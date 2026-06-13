@@ -204,3 +204,58 @@ Next:
 - Coder の commit / implementation_report / validation evidence を確認後、Reviewer を read-only 基本で起動する。
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-13T11:14:26Z -->
+
+## Implementation report
+
+Implementation report for commit 949ceb5a (fix: refresh tui after rewind)
+
+Files changed:
+- crates/tui/src/app.rs: added rewind apply-pending state, post-rewind live-update fence, authoritative RewindApplied restore path that always clears/replays retained entries, actionbar-visible failure handling, and focused rewind refresh tests.
+- crates/tui/src/single_pod.rs: route Esc through cancel_rewind_picker so submitted rewinds stay visibly pending until the Pod responds.
+- crates/tui/src/ui.rs: show an applying/waiting state in the rewind picker header while RewindTo is pending.
+
+Validation:
+- cargo test -p tui rewind_refresh_tests: PASS (4 tests).
+- cargo test -p tui single_pod::tests::rewind_picker: PASS (2 tests).
+- cargo fmt --check: PASS.
+- git diff --check: PASS.
+- cargo test -p tui: ATTEMPTED; unrelated failures remain in multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace and spawn::tests::{profile_choices_include_builtin_and_project_default_marker, profile_choices_use_project_registry_default}. The rewind-focused tests above passed.
+
+Residual risks:
+- The stale-update fence is intentionally short-lived and clears on authoritative Status/Snapshot after RewindApplied; it drops queued display-mutating live events during that window to avoid re-polluting the restored session tail.
+- No protocol or Pod persistence changes were made.
+
+---
+
+<!-- event: review author: hare at: 2026-06-13T11:21:32Z status: approve -->
+
+## Review: approve
+
+## Review: approve
+
+Reviewed implementation commits `949ceb5a` and `3a7edbde` against Ticket `00001KV04NJ8D` intent and acceptance criteria.
+
+Evidence:
+- `Event::RewindApplied` no longer gates transcript restoration on `App::greeting`; it clears/replays the Pod-provided post-rewind entries through a shared restore path and emits an explicit warning if greeting metadata is unavailable, avoiding silent stale-view success.
+- Rewind picker submit now enters an `applying` state, suppresses repeated `Enter`/navigation, shows an applying header, blocks `Esc` from hiding an in-flight destructive request, and closes on successful `RewindApplied`.
+- Rewind failure (`Event::Error` while applying) clears the pending state, leaves the existing transcript intact, and surfaces an actionbar-visible failure plus normal error block.
+- A short rewind refresh fence drops display-mutating stale live events after successful restore until authoritative `Status`/`Snapshot`; no Pod protocol or persistence semantics changed.
+- Temporary investigation logging was not present in the final diff.
+- Focused tests cover successful restore/old-tail removal, missing-greeting restore, duplicate-submit suppression with failure preservation, and stale live update suppression; existing rewind picker tests still pass.
+
+Validation performed:
+- `git diff --check 20daae0c..HEAD`: PASS.
+- `cargo test -p tui rewind_refresh_tests`: PASS (4 tests).
+- `cargo test -p tui single_pod::tests::rewind_picker`: PASS (2 tests).
+- `cargo fmt --check`: PASS.
+- `cargo check -p protocol -p pod -p tui`: PASS.
+- `cargo test -p tui`: FAILED only in the already-reported unrelated tests: `multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace` and `spawn::tests::{profile_choices_include_builtin_and_project_default_marker, profile_choices_use_project_registry_default}`; rewind-focused tests passed in that run.
+
+Residual note:
+- The stale-update fence intentionally relies on the Pod's follow-up `Status`/`Snapshot` to clear; this matches the current `RewindApplied`/`Status` flow and is acceptable for this Ticket.
+
+Decision: approve.
+
+---

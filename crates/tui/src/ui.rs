@@ -433,7 +433,25 @@ fn draw_rewind_picker(
     picker: &mut crate::app::RewindPickerState,
 ) {
     let mut logical: Vec<Line<'static>> = Vec::new();
-    logical.push(Line::from(vec![
+    let action_spans = if picker.applying {
+        vec![
+            Span::styled(
+                "Applying rewind…",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" waiting for Pod response"),
+        ]
+    } else {
+        vec![
+            Span::styled("Enter", Style::default().fg(Color::Green)),
+            Span::raw(" apply  "),
+            Span::styled("Esc", Style::default().fg(Color::Green)),
+            Span::raw(" cancel"),
+        ]
+    };
+    let mut header = vec![
         Span::styled(
             "Rewind targets",
             Style::default()
@@ -441,11 +459,9 @@ fn draw_rewind_picker(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!("  head={} ", picker.head_entries)),
-        Span::styled("Enter", Style::default().fg(Color::Green)),
-        Span::raw(" apply  "),
-        Span::styled("Esc", Style::default().fg(Color::Green)),
-        Span::raw(" cancel"),
-    ]));
+    ];
+    header.extend(action_spans);
+    logical.push(Line::from(header));
     logical.push(Line::from(Span::styled(
         "Selecting a target discards the later history suffix; tool side effects are not undone.",
         Style::default().fg(Color::DarkGray),
