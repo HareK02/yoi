@@ -58,3 +58,45 @@ This preserves the desired detachable shape: feature state remains in the featur
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-14T16:53:27Z -->
+
+## Decision
+
+決定:
+- Durable terminology は `Plugin runtime` / `Plugin surface` / `Plugin host API` にする。`contribution category` は分かりづらいため設計語彙として使わない。
+- Plugin surface は Tool / Hook / Service / Ingress の4つに整理する。
+- Outbound は独立 surface にしない。Slack/Discord 送信など外部副作用は `external_write` metadata を持つ Tool として扱う。
+- Ingress は Plugin が Notify/Run を直接呼ぶ API ではなく、typed external event を host に submit する API とする。host routing policy が notify/run/drop を決める。
+- Web/FS/Secret/State/Timer/Diagnostics は Plugin surface ではなく Plugin host API。WASM などの runtime が surface を実装するために、Plugin-layer grant で明示的に許可された範囲だけ使える。
+- Chat bridge target は、Yoi が discord.js/Slack SDK process を起動する前提にしない。外部管理の bridge service に WASM Plugin が configured URL + SecretRef で接続する設計を first-class にする。
+
+
+---
+
+<!-- event: decision author: hare at: 2026-06-14T17:19:59Z -->
+
+## Decision
+
+決定:
+- Initial Plugin surface は Tool / Hook を主軸にする。
+- Service / Ingress は将来候補として残すが、Submit/Notify/Run や lifecycle semantics を具体化する別 Ticket まで初期 contract には入れない。
+- Outbound は独立 surface にしない。外部副作用は `external_write` metadata を持つ Tool として扱う。
+- Plugin host API は初期は `https` と `fs` に絞る。`web` という広い API 名は使わず、HTTPS-only の bounded client と scoped FS として設計する。
+- WebSocket/SSE/long polling、timer、state、secret plaintext access、Ingress submit API は必要性が具体化した時点で追加設計する。
+
+
+---
+
+<!-- event: decision author: hare at: 2026-06-14T17:22:23Z -->
+
+## Decision
+
+決定:
+- Service / Ingress は Plugin surface として必要なので初期設計対象に戻す。
+- Service は Pod-lifetime の Plugin work として具体化する。ただし Service という語は WebSocket/SSE/raw network support を含意しない。初期の外部通信は `https` host API の範囲に限定し、streaming API は別途設計する。
+- Ingress は `host.ingress.submit(typed external event)` として具体化する。Plugin が Notify/Run/context injection を直接選ばず、host routing policy が notify/run/drop/diagnostic を決める。
+- General-purpose host API は引き続き `https` と `fs` に絞る。`ingress.submit` と `diagnostics` は surface-intrinsic host calls として扱い、広い ambient capability にはしない。
+
+
+---
