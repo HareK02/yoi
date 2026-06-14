@@ -1,11 +1,13 @@
 ---
 title: 'Panel: invalid Ticket があっても Ticket 機能全体を無効化しない'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-14T14:56:51Z'
-updated_at: '2026-06-14T14:56:51Z'
+updated_at: '2026-06-14T15:35:56Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['tui-panel', 'ticket-backend', 'partial-failure', 'diagnostics']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-14T15:35:56Z'
 ---
 
 ## Background
