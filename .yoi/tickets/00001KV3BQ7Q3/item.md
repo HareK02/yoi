@@ -1,11 +1,13 @@
 ---
 title: '対象 TUI/Panel merge commit の挙動を現行 E2E で確認する'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-14T15:24:05Z'
-updated_at: '2026-06-14T15:24:05Z'
+updated_at: '2026-06-14T15:35:57Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['e2e', 'tui', 'panel', 'regression-evidence']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-14T15:35:57Z'
 ---
 
 ## Background
