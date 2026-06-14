@@ -1171,11 +1171,40 @@ impl MultiPodApp {
     }
 
     fn handle_mouse_event(&mut self, event: MouseEvent) -> bool {
-        if !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return false;
-        }
         if self.panel_diagnostic_open {
             return false;
+        }
+        match event.kind {
+            MouseEventKind::ScrollDown => {
+                #[cfg(feature = "e2e-test")]
+                crate::e2e_observer::emit(
+                    "panel",
+                    "mouse_wheel",
+                    serde_json::json!({
+                        "column": event.column,
+                        "row": event.row,
+                        "direction": "down",
+                    }),
+                );
+                self.select_next();
+                return true;
+            }
+            MouseEventKind::ScrollUp => {
+                #[cfg(feature = "e2e-test")]
+                crate::e2e_observer::emit(
+                    "panel",
+                    "mouse_wheel",
+                    serde_json::json!({
+                        "column": event.column,
+                        "row": event.row,
+                        "direction": "up",
+                    }),
+                );
+                self.select_prev();
+                return true;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {}
+            _ => return false,
         }
         let Some(key) = self
             .row_hit_boxes
