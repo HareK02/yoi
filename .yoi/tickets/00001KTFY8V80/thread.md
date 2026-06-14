@@ -63,3 +63,12 @@ Created by LocalTicketBackend create.
 Intake refinement が完了し、要件・受け入れ条件・binding invariants・escalation conditions が Ticket thread に記録されたため `planning -> ready` にします。実装 side effects は Orchestrator routing 後に行います。
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-14T15:23:07Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
