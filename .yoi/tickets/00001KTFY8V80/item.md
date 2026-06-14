@@ -1,8 +1,8 @@
 ---
 title: "Preserve active workflows across compaction"
-state: 'inprogress'
+state: 'done'
 created_at: "2026-06-07T02:23:28Z"
-updated_at: '2026-06-14T16:25:00Z'
+updated_at: '2026-06-14T16:26:01Z'
 queued_by: 'workspace-panel'
 queued_at: '2026-06-14T15:23:07Z'
 ---
