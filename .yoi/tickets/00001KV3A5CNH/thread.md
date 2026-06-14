@@ -308,3 +308,47 @@ Conclusion:
 - Approved. No remaining blocker found.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-14T16:38:01Z -->
+
+## Implementation report
+
+Integration report:
+
+Merged implementation branch into orchestration branch:
+- branch: `impl/00001KV3A5CNH-panel-invalid-ticket-tolerance`
+- implementation commits:
+  - `b83b9e4e fix: tolerate invalid ticket rows in panel`
+  - `456722c3 fix: disable tickets with invalid detail records`
+- merge commit: `863b13b6 merge: tolerate invalid panel tickets`
+
+Reviewer result:
+- First review requested changes for corrupt current-ticket relation/detail artifacts exposing lifecycle actions.
+- Second-pass review `approve` recorded from `yoi-reviewer-00001KV3A5CNH-r2`.
+
+Validation in Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration`:
+- Passed: `cargo test -p tui workspace_panel --lib`
+  - 16 passed
+- Passed: `cargo test -p ticket partial_list_and_show --lib`
+  - 1 passed
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check`
+
+Notes:
+- Valid Ticket rows/actions remain available when peer records are invalid.
+- If a current Ticket's detail/artifact load reports invalidity, Panel renders only a disabled invalid placeholder for that id and no lifecycle action.
+- Orchestrator worktree is clean after validation.
+
+Cleanup planned:
+- Stop related coder/reviewer Pods.
+- Remove only child implementation worktree/branch for this Ticket.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-14T16:38:01Z from: inprogress to: done reason: merged_validated field: state -->
+
+## State changed
+
+Reviewer approved after requested fixes, implementation branch merged into the orchestration branch, and focused validation passed in the Orchestrator worktree. Marking Ticket done in the orchestration branch.
+
+---
