@@ -35,9 +35,8 @@ const TASK_MANAGEMENT_TOOL_NAMES: [&str; 2] = ["TaskCreate", "TaskUpdate"];
 ///
 /// The returned module contributes `TaskCreate`, `TaskUpdate`, `TaskGet`, and
 /// `TaskList` through descriptor-approved tool registration, plus built-in hooks
-/// that maintain Task-reminder state. It does not request sandbox/external-plugin
-/// host authorities; normal ToolRegistry and PreToolCall permission policy still
-/// applies at call time.
+/// that maintain Task-reminder state. Normal ToolRegistry and PreToolCall
+/// permission policy still applies at call time.
 pub fn task_tools_feature() -> TaskFeature {
     TaskFeature::new()
 }

@@ -27,6 +27,53 @@ Ticket を `workspace-panel` が queued にしました。
 
 ---
 
+<!-- event: implementation_report author: orchestrator at: 2026-06-13T18:33:30Z -->
+
+## Implementation report
+
+Implementation handoff resumed successfully after retry.
+
+- Previous blocker was child launch validation requiring workspace root read grant.
+- Retried `SpawnPod` with explicit non-recursive read grant for `/home/hare/Projects/yoi` plus child worktree read/write scopes.
+- Coder Pod started: `coder-00001KV10SN02-e2e-critical`
+- Worktree: `/home/hare/Projects/yoi/.worktree/e2e-critical-path`
+- Branch: `ticket-00001KV10SN02-e2e-critical-path`
+
+The root workspace grant is non-recursive and is only for runtime launch validation. Coder instructions explicitly prohibit inspecting, writing, running git, validating, merging, or cleaning up in the root/original workspace.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-13T18:43:30Z from: queued to: inprogress reason: orchestrator_acceptance_recorded_after_spawn_retry field: state -->
+
+## State changed
+
+Coder Pod `coder-00001KV10SN02-e2e-critical` has been started after SpawnPod retry with explicit root non-recursive read grant. This records the missing acceptance marker before further implementation/review side effects continue; previous handoff report already documented the retry and scope.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-13T19:04:40Z -->
+
+## Implementation report
+
+Implementation blocked / stopped for now.
+
+Problem:
+- Coder Pod `coder-00001KV10SN02-e2e-critical` is in an inconsistent communication state: `ReadPodOutput` reports it as stopped/unreachable, while restore/list surfaces report the socket as live/reachable, and `SendToPod` times out waiting for initial Snapshot.
+- Worktree `/home/hare/Projects/yoi/.worktree/e2e-critical-path` contains uncommitted changes in `crates/tui/src/multi_pod.rs`, `crates/tui/src/single_pod.rs`, `tests/e2e/src/lib.rs`, `tests/e2e/tests/panel.rs`, and new `tests/e2e/tests/rewind.rs`.
+- No Coder final report, commit, or Ticket implementation_report was received.
+
+Decision:
+- Per user instruction, stop this Ticket instead of attempting to merge incomplete/unreviewed work.
+- Do not merge this branch.
+- Preserve the dirty worktree for human/next-Orchestrator inspection rather than deleting it.
+
+Recovery needed:
+- Inspect dirty diff in `/home/hare/Projects/yoi/.worktree/e2e-critical-path`.
+- Decide whether to salvage/commit after validation, ask Coder to continue after runtime recovery, or discard and restart from clean branch.
+- Do not mark done until implementation is committed, reviewed, and validated.
+
+---
+
 <!-- event: implementation_report author: hare at: 2026-06-14T05:24:37Z -->
 
 ## Implementation report
@@ -57,6 +104,3 @@ Additional note:
 Residual risks:
 - Rewind E2E uses an e2e-test-only canned in-process fixture instead of a provider/socket-backed Pod, intentionally avoiding credentials/network while still exercising the real single-Pod TUI/PTTY path.
 - nix build emitted the expected dirty-tree warning before succeeding.
-
-
----
