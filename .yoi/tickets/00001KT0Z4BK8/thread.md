@@ -51,3 +51,48 @@ Distribution direction from user discussion:
 
 
 ---
+
+<!-- event: intake_summary author: hare at: 2026-06-14T14:53:35Z -->
+
+## Intake summary
+
+Marked ready by `yoi ticket state`.
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-06-14T14:53:35Z from: planning to: ready reason: cli_state field: state -->
+
+## State changed
+
+Marked ready by `yoi ticket state`.
+
+
+---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-14T14:54:52Z from: ready to: planning reason: panel_return_to_planning field: state -->
+
+## State changed
+
+Panel returned ready Ticket 00001KT0Z4BK8 to planning for requirements sync. This is not Queue routing and must not start implementation.
+
+## User refinement instruction
+
+前何回かに渡って実装されたlatencyとかE2Eとかの話なんだけど
+
+
+---
+
+<!-- event: comment author: intake at: 2026-06-14T14:56:35Z -->
+
+## Comment
+
+Intake 確認:
+- Ticket `00001KT0Z4BK8` の body / thread / artifacts を確認した。この Ticket の現在の主題は Plugin distribution package format / discovery / enablement boundary であり、直近の user refinement「前何回かに渡って実装されたlatencyとかE2Eとかの話なんだけど」は、この Ticket の plugin package 要件とは直接対応しない。
+- 関連しそうな既存 Ticket として `00001KV0723PC`（Panel Quit latency）、`00001KSKBP9YG`（E2E harness）、`00001KV0TJVN5`（E2E binary/env isolation）、`00001KV0YK5S0`（E2E tmp/runtime isolation）、`00001KV10SN02`（E2E critical-path coverage）を確認した。いずれも closed で、latency/E2E の実装・検証・残差整理はそちらの系譜に記録されている。
+- 現時点では、Plugin package Ticket の readiness / requirements を変更する根拠は不足している。ユーザーに、(a) `00001KT0Z4BK8` に latency/E2E 由来の検証要件を追加したいのか、(b) latency/E2E 系の既存 Ticket に追記したいのか、(c) 新しい concrete follow-up Ticket が必要なのか、を確認する。
+
+状態:
+- このコメントは要件同期の保留記録であり、queue / implementation routing ではない。
+- duplicate Ticket は作成していない。
+
+---
