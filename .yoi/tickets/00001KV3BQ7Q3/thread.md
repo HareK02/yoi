@@ -149,3 +149,90 @@ Branch: `impl/00001KV3BQ7Q3-panel-e2e-evidence`
 
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KV3BQ7Q3 at: 2026-06-14T16:53:51Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Evidence checked:
+- Worktree/branch/commit:
+  - `/home/hare/Projects/yoi/.worktree/00001KV3BQ7Q3-panel-e2e-evidence`
+  - `impl/00001KV3BQ7Q3-panel-e2e-evidence`
+  - HEAD `1f07e57a test: record panel tui e2e evidence`
+  - base/merge-base `5e81bc38`
+- Ticket intent and acceptance criteria in `.yoi/tickets/00001KV3BQ7Q3/item.md`.
+- Implementation/evidence changes in:
+  - `.yoi/tickets/00001KV3BQ7Q3/artifacts/e2e-evidence.md`
+  - `.yoi/tickets/00001KV3BQ7Q3/thread.md`
+  - `crates/tui/src/single_pod.rs`
+  - `tests/e2e/src/lib.rs`
+  - `tests/e2e/tests/panel.rs`
+  - `tests/e2e/tests/rewind.rs`
+
+Findings:
+- `802fa1f0` / rewind live refresh: strengthened `single_pod_rewind_picker_applies_without_escape_and_suppresses_duplicate_enter` uses real `yoi` PTY fixture, applies rewind, observes `rewind_applied`, verifies restored composer text `rewind-live-refresh`, and waits for raw PTY output after the pre-rewind offset to contain that marker. This satisfies fixture PTY E2E evidence for restart/restore-free live display update.
+- `02311883` / panel mouse selection: existing `panel_mouse_click_selects_row_without_dispatching_action` uses real `yoi panel` PTY, SGR click injection, observes selection change, and asserts no `action_requested` from click alone. This is not just unit/code review coverage.
+- `db7bad7a` / panel quit latency: strengthened `panel_ctrl_c_exits_promptly_after_background_barrier` confirms pending `reload`, sends Ctrl-C, requires clean exit within `PanelHarness::default_exit_wait()` / 1500 ms, and asserts `background_task_aborted { task: "reload" }`. The evidence states the bounded guarantee precisely and does not overclaim arbitrary live-terminal latency.
+
+Residual gap representation:
+- Correctly represented. The evidence distinguishes automated fixture PTY E2E from manual/live-terminal validation, describes mouse coverage as SGR PTY injection rather than terminal-emulator matrix, and keeps the original live-terminal latency gap outside the fixture guarantee.
+
+Validation performed by reviewer:
+- Passed: `git diff --check 5e81bc38..HEAD`
+- Passed: `cargo fmt --check`
+- `git status --porcelain=v1` was clean.
+
+Validation not rerun by reviewer:
+- E2E tests/checks were not rerun in reviewer because they write to build/artifact locations. Coder-reported passing results were reviewed as evidence.
+
+Conclusion:
+- Approved. No blocker remains.
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-14T16:54:05Z -->
+
+## Implementation report
+
+Integration report:
+
+Merged implementation/evidence branch into orchestration branch:
+- branch: `impl/00001KV3BQ7Q3-panel-e2e-evidence`
+- implementation commit: `1f07e57a test: record panel tui e2e evidence`
+- merge commit: `b5e7ca98 merge: panel e2e evidence`
+
+Reviewer result:
+- `approve` recorded from `yoi-reviewer-00001KV3BQ7Q3`.
+
+Validation in Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration`:
+- Passed: `cargo fmt --check`
+- Passed: `cargo test -p yoi-e2e --features e2e --no-run`
+- Passed: `cargo test -p yoi-e2e --features e2e`
+- Passed: `cargo check -p yoi-e2e -p yoi -p tui`
+- Passed: `git diff --check`
+
+Per-target evidence outcome:
+- `802fa1f0` / rewind live refresh: pass for current fixture PTY E2E. Strengthened rewind E2E verifies post-apply PTY output contains the unique restored composer marker without restart/restore.
+- `02311883` / panel mouse selection: pass for current fixture PTY E2E. Existing Panel mouse E2E covers real `yoi panel` PTY, SGR click selection change, and no action dispatch on click alone.
+- `db7bad7a` / panel quit latency: pass for bounded fixture PTY E2E with residual live-terminal gap. Strengthened Panel quit E2E confirms pending reload background task is aborted and quit completes within the 1500 ms fixture threshold.
+
+Residual gaps:
+- Evidence is automated fixture PTY E2E, not manual/live-terminal validation.
+- Mouse coverage is SGR PTY injection through real process path, not a terminal-emulator compatibility matrix.
+- Quit latency evidence is bounded to fixture-held reload work and threshold, not every historical live latency scenario.
+
+Cleanup planned:
+- Stop related coder/reviewer Pods.
+- Remove only child implementation worktree/branch for this Ticket.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-14T16:54:05Z from: inprogress to: done reason: merged_validated field: state -->
+
+## State changed
+
+Reviewer approved, implementation/evidence branch merged into the orchestration branch, and E2E-focused validation passed in the Orchestrator worktree. Marking Ticket done in the orchestration branch.
+
+---
