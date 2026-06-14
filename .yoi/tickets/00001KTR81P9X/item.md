@@ -1,11 +1,13 @@
 ---
 title: 'Extend pod::feature API for external protocol-backed capability providers'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-10T07:48:14Z'
-updated_at: '2026-06-13T16:27:15Z'
+updated_at: '2026-06-14T06:08:25Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['feature-api', 'tool-registry', 'permission-scope', 'prompt-context', 'dynamic-registry', 'service-lifecycle']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-14T06:08:25Z'
 ---
 
 ## Background
