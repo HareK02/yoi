@@ -958,6 +958,10 @@ fn panel_e2e_row_key(key: &PanelRowKey) -> PanelE2eRowKey {
             kind: "ticket",
             id: id.clone(),
         },
+        PanelRowKey::InvalidTicket(label) => PanelE2eRowKey {
+            kind: "invalid_ticket",
+            id: label.clone(),
+        },
         PanelRowKey::TicketIntakePod {
             ticket_id,
             pod_name,
@@ -1359,7 +1363,9 @@ impl MultiPodApp {
                     ),
                     None => match &hit.key {
                         PanelRowKey::Pod(name) => (name.clone(), None, None),
-                        PanelRowKey::Ticket(id) => (id.clone(), None, None),
+                        PanelRowKey::Ticket(id) | PanelRowKey::InvalidTicket(id) => {
+                            (id.clone(), None, None)
+                        }
                         PanelRowKey::TicketIntakePod { pod_name, .. } => {
                             (pod_name.clone(), None, None)
                         }
@@ -1415,7 +1421,9 @@ impl MultiPodApp {
                 }
                 if let Some(key) = visible.iter().find(|key| match key {
                     PanelRowKey::Pod(name) => Some(name.as_str()) != orchestrator_pod_name,
-                    PanelRowKey::Ticket(_) | PanelRowKey::TicketIntakePod { .. } => true,
+                    PanelRowKey::Ticket(_)
+                    | PanelRowKey::InvalidTicket(_)
+                    | PanelRowKey::TicketIntakePod { .. } => true,
                 }) {
                     self.select_panel_key(key.clone());
                     return;
@@ -4693,6 +4701,11 @@ fn selected_ticket_notice(row: Option<&PanelRow>) -> String {
             .unwrap_or_else(|| {
                 "Open/attach this Ticket's Intake Pod from the associated row.".to_string()
             }),
+        Some(row) if row.kind == PanelRowKind::InvalidTicket => row
+            .disabled_reason
+            .clone()
+            .or_else(|| row.key_hint.clone())
+            .unwrap_or_else(|| "Invalid Ticket record placeholder has no actions.".to_string()),
         _ => "No Pod is selected.".to_string(),
     }
 }
@@ -5262,6 +5275,14 @@ fn push_ticket_marker_span(spans: &mut Vec<Span<'static>>, selected: bool, remai
 }
 
 fn panel_ticket_detail(row: &PanelRow) -> String {
+    if row.kind == PanelRowKind::InvalidTicket {
+        let mut parts = vec![panel_ticket_reference(row), "Gate: unavailable".to_string()];
+        if let Some(reason) = panel_ticket_reason(row) {
+            parts.push(format!("Reason: {reason}"));
+        }
+        return parts.join(" · ");
+    }
+
     if row.kind == PanelRowKind::TicketIntakePod {
         let mut parts = row
             .subtitle
@@ -5320,6 +5341,9 @@ fn panel_ticket_reason(row: &PanelRow) -> Option<&str> {
 }
 
 fn ticket_detail_style(row: &PanelRow) -> Style {
+    if row.kind == PanelRowKind::InvalidTicket {
+        return Style::default().fg(Color::Yellow);
+    }
     if row
         .ticket
         .as_ref()
@@ -5337,7 +5361,7 @@ fn panel_ticket_reference(row: &PanelRow) -> String {
         .as_ref()
         .map(|ticket| ticket.id.clone())
         .unwrap_or_else(|| match &row.key {
-            PanelRowKey::Ticket(id) => id.clone(),
+            PanelRowKey::Ticket(id) | PanelRowKey::InvalidTicket(id) => id.clone(),
             PanelRowKey::TicketIntakePod { ticket_id, .. } => ticket_id.clone(),
             PanelRowKey::Pod(name) => name.clone(),
         })

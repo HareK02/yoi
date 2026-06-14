@@ -766,6 +766,24 @@ pub struct TicketSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketInvalidRecord {
+    pub label: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TicketPartialList {
+    pub tickets: Vec<TicketSummary>,
+    pub invalid_records: Vec<TicketInvalidRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketPartial {
+    pub ticket: Ticket,
+    pub invalid_records: Vec<TicketInvalidRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketDocument {
     pub body: MarkdownText,
     pub raw_frontmatter: BTreeMap<String, String>,
@@ -932,6 +950,49 @@ impl LocalTicketBackend {
         }
     }
 
+    pub fn list_partial(&self, filter: TicketFilter) -> Result<TicketPartialList> {
+        let mut output = TicketPartialList::default();
+        let mut invalid_seen = BTreeSet::new();
+        for dir in self.iter_ticket_dirs(TicketFilter::all())? {
+            let item = dir.join("item.md");
+            if !item.exists() {
+                continue;
+            }
+            match read_item_file(&item)
+                .and_then(|parsed| ticket_meta_for_dir(&dir, parsed.frontmatter))
+            {
+                Ok(meta) => {
+                    if filter
+                        .state
+                        .is_some_and(|state| meta.workflow_state != state)
+                    {
+                        continue;
+                    }
+                    output.tickets.push(ticket_summary_from_meta(meta));
+                }
+                Err(error) => push_invalid_ticket_record(
+                    &mut output.invalid_records,
+                    &mut invalid_seen,
+                    &dir,
+                    &error,
+                ),
+            }
+        }
+        Ok(output)
+    }
+
+    pub fn show_partial(&self, id: TicketIdOrSlug) -> Result<TicketPartial> {
+        let dir = self.find_ticket_dir(&id)?;
+        let mut invalid_records = Vec::new();
+        let mut invalid_seen = BTreeSet::new();
+        let ticket =
+            self.ticket_from_dir_tolerant(&dir, &mut invalid_records, &mut invalid_seen)?;
+        Ok(TicketPartial {
+            ticket,
+            invalid_records,
+        })
+    }
+
     fn generated_heading(&self, default: &'static str, japanese: &'static str) -> &'static str {
         if is_japanese_record_language(self.record_language()) {
             japanese
@@ -1045,6 +1106,27 @@ impl LocalTicketBackend {
     }
 
     fn ticket_from_dir(&self, dir: &Path) -> Result<Ticket> {
+        self.ticket_from_dir_with_relations(dir, |backend, meta| {
+            backend.relation_view_for_meta(meta)
+        })
+    }
+
+    fn ticket_from_dir_tolerant(
+        &self,
+        dir: &Path,
+        invalid_records: &mut Vec<TicketInvalidRecord>,
+        invalid_seen: &mut BTreeSet<String>,
+    ) -> Result<Ticket> {
+        self.ticket_from_dir_with_relations(dir, |backend, meta| {
+            backend.relation_view_for_meta_tolerant(meta, invalid_records, invalid_seen)
+        })
+    }
+
+    fn ticket_from_dir_with_relations(
+        &self,
+        dir: &Path,
+        relation_view: impl FnOnce(&Self, &TicketMeta) -> Result<TicketRelationView>,
+    ) -> Result<Ticket> {
         let item_path = dir.join("item.md");
         let parsed = read_item_file(&item_path)?;
         let meta = ticket_meta_for_dir(dir, parsed.frontmatter.clone())?;
@@ -1059,7 +1141,7 @@ impl LocalTicketBackend {
             Vec::new()
         };
         let artifacts = collect_artifacts(&dir.join("artifacts"))?;
-        let relations = self.relation_view_for_meta(&meta)?;
+        let relations = relation_view(self, &meta)?;
         let resolution_path = dir.join("resolution.md");
         let resolution = if resolution_path.exists() {
             Some(MarkdownText::new(
@@ -1223,13 +1305,25 @@ impl LocalTicketBackend {
         for dir in self.iter_ticket_dirs(TicketFilter::all())? {
             relations.extend(self.read_ticket_relations_for_dir(&dir)?);
         }
-        relations.sort_by(|a, b| {
-            a.ticket_id
-                .cmp(&b.ticket_id)
-                .then_with(|| a.kind.cmp(&b.kind))
-                .then_with(|| a.target.cmp(&b.target))
-                .then_with(|| a.at.cmp(&b.at))
-        });
+        sort_ticket_relations(&mut relations);
+        Ok(relations)
+    }
+
+    fn all_ticket_relation_records_tolerant(
+        &self,
+        invalid_records: &mut Vec<TicketInvalidRecord>,
+        invalid_seen: &mut BTreeSet<String>,
+    ) -> Result<Vec<TicketRelation>> {
+        let mut relations = Vec::new();
+        for dir in self.iter_ticket_dirs(TicketFilter::all())? {
+            match self.read_ticket_relations_for_dir(&dir) {
+                Ok(records) => relations.extend(records),
+                Err(error) => {
+                    push_invalid_ticket_record(invalid_records, invalid_seen, &dir, &error)
+                }
+            }
+        }
+        sort_ticket_relations(&mut relations);
         Ok(relations)
     }
 
@@ -1239,12 +1333,45 @@ impl LocalTicketBackend {
         Ok(relation_view_from_records(meta, &all, &states))
     }
 
+    fn relation_view_for_meta_tolerant(
+        &self,
+        meta: &TicketMeta,
+        invalid_records: &mut Vec<TicketInvalidRecord>,
+        invalid_seen: &mut BTreeSet<String>,
+    ) -> Result<TicketRelationView> {
+        let states = self.ticket_state_index_tolerant(invalid_records, invalid_seen)?;
+        let all = self.all_ticket_relation_records_tolerant(invalid_records, invalid_seen)?;
+        Ok(relation_view_from_records(meta, &all, &states))
+    }
+
     fn ticket_state_index(&self) -> Result<HashMap<String, TicketWorkflowState>> {
         let mut states = HashMap::new();
         for dir in self.iter_ticket_dirs(TicketFilter::all())? {
             let item = dir.join("item.md");
             let meta = ticket_meta_for_dir(&dir, read_item_file(&item)?.frontmatter)?;
             states.insert(meta.id, meta.workflow_state);
+        }
+        Ok(states)
+    }
+
+    fn ticket_state_index_tolerant(
+        &self,
+        invalid_records: &mut Vec<TicketInvalidRecord>,
+        invalid_seen: &mut BTreeSet<String>,
+    ) -> Result<HashMap<String, TicketWorkflowState>> {
+        let mut states = HashMap::new();
+        for dir in self.iter_ticket_dirs(TicketFilter::all())? {
+            let item = dir.join("item.md");
+            match read_item_file(&item)
+                .and_then(|parsed| ticket_meta_for_dir(&dir, parsed.frontmatter))
+            {
+                Ok(meta) => {
+                    states.insert(meta.id, meta.workflow_state);
+                }
+                Err(error) => {
+                    push_invalid_ticket_record(invalid_records, invalid_seen, &dir, &error)
+                }
+            }
         }
         Ok(states)
     }
@@ -1274,21 +1401,7 @@ impl TicketBackend for LocalTicketBackend {
             }
             let parsed = read_item_file(&item)?;
             let meta = ticket_meta_for_dir(&dir, parsed.frontmatter)?;
-            tickets.push(TicketSummary {
-                id: meta.id,
-                slug: meta.slug,
-                title: meta.title,
-                status: meta.status,
-                kind: meta.kind,
-                priority: meta.priority,
-                labels: meta.labels,
-                readiness: meta.readiness,
-                workflow_state: meta.workflow_state,
-                workflow_state_explicit: meta.workflow_state_explicit,
-                queued_by: meta.queued_by,
-                queued_at: meta.queued_at,
-                updated_at: meta.updated_at,
-            });
+            tickets.push(ticket_summary_from_meta(meta));
         }
         Ok(tickets)
     }
@@ -2221,6 +2334,72 @@ fn ticket_meta(frontmatter: TicketItemFrontmatter, id: String) -> TicketMeta {
         queued_by: frontmatter.queued_by,
         queued_at: frontmatter.queued_at,
         raw: frontmatter.raw,
+    }
+}
+
+fn ticket_summary_from_meta(meta: TicketMeta) -> TicketSummary {
+    TicketSummary {
+        id: meta.id,
+        slug: meta.slug,
+        title: meta.title,
+        status: meta.status,
+        kind: meta.kind,
+        priority: meta.priority,
+        labels: meta.labels,
+        readiness: meta.readiness,
+        workflow_state: meta.workflow_state,
+        workflow_state_explicit: meta.workflow_state_explicit,
+        queued_by: meta.queued_by,
+        queued_at: meta.queued_at,
+        updated_at: meta.updated_at,
+    }
+}
+
+fn sort_ticket_relations(relations: &mut [TicketRelation]) {
+    relations.sort_by(|a, b| {
+        a.ticket_id
+            .cmp(&b.ticket_id)
+            .then_with(|| a.kind.cmp(&b.kind))
+            .then_with(|| a.target.cmp(&b.target))
+            .then_with(|| a.at.cmp(&b.at))
+    });
+}
+
+fn invalid_ticket_record_label(dir: &Path) -> String {
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| validate_record_id(name).is_ok())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "invalid ticket record".to_string())
+}
+
+fn invalid_ticket_record_reason(error: &TicketError) -> &'static str {
+    match error {
+        TicketError::Io { .. } => "could not read ticket record",
+        TicketError::Parse { .. } => "invalid ticket record schema",
+        TicketError::InvalidPathComponent(_) | TicketError::PathEscapesRoot { .. } => {
+            "invalid ticket record identity"
+        }
+        TicketError::Locked { .. } => "ticket backend is locked",
+        TicketError::NotFound(_) => "ticket record is missing",
+        TicketError::Ambiguous { .. } | TicketError::Conflict(_) => {
+            "invalid ticket record metadata"
+        }
+    }
+}
+
+fn push_invalid_ticket_record(
+    invalid_records: &mut Vec<TicketInvalidRecord>,
+    invalid_seen: &mut BTreeSet<String>,
+    dir: &Path,
+    error: &TicketError,
+) {
+    let label = invalid_ticket_record_label(dir);
+    if invalid_seen.insert(label.clone()) {
+        invalid_records.push(TicketInvalidRecord {
+            label,
+            reason: invalid_ticket_record_reason(error).to_string(),
+        });
     }
 }
 
@@ -3631,6 +3810,47 @@ state: planning
         assert!(record.meta.workflow_state_explicit);
         let report = backend.doctor().unwrap();
         assert!(report.is_ok(), "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn partial_list_and_show_keep_valid_tickets_when_peer_record_is_invalid() {
+        let tmp = TempDir::new().unwrap();
+        let backend = backend(&tmp);
+        let mut ready = NewTicket::new("Ready Valid");
+        ready.workflow_state = Some(TicketWorkflowState::Ready);
+        let valid = backend.create(ready).unwrap();
+        let invalid = backend
+            .create(NewTicket::new("Invalid Secret Title"))
+            .unwrap();
+        fs::write(
+            backend.root().join(&invalid.id).join("item.md"),
+            "---\ntitle: Invalid Secret Title\nstate: super-secret-invalid\n---\nbody\n",
+        )
+        .unwrap();
+
+        assert!(backend.list(TicketFilter::all()).is_err());
+
+        let partial = backend.list_partial(TicketFilter::all()).unwrap();
+        assert_eq!(partial.tickets.len(), 1);
+        assert_eq!(partial.tickets[0].id, valid.id);
+        assert_eq!(partial.invalid_records.len(), 1);
+        assert_eq!(partial.invalid_records[0].label, invalid.id);
+        assert_eq!(
+            partial.invalid_records[0].reason,
+            "invalid ticket record schema"
+        );
+        assert!(
+            !partial.invalid_records[0]
+                .reason
+                .contains("super-secret-invalid")
+        );
+
+        let detail = backend
+            .show_partial(TicketIdOrSlug::Id(valid.id.clone()))
+            .unwrap();
+        assert_eq!(detail.ticket.meta.title, "Ready Valid");
+        assert_eq!(detail.invalid_records.len(), 1);
+        assert_eq!(detail.invalid_records[0].label, invalid.id);
     }
 
     #[test]
