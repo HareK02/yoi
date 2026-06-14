@@ -4,7 +4,7 @@ use protocol::PodStatus;
 use ticket::config::{TICKET_CONFIG_RELATIVE_PATH, TicketConfig};
 use ticket::{
     LocalTicketBackend, TicketBackend, TicketError, TicketEvent, TicketFilter, TicketIdOrSlug,
-    TicketMeta, TicketRelationBlocker, TicketSummary, TicketWorkflowState,
+    TicketInvalidRecord, TicketMeta, TicketRelationBlocker, TicketSummary, TicketWorkflowState,
 };
 
 use crate::pod_list::{PodList, PodListEntry, StoredMetadataState};
@@ -182,7 +182,18 @@ impl OrchestratorPanelStatus {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum PanelRowKey {
     Ticket(String),
+    InvalidTicket(String),
+    TicketIntakePod { ticket_id: String, pod_name: String },
     Pod(String),
+}
+
+impl PanelRowKey {
+    pub(crate) fn pod_name(&self) -> Option<&str> {
+        match self {
+            Self::Pod(name) | Self::TicketIntakePod { pod_name: name, .. } => Some(name),
+            Self::Ticket(_) | Self::InvalidTicket(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,7 +202,9 @@ pub(crate) enum PanelRowKind {
     Ticket,
     Review,
     ActiveWork,
+    TicketIntakePod,
     Pod,
+    InvalidTicket,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -236,6 +249,30 @@ pub(crate) struct TicketPanelEntry {
     pub(crate) blocked_reason: Option<String>,
     pub(crate) related_pods: Vec<String>,
     pub(crate) local_claim: Option<TicketLocalClaimEntry>,
+    pub(crate) intake_pods: Vec<TicketAssociatedIntakeEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TicketAssociatedIntakeEntry {
+    pub(crate) ticket_id: String,
+    pub(crate) pod_name: String,
+    pub(crate) status: TicketLocalClaimStatus,
+    pub(crate) source: TicketAssociatedIntakeSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TicketAssociatedIntakeSource {
+    LocalClaim,
+    RelatedSession,
+}
+
+impl TicketAssociatedIntakeSource {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::LocalClaim => "local claim",
+            Self::RelatedSession => "related session",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,11 +316,27 @@ pub(crate) struct PanelRow {
 
 impl PanelRow {
     pub(crate) fn is_ticket_action(&self) -> bool {
-        !matches!(self.kind, PanelRowKind::Pod)
+        matches!(
+            self.kind,
+            PanelRowKind::Planning
+                | PanelRowKind::Ticket
+                | PanelRowKind::Review
+                | PanelRowKind::ActiveWork
+        )
+    }
+
+    pub(crate) fn is_ticket_section_row(&self) -> bool {
+        self.is_ticket_action()
+            || matches!(
+                self.kind,
+                PanelRowKind::TicketIntakePod | PanelRowKind::InvalidTicket
+            )
     }
 }
 
 const MAX_POD_NAME_CHARS: usize = 80;
+const MAX_ASSOCIATED_INTAKE_ROWS_PER_TICKET: usize = 3;
+const MAX_INVALID_TICKET_PLACEHOLDER_ROWS: usize = 5;
 const ORCHESTRATOR_SUFFIX: &str = "-orchestrator";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -543,7 +596,10 @@ fn build_workspace_panel_with_registry_model(
                     let backend = LocalTicketBackend::new(config.backend_root().to_path_buf())
                         .with_record_language(config.ticket_record_language());
                     match build_ticket_rows(&backend, pods, registry) {
-                        Ok(rows) => model.rows.extend(rows),
+                        Ok(ticket_rows) => {
+                            model.rows.extend(ticket_rows.rows);
+                            model.header.diagnostics.extend(ticket_rows.diagnostics);
+                        }
                         Err(error) => {
                             model
                                 .header
@@ -574,12 +630,6 @@ fn build_workspace_panel_with_registry_model(
     }
 
     model.rows.extend(pod_rows(pods));
-    model.rows.sort_by(|a, b| {
-        a.priority
-            .cmp(&b.priority)
-            .then_with(|| row_updated_at(b).cmp(row_updated_at(a)))
-            .then_with(|| a.title.cmp(&b.title))
-    });
     model
 }
 
@@ -623,26 +673,127 @@ fn ticket_summary_from_meta(meta: &TicketMeta) -> TicketSummary {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TicketRowsBuild {
+    rows: Vec<PanelRow>,
+    diagnostics: Vec<String>,
+}
+
 fn build_ticket_rows(
     backend: &LocalTicketBackend,
     pods: &PodList,
     registry: &PanelRegistrySnapshot,
-) -> ticket::Result<Vec<PanelRow>> {
-    let mut rows = Vec::new();
-    for summary in backend.list(TicketFilter::all())? {
+) -> ticket::Result<TicketRowsBuild> {
+    let partial = backend.list_partial(TicketFilter::all())?;
+    let mut ticket_rows = Vec::new();
+    let mut invalid_records = partial.invalid_records;
+    for summary in partial.tickets {
         if summary.workflow_state == TicketWorkflowState::Closed {
             continue;
         }
-        let ticket = backend.show(TicketIdOrSlug::Query(summary.id.clone()))?;
-        rows.push(ticket_row(
-            summary,
-            &ticket.events,
-            &ticket.relations.blockers,
-            pods,
-            registry,
-        ));
+        match backend.show_partial(TicketIdOrSlug::Query(summary.id.clone())) {
+            Ok(ticket) => {
+                let current_ticket_invalid = ticket
+                    .invalid_records
+                    .iter()
+                    .any(|record| record.label == summary.id);
+                invalid_records.extend(ticket.invalid_records);
+                if current_ticket_invalid {
+                    continue;
+                }
+                ticket_rows.push(ticket_row(
+                    summary,
+                    &ticket.ticket.events,
+                    &ticket.ticket.relations.blockers,
+                    pods,
+                    registry,
+                ));
+            }
+            Err(_) => invalid_records.push(TicketInvalidRecord {
+                label: summary.id,
+                reason: "could not load ticket detail".to_string(),
+            }),
+        }
     }
-    Ok(rows)
+    ticket_rows.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then_with(|| row_updated_at(b).cmp(row_updated_at(a)))
+            .then_with(|| a.title.cmp(&b.title))
+    });
+
+    let mut rows = Vec::new();
+    for row in ticket_rows {
+        let intake_rows = ticket_intake_pod_rows(&row);
+        rows.push(row);
+        rows.extend(intake_rows);
+    }
+
+    let invalid_records = dedupe_invalid_ticket_records(invalid_records);
+    let diagnostics = invalid_ticket_diagnostics(invalid_records.len());
+    rows.extend(invalid_ticket_rows(&invalid_records));
+
+    Ok(TicketRowsBuild { rows, diagnostics })
+}
+
+fn dedupe_invalid_ticket_records(records: Vec<TicketInvalidRecord>) -> Vec<TicketInvalidRecord> {
+    let mut deduped = Vec::new();
+    for record in records {
+        if deduped
+            .iter()
+            .any(|existing: &TicketInvalidRecord| existing.label == record.label)
+        {
+            continue;
+        }
+        deduped.push(record);
+    }
+    deduped
+}
+
+fn invalid_ticket_diagnostics(invalid_count: usize) -> Vec<String> {
+    if invalid_count == 0 {
+        return Vec::new();
+    }
+    let suffix = if invalid_count > MAX_INVALID_TICKET_PLACEHOLDER_ROWS {
+        format!(
+            "; showing first {} placeholder rows",
+            MAX_INVALID_TICKET_PLACEHOLDER_ROWS
+        )
+    } else {
+        String::new()
+    };
+    vec![bounded_panel_diagnostic(format!(
+        "Ticket records partially loaded: {invalid_count} invalid record(s) unavailable for actions{suffix}."
+    ))]
+}
+
+fn invalid_ticket_rows(records: &[TicketInvalidRecord]) -> Vec<PanelRow> {
+    records
+        .iter()
+        .take(MAX_INVALID_TICKET_PLACEHOLDER_ROWS)
+        .map(invalid_ticket_row)
+        .collect()
+}
+
+fn invalid_ticket_row(record: &TicketInvalidRecord) -> PanelRow {
+    PanelRow {
+        key: PanelRowKey::InvalidTicket(record.label.clone()),
+        kind: PanelRowKind::InvalidTicket,
+        title: format!("Invalid Ticket record: {}", record.label),
+        subtitle: Some(record.reason.clone()),
+        status: "invalid".to_string(),
+        priority: ActionPriority::Background,
+        next_action: None,
+        ticket: None,
+        related_pods: Vec::new(),
+        disabled_reason: Some(
+            "Invalid Ticket record is diagnostics-only; lifecycle actions are disabled."
+                .to_string(),
+        ),
+        key_hint: Some(
+            "Actions unavailable until the Ticket record is repaired manually.".to_string(),
+        ),
+    }
 }
 
 fn ticket_row(
@@ -653,7 +804,17 @@ fn ticket_row(
     registry: &PanelRegistrySnapshot,
 ) -> PanelRow {
     let local_claim = local_claim_for_ticket(&summary, pods, registry);
-    let related_pods = related_pods_for_ticket(&summary, pods, registry);
+    let intake_pods =
+        associated_intake_entries_for_ticket(&summary, pods, registry, local_claim.as_ref());
+    let mut related_pods = Vec::new();
+    if let Some(claim) = local_claim.as_ref() {
+        related_pods.push(claim.pod_name.clone());
+    }
+    for pod_name in intake_pods.iter().map(|intake| intake.pod_name.clone()) {
+        if !related_pods.iter().any(|existing| existing == &pod_name) {
+            related_pods.push(pod_name);
+        }
+    }
     let derived = derive_ticket_state(&summary, relation_blockers);
     let latest_event = events.last();
     let entry = TicketPanelEntry {
@@ -669,6 +830,7 @@ fn ticket_row(
         blocked_reason: derived.blocked_reason.clone(),
         related_pods: related_pods.clone(),
         local_claim,
+        intake_pods,
     };
     let subtitle = ticket_subtitle(&entry);
     PanelRow {
@@ -802,32 +964,111 @@ fn derive_ticket_state(
     }
 }
 
-fn related_pods_for_ticket(
+fn associated_intake_entries_for_ticket(
     summary: &TicketSummary,
     pods: &PodList,
     registry: &PanelRegistrySnapshot,
-) -> Vec<String> {
-    let id = lowercase(&summary.id);
-    let mut names = Vec::new();
-    if let Some(claim) = registry.claim_for_ticket(&summary.id) {
-        names.push(claim.pod_name.clone());
+    local_claim: Option<&TicketLocalClaimEntry>,
+) -> Vec<TicketAssociatedIntakeEntry> {
+    let mut entries = Vec::new();
+    if let Some(claim) = local_claim.filter(|claim| is_intake_role(&claim.role)) {
+        entries.push(TicketAssociatedIntakeEntry {
+            ticket_id: summary.id.clone(),
+            pod_name: claim.pod_name.clone(),
+            status: claim.status,
+            source: TicketAssociatedIntakeSource::LocalClaim,
+        });
     }
-    for pod in pods.entries.iter().filter_map(|pod| {
-        let name = lowercase(&pod.name);
-        if !id.is_empty() && name.contains(&id) {
-            Some(pod.name.clone())
-        } else {
-            None
+
+    let mut related_sessions = registry
+        .sessions
+        .iter()
+        .filter(|session| {
+            is_intake_role(&session.role)
+                && session
+                    .related_tickets
+                    .iter()
+                    .any(|related| related.id == summary.id.as_str())
+        })
+        .map(|session| session.pod_name.clone())
+        .collect::<Vec<_>>();
+    related_sessions.sort();
+    related_sessions.dedup();
+
+    for pod_name in related_sessions {
+        if entries.iter().any(|entry| entry.pod_name == pod_name) {
+            continue;
         }
-    }) {
-        if !names.iter().any(|existing| existing == &pod) {
-            names.push(pod);
-        }
-        if names.len() >= 5 {
+        entries.push(TicketAssociatedIntakeEntry {
+            ticket_id: summary.id.clone(),
+            status: local_claim_status_for_pod(&pod_name, pods),
+            pod_name,
+            source: TicketAssociatedIntakeSource::RelatedSession,
+        });
+        if entries.len() >= MAX_ASSOCIATED_INTAKE_ROWS_PER_TICKET {
             break;
         }
     }
-    names
+
+    entries.truncate(MAX_ASSOCIATED_INTAKE_ROWS_PER_TICKET);
+    entries
+}
+
+fn is_intake_role(role: &str) -> bool {
+    role.eq_ignore_ascii_case("intake")
+}
+
+fn ticket_intake_pod_rows(row: &PanelRow) -> Vec<PanelRow> {
+    row.ticket
+        .as_ref()
+        .map(|ticket| {
+            ticket
+                .intake_pods
+                .iter()
+                .map(ticket_intake_pod_row)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn ticket_intake_pod_row(intake: &TicketAssociatedIntakeEntry) -> PanelRow {
+    let stale = intake.status == TicketLocalClaimStatus::Stale;
+    PanelRow {
+        key: PanelRowKey::TicketIntakePod {
+            ticket_id: intake.ticket_id.clone(),
+            pod_name: intake.pod_name.clone(),
+        },
+        kind: PanelRowKind::TicketIntakePod,
+        title: format!("↳ Intake Pod: {}", intake.pod_name),
+        subtitle: Some(format!(
+            "Ticket {} · {} · {}",
+            intake.ticket_id,
+            intake.source.label(),
+            intake.status.label()
+        )),
+        status: intake.status.label().to_string(),
+        priority: ActionPriority::ActiveWork,
+        next_action: if stale {
+            None
+        } else {
+            Some(NextUserAction::OpenPod)
+        },
+        ticket: None,
+        related_pods: vec![intake.pod_name.clone()],
+        disabled_reason: if stale {
+            Some(
+                "Associated Intake Pod is stale; no live or restorable Pod entry is available."
+                    .to_string(),
+            )
+        } else {
+            None
+        },
+        key_hint: Some(if stale {
+            "Stale Intake claim/session; restore is unavailable".to_string()
+        } else {
+            "Open/attach this Ticket's Intake Pod".to_string()
+        }),
+    }
 }
 
 fn local_claim_for_ticket(
@@ -962,15 +1203,12 @@ fn excerpt(markdown: &str, max_chars: usize) -> Option<String> {
     }
 }
 
-fn lowercase(value: &str) -> String {
-    value.to_ascii_lowercase()
-}
-
 #[allow(dead_code)]
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pod_list::{LivePodInfo, PodEntrySummary};
+    use crate::role_session_registry::{PanelRegistryStore, RelatedTicketRef, RoleSessionOrigin};
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -1070,6 +1308,179 @@ mod tests {
         assert_eq!(row.next_action, Some(NextUserAction::Queue));
     }
 
+    #[test]
+    fn workspace_panel_keeps_valid_ticket_actions_with_invalid_records() {
+        let temp = TempDir::new().unwrap();
+        write_ticket_config(temp.path());
+        let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
+        let mut ready_input = NewTicket::new("Ready Still Queueable");
+        ready_input.workflow_state = Some(TicketWorkflowState::Ready);
+        let ready = backend.create(ready_input).unwrap();
+        backend
+            .create(NewTicket::new("Planning Still Clarifies"))
+            .unwrap();
+
+        for index in 0..6 {
+            let ticket = backend
+                .create(NewTicket::new(format!("Leaked Secret Invalid {index}")))
+                .unwrap();
+            fs::write(
+                temp.path()
+                    .join(".yoi/tickets")
+                    .join(&ticket.id)
+                    .join("item.md"),
+                format!(
+                    "---\ntitle: Leaked Secret Invalid {index}\nstate: super-secret-invalid-{index}\n---\nbody\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let registry = PanelRegistryStore::from_root(temp.path().join("registry"));
+        registry
+            .claim_ticket(&ready.id, None, "ready-intake", "intake")
+            .unwrap();
+        let model = build_workspace_panel_with_registry(
+            temp.path(),
+            &live_pods(&["ready-intake"]),
+            &registry.snapshot().unwrap(),
+        );
+
+        let ready_index = model
+            .rows
+            .iter()
+            .position(|row| row.title == "Ready Still Queueable")
+            .unwrap();
+        let ready_row = &model.rows[ready_index];
+        assert_eq!(ready_row.next_action, Some(NextUserAction::Queue));
+        assert!(ready_row.is_ticket_action());
+        assert_eq!(
+            model.rows[ready_index + 1].key,
+            PanelRowKey::TicketIntakePod {
+                ticket_id: ready.id.clone(),
+                pod_name: "ready-intake".to_string(),
+            }
+        );
+
+        let planning = model
+            .rows
+            .iter()
+            .find(|row| row.title == "Planning Still Clarifies")
+            .unwrap();
+        assert_eq!(planning.next_action, Some(NextUserAction::Clarify));
+        assert!(planning.is_ticket_action());
+
+        let invalid_rows = model
+            .rows
+            .iter()
+            .filter(|row| row.kind == PanelRowKind::InvalidTicket)
+            .collect::<Vec<_>>();
+        assert_eq!(invalid_rows.len(), MAX_INVALID_TICKET_PLACEHOLDER_ROWS);
+        for row in invalid_rows {
+            assert_eq!(row.status, "invalid");
+            assert!(row.ticket.is_none());
+            assert_eq!(row.next_action, None);
+            assert!(!row.is_ticket_action());
+            assert!(row.disabled_reason.as_deref().unwrap().contains("disabled"));
+        }
+
+        let diagnostics = model.header.diagnostics.join("\n");
+        assert!(diagnostics.contains("Ticket records partially loaded: 6 invalid record"));
+        assert!(diagnostics.contains("showing first 5"));
+        assert!(!diagnostics.contains("super-secret-invalid"));
+        assert!(
+            !model
+                .rows
+                .iter()
+                .any(|row| row.title.contains("Leaked Secret Invalid"))
+        );
+    }
+
+    #[test]
+    fn workspace_panel_disables_current_ticket_when_detail_artifact_is_invalid() {
+        let temp = TempDir::new().unwrap();
+        write_ticket_config(temp.path());
+        let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
+        let mut corrupt_input = NewTicket::new("Ready With Corrupt Relations");
+        corrupt_input.workflow_state = Some(TicketWorkflowState::Ready);
+        let corrupt = backend.create(corrupt_input).unwrap();
+        let mut other_input = NewTicket::new("Other Ready Still Queueable");
+        other_input.workflow_state = Some(TicketWorkflowState::Ready);
+        let other = backend.create(other_input).unwrap();
+
+        let artifacts = temp
+            .path()
+            .join(".yoi/tickets")
+            .join(&corrupt.id)
+            .join("artifacts");
+        fs::create_dir_all(&artifacts).unwrap();
+        fs::write(artifacts.join("relations.json"), "{").unwrap();
+
+        let model = build_workspace_panel(temp.path(), &empty_pods());
+
+        let corrupt_placeholders = model
+            .rows
+            .iter()
+            .filter(|row| row.key == PanelRowKey::InvalidTicket(corrupt.id.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(corrupt_placeholders.len(), 1);
+        let corrupt_placeholder = corrupt_placeholders[0];
+        assert_eq!(corrupt_placeholder.kind, PanelRowKind::InvalidTicket);
+        assert_eq!(corrupt_placeholder.next_action, None);
+        assert!(corrupt_placeholder.ticket.is_none());
+        assert!(!corrupt_placeholder.is_ticket_action());
+
+        assert!(
+            !model
+                .rows
+                .iter()
+                .any(|row| row.key == PanelRowKey::Ticket(corrupt.id.clone()))
+        );
+
+        let other_row = model
+            .rows
+            .iter()
+            .find(|row| row.key == PanelRowKey::Ticket(other.id.clone()))
+            .unwrap();
+        assert_eq!(other_row.next_action, Some(NextUserAction::Queue));
+        assert!(other_row.is_ticket_action());
+
+        let diagnostics = model.header.diagnostics.join("\n");
+        assert!(diagnostics.contains("Ticket records partially loaded: 1 invalid record"));
+    }
+
+    #[test]
+    fn workspace_panel_keeps_backend_config_unusable_as_whole_ticket_degradation() {
+        let temp = TempDir::new().unwrap();
+        let config_dir = temp.path().join(".yoi");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("ticket.config.toml"),
+            "[backend]\nprovider = \"unknown:provider\"\nroot = \".yoi/tickets\"\n",
+        )
+        .unwrap();
+
+        let model = build_workspace_panel(temp.path(), &live_pods(&["idle"]));
+
+        let diagnostics = model.header.diagnostics.join("\n");
+        assert!(diagnostics.contains("Ticket config is unusable"));
+        assert!(
+            model
+                .rows
+                .iter()
+                .all(|row| row.kind != PanelRowKind::InvalidTicket)
+        );
+        assert_eq!(
+            model.composer.available_targets,
+            vec![ComposerTarget::Companion]
+        );
+        assert!(
+            model
+                .rows
+                .iter()
+                .any(|row| row.key == PanelRowKey::Pod("idle".to_string()))
+        );
+    }
     #[test]
     fn workspace_panel_does_not_infer_workflow_state_from_readiness_or_title() {
         let temp = TempDir::new().unwrap();
@@ -1194,6 +1605,97 @@ mod tests {
         assert!(backlog.is_ticket_action());
         assert_eq!(done.status, "done");
         assert_eq!(done.next_action, Some(NextUserAction::Close));
+    }
+
+    #[test]
+    fn workspace_panel_shows_ticket_associated_intake_pods_adjacent_to_ticket() {
+        let temp = TempDir::new().unwrap();
+        write_ticket_config(temp.path());
+        let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
+        create_ticket(&backend, "Ticket With Intake", |input| {
+            input.workflow_state = Some(TicketWorkflowState::Ready);
+        });
+        let ticket_id = backend
+            .list(TicketFilter::all())
+            .unwrap()
+            .into_iter()
+            .find(|ticket| ticket.title == "Ticket With Intake")
+            .unwrap()
+            .id;
+        let preticket_pod = format!("pre-{ticket_id}-intake");
+        let registry = PanelRegistryStore::from_root(temp.path().join("registry"));
+        registry
+            .claim_ticket(&ticket_id, None, "claimed-intake", "intake")
+            .unwrap();
+        registry
+            .record_session(
+                "shared-intake",
+                "intake",
+                RoleSessionOrigin::RoleLaunch,
+                None,
+                [RelatedTicketRef {
+                    id: ticket_id.clone(),
+                    slug: None,
+                }],
+            )
+            .unwrap();
+        registry
+            .record_session(
+                &preticket_pod,
+                "intake",
+                RoleSessionOrigin::PreTicketIntake,
+                None,
+                [],
+            )
+            .unwrap();
+
+        let pods = live_pods(&["claimed-intake", "shared-intake", &preticket_pod]);
+        let model =
+            build_workspace_panel_with_registry(temp.path(), &pods, &registry.snapshot().unwrap());
+
+        let ticket_index = model
+            .rows
+            .iter()
+            .position(|row| row.key == PanelRowKey::Ticket(ticket_id.clone()))
+            .unwrap();
+        let ticket_row = &model.rows[ticket_index];
+        let ticket = ticket_row.ticket.as_ref().unwrap();
+        assert_eq!(
+            ticket
+                .intake_pods
+                .iter()
+                .map(|entry| entry.pod_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["claimed-intake", "shared-intake"]
+        );
+        assert_eq!(ticket.related_pods, vec!["claimed-intake", "shared-intake"]);
+        assert_eq!(
+            model.rows[ticket_index + 1].key,
+            PanelRowKey::TicketIntakePod {
+                ticket_id: ticket_id.clone(),
+                pod_name: "claimed-intake".to_string(),
+            }
+        );
+        assert_eq!(
+            model.rows[ticket_index + 1].kind,
+            PanelRowKind::TicketIntakePod
+        );
+        assert_eq!(model.rows[ticket_index + 1].status, "live");
+        assert_eq!(
+            model.rows[ticket_index + 1].next_action,
+            Some(NextUserAction::OpenPod)
+        );
+        assert_eq!(
+            model.rows[ticket_index + 2].key,
+            PanelRowKey::TicketIntakePod {
+                ticket_id: ticket_id.clone(),
+                pod_name: "shared-intake".to_string(),
+            }
+        );
+        assert!(model.rows.iter().all(|row| {
+            row.kind != PanelRowKind::TicketIntakePod
+                || row.key.pod_name() != Some(preticket_pod.as_str())
+        }));
     }
 
     #[test]

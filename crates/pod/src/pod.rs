@@ -26,6 +26,7 @@ use manifest::{
     ScopeError, ScopeRule, SharedScope, WorkerManifest,
 };
 
+use crate::active_workflow::{self, ActiveWorkflowStore};
 use crate::compact::state::CompactState;
 use crate::compact::usage_tracker::UsageTracker;
 use crate::feature::builtin::TaskFeature;
@@ -145,6 +146,7 @@ struct EmptyTurnRollbackSnapshot {
     usage_history_len: usize,
     ai_activity_count: usize,
     last_run_interrupted: bool,
+    active_workflows: active_workflow::ActiveWorkflowSnapshot,
 }
 
 fn is_ai_materialized_item(item: &Item) -> bool {
@@ -196,20 +198,23 @@ where
 /// interceptor commit `SystemItem`s without being generic over the
 /// concrete `Store` type.
 pub trait SystemItemCommitter: Send + Sync {
-    fn commit_system_item(&self, item: SystemItem);
+    fn commit_log_entry(&self, entry: LogEntry);
+
+    fn commit_system_item(&self, item: SystemItem) {
+        self.commit_log_entry(LogEntry::SystemItem {
+            ts: segment_log::now_millis(),
+            item,
+        });
+    }
 }
 
 impl<St> SystemItemCommitter for LogWriterHandle<St>
 where
     St: Store + Clone + Send + Sync + 'static,
 {
-    fn commit_system_item(&self, item: SystemItem) {
-        let entry = LogEntry::SystemItem {
-            ts: segment_log::now_millis(),
-            item,
-        };
+    fn commit_log_entry(&self, entry: LogEntry) {
         if let Err(err) = self.append_entry(entry) {
-            warn!(error = %err, "system item commit failed; dropping");
+            warn!(error = %err, "session log entry commit failed; dropping");
         }
     }
 }
@@ -274,6 +279,10 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// the narrow snapshot/restore surface Pod needs for compaction and rewind.
     /// Store/reminder ownership stays inside the Task feature module.
     task_feature: TaskFeature,
+    /// Durable state for workflow invocations that are active for the current task.
+    /// The store is persisted as typed session-log extensions and rehydrated into
+    /// prompt context during compaction.
+    active_workflows: ActiveWorkflowStore,
     /// Parsed system-prompt template awaiting first-turn materialisation.
     /// `Some` until `ensure_system_prompt_materialized` renders it once,
     /// then `None` forever — including after compaction.
@@ -435,6 +444,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
             usage_history: self.usage_history.clone(),
             tracker: None,
             task_feature: self.task_feature.clone(),
+            active_workflows: self.active_workflows.clone(),
             system_prompt_template: None,
             alerter: self.alerter.clone(),
             event_tx: self.event_tx.clone(),
@@ -618,6 +628,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             usage_history: Arc::new(Mutex::new(Vec::<UsageRecord>::new())),
             tracker: None,
             task_feature: TaskFeature::new(),
+            active_workflows: ActiveWorkflowStore::new(),
             system_prompt_template: None,
             alerter: None,
             event_tx: None,
@@ -813,7 +824,16 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         registry: FeatureRegistryBuilder,
     ) -> FeatureRegistryInstallReport {
         let worker = self.worker.as_mut().expect("worker taken during run");
-        registry.install_into_worker(worker, &mut self.hook_builder)
+        let report = registry.install_into_worker(worker, &mut self.hook_builder);
+        let active_workflow_committer = self.log_writer.clone().map(|writer| {
+            Arc::new(move |entry| writer.commit_log_entry(entry))
+                as active_workflow::LogEntryCommitter
+        });
+        worker.register_tools(active_workflow::active_workflow_tools(
+            self.active_workflows.clone(),
+            active_workflow_committer,
+        ));
+        report
     }
 
     /// Reference to the store.
@@ -876,7 +896,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.sink.truncate_silent(truncate_entries);
 
         self.task_feature.restore_from_history(&state.history);
-        self.worker_mut().set_history(state.history);
+        self.active_workflows
+            .restore_from_history_and_extensions(&state.history, &state.extensions);
+        let mut history = state.history;
+        active_workflow::strip_rehydration_messages(&mut history);
+        self.worker_mut().set_history(history);
         self.worker_mut().set_request_config(state.config);
         self.worker_mut().set_turn_count(state.turn_count);
         self.worker_mut()
@@ -1242,6 +1266,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 self.pending_attachments.clone(),
                 self.prompts.clone(),
                 self.log_writer.clone(),
+                self.active_workflows.clone(),
             )
             .with_usage_tracker(self.usage_tracker.clone());
             self.worker_mut().set_interceptor(interceptor);
@@ -1428,6 +1453,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             usage_history_len,
             ai_activity_count: self.ai_activity_counter.load(Ordering::SeqCst),
             last_run_interrupted: self.worker().last_run_interrupted(),
+            active_workflows: self.active_workflows.snapshot(),
         }
     }
 
@@ -1465,6 +1491,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .truncate(snapshot.usage_history_len);
         let _ = self.usage_tracker.drain();
         let _ = self.metrics_tracker.drain();
+        self.active_workflows
+            .replace_with(snapshot.active_workflows);
 
         let loc = self.segment_state.location();
         self.store
@@ -1535,14 +1563,20 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let mut attachments = self.resolve_file_refs(&input);
         attachments.extend(self.resolve_knowledge_refs(&input));
         attachments.extend(self.resolve_workflow_invocations(&input)?);
+        let flattened = self.flatten_segments(&input);
+        if self.active_workflows.activate_from_system_items(
+            &attachments,
+            flattened.clone(),
+            segment_log::now_millis(),
+        ) {
+            self.commit_entry(self.active_workflows.extension_entry())?;
+        }
         if !attachments.is_empty() {
             *self
                 .pending_attachments
                 .lock()
                 .expect("pending_attachments poisoned") = attachments;
         }
-
-        let flattened = self.flatten_segments(&input);
 
         let history_before = self.worker.as_ref().unwrap().history().len();
 
@@ -2368,8 +2402,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let worker = self.worker.as_ref().expect("worker taken during run");
         let history = worker.history();
         let retain_from = cut.index.min(history.len());
-        let retained_items = history[retain_from..].to_vec();
-        let items_to_summarise = history[..retain_from].to_vec();
+        let mut retained_items = history[retain_from..].to_vec();
+        let mut items_to_summarise = history[..retain_from].to_vec();
+        active_workflow::strip_rehydration_messages(&mut retained_items);
+        active_workflow::strip_rehydration_messages(&mut items_to_summarise);
 
         // Compaction-related knobs. Fall through to manifest defaults when
         // `[compaction]` is omitted entirely.
@@ -2428,13 +2464,15 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .unwrap_or_default();
 
         // Input text fed to the compact worker. Includes the default
-        // references, current TaskStore snapshot, and the (pruned)
-        // conversation text.
+        // references, current TaskStore snapshot, active workflow invocation
+        // state, and the (pruned) conversation text.
         let task_snapshot_text = self.task_feature.snapshot_text();
+        let active_workflow_snapshot_text = self.active_workflows.snapshot_text();
         let summary_input = build_summary_input(
             &items_to_summarise,
             &default_refs,
             Some(task_snapshot_text.as_str()),
+            active_workflow_snapshot_text.as_deref(),
             SummaryInputOptions {
                 overview_target_tokens,
                 overview_warning_tokens,
@@ -2610,6 +2648,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .count();
 
         // Build new history: [summary, ...auto-read, references, ...retained, task snapshot, TaskList synthetic call/result].
+        // Active workflow guidance is intentionally not persisted as an ordinary
+        // compacted-history system message. It is regenerated request-locally
+        // from typed `pod.active_workflows` extension state so completed,
+        // cancelled, corrupt, or missing state cannot leak stale obligations.
         // The TaskStore snapshot trails the retained items so that, on resume,
         // `replay_history` walks any pre-compact Task* calls preserved verbatim
         // in retained_items first and the trailing snapshot's `replace_with`
@@ -2680,18 +2722,23 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 at_turn_index: source_turn_count,
             }),
         };
+        let active_workflow_extension = self.active_workflows.extension_entry();
+        let initial_entries = vec![entry.clone(), active_workflow_extension.clone()];
         self.store
-            .create_segment(old_loc.session_id, new_segment_id, &[entry.clone()])?;
+            .create_segment(old_loc.session_id, new_segment_id, &initial_entries)?;
         self.segment_state.set_location(SegmentLocation {
             session_id: old_loc.session_id,
             segment_id: new_segment_id,
         });
-        self.segment_state.set_entries_written(1);
+        self.segment_state
+            .set_entries_written(initial_entries.len());
         let session_start = entry;
         // Broadcast the SegmentStart through the sink. This atomically
-        // resets the mirror to `[SegmentStart]` so any subscriber
-        // querying after this point sees the post-compaction prefix.
-        self.sink.reset_with_initial(session_start);
+        // resets the mirror to the replacement segment prefix so any subscriber
+        // querying after this point sees the post-compaction prefix, including
+        // durable extension state.
+        self.sink
+            .reset_with_initial_entries(vec![session_start, active_workflow_extension]);
         // Keep pods.json pointing at the live segment_id. Without this
         // a concurrent `restore_from_manifest(new_segment_id)` would
         // see no live writer and grab the session this Pod just moved
@@ -3794,6 +3841,7 @@ where
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
             task_feature: TaskFeature::new(),
+            active_workflows: ActiveWorkflowStore::new(),
             system_prompt_template: common.system_prompt_template,
             alerter: None,
             event_tx: None,
@@ -3902,6 +3950,7 @@ where
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
             task_feature: TaskFeature::new(),
+            active_workflows: ActiveWorkflowStore::new(),
             system_prompt_template: common.system_prompt_template,
             alerter: None,
             event_tx: None,
@@ -4101,7 +4150,9 @@ where
                 ..
             })
         );
-        worker.set_history(state.history.clone());
+        let mut restored_history = state.history.clone();
+        active_workflow::strip_rehydration_messages(&mut restored_history);
+        worker.set_history(restored_history);
         worker.set_request_config(state.config.clone());
         worker.set_turn_count(state.turn_count);
         worker.set_last_run_interrupted(state.last_run_interrupted);
@@ -4111,6 +4162,8 @@ where
 
         let extract_pointer = memory::extract::fold_pointer(&state.extensions);
         let task_feature = TaskFeature::from_history(&state.history);
+        let active_workflows = ActiveWorkflowStore::new();
+        active_workflows.restore_from_history_and_extensions(&state.history, &state.extensions);
         let pod_metadata_writer = Some(pod_metadata_writer_for_store(&store));
 
         let mut pod = Self {
@@ -4131,6 +4184,7 @@ where
             usage_history: Arc::new(Mutex::new(state.usage_history)),
             tracker: None,
             task_feature,
+            active_workflows,
             // Restore replays the saved system_prompt verbatim — no
             // template re-render on resume.
             system_prompt_template: None,
@@ -4335,12 +4389,13 @@ struct SummaryInputBuild {
 }
 
 /// Build the compact worker's input: default-reference instructions,
-/// the list of recently-touched files, task snapshot, and a bounded overview
-/// rather than a prefix-wide transcript.
+/// the list of recently-touched files, task snapshot, active workflow snapshot,
+/// and a bounded overview rather than a prefix-wide transcript.
 fn build_summary_input(
     items: &[Item],
     default_refs: &[PathBuf],
     task_snapshot: Option<&str>,
+    active_workflow_snapshot: Option<&str>,
     options: SummaryInputOptions,
 ) -> SummaryInputBuild {
     let overview = build_summary_overview(
@@ -4390,6 +4445,17 @@ fn build_summary_input(
              from the compact worker.\n",
         );
         out.push_str(task_snapshot);
+        out.push_str("\n\n");
+    }
+    if let Some(active_workflow_snapshot) = active_workflow_snapshot {
+        out.push_str(
+            "## Active Workflow Invocation State\n\
+             This is durable typed workflow state for workflow-governed tasks. Preserve active \
+             slugs, invocation scope, status, obligations/checkpoints, and the snapshotted \
+             workflow guidance in the summary; do not substitute advertised/latest workflow \
+             resources for this invocation state.\n",
+        );
+        out.push_str(active_workflow_snapshot);
         out.push_str("\n\n");
     }
     out.push_str("## Conversation overview/index\n");
@@ -5278,6 +5344,7 @@ mod build_summary_prompt_tests {
             items,
             &[],
             None,
+            None,
             SummaryInputOptions {
                 overview_target_tokens: 512,
                 overview_warning_tokens: 1024,
@@ -5327,11 +5394,33 @@ mod build_summary_prompt_tests {
     }
 
     #[test]
+    fn includes_active_workflow_snapshot_section() {
+        let prompt = build_summary_input(
+            &[Item::user_message("continue after review")],
+            &[],
+            None,
+            Some("ActiveWorkflowStore: 1 active workflow\n- review before merge\n- close ticket"),
+            SummaryInputOptions {
+                overview_target_tokens: 512,
+                overview_warning_tokens: 1024,
+                overview_deadline_tokens: 2048,
+                summary_target_tokens: 256,
+            },
+        )
+        .text;
+
+        assert!(prompt.contains("## Active Workflow Invocation State"));
+        assert!(prompt.contains("review before merge"));
+        assert!(prompt.contains("close ticket"));
+    }
+
+    #[test]
     fn overview_warning_does_not_drop_input() {
         let items = vec![Item::user_message("x".repeat(4_000))];
         let built = build_summary_input(
             &items,
             &[],
+            None,
             None,
             SummaryInputOptions {
                 overview_target_tokens: 10,
@@ -5351,6 +5440,7 @@ mod build_summary_prompt_tests {
         let built = build_summary_input(
             &items,
             &[],
+            None,
             None,
             SummaryInputOptions {
                 overview_target_tokens: 10,

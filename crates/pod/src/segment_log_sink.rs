@@ -147,6 +147,24 @@ impl SegmentLogSink {
         let _ = self.inner.broadcast_tx.send(initial);
     }
 
+    /// Atomically swap the mirror to the supplied replacement-session prefix
+    /// and broadcast the first entry as the live rotation signal. Entries after
+    /// the first are already reflected in reconnect snapshots but are not
+    /// broadcast live; this is intended for non-live extension state that must
+    /// share the new segment prefix with SegmentStart.
+    pub fn reset_with_initial_entries(&self, entries: Vec<LogEntry>) {
+        let first = entries.first().cloned();
+        let mut mirror = self
+            .inner
+            .mirror
+            .lock()
+            .expect("session log mirror mutex poisoned");
+        *mirror = entries;
+        if let Some(initial) = first {
+            let _ = self.inner.broadcast_tx.send(initial);
+        }
+    }
+
     /// Replace the mirror with the supplied prefix without broadcasting.
     ///
     /// Used by restore paths that load a session's complete log into

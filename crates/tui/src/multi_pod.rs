@@ -48,11 +48,11 @@ use crate::workspace_panel::{
     ActionPriority, CompanionLifecyclePlan, CompanionPanelState, CompanionPanelStatus,
     CompanionPodPresence, ComposerTarget, NextUserAction, OrchestratorLifecyclePlan,
     OrchestratorPanelState, OrchestratorPanelStatus, OrchestratorPodPresence, PanelRow,
-    PanelRowKey, TicketConfigAvailability, TicketLocalClaimStatus, WorkspacePanelViewModel,
-    bounded_panel_diagnostic, build_current_ticket_row, build_workspace_panel,
-    companion_pod_presence, decide_companion_lifecycle, decide_orchestrator_lifecycle,
-    local_claim_status_for_pod, orchestrator_pod_presence, ticket_config_availability,
-    workspace_companion_pod_name, workspace_orchestrator_pod_name,
+    PanelRowKey, PanelRowKind, TicketConfigAvailability, TicketLocalClaimStatus,
+    WorkspacePanelViewModel, bounded_panel_diagnostic, build_current_ticket_row,
+    build_workspace_panel, companion_pod_presence, decide_companion_lifecycle,
+    decide_orchestrator_lifecycle, local_claim_status_for_pod, orchestrator_pod_presence,
+    ticket_config_availability, workspace_companion_pod_name, workspace_orchestrator_pod_name,
 };
 
 const MAX_ENTRIES: usize = 50;
@@ -958,6 +958,17 @@ fn panel_e2e_row_key(key: &PanelRowKey) -> PanelE2eRowKey {
             kind: "ticket",
             id: id.clone(),
         },
+        PanelRowKey::InvalidTicket(label) => PanelE2eRowKey {
+            kind: "invalid_ticket",
+            id: label.clone(),
+        },
+        PanelRowKey::TicketIntakePod {
+            ticket_id,
+            pod_name,
+        } => PanelE2eRowKey {
+            kind: "ticket_intake_pod",
+            id: format!("{ticket_id}:{pod_name}"),
+        },
         PanelRowKey::Pod(name) => PanelE2eRowKey {
             kind: "pod",
             id: name.clone(),
@@ -1207,12 +1218,8 @@ impl MultiPodApp {
     }
 
     fn selected_pod_entry(&self) -> Option<&PodListEntry> {
-        match self.selected_row.as_ref() {
-            Some(PanelRowKey::Pod(name)) => {
-                self.list.entries.iter().find(|entry| &entry.name == name)
-            }
-            _ => None,
-        }
+        let name = self.selected_row.as_ref().and_then(PanelRowKey::pod_name)?;
+        self.list.entries.iter().find(|entry| entry.name == name)
     }
 
     #[cfg(test)]
@@ -1238,11 +1245,14 @@ impl MultiPodApp {
                     }),
             );
         }
-        let entry = self.selected_pod_entry()?;
-        if entry.actions.can_open {
-            return None;
+        if let Some(entry) = self.selected_pod_entry() {
+            if entry.actions.can_open {
+                return None;
+            }
+            return Some(open_disabled_reason(entry));
         }
-        Some(open_disabled_reason(entry))
+        self.selected_panel_row()
+            .and_then(|row| row.disabled_reason.clone().or_else(|| row.key_hint.clone()))
     }
 
     pub(crate) fn select_next(&mut self) {
@@ -1353,7 +1363,12 @@ impl MultiPodApp {
                     ),
                     None => match &hit.key {
                         PanelRowKey::Pod(name) => (name.clone(), None, None),
-                        PanelRowKey::Ticket(id) => (id.clone(), None, None),
+                        PanelRowKey::Ticket(id) | PanelRowKey::InvalidTicket(id) => {
+                            (id.clone(), None, None)
+                        }
+                        PanelRowKey::TicketIntakePod { pod_name, .. } => {
+                            (pod_name.clone(), None, None)
+                        }
                     },
                 };
                 PanelE2eRenderedRow {
@@ -1406,7 +1421,9 @@ impl MultiPodApp {
                 }
                 if let Some(key) = visible.iter().find(|key| match key {
                     PanelRowKey::Pod(name) => Some(name.as_str()) != orchestrator_pod_name,
-                    PanelRowKey::Ticket(_) => true,
+                    PanelRowKey::Ticket(_)
+                    | PanelRowKey::InvalidTicket(_)
+                    | PanelRowKey::TicketIntakePod { .. } => true,
                 }) {
                     self.select_panel_key(key.clone());
                     return;
@@ -4677,6 +4694,18 @@ fn selected_ticket_notice(row: Option<&PanelRow>) -> String {
                 row.title
             )
         }
+        Some(row) if row.kind == PanelRowKind::TicketIntakePod => row
+            .disabled_reason
+            .clone()
+            .or_else(|| row.key_hint.clone())
+            .unwrap_or_else(|| {
+                "Open/attach this Ticket's Intake Pod from the associated row.".to_string()
+            }),
+        Some(row) if row.kind == PanelRowKind::InvalidTicket => row
+            .disabled_reason
+            .clone()
+            .or_else(|| row.key_hint.clone())
+            .unwrap_or_else(|| "Invalid Ticket record placeholder has no actions.".to_string()),
         _ => "No Pod is selected.".to_string(),
     }
 }
@@ -4793,7 +4822,7 @@ fn visible_panel_keys(panel: &WorkspacePanelViewModel, list: &PodList) -> Vec<Pa
     let mut keys = panel
         .rows
         .iter()
-        .filter(|row| row.is_ticket_action())
+        .filter(|row| row.is_ticket_section_row())
         .map(|row| row.key.clone())
         .collect::<Vec<_>>();
     keys.extend(
@@ -5145,7 +5174,7 @@ fn panel_action_rows(
     let rows = panel
         .rows
         .iter()
-        .filter(|row| row.is_ticket_action())
+        .filter(|row| row.is_ticket_section_row())
         .collect::<Vec<_>>();
     if rows.is_empty() {
         return Vec::new();
@@ -5181,11 +5210,15 @@ fn panel_action_header_line(total: usize, width: u16) -> Line<'static> {
 const TICKET_STATE_COLUMN_WIDTH: usize = 10;
 const POD_STATUS_COLUMN_WIDTH: usize = 18;
 
-fn panel_row_lines(row: &PanelRow, selected: bool, width: u16) -> [Line<'static>; 2] {
-    [
-        panel_row_title_line(row, selected, width),
-        panel_row_detail_line(row, selected, width),
-    ]
+fn panel_row_lines(row: &PanelRow, selected: bool, width: u16) -> Vec<Line<'static>> {
+    if row.kind == PanelRowKind::TicketIntakePod {
+        vec![panel_row_title_line(row, selected, width)]
+    } else {
+        vec![
+            panel_row_title_line(row, selected, width),
+            panel_row_detail_line(row, selected, width),
+        ]
+    }
 }
 
 fn panel_row_title_line(row: &PanelRow, selected: bool, width: u16) -> Line<'static> {
@@ -5242,6 +5275,29 @@ fn push_ticket_marker_span(spans: &mut Vec<Span<'static>>, selected: bool, remai
 }
 
 fn panel_ticket_detail(row: &PanelRow) -> String {
+    if row.kind == PanelRowKind::InvalidTicket {
+        let mut parts = vec![panel_ticket_reference(row), "Gate: unavailable".to_string()];
+        if let Some(reason) = panel_ticket_reason(row) {
+            parts.push(format!("Reason: {reason}"));
+        }
+        return parts.join(" · ");
+    }
+
+    if row.kind == PanelRowKind::TicketIntakePod {
+        let mut parts = row
+            .subtitle
+            .as_ref()
+            .map(|subtitle| vec![subtitle.clone()])
+            .unwrap_or_else(|| vec![panel_ticket_reference(row)]);
+        if let Some(action) = row.next_action {
+            parts.push(format!("Action: {}", action.label()));
+        }
+        if let Some(reason) = panel_ticket_reason(row) {
+            parts.push(format!("Reason: {reason}"));
+        }
+        return parts.join(" · ");
+    }
+
     let mut parts = vec![panel_ticket_reference(row)];
     if let Some(blocked_reason) = row
         .ticket
@@ -5285,6 +5341,9 @@ fn panel_ticket_reason(row: &PanelRow) -> Option<&str> {
 }
 
 fn ticket_detail_style(row: &PanelRow) -> Style {
+    if row.kind == PanelRowKind::InvalidTicket {
+        return Style::default().fg(Color::Yellow);
+    }
     if row
         .ticket
         .as_ref()
@@ -5302,7 +5361,8 @@ fn panel_ticket_reference(row: &PanelRow) -> String {
         .as_ref()
         .map(|ticket| ticket.id.clone())
         .unwrap_or_else(|| match &row.key {
-            PanelRowKey::Ticket(id) => id.clone(),
+            PanelRowKey::Ticket(id) | PanelRowKey::InvalidTicket(id) => id.clone(),
+            PanelRowKey::TicketIntakePod { ticket_id, .. } => ticket_id.clone(),
             PanelRowKey::Pod(name) => name.clone(),
         })
 }
@@ -7321,7 +7381,8 @@ branch = "orchestration/custom-panel"
             "inprogress",
         );
 
-        let [title, detail] = panel_row_lines(&row, true, 160);
+        let lines = panel_row_lines(&row, true, 160);
+        let (title, detail) = (&lines[0], &lines[1]);
         let title_line = plain_line(&title);
         let detail_line = plain_line(&detail);
         let state_start = 2;
@@ -7352,7 +7413,8 @@ branch = "orchestration/custom-panel"
             "ready",
         );
 
-        let [title, detail] = panel_row_lines(&row, false, 160);
+        let lines = panel_row_lines(&row, false, 160);
+        let (title, detail) = (&lines[0], &lines[1]);
         let title_line = plain_line(&title);
         let detail_line = plain_line(&detail);
         let state_start = 2;
@@ -7377,7 +7439,8 @@ branch = "orchestration/custom-panel"
             "ready",
         );
 
-        let [title, detail] = panel_row_lines(&row, false, 42);
+        let lines = panel_row_lines(&row, false, 42);
+        let (title, detail) = (&lines[0], &lines[1]);
         let title_line = plain_line(&title);
         let detail_line = plain_line(&detail);
         let title_start = 2 + TICKET_STATE_COLUMN_WIDTH + 1;
@@ -7402,7 +7465,8 @@ branch = "orchestration/custom-panel"
         row.disabled_reason = Some("Queue disabled: waiting for BLOCKER-1".to_string());
         row.ticket.as_mut().unwrap().blocked_reason = Some("BLOCKER-1 via depends_on".to_string());
 
-        let [_title, detail] = panel_row_lines(&row, true, 160);
+        let lines = panel_row_lines(&row, true, 160);
+        let detail = &lines[1];
         let detail_line = plain_line(&detail);
 
         assert!(detail_line.contains("Gate: waiting for BLOCKER-1 via depends_on"));
@@ -8602,6 +8666,7 @@ branch = "orchestration/custom-panel"
             blocked_reason: None,
             related_pods: Vec::new(),
             local_claim: None,
+            intake_pods: Vec::new(),
         };
         PanelRow {
             key: PanelRowKey::Ticket(ticket.id.clone()),

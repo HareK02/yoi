@@ -145,3 +145,273 @@ Critical risks / reviewer focus:
 Routing decision と accepted implementation plan を記録済み。blocking relation / orchestration-plan blocker はなく、Orchestrator workspace は clean。implementation side effects の前に `queued -> inprogress` acceptance を記録する。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KTFY8V80 at: 2026-06-14T15:50:38Z -->
+
+## Implementation report
+
+Implementation report from Coder Pod `yoi-coder-00001KTFY8V80`:
+
+Commit:
+- `362fedfb fix: preserve active workflows across compaction`
+
+Changed files:
+- `crates/pod/src/active_workflow.rs`
+- `crates/pod/src/lib.rs`
+- `crates/pod/src/pod.rs`
+- `crates/pod/src/segment_log_sink.rs`
+- `resources/prompts/internal/compact_system.md`
+
+Implemented behavior:
+- Added durable typed active workflow state as session-log extension domain `pod.active_workflows`.
+- State records include:
+  - workflow slug
+  - invocation source/time
+  - task scope
+  - active/completed/cancelled status
+  - snapshotted workflow guidance
+  - extracted obligations/checkpoints
+  - completion/cancellation reason/time
+- Workflow bodies are snapshotted at invocation time rather than resolved to latest resource/builtin version during rehydration. Rationale: active workflow authority remains traceable to the original governed task and does not silently change when resource files change later.
+- Compaction now:
+  - feeds active workflow state into compact worker input
+  - writes active workflow state into the replacement segment as typed extension state
+  - injects post-compaction workflow guidance into `SegmentStart.history` from durable state, not transient turn-local data
+- Added `ActiveWorkflowList`, `ActiveWorkflowComplete`, and `ActiveWorkflowCancel` tools so active workflow state can be inspected, completed, or explicitly cancelled.
+- Missing/corrupt/unsupported active workflow extension state fails closed with bounded diagnostics rather than reusing stale prior state.
+
+Validation reported by coder:
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check`
+- Passed: `cargo test -p pod active_workflow --lib`
+  - includes focused coverage for review/merge/close-style obligations crossing compaction/rehydration
+- Passed: `cargo test -p pod includes_active_workflow_snapshot_section --lib`
+- Ran: `cargo test -p pod --lib`
+  - Failed on 2 prompt text assertions reported as unrelated/pre-existing:
+    - `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`
+    - `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`
+    - both assert the unrelated string `worktree status, diff, and test results`
+
+Repository status:
+- Child implementation worktree clean after commit.
+
+Residual risks / notes:
+- Active workflow obligation extraction is intentionally conservative: it stores full snapshotted guidance as authority and derives bounded checkpoint labels from obligation-like lines.
+- Completion/cancellation tool calls persist through normal history; compaction additionally writes updated typed snapshot into the compacted segment.
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KTFY8V80 at: 2026-06-14T15:58:49Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+Evidence checked:
+- Child worktree/branch/head:
+  - `/home/hare/Projects/yoi/.worktree/00001KTFY8V80-active-workflows-compaction`
+  - `impl/00001KTFY8V80-active-workflows-compaction`
+  - HEAD `362fedfbe6689886f1e2e7c29da61e39b0ce1e38`
+  - merge base with requested base: `73d0a6a4`
+- `git status --short` was clean.
+- Diff `73d0a6a4..362fedfb` inspected.
+- Read-only validation:
+  - Passed: `git diff --check 73d0a6a4..362fedfb`
+- Cargo/fmt not rerun because review scope was read-only.
+
+What looks good:
+- A typed active workflow snapshot was added with slug, status, invocation source/time, task scope, snapshot policy, snapshotted guidance, obligations/checkpoints, and completion metadata.
+- Active workflow state is separated from advertised workflows; activation comes from invoked `SystemItem::Workflow` rather than resident workflow catalog.
+- Snapshot-vs-latest behavior is explicit via `WorkflowBodySnapshotPolicy::SnapshottedAtInvocation`.
+- Compaction passes active workflow state into compactor input and writes typed `LogEntry::Extension` into the compacted segment.
+- Clear/cancel tools are exposed as `ActiveWorkflowComplete` / `ActiveWorkflowCancel`.
+
+Required changes:
+
+1. Stale active workflow guidance can remain in prompt history after typed state is invalid, completed, or cancelled.
+
+- The implementation writes active workflow rehydration guidance as an ordinary system message in compacted history (`pod.rs` around the compaction replacement history construction).
+- Restore later uses `SegmentStart.history` as worker history.
+- Corrupt/obsolete extension handling drops/diagnoses the typed state but does not remove the old `[Active workflow snapshot]` system message from compacted history.
+- Therefore the model can still see stale workflow obligations even when the durable active-workflow extension is missing/corrupt/obsolete.
+- The same leakage risk applies after completion/cancellation: old compacted system messages can remain until another compaction.
+
+Required fix:
+- Ensure active workflow guidance shown to the model is gated by currently valid active workflow state, not immutable old compacted history.
+- For example, regenerate guidance from validated typed state at context/compaction time, or sanitize/supersede old active workflow system messages when typed state is invalid/inactive.
+- Add focused coverage for compacted history containing an active workflow message plus missing/corrupt/obsolete extension, and for completion/cancellation after compaction.
+
+2. Completion/cancellation durability is inferred from generic tool-call history and trusts bare `ToolCall`s.
+
+- `ActiveWorkflowComplete` / `ActiveWorkflowCancel` mutate only the in-memory store in the tool implementation.
+- They do not append a new typed `LogEntry::Extension` on successful status change.
+- Restore reconstructs completion/cancellation by scanning history.
+- Replay marks workflows completed/cancelled based solely on `Item::ToolCall` names, without requiring a matching successful `ToolResult`.
+
+Required fix:
+- Persist status changes as typed durable active workflow state when the status tool succeeds, or make replay validate a matching non-error tool result/event proving the tool executed successfully.
+- Add focused tests for interrupted/unmatched/error status tool calls.
+
+Prompt-test failure assessment:
+- The reported `cargo test -p pod --lib` failures about `worktree status, diff, and test results` appear unrelated. The diff changes `resources/prompts/internal/compact_system.md`, while the failing assertions are in pod orchestration prompt tests and reference a different prompt resource.
+
+Conclusion:
+- Changes requested. Do not integrate until stale-guidance gating and completion/cancellation durability are fixed and covered.
+
+---
+
+<!-- event: implementation_report author: yoi-coder-00001KTFY8V80 at: 2026-06-14T16:17:48Z -->
+
+## Implementation report
+
+Follow-up implementation report after reviewer request_changes:
+
+New commit:
+- `ff446052 fix: gate active workflow rehydration state`
+
+Changed files in follow-up:
+- `crates/pod/src/active_workflow.rs`
+- `crates/pod/src/ipc/interceptor.rs`
+- `crates/pod/src/pod.rs`
+
+Review blocker 1 resolved: stale active workflow guidance in prompt history
+- Active workflow rehydration guidance is no longer persisted into compacted `SegmentStart.history` as an ordinary system message.
+- Compaction still carries active workflow state forward via typed `pod.active_workflows` extension state.
+- Request context is sanitized before model calls:
+  - stale `[Active workflow snapshot]` system messages are stripped,
+  - current active workflow guidance is regenerated request-locally from validated typed state,
+  - when typed state is missing/corrupt/obsolete/inactive and stale workflow hints are present, a bounded inactive-state message supersedes old compacted references.
+- Restore paths strip stale active workflow rehydration messages before installing worker history.
+- Compaction source/retained histories strip old active workflow rehydration messages so old snapshots are not re-summarized as active authority.
+
+Review blocker 2 resolved: completion/cancellation durability
+- `ActiveWorkflowComplete` / `ActiveWorkflowCancel` now persist successful status changes by committing a new typed `LogEntry::Extension` snapshot through the session log writer.
+- Restore no longer infers completion/cancellation from bare `Item::ToolCall` history.
+- Typed extension state is the authority, avoiding trust in unmatched/interrupted/error tool calls.
+
+Focused coverage added/updated:
+- Compacted history containing active workflow rehydration message plus:
+  - missing extension,
+  - corrupt extension,
+  - obsolete extension.
+- Completion/cancellation after compaction suppressing old compacted guidance.
+- Successful status tool writes a typed durable extension.
+- Unmatched/error status tool calls do not mutate restored active workflow state.
+- Existing review/merge/close workflow obligation coverage still passes.
+
+Validation reported by coder:
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check`
+- Passed: `cargo test -p pod active_workflow --lib`
+  - 7 passed
+- Passed: `cargo test -p pod interceptor --lib`
+  - 19 passed
+- Ran: `cargo test -p pod --lib`
+  - Still fails only on the previously reported unrelated prompt assertion failures:
+    - `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`
+    - `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`
+    - both assert missing text: `worktree status, diff, and test results`
+    - result: `332 passed; 2 failed`
+
+Repository status:
+- Child implementation worktree clean after follow-up commit.
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KTFY8V80-r2 at: 2026-06-14T16:25:00Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Evidence checked:
+- Child worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KTFY8V80-active-workflows-compaction`
+- HEAD: `ff446052 fix: gate active workflow rehydration state`
+- Base checked against: `73d0a6a4`
+- Original implementation checked where relevant: `362fedfb`
+
+Prior blocker 1: stale active workflow guidance after compaction
+- Resolved.
+- Active workflow rehydration is now derived from typed `LogEntry::Extension` state via `ActiveWorkflowStore`, not from ordinary prompt/tool-call history.
+- Restore strips prior `[Active workflow snapshot]` system messages before installing history.
+- Rehydration guidance is regenerated request-time from validated active typed state.
+- Missing/corrupt/unsupported extension state fails closed: no active workflow restored, stale rehydration messages stripped, and bounded inactive diagnostic text tells the model not to treat older compacted history/summaries as active workflow authority.
+- Completed/cancelled typed state does not regenerate active guidance.
+- Compaction no longer stores active workflow guidance directly in `SegmentStart.history` as ordinary durable prompt authority; it carries typed extension entries.
+- Focused coverage exists for stale active workflow message plus missing/corrupt/unsupported state and completion/cancellation after compaction.
+
+Prior blocker 2: completion/cancellation durability
+- Resolved.
+- `ActiveWorkflowComplete` / `ActiveWorkflowCancel` mutate store status and commit a fresh typed `LogEntry::Extension` snapshot through the active workflow log committer.
+- Production controller wiring attaches the log writer before feature/tool registration, so status tools have durable commit plumbing.
+- Restore no longer trusts bare unmatched `Item::ToolCall` entries or failed/error calls to infer completed/cancelled state.
+- Focused tests cover unmatched/error status tool calls and explicit completed/cancelled typed extension suppression of active guidance.
+
+Overall acceptance:
+- Durable typed active workflow representation exists.
+- Compaction carries active workflow state forward through typed extension state.
+- Rehydration restores guidance from durable validated state.
+- Snapshot-vs-latest policy is explicit and fail-closed on missing/corrupt/unsupported latest state.
+- No hidden context injection from non-durable transient data was found.
+- Active vs advertised workflow separation is preserved.
+- Clear/cancel/complete behavior is durable typed-state transition.
+
+Validation performed by reviewer:
+- Passed: `git diff --check 73d0a6a4..HEAD`
+- Passed: `cargo fmt --check`
+- `git status --short` remained clean.
+
+Validation not rerun by reviewer:
+- Cargo tests were not rerun because review scope was read-only and tests write build artifacts. Coder-reported focused test results were inspected as evidence.
+
+Full-suite prompt failure assessment:
+- The remaining reported `cargo test -p pod --lib` prompt assertion failures involving `worktree status, diff, and test results` appear unrelated to the active workflow typed-state/compaction changes.
+
+Conclusion:
+- Approved. No remaining blocker found.
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-14T16:26:01Z -->
+
+## Implementation report
+
+Integration report:
+
+Merged implementation branch into orchestration branch:
+- branch: `impl/00001KTFY8V80-active-workflows-compaction`
+- implementation commits:
+  - `362fedfb fix: preserve active workflows across compaction`
+  - `ff446052 fix: gate active workflow rehydration state`
+- merge commit: `64d26f84 merge: preserve active workflows across compaction`
+
+Reviewer result:
+- First review requested changes for stale prompt-history guidance and completion/cancellation durability.
+- Second-pass review `approve` recorded from `yoi-reviewer-00001KTFY8V80-r2`.
+
+Validation in Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration`:
+- Passed: `cargo test -p pod active_workflow --lib`
+  - 7 passed
+- Passed: `cargo test -p pod interceptor --lib`
+  - 19 passed
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check`
+
+Notes:
+- Full `cargo test -p pod --lib` was not rerun at integration because coder already reported only the known unrelated prompt assertion failures. Focused tests and reviewer inspection covered the changed active workflow/compaction/interceptor paths.
+- Orchestrator worktree is clean after validation.
+
+Cleanup planned:
+- Stop related coder/reviewer Pods.
+- Remove only child implementation worktree/branch for this Ticket.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-14T16:26:01Z from: inprogress to: done reason: merged_validated field: state -->
+
+## State changed
+
+Reviewer approved after requested fixes, implementation branch merged into the orchestration branch, and focused validation passed in the Orchestrator worktree. Marking Ticket done in the orchestration branch.
+
+---
