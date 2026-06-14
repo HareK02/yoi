@@ -150,3 +150,43 @@ Residual risk:
 - Branch validation is an internal git-ref-compatible validator rather than an invocation of `git check-ref-format`; reviewed as acceptable and conservative for this Ticket.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-14T05:05:48Z -->
+
+## Implementation report
+
+Integration outcome: merged and validated.
+
+- Implementation branch: `ticket-00001KV0X254D-orchestration-branch-config`
+- Implementation commits: `1c54689e tui: configure orchestration branch`, `fc075bc6 ticket: report orchestration branch config`
+- Review commit: `9ad87dda ticket: approve orchestration branch config`
+- Orchestrator merge commit: `290c4230 merge: orchestration branch config`
+
+Reviewer result:
+- `approve`。typed `[orchestration] branch` config、default preservation、invalid branch pre-Git rejection、create/reuse/restore/queue paths sharing resolved branch、non-destructive mismatch diagnostics を確認済み。
+
+Orchestrator validation after merge:
+- `cargo test -p ticket config --lib`: PASS
+- `cargo test -p tui orchestration_worktree --lib`: PASS
+- `cargo test -p tui configured_orchestration_branch --lib`: PASS
+- `cargo test -p tui ticket_queue_action --lib`: PASS
+- `cargo fmt --check`: PASS
+- `git diff --check`: PASS
+- `cargo build -p yoi`: PASS
+- `target/debug/yoi ticket doctor`: PASS
+
+Residual notes:
+- Broad `cargo test -p tui orchestration --lib` contains a known unrelated stale assertion (`orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace`) from child validation; focused branch/config tests pass.
+
+Next:
+- Mark Ticket done and clean up child coder/reviewer Pods plus implementation worktree/branch.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-14T05:05:57Z from: inprogress to: done reason: merged_and_validated field: state -->
+
+## State changed
+
+Implementation branch was reviewed, approved, merged into the Orchestrator branch as `290c4230`, and validated in the Orchestrator worktree. Focused ticket config / TUI orchestration worktree / configured branch / queue action tests, formatting, diff check, `cargo build -p yoi`, and `yoi ticket doctor` passed. Ticket implementation work is done; closure remains separate.
+
+---
