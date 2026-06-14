@@ -104,7 +104,7 @@ fn fixture_setup_env_policy() -> EnvPolicy {
     )
 }
 
-fn panel_env_policy(include_hold_background_task: bool) -> EnvPolicy {
+fn tui_env_policy(include_hold_background_task: bool, include_rewind_fixture: bool) -> EnvPolicy {
     let mut allowlist = vec![
         "HOME",
         "XDG_DATA_HOME",
@@ -118,10 +118,17 @@ fn panel_env_policy(include_hold_background_task: bool) -> EnvPolicy {
     if include_hold_background_task {
         allowlist.push("YOI_TUI_TEST_HOLD_BACKGROUND_TASK");
     }
+    if include_rewind_fixture {
+        allowlist.push("YOI_TUI_TEST_REWIND_FIXTURE");
+    }
     env_policy(
         &allowlist,
-        "tested yoi panel subprocess uses env_clear and receives only fixture HOME, XDG data/state/config/runtime dirs, terminal/test-observer variables, and the explicit runtime binary override",
+        "tested yoi TUI subprocess uses env_clear and receives only fixture HOME, XDG data/state/config/runtime dirs, terminal/test-observer variables, explicit e2e fixture toggles, and the explicit runtime binary override",
     )
+}
+
+fn panel_env_policy(include_hold_background_task: bool) -> EnvPolicy {
+    tui_env_policy(include_hold_background_task, false)
 }
 
 fn tested_yoi_env_policy_overview() -> TestedYoiEnvPolicy {
@@ -148,6 +155,9 @@ pub enum HarnessError {
     },
     MissingBinary(PathBuf),
     MouseCaptureNotEnabled {
+        artifacts: PanelArtifacts,
+    },
+    FullDragMouseCaptureEnabled {
         artifacts: PanelArtifacts,
     },
     Protocol(String),
@@ -184,6 +194,11 @@ impl std::fmt::Display for HarnessError {
                 "terminal mouse capture was not observed before mouse input; artifacts at {}",
                 artifacts.dir.display()
             ),
+            Self::FullDragMouseCaptureEnabled { artifacts } => write!(
+                f,
+                "forbidden full drag-motion mouse capture (?1002h/?1003h) was observed; artifacts at {}",
+                artifacts.dir.display()
+            ),
             Self::Protocol(message) => write!(f, "protocol error: {message}"),
         }
     }
@@ -215,6 +230,8 @@ pub struct PanelHarnessConfig {
     pub fixture_root: PathBuf,
     pub terminal_size: (u16, u16),
     pub hold_background_task: Option<String>,
+    pub rewind_fixture: bool,
+    pub command_args: Vec<String>,
     pub artifacts_dir: PathBuf,
 }
 
@@ -260,6 +277,7 @@ pub struct RowsRendered {
 pub enum KeyPress {
     CtrlC,
     CtrlD,
+    CtrlR,
     Enter,
     Esc,
     Text(String),
@@ -299,11 +317,13 @@ impl PanelHarness {
         fs::write(&artifacts.events_jsonl, "")?;
         fs::write(&artifacts.input_log, "")?;
         fs::write(&artifacts.output_log, "")?;
-        let env_policy = panel_env_policy(config.hold_background_task.is_some());
+        let env_policy =
+            tui_env_policy(config.hold_background_task.is_some(), config.rewind_fixture);
         fs::write(
             &artifacts.run_json,
             serde_json::to_vec_pretty(&serde_json::json!({
                 "binary": config.binary,
+                "args": &config.command_args,
                 "workspace": config.workspace,
                 "home": config.home,
                 "xdg_data_home": config.xdg_data_home,
@@ -321,6 +341,7 @@ impl PanelHarness {
                     "rows": config.terminal_size.1,
                 },
                 "hold_background_task": config.hold_background_task,
+                "rewind_fixture": config.rewind_fixture,
                 "tested_yoi_env_policy": &env_policy,
             }))?,
         )?;
@@ -331,9 +352,7 @@ impl PanelHarness {
 
         let mut command = Command::new(&config.binary);
         command
-            .arg("panel")
-            .arg("--workspace")
-            .arg(&config.workspace)
+            .args(&config.command_args)
             .env_clear()
             .env("YOI_TUI_TEST_EVENTS", &artifacts.events_jsonl)
             .env("YOI_POD_RUNTIME_COMMAND", &config.binary)
@@ -348,6 +367,9 @@ impl PanelHarness {
             .stderr(Stdio::from(slave));
         if let Some(task) = &config.hold_background_task {
             command.env("YOI_TUI_TEST_HOLD_BACKGROUND_TASK", task);
+        }
+        if config.rewind_fixture {
+            command.env("YOI_TUI_TEST_REWIND_FIXTURE", "1");
         }
         let child = command.spawn()?;
 
@@ -457,6 +479,58 @@ impl PanelHarness {
         }
     }
 
+    pub fn assert_no_full_drag_mouse_capture(&mut self) -> Result<()> {
+        if self.full_drag_mouse_capture_observed() {
+            self.flush_output_artifact()?;
+            return Err(HarnessError::FullDragMouseCaptureEnabled {
+                artifacts: self.artifacts.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn expect_event(
+        &mut self,
+        event_name: &'static str,
+        timeout: Duration,
+    ) -> Result<HarnessEvent> {
+        self.wait_for(event_name, timeout, |event| event.event == event_name)
+    }
+
+    pub fn count_events(&mut self, event_name: &str) -> Result<usize> {
+        Ok(self
+            .events()?
+            .into_iter()
+            .filter(|event| event.event == event_name)
+            .count())
+    }
+
+    pub fn wait_for_no_additional_events(
+        &mut self,
+        event_name: &str,
+        baseline: usize,
+        duration: Duration,
+    ) -> Result<()> {
+        let start = Instant::now();
+        while start.elapsed() < duration {
+            if let Some(status) = self.child.try_wait()? {
+                self.flush_output_artifact()?;
+                return Err(HarnessError::Protocol(format!(
+                    "process exited with {status} while waiting for no additional {event_name} events"
+                )));
+            }
+            let count = self.count_events(event_name)?;
+            if count > baseline {
+                self.flush_output_artifact()?;
+                return Err(HarnessError::Protocol(format!(
+                    "observed {count} {event_name} events; expected no more than {baseline}"
+                )));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    }
+
     pub fn expect_background_task_pending(&mut self, task: &str) -> Result<()> {
         let start = Instant::now();
         loop {
@@ -495,10 +569,40 @@ impl PanelHarness {
         )
     }
 
+    pub fn wheel_down(&mut self, row: &RenderedPanelRow) -> Result<()> {
+        self.wheel(row, 65, "down")
+    }
+
+    pub fn wheel_up(&mut self, row: &RenderedPanelRow) -> Result<()> {
+        self.wheel(row, 64, "up")
+    }
+
+    pub fn wheel(&mut self, row: &RenderedPanelRow, sgr_button: u8, label: &str) -> Result<()> {
+        if !self.mouse_capture_enabled() {
+            self.flush_output_artifact()?;
+            return Err(HarnessError::MouseCaptureNotEnabled {
+                artifacts: self.artifacts.clone(),
+            });
+        }
+        let x = row.rect.x.saturating_add(1);
+        let y = row.rect.y;
+        self.write_input(
+            &format!("mouse wheel {label} {} at {},{}", row.title, x, y),
+            format!(
+                "\u{1b}[<{};{};{}M",
+                sgr_button,
+                x.saturating_add(1),
+                y.saturating_add(1)
+            )
+            .as_bytes(),
+        )
+    }
+
     pub fn press(&mut self, key: KeyPress) -> Result<()> {
         match key {
             KeyPress::CtrlC => self.write_input("Ctrl+C", b"\x03"),
             KeyPress::CtrlD => self.write_input("Ctrl+D", b"\x04"),
+            KeyPress::CtrlR => self.write_input("Ctrl+R", b"\x12"),
             KeyPress::Enter => self.write_input("Enter", b"\r"),
             KeyPress::Esc => self.write_input("Esc", b"\x1b"),
             KeyPress::Text(text) => self.write_input(&format!("text {text:?}"), text.as_bytes()),
@@ -584,6 +688,13 @@ impl PanelHarness {
         self.output
             .lock()
             .map(|output| output_has_enabled_mouse_capture(&output))
+            .unwrap_or(false)
+    }
+
+    fn full_drag_mouse_capture_observed(&self) -> bool {
+        self.output
+            .lock()
+            .map(|output| output_has_full_drag_mouse_capture(&output))
             .unwrap_or(false)
     }
 
@@ -744,6 +855,12 @@ impl FixtureWorkspace {
             fixture_root: self.root.clone(),
             terminal_size: (100, 32),
             hold_background_task: None,
+            rewind_fixture: false,
+            command_args: vec![
+                "panel".to_string(),
+                "--workspace".to_string(),
+                self.workspace.display().to_string(),
+            ],
             artifacts_dir: self.artifacts_dir.clone(),
         }
     }
@@ -755,6 +872,19 @@ impl FixtureWorkspace {
     ) -> PanelHarnessConfig {
         let mut config = self.panel_config(binary);
         config.hold_background_task = Some(task.into());
+        config
+    }
+
+    pub fn rewind_fixture_config(&self, binary: PathBuf) -> PanelHarnessConfig {
+        let mut config = self.panel_config(binary);
+        config.rewind_fixture = true;
+        config.command_args = vec![
+            "--workspace".to_string(),
+            self.workspace.display().to_string(),
+            "--pod".to_string(),
+            "e2e-rewind".to_string(),
+        ];
+        config.artifacts_dir = self.artifacts_dir.join("rewind");
         config
     }
 
@@ -1169,6 +1299,15 @@ fn output_has_enabled_mouse_capture(output: &[u8]) -> bool {
         && mouse_mode_enabled(output, b"\x1b[?1006h", b"\x1b[?1006l")
 }
 
+fn output_has_full_drag_mouse_capture(output: &[u8]) -> bool {
+    output
+        .windows(b"\x1b[?1002h".len())
+        .any(|window| window == b"\x1b[?1002h")
+        || output
+            .windows(b"\x1b[?1003h".len())
+            .any(|window| window == b"\x1b[?1003h")
+}
+
 fn mouse_mode_enabled(output: &[u8], enable: &[u8], disable: &[u8]) -> bool {
     let last_enable = last_subsequence_index(output, enable);
     let last_disable = last_subsequence_index(output, disable);
@@ -1253,6 +1392,7 @@ mod tests {
                 "XDG_DATA_HOME",
                 "XDG_STATE_HOME",
                 "XDG_CONFIG_HOME",
+                "XDG_RUNTIME_DIR",
                 "YOI_POD_RUNTIME_COMMAND",
             ]
         );
@@ -1266,6 +1406,7 @@ mod tests {
                 "XDG_DATA_HOME",
                 "XDG_STATE_HOME",
                 "XDG_CONFIG_HOME",
+                "XDG_RUNTIME_DIR",
                 "TERM",
                 "YOI_TUI_TEST_EVENTS",
                 "YOI_POD_RUNTIME_COMMAND",

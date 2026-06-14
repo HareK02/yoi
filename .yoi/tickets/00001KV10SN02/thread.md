@@ -98,3 +98,64 @@ Replacement Coder task:
 - Do not merge or clean up; Orchestrator will handle review/merge.
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-14T05:24:37Z -->
+
+## Implementation report
+
+Implemented critical-path TUI E2E coverage in commit b9f49eee.
+
+Files changed:
+- crates/tui/src/multi_pod.rs: panel mouse wheel events now move selection and emit e2e observer diagnostics without enabling full drag-motion capture.
+- crates/tui/src/single_pod.rs: e2e-test-only canned single-Pod rewind fixture path for real TUI/PTTY driving; preserves production/non-production boundary.
+- tests/e2e/Cargo.toml: disables auto-discovered integration tests and registers panel/rewind only behind the e2e feature.
+- tests/e2e/src/lib.rs: harness support for rewind fixture env isolation, wheel input, event waiting, and forbidden ?1002h/?1003h capture detection.
+- tests/e2e/tests/panel.rs: adds PTY wheel regression coverage and drag-capture failure assertion while keeping existing panel cases.
+- tests/e2e/tests/rewind.rs: adds single-Pod rewind picker/apply/duplicate-Enter regression.
+
+Validation:
+- cargo fmt --check
+- git diff --check
+- cargo test -p yoi-e2e --no-run
+- cargo build -p yoi
+- cargo test -p yoi-e2e --features e2e
+- cargo test -p tui --lib single_pod::tests::rewind
+- cargo test -p tui --lib mouse
+- nix build .#yoi
+
+Additional note:
+- Full cargo test -p tui was also attempted and failed in pre-existing/unrelated tests: multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace and spawn::tests::{profile_choices_include_builtin_and_project_default_marker, profile_choices_use_project_registry_default}. Focused changed-area tui tests passed.
+
+Residual risks:
+- Rewind E2E uses an e2e-test-only canned in-process fixture instead of a provider/socket-backed Pod, intentionally avoiding credentials/network while still exercising the real single-Pod TUI/PTTY path.
+- nix build emitted the expected dirty-tree warning before succeeding.
+
+---
+
+<!-- event: review author: hare at: 2026-06-14T05:33:43Z status: approve -->
+
+## Review: approve
+
+APPROVE.
+
+Review evidence:
+- Diff base: inspected `git diff orchestration/yoi-orchestrator..HEAD`; changed files are limited to this Ticket record plus intended TUI/E2E files (`crates/tui/src/{multi_pod.rs,single_pod.rs}`, `tests/e2e/{Cargo.toml,src/lib.rs,tests/panel.rs,tests/rewind.rs}`). No unrelated Ticket records or broad code churn were present.
+- Existing Panel E2E remains opt-in: `tests/e2e/Cargo.toml` uses `autotests = false`; `panel` and `rewind` integration tests have `required-features = ["e2e"]`. `cargo test -p yoi-e2e --no-run` compiled only the library test, while `cargo test -p yoi-e2e --features e2e` ran the isolated panel/rewind cases.
+- Wheel PTY coverage is meaningful: the panel test drives real PTY SGR wheel input at a row coordinate derived from `rows_rendered`, then observes `mouse_wheel`, `selection_changed`, and refreshed `rows_rendered` events. This exercises terminal input delivery and row/list selection behavior rather than direct state mutation.
+- Mouse capture assertions cover the intended invariant: the TUI now enables normal tracking + SGR through the local `EnableWheelMouseCapture` command, and tests assert mouse capture is enabled while rejecting forbidden full drag-motion modes. Observed PTY artifacts from the reviewer run contained `?1000h`/`?1006h` once and `?1002h`/`?1003h` zero times for panel and rewind runs.
+- Rewind E2E uses a real single-Pod TUI/PTTY surface with an `e2e-test`-only fixture. The test sends `Ctrl+R`, `Enter`, and repeated `Enter`; observed events show picker open, exactly one rewind submit, duplicate Enter suppression while pending, and `rewind_applied` with restored composer text. The PTY output artifact also contained the restored text (`revise the plan`), so this covers visible composer restoration without Esc/restart/restore.
+- Credential/network isolation is preserved: the E2E harness uses `env_clear`, fixture HOME/XDG runtime/data/config/state, explicit runtime binary override, and default-deny provider credential policy. The rewind fixture is only compiled/activated behind the `e2e-test` feature and `YOI_TUI_TEST_REWIND_FIXTURE`; normal `cargo build -p yoi` passed without that fixture.
+
+Validation performed:
+- `cargo fmt --check` — pass
+- `git diff --check orchestration/yoi-orchestrator..HEAD` — pass
+- `cargo test -p yoi-e2e --no-run` — pass
+- `cargo build -p yoi` — pass
+- `cargo test -p yoi-e2e --features e2e` — pass (1 lib env-policy test, 3 panel tests, 1 rewind test)
+- `cargo test -p tui --lib single_pod::tests::rewind` — pass (5 tests)
+- `cargo test -p tui --lib mouse` — pass (4 tests)
+- `cargo test -p tui --lib` — fails in known unrelated tests already noted by implementation report: `multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace` and `spawn::tests::{profile_choices_include_builtin_and_project_default_marker, profile_choices_use_project_registry_default}`; 327 other tests passed, including the changed-area mouse/rewind tests.
+- `nix build .#yoi` — not run by reviewer because this review grant allows writes only under `target/` and this Ticket record; a normal nix build would write outside that boundary (store/result link). Coder's implementation report recorded a successful nix build with the expected dirty-tree warning.
+
+Residual risk:
+- The rewind E2E intentionally uses an in-process canned rewind fixture instead of a provider/socket-backed Pod to avoid credentials and network. This is acceptable for the Ticket's critical TUI/PTTY regression focus, but it is not full provider integration coverage.

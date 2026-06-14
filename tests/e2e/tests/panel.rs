@@ -12,6 +12,7 @@ fn panel_mouse_click_selects_row_without_dispatching_action() -> yoi_e2e::Result
     let mut panel = PanelHarness::spawn(fixture.panel_config(binary))?;
 
     panel.expect_mouse_capture_enabled()?;
+    panel.assert_no_full_drag_mouse_capture()?;
     let rows = panel.wait_for_rows(2)?;
     assert_no_runtime_or_host_pod_leak(
         &fixture,
@@ -36,6 +37,69 @@ fn panel_mouse_click_selects_row_without_dispatching_action() -> yoi_e2e::Result
             .iter()
             .all(|event| event.event != "action_requested"),
         "mouse selection must not dispatch panel actions; artifacts at {}",
+        panel.artifacts().dir.display()
+    );
+    panel.assert_no_full_drag_mouse_capture()?;
+
+    panel.press(KeyPress::CtrlC)?;
+    let status = panel.expect_exit_within(PanelHarness::default_exit_wait())?;
+    assert!(status.success(), "panel should exit cleanly with Ctrl+C");
+    drop(panel);
+    assert_fixture_cleanup(fixture.cleanup()?);
+    Ok(())
+}
+
+#[test]
+fn panel_mouse_wheel_moves_selection_without_full_drag_capture() -> yoi_e2e::Result<()> {
+    let binary = yoi_binary()?;
+    let fixture = FixtureWorkspace::new(&binary)?;
+    assert_fixture_paths_are_isolated(&fixture);
+    let mut panel = PanelHarness::spawn(fixture.panel_config(binary))?;
+
+    panel.expect_mouse_capture_enabled()?;
+    panel.assert_no_full_drag_mouse_capture()?;
+    let rows = panel.wait_for_rows(2)?;
+    assert_no_runtime_or_host_pod_leak(
+        &fixture,
+        &rows.rows,
+        panel.artifacts().dir.display().to_string().as_str(),
+    );
+    let selected = rows
+        .selected
+        .as_ref()
+        .expect("fixture should render an initially selected row")
+        .clone();
+    let selected_index = rows
+        .rows
+        .iter()
+        .position(|row| row.key == selected)
+        .expect("selected row should be rendered");
+    let target_index = (selected_index + 1).min(rows.rows.len() - 1);
+    assert_ne!(
+        selected_index, target_index,
+        "fixture should render a wheel-selectable next row"
+    );
+    let source = rows.rows[selected_index].clone();
+    let target = rows.rows[target_index].clone();
+
+    let before_events = panel.events()?.len();
+    panel.wheel_down(&source)?;
+    panel.expect_selection(&target.key)?;
+    panel.assert_no_full_drag_mouse_capture()?;
+
+    let events = panel.events()?;
+    assert!(
+        events[before_events..]
+            .iter()
+            .any(|event| event.event == "mouse_wheel"),
+        "wheel movement should be visible in e2e events; artifacts at {}",
+        panel.artifacts().dir.display()
+    );
+    assert!(
+        events[before_events..]
+            .iter()
+            .all(|event| event.event != "action_requested"),
+        "wheel selection must not dispatch panel actions; artifacts at {}",
         panel.artifacts().dir.display()
     );
 
