@@ -22,6 +22,7 @@ use llm_worker::tool::ToolOutput;
 use tracing::info;
 use tracing::warn;
 
+use crate::active_workflow::ActiveWorkflowStore;
 use crate::compact::state::CompactState;
 use crate::compact::usage_tracker::UsageTracker;
 use session_store::SystemItem;
@@ -71,6 +72,10 @@ pub(crate) struct PodInterceptor {
     /// worker. `None` in tests / `Pod::new` paths where no writer is
     /// attached.
     log_writer: Option<Arc<dyn SystemItemCommitter>>,
+    /// Active workflow state is durable typed Pod state.  The interceptor
+    /// regenerates request-local workflow guidance from this store and strips
+    /// any stale compacted-history copies before each model request.
+    active_workflows: ActiveWorkflowStore,
     /// Next turn index assigned by `on_prompt_submit`.
     next_turn_index: AtomicUsize,
     /// Tool calls observed in the current turn (reset on each new prompt).
@@ -86,6 +91,7 @@ impl PodInterceptor {
         pending_attachments: Arc<Mutex<Vec<SystemItem>>>,
         prompts: Arc<PromptCatalog>,
         log_writer: Option<Arc<dyn SystemItemCommitter>>,
+        active_workflows: ActiveWorkflowStore,
     ) -> Self {
         Self {
             registry,
@@ -96,6 +102,7 @@ impl PodInterceptor {
             pending_attachments,
             prompts,
             log_writer,
+            active_workflows,
             next_turn_index: AtomicUsize::new(0),
             tool_calls_this_turn: AtomicUsize::new(0),
         }
@@ -234,6 +241,8 @@ impl Interceptor for PodInterceptor {
     }
 
     async fn pre_llm_request(&self, context: &mut Vec<Item>) -> PreRequestAction {
+        self.active_workflows.sanitize_context(context);
+
         let initial_tokens = self.estimated_tokens(context);
         if self.request_threshold_exceeded(initial_tokens, context) {
             return PreRequestAction::Yield;
@@ -449,11 +458,13 @@ mod tests {
     }
 
     impl SystemItemCommitter for RecordingSystemItemCommitter {
-        fn commit_system_item(&self, item: SystemItem) {
-            self.committed
-                .lock()
-                .expect("committed system-item list poisoned")
-                .push(item);
+        fn commit_log_entry(&self, entry: session_store::LogEntry) {
+            if let session_store::LogEntry::SystemItem { item, .. } = entry {
+                self.committed
+                    .lock()
+                    .expect("committed system-item list poisoned")
+                    .push(item);
+            }
         }
     }
 
@@ -525,6 +536,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
             None,
+            ActiveWorkflowStore::new(),
         );
         let mut ctx = ctx_items;
         let action = interceptor.pre_llm_request(&mut ctx).await;
@@ -557,6 +569,7 @@ mod tests {
             Some(Arc::new(RecordingSystemItemCommitter {
                 committed: Arc::clone(&committed),
             })),
+            ActiveWorkflowStore::new(),
         );
         let mut ctx = ctx_items;
         let action = interceptor.pre_llm_request(&mut ctx).await;
@@ -593,6 +606,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
             None,
+            ActiveWorkflowStore::new(),
         )
         .with_usage_tracker(usage_tracker);
         let mut ctx = ctx_items;
@@ -618,6 +632,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
             None,
+            ActiveWorkflowStore::new(),
         );
         let mut ctx = ctx_items;
         let action = interceptor.pre_llm_request(&mut ctx).await;
@@ -659,6 +674,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
             None,
+            ActiveWorkflowStore::new(),
         );
         let mut ctx = ctx_items;
         let action = interceptor.pre_llm_request(&mut ctx).await;
@@ -686,6 +702,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
             None,
+            ActiveWorkflowStore::new(),
         );
         let mut ctx = ctx_items;
         let action = interceptor.pre_llm_request(&mut ctx).await;
@@ -707,6 +724,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
             None,
+            ActiveWorkflowStore::new(),
         );
         let mut ctx: Vec<Item> = Vec::new();
         let action = interceptor.pre_llm_request(&mut ctx).await;
@@ -735,6 +753,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
             Some(committer),
+            ActiveWorkflowStore::new(),
         );
 
         let mut ctx: Vec<Item> = Vec::new();
@@ -782,6 +801,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
             None,
+            ActiveWorkflowStore::new(),
         );
 
         let mut ctx: Vec<Item> = Vec::new();
@@ -839,6 +859,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
             None,
+            ActiveWorkflowStore::new(),
         );
         let mut info = task_tool_call_info("TaskList", serde_json::json!({"scope": "all"}));
 
@@ -886,6 +907,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
             None,
+            ActiveWorkflowStore::new(),
         );
         let info = task_tool_call_info("TaskList", serde_json::json!({}));
         let mut result_info = ToolResultInfo {
@@ -935,6 +957,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
             None,
+            ActiveWorkflowStore::new(),
         );
         let history = vec![Item::user_message("hi"), Item::assistant_message("done")];
 
@@ -969,6 +992,7 @@ mod tests {
             Some(Arc::new(RecordingSystemItemCommitter {
                 committed: Arc::clone(&committed),
             })),
+            ActiveWorkflowStore::new(),
         )
         .with_usage_tracker(Arc::clone(&usage_tracker));
 
@@ -1028,6 +1052,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
             None,
+            ActiveWorkflowStore::new(),
         );
 
         let items = interceptor.pending_history_appends().await;
@@ -1065,6 +1090,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
             None,
+            ActiveWorkflowStore::new(),
         );
         let mut ctx: Vec<Item> = vec![Item::user_message("hi")];
         let action = interceptor.pre_llm_request(&mut ctx).await;
@@ -1095,6 +1121,7 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
             PromptCatalog::builtins_only().unwrap(),
             None,
+            ActiveWorkflowStore::new(),
         );
         let mut ctx: Vec<Item> = Vec::new();
         let action = interceptor.pre_llm_request(&mut ctx).await;

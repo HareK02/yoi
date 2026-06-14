@@ -198,20 +198,23 @@ where
 /// interceptor commit `SystemItem`s without being generic over the
 /// concrete `Store` type.
 pub trait SystemItemCommitter: Send + Sync {
-    fn commit_system_item(&self, item: SystemItem);
+    fn commit_log_entry(&self, entry: LogEntry);
+
+    fn commit_system_item(&self, item: SystemItem) {
+        self.commit_log_entry(LogEntry::SystemItem {
+            ts: segment_log::now_millis(),
+            item,
+        });
+    }
 }
 
 impl<St> SystemItemCommitter for LogWriterHandle<St>
 where
     St: Store + Clone + Send + Sync + 'static,
 {
-    fn commit_system_item(&self, item: SystemItem) {
-        let entry = LogEntry::SystemItem {
-            ts: segment_log::now_millis(),
-            item,
-        };
+    fn commit_log_entry(&self, entry: LogEntry) {
         if let Err(err) = self.append_entry(entry) {
-            warn!(error = %err, "system item commit failed; dropping");
+            warn!(error = %err, "session log entry commit failed; dropping");
         }
     }
 }
@@ -822,8 +825,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     ) -> FeatureRegistryInstallReport {
         let worker = self.worker.as_mut().expect("worker taken during run");
         let report = registry.install_into_worker(worker, &mut self.hook_builder);
+        let active_workflow_committer = self.log_writer.clone().map(|writer| {
+            Arc::new(move |entry| writer.commit_log_entry(entry))
+                as active_workflow::LogEntryCommitter
+        });
         worker.register_tools(active_workflow::active_workflow_tools(
             self.active_workflows.clone(),
+            active_workflow_committer,
         ));
         report
     }
@@ -890,7 +898,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.task_feature.restore_from_history(&state.history);
         self.active_workflows
             .restore_from_history_and_extensions(&state.history, &state.extensions);
-        self.worker_mut().set_history(state.history);
+        let mut history = state.history;
+        active_workflow::strip_rehydration_messages(&mut history);
+        self.worker_mut().set_history(history);
         self.worker_mut().set_request_config(state.config);
         self.worker_mut().set_turn_count(state.turn_count);
         self.worker_mut()
@@ -1256,6 +1266,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 self.pending_attachments.clone(),
                 self.prompts.clone(),
                 self.log_writer.clone(),
+                self.active_workflows.clone(),
             )
             .with_usage_tracker(self.usage_tracker.clone());
             self.worker_mut().set_interceptor(interceptor);
@@ -2391,8 +2402,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let worker = self.worker.as_ref().expect("worker taken during run");
         let history = worker.history();
         let retain_from = cut.index.min(history.len());
-        let retained_items = history[retain_from..].to_vec();
-        let items_to_summarise = history[..retain_from].to_vec();
+        let mut retained_items = history[retain_from..].to_vec();
+        let mut items_to_summarise = history[..retain_from].to_vec();
+        active_workflow::strip_rehydration_messages(&mut retained_items);
+        active_workflow::strip_rehydration_messages(&mut items_to_summarise);
 
         // Compaction-related knobs. Fall through to manifest defaults when
         // `[compaction]` is omitted entirely.
@@ -2634,31 +2647,24 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .filter(|i| i.is_user_message())
             .count();
 
-        // Build new history: [summary, ...auto-read, references, ...retained, active workflow snapshot, task snapshot, TaskList synthetic call/result].
-        // The active workflow snapshot is inserted from durable typed state so
-        // workflow-governed tasks keep their procedural authority after the
-        // compacted segment starts.
+        // Build new history: [summary, ...auto-read, references, ...retained, task snapshot, TaskList synthetic call/result].
+        // Active workflow guidance is intentionally not persisted as an ordinary
+        // compacted-history system message. It is regenerated request-locally
+        // from typed `pod.active_workflows` extension state so completed,
+        // cancelled, corrupt, or missing state cannot leak stale obligations.
         // The TaskStore snapshot trails the retained items so that, on resume,
         // `replay_history` walks any pre-compact Task* calls preserved verbatim
         // in retained_items first and the trailing snapshot's `replace_with`
         // is the final word — pre-compact `TaskCreate` calls cannot leak as
         // duplicate entries.
-        let active_workflow_message = self
-            .active_workflows
-            .rehydration_message()
-            .map(Item::system_message);
         let mut new_history = Vec::with_capacity(
             1 + auto_read_messages.len()
                 + 3
                 + reference_message.is_some() as usize
-                + active_workflow_message.is_some() as usize
                 + retained_items.len(),
         );
-        let mut compact_introduced_system_messages = Vec::with_capacity(
-            2 + auto_read_messages.len()
-                + reference_message.is_some() as usize
-                + active_workflow_message.is_some() as usize,
-        );
+        let mut compact_introduced_system_messages =
+            Vec::with_capacity(2 + auto_read_messages.len() + reference_message.is_some() as usize);
         let summary_message =
             Item::system_message(format!("[Compacted context summary]\n\n{summary_text}"));
         compact_introduced_system_messages.push(summary_message.clone());
@@ -2671,9 +2677,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
              This is the complete session task list preserved across compaction. \
              The following TaskList tool result presents the same state through the tool lane."
         ));
-        if let Some(msg) = active_workflow_message.as_ref() {
-            compact_introduced_system_messages.push(msg.clone());
-        }
         compact_introduced_system_messages.push(task_snapshot_message.clone());
 
         new_history.push(summary_message);
@@ -2682,9 +2685,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             new_history.push(msg);
         }
         new_history.extend(retained_items);
-        if let Some(msg) = active_workflow_message {
-            new_history.push(msg);
-        }
         new_history.push(task_snapshot_message);
         new_history.push(Item::tool_call("compact-tasklist", "TaskList", "{}"));
         new_history.push(Item::tool_result_with_content(
@@ -4150,7 +4150,9 @@ where
                 ..
             })
         );
-        worker.set_history(state.history.clone());
+        let mut restored_history = state.history.clone();
+        active_workflow::strip_rehydration_messages(&mut restored_history);
+        worker.set_history(restored_history);
         worker.set_request_config(state.config.clone());
         worker.set_turn_count(state.turn_count);
         worker.set_last_run_interrupted(state.last_run_interrupted);

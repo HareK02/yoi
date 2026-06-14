@@ -17,7 +17,11 @@ use serde_json::json;
 use session_store::{LogEntry, SystemItem, segment_log};
 
 pub const DOMAIN: &str = "pod.active_workflows";
+pub const REHYDRATION_MESSAGE_PREFIX: &str = "[Active workflow snapshot]";
+pub const INACTIVE_MESSAGE_PREFIX: &str = "[Active workflow state]";
 const SCHEMA_VERSION: u32 = 1;
+
+pub type LogEntryCommitter = Arc<dyn Fn(LogEntry) + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveWorkflowSnapshot {
@@ -221,6 +225,16 @@ impl ActiveWorkflowStore {
         (!active.is_empty()).then(|| render_rehydration_message(&active))
     }
 
+    pub fn sanitize_context(&self, context: &mut Vec<Item>) -> usize {
+        let removed = strip_rehydration_messages(context);
+        if let Some(message) = self.rehydration_message() {
+            context.push(Item::system_message(message));
+        } else if removed > 0 || context.iter().any(has_active_workflow_hint) {
+            context.push(Item::system_message(inactive_workflow_message()));
+        }
+        removed
+    }
+
     pub fn extension_entry(&self) -> LogEntry {
         LogEntry::Extension {
             ts: segment_log::now_millis(),
@@ -232,14 +246,13 @@ impl ActiveWorkflowStore {
 
     pub fn restore_from_history_and_extensions(
         &self,
-        history: &[Item],
+        _history: &[Item],
         extensions: &[(String, serde_json::Value)],
     ) {
-        let (mut snapshot, diagnostics) = fold_extensions(extensions);
+        let (snapshot, diagnostics) = fold_extensions(extensions);
         for diagnostic in diagnostics {
             tracing::warn!(diagnostic, "failed to restore active workflow state");
         }
-        replay_history_tools(&mut snapshot, history);
         self.replace_with(snapshot);
     }
 }
@@ -271,49 +284,61 @@ pub fn fold_extensions(
     (latest.unwrap_or_default(), diagnostics)
 }
 
-fn replay_history_tools(snapshot: &mut ActiveWorkflowSnapshot, history: &[Item]) {
-    for item in history {
-        let Item::ToolCall {
-            name, arguments, ..
-        } = item
-        else {
-            continue;
-        };
-        let status = match name.as_str() {
-            "ActiveWorkflowComplete" => ActiveWorkflowStatus::Completed,
-            "ActiveWorkflowCancel" => ActiveWorkflowStatus::Cancelled,
-            _ => continue,
-        };
-        if let Ok(params) = serde_json::from_str::<WorkflowStatusParams>(arguments) {
-            if let Some(record) = snapshot
-                .workflows
-                .iter_mut()
-                .find(|record| record.slug == params.slug)
-            {
-                let reason = params.reason.unwrap_or_else(|| status.to_string());
-                record.status = status;
-                record.updated_at_ms = record.updated_at_ms.saturating_add(1);
-                record.completion = Some(WorkflowCompletionInfo {
-                    completed_at_ms: record.updated_at_ms,
-                    reason,
-                });
-                for checkpoint in &mut record.checkpoints {
-                    checkpoint.status = match status {
-                        ActiveWorkflowStatus::Active => WorkflowCheckpointStatus::Open,
-                        ActiveWorkflowStatus::Completed => WorkflowCheckpointStatus::Done,
-                        ActiveWorkflowStatus::Cancelled => WorkflowCheckpointStatus::Cancelled,
-                    };
-                }
-            }
-        }
+pub fn strip_rehydration_messages(items: &mut Vec<Item>) -> usize {
+    let before = items.len();
+    items.retain(|item| !is_rehydration_message(item));
+    before - items.len()
+}
+
+pub fn is_rehydration_message(item: &Item) -> bool {
+    item_system_text(item)
+        .map(|text| text.trim_start().starts_with(REHYDRATION_MESSAGE_PREFIX))
+        .unwrap_or(false)
+}
+
+fn has_active_workflow_hint(item: &Item) -> bool {
+    item_system_text(item)
+        .map(|text| {
+            text.contains("Active Workflow Invocation State")
+                || text.contains("ActiveWorkflowStore:")
+                || text.contains(REHYDRATION_MESSAGE_PREFIX)
+        })
+        .unwrap_or(false)
+}
+
+fn item_system_text(item: &Item) -> Option<String> {
+    match item {
+        Item::Message { role, content, .. } if *role == llm_worker::Role::System => Some(
+            content
+                .iter()
+                .map(|part| part.as_text())
+                .collect::<String>(),
+        ),
+        _ => None,
     }
 }
 
-pub fn active_workflow_tools(store: ActiveWorkflowStore) -> Vec<ToolDefinition> {
+fn inactive_workflow_message() -> String {
+    format!(
+        "{INACTIVE_MESSAGE_PREFIX}\n\n\
+         No currently valid active workflow invocation state is active. Ignore older compacted \
+         history or summaries that appear to describe active workflow obligations; only validated \
+         typed `{DOMAIN}` records with status `active` establish active workflow guidance."
+    )
+}
+
+pub fn active_workflow_tools(
+    store: ActiveWorkflowStore,
+    committer: Option<LogEntryCommitter>,
+) -> Vec<ToolDefinition> {
     vec![
         list_tool(store.clone()),
-        status_tool(store.clone(), ActiveWorkflowStatus::Completed),
-        status_tool(store, ActiveWorkflowStatus::Cancelled),
+        status_tool(
+            store.clone(),
+            ActiveWorkflowStatus::Completed,
+            committer.clone(),
+        ),
+        status_tool(store, ActiveWorkflowStatus::Cancelled, committer),
     ]
 }
 
@@ -332,7 +357,11 @@ fn list_tool(store: ActiveWorkflowStore) -> ToolDefinition {
     })
 }
 
-fn status_tool(store: ActiveWorkflowStore, status: ActiveWorkflowStatus) -> ToolDefinition {
+fn status_tool(
+    store: ActiveWorkflowStore,
+    status: ActiveWorkflowStatus,
+    committer: Option<LogEntryCommitter>,
+) -> ToolDefinition {
     let name = match status {
         ActiveWorkflowStatus::Completed => "ActiveWorkflowComplete",
         ActiveWorkflowStatus::Cancelled => "ActiveWorkflowCancel",
@@ -348,6 +377,7 @@ fn status_tool(store: ActiveWorkflowStore, status: ActiveWorkflowStatus) -> Tool
         ActiveWorkflowStatus::Active => unreachable!("active status tool is not exposed"),
     };
     let store_for_tool = store.clone();
+    let committer_for_tool = committer.clone();
     Arc::new(move || {
         (
             ToolMeta::new(name)
@@ -364,6 +394,7 @@ fn status_tool(store: ActiveWorkflowStore, status: ActiveWorkflowStatus) -> Tool
             Arc::new(ActiveWorkflowStatusTool {
                 store: store_for_tool.clone(),
                 status,
+                committer: committer_for_tool.clone(),
             }) as Arc<dyn Tool>,
         )
     })
@@ -401,6 +432,7 @@ impl Tool for ActiveWorkflowListTool {
 struct ActiveWorkflowStatusTool {
     store: ActiveWorkflowStore,
     status: ActiveWorkflowStatus,
+    committer: Option<LogEntryCommitter>,
 }
 
 #[async_trait]
@@ -417,6 +449,9 @@ impl Tool for ActiveWorkflowStatusTool {
             .store
             .set_status(&params.slug, self.status, reason, segment_log::now_millis())
             .map_err(ToolError::InvalidArgument)?;
+        if let Some(committer) = &self.committer {
+            committer(self.store.extension_entry());
+        }
         let content = serde_json::to_string_pretty(&record)
             .map_err(|err| ToolError::Internal(err.to_string()))?;
         Ok(ToolOutput {
@@ -490,12 +525,12 @@ fn render_snapshot_text(records: &[ActiveWorkflowRecord]) -> String {
 }
 
 fn render_rehydration_message(records: &[ActiveWorkflowRecord]) -> String {
-    let mut out = String::from(
-        "[Active workflow snapshot]\n\n\
+    let mut out = format!(
+        "{REHYDRATION_MESSAGE_PREFIX}\n\n\
          The following workflow invocation state is durable state carried across compaction. \
          Continue to follow each active workflow's snapshotted guidance until the governed task \
          is completed with ActiveWorkflowComplete or explicitly cancelled with ActiveWorkflowCancel. \
-         Missing or obsolete workflow resources must not replace these invocation snapshots.\n",
+         Missing or obsolete workflow resources must not replace these invocation snapshots.\n"
     );
     for record in records {
         out.push_str(&format!(
@@ -547,25 +582,146 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn active_workflow_guidance_carries_merge_close_obligations() {
+    fn store_with_active_workflow() -> ActiveWorkflowStore {
         let store = ActiveWorkflowStore::new();
-        let items = vec![SystemItem::Workflow {
-            slug: "multi-agent-workflow".into(),
-            body: "# Multi-agent workflow\n- Delegate implementation to coder.\n- Require external review before merge.\n- Close the Ticket after merge and report evidence.\n".into(),
-        }];
-
         assert!(store.activate_from_system_items(
-            &items,
+            &[SystemItem::Workflow {
+                slug: "multi-agent-workflow".into(),
+                body: "# Multi-agent workflow\n- Delegate implementation to coder.\n- Require external review before merge.\n- Close the Ticket after merge and report evidence.\n".into(),
+            }],
             "/multi-agent-workflow implement ticket".into(),
             42,
         ));
+        store
+    }
+
+    fn active_extension(store: &ActiveWorkflowStore) -> (String, serde_json::Value) {
+        (
+            DOMAIN.to_string(),
+            serde_json::to_value(store.snapshot()).expect("snapshot json"),
+        )
+    }
+
+    #[test]
+    fn active_workflow_guidance_carries_merge_close_obligations() {
+        let store = store_with_active_workflow();
         let msg = store.rehydration_message().unwrap();
 
         assert!(msg.contains("multi-agent-workflow"));
         assert!(msg.contains("external review before merge"));
         assert!(msg.contains("Close the Ticket after merge"));
         assert!(msg.contains("Snapshotted workflow guidance"));
+    }
+
+    #[test]
+    fn compacted_rehydration_message_is_removed_when_typed_state_missing_or_invalid() {
+        for extensions in [
+            Vec::new(),
+            vec![(DOMAIN.to_string(), json!({"schema_version":"bad"}))],
+            vec![(
+                DOMAIN.to_string(),
+                json!({"schema_version":999,"workflows":[]}),
+            )],
+        ] {
+            let original = store_with_active_workflow();
+            let stale_message = original.rehydration_message().unwrap();
+            let mut context = vec![
+                Item::system_message(stale_message),
+                Item::user_message("continue"),
+            ];
+            let restored = ActiveWorkflowStore::new();
+
+            restored.restore_from_history_and_extensions(&context, &extensions);
+            let removed = restored.sanitize_context(&mut context);
+
+            assert_eq!(removed, 1);
+            assert!(restored.active_records().is_empty());
+            assert!(!context.iter().any(is_rehydration_message));
+        }
+    }
+
+    #[test]
+    fn completion_or_cancellation_suppresses_old_compacted_guidance() {
+        for status in [
+            ActiveWorkflowStatus::Completed,
+            ActiveWorkflowStatus::Cancelled,
+        ] {
+            let store = store_with_active_workflow();
+            let stale_message = store.rehydration_message().unwrap();
+            let mut context = vec![
+                Item::system_message(stale_message),
+                Item::user_message("continue"),
+            ];
+
+            store
+                .set_status("multi-agent-workflow", status, status.to_string(), 84)
+                .expect("workflow exists");
+            let removed = store.sanitize_context(&mut context);
+
+            assert_eq!(removed, 1);
+            assert!(!context.iter().any(is_rehydration_message));
+        }
+    }
+
+    #[test]
+    fn unmatched_status_tool_calls_do_not_mutate_restored_state() {
+        let store = store_with_active_workflow();
+        let extensions = vec![active_extension(&store)];
+        let history = vec![
+            Item::tool_call(
+                "call-1",
+                "ActiveWorkflowCancel",
+                json!({"slug":"multi-agent-workflow","reason":"not durable"}).to_string(),
+            ),
+            Item::tool_result_error("call-1", "error: failed"),
+        ];
+        let restored = ActiveWorkflowStore::new();
+
+        restored.restore_from_history_and_extensions(&history, &extensions);
+
+        assert_eq!(restored.active_records().len(), 1);
+        assert_eq!(
+            restored.snapshot().workflows[0].status,
+            ActiveWorkflowStatus::Active
+        );
+    }
+
+    #[tokio::test]
+    async fn status_tool_persists_typed_extension_on_success() {
+        let store = store_with_active_workflow();
+        let committed = Arc::new(Mutex::new(Vec::<LogEntry>::new()));
+        let committed_for_tool = committed.clone();
+        let tools = active_workflow_tools(
+            store.clone(),
+            Some(Arc::new(move |entry| {
+                committed_for_tool
+                    .lock()
+                    .expect("committed entries mutex poisoned")
+                    .push(entry);
+            })),
+        );
+        let (_, tool) = tools[1]();
+
+        tool.execute(
+            &json!({"slug":"multi-agent-workflow","reason":"review complete"}).to_string(),
+            ToolExecutionContext::default(),
+        )
+        .await
+        .expect("status tool succeeds");
+
+        let committed = committed.lock().expect("committed entries mutex poisoned");
+        let LogEntry::Extension {
+            domain, payload, ..
+        } = committed.last().expect("extension committed")
+        else {
+            panic!("expected typed active workflow extension");
+        };
+        assert_eq!(domain, DOMAIN);
+        let snapshot: ActiveWorkflowSnapshot = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(
+            snapshot.workflows[0].status,
+            ActiveWorkflowStatus::Completed
+        );
     }
 
     #[test]
