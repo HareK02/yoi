@@ -145,3 +145,58 @@ Critical risks / reviewer focus:
 Routing decision と accepted implementation plan を記録済み。blocking relation / orchestration-plan blocker はなく、Orchestrator workspace は clean。implementation side effects の前に `queued -> inprogress` acceptance を記録する。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KTFY8V80 at: 2026-06-14T15:50:38Z -->
+
+## Implementation report
+
+Implementation report from Coder Pod `yoi-coder-00001KTFY8V80`:
+
+Commit:
+- `362fedfb fix: preserve active workflows across compaction`
+
+Changed files:
+- `crates/pod/src/active_workflow.rs`
+- `crates/pod/src/lib.rs`
+- `crates/pod/src/pod.rs`
+- `crates/pod/src/segment_log_sink.rs`
+- `resources/prompts/internal/compact_system.md`
+
+Implemented behavior:
+- Added durable typed active workflow state as session-log extension domain `pod.active_workflows`.
+- State records include:
+  - workflow slug
+  - invocation source/time
+  - task scope
+  - active/completed/cancelled status
+  - snapshotted workflow guidance
+  - extracted obligations/checkpoints
+  - completion/cancellation reason/time
+- Workflow bodies are snapshotted at invocation time rather than resolved to latest resource/builtin version during rehydration. Rationale: active workflow authority remains traceable to the original governed task and does not silently change when resource files change later.
+- Compaction now:
+  - feeds active workflow state into compact worker input
+  - writes active workflow state into the replacement segment as typed extension state
+  - injects post-compaction workflow guidance into `SegmentStart.history` from durable state, not transient turn-local data
+- Added `ActiveWorkflowList`, `ActiveWorkflowComplete`, and `ActiveWorkflowCancel` tools so active workflow state can be inspected, completed, or explicitly cancelled.
+- Missing/corrupt/unsupported active workflow extension state fails closed with bounded diagnostics rather than reusing stale prior state.
+
+Validation reported by coder:
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check`
+- Passed: `cargo test -p pod active_workflow --lib`
+  - includes focused coverage for review/merge/close-style obligations crossing compaction/rehydration
+- Passed: `cargo test -p pod includes_active_workflow_snapshot_section --lib`
+- Ran: `cargo test -p pod --lib`
+  - Failed on 2 prompt text assertions reported as unrelated/pre-existing:
+    - `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`
+    - `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`
+    - both assert the unrelated string `worktree status, diff, and test results`
+
+Repository status:
+- Child implementation worktree clean after commit.
+
+Residual risks / notes:
+- Active workflow obligation extraction is intentionally conservative: it stores full snapshotted guidance as authority and derives bounded checkpoint labels from obligation-like lines.
+- Completion/cancellation tool calls persist through normal history; compaction additionally writes updated typed snapshot into the compacted segment.
+
+---
