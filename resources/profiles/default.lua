@@ -2,7 +2,6 @@ return yoi.profile {
     slug = "default",
     description = "Default Yoi coding profile",
 
-    scope = yoi.scope.workspace_write(),
 
     session = {
         record_event_trace = true,

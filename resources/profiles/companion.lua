@@ -2,9 +2,6 @@ local p = yoi.profile.import("builtin:default")
 
 p.slug = "companion"
 p.description = "Companion role profile with bundled reusable policy"
-p.scope = yoi.scope.workspace_write({
-    deny_write = { ".worktree" },
-})
 p.feature = {
     task = { enabled = true },
     memory = { enabled = true },

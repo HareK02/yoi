@@ -729,9 +729,6 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             },
         };
 
-        if cfg.scope.allow.is_empty() {
-            return Err(ResolveError::MissingField("scope.allow"));
-        }
         for rule in &cfg.scope.allow {
             ensure_absolute("scope.allow.target", &rule.target)?;
         }
@@ -1028,11 +1025,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rejects_empty_scope() {
+    fn resolve_accepts_empty_scope_for_profile_launch_policy() {
         let mut cfg = minimal_valid();
         cfg.scope.allow.clear();
-        let err = PodManifest::try_from(cfg).unwrap_err();
-        assert!(matches!(err, ResolveError::MissingField("scope.allow")));
+        let manifest = PodManifest::try_from(cfg).unwrap();
+        assert!(manifest.scope.allow.is_empty());
     }
 
     #[test]

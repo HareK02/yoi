@@ -1054,6 +1054,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn orchestration_delegation_allows_root_read_and_worktree_writes_not_root_writes() {
+        let tmp = TempDir::new().unwrap();
+        let workspace_root = tmp.path().join("original");
+        let implementation_worktree = workspace_root.join(".worktree/ticket-1");
+        std::fs::create_dir_all(&implementation_worktree).unwrap();
+        let delegation = DelegationScope::from_config(&ScopeConfig {
+            allow: vec![
+                abs_rule(&workspace_root, Permission::Read),
+                abs_rule(&workspace_root.join(".worktree"), Permission::Write),
+            ],
+            deny: Vec::new(),
+        })
+        .unwrap();
+
+        let coder_scope = vec![
+            abs_rule(&workspace_root, Permission::Read),
+            abs_rule(&implementation_worktree, Permission::Write),
+        ];
+        assert!(
+            coder_scope
+                .iter()
+                .all(|rule| delegation.allows_rule(rule).unwrap())
+        );
+
+        let reviewer_scope = vec![abs_rule(&workspace_root, Permission::Read)];
+        assert!(
+            reviewer_scope
+                .iter()
+                .all(|rule| delegation.allows_rule(rule).unwrap())
+        );
+
+        let root_writer_scope = vec![abs_rule(&workspace_root, Permission::Write)];
+        assert!(
+            root_writer_scope
+                .iter()
+                .any(|rule| !delegation.allows_rule(rule).unwrap())
+        );
+    }
+
     fn parent_manifest(root: &Path, deny: Option<&Path>) -> PodManifest {
         PodManifestConfig {
             pod: PodMetaConfig {

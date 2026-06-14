@@ -5,7 +5,8 @@ use std::process::ExitCode;
 use crate::{Pod, PodController, PromptLoader};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use manifest::{
-    PodManifest, PodManifestConfig, ProfileResolveOptions, ProfileResolver, ProfileSelector, paths,
+    Permission, PodManifest, PodManifestConfig, ProfileResolveOptions, ProfileResolver,
+    ProfileSelector, ScopeConfig, ScopeRule, paths,
 };
 use pod_store::{CombinedStore, FsPodStore, PodMetadataStore};
 use session_store::{FsStore, SegmentId, Store};
@@ -147,27 +148,43 @@ where
 {
     let workspace_root = runtime_workspace_root(cli)?;
     let runtime_pod_name = runtime_pod_name(cli, &workspace_root);
-    let mut manifest_and_loader = if let Some(config_json) = cli.spawn_config_json.as_deref() {
-        load_spawn_config_json(config_json)?
-    } else if let Some(profile) = &cli.profile {
-        let selector = ProfileSelector::parse_cli(profile);
-        load_profile_fn(&selector, &workspace_root, &runtime_pod_name)?
-    } else if let Some(path) = &cli.manifest {
-        load_single_manifest(path, cli.pod.as_deref(), &runtime_pod_name)?
-    } else {
-        if cli.project.is_some() {
-            return Err(
+    let ((mut manifest, loader), manifest_source) =
+        if let Some(config_json) = cli.spawn_config_json.as_deref() {
+            (
+                load_spawn_config_json(config_json)?,
+                ManifestSource::SpawnConfig,
+            )
+        } else if let Some(profile) = &cli.profile {
+            let selector = ProfileSelector::parse_cli(profile);
+            (
+                load_profile_fn(&selector, &workspace_root, &runtime_pod_name)?,
+                ManifestSource::ProfileLaunch,
+            )
+        } else if let Some(path) = &cli.manifest {
+            (
+                load_single_manifest(path, cli.pod.as_deref(), &runtime_pod_name)?,
+                ManifestSource::ManifestFile,
+            )
+        } else {
+            if cli.project.is_some() {
+                return Err(
                 "--project is no longer supported; normal startup uses profile discovery/default, \
                  and --manifest <PATH> is the only one-file manifest mode"
                     .to_string(),
             );
-        }
-        let selector = ProfileSelector::Default;
-        load_profile_fn(&selector, &workspace_root, &runtime_pod_name)?
-    };
+            }
+            let selector = ProfileSelector::Default;
+            (
+                load_profile_fn(&selector, &workspace_root, &runtime_pod_name)?,
+                ManifestSource::ProfileLaunch,
+            )
+        };
 
-    apply_session_restore_overrides(&mut manifest_and_loader.0, cli)?;
-    Ok(manifest_and_loader)
+    if manifest_source == ManifestSource::ProfileLaunch {
+        apply_profile_launch_policy(&mut manifest, &workspace_root, cli.ticket_role.as_deref())?;
+    }
+    apply_session_restore_overrides(&mut manifest, cli)?;
+    Ok((manifest, loader))
 }
 
 fn apply_session_restore_overrides(manifest: &mut PodManifest, cli: &Cli) -> Result<(), String> {
@@ -233,7 +250,104 @@ fn load_single_manifest(
     }
     let manifest = PodManifest::try_from(config)
         .map_err(|e| format!("failed to resolve manifest {}: {e}", path.display()))?;
+    if manifest.scope.allow.is_empty() {
+        return Err(format!(
+            "manifest {} must declare scope.allow; profile launches receive concrete scope from launch policy",
+            path.display()
+        ));
+    }
     Ok((manifest, PromptLoader::builtins_only()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestSource {
+    ProfileLaunch,
+    ManifestFile,
+    SpawnConfig,
+}
+
+fn read_rule(target: PathBuf) -> ScopeRule {
+    ScopeRule {
+        target,
+        permission: Permission::Read,
+        recursive: true,
+    }
+}
+
+fn write_rule(target: PathBuf) -> ScopeRule {
+    ScopeRule {
+        target,
+        permission: Permission::Write,
+        recursive: true,
+    }
+}
+
+fn workspace_scope(
+    workspace_root: &Path,
+    permission: Permission,
+    deny_write: &[PathBuf],
+) -> ScopeConfig {
+    let allow_rule = ScopeRule {
+        target: workspace_root.to_path_buf(),
+        permission,
+        recursive: true,
+    };
+    let deny = deny_write
+        .iter()
+        .cloned()
+        .map(write_rule)
+        .collect::<Vec<_>>();
+    ScopeConfig {
+        allow: vec![allow_rule],
+        deny,
+    }
+}
+
+fn workspace_worktree_delegation(workspace_root: &Path) -> ScopeConfig {
+    ScopeConfig {
+        allow: vec![
+            read_rule(workspace_root.to_path_buf()),
+            write_rule(workspace_root.join(".worktree")),
+        ],
+        deny: Vec::new(),
+    }
+}
+
+fn apply_profile_launch_policy(
+    manifest: &mut PodManifest,
+    workspace_root: &Path,
+    ticket_role: Option<&str>,
+) -> Result<(), String> {
+    let role = match ticket_role {
+        Some(raw) => {
+            Some(TicketRole::parse(raw).ok_or_else(|| format!("invalid ticket role `{raw}`"))?)
+        }
+        None => None,
+    };
+    match role {
+        Some(TicketRole::Orchestrator) => {
+            manifest.scope = workspace_scope(workspace_root, Permission::Read, &[]);
+            manifest.delegation_scope = workspace_worktree_delegation(workspace_root);
+        }
+        Some(TicketRole::Intake) | Some(TicketRole::Reviewer) => {
+            manifest.scope = workspace_scope(workspace_root, Permission::Read, &[]);
+            manifest.delegation_scope = ScopeConfig::default();
+        }
+        Some(TicketRole::Coder) => {
+            manifest.scope = workspace_scope(workspace_root, Permission::Write, &[]);
+            manifest.delegation_scope = ScopeConfig::default();
+        }
+        None => {
+            let worktree_root = workspace_root.join(".worktree");
+            manifest.scope = workspace_scope(
+                workspace_root,
+                Permission::Write,
+                std::slice::from_ref(&worktree_root),
+            );
+            manifest.delegation_scope = workspace_worktree_delegation(workspace_root);
+        }
+    }
+    Ok(())
 }
 
 pub async fn run_cli() -> ExitCode {
@@ -762,6 +876,96 @@ permission = "write"
 
         assert!(called);
         assert_eq!(manifest.pod.name, "runtime-workspace");
+        assert_eq!(manifest.scope.allow.len(), 1);
+        assert_eq!(manifest.scope.allow[0].target, workspace);
+        assert_eq!(manifest.scope.allow[0].permission, Permission::Write);
+        assert_eq!(manifest.scope.deny.len(), 1);
+        assert_eq!(
+            manifest.scope.deny[0].target,
+            tmp.path().join("runtime-workspace/.worktree")
+        );
+        assert_eq!(manifest.scope.deny[0].permission, Permission::Write);
+        assert_eq!(manifest.delegation_scope.allow.len(), 2);
+        assert_eq!(
+            manifest.delegation_scope.allow[0].target,
+            tmp.path().join("runtime-workspace")
+        );
+        assert_eq!(
+            manifest.delegation_scope.allow[0].permission,
+            Permission::Read
+        );
+        assert_eq!(
+            manifest.delegation_scope.allow[1].target,
+            tmp.path().join("runtime-workspace/.worktree")
+        );
+        assert_eq!(
+            manifest.delegation_scope.allow[1].permission,
+            Permission::Write
+        );
+    }
+
+    #[test]
+    fn orchestrator_profile_launch_gets_read_root_and_worktree_delegation_from_launch_policy() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("original-workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let cli = Cli::try_parse_from([
+            "yoi pod",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--profile",
+            "builtin:orchestrator",
+            "--ticket-role",
+            "orchestrator",
+        ])
+        .unwrap();
+
+        let (manifest, _loader) =
+            resolve_manifest_with_profile_loader(&cli, |selector, _workspace_root, pod_name| {
+                assert_eq!(
+                    selector,
+                    &ProfileSelector::source_named(
+                        manifest::ProfileRegistrySource::Builtin,
+                        "orchestrator"
+                    )
+                );
+                let mut manifest =
+                    PodManifest::from_toml(&manifest_toml("from-orchestrator-profile", tmp.path()))
+                        .unwrap();
+                manifest.pod.name = pod_name.to_string();
+                Ok((manifest, PromptLoader::builtins_only()))
+            })
+            .unwrap();
+
+        assert_eq!(manifest.scope.allow.len(), 1);
+        assert_eq!(manifest.scope.allow[0].target, workspace);
+        assert_eq!(manifest.scope.allow[0].permission, Permission::Read);
+        assert!(manifest.scope.deny.is_empty());
+        assert_eq!(manifest.delegation_scope.allow.len(), 2);
+        assert_eq!(
+            manifest.delegation_scope.allow[0].target,
+            tmp.path().join("original-workspace")
+        );
+        assert_eq!(
+            manifest.delegation_scope.allow[0].permission,
+            Permission::Read
+        );
+        assert_eq!(
+            manifest.delegation_scope.allow[1].target,
+            tmp.path().join("original-workspace/.worktree")
+        );
+        assert_eq!(
+            manifest.delegation_scope.allow[1].permission,
+            Permission::Write
+        );
+        assert!(
+            !manifest
+                .delegation_scope
+                .allow
+                .iter()
+                .any(|rule| rule.target == tmp.path().join("original-workspace")
+                    && rule.permission == Permission::Write)
+        );
     }
 
     #[test]
