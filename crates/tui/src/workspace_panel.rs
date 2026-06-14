@@ -693,7 +693,14 @@ fn build_ticket_rows(
         }
         match backend.show_partial(TicketIdOrSlug::Query(summary.id.clone())) {
             Ok(ticket) => {
+                let current_ticket_invalid = ticket
+                    .invalid_records
+                    .iter()
+                    .any(|record| record.label == summary.id);
                 invalid_records.extend(ticket.invalid_records);
+                if current_ticket_invalid {
+                    continue;
+                }
                 ticket_rows.push(ticket_row(
                     summary,
                     &ticket.ticket.events,
@@ -1387,6 +1394,59 @@ mod tests {
                 .iter()
                 .any(|row| row.title.contains("Leaked Secret Invalid"))
         );
+    }
+
+    #[test]
+    fn workspace_panel_disables_current_ticket_when_detail_artifact_is_invalid() {
+        let temp = TempDir::new().unwrap();
+        write_ticket_config(temp.path());
+        let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
+        let mut corrupt_input = NewTicket::new("Ready With Corrupt Relations");
+        corrupt_input.workflow_state = Some(TicketWorkflowState::Ready);
+        let corrupt = backend.create(corrupt_input).unwrap();
+        let mut other_input = NewTicket::new("Other Ready Still Queueable");
+        other_input.workflow_state = Some(TicketWorkflowState::Ready);
+        let other = backend.create(other_input).unwrap();
+
+        let artifacts = temp
+            .path()
+            .join(".yoi/tickets")
+            .join(&corrupt.id)
+            .join("artifacts");
+        fs::create_dir_all(&artifacts).unwrap();
+        fs::write(artifacts.join("relations.json"), "{").unwrap();
+
+        let model = build_workspace_panel(temp.path(), &empty_pods());
+
+        let corrupt_placeholders = model
+            .rows
+            .iter()
+            .filter(|row| row.key == PanelRowKey::InvalidTicket(corrupt.id.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(corrupt_placeholders.len(), 1);
+        let corrupt_placeholder = corrupt_placeholders[0];
+        assert_eq!(corrupt_placeholder.kind, PanelRowKind::InvalidTicket);
+        assert_eq!(corrupt_placeholder.next_action, None);
+        assert!(corrupt_placeholder.ticket.is_none());
+        assert!(!corrupt_placeholder.is_ticket_action());
+
+        assert!(
+            !model
+                .rows
+                .iter()
+                .any(|row| row.key == PanelRowKey::Ticket(corrupt.id.clone()))
+        );
+
+        let other_row = model
+            .rows
+            .iter()
+            .find(|row| row.key == PanelRowKey::Ticket(other.id.clone()))
+            .unwrap();
+        assert_eq!(other_row.next_action, Some(NextUserAction::Queue));
+        assert!(other_row.is_ticket_action());
+
+        let diagnostics = model.header.diagnostics.join("\n");
+        assert!(diagnostics.contains("Ticket records partially loaded: 1 invalid record"));
     }
 
     #[test]
