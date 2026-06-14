@@ -157,3 +157,61 @@ Residual risks / blockers:
 - Strict backend list/show behavior was preserved; new partial methods are opt-in for Panel tolerance.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KV3A5CNH at: 2026-06-14T16:27:19Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+Blocker:
+- A corrupt current-ticket relation artifact can still produce an actionable normal Ticket row.
+
+Details:
+- New tolerant relation loading records relation-artifact failures as `TicketInvalidRecord`, but still returns an `Ok(Ticket)` with lossy/omitted relations.
+- `LocalTicketBackend::show_partial` returns `ticket_from_dir_tolerant(...)` as successful partial details.
+- `relation_view_for_meta_tolerant` builds a relation view from remaining records after `all_ticket_relation_records_tolerant` records relation read errors.
+- Panel unconditionally emits a normal actionable `ticket_row(...)` whenever `show_partial` returns `Ok`, and only extends `invalid_records` for diagnostics.
+- A ready row can therefore still receive `NextUserAction::Queue`.
+
+Consequence:
+- If a ready Ticket's own `artifacts/relations.json` is corrupt/unreadable, Panel can show both:
+  1. a normal ready Ticket row with `Queue`, and
+  2. an invalid placeholder for the same Ticket id.
+- This violates the invariant that invalid/corrupt Ticket records must not expose Queue/Close/planning-return/lifecycle mutation actions.
+- It is also risky because malformed relations may hide dependency/blocker authority; Queue must not be exposed for that same corrupt Ticket record.
+
+Required changes:
+- If partial detail loading reports an invalid record for the same Ticket id being rendered, do not also render that Ticket as an actionable normal row.
+- Replace it with a disabled invalid placeholder, or otherwise guarantee no lifecycle mutation action is available for that id.
+- Add focused coverage for a valid `item.md` with corrupt/unreadable current Ticket detail/artifact, preferably malformed `artifacts/relations.json`, asserting:
+  - Ticket id is visible as invalid diagnostic/placeholder.
+  - no Queue/Close/lifecycle action is available for that Ticket id.
+  - other valid Ticket rows/actions remain available.
+
+Evidence checked:
+- Reviewed implementation diff `a1c8264b..b83b9e4e`.
+- Inspected:
+  - `crates/ticket/src/lib.rs`
+  - `crates/tui/src/workspace_panel.rs`
+  - `crates/tui/src/multi_pod.rs`
+  - Ticket `00001KV3A5CNH` item.
+
+Positive findings:
+- Strict `TicketBackend::list/show` behavior remains unchanged; partial behavior is opt-in.
+- Mixed valid/invalid item frontmatter is covered by focused tests.
+- Panel creates disabled invalid placeholder rows with no `next_action`.
+- Backend config unusable remains a whole-ticket degraded case in tests.
+- Existing associated Intake row behavior is covered for a valid ready Ticket.
+
+Validation performed by reviewer:
+- Passed: `git diff --check a1c8264b..HEAD`
+- Passed: `cargo fmt --check`
+
+Validation not run:
+- `cargo test` was not rerun because review scope was read-only and Cargo writes build artifacts.
+
+Conclusion:
+- Changes requested. Do not integrate until current-ticket detail/artifact corruption cannot expose lifecycle actions and focused coverage is added.
+
+---
