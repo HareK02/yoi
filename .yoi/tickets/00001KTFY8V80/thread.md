@@ -317,3 +317,58 @@ Repository status:
 - Child implementation worktree clean after follow-up commit.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KTFY8V80-r2 at: 2026-06-14T16:25:00Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Evidence checked:
+- Child worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KTFY8V80-active-workflows-compaction`
+- HEAD: `ff446052 fix: gate active workflow rehydration state`
+- Base checked against: `73d0a6a4`
+- Original implementation checked where relevant: `362fedfb`
+
+Prior blocker 1: stale active workflow guidance after compaction
+- Resolved.
+- Active workflow rehydration is now derived from typed `LogEntry::Extension` state via `ActiveWorkflowStore`, not from ordinary prompt/tool-call history.
+- Restore strips prior `[Active workflow snapshot]` system messages before installing history.
+- Rehydration guidance is regenerated request-time from validated active typed state.
+- Missing/corrupt/unsupported extension state fails closed: no active workflow restored, stale rehydration messages stripped, and bounded inactive diagnostic text tells the model not to treat older compacted history/summaries as active workflow authority.
+- Completed/cancelled typed state does not regenerate active guidance.
+- Compaction no longer stores active workflow guidance directly in `SegmentStart.history` as ordinary durable prompt authority; it carries typed extension entries.
+- Focused coverage exists for stale active workflow message plus missing/corrupt/unsupported state and completion/cancellation after compaction.
+
+Prior blocker 2: completion/cancellation durability
+- Resolved.
+- `ActiveWorkflowComplete` / `ActiveWorkflowCancel` mutate store status and commit a fresh typed `LogEntry::Extension` snapshot through the active workflow log committer.
+- Production controller wiring attaches the log writer before feature/tool registration, so status tools have durable commit plumbing.
+- Restore no longer trusts bare unmatched `Item::ToolCall` entries or failed/error calls to infer completed/cancelled state.
+- Focused tests cover unmatched/error status tool calls and explicit completed/cancelled typed extension suppression of active guidance.
+
+Overall acceptance:
+- Durable typed active workflow representation exists.
+- Compaction carries active workflow state forward through typed extension state.
+- Rehydration restores guidance from durable validated state.
+- Snapshot-vs-latest policy is explicit and fail-closed on missing/corrupt/unsupported latest state.
+- No hidden context injection from non-durable transient data was found.
+- Active vs advertised workflow separation is preserved.
+- Clear/cancel/complete behavior is durable typed-state transition.
+
+Validation performed by reviewer:
+- Passed: `git diff --check 73d0a6a4..HEAD`
+- Passed: `cargo fmt --check`
+- `git status --short` remained clean.
+
+Validation not rerun by reviewer:
+- Cargo tests were not rerun because review scope was read-only and tests write build artifacts. Coder-reported focused test results were inspected as evidence.
+
+Full-suite prompt failure assessment:
+- The remaining reported `cargo test -p pod --lib` prompt assertion failures involving `worktree status, diff, and test results` appear unrelated to the active workflow typed-state/compaction changes.
+
+Conclusion:
+- Approved. No remaining blocker found.
+
+---
