@@ -161,3 +161,81 @@ Next action:
 - planning return ではなく queued のまま waiting とする。
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-14T15:49:34Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- 先行 Coder のうち `00001KV09WYC6` が implementation report を返し review stage に入ったため、Plugin work 用の Coder capacity を再評価した。
+- Ticket body / thread / relations / orchestration plan / Orchestrator workspace state を再確認した。blocking relation はなく、既存 waiting note は capacity 起因であり、現在は1件分の Coder capacity を空けられる。
+- 本 Ticket は Plugin package / discovery / enablement boundary の design/documentation work が主で、active Panel/TUI implementation と source surface が大きく重ならない。
+- Plugin/MCP/feature-layer authority boundary に関する prior decisions は Ticket thread に記録済みで、残る不確実性は proposal の構成・記述・必要最小限の config shape 調査に閉じている。
+
+Evidence checked:
+- Ticket body / thread: package format、store/source mapping、discovery vs enablement、manifest semantics、runtime-specific notes、cache/pinning、diagnostics、prior Plugin/MCP/feature-layer decisions を確認。
+- Ticket relations: blocker なし。
+- OrchestrationPlan: capacity waiting note 1件のみ。blocking/conflict record なし。
+- Orchestrator workspace: `/home/hare/Projects/yoi/.worktree/orchestration` は clean、`80a9e40d` 上。
+- Active Pods: `00001KTFY8V80` coder running、`00001KV09WYC6` reviewer running。
+- Bounded code/doc map: Plugin docs は未作成。関連 candidate は `docs/design/*`, `crates/manifest/src/{config,profile}.rs`, `crates/pod/src/feature.rs`, `crates/pod/src/hook.rs`。
+
+IntentPacket:
+
+Intent:
+- `.yoi-plugin` package distribution/discovery/enablement boundary の durable design proposal を repository に追加し、後続 implementation Ticket を独立して切れる状態にする。
+
+Binding decisions / invariants:
+- Package presence in user/workspace plugin stores is discovery only; registration, WASM init, Hooks/Tools contribution, process/server startup, and MCP server launch require explicit enablement and grants.
+- Source-qualified identity is required: `user:<id>`, `project:<id>`, `builtin:<id>` are distinct; ambiguous unqualified IDs fail closed.
+- Plugin permission declarations are requests, not grants. Effective grants are Plugin-layer policy plus existing manifest/profile/scope/tool/web/secret/runtime allowlists.
+- Do not model Plugin permissions with `pod::feature` HostAuthority/grant concepts.
+- MCP remains a separate feature-backed integration and is out of initial Plugin packaging/runtime unless future Ticket explicitly approves a bridge.
+- Archive handling must reject path traversal and unsafe layout, use bounded extraction, compute deterministic digest, and materialize into digest-keyed cache before runtime initialization.
+- Restore should use resolved manifest/session metadata for enabled Plugin plan; fresh discovery must not silently upgrade a restored Pod.
+
+Requirements / acceptance criteria:
+- Repository contains a documented Plugin distribution/package proposal covering `.yoi-plugin` archive structure, root `plugin.toml`, assets, user/workspace/builtin stores, source/trust mapping, identity collision rules, discovery vs enablement, manifest fields, archive safety, cache/digest/pinning, diagnostics, and runtime-specific notes for declarative hooks and WASM.
+- Proposal explicitly states store placement is discovery only, not execution or registration.
+- Proposal distinguishes Plugin permission request/grant model from `pod::feature` authority concepts.
+- Proposal calls out MCP as separate and out of initial Plugin packaging.
+- Follow-up implementation cuts are clear for manifest/profile enablement, package discovery, archive validation/cache, Plugin permission policy, WASM packaging, and any future MCP/plugin bridge.
+
+Implementation latitude:
+- Primary deliverable may be a design doc plus minimal cross-references; code changes are optional and should stay within safe internal boundaries.
+- Coder may choose exact doc path/name consistent with existing docs organization.
+- If proposing config shape, prefer illustrative schemas over broad runtime implementation unless obviously small and safe.
+
+Escalate if:
+- A real runtime implementation becomes necessary to satisfy the Ticket.
+- Plugin package design would require changing Profile/manifest authority semantics, Pod restore semantics, secret handling, or MCP enablement model.
+- The proposal would imply workspace package execution or silent restore upgrades.
+
+Validation:
+- `cargo fmt --check` if code or Rust doc tests are touched.
+- `git diff --check` always.
+- If only Markdown docs are touched, focused validation may be `git diff --check` plus link/path sanity review.
+
+Current code/doc map:
+- Likely doc destination: `docs/design/`.
+- Related architecture candidates: `crates/manifest/src/config.rs`, `crates/manifest/src/profile.rs`, `crates/pod/src/feature.rs`, `crates/pod/src/hook.rs`.
+
+Critical risks / reviewer focus:
+- Discovery vs enablement separation.
+- Plugin permission requests vs grants.
+- MCP separation.
+- Source identity collision/fail-closed behavior.
+- Archive safety and digest/cache semantics.
+- Restore/fresh discovery no silent upgrade invariant。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-14T15:49:39Z from: queued to: inprogress reason: orchestrator_acceptance_after_capacity_release field: state -->
+
+## State changed
+
+Routing decision と accepted implementation plan を記録済み。blocking relation / orchestration-plan blocker はなく、capacity waiting reason は解消した。implementation side effects の前に `queued -> inprogress` acceptance を記録する。
+
+---
