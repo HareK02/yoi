@@ -167,3 +167,47 @@ Result: approve. No blocking requirement or design-boundary concern found.
 
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-14T07:04:12Z -->
+
+## Implementation report
+
+Integration outcome: merged and validated.
+
+- Implementation branch: `ticket-00001KV11DHGZ-profile-launch-policy-scope`
+- Implementation commit: `21bf009a feat: move profile scope to launch policy`
+- Report commit: `77892b94 ticket: report 00001KV11DHGZ implementation`
+- Review commit: `dcbdf251 ticket: approve profile launch policy scope`
+- Orchestrator merge commit: `3a67b95b merge: profile launch policy scope`
+
+Reviewer result:
+- `approve`。Builtin role Profiles no longer carry concrete `scope` / `delegation_scope`; fresh profile launches get concrete scope/delegation from launch policy; Orchestrator launch gets direct root read plus delegation root read + `.worktree` write with no root workspace write delegation; SpawnPod child scope remains explicit delegated scope; restore preserves saved metadata snapshot.
+
+Orchestrator validation after merge:
+- `cargo test -p manifest --quiet`: PASS
+- `cargo test -p pod --lib entrypoint::tests::normal_startup_uses_default_profile --quiet`: PASS
+- `cargo test -p pod --lib entrypoint::tests::orchestrator_profile_launch_gets_read_root_and_worktree_delegation_from_launch_policy --quiet`: PASS
+- `cargo test -p pod --lib spawn::tool::tests::orchestration_delegation_allows_root_read_and_worktree_writes_not_root_writes --quiet`: PASS
+- `cargo test -p pod --lib pod::pod_metadata_restore_manifest_tests::snapshot_preserves_saved_scope_over_current_manifest --quiet`: PASS
+- `cargo test -p client ticket_role --quiet`: PASS
+- `cargo build -p yoi`: PASS
+- `cargo fmt --check`: PASS
+- `git diff --check`: PASS
+- `nix build .#yoi`: PASS
+
+Residual notes:
+- User Profile `scope` compatibility remains supported for now; builtin role authority no longer depends on Profile concrete scope.
+- Full `cargo test -p pod --lib` was not used as merge gate because Coder observed pre-existing prompt text assertion failures unrelated to this diff.
+
+Next:
+- Mark Ticket done and clean up child coder/reviewer Pods plus implementation worktree/branch.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-14T07:04:22Z from: inprogress to: done reason: merged_and_validated field: state -->
+
+## State changed
+
+Implementation branch was reviewed, approved, merged into the Orchestrator branch as `3a67b95b`, and validated in the Orchestrator worktree. Focused manifest/client/pod launch-policy/scope/restore tests, build, formatting, diff check, and `nix build .#yoi` passed. Ticket implementation work is done; closure remains separate.
+
+---
