@@ -77,3 +77,33 @@ Risks:
 
 
 ---
+
+<!-- event: review author: hare at: 2026-06-14T06:37:08Z status: approve -->
+
+## Review: approve
+
+Approve.
+
+Evidence:
+- Reviewed `git diff f709fc10..HEAD` for implementation commit `645d048d`.
+- Ticket action rows now expand each Ticket into two selectable visual rows: the first renders canonical state plus title, the second renders Ticket id, derived gate, action, and reason. The selected marker is the `| ` grouping marker on both visual lines, and the title line no longer embeds the Ticket id.
+- Hit testing merges adjacent visual rows with the same `PanelRowKey`, so both Ticket visual lines select the same logical row/hitbox; mouse selection does not dispatch by itself, with dispatch still requiring the existing blank-Enter path.
+- Relation blockers are derived from relation data into `Wait`/queue-disabled gate text and preserve the canonical workflow state rather than introducing a persisted `waiting` lifecycle state or the old blocked/edit/human-reply row class.
+- Short-area/list-row slicing remains bounded by available height and hitboxes ignore out-of-area rows, so very small panel areas degrade without panics.
+
+Validation:
+- `cargo test -p tui panel_ticket --lib` — passed (3 tests).
+- `cargo test -p tui row_hit_testing --lib` — passed (1 test).
+- `cargo test -p tui mouse_click --lib` — passed (2 tests).
+- `cargo test -p tui ready_ticket_with_waiting_gate --lib` — passed (1 test).
+- `cargo test -p tui workspace_panel_marks_ready_ticket_with_unresolved_relation_waiting_gate --lib` — passed (1 test).
+- `cargo test -p yoi-e2e --features e2e --test panel -- --nocapture` — passed (3 tests).
+- `cargo build -p yoi` — passed.
+- `cargo fmt --check` — passed.
+- `git diff --check f709fc10..HEAD` — passed.
+
+Risks / unresolved:
+- None found within the requested review focus.
+
+
+---
