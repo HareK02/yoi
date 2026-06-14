@@ -2,7 +2,7 @@
 title: 'Plugin distribution package format and discovery'
 state: 'inprogress'
 created_at: '2026-06-01T06:49:53Z'
-updated_at: '2026-06-14T15:53:15Z'
+updated_at: '2026-06-14T15:56:22Z'
 queued_by: 'workspace-panel'
 queued_at: '2026-06-14T15:40:15Z'
 ---

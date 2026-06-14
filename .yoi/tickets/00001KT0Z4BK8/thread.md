@@ -287,3 +287,52 @@ Residual risks / blockers:
 - This is intentionally a design proposal only. Exact manifest/Profile schema, lock-file format, archive limits, cache path, and WASM ABI details remain for follow-up implementation Tickets.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KT0Z4BK8 at: 2026-06-14T15:56:22Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Evidence checked:
+- Child worktree/branch:
+  - `/home/hare/Projects/yoi/.worktree/00001KT0Z4BK8-plugin-package-discovery`
+  - `impl/00001KT0Z4BK8-plugin-package-discovery`
+- HEAD: `3c674a70512ca31b5745d901959c04442c1695d0`
+- Base merge point: `d73f748ee8d2e25217cafe3754eb9fa8870ddbed`
+- Diff `d73f748e..HEAD` inspected:
+  - added `docs/design/plugin-packages.md`
+  - updated `docs/README.md`
+- Ticket intent/acceptance context reviewed from the child worktree Ticket record.
+
+Acceptance criteria review:
+- `.yoi-plugin` archive structure and required root `plugin.toml` are documented.
+- Packaged assets/layout are covered, including optional WASM module, hooks, schemas, README/license, and `assets/**`.
+- Stores and source/trust mapping are covered for `builtin:<id>`, `user:<id>`, and `project:<id>`.
+- Package presence in user/workspace stores is clearly discovery only, not execution/registration.
+- Source-qualified identity, ambiguous-id fail-closed behavior, and collision handling are covered.
+- Discovery vs enablement and restore/no-silent-upgrade behavior are explicit.
+- Manifest/Profile enablement shape is illustrative and appropriately deferred.
+- Plugin permission declarations are requests, not grants; effective grants are tied to Plugin-layer policy plus existing manifest/profile/tool/scope/web/secret/runtime authority layers.
+- The document avoids using `pod::feature` HostAuthority/grant concepts as Plugin permission/security model.
+- Archive safety covers traversal rejection, unsafe file types, bounded extraction, deterministic digest, digest-keyed cache, and manifest path validation.
+- Diagnostics guidance covers attribution, bounded output, and no secret leakage.
+- Runtime notes cover declarative hooks, WASM initialization from digest cache, host limits, and ToolRegistry/permission checks.
+- MCP is explicitly separate and out of the initial Plugin package runtime.
+- Follow-up implementation cuts are clear and separable.
+- `docs/README.md` cross-reference is appropriate and remains Why/design-oriented.
+
+Validation performed:
+- Passed: `git diff --check d73f748e..HEAD`
+- Passed: `git diff --check HEAD~1 HEAD`
+- README-listed relative doc target existence checked with shell commands.
+- Manual Markdown/design boundary review completed.
+
+Validation not run:
+- No cargo commands because the change is documentation-only.
+- A Python-based link check could not run because `python3` is unavailable; shell existence checks were used instead.
+
+Conclusion:
+- Approved. No blocking concern remains.
+
+---
