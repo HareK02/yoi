@@ -200,3 +200,62 @@ Residual risks / notes:
 - Completion/cancellation tool calls persist through normal history; compaction additionally writes updated typed snapshot into the compacted segment.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KTFY8V80 at: 2026-06-14T15:58:49Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+Evidence checked:
+- Child worktree/branch/head:
+  - `/home/hare/Projects/yoi/.worktree/00001KTFY8V80-active-workflows-compaction`
+  - `impl/00001KTFY8V80-active-workflows-compaction`
+  - HEAD `362fedfbe6689886f1e2e7c29da61e39b0ce1e38`
+  - merge base with requested base: `73d0a6a4`
+- `git status --short` was clean.
+- Diff `73d0a6a4..362fedfb` inspected.
+- Read-only validation:
+  - Passed: `git diff --check 73d0a6a4..362fedfb`
+- Cargo/fmt not rerun because review scope was read-only.
+
+What looks good:
+- A typed active workflow snapshot was added with slug, status, invocation source/time, task scope, snapshot policy, snapshotted guidance, obligations/checkpoints, and completion metadata.
+- Active workflow state is separated from advertised workflows; activation comes from invoked `SystemItem::Workflow` rather than resident workflow catalog.
+- Snapshot-vs-latest behavior is explicit via `WorkflowBodySnapshotPolicy::SnapshottedAtInvocation`.
+- Compaction passes active workflow state into compactor input and writes typed `LogEntry::Extension` into the compacted segment.
+- Clear/cancel tools are exposed as `ActiveWorkflowComplete` / `ActiveWorkflowCancel`.
+
+Required changes:
+
+1. Stale active workflow guidance can remain in prompt history after typed state is invalid, completed, or cancelled.
+
+- The implementation writes active workflow rehydration guidance as an ordinary system message in compacted history (`pod.rs` around the compaction replacement history construction).
+- Restore later uses `SegmentStart.history` as worker history.
+- Corrupt/obsolete extension handling drops/diagnoses the typed state but does not remove the old `[Active workflow snapshot]` system message from compacted history.
+- Therefore the model can still see stale workflow obligations even when the durable active-workflow extension is missing/corrupt/obsolete.
+- The same leakage risk applies after completion/cancellation: old compacted system messages can remain until another compaction.
+
+Required fix:
+- Ensure active workflow guidance shown to the model is gated by currently valid active workflow state, not immutable old compacted history.
+- For example, regenerate guidance from validated typed state at context/compaction time, or sanitize/supersede old active workflow system messages when typed state is invalid/inactive.
+- Add focused coverage for compacted history containing an active workflow message plus missing/corrupt/obsolete extension, and for completion/cancellation after compaction.
+
+2. Completion/cancellation durability is inferred from generic tool-call history and trusts bare `ToolCall`s.
+
+- `ActiveWorkflowComplete` / `ActiveWorkflowCancel` mutate only the in-memory store in the tool implementation.
+- They do not append a new typed `LogEntry::Extension` on successful status change.
+- Restore reconstructs completion/cancellation by scanning history.
+- Replay marks workflows completed/cancelled based solely on `Item::ToolCall` names, without requiring a matching successful `ToolResult`.
+
+Required fix:
+- Persist status changes as typed durable active workflow state when the status tool succeeds, or make replay validate a matching non-error tool result/event proving the tool executed successfully.
+- Add focused tests for interrupted/unmatched/error status tool calls.
+
+Prompt-test failure assessment:
+- The reported `cargo test -p pod --lib` failures about `worktree status, diff, and test results` appear unrelated. The diff changes `resources/prompts/internal/compact_system.md`, while the failing assertions are in pod orchestration prompt tests and reference a different prompt resource.
+
+Conclusion:
+- Changes requested. Do not integrate until stale-guidance gating and completion/cancellation durability are fixed and covered.
+
+---
