@@ -135,12 +135,18 @@ fn panel_ctrl_c_exits_promptly_after_background_barrier() -> yoi_e2e::Result<()>
         "quit latency {elapsed:?} exceeded threshold; artifacts at {}",
         panel.artifacts().dir.display()
     );
+    let events = panel.events()?;
     assert!(
-        panel
-            .events()?
-            .iter()
-            .any(|event| event.event == "quit_requested"),
+        events.iter().any(|event| event.event == "quit_requested"),
         "quit_requested observability event missing; artifacts at {}",
+        panel.artifacts().dir.display()
+    );
+    assert!(
+        events.iter().any(|event| {
+            event.event == "background_task_aborted"
+                && event.data.get("task").and_then(serde_json::Value::as_str) == Some("reload")
+        }),
+        "pending reload task should be aborted before quit completes; artifacts at {}",
         panel.artifacts().dir.display()
     );
     drop(panel);

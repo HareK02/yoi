@@ -489,7 +489,7 @@ async fn run_e2e_rewind_fixture(
                                     truncate_entries: 1,
                                     turn_index: 1,
                                     timestamp_ms: Some(1),
-                                    preview: "revise the plan".to_string(),
+                                    preview: "candidate rewind target".to_string(),
                                     eligible: true,
                                     disabled_reason: None,
                                     warning: None,
@@ -500,7 +500,7 @@ async fn run_e2e_rewind_fixture(
                                 "rewind_picker_opened",
                                 serde_json::json!({
                                     "targets": 1,
-                                    "selected_preview": "revise the plan",
+                                    "selected_preview": "candidate rewind target",
                                 }),
                             );
                         }
@@ -545,7 +545,7 @@ async fn run_e2e_rewind_fixture(
             if submitted_at.elapsed() >= apply_delay {
                 app.handle_pod_event(Event::RewindApplied {
                     entries: Vec::new(),
-                    input: vec![Segment::text("revise the plan")],
+                    input: vec![Segment::text("rewind-live-refresh")],
                     summary: RewindSummary {
                         truncated_to_entries: 1,
                         discarded_entries: 2,

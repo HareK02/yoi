@@ -13,6 +13,7 @@ fn single_pod_rewind_picker_applies_without_escape_and_suppresses_duplicate_ente
     tui.assert_no_full_drag_mouse_capture()?;
     tui.expect_event("rewind_fixture_ready", Duration::from_secs(5))?;
 
+    let before_rewind_output = tui.output_len();
     tui.press(KeyPress::CtrlR)?;
     tui.expect_event("rewind_picker_opened", Duration::from_secs(5))?;
 
@@ -34,10 +35,15 @@ fn single_pod_rewind_picker_applies_without_escape_and_suppresses_duplicate_ente
             .data
             .get("composer_text")
             .and_then(serde_json::Value::as_str),
-        Some("revise the plan"),
+        Some("rewind-live-refresh"),
         "rewind should update the visible composer state without Esc/restart; artifacts at {}",
         tui.artifacts().dir.display()
     );
+    tui.wait_for_output_contains_from(
+        before_rewind_output,
+        "rewind-live-refresh",
+        Duration::from_secs(5),
+    )?;
     assert_eq!(
         tui.count_events("rewind_submit_sent")?,
         submit_count,
