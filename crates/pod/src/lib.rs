@@ -1,3 +1,4 @@
+pub mod active_workflow;
 pub mod compact;
 pub mod controller;
 pub mod discovery;
