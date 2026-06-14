@@ -190,14 +190,12 @@ pub(crate) enum PanelRowKind {
     Planning,
     Ticket,
     Review,
-    Blocked,
     ActiveWork,
     Pod,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ActionPriority {
-    UserReply,
     ReadyForQueue,
     ActiveWork,
     Background,
@@ -208,7 +206,6 @@ pub(crate) enum NextUserAction {
     Clarify,
     Queue,
     Close,
-    Edit,
     Wait,
     OpenPod,
 }
@@ -219,7 +216,6 @@ impl NextUserAction {
             Self::Clarify => "Clarify",
             Self::Queue => "Queue",
             Self::Close => "Close",
-            Self::Edit => "Edit",
             Self::Wait => "Wait",
             Self::OpenPod => "Open",
         }
@@ -705,7 +701,8 @@ fn derive_ticket_state(
     relation_blockers: &[TicketRelationBlocker],
 ) -> DerivedTicketState {
     if !relation_blockers.is_empty() {
-        let blockers = relation_blockers
+        let shown_blockers = relation_blockers.iter().take(3).count();
+        let mut blockers = relation_blockers
             .iter()
             .take(3)
             .map(|blocker| {
@@ -718,15 +715,31 @@ fn derive_ticket_state(
             })
             .collect::<Vec<_>>()
             .join(", ");
+        let remaining_blockers = relation_blockers.len().saturating_sub(shown_blockers);
+        if remaining_blockers > 0 {
+            blockers.push_str(&format!(" (+{remaining_blockers} more)"));
+        }
+        let waiting_reason = format!("waiting for {blockers}");
         return DerivedTicketState {
-            kind: PanelRowKind::Blocked,
-            priority: ActionPriority::UserReply,
-            action: Some(NextUserAction::Edit),
-            disabled_reason: Some(
-                "Unresolved Ticket relation blocks queueing; resolve dependency/blocker before ready -> queued."
-                    .to_string(),
-            ),
-            key_hint: Some("Open the Ticket relation diagnostics before queueing".to_string()),
+            kind: match summary.workflow_state {
+                TicketWorkflowState::Planning => PanelRowKind::Planning,
+                TicketWorkflowState::Queued | TicketWorkflowState::InProgress => {
+                    PanelRowKind::ActiveWork
+                }
+                TicketWorkflowState::Done | TicketWorkflowState::Closed => PanelRowKind::Review,
+                TicketWorkflowState::Ready => PanelRowKind::Ticket,
+            },
+            priority: match summary.workflow_state {
+                TicketWorkflowState::Queued | TicketWorkflowState::InProgress => {
+                    ActionPriority::ActiveWork
+                }
+                _ => ActionPriority::Background,
+            },
+            action: Some(NextUserAction::Wait),
+            disabled_reason: Some(format!(
+                "Queue disabled: {waiting_reason}. Resolve dependency/blocker before ready -> queued."
+            )),
+            key_hint: Some(format!("Gate: {waiting_reason}")),
             blocked_reason: Some(blockers),
         };
     }
@@ -1105,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_panel_marks_ready_ticket_with_unresolved_relation_blocked() {
+    fn workspace_panel_marks_ready_ticket_with_unresolved_relation_waiting_gate() {
         let temp = TempDir::new().unwrap();
         write_ticket_config(temp.path());
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
@@ -1134,14 +1147,14 @@ mod tests {
             .find(|row| row.title == "Ready Blocked By Relation")
             .unwrap();
 
-        assert_eq!(row.kind, PanelRowKind::Blocked);
-        assert_eq!(row.next_action, Some(NextUserAction::Edit));
-        assert_eq!(row.priority, ActionPriority::UserReply);
+        assert_eq!(row.kind, PanelRowKind::Ticket);
+        assert_eq!(row.next_action, Some(NextUserAction::Wait));
+        assert_eq!(row.priority, ActionPriority::Background);
         assert!(
             row.disabled_reason
                 .as_deref()
                 .unwrap()
-                .contains("Unresolved Ticket relation")
+                .contains("Queue disabled: waiting for")
         );
         assert!(
             row.ticket
