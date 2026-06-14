@@ -82,3 +82,61 @@ Validation:
 Ticket evidence, satisfied dependency on HostAuthority cleanup, relation records, orchestration plan, and clean workspace state were checked. No blockers remain; accept for implementation before worktree/spawn side effects.
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-14T06:30:42Z -->
+
+## Implementation report
+
+Implemented provider feature API for Ticket 00001KTR81P9X.
+
+Summary:
+- Extended `pod::feature` descriptors with `ProtocolProviderDeclaration` and provider lifecycle state/diagnostic reporting.
+- Added `ProtocolProviderContribution` and `FeatureInstallContext::protocol_providers()` so startup-discovered provider tools, services, and background task declarations register through the existing feature install pipeline.
+- Provider tools are materialized once at startup and then installed as ordinary Worker tool definitions, preserving stable schemas for the run and normal permission/history/bounded-result execution paths.
+- Unavailable providers record lifecycle diagnostics and skip discovered contributions without adding a separate feature authority layer.
+- Added focused tests for ready providers, failed providers, undeclared providers, and stable dynamic tool metadata.
+
+Validation:
+- PASS: `cargo fmt --check`
+- PASS: `cargo test -p pod feature::tests`
+- PASS: `cargo check --workspace --all-targets`
+- PASS: `git diff --check`
+- FAIL (pre-existing/unrelated prompt assertion): `cargo test -p pod` fails in `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body` and `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`, both expecting the phrase `worktree status, diff, and test results`.
+- FAIL (environment/resource): `nix build --no-link .#yoi` compiles through the Rust crates but fails during final binary link with `No space left on device`.
+
+Risks/notes:
+- This does not implement MCP protocol, MCP trust policy, plugin permissions, subprocess management, or a replacement HostAuthority-style grant layer.
+- Provider metadata and diagnostics remain install-report data; actual provider tool execution goes through the normal Worker/tool machinery.
+
+
+---
+
+<!-- event: review author: hare at: 2026-06-14T06:36:23Z status: approve -->
+
+## Review: approve
+
+## Review: approve
+
+Reviewed implementation commit `053a4f90` against Ticket `00001KTR81P9X` and base routing commit `f709fc10`.
+
+Evidence:
+- Diff is limited to the Ticket record and `crates/pod/src/feature.rs`.
+- The provider API extension stays in `pod::feature` as a contribution/reporting substrate: `ProviderId`, `ProtocolProviderDeclaration`, `ProtocolProviderLifecycleState`, `ProtocolProviderContribution`, lifecycle diagnostics, and `FeatureInstallContext::protocol_providers()` were added without introducing `HostAuthority`, grant replacement types, MCP trust policy, plugin permission policy, subprocess management, or ToolRegistry/history bypasses.
+- Startup-discovered provider tools are materialized once during feature installation and then registered through `Worker::register_tools`, preserving stable schemas for the run and normal Worker permission/history/result machinery.
+- Ready providers can contribute tools, service declarations, and background task declarations through the existing feature install report/registry surfaces; unavailable providers record lifecycle diagnostics and skip discovered contributions instead of panicking or installing stale tools.
+- Diagnostics cover undeclared provider ids, duplicate tool names through the shared tool registrar, and failed lifecycle states.
+- API shape is type-oriented and localized; I did not find broad compatibility glue or authority-layer leakage.
+
+Validation performed:
+- PASS `cargo fmt --check`
+- PASS `git diff --check f709fc10..HEAD`
+- PASS `cargo test -p pod feature::tests` (17 passed)
+- PASS `cargo check --workspace --all-targets`
+- FAIL `cargo test -p pod`: 323 passed / 2 failed in the same prompt assertion tests reported by Coder (`prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`, `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`, both expecting `worktree status, diff, and test results`). The reviewed diff does not touch prompt resources or those prompt modules, so I classify this as unrelated/pre-existing for this Ticket.
+
+Risks / notes:
+- I did not rerun `nix build`; Coder reported a final-link `No space left on device` after Rust compilation. Focused Rust validation passed.
+- Permission denial and bounded-result behavior are not reimplemented in this diff; they are intentionally inherited because provider tools are installed as ordinary Worker tools.
+
+
+---
