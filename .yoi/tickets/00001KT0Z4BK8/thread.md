@@ -239,3 +239,51 @@ Critical risks / reviewer focus:
 Routing decision と accepted implementation plan を記録済み。blocking relation / orchestration-plan blocker はなく、capacity waiting reason は解消した。implementation side effects の前に `queued -> inprogress` acceptance を記録する。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KT0Z4BK8 at: 2026-06-14T15:53:15Z -->
+
+## Implementation report
+
+Implementation report from Coder Pod `yoi-coder-00001KT0Z4BK8`:
+
+Commit:
+- `3c674a70 docs: propose plugin package distribution`
+
+Changed files:
+- `docs/design/plugin-packages.md`
+  - Added the `.yoi-plugin` package/discovery/enablement design proposal.
+- `docs/README.md`
+  - Added the new design doc to the maintained documentation reading order.
+
+Design choices covered:
+- `.yoi-plugin` as a constrained single-file archive with required root `plugin.toml`.
+- Suggested package layout for `module.wasm`, declarative hooks, schemas, README/license, and assets.
+- User/workspace/builtin plugin stores and source-qualified identity: `user:<id>`, `project:<id>`, `builtin:<id>`.
+- Explicit discovery-vs-enablement separation.
+- Store presence under `${XDG_DATA_HOME:-~/.local/share}/yoi/plugins/` or `<workspace>/.yoi/plugins/` is discovery only, never registration/execution.
+- Plugin permission declarations are requests, not grants.
+- Plugin permission policy is explicitly separate from `pod::feature` HostAuthority/grant concepts.
+- Archive validation, traversal rejection, bounded extraction, deterministic digest, digest-keyed cache materialization, and optional pin/lock behavior.
+- Restore uses resolved enabled-plugin plan/digest metadata; fresh discovery must not silently upgrade a restored Pod.
+- Diagnostics guidance without secret leakage.
+- Runtime notes for declarative hooks and WASM.
+- MCP is explicitly out of initial Plugin packaging/runtime and requires a future separate bridge Ticket.
+- Follow-up implementation cuts are listed for enablement schema, discovery, validation/cache, permission policy, declarative hooks, WASM, locks, and future MCP bridge.
+
+Validation reported by coder:
+- Passed: `git diff --check`.
+- Link/path sanity review:
+  - Verified `docs/README.md` references existing `docs/design/plugin-packages.md`.
+  - Verified touched Markdown files have trailing newlines and no tab characters.
+- Post-commit check:
+  - `git status --short --branch` showed clean branch `impl/00001KT0Z4BK8-plugin-package-discovery`.
+  - `git diff --check HEAD~1 HEAD` passed with no whitespace errors.
+- No Rust/code changes were made, so `cargo fmt` / `cargo test` were not run.
+
+Repository status:
+- Child implementation worktree clean after commit.
+
+Residual risks / blockers:
+- This is intentionally a design proposal only. Exact manifest/Profile schema, lock-file format, archive limits, cache path, and WASM ABI details remain for follow-up implementation Tickets.
+
+---
