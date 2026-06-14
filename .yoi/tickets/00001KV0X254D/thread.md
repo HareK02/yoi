@@ -85,3 +85,68 @@ Implementation handoff started.
 Next: Coder implementation_report / commit / validation evidence を確認後、Reviewer を起動する。
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-13T18:59:21Z -->
+
+## Implementation report
+
+Implemented Ticket 00001KV0X254D.
+
+Files changed:
+- `crates/ticket/src/config.rs`
+  - Added typed `[orchestration] branch = "..."` config support via `TicketOrchestrationConfig` and validated `GitBranchName`.
+  - Kept default behavior as no configured branch; documented the optional config in the generated scaffold.
+  - Added config validation tests for valid custom branches and invalid Git branch names.
+- `crates/tui/src/multi_pod.rs`
+  - Resolved Panel Orchestrator worktree branch from typed ticket config, falling back to `orchestration/<workspace-orchestrator-pod-name>`.
+  - Reused the resolved branch for worktree creation, existing-worktree validation, restore preparation, queue handoff checks, and restore diagnostics.
+  - Preserved refusal behavior for dirty/unknown/mismatched worktrees; mismatches are diagnostic and do not checkout/delete/repair.
+  - Added TUI tests covering custom configured branch creation/reuse/restore, invalid branch rejection before worktree Git operations, and mismatched restore rejection without checkout.
+
+Validation:
+- `cargo test -p ticket config --lib` — passed.
+- `cargo test -p tui ensure_and_restore_use_configured_orchestration_branch --lib` — passed.
+- `cargo test -p tui invalid_configured_orchestration_branch_is_rejected_before_git_worktree_operations --lib` — passed.
+- `cargo test -p tui restore_rejects_mismatched_configured_orchestration_branch_without_checkout --lib` — passed.
+- `cargo fmt --check` — passed.
+- `git diff --check` — passed.
+- `cargo build -p yoi` — passed.
+- `target/debug/yoi ticket doctor` — passed.
+
+Additional note:
+- I also tried broader `cargo test -p tui orchestration --lib`; it compiled but includes the existing `multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace` failure, in code not touched by this change. The focused new orchestration-branch tests listed above pass.
+
+Commit:
+- `1c54689e tui: configure orchestration branch`
+
+Residual risks:
+- Branch validation is implemented as an internal Git-ref compatible validator rather than invoking `git check-ref-format`, so it is intentionally conservative (for example, rejects spaces and full `refs/...` names) before any worktree Git operation.
+
+---
+
+<!-- event: review author: hare at: 2026-06-13T19:05:48Z status: approve -->
+
+## Review: approve
+
+Approve.
+
+Evidence:
+- `crates/ticket/src/config.rs` adds typed `[orchestration] branch = "..."` via `TicketOrchestrationConfig` and `GitBranchName`, with `deny_unknown_fields` preserved and scaffold documentation limited to the Ticket config surface. Missing config leaves `orchestration.branch_name() == None`, preserving the existing default.
+- `crates/tui/src/multi_pod.rs` resolves the Panel Orchestrator branch once through `resolved_orchestration_worktree_layout`, falling back to `orchestration/<workspace-orchestrator-pod-name>`, and uses that layout for create/reuse, restore preparation/validation/diagnostics, and Queue handoff preflight/sync notices.
+- Invalid configured branches fail during Ticket config loading / branch resolution before `.worktree` creation; existing dirty, unknown, wrong-branch, or unrelated-repo paths remain diagnostic-only and are not checked out, deleted, reset, or repaired.
+- No hidden prompt/Profile injection or unrelated config surface drift was found; the change stays in typed Ticket config plus Panel orchestration worktree handling.
+- Tests cover default resolution, configured branch creation/restore, invalid branch rejection before worktree operations, mismatched branch diagnostics without checkout, and Queue paths using the resolved branch.
+
+Validation performed:
+- `git diff --check c4465a04..HEAD` — passed.
+- `cargo fmt --check` — passed.
+- `cargo test -p ticket config --lib` — passed (23 tests).
+- `cargo test -p tui orchestration_worktree --lib` — passed (3 tests).
+- `cargo test -p tui configured_orchestration_branch --lib` — passed (3 tests).
+- `cargo test -p tui ticket_queue_action --lib` — passed (5 tests).
+- `cargo test -p tui orchestration --lib` — failed only on the known unrelated `multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace` stale assertion; the branch/config-focused cases in that run passed.
+
+Residual risk:
+- Branch validation is an internal git-ref-compatible validator rather than an invocation of `git check-ref-format`; reviewed as acceptable and conservative for this Ticket.
+
+---
