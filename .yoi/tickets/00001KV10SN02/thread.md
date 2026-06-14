@@ -73,3 +73,28 @@ Recovery needed:
 - Do not mark done until implementation is committed, reviewed, and validated.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-14T05:13:26Z -->
+
+## Implementation report
+
+Recovery action: hand off dirty worktree to a replacement Coder.
+
+User requested continuing with a different Coder after the prior Coder Pod stopped unexpectedly.
+
+Current worktree state before handoff:
+- Worktree: `/home/hare/Projects/yoi/.worktree/e2e-critical-path`
+- Branch: `ticket-00001KV10SN02-e2e-critical-path`
+- Dirty files from prior Coder attempt:
+  - `crates/tui/src/multi_pod.rs`
+  - `crates/tui/src/single_pod.rs`
+  - `tests/e2e/src/lib.rs`
+  - `tests/e2e/tests/panel.rs`
+  - `tests/e2e/tests/rewind.rs` (new)
+- `git diff --check` currently reports no whitespace/check errors.
+
+Replacement Coder task:
+- Inspect the dirty diff, decide whether it is salvageable, then either finish/commit/report it or stop with a concrete blocker.
+- Do not merge or clean up; Orchestrator will handle review/merge.
+
+---
