@@ -109,3 +109,20 @@ Intake 確認:
 - `00001KT0Z4BK8` 自体の Plugin package requirements には現時点で反映しない。必要なら別 follow-up Ticket として「E2E 結果と user-visible validation gap の整理 / merge gate 明文化」を扱う。
 
 ---
+
+<!-- event: intake_summary author: hare at: 2026-06-14T15:37:24Z -->
+
+## Intake summary
+
+Marked ready by `yoi ticket state`.
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-06-14T15:37:24Z from: planning to: ready reason: cli_state field: state -->
+
+## State changed
+
+Marked ready by `yoi ticket state`.
+
+
+---

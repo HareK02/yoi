@@ -1,8 +1,8 @@
 ---
 title: 'Plugin distribution package format and discovery'
-state: 'planning'
+state: 'ready'
 created_at: '2026-06-01T06:49:53Z'
-updated_at: '2026-06-14T15:12:07Z'
+updated_at: '2026-06-14T15:37:24Z'
 ---
 
 ## Background
