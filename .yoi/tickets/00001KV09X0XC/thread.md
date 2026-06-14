@@ -144,3 +144,42 @@ Residual notes:
 - Discoverability depends on the existing composer target model: select a ready Ticket row, switch to Ticket Intake, type non-empty refinement instructions, then Enter. The implementation makes this visible in status/actionbar text; no separate button/menu was added.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-14T05:08:58Z -->
+
+## Implementation report
+
+Integration outcome: merged and validated.
+
+- Implementation branch: `ticket-00001KV09X0XC-panel-return-planning`
+- Implementation commits: `f74146c6 tui: return ready tickets to planning from panel`, `cb565477 ticket: report panel planning return implementation`
+- Review commit: `9d4abe50 ticket: approve panel planning return`
+- Orchestrator merge commit: `7a6321d9 merge: panel return planning`
+
+Reviewer result:
+- `approve`。ready Ticket row + Ticket Intake target + non-empty instruction のみで typed `ready -> planning` を記録し、stale state を拒否し、Queue / worktree / implementation Pod side effects を発生させないことを確認済み。
+
+Orchestrator validation after merge:
+- `cargo test -p tui planning_return`: PASS
+- `cargo test -p tui intake_registry`: PASS
+- `cargo test -p tui workspace_panel`: PASS
+- `cargo test -p ticket`: PASS
+- `cargo fmt --check`: PASS
+- `git diff --check`: PASS
+
+Residual notes:
+- Review note の通り、real terminal/PTTY Panel E2E は未実施。coverage は focused unit/action-path validation。
+- Discoverability は既存 composer target model（Ticket Intake target + ready row selection + non-empty text）に依存し、独立ボタン/メニューは追加していない。
+
+Next:
+- Mark Ticket done and clean up child coder/reviewer Pods plus implementation worktree/branch.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-14T05:09:07Z from: inprogress to: done reason: merged_and_validated field: state -->
+
+## State changed
+
+Implementation branch was reviewed, approved, merged into the Orchestrator branch as `7a6321d9`, and validated in the Orchestrator worktree. Focused TUI planning-return/intake/workspace-panel tests, Ticket tests, formatting, and diff check passed. Ticket implementation work is done; closure remains separate.
+
+---
