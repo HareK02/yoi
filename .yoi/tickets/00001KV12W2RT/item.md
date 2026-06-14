@@ -2,7 +2,7 @@
 title: 'Panel Ticket rows を2行表示にして gate 情報を分離する'
 state: 'inprogress'
 created_at: '2026-06-13T18:10:57Z'
-updated_at: '2026-06-14T06:10:45Z'
+updated_at: '2026-06-14T06:37:08Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['tui', 'workspace-panel', 'ticket-relations', 'mouse-input', 'layout']

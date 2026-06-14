@@ -3753,16 +3753,15 @@ async fn dispatch_ticket_action(
             .await
         }
         NextUserAction::Close => unreachable!("Close action is handled before row dispatch"),
-        NextUserAction::Clarify
-        | NextUserAction::Edit
-        | NextUserAction::OpenPod
-        | NextUserAction::Wait => Ok(TicketActionOutcome {
-            notice: format!(
-                "{} for Ticket {} has no safe inline workspace-panel dispatch; use the Ticket workflow.",
-                request.action.label(),
-                current_ticket.id
-            ),
-        }),
+        NextUserAction::Clarify | NextUserAction::OpenPod | NextUserAction::Wait => {
+            Ok(TicketActionOutcome {
+                notice: format!(
+                    "{} for Ticket {} has no safe inline workspace-panel dispatch; use the Ticket workflow.",
+                    request.action.label(),
+                    current_ticket.id
+                ),
+            })
+        }
     }
 }
 
@@ -5094,19 +5093,34 @@ fn row_hit_boxes(rows: &[PanelListRow], area: Rect) -> Vec<PanelRowHitBox> {
     if area.width == 0 || area.height == 0 {
         return Vec::new();
     }
-    rows.iter()
-        .enumerate()
-        .filter_map(|(offset, row)| {
-            let y = area.y.checked_add(offset as u16)?;
-            if y >= area.y.saturating_add(area.height) {
-                return None;
+
+    let mut hit_boxes: Vec<PanelRowHitBox> = Vec::new();
+    for (offset, row) in rows.iter().enumerate() {
+        let Some(key) = row.key.clone() else {
+            continue;
+        };
+        let Some(y) = area.y.checked_add(offset as u16) else {
+            continue;
+        };
+        if y >= area.y.saturating_add(area.height) {
+            continue;
+        }
+        if let Some(last) = hit_boxes.last_mut() {
+            if last.key == key
+                && last.rect.x == area.x
+                && last.rect.width == area.width
+                && last.rect.y.saturating_add(last.rect.height) == y
+            {
+                last.rect.height = last.rect.height.saturating_add(1);
+                continue;
             }
-            Some(PanelRowHitBox {
-                rect: Rect::new(area.x, y, area.width, 1),
-                key: row.key.clone()?,
-            })
-        })
-        .collect()
+        }
+        hit_boxes.push(PanelRowHitBox {
+            rect: Rect::new(area.x, y, area.width, 1),
+            key,
+        });
+    }
+    hit_boxes
 }
 
 fn panel_diagnostic_lines(panel: &WorkspacePanelViewModel, width: u16) -> Vec<Line<'static>> {
@@ -5139,16 +5153,15 @@ fn panel_action_rows(
     if rows.is_empty() {
         return Vec::new();
     }
-    let mut lines = Vec::with_capacity(rows.len() + 1);
+    let mut lines = Vec::with_capacity((rows.len() * 2) + 1);
     lines.push(PanelListRow::inert(panel_action_header_line(
         rows.len(),
         width,
     )));
     for row in rows {
-        lines.push(PanelListRow::selectable(
-            panel_row_line(row, selected == Some(&row.key), width),
-            row.key.clone(),
-        ));
+        for line in panel_row_lines(row, selected == Some(&row.key), width) {
+            lines.push(PanelListRow::selectable(line, row.key.clone()));
+        }
     }
     lines
 }
@@ -5169,11 +5182,16 @@ fn panel_action_header_line(total: usize, width: u16) -> Line<'static> {
 }
 
 const TICKET_STATE_COLUMN_WIDTH: usize = 10;
-const TICKET_ID_COLUMN_WIDTH: usize = 13;
 const POD_STATUS_COLUMN_WIDTH: usize = 18;
 
-fn panel_row_line(row: &PanelRow, selected: bool, width: u16) -> Line<'static> {
-    let marker = if selected { "▶ " } else { "  " };
+fn panel_row_lines(row: &PanelRow, selected: bool, width: u16) -> [Line<'static>; 2] {
+    [
+        panel_row_title_line(row, selected, width),
+        panel_row_detail_line(row, selected, width),
+    ]
+}
+
+fn panel_row_title_line(row: &PanelRow, selected: bool, width: u16) -> Line<'static> {
     let title_style = if selected {
         Style::default()
             .fg(Color::Magenta)
@@ -5181,22 +5199,10 @@ fn panel_row_line(row: &PanelRow, selected: bool, width: u16) -> Line<'static> {
     } else {
         Style::default().fg(Color::Magenta)
     };
-    let ticket_ref = panel_ticket_reference(row);
     let mut spans = Vec::new();
     let mut remaining = width as usize;
 
-    push_bounded_span(
-        &mut spans,
-        marker,
-        if selected {
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        },
-        &mut remaining,
-    );
+    push_ticket_marker_span(&mut spans, selected, &mut remaining);
     push_column_span(
         &mut spans,
         &row.status,
@@ -5204,16 +5210,94 @@ fn panel_row_line(row: &PanelRow, selected: bool, width: u16) -> Line<'static> {
         panel_priority_style(row.priority),
         &mut remaining,
     );
-    push_column_span(
-        &mut spans,
-        &ticket_ref,
-        TICKET_ID_COLUMN_WIDTH,
-        Style::default().fg(Color::DarkGray),
-        &mut remaining,
-    );
     push_bounded_span(&mut spans, row.title.as_str(), title_style, &mut remaining);
 
     Line::from(spans)
+}
+
+fn panel_row_detail_line(row: &PanelRow, selected: bool, width: u16) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut remaining = width as usize;
+
+    push_ticket_marker_span(&mut spans, selected, &mut remaining);
+    push_bounded_span(
+        &mut spans,
+        &panel_ticket_detail(row),
+        ticket_detail_style(row),
+        &mut remaining,
+    );
+
+    Line::from(spans)
+}
+
+fn push_ticket_marker_span(spans: &mut Vec<Span<'static>>, selected: bool, remaining: &mut usize) {
+    let (marker, style) = if selected {
+        (
+            "| ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        ("  ", Style::default().fg(Color::DarkGray))
+    };
+    push_bounded_span(spans, marker, style, remaining);
+}
+
+fn panel_ticket_detail(row: &PanelRow) -> String {
+    let mut parts = vec![panel_ticket_reference(row)];
+    if let Some(blocked_reason) = row
+        .ticket
+        .as_ref()
+        .and_then(|ticket| ticket.blocked_reason.as_deref())
+    {
+        parts.push(format!("Gate: waiting for {blocked_reason}"));
+    } else {
+        parts.push("Gate: clear".to_string());
+    }
+    if let Some(action) = row.next_action {
+        parts.push(format!(
+            "Action: {}",
+            panel_ticket_action_label(row, action)
+        ));
+    }
+    if let Some(reason) = panel_ticket_reason(row) {
+        parts.push(format!("Reason: {reason}"));
+    }
+    parts.join(" · ")
+}
+
+fn panel_ticket_action_label(row: &PanelRow, action: NextUserAction) -> &'static str {
+    if action == NextUserAction::Wait
+        && row
+            .ticket
+            .as_ref()
+            .and_then(|ticket| ticket.blocked_reason.as_ref())
+            .is_some()
+    {
+        "queue disabled"
+    } else {
+        action.label()
+    }
+}
+
+fn panel_ticket_reason(row: &PanelRow) -> Option<&str> {
+    row.disabled_reason
+        .as_deref()
+        .or_else(|| row.key_hint.as_deref())
+}
+
+fn ticket_detail_style(row: &PanelRow) -> Style {
+    if row
+        .ticket
+        .as_ref()
+        .and_then(|ticket| ticket.blocked_reason.as_ref())
+        .is_some()
+    {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
 }
 
 fn panel_ticket_reference(row: &PanelRow) -> String {
@@ -5264,7 +5348,6 @@ fn padded_cell(value: &str, width: usize) -> String {
 
 fn panel_priority_style(priority: ActionPriority) -> Style {
     match priority {
-        ActionPriority::UserReply => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ActionPriority::ReadyForQueue => Style::default().fg(Color::Green),
         ActionPriority::ActiveWork => Style::default().fg(Color::Cyan),
         ActionPriority::Background => Style::default().fg(Color::DarkGray),
@@ -5379,8 +5462,11 @@ fn target_status_line(app: &MultiPodApp) -> Line<'static> {
         .selected_panel_row()
         .filter(|row| row.is_ticket_action())
     {
-        let action = row.next_action.map(NextUserAction::label).unwrap_or("View");
-        Line::from(vec![
+        let action = row
+            .next_action
+            .map(|action| panel_ticket_action_label(row, action))
+            .unwrap_or("View");
+        let mut spans = vec![
             Span::styled("composer target ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 app.composer_target().label(),
@@ -5392,7 +5478,15 @@ fn target_status_line(app: &MultiPodApp) -> Line<'static> {
             Span::styled(row.status.clone(), panel_priority_style(row.priority)),
             Span::styled(" · blank Enter ", Style::default().fg(Color::DarkGray)),
             Span::styled(action, Style::default().fg(Color::Magenta)),
-        ])
+        ];
+        if let Some(reason) = panel_ticket_reason(row) {
+            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                truncate_with_ellipsis(reason, 100),
+                ticket_detail_style(row),
+            ));
+        }
+        Line::from(spans)
     } else if let Some(entry) = app.selected_pod_entry() {
         let (status, status_style) = row_status_label(entry);
         Line::from(vec![
@@ -6694,10 +6788,11 @@ branch = "orchestration/custom-panel"
 
         assert_eq!(boxes.len(), 3);
         assert_eq!(boxes[0].key, PanelRowKey::Ticket("TICKET-1".into()));
-        assert_eq!(boxes[0].rect, Rect::new(3, 6, 80, 1));
+        assert_eq!(boxes[0].rect, Rect::new(3, 6, 80, 2));
         assert_eq!(boxes[1].key, PanelRowKey::Ticket("TICKET-2".into()));
-        assert_eq!(boxes[1].rect, Rect::new(3, 7, 80, 1));
+        assert_eq!(boxes[1].rect, Rect::new(3, 8, 80, 2));
         assert_eq!(boxes[2].key, PanelRowKey::Pod("alpha".into()));
+        assert_eq!(boxes[2].rect, Rect::new(3, 11, 80, 1));
         assert!(boxes.iter().all(|hit| !hit.contains(2, hit.rect.y)));
     }
 
@@ -6725,7 +6820,13 @@ branch = "orchestration/custom-panel"
         let rows = list_rows(&app, 80, 6);
         app.set_row_hit_boxes(&rows, Rect::new(0, 0, 80, 6));
 
-        assert!(app.handle_mouse_event(left_click(2, 2)));
+        assert!(app.handle_mouse_event(left_click(2, 3)));
+        assert_eq!(
+            app.selected_row,
+            Some(PanelRowKey::Ticket("TICKET-2".into()))
+        );
+        app.selected_row = None;
+        assert!(app.handle_mouse_event(left_click(2, 4)));
         assert_eq!(
             app.selected_row,
             Some(PanelRowKey::Ticket("TICKET-2".into()))
@@ -6787,7 +6888,7 @@ branch = "orchestration/custom-panel"
         let rows = list_rows(&app, 80, 6);
         app.set_row_hit_boxes(&rows, Rect::new(0, 0, 80, 6));
 
-        assert!(app.handle_mouse_event(left_click(2, 2)));
+        assert!(app.handle_mouse_event(left_click(2, 4)));
         assert_eq!(
             app.selected_row,
             Some(PanelRowKey::Ticket("TICKET-2".into()))
@@ -7221,15 +7322,39 @@ branch = "orchestration/custom-panel"
     }
 
     #[test]
-    fn panel_ticket_rows_use_aligned_columns_before_title() {
-        let review_row = panel_test_ticket_row(
+    fn panel_ticket_rows_render_state_title_then_detail_line() {
+        let row = panel_test_ticket_row(
             "00001KTX1QMG9",
             "Workspace panel composer targets",
             ActionPriority::ActiveWork,
             NextUserAction::Wait,
             "inprogress",
         );
-        let ready_row = panel_test_ticket_row(
+
+        let [title, detail] = panel_row_lines(&row, true, 160);
+        let title_line = plain_line(&title);
+        let detail_line = plain_line(&detail);
+        let state_start = 2;
+        let title_start = state_start + TICKET_STATE_COLUMN_WIDTH + 1;
+        let row_id = row.ticket.as_ref().unwrap().id.as_str();
+
+        assert!(title_line.starts_with("| "));
+        assert!(detail_line.starts_with("| "));
+        assert!(!title_line.starts_with("▶"));
+        assert!(!title_line.contains(row_id));
+        assert_eq!(display_column(&title_line, "inprogress"), state_start);
+        assert_eq!(
+            display_column(&title_line, "Workspace panel composer targets"),
+            title_start
+        );
+        assert!(detail_line.contains(row_id));
+        assert!(detail_line.contains("Gate: clear"));
+        assert!(detail_line.contains("Action: Wait"));
+    }
+
+    #[test]
+    fn panel_ticket_non_selected_rows_align_with_selected_marker_space() {
+        let row = panel_test_ticket_row(
             "00001KTTB479X",
             "Long Ticket title that should be rendered after short columns",
             ActionPriority::ReadyForQueue,
@@ -7237,53 +7362,62 @@ branch = "orchestration/custom-panel"
             "ready",
         );
 
-        let review_line = plain_line(&panel_row_line(&review_row, true, 160));
-        let ready_line = plain_line(&panel_row_line(&ready_row, false, 160));
+        let [title, detail] = panel_row_lines(&row, false, 160);
+        let title_line = plain_line(&title);
+        let detail_line = plain_line(&detail);
         let state_start = 2;
-        let id_start = state_start + TICKET_STATE_COLUMN_WIDTH + 1;
-        let title_start = id_start + TICKET_ID_COLUMN_WIDTH + 1;
+        let title_start = state_start + TICKET_STATE_COLUMN_WIDTH + 1;
 
-        assert!(!review_line.starts_with("▶ Workspace panel composer targets"));
-        assert_eq!(display_column(&review_line, "inprogress"), state_start);
-        assert_eq!(display_column(&ready_line, "ready"), state_start);
-        let review_id = review_row.ticket.as_ref().unwrap().id.as_str();
-        let ready_id = ready_row.ticket.as_ref().unwrap().id.as_str();
-        assert_eq!(review_id.width(), TICKET_ID_COLUMN_WIDTH);
-        assert_eq!(ready_id.width(), TICKET_ID_COLUMN_WIDTH);
-        assert_eq!(display_column(&review_line, review_id), id_start);
-        assert_eq!(display_column(&ready_line, ready_id), id_start);
+        assert!(title_line.starts_with("  ready"));
+        assert!(detail_line.starts_with("  00001KTTB479X"));
+        assert_eq!(display_column(&title_line, "ready"), state_start);
         assert_eq!(
-            display_column(&review_line, "Workspace panel composer targets"),
-            title_start
-        );
-        assert_eq!(
-            display_column(&ready_line, "Long Ticket title"),
+            display_column(&title_line, "Long Ticket title"),
             title_start
         );
     }
 
     #[test]
-    fn panel_ticket_title_truncates_after_stable_columns() {
+    fn panel_ticket_title_truncates_after_state_column() {
         let row = panel_test_ticket_row(
             "00001KTTB479X",
-            "Very long Ticket title that should truncate only after the aligned short columns",
+            "Very long Ticket title that should truncate only after the state column",
             ActionPriority::ReadyForQueue,
             NextUserAction::Queue,
             "ready",
         );
 
-        let line = plain_line(&panel_row_line(&row, false, 58));
-        let title_start = 2 + TICKET_STATE_COLUMN_WIDTH + 1 + TICKET_ID_COLUMN_WIDTH + 1;
+        let [title, detail] = panel_row_lines(&row, false, 42);
+        let title_line = plain_line(&title);
+        let detail_line = plain_line(&detail);
+        let title_start = 2 + TICKET_STATE_COLUMN_WIDTH + 1;
 
-        assert_eq!(line.width(), 58);
-        let row_id = row.ticket.as_ref().unwrap().id.as_str();
-        assert_eq!(row_id.width(), TICKET_ID_COLUMN_WIDTH);
-        assert_eq!(
-            display_column(&line, row_id),
-            title_start - TICKET_ID_COLUMN_WIDTH - 1
+        assert_eq!(title_line.width(), 42);
+        assert_eq!(display_column(&title_line, "Very long Ticket"), title_start);
+        assert!(title_line.ends_with('…'));
+        assert_eq!(detail_line.width(), 42);
+        assert!(detail_line.starts_with("  00001KTTB479X · Gate: clear"));
+        assert!(detail_line.ends_with('…'));
+    }
+
+    #[test]
+    fn ready_ticket_with_waiting_gate_shows_queue_disabled_reason() {
+        let mut row = panel_test_ticket_row(
+            "00001WAITING",
+            "Ready but gated",
+            ActionPriority::Background,
+            NextUserAction::Wait,
+            "ready",
         );
-        assert_eq!(display_column(&line, "Very long Ticket"), title_start);
-        assert!(line.ends_with('…'));
+        row.disabled_reason = Some("Queue disabled: waiting for BLOCKER-1".to_string());
+        row.ticket.as_mut().unwrap().blocked_reason = Some("BLOCKER-1 via depends_on".to_string());
+
+        let [_title, detail] = panel_row_lines(&row, true, 160);
+        let detail_line = plain_line(&detail);
+
+        assert!(detail_line.contains("Gate: waiting for BLOCKER-1 via depends_on"));
+        assert!(detail_line.contains("Action: queue disabled"));
+        assert!(detail_line.contains("Reason: Queue disabled: waiting for BLOCKER-1"));
     }
 
     #[test]
