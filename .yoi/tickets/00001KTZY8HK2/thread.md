@@ -137,3 +137,46 @@ Risks / notes:
 
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-14T06:34:22Z -->
+
+## Implementation report
+
+Integration outcome: merged and validated.
+
+- Implementation branch: `ticket-00001KTZY8HK2-profile-extend-removal`
+- Implementation commit: `7c6070ef profile: remove extend profile composition`
+- Review commit: `c12fbd8e ticket: approve profile extend removal`
+- Orchestrator merge commit: `58b15ee6 merge: profile extend removal`
+
+Reviewer result:
+- `approve`。`yoi.profile.extend` deep-merge composition is removed, builtin role profiles use `yoi.profile.import("builtin:default")` plus explicit Lua assignment, and no scope/delegation authority semantics were expanded into this Ticket.
+
+Orchestrator validation after merge:
+- `cargo fmt --check`: PASS
+- `git diff --check`: PASS
+- `cargo test -p manifest profile::tests:: -- --nocapture`: PASS
+- `cargo build -p yoi`: first attempt failed due to disk full during Rust metadata output; after stopping/removing profile child Pods/worktree/target, rerun PASS
+- `nix build .#yoi`: PASS (result symlink produced)
+
+Cleanup already performed before rerun validation to free disk:
+- stopped `coder-00001KTZY8HK2-profile-extend` and `reviewer-00001KTZY8HK2-profile-extend`
+- removed child worktree `/home/hare/Projects/yoi/.worktree/profile-extend-removal`
+- deleted branch `ticket-00001KTZY8HK2-profile-extend-removal`
+
+Residual notes:
+- Existing users of `yoi.profile.extend` will now get the intended removed-API diagnostic and must migrate to import + explicit Lua assignment.
+
+Next:
+- Mark Ticket done. Closure remains separate.
+- Re-evaluate queued `00001KV11DHGZ` because its profile-surface conflict wait on this Ticket is now resolved.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-14T06:34:34Z from: inprogress to: done reason: merged_and_validated field: state -->
+
+## State changed
+
+Implementation branch was reviewed, approved, merged into the Orchestrator branch as `58b15ee6`, and validated in the Orchestrator worktree. Focused manifest profile tests, formatting, diff check, `cargo build -p yoi`, and `nix build .#yoi` passed after cleanup freed disk space. Ticket implementation work is done; closure remains separate.
+
+---
