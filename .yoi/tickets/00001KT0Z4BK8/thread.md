@@ -135,3 +135,29 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-14T15:40:52Z -->
+
+## Decision
+
+Routing decision: implementation_ready_but_waiting_capacity
+
+Reason:
+- Ticket body / thread / artifacts、relation、OrchestrationPlan、Orchestrator workspace state を確認した。Plugin package / discovery / enablement boundary の design work item として要件・受け入れ条件・non-goals・invariants は十分に具体化されている。
+- blocking relation / OrchestrationPlan blocker はない。
+- Plugin package work は現在 active な Panel/TUI implementation と source surface が大きく重ならないため、設計上の conflict blocker ではない。
+- ただし現在 `00001KTFY8V80` と `00001KV09WYC6` の2件が inprogress で Coder Pod running。Reviewer follow-up と integration capacity も未使用ではなく、さらに queued Panel/TUI work 2件を待機させている。
+- 現時点では追加 Coder Pod を spawn せず、active Coder のいずれかが implementation report を返して review/integration 見通しが立ってから acceptance する。
+
+Evidence checked:
+- Ticket body/thread: Plugin package design requirements、過去の Plugin/MCP/feature-layer decision、`planning -> ready`、Panel `ready -> queued` を確認。
+- Ticket relations: blocker なし。
+- OrchestrationPlan: 既存 record なし。
+- Orchestrator workspace: `/home/hare/Projects/yoi/.worktree/orchestration` は clean、queue commit `4be6c966` 上。
+- Visible Pods: `yoi-coder-00001KTFY8V80` と `yoi-coder-00001KV09WYC6` が running。
+
+Next action:
+- 先行 inprogress Ticket の少なくとも1件が implementation report / review stage に進み、Coder capacity が空いた時点で再確認し、unblocked なら `queued -> inprogress` acceptance と dedicated worktree 作成へ進む。
+- planning return ではなく queued のまま waiting とする。
+
+---

@@ -1,0 +1,1 @@
+{"id":"orch-plan-20260614-154052-1","ticket_id":"00001KT0Z4BK8","kind":"waiting_capacity_note","note":"Ticket 自体は implementation_ready で blocking relation なし。現在 `00001KTFY8V80` と `00001KV09WYC6` の Coder Pod が running で、review/integration follow-up capacity も必要なため、追加 spawn は一時待機する。","author":"yoi-orchestrator","at":"2026-06-14T15:40:52Z"}
