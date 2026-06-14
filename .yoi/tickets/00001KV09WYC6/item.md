@@ -1,8 +1,8 @@
 ---
 title: 'Workspace panel: show Ticket-associated Intake Pods adjacent to Ticket rows'
-state: 'queued'
+state: 'inprogress'
 created_at: '2026-06-13T10:54:31Z'
-updated_at: '2026-06-14T15:23:27Z'
+updated_at: '2026-06-14T15:24:58Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['panel-ux', 'local-role-session-registry', 'pod-session-state']
