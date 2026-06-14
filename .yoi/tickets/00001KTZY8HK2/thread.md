@@ -29,3 +29,16 @@ LocalTicketBackend によって作成されました。
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-14T02:14:43Z -->
+
+## Decision
+
+決定:
+- `yoi.profile.extend` に replace/clear API を足す方向ではなく、`extend` 自体を廃止する。
+- Profile 継承は `local p = yoi.profile.import("builtin:default"); p.field = ...; return p` の ordinary Lua assignment に寄せる。
+- deep merge helper が必要なら、semantics が明示された別 API として後続で検討する。
+- scope/delegation_scope の問題は `00001KV11DHGZ` で launch policy に移すため、この Ticket では scope replacement API を作らない。
+
+
+---

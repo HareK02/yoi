@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::{Stream, StreamExt, TryStreamExt};
 use reqwest::header::{
-    ACCEPT, CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RETRY_AFTER,
+    ACCEPT, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue,
+    RETRY_AFTER, TRANSFER_ENCODING,
 };
 use serde_json::{Map, Value, json};
 
@@ -60,6 +61,40 @@ impl ResolvedAuth {
             _ => false,
         }
     }
+}
+
+fn header_value_for_diagnostics(headers: &HeaderMap, name: &'static HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn response_header_diagnostics(headers: &HeaderMap) -> serde_json::Value {
+    serde_json::json!({
+        "content_type": header_value_for_diagnostics(headers, &CONTENT_TYPE),
+        "content_encoding": header_value_for_diagnostics(headers, &CONTENT_ENCODING),
+        "transfer_encoding": header_value_for_diagnostics(headers, &TRANSFER_ENCODING),
+        "content_length": header_value_for_diagnostics(headers, &CONTENT_LENGTH),
+    })
+}
+
+fn sse_error_context(status: u16, headers: &serde_json::Value, source: &str) -> String {
+    let field = |name: &str| {
+        headers
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<none>")
+    };
+    format!(
+        "SSE stream parse failed after HTTP {status}: {source}; content-type={}, content-encoding={}, transfer-encoding={}, content-length={}",
+        field("content_type"),
+        field("content_encoding"),
+        field("transfer_encoding"),
+        field("content_length")
+    )
 }
 
 /// scheme 共通の HTTP 通信層。
@@ -510,6 +545,7 @@ impl<S: Scheme + Clone + 'static> LlmClient for HttpTransport<S> {
                 .await
             {
                 Ok(response) => {
+                    let response_headers = response_header_diagnostics(response.headers());
                     emit_transport_trace(
                         &request,
                         "transport_http_headers_received",
@@ -517,6 +553,7 @@ impl<S: Scheme + Clone + 'static> LlmClient for HttpTransport<S> {
                             "elapsed_ms": send_started.elapsed().as_millis() as u64,
                             "status": response.status().as_u16(),
                             "success": response.status().is_success(),
+                            "headers": response_headers,
                         }),
                     );
                     response
@@ -563,6 +600,9 @@ impl<S: Scheme + Clone + 'static> LlmClient for HttpTransport<S> {
         );
 
         let scheme = self.scheme.clone();
+        let status = response.status().as_u16();
+        let response_headers = response_header_diagnostics(response.headers());
+        let transport_trace = request.transport_trace.clone();
         let byte_stream = response.bytes_stream().map_err(std::io::Error::other);
         let event_stream = byte_stream.eventsource();
 
@@ -575,7 +615,21 @@ impl<S: Scheme + Clone + 'static> LlmClient for HttpTransport<S> {
                     Ok(events) => Ok(events),
                     Err(e) => Err(e),
                 },
-                Err(e) => Err(ClientError::Sse(e.to_string())),
+                Err(e) => {
+                    let source = e.to_string();
+                    let message = sse_error_context(status, &response_headers, &source);
+                    if let Some(trace) = &transport_trace {
+                        trace.emit(
+                            "transport_sse_parse_error",
+                            json!({
+                                "status": status,
+                                "headers": response_headers.clone(),
+                                "error": source,
+                            }),
+                        );
+                    }
+                    Err(ClientError::Sse(message))
+                }
             })
             .map(|res| {
                 let s: Pin<Box<dyn Stream<Item = Result<Event, ClientError>> + Send>> = match res {
@@ -673,6 +727,39 @@ mod tests {
             auth,
             ModelCapability::minimal(),
         )
+    }
+
+    #[test]
+    fn sse_error_context_includes_response_headers() {
+        let headers = json!({
+            "content_type": "application/octet-stream",
+            "content_encoding": "gzip",
+            "transfer_encoding": "chunked",
+            "content_length": "123",
+        });
+
+        let message = sse_error_context(200, &headers, "stream did not contain valid UTF-8");
+
+        assert!(message.contains("HTTP 200"));
+        assert!(message.contains("stream did not contain valid UTF-8"));
+        assert!(message.contains("content-type=application/octet-stream"));
+        assert!(message.contains("content-encoding=gzip"));
+        assert!(message.contains("transfer-encoding=chunked"));
+        assert!(message.contains("content-length=123"));
+    }
+
+    #[test]
+    fn response_header_diagnostics_redacts_to_safe_header_subset() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("identity"));
+        headers.insert("authorization", HeaderValue::from_static("Bearer secret"));
+
+        let diagnostics = response_header_diagnostics(&headers);
+
+        assert_eq!(diagnostics["content_type"], "text/event-stream");
+        assert_eq!(diagnostics["content_encoding"], "identity");
+        assert!(diagnostics.get("authorization").is_none());
     }
 
     #[test]
