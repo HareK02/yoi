@@ -4,6 +4,7 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 publish = false
+autotests = false
 
 [features]
 default = []
@@ -18,4 +19,9 @@ tempfile.workspace = true
 [[test]]
 name = "panel"
 path = "tests/panel.rs"
+required-features = ["e2e"]
+
+[[test]]
+name = "rewind"
+path = "tests/rewind.rs"
 required-features = ["e2e"]

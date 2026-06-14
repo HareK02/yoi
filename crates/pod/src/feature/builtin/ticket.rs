@@ -18,14 +18,13 @@ use ticket::{
 
 use crate::feature::{
     FeatureDescriptor, FeatureDiagnostic, FeatureInstallContext, FeatureInstallError,
-    FeatureModule, HostAuthority, HostAuthorityRequest, ToolContribution, ToolDeclaration,
+    FeatureModule, ToolContribution, ToolDeclaration,
 };
 
 const FEATURE_ID: &str = "ticket";
 const FEATURE_NAME: &str = "Ticket tools";
 const FEATURE_DESCRIPTION: &str = "Typed local Ticket work-item operations over a bounded backend root. \
 The tools operate through the ticket crate backend and do not grant generic filesystem write scope.";
-const AUTHORITY_REASON: &str = "Use a configured local Ticket backend root for typed work-item operations without generic filesystem write authority.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TicketFeatureAccess {
@@ -150,12 +149,6 @@ impl TicketFeature {
         names
     }
 
-    fn authority(&self) -> HostAuthority {
-        HostAuthority::TicketBackend {
-            root: self.backend_root.display().to_string(),
-        }
-    }
-
     fn usable_backend_root(&self) -> Result<PathBuf, String> {
         let root = self
             .backend_root
@@ -171,11 +164,7 @@ impl TicketFeature {
 impl FeatureModule for TicketFeature {
     fn descriptor(&self) -> FeatureDescriptor {
         let mut descriptor = FeatureDescriptor::builtin(FEATURE_ID, FEATURE_NAME)
-            .with_description(FEATURE_DESCRIPTION)
-            .with_host_authority(HostAuthorityRequest::required(
-                self.authority(),
-                AUTHORITY_REASON,
-            ));
+            .with_description(FEATURE_DESCRIPTION);
         let enabled_tool_names = self.enabled_tool_names();
         for name in &enabled_tool_names {
             descriptor = descriptor.with_tool(ToolDeclaration::new(
@@ -207,7 +196,6 @@ impl FeatureModule for TicketFeature {
                 return Ok(());
             }
         };
-        let authority = self.authority();
         let backend = LocalTicketBackend::new(usable_root)
             .with_record_language(self.record_language.as_deref());
         let allowed_tool_names = self.enabled_tool_names();
@@ -221,10 +209,7 @@ impl FeatureModule for TicketFeature {
             {
                 continue;
             }
-            tools.register(
-                ToolContribution::new(name, definition)
-                    .with_required_host_authorities(vec![authority.clone()]),
-            )?;
+            tools.register(ToolContribution::new(name, definition))?;
         }
         Ok(())
     }
@@ -284,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_declares_ticket_tools_and_backend_authority() {
+    fn descriptor_declares_ticket_tools() {
         let temp = TempDir::new().unwrap();
         let feature = ticket_tools_feature(temp.path());
         let descriptor = feature.descriptor();
@@ -299,11 +284,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             TICKET_TOOL_NAMES
         );
-        assert_eq!(descriptor.requested_host_authorities.len(), 1);
-        assert!(matches!(
-            descriptor.requested_host_authorities[0].authority,
-            HostAuthority::TicketBackend { .. }
-        ));
     }
 
     #[test]
@@ -321,7 +301,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             TICKET_READ_ONLY_TOOL_NAMES
         );
-        assert_eq!(descriptor.requested_host_authorities.len(), 1);
     }
 
     #[test]

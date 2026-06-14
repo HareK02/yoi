@@ -15,6 +15,8 @@ use crossterm::event::{
 };
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{Command, execute};
+#[cfg(feature = "e2e-test")]
+use protocol::{Event, Greeting, RewindSummary, RewindTarget, RewindTargetId, Segment};
 use protocol::{Method, PodStatus};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -75,6 +77,15 @@ pub(crate) async fn run_pod_name(
     socket_override: Option<PathBuf>,
     runtime_command: PodRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "e2e-test")]
+    if std::env::var_os("YOI_TUI_TEST_REWIND_FIXTURE").is_some() {
+        let mut terminal = enter_fullscreen()?;
+        terminal.clear()?;
+        let result = run_e2e_rewind_fixture(&mut terminal, pod_name).await;
+        let _ = leave_fullscreen(&mut terminal);
+        return result;
+    }
+
     if let Some(client) = try_connect_live_pod(&pod_name, socket_override.clone()).await {
         let mut terminal = enter_fullscreen()?;
         run_connected_pod(&mut terminal, pod_name, client, runtime_command.clone()).await?;
@@ -248,6 +259,16 @@ pub(crate) async fn run_spawn(
     profile: Option<String>,
     runtime_command: PodRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "e2e-test")]
+    if std::env::var_os("YOI_TUI_TEST_REWIND_FIXTURE").is_some() {
+        let mut terminal = enter_fullscreen()?;
+        terminal.clear()?;
+        let fixture_pod_name = pod_name.unwrap_or_else(|| "e2e-rewind".to_string());
+        let result = run_e2e_rewind_fixture(&mut terminal, fixture_pod_name).await;
+        let _ = leave_fullscreen(&mut terminal);
+        return result;
+    }
+
     let ready = match spawn::run(resume_from, pod_name, profile, runtime_command.clone()).await? {
         SpawnOutcome::Ready(r) => r,
         SpawnOutcome::Cancelled => return Ok(()),
@@ -386,6 +407,181 @@ fn read_terminal_events(stop: Arc<AtomicBool>, tx: mpsc::UnboundedSender<Termina
             }
         }
     }
+}
+
+#[cfg(feature = "e2e-test")]
+async fn run_e2e_rewind_fixture(
+    terminal: &mut FullscreenTerminal,
+    pod_name: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let mut app = App::new_with_persistent_input_history(pod_name.clone(), &workspace_root);
+    app.connected = true;
+    app.handle_pod_event(Event::Snapshot {
+        entries: Vec::new(),
+        status: PodStatus::Idle,
+        greeting: Greeting {
+            pod_name: pod_name.clone(),
+            cwd: workspace_root.display().to_string(),
+            provider: "e2e-fixture".to_string(),
+            model: "canned".to_string(),
+            scope_summary: "isolated e2e rewind fixture".to_string(),
+            tools: Vec::new(),
+            context_window: 0,
+            context_tokens: 0,
+        },
+    });
+
+    let (_reader, mut term_rx) = TerminalEventReader::spawn()?;
+    let target_id = RewindTargetId {
+        segment_id: uuid::Uuid::from_u128(1),
+        user_input_entry_index: 1,
+    };
+    let mut rewind_submit_count = 0usize;
+    let mut pending_apply: Option<std::time::Instant> = None;
+    let apply_delay = Duration::from_millis(400);
+    #[cfg(feature = "e2e-test")]
+    crate::e2e_observer::emit(
+        "single_pod",
+        "rewind_fixture_ready",
+        serde_json::json!({ "pod": pod_name.clone() }),
+    );
+    terminal.draw(|frame| ui::draw(frame, &mut app))?;
+
+    loop {
+        let wait = pending_apply.map(|submitted_at| {
+            apply_delay
+                .checked_sub(submitted_at.elapsed())
+                .unwrap_or(Duration::ZERO)
+        });
+        let input = match wait {
+            Some(Duration::ZERO) => E2eRewindInput::Tick,
+            Some(timeout) => match tokio::time::timeout(timeout, term_rx.recv()).await {
+                Ok(Some(Ok(event))) => E2eRewindInput::Terminal(event),
+                Ok(Some(Err(err))) => return Err(Box::new(err)),
+                Ok(None) => E2eRewindInput::TerminalClosed,
+                Err(_) => E2eRewindInput::Tick,
+            },
+            None => match term_rx.recv().await {
+                Some(Ok(event)) => E2eRewindInput::Terminal(event),
+                Some(Err(err)) => return Err(Box::new(err)),
+                None => E2eRewindInput::TerminalClosed,
+            },
+        };
+
+        let mut needs_draw = false;
+        match input {
+            E2eRewindInput::Terminal(TermEvent::Key(key)) => {
+                let duplicate_enter_pending = matches!(key.code, KeyCode::Enter)
+                    && app
+                        .rewind_picker
+                        .as_ref()
+                        .map(|picker| picker.applying)
+                        .unwrap_or(false);
+                if let Some(method) = handle_key(&mut app, key) {
+                    match method {
+                        Method::ListRewindTargets => {
+                            app.handle_pod_event(Event::RewindTargets {
+                                head_entries: 3,
+                                targets: vec![RewindTarget {
+                                    id: target_id.clone(),
+                                    expected_head_entries: 3,
+                                    truncate_entries: 1,
+                                    turn_index: 1,
+                                    timestamp_ms: Some(1),
+                                    preview: "revise the plan".to_string(),
+                                    eligible: true,
+                                    disabled_reason: None,
+                                    warning: None,
+                                }],
+                            });
+                            crate::e2e_observer::emit(
+                                "single_pod",
+                                "rewind_picker_opened",
+                                serde_json::json!({
+                                    "targets": 1,
+                                    "selected_preview": "revise the plan",
+                                }),
+                            );
+                        }
+                        Method::RewindTo {
+                            target,
+                            expected_head_entries,
+                        } => {
+                            rewind_submit_count += 1;
+                            pending_apply = Some(std::time::Instant::now());
+                            crate::e2e_observer::emit(
+                                "single_pod",
+                                "rewind_submit_sent",
+                                serde_json::json!({
+                                    "segment_id": target.segment_id.to_string(),
+                                    "user_input_entry_index": target.user_input_entry_index,
+                                    "expected_head_entries": expected_head_entries,
+                                    "submit_count": rewind_submit_count,
+                                }),
+                            );
+                        }
+                        _ => {}
+                    }
+                } else if duplicate_enter_pending {
+                    crate::e2e_observer::emit(
+                        "single_pod",
+                        "rewind_duplicate_enter_suppressed",
+                        serde_json::json!({ "submit_count": rewind_submit_count }),
+                    );
+                }
+                needs_draw = true;
+            }
+            E2eRewindInput::Terminal(TermEvent::Mouse(_))
+            | E2eRewindInput::Terminal(TermEvent::Resize(_, _))
+            | E2eRewindInput::Tick => {
+                needs_draw = true;
+            }
+            E2eRewindInput::TerminalClosed => break,
+            E2eRewindInput::Terminal(_) => {}
+        }
+
+        if let Some(submitted_at) = pending_apply {
+            if submitted_at.elapsed() >= apply_delay {
+                app.handle_pod_event(Event::RewindApplied {
+                    entries: Vec::new(),
+                    input: vec![Segment::text("revise the plan")],
+                    summary: RewindSummary {
+                        truncated_to_entries: 1,
+                        discarded_entries: 2,
+                        tool_side_effect_warning: false,
+                    },
+                });
+                pending_apply = None;
+                let composer_text = Segment::flatten_to_text(&app.input.submit_segments());
+                crate::e2e_observer::emit(
+                    "single_pod",
+                    "rewind_applied",
+                    serde_json::json!({
+                        "composer_text": composer_text,
+                        "submit_count": rewind_submit_count,
+                    }),
+                );
+                needs_draw = true;
+            }
+        }
+
+        if app.quit {
+            break;
+        }
+        if needs_draw {
+            terminal.draw(|frame| ui::draw(frame, &mut app))?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "e2e-test")]
+enum E2eRewindInput {
+    Terminal(TermEvent),
+    TerminalClosed,
+    Tick,
 }
 
 enum LoopInput<P> {
