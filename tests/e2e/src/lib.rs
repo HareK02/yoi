@@ -638,6 +638,43 @@ impl PanelHarness {
         }
     }
 
+    pub fn output_len(&self) -> usize {
+        self.output.lock().map(|output| output.len()).unwrap_or(0)
+    }
+
+    pub fn wait_for_output_contains_from(
+        &mut self,
+        start_offset: usize,
+        needle: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        let start = Instant::now();
+        let needle = needle.as_bytes();
+        loop {
+            if self.output_after(start_offset, needle) {
+                return Ok(());
+            }
+            if let Some(status) = self.child.try_wait()? {
+                self.flush_output_artifact()?;
+                return Err(HarnessError::Protocol(format!(
+                    "process exited with {status} before PTY output contained {:?}",
+                    String::from_utf8_lossy(needle)
+                )));
+            }
+            if start.elapsed() >= timeout {
+                self.flush_output_artifact()?;
+                return Err(HarnessError::Timeout {
+                    what: format!(
+                        "PTY output containing {:?} after offset {start_offset}",
+                        String::from_utf8_lossy(needle)
+                    ),
+                    artifacts: self.artifacts.clone(),
+                });
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     pub fn events(&mut self) -> Result<Vec<HarnessEvent>> {
         let text = fs::read_to_string(&self.artifacts.events_jsonl)?;
         text.lines()
@@ -682,6 +719,21 @@ impl PanelHarness {
         self.master.write_all(bytes)?;
         self.master.flush()?;
         Ok(())
+    }
+
+    fn output_after(&self, start_offset: usize, needle: &[u8]) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        self.output
+            .lock()
+            .map(|output| {
+                let start = start_offset.min(output.len());
+                output[start..]
+                    .windows(needle.len())
+                    .any(|window| window == needle)
+            })
+            .unwrap_or(false)
     }
 
     fn mouse_capture_enabled(&self) -> bool {
