@@ -207,3 +207,41 @@ Conclusion:
 - Approved. No blocker remains for integration.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-14T15:55:36Z -->
+
+## Implementation report
+
+Integration report:
+
+Merged implementation branch into orchestration branch:
+- branch: `impl/00001KV09WYC6-panel-intake-pod-rows`
+- implementation commit: `2664cdd9 feat: show ticket intake pods in panel`
+- merge commit: `2fcbd6ae merge: panel intake pod rows`
+
+Reviewer result:
+- `approve` recorded from `yoi-reviewer-00001KV09WYC6`.
+
+Validation in Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration`:
+- Passed: `cargo test -p tui workspace_panel --lib`
+- Passed: `cargo test -p tui role_session_registry --lib`
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check`
+
+Notes:
+- The coder-reported `cargo test -p tui multi_pod --lib` failure was reviewed and assessed unrelated to this Ticket. It was not used as a blocker.
+- Orchestrator worktree is clean after validation.
+
+Cleanup planned:
+- Stop related coder/reviewer Pods.
+- Remove only child implementation worktree/branch for this Ticket.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-14T15:55:36Z from: inprogress to: done reason: merged_validated field: state -->
+
+## State changed
+
+Reviewer approved, implementation branch merged into the orchestration branch, focused validation passed in the Orchestrator worktree, and cleanup is ready. Marking Ticket done in the orchestration branch.
+
+---
