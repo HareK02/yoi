@@ -2,14 +2,14 @@
 //!
 //! This module defines the Pod-side feature boundary used to collect
 //! descriptor metadata, tool contributions, safe hook contributions, background
-//! task declarations, and service declarations before
-//! installing them into the existing Worker/HookRegistry host surfaces.
+//! task declarations, service declarations, and protocol-backed provider
+//! startup discovery before installing them into the existing Worker/HookRegistry
+//! host surfaces.
 //!
-//! The first implementation slice is intentionally host-mediated and
-//! descriptor-first: tools are installed through the normal Worker tool path,
-//! hooks are installed through [`crate::hook::HookRegistryBuilder`], while
-//! service and background-task contributions are represented in descriptors and
-//! install reports without starting an independent runtime lifecycle.
+//! The implementation is intentionally host-mediated: tools are installed through
+//! the normal Worker tool path, hooks are installed through
+//! [`crate::hook::HookRegistryBuilder`], and provider output is represented as
+//! ordinary feature reports/diagnostics instead of a separate authority layer.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -60,6 +60,183 @@ impl From<FeatureId> for String {
     }
 }
 
+/// Stable source-qualified identifier for a protocol-backed provider instance.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ProviderId(String);
+
+impl ProviderId {
+    pub fn new(value: impl Into<String>) -> Result<Self, FeatureInstallError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(FeatureInstallError::InvalidDescriptor(
+                "provider id must not be empty".into(),
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn builtin(slug: impl AsRef<str>) -> Self {
+        Self(format!("builtin:{}", slug.as_ref()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ProviderId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Startup/lifecycle state for a protocol-backed provider.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolProviderLifecycleState {
+    Starting,
+    Ready,
+    Degraded,
+    Failed,
+    Stopped,
+}
+
+impl ProtocolProviderLifecycleState {
+    pub fn can_contribute(&self) -> bool {
+        matches!(self, Self::Ready | Self::Degraded)
+    }
+}
+
+/// Approved protocol-backed provider declaration in a feature descriptor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolProviderDeclaration {
+    pub id: ProviderId,
+    pub protocol: String,
+    pub display_name: String,
+    pub version: String,
+    pub description: String,
+}
+
+impl ProtocolProviderDeclaration {
+    pub fn new(
+        id: ProviderId,
+        protocol: impl Into<String>,
+        display_name: impl Into<String>,
+        version: impl Into<String>,
+    ) -> Self {
+        Self {
+            id,
+            protocol: protocol.into(),
+            display_name: display_name.into(),
+            version: version.into(),
+            description: String::new(),
+        }
+    }
+
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+}
+
+/// Lifecycle diagnostic captured for a protocol-backed provider.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolProviderLifecycleDiagnostic {
+    pub provider_id: ProviderId,
+    pub state: ProtocolProviderLifecycleState,
+    pub severity: FeatureDiagnosticSeverity,
+    pub message: String,
+}
+
+impl ProtocolProviderLifecycleDiagnostic {
+    pub fn new(
+        provider_id: ProviderId,
+        state: ProtocolProviderLifecycleState,
+        severity: FeatureDiagnosticSeverity,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider_id,
+            state,
+            severity,
+            message: message.into(),
+        }
+    }
+}
+
+/// Startup-discovered contribution set returned by a protocol-backed provider.
+///
+/// Tool definitions are materialized exactly once when registered, then inserted
+/// into the normal Worker tool path as stable metadata plus executable tool
+/// handles for the remainder of the run. Execution still flows through the
+/// Worker, permission, history, and bounded-result machinery.
+pub struct ProtocolProviderContribution {
+    declaration: ProtocolProviderDeclaration,
+    state: ProtocolProviderLifecycleState,
+    tools: Vec<ToolContribution>,
+    services: Vec<ServiceDeclaration>,
+    background_tasks: Vec<BackgroundTaskDeclaration>,
+    diagnostics: Vec<FeatureDiagnostic>,
+}
+
+impl ProtocolProviderContribution {
+    pub fn new(
+        declaration: ProtocolProviderDeclaration,
+        state: ProtocolProviderLifecycleState,
+    ) -> Self {
+        Self {
+            declaration,
+            state,
+            tools: Vec::new(),
+            services: Vec::new(),
+            background_tasks: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub fn ready(declaration: ProtocolProviderDeclaration) -> Self {
+        Self::new(declaration, ProtocolProviderLifecycleState::Ready)
+    }
+
+    pub fn failed(declaration: ProtocolProviderDeclaration, message: impl Into<String>) -> Self {
+        Self::new(declaration.clone(), ProtocolProviderLifecycleState::Failed).with_diagnostic(
+            FeatureDiagnostic::error(format!(
+                "provider {} failed during startup: {}",
+                declaration.id,
+                message.into()
+            )),
+        )
+    }
+
+    pub fn provider(&self) -> &ProtocolProviderDeclaration {
+        &self.declaration
+    }
+
+    pub fn state(&self) -> &ProtocolProviderLifecycleState {
+        &self.state
+    }
+
+    pub fn with_tool(mut self, tool: ToolContribution) -> Self {
+        self.tools.push(tool);
+        self
+    }
+
+    pub fn with_service(mut self, service: ServiceDeclaration) -> Self {
+        self.services.push(service);
+        self
+    }
+
+    pub fn with_background_task(mut self, task: BackgroundTaskDeclaration) -> Self {
+        self.background_tasks.push(task);
+        self
+    }
+
+    pub fn with_diagnostic(mut self, diagnostic: FeatureDiagnostic) -> Self {
+        self.diagnostics.push(diagnostic);
+        self
+    }
+}
+
 /// Runtime/source class for a feature module.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -67,6 +244,7 @@ pub enum FeatureRuntimeKind {
     Builtin,
     LuaProfile,
     ExternalPlugin,
+    ProtocolProvider,
 }
 
 /// A safe hook contribution point exposed to feature modules.
@@ -308,6 +486,7 @@ pub struct FeatureDescriptor {
     pub background_tasks: Vec<BackgroundTaskDeclaration>,
     pub provides_services: Vec<ServiceDeclaration>,
     pub requires_services: Vec<ServiceRequirement>,
+    pub protocol_providers: Vec<ProtocolProviderDeclaration>,
 }
 
 impl FeatureDescriptor {
@@ -323,6 +502,7 @@ impl FeatureDescriptor {
             background_tasks: Vec::new(),
             provides_services: Vec::new(),
             requires_services: Vec::new(),
+            protocol_providers: Vec::new(),
         }
     }
 
@@ -353,6 +533,11 @@ impl FeatureDescriptor {
 
     pub fn with_service_requirement(mut self, requirement: ServiceRequirement) -> Self {
         self.requires_services.push(requirement);
+        self
+    }
+
+    pub fn with_protocol_provider(mut self, provider: ProtocolProviderDeclaration) -> Self {
+        self.protocol_providers.push(provider);
         self
     }
 }
@@ -410,6 +595,7 @@ pub enum FeatureContributionKind {
     Hook,
     BackgroundTask,
     Service,
+    ProtocolProvider,
     Notification,
     Alert,
     Diagnostic,
@@ -434,6 +620,7 @@ pub struct FeatureInstallReport {
     pub declared_background_tasks: Vec<BackgroundTaskDeclaration>,
     pub provided_services: Vec<ServiceDeclaration>,
     pub resolved_service_requirements: Vec<ServiceRequirement>,
+    pub protocol_providers: Vec<ProtocolProviderLifecycleDiagnostic>,
     pub skipped: Vec<SkippedContribution>,
     pub diagnostics: Vec<FeatureDiagnostic>,
 }
@@ -449,6 +636,7 @@ impl FeatureInstallReport {
             declared_background_tasks: Vec::new(),
             provided_services: Vec::new(),
             resolved_service_requirements: Vec::new(),
+            protocol_providers: Vec::new(),
             skipped: Vec::new(),
             diagnostics: Vec::new(),
         }
@@ -474,6 +662,7 @@ struct FeatureContributionDeclarations {
     hooks: HashSet<(String, FeatureHookPoint)>,
     background_tasks: HashSet<String>,
     provided_services: HashSet<(ServiceId, String)>,
+    protocol_providers: HashSet<ProviderId>,
 }
 
 impl FeatureContributionDeclarations {
@@ -499,6 +688,11 @@ impl FeatureContributionDeclarations {
                 .iter()
                 .map(|service| (service.id.clone(), service.version.clone()))
                 .collect(),
+            protocol_providers: descriptor
+                .protocol_providers
+                .iter()
+                .map(|provider| provider.id.clone())
+                .collect(),
         }
     }
 
@@ -518,6 +712,10 @@ impl FeatureContributionDeclarations {
     fn contains_provided_service(&self, declaration: &ServiceDeclaration) -> bool {
         self.provided_services
             .contains(&(declaration.id.clone(), declaration.version.clone()))
+    }
+
+    fn contains_protocol_provider(&self, declaration: &ProtocolProviderDeclaration) -> bool {
+        self.protocol_providers.contains(&declaration.id)
     }
 }
 
@@ -600,6 +798,58 @@ impl FeatureDiagnosticSink<'_> {
     }
 }
 
+fn register_tool_contribution(
+    feature_id: &FeatureId,
+    report: &mut FeatureInstallReport,
+    pending_tools: &mut Vec<ToolDefinition>,
+    installed_tool_names: &mut HashMap<String, FeatureId>,
+    contribution: ToolContribution,
+    require_declared: impl FnOnce(&str) -> bool,
+) -> Result<(), FeatureInstallError> {
+    let (tool_meta, tool) = (contribution.definition)();
+    let model_visible_name = tool_meta.name.clone();
+    if contribution.name != model_visible_name {
+        let error = FeatureInstallError::ToolNameMismatch {
+            declared: contribution.name,
+            model_visible: model_visible_name.clone(),
+        };
+        report.mark_skipped(
+            FeatureContributionKind::Tool,
+            model_visible_name,
+            error.to_string(),
+        );
+        return Err(error);
+    }
+
+    if !require_declared(&model_visible_name) {
+        return Err(reject_undeclared_contribution(
+            feature_id,
+            report,
+            FeatureContributionKind::Tool,
+            model_visible_name,
+        ));
+    }
+
+    if let Some(first) = installed_tool_names.get(&model_visible_name) {
+        let error = FeatureInstallError::DuplicateToolName {
+            tool: model_visible_name.clone(),
+            first_feature: first.to_string(),
+            duplicate_feature: feature_id.to_string(),
+        };
+        report.mark_skipped(
+            FeatureContributionKind::Tool,
+            model_visible_name,
+            error.to_string(),
+        );
+        return Err(error);
+    }
+
+    installed_tool_names.insert(model_visible_name.clone(), feature_id.clone());
+    report.installed_tools.push(model_visible_name);
+    pending_tools.push(Arc::new(move || (tool_meta.clone(), Arc::clone(&tool))));
+    Ok(())
+}
+
 /// Tool contribution registrar exposed inside [`FeatureInstallContext`].
 pub struct ToolContributionRegistrar<'a> {
     feature_id: &'a FeatureId,
@@ -611,50 +861,14 @@ pub struct ToolContributionRegistrar<'a> {
 
 impl ToolContributionRegistrar<'_> {
     pub fn register(&mut self, contribution: ToolContribution) -> Result<(), FeatureInstallError> {
-        let (tool_meta, tool) = (contribution.definition)();
-        let model_visible_name = tool_meta.name.clone();
-        if contribution.name != model_visible_name {
-            let error = FeatureInstallError::ToolNameMismatch {
-                declared: contribution.name,
-                model_visible: model_visible_name.clone(),
-            };
-            self.report.mark_skipped(
-                FeatureContributionKind::Tool,
-                model_visible_name,
-                error.to_string(),
-            );
-            return Err(error);
-        }
-
-        if !self.declarations.contains_tool(&model_visible_name) {
-            return Err(reject_undeclared_contribution(
-                self.feature_id,
-                self.report,
-                FeatureContributionKind::Tool,
-                model_visible_name,
-            ));
-        }
-
-        if let Some(first) = self.installed_tool_names.get(&model_visible_name) {
-            let error = FeatureInstallError::DuplicateToolName {
-                tool: model_visible_name.clone(),
-                first_feature: first.to_string(),
-                duplicate_feature: self.feature_id.to_string(),
-            };
-            self.report.mark_skipped(
-                FeatureContributionKind::Tool,
-                model_visible_name,
-                error.to_string(),
-            );
-            return Err(error);
-        }
-
-        self.installed_tool_names
-            .insert(model_visible_name.clone(), self.feature_id.clone());
-        self.report.installed_tools.push(model_visible_name);
-        self.pending_tools
-            .push(Arc::new(move || (tool_meta.clone(), Arc::clone(&tool))));
-        Ok(())
+        register_tool_contribution(
+            self.feature_id,
+            self.report,
+            self.pending_tools,
+            self.installed_tool_names,
+            contribution,
+            |model_visible_name| self.declarations.contains_tool(model_visible_name),
+        )
     }
 }
 
@@ -796,6 +1010,143 @@ impl FeatureServiceRegistrar<'_> {
     }
 }
 
+/// Registrar for startup-discovered protocol-backed provider contributions.
+pub struct ProtocolProviderRegistrar<'a> {
+    feature_id: &'a FeatureId,
+    declarations: &'a FeatureContributionDeclarations,
+    pending_tools: &'a mut Vec<ToolDefinition>,
+    installed_tool_names: &'a mut HashMap<String, FeatureId>,
+    service_registry: &'a mut FeatureServiceRegistry,
+    report: &'a mut FeatureInstallReport,
+}
+
+impl ProtocolProviderRegistrar<'_> {
+    pub fn register(
+        &mut self,
+        contribution: ProtocolProviderContribution,
+    ) -> Result<(), FeatureInstallError> {
+        let ProtocolProviderContribution {
+            declaration,
+            state,
+            tools,
+            services,
+            background_tasks,
+            diagnostics,
+        } = contribution;
+
+        if !self.declarations.contains_protocol_provider(&declaration) {
+            return Err(reject_undeclared_contribution(
+                self.feature_id,
+                self.report,
+                FeatureContributionKind::ProtocolProvider,
+                declaration.id.to_string(),
+            ));
+        }
+
+        if self
+            .report
+            .protocol_providers
+            .iter()
+            .any(|provider| provider.provider_id == declaration.id)
+        {
+            let reason = format!(
+                "duplicate protocol provider contribution: {}",
+                declaration.id
+            );
+            let error = FeatureInstallError::InvalidDescriptor(reason.clone());
+            self.report.mark_skipped(
+                FeatureContributionKind::ProtocolProvider,
+                declaration.id.to_string(),
+                reason,
+            );
+            return Err(error);
+        }
+
+        for diagnostic in diagnostics {
+            self.report.diagnostics.push(FeatureDiagnostic {
+                severity: diagnostic.severity.clone(),
+                message: format!("provider {}: {}", declaration.id, diagnostic.message),
+            });
+        }
+
+        self.report
+            .protocol_providers
+            .push(ProtocolProviderLifecycleDiagnostic::new(
+                declaration.id.clone(),
+                state.clone(),
+                if state.can_contribute() {
+                    FeatureDiagnosticSeverity::Info
+                } else {
+                    FeatureDiagnosticSeverity::Error
+                },
+                format!(
+                    "protocol provider {} ({}) is {:?}",
+                    declaration.display_name, declaration.protocol, state
+                ),
+            ));
+
+        if !state.can_contribute() {
+            let reason = format!("protocol provider is not available: {:?}", state);
+            for tool in tools {
+                self.report
+                    .mark_skipped(FeatureContributionKind::Tool, tool.name, reason.clone());
+            }
+            for service in services {
+                self.report.mark_skipped(
+                    FeatureContributionKind::Service,
+                    service.id.to_string(),
+                    reason.clone(),
+                );
+            }
+            for task in background_tasks {
+                self.report.mark_skipped(
+                    FeatureContributionKind::BackgroundTask,
+                    task.name,
+                    reason.clone(),
+                );
+            }
+            return Ok(());
+        }
+
+        for tool in tools {
+            register_tool_contribution(
+                self.feature_id,
+                self.report,
+                self.pending_tools,
+                self.installed_tool_names,
+                tool,
+                |_| true,
+            )?;
+        }
+
+        for service in services {
+            if !self
+                .report
+                .provided_services
+                .iter()
+                .any(|provided| provided.id == service.id && provided.version == service.version)
+            {
+                self.service_registry
+                    .register_provider(self.feature_id.clone(), service.clone())?;
+                self.report.provided_services.push(service);
+            }
+        }
+
+        for task in background_tasks {
+            if !self
+                .report
+                .declared_background_tasks
+                .iter()
+                .any(|declared| declared.name == task.name)
+            {
+                self.report.declared_background_tasks.push(task);
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Install-time context provided to a feature module.
 pub struct FeatureInstallContext<'a> {
     feature_id: &'a FeatureId,
@@ -843,6 +1194,17 @@ impl FeatureInstallContext<'_> {
         FeatureServiceRegistrar {
             feature_id: self.feature_id,
             declarations: self.declarations,
+            service_registry: self.service_registry,
+            report: self.report,
+        }
+    }
+
+    pub fn protocol_providers(&mut self) -> ProtocolProviderRegistrar<'_> {
+        ProtocolProviderRegistrar {
+            feature_id: self.feature_id,
+            declarations: self.declarations,
+            pending_tools: self.pending_tools,
+            installed_tool_names: self.installed_tool_names,
             service_registry: self.service_registry,
             report: self.report,
         }
@@ -1248,6 +1610,184 @@ mod tests {
                 .contains("does not match model-visible tool name")
         }));
         assert_eq!(report.reports[0].skipped[0].name, "Actual");
+    }
+
+    struct ProviderFeature {
+        descriptor: FeatureDescriptor,
+        provider: ProtocolProviderDeclaration,
+        calls: Arc<AtomicUsize>,
+        state: ProtocolProviderLifecycleState,
+    }
+
+    impl FeatureModule for ProviderFeature {
+        fn descriptor(&self) -> FeatureDescriptor {
+            self.descriptor.clone()
+        }
+
+        fn install(
+            &self,
+            context: &mut FeatureInstallContext<'_>,
+        ) -> Result<(), FeatureInstallError> {
+            let calls = Arc::clone(&self.calls);
+            let definition: ToolDefinition = Arc::new(move || {
+                let call_index = calls.fetch_add(1, Ordering::SeqCst);
+                let name = if call_index == 0 {
+                    "DynamicTool"
+                } else {
+                    "ChangedDynamicTool"
+                };
+                (
+                    ToolMeta::new(name)
+                        .description("startup-discovered")
+                        .input_schema(json!({ "type": "object" })),
+                    Arc::new(DummyTool) as Arc<dyn Tool>,
+                )
+            });
+            let contribution =
+                ProtocolProviderContribution::new(self.provider.clone(), self.state.clone())
+                    .with_tool(ToolContribution::new("DynamicTool", definition))
+                    .with_service(ServiceDeclaration::new(
+                        ServiceId::builtin("dynamic-service"),
+                        "1.0.0",
+                        "startup-discovered service",
+                    ))
+                    .with_background_task(BackgroundTaskDeclaration::descriptor_only(
+                        "provider-poller",
+                        "provider lifecycle poller",
+                    ))
+                    .with_diagnostic(FeatureDiagnostic::info("startup discovery completed"));
+            context.protocol_providers().register(contribution)
+        }
+    }
+
+    #[test]
+    fn protocol_provider_registers_startup_discovered_contributions_through_worker_path() {
+        let provider = ProtocolProviderDeclaration::new(
+            ProviderId::builtin("dynamic-provider"),
+            "test-protocol",
+            "Dynamic provider",
+            "1",
+        );
+        let descriptor = FeatureDescriptor::builtin("provider-feature", "Provider feature")
+            .with_protocol_provider(provider.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut worker = Worker::new(DummyClient);
+        let mut hook_builder = HookRegistryBuilder::default();
+
+        let report = FeatureRegistryBuilder::new()
+            .with_module(ProviderFeature {
+                descriptor,
+                provider,
+                calls: Arc::clone(&calls),
+                state: ProtocolProviderLifecycleState::Ready,
+            })
+            .install_into_worker(&mut worker, &mut hook_builder);
+
+        worker.tool_server_handle().flush_pending();
+        let tool_names: Vec<_> = worker
+            .tool_server_handle()
+            .tool_definitions_sorted()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        let feature_report = &report.reports[0];
+
+        assert!(feature_report.installed);
+        assert_eq!(feature_report.installed_tools, vec!["DynamicTool"]);
+        assert_eq!(tool_names, vec!["DynamicTool"]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(feature_report.provided_services.len(), 1);
+        assert_eq!(
+            feature_report.provided_services[0].id,
+            ServiceId::builtin("dynamic-service")
+        );
+        assert_eq!(
+            feature_report.declared_background_tasks[0].name,
+            "provider-poller"
+        );
+        assert_eq!(feature_report.protocol_providers.len(), 1);
+        assert_eq!(
+            feature_report.protocol_providers[0].state,
+            ProtocolProviderLifecycleState::Ready
+        );
+        assert!(
+            feature_report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("startup discovery completed"))
+        );
+    }
+
+    #[test]
+    fn unavailable_protocol_provider_records_lifecycle_and_skips_discovered_contributions() {
+        let provider = ProtocolProviderDeclaration::new(
+            ProviderId::builtin("failed-provider"),
+            "test-protocol",
+            "Failed provider",
+            "1",
+        );
+        let descriptor = FeatureDescriptor::builtin("failed-provider-feature", "Failed provider")
+            .with_protocol_provider(provider.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut hook_builder = HookRegistryBuilder::default();
+        let mut pending_tools = Vec::new();
+
+        let report = FeatureRegistryBuilder::new()
+            .with_module(ProviderFeature {
+                descriptor,
+                provider,
+                calls: Arc::clone(&calls),
+                state: ProtocolProviderLifecycleState::Failed,
+            })
+            .install_into_pending(&mut pending_tools, &mut hook_builder);
+
+        let feature_report = &report.reports[0];
+        assert!(feature_report.installed);
+        assert!(pending_tools.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            feature_report.protocol_providers[0].state,
+            ProtocolProviderLifecycleState::Failed
+        );
+        assert!(feature_report.provided_services.is_empty());
+        assert!(feature_report.declared_background_tasks.is_empty());
+        assert!(
+            feature_report
+                .skipped
+                .iter()
+                .any(|skipped| skipped.kind == FeatureContributionKind::Tool)
+        );
+    }
+
+    #[test]
+    fn undeclared_protocol_provider_is_rejected_before_registering_tools() {
+        let provider = ProtocolProviderDeclaration::new(
+            ProviderId::builtin("undeclared-provider"),
+            "test-protocol",
+            "Undeclared provider",
+            "1",
+        );
+        let descriptor = FeatureDescriptor::builtin("undeclared-provider-feature", "Undeclared");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut hook_builder = HookRegistryBuilder::default();
+        let mut pending_tools = Vec::new();
+
+        let report = FeatureRegistryBuilder::new()
+            .with_module(ProviderFeature {
+                descriptor,
+                provider,
+                calls: Arc::clone(&calls),
+                state: ProtocolProviderLifecycleState::Ready,
+            })
+            .install_into_pending(&mut pending_tools, &mut hook_builder);
+
+        assert!(!report.reports[0].installed);
+        assert!(pending_tools.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            report.reports[0].skipped[0].kind,
+            FeatureContributionKind::ProtocolProvider
+        );
     }
 
     #[test]

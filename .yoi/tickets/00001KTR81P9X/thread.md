@@ -82,3 +82,31 @@ Validation:
 Ticket evidence, satisfied dependency on HostAuthority cleanup, relation records, orchestration plan, and clean workspace state were checked. No blockers remain; accept for implementation before worktree/spawn side effects.
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-14T06:30:42Z -->
+
+## Implementation report
+
+Implemented provider feature API for Ticket 00001KTR81P9X.
+
+Summary:
+- Extended `pod::feature` descriptors with `ProtocolProviderDeclaration` and provider lifecycle state/diagnostic reporting.
+- Added `ProtocolProviderContribution` and `FeatureInstallContext::protocol_providers()` so startup-discovered provider tools, services, and background task declarations register through the existing feature install pipeline.
+- Provider tools are materialized once at startup and then installed as ordinary Worker tool definitions, preserving stable schemas for the run and normal permission/history/bounded-result execution paths.
+- Unavailable providers record lifecycle diagnostics and skip discovered contributions without adding a separate feature authority layer.
+- Added focused tests for ready providers, failed providers, undeclared providers, and stable dynamic tool metadata.
+
+Validation:
+- PASS: `cargo fmt --check`
+- PASS: `cargo test -p pod feature::tests`
+- PASS: `cargo check --workspace --all-targets`
+- PASS: `git diff --check`
+- FAIL (pre-existing/unrelated prompt assertion): `cargo test -p pod` fails in `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body` and `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`, both expecting the phrase `worktree status, diff, and test results`.
+- FAIL (environment/resource): `nix build --no-link .#yoi` compiles through the Rust crates but fails during final binary link with `No space left on device`.
+
+Risks/notes:
+- This does not implement MCP protocol, MCP trust policy, plugin permissions, subprocess management, or a replacement HostAuthority-style grant layer.
+- Provider metadata and diagnostics remain install-report data; actual provider tool execution goes through the normal Worker/tool machinery.
+
+
+---
