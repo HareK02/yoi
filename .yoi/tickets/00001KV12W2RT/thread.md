@@ -107,3 +107,44 @@ Risks / unresolved:
 
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-14T06:41:55Z -->
+
+## Implementation report
+
+Integration outcome: merged and validated.
+
+- Implementation branch: `ticket-00001KV12W2RT-panel-ticket-two-line-rows`
+- Implementation commit: `645d048d tui: render panel ticket rows on two lines`
+- Review commit: `77e57cff ticket: approve panel two-line rows`
+- Orchestrator merge commit: `a9ece1dc merge: panel ticket two-line rows`
+
+Reviewer result:
+- `approve`。Ticket rows are two visual lines with canonical state/title separated from id/gate/action/reason; selected rows use `|` grouping marker on both lines; click/hitbox groups both visual lines into one logical row; relation waits remain derived gate info rather than persisted state.
+
+Orchestrator validation after merge:
+- `cargo test -p tui panel_ticket --lib`: PASS
+- `cargo test -p tui row_hit_testing --lib`: PASS
+- `cargo test -p tui mouse_click --lib`: PASS
+- `cargo test -p tui ready_ticket_with_waiting_gate --lib`: PASS
+- `cargo test -p tui workspace_panel_marks_ready_ticket_with_unresolved_relation_waiting_gate --lib`: PASS
+- `cargo test -p yoi-e2e --features e2e --test panel -- --nocapture`: PASS（3 tests）
+- `cargo build -p yoi`: PASS
+- `cargo fmt --check`: PASS
+- `git diff --check`: PASS
+
+Residual notes:
+- Full broad TUI suite was not used as merge gate because there are known unrelated failures already tracked in this session; focused row/mouse/E2E coverage passed.
+
+Next:
+- Mark Ticket done and clean up child coder/reviewer Pods plus implementation worktree/branch.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-14T06:42:04Z from: inprogress to: done reason: merged_and_validated field: state -->
+
+## State changed
+
+Implementation branch was reviewed, approved, merged into the Orchestrator branch as `a9ece1dc`, and validated in the Orchestrator worktree. Focused TUI row/mouse/gate tests, Panel E2E tests, build, formatting, and diff check passed. Ticket implementation work is done; closure remains separate.
+
+---
