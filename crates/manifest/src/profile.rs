@@ -1262,12 +1262,7 @@ fn profile_scope_to_config(
     scope: Option<ProfileScopeConfig>,
     workspace_base: &Path,
 ) -> Result<ScopeConfig, ProfileError> {
-    profile_scope_intent_to_config(
-        scope,
-        workspace_base,
-        Some(ProfileScopeIntent::WorkspaceWrite),
-        "scope",
-    )
+    profile_scope_intent_to_config(scope, workspace_base, None, "scope")
 }
 
 fn profile_delegation_scope_to_config(
@@ -1594,10 +1589,9 @@ mod tests {
         assert!(companion.feature.task.enabled);
         assert!(companion.feature.pods.enabled);
         assert!(companion.feature.ticket.enabled);
-        assert_eq!(companion.scope.allow[0].permission, Permission::Write);
-        assert_eq!(companion.scope.deny.len(), 1);
-        assert_eq!(companion.scope.deny[0].permission, Permission::Write);
-        assert_eq!(companion.scope.deny[0].target, tmp.path().join(".worktree"));
+        assert!(companion.scope.allow.is_empty());
+        assert!(companion.scope.deny.is_empty());
+        assert!(companion.delegation_scope.allow.is_empty());
         assert_eq!(companion.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
         assert!(companion.web.is_some());
 
@@ -1605,7 +1599,8 @@ mod tests {
         assert!(!intake.feature.task.enabled);
         assert!(!intake.feature.pods.enabled);
         assert!(intake.feature.ticket.enabled);
-        assert_eq!(intake.scope.allow[0].permission, Permission::Read);
+        assert!(intake.scope.allow.is_empty());
+        assert!(intake.delegation_scope.allow.is_empty());
         assert_eq!(intake.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
         assert!(intake.web.is_some());
         assert!(!intake.feature.ticket_orchestration.enabled);
@@ -1615,21 +1610,19 @@ mod tests {
         assert!(orchestrator.feature.pods.enabled);
         assert!(orchestrator.feature.ticket.enabled);
         assert!(orchestrator.feature.ticket_orchestration.enabled);
-        assert_eq!(orchestrator.scope.allow[0].permission, Permission::Read);
+        assert!(orchestrator.scope.allow.is_empty());
+        assert!(orchestrator.delegation_scope.allow.is_empty());
         assert_eq!(
             orchestrator.model.ref_.as_deref(),
             Some("codex-oauth/gpt-5.5")
         );
         assert!(orchestrator.web.is_some());
-        assert_eq!(
-            orchestrator.delegation_scope.allow[0].permission,
-            Permission::Write
-        );
 
         let coder = resolve("coder");
         assert!(coder.feature.task.enabled);
         assert!(!coder.feature.pods.enabled);
-        assert_eq!(coder.scope.allow[0].permission, Permission::Write);
+        assert!(coder.scope.allow.is_empty());
+        assert!(coder.delegation_scope.allow.is_empty());
         assert_eq!(coder.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
         assert!(coder.web.is_some());
 
@@ -1637,7 +1630,8 @@ mod tests {
         assert!(!reviewer.feature.task.enabled);
         assert!(!reviewer.feature.pods.enabled);
         assert!(!reviewer.feature.ticket.enabled);
-        assert_eq!(reviewer.scope.allow[0].permission, Permission::Read);
+        assert!(reviewer.scope.allow.is_empty());
+        assert!(reviewer.delegation_scope.allow.is_empty());
         assert_eq!(reviewer.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
         assert!(reviewer.web.is_some());
     }
@@ -1959,11 +1953,8 @@ return profile {
             resolved.manifest.model.ref_.as_deref(),
             Some("codex-oauth/gpt-5.5")
         );
-        assert_eq!(resolved.manifest.scope.allow[0].target, tmp.path());
-        assert_eq!(
-            resolved.manifest.scope.allow[0].permission,
-            Permission::Write
-        );
+        assert!(resolved.manifest.scope.allow.is_empty());
+        assert!(resolved.manifest.delegation_scope.allow.is_empty());
         assert!(resolved.manifest.session.record_event_trace);
         assert_eq!(
             resolved.profile.as_ref().unwrap().name.as_deref(),
@@ -2016,7 +2007,7 @@ record_event_trace = false
             resolved.manifest.pod.prompt_pack.as_deref(),
             Some(yoi_dir.join("prompts.toml").as_path())
         );
-        assert_eq!(resolved.manifest.scope.allow[0].target, nested);
+        assert!(resolved.manifest.scope.allow.is_empty());
         assert_eq!(
             resolved
                 .manifest
