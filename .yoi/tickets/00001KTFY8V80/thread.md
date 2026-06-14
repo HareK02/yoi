@@ -72,3 +72,76 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-14T15:24:40Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- Panel Queue により routing が明示的に許可され、Ticket は `queued`。
+- 要件、受け入れ条件、binding invariants、implementation latitude、escalation conditions が Ticket body/thread に揃っている。
+- active Workflow invocation/state/obligations を durable history/state と compaction/rehydration 経路に載せる目的は concrete で、残る不確実性は既存 Pod/session/compaction architecture 内の実装戦術選択に閉じている。
+
+Evidence checked:
+- Ticket body / thread / artifacts: artifacts なし、Intake refinement と `planning -> ready`、Panel `ready -> queued` を確認。
+- Ticket relations: blocking relation なし。
+- OrchestrationPlan records: 既存 record なし。
+- Orchestrator workspace state: `/home/hare/Projects/yoi/.worktree/orchestration` は clean、queue commit `d311fe8f` 上。
+- Visible Pods: spawned child なし。
+- Bounded code map: workflow / compaction 関連は `crates/pod/src/compact/*`, `crates/pod/src/workflow/*`, `crates/pod/src/prompt/*`, `crates/session-store/src/*`, `crates/protocol/src/lib.rs`, `resources/workflows/*` が候補。
+
+IntentPacket:
+
+Intent:
+- compaction を跨ぐ長時間 workflow-governed task で、active workflow と残る operational obligations が失われないようにする。
+
+Binding decisions / invariants:
+- Workflow instructions を、history/state に残らない turn-local transient context だけを根拠に model context へ注入しない。
+- post-compaction context は「available workflow」と「この task で active な workflow obligations」を区別する。
+- missing / corrupt / obsolete active workflow state は silent stale instruction ではなく fail-closed または bounded diagnostic にする。
+- Ticket / Pod history / workflow record / compaction output の authority boundary を混同しない。
+- active workflow state は workflow-governed task の完了または explicit cancellation で clear / completed にできる必要がある。
+
+Requirements / acceptance criteria:
+- active workflow の slug、invocation source/time、task/scope、active/completed、current obligations/checkpoints を durable typed history/state として表現する。
+- compaction が active workflow state を明示的に carry forward する。
+- rehydration が durable source から active workflow guidance を復元できる。
+- snapshot vs latest workflow body の選択を実装報告または docs/code に明示する。
+- focused coverage に、review delegation と merge/close handling の間で compaction が起きる worktree/multi-agent style flow を含める。
+
+Implementation latitude:
+- 永続化先、schema、snapshot 粒度、diagnostic 表現は既存 Pod/session/compaction architecture に合わせて選んでよい。
+- local tactic 調査は coder に委ねるが、authority boundary を広げる必要があれば escalate する。
+
+Escalate if:
+- workflow snapshot vs latest body の選択が authority boundary や backward compatibility を大きく変える。
+- compaction 復元が hidden context injection を必要としそうになる。
+- persisted workflow state migration / compatibility が既存 records を破壊しそうになる。
+- Ticket lifecycle / Orchestrator queue semantics / workflow invocation semantics を広げる必要が出る。
+
+Validation:
+- 変更箇所に応じて `cargo test` / `cargo check` の focused subset。
+- 少なくとも workflow/compaction 関連 unit coverage、`cargo fmt --check`、`git diff --check`。
+
+Current code map:
+- Primary candidates: `crates/pod/src/compact/*`, `crates/pod/src/workflow/*`, `crates/pod/src/prompt/*`, `crates/session-store/src/*`, `crates/protocol/src/lib.rs`。
+- Workflow resources: `resources/workflows/*`。
+
+Critical risks / reviewer focus:
+- hidden context injection 回避。
+- active vs advertised workflow の明確な区別。
+- stale workflow obligations の漏れ込み防止。
+- persisted state の compatibility / corrupt-state diagnostics。
+- compaction 後の traceability と test coverage。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-14T15:24:58Z from: queued to: inprogress reason: orchestrator_acceptance field: state -->
+
+## State changed
+
+Routing decision と accepted implementation plan を記録済み。blocking relation / orchestration-plan blocker はなく、Orchestrator workspace は clean。implementation side effects の前に `queued -> inprogress` acceptance を記録する。
+
+---
