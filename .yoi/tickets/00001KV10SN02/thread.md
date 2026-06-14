@@ -159,3 +159,45 @@ Validation performed:
 
 Residual risk:
 - The rewind E2E intentionally uses an in-process canned rewind fixture instead of a provider/socket-backed Pod to avoid credentials and network. This is acceptable for the Ticket's critical TUI/PTTY regression focus, but it is not full provider integration coverage.
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-14T05:38:52Z -->
+
+## Implementation report
+
+Integration outcome: merged and validated.
+
+- Implementation branch: `ticket-00001KV10SN02-e2e-critical-path`
+- Implementation commits: `b9f49eee test: cover critical tui e2e paths`, `3de938b7 ticket: report e2e critical implementation`
+- Sync commit: `b6c6fc04 merge: sync e2e critical branch`
+- Review commit: `581cb202 ticket: approve e2e critical path`
+- Orchestrator merge commit: `059b1fd4 merge: e2e critical path`
+
+Reviewer result:
+- `approve`。Panel wheel PTY coverage, forbidden drag-capture checks, single-Pod rewind PTY E2E with canned e2e-test fixture, no real provider/network calls, and existing tmp/env/runtime isolation preservation were reviewed.
+
+Orchestrator validation after merge:
+- `cargo fmt --check`: PASS
+- `git diff --check`: PASS
+- `cargo test -p yoi-e2e --no-run`: PASS
+- `cargo build -p yoi`: PASS
+- `cargo test -p yoi-e2e --features e2e`: PASS
+- `cargo test -p tui --lib single_pod::tests::rewind`: PASS
+- `cargo test -p tui --lib mouse`: PASS
+- `nix build .#yoi`: PASS
+
+Residual notes:
+- Full `cargo test -p tui --lib` was not used as merge gate because reviewer/coder both observed known unrelated failures in `multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace` and `spawn::tests::{profile_choices_include_builtin_and_project_default_marker, profile_choices_use_project_registry_default}`.
+- Rewind E2E intentionally uses e2e-test-only canned fixture rather than provider/socket-backed Pod to avoid credentials/network while covering the TUI/PTTY regression path.
+
+Next:
+- Mark Ticket done and clean up replacement Coder / Reviewer Pods plus implementation worktree/branch.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-14T05:39:03Z from: inprogress to: done reason: merged_and_validated field: state -->
+
+## State changed
+
+Implementation branch was reviewed, approved, merged into the Orchestrator branch as `059b1fd4`, and validated in the Orchestrator worktree. Focused E2E, TUI rewind/mouse tests, formatting, diff check, `cargo build -p yoi`, and `nix build .#yoi` passed. Ticket implementation work is done; closure remains separate.
+
+---
