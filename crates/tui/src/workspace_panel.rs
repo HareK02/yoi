@@ -182,7 +182,17 @@ impl OrchestratorPanelStatus {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum PanelRowKey {
     Ticket(String),
+    TicketIntakePod { ticket_id: String, pod_name: String },
     Pod(String),
+}
+
+impl PanelRowKey {
+    pub(crate) fn pod_name(&self) -> Option<&str> {
+        match self {
+            Self::Pod(name) | Self::TicketIntakePod { pod_name: name, .. } => Some(name),
+            Self::Ticket(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +201,7 @@ pub(crate) enum PanelRowKind {
     Ticket,
     Review,
     ActiveWork,
+    TicketIntakePod,
     Pod,
 }
 
@@ -236,6 +247,30 @@ pub(crate) struct TicketPanelEntry {
     pub(crate) blocked_reason: Option<String>,
     pub(crate) related_pods: Vec<String>,
     pub(crate) local_claim: Option<TicketLocalClaimEntry>,
+    pub(crate) intake_pods: Vec<TicketAssociatedIntakeEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TicketAssociatedIntakeEntry {
+    pub(crate) ticket_id: String,
+    pub(crate) pod_name: String,
+    pub(crate) status: TicketLocalClaimStatus,
+    pub(crate) source: TicketAssociatedIntakeSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TicketAssociatedIntakeSource {
+    LocalClaim,
+    RelatedSession,
+}
+
+impl TicketAssociatedIntakeSource {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::LocalClaim => "local claim",
+            Self::RelatedSession => "related session",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,11 +314,22 @@ pub(crate) struct PanelRow {
 
 impl PanelRow {
     pub(crate) fn is_ticket_action(&self) -> bool {
-        !matches!(self.kind, PanelRowKind::Pod)
+        matches!(
+            self.kind,
+            PanelRowKind::Planning
+                | PanelRowKind::Ticket
+                | PanelRowKind::Review
+                | PanelRowKind::ActiveWork
+        )
+    }
+
+    pub(crate) fn is_ticket_section_row(&self) -> bool {
+        self.is_ticket_action() || matches!(self.kind, PanelRowKind::TicketIntakePod)
     }
 }
 
 const MAX_POD_NAME_CHARS: usize = 80;
+const MAX_ASSOCIATED_INTAKE_ROWS_PER_TICKET: usize = 3;
 const ORCHESTRATOR_SUFFIX: &str = "-orchestrator";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -574,12 +620,6 @@ fn build_workspace_panel_with_registry_model(
     }
 
     model.rows.extend(pod_rows(pods));
-    model.rows.sort_by(|a, b| {
-        a.priority
-            .cmp(&b.priority)
-            .then_with(|| row_updated_at(b).cmp(row_updated_at(a)))
-            .then_with(|| a.title.cmp(&b.title))
-    });
     model
 }
 
@@ -628,19 +668,32 @@ fn build_ticket_rows(
     pods: &PodList,
     registry: &PanelRegistrySnapshot,
 ) -> ticket::Result<Vec<PanelRow>> {
-    let mut rows = Vec::new();
+    let mut ticket_rows = Vec::new();
     for summary in backend.list(TicketFilter::all())? {
         if summary.workflow_state == TicketWorkflowState::Closed {
             continue;
         }
         let ticket = backend.show(TicketIdOrSlug::Query(summary.id.clone()))?;
-        rows.push(ticket_row(
+        ticket_rows.push(ticket_row(
             summary,
             &ticket.events,
             &ticket.relations.blockers,
             pods,
             registry,
         ));
+    }
+    ticket_rows.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then_with(|| row_updated_at(b).cmp(row_updated_at(a)))
+            .then_with(|| a.title.cmp(&b.title))
+    });
+
+    let mut rows = Vec::new();
+    for row in ticket_rows {
+        let intake_rows = ticket_intake_pod_rows(&row);
+        rows.push(row);
+        rows.extend(intake_rows);
     }
     Ok(rows)
 }
@@ -653,7 +706,17 @@ fn ticket_row(
     registry: &PanelRegistrySnapshot,
 ) -> PanelRow {
     let local_claim = local_claim_for_ticket(&summary, pods, registry);
-    let related_pods = related_pods_for_ticket(&summary, pods, registry);
+    let intake_pods =
+        associated_intake_entries_for_ticket(&summary, pods, registry, local_claim.as_ref());
+    let mut related_pods = Vec::new();
+    if let Some(claim) = local_claim.as_ref() {
+        related_pods.push(claim.pod_name.clone());
+    }
+    for pod_name in intake_pods.iter().map(|intake| intake.pod_name.clone()) {
+        if !related_pods.iter().any(|existing| existing == &pod_name) {
+            related_pods.push(pod_name);
+        }
+    }
     let derived = derive_ticket_state(&summary, relation_blockers);
     let latest_event = events.last();
     let entry = TicketPanelEntry {
@@ -669,6 +732,7 @@ fn ticket_row(
         blocked_reason: derived.blocked_reason.clone(),
         related_pods: related_pods.clone(),
         local_claim,
+        intake_pods,
     };
     let subtitle = ticket_subtitle(&entry);
     PanelRow {
@@ -802,32 +866,111 @@ fn derive_ticket_state(
     }
 }
 
-fn related_pods_for_ticket(
+fn associated_intake_entries_for_ticket(
     summary: &TicketSummary,
     pods: &PodList,
     registry: &PanelRegistrySnapshot,
-) -> Vec<String> {
-    let id = lowercase(&summary.id);
-    let mut names = Vec::new();
-    if let Some(claim) = registry.claim_for_ticket(&summary.id) {
-        names.push(claim.pod_name.clone());
+    local_claim: Option<&TicketLocalClaimEntry>,
+) -> Vec<TicketAssociatedIntakeEntry> {
+    let mut entries = Vec::new();
+    if let Some(claim) = local_claim.filter(|claim| is_intake_role(&claim.role)) {
+        entries.push(TicketAssociatedIntakeEntry {
+            ticket_id: summary.id.clone(),
+            pod_name: claim.pod_name.clone(),
+            status: claim.status,
+            source: TicketAssociatedIntakeSource::LocalClaim,
+        });
     }
-    for pod in pods.entries.iter().filter_map(|pod| {
-        let name = lowercase(&pod.name);
-        if !id.is_empty() && name.contains(&id) {
-            Some(pod.name.clone())
-        } else {
-            None
+
+    let mut related_sessions = registry
+        .sessions
+        .iter()
+        .filter(|session| {
+            is_intake_role(&session.role)
+                && session
+                    .related_tickets
+                    .iter()
+                    .any(|related| related.id == summary.id.as_str())
+        })
+        .map(|session| session.pod_name.clone())
+        .collect::<Vec<_>>();
+    related_sessions.sort();
+    related_sessions.dedup();
+
+    for pod_name in related_sessions {
+        if entries.iter().any(|entry| entry.pod_name == pod_name) {
+            continue;
         }
-    }) {
-        if !names.iter().any(|existing| existing == &pod) {
-            names.push(pod);
-        }
-        if names.len() >= 5 {
+        entries.push(TicketAssociatedIntakeEntry {
+            ticket_id: summary.id.clone(),
+            status: local_claim_status_for_pod(&pod_name, pods),
+            pod_name,
+            source: TicketAssociatedIntakeSource::RelatedSession,
+        });
+        if entries.len() >= MAX_ASSOCIATED_INTAKE_ROWS_PER_TICKET {
             break;
         }
     }
-    names
+
+    entries.truncate(MAX_ASSOCIATED_INTAKE_ROWS_PER_TICKET);
+    entries
+}
+
+fn is_intake_role(role: &str) -> bool {
+    role.eq_ignore_ascii_case("intake")
+}
+
+fn ticket_intake_pod_rows(row: &PanelRow) -> Vec<PanelRow> {
+    row.ticket
+        .as_ref()
+        .map(|ticket| {
+            ticket
+                .intake_pods
+                .iter()
+                .map(ticket_intake_pod_row)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn ticket_intake_pod_row(intake: &TicketAssociatedIntakeEntry) -> PanelRow {
+    let stale = intake.status == TicketLocalClaimStatus::Stale;
+    PanelRow {
+        key: PanelRowKey::TicketIntakePod {
+            ticket_id: intake.ticket_id.clone(),
+            pod_name: intake.pod_name.clone(),
+        },
+        kind: PanelRowKind::TicketIntakePod,
+        title: format!("↳ Intake Pod: {}", intake.pod_name),
+        subtitle: Some(format!(
+            "Ticket {} · {} · {}",
+            intake.ticket_id,
+            intake.source.label(),
+            intake.status.label()
+        )),
+        status: intake.status.label().to_string(),
+        priority: ActionPriority::ActiveWork,
+        next_action: if stale {
+            None
+        } else {
+            Some(NextUserAction::OpenPod)
+        },
+        ticket: None,
+        related_pods: vec![intake.pod_name.clone()],
+        disabled_reason: if stale {
+            Some(
+                "Associated Intake Pod is stale; no live or restorable Pod entry is available."
+                    .to_string(),
+            )
+        } else {
+            None
+        },
+        key_hint: Some(if stale {
+            "Stale Intake claim/session; restore is unavailable".to_string()
+        } else {
+            "Open/attach this Ticket's Intake Pod".to_string()
+        }),
+    }
 }
 
 fn local_claim_for_ticket(
@@ -962,15 +1105,12 @@ fn excerpt(markdown: &str, max_chars: usize) -> Option<String> {
     }
 }
 
-fn lowercase(value: &str) -> String {
-    value.to_ascii_lowercase()
-}
-
 #[allow(dead_code)]
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pod_list::{LivePodInfo, PodEntrySummary};
+    use crate::role_session_registry::{PanelRegistryStore, RelatedTicketRef, RoleSessionOrigin};
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -1194,6 +1334,97 @@ mod tests {
         assert!(backlog.is_ticket_action());
         assert_eq!(done.status, "done");
         assert_eq!(done.next_action, Some(NextUserAction::Close));
+    }
+
+    #[test]
+    fn workspace_panel_shows_ticket_associated_intake_pods_adjacent_to_ticket() {
+        let temp = TempDir::new().unwrap();
+        write_ticket_config(temp.path());
+        let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
+        create_ticket(&backend, "Ticket With Intake", |input| {
+            input.workflow_state = Some(TicketWorkflowState::Ready);
+        });
+        let ticket_id = backend
+            .list(TicketFilter::all())
+            .unwrap()
+            .into_iter()
+            .find(|ticket| ticket.title == "Ticket With Intake")
+            .unwrap()
+            .id;
+        let preticket_pod = format!("pre-{ticket_id}-intake");
+        let registry = PanelRegistryStore::from_root(temp.path().join("registry"));
+        registry
+            .claim_ticket(&ticket_id, None, "claimed-intake", "intake")
+            .unwrap();
+        registry
+            .record_session(
+                "shared-intake",
+                "intake",
+                RoleSessionOrigin::RoleLaunch,
+                None,
+                [RelatedTicketRef {
+                    id: ticket_id.clone(),
+                    slug: None,
+                }],
+            )
+            .unwrap();
+        registry
+            .record_session(
+                &preticket_pod,
+                "intake",
+                RoleSessionOrigin::PreTicketIntake,
+                None,
+                [],
+            )
+            .unwrap();
+
+        let pods = live_pods(&["claimed-intake", "shared-intake", &preticket_pod]);
+        let model =
+            build_workspace_panel_with_registry(temp.path(), &pods, &registry.snapshot().unwrap());
+
+        let ticket_index = model
+            .rows
+            .iter()
+            .position(|row| row.key == PanelRowKey::Ticket(ticket_id.clone()))
+            .unwrap();
+        let ticket_row = &model.rows[ticket_index];
+        let ticket = ticket_row.ticket.as_ref().unwrap();
+        assert_eq!(
+            ticket
+                .intake_pods
+                .iter()
+                .map(|entry| entry.pod_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["claimed-intake", "shared-intake"]
+        );
+        assert_eq!(ticket.related_pods, vec!["claimed-intake", "shared-intake"]);
+        assert_eq!(
+            model.rows[ticket_index + 1].key,
+            PanelRowKey::TicketIntakePod {
+                ticket_id: ticket_id.clone(),
+                pod_name: "claimed-intake".to_string(),
+            }
+        );
+        assert_eq!(
+            model.rows[ticket_index + 1].kind,
+            PanelRowKind::TicketIntakePod
+        );
+        assert_eq!(model.rows[ticket_index + 1].status, "live");
+        assert_eq!(
+            model.rows[ticket_index + 1].next_action,
+            Some(NextUserAction::OpenPod)
+        );
+        assert_eq!(
+            model.rows[ticket_index + 2].key,
+            PanelRowKey::TicketIntakePod {
+                ticket_id: ticket_id.clone(),
+                pod_name: "shared-intake".to_string(),
+            }
+        );
+        assert!(model.rows.iter().all(|row| {
+            row.kind != PanelRowKind::TicketIntakePod
+                || row.key.pod_name() != Some(preticket_pod.as_str())
+        }));
     }
 
     #[test]
