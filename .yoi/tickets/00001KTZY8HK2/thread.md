@@ -83,3 +83,28 @@ Validation:
 Ticket evidence, related records, orchestration plan, and clean workspace state were checked. No blockers remain; accept for implementation before worktree/spawn side effects.
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-14T06:24:18Z -->
+
+## Implementation report
+
+Implemented removal/deprecation of yoi.profile.extend and migrated builtin role Profile resources to yoi.profile.import plus explicit Lua assignment.
+
+Changes:
+- yoi.profile.extend now fails with a removed-API diagnostic directing users to yoi.profile.import(...) plus assignment; the previous JSON deep-merge implementation was removed.
+- Builtin role Lua profiles (companion/intake/orchestrator/coder/reviewer) import builtin:default, then assign each overridden field explicitly. Worker instruction overrides preserve imported worker defaults by assigning p.worker.instruction.
+- Focused profile tests now cover explicit assignment, object replacement without hidden deep-merge retention, removed extend diagnostics, and role profile resolution/feature policy.
+
+Validation:
+- cargo fmt --check
+- git diff --check
+- cargo test -p manifest profile::tests:: -- --nocapture
+- cargo build -p yoi
+- nix build .#yoi (completed; dirty-tree warning expected before commit, result symlink removed)
+
+Risks/notes:
+- yoi.profile.extend remains present only as a failing diagnostic stub so callers receive an actionable migration error instead of a nil-call Lua error.
+- Scope/delegation authority semantics were not expanded; this change only preserves existing builtin profile scope/delegation declarations while changing composition style.
+
+
+---

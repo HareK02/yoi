@@ -1,21 +1,17 @@
-return yoi.profile.extend("builtin:default", {
-    slug = "orchestrator",
-    description = "Orchestrator role profile with bundled reusable policy",
+local p = yoi.profile.import("builtin:default")
 
-    scope = "workspace_read",
+p.slug = "orchestrator"
+p.description = "Orchestrator role profile with bundled reusable policy"
+p.scope = "workspace_read"
+p.worker.instruction = "$yoi/role/orchestrator"
+p.feature = {
+    task = { enabled = false },
+    memory = { enabled = true },
+    web = { enabled = true },
+    pods = { enabled = true },
+    ticket = { enabled = true, access = "lifecycle" },
+    ticket_orchestration = { enabled = true },
+}
+p.delegation_scope = "workspace_write"
 
-    worker = {
-        instruction = "$yoi/role/orchestrator",
-    },
-
-    feature = {
-        task = { enabled = false },
-        memory = { enabled = true },
-        web = { enabled = true },
-        pods = { enabled = true },
-        ticket = { enabled = true, access = "lifecycle" },
-        ticket_orchestration = { enabled = true },
-    },
-
-    delegation_scope = "workspace_write",
-})
+return p

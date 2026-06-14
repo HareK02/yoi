@@ -1054,12 +1054,10 @@ fn profile_module(lua: &Lua) -> mlua::Result<Table> {
     )?;
     module.set(
         "extend",
-        lua.create_function(|lua, (reference, overrides): (String, LuaValue)| {
-            let base_value = import_profile_artifact(lua, &reference)?;
-            let mut base_json: serde_json::Value = lua.from_value(base_value)?;
-            let override_json: serde_json::Value = lua.from_value(overrides)?;
-            deep_merge_profile_json(&mut base_json, override_json);
-            lua.to_value(&base_json)
+        lua.create_function(|_, (_reference, _overrides): (String, LuaValue)| {
+            Err::<LuaValue, _>(mlua::Error::RuntimeError(
+                "yoi.profile.extend has been removed; use yoi.profile.import(...) and explicit Lua assignment instead".to_string(),
+            ))
         })?,
     )?;
     let meta = lua.create_table()?;
@@ -1083,23 +1081,6 @@ fn builtin_profile_by_ref(reference: &str) -> Option<&'static BuiltinProfile> {
     BUILTIN_PROFILES
         .iter()
         .find(|profile| profile.name == name || profile.label == reference)
-}
-fn deep_merge_profile_json(base: &mut serde_json::Value, overrides: serde_json::Value) {
-    match (base, overrides) {
-        (serde_json::Value::Object(base), serde_json::Value::Object(overrides)) => {
-            for (key, value) in overrides {
-                match base.get_mut(&key) {
-                    Some(existing) => deep_merge_profile_json(existing, value),
-                    None => {
-                        base.insert(key, value);
-                    }
-                }
-            }
-        }
-        (base, override_value) => {
-            *base = override_value;
-        }
-    }
 }
 fn models_module(lua: &Lua) -> mlua::Result<Table> {
     let t = lua.create_table()?;
@@ -1610,9 +1591,9 @@ mod tests {
         };
 
         let companion = resolve("companion");
-        assert!(!companion.feature.task.enabled);
-        assert!(!companion.feature.pods.enabled);
-        assert!(!companion.feature.ticket.enabled);
+        assert!(companion.feature.task.enabled);
+        assert!(companion.feature.pods.enabled);
+        assert!(companion.feature.ticket.enabled);
         assert_eq!(companion.scope.allow[0].permission, Permission::Write);
         assert_eq!(companion.scope.deny.len(), 1);
         assert_eq!(companion.scope.deny[0].permission, Permission::Write);
@@ -1646,7 +1627,7 @@ mod tests {
         );
 
         let coder = resolve("coder");
-        assert!(!coder.feature.task.enabled);
+        assert!(coder.feature.task.enabled);
         assert!(!coder.feature.pods.enabled);
         assert_eq!(coder.scope.allow[0].permission, Permission::Write);
         assert_eq!(coder.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
@@ -1812,23 +1793,23 @@ return yoi.profile {
         );
     }
     #[test]
-    fn global_yoi_import_and_extend_builtin_profile() {
+    fn global_yoi_import_supports_explicit_lua_assignment() {
         let tmp = TempDir::new().unwrap();
         let profile = write_profile(
             tmp.path(),
-            "extended.lua",
+            "assigned.lua",
             r#"
-local imported = yoi.profile.import("builtin:default")
-assert(imported.model.ref == "codex-oauth/gpt-5.5")
-return yoi.profile.extend("builtin:default", {
-  slug = "extended",
-  model = yoi.models.catalog("anthropic/claude-sonnet-4-6"),
-  feature = {
-    task = { enabled = false },
-    pods = { enabled = true },
-  },
-  compaction = { kind = "tokens", threshold = 123, request_threshold = 456 },
-})
+local p = yoi.profile.import("builtin:default")
+assert(p.model.ref == "codex-oauth/gpt-5.5")
+p.slug = "assigned"
+p.model = yoi.models.catalog("anthropic/claude-sonnet-4-6")
+p.feature = {
+  task = { enabled = false },
+  pods = { enabled = true },
+}
+p.web = { enabled = false }
+p.compaction = yoi.compact.tokens { threshold = 123, request_threshold = 456 }
+return p
 "#,
         );
         let resolved = ProfileResolver::new()
@@ -1844,25 +1825,27 @@ return yoi.profile.extend("builtin:default", {
         );
         assert!(!resolved.manifest.feature.task.enabled);
         assert!(resolved.manifest.feature.pods.enabled);
+        assert_eq!(resolved.manifest.web.as_ref().unwrap().enabled, Some(false));
+        assert!(resolved.manifest.web.as_ref().unwrap().search.is_none());
         assert_eq!(
             resolved.manifest.compaction.as_ref().unwrap().threshold,
             Some(123)
         );
         assert_eq!(
             resolved.profile.as_ref().unwrap().name.as_deref(),
-            Some("extended")
+            Some("assigned")
         );
     }
 
     #[test]
-    fn global_yoi_extend_keeps_profile_validation_boundary() {
+    fn global_yoi_extend_fails_with_removed_api_diagnostic() {
         let tmp = TempDir::new().unwrap();
         let profile = write_profile(
             tmp.path(),
             "bad.lua",
             r#"
 return yoi.profile.extend("builtin:default", {
-  pod = { name = "not-runtime" },
+  slug = "bad",
 })
 "#,
         );
@@ -1873,7 +1856,10 @@ return yoi.profile.extend("builtin:default", {
                 ProfileResolveOptions::with_pod_name("p"),
             )
             .unwrap_err();
-        assert!(err.to_string().contains("field `pod`"));
+        let message = err.to_string();
+        assert!(message.contains("yoi.profile.extend"), "{message}");
+        assert!(message.contains("removed"), "{message}");
+        assert!(message.contains("yoi.profile.import"), "{message}");
     }
 
     #[test]

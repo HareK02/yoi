@@ -1,19 +1,16 @@
-return yoi.profile.extend("builtin:default", {
-    slug = "coder",
-    description = "Coder role profile with bundled reusable policy",
+local p = yoi.profile.import("builtin:default")
 
-    scope = yoi.scope.workspace_write(),
+p.slug = "coder"
+p.description = "Coder role profile with bundled reusable policy"
+p.scope = yoi.scope.workspace_write()
+p.worker.instruction = "$yoi/role/coder"
+p.feature = {
+    task = { enabled = true },
+    memory = { enabled = true },
+    web = { enabled = true },
+    pods = { enabled = false },
+    ticket = { enabled = false, access = "lifecycle" },
+    ticket_orchestration = { enabled = false },
+}
 
-    worker = {
-        instruction = "$yoi/role/coder",
-    },
-
-    feature = {
-        task = { enabled = true },
-        memory = { enabled = true },
-        web = { enabled = true },
-        pods = { enabled = false },
-        ticket = { enabled = false, access = "lifecycle" },
-        ticket_orchestration = { enabled = false },
-    },
-})
+return p
