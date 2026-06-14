@@ -2,7 +2,7 @@
 title: 'Panel: invalid Ticket があっても Ticket 機能全体を無効化しない'
 state: 'inprogress'
 created_at: '2026-06-14T14:56:51Z'
-updated_at: '2026-06-14T16:27:19Z'
+updated_at: '2026-06-14T16:30:55Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['tui-panel', 'ticket-backend', 'partial-failure', 'diagnostics']

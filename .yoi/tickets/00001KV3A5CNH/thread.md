@@ -215,3 +215,48 @@ Conclusion:
 - Changes requested. Do not integrate until current-ticket detail/artifact corruption cannot expose lifecycle actions and focused coverage is added.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KV3A5CNH at: 2026-06-14T16:30:55Z -->
+
+## Implementation report
+
+Follow-up implementation report after reviewer request_changes:
+
+New commit:
+- `456722c3 fix: disable tickets with invalid detail records`
+
+Changed file in follow-up:
+- `crates/tui/src/workspace_panel.rs`
+
+Blocker resolved:
+- `build_ticket_rows(...)` now checks `show_partial(...)` diagnostics for an invalid record whose label matches the Ticket id currently being rendered.
+- If the current Ticket id is reported invalid during partial detail loading, Panel no longer emits the normal actionable `ticket_row(...)`.
+- The invalid record flows through the existing bounded invalid placeholder/diagnostic path, so the Ticket id remains visible but has no lifecycle action.
+
+Behavior after fix:
+- A ready Ticket with valid `item.md` but malformed `artifacts/relations.json` is shown only as an invalid diagnostic placeholder.
+- It cannot receive Queue, Close, clarification/planning-return, or other lifecycle mutation actions.
+- Other valid Ticket rows continue to render normally and keep their actions.
+
+Coverage added:
+- `workspace_panel_disables_current_ticket_when_detail_artifact_is_invalid`
+- Test scenario:
+  - one ready Ticket with malformed `artifacts/relations.json`
+  - one separate valid ready Ticket
+- Assertions:
+  - corrupt Ticket id is visible as `PanelRowKey::InvalidTicket(...)`
+  - no normal `PanelRowKey::Ticket(...)` row exists for that corrupt id
+  - placeholder has no action and no Ticket action identity
+  - other valid ready Ticket still has `NextUserAction::Queue`
+  - header reports partial Ticket load failure
+
+Validation reported by coder:
+- Passed: `cargo test -p tui workspace_panel_disables_current_ticket_when_detail_artifact_is_invalid --lib`
+- Passed: `cargo test -p tui workspace_panel --lib`
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check`
+
+Repository status:
+- Child implementation worktree clean after follow-up commit.
+
+---
