@@ -28,7 +28,10 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use serde::Serialize;
 use session_store::FsStore;
 use ticket::config::{GitBranchName, TicketConfig};
-use ticket::{LocalTicketBackend, TicketBackend, TicketIdOrSlug, TicketWorkflowState};
+use ticket::{
+    LocalTicketBackend, MarkdownText, TicketBackend, TicketIdOrSlug, TicketStateChange,
+    TicketWorkflowState,
+};
 use tokio::net::UnixStream;
 use unicode_width::UnicodeWidthStr;
 
@@ -62,6 +65,7 @@ const ORCHESTRATOR_QUEUE_ATTENTION_MAX_MESSAGE_CHARS: usize = 2_400;
 const SOCKET_OP_TIMEOUT: Duration = Duration::from_secs(3);
 const MULTI_POD_POLL_INTERVAL: Duration = Duration::from_millis(1_500);
 const TERMINAL_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const PANEL_READY_REFINEMENT_MAX_INSTRUCTION_CHARS: usize = 4_000;
 
 #[derive(Debug)]
 pub(crate) enum MultiPodError {
@@ -205,6 +209,42 @@ pub(crate) async fn run(
                     terminal.draw(|f| draw(f, app))?;
                     let result = dispatch_ticket_action(request).await;
                     app.finish_ticket_action_dispatch(result);
+                    if pending_reload.start(OrchestratorLifecycleMode::Observe) {
+                        app.refreshing = true;
+                    }
+                    next_poll = Instant::now() + MULTI_POD_POLL_INTERVAL;
+                }
+                MultiPodAction::ReturnReadyTicketToPlanning(request) => {
+                    #[cfg(feature = "e2e-test")]
+                    crate::e2e_observer::emit(
+                        "panel",
+                        "action_requested",
+                        serde_json::json!({ "action": "return_ready_ticket_to_planning" }),
+                    );
+                    pending_reload.abort();
+                    pending_queue_attention_notice.abort();
+                    terminal.draw(|f| draw(f, app))?;
+                    match dispatch_ready_ticket_planning_return(request).await {
+                        Ok(outcome) => {
+                            match app.finish_ready_ticket_planning_return_success(outcome) {
+                                ReadyTicketPlanningReturnAfterMutation::LaunchIntake(request) => {
+                                    terminal.draw(|f| draw(f, app))?;
+                                    let planning_notice = app.notice.clone().unwrap_or_default();
+                                    let result = launch_intake_with_handoff(request).await;
+                                    app.finish_ready_ticket_planning_return_with_intake_launch(
+                                        planning_notice,
+                                        result,
+                                    );
+                                }
+                                ReadyTicketPlanningReturnAfterMutation::OpenClaim(request) => {
+                                    terminal.draw(|f| draw(f, app))?;
+                                    return Ok(MultiPodOutcome::Open(request));
+                                }
+                                ReadyTicketPlanningReturnAfterMutation::None => {}
+                            }
+                        }
+                        Err(error) => app.finish_ready_ticket_planning_return_error(error),
+                    }
                     if pending_reload.start(OrchestratorLifecycleMode::Observe) {
                         app.refreshing = true;
                     }
@@ -456,6 +496,45 @@ pub(crate) enum IntakeRegistryUpdate {
         ticket_slug: Option<String>,
         pod_name: String,
     },
+    ClaimLaunchedTicket {
+        registry_root: PathBuf,
+        ticket_id: String,
+        ticket_slug: Option<String>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct ReadyTicketPlanningReturnRequest {
+    workspace_root: PathBuf,
+    ticket_id: String,
+    user_instruction: String,
+    followup: ReadyTicketPlanningReturnFollowup,
+}
+
+#[derive(Debug)]
+pub(crate) enum ReadyTicketPlanningReturnFollowup {
+    LaunchIntake(IntakeLaunchRequest),
+    NotifyLiveClaimedIntake {
+        pod_name: String,
+        socket_path: PathBuf,
+    },
+    OpenRestorableClaimedIntake(OpenPodRequest),
+    BlockedByStaleClaim {
+        pod_name: String,
+    },
+}
+
+#[derive(Debug)]
+struct ReadyTicketPlanningReturnOutcome {
+    notice: String,
+    followup: ReadyTicketPlanningReturnAfterMutation,
+}
+
+#[derive(Debug)]
+enum ReadyTicketPlanningReturnAfterMutation {
+    LaunchIntake(IntakeLaunchRequest),
+    OpenClaim(OpenPodRequest),
+    None,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -608,7 +687,8 @@ async fn launch_intake_with_handoff(request: IntakeLaunchRequest) -> IntakeLaunc
         options,
     )
     .await?;
-    let registry_warning = commit_intake_registry_update(request.registry_update);
+    let registry_warning =
+        commit_intake_registry_update(request.registry_update, Some(&launch.plan.pod_name));
     let peer_registration = match (orchestrator_pod, skip_warning) {
         (_, Some(warning)) => warning,
         (Some(orchestrator_pod), None) if launch.pre_run_warnings.is_empty() => {
@@ -633,7 +713,10 @@ async fn launch_intake_with_handoff(request: IntakeLaunchRequest) -> IntakeLaunc
     })
 }
 
-fn commit_intake_registry_update(update: IntakeRegistryUpdate) -> Option<String> {
+fn commit_intake_registry_update(
+    update: IntakeRegistryUpdate,
+    launched_pod_name: Option<&str>,
+) -> Option<String> {
     match update {
         IntakeRegistryUpdate::RecordSession {
             registry_root,
@@ -670,6 +753,29 @@ fn commit_intake_registry_update(update: IntakeRegistryUpdate) -> Option<String>
                 "local Ticket Intake claim could not be committed after launch acceptance: {error}"
             ))),
         },
+        IntakeRegistryUpdate::ClaimLaunchedTicket {
+            registry_root,
+            ticket_id,
+            ticket_slug,
+        } => {
+            let Some(pod_name) = launched_pod_name else {
+                return Some(
+                    "local Ticket Intake claim could not be committed after launch acceptance: missing launched Pod name"
+                        .to_string(),
+                );
+            };
+            match PanelRegistryStore::from_root(registry_root).claim_ticket(
+                &ticket_id,
+                ticket_slug.as_deref(),
+                pod_name,
+                TicketRole::Intake.as_str(),
+            ) {
+                Ok(TicketClaimResult::Claimed) | Ok(TicketClaimResult::AlreadyOwned(_)) => None,
+                Err(error) => Some(bounded_panel_diagnostic(format!(
+                    "local Ticket Intake claim could not be committed after launch acceptance: {error}"
+                ))),
+            }
+        }
     }
 }
 
@@ -1715,6 +1821,209 @@ impl MultiPodApp {
         })
     }
 
+    pub(crate) fn prepare_ready_ticket_planning_return(
+        &mut self,
+    ) -> Option<ReadyTicketPlanningReturnRequest> {
+        if self.sending {
+            self.notice = Some(
+                "Ticket refinement return is already in progress; wait for it to finish before retrying."
+                    .to_string(),
+            );
+            return None;
+        }
+        if !self
+            .panel
+            .composer
+            .is_available(ComposerTarget::TicketIntake)
+        {
+            self.composer_target = ComposerTarget::Companion;
+            self.notice = Some(
+                "Ticket Intake target is unavailable without usable Ticket config.".to_string(),
+            );
+            return None;
+        }
+        let body = Segment::flatten_to_text(&self.input.submit_segments());
+        let user_instruction = bounded_refinement_instruction(body.trim());
+        if user_instruction.is_empty() {
+            self.notice = Some(
+                "Type refinement instructions with the Ticket Planning target before returning a ready Ticket to planning."
+                    .to_string(),
+            );
+            return None;
+        }
+        let row = match self.selected_panel_row() {
+            Some(row) if row.is_ticket_action() => row,
+            Some(row) if row.ticket.is_some() => {
+                self.notice =
+                    Some("Selected Ticket row has no refinement return action.".to_string());
+                return None;
+            }
+            _ => {
+                self.notice =
+                    Some("Select a ready Ticket row before returning it to planning.".to_string());
+                return None;
+            }
+        };
+        if row.next_action != Some(NextUserAction::Queue) {
+            self.notice = Some(
+                "Only ready Ticket rows can be returned to planning from the Ticket Planning target."
+                    .to_string(),
+            );
+            return None;
+        }
+        let Some(ticket) = row.ticket.as_ref() else {
+            self.notice =
+                Some("Select a ready Ticket row before returning it to planning.".to_string());
+            return None;
+        };
+        let ticket_id = ticket.id.clone();
+        if ticket.workflow_state != TicketWorkflowState::Ready {
+            self.notice = Some(format!(
+                "Ticket {} is {}; expected ready before returning to planning.",
+                ticket_id,
+                ticket.workflow_state.as_str()
+            ));
+            return None;
+        }
+
+        let workspace_root = current_workspace_root();
+        let store = match PanelRegistryStore::default_for_workspace(&workspace_root) {
+            Ok(store) => store,
+            Err(error) => {
+                self.notice = Some(format!("Ticket Intake registry unavailable: {error}"));
+                return None;
+            }
+        };
+        let followup = match store.claim_for_ticket(&ticket_id) {
+            Ok(Some(claim)) => match local_claim_status_for_pod(&claim.pod_name, &self.list) {
+                TicketLocalClaimStatus::Live => match self
+                    .list
+                    .entries
+                    .iter()
+                    .find(|entry| entry.name == claim.pod_name)
+                    .and_then(PodListEntry::attach_socket_path)
+                {
+                    Some(socket_path) => {
+                        ReadyTicketPlanningReturnFollowup::NotifyLiveClaimedIntake {
+                            pod_name: claim.pod_name,
+                            socket_path: socket_path.to_path_buf(),
+                        }
+                    }
+                    None => ReadyTicketPlanningReturnFollowup::BlockedByStaleClaim {
+                        pod_name: claim.pod_name,
+                    },
+                },
+                TicketLocalClaimStatus::Restorable => {
+                    ReadyTicketPlanningReturnFollowup::OpenRestorableClaimedIntake(OpenPodRequest {
+                        pod_name: claim.pod_name,
+                        socket_override: None,
+                    })
+                }
+                TicketLocalClaimStatus::Stale => {
+                    ReadyTicketPlanningReturnFollowup::BlockedByStaleClaim {
+                        pod_name: claim.pod_name,
+                    }
+                }
+            },
+            Ok(None) => {
+                let mut context =
+                    TicketRoleLaunchContext::new(workspace_root.clone(), TicketRole::Intake);
+                context.ticket = Some(TicketRef::id(ticket_id.clone()));
+                context.user_instruction = Some(build_ready_ticket_refinement_launch_instruction(
+                    &ticket_id,
+                    &user_instruction,
+                ));
+                let peer_registration = self.prepare_intake_peer_registration(&mut context);
+                ReadyTicketPlanningReturnFollowup::LaunchIntake(IntakeLaunchRequest {
+                    context,
+                    runtime_command: self.runtime_command.clone(),
+                    peer_registration,
+                    registry_update: IntakeRegistryUpdate::ClaimLaunchedTicket {
+                        registry_root: store.root().to_path_buf(),
+                        ticket_id: ticket_id.clone(),
+                        ticket_slug: None,
+                    },
+                })
+            }
+            Err(error) => {
+                self.notice = Some(format!("Ticket claim diagnostic required: {error}"));
+                return None;
+            }
+        };
+
+        self.sending = true;
+        self.notice = Some(format!(
+            "Returning ready Ticket {} to planning for refinement…",
+            ticket_id
+        ));
+        Some(ReadyTicketPlanningReturnRequest {
+            workspace_root,
+            ticket_id,
+            user_instruction,
+            followup,
+        })
+    }
+
+    fn finish_ready_ticket_planning_return_error(&mut self, error: TicketActionError) {
+        self.sending = false;
+        self.notice = Some(match error {
+            TicketActionError::Stale(message) => {
+                self.set_panel_diagnostic("Ticket planning return rejected", message)
+            }
+            TicketActionError::BackendConfig(error) | TicketActionError::Ticket(error) => {
+                self.set_panel_diagnostic("Ticket planning return failed", error)
+            }
+        });
+    }
+
+    fn finish_ready_ticket_planning_return_success(
+        &mut self,
+        outcome: ReadyTicketPlanningReturnOutcome,
+    ) -> ReadyTicketPlanningReturnAfterMutation {
+        self.sending = false;
+        self.input.clear();
+        self.notice = Some(outcome.notice);
+        outcome.followup
+    }
+
+    fn finish_ready_ticket_planning_return_with_intake_launch(
+        &mut self,
+        planning_notice: String,
+        result: IntakeLaunchResult,
+    ) {
+        self.sending = false;
+        self.input.clear();
+        match result {
+            Ok(result) => {
+                let pod_name = result.launch.plan.pod_name;
+                let peer_notice = match result.peer_registration {
+                    IntakePeerRegistrationStatus::Registered { orchestrator_pod } => {
+                        format!(" Handoff peer registered with {orchestrator_pod}.")
+                    }
+                    IntakePeerRegistrationStatus::Warning { message } => {
+                        format!(" Handoff warning: {message}")
+                    }
+                };
+                let registry_notice = result
+                    .registry_warning
+                    .map(|warning| format!(" Registry warning: {warning}"))
+                    .unwrap_or_default();
+                self.notice = Some(bounded_panel_diagnostic(format!(
+                    "{planning_notice} Launched Ticket Intake Pod {pod_name}.{peer_notice}{registry_notice}"
+                )));
+            }
+            Err(error) => {
+                self.notice = Some(self.set_panel_diagnostic(
+                    "Ticket Intake launch failed after planning return",
+                    format!(
+                        "{planning_notice} Intake launch/restore failed after Ticket was returned to planning; instruction was recorded in the Ticket thread. {}",
+                        error
+                    ),
+                ));
+            }
+        }
+    }
+
     pub(crate) fn finish_intake_launch(&mut self, result: IntakeLaunchResult) {
         self.sending = false;
         match result {
@@ -1828,6 +2137,14 @@ impl MultiPodApp {
                     .unwrap_or(MultiPodAction::None)
             }
             KeyCode::Enter if self.composer_is_blank() => MultiPodAction::Open,
+            KeyCode::Enter
+                if self.composer_target == ComposerTarget::TicketIntake
+                    && self.selected_ticket_action() == Some(NextUserAction::Queue) =>
+            {
+                self.prepare_ready_ticket_planning_return()
+                    .map(MultiPodAction::ReturnReadyTicketToPlanning)
+                    .unwrap_or(MultiPodAction::None)
+            }
             KeyCode::Enter if self.composer_target == ComposerTarget::TicketIntake => self
                 .prepare_intake_launch()
                 .map(MultiPodAction::LaunchIntake)
@@ -1850,6 +2167,7 @@ enum MultiPodAction {
     Quit,
     Open,
     DispatchTicketAction(TicketActionRequest),
+    ReturnReadyTicketToPlanning(ReadyTicketPlanningReturnRequest),
     LaunchIntake(IntakeLaunchRequest),
     SendCompanion(CompanionSendRequest),
 }
@@ -3150,6 +3468,132 @@ async fn dispatch_orchestrator_queue_attention_notice(
             format!("{}: {}", request.pod_name, err),
         ),
     }
+}
+
+fn bounded_refinement_instruction(input: &str) -> String {
+    bounded_progress_text(input, PANEL_READY_REFINEMENT_MAX_INSTRUCTION_CHARS)
+        .trim()
+        .to_string()
+}
+
+fn build_ready_ticket_refinement_thread_body(ticket_id: &str, instruction: &str) -> String {
+    format!(
+        "Panel returned ready Ticket {ticket_id} to planning for requirements sync. This is not Queue routing and must not start implementation.\n\n## User refinement instruction\n\n{instruction}\n"
+    )
+}
+
+fn build_ready_ticket_refinement_launch_instruction(ticket_id: &str, instruction: &str) -> String {
+    format!(
+        "Continue Ticket Intake / requirements sync for existing Ticket {ticket_id}. The Panel has returned the Ticket from ready to planning; do not queue the Ticket, do not route implementation, and do not create a duplicate unless the user explicitly asks for one. Read TicketShow body/thread/artifacts before making requirements or readiness decisions.\n\nUser refinement instruction:\n\n{instruction}"
+    )
+}
+
+fn build_ready_ticket_refinement_notify(ticket_id: &str, instruction: &str) -> String {
+    format!(
+        "Ticket {ticket_id} was returned from ready to planning from the Panel for requirements sync. Continue Intake/refinement only; do not Queue or route implementation. Read the Ticket thread for the recorded state change and user instruction.\n\nUser refinement instruction:\n\n{instruction}"
+    )
+}
+
+async fn dispatch_ready_ticket_planning_return(
+    request: ReadyTicketPlanningReturnRequest,
+) -> Result<ReadyTicketPlanningReturnOutcome, TicketActionError> {
+    match ticket_config_availability(&request.workspace_root) {
+        TicketConfigAvailability::Usable => {}
+        TicketConfigAvailability::Absent => {
+            return Err(TicketActionError::Stale(
+                "Ticket config is absent; workspace panel no longer exposes Ticket actions"
+                    .to_string(),
+            ));
+        }
+        TicketConfigAvailability::Unusable(message) => {
+            return Err(TicketActionError::Stale(format!(
+                "Ticket config is unusable; workspace panel no longer exposes Ticket actions: {message}"
+            )));
+        }
+    }
+    let config = TicketConfig::load_workspace(&request.workspace_root)
+        .map_err(|error| TicketActionError::BackendConfig(error.to_string()))?;
+    let backend = LocalTicketBackend::new(config.backend_root())
+        .with_record_language(config.ticket_record_language());
+    let id = TicketIdOrSlug::Id(request.ticket_id.clone());
+    let ticket = backend
+        .show(id.clone())
+        .map_err(|error| TicketActionError::Ticket(error.to_string()))?;
+    if ticket.meta.workflow_state != TicketWorkflowState::Ready {
+        return Err(TicketActionError::Stale(format!(
+            "Ticket {} is {}; expected ready before returning it to planning. Refresh the panel and retry if appropriate.",
+            ticket.meta.id,
+            ticket.meta.workflow_state.as_str()
+        )));
+    }
+    let mut change = TicketStateChange::new(
+        TicketWorkflowState::Ready.as_str(),
+        TicketWorkflowState::Planning.as_str(),
+        "panel_return_to_planning",
+        MarkdownText::from(build_ready_ticket_refinement_thread_body(
+            &ticket.meta.id,
+            &request.user_instruction,
+        )),
+    );
+    change.author = Some("workspace-panel".to_string());
+    backend
+        .set_workflow_state(id, change)
+        .map_err(|error| TicketActionError::Ticket(error.to_string()))?;
+
+    let notice = match request.followup {
+        ReadyTicketPlanningReturnFollowup::LaunchIntake(request) => {
+            ReadyTicketPlanningReturnOutcome {
+                notice: format!(
+                    "Ticket {} returned to planning for refinement; launching Ticket Intake…",
+                    ticket.meta.id
+                ),
+                followup: ReadyTicketPlanningReturnAfterMutation::LaunchIntake(request),
+            }
+        }
+        ReadyTicketPlanningReturnFollowup::NotifyLiveClaimedIntake {
+            pod_name,
+            socket_path,
+        } => {
+            let message =
+                build_ready_ticket_refinement_notify(&ticket.meta.id, &request.user_instruction);
+            match send_notify_only(&socket_path, message, true).await {
+                Ok(()) => ReadyTicketPlanningReturnOutcome {
+                    notice: format!(
+                        "Ticket {} returned to planning for refinement; notified live Intake Pod {}.",
+                        ticket.meta.id, pod_name
+                    ),
+                    followup: ReadyTicketPlanningReturnAfterMutation::None,
+                },
+                Err(error) => ReadyTicketPlanningReturnOutcome {
+                    notice: bounded_panel_diagnostic(format!(
+                        "Ticket {} returned to planning and instruction was recorded, but notifying Intake Pod {} failed: {}",
+                        ticket.meta.id, pod_name, error
+                    )),
+                    followup: ReadyTicketPlanningReturnAfterMutation::None,
+                },
+            }
+        }
+        ReadyTicketPlanningReturnFollowup::OpenRestorableClaimedIntake(request) => {
+            let pod_name = request.pod_name.clone();
+            ReadyTicketPlanningReturnOutcome {
+                notice: format!(
+                    "Ticket {} returned to planning for refinement; opening/restoring claimed Intake Pod {}…",
+                    ticket.meta.id, pod_name
+                ),
+                followup: ReadyTicketPlanningReturnAfterMutation::OpenClaim(request),
+            }
+        }
+        ReadyTicketPlanningReturnFollowup::BlockedByStaleClaim { pod_name } => {
+            ReadyTicketPlanningReturnOutcome {
+                notice: bounded_panel_diagnostic(format!(
+                    "Ticket {} returned to planning and instruction was recorded, but Intake launch was not attempted because existing Intake claim {} is stale; inspect or clear the local claim before launching another Intake Pod.",
+                    ticket.meta.id, pod_name
+                )),
+                followup: ReadyTicketPlanningReturnAfterMutation::None,
+            }
+        }
+    };
+    Ok(notice)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4973,6 +5417,11 @@ fn draw_input(frame: &mut Frame<'_>, render: &crate::input::InputRender, area: R
 fn composer_enter_status_text(app: &MultiPodApp) -> String {
     match app.composer_target() {
         ComposerTarget::Companion => companion_enter_status_text(app),
+        ComposerTarget::TicketIntake
+            if app.selected_ticket_action() == Some(NextUserAction::Queue) =>
+        {
+            "return selected ready Ticket to planning".to_string()
+        }
         ComposerTarget::TicketIntake => "launch Intake with composer text".to_string(),
     }
 }
@@ -4980,6 +5429,9 @@ fn composer_enter_status_text(app: &MultiPodApp) -> String {
 fn composer_enter_actionbar_text(app: &MultiPodApp) -> String {
     match app.composer_target() {
         ComposerTarget::Companion => companion_enter_actionbar_text(app),
+        ComposerTarget::TicketIntake if app.selected_ticket_action() == Some(NextUserAction::Queue) => {
+            "Ticket Intake target: Enter records instructions and returns selected ready Ticket to planning".to_string()
+        }
         ComposerTarget::TicketIntake => {
             "Ticket Intake target: Enter launches Intake with composer text".to_string()
         }
@@ -5085,7 +5537,11 @@ fn actionbar_left_text(app: &MultiPodApp) -> String {
                     .to_string()
             }
             ComposerTarget::TicketIntake => {
-                "Composer target: Ticket Intake; type a request, then Enter launches Intake".to_string()
+                if app.selected_ticket_action() == Some(NextUserAction::Queue) {
+                    "Composer target: Ticket Intake; text + Enter returns selected ready Ticket to planning".to_string()
+                } else {
+                    "Composer target: Ticket Intake; type a request, then Enter launches Intake".to_string()
+                }
             }
         }
     }
@@ -5558,6 +6014,168 @@ branch = "orchestration/custom-panel"
             action,
             orchestrator: None,
         }
+    }
+
+    fn planning_return_request(
+        temp: &TempDir,
+        ticket_id: String,
+        instruction: &str,
+    ) -> ReadyTicketPlanningReturnRequest {
+        ReadyTicketPlanningReturnRequest {
+            workspace_root: temp.path().to_path_buf(),
+            ticket_id,
+            user_instruction: instruction.to_string(),
+            followup: ReadyTicketPlanningReturnFollowup::BlockedByStaleClaim {
+                pod_name: "stale-intake".to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_ticket_planning_return_records_instruction_and_returns_to_planning_without_queueing()
+     {
+        let (temp, ticket_id, backend) = ready_ticket_workspace("panel-refine-ready");
+
+        let outcome = dispatch_ready_ticket_planning_return(planning_return_request(
+            &temp,
+            ticket_id.clone(),
+            "please add acceptance detail before queueing",
+        ))
+        .await
+        .unwrap();
+
+        assert!(outcome.notice.contains("returned to planning"));
+        assert!(outcome.notice.contains("instruction was recorded"));
+        assert!(matches!(
+            outcome.followup,
+            ReadyTicketPlanningReturnAfterMutation::None
+        ));
+        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id.clone())).unwrap();
+        assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Planning);
+        assert!(ticket.meta.queued_by.is_none());
+        assert!(ticket.meta.queued_at.is_none());
+        let state_change = ticket
+            .events
+            .iter()
+            .find(|event| {
+                event.kind == TicketEventKind::StateChanged
+                    && event.state_field.as_deref() == Some("state")
+                    && event.from.as_deref() == Some("ready")
+                    && event.to.as_deref() == Some("planning")
+            })
+            .expect("ready -> planning state_changed event is recorded");
+        assert_eq!(state_change.author.as_deref(), Some("workspace-panel"));
+        assert!(
+            state_change
+                .body
+                .as_str()
+                .contains("please add acceptance detail")
+        );
+        assert!(state_change.body.as_str().contains("not Queue routing"));
+        assert!(
+            state_change
+                .body
+                .as_str()
+                .contains("must not start implementation")
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_ticket_planning_return_rejects_stale_non_ready_ticket() {
+        let (temp, ticket_id, backend) =
+            ticket_workspace("panel-refine-stale", TicketWorkflowState::Planning, |_| {});
+
+        let error = dispatch_ready_ticket_planning_return(planning_return_request(
+            &temp,
+            ticket_id.clone(),
+            "refine please",
+        ))
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("expected ready"));
+        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
+        assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Planning);
+        assert!(
+            ticket
+                .events
+                .iter()
+                .all(|event| !(event.kind == TicketEventKind::StateChanged
+                    && event.from.as_deref() == Some("ready")
+                    && event.to.as_deref() == Some("planning")))
+        );
+    }
+
+    #[test]
+    fn ready_ticket_intake_enter_prepares_planning_return_not_queue_or_generic_launch() {
+        let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
+        panel.composer = crate::workspace_panel::WorkspacePanelComposer::ticket_enabled();
+        panel.rows.push(panel_test_ticket_row(
+            "20260608-000123-ready",
+            "Ready Ticket",
+            ActionPriority::ReadyForQueue,
+            NextUserAction::Queue,
+            "ready",
+        ));
+        let mut app = app_with_panel(empty_test_list(), panel);
+        app.cycle_composer_target();
+        app.input.insert_str("clarify expected behavior");
+
+        let request = match app.handle_key(key(KeyCode::Enter)) {
+            MultiPodAction::ReturnReadyTicketToPlanning(request) => request,
+            _ => panic!("ready Ticket row with Ticket Intake text should return to planning"),
+        };
+
+        assert_eq!(request.ticket_id, "20260608-000123-ready");
+        assert_eq!(request.user_instruction, "clarify expected behavior");
+        assert!(matches!(
+            request.followup,
+            ReadyTicketPlanningReturnFollowup::LaunchIntake(_)
+        ));
+        assert!(app.sending);
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Returning ready Ticket")
+        );
+        assert_eq!(input_text(&app), "clarify expected behavior");
+    }
+
+    #[tokio::test]
+    async fn planning_return_with_launch_followup_changes_state_before_launch_followup() {
+        let (temp, ticket_id, backend) = ready_ticket_workspace("panel-refine-launch");
+        let request = ReadyTicketPlanningReturnRequest {
+            workspace_root: temp.path().to_path_buf(),
+            ticket_id: ticket_id.clone(),
+            user_instruction: "launch intake after state change".to_string(),
+            followup: ReadyTicketPlanningReturnFollowup::LaunchIntake(IntakeLaunchRequest {
+                context: TicketRoleLaunchContext::new(
+                    temp.path().to_path_buf(),
+                    TicketRole::Intake,
+                ),
+                runtime_command: PodRuntimeCommand::for_executable("/tmp/yoi"),
+                peer_registration: IntakePeerRegistrationRequest::Skip {
+                    reason: "test".to_string(),
+                },
+                registry_update: IntakeRegistryUpdate::ClaimLaunchedTicket {
+                    registry_root: temp.path().join(".yoi/local-role-sessions"),
+                    ticket_id: ticket_id.clone(),
+                    ticket_slug: None,
+                },
+            }),
+        };
+
+        let outcome = dispatch_ready_ticket_planning_return(request)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome.followup,
+            ReadyTicketPlanningReturnAfterMutation::LaunchIntake(_)
+        ));
+        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id)).unwrap();
+        assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Planning);
     }
 
     #[tokio::test]
@@ -7408,7 +8026,7 @@ branch = "orchestration/custom-panel"
             "holding a pending Intake registry update must not persist a Ticket claim"
         );
 
-        assert!(commit_intake_registry_update(update.clone()).is_none());
+        assert!(commit_intake_registry_update(update.clone(), None).is_none());
         assert!(
             store
                 .claim_for_ticket("20260608-000000-existing")
@@ -7417,7 +8035,7 @@ branch = "orchestration/custom-panel"
             "the claim is persisted only by the post-acceptance commit step"
         );
 
-        assert!(commit_intake_registry_update(update).is_none());
+        assert!(commit_intake_registry_update(update, None).is_none());
         let snapshot = store.snapshot().unwrap();
         assert_eq!(snapshot.claims.len(), 1);
         assert_eq!(snapshot.sessions.len(), 1);
@@ -7427,6 +8045,56 @@ branch = "orchestration/custom-panel"
         assert_eq!(
             snapshot.sessions[0].related_tickets[0].id,
             "20260608-000000-existing"
+        );
+    }
+
+    #[test]
+    fn intake_registry_claims_launched_ticket_with_accepted_pod_name() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("registry");
+        let store = PanelRegistryStore::from_root(root.clone());
+        let update = IntakeRegistryUpdate::ClaimLaunchedTicket {
+            registry_root: root,
+            ticket_id: "20260608-000000-ready".to_string(),
+            ticket_slug: None,
+        };
+
+        assert!(commit_intake_registry_update(update, Some("launched-intake")).is_none());
+
+        let claim = store
+            .claim_for_ticket("20260608-000000-ready")
+            .unwrap()
+            .expect("launched Intake Pod is claimed after accepted launch");
+        assert_eq!(claim.pod_name, "launched-intake");
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(snapshot.claims.len(), 1);
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(snapshot.sessions[0].origin, RoleSessionOrigin::TicketClaim);
+        assert_eq!(snapshot.sessions[0].pod_name, "launched-intake");
+    }
+
+    #[test]
+    fn intake_registry_launched_ticket_claim_without_pod_name_is_diagnostic() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("registry");
+        let store = PanelRegistryStore::from_root(root.clone());
+
+        let warning = commit_intake_registry_update(
+            IntakeRegistryUpdate::ClaimLaunchedTicket {
+                registry_root: root,
+                ticket_id: "20260608-000000-ready".to_string(),
+                ticket_slug: None,
+            },
+            None,
+        )
+        .expect("missing launched Pod name should be diagnostic");
+
+        assert!(warning.contains("missing launched Pod name"));
+        assert!(
+            store
+                .claim_for_ticket("20260608-000000-ready")
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -7444,12 +8112,15 @@ branch = "orchestration/custom-panel"
             )
             .unwrap();
 
-        let warning = commit_intake_registry_update(IntakeRegistryUpdate::ClaimTicket {
-            registry_root: root,
-            ticket_id: "20260608-000001-existing".to_string(),
-            ticket_slug: Some("existing".to_string()),
-            pod_name: "second-intake".to_string(),
-        })
+        let warning = commit_intake_registry_update(
+            IntakeRegistryUpdate::ClaimTicket {
+                registry_root: root,
+                ticket_id: "20260608-000001-existing".to_string(),
+                ticket_slug: Some("existing".to_string()),
+                pod_name: "second-intake".to_string(),
+            },
+            None,
+        )
         .expect("conflicting post-success claim should be reported");
 
         assert!(warning.contains("could not be committed"));

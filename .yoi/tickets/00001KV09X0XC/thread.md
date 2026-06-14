@@ -85,3 +85,62 @@ Implementation handoff started.
 Next: Coder implementation_report / commit / validation evidence を確認後、Reviewer を起動する。
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-13T19:01:36Z -->
+
+## Implementation report
+
+Commit: `f74146c6` (`tui: return ready tickets to planning from panel`)
+
+Files changed:
+- `crates/tui/src/multi_pod.rs`
+
+What changed:
+- Added a separate Panel path for selected `ready` Ticket rows when the composer target is Ticket Intake and the user submits non-empty refinement instructions.
+- The action rereads the Ticket through the typed local Ticket backend and records a typed `ready -> planning` `state_changed` event with the user's refinement instruction in the Ticket thread.
+- The action does not invoke Queue, `queued -> inprogress`, worktree creation, or implementation-role spawning.
+- After the state change it attempts the Intake continuation path:
+  - launch and claim a new Intake Pod when no local Intake claim exists,
+  - notify a live claimed Intake Pod,
+  - open/restore a restorable claimed Intake Pod,
+  - or leave a visible diagnostic for stale claims without launching a duplicate.
+- Added focused tests for stale-state rejection, state/event recording, action dispatch selection, launch-after-mutation followup, and role-session claim recording for post-launch Intake Pods.
+
+Validation:
+- `cargo test -p tui planning_return`
+- `cargo test -p tui intake_registry`
+- `cargo test -p tui workspace_panel`
+- `cargo test -p ticket`
+- `cargo fmt --check`
+- `git diff --check`
+
+Residual risks:
+- No real terminal/PTTY Panel E2E was run; coverage is focused unit/action-path validation.
+- The existing Panel composer model exposes this via Ticket Intake target + selected ready row + non-empty text, rather than adding a new visible button/menu surface.
+
+---
+
+<!-- event: review author: hare at: 2026-06-13T19:07:43Z status: approve -->
+
+## Review: approve
+
+Evidence reviewed:
+- Inspected `git diff c4465a04..HEAD`; source changes are confined to `crates/tui/src/multi_pod.rs` plus Ticket record/report updates.
+- Panel dispatch now has a separate `ReturnReadyTicketToPlanning` path for non-empty composer text when the composer target is Ticket Intake and the selected row action is `Queue`/ready.
+- The mutation path reloads the Ticket from `LocalTicketBackend`, rejects non-`ready` current state, and records a typed `ready -> planning` `state_changed` event with author `workspace-panel`, reason `panel_return_to_planning`, and the user instruction in the thread body.
+- The follow-up paths are Intake-only: launch when unclaimed, notify live claimed Intake, open/restorable claimed Intake, or diagnose stale claim without duplicate launch. I did not find calls to queue dispatch, `queued -> inprogress`, worktree creation, Orchestrator/Coder/Reviewer spawn in this path.
+- Tests cover successful planning return, stale-state rejection, dispatch separation from Queue/generic Intake launch, state-before-launch follow-up, and launched-claim registry handling. Existing queue action coverage remains present.
+
+Validation run:
+- `cargo test -p tui planning_return` — pass (4 tests)
+- `cargo test -p tui intake_registry` — pass (4 tests)
+- `cargo test -p tui workspace_panel` — pass (12 tests)
+- `cargo test -p ticket` — pass (68 tests + doctests)
+- `cargo fmt --check` — pass
+- `git diff --check c4465a04..HEAD` — pass
+
+Residual notes:
+- No real terminal/PTTY Panel E2E was run; this remains a unit/action-path review only.
+- Discoverability depends on the existing composer target model: select a ready Ticket row, switch to Ticket Intake, type non-empty refinement instructions, then Enter. The implementation makes this visible in status/actionbar text; no separate button/menu was added.
+
+---
