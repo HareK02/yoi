@@ -116,3 +116,44 @@ Critical risks / reviewer focus:
 Routing decision と accepted implementation plan を記録済み。先行 `00001KV09WYC6` は merge/validation/done 済みで、prior conflict/waiting reason は解消。blocking relation / unresolved orchestration-plan blocker はないため、implementation side effects の前に `queued -> inprogress` acceptance を記録する。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KV3A5CNH at: 2026-06-14T16:21:50Z -->
+
+## Implementation report
+
+Implementation report from Coder Pod `yoi-coder-00001KV3A5CNH`:
+
+Commit:
+- `b83b9e4e fix: tolerate invalid ticket rows in panel`
+
+Changed files:
+- `crates/ticket/src/lib.rs`
+  - Added tolerant `LocalTicketBackend::list_partial(...)` and `show_partial(...)`.
+  - Added bounded/sanitized `TicketInvalidRecord` reporting.
+  - Preserved strict existing `TicketBackend::list/show` semantics.
+  - Added ticket backend test for valid records surviving peer invalid record failures.
+- `crates/tui/src/workspace_panel.rs`
+  - Panel now uses partial ticket loading.
+  - Valid Ticket rows remain visible/actionable when sibling Ticket records are invalid.
+  - Invalid records render as disabled diagnostic placeholder rows.
+  - Invalid placeholder rows have no lifecycle actions and no `ticket` action identity.
+  - Header diagnostics indicate partial Ticket load failure with bounded placeholder count.
+  - Added focused Panel tests covering valid ready Queue action, valid planning Clarify/Intake path, associated Intake row adjacency, invalid row bounded/non-actionable behavior, secret-like content non-exposure, and backend config unusable behavior.
+- `crates/tui/src/multi_pod.rs`
+  - Added rendering/selection support for invalid Ticket placeholder rows.
+  - Invalid placeholder rows are shown as ticket-section diagnostics but remain action-disabled.
+
+Validation reported by coder:
+- Passed: `cargo test -p tui workspace_panel --lib`
+- Passed: `cargo test -p ticket partial_list_and_show --lib`
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check`
+
+Repository status:
+- Child implementation worktree clean after commit.
+
+Residual risks / blockers:
+- None known.
+- Strict backend list/show behavior was preserved; new partial methods are opt-in for Panel tolerance.
+
+---
