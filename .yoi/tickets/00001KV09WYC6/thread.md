@@ -21,3 +21,12 @@ LocalTicketBackend によって作成されました。
 Intake 確認により、既存 Ticket の要件は実装 routing 可能な状態と判断した。実装 side effect は Orchestrator の queue/routing flow に委ねる。
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-14T15:23:27Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
