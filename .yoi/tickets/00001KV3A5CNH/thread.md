@@ -260,3 +260,51 @@ Repository status:
 - Child implementation worktree clean after follow-up commit.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KV3A5CNH-r2 at: 2026-06-14T16:37:15Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Evidence checked:
+- Target worktree clean at `456722c3`.
+- Reviewed diff `a1c8264b..456722c3` and second-pass fix diff `b83b9e4e..456722c3`.
+- Confirmed backend partial/tolerant read paths:
+  - `LocalTicketBackend::list_partial`
+  - `LocalTicketBackend::show_partial`
+  - tolerant relation/state loading records invalid Ticket ids via `TicketInvalidRecord` instead of failing entire list/detail load.
+- Confirmed Panel row construction:
+  - uses `list_partial` and `show_partial`;
+  - collects invalid records into bounded diagnostics/placeholders;
+  - detects when `show_partial` reports an invalid record whose label matches the summary id being rendered;
+  - skips normal actionable `PanelRowKey::Ticket(id)` for that id;
+  - emits `InvalidTicket(id)` placeholder instead.
+- Confirmed invalid placeholder rows are diagnostics-only:
+  - `kind == PanelRowKind::InvalidTicket`
+  - `ticket == None`
+  - `next_action == None`
+  - `is_ticket_action()` excludes invalid rows
+  - lifecycle dispatch preparation only accepts `row.is_ticket_action()`.
+- Confirmed regression test for prior blocker:
+  - `workspace_panel_disables_current_ticket_when_detail_artifact_is_invalid`
+  - malformed `artifacts/relations.json` ready Ticket has no normal actionable row;
+  - disabled `PanelRowKey::InvalidTicket(corrupt.id)` placeholder exists;
+  - another valid ready Ticket keeps `Queue`.
+- Confirmed broader acceptance coverage remains:
+  - mixed valid/invalid records preserve valid ready/planning rows;
+  - invalid rows are capped and do not leak malformed state strings;
+  - backend config unusable remains separate whole-ticket degradation;
+  - valid Ticket-associated Intake rows remain adjacent to valid Ticket rows.
+
+Validation performed by reviewer:
+- Passed: `git diff --check a1c8264b..HEAD`
+- Passed: `cargo fmt --check`
+
+Validation not run:
+- `cargo test` was not run by reviewer because read-only review scope prevents writing build artifacts. Coder-reported passing tests were inspected as evidence.
+
+Conclusion:
+- Approved. No remaining blocker found.
+
+---
