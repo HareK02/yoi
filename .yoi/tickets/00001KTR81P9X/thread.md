@@ -140,3 +140,42 @@ Risks / notes:
 
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-06-14T06:39:37Z -->
+
+## Implementation report
+
+Integration outcome: merged and validated.
+
+- Implementation branch: `ticket-00001KTR81P9X-feature-provider-api`
+- Implementation commit: `053a4f90 feat: add protocol provider feature contributions`
+- Review commit: `d0e8d791 ticket: approve feature provider api`
+- Orchestrator merge commit: `3d140dbb merge: feature provider api`
+
+Reviewer result:
+- `approve`。Provider API extension stays in the contribution/reporting substrate, does not reintroduce HostAuthority/grants, does not implement MCP trust/plugin permission policy, and uses ordinary ToolRegistry/Worker/history/permission paths.
+
+Orchestrator validation after merge:
+- `cargo fmt --check`: PASS
+- `git diff --check`: PASS
+- `cargo test -p pod feature::tests`: PASS
+- `cargo check --workspace --all-targets`: PASS
+
+Not run:
+- `nix build .#yoi`: skipped at integration because prior Coder run hit host disk pressure during final link; this change did not modify dependencies, Cargo.lock, packaging, or source filters. Recent package validation was performed on adjacent E2E/Profile work.
+
+Residual notes:
+- Full `cargo test -p pod` is known to fail unrelated prompt assertion tests expecting old guidance text. Reviewer classified those as unrelated/pre-existing to this feature API diff.
+
+Next:
+- Mark Ticket done and clean up child coder/reviewer Pods plus implementation worktree/branch.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-14T06:39:48Z from: inprogress to: done reason: merged_and_validated field: state -->
+
+## State changed
+
+Implementation branch was reviewed, approved, merged into the Orchestrator branch as `3d140dbb`, and validated in the Orchestrator worktree. Feature-provider focused tests, formatting, diff check, and workspace check passed. Ticket implementation work is done; closure remains separate.
+
+---
