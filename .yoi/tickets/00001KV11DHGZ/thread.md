@@ -27,3 +27,20 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-14T06:10:23Z -->
+
+## Decision
+
+Routing decision: queued_waiting_conflict
+
+Reason:
+- Ticket is queued and appears implementation-ready, but it touches Profile concrete scope / launch policy surfaces.
+- `00001KTZY8HK2` was also queued and accepted in this routing pass for Profile API/resource migration (`extend` removal). Running both profile-surface migrations in parallel is likely to create merge conflicts and unclear review boundaries.
+- No missing requirement or dependency blocker was identified; this is a conflict/migration-order wait.
+
+Next action:
+- Keep queued for now.
+- Re-evaluate after `00001KTZY8HK2` is merged/validated, or if human explicitly authorizes parallel work despite conflict risk.
+
+---

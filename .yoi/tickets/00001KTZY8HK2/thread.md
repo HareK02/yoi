@@ -51,3 +51,35 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-06-14T06:10:02Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- Ticket is queued and explicitly decides to deprecate/remove `yoi.profile.extend` in favor of `yoi.profile.import` plus explicit Lua assignment.
+- Relation checks show no blocker; related launch-policy Ticket `00001KV11DHGZ` is not a dependency for this implementation.
+- Risk is bounded to Lua Profile API/resources/tests.
+
+IntentPacket:
+- Migrate builtin Profile resources away from `yoi.profile.extend`, keep `import`, and make `extend` fail clearly or emit a deprecation diagnostic. Remove docs/tests that suggest scope replacement APIs.
+
+Binding invariants:
+- Do not solve concrete scope/delegation authority here; that belongs to `00001KV11DHGZ`.
+- Do not add ambiguous replacement/clear API as part of `extend`.
+- Builtin resources must use import + explicit Lua assignment.
+
+Validation:
+- focused profile resolution tests, resource/profile tests, `cargo fmt --check`, `git diff --check`, `cargo build -p yoi`; `nix build .#yoi` if resource packaging is affected.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-06-14T06:10:45Z from: queued to: inprogress reason: orchestrator_acceptance_unblocked field: state -->
+
+## State changed
+
+Ticket evidence, related records, orchestration plan, and clean workspace state were checked. No blockers remain; accept for implementation before worktree/spawn side effects.
+
+---
