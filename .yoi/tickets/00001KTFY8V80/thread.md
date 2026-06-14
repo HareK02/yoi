@@ -259,3 +259,61 @@ Conclusion:
 - Changes requested. Do not integrate until stale-guidance gating and completion/cancellation durability are fixed and covered.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KTFY8V80 at: 2026-06-14T16:17:48Z -->
+
+## Implementation report
+
+Follow-up implementation report after reviewer request_changes:
+
+New commit:
+- `ff446052 fix: gate active workflow rehydration state`
+
+Changed files in follow-up:
+- `crates/pod/src/active_workflow.rs`
+- `crates/pod/src/ipc/interceptor.rs`
+- `crates/pod/src/pod.rs`
+
+Review blocker 1 resolved: stale active workflow guidance in prompt history
+- Active workflow rehydration guidance is no longer persisted into compacted `SegmentStart.history` as an ordinary system message.
+- Compaction still carries active workflow state forward via typed `pod.active_workflows` extension state.
+- Request context is sanitized before model calls:
+  - stale `[Active workflow snapshot]` system messages are stripped,
+  - current active workflow guidance is regenerated request-locally from validated typed state,
+  - when typed state is missing/corrupt/obsolete/inactive and stale workflow hints are present, a bounded inactive-state message supersedes old compacted references.
+- Restore paths strip stale active workflow rehydration messages before installing worker history.
+- Compaction source/retained histories strip old active workflow rehydration messages so old snapshots are not re-summarized as active authority.
+
+Review blocker 2 resolved: completion/cancellation durability
+- `ActiveWorkflowComplete` / `ActiveWorkflowCancel` now persist successful status changes by committing a new typed `LogEntry::Extension` snapshot through the session log writer.
+- Restore no longer infers completion/cancellation from bare `Item::ToolCall` history.
+- Typed extension state is the authority, avoiding trust in unmatched/interrupted/error tool calls.
+
+Focused coverage added/updated:
+- Compacted history containing active workflow rehydration message plus:
+  - missing extension,
+  - corrupt extension,
+  - obsolete extension.
+- Completion/cancellation after compaction suppressing old compacted guidance.
+- Successful status tool writes a typed durable extension.
+- Unmatched/error status tool calls do not mutate restored active workflow state.
+- Existing review/merge/close workflow obligation coverage still passes.
+
+Validation reported by coder:
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check`
+- Passed: `cargo test -p pod active_workflow --lib`
+  - 7 passed
+- Passed: `cargo test -p pod interceptor --lib`
+  - 19 passed
+- Ran: `cargo test -p pod --lib`
+  - Still fails only on the previously reported unrelated prompt assertion failures:
+    - `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`
+    - `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`
+    - both assert missing text: `worktree status, diff, and test results`
+    - result: `332 passed; 2 failed`
+
+Repository status:
+- Child implementation worktree clean after follow-up commit.
+
+---
