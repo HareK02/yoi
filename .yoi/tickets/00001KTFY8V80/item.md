@@ -1,8 +1,8 @@
 ---
 title: "Preserve active workflows across compaction"
-state: "planning"
+state: 'ready'
 created_at: "2026-06-07T02:23:28Z"
-updated_at: "2026-06-07T02:23:28Z"
+updated_at: '2026-06-14T14:13:43Z'
 ---
 
 ## Background

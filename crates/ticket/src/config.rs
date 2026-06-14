@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -16,6 +16,9 @@ use thiserror::Error;
 pub const TICKET_CONFIG_RELATIVE_PATH: &str = ".yoi/ticket.config.toml";
 /// Workspace-relative default root for the built-in local Ticket backend.
 pub const DEFAULT_TICKET_BACKEND_RELATIVE_PATH: &str = ".yoi/tickets";
+const DEFAULT_ORCHESTRATION_BRANCH: &str = "orchestration";
+const DEFAULT_ORCHESTRATION_WORKTREE_DIR: &str = ".worktree";
+const DEFAULT_ORCHESTRATION_WORKTREE_NAME: &str = "orchestration";
 
 /// Return the explicit workspace Ticket config scaffold written by `yoi ticket init`.
 ///
@@ -36,7 +39,7 @@ pub fn ticket_config_scaffold() -> String {
         "\n# Optional durable Ticket record language. When unset, generated Ticket text keeps current defaults.\n# [ticket]\n# language = \"Japanese\"\n",
     );
     out.push_str(
-        "\n# Optional Panel Orchestrator worktree branch. When unset, Panel uses orchestration/<workspace-orchestrator-pod-name>.\n# [orchestration]\n# branch = \"orchestration/<workspace-orchestrator-pod-name>\"\n",
+        "\n# Optional Panel Orchestrator worktree settings. When unset, Panel uses branch `orchestration` at `.worktree/orchestration`.\n# [orchestration]\n# branch = \"orchestration\"\n# worktree_dir = \".worktree\"\n# worktree_name = \"orchestration\"\n",
     );
     for role in TicketRole::ALL {
         out.push_str(&format!(
@@ -77,11 +80,29 @@ pub struct TicketConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TicketOrchestrationConfig {
     pub branch: Option<GitBranchName>,
+    pub worktree_dir: Option<PathBuf>,
+    pub worktree_name: Option<PathBuf>,
 }
 
 impl TicketOrchestrationConfig {
     pub fn branch_name(&self) -> Option<&str> {
         self.branch.as_ref().map(GitBranchName::as_str)
+    }
+
+    pub fn effective_branch_name(&self) -> &str {
+        self.branch_name().unwrap_or(DEFAULT_ORCHESTRATION_BRANCH)
+    }
+
+    pub fn worktree_dir(&self) -> &Path {
+        self.worktree_dir
+            .as_deref()
+            .unwrap_or_else(|| Path::new(DEFAULT_ORCHESTRATION_WORKTREE_DIR))
+    }
+
+    pub fn worktree_name(&self) -> &Path {
+        self.worktree_name
+            .as_deref()
+            .unwrap_or_else(|| Path::new(DEFAULT_ORCHESTRATION_WORKTREE_NAME))
     }
 }
 
@@ -164,6 +185,27 @@ fn validate_git_branch_name_value(value: &str) -> Result<(), String> {
         }
     }
 
+    Ok(())
+}
+
+fn validate_orchestration_relative_path(path: &Path, label: &str) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if path.is_absolute() {
+        return Err(format!("{label} must be workspace-relative"));
+    }
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => {}
+            Component::CurDir | Component::ParentDir => {
+                return Err(format!("{label} must not contain `.` or `..` components"));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!("{label} must be workspace-relative"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -636,13 +678,25 @@ struct RawTicketConfig {
 struct RawTicketOrchestrationConfig {
     #[serde(default)]
     branch: Option<GitBranchName>,
+    #[serde(default)]
+    worktree_dir: Option<PathBuf>,
+    #[serde(default)]
+    worktree_name: Option<PathBuf>,
 }
 
 impl RawTicketOrchestrationConfig {
-    fn resolve(self) -> TicketOrchestrationConfig {
-        TicketOrchestrationConfig {
-            branch: self.branch,
+    fn resolve(self) -> Result<TicketOrchestrationConfig, String> {
+        if let Some(path) = &self.worktree_dir {
+            validate_orchestration_relative_path(path, "orchestration.worktree_dir")?;
         }
+        if let Some(path) = &self.worktree_name {
+            validate_orchestration_relative_path(path, "orchestration.worktree_name")?;
+        }
+        Ok(TicketOrchestrationConfig {
+            branch: self.branch,
+            worktree_dir: self.worktree_dir,
+            worktree_name: self.worktree_name,
+        })
     }
 }
 
@@ -691,7 +745,12 @@ impl RawTicketConfig {
                 }
             })?,
             ticket: self.ticket.resolve(),
-            orchestration: self.orchestration.resolve(),
+            orchestration: self.orchestration.resolve().map_err(|message| {
+                TicketConfigError::Invalid {
+                    path: path.to_path_buf(),
+                    message,
+                }
+            })?,
             roles,
         })
     }
@@ -797,6 +856,15 @@ mod tests {
         );
         assert_eq!(config.ticket_record_language(), None);
         assert_eq!(config.orchestration.branch_name(), None);
+        assert_eq!(
+            config.orchestration.effective_branch_name(),
+            "orchestration"
+        );
+        assert_eq!(config.orchestration.worktree_dir(), Path::new(".worktree"));
+        assert_eq!(
+            config.orchestration.worktree_name(),
+            Path::new("orchestration")
+        );
         for role in TicketRole::ALL {
             let role_config = config.role(role);
             assert_eq!(role_config.profile.as_str(), "inherit");
@@ -820,6 +888,8 @@ language = "Japanese"
 
 [orchestration]
 branch = "orchestration/custom-panel"
+worktree_dir = "custom-worktrees"
+worktree_name = "custom-orchestrator"
 
 [roles.intake]
 profile = "project:intake"
@@ -855,6 +925,18 @@ workflow = "multi-agent-workflow"
             Some("orchestration/custom-panel")
         );
         assert_eq!(
+            config.orchestration.effective_branch_name(),
+            "orchestration/custom-panel"
+        );
+        assert_eq!(
+            config.orchestration.worktree_dir(),
+            Path::new("custom-worktrees")
+        );
+        assert_eq!(
+            config.orchestration.worktree_name(),
+            Path::new("custom-orchestrator")
+        );
+        assert_eq!(
             config.profile_for(TicketRole::Intake).as_str(),
             "project:intake"
         );
@@ -881,7 +963,7 @@ workflow = "multi-agent-workflow"
         assert!(scaffold.contains("root = \".yoi/tickets\""));
         assert!(scaffold.contains("# [ticket]\n# language = \"Japanese\""));
         assert!(scaffold.contains(
-            "# [orchestration]\n# branch = \"orchestration/<workspace-orchestrator-pod-name>\""
+            "# [orchestration]\n# branch = \"orchestration\"\n# worktree_dir = \".worktree\"\n# worktree_name = \"orchestration\""
         ));
         for role in TicketRole::ALL {
             assert!(scaffold.contains(&format!("[roles.{role}]")));
@@ -901,6 +983,15 @@ workflow = "multi-agent-workflow"
         .unwrap();
         assert_eq!(config.backend_root(), temp.path().join(".yoi/tickets"));
         assert_eq!(config.orchestration.branch_name(), None);
+        assert_eq!(
+            config.orchestration.effective_branch_name(),
+            "orchestration"
+        );
+        assert_eq!(config.orchestration.worktree_dir(), Path::new(".worktree"));
+        assert_eq!(
+            config.orchestration.worktree_name(),
+            Path::new("orchestration")
+        );
         for role in TicketRole::ALL {
             let role_config = config.role_launch_config(role).unwrap();
             assert_eq!(role_config.profile.as_str(), role.default_profile());

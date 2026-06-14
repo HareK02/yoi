@@ -38,3 +38,16 @@ Distribution direction from user discussion:
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-14T14:34:33Z -->
+
+## Decision
+
+決定:
+- Plugin discovery stores, source-qualified identity, discovery/enablement separation, Pod-startup initialization timing, restore behavior, and MCP boundaryをこの `00001KT0Z4BK8` の安定 contract として統合した。
+- User Plugin package store は `${XDG_DATA_HOME:-~/.local/share}/yoi/plugins/` とし、`~/.config/yoi/plugins/` は使わない。
+- Package presence は discovery only であり、実行・登録・runtime initialization は explicit enablement 後の Pod startup に限定する。
+- Restore は metadata snapshot の enabled Plugin plan を正本とし、fresh discovery で silent upgrade しない。
+
+
+---

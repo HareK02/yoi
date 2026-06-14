@@ -1,8 +1,8 @@
 ---
 title: 'Panel から ready Ticket を指示付きで planning に戻して Intake を再開できるようにする'
-state: 'done'
+state: 'closed'
 created_at: '2026-06-13T10:54:34Z'
-updated_at: '2026-06-14T05:09:07Z'
+updated_at: '2026-06-14T14:00:13Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['panel-action', 'ticket-lifecycle', 'role-session', 'authority-boundary']

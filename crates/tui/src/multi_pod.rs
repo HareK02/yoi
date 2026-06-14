@@ -27,7 +27,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use serde::Serialize;
 use session_store::FsStore;
-use ticket::config::{GitBranchName, TicketConfig};
+use ticket::config::{GitBranchName, TicketConfig, TicketOrchestrationConfig};
 use ticket::{
     LocalTicketBackend, MarkdownText, TicketBackend, TicketIdOrSlug, TicketStateChange,
     TicketWorkflowState,
@@ -2517,40 +2517,37 @@ struct OrchestrationWorktreeReady {
     status: OrchestrationWorktreeStatus,
 }
 
-fn orchestration_worktree_layout_for_branch(
+fn orchestration_worktree_layout_for_config(
     workspace_root: &Path,
-    branch: String,
+    orchestration: &TicketOrchestrationConfig,
 ) -> OrchestrationWorktreeLayout {
-    let stem = workspace_orchestrator_pod_name(workspace_root);
     OrchestrationWorktreeLayout {
         path: workspace_root
-            .join(".worktree")
-            .join("orchestration")
-            .join(&stem),
-        branch,
+            .join(orchestration.worktree_dir())
+            .join(orchestration.worktree_name()),
+        branch: orchestration.effective_branch_name().to_string(),
     }
 }
 
+#[cfg(test)]
 fn orchestration_worktree_layout(workspace_root: &Path) -> OrchestrationWorktreeLayout {
-    let stem = workspace_orchestrator_pod_name(workspace_root);
-    orchestration_worktree_layout_for_branch(workspace_root, format!("orchestration/{stem}"))
+    OrchestrationWorktreeLayout {
+        path: workspace_root.join(".worktree").join("orchestration"),
+        branch: "orchestration".to_string(),
+    }
 }
 
 fn resolved_orchestration_worktree_layout(
     workspace_root: &Path,
 ) -> Result<OrchestrationWorktreeLayout, String> {
     let config = TicketConfig::load_workspace(workspace_root)
-        .map_err(|err| format!("failed to load ticket config for orchestration branch: {err}"))?;
-    let branch = if let Some(branch) = config.orchestration.branch_name() {
-        branch.to_string()
-    } else {
-        orchestration_worktree_layout(workspace_root).branch
-    };
-    GitBranchName::new(branch.clone())
+        .map_err(|err| format!("failed to load ticket config for orchestration worktree: {err}"))?;
+    let branch = config.orchestration.effective_branch_name();
+    GitBranchName::new(branch.to_string())
         .map_err(|message| format!("invalid orchestration branch `{branch}`: {message}"))?;
-    Ok(orchestration_worktree_layout_for_branch(
+    Ok(orchestration_worktree_layout_for_config(
         workspace_root,
-        branch,
+        &config.orchestration,
     ))
 }
 
@@ -5757,9 +5754,9 @@ mod tests {
         let layout = orchestration_worktree_layout(root);
         assert_eq!(
             layout.path,
-            PathBuf::from("/tmp/Yoi Workspace/.worktree/orchestration/yoi-workspace-orchestrator")
+            PathBuf::from("/tmp/Yoi Workspace/.worktree/orchestration")
         );
-        assert_eq!(layout.branch, "orchestration/yoi-workspace-orchestrator");
+        assert_eq!(layout.branch, "orchestration");
     }
 
     #[test]
@@ -5834,7 +5831,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_and_restore_use_configured_orchestration_branch() {
+    fn ensure_and_restore_use_configured_orchestration_layout() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("repo");
         init_test_repo(&root);
@@ -5843,6 +5840,8 @@ mod tests {
             r#"
 [orchestration]
 branch = "orchestration/custom-panel"
+worktree_dir = "custom-worktrees"
+worktree_name = "panel"
 "#,
         );
         run_test_git(&root, &["add", ".yoi/ticket.config.toml"]).unwrap();
@@ -5850,11 +5849,7 @@ branch = "orchestration/custom-panel"
 
         let resolved = resolved_orchestration_worktree_layout(&root).unwrap();
         assert_eq!(resolved.branch, "orchestration/custom-panel");
-        assert!(
-            resolved
-                .path
-                .ends_with(".worktree/orchestration/repo-orchestrator")
-        );
+        assert!(resolved.path.ends_with("custom-worktrees/panel"));
 
         let created = ensure_orchestration_worktree(&root).unwrap();
         assert_eq!(created.status, OrchestrationWorktreeStatus::Created);
@@ -5934,12 +5929,7 @@ branch = "orchestration/custom-panel"
         assert_eq!(restored.status, OrchestrationWorktreeStatus::Reused);
         assert_eq!(restored.layout.path, created.layout.path);
         assert_ne!(restored.layout.path, root);
-        assert!(
-            restored
-                .layout
-                .path
-                .ends_with(".worktree/orchestration/repo-orchestrator")
-        );
+        assert!(restored.layout.path.ends_with(".worktree/orchestration"));
     }
 
     #[test]

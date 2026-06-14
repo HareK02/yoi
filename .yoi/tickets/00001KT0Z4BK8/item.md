@@ -2,7 +2,7 @@
 title: 'Plugin distribution package format and discovery'
 state: 'planning'
 created_at: '2026-06-01T06:49:53Z'
-updated_at: '2026-06-13T15:29:21Z'
+updated_at: '2026-06-14T14:34:33Z'
 ---
 
 ## Background
@@ -13,8 +13,8 @@ MCP is intentionally not modeled as a Plugin package/runtime in this Ticket. MCP
 
 The desired initial direction is a single-file plugin package that can be placed in user or workspace plugin stores, for example:
 
-- `~/.config/yoi/plugins/<id>.yoi-plugin`
-- `./.yoi/plugins/<id>.yoi-plugin`
+- `${XDG_DATA_HOME:-~/.local/share}/yoi/plugins/<id>.yoi-plugin`
+- `<workspace>/.yoi/plugins/<id>.yoi-plugin`
 
 The package should be easy to copy, inspect, cache, and pin while preserving Yoi's scope, permission, history, prompt-context, and trust invariants. Workspace plugins may come from a repository checkout and must not execute merely because an archive exists under `./.yoi/plugins`.
 
@@ -26,10 +26,11 @@ The package should be easy to copy, inspect, cache, and pin while preserving Yoi
   - Support packaged assets such as `module.wasm`, JSON schemas, README, and license files.
   - Specify archive safety rules, including path traversal rejection, bounded extraction, and deterministic digest calculation.
 - Define plugin stores and source/trust mapping.
-  - User plugin store: `~/.config/yoi/plugins/`.
-  - Workspace/project plugin store: `./.yoi/plugins/`.
-  - Map stores to the existing source vocabulary (`User`, `Project`/workspace, and future `Builtin`).
-  - Treat `user:<id>` and `project:<id>` as distinct plugin references; ambiguous unqualified IDs should fail closed.
+  - User plugin store: `${XDG_DATA_HOME:-~/.local/share}/yoi/plugins/`.
+  - Workspace/project plugin store: `<workspace>/.yoi/plugins/`.
+  - Builtin plugin source: Yoi-distributed `builtin:` registry.
+  - Map stores to the source vocabulary (`user`, `project`, `builtin`).
+  - Treat `user:<id>` and `project:<id>` as distinct plugin references; ambiguous unqualified IDs fail closed.
 - Separate discovery from enablement.
   - Yoi may discover plugin packages in configured stores.
   - Discovered packages must not register Tools/Hooks, initialize WASM, start services, or start MCP servers until explicitly enabled by manifest/profile configuration.
@@ -80,7 +81,7 @@ The package should be easy to copy, inspect, cache, and pin while preserving Yoi
 ## Acceptance criteria
 
 - The repository has a documented plugin distribution/package proposal covering user and workspace plugin stores, single-file archive format, manifest fields, archive safety, cache/digest behavior, and discovery vs enablement.
-- The proposal explicitly states that placing a package in `~/.config/yoi/plugins/` or `./.yoi/plugins/` is discovery only, not execution or registration.
+- The proposal explicitly states that placing a package in `${XDG_DATA_HOME:-~/.local/share}/yoi/plugins/` or `<workspace>/.yoi/plugins/` is discovery only, not execution or registration.
 - The design maps package sources to user/project/builtin trust categories and defines how ID collisions and ambiguous selectors are handled.
 - The design explains Plugin permission requests/grants as Plugin-layer policy, distinct from `pod::feature` authority/grant concepts.
 - Runtime-specific notes cover declarative hooks and WASM packages; MCP is called out as a separate feature-backed integration, not part of initial Plugin packaging.

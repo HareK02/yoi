@@ -1,8 +1,8 @@
 ---
 title: 'Profile から concrete scope を外して launch policy で付与する'
-state: 'done'
+state: 'closed'
 created_at: '2026-06-13T17:45:32Z'
-updated_at: '2026-06-14T07:04:22Z'
+updated_at: '2026-06-14T14:00:13Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['scope', 'delegation-scope', 'profiles', 'launch-policy', 'orchestrator', 'spawnpod', 'restore']

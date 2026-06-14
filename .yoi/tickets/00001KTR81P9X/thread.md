@@ -179,3 +179,21 @@ Next:
 Implementation branch was reviewed, approved, merged into the Orchestrator branch as `3d140dbb`, and validated in the Orchestrator worktree. Feature-provider focused tests, formatting, diff check, and workspace check passed. Ticket implementation work is done; closure remains separate.
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-14T14:00:13Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-14T14:00:13Z status: closed -->
+
+## 完了
+
+Closed after prior done-state completion.
+
+
+---

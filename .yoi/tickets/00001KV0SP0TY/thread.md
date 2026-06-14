@@ -206,3 +206,21 @@ Next:
 Implementation branch was reviewed, approved, merged into the Orchestrator branch as `297e95ef`, and validated in the Orchestrator worktree. Focused pod/ticket tests, formatting, diff check, and `cargo check --workspace --all-targets` passed after cleanup freed disk space. Ticket implementation work is done; closure remains separate.
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-14T14:00:13Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-14T14:00:13Z status: closed -->
+
+## 完了
+
+Closed after prior done-state completion.
+
+
+---

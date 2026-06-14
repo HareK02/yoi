@@ -1,8 +1,8 @@
 ---
 title: 'E2E: close remaining critical-path gaps after panel harness'
-state: 'done'
+state: 'closed'
 created_at: '2026-06-13T17:34:41Z'
-updated_at: '2026-06-14T05:39:03Z'
+updated_at: '2026-06-14T14:00:13Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['e2e', 'tui', 'pty', 'quit-latency', 'mouse-input', 'rewind']

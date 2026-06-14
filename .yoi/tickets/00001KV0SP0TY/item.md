@@ -1,8 +1,8 @@
 ---
 title: 'Remove feature-layer HostAuthority model'
-state: 'done'
+state: 'closed'
 created_at: '2026-06-13T15:30:22Z'
-updated_at: '2026-06-13T19:02:01Z'
+updated_at: '2026-06-14T14:00:13Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['feature-api', 'tool-registry', 'ticket-tools']

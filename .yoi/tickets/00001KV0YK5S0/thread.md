@@ -193,3 +193,21 @@ Next:
 E2E tmp/runtime isolation follow-up was reviewed, merged into the Orchestrator branch as `20184eeb`, and validated in the Orchestrator worktree. Panel E2E now uses clean per-scenario tmp workspace/data/runtime fixtures, preserves artifacts under `target/e2e-artifacts`, removes fixture temp roots after runs, and does not inherit host runtime/credential environment. Ticket implementation work is done; closure remains separate.
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-14T14:00:13Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-14T14:00:13Z status: closed -->
+
+## 完了
+
+Closed after prior done-state completion.
+
+
+---

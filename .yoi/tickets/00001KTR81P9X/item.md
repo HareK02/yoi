@@ -1,8 +1,8 @@
 ---
 title: 'Extend pod::feature API for external protocol-backed capability providers'
-state: 'done'
+state: 'closed'
 created_at: '2026-06-10T07:48:14Z'
-updated_at: '2026-06-14T06:39:48Z'
+updated_at: '2026-06-14T14:00:13Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['feature-api', 'tool-registry', 'permission-scope', 'prompt-context', 'dynamic-registry', 'service-lifecycle']

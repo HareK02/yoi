@@ -1,8 +1,8 @@
 ---
 title: 'Profile extend API を廃止して import + Lua 代入に寄せる'
-state: 'done'
+state: 'closed'
 created_at: '2026-06-13T07:31:09Z'
-updated_at: '2026-06-14T06:34:34Z'
+updated_at: '2026-06-14T14:00:13Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['profiles', 'lua-api', 'builtin-resources', 'migration']
