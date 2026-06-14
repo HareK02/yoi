@@ -2,7 +2,7 @@
 title: 'Plugin distribution package format and discovery'
 state: 'planning'
 created_at: '2026-06-01T06:49:53Z'
-updated_at: '2026-06-14T14:56:35Z'
+updated_at: '2026-06-14T15:12:07Z'
 ---
 
 ## Background

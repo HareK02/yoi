@@ -96,3 +96,16 @@ Intake 確認:
 - duplicate Ticket は作成していない。
 
 ---
+
+<!-- event: comment author: intake at: 2026-06-14T15:12:07Z -->
+
+## Comment
+
+ユーザー確認の要点:
+- ユーザーは latency / mouse / E2E の経緯説明ではなく、最終的な evidence status を確認している。
+- Ticket 記録上、`00001KV0723PC` の元の Panel Quit latency 修正は post-merge measurement で「still present / not proven fixed」と記録されており、ユーザー観測の latency 改善としては最終的に認められていない。
+- `00001KV072V89` の元の mouse selection 修正も post-merge user verification で「マウス選択全く効かない」と記録され、元の done decision は insufficient とされている。
+- 後続 E2E は fixture/PTY 上で mouse click/wheel と quit pending-barrier regression を pass させたが、これは user の実環境・実インストール経路で latency が解消したこと、または mouse 操作が実際に動作したことの human/live confirmation ではない。
+- `00001KT0Z4BK8` 自体の Plugin package requirements には現時点で反映しない。必要なら別 follow-up Ticket として「E2E 結果と user-visible validation gap の整理 / merge gate 明文化」を扱う。
+
+---
