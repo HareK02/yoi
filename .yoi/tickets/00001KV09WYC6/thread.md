@@ -166,3 +166,44 @@ Residual risks / blockers:
 - Validation caveat: unrelated `multi_pod` filtered-suite failure noted above remains for reviewer/orchestrator assessment.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KV09WYC6 at: 2026-06-14T15:54:30Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Evidence checked:
+- Worktree clean and HEAD at implementation commit `2664cdd9`.
+- Ticket intent/body/thread reviewed from the child worktree.
+- Diff `73d0a6a4..2664cdd9` reviewed.
+- Changed files limited to:
+  - `crates/tui/src/workspace_panel.rs`
+  - `crates/tui/src/multi_pod.rs`
+- Read-only whitespace validation:
+  - `git diff --check 73d0a6a4..2664cdd9` passed.
+
+Acceptance / invariant review:
+- Ticket-associated Intake Pods are modeled as explicit `PanelRowKind::TicketIntakePod` rows with `PanelRowKey::TicketIntakePod { ticket_id, pod_name }`.
+- Rows are inserted immediately after the owning Ticket row, satisfying adjacent/clearly-related display.
+- Association comes from local role/session registry evidence: active local claim and Intake sessions with explicit `related_tickets`.
+- Pod-name-contains-ticket-id heuristic was removed, reducing false association risk and preserving the pre-Ticket Intake invariant.
+- Pre-Ticket Intake Pods without related Ticket evidence are not attached to Ticket rows; focused test covers this.
+- Multiple Intake entries per Ticket are supported and bounded by `MAX_ASSOCIATED_INTAKE_ROWS_PER_TICKET`; no 1:1 assumption.
+- one-active-claim-per-Ticket remains enforced by existing registry claim path; this change only reads/displays claims/sessions.
+- No git-tracked Ticket metadata/frontmatter/thread storage was added for Pod assignment/status.
+- No automatic polling or automatic Intake spawn was added.
+- Arbitrary selected Pod direct-send UX was not revived; associated Intake row routes through existing open/attach behavior.
+- live/restorable/stale status is surfaced via `TicketLocalClaimStatus::label()`.
+- Focused coverage exists for adjacent Intake rows and multi-pod selection/open behavior.
+
+Validation not rerun:
+- Cargo/fmt validation was not rerun because the review scope was read-only and those commands may write build artifacts.
+
+Reported `multi_pod` failure assessment:
+- `tests::orchestrator_launch_uses_runtime_workspace_not_process_cwd` appears unrelated. The implementation changes Workspace Panel row modeling/rendering/selection/open routing only and does not modify orchestrator launch workspace/cwd construction.
+
+Conclusion:
+- Approved. No blocker remains for integration.
+
+---
