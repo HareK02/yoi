@@ -109,3 +109,60 @@ Critical risks / reviewer focus:
 Routing decision と accepted implementation plan を記録済み。blocking relation / orchestration-plan blocker はなく、Orchestrator workspace は clean。00001KTFY8V80 とは主対象が workflow/compaction と TUI Panel で分かれており、独立 worktree/branch で並行開始可能と判断したため、implementation side effects の前に `queued -> inprogress` acceptance を記録する。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KV09WYC6 at: 2026-06-14T15:48:12Z -->
+
+## Implementation report
+
+Implementation report from Coder Pod `yoi-coder-00001KV09WYC6`:
+
+Commit:
+- `2664cdd9 feat: show ticket intake pods in panel`
+
+Changed files:
+- `crates/tui/src/workspace_panel.rs`
+- `crates/tui/src/multi_pod.rs`
+
+Implemented behavior:
+- Workspace Panel derives Ticket-associated Intake Pods from the local role/session registry:
+  - active local Intake claim for a Ticket
+  - related Intake sessions whose `related_tickets` explicitly contain that Ticket id
+- Pre-Ticket Intake sessions without an explicit Ticket relation are not associated, even if the Pod name contains the Ticket id.
+- Ticket rows now get adjacent child rows:
+  - `↳ Intake Pod: <pod-name>`
+  - status column shows `live`, `restorable`, or `stale`
+  - non-stale associated Intake rows expose `Open/attach` behavior via the existing Pod open path
+  - stale rows show unavailable/stale reason instead of trying to open
+- Added typed row key/kind for Ticket Intake Pod rows:
+  - `PanelRowKey::TicketIntakePod`
+  - `PanelRowKind::TicketIntakePod`
+- Kept related display bounded with `MAX_ASSOCIATED_INTAKE_ROWS_PER_TICKET = 3`.
+- Preserved existing local claim handling for generic `related_pods`, while using the new typed `intake_pods` field for visible Ticket Intake child rows.
+- Updated panel selection/open plumbing so associated Intake rows resolve to existing Pod open/attach behavior.
+
+Focused coverage:
+- Added `workspace_panel_shows_ticket_associated_intake_pods_adjacent_to_ticket`, covering:
+  - local Intake claim adjacent row
+  - related Intake session adjacent row
+  - live status/action contract
+  - Pre-Ticket Intake session not falsely associated
+
+Validation reported by coder:
+- Passed: `cargo test -p tui workspace_panel --lib`
+- Passed: `cargo test -p tui role_session_registry --lib`
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check`
+- Ran relevant: `cargo test -p tui multi_pod --lib`
+  - Failed in one existing environment/path-sensitive test:
+    - `tests::orchestrator_launch_uses_runtime_workspace_not_process_cwd`
+    - Failure expected `/tmp/.../runtime-workspace` but observed the worktree path.
+  - The suite compiled; coder assessed this as unrelated to the Intake-row changes.
+
+Repository status:
+- Child implementation worktree clean after commit.
+
+Residual risks / blockers:
+- No known implementation blocker.
+- Validation caveat: unrelated `multi_pod` filtered-suite failure noted above remains for reviewer/orchestrator assessment.
+
+---
