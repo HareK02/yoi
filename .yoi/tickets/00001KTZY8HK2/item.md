@@ -1,11 +1,13 @@
 ---
 title: 'Profile extend API を廃止して import + Lua 代入に寄せる'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-13T07:31:09Z'
-updated_at: '2026-06-14T02:14:43Z'
+updated_at: '2026-06-14T06:08:28Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['profiles', 'lua-api', 'builtin-resources', 'migration']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-14T06:08:28Z'
 ---
 
 ## Background
