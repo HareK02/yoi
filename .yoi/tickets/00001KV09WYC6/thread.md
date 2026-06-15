@@ -245,3 +245,23 @@ Cleanup planned:
 Reviewer approved, implementation branch merged into the orchestration branch, focused validation passed in the Orchestrator worktree, and cleanup is ready. Marking Ticket done in the orchestration branch.
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-15T06:33:52Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-15T06:33:52Z status: closed -->
+
+## 完了
+
+Ticket `00001KV09WYC6` (`Workspace panel: show Ticket-associated Intake Pods adjacent to Ticket rows`) はすでに `state: done` に到達していたため、workspace Panel から close しました。
+
+この Close action によって、実装作業、state 変更、Orchestrator/Companion launch、worker invocation は開始されていません。
+
+
+---

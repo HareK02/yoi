@@ -376,3 +376,23 @@ Cleanup planned:
 Reviewer approved, documentation/design implementation branch merged into the orchestration branch, and documentation-focused validation passed in the Orchestrator worktree. Marking Ticket done in the orchestration branch.
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-15T06:33:50Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-15T06:33:50Z status: closed -->
+
+## 完了
+
+Ticket `00001KT0Z4BK8` (`Plugin distribution package format and discovery`) はすでに `state: done` に到達していたため、workspace Panel から close しました。
+
+この Close action によって、実装作業、state 変更、Orchestrator/Companion launch、worker invocation は開始されていません。
+
+
+---

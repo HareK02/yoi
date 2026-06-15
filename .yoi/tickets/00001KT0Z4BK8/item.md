@@ -1,8 +1,8 @@
 ---
 title: 'Plugin distribution package format and discovery'
-state: 'done'
+state: 'closed'
 created_at: '2026-06-01T06:49:53Z'
-updated_at: '2026-06-14T15:56:45Z'
+updated_at: '2026-06-15T06:33:50Z'
 queued_by: 'workspace-panel'
 queued_at: '2026-06-14T15:40:15Z'
 ---
