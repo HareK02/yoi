@@ -5221,7 +5221,7 @@ const POD_STATUS_COLUMN_WIDTH: usize = 18;
 
 fn panel_row_lines(row: &PanelRow, selected: bool, width: u16) -> Vec<Line<'static>> {
     if row.kind == PanelRowKind::TicketIntakePod {
-        vec![panel_row_title_line(row, selected, width)]
+        vec![panel_intake_child_line(row, selected, width)]
     } else {
         vec![
             panel_row_title_line(row, selected, width),
@@ -5241,7 +5241,7 @@ fn panel_row_title_line(row: &PanelRow, selected: bool, width: u16) -> Line<'sta
     let mut spans = Vec::new();
     let mut remaining = width as usize;
 
-    push_ticket_marker_span(&mut spans, selected, &mut remaining);
+    push_ticket_primary_marker_span(&mut spans, selected, &mut remaining);
     push_column_span(
         &mut spans,
         &row.status,
@@ -5254,11 +5254,41 @@ fn panel_row_title_line(row: &PanelRow, selected: bool, width: u16) -> Line<'sta
     Line::from(spans)
 }
 
+fn panel_intake_child_line(row: &PanelRow, selected: bool, width: u16) -> Line<'static> {
+    let title_style = if selected {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    let mut spans = Vec::new();
+    let mut remaining = width as usize;
+
+    push_intake_child_marker_span(&mut spans, selected, &mut remaining);
+    push_column_span(
+        &mut spans,
+        &row.status,
+        TICKET_STATE_COLUMN_WIDTH,
+        intake_status_style(&row.status),
+        &mut remaining,
+    );
+    push_bounded_span(&mut spans, row.title.as_str(), title_style, &mut remaining);
+
+    Line::from(spans)
+}
+
 fn panel_row_detail_line(row: &PanelRow, selected: bool, width: u16) -> Line<'static> {
     let mut spans = Vec::new();
     let mut remaining = width as usize;
 
-    push_ticket_marker_span(&mut spans, selected, &mut remaining);
+    push_ticket_detail_marker_span(&mut spans, selected, &mut remaining);
+    push_bounded_span(
+        &mut spans,
+        "meta ",
+        Style::default().fg(Color::DarkGray),
+        &mut remaining,
+    );
     push_bounded_span(
         &mut spans,
         &panel_ticket_detail(row),
@@ -5269,16 +5299,56 @@ fn panel_row_detail_line(row: &PanelRow, selected: bool, width: u16) -> Line<'st
     Line::from(spans)
 }
 
-fn push_ticket_marker_span(spans: &mut Vec<Span<'static>>, selected: bool, remaining: &mut usize) {
+fn push_ticket_primary_marker_span(
+    spans: &mut Vec<Span<'static>>,
+    selected: bool,
+    remaining: &mut usize,
+) {
     let (marker, style) = if selected {
         (
-            "| ",
+            "▶ ",
             Style::default()
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
         )
     } else {
         ("  ", Style::default().fg(Color::DarkGray))
+    };
+    push_bounded_span(spans, marker, style, remaining);
+}
+
+fn push_ticket_detail_marker_span(
+    spans: &mut Vec<Span<'static>>,
+    selected: bool,
+    remaining: &mut usize,
+) {
+    let (marker, style) = if selected {
+        (
+            "│ ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        ("  ", Style::default().fg(Color::DarkGray))
+    };
+    push_bounded_span(spans, marker, style, remaining);
+}
+
+fn push_intake_child_marker_span(
+    spans: &mut Vec<Span<'static>>,
+    selected: bool,
+    remaining: &mut usize,
+) {
+    let (marker, style) = if selected {
+        (
+            "  ▶ ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        ("  └ ", Style::default().fg(Color::DarkGray))
     };
     push_bounded_span(spans, marker, style, remaining);
 }
@@ -5420,6 +5490,15 @@ fn panel_priority_style(priority: ActionPriority) -> Style {
     }
 }
 
+fn intake_status_style(status: &str) -> Style {
+    match status {
+        "live" => Style::default().fg(Color::Green),
+        "restorable" => Style::default().fg(Color::Yellow),
+        "stale" => Style::default().fg(Color::DarkGray),
+        _ => Style::default().fg(Color::Cyan),
+    }
+}
+
 fn section_rows(
     list: &PodList,
     section: &MultiPodSection,
@@ -5553,6 +5632,34 @@ fn target_status_line(app: &MultiPodApp) -> Line<'static> {
             ));
         }
         Line::from(spans)
+    } else if let Some(row) = app
+        .selected_panel_row()
+        .filter(|row| row.kind == PanelRowKind::TicketIntakePod)
+    {
+        let ticket_id = panel_ticket_reference(row);
+        let action = if row.next_action == Some(NextUserAction::OpenPod) {
+            "open/attach"
+        } else {
+            "unavailable"
+        };
+        Line::from(vec![
+            Span::styled("composer target ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.composer_target().label(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " · selected Intake Pod ",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(row.status.clone(), intake_status_style(&row.status)),
+            Span::styled(
+                format!(" · Ticket {ticket_id} · blank Enter {action}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
     } else if let Some(entry) = app.selected_pod_entry() {
         let (status, status_style) = row_status_label(entry);
         Line::from(vec![
@@ -7398,9 +7505,8 @@ branch = "orchestration/custom-panel"
         let title_start = state_start + TICKET_STATE_COLUMN_WIDTH + 1;
         let row_id = row.ticket.as_ref().unwrap().id.as_str();
 
-        assert!(title_line.starts_with("| "));
-        assert!(detail_line.starts_with("| "));
-        assert!(!title_line.starts_with("▶"));
+        assert!(title_line.starts_with("▶ "));
+        assert!(detail_line.starts_with("│ meta "));
         assert!(!title_line.contains(row_id));
         assert_eq!(display_column(&title_line, "inprogress"), state_start);
         assert_eq!(
@@ -7430,7 +7536,7 @@ branch = "orchestration/custom-panel"
         let title_start = state_start + TICKET_STATE_COLUMN_WIDTH + 1;
 
         assert!(title_line.starts_with("  ready"));
-        assert!(detail_line.starts_with("  00001KTTB479X"));
+        assert!(detail_line.starts_with("  meta 00001KTTB479X"));
         assert_eq!(display_column(&title_line, "ready"), state_start);
         assert_eq!(
             display_column(&title_line, "Long Ticket title"),
@@ -7458,7 +7564,7 @@ branch = "orchestration/custom-panel"
         assert_eq!(display_column(&title_line, "Very long Ticket"), title_start);
         assert!(title_line.ends_with('…'));
         assert_eq!(detail_line.width(), 42);
-        assert!(detail_line.starts_with("  00001KTTB479X · Gate: clear"));
+        assert!(detail_line.starts_with("  meta 00001KTTB479X · Gate: clear"));
         assert!(detail_line.ends_with('…'));
     }
 
@@ -7481,6 +7587,67 @@ branch = "orchestration/custom-panel"
         assert!(detail_line.contains("Gate: waiting for BLOCKER-1 via depends_on"));
         assert!(detail_line.contains("Action: queue disabled"));
         assert!(detail_line.contains("Reason: Queue disabled: waiting for BLOCKER-1"));
+    }
+
+    #[test]
+    fn panel_ticket_intake_child_rows_render_as_indented_single_line() {
+        let row = panel_test_intake_child_row(
+            "00001TICKET",
+            "intake-live",
+            TicketLocalClaimStatus::Live,
+            Some(NextUserAction::OpenPod),
+        );
+
+        let lines = panel_row_lines(&row, false, 160);
+        assert_eq!(lines.len(), 1);
+        let line = plain_line(&lines[0]);
+        let status_start = 4;
+        let title_start = status_start + TICKET_STATE_COLUMN_WIDTH + 1;
+
+        assert!(line.starts_with("  └ live"));
+        assert_eq!(display_column(&line, "live"), status_start);
+        assert_eq!(
+            display_column(&line, "Intake Pod: intake-live"),
+            title_start
+        );
+        assert!(!line.starts_with("  live"));
+
+        let selected_line = plain_line(&panel_row_lines(&row, true, 160)[0]);
+        assert!(selected_line.starts_with("  ▶ live"));
+        assert!(selected_line.contains("Intake Pod: intake-live"));
+    }
+
+    #[test]
+    fn selected_ticket_intake_child_status_is_not_rendered_as_generic_ticket_or_pod() {
+        let ticket_id = "00001TICKET";
+        let pod_name = "intake-live";
+        let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
+        panel.rows.push(panel_test_intake_child_row(
+            ticket_id,
+            pod_name,
+            TicketLocalClaimStatus::Live,
+            Some(NextUserAction::OpenPod),
+        ));
+        let list = PodList::from_sources(
+            PodVisibilitySource::ResumePicker,
+            vec![],
+            vec![live_info(pod_name, PodStatus::Idle)],
+            None,
+            10,
+        );
+        let mut app = app_with_panel(list, panel);
+        app.select_panel_key(PanelRowKey::TicketIntakePod {
+            ticket_id: ticket_id.to_string(),
+            pod_name: pod_name.to_string(),
+        });
+
+        let status = plain_line(&target_status_line(&app));
+
+        assert!(status.contains("selected Intake Pod live"));
+        assert!(status.contains("Ticket 00001TICKET"));
+        assert!(status.contains("blank Enter open/attach"));
+        assert!(!status.contains("selected Ticket"));
+        assert!(!status.contains("selected Pod live"));
     }
 
     #[test]
@@ -8747,6 +8914,36 @@ branch = "orchestration/custom-panel"
             related_pods: Vec::new(),
             disabled_reason: None,
             key_hint: Some("Enter".to_string()),
+        }
+    }
+
+    fn panel_test_intake_child_row(
+        ticket_id: &str,
+        pod_name: &str,
+        status: TicketLocalClaimStatus,
+        next_action: Option<NextUserAction>,
+    ) -> PanelRow {
+        PanelRow {
+            key: PanelRowKey::TicketIntakePod {
+                ticket_id: ticket_id.to_string(),
+                pod_name: pod_name.to_string(),
+            },
+            kind: PanelRowKind::TicketIntakePod,
+            title: format!("Intake Pod: {pod_name}"),
+            subtitle: Some(format!("Intake claim for Ticket {ticket_id}")),
+            status: status.label().to_string(),
+            priority: match status {
+                TicketLocalClaimStatus::Live | TicketLocalClaimStatus::Restorable => {
+                    ActionPriority::ActiveWork
+                }
+                TicketLocalClaimStatus::Stale => ActionPriority::Background,
+            },
+            next_action,
+            ticket: None,
+            related_pods: vec![pod_name.to_string()],
+            disabled_reason: (status == TicketLocalClaimStatus::Stale)
+                .then(|| "claim metadata is stale".to_string()),
+            key_hint: Some(format!("Ticket {ticket_id} Intake Pod {pod_name}")),
         }
     }
 
