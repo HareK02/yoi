@@ -98,3 +98,74 @@ Critical risks / reviewer focus:
 Routing decision と accepted implementation plan を記録済み。dependency `00001KV5R5V2S` は done で relation blocker は解消済み。Orchestrator workspace は clean。implementation side effects の前に `queued -> inprogress` acceptance を記録する。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KV5W3PHA at: 2026-06-15T16:20:05Z -->
+
+## Implementation report
+
+Implementation report from Coder Pod `yoi-coder-00001KV5W3PHA`:
+
+Commit:
+- `05a9c522 feat: register plugin tool surfaces`
+
+Changed files:
+- `crates/manifest/src/plugin.rs`
+- `crates/manifest/src/lib.rs`
+- `crates/manifest/src/config.rs`
+- `crates/llm-worker/src/tool.rs`
+- `crates/pod/src/feature.rs`
+- `crates/pod/src/feature/plugin.rs`
+- `crates/pod/src/controller.rs`
+- `crates/pod/src/pod.rs`
+
+Implemented behavior:
+- Added minimal Plugin package `tools` manifest surface parsing:
+  - `name`
+  - `description`
+  - `input_schema`
+- Added `feature.plugins` profile/manifest gate, default disabled.
+- Added Plugin Tool feature adapter:
+  - only enabled resolved Plugin packages with enabled Tool surface register schemas;
+  - package discovery alone does not register Tools;
+  - disabled profile feature suppresses Plugin Tool schema surface.
+- Registered Plugin Tool definitions into existing ToolRegistry/model-visible schema path.
+- Added host-side `ToolOrigin` metadata on `ToolMeta`:
+  - plugin id/ref
+  - source
+  - digest
+  - package version/API
+  - `surface = "tool"`
+- Added runtime-missing stub executor:
+  - Tool schema is visible when registered;
+  - actual calls return safe unavailable/runtime-missing error;
+  - no Plugin code execution or WASM runtime added.
+- Added registration-time fail-closed checks:
+  - duplicate Plugin Tool names;
+  - collision with already registered builtin Tool names;
+  - invalid/unsupported input schemas.
+- Adjusted feature install ordering so builtin/pending tools are flushed before Plugin feature registration, allowing Plugin collisions against already registered Tool names to be diagnosed instead of reaching later duplicate panic.
+
+Diagnostics behavior:
+- Duplicate Tool contributions produce feature install diagnostics and skip duplicate registration.
+- Invalid Plugin input schema produces feature install diagnostics and registers no stub for that invalid Tool.
+- Runtime calls before executor support return safe unavailable/runtime-missing `ToolError`.
+
+Validation reported by coder:
+- Passed: `cargo test -p manifest plugin --no-default-features`
+- Passed: `cargo test -p pod plugin::tests --no-default-features`
+- Passed: `cargo check -p pod -p manifest -p llm-worker`
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check`
+- Attempted broader validation: `cargo test -p pod --no-default-features`
+  - Failed in existing prompt text assertions unrelated to Plugin Tool surface implementation:
+    - `prompt::tests::default_subagent_prompt_matches_resource`
+    - `prompt::tests::subagent_prompt_treats_paths_as_data`
+
+Not run:
+- `nix build .#yoi` — no dependency, `Cargo.lock`, resource, or packaging changes.
+
+Residual risks / blockers:
+- Plugin executor is intentionally runtime-missing stub; actual WASM/runtime execution remains for later Ticket.
+- Input schema validation is intentionally a narrow model-visible shape check, not a full JSON Schema engine. Unsupported composition/reference keywords are rejected fail-closed.
+
+---
