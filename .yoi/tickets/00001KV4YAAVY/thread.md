@@ -214,3 +214,53 @@ Conclusion:
 - Approved. No blocker remains.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-15T07:15:54Z -->
+
+## Implementation report
+
+Integration report:
+
+Merged implementation branch into orchestration branch:
+- branch: `impl/00001KV4YAAVY-single-pod-text-selection`
+- implementation commit: `09f5e9d5 feat: add single-pod text selection`
+- merge commit: `3fa52f2c merge: single-pod text selection`
+
+Reviewer result:
+- `approve` recorded from `yoi-reviewer-00001KV4YAAVY`.
+
+Additional integration fix:
+- Because the implementation added a direct `base64` dependency to `crates/tui/Cargo.toml` and updated `Cargo.lock`, `nix build .#yoi --no-link` first failed with stale `package.nix` `cargoHash`.
+- Updated `package.nix` `cargoHash` to the new fixed-output vendor hash:
+  - `sha256-pIDYnbBs3U8Z3IndgH10rirv8/IdFv1WlgwpCbKXy+M=`
+
+Validation in Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration`:
+- Passed: `cargo fmt --check`
+- Passed: `cargo check -p tui --all-targets`
+- Passed: `cargo test -p tui text_selection`
+  - 4 passed
+- Passed: `cargo test -p tui single_pod::tests`
+  - 38 passed
+- Passed: `cargo test -p tui ui::tests::history_rows_mark_text_items_selectable_and_non_text_unselectable`
+  - 1 passed
+- Passed: `git diff --check`
+- Passed after hash update: `nix build .#yoi --no-link`
+
+Notes:
+- OSC52 clipboard acceptance remains terminal/multiplexer dependent; implementation reports write/flush success/failure only.
+- No PTY/E2E validation was run for real terminal selection/copy behavior; focused unit coverage and reviewer inspection covered selection/copy state, extraction, and persistence boundaries.
+- Orchestrator worktree is clean apart from the pending `package.nix`/Ticket integration commit at the time of recording.
+
+Cleanup planned:
+- Stop related coder/reviewer Pods.
+- Remove only child implementation worktree/branch for this Ticket.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-15T07:15:54Z from: inprogress to: done reason: merged_validated field: state -->
+
+## State changed
+
+Reviewer approved, implementation branch merged into the orchestration branch, integration validation passed including Nix package hash refresh, and focused validation passed in the Orchestrator worktree. Marking Ticket done in the orchestration branch.
+
+---
