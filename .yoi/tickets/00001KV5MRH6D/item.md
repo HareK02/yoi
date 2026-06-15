@@ -1,8 +1,8 @@
 ---
 title: 'Panel 起動遅延の待ち要因を E2E 計測で特定し改善する'
-state: 'queued'
+state: 'inprogress'
 created_at: '2026-06-15T12:40:33Z'
-updated_at: '2026-06-15T13:59:47Z'
+updated_at: '2026-06-15T14:01:19Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['panel', 'tui', 'e2e', 'latency', 'runtime-observation']

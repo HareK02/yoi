@@ -1,8 +1,8 @@
 ---
 title: 'Plugin: package discovery and explicit enablement resolver'
-state: 'queued'
+state: 'inprogress'
 created_at: '2026-06-15T13:40:15Z'
-updated_at: '2026-06-15T13:59:47Z'
+updated_at: '2026-06-15T14:01:19Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['plugin', 'package-loading', 'discovery', 'enablement', 'capability-boundary', 'startup-restore']
