@@ -3211,7 +3211,22 @@ fn derive_orchestrator_work_set(
         .iter()
         .filter_map(|row| {
             let ticket = row.ticket.as_ref()?;
-            if ticket.workflow_state == TicketWorkflowState::InProgress {
+            if let Some(overlay) = ticket
+                .orchestration_overlay
+                .as_ref()
+                .filter(|overlay| overlay.workflow_state == TicketWorkflowState::InProgress)
+            {
+                Some(OrchestratorActiveWorkItem {
+                    id: ticket.id.clone(),
+                    title: ticket.title.clone(),
+                    status: format!(
+                        "local: {} · {}: {}",
+                        ticket.workflow_state.as_str(),
+                        overlay.source,
+                        overlay.workflow_state.as_str()
+                    ),
+                })
+            } else if ticket.workflow_state == TicketWorkflowState::InProgress {
                 Some(OrchestratorActiveWorkItem {
                     id: ticket.id.clone(),
                     title: ticket.title.clone(),
@@ -3296,6 +3311,13 @@ fn queued_duplicate_guard(
         if !guards.iter().any(|guard| guard.contains(pod)) {
             guards.push(format!("related pod/worktree {pod}"));
         }
+    }
+    if let Some(overlay) = ticket.orchestration_overlay.as_ref() {
+        guards.push(format!(
+            "{} worktree overlay shows state {}",
+            overlay.source,
+            overlay.workflow_state.as_str()
+        ));
     }
     if guards.is_empty() {
         None
@@ -8893,6 +8915,7 @@ branch = "orchestration/custom-panel"
             workflow_state: TicketWorkflowState::parse(state)
                 .unwrap_or(TicketWorkflowState::Planning),
             workflow_state_explicit: true,
+            orchestration_overlay: None,
             next_action: Some(next_action),
             updated_at: None,
             latest_event_kind: Some("implementation_report".to_string()),
