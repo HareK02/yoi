@@ -85,3 +85,45 @@ Critical risks / reviewer focus:
 Routing decision と accepted implementation plan を記録済み。blocking relation / unresolved OrchestrationPlan blocker はなく、Panel Alt+Enter bugfix は同時に開始する single-Pod View selection work と主対象が異なるため、implementation side effects の前に `queued -> inprogress` acceptance を記録する。Panel visual hierarchy work `00001KV4ZPAD3` は conflict/capacity 理由で queued のまま待機させる。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KV4ZDMV1 at: 2026-06-15T06:46:31Z -->
+
+## Implementation report
+
+Implementation report from Coder Pod `yoi-coder-00001KV4ZDMV1`:
+
+Commit:
+- `5c339177 fix: align panel alt-enter composer handling`
+
+Changed files:
+- `crates/tui/src/multi_pod.rs`
+  - Panel now resolves shared `composer_edit_action` modifier actions before Panel `Enter` actions.
+  - `Alt+Enter` is handled as `InsertNewline` and returns `MultiPodAction::None`, so it cannot open Pods, dispatch Ticket actions, launch Intake, or send Companion messages.
+  - Added focused Panel tests for:
+    - non-empty composer inserts newline without Companion send
+    - blank Pod row selection inserts newline without open
+    - blank Ticket action selection inserts newline without dispatch
+- `crates/tui/src/composer_keys.rs`
+  - Added explicit shared-keymap coverage for `Alt+Enter -> InsertNewline`.
+
+Validation reported by coder:
+- Passed: `cargo test -p tui composer_keys`
+- Passed: `cargo test -p tui multi_alt_enter --lib`
+- Passed focused bare-Enter regression checks:
+  - `cargo test -p tui multi_empty_enter_uses_open_action --lib`
+  - `cargo test -p tui multi_non_empty_enter_reports_companion_unavailable --lib`
+  - `cargo test -p tui multi_ticket_intake_enter_builds_launch_request_not_direct_send --lib`
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check`
+
+Broader suite note:
+- Attempted: `cargo test -p tui multi_pod --lib`
+- Failed in existing unrelated test:
+  - `multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace`
+  - assertion mismatch: expected target/orchestration path vs `/repo/yoi`
+- Coder assessed this as outside the Alt+Enter change path; focused Ticket tests pass.
+
+Repository status:
+- Child implementation worktree clean after commit.
+
+---
