@@ -229,3 +229,67 @@ Conclusion:
 - Changes requested. Do not integrate until nested schema validation is fail-closed and covered.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KV5W3PHA at: 2026-06-15T16:30:49Z -->
+
+## Implementation report
+
+Follow-up implementation report after reviewer request_changes:
+
+New commit:
+- `3413bae7 fix: reject nested plugin tool schema errors`
+
+Changed file:
+- `crates/pod/src/feature/plugin.rs`
+
+Schema validation behavior updated:
+- Replaced shallow root-only validation with recursive validation of an explicit supported subset.
+- Every schema node must be a JSON object with supported string `type`.
+- Supported `type` values:
+  - `object`
+  - `array`
+  - `string`
+  - `number`
+  - `integer`
+  - `boolean`
+  - `null`
+- Supported keywords:
+  - `type`
+  - `title`
+  - `description`
+  - `properties`
+  - `required`
+  - `additionalProperties`
+  - `items`
+  - `enum`
+
+Recursive/fail-closed behavior:
+- `properties.*` values are recursively validated as schema objects.
+- `items` is only allowed on array schemas and recursively validates a schema object.
+- `additionalProperties` is only allowed on object schemas and must be boolean or recursively valid schema object.
+- Non-object nested schema nodes reject registration.
+- Unknown/problematic keywords reject registration.
+- Unsupported `type` values reject registration.
+- `required` must be an array of unique strings.
+- `required` entries must be declared in `properties` when `properties` exists.
+- `enum` must be non-empty array with unique entries.
+
+Regression tests added:
+- Direct validation rejects:
+  - `properties.query = "not-a-schema"`
+  - invalid recursive `items`
+  - invalid recursive `additionalProperties`
+  - duplicate `required` entries
+- Registration test confirms nested invalid schema does not register a Plugin Tool and emits an `invalid input_schema` diagnostic with nested path.
+
+Validation reported by coder:
+- Passed: `cargo test -p pod plugin::tests --no-default-features`
+- Passed: `cargo test -p manifest plugin --no-default-features`
+- Passed: `cargo check -p pod -p manifest -p llm-worker`
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check`
+
+Repository status:
+- Child implementation worktree clean after follow-up commit.
+
+---
