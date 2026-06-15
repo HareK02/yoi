@@ -163,3 +163,86 @@ Residual risks / notes:
 - Current archive reader intentionally supports a constrained stored-ZIP profile and fails closed on unsupported compression methods. Broader `.zip` compression support can be added later if package tooling requires it.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KV5R5V2S at: 2026-06-15T14:37:12Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+Evidence checked:
+- Child worktree only:
+  - `/home/hare/Projects/yoi/.worktree/00001KV5R5V2S-plugin-enable-resolver`
+  - branch/head `impl/00001KV5R5V2S-plugin-enable-resolver` at `a03a9da6`
+- Diff files:
+  - `crates/manifest/src/plugin.rs`
+  - `crates/manifest/src/config.rs`
+  - `crates/manifest/src/lib.rs`
+  - `crates/manifest/src/profile.rs`
+  - `crates/pod/src/spawn/tool.rs`
+  - `crates/manifest/Cargo.toml`
+  - `Cargo.lock`
+  - `package.nix`
+  - `docs/design/plugin-packages.md`
+- Ticket record:
+  - `.yoi/tickets/00001KV5R5V2S/item.md`
+  - `.yoi/tickets/00001KV5R5V2S/thread.md`
+
+Read-only validation performed:
+- Passed: `git diff --check 4772c4d6..a03a9da6`
+
+Positive findings:
+- Discovery/resolution code is isolated in `crates/manifest/src/plugin.rs`.
+- No runtime registration, WASM execution, Tool/Hook/Service/Ingress contribution path was found.
+- User/workspace stores are represented.
+- Discovery checks include store containment, symlink escape rejection, path normalization, count/size/manifest bounds, duplicate normalized path rejection, and deterministic digest.
+- Package presence alone does not activate anything; resolution requires `plugins.enabled`.
+- Manifest/profile/child-spawn config plumbing preserves `plugins` config.
+
+Required changes:
+
+1. Version mismatch support is missing.
+
+- Ticket requires enablement entries to express package version/version constraint and requires version mismatch to be a distinct diagnostic.
+- `PluginEnablementConfig` currently has `id`, `digest`, `surfaces`, `grants`, `config`, but no version/version constraint field.
+- `resolve_enabled_plugins` never compares enablement against `package.manifest.version`.
+- `PluginPackageManifest` has `version`, but it is only validated non-empty.
+- `PluginDiagnosticKind::Version` currently appears to be used for unsupported API version, so package-version mismatch and API incompatibility are not clearly separated.
+
+Required fix:
+- Add a typed version/version requirement field to enablement config, or explicitly documented minimal exact-version field if constraints are deferred.
+- Compare it to `manifest.version` during resolution.
+- Emit a distinct version-mismatch diagnostic separate from incompatible API version.
+- Add tests for version mismatch fail-closed behavior.
+
+2. Startup/restore determinism is not satisfied.
+
+- Ticket requires deterministic startup/restore behavior for the resolved plugin set.
+- Implementation preserves authoring config, but no resolved plugin metadata/digest recording or deterministic restore re-resolution path was found.
+- Unpinned enablement can resolve to a different package if mutable user/workspace store changes before restore.
+- The design doc also states restore should use a resolved plan, not fresh discovery choosing newer packages.
+
+Required fix:
+- Either persist resolved plugin identity/digest metadata into resolved manifest/session metadata used for restore, or define and implement deterministic re-resolution semantics that cannot silently change a restored plugin set.
+- Add focused test or validation evidence for the chosen restore/reproducibility path.
+- If intentionally deferred, Ticket acceptance/report must be updated before approval because current acceptance still requires it.
+
+3. Bounded diagnostic truncation can panic on valid UTF-8.
+
+- `bounded_message` slices a Rust `String` at byte offset 240.
+- It is used for TOML parse errors from untrusted plugin manifests.
+- If byte 240 falls inside a multibyte UTF-8 character, slicing panics instead of producing a bounded diagnostic.
+
+Required fix:
+- Truncate on character boundary using safe helper logic.
+- Add malformed manifest test with long multibyte content proving diagnostics remain bounded and non-panicking.
+- Consider reducing raw TOML-error content leakage because diagnostics should avoid secret-like path/content leakage.
+
+Additional concern:
+- Design doc examples use `schema_version`, but implemented parser requires `api_version`.
+- Align schema naming before merge to avoid contradictory package-author guidance.
+
+Conclusion:
+- Changes requested. Do not integrate until these blockers are fixed and covered.
+
+---
