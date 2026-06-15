@@ -10,8 +10,8 @@ use std::thread;
 use std::time::Duration;
 
 use crossterm::event::{
-    self, DisableMouseCapture, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseEvent,
-    MouseEventKind,
+    self, DisableMouseCapture, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton,
+    MouseEvent, MouseEventKind,
 };
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{Command, execute};
@@ -23,6 +23,7 @@ use ratatui::backend::CrosstermBackend;
 use session_store::SegmentId;
 use tokio::sync::mpsc;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use client::{PodClient, PodRuntimeCommand};
 
 use crate::app::{ActionbarNoticeLevel, ActionbarNoticeSource, App};
@@ -33,20 +34,19 @@ use crate::{multi_pod, picker, spawn, ui};
 
 type FullscreenTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
-/// Enable the narrowest standard xterm mouse mode that still reports wheel
-/// events. Crossterm's `EnableMouseCapture` also enables button-event
-/// tracking (`?1002h`), which requests drag-motion reports and interferes
-/// with terminal text selection more aggressively. Normal tracking (`?1000h`)
-/// reports button presses, releases, and wheel notches, but does not request
-/// drag-motion reports; the TUI ignores the non-wheel events.
+/// Enable SGR coordinates plus button-event tracking for Yoi-owned drag text
+/// selection in the single-Pod transcript. This intentionally opts out of
+/// terminal-native selection while the alternate screen is active, but still
+/// avoids all-motion tracking (`?1003h`).
 #[derive(Debug, Clone, Copy)]
-struct EnableWheelMouseCapture;
+struct EnableSinglePodMouseCapture;
 
-impl Command for EnableWheelMouseCapture {
+impl Command for EnableSinglePodMouseCapture {
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        // 1000: normal mouse tracking (includes wheel button presses)
         // 1006: SGR extended coordinates used by crossterm's parser
-        f.write_str("\x1B[?1000h\x1B[?1006h")
+        // 1000: normal mouse tracking (button presses/releases and wheel)
+        // 1002: button-event tracking (drag reports while a button is held)
+        f.write_str("\x1B[?1006h\x1B[?1000h\x1B[?1002h")
     }
 
     #[cfg(windows)]
@@ -58,6 +58,45 @@ impl Command for EnableWheelMouseCapture {
     fn is_ansi_code_supported(&self) -> bool {
         true
     }
+}
+
+fn copy_to_terminal_clipboard<W: io::Write>(out: &mut W, text: &str) -> io::Result<()> {
+    let encoded = BASE64_STANDARD.encode(text.as_bytes());
+    write!(out, "\x1B]52;c;{}\x07", encoded)?;
+    out.flush()
+}
+
+fn copy_selection_to_writer<W: io::Write>(app: &mut App, out: &mut W) -> bool {
+    let Some(text) = app.text_selection.copy_text() else {
+        return false;
+    };
+
+    let result = copy_to_terminal_clipboard(out, &text);
+    app.text_selection.clear();
+    match result {
+        Ok(()) => {
+            app.flash_actionbar_notice(
+                "Copied selected text to terminal clipboard.",
+                ActionbarNoticeLevel::Info,
+                ActionbarNoticeSource::Tui,
+                Duration::from_secs(3),
+            );
+        }
+        Err(_) => {
+            app.flash_actionbar_notice(
+                "Copy failed: terminal clipboard write failed.",
+                ActionbarNoticeLevel::Error,
+                ActionbarNoticeSource::Tui,
+                Duration::from_secs(5),
+            );
+        }
+    }
+    true
+}
+
+fn copy_selection_to_terminal(app: &mut App) -> bool {
+    let mut stdout = io::stdout();
+    copy_selection_to_writer(app, &mut stdout)
 }
 
 fn resolve_socket(pod_name: &str, override_path: Option<PathBuf>) -> PathBuf {
@@ -294,10 +333,9 @@ pub(crate) async fn run_spawn(
 
 fn enter_fullscreen() -> Result<FullscreenTerminal, Box<dyn std::error::Error>> {
     let mut stdout = io::stdout();
-    // Enable only normal mouse tracking for wheel events. Avoid crossterm's
-    // full mouse capture because it requests drag-motion events and breaks
-    // terminal-native text selection.
-    execute!(stdout, EnterAlternateScreen, EnableWheelMouseCapture)?;
+    // Enable button-event tracking so the transcript can own drag selection;
+    // avoid all-motion capture because hover-motion reports are unnecessary.
+    execute!(stdout, EnterAlternateScreen, EnableSinglePodMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
@@ -310,7 +348,7 @@ fn enter_fullscreen_existing(
     execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
-        EnableWheelMouseCapture
+        EnableSinglePodMouseCapture
     )?;
     Ok(())
 }
@@ -761,8 +799,25 @@ const PANE_SCROLL_LINES: usize = 5;
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     match mouse.kind {
-        MouseEventKind::ScrollUp => app.scroll.scroll_up(WHEEL_LINES),
-        MouseEventKind::ScrollDown => app.scroll.scroll_down(WHEEL_LINES),
+        MouseEventKind::ScrollUp => {
+            app.text_selection.clear();
+            app.scroll.scroll_up(WHEEL_LINES);
+        }
+        MouseEventKind::ScrollDown => {
+            app.text_selection.clear();
+            app.scroll.scroll_down(WHEEL_LINES);
+        }
+        MouseEventKind::Down(MouseButton::Left) if app.rewind_picker.is_none() => {
+            if !app.text_selection.begin_drag(mouse.column, mouse.row) {
+                app.text_selection.clear();
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) if app.rewind_picker.is_none() => {
+            app.text_selection.update_drag(mouse.column, mouse.row);
+        }
+        MouseEventKind::Up(MouseButton::Left) if app.rewind_picker.is_none() => {
+            app.text_selection.finish_drag(mouse.column, mouse.row);
+        }
         _ => {}
     }
 }
@@ -983,6 +1038,25 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
         }
     }
 
+    if key.modifiers.is_empty() {
+        match key.code {
+            KeyCode::Esc if app.text_selection.clear() => return None,
+            KeyCode::Char('y') if app.text_selection.has_selection() => {
+                if !copy_selection_to_terminal(app) {
+                    app.text_selection.clear();
+                    app.flash_actionbar_notice(
+                        "Selection contains no copyable text.",
+                        ActionbarNoticeLevel::Warn,
+                        ActionbarNoticeSource::Tui,
+                        Duration::from_secs(3),
+                    );
+                }
+                return None;
+            }
+            _ => {}
+        }
+    }
+
     match key.code {
         KeyCode::Esc => {
             // Close the popup if it's still showing (covers the
@@ -1128,16 +1202,114 @@ fn handle_pause_or_quit(app: &mut App) -> Option<Method> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text_selection::{HistoryViewport, SelectionRow};
     use protocol::{Event, RewindTarget, RewindTargetId, Segment};
 
     #[test]
-    fn wheel_mouse_capture_uses_normal_tracking_without_drag_capture() {
+    fn single_pod_mouse_capture_enables_drag_without_all_motion() {
         let mut ansi = String::new();
-        Command::write_ansi(&EnableWheelMouseCapture, &mut ansi).unwrap();
+        Command::write_ansi(&EnableSinglePodMouseCapture, &mut ansi).unwrap();
 
-        assert_eq!(ansi, "\x1B[?1000h\x1B[?1006h");
-        assert!(!ansi.contains("?1002h"));
+        assert!(ansi.contains("?1000h"));
+        assert!(ansi.contains("?1002h"));
+        assert!(ansi.contains("?1006h"));
         assert!(!ansi.contains("?1003h"));
+    }
+
+    #[test]
+    fn mouse_drag_updates_selection_state() {
+        let mut app = App::new("pod".into());
+        app.text_selection.set_history_snapshot(
+            HistoryViewport {
+                x: 1,
+                y: 2,
+                width: 20,
+                height: 3,
+                top_offset: 0,
+                total_lines: 1,
+            },
+            vec![SelectionRow::new("alpha".into(), true)],
+        );
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 4,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 4,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert_eq!(app.text_selection.copy_text().as_deref(), Some("lph"));
+        assert!(!app.text_selection.active().unwrap().dragging);
+    }
+
+    #[test]
+    fn esc_clears_selection_without_editing_composer() {
+        let mut app = App::new("pod".into());
+        app.text_selection.set_history_snapshot(
+            HistoryViewport {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 1,
+                top_offset: 0,
+                total_lines: 1,
+            },
+            vec![SelectionRow::new("hello".into(), true)],
+        );
+        assert!(app.text_selection.begin_drag(0, 0));
+
+        assert!(handle_key(&mut app, key(KeyCode::Esc)).is_none());
+        assert!(!app.text_selection.has_selection());
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn copy_selection_writes_osc52_and_clears_selection() {
+        let mut app = App::new("pod".into());
+        app.text_selection.set_history_snapshot(
+            HistoryViewport {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 1,
+                top_offset: 0,
+                total_lines: 1,
+            },
+            vec![SelectionRow::new("hello".into(), true)],
+        );
+        assert!(app.text_selection.begin_drag(0, 0));
+        assert!(app.text_selection.update_drag(4, 0));
+
+        let mut out = Vec::new();
+        assert!(copy_selection_to_writer(&mut app, &mut out));
+
+        assert_eq!(String::from_utf8(out).unwrap(), "\x1B]52;c;aGVsbG8=\x07");
+        assert!(!app.text_selection.has_selection());
+        assert!(
+            app.current_actionbar_notice(std::time::Instant::now())
+                .is_some()
+        );
     }
 
     #[tokio::test]
