@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KV5W3PJ3",
+      "kind": "depends_on",
+      "target": "00001KV5W3PHW",
+      "note": "Grant enforcement must cover runtime execution path.",
+      "author": "yoi ticket",
+      "at": "2026-06-15T14:50:28Z"
+    },
+    {
+      "ticket_id": "00001KV5W3PJ3",
+      "kind": "related",
+      "target": "00001KSXRQ4G8",
+      "note": "Plugin runtime/surface/host API design record.",
+      "author": "yoi ticket",
+      "at": "2026-06-15T14:50:28Z"
+    }
+  ]
+}
