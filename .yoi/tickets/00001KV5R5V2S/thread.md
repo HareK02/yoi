@@ -95,3 +95,71 @@ Critical risks / reviewer focus:
 Routing decision と accepted implementation plan を記録済み。blocking relation / unresolved OrchestrationPlan blocker はなく、Plugin resolver work は同時に開始する Panel startup latency work と主対象が異なるため、implementation side effects の前に `queued -> inprogress` acceptance を記録する。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KV5R5V2S at: 2026-06-15T14:27:54Z -->
+
+## Implementation report
+
+Implementation report from Coder Pod `yoi-coder-00001KV5R5V2S`:
+
+Commit:
+- `a03a9da6 feat: add plugin package resolver`
+
+Changed files:
+- `crates/manifest/src/plugin.rs`
+  - New typed plugin discovery/resolution module.
+- `crates/manifest/src/lib.rs`
+  - Added `plugins` config to `PodManifest`.
+  - Added parsing test for `[[plugins.enabled]]`.
+- `crates/manifest/src/config.rs`
+  - Added `plugins` to `PodManifestConfig` and merge/materialization path.
+- `crates/manifest/src/profile.rs`
+  - Added profile/Lua config support for plugin enablement config.
+- `crates/pod/src/spawn/tool.rs`
+  - Preserves plugin config when deriving child manifest config.
+- `crates/manifest/Cargo.toml`
+  - Added `sha2` dependency for deterministic package digests.
+- `Cargo.lock`
+  - Updated manifest crate dependency metadata.
+- `package.nix`
+  - Updated `cargoHash`.
+
+Resolver/config shape:
+- Config supports explicit enablement through `[[plugins.enabled]]`:
+  - `id = "project:<id>" | "user:<id>" | "builtin:<id>"`
+  - optional `digest = "sha256:<hex>"`
+  - optional `surfaces = ["hook", ...]`
+  - optional `[plugins.enabled.config]`
+  - optional grants, currently fail closed when authority-bearing/non-empty.
+- Discovery stores:
+  - User: `${XDG_DATA_HOME:-~/.local/share}/yoi/plugins/*.yoi-plugin`
+  - Workspace: `<workspace>/.yoi/plugins/*.yoi-plugin`
+
+Implemented behavior:
+- Discovery is read-only and returns typed `DiscoveredPluginPackage` metadata only.
+- Resolution only activates packages explicitly listed in config and returns typed `ResolvedPlugin` metadata.
+- No runtime initialization, code execution, WASM runtime, hook/tool/service/ingress registration, network, package-manager, or MCP behavior was added.
+- Source-qualified ids are required; unqualified ids fail closed as ambiguous.
+- Unsupported plugin API versions fail closed.
+- Digest pins are checked against deterministic package content digests.
+- Traversal/root escape/symlink escape checks are enforced.
+- Package count, package size, manifest size, entry count, per-file size, and expanded size are bounded.
+- Non-empty authority-bearing grants fail closed, so plugins do not receive ambient workspace filesystem authority.
+
+Diagnostics:
+- Added typed diagnostic kinds for missing, duplicate, ambiguous, version, digest, API, surface, grant, malformed, traversal, bounds, and I/O.
+- Diagnostics avoid full package path/content disclosure and use bounded/sanitized messages.
+
+Validation reported by coder:
+- Passed: `cargo fmt --check`
+- Passed: `cargo test -p manifest plugin`
+- Passed: `cargo test -p manifest`
+- Passed: `cargo check`
+- Passed: `cargo test -p pod spawn_pod`
+- Passed: `git diff --check`
+- Passed: `nix build .#yoi`
+
+Residual risks / notes:
+- Current archive reader intentionally supports a constrained stored-ZIP profile and fails closed on unsupported compression methods. Broader `.zip` compression support can be added later if package tooling requires it.
+
+---
