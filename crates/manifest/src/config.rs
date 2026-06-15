@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::defaults;
 use crate::model::{AuthRef, ModelManifest, ReasoningControl};
+use crate::plugin::PluginConfig;
 use crate::{
     CompactionConfig, FeatureConfig, FeatureFlagConfig, FileUploadLimits, MemoryConfig,
     PodManifest, PodMeta, ScopeConfig, SessionConfig, SkillsConfig, TicketFeatureAccessConfig,
@@ -52,6 +53,10 @@ pub struct PodManifestConfig {
     /// disabled after cascade merge.
     #[serde(default)]
     pub feature: FeatureConfigPartial,
+    /// Explicit plugin package enablement entries. Discovery/resolution is a
+    /// separate step and does not run during config merge.
+    #[serde(default)]
+    pub plugins: PluginConfig,
     #[serde(default)]
     pub compaction: Option<CompactionConfigPartial>,
     /// First-class web tool opt-in. See [`WebConfig`].
@@ -444,6 +449,7 @@ impl PodManifestConfig {
                 PermissionConfigPartial::merge,
             ),
             feature: self.feature.merge(upper.feature),
+            plugins: merge_plugin_config(self.plugins, upper.plugins),
             compaction: merge_option(
                 self.compaction,
                 upper.compaction,
@@ -461,6 +467,16 @@ impl SkillsConfig {
         self.directories.extend(upper.directories);
         self
     }
+}
+
+fn merge_plugin_config(mut base: PluginConfig, upper: PluginConfig) -> PluginConfig {
+    let upper_has_resolved_plan = upper.has_resolved_plan();
+    base.enabled.extend(upper.enabled);
+    if upper_has_resolved_plan {
+        base.resolved = upper.resolved;
+        base.diagnostics = upper.diagnostics;
+    }
+    base
 }
 
 impl WebConfig {
@@ -827,6 +843,7 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             session,
             permissions,
             feature: FeatureConfig::from(cfg.feature),
+            plugins: cfg.plugins,
             compaction,
             web: cfg.web,
             memory: cfg.memory,
@@ -873,6 +890,7 @@ mod tests {
             delegation_scope: ScopeConfig::default(),
             permissions: None,
             feature: FeatureConfigPartial::default(),
+            plugins: PluginConfig::default(),
             session: None,
             compaction: None,
             web: None,

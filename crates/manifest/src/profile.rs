@@ -17,6 +17,7 @@ use crate::config::{
     CompactionConfigPartial, FeatureConfigPartial, PermissionConfigPartial, SessionConfigPartial,
 };
 use crate::model::{AuthRef, ModelManifest};
+use crate::plugin::PluginConfig;
 use crate::{
     MemoryConfig, Permission, PodManifest, PodManifestConfig, PodMetaConfig, ResolveError,
     ScopeConfig, ScopeRule, SkillsConfig, WebConfig, WorkerManifestConfig, paths,
@@ -626,6 +627,7 @@ fn resolve_lua_profile_value(
         session: profile.session,
         permissions: profile.permissions,
         feature: profile.feature,
+        plugins: profile.plugins,
         compaction,
         web: profile.web,
         memory: profile.memory,
@@ -686,6 +688,8 @@ struct ProfileConfig {
     permissions: Option<PermissionConfigPartial>,
     #[serde(default)]
     feature: FeatureConfigPartial,
+    #[serde(default)]
+    plugins: PluginConfig,
     #[serde(default)]
     compaction: Option<serde_json::Value>,
     #[serde(default)]

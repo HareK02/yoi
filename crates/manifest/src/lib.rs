@@ -2,6 +2,7 @@ mod config;
 pub mod defaults;
 mod model;
 pub mod paths;
+pub mod plugin;
 mod profile;
 mod scope;
 
@@ -57,6 +58,10 @@ pub struct PodManifest {
     /// resolve disabled so Profile authors choose the exposed built-in surfaces.
     #[serde(default)]
     pub feature: FeatureConfig,
+    /// Explicit plugin package enablement. Discovery remains read-only; only
+    /// source-qualified entries listed here may resolve to active plugin metadata.
+    #[serde(default)]
+    pub plugins: plugin::PluginConfig,
     #[serde(default)]
     pub compaction: Option<CompactionConfig>,
     /// Memory subsystem configuration. Presence of `[memory]` configures memory
@@ -865,6 +870,37 @@ model_id = "claude-sonnet-4-20250514"
 [worker]
 "#;
         assert!(PodManifest::from_toml(toml).is_err());
+    }
+
+    #[test]
+    fn parse_plugin_enablement_config() {
+        let toml = format!(
+            "{MINIMAL_REQUIRED}\n\
+             [[plugins.enabled]]\n\
+             id = \"project:example\"\n\
+             version = \"0.1.0\"\n\
+             digest = \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\
+             surfaces = [\"hook\"]\n\n\
+             [plugins.enabled.config]\n\
+             greeting = \"hello\"\n"
+        );
+        let manifest = PodManifest::from_toml(&toml).unwrap();
+        assert_eq!(manifest.plugins.enabled.len(), 1);
+        let enabled = &manifest.plugins.enabled[0];
+        assert_eq!(enabled.id, "project:example");
+        assert_eq!(
+            enabled.version.as_ref().map(|version| version.0.as_str()),
+            Some("0.1.0")
+        );
+        assert_eq!(enabled.surfaces, vec![plugin::PluginSurface::Hook]);
+        assert_eq!(
+            enabled
+                .config
+                .as_ref()
+                .and_then(|value| value.get("greeting"))
+                .and_then(|value| value.as_str()),
+            Some("hello")
+        );
     }
 
     #[test]

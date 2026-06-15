@@ -775,6 +775,7 @@ fn manifest_to_reusable_config(manifest: &PodManifest) -> PodManifestConfig {
                 rules: p.rules.clone(),
             }),
         feature: manifest.feature.clone().into(),
+        plugins: manifest.plugins.clone(),
         compaction: manifest
             .compaction
             .as_ref()

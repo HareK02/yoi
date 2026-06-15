@@ -22,51 +22,46 @@ LICENSE*                 # recommended license text
 assets/**                # optional non-executable data assets
 ```
 
-The package layout is intentionally data-first. Placing a package in a store must never execute `module.wasm`, register `hooks/*.toml`, or scan assets as prompts. Those steps happen only after explicit enablement and policy resolution.
+The package layout is intentionally data-first. Placing a package in a store must never execute `module.wasm`, register hook metadata, or scan assets as prompts. Those steps happen only after explicit enablement and policy resolution.
 
 ## `plugin.toml`
 
 `plugin.toml` is the package authority for package identity and declared needs. It is not the authority for runtime grants.
 
-Illustrative manifest shape:
+Currently implemented strict `plugin.toml` shape:
 
 ```toml
 schema_version = 1
-id = "example"
-name = "Example Plugin"
+id = "example.summarizer"
+name = "Example Summarizer"
 version = "0.1.0"
-description = "Demonstrates declarative hooks and an optional WASM module."
-
-[runtime]
-kind = "wasm" # "declarative" or "wasm" for the initial plugin system
-entry = "module.wasm"
-abi = "yoi-plugin-wasm-1"
-
-[package]
-readme = "README.md"
-license = "LICENSE"
-
-[permissions]
-tools = ["Bash"]
-web = false
-secrets = []
-filesystem = []
+description = "Adds a custom summary command."
+surfaces = ["hook"]
 
 [[hooks]]
-id = "summarize-ticket"
-file = "hooks/summarize-ticket.toml"
+id = "summary"
+file = "hooks/summary.md"
 ```
 
-Fields proposed for the first implementation pass:
+The package archive must contain both root `plugin.toml` and the referenced `hooks/summary.md` entry. Optional WASM metadata is accepted only for the declared future runtime boundary and is not executed:
+
+```toml
+[runtime]
+kind = "wasm"
+entry = "plugin.wasm"
+abi = "yoi-plugin-wasm-1"
+```
+
+First-pass fields accepted by the parser:
 
 - `schema_version`: required integer; unsupported versions fail closed.
 - `id`: required unqualified local id. It is scoped by the source that discovered the package; it is not globally unique by itself.
 - `name`, `version`, `description`: human metadata used in listings and diagnostics.
-- `runtime.kind`: required runtime family. Initial values should be `declarative` and `wasm`.
-- `runtime.entry`: required for `wasm`, forbidden or ignored for purely declarative packages.
-- `runtime.abi`: required for `wasm` so the host can reject incompatible modules before initialization.
-- `hooks`, `schemas`, `package.readme`, `package.license`: package-relative paths that must pass the same normalized-path validation as archive entries.
-- `permissions`: requested authority. These declarations are requests only; they do not grant access.
+- `surfaces`: optional declared contribution surface names.
+- `runtime`: optional WASM metadata only. Discovery records metadata and never executes it.
+- `hooks`: optional hook metadata. Discovery records metadata and does not register hooks.
+
+Future descriptor sections such as `[package]`, `[permissions]`, richer `contributions`, or `runtime.kind = "declarative"` are aspirational and are intentionally rejected by the current strict parser until implemented safely.
 
 The `source` is not read from `plugin.toml`. It is assigned by the store that discovered the package.
 
@@ -104,11 +99,12 @@ Discovery is a read-only inventory operation. It may report package metadata, va
 
 Enablement is a resolved runtime plan. It should come from Profile/manifest configuration or another explicit local policy layer, then be recorded into the resolved Manifest/session metadata used to start the Pod. Restored Pods should use that resolved enabled-plugin plan instead of silently re-running fresh discovery and picking newer packages. Fresh discovery must not silently upgrade a restored Pod.
 
-A future enablement record can be shaped like this, but the exact schema belongs to the implementation Ticket:
+A minimal implemented enablement record is shaped like this. `version` is an exact package-version requirement; richer range constraints are deferred. `digest` is optional in authoring config, but fresh startup records the resolved digest into runtime metadata.
 
 ```toml
 [[plugins.enabled]]
 id = "user:example"
+version = "0.1.0"  # optional exact package-version requirement
 digest = "sha256:..." # optional pin in authoring, resolved in runtime metadata
 config = { level = "concise" }
 ```
