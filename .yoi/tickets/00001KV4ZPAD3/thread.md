@@ -137,3 +137,51 @@ Critical risks / reviewer focus:
 Routing decision と accepted implementation plan を記録済み。先行 `00001KV4ZDMV1` は merge/validation/done 済みで prior conflict/waiting reason は解消。blocking relation / unresolved orchestration-plan blocker はないため、implementation side effects の前に `queued -> inprogress` acceptance を記録する。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KV4ZPAD3 at: 2026-06-15T07:04:06Z -->
+
+## Implementation report
+
+Implementation report from Coder Pod `yoi-coder-00001KV4ZPAD3`:
+
+Commit:
+- `f3b435e7 fix: clarify panel ticket row hierarchy`
+
+Changed files:
+- `crates/tui/src/multi_pod.rs`
+- `crates/tui/src/workspace_panel.rs`
+
+Visual hierarchy decisions:
+- Ticket rows now use a clearer two-line structure:
+  - primary line uses selected `▶ ` marker and carries state + title
+  - secondary line uses `meta` label and selected `│ ` marker, making id/gate/action information clearly secondary
+- Ticket-associated Intake Pod rows now render as adjacent child rows:
+  - non-selected child marker: `  └ `
+  - selected child marker: `  ▶ `
+  - `live` / `restorable` / `stale` remains visible in status column
+  - title is `Intake Pod: <name>` without embedding tree glyphs in the ViewModel title
+- Selected Intake Pod status line now says `selected Intake Pod ...` instead of generic selected Pod wording.
+- No Ticket lifecycle, relation gate, action authority, persisted schema, polling, or spawn semantics were changed.
+
+Focused tests added/updated:
+- Ticket row rendering asserts primary vs secondary line structure.
+- Intake child row rendering asserts single-line child indentation/marker/status/title placement.
+- Selected Intake Pod target status asserts it is visually described as Intake-related, not generic Ticket or Pod.
+
+Validation reported by coder:
+- Passed: `cargo test -p tui workspace_panel --lib`
+- Passed: `cargo test -p tui panel_ticket --lib`
+- Passed: `cargo test -p tui selected_ticket_intake_child_status --lib`
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check`
+- Ran: `cargo test -p tui multi_pod --lib`
+  - Failed in pre-existing/unrelated workspace context tests:
+    - `tests::workspace_panel_spawns_orchestrator_with_workspace_context`
+    - `tests::workspace_panel_spawns_panel_orchestrator_with_workspace_context`
+  - Assertion mismatch concerns expected `/workspace` vs temp test workspace paths, not row rendering/selection changes.
+
+Residual risks:
+- No interactive `yoi panel` PTY session was run; visual evidence is covered by focused render/string tests.
+- Full `multi_pod` suite remains blocked by unrelated existing failures noted above.
+
+---
