@@ -246,3 +246,64 @@ Conclusion:
 - Changes requested. Do not integrate until these blockers are fixed and covered.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KV5R5V2S at: 2026-06-15T14:53:21Z -->
+
+## Implementation report
+
+Follow-up implementation report after reviewer request_changes:
+
+New commit:
+- `ede7acfd fix: pin plugin resolution metadata`
+
+Resolved blockers:
+
+1. Version mismatch support
+- Added typed exact-version requirement:
+  - `PluginExactVersion`
+  - `PluginEnablementConfig.version: Option<PluginExactVersion>`
+- Resolution now compares `plugins.enabled.version` against `package.manifest.version`.
+- Version mismatch fails closed with `PluginDiagnosticKind::Version`.
+- Unsupported plugin schema/API version now emits `PluginDiagnosticKind::Api`, distinct from package version mismatch.
+- Added focused test:
+  - `exact_version_mismatch_fails_closed_with_distinct_diagnostic`
+
+2. Startup/restore determinism
+- Added runtime resolved-plan metadata to `PluginConfig`:
+  - `resolved: Vec<ResolvedPluginRecord>`
+  - `diagnostics: Vec<PluginDiagnostic>`
+- Added `resolve_plugin_config_for_startup`.
+- Fresh startup resolves enabled plugins and records identity/path/label/digest/version/manifest/enabled surfaces/grants/config into manifest plugin config.
+- Restore/snapshot configs with an existing resolved plan are reused as-is and do not silently select newer mutable store contents.
+- Wired startup resolution into pod manifest resolution in `crates/pod/src/entrypoint.rs`.
+- Preserved resolved plugin plan through config merge.
+- Added focused test:
+  - `resolved_plan_pins_unpinned_enablement_for_restore`
+
+3. Safe bounded diagnostics
+- Replaced byte slicing in `bounded_message` with char-boundary truncation.
+- TOML parse diagnostics no longer embed raw untrusted manifest content; diagnostic reports bounded parse message with optional byte span.
+- Added focused multibyte malformed manifest test:
+  - `malformed_manifest_multibyte_diagnostic_is_bounded_and_redacted`
+
+4. Schema naming alignment
+- Plugin package manifest parser now uses `schema_version`, matching `docs/design/plugin-packages.md`.
+- Updated tests/helpers accordingly.
+- Updated design doc enablement example to include implemented exact `version` field and describe deferred richer constraints.
+
+Validation reported by coder:
+- Passed: `cargo fmt --check`
+- Passed: `cargo test -p manifest plugin`
+- Passed: `cargo test -p manifest`
+- Passed: `cargo check`
+- Passed: `cargo test -p pod spawn_pod`
+- Passed: `git diff --check`
+- Passed: `nix build .#yoi`
+
+Repository status:
+- Child implementation worktree clean after follow-up commit.
+
+Residual note:
+- Version constraints are intentionally minimal exact-version matching for this Ticket. Richer semantic/range constraints remain deferred and documented as follow-up scope.
+
+---
