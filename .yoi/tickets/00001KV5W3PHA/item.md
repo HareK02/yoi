@@ -1,11 +1,13 @@
 ---
 title: 'Plugin: register enabled Tool surface from packages'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-15T14:48:59Z'
-updated_at: '2026-06-15T14:50:28Z'
+updated_at: '2026-06-15T15:53:32Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['plugin', 'tool-registry', 'model-visible-schema', 'capability-boundary', 'profile-config']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-15T15:53:32Z'
 ---
 
 ## Background
