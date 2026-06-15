@@ -307,3 +307,68 @@ Residual note:
 - Version constraints are intentionally minimal exact-version matching for this Ticket. Richer semantic/range constraints remain deferred and documented as follow-up scope.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KV5R5V2S-r2 at: 2026-06-15T15:05:55Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+Evidence checked:
+- Child worktree only:
+  - `/home/hare/Projects/yoi/.worktree/00001KV5R5V2S-plugin-enable-resolver`
+  - HEAD `ede7acfd fix: pin plugin resolution metadata`
+  - base `4772c4d6`
+- Relevant files:
+  - `crates/manifest/src/plugin.rs`
+  - `crates/pod/src/entrypoint.rs`
+  - `crates/pod/src/pod.rs`
+  - `docs/design/plugin-packages.md`
+
+Validation performed by reviewer:
+- Passed: `git diff --check 4772c4d6..HEAD`
+- Passed: `cargo fmt --check`
+- `git status --short` clean
+
+Validation not run:
+- `cargo test`, `cargo check`, and `nix build` were not rerun because reviewer scope was read-only and those commands write build artifacts. Coder-reported results were treated as evidence only.
+
+Remaining blockers:
+
+1. Startup/restore determinism is incomplete for non-profile / spawn-config launches.
+
+Positive pieces exist:
+- `apply_plugin_resolution_plan()` resolves plugins during manifest resolution.
+- `resolve_plugin_config_for_startup()` skips fresh discovery when `plugins.resolved` or `plugins.diagnostics` already exists.
+- focused helper test confirms a restored resolved plan does not pick newer mutable store contents.
+
+Blocker:
+- resolved manifest snapshot is only persisted to Pod metadata when `self.manifest.profile.is_some()`.
+- Restore uses saved snapshot if present, otherwise falls back to freshly resolved current manifest.
+- A named Pod started from `--manifest` or spawn config can resolve plugin metadata at startup but fail to persist that resolved plan, then later restore can silently re-resolve against newer mutable store contents unless authoring config had digest pin.
+
+Required fix:
+- Persist the resolved manifest snapshot for plugin-resolved manifests regardless of `manifest.profile`, or otherwise make non-profile restore deterministically use the original resolved plan.
+- Add focused test/validation for the runtime persistence path, not only the helper behavior.
+
+2. Documentation examples still appear broader than the implemented strict parser.
+
+Resolved part:
+- `schema_version` naming is now consistent in implementation/tests/minimal docs.
+
+Remaining mismatch:
+- docs illustrative `plugin.toml` still includes fields/sections rejected by current `#[serde(deny_unknown_fields)]` parser, such as `[package]` and `[permissions]`.
+- docs describe `runtime.kind = "declarative"` as an initial value while implementation rejects runtime kinds other than `"wasm"`.
+
+Required fix:
+- Either mark those fields/sections as future/aspirational and provide a minimal currently-valid manifest example, or extend the parser to accept the documented first-pass fields safely.
+
+Prior blockers resolved:
+- Version mismatch support is resolved with exact-version field and distinct `Version` vs `Api` diagnostics.
+- Safe bounded diagnostics are mostly resolved with UTF-8-boundary truncation and redacted TOML parse diagnostics.
+- Discovery/enablement/no-registration boundaries look good.
+
+Conclusion:
+- Changes requested. Do not integrate until the non-profile/spawn restore determinism path and docs/parser mismatch are fixed and covered.
+
+---
