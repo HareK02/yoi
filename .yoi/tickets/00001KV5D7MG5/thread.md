@@ -151,3 +151,59 @@ Residual blockers:
 - None reported.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KV5D7MG5 at: 2026-06-15T13:04:06Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Evidence checked:
+- Inspected implementation diff `95abdc8d..e0ddbed1`.
+- Changed files reviewed:
+  - `crates/tui/src/workspace_panel.rs`
+  - `crates/tui/src/multi_pod.rs`
+- Worktree remained clean after read-only checks.
+
+Acceptance review:
+- Current branch remains primary authority:
+  - local Ticket summaries are loaded from the current workspace backend first;
+  - overlay data is joined by canonical Ticket id and stored separately in `PanelTicketInfo.orchestration_overlay`;
+  - `workflow_state` remains local/current-branch state and is not overwritten by overlay.
+- Overlay is read-only:
+  - overlay loading uses `LocalTicketBackend::list_partial()` against the orchestration worktree ticket root;
+  - no overlay writes or current-branch Ticket mutation path was found;
+  - test coverage includes local Ticket files not being mutated by overlay read.
+- Safety checks are appropriately conservative:
+  - expected configured/default orchestration path;
+  - path existence/directory check;
+  - canonical top-level comparison;
+  - expected branch check;
+  - same git common-dir check against current workspace.
+- Branch mismatch and missing worktree fall back safely.
+- Default orchestration config behavior is covered when no `[orchestration]` section is present.
+- Canonical Ticket id join is covered; unrelated overlay Tickets do not affect local rows.
+- Source-qualified display is present, e.g. `local: queued · orchestration: inprogress/done`.
+- Duplicate Queue/Start suppression is implemented for local `queued` with overlay `inprogress` or `done`.
+- `multi_pod` queued-work attention also suppresses already-progressed overlay work.
+- Overlay `done` / `closed` remains merge/review-pending information and does not grant close/merge/lifecycle authority.
+
+Validation performed by reviewer:
+- Passed: `git diff --check 95abdc8d..e0ddbed1`
+- Passed: `cargo fmt --check`
+- Passed: `git status --short` clean
+
+Validation not run by reviewer:
+- `cargo test -p tui workspace_panel --lib`
+- `cargo check -p tui --all-targets`
+
+Reason: review scope was read-only and Cargo writes build artifacts. Coder-reported passing results for those commands were inspected as evidence.
+
+Risk assessment:
+- Low residual risk. The main behavior is ViewModel-tested and safety checks are conservative.
+- Minor UI risk: compact status column may truncate long source-qualified overlay text, but the full model value and disabled/detail text carry overlay progress context.
+
+Conclusion:
+- Approved. No blocker found.
+
+---
