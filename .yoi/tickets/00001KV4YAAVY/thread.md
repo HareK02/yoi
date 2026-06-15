@@ -93,3 +93,68 @@ Critical risks / reviewer focus:
 Routing decision と accepted implementation plan を記録済み。blocking relation / unresolved OrchestrationPlan blocker はなく、single-Pod View work は同時に開始する Panel composer work と主対象が異なるため、implementation side effects の前に `queued -> inprogress` acceptance を記録する。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KV4YAAVY at: 2026-06-15T07:02:42Z -->
+
+## Implementation report
+
+Implementation report from Coder Pod `yoi-coder-00001KV4YAAVY`:
+
+Commit:
+- `09f5e9d5 feat: add single-pod text selection`
+
+Changed files:
+- `crates/tui/src/text_selection.rs`
+  - New transient selection state, coordinate mapping, extraction, and focused tests.
+- `crates/tui/src/app.rs`
+  - Local non-persistent selection state on `App`.
+- `crates/tui/src/ui.rs`
+  - Selectable history row metadata, highlight rendering, snapshot wiring, selectable/non-text tests.
+- `crates/tui/src/single_pod.rs`
+  - Drag mouse handling, `Esc` clear, `y` copy+clear, OSC52 copy, tests.
+- `crates/tui/src/lib.rs`
+  - Module registration.
+- `crates/tui/Cargo.toml`, `Cargo.lock`
+  - Added direct `base64` dependency for OSC52 clipboard payloads.
+
+Behavior / implementation decisions:
+- Selectable Items:
+  - `UserMessage`
+  - `SystemMessage`
+  - `AssistantText`
+- Non-text/tool Items:
+  - tool calls, thinking, stats, greetings, alerts, turn headers, etc. are not selectable/copyable through this path.
+  - extraction skips non-selectable rows.
+- Cross-item selection separator:
+  - copied text follows rendered row order and preserves selectable blank spacer rows, giving deterministic `\n\n` between adjacent text-like Items.
+- Copy target:
+  - terminal clipboard via OSC52 (`ESC ] 52 ; c ; base64 BEL`), not OS clipboard APIs.
+  - avoids adding platform clipboard runtime behavior.
+- Copy diagnostics:
+  - actionbar-only sanitized messages:
+    - success: `copied selected text to terminal clipboard`
+    - failure: `terminal clipboard write failed`
+  - no selected content appears in diagnostics.
+- Selection persistence:
+  - selection state/copied text remains TUI-local only.
+  - not appended to Pod history, model context, session logs, Ticket records, memory, or durable state.
+- Mouse tracking:
+  - single-Pod TUI now enables button-event drag tracking (`?1002h`) but not all-motion tracking (`?1003h`).
+  - Panel code was not changed.
+
+Validation reported by coder:
+- Passed: `cargo fmt --check`
+- Passed: `cargo check -p tui --all-targets`
+- Passed: `cargo test -p tui text_selection`
+- Passed: `cargo test -p tui single_pod::tests`
+- Passed: `cargo test -p tui ui::tests::history_rows_mark_text_items_selectable_and_non_text_unselectable`
+- Passed: `git diff --check`
+
+Repository status:
+- Child implementation worktree clean after commit.
+
+Residual risks / notes:
+- OSC52 clipboard success means sequence written/flushed; actual clipboard acceptance depends on terminal/multiplexer policy.
+- No real PTY/E2E validation was run; coverage is focused unit-level mouse/key/selection/render extraction behavior.
+
+---
