@@ -1,7 +1,12 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use protocol::PodStatus;
-use ticket::config::{TICKET_CONFIG_RELATIVE_PATH, TicketConfig};
+use ticket::config::{
+    DEFAULT_TICKET_BACKEND_RELATIVE_PATH, TICKET_CONFIG_RELATIVE_PATH, TicketConfig,
+    TicketOrchestrationConfig,
+};
 use ticket::{
     LocalTicketBackend, TicketBackend, TicketError, TicketEvent, TicketFilter, TicketIdOrSlug,
     TicketInvalidRecord, TicketMeta, TicketRelationBlocker, TicketSummary, TicketWorkflowState,
@@ -242,6 +247,7 @@ pub(crate) struct TicketPanelEntry {
     pub(crate) priority: String,
     pub(crate) workflow_state: TicketWorkflowState,
     pub(crate) workflow_state_explicit: bool,
+    pub(crate) orchestration_overlay: Option<TicketStateOverlay>,
     pub(crate) next_action: Option<NextUserAction>,
     pub(crate) updated_at: Option<String>,
     pub(crate) latest_event_kind: Option<String>,
@@ -250,6 +256,12 @@ pub(crate) struct TicketPanelEntry {
     pub(crate) related_pods: Vec<String>,
     pub(crate) local_claim: Option<TicketLocalClaimEntry>,
     pub(crate) intake_pods: Vec<TicketAssociatedIntakeEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TicketStateOverlay {
+    pub(crate) source: String,
+    pub(crate) workflow_state: TicketWorkflowState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,6 +389,27 @@ pub(crate) enum OrchestratorLifecyclePlan {
     Restore,
     Spawn,
     Unavailable(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrchestrationTicketOverlay {
+    states: BTreeMap<String, TicketStateOverlay>,
+    diagnostics: Vec<String>,
+}
+
+impl OrchestrationTicketOverlay {
+    fn empty() -> Self {
+        Self {
+            states: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrchestrationWorktreeLayout {
+    path: PathBuf,
+    branch: String,
 }
 
 pub(crate) fn workspace_companion_pod_name(workspace_root: &Path) -> String {
@@ -543,6 +576,161 @@ pub(crate) fn bounded_panel_diagnostic(message: impl AsRef<str>) -> String {
     excerpt(&collapsed, 180).unwrap_or_else(|| "unknown diagnostic".to_string())
 }
 
+fn load_orchestration_ticket_overlay(
+    workspace_root: &Path,
+    config: &TicketConfig,
+) -> OrchestrationTicketOverlay {
+    let layout = orchestration_worktree_layout(workspace_root, &config.orchestration);
+    if !layout.path.exists() {
+        return OrchestrationTicketOverlay::empty();
+    }
+    match validate_orchestration_overlay_source(workspace_root, &layout) {
+        Ok(()) => {
+            load_orchestration_ticket_overlay_states(&layout.path, config.ticket_record_language())
+                .unwrap_or_else(|message| OrchestrationTicketOverlay {
+                    states: BTreeMap::new(),
+                    diagnostics: vec![bounded_panel_diagnostic(format!(
+                        "Orchestration Ticket overlay unavailable: {message}"
+                    ))],
+                })
+        }
+        Err(message) => OrchestrationTicketOverlay {
+            states: BTreeMap::new(),
+            diagnostics: vec![bounded_panel_diagnostic(format!(
+                "Orchestration Ticket overlay unavailable: {message}"
+            ))],
+        },
+    }
+}
+
+fn orchestration_worktree_layout(
+    workspace_root: &Path,
+    config: &TicketOrchestrationConfig,
+) -> OrchestrationWorktreeLayout {
+    OrchestrationWorktreeLayout {
+        path: workspace_root
+            .join(config.worktree_dir())
+            .join(config.worktree_name()),
+        branch: config.effective_branch_name().to_string(),
+    }
+}
+
+fn load_orchestration_ticket_overlay_states(
+    worktree_root: &Path,
+    record_language: Option<&str>,
+) -> Result<OrchestrationTicketOverlay, String> {
+    let ticket_root = worktree_root.join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH);
+    if !ticket_root.is_dir() {
+        return Ok(OrchestrationTicketOverlay {
+            states: BTreeMap::new(),
+            diagnostics: vec![bounded_panel_diagnostic(format!(
+                "Orchestration worktree has no {} directory",
+                DEFAULT_TICKET_BACKEND_RELATIVE_PATH
+            ))],
+        });
+    }
+    let backend = LocalTicketBackend::new(ticket_root).with_record_language(record_language);
+    let partial = backend
+        .list_partial(TicketFilter::all())
+        .map_err(|error| error.to_string())?;
+    let mut states = BTreeMap::new();
+    for summary in partial.tickets {
+        states.insert(
+            summary.id,
+            TicketStateOverlay {
+                source: "orchestration".to_string(),
+                workflow_state: summary.workflow_state,
+            },
+        );
+    }
+    let diagnostics = invalid_ticket_diagnostics(partial.invalid_records.len());
+    Ok(OrchestrationTicketOverlay {
+        states,
+        diagnostics,
+    })
+}
+
+fn validate_orchestration_overlay_source(
+    workspace_root: &Path,
+    layout: &OrchestrationWorktreeLayout,
+) -> Result<(), String> {
+    if !layout.path.exists() {
+        return Err(format!(
+            "expected worktree {} does not exist",
+            layout.path.display()
+        ));
+    }
+    if !layout.path.is_dir() {
+        return Err(format!(
+            "expected worktree {} is not a directory",
+            layout.path.display()
+        ));
+    }
+    let expected_path = layout
+        .path
+        .canonicalize()
+        .map_err(|error| format!("could not canonicalize expected worktree: {error}"))?;
+    let overlay_top = git_output(&layout.path, &["rev-parse", "--show-toplevel"])?;
+    let overlay_top = PathBuf::from(overlay_top);
+    let overlay_top = overlay_top
+        .canonicalize()
+        .map_err(|error| format!("could not canonicalize overlay git top-level: {error}"))?;
+    if overlay_top != expected_path {
+        return Err(format!(
+            "overlay git top-level {} does not match expected path {}",
+            overlay_top.display(),
+            expected_path.display()
+        ));
+    }
+
+    let current_common_dir = git_common_dir(workspace_root)?;
+    let overlay_common_dir = git_common_dir(&layout.path)?;
+    if current_common_dir != overlay_common_dir {
+        return Err("expected worktree is from a different git common-dir".to_string());
+    }
+
+    let overlay_branch = git_output(&layout.path, &["branch", "--show-current"])?;
+    if overlay_branch != layout.branch {
+        return Err(format!(
+            "expected branch {} but worktree is on {}",
+            layout.branch, overlay_branch
+        ));
+    }
+
+    Ok(())
+}
+
+fn git_common_dir(worktree_root: &Path) -> Result<PathBuf, String> {
+    let common_dir = git_output(worktree_root, &["rev-parse", "--git-common-dir"])?;
+    let common_dir_path = PathBuf::from(common_dir);
+    let absolute = if common_dir_path.is_absolute() {
+        common_dir_path
+    } else {
+        worktree_root.join(common_dir_path)
+    };
+    absolute
+        .canonicalize()
+        .map_err(|error| format!("could not canonicalize git common-dir: {error}"))
+}
+
+fn git_output(worktree_root: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(worktree_root)
+        .output()
+        .map_err(|error| format!("could not run git {}: {error}", args.join(" ")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let message = if stderr.is_empty() {
+            format!("git {} exited with {}", args.join(" "), output.status)
+        } else {
+            format!("git {} failed: {stderr}", args.join(" "))
+        };
+        return Err(message);
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 pub(crate) fn build_workspace_panel(
     workspace_root: &Path,
     pods: &PodList,
@@ -595,10 +783,17 @@ fn build_workspace_panel_with_registry_model(
                     model.header.ticket_root = config.backend_root().to_path_buf();
                     let backend = LocalTicketBackend::new(config.backend_root().to_path_buf())
                         .with_record_language(config.ticket_record_language());
-                    match build_ticket_rows(&backend, pods, registry) {
+                    let orchestration_overlay =
+                        load_orchestration_ticket_overlay(workspace_root, &config);
+                    match build_ticket_rows(&backend, pods, registry, &orchestration_overlay.states)
+                    {
                         Ok(ticket_rows) => {
                             model.rows.extend(ticket_rows.rows);
                             model.header.diagnostics.extend(ticket_rows.diagnostics);
+                            model
+                                .header
+                                .diagnostics
+                                .extend(orchestration_overlay.diagnostics);
                         }
                         Err(error) => {
                             model
@@ -652,6 +847,7 @@ pub(crate) fn build_current_ticket_row(
         &ticket.relations.blockers,
         pods,
         &registry,
+        None,
     ))
 }
 
@@ -683,6 +879,7 @@ fn build_ticket_rows(
     backend: &LocalTicketBackend,
     pods: &PodList,
     registry: &PanelRegistrySnapshot,
+    orchestration_overlay: &BTreeMap<String, TicketStateOverlay>,
 ) -> ticket::Result<TicketRowsBuild> {
     let partial = backend.list_partial(TicketFilter::all())?;
     let mut ticket_rows = Vec::new();
@@ -701,12 +898,14 @@ fn build_ticket_rows(
                 if current_ticket_invalid {
                     continue;
                 }
+                let overlay = orchestration_overlay.get(&summary.id);
                 ticket_rows.push(ticket_row(
                     summary,
                     &ticket.ticket.events,
                     &ticket.ticket.relations.blockers,
                     pods,
                     registry,
+                    overlay,
                 ));
             }
             Err(_) => invalid_records.push(TicketInvalidRecord {
@@ -802,6 +1001,7 @@ fn ticket_row(
     relation_blockers: &[TicketRelationBlocker],
     pods: &PodList,
     registry: &PanelRegistrySnapshot,
+    orchestration_overlay: Option<&TicketStateOverlay>,
 ) -> PanelRow {
     let local_claim = local_claim_for_ticket(&summary, pods, registry);
     let intake_pods =
@@ -815,14 +1015,24 @@ fn ticket_row(
             related_pods.push(pod_name);
         }
     }
-    let derived = derive_ticket_state(&summary, relation_blockers);
+    let visible_overlay = orchestration_overlay
+        .filter(|overlay| {
+            overlay_state_has_progressed(summary.workflow_state, overlay.workflow_state)
+        })
+        .cloned();
+    let mut derived = derive_ticket_state(&summary, relation_blockers);
+    if let Some(overlay) = visible_overlay.as_ref() {
+        apply_orchestration_overlay_to_derived(&mut derived, summary.workflow_state, overlay);
+    }
     let latest_event = events.last();
+    let state_display = ticket_state_display(summary.workflow_state, visible_overlay.as_ref());
     let entry = TicketPanelEntry {
         id: summary.id.clone(),
         title: summary.title.clone(),
         priority: summary.priority.clone(),
         workflow_state: summary.workflow_state,
         workflow_state_explicit: summary.workflow_state_explicit,
+        orchestration_overlay: visible_overlay,
         next_action: derived.action,
         updated_at: summary.updated_at.clone(),
         latest_event_kind: latest_event.map(|event| event.kind.as_str().to_string()),
@@ -838,7 +1048,7 @@ fn ticket_row(
         kind: derived.kind,
         title: summary.title,
         subtitle,
-        status: summary.workflow_state.as_str().to_string(),
+        status: state_display,
         priority: derived.priority,
         next_action: derived.action,
         ticket: Some(entry),
@@ -856,6 +1066,76 @@ struct DerivedTicketState {
     disabled_reason: Option<String>,
     key_hint: Option<String>,
     blocked_reason: Option<String>,
+}
+
+fn workflow_state_progress_rank(state: TicketWorkflowState) -> u8 {
+    match state {
+        TicketWorkflowState::Planning => 0,
+        TicketWorkflowState::Ready => 1,
+        TicketWorkflowState::Queued => 2,
+        TicketWorkflowState::InProgress => 3,
+        TicketWorkflowState::Done => 4,
+        TicketWorkflowState::Closed => 5,
+    }
+}
+
+fn overlay_state_has_progressed(local: TicketWorkflowState, overlay: TicketWorkflowState) -> bool {
+    workflow_state_progress_rank(overlay) > workflow_state_progress_rank(local)
+}
+
+fn ticket_state_display(
+    local: TicketWorkflowState,
+    overlay: Option<&TicketStateOverlay>,
+) -> String {
+    match overlay {
+        Some(overlay) => format!(
+            "local: {} · {}: {}",
+            local.as_str(),
+            overlay.source,
+            overlay.workflow_state.as_str()
+        ),
+        None => local.as_str().to_string(),
+    }
+}
+
+fn apply_orchestration_overlay_to_derived(
+    derived: &mut DerivedTicketState,
+    local: TicketWorkflowState,
+    overlay: &TicketStateOverlay,
+) {
+    derived.action = Some(NextUserAction::Wait);
+    let overlay_state = overlay.workflow_state.as_str();
+    match overlay.workflow_state {
+        TicketWorkflowState::Done | TicketWorkflowState::Closed => {
+            derived.kind = PanelRowKind::Review;
+            derived.priority = ActionPriority::Background;
+            derived.disabled_reason = Some(format!(
+                "{} worktree overlay shows Ticket state {overlay_state}; local state remains {} until merge/review/close authority updates the current branch.",
+                overlay.source,
+                local.as_str()
+            ));
+            derived.key_hint = Some(format!(
+                "Merge pending: local: {} · {}: {overlay_state}",
+                local.as_str(),
+                overlay.source
+            ));
+        }
+        TicketWorkflowState::InProgress | TicketWorkflowState::Queued => {
+            derived.kind = PanelRowKind::ActiveWork;
+            derived.priority = ActionPriority::ActiveWork;
+            derived.disabled_reason = Some(format!(
+                "{} worktree overlay shows Ticket state {overlay_state}; local state remains {} and duplicate queue/start actions are suppressed.",
+                overlay.source,
+                local.as_str()
+            ));
+            derived.key_hint = Some(format!(
+                "Progress overlay: local: {} · {}: {overlay_state}",
+                local.as_str(),
+                overlay.source
+            ));
+        }
+        TicketWorkflowState::Planning | TicketWorkflowState::Ready => {}
+    }
 }
 
 fn derive_ticket_state(
@@ -1099,7 +1379,11 @@ pub(crate) fn local_claim_status_for_pod(pod_name: &str, pods: &PodList) -> Tick
 }
 
 fn ticket_subtitle(entry: &TicketPanelEntry) -> Option<String> {
-    let mut parts = vec![format!("{} · {}", entry.id, entry.workflow_state.as_str())];
+    let mut parts = vec![format!(
+        "{} · {}",
+        entry.id,
+        ticket_state_display(entry.workflow_state, entry.orchestration_overlay.as_ref())
+    )];
     if let Some(claim) = entry.local_claim.as_ref() {
         parts.push(format!(
             "claim: {} ({})",
@@ -1212,7 +1496,10 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
-    use ticket::{NewTicket, NewTicketRelation, TicketRelationKind, TicketWorkflowState};
+    use ticket::{
+        NewTicket, NewTicketRelation, TicketIdOrSlug, TicketRelationKind, TicketStateChange,
+        TicketWorkflowState,
+    };
 
     fn empty_pods() -> PodList {
         PodList::from_sources(
@@ -1229,9 +1516,17 @@ mod tests {
         title: &str,
         configure: impl FnOnce(&mut NewTicket),
     ) {
+        create_ticket_with_id(backend, title, configure);
+    }
+
+    fn create_ticket_with_id(
+        backend: &LocalTicketBackend,
+        title: &str,
+        configure: impl FnOnce(&mut NewTicket),
+    ) -> String {
         let mut input = NewTicket::new(title);
         configure(&mut input);
-        backend.create(input).unwrap();
+        backend.create(input).unwrap().id
     }
 
     fn write_ticket_config(workspace_root: &Path) {
@@ -1242,6 +1537,111 @@ mod tests {
             "[backend]\nprovider = \"builtin:yoi_local\"\nroot = \".yoi/tickets\"\n",
         )
         .unwrap();
+    }
+
+    fn run_git(workspace_root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(workspace_root)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run git {args:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_git_repo(workspace_root: &Path) {
+        run_git(workspace_root, &["init", "--initial-branch", "main"]);
+        run_git(workspace_root, &["config", "user.name", "Panel Test"]);
+        run_git(
+            workspace_root,
+            &["config", "user.email", "panel-test@example.invalid"],
+        );
+        fs::write(workspace_root.join("README.md"), "panel test\n").unwrap();
+        run_git(workspace_root, &["add", "README.md"]);
+        run_git(workspace_root, &["commit", "-m", "init"]);
+    }
+
+    fn add_orchestration_worktree(workspace_root: &Path, branch: &str) -> PathBuf {
+        let orchestration_root = workspace_root.join(".worktree/orchestration");
+        fs::create_dir_all(orchestration_root.parent().unwrap()).unwrap();
+        run_git(
+            workspace_root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                orchestration_root.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        orchestration_root
+    }
+
+    fn copy_ticket_to_overlay(workspace_root: &Path, orchestration_root: &Path, id: &str) {
+        let local_ticket_dir = workspace_root.join(".yoi/tickets").join(id);
+        let overlay_ticket_dir = orchestration_root.join(".yoi/tickets").join(id);
+        fs::create_dir_all(overlay_ticket_dir.parent().unwrap()).unwrap();
+        fs::create_dir_all(&overlay_ticket_dir).unwrap();
+        fs::copy(
+            local_ticket_dir.join("item.md"),
+            overlay_ticket_dir.join("item.md"),
+        )
+        .unwrap();
+        let local_thread = local_ticket_dir.join("thread.md");
+        if local_thread.exists() {
+            fs::copy(local_thread, overlay_ticket_dir.join("thread.md")).unwrap();
+        }
+    }
+
+    fn set_ticket_state(backend: &LocalTicketBackend, id: &str, state: TicketWorkflowState) {
+        loop {
+            let ticket = backend.show(TicketIdOrSlug::Id(id.to_string())).unwrap();
+            if ticket.meta.workflow_state == state {
+                break;
+            }
+            let next = match (ticket.meta.workflow_state, state) {
+                (TicketWorkflowState::Queued, TicketWorkflowState::InProgress)
+                | (TicketWorkflowState::Queued, TicketWorkflowState::Done) => {
+                    TicketWorkflowState::InProgress
+                }
+                (TicketWorkflowState::InProgress, TicketWorkflowState::Done) => {
+                    TicketWorkflowState::Done
+                }
+                (from, to) => panic!("unsupported test transition {from} -> {to}"),
+            };
+            backend
+                .set_workflow_state(
+                    TicketIdOrSlug::Id(id.to_string()),
+                    TicketStateChange::new(
+                        ticket.meta.workflow_state.as_str(),
+                        next.as_str(),
+                        "test",
+                        format!("test state -> {}", next.as_str()),
+                    ),
+                )
+                .unwrap();
+        }
+    }
+
+    fn ticket_row_by_title<'a>(model: &'a WorkspacePanelViewModel, title: &str) -> &'a PanelRow {
+        model
+            .rows
+            .iter()
+            .find(|row| row.title == title)
+            .unwrap_or_else(|| panic!("missing row for {title}"))
+    }
+
+    fn status_contains(row: &PanelRow, needle: &str) {
+        assert!(
+            row.status.contains(needle),
+            "status {:?} did not contain {:?}",
+            row.status,
+            needle
+        );
     }
 
     fn live_pods(names: &[&str]) -> PodList {
@@ -1306,6 +1706,151 @@ mod tests {
         assert_eq!(row.status, "ready");
         assert_eq!(row.priority, ActionPriority::ReadyForQueue);
         assert_eq!(row.next_action, Some(NextUserAction::Queue));
+    }
+
+    #[test]
+    fn workspace_panel_joins_orchestration_overlay_by_ticket_id() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+        write_ticket_config(temp.path());
+        let orchestration_root = add_orchestration_worktree(temp.path(), "orchestration");
+        let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
+        let id = create_ticket_with_id(&backend, "Overlay Match", |input| {
+            input.workflow_state = Some(TicketWorkflowState::Queued);
+        });
+        create_ticket(&backend, "Local Only", |input| {
+            input.workflow_state = Some(TicketWorkflowState::Queued);
+        });
+        copy_ticket_to_overlay(temp.path(), &orchestration_root, &id);
+        let overlay_backend = LocalTicketBackend::new(orchestration_root.join(".yoi/tickets"));
+        set_ticket_state(&overlay_backend, &id, TicketWorkflowState::InProgress);
+        create_ticket(&overlay_backend, "Overlay Only", |input| {
+            input.workflow_state = Some(TicketWorkflowState::Done);
+        });
+
+        let model = build_workspace_panel(temp.path(), &empty_pods());
+
+        let matched = ticket_row_by_title(&model, "Overlay Match");
+        status_contains(matched, "local: queued");
+        status_contains(matched, "orchestration: inprogress");
+        assert_eq!(
+            matched.ticket.as_ref().unwrap().workflow_state,
+            TicketWorkflowState::Queued
+        );
+        assert_eq!(
+            matched
+                .ticket
+                .as_ref()
+                .unwrap()
+                .orchestration_overlay
+                .as_ref()
+                .unwrap()
+                .workflow_state,
+            TicketWorkflowState::InProgress
+        );
+        assert_eq!(ticket_row_by_title(&model, "Local Only").status, "queued");
+        assert!(model.rows.iter().all(|row| row.title != "Overlay Only"));
+    }
+
+    #[test]
+    fn workspace_panel_displays_queued_plus_orchestration_inprogress_without_mutating_local_ticket()
+    {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+        write_ticket_config(temp.path());
+        let orchestration_root = add_orchestration_worktree(temp.path(), "orchestration");
+        let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
+        let id = create_ticket_with_id(&backend, "Overlay In Progress", |input| {
+            input.workflow_state = Some(TicketWorkflowState::Queued);
+        });
+        copy_ticket_to_overlay(temp.path(), &orchestration_root, &id);
+        let overlay_backend = LocalTicketBackend::new(orchestration_root.join(".yoi/tickets"));
+        set_ticket_state(&overlay_backend, &id, TicketWorkflowState::InProgress);
+        let local_item = temp.path().join(".yoi/tickets").join(&id).join("item.md");
+        let before = fs::read_to_string(&local_item).unwrap();
+
+        let model = build_workspace_panel(temp.path(), &empty_pods());
+
+        let row = ticket_row_by_title(&model, "Overlay In Progress");
+        status_contains(row, "local: queued");
+        status_contains(row, "orchestration: inprogress");
+        assert_eq!(row.next_action, Some(NextUserAction::Wait));
+        assert_eq!(row.kind, PanelRowKind::ActiveWork);
+        assert_eq!(fs::read_to_string(&local_item).unwrap(), before);
+        let local_ticket = backend.show(TicketIdOrSlug::Id(id)).unwrap();
+        assert_eq!(
+            local_ticket.meta.workflow_state,
+            TicketWorkflowState::Queued
+        );
+    }
+
+    #[test]
+    fn workspace_panel_displays_queued_plus_orchestration_done_as_merge_pending_without_queue() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+        write_ticket_config(temp.path());
+        let orchestration_root = add_orchestration_worktree(temp.path(), "orchestration");
+        let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
+        let id = create_ticket_with_id(&backend, "Overlay Done", |input| {
+            input.workflow_state = Some(TicketWorkflowState::Queued);
+        });
+        copy_ticket_to_overlay(temp.path(), &orchestration_root, &id);
+        let overlay_backend = LocalTicketBackend::new(orchestration_root.join(".yoi/tickets"));
+        set_ticket_state(&overlay_backend, &id, TicketWorkflowState::Done);
+
+        let model = build_workspace_panel(temp.path(), &empty_pods());
+
+        let row = ticket_row_by_title(&model, "Overlay Done");
+        status_contains(row, "local: queued");
+        status_contains(row, "orchestration: done");
+        assert_eq!(row.kind, PanelRowKind::Review);
+        assert_eq!(row.next_action, Some(NextUserAction::Wait));
+        assert_ne!(row.next_action, Some(NextUserAction::Queue));
+        assert!(
+            row.disabled_reason
+                .as_deref()
+                .unwrap()
+                .contains("merge/review/close authority")
+        );
+    }
+
+    #[test]
+    fn workspace_panel_ignores_orchestration_overlay_on_branch_mismatch() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+        write_ticket_config(temp.path());
+        let orchestration_root = add_orchestration_worktree(temp.path(), "other-branch");
+        let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
+        let id = create_ticket_with_id(&backend, "Branch Mismatch", |input| {
+            input.workflow_state = Some(TicketWorkflowState::Queued);
+        });
+        copy_ticket_to_overlay(temp.path(), &orchestration_root, &id);
+        let overlay_backend = LocalTicketBackend::new(orchestration_root.join(".yoi/tickets"));
+        set_ticket_state(&overlay_backend, &id, TicketWorkflowState::Done);
+
+        let model = build_workspace_panel(temp.path(), &empty_pods());
+
+        let row = ticket_row_by_title(&model, "Branch Mismatch");
+        assert_eq!(row.status, "queued");
+        assert!(row.ticket.as_ref().unwrap().orchestration_overlay.is_none());
+        let diagnostics = model.header.diagnostics.join("\n");
+        assert!(diagnostics.contains("expected branch orchestration"));
+    }
+
+    #[test]
+    fn workspace_panel_falls_back_when_orchestration_worktree_is_missing() {
+        let temp = TempDir::new().unwrap();
+        write_ticket_config(temp.path());
+        let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
+        create_ticket(&backend, "Missing Overlay", |input| {
+            input.workflow_state = Some(TicketWorkflowState::Queued);
+        });
+
+        let model = build_workspace_panel(temp.path(), &empty_pods());
+
+        let row = ticket_row_by_title(&model, "Missing Overlay");
+        assert_eq!(row.status, "queued");
+        assert!(row.ticket.as_ref().unwrap().orchestration_overlay.is_none());
     }
 
     #[test]
