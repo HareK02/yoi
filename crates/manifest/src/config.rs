@@ -84,6 +84,8 @@ pub struct FeatureConfigPartial {
     pub ticket: Option<TicketFeatureConfigPartial>,
     #[serde(default)]
     pub ticket_orchestration: Option<FeatureFlagConfigPartial>,
+    #[serde(default)]
+    pub plugins: Option<FeatureFlagConfigPartial>,
 }
 
 impl FeatureConfigPartial {
@@ -99,6 +101,7 @@ impl FeatureConfigPartial {
                 other.ticket_orchestration,
                 FeatureFlagConfigPartial::merge,
             ),
+            plugins: merge_option(self.plugins, other.plugins, FeatureFlagConfigPartial::merge),
         }
     }
 }
@@ -152,6 +155,10 @@ impl From<FeatureConfigPartial> for FeatureConfig {
                 .ticket_orchestration
                 .map(FeatureFlagConfig::from)
                 .unwrap_or_default(),
+            plugins: value
+                .plugins
+                .map(FeatureFlagConfig::from)
+                .unwrap_or_default(),
         }
     }
 }
@@ -199,6 +206,7 @@ impl From<FeatureConfig> for FeatureConfigPartial {
             pods: Some(value.pods.into()),
             ticket: Some(value.ticket.into()),
             ticket_orchestration: Some(value.ticket_orchestration.into()),
+            plugins: Some(value.plugins.into()),
         }
     }
 }

@@ -107,6 +107,8 @@ pub struct FeatureConfig {
     pub ticket: TicketFeatureConfig,
     #[serde(default)]
     pub ticket_orchestration: FeatureFlagConfig,
+    #[serde(default)]
+    pub plugins: FeatureFlagConfig,
 }
 
 impl Default for FeatureConfig {
@@ -118,6 +120,7 @@ impl Default for FeatureConfig {
             pods: FeatureFlagConfig::disabled(),
             ticket: TicketFeatureConfig::default(),
             ticket_orchestration: FeatureFlagConfig::disabled(),
+            plugins: FeatureFlagConfig::disabled(),
         }
     }
 }
