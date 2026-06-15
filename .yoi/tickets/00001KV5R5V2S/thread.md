@@ -471,3 +471,57 @@ Conclusion:
 - Approved. No remaining blocker found.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-15T15:30:00Z -->
+
+## Implementation report
+
+Integration report:
+
+Merged implementation branch into orchestration branch:
+- branch: `impl/00001KV5R5V2S-plugin-enable-resolver`
+- implementation commits:
+  - `a03a9da6 feat: add plugin package resolver`
+  - `ede7acfd fix: pin plugin resolution metadata`
+  - `07978d2d fix: persist plugin snapshots for restore`
+- merge commit: `f678383a merge: plugin package resolver`
+
+Reviewer result:
+- Initial review requested changes for version mismatch support, restore determinism, UTF-8-safe diagnostics, and docs/parser mismatch.
+- Second review requested changes for non-profile/spawn restore determinism and docs/parser mismatch.
+- Third-pass review `approve` recorded from `yoi-reviewer-00001KV5R5V2S-r3`.
+
+Validation in Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration`:
+- Passed: `cargo fmt --check`
+- Passed: `cargo test -p manifest plugin`
+  - 19 passed
+- Passed: `cargo test -p manifest`
+  - 54 passed
+- Passed: `cargo test -p pod plugin_resolved_manifest_snapshot_is_persisted_without_profile`
+  - 1 passed
+- Passed: `cargo test -p pod spawn_pod`
+  - 7 passed
+- Passed: `cargo check`
+- Passed: `git diff --check`
+- Passed: `nix build .#yoi --no-link`
+
+Outcome:
+- Plugin package discovery and explicit enablement resolver are implemented as typed manifest-layer functionality.
+- Discovery remains inactive/read-only without explicit enablement.
+- Resolved plugin metadata/digests can be snapshotted for restore determinism, including non-profile/plugin-resolved manifests.
+- No runtime Tool/Hook/Service/Ingress registration or plugin execution path was added.
+- Package safety, source-qualified identity, exact version pins, digest pins, bounded diagnostics, and strict docs/parser alignment are covered by focused tests.
+
+Cleanup planned:
+- Stop related coder/reviewer Pods.
+- Remove only child implementation worktree/branch for this Ticket.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-15T15:30:00Z from: inprogress to: done reason: merged_validated field: state -->
+
+## State changed
+
+Reviewer approved after requested fixes, implementation branch merged into the orchestration branch, and focused plus packaging validation passed in the Orchestrator worktree. Marking Ticket done in the orchestration branch.
+
+---
