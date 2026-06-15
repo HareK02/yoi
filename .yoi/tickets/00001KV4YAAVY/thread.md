@@ -264,3 +264,23 @@ Cleanup planned:
 Reviewer approved, implementation branch merged into the orchestration branch, integration validation passed including Nix package hash refresh, and focused validation passed in the Orchestrator worktree. Marking Ticket done in the orchestration branch.
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-15T14:59:40Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-15T14:59:40Z status: closed -->
+
+## 完了
+
+Ticket `00001KV4YAAVY` (`single-Pod View Item text をマウスドラッグで選択・コピーできるようにする`) はすでに `state: done` に到達していたため、workspace Panel から close しました。
+
+この Close action によって、実装作業、state 変更、Orchestrator/Companion launch、worker invocation は開始されていません。
+
+
+---
