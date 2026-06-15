@@ -129,3 +129,90 @@ Routing decision と accepted implementation/evidence plan を記録済み。blo
 
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KV5MRH6D at: 2026-06-15T14:31:11Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Evidence checked:
+- Reviewed child worktree diff `4772c4d6..9bad2745`.
+- Reviewed changed files:
+  - `.yoi/tickets/00001KV5MRH6D/item.md`
+  - `.yoi/tickets/00001KV5MRH6D/thread.md`
+  - `crates/tui/src/multi_pod.rs`
+  - `crates/tui/src/single_pod.rs`
+  - `tests/e2e/tests/panel.rs`
+- Worktree was clean and at expected branch/commit.
+
+Acceptance review:
+- E2E uses real `yoi panel` process under PTY fixture, not unit-only coverage.
+- First visible render is explicitly measured and asserted via `panel_first_visible_render_arrives_before_background_reload` with a 1500ms budget.
+- Full-ready/background work is separately measured via `panel_full_ready_has_separate_startup_budget` with its own budget and ready-row assertion.
+- The implementation defers the initial background reload until after the first loading frame is queued/drawn; it does not fake Ticket/Pod/Orchestrator state.
+- The tests use a held reload barrier to prove first visible rendering happens before background reload unblocks.
+- Background reload correctness is preserved by waiting for rows/actions after the barrier.
+- The reported before/after evidence and thread update correctly explain that fixture E2E did not reproduce the live ~7s delay and that live/manual confirmation remains a residual gap.
+- Existing no-provider/no-network style E2E isolation is preserved; no provider/secret/network dependency was introduced.
+- The mouse capture adjustment avoids drag/full-motion capture modes while preserving SGR normal mouse tracking, matching recent Panel mouse invariants.
+- No Ticket workflow, Pod restore/spawn authority, Orchestrator queue, scheduler, or lease semantics were changed.
+
+Validation performed by reviewer:
+- Passed: `git diff --check 4772c4d6..9bad2745`
+- Passed: `cargo fmt --check`
+- Worktree stayed clean.
+
+Validation not run by reviewer:
+- E2E/cargo test commands were not rerun because review scope was read-only and they write build artifacts. Coder-reported validation was inspected as evidence.
+
+Conclusion:
+- Approved. No blocker remains.
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-15T14:31:28Z -->
+
+## Implementation report
+
+Integration report:
+
+Merged implementation/evidence branch into orchestration branch:
+- branch: `impl/00001KV5MRH6D-panel-startup-latency`
+- implementation commit: `9bad2745 fix: measure and defer panel startup reload`
+- merge commit: `6f99ebed merge: panel startup latency e2e`
+
+Reviewer result:
+- `approve` recorded from `yoi-reviewer-00001KV5MRH6D`.
+
+Validation in Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration`:
+- Passed: `cargo fmt --check`
+- Passed: `cargo test -p yoi-e2e --features e2e --no-run`
+- Passed: `cargo test -p yoi-e2e --features e2e`
+  - yoi-e2e lib: 1 passed
+  - panel E2E: 5 passed
+  - rewind E2E: 1 passed
+- Passed: `cargo check -p yoi-e2e -p yoi -p tui`
+- Passed: `cargo test -p tui single_pod_mouse_capture_avoids_drag_and_all_motion_modes`
+  - 1 passed
+- Passed: `git diff --check`
+
+Evidence outcome:
+- First visible render is asserted within 1500ms through real `yoi panel` PTY fixture.
+- Full-ready/background row availability is asserted separately within 5s.
+- Initial reload/observation is deferred until after first loading frame; state/diagnostics are not faked or skipped.
+- Fixture did not reproduce the live ~7s startup delay, so live/manual confirmation remains a documented gap.
+
+Cleanup planned:
+- Stop related coder/reviewer Pods.
+- Remove only child implementation worktree/branch for this Ticket.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-15T14:31:28Z from: inprogress to: done reason: merged_validated field: state -->
+
+## State changed
+
+Reviewer approved, implementation/evidence branch merged into the orchestration branch, and E2E-focused validation passed in the Orchestrator worktree. Marking Ticket done in the orchestration branch.
+
+---
