@@ -924,11 +924,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     }
 
     fn pod_metadata(&self, active: Option<PodActiveSegmentRef>) -> PodMetadata {
-        let mut metadata = PodMetadata::new(self.manifest.pod.name.clone(), active);
-        if self.manifest.profile.is_some() {
-            metadata.resolved_manifest_snapshot = serde_json::to_value(&self.manifest).ok();
-        }
-        metadata
+        pod_metadata_for_manifest(&self.manifest, active)
     }
 
     fn write_pod_metadata_pending(&self) -> Result<(), PodError> {
@@ -4321,6 +4317,21 @@ fn request_config_from_worker_manifest(wm: &WorkerManifest) -> RequestConfig {
     config
 }
 
+fn pod_metadata_for_manifest(
+    manifest: &PodManifest,
+    active: Option<PodActiveSegmentRef>,
+) -> PodMetadata {
+    let mut metadata = PodMetadata::new(manifest.pod.name.clone(), active);
+    if should_persist_resolved_manifest_snapshot(manifest) {
+        metadata.resolved_manifest_snapshot = serde_json::to_value(manifest).ok();
+    }
+    metadata
+}
+
+fn should_persist_resolved_manifest_snapshot(manifest: &PodManifest) -> bool {
+    manifest.profile.is_some() || manifest.plugins.has_resolved_plan()
+}
+
 fn restore_manifest_from_pod_metadata_snapshot(
     pod_name: &str,
     snapshot: Option<serde_json::Value>,
@@ -5293,6 +5304,74 @@ permission = "write"
             restored.delegation_scope.allow[0].permission,
             Permission::Write
         );
+    }
+
+    #[test]
+    fn plugin_resolved_manifest_snapshot_is_persisted_without_profile() {
+        let mut manifest = PodManifest::from_toml(
+            r#"
+[pod]
+name = "plugin-snapshot"
+
+[model]
+scheme = "anthropic"
+model_id = "claude-sonnet-4-20250514"
+
+[worker]
+instruction = "saved"
+
+[[scope.allow]]
+target = "/snapshot/workspace"
+permission = "read"
+"#,
+        )
+        .unwrap();
+        assert!(manifest.profile.is_none());
+        assert!(
+            pod_metadata_for_manifest(&manifest, None)
+                .resolved_manifest_snapshot
+                .is_none()
+        );
+
+        manifest.plugins.resolved = vec![manifest::plugin::ResolvedPluginRecord {
+            identity: manifest::plugin::SourceQualifiedPluginId::new(
+                manifest::plugin::PluginSourceKind::Project,
+                "example",
+            ),
+            source: manifest::plugin::PluginSourceKind::Project,
+            package_path: PathBuf::from("/snapshot/workspace/.yoi/plugins/example.yoi-plugin"),
+            package_label: "example.yoi-plugin".to_string(),
+            digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            version: "0.1.0".to_string(),
+            manifest: manifest::plugin::PluginPackageManifest {
+                schema_version: 1,
+                id: "example".to_string(),
+                name: "Example".to_string(),
+                version: "0.1.0".to_string(),
+                description: None,
+                surfaces: vec![manifest::plugin::PluginSurface::Hook],
+                runtime: None,
+                hooks: vec![],
+            },
+            enabled_surfaces: vec![manifest::plugin::PluginSurface::Hook],
+            grants: manifest::plugin::PluginGrantConfig::default(),
+            config: None,
+        }];
+
+        let metadata = pod_metadata_for_manifest(&manifest, None);
+        let snapshot = metadata
+            .resolved_manifest_snapshot
+            .expect("plugin-resolved manifest should be snapshotted");
+        let restored: PodManifest = serde_json::from_value(snapshot).unwrap();
+
+        assert!(restored.profile.is_none());
+        assert_eq!(restored.plugins.resolved.len(), 1);
+        assert_eq!(
+            restored.plugins.resolved[0].digest,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(restored.plugins.resolved[0].version, "0.1.0");
     }
 }
 
