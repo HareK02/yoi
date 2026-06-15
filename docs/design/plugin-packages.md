@@ -104,11 +104,12 @@ Discovery is a read-only inventory operation. It may report package metadata, va
 
 Enablement is a resolved runtime plan. It should come from Profile/manifest configuration or another explicit local policy layer, then be recorded into the resolved Manifest/session metadata used to start the Pod. Restored Pods should use that resolved enabled-plugin plan instead of silently re-running fresh discovery and picking newer packages. Fresh discovery must not silently upgrade a restored Pod.
 
-A future enablement record can be shaped like this, but the exact schema belongs to the implementation Ticket:
+A minimal implemented enablement record is shaped like this. `version` is an exact package-version requirement; richer range constraints are deferred. `digest` is optional in authoring config, but fresh startup records the resolved digest into runtime metadata.
 
 ```toml
 [[plugins.enabled]]
 id = "user:example"
+version = "0.1.0"  # optional exact package-version requirement
 digest = "sha256:..." # optional pin in authoring, resolved in runtime metadata
 config = { level = "concise" }
 ```

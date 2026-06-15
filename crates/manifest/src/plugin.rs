@@ -19,11 +19,20 @@ const ZIP_UNIX_FILE_TYPE_MASK: u32 = 0o170000;
 #[serde(default, deny_unknown_fields)]
 pub struct PluginConfig {
     pub enabled: Vec<PluginEnablementConfig>,
+    /// Runtime restore metadata. Fresh resolution fills this from discovered packages;
+    /// restore uses it without selecting newer mutable-store contents.
+    pub resolved: Vec<ResolvedPluginRecord>,
+    /// Safe bounded discovery/resolution diagnostics recorded with the resolved plan.
+    pub diagnostics: Vec<PluginDiagnostic>,
 }
 
 impl PluginConfig {
     pub fn is_empty(&self) -> bool {
-        self.enabled.is_empty()
+        self.enabled.is_empty() && self.resolved.is_empty()
+    }
+
+    pub fn has_resolved_plan(&self) -> bool {
+        !self.resolved.is_empty() || !self.diagnostics.is_empty()
     }
 }
 
@@ -32,6 +41,8 @@ impl PluginConfig {
 pub struct PluginEnablementConfig {
     /// Source-qualified plugin id such as `user:example`, `project:example`, or `builtin:example`.
     pub id: String,
+    /// Optional exact package version requirement. Rich version constraints are deferred.
+    pub version: Option<PluginExactVersion>,
     /// Optional deterministic digest pin in `sha256:<hex>` form.
     pub digest: Option<String>,
     /// Optional explicit surface subset. When omitted, all declared package surfaces are selected.
@@ -40,6 +51,16 @@ pub struct PluginEnablementConfig {
     pub grants: PluginGrantConfig,
     /// Opaque plugin-local configuration copied into resolved metadata without interpretation.
     pub config: Option<toml::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PluginExactVersion(pub String);
+
+impl PluginExactVersion {
+    pub fn matches(&self, version: &str) -> bool {
+        self.0 == version
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,7 +177,7 @@ pub enum PluginIdParseError {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginPackageManifest {
-    pub api_version: u32,
+    pub schema_version: u32,
     pub id: String,
     pub name: String,
     pub version: String,
@@ -277,11 +298,43 @@ pub struct ResolvedPlugin {
     pub identity: SourceQualifiedPluginId,
     pub source: PluginSourceKind,
     pub package_path: PathBuf,
+    pub package_label: String,
     pub digest: String,
     pub manifest: PluginPackageManifest,
     pub enabled_surfaces: Vec<PluginSurface>,
     pub grants: PluginGrantConfig,
     pub config: Option<toml::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedPluginRecord {
+    pub identity: SourceQualifiedPluginId,
+    pub source: PluginSourceKind,
+    pub package_path: PathBuf,
+    pub package_label: String,
+    pub digest: String,
+    pub version: String,
+    pub manifest: PluginPackageManifest,
+    pub enabled_surfaces: Vec<PluginSurface>,
+    pub grants: PluginGrantConfig,
+    pub config: Option<toml::Value>,
+}
+
+impl ResolvedPluginRecord {
+    fn from_resolved(resolved: &ResolvedPlugin) -> Self {
+        Self {
+            identity: resolved.identity.clone(),
+            source: resolved.source,
+            package_path: resolved.package_path.clone(),
+            package_label: resolved.package_label.clone(),
+            digest: resolved.digest.clone(),
+            version: resolved.manifest.version.clone(),
+            manifest: resolved.manifest.clone(),
+            enabled_surfaces: resolved.enabled_surfaces.clone(),
+            grants: resolved.grants.clone(),
+            config: resolved.config.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -290,7 +343,7 @@ pub struct PluginResolution {
     pub diagnostics: Vec<PluginDiagnostic>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginDiagnostic {
     pub kind: PluginDiagnosticKind,
     pub phase: PluginDiagnosticPhase,
@@ -339,7 +392,8 @@ impl PluginDiagnostic {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PluginDiagnosticKind {
     Missing,
     Duplicate,
@@ -355,7 +409,8 @@ pub enum PluginDiagnosticKind {
     Io,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PluginDiagnosticPhase {
     Discovery,
     Manifest,
@@ -476,6 +531,23 @@ pub fn resolve_enabled_plugins(
             }
         }
 
+        if let Some(required_version) = &enablement.version {
+            if !required_version.matches(&package.manifest.version) {
+                resolution.diagnostics.push(
+                    PluginDiagnostic::new(
+                        PluginDiagnosticKind::Version,
+                        PluginDiagnosticPhase::Resolution,
+                        "enabled plugin exact version requirement does not match discovered package version",
+                    )
+                    .with_source(identity.source)
+                    .with_identity(&identity)
+                    .with_package(&package.package_label)
+                    .with_digest(&package.digest),
+                );
+                continue;
+            }
+        }
+
         if !enablement.grants.is_empty() {
             resolution.diagnostics.push(
                 PluginDiagnostic::new(
@@ -519,6 +591,7 @@ pub fn resolve_enabled_plugins(
             identity: identity.clone(),
             source: identity.source,
             package_path: package.package_path.clone(),
+            package_label: package.package_label.clone(),
             digest: package.digest.clone(),
             manifest: package.manifest.clone(),
             enabled_surfaces: selected_surfaces.into_iter().collect(),
@@ -528,6 +601,27 @@ pub fn resolve_enabled_plugins(
     }
 
     resolution
+}
+
+pub fn resolve_plugin_config_for_startup(
+    config: &PluginConfig,
+    options: &PluginDiscoveryOptions,
+) -> PluginConfig {
+    if config.enabled.is_empty() || config.has_resolved_plan() {
+        return config.clone();
+    }
+
+    let discovery = discover_plugins(options);
+    let resolution = resolve_enabled_plugins(config, &discovery);
+    let mut snapshot = config.clone();
+    snapshot.resolved = resolution
+        .resolved
+        .iter()
+        .map(ResolvedPluginRecord::from_resolved)
+        .collect();
+    snapshot.diagnostics = discovery.diagnostics;
+    snapshot.diagnostics.extend(resolution.diagnostics);
+    snapshot
 }
 
 #[derive(Clone, Debug)]
@@ -756,10 +850,7 @@ fn read_package(
         PluginDiagnostic::new(
             PluginDiagnosticKind::Malformed,
             PluginDiagnosticPhase::Manifest,
-            format!(
-                "plugin.toml could not be parsed: {}",
-                bounded_message(error.to_string())
-            ),
+            safe_toml_parse_message(&error),
         )
         .with_source(source)
         .with_package(label)
@@ -784,11 +875,11 @@ fn validate_manifest(
     label: &str,
     source: PluginSourceKind,
 ) -> Result<(), PluginDiagnostic> {
-    if manifest.api_version != SUPPORTED_PLUGIN_API_VERSION {
+    if manifest.schema_version != SUPPORTED_PLUGIN_API_VERSION {
         return Err(PluginDiagnostic::new(
-            PluginDiagnosticKind::Version,
+            PluginDiagnosticKind::Api,
             PluginDiagnosticPhase::Manifest,
-            "plugin API version is unsupported",
+            "plugin schema/API version is unsupported",
         )
         .with_source(source)
         .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
@@ -1264,13 +1355,26 @@ fn safe_io_error(error: &io::Error) -> &'static str {
     }
 }
 
+fn safe_toml_parse_message(error: &toml::de::Error) -> String {
+    let mut message = String::from("plugin.toml could not be parsed");
+    if let Some(span) = error.span() {
+        message.push_str(&format!(" near byte span {}..{}", span.start, span.end));
+    }
+    bounded_message(message)
+}
+
 fn bounded_message(message: String) -> String {
     const MAX: usize = 240;
     if message.len() <= MAX {
-        message
-    } else {
-        format!("{}…", &message[..MAX])
+        return message;
     }
+    let end = message
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= MAX)
+        .last()
+        .unwrap_or(0);
+    format!("{}…", &message[..end])
 }
 
 fn is_safe_id(value: &str) -> bool {
@@ -1398,6 +1502,7 @@ mod tests {
                         ..PluginEnablementConfig::default()
                     },
                 ],
+                ..PluginConfig::default()
             },
             &report,
         );
@@ -1427,12 +1532,113 @@ mod tests {
                     digest: Some("sha256:0000".to_string()),
                     ..PluginEnablementConfig::default()
                 }],
+                ..PluginConfig::default()
             },
             &report,
         );
 
         assert!(resolution.resolved.is_empty());
         assert_eq!(resolution.diagnostics[0].kind, PluginDiagnosticKind::Digest);
+    }
+
+    #[test]
+    fn exact_version_mismatch_fails_closed_with_distinct_diagnostic() {
+        let (report, _) = fixture_with_enabled_plugin(false);
+        let resolution = resolve_enabled_plugins(
+            &PluginConfig {
+                enabled: vec![PluginEnablementConfig {
+                    id: "project:example".to_string(),
+                    version: Some(PluginExactVersion("9.9.9".to_string())),
+                    ..PluginEnablementConfig::default()
+                }],
+                ..PluginConfig::default()
+            },
+            &report,
+        );
+
+        assert!(resolution.resolved.is_empty());
+        assert_eq!(
+            resolution.diagnostics[0].kind,
+            PluginDiagnosticKind::Version
+        );
+        assert_eq!(
+            resolution.diagnostics[0].phase,
+            PluginDiagnosticPhase::Resolution
+        );
+        assert!(
+            !resolution
+                .diagnostics
+                .iter()
+                .any(|diag| diag.kind == PluginDiagnosticKind::Api)
+        );
+    }
+
+    #[test]
+    fn resolved_plan_pins_unpinned_enablement_for_restore() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        let plugins = workspace.join(".yoi/plugins");
+        fs::create_dir_all(&plugins).unwrap();
+        let package = plugins.join("example.yoi-plugin");
+        write_plugin_version(
+            &package,
+            "example",
+            "0.1.0",
+            &[PluginSurface::Hook],
+            &[("hooks/example.md", b"v1")],
+        );
+        let options = PluginDiscoveryOptions::new(&workspace);
+        let config = PluginConfig {
+            enabled: vec![PluginEnablementConfig {
+                id: "project:example".to_string(),
+                ..PluginEnablementConfig::default()
+            }],
+            ..PluginConfig::default()
+        };
+
+        let startup_snapshot = resolve_plugin_config_for_startup(&config, &options);
+        assert_eq!(startup_snapshot.resolved.len(), 1);
+        let restored_digest = startup_snapshot.resolved[0].digest.clone();
+        assert_eq!(startup_snapshot.resolved[0].version, "0.1.0");
+
+        write_plugin_version(
+            &package,
+            "example",
+            "0.2.0",
+            &[PluginSurface::Hook],
+            &[("hooks/example.md", b"v2")],
+        );
+        let fresh_snapshot = resolve_plugin_config_for_startup(&config, &options);
+        assert_ne!(fresh_snapshot.resolved[0].digest, restored_digest);
+        assert_eq!(fresh_snapshot.resolved[0].version, "0.2.0");
+
+        let restored_snapshot = resolve_plugin_config_for_startup(&startup_snapshot, &options);
+        assert_eq!(restored_snapshot.resolved[0].digest, restored_digest);
+        assert_eq!(restored_snapshot.resolved[0].version, "0.1.0");
+    }
+
+    #[test]
+    fn malformed_manifest_multibyte_diagnostic_is_bounded_and_redacted() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        let plugins = workspace.join(".yoi/plugins");
+        fs::create_dir_all(&plugins).unwrap();
+        let malformed = format!("schema_version = [\n# {}", "機密".repeat(200));
+        write_stored_zip(
+            &plugins.join("bad-multibyte.yoi-plugin"),
+            &[("plugin.toml", malformed.into_bytes(), 0)],
+        );
+
+        let report = discover_plugins(&PluginDiscoveryOptions::new(&workspace));
+
+        assert!(report.packages.is_empty());
+        let diagnostic = report
+            .diagnostics
+            .iter()
+            .find(|diag| diag.kind == PluginDiagnosticKind::Malformed)
+            .unwrap();
+        assert!(diagnostic.message.len() <= 241);
+        assert!(!diagnostic.message.contains("機密"));
     }
 
     #[test]
@@ -1446,7 +1652,7 @@ mod tests {
             &[
                 (
                     "plugin.toml",
-                    manifest("escape", &[PluginSurface::Hook]).into_bytes(),
+                    manifest("escape", "0.1.0", &[PluginSurface::Hook]).into_bytes(),
                     0,
                 ),
                 ("../evil", b"x".to_vec(), 0),
@@ -1490,10 +1696,10 @@ mod tests {
         let plugins = workspace.join(".yoi/plugins");
         fs::create_dir_all(&plugins).unwrap();
         write_stored_zip(
-            &plugins.join("bad-api.yoi-plugin"),
+            &plugins.join("bad-schema.yoi-plugin"),
             &[(
                 "plugin.toml",
-                manifest_with_api("bad_api", 999).into_bytes(),
+                manifest_with_schema("bad_schema", "0.1.0", 999).into_bytes(),
                 0,
             )],
         );
@@ -1509,7 +1715,7 @@ mod tests {
             report
                 .diagnostics
                 .iter()
-                .any(|diag| diag.kind == PluginDiagnosticKind::Version)
+                .any(|diag| diag.kind == PluginDiagnosticKind::Api)
         );
         assert!(
             report
@@ -1539,6 +1745,7 @@ mod tests {
                         ..PluginEnablementConfig::default()
                     },
                 ],
+                ..PluginConfig::default()
             },
             &report,
         );
@@ -1579,6 +1786,7 @@ mod tests {
             } else {
                 vec![]
             },
+            ..PluginConfig::default()
         };
         (report, config)
     }
@@ -1589,7 +1797,21 @@ mod tests {
         surfaces: &[PluginSurface],
         extra_files: &[(&str, &[u8])],
     ) {
-        let mut entries = vec![("plugin.toml", manifest(id, surfaces).into_bytes(), 0)];
+        write_plugin_version(path, id, "0.1.0", surfaces, extra_files);
+    }
+
+    fn write_plugin_version(
+        path: &Path,
+        id: &str,
+        version: &str,
+        surfaces: &[PluginSurface],
+        extra_files: &[(&str, &[u8])],
+    ) {
+        let mut entries = vec![(
+            "plugin.toml",
+            manifest(id, version, surfaces).into_bytes(),
+            0,
+        )];
         if surfaces.contains(&PluginSurface::Hook)
             && !extra_files
                 .iter()
@@ -1605,17 +1827,17 @@ mod tests {
         write_stored_zip(path, &entries);
     }
 
-    fn manifest(id: &str, surfaces: &[PluginSurface]) -> String {
-        let mut manifest = manifest_with_api(id, SUPPORTED_PLUGIN_API_VERSION);
+    fn manifest(id: &str, version: &str, surfaces: &[PluginSurface]) -> String {
+        let mut manifest = manifest_with_schema(id, version, SUPPORTED_PLUGIN_API_VERSION);
         if surfaces.contains(&PluginSurface::Hook) {
             manifest.push_str("\n[[hooks]]\nid = \"startup\"\nfile = \"hooks/example.md\"\n");
         }
         manifest
     }
 
-    fn manifest_with_api(id: &str, api_version: u32) -> String {
+    fn manifest_with_schema(id: &str, version: &str, schema_version: u32) -> String {
         format!(
-            "api_version = {api_version}\nid = \"{id}\"\nname = \"Example\"\nversion = \"0.1.0\"\n"
+            "schema_version = {schema_version}\nid = \"{id}\"\nname = \"Example\"\nversion = \"{version}\"\n"
         )
     }
 

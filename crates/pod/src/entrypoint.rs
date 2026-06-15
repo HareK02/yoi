@@ -7,6 +7,7 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 use manifest::{
     Permission, PodManifest, PodManifestConfig, ProfileResolveOptions, ProfileResolver,
     ProfileSelector, ScopeConfig, ScopeRule, paths,
+    plugin::{PluginDiscoveryOptions, resolve_plugin_config_for_startup},
 };
 use pod_store::{CombinedStore, FsPodStore, PodMetadataStore};
 use session_store::{FsStore, SegmentId, Store};
@@ -184,7 +185,13 @@ where
         apply_profile_launch_policy(&mut manifest, &workspace_root, cli.ticket_role.as_deref())?;
     }
     apply_session_restore_overrides(&mut manifest, cli)?;
+    apply_plugin_resolution_plan(&mut manifest, &workspace_root);
     Ok((manifest, loader))
+}
+
+fn apply_plugin_resolution_plan(manifest: &mut PodManifest, workspace_root: &Path) {
+    let options = PluginDiscoveryOptions::new(workspace_root);
+    manifest.plugins = resolve_plugin_config_for_startup(&manifest.plugins, &options);
 }
 
 fn apply_session_restore_overrides(manifest: &mut PodManifest, cli: &Cli) -> Result<(), String> {

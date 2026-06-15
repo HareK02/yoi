@@ -470,7 +470,12 @@ impl SkillsConfig {
 }
 
 fn merge_plugin_config(mut base: PluginConfig, upper: PluginConfig) -> PluginConfig {
+    let upper_has_resolved_plan = upper.has_resolved_plan();
     base.enabled.extend(upper.enabled);
+    if upper_has_resolved_plan {
+        base.resolved = upper.resolved;
+        base.diagnostics = upper.diagnostics;
+    }
     base
 }
 

@@ -878,6 +878,7 @@ model_id = "claude-sonnet-4-20250514"
             "{MINIMAL_REQUIRED}\n\
              [[plugins.enabled]]\n\
              id = \"project:example\"\n\
+             version = \"0.1.0\"\n\
              digest = \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\
              surfaces = [\"hook\"]\n\n\
              [plugins.enabled.config]\n\
@@ -887,6 +888,10 @@ model_id = "claude-sonnet-4-20250514"
         assert_eq!(manifest.plugins.enabled.len(), 1);
         let enabled = &manifest.plugins.enabled[0];
         assert_eq!(enabled.id, "project:example");
+        assert_eq!(
+            enabled.version.as_ref().map(|version| version.0.as_str()),
+            Some("0.1.0")
+        );
         assert_eq!(enabled.surfaces, vec![plugin::PluginSurface::Hook]);
         assert_eq!(
             enabled
