@@ -197,66 +197,175 @@ fn validate_tool_name(name: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn validate_input_schema(schema: &Value) -> Result<(), String> {
-    let Value::Object(root) = schema else {
-        return Err("root schema must be a JSON object".into());
-    };
-    match root.get("type") {
-        Some(Value::String(value)) if value == "object" => {}
-        Some(_) => return Err("root schema type must be `object`".into()),
-        None => return Err("root schema must declare type = `object`".into()),
-    }
-    if let Some(properties) = root.get("properties") {
-        if !properties.is_object() {
-            return Err("properties must be a JSON object".into());
-        }
-    }
-    if let Some(required) = root.get("required") {
-        let Some(required) = required.as_array() else {
-            return Err("required must be an array".into());
-        };
-        if !required.iter().all(Value::is_string) {
-            return Err("required entries must be strings".into());
-        }
-    }
-    if let Some(additional) = root.get("additionalProperties") {
-        if !(additional.is_boolean() || additional.is_object()) {
-            return Err("additionalProperties must be boolean or object".into());
-        }
-    }
-    reject_unsupported_keywords(schema)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SupportedSchemaType {
+    Object,
+    Array,
+    String,
+    Number,
+    Integer,
+    Boolean,
+    Null,
 }
 
-fn reject_unsupported_keywords(schema: &Value) -> Result<(), String> {
-    match schema {
-        Value::Object(map) => {
-            for (key, value) in map {
-                if matches!(
-                    key.as_str(),
-                    "$ref"
-                        | "$dynamicRef"
-                        | "oneOf"
-                        | "anyOf"
-                        | "allOf"
-                        | "not"
-                        | "patternProperties"
-                        | "dependentSchemas"
-                        | "dependencies"
-                ) {
-                    return Err(format!("unsupported schema keyword `{key}`"));
-                }
-                reject_unsupported_keywords(value)?;
-            }
-            Ok(())
+impl SupportedSchemaType {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "object" => Some(Self::Object),
+            "array" => Some(Self::Array),
+            "string" => Some(Self::String),
+            "number" => Some(Self::Number),
+            "integer" => Some(Self::Integer),
+            "boolean" => Some(Self::Boolean),
+            "null" => Some(Self::Null),
+            _ => None,
         }
-        Value::Array(values) => {
-            for value in values {
-                reject_unsupported_keywords(value)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
     }
+}
+
+fn validate_input_schema(schema: &Value) -> Result<(), String> {
+    let ty = validate_schema_node(schema, "$", true)?;
+    if ty != SupportedSchemaType::Object {
+        return Err("root schema type must be `object`".into());
+    }
+    Ok(())
+}
+
+fn validate_schema_node(
+    schema: &Value,
+    path: &str,
+    root: bool,
+) -> Result<SupportedSchemaType, String> {
+    let Value::Object(map) = schema else {
+        return Err(format!("{path}: schema node must be a JSON object"));
+    };
+
+    for key in map.keys() {
+        if !is_supported_schema_keyword(key) {
+            return Err(format!("{path}: unsupported schema keyword `{key}`"));
+        }
+    }
+
+    let ty = match map.get("type") {
+        Some(Value::String(value)) => SupportedSchemaType::parse(value)
+            .ok_or_else(|| format!("{path}: unsupported schema type `{value}`"))?,
+        Some(_) => return Err(format!("{path}: type must be a string")),
+        None if root => return Err("root schema must declare type = `object`".into()),
+        None => return Err(format!("{path}: schema node must declare type")),
+    };
+
+    if let Some(title) = map.get("title") {
+        if !title.is_string() {
+            return Err(format!("{path}: title must be a string"));
+        }
+    }
+    if let Some(description) = map.get("description") {
+        if !description.is_string() {
+            return Err(format!("{path}: description must be a string"));
+        }
+    }
+
+    let properties = map.get("properties");
+    if let Some(properties) = properties {
+        if ty != SupportedSchemaType::Object {
+            return Err(format!(
+                "{path}: properties is only supported for object schemas"
+            ));
+        }
+        let Some(properties) = properties.as_object() else {
+            return Err(format!("{path}: properties must be a JSON object"));
+        };
+        for (name, child_schema) in properties {
+            validate_schema_node(child_schema, &format!("{path}.properties.{name}"), false)?;
+        }
+    }
+
+    if let Some(required) = map.get("required") {
+        if ty != SupportedSchemaType::Object {
+            return Err(format!(
+                "{path}: required is only supported for object schemas"
+            ));
+        }
+        let Some(required) = required.as_array() else {
+            return Err(format!("{path}: required must be an array"));
+        };
+        let mut seen = HashSet::new();
+        for entry in required {
+            let Some(name) = entry.as_str() else {
+                return Err(format!("{path}: required entries must be strings"));
+            };
+            if !seen.insert(name) {
+                return Err(format!("{path}: required entries must be unique"));
+            }
+            if let Some(properties) = properties.and_then(Value::as_object) {
+                if !properties.contains_key(name) {
+                    return Err(format!(
+                        "{path}: required entry `{name}` is not declared in properties"
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Some(additional) = map.get("additionalProperties") {
+        if ty != SupportedSchemaType::Object {
+            return Err(format!(
+                "{path}: additionalProperties is only supported for object schemas"
+            ));
+        }
+        match additional {
+            Value::Bool(_) => {}
+            Value::Object(_) => {
+                validate_schema_node(additional, &format!("{path}.additionalProperties"), false)?;
+            }
+            _ => {
+                return Err(format!(
+                    "{path}: additionalProperties must be boolean or schema object"
+                ));
+            }
+        }
+    }
+
+    if let Some(items) = map.get("items") {
+        if ty != SupportedSchemaType::Array {
+            return Err(format!("{path}: items is only supported for array schemas"));
+        }
+        validate_schema_node(items, &format!("{path}.items"), false)?;
+    }
+
+    if let Some(enum_values) = map.get("enum") {
+        let Some(enum_values) = enum_values.as_array() else {
+            return Err(format!("{path}: enum must be an array"));
+        };
+        if enum_values.is_empty() {
+            return Err(format!("{path}: enum must not be empty"));
+        }
+        for (index, value) in enum_values.iter().enumerate() {
+            if enum_values
+                .iter()
+                .skip(index + 1)
+                .any(|other| other == value)
+            {
+                return Err(format!("{path}: enum entries must be unique"));
+            }
+        }
+    }
+
+    Ok(ty)
+}
+
+fn is_supported_schema_keyword(key: &str) -> bool {
+    matches!(
+        key,
+        "type"
+            | "title"
+            | "description"
+            | "properties"
+            | "required"
+            | "additionalProperties"
+            | "items"
+            | "enum"
+    )
 }
 
 #[cfg(test)]
@@ -344,12 +453,63 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_nested_property_schema_node() {
+        let schema = json!({
+            "type":"object",
+            "properties":{"query":"not-a-schema"},
+            "required":["query"],
+            "additionalProperties":false
+        });
+        let error = validate_input_schema(&schema).unwrap_err();
+        assert!(error.contains("$.properties.query"));
+        assert!(error.contains("schema node must be a JSON object"));
+    }
+
+    #[test]
+    fn rejects_invalid_recursive_schema_members() {
+        let duplicate_required = json!({
+            "type":"object",
+            "properties":{"query":{"type":"string"}},
+            "required":["query", "query"]
+        });
+        assert!(
+            validate_input_schema(&duplicate_required)
+                .unwrap_err()
+                .contains("required entries must be unique")
+        );
+
+        let invalid_items = json!({
+            "type":"object",
+            "properties":{"values":{"type":"array", "items":"not-a-schema"}}
+        });
+        assert!(
+            validate_input_schema(&invalid_items)
+                .unwrap_err()
+                .contains("$.properties.values.items")
+        );
+
+        let invalid_additional = json!({
+            "type":"object",
+            "additionalProperties":{"type":"unsupported"}
+        });
+        assert!(
+            validate_input_schema(&invalid_additional)
+                .unwrap_err()
+                .contains("unsupported schema type")
+        );
+    }
+
+    #[test]
     fn accepts_object_tool_schema() {
         validate_input_schema(&json!({
             "type":"object",
-            "properties":{"query":{"type":"string"}},
+            "properties":{
+                "query":{"type":"string", "description":"Search text"},
+                "limit":{"type":"integer", "enum":[1, 5, 10]},
+                "tags":{"type":"array", "items":{"type":"string"}}
+            },
             "required":["query"],
-            "additionalProperties":false
+            "additionalProperties":{"type":"string"}
         }))
         .unwrap();
     }
@@ -461,6 +621,27 @@ mod tests {
 
         assert!(pending.is_empty());
         assert!(has_diagnostic(&report, "invalid input_schema"));
+    }
+
+    #[test]
+    fn nested_invalid_input_schema_does_not_register_plugin_tool() {
+        let mut invalid = tool("BadNestedSchema");
+        invalid.input_schema = json!({
+            "type":"object",
+            "properties":{"query":"not-a-schema"},
+            "required":["query"],
+            "additionalProperties":false
+        });
+        let mut pending = Vec::new();
+        let mut hooks = crate::hook::HookRegistryBuilder::new();
+
+        let report = super::super::FeatureRegistryBuilder::default()
+            .with_module(PluginToolFeature::new(record(vec![invalid])))
+            .install_into_pending(&mut pending, &mut hooks);
+
+        assert!(pending.is_empty());
+        assert!(has_diagnostic(&report, "invalid input_schema"));
+        assert!(has_diagnostic(&report, "$.properties.query"));
     }
 
     #[tokio::test]
