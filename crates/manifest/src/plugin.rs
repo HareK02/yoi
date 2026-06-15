@@ -188,13 +188,18 @@ pub struct PluginPackageManifest {
     pub runtime: Option<PluginRuntimeManifest>,
     #[serde(default)]
     pub hooks: Vec<PluginHookManifest>,
+    #[serde(default)]
+    pub tools: Vec<PluginToolManifest>,
 }
 
 impl PluginPackageManifest {
-    fn declared_surfaces(&self) -> BTreeSet<PluginSurface> {
+    pub fn declared_surfaces(&self) -> BTreeSet<PluginSurface> {
         let mut surfaces: BTreeSet<_> = self.surfaces.iter().copied().collect();
         if !self.hooks.is_empty() {
             surfaces.insert(PluginSurface::Hook);
+        }
+        if !self.tools.is_empty() {
+            surfaces.insert(PluginSurface::Tool);
         }
         if self.runtime.is_some() {
             surfaces.insert(PluginSurface::Wasm);
@@ -216,6 +221,14 @@ pub struct PluginRuntimeManifest {
 pub struct PluginHookManifest {
     pub id: String,
     pub file: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginToolManifest {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1651,6 +1664,29 @@ file = "hooks/summary.md"
             report.packages[0].identity.to_string(),
             "project:example.summarizer"
         );
+    }
+
+    #[test]
+    fn package_manifest_tool_surface_shape_is_accepted() {
+        let manifest: PluginPackageManifest = toml::from_str(
+            r#"
+schema_version = 1
+id = "example.tool"
+name = "Example Tool"
+version = "0.1.0"
+
+[[tools]]
+name = "ExampleTool"
+description = "Runs a package-defined tool."
+input_schema = { type = "object", properties = { query = { type = "string" } }, required = ["query"], additionalProperties = false }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.tools.len(), 1);
+        assert!(manifest.declared_surfaces().contains(&PluginSurface::Tool));
+        assert_eq!(manifest.tools[0].name, "ExampleTool");
+        assert_eq!(manifest.tools[0].input_schema["type"], "object");
     }
 
     #[test]

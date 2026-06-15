@@ -634,66 +634,74 @@ where
             ),
         );
     }
-    let _feature_install_report = pod.install_features(feature_registry);
-
-    let worker = pod.worker_mut();
-
-    // Memory tools require both explicit feature exposure and memory storage
-    // configuration. This keeps resident-memory config separate from the
-    // model-visible Memory*/Knowledge* tool surface.
-    if feature_config.memory.enabled {
-        let mem = memory_config.as_ref().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "[feature.memory].enabled = true requires a [memory] configuration section",
-            )
-        })?;
-        let layout = memory::WorkspaceLayout::resolve(mem, &workspace_root);
-        let query_cfg = memory::tool::QueryConfig::from(mem);
-        worker.register_tool(memory::tool::read_tool_with_usage(
-            layout.clone(),
-            session_id_for_usage,
-        ));
-        worker.register_tool(memory::tool::write_tool(layout.clone()));
-        worker.register_tool(memory::tool::edit_tool(layout.clone()));
-        worker.register_tool(memory::tool::delete_tool(layout.clone()));
-        worker.register_tool(memory::tool::memory_query_tool(layout.clone(), query_cfg));
-        worker.register_tool(memory::tool::knowledge_query_tool(layout, query_cfg));
+    for module in crate::feature::plugin::plugin_tool_features_if_enabled(
+        feature_config.plugins.enabled,
+        &pod.manifest().plugins,
+    ) {
+        feature_registry = feature_registry.with_module(module);
     }
 
-    // Pod-orchestration tools (SpawnPod + the four comm tools) share
-    // the Pod-scoped `SpawnedPodRegistry` (also consumed by the main
-    // loop's `PodEvent` handler). Expose them only behind the explicit
-    // profile feature and require delegation authority up front so enabling
-    // the surface cannot imply broad child scope by accident.
-    if feature_config.pods.enabled {
-        if spawner_manifest.delegation_scope.allow.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "[feature.pods].enabled = true requires non-empty [[delegation_scope.allow]]",
+    {
+        let worker = pod.worker_mut();
+
+        // Memory tools require both explicit feature exposure and memory storage
+        // configuration. This keeps resident-memory config separate from the
+        // model-visible Memory*/Knowledge* tool surface.
+        if feature_config.memory.enabled {
+            let mem = memory_config.as_ref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "[feature.memory].enabled = true requires a [memory] configuration section",
+                )
+            })?;
+            let layout = memory::WorkspaceLayout::resolve(mem, &workspace_root);
+            let query_cfg = memory::tool::QueryConfig::from(mem);
+            worker.register_tool(memory::tool::read_tool_with_usage(
+                layout.clone(),
+                session_id_for_usage,
             ));
+            worker.register_tool(memory::tool::write_tool(layout.clone()));
+            worker.register_tool(memory::tool::edit_tool(layout.clone()));
+            worker.register_tool(memory::tool::delete_tool(layout.clone()));
+            worker.register_tool(memory::tool::memory_query_tool(layout.clone(), query_cfg));
+            worker.register_tool(memory::tool::knowledge_query_tool(layout, query_cfg));
         }
-        worker.register_tool(spawn_pod_tool(
-            spawner_name.clone(),
-            spawner_socket,
-            runtime_base.clone(),
-            workspace_root.clone(),
-            cwd.clone(),
-            spawned_registry.clone(),
-            self_parent_socket,
-            spawner_manifest,
-            scope_handle,
-            prompts,
-        ));
-        worker.register_tool(send_to_pod_tool(spawned_registry.clone()));
-        worker.register_tool(read_pod_output_tool(spawned_registry.clone()));
-        worker.register_tool(stop_pod_tool(spawned_registry.clone()));
-        let discovery =
-            PodDiscovery::new(pod_store, spawner_name, runtime_base, cwd, spawned_registry);
-        worker.register_tool(list_pods_tool(discovery.clone()));
-        worker.register_tool(restore_pod_tool(discovery.clone()));
-        worker.register_tool(send_to_peer_pod_tool(discovery));
+
+        // Pod-orchestration tools (SpawnPod + the four comm tools) share
+        // the Pod-scoped `SpawnedPodRegistry` (also consumed by the main
+        // loop's `PodEvent` handler). Expose them only behind the explicit
+        // profile feature and require delegation authority up front so enabling
+        // the surface cannot imply broad child scope by accident.
+        if feature_config.pods.enabled {
+            if spawner_manifest.delegation_scope.allow.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "[feature.pods].enabled = true requires non-empty [[delegation_scope.allow]]",
+                ));
+            }
+            worker.register_tool(spawn_pod_tool(
+                spawner_name.clone(),
+                spawner_socket,
+                runtime_base.clone(),
+                workspace_root.clone(),
+                cwd.clone(),
+                spawned_registry.clone(),
+                self_parent_socket,
+                spawner_manifest,
+                scope_handle,
+                prompts,
+            ));
+            worker.register_tool(send_to_pod_tool(spawned_registry.clone()));
+            worker.register_tool(read_pod_output_tool(spawned_registry.clone()));
+            worker.register_tool(stop_pod_tool(spawned_registry.clone()));
+            let discovery =
+                PodDiscovery::new(pod_store, spawner_name, runtime_base, cwd, spawned_registry);
+            worker.register_tool(list_pods_tool(discovery.clone()));
+            worker.register_tool(restore_pod_tool(discovery.clone()));
+            worker.register_tool(send_to_peer_pod_tool(discovery));
+        }
     }
+    let _feature_install_report = pod.install_features(feature_registry);
     pod.attach_tracker(tracker);
     Ok(fs_for_view)
 }
