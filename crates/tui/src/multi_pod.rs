@@ -2134,6 +2134,14 @@ impl MultiPodApp {
             };
         }
 
+        let composer_action = composer_edit_action(key);
+        if let Some(action) = composer_action {
+            if action.is_modifier_action() {
+                self.apply_composer_edit_action(action);
+                return MultiPodAction::None;
+            }
+        }
+
         match key.code {
             KeyCode::F(2) => {
                 if self.panel_diagnostic.is_some() {
@@ -2199,11 +2207,12 @@ impl MultiPodApp {
                 .prepare_companion_send()
                 .map(MultiPodAction::SendCompanion)
                 .unwrap_or(MultiPodAction::None),
-            _ if composer_edit_action(key).is_some() => {
-                self.apply_composer_edit_action(composer_edit_action(key).expect("checked above"));
+            _ => {
+                if let Some(action) = composer_action {
+                    self.apply_composer_edit_action(action);
+                }
                 MultiPodAction::None
             }
-            _ => MultiPodAction::None,
         }
     }
 }
@@ -7981,6 +7990,64 @@ branch = "orchestration/custom-panel"
                 .unwrap()
                 .contains("Workspace Companion is unavailable")
         );
+    }
+
+    #[test]
+    fn multi_alt_enter_inserts_newline_without_companion_send() {
+        let mut app = ticket_enabled_app(vec![live_info("idle", PodStatus::Idle)]);
+        app.input.insert_str("first line");
+
+        assert!(matches!(
+            app.handle_key(modified_key(KeyCode::Enter, KeyModifiers::ALT)),
+            MultiPodAction::None
+        ));
+
+        assert_eq!(input_text(&app), "first line\n");
+        assert!(!app.sending);
+        assert!(app.notice.is_none());
+    }
+
+    #[test]
+    fn multi_alt_enter_on_blank_pod_selection_inserts_newline_without_opening() {
+        let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
+        let selected_before = app.selected_row.clone();
+
+        assert!(matches!(
+            app.handle_key(modified_key(KeyCode::Enter, KeyModifiers::ALT)),
+            MultiPodAction::None
+        ));
+
+        assert_eq!(input_text(&app), "\n");
+        assert_eq!(app.selected_row, selected_before);
+        assert!(app.notice.is_none());
+    }
+
+    #[test]
+    fn multi_alt_enter_on_blank_ticket_action_inserts_newline_without_dispatch() {
+        let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
+        panel.rows.push(panel_test_ticket_row(
+            "TICKET-1",
+            "Ready",
+            ActionPriority::ReadyForQueue,
+            NextUserAction::Queue,
+            "ready",
+        ));
+        let mut app = app_with_panel(
+            PodList::from_sources(PodVisibilitySource::ResumePicker, vec![], vec![], None, 10),
+            panel,
+        );
+        let selected_before = app.selected_row.clone();
+        assert_eq!(app.selected_ticket_action(), Some(NextUserAction::Queue));
+
+        assert!(matches!(
+            app.handle_key(modified_key(KeyCode::Enter, KeyModifiers::ALT)),
+            MultiPodAction::None
+        ));
+
+        assert_eq!(input_text(&app), "\n");
+        assert_eq!(app.selected_row, selected_before);
+        assert!(!app.sending);
+        assert!(app.notice.is_none());
     }
 
     #[test]

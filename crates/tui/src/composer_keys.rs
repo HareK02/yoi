@@ -94,6 +94,21 @@ mod tests {
     }
 
     #[test]
+    fn maps_alt_enter_to_newline() {
+        assert_eq!(
+            composer_edit_action(modified(KeyCode::Enter, KeyModifiers::ALT)),
+            Some(ComposerEditAction::InsertNewline)
+        );
+        assert_eq!(
+            composer_edit_action(modified(
+                KeyCode::Enter,
+                KeyModifiers::ALT | KeyModifiers::CONTROL,
+            )),
+            None
+        );
+    }
+
+    #[test]
     fn leaves_enter_tab_esc_and_control_letters_for_callers() {
         assert_eq!(composer_edit_action(key(KeyCode::Enter)), None);
         assert_eq!(composer_edit_action(key(KeyCode::Tab)), None);
