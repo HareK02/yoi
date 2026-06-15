@@ -1618,6 +1618,42 @@ mod tests {
     }
 
     #[test]
+    fn currently_documented_manifest_shape_is_accepted() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        let plugins = workspace.join(".yoi/plugins");
+        fs::create_dir_all(&plugins).unwrap();
+        let manifest = r#"
+schema_version = 1
+id = "example.summarizer"
+name = "Example Summarizer"
+version = "0.1.0"
+description = "Adds a custom summary command."
+surfaces = ["hook"]
+
+[[hooks]]
+id = "summary"
+file = "hooks/summary.md"
+"#;
+        write_stored_zip(
+            &plugins.join("documented.yoi-plugin"),
+            &[
+                ("plugin.toml", manifest.as_bytes().to_vec(), 0),
+                ("hooks/summary.md", b"summarize".to_vec(), 0),
+            ],
+        );
+
+        let report = discover_plugins(&PluginDiscoveryOptions::new(&workspace));
+
+        assert_eq!(report.diagnostics, vec![]);
+        assert_eq!(report.packages.len(), 1);
+        assert_eq!(
+            report.packages[0].identity.to_string(),
+            "project:example.summarizer"
+        );
+    }
+
+    #[test]
     fn malformed_manifest_multibyte_diagnostic_is_bounded_and_redacted() {
         let temp = TempDir::new().unwrap();
         let workspace = temp.path().join("workspace");
