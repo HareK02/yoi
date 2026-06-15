@@ -3958,6 +3958,7 @@ dependencies = [
 name = "tui"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "client",
  "crossterm 0.28.1",
  "llm-worker",

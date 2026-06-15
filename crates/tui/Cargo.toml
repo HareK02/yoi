@@ -12,6 +12,7 @@ e2e-test = []
 client = { workspace = true }
 protocol = { workspace = true }
 ratatui = { version = "0.30.0", features = ["scrolling-regions"] }
+base64 = "0.22.1"
 crossterm = "0.28"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }
 serde_json = { workspace = true }

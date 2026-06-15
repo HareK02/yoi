@@ -31,6 +31,7 @@ use crate::app::{ActionbarNoticeLevel, App, CompletionState, alert_source_label,
 use crate::block::{Block, CompactEvent, ThinkingBlock, ThinkingState};
 use crate::command::CommandCandidate;
 use crate::task::{TaskCounts, TaskEntry, TaskStatus, TaskStore};
+use crate::text_selection::{HistoryViewport, SelectionRow};
 use crate::view_mode::Mode;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -306,55 +307,90 @@ fn input_area_height(render: &crate::input::InputRender, terminal_height: u16) -
     needed.clamp(1, cap)
 }
 
+pub struct HistoryRow {
+    pub line: Line<'static>,
+    pub text: String,
+    pub selectable: bool,
+}
+
+impl HistoryRow {
+    fn new(line: Line<'static>, selectable: bool) -> Self {
+        let text = line_text(&line);
+        Self {
+            line,
+            text,
+            selectable,
+        }
+    }
+
+    fn selection_row(&self) -> SelectionRow {
+        SelectionRow::new(self.text.clone(), self.selectable)
+    }
+}
+
 /// Pre-rendered history lines plus the line indices at which each turn
 /// begins (used for Ctrl-[/] jumps).
 pub struct HistoryLayout {
-    pub lines: Vec<Line<'static>>,
+    pub rows: Vec<HistoryRow>,
     pub turn_starts: Vec<usize>,
 }
 
 pub fn compute_history(app: &App, width: u16) -> HistoryLayout {
     // Step 1: collect logical lines from each block (unwrapped).
-    let mut logical: Vec<Line<'static>> = Vec::new();
+    let mut logical: Vec<(Line<'static>, bool)> = Vec::new();
     let mut logical_turn_starts: Vec<usize> = Vec::new();
     let mut first = true;
+    let mut previous_selectable = false;
     let mut i = 0;
     while i < app.blocks.len() {
+        let block = &app.blocks[i];
+        let current_selectable = block_is_selectable_text(block);
         if !first {
-            logical.push(Line::from(""));
+            // Preserve a deterministic blank-line separator when copying
+            // across text-like items. Tool/non-text item rows remain
+            // unselectable, but separators adjacent to text are copied as
+            // blank lines so cross-item extraction is stable.
+            logical.push((Line::from(""), previous_selectable || current_selectable));
         }
         first = false;
-        let block = &app.blocks[i];
         if matches!(block, Block::TurnHeader { .. }) {
             logical_turn_starts.push(logical.len());
         }
         if matches!(block, Block::ToolCall(_)) {
             let out = crate::tool::render_tool(&app.cache, &app.blocks, i, width, app.mode);
-            logical.extend(out.lines);
+            logical.extend(out.lines.into_iter().map(|line| (line, false)));
             i += out.consumed.max(1);
+            previous_selectable = false;
             continue;
         }
-        render_block_into(&mut logical, block, width, app.mode);
+        let mut block_lines = Vec::new();
+        render_block_into(&mut block_lines, block, width, app.mode);
+        logical.extend(
+            block_lines
+                .into_iter()
+                .map(|line| (line, current_selectable)),
+        );
+        previous_selectable = current_selectable;
         i += 1;
     }
 
     // Step 2: pre-wrap every logical line to char-based terminal rows so
     // scroll math is exact. Track the logical → wrapped mapping so
     // turn-start indices get translated into wrapped-row coordinates.
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(logical.len());
+    let mut rows: Vec<HistoryRow> = Vec::with_capacity(logical.len());
     let mut logical_to_wrapped: Vec<usize> = Vec::with_capacity(logical.len() + 1);
-    for line in logical {
-        logical_to_wrapped.push(lines.len());
-        wrap_line_into(line, width, &mut lines);
+    for (line, selectable) in logical {
+        logical_to_wrapped.push(rows.len());
+        wrap_history_row_into(line, selectable, width, &mut rows);
     }
-    logical_to_wrapped.push(lines.len());
+    logical_to_wrapped.push(rows.len());
 
     let turn_starts = logical_turn_starts
         .into_iter()
-        .map(|i| logical_to_wrapped.get(i).copied().unwrap_or(lines.len()))
+        .map(|i| logical_to_wrapped.get(i).copied().unwrap_or(rows.len()))
         .collect();
 
-    HistoryLayout { lines, turn_starts }
+    HistoryLayout { rows, turn_starts }
 }
 
 /// Horizontal gutter around the log area. Applied via a
@@ -369,6 +405,7 @@ fn draw_history(frame: &mut Frame, app: &mut App, area: Rect) {
         app.scroll.total_lines = 0;
         app.scroll.tail_top_offset = 0;
         app.scroll.turn_starts.clear();
+        app.text_selection.clear_history_snapshot();
         return;
     }
 
@@ -389,21 +426,23 @@ fn draw_history(frame: &mut Frame, app: &mut App, area: Rect) {
     let outer_block = UiBlock::default().padding(Padding::horizontal(HISTORY_PADDING));
     let inner = outer_block.inner(history_area);
     if inner.width == 0 || inner.height == 0 {
+        app.text_selection.clear_history_snapshot();
         return;
     }
 
     if let Some(picker) = app.rewind_picker.as_mut() {
+        app.text_selection.clear_history_snapshot();
         draw_rewind_picker(frame, history_area, inner, outer_block, picker);
         return;
     }
 
-    let HistoryLayout { lines, turn_starts } = compute_history(app, inner.width);
+    let HistoryLayout { rows, turn_starts } = compute_history(app, inner.width);
 
-    // `lines` is already pre-wrapped: 1 entry == 1 terminal row. Scroll
+    // `rows` is already pre-wrapped: 1 entry == 1 terminal row. Scroll
     // math degenerates to index arithmetic.
-    let tail_top = lines.len().saturating_sub(inner.height as usize);
+    let tail_top = rows.len().saturating_sub(inner.height as usize);
     app.scroll.area_height = inner.height;
-    app.scroll.total_lines = lines.len();
+    app.scroll.total_lines = rows.len();
     app.scroll.tail_top_offset = tail_top;
     app.scroll.turn_starts = turn_starts;
 
@@ -413,8 +452,30 @@ fn draw_history(frame: &mut Frame, app: &mut App, area: Rect) {
         app.scroll.top_offset = app.scroll.top_offset.min(tail_top);
     }
 
-    let end = (app.scroll.top_offset + inner.height as usize).min(lines.len());
-    let visible: Vec<Line<'static>> = lines[app.scroll.top_offset..end].to_vec();
+    app.text_selection.set_history_snapshot(
+        HistoryViewport {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: inner.height,
+            top_offset: app.scroll.top_offset,
+            total_lines: rows.len(),
+        },
+        rows.iter().map(HistoryRow::selection_row).collect(),
+    );
+
+    let end = (app.scroll.top_offset + inner.height as usize).min(rows.len());
+    let visible: Vec<Line<'static>> = rows[app.scroll.top_offset..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, row)| {
+            let absolute_row = app.scroll.top_offset + offset;
+            match app.text_selection.range_for_row(absolute_row) {
+                Some((from, to)) => highlight_line_selection(&row.line, from, to),
+                None => row.line.clone(),
+            }
+        })
+        .collect();
 
     // Pre-wrapped input → render without ratatui's word-wrap (which
     // would otherwise re-wrap mid-row at word boundaries and desync the
@@ -715,6 +776,88 @@ fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>)
 
     // Always emit the final row (empty line stays empty).
     push_row(&mut current, &mut row_width, out);
+}
+
+fn wrap_history_row_into(
+    line: Line<'static>,
+    selectable: bool,
+    width: u16,
+    out: &mut Vec<HistoryRow>,
+) {
+    let mut wrapped = Vec::new();
+    wrap_line_into(line, width, &mut wrapped);
+    out.extend(
+        wrapped
+            .into_iter()
+            .map(|line| HistoryRow::new(line, selectable)),
+    );
+}
+
+fn line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
+}
+
+fn highlight_line_selection(line: &Line<'static>, start: usize, end: usize) -> Line<'static> {
+    if start >= end {
+        return line.clone();
+    }
+
+    let highlight = Style::default().fg(Color::Black).bg(Color::Cyan);
+    let mut col = 0usize;
+    let mut spans = Vec::new();
+    for span in &line.spans {
+        let mut plain = String::new();
+        let mut selected = String::new();
+        let push_pending =
+            |plain: &mut String, selected: &mut String, spans: &mut Vec<Span<'static>>| {
+                if !plain.is_empty() {
+                    spans.push(Span::styled(std::mem::take(plain), span.style));
+                }
+                if !selected.is_empty() {
+                    spans.push(Span::styled(
+                        std::mem::take(selected),
+                        span.style.patch(highlight),
+                    ));
+                }
+            };
+
+        let mut in_selected = false;
+        for ch in span.content.chars() {
+            let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            let next = col.saturating_add(width);
+            let selected_char = next > start && col < end;
+            if selected_char != in_selected {
+                push_pending(&mut plain, &mut selected, &mut spans);
+                in_selected = selected_char;
+            }
+            if selected_char {
+                selected.push(ch);
+            } else {
+                plain.push(ch);
+            }
+            col = next;
+        }
+        push_pending(&mut plain, &mut selected, &mut spans);
+    }
+
+    Line {
+        spans,
+        style: line.style,
+        alignment: line.alignment,
+    }
+}
+
+/// Only text-like transcript Items are selectable/copyable. Tool calls and
+/// other non-text Items remain visible but unselectable, so their rendered
+/// diagnostics/output are never copied through this path.
+fn block_is_selectable_text(block: &Block) -> bool {
+    matches!(
+        block,
+        Block::UserMessage { .. } | Block::SystemMessage { .. } | Block::AssistantText { .. }
+    )
 }
 
 fn render_block_into(lines: &mut Vec<Line<'static>>, block: &Block, width: u16, mode: Mode) {
@@ -1666,6 +1809,43 @@ mod tests {
         assert_eq!(
             actionbar_left_item(&app, now + Duration::from_secs(1)).map(|(text, _)| text),
             Some("retrying LLM request".into())
+        );
+    }
+
+    #[test]
+    fn history_rows_mark_text_items_selectable_and_non_text_unselectable() {
+        let mut app = App::new("pod".to_string());
+        app.blocks = vec![
+            Block::UserMessage {
+                segments: vec![Segment::Text {
+                    content: "hello".to_string(),
+                }],
+            },
+            Block::AssistantText {
+                text: "world".to_string(),
+            },
+            Block::Thinking(ThinkingBlock {
+                text: "private reasoning".to_string(),
+                state: ThinkingState::Finished { elapsed_secs: None },
+            }),
+        ];
+
+        let layout = compute_history(&app, 80);
+        let rows: Vec<_> = layout
+            .rows
+            .iter()
+            .map(|row| (row.text.as_str(), row.selectable))
+            .collect();
+
+        assert!(rows.contains(&("hello", true)));
+        assert!(rows.contains(&("world", true)));
+        assert!(
+            rows.iter()
+                .any(|(text, selectable)| text.contains("private reasoning") && !*selectable)
+        );
+        assert!(
+            rows.iter()
+                .any(|(text, selectable)| text.is_empty() && *selectable)
         );
     }
 }

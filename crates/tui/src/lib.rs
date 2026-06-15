@@ -18,6 +18,7 @@ pub mod setup_model;
 mod single_pod;
 mod spawn;
 mod task;
+mod text_selection;
 mod tool;
 mod ui;
 mod view_mode;
