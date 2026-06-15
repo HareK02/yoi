@@ -2,7 +2,7 @@
 title: 'Panel composer で Alt+Enter 改行を SessionView と揃える'
 state: 'inprogress'
 created_at: '2026-06-15T06:27:36Z'
-updated_at: '2026-06-15T06:46:31Z'
+updated_at: '2026-06-15T06:50:25Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['tui-input', 'ux-consistency']
