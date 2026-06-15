@@ -372,3 +372,59 @@ Conclusion:
 - Changes requested. Do not integrate until the non-profile/spawn restore determinism path and docs/parser mismatch are fixed and covered.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KV5R5V2S at: 2026-06-15T15:16:14Z -->
+
+## Implementation report
+
+Second follow-up implementation report after reviewer request_changes:
+
+New commit:
+- `07978d2d fix: persist plugin snapshots for restore`
+
+Resolved remaining blockers:
+
+1. Non-profile / spawn-config restore determinism
+- Changed Pod metadata snapshot persistence so resolved manifests are snapshotted when either:
+  - `manifest.profile.is_some()` (existing profile behavior), or
+  - `manifest.plugins.has_resolved_plan()` (new plugin-resolved manifest behavior).
+- Added helper path:
+  - `pod_metadata_for_manifest`
+  - `should_persist_resolved_manifest_snapshot`
+- A named Pod whose plugin enablement is resolved at startup now persists resolved plugin metadata/digest plan in `resolved_manifest_snapshot` even without a profile.
+- Restore therefore uses the original resolved plan instead of silently rediscovering mutable stores.
+
+Focused runtime persistence test added:
+- `plugin_resolved_manifest_snapshot_is_persisted_without_profile`
+  - verifies a non-profile manifest does not snapshot by default;
+  - adds resolved plugin metadata;
+  - verifies runtime metadata snapshot is persisted;
+  - verifies restored snapshot contains the original plugin digest/version.
+
+2. Docs/parser alignment
+- Updated `docs/design/plugin-packages.md` with a minimal currently-valid strict `plugin.toml` example:
+  - top-level `schema_version`, `id`, `name`, `version`, `description`, `surfaces`;
+  - `[[hooks]]` with `id` and `file`.
+- Clarified referenced files must exist in the package archive.
+- Clarified optional `[runtime]` currently accepts only:
+  - `kind = "wasm"`
+  - `entry = "..."`
+  - `abi = "yoi-plugin-wasm-1"`
+- Marked `[package]`, `[permissions]`, richer `contributions`, and `runtime.kind = "declarative"` as future/aspirational and intentionally rejected by strict parser for now.
+- Added parser-alignment test:
+  - `currently_documented_manifest_shape_is_accepted`
+
+Validation reported by coder:
+- Passed: `cargo fmt --check`
+- Passed: `cargo test -p manifest plugin`
+- Passed: `cargo test -p manifest`
+- Passed: `cargo test -p pod plugin_resolved_manifest_snapshot_is_persisted_without_profile`
+- Passed: `cargo test -p pod spawn_pod`
+- Passed: `cargo check`
+- Passed: `git diff --check`
+- Passed: `nix build .#yoi`
+
+Repository status:
+- Child implementation worktree clean after follow-up commit.
+
+---
