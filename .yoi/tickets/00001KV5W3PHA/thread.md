@@ -293,3 +293,64 @@ Repository status:
 - Child implementation worktree clean after follow-up commit.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KV5W3PHA-r2 at: 2026-06-15T16:38:37Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Second-pass blocker verification: resolved.
+
+Evidence checked:
+- Child worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KV5W3PHA-plugin-tool-surface`
+  - branch `impl/00001KV5W3PHA-plugin-tool-surface`
+  - HEAD `3413bae7 fix: reject nested plugin tool schema errors`
+- Fix diff `05a9c522..3413bae7`.
+- Relevant implementation:
+  - `crates/pod/src/feature/plugin.rs`
+  - `crates/pod/src/feature.rs`
+  - `crates/pod/src/controller.rs`
+  - `crates/llm-worker/src/tool.rs`
+  - `crates/llm-worker/src/tool_server.rs`
+  - `crates/manifest/src/plugin.rs`
+
+Blocker-specific findings:
+- Nested invalid schemas are now rejected recursively.
+- `validate_schema_node` requires every schema node to be a JSON object with supported string `type`.
+- `properties` child schemas are recursively validated.
+- `items` is only accepted on array schemas and recursively validated.
+- `additionalProperties` is only accepted on object schemas and must be boolean or recursively valid schema object.
+- `required` must be a unique string array and, when `properties` exists, entries must be declared.
+- `enum` must be non-empty and unique.
+- Unknown keywords are rejected before registration.
+- The prior concrete failure case `properties.query = "not-a-schema"` now fails with path-bearing diagnostic such as `$.properties.query`.
+- Regression test `nested_invalid_input_schema_does_not_register_plugin_tool` asserts pending tool registration remains empty and diagnostics include `invalid input_schema`.
+- Invalid schemas return `FeatureInstallError::InvalidToolManifest`, recorded as install diagnostic by feature registry.
+- No evidence found that invalid nested schemas become model-visible after the fix.
+
+Overall acceptance spot-check:
+- Enabled Plugin Tool definitions are wired through normal `FeatureRegistryBuilder` / `ToolRegistry` path.
+- Discovery-only or non-tool packages remain inactive through manifest surface filtering.
+- Duplicate/builtin collisions are handled by feature registry duplicate checks against registered/pending tool names.
+- `ToolOrigin` metadata is preserved on `ToolMeta`.
+- Feature/profile disabled plugin support hides Plugin Tool modules through `plugin_tool_features_if_enabled`.
+- Runtime-missing calls use `PluginRuntimeMissingTool` and return safe unavailable error.
+- No Plugin code execution, WASM runtime, host API, Service/Ingress/MCP bridge, or permission grant enforcement was added.
+
+Validation performed by reviewer:
+- Passed: `git diff --check fcae8860..HEAD`
+- Passed: `cargo fmt --check`
+
+Validation not rerun by reviewer:
+- `cargo test` / `cargo check` were not rerun because reviewer scope was read-only. Coder-reported passing results were inspected as evidence.
+
+Risk assessment:
+- Residual risk is mainly integration-level because reviewer did not run cargo tests.
+- The fix is focused and directly covers the prior blocker with recursive validation and regression coverage.
+
+Conclusion:
+- Approved. No remaining blocker found.
+
+---
