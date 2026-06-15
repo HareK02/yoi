@@ -99,3 +99,55 @@ Critical risks / reviewer focus:
 Routing decision と accepted implementation plan を記録済み。blocking relation / unresolved OrchestrationPlan blocker はなく、Orchestrator workspace は clean。implementation side effects の前に `queued -> inprogress` acceptance を記録する。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KV5D7MG5 at: 2026-06-15T12:57:12Z -->
+
+## Implementation report
+
+Implementation report from Coder Pod `yoi-coder-00001KV5D7MG5`:
+
+Commit:
+- `e0ddbed1 feat: show orchestration ticket overlay in panel`
+
+Changed files:
+- `crates/tui/src/workspace_panel.rs`
+- `crates/tui/src/multi_pod.rs`
+
+Implemented behavior:
+- Panel ViewModel attempts to read a read-only orchestration worktree Ticket state overlay from configured/default `[orchestration]` settings.
+- Overlay loading validates:
+  - expected worktree path
+  - expected branch
+  - same Git common-dir/repository
+  - canonical Git top-level equals expected worktree path
+- Overlay state is joined by canonical Ticket id only.
+- Local/current branch `.yoi/tickets` remains primary authority and is not mutated or overwritten.
+- Rows with progressed overlay state show source-qualified state such as:
+  - `local: queued · orchestration: inprogress`
+  - `local: queued · orchestration: done`
+- Progressed overlay state suppresses duplicate queue/start-like actions:
+  - overlay `inprogress` is treated as active work / read-only progress
+  - overlay `done` is treated as merge/review pending and does not expose queue/start again
+- Orchestrator work-set derivation accounts for overlay in-progress/done guards to avoid duplicate start routing.
+
+Tests added/covered:
+- overlay joins by Ticket id
+- local `queued` + overlay `inprogress` display/action behavior
+- local `queued` + overlay `done` merge-pending/action gating
+- branch mismatch ignored
+- missing worktree fallback
+- local Ticket file not mutated by overlay reading
+
+Validation reported by coder:
+- Passed: `cargo test -p tui workspace_panel --lib`
+- Passed: `cargo check -p tui --all-targets`
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check`
+
+Repository status:
+- Child implementation worktree clean after commit.
+
+Residual blockers:
+- None reported.
+
+---

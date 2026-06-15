@@ -2,7 +2,7 @@
 title: 'Panel に orchestration worktree の Ticket state overlay を表示する'
 state: 'inprogress'
 created_at: '2026-06-15T10:29:00Z'
-updated_at: '2026-06-15T12:40:45Z'
+updated_at: '2026-06-15T12:57:12Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['panel', 'ticket-state', 'orchestration', 'worktree', 'git-branch', 'read-only-overlay']
