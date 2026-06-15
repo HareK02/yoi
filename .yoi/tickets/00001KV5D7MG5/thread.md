@@ -207,3 +207,45 @@ Conclusion:
 - Approved. No blocker found.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-15T13:05:20Z -->
+
+## Implementation report
+
+Integration report:
+
+Merged implementation branch into orchestration branch:
+- branch: `impl/00001KV5D7MG5-panel-orchestration-overlay`
+- implementation commit: `e0ddbed1 feat: show orchestration ticket overlay in panel`
+- merge commit: `eeb6986f merge: panel orchestration overlay`
+
+Reviewer result:
+- `approve` recorded from `yoi-reviewer-00001KV5D7MG5`.
+
+Validation in Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration`:
+- Passed: `cargo test -p tui workspace_panel --lib`
+  - 21 passed
+- Passed: `cargo check -p tui --all-targets`
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check`
+
+Notes:
+- Overlay is read-only and source-qualified.
+- Current branch Ticket state remains primary authority and is not overwritten.
+- Missing worktree / branch mismatch / unrelated repo safety paths are covered by focused tests.
+- Queue/Start-like duplicate actions are suppressed when overlay shows `inprogress` or `done`.
+- Orchestrator worktree is clean after validation.
+
+Cleanup planned:
+- Stop related coder/reviewer Pods.
+- Remove only child implementation worktree/branch for this Ticket.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-15T13:05:20Z from: inprogress to: done reason: merged_validated field: state -->
+
+## State changed
+
+Reviewer approved, implementation branch merged into the orchestration branch, and focused validation passed in the Orchestrator worktree. Marking Ticket done in the orchestration branch.
+
+---
