@@ -1,8 +1,130 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const FIRST_VISIBLE_RENDER_BUDGET: Duration = Duration::from_millis(1500);
+const FULL_READY_BUDGET: Duration = Duration::from_secs(5);
 
 use yoi_e2e::{
     FixtureCleanupReport, FixtureWorkspace, KeyPress, PanelHarness, RenderedPanelRow, yoi_binary,
 };
+
+#[test]
+fn panel_first_visible_render_arrives_before_background_reload() -> yoi_e2e::Result<()> {
+    let binary = yoi_binary()?;
+    let fixture = FixtureWorkspace::new(&binary)?;
+    assert_fixture_paths_are_isolated(&fixture);
+
+    let started = Instant::now();
+    let mut panel =
+        PanelHarness::spawn(fixture.panel_config_holding_background_task(binary, "reload"))?;
+    let remaining = FIRST_VISIBLE_RENDER_BUDGET
+        .checked_sub(started.elapsed())
+        .unwrap_or_else(|| Duration::from_millis(0));
+    panel.wait_for("first visible panel render", remaining, |event| {
+        event.event == "panel_ready"
+    })?;
+    let first_visible_elapsed = started.elapsed();
+    eprintln!(
+        "panel first visible render: {first_visible_elapsed:?} (budget {FIRST_VISIBLE_RENDER_BUDGET:?}); artifacts at {}",
+        panel.artifacts().dir.display()
+    );
+    assert!(
+        first_visible_elapsed <= FIRST_VISIBLE_RENDER_BUDGET,
+        "first visible render took {first_visible_elapsed:?}, budget {FIRST_VISIBLE_RENDER_BUDGET:?}; artifacts at {}",
+        panel.artifacts().dir.display()
+    );
+
+    let events = panel.events()?;
+    let ready_index = events
+        .iter()
+        .position(|event| event.event == "panel_ready")
+        .expect("panel_ready event should be present");
+    assert!(
+        events[..ready_index]
+            .iter()
+            .all(|event| event.event != "background_task_started"),
+        "initial render must be emitted before reload/background work starts; artifacts at {}",
+        panel.artifacts().dir.display()
+    );
+
+    panel.expect_background_task_pending("reload")?;
+    let events = panel.events()?;
+    let reload_started_index = events
+        .iter()
+        .position(|event| {
+            event.event == "background_task_started"
+                && event.data.get("task").and_then(serde_json::Value::as_str) == Some("reload")
+        })
+        .expect("held reload should start after first visible render");
+    assert!(
+        ready_index < reload_started_index,
+        "first visible render and reload ordering should remain separate; artifacts at {}",
+        panel.artifacts().dir.display()
+    );
+
+    panel.press(KeyPress::CtrlC)?;
+    let status = panel.expect_exit_within(PanelHarness::default_exit_wait())?;
+    assert!(status.success(), "panel should exit cleanly with Ctrl+C");
+    drop(panel);
+    assert_fixture_cleanup(fixture.cleanup()?);
+    Ok(())
+}
+
+#[test]
+fn panel_full_ready_has_separate_startup_budget() -> yoi_e2e::Result<()> {
+    let binary = yoi_binary()?;
+    let fixture = FixtureWorkspace::new(&binary)?;
+    assert_fixture_paths_are_isolated(&fixture);
+
+    let started = Instant::now();
+    let mut panel = PanelHarness::spawn(fixture.panel_config(binary))?;
+    let first_visible_remaining = FIRST_VISIBLE_RENDER_BUDGET
+        .checked_sub(started.elapsed())
+        .unwrap_or_else(|| Duration::from_millis(0));
+    panel.wait_for(
+        "first visible panel render",
+        first_visible_remaining,
+        |event| event.event == "panel_ready",
+    )?;
+    let first_visible_elapsed = started.elapsed();
+    eprintln!(
+        "panel first visible render: {first_visible_elapsed:?} (budget {FIRST_VISIBLE_RENDER_BUDGET:?}); artifacts at {}",
+        panel.artifacts().dir.display()
+    );
+    assert!(
+        first_visible_elapsed <= FIRST_VISIBLE_RENDER_BUDGET,
+        "first visible render took {first_visible_elapsed:?}, budget {FIRST_VISIBLE_RENDER_BUDGET:?}; artifacts at {}",
+        panel.artifacts().dir.display()
+    );
+
+    let full_ready_remaining = FULL_READY_BUDGET
+        .checked_sub(started.elapsed())
+        .unwrap_or_else(|| Duration::from_millis(0));
+    panel.wait_for("full ready fixture rows", full_ready_remaining, |event| {
+        event.event == "rows_rendered"
+            && event
+                .data
+                .get("rows")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|rows| rows.len() >= 2)
+    })?;
+    let full_ready_elapsed = started.elapsed();
+    eprintln!(
+        "panel full ready: {full_ready_elapsed:?} (budget {FULL_READY_BUDGET:?}); artifacts at {}",
+        panel.artifacts().dir.display()
+    );
+    assert!(
+        full_ready_elapsed <= FULL_READY_BUDGET,
+        "full ready took {full_ready_elapsed:?}, budget {FULL_READY_BUDGET:?}; artifacts at {}",
+        panel.artifacts().dir.display()
+    );
+
+    panel.press(KeyPress::CtrlC)?;
+    let status = panel.expect_exit_within(PanelHarness::default_exit_wait())?;
+    assert!(status.success(), "panel should exit cleanly with Ctrl+C");
+    drop(panel);
+    assert_fixture_cleanup(fixture.cleanup()?);
+    Ok(())
+}
 
 #[test]
 fn panel_mouse_click_selects_row_without_dispatching_action() -> yoi_e2e::Result<()> {

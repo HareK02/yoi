@@ -131,11 +131,7 @@ pub(crate) async fn run(
 
     let mut pending_reload = PendingReload::default();
     let mut pending_queue_attention_notice = PendingQueueAttentionNotice::default();
-    if let Some(mode) = app.enter_reload.take() {
-        if pending_reload.start(mode) {
-            app.refreshing = true;
-        }
-    }
+    let mut deferred_enter_reload = app.enter_reload.take();
     let mut next_poll = Instant::now() + MULTI_POD_POLL_INTERVAL;
     #[cfg(feature = "e2e-test")]
     let mut emitted_panel_ready = false;
@@ -159,6 +155,12 @@ pub(crate) async fn run(
                 emitted_panel_ready = true;
             }
             app.emit_rows_rendered();
+        }
+
+        if let Some(mode) = deferred_enter_reload.take() {
+            if pending_reload.start(mode) {
+                app.refreshing = true;
+            }
         }
 
         let now = Instant::now();
