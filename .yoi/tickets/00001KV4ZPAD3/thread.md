@@ -185,3 +185,55 @@ Residual risks:
 - Full `multi_pod` suite remains blocked by unrelated existing failures noted above.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KV4ZPAD3 at: 2026-06-15T07:08:12Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Evidence checked:
+- Reviewed diff `79dda10d..f3b435e7`.
+- Changed files limited to:
+  - `crates/tui/src/multi_pod.rs`
+  - `crates/tui/src/workspace_panel.rs`
+- Worktree was clean and on expected branch/commit:
+  - `impl/00001KV4ZPAD3-panel-row-hierarchy`
+  - `f3b435e7 fix: clarify panel ticket row hierarchy`
+
+Acceptance review:
+- Ticket two-line rows now have clearer hierarchy:
+  - primary line uses selected marker `▶ ` plus state/title;
+  - detail line uses `│ meta ` when selected and `meta` label for secondary metadata.
+- Ticket-associated Intake Pod rows now render as child rows with indentation plus `└` / indented `▶` and `Intake Pod: <pod>` labeling.
+- Relationship is not color-only; indentation/marker/label communicate hierarchy.
+- Selected Ticket vs selected Intake Pod are distinguishable through marker placement, label, color/style, and status text.
+- `live`, `restorable`, and `stale` Intake status remains visible.
+- Pre-Ticket Intake Pod behavior appears preserved; existing tests still assert pre-ticket sessions are not emitted as `TicketIntakePod` child rows.
+- Mouse/keyboard action semantics appear unchanged; changes are limited to row rendering/status text.
+- Ticket lifecycle transitions, relation gates, registry persistence, polling/spawn behavior, and Ticket schema were not changed.
+- Invalid Ticket placeholder behavior remains non-actionable.
+- Alt+Enter handling was not touched.
+
+Focused coverage observed:
+- Ticket primary/secondary row rendering contract updated.
+- Non-selected alignment/truncation tests updated for `meta`.
+- Waiting gate readability remains covered.
+- New child-row rendering test covers indentation, single-line behavior, status column, title label, and selected child marker.
+- New selected Intake child status test confirms it is not presented as a generic Ticket or generic Pod.
+- Existing adjacency/pre-ticket exclusion test remains present.
+
+Validation performed by reviewer:
+- Passed: `git diff --check 79dda10d..f3b435e7`
+- Passed: `cargo fmt --check`
+
+Validation not run by reviewer:
+- Cargo tests were not rerun because review scope was read-only and tests write build artifacts. Coder-reported focused test results were inspected as evidence.
+
+Broader failure assessment:
+- The reported broader `cargo test -p tui multi_pod --lib` failure appears unrelated based on diff scope; changes are confined to Panel row rendering/status presentation and tests around that contract, with no workspace-context/runtime setup logic changes.
+
+Conclusion:
+- Approved. No blocker remains.
+
+---
