@@ -1,8 +1,8 @@
 ---
 title: 'Plugin: register enabled Tool surface from packages'
-state: 'queued'
+state: 'inprogress'
 created_at: '2026-06-15T14:48:59Z'
-updated_at: '2026-06-15T15:53:32Z'
+updated_at: '2026-06-15T15:54:24Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['plugin', 'tool-registry', 'model-visible-schema', 'capability-boundary', 'profile-config']
