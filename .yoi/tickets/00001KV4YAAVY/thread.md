@@ -158,3 +158,59 @@ Residual risks / notes:
 - No real PTY/E2E validation was run; coverage is focused unit-level mouse/key/selection/render extraction behavior.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KV4YAAVY at: 2026-06-15T07:11:34Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Evidence checked:
+- Reviewed child worktree only:
+  - `/home/hare/Projects/yoi/.worktree/00001KV4YAAVY-single-pod-text-selection`
+  - diff `368249d6..09f5e9d5`
+  - Ticket record/thread in the child worktree
+- Read-only validation:
+  - Passed: `git diff --check 368249d6..09f5e9d5`
+
+Implementation review:
+- TUI-local selection state was added in `crates/tui/src/text_selection.rs` and wired into single-Pod rendering/input.
+- Mouse drag maps terminal coordinates through `HistoryViewport` into rendered history rows.
+- Drag start/update/release are handled in `single_pod.rs`; selection remains active after release.
+- `Esc` clears selection before normal composer handling.
+- bare `y` copies only when a selection exists; otherwise composer input remains available.
+- Highlighting is applied through `range_for_row` and `highlight_line_selection`.
+- Selectable item boundary is explicit:
+  - selectable: `UserMessage`, `SystemMessage`, `AssistantText`
+  - non-selectable: tool calls, thinking, notices, stats, greetings, etc.
+- Tool/non-text rows are marked unselectable and extraction skips unselectable rows.
+- Cross-item extraction is deterministic, with documented newline/blank-line behavior.
+- Copy uses OSC52; selected text is base64 encoded before writing the OSC52 sequence.
+- Copy diagnostics are generic/actionbar-local and do not include selected content.
+- Selection state lives in TUI-local `App.text_selection`; no path was found that appends selected/copied text to Pod history, model context, session log, Ticket records, memory, or durable state.
+- Mouse capture changes are limited to single-Pod fullscreen setup and avoid all-motion `?1003h`; Panel/multi-pod mouse row selection code was not modified.
+- Composer, scroll, rewind picker, completion/key routing, and normal key handling interactions were inspected and no blocker found.
+
+Coverage reviewed:
+- coordinate mapping
+- drag update/release state
+- multi-row / separator extraction
+- non-selectable row skipping
+- Esc clear
+- copy helper + clear
+- UI selectable/non-selectable marking
+- mouse capture mode avoiding all-motion tracking
+
+Non-blocking notes:
+- No PTY/E2E validation was run; terminal-specific OSC52/mouse behavior still depends on real terminal behavior.
+- OSC52 cannot acknowledge terminal clipboard acceptance; implementation can only report write/flush success/failure.
+- There is no explicit byte-size cap on OSC52 payload, but selection is bounded by visible rendered viewport rather than arbitrary full history traversal. Future hard cap/error notice would be reasonable hardening.
+- A full fixture test constructing an actual `Block::ToolCall` could strengthen coverage, but the non-text path is explicit and source-inspected.
+
+Validation not rerun by reviewer:
+- Cargo validation was not rerun because review scope was read-only and Cargo writes build artifacts. Coder-reported validation was inspected as evidence.
+
+Conclusion:
+- Approved. No blocker remains.
+
+---

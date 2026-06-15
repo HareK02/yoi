@@ -2,7 +2,7 @@
 title: 'single-Pod View Item text をマウスドラッグで選択・コピーできるようにする'
 state: 'inprogress'
 created_at: '2026-06-15T06:08:19Z'
-updated_at: '2026-06-15T07:02:42Z'
+updated_at: '2026-06-15T07:11:34Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['tui', 'mouse-input', 'selection', 'clipboard', 'single-pod-view']
