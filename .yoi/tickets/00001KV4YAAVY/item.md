@@ -1,11 +1,13 @@
 ---
 title: 'single-Pod View Item text をマウスドラッグで選択・コピーできるようにする'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-15T06:08:19Z'
-updated_at: '2026-06-15T06:09:17Z'
+updated_at: '2026-06-15T06:37:00Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['tui', 'mouse-input', 'selection', 'clipboard', 'single-pod-view']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-15T06:37:00Z'
 ---
 
 ## Background
