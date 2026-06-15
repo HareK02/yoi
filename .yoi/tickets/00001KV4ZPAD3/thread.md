@@ -237,3 +237,46 @@ Conclusion:
 - Approved. No blocker remains.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-15T07:09:01Z -->
+
+## Implementation report
+
+Integration report:
+
+Merged implementation branch into orchestration branch:
+- branch: `impl/00001KV4ZPAD3-panel-row-hierarchy`
+- implementation commit: `f3b435e7 fix: clarify panel ticket row hierarchy`
+- merge commit: `8c00a6e9 merge: panel row hierarchy`
+
+Reviewer result:
+- `approve` recorded from `yoi-reviewer-00001KV4ZPAD3`.
+
+Validation in Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration`:
+- Passed: `cargo test -p tui workspace_panel --lib`
+  - 16 passed
+- Passed: `cargo test -p tui panel_ticket --lib`
+  - 4 passed
+- Passed: `cargo test -p tui selected_ticket_intake_child_status --lib`
+  - 1 passed
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check`
+
+Notes:
+- Broader `cargo test -p tui multi_pod --lib` remains affected by unrelated workspace-context tests and was not used as a blocker.
+- Ticket/Intake visual hierarchy improved without lifecycle/action/schema/polling/spawn semantic changes.
+- Orchestrator worktree is clean after validation.
+
+Cleanup planned:
+- Stop related coder/reviewer Pods.
+- Remove only child implementation worktree/branch for this Ticket.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-15T07:09:01Z from: inprogress to: done reason: merged_validated field: state -->
+
+## State changed
+
+Reviewer approved, implementation branch merged into the orchestration branch, and focused validation passed in the Orchestrator worktree. Marking Ticket done in the orchestration branch.
+
+---
