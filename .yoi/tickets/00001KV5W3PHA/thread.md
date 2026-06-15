@@ -169,3 +169,63 @@ Residual risks / blockers:
 - Input schema validation is intentionally a narrow model-visible shape check, not a full JSON Schema engine. Unsupported composition/reference keywords are rejected fail-closed.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KV5W3PHA at: 2026-06-15T16:26:34Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+Blocker:
+- Invalid nested Plugin Tool schemas can still become model-visible.
+
+Evidence:
+- `crates/pod/src/feature/plugin.rs` validates root-level schema shape and recursively rejects only selected unsupported keywords.
+- It does not validate that nested schema nodes are valid JSON Schema objects.
+- Example invalid schema that appears to pass current validation:
+
+```toml
+input_schema = {
+  type = "object",
+  properties = { query = "not-a-schema" },
+  required = ["query"],
+  additionalProperties = false
+}
+```
+
+Why this is a blocker:
+- `properties.query = "not-a-schema"` is not a valid schema node.
+- Current checks can allow it into ToolRegistry / model-visible tool schema path.
+- This violates the acceptance criteria that invalid input schema is rejected with diagnostic and the critical focus on model-visible schema gating.
+
+Required changes:
+- Strengthen Plugin Tool schema validation before registration so invalid nested schemas fail closed with diagnostics.
+- Add regression tests showing nested invalid schema nodes do not register a Plugin Tool.
+- Prefer defining/enforcing an explicit supported subset recursively, for example:
+  - validate property schemas;
+  - validate allowed `type` values;
+  - validate `required` string/unique array;
+  - validate or reject `items` / `additionalProperties` recursively;
+  - reject unknown/problematic keywords unless explicitly supported.
+
+Positive evidence checked:
+- Plugin tool registration is feature-gated by `feature_config.plugins.enabled`.
+- Discovery-only packages do not register tools because registration uses resolved enabled Plugin records/surfaces.
+- Registered Plugin Tools preserve `ToolOrigin::Plugin` metadata.
+- Builtin collisions and duplicate Plugin Tool names are diagnosed/rejected.
+- Runtime execution is a safe unavailable/runtime-missing stub.
+- No Plugin code execution, WASM runtime, host API, Service/Ingress/MCP bridge, or permission grant enforcement was added.
+- `ToolOrigin` is not exposed directly to model-visible schema.
+
+Validation performed by reviewer:
+- Passed: `git diff --check fcae8860..05a9c522`
+- Passed: `cargo fmt --check`
+- Worktree remained clean.
+
+Validation not run:
+- `cargo test` / `cargo check` were not rerun because reviewer scope was read-only.
+
+Conclusion:
+- Changes requested. Do not integrate until nested schema validation is fail-closed and covered.
+
+---
