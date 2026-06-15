@@ -1,11 +1,13 @@
 ---
 title: 'Panel に orchestration worktree の Ticket state overlay を表示する'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-15T10:29:00Z'
-updated_at: '2026-06-15T10:29:00Z'
+updated_at: '2026-06-15T12:39:21Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['panel', 'ticket-state', 'orchestration', 'worktree', 'git-branch', 'read-only-overlay']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-15T12:39:21Z'
 ---
 
 ## Background
