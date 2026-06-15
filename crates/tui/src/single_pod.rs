@@ -34,10 +34,9 @@ use crate::{multi_pod, picker, spawn, ui};
 
 type FullscreenTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
-/// Enable SGR coordinates plus button-event tracking for Yoi-owned drag text
-/// selection in the single-Pod transcript. This intentionally opts out of
-/// terminal-native selection while the alternate screen is active, but still
-/// avoids all-motion tracking (`?1003h`).
+/// Enable SGR coordinates plus normal mouse tracking. This captures clicks,
+/// releases, and wheel events without drag-capture modes (`?1002h`/`?1003h`)
+/// so terminal-native drag selection remains available during startup.
 #[derive(Debug, Clone, Copy)]
 struct EnableSinglePodMouseCapture;
 
@@ -45,8 +44,31 @@ impl Command for EnableSinglePodMouseCapture {
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
         // 1006: SGR extended coordinates used by crossterm's parser
         // 1000: normal mouse tracking (button presses/releases and wheel)
-        // 1002: button-event tracking (drag reports while a button is held)
-        f.write_str("\x1B[?1006h\x1B[?1000h\x1B[?1002h")
+        f.write_str("\x1B[?1006h\x1B[?1000h")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
+}
+
+/// Enable Panel mouse input without drag tracking. The Panel only needs button
+/// presses/releases and wheel events; enabling `?1002h` can make terminal drag
+/// selection look captured and is intentionally avoided for Panel startup.
+#[derive(Debug, Clone, Copy)]
+struct EnablePanelMouseCapture;
+
+impl Command for EnablePanelMouseCapture {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        // 1006: SGR extended coordinates used by crossterm's parser
+        // 1000: normal mouse tracking (button presses/releases and wheel)
+        f.write_str("\x1B[?1006h\x1B[?1000h")
     }
 
     #[cfg(windows)]
@@ -263,7 +285,7 @@ pub(crate) async fn run_panel(
     runtime_command: PodRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = multi_pod::load_app(runtime_command.clone()).await?;
-    let mut terminal = enter_fullscreen()?;
+    let mut terminal = enter_panel_fullscreen()?;
 
     loop {
         match multi_pod::run(&mut terminal, &mut app).await? {
@@ -336,6 +358,15 @@ fn enter_fullscreen() -> Result<FullscreenTerminal, Box<dyn std::error::Error>> 
     // Enable button-event tracking so the transcript can own drag selection;
     // avoid all-motion capture because hover-motion reports are unnecessary.
     execute!(stdout, EnterAlternateScreen, EnableSinglePodMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    Ok(Terminal::new(backend)?)
+}
+
+fn enter_panel_fullscreen() -> Result<FullscreenTerminal, Box<dyn std::error::Error>> {
+    let mut stdout = io::stdout();
+    // Panel needs clicks and wheel input only; do not capture drag motion before
+    // the first visible frame.
+    execute!(stdout, EnterAlternateScreen, EnablePanelMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
@@ -1206,12 +1237,12 @@ mod tests {
     use protocol::{Event, RewindTarget, RewindTargetId, Segment};
 
     #[test]
-    fn single_pod_mouse_capture_enables_drag_without_all_motion() {
+    fn single_pod_mouse_capture_avoids_drag_and_all_motion_modes() {
         let mut ansi = String::new();
         Command::write_ansi(&EnableSinglePodMouseCapture, &mut ansi).unwrap();
 
         assert!(ansi.contains("?1000h"));
-        assert!(ansi.contains("?1002h"));
+        assert!(!ansi.contains("?1002h"));
         assert!(ansi.contains("?1006h"));
         assert!(!ansi.contains("?1003h"));
     }

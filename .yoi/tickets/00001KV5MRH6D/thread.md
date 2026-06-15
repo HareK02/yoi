@@ -94,3 +94,38 @@ Critical risks / reviewer focus:
 Routing decision と accepted implementation/evidence plan を記録済み。blocking relation / unresolved OrchestrationPlan blocker はなく、Panel startup latency work は同時に開始する Plugin resolver work と主対象が異なるため、implementation side effects の前に `queued -> inprogress` acceptance を記録する。
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-15T14:20:26Z -->
+
+## Implementation report
+
+### E2E measurements (real `target/debug/yoi` + PTY)
+
+| Scenario | Before | After | Budget | Notes |
+| --- | ---: | ---: | ---: | --- |
+| Fixture first visible panel render (`panel_full_ready_has_separate_startup_budget`) | 20.342 ms | 20.384 ms | 1500 ms | Warm fixture did not reproduce 7 s latency; after path keeps first draw separate from reload work. |
+| Fixture full-ready rows (`panel_full_ready_has_separate_startup_budget`) | 120.576 ms | 120.552 ms | 5000 ms | Separate metric; fixture full-ready remains well below budget after the first-frame deferral. |
+| Held-reload ordering (`panel_first_visible_render_arrives_before_background_reload`) | `background_task_started` before `panel_ready` | `panel_ready` before held `background_task_started`; first visible 20.396 ms | 1500 ms | Guarantees initial visible frame is not blocked by reload/observation. |
+| Pre-change ad-hoc Panel run from existing fixture artifact | `background_task_started@76 ms`, `panel_ready@80 ms`, full rows `@182 ms` | latest held/full tests above | n/a | Used to identify wait ordering; fixture still did not reproduce live 7 s. |
+
+### Wait points identified
+
+- Synchronous before first draw: CLI/process startup, `run_panel` workspace/cwd setup, `load_app` construction of an empty/loading `WorkspacePanelViewModel`, raw-mode/bracketed-paste/alternate-screen/mouse setup, and the first `terminal.draw`.
+- Previously scheduled before first draw: initial Panel reload/observation task (`PendingReload::start(Ensure { ... })`), which can scan Tickets/Pods/orchestrator state and perform socket/status probing before fixture rows are fully ready.
+- Background/full-ready after first draw: `load_multi_pod_snapshot`, Ticket list/detail loading, Pod metadata/status checks, orchestrator lifecycle observation, row selection/re-render, and background diagnostics.
+
+### Changes
+
+- Added PTY E2E startup coverage for `yoi panel`:
+  - `panel_first_visible_render_arrives_before_background_reload` asserts `panel_ready` arrives within 1500 ms and before the held reload task starts.
+  - `panel_full_ready_has_separate_startup_budget` asserts first visible render within 1500 ms and full fixture rows within 5 s as a separate metric.
+- Deferred the initial Panel reload start until after the first loading frame is drawn, preserving later background reload correctness.
+- Kept Panel/terminal mouse capture to SGR + normal tracking (`?1006h` + `?1000h`) and avoided drag-capture (`?1002h`/`?1003h`) so existing PTY tests can confirm no drag-capture regression.
+
+### Guaranteed scope / residual gaps
+
+- Guaranteed by E2E fixture: real binary, PTY, first visible frame budget, held-reload ordering, separate full-ready row budget, no provider/network/secret dependency.
+- Residual live/manual gap: the reported ~7 s live Panel startup did not reproduce in this fixture. This change prevents initial reload/observation from blocking or contending with the first visible frame, but live-terminal confirmation is still needed if the remaining cause is workspace-specific (for example a large real Ticket/Pod set or slow live socket/status probe).
+
+
+---
