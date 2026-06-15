@@ -428,3 +428,46 @@ Repository status:
 - Child implementation worktree clean after follow-up commit.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KV5R5V2S-r3 at: 2026-06-15T15:27:07Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Evidence checked:
+- Third-pass target worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KV5R5V2S-plugin-enable-resolver`
+  - HEAD includes `07978d2d fix: persist plugin snapshots for restore`
+- Non-profile / spawn-config restore determinism:
+  - `pod_metadata_for_manifest` persists `resolved_manifest_snapshot` when either profile is present or `manifest.plugins.has_resolved_plan()` is true.
+  - Pending and active metadata writes use the helper.
+  - Restore path prefers `metadata.resolved_manifest_snapshot` when present and falls back only when absent.
+  - Existing profile behavior is preserved.
+  - Focused test `plugin_resolved_manifest_snapshot_is_persisted_without_profile` exercises profile-none metadata construction with resolved plugin records and verifies identity/version/digest are retained.
+- Docs/parser alignment:
+  - `docs/design/plugin-packages.md` now includes a minimal strict currently-valid `plugin.toml` example using `schema_version = 1`, `[runtime] kind = "wasm"`, and currently accepted hook metadata.
+  - Future/unsupported `[package]`, `[permissions]`, richer contributions, and `runtime.kind = "declarative"` are explicitly marked future/unsupported rather than current parser surface.
+  - Parser/tests align with current schema/runtime shape.
+- Prior acceptance spot-check:
+  - Discovery remains inactive without explicit enablement.
+  - Version mismatch and API incompatibility diagnostics are distinct.
+  - Diagnostics are bounded/sanitized.
+  - Authority grants fail closed.
+  - No Tool/Hook/Service/Ingress registration plumbing was added.
+
+Validation performed by reviewer:
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check 4772c4d6..HEAD`
+
+Validation not rerun by reviewer:
+- `cargo test`, `cargo check`, and `nix build .#yoi` were not rerun due read-only review scope. Coder-reported successful heavier validation was used as supporting evidence.
+
+Risk assessment:
+- Residual risk is low. Snapshot persistence is in the central Pod metadata helper and restore already prefers persisted snapshots.
+- Remaining coverage is unit/integration-level rather than full E2E process restore, matching current project E2E boundary and not a blocker for this Ticket.
+
+Conclusion:
+- Approved. No remaining blocker found.
+
+---
