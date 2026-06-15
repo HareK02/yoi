@@ -2,7 +2,7 @@
 title: 'Panel Ticket / Intake Pod row の視覚階層を改善する'
 state: 'queued'
 created_at: '2026-06-15T06:32:21Z'
-updated_at: '2026-06-15T06:37:02Z'
+updated_at: '2026-06-15T06:39:16Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['panel-ux', 'tui-layout', 'accessibility', 'row-selection']

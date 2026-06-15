@@ -30,3 +30,27 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-15T06:39:02Z -->
+
+## Decision
+
+Routing decision: implementation_ready_but_waiting_conflict_capacity
+
+Reason:
+- Ticket body / thread / relations / OrchestrationPlan / Orchestrator workspace state を確認した。要件・受け入れ条件・invariants は実装可能な粒度で揃っており、planning に戻す concrete missing information はない。
+- ただし同時に `00001KV4ZDMV1` を Panel composer key handling work として accept する。両者は `crates/tui/src/multi_pod.rs` / Panel rendering・input surface に触れる可能性があり、並行すると row rendering / selected row / action identity regression の確認が曖昧になる。
+- `00001KV4YAAVY` は single-Pod View selection で並行開始するため、現時点では Panel visual hierarchy work を追加 spawn せず、先行 Panel composer work の outcome を待つ。
+
+Evidence checked:
+- Ticket body/thread: visual hierarchy/readability requirements、accessibility、row-selection invariants、validation を確認。
+- Ticket relations: blocker なし。
+- OrchestrationPlan: 既存 record なし。
+- Orchestrator workspace: `/home/hare/Projects/yoi/.worktree/orchestration` は clean、`f0de8413` 上。
+- Visible Pods: implementation child Pod なし。これから `00001KV4YAAVY` と `00001KV4ZDMV1` を acceptance 予定。
+
+Next action:
+- `00001KV4ZDMV1` の implementation/review/integration 後、Panel rendering surface を再確認し、unblocked なら `queued -> inprogress` acceptance へ進む。
+- planning return ではなく queued のまま waiting とする。
+
+---
