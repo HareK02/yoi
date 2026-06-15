@@ -20,6 +20,7 @@ use crate::composer_history::{
 use crate::input::InputBuffer;
 use crate::scroll::Scroll;
 use crate::task::TaskStore;
+use crate::text_selection::TextSelectionState;
 use crate::view_mode::Mode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +294,10 @@ pub struct App {
     /// `[Session TaskStore snapshot]` system messages — no protocol
     /// surface added on the Pod side.
     pub task_store: TaskStore,
+    /// Transient single-Pod transcript text selection. This is viewport-local
+    /// UI state only; it is never sent to the Pod, persisted, or appended to
+    /// session history/model context.
+    pub text_selection: TextSelectionState,
     /// Whether the right-side task pane is currently open.
     pub task_pane_open: bool,
     /// Top entry index of the task pane's visible window. Clamped on
@@ -351,6 +356,7 @@ impl App {
             rewind_refresh_fence: false,
             greeting: None,
             task_store: TaskStore::new(),
+            text_selection: TextSelectionState::default(),
             task_pane_open: false,
             task_pane_scroll: 0,
             queued_inputs: VecDeque::new(),

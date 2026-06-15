@@ -1039,7 +1039,7 @@ fn ticket_intake_pod_row(intake: &TicketAssociatedIntakeEntry) -> PanelRow {
             pod_name: intake.pod_name.clone(),
         },
         kind: PanelRowKind::TicketIntakePod,
-        title: format!("↳ Intake Pod: {}", intake.pod_name),
+        title: format!("Intake Pod: {}", intake.pod_name),
         subtitle: Some(format!(
             "Ticket {} · {} · {}",
             intake.ticket_id,
