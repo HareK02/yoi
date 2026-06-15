@@ -354,3 +354,49 @@ Conclusion:
 - Approved. No remaining blocker found.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-15T16:39:57Z -->
+
+## Implementation report
+
+Integration report:
+
+Merged implementation branch into orchestration branch:
+- branch: `impl/00001KV5W3PHA-plugin-tool-surface`
+- implementation commits:
+  - `05a9c522 feat: register plugin tool surfaces`
+  - `3413bae7 fix: reject nested plugin tool schema errors`
+- merge commit: `204d0d02 merge: plugin tool surface registration`
+
+Reviewer result:
+- Initial review requested changes for nested invalid Plugin Tool schema validation.
+- Second-pass review `approve` recorded from `yoi-reviewer-00001KV5W3PHA-r2`.
+
+Validation in Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration`:
+- Passed: `cargo test -p pod plugin::tests --no-default-features`
+- Passed: `cargo test -p manifest plugin --no-default-features`
+  - 15 passed
+- Passed: `cargo check -p pod -p manifest -p llm-worker`
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check`
+
+Notes:
+- Broader `cargo test -p pod --no-default-features` was not rerun because coder had already reported existing unrelated prompt text assertion failures outside this change path.
+- Plugin Tool registration is feature-gated and enablement-gated.
+- Runtime execution remains an unavailable/runtime-missing stub; no Plugin code execution or WASM runtime was added.
+- Recursive schema validation now rejects nested invalid schema nodes before model-visible registration.
+- Orchestrator worktree is clean after validation.
+
+Cleanup planned:
+- Stop related coder/reviewer Pods.
+- Remove only child implementation worktree/branch for this Ticket.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-15T16:39:58Z from: inprogress to: done reason: merged_validated field: state -->
+
+## State changed
+
+Reviewer approved after requested schema validation fix, implementation branch merged into the orchestration branch, and focused validation passed in the Orchestrator worktree. Marking Ticket done in the orchestration branch.
+
+---
