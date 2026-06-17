@@ -1290,15 +1290,36 @@ impl FeatureRegistryBuilder {
         hook_builder: &mut HookRegistryBuilder,
     ) -> FeatureRegistryInstallReport {
         let mut pending_tools = Vec::new();
-        let report = self.install_into_pending(&mut pending_tools, hook_builder);
+        worker.tool_server_handle().flush_pending();
+        let registered_tool_names = worker
+            .tool_server_handle()
+            .tool_definitions_sorted()
+            .into_iter()
+            .map(|definition| (definition.name, FeatureId::builtin("preexisting-tool")))
+            .collect();
+        let report = self.install_into_pending_with_registered(
+            &mut pending_tools,
+            hook_builder,
+            registered_tool_names,
+        );
         worker.register_tools(pending_tools);
         report
     }
 
+    #[allow(dead_code)]
     pub(crate) fn install_into_pending(
         self,
         pending_tools: &mut Vec<ToolDefinition>,
         hook_builder: &mut HookRegistryBuilder,
+    ) -> FeatureRegistryInstallReport {
+        self.install_into_pending_with_registered(pending_tools, hook_builder, HashMap::new())
+    }
+
+    fn install_into_pending_with_registered(
+        self,
+        pending_tools: &mut Vec<ToolDefinition>,
+        hook_builder: &mut HookRegistryBuilder,
+        mut installed_tool_names: HashMap<String, FeatureId>,
     ) -> FeatureRegistryInstallReport {
         let descriptors: Vec<_> = self
             .modules
@@ -1307,7 +1328,6 @@ impl FeatureRegistryBuilder {
             .collect();
         let mut service_registry = FeatureServiceRegistry::default();
         let mut reports = Vec::with_capacity(self.modules.len());
-        let mut installed_tool_names = HashMap::new();
         let mut seen_features = HashSet::new();
 
         for (module, descriptor) in self.modules.into_iter().zip(descriptors.into_iter()) {
@@ -1455,6 +1475,7 @@ pub enum FeatureInstallError {
 }
 
 pub mod builtin;
+pub mod plugin;
 
 #[cfg(test)]
 mod tests {

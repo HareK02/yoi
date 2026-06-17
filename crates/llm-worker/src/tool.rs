@@ -127,6 +127,31 @@ impl From<String> for ToolOutput {
 // ToolMeta - Immutable Meta Information
 // =============================================================================
 
+/// Origin metadata for a registered tool.
+///
+/// This metadata is intentionally not part of the provider-facing tool schema.
+/// It lets host layers audit where a model-visible tool definition came from
+/// while keeping execution and permission semantics in the normal Worker path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOrigin {
+    /// Origin kind, for example `plugin` or `builtin`.
+    pub kind: String,
+    /// Package-local plugin id.
+    pub plugin_id: String,
+    /// Source-qualified plugin/package reference when `kind == "plugin"`.
+    pub plugin_ref: String,
+    /// Plugin source such as `user`, `project`, or `builtin`.
+    pub source: String,
+    /// Resolved package digest.
+    pub digest: String,
+    /// Resolved package version.
+    pub package_version: String,
+    /// Plugin API/schema version declared by the package.
+    pub package_api_version: u32,
+    /// Surface that contributed this tool. Plugin tools use `tool`.
+    pub surface: String,
+}
+
 /// Tool meta information (fixed at registration, immutable)
 ///
 /// Generated from `ToolDefinition` factory and does not change after registration with Worker.
@@ -139,6 +164,8 @@ pub struct ToolMeta {
     pub description: String,
     /// JSON Schema for arguments
     pub input_schema: Value,
+    /// Optional host-side origin metadata. This is not exposed to the LLM.
+    pub origin: Option<ToolOrigin>,
 }
 
 impl ToolMeta {
@@ -148,6 +175,7 @@ impl ToolMeta {
             name: name.into(),
             description: String::new(),
             input_schema: Value::Object(Default::default()),
+            origin: None,
         }
     }
 
@@ -160,6 +188,12 @@ impl ToolMeta {
     /// Set the argument schema
     pub fn input_schema(mut self, schema: Value) -> Self {
         self.input_schema = schema;
+        self
+    }
+
+    /// Set host-side origin metadata.
+    pub fn origin(mut self, origin: ToolOrigin) -> Self {
+        self.origin = Some(origin);
         self
     }
 }

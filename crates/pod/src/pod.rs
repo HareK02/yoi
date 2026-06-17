@@ -824,7 +824,6 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         registry: FeatureRegistryBuilder,
     ) -> FeatureRegistryInstallReport {
         let worker = self.worker.as_mut().expect("worker taken during run");
-        let report = registry.install_into_worker(worker, &mut self.hook_builder);
         let active_workflow_committer = self.log_writer.clone().map(|writer| {
             Arc::new(move |entry| writer.commit_log_entry(entry))
                 as active_workflow::LogEntryCommitter
@@ -833,6 +832,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             self.active_workflows.clone(),
             active_workflow_committer,
         ));
+        let report = registry.install_into_worker(worker, &mut self.hook_builder);
         report
     }
 
@@ -5353,6 +5353,7 @@ permission = "read"
                 surfaces: vec![manifest::plugin::PluginSurface::Hook],
                 runtime: None,
                 hooks: vec![],
+                tools: vec![],
             },
             enabled_surfaces: vec![manifest::plugin::PluginSurface::Hook],
             grants: manifest::plugin::PluginGrantConfig::default(),
