@@ -1,8 +1,8 @@
 ---
 title: 'Panel startup latency E2E を一覧データ描画完了基準に修正する'
-state: 'queued'
+state: 'inprogress'
 created_at: '2026-06-15T16:44:06Z'
-updated_at: '2026-06-17T09:46:03Z'
+updated_at: '2026-06-17T09:49:19Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['panel', 'e2e', 'startup-latency', 'readiness-metric', 'ticket-list-rendering']

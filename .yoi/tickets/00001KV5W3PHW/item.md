@@ -1,8 +1,8 @@
 ---
 title: 'Plugin: execute Plugin Tool with minimal WASM runtime'
-state: 'queued'
+state: 'inprogress'
 created_at: '2026-06-15T14:48:59Z'
-updated_at: '2026-06-17T09:46:10Z'
+updated_at: '2026-06-17T09:49:19Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['plugin', 'wasm', 'tool-runtime', 'sandbox', 'capability-boundary', 'cancellation']
