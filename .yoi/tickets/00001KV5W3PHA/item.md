@@ -1,8 +1,8 @@
 ---
 title: 'Plugin: register enabled Tool surface from packages'
-state: 'done'
+state: 'closed'
 created_at: '2026-06-15T14:48:59Z'
-updated_at: '2026-06-15T16:39:58Z'
+updated_at: '2026-06-17T05:44:04Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['plugin', 'tool-registry', 'model-visible-schema', 'capability-boundary', 'profile-config']
