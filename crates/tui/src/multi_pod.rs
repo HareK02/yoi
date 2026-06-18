@@ -925,14 +925,14 @@ impl PanelRowHitBox {
 }
 
 #[cfg(feature = "e2e-test")]
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct PanelE2eRowKey {
     kind: &'static str,
     id: String,
 }
 
 #[cfg(feature = "e2e-test")]
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct PanelE2eRect {
     x: u16,
     y: u16,
@@ -941,7 +941,7 @@ struct PanelE2eRect {
 }
 
 #[cfg(feature = "e2e-test")]
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct PanelE2eRenderedRow {
     key: PanelE2eRowKey,
     title: String,
@@ -951,10 +951,47 @@ struct PanelE2eRenderedRow {
 }
 
 #[cfg(feature = "e2e-test")]
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct PanelE2eRowsRendered {
     selected: Option<PanelE2eRowKey>,
     rows: Vec<PanelE2eRenderedRow>,
+}
+
+#[cfg(feature = "e2e-test")]
+#[derive(Debug, Serialize)]
+struct PanelE2eDashboardContentReady {
+    ticket_configured: bool,
+    selected: Option<PanelE2eRowKey>,
+    categories: PanelE2eDashboardCategories,
+    diagnostics: Vec<String>,
+    rows: Vec<PanelE2eRenderedRow>,
+}
+
+#[cfg(feature = "e2e-test")]
+#[derive(Debug, Serialize)]
+struct PanelE2eDashboardCategories {
+    ticket_rows: usize,
+    ready_ticket_rows: usize,
+    planning_ticket_rows: usize,
+    pod_rows: usize,
+    actionable_rows: usize,
+}
+
+#[cfg(feature = "e2e-test")]
+#[derive(Debug, Serialize)]
+struct PanelE2eSourceTiming {
+    source: &'static str,
+    elapsed_ms: u128,
+}
+
+#[cfg(feature = "e2e-test")]
+#[derive(Debug, Serialize)]
+struct PanelE2eDashboardSourceBreakdown {
+    total_elapsed_ms: u128,
+    sources: Vec<PanelE2eSourceTiming>,
+    ticket_rows: usize,
+    pod_rows: usize,
+    diagnostics: usize,
 }
 
 #[cfg(feature = "e2e-test")]
@@ -992,6 +1029,34 @@ fn panel_e2e_rect(rect: Rect) -> PanelE2eRect {
     }
 }
 
+#[cfg(feature = "e2e-test")]
+fn panel_e2e_dashboard_categories(rows: &[PanelE2eRenderedRow]) -> PanelE2eDashboardCategories {
+    PanelE2eDashboardCategories {
+        ticket_rows: rows.iter().filter(|row| row.key.kind == "ticket").count(),
+        ready_ticket_rows: rows
+            .iter()
+            .filter(|row| row.key.kind == "ticket" && row.status.as_deref() == Some("ready"))
+            .count(),
+        planning_ticket_rows: rows
+            .iter()
+            .filter(|row| row.key.kind == "ticket" && row.status.as_deref() == Some("planning"))
+            .count(),
+        pod_rows: rows.iter().filter(|row| row.key.kind == "pod").count(),
+        actionable_rows: rows.iter().filter(|row| row.action.is_some()).count(),
+    }
+}
+
+#[cfg(feature = "e2e-test")]
+fn panel_e2e_dashboard_content_is_ready(
+    ticket_configured: bool,
+    categories: &PanelE2eDashboardCategories,
+) -> bool {
+    ticket_configured
+        && categories.ready_ticket_rows > 0
+        && categories.planning_ticket_rows > 0
+        && categories.pod_rows > 0
+}
+
 pub(crate) struct MultiPodApp {
     pub(crate) list: PodList,
     pub(crate) panel: WorkspacePanelViewModel,
@@ -1010,6 +1075,8 @@ pub(crate) struct MultiPodApp {
     last_orchestrator_lifecycle_failure: Option<OrchestratorPanelState>,
     orchestrator_work_set: OrchestratorWorkSet,
     orchestrator_queue_attention: Option<OrchestratorQueueAttentionFreshness>,
+    #[cfg(feature = "e2e-test")]
+    emitted_dashboard_content_ready: bool,
 }
 
 impl MultiPodApp {
@@ -1046,6 +1113,8 @@ impl MultiPodApp {
             last_orchestrator_lifecycle_failure: None,
             orchestrator_work_set: OrchestratorWorkSet::default(),
             orchestrator_queue_attention: None,
+            #[cfg(feature = "e2e-test")]
+            emitted_dashboard_content_ready: false,
         }
     }
 
@@ -1355,8 +1424,8 @@ impl MultiPodApp {
     }
 
     #[cfg(feature = "e2e-test")]
-    fn emit_rows_rendered(&self) {
-        let rows = self
+    fn emit_rows_rendered(&mut self) {
+        let rows: Vec<_> = self
             .row_hit_boxes
             .iter()
             .map(|hit| {
@@ -1386,14 +1455,35 @@ impl MultiPodApp {
                 }
             })
             .collect();
+        let selected = self.selected_row.as_ref().map(panel_e2e_row_key);
         crate::e2e_observer::emit(
             "panel",
             "rows_rendered",
             PanelE2eRowsRendered {
-                selected: self.selected_row.as_ref().map(panel_e2e_row_key),
-                rows,
+                selected: selected.clone(),
+                rows: rows.clone(),
             },
         );
+        if !self.emitted_dashboard_content_ready {
+            let categories = panel_e2e_dashboard_categories(&rows);
+            if panel_e2e_dashboard_content_is_ready(
+                self.panel.header.ticket_configured,
+                &categories,
+            ) {
+                crate::e2e_observer::emit(
+                    "panel",
+                    "dashboard_content_ready",
+                    PanelE2eDashboardContentReady {
+                        ticket_configured: self.panel.header.ticket_configured,
+                        selected,
+                        categories,
+                        diagnostics: self.panel.header.diagnostics.clone(),
+                        rows,
+                    },
+                );
+                self.emitted_dashboard_content_ready = true;
+            }
+        }
     }
 
     fn ensure_selection_visible(&mut self) {
@@ -2286,12 +2376,35 @@ async fn load_multi_pod_snapshot(
     lifecycle_mode: OrchestratorLifecycleMode,
 ) -> Result<MultiPodSnapshot, MultiPodError> {
     let workspace_root = current_workspace_root();
+    #[cfg(feature = "e2e-test")]
+    let load_started = Instant::now();
+    #[cfg(feature = "e2e-test")]
+    let mut source_timings = Vec::new();
     let companion_pod_name = workspace_companion_pod_name(&workspace_root);
     let list_selected_name = selected_name
         .clone()
         .or_else(|| Some(companion_pod_name.clone()));
+
+    #[cfg(feature = "e2e-test")]
+    let source_started = Instant::now();
     let mut list = load_pod_list(list_selected_name.clone(), MAX_ENTRIES).await?;
+    #[cfg(feature = "e2e-test")]
+    source_timings.push(PanelE2eSourceTiming {
+        source: "pod_list.initial",
+        elapsed_ms: source_started.elapsed().as_millis(),
+    });
+
+    #[cfg(feature = "e2e-test")]
+    let source_started = Instant::now();
     let companion_presence = load_exact_companion_pod_presence(&companion_pod_name).await?;
+    #[cfg(feature = "e2e-test")]
+    source_timings.push(PanelE2eSourceTiming {
+        source: "companion.presence",
+        elapsed_ms: source_started.elapsed().as_millis(),
+    });
+
+    #[cfg(feature = "e2e-test")]
+    let source_started = Instant::now();
     let companion = match lifecycle_mode.clone() {
         OrchestratorLifecycleMode::Ensure { runtime_command } => {
             ensure_workspace_companion(
@@ -2306,17 +2419,48 @@ async fn load_multi_pod_snapshot(
             observe_workspace_companion(companion_pod_name, companion_presence)
         }
     };
+    #[cfg(feature = "e2e-test")]
+    source_timings.push(PanelE2eSourceTiming {
+        source: "companion.lifecycle",
+        elapsed_ms: source_started.elapsed().as_millis(),
+    });
     if companion.reload_pods {
+        #[cfg(feature = "e2e-test")]
+        let source_started = Instant::now();
         list = load_pod_list(list_selected_name.clone(), MAX_ENTRIES).await?;
+        #[cfg(feature = "e2e-test")]
+        source_timings.push(PanelE2eSourceTiming {
+            source: "pod_list.after_companion_reload",
+            elapsed_ms: source_started.elapsed().as_millis(),
+        });
     }
+
+    #[cfg(feature = "e2e-test")]
+    let source_started = Instant::now();
     let config = ticket_config_availability(&workspace_root);
+    #[cfg(feature = "e2e-test")]
+    source_timings.push(PanelE2eSourceTiming {
+        source: "ticket_config",
+        elapsed_ms: source_started.elapsed().as_millis(),
+    });
+
     let orchestrator_pod_name = workspace_orchestrator_pod_name(&workspace_root);
+    #[cfg(feature = "e2e-test")]
+    let source_started = Instant::now();
     let orchestrator_presence = match &config {
         TicketConfigAvailability::Absent | TicketConfigAvailability::Unusable(_) => None,
         TicketConfigAvailability::Usable => {
             Some(load_exact_pod_presence(&orchestrator_pod_name).await?)
         }
     };
+    #[cfg(feature = "e2e-test")]
+    source_timings.push(PanelE2eSourceTiming {
+        source: "orchestrator.presence",
+        elapsed_ms: source_started.elapsed().as_millis(),
+    });
+
+    #[cfg(feature = "e2e-test")]
+    let source_started = Instant::now();
     let orchestrator = match lifecycle_mode {
         OrchestratorLifecycleMode::Ensure { runtime_command } => {
             ensure_workspace_orchestrator(
@@ -2332,14 +2476,51 @@ async fn load_multi_pod_snapshot(
             observe_workspace_orchestrator(config, orchestrator_pod_name, orchestrator_presence)
         }
     };
+    #[cfg(feature = "e2e-test")]
+    source_timings.push(PanelE2eSourceTiming {
+        source: "orchestrator.lifecycle",
+        elapsed_ms: source_started.elapsed().as_millis(),
+    });
     if orchestrator.reload_pods {
+        #[cfg(feature = "e2e-test")]
+        let source_started = Instant::now();
         list = load_pod_list(list_selected_name, MAX_ENTRIES).await?;
+        #[cfg(feature = "e2e-test")]
+        source_timings.push(PanelE2eSourceTiming {
+            source: "pod_list.after_orchestrator_reload",
+            elapsed_ms: source_started.elapsed().as_millis(),
+        });
     }
+
+    #[cfg(feature = "e2e-test")]
+    let source_started = Instant::now();
     let mut panel = build_workspace_panel(&workspace_root, &list);
     panel.header.companion = companion.state;
     panel.header.diagnostics.extend(companion.diagnostics);
     panel.header.orchestrator = orchestrator.state;
     panel.header.diagnostics.extend(orchestrator.diagnostics);
+    #[cfg(feature = "e2e-test")]
+    source_timings.push(PanelE2eSourceTiming {
+        source: "workspace_panel.build",
+        elapsed_ms: source_started.elapsed().as_millis(),
+    });
+
+    #[cfg(feature = "e2e-test")]
+    crate::e2e_observer::emit(
+        "panel",
+        "dashboard_source_breakdown",
+        PanelE2eDashboardSourceBreakdown {
+            total_elapsed_ms: load_started.elapsed().as_millis(),
+            sources: source_timings,
+            ticket_rows: panel
+                .rows
+                .iter()
+                .filter(|row| row.is_ticket_action())
+                .count(),
+            pod_rows: list.entries.len(),
+            diagnostics: panel.header.diagnostics.len(),
+        },
+    );
     Ok(MultiPodSnapshot { list, panel })
 }
 

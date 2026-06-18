@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 const FIRST_VISIBLE_RENDER_BUDGET: Duration = Duration::from_millis(1500);
-const ROWS_READY_BUDGET: Duration = Duration::from_secs(5);
+const DASHBOARD_CONTENT_READY_BUDGET: Duration = Duration::from_secs(5);
 
 use yoi_e2e::{
     ExpectedPanelTicketRow, FixtureCleanupReport, FixtureWorkspace, KeyPress, PanelHarness,
@@ -114,11 +114,11 @@ fn panel_first_visible_render_arrives_before_background_reload() -> yoi_e2e::Res
 }
 
 #[test]
-fn panel_fixture_ticket_row_ready_has_startup_budget() -> yoi_e2e::Result<()> {
+fn panel_dashboard_content_ready_has_startup_budget() -> yoi_e2e::Result<()> {
     let binary = yoi_binary()?;
     let fixture = FixtureWorkspace::new(&binary)?;
     assert_fixture_paths_are_isolated(&fixture);
-    let ready_ticket = fixture.ready_fixture_ticket_row();
+    let expected_content = fixture.expected_dashboard_content();
 
     let started = Instant::now();
     let mut panel = PanelHarness::spawn(fixture.panel_config(binary))?;
@@ -137,23 +137,47 @@ fn panel_fixture_ticket_row_ready_has_startup_budget() -> yoi_e2e::Result<()> {
         panel.artifacts().dir.display()
     );
 
-    let rows_ready_remaining = ROWS_READY_BUDGET
+    let content_ready_remaining = DASHBOARD_CONTENT_READY_BUDGET
         .checked_sub(started.elapsed())
         .unwrap_or_else(|| Duration::from_millis(0));
-    let rows = panel.wait_for_fixture_ticket_rows_ready(&ready_ticket, rows_ready_remaining)?;
+    let content_ready =
+        panel.wait_for_dashboard_content_ready(&expected_content, content_ready_remaining)?;
     assert!(
-        rows.has_fixture_ticket_row(&ready_ticket),
-        "rows-ready event must contain concrete ready fixture Ticket row; artifacts at {}",
+        content_ready.ticket_configured,
+        "dashboard content ready must include usable Ticket configuration; artifacts at {}",
         panel.artifacts().dir.display()
     );
-    let rows_ready_elapsed = started.elapsed();
+    assert!(
+        content_ready.categories.ready_ticket_rows > 0
+            && content_ready.categories.planning_ticket_rows > 0
+            && content_ready.categories.pod_rows > 0,
+        "dashboard content ready must include ready Ticket, planning Ticket, and Pod categories; got {:?}; artifacts at {}",
+        content_ready.categories,
+        panel.artifacts().dir.display()
+    );
+    let content_ready_elapsed = started.elapsed();
     eprintln!(
-        "panel fixture rows ready: {rows_ready_elapsed:?} (budget {ROWS_READY_BUDGET:?}); artifacts at {}",
+        "panel dashboard content ready: {content_ready_elapsed:?} (budget {DASHBOARD_CONTENT_READY_BUDGET:?}; first frame {first_visible_elapsed:?}); artifacts at {}",
         panel.artifacts().dir.display()
     );
     assert!(
-        rows_ready_elapsed <= ROWS_READY_BUDGET,
-        "fixture rows ready took {rows_ready_elapsed:?}, budget {ROWS_READY_BUDGET:?}; artifacts at {}",
+        content_ready_elapsed <= DASHBOARD_CONTENT_READY_BUDGET,
+        "dashboard content ready took {content_ready_elapsed:?}, budget {DASHBOARD_CONTENT_READY_BUDGET:?}; artifacts at {}",
+        panel.artifacts().dir.display()
+    );
+
+    let source_breakdown = panel.expect_dashboard_source_breakdown()?;
+    assert!(
+        source_breakdown.has_source("pod_list.initial")
+            && source_breakdown.has_source("ticket_config")
+            && source_breakdown.has_source("workspace_panel.build"),
+        "dashboard source breakdown should include pod, ticket, and panel-build sources; got {:?}; artifacts at {}",
+        source_breakdown,
+        panel.artifacts().dir.display()
+    );
+    eprintln!(
+        "panel dashboard source breakdown: {:?}; artifacts at {}",
+        source_breakdown,
         panel.artifacts().dir.display()
     );
 

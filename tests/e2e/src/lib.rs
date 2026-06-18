@@ -298,6 +298,104 @@ impl ExpectedPanelTicketRow {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedDashboardContent {
+    pub tickets: Vec<ExpectedPanelTicketRow>,
+    pub pod_names: Vec<String>,
+}
+
+impl ExpectedDashboardContent {
+    fn description(&self) -> String {
+        let tickets = self
+            .tickets
+            .iter()
+            .map(ExpectedPanelTicketRow::description)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let pods = self.pod_names.join(", ");
+        format!("tickets=[{tickets}] pods=[{pods}]")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DashboardContentSnapshot {
+    pub tickets: Vec<ExpectedPanelTicketRow>,
+    pub pod_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardContentReady {
+    pub ticket_configured: bool,
+    pub selected: Option<PanelRowKey>,
+    pub categories: DashboardContentCategories,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+    pub rows: Vec<RenderedPanelRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardContentCategories {
+    pub ticket_rows: usize,
+    pub ready_ticket_rows: usize,
+    pub planning_ticket_rows: usize,
+    pub pod_rows: usize,
+    pub actionable_rows: usize,
+}
+
+impl DashboardContentReady {
+    pub fn rows_rendered(&self) -> RowsRendered {
+        RowsRendered {
+            selected: self.selected.clone(),
+            rows: self.rows.clone(),
+        }
+    }
+
+    pub fn snapshot_for_expected(
+        &self,
+        expected: &ExpectedDashboardContent,
+    ) -> DashboardContentSnapshot {
+        DashboardContentSnapshot {
+            tickets: expected
+                .tickets
+                .iter()
+                .filter(|ticket| self.rows.iter().any(|row| ticket.matches(row)))
+                .cloned()
+                .collect(),
+            pod_names: expected
+                .pod_names
+                .iter()
+                .filter(|pod_name| {
+                    self.rows
+                        .iter()
+                        .any(|row| row.key.kind == "pod" && row.key.id == pod_name.as_str())
+                })
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardSourceBreakdown {
+    pub total_elapsed_ms: u128,
+    pub sources: Vec<DashboardSourceTiming>,
+    pub ticket_rows: usize,
+    pub pod_rows: usize,
+    pub diagnostics: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardSourceTiming {
+    pub source: String,
+    pub elapsed_ms: u128,
+}
+
+impl DashboardSourceBreakdown {
+    pub fn has_source(&self, source: &str) -> bool {
+        self.sources.iter().any(|timing| timing.source == source)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RowsRendered {
     pub selected: Option<PanelRowKey>,
@@ -540,6 +638,52 @@ impl PanelHarness {
             },
         )?;
         serde_json::from_value(event.data).map_err(HarnessError::from)
+    }
+
+    /// Waits for the dashboard-content-ready observer event. Unlike first-frame
+    /// or row-count readiness, this requires representative user-visible content:
+    /// ready + planning Ticket rows and a Pod row, then checks the fixture-specific
+    /// rows as a small snapshot of the expected dashboard content.
+    pub fn wait_for_dashboard_content_ready(
+        &mut self,
+        expected: &ExpectedDashboardContent,
+        timeout: Duration,
+    ) -> Result<DashboardContentReady> {
+        let expected_snapshot = DashboardContentSnapshot {
+            tickets: expected.tickets.clone(),
+            pod_names: expected.pod_names.clone(),
+        };
+        let description = expected.description();
+        let event = self.wait_for(
+            format!("dashboard content ready ({description})"),
+            timeout,
+            |event| {
+                if event.event != "dashboard_content_ready" {
+                    return false;
+                }
+                serde_json::from_value::<DashboardContentReady>(event.data.clone())
+                    .map(|ready| ready.snapshot_for_expected(expected) == expected_snapshot)
+                    .unwrap_or(false)
+            },
+        )?;
+        serde_json::from_value(event.data).map_err(HarnessError::from)
+    }
+
+    pub fn latest_dashboard_source_breakdown(
+        &mut self,
+    ) -> Result<Option<DashboardSourceBreakdown>> {
+        Ok(self
+            .events()?
+            .into_iter()
+            .rev()
+            .filter(|event| event.event == "dashboard_source_breakdown")
+            .find_map(|event| serde_json::from_value(event.data).ok()))
+    }
+
+    pub fn expect_dashboard_source_breakdown(&mut self) -> Result<DashboardSourceBreakdown> {
+        self.latest_dashboard_source_breakdown()?.ok_or_else(|| {
+            HarnessError::Protocol("missing dashboard_source_breakdown observer event".to_string())
+        })
     }
 
     pub fn assert_fixture_ticket_row_not_rendered(
@@ -1039,6 +1183,24 @@ impl FixtureWorkspace {
             READY_FIXTURE_TICKET_TITLE,
             "ready",
         )
+    }
+
+    pub fn planning_fixture_ticket_row(&self) -> ExpectedPanelTicketRow {
+        ExpectedPanelTicketRow::new(
+            self.planning_ticket_id.clone(),
+            PLANNING_FIXTURE_TICKET_TITLE,
+            "planning",
+        )
+    }
+
+    pub fn expected_dashboard_content(&self) -> ExpectedDashboardContent {
+        ExpectedDashboardContent {
+            tickets: vec![
+                self.ready_fixture_ticket_row(),
+                self.planning_fixture_ticket_row(),
+            ],
+            pod_names: vec!["workspace".to_string()],
+        }
     }
 
     pub fn panel_config(&self, binary: PathBuf) -> PanelHarnessConfig {
