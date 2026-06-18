@@ -1,8 +1,8 @@
 ---
 title: 'Panel 表示を現在 workspace の Pod に限定する'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-06-18T14:09:59Z'
-updated_at: '2026-06-18T15:37:52Z'
+updated_at: '2026-06-18T15:40:38Z'
 assignee: null
 readiness: 'ready'
 risk_flags: ['panel', 'pod-metadata', 'workspace-boundary', 'runtime-observation']
