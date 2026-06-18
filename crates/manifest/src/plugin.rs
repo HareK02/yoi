@@ -637,6 +637,146 @@ pub fn resolve_plugin_config_for_startup(
     snapshot
 }
 
+/// Load the recorded WASM runtime module for a resolved plugin package.
+///
+/// Restore and execution paths use this helper instead of reading arbitrary
+/// package paths directly so module selection remains tied to the resolved
+/// package identity, runtime manifest entry, and deterministic package digest.
+pub fn read_resolved_plugin_runtime_module(
+    record: &ResolvedPluginRecord,
+    limits: &PluginDiscoveryLimits,
+) -> Result<Vec<u8>, PluginDiagnostic> {
+    let runtime = record.manifest.runtime.as_ref().ok_or_else(|| {
+        PluginDiagnostic::new(
+            PluginDiagnosticKind::Missing,
+            PluginDiagnosticPhase::Manifest,
+            "resolved plugin package does not declare a WASM runtime",
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(&record.digest)
+    })?;
+
+    if runtime.kind != "wasm" {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Api,
+            PluginDiagnosticPhase::Manifest,
+            "plugin runtime kind is unsupported",
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(&record.digest));
+    }
+    if runtime.abi.as_deref() != Some("yoi-plugin-wasm-1") {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Api,
+            PluginDiagnosticPhase::Manifest,
+            "plugin WASM ABI is unsupported",
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(&record.digest));
+    }
+
+    let metadata = fs::metadata(&record.package_path).map_err(|error| {
+        PluginDiagnostic::new(
+            PluginDiagnosticKind::Io,
+            PluginDiagnosticPhase::Discovery,
+            format!(
+                "resolved plugin package metadata could not be read: {}",
+                safe_io_error(&error)
+            ),
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(&record.digest)
+    })?;
+    if !metadata.is_file() {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Malformed,
+            PluginDiagnosticPhase::Discovery,
+            "resolved plugin package is not a regular file",
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(&record.digest));
+    }
+    if metadata.len() > limits.max_package_size_bytes {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Bounds,
+            PluginDiagnosticPhase::Discovery,
+            "resolved plugin package exceeds the configured package size bound",
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(&record.digest));
+    }
+
+    let bytes = fs::read(&record.package_path).map_err(|error| {
+        PluginDiagnostic::new(
+            PluginDiagnosticKind::Io,
+            PluginDiagnosticPhase::Discovery,
+            format!(
+                "resolved plugin package content could not be read: {}",
+                safe_io_error(&error)
+            ),
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(&record.digest)
+    })?;
+    let archive = parse_stored_zip(&bytes, &record.package_label, record.source, limits)?;
+    let actual_digest = deterministic_digest(&archive.files);
+    if !digest_matches(&record.digest, &actual_digest) {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Digest,
+            PluginDiagnosticPhase::Resolution,
+            "resolved plugin package digest does not match current package content",
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(actual_digest));
+    }
+
+    validate_manifest_path(
+        &runtime.entry,
+        &archive,
+        &record.package_label,
+        record.source,
+        &record.manifest.id,
+    )?;
+    let normalized = normalize_archive_path(&runtime.entry).ok_or_else(|| {
+        PluginDiagnostic::new(
+            PluginDiagnosticKind::Traversal,
+            PluginDiagnosticPhase::Manifest,
+            "plugin manifest references a path outside the package root",
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(&record.digest)
+    })?;
+    archive.files.get(&normalized).cloned().ok_or_else(|| {
+        PluginDiagnostic::new(
+            PluginDiagnosticKind::Missing,
+            PluginDiagnosticPhase::Manifest,
+            "plugin runtime module entry is missing from the package",
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(&record.digest)
+    })
+}
+
 #[derive(Clone, Debug)]
 struct PluginStore {
     source: PluginSourceKind,

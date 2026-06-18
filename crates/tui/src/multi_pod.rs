@@ -151,9 +151,13 @@ pub(crate) async fn run(
         #[cfg(feature = "e2e-test")]
         {
             if !emitted_panel_ready {
+                // `panel_ready` is a first-visible-frame signal only. E2E tests that need
+                // list/data readiness must wait for a concrete `rows_rendered` fixture row.
                 crate::e2e_observer::emit("panel", "panel_ready", serde_json::json!({}));
                 emitted_panel_ready = true;
             }
+            // Emit every drawn row snapshot separately so tests can assert data-backed row
+            // readiness without conflating it with the first frame.
             app.emit_rows_rendered();
         }
 
