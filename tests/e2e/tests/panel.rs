@@ -4,28 +4,106 @@ const FIRST_VISIBLE_RENDER_BUDGET: Duration = Duration::from_millis(1500);
 const DASHBOARD_CONTENT_READY_BUDGET: Duration = Duration::from_secs(5);
 
 use yoi_e2e::{
+    DashboardCompanionState, DashboardContentCategories, DashboardContentReady, DashboardHeader,
+    DashboardOrchestratorState, DashboardSnapshot, ExpectedDashboardContent,
     ExpectedPanelTicketRow, FixtureCleanupReport, FixtureWorkspace, KeyPress, PanelHarness,
     PanelRect, PanelRowKey, RenderedPanelRow, RowsRendered, yoi_binary,
 };
 
-#[test]
-fn panel_fixture_ticket_row_matcher_rejects_absent_fixture_data() {
-    let expected = ExpectedPanelTicketRow::new("0000000000000", "Ready E2E Ticket", "ready");
-    let wrong_title = RenderedPanelRow {
+fn rendered_ticket_row(
+    id: &str,
+    title: &str,
+    status: &str,
+    action: Option<&str>,
+    disabled_reason: Option<&str>,
+    local_state: Option<&str>,
+    overlay_state: Option<&str>,
+) -> RenderedPanelRow {
+    RenderedPanelRow {
         key: PanelRowKey {
             kind: "ticket".to_string(),
-            id: "0000000000000".to_string(),
+            id: id.to_string(),
         },
-        title: "Different Ticket".to_string(),
-        status: Some("ready".to_string()),
-        action: None,
+        title: title.to_string(),
+        status: Some(status.to_string()),
+        action: action.map(ToOwned::to_owned),
+        disabled_reason: disabled_reason.map(ToOwned::to_owned),
+        local_state: local_state.map(ToOwned::to_owned),
+        overlay_state: overlay_state.map(ToOwned::to_owned),
+        overlay_detail: overlay_state.map(|state| format!("orchestration:{state}")),
         rect: PanelRect {
             x: 0,
             y: 0,
             width: 10,
             height: 1,
         },
-    };
+    }
+}
+
+fn rendered_pod_row(name: &str) -> RenderedPanelRow {
+    RenderedPanelRow {
+        key: PanelRowKey {
+            kind: "pod".to_string(),
+            id: name.to_string(),
+        },
+        title: name.to_string(),
+        status: None,
+        action: None,
+        disabled_reason: None,
+        local_state: None,
+        overlay_state: None,
+        overlay_detail: None,
+        rect: PanelRect {
+            x: 0,
+            y: 1,
+            width: 10,
+            height: 1,
+        },
+    }
+}
+
+fn ready_snapshot(rows: Vec<RenderedPanelRow>) -> DashboardContentReady {
+    DashboardContentReady {
+        snapshot: DashboardSnapshot {
+            header: DashboardHeader {
+                ticket_configured: true,
+                companion: Some(DashboardCompanionState {
+                    pod_name: "workspace".to_string(),
+                    status: "unavailable".to_string(),
+                }),
+                orchestrator: Some(DashboardOrchestratorState {
+                    pod_name: "workspace-orchestrator".to_string(),
+                    status: "unavailable".to_string(),
+                    detail: Some("fixture blocks host Pod launch".to_string()),
+                }),
+                diagnostics: vec![],
+            },
+            rows,
+        },
+        categories: DashboardContentCategories {
+            ticket_rows: 2,
+            ready_ticket_rows: 1,
+            planning_ticket_rows: 1,
+            pod_rows: 1,
+            actionable_rows: 2,
+        },
+    }
+}
+
+#[test]
+fn panel_fixture_ticket_row_matcher_rejects_absent_fixture_data() {
+    let expected = ExpectedPanelTicketRow::new("0000000000000", "Ready E2E Ticket", "ready")
+        .with_action("Queue")
+        .with_local_state("ready");
+    let wrong_title = rendered_ticket_row(
+        "0000000000000",
+        "Different Ticket",
+        "ready",
+        Some("Queue"),
+        None,
+        Some("ready"),
+        None,
+    );
     let wrong_kind = RenderedPanelRow {
         key: PanelRowKey {
             kind: "pod".to_string(),
@@ -33,7 +111,11 @@ fn panel_fixture_ticket_row_matcher_rejects_absent_fixture_data() {
         },
         title: "Ready E2E Ticket".to_string(),
         status: Some("ready".to_string()),
-        action: None,
+        action: Some("Queue".to_string()),
+        disabled_reason: None,
+        local_state: Some("ready".to_string()),
+        overlay_state: None,
+        overlay_detail: None,
         rect: PanelRect {
             x: 0,
             y: 0,
@@ -49,6 +131,91 @@ fn panel_fixture_ticket_row_matcher_rejects_absent_fixture_data() {
         rows: vec![wrong_title, wrong_kind],
     };
     assert!(!rows.has_fixture_ticket_row(&expected));
+}
+
+#[test]
+fn dashboard_snapshot_rejects_missing_row_wrong_state_missing_overlay_and_missing_action() {
+    let expected_ready = ExpectedPanelTicketRow::new("ready-id", "Ready E2E Ticket", "ready→prog")
+        .with_action("Wait")
+        .with_disabled_reason("orchestration worktree overlay shows Ticket state inprogress")
+        .with_local_state("ready")
+        .with_overlay_state("inprogress");
+    let expected_planning =
+        ExpectedPanelTicketRow::new("planning-id", "Planning E2E Ticket", "planning")
+            .with_action("Clarify")
+            .with_disabled_reason("Ticket is still in planning")
+            .with_local_state("planning");
+    let expected = ExpectedDashboardContent {
+        tickets: vec![expected_ready.clone(), expected_planning.clone()],
+        pod_names: vec!["workspace".to_string()],
+        companion_status: "unavailable".to_string(),
+        orchestrator_status: "unavailable".to_string(),
+    };
+    let complete_rows = || {
+        vec![
+            rendered_ticket_row(
+                "ready-id",
+                "Ready E2E Ticket",
+                "ready→prog",
+                Some("Wait"),
+                Some("orchestration worktree overlay shows Ticket state inprogress"),
+                Some("ready"),
+                Some("inprogress"),
+            ),
+            rendered_ticket_row(
+                "planning-id",
+                "Planning E2E Ticket",
+                "planning",
+                Some("Clarify"),
+                Some("Ticket is still in planning"),
+                Some("planning"),
+                None,
+            ),
+            rendered_pod_row("workspace"),
+        ]
+    };
+    assert_eq!(
+        ready_snapshot(complete_rows()).snapshot_for_expected(&expected),
+        expected.snapshot()
+    );
+
+    let missing_row = ready_snapshot(vec![
+        rendered_ticket_row(
+            "ready-id",
+            "Ready E2E Ticket",
+            "ready→prog",
+            Some("Wait"),
+            Some("orchestration worktree overlay shows Ticket state inprogress"),
+            Some("ready"),
+            Some("inprogress"),
+        ),
+        rendered_pod_row("workspace"),
+    ]);
+    assert_ne!(
+        missing_row.snapshot_for_expected(&expected),
+        expected.snapshot()
+    );
+
+    let mut wrong_state_rows = complete_rows();
+    wrong_state_rows[0].status = Some("ready".to_string());
+    assert_ne!(
+        ready_snapshot(wrong_state_rows).snapshot_for_expected(&expected),
+        expected.snapshot()
+    );
+
+    let mut missing_overlay_rows = complete_rows();
+    missing_overlay_rows[0].overlay_state = None;
+    assert_ne!(
+        ready_snapshot(missing_overlay_rows).snapshot_for_expected(&expected),
+        expected.snapshot()
+    );
+
+    let mut missing_action_rows = complete_rows();
+    missing_action_rows[0].action = None;
+    assert_ne!(
+        ready_snapshot(missing_action_rows).snapshot_for_expected(&expected),
+        expected.snapshot()
+    );
 }
 
 #[test]
@@ -143,8 +310,21 @@ fn panel_dashboard_content_ready_has_startup_budget() -> yoi_e2e::Result<()> {
     let content_ready =
         panel.wait_for_dashboard_content_ready(&expected_content, content_ready_remaining)?;
     assert!(
-        content_ready.ticket_configured,
+        content_ready.snapshot.header.ticket_configured,
         "dashboard content ready must include usable Ticket configuration; artifacts at {}",
+        panel.artifacts().dir.display()
+    );
+    assert!(
+        content_ready.snapshot.header.companion.is_some()
+            && content_ready.snapshot.header.orchestrator.is_some(),
+        "dashboard content ready must include Companion and Orchestrator header status; got {:?}; artifacts at {}",
+        content_ready.snapshot.header,
+        panel.artifacts().dir.display()
+    );
+    assert_eq!(
+        content_ready.snapshot_for_expected(&expected_content),
+        expected_content.snapshot(),
+        "dashboard content ready must match expected Ticket/action/overlay/header snapshot; artifacts at {}",
         panel.artifacts().dir.display()
     );
     assert!(
@@ -168,10 +348,13 @@ fn panel_dashboard_content_ready_has_startup_budget() -> yoi_e2e::Result<()> {
 
     let source_breakdown = panel.expect_dashboard_source_breakdown()?;
     assert!(
-        source_breakdown.has_source("pod_list.initial")
-            && source_breakdown.has_source("ticket_config")
-            && source_breakdown.has_source("workspace_panel.build"),
-        "dashboard source breakdown should include pod, ticket, and panel-build sources; got {:?}; artifacts at {}",
+        source_breakdown.has_source("pod_metadata_status_probe.initial")
+            && source_breakdown.has_source("ticket_config_probe")
+            && source_breakdown.has_source("local_claim_scan")
+            && source_breakdown.has_source("ticket_scan_parse")
+            && source_breakdown.has_source("orchestration_overlay_validation_read_git")
+            && source_breakdown.has_source("workspace_panel.build.total"),
+        "dashboard source breakdown should include pod metadata/status, ticket scan/parse, overlay validation/read/git, local claim scan, and panel-build sources; got {:?}; artifacts at {}",
         source_breakdown,
         panel.artifacts().dir.display()
     );

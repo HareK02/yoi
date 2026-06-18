@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(feature = "e2e-test")]
+use std::time::Instant;
 
 use protocol::PodStatus;
 use ticket::config::{
@@ -731,6 +733,7 @@ fn git_output(worktree_root: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+#[cfg_attr(feature = "e2e-test", allow(dead_code))]
 pub(crate) fn build_workspace_panel(
     workspace_root: &Path,
     pods: &PodList,
@@ -756,6 +759,148 @@ pub(crate) fn build_workspace_panel(
         }
     };
     build_workspace_panel_with_registry(workspace_root, pods, &registry)
+}
+
+#[cfg(feature = "e2e-test")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspacePanelE2eSourceTiming {
+    pub(crate) source: &'static str,
+    pub(crate) elapsed_ms: u128,
+}
+
+#[cfg(feature = "e2e-test")]
+pub(crate) fn build_workspace_panel_with_e2e_timings(
+    workspace_root: &Path,
+    pods: &PodList,
+) -> (WorkspacePanelViewModel, Vec<WorkspacePanelE2eSourceTiming>) {
+    let mut timings = Vec::new();
+    let started = Instant::now();
+    let registry = match PanelRegistryStore::default_for_workspace(workspace_root)
+        .and_then(|store| store.snapshot())
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            timings.push(WorkspacePanelE2eSourceTiming {
+                source: "local_claim_scan",
+                elapsed_ms: started.elapsed().as_millis(),
+            });
+            let mut model = WorkspacePanelViewModel::empty(workspace_root);
+            model
+                .header
+                .diagnostics
+                .push(bounded_panel_diagnostic(format!(
+                    "Panel local role registry unavailable: {error}"
+                )));
+            return (
+                build_workspace_panel_with_registry_model(
+                    model,
+                    workspace_root,
+                    pods,
+                    &PanelRegistrySnapshot::empty(),
+                ),
+                timings,
+            );
+        }
+    };
+    timings.push(WorkspacePanelE2eSourceTiming {
+        source: "local_claim_scan",
+        elapsed_ms: started.elapsed().as_millis(),
+    });
+
+    let mut model = WorkspacePanelViewModel::empty(workspace_root);
+    let started = Instant::now();
+    let availability = ticket_config_availability(workspace_root);
+    timings.push(WorkspacePanelE2eSourceTiming {
+        source: "ticket_config_probe",
+        elapsed_ms: started.elapsed().as_millis(),
+    });
+    match availability {
+        TicketConfigAvailability::Absent => {}
+        TicketConfigAvailability::Usable => {
+            model.header.ticket_configured = true;
+            model.composer = WorkspacePanelComposer::ticket_enabled();
+            let started = Instant::now();
+            match TicketConfig::load_workspace(workspace_root) {
+                Ok(config) => {
+                    timings.push(WorkspacePanelE2eSourceTiming {
+                        source: "ticket_config_parse",
+                        elapsed_ms: started.elapsed().as_millis(),
+                    });
+                    model.header.ticket_root = config.backend_root().to_path_buf();
+                    let backend = LocalTicketBackend::new(config.backend_root().to_path_buf())
+                        .with_record_language(config.ticket_record_language());
+                    let started = Instant::now();
+                    let orchestration_overlay =
+                        load_orchestration_ticket_overlay(workspace_root, &config);
+                    timings.push(WorkspacePanelE2eSourceTiming {
+                        source: "orchestration_overlay_validation_read_git",
+                        elapsed_ms: started.elapsed().as_millis(),
+                    });
+                    let started = Instant::now();
+                    match build_ticket_rows(
+                        &backend,
+                        pods,
+                        &registry,
+                        &orchestration_overlay.states,
+                    ) {
+                        Ok(ticket_rows) => {
+                            timings.push(WorkspacePanelE2eSourceTiming {
+                                source: "ticket_scan_parse",
+                                elapsed_ms: started.elapsed().as_millis(),
+                            });
+                            model.rows.extend(ticket_rows.rows);
+                            model.header.diagnostics.extend(ticket_rows.diagnostics);
+                            model
+                                .header
+                                .diagnostics
+                                .extend(orchestration_overlay.diagnostics);
+                        }
+                        Err(error) => {
+                            timings.push(WorkspacePanelE2eSourceTiming {
+                                source: "ticket_scan_parse",
+                                elapsed_ms: started.elapsed().as_millis(),
+                            });
+                            model
+                                .header
+                                .diagnostics
+                                .push(bounded_panel_diagnostic(format!(
+                                    "Ticket rows unavailable: {error}"
+                                )))
+                        }
+                    }
+                }
+                Err(error) => {
+                    timings.push(WorkspacePanelE2eSourceTiming {
+                        source: "ticket_config_parse",
+                        elapsed_ms: started.elapsed().as_millis(),
+                    });
+                    model
+                        .header
+                        .diagnostics
+                        .push(bounded_panel_diagnostic(format!(
+                            "Ticket config is unusable: {error}"
+                        )))
+                }
+            }
+        }
+        TicketConfigAvailability::Unusable(message) => {
+            model.header.ticket_configured = true;
+            model
+                .header
+                .diagnostics
+                .push(bounded_panel_diagnostic(format!(
+                    "Ticket config is unusable: {message}"
+                )));
+        }
+    }
+
+    let started = Instant::now();
+    model.rows.extend(pod_rows(pods));
+    timings.push(WorkspacePanelE2eSourceTiming {
+        source: "pod_row_materialization",
+        elapsed_ms: started.elapsed().as_millis(),
+    });
+    (model, timings)
 }
 
 fn build_workspace_panel_with_registry(
