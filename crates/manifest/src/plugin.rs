@@ -66,18 +66,111 @@ impl PluginExactVersion {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PluginGrantConfig {
-    pub tools: Vec<String>,
-    pub secrets: Vec<String>,
-    pub filesystem: Vec<String>,
-    pub network: bool,
+    /// Source-qualified package id this grant is pinned to, for example `project:example`.
+    pub id: Option<String>,
+    /// Exact package version this grant is pinned to.
+    pub version: Option<PluginExactVersion>,
+    /// Deterministic package digest this grant is pinned to.
+    pub digest: Option<String>,
+    /// Explicit capabilities granted for the pinned package identity/version/digest.
+    pub permissions: Vec<PluginPermission>,
 }
 
 impl PluginGrantConfig {
     pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
-            && self.secrets.is_empty()
-            && self.filesystem.is_empty()
-            && !self.network
+        self.permissions.is_empty()
+    }
+
+    pub fn binding_error(
+        &self,
+        identity: &SourceQualifiedPluginId,
+        digest: &str,
+        version: &str,
+    ) -> Option<&'static str> {
+        if self.permissions.is_empty() {
+            return None;
+        }
+        let Some(grant_id) = &self.id else {
+            return Some("plugin grant is missing a source-qualified package id binding");
+        };
+        match SourceQualifiedPluginId::parse(grant_id) {
+            Ok(grant_identity) if &grant_identity == identity => {}
+            Ok(_) => return Some("plugin grant package id binding does not match enabled package"),
+            Err(_) => {
+                return Some(
+                    "plugin grant package id binding is not a valid source-qualified plugin id",
+                );
+            }
+        }
+        let Some(grant_digest) = &self.digest else {
+            return Some("plugin grant is missing a deterministic digest binding");
+        };
+        if !digest_matches(grant_digest, digest) {
+            return Some("plugin grant digest binding does not match enabled package digest");
+        }
+        let Some(grant_version) = &self.version else {
+            return Some("plugin grant is missing an exact package version binding");
+        };
+        if !grant_version.matches(version) {
+            return Some("plugin grant version binding does not match enabled package version");
+        }
+        None
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PluginPermission {
+    Surface { surface: PluginSurface },
+    Tool { name: String },
+    ToolNamespace { namespace: String },
+    ExternalWrite,
+    HostApi { api: PluginHostApi },
+}
+
+impl PluginPermission {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Surface { surface } => format!("surfaces.{surface}"),
+            Self::Tool { name } => format!("tool.{name}"),
+            Self::ToolNamespace { namespace } => format!("tool_namespace.{namespace}"),
+            Self::ExternalWrite => "external_write".to_string(),
+            Self::HostApi { api } => format!("host_api.{api}"),
+        }
+    }
+
+    pub fn surface(surface: PluginSurface) -> Self {
+        Self::Surface { surface }
+    }
+
+    pub fn tool(name: impl Into<String>) -> Self {
+        Self::Tool { name: name.into() }
+    }
+
+    pub fn tool_namespace(namespace: impl Into<String>) -> Self {
+        Self::ToolNamespace {
+            namespace: namespace.into(),
+        }
+    }
+
+    pub fn host_api(api: PluginHostApi) -> Self {
+        Self::HostApi { api }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginHostApi {
+    Https,
+    Fs,
+}
+
+impl fmt::Display for PluginHostApi {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Https => f.write_str("https"),
+            Self::Fs => f.write_str("fs"),
+        }
     }
 }
 
@@ -190,6 +283,10 @@ pub struct PluginPackageManifest {
     pub hooks: Vec<PluginHookManifest>,
     #[serde(default)]
     pub tools: Vec<PluginToolManifest>,
+    /// Permission requests declared by the package. These are requests only;
+    /// enablement grants must match them before runtime surfaces are exposed.
+    #[serde(default)]
+    pub permissions: Vec<PluginPermission>,
 }
 
 impl PluginPackageManifest {
@@ -229,6 +326,11 @@ pub struct PluginToolManifest {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    /// Whether this Tool declares side effects outside the model-visible result.
+    /// The flag does not grant authority; it requires a matching external_write
+    /// request and grant before registration or execution.
+    #[serde(default)]
+    pub external_write: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -561,12 +663,16 @@ pub fn resolve_enabled_plugins(
             }
         }
 
-        if !enablement.grants.is_empty() {
+        if let Some(message) =
+            enablement
+                .grants
+                .binding_error(&identity, &package.digest, &package.manifest.version)
+        {
             resolution.diagnostics.push(
                 PluginDiagnostic::new(
                     PluginDiagnosticKind::Grant,
                     PluginDiagnosticPhase::Resolution,
-                    "plugin authority grants are not implemented and fail closed",
+                    message,
                 )
                 .with_source(identity.source)
                 .with_identity(&identity)
@@ -1938,6 +2044,93 @@ input_schema = { type = "object", properties = { query = { type = "string" } }, 
     }
 
     #[test]
+    fn typed_permission_grant_binding_resolves_only_exact_package_identity() {
+        let (report, _) = fixture_with_enabled_plugin(false);
+        let digest = report.packages[0].digest.clone();
+        let exact_grants = PluginGrantConfig {
+            id: Some("project:example".to_string()),
+            version: Some(PluginExactVersion("0.1.0".to_string())),
+            digest: Some(digest.clone()),
+            permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
+        };
+        let resolution = resolve_enabled_plugins(
+            &PluginConfig {
+                enabled: vec![PluginEnablementConfig {
+                    id: "project:example".to_string(),
+                    grants: exact_grants,
+                    ..PluginEnablementConfig::default()
+                }],
+                ..PluginConfig::default()
+            },
+            &report,
+        );
+        assert!(
+            resolution.diagnostics.is_empty(),
+            "{:#?}",
+            resolution.diagnostics
+        );
+        assert_eq!(resolution.resolved.len(), 1);
+
+        for grants in [
+            PluginGrantConfig {
+                id: Some("project:other".to_string()),
+                version: Some(PluginExactVersion("0.1.0".to_string())),
+                digest: Some(digest.clone()),
+                permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
+            },
+            PluginGrantConfig {
+                id: Some("project:example".to_string()),
+                version: Some(PluginExactVersion("0.1.1".to_string())),
+                digest: Some(digest.clone()),
+                permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
+            },
+            PluginGrantConfig {
+                id: Some("project:example".to_string()),
+                version: Some(PluginExactVersion("0.1.0".to_string())),
+                digest: Some("sha256:unrelated".to_string()),
+                permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
+            },
+        ] {
+            let resolution = resolve_enabled_plugins(
+                &PluginConfig {
+                    enabled: vec![PluginEnablementConfig {
+                        id: "project:example".to_string(),
+                        grants,
+                        ..PluginEnablementConfig::default()
+                    }],
+                    ..PluginConfig::default()
+                },
+                &report,
+            );
+            assert!(resolution.resolved.is_empty());
+            assert!(
+                resolution
+                    .diagnostics
+                    .iter()
+                    .any(|diag| diag.kind == PluginDiagnosticKind::Grant),
+                "{:#?}",
+                resolution.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_permission_kind_fails_closed_at_manifest_parse_boundary() {
+        let error = toml::from_str::<PluginPackageManifest>(
+            r#"schema_version = 1
+id = "example"
+name = "Example"
+version = "0.1.0"
+
+[[permissions]]
+kind = "ambient_shell"
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("ambient_shell"), "{error}");
+    }
+
+    #[test]
     fn surface_and_grant_failures_do_not_resolve() {
         let (report, _) = fixture_with_enabled_plugin(false);
         let resolution = resolve_enabled_plugins(
@@ -1951,7 +2144,7 @@ input_schema = { type = "object", properties = { query = { type = "string" } }, 
                     PluginEnablementConfig {
                         id: "project:example".to_string(),
                         grants: PluginGrantConfig {
-                            filesystem: vec![".".to_string()],
+                            permissions: vec![PluginPermission::surface(PluginSurface::Tool)],
                             ..PluginGrantConfig::default()
                         },
                         ..PluginEnablementConfig::default()
