@@ -279,3 +279,68 @@ Next:
 - 修正後、必要に応じて同じ review focus で再レビューする。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-18T14:41:45Z -->
+
+## Implementation report
+
+Coder review-fix implementation report received:
+
+Incremental fix commit:
+- `5870251b` — `tui: tighten panel dashboard readiness`
+
+Summary:
+- `dashboard_content_ready` を broad category gate から、full dashboard snapshot を carry/validate する readiness に強化。
+- Snapshot/header assertions を追加。
+  - Companion status
+  - Orchestrator status
+  - orchestration overlay state
+  - Ticket action labels
+  - disabled reasons
+  - local / overlay Ticket states
+- E2E fixture を real git/orchestration worktree overlay を作る形に更新。
+  - local ready Ticket は `ready` のまま。
+  - orchestration overlay 側で同 Ticket を `inprogress` に進める。
+  - visible `ready→prog` row と `Wait` action を期待する。
+- negative coverage を追加。
+  - missing expected row
+  - wrong state
+  - missing overlay
+  - missing action label
+- source breakdown attribution を拡張。
+  - `pod_metadata_status_probe.initial`
+  - `ticket_config_probe`
+  - `ticket_config_parse`
+  - `orchestration_overlay_validation_read_git`
+  - `ticket_scan_parse`
+  - `local_claim_scan`
+  - `pod_row_materialization`
+  - `workspace_panel.build.total`
+
+Files changed in incremental fix:
+- `crates/tui/src/multi_pod.rs`
+- `crates/tui/src/workspace_panel.rs`
+- `tests/e2e/src/lib.rs`
+- `tests/e2e/tests/panel.rs`
+
+Coder reported no blockers/escalations.
+
+Orchestrator evidence checked:
+- Pod output を確認。
+- implementation worktree は clean。
+- branch `impl/00001KVDETSN6-panel-dashboard-content-ready` HEAD は `5870251b`。
+- incremental diff stat from `fc1ee5bb..5870251b`: 4 files changed, 709 insertions, 65 deletions。
+- `git diff --check fc1ee5bb..HEAD` passed。
+
+Validation re-run by Orchestrator in implementation worktree:
+- `cargo fmt --check` — passed
+- `cargo check -p tui --features e2e-test` — passed
+- `cargo test -p yoi-e2e --features e2e --test panel` — passed; 7 passed, 0 failed
+- `git diff --check` — passed
+
+Routing classification: review_needed
+
+Next action:
+- previous `request_changes` blockers が解消されたか、read-only Reviewer Pod で再レビューする。
+
+---
