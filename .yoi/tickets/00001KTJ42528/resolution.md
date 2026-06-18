@@ -1,24 +1,3 @@
-<!-- event: create author: LocalTicketBackend at: 2026-06-07T22:43:09Z -->
-
-## Created
-
-Created by LocalTicketBackend create.
-
----
-
-<!-- event: state_changed author: hare at: 2026-06-18T12:22:10Z from: planning to: closed reason: closed field: state -->
-
-## State changed
-
-Ticket を closed にしました。
-
-
----
-
-<!-- event: close author: hare at: 2026-06-18T12:22:10Z status: closed -->
-
-## 完了
-
 Closed as resolved by current dogfooding workflow rather than a new broad implementation.
 
 The active policy is now operationally established:
@@ -30,6 +9,3 @@ The active policy is now operationally established:
 - keep audit evidence in Ticket files/thread/resolution even when Git commits are batched.
 
 Future changes should be filed as targeted Tickets, such as Panel dirty-state UX, workflow prompt wording, or automated queue commit behavior.
-
-
----

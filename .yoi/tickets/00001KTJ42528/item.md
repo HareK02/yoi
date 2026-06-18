@@ -1,8 +1,8 @@
 ---
 title: "Ticket lifecycle commit noise を減らし commit / publication policy を一本化する"
-state: "planning"
+state: 'closed'
 created_at: "2026-06-07T22:43:09Z"
-updated_at: "2026-06-11T05:45:00Z"
+updated_at: '2026-06-18T12:22:10Z'
 ---
 
 ## 背景
