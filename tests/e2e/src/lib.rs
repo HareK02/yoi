@@ -267,10 +267,76 @@ pub struct RenderedPanelRow {
     pub rect: PanelRect,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedPanelTicketRow {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+}
+
+impl ExpectedPanelTicketRow {
+    pub fn new(id: impl Into<String>, title: impl Into<String>, status: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+            status: status.into(),
+        }
+    }
+
+    pub fn matches(&self, row: &RenderedPanelRow) -> bool {
+        row.key.kind == "ticket"
+            && row.key.id == self.id
+            && row.title == self.title
+            && row.status.as_deref() == Some(self.status.as_str())
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "ticket row id={} title={:?} status={}",
+            self.id, self.title, self.status
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RowsRendered {
     pub selected: Option<PanelRowKey>,
     pub rows: Vec<RenderedPanelRow>,
+}
+
+impl RowsRendered {
+    pub fn fixture_ticket_row(
+        &self,
+        expected: &ExpectedPanelTicketRow,
+    ) -> Option<&RenderedPanelRow> {
+        self.rows.iter().find(|row| expected.matches(row))
+    }
+
+    pub fn has_fixture_ticket_row(&self, expected: &ExpectedPanelTicketRow) -> bool {
+        self.fixture_ticket_row(expected).is_some()
+    }
+}
+
+fn rows_rendered_event_has_fixture_ticket(
+    event: &HarnessEvent,
+    expected: &ExpectedPanelTicketRow,
+) -> bool {
+    serde_json::from_value::<RowsRendered>(event.data.clone())
+        .map(|rows| rows.has_fixture_ticket_row(expected))
+        .unwrap_or(false)
+}
+
+fn describe_rows(rows: &RowsRendered) -> String {
+    rows.rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{}:{} title={:?} status={:?}",
+                row.key.kind, row.key.id, row.title, row.status
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[derive(Debug, Clone)]
@@ -443,6 +509,69 @@ impl PanelHarness {
             }
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Waits for the legacy `panel_ready` observer event, which means the first
+    /// panel frame was painted. It intentionally does not mean workspace rows or
+    /// Ticket data are ready.
+    pub fn wait_for_first_visible_frame(&mut self, timeout: Duration) -> Result<HarnessEvent> {
+        self.wait_for(
+            "first visible panel frame (panel_ready, before rows readiness)",
+            timeout,
+            |event| event.event == "panel_ready",
+        )
+    }
+
+    /// Waits until a concrete fixture Ticket row has rendered. This is the
+    /// startup rows-ready signal; it validates id + title + state rather than
+    /// using only the number of rendered rows.
+    pub fn wait_for_fixture_ticket_rows_ready(
+        &mut self,
+        expected: &ExpectedPanelTicketRow,
+        timeout: Duration,
+    ) -> Result<RowsRendered> {
+        let description = expected.description();
+        let event = self.wait_for(
+            format!("fixture Ticket rows ready ({description})"),
+            timeout,
+            |event| {
+                event.event == "rows_rendered"
+                    && rows_rendered_event_has_fixture_ticket(event, expected)
+            },
+        )?;
+        serde_json::from_value(event.data).map_err(HarnessError::from)
+    }
+
+    pub fn assert_fixture_ticket_row_not_rendered(
+        &mut self,
+        expected: &ExpectedPanelTicketRow,
+        duration: Duration,
+    ) -> Result<()> {
+        let start = Instant::now();
+        while start.elapsed() < duration {
+            if let Some(rows) = self
+                .events()?
+                .iter()
+                .filter(|event| event.event == "rows_rendered")
+                .filter_map(|event| serde_json::from_value::<RowsRendered>(event.data.clone()).ok())
+                .find(|rows| rows.has_fixture_ticket_row(expected))
+            {
+                self.flush_output_artifact()?;
+                return Err(HarnessError::Protocol(format!(
+                    "fixture Ticket row rendered before data-backed rows readiness was expected: {}; rows: {}",
+                    expected.description(),
+                    describe_rows(&rows)
+                )));
+            }
+            if let Some(status) = self.child.try_wait()? {
+                self.flush_output_artifact()?;
+                return Err(HarnessError::Protocol(format!(
+                    "process exited with {status} while asserting fixture Ticket rows stayed delayed"
+                )));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
     }
 
     pub fn wait_for_rows(&mut self, min_rows: usize) -> Result<RowsRendered> {
@@ -781,6 +910,9 @@ pub struct FixtureCleanupReport {
     pub report_path: PathBuf,
 }
 
+pub const READY_FIXTURE_TICKET_TITLE: &str = "Ready E2E Ticket";
+pub const PLANNING_FIXTURE_TICKET_TITLE: &str = "Planning E2E Ticket";
+
 #[derive(Debug)]
 pub struct FixtureWorkspace {
     temp_root: Option<TempDir>,
@@ -792,6 +924,8 @@ pub struct FixtureWorkspace {
     pub xdg_config_home: PathBuf,
     pub xdg_runtime_dir: PathBuf,
     pub artifacts_dir: PathBuf,
+    pub ready_ticket_id: String,
+    pub planning_ticket_id: String,
 }
 
 impl FixtureWorkspace {
@@ -832,7 +966,7 @@ impl FixtureWorkspace {
             fs::create_dir_all(dir)?;
         }
 
-        let fixture = Self {
+        let mut fixture = Self {
             temp_root: Some(temp_root),
             root,
             workspace,
@@ -842,6 +976,8 @@ impl FixtureWorkspace {
             xdg_config_home,
             xdg_runtime_dir,
             artifacts_dir,
+            ready_ticket_id: String::new(),
+            planning_ticket_id: String::new(),
         };
         fixture.write_fixture_metadata("created", None)?;
 
@@ -867,7 +1003,7 @@ impl FixtureWorkspace {
             &fixture.xdg_config_home,
             &fixture.xdg_runtime_dir,
             &fixture.artifacts_dir,
-            "Ready E2E Ticket",
+            READY_FIXTURE_TICKET_TITLE,
         )?;
         run_yoi(
             binary,
@@ -880,7 +1016,7 @@ impl FixtureWorkspace {
             &fixture.artifacts_dir,
             &["ticket", "state", &first, "ready"],
         )?;
-        let _second = create_ticket(
+        let second = create_ticket(
             binary,
             &fixture.workspace,
             &fixture.home,
@@ -889,10 +1025,20 @@ impl FixtureWorkspace {
             &fixture.xdg_config_home,
             &fixture.xdg_runtime_dir,
             &fixture.artifacts_dir,
-            "Planning E2E Ticket",
+            PLANNING_FIXTURE_TICKET_TITLE,
         )?;
+        fixture.ready_ticket_id = first;
+        fixture.planning_ticket_id = second;
         fixture.write_fixture_metadata("ready", None)?;
         Ok(fixture)
+    }
+
+    pub fn ready_fixture_ticket_row(&self) -> ExpectedPanelTicketRow {
+        ExpectedPanelTicketRow::new(
+            self.ready_ticket_id.clone(),
+            READY_FIXTURE_TICKET_TITLE,
+            "ready",
+        )
     }
 
     pub fn panel_config(&self, binary: PathBuf) -> PanelHarnessConfig {
@@ -999,6 +1145,18 @@ impl FixtureWorkspace {
                 "xdg_config_home": &self.xdg_config_home,
                 "xdg_runtime_dir": &self.xdg_runtime_dir,
                 "artifacts_dir": &self.artifacts_dir,
+                "tickets": {
+                    "ready": {
+                        "id": &self.ready_ticket_id,
+                        "title": READY_FIXTURE_TICKET_TITLE,
+                        "state": "ready"
+                    },
+                    "planning": {
+                        "id": &self.planning_ticket_id,
+                        "title": PLANNING_FIXTURE_TICKET_TITLE,
+                        "state": "planning"
+                    }
+                },
                 "env_runtime_policy": {
                     "tested_yoi_uses_env_clear": true,
                     "host_runtime_inherited": false,
