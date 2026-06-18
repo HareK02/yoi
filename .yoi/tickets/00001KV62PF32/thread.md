@@ -238,3 +238,47 @@ Conclusion:
 - Approved. No blocker remains.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-18T12:25:14Z -->
+
+## Implementation report
+
+Integration report:
+
+Merged implementation branch into orchestration branch:
+- branch: `impl/00001KV62PF32-panel-rows-ready-e2e`
+- implementation commit: `fffdfd27 test: assert panel rows-ready fixture data`
+- merge commit: `226eca7a merge: panel rows-ready e2e`
+
+Reviewer result:
+- `approve` recorded from `yoi-reviewer-00001KV62PF32`.
+
+Validation in Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration`:
+- Passed: `cargo test -p yoi-e2e --features e2e --no-run`
+- Passed: `cargo test -p yoi-e2e --features e2e panel -- --nocapture`
+  - panel E2E: 6 passed
+  - first visible frame examples: ~20.34ms / budget 1.5s
+  - fixture rows ready example: ~120.54ms / budget 5s
+- Passed: `cargo check -p yoi-e2e -p yoi -p tui`
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check`
+
+Outcome:
+- Startup readiness E2E now uses concrete fixture Ticket row render readiness instead of first visible/loading frame or weak row-count checks.
+- `panel_ready` remains first-visible-frame only; `rows_rendered` fixture row matching is the data-backed readiness surface.
+- Delayed reload coverage verifies first frame can arrive before rows-ready and expected fixture Ticket row remains absent while reload is held.
+- Existing Panel mouse/row selection E2E remains covered.
+
+Cleanup planned:
+- Stop related coder/reviewer Pods.
+- Remove only child implementation worktree/branch for this Ticket.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-18T12:25:14Z from: inprogress to: done reason: merged_validated field: state -->
+
+## State changed
+
+Reviewer approved, implementation branch merged into the orchestration branch, and E2E-focused validation passed in the Orchestrator worktree. Marking Ticket done in the orchestration branch.
+
+---
