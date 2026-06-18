@@ -350,3 +350,30 @@ Next action:
 - previous `request_changes` blocker が解消されたか、read-only Reviewer Pod で再レビューする。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-18T15:29:46Z -->
+
+## Plan
+
+Review re-dispatch:
+
+Reviewer Pod `yoi-reviewer-00001KVDH2E06-r2` を read-only scope で起動した。
+
+Review target:
+- worktree: `/home/hare/Projects/yoi/.worktree/00001KVDH2E06-panel-current-workspace-pods`
+- branch: `impl/00001KVDH2E06-panel-current-workspace-pods`
+- commits:
+  - `3b634d66` — initial implementation
+  - `160c96ad` — persistence-boundary fix
+
+Reviewer focus:
+- previous blocker が normal runtime/store write-through path で解消されているか。
+- `set_active_with_workspace_root` が unrelated metadata fields を破壊せず、workspace ownership を永続化するか。
+- compatibility `set_active` が existing workspace ownership を保持しているか。
+- 新 test `metadata_writer_persists_workspace_root_through_store_update` が constructor ではなく `pod_metadata_writer_for_store` + `FsPodStore` boundary を実際に検証しているか。
+- final branch が current workspace visible / external hidden / role visible / unknown corrupt fail-closed / hidden external action target なし、という Ticket acceptance criteria を満たすか。
+
+Next:
+- Reviewer output を確認し、approve なら Orchestrator worktree への merge/validation/cleanup/close-ready 処理へ進む。request_changes なら blocker を記録して Coder に戻す。
+
+---
