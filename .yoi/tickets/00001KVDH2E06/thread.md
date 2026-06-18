@@ -153,3 +153,61 @@ Next:
 - Coder は current-workspace Pod filtering、focused tests、validation、implementation commit を行い、実装報告を返す予定。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-18T15:15:57Z -->
+
+## Implementation report
+
+Coder implementation report received:
+
+Commit:
+- `3b634d66` — `tui: filter panel pods by workspace`
+
+Summary:
+- `PodMetadata` に optional persisted `workspace_root` を追加し、新規 metadata write 時に Pod runtime workspace を保存するようにした。
+- persisted metadata に基づく workspace-aware Pod list construction/filtering を追加。Pod name prefix や cwd heuristic では判定しない。
+- `yoi panel` の normal Pod rows / action targets を current runtime workspace metadata で filter するようにした。
+- legacy / unknown / corrupt workspace metadata は normal Panel Pod rows では fail-closed にした。
+- current-workspace Companion / Orchestrator / Ticket role Pod は、stored runtime workspace が current workspace と一致すれば worktree/cwd 差分に関係なく表示対象に残る。
+
+Files changed:
+- `crates/pod-store/src/lib.rs`
+- `crates/pod/src/pod.rs`
+- `crates/pod/src/discovery.rs`
+- `crates/pod/src/ticket_event_notify.rs`
+- `crates/tui/src/multi_pod.rs`
+- `crates/tui/src/pod_list.rs`
+- `crates/tui/src/workspace_panel.rs`
+
+Focused validation reported by Coder:
+- `cargo test -p tui workspace_panel -- --nocapture` — passed; 23 tests
+- `cargo test -p tui pod_list -- --nocapture` — passed; 19 tests
+- `cargo test -p pod-store` — passed; 6 tests
+- `cargo test -p pod pod_metadata -- --nocapture` — passed targeted Pod metadata tests and filtered integration tests
+- `cargo check -p tui -p pod -p pod-store` — passed
+- `cargo fmt --check` — passed
+- `git diff --check` — passed
+
+Full-suite note:
+- Coder also attempted `cargo test -p tui`; it failed with 3 tests outside the focused scope:
+  - `multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace`
+  - `spawn::tests::profile_choices_include_builtin_and_project_default_marker`
+  - `spawn::tests::profile_choices_use_project_registry_default`
+- Orchestrator re-ran these failing tests in both the implementation worktree and the current Orchestrator worktree before this implementation was merged. The same failures reproduce on the Orchestrator branch, so they are currently treated as pre-existing validation debt rather than blockers for this Ticket, unless review finds the implementation worsens their semantics.
+
+Orchestrator evidence checked:
+- Pod output を確認。
+- implementation worktree は clean。
+- branch `impl/00001KVDH2E06-panel-current-workspace-pods` HEAD は `3b634d66`。
+- diff stat from accepted base `e2e76d3b..3b634d66`: 7 files changed, 292 insertions, 14 deletions。
+- Focused failing-test comparison:
+  - `cargo test -p tui multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace -- --nocapture` fails identically on implementation worktree and Orchestrator worktree.
+  - `cargo test -p tui spawn::tests::profile_choices -- --nocapture` fails identically on implementation worktree and Orchestrator worktree.
+
+Routing classification: review_needed
+
+Next action:
+- recorded intent / invariants / acceptance criteria に照らして、read-only Reviewer Pod で外部レビューする。
+- 特に workspace authority が runtime workspace metadata であり cwd/name heuristic ではないこと、unknown/corrupt metadata の fail-closed、current workspace role Pod visibility、hidden external Pod に action target が残らないこと、optional `workspace_root` metadata の compatibility を確認する。
+
+---
