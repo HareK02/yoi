@@ -122,3 +122,23 @@ State handling:
 - Ticket remains `inprogress` because acceptance and worktree side effects already happened; it is not silently returned to `queued`.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-18T13:56:44Z -->
+
+## Implementation report
+
+Implementation resume note:
+
+Coder Pod の再開を試み、最初の `SpawnPod` は child scope に runtime workspace root `/home/hare/Projects/yoi` の read scope が含まれていなかったため失敗した。
+
+Recovery:
+- 既存 implementation worktree `/home/hare/Projects/yoi/.worktree/00001KV5W3PJ3-plugin-permission-grants` を再利用。
+- child scope を workspace root read + implementation worktree write に狭く設定して再試行。
+- Coder Pod `yoi-coder-00001KV5W3PJ3` の起動に成功。
+
+Current status:
+- Ticket は `inprogress` のまま。
+- Coder は Plugin permission grants 実装、focused validation、commit、実装報告を行う予定。
+- root/original workspace は触らず、implementation worktree 上で作業するよう指示済み。
+
+---
