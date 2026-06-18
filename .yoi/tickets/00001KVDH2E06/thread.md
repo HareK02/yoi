@@ -305,3 +305,48 @@ Next:
 - 修正後、同じ persistence boundary と filtering semantics を中心に再レビューする。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-18T15:29:08Z -->
+
+## Implementation report
+
+Coder review-fix implementation report received:
+
+Incremental fix commit:
+- `160c96ad` — `pod: persist metadata workspace root`
+
+Summary:
+- metadata write-through path を更新し、`PodMetadata.workspace_root` が永続化されるようにした。
+- `PodMetadataStore::set_active_with_workspace_root(...)` を追加。
+- 既存 `set_active(...)` は compatibility wrapper として残し、既存 workspace ownership を保持する挙動にした。
+- `pod_metadata_writer_for_store(...)` が `metadata.workspace_root` を store に渡すようにした。
+- persistence-boundary targeted test を追加。
+  - `metadata_writer_persists_workspace_root_through_store_update`
+  - `pod_metadata_writer_for_store` + `FsPodStore` を通し、stored metadata に runtime workspace root が残ることを検証。
+
+Files changed in incremental fix:
+- `crates/pod-store/src/lib.rs`
+- `crates/pod/src/pod.rs`
+
+Validation reported by Coder:
+- `cargo test -p pod metadata_writer_persists_workspace_root_through_store_update -- --nocapture` — passed
+- `cargo test -p pod pod_metadata -- --nocapture` — passed
+- `cargo test -p pod-store` — passed
+- `cargo test -p tui workspace_panel -- --nocapture` — passed
+- `cargo test -p tui pod_list -- --nocapture` — passed
+- `cargo check -p tui -p pod -p pod-store` — passed
+- `cargo fmt --check` — passed
+- `git diff --check` — passed
+
+Orchestrator evidence checked:
+- Pod output を確認。
+- implementation worktree は clean。
+- branch `impl/00001KVDH2E06-panel-current-workspace-pods` HEAD は `160c96ad`。
+- incremental diff stat from previous review target `3b634d66..160c96ad`: 2 files changed, 35 insertions, 2 deletions。
+
+Routing classification: review_needed
+
+Next action:
+- previous `request_changes` blocker が解消されたか、read-only Reviewer Pod で再レビューする。
+
+---
