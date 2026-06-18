@@ -266,3 +266,47 @@ Conclusion:
 - Approved. No blocker remains.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-18T12:39:30Z -->
+
+## Implementation report
+
+Integration report:
+
+Merged implementation branch into orchestration branch:
+- branch: `impl/00001KV5W3PHW-plugin-wasm-tool-runtime`
+- implementation commit: `10d12148 feat: run plugin tools through wasm runtime`
+- merge commit: `05cd788c merge: plugin wasm tool runtime`
+
+Reviewer result:
+- `approve` recorded from `yoi-reviewer-00001KV5W3PHW`.
+
+Validation in Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration`:
+- Passed: `cargo fmt --check`
+- Passed: `cargo check -p pod`
+- Passed: `cargo test -p manifest plugin::`
+- Passed: `cargo test -p pod feature::plugin`
+  - 21 passed
+- Passed: `git diff --check`
+- Passed: `nix build .#yoi --no-link`
+
+Outcome:
+- Enabled Plugin Tool calls now execute through minimal `wasmi` runtime with no WASI/fs/network/env host imports.
+- Runtime module selection is deterministic from resolved package path/digest/runtime config and rechecks package digest.
+- Tool input/output/errors are bounded and returned through ordinary Tool result/error path.
+- Missing/malformed/oversize/schema-mismatch/non-terminating execution fails closed with safe Tool errors.
+- Permission grants, richer host APIs, WASI-like APIs, and stronger cancellation-token integration remain follow-up scope.
+
+Cleanup planned:
+- Stop related coder/reviewer Pods.
+- Remove only child implementation worktree/branch for this Ticket.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-18T12:39:30Z from: inprogress to: done reason: merged_validated field: state -->
+
+## State changed
+
+Reviewer approved, implementation branch merged into the orchestration branch, and focused plus packaging validation passed in the Orchestrator worktree. Marking Ticket done in the orchestration branch.
+
+---
