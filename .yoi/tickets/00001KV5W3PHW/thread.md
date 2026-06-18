@@ -147,3 +147,78 @@ Coder Pod:
 No duplicate `queued -> inprogress` transition was performed; this resumes the already accepted in-progress work.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KV5W3PHW at: 2026-06-18T12:31:01Z -->
+
+## Implementation report
+
+Implementation report from Coder Pod `yoi-coder-00001KV5W3PHW`:
+
+Commit:
+- `10d12148 feat: run plugin tools through wasm runtime`
+
+Changed files:
+- `Cargo.lock`
+- `crates/manifest/src/plugin.rs`
+- `crates/pod/Cargo.toml`
+- `crates/pod/src/feature/plugin.rs`
+- `package.nix`
+
+Implemented behavior:
+- Added minimal sandboxed Plugin Tool WASM runtime using `wasmi`.
+- Enabled registered Plugin Tool calls now execute through normal `Tool::execute` / `ToolOutput` / `ToolResult` paths.
+- Added manifest-side helper to load resolved runtime module from pinned package:
+  - validates runtime kind/ABI;
+  - re-reads package from resolved path;
+  - verifies deterministic package digest before selecting runtime entry;
+  - bounds package/module size and reports safe diagnostics.
+- Added `yoi-plugin-wasm-1` host ABI:
+  - required export: `yoi_tool_call()`;
+  - required guest export: `memory`;
+  - host imports under `yoi:tool` only:
+    - `tool_name_len() -> i32`
+    - `tool_name_read(ptr, len) -> i32`
+    - `input_len() -> i32`
+    - `input_read(ptr, len) -> i32`
+    - `output_write(ptr, len) -> i32`
+- No WASI, filesystem, network, environment, or arbitrary host imports are provided; unsupported imports fail closed.
+
+Bounds / failure behavior:
+- Input JSON bound: `64 KiB`.
+- Output JSON bound: `64 KiB`.
+- Output summary bound: `1 KiB`.
+- Linear memory bound: `2 MiB`.
+- Table bound: `256`.
+- Fuel bound: `5_000_000`.
+- Wall timeout: `1s`.
+- Diagnostics/errors are bounded and sanitized before surfacing as ordinary Tool errors.
+- Malformed input JSON, malformed output JSON, output schema mismatch, oversized output, missing runtime/package/module, unsupported imports, load failure, and non-terminating execution fail closed.
+
+Tests added/updated cover:
+- Sample Plugin package Tool executes through WASM runtime.
+- Tool input JSON reaches the module.
+- Output JSON returns through ordinary Tool result path.
+- Malformed input JSON.
+- Malformed output JSON.
+- Output schema mismatch.
+- Oversize output.
+- Non-terminating/high-fuel execution fail closed.
+- Missing runtime/package/module diagnostic is safe and bounded.
+- No ambient WASI/fs/network/env import access.
+- Existing Plugin Tool registration behavior.
+
+Validation reported by coder:
+- Passed: `cargo fmt --check`
+- Passed: `cargo check -p pod`
+- Passed: `cargo test -p manifest plugin::`
+- Passed: `cargo test -p pod feature::plugin`
+- Passed: `git diff --check`
+- Passed: `nix build .#yoi`
+- Passed: `nix build .#yoi --no-link`
+
+Residual risks / notes:
+- ABI is intentionally minimal and not a general Plugin capability model.
+- Permission grants, richer host APIs, WASI-like APIs, per-plugin runtime configuration knobs, and schema-driven rich output contracts remain follow-up work.
+- Cancellation has no explicit `ToolExecutionContext` cancellation token today; this implementation provides safe timeout/fuel-bounded execution and maps timeout/join failure into ordinary Tool errors.
+
+---
