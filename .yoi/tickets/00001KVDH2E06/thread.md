@@ -211,3 +211,31 @@ Next action:
 - 特に workspace authority が runtime workspace metadata であり cwd/name heuristic ではないこと、unknown/corrupt metadata の fail-closed、current workspace role Pod visibility、hidden external Pod に action target が残らないこと、optional `workspace_root` metadata の compatibility を確認する。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-18T15:16:45Z -->
+
+## Plan
+
+Review dispatch:
+
+Reviewer Pod `yoi-reviewer-00001KVDH2E06` を read-only scope で起動した。
+
+Review target:
+- worktree: `/home/hare/Projects/yoi/.worktree/00001KVDH2E06-panel-current-workspace-pods`
+- branch: `impl/00001KVDH2E06-panel-current-workspace-pods`
+- commit: `3b634d66`
+
+Reviewer focus:
+- recorded intent / invariants / acceptance criteria に対する適合性。
+- workspace ownership authority が persisted runtime workspace metadata / resolved identity に基づき、Pod name prefix / cwd heuristic ではないこと。
+- external workspace Pod が normal rows と normal action targets から除外されること。
+- current workspace Companion / Orchestrator / Ticket role Pod が cwd/worktree difference によって誤って隠されないこと。
+- unknown/corrupt/legacy metadata が fail-closed で current workspace と誤認されないこと。
+- optional `workspace_root` metadata が non-destructive / compatible であること。
+- focused tests が current visible / external hidden / role visible / worktree cwd difference / live-only legacy corrupt hidden / Panel row-action filtering を十分に覆っていること。
+- `cargo test -p tui` の 3 failure は Orchestrator branch でも同様に再現するため pre-existing debt と見てよいか、それともこの branch が semantic に悪化させているか。
+
+Next:
+- Reviewer output を確認し、approve なら Orchestrator worktree へ merge/validation/cleanup/close-ready 処理へ進む。request_changes なら blocker を記録して Coder に戻す。
+
+---
