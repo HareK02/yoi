@@ -127,3 +127,29 @@ Next action:
 Ticket body/thread, relation metadata, orchestration plan records, Orchestrator worktree, visible Pods, existing branch/worktree, and bounded code context were checked. No blocking relation, conflict, dirty-state blocker, or missing planning decision was found. Risk flags are captured as invariants/reviewer focus rather than stop gates. Accepting this queued Ticket for implementation before worktree/Pod side effects.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-18T14:51:50Z -->
+
+## Implementation report
+
+Implementation start note:
+
+`queued -> inprogress` acceptance、accepted plan、routing decision / IntentPacket を記録し、Orchestrator worktree で commit した後に、専用 implementation worktree と Coder Pod を起動した。
+
+Worktree:
+- `/home/hare/Projects/yoi/.worktree/00001KVDH2E06-panel-current-workspace-pods`
+- branch: `impl/00001KVDH2E06-panel-current-workspace-pods`
+
+Coder Pod:
+- `yoi-coder-00001KVDH2E06`
+
+Scope / boundaries:
+- child runtime workspace root は read scope。
+- implementation worktree は write scope。
+- root/original workspace と Orchestrator worktree へは書き込まないよう指示済み。
+- `.yoi/memory`、runtime/log/lock/local/secret-like `.yoi` paths は編集しないよう指示済み。
+
+Next:
+- Coder は current-workspace Pod filtering、focused tests、validation、implementation commit を行い、実装報告を返す予定。
+
+---
