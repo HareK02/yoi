@@ -425,3 +425,116 @@ Conclusion:
 - Implementation satisfies the recorded Ticket acceptance criteria and is ready for merge/validation in the Orchestrator worktree.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-18T14:47:55Z -->
+
+## Implementation report
+
+Merge / validation report:
+
+Implementation branch `impl/00001KVDETSN6-panel-dashboard-content-ready` を Orchestrator worktree の `orchestration` branch に merge した。
+
+Merge:
+- merge commit: `2d4d11e4` — `merge: panel dashboard readiness metric`
+- implementation commits:
+  - `fc1ee5bb` — `tui: measure panel dashboard readiness`
+  - `5870251b` — `tui: tighten panel dashboard readiness`
+- changed files:
+  - `crates/tui/src/multi_pod.rs`
+  - `crates/tui/src/workspace_panel.rs`
+  - `tests/e2e/src/lib.rs`
+  - `tests/e2e/tests/panel.rs`
+
+Validation in Orchestrator worktree:
+- `cargo fmt --check` — passed
+- `cargo check -p tui --features e2e-test` — passed
+- `cargo test -p yoi-e2e --features e2e --test panel` — passed; 7 passed, 0 failed
+- `git diff --check` — passed
+
+Review:
+- First review returned `request_changes` and blockers were sent back to Coder.
+- Re-review `yoi-reviewer-00001KVDETSN6-r2` returned `approve` with no remaining blockers.
+
+Outcome:
+- `dashboard_content_ready` now validates expected dashboard snapshot content including Ticket / Pod / Companion / Orchestrator / overlay-visible state and action/disabled fields.
+- first-frame / single-row readiness no longer satisfies the main metric.
+- negative coverage covers missing row, wrong state, missing overlay, and missing action label.
+- slow-source breakdown is bounded and more diagnostic.
+- Root/original workspace was not read/written/merged/validated for this Ticket, per Panel Queue instruction.
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-18T14:48:21Z -->
+
+## Implementation report
+
+Cleanup report:
+
+Panel dashboard readiness Ticket の implementation/review Pods と child worktree を cleanup した。
+
+Stopped Pods:
+- `yoi-coder-00001KVDETSN6`
+- `yoi-reviewer-00001KVDETSN6-r2`
+
+Removed child implementation worktree:
+- `/home/hare/Projects/yoi/.worktree/00001KVDETSN6-panel-dashboard-content-ready`
+
+Deleted merged implementation branch:
+- `impl/00001KVDETSN6-panel-dashboard-content-ready` at `5870251b`
+
+Orchestrator branch remains the integration authority for this completed work. Root/original workspace was not touched for this Ticket, per Panel Queue instruction.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-18T14:48:30Z from: inprogress to: done reason: merged_validated_review_approved field: state -->
+
+## State changed
+
+Implementation commits `fc1ee5bb` and `5870251b` were reviewed after blocker resolution, approved, merged into the Orchestrator branch as `2d4d11e4`, validated in the Orchestrator worktree, and child implementation resources were cleaned up. Requirements and acceptance criteria are satisfied for this Ticket. Root/original workspace was not operated on for this Ticket per Panel Queue instruction.
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-18T14:48:44Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-18T14:48:44Z status: closed -->
+
+## 完了
+
+Ticket `00001KVDETSN6` is complete.
+
+Completed implementation:
+- Added a user-visible `dashboard_content_ready` metric that carries and validates a rendered dashboard snapshot rather than treating first frame or a single row as ready.
+- Added expected dashboard content coverage for Ticket rows, Pod rows, Companion status, Orchestrator status, orchestration overlay state, action labels, disabled reasons, local Ticket state, and overlay Ticket state.
+- Added a real git/orchestration overlay fixture for the local-ready / overlay-inprogress case and validated the visible `ready→prog` / `Wait` row.
+- Added negative coverage for missing expected row, wrong state, missing overlay state, and missing action label.
+- Added bounded startup source breakdown including pod metadata/status probing, ticket config probe/parse, overlay validation/read/git checks, ticket scan/parse, local claim scan, pod row materialization, and total workspace panel build.
+
+Reviewed / merged:
+- Initial implementation: `fc1ee5bb` (`tui: measure panel dashboard readiness`)
+- Review-fix implementation: `5870251b` (`tui: tighten panel dashboard readiness`)
+- First review requested changes; blockers were fixed.
+- Re-review approved with no remaining blockers.
+- Orchestrator merge commit: `2d4d11e4` (`merge: panel dashboard readiness metric`)
+
+Validation in Orchestrator worktree:
+- `cargo fmt --check` — passed
+- `cargo check -p tui --features e2e-test` — passed
+- `cargo test -p yoi-e2e --features e2e --test panel` — passed; 7 passed, 0 failed
+- `git diff --check` — passed
+
+Cleanup:
+- Stopped Coder Pod `yoi-coder-00001KVDETSN6`.
+- Stopped Reviewer Pod `yoi-reviewer-00001KVDETSN6-r2`.
+- Removed child worktree `/home/hare/Projects/yoi/.worktree/00001KVDETSN6-panel-dashboard-content-ready`.
+- Deleted merged branch `impl/00001KVDETSN6-panel-dashboard-content-ready`.
+
+Root/original workspace was not read/written/merged/validated for this Ticket, per Panel Queue instruction. The completed work is integrated on the Orchestrator branch.
+
+---
