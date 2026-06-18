@@ -1326,7 +1326,7 @@ impl FixtureWorkspace {
                 self.planning_fixture_ticket_row(),
             ],
             pod_names: vec!["workspace".to_string()],
-            companion_status: "unavailable".to_string(),
+            companion_status: "spawned".to_string(),
             orchestrator_status: "unavailable".to_string(),
         }
     }
