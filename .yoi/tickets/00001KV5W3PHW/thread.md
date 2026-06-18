@@ -222,3 +222,47 @@ Residual risks / notes:
 - Cancellation has no explicit `ToolExecutionContext` cancellation token today; this implementation provides safe timeout/fuel-bounded execution and maps timeout/join failure into ordinary Tool errors.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KV5W3PHW at: 2026-06-18T12:37:14Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Evidence checked:
+- Child worktree のみ確認。
+  - `/home/hare/Projects/yoi/.worktree/00001KV5W3PHW-plugin-wasm-tool-runtime`
+  - implementation commit: `10d12148`
+  - base: `d32fb3bc`
+- 変更箇所を確認。
+  - `crates/pod/src/feature/plugin.rs`
+  - `crates/manifest/src/plugin.rs`
+  - `crates/pod/Cargo.toml`
+  - `Cargo.lock`
+  - `package.nix`
+- Read-only validation:
+  - Passed: `git diff --check d32fb3bc..10d12148`
+
+Acceptance review:
+- WASM runtime は `wasmi` を使い、WASI setup はなく、host import surface は `yoi_plugin_tool_v1` の最小 input/output 関数だけに限定されている。
+- `wasi_snapshot_preview1.fd_write` や `env.getenv` など ambient-style imports は拒否される。
+- Plugin Tools は ordinary `Feature` tool contribution / `ToolExecutor` path で `ToolOutput` / `ToolError` を返し、hidden context injection path は見当たらない。
+- module/input/output/summary/error/memory/table/stack/fuel などの bounds が実装されている。
+- malformed output、invalid UTF-8、schema mismatch、oversize output は `ToolError` として fail closed する。
+- runtime module selection は resolved plugin record、resolved package path、recorded digest、runtime kind/ABI、entry path に基づき、archive digest を再検証してから module bytes を使用している。
+- non-termination は fuel exhaustion と runtime timeout wrapper で fail closed する。現行 `ToolExecutionContext` に cancellation token がないため、明示的 cancellation-token integration がない点は、この Ticket の範囲では blocker ではないと判断した。
+- `wasmi` は `default-features = false` で `std` / `extra-checks` のみ、`wat` は dev-only。WASI/network/process capability library の追加は見当たらない。
+
+Validation not run by reviewer:
+- `cargo test` / `cargo check` / `nix build` は read-only review scope では build artifacts を書くため未実行。Coder reported validation を evidence とした。
+
+Risk assessment:
+- residual risk は低〜中程度。
+- sandbox boundary は Ticket scope に対して妥当。No WASI / no fs / no network / no env imports、bounded IO、bounded diagnostics、deterministic digest check がある。
+- `tokio::time::timeout` は `spawn_blocking` の実行中 task を強制 abort しないが、fuel により guest execution は有限化される。より強い cooperative cancellation semantics は Tool execution API/runtime cancellation model の follow-up として扱うべき。
+- Permission grants / richer host API authority は正しく未実装の follow-up に残っている。
+
+Conclusion:
+- Approved. No blocker remains.
+
+---
