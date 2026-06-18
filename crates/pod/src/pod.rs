@@ -72,10 +72,11 @@ where
     let store = store.clone();
     Arc::new(move |metadata| {
         store
-            .set_active(
+            .set_active_with_workspace_root(
                 &metadata.pod_name,
                 metadata.active,
                 metadata.resolved_manifest_snapshot,
+                metadata.workspace_root,
             )
             .map(|_| ())
     })
@@ -5235,6 +5236,24 @@ permission = "write"
 #[cfg(test)]
 mod pod_metadata_restore_manifest_tests {
     use super::*;
+
+    #[test]
+    fn metadata_writer_persists_workspace_root_through_store_update() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = pod_store::FsPodStore::new(temp.path().join("pods")).unwrap();
+        let workspace_root = temp.path().join("workspace-root");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let writer = pod_metadata_writer_for_store(&store);
+
+        writer(PodMetadata::new("runtime-pod", None).with_workspace_root(workspace_root.clone()))
+            .unwrap();
+
+        let stored = store.read_by_name("runtime-pod").unwrap().unwrap();
+        assert_eq!(
+            stored.workspace_root.as_deref(),
+            Some(workspace_root.as_path())
+        );
+    }
 
     #[test]
     fn snapshot_preserves_saved_scope_over_current_manifest() {
