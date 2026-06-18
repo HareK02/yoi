@@ -15,8 +15,8 @@ use llm_worker::tool::{
     Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOrigin, ToolOutput,
 };
 use manifest::plugin::{
-    PluginConfig, PluginDiscoveryLimits, PluginSurface, ResolvedPluginRecord,
-    read_resolved_plugin_runtime_module,
+    PluginConfig, PluginDiscoveryLimits, PluginHostApi, PluginPermission, PluginSurface,
+    PluginToolManifest, ResolvedPluginRecord, read_resolved_plugin_runtime_module,
 };
 use serde_json::Value;
 
@@ -106,6 +106,8 @@ impl FeatureModule for PluginToolFeature {
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
         validate_declared_tool_names(&self.record)?;
         let origin = self.origin();
+        let mut registered = 0usize;
+        let mut denied = Vec::new();
         for tool in &self.record.manifest.tools {
             validate_tool_name(&tool.name).map_err(|reason| {
                 FeatureInstallError::Install(format!(
@@ -119,6 +121,17 @@ impl FeatureModule for PluginToolFeature {
                     self.record.identity, tool.name
                 ))
             })?;
+            if let Err(error) = authorize_plugin_tool(&self.record, tool) {
+                let message = format!(
+                    "plugin `{}` tool `{}` registration denied: {}",
+                    self.record.identity,
+                    tool.name,
+                    error.bounded_message()
+                );
+                context.diagnostics().warning(message.clone());
+                denied.push(message);
+                continue;
+            }
             context.tools().register(ToolContribution::new(
                 tool.name.clone(),
                 plugin_wasm_tool_definition(
@@ -129,9 +142,126 @@ impl FeatureModule for PluginToolFeature {
                     origin.clone(),
                 ),
             ))?;
+            registered += 1;
+        }
+        if registered == 0 && !denied.is_empty() {
+            let summary = if denied.len() == 1 {
+                denied.remove(0)
+            } else {
+                format!(
+                    "{} plugin tool registrations denied; first denial: {}",
+                    denied.len(),
+                    denied[0]
+                )
+            };
+            return Err(FeatureInstallError::Install(bounded_message(summary)));
         }
         Ok(())
     }
+}
+
+#[derive(Debug)]
+struct PluginPermissionError(String);
+
+impl PluginPermissionError {
+    fn bounded_message(&self) -> String {
+        bounded_message(&self.0)
+    }
+}
+
+fn authorize_plugin_tool(
+    record: &ResolvedPluginRecord,
+    tool: &PluginToolManifest,
+) -> Result<(), PluginPermissionError> {
+    validate_grant_binding(record)?;
+    require_permission(
+        &record.manifest.permissions,
+        &PluginPermission::surface(PluginSurface::Tool),
+        "requested surfaces.tool permission is missing",
+    )?;
+    require_permission(
+        &record.grants.permissions,
+        &PluginPermission::surface(PluginSurface::Tool),
+        "granted surfaces.tool permission is missing",
+    )?;
+    if !permission_allows_tool(&record.manifest.permissions, &tool.name) {
+        return Err(PluginPermissionError(format!(
+            "requested tool permission for `{}` is missing",
+            tool.name
+        )));
+    }
+    if !permission_allows_tool(&record.grants.permissions, &tool.name) {
+        return Err(PluginPermissionError(format!(
+            "granted tool permission for `{}` is missing",
+            tool.name
+        )));
+    }
+    if tool.external_write {
+        require_permission(
+            &record.manifest.permissions,
+            &PluginPermission::ExternalWrite,
+            "requested external_write permission is missing",
+        )?;
+        require_permission(
+            &record.grants.permissions,
+            &PluginPermission::ExternalWrite,
+            "granted external_write permission is missing",
+        )?;
+    }
+    Ok(())
+}
+
+fn authorize_plugin_host_api(
+    record: &ResolvedPluginRecord,
+    api: PluginHostApi,
+) -> Result<(), PluginPermissionError> {
+    validate_grant_binding(record)?;
+    let permission = PluginPermission::host_api(api);
+    require_permission(
+        &record.manifest.permissions,
+        &permission,
+        &format!("requested host_api.{api} permission is missing"),
+    )?;
+    require_permission(
+        &record.grants.permissions,
+        &permission,
+        &format!("granted host_api.{api} permission is missing"),
+    )?;
+    Err(PluginPermissionError(format!(
+        "host_api.{api} is not implemented"
+    )))
+}
+
+fn validate_grant_binding(record: &ResolvedPluginRecord) -> Result<(), PluginPermissionError> {
+    if let Some(message) =
+        record
+            .grants
+            .binding_error(&record.identity, &record.digest, &record.manifest.version)
+    {
+        return Err(PluginPermissionError(message.to_string()));
+    }
+    Ok(())
+}
+
+fn require_permission(
+    permissions: &[PluginPermission],
+    expected: &PluginPermission,
+    missing_message: &str,
+) -> Result<(), PluginPermissionError> {
+    if permissions.iter().any(|permission| permission == expected) {
+        return Ok(());
+    }
+    Err(PluginPermissionError(missing_message.to_string()))
+}
+
+fn permission_allows_tool(permissions: &[PluginPermission], tool_name: &str) -> bool {
+    permissions.iter().any(|permission| match permission {
+        PluginPermission::Tool { name } => name == tool_name,
+        PluginPermission::ToolNamespace { namespace } => {
+            !namespace.is_empty() && tool_name.starts_with(namespace)
+        }
+        _ => false,
+    })
 }
 
 const PLUGIN_WASM_HOST_MODULE: &str = "yoi:tool";
@@ -259,6 +389,20 @@ fn run_plugin_wasm_tool(
     tool_name: String,
     input: Vec<u8>,
 ) -> Result<ToolOutput, PluginWasmError> {
+    let tool = record
+        .manifest
+        .tools
+        .iter()
+        .find(|tool| tool.name == tool_name)
+        .ok_or_else(|| {
+            PluginWasmError::Module("requested tool is not declared by plugin manifest".to_string())
+        })?;
+    authorize_plugin_tool(&record, tool).map_err(|error| {
+        PluginWasmError::Module(format!(
+            "plugin permission denied: {}",
+            error.bounded_message()
+        ))
+    })?;
     let limits = PluginDiscoveryLimits::default();
     let module_bytes = read_resolved_plugin_runtime_module(&record, &limits)
         .map_err(|diagnostic| PluginWasmError::Package(diagnostic.message))?;
@@ -276,7 +420,7 @@ fn run_plugin_wasm_tool(
     let engine = wasmi::Engine::new(&config);
     let module = wasmi::Module::new(&engine, &module_bytes[..])
         .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-    validate_wasm_imports(&module)?;
+    validate_wasm_imports(&record, &module)?;
 
     let store_limits = wasmi::StoreLimitsBuilder::new()
         .memory_size(PLUGIN_WASM_MEMORY_BYTES)
@@ -319,8 +463,27 @@ fn run_plugin_wasm_tool(
     decode_plugin_wasm_output(&store.data().output)
 }
 
-fn validate_wasm_imports(module: &wasmi::Module) -> Result<(), PluginWasmError> {
+fn validate_wasm_imports(
+    record: &ResolvedPluginRecord,
+    module: &wasmi::Module,
+) -> Result<(), PluginWasmError> {
     for import in module.imports() {
+        if import.module() == "yoi:https" {
+            authorize_plugin_host_api(record, PluginHostApi::Https).map_err(|error| {
+                PluginWasmError::Module(format!(
+                    "plugin host API dispatch denied: {}",
+                    error.bounded_message()
+                ))
+            })?;
+        }
+        if import.module() == "yoi:fs" {
+            authorize_plugin_host_api(record, PluginHostApi::Fs).map_err(|error| {
+                PluginWasmError::Module(format!(
+                    "plugin host API dispatch denied: {}",
+                    error.bounded_message()
+                ))
+            })?;
+        }
         if import.module() != PLUGIN_WASM_HOST_MODULE {
             return Err(PluginWasmError::Module(format!(
                 "unsupported import module `{}`; only `{}` is available",
@@ -752,8 +915,9 @@ fn is_supported_schema_keyword(key: &str) -> bool {
 mod tests {
     use super::*;
     use manifest::plugin::{
-        PluginDiscoveryOptions, PluginEnablementConfig, PluginPackageManifest,
-        PluginRuntimeManifest, SourceQualifiedPluginId, resolve_plugin_config_for_startup,
+        PluginDiscoveryOptions, PluginEnablementConfig, PluginExactVersion, PluginGrantConfig,
+        PluginPackageManifest, PluginRuntimeManifest, SourceQualifiedPluginId,
+        resolve_plugin_config_for_startup,
     };
     use serde_json::json;
     use std::fs;
@@ -765,6 +929,7 @@ mod tests {
             name: name.into(),
             description: format!("{name} tool"),
             input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+            external_write: false,
         }
     }
 
@@ -777,6 +942,7 @@ mod tests {
         tools: Vec<manifest::plugin::PluginToolManifest>,
     ) -> ResolvedPluginRecord {
         let parsed_identity = SourceQualifiedPluginId::parse(identity).unwrap();
+        let permissions = tool_permissions(&tools);
         ResolvedPluginRecord {
             identity: parsed_identity.clone(),
             source: parsed_identity.source,
@@ -794,11 +960,27 @@ mod tests {
                 runtime: None,
                 hooks: Vec::new(),
                 tools,
+                permissions: permissions.clone(),
             },
             enabled_surfaces: vec![PluginSurface::Tool],
-            grants: manifest::plugin::PluginGrantConfig::default(),
+            grants: PluginGrantConfig {
+                id: Some(parsed_identity.to_string()),
+                version: Some(PluginExactVersion("0.1.0".to_string())),
+                digest: Some("sha256:abc".to_string()),
+                permissions,
+            },
             config: None,
         }
+    }
+
+    fn tool_permissions(tools: &[manifest::plugin::PluginToolManifest]) -> Vec<PluginPermission> {
+        let mut permissions = vec![PluginPermission::surface(PluginSurface::Tool)];
+        permissions.extend(
+            tools
+                .iter()
+                .map(|tool| PluginPermission::tool(tool.name.clone())),
+        );
+        permissions
     }
 
     fn skipped_count(report: &super::super::FeatureRegistryInstallReport) -> usize {
@@ -816,6 +998,20 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains(needle))
         })
+    }
+
+    fn install_plugin_record(
+        record: ResolvedPluginRecord,
+    ) -> (
+        super::super::FeatureRegistryInstallReport,
+        Vec<ToolDefinition>,
+    ) {
+        let mut pending = Vec::new();
+        let mut hooks = crate::hook::HookRegistryBuilder::new();
+        let report = super::super::FeatureRegistryBuilder::default()
+            .with_module(PluginToolFeature::new(record))
+            .install_into_pending(&mut pending, &mut hooks);
+        (report, pending)
     }
 
     #[test]
@@ -940,6 +1136,146 @@ mod tests {
         assert_eq!(origin.digest, "sha256:abc");
         assert_eq!(origin.source, "project");
         assert_eq!(origin.surface, "tool");
+    }
+
+    #[test]
+    fn no_grant_denies_plugin_tool_registration_and_runtime_execution() {
+        let mut record = record(vec![tool("PluginSearch")]);
+        record.grants = PluginGrantConfig::default();
+
+        let (report, pending) = install_plugin_record(record.clone());
+        assert!(pending.is_empty());
+        assert!(has_diagnostic(&report, "registration denied"));
+        assert!(has_diagnostic(
+            &report,
+            "granted surfaces.tool permission is missing"
+        ));
+
+        let error = run_plugin_wasm_tool(record, "PluginSearch".into(), br#"{}"#.to_vec())
+            .unwrap_err()
+            .bounded_message();
+        assert!(error.contains("plugin permission denied"), "{error}");
+        assert!(
+            error.contains("granted surfaces.tool permission is missing"),
+            "{error}"
+        );
+        assert!(error.len() < 700, "{error}");
+    }
+
+    #[test]
+    fn specific_tool_grant_registers_only_intended_plugin_tool() {
+        let mut record = record(vec![tool("PluginAllowed"), tool("PluginDenied")]);
+        record.grants.permissions = vec![
+            PluginPermission::surface(PluginSurface::Tool),
+            PluginPermission::tool("PluginAllowed"),
+        ];
+
+        let (report, pending) = install_plugin_record(record);
+        assert_eq!(pending.len(), 1);
+        let (meta, _) = pending[0]();
+        assert_eq!(meta.name, "PluginAllowed");
+        assert_eq!(report.installed_tool_names(), vec!["PluginAllowed"]);
+        assert!(has_diagnostic(
+            &report,
+            "granted tool permission for `PluginDenied` is missing"
+        ));
+    }
+
+    #[test]
+    fn grant_binding_mismatches_do_not_authorize_plugin_tool() {
+        let mut unrelated = record(vec![tool("PluginSearch")]);
+        unrelated.grants.id = Some("project:other".to_string());
+        let error = authorize_plugin_tool(&unrelated, &unrelated.manifest.tools[0])
+            .unwrap_err()
+            .bounded_message();
+        assert!(
+            error.contains("package id binding does not match"),
+            "{error}"
+        );
+
+        let mut bad_digest = record(vec![tool("PluginSearch")]);
+        bad_digest.grants.digest = Some("sha256:not-the-package".to_string());
+        let error = authorize_plugin_tool(&bad_digest, &bad_digest.manifest.tools[0])
+            .unwrap_err()
+            .bounded_message();
+        assert!(error.contains("digest binding does not match"), "{error}");
+
+        let mut bad_version = record(vec![tool("PluginSearch")]);
+        bad_version.grants.version = Some(PluginExactVersion("9.9.9".to_string()));
+        let error = authorize_plugin_tool(&bad_version, &bad_version.manifest.tools[0])
+            .unwrap_err()
+            .bounded_message();
+        assert!(error.contains("version binding does not match"), "{error}");
+    }
+
+    #[test]
+    fn requested_surface_tool_and_external_write_permissions_are_required() {
+        let mut missing_surface = record(vec![tool("PluginSearch")]);
+        missing_surface.manifest.permissions = vec![PluginPermission::tool("PluginSearch")];
+        let (report, pending) = install_plugin_record(missing_surface);
+        assert!(pending.is_empty());
+        assert!(has_diagnostic(
+            &report,
+            "requested surfaces.tool permission is missing"
+        ));
+
+        let mut missing_tool = record(vec![tool("PluginSearch")]);
+        missing_tool.manifest.permissions = vec![PluginPermission::surface(PluginSurface::Tool)];
+        let (report, pending) = install_plugin_record(missing_tool);
+        assert!(pending.is_empty());
+        assert!(has_diagnostic(
+            &report,
+            "requested tool permission for `PluginSearch` is missing"
+        ));
+
+        let mut external_tool = tool("PluginWrite");
+        external_tool.external_write = true;
+        let mut missing_external_request = record(vec![external_tool]);
+        let (report, pending) = install_plugin_record(missing_external_request.clone());
+        assert!(pending.is_empty());
+        assert!(has_diagnostic(
+            &report,
+            "requested external_write permission is missing"
+        ));
+
+        missing_external_request
+            .manifest
+            .permissions
+            .push(PluginPermission::ExternalWrite);
+        let (report, pending) = install_plugin_record(missing_external_request);
+        assert!(pending.is_empty());
+        assert!(has_diagnostic(
+            &report,
+            "granted external_write permission is missing"
+        ));
+    }
+
+    #[test]
+    fn future_host_api_imports_are_permission_checked_before_unimplemented_boundary() {
+        let (_dir, mut record) = resolved_record_with_wasm(https_import_module());
+        let error = run_plugin_wasm_tool(record.clone(), "PluginEcho".into(), br#"{}"#.to_vec())
+            .unwrap_err()
+            .bounded_message();
+        assert!(
+            error.contains("requested host_api.https permission is missing"),
+            "{error}"
+        );
+
+        record
+            .manifest
+            .permissions
+            .push(PluginPermission::host_api(PluginHostApi::Https));
+        record
+            .grants
+            .permissions
+            .push(PluginPermission::host_api(PluginHostApi::Https));
+        let error = run_plugin_wasm_tool(record, "PluginEcho".into(), br#"{}"#.to_vec())
+            .unwrap_err()
+            .bounded_message();
+        assert!(
+            error.contains("host_api.https is not implemented"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1176,7 +1512,14 @@ mod tests {
             resolved.diagnostics
         );
         assert_eq!(resolved.resolved.len(), 1);
-        (dir, resolved.resolved[0].clone())
+        let mut record = resolved.resolved[0].clone();
+        record.grants = PluginGrantConfig {
+            id: Some(record.identity.to_string()),
+            version: Some(PluginExactVersion(record.version.clone())),
+            digest: Some(record.digest.clone()),
+            permissions: tool_permissions(&record.manifest.tools),
+        };
+        (dir, record)
     }
 
     fn write_plugin_package(path: &Path, wasm: &[u8]) {
@@ -1191,6 +1534,14 @@ surfaces = ["tool"]
 kind = "wasm"
 entry = "plugin.wasm"
 abi = "yoi-plugin-wasm-1"
+
+[[permissions]]
+kind = "surface"
+surface = "tool"
+
+[[permissions]]
+kind = "tool"
+name = "PluginEcho"
 
 [[tools]]
 name = "PluginEcho"
@@ -1289,6 +1640,17 @@ input_schema = { type = "object", additionalProperties = true }
         wat::parse_str(
             r#"(module
                 (import "wasi_snapshot_preview1" "fd_write" (func $fd_write))
+                (memory (export "memory") 1)
+                (func (export "yoi_tool_call"))
+              )"#,
+        )
+        .unwrap()
+    }
+
+    fn https_import_module() -> Vec<u8> {
+        wat::parse_str(
+            r#"(module
+                (import "yoi:https" "request" (func $request))
                 (memory (export "memory") 1)
                 (func (export "yoi_tool_call"))
               )"#,

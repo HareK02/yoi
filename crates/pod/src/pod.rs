@@ -5354,6 +5354,7 @@ permission = "read"
                 runtime: None,
                 hooks: vec![],
                 tools: vec![],
+                permissions: vec![],
             },
             enabled_surfaces: vec![manifest::plugin::PluginSurface::Hook],
             grants: manifest::plugin::PluginGrantConfig::default(),

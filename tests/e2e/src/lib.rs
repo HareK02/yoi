@@ -264,6 +264,14 @@ pub struct RenderedPanelRow {
     pub title: String,
     pub status: Option<String>,
     pub action: Option<String>,
+    #[serde(default)]
+    pub disabled_reason: Option<String>,
+    #[serde(default)]
+    pub local_state: Option<String>,
+    #[serde(default)]
+    pub overlay_state: Option<String>,
+    #[serde(default)]
+    pub overlay_detail: Option<String>,
     pub rect: PanelRect,
 }
 
@@ -272,6 +280,10 @@ pub struct ExpectedPanelTicketRow {
     pub id: String,
     pub title: String,
     pub status: String,
+    pub action: Option<String>,
+    pub disabled_reason: Option<String>,
+    pub local_state: Option<String>,
+    pub overlay_state: Option<String>,
 }
 
 impl ExpectedPanelTicketRow {
@@ -280,7 +292,31 @@ impl ExpectedPanelTicketRow {
             id: id.into(),
             title: title.into(),
             status: status.into(),
+            action: None,
+            disabled_reason: None,
+            local_state: None,
+            overlay_state: None,
         }
+    }
+
+    pub fn with_action(mut self, action: impl Into<String>) -> Self {
+        self.action = Some(action.into());
+        self
+    }
+
+    pub fn with_disabled_reason(mut self, disabled_reason: impl Into<String>) -> Self {
+        self.disabled_reason = Some(disabled_reason.into());
+        self
+    }
+
+    pub fn with_local_state(mut self, local_state: impl Into<String>) -> Self {
+        self.local_state = Some(local_state.into());
+        self
+    }
+
+    pub fn with_overlay_state(mut self, overlay_state: impl Into<String>) -> Self {
+        self.overlay_state = Some(overlay_state.into());
+        self
     }
 
     pub fn matches(&self, row: &RenderedPanelRow) -> bool {
@@ -288,13 +324,186 @@ impl ExpectedPanelTicketRow {
             && row.key.id == self.id
             && row.title == self.title
             && row.status.as_deref() == Some(self.status.as_str())
+            && self.action.as_ref().map_or(true, |action| {
+                row.action.as_deref() == Some(action.as_str())
+            })
+            && self.disabled_reason.as_ref().map_or(true, |reason| {
+                row.disabled_reason
+                    .as_deref()
+                    .is_some_and(|actual| actual.contains(reason))
+            })
+            && self.local_state.as_ref().map_or(true, |state| {
+                row.local_state.as_deref() == Some(state.as_str())
+            })
+            && self.overlay_state.as_ref().map_or(true, |state| {
+                row.overlay_state.as_deref() == Some(state.as_str())
+            })
     }
 
     fn description(&self) -> String {
         format!(
-            "ticket row id={} title={:?} status={}",
-            self.id, self.title, self.status
+            "ticket row id={} title={:?} status={} action={:?} disabled_reason={:?} local_state={:?} overlay_state={:?}",
+            self.id,
+            self.title,
+            self.status,
+            self.action,
+            self.disabled_reason,
+            self.local_state,
+            self.overlay_state,
         )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedDashboardContent {
+    pub tickets: Vec<ExpectedPanelTicketRow>,
+    pub pod_names: Vec<String>,
+    pub companion_status: String,
+    pub orchestrator_status: String,
+}
+
+impl ExpectedDashboardContent {
+    pub fn snapshot(&self) -> DashboardContentSnapshot {
+        DashboardContentSnapshot {
+            tickets: self.tickets.clone(),
+            pod_names: self.pod_names.clone(),
+            companion_status: self.companion_status.clone(),
+            orchestrator_status: self.orchestrator_status.clone(),
+        }
+    }
+
+    fn description(&self) -> String {
+        let tickets = self
+            .tickets
+            .iter()
+            .map(ExpectedPanelTicketRow::description)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let pods = self.pod_names.join(", ");
+        format!(
+            "tickets=[{tickets}] pods=[{pods}] companion={} orchestrator={}",
+            self.companion_status, self.orchestrator_status
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DashboardContentSnapshot {
+    pub tickets: Vec<ExpectedPanelTicketRow>,
+    pub pod_names: Vec<String>,
+    pub companion_status: String,
+    pub orchestrator_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardContentReady {
+    pub snapshot: DashboardSnapshot,
+    pub categories: DashboardContentCategories,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardSnapshot {
+    pub header: DashboardHeader,
+    pub rows: Vec<RenderedPanelRow>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardHeader {
+    pub ticket_configured: bool,
+    pub companion: Option<DashboardCompanionState>,
+    pub orchestrator: Option<DashboardOrchestratorState>,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardCompanionState {
+    pub pod_name: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardOrchestratorState {
+    pub pod_name: String,
+    pub status: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardContentCategories {
+    pub ticket_rows: usize,
+    pub ready_ticket_rows: usize,
+    pub planning_ticket_rows: usize,
+    pub pod_rows: usize,
+    pub actionable_rows: usize,
+}
+
+impl DashboardContentReady {
+    pub fn rows_rendered(&self) -> RowsRendered {
+        RowsRendered {
+            selected: None,
+            rows: self.snapshot.rows.clone(),
+        }
+    }
+
+    pub fn snapshot_for_expected(
+        &self,
+        expected: &ExpectedDashboardContent,
+    ) -> DashboardContentSnapshot {
+        DashboardContentSnapshot {
+            tickets: expected
+                .tickets
+                .iter()
+                .filter(|ticket| self.snapshot.rows.iter().any(|row| ticket.matches(row)))
+                .cloned()
+                .collect(),
+            pod_names: expected
+                .pod_names
+                .iter()
+                .filter(|pod_name| {
+                    self.snapshot
+                        .rows
+                        .iter()
+                        .any(|row| row.key.kind == "pod" && row.key.id == pod_name.as_str())
+                })
+                .cloned()
+                .collect(),
+            companion_status: self
+                .snapshot
+                .header
+                .companion
+                .as_ref()
+                .map(|companion| companion.status.clone())
+                .unwrap_or_default(),
+            orchestrator_status: self
+                .snapshot
+                .header
+                .orchestrator
+                .as_ref()
+                .map(|orchestrator| orchestrator.status.clone())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardSourceBreakdown {
+    pub total_elapsed_ms: u128,
+    pub sources: Vec<DashboardSourceTiming>,
+    pub ticket_rows: usize,
+    pub pod_rows: usize,
+    pub diagnostics: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardSourceTiming {
+    pub source: String,
+    pub elapsed_ms: u128,
+}
+
+impl DashboardSourceBreakdown {
+    pub fn has_source(&self, source: &str) -> bool {
+        self.sources.iter().any(|timing| timing.source == source)
     }
 }
 
@@ -540,6 +749,49 @@ impl PanelHarness {
             },
         )?;
         serde_json::from_value(event.data).map_err(HarnessError::from)
+    }
+
+    /// Waits for the dashboard-content-ready observer event. Unlike first-frame
+    /// or row-count readiness, this requires representative user-visible content:
+    /// ready + planning Ticket rows and a Pod row, then checks the fixture-specific
+    /// rows as a small snapshot of the expected dashboard content.
+    pub fn wait_for_dashboard_content_ready(
+        &mut self,
+        expected: &ExpectedDashboardContent,
+        timeout: Duration,
+    ) -> Result<DashboardContentReady> {
+        let expected_snapshot = expected.snapshot();
+        let description = expected.description();
+        let event = self.wait_for(
+            format!("dashboard content ready ({description})"),
+            timeout,
+            |event| {
+                if event.event != "dashboard_content_ready" {
+                    return false;
+                }
+                serde_json::from_value::<DashboardContentReady>(event.data.clone())
+                    .map(|ready| ready.snapshot_for_expected(expected) == expected_snapshot)
+                    .unwrap_or(false)
+            },
+        )?;
+        serde_json::from_value(event.data).map_err(HarnessError::from)
+    }
+
+    pub fn latest_dashboard_source_breakdown(
+        &mut self,
+    ) -> Result<Option<DashboardSourceBreakdown>> {
+        Ok(self
+            .events()?
+            .into_iter()
+            .rev()
+            .filter(|event| event.event == "dashboard_source_breakdown")
+            .find_map(|event| serde_json::from_value(event.data).ok()))
+    }
+
+    pub fn expect_dashboard_source_breakdown(&mut self) -> Result<DashboardSourceBreakdown> {
+        self.latest_dashboard_source_breakdown()?.ok_or_else(|| {
+            HarnessError::Protocol("missing dashboard_source_breakdown observer event".to_string())
+        })
     }
 
     pub fn assert_fixture_ticket_row_not_rendered(
@@ -1029,6 +1281,7 @@ impl FixtureWorkspace {
         )?;
         fixture.ready_ticket_id = first;
         fixture.planning_ticket_id = second;
+        fixture.setup_orchestration_overlay(binary)?;
         fixture.write_fixture_metadata("ready", None)?;
         Ok(fixture)
     }
@@ -1039,6 +1292,95 @@ impl FixtureWorkspace {
             READY_FIXTURE_TICKET_TITLE,
             "ready",
         )
+        .with_action("Queue")
+        .with_local_state("ready")
+    }
+
+    pub fn ready_overlay_ticket_row(&self) -> ExpectedPanelTicketRow {
+        ExpectedPanelTicketRow::new(
+            self.ready_ticket_id.clone(),
+            READY_FIXTURE_TICKET_TITLE,
+            "ready→prog",
+        )
+        .with_action("Wait")
+        .with_disabled_reason("orchestration worktree overlay shows Ticket state inprogress")
+        .with_local_state("ready")
+        .with_overlay_state("inprogress")
+    }
+
+    pub fn planning_fixture_ticket_row(&self) -> ExpectedPanelTicketRow {
+        ExpectedPanelTicketRow::new(
+            self.planning_ticket_id.clone(),
+            PLANNING_FIXTURE_TICKET_TITLE,
+            "planning",
+        )
+        .with_action("Clarify")
+        .with_disabled_reason("Ticket is still in planning")
+        .with_local_state("planning")
+    }
+
+    pub fn expected_dashboard_content(&self) -> ExpectedDashboardContent {
+        ExpectedDashboardContent {
+            tickets: vec![
+                self.ready_overlay_ticket_row(),
+                self.planning_fixture_ticket_row(),
+            ],
+            pod_names: vec!["workspace".to_string()],
+            companion_status: "unavailable".to_string(),
+            orchestrator_status: "unavailable".to_string(),
+        }
+    }
+
+    fn setup_orchestration_overlay(&self, binary: &Path) -> Result<()> {
+        run_git(&self.workspace, &["init"])?;
+        run_git(&self.workspace, &["checkout", "-B", "develop"])?;
+        run_git(
+            &self.workspace,
+            &["config", "user.email", "fixture@example.invalid"],
+        )?;
+        run_git(&self.workspace, &["config", "user.name", "Yoi E2E Fixture"])?;
+        run_git(&self.workspace, &["add", ".yoi"])?;
+        run_git(&self.workspace, &["commit", "-m", "fixture tickets"])?;
+        let orchestration = self.workspace.join(".worktree/orchestration");
+        run_git(
+            &self.workspace,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "orchestration",
+                orchestration.to_string_lossy().as_ref(),
+                "HEAD",
+            ],
+        )?;
+        run_yoi(
+            binary,
+            &orchestration,
+            &self.home,
+            &self.xdg_data_home,
+            &self.xdg_state_home,
+            &self.xdg_config_home,
+            &self.xdg_runtime_dir,
+            &self.artifacts_dir,
+            &["ticket", "state", &self.ready_ticket_id, "queued"],
+        )?;
+        run_yoi(
+            binary,
+            &orchestration,
+            &self.home,
+            &self.xdg_data_home,
+            &self.xdg_state_home,
+            &self.xdg_config_home,
+            &self.xdg_runtime_dir,
+            &self.artifacts_dir,
+            &["ticket", "state", &self.ready_ticket_id, "inprogress"],
+        )?;
+        run_git(&orchestration, &["add", ".yoi"])?;
+        run_git(
+            &orchestration,
+            &["commit", "-m", "fixture orchestration overlay"],
+        )?;
+        Ok(())
     }
 
     pub fn panel_config(&self, binary: PathBuf) -> PanelHarnessConfig {
@@ -1377,6 +1719,23 @@ fn create_ticket(
         .find(|part| part.len() >= 13 && part.chars().all(|ch| ch.is_ascii_alphanumeric()))
         .map(ToOwned::to_owned)
         .ok_or_else(|| HarnessError::Protocol(format!("could not parse ticket id from {output:?}")))
+}
+
+fn run_git(workspace: &Path, args: &[&str]) -> Result<()> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(workspace)
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(HarnessError::CommandFailed {
+        program: PathBuf::from("git"),
+        args: args.iter().map(|arg| (*arg).to_string()).collect(),
+        status: output.status,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
 }
 
 fn run_yoi(

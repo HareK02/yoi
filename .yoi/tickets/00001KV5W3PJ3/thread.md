@@ -122,3 +122,268 @@ State handling:
 - Ticket remains `inprogress` because acceptance and worktree side effects already happened; it is not silently returned to `queued`.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-18T13:56:44Z -->
+
+## Implementation report
+
+Implementation resume note:
+
+Coder Pod の再開を試み、最初の `SpawnPod` は child scope に runtime workspace root `/home/hare/Projects/yoi` の read scope が含まれていなかったため失敗した。
+
+Recovery:
+- 既存 implementation worktree `/home/hare/Projects/yoi/.worktree/00001KV5W3PJ3-plugin-permission-grants` を再利用。
+- child scope を workspace root read + implementation worktree write に狭く設定して再試行。
+- Coder Pod `yoi-coder-00001KV5W3PJ3` の起動に成功。
+
+Current status:
+- Ticket は `inprogress` のまま。
+- Coder は Plugin permission grants 実装、focused validation、commit、実装報告を行う予定。
+- root/original workspace は触らず、implementation worktree 上で作業するよう指示済み。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-18T14:15:12Z -->
+
+## Implementation report
+
+Coder implementation report received:
+
+Commit:
+- `b1ba1599` — `plugin: enforce permission grants`
+
+Summary:
+- typed plugin permission declarations/grants を追加。
+  - `surfaces.tool`
+  - specific tool names
+  - tool namespaces
+  - `external_write`
+  - future `host_api.https` / `host_api.fs`
+- grant binding を source-qualified package id / deterministic digest / exact package version に結合。
+- registration gating を `PluginToolFeature::install` に実装。
+  - ungranted / unrequested plugin tools は登録されない。
+  - partial grant では authorized tools のみ登録し、skipped tools は bounded diagnostics。
+- runtime execution gating を `run_plugin_wasm_tool` に実装。
+  - WASM 読み込み/実行前に binding と requested/granted tool authority を再確認。
+- future host API boundary として `validate_wasm_imports` が `yoi:https` / `yoi:fs` imports を認識し、non-implemented boundary error の前に permission check。
+- actual `https` / `fs` host API は実装していない。
+- `external_write` を plugin tool manifest metadata に追加し、requested+granted の場合のみ許可。
+- Existing PreToolCall/tool permission path は変更せず、plugin grant checks を追加の fail-closed gate とした。
+
+Files changed:
+- `crates/manifest/src/plugin.rs`
+- `crates/pod/src/feature/plugin.rs`
+- `crates/pod/src/pod.rs`
+
+Validation reported by Coder:
+- `cargo fmt --check`
+- `cargo check -p manifest -p pod`
+- `cargo test -p pod plugin -- --nocapture` — 27 passed
+- `cargo test -p manifest plugin -- --nocapture` — 17 passed
+- `git diff --check`
+
+Orchestrator evidence checked:
+- Pod output を確認。
+- implementation worktree は clean。
+- commit `b1ba1599` が branch `impl/00001KV5W3PJ3-plugin-permission-grants` の HEAD。
+- diff stat: `crates/manifest/src/plugin.rs`, `crates/pod/src/feature/plugin.rs`, `crates/pod/src/pod.rs` に 575 insertions / 19 deletions。
+
+Routing classification: review_needed
+
+Next action:
+- recorded intent / invariants / acceptance criteria に照らして、read-only Reviewer Pod で外部レビューする。
+- 特に fail-closed grant enforcement、source/digest/version binding、no ambient authority、external_write/effect metadata、bounded diagnostics、existing PreToolCall path との整合性を確認する。
+
+---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-18T14:16:18Z -->
+
+## Plan
+
+Review dispatch:
+
+Reviewer Pod `yoi-reviewer-00001KV5W3PJ3` を read-only scope で起動した。
+
+Review target:
+- worktree: `/home/hare/Projects/yoi/.worktree/00001KV5W3PJ3-plugin-permission-grants`
+- branch: `impl/00001KV5W3PJ3-plugin-permission-grants`
+- commit: `b1ba1599`
+
+Reviewer focus:
+- recorded intent / invariants / acceptance criteria に対する適合性。
+- registration / execution の fail-closed grant enforcement。
+- source-qualified identity / digest / version binding。
+- unrelated grant / digest mismatch / missing surface/tool/external_write / unknown kind の拒否。
+- `external_write` と Tool effect / PreToolCall path の整合性。
+- future `https` / `fs` host API permission boundary が ambient authority を作っていないこと。
+- bounded safe diagnostics。
+
+Next:
+- Reviewer output を確認し、approve なら Ticket review に記録して merge-ready 判断へ進む。request_changes なら Coder に修正依頼する。
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KV5W3PJ3 at: 2026-06-18T14:22:32Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+対象:
+- Ticket: `00001KV5W3PJ3`
+- branch: `impl/00001KV5W3PJ3-plugin-permission-grants`
+- commit: `b1ba1599` (`plugin: enforce permission grants`)
+
+No blockers found.
+
+Review / validation performed:
+- review target branch/head が `impl/00001KV5W3PJ3-plugin-permission-grants` at `b1ba1599` であることを確認。
+- merge-base `a984f580` との差分を確認。
+- changed files は以下に限定:
+  - `crates/manifest/src/plugin.rs`
+  - `crates/pod/src/feature/plugin.rs`
+  - `crates/pod/src/pod.rs`
+- `git diff --check` against merge-base を実行し、whitespace/check failure なし。
+- Review boundary が read-only/static review のため cargo validation は再実行せず、Coder reported validation を確認。
+
+Evidence:
+- typed permission/grant model が追加されている。
+  - `PluginGrantConfig` は non-empty grants を source-qualified id、digest、exact version に binding し、missing/mismatched binding では fail する。
+  - permission variants は `surfaces.*`、tool names/namespaces、`external_write`、future `host_api.https/fs` を含む。
+  - `PluginToolManifest.external_write` は explicit metadata として追加され、matching request+grant を要求する設計。
+- grant binding は resolution 時に enforcement され、mismatch では `Grant` diagnostic と no resolved record になる。
+- registration は fail-closed。
+  - `PluginToolFeature::install` が tool 登録前に `authorize_plugin_tool` を呼び、denied tool は bounded diagnostic として skip する。
+  - `authorize_plugin_tool` は requested+granted `surfaces.tool`、tool permission/name/namespace、必要時 `external_write` を要求する。
+- execution も独立して fail-closed。
+  - `run_plugin_wasm_tool` が WASM read/load/execute 前に manifest tool を再確認し、`authorize_plugin_tool` を再実行する。
+- future host API は実装せずに permission boundary を model 化。
+  - `authorize_plugin_host_api` は requested+granted host API permission を要求してから `host_api.* is not implemented` を返す。
+  - `validate_wasm_imports` は `yoi:https` / `yoi:fs` imports を authorization path に通してから unsupported module を reject する。
+- denial diagnostics は bounded/sanitized。
+  - `bounded_message` が 512 bytes に truncation し、newline/tab 以外の control characters を除去する。
+- Existing Tool / PreToolCall path と矛盾していない。
+  - granted plugin tools は normal `ToolRegistry` / `PreToolCall` policy path に入る。
+
+Test coverage evidence in diff:
+- no grant denies registration and runtime execution。
+- specific grant registers only intended tool。
+- unrelated package/digest/version grants do not authorize。
+- requested surface/tool/external_write missing denies。
+- future host API permissions checked before unimplemented boundary。
+- exact package identity/digest/version binding and mismatch cases。
+- unknown permission kind fails at manifest parse boundary。
+
+Residual note:
+- `external_write` effect metadata は broader `ToolMeta` public API effect field ではなく plugin manifest/tool metadata level で表現されている。Ticket の escalation condition が broad PreToolCall/Tool metadata redesign を要求していたため、この slice では implemented permission gate として許容可能。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-18T14:23:59Z -->
+
+## Implementation report
+
+Merge / validation report:
+
+Implementation branch `impl/00001KV5W3PJ3-plugin-permission-grants` を Orchestrator worktree の `orchestration` branch に merge した。
+
+Merge:
+- merge commit: `94aa3c1d` — `merge: plugin permission grants`
+- implementation commit: `b1ba1599` — `plugin: enforce permission grants`
+- changed files:
+  - `crates/manifest/src/plugin.rs`
+  - `crates/pod/src/feature/plugin.rs`
+  - `crates/pod/src/pod.rs`
+
+Validation in Orchestrator worktree:
+- `cargo fmt --check` — passed
+- `cargo check -p manifest -p pod` — passed
+- `cargo test -p pod plugin -- --nocapture` — passed; 27 passed, 0 failed
+- `cargo test -p manifest plugin -- --nocapture` — passed; 17 passed, 0 failed
+- `git diff --check` — passed
+
+Review:
+- Reviewer `yoi-reviewer-00001KV5W3PJ3` returned `approve` with no blockers.
+
+Outcome:
+- Recorded requirements are satisfied.
+- Implementation is merged into the Orchestrator branch and validated.
+- Ticket is ready for done/close processing under standing merge/close completion authority. Root/original workspace promotion is not performed in this step.
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-18T14:24:23Z -->
+
+## Implementation report
+
+Cleanup report:
+
+Plugin permission grants Ticket の implementation/review Pods と child worktree を cleanup した。
+
+Stopped Pods:
+- `yoi-coder-00001KV5W3PJ3`
+- `yoi-reviewer-00001KV5W3PJ3`
+
+Removed child implementation worktree:
+- `/home/hare/Projects/yoi/.worktree/00001KV5W3PJ3-plugin-permission-grants`
+
+Deleted merged implementation branch:
+- `impl/00001KV5W3PJ3-plugin-permission-grants` at `b1ba1599`
+
+Orchestrator branch remains the integration authority for this completed work. Root/original workspace promotion was not performed in this step.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-18T14:24:29Z from: inprogress to: done reason: merged_validated_review_approved field: state -->
+
+## State changed
+
+Implementation commit `b1ba1599` was reviewed and approved, merged into the Orchestrator branch as `94aa3c1d`, validated in the Orchestrator worktree, and child implementation resources were cleaned up. Requirements and acceptance criteria are satisfied for this Ticket.
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-18T14:24:42Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-18T14:24:42Z status: closed -->
+
+## 完了
+
+Ticket `00001KV5W3PJ3` is complete.
+
+Completed implementation:
+- Added typed Plugin permission declarations/grants for tool surfaces, tool names/namespaces, `external_write`, and future `host_api.https` / `host_api.fs` boundaries.
+- Bound grants to source-qualified package identity, deterministic digest, and exact package version.
+- Added fail-closed registration gating in `PluginToolFeature::install`.
+- Added independent runtime execution gating in `run_plugin_wasm_tool` before WASM load/execute.
+- Added future host API permission boundary checks without implementing actual `https` / `fs` host APIs.
+- Added bounded/sanitized denial diagnostics.
+- Preserved the existing PreToolCall / Tool permission path; plugin grants are an additional fail-closed gate, not an ambient authority grant.
+
+Reviewed / merged:
+- Implementation commit: `b1ba1599` (`plugin: enforce permission grants`)
+- Reviewer result: approve, no blockers.
+- Orchestrator merge commit: `94aa3c1d` (`merge: plugin permission grants`)
+
+Validation in Orchestrator worktree:
+- `cargo fmt --check` — passed
+- `cargo check -p manifest -p pod` — passed
+- `cargo test -p pod plugin -- --nocapture` — passed; 27 passed, 0 failed
+- `cargo test -p manifest plugin -- --nocapture` — passed; 17 passed, 0 failed
+- `git diff --check` — passed
+
+Cleanup:
+- Stopped Coder Pod `yoi-coder-00001KV5W3PJ3`.
+- Stopped Reviewer Pod `yoi-reviewer-00001KV5W3PJ3`.
+- Removed child worktree `/home/hare/Projects/yoi/.worktree/00001KV5W3PJ3-plugin-permission-grants`.
+- Deleted merged branch `impl/00001KV5W3PJ3-plugin-permission-grants`.
+
+Root/original workspace promotion was not performed in this step; the completed work is integrated on the Orchestrator branch.
+
+---
