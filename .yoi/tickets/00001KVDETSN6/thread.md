@@ -372,3 +372,56 @@ Next:
 - Reviewer output を確認し、approve なら merge/validation/close-ready 処理へ進む。request_changes なら blocker を記録して Coder に戻す。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVDETSN6-r2 at: 2026-06-18T14:46:51Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+対象:
+- Ticket: `00001KVDETSN6`
+- branch: `impl/00001KVDETSN6-panel-dashboard-content-ready`
+- commits:
+  - `fc1ee5bb` — `tui: measure panel dashboard readiness`
+  - `5870251b` — `tui: tighten panel dashboard readiness`
+
+No remaining blockers found.
+
+Evidence reviewed:
+- `dashboard_content_ready` は broad readiness timestamp ではなく、rendered dashboard snapshot を carry するようになっている。
+  - `crates/tui/src/multi_pod.rs` の `PanelE2eDashboardContentReady` が `header`, `rows`, `source_breakdown` を持つ。
+  - rendered Ticket rows は `action`, `disabled_reason`, `local_state`, `orchestration_overlay_state` を含み、Ticket / Pod / Companion / Orchestrator / overlay-visible content の validation basis になっている。
+- main E2E readiness wait は first-frame / single-row readiness では通らない。
+  - `panel_e2e_dashboard_content_is_ready` が header content、ready/planning/pod categories、action/disabled/overlay fields を含む Ticket rows を要求する。
+  - test harness は emitted snapshot を `ExpectedDashboardContent` と照合するため、wrong visible content は metric を満たさない。
+- Companion / Orchestrator / overlay content が coverage に含まれている。
+  - `tests/e2e/tests/panel.rs` が `companion_status`, `orchestrator_status`, overlay state, local state, action label, disabled reason を assert する。
+  - `tests/e2e/src/lib.rs` が real orchestration worktree overlay を作成し、local state は `ready` のまま overlay state を `inprogress` に進め、visible `ready→prog` / `Wait` row を期待している。
+- Negative coverage は meaningful。
+  - missing expected row、wrong state、missing overlay state、missing action label が `snapshot_for_expected` を失敗させる。
+  - wrong action labels は `ExpectedPanelTicketRow::matches` が `action` equality を見るため reject される。
+- Slow-source breakdown は改善され、bounded。
+  - initial pod metadata/status probing、ticket config probe/parse、orchestration overlay validation/read/git checks、ticket scan/parse、local claim scan、pod row materialization、total workspace panel build が区別されている。
+  - `workspace_panel.build.total` は additive component ではなく enclosing total であることが naming から分かる。
+- Panel semantics は preserved と判断。
+  - local-ready / overlay-inprogress の場合に disabled `Wait` action になり、stale local state から queue しない。
+  - planning rows は expected disabled reason 付き `Clarify` を維持。
+  - 新しい assertions は intended user-visible dashboard content/action labels に結びついており、incidental layout/terminal formatting には依存していない。
+
+Reviewer validation:
+- final branch と `fc1ee5bb..5870251b` focus areas の static review。
+- read-only git/worktree inspection。
+- `git diff --check` over reviewed commits — passed。
+
+Orchestrator validation already confirmed:
+- `cargo fmt --check` — passed
+- `cargo check -p tui --features e2e-test` — passed
+- `cargo test -p yoi-e2e --features e2e --test panel` — passed
+- `git diff --check` — passed
+
+Conclusion:
+- Previous request_changes blockers are resolved.
+- Implementation satisfies the recorded Ticket acceptance criteria and is ready for merge/validation in the Orchestrator worktree.
+
+---
