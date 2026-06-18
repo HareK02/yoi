@@ -222,3 +222,59 @@ Next:
 - Reviewer output を確認し、approve なら Ticket review に記録して merge-ready 判断へ進む。request_changes なら Coder に修正依頼する。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KV5W3PJ3 at: 2026-06-18T14:22:32Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+対象:
+- Ticket: `00001KV5W3PJ3`
+- branch: `impl/00001KV5W3PJ3-plugin-permission-grants`
+- commit: `b1ba1599` (`plugin: enforce permission grants`)
+
+No blockers found.
+
+Review / validation performed:
+- review target branch/head が `impl/00001KV5W3PJ3-plugin-permission-grants` at `b1ba1599` であることを確認。
+- merge-base `a984f580` との差分を確認。
+- changed files は以下に限定:
+  - `crates/manifest/src/plugin.rs`
+  - `crates/pod/src/feature/plugin.rs`
+  - `crates/pod/src/pod.rs`
+- `git diff --check` against merge-base を実行し、whitespace/check failure なし。
+- Review boundary が read-only/static review のため cargo validation は再実行せず、Coder reported validation を確認。
+
+Evidence:
+- typed permission/grant model が追加されている。
+  - `PluginGrantConfig` は non-empty grants を source-qualified id、digest、exact version に binding し、missing/mismatched binding では fail する。
+  - permission variants は `surfaces.*`、tool names/namespaces、`external_write`、future `host_api.https/fs` を含む。
+  - `PluginToolManifest.external_write` は explicit metadata として追加され、matching request+grant を要求する設計。
+- grant binding は resolution 時に enforcement され、mismatch では `Grant` diagnostic と no resolved record になる。
+- registration は fail-closed。
+  - `PluginToolFeature::install` が tool 登録前に `authorize_plugin_tool` を呼び、denied tool は bounded diagnostic として skip する。
+  - `authorize_plugin_tool` は requested+granted `surfaces.tool`、tool permission/name/namespace、必要時 `external_write` を要求する。
+- execution も独立して fail-closed。
+  - `run_plugin_wasm_tool` が WASM read/load/execute 前に manifest tool を再確認し、`authorize_plugin_tool` を再実行する。
+- future host API は実装せずに permission boundary を model 化。
+  - `authorize_plugin_host_api` は requested+granted host API permission を要求してから `host_api.* is not implemented` を返す。
+  - `validate_wasm_imports` は `yoi:https` / `yoi:fs` imports を authorization path に通してから unsupported module を reject する。
+- denial diagnostics は bounded/sanitized。
+  - `bounded_message` が 512 bytes に truncation し、newline/tab 以外の control characters を除去する。
+- Existing Tool / PreToolCall path と矛盾していない。
+  - granted plugin tools は normal `ToolRegistry` / `PreToolCall` policy path に入る。
+
+Test coverage evidence in diff:
+- no grant denies registration and runtime execution。
+- specific grant registers only intended tool。
+- unrelated package/digest/version grants do not authorize。
+- requested surface/tool/external_write missing denies。
+- future host API permissions checked before unimplemented boundary。
+- exact package identity/digest/version binding and mismatch cases。
+- unknown permission kind fails at manifest parse boundary。
+
+Residual note:
+- `external_write` effect metadata は broader `ToolMeta` public API effect field ではなく plugin manifest/tool metadata level で表現されている。Ticket の escalation condition が broad PreToolCall/Tool metadata redesign を要求していたため、この slice では implemented permission gate として許容可能。
+
+---
