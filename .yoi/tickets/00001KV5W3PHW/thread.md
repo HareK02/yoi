@@ -128,3 +128,22 @@ State handling:
 - Ticket remains `inprogress` because acceptance and worktree side effects already happened; it is not silently returned to `queued`.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-18T12:05:59Z -->
+
+## Implementation report
+
+Implementation resumed:
+
+Previous `SpawnPod` failure was recovered after Orchestrator runtime refresh. Reused existing clean child worktree and successfully spawned Coder Pod.
+
+Worktree:
+- `/home/hare/Projects/yoi/.worktree/00001KV5W3PHW-plugin-wasm-tool-runtime`
+- branch: `impl/00001KV5W3PHW-plugin-wasm-tool-runtime`
+
+Coder Pod:
+- `yoi-coder-00001KV5W3PHW`
+
+No duplicate `queued -> inprogress` transition was performed; this resumes the already accepted in-progress work.
+
+---
