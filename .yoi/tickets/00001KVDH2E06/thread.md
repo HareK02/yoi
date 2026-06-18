@@ -239,3 +239,46 @@ Next:
 - Reviewer output を確認し、approve なら Orchestrator worktree へ merge/validation/cleanup/close-ready 処理へ進む。request_changes なら blocker を記録して Coder に戻す。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVDH2E06 at: 2026-06-18T15:24:39Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+対象:
+- Ticket: `00001KVDH2E06`
+- branch: `impl/00001KVDH2E06-panel-current-workspace-pods`
+- commit: `3b634d66` (`tui: filter panel pods by workspace`)
+
+Blocker:
+- runtime metadata 用の `workspace_root` は計算されているが、normal metadata write-through path で永続化される前に捨てられている。
+
+Evidence:
+- `crates/pod/src/pod.rs:4320-4327` では `PodMetadata::new(...).with_workspace_root(workspace_root.to_path_buf())` を構築している。
+- しかし `pod_metadata_writer_for_store` (`crates/pod/src/pod.rs:68-80`) は `store.set_active(&metadata.pod_name, metadata.active, metadata.resolved_manifest_snapshot)` だけを呼び、`metadata.workspace_root` を渡していない。
+- `PodMetadataStore::set_active` / `update_by_name` (`crates/pod-store/src/lib.rs:154-178`) は absent record を `PodMetadata::new(pod_name, None)` で作り、`active` / `resolved_manifest_snapshot` だけを更新する。そのため、新規 metadata file は `workspace_root: None` のままになる。
+- constructors/write-through paths、例: `write_pod_metadata_pending` はこの writer を使うため、normal runtime path では新しい workspace ownership field が永続化されないように見える。
+
+Why this breaks acceptance:
+- `crates/tui/src/pod_list.rs:68-95` は fail-closed 設計で、stored Pods は `info.workspace_root.is_some_and(...)` の場合だけ含め、live Pods も stored current-workspace record と name が一致した場合だけ含める。
+- normal write path が current-workspace Pods を `workspace_root: None` のままにすると、新規 current-workspace Pods が unknown/legacy として扱われ、normal Panel rows/action targets から隠れる。
+- これは current-workspace Companion / Orchestrator / Ticket role Pods を表示するという acceptance criteria を直接壊す。
+
+Positive findings:
+- filter logic の方向性は正しい。persisted `workspace_root` を使っており、Pod name / live cwd heuristic ではない。
+- `workspace_root: Option<PathBuf>` に serde default / skip-serializing-if を付ける設計は old metadata に対して non-destructive に見える。
+- tests は pure Panel/PodList filtering fixtures を覆っているが、runtime metadata with `workspace_root` が normal Pod runtime path で実際に永続化される persistence boundary を見逃している。
+
+Requested changes:
+- write-through path で `metadata.workspace_root` を永続化すること。
+  - 例: `set_active` を拡張する、または active/snapshot/workspace ownership を同時に更新する store method を追加する。
+  - unrelated fields は保持すること。
+- normal Pod metadata write-through を構築/実行し、stored metadata に runtime workspace root が残ることを確認する targeted test を追加する。
+- Filtering fixture だけではなく、`PodMetadata::with_workspace_root` が存在するだけでもなく、normal runtime/store boundary の永続化を検証すること。
+
+Validation note:
+- Reviewer は read-only inspection を実施。Coder の focused validation は確認した。
+- `cargo test -p tui` の既知 3 failures について、この branch が原因/悪化とは見ていない。ただし上記 persistence blocker は独立して修正が必要。
+
+---
