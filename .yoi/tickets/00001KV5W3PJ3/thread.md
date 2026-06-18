@@ -278,3 +278,112 @@ Residual note:
 - `external_write` effect metadata は broader `ToolMeta` public API effect field ではなく plugin manifest/tool metadata level で表現されている。Ticket の escalation condition が broad PreToolCall/Tool metadata redesign を要求していたため、この slice では implemented permission gate として許容可能。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-18T14:23:59Z -->
+
+## Implementation report
+
+Merge / validation report:
+
+Implementation branch `impl/00001KV5W3PJ3-plugin-permission-grants` を Orchestrator worktree の `orchestration` branch に merge した。
+
+Merge:
+- merge commit: `94aa3c1d` — `merge: plugin permission grants`
+- implementation commit: `b1ba1599` — `plugin: enforce permission grants`
+- changed files:
+  - `crates/manifest/src/plugin.rs`
+  - `crates/pod/src/feature/plugin.rs`
+  - `crates/pod/src/pod.rs`
+
+Validation in Orchestrator worktree:
+- `cargo fmt --check` — passed
+- `cargo check -p manifest -p pod` — passed
+- `cargo test -p pod plugin -- --nocapture` — passed; 27 passed, 0 failed
+- `cargo test -p manifest plugin -- --nocapture` — passed; 17 passed, 0 failed
+- `git diff --check` — passed
+
+Review:
+- Reviewer `yoi-reviewer-00001KV5W3PJ3` returned `approve` with no blockers.
+
+Outcome:
+- Recorded requirements are satisfied.
+- Implementation is merged into the Orchestrator branch and validated.
+- Ticket is ready for done/close processing under standing merge/close completion authority. Root/original workspace promotion is not performed in this step.
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-18T14:24:23Z -->
+
+## Implementation report
+
+Cleanup report:
+
+Plugin permission grants Ticket の implementation/review Pods と child worktree を cleanup した。
+
+Stopped Pods:
+- `yoi-coder-00001KV5W3PJ3`
+- `yoi-reviewer-00001KV5W3PJ3`
+
+Removed child implementation worktree:
+- `/home/hare/Projects/yoi/.worktree/00001KV5W3PJ3-plugin-permission-grants`
+
+Deleted merged implementation branch:
+- `impl/00001KV5W3PJ3-plugin-permission-grants` at `b1ba1599`
+
+Orchestrator branch remains the integration authority for this completed work. Root/original workspace promotion was not performed in this step.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-18T14:24:29Z from: inprogress to: done reason: merged_validated_review_approved field: state -->
+
+## State changed
+
+Implementation commit `b1ba1599` was reviewed and approved, merged into the Orchestrator branch as `94aa3c1d`, validated in the Orchestrator worktree, and child implementation resources were cleaned up. Requirements and acceptance criteria are satisfied for this Ticket.
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-18T14:24:42Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-18T14:24:42Z status: closed -->
+
+## 完了
+
+Ticket `00001KV5W3PJ3` is complete.
+
+Completed implementation:
+- Added typed Plugin permission declarations/grants for tool surfaces, tool names/namespaces, `external_write`, and future `host_api.https` / `host_api.fs` boundaries.
+- Bound grants to source-qualified package identity, deterministic digest, and exact package version.
+- Added fail-closed registration gating in `PluginToolFeature::install`.
+- Added independent runtime execution gating in `run_plugin_wasm_tool` before WASM load/execute.
+- Added future host API permission boundary checks without implementing actual `https` / `fs` host APIs.
+- Added bounded/sanitized denial diagnostics.
+- Preserved the existing PreToolCall / Tool permission path; plugin grants are an additional fail-closed gate, not an ambient authority grant.
+
+Reviewed / merged:
+- Implementation commit: `b1ba1599` (`plugin: enforce permission grants`)
+- Reviewer result: approve, no blockers.
+- Orchestrator merge commit: `94aa3c1d` (`merge: plugin permission grants`)
+
+Validation in Orchestrator worktree:
+- `cargo fmt --check` — passed
+- `cargo check -p manifest -p pod` — passed
+- `cargo test -p pod plugin -- --nocapture` — passed; 27 passed, 0 failed
+- `cargo test -p manifest plugin -- --nocapture` — passed; 17 passed, 0 failed
+- `git diff --check` — passed
+
+Cleanup:
+- Stopped Coder Pod `yoi-coder-00001KV5W3PJ3`.
+- Stopped Reviewer Pod `yoi-reviewer-00001KV5W3PJ3`.
+- Removed child worktree `/home/hare/Projects/yoi/.worktree/00001KV5W3PJ3-plugin-permission-grants`.
+- Deleted merged branch `impl/00001KV5W3PJ3-plugin-permission-grants`.
+
+Root/original workspace promotion was not performed in this step; the completed work is integrated on the Orchestrator branch.
+
+---
