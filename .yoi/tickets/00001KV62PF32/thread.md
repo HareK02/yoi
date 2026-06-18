@@ -143,3 +143,56 @@ Coder Pod:
 No duplicate `queued -> inprogress` transition was performed; this resumes the already accepted in-progress work.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KV62PF32 at: 2026-06-18T12:19:45Z -->
+
+## Implementation report
+
+Implementation report from Coder Pod `yoi-coder-00001KV62PF32`:
+
+Commit:
+- `fffdfd27 test: assert panel rows-ready fixture data`
+
+Changed files:
+- `tests/e2e/src/lib.rs`
+  - Added concrete `ExpectedPanelTicketRow` matcher.
+  - Exposed fixture ready/planning Ticket ids/titles/states.
+  - Added `wait_for_first_visible_frame`, `wait_for_fixture_ticket_rows_ready`, and delayed-row negative assertion helpers.
+- `tests/e2e/tests/panel.rs`
+  - Replaced main startup readiness assertion from `rows.len() >= 2` / “full ready” to concrete ready fixture Ticket row readiness.
+  - Added matcher regression test proving absent/wrong fixture data is rejected.
+  - Added delayed reload assertion that first frame can arrive while fixture rows are still not rendered.
+- `crates/tui/src/multi_pod.rs`
+  - Added comments clarifying `panel_ready` is first-visible-frame only, while `rows_rendered` snapshots are the data-backed readiness surface.
+
+Behavior / evidence:
+- Main startup readiness now distinguishes:
+  - first frame: legacy `panel_ready`, can be loading/empty;
+  - rows ready: concrete `rows_rendered` containing expected fixture Ticket id/title/state/kind;
+  - full/background completion: still observable via background task events, but no longer the startup readiness proxy.
+- Startup readiness assertion is no longer satisfied by first frame alone or by weak `rows.len() >= N` checks.
+- Delayed reload test asserts first visible frame can arrive while expected fixture Ticket row remains absent for the delayed window.
+
+Validation reported by coder:
+- Passed: `cargo test -p yoi-e2e --features e2e --no-run`
+- Passed: `cargo test -p yoi-e2e --features e2e panel -- --nocapture`
+- Passed: `cargo check -p yoi-e2e -p yoi -p tui`
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check`
+- Not run: `nix build .#yoi` — no runtime/package/dependency changes.
+
+Measured values from focused post-commit reruns:
+- `panel_fixture_ticket_row_ready_has_startup_budget`
+  - first visible frame: `20.403589ms` / budget `1.5s`
+  - fixture rows ready: `120.605891ms` / budget `5s`
+- `panel_first_visible_render_arrives_before_background_reload`
+  - first visible frame: `20.311085ms` / budget `1.5s`
+  - reload held; test asserts ready fixture Ticket row remains absent for delayed window before exit.
+
+Repository status:
+- Child implementation worktree clean at `fffdfd27`.
+
+Residual gaps:
+- None known.
+
+---
