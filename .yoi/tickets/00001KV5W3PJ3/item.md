@@ -1,8 +1,8 @@
 ---
 title: 'Plugin: enforce Plugin permission grants'
-state: 'queued'
+state: 'inprogress'
 created_at: '2026-06-15T14:48:59Z'
-updated_at: '2026-06-18T13:11:00Z'
+updated_at: '2026-06-18T13:12:47Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['plugin', 'permission', 'grant-enforcement', 'capability-boundary', 'tool-execution']
