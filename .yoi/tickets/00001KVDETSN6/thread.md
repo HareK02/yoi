@@ -258,3 +258,24 @@ Requested changes:
 - source breakdown を、少なくとも ticket scan/parsing、overlay validation/read/git checks、pod metadata/status probing、local claim scan が見える程度に分割する。省略する場合は明確な non-action rationale を記録する。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-18T14:20:54Z -->
+
+## Plan
+
+Review follow-up dispatch:
+
+Reviewer `yoi-reviewer-00001KVDETSN6` は `request_changes` を返したため、Ticket review として記録し、既存 Coder Pod `yoi-coder-00001KVDETSN6` に修正依頼を送った。
+
+Coder に依頼した主な修正:
+- dashboard content readiness に Companion / Orchestrator / orchestration overlay state を含める。
+- expected dashboard content に action labels / disabled reasons 相当を含め、wrong/missing action が readiness を通らないようにする。
+- missing row、wrong state、missing overlay、missing action label の negative tests/fixtures を追加する。
+- `dashboard_content_ready` event / exported main metric が broad category gate と誤解されないよう、complete snapshot semantics を carry/validate するか内部 gate と分離する。
+- slow-source breakdown を ticket scan/parsing、overlay validation/read/git checks、pod metadata/status probing、local claim scan などに分割する。広い設計変更なしに観測できない source は明確な non-action rationale として報告する。
+
+Next:
+- Coder の修正 commit / validation report を待つ。
+- 修正後、必要に応じて同じ review focus で再レビューする。
+
+---
