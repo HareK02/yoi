@@ -1,11 +1,13 @@
 ---
 title: 'Panel 表示を現在 workspace の Pod に限定する'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-18T14:09:59Z'
-updated_at: '2026-06-18T14:10:12Z'
+updated_at: '2026-06-18T14:47:10Z'
 assignee: null
 readiness: 'ready'
 risk_flags: ['panel', 'pod-metadata', 'workspace-boundary', 'runtime-observation']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-18T14:47:10Z'
 ---
 
 ## Background
