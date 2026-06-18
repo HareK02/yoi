@@ -101,3 +101,30 @@ Next action:
 Routing decision と accepted implementation plan を記録済み。Ticket body/thread、relations、OrchestrationPlan、関連 Ticket、Orchestrator worktree、visible Pods、既存 branch/worktree を確認し、blocking relation / conflict / missing planning decision は見つからなかった。Panel startup dashboard-content-ready work は既存 Plugin permission grants work と主対象が異なり、別 worktree/branch/scope で並行可能なため、implementation side effects の前に acceptance を記録する。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-18T13:59:23Z -->
+
+## Implementation report
+
+Implementation start note:
+
+`queued -> inprogress` acceptance、accepted plan の記録、Orchestrator worktree での Ticket record commit 後に、専用 implementation worktree と Coder Pod を起動した。
+
+Worktree:
+- `/home/hare/Projects/yoi/.worktree/00001KVDETSN6-panel-dashboard-content-ready`
+- branch: `impl/00001KVDETSN6-panel-dashboard-content-ready`
+- base: Orchestrator branch commit `3b487944`
+
+Coder Pod:
+- `yoi-coder-00001KVDETSN6`
+
+Scope / boundaries:
+- child runtime workspace root は read scope。
+- implementation worktree は write scope。
+- root/original workspace と Orchestrator worktree へは書き込まないよう指示済み。
+- `.yoi/memory`、runtime/log/lock/local/secret-like `.yoi` paths は編集しないよう指示済み。
+
+Next:
+- Coder は dashboard content ready metric / live-like fixture / slow-source breakdown / focused validation を実装し、commit と実装報告を返す予定。
+
+---
