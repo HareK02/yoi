@@ -1,11 +1,13 @@
 ---
 title: 'Plugin: enforce Plugin permission grants'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-15T14:48:59Z'
-updated_at: '2026-06-15T14:50:28Z'
+updated_at: '2026-06-18T13:11:00Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['plugin', 'permission', 'grant-enforcement', 'capability-boundary', 'tool-execution']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-18T13:11:00Z'
 ---
 
 ## Background
