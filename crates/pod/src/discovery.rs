@@ -1108,6 +1108,7 @@ mod tests {
         let parent = PodMetadata {
             pod_name: "parent".into(),
             active: None,
+            workspace_root: None,
             spawned_children: vec![
                 child("child-live", &live_socket),
                 child("child-stale", &stale_socket),
@@ -1127,6 +1128,7 @@ mod tests {
                     session_id,
                     active_child_segment,
                 )),
+                workspace_root: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: Vec::new(),
@@ -1140,6 +1142,7 @@ mod tests {
                     session_id,
                     active_child_segment,
                 )),
+                workspace_root: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: Vec::new(),
@@ -1150,6 +1153,7 @@ mod tests {
             .write(&PodMetadata {
                 pod_name: "child-pending".into(),
                 active: Some(PodActiveSegmentRef::pending_segment(pending_session_id)),
+                workspace_root: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: Vec::new(),
@@ -1163,6 +1167,7 @@ mod tests {
                     session_id,
                     new_segment_id(),
                 )),
+                workspace_root: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: Vec::new(),
@@ -1173,6 +1178,7 @@ mod tests {
             .write(&PodMetadata {
                 pod_name: "peer".into(),
                 active: None,
+                workspace_root: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: vec![pod_store::PodPeer {
@@ -1366,6 +1372,7 @@ mod tests {
             .write(&PodMetadata {
                 pod_name: "source".into(),
                 active: None,
+                workspace_root: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: vec![pod_store::PodPeer {
@@ -1405,6 +1412,7 @@ mod tests {
             .write(&PodMetadata {
                 pod_name: "source".into(),
                 active: None,
+                workspace_root: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: vec![pod_store::PodPeer {
@@ -1417,6 +1425,7 @@ mod tests {
             .write(&PodMetadata {
                 pod_name: "target".into(),
                 active: None,
+                workspace_root: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: vec![pod_store::PodPeer {
@@ -1519,6 +1528,7 @@ mod tests {
             .write(&PodMetadata {
                 pod_name: "source".into(),
                 active: None,
+                workspace_root: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: vec![pod_store::PodPeer {
@@ -1531,6 +1541,7 @@ mod tests {
             .write(&PodMetadata {
                 pod_name: "target".into(),
                 active: None,
+                workspace_root: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: vec![pod_store::PodPeer {
@@ -1631,6 +1642,7 @@ mod tests {
             .write(&PodMetadata {
                 pod_name: "source".into(),
                 active: None,
+                workspace_root: None,
                 spawned_children: vec![child("target", &socket)],
                 reclaimed_children: Vec::new(),
                 peers: Vec::new(),

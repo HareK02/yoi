@@ -918,6 +918,8 @@ fn build_workspace_panel_with_registry_model(
     pods: &PodList,
     registry: &PanelRegistrySnapshot,
 ) -> WorkspacePanelViewModel {
+    let pods = pods.filter_for_workspace(workspace_root);
+    let pods = &pods;
     match ticket_config_availability(workspace_root) {
         TicketConfigAvailability::Absent => {}
         TicketConfigAvailability::Usable => {
@@ -1685,7 +1687,7 @@ fn excerpt(markdown: &str, max_chars: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pod_list::{LivePodInfo, PodEntrySummary};
+    use crate::pod_list::{LivePodInfo, PodEntrySummary, StoredPodInfo};
     use crate::role_session_registry::{PanelRegistryStore, RelatedTicketRef, RoleSessionOrigin};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1829,10 +1831,22 @@ mod tests {
             .unwrap_or_else(|| panic!("missing row for {title}"))
     }
 
-    fn live_pods(names: &[&str]) -> PodList {
+    fn live_pods(workspace_root: &Path, names: &[&str]) -> PodList {
+        let stored = names
+            .iter()
+            .map(|name| StoredPodInfo {
+                pod_name: (*name).to_string(),
+                metadata_state: StoredMetadataState::Present,
+                active_session_id: None,
+                active_segment_id: None,
+                updated_at: 1,
+                workspace_root: Some(workspace_root.to_path_buf()),
+                preview: None,
+            })
+            .collect();
         PodList::from_sources(
             crate::pod_list::PodVisibilitySource::ResumePicker,
-            vec![],
+            stored,
             names
                 .iter()
                 .map(|name| LivePodInfo {
@@ -1855,7 +1869,7 @@ mod tests {
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
         create_ticket(&backend, "Hidden Without Config", |_| {});
 
-        let model = build_workspace_panel(temp.path(), &live_pods(&["idle"]));
+        let model = build_workspace_panel(temp.path(), &live_pods(temp.path(), &["idle"]));
 
         assert!(model.header.diagnostics.is_empty());
         assert_eq!(
@@ -2069,7 +2083,7 @@ mod tests {
             .unwrap();
         let model = build_workspace_panel_with_registry(
             temp.path(),
-            &live_pods(&["ready-intake"]),
+            &live_pods(temp.path(), &["ready-intake"]),
             &registry.snapshot().unwrap(),
         );
 
@@ -2187,7 +2201,7 @@ mod tests {
         )
         .unwrap();
 
-        let model = build_workspace_panel(temp.path(), &live_pods(&["idle"]));
+        let model = build_workspace_panel(temp.path(), &live_pods(temp.path(), &["idle"]));
 
         let diagnostics = model.header.diagnostics.join("\n");
         assert!(diagnostics.contains("Ticket config is unusable"));
@@ -2420,7 +2434,10 @@ mod tests {
             )
             .unwrap();
 
-        let pods = live_pods(&["claimed-intake", "shared-intake", &preticket_pod]);
+        let pods = live_pods(
+            temp.path(),
+            &["claimed-intake", "shared-intake", &preticket_pod],
+        );
         let model =
             build_workspace_panel_with_registry(temp.path(), &pods, &registry.snapshot().unwrap());
 
@@ -2484,7 +2501,7 @@ mod tests {
 
         let model = build_workspace_panel_with_registry(
             temp.path(),
-            &live_pods(&["ticket-claimed-intake"]),
+            &live_pods(temp.path(), &["ticket-claimed-intake"]),
             &registry,
         );
         let row = model
@@ -2690,6 +2707,106 @@ mod tests {
                 &orchestrator_pod_presence("zz-workspace-orchestrator", &authority),
             ),
             OrchestratorLifecyclePlan::ReportLive
+        );
+    }
+
+    fn mixed_workspace_pods(current: &Path, external: &Path) -> PodList {
+        let stored = vec![
+            StoredPodInfo {
+                pod_name: "current".to_string(),
+                metadata_state: StoredMetadataState::Present,
+                active_session_id: None,
+                active_segment_id: None,
+                updated_at: 10,
+                workspace_root: Some(current.to_path_buf()),
+                preview: None,
+            },
+            StoredPodInfo {
+                pod_name: "current-coder".to_string(),
+                metadata_state: StoredMetadataState::Present,
+                active_session_id: None,
+                active_segment_id: None,
+                updated_at: 20,
+                workspace_root: Some(current.to_path_buf()),
+                preview: None,
+            },
+            StoredPodInfo {
+                pod_name: "external".to_string(),
+                metadata_state: StoredMetadataState::Present,
+                active_session_id: None,
+                active_segment_id: None,
+                updated_at: 30,
+                workspace_root: Some(external.to_path_buf()),
+                preview: None,
+            },
+            StoredPodInfo {
+                pod_name: "legacy".to_string(),
+                metadata_state: StoredMetadataState::Present,
+                active_session_id: None,
+                active_segment_id: None,
+                updated_at: 40,
+                workspace_root: None,
+                preview: None,
+            },
+            StoredPodInfo {
+                pod_name: "corrupt".to_string(),
+                metadata_state: StoredMetadataState::Corrupt("bad metadata".to_string()),
+                active_session_id: None,
+                active_segment_id: None,
+                updated_at: 50,
+                workspace_root: None,
+                preview: Some("metadata: bad metadata".to_string()),
+            },
+        ];
+        let live = [
+            "current",
+            "current-coder",
+            "external",
+            "legacy",
+            "live-only",
+        ]
+        .iter()
+        .map(|name| LivePodInfo {
+            pod_name: (*name).to_string(),
+            socket_path: PathBuf::from(format!("/tmp/{name}.sock")),
+            status: Some(PodStatus::Idle),
+            reachable: true,
+            segment_id: None,
+            summary: PodEntrySummary::default(),
+        })
+        .collect();
+        PodList::from_sources(
+            crate::pod_list::PodVisibilitySource::ResumePicker,
+            stored,
+            live,
+            None,
+            10,
+        )
+    }
+
+    #[test]
+    fn workspace_panel_filters_pod_rows_to_current_workspace_metadata() {
+        let current = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let pods = mixed_workspace_pods(current.path(), external.path());
+
+        let model = build_workspace_panel(current.path(), &pods);
+        let pod_names = model
+            .rows
+            .iter()
+            .filter_map(|row| match &row.key {
+                PanelRowKey::Pod(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(pod_names, vec!["current-coder", "current"]);
+        assert!(
+            model
+                .rows
+                .iter()
+                .filter(|row| matches!(row.key, PanelRowKey::Pod(_)))
+                .all(|row| row.next_action == Some(NextUserAction::OpenPod))
         );
     }
 }

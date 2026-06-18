@@ -100,6 +100,8 @@ pub struct PodMetadata {
     pub pod_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<PodActiveSegmentRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spawned_children: Vec<PodSpawnedChild>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -116,11 +118,17 @@ impl PodMetadata {
         Self {
             pod_name: pod_name.into(),
             active,
+            workspace_root: None,
             spawned_children: Vec::new(),
             reclaimed_children: Vec::new(),
             peers: Vec::new(),
             resolved_manifest_snapshot: None,
         }
+    }
+
+    pub fn with_workspace_root(mut self, workspace_root: PathBuf) -> Self {
+        self.workspace_root = Some(workspace_root);
+        self
     }
 }
 
@@ -157,16 +165,30 @@ pub trait PodMetadataStore: Send + Sync {
         Ok(metadata)
     }
 
-    /// Set the active pointer while preserving spawned children and manifest snapshot.
+    /// Set the active pointer while preserving spawned children, workspace ownership, and manifest snapshot.
     fn set_active(
         &self,
         pod_name: &str,
         active: Option<PodActiveSegmentRef>,
         resolved_manifest_snapshot: Option<serde_json::Value>,
     ) -> Result<PodMetadata, PodStoreError> {
+        self.set_active_with_workspace_root(pod_name, active, resolved_manifest_snapshot, None)
+    }
+
+    /// Set the active pointer and workspace ownership while preserving unrelated fields.
+    fn set_active_with_workspace_root(
+        &self,
+        pod_name: &str,
+        active: Option<PodActiveSegmentRef>,
+        resolved_manifest_snapshot: Option<serde_json::Value>,
+        workspace_root: Option<PathBuf>,
+    ) -> Result<PodMetadata, PodStoreError> {
         self.update_by_name(pod_name, |metadata| {
             metadata.active = active;
             metadata.resolved_manifest_snapshot = resolved_manifest_snapshot;
+            if let Some(workspace_root) = workspace_root {
+                metadata.workspace_root = Some(workspace_root);
+            }
         })
     }
 
