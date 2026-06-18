@@ -195,3 +195,30 @@ Next action:
 - 特に fail-closed grant enforcement、source/digest/version binding、no ambient authority、external_write/effect metadata、bounded diagnostics、existing PreToolCall path との整合性を確認する。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-18T14:16:18Z -->
+
+## Plan
+
+Review dispatch:
+
+Reviewer Pod `yoi-reviewer-00001KV5W3PJ3` を read-only scope で起動した。
+
+Review target:
+- worktree: `/home/hare/Projects/yoi/.worktree/00001KV5W3PJ3-plugin-permission-grants`
+- branch: `impl/00001KV5W3PJ3-plugin-permission-grants`
+- commit: `b1ba1599`
+
+Reviewer focus:
+- recorded intent / invariants / acceptance criteria に対する適合性。
+- registration / execution の fail-closed grant enforcement。
+- source-qualified identity / digest / version binding。
+- unrelated grant / digest mismatch / missing surface/tool/external_write / unknown kind の拒否。
+- `external_write` と Tool effect / PreToolCall path の整合性。
+- future `https` / `fs` host API permission boundary が ambient authority を作っていないこと。
+- bounded safe diagnostics。
+
+Next:
+- Reviewer output を確認し、approve なら Ticket review に記録して merge-ready 判断へ進む。request_changes なら Coder に修正依頼する。
+
+---

@@ -178,3 +178,29 @@ Next action:
 - 特に dashboard content ready が名前だけの metric ではないこと、fixture が live-like な representative dashboard content を検証していること、single-row readiness だけでは通らないこと、negative fixtures が有効であること、Panel semantics を accidental に変更していないことを確認する。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-18T14:16:26Z -->
+
+## Plan
+
+Review dispatch:
+
+Reviewer Pod `yoi-reviewer-00001KVDETSN6` を read-only scope で起動した。
+
+Review target:
+- worktree: `/home/hare/Projects/yoi/.worktree/00001KVDETSN6-panel-dashboard-content-ready`
+- branch: `impl/00001KVDETSN6-panel-dashboard-content-ready`
+- commit: `fc1ee5bb`
+
+Reviewer focus:
+- recorded intent / invariants / acceptance criteria に対する適合性。
+- `dashboard_content_ready` が名前だけの metric ではなく、代表 dashboard content の expected row/content set に基づくこと。
+- first frame / single-row readiness だけでは主 E2E が通らないこと。
+- missing dashboard content / missing orchestration overlay の negative fixtures が意味を持つこと。
+- startup source breakdown が bounded で regression triage に使えること。
+- Existing Panel behavior / workflow semantics を accidental に変更していないこと。
+
+Next:
+- Reviewer output を確認し、approve なら Ticket review に記録して merge-ready 判断へ進む。request_changes なら Coder に修正依頼する。
+
+---
