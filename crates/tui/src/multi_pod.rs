@@ -5406,6 +5406,9 @@ fn panel_ticket_detail(row: &PanelRow) -> String {
     }
 
     let mut parts = vec![panel_ticket_reference(row)];
+    if let Some(overlay_detail) = panel_ticket_overlay_detail(row) {
+        parts.push(overlay_detail);
+    }
     if let Some(blocked_reason) = row
         .ticket
         .as_ref()
@@ -5439,6 +5442,24 @@ fn panel_ticket_action_label(row: &PanelRow, action: NextUserAction) -> &'static
     } else {
         action.label()
     }
+}
+
+fn panel_ticket_overlay_detail(row: &PanelRow) -> Option<String> {
+    let ticket = row.ticket.as_ref()?;
+    let overlay = ticket.orchestration_overlay.as_ref()?;
+    let mut detail = format!(
+        "Overlay: local {} · {} {}",
+        ticket.workflow_state.as_str(),
+        overlay.source,
+        overlay.workflow_state.as_str()
+    );
+    if matches!(
+        overlay.workflow_state,
+        TicketWorkflowState::Done | TicketWorkflowState::Closed
+    ) {
+        detail.push_str(" · merge pending");
+    }
+    Some(detail)
 }
 
 fn panel_ticket_reason(row: &PanelRow) -> Option<&str> {
@@ -7594,6 +7615,43 @@ branch = "orchestration/custom-panel"
         assert_eq!(detail_line.width(), 42);
         assert!(detail_line.starts_with("  meta 00001KTTB479X · Gate: clear"));
         assert!(detail_line.ends_with('…'));
+    }
+
+    #[test]
+    fn panel_orchestration_overlay_uses_compact_status_column_and_detail_line() {
+        let mut row = panel_test_ticket_row(
+            "00001OVERLAY",
+            "Overlay column regression",
+            ActionPriority::Background,
+            NextUserAction::Wait,
+            "queued",
+        );
+        row.kind = PanelRowKind::Review;
+        row.status = "q→done".to_string();
+        row.disabled_reason = Some(
+            "orchestration worktree overlay shows Ticket state done; local state remains queued"
+                .to_string(),
+        );
+        row.ticket.as_mut().unwrap().orchestration_overlay =
+            Some(crate::workspace_panel::TicketStateOverlay {
+                source: "orchestration".to_string(),
+                workflow_state: TicketWorkflowState::Done,
+            });
+
+        let lines = panel_row_lines(&row, false, 160);
+        let title_line = plain_line(&lines[0]);
+        let detail_line = plain_line(&lines[1]);
+        let state_start = 2;
+        let title_start = state_start + TICKET_STATE_COLUMN_WIDTH + 1;
+
+        assert!(row.status.width() <= TICKET_STATE_COLUMN_WIDTH);
+        assert_eq!(display_column(&title_line, "q→done"), state_start);
+        assert_eq!(
+            display_column(&title_line, "Overlay column regression"),
+            title_start
+        );
+        assert!(!title_line.contains("orchestration"));
+        assert!(detail_line.contains("Overlay: local queued · orchestration done · merge pending"));
     }
 
     #[test]

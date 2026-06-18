@@ -282,3 +282,16 @@ Cleanup planned:
 Reviewer approved, implementation branch merged into the orchestration branch, and E2E-focused validation passed in the Orchestrator worktree. Marking Ticket done in the orchestration branch.
 
 ---
+
+<!-- event: review author: hare at: 2026-06-18T13:30:51Z status: request_changes -->
+
+## Review: request changes
+
+Request changes.
+
+The current result still does not answer the user-facing latency problem. The problematic latency is the time from launching `yoi panel` / pressing Enter to seeing the actual workspace dashboard content. The current E2E measures a direct subprocess spawn to one concrete fixture Ticket row appearing in `rows_rendered`; it does not require the dashboard content to be complete from the user's perspective, and it does not reproduce or attribute the clearly long live-workspace delay.
+
+Do not treat fixture first-frame or single-row readiness numbers as evidence that no improvement is needed. The acceptance criterion must be strengthened to a user-visible dashboard-content-ready point and paired with slow-source attribution/improvement for the live-like Panel startup path.
+
+
+---

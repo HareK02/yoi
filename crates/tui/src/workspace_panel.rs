@@ -1089,12 +1089,22 @@ fn ticket_state_display(
 ) -> String {
     match overlay {
         Some(overlay) => format!(
-            "local: {} · {}: {}",
-            local.as_str(),
-            overlay.source,
-            overlay.workflow_state.as_str()
+            "{}→{}",
+            compact_ticket_state_label(local),
+            compact_ticket_state_label(overlay.workflow_state)
         ),
         None => local.as_str().to_string(),
+    }
+}
+
+fn compact_ticket_state_label(state: TicketWorkflowState) -> &'static str {
+    match state {
+        TicketWorkflowState::Planning => "plan",
+        TicketWorkflowState::Ready => "ready",
+        TicketWorkflowState::Queued => "q",
+        TicketWorkflowState::InProgress => "prog",
+        TicketWorkflowState::Done => "done",
+        TicketWorkflowState::Closed => "cls",
     }
 }
 
@@ -1138,51 +1148,90 @@ fn apply_orchestration_overlay_to_derived(
     }
 }
 
+fn format_relation_blockers(blockers: &[&TicketRelationBlocker]) -> String {
+    let shown_blockers = blockers.iter().take(3).count();
+    let mut formatted = blockers
+        .iter()
+        .take(3)
+        .map(|blocker| {
+            format!(
+                "{} via {} (state: {})",
+                blocker.blocking_ticket,
+                blocker.reason_kind,
+                blocker.blocking_state.as_str()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining_blockers = blockers.len().saturating_sub(shown_blockers);
+    if remaining_blockers > 0 {
+        formatted.push_str(&format!(" (+{remaining_blockers} more)"));
+    }
+    formatted
+}
+
+fn relation_blocker_allows_ready_queue(blocker: &TicketRelationBlocker) -> bool {
+    matches!(
+        blocker.blocking_state,
+        TicketWorkflowState::Queued | TicketWorkflowState::InProgress
+    )
+}
+
 fn derive_ticket_state(
     summary: &TicketSummary,
     relation_blockers: &[TicketRelationBlocker],
 ) -> DerivedTicketState {
     if !relation_blockers.is_empty() {
-        let shown_blockers = relation_blockers.iter().take(3).count();
-        let mut blockers = relation_blockers
+        let active_blockers = relation_blockers
             .iter()
-            .take(3)
-            .map(|blocker| {
-                format!(
-                    "{} via {} (state: {})",
-                    blocker.blocking_ticket,
-                    blocker.reason_kind,
-                    blocker.blocking_state.as_str()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let remaining_blockers = relation_blockers.len().saturating_sub(shown_blockers);
-        if remaining_blockers > 0 {
-            blockers.push_str(&format!(" (+{remaining_blockers} more)"));
+            .filter(|blocker| !relation_blocker_allows_ready_queue(blocker))
+            .collect::<Vec<_>>();
+        if !active_blockers.is_empty() || summary.workflow_state != TicketWorkflowState::Ready {
+            let blockers_to_report = if active_blockers.is_empty() {
+                relation_blockers.iter().collect::<Vec<_>>()
+            } else {
+                active_blockers
+            };
+            let blockers = format_relation_blockers(&blockers_to_report);
+            let waiting_reason = format!("waiting for {blockers}");
+            return DerivedTicketState {
+                kind: match summary.workflow_state {
+                    TicketWorkflowState::Planning => PanelRowKind::Planning,
+                    TicketWorkflowState::Queued | TicketWorkflowState::InProgress => {
+                        PanelRowKind::ActiveWork
+                    }
+                    TicketWorkflowState::Done | TicketWorkflowState::Closed => PanelRowKind::Review,
+                    TicketWorkflowState::Ready => PanelRowKind::Ticket,
+                },
+                priority: match summary.workflow_state {
+                    TicketWorkflowState::Queued | TicketWorkflowState::InProgress => {
+                        ActionPriority::ActiveWork
+                    }
+                    _ => ActionPriority::Background,
+                },
+                action: Some(NextUserAction::Wait),
+                disabled_reason: Some(format!(
+                    "Queue disabled: {waiting_reason}. Resolve dependency/blocker before ready -> queued."
+                )),
+                key_hint: Some(format!("Gate: {waiting_reason}")),
+                blocked_reason: Some(blockers),
+            };
         }
-        let waiting_reason = format!("waiting for {blockers}");
+
+        let blockers = format_relation_blockers(
+            &relation_blockers
+                .iter()
+                .collect::<Vec<&TicketRelationBlocker>>(),
+        );
         return DerivedTicketState {
-            kind: match summary.workflow_state {
-                TicketWorkflowState::Planning => PanelRowKind::Planning,
-                TicketWorkflowState::Queued | TicketWorkflowState::InProgress => {
-                    PanelRowKind::ActiveWork
-                }
-                TicketWorkflowState::Done | TicketWorkflowState::Closed => PanelRowKind::Review,
-                TicketWorkflowState::Ready => PanelRowKind::Ticket,
-            },
-            priority: match summary.workflow_state {
-                TicketWorkflowState::Queued | TicketWorkflowState::InProgress => {
-                    ActionPriority::ActiveWork
-                }
-                _ => ActionPriority::Background,
-            },
-            action: Some(NextUserAction::Wait),
-            disabled_reason: Some(format!(
-                "Queue disabled: {waiting_reason}. Resolve dependency/blocker before ready -> queued."
+            kind: PanelRowKind::Ticket,
+            priority: ActionPriority::ReadyForQueue,
+            action: Some(NextUserAction::Queue),
+            disabled_reason: None,
+            key_hint: Some(format!(
+                "Queue allowed: prerequisites are already queued/in progress; Orchestrator will preserve order ({blockers})."
             )),
-            key_hint: Some(format!("Gate: {waiting_reason}")),
-            blocked_reason: Some(blockers),
+            blocked_reason: None,
         };
     }
 
@@ -1635,15 +1684,6 @@ mod tests {
             .unwrap_or_else(|| panic!("missing row for {title}"))
     }
 
-    fn status_contains(row: &PanelRow, needle: &str) {
-        assert!(
-            row.status.contains(needle),
-            "status {:?} did not contain {:?}",
-            row.status,
-            needle
-        );
-    }
-
     fn live_pods(names: &[&str]) -> PodList {
         PodList::from_sources(
             crate::pod_list::PodVisibilitySource::ResumePicker,
@@ -1731,8 +1771,7 @@ mod tests {
         let model = build_workspace_panel(temp.path(), &empty_pods());
 
         let matched = ticket_row_by_title(&model, "Overlay Match");
-        status_contains(matched, "local: queued");
-        status_contains(matched, "orchestration: inprogress");
+        assert_eq!(matched.status, "q→prog");
         assert_eq!(
             matched.ticket.as_ref().unwrap().workflow_state,
             TicketWorkflowState::Queued
@@ -1772,8 +1811,7 @@ mod tests {
         let model = build_workspace_panel(temp.path(), &empty_pods());
 
         let row = ticket_row_by_title(&model, "Overlay In Progress");
-        status_contains(row, "local: queued");
-        status_contains(row, "orchestration: inprogress");
+        assert_eq!(row.status, "q→prog");
         assert_eq!(row.next_action, Some(NextUserAction::Wait));
         assert_eq!(row.kind, PanelRowKind::ActiveWork);
         assert_eq!(fs::read_to_string(&local_item).unwrap(), before);
@@ -1801,8 +1839,7 @@ mod tests {
         let model = build_workspace_panel(temp.path(), &empty_pods());
 
         let row = ticket_row_by_title(&model, "Overlay Done");
-        status_contains(row, "local: queued");
-        status_contains(row, "orchestration: done");
+        assert_eq!(row.status, "q→done");
         assert_eq!(row.kind, PanelRowKind::Review);
         assert_eq!(row.next_action, Some(NextUserAction::Wait));
         assert_ne!(row.next_action, Some(NextUserAction::Queue));
@@ -2121,6 +2158,50 @@ mod tests {
                 .unwrap()
                 .contains(&dependency.id)
         );
+    }
+
+    #[test]
+    fn workspace_panel_allows_ready_ticket_when_relation_prerequisite_is_queued() {
+        let temp = TempDir::new().unwrap();
+        write_ticket_config(temp.path());
+        let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
+        let mut ready_input = NewTicket::new("Ready After Queued Relation");
+        ready_input.workflow_state = Some(TicketWorkflowState::Ready);
+        let ready = backend.create(ready_input).unwrap();
+        let mut dependency_input = NewTicket::new("Queued Relation Dependency");
+        dependency_input.workflow_state = Some(TicketWorkflowState::Queued);
+        let dependency = backend.create(dependency_input).unwrap();
+        backend
+            .add_ticket_relation(
+                TicketIdOrSlug::Id(ready.id.clone()),
+                NewTicketRelation {
+                    kind: TicketRelationKind::DependsOn,
+                    target: dependency.id.clone(),
+                    note: None,
+                    author: Some("test".to_string()),
+                },
+            )
+            .unwrap();
+
+        let model = build_workspace_panel(temp.path(), &empty_pods());
+        let row = model
+            .rows
+            .iter()
+            .find(|row| row.title == "Ready After Queued Relation")
+            .unwrap();
+
+        assert_eq!(row.kind, PanelRowKind::Ticket);
+        assert_eq!(row.next_action, Some(NextUserAction::Queue));
+        assert_eq!(row.priority, ActionPriority::ReadyForQueue);
+        assert!(row.disabled_reason.is_none());
+        assert!(row.ticket.as_ref().unwrap().blocked_reason.is_none());
+        assert!(
+            row.key_hint
+                .as_deref()
+                .unwrap()
+                .contains("Queue allowed: prerequisites are already queued/in progress")
+        );
+        assert!(row.key_hint.as_deref().unwrap().contains(&dependency.id));
     }
 
     #[test]

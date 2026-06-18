@@ -75,3 +75,30 @@ Companion work is useful but not required for near-term panel operation. The pan
 Decision: downgrade Companion-related follow-up priority to P2 so near-term focus can stay on Ticket role config strictness/init, Orchestrator queue automation, and workflow/compaction reliability.
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-18T13:06:31Z from: planning to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-18T13:06:31Z status: closed -->
+
+## 完了
+
+Closed as completed by child Tickets.
+
+The original Workspace Panel Companion interface plan has been implemented through more specific work:
+- direct selected-Pod send was removed from the Panel composer path;
+- Panel composer routing now targets the workspace Companion and Ticket Intake explicitly;
+- workspace Companion Pod lifecycle restore/spawn/observe behavior is implemented;
+- local role/session registry and Ticket claim handling were added for Panel-launched role sessions;
+- project role Profile feature defaults limit Companion authority and keep Ticket orchestration / Pods / Task disabled for Companion by default.
+
+The remaining work in this area should be tracked as targeted follow-up Tickets rather than keeping this umbrella planning Ticket open.
+
+
+---

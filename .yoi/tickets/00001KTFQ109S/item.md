@@ -1,8 +1,8 @@
 ---
 title: "Workspace panel Companion interface"
-state: "planning"
+state: 'closed'
 created_at: "2026-06-07T00:16:51Z"
-updated_at: "2026-06-07T03:13:01Z"
+updated_at: '2026-06-18T13:06:31Z'
 ---
 
 ## Background
