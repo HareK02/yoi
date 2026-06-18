@@ -344,3 +344,31 @@ Next action:
 - previous `request_changes` blockers が解消されたか、read-only Reviewer Pod で再レビューする。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-18T14:42:24Z -->
+
+## Plan
+
+Review re-dispatch:
+
+Reviewer Pod `yoi-reviewer-00001KVDETSN6-r2` を read-only scope で起動した。
+
+Review target:
+- worktree: `/home/hare/Projects/yoi/.worktree/00001KVDETSN6-panel-dashboard-content-ready`
+- branch: `impl/00001KVDETSN6-panel-dashboard-content-ready`
+- commits:
+  - `fc1ee5bb` — initial implementation
+  - `5870251b` — review-fix implementation
+
+Reviewer focus:
+- previous `request_changes` blockers が解消されているか。
+- final `dashboard_content_ready` が Ticket / Pod / Companion / Orchestrator / overlay elements を含む expected dashboard snapshot semantics を持つか。
+- first-frame / single-row readiness だけで main metric が通らないか。
+- missing row / wrong state / missing overlay / missing action label の negative tests が意味を持つか。
+- slow-source breakdown が bounded かつ診断可能か。
+- Panel workflow semantics を accidental に変更していないか。
+
+Next:
+- Reviewer output を確認し、approve なら merge/validation/close-ready 処理へ進む。request_changes なら blocker を記録して Coder に戻す。
+
+---
