@@ -196,3 +196,45 @@ Residual gaps:
 - None known.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KV62PF32 at: 2026-06-18T12:24:00Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Evidence checked:
+- 対象 worktree / branch / commit が期待通りで clean であることを確認。
+  - branch: `impl/00001KV62PF32-panel-rows-ready-e2e`
+  - HEAD: `fffdfd2721fed5171d4dd9780f893b9bb323ab8a`
+  - base: `d32fb3bc3c82f1cb7e4a29d4fdf6e908ba495c7f`
+- Diff scope は以下3ファイルに限定されていることを確認。
+  - `crates/tui/src/multi_pod.rs`
+  - `tests/e2e/src/lib.rs`
+  - `tests/e2e/tests/panel.rs`
+
+Acceptance / intent review:
+- Main startup readiness は `panel_fixture_ticket_row_ready_has_startup_budget` で concrete fixture Ticket row readiness を待つ形になっている。
+- `rows.len() >= N` ではなく、fixture Ticket row の kind / id / title / status-state を matcher で確認している。
+- `panel_ready` / `wait_for_first_visible_frame` は first-visible-frame only としてコメント・helper 名で区別されている。
+- `wait_for_fixture_ticket_rows_ready` が startup rows-ready signal として定義されている。
+- `panel_fixture_ticket_row_matcher_rejects_absent_fixture_data` により absent/wrong fixture data を reject する挙動が確認されている。
+- delayed reload test は first frame が先に出る一方、held reload 中は expected fixture Ticket row が描画されないことを確認している。
+- 既存 Panel mouse / row selection E2E は残っており、action dispatch なし・mouse capture behavior の coverage は維持されている。
+- fixture isolation / no-provider / no-network 前提は維持されている。
+
+Validation performed by reviewer:
+- Passed: `cargo fmt --check`
+- Passed: `git diff --check d32fb3bc..HEAD`
+
+Validation not run by reviewer:
+- `cargo test` / `cargo check` は read-only review scope では build/artifact 書き込みを伴うため未実行。Coder reported validation を evidence として確認した。
+
+Risk assessment:
+- residual risk は低い。変更は test/harness focused で Ticket boundary に沿っている。
+- timing test は環境依存性が残るが、readiness predicate は first frame/loading paint ではなく concrete fixture row rendering を測るよう修正されている。
+
+Conclusion:
+- Approved. No blocker remains.
+
+---
