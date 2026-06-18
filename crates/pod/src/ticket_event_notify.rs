@@ -5,9 +5,9 @@ use minijinja::Value as TemplateValue;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use ticket::{LocalTicketBackend, TicketBackend, TicketIdOrSlug};
-use tracing::debug;
+use tracing::{debug, warn};
 
-use crate::discovery::PodDiscovery;
+use crate::discovery::{PodDiscovery, WeakNotifyDelivery};
 use crate::hook::{Hook, HookPostToolAction, PostToolCall, ToolResultSummary};
 use crate::prompt::catalog::{PodPrompt, PromptCatalog};
 use pod_store::PodMetadataStore;
@@ -48,17 +48,58 @@ impl<St: PodMetadataStore + Clone + Send + Sync + 'static> Hook<PostToolCall>
         let Some(notice) = build_ticket_event_notice(&self.backend, summary) else {
             return HookPostToolAction::Continue;
         };
-        let delivered = self
+        match self
+            .discovery
+            .ensure_existing_peer(&self.companion_pod_name)
+        {
+            Ok(Some(_)) => {
+                debug!(
+                    ticket = %notice.ticket_id,
+                    event_kind = %notice.event_kind,
+                    companion = %self.companion_pod_name,
+                    "ensured Companion peer relationship before Ticket event notification"
+                );
+            }
+            Ok(None) => {
+                debug!(
+                    ticket = %notice.ticket_id,
+                    event_kind = %notice.event_kind,
+                    companion = %self.companion_pod_name,
+                    "skipping Companion peer registration because Companion metadata is missing"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    ticket = %notice.ticket_id,
+                    event_kind = %notice.event_kind,
+                    companion = %self.companion_pod_name,
+                    error = %error,
+                    "failed to ensure Companion peer relationship before Ticket event notification"
+                );
+            }
+        }
+        let delivery = self
             .discovery
             .send_weak_notify_to_live_peer(&self.companion_pod_name, notice.message)
             .await;
-        if delivered {
-            debug!(
-                ticket = %notice.ticket_id,
-                event_kind = %notice.event_kind,
-                companion = %self.companion_pod_name,
-                "delivered weak Ticket event notification to Companion peer"
-            );
+        match delivery {
+            WeakNotifyDelivery::Delivered => {
+                debug!(
+                    ticket = %notice.ticket_id,
+                    event_kind = %notice.event_kind,
+                    companion = %self.companion_pod_name,
+                    "delivered weak Ticket event notification to Companion peer"
+                );
+            }
+            skipped => {
+                warn!(
+                    ticket = %notice.ticket_id,
+                    event_kind = %notice.event_kind,
+                    companion = %self.companion_pod_name,
+                    delivery = %skipped,
+                    "skipped weak Ticket event notification to Companion peer"
+                );
+            }
         }
         HookPostToolAction::Continue
     }
@@ -327,7 +368,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn ticket_event_hook_delivers_weak_companion_notification() {
+    async fn ticket_event_hook_ensures_peer_and_delivers_weak_companion_notification() {
         let root = tempdir().expect("tempdir");
         let runtime_base = root.path().join("runtime");
         let store_dir = root.path().join("store");
@@ -339,9 +380,7 @@ mod tests {
                 active: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
-                peers: vec![pod_store::PodPeer {
-                    pod_name: "companion".into(),
-                }],
+                peers: Vec::new(),
                 resolved_manifest_snapshot: None,
             })
             .unwrap();
@@ -351,9 +390,7 @@ mod tests {
                 active: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
-                peers: vec![pod_store::PodPeer {
-                    pod_name: "orchestrator".into(),
-                }],
+                peers: Vec::new(),
                 resolved_manifest_snapshot: None,
             })
             .unwrap();
@@ -363,6 +400,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
+        let store_for_assert = store.clone();
         let hook = TicketEventCompanionNotifyHook::new(
             backend,
             PodDiscovery::new(
@@ -448,6 +486,15 @@ mod tests {
         let message = rx.recv().await.unwrap();
         assert!(message.contains("event: state/queued->inprogress"));
         assert!(message.contains("title: Companion event hook"));
+        let orchestrator = store_for_assert
+            .read_by_name("orchestrator")
+            .unwrap()
+            .unwrap();
+        assert_eq!(orchestrator.peers.len(), 1);
+        assert_eq!(orchestrator.peers[0].pod_name, "companion");
+        let companion_metadata = store_for_assert.read_by_name("companion").unwrap().unwrap();
+        assert_eq!(companion_metadata.peers.len(), 1);
+        assert_eq!(companion_metadata.peers[0].pod_name, "orchestrator");
         companion.await.unwrap();
     }
 }

@@ -10,6 +10,7 @@ use session_store::Store;
 use ticket::LocalTicketBackend;
 use ticket::config::TicketConfig;
 use tokio::sync::{broadcast, mpsc, oneshot};
+use tracing::{debug, warn};
 
 use crate::discovery::{PodDiscovery, list_pods_tool, restore_pod_tool, send_to_peer_pod_tool};
 use crate::feature::FeatureRegistryBuilder;
@@ -546,6 +547,30 @@ fn install_ticket_event_companion_notify_hook<C, St>(
         pod.cwd().to_path_buf(),
         spawned_registry,
     );
+    match discovery.ensure_existing_peer(&companion_pod_name) {
+        Ok(Some(_)) => {
+            debug!(
+                companion = %companion_pod_name,
+                orchestrator = %pod.manifest().pod.name,
+                "ensured Companion peer relationship for Orchestrator Ticket event notifications"
+            );
+        }
+        Ok(None) => {
+            debug!(
+                companion = %companion_pod_name,
+                orchestrator = %pod.manifest().pod.name,
+                "Companion metadata is missing; Ticket event notifications will skip until Companion exists"
+            );
+        }
+        Err(error) => {
+            warn!(
+                companion = %companion_pod_name,
+                orchestrator = %pod.manifest().pod.name,
+                error = %error,
+                "failed to ensure Companion peer relationship for Orchestrator Ticket event notifications"
+            );
+        }
+    }
     pod.add_post_tool_call_hook(TicketEventCompanionNotifyHook::new(
         LocalTicketBackend::new(backend_root),
         discovery,

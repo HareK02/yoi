@@ -7,6 +7,7 @@
 //! state that exists but is outside that visibility set.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -177,6 +178,16 @@ where
         &self,
         peer_name: &str,
     ) -> Result<PeerRegistrationResult, PodDiscoveryError> {
+        self.ensure_existing_peer(peer_name)?
+            .ok_or_else(|| PodDiscoveryError::MissingPod {
+                pod_name: peer_name.to_string(),
+            })
+    }
+
+    pub fn ensure_existing_peer(
+        &self,
+        peer_name: &str,
+    ) -> Result<Option<PeerRegistrationResult>, PodDiscoveryError> {
         validate_pod_name(peer_name)?;
         if peer_name == self.self_pod_name {
             return Err(PodDiscoveryError::SelfPeer {
@@ -191,9 +202,7 @@ where
             })?;
         let prior_self_peers = self_metadata.peers.clone();
         if self.store.read_by_name(peer_name)?.is_none() {
-            return Err(PodDiscoveryError::MissingPod {
-                pod_name: peer_name.to_string(),
-            });
+            return Ok(None);
         }
 
         self.store.add_peer(&self.self_pod_name, peer_name)?;
@@ -202,10 +211,10 @@ where
             return Err(PodDiscoveryError::PodStore(error));
         }
 
-        Ok(PeerRegistrationResult {
+        Ok(Some(PeerRegistrationResult {
             source: self.self_pod_name.clone(),
             peer: peer_name.to_string(),
-        })
+        }))
     }
 
     async fn visibility(&self) -> Result<VisibilitySet, PodDiscoveryError> {
@@ -354,16 +363,41 @@ where
         }
     }
 
-    pub async fn send_weak_notify_to_live_peer(&self, peer_name: &str, message: String) -> bool {
-        let Ok(detail) = self.inspect(peer_name).await else {
-            return false;
+    pub async fn send_weak_notify_to_live_peer(
+        &self,
+        peer_name: &str,
+        message: String,
+    ) -> WeakNotifyDelivery {
+        let detail = match self.inspect(peer_name).await {
+            Ok(detail) => detail,
+            Err(PodDiscoveryError::StateMissing { .. } | PodDiscoveryError::MissingPod { .. }) => {
+                return WeakNotifyDelivery::SkippedMissing;
+            }
+            Err(PodDiscoveryError::NotVisible { .. }) => {
+                return WeakNotifyDelivery::SkippedNotVisible;
+            }
+            Err(error) => {
+                return WeakNotifyDelivery::SendFailed {
+                    error: error.to_string(),
+                };
+            }
         };
-        if detail.visibility != VisibilityReason::Peer || !detail.live.reachable {
-            return false;
+        if detail.visibility != VisibilityReason::Peer {
+            return WeakNotifyDelivery::SkippedNotPeer {
+                visibility: detail.visibility,
+            };
         }
-        send_notify(&detail.live.socket_path, message, false)
-            .await
-            .is_ok()
+        if !detail.live.reachable {
+            return WeakNotifyDelivery::SkippedNotLive {
+                reason: detail.live.error,
+            };
+        }
+        match send_notify(&detail.live.socket_path, message, false).await {
+            Ok(()) => WeakNotifyDelivery::Delivered,
+            Err(error) => WeakNotifyDelivery::SendFailed {
+                error: error.to_string(),
+            },
+        }
     }
 
     async fn live_for_name(&self, pod_name: &str, socket_override: Option<&Path>) -> LiveInfo {
@@ -583,6 +617,50 @@ pub enum RestoreResult {
 pub struct PeerRegistrationResult {
     pub source: String,
     pub peer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WeakNotifyDelivery {
+    Delivered,
+    SkippedMissing,
+    SkippedNotVisible,
+    SkippedNotPeer { visibility: VisibilityReason },
+    SkippedNotLive { reason: Option<String> },
+    SendFailed { error: String },
+}
+
+impl WeakNotifyDelivery {
+    pub fn delivered(&self) -> bool {
+        matches!(self, WeakNotifyDelivery::Delivered)
+    }
+}
+
+impl fmt::Display for WeakNotifyDelivery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WeakNotifyDelivery::Delivered => write!(f, "delivered"),
+            WeakNotifyDelivery::SkippedMissing => {
+                write!(f, "skipped: target pod metadata is missing")
+            }
+            WeakNotifyDelivery::SkippedNotVisible => {
+                write!(f, "skipped: target pod is not visible")
+            }
+            WeakNotifyDelivery::SkippedNotPeer { visibility } => {
+                write!(
+                    f,
+                    "skipped: target pod is visible as {visibility:?}, not peer"
+                )
+            }
+            WeakNotifyDelivery::SkippedNotLive { reason } => {
+                if let Some(reason) = reason {
+                    write!(f, "skipped: target peer is not live/reachable ({reason})")
+                } else {
+                    write!(f, "skipped: target peer is not live/reachable")
+                }
+            }
+            WeakNotifyDelivery::SendFailed { error } => write!(f, "send failed: {error}"),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1524,18 +1602,20 @@ mod tests {
             }
         });
 
-        assert!(
+        assert_eq!(
             discovery
                 .send_weak_notify_to_live_peer("target", "weak event".into())
-                .await
+                .await,
+            WeakNotifyDelivery::Delivered
         );
         assert_eq!(rx.recv().await.unwrap(), "weak event");
         target.await.unwrap();
 
-        assert!(
-            !discovery
+        assert_eq!(
+            discovery
                 .send_weak_notify_to_live_peer("missing", "no-op".into())
-                .await
+                .await,
+            WeakNotifyDelivery::SkippedMissing
         );
     }
 
@@ -1567,10 +1647,13 @@ mod tests {
             SpawnedPodRegistry::new(runtime_dir),
         );
 
-        assert!(
-            !discovery
+        assert_eq!(
+            discovery
                 .send_weak_notify_to_live_peer("target", "must not send".into())
-                .await
+                .await,
+            WeakNotifyDelivery::SkippedNotPeer {
+                visibility: VisibilityReason::SpawnedChild
+            }
         );
     }
 

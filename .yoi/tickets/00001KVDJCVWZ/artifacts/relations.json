@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KVDJCVWZ",
+      "kind": "related",
+      "target": "00001KTTW04W2",
+      "note": "Fixes live delivery gap for auto_run:false Orchestrator Ticket event Companion notifications.",
+      "author": "yoi ticket",
+      "at": "2026-06-18T14:33:50Z"
+    }
+  ]
+}
