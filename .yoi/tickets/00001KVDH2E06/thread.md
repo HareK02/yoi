@@ -282,3 +282,26 @@ Validation note:
 - `cargo test -p tui` の既知 3 failures について、この branch が原因/悪化とは見ていない。ただし上記 persistence blocker は独立して修正が必要。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-18T15:25:21Z -->
+
+## Plan
+
+Review follow-up dispatch:
+
+Reviewer `yoi-reviewer-00001KVDH2E06` は `request_changes` を返したため、Ticket review として記録し、既存 Coder Pod `yoi-coder-00001KVDH2E06` に修正依頼を送った。
+
+Coder に依頼した blocker:
+- `workspace_root` は runtime metadata 構築時に計算されるが、normal metadata write-through path で `PodMetadataStore::set_active` / `update_by_name` に渡されず、永続化されていない。
+- その結果、新規 current-workspace Pod metadata が `workspace_root: None` になり、fail-closed filter により current-workspace Companion / Orchestrator / Ticket role Pod まで normal Panel rows/action targets から隠れる可能性がある。
+
+Required fixes:
+- `metadata.workspace_root` を write-through path で永続化する。
+- active/snapshot/workspace ownership を同時に更新する API 追加または既存 API 拡張で、unrelated fields は保持する。
+- normal Pod metadata write-through/store boundary を通して、stored metadata に runtime workspace root が残る targeted test を追加する。
+
+Next:
+- Coder の修正 commit / validation report を待つ。
+- 修正後、同じ persistence boundary と filtering semantics を中心に再レビューする。
+
+---
