@@ -1,17 +1,62 @@
 use std::time::{Duration, Instant};
 
 const FIRST_VISIBLE_RENDER_BUDGET: Duration = Duration::from_millis(1500);
-const FULL_READY_BUDGET: Duration = Duration::from_secs(5);
+const ROWS_READY_BUDGET: Duration = Duration::from_secs(5);
 
 use yoi_e2e::{
-    FixtureCleanupReport, FixtureWorkspace, KeyPress, PanelHarness, RenderedPanelRow, yoi_binary,
+    ExpectedPanelTicketRow, FixtureCleanupReport, FixtureWorkspace, KeyPress, PanelHarness,
+    PanelRect, PanelRowKey, RenderedPanelRow, RowsRendered, yoi_binary,
 };
+
+#[test]
+fn panel_fixture_ticket_row_matcher_rejects_absent_fixture_data() {
+    let expected = ExpectedPanelTicketRow::new("0000000000000", "Ready E2E Ticket", "ready");
+    let wrong_title = RenderedPanelRow {
+        key: PanelRowKey {
+            kind: "ticket".to_string(),
+            id: "0000000000000".to_string(),
+        },
+        title: "Different Ticket".to_string(),
+        status: Some("ready".to_string()),
+        action: None,
+        rect: PanelRect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 1,
+        },
+    };
+    let wrong_kind = RenderedPanelRow {
+        key: PanelRowKey {
+            kind: "pod".to_string(),
+            id: "0000000000000".to_string(),
+        },
+        title: "Ready E2E Ticket".to_string(),
+        status: Some("ready".to_string()),
+        action: None,
+        rect: PanelRect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 1,
+        },
+    };
+
+    assert!(!expected.matches(&wrong_title));
+    assert!(!expected.matches(&wrong_kind));
+    let rows = RowsRendered {
+        selected: None,
+        rows: vec![wrong_title, wrong_kind],
+    };
+    assert!(!rows.has_fixture_ticket_row(&expected));
+}
 
 #[test]
 fn panel_first_visible_render_arrives_before_background_reload() -> yoi_e2e::Result<()> {
     let binary = yoi_binary()?;
     let fixture = FixtureWorkspace::new(&binary)?;
     assert_fixture_paths_are_isolated(&fixture);
+    let ready_ticket = fixture.ready_fixture_ticket_row();
 
     let started = Instant::now();
     let mut panel =
@@ -19,17 +64,15 @@ fn panel_first_visible_render_arrives_before_background_reload() -> yoi_e2e::Res
     let remaining = FIRST_VISIBLE_RENDER_BUDGET
         .checked_sub(started.elapsed())
         .unwrap_or_else(|| Duration::from_millis(0));
-    panel.wait_for("first visible panel render", remaining, |event| {
-        event.event == "panel_ready"
-    })?;
+    panel.wait_for_first_visible_frame(remaining)?;
     let first_visible_elapsed = started.elapsed();
     eprintln!(
-        "panel first visible render: {first_visible_elapsed:?} (budget {FIRST_VISIBLE_RENDER_BUDGET:?}); artifacts at {}",
+        "panel first visible frame: {first_visible_elapsed:?} (budget {FIRST_VISIBLE_RENDER_BUDGET:?}); artifacts at {}",
         panel.artifacts().dir.display()
     );
     assert!(
         first_visible_elapsed <= FIRST_VISIBLE_RENDER_BUDGET,
-        "first visible render took {first_visible_elapsed:?}, budget {FIRST_VISIBLE_RENDER_BUDGET:?}; artifacts at {}",
+        "first visible frame took {first_visible_elapsed:?}, budget {FIRST_VISIBLE_RENDER_BUDGET:?}; artifacts at {}",
         panel.artifacts().dir.display()
     );
 
@@ -42,7 +85,7 @@ fn panel_first_visible_render_arrives_before_background_reload() -> yoi_e2e::Res
         events[..ready_index]
             .iter()
             .all(|event| event.event != "background_task_started"),
-        "initial render must be emitted before reload/background work starts; artifacts at {}",
+        "initial frame must be emitted before reload/background work starts; artifacts at {}",
         panel.artifacts().dir.display()
     );
 
@@ -54,12 +97,13 @@ fn panel_first_visible_render_arrives_before_background_reload() -> yoi_e2e::Res
             event.event == "background_task_started"
                 && event.data.get("task").and_then(serde_json::Value::as_str) == Some("reload")
         })
-        .expect("held reload should start after first visible render");
+        .expect("held reload should start after first visible frame");
     assert!(
         ready_index < reload_started_index,
-        "first visible render and reload ordering should remain separate; artifacts at {}",
+        "first visible frame and reload ordering should remain separate; artifacts at {}",
         panel.artifacts().dir.display()
     );
+    panel.assert_fixture_ticket_row_not_rendered(&ready_ticket, Duration::from_millis(150))?;
 
     panel.press(KeyPress::CtrlC)?;
     let status = panel.expect_exit_within(PanelHarness::default_exit_wait())?;
@@ -70,51 +114,46 @@ fn panel_first_visible_render_arrives_before_background_reload() -> yoi_e2e::Res
 }
 
 #[test]
-fn panel_full_ready_has_separate_startup_budget() -> yoi_e2e::Result<()> {
+fn panel_fixture_ticket_row_ready_has_startup_budget() -> yoi_e2e::Result<()> {
     let binary = yoi_binary()?;
     let fixture = FixtureWorkspace::new(&binary)?;
     assert_fixture_paths_are_isolated(&fixture);
+    let ready_ticket = fixture.ready_fixture_ticket_row();
 
     let started = Instant::now();
     let mut panel = PanelHarness::spawn(fixture.panel_config(binary))?;
     let first_visible_remaining = FIRST_VISIBLE_RENDER_BUDGET
         .checked_sub(started.elapsed())
         .unwrap_or_else(|| Duration::from_millis(0));
-    panel.wait_for(
-        "first visible panel render",
-        first_visible_remaining,
-        |event| event.event == "panel_ready",
-    )?;
+    panel.wait_for_first_visible_frame(first_visible_remaining)?;
     let first_visible_elapsed = started.elapsed();
     eprintln!(
-        "panel first visible render: {first_visible_elapsed:?} (budget {FIRST_VISIBLE_RENDER_BUDGET:?}); artifacts at {}",
+        "panel first visible frame: {first_visible_elapsed:?} (budget {FIRST_VISIBLE_RENDER_BUDGET:?}); artifacts at {}",
         panel.artifacts().dir.display()
     );
     assert!(
         first_visible_elapsed <= FIRST_VISIBLE_RENDER_BUDGET,
-        "first visible render took {first_visible_elapsed:?}, budget {FIRST_VISIBLE_RENDER_BUDGET:?}; artifacts at {}",
+        "first visible frame took {first_visible_elapsed:?}, budget {FIRST_VISIBLE_RENDER_BUDGET:?}; artifacts at {}",
         panel.artifacts().dir.display()
     );
 
-    let full_ready_remaining = FULL_READY_BUDGET
+    let rows_ready_remaining = ROWS_READY_BUDGET
         .checked_sub(started.elapsed())
         .unwrap_or_else(|| Duration::from_millis(0));
-    panel.wait_for("full ready fixture rows", full_ready_remaining, |event| {
-        event.event == "rows_rendered"
-            && event
-                .data
-                .get("rows")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|rows| rows.len() >= 2)
-    })?;
-    let full_ready_elapsed = started.elapsed();
+    let rows = panel.wait_for_fixture_ticket_rows_ready(&ready_ticket, rows_ready_remaining)?;
+    assert!(
+        rows.has_fixture_ticket_row(&ready_ticket),
+        "rows-ready event must contain concrete ready fixture Ticket row; artifacts at {}",
+        panel.artifacts().dir.display()
+    );
+    let rows_ready_elapsed = started.elapsed();
     eprintln!(
-        "panel full ready: {full_ready_elapsed:?} (budget {FULL_READY_BUDGET:?}); artifacts at {}",
+        "panel fixture rows ready: {rows_ready_elapsed:?} (budget {ROWS_READY_BUDGET:?}); artifacts at {}",
         panel.artifacts().dir.display()
     );
     assert!(
-        full_ready_elapsed <= FULL_READY_BUDGET,
-        "full ready took {full_ready_elapsed:?}, budget {FULL_READY_BUDGET:?}; artifacts at {}",
+        rows_ready_elapsed <= ROWS_READY_BUDGET,
+        "fixture rows ready took {rows_ready_elapsed:?}, budget {ROWS_READY_BUDGET:?}; artifacts at {}",
         panel.artifacts().dir.display()
     );
 
