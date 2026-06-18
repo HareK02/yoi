@@ -93,3 +93,32 @@ Critical risks / reviewer focus:
 Routing decision と accepted implementation plan を記録済み。dependency `00001KV5W3PHW` は done/closed で relation blocker は解消済み。Orchestrator workspace は clean。implementation side effects の前に `queued -> inprogress` acceptance を記録する。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-18T13:12:47Z -->
+
+## Implementation report
+
+Implementation start failure / recovery note:
+
+`queued -> inprogress` acceptance と worktree 作成は完了したが、Coder Pod spawn に失敗した。
+
+Created worktree:
+- `/home/hare/Projects/yoi/.worktree/00001KV5W3PJ3-plugin-permission-grants`
+- branch: `impl/00001KV5W3PJ3-plugin-permission-grants`
+
+Failure:
+- `SpawnPod` failed before child Pod creation.
+- Error: `failed to spawn /home/hare/Projects/yoi/target/debug/yoi (deleted) pod: No such file or directory (os error 2)`
+
+Interpretation:
+- Runtime binary path for this long-lived Orchestrator process again points at a deleted executable. This is an operational/runtime issue, not a Ticket requirement issue.
+- No Coder Pod was started and no implementation commit exists in the child worktree yet.
+
+Recovery needed:
+- Refresh/restart the Orchestrator runtime or provide a valid Pod runtime command so `SpawnPod` can launch children again.
+- After recovery, reuse the existing clean child worktree/branch and resume Coder spawn for this in-progress Ticket.
+
+State handling:
+- Ticket remains `inprogress` because acceptance and worktree side effects already happened; it is not silently returned to `queued`.
+
+---
