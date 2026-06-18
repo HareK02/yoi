@@ -142,3 +142,56 @@ Current status:
 - root/original workspace は触らず、implementation worktree 上で作業するよう指示済み。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-18T14:15:12Z -->
+
+## Implementation report
+
+Coder implementation report received:
+
+Commit:
+- `b1ba1599` — `plugin: enforce permission grants`
+
+Summary:
+- typed plugin permission declarations/grants を追加。
+  - `surfaces.tool`
+  - specific tool names
+  - tool namespaces
+  - `external_write`
+  - future `host_api.https` / `host_api.fs`
+- grant binding を source-qualified package id / deterministic digest / exact package version に結合。
+- registration gating を `PluginToolFeature::install` に実装。
+  - ungranted / unrequested plugin tools は登録されない。
+  - partial grant では authorized tools のみ登録し、skipped tools は bounded diagnostics。
+- runtime execution gating を `run_plugin_wasm_tool` に実装。
+  - WASM 読み込み/実行前に binding と requested/granted tool authority を再確認。
+- future host API boundary として `validate_wasm_imports` が `yoi:https` / `yoi:fs` imports を認識し、non-implemented boundary error の前に permission check。
+- actual `https` / `fs` host API は実装していない。
+- `external_write` を plugin tool manifest metadata に追加し、requested+granted の場合のみ許可。
+- Existing PreToolCall/tool permission path は変更せず、plugin grant checks を追加の fail-closed gate とした。
+
+Files changed:
+- `crates/manifest/src/plugin.rs`
+- `crates/pod/src/feature/plugin.rs`
+- `crates/pod/src/pod.rs`
+
+Validation reported by Coder:
+- `cargo fmt --check`
+- `cargo check -p manifest -p pod`
+- `cargo test -p pod plugin -- --nocapture` — 27 passed
+- `cargo test -p manifest plugin -- --nocapture` — 17 passed
+- `git diff --check`
+
+Orchestrator evidence checked:
+- Pod output を確認。
+- implementation worktree は clean。
+- commit `b1ba1599` が branch `impl/00001KV5W3PJ3-plugin-permission-grants` の HEAD。
+- diff stat: `crates/manifest/src/plugin.rs`, `crates/pod/src/feature/plugin.rs`, `crates/pod/src/pod.rs` に 575 insertions / 19 deletions。
+
+Routing classification: review_needed
+
+Next action:
+- recorded intent / invariants / acceptance criteria に照らして、read-only Reviewer Pod で外部レビューする。
+- 特に fail-closed grant enforcement、source/digest/version binding、no ambient authority、external_write/effect metadata、bounded diagnostics、existing PreToolCall path との整合性を確認する。
+
+---

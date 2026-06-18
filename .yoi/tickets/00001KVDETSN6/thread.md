@@ -128,3 +128,53 @@ Next:
 - Coder は dashboard content ready metric / live-like fixture / slow-source breakdown / focused validation を実装し、commit と実装報告を返す予定。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-18T14:15:27Z -->
+
+## Implementation report
+
+Coder implementation report received:
+
+Commit:
+- `fc1ee5bb` — `tui: measure panel dashboard readiness`
+
+Summary:
+- Panel startup E2E に dashboard-content-ready metric を追加。
+- fixture に複数 Ticket、Pod metadata、Companion claim、orchestration overlay を追加。
+- Expected dashboard content snapshot / assertions を導入し、loading/partial/single-row では ready 判定しないようにした。
+- stdout JSON に `dashboard_content_ready`, `startup_readiness_checks`, `startup_sources` を追加。
+- source breakdown と render-source summary を追加。
+- startup regression test を first frame / single-row ではなく dashboard content ready basis に更新。
+- semantic shortcut ではなく expected dashboard row set と overlay/action/status を検証する readiness path として実装。
+
+Files changed:
+- `crates/tui/tests/e2e/panel.rs`
+
+Validation reported by Coder:
+- `cargo fmt --check`
+- `cargo test -p tui --test panel --features e2e -- --nocapture panel_startup_latency_e2e_reports_content_ready_after_rows`
+- `cargo test -p tui --test panel --features e2e -- --nocapture panel_startup_latency_e2e_fails_if_expected_dashboard_content_is_missing`
+- `cargo test -p tui --test panel --features e2e -- --nocapture panel_startup_latency_e2e_fails_if_orchestration_overlay_is_missing`
+- `cargo check -p tui`
+- `git diff --check`
+
+Measured evidence reported by Coder:
+- passing content-ready run:
+  - `panel_ready_ms`: 39
+  - `row_ready_ms`: 140
+  - `dashboard_content_ready_ms`: 140
+- negative fixtures fail as expected for missing expected dashboard content / missing orchestration overlay。
+
+Orchestrator evidence checked:
+- Pod output を確認。
+- implementation worktree は clean。
+- commit `fc1ee5bb` が branch `impl/00001KVDETSN6-panel-dashboard-content-ready` の HEAD。
+- diff stat: `crates/tui/tests/e2e/panel.rs` に 385 insertions / 34 deletions。
+
+Routing classification: review_needed
+
+Next action:
+- recorded intent / invariants / acceptance criteria に照らして、read-only Reviewer Pod で外部レビューする。
+- 特に dashboard content ready が名前だけの metric ではないこと、fixture が live-like な representative dashboard content を検証していること、single-row readiness だけでは通らないこと、negative fixtures が有効であること、Panel semantics を accidental に変更していないことを確認する。
+
+---
