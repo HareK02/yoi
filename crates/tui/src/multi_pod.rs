@@ -3398,12 +3398,13 @@ async fn load_pod_list(
     let live = read_reachable_live_pod_infos(&store)
         .await
         .unwrap_or_default();
-    Ok(PodList::from_sources(
+    Ok(PodList::from_workspace_sources(
         PodVisibilitySource::ResumePicker,
         stored,
         live,
         selected_name,
         max_entries,
+        &current_workspace_root(),
     ))
 }
 
@@ -9390,6 +9391,7 @@ branch = "orchestration/custom-panel"
             active_session_id: None,
             active_segment_id: None,
             updated_at,
+            workspace_root: None,
             preview: None,
         }
     }

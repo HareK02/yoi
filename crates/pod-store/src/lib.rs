@@ -100,6 +100,8 @@ pub struct PodMetadata {
     pub pod_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<PodActiveSegmentRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spawned_children: Vec<PodSpawnedChild>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -116,11 +118,17 @@ impl PodMetadata {
         Self {
             pod_name: pod_name.into(),
             active,
+            workspace_root: None,
             spawned_children: Vec::new(),
             reclaimed_children: Vec::new(),
             peers: Vec::new(),
             resolved_manifest_snapshot: None,
         }
+    }
+
+    pub fn with_workspace_root(mut self, workspace_root: PathBuf) -> Self {
+        self.workspace_root = Some(workspace_root);
+        self
     }
 }
 

@@ -378,6 +378,7 @@ mod tests {
             .write(&PodMetadata {
                 pod_name: "orchestrator".into(),
                 active: None,
+                workspace_root: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: Vec::new(),
@@ -388,6 +389,7 @@ mod tests {
             .write(&PodMetadata {
                 pod_name: "companion".into(),
                 active: None,
+                workspace_root: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: Vec::new(),

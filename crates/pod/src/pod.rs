@@ -924,7 +924,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     }
 
     fn pod_metadata(&self, active: Option<PodActiveSegmentRef>) -> PodMetadata {
-        pod_metadata_for_manifest(&self.manifest, active)
+        pod_metadata_for_manifest(&self.manifest, &self.workspace_root, active)
     }
 
     fn write_pod_metadata_pending(&self) -> Result<(), PodError> {
@@ -4319,9 +4319,11 @@ fn request_config_from_worker_manifest(wm: &WorkerManifest) -> RequestConfig {
 
 fn pod_metadata_for_manifest(
     manifest: &PodManifest,
+    workspace_root: &Path,
     active: Option<PodActiveSegmentRef>,
 ) -> PodMetadata {
-    let mut metadata = PodMetadata::new(manifest.pod.name.clone(), active);
+    let mut metadata = PodMetadata::new(manifest.pod.name.clone(), active)
+        .with_workspace_root(workspace_root.to_path_buf());
     if should_persist_resolved_manifest_snapshot(manifest) {
         metadata.resolved_manifest_snapshot = serde_json::to_value(manifest).ok();
     }
@@ -5328,7 +5330,7 @@ permission = "read"
         .unwrap();
         assert!(manifest.profile.is_none());
         assert!(
-            pod_metadata_for_manifest(&manifest, None)
+            pod_metadata_for_manifest(&manifest, Path::new("/snapshot/workspace"), None)
                 .resolved_manifest_snapshot
                 .is_none()
         );
@@ -5361,7 +5363,7 @@ permission = "read"
             config: None,
         }];
 
-        let metadata = pod_metadata_for_manifest(&manifest, None);
+        let metadata = pod_metadata_for_manifest(&manifest, Path::new("/snapshot/workspace"), None);
         let snapshot = metadata
             .resolved_manifest_snapshot
             .expect("plugin-resolved manifest should be snapshotted");

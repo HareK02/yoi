@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -65,6 +65,56 @@ impl PodList {
         }
     }
 
+    pub(crate) fn from_workspace_sources(
+        source: PodVisibilitySource,
+        stored: Vec<StoredPodInfo>,
+        live: Vec<LivePodInfo>,
+        selected_name: Option<String>,
+        max_entries: usize,
+        workspace_root: &Path,
+    ) -> Self {
+        let current_workspace = workspace_root_key(workspace_root);
+        let mut current_names = BTreeSet::new();
+        let stored: Vec<_> = stored
+            .into_iter()
+            .filter(|info| {
+                let matches = info
+                    .workspace_root
+                    .as_deref()
+                    .is_some_and(|root| workspace_root_key(root) == current_workspace);
+                if matches {
+                    current_names.insert(info.pod_name.clone());
+                }
+                matches
+            })
+            .collect();
+        let live = live
+            .into_iter()
+            .filter(|info| current_names.contains(&info.pod_name))
+            .collect();
+        Self::from_sources(source, stored, live, selected_name, max_entries)
+    }
+
+    pub(crate) fn filter_for_workspace(&self, workspace_root: &Path) -> Self {
+        let current_workspace = workspace_root_key(workspace_root);
+        let entries: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|entry| entry_belongs_to_workspace(entry, &current_workspace))
+            .cloned()
+            .collect();
+        let selected_name = self
+            .selected_name
+            .as_ref()
+            .filter(|name| entries.iter().any(|entry| entry.name == **name))
+            .cloned()
+            .or_else(|| entries.first().map(|entry| entry.name.clone()));
+        Self {
+            entries,
+            selected_name,
+        }
+    }
+
     pub(crate) fn selected_index(&self) -> usize {
         self.selected_name
             .as_ref()
@@ -80,6 +130,18 @@ impl PodList {
         let index = self.selected_index();
         self.entries.get(index)
     }
+}
+
+fn workspace_root_key(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn entry_belongs_to_workspace(entry: &PodListEntry, current_workspace: &Path) -> bool {
+    entry
+        .stored
+        .as_ref()
+        .and_then(|stored| stored.workspace_root.as_deref())
+        .is_some_and(|root| workspace_root_key(root) == current_workspace)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +272,7 @@ pub(crate) struct StoredPodInfo {
     pub active_session_id: Option<SessionId>,
     pub active_segment_id: Option<SegmentId>,
     pub updated_at: u64,
+    pub workspace_root: Option<PathBuf>,
     pub preview: Option<String>,
 }
 
@@ -348,6 +411,7 @@ fn stored_info_from_metadata(
         active_session_id,
         active_segment_id,
         updated_at: summary.updated_at,
+        workspace_root: metadata.workspace_root,
         preview: summary.preview,
     }
 }
@@ -359,6 +423,7 @@ fn corrupt_stored_info(pod_name: String, message: String) -> StoredPodInfo {
         active_session_id: None,
         active_segment_id: None,
         updated_at: 0,
+        workspace_root: None,
         preview: Some(format!("metadata: {}", trim_one_line(&message, 48))),
     }
 }
@@ -1061,6 +1126,7 @@ mod tests {
             active_session_id: Some(session_id),
             active_segment_id: None,
             updated_at: 0,
+            workspace_root: None,
             preview: Some("[pending segment]".to_string()),
         }
     }
@@ -1072,6 +1138,7 @@ mod tests {
             active_session_id: None,
             active_segment_id: None,
             updated_at,
+            workspace_root: None,
             preview: None,
         }
     }
@@ -1169,5 +1236,73 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    fn stopped_info_for_workspace(pod_name: &str, workspace_root: &Path) -> StoredPodInfo {
+        let mut info = stopped_info_with_updated_at(pod_name, 10);
+        info.workspace_root = Some(workspace_root.to_path_buf());
+        info
+    }
+
+    #[test]
+    fn workspace_sources_include_current_and_hide_external_or_unknown_pods() {
+        let current = tempdir().unwrap();
+        let external = tempdir().unwrap();
+
+        let list = PodList::from_workspace_sources(
+            SOURCE,
+            vec![
+                stopped_info_for_workspace("current", current.path()),
+                stopped_info_for_workspace("current-orchestrator", current.path()),
+                stopped_info_for_workspace("other-workspace", external.path()),
+                stopped_info_with_updated_at("legacy-unknown", 10),
+                corrupt_stored_info("corrupt".to_string(), "invalid metadata".to_string()),
+            ],
+            vec![
+                live_info("current", PodStatus::Idle),
+                live_info("current-orchestrator", PodStatus::Running),
+                live_info("other-workspace", PodStatus::Idle),
+                live_info("legacy-unknown", PodStatus::Idle),
+                live_info("live-only", PodStatus::Idle),
+            ],
+            None,
+            10,
+            current.path(),
+        );
+
+        let names = list
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["current", "current-orchestrator"]);
+        assert!(list.entries.iter().all(|entry| entry.actions.can_open));
+    }
+
+    #[test]
+    fn workspace_sources_use_workspace_metadata_not_cwd_or_live_presence() {
+        let current = tempdir().unwrap();
+        let worktree_cwd = current.path().join(".worktree/impl");
+
+        let list = PodList::from_workspace_sources(
+            SOURCE,
+            vec![stopped_info_for_workspace("ticket-role", current.path())],
+            vec![live_info("ticket-role", PodStatus::Idle)],
+            None,
+            10,
+            &worktree_cwd,
+        );
+        assert!(list.entries.is_empty());
+
+        let list = PodList::from_workspace_sources(
+            SOURCE,
+            vec![stopped_info_for_workspace("ticket-role", current.path())],
+            vec![live_info("ticket-role", PodStatus::Idle)],
+            None,
+            10,
+            current.path(),
+        );
+        assert_eq!(list.entries[0].name, "ticket-role");
+        assert!(list.entries[0].actions.can_open);
     }
 }
