@@ -204,3 +204,57 @@ Next:
 - Reviewer output を確認し、approve なら Ticket review に記録して merge-ready 判断へ進む。request_changes なら Coder に修正依頼する。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVDETSN6 at: 2026-06-18T14:20:21Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+対象:
+- Ticket: `00001KVDETSN6`
+- branch: `impl/00001KVDETSN6-panel-dashboard-content-ready`
+- commit: `fc1ee5bb` (`tui: measure panel dashboard readiness`)
+
+Blockers:
+
+1. Dashboard content readiness が required Companion / Orchestrator / orchestration overlay content を含んでいない。
+   - fixture は 2 件の Ticket と `workspace` / `workspace-orchestrator` の Pod metadata だけを作っている。
+   - expected dashboard content は ready Ticket、planning Ticket、Pod name `workspace` のみ。
+   - orchestration worktree/overlay fixture setup、expected overlay state、Companion/Orchestrator status assertion が `dashboard_content_ready` に含まれていない。
+   - Ticket acceptance criteria の Ticket / Pod / Companion / Orchestrator / overlay elements を代表する expected dashboard snapshot に不足がある。
+
+2. Wrong / missing action labels が readiness を通過できる。
+   - `ExpectedPanelTicketRow::matches` は row kind、id、title、status のみを確認している。
+   - `ExpectedDashboardContent` は `tickets` と `pod_names` のみ。
+   - main E2E は ready/planning/pod categories を確認するが、`actionable_rows > 0` や specific action labels を確認していない。
+   - acceptance では missing action label / wrong action が失敗することを求めている。
+
+3. Missing overlay / missing action / wrong state の committed negative fixtures がない。
+   - 既存 negative test は単一 ticket matcher の wrong title / wrong kind に限られる。
+   - missing row、wrong state、missing overlay、missing action label が dashboard readiness を失敗させることを示す test/fixture が必要。
+
+4. emitted `dashboard_content_ready` event が broad category gate のまま。
+   - runtime readiness predicate は `ticket_configured && ready_ticket_rows > 0 && planning_ticket_rows > 0 && pod_rows > 0` 程度。
+   - harness 側 expected filter により現在の test では first-frame/single-ticket passing を防いでいるが、event 名自体は overlay/action/header content を検証せず emit され得る。
+   - main/exported metric として誤用されやすく、Ticket の expected dashboard snapshot 定義より弱い。
+
+5. Slow-source breakdown が requested attribution には粗い。
+   - 追加 source は pod list、companion presence/lifecycle、ticket config、orchestrator presence/lifecycle、`workspace_panel.build` など。
+   - Ticket は Ticket scan/parsing、orchestration overlay validation/read、Pod metadata scan、socket/status probing、role claim scan、git worktree/branch checks の attribution を求めている。
+   - overlay/role/ticket parsing/git checks が `workspace_panel.build` に lump されており、live-latency source の診断には不足。
+
+Positive evidence:
+- main startup test は `dashboard_content_ready` を待つ形に変更され、`panel_ready` や単一 ready Ticket row だけではない。
+- current main E2E は expected fixture Tickets と expected Pod name を要求するため、first frame / single Ticket row だけでは通らない。
+- diff は E2E instrumentation / harness/tests に閉じており、queue/close/review workflow semantic changes は見当たらない。
+- Reviewer は `git diff --check fc1ee5bb^..fc1ee5bb` を実行し、成功を確認した。
+
+Requested changes:
+- expected dashboard content に action labels / disabled reasons を追加する。
+- Companion / Orchestrator status と orchestration overlay state の fixture support と assertions を追加する。
+- missing row、wrong state、missing overlay、missing action label の negative tests/fixtures を追加する。
+- `dashboard_content_ready` event 自体が complete snapshot semantics を carry/validate する、または exported/main metric が broad category gate と誤解されない形にする。
+- source breakdown を、少なくとも ticket scan/parsing、overlay validation/read/git checks、pod metadata/status probing、local claim scan が見える程度に分割する。省略する場合は明確な non-action rationale を記録する。
+
+---

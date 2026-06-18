@@ -2,7 +2,7 @@
 title: 'Panel startup latency をユーザー目線の dashboard content ready 基準で計測・改善する'
 state: 'inprogress'
 created_at: '2026-06-18T13:30:51Z'
-updated_at: '2026-06-18T14:16:26Z'
+updated_at: '2026-06-18T14:20:21Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['panel', 'e2e', 'startup-latency', 'user-visible-readiness', 'dashboard-content', 'profiling']
