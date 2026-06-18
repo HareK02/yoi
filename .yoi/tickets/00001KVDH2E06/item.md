@@ -2,7 +2,7 @@
 title: 'Panel 表示を現在 workspace の Pod に限定する'
 state: 'inprogress'
 created_at: '2026-06-18T14:09:59Z'
-updated_at: '2026-06-18T15:29:46Z'
+updated_at: '2026-06-18T15:37:52Z'
 assignee: null
 readiness: 'ready'
 risk_flags: ['panel', 'pod-metadata', 'workspace-boundary', 'runtime-observation']

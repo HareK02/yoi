@@ -377,3 +377,56 @@ Next:
 - Reviewer output を確認し、approve なら Orchestrator worktree への merge/validation/cleanup/close-ready 処理へ進む。request_changes なら blocker を記録して Coder に戻す。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVDH2E06-r2 at: 2026-06-18T15:37:52Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+対象:
+- Ticket: `00001KVDH2E06`
+- branch: `impl/00001KVDH2E06-panel-current-workspace-pods`
+- commits:
+  - `3b634d66` — `tui: filter panel pods by workspace`
+  - `160c96ad` — `pod: persist metadata workspace root`
+
+No blockers found.
+
+Evidence reviewed:
+- Previous blocker is fixed in the normal write-through path.
+  - `crates/pod/src/pod.rs:68-82` の `pod_metadata_writer_for_store(...)` が `store.set_active_with_workspace_root(...)` を呼び、`metadata.workspace_root` を渡している。
+  - `pod_metadata_for_manifest(...)` は引き続き `.with_workspace_root(workspace_root.to_path_buf())` で runtime metadata を構築しており、computed runtime workspace root が writer から `PodMetadataStore` へ流れる。
+- `set_active_with_workspace_root` は unrelated metadata を保持している。
+  - `crates/pod-store/src/lib.rs:178-192` は `active`、`resolved_manifest_snapshot`、および `workspace_root` が `Some` の場合のみ `workspace_root` を更新する。
+  - `update_by_name` を使うため、`spawned_children`、`reclaimed_children`、`peers` などは保持される。
+- compatibility `set_active` は existing workspace ownership を保持している。
+  - `crates/pod-store/src/lib.rs:168-176` は `workspace_root: None` で delegate する。
+  - delegated implementation は `if let Some(...)` の中でだけ `metadata.workspace_root` を書くため、legacy callers は既存 workspace ownership を clear しない。
+- 新 test は constructor ではなく persistence boundary を検証している。
+  - `metadata_writer_persists_workspace_root_through_store_update` は real `FsPodStore` を作り、production `pod_metadata_writer_for_store` を取得し、writer を実行した後、stored metadata を読み戻して `workspace_root` が残ることを assert している。
+- Final branch still satisfies Ticket behavior。
+  - `PodList::from_workspace_sources` は persisted `workspace_root` で stored Pods を filter し、live probes は stored current-workspace names に限定するため、live-only / legacy / unknown Pods は fail-closed。
+  - `WorkspacePanelViewModel` construction も `pods.filter_for_workspace(workspace_root)` を通すため、external workspace rows は normal Panel rows/action targets にならない。
+  - focused tests は current workspace visible、external/legacy/corrupt/live-only hidden、role-like current workspace Pods visible、normal open action only for visible rows を覆っている。
+
+Reviewer validation:
+- `git diff --check 3b634d66..160c96ad` — passed
+- `git diff --check e2e76d3b..HEAD` — passed
+- `cargo test -p pod metadata_writer_persists_workspace_root_through_store_update -- --nocapture` — passed
+- `cargo test -p pod-store active_updates_preserve_children_and_manifest_snapshot -- --nocapture` — passed
+- `cargo test -p tui pod_list -- --nocapture` — passed
+- `cargo test -p tui workspace_panel_filters_pod_rows_to_current_workspace_metadata -- --nocapture` — passed
+
+Known validation debt:
+- Full `cargo test -p tui -- --nocapture` still fails in three tests, but these appear pre-existing/unrelated to this branch:
+  - `multi_pod::tests::orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace`
+  - `spawn::tests::profile_choices_use_project_registry_default`
+  - `spawn::tests::profile_choices_include_builtin_and_project_default_marker`
+- The failing orchestrator assertion/code is already identical on `develop`, and the spawn failures are in unrelated profile-choice tests.
+
+Conclusion:
+- Previous request_changes blocker is resolved.
+- Implementation satisfies the recorded Ticket acceptance criteria and is ready for merge/validation in the Orchestrator worktree.
+
+---
