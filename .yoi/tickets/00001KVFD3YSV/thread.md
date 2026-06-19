@@ -1061,3 +1061,64 @@ Next:
 - 修正後、present-but-invalid package の `rejected` semantics を中心に再レビューする。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-19T14:10:25Z -->
+
+## Implementation report
+
+Coder review-fix implementation report received / Orchestrator validation:
+
+Incremental fix commit:
+- `0142ef1d` — `plugin: distinguish present invalid packages`
+
+Summary:
+- Plugin inspection snapshot construction に internal `package_present` tracking を追加。
+- Configured-but-not-discovered packages now report:
+  - `missing` only when configured/enabled ref is truly absent;
+  - `rejected` when the package file is present but invalid, even if diagnostic kind is `missing`.
+- Present-but-invalid package diagnostics are distinguished for:
+  - package exists but root `plugin.toml` is absent;
+  - manifest references a missing runtime/package entry.
+- JSON and human-output coverage added for these cases.
+- Prior fixes are preserved:
+  - status vocabulary;
+  - package path/API/schema fields;
+  - Tool schema/name validation;
+  - read-only/no-execution inspection;
+  - bounded diagnostics.
+
+Files changed in incremental fix:
+- `crates/yoi/src/plugin_cli.rs`
+
+Coder reported validation:
+- `cargo test -p yoi configured_present_package_with_missing_manifest_entries_is_rejected_not_missing` — passed
+- `cargo fmt` — passed
+- `cargo test -p yoi plugin` — passed
+- `cargo test -p pod static_inspection` — passed
+- `cargo check -p yoi -p pod -p manifest` — passed
+- `cargo fmt --check` — passed
+- `git diff --check` — passed
+- `nix build .#yoi --no-link` — passed
+
+Orchestrator evidence checked:
+- Pod output を確認。
+- implementation worktree は clean。
+- branch `impl/00001KVFD3YSV-plugin-cli-inspection` HEAD は `0142ef1d`。
+- incremental diff stat from previous review target `a5f3b0b5..0142ef1d`: 1 file changed, 111 insertions, 5 deletions。
+
+Validation re-run by Orchestrator in implementation worktree:
+- `cargo fmt --check` — passed
+- `cargo check -p yoi -p pod -p manifest` — passed
+- `cargo test -p yoi plugin -- --nocapture` — passed; 11 passed, 0 failed
+- `cargo test -p pod static_inspection -- --nocapture` — passed; 4 passed, 0 failed
+- `cargo test -p pod plugin -- --nocapture` — passed; 31 passed, 0 failed
+- `cargo test -p manifest plugin -- --nocapture` — passed; 17 passed, 0 failed
+- `git diff --check` — passed
+- `nix build .#yoi --no-link` — passed
+
+Routing classification: review_needed
+
+Next action:
+- previous `request_changes` blocker が解消されたか、read-only Reviewer Pod で再レビューする。
+
+---
