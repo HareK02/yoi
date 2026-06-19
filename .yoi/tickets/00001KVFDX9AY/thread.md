@@ -631,3 +631,62 @@ Conclusion:
 - Implementation satisfies the recorded Ticket acceptance criteria and is ready for merge/validation in the Orchestrator worktree.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVFDX9AY at: 2026-06-19T16:12:41Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+対象:
+- Ticket: `00001KVFDX9AY`
+- branch: `impl/00001KVFDX9AY-plugin-fs-host-api`
+- commit: `717c0999` (`plugin: implement fs host api`)
+
+No blockers found.
+
+Evidence reviewed:
+- FS grant schema is explicit and additive: `PluginGrantConfig.fs`, `PluginFsGrant { root, operations }`, and `PluginFsOperation::{read,list,write}` in `crates/manifest/src/plugin.rs`. Existing HTTPS grant shape remains separate.
+- Runtime dispatch checks `host_api.fs` before request parsing reaches any filesystem operation: `execute_plugin_fs_request` bounds descriptor size, then calls `authorize_plugin_host_api(record, PluginHostApi::Fs)` before read/list/write dispatch.
+- Permission/grant binding is layered correctly:
+  - requested `host_api.fs` permission required;
+  - configured grant permission required;
+  - usable FS scope required;
+  - per-operation grants checked in `authorize_fs_path` / `authorize_fs_write_path`.
+- No ambient WASI/workspace filesystem authority is exposed. WASM import validation only allows `yoi:tool`, `yoi:https`, and `yoi:fs`; WASI remains rejected. Runtime FS is only through `yoi:fs` imports.
+- Path safety is materially addressed:
+  - absolute paths, NULs, and `..` traversal rejected;
+  - grant root must be absolute, existing, directory, and not final symlink;
+  - request path components are symlink-checked;
+  - canonicalized targets must remain under the canonical grant root;
+  - write target symlinks/dirs rejected;
+  - Unix writes add `O_NOFOLLOW`.
+- Bounds are explicit:
+  - request descriptor, path, read bytes, write bytes, list entry count, and diagnostics are bounded/redacted;
+  - read/list truncation is explicit via `truncated`;
+  - oversize write fails closed.
+- Writes serialize by normalized/canonical target with a shared lock map and use truncate/create with `sync_all`.
+- Diagnostics use `PluginFsError::new` with `bounded_message(redact_secret_like(...))`; tests verify secret-like path redaction and no file-content leakage on denial.
+- FS responses flow through WASM host response buffers and then ordinary plugin Tool output/error handling; no hidden context/history injection path found.
+- CLI inspection reports `configured_fs_grants` alongside existing permission/HTTPS grant inspection without changing HTTPS semantics.
+
+Reviewer validation:
+- Static review of changed files and relevant tests.
+- Confirmed worktree branch/head.
+- `git diff --check 717c0999^..717c0999` — passed.
+- Orchestrator-reported validation was reviewed:
+  - `cargo fmt --check`
+  - `cargo check -p pod -p manifest -p yoi`
+  - `cargo test -p pod feature::plugin`
+  - `cargo test -p manifest plugin`
+  - `cargo test -p yoi plugin_cli`
+  - `git diff --check`
+  - `nix build .#yoi --no-link`
+
+Non-blocking risk noted:
+- The implementation is still fundamentally path/canonicalization based. It rejects static symlink/root escapes and uses Unix `O_NOFOLLOW` for final write target, but it does not fully eliminate adversarial external TOCTOU races where another local process mutates granted-root directories between checks and open/read/list/write. This is judged within the feasible scope of the initial subset and not a blocker for this Ticket, but should be preserved as future hardening context if the threat model expands.
+
+Conclusion:
+- Implementation satisfies the recorded Ticket acceptance criteria and is ready for merge/validation in the Orchestrator worktree.
+
+---

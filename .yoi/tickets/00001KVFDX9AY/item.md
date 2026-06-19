@@ -2,7 +2,7 @@
 title: 'Plugin: implement fs host API for Tool runtime'
 state: 'inprogress'
 created_at: '2026-06-19T07:53:13Z'
-updated_at: '2026-06-19T16:11:47Z'
+updated_at: '2026-06-19T16:12:41Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['plugin', 'fs', 'host-api', 'sandbox', 'path-safety', 'permission-grants', 'file-mutation']
