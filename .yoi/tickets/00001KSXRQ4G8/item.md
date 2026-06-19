@@ -1,8 +1,8 @@
 ---
 title: 'Plugin: define runtime, surface, and minimal host API model'
-state: 'planning'
+state: 'closed'
 created_at: '2026-05-31T01:00:05Z'
-updated_at: '2026-06-14T17:22:23Z'
+updated_at: '2026-06-19T13:29:26Z'
 assignee: null
 ---
 
