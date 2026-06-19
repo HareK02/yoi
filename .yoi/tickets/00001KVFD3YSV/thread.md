@@ -770,3 +770,32 @@ Reviewer validation:
 - Inspected final branch clean at HEAD `982a1b75`, incremental diff `dfa966db..982a1b75`, final implementation in `crates/pod/src/feature/plugin.rs`, `crates/yoi/src/plugin_cli.rs`, and relevant Ticket acceptance text.
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-19T13:45:45Z -->
+
+## Plan
+
+Review follow-up dispatch:
+
+Reviewer `yoi-reviewer-00001KVFD3YSV-r4` は `request_changes` を返したため、Ticket review として記録し、既存 Coder Pod `yoi-coder-00001KVFD3YSV` に修正依頼を送った。
+
+Resolved:
+- Tool schema/name static inspection blocker は解消済み。
+- Prior status vocabulary、package path/location、API/schema version fixes も維持されている。
+
+Remaining blocker:
+- Configured invalid / incompatible package が `rejected` ではなく `missing` と報告され得る。
+- Ticket acceptance は enabled but absent package => `missing` と、invalid manifest / incompatible API => `rejected` with diagnostic を区別している。
+- `ItemBuilder::finish` の status precedence により、明示 enable された `.yoi/plugins/bad.yoi-plugin` が存在するが invalid manifest / unsupported API version の場合、diagnostic は attach されるが discovered package は作られず、`configured=true`, `discovered=false`, diagnostics present で `missing` になる可能性がある。
+
+Required fixes sent to Coder:
+- Configured package に discovery/resolution diagnostic が attach されている場合、absent package `missing` より `rejected` を優先する。
+- `missing` は enabled/configured package refs が本当に absent の場合だけにする。
+- configured invalid manifest / incompatible API package が JSON/human output で `rejected` + diagnostic になる tests を追加する。
+- Prior fixes: status vocabulary、package path/API fields、Tool schema validation、read-only/no-execution、bounded diagnostics を維持する。
+
+Next:
+- Coder の修正 commit / validation report を待つ。
+- 修正後、configured invalid/incompatible package status semantics を中心に再レビューする。
+
+---
