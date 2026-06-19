@@ -1,11 +1,13 @@
 ---
 title: 'Plugin: add read-only CLI inspection list/show'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-19T07:39:23Z'
-updated_at: '2026-06-19T07:40:41Z'
+updated_at: '2026-06-19T10:19:28Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['plugin', 'cli', 'diagnostics', 'read-only', 'json-output', 'no-execution']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-19T10:19:28Z'
 ---
 
 ## Background
