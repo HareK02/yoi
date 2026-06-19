@@ -146,3 +146,33 @@ Next action:
 Ticket body/thread, relation metadata, orchestration plan records, related completed Tickets, Orchestrator worktree, visible Pods, existing branch/worktree, and bounded Plugin host API code context were checked. Depends-on blockers are closed, prior CLI inspection related work is closed, and no dirty-state blocker or missing planning decision was found. `fs` host API and Component Model migration remain queued with conflict/migration waiting records. Accepting this queued Ticket for implementation before worktree/Pod side effects.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-19T14:26:32Z -->
+
+## Implementation report
+
+Implementation start note:
+
+`queued -> inprogress` acceptance、accepted plan、routing decision / IntentPacket、fs host API / Component Model migration の waiting records を記録し、Orchestrator worktree で commit した後に、専用 implementation worktree と Coder Pod を起動した。
+
+Worktree:
+- `/home/hare/Projects/yoi/.worktree/00001KVFDX9AF-plugin-https-host-api`
+- branch: `impl/00001KVFDX9AF-plugin-https-host-api`
+
+Coder Pod:
+- `yoi-coder-00001KVFDX9AF`
+
+Scope / boundaries:
+- child runtime workspace root は read scope。
+- implementation worktree は write scope。
+- root/original workspace と Orchestrator worktree へは書き込まないよう指示済み。
+- `.yoi/memory`、runtime/log/lock/local/secret-like `.yoi` paths は編集しないよう指示済み。
+
+Related queued Tickets:
+- `00001KVFDX9AY` fs host API remains queued due existing do_not_parallelize / conflict with HTTPS host API.
+- `00001KVG0HR96` Component Model migration remains queued due migration boundary / conflict with active host API work.
+
+Next:
+- Coder は granted HTTPS host API implementation、focused tests、validation、implementation commit を行い、実装報告を返す予定。
+
+---
