@@ -1,24 +1,3 @@
-<!-- event: create author: "yoi ticket" at: 2026-06-18T16:02:56Z -->
-
-## 作成
-
-LocalTicketBackend によって作成されました。
-
----
-
-<!-- event: state_changed author: hare at: 2026-06-19T05:44:09Z from: done to: closed reason: closed field: state -->
-
-## State changed
-
-Ticket を closed にしました。
-
-
----
-
-<!-- event: close author: hare at: 2026-06-19T05:44:09Z status: closed -->
-
-## 完了
-
 Closed as completed.
 
 Added E2E coverage for a Panel shell-enter launch path:
@@ -29,6 +8,3 @@ Added E2E coverage for a Panel shell-enter launch path:
 - direct-spawn Panel readiness tests remain as separate coverage.
 
 Validation was recorded during implementation, including the focused shell-enter test, the full Panel E2E test set, relevant cargo check, formatting, diff check, ticket doctor, and Nix build.
-
-
----

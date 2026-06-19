@@ -1,8 +1,8 @@
 ---
 title: 'Panel E2E に shell Enter 起動経路の dashboard readiness 計測を追加する'
-state: 'done'
+state: 'closed'
 created_at: '2026-06-18T16:02:56Z'
-updated_at: '2026-06-18T16:03:59Z'
+updated_at: '2026-06-19T05:44:09Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['panel', 'e2e', 'startup-latency', 'shell-launch', 'dashboard-content-ready']
