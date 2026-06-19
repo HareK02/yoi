@@ -1,5 +1,6 @@
 mod memory_lint;
 mod objective_cli;
+mod plugin_cli;
 mod session_cli;
 mod ticket_cli;
 
@@ -17,6 +18,7 @@ enum Mode {
     Help,
     MemoryLintHelp,
     MemoryLint(LintCliOptions),
+    Plugin(plugin_cli::PluginCliCommand),
     Objective(objective_cli::ObjectiveCli),
     Session(session_cli::SessionCli),
     Ticket(ticket_cli::TicketCli),
@@ -65,6 +67,13 @@ async fn main() -> ExitCode {
             Ok(LintStatus::Failed) => ExitCode::FAILURE,
             Err(e) => {
                 eprintln!("yoi memory lint: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Mode::Plugin(command) => match plugin_cli::run(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("yoi plugin: {e}");
                 ExitCode::FAILURE
             }
         },
@@ -172,6 +181,10 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
             let ticket_cli =
                 ticket_cli::parse_ticket_args(&args[1..]).map_err(|e| ParseError(e.to_string()))?;
             return Ok(Mode::Ticket(ticket_cli));
+        }
+        "plugin" => {
+            let plugin_cli = parse_plugin_args(&args[1..])?;
+            return Ok(Mode::Plugin(plugin_cli));
         }
         "panel" => {
             return Ok(Mode::Tui {
@@ -413,6 +426,97 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
     })
 }
 
+fn parse_plugin_args(args: &[String]) -> Result<plugin_cli::PluginCliCommand, ParseError> {
+    let Some((subcommand, rest)) = args.split_first() else {
+        return Err(ParseError(
+            "yoi plugin requires `list` or `show <ref>`".to_string(),
+        ));
+    };
+    match subcommand.as_str() {
+        "list" => {
+            let (plugin_args, positional) = parse_plugin_common_args(rest)?;
+            if !positional.is_empty() {
+                return Err(ParseError(
+                    "yoi plugin list does not accept positional arguments".to_string(),
+                ));
+            }
+            Ok(plugin_cli::PluginCliCommand::List(plugin_args))
+        }
+        "show" => {
+            let (plugin_args, positional) = parse_plugin_common_args(rest)?;
+            match positional.as_slice() {
+                [reference] => Ok(plugin_cli::PluginCliCommand::Show {
+                    reference: reference.clone(),
+                    args: plugin_args,
+                }),
+                [] => Err(ParseError(
+                    "yoi plugin show requires a plugin ref".to_string(),
+                )),
+                _ => Err(ParseError(
+                    "yoi plugin show accepts exactly one plugin ref".to_string(),
+                )),
+            }
+        }
+        "--help" | "-h" => Err(ParseError(plugin_usage().to_string())),
+        other => Err(ParseError(format!(
+            "unknown yoi plugin subcommand `{other}`"
+        ))),
+    }
+}
+
+fn parse_plugin_common_args(
+    args: &[String],
+) -> Result<(plugin_cli::PluginCliArgs, Vec<String>), ParseError> {
+    let mut parsed = plugin_cli::PluginCliArgs::default();
+    let mut positional = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "--json" => parsed.json = true,
+            "--workspace" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(ParseError("--workspace requires a value".to_string()));
+                };
+                parsed.workspace = Some(PathBuf::from(value));
+            }
+            "--profile" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(ParseError("--profile requires a value".to_string()));
+                };
+                parsed.profile = Some(value.clone());
+            }
+            "--help" | "-h" => return Err(ParseError(plugin_usage().to_string())),
+            _ if arg.starts_with("--workspace=") => {
+                let value = arg.trim_start_matches("--workspace=");
+                if value.is_empty() {
+                    return Err(ParseError("--workspace requires a value".to_string()));
+                }
+                parsed.workspace = Some(PathBuf::from(value));
+            }
+            _ if arg.starts_with("--profile=") => {
+                let value = arg.trim_start_matches("--profile=");
+                if value.is_empty() {
+                    return Err(ParseError("--profile requires a value".to_string()));
+                }
+                parsed.profile = Some(value.to_string());
+            }
+            _ if arg.starts_with('-') => {
+                return Err(ParseError(format!("unknown yoi plugin option `{arg}`")));
+            }
+            _ => positional.push(arg.clone()),
+        }
+        index += 1;
+    }
+    Ok((parsed, positional))
+}
+
+fn plugin_usage() -> &'static str {
+    "usage: yoi plugin list [--workspace PATH] [--profile REF] [--json]\n       yoi plugin show <ref> [--workspace PATH] [--profile REF] [--json]"
+}
+
 fn parse_panel_workspace(args: &[String]) -> Result<PathBuf, ParseError> {
     match args {
         [] => std::env::current_dir()
@@ -443,7 +547,7 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
 
 fn print_help() {
     println!(
-        "yoi\n\nUsage:\n  yoi [OPTIONS] [POD_NAME]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi pod [POD_OPTIONS]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi memory lint [OPTIONS]\n\nOptions:\n  -r, --resume           Open the Pod picker and resume/attach a Pod\n      --workspace <PATH> Runtime workspace root (defaults to cwd)\n      --pod <NAME>       Attach/restore/create a Pod by name\n      --socket <PATH>    Attach to a specific Pod socket with --pod\n      --session <UUID>   Resume a specific session segment\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
+        "yoi\n\nUsage:\n  yoi [OPTIONS] [POD_NAME]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi pod [POD_OPTIONS]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nOptions:\n  -r, --resume           Open the Pod picker and resume/attach a Pod\n      --workspace <PATH> Runtime workspace root (defaults to cwd)\n      --pod <NAME>       Attach/restore/create a Pod by name\n      --socket <PATH>    Attach to a specific Pod socket with --pod\n      --session <UUID>   Resume a specific session segment\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
     );
 }
 
@@ -604,6 +708,33 @@ mod tests {
                 assert!(options.warnings_as_errors);
             }
             _ => panic!("expected MemoryLint mode"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_list_and_show() {
+        match parse_args_from(["plugin", "list", "--workspace=/tmp/ws", "--json"]).unwrap() {
+            Mode::Plugin(plugin_cli::PluginCliCommand::List(options)) => {
+                assert_eq!(options.workspace, Some(PathBuf::from("/tmp/ws")));
+                assert!(options.json);
+            }
+            _ => panic!("expected Plugin list mode"),
+        }
+
+        match parse_args_from([
+            "plugin",
+            "show",
+            "project:echo",
+            "--profile",
+            "project:inspect",
+        ])
+        .unwrap()
+        {
+            Mode::Plugin(plugin_cli::PluginCliCommand::Show { reference, args }) => {
+                assert_eq!(reference, "project:echo");
+                assert_eq!(args.profile.as_deref(), Some("project:inspect"));
+            }
+            _ => panic!("expected Plugin show mode"),
         }
     }
 

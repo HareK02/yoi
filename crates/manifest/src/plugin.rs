@@ -436,7 +436,7 @@ pub struct ResolvedPluginRecord {
 }
 
 impl ResolvedPluginRecord {
-    fn from_resolved(resolved: &ResolvedPlugin) -> Self {
+    pub fn from_resolved(resolved: &ResolvedPlugin) -> Self {
         Self {
             identity: resolved.identity.clone(),
             source: resolved.source,
