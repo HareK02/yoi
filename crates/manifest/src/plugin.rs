@@ -378,12 +378,28 @@ impl PluginPackageManifest {
     }
 }
 
+pub const PLUGIN_RUNTIME_WASM_KIND: &str = "wasm";
+pub const PLUGIN_RUNTIME_WASM_ABI: &str = "yoi-plugin-wasm-1";
+/// Manifest runtime kind for WebAssembly Component Model Tool packages.
+///
+/// Component runtime manifests must set `component` to the packaged component
+/// artifact path and `world` to [`PLUGIN_COMPONENT_TOOL_WORLD`]. Raw core-Wasm
+/// packages remain explicit `kind = "wasm"` plus `abi = "yoi-plugin-wasm-1"`.
+pub const PLUGIN_RUNTIME_COMPONENT_KIND: &str = "wasm-component";
+pub const PLUGIN_COMPONENT_TOOL_WORLD: &str = "yoi:plugin/tool@1.0.0";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginRuntimeManifest {
     pub kind: String,
-    pub entry: String,
+    #[serde(default)]
+    pub entry: Option<String>,
+    #[serde(default)]
     pub abi: Option<String>,
+    #[serde(default)]
+    pub component: Option<String>,
+    #[serde(default)]
+    pub world: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -837,7 +853,7 @@ pub fn read_resolved_plugin_runtime_module(
         .with_digest(&record.digest)
     })?;
 
-    if runtime.kind != "wasm" {
+    if runtime.kind != PLUGIN_RUNTIME_WASM_KIND {
         return Err(PluginDiagnostic::new(
             PluginDiagnosticKind::Api,
             PluginDiagnosticPhase::Manifest,
@@ -848,7 +864,7 @@ pub fn read_resolved_plugin_runtime_module(
         .with_package(&record.package_label)
         .with_digest(&record.digest));
     }
-    if runtime.abi.as_deref() != Some("yoi-plugin-wasm-1") {
+    if runtime.abi.as_deref() != Some(PLUGIN_RUNTIME_WASM_ABI) {
         return Err(PluginDiagnostic::new(
             PluginDiagnosticKind::Api,
             PluginDiagnosticPhase::Manifest,
@@ -859,6 +875,18 @@ pub fn read_resolved_plugin_runtime_module(
         .with_package(&record.package_label)
         .with_digest(&record.digest));
     }
+
+    let entry = runtime.entry.as_deref().ok_or_else(|| {
+        PluginDiagnostic::new(
+            PluginDiagnosticKind::Missing,
+            PluginDiagnosticPhase::Manifest,
+            "plugin WASM runtime entry is required",
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(&record.digest)
+    })?;
 
     let metadata = fs::metadata(&record.package_path).map_err(|error| {
         PluginDiagnostic::new(
@@ -926,13 +954,13 @@ pub fn read_resolved_plugin_runtime_module(
     }
 
     validate_manifest_path(
-        &runtime.entry,
+        entry,
         &archive,
         &record.package_label,
         record.source,
         &record.manifest.id,
     )?;
-    let normalized = normalize_archive_path(&runtime.entry).ok_or_else(|| {
+    let normalized = normalize_archive_path(entry).ok_or_else(|| {
         PluginDiagnostic::new(
             PluginDiagnosticKind::Traversal,
             PluginDiagnosticPhase::Manifest,
@@ -948,6 +976,154 @@ pub fn read_resolved_plugin_runtime_module(
             PluginDiagnosticKind::Missing,
             PluginDiagnosticPhase::Manifest,
             "plugin runtime module entry is missing from the package",
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(&record.digest)
+    })
+}
+
+/// Reads the WebAssembly Component Model artifact selected by a resolved plugin
+/// package manifest while preserving package digest pinning.
+pub fn read_resolved_plugin_runtime_component(
+    record: &ResolvedPluginRecord,
+    limits: &PluginDiscoveryLimits,
+) -> Result<Vec<u8>, PluginDiagnostic> {
+    let runtime = record.manifest.runtime.as_ref().ok_or_else(|| {
+        PluginDiagnostic::new(
+            PluginDiagnosticKind::Missing,
+            PluginDiagnosticPhase::Manifest,
+            "resolved plugin package does not declare a component runtime",
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(&record.digest)
+    })?;
+
+    if runtime.kind != PLUGIN_RUNTIME_COMPONENT_KIND {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Api,
+            PluginDiagnosticPhase::Manifest,
+            "plugin runtime kind is unsupported",
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(&record.digest));
+    }
+    if runtime.world.as_deref() != Some(PLUGIN_COMPONENT_TOOL_WORLD) {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Api,
+            PluginDiagnosticPhase::Manifest,
+            "plugin component world is unsupported",
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(&record.digest));
+    }
+    let component = runtime.component.as_deref().ok_or_else(|| {
+        PluginDiagnostic::new(
+            PluginDiagnosticKind::Missing,
+            PluginDiagnosticPhase::Manifest,
+            "plugin component runtime artifact is required",
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(&record.digest)
+    })?;
+
+    let metadata = fs::metadata(&record.package_path).map_err(|error| {
+        PluginDiagnostic::new(
+            PluginDiagnosticKind::Io,
+            PluginDiagnosticPhase::Discovery,
+            format!(
+                "resolved plugin package metadata could not be read: {}",
+                safe_io_error(&error)
+            ),
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(&record.digest)
+    })?;
+    if !metadata.is_file() {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Malformed,
+            PluginDiagnosticPhase::Discovery,
+            "resolved plugin package is not a regular file",
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(&record.digest));
+    }
+    if metadata.len() > limits.max_package_size_bytes {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Bounds,
+            PluginDiagnosticPhase::Discovery,
+            "resolved plugin package exceeds the configured package size bound",
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(&record.digest));
+    }
+
+    let bytes = fs::read(&record.package_path).map_err(|error| {
+        PluginDiagnostic::new(
+            PluginDiagnosticKind::Io,
+            PluginDiagnosticPhase::Discovery,
+            format!(
+                "resolved plugin package content could not be read: {}",
+                safe_io_error(&error)
+            ),
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(&record.digest)
+    })?;
+    let archive = parse_stored_zip(&bytes, &record.package_label, record.source, limits)?;
+    let actual_digest = deterministic_digest(&archive.files);
+    if !digest_matches(&record.digest, &actual_digest) {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Digest,
+            PluginDiagnosticPhase::Resolution,
+            "resolved plugin package digest does not match current package content",
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(actual_digest));
+    }
+
+    validate_manifest_path(
+        component,
+        &archive,
+        &record.package_label,
+        record.source,
+        &record.manifest.id,
+    )?;
+    let normalized = normalize_archive_path(component).ok_or_else(|| {
+        PluginDiagnostic::new(
+            PluginDiagnosticKind::Traversal,
+            PluginDiagnosticPhase::Manifest,
+            "plugin manifest references a path outside the package root",
+        )
+        .with_source(record.source)
+        .with_identity(&record.identity)
+        .with_package(&record.package_label)
+        .with_digest(&record.digest)
+    })?;
+    archive.files.get(&normalized).cloned().ok_or_else(|| {
+        PluginDiagnostic::new(
+            PluginDiagnosticKind::Missing,
+            PluginDiagnosticPhase::Manifest,
+            "plugin runtime component artifact is missing from the package",
         )
         .with_source(record.source)
         .with_identity(&record.identity)
@@ -1237,27 +1413,84 @@ fn validate_manifest(
         .with_package(label));
     }
     if let Some(runtime) = &manifest.runtime {
-        if runtime.kind != "wasm" {
-            return Err(PluginDiagnostic::new(
-                PluginDiagnosticKind::Api,
-                PluginDiagnosticPhase::Manifest,
-                "plugin runtime kind is unsupported",
-            )
-            .with_source(source)
-            .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
-            .with_package(label));
+        match runtime.kind.as_str() {
+            PLUGIN_RUNTIME_WASM_KIND => {
+                if runtime.abi.as_deref() != Some(PLUGIN_RUNTIME_WASM_ABI) {
+                    return Err(PluginDiagnostic::new(
+                        PluginDiagnosticKind::Api,
+                        PluginDiagnosticPhase::Manifest,
+                        "plugin WASM ABI is unsupported",
+                    )
+                    .with_source(source)
+                    .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
+                    .with_package(label));
+                }
+                let Some(entry) = runtime.entry.as_deref() else {
+                    return Err(PluginDiagnostic::new(
+                        PluginDiagnosticKind::Missing,
+                        PluginDiagnosticPhase::Manifest,
+                        "plugin WASM runtime entry is required",
+                    )
+                    .with_source(source)
+                    .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
+                    .with_package(label));
+                };
+                if runtime.component.is_some() || runtime.world.is_some() {
+                    return Err(PluginDiagnostic::new(
+                        PluginDiagnosticKind::Malformed,
+                        PluginDiagnosticPhase::Manifest,
+                        "plugin WASM runtime must not declare component metadata",
+                    )
+                    .with_source(source)
+                    .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
+                    .with_package(label));
+                }
+                validate_manifest_path(entry, archive, label, source, &manifest.id)?;
+            }
+            PLUGIN_RUNTIME_COMPONENT_KIND => {
+                if runtime.abi.is_some() || runtime.entry.is_some() {
+                    return Err(PluginDiagnostic::new(
+                        PluginDiagnosticKind::Malformed,
+                        PluginDiagnosticPhase::Manifest,
+                        "plugin component runtime must not declare raw WASM ABI metadata",
+                    )
+                    .with_source(source)
+                    .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
+                    .with_package(label));
+                }
+                if runtime.world.as_deref() != Some(PLUGIN_COMPONENT_TOOL_WORLD) {
+                    return Err(PluginDiagnostic::new(
+                        PluginDiagnosticKind::Api,
+                        PluginDiagnosticPhase::Manifest,
+                        "plugin component world is unsupported",
+                    )
+                    .with_source(source)
+                    .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
+                    .with_package(label));
+                }
+                let Some(component) = runtime.component.as_deref() else {
+                    return Err(PluginDiagnostic::new(
+                        PluginDiagnosticKind::Missing,
+                        PluginDiagnosticPhase::Manifest,
+                        "plugin component runtime artifact is required",
+                    )
+                    .with_source(source)
+                    .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
+                    .with_package(label));
+                };
+                validate_manifest_path(component, archive, label, source, &manifest.id)?;
+            }
+            _ => {
+                return Err(PluginDiagnostic::new(
+                    PluginDiagnosticKind::Api,
+                    PluginDiagnosticPhase::Manifest,
+                    "plugin runtime kind is unsupported",
+                )
+                .with_source(source)
+                .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
+                .with_package(label));
+            }
         }
-        if runtime.abi.as_deref() != Some("yoi-plugin-wasm-1") {
-            return Err(PluginDiagnostic::new(
-                PluginDiagnosticKind::Api,
-                PluginDiagnosticPhase::Manifest,
-                "plugin WASM ABI is unsupported",
-            )
-            .with_source(source)
-            .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
-            .with_package(label));
-        }
-        validate_manifest_path(&runtime.entry, archive, label, source, &manifest.id)?;
     }
     for hook in &manifest.hooks {
         if !is_safe_id(&hook.id) {
