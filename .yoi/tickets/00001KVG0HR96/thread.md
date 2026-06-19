@@ -192,3 +192,48 @@ Review dispatch:
 - Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVG0HR96-r1 at: 2026-06-19T17:08:18Z status: request_changes -->
+
+## Review: request changes
+
+Verdict: `request_changes`
+
+確認範囲:
+- Ticket contract: `.yoi/tickets/00001KVG0HR96/item.md`, `.yoi/tickets/00001KVG0HR96/thread.md`
+- Diff: `878517dc..57bbf14e`
+- 主な対象: `crates/manifest/src/plugin.rs`, `crates/pod/src/feature/plugin.rs`, `crates/pod/Cargo.toml`, `Cargo.lock`, `package.nix`, `resources/plugin/wit/*`, docs/sample, existing `crates/yoi/src/plugin_cli.rs` static inspection path。
+
+良い点:
+- 明示的な `wasm-component` metadata、raw `wasm` ABI との分離、artifact を実行しない static inspection、ToolRegistry 経由の registration/execution、Tool execution/host API 前の grant check、WASI imports を link しない方針は概ね Ticket intent に沿っている。
+
+Blocking issue:
+1. Component runtime が既存 WASM sandbox/resource boundary を保持していない。
+   - Raw core-Wasm path は `StoreLimitsBuilder` / `memory_size(PLUGIN_WASM_MEMORY_BYTES)` / table/instance/memory limits / `store.limiter(...)` を使っている。
+   - 新しい Component Model path (`crates/pod/src/feature/plugin.rs:1965-2006`) は `consume_fuel(true)` と `max_wasm_stack(...)` は設定しているが、component execution store に同等の `Store::limiter(...)` / resource limit がない。
+   - また component result は `String` として host 側に lift された後で `decode_plugin_wasm_output(output.as_bytes())` による output cap を適用しており、untrusted component が output cap 前に host allocation を強制できる。
+   - これは Ticket/design の「Component Model support must preserve existing Plugin authority/sandbox boundaries」に反する。component memory/table/instance/output bounds のテストも不足している。
+
+Required fix:
+- Component execution store に raw runtime と同等の Wasmtime resource limiter / memory/table/instance limits を入れる。
+- Component output/string lifting が unbounded host allocation にならないよう、少なくとも component memory/resource limit により bounded で fail-closed になることを実装・コメント・テストで示す。
+- Component memory/resource/output bound の negative tests を追加する。
+
+Non-blocking concerns / follow-ups:
+- WIT は現在 `call(tool-name: string, input-json: string) -> string`。Ticket の “Tool request / response / structured error types” は完全には表現していない。今回 v1 の narrow ABI として意図的に deferred なら decision/follow-up として記録すること。
+- Rust sample は `wit_bindgen` authoring sketch であり、build/package された sample plugin を test しているわけではない。follow-up として packaged sample があるとよい。
+- `nix build` / `cargoHash` は検証されているが、binary size/build-time impact measurement がまだ明示記録されていない。最終 closure 前に capture すること。
+
+Reviewer validation:
+- `git diff --check 878517dc..57bbf14e`: passed
+- `cargo fmt --check`: passed
+- `cargo test -p manifest plugin -- --nocapture`: 17 passed
+- `cargo test -p pod feature::plugin::tests -- --nocapture`: 55 passed
+- `cargo test -p yoi plugin -- --nocapture`: 11 passed
+- `cargo check`: passed
+- `nix build .#yoi --no-link`: passed
+- `nix path-info .#yoi`: `/nix/store/m5gsv05lfs7s9bh8dfy4ady6sda925fv-yoi-0.1.0`
+
+Worktree status at review end: clean。
+
+---
