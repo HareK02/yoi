@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KVG0HR96",
+      "kind": "depends_on",
+      "target": "00001KV5W3PHW",
+      "note": "Component Model runtime migrates the existing raw WASM Tool runtime.",
+      "author": "yoi ticket",
+      "at": "2026-06-19T13:21:01Z"
+    },
+    {
+      "ticket_id": "00001KVG0HR96",
+      "kind": "depends_on",
+      "target": "00001KV5W3PJ3",
+      "note": "Component runtime must preserve Plugin permission grant enforcement.",
+      "author": "yoi ticket",
+      "at": "2026-06-19T13:21:01Z"
+    },
+    {
+      "ticket_id": "00001KVG0HR96",
+      "kind": "related",
+      "target": "00001KSXRQ4G8",
+      "note": "Updates Plugin runtime/surface/host API design direction toward Component Model.",
+      "author": "yoi ticket",
+      "at": "2026-06-19T13:21:01Z"
+    },
+    {
+      "ticket_id": "00001KVG0HR96",
+      "kind": "related",
+      "target": "00001KVFD3YSV",
+      "note": "Inspection CLI should report component runtime metadata without execution.",
+      "author": "yoi ticket",
+      "at": "2026-06-19T13:21:01Z"
+    },
+    {
+      "ticket_id": "00001KVG0HR96",
+      "kind": "related",
+      "target": "00001KVFDX9AF",
+      "note": "https host API should be designed in WIT-compatible typed terms.",
+      "author": "yoi ticket",
+      "at": "2026-06-19T13:21:01Z"
+    },
+    {
+      "ticket_id": "00001KVG0HR96",
+      "kind": "related",
+      "target": "00001KVFDX9AY",
+      "note": "fs host API should be designed in WIT-compatible typed terms.",
+      "author": "yoi ticket",
+      "at": "2026-06-19T13:21:01Z"
+    }
+  ]
+}

@@ -52,6 +52,15 @@ entry = "plugin.wasm"
 abi = "yoi-plugin-wasm-1"
 ```
 
+The preferred future WASM authoring/runtime shape is the WebAssembly Component Model, recorded in [Plugin Component Model migration](plugin-component-model.md). Component packages should be explicit and source-compatible rather than silently changing the existing raw core-Wasm runtime:
+
+```toml
+[runtime]
+kind = "wasm-component"
+component = "plugin.component.wasm"
+world = "yoi:plugin/tool@1.0.0"
+```
+
 First-pass fields accepted by the parser:
 
 - `schema_version`: required integer; unsupported versions fail closed.
