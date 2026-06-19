@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use manifest::plugin::{
     PluginConfig, PluginDiagnostic, PluginDiagnosticKind, PluginDiscoveryLimits,
     PluginDiscoveryOptions, PluginDiscoveryReport, PluginPackageManifest, PluginPermission,
-    PluginResolution, PluginSurface, ResolvedPlugin, ResolvedPluginRecord, SourceQualifiedPluginId,
-    discover_plugins, resolve_enabled_plugins,
+    PluginResolution, PluginSourceKind, PluginSurface, ResolvedPlugin, ResolvedPluginRecord,
+    SourceQualifiedPluginId, discover_plugins, resolve_enabled_plugins,
 };
 use manifest::{ProfileResolveOptions, ProfileResolver, ProfileSelector, paths};
 use pod::feature::plugin::{PluginStaticInspection, inspect_resolved_plugin_static};
@@ -70,10 +70,20 @@ fn render_list_snapshot_human(snapshot: &PluginInspectionSnapshot) -> Result<Str
     for item in snapshot.items.iter().take(MAX_LIST_ITEMS) {
         writeln!(
             out,
-            "- {} [{}] version={} digest={} source={} enabled_surfaces={} tools={} diagnostics={}",
+            "- {} [{}] version={} schema_version={} api_version={} package_path={} digest={} source={} enabled_surfaces={} tools={} diagnostics={}",
             item.reference,
             item.status,
             item.version.as_deref().unwrap_or("<unknown>"),
+            item.schema_version
+                .map(|version| version.to_string())
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            item.api_version
+                .map(|version| version.to_string())
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            item.package_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<unknown>".to_string()),
             item.digest.as_deref().unwrap_or("<unknown>"),
             item.source.as_deref().unwrap_or("<unknown>"),
             join_or_none(&item.enabled_surfaces),
@@ -117,6 +127,28 @@ fn render_item_human(item: &PluginInspectionItem) -> Result<String> {
         out,
         "  package: {}",
         item.package.as_deref().unwrap_or("<unknown>")
+    )?;
+    writeln!(
+        out,
+        "  package_path: {}",
+        item.package_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string())
+    )?;
+    writeln!(
+        out,
+        "  schema_version: {}",
+        item.schema_version
+            .map(|version| version.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string())
+    )?;
+    writeln!(
+        out,
+        "  api_version: {}",
+        item.api_version
+            .map(|version| version.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string())
     )?;
     writeln!(
         out,
@@ -287,8 +319,11 @@ fn snapshot_from_resolution(
         builder.discovered = true;
         builder.source = Some(package.identity.source.to_string());
         builder.package = Some(package.package_label.clone());
+        builder.package_path = Some(package.package_path.clone());
         builder.digest = Some(package.digest.clone());
         builder.version = Some(package.manifest.version.clone());
+        builder.schema_version = Some(package.manifest.schema_version);
+        builder.api_version = Some(package.manifest.schema_version);
         builder.declared_surfaces = surface_strings(package.manifest.surfaces.iter().copied());
         builder.requested_permissions = permission_strings(&package.manifest.permissions);
         builder.tools = package
@@ -322,6 +357,13 @@ fn snapshot_from_resolution(
             builder
                 .source
                 .get_or_insert_with(|| identity.source.to_string());
+            builder.package_path.get_or_insert_with(|| {
+                package_path_for_source(
+                    &workspace,
+                    identity.source,
+                    &format!("{}.yoi-plugin", identity.local_id),
+                )
+            });
         }
     }
 
@@ -345,6 +387,20 @@ fn snapshot_from_resolution(
                 .or_insert_with(|| ItemBuilder::new(reference))
                 .diagnostics
                 .push(rendered);
+        } else if let (Some(source), Some(package)) =
+            (diagnostic.source, diagnostic.package.as_ref())
+        {
+            let local_id = package_local_id(package);
+            let key = format!("{source}:{local_id}");
+            let builder = builders
+                .entry(key.clone())
+                .or_insert_with(|| ItemBuilder::new(key));
+            builder.source.get_or_insert_with(|| source.to_string());
+            builder.package.get_or_insert_with(|| package.clone());
+            builder
+                .package_path
+                .get_or_insert_with(|| package_path_for_source(&workspace, source, package));
+            builder.diagnostics.push(rendered);
         } else {
             let key = "<global>".to_string();
             builders
@@ -370,8 +426,11 @@ fn fill_resolved(builder: &mut ItemBuilder, resolved: &ResolvedPlugin) {
     builder.resolved = true;
     builder.source = Some(resolved.identity.source.to_string());
     builder.package = Some(resolved.package_label.clone());
+    builder.package_path = Some(resolved.package_path.clone());
     builder.digest = Some(resolved.digest.clone());
     builder.version = Some(resolved.manifest.version.clone());
+    builder.schema_version = Some(resolved.manifest.schema_version);
+    builder.api_version = Some(resolved.manifest.schema_version);
     builder.declared_surfaces = surface_strings(resolved.manifest.surfaces.iter().copied());
     builder.enabled_surfaces = surface_strings(resolved.enabled_surfaces.iter().copied());
     builder.requested_permissions = permission_strings(&resolved.manifest.permissions);
@@ -478,6 +537,28 @@ fn permission_requested(manifest: &PluginPackageManifest, permission: &PluginPer
         .any(|requested| requested == permission)
 }
 
+fn package_local_id(package_label: &str) -> String {
+    package_label
+        .strip_suffix(".yoi-plugin")
+        .unwrap_or(package_label)
+        .to_string()
+}
+
+fn package_path_for_source(
+    workspace: &Path,
+    source: PluginSourceKind,
+    package_label: &str,
+) -> PathBuf {
+    match source {
+        PluginSourceKind::Project => workspace.join(".yoi/plugins").join(package_label),
+        PluginSourceKind::User => paths::data_dir()
+            .unwrap_or_else(|| PathBuf::from("<unavailable-user-data-dir>"))
+            .join("yoi/plugins")
+            .join(package_label),
+        PluginSourceKind::Builtin => PathBuf::from("<builtin>").join(package_label),
+    }
+}
+
 fn local_ref(reference: &str) -> Option<String> {
     SourceQualifiedPluginId::parse(reference)
         .ok()
@@ -506,7 +587,10 @@ struct PluginInspectionItem {
     status: String,
     source: Option<String>,
     package: Option<String>,
+    package_path: Option<PathBuf>,
     version: Option<String>,
+    schema_version: Option<u32>,
+    api_version: Option<u32>,
     digest: Option<String>,
     configured: bool,
     discovered: bool,
@@ -572,7 +656,10 @@ struct ItemBuilder {
     resolved: bool,
     source: Option<String>,
     package: Option<String>,
+    package_path: Option<PathBuf>,
     version: Option<String>,
+    schema_version: Option<u32>,
+    api_version: Option<u32>,
     digest: Option<String>,
     static_eligible: bool,
     declared_surfaces: Vec<String>,
@@ -593,7 +680,10 @@ impl ItemBuilder {
             resolved: false,
             source: None,
             package: None,
+            package_path: None,
             version: None,
+            schema_version: None,
+            api_version: None,
             digest: None,
             static_eligible: false,
             declared_surfaces: Vec::new(),
@@ -649,7 +739,10 @@ impl ItemBuilder {
             status,
             source: self.source,
             package: self.package,
+            package_path: self.package_path,
             version: self.version,
+            schema_version: self.schema_version,
+            api_version: self.api_version,
             digest: self.digest,
             configured: self.configured,
             discovered: self.discovered,
@@ -686,19 +779,47 @@ mod tests {
         assert_eq!(item.tools[0].name, "Echo");
         assert!(item.static_eligible);
         assert_eq!(item.package.as_deref(), Some("echo.yoi-plugin"));
+        assert_eq!(item.schema_version, Some(1));
+        assert_eq!(item.api_version, Some(1));
+        assert_eq!(
+            item.package_path.as_deref(),
+            Some(workspace.join(".yoi/plugins/echo.yoi-plugin").as_path())
+        );
 
         let list_json = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(list_json["items"][0]["status"], "active");
+        assert_eq!(list_json["items"][0]["schema_version"], 1);
+        assert_eq!(list_json["items"][0]["api_version"], 1);
+        assert_eq!(
+            list_json["items"][0]["package_path"],
+            workspace
+                .join(".yoi/plugins/echo.yoi-plugin")
+                .display()
+                .to_string()
+        );
         assert_eq!(list_json["items"][0]["enabled_surfaces"][0], "tool");
         assert_eq!(list_json["items"][0]["tools"][0]["granted"], true);
 
         let show_json = serde_json::to_value(item).unwrap();
         assert_eq!(show_json["status"], "active");
+        assert_eq!(show_json["schema_version"], 1);
+        assert_eq!(show_json["api_version"], 1);
+        assert_eq!(
+            show_json["package_path"],
+            workspace
+                .join(".yoi/plugins/echo.yoi-plugin")
+                .display()
+                .to_string()
+        );
         assert_eq!(show_json["configured_grants"][0], "surfaces.tool");
         assert_eq!(show_json["tools"][0]["permission"], "tool.Echo");
 
         let show = render_item_human(item).unwrap();
         assert!(show.contains("status: active"));
+        assert!(show.contains("schema_version: 1"));
+        assert!(show.contains("api_version: 1"));
+        assert!(show.contains("package_path:"));
+        assert!(show.contains("echo.yoi-plugin"));
         assert!(show.contains("configured_grants: surfaces.tool, tool.Echo"));
     }
 
@@ -759,6 +880,11 @@ mod tests {
         assert!(output.contains("project:spare [disabled]"));
         assert!(output.contains("project:bad [rejected]"));
         assert!(output.contains("project:missing [missing]"));
+        assert!(output.contains("schema_version=1"));
+        assert!(output.contains("api_version=1"));
+        assert!(output.contains("package_path="));
+        assert!(output.contains("echo.yoi-plugin"));
+        assert!(output.contains("missing.yoi-plugin"));
         assert!(output.contains("enabled_surfaces=tool"));
         assert!(!output.contains("enabled-with-diagnostics"));
         assert!(!output.contains("configured-"));
