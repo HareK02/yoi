@@ -952,3 +952,33 @@ Next action:
 - previous `request_changes` blocker が解消されたか、read-only Reviewer Pod で再レビューする。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-19T13:54:49Z -->
+
+## Plan
+
+Review re-dispatch:
+
+Reviewer Pod `yoi-reviewer-00001KVFD3YSV-r5` を read-only scope で起動した。
+
+Review target:
+- worktree: `/home/hare/Projects/yoi/.worktree/00001KVFD3YSV-plugin-cli-inspection`
+- branch: `impl/00001KVFD3YSV-plugin-cli-inspection`
+- commits:
+  - `462de32a` — initial implementation
+  - `b5f10ab7` — status vocabulary fix
+  - `dfa966db` — package path / API-schema version metadata fix
+  - `982a1b75` — static Tool schema/name validation fix
+  - `a5f3b0b5` — configured invalid/incompatible package status fix
+
+Reviewer focus:
+- previous configured invalid/incompatible package status blocker が解消されているか。
+- `missing` が本当に absent の enabled/configured package refs にだけ使われるか。
+- configured invalid manifest / incompatible API cases が JSON/human output tests で覆われているか。
+- prior fixes: status vocabulary、package path/API fields、Tool schema validation、read-only/no-execution、bounded diagnostics が維持されているか。
+- original Ticket acceptance と future `https` / `fs` host API inspection extension を妨げていないか。
+
+Next:
+- Reviewer output を確認し、approve なら Orchestrator worktree への merge/validation/cleanup/close-ready 処理へ進む。request_changes なら blocker を記録して Coder に戻す。
+
+---
