@@ -1263,3 +1263,93 @@ Outcome:
 - Root/original workspace was not read/written/merged/validated for this Ticket, per Panel Queue instruction.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-19T14:22:09Z -->
+
+## Implementation report
+
+Cleanup report:
+
+Plugin CLI inspection Ticket の implementation/review Pods と child worktree を cleanup した。
+
+Stopped Pods:
+- `yoi-coder-00001KVFD3YSV`
+- `yoi-reviewer-00001KVFD3YSV-r6`
+
+Removed child implementation worktree:
+- `/home/hare/Projects/yoi/.worktree/00001KVFD3YSV-plugin-cli-inspection`
+
+Deleted merged implementation branch:
+- `impl/00001KVFD3YSV-plugin-cli-inspection` at `0142ef1d`
+
+Orchestrator branch remains the integration authority for this completed work. Root/original workspace was not touched for this Ticket, per Panel Queue instruction.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-19T14:22:19Z from: inprogress to: done reason: merged_validated_review_approved field: state -->
+
+## State changed
+
+Implementation commits `462de32a`, `b5f10ab7`, `dfa966db`, `982a1b75`, `a5f3b0b5`, and `0142ef1d` were reviewed after blocker resolution, approved, merged into the Orchestrator branch as `71ca05c8`, validated in the Orchestrator worktree, and child implementation resources were cleaned up. Requirements and acceptance criteria are satisfied for this Ticket. Root/original workspace was not operated on for this Ticket per Panel Queue instruction.
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-19T14:22:41Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-19T14:22:41Z status: closed -->
+
+## 完了
+
+Ticket `00001KVFD3YSV` is complete.
+
+Completed implementation:
+- Added read-only Plugin inspection CLI commands:
+  - `yoi plugin list`
+  - `yoi plugin show <ref>`
+  - JSON output support.
+- Added typed Plugin inspection report used by both JSON and human output.
+- Inspection reports package path/location, schema/API version, source/ref/digest/version, requested permissions, grants/denials, diagnostics, Tool/static eligibility, and future host API eligibility structure.
+- Status vocabulary is limited to `active`, `disabled`, `missing`, `rejected`, `partial`.
+- Implemented static Tool definition inspection for invalid/duplicate Tool names and invalid `input_schema`.
+- Distinguished truly absent configured package refs (`missing`) from present-but-invalid packages (`rejected`), including `Missing` diagnostics for missing root `plugin.toml` or missing referenced runtime/package entries.
+- Preserved read-only/no-execution behavior: inspection does not execute Plugin WASM or Tool code.
+- Kept diagnostics bounded and structured.
+
+Reviewed / merged:
+- Implementation commits:
+  - `462de32a` (`plugin: add cli inspection`)
+  - `b5f10ab7` (`plugin: align inspection statuses`)
+  - `dfa966db` (`plugin: report inspection package metadata`)
+  - `982a1b75` (`plugin: validate inspected tool schemas`)
+  - `a5f3b0b5` (`plugin: reject configured invalid packages`)
+  - `0142ef1d` (`plugin: distinguish present invalid packages`)
+- Multiple review rounds requested and verified fixes for status vocabulary, package metadata fields, Tool schema/name validation, configured invalid package status, and present-but-invalid `Missing` diagnostics.
+- Final review `yoi-reviewer-00001KVFD3YSV-r6` approved with no blockers.
+- Orchestrator merge commit: `71ca05c8` (`merge: plugin cli inspection`)
+
+Validation in Orchestrator worktree:
+- `cargo fmt --check` — passed
+- `cargo check -p yoi -p pod -p manifest` — passed
+- `cargo test -p yoi plugin -- --nocapture` — passed; 11 passed, 0 failed
+- `cargo test -p pod static_inspection -- --nocapture` — passed; 4 passed, 0 failed
+- `cargo test -p pod plugin -- --nocapture` — passed; 31 passed, 0 failed
+- `cargo test -p manifest plugin -- --nocapture` — passed; 17 passed, 0 failed
+- `git diff --check` — passed
+- `nix build .#yoi --no-link` — passed
+
+Cleanup:
+- Stopped Coder Pod `yoi-coder-00001KVFD3YSV`.
+- Stopped Reviewer Pod `yoi-reviewer-00001KVFD3YSV-r6`.
+- Removed child worktree `/home/hare/Projects/yoi/.worktree/00001KVFD3YSV-plugin-cli-inspection`.
+- Deleted merged branch `impl/00001KVFD3YSV-plugin-cli-inspection`.
+
+Root/original workspace was not read/written/merged/validated for this Ticket, per Panel Queue instruction. The completed work is integrated on the Orchestrator branch.
+
+---

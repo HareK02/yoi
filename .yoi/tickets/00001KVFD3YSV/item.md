@@ -1,8 +1,8 @@
 ---
 title: 'Plugin: add read-only CLI inspection list/show'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-06-19T07:39:23Z'
-updated_at: '2026-06-19T14:21:26Z'
+updated_at: '2026-06-19T14:22:41Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['plugin', 'cli', 'diagnostics', 'read-only', 'json-output', 'no-execution']
