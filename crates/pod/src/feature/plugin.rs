@@ -18,6 +18,7 @@ use manifest::plugin::{
     PluginConfig, PluginDiscoveryLimits, PluginHostApi, PluginPermission, PluginSurface,
     PluginToolManifest, ResolvedPluginRecord, read_resolved_plugin_runtime_module,
 };
+use serde::Serialize;
 use serde_json::Value;
 
 use super::{
@@ -73,6 +74,204 @@ impl PluginToolFeature {
             package_api_version: self.record.manifest.schema_version,
             surface: "tool".into(),
         }
+    }
+}
+
+/// Static, read-only eligibility information for a resolved plugin package.
+///
+/// This inspection mirrors the registration-time permission checks without
+/// loading the WASM module, calling a plugin Tool, or executing plugin code.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PluginStaticInspection {
+    pub runtime: PluginRuntimeEligibility,
+    pub host_apis: Vec<PluginPermissionEligibility>,
+    pub tools: Vec<PluginToolEligibility>,
+}
+
+impl PluginStaticInspection {
+    pub fn statically_eligible(&self) -> bool {
+        self.runtime.eligible
+            && self.host_apis.iter().all(|api| api.eligible)
+            && self.tools.iter().all(|tool| tool.eligible)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PluginRuntimeEligibility {
+    pub eligible: bool,
+    pub status: String,
+    pub diagnostic: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PluginPermissionEligibility {
+    pub permission: String,
+    pub requested: bool,
+    pub granted: bool,
+    pub eligible: bool,
+    pub diagnostic: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PluginToolEligibility {
+    pub name: String,
+    pub permission: String,
+    pub requested: bool,
+    pub granted: bool,
+    pub eligible: bool,
+    pub external_write: bool,
+    pub diagnostic: Option<String>,
+}
+
+/// Inspect static plugin runtime/tool eligibility without executing plugin code.
+pub fn inspect_resolved_plugin_static(record: &ResolvedPluginRecord) -> PluginStaticInspection {
+    let runtime = match &record.manifest.runtime {
+        Some(runtime)
+            if runtime.kind == "wasm" && runtime.abi.as_deref() == Some("yoi-plugin-wasm-1") =>
+        {
+            PluginRuntimeEligibility {
+                eligible: true,
+                status: "wasm/yoi-plugin-wasm-1".to_string(),
+                diagnostic: None,
+            }
+        }
+        Some(runtime) if runtime.kind == "wasm" => {
+            let status = runtime
+                .abi
+                .as_deref()
+                .map(|abi| format!("wasm/{abi}"))
+                .unwrap_or_else(|| "wasm/<missing-abi>".to_string());
+            PluginRuntimeEligibility {
+                eligible: false,
+                status,
+                diagnostic: Some("unsupported or missing plugin runtime ABI".to_string()),
+            }
+        }
+        Some(runtime) => PluginRuntimeEligibility {
+            eligible: false,
+            status: runtime.kind.clone(),
+            diagnostic: Some(format!(
+                "unsupported plugin runtime kind `{}`",
+                runtime.kind
+            )),
+        },
+        None => PluginRuntimeEligibility {
+            eligible: false,
+            status: "none".to_string(),
+            diagnostic: Some("plugin runtime is not declared".to_string()),
+        },
+    };
+
+    let host_apis = [PluginHostApi::Https, PluginHostApi::Fs]
+        .into_iter()
+        .filter_map(|api| {
+            let permission = PluginPermission::host_api(api);
+            let requested = permission_requested(record, &permission);
+            let granted = grant_allows(record, &permission);
+            if !requested && !granted {
+                return None;
+            }
+            let diagnostic = authorize_plugin_host_api(record, api)
+                .err()
+                .map(|error| error.bounded_message());
+            Some(PluginPermissionEligibility {
+                permission: permission.label(),
+                requested,
+                granted,
+                eligible: diagnostic.is_none(),
+                diagnostic,
+            })
+        })
+        .collect();
+
+    let duplicate_tool_names = duplicate_tool_names(record);
+    let tools = record
+        .manifest
+        .tools
+        .iter()
+        .map(|tool| {
+            let permission = PluginPermission::tool(&tool.name);
+            let requested = permission_requested(record, &permission);
+            let granted = grant_allows(record, &permission);
+            let mut diagnostics = validate_plugin_tool_definition(tool, &duplicate_tool_names);
+            if let Err(error) = authorize_plugin_tool(record, tool) {
+                diagnostics.push(error.bounded_message());
+            }
+            let diagnostic = join_tool_diagnostics(diagnostics);
+            PluginToolEligibility {
+                name: tool.name.clone(),
+                permission: permission.label(),
+                requested,
+                granted,
+                eligible: diagnostic.is_none(),
+                external_write: tool.external_write,
+                diagnostic,
+            }
+        })
+        .collect();
+
+    PluginStaticInspection {
+        runtime,
+        host_apis,
+        tools,
+    }
+}
+
+fn permission_requested(record: &ResolvedPluginRecord, permission: &PluginPermission) -> bool {
+    record
+        .manifest
+        .permissions
+        .iter()
+        .any(|requested| requested == permission)
+}
+
+fn grant_allows(record: &ResolvedPluginRecord, permission: &PluginPermission) -> bool {
+    record
+        .grants
+        .permissions
+        .iter()
+        .any(|granted| granted == permission)
+}
+
+fn duplicate_tool_names(record: &ResolvedPluginRecord) -> HashSet<String> {
+    let mut seen = HashSet::new();
+    let mut duplicates = HashSet::new();
+    for tool in &record.manifest.tools {
+        if !seen.insert(tool.name.clone()) {
+            duplicates.insert(tool.name.clone());
+        }
+    }
+    duplicates
+}
+
+fn validate_plugin_tool_definition(
+    tool: &PluginToolManifest,
+    duplicate_tool_names: &HashSet<String>,
+) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    if duplicate_tool_names.contains(&tool.name) {
+        diagnostics.push(format!(
+            "tool `{}` has duplicate name within plugin manifest",
+            tool.name
+        ));
+    }
+    if let Err(reason) = validate_tool_name(&tool.name) {
+        diagnostics.push(format!("tool `{}` has invalid name: {reason}", tool.name));
+    }
+    if let Err(reason) = validate_input_schema(&tool.input_schema) {
+        diagnostics.push(format!(
+            "tool `{}` has invalid input_schema: {reason}",
+            tool.name
+        ));
+    }
+    diagnostics
+}
+
+fn join_tool_diagnostics(diagnostics: Vec<String>) -> Option<String> {
+    if diagnostics.is_empty() {
+        None
+    } else {
+        Some(bounded_message(diagnostics.join("; ")))
     }
 }
 
@@ -1663,6 +1862,111 @@ input_schema = { type = "object", additionalProperties = true }
             .iter()
             .map(|byte| format!(r#"\{:02x}"#, byte))
             .collect()
+    }
+
+    #[test]
+    fn static_inspection_does_not_read_or_execute_package() {
+        let mut record = record(vec![tool("Echo")]);
+        record.package_path = std::path::PathBuf::from("/no/such/plugin.wasm");
+        record.manifest.runtime = Some(PluginRuntimeManifest {
+            kind: "wasm".to_string(),
+            entry: "plugin.wasm".to_string(),
+            abi: Some("yoi-plugin-wasm-1".to_string()),
+        });
+
+        let inspection = inspect_resolved_plugin_static(&record);
+
+        assert!(inspection.runtime.eligible);
+        assert_eq!(inspection.tools.len(), 1);
+        assert!(inspection.tools[0].eligible);
+        assert!(inspection.statically_eligible());
+    }
+
+    #[test]
+    fn static_inspection_reports_missing_tool_grant() {
+        let mut record = record(vec![tool("Echo")]);
+        record.manifest.runtime = Some(PluginRuntimeManifest {
+            kind: "wasm".to_string(),
+            entry: "plugin.wasm".to_string(),
+            abi: Some("yoi-plugin-wasm-1".to_string()),
+        });
+        record.grants.permissions = vec![PluginPermission::surface(PluginSurface::Tool)];
+
+        let inspection = inspect_resolved_plugin_static(&record);
+
+        assert!(!inspection.statically_eligible());
+        assert!(!inspection.tools[0].eligible);
+        assert!(
+            inspection.tools[0]
+                .diagnostic
+                .as_deref()
+                .unwrap_or_default()
+                .contains("grant")
+        );
+    }
+
+    #[test]
+    fn static_inspection_reports_invalid_tool_definition() {
+        let mut bad_schema = tool("Echo");
+        bad_schema.input_schema = json!({"type":"string"});
+        let mut record = record(vec![bad_schema]);
+        record.manifest.runtime = Some(PluginRuntimeManifest {
+            kind: "wasm".to_string(),
+            entry: "plugin.wasm".to_string(),
+            abi: Some("yoi-plugin-wasm-1".to_string()),
+        });
+
+        let inspection = inspect_resolved_plugin_static(&record);
+
+        assert!(!inspection.statically_eligible());
+        assert!(!inspection.tools[0].eligible);
+        let diagnostic = inspection.tools[0]
+            .diagnostic
+            .as_deref()
+            .unwrap_or_default();
+        assert!(diagnostic.contains("invalid input_schema"));
+        assert!(diagnostic.contains("root schema type must be `object`"));
+    }
+
+    #[test]
+    fn static_inspection_reports_invalid_and_duplicate_tool_names() {
+        let mut invalid = tool("Bad Tool");
+        invalid.input_schema = json!({"type":"object"});
+        let mut first_duplicate = tool("Echo");
+        let mut second_duplicate = tool("Echo");
+        first_duplicate.input_schema = json!({"type":"object"});
+        second_duplicate.input_schema = json!({"type":"object"});
+        let mut record = record(vec![invalid, first_duplicate, second_duplicate]);
+        record.manifest.runtime = Some(PluginRuntimeManifest {
+            kind: "wasm".to_string(),
+            entry: "plugin.wasm".to_string(),
+            abi: Some("yoi-plugin-wasm-1".to_string()),
+        });
+
+        let inspection = inspect_resolved_plugin_static(&record);
+
+        assert!(!inspection.statically_eligible());
+        assert!(
+            inspection.tools[0]
+                .diagnostic
+                .as_deref()
+                .unwrap_or_default()
+                .contains("invalid name")
+        );
+        assert!(
+            inspection.tools[1]
+                .diagnostic
+                .as_deref()
+                .unwrap_or_default()
+                .contains("duplicate name")
+        );
+        assert!(
+            inspection.tools[2]
+                .diagnostic
+                .as_deref()
+                .unwrap_or_default()
+                .contains("duplicate name")
+        );
     }
 
     fn write_stored_zip(path: &Path, files: &[(&str, &[u8])]) {
