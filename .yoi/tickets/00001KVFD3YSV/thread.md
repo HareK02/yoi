@@ -135,3 +135,52 @@ Next:
 - Coder は read-only Plugin CLI inspection、focused tests、validation、implementation commit を行い、実装報告を返す予定。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-19T11:03:00Z -->
+
+## Implementation report
+
+Coder implementation report received / Orchestrator validation:
+
+Implementation commit:
+- `462de32a` — `plugin: add cli inspection`
+
+Summary:
+- Product CLI に read-only Plugin inspection commands を追加。
+  - `yoi plugin list`
+  - `yoi plugin show <ref>`
+  - `--json` support
+- Typed inspection report / formatting を追加し、human output は typed report の thin formatting として実装。
+- Plugin resolver / diagnostics から package discovery、enablement、source/ref/digest/version、requested permissions、grants、tool/runtime static eligibility、diagnostics を inspection output に出せるようにした。
+- Inspection path は Plugin WASM / Tool execution を行わない前提で実装。
+- Bounded diagnostics / JSON-friendly structure を追加。
+
+Files changed:
+- `crates/manifest/src/plugin.rs`
+- `crates/pod/src/feature/plugin.rs`
+- `crates/yoi/src/main.rs`
+- `crates/yoi/src/plugin_cli.rs`
+
+Orchestrator evidence checked:
+- Pod output notification を確認。
+- implementation worktree は clean。
+- branch `impl/00001KVFD3YSV-plugin-cli-inspection` HEAD は `462de32a`。
+- merge-base `d51b610f` からの diff stat: 4 files changed, 1160 insertions, 2 deletions。
+- `git diff --check $(git merge-base HEAD orchestration)..HEAD` — passed。
+
+Validation re-run by Orchestrator in implementation worktree:
+- `cargo fmt --check` — passed
+- `cargo check -p yoi -p pod -p manifest` — passed
+- `cargo test -p yoi plugin -- --nocapture` — passed; 4 passed, 0 failed
+- `cargo test -p pod plugin -- --nocapture` — passed; 29 passed, 0 failed
+- `cargo test -p manifest plugin -- --nocapture` — passed; 17 passed, 0 failed
+- `git diff --check` — passed
+- `nix build .#yoi --no-link` — passed
+
+Routing classification: review_needed
+
+Next action:
+- recorded intent / invariants / acceptance criteria に照らして、read-only Reviewer Pod で外部レビューする。
+- 特に read-only/no-execution、JSON typed structure、bounded diagnostics、grant mismatch/no grant/invalid/ambiguous ref coverage、secrets leakage avoidance、product CLI / lower crate boundary、future host API extension point を確認する。
+
+---
