@@ -588,3 +588,33 @@ Validation note:
 - Reviewer performed static code/diff review and relied on Orchestrator-reported cargo/nix validation. No mutations were made by Reviewer.
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-19T11:42:23Z -->
+
+## Plan
+
+Review follow-up dispatch:
+
+Reviewer `yoi-reviewer-00001KVFD3YSV-r3` は `request_changes` を返したため、Ticket review として記録し、既存 Coder Pod `yoi-coder-00001KVFD3YSV` に修正依頼を送った。
+
+Resolved:
+- Status vocabulary blocker は解消済み。
+- Package path/location + API/schema version blocker も解消済み。
+
+Remaining blocker:
+- Static inspection が Tool definition/schema validity を検証していないため、invalid Tool schema が `active` として報告され得る。
+- Runtime registration path は `validate_tool_name(...)` と `validate_input_schema(...)` を実行しているが、read-only inspection path の `inspect_resolved_plugin_static` は runtime ABI / host API permission / `authorize_plugin_tool(...)` grant check に留まり、同じ static Tool-definition validity を mirror していない。
+- Ticket intent は “tool schema [is] valid” の inspection と `invalid schema` を `rejected` として扱うことを要求している。
+
+Required fixes sent to Coder:
+- Static inspection に、registration path と同等の static Tool definition validity を追加する。少なくとも Tool name と `input_schema` validation を含める。
+- Invalid tool name / invalid input schema は bounded diagnostics にする。
+- affected tool/package は全 tools invalid/unusable なら `rejected`、一部 usable / 一部 invalid なら `partial` として表現する。
+- invalid Tool schema behavior の focused JSON/human tests を追加する。
+- read-only/no-execution behavior を維持する。
+
+Next:
+- Coder の修正 commit / validation report を待つ。
+- 修正後、static inspection schema validity / no-execution / typed status semantics を中心に再レビューする。
+
+---
