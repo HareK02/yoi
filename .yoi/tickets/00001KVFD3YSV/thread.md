@@ -309,3 +309,44 @@ Next:
 - 修正後、同じ CLI contract / read-only no-execution / bounded diagnostics focus で再レビューする。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-19T11:17:04Z -->
+
+## Implementation report
+
+Coder review-fix implementation report received / Orchestrator validation:
+
+Incremental fix commit:
+- `b5f10ab7` — `plugin: align inspection statuses`
+
+Summary:
+- Plugin inspection typed report / JSON / human output の status vocabulary を Ticket 指定の `active`, `disabled`, `missing`, `rejected`, `partial` に合わせた。
+- `partial` status を mixed eligibility / diagnostics のある usable package として表現。
+- Human `yoi plugin list` output に enabled surfaces を含めるように更新。
+- JSON list/show structure と status vocabulary を tests で pin。
+- active / disabled / missing / rejected / partial、missing grant、ambiguous ref、no-execution などの CLI contract coverage を補強。
+
+Files changed in incremental fix:
+- `crates/yoi/src/plugin_cli.rs`
+
+Orchestrator evidence checked:
+- Pod output notification を確認。
+- implementation worktree は clean。
+- branch `impl/00001KVFD3YSV-plugin-cli-inspection` HEAD は `b5f10ab7`。
+- incremental diff stat from previous review target `462de32a..b5f10ab7`: 1 file changed, 266 insertions, 42 deletions。
+
+Validation re-run by Orchestrator in implementation worktree:
+- `cargo fmt --check` — passed
+- `cargo check -p yoi -p pod -p manifest` — passed
+- `cargo test -p yoi plugin -- --nocapture` — passed; 8 passed, 0 failed
+- `cargo test -p pod plugin -- --nocapture` — passed; 29 passed, 0 failed
+- `cargo test -p manifest plugin -- --nocapture` — passed; 17 passed, 0 failed
+- `git diff --check` — passed
+- `nix build .#yoi --no-link` — passed
+
+Routing classification: review_needed
+
+Next action:
+- previous `request_changes` blocker が解消されたか、read-only Reviewer Pod で再レビューする。
+
+---
