@@ -1511,6 +1511,17 @@ const PLUGIN_FS_MAX_READ_BYTES: usize = 64 * 1024;
 const PLUGIN_FS_MAX_WRITE_BYTES: usize = 64 * 1024;
 const PLUGIN_FS_MAX_LIST_ENTRIES: usize = 256;
 
+fn wasm_component_store_limits() -> wasmtime::StoreLimits {
+    wasmtime::StoreLimitsBuilder::new()
+        .memory_size(PLUGIN_WASM_MEMORY_BYTES)
+        .table_elements(PLUGIN_WASM_TABLE_ELEMENTS)
+        .instances(1)
+        .tables(1)
+        .memories(1)
+        .trap_on_grow_failure(true)
+        .build()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PluginFsRuntimeOperation {
     Read,
@@ -1916,6 +1927,7 @@ fn run_plugin_wasm_tool_with_https_client(
 struct PluginComponentHostState {
     record: ResolvedPluginRecord,
     https_client: Arc<dyn PluginHttpsClient>,
+    store_limits: wasmtime::StoreLimits,
 }
 
 fn run_plugin_component_tool(
@@ -1981,8 +1993,10 @@ fn run_plugin_component_tool_with_https_client(
         PluginComponentHostState {
             record: record.clone(),
             https_client,
+            store_limits: wasm_component_store_limits(),
         },
     );
+    store.limiter(|state| &mut state.store_limits);
     store
         .set_fuel(PLUGIN_WASM_FUEL)
         .map_err(|error| PluginWasmError::Execution(error.to_string()))?;
@@ -2000,6 +2014,12 @@ fn run_plugin_component_tool_with_https_client(
     let input_json = std::str::from_utf8(&input).map_err(|error| {
         PluginWasmError::Output(format!("plugin component input is not UTF-8: {error}"))
     })?;
+    // Wasmtime lifts the returned WIT `string` into a host `String` before the
+    // ordinary ToolOutput JSON cap can be applied. Keep the component store on
+    // the same memory/table/instance limits as the raw WASM runtime so an
+    // untrusted component can only force host string allocation from bounded
+    // component memory; oversized memories/tables/instances fail closed during
+    // instantiation/growth before this lift succeeds.
     let (output,) = call
         .call(&mut store, (&tool_name, input_json))
         .map_err(|error| PluginWasmError::Execution(error.to_string()))?;
@@ -4070,10 +4090,14 @@ input_schema = {{ type = "object", additionalProperties = true }}
     }
 
     fn component_tool_that_returns(output: &[u8]) -> Vec<u8> {
+        component_tool_with_memory_pages(output, 1)
+    }
+
+    fn component_tool_with_memory_pages(output: &[u8], memory_pages: usize) -> Vec<u8> {
         wat::parse_str(format!(
             r#"(component
               (core module $m
-                (memory (export "memory") 1)
+                (memory (export "memory") {})
                 (func (export "realloc") (param i32 i32 i32 i32) (result i32)
                   (if (result i32) (i32.eqz (local.get 0))
                     (then (i32.const 8192))
@@ -4092,6 +4116,38 @@ input_schema = {{ type = "object", additionalProperties = true }}
               (func $call (type $call_ty) (canon lift (core func $call_core) (memory $mem) (realloc $realloc) string-encoding=utf8))
               (export "call" (func $call))
             )"#,
+            memory_pages,
+            wat_bytes(output),
+            output.len()
+        ))
+        .expect("valid component wat")
+    }
+
+    fn component_tool_with_table_elements(output: &[u8], table_elements: usize) -> Vec<u8> {
+        wat::parse_str(format!(
+            r#"(component
+              (core module $m
+                (memory (export "memory") 1)
+                (table {} funcref)
+                (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+                  (if (result i32) (i32.eqz (local.get 0))
+                    (then (i32.const 8192))
+                    (else (local.get 0))))
+                (data (i32.const 1024) "{}")
+                (func (export "call") (param i32 i32 i32 i32) (result i32)
+                  (i32.store (i32.const 2048) (i32.const 1024))
+                  (i32.store (i32.const 2052) (i32.const {}))
+                  (i32.const 2048))
+              )
+              (core instance $i (instantiate $m))
+              (alias core export $i "memory" (core memory $mem))
+              (alias core export $i "realloc" (core func $realloc))
+              (alias core export $i "call" (core func $call_core))
+              (type $call_ty (func (param "tool-name" string) (param "input-json" string) (result string)))
+              (func $call (type $call_ty) (canon lift (core func $call_core) (memory $mem) (realloc $realloc) string-encoding=utf8))
+              (export "call" (func $call))
+            )"#,
+            table_elements,
             wat_bytes(output),
             output.len()
         ))
@@ -4148,6 +4204,48 @@ input_schema = {{ type = "object", additionalProperties = true }}
 
         assert_eq!(output.summary, "component ok");
         assert_eq!(output.content.as_deref(), Some("ordinary tool result path"));
+    }
+
+    #[test]
+    fn component_memory_limit_fails_closed_before_string_lift() {
+        let oversized_memory_pages = (PLUGIN_WASM_MEMORY_BYTES / 65_536) + 1;
+        let (_dir, record) = resolved_record_with_component(component_tool_with_memory_pages(
+            br#"{"summary":"should not lift"}"#,
+            oversized_memory_pages,
+        ));
+
+        let error = run_plugin_component_tool(record, "PluginEcho".to_string(), b"{}".to_vec())
+            .expect_err("component memory limit is enforced");
+
+        assert!(format!("{error:?}").contains("growing memory"), "{error:?}");
+    }
+
+    #[test]
+    fn component_table_limit_fails_closed() {
+        let (_dir, record) = resolved_record_with_component(component_tool_with_table_elements(
+            br#"{"summary":"should not run"}"#,
+            PLUGIN_WASM_TABLE_ELEMENTS + 1,
+        ));
+
+        let error = run_plugin_component_tool(record, "PluginEcho".to_string(), b"{}".to_vec())
+            .expect_err("component table limit is enforced");
+
+        assert!(format!("{error:?}").contains("growing table"), "{error:?}");
+    }
+
+    #[test]
+    fn component_output_cap_still_fails_closed_after_bounded_lift() {
+        let output = format!(
+            r#"{{"summary":"too big","content":"{}"}}"#,
+            "x".repeat(PLUGIN_WASM_MAX_OUTPUT_BYTES)
+        );
+        let (_dir, record) =
+            resolved_record_with_component(component_tool_with_memory_pages(output.as_bytes(), 2));
+
+        let error = run_plugin_component_tool(record, "PluginEcho".to_string(), b"{}".to_vec())
+            .expect_err("component output cap is enforced");
+
+        assert!(format!("{error:?}").contains("output exceeds"), "{error:?}");
     }
 
     #[test]

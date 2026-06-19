@@ -165,3 +165,13 @@ See `docs/examples/plugin-component-tool/lib.rs` for a minimal
 `wit-bindgen`/SDK-style authoring sketch. Package authors should generate
 bindings from `resources/plugin/wit`, build a component artifact, and set the
 component runtime metadata above.
+
+### v1 request/response shape
+
+The v1 component world intentionally keeps Tool input, Tool output, and host API
+payloads as JSON strings. This is a migration bridge that preserves the existing
+ToolOutput schema, Tool history behavior, grant checks, and raw-Wasm host API
+semantics while moving package authors onto WIT/canonical ABI bindings.
+Structured WIT records for Tool requests/responses/errors and host HTTPS/FS
+payloads are deferred to a follow-up API-design step rather than accidentally
+omitted.
