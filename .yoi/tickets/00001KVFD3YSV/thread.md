@@ -1031,3 +1031,33 @@ Requested changes:
 - Preserve all prior fixes and validation behavior.
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-19T14:03:32Z -->
+
+## Plan
+
+Review follow-up dispatch:
+
+Reviewer `yoi-reviewer-00001KVFD3YSV-r5` は `request_changes` を返したため、Ticket review として記録し、既存 Coder Pod `yoi-coder-00001KVFD3YSV` に修正依頼を送った。
+
+Resolved:
+- Status vocabulary、package path/schema/API fields、Tool name / `input_schema` static validation、read-only/static inspection path、bounded diagnostics、future `https`/`fs` host API inspection structure は維持されている。
+
+Remaining blocker:
+- `missing` が truly absent configured/enabled package refs だけに限定されていない。
+- Existing invalid package が diagnostic kind `Missing` を持つ場合、configured-but-not-discovered item として `missing` になり得る。
+- 例: package file exists but root `plugin.toml` is absent、または manifest references a missing path/runtime entry。
+
+Required fixes sent to Coder:
+- truly absent enabled package refs と present-but-invalid package diagnostics を、diagnostic kind が `missing` でも区別する。
+- configured package-present-but-invalid cases は `rejected` + diagnostics として報告する。
+- JSON/human output coverage を追加する。例:
+  - `.yoi/plugins/foo.yoi-plugin` exists but root `plugin.toml` is absent;
+  - manifest references a missing runtime/path entry。
+- Prior fixes と validation behavior を維持する。
+
+Next:
+- Coder の修正 commit / validation report を待つ。
+- 修正後、present-but-invalid package の `rejected` semantics を中心に再レビューする。
+
+---
