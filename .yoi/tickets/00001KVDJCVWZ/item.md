@@ -1,8 +1,8 @@
 ---
 title: 'Orchestrator Ticket event Companion notify の peer registration / diagnostics を修正する'
-state: 'done'
+state: 'closed'
 created_at: '2026-06-18T14:33:09Z'
-updated_at: '2026-06-18T14:33:50Z'
+updated_at: '2026-06-19T07:52:14Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['orchestrator', 'companion', 'peer-notify', 'ticket-event', 'auto-run-false', 'diagnostics']

@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KVFD3YSV",
+      "kind": "depends_on",
+      "target": "00001KV5R5V2S",
+      "note": "CLI inspection consumes Plugin package discovery and enablement resolver output.",
+      "author": "yoi ticket",
+      "at": "2026-06-19T07:40:41Z"
+    },
+    {
+      "ticket_id": "00001KVFD3YSV",
+      "kind": "depends_on",
+      "target": "00001KV5W3PJ3",
+      "note": "CLI inspection should expose permission/grant diagnostics from the implemented grant model.",
+      "author": "yoi ticket",
+      "at": "2026-06-19T07:40:41Z"
+    },
+    {
+      "ticket_id": "00001KVFD3YSV",
+      "kind": "related",
+      "target": "00001KSXRQ4G8",
+      "note": "Uses established Plugin runtime/surface/host API terminology.",
+      "author": "yoi ticket",
+      "at": "2026-06-19T07:40:41Z"
+    },
+    {
+      "ticket_id": "00001KVFD3YSV",
+      "kind": "related",
+      "target": "00001KV5W3PHA",
+      "note": "Tool surface registration status should be visible in inspection output.",
+      "author": "yoi ticket",
+      "at": "2026-06-19T07:40:41Z"
+    },
+    {
+      "ticket_id": "00001KVFD3YSV",
+      "kind": "related",
+      "target": "00001KV5W3PHW",
+      "note": "Runtime config/status should be shown without executing Plugin code.",
+      "author": "yoi ticket",
+      "at": "2026-06-19T07:40:41Z"
+    }
+  ]
+}
