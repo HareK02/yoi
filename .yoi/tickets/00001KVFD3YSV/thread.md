@@ -982,3 +982,52 @@ Next:
 - Reviewer output を確認し、approve なら Orchestrator worktree への merge/validation/cleanup/close-ready 処理へ進む。request_changes なら blocker を記録して Coder に戻す。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVFD3YSV-r5 at: 2026-06-19T14:02:39Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+対象:
+- Ticket: `00001KVFD3YSV`
+- branch: `impl/00001KVFD3YSV-plugin-cli-inspection`
+- commits:
+  - `462de32a` — `plugin: add cli inspection`
+  - `b5f10ab7` — `plugin: align inspection statuses`
+  - `dfa966db` — `plugin: report inspection package metadata`
+  - `982a1b75` — `plugin: validate inspected tool schemas`
+  - `a5f3b0b5` — `plugin: reject configured invalid packages`
+
+Result: request_changes
+
+Blocker:
+- `missing` is still not limited to truly absent configured/enabled package refs.
+
+Evidence:
+- `crates/yoi/src/plugin_cli.rs` classifies configured-but-not-discovered items as `rejected` only when any diagnostic kind is not `"missing"`; otherwise it reports `missing`.
+- Discovery/manifest diagnostics for an existing invalid package can also have kind `Missing`, for example:
+  - package file exists but root `plugin.toml` is absent;
+  - package file exists and manifest references a missing path/runtime entry.
+- Those diagnostics are attached back to the package item by source/package label.
+- Therefore an enabled `project:foo` with `.yoi/plugins/foo.yoi-plugin` present but missing `plugin.toml`, or with a manifest referencing a missing entry, can still be reported as `[missing]` rather than `[rejected]`.
+- The new test covers malformed TOML and incompatible API/schema cases, but not invalid packages whose diagnostic kind is `missing`.
+
+Why this blocks acceptance:
+- Ticket semantics require `missing` only for truly absent enabled/configured package refs.
+- Existing-but-invalid packages with missing internal files or missing referenced runtime entries should be `rejected` with diagnostics, not `missing`.
+
+Prior fixes still appear intact:
+- Status strings are limited to `partial`, `active`, `rejected`, `disabled`, `missing`.
+- Package path/schema/API fields are present in list/show and tested.
+- Tool name / `input_schema` static validation is preserved and tested.
+- Read-only/static inspection path is preserved.
+- Diagnostics/list output remain bounded.
+- Future `https` / `fs` host API inspection remains structurally represented.
+
+Requested changes:
+- Distinguish truly absent enabled package refs from present-but-invalid package diagnostics even when diagnostic kind is `missing`.
+- Add JSON and human-output coverage for configured package-present-but-invalid cases such as missing root `plugin.toml` and/or missing referenced runtime entry.
+- Preserve all prior fixes and validation behavior.
+
+---
