@@ -74,11 +74,13 @@ pub struct PluginGrantConfig {
     pub digest: Option<String>,
     /// Explicit capabilities granted for the pinned package identity/version/digest.
     pub permissions: Vec<PluginPermission>,
+    /// Bounded outbound HTTPS allowlist entries for `host_api.https`.
+    pub https: Vec<PluginHttpsGrant>,
 }
 
 impl PluginGrantConfig {
     pub fn is_empty(&self) -> bool {
-        self.permissions.is_empty()
+        self.permissions.is_empty() && self.https.is_empty()
     }
 
     pub fn binding_error(
@@ -87,7 +89,7 @@ impl PluginGrantConfig {
         digest: &str,
         version: &str,
     ) -> Option<&'static str> {
-        if self.permissions.is_empty() {
+        if self.is_empty() {
             return None;
         }
         let Some(grant_id) = &self.id else {
@@ -126,6 +128,33 @@ pub enum PluginPermission {
     ToolNamespace { namespace: String },
     ExternalWrite,
     HostApi { api: PluginHostApi },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PluginHttpsGrant {
+    /// Exact HTTPS request host allowed by this grant. Wildcards are intentionally unsupported.
+    pub host: String,
+    /// Uppercase HTTP methods allowed for this host, for example `GET` or `POST`.
+    pub methods: Vec<String>,
+    /// Optional path prefixes allowed for this host. Empty means any absolute path on the host.
+    pub path_prefixes: Vec<String>,
+}
+
+impl PluginHttpsGrant {
+    pub fn label(&self) -> String {
+        let methods = if self.methods.is_empty() {
+            "<no-methods>".to_string()
+        } else {
+            self.methods.join(",")
+        };
+        let paths = if self.path_prefixes.is_empty() {
+            "*".to_string()
+        } else {
+            self.path_prefixes.join(",")
+        };
+        format!("{} {} {}", self.host, methods, paths)
+    }
 }
 
 impl PluginPermission {
@@ -2052,6 +2081,7 @@ input_schema = { type = "object", properties = { query = { type = "string" } }, 
             version: Some(PluginExactVersion("0.1.0".to_string())),
             digest: Some(digest.clone()),
             permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
+            https: Vec::new(),
         };
         let resolution = resolve_enabled_plugins(
             &PluginConfig {
@@ -2077,18 +2107,21 @@ input_schema = { type = "object", properties = { query = { type = "string" } }, 
                 version: Some(PluginExactVersion("0.1.0".to_string())),
                 digest: Some(digest.clone()),
                 permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
+                https: Vec::new(),
             },
             PluginGrantConfig {
                 id: Some("project:example".to_string()),
                 version: Some(PluginExactVersion("0.1.1".to_string())),
                 digest: Some(digest.clone()),
                 permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
+                https: Vec::new(),
             },
             PluginGrantConfig {
                 id: Some("project:example".to_string()),
                 version: Some(PluginExactVersion("0.1.0".to_string())),
                 digest: Some("sha256:unrelated".to_string()),
                 permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
+                https: Vec::new(),
             },
         ] {
             let resolution = resolve_enabled_plugins(

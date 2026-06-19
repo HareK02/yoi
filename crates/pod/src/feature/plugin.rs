@@ -2,11 +2,14 @@
 //!
 //! This module registers *enabled* plugin package tool surface definitions and
 //! executes Tool calls through the minimal sandboxed `yoi-plugin-wasm-1` WASM
-//! ABI. It deliberately does not grant filesystem, network, environment, hook,
-//! service, ingress, or richer host API authority; those remain follow-up
-//! boundaries.
+//! ABI. It deliberately does not grant filesystem, environment, hook, service,
+//! ingress, or ambient network authority. WASM Tools can only reach outbound HTTPS
+//! through the explicit `yoi:https` host import plus matching permission and
+//! allowlist grants.
 
 use std::collections::HashSet;
+use std::io::Read as _;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +21,7 @@ use manifest::plugin::{
     PluginConfig, PluginDiscoveryLimits, PluginHostApi, PluginPermission, PluginSurface,
     PluginToolManifest, ResolvedPluginRecord, read_resolved_plugin_runtime_module,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
@@ -359,6 +362,486 @@ impl FeatureModule for PluginToolFeature {
     }
 }
 
+impl PluginHttpsClient for ReqwestPluginHttpsClient {
+    fn execute(
+        &self,
+        request: &PluginHttpsRequest,
+        url: &reqwest::Url,
+        limits: PluginHttpsLimits,
+    ) -> Result<PluginHttpsResponse, PluginHttpsError> {
+        let pinned_resolution = resolve_https_target_for_client(url, &SystemPluginHttpsResolver)?;
+        let method = reqwest::Method::from_bytes(request.method.as_bytes()).map_err(|_| {
+            PluginHttpsError::new(format!("unsupported HTTPS method `{}`", request.method))
+        })?;
+        let mut client_builder = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(limits.timeout)
+            .no_proxy()
+            .user_agent("yoi-plugin-https-host-api/0.1");
+        if let Some(pinned_resolution) = &pinned_resolution {
+            for domain in &pinned_resolution.domains {
+                client_builder = client_builder.resolve_to_addrs(domain, &pinned_resolution.addrs);
+            }
+        }
+        let client = client_builder.build().map_err(|error| {
+            PluginHttpsError::new(format!("HTTPS client build failed: {error}"))
+        })?;
+        let mut builder = client.request(method, url.clone()).timeout(limits.timeout);
+        for header in &request.headers {
+            let name =
+                reqwest::header::HeaderName::from_bytes(header.name.as_bytes()).map_err(|_| {
+                    PluginHttpsError::new(format!(
+                        "invalid HTTPS request header name `{}`",
+                        header.name
+                    ))
+                })?;
+            let value = reqwest::header::HeaderValue::from_str(&header.value).map_err(|_| {
+                PluginHttpsError::new(format!(
+                    "invalid HTTPS request header value for `{}`",
+                    header.name
+                ))
+            })?;
+            builder = builder.header(name, value);
+        }
+        if let Some(body) = &request.body {
+            builder = builder.body(body.clone());
+        }
+        let mut response = builder.send().map_err(|error| {
+            if error.is_timeout() {
+                PluginHttpsError::new(format!("HTTPS request to {} timed out", safe_url(url)))
+            } else {
+                PluginHttpsError::new(format!(
+                    "HTTPS request to {} failed: {error}",
+                    safe_url(url)
+                ))
+            }
+        })?;
+        let status = response.status().as_u16();
+        let headers = collect_https_response_headers(response.headers());
+        let mut body = Vec::new();
+        let read_limit = limits.max_response_bytes.saturating_add(1) as u64;
+        response
+            .by_ref()
+            .take(read_limit)
+            .read_to_end(&mut body)
+            .map_err(|error| {
+                PluginHttpsError::new(format!("HTTPS response read failed: {error}"))
+            })?;
+        let truncated = body.len() > limits.max_response_bytes;
+        if truncated {
+            body.truncate(limits.max_response_bytes);
+        }
+        Ok(PluginHttpsResponse {
+            status,
+            headers,
+            body: String::from_utf8_lossy(&body).into_owned(),
+            truncated,
+        })
+    }
+}
+
+fn execute_plugin_https_request(
+    record: &ResolvedPluginRecord,
+    client: &dyn PluginHttpsClient,
+    request_bytes: &[u8],
+) -> Result<Vec<u8>, PluginHttpsError> {
+    if request_bytes.len() > PLUGIN_HTTPS_MAX_REQUEST_BYTES {
+        return Err(PluginHttpsError::new(format!(
+            "HTTPS request descriptor exceeds {} bytes",
+            PLUGIN_HTTPS_MAX_REQUEST_BYTES
+        )));
+    }
+    authorize_plugin_host_api(record, PluginHostApi::Https).map_err(|error| {
+        PluginHttpsError::new(format!(
+            "plugin host API dispatch denied: {}",
+            error.bounded_message()
+        ))
+    })?;
+    let request: PluginHttpsRequest = serde_json::from_slice(request_bytes)
+        .map_err(|error| PluginHttpsError::new(format!("invalid HTTPS request JSON: {error}")))?;
+    let url = validate_plugin_https_request(record, &request)?;
+    let mut response = client.execute(&request, &url, PluginHttpsLimits::default())?;
+    enforce_https_response_bounds(&mut response, PluginHttpsLimits::default());
+    serde_json::to_vec(&response)
+        .map_err(|error| PluginHttpsError::new(format!("failed to encode HTTPS response: {error}")))
+}
+
+fn enforce_https_response_bounds(response: &mut PluginHttpsResponse, limits: PluginHttpsLimits) {
+    if response.body.len() > limits.max_response_bytes {
+        truncate_string_to_boundary(&mut response.body, limits.max_response_bytes);
+        response.truncated = true;
+    }
+    if response.headers.len() > PLUGIN_HTTPS_MAX_RESPONSE_HEADERS {
+        response.headers.truncate(PLUGIN_HTTPS_MAX_RESPONSE_HEADERS);
+    }
+    for header in &mut response.headers {
+        header.value = bounded_header_value(&header.value);
+    }
+}
+
+fn truncate_string_to_boundary(value: &mut String, max_len: usize) {
+    if value.len() <= max_len {
+        return;
+    }
+    let mut boundary = max_len;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+}
+
+fn validate_plugin_https_request(
+    record: &ResolvedPluginRecord,
+    request: &PluginHttpsRequest,
+) -> Result<reqwest::Url, PluginHttpsError> {
+    let method = request.method.trim().to_ascii_uppercase();
+    if method != request.method || !PLUGIN_HTTPS_ALLOWED_METHODS.contains(&method.as_str()) {
+        return Err(PluginHttpsError::new(format!(
+            "HTTPS method `{}` is not allowed",
+            request.method
+        )));
+    }
+    if request.headers.len() > PLUGIN_HTTPS_MAX_REQUEST_HEADERS {
+        return Err(PluginHttpsError::new(format!(
+            "HTTPS request has too many headers (max {})",
+            PLUGIN_HTTPS_MAX_REQUEST_HEADERS
+        )));
+    }
+    for header in &request.headers {
+        validate_https_header(header)?;
+    }
+    if let Some(body) = &request.body {
+        if body.len() > PLUGIN_HTTPS_MAX_REQUEST_BODY_BYTES {
+            return Err(PluginHttpsError::new(format!(
+                "HTTPS request body exceeds {} bytes",
+                PLUGIN_HTTPS_MAX_REQUEST_BODY_BYTES
+            )));
+        }
+    }
+    let url = reqwest::Url::parse(&request.url)
+        .map_err(|error| PluginHttpsError::new(format!("invalid HTTPS URL: {error}")))?;
+    if url.scheme() != "https" {
+        return Err(PluginHttpsError::new(format!(
+            "unsupported URL scheme {:?}; only https is allowed",
+            url.scheme()
+        )));
+    }
+    if url.host_str().is_none() {
+        return Err(PluginHttpsError::new("HTTPS URL must include a host"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(PluginHttpsError::new(
+            "HTTPS URLs with embedded credentials are not allowed",
+        ));
+    }
+    validate_static_https_target(&url)?;
+    authorize_https_allowlist(record, &method, &url)?;
+    Ok(url)
+}
+
+fn validate_https_header(header: &PluginHttpsHeader) -> Result<(), PluginHttpsError> {
+    if header.name.is_empty() || header.name.len() > PLUGIN_HTTPS_MAX_HEADER_NAME_BYTES {
+        return Err(PluginHttpsError::new(
+            "HTTPS request header name is invalid",
+        ));
+    }
+    if header.value.len() > PLUGIN_HTTPS_MAX_HEADER_VALUE_BYTES {
+        return Err(PluginHttpsError::new(format!(
+            "HTTPS request header `{}` exceeds {} bytes",
+            header.name, PLUGIN_HTTPS_MAX_HEADER_VALUE_BYTES
+        )));
+    }
+    if is_sensitive_header(&header.name) {
+        return Err(PluginHttpsError::new(format!(
+            "HTTPS request header `{}` is credential-like and must be supplied by an explicit future secret-ref grant, not guest memory",
+            header.name
+        )));
+    }
+    reqwest::header::HeaderName::from_bytes(header.name.as_bytes()).map_err(|_| {
+        PluginHttpsError::new(format!(
+            "invalid HTTPS request header name `{}`",
+            header.name
+        ))
+    })?;
+    reqwest::header::HeaderValue::from_str(&header.value).map_err(|_| {
+        PluginHttpsError::new(format!(
+            "invalid HTTPS request header value for `{}`",
+            header.name
+        ))
+    })?;
+    Ok(())
+}
+
+fn authorize_https_allowlist(
+    record: &ResolvedPluginRecord,
+    method: &str,
+    url: &reqwest::Url,
+) -> Result<(), PluginHttpsError> {
+    let host = canonical_host(url)?;
+    let path = url.path();
+    let allowed = record.grants.https.iter().any(|grant| {
+        canonical_grant_host(&grant.host).as_deref() == Some(host.as_str())
+            && grant
+                .methods
+                .iter()
+                .any(|allowed_method| allowed_method.eq_ignore_ascii_case(method))
+            && (grant.path_prefixes.is_empty()
+                || grant
+                    .path_prefixes
+                    .iter()
+                    .any(|prefix| !prefix.is_empty() && path.starts_with(prefix)))
+    });
+    if allowed {
+        return Ok(());
+    }
+    Err(PluginHttpsError::new(format!(
+        "HTTPS request {} {} is not covered by host/method/path grants",
+        method,
+        safe_url(url)
+    )))
+}
+
+fn canonical_grant_host(host: &str) -> Option<String> {
+    let value = normalize_host_literal(host.trim());
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn normalize_host_literal(host: &str) -> String {
+    host.trim_end_matches('.')
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
+}
+
+fn has_usable_https_grant(record: &ResolvedPluginRecord) -> bool {
+    record.grants.https.iter().any(|grant| {
+        canonical_grant_host(&grant.host).is_some()
+            && grant.methods.iter().any(|method| {
+                let method = method.trim().to_ascii_uppercase();
+                PLUGIN_HTTPS_ALLOWED_METHODS.contains(&method.as_str())
+            })
+    })
+}
+
+fn canonical_host(url: &reqwest::Url) -> Result<String, PluginHttpsError> {
+    url.host_str()
+        .map(normalize_host_literal)
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| PluginHttpsError::new("HTTPS URL must include a host"))
+}
+
+fn validate_static_https_target(url: &reqwest::Url) -> Result<(), PluginHttpsError> {
+    let host = canonical_host(url)?;
+    if is_forbidden_host_name(&host) {
+        return Err(PluginHttpsError::new(format!(
+            "HTTPS blocked local/private host {:?}",
+            host
+        )));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        validate_public_ip(ip, &host)?;
+    }
+    if url.cannot_be_a_base() {
+        return Err(PluginHttpsError::new(
+            "HTTPS URL target is not hierarchical",
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_https_target_for_client(
+    url: &reqwest::Url,
+    resolver: &dyn PluginHttpsResolver,
+) -> Result<Option<PinnedHttpsResolution>, PluginHttpsError> {
+    let host = canonical_host(url)?;
+    if host.parse::<IpAddr>().is_ok() {
+        return Ok(None);
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| PluginHttpsError::new("HTTPS URL uses a scheme without a default port"))?;
+    let addrs = resolver.resolve(&host, port)?;
+    if addrs.is_empty() {
+        return Err(PluginHttpsError::new(format!(
+            "DNS lookup for {:?} returned no addresses",
+            host
+        )));
+    }
+    for addr in &addrs {
+        validate_public_ip(addr.ip(), &host)?;
+    }
+    let mut domains = Vec::new();
+    if let Some(raw_host) = url.host_str() {
+        let raw_host = raw_host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase();
+        if !raw_host.is_empty() {
+            domains.push(raw_host);
+        }
+    }
+    if !domains.contains(&host) {
+        domains.push(host);
+    }
+    Ok(Some(PinnedHttpsResolution { domains, addrs }))
+}
+
+fn validate_public_ip(ip: IpAddr, host: &str) -> Result<(), PluginHttpsError> {
+    let forbidden = match ip {
+        IpAddr::V4(ip) => is_forbidden_ipv4(ip),
+        IpAddr::V6(ip) => is_forbidden_ipv6(ip),
+    };
+    if forbidden {
+        return Err(PluginHttpsError::new(format!(
+            "HTTPS blocked local/private address {ip} for host {:?}",
+            host
+        )));
+    }
+    Ok(())
+}
+
+fn is_forbidden_host_name(host: &str) -> bool {
+    let lower = host.trim_end_matches('.').to_ascii_lowercase();
+    lower == "localhost" || lower.ends_with(".localhost")
+}
+
+fn is_forbidden_ipv4(ip: Ipv4Addr) -> bool {
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_unspecified()
+        || ip.octets()[0] == 0
+        || ip.octets()[0] >= 224
+        || ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1])
+        || ip.octets()[0] == 169 && ip.octets()[1] == 254
+        || ip.octets()[0] == 192 && ip.octets()[1] == 0 && ip.octets()[2] == 0
+        || ip.octets()[0] == 198 && (18..=19).contains(&ip.octets()[1])
+}
+
+fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(mapped) = ipv6_embedded_ipv4(ip) {
+        return is_forbidden_ipv4(mapped);
+    }
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || (ip.segments()[0] & 0xfe00) == 0xfc00
+        || (ip.segments()[0] & 0xffc0) == 0xfe80
+        || (ip.segments()[0] & 0xff00) == 0xff00
+}
+
+fn ipv6_embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(mapped) = ip.to_ipv4_mapped() {
+        return Some(mapped);
+    }
+    let segments = ip.segments();
+    if segments[..6] == [0, 0, 0, 0, 0, 0] {
+        return Some(Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            segments[6] as u8,
+            (segments[7] >> 8) as u8,
+            segments[7] as u8,
+        ));
+    }
+    None
+}
+
+fn collect_https_response_headers(headers: &reqwest::header::HeaderMap) -> Vec<PluginHttpsHeader> {
+    headers
+        .iter()
+        .filter(|(name, _)| !is_sensitive_header(name.as_str()))
+        .take(PLUGIN_HTTPS_MAX_RESPONSE_HEADERS)
+        .filter_map(|(name, value)| {
+            value.to_str().ok().map(|value| PluginHttpsHeader {
+                name: name.as_str().to_string(),
+                value: bounded_header_value(value),
+            })
+        })
+        .collect()
+}
+
+fn bounded_header_value(value: &str) -> String {
+    let mut redacted = redact_secret_like(value);
+    if redacted.len() > PLUGIN_HTTPS_MAX_HEADER_VALUE_BYTES {
+        truncate_string_to_boundary(&mut redacted, PLUGIN_HTTPS_MAX_HEADER_VALUE_BYTES);
+        redacted.push('…');
+    }
+    redacted
+}
+
+fn is_sensitive_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "x-api-key"
+            | "x-auth-token"
+            | "api-key"
+            | "apikey"
+    )
+}
+
+fn safe_url(url: &reqwest::Url) -> String {
+    let host = url.host_str().unwrap_or("<missing-host>");
+    let mut path = url.path().to_string();
+    if path.len() > 120 {
+        truncate_string_to_boundary(&mut path, 120);
+        path.push('…');
+    }
+    match url.port() {
+        Some(port) => format!("https://{host}:{port}{path}"),
+        None => format!("https://{host}{path}"),
+    }
+}
+
+fn redact_secret_like(message: &str) -> String {
+    let mut value = message.to_string();
+    for needle in [
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "x-api-key",
+        "x-auth-token",
+        "api-key",
+        "token",
+        "secret",
+        "password",
+    ] {
+        value = redact_after_secret_word(&value, needle);
+    }
+    value
+}
+
+fn redact_after_secret_word(input: &str, needle: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    while let Some(relative) = lower[cursor..].find(needle) {
+        let start = cursor + relative;
+        let mut end = start + needle.len();
+        out.push_str(&input[cursor..end]);
+        let bytes = input.as_bytes();
+        while end < input.len() && matches!(bytes[end], b' ' | b'=' | b':' | b'\t') {
+            out.push(bytes[end] as char);
+            end += 1;
+        }
+        let secret_start = end;
+        while end < input.len() && !matches!(bytes[end], b' ' | b',' | b';' | b'\n' | b'\r') {
+            end += 1;
+        }
+        if end > secret_start {
+            out.push_str(PLUGIN_HTTPS_REDACTION);
+        }
+        cursor = end;
+    }
+    out.push_str(&input[cursor..]);
+    out
+}
+
 #[derive(Debug)]
 struct PluginPermissionError(String);
 
@@ -426,9 +909,19 @@ fn authorize_plugin_host_api(
         &permission,
         &format!("granted host_api.{api} permission is missing"),
     )?;
-    Err(PluginPermissionError(format!(
-        "host_api.{api} is not implemented"
-    )))
+    match api {
+        PluginHostApi::Https => {
+            if !has_usable_https_grant(record) {
+                return Err(PluginPermissionError(
+                    "granted host_api.https allowlist is missing".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        PluginHostApi::Fs => Err(PluginPermissionError(format!(
+            "host_api.{api} is not implemented"
+        ))),
+    }
 }
 
 fn validate_grant_binding(record: &ResolvedPluginRecord) -> Result<(), PluginPermissionError> {
@@ -472,6 +965,101 @@ const PLUGIN_WASM_FUEL: u64 = 5_000_000;
 const PLUGIN_WASM_TIMEOUT: Duration = Duration::from_secs(1);
 const PLUGIN_WASM_MEMORY_BYTES: usize = 2 * 1024 * 1024;
 const PLUGIN_WASM_TABLE_ELEMENTS: usize = 256;
+const PLUGIN_WASM_HTTPS_MODULE: &str = "yoi:https";
+const PLUGIN_HTTPS_MAX_REQUEST_BYTES: usize = 48 * 1024;
+const PLUGIN_HTTPS_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024;
+const PLUGIN_HTTPS_MAX_REQUEST_HEADERS: usize = 16;
+const PLUGIN_HTTPS_MAX_RESPONSE_HEADERS: usize = 16;
+const PLUGIN_HTTPS_MAX_HEADER_NAME_BYTES: usize = 64;
+const PLUGIN_HTTPS_MAX_HEADER_VALUE_BYTES: usize = 1024;
+const PLUGIN_HTTPS_MAX_RESPONSE_BYTES: usize = 64 * 1024;
+const PLUGIN_HTTPS_TIMEOUT: Duration = Duration::from_secs(5);
+const PLUGIN_HTTPS_ALLOWED_METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE"];
+const PLUGIN_HTTPS_REDACTION: &str = "<redacted>";
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginHttpsRequest {
+    method: String,
+    url: String,
+    #[serde(default)]
+    headers: Vec<PluginHttpsHeader>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginHttpsHeader {
+    name: String,
+    value: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PluginHttpsResponse {
+    status: u16,
+    headers: Vec<PluginHttpsHeader>,
+    body: String,
+    truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PluginHttpsLimits {
+    timeout: Duration,
+    max_response_bytes: usize,
+}
+
+impl Default for PluginHttpsLimits {
+    fn default() -> Self {
+        Self {
+            timeout: PLUGIN_HTTPS_TIMEOUT,
+            max_response_bytes: PLUGIN_HTTPS_MAX_RESPONSE_BYTES,
+        }
+    }
+}
+
+trait PluginHttpsClient: Send + Sync {
+    fn execute(
+        &self,
+        request: &PluginHttpsRequest,
+        url: &reqwest::Url,
+        limits: PluginHttpsLimits,
+    ) -> Result<PluginHttpsResponse, PluginHttpsError>;
+}
+
+struct ReqwestPluginHttpsClient;
+struct SystemPluginHttpsResolver;
+
+#[derive(Clone, Debug)]
+struct PinnedHttpsResolution {
+    domains: Vec<String>,
+    addrs: Vec<SocketAddr>,
+}
+
+trait PluginHttpsResolver {
+    fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, PluginHttpsError>;
+}
+
+impl PluginHttpsResolver for SystemPluginHttpsResolver {
+    fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, PluginHttpsError> {
+        let mut addrs = Vec::new();
+        for addr in (host, port).to_socket_addrs().map_err(|error| {
+            PluginHttpsError::new(format!("DNS lookup failed for {:?}: {error}", host))
+        })? {
+            addrs.push(addr);
+        }
+        Ok(addrs)
+    }
+}
+
+#[derive(Debug)]
+struct PluginHttpsError(String);
+
+impl PluginHttpsError {
+    fn new(message: impl Into<String>) -> Self {
+        Self(redact_secret_like(&bounded_message(message.into())))
+    }
+}
 
 fn plugin_wasm_tool_definition(
     record: ResolvedPluginRecord,
@@ -574,12 +1162,14 @@ impl PluginWasmError {
     }
 }
 
-#[derive(Debug)]
 struct PluginWasmHostState {
+    record: ResolvedPluginRecord,
+    https_client: Arc<dyn PluginHttpsClient>,
     tool_name: Vec<u8>,
     input: Vec<u8>,
     output: Vec<u8>,
     output_error: Option<String>,
+    https_response: Vec<u8>,
     store_limits: wasmi::StoreLimits,
 }
 
@@ -587,6 +1177,20 @@ fn run_plugin_wasm_tool(
     record: ResolvedPluginRecord,
     tool_name: String,
     input: Vec<u8>,
+) -> Result<ToolOutput, PluginWasmError> {
+    run_plugin_wasm_tool_with_https_client(
+        record,
+        tool_name,
+        input,
+        Arc::new(ReqwestPluginHttpsClient),
+    )
+}
+
+fn run_plugin_wasm_tool_with_https_client(
+    record: ResolvedPluginRecord,
+    tool_name: String,
+    input: Vec<u8>,
+    https_client: Arc<dyn PluginHttpsClient>,
 ) -> Result<ToolOutput, PluginWasmError> {
     let tool = record
         .manifest
@@ -632,10 +1236,13 @@ fn run_plugin_wasm_tool(
     let mut store = wasmi::Store::new(
         &engine,
         PluginWasmHostState {
+            record: record.clone(),
+            https_client,
             tool_name: tool_name.into_bytes(),
             input,
             output: Vec::new(),
             output_error: None,
+            https_response: Vec::new(),
             store_limits,
         },
     );
@@ -667,35 +1274,48 @@ fn validate_wasm_imports(
     module: &wasmi::Module,
 ) -> Result<(), PluginWasmError> {
     for import in module.imports() {
-        if import.module() == "yoi:https" {
-            authorize_plugin_host_api(record, PluginHostApi::Https).map_err(|error| {
-                PluginWasmError::Module(format!(
-                    "plugin host API dispatch denied: {}",
-                    error.bounded_message()
-                ))
-            })?;
-        }
-        if import.module() == "yoi:fs" {
-            authorize_plugin_host_api(record, PluginHostApi::Fs).map_err(|error| {
-                PluginWasmError::Module(format!(
-                    "plugin host API dispatch denied: {}",
-                    error.bounded_message()
-                ))
-            })?;
-        }
-        if import.module() != PLUGIN_WASM_HOST_MODULE {
-            return Err(PluginWasmError::Module(format!(
-                "unsupported import module `{}`; only `{}` is available",
-                import.module(),
-                PLUGIN_WASM_HOST_MODULE
-            )));
-        }
-        match import.name() {
-            "tool_name_len" | "tool_name_read" | "input_len" | "input_read" | "output_write" => {}
+        match import.module() {
+            PLUGIN_WASM_HOST_MODULE => match import.name() {
+                "tool_name_len" | "tool_name_read" | "input_len" | "input_read"
+                | "output_write" => {}
+                other => {
+                    return Err(PluginWasmError::Module(format!(
+                        "unsupported host import `{}`; no filesystem, ambient network, environment, or WASI imports are available",
+                        other
+                    )));
+                }
+            },
+            PLUGIN_WASM_HTTPS_MODULE => {
+                authorize_plugin_host_api(record, PluginHostApi::Https).map_err(|error| {
+                    PluginWasmError::Module(format!(
+                        "plugin host API dispatch denied: {}",
+                        error.bounded_message()
+                    ))
+                })?;
+                match import.name() {
+                    "request" | "response_len" | "response_read" => {}
+                    other => {
+                        return Err(PluginWasmError::Module(format!(
+                            "unsupported https host import `{other}`"
+                        )));
+                    }
+                }
+            }
+            "yoi:fs" => {
+                authorize_plugin_host_api(record, PluginHostApi::Fs).map_err(|error| {
+                    PluginWasmError::Module(format!(
+                        "plugin host API dispatch denied: {}",
+                        error.bounded_message()
+                    ))
+                })?;
+                return Err(PluginWasmError::Module(
+                    "host_api.fs is not implemented".to_string(),
+                ));
+            }
             other => {
                 return Err(PluginWasmError::Module(format!(
-                    "unsupported host import `{}`; no filesystem, network, environment, or WASI imports are available",
-                    other
+                    "unsupported import module `{}`; only `{}` and `{}` are available",
+                    other, PLUGIN_WASM_HOST_MODULE, PLUGIN_WASM_HTTPS_MODULE
                 )));
             }
         }
@@ -751,6 +1371,33 @@ fn define_plugin_wasm_host_imports(
             },
         )
         .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    linker
+        .func_wrap(
+            PLUGIN_WASM_HTTPS_MODULE,
+            "request",
+            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, ptr: i32, len: i32| -> i32 {
+                read_guest_https_request(&mut caller, ptr, len)
+            },
+        )
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    linker
+        .func_wrap(
+            PLUGIN_WASM_HTTPS_MODULE,
+            "response_len",
+            |caller: wasmi::Caller<'_, PluginWasmHostState>| -> i32 {
+                caller.data().https_response.len() as i32
+            },
+        )
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    linker
+        .func_wrap(
+            PLUGIN_WASM_HTTPS_MODULE,
+            "response_read",
+            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, ptr: i32, len: i32| -> i32 {
+                write_host_bytes_to_guest(&mut caller, ptr, len, HostBuffer::HttpsResponse)
+            },
+        )
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
     Ok(())
 }
 
@@ -758,6 +1405,7 @@ fn define_plugin_wasm_host_imports(
 enum HostBuffer {
     ToolName,
     Input,
+    HttpsResponse,
 }
 
 fn write_host_bytes_to_guest(
@@ -772,6 +1420,7 @@ fn write_host_bytes_to_guest(
     let bytes = match buffer {
         HostBuffer::ToolName => caller.data().tool_name.clone(),
         HostBuffer::Input => caller.data().input.clone(),
+        HostBuffer::HttpsResponse => caller.data().https_response.clone(),
     };
     if len as usize != bytes.len() {
         return -1;
@@ -786,6 +1435,58 @@ fn write_host_bytes_to_guest(
         Ok(()) => bytes.len() as i32,
         Err(_) => -1,
     }
+}
+
+fn read_guest_https_request(
+    caller: &mut wasmi::Caller<'_, PluginWasmHostState>,
+    ptr: i32,
+    len: i32,
+) -> i32 {
+    let bytes = match read_guest_bytes(caller, ptr, len, PLUGIN_HTTPS_MAX_REQUEST_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            caller.data_mut().output_error = Some(error);
+            return -1;
+        }
+    };
+    let record = caller.data().record.clone();
+    let https_client = caller.data().https_client.clone();
+    match execute_plugin_https_request(&record, https_client.as_ref(), &bytes) {
+        Ok(response) => {
+            caller.data_mut().https_response = response;
+            caller.data().https_response.len() as i32
+        }
+        Err(error) => {
+            caller.data_mut().output_error = Some(error.0);
+            -1
+        }
+    }
+}
+
+fn read_guest_bytes(
+    caller: &mut wasmi::Caller<'_, PluginWasmHostState>,
+    ptr: i32,
+    len: i32,
+    max_len: usize,
+) -> Result<Vec<u8>, String> {
+    if ptr < 0 || len < 0 {
+        return Err("guest input pointer/length is invalid".into());
+    }
+    let len = len as usize;
+    if len > max_len {
+        return Err(format!("guest input exceeds {max_len} bytes"));
+    }
+    let Some(memory) = caller
+        .get_export("memory")
+        .and_then(|export| export.into_memory())
+    else {
+        return Err("guest did not export linear memory".into());
+    };
+    let mut bytes = vec![0; len];
+    memory
+        .read(&*caller, ptr as usize, &mut bytes)
+        .map_err(|_| "guest input memory range is invalid".to_string())?;
+    Ok(bytes)
 }
 
 fn read_guest_output(
@@ -1115,12 +1816,13 @@ mod tests {
     use super::*;
     use manifest::plugin::{
         PluginDiscoveryOptions, PluginEnablementConfig, PluginExactVersion, PluginGrantConfig,
-        PluginPackageManifest, PluginRuntimeManifest, SourceQualifiedPluginId,
+        PluginHttpsGrant, PluginPackageManifest, PluginRuntimeManifest, SourceQualifiedPluginId,
         resolve_plugin_config_for_startup,
     };
     use serde_json::json;
     use std::fs;
     use std::path::Path;
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
     fn tool(name: &str) -> manifest::plugin::PluginToolManifest {
@@ -1167,6 +1869,7 @@ mod tests {
                 version: Some(PluginExactVersion("0.1.0".to_string())),
                 digest: Some("sha256:abc".to_string()),
                 permissions,
+                https: Vec::new(),
             },
             config: None,
         }
@@ -1211,6 +1914,145 @@ mod tests {
             .with_module(PluginToolFeature::new(record))
             .install_into_pending(&mut pending, &mut hooks);
         (report, pending)
+    }
+
+    fn record_with_https_grant() -> ResolvedPluginRecord {
+        let mut record = record(vec![tool("HttpsTool")]);
+        let https_permission = PluginPermission::HostApi {
+            api: PluginHostApi::Https,
+        };
+        record.manifest.permissions.push(https_permission.clone());
+        record.grants.permissions.push(https_permission);
+        record.grants.https.push(PluginHttpsGrant {
+            host: "api.example.test".to_string(),
+            methods: vec!["GET".to_string(), "POST".to_string()],
+            path_prefixes: vec!["/v1".to_string()],
+        });
+        record
+    }
+
+    struct MockHttpsClient {
+        calls: Mutex<usize>,
+        response_body: String,
+        error: Mutex<Option<String>>,
+    }
+
+    impl Default for MockHttpsClient {
+        fn default() -> Self {
+            Self {
+                calls: Mutex::new(0),
+                response_body: "ok".to_string(),
+                error: Mutex::new(None),
+            }
+        }
+    }
+
+    impl MockHttpsClient {
+        fn call_count(&self) -> usize {
+            *self.calls.lock().expect("mock call lock")
+        }
+    }
+
+    impl PluginHttpsClient for MockHttpsClient {
+        fn execute(
+            &self,
+            _request: &PluginHttpsRequest,
+            _url: &reqwest::Url,
+            _limits: PluginHttpsLimits,
+        ) -> Result<PluginHttpsResponse, PluginHttpsError> {
+            *self.calls.lock().expect("mock call lock") += 1;
+            if let Some(error) = self.error.lock().expect("mock error lock").take() {
+                return Err(PluginHttpsError::new(error));
+            }
+            Ok(PluginHttpsResponse {
+                status: 200,
+                headers: vec![PluginHttpsHeader {
+                    name: "content-type".to_string(),
+                    value: "text/plain".to_string(),
+                }],
+                body: self.response_body.clone(),
+                truncated: false,
+            })
+        }
+    }
+
+    struct FakeHttpsResolver {
+        calls: Mutex<Vec<(String, u16)>>,
+        addrs: Vec<SocketAddr>,
+    }
+
+    impl FakeHttpsResolver {
+        fn new(addrs: Vec<SocketAddr>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                addrs,
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, u16)> {
+            self.calls.lock().expect("resolver calls lock").clone()
+        }
+    }
+
+    impl PluginHttpsResolver for FakeHttpsResolver {
+        fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, PluginHttpsError> {
+            self.calls
+                .lock()
+                .expect("resolver calls lock")
+                .push((host.to_string(), port));
+            Ok(self.addrs.clone())
+        }
+    }
+
+    fn https_request_json(method: &str, url: &str) -> String {
+        json!({ "method": method, "url": url }).to_string()
+    }
+
+    fn wasm_tool_that_calls_https(request: &str) -> Vec<u8> {
+        let output = br#"{"summary":"https ok","content":"ordinary tool result path"}"#;
+        wat::parse_str(format!(
+            r#"
+            (module
+              (import "yoi:tool" "output_write" (func $output_write (param i32 i32) (result i32)))
+              (import "yoi:https" "request" (func $https_request (param i32 i32) (result i32)))
+              (import "yoi:https" "response_len" (func $https_response_len (result i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 16) "{}")
+              (data (i32.const 4096) "{}")
+              (func (export "yoi_tool_call")
+                (local $n i32)
+                (local.set $n (call $https_request (i32.const 16) (i32.const {})))
+                (if (i32.lt_s (local.get $n) (i32.const 0)) (then unreachable))
+                (drop (call $https_response_len))
+                (drop (call $output_write (i32.const 4096) (i32.const {})))
+              )
+            )
+            "#,
+            wat_bytes(request.as_bytes()),
+            wat_bytes(output),
+            request.len(),
+            output.len()
+        ))
+        .expect("valid wat")
+    }
+
+    fn empty_wasm_tool() -> Vec<u8> {
+        let output = br#"{"summary":"no network","content":"no https import"}"#;
+        wat::parse_str(format!(
+            r#"
+            (module
+              (import "yoi:tool" "output_write" (func $output_write (param i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 4096) "{}")
+              (func (export "yoi_tool_call")
+                (drop (call $output_write (i32.const 4096) (i32.const {})))
+              )
+            )
+            "#,
+            wat_bytes(output),
+            output.len()
+        ))
+        .expect("valid wat")
     }
 
     #[test]
@@ -1307,6 +2149,184 @@ mod tests {
         assert_eq!(origin.package_version, "0.1.0");
         assert_eq!(origin.package_api_version, 1);
         assert_eq!(origin.surface, "tool");
+    }
+
+    #[test]
+    fn wasm_tool_can_call_granted_https_host_api() {
+        let (_dir, record) = runtime_record_with_https_wasm(wasm_tool_that_calls_https(
+            &https_request_json("GET", "https://api.example.test/v1/data"),
+        ));
+        let client = Arc::new(MockHttpsClient::default());
+        let output = run_plugin_wasm_tool_with_https_client(
+            record,
+            "PluginEcho".to_string(),
+            Vec::new(),
+            client.clone(),
+        )
+        .expect("tool output");
+        assert_eq!(client.call_count(), 1);
+        assert_eq!(output.summary, "https ok");
+        assert_eq!(output.content.as_deref(), Some("ordinary tool result path"));
+    }
+
+    #[test]
+    fn missing_https_grant_denies_before_network() {
+        let (_dir, mut record) = resolved_record_with_wasm(wasm_tool_that_calls_https(
+            &https_request_json("GET", "https://api.example.test/v1/data"),
+        ));
+        record.manifest.permissions.push(PluginPermission::HostApi {
+            api: PluginHostApi::Https,
+        });
+        let client = Arc::new(MockHttpsClient::default());
+        let error = run_plugin_wasm_tool_with_https_client(
+            record,
+            "PluginEcho".to_string(),
+            Vec::new(),
+            client.clone(),
+        )
+        .expect_err("grant denied");
+        assert_eq!(client.call_count(), 0);
+        assert!(error.bounded_message().contains("host_api.https"));
+    }
+
+    #[test]
+    fn disallowed_https_request_targets_deny_before_network() {
+        let record = record_with_https_grant();
+        let client = MockHttpsClient::default();
+        for (method, url, needle) in [
+            ("GET", "http://api.example.test/v1/data", "scheme"),
+            ("TRACE", "https://api.example.test/v1/data", "method"),
+            ("GET", "https://other.example.test/v1/data", "grants"),
+            ("GET", "https://localhost/v1/data", "local/private"),
+            ("GET", "https://127.0.0.1/v1/data", "local/private"),
+            ("GET", "https://10.0.0.1/v1/data", "local/private"),
+            ("GET", "https://169.254.169.254/v1/data", "local/private"),
+            ("GET", "file:///tmp/secret", "scheme"),
+        ] {
+            let error = execute_plugin_https_request(
+                &record,
+                &client,
+                https_request_json(method, url).as_bytes(),
+            )
+            .expect_err("request denied");
+            assert!(
+                error.0.contains(needle),
+                "{method} {url} produced {:?}, expected {needle}",
+                error.0
+            );
+        }
+        assert_eq!(client.call_count(), 0);
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_targets_deny_before_network() {
+        let record = record_with_https_grant();
+        let client = MockHttpsClient::default();
+        for url in [
+            "https://[::ffff:127.0.0.1]/v1/data",
+            "https://[::ffff:10.0.0.1]/v1/data",
+            "https://[::ffff:169.254.169.254]/v1/data",
+            "https://[::10.0.0.1]/v1/data",
+        ] {
+            let error = execute_plugin_https_request(
+                &record,
+                &client,
+                https_request_json("GET", url).as_bytes(),
+            )
+            .expect_err("mapped address denied");
+            assert!(
+                error.0.contains("local/private"),
+                "{url} produced {:?}",
+                error.0
+            );
+        }
+        assert_eq!(client.call_count(), 0);
+    }
+
+    #[test]
+    fn dns_resolution_is_pinned_to_validated_public_socket_addresses() {
+        let url = reqwest::Url::parse("https://api.example.test:8443/v1/data").unwrap();
+        let resolver = FakeHttpsResolver::new(vec!["93.184.216.34:8443".parse().unwrap()]);
+        let pinned = resolve_https_target_for_client(&url, &resolver)
+            .expect("resolution")
+            .expect("hostname resolution is pinned");
+        assert_eq!(
+            resolver.calls(),
+            vec![("api.example.test".to_string(), 8443)]
+        );
+        assert_eq!(pinned.domains, vec!["api.example.test".to_string()]);
+        assert_eq!(pinned.addrs, vec!["93.184.216.34:8443".parse().unwrap()]);
+
+        let mut builder = reqwest::blocking::Client::builder().no_proxy();
+        for domain in &pinned.domains {
+            builder = builder.resolve_to_addrs(domain, &pinned.addrs);
+        }
+        builder.build().expect("client accepts pinned resolver");
+    }
+
+    #[test]
+    fn dns_resolution_rejects_private_addresses_before_client_build() {
+        let url = reqwest::Url::parse("https://api.example.test/v1/data").unwrap();
+        let resolver = FakeHttpsResolver::new(vec!["127.0.0.1:443".parse().unwrap()]);
+        let error =
+            resolve_https_target_for_client(&url, &resolver).expect_err("private DNS answer");
+        assert!(error.0.contains("local/private"));
+    }
+
+    #[test]
+    fn timeout_and_secret_diagnostics_are_bounded_and_redacted() {
+        let record = record_with_https_grant();
+        let client = MockHttpsClient::default();
+        *client.error.lock().expect("mock error lock") =
+            Some("timeout while using Authorization: Bearer SUPER_SECRET_TOKEN".to_string());
+        let error = execute_plugin_https_request(
+            &record,
+            &client,
+            https_request_json("GET", "https://api.example.test/v1/data").as_bytes(),
+        )
+        .expect_err("timeout error");
+        assert!(error.0.contains("timeout"));
+        assert!(error.0.contains(PLUGIN_HTTPS_REDACTION));
+        assert!(!error.0.contains("SUPER_SECRET_TOKEN"));
+        assert!(error.0.len() <= 513);
+        assert_eq!(client.call_count(), 1);
+    }
+
+    #[test]
+    fn response_size_bound_truncates() {
+        let record = record_with_https_grant();
+        let client = MockHttpsClient {
+            calls: Mutex::new(0),
+            response_body: "x".repeat(PLUGIN_HTTPS_MAX_RESPONSE_BYTES + 8),
+            error: Mutex::new(None),
+        };
+        let response = execute_plugin_https_request(
+            &record,
+            &client,
+            https_request_json("GET", "https://api.example.test/v1/data").as_bytes(),
+        )
+        .expect("response");
+        let value: Value = serde_json::from_slice(&response).expect("response json");
+        assert_eq!(value["truncated"], true);
+        assert_eq!(
+            value["body"].as_str().expect("body").len(),
+            PLUGIN_HTTPS_MAX_RESPONSE_BYTES
+        );
+    }
+
+    #[test]
+    fn no_network_without_https_import() {
+        let (_dir, record) = runtime_record_with_https_wasm(empty_wasm_tool());
+        let client = Arc::new(MockHttpsClient::default());
+        let output = run_plugin_wasm_tool_with_https_client(
+            record,
+            "PluginEcho".to_string(),
+            Vec::new(),
+            client.clone(),
+        )
+        .expect("tool output");
+        assert_eq!(client.call_count(), 0);
+        assert_eq!(output.summary, "no network");
     }
 
     #[test]
@@ -1472,7 +2492,7 @@ mod tests {
             .unwrap_err()
             .bounded_message();
         assert!(
-            error.contains("host_api.https is not implemented"),
+            error.contains("granted host_api.https allowlist is missing"),
             "{error}"
         );
     }
@@ -1688,6 +2708,21 @@ mod tests {
         record
     }
 
+    fn runtime_record_with_https_wasm(wasm: Vec<u8>) -> (TempDir, ResolvedPluginRecord) {
+        let (dir, mut record) = resolved_record_with_wasm(wasm);
+        let https_permission = PluginPermission::HostApi {
+            api: PluginHostApi::Https,
+        };
+        record.manifest.permissions.push(https_permission.clone());
+        record.grants.permissions.push(https_permission);
+        record.grants.https.push(PluginHttpsGrant {
+            host: "api.example.test".to_string(),
+            methods: vec!["GET".to_string(), "POST".to_string()],
+            path_prefixes: vec!["/v1".to_string()],
+        });
+        (dir, record)
+    }
+
     fn resolved_record_with_wasm(wasm: Vec<u8>) -> (TempDir, ResolvedPluginRecord) {
         let dir = TempDir::new().unwrap();
         let package_dir = dir.path().join(".yoi/plugins");
@@ -1717,6 +2752,7 @@ mod tests {
             version: Some(PluginExactVersion(record.version.clone())),
             digest: Some(record.digest.clone()),
             permissions: tool_permissions(&record.manifest.tools),
+            https: Vec::new(),
         };
         (dir, record)
     }
