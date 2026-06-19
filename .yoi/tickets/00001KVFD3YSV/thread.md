@@ -213,3 +213,73 @@ Next:
 - Reviewer output を確認し、approve なら Orchestrator worktree へ merge/validation/cleanup/close-ready 処理へ進む。request_changes なら blocker を記録して Coder に戻す。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVFD3YSV at: 2026-06-19T11:07:58Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+対象:
+- Ticket: `00001KVFD3YSV`
+- branch: `impl/00001KVFD3YSV-plugin-cli-inspection`
+- commit: `462de32a` (`plugin: add cli inspection`)
+
+Blocker:
+- Status vocabulary が Ticket の binding acceptance criteria を満たしていない。
+
+Evidence:
+- Ticket body では package status として `active`, `disabled`, `missing`, `rejected`, `partial` を要求している。
+- 実装は代わりに以下を JSON / human output に出している。
+  - `enabled`
+  - `enabled-with-diagnostics`
+  - `configured-blocked`
+  - `configured-missing`
+  - `discovered`
+  - `diagnostic`
+- `crates/yoi/src/plugin_cli.rs:605-617` が required vocabulary ではない status strings を計算している。
+- Human list/show は `item.status` を直接表示している。
+- JSON output も同じ item/snapshot を serialize している。
+- Tests も現状の wrong vocabulary を固定しており、`enabled` / `enabled-with-diagnostics` を期待している。
+
+Why this blocks acceptance:
+- Valid enabled Plugin が `active` として出ない。
+- discovered but not enabled Plugin が `disabled` として出ない。
+- enabled but missing package が `missing` として出ない。
+- invalid manifest / incompatible api / digest mismatch / grant mismatch / invalid schema などが `rejected` として出ない。
+- mixed tool eligibility / partial rejection が `partial` として表現されない。
+- Status は typed JSON/report surface の一部なので、単なる human formatting の差分ではない。
+
+Additional concerns to address with the blocker:
+- CLI contract の acceptance coverage が不足している。
+  - JSON list/show structure。
+  - human list の active / disabled / rejected / missing。
+  - show active with grants。
+  - invalid manifest。
+  - digest mismatch。
+  - missing grant。
+  - ambiguous ref。
+  - no runtime execution。
+- 現在の `yoi` tests は resolved package、missing ref、grant mismatch、parser behavior だけで、requested status vocabulary や JSON structure を十分に pin していない。
+- Human `list` output が enabled surfaces を表示せず、`tools=<len>` と diagnostics count に留まっている。Ticket の human overview requirement は surfaces を明示している。
+
+Positive findings:
+- CLI surface は `crates/yoi` 側にあり、lower crates が product CLI façade に依存している様子はない。
+- Inspection path は read-only / non-executing に見える。
+  - snapshot build は config/profile resolution、plugin discovery、enabled-plugin resolution、static inspection に留まる。
+  - static inspection は manifest/runtime metadata、grants、host API permissions、tool eligibility を見るだけで、WASM runtime/tool execution path を呼んでいない。
+- Missing / ambiguous CLI refs は bounded message で fail closed している。
+- Diagnostics/output は一部 bounded で、list truncation / diagnostic truncation / `bound_text` がある。
+
+Requested changes:
+- typed report / JSON / human output の status vocabulary を Ticket 指定の `active`, `disabled`, `missing`, `rejected`, `partial` に合わせる。
+- `partial` の判定を package usable but some surfaces/tools rejected の意味で表現する。
+- Human `list` output に enabled surfaces を出す。
+- Tests を更新/追加し、requested vocabulary と JSON structure を pin する。
+- Acceptance coverage gap のうち、少なくとも status vocabulary / JSON list-show / active-disabled-rejected-missing / missing grant / ambiguous ref / no-execution の主要契約を明確に覆う。
+
+Validation note:
+- Reviewer は read-only source/diff inspection を実施。
+- cargo/nix validation は Orchestrator reported validation を確認した。
+
+---
