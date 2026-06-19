@@ -246,3 +246,34 @@ Next action:
 - 特に no ambient workspace fs authority、grant-before-filesystem access、path traversal/symlink/root escape、bounds/truncation/fail-closed policy、write serialization/O_NOFOLLOW、diagnostic redaction、ordinary Tool result path、HTTPS/CLI compatibility を確認する。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-19T16:02:39Z -->
+
+## Plan
+
+Review dispatch:
+
+Reviewer Pod `yoi-reviewer-00001KVFDX9AY` を read-only scope で起動した。
+
+Review target:
+- worktree: `/home/hare/Projects/yoi/.worktree/00001KVFDX9AY-plugin-fs-host-api`
+- branch: `impl/00001KVFDX9AY-plugin-fs-host-api`
+- commit: `717c0999`
+
+Reviewer focus:
+- recorded intent / invariants / acceptance criteria に対する適合性。
+- filesystem access が grant checks の前に発生しないこと。
+- Workspace/POD filesystem authority が Plugin に自動継承されていないこと。
+- traversal / symlink / root escape protections が canonicalization races を含め妥当であること。
+- read/list/write bounds と truncate-vs-fail-closed policy が明確で enforce されること。
+- write serialization by normalized target と `O_NOFOLLOW` が既存 file mutation safety と整合すること。portability issue がないこと。
+- diagnostics に file content / secret-like data が漏れないこと。
+- ordinary Tool result/history path だけに戻ること。
+- tests が allowed read/list/write、missing grant、no workspace inheritance、traversal、symlink/root escape、bounds、redaction、write safety を十分に覆うこと。
+- manifest/permission grant schema と CLI inspection changes が既存 HTTPS grants / Plugin inspection behavior と互換であること。
+- HTTPS host API と Component Model migration が non-goals として保たれていること。
+
+Next:
+- Reviewer output を確認し、approve なら Orchestrator worktree への merge/validation/cleanup/close-ready 処理へ進む。request_changes なら blocker を記録して Coder に戻す。
+
+---
