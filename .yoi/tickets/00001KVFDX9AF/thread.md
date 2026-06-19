@@ -279,3 +279,45 @@ Next:
 - Reviewer output を確認し、approve なら Orchestrator worktree への merge/validation/cleanup/close-ready 処理へ進む。request_changes なら blocker を記録して Coder に戻す。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVFDX9AF at: 2026-06-19T15:10:37Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+対象:
+- Ticket: `00001KVFDX9AF`
+- branch: `impl/00001KVFDX9AF-plugin-https-host-api`
+- commit: `7377527f` (`plugin: implement https host api`)
+
+Blockers:
+
+1. Private/local target rejection is bypassable with IPv4-mapped IPv6 literals.
+   - `validate_static_https_target` parses the URL host as `IpAddr` and delegates IPv6 literals to `is_forbidden_ipv6` (`crates/pod/src/feature/plugin.rs:622-631`, `665-669`).
+   - `is_forbidden_ipv6` rejects loopback/unspecified/ULA/link-local/multicast (`699-705`) but does not check `Ipv6Addr::to_ipv4_mapped()` / IPv4-compatible forms.
+   - Rust confirms `::ffff:127.0.0.1` is not `is_loopback()` as IPv6, while `to_ipv4_mapped()` is `Some(127.0.0.1)`.
+   - A granted request to `https://[::ffff:127.0.0.1]/...` would therefore pass the current private/local filter if the grant host matches, violating localhost/private IP rejection and the IPv6 edge-case reviewer focus.
+
+2. DNS private-address validation is TOCTOU and does not bind the checked address set to the actual connection.
+   - `ReqwestPluginHttpsClient::execute` calls `validate_dns_target(url)` before constructing/sending the request (`crates/pod/src/feature/plugin.rs:365-405`).
+   - `validate_dns_target` resolves with `ToSocketAddrs` and rejects private/local addresses in that returned set (`641-655`), but `reqwest` performs its own DNS resolution later during `builder.send()` (`405`).
+   - DNS rebinding / split answers between the preflight lookup and reqwest’s lookup can pass validation on a public address then connect to a private/local address.
+   - Ticket critical risks explicitly include DNS/private/local bypasses before network access.
+
+Requested changes:
+- Reject IPv4-mapped IPv6 addresses by applying the existing IPv4 forbidden checks to mapped IPv4 addresses; add tests for mapped loopback/private/link-local examples.
+- Bind DNS validation to the actual connection path. Either pin validated public `SocketAddr`s into the reqwest client/request resolver path, or otherwise ensure the actual connected remote address is validated / not private.
+- Add deterministic test coverage around the real validation edge cases where feasible.
+
+Supporting positive findings:
+- Grant checks happen before request parsing/DNS/network dispatch in `execute_plugin_https_request`, and WASM import validation denies `yoi:https` imports without requested/configured `host_api.https` grant before instantiation.
+- Scheme, embedded credentials, method allowlist, request descriptor/body/header count/size, response body/header bounds, timeout, no redirects, and `no_proxy()` are present.
+- WASM imports are narrow (`yoi:tool`, `yoi:https` only), WASI/ambient imports are rejected, and `yoi:fs` remains explicitly unimplemented.
+- Response path remains ordinary plugin Tool output/history path.
+- Manifest/CLI schema additions are mostly compatible: new `PluginPermission::HostApi`, `PluginHttpsGrant`, defaulted `grants.https`, and CLI display of configured HTTPS grants.
+
+Test gap:
+- Current HTTPS-focused tests use `MockHttpsClient` for allowed/denied/timeout/truncation behavior. That is useful for grant ordering, but it does not exercise the real `ReqwestPluginHttpsClient` DNS filtering, redirect policy, TLS/HTTPS path, or actual timeout/read-limit behavior. Given the security-sensitive DNS/IP requirements, add coverage for the real validation edge cases above.
+
+---
