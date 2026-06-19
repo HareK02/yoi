@@ -1,11 +1,13 @@
 ---
 title: 'Plugin: implement https host API for Tool runtime'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-19T07:53:13Z'
-updated_at: '2026-06-19T07:54:32Z'
+updated_at: '2026-06-19T10:19:53Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['plugin', 'https', 'host-api', 'network', 'sandbox', 'secrets', 'permission-grants']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-19T10:19:53Z'
 ---
 
 ## Background
