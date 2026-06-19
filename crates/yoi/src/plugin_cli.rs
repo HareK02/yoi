@@ -52,6 +52,10 @@ fn render_list(args: &PluginCliArgs) -> Result<String> {
         return Ok(format!("{}\n", serde_json::to_string_pretty(&snapshot)?));
     }
 
+    render_list_snapshot_human(&snapshot)
+}
+
+fn render_list_snapshot_human(snapshot: &PluginInspectionSnapshot) -> Result<String> {
     let mut out = String::new();
     writeln!(
         out,
@@ -66,12 +70,13 @@ fn render_list(args: &PluginCliArgs) -> Result<String> {
     for item in snapshot.items.iter().take(MAX_LIST_ITEMS) {
         writeln!(
             out,
-            "- {} [{}] version={} digest={} source={} tools={} diagnostics={}",
+            "- {} [{}] version={} digest={} source={} enabled_surfaces={} tools={} diagnostics={}",
             item.reference,
             item.status,
             item.version.as_deref().unwrap_or("<unknown>"),
             item.digest.as_deref().unwrap_or("<unknown>"),
             item.source.as_deref().unwrap_or("<unknown>"),
+            join_or_none(&item.enabled_surfaces),
             item.tools.len(),
             item.diagnostics.len()
         )?;
@@ -96,6 +101,10 @@ fn render_show(reference: &str, args: &PluginCliArgs) -> Result<String> {
         return Ok(format!("{}\n", serde_json::to_string_pretty(item)?));
     }
 
+    render_item_human(item)
+}
+
+fn render_item_human(item: &PluginInspectionItem) -> Result<String> {
     let mut out = String::new();
     writeln!(out, "plugin {}", item.reference)?;
     writeln!(out, "  status: {}", item.status)?;
@@ -602,19 +611,37 @@ impl ItemBuilder {
             (left.kind.as_str(), left.message.as_str())
                 .cmp(&(right.kind.as_str(), right.message.as_str()))
         });
-        let status = if self.resolved && self.diagnostics.is_empty() {
-            "enabled".to_string()
-        } else if self.resolved {
-            "enabled-with-diagnostics".to_string()
-        } else if self.configured && self.discovered {
-            "configured-blocked".to_string()
-        } else if self.configured {
-            "configured-missing".to_string()
-        } else if self.discovered {
-            "discovered".to_string()
+        let usable_tool = self.tools.iter().any(|tool| tool.eligible);
+        let rejected_tool = self
+            .tools
+            .iter()
+            .any(|tool| !tool.eligible || tool.diagnostic.is_some());
+        let static_runtime_rejected = self.static_runtime.as_ref().is_some_and(|runtime| {
+            !runtime.runtime.eligible
+                || runtime.runtime.diagnostic.is_some()
+                || runtime
+                    .host_apis
+                    .iter()
+                    .any(|api| !api.eligible || api.diagnostic.is_some())
+        });
+        let has_diagnostic =
+            !self.diagnostics.is_empty() || rejected_tool || static_runtime_rejected;
+        let status = if self.resolved {
+            if usable_tool && has_diagnostic {
+                "partial"
+            } else if usable_tool || (self.static_eligible && !self.enabled_surfaces.is_empty()) {
+                "active"
+            } else {
+                "rejected"
+            }
+        } else if self.discovered && !self.configured {
+            "disabled"
+        } else if self.configured && !self.discovered {
+            "missing"
         } else {
-            "diagnostic".to_string()
-        };
+            "rejected"
+        }
+        .to_string();
         let local_ref = local_ref(&self.reference);
         PluginInspectionItem {
             reference: self.reference,
@@ -646,27 +673,95 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn list_and_show_resolved_plugin_without_execution() {
+    fn active_list_and_show_json_are_structured_and_non_executing() {
         let dir = tempdir().unwrap();
         let workspace = dir.path();
         write_plugin_package(workspace, "echo");
         let config = enabled_config(workspace, true, None);
-
-        let discovery = discover_plugins(&PluginDiscoveryOptions {
-            workspace_root: workspace.to_path_buf(),
-            user_data_home: None,
-            limits: PluginDiscoveryLimits::default(),
-        });
-        let resolution = resolve_enabled_plugins(&config, &discovery);
-        let snapshot =
-            snapshot_from_resolution(workspace.to_path_buf(), &config, &discovery, &resolution);
+        let snapshot = inspect_snapshot(workspace, &config);
 
         assert_eq!(snapshot.items.len(), 1);
         let item = select_item(&snapshot, "echo").unwrap();
-        assert_eq!(item.status, "enabled");
+        assert_eq!(item.status, "active");
         assert_eq!(item.tools[0].name, "Echo");
         assert!(item.static_eligible);
         assert_eq!(item.package.as_deref(), Some("echo.yoi-plugin"));
+
+        let list_json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(list_json["items"][0]["status"], "active");
+        assert_eq!(list_json["items"][0]["enabled_surfaces"][0], "tool");
+        assert_eq!(list_json["items"][0]["tools"][0]["granted"], true);
+
+        let show_json = serde_json::to_value(item).unwrap();
+        assert_eq!(show_json["status"], "active");
+        assert_eq!(show_json["configured_grants"][0], "surfaces.tool");
+        assert_eq!(show_json["tools"][0]["permission"], "tool.Echo");
+
+        let show = render_item_human(item).unwrap();
+        assert!(show.contains("status: active"));
+        assert!(show.contains("configured_grants: surfaces.tool, tool.Echo"));
+    }
+
+    #[test]
+    fn human_list_uses_required_status_vocabulary() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        write_plugin_package(workspace, "echo");
+        write_plugin_package(workspace, "spare");
+        let bad_digest = write_plugin_package(workspace, "bad");
+        let mut config = enabled_config(workspace, true, None);
+        config.enabled.push(PluginEnablementConfig {
+            id: "project:missing".to_string(),
+            digest: None,
+            version: Some(PluginExactVersion("0.1.0".to_string())),
+            surfaces: vec![PluginSurface::Tool],
+            grants: PluginGrantConfig {
+                id: Some("project:missing".to_string()),
+                version: Some(PluginExactVersion("0.1.0".to_string())),
+                digest: None,
+                permissions: vec![
+                    PluginPermission::surface(PluginSurface::Tool),
+                    PluginPermission::tool("Echo"),
+                ],
+            },
+            config: None,
+        });
+        config.enabled.push(PluginEnablementConfig {
+            id: "project:bad".to_string(),
+            digest: Some("sha256:0000".to_string()),
+            version: Some(PluginExactVersion("0.1.0".to_string())),
+            surfaces: vec![PluginSurface::Tool],
+            grants: PluginGrantConfig {
+                id: Some("project:bad".to_string()),
+                version: Some(PluginExactVersion("0.1.0".to_string())),
+                digest: Some(bad_digest),
+                permissions: vec![
+                    PluginPermission::surface(PluginSurface::Tool),
+                    PluginPermission::tool("Echo"),
+                ],
+            },
+            config: None,
+        });
+
+        let snapshot = inspect_snapshot(workspace, &config);
+        let statuses: std::collections::BTreeSet<_> = snapshot
+            .items
+            .iter()
+            .map(|item| item.status.as_str())
+            .collect();
+        assert_eq!(
+            statuses,
+            std::collections::BTreeSet::from(["active", "disabled", "missing", "rejected"])
+        );
+        let output = render_list_snapshot_human(&snapshot).unwrap();
+
+        assert!(output.contains("project:echo [active]"));
+        assert!(output.contains("project:spare [disabled]"));
+        assert!(output.contains("project:bad [rejected]"));
+        assert!(output.contains("project:missing [missing]"));
+        assert!(output.contains("enabled_surfaces=tool"));
+        assert!(!output.contains("enabled-with-diagnostics"));
+        assert!(!output.contains("configured-"));
     }
 
     #[test]
@@ -688,22 +783,110 @@ mod tests {
         let mut config = enabled_config(workspace, false, Some(digest));
         config.enabled[0].grants.permissions = vec![PluginPermission::tool("Other")];
 
-        let discovery = discover_plugins(&PluginDiscoveryOptions {
-            workspace_root: workspace.to_path_buf(),
-            user_data_home: None,
-            limits: PluginDiscoveryLimits::default(),
-        });
-        let resolution = resolve_enabled_plugins(&config, &discovery);
-        let snapshot =
-            snapshot_from_resolution(workspace.to_path_buf(), &config, &discovery, &resolution);
+        let snapshot = inspect_snapshot(workspace, &config);
         let item = select_item(&snapshot, "project:echo").unwrap();
-        assert_eq!(item.status, "enabled-with-diagnostics");
+        assert_eq!(item.status, "rejected");
         assert!(!item.static_eligible);
         assert!(
             item.diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.kind == "static_eligibility")
         );
+    }
+
+    #[test]
+    fn partial_status_represents_mixed_tool_usability() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let digest = write_dual_tool_package(workspace, "echo");
+        let mut config = enabled_config(workspace, true, Some(digest));
+        config.enabled[0].grants.permissions = vec![
+            PluginPermission::surface(PluginSurface::Tool),
+            PluginPermission::tool("Echo"),
+        ];
+
+        let snapshot = inspect_snapshot(workspace, &config);
+        let item = select_item(&snapshot, "project:echo").unwrap();
+
+        assert_eq!(item.status, "partial");
+        assert!(
+            item.tools
+                .iter()
+                .any(|tool| tool.name == "Echo" && tool.eligible)
+        );
+        assert!(
+            item.tools
+                .iter()
+                .any(|tool| tool.name == "Other" && !tool.eligible)
+        );
+    }
+
+    #[test]
+    fn invalid_manifest_and_digest_mismatch_are_rejected_diagnostics() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        fs::create_dir_all(workspace.join(".yoi/plugins")).unwrap();
+        write_stored_zip(
+            &workspace.join(".yoi/plugins/invalid.yoi-plugin"),
+            &[("plugin.toml", b"not = [valid")],
+        );
+        let invalid_snapshot = inspect_snapshot(workspace, &PluginConfig::default());
+        let invalid_output = render_list_snapshot_human(&invalid_snapshot).unwrap();
+        assert!(invalid_output.contains("[rejected]"));
+        assert!(invalid_output.contains("diagnostic:"));
+
+        let digest = write_plugin_package(workspace, "bad");
+        let mut config = PluginConfig::default();
+        config.enabled.push(PluginEnablementConfig {
+            id: "project:bad".to_string(),
+            digest: Some("sha256:0000".to_string()),
+            version: Some(PluginExactVersion("0.1.0".to_string())),
+            surfaces: vec![PluginSurface::Tool],
+            grants: PluginGrantConfig {
+                id: Some("project:bad".to_string()),
+                version: Some(PluginExactVersion("0.1.0".to_string())),
+                digest: Some(digest),
+                permissions: vec![
+                    PluginPermission::surface(PluginSurface::Tool),
+                    PluginPermission::tool("Echo"),
+                ],
+            },
+            config: None,
+        });
+        let snapshot = inspect_snapshot(workspace, &config);
+        let item = select_item(&snapshot, "project:bad").unwrap();
+        assert_eq!(item.status, "rejected");
+        assert!(
+            item.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "digest")
+        );
+    }
+
+    #[test]
+    fn ambiguous_ref_is_bounded_error() {
+        let snapshot = PluginInspectionSnapshot {
+            workspace: PathBuf::from("/tmp/workspace"),
+            items: vec![
+                ItemBuilder::new("project:echo".to_string()).finish(),
+                ItemBuilder::new("user:echo".to_string()).finish(),
+            ],
+        };
+
+        let error = select_item(&snapshot, "echo").unwrap_err().to_string();
+
+        assert!(error.contains("ambiguous"));
+        assert!(error.len() < 160);
+    }
+
+    fn inspect_snapshot(workspace: &Path, config: &PluginConfig) -> PluginInspectionSnapshot {
+        let discovery = discover_plugins(&PluginDiscoveryOptions {
+            workspace_root: workspace.to_path_buf(),
+            user_data_home: None,
+            limits: PluginDiscoveryLimits::default(),
+        });
+        let resolution = resolve_enabled_plugins(config, &discovery);
+        snapshot_from_resolution(workspace.to_path_buf(), config, &discovery, &resolution)
     }
 
     fn enabled_config(
@@ -734,16 +917,14 @@ mod tests {
     }
 
     fn write_plugin_package(workspace: &Path, id: &str) -> String {
-        let package_dir = workspace.join(".yoi/plugins");
-        fs::create_dir_all(&package_dir).unwrap();
-        let package = package_dir.join(format!("{id}.yoi-plugin"));
-        let manifest = r#"
+        let manifest = format!(
+            r#"
 schema_version = 1
-id = "echo"
-name = "Echo"
+id = "{id}"
+name = "{id}"
 version = "0.1.0"
 surfaces = ["tool"]
-permissions = [{ kind = "surface", surface = "tool" }, { kind = "tool", name = "Echo" }]
+permissions = [{{ kind = "surface", surface = "tool" }}, {{ kind = "tool", name = "Echo" }}]
 
 [runtime]
 kind = "wasm"
@@ -753,8 +934,45 @@ abi = "yoi-plugin-wasm-1"
 [[tools]]
 name = "Echo"
 description = "Echo input"
-input_schema = { type = "object" }
-"#;
+input_schema = {{ type = "object" }}
+"#
+        );
+        write_plugin_manifest(workspace, id, &manifest)
+    }
+
+    fn write_dual_tool_package(workspace: &Path, id: &str) -> String {
+        let manifest = format!(
+            r#"
+schema_version = 1
+id = "{id}"
+name = "{id}"
+version = "0.1.0"
+surfaces = ["tool"]
+permissions = [{{ kind = "surface", surface = "tool" }}, {{ kind = "tool", name = "Echo" }}, {{ kind = "tool", name = "Other" }}]
+
+[runtime]
+kind = "wasm"
+entry = "plugin.wasm"
+abi = "yoi-plugin-wasm-1"
+
+[[tools]]
+name = "Echo"
+description = "Echo input"
+input_schema = {{ type = "object" }}
+
+[[tools]]
+name = "Other"
+description = "Other input"
+input_schema = {{ type = "object" }}
+"#
+        );
+        write_plugin_manifest(workspace, id, &manifest)
+    }
+
+    fn write_plugin_manifest(workspace: &Path, id: &str, manifest: &str) -> String {
+        let package_dir = workspace.join(".yoi/plugins");
+        fs::create_dir_all(&package_dir).unwrap();
+        let package = package_dir.join(format!("{id}.yoi-plugin"));
         write_stored_zip(
             &package,
             &[
@@ -768,7 +986,13 @@ input_schema = { type = "object" }
             user_data_home: None,
             limits: PluginDiscoveryLimits::default(),
         });
-        discovery.packages[0].digest.clone()
+        discovery
+            .packages
+            .iter()
+            .find(|package| package.identity.local_id == id)
+            .unwrap()
+            .digest
+            .clone()
     }
 
     fn write_stored_zip(path: &Path, entries: &[(&str, &[u8])]) {
