@@ -126,3 +126,18 @@ Next action:
 Ticket body/thread, relation metadata, orchestration plan records, related completed Tickets, Orchestrator worktree, visible Pods, existing branch/worktree, and bounded Component Model runtime code context were checked. Depends-on blockers are closed, Plugin CLI / HTTPS / FS related work are closed, and no dirty-state blocker or missing planning decision was found. Accepting this queued Ticket for implementation before worktree/Pod side effects.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-19T16:25:23Z -->
+
+## Implementation report
+
+Implementation orchestration start:
+- Acceptance records were committed on Orchestrator branch: `878517dc ticket: accept plugin component model runtime`.
+- Created implementation worktree `/home/hare/Projects/yoi/.worktree/00001KVG0HR96-plugin-component-model-runtime` on branch `impl/00001KVG0HR96-plugin-component-model-runtime` at `878517dc`.
+- Initial `SpawnPod` attempt with only the implementation worktree as readable scope failed because the spawned runtime workspace identity is `/home/hare/Projects/yoi` and that root was not readable under the child scope. No child Pod remained registered.
+- Retried with read-only scope for `/home/hare/Projects/yoi` plus write scope limited to the implementation worktree. Coder Pod `yoi-coder-00001KVG0HR96` started successfully. The task explicitly instructs the Coder to edit/build/commit only in the implementation worktree and not to operate in the root/original workspace.
+
+Next action:
+- Wait for Coder implementation report, then inspect branch diff/validation evidence and route to Reviewer.
+
+---
