@@ -2503,10 +2503,10 @@ async fn load_multi_pod_snapshot(
 
     #[cfg(feature = "e2e-test")]
     let source_started = Instant::now();
-    let companion_presence = load_exact_companion_pod_presence(&companion_pod_name).await?;
+    let companion_presence = companion_pod_presence(&companion_pod_name, &list);
     #[cfg(feature = "e2e-test")]
     source_timings.push(PanelE2eSourceTiming {
-        source: "companion.presence",
+        source: "companion.presence.from_initial_list",
         elapsed_ms: source_started.elapsed().as_millis(),
     });
 
@@ -2557,12 +2557,12 @@ async fn load_multi_pod_snapshot(
     let orchestrator_presence = match &config {
         TicketConfigAvailability::Absent | TicketConfigAvailability::Unusable(_) => None,
         TicketConfigAvailability::Usable => {
-            Some(load_exact_pod_presence(&orchestrator_pod_name).await?)
+            Some(orchestrator_pod_presence(&orchestrator_pod_name, &list))
         }
     };
     #[cfg(feature = "e2e-test")]
     source_timings.push(PanelE2eSourceTiming {
-        source: "orchestrator.presence",
+        source: "orchestrator.presence.from_initial_list",
         elapsed_ms: source_started.elapsed().as_millis(),
     });
 
@@ -3373,18 +3373,6 @@ fn existing_ticket_claim_notice(
             "Ticket {ticket_id} has a stale local Intake claim for {pod_name}; explicit reclaim/diagnostic is required before starting a replacement."
         ),
     }
-}
-
-async fn load_exact_companion_pod_presence(
-    pod_name: &str,
-) -> Result<CompanionPodPresence, MultiPodError> {
-    let list = load_pod_list(Some(pod_name.to_string()), usize::MAX).await?;
-    Ok(companion_pod_presence(pod_name, &list))
-}
-
-async fn load_exact_pod_presence(pod_name: &str) -> Result<OrchestratorPodPresence, MultiPodError> {
-    let list = load_pod_list(Some(pod_name.to_string()), usize::MAX).await?;
-    Ok(orchestrator_pod_presence(pod_name, &list))
 }
 
 async fn load_pod_list(

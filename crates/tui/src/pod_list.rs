@@ -7,9 +7,7 @@ use client::PodClient;
 use pod_registry::{LockFileGuard, default_registry_path};
 use pod_store::{PodActiveSegmentRef, PodMetadata, PodMetadataStore};
 use protocol::{Event, PodStatus};
-use session_store::{
-    FsStore, LogEntry, LoggedContentPart, LoggedItem, SegmentId, SessionId, Store,
-};
+use session_store::{FsStore, SegmentId, SessionId};
 
 #[derive(Debug, Clone)]
 pub(crate) struct PodList {
@@ -27,20 +25,20 @@ impl PodList {
     ) -> Self {
         let mut entries_by_name: BTreeMap<String, PodListEntry> = BTreeMap::new();
 
-        for live_info in live {
-            let name = live_info.pod_name.clone();
-            entries_by_name
-                .entry(name.clone())
-                .or_insert_with(|| PodListEntry::new(name, source))
-                .merge_live(live_info);
-        }
-
         for stored_info in stored {
             let name = stored_info.pod_name.clone();
             entries_by_name
                 .entry(name.clone())
                 .or_insert_with(|| PodListEntry::new(name, source))
                 .merge_stored(stored_info);
+        }
+
+        for live_info in live {
+            let name = live_info.pod_name.clone();
+            entries_by_name
+                .entry(name.clone())
+                .or_insert_with(|| PodListEntry::new(name, source))
+                .merge_live(live_info);
         }
 
         let mut entries: Vec<PodListEntry> = entries_by_name.into_values().collect();
@@ -358,7 +356,7 @@ pub(crate) async fn read_reachable_live_pod_infos(
 }
 
 async fn probe_reachable_live_pod_infos(
-    store: &FsStore,
+    _store: &FsStore,
     records: Vec<LivePodInfo>,
 ) -> Result<Vec<LivePodInfo>, io::Error> {
     let mut handles = Vec::with_capacity(records.len());
@@ -371,10 +369,9 @@ async fn probe_reachable_live_pod_infos(
         let result = handle
             .await
             .map_err(|e| io::Error::other(format!("live status probe task failed: {e}")))?;
-        let Ok(mut record) = result else {
+        let Ok(record) = result else {
             continue;
         };
-        record.summary = summarize_live_pod(store, &record);
         reachable.push(record);
     }
     Ok(reachable)
@@ -462,109 +459,22 @@ struct SegmentSummary {
     preview: Option<String>,
 }
 
-fn summarize_live_pod(store: &FsStore, live: &LivePodInfo) -> PodEntrySummary {
-    let Some(segment_id) = live.segment_id else {
-        return PodEntrySummary::default();
-    };
-    let session_id = store.lookup_session_of(segment_id).ok().flatten();
-    let Some(session_id) = session_id else {
-        return PodEntrySummary {
-            active_session_id: None,
-            active_segment_id: Some(segment_id),
-            updated_at: 0,
-            preview: None,
-        };
-    };
-    let summary = summarize_segment(store, session_id, segment_id);
-    PodEntrySummary {
-        active_session_id: Some(session_id),
-        active_segment_id: Some(segment_id),
-        updated_at: summary.updated_at,
-        preview: summary.preview,
-    }
-}
-
-fn summarize_metadata(store: &FsStore, active: Option<&PodActiveSegmentRef>) -> SegmentSummary {
+fn summarize_metadata(_store: &FsStore, active: Option<&PodActiveSegmentRef>) -> SegmentSummary {
     let Some(active) = active else {
         return SegmentSummary {
             updated_at: 0,
             preview: None,
         };
     };
-    let Some(segment_id) = active.segment_id else {
-        return SegmentSummary {
+    match active.segment_id {
+        Some(segment_id) => SegmentSummary {
+            updated_at: 0,
+            preview: Some(format!("active segment {segment_id}")),
+        },
+        None => SegmentSummary {
             updated_at: 0,
             preview: Some("[pending segment]".to_string()),
-        };
-    };
-    summarize_segment(store, active.session_id, segment_id)
-}
-
-fn summarize_segment(
-    store: &FsStore,
-    session_id: SessionId,
-    segment_id: SegmentId,
-) -> SegmentSummary {
-    match store.read_all(session_id, segment_id) {
-        Ok(entries) => SegmentSummary {
-            updated_at: last_entry_ts(&entries).unwrap_or(0),
-            preview: last_message_preview(&entries).or_else(|| Some("[empty]".to_string())),
         },
-        Err(_) => SegmentSummary {
-            updated_at: 0,
-            preview: Some("[corrupt segment]".to_string()),
-        },
-    }
-}
-
-fn last_entry_ts(entries: &[LogEntry]) -> Option<u64> {
-    entries.iter().map(log_entry_ts).max()
-}
-
-fn log_entry_ts(entry: &LogEntry) -> u64 {
-    match entry {
-        LogEntry::SegmentStart { ts, .. }
-        | LogEntry::Invoke { ts, .. }
-        | LogEntry::UserInput { ts, .. }
-        | LogEntry::AssistantItem { ts, .. }
-        | LogEntry::ToolResult { ts, .. }
-        | LogEntry::SystemItem { ts, .. }
-        | LogEntry::TurnEnd { ts, .. }
-        | LogEntry::RunCompleted { ts, .. }
-        | LogEntry::RunErrored { ts, .. }
-        | LogEntry::ConfigChanged { ts, .. }
-        | LogEntry::LlmUsage { ts, .. }
-        | LogEntry::Extension { ts, .. } => *ts,
-    }
-}
-
-fn last_message_preview(entries: &[LogEntry]) -> Option<String> {
-    for entry in entries.iter().rev() {
-        match entry {
-            LogEntry::UserInput { segments, .. } => {
-                let text = protocol::Segment::flatten_to_text(segments);
-                if !text.is_empty() {
-                    return Some(format!("user: {}", trim_one_line(&text, 60)));
-                }
-            }
-            LogEntry::AssistantItem { item, .. } => {
-                if let Some(text) = first_text_logged(item) {
-                    return Some(format!("assistant: {}", trim_one_line(&text, 60)));
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn first_text_logged(item: &LoggedItem) -> Option<String> {
-    match item {
-        LoggedItem::Message { content, .. } => content.iter().find_map(|p| match p {
-            LoggedContentPart::Text { text } => Some(text.clone()),
-            _ => None,
-        }),
-        _ => None,
     }
 }
 
@@ -652,7 +562,7 @@ mod tests {
     use pod_store::FsPodStore;
     use pod_store::{PodActiveSegmentRef, PodMetadataStore};
     use protocol::stream::JsonLineWriter;
-    use session_store::{new_segment_id, new_session_id};
+    use session_store::{LogEntry, Store, new_segment_id, new_session_id};
     use tempfile::tempdir;
     use tokio::net::UnixListener;
     use tokio::sync::Barrier;
@@ -660,44 +570,35 @@ mod tests {
     const SOURCE: PodVisibilitySource = PodVisibilitySource::ResumePicker;
 
     #[test]
-    fn pod_list_rows_are_sorted_by_active_segment_timestamp() {
+    fn stored_metadata_summary_uses_segment_marker_without_reading_session_log() {
         let dir = tempdir().unwrap();
         let store = FsStore::new(dir.path()).unwrap();
-        let earlier_session = new_session_id();
-        let later_session = new_session_id();
-        let earlier_segment = new_segment_id();
-        let later_segment = new_segment_id();
+        let session = new_session_id();
+        let segment = new_segment_id();
 
-        append_start(&store, earlier_session, earlier_segment, 10);
+        append_start(&store, session, segment, 10);
         append_user(
             &store,
-            earlier_session,
-            earlier_segment,
+            session,
+            segment,
             100,
-            "old pod update",
+            "session log text should not be scanned",
         );
-        append_start(&store, later_session, later_segment, 20);
-        append_user(&store, later_session, later_segment, 200, "new pod update");
 
-        let entries = PodList::from_sources(
+        let entry = single_entry(PodList::from_sources(
             SOURCE,
-            vec![
-                metadata_info(&store, "older", earlier_session, earlier_segment),
-                metadata_info(&store, "newer", later_session, later_segment),
-            ],
+            vec![metadata_info(&store, "stored", session, segment)],
             vec![],
             None,
             10,
-        )
-        .entries;
+        ));
 
-        assert_eq!(entries[0].name, "newer");
-        assert_eq!(entries[0].summary.updated_at, 200);
+        assert_eq!(entry.name, "stored");
+        assert_eq!(entry.summary.updated_at, 0);
         assert_eq!(
-            entries[0].summary.preview.as_deref(),
-            Some("user: new pod update")
+            entry.summary.preview.as_deref(),
+            Some(format!("active segment {segment}").as_str())
         );
-        assert_eq!(entries[1].name, "older");
     }
 
     #[test]

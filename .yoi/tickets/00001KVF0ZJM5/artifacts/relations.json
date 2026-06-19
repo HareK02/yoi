@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KVF0ZJM5",
+      "kind": "related",
+      "target": "00001KVDETSN6",
+      "note": "Implements live startup latency improvement after dashboard content-ready measurement exposed Pod probe bottleneck.",
+      "author": "yoi ticket",
+      "at": "2026-06-19T04:19:09Z"
+    },
+    {
+      "ticket_id": "00001KVF0ZJM5",
+      "kind": "related",
+      "target": "00001KVDQH839",
+      "note": "Uses shell/live startup measurements added by the E2E launch-path work.",
+      "author": "yoi ticket",
+      "at": "2026-06-19T04:19:09Z"
+    }
+  ]
+}
