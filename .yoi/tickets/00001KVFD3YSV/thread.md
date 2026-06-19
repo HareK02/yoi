@@ -708,3 +708,65 @@ Next:
 - Reviewer output を確認し、approve なら Orchestrator worktree への merge/validation/cleanup/close-ready 処理へ進む。request_changes なら blocker を記録して Coder に戻す。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVFD3YSV-r4 at: 2026-06-19T13:45:01Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+対象:
+- Ticket: `00001KVFD3YSV`
+- branch: `impl/00001KVFD3YSV-plugin-cli-inspection`
+- commits:
+  - `462de32a` — `plugin: add cli inspection`
+  - `b5f10ab7` — `plugin: align inspection statuses`
+  - `dfa966db` — `plugin: report inspection package metadata`
+  - `982a1b75` — `plugin: validate inspected tool schemas`
+
+Resolved:
+- round-4 Tool schema/name blocker は解消済み。
+- Static inspection は duplicate tool names、invalid names、invalid `input_schema`、recursive/schema member issues を検出する。
+- Invalid Tool definitions は typed static inspection で ineligible になり、bounded diagnostics が出る。
+- `partial` は mixed usable/unusable tools を表現できる。
+- JSON/human invalid schema/name coverage が追加されている。
+- Prior metadata/status fixes も維持されている。
+
+Remaining blocker:
+- Configured invalid / incompatible package が `rejected` ではなく `missing` と報告され得る。
+
+Evidence:
+- Ticket acceptance は `enabled but absent package => missing` と `invalid manifest / incompatible API => rejected with diagnostic` を区別している。
+- `crates/yoi/src/plugin_cli.rs` の snapshot construction は configured enablements を diagnostics より先に記録する。
+  - config enablement が `configured = true` と inferred `package_path` を設定する。
+  - discovery/resolution diagnostics for invalid package files は後から attach される。
+- しかし `ItemBuilder::finish` の status precedence は概ね次の順序になっている。
+
+```rust
+} else if self.discovered && !self.configured {
+    "disabled"
+} else if self.configured && !self.discovered {
+    "missing"
+} else {
+    "rejected"
+}
+```
+
+- そのため `project:bad` が明示 enable され、`.yoi/plugins/bad.yoi-plugin` が存在するが manifest invalid / unsupported API version の場合、discovery diagnostic は出るが discovered package は作られない。builder は `configured=true`, `discovered=false`, diagnostics present となり、status が `missing` になる。
+- Current tests は unconfigured invalid manifests as rejected と configured digest mismatch as rejected を覆るが、configured invalid/incompatible packages を覆っていない。
+
+Why this blocks acceptance:
+- CLI inspection は package discovery / enablement resolution の debugging surface であり、存在するが invalid/incompatible な package と、存在しない package を区別する必要がある。
+- invalid manifest / incompatible API を `missing` と表示すると、原因調査を誤誘導し、Ticket の `rejected` semantics を満たさない。
+
+Requested changes:
+- Configured package に discovery/resolution diagnostic が attach されている場合、absent package `missing` よりも `rejected` を優先する。
+- enabled but truly absent package だけを `missing` にする。
+- Add tests for configured invalid manifest / incompatible API package reporting `rejected` with diagnostic in JSON/human output.
+- Preserve current fixes: status vocabulary, package path/API fields, Tool schema validation, read-only/no-execution.
+
+Reviewer validation:
+- Static review only, per read-only boundary and because Orchestrator already reran validation.
+- Inspected final branch clean at HEAD `982a1b75`, incremental diff `dfa966db..982a1b75`, final implementation in `crates/pod/src/feature/plugin.rs`, `crates/yoi/src/plugin_cli.rs`, and relevant Ticket acceptance text.
+
+---
