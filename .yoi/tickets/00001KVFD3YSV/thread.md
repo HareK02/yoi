@@ -1154,3 +1154,66 @@ Next:
 - Reviewer output を確認し、approve なら Orchestrator worktree への merge/validation/cleanup/close-ready 処理へ進む。request_changes なら blocker を記録して Coder に戻す。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVFD3YSV-r6 at: 2026-06-19T14:18:42Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+対象:
+- Ticket: `00001KVFD3YSV`
+- branch: `impl/00001KVFD3YSV-plugin-cli-inspection`
+- commits:
+  - `462de32a` — `plugin: add cli inspection`
+  - `b5f10ab7` — `plugin: align inspection statuses`
+  - `dfa966db` — `plugin: report inspection package metadata`
+  - `982a1b75` — `plugin: validate inspected tool schemas`
+  - `a5f3b0b5` — `plugin: reject configured invalid packages`
+  - `0142ef1d` — `plugin: distinguish present invalid packages`
+
+No blockers found.
+
+Evidence reviewed:
+- `a5f3b0b5..0142ef1d` only changes `crates/yoi/src/plugin_cli.rs`.
+- New `package_present` tracking is wired into snapshot construction:
+  - discovered packages set it directly;
+  - diagnostics carrying `source + package` also mark the package as present;
+  - this covers invalid present packages even when diagnostic kind is `missing`.
+- Status selection now keeps `missing` only for configured-but-undiscovered items that have neither a present package nor non-`missing` diagnostics:
+  - `configured && !discovered && package_present` => `rejected`
+  - `configured && !discovered && has_non_missing_diagnostic` => `rejected`
+  - otherwise => `missing`
+- Present-but-invalid `Missing` diagnostic cases are covered:
+  - package exists but root `plugin.toml` is absent;
+  - manifest exists but references a missing runtime/package entry;
+  - tests assert both JSON and human output report `rejected`, not `missing`, while preserving `missing` diagnostics.
+- Prior fixes are preserved:
+  - item status vocabulary remains limited to `active`, `disabled`, `missing`, `rejected`, `partial`;
+  - list/show include package path plus schema/API fields;
+  - static inspection covers tool name and `input_schema` validity;
+  - inspection path remains static/read-only, with no WASM/tool execution path introduced;
+  - bounded output remains in place via item/diagnostic/text limits;
+  - host API inspection remains structured around `host_api.https` / `host_api.fs` eligibility/diagnostics, so future implementation can extend the authorization boundary without changing CLI report shape.
+
+Reviewer validation:
+- Static review of final branch and incremental diff.
+- Read Ticket requirements/acceptance.
+- `git diff --check 462de32a^..HEAD` — passed
+- `git status --short` — clean
+
+Orchestrator validation already confirmed:
+- `cargo fmt --check` — passed
+- `cargo check -p yoi -p pod -p manifest` — passed
+- `cargo test -p yoi plugin -- --nocapture` — passed
+- `cargo test -p pod static_inspection -- --nocapture` — passed
+- `cargo test -p pod plugin -- --nocapture` — passed
+- `cargo test -p manifest plugin -- --nocapture` — passed
+- `git diff --check` — passed
+- `nix build .#yoi --no-link` — passed
+
+Conclusion:
+- Previous request_changes blockers are resolved.
+- Implementation satisfies the recorded Ticket acceptance criteria and is ready for merge/validation in the Orchestrator worktree.
+
+---
