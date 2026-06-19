@@ -184,3 +184,32 @@ Next action:
 - 特に read-only/no-execution、JSON typed structure、bounded diagnostics、grant mismatch/no grant/invalid/ambiguous ref coverage、secrets leakage avoidance、product CLI / lower crate boundary、future host API extension point を確認する。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-19T11:03:51Z -->
+
+## Plan
+
+Review dispatch:
+
+Reviewer Pod `yoi-reviewer-00001KVFD3YSV` を read-only scope で起動した。
+
+Review target:
+- worktree: `/home/hare/Projects/yoi/.worktree/00001KVFD3YSV-plugin-cli-inspection`
+- branch: `impl/00001KVFD3YSV-plugin-cli-inspection`
+- commit: `462de32a`
+
+Reviewer focus:
+- recorded intent / invariants / acceptance criteria に対する適合性。
+- `yoi plugin list` / `yoi plugin show <ref>` と `--json` が read-only typed inspection surface になっていること。
+- Plugin WASM / Tool code / hooks / services / ingress を実行していないこと。
+- human output が typed report の thin formatting であり、JSON structure が stable であること。
+- active / disabled / missing / rejected / partial の status vocabulary と package/tool-level outcome が適切であること。
+- missing ref / ambiguous unqualified ref / invalid manifest / digest-version-source mismatch / missing grant-denied permission / unsupported permission diagnostics が bounded かつ安全であること。
+- secrets/raw untrusted content leakage がないこと。
+- product CLI ownership と lower-crate boundary が保たれていること。
+- future `https` / `fs` host API Tickets が inspection output を拡張しやすいこと。
+
+Next:
+- Reviewer output を確認し、approve なら Orchestrator worktree へ merge/validation/cleanup/close-ready 処理へ進む。request_changes なら blocker を記録して Coder に戻す。
+
+---
