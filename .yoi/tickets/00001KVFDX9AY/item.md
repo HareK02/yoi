@@ -1,11 +1,13 @@
 ---
 title: 'Plugin: implement fs host API for Tool runtime'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-19T07:53:13Z'
-updated_at: '2026-06-19T07:54:32Z'
+updated_at: '2026-06-19T10:19:52Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['plugin', 'fs', 'host-api', 'sandbox', 'path-safety', 'permission-grants', 'file-mutation']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-19T10:19:52Z'
 ---
 
 ## Background
