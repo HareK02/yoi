@@ -4,13 +4,16 @@
 //! executes Tool calls through the minimal sandboxed `yoi-plugin-wasm-1` WASM
 //! ABI. It deliberately does not grant filesystem, environment, hook, service,
 //! ingress, or ambient network authority. WASM Tools can only reach outbound HTTPS
-//! through the explicit `yoi:https` host import plus matching permission and
-//! allowlist grants.
+//! through the explicit `yoi:https` host import, and filesystem read/list/write
+//! through the explicit `yoi:fs` host import, with matching permissions and
+//! scoped allowlist grants.
 
-use std::collections::HashSet;
-use std::io::Read as _;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use std::sync::Arc;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -18,8 +21,9 @@ use llm_worker::tool::{
     Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOrigin, ToolOutput,
 };
 use manifest::plugin::{
-    PluginConfig, PluginDiscoveryLimits, PluginHostApi, PluginPermission, PluginSurface,
-    PluginToolManifest, ResolvedPluginRecord, read_resolved_plugin_runtime_module,
+    PluginConfig, PluginDiscoveryLimits, PluginFsGrant, PluginFsOperation, PluginHostApi,
+    PluginPermission, PluginSurface, PluginToolManifest, ResolvedPluginRecord,
+    read_resolved_plugin_runtime_module,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -466,6 +470,208 @@ fn execute_plugin_https_request(
         .map_err(|error| PluginHttpsError::new(format!("failed to encode HTTPS response: {error}")))
 }
 
+fn execute_plugin_fs_request(
+    record: &ResolvedPluginRecord,
+    operation: PluginFsRuntimeOperation,
+    request_bytes: &[u8],
+) -> Result<Vec<u8>, PluginFsError> {
+    if request_bytes.len() > PLUGIN_FS_MAX_REQUEST_BYTES {
+        return Err(PluginFsError::new(format!(
+            "FS request descriptor exceeds {} bytes",
+            PLUGIN_FS_MAX_REQUEST_BYTES
+        )));
+    }
+    authorize_plugin_host_api(record, PluginHostApi::Fs).map_err(|error| {
+        PluginFsError::new(format!(
+            "plugin host API dispatch denied: {}",
+            error.bounded_message()
+        ))
+    })?;
+
+    match operation {
+        PluginFsRuntimeOperation::Read => {
+            let request: PluginFsPathRequest =
+                serde_json::from_slice(request_bytes).map_err(|error| {
+                    PluginFsError::new(format!("invalid FS read request JSON: {error}"))
+                })?;
+            execute_plugin_fs_read(record, &request.path)
+        }
+        PluginFsRuntimeOperation::List => {
+            let request: PluginFsPathRequest =
+                serde_json::from_slice(request_bytes).map_err(|error| {
+                    PluginFsError::new(format!("invalid FS list request JSON: {error}"))
+                })?;
+            execute_plugin_fs_list(record, &request.path)
+        }
+        PluginFsRuntimeOperation::Write => {
+            let request: PluginFsWriteRequest =
+                serde_json::from_slice(request_bytes).map_err(|error| {
+                    PluginFsError::new(format!("invalid FS write request JSON: {error}"))
+                })?;
+            execute_plugin_fs_write(record, &request.path, request.content.as_bytes())
+        }
+    }
+}
+
+fn execute_plugin_fs_read(
+    record: &ResolvedPluginRecord,
+    path: &str,
+) -> Result<Vec<u8>, PluginFsError> {
+    let target = authorize_fs_path(record, PluginFsRuntimeOperation::Read, path)?;
+    let meta = fs::metadata(&target.resolved).map_err(|error| {
+        PluginFsError::new(format!(
+            "FS read metadata failed for {}: {error}",
+            safe_fs_path(path)
+        ))
+    })?;
+    if !meta.is_file() {
+        return Err(PluginFsError::new(format!(
+            "FS read target is not a regular file: {}",
+            safe_fs_path(path)
+        )));
+    }
+    let mut file = fs::File::open(&target.resolved).map_err(|error| {
+        PluginFsError::new(format!(
+            "FS read failed for {}: {error}",
+            safe_fs_path(path)
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take((PLUGIN_FS_MAX_READ_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            PluginFsError::new(format!(
+                "FS read failed for {}: {error}",
+                safe_fs_path(path)
+            ))
+        })?;
+    let truncated = bytes.len() > PLUGIN_FS_MAX_READ_BYTES;
+    if truncated {
+        bytes.truncate(PLUGIN_FS_MAX_READ_BYTES);
+    }
+    let response = PluginFsReadResponse {
+        path: safe_fs_path(path),
+        content: String::from_utf8_lossy(&bytes).into_owned(),
+        truncated,
+    };
+    serde_json::to_vec(&response)
+        .map_err(|error| PluginFsError::new(format!("failed to encode FS read response: {error}")))
+}
+
+fn execute_plugin_fs_list(
+    record: &ResolvedPluginRecord,
+    path: &str,
+) -> Result<Vec<u8>, PluginFsError> {
+    let target = authorize_fs_path(record, PluginFsRuntimeOperation::List, path)?;
+    let meta = fs::metadata(&target.resolved).map_err(|error| {
+        PluginFsError::new(format!(
+            "FS list metadata failed for {}: {error}",
+            safe_fs_path(path)
+        ))
+    })?;
+    if !meta.is_dir() {
+        return Err(PluginFsError::new(format!(
+            "FS list target is not a directory: {}",
+            safe_fs_path(path)
+        )));
+    }
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    for entry in fs::read_dir(&target.resolved).map_err(|error| {
+        PluginFsError::new(format!(
+            "FS list failed for {}: {error}",
+            safe_fs_path(path)
+        ))
+    })? {
+        let entry = entry.map_err(|error| {
+            PluginFsError::new(format!(
+                "FS list failed for {}: {error}",
+                safe_fs_path(path)
+            ))
+        })?;
+        if entries.len() >= PLUGIN_FS_MAX_LIST_ENTRIES {
+            truncated = true;
+            break;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let file_type = entry.file_type().map_err(|error| {
+            PluginFsError::new(format!(
+                "FS list failed for {}: {error}",
+                safe_fs_path(path)
+            ))
+        })?;
+        let kind = if file_type.is_dir() {
+            "dir"
+        } else if file_type.is_file() {
+            "file"
+        } else if file_type.is_symlink() {
+            "symlink"
+        } else {
+            "other"
+        };
+        entries.push(PluginFsDirEntry {
+            name,
+            kind: kind.to_string(),
+        });
+    }
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    let response = PluginFsListResponse {
+        path: safe_fs_path(path),
+        entries,
+        truncated,
+    };
+    serde_json::to_vec(&response)
+        .map_err(|error| PluginFsError::new(format!("failed to encode FS list response: {error}")))
+}
+
+fn execute_plugin_fs_write(
+    record: &ResolvedPluginRecord,
+    path: &str,
+    content: &[u8],
+) -> Result<Vec<u8>, PluginFsError> {
+    if content.len() > PLUGIN_FS_MAX_WRITE_BYTES {
+        return Err(PluginFsError::new(format!(
+            "FS write content exceeds {} bytes",
+            PLUGIN_FS_MAX_WRITE_BYTES
+        )));
+    }
+    let target = authorize_fs_write_path(record, path)?;
+    let lock = plugin_fs_write_lock(target.lock_key.clone());
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&target.resolved).map_err(|error| {
+        PluginFsError::new(format!(
+            "FS write failed for {}: {error}",
+            safe_fs_path(path)
+        ))
+    })?;
+    file.write_all(content).map_err(|error| {
+        PluginFsError::new(format!(
+            "FS write failed for {}: {error}",
+            safe_fs_path(path)
+        ))
+    })?;
+    file.sync_all().map_err(|error| {
+        PluginFsError::new(format!(
+            "FS write failed for {}: {error}",
+            safe_fs_path(path)
+        ))
+    })?;
+    let response = PluginFsWriteResponse {
+        path: safe_fs_path(path),
+        bytes_written: content.len(),
+    };
+    serde_json::to_vec(&response)
+        .map_err(|error| PluginFsError::new(format!("failed to encode FS write response: {error}")))
+}
+
 fn enforce_https_response_bounds(response: &mut PluginHttpsResponse, limits: PluginHttpsLimits) {
     if response.body.len() > limits.max_response_bytes {
         truncate_string_to_boundary(&mut response.body, limits.max_response_bytes);
@@ -488,6 +694,288 @@ fn truncate_string_to_boundary(value: &mut String, max_len: usize) {
         boundary -= 1;
     }
     value.truncate(boundary);
+}
+
+#[derive(Clone, Debug)]
+struct PluginFsResolvedPath {
+    resolved: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct PluginFsWritePath {
+    resolved: PathBuf,
+    lock_key: PathBuf,
+}
+
+fn authorize_fs_path(
+    record: &ResolvedPluginRecord,
+    operation: PluginFsRuntimeOperation,
+    path: &str,
+) -> Result<PluginFsResolvedPath, PluginFsError> {
+    let relative = parse_plugin_fs_relative_path(path)?;
+    let mut saw_operation_grant = false;
+    let mut last_error: Option<PluginFsError> = None;
+    for grant in &record.grants.fs {
+        if !grant_allows_operation(grant, operation) {
+            continue;
+        }
+        saw_operation_grant = true;
+        match resolve_plugin_fs_grant_root(grant)
+            .and_then(|root| resolve_existing_plugin_fs_path(&root, &relative, safe_fs_path(path)))
+        {
+            Ok(resolved) => return Ok(PluginFsResolvedPath { resolved }),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if !saw_operation_grant {
+        return Err(PluginFsError::new(format!(
+            "host_api.fs {} denied: no matching operation grant",
+            operation.as_str()
+        )));
+    }
+    Err(last_error.unwrap_or_else(|| {
+        PluginFsError::new(format!(
+            "host_api.fs {} denied by scoped path policy",
+            operation.as_str()
+        ))
+    }))
+}
+
+fn authorize_fs_write_path(
+    record: &ResolvedPluginRecord,
+    path: &str,
+) -> Result<PluginFsWritePath, PluginFsError> {
+    let relative = parse_plugin_fs_relative_path(path)?;
+    if relative.as_os_str().is_empty() || relative.file_name().is_none() {
+        return Err(PluginFsError::new("FS write path must name a file"));
+    }
+    let mut saw_operation_grant = false;
+    let mut last_error: Option<PluginFsError> = None;
+    for grant in &record.grants.fs {
+        if !grant_allows_operation(grant, PluginFsRuntimeOperation::Write) {
+            continue;
+        }
+        saw_operation_grant = true;
+        match resolve_plugin_fs_grant_root(grant)
+            .and_then(|root| resolve_writable_plugin_fs_path(&root, &relative, safe_fs_path(path)))
+        {
+            Ok(resolved) => return Ok(resolved),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if !saw_operation_grant {
+        return Err(PluginFsError::new(
+            "host_api.fs write denied: no matching operation grant",
+        ));
+    }
+    Err(last_error
+        .unwrap_or_else(|| PluginFsError::new("host_api.fs write denied by scoped path policy")))
+}
+
+fn grant_allows_operation(grant: &PluginFsGrant, operation: PluginFsRuntimeOperation) -> bool {
+    let requested = operation.grant_operation();
+    grant.operations.iter().any(|allowed| *allowed == requested)
+}
+
+fn parse_plugin_fs_relative_path(path: &str) -> Result<PathBuf, PluginFsError> {
+    if path.as_bytes().len() > PLUGIN_FS_MAX_PATH_BYTES {
+        return Err(PluginFsError::new(format!(
+            "FS path exceeds {} bytes",
+            PLUGIN_FS_MAX_PATH_BYTES
+        )));
+    }
+    if path.is_empty() {
+        return Err(PluginFsError::new("FS path must not be empty"));
+    }
+    if path.contains('\0') {
+        return Err(PluginFsError::new("FS path contains a NUL byte"));
+    }
+    let input = Path::new(path);
+    if input.is_absolute() {
+        return Err(PluginFsError::new(
+            "FS request paths must be relative to a configured fs grant root",
+        ));
+    }
+    let mut relative = PathBuf::new();
+    for component in input.components() {
+        match component {
+            Component::Normal(component) => relative.push(component),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(PluginFsError::new(
+                    "FS path traversal outside the grant root is denied",
+                ));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(PluginFsError::new(
+                    "FS request paths must be relative to a configured fs grant root",
+                ));
+            }
+        }
+    }
+    Ok(relative)
+}
+
+fn resolve_plugin_fs_grant_root(grant: &PluginFsGrant) -> Result<PathBuf, PluginFsError> {
+    let root = grant.root.trim();
+    if root.is_empty() || root.as_bytes().len() > PLUGIN_FS_MAX_PATH_BYTES {
+        return Err(PluginFsError::new("configured fs grant root is invalid"));
+    }
+    let root_path = Path::new(root);
+    if !root_path.is_absolute() {
+        return Err(PluginFsError::new(
+            "configured fs grant root must be an absolute path",
+        ));
+    }
+    let root_meta = fs::symlink_metadata(root_path)
+        .map_err(|_| PluginFsError::new("configured fs grant root is unavailable"))?;
+    if root_meta.file_type().is_symlink() {
+        return Err(PluginFsError::new(
+            "configured fs grant root must not be a symlink",
+        ));
+    }
+    let canonical = fs::canonicalize(root_path)
+        .map_err(|_| PluginFsError::new("configured fs grant root is unavailable"))?;
+    let metadata = fs::metadata(&canonical)
+        .map_err(|_| PluginFsError::new("configured fs grant root is unavailable"))?;
+    if !metadata.is_dir() {
+        return Err(PluginFsError::new(
+            "configured fs grant root must be a directory",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn resolve_existing_plugin_fs_path(
+    root: &Path,
+    relative: &Path,
+    requested: String,
+) -> Result<PathBuf, PluginFsError> {
+    let target = root.join(relative);
+    reject_symlink_components(root, relative, true, &requested)?;
+    let canonical = fs::canonicalize(&target).map_err(|error| {
+        PluginFsError::new(format!("FS path is unavailable for {requested}: {error}"))
+    })?;
+    if !canonical.starts_with(root) {
+        return Err(PluginFsError::new(format!(
+            "FS path escapes the configured grant root: {requested}"
+        )));
+    }
+    Ok(canonical)
+}
+
+fn resolve_writable_plugin_fs_path(
+    root: &Path,
+    relative: &Path,
+    requested: String,
+) -> Result<PluginFsWritePath, PluginFsError> {
+    let Some(file_name) = relative.file_name() else {
+        return Err(PluginFsError::new("FS write path must name a file"));
+    };
+    let parent_relative = relative.parent().unwrap_or_else(|| Path::new(""));
+    reject_symlink_components(root, parent_relative, true, &requested)?;
+    let parent = fs::canonicalize(root.join(parent_relative)).map_err(|error| {
+        PluginFsError::new(format!(
+            "FS write parent is unavailable for {requested}: {error}"
+        ))
+    })?;
+    if !parent.starts_with(root) {
+        return Err(PluginFsError::new(format!(
+            "FS write parent escapes the configured grant root: {requested}"
+        )));
+    }
+    let resolved = parent.join(file_name);
+    if let Ok(meta) = fs::symlink_metadata(&resolved) {
+        if meta.file_type().is_symlink() {
+            return Err(PluginFsError::new(format!(
+                "FS write target is a symlink: {requested}"
+            )));
+        }
+        if meta.is_dir() {
+            return Err(PluginFsError::new(format!(
+                "FS write target is a directory: {requested}"
+            )));
+        }
+        let canonical = fs::canonicalize(&resolved).map_err(|error| {
+            PluginFsError::new(format!(
+                "FS write target is unavailable for {requested}: {error}"
+            ))
+        })?;
+        if !canonical.starts_with(root) {
+            return Err(PluginFsError::new(format!(
+                "FS write target escapes the configured grant root: {requested}"
+            )));
+        }
+        return Ok(PluginFsWritePath {
+            resolved,
+            lock_key: canonical,
+        });
+    }
+    if !resolved.starts_with(root) {
+        return Err(PluginFsError::new(format!(
+            "FS write target escapes the configured grant root: {requested}"
+        )));
+    }
+    Ok(PluginFsWritePath {
+        lock_key: resolved.clone(),
+        resolved,
+    })
+}
+
+fn reject_symlink_components(
+    root: &Path,
+    relative: &Path,
+    include_leaf: bool,
+    requested: &str,
+) -> Result<(), PluginFsError> {
+    let mut current = root.to_path_buf();
+    let components = relative.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        current.push(name);
+        if !include_leaf && index + 1 == components.len() {
+            break;
+        }
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            PluginFsError::new(format!(
+                "FS path component is unavailable for {requested}: {error}"
+            ))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(PluginFsError::new(format!(
+                "FS path symlink escape is denied: {requested}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn plugin_fs_write_lock(path: PathBuf) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.entry(path)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn safe_fs_path(path: &str) -> String {
+    let mut sanitized = redact_secret_like(path).replace('\0', " ");
+    if sanitized.len() > 160 {
+        let mut boundary = 160;
+        while boundary > 0 && !sanitized.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        sanitized.truncate(boundary);
+        sanitized.push('…');
+    }
+    if sanitized.is_empty() {
+        ".".to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn validate_plugin_https_request(
@@ -620,6 +1108,14 @@ fn has_usable_https_grant(record: &ResolvedPluginRecord) -> bool {
                 let method = method.trim().to_ascii_uppercase();
                 PLUGIN_HTTPS_ALLOWED_METHODS.contains(&method.as_str())
             })
+    })
+}
+
+fn has_usable_fs_grant(record: &ResolvedPluginRecord) -> bool {
+    record.grants.fs.iter().any(|grant| {
+        !grant.root.trim().is_empty()
+            && Path::new(&grant.root).is_absolute()
+            && !grant.operations.is_empty()
     })
 }
 
@@ -918,9 +1414,14 @@ fn authorize_plugin_host_api(
             }
             Ok(())
         }
-        PluginHostApi::Fs => Err(PluginPermissionError(format!(
-            "host_api.{api} is not implemented"
-        ))),
+        PluginHostApi::Fs => {
+            if !has_usable_fs_grant(record) {
+                return Err(PluginPermissionError(
+                    "granted host_api.fs scope allowlist is missing".to_string(),
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -966,6 +1467,7 @@ const PLUGIN_WASM_TIMEOUT: Duration = Duration::from_secs(1);
 const PLUGIN_WASM_MEMORY_BYTES: usize = 2 * 1024 * 1024;
 const PLUGIN_WASM_TABLE_ELEMENTS: usize = 256;
 const PLUGIN_WASM_HTTPS_MODULE: &str = "yoi:https";
+const PLUGIN_WASM_FS_MODULE: &str = "yoi:fs";
 const PLUGIN_HTTPS_MAX_REQUEST_BYTES: usize = 48 * 1024;
 const PLUGIN_HTTPS_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024;
 const PLUGIN_HTTPS_MAX_REQUEST_HEADERS: usize = 16;
@@ -976,6 +1478,97 @@ const PLUGIN_HTTPS_MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const PLUGIN_HTTPS_TIMEOUT: Duration = Duration::from_secs(5);
 const PLUGIN_HTTPS_ALLOWED_METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE"];
 const PLUGIN_HTTPS_REDACTION: &str = "<redacted>";
+const PLUGIN_FS_MAX_REQUEST_BYTES: usize = 64 * 1024;
+const PLUGIN_FS_MAX_PATH_BYTES: usize = 4096;
+const PLUGIN_FS_MAX_READ_BYTES: usize = 64 * 1024;
+const PLUGIN_FS_MAX_WRITE_BYTES: usize = 64 * 1024;
+const PLUGIN_FS_MAX_LIST_ENTRIES: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PluginFsRuntimeOperation {
+    Read,
+    List,
+    Write,
+}
+
+impl PluginFsRuntimeOperation {
+    fn grant_operation(self) -> PluginFsOperation {
+        match self {
+            Self::Read => PluginFsOperation::Read,
+            Self::List => PluginFsOperation::List,
+            Self::Write => PluginFsOperation::Write,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::List => "list",
+            Self::Write => "write",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginFsPathRequest {
+    path: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginFsWriteRequest {
+    path: String,
+    content: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PluginFsReadResponse {
+    path: String,
+    content: String,
+    truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PluginFsListResponse {
+    path: String,
+    entries: Vec<PluginFsDirEntry>,
+    truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PluginFsDirEntry {
+    name: String,
+    kind: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PluginFsWriteResponse {
+    path: String,
+    bytes_written: usize,
+}
+
+#[derive(Debug)]
+struct PluginFsError {
+    message: String,
+}
+
+impl PluginFsError {
+    fn new(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            message: bounded_message(redact_secret_like(&message)),
+        }
+    }
+}
+
+impl std::fmt::Display for PluginFsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PluginFsError {}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1170,6 +1763,7 @@ struct PluginWasmHostState {
     output: Vec<u8>,
     output_error: Option<String>,
     https_response: Vec<u8>,
+    fs_response: Vec<u8>,
     store_limits: wasmi::StoreLimits,
 }
 
@@ -1243,6 +1837,7 @@ fn run_plugin_wasm_tool_with_https_client(
             output: Vec::new(),
             output_error: None,
             https_response: Vec::new(),
+            fs_response: Vec::new(),
             store_limits,
         },
     );
@@ -1301,21 +1896,26 @@ fn validate_wasm_imports(
                     }
                 }
             }
-            "yoi:fs" => {
+            PLUGIN_WASM_FS_MODULE => {
                 authorize_plugin_host_api(record, PluginHostApi::Fs).map_err(|error| {
                     PluginWasmError::Module(format!(
                         "plugin host API dispatch denied: {}",
                         error.bounded_message()
                     ))
                 })?;
-                return Err(PluginWasmError::Module(
-                    "host_api.fs is not implemented".to_string(),
-                ));
+                match import.name() {
+                    "read" | "list" | "write" | "response_len" | "response_read" => {}
+                    other => {
+                        return Err(PluginWasmError::Module(format!(
+                            "unsupported fs host import `{other}`"
+                        )));
+                    }
+                }
             }
             other => {
                 return Err(PluginWasmError::Module(format!(
-                    "unsupported import module `{}`; only `{}` and `{}` are available",
-                    other, PLUGIN_WASM_HOST_MODULE, PLUGIN_WASM_HTTPS_MODULE
+                    "unsupported import module `{}`; only `{}`, `{}`, and `{}` are available",
+                    other, PLUGIN_WASM_HOST_MODULE, PLUGIN_WASM_HTTPS_MODULE, PLUGIN_WASM_FS_MODULE
                 )));
             }
         }
@@ -1398,6 +1998,51 @@ fn define_plugin_wasm_host_imports(
             },
         )
         .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    linker
+        .func_wrap(
+            PLUGIN_WASM_FS_MODULE,
+            "read",
+            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, ptr: i32, len: i32| -> i32 {
+                read_guest_fs_request(&mut caller, ptr, len, PluginFsRuntimeOperation::Read)
+            },
+        )
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    linker
+        .func_wrap(
+            PLUGIN_WASM_FS_MODULE,
+            "list",
+            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, ptr: i32, len: i32| -> i32 {
+                read_guest_fs_request(&mut caller, ptr, len, PluginFsRuntimeOperation::List)
+            },
+        )
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    linker
+        .func_wrap(
+            PLUGIN_WASM_FS_MODULE,
+            "write",
+            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, ptr: i32, len: i32| -> i32 {
+                read_guest_fs_request(&mut caller, ptr, len, PluginFsRuntimeOperation::Write)
+            },
+        )
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    linker
+        .func_wrap(
+            PLUGIN_WASM_FS_MODULE,
+            "response_len",
+            |caller: wasmi::Caller<'_, PluginWasmHostState>| -> i32 {
+                caller.data().fs_response.len() as i32
+            },
+        )
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    linker
+        .func_wrap(
+            PLUGIN_WASM_FS_MODULE,
+            "response_read",
+            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, ptr: i32, len: i32| -> i32 {
+                write_host_bytes_to_guest(&mut caller, ptr, len, HostBuffer::FsResponse)
+            },
+        )
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
     Ok(())
 }
 
@@ -1406,6 +2051,7 @@ enum HostBuffer {
     ToolName,
     Input,
     HttpsResponse,
+    FsResponse,
 }
 
 fn write_host_bytes_to_guest(
@@ -1421,6 +2067,7 @@ fn write_host_bytes_to_guest(
         HostBuffer::ToolName => caller.data().tool_name.clone(),
         HostBuffer::Input => caller.data().input.clone(),
         HostBuffer::HttpsResponse => caller.data().https_response.clone(),
+        HostBuffer::FsResponse => caller.data().fs_response.clone(),
     };
     if len as usize != bytes.len() {
         return -1;
@@ -1458,6 +2105,32 @@ fn read_guest_https_request(
         }
         Err(error) => {
             caller.data_mut().output_error = Some(error.0);
+            -1
+        }
+    }
+}
+
+fn read_guest_fs_request(
+    caller: &mut wasmi::Caller<'_, PluginWasmHostState>,
+    ptr: i32,
+    len: i32,
+    operation: PluginFsRuntimeOperation,
+) -> i32 {
+    let bytes = match read_guest_bytes(caller, ptr, len, PLUGIN_FS_MAX_REQUEST_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            caller.data_mut().output_error = Some(error);
+            return -1;
+        }
+    };
+    let record = caller.data().record.clone();
+    match execute_plugin_fs_request(&record, operation, &bytes) {
+        Ok(response) => {
+            caller.data_mut().fs_response = response;
+            caller.data().fs_response.len() as i32
+        }
+        Err(error) => {
+            caller.data_mut().output_error = Some(error.message);
             -1
         }
     }
@@ -1870,6 +2543,7 @@ mod tests {
                 digest: Some("sha256:abc".to_string()),
                 permissions,
                 https: Vec::new(),
+                fs: Vec::new(),
             },
             config: None,
         }
@@ -2036,6 +2710,79 @@ mod tests {
         .expect("valid wat")
     }
 
+    fn fs_request_json(path: &str) -> String {
+        json!({ "path": path }).to_string()
+    }
+
+    fn fs_write_request_json(path: &str, content: &str) -> String {
+        json!({ "path": path, "content": content }).to_string()
+    }
+
+    fn record_with_fs_grant(
+        root: &Path,
+        operations: Vec<PluginFsOperation>,
+    ) -> ResolvedPluginRecord {
+        let mut record = record(vec![tool("FsTool")]);
+        let fs_permission = PluginPermission::HostApi {
+            api: PluginHostApi::Fs,
+        };
+        record.manifest.permissions.push(fs_permission.clone());
+        record.grants.permissions.push(fs_permission);
+        record.grants.fs.push(PluginFsGrant {
+            root: root.to_string_lossy().into_owned(),
+            operations,
+        });
+        record
+    }
+
+    fn runtime_record_with_fs_wasm(
+        wasm: Vec<u8>,
+        root: &Path,
+        operations: Vec<PluginFsOperation>,
+    ) -> (TempDir, ResolvedPluginRecord) {
+        let (dir, mut record) = resolved_record_with_wasm(wasm);
+        let fs_permission = PluginPermission::HostApi {
+            api: PluginHostApi::Fs,
+        };
+        record.manifest.permissions.push(fs_permission.clone());
+        record.grants.permissions.push(fs_permission);
+        record.grants.fs.push(PluginFsGrant {
+            root: root.to_string_lossy().into_owned(),
+            operations,
+        });
+        (dir, record)
+    }
+
+    fn wasm_tool_that_calls_fs_read(request: &str) -> Vec<u8> {
+        let output = br#"{"summary":"fs ok","content":"ordinary tool result path"}"#;
+        wat::parse_str(format!(
+            r#"
+            (module
+              (import "yoi:tool" "output_write" (func $output_write (param i32 i32) (result i32)))
+              (import "yoi:fs" "read" (func $fs_read (param i32 i32) (result i32)))
+              (import "yoi:fs" "response_len" (func $fs_response_len (result i32)))
+              (import "yoi:fs" "response_read" (func $fs_response_read (param i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 16) "{}")
+              (data (i32.const 4096) "{}")
+              (func (export "yoi_tool_call")
+                (local $n i32)
+                (local.set $n (call $fs_read (i32.const 16) (i32.const {})))
+                (if (i32.lt_s (local.get $n) (i32.const 0)) (then unreachable))
+                (drop (call $fs_response_len))
+                (drop (call $fs_response_read (i32.const 8192) (i32.const 4096)))
+                (drop (call $output_write (i32.const 4096) (i32.const {})))
+              )
+            )
+            "#,
+            wat_bytes(request.as_bytes()),
+            wat_bytes(output),
+            request.len(),
+            output.len()
+        ))
+        .expect("valid wat")
+    }
+
     fn empty_wasm_tool() -> Vec<u8> {
         let output = br#"{"summary":"no network","content":"no https import"}"#;
         wat::parse_str(format!(
@@ -2135,6 +2882,237 @@ mod tests {
             "additionalProperties":{"type":"string"}
         }))
         .unwrap();
+    }
+
+    #[test]
+    fn wasm_tool_can_call_granted_fs_read_host_api() {
+        let root = TempDir::new().expect("temp root");
+        fs::write(root.path().join("allowed.txt"), "hello fs").expect("write fixture");
+        let (_dir, record) = runtime_record_with_fs_wasm(
+            wasm_tool_that_calls_fs_read(&fs_request_json("allowed.txt")),
+            root.path(),
+            vec![PluginFsOperation::Read],
+        );
+        let output = run_plugin_wasm_tool(record, "PluginEcho".to_string(), Vec::new())
+            .expect("tool output");
+        assert_eq!(output.summary, "fs ok");
+        assert_eq!(output.content.as_deref(), Some("ordinary tool result path"));
+    }
+
+    #[test]
+    fn granted_fs_read_list_and_write_are_scoped() {
+        let root = TempDir::new().expect("temp root");
+        fs::write(root.path().join("read.txt"), "hello fs").expect("write fixture");
+        fs::create_dir(root.path().join("dir")).expect("create dir");
+        fs::write(root.path().join("dir").join("entry.txt"), "entry").expect("write entry");
+        let record = record_with_fs_grant(
+            root.path(),
+            vec![
+                PluginFsOperation::Read,
+                PluginFsOperation::List,
+                PluginFsOperation::Write,
+            ],
+        );
+
+        let read = execute_plugin_fs_request(
+            &record,
+            PluginFsRuntimeOperation::Read,
+            fs_request_json("read.txt").as_bytes(),
+        )
+        .expect("read allowed");
+        let read: serde_json::Value = serde_json::from_slice(&read).expect("read response json");
+        assert_eq!(read["content"], "hello fs");
+        assert_eq!(read["truncated"], false);
+
+        let list = execute_plugin_fs_request(
+            &record,
+            PluginFsRuntimeOperation::List,
+            fs_request_json("dir").as_bytes(),
+        )
+        .expect("list allowed");
+        let list: serde_json::Value = serde_json::from_slice(&list).expect("list response json");
+        assert_eq!(list["entries"][0]["name"], "entry.txt");
+        assert_eq!(list["entries"][0]["kind"], "file");
+
+        let write = execute_plugin_fs_request(
+            &record,
+            PluginFsRuntimeOperation::Write,
+            fs_write_request_json("written.txt", "new content").as_bytes(),
+        )
+        .expect("write allowed");
+        let write: serde_json::Value = serde_json::from_slice(&write).expect("write response json");
+        assert_eq!(write["bytes_written"], "new content".len());
+        assert_eq!(
+            fs::read_to_string(root.path().join("written.txt")).expect("read written"),
+            "new content"
+        );
+    }
+
+    #[test]
+    fn missing_fs_grant_denies_even_when_manifest_requests_api() {
+        let root = TempDir::new().expect("temp root");
+        fs::write(root.path().join("secret.txt"), "must not leak").expect("write fixture");
+        let mut record = record(vec![tool("FsTool")]);
+        record.manifest.permissions.push(PluginPermission::HostApi {
+            api: PluginHostApi::Fs,
+        });
+        let error = execute_plugin_fs_request(
+            &record,
+            PluginFsRuntimeOperation::Read,
+            fs_request_json("secret.txt").as_bytes(),
+        )
+        .expect_err("grant denied");
+        assert!(error.message.contains("host_api.fs"));
+        assert!(!error.message.contains("must not leak"));
+    }
+
+    #[test]
+    fn workspace_scope_is_not_inherited_without_plugin_fs_grant() {
+        let root = TempDir::new().expect("temp root");
+        fs::write(root.path().join("workspace.txt"), "workspace authority").expect("write fixture");
+        let record = record(vec![tool("FsTool")]);
+        let error = execute_plugin_fs_request(
+            &record,
+            PluginFsRuntimeOperation::Read,
+            fs_request_json("workspace.txt").as_bytes(),
+        )
+        .expect_err("plugin grant required");
+        assert!(error.message.contains("host_api.fs"));
+        assert!(!error.message.contains("workspace authority"));
+    }
+
+    #[test]
+    fn fs_traversal_and_absolute_paths_are_rejected() {
+        let root = TempDir::new().expect("temp root");
+        let record = record_with_fs_grant(root.path(), vec![PluginFsOperation::Read]);
+        for path in ["../outside.txt", "/etc/passwd"] {
+            let error = execute_plugin_fs_request(
+                &record,
+                PluginFsRuntimeOperation::Read,
+                fs_request_json(path).as_bytes(),
+            )
+            .expect_err("path denied");
+            assert!(
+                error.message.contains("relative") || error.message.contains("traversal"),
+                "unexpected error: {}",
+                error.message
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fs_symlink_escape_is_rejected() {
+        let root = TempDir::new().expect("temp root");
+        let outside = TempDir::new().expect("outside root");
+        fs::write(outside.path().join("outside.txt"), "outside secret").expect("write outside");
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link"))
+            .expect("create symlink");
+        let record = record_with_fs_grant(root.path(), vec![PluginFsOperation::Read]);
+        let error = execute_plugin_fs_request(
+            &record,
+            PluginFsRuntimeOperation::Read,
+            fs_request_json("link/outside.txt").as_bytes(),
+        )
+        .expect_err("symlink denied");
+        assert!(error.message.contains("symlink"));
+        assert!(!error.message.contains("outside secret"));
+    }
+
+    #[test]
+    fn fs_read_write_and_list_bounds_are_enforced() {
+        let root = TempDir::new().expect("temp root");
+        fs::write(
+            root.path().join("big.txt"),
+            vec![b'a'; PLUGIN_FS_MAX_READ_BYTES + 1],
+        )
+        .expect("write big file");
+        let list_dir = root.path().join("many");
+        fs::create_dir(&list_dir).expect("create list dir");
+        for index in 0..=PLUGIN_FS_MAX_LIST_ENTRIES {
+            fs::write(list_dir.join(format!("entry-{index:03}.txt")), "x")
+                .expect("write list entry");
+        }
+        let record = record_with_fs_grant(
+            root.path(),
+            vec![
+                PluginFsOperation::Read,
+                PluginFsOperation::List,
+                PluginFsOperation::Write,
+            ],
+        );
+        let read = execute_plugin_fs_request(
+            &record,
+            PluginFsRuntimeOperation::Read,
+            fs_request_json("big.txt").as_bytes(),
+        )
+        .expect("bounded read allowed");
+        let read: serde_json::Value = serde_json::from_slice(&read).expect("read response json");
+        assert_eq!(read["truncated"], true);
+        assert_eq!(
+            read["content"].as_str().expect("content").len(),
+            PLUGIN_FS_MAX_READ_BYTES
+        );
+
+        let list = execute_plugin_fs_request(
+            &record,
+            PluginFsRuntimeOperation::List,
+            fs_request_json("many").as_bytes(),
+        )
+        .expect("bounded list allowed");
+        let list: serde_json::Value = serde_json::from_slice(&list).expect("list response json");
+        assert_eq!(list["truncated"], true);
+        assert_eq!(
+            list["entries"].as_array().expect("entries").len(),
+            PLUGIN_FS_MAX_LIST_ENTRIES
+        );
+
+        let too_large = "x".repeat(PLUGIN_FS_MAX_WRITE_BYTES + 1);
+        let error = execute_plugin_fs_request(
+            &record,
+            PluginFsRuntimeOperation::Write,
+            fs_write_request_json("too-large.txt", &too_large).as_bytes(),
+        )
+        .expect_err("oversize write denied");
+        assert!(error.message.contains("exceeds"));
+        assert!(!root.path().join("too-large.txt").exists());
+    }
+
+    #[test]
+    fn fs_diagnostics_redact_secret_like_path_segments() {
+        let root = TempDir::new().expect("temp root");
+        let record = record_with_fs_grant(root.path(), vec![PluginFsOperation::Read]);
+        let error = execute_plugin_fs_request(
+            &record,
+            PluginFsRuntimeOperation::Read,
+            fs_request_json("secret=my-token-value.txt").as_bytes(),
+        )
+        .expect_err("missing file");
+        assert!(error.message.contains("secret"));
+        assert!(error.message.contains("<redacted>"));
+        assert!(!error.message.contains("my-token-value"));
+    }
+
+    #[test]
+    fn fs_writes_serialize_to_normalized_target() {
+        let root = TempDir::new().expect("temp root");
+        let record = record_with_fs_grant(root.path(), vec![PluginFsOperation::Write]);
+        execute_plugin_fs_request(
+            &record,
+            PluginFsRuntimeOperation::Write,
+            fs_write_request_json("target.txt", "first").as_bytes(),
+        )
+        .expect("first write");
+        execute_plugin_fs_request(
+            &record,
+            PluginFsRuntimeOperation::Write,
+            fs_write_request_json("./target.txt", "second").as_bytes(),
+        )
+        .expect("second write");
+        assert_eq!(
+            fs::read_to_string(root.path().join("target.txt")).expect("read target"),
+            "second"
+        );
     }
 
     #[test]
@@ -2753,6 +3731,7 @@ mod tests {
             digest: Some(record.digest.clone()),
             permissions: tool_permissions(&record.manifest.tools),
             https: Vec::new(),
+            fs: Vec::new(),
         };
         (dir, record)
     }
