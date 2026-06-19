@@ -716,6 +716,10 @@ impl ItemBuilder {
         });
         let has_diagnostic =
             !self.diagnostics.is_empty() || rejected_tool || static_runtime_rejected;
+        let has_non_missing_diagnostic = self
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.kind != "missing");
         let status = if self.resolved {
             if usable_tool && has_diagnostic {
                 "partial"
@@ -727,7 +731,11 @@ impl ItemBuilder {
         } else if self.discovered && !self.configured {
             "disabled"
         } else if self.configured && !self.discovered {
-            "missing"
+            if has_non_missing_diagnostic {
+                "rejected"
+            } else {
+                "missing"
+            }
         } else {
             "rejected"
         }
@@ -990,6 +998,80 @@ mod tests {
     }
 
     #[test]
+    fn configured_invalid_or_incompatible_package_is_rejected_not_missing() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        fs::create_dir_all(workspace.join(".yoi/plugins")).unwrap();
+        write_stored_zip(
+            &workspace.join(".yoi/plugins/invalid.yoi-plugin"),
+            &[("plugin.toml", b"not = [valid")],
+        );
+        let incompatible_manifest = plugin_manifest_with_schema("incompat", "Echo", 999);
+        write_stored_zip(
+            &workspace.join(".yoi/plugins/incompat.yoi-plugin"),
+            &[
+                ("plugin.toml", incompatible_manifest.as_bytes()),
+                ("plugin.wasm", b"not wasm"),
+            ],
+        );
+        let mut config = PluginConfig::default();
+        config.enabled.push(enablement_without_digest(
+            "project:invalid",
+            "0.1.0",
+            &["Echo"],
+        ));
+        config.enabled.push(enablement_without_digest(
+            "project:incompat",
+            "0.1.0",
+            &["Echo"],
+        ));
+
+        let snapshot = inspect_snapshot(workspace, &config);
+        let invalid = select_item(&snapshot, "project:invalid").unwrap();
+        let incompatible = select_item(&snapshot, "project:incompat").unwrap();
+
+        assert_eq!(invalid.status, "rejected");
+        assert_eq!(incompatible.status, "rejected");
+        assert!(invalid.configured);
+        assert!(!invalid.discovered);
+        assert!(incompatible.configured);
+        assert!(!incompatible.discovered);
+        assert!(!invalid.diagnostics.is_empty());
+        assert!(
+            incompatible
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "api")
+        );
+
+        let list_json = serde_json::to_value(&snapshot).unwrap();
+        assert!(list_json["items"].as_array().unwrap().iter().any(|item| {
+            item["reference"] == "project:invalid"
+                && item["status"] == "rejected"
+                && item["package_path"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .ends_with(".yoi/plugins/invalid.yoi-plugin")
+        }));
+        let show_json = serde_json::to_value(incompatible).unwrap();
+        assert_eq!(show_json["status"], "rejected");
+        assert!(
+            show_json["diagnostics"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unsupported")
+        );
+
+        let list_output = render_list_snapshot_human(&snapshot).unwrap();
+        assert!(list_output.contains("project:invalid [rejected]"));
+        assert!(list_output.contains("project:incompat [rejected]"));
+        assert!(!list_output.contains("project:invalid [missing]"));
+        let show_output = render_item_human(invalid).unwrap();
+        assert!(show_output.contains("status: rejected"));
+        assert!(show_output.contains("diagnostics:"));
+    }
+
+    #[test]
     fn invalid_tool_schema_and_name_are_rejected_in_json_and_human_output() {
         let dir = tempdir().unwrap();
         let workspace = dir.path();
@@ -1127,11 +1209,51 @@ mod tests {
         }
     }
 
+    fn enablement_without_digest(
+        id: &str,
+        version: &str,
+        tool_permissions: &[&str],
+    ) -> PluginEnablementConfig {
+        let mut permissions = vec![PluginPermission::surface(PluginSurface::Tool)];
+        permissions.extend(
+            tool_permissions
+                .iter()
+                .map(|tool_name| PluginPermission::tool(*tool_name)),
+        );
+        PluginEnablementConfig {
+            id: id.to_string(),
+            digest: None,
+            version: Some(PluginExactVersion(version.to_string())),
+            surfaces: vec![PluginSurface::Tool],
+            grants: PluginGrantConfig {
+                id: Some(id.to_string()),
+                version: Some(PluginExactVersion(version.to_string())),
+                digest: None,
+                permissions,
+            },
+            config: None,
+        }
+    }
+
     fn plugin_manifest(
         id: &str,
         tool_name: &str,
         schema_type: &str,
         permission_tools: &[&str],
+    ) -> String {
+        plugin_manifest_with_schema_and_tool(id, tool_name, schema_type, permission_tools, 1)
+    }
+
+    fn plugin_manifest_with_schema(id: &str, tool_name: &str, schema_version: u32) -> String {
+        plugin_manifest_with_schema_and_tool(id, tool_name, "object", &[tool_name], schema_version)
+    }
+
+    fn plugin_manifest_with_schema_and_tool(
+        id: &str,
+        tool_name: &str,
+        schema_type: &str,
+        permission_tools: &[&str],
+        schema_version: u32,
     ) -> String {
         let permissions = permission_tools
             .iter()
@@ -1140,7 +1262,7 @@ mod tests {
             .join(", ");
         format!(
             r#"
-schema_version = 1
+schema_version = {schema_version}
 id = "{id}"
 name = "{id}"
 version = "0.1.0"
