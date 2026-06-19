@@ -434,3 +434,34 @@ Reviewer validation:
 - Cargo/nix validation は Orchestrator reported validation を確認。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-19T11:24:06Z -->
+
+## Plan
+
+Review follow-up dispatch:
+
+Reviewer `yoi-reviewer-00001KVFD3YSV-r2` は `request_changes` を返したため、Ticket review として記録し、既存 Coder Pod `yoi-coder-00001KVFD3YSV` に修正依頼を送った。
+
+Resolved:
+- Previous status vocabulary blocker は解消済み。`active`, `disabled`, `missing`, `rejected`, `partial` は typed report / JSON / human output と tests に反映されている。
+
+Remaining blocker:
+- typed report / JSON / human output に Plugin API/schema version と package path / inspectable package location が不足している。
+- Ticket は list overview に package path と API version、show に package path と version / API version を要求している。
+- 現在の `PluginInspectionItem` は `package`, `version`, `digest` を持つが、`api_version` / `schema_version` と `package_path` field がない。
+- `package` は package label 由来であり、inspectable package location/path ではない。
+
+Required fixes sent to Coder:
+- typed report / JSON に Plugin API/schema version field を追加する。
+- typed report / JSON に package path / inspectable package location field を追加する。
+- human `list` overview に package path/location と API/schema version を表示する。
+- human `show` に package path/location と API/schema version を表示する。
+- JSON list/show と human list/show の API/schema version と package path/location presence を tests で pin する。
+- path/location 表示は bounded/deterministic にし、secret/raw untrusted content leakage を避ける。
+
+Next:
+- Coder の修正 commit / validation report を待つ。
+- 修正後、同じ typed report contract / read-only no-execution / bounded diagnostics focus で再レビューする。
+
+---
