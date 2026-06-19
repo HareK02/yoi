@@ -535,3 +535,56 @@ Next:
 - Reviewer output を確認し、approve なら Orchestrator worktree への merge/validation/cleanup/close-ready 処理へ進む。request_changes なら blocker を記録して Coder に戻す。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVFD3YSV-r3 at: 2026-06-19T11:41:24Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+対象:
+- Ticket: `00001KVFD3YSV`
+- branch: `impl/00001KVFD3YSV-plugin-cli-inspection`
+- commits:
+  - `462de32a` — `plugin: add cli inspection`
+  - `b5f10ab7` — `plugin: align inspection statuses`
+  - `dfa966db` — `plugin: report inspection package metadata`
+
+Resolved:
+- Previous metadata blocker is resolved. Typed JSON/report fields now include `package_path`, `schema_version`, and `api_version`; human list/show also include those fields, and tests pin their presence.
+- Status vocabulary remains correct: `active`, `disabled`, `missing`, `rejected`, `partial`.
+
+Remaining blocker:
+- Static inspection does not validate Tool definition/schema validity, so invalid Tool schemas can be reported as `active`.
+
+Evidence:
+- Ticket intent explicitly asks inspection to answer whether the “tool schema [is] valid” and says `rejected` covers “invalid schema etc.”
+- Runtime registration path validates Tool names and input schemas:
+  - `crates/pod/src/feature/plugin.rs:260-277` validates `validate_tool_name(...)` and `validate_input_schema(...)` before registration.
+  - `validate_tool_name` / `validate_input_schema` are defined in `crates/pod/src/feature/plugin.rs`.
+- Read-only inspection path does not mirror those checks:
+  - `inspect_resolved_plugin_static` checks runtime ABI, host API permission diagnostics, and `authorize_plugin_tool(...)` grant/permission checks.
+  - Tool eligibility is set from `authorize_plugin_tool(...)` only.
+- Therefore a resolved plugin with valid grants but invalid `input_schema` can get `tool.eligible = true`, `static_eligible = true`, and top-level status `active`.
+- Current CLI tests do not pin invalid Tool schema behavior; fixtures appear to use valid `input_schema = { type = "object" }` only.
+
+Why this blocks acceptance:
+- CLI inspection is supposed to provide static Tool/runtime eligibility and reject invalid schemas without executing Plugin code.
+- If invalid Tool schemas are reported as `active`, the typed report / JSON / human output overstates eligibility and misses a required fail-closed diagnostic.
+
+Requested changes:
+- Static inspection should include the same static Tool-definition validity that registration enforces, at least Tool name and `input_schema` validation.
+- Invalid tool name / invalid input schema should produce bounded diagnostics and mark affected tool/package as `rejected` or `partial` as appropriate.
+- Add focused JSON/human tests for invalid Tool schema behavior.
+- Preserve read-only / no-execution behavior.
+
+Positive findings:
+- Previous metadata blocker is fixed.
+- Status vocabulary is fixed and tested.
+- Read-only/no-execution shape remains good.
+- Future `https` / `fs` inspection extension point remains present through static host API permission eligibility.
+
+Validation note:
+- Reviewer performed static code/diff review and relied on Orchestrator-reported cargo/nix validation. No mutations were made by Reviewer.
+
+---
