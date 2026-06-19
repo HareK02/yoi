@@ -690,3 +690,43 @@ Conclusion:
 - Implementation satisfies the recorded Ticket acceptance criteria and is ready for merge/validation in the Orchestrator worktree.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-19T16:14:42Z -->
+
+## Implementation report
+
+Merge / validation report:
+
+Implementation branch `impl/00001KVFDX9AY-plugin-fs-host-api` を Orchestrator worktree の `orchestration` branch に merge 済み。
+
+Merge:
+- merge commit: `c94e157b` — `merge: plugin fs host api`
+- implementation commit:
+  - `717c0999` — `plugin: implement fs host api`
+- changed files:
+  - `crates/manifest/src/plugin.rs`
+  - `crates/pod/src/feature/plugin.rs`
+  - `crates/yoi/src/plugin_cli.rs`
+
+Validation in Orchestrator worktree after merge:
+- `cargo fmt --check` — passed
+- `cargo check -p pod -p manifest -p yoi` — passed
+- `cargo test -p pod feature::plugin -- --nocapture` — passed; 48 passed, 0 failed
+- `cargo test -p manifest plugin -- --nocapture` — passed; 17 passed, 0 failed
+- `cargo test -p yoi plugin_cli -- --nocapture` — passed; 10 passed, 0 failed
+- `git diff --check` — passed
+- `nix build .#yoi --no-link` — passed
+
+Review:
+- Reviewer `yoi-reviewer-00001KVFDX9AY` returned `approve` with no blockers.
+- Reviewer noted a non-blocking future hardening context: this implementation is path/canonicalization based and does not fully eliminate adversarial external TOCTOU races where another local process mutates granted-root directories between checks and open/read/list/write. This is accepted within the feasible scope of the initial subset.
+
+Outcome:
+- Granted scoped filesystem `fs` host API is implemented for WASM Plugin Tools.
+- Missing `host_api.fs` grant denies before filesystem access.
+- Workspace/POD filesystem authority is not inherited by Plugin without Plugin grant.
+- Path traversal / symlink / root escape protections, read/list/write bounds, write serialization, diagnostics redaction, ordinary Tool result path, and CLI inspection compatibility are present.
+- HTTPS host API and Component Model migration remain non-goals for this Ticket.
+- Root/original workspace was not read/written/merged/validated for this Ticket, per Panel Queue instruction.
+
+---
