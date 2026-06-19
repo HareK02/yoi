@@ -675,3 +675,36 @@ Next action:
 - previous `request_changes` blocker が解消されたか、read-only Reviewer Pod で再レビューする。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-19T13:36:54Z -->
+
+## Plan
+
+Review re-dispatch:
+
+Reviewer Pod `yoi-reviewer-00001KVFD3YSV-r4` を read-only scope で起動した。
+
+Review target:
+- worktree: `/home/hare/Projects/yoi/.worktree/00001KVFD3YSV-plugin-cli-inspection`
+- branch: `impl/00001KVFD3YSV-plugin-cli-inspection`
+- commits:
+  - `462de32a` — initial implementation
+  - `b5f10ab7` — status vocabulary fix
+  - `dfa966db` — package path / API-schema version metadata fix
+  - `982a1b75` — static Tool schema/name validation fix
+
+Reviewer focus:
+- previous Tool name / `input_schema` static inspection blocker が解消されているか。
+- invalid / duplicate Tool definitions が bounded diagnostics になり、package status が `rejected` / `partial` へ正しく反映されるか。
+- invalid schema/name behavior の JSON/human tests が十分か。
+- prior fixes: status vocabulary、package path/location、API/schema version が維持されているか。
+- read-only/no-execution、bounded diagnostics、missing/ambiguous ref fail-closed、grant/digest/invalid diagnostics、product CLI boundary、no secrets/unbounded raw output が維持されているか。
+- future `https` / `fs` host API inspection extension を妨げていないか。
+
+Related queue note:
+- 新規 queued Ticket `00001KVG0HR96` は body/relations/plan/workspace state を確認し、Component Model runtime migration が Plugin runtime/grant/inspection/packaging に広く触れる migration boundary であるため、現在の `00001KVFD3YSV` review outcome まで queued のまま待機する waiting-capacity note を記録済み。
+
+Next:
+- Reviewer output を確認し、approve なら Orchestrator worktree への merge/validation/cleanup/close-ready 処理へ進む。request_changes なら blocker を記録して Coder に戻す。
+
+---
