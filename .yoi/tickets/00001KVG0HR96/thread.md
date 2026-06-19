@@ -179,3 +179,16 @@ Next action:
 - Dispatch Reviewer for r1 review against Ticket requirements, with focus on Component Model authority boundaries, grant enforcement, no ambient WASI, raw runtime compatibility, inspection not executing code, diagnostics, tests, and packaging/Nix impact.
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-19T17:00:57Z -->
+
+## Plan
+
+Review dispatch:
+- Spawned Reviewer Pod `yoi-reviewer-00001KVG0HR96-r1` against implementation branch `impl/00001KVG0HR96-plugin-component-model-runtime`.
+- Review target commit: `57bbf14e plugin: implement component model runtime`.
+- Review baseline: `878517dc`.
+- Reviewer task focuses on Component/WIT authority boundaries, Plugin grant enforcement, no ambient WASI, raw runtime compatibility, inspection read-only behavior, fail-closed diagnostics, HTTPS/FS invariant preservation, dependency/package impact, and validation evidence.
+- Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator.
+
+---
