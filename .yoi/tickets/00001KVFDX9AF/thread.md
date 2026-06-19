@@ -248,3 +248,34 @@ Next action:
 - 特に grant-before-network、private/local rejection、redirect/DNS bypass、bounds/timeouts、secret redaction、ordinary Tool result path、no ambient env credentials、CLI inspection compatibility、dependency/package.nix correctness を確認する。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-19T15:04:59Z -->
+
+## Plan
+
+Review dispatch:
+
+Reviewer Pod `yoi-reviewer-00001KVFDX9AF` を read-only scope で起動した。
+
+Review target:
+- worktree: `/home/hare/Projects/yoi/.worktree/00001KVFDX9AF-plugin-https-host-api`
+- branch: `impl/00001KVFDX9AF-plugin-https-host-api`
+- commit: `73775275`
+
+Reviewer focus:
+- recorded intent / invariants / acceptance criteria に対する適合性。
+- network access が grant/allowlist checks の前に発生しないこと。
+- private/local/localhost/link-local target rejection が DNS / IPv6 / redirect / scheme edge cases を含め妥当であること。
+- timeout / request-response size / header bounds が enforce されること。
+- secret-like values が errors / diagnostics / Tool results に漏れないこと。
+- ambient env credential / ambient network access path が WASM に exposed されていないこと。
+- HTTPS response が ordinary Tool result/history path だけに戻ること。
+- allowed HTTPS / missing grant / disallowed host-method-scheme-private target / timeout / truncation / redaction / no network without grant/import tests が意味を持つこと。
+- manifest/permission grant schema changes が existing grants / CLI inspection と整合していること。
+- `Cargo.lock` / `package.nix` update が妥当で、`nix build .#yoi --no-link` validation と整合していること。
+- `fs` host API と Component Model migration が non-goals として保たれていること。
+
+Next:
+- Reviewer output を確認し、approve なら Orchestrator worktree への merge/validation/cleanup/close-ready 処理へ進む。request_changes なら blocker を記録して Coder に戻す。
+
+---
