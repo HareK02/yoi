@@ -40,7 +40,7 @@ rustPlatform.buildRustPackage rec {
     filter = sourceFilter;
   };
 
-  cargoHash = "sha256-ud+3INcXnT5W26Bz0K4QXUqoqw3p/ER9c4F2Fhq3YuQ=";
+  cargoHash = "sha256-xqax43t9IevkNG2lZvfRP562ORKb3aHxUNsQwS1FK/k=";
 
   depsExtraArgs = {
     # Older fetchCargoVendor utilities used crates.io's API download endpoint,

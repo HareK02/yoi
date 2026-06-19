@@ -185,6 +185,11 @@ fn render_item_human(item: &PluginInspectionItem) -> Result<String> {
         "  configured_grants: {}",
         join_or_none(&item.configured_grants)
     )?;
+    writeln!(
+        out,
+        "  configured_https_grants: {}",
+        join_or_none(&item.configured_https_grants)
+    )?;
 
     if let Some(runtime) = &item.static_runtime {
         writeln!(
@@ -354,6 +359,7 @@ fn snapshot_from_resolution(
         builder.configured = true;
         builder.enabled_surfaces = surface_strings(enablement.surfaces.iter().copied());
         builder.configured_grants = permission_strings(&enablement.grants.permissions);
+        builder.configured_https_grants = https_grant_strings(&enablement.grants.https);
         if let Ok(identity) = SourceQualifiedPluginId::parse(&enablement.id) {
             builder
                 .source
@@ -445,6 +451,7 @@ fn fill_resolved(builder: &mut ItemBuilder, resolved: &ResolvedPlugin) {
     builder.enabled_surfaces = surface_strings(resolved.enabled_surfaces.iter().copied());
     builder.requested_permissions = permission_strings(&resolved.manifest.permissions);
     builder.configured_grants = permission_strings(&resolved.grants.permissions);
+    builder.configured_https_grants = https_grant_strings(&resolved.grants.https);
 
     let record = ResolvedPluginRecord::from_resolved(resolved);
     let static_runtime = inspect_resolved_plugin_static(&record);
@@ -540,6 +547,13 @@ fn permission_strings(permissions: &[PluginPermission]) -> Vec<String> {
     values
 }
 
+fn https_grant_strings(grants: &[manifest::plugin::PluginHttpsGrant]) -> Vec<String> {
+    let mut values: Vec<_> = grants.iter().map(|grant| grant.label()).collect();
+    values.sort();
+    values.dedup();
+    values
+}
+
 fn permission_requested(manifest: &PluginPackageManifest, permission: &PluginPermission) -> bool {
     manifest
         .permissions
@@ -610,6 +624,7 @@ struct PluginInspectionItem {
     enabled_surfaces: Vec<String>,
     requested_permissions: Vec<String>,
     configured_grants: Vec<String>,
+    configured_https_grants: Vec<String>,
     tools: Vec<ToolSummary>,
     static_runtime: Option<PluginStaticInspection>,
     diagnostics: Vec<DiagnosticSummary>,
@@ -677,6 +692,7 @@ struct ItemBuilder {
     enabled_surfaces: Vec<String>,
     requested_permissions: Vec<String>,
     configured_grants: Vec<String>,
+    configured_https_grants: Vec<String>,
     tools: Vec<ToolSummary>,
     static_runtime: Option<PluginStaticInspection>,
     diagnostics: Vec<DiagnosticSummary>,
@@ -702,6 +718,7 @@ impl ItemBuilder {
             enabled_surfaces: Vec::new(),
             requested_permissions: Vec::new(),
             configured_grants: Vec::new(),
+            configured_https_grants: Vec::new(),
             tools: Vec::new(),
             static_runtime: None,
             diagnostics: Vec::new(),
@@ -772,6 +789,7 @@ impl ItemBuilder {
             enabled_surfaces: self.enabled_surfaces,
             requested_permissions: self.requested_permissions,
             configured_grants: self.configured_grants,
+            configured_https_grants: self.configured_https_grants,
             tools: self.tools,
             static_runtime: self.static_runtime,
             diagnostics: self.diagnostics,
@@ -864,6 +882,7 @@ mod tests {
                     PluginPermission::surface(PluginSurface::Tool),
                     PluginPermission::tool("Echo"),
                 ],
+                https: Vec::new(),
             },
             config: None,
         });
@@ -880,6 +899,7 @@ mod tests {
                     PluginPermission::surface(PluginSurface::Tool),
                     PluginPermission::tool("Echo"),
                 ],
+                https: Vec::new(),
             },
             config: None,
         });
@@ -996,6 +1016,7 @@ mod tests {
                     PluginPermission::surface(PluginSurface::Tool),
                     PluginPermission::tool("Echo"),
                 ],
+                https: Vec::new(),
             },
             config: None,
         });
@@ -1258,6 +1279,7 @@ mod tests {
                         PluginPermission::surface(PluginSurface::Tool),
                         PluginPermission::tool("Echo"),
                     ],
+                    https: Vec::new(),
                 },
                 config: None,
             }],
@@ -1287,6 +1309,7 @@ mod tests {
                 version: Some(PluginExactVersion(version.to_string())),
                 digest: Some(digest),
                 permissions,
+                https: Vec::new(),
             },
             config: None,
         }
@@ -1313,6 +1336,7 @@ mod tests {
                 version: Some(PluginExactVersion(version.to_string())),
                 digest: None,
                 permissions,
+                https: Vec::new(),
             },
             config: None,
         }
