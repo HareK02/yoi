@@ -291,3 +291,68 @@ Next action:
 - Route back to Reviewer for r2 verification of the resource-boundary blocker and final acceptance criteria.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVG0HR96-r1 at: 2026-06-19T17:19:55Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket contract: `.yoi/tickets/00001KVG0HR96/item.md`, `.yoi/tickets/00001KVG0HR96/thread.md`
+- r1 blocker fix diff: `57bbf14e..a705bb3b`
+- 全体実装: `878517dc..a705bb3b`
+- 主な対象: Plugin runtime / manifest / WIT / docs / tests / Cargo/Nix/package impact paths。
+
+Previous blocker verification:
+- Component runtime now has raw-runtime-equivalent Wasmtime store limits:
+  - `crates/pod/src/feature/plugin.rs:1514-1523`
+  - `memory_size(PLUGIN_WASM_MEMORY_BYTES)`
+  - `table_elements(PLUGIN_WASM_TABLE_ELEMENTS)`
+  - `instances(1)`
+  - `tables(1)`
+  - `memories(1)`
+  - `trap_on_grow_failure(true)`
+- Component host state carries those limits:
+  - `crates/pod/src/feature/plugin.rs:1926-1930`
+- Component store installs the limiter before instantiation/execution:
+  - `crates/pod/src/feature/plugin.rs:1991-2001`
+- Code documents why WIT string lifting remains bounded before ToolOutput JSON cap enforcement:
+  - `crates/pod/src/feature/plugin.rs:2017-2026`
+- Focused negative tests were added and passed:
+  - component memory limit fails closed before string lift
+  - component table limit fails closed
+  - component output cap still fails closed after bounded lift
+
+Overall Ticket satisfaction:
+- Runtime kind is explicit and manifest-driven: raw `kind = "wasm"` + `abi = "yoi-plugin-wasm-1"`; component `kind = "wasm-component"` + `component` + expected `world`。
+- Component execution stays on existing Plugin Tool / ToolRegistry path。
+- Plugin grants remain authority boundary before Tool execution and host API use。
+- Component imports are validated; unsupported imports fail closed。
+- No WASI fs/network/env is linked。
+- Static inspection reports runtime metadata without executing component artifacts。
+- Existing raw runtime tests continue passing。
+- Docs record JSON-string WIT v1 as deliberate migration bridge and defer structured WIT records:
+  - `docs/design/plugin-component-model.md:169-177`
+
+Blocking issues: none。
+
+Non-blocking follow-ups:
+- Structured WIT request/response/error records are intentionally deferred。
+- Sample remains an authoring sketch rather than fully built packaged sample, but runtime behavior is covered by focused component fixtures/tests。
+
+Reviewer validation:
+- `git diff --check 878517dc..a705bb3b`: passed
+- `cargo fmt --check`: passed
+- `cargo test -p pod feature::plugin::tests -- --nocapture`: 58 passed
+- `cargo test -p manifest plugin -- --nocapture`: 17 passed
+- `cargo test -p yoi plugin -- --nocapture`: 11 passed
+- `cargo check`: passed
+- `nix build .#yoi --no-link`: passed
+- `nix path-info -S .#yoi`: `/nix/store/g9nhx3g2xsn7r3rw6n61scdkha5s7m8s-yoi-0.1.0 112156120`
+- `stat -c '%s %n' "$out/bin/yoi"`: `54605944 .../bin/yoi`
+- `du -sh "$out"`: `53M`
+
+Worktree status at review end: clean。
+
+---
