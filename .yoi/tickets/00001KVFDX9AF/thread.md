@@ -681,3 +681,86 @@ Outcome:
 - Root/original workspace was not read/written/merged/validated for this Ticket, per Panel Queue instruction.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-19T15:35:11Z -->
+
+## Implementation report
+
+Cleanup report:
+
+Plugin HTTPS host API Ticket の implementation/review Pods と child worktree を cleanup 済み。
+
+Stopped Pods:
+- `yoi-coder-00001KVFDX9AF`
+- `yoi-reviewer-00001KVFDX9AF-r2`
+
+Removed child implementation worktree:
+- `/home/hare/Projects/yoi/.worktree/00001KVFDX9AF-plugin-https-host-api`
+
+Deleted merged implementation branch:
+- `impl/00001KVFDX9AF-plugin-https-host-api` at `85683f17`
+
+Orchestrator branch remains the integration authority for this completed work. Root/original workspace was not touched for this Ticket, per Panel Queue instruction.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-19T15:35:22Z from: inprogress to: done reason: merged_validated_review_approved field: state -->
+
+## State changed
+
+Implementation commits `7377527f` and `85683f17` were reviewed after blocker resolution, approved, merged into the Orchestrator branch as `6beb8625`, validated in the Orchestrator worktree, and child implementation resources were cleaned up. Requirements and acceptance criteria are satisfied for this Ticket. Root/original workspace was not operated on for this Ticket per Panel Queue instruction.
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-19T15:35:45Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-19T15:35:46Z status: closed -->
+
+## 完了
+
+Ticket `00001KVFDX9AF` is complete.
+
+Completed implementation:
+- Added granted outbound HTTPS host API for WASM Plugin Tools.
+- Added typed `host_api.https` grant scope with host, method, optional path prefix, and bounded request/response options.
+- Implemented `yoi:https` WASM host import handling.
+- Enforced grant/allowlist checks before network access.
+- Enforced HTTPS-only behavior and rejected `http://`, embedded credentials, localhost/private/link-local/local targets, IPv4-mapped/compatible IPv6 private/local forms, and unsafe DNS results.
+- Bound DNS validation to the actual reqwest connection path by pinning validated public socket addresses with `resolve_to_addrs`.
+- Added request/response bounds, timeout, no redirects, `no_proxy()`, response truncation, and secret-like diagnostics redaction.
+- Preserved ordinary Tool result/history path and avoided hidden context injection.
+- Updated Plugin CLI inspection and manifest/permission model to expose HTTPS host API grant/diagnostic details.
+
+Reviewed / merged:
+- Implementation commits:
+  - `7377527f` (`plugin: implement https host api`)
+  - `85683f17` (`plugin: harden https target validation`)
+- First review requested changes for IPv4-mapped IPv6 bypass and DNS validation TOCTOU.
+- Re-review approved with no remaining blockers.
+- Orchestrator merge commit: `6beb8625` (`merge: plugin https host api`)
+
+Validation in Orchestrator worktree:
+- `cargo fmt --check` — passed
+- `cargo check -p pod -p manifest -p yoi` — passed
+- `cargo test -p pod feature::plugin::tests -- --nocapture` — passed; 39 passed, 0 failed
+- `cargo test -p manifest plugin -- --nocapture` — passed; 17 passed, 0 failed
+- `cargo test -p yoi plugin_cli -- --nocapture` — passed; 10 passed, 0 failed
+- `git diff --check` — passed
+- `nix build .#yoi --no-link` — passed
+
+Cleanup:
+- Stopped Coder Pod `yoi-coder-00001KVFDX9AF`.
+- Stopped Reviewer Pod `yoi-reviewer-00001KVFDX9AF-r2`.
+- Removed child worktree `/home/hare/Projects/yoi/.worktree/00001KVFDX9AF-plugin-https-host-api`.
+- Deleted merged branch `impl/00001KVFDX9AF-plugin-https-host-api`.
+
+Root/original workspace was not read/written/merged/validated for this Ticket, per Panel Queue instruction. The completed work is integrated on the Orchestrator branch.
+
+---
