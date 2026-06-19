@@ -76,11 +76,13 @@ pub struct PluginGrantConfig {
     pub permissions: Vec<PluginPermission>,
     /// Bounded outbound HTTPS allowlist entries for `host_api.https`.
     pub https: Vec<PluginHttpsGrant>,
+    /// Scoped filesystem allowlist entries for `host_api.fs`.
+    pub fs: Vec<PluginFsGrant>,
 }
 
 impl PluginGrantConfig {
     pub fn is_empty(&self) -> bool {
-        self.permissions.is_empty() && self.https.is_empty()
+        self.permissions.is_empty() && self.https.is_empty() && self.fs.is_empty()
     }
 
     pub fn binding_error(
@@ -154,6 +156,48 @@ impl PluginHttpsGrant {
             self.path_prefixes.join(",")
         };
         format!("{} {} {}", self.host, methods, paths)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PluginFsGrant {
+    /// Absolute host path that bounds every relative `host_api.fs` request.
+    pub root: String,
+    /// Explicit operation kinds allowed below `root`; write does not imply read/list.
+    pub operations: Vec<PluginFsOperation>,
+}
+
+impl PluginFsGrant {
+    pub fn label(&self) -> String {
+        let operations = if self.operations.is_empty() {
+            "<no-operations>".to_string()
+        } else {
+            self.operations
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!("{} {}", self.root, operations)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginFsOperation {
+    Read,
+    List,
+    Write,
+}
+
+impl fmt::Display for PluginFsOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read => f.write_str("read"),
+            Self::List => f.write_str("list"),
+            Self::Write => f.write_str("write"),
+        }
     }
 }
 
@@ -2082,6 +2126,7 @@ input_schema = { type = "object", properties = { query = { type = "string" } }, 
             digest: Some(digest.clone()),
             permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
             https: Vec::new(),
+            fs: Vec::new(),
         };
         let resolution = resolve_enabled_plugins(
             &PluginConfig {
@@ -2108,6 +2153,7 @@ input_schema = { type = "object", properties = { query = { type = "string" } }, 
                 digest: Some(digest.clone()),
                 permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
                 https: Vec::new(),
+                fs: Vec::new(),
             },
             PluginGrantConfig {
                 id: Some("project:example".to_string()),
@@ -2115,6 +2161,7 @@ input_schema = { type = "object", properties = { query = { type = "string" } }, 
                 digest: Some(digest.clone()),
                 permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
                 https: Vec::new(),
+                fs: Vec::new(),
             },
             PluginGrantConfig {
                 id: Some("project:example".to_string()),
@@ -2122,6 +2169,7 @@ input_schema = { type = "object", properties = { query = { type = "string" } }, 
                 digest: Some("sha256:unrelated".to_string()),
                 permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
                 https: Vec::new(),
+                fs: Vec::new(),
             },
         ] {
             let resolution = resolve_enabled_plugins(
