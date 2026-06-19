@@ -21,8 +21,10 @@ use llm_worker::tool::{
     Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOrigin, ToolOutput,
 };
 use manifest::plugin::{
-    PluginConfig, PluginDiscoveryLimits, PluginFsGrant, PluginFsOperation, PluginHostApi,
-    PluginPermission, PluginSurface, PluginToolManifest, ResolvedPluginRecord,
+    PLUGIN_COMPONENT_TOOL_WORLD, PLUGIN_RUNTIME_COMPONENT_KIND, PLUGIN_RUNTIME_WASM_ABI,
+    PLUGIN_RUNTIME_WASM_KIND, PluginConfig, PluginDiscoveryLimits, PluginFsGrant,
+    PluginFsOperation, PluginHostApi, PluginPermission, PluginSurface, PluginToolManifest,
+    ResolvedPluginRecord, read_resolved_plugin_runtime_component,
     read_resolved_plugin_runtime_module,
 };
 use serde::{Deserialize, Serialize};
@@ -134,24 +136,49 @@ pub struct PluginToolEligibility {
 pub fn inspect_resolved_plugin_static(record: &ResolvedPluginRecord) -> PluginStaticInspection {
     let runtime = match &record.manifest.runtime {
         Some(runtime)
-            if runtime.kind == "wasm" && runtime.abi.as_deref() == Some("yoi-plugin-wasm-1") =>
+            if runtime.kind == PLUGIN_RUNTIME_WASM_KIND
+                && runtime.abi.as_deref() == Some(PLUGIN_RUNTIME_WASM_ABI)
+                && runtime.entry.is_some() =>
         {
             PluginRuntimeEligibility {
                 eligible: true,
-                status: "wasm/yoi-plugin-wasm-1".to_string(),
+                status: format!("{PLUGIN_RUNTIME_WASM_KIND}/{PLUGIN_RUNTIME_WASM_ABI}"),
                 diagnostic: None,
             }
         }
-        Some(runtime) if runtime.kind == "wasm" => {
+        Some(runtime) if runtime.kind == PLUGIN_RUNTIME_WASM_KIND => {
             let status = runtime
                 .abi
                 .as_deref()
-                .map(|abi| format!("wasm/{abi}"))
-                .unwrap_or_else(|| "wasm/<missing-abi>".to_string());
+                .map(|abi| format!("{PLUGIN_RUNTIME_WASM_KIND}/{abi}"))
+                .unwrap_or_else(|| format!("{PLUGIN_RUNTIME_WASM_KIND}/<missing-abi>"));
             PluginRuntimeEligibility {
                 eligible: false,
                 status,
                 diagnostic: Some("unsupported or missing plugin runtime ABI".to_string()),
+            }
+        }
+        Some(runtime)
+            if runtime.kind == PLUGIN_RUNTIME_COMPONENT_KIND
+                && runtime.world.as_deref() == Some(PLUGIN_COMPONENT_TOOL_WORLD)
+                && runtime.component.is_some() =>
+        {
+            PluginRuntimeEligibility {
+                eligible: true,
+                status: format!("{PLUGIN_RUNTIME_COMPONENT_KIND}/{PLUGIN_COMPONENT_TOOL_WORLD}"),
+                diagnostic: None,
+            }
+        }
+        Some(runtime) if runtime.kind == PLUGIN_RUNTIME_COMPONENT_KIND => {
+            let status = runtime
+                .world
+                .as_deref()
+                .map(|world| format!("{PLUGIN_RUNTIME_COMPONENT_KIND}/{world}"))
+                .unwrap_or_else(|| format!("{PLUGIN_RUNTIME_COMPONENT_KIND}/<missing-world>"));
+            PluginRuntimeEligibility {
+                eligible: false,
+                status,
+                diagnostic: Some("unsupported or missing plugin component world".to_string()),
             }
         }
         Some(runtime) => PluginRuntimeEligibility {
@@ -1484,6 +1511,17 @@ const PLUGIN_FS_MAX_READ_BYTES: usize = 64 * 1024;
 const PLUGIN_FS_MAX_WRITE_BYTES: usize = 64 * 1024;
 const PLUGIN_FS_MAX_LIST_ENTRIES: usize = 256;
 
+fn wasm_component_store_limits() -> wasmtime::StoreLimits {
+    wasmtime::StoreLimitsBuilder::new()
+        .memory_size(PLUGIN_WASM_MEMORY_BYTES)
+        .table_elements(PLUGIN_WASM_TABLE_ELEMENTS)
+        .instances(1)
+        .tables(1)
+        .memories(1)
+        .trap_on_grow_failure(true)
+        .build()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PluginFsRuntimeOperation {
     Read,
@@ -1708,26 +1746,25 @@ impl Tool for PluginWasmTool {
         let plugin_ref = self.origin.plugin_ref.clone();
         let digest = self.origin.digest.clone();
         let input = input_json.as_bytes().to_vec();
-        let execution =
-            tokio::task::spawn_blocking(move || run_plugin_wasm_tool(record, name, input));
+        let execution = tokio::task::spawn_blocking(move || run_plugin_tool(record, name, input));
         match tokio::time::timeout(PLUGIN_WASM_TIMEOUT, execution).await {
             Ok(Ok(Ok(output))) => Ok(output),
             Ok(Ok(Err(error))) => Err(ToolError::ExecutionFailed(format!(
-                "plugin WASM tool `{}` from `{}` (digest {}) failed closed: {}",
+                "plugin tool `{}` from `{}` (digest {}) failed closed: {}",
                 self.name,
                 plugin_ref,
                 digest,
                 error.bounded_message()
             ))),
             Ok(Err(error)) => Err(ToolError::ExecutionFailed(format!(
-                "plugin WASM tool `{}` from `{}` (digest {}) cancelled/failed to join: {}",
+                "plugin tool `{}` from `{}` (digest {}) cancelled/failed to join: {}",
                 self.name,
                 plugin_ref,
                 digest,
                 bounded_message(error.to_string())
             ))),
             Err(_) => Err(ToolError::ExecutionFailed(format!(
-                "plugin WASM tool `{}` from `{}` (digest {}) timed out after {:?}",
+                "plugin tool `{}` from `{}` (digest {}) timed out after {:?}",
                 self.name, plugin_ref, digest, PLUGIN_WASM_TIMEOUT
             ))),
         }
@@ -1765,6 +1802,28 @@ struct PluginWasmHostState {
     https_response: Vec<u8>,
     fs_response: Vec<u8>,
     store_limits: wasmi::StoreLimits,
+}
+
+fn run_plugin_tool(
+    record: ResolvedPluginRecord,
+    tool_name: String,
+    input: Vec<u8>,
+) -> Result<ToolOutput, PluginWasmError> {
+    match record
+        .manifest
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.kind.as_str())
+    {
+        Some(PLUGIN_RUNTIME_WASM_KIND) => run_plugin_wasm_tool(record, tool_name, input),
+        Some(PLUGIN_RUNTIME_COMPONENT_KIND) => run_plugin_component_tool(record, tool_name, input),
+        Some(other) => Err(PluginWasmError::Module(format!(
+            "unsupported plugin runtime kind `{other}`"
+        ))),
+        None => Err(PluginWasmError::Package(
+            "plugin runtime is not declared".to_string(),
+        )),
+    }
 }
 
 fn run_plugin_wasm_tool(
@@ -1862,6 +1921,225 @@ fn run_plugin_wasm_tool_with_https_client(
         return Err(PluginWasmError::Output(error));
     }
     decode_plugin_wasm_output(&store.data().output)
+}
+
+#[derive(Clone)]
+struct PluginComponentHostState {
+    record: ResolvedPluginRecord,
+    https_client: Arc<dyn PluginHttpsClient>,
+    store_limits: wasmtime::StoreLimits,
+}
+
+fn run_plugin_component_tool(
+    record: ResolvedPluginRecord,
+    tool_name: String,
+    input: Vec<u8>,
+) -> Result<ToolOutput, PluginWasmError> {
+    run_plugin_component_tool_with_https_client(
+        record,
+        tool_name,
+        input,
+        Arc::new(ReqwestPluginHttpsClient),
+    )
+}
+
+fn run_plugin_component_tool_with_https_client(
+    record: ResolvedPluginRecord,
+    tool_name: String,
+    input: Vec<u8>,
+    https_client: Arc<dyn PluginHttpsClient>,
+) -> Result<ToolOutput, PluginWasmError> {
+    let tool = record
+        .manifest
+        .tools
+        .iter()
+        .find(|tool| tool.name == tool_name)
+        .ok_or_else(|| {
+            PluginWasmError::Module("requested tool is not declared by plugin manifest".to_string())
+        })?;
+    authorize_plugin_tool(&record, tool).map_err(|error| {
+        PluginWasmError::Module(format!(
+            "plugin permission denied: {}",
+            error.bounded_message()
+        ))
+    })?;
+
+    let limits = PluginDiscoveryLimits::default();
+    let component_bytes = read_resolved_plugin_runtime_component(&record, &limits)
+        .map_err(|diagnostic| PluginWasmError::Package(diagnostic.message))?;
+    if component_bytes.len() > limits.max_file_size_bytes as usize {
+        return Err(PluginWasmError::Package(format!(
+            "WASM component runtime artifact exceeds {} bytes",
+            limits.max_file_size_bytes
+        )));
+    }
+
+    let mut config = wasmtime::Config::new();
+    config.wasm_component_model(true);
+    config.consume_fuel(true);
+    config.max_wasm_stack(8 * 1024 * 1024);
+    let engine = wasmtime::Engine::new(&config)
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    let component =
+        wasmtime::component::Component::new(&engine, &component_bytes).map_err(|error| {
+            PluginWasmError::Module(format!("component is incompatible: {error:?}"))
+        })?;
+    validate_component_imports(&record, &engine, &component)?;
+
+    let mut linker = wasmtime::component::Linker::<PluginComponentHostState>::new(&engine);
+    define_plugin_component_host_imports(&mut linker)?;
+    let mut store = wasmtime::Store::new(
+        &engine,
+        PluginComponentHostState {
+            record: record.clone(),
+            https_client,
+            store_limits: wasm_component_store_limits(),
+        },
+    );
+    store.limiter(|state| &mut state.store_limits);
+    store
+        .set_fuel(PLUGIN_WASM_FUEL)
+        .map_err(|error| PluginWasmError::Execution(error.to_string()))?;
+    let instance = linker
+        .instantiate(&mut store, &component)
+        .map_err(|error| PluginWasmError::Execution(error.to_string()))?;
+    let call = instance
+        .get_typed_func::<(&str, &str), (String,)>(&mut store, "call")
+        .map_err(|error| {
+            PluginWasmError::Module(format!(
+                "component does not export expected `{}` call function: {error}",
+                PLUGIN_COMPONENT_TOOL_WORLD
+            ))
+        })?;
+    let input_json = std::str::from_utf8(&input).map_err(|error| {
+        PluginWasmError::Output(format!("plugin component input is not UTF-8: {error}"))
+    })?;
+    // Wasmtime lifts the returned WIT `string` into a host `String` before the
+    // ordinary ToolOutput JSON cap can be applied. Keep the component store on
+    // the same memory/table/instance limits as the raw WASM runtime so an
+    // untrusted component can only force host string allocation from bounded
+    // component memory; oversized memories/tables/instances fail closed during
+    // instantiation/growth before this lift succeeds.
+    let (output,) = call
+        .call(&mut store, (&tool_name, input_json))
+        .map_err(|error| PluginWasmError::Execution(error.to_string()))?;
+    decode_plugin_wasm_output(output.as_bytes())
+}
+
+fn validate_component_imports(
+    record: &ResolvedPluginRecord,
+    engine: &wasmtime::Engine,
+    component: &wasmtime::component::Component,
+) -> Result<(), PluginWasmError> {
+    for (name, _) in component.component_type().imports(engine) {
+        match name {
+            "yoi:host/https@1.0.0" => {
+                authorize_plugin_host_api(record, PluginHostApi::Https).map_err(|error| {
+                    PluginWasmError::Module(format!(
+                        "plugin host API dispatch denied: {}",
+                        error.bounded_message()
+                    ))
+                })?;
+            }
+            "yoi:host/fs@1.0.0" => {
+                authorize_plugin_host_api(record, PluginHostApi::Fs).map_err(|error| {
+                    PluginWasmError::Module(format!(
+                        "plugin host API dispatch denied: {}",
+                        error.bounded_message()
+                    ))
+                })?;
+            }
+            other => {
+                return Err(PluginWasmError::Module(format!(
+                    "unsupported component import `{other}`; no WASI filesystem, ambient network, environment, or other imports are available"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn define_plugin_component_host_imports(
+    linker: &mut wasmtime::component::Linker<PluginComponentHostState>,
+) -> Result<(), PluginWasmError> {
+    linker
+        .root()
+        .instance("yoi:host/https@1.0.0")
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?
+        .func_wrap(
+            "request",
+            |store: wasmtime::StoreContextMut<'_, PluginComponentHostState>,
+             (request,): (String,)|
+             -> wasmtime::Result<(String,)> {
+                authorize_plugin_host_api(&store.data().record, PluginHostApi::Https)
+                    .map_err(|error| wasmtime::Error::msg(error.bounded_message()))?;
+                let response = execute_plugin_https_request(
+                    &store.data().record,
+                    store.data().https_client.as_ref(),
+                    request.as_bytes(),
+                )
+                .map_err(|error| wasmtime::Error::msg(error.0))?;
+                Ok((String::from_utf8_lossy(&response).into_owned(),))
+            },
+        )
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+
+    let mut root = linker.root();
+    let mut fs = root
+        .instance("yoi:host/fs@1.0.0")
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    fs.func_wrap(
+        "read",
+        |store: wasmtime::StoreContextMut<'_, PluginComponentHostState>,
+         (request,): (String,)|
+         -> wasmtime::Result<(String,)> {
+            authorize_plugin_host_api(&store.data().record, PluginHostApi::Fs)
+                .map_err(|error| wasmtime::Error::msg(error.bounded_message()))?;
+            execute_plugin_fs_request(
+                &store.data().record,
+                PluginFsRuntimeOperation::Read,
+                request.as_bytes(),
+            )
+            .map(|bytes| (String::from_utf8_lossy(&bytes).into_owned(),))
+            .map_err(|error| wasmtime::Error::msg(error.message))
+        },
+    )
+    .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    fs.func_wrap(
+        "list",
+        |store: wasmtime::StoreContextMut<'_, PluginComponentHostState>,
+         (request,): (String,)|
+         -> wasmtime::Result<(String,)> {
+            authorize_plugin_host_api(&store.data().record, PluginHostApi::Fs)
+                .map_err(|error| wasmtime::Error::msg(error.bounded_message()))?;
+            execute_plugin_fs_request(
+                &store.data().record,
+                PluginFsRuntimeOperation::List,
+                request.as_bytes(),
+            )
+            .map(|bytes| (String::from_utf8_lossy(&bytes).into_owned(),))
+            .map_err(|error| wasmtime::Error::msg(error.message))
+        },
+    )
+    .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    fs.func_wrap(
+        "write",
+        |store: wasmtime::StoreContextMut<'_, PluginComponentHostState>,
+         (request,): (String,)|
+         -> wasmtime::Result<(String,)> {
+            authorize_plugin_host_api(&store.data().record, PluginHostApi::Fs)
+                .map_err(|error| wasmtime::Error::msg(error.bounded_message()))?;
+            execute_plugin_fs_request(
+                &store.data().record,
+                PluginFsRuntimeOperation::Write,
+                request.as_bytes(),
+            )
+            .map(|bytes| (String::from_utf8_lossy(&bytes).into_owned(),))
+            .map_err(|error| wasmtime::Error::msg(error.message))
+        },
+    )
+    .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    Ok(())
 }
 
 fn validate_wasm_imports(
@@ -3679,9 +3957,11 @@ mod tests {
     fn record_with_missing_package_runtime() -> ResolvedPluginRecord {
         let mut record = record(vec![tool("PluginSearch")]);
         record.manifest.runtime = Some(PluginRuntimeManifest {
-            kind: "wasm".into(),
-            entry: "plugin.wasm".into(),
-            abi: Some("yoi-plugin-wasm-1".into()),
+            kind: PLUGIN_RUNTIME_WASM_KIND.into(),
+            entry: Some("plugin.wasm".into()),
+            abi: Some(PLUGIN_RUNTIME_WASM_ABI.into()),
+            component: None,
+            world: None,
         });
         record
     }
@@ -3734,6 +4014,347 @@ mod tests {
             fs: Vec::new(),
         };
         (dir, record)
+    }
+
+    fn write_component_plugin_package(path: &Path, component: &[u8], world: &str) {
+        let manifest = format!(
+            r#"schema_version = 1
+id = "example"
+name = "Example"
+version = "1.0.0"
+description = "Example component plugin"
+surfaces = ["tool"]
+
+[runtime]
+kind = "wasm-component"
+component = "plugin.component.wasm"
+world = "{}"
+
+[[permissions]]
+kind = "surface"
+surface = "tool"
+
+[[permissions]]
+kind = "tool"
+name = "PluginEcho"
+
+[[tools]]
+name = "PluginEcho"
+description = "Echo plugin tool"
+input_schema = {{ type = "object", additionalProperties = true }}
+"#,
+            world
+        );
+        write_stored_zip(
+            path,
+            &[
+                ("plugin.toml", manifest.as_bytes()),
+                ("plugin.component.wasm", component),
+            ],
+        );
+    }
+
+    fn resolved_record_with_component(component: Vec<u8>) -> (TempDir, ResolvedPluginRecord) {
+        let dir = TempDir::new().unwrap();
+        let package_dir = dir.path().join(".yoi/plugins");
+        fs::create_dir_all(&package_dir).unwrap();
+        let package_path = package_dir.join("component.yoi-plugin");
+        write_component_plugin_package(&package_path, &component, PLUGIN_COMPONENT_TOOL_WORLD);
+        let config = PluginConfig {
+            enabled: vec![PluginEnablementConfig {
+                id: "project:example".parse().unwrap(),
+                surfaces: vec![PluginSurface::Tool],
+                ..PluginEnablementConfig::default()
+            }],
+            resolved: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let options = PluginDiscoveryOptions::new(dir.path());
+        let resolved = resolve_plugin_config_for_startup(&config, &options);
+        assert!(
+            resolved.diagnostics.is_empty(),
+            "{:#?}",
+            resolved.diagnostics
+        );
+        assert_eq!(resolved.resolved.len(), 1);
+        let mut record = resolved.resolved[0].clone();
+        record.grants = PluginGrantConfig {
+            id: Some(record.identity.to_string()),
+            version: Some(PluginExactVersion(record.version.clone())),
+            digest: Some(record.digest.clone()),
+            permissions: tool_permissions(&record.manifest.tools),
+            https: Vec::new(),
+            fs: Vec::new(),
+        };
+        (dir, record)
+    }
+
+    fn component_tool_that_returns(output: &[u8]) -> Vec<u8> {
+        component_tool_with_memory_pages(output, 1)
+    }
+
+    fn component_tool_with_memory_pages(output: &[u8], memory_pages: usize) -> Vec<u8> {
+        wat::parse_str(format!(
+            r#"(component
+              (core module $m
+                (memory (export "memory") {})
+                (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+                  (if (result i32) (i32.eqz (local.get 0))
+                    (then (i32.const 8192))
+                    (else (local.get 0))))
+                (data (i32.const 1024) "{}")
+                (func (export "call") (param i32 i32 i32 i32) (result i32)
+                  (i32.store (i32.const 2048) (i32.const 1024))
+                  (i32.store (i32.const 2052) (i32.const {}))
+                  (i32.const 2048))
+              )
+              (core instance $i (instantiate $m))
+              (alias core export $i "memory" (core memory $mem))
+              (alias core export $i "realloc" (core func $realloc))
+              (alias core export $i "call" (core func $call_core))
+              (type $call_ty (func (param "tool-name" string) (param "input-json" string) (result string)))
+              (func $call (type $call_ty) (canon lift (core func $call_core) (memory $mem) (realloc $realloc) string-encoding=utf8))
+              (export "call" (func $call))
+            )"#,
+            memory_pages,
+            wat_bytes(output),
+            output.len()
+        ))
+        .expect("valid component wat")
+    }
+
+    fn component_tool_with_table_elements(output: &[u8], table_elements: usize) -> Vec<u8> {
+        wat::parse_str(format!(
+            r#"(component
+              (core module $m
+                (memory (export "memory") 1)
+                (table {} funcref)
+                (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+                  (if (result i32) (i32.eqz (local.get 0))
+                    (then (i32.const 8192))
+                    (else (local.get 0))))
+                (data (i32.const 1024) "{}")
+                (func (export "call") (param i32 i32 i32 i32) (result i32)
+                  (i32.store (i32.const 2048) (i32.const 1024))
+                  (i32.store (i32.const 2052) (i32.const {}))
+                  (i32.const 2048))
+              )
+              (core instance $i (instantiate $m))
+              (alias core export $i "memory" (core memory $mem))
+              (alias core export $i "realloc" (core func $realloc))
+              (alias core export $i "call" (core func $call_core))
+              (type $call_ty (func (param "tool-name" string) (param "input-json" string) (result string)))
+              (func $call (type $call_ty) (canon lift (core func $call_core) (memory $mem) (realloc $realloc) string-encoding=utf8))
+              (export "call" (func $call))
+            )"#,
+            table_elements,
+            wat_bytes(output),
+            output.len()
+        ))
+        .expect("valid component wat")
+    }
+
+    fn component_tool_importing_https(output: &[u8]) -> Vec<u8> {
+        wat::parse_str(format!(
+            r#"(component
+              (import "yoi:host/https@1.0.0" (instance $https (export "request" (func $request (param "request-json" string) (result string)))))
+              (core module $m
+                (memory (export "memory") 1)
+                (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+                  (if (result i32) (i32.eqz (local.get 0))
+                    (then (i32.const 8192))
+                    (else (local.get 0))))
+                (data (i32.const 1024) "{}")
+                (func (export "call") (param i32 i32 i32 i32) (result i32)
+                  (i32.store (i32.const 2048) (i32.const 1024))
+                  (i32.store (i32.const 2052) (i32.const {}))
+                  (i32.const 2048))
+              )
+              (core instance $i (instantiate $m))
+              (alias core export $i "memory" (core memory $mem))
+              (alias core export $i "realloc" (core func $realloc))
+              (alias core export $i "call" (core func $call_core))
+              (type $call_ty (func (param "tool-name" string) (param "input-json" string) (result string)))
+              (func $call (type $call_ty) (canon lift (core func $call_core) (memory $mem) (realloc $realloc) string-encoding=utf8))
+              (export "call" (func $call))
+            )"#,
+            wat_bytes(output),
+            output.len()
+        ))
+        .expect("valid component wat")
+    }
+
+    fn component_without_call_export() -> Vec<u8> {
+        wat::parse_str(r#"(component (core module $m) (core instance $i (instantiate $m)))"#)
+            .unwrap()
+    }
+
+    fn raw_module_bytes() -> Vec<u8> {
+        wat::parse_str(r#"(module (func (export "call")))"#).unwrap()
+    }
+
+    #[test]
+    fn component_tool_executes_through_ordinary_tool_result_path() {
+        let (_dir, record) = resolved_record_with_component(component_tool_that_returns(
+            br#"{"summary":"component ok","content":"ordinary tool result path"}"#,
+        ));
+
+        let output = run_plugin_component_tool(record, "PluginEcho".to_string(), b"{}".to_vec())
+            .expect("component tool output");
+
+        assert_eq!(output.summary, "component ok");
+        assert_eq!(output.content.as_deref(), Some("ordinary tool result path"));
+    }
+
+    #[test]
+    fn component_memory_limit_fails_closed_before_string_lift() {
+        let oversized_memory_pages = (PLUGIN_WASM_MEMORY_BYTES / 65_536) + 1;
+        let (_dir, record) = resolved_record_with_component(component_tool_with_memory_pages(
+            br#"{"summary":"should not lift"}"#,
+            oversized_memory_pages,
+        ));
+
+        let error = run_plugin_component_tool(record, "PluginEcho".to_string(), b"{}".to_vec())
+            .expect_err("component memory limit is enforced");
+
+        assert!(format!("{error:?}").contains("growing memory"), "{error:?}");
+    }
+
+    #[test]
+    fn component_table_limit_fails_closed() {
+        let (_dir, record) = resolved_record_with_component(component_tool_with_table_elements(
+            br#"{"summary":"should not run"}"#,
+            PLUGIN_WASM_TABLE_ELEMENTS + 1,
+        ));
+
+        let error = run_plugin_component_tool(record, "PluginEcho".to_string(), b"{}".to_vec())
+            .expect_err("component table limit is enforced");
+
+        assert!(format!("{error:?}").contains("growing table"), "{error:?}");
+    }
+
+    #[test]
+    fn component_output_cap_still_fails_closed_after_bounded_lift() {
+        let output = format!(
+            r#"{{"summary":"too big","content":"{}"}}"#,
+            "x".repeat(PLUGIN_WASM_MAX_OUTPUT_BYTES)
+        );
+        let (_dir, record) =
+            resolved_record_with_component(component_tool_with_memory_pages(output.as_bytes(), 2));
+
+        let error = run_plugin_component_tool(record, "PluginEcho".to_string(), b"{}".to_vec())
+            .expect_err("component output cap is enforced");
+
+        assert!(format!("{error:?}").contains("output exceeds"), "{error:?}");
+    }
+
+    #[test]
+    fn component_tool_denies_host_import_without_matching_grant() {
+        let (_dir, record) = resolved_record_with_component(component_tool_importing_https(
+            br#"{"summary":"component ok"}"#,
+        ));
+
+        let error = run_plugin_component_tool(record, "PluginEcho".to_string(), b"{}".to_vec())
+            .expect_err("host import without grant is denied");
+
+        assert!(
+            format!("{error:?}").contains("plugin host API dispatch denied"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn component_tool_missing_export_fails_closed() {
+        let (_dir, record) = resolved_record_with_component(component_without_call_export());
+
+        let error = run_plugin_component_tool(record, "PluginEcho".to_string(), b"{}".to_vec())
+            .expect_err("missing export fails closed");
+
+        assert!(
+            format!("{error:?}").contains("does not export expected"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn core_wasm_is_not_silently_reinterpreted_as_component() {
+        let (_dir, record) = resolved_record_with_component(raw_module_bytes());
+
+        let error = run_plugin_component_tool(record, "PluginEcho".to_string(), b"{}".to_vec())
+            .expect_err("core module is incompatible with component runtime");
+
+        assert!(
+            format!("{error:?}").contains("component is incompatible"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn component_wrong_world_fails_closed_during_discovery() {
+        let dir = TempDir::new().unwrap();
+        let package_dir = dir.path().join(".yoi/plugins");
+        fs::create_dir_all(&package_dir).unwrap();
+        let package_path = package_dir.join("component.yoi-plugin");
+        write_component_plugin_package(
+            &package_path,
+            &component_tool_that_returns(br#"{"summary":"component ok"}"#),
+            "example:other/world@1.0.0",
+        );
+        let config = PluginConfig {
+            enabled: vec![PluginEnablementConfig {
+                id: "project:example".parse().unwrap(),
+                surfaces: vec![PluginSurface::Tool],
+                ..PluginEnablementConfig::default()
+            }],
+            resolved: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let options = PluginDiscoveryOptions::new(dir.path());
+        let resolved = resolve_plugin_config_for_startup(&config, &options);
+
+        assert!(resolved.resolved.is_empty());
+        assert!(
+            resolved.diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("component world is unsupported")),
+            "{:#?}",
+            resolved.diagnostics
+        );
+    }
+
+    #[test]
+    fn component_tool_registration_uses_existing_tool_registry_path() {
+        let (_dir, record) = resolved_record_with_component(component_tool_that_returns(
+            br#"{"summary":"component ok"}"#,
+        ));
+        let (report, pending) = install_plugin_record(record);
+
+        assert_eq!(skipped_count(&report), 0, "{report:#?}");
+        assert_eq!(pending.len(), 1);
+        let (meta, _) = pending[0]();
+        assert_eq!(meta.name, "PluginEcho");
+    }
+
+    #[test]
+    fn component_static_inspection_reports_component_runtime_without_execution() {
+        let mut record = record(vec![tool("Echo")]);
+        record.package_path = std::path::PathBuf::from("/no/such/component.wasm");
+        record.manifest.runtime = Some(PluginRuntimeManifest {
+            kind: PLUGIN_RUNTIME_COMPONENT_KIND.to_string(),
+            entry: None,
+            abi: None,
+            component: Some("plugin.component.wasm".to_string()),
+            world: Some(PLUGIN_COMPONENT_TOOL_WORLD.to_string()),
+        });
+
+        let inspection = inspect_resolved_plugin_static(&record);
+
+        assert!(inspection.runtime.eligible);
+        assert_eq!(
+            inspection.runtime.status,
+            format!("{PLUGIN_RUNTIME_COMPONENT_KIND}/{PLUGIN_COMPONENT_TOOL_WORLD}")
+        );
+        assert!(inspection.runtime.diagnostic.is_none());
     }
 
     fn write_plugin_package(path: &Path, wasm: &[u8]) {
@@ -3884,9 +4505,11 @@ input_schema = { type = "object", additionalProperties = true }
         let mut record = record(vec![tool("Echo")]);
         record.package_path = std::path::PathBuf::from("/no/such/plugin.wasm");
         record.manifest.runtime = Some(PluginRuntimeManifest {
-            kind: "wasm".to_string(),
-            entry: "plugin.wasm".to_string(),
-            abi: Some("yoi-plugin-wasm-1".to_string()),
+            kind: PLUGIN_RUNTIME_WASM_KIND.to_string(),
+            entry: Some("plugin.wasm".to_string()),
+            abi: Some(PLUGIN_RUNTIME_WASM_ABI.to_string()),
+            component: None,
+            world: None,
         });
 
         let inspection = inspect_resolved_plugin_static(&record);
@@ -3901,9 +4524,11 @@ input_schema = { type = "object", additionalProperties = true }
     fn static_inspection_reports_missing_tool_grant() {
         let mut record = record(vec![tool("Echo")]);
         record.manifest.runtime = Some(PluginRuntimeManifest {
-            kind: "wasm".to_string(),
-            entry: "plugin.wasm".to_string(),
-            abi: Some("yoi-plugin-wasm-1".to_string()),
+            kind: PLUGIN_RUNTIME_WASM_KIND.to_string(),
+            entry: Some("plugin.wasm".to_string()),
+            abi: Some(PLUGIN_RUNTIME_WASM_ABI.to_string()),
+            component: None,
+            world: None,
         });
         record.grants.permissions = vec![PluginPermission::surface(PluginSurface::Tool)];
 
@@ -3926,9 +4551,11 @@ input_schema = { type = "object", additionalProperties = true }
         bad_schema.input_schema = json!({"type":"string"});
         let mut record = record(vec![bad_schema]);
         record.manifest.runtime = Some(PluginRuntimeManifest {
-            kind: "wasm".to_string(),
-            entry: "plugin.wasm".to_string(),
-            abi: Some("yoi-plugin-wasm-1".to_string()),
+            kind: PLUGIN_RUNTIME_WASM_KIND.to_string(),
+            entry: Some("plugin.wasm".to_string()),
+            abi: Some(PLUGIN_RUNTIME_WASM_ABI.to_string()),
+            component: None,
+            world: None,
         });
 
         let inspection = inspect_resolved_plugin_static(&record);
@@ -3953,9 +4580,11 @@ input_schema = { type = "object", additionalProperties = true }
         second_duplicate.input_schema = json!({"type":"object"});
         let mut record = record(vec![invalid, first_duplicate, second_duplicate]);
         record.manifest.runtime = Some(PluginRuntimeManifest {
-            kind: "wasm".to_string(),
-            entry: "plugin.wasm".to_string(),
-            abi: Some("yoi-plugin-wasm-1".to_string()),
+            kind: PLUGIN_RUNTIME_WASM_KIND.to_string(),
+            entry: Some("plugin.wasm".to_string()),
+            abi: Some(PLUGIN_RUNTIME_WASM_ABI.to_string()),
+            component: None,
+            world: None,
         });
 
         let inspection = inspect_resolved_plugin_static(&record);

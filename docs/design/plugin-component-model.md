@@ -121,3 +121,57 @@ For example, `https` should be modeled as typed request/response data with expli
 - It does not replace Plugin grants with WIT imports.
 - It does not introduce Service, Ingress, WebSocket, or inbound HTTP by itself.
 - It does not merge Plugin and MCP. MCP remains a separate untrusted tool/resource/prompt bridge with its own policy.
+
+## Implemented runtime boundary
+
+Plugin Tool packages now select the runtime explicitly in `plugin.toml`:
+
+```toml
+[runtime]
+kind = "wasm-component"
+component = "plugin.component.wasm"
+world = "yoi:plugin/tool@1.0.0"
+```
+
+The legacy core-Wasm ABI remains explicit and is not reinterpreted as a
+component:
+
+```toml
+[runtime]
+kind = "wasm"
+entry = "plugin.wasm"
+abi = "yoi-plugin-wasm-1"
+```
+
+The component runtime uses `wasmtime::component` and expects the exported world
+`yoi:plugin/tool@1.0.0` with a `call(tool-name: string, input-json: string) ->
+string` export. The returned string is the same ToolOutput JSON used by the raw
+runtime, so registration and execution still flow through the existing
+ToolRegistry and Worker Tool-result history path.
+
+Host imports are stable names under `yoi:host/*@1.0.0`; the repository WIT files
+live in `resources/plugin/wit/`. Importing `yoi:host/https@1.0.0` or
+`yoi:host/fs@1.0.0` is not authority. The runtime checks package grants before
+component instantiation and checks again on every host call. No WASI filesystem,
+network, environment, or other ambient imports are linked.
+
+Static discovery and `yoi plugin list/show` only parse package manifests and
+reported runtime metadata. They do not instantiate or execute the component.
+Wrong `world`, missing artifact metadata, missing `call` export, unsupported
+imports, or core-Wasm bytes in a component package all fail closed with bounded
+Plugin diagnostics or ordinary Tool errors.
+
+See `docs/examples/plugin-component-tool/lib.rs` for a minimal
+`wit-bindgen`/SDK-style authoring sketch. Package authors should generate
+bindings from `resources/plugin/wit`, build a component artifact, and set the
+component runtime metadata above.
+
+### v1 request/response shape
+
+The v1 component world intentionally keeps Tool input, Tool output, and host API
+payloads as JSON strings. This is a migration bridge that preserves the existing
+ToolOutput schema, Tool history behavior, grant checks, and raw-Wasm host API
+semantics while moving package authors onto WIT/canonical ABI bindings.
+Structured WIT records for Tool requests/responses/errors and host HTTPS/FS
+payloads are deferred to a follow-up API-design step rather than accidentally
+omitted.

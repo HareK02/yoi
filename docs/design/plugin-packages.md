@@ -204,3 +204,29 @@ Good follow-up Tickets are intentionally separable:
 6. WASM package ABI, initialization limits, host-function grants, and Tool/Hook contribution plumbing.
 7. Optional lock-file or pin update workflow for reproducible fresh startup.
 8. Future MCP/plugin bridge, only if explicitly approved as a separate design and implementation effort.
+
+### Component Model Tool runtime
+
+Tool packages may use WebAssembly Component Model runtime metadata:
+
+```toml
+[runtime]
+kind = "wasm-component"
+component = "plugin.component.wasm"
+world = "yoi:plugin/tool@1.0.0"
+```
+
+This is separate from the legacy raw core-Wasm runtime:
+
+```toml
+[runtime]
+kind = "wasm"
+entry = "plugin.wasm"
+abi = "yoi-plugin-wasm-1"
+```
+
+Component packages must not use `entry`/`abi`; raw packages must not use
+`component`/`world`. Discovery reports the selected runtime kind/world without
+executing the artifact. Component execution still requires explicit package
+enablement, exact source/version/digest grants, and matching Tool/host API
+permissions.
