@@ -321,3 +321,33 @@ Test gap:
 - Current HTTPS-focused tests use `MockHttpsClient` for allowed/denied/timeout/truncation behavior. That is useful for grant ordering, but it does not exercise the real `ReqwestPluginHttpsClient` DNS filtering, redirect policy, TLS/HTTPS path, or actual timeout/read-limit behavior. Given the security-sensitive DNS/IP requirements, add coverage for the real validation edge cases above.
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-19T15:12:19Z -->
+
+## Plan
+
+Review follow-up dispatch:
+
+Reviewer `yoi-reviewer-00001KVFDX9AF` は `request_changes` を返したため、Ticket review として記録し、既存 Coder Pod `yoi-coder-00001KVFDX9AF` に修正依頼を送った。
+
+Blockers:
+1. IPv4-mapped IPv6 literals が private/local target rejection を bypass し得る。
+   - `::ffff:127.0.0.1` などを IPv6 として見るだけでは loopback/private 判定に漏れる。
+   - `Ipv6Addr::to_ipv4_mapped()` 等で mapped IPv4 を取り出し、既存 IPv4 forbidden checks を適用する必要がある。
+
+2. DNS private-address validation が TOCTOU で actual connection path に bind されていない。
+   - preflight `ToSocketAddrs` validation 後に `reqwest` が別途 DNS resolution するため、DNS rebinding / split answers で public answer validation 後に private/local address へ接続し得る。
+   - validated public `SocketAddr`s を reqwest client/request resolver path に pin する、または actual connected remote address を検証する必要がある。
+
+Required fixes sent to Coder:
+- IPv4-mapped IPv6 addresses を mapped IPv4 として private/local/link-local/loopback checks に通す。
+- mapped loopback/private/link-local の tests を追加する。
+- DNS validation を actual connection path に bind する設計へ修正する。
+- DNS / actual connection edge の deterministic test coverage を追加する。
+- Prior positives を維持する: grant-before-network、WASM import grant validation、HTTPS-only、embedded credentials rejection、method allowlist、bounds、timeout、no redirects、`no_proxy()`、ordinary Tool result path、manifest/CLI schema compatibility。
+
+Next:
+- Coder の修正 commit / validation report を待つ。
+- 修正後、network-safety edge cases と grant-before-network invariants を中心に再レビューする。
+
+---
