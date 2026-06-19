@@ -184,6 +184,7 @@ pub fn inspect_resolved_plugin_static(record: &ResolvedPluginRecord) -> PluginSt
         })
         .collect();
 
+    let duplicate_tool_names = duplicate_tool_names(record);
     let tools = record
         .manifest
         .tools
@@ -192,9 +193,11 @@ pub fn inspect_resolved_plugin_static(record: &ResolvedPluginRecord) -> PluginSt
             let permission = PluginPermission::tool(&tool.name);
             let requested = permission_requested(record, &permission);
             let granted = grant_allows(record, &permission);
-            let diagnostic = authorize_plugin_tool(record, tool)
-                .err()
-                .map(|error| error.bounded_message());
+            let mut diagnostics = validate_plugin_tool_definition(tool, &duplicate_tool_names);
+            if let Err(error) = authorize_plugin_tool(record, tool) {
+                diagnostics.push(error.bounded_message());
+            }
+            let diagnostic = join_tool_diagnostics(diagnostics);
             PluginToolEligibility {
                 name: tool.name.clone(),
                 permission: permission.label(),
@@ -228,6 +231,48 @@ fn grant_allows(record: &ResolvedPluginRecord, permission: &PluginPermission) ->
         .permissions
         .iter()
         .any(|granted| granted == permission)
+}
+
+fn duplicate_tool_names(record: &ResolvedPluginRecord) -> HashSet<String> {
+    let mut seen = HashSet::new();
+    let mut duplicates = HashSet::new();
+    for tool in &record.manifest.tools {
+        if !seen.insert(tool.name.clone()) {
+            duplicates.insert(tool.name.clone());
+        }
+    }
+    duplicates
+}
+
+fn validate_plugin_tool_definition(
+    tool: &PluginToolManifest,
+    duplicate_tool_names: &HashSet<String>,
+) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    if duplicate_tool_names.contains(&tool.name) {
+        diagnostics.push(format!(
+            "tool `{}` has duplicate name within plugin manifest",
+            tool.name
+        ));
+    }
+    if let Err(reason) = validate_tool_name(&tool.name) {
+        diagnostics.push(format!("tool `{}` has invalid name: {reason}", tool.name));
+    }
+    if let Err(reason) = validate_input_schema(&tool.input_schema) {
+        diagnostics.push(format!(
+            "tool `{}` has invalid input_schema: {reason}",
+            tool.name
+        ));
+    }
+    diagnostics
+}
+
+fn join_tool_diagnostics(diagnostics: Vec<String>) -> Option<String> {
+    if diagnostics.is_empty() {
+        None
+    } else {
+        Some(bounded_message(diagnostics.join("; ")))
+    }
 }
 
 impl FeatureModule for PluginToolFeature {
@@ -1857,6 +1902,70 @@ input_schema = { type = "object", additionalProperties = true }
                 .as_deref()
                 .unwrap_or_default()
                 .contains("grant")
+        );
+    }
+
+    #[test]
+    fn static_inspection_reports_invalid_tool_definition() {
+        let mut bad_schema = tool("Echo");
+        bad_schema.input_schema = json!({"type":"string"});
+        let mut record = record(vec![bad_schema]);
+        record.manifest.runtime = Some(PluginRuntimeManifest {
+            kind: "wasm".to_string(),
+            entry: "plugin.wasm".to_string(),
+            abi: Some("yoi-plugin-wasm-1".to_string()),
+        });
+
+        let inspection = inspect_resolved_plugin_static(&record);
+
+        assert!(!inspection.statically_eligible());
+        assert!(!inspection.tools[0].eligible);
+        let diagnostic = inspection.tools[0]
+            .diagnostic
+            .as_deref()
+            .unwrap_or_default();
+        assert!(diagnostic.contains("invalid input_schema"));
+        assert!(diagnostic.contains("root schema type must be `object`"));
+    }
+
+    #[test]
+    fn static_inspection_reports_invalid_and_duplicate_tool_names() {
+        let mut invalid = tool("Bad Tool");
+        invalid.input_schema = json!({"type":"object"});
+        let mut first_duplicate = tool("Echo");
+        let mut second_duplicate = tool("Echo");
+        first_duplicate.input_schema = json!({"type":"object"});
+        second_duplicate.input_schema = json!({"type":"object"});
+        let mut record = record(vec![invalid, first_duplicate, second_duplicate]);
+        record.manifest.runtime = Some(PluginRuntimeManifest {
+            kind: "wasm".to_string(),
+            entry: "plugin.wasm".to_string(),
+            abi: Some("yoi-plugin-wasm-1".to_string()),
+        });
+
+        let inspection = inspect_resolved_plugin_static(&record);
+
+        assert!(!inspection.statically_eligible());
+        assert!(
+            inspection.tools[0]
+                .diagnostic
+                .as_deref()
+                .unwrap_or_default()
+                .contains("invalid name")
+        );
+        assert!(
+            inspection.tools[1]
+                .diagnostic
+                .as_deref()
+                .unwrap_or_default()
+                .contains("duplicate name")
+        );
+        assert!(
+            inspection.tools[2]
+                .diagnostic
+                .as_deref()
+                .unwrap_or_default()
+                .contains("duplicate name")
         );
     }
 

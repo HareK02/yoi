@@ -990,6 +990,64 @@ mod tests {
     }
 
     #[test]
+    fn invalid_tool_schema_and_name_are_rejected_in_json_and_human_output() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let bad_schema_manifest = plugin_manifest("bad_schema", "Echo", "string", &["Echo"]);
+        let bad_name_manifest = plugin_manifest("bad_name", "Bad Tool", "object", &["Bad Tool"]);
+        let bad_schema_digest =
+            write_plugin_manifest(workspace, "bad_schema", &bad_schema_manifest);
+        let bad_name_digest = write_plugin_manifest(workspace, "bad_name", &bad_name_manifest);
+        let mut config = PluginConfig::default();
+        config.enabled.push(enablement(
+            "project:bad_schema",
+            "0.1.0",
+            bad_schema_digest,
+            &["Echo"],
+        ));
+        config.enabled.push(enablement(
+            "project:bad_name",
+            "0.1.0",
+            bad_name_digest,
+            &["Bad Tool"],
+        ));
+
+        let snapshot = inspect_snapshot(workspace, &config);
+        let bad_schema = select_item(&snapshot, "project:bad_schema").unwrap();
+        let bad_name = select_item(&snapshot, "project:bad_name").unwrap();
+
+        assert_eq!(bad_schema.status, "rejected");
+        assert_eq!(bad_name.status, "rejected");
+        assert!(!bad_schema.tools[0].eligible);
+        assert!(!bad_name.tools[0].eligible);
+
+        let list_json = serde_json::to_value(&snapshot).unwrap();
+        assert!(list_json["items"].as_array().unwrap().iter().any(|item| {
+            item["reference"] == "project:bad_schema"
+                && item["status"] == "rejected"
+                && item["tools"][0]["diagnostic"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("invalid input_schema")
+        }));
+        let show_json = serde_json::to_value(bad_name).unwrap();
+        assert_eq!(show_json["status"], "rejected");
+        assert!(
+            show_json["tools"][0]["diagnostic"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("invalid name")
+        );
+
+        let list_output = render_list_snapshot_human(&snapshot).unwrap();
+        assert!(list_output.contains("project:bad_schema [rejected]"));
+        assert!(list_output.contains("project:bad_name [rejected]"));
+        let show_output = render_item_human(bad_schema).unwrap();
+        assert!(show_output.contains("invalid input_schema"));
+        assert!(show_output.contains("eligible=false"));
+    }
+
+    #[test]
     fn ambiguous_ref_is_bounded_error() {
         let snapshot = PluginInspectionSnapshot {
             workspace: PathBuf::from("/tmp/workspace"),
@@ -1040,6 +1098,66 @@ mod tests {
             }],
             ..PluginConfig::default()
         }
+    }
+
+    fn enablement(
+        id: &str,
+        version: &str,
+        digest: String,
+        tool_permissions: &[&str],
+    ) -> PluginEnablementConfig {
+        let mut permissions = vec![PluginPermission::surface(PluginSurface::Tool)];
+        permissions.extend(
+            tool_permissions
+                .iter()
+                .map(|tool_name| PluginPermission::tool(*tool_name)),
+        );
+        PluginEnablementConfig {
+            id: id.to_string(),
+            digest: Some(digest.clone()),
+            version: Some(PluginExactVersion(version.to_string())),
+            surfaces: vec![PluginSurface::Tool],
+            grants: PluginGrantConfig {
+                id: Some(id.to_string()),
+                version: Some(PluginExactVersion(version.to_string())),
+                digest: Some(digest),
+                permissions,
+            },
+            config: None,
+        }
+    }
+
+    fn plugin_manifest(
+        id: &str,
+        tool_name: &str,
+        schema_type: &str,
+        permission_tools: &[&str],
+    ) -> String {
+        let permissions = permission_tools
+            .iter()
+            .map(|tool| format!(r#"{{ kind = "tool", name = "{tool}" }}"#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            r#"
+schema_version = 1
+id = "{id}"
+name = "{id}"
+version = "0.1.0"
+surfaces = ["tool"]
+permissions = [{{ kind = "surface", surface = "tool" }}, {permissions}]
+
+[runtime]
+kind = "wasm"
+entry = "plugin.wasm"
+abi = "yoi-plugin-wasm-1"
+
+[[tools]]
+name = "{tool_name}"
+description = "Test tool"
+input_schema = {{ type = "{schema_type}" }}
+"#
+        )
     }
 
     fn write_plugin_package(workspace: &Path, id: &str) -> String {
