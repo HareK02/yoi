@@ -618,3 +618,60 @@ Next:
 - 修正後、static inspection schema validity / no-execution / typed status semantics を中心に再レビューする。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-19T13:35:49Z -->
+
+## Implementation report
+
+Coder review-fix implementation report received / Orchestrator validation:
+
+Incremental fix commit:
+- `982a1b75` — `plugin: validate inspected tool schemas`
+
+Summary:
+- Static Plugin inspection が Tool definition validity を検証するようになった。
+  - invalid tool names
+  - duplicate tool names
+  - invalid `input_schema`
+- Tool-definition diagnostics は bounded で JSON/human inspection output に含まれる。
+- Invalid tool schema/name は tool を ineligible にする。
+- Package status semantics:
+  - 全 tools unusable の場合は `rejected`
+  - 少なくとも1つ usable で一部 rejected の場合は `partial`
+- read-only / no-execution behavior は維持。
+
+Files changed in incremental fix:
+- `crates/pod/src/feature/plugin.rs`
+- `crates/yoi/src/plugin_cli.rs`
+
+Coder reported validation:
+- `cargo fmt` — passed
+- `cargo test -p yoi plugin` — passed
+- `cargo test -p pod static_inspection` — passed
+- `cargo check -p yoi -p pod -p manifest` — passed
+- `cargo fmt --check` — passed
+- `git diff --check` — passed
+- `nix build .#yoi --no-link` — passed
+
+Orchestrator evidence checked:
+- Pod output を確認。
+- implementation worktree は clean。
+- branch `impl/00001KVFD3YSV-plugin-cli-inspection` HEAD は `982a1b75`。
+- incremental diff stat from previous review target `dfa966db..982a1b75`: 2 files changed, 230 insertions, 3 deletions。
+
+Validation re-run by Orchestrator in implementation worktree:
+- `cargo fmt --check` — passed
+- `cargo check -p yoi -p pod -p manifest` — passed
+- `cargo test -p yoi plugin -- --nocapture` — passed; 10 passed, 0 failed
+- `cargo test -p pod static_inspection -- --nocapture` — passed; 5 passed, 0 failed
+- `cargo test -p pod plugin -- --nocapture` — passed; 33 passed, 0 failed
+- `cargo test -p manifest plugin -- --nocapture` — passed; 17 passed, 0 failed
+- `git diff --check` — passed
+- `nix build .#yoi --no-link` — passed
+
+Routing classification: review_needed
+
+Next action:
+- previous `request_changes` blocker が解消されたか、read-only Reviewer Pod で再レビューする。
+
+---
