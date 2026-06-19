@@ -1217,3 +1217,49 @@ Conclusion:
 - Implementation satisfies the recorded Ticket acceptance criteria and is ready for merge/validation in the Orchestrator worktree.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-19T14:21:26Z -->
+
+## Implementation report
+
+Merge / validation report:
+
+Implementation branch `impl/00001KVFD3YSV-plugin-cli-inspection` を Orchestrator worktree の `orchestration` branch に merge した。
+
+Merge:
+- merge commit: `71ca05c8` — `merge: plugin cli inspection`
+- implementation commits:
+  - `462de32a` — `plugin: add cli inspection`
+  - `b5f10ab7` — `plugin: align inspection statuses`
+  - `dfa966db` — `plugin: report inspection package metadata`
+  - `982a1b75` — `plugin: validate inspected tool schemas`
+  - `a5f3b0b5` — `plugin: reject configured invalid packages`
+  - `0142ef1d` — `plugin: distinguish present invalid packages`
+- changed files:
+  - `crates/manifest/src/plugin.rs`
+  - `crates/pod/src/feature/plugin.rs`
+  - `crates/yoi/src/main.rs`
+  - `crates/yoi/src/plugin_cli.rs`
+
+Validation in Orchestrator worktree:
+- `cargo fmt --check` — passed
+- `cargo check -p yoi -p pod -p manifest` — passed
+- `cargo test -p yoi plugin -- --nocapture` — passed; 11 passed, 0 failed
+- `cargo test -p pod static_inspection -- --nocapture` — passed; 4 passed, 0 failed
+- `cargo test -p pod plugin -- --nocapture` — passed; 31 passed, 0 failed
+- `cargo test -p manifest plugin -- --nocapture` — passed; 17 passed, 0 failed
+- `git diff --check` — passed
+- `nix build .#yoi --no-link` — passed
+
+Review:
+- Multiple review rounds requested changes for status vocabulary, package metadata fields, Tool schema/name static validation, configured invalid package status, and present-but-invalid `Missing` diagnostics.
+- Final re-review `yoi-reviewer-00001KVFD3YSV-r6` returned `approve` with no blockers.
+
+Outcome:
+- `yoi plugin list` / `yoi plugin show <ref>` read-only inspection CLI is implemented with typed JSON/report and human output.
+- Inspection reports package path/location, schema/API version, source/ref/digest/version, requested permissions/grants/diagnostics, Tool/static eligibility, host API eligibility structure, and bounded diagnostics.
+- Status vocabulary is `active`, `disabled`, `missing`, `rejected`, `partial` with tests covering the reviewed edge cases.
+- Inspection remains static/read-only and does not execute Plugin WASM/Tool code.
+- Root/original workspace was not read/written/merged/validated for this Ticket, per Panel Queue instruction.
+
+---
