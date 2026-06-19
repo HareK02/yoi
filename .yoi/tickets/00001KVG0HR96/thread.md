@@ -237,3 +237,57 @@ Reviewer validation:
 Worktree status at review end: clean。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-19T17:17:08Z -->
+
+## Implementation report
+
+Coder r1-fix report received from `yoi-coder-00001KVG0HR96`.
+
+New fix commit:
+- `a705bb3b plugin: bound component model runtime resources`
+
+Branch commits now:
+- `a705bb3b plugin: bound component model runtime resources`
+- `57bbf14e plugin: implement component model runtime`
+
+Fix summary:
+- Added `wasmtime::StoreLimits` to Component Model host state.
+- Applied raw-runtime-equivalent limits to component execution store:
+  - `memory_size(PLUGIN_WASM_MEMORY_BYTES)`
+  - `table_elements(PLUGIN_WASM_TABLE_ELEMENTS)`
+  - `instances(1)`
+  - `tables(1)`
+  - `memories(1)`
+  - `trap_on_grow_failure(true)`
+- Added inline comment near WIT string lift explaining that host allocation before `decode_plugin_wasm_output` is bounded by component memory/table/instance limits.
+- Added negative tests:
+  - component oversized memory fails closed before string lift
+  - component oversized table fails closed
+  - component output cap still fails closed after bounded lift
+- Added docs note that JSON-string WIT v1 request/response is deliberate migration bridge and structured WIT records are deferred.
+
+Coder validation reported as passing:
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check`
+- `cargo test -p pod feature::plugin::tests -- --nocapture` (`58 passed`)
+- `cargo test -p manifest plugin -- --nocapture` (`17 passed`)
+- `cargo test -p yoi plugin -- --nocapture` (`11 passed`)
+- `nix build .#yoi --no-link`
+
+Package / binary impact measurement reported:
+- `nix path-info -S .#yoi`: `/nix/store/g9nhx3g2xsn7r3rw6n61scdkha5s7m8s-yoi-0.1.0 112156120`
+- `stat -c '%s %n' "$out/bin/yoi"`: `54605944 .../bin/yoi`
+- `du -sh "$out"`: `53M`
+
+Orchestrator evidence checked before re-review:
+- Implementation worktree is clean.
+- HEAD is `a705bb3b`.
+- Fix diff from `57bbf14e..HEAD` touches `crates/pod/src/feature/plugin.rs` and `docs/design/plugin-component-model.md`, 108 insertions.
+- Overall `git diff --check 878517dc..HEAD` produced no diagnostics.
+
+Next action:
+- Route back to Reviewer for r2 verification of the resource-boundary blocker and final acceptance criteria.
+
+---
