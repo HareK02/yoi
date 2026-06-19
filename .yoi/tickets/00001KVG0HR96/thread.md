@@ -141,3 +141,41 @@ Next action:
 - Wait for Coder implementation report, then inspect branch diff/validation evidence and route to Reviewer.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-19T17:00:21Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVG0HR96`.
+
+Implementation commit:
+- `57bbf14e plugin: implement component model runtime`
+
+Changed areas reported:
+- Manifest/runtime metadata: added explicit `kind = "wasm-component"` support with `component` artifact path and `world = "yoi:plugin/tool@1.0.0"`; preserved raw core-Wasm as `kind = "wasm"` + `abi = "yoi-plugin-wasm-1"`; reject mixed raw/component runtime metadata.
+- Plugin runtime: added `wasmtime::component` path; Component Tools execute through existing ToolRegistry / Worker Tool path; component imports are fail-closed; grants are checked before instantiation/import use and on host API calls; no WASI fs/network/env exposed.
+- Static inspection: reports `wasm-component/yoi:plugin/tool@1.0.0` without reading/executing the artifact.
+- Tests: component discovery/registration/execution, host-import grant denial, wrong-world, missing-export, raw-core-Wasm-not-component fail-closed, and existing raw runtime coverage.
+- Docs / authoring: updated design/package docs, added WIT files under `resources/plugin/wit/`, and sample author source under `docs/examples/plugin-component-tool/lib.rs`.
+- Packaging: added `wasmtime = 45.0.2` with narrow non-default features; updated `Cargo.lock` and `package.nix` `cargoHash`.
+
+Coder validation reported as passing:
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check`
+- `cargo test -p pod feature::plugin::tests -- --nocapture` (`55 passed`)
+- `cargo test -p manifest plugin -- --nocapture` (`17 passed`)
+- `cargo test -p yoi plugin -- --nocapture` (`11 passed`)
+- `nix build .#yoi --no-link`
+
+Orchestrator evidence checked before review dispatch:
+- Implementation worktree is clean on `impl/00001KVG0HR96-plugin-component-model-runtime`.
+- Merge-base with `orchestration` is `878517dc`; Orchestrator branch head is `02006fee`.
+- Diff from acceptance is one implementation commit, `57bbf14e`, touching 10 files: `Cargo.lock`, manifest Plugin parser, pod Plugin runtime, `crates/pod/Cargo.toml`, docs, `package.nix`, and WIT/sample files.
+- `git diff --check 878517dc..HEAD` produced no diagnostics.
+- Diff size is material: about 1568 insertions / 68 deletions; dependency impact note is reviewer focus.
+
+Next action:
+- Dispatch Reviewer for r1 review against Ticket requirements, with focus on Component Model authority boundaries, grant enforcement, no ambient WASI, raw runtime compatibility, inspection not executing code, diagnostics, tests, and packaging/Nix impact.
+
+---
