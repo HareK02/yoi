@@ -173,3 +173,76 @@ Next:
 - Coder は scoped `fs` host API implementation、focused tests、validation、implementation commit を行い、実装報告を返す予定。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-19T16:01:41Z -->
+
+## Implementation report
+
+Coder implementation report received / Orchestrator validation:
+
+Implementation commit:
+- `717c0999` — `plugin: implement fs host api`
+
+Summary:
+- Added manifest/config support for `host_api.fs` grants:
+  - `PluginFsGrant { root, operations }`
+  - `PluginFsOperation::{read,list,write}`
+- Implemented WASM host import module `yoi:fs` with:
+  - `read`
+  - `list`
+  - `write`
+  - `response_len`
+  - `response_read`
+- Enforced plugin-specific grant checks; Pod/workspace fs authority is not inherited.
+- Added path safety:
+  - relative-only request paths;
+  - `..` traversal rejection;
+  - configured root must be absolute/non-symlink directory;
+  - symlink component/target rejection;
+  - canonical allowed-root escape checks.
+- Added bounds:
+  - request descriptor size;
+  - path length;
+  - read size with explicit truncation flag;
+  - write size fail-closed;
+  - directory entry count with explicit truncation flag.
+- Added write serialization by normalized target plus `O_NOFOLLOW` on Unix.
+- Kept fs errors/diagnostics bounded and redacted.
+- Extended Plugin CLI inspection to show configured fs grants.
+
+Files changed:
+- `crates/manifest/src/plugin.rs`
+- `crates/pod/src/feature/plugin.rs`
+- `crates/yoi/src/plugin_cli.rs`
+
+Coder reported validation:
+- `cargo fmt --check` — passed
+- `cargo test -p pod feature::plugin` — passed
+- `cargo test -p manifest plugin` — passed
+- `cargo test -p yoi plugin_cli` — passed
+- `cargo check -p pod -p manifest -p yoi` — passed
+- `git diff --check` — passed
+- `nix build` not run by Coder because no dependency/package-source-filter changes.
+
+Orchestrator evidence checked:
+- Pod output を確認。
+- implementation worktree は clean。
+- branch `impl/00001KVFDX9AY-plugin-fs-host-api` HEAD は `717c0999`。
+- diff stat from accepted base `6711bcf3..717c0999`: 3 files changed, 1068 insertions, 17 deletions。
+
+Validation re-run by Orchestrator in implementation worktree:
+- `cargo fmt --check` — passed
+- `cargo check -p pod -p manifest -p yoi` — passed
+- `cargo test -p pod feature::plugin -- --nocapture` — passed; 48 passed, 0 failed
+- `cargo test -p manifest plugin -- --nocapture` — passed; 17 passed, 0 failed
+- `cargo test -p yoi plugin_cli -- --nocapture` — passed; 10 passed, 0 failed
+- `git diff --check` — passed
+- `nix build .#yoi --no-link` — passed
+
+Routing classification: review_needed
+
+Next action:
+- recorded intent / invariants / acceptance criteria に照らして、read-only Reviewer Pod で外部レビューする。
+- 特に no ambient workspace fs authority、grant-before-filesystem access、path traversal/symlink/root escape、bounds/truncation/fail-closed policy、write serialization/O_NOFOLLOW、diagnostic redaction、ordinary Tool result path、HTTPS/CLI compatibility を確認する。
+
+---
