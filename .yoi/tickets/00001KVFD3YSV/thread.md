@@ -379,3 +379,58 @@ Next:
 - Reviewer output を確認し、approve なら Orchestrator worktree への merge/validation/cleanup/close-ready 処理へ進む。request_changes なら blocker を記録して Coder に戻す。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVFD3YSV-r2 at: 2026-06-19T11:23:25Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+対象:
+- Ticket: `00001KVFD3YSV`
+- branch: `impl/00001KVFD3YSV-plugin-cli-inspection`
+- commits:
+  - `462de32a` — `plugin: add cli inspection`
+  - `b5f10ab7` — `plugin: align inspection statuses`
+
+Previous blocker status:
+- status vocabulary blocker は解消済み。
+- `active`, `disabled`, `missing`, `rejected`, `partial` が typed report / JSON / human output に使われ、old vocabulary は出力から除去されている。
+
+Remaining blocker:
+- typed report / JSON / human output が Plugin API/schema version と package path / inspectable package location をまだ出していない。
+
+Evidence:
+- Ticket requirements / acceptance は list overview に package path と API version、show に package path と version / API version を要求している。
+- `PluginInspectionItem` は `package`, `version`, `digest` を持つが、`api_version` / `schema_version` と `package_path` field がない。
+- builder は `package` を package label から埋めており、inspectable package location/path ではない。
+- Human `list` は `version`, `digest`, `source`, `enabled_surfaces`, tools, diagnostics を表示するが、API version と package/path を表示しない。
+- Human `show` は `package`, `version`, `digest` などを表示するが、API/schema version を表示しない。
+- Tests は JSON fields を一部 pin しているが、API/schema version や package path presence は pin していない。
+
+Why this blocks acceptance:
+- CLI inspection の主目的は、Plugin package discovery / enablement resolution / source/ref/digest/version / requested permissions / grants / diagnostics を read-only に確認できること。
+- Ticket は package path と API version を明示的な list/show output contract として要求しており、typed JSON/report surface に含まれていないと、human output の薄い formatting でも確認できない。
+
+Positive findings:
+- read-only/no-execution boundary は維持されているように見える。
+- future `https` / `fs` inspection extension は `PluginStaticInspection.host_apis` と human `host_api_permissions` rendering があり、拡張可能に見える。
+- bounded diagnostics は `MAX_*` constants と `bound_text` により維持されている。
+- Status vocabulary fix は requested terms を満たし、tests でも pin されている。
+
+Requested changes:
+- typed report / JSON に Plugin API/schema version field を追加する。
+- typed report / JSON に package path / inspectable package location field を追加する。
+- human `list` overview に package path/location と API/schema version を表示する。
+- human `show` に package path/location と API/schema version を表示する。
+- Tests で JSON list/show と human list/show の API/schema version と package path/location presence を pin する。
+- 既存の bounded output / no secret leakage 方針に従い、path/location 表示は必要最小限かつ deterministic にする。
+
+Reviewer validation:
+- Final branch と `462de32a..b5f10ab7` の static review。
+- Ticket requirements を再確認。
+- `git diff --check develop...HEAD` — passed。
+- targeted `rg` for old status terms。
+- Cargo/nix validation は Orchestrator reported validation を確認。
+
+---
