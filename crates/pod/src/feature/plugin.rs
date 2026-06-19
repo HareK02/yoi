@@ -9,7 +9,7 @@
 
 use std::collections::HashSet;
 use std::io::Read as _;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -369,19 +369,23 @@ impl PluginHttpsClient for ReqwestPluginHttpsClient {
         url: &reqwest::Url,
         limits: PluginHttpsLimits,
     ) -> Result<PluginHttpsResponse, PluginHttpsError> {
-        validate_dns_target(url)?;
+        let pinned_resolution = resolve_https_target_for_client(url, &SystemPluginHttpsResolver)?;
         let method = reqwest::Method::from_bytes(request.method.as_bytes()).map_err(|_| {
             PluginHttpsError::new(format!("unsupported HTTPS method `{}`", request.method))
         })?;
-        let client = reqwest::blocking::Client::builder()
+        let mut client_builder = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(limits.timeout)
             .no_proxy()
-            .user_agent("yoi-plugin-https-host-api/0.1")
-            .build()
-            .map_err(|error| {
-                PluginHttpsError::new(format!("HTTPS client build failed: {error}"))
-            })?;
+            .user_agent("yoi-plugin-https-host-api/0.1");
+        if let Some(pinned_resolution) = &pinned_resolution {
+            for domain in &pinned_resolution.domains {
+                client_builder = client_builder.resolve_to_addrs(domain, &pinned_resolution.addrs);
+            }
+        }
+        let client = client_builder.build().map_err(|error| {
+            PluginHttpsError::new(format!("HTTPS client build failed: {error}"))
+        })?;
         let mut builder = client.request(method, url.clone()).timeout(limits.timeout);
         for header in &request.headers {
             let name =
@@ -598,8 +602,15 @@ fn authorize_https_allowlist(
 }
 
 fn canonical_grant_host(host: &str) -> Option<String> {
-    let value = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let value = normalize_host_literal(host.trim());
     if value.is_empty() { None } else { Some(value) }
+}
+
+fn normalize_host_literal(host: &str) -> String {
+    host.trim_end_matches('.')
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
 }
 
 fn has_usable_https_grant(record: &ResolvedPluginRecord) -> bool {
@@ -614,7 +625,7 @@ fn has_usable_https_grant(record: &ResolvedPluginRecord) -> bool {
 
 fn canonical_host(url: &reqwest::Url) -> Result<String, PluginHttpsError> {
     url.host_str()
-        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+        .map(normalize_host_literal)
         .filter(|host| !host.is_empty())
         .ok_or_else(|| PluginHttpsError::new("HTTPS URL must include a host"))
 }
@@ -638,28 +649,41 @@ fn validate_static_https_target(url: &reqwest::Url) -> Result<(), PluginHttpsErr
     Ok(())
 }
 
-fn validate_dns_target(url: &reqwest::Url) -> Result<(), PluginHttpsError> {
+fn resolve_https_target_for_client(
+    url: &reqwest::Url,
+    resolver: &dyn PluginHttpsResolver,
+) -> Result<Option<PinnedHttpsResolution>, PluginHttpsError> {
     let host = canonical_host(url)?;
     if host.parse::<IpAddr>().is_ok() {
-        return Ok(());
+        return Ok(None);
     }
     let port = url
         .port_or_known_default()
         .ok_or_else(|| PluginHttpsError::new("HTTPS URL uses a scheme without a default port"))?;
-    let mut resolved = false;
-    for addr in (host.as_str(), port).to_socket_addrs().map_err(|error| {
-        PluginHttpsError::new(format!("DNS lookup failed for {:?}: {error}", host))
-    })? {
-        resolved = true;
-        validate_public_ip(addr.ip(), &host)?;
-    }
-    if !resolved {
+    let addrs = resolver.resolve(&host, port)?;
+    if addrs.is_empty() {
         return Err(PluginHttpsError::new(format!(
             "DNS lookup for {:?} returned no addresses",
             host
         )));
     }
-    Ok(())
+    for addr in &addrs {
+        validate_public_ip(addr.ip(), &host)?;
+    }
+    let mut domains = Vec::new();
+    if let Some(raw_host) = url.host_str() {
+        let raw_host = raw_host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase();
+        if !raw_host.is_empty() {
+            domains.push(raw_host);
+        }
+    }
+    if !domains.contains(&host) {
+        domains.push(host);
+    }
+    Ok(Some(PinnedHttpsResolution { domains, addrs }))
 }
 
 fn validate_public_ip(ip: IpAddr, host: &str) -> Result<(), PluginHttpsError> {
@@ -697,11 +721,30 @@ fn is_forbidden_ipv4(ip: Ipv4Addr) -> bool {
 }
 
 fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(mapped) = ipv6_embedded_ipv4(ip) {
+        return is_forbidden_ipv4(mapped);
+    }
     ip.is_loopback()
         || ip.is_unspecified()
         || (ip.segments()[0] & 0xfe00) == 0xfc00
         || (ip.segments()[0] & 0xffc0) == 0xfe80
         || (ip.segments()[0] & 0xff00) == 0xff00
+}
+
+fn ipv6_embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(mapped) = ip.to_ipv4_mapped() {
+        return Some(mapped);
+    }
+    let segments = ip.segments();
+    if segments[..6] == [0, 0, 0, 0, 0, 0] {
+        return Some(Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            segments[6] as u8,
+            (segments[7] >> 8) as u8,
+            segments[7] as u8,
+        ));
+    }
+    None
 }
 
 fn collect_https_response_headers(headers: &reqwest::header::HeaderMap) -> Vec<PluginHttpsHeader> {
@@ -985,6 +1028,29 @@ trait PluginHttpsClient: Send + Sync {
 }
 
 struct ReqwestPluginHttpsClient;
+struct SystemPluginHttpsResolver;
+
+#[derive(Clone, Debug)]
+struct PinnedHttpsResolution {
+    domains: Vec<String>,
+    addrs: Vec<SocketAddr>,
+}
+
+trait PluginHttpsResolver {
+    fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, PluginHttpsError>;
+}
+
+impl PluginHttpsResolver for SystemPluginHttpsResolver {
+    fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, PluginHttpsError> {
+        let mut addrs = Vec::new();
+        for addr in (host, port).to_socket_addrs().map_err(|error| {
+            PluginHttpsError::new(format!("DNS lookup failed for {:?}: {error}", host))
+        })? {
+            addrs.push(addr);
+        }
+        Ok(addrs)
+    }
+}
 
 #[derive(Debug)]
 struct PluginHttpsError(String);
@@ -1910,6 +1976,34 @@ mod tests {
         }
     }
 
+    struct FakeHttpsResolver {
+        calls: Mutex<Vec<(String, u16)>>,
+        addrs: Vec<SocketAddr>,
+    }
+
+    impl FakeHttpsResolver {
+        fn new(addrs: Vec<SocketAddr>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                addrs,
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, u16)> {
+            self.calls.lock().expect("resolver calls lock").clone()
+        }
+    }
+
+    impl PluginHttpsResolver for FakeHttpsResolver {
+        fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, PluginHttpsError> {
+            self.calls
+                .lock()
+                .expect("resolver calls lock")
+                .push((host.to_string(), port));
+            Ok(self.addrs.clone())
+        }
+    }
+
     fn https_request_json(method: &str, url: &str) -> String {
         json!({ "method": method, "url": url }).to_string()
     }
@@ -2122,6 +2216,61 @@ mod tests {
             );
         }
         assert_eq!(client.call_count(), 0);
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_targets_deny_before_network() {
+        let record = record_with_https_grant();
+        let client = MockHttpsClient::default();
+        for url in [
+            "https://[::ffff:127.0.0.1]/v1/data",
+            "https://[::ffff:10.0.0.1]/v1/data",
+            "https://[::ffff:169.254.169.254]/v1/data",
+            "https://[::10.0.0.1]/v1/data",
+        ] {
+            let error = execute_plugin_https_request(
+                &record,
+                &client,
+                https_request_json("GET", url).as_bytes(),
+            )
+            .expect_err("mapped address denied");
+            assert!(
+                error.0.contains("local/private"),
+                "{url} produced {:?}",
+                error.0
+            );
+        }
+        assert_eq!(client.call_count(), 0);
+    }
+
+    #[test]
+    fn dns_resolution_is_pinned_to_validated_public_socket_addresses() {
+        let url = reqwest::Url::parse("https://api.example.test:8443/v1/data").unwrap();
+        let resolver = FakeHttpsResolver::new(vec!["93.184.216.34:8443".parse().unwrap()]);
+        let pinned = resolve_https_target_for_client(&url, &resolver)
+            .expect("resolution")
+            .expect("hostname resolution is pinned");
+        assert_eq!(
+            resolver.calls(),
+            vec![("api.example.test".to_string(), 8443)]
+        );
+        assert_eq!(pinned.domains, vec!["api.example.test".to_string()]);
+        assert_eq!(pinned.addrs, vec!["93.184.216.34:8443".parse().unwrap()]);
+
+        let mut builder = reqwest::blocking::Client::builder().no_proxy();
+        for domain in &pinned.domains {
+            builder = builder.resolve_to_addrs(domain, &pinned.addrs);
+        }
+        builder.build().expect("client accepts pinned resolver");
+    }
+
+    #[test]
+    fn dns_resolution_rejects_private_addresses_before_client_build() {
+        let url = reqwest::Url::parse("https://api.example.test/v1/data").unwrap();
+        let resolver = FakeHttpsResolver::new(vec!["127.0.0.1:443".parse().unwrap()]);
+        let error =
+            resolve_https_target_for_client(&url, &resolver).expect_err("private DNS answer");
+        assert!(error.0.contains("local/private"));
     }
 
     #[test]
