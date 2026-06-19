@@ -283,3 +283,29 @@ Validation note:
 - cargo/nix validation は Orchestrator reported validation を確認した。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-19T11:08:37Z -->
+
+## Plan
+
+Review follow-up dispatch:
+
+Reviewer `yoi-reviewer-00001KVFD3YSV` は `request_changes` を返したため、Ticket review として記録し、既存 Coder Pod `yoi-coder-00001KVFD3YSV` に修正依頼を送った。
+
+Main blocker:
+- typed report / JSON / human output の status vocabulary が Ticket の binding acceptance criteria と一致していない。
+- Ticket は `active`, `disabled`, `missing`, `rejected`, `partial` を要求しているが、実装は `enabled`, `enabled-with-diagnostics`, `configured-blocked`, `configured-missing`, `discovered`, `diagnostic` を出している。
+- status は typed JSON/report surface の一部なので、human formatting だけの差分ではない。
+
+Required fixes sent to Coder:
+- status vocabulary を `active`, `disabled`, `missing`, `rejected`, `partial` に合わせる。
+- `partial` を、package usable だが一部 surface/tool が rejected/diagnostic である状態として表現する。
+- human `list` output に enabled surfaces を表示する。
+- requested vocabulary と JSON structure を tests で pin する。
+- JSON list/show、human active/disabled/rejected/missing、show active with grants、invalid manifest、digest mismatch、missing grant、ambiguous ref、no-execution の主要契約を追加/補強する。
+
+Next:
+- Coder の修正 commit / validation report を待つ。
+- 修正後、同じ CLI contract / read-only no-execution / bounded diagnostics focus で再レビューする。
+
+---
