@@ -373,6 +373,58 @@ fn panel_dashboard_content_ready_has_startup_budget() -> yoi_e2e::Result<()> {
 }
 
 #[test]
+fn panel_dashboard_content_ready_from_shell_enter_path() -> yoi_e2e::Result<()> {
+    let binary = yoi_binary()?;
+    let fixture = FixtureWorkspace::new(&binary)?;
+    assert_fixture_paths_are_isolated(&fixture);
+    let expected_content = fixture.expected_dashboard_content();
+
+    let (mut panel, started) = PanelHarness::spawn_via_shell_enter(fixture.panel_config(binary))?;
+    let first_visible_remaining = FIRST_VISIBLE_RENDER_BUDGET
+        .checked_sub(started.elapsed())
+        .unwrap_or_else(|| Duration::from_millis(0));
+    panel.wait_for_first_visible_frame(first_visible_remaining)?;
+    let first_visible_elapsed = started.elapsed();
+
+    let content_ready_remaining = DASHBOARD_CONTENT_READY_BUDGET
+        .checked_sub(started.elapsed())
+        .unwrap_or_else(|| Duration::from_millis(0));
+    let content_ready =
+        panel.wait_for_dashboard_content_ready(&expected_content, content_ready_remaining)?;
+    assert_eq!(
+        content_ready.snapshot_for_expected(&expected_content),
+        expected_content.snapshot(),
+        "shell-enter dashboard content ready must match expected Ticket/action/overlay/header snapshot; artifacts at {}",
+        panel.artifacts().dir.display()
+    );
+    let content_ready_elapsed = started.elapsed();
+    eprintln!(
+        "panel shell-enter dashboard content ready: {content_ready_elapsed:?} (budget {DASHBOARD_CONTENT_READY_BUDGET:?}; first frame {first_visible_elapsed:?}); artifacts at {}",
+        panel.artifacts().dir.display()
+    );
+    assert!(
+        content_ready_elapsed <= DASHBOARD_CONTENT_READY_BUDGET,
+        "shell-enter dashboard content ready took {content_ready_elapsed:?}, budget {DASHBOARD_CONTENT_READY_BUDGET:?}; artifacts at {}",
+        panel.artifacts().dir.display()
+    );
+
+    let source_breakdown = panel.expect_dashboard_source_breakdown()?;
+    assert!(
+        source_breakdown.has_source("workspace_panel.build.total"),
+        "shell-enter dashboard source breakdown should include total panel build source; got {:?}; artifacts at {}",
+        source_breakdown,
+        panel.artifacts().dir.display()
+    );
+
+    panel.press(KeyPress::CtrlC)?;
+    let status = panel.expect_exit_within(PanelHarness::default_exit_wait())?;
+    assert!(status.success(), "panel should exit cleanly with Ctrl+C");
+    drop(panel);
+    assert_fixture_cleanup(fixture.cleanup()?);
+    Ok(())
+}
+
+#[test]
 fn panel_mouse_click_selects_row_without_dispatching_action() -> yoi_e2e::Result<()> {
     let binary = yoi_binary()?;
     let fixture = FixtureWorkspace::new(&binary)?;

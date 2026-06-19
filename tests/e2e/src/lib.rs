@@ -606,6 +606,7 @@ impl PanelHarness {
                 "xdg_config_home": config.xdg_config_home,
                 "xdg_runtime_dir": config.xdg_runtime_dir,
                 "fixture_root": config.fixture_root,
+                "launch_mode": "direct_exec",
                 "runtime_policy": {
                     "host_runtime_inherited": false,
                     "host_xdg_runtime_dir_present": std::env::var_os("XDG_RUNTIME_DIR").is_some(),
@@ -684,6 +685,122 @@ impl PanelHarness {
             last_event_offset: 0,
             artifacts,
         })
+    }
+
+    pub fn spawn_via_shell_enter(config: PanelHarnessConfig) -> Result<(Self, Instant)> {
+        if !config.binary.exists() {
+            return Err(HarnessError::MissingBinary(config.binary));
+        }
+        fs::create_dir_all(&config.artifacts_dir)?;
+        let artifacts = PanelArtifacts {
+            dir: config.artifacts_dir.clone(),
+            events_jsonl: config.artifacts_dir.join("events.jsonl"),
+            input_log: config.artifacts_dir.join("input.log"),
+            output_log: config.artifacts_dir.join("pty-output.log"),
+            run_json: config.artifacts_dir.join("run.json"),
+        };
+        fs::write(&artifacts.events_jsonl, "")?;
+        fs::write(&artifacts.input_log, "")?;
+        fs::write(&artifacts.output_log, "")?;
+        let env_policy =
+            tui_env_policy(config.hold_background_task.is_some(), config.rewind_fixture);
+        fs::write(
+            &artifacts.run_json,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "binary": config.binary,
+                "args": &config.command_args,
+                "workspace": config.workspace,
+                "home": config.home,
+                "xdg_data_home": config.xdg_data_home,
+                "xdg_state_home": config.xdg_state_home,
+                "xdg_config_home": config.xdg_config_home,
+                "xdg_runtime_dir": config.xdg_runtime_dir,
+                "fixture_root": config.fixture_root,
+                "launch_mode": "shell_enter_exec",
+                "runtime_policy": {
+                    "host_runtime_inherited": false,
+                    "host_xdg_runtime_dir_present": std::env::var_os("XDG_RUNTIME_DIR").is_some(),
+                    "tested_yoi_runtime_source": "fixture XDG_RUNTIME_DIR"
+                },
+                "terminal_size": {
+                    "columns": config.terminal_size.0,
+                    "rows": config.terminal_size.1,
+                },
+                "hold_background_task": config.hold_background_task,
+                "rewind_fixture": config.rewind_fixture,
+                "tested_yoi_env_policy": &env_policy,
+            }))?,
+        )?;
+
+        let (master, slave) = open_pty(config.terminal_size)?;
+        let slave_for_stdin = slave.try_clone()?;
+        let slave_for_stdout = slave.try_clone()?;
+        let mut command = Command::new("/bin/sh");
+        command
+            .current_dir(&config.workspace)
+            .env_clear()
+            .env("YOI_TUI_TEST_EVENTS", &artifacts.events_jsonl)
+            .env("YOI_POD_RUNTIME_COMMAND", &config.binary)
+            .env("HOME", &config.home)
+            .env("XDG_DATA_HOME", &config.xdg_data_home)
+            .env("XDG_STATE_HOME", &config.xdg_state_home)
+            .env("XDG_CONFIG_HOME", &config.xdg_config_home)
+            .env("XDG_RUNTIME_DIR", &config.xdg_runtime_dir)
+            .env("TERM", "xterm-256color")
+            .stdin(Stdio::from(slave_for_stdin))
+            .stdout(Stdio::from(slave_for_stdout))
+            .stderr(Stdio::from(slave));
+        if let Some(task) = &config.hold_background_task {
+            command.env("YOI_TUI_TEST_HOLD_BACKGROUND_TASK", task);
+        }
+        if config.rewind_fixture {
+            command.env("YOI_TUI_TEST_REWIND_FIXTURE", "1");
+        }
+        let child = command.spawn()?;
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let output_for_thread = Arc::clone(&output);
+        let mut reader_file = master.try_clone()?;
+        let output_log = artifacts.output_log.clone();
+        let reader = thread::spawn(move || {
+            let mut sink = OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(output_log)
+                .ok();
+            let mut buf = [0_u8; 4096];
+            loop {
+                match reader_file.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Some(sink) = sink.as_mut() {
+                            let _ = sink.write_all(&buf[..n]);
+                        }
+                        if let Ok(mut output) = output_for_thread.lock() {
+                            output.extend_from_slice(&buf[..n]);
+                        }
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut harness = Self {
+            child,
+            master,
+            reader: Some(reader),
+            output,
+            last_event_offset: 0,
+            artifacts,
+        };
+        let command_line = shell_exec_command(&config.binary, &config.command_args);
+        let started = Instant::now();
+        harness.write_input(
+            "shell Enter yoi panel",
+            format!("{command_line}\n").as_bytes(),
+        )?;
+        Ok((harness, started))
     }
 
     pub fn wait_for<F>(
@@ -1663,6 +1780,30 @@ fn command_display(program: &Path, args: &[String]) -> String {
         .chain(args.iter().cloned())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn shell_exec_command(program: &Path, args: &[String]) -> String {
+    std::iter::once("exec".to_string())
+        .chain(std::iter::once(shell_quote(&program.to_string_lossy())))
+        .chain(args.iter().map(|arg| shell_quote(arg)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    let mut quoted = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 fn open_pty(size: (u16, u16)) -> Result<(File, File)> {
