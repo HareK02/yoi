@@ -409,3 +409,132 @@ Next action:
 - previous `request_changes` blockers が解消されたか、read-only Reviewer Pod で再レビューする。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-19T15:23:58Z -->
+
+## Plan
+
+Review re-dispatch:
+
+Reviewer Pod `yoi-reviewer-00001KVFDX9AF-r2` を read-only scope で起動した。
+
+Review target:
+- worktree: `/home/hare/Projects/yoi/.worktree/00001KVFDX9AF-plugin-https-host-api`
+- branch: `impl/00001KVFDX9AF-plugin-https-host-api`
+- commits:
+  - `7377527f` — initial HTTPS host API implementation
+  - `85683f17` — target validation hardening fix
+
+Reviewer focus:
+- previous IPv4-mapped/compatible IPv6 private/local bypass blocker が解消されているか。
+- DNS validation が validated address pinning により actual reqwest connection path に bind され、unvalidated resolution path が残っていないか。
+- mapped IPv6 / DNS pinning / private DNS answer rejection tests が deterministic で意味を持つか。
+- prior positives: grant-before-network、WASM import grant validation、HTTPS-only、embedded credentials rejection、method allowlist、bounds、timeout、no redirects、`no_proxy()`、ordinary Tool result path、manifest/CLI schema compatibility が維持されているか。
+- `resolve_to_addrs` usage や host canonicalization に新しい security regression がないか。
+
+Next:
+- Reviewer output を確認し、approve なら Orchestrator worktree への merge/validation/cleanup/close-ready 処理へ進む。request_changes なら blocker を記録して Coder に戻す。
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KVFDX9AF-r2 at: 2026-06-19T15:29:22Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+対象:
+- Ticket: `00001KVFDX9AF`
+- branch: `impl/00001KVFDX9AF-plugin-https-host-api`
+- commits:
+  - `7377527f` — `plugin: implement https host api`
+  - `85683f17` — `plugin: harden https target validation`
+
+No remaining blockers found.
+
+Evidence reviewed:
+- IPv4-mapped / compatible IPv6 bypass is closed.
+  - Host canonicalization strips IPv6 brackets before IP parsing via `normalize_host_literal` / `canonical_host`.
+  - `validate_static_https_target` parses canonical hosts as `IpAddr` and applies `validate_public_ip`.
+  - `is_forbidden_ipv6` delegates mapped/compatible embedded IPv4 addresses through `ipv6_embedded_ipv4`, then applies existing IPv4 private/loopback/link-local/broadcast/special checks.
+  - `ipv4_mapped_ipv6_targets_deny_before_network` covers `::ffff:127.0.0.1`, `::ffff:10.0.0.1`, `::ffff:169.254.169.254`, and compatible `::10.0.0.1`, with mock network call count asserted as zero.
+- DNS validation is bound to the reqwest connection path.
+  - `ReqwestPluginHttpsClient::execute` calls `resolve_https_target_for_client` before building the client.
+  - Hostname URLs resolve to `SocketAddr`s, reject empty/private/local answers, and return those exact validated addresses.
+  - reqwest builder pins each validated domain using `resolve_to_addrs(domain, &pinned_resolution.addrs)`, with no remaining separate unvalidated DNS lookup path visible in this implementation.
+  - IP-literal URLs skip DNS pinning only after static IP validation.
+- DNS tests are deterministic and meaningful at the unit boundary.
+  - `FakeHttpsResolver` avoids live DNS/network.
+  - `dns_resolution_is_pinned_to_validated_public_socket_addresses` verifies resolver input, returned pinned domains/addrs, and reqwest builder acceptance of `resolve_to_addrs`.
+  - `dns_resolution_rejects_private_addresses_before_client_build` verifies private DNS answers fail before client build/network dispatch.
+- Prior positives remain preserved.
+  - Grant checks happen before request validation/client dispatch in `execute_plugin_https_request`.
+  - WASM import validation checks `yoi:https` authorization before allowing the import.
+  - HTTPS-only, embedded-credential rejection, host/method/path allowlist, request/header/body bounds, response truncation, timeout, no redirects, `no_proxy()`, sensitive-header rejection/redaction, and ordinary Tool result flow remain present.
+  - Existing tests cover missing grant before network, disallowed host/method/scheme/private targets before network, timeout/redaction, response truncation, no network without HTTPS import, and ordinary Tool result path.
+
+Reviewer validation:
+- Static diff/code review and worktree status inspection.
+- Orchestrator-reported successful runs were reviewed:
+  - `cargo fmt --check`
+  - `cargo check -p pod -p manifest -p yoi`
+  - focused pod/manifest/yoi plugin tests
+  - `git diff --check`
+  - `nix build .#yoi --no-link`
+
+Conclusion:
+- Previous request_changes blockers are resolved.
+- Implementation satisfies the recorded Ticket acceptance criteria and is ready for merge/validation in the Orchestrator worktree.
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KVFDX9AF-r2 at: 2026-06-19T15:29:45Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+対象:
+- Ticket: `00001KVFDX9AF`
+- branch: `impl/00001KVFDX9AF-plugin-https-host-api`
+- commits:
+  - `7377527f` — `plugin: implement https host api`
+  - `85683f17` — `plugin: harden https target validation`
+
+No remaining blockers found.
+
+Evidence reviewed:
+- IPv4-mapped / compatible IPv6 bypass is closed.
+  - Host canonicalization strips IPv6 brackets before IP parsing via `normalize_host_literal` / `canonical_host`.
+  - `validate_static_https_target` parses canonical hosts as `IpAddr` and applies `validate_public_ip`.
+  - `is_forbidden_ipv6` delegates mapped/compatible embedded IPv4 addresses through `ipv6_embedded_ipv4`, then applies existing IPv4 private/loopback/link-local/broadcast/special checks.
+  - `ipv4_mapped_ipv6_targets_deny_before_network` covers `::ffff:127.0.0.1`, `::ffff:10.0.0.1`, `::ffff:169.254.169.254`, and compatible `::10.0.0.1`, with mock network call count asserted as zero.
+- DNS validation is bound to the reqwest connection path.
+  - `ReqwestPluginHttpsClient::execute` calls `resolve_https_target_for_client` before building the client.
+  - Hostname URLs resolve to `SocketAddr`s, reject empty/private/local answers, and return those exact validated addresses.
+  - reqwest builder pins each validated domain using `resolve_to_addrs(domain, &pinned_resolution.addrs)`, with no remaining separate unvalidated DNS lookup path visible in this implementation.
+  - IP-literal URLs skip DNS pinning only after static IP validation.
+- DNS tests are deterministic and meaningful at the unit boundary.
+  - `FakeHttpsResolver` avoids live DNS/network.
+  - `dns_resolution_is_pinned_to_validated_public_socket_addresses` verifies resolver input, returned pinned domains/addrs, and reqwest builder acceptance of `resolve_to_addrs`.
+  - `dns_resolution_rejects_private_addresses_before_client_build` verifies private DNS answers fail before client build/network dispatch.
+- Prior positives remain preserved.
+  - Grant checks happen before request validation/client dispatch in `execute_plugin_https_request`.
+  - WASM import validation checks `yoi:https` authorization before allowing the import.
+  - HTTPS-only, embedded-credential rejection, host/method/path allowlist, request/header/body bounds, response truncation, timeout, no redirects, `no_proxy()`, sensitive-header rejection/redaction, and ordinary Tool result flow remain present.
+  - Existing tests cover missing grant before network, disallowed host/method/scheme/private targets before network, timeout/redaction, response truncation, no network without HTTPS import, and ordinary Tool result path.
+
+Reviewer validation:
+- Static diff/code review and worktree status inspection.
+- Orchestrator-reported successful runs were reviewed:
+  - `cargo fmt --check`
+  - `cargo check -p pod -p manifest -p yoi`
+  - focused pod/manifest/yoi plugin tests
+  - `git diff --check`
+  - `nix build .#yoi --no-link`
+
+Conclusion:
+- Previous request_changes blockers are resolved.
+- Implementation satisfies the recorded Ticket acceptance criteria and is ready for merge/validation in the Orchestrator worktree.
+
+---
