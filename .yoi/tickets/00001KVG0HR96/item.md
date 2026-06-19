@@ -2,7 +2,7 @@
 title: 'Plugin: migrate WASM Tool runtime to WebAssembly Component Model'
 state: 'inprogress'
 created_at: '2026-06-19T13:18:58Z'
-updated_at: '2026-06-19T16:21:50Z'
+updated_at: '2026-06-19T16:25:23Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['plugin', 'wasm', 'component-model', 'wit', 'runtime-backend', 'sandbox', 'packaging', 'sdk']
