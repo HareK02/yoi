@@ -317,6 +317,7 @@ fn snapshot_from_resolution(
             .entry(key.clone())
             .or_insert_with(|| ItemBuilder::new(key));
         builder.discovered = true;
+        builder.package_present = true;
         builder.source = Some(package.identity.source.to_string());
         builder.package = Some(package.package_label.clone());
         builder.package_path = Some(package.package_path.clone());
@@ -382,11 +383,18 @@ fn snapshot_from_resolution(
     {
         let rendered = DiagnosticSummary::from(diagnostic);
         if let Some(reference) = diagnostic_reference(diagnostic) {
-            builders
+            let builder = builders
                 .entry(reference.clone())
-                .or_insert_with(|| ItemBuilder::new(reference))
-                .diagnostics
-                .push(rendered);
+                .or_insert_with(|| ItemBuilder::new(reference));
+            if let (Some(source), Some(package)) = (diagnostic.source, diagnostic.package.as_ref())
+            {
+                builder.package_present = true;
+                builder.package.get_or_insert_with(|| package.clone());
+                builder
+                    .package_path
+                    .get_or_insert_with(|| package_path_for_source(&workspace, source, package));
+            }
+            builder.diagnostics.push(rendered);
         } else if let (Some(source), Some(package)) =
             (diagnostic.source, diagnostic.package.as_ref())
         {
@@ -396,6 +404,7 @@ fn snapshot_from_resolution(
                 .entry(key.clone())
                 .or_insert_with(|| ItemBuilder::new(key));
             builder.source.get_or_insert_with(|| source.to_string());
+            builder.package_present = true;
             builder.package.get_or_insert_with(|| package.clone());
             builder
                 .package_path
@@ -423,6 +432,7 @@ fn snapshot_from_resolution(
 fn fill_resolved(builder: &mut ItemBuilder, resolved: &ResolvedPlugin) {
     builder.configured = true;
     builder.discovered = true;
+    builder.package_present = true;
     builder.resolved = true;
     builder.source = Some(resolved.identity.source.to_string());
     builder.package = Some(resolved.package_label.clone());
@@ -653,6 +663,7 @@ struct ItemBuilder {
     reference: String,
     configured: bool,
     discovered: bool,
+    package_present: bool,
     resolved: bool,
     source: Option<String>,
     package: Option<String>,
@@ -677,6 +688,7 @@ impl ItemBuilder {
             reference,
             configured: false,
             discovered: false,
+            package_present: false,
             resolved: false,
             source: None,
             package: None,
@@ -731,7 +743,7 @@ impl ItemBuilder {
         } else if self.discovered && !self.configured {
             "disabled"
         } else if self.configured && !self.discovered {
-            if has_non_missing_diagnostic {
+            if self.package_present || has_non_missing_diagnostic {
                 "rejected"
             } else {
                 "missing"
@@ -1072,6 +1084,77 @@ mod tests {
     }
 
     #[test]
+    fn configured_present_package_with_missing_manifest_entries_is_rejected_not_missing() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        fs::create_dir_all(workspace.join(".yoi/plugins")).unwrap();
+        write_stored_zip(
+            &workspace.join(".yoi/plugins/no_manifest.yoi-plugin"),
+            &[("plugin.wasm", b"not wasm")],
+        );
+        let missing_runtime_manifest = plugin_manifest_missing_runtime_entry("missing_runtime");
+        write_stored_zip(
+            &workspace.join(".yoi/plugins/missing_runtime.yoi-plugin"),
+            &[("plugin.toml", missing_runtime_manifest.as_bytes())],
+        );
+        let mut config = PluginConfig::default();
+        config.enabled.push(enablement_without_digest(
+            "project:no_manifest",
+            "0.1.0",
+            &["Echo"],
+        ));
+        config.enabled.push(enablement_without_digest(
+            "project:missing_runtime",
+            "0.1.0",
+            &["Echo"],
+        ));
+
+        let snapshot = inspect_snapshot(workspace, &config);
+        let no_manifest = select_item(&snapshot, "project:no_manifest").unwrap();
+        let missing_runtime = select_item(&snapshot, "project:missing_runtime").unwrap();
+
+        assert_eq!(no_manifest.status, "rejected");
+        assert_eq!(missing_runtime.status, "rejected");
+        assert!(no_manifest.configured);
+        assert!(!no_manifest.discovered);
+        assert!(missing_runtime.configured);
+        assert!(!missing_runtime.discovered);
+        assert!(
+            no_manifest
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "missing"
+                    && diagnostic.message.contains("plugin.toml"))
+        );
+        assert!(
+            missing_runtime
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == "missing"
+                    && diagnostic.message.contains("path not present"))
+        );
+
+        let list_json = serde_json::to_value(&snapshot).unwrap();
+        assert!(list_json["items"].as_array().unwrap().iter().any(|item| {
+            item["reference"] == "project:no_manifest"
+                && item["status"] == "rejected"
+                && item["diagnostics"][0]["kind"] == "missing"
+        }));
+        let show_json = serde_json::to_value(missing_runtime).unwrap();
+        assert_eq!(show_json["status"], "rejected");
+        assert_eq!(show_json["diagnostics"][0]["kind"], "missing");
+
+        let list_output = render_list_snapshot_human(&snapshot).unwrap();
+        assert!(list_output.contains("project:no_manifest [rejected]"));
+        assert!(list_output.contains("project:missing_runtime [rejected]"));
+        assert!(!list_output.contains("project:no_manifest [missing]"));
+        assert!(!list_output.contains("project:missing_runtime [missing]"));
+        let show_output = render_item_human(no_manifest).unwrap();
+        assert!(show_output.contains("status: rejected"));
+        assert!(show_output.contains("plugin.toml"));
+    }
+
+    #[test]
     fn invalid_tool_schema_and_name_are_rejected_in_json_and_human_output() {
         let dir = tempdir().unwrap();
         let workspace = dir.path();
@@ -1246,6 +1329,29 @@ mod tests {
 
     fn plugin_manifest_with_schema(id: &str, tool_name: &str, schema_version: u32) -> String {
         plugin_manifest_with_schema_and_tool(id, tool_name, "object", &[tool_name], schema_version)
+    }
+
+    fn plugin_manifest_missing_runtime_entry(id: &str) -> String {
+        format!(
+            r#"
+schema_version = 1
+id = "{id}"
+name = "{id}"
+version = "0.1.0"
+surfaces = ["tool"]
+permissions = [{{ kind = "surface", surface = "tool" }}, {{ kind = "tool", name = "Echo" }}]
+
+[runtime]
+kind = "wasm"
+entry = "missing.wasm"
+abi = "yoi-plugin-wasm-1"
+
+[[tools]]
+name = "Echo"
+description = "Test tool"
+input_schema = {{ type = "object" }}
+"#
+        )
     }
 
     fn plugin_manifest_with_schema_and_tool(
