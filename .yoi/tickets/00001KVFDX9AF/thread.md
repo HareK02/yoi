@@ -589,3 +589,95 @@ Conclusion:
 - Implementation satisfies the recorded Ticket acceptance criteria and is ready for merge/validation in the Orchestrator worktree.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-19T15:32:56Z -->
+
+## Implementation report
+
+Merge / validation report:
+
+Implementation branch `impl/00001KVFDX9AF-plugin-https-host-api` は Orchestrator worktree の `orchestration` branch に merge 済み。
+
+Merge:
+- merge commit: `6beb8625` — `merge: plugin https host api`
+- implementation commits:
+  - `7377527f` — `plugin: implement https host api`
+  - `85683f17` — `plugin: harden https target validation`
+- changed files:
+  - `Cargo.lock`
+  - `crates/manifest/src/plugin.rs`
+  - `crates/pod/Cargo.toml`
+  - `crates/pod/src/feature/plugin.rs`
+  - `crates/yoi/src/plugin_cli.rs`
+  - `package.nix`
+
+Validation in Orchestrator worktree after merge:
+- `cargo fmt --check` — passed
+- `cargo check -p pod -p manifest -p yoi` — passed
+- `cargo test -p pod feature::plugin::tests -- --nocapture` — passed; 39 passed, 0 failed
+- `cargo test -p manifest plugin -- --nocapture` — passed; 17 passed, 0 failed
+- `cargo test -p yoi plugin_cli -- --nocapture` — passed; 10 passed, 0 failed
+- `git diff --check` — passed
+- `nix build .#yoi --no-link` — passed
+
+Review:
+- First review requested changes for IPv4-mapped IPv6 private/local bypass and DNS validation TOCTOU.
+- Coder fixed target validation by applying IPv4 checks to mapped/compatible IPv6 forms and binding DNS validation to reqwest via validated address pinning.
+- Re-review `yoi-reviewer-00001KVFDX9AF-r2` returned `approve` with no remaining blockers.
+
+Outcome:
+- Granted HTTPS host API is implemented for WASM Plugin Tools.
+- Missing grant denies before network access.
+- Host/method/path allowlist and HTTPS-only/private-local target restrictions are represented and tested.
+- DNS validation is pinned to the actual reqwest connection path.
+- Request/response bounds, timeout, no redirects, `no_proxy()`, secret redaction, ordinary Tool result path, and CLI inspection compatibility are present.
+- `fs` host API and Component Model migration remain non-goals for this Ticket.
+- Root/original workspace was not read/written/merged/validated for this Ticket, per Panel Queue instruction.
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-19T15:33:57Z -->
+
+## Implementation report
+
+Merge / validation report:
+
+Implementation branch `impl/00001KVFDX9AF-plugin-https-host-api` は Orchestrator worktree の `orchestration` branch に merge 済み。
+
+Merge:
+- merge commit: `6beb8625` — `merge: plugin https host api`
+- implementation commits:
+  - `7377527f` — `plugin: implement https host api`
+  - `85683f17` — `plugin: harden https target validation`
+- changed files:
+  - `Cargo.lock`
+  - `crates/manifest/src/plugin.rs`
+  - `crates/pod/Cargo.toml`
+  - `crates/pod/src/feature/plugin.rs`
+  - `crates/yoi/src/plugin_cli.rs`
+  - `package.nix`
+
+Validation in Orchestrator worktree after merge:
+- `cargo fmt --check` — passed
+- `cargo check -p pod -p manifest -p yoi` — passed
+- `cargo test -p pod feature::plugin::tests -- --nocapture` — passed; 39 passed, 0 failed
+- `cargo test -p manifest plugin -- --nocapture` — passed; 17 passed, 0 failed
+- `cargo test -p yoi plugin_cli -- --nocapture` — passed; 10 passed, 0 failed
+- `git diff --check` — passed
+- `nix build .#yoi --no-link` — passed
+
+Review:
+- First review requested changes for IPv4-mapped IPv6 private/local bypass and DNS validation TOCTOU.
+- Coder fixed target validation by applying IPv4 checks to mapped/compatible IPv6 forms and binding DNS validation to reqwest via validated address pinning.
+- Re-review `yoi-reviewer-00001KVFDX9AF-r2` returned `approve` with no remaining blockers.
+
+Outcome:
+- Granted HTTPS host API is implemented for WASM Plugin Tools.
+- Missing grant denies before network access.
+- Host/method/path allowlist and HTTPS-only/private-local target restrictions are represented and tested.
+- DNS validation is pinned to the actual reqwest connection path.
+- Request/response bounds, timeout, no redirects, `no_proxy()`, secret redaction, ordinary Tool result path, and CLI inspection compatibility are present.
+- `fs` host API and Component Model migration remain non-goals for this Ticket.
+- Root/original workspace was not read/written/merged/validated for this Ticket, per Panel Queue instruction.
+
+---
