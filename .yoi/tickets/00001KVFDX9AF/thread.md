@@ -351,3 +351,61 @@ Next:
 - 修正後、network-safety edge cases と grant-before-network invariants を中心に再レビューする。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-19T15:22:56Z -->
+
+## Implementation report
+
+Coder review-fix implementation report received / Orchestrator validation:
+
+Incremental fix commit:
+- `85683f17` — `plugin: harden https target validation`
+
+Summary:
+- Hardened IPv6 target validation:
+  - IPv4-mapped IPv6 addresses now apply existing IPv4 private/local/link-local checks.
+  - IPv4-compatible embedded forms are also checked through IPv4 rules.
+  - Host canonicalization strips IPv6 brackets before IP parsing.
+- Removed DNS validation TOCTOU gap:
+  - DNS resolution now produces validated public `SocketAddr`s.
+  - Those exact validated addresses are pinned into the `reqwest` client via `resolve_to_addrs`, so `reqwest` does not perform a separate unvalidated DNS lookup for hostname requests.
+  - Private DNS answers are rejected before client build / network dispatch.
+- Added deterministic tests for:
+  - IPv4-mapped loopback/private/link-local rejection;
+  - IPv4-compatible private rejection;
+  - DNS resolution pinning to validated public socket addresses;
+  - private DNS answer rejection before client build.
+
+Files changed in incremental fix:
+- `crates/pod/src/feature/plugin.rs`
+
+Coder reported validation:
+- `cargo test -p pod feature::plugin::tests` — passed; 39 tests
+- `cargo test -p manifest plugin` — passed; 17 tests
+- `cargo test -p yoi plugin_cli` — passed; 10 tests
+- `cargo check -p pod -p manifest -p yoi` — passed
+- `cargo fmt --check` — passed
+- `git diff --check` — passed
+- `nix build .#yoi --no-link` — passed
+
+Orchestrator evidence checked:
+- Pod output を確認。
+- implementation worktree は clean。
+- branch `impl/00001KVFDX9AF-plugin-https-host-api` HEAD は `85683f17`。
+- incremental diff stat from previous review target `7377527f..85683f17`: 1 file changed, 170 insertions, 21 deletions。
+
+Validation re-run by Orchestrator in implementation worktree:
+- `cargo fmt --check` — passed
+- `cargo check -p pod -p manifest -p yoi` — passed
+- `cargo test -p pod feature::plugin::tests -- --nocapture` — passed; 39 passed, 0 failed
+- `cargo test -p manifest plugin -- --nocapture` — passed; 17 passed, 0 failed
+- `cargo test -p yoi plugin_cli -- --nocapture` — passed; 10 passed, 0 failed
+- `git diff --check` — passed
+- `nix build .#yoi --no-link` — passed
+
+Routing classification: review_needed
+
+Next action:
+- previous `request_changes` blockers が解消されたか、read-only Reviewer Pod で再レビューする。
+
+---
