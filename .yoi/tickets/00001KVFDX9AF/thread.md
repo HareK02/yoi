@@ -176,3 +176,75 @@ Next:
 - Coder は granted HTTPS host API implementation、focused tests、validation、implementation commit を行い、実装報告を返す予定。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-19T15:04:07Z -->
+
+## Implementation report
+
+Coder implementation report received / Orchestrator validation:
+
+Implementation commit:
+- `73775275` — `plugin: implement https host api`
+
+Summary:
+- Added typed HTTPS host API grant scope to Plugin permission model:
+  - hosts
+  - methods
+  - optional path prefixes
+  - bounded request/response options
+- Implemented `yoi:https` WASM host import handling in the Plugin Tool runtime。
+- Added deterministic local TLS / HTTPS test harness for runtime tests。
+- Added URL validation / network safety checks:
+  - HTTPS-only;
+  - reject `http://`;
+  - reject localhost/private/link-local/local targets;
+  - reject disallowed hosts/methods/schemes before network access。
+- Added request/response bounds and diagnostics:
+  - body/header limits;
+  - response truncation;
+  - timeout;
+  - bounded/redacted error messages。
+- Preserved no ambient env credentials and ordinary Tool result/history path semantics。
+- Updated read-only Plugin CLI inspection so HTTPS host API grant details / diagnostics remain inspectable。
+- Updated `package.nix` cargo hash for new dependency/build closure.
+
+Files changed:
+- `Cargo.lock`
+- `crates/manifest/src/plugin.rs`
+- `crates/pod/Cargo.toml`
+- `crates/pod/src/feature/plugin.rs`
+- `crates/pod/src/pod.rs`
+- `crates/yoi/src/plugin_cli.rs`
+- `package.nix`
+
+Coder reported validation:
+- `cargo fmt --check` — passed
+- `cargo check -p pod -p manifest -p yoi` — passed
+- `cargo test -p pod feature::plugin::tests -- --nocapture` — passed; 36 passed
+- `cargo test -p manifest plugin -- --nocapture` — passed; 17 passed
+- `cargo test -p yoi plugin_cli -- --nocapture` — passed; 10 passed
+- `git diff --check` — passed
+- `nix build .#yoi --no-link` — passed
+
+Orchestrator evidence checked:
+- Pod output を確認。
+- implementation worktree は clean。
+- branch `impl/00001KVFDX9AF-plugin-https-host-api` HEAD は `73775275`。
+- diff stat from accepted base `1fdef32a..73775275`: 7 files changed, 1799 insertions, 97 deletions。
+
+Validation re-run by Orchestrator in implementation worktree:
+- `cargo fmt --check` — passed
+- `cargo check -p pod -p manifest -p yoi` — passed
+- `cargo test -p pod feature::plugin::tests -- --nocapture` — passed; 36 passed, 0 failed
+- `cargo test -p manifest plugin -- --nocapture` — passed; 17 passed, 0 failed
+- `cargo test -p yoi plugin_cli -- --nocapture` — passed; 10 passed, 0 failed
+- `git diff --check` — passed
+- `nix build .#yoi --no-link` — passed
+
+Routing classification: review_needed
+
+Next action:
+- recorded intent / invariants / acceptance criteria に照らして、read-only Reviewer Pod で外部レビューする。
+- 特に grant-before-network、private/local rejection、redirect/DNS bypass、bounds/timeouts、secret redaction、ordinary Tool result path、no ambient env credentials、CLI inspection compatibility、dependency/package.nix correctness を確認する。
+
+---

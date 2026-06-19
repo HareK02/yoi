@@ -2,7 +2,7 @@
 title: 'Plugin: implement https host API for Tool runtime'
 state: 'inprogress'
 created_at: '2026-06-19T07:53:13Z'
-updated_at: '2026-06-19T14:26:32Z'
+updated_at: '2026-06-19T15:04:07Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['plugin', 'https', 'host-api', 'network', 'sandbox', 'secrets', 'permission-grants']
