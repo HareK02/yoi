@@ -207,3 +207,48 @@ Reviewer validation:
 Worktree status at review end: clean。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T12:13:03Z -->
+
+## Implementation report
+
+Merge and final validation report:
+
+Merged implementation branch into Orchestrator branch:
+- Merge commit: `a1386881 merge: profile override scope`
+- Implementation commit included:
+  - `0717aae3 pod: preserve profile override scope`
+
+Reviewer outcome:
+- r1 approved with no blocking issues。
+- Reviewer confirmed explicit Profile/workspace override `scope.allow` preservation, no wholesale `manifest.scope` replacement, workspace root write / `.worktree` deny default preservation, Ticket role launch/delegation defaults, final snapshot/tool-visible scope consistency, and restore non-goal preservation。
+
+Orchestrator validation after merge passed:
+- `cargo fmt --all --check`
+- `git diff --check HEAD^1..HEAD`
+- `cargo test -p pod entrypoint::tests::`
+- `cargo check -p pod`
+
+Validation log:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/bash-WNUQvw.log`
+
+Known unrelated validation note:
+- Full `cargo test -p pod` was not used as a final gate because Reviewer confirmed unrelated/pre-existing prompt-guidance assertion failures outside this branch's diff。
+
+Nix validation:
+- Not run because this Ticket changed only Rust source in `crates/pod/src/entrypoint.rs` and no dependency/package/source-filter files changed。
+
+Final state:
+- Orchestrator worktree clean at `a1386881` after validation。
+- Implementation worktree remains available for cleanup after Ticket completion records are committed。
+- WebFetch PDF and Intake investigation gate Coder Pods continue in parallel。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-20T12:13:11Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Implementation was merged into Orchestrator branch at `a1386881`, review approved, and final Orchestrator validation passed: `cargo fmt --all --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p pod entrypoint::tests::`, and `cargo check -p pod`.
+
+---
