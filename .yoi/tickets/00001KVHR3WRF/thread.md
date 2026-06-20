@@ -171,3 +171,41 @@ Review dispatch:
 - Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVHR3WRF-r1 at: 2026-06-20T07:27:01Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket contract / Orchestrator IntentPacket。
+- Diff: `b0225e48..e0680cce`。
+- 主な対象: `crates/manifest/src/lib.rs`, `crates/manifest/src/config.rs`, `crates/manifest/src/profile.rs`, `crates/manifest/Cargo.toml`, `crates/pod/src/spawn/tool.rs`, `docs/design/profiles-manifests-prompts.md`, `Cargo.lock`, `package.nix`。
+- Diff 内で `Command::new`, `tokio::process`, `std::process`, spawn, initialize/capability negotiation, JSON-RPC/tool registration などの process/lifecycle implementation 追加を確認。
+
+Blocking issues: none。
+
+Critical risk checks:
+- Config-only boundary は維持されている。MCP subprocess spawning、MCP initialize/capability negotiation、JSON-RPC lifecycle、tool/resource/prompt registration は追加されていない。
+- `crates/manifest/src/lib.rs` は typed `McpConfig`、named `stdio_server` entries、`command` / `args` / `cwd` / explicit `env.inherit` / `env.set`、`literal` / `secret_ref` / `env_ref` を追加している。
+- `McpEnvValue::Debug` は literal env values を redact する。validation errors は literal/env/secret values を echo しない。
+- `crates/manifest/src/config.rs` は duplicate server names、empty/NUL names/commands/args、cwd absolute-after-resolution policy、env var names、secret ref IDs、NUL literal env values を bounded diagnostics で検証している。
+- Profile integration は通常の Profile resolution / path-resolution flow 経由。Reusable Profiles は absolute MCP cwd paths を拒否する。
+- `crates/pod/src/spawn/tool.rs` は `manifest.mcp.clone()` を inherited child manifest config に載せるだけで、child/grandchild MCP execution は追加しない。
+- Docs は stdio config 宣言だけでは subprocess / tool/resource/prompt registration が起きないこと、local stdio MCP server は user OS permissions の通常 executable として動くこと、Yoi feature flags / Plugin permissions / MCP config validation は OS sandbox ではないことを明記している。
+
+Non-blocking concerns / follow-ups:
+- `cargo test -p manifest --lib` は `plugin::tests::embedded_rust_component_tool_template_is_valid_package_shape` で失敗するが、この branch の diff は `crates/manifest/src/plugin.rs` や template files を変更していない。Reviewer は `b0225e48` 時点で既に同じ template resource/test mismatch があるため unrelated/pre-existing と判断した。
+
+Reviewer validation:
+- `cargo fmt --all --check`: passed。
+- `git diff --check b0225e48..HEAD`: passed。
+- `cargo test -p manifest mcp --lib`: 5 MCP-focused tests passed。
+- `cargo check`: passed。
+- `nix build .#yoi --no-link`: passed。
+- `cargo test -p manifest --lib`: unrelated pre-existing plugin template-shape failure only。
+
+Worktree status at review end: clean。
+
+---

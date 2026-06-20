@@ -2,7 +2,7 @@
 title: 'MCP: add local stdio server config and trust policy'
 state: 'inprogress'
 created_at: '2026-06-20T05:30:04Z'
-updated_at: '2026-06-20T07:19:20Z'
+updated_at: '2026-06-20T07:27:01Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['mcp', 'config', 'trust-boundary', 'secrets', 'process-exec']
