@@ -23,10 +23,14 @@ Ingress は外部から Yoi に入る event boundary として扱う。Discord m
 ## 設計方針
 
 - Service は Tool call の延長ではなく、host-managed lifecycle を持つ separate surface とする。
+- ただし stateful Plugin では、Service instance が Plugin の機能上の主 instance であり、同じ Plugin package が提供する Tool はその instance にアクセスできる必要がある。
+  - Minecraft Plugin 的に、Plugin instance とその state は Tool/Service/Ingress から不可分な場合がある。
+  - Tool は transient worker state ではなく、host が保持する Plugin/Service instance へ command/query として dispatch される。
+  - Tool schema/model-visible registration と Service lifecycle は別 surface だが、実行先 instance は同一であり得る。
 - Wasm component は Service interface の export を実装する。
-  - 例: `start(config)`, `handle_event(event)`, `status()`, `stop(reason)` 相当。
-  - exact schema / naming は実装時に詰めるが、Tool handler とは別の world/interface として扱う。
-- Yoi host は Service instance を保持し、lifecycle / restart / diagnostics / resource bounds を管理する。
+  - 例: `start(config)`, `handle_event(event)`, `handle_tool(tool, input)`, `status()`, `stop(reason)` 相当。
+  - exact schema / naming は実装時に詰めるが、Tool-only handler と stateful Service-backed Tool dispatch は区別する。
+- Yoi host は Plugin/Service instance を保持し、lifecycle / restart / diagnostics / resource bounds / call serialization を管理する。
 - 長寿命 network/socket/process ownership は原則 host 側に置く。
   - Wasm に raw ambient network/WASI socket を渡して unmanaged runtime loop を作らせない。
   - 必要な outbound/inbound は host API と grant で明示する。
@@ -46,9 +50,13 @@ Ingress は外部から Yoi に入る event boundary として扱う。Discord m
   - service id/version, ingress event kinds, required host APIs, side effects, secrets/network requirements を reviewable にする。
 - Component Service runtime が Tool runtime と分離される。
   - Tool schema/model-visible registration と Service lifecycle registration を混同しない。
+  - Tool-only Plugin は従来通り bounded Tool execution でよい。
+  - Service-backed Plugin では、Tool execution が host-managed Plugin/Service instance の command/query export へ dispatch できる。
   - Service component artifact / interface compatibility を static check できる。
 - Host-managed Service instance registry を追加する。
   - enabled Service を start/stop/status できる。
+  - 同一 Plugin package の Tool / Ingress / Service 呼び出しが同じ stateful instance を参照できる。
+  - instance への同時呼び出し、reentrancy、timeout、crash isolation の方針を定義する。
   - failure/restart/backoff/diagnostics を bounded に記録/表示できる。
   - Pod shutdown / restore / config change 時の lifecycle を明確化する。
 - Ingress event delivery path を追加する。
@@ -75,6 +83,7 @@ Ingress は外部から Yoi に入る event boundary として扱う。Discord m
 - Service/Ingress surface の design record または implementation design が repository 内に追加され、Tool surface との違い、host-managed instance lifecycle、Ingress event boundary、permission/grant model が明文化されている。
 - `plugin.toml` / package inspection / enablement model に Service/Ingress contribution をどう表現するかが決まっている。
 - Wasm 側が実装する Service interface と、host が保持・呼び出す lifecycle の責務境界が決まっている。
+- Service-backed Tool が同じ stateful Plugin/Service instance に command/query としてアクセスする方式が決まっている。
 - Ingress event がどの durable/visible Yoi path に変換され得るか、どの path が禁止かが決まっている。
 - 既存 Tool Plugin runtime/docs が「現時点では Tool surface」であることを誤解なく示す。
 - 実装を一度に詰め込まず、必要なら follow-up Ticket に分割できる状態になっている。
