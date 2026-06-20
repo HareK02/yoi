@@ -19,8 +19,9 @@ use crate::config::{
 use crate::model::{AuthRef, ModelManifest};
 use crate::plugin::PluginConfig;
 use crate::{
-    MemoryConfig, Permission, PodManifest, PodManifestConfig, PodMetaConfig, ResolveError,
-    ScopeConfig, ScopeRule, SkillsConfig, WebConfig, WorkerManifestConfig, paths,
+    McpConfig, McpStdioCwdPolicy, MemoryConfig, Permission, PodManifest, PodManifestConfig,
+    PodMetaConfig, ResolveError, ScopeConfig, ScopeRule, SkillsConfig, WebConfig,
+    WorkerManifestConfig, paths,
 };
 
 const PROFILE_FORMAT_V1: &str = "yoi.lua-profile.v1";
@@ -628,6 +629,7 @@ fn resolve_lua_profile_value(
         permissions: profile.permissions,
         feature: profile.feature,
         plugins: profile.plugins,
+        mcp: profile.mcp,
         compaction,
         web: profile.web,
         memory: profile.memory,
@@ -690,6 +692,8 @@ struct ProfileConfig {
     feature: FeatureConfigPartial,
     #[serde(default)]
     plugins: PluginConfig,
+    #[serde(default)]
+    mcp: McpConfig,
     #[serde(default)]
     compaction: Option<serde_json::Value>,
     #[serde(default)]
@@ -1247,6 +1251,16 @@ fn validate_profile_paths(profile: &ProfileConfig) -> Result<(), ProfileError> {
             }
         }
     }
+    for server in &profile.mcp.stdio_servers {
+        if let Some(McpStdioCwdPolicy::Path { path }) = &server.cwd
+            && path.is_absolute()
+        {
+            return Err(ProfileError::InvalidProfile(
+                "field `mcp.stdio_server.cwd.path` must be profile-relative in reusable Profiles"
+                    .into(),
+            ));
+        }
+    }
     Ok(())
 }
 fn reject_absolute_auth_file(
@@ -1692,6 +1706,66 @@ return profile {
             resolved.profile.as_ref().unwrap().name.as_deref(),
             Some("coder")
         );
+    }
+
+    #[test]
+    fn lua_profile_resolves_named_mcp_stdio_config_without_starting_command() {
+        let tmp = TempDir::new().unwrap();
+        let profile = write_profile(
+            tmp.path(),
+            "mcp.lua",
+            r#"
+local profile = require("yoi.profile")
+return profile {
+  slug = "mcp",
+  model = { scheme = "anthropic", model_id = "claude-sonnet-4-20250514" },
+  mcp = {
+    stdio_server = {
+      {
+        name = "filesystem",
+        command = "definitely-not-spawned-during-profile-resolution",
+        args = { "--root", "." },
+        cwd = { kind = "path", path = "servers" },
+        env = {
+          inherit = { "PATH" },
+          set = {
+            SAFE_MODE = { kind = "literal", value = "1" },
+            API_TOKEN = { kind = "secret_ref", ref = "providers/mcp-token" },
+            FROM_ENV = { kind = "env_ref", name = "MCP_TOKEN" },
+          },
+        },
+      },
+    },
+  },
+}
+"#,
+        );
+        std::fs::create_dir(tmp.path().join("servers")).unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+
+        let resolved = ProfileResolver::new()
+            .with_workspace_base(&workspace)
+            .resolve(
+                &ProfileSelector::path(&profile),
+                ProfileResolveOptions::with_pod_name("runtime-pod"),
+            )
+            .unwrap();
+
+        let server = &resolved.manifest.mcp.stdio_servers[0];
+        assert_eq!(server.name, "filesystem");
+        assert_eq!(
+            server.command,
+            "definitely-not-spawned-during-profile-resolution"
+        );
+        assert!(matches!(
+            server.cwd,
+            Some(McpStdioCwdPolicy::Path { ref path }) if path == &tmp.path().join("servers")
+        ));
+        assert!(matches!(
+            server.env.set["API_TOKEN"],
+            crate::McpEnvValue::SecretRef { .. }
+        ));
     }
     #[test]
     fn resolves_lua_profile_feature_flags_without_runtime_state() {
