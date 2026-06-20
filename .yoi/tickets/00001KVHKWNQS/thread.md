@@ -322,3 +322,49 @@ Reviewer validation:
 Worktree status at review end: source tree clean。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T06:54:35Z -->
+
+## Implementation report
+
+Merge and final validation report:
+
+Merged implementation branch into Orchestrator branch:
+- Merge commit: `87704ad4 merge: plugin authoring cli`
+- Implementation commits included:
+  - `945ecdf6 plugin: add authoring cli`
+  - `699db538 plugin: harden authoring checks`
+
+Reviewer outcome:
+- r1 requested changes for symlink destination write-through and placeholder component being reported as enablement-ready。
+- Coder added symlink destination refusal, placeholder detection, `partial` status / diagnostics, and tests。
+- r2 approved with no blocking issues。
+
+Orchestrator validation after merge:
+- Passed before Nix:
+  - `cargo fmt --check`
+  - `git diff --check HEAD^1..HEAD`
+  - `cargo check -p yoi`
+  - `cargo test -p yoi plugin_cli`
+  - `cargo test -p yoi-plugin-pdk template`
+- Initial `nix build .#yoi --no-link` failed with environment storage exhaustion while building `aws-lc-sys` (`No space left on device`), not a source/package diagnostic。
+- Orchestrator freed only Orchestrator-worktree Cargo build artifacts with `cargo clean` (`43.3GiB`) and reran:
+  - `nix build .#yoi --no-link`: passed。
+  - `nix path-info -S .#yoi`: `112260512`。
+
+Validation log for first grouped run:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/bash-Q0KE3A.log`
+
+Final state:
+- Orchestrator worktree clean at `87704ad4` after successful Nix validation。
+- Implementation worktree remains available for cleanup after Ticket completion records are committed。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-20T06:54:45Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Implementation was merged into Orchestrator branch at `87704ad4`, r2 review approved, and final Orchestrator validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, `cargo check -p yoi`, focused `yoi plugin_cli` / `yoi-plugin-pdk template` tests, and `nix build .#yoi --no-link` after freeing Orchestrator worktree build artifacts.
+
+---
