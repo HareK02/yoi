@@ -46,6 +46,12 @@ pub const RUST_COMPONENT_TOOL_TEMPLATE: &[PluginTemplateResource] = &[
         ),
     },
     PluginTemplateResource {
+        path: "plugin.component.wasm",
+        contents: include_str!(
+            "../../../resources/plugin/templates/rust-component-tool/plugin.component.wasm"
+        ),
+    },
+    PluginTemplateResource {
         path: "README.md",
         contents: include_str!("../../../resources/plugin/templates/rust-component-tool/README.md"),
     },
@@ -516,6 +522,23 @@ pub struct DiscoveredPluginPackage {
     pub digest: String,
     pub manifest: PluginPackageManifest,
     pub entries: BTreeSet<String>,
+}
+
+/// Fully materialized package content used by local authoring checks and pack.
+///
+/// This is data-only metadata and bytes. Constructing it parses manifests and
+/// validates package/archive shape, but it does not load, instantiate, or
+/// execute Plugin code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterializedPluginPackage {
+    pub package: DiscoveredPluginPackage,
+    pub files: BTreeMap<String, Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackedPluginPackage {
+    pub output_path: PathBuf,
+    pub package: DiscoveredPluginPackage,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1362,7 +1385,146 @@ fn read_package(
         .with_source(source)
         .with_package(label)
     })?;
-    let archive = parse_stored_zip(&bytes, label, source, limits)?;
+    materialize_archive(path, label, source, &bytes, limits)
+        .map(|materialized| materialized.package)
+}
+
+pub fn read_plugin_package_file(
+    path: &Path,
+    source: PluginSourceKind,
+    limits: &PluginDiscoveryLimits,
+) -> Result<MaterializedPluginPackage, PluginDiagnostic> {
+    let label = package_label(path);
+    let metadata = fs::metadata(path).map_err(|error| {
+        PluginDiagnostic::new(
+            PluginDiagnosticKind::Io,
+            PluginDiagnosticPhase::Discovery,
+            format!(
+                "plugin package metadata could not be read: {}",
+                safe_io_error(&error)
+            ),
+        )
+        .with_source(source)
+        .with_package(label.clone())
+    })?;
+    if !metadata.is_file() {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Malformed,
+            PluginDiagnosticPhase::Discovery,
+            "plugin package candidate is not a regular file",
+        )
+        .with_source(source)
+        .with_package(label));
+    }
+    if metadata.len() > limits.max_package_size_bytes {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Bounds,
+            PluginDiagnosticPhase::Discovery,
+            "plugin package exceeds the configured package size bound",
+        )
+        .with_source(source)
+        .with_package(label));
+    }
+    let bytes = fs::read(path).map_err(|error| {
+        PluginDiagnostic::new(
+            PluginDiagnosticKind::Io,
+            PluginDiagnosticPhase::Discovery,
+            format!(
+                "plugin package content could not be read: {}",
+                safe_io_error(&error)
+            ),
+        )
+        .with_source(source)
+        .with_package(label.clone())
+    })?;
+    materialize_archive(path, &label, source, &bytes, limits)
+}
+
+pub fn read_plugin_directory(
+    path: &Path,
+    source: PluginSourceKind,
+    limits: &PluginDiscoveryLimits,
+) -> Result<MaterializedPluginPackage, PluginDiagnostic> {
+    let label = package_label(path);
+    let root = fs::canonicalize(path).map_err(|error| {
+        PluginDiagnostic::new(
+            PluginDiagnosticKind::Io,
+            PluginDiagnosticPhase::Discovery,
+            format!(
+                "plugin directory could not be read: {}",
+                safe_io_error(&error)
+            ),
+        )
+        .with_source(source)
+        .with_package(label.clone())
+    })?;
+    let metadata = fs::metadata(&root).map_err(|error| {
+        PluginDiagnostic::new(
+            PluginDiagnosticKind::Io,
+            PluginDiagnosticPhase::Discovery,
+            format!(
+                "plugin directory metadata could not be read: {}",
+                safe_io_error(&error)
+            ),
+        )
+        .with_source(source)
+        .with_package(label.clone())
+    })?;
+    if !metadata.is_dir() {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Malformed,
+            PluginDiagnosticPhase::Discovery,
+            "plugin directory input is not a directory",
+        )
+        .with_source(source)
+        .with_package(label));
+    }
+
+    let mut files = BTreeMap::new();
+    collect_directory_files(&root, &root, &label, source, limits, &mut files)?;
+    materialize_files(path, label, source, files, limits)
+}
+
+pub fn write_plugin_package_file(
+    materialized: &MaterializedPluginPackage,
+    output_path: &Path,
+    limits: &PluginDiscoveryLimits,
+) -> Result<PackedPluginPackage, PluginDiagnostic> {
+    write_stored_zip_file(output_path, &materialized.files, limits)?;
+    let package = read_plugin_package_file(output_path, materialized.package.source(), limits)?;
+    Ok(PackedPluginPackage {
+        output_path: output_path.to_path_buf(),
+        package: package.package,
+    })
+}
+
+impl DiscoveredPluginPackage {
+    pub fn source(&self) -> PluginSourceKind {
+        self.identity.source
+    }
+}
+
+fn materialize_archive(
+    path: &Path,
+    label: &str,
+    source: PluginSourceKind,
+    bytes: &[u8],
+    limits: &PluginDiscoveryLimits,
+) -> Result<MaterializedPluginPackage, PluginDiagnostic> {
+    let archive = parse_stored_zip(bytes, label, source, limits)?;
+    materialize_files(path, label.to_string(), source, archive.files, limits)
+}
+
+fn materialize_files(
+    path: &Path,
+    label: String,
+    source: PluginSourceKind,
+    files: BTreeMap<String, Vec<u8>>,
+    limits: &PluginDiscoveryLimits,
+) -> Result<MaterializedPluginPackage, PluginDiagnostic> {
+    let archive = StoredArchive {
+        files: files.clone(),
+    };
     let manifest_bytes = archive.files.get("plugin.toml").ok_or_else(|| {
         PluginDiagnostic::new(
             PluginDiagnosticKind::Missing,
@@ -1370,7 +1532,7 @@ fn read_package(
             "plugin package is missing root plugin.toml",
         )
         .with_source(source)
-        .with_package(label)
+        .with_package(label.clone())
     })?;
     if manifest_bytes.len() > limits.max_manifest_size_bytes {
         return Err(PluginDiagnostic::new(
@@ -1388,7 +1550,7 @@ fn read_package(
             "plugin.toml is not valid UTF-8",
         )
         .with_source(source)
-        .with_package(label)
+        .with_package(label.clone())
     })?;
     let manifest: PluginPackageManifest = toml::from_str(manifest_text).map_err(|error| {
         PluginDiagnostic::new(
@@ -1397,20 +1559,282 @@ fn read_package(
             safe_toml_parse_message(&error),
         )
         .with_source(source)
-        .with_package(label)
+        .with_package(label.clone())
     })?;
-    validate_manifest(&manifest, &archive, label, source)?;
+    validate_manifest(&manifest, &archive, &label, source)?;
     let digest = deterministic_digest(&archive.files);
     let identity = SourceQualifiedPluginId::new(source, manifest.id.clone());
-
-    Ok(DiscoveredPluginPackage {
+    let package = DiscoveredPluginPackage {
         identity,
         package_path: path.to_path_buf(),
-        package_label: label.to_string(),
+        package_label: label,
         digest,
         manifest,
         entries: archive.files.keys().cloned().collect(),
-    })
+    };
+    Ok(MaterializedPluginPackage { package, files })
+}
+
+fn collect_directory_files(
+    root: &Path,
+    dir: &Path,
+    label: &str,
+    source: PluginSourceKind,
+    limits: &PluginDiscoveryLimits,
+    files: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<(), PluginDiagnostic> {
+    let mut entries = fs::read_dir(dir)
+        .map_err(|error| {
+            PluginDiagnostic::new(
+                PluginDiagnosticKind::Io,
+                PluginDiagnosticPhase::Discovery,
+                format!(
+                    "plugin directory could not be listed: {}",
+                    safe_io_error(&error)
+                ),
+            )
+            .with_source(source)
+            .with_package(label.to_string())
+        })?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect::<Vec<_>>();
+    entries.sort();
+
+    for path in entries {
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            PluginDiagnostic::new(
+                PluginDiagnosticKind::Io,
+                PluginDiagnosticPhase::Discovery,
+                format!(
+                    "plugin directory entry metadata could not be read: {}",
+                    safe_io_error(&error)
+                ),
+            )
+            .with_source(source)
+            .with_package(label.to_string())
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(PluginDiagnostic::new(
+                PluginDiagnosticKind::Traversal,
+                PluginDiagnosticPhase::Discovery,
+                "plugin directory contains a symlink entry",
+            )
+            .with_source(source)
+            .with_package(label.to_string()));
+        }
+        if metadata.is_dir() {
+            collect_directory_files(root, &path, label, source, limits, files)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        if metadata.len() > limits.max_file_size_bytes {
+            return Err(PluginDiagnostic::new(
+                PluginDiagnosticKind::Bounds,
+                PluginDiagnosticPhase::Discovery,
+                "plugin directory file exceeds the configured per-file bound",
+            )
+            .with_source(source)
+            .with_package(label.to_string()));
+        }
+        let canonical = fs::canonicalize(&path).map_err(|error| {
+            PluginDiagnostic::new(
+                PluginDiagnosticKind::Io,
+                PluginDiagnosticPhase::Discovery,
+                format!(
+                    "plugin directory file could not be read: {}",
+                    safe_io_error(&error)
+                ),
+            )
+            .with_source(source)
+            .with_package(label.to_string())
+        })?;
+        if !canonical.starts_with(root) {
+            return Err(PluginDiagnostic::new(
+                PluginDiagnosticKind::Traversal,
+                PluginDiagnosticPhase::Discovery,
+                "plugin directory file escapes the package root",
+            )
+            .with_source(source)
+            .with_package(label.to_string()));
+        }
+        let relative = canonical.strip_prefix(root).map_err(|_| {
+            PluginDiagnostic::new(
+                PluginDiagnosticKind::Traversal,
+                PluginDiagnosticPhase::Discovery,
+                "plugin directory file escapes the package root",
+            )
+            .with_source(source)
+            .with_package(label.to_string())
+        })?;
+        let normalized = relative
+            .components()
+            .map(|component| component.as_os_str().to_str())
+            .collect::<Option<Vec<_>>>()
+            .and_then(|parts| normalize_archive_path(&parts.join("/")))
+            .ok_or_else(|| {
+                PluginDiagnostic::new(
+                    PluginDiagnosticKind::Traversal,
+                    PluginDiagnosticPhase::Discovery,
+                    "plugin directory contains an unsafe relative path",
+                )
+                .with_source(source)
+                .with_package(label.to_string())
+            })?;
+        let content = fs::read(&path).map_err(|error| {
+            PluginDiagnostic::new(
+                PluginDiagnosticKind::Io,
+                PluginDiagnosticPhase::Discovery,
+                format!(
+                    "plugin directory file could not be read: {}",
+                    safe_io_error(&error)
+                ),
+            )
+            .with_source(source)
+            .with_package(label.to_string())
+        })?;
+        files.insert(normalized, content);
+        if files.len() > limits.max_entries_per_package {
+            return Err(PluginDiagnostic::new(
+                PluginDiagnosticKind::Bounds,
+                PluginDiagnosticPhase::Discovery,
+                "plugin directory contains more files than the configured bound",
+            )
+            .with_source(source)
+            .with_package(label.to_string()));
+        }
+        let expanded_size = files
+            .values()
+            .map(|content| content.len() as u64)
+            .sum::<u64>();
+        if expanded_size > limits.max_expanded_size_bytes {
+            return Err(PluginDiagnostic::new(
+                PluginDiagnosticKind::Bounds,
+                PluginDiagnosticPhase::Discovery,
+                "plugin directory expanded size exceeds the configured bound",
+            )
+            .with_source(source)
+            .with_package(label.to_string()));
+        }
+    }
+    Ok(())
+}
+
+fn write_stored_zip_file(
+    output_path: &Path,
+    files: &BTreeMap<String, Vec<u8>>,
+    limits: &PluginDiscoveryLimits,
+) -> Result<(), PluginDiagnostic> {
+    if files.len() > limits.max_entries_per_package {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Bounds,
+            PluginDiagnosticPhase::Discovery,
+            "plugin package contains more entries than the configured bound",
+        ));
+    }
+    let mut bytes = Vec::new();
+    let mut central = Vec::new();
+    for (name, content) in files {
+        let name = normalize_archive_path(name).ok_or_else(|| {
+            PluginDiagnostic::new(
+                PluginDiagnosticKind::Traversal,
+                PluginDiagnosticPhase::Discovery,
+                "plugin package entry path escapes the archive root",
+            )
+        })?;
+        if content.len() as u64 > limits.max_file_size_bytes {
+            return Err(PluginDiagnostic::new(
+                PluginDiagnosticKind::Bounds,
+                PluginDiagnosticPhase::Discovery,
+                "plugin package entry exceeds the configured per-file bound",
+            ));
+        }
+        let local_offset = bytes.len() as u32;
+        write_u32_vec(&mut bytes, ZIP_LOCAL_FILE);
+        write_u16_vec(&mut bytes, 20);
+        write_u16_vec(&mut bytes, 0x0800);
+        write_u16_vec(&mut bytes, ZIP_COMPRESSION_STORED);
+        write_u16_vec(&mut bytes, 0);
+        write_u16_vec(&mut bytes, 0);
+        write_u32_vec(&mut bytes, 0);
+        write_u32_vec(&mut bytes, content.len() as u32);
+        write_u32_vec(&mut bytes, content.len() as u32);
+        write_u16_vec(&mut bytes, name.len() as u16);
+        write_u16_vec(&mut bytes, 0);
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(content);
+
+        write_u32_vec(&mut central, ZIP_CENTRAL_DIRECTORY);
+        write_u16_vec(&mut central, 20);
+        write_u16_vec(&mut central, 20);
+        write_u16_vec(&mut central, 0x0800);
+        write_u16_vec(&mut central, ZIP_COMPRESSION_STORED);
+        write_u16_vec(&mut central, 0);
+        write_u16_vec(&mut central, 0);
+        write_u32_vec(&mut central, 0);
+        write_u32_vec(&mut central, content.len() as u32);
+        write_u32_vec(&mut central, content.len() as u32);
+        write_u16_vec(&mut central, name.len() as u16);
+        write_u16_vec(&mut central, 0);
+        write_u16_vec(&mut central, 0);
+        write_u16_vec(&mut central, 0);
+        write_u16_vec(&mut central, 0);
+        write_u32_vec(&mut central, 0);
+        write_u32_vec(&mut central, local_offset);
+        central.extend_from_slice(name.as_bytes());
+    }
+    let central_offset = bytes.len() as u32;
+    bytes.extend_from_slice(&central);
+    write_u32_vec(&mut bytes, ZIP_EOCD);
+    write_u16_vec(&mut bytes, 0);
+    write_u16_vec(&mut bytes, 0);
+    write_u16_vec(&mut bytes, files.len() as u16);
+    write_u16_vec(&mut bytes, files.len() as u16);
+    write_u32_vec(&mut bytes, central.len() as u32);
+    write_u32_vec(&mut bytes, central_offset);
+    write_u16_vec(&mut bytes, 0);
+    if bytes.len() as u64 > limits.max_package_size_bytes {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Bounds,
+            PluginDiagnosticPhase::Discovery,
+            "plugin package exceeds the configured package size bound",
+        ));
+    }
+    if let Some(parent) = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|error| {
+            PluginDiagnostic::new(
+                PluginDiagnosticKind::Io,
+                PluginDiagnosticPhase::Discovery,
+                format!(
+                    "plugin package output directory could not be created: {}",
+                    safe_io_error(&error)
+                ),
+            )
+        })?;
+    }
+    fs::write(output_path, bytes).map_err(|error| {
+        PluginDiagnostic::new(
+            PluginDiagnosticKind::Io,
+            PluginDiagnosticPhase::Discovery,
+            format!(
+                "plugin package output could not be written: {}",
+                safe_io_error(&error)
+            ),
+        )
+    })?;
+    Ok(())
+}
+
+fn write_u16_vec(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32_vec(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
 }
 
 fn validate_manifest(

@@ -5,10 +5,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use manifest::plugin::{
-    PluginConfig, PluginDiagnostic, PluginDiagnosticKind, PluginDiscoveryLimits,
-    PluginDiscoveryOptions, PluginDiscoveryReport, PluginPackageManifest, PluginPermission,
-    PluginResolution, PluginSourceKind, PluginSurface, ResolvedPlugin, ResolvedPluginRecord,
-    SourceQualifiedPluginId, discover_plugins, resolve_enabled_plugins,
+    MaterializedPluginPackage, PluginConfig, PluginDiagnostic, PluginDiagnosticKind,
+    PluginDiagnosticPhase, PluginDiscoveryLimits, PluginDiscoveryOptions, PluginDiscoveryReport,
+    PluginExactVersion, PluginGrantConfig, PluginPackageManifest, PluginPermission,
+    PluginResolution, PluginSourceKind, PluginSurface, RUST_COMPONENT_TOOL_TEMPLATE,
+    ResolvedPlugin, ResolvedPluginRecord, SourceQualifiedPluginId, discover_plugins,
+    read_plugin_directory, read_plugin_package_file, resolve_enabled_plugins,
+    write_plugin_package_file,
 };
 use manifest::{ProfileResolveOptions, ProfileResolver, ProfileSelector, paths};
 use pod::feature::plugin::{PluginStaticInspection, inspect_resolved_plugin_static};
@@ -35,15 +38,550 @@ pub(crate) enum PluginCliCommand {
         reference: String,
         args: PluginCliArgs,
     },
+    New {
+        template: String,
+        destination: PathBuf,
+        args: PluginCliArgs,
+    },
+    Check {
+        input: PathBuf,
+        args: PluginCliArgs,
+    },
+    Pack {
+        input: PathBuf,
+        output: Option<PathBuf>,
+        args: PluginCliArgs,
+    },
 }
 
 pub(crate) fn run(command: PluginCliCommand) -> Result<()> {
+    if let PluginCliCommand::Check { input, args } = command {
+        let report = build_check_report(&input);
+        let rendered = render_check_report(&report, &args)?;
+        print!("{rendered}");
+        if report.status != "active" {
+            return Err("plugin check failed; see diagnostics above".into());
+        }
+        return Ok(());
+    }
     let rendered = match command {
         PluginCliCommand::List(args) => render_list(&args)?,
         PluginCliCommand::Show { reference, args } => render_show(&reference, &args)?,
+        PluginCliCommand::New {
+            template,
+            destination,
+            args,
+        } => render_new(&template, &destination, &args)?,
+        PluginCliCommand::Check { .. } => unreachable!("handled above"),
+        PluginCliCommand::Pack {
+            input,
+            output,
+            args,
+        } => render_pack(&input, output.as_deref(), &args)?,
     };
     print!("{rendered}");
     Ok(())
+}
+
+fn render_new(template: &str, destination: &Path, args: &PluginCliArgs) -> Result<String> {
+    if template != "rust-component-tool" {
+        return Err(format!(
+            "unsupported plugin template `{template}` (supported: rust-component-tool)"
+        )
+        .into());
+    }
+    materialize_template(destination)?;
+    let report = NewReport {
+        command: "new",
+        template: "rust-component-tool",
+        destination: destination.display().to_string(),
+        files: RUST_COMPONENT_TOOL_TEMPLATE
+            .iter()
+            .map(|resource| resource.path.to_string())
+            .collect(),
+        safety: AuthoringSafetyReport::default(),
+        next_steps: vec![
+            "Review plugin.toml and generated Rust source.".to_string(),
+            "Replace the placeholder plugin.component.wasm with a real built component before enabling or execution.".to_string(),
+            "Run `yoi plugin check <path>` and then `yoi plugin pack <path>`.".to_string(),
+        ],
+    };
+    if args.json {
+        return Ok(format!("{}\n", serde_json::to_string_pretty(&report)?));
+    }
+    render_new_human(&report)
+}
+
+fn materialize_template(destination: &Path) -> Result<()> {
+    if destination.exists() {
+        let metadata = fs::metadata(destination)?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "plugin template destination `{}` already exists and is not a directory",
+                destination.display()
+            )
+            .into());
+        }
+        if fs::read_dir(destination)?.next().is_some() {
+            return Err(format!(
+                "plugin template destination `{}` is not empty",
+                destination.display()
+            )
+            .into());
+        }
+    } else {
+        fs::create_dir_all(destination)?;
+    }
+
+    for resource in RUST_COMPONENT_TOOL_TEMPLATE {
+        let relative = safe_template_relative_path(resource.path)?;
+        let path = destination.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, resource.contents)?;
+    }
+    Ok(())
+}
+
+fn safe_template_relative_path(path: &str) -> Result<&Path> {
+    let relative = Path::new(path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!("embedded plugin template path `{path}` is unsafe").into());
+    }
+    Ok(relative)
+}
+
+#[cfg(test)]
+fn render_check(input: &Path, args: &PluginCliArgs) -> Result<String> {
+    let report = build_check_report(input);
+    render_check_report(&report, args)
+}
+
+fn render_check_report(report: &CheckReport, args: &PluginCliArgs) -> Result<String> {
+    if args.json {
+        return Ok(format!("{}\n", serde_json::to_string_pretty(report)?));
+    }
+    render_check_human(report)
+}
+
+fn render_pack(input: &Path, output: Option<&Path>, args: &PluginCliArgs) -> Result<String> {
+    let limits = PluginDiscoveryLimits::default();
+    let materialized = read_plugin_directory(input, PluginSourceKind::Project, &limits)
+        .map_err(|diagnostic| plugin_diagnostic_error("plugin pack", diagnostic))?;
+    let output_path = output
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_package_output_path(input));
+    let packed = write_plugin_package_file(&materialized, &output_path, &limits)
+        .map_err(|diagnostic| plugin_diagnostic_error("plugin pack", diagnostic))?;
+    let report = PackReport {
+        command: "pack",
+        status: "packed",
+        input_path: input.display().to_string(),
+        output_path: packed.output_path.display().to_string(),
+        package: PackageReport::from_materialized(&MaterializedPluginPackage {
+            package: packed.package,
+            files: materialized.files,
+        }),
+        safety: AuthoringSafetyReport::default(),
+    };
+    if args.json {
+        return Ok(format!("{}\n", serde_json::to_string_pretty(&report)?));
+    }
+    render_pack_human(&report)
+}
+
+fn default_package_output_path(input: &Path) -> PathBuf {
+    let name = input
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("plugin");
+    input.with_file_name(format!("{name}.yoi-plugin"))
+}
+
+fn build_check_report(input: &Path) -> CheckReport {
+    let limits = PluginDiscoveryLimits::default();
+    let input_kind = if input.is_dir() {
+        "directory"
+    } else {
+        "package"
+    };
+    let result = if input.is_dir() {
+        read_plugin_directory(input, PluginSourceKind::Project, &limits)
+    } else {
+        read_plugin_package_file(input, PluginSourceKind::Project, &limits)
+    };
+    match result {
+        Ok(materialized) => {
+            let static_inspection = inspect_materialized_package(&materialized);
+            let diagnostics = static_inspection_diagnostics(&static_inspection);
+            let status = if diagnostics.is_empty() {
+                "active"
+            } else {
+                "rejected"
+            };
+            let reference = package_reference(&materialized.package.identity);
+            CheckReport {
+                command: "check",
+                status,
+                input_path: input.display().to_string(),
+                input_kind,
+                package: Some(PackageReport::from_materialized(&materialized)),
+                diagnostics,
+                static_inspection: Some(StaticInspectionReport::from_inspection(
+                    &static_inspection,
+                )),
+                safety: AuthoringSafetyReport::default(),
+                next_steps: check_next_steps(status, &reference),
+            }
+        }
+        Err(diagnostic) => CheckReport {
+            command: "check",
+            status: "rejected",
+            input_path: input.display().to_string(),
+            input_kind,
+            package: None,
+            diagnostics: vec![PluginDiagnosticReport::from_diagnostic(&diagnostic)],
+            static_inspection: None,
+            safety: AuthoringSafetyReport::default(),
+            next_steps: vec![
+                "Fix the reported package diagnostic and run `yoi plugin check` again.".to_string(),
+            ],
+        },
+    }
+}
+
+fn inspect_materialized_package(
+    materialized: &MaterializedPluginPackage,
+) -> PluginStaticInspection {
+    let requested_permissions = materialized.package.manifest.permissions.clone();
+    let record = ResolvedPluginRecord {
+        identity: materialized.package.identity.clone(),
+        source: materialized.package.identity.source,
+        package_path: materialized.package.package_path.clone(),
+        package_label: materialized.package.package_label.clone(),
+        digest: materialized.package.digest.clone(),
+        version: materialized.package.manifest.version.clone(),
+        manifest: materialized.package.manifest.clone(),
+        enabled_surfaces: materialized.package.manifest.surfaces.clone(),
+        grants: PluginGrantConfig {
+            id: Some(materialized.package.identity.to_string()),
+            version: Some(PluginExactVersion(
+                materialized.package.manifest.version.clone(),
+            )),
+            digest: Some(materialized.package.digest.clone()),
+            permissions: requested_permissions,
+            https: Vec::new(),
+            fs: Vec::new(),
+        },
+        config: None,
+    };
+    inspect_resolved_plugin_static(&record)
+}
+
+fn static_inspection_diagnostics(
+    inspection: &PluginStaticInspection,
+) -> Vec<PluginDiagnosticReport> {
+    let mut diagnostics = Vec::new();
+    if let Some(message) = &inspection.runtime.diagnostic {
+        diagnostics.push(PluginDiagnosticReport {
+            kind: "malformed".to_string(),
+            phase: "resolution".to_string(),
+            message: bound_text(message.clone()),
+        });
+    }
+    for api in &inspection.host_apis {
+        if let Some(message) = &api.diagnostic {
+            diagnostics.push(PluginDiagnosticReport {
+                kind: "grant".to_string(),
+                phase: "resolution".to_string(),
+                message: bound_text(message.clone()),
+            });
+        }
+    }
+    for tool in &inspection.tools {
+        if let Some(message) = &tool.diagnostic {
+            diagnostics.push(PluginDiagnosticReport {
+                kind: "malformed".to_string(),
+                phase: "resolution".to_string(),
+                message: bound_text(message.clone()),
+            });
+        }
+    }
+    diagnostics
+}
+
+fn check_next_steps(status: &str, reference: &str) -> Vec<String> {
+    if status == "active" {
+        vec![
+            "Package metadata is valid without executing Plugin code.".to_string(),
+            format!(
+                "To enable after review, add an explicit plugin enablement entry for `{reference}` with matching digest and grants."
+            ),
+            "Run `yoi plugin pack <path>` to create a deterministic .yoi-plugin archive."
+                .to_string(),
+        ]
+    } else {
+        vec!["Fix the reported diagnostics before enabling or packing this Plugin.".to_string()]
+    }
+}
+
+fn plugin_diagnostic_error(context: &str, diagnostic: PluginDiagnostic) -> String {
+    format!("{context} failed: {}", diagnostic.message)
+}
+
+fn render_new_human(report: &NewReport) -> Result<String> {
+    let mut out = String::new();
+    writeln!(
+        out,
+        "created plugin template `{}` at {}",
+        report.template, report.destination
+    )?;
+    writeln!(out, "files:")?;
+    for file in &report.files {
+        writeln!(out, "  - {file}")?;
+    }
+    writeln!(
+        out,
+        "safety: no network; embedded template only; no secrets generated"
+    )?;
+    writeln!(out, "next steps:")?;
+    for step in &report.next_steps {
+        writeln!(out, "  - {step}")?;
+    }
+    Ok(out)
+}
+
+fn render_check_human(report: &CheckReport) -> Result<String> {
+    let mut out = String::new();
+    writeln!(
+        out,
+        "plugin check: {} [{}] input_kind={}",
+        report.input_path, report.status, report.input_kind
+    )?;
+    if let Some(package) = &report.package {
+        writeln!(
+            out,
+            "package: {} version={} digest={} entries={} source={} surfaces={} tools={}",
+            package.reference,
+            package.version,
+            package.digest,
+            package.entries.len(),
+            package.source,
+            join_or_none(&package.surfaces),
+            package.tools.len()
+        )?;
+        writeln!(
+            out,
+            "enablement guidance: pin reference `{}` and digest `{}` explicitly; this command does not mutate config",
+            package.reference, package.digest
+        )?;
+    }
+    if report.diagnostics.is_empty() {
+        writeln!(out, "diagnostics: none")?;
+    } else {
+        writeln!(out, "diagnostics:")?;
+        for diagnostic in &report.diagnostics {
+            writeln!(
+                out,
+                "  - kind={} phase={} message={}",
+                diagnostic.kind, diagnostic.phase, diagnostic.message
+            )?;
+        }
+    }
+    writeln!(
+        out,
+        "safety: no Plugin execution; no enablement config mutation; no secrets generated"
+    )?;
+    writeln!(out, "next steps:")?;
+    for step in &report.next_steps {
+        writeln!(out, "  - {step}")?;
+    }
+    Ok(out)
+}
+
+fn render_pack_human(report: &PackReport) -> Result<String> {
+    let mut out = String::new();
+    writeln!(
+        out,
+        "plugin pack: {} [{}]",
+        report.output_path, report.status
+    )?;
+    writeln!(
+        out,
+        "package: {} version={} digest={} entries={}",
+        report.package.reference,
+        report.package.version,
+        report.package.digest,
+        report.package.entries.len()
+    )?;
+    writeln!(
+        out,
+        "safety: deterministic stored .yoi-plugin archive; no Plugin execution; no config mutation"
+    )?;
+    Ok(out)
+}
+
+#[derive(Serialize)]
+struct AuthoringSafetyReport {
+    no_network: bool,
+    no_plugin_execution: bool,
+    no_enablement_config_mutation: bool,
+    no_secrets_generated: bool,
+}
+
+impl Default for AuthoringSafetyReport {
+    fn default() -> Self {
+        Self {
+            no_network: true,
+            no_plugin_execution: true,
+            no_enablement_config_mutation: true,
+            no_secrets_generated: true,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct NewReport {
+    command: &'static str,
+    template: &'static str,
+    destination: String,
+    files: Vec<String>,
+    safety: AuthoringSafetyReport,
+    next_steps: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct CheckReport {
+    command: &'static str,
+    status: &'static str,
+    input_path: String,
+    input_kind: &'static str,
+    package: Option<PackageReport>,
+    diagnostics: Vec<PluginDiagnosticReport>,
+    static_inspection: Option<StaticInspectionReport>,
+    safety: AuthoringSafetyReport,
+    next_steps: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct PackReport {
+    command: &'static str,
+    status: &'static str,
+    input_path: String,
+    output_path: String,
+    package: PackageReport,
+    safety: AuthoringSafetyReport,
+}
+
+#[derive(Serialize)]
+struct PackageReport {
+    reference: String,
+    package: String,
+    source: String,
+    version: String,
+    schema_version: u32,
+    digest: String,
+    package_path: String,
+    entries: Vec<String>,
+    surfaces: Vec<String>,
+    tools: Vec<String>,
+    permissions: Vec<String>,
+}
+
+impl PackageReport {
+    fn from_materialized(materialized: &MaterializedPluginPackage) -> Self {
+        Self {
+            reference: package_reference(&materialized.package.identity),
+            package: materialized.package.manifest.id.clone(),
+            source: materialized.package.identity.source.to_string(),
+            version: materialized.package.manifest.version.clone(),
+            schema_version: materialized.package.manifest.schema_version,
+            digest: materialized.package.digest.clone(),
+            package_path: materialized.package.package_path.display().to_string(),
+            entries: materialized.package.entries.iter().cloned().collect(),
+            surfaces: materialized
+                .package
+                .manifest
+                .surfaces
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            tools: materialized
+                .package
+                .manifest
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect(),
+            permissions: materialized
+                .package
+                .manifest
+                .permissions
+                .iter()
+                .map(|permission| permission_name(permission.clone()).to_string())
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PluginDiagnosticReport {
+    kind: String,
+    phase: String,
+    message: String,
+}
+
+impl PluginDiagnosticReport {
+    fn from_diagnostic(diagnostic: &PluginDiagnostic) -> Self {
+        Self {
+            kind: diagnostic_kind(&diagnostic.kind).to_string(),
+            phase: diagnostic_phase(&diagnostic.phase).to_string(),
+            message: bound_text(diagnostic.message.clone()),
+        }
+    }
+}
+
+fn diagnostic_phase(phase: &PluginDiagnosticPhase) -> &'static str {
+    match phase {
+        PluginDiagnosticPhase::Discovery => "discovery",
+        PluginDiagnosticPhase::Manifest => "manifest",
+        PluginDiagnosticPhase::Resolution => "resolution",
+    }
+}
+
+fn package_reference(identity: &SourceQualifiedPluginId) -> String {
+    identity.to_string()
+}
+
+fn permission_name(permission: PluginPermission) -> String {
+    permission.label()
+}
+
+#[derive(Serialize)]
+struct StaticInspectionReport {
+    status: String,
+    diagnostics: usize,
+}
+
+impl StaticInspectionReport {
+    fn from_inspection(inspection: &PluginStaticInspection) -> Self {
+        let diagnostics = static_inspection_diagnostics(inspection).len();
+        let status = if diagnostics == 0 {
+            "active"
+        } else {
+            "rejected"
+        };
+        Self {
+            status: status.to_string(),
+            diagnostics,
+        }
+    }
 }
 
 fn render_list(args: &PluginCliArgs) -> Result<String> {
@@ -1252,6 +1790,188 @@ mod tests {
         let show_output = render_item_human(bad_schema).unwrap();
         assert!(show_output.contains("invalid input_schema"));
         assert!(show_output.contains("eligible=false"));
+    }
+
+    #[test]
+    fn plugin_new_creates_template_files_and_refuses_non_empty_destination() {
+        let dir = tempdir().unwrap();
+        let destination = dir.path().join("my-plugin");
+
+        let output = render_new(
+            "rust-component-tool",
+            &destination,
+            &PluginCliArgs::default(),
+        )
+        .unwrap();
+
+        assert!(output.contains("created plugin template"));
+        for resource in RUST_COMPONENT_TOOL_TEMPLATE {
+            assert!(
+                destination.join(resource.path).is_file(),
+                "missing {}",
+                resource.path
+            );
+        }
+        let check_json = render_check(
+            &destination,
+            &PluginCliArgs {
+                json: true,
+                ..PluginCliArgs::default()
+            },
+        )
+        .unwrap();
+        let check_value: serde_json::Value = serde_json::from_str(&check_json).unwrap();
+        assert_eq!(check_value["status"], "active");
+        let error = render_new(
+            "rust-component-tool",
+            &destination,
+            &PluginCliArgs::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not empty"));
+    }
+
+    #[test]
+    fn plugin_check_accepts_valid_directory_and_reports_json_shape() {
+        let dir = tempdir().unwrap();
+        let plugin = dir.path().join("plugin");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(
+            plugin.join("plugin.toml"),
+            plugin_manifest("echo", "echo", "object", &["echo"]),
+        )
+        .unwrap();
+        fs::write(plugin.join("plugin.wasm"), b"not wasm").unwrap();
+
+        let human = render_check(&plugin, &PluginCliArgs::default()).unwrap();
+        assert!(human.contains("[active]"));
+        assert!(human.contains("digest="));
+        assert!(human.contains("does not mutate config"));
+
+        let json = render_check(
+            &plugin,
+            &PluginCliArgs {
+                json: true,
+                ..PluginCliArgs::default()
+            },
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["command"], "check");
+        assert_eq!(value["status"], "active");
+        assert_eq!(value["input_kind"], "directory");
+        assert_eq!(value["package"]["reference"], "project:echo");
+        assert_eq!(value["safety"]["no_plugin_execution"], true);
+    }
+
+    #[test]
+    fn plugin_check_rejects_invalid_manifest_and_missing_runtime_artifact() {
+        let dir = tempdir().unwrap();
+        let invalid = dir.path().join("invalid");
+        fs::create_dir_all(&invalid).unwrap();
+        fs::write(
+            invalid.join("plugin.toml"),
+            "schema_version = 1\nid = [\"bad\"]\n",
+        )
+        .unwrap();
+
+        let invalid_json = render_check(
+            &invalid,
+            &PluginCliArgs {
+                json: true,
+                ..PluginCliArgs::default()
+            },
+        )
+        .unwrap();
+        let invalid_value: serde_json::Value = serde_json::from_str(&invalid_json).unwrap();
+        assert_eq!(invalid_value["status"], "rejected");
+        assert_eq!(invalid_value["diagnostics"][0]["phase"], "manifest");
+
+        let missing = dir.path().join("missing-runtime");
+        fs::create_dir_all(&missing).unwrap();
+        fs::write(
+            missing.join("plugin.toml"),
+            plugin_manifest_missing_runtime_entry("missing_runtime"),
+        )
+        .unwrap();
+        let missing_output = render_check(&missing, &PluginCliArgs::default()).unwrap();
+        assert!(missing_output.contains("rejected"));
+        assert!(missing_output.contains("path not present"));
+    }
+
+    #[test]
+    fn plugin_check_rejects_unsafe_package_archive() {
+        let dir = tempdir().unwrap();
+        let package = dir.path().join("unsafe.yoi-plugin");
+        write_stored_zip(
+            &package,
+            &[
+                (
+                    "plugin.toml",
+                    plugin_manifest("unsafe", "Echo", "object", &["Echo"]).as_bytes(),
+                ),
+                ("../escape.wasm", b"not wasm"),
+            ],
+        );
+
+        let output = render_check(&package, &PluginCliArgs::default()).unwrap();
+        assert!(output.contains("rejected"));
+        assert!(output.contains("escapes"));
+    }
+
+    #[test]
+    fn plugin_pack_is_deterministic_and_discoverable() {
+        let dir = tempdir().unwrap();
+        let plugin = dir.path().join("plugin");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(
+            plugin.join("plugin.toml"),
+            plugin_manifest("echo", "echo", "object", &["echo"]),
+        )
+        .unwrap();
+        fs::write(plugin.join("plugin.wasm"), b"not wasm").unwrap();
+        let first = dir.path().join("first.yoi-plugin");
+        let second = dir.path().join("second.yoi-plugin");
+
+        let first_json = render_pack(
+            &plugin,
+            Some(&first),
+            &PluginCliArgs {
+                json: true,
+                ..PluginCliArgs::default()
+            },
+        )
+        .unwrap();
+        let second_json = render_pack(
+            &plugin,
+            Some(&second),
+            &PluginCliArgs {
+                json: true,
+                ..PluginCliArgs::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
+        let first_value: serde_json::Value = serde_json::from_str(&first_json).unwrap();
+        let second_value: serde_json::Value = serde_json::from_str(&second_json).unwrap();
+        assert_eq!(first_value["command"], "pack");
+        assert_eq!(first_value["status"], "packed");
+        assert_eq!(
+            first_value["package"]["digest"],
+            second_value["package"]["digest"]
+        );
+
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(workspace.join(".yoi/plugins")).unwrap();
+        fs::copy(&first, workspace.join(".yoi/plugins/echo.yoi-plugin")).unwrap();
+        let discovery = discover_plugins(&PluginDiscoveryOptions {
+            workspace_root: workspace,
+            user_data_home: None,
+            limits: PluginDiscoveryLimits::default(),
+        });
+        assert_eq!(discovery.packages.len(), 1);
+        assert_eq!(discovery.packages[0].identity.to_string(), "project:echo");
     }
 
     #[test]
