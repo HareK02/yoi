@@ -122,3 +122,58 @@ Next action:
 - Wait for Coder implementation report, then inspect branch diff/validation evidence and route to Reviewer。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T14:16:45Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVJHYP4Q`.
+
+Implementation commit:
+- `147a6005 plugin: add instance lifecycle surface`
+
+Changed areas reported:
+- Manifest support for Service/Ingress declarations and permissions。
+- New `yoi:plugin/instance@1.0.0` WIT/resource surface。
+- Host-managed `PluginInstanceRegistry` / `PluginInstanceHandle` in Pod plugin feature layer。
+- Plugin Tool registration/dispatch now routes through instance handles。
+- Legacy raw-wasm and `yoi:plugin/tool@1.0.0` component Tool runtimes preserved through registry adapter path。
+- Instance lifecycle/status/stop/diagnostics surfaces and bounded Ingress dispatch API added。
+- Independent Tool/Service/Ingress grant validation added。
+- Static inspection / Plugin CLI diagnostics extended for Service/Ingress eligibility。
+- Rust PDK instance-oriented types/trait/macro support added。
+- Rust component instance template resources added。
+- Plugin component model docs updated。
+- Tests added/updated for manifest validation, CLI reporting/templates, legacy compatibility, grant checks, and in-process shared Tool/Ingress dispatch。
+
+Coder validation reported as passing:
+- `cargo test -p manifest plugin -- --nocapture`
+- `cargo test -p pod plugin -- --nocapture`
+- `cargo test -p yoi plugin -- --nocapture`
+- `cargo check -p yoi`
+- `cargo check -p yoi-plugin-pdk`
+- `cargo fmt --check`
+- `git diff --check`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Dependency/package impact:
+- No new Rust dependencies。
+- Added package/resource files under `resources/plugin/templates/rust-component-instance/` and `resources/plugin/wit/yoi-plugin-instance-v1.wit`。
+- No `Cargo.lock` or `package.nix` changes required; Nix build succeeded。
+
+Known risks / deferrals:
+- Instance Component ABI is intentionally minimal string-JSON host dispatch (`start`, `handle-tool`, `handle-ingress`, `status`, `stop`) and should be reviewed before treating it as stable public low-level ABI。
+- Service lifecycle is surfaced as host-managed registration/status/stop diagnostics; no unsafe hidden model/tool/context action path was added。
+- Rust PDK instance macro provides author-facing instance helpers, but full cargo-component generated glue ergonomics may need follow-up polish if public PDK shape becomes stricter。
+
+Orchestrator evidence checked before review dispatch:
+- Implementation worktree is clean。
+- HEAD is `147a6005`。
+- Diff from acceptance `5ec8bae9..HEAD` is one implementation commit touching 12 files, about 1399 insertions / 34 deletions。
+- `git diff --check 5ec8bae9..HEAD` produced no diagnostics。
+
+Next action:
+- Dispatch Reviewer for r1 review against Ticket requirements, with focus on instance registry boundary, legacy compatibility, ToolRegistry run-stability, no hidden context/action paths, per-surface grants, Service/Ingress lifecycle semantics, static inspection/CLI reporting, WIT/PDK/template correctness, bounds/resource limits, and validation evidence。
+
+---
