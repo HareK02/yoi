@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KVJKHAFE",
+      "kind": "related",
+      "target": "00001KVHR3WRF",
+      "note": "CLI inspection reads resolved MCP server config/trust policy",
+      "author": "yoi ticket",
+      "at": "2026-06-20T13:30:15Z"
+    },
+    {
+      "ticket_id": "00001KVJKHAFE",
+      "kind": "related",
+      "target": "00001KVHR3WRY",
+      "note": "CLI inspection reports lifecycle/client initialization diagnostics",
+      "author": "yoi ticket",
+      "at": "2026-06-20T13:30:15Z"
+    },
+    {
+      "ticket_id": "00001KVJKHAFE",
+      "kind": "related",
+      "target": "00001KVHR3WS6",
+      "note": "CLI tools output reports provider-discovered ToolRegistry registration eligibility",
+      "author": "yoi ticket",
+      "at": "2026-06-20T13:30:16Z"
+    },
+    {
+      "ticket_id": "00001KVJKHAFE",
+      "kind": "related",
+      "target": "00001KVHR3WSN",
+      "note": "CLI resources/prompts output reports explicit operation eligibility",
+      "author": "yoi ticket",
+      "at": "2026-06-20T13:30:16Z"
+    },
+    {
+      "ticket_id": "00001KVJKHAFE",
+      "kind": "related",
+      "target": "00001KVHR3WSW",
+      "note": "CLI shows list_changed refresh/reinitialize diagnostics",
+      "author": "yoi ticket",
+      "at": "2026-06-20T13:30:16Z"
+    }
+  ]
+}
