@@ -213,3 +213,45 @@ Reviewer validation:
 Worktree status at review end: source tree clean; ignored `target/` only。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T10:32:28Z -->
+
+## Implementation report
+
+Merge and final validation report:
+
+Merged implementation branch into Orchestrator branch:
+- Merge commit: `ae5f3e42 merge: mcp list changed handling`
+- Implementation commit included:
+  - `e33dee19 mcp: handle list changed notifications`
+
+Reviewer outcome:
+- r1 approved with no blocking issues。
+- Reviewer confirmed bounded kind-only list_changed state, ignored notification params, safe-boundary startup refresh, restart-required fallback, no post-registration live schema mutation, no hidden resource/prompt injection, no sampling/elicitation/remote scope creep, and focused tests。
+
+Orchestrator validation after merge passed:
+- `cargo fmt --all --check`
+- `git diff --check HEAD^1..HEAD`
+- `cargo test -p mcp list_changed -- --nocapture`
+- `cargo test -p pod mcp::tests:: -- --nocapture`
+- `cargo test -p mcp`
+- `cargo check --workspace`
+- `nix build .#yoi --no-link`
+- `nix path-info -S .#yoi`: `113428296`
+
+Validation log:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/bash-ddp5Ei.log`
+
+Final state:
+- Orchestrator worktree clean at `ae5f3e42` after validation。
+- Implementation worktree remains available for cleanup after Ticket completion records are committed。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-20T10:32:35Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Implementation was merged into Orchestrator branch at `ae5f3e42`, review approved, and final Orchestrator validation passed: `cargo fmt --all --check`, `git diff --check HEAD^1..HEAD`, focused `mcp` and `pod mcp::tests::` tests, `cargo check --workspace`, and `nix build .#yoi --no-link`.
+
+---
