@@ -133,3 +133,50 @@ Next action:
 - Let Dashboard/Console Coder proceed in parallel with the MCP tool-registration review loop. Inspect implementation report and route to Reviewer when ready。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T09:13:21Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVHX0WBE`.
+
+Implementation commit:
+- `5415a947 tui: introduce dashboard console boundaries`
+
+Changed areas reported:
+- Introduced `crates/tui/src/dashboard/` as Dashboard boundary:
+  - `mod.rs` for Dashboard state/action/lifecycle entrypoint。
+  - `render.rs` for render/list/layout composition。
+  - `tests.rs` for Dashboard-focused tests。
+- Introduced `crates/tui/src/console/` as the single-Pod Console boundary。
+- Updated `crates/tui/src/lib.rs` routing:
+  - `LaunchMode::Panel => dashboard::launch(...)`。
+  - Console launch modes route through `console::*`。
+  - No `single_pod::run_panel` path remains。
+- Preserved `yoi panel` command name and did not add `yoi dashboard`。
+- Updated help/docs terminology: Dashboard = `yoi panel` workspace cockpit/action surface; Console = single-Pod chat/client surface; TUI = implementation umbrella。
+- Updated tests/help expectations and brittle profile-default assertions surfaced by validation。
+
+Coder validation reported:
+- `cargo test -p tui`: passed。
+- `cargo test -p yoi`: passed。
+- `cargo check --workspace --all-targets`: passed。
+- `cargo fmt --check`: passed。
+- `git diff --check`: passed。
+- `git diff --cached --check`: passed。
+- Targeted help/grep checks for Dashboard/Console terminology and no `yoi dashboard` alias: passed。
+- `nix build .#yoi --no-link` not run because package/source filters were not changed。
+
+Known risks / deferrals:
+- Internal `workspace_panel` naming remains in lower-level model types to avoid broad unrelated churn; user-facing docs/help and TUI entry/module boundaries now use Dashboard/Console terminology。
+
+Orchestrator evidence checked before review dispatch:
+- Implementation worktree is clean。
+- HEAD is `5415a947`。
+- Diff from acceptance `7e35721a..HEAD` is one implementation commit touching 12 files with a large split/rename: `single_pod.rs -> console/mod.rs`, `multi_pod.rs -> dashboard/mod.rs`, new `dashboard/render.rs`, new `dashboard/tests.rs`, docs/help/prompt updates。
+- `git diff --check 7e35721a..HEAD` produced no diagnostics。
+
+Next action:
+- Dispatch Reviewer for r1 review against Ticket requirements, with focus on behavior preservation, `yoi panel` command preservation/no alias, Dashboard/Console/TUI terminology, entrypoint/module boundary, large-file split quality, tests, and whether changed prompt/help wording is appropriate。
+
+---
