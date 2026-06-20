@@ -188,3 +188,34 @@ Next action:
 - Route to read-only Reviewer Pod for acceptance review against the Ticket and IntentPacket。
 
 ---
+
+<!-- event: comment author: yoi-orchestrator at: 2026-06-20T16:46:52Z -->
+
+## Comment
+
+Review routing:
+
+Spawned read-only Reviewer Pod:
+- `yoi-reviewer-00001KVJX7VZT-r1`
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVJX7VZT-cli-resume-subcommand`
+- Branch: `impl/00001KVJX7VZT-cli-resume-subcommand`
+- Baseline: `a63b40f4`
+- Implementation commit: `861c351a feat: add explicit resume command`
+- Diff: `a63b40f4..861c351a`
+
+Reviewer scope:
+- read-only `/home/hare/Projects/yoi`
+
+Reviewer focus:
+- No remaining `-r` / `--resume` compatibility alias。
+- No remaining top-level bare Pod-name inference。
+- Default `yoi resume` is workspace-scoped and `resume --all` is required for host-wide listing。
+- Workspace filtering uses persisted Pod metadata `workspace_root` semantics。
+- Explicit `--pod <NAME>` and existing subcommands remain parseable。
+- Help/errors are discoverable and no longer advertise `[POD_NAME]` or legacy resume flag。
+
+Orchestrator will wait for reviewer verdict before integration。
+
+---
