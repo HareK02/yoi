@@ -124,3 +124,52 @@ Next action:
 - Wait for Coder implementation report, then inspect branch diff/validation evidence and route to Reviewer。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T06:25:39Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVHKWNQS`.
+
+Implementation commit:
+- `945ecdf6 plugin: add authoring cli`
+
+Changed areas reported:
+- Added `yoi plugin new rust-component-tool <path-or-name>`。
+- Added `yoi plugin check <path-or-package> [--json]`。
+- Added `yoi plugin pack <path> [--output <file>] [--json]`。
+- Added manifest-level materialized package helpers for safe directory/package reading, deterministic digesting, deterministic stored `.yoi-plugin` writing, and symlink/root-escape rejection。
+- Reused existing static Plugin inspection for Tool schema / permission / host API declaration checks without Plugin execution。
+- Added embedded `plugin.component.wasm` placeholder to Rust component Tool template so generated templates can be checked/packed immediately; docs instruct replacing it before enabling/execution。
+- Updated CLI parsing/help and Plugin development docs。
+- Added focused tests for generated file set, overwrite refusal, valid directory check, invalid manifest, missing runtime artifact, unsafe package archive, deterministic pack digest, package discoverability, and JSON report shape。
+
+Coder validation reported:
+- `cargo fmt`
+- `cargo fmt --check`
+- `cargo check -p yoi`
+- `cargo test -p yoi plugin_cli`
+- `cargo test -p yoi-plugin-pdk template`
+- `git diff --check`
+- CLI smoke:
+  - `cargo run -q -p yoi -- plugin new rust-component-tool ... --json`
+  - `cargo run -q -p yoi -- plugin check ... --json`
+  - `cargo run -q -p yoi -- plugin pack ... --output ... --json`
+  - invalid check reports `"status": "rejected"` and exits non-zero。
+- `nix build .#yoi --no-link` was attempted but failed due environment/storage: `No space left on device`。
+- No Cargo dependency or `Cargo.lock` changes were introduced。
+
+Known risks / deferrals reported:
+- Component validation remains metadata/static only; no component instantiation/execution is performed by design。
+- Template includes a placeholder artifact solely for deterministic authoring check/pack; docs instruct replacing it before enabling/execution。
+
+Orchestrator evidence checked before review dispatch:
+- Implementation worktree is clean on `impl/00001KVHKWNQS-plugin-authoring-cli`。
+- HEAD is `945ecdf6`。
+- Diff from acceptance `d1095f85..HEAD` is one implementation commit touching 6 files, about 1274 insertions / 24 deletions。
+- `git diff --check d1095f85..HEAD` produced no diagnostics。
+
+Next action:
+- Dispatch Reviewer for r1 review against Ticket requirements, with focus on non-execution safety, archive/path traversal safety, deterministic pack/digest behavior, placeholder artifact policy, JSON report stability, discoverability, workspace/config non-mutation, CLI UX, tests, and Nix/package validation feasibility。
+
+---
