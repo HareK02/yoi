@@ -4,18 +4,18 @@ mod cache;
 mod command;
 mod composer_history;
 mod composer_keys;
+mod console;
+mod dashboard;
 #[cfg(feature = "e2e-test")]
 mod e2e_observer;
 mod input;
 pub mod keys;
 mod markdown;
-mod multi_pod;
 mod picker;
 mod pod_list;
 mod role_session_registry;
 mod scroll;
 pub mod setup_model;
-mod single_pod;
 mod spawn;
 mod task;
 mod text_selection;
@@ -64,7 +64,7 @@ pub enum LaunchMode {
         id: SegmentId,
         pod_name: Option<String>,
     },
-    /// `yoi panel`: open the workspace panel from the current workspace.
+    /// `yoi panel`: open the workspace Dashboard from the current workspace.
     Panel,
 }
 
@@ -95,17 +95,17 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
 
     let result = match mode {
         LaunchMode::Spawn { pod_name, profile } => {
-            single_pod::run_spawn(None, pod_name, profile, runtime_command).await
+            console::run_spawn(None, pod_name, profile, runtime_command).await
         }
         LaunchMode::PodName {
             pod_name,
             socket_override,
-        } => single_pod::run_pod_name(pod_name, socket_override, runtime_command).await,
-        LaunchMode::Resume => single_pod::run_resume(runtime_command).await,
+        } => console::run_pod_name(pod_name, socket_override, runtime_command).await,
+        LaunchMode::Resume => console::run_resume(runtime_command).await,
         LaunchMode::ResumeWithSession { id, pod_name } => {
-            single_pod::run_spawn(Some(id), pod_name, None, runtime_command).await
+            console::run_spawn(Some(id), pod_name, None, runtime_command).await
         }
-        LaunchMode::Panel => single_pod::run_panel(runtime_command).await,
+        LaunchMode::Panel => dashboard::launch(runtime_command).await,
     };
 
     // Always restore the terminal first so any pending eprintln below

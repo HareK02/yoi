@@ -2,7 +2,7 @@
 
 ## Role
 
-`tui` implements terminal UI clients for interacting with one or more Pods.
+`tui` implements terminal UI clients for the single-Pod Console and workspace Dashboard surfaces.
 
 ## Boundaries
 
@@ -10,8 +10,8 @@ Owns:
 
 - terminal rendering and input handling
 - local composer state and UI affordances
-- single-Pod attach/restore screens
-- multi-Pod dashboard presentation
+- single-Pod Console attach/restore/chat screens
+- workspace Dashboard presentation and role-action UI
 
 Does not own:
 
