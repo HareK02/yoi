@@ -168,3 +168,50 @@ Review dispatch:
 - Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVJA7V2R-r1 at: 2026-06-20T12:28:18Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket contract / Orchestrator IntentPacket。
+- Implementation diff: `e752a720..b1af95ad`。
+- 主な対象:
+  - `crates/tools/src/web.rs`
+  - `crates/tools/Cargo.toml`
+  - `Cargo.lock`
+  - `package.nix`
+
+Approval evidence:
+- WebFetch safety pipeline は PDF rendering 前にも共有されている。
+  - URL validation。
+  - Redirect validation。
+  - Content-Length rejection。
+  - Bounded body read。
+- PDF classification は exact `application/pdf` のみで、extension sniffing や `application/octet-stream` guessing は追加されていない。
+- PDF path は `reject_binary()` / UTF-8 text decoding を bypass し、`pdf_extract::extract_text_from_mem_by_pages()` を `spawn_blocking` 内で使っている。
+- Output は `## Page N` 形式の page-delimited text。
+- `transformed_as` / `pdf_extraction.method` は `pdf_text_by_pages` を使い、semantic Markdown fidelity は主張していない。
+- PDF rendering 後も `max_output_bytes` truncation が適用されている。
+- Existing HTML extraction metadata は維持され、PDF result は `html_extraction = null` / `pdf_extraction` populated になる。
+- `pdf-extract` dependency inspection では Poppler/Pdfium/subprocess/OCR runtime dependency は見つからない。
+
+Blocking issues: none。
+
+Non-blocking concerns / follow-ups:
+- Valid multi-page PDF、PDF output truncation、malformed PDF error、unsupported non-PDF binary rejection の tests はあるが、encrypted/textless PDF と oversized PDF `Content-Length` の dedicated tests は無い。実装上は textless pages は readable=false metadata、Content-Length rejection は content-type rendering 前の shared path で covered されるため、この Ticket では blocking ではない。
+- Malformed PDF は `pdf_extraction` metadata付き JSON result ではなく `ToolError` を返すが、Ticket は “diagnostic error or readable=false metadata” を許容しているため OK。
+
+Reviewer validation:
+- `cargo fmt --check`: passed。
+- `git diff --check e752a720..HEAD`: passed。
+- `cargo test -p tools web`: passed, 19 tests。
+- `cargo check -p tools`: passed。
+- `cargo tree -p pdf-extract`: inspected; native PDF runtime dependencyなし。
+- `nix build .#yoi --no-link`: passed。
+
+Worktree status at review end: source tree clean; ignored `target/` only。
+
+---
