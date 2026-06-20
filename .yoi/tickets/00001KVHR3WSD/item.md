@@ -1,8 +1,8 @@
 ---
 title: 'MCP: execute tools/call through ordinary Tool path'
-state: 'queued'
+state: 'inprogress'
 created_at: '2026-06-20T05:30:04Z'
-updated_at: '2026-06-20T06:00:44Z'
+updated_at: '2026-06-20T08:48:15Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['mcp', 'tools-call', 'permission', 'history', 'bounded-output']
