@@ -145,3 +145,16 @@ Next action:
 - Dispatch Reviewer for r1 review against Ticket requirements, with focus on model-facing Intake behavior, Ticket化前 investigation gate clarity, user-agreement preservation, stale vocabulary removal, bundled/workspace workflow boundary, and Intake non-scheduler boundaries。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-20T12:17:06Z -->
+
+## Plan
+
+Review dispatch:
+- Spawned Reviewer Pod `yoi-reviewer-00001KVJDJD02-r1` against implementation branch `impl/00001KVJDJD02-intake-investigation-gate`。
+- Review target commit: `1143ae1c workflow: add intake investigation gate`。
+- Review baseline: `e752a720`。
+- Reviewer task focuses on Intake non-scheduler boundaries, user agreement before official Ticket creation, Ticket化前 investigation gate clarity, draft / `spike_needed` / `requirements_sync_needed` stop behavior, claims/facts/hypotheses/open questions separation, bundled/workspace workflow consistency, stale vocabulary removal, and absence of unintended runtime/code changes。
+- Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
+
+---

@@ -2,7 +2,7 @@
 title: 'Intake workflow に Ticket 化前の調査ゲートを明示する'
 state: 'inprogress'
 created_at: '2026-06-20T11:45:00Z'
-updated_at: '2026-06-20T12:16:24Z'
+updated_at: '2026-06-20T12:17:06Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['prompt-context', 'workflow-source', 'role-behavior', 'ticket-authority']
