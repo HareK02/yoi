@@ -155,3 +155,16 @@ Next action:
 - Dispatch Reviewer for r1 review against Ticket requirements, with focus on WebFetch network/binary safety preservation, PDF extraction bounds/metadata, dependency/Nix impact, malformed/textless behavior, unsupported binary rejection, and HTML/text regression safety。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-20T12:24:42Z -->
+
+## Plan
+
+Review dispatch:
+- Spawned Reviewer Pod `yoi-reviewer-00001KVJA7V2R-r1` against implementation branch `impl/00001KVJA7V2R-webfetch-pdf-text`。
+- Review target commit: `b1af95ad web: fetch pdf text by pages`。
+- Review baseline: `e752a720`。
+- Reviewer task focuses on WebFetch network safety preservation, PDF binary path separation, response/output bounds, `pdf_text_by_pages` metadata accuracy, malformed/textless behavior, unsupported binary rejection, existing HTML/text regression safety, dependency/package impact, and Nix validation。
+- Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
+
+---
