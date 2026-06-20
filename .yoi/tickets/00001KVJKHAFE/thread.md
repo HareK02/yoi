@@ -225,3 +225,47 @@ Reviewer validation:
 Worktree status at review end: source tree clean; ignored `target/` only。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T13:56:02Z -->
+
+## Implementation report
+
+Merge and final validation report:
+
+Merged implementation branch into Orchestrator branch:
+- Merge commit: `5e0b023a merge: mcp cli inspection`
+- Implementation commit included:
+  - `c91f5fc9 mcp: add cli inspection`
+
+Reviewer outcome:
+- r1 approved with no blocking issues。
+- Reviewer confirmed CLI inspection is static/read-only, does not start MCP server processes, does not call tools/resources/prompts, distinguishes static vs live unavailable state, redacts/omits secrets/env/args/content, keeps MCP namespace separate from Plugin CLI, and has focused tests。
+
+Orchestrator validation after merge passed:
+- `cargo fmt --check`
+- `git diff --check HEAD^1..HEAD`
+- `cargo test -p yoi mcp`
+- `cargo check -p yoi`
+- `cargo run -q -p yoi -- --help` with targeted grep for MCP commands。
+- `TicketDoctor`: 0 errors, 4 existing warnings unrelated to this Ticket。
+
+Validation log:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/bash-xrqves.log`
+
+Nix validation:
+- Not run because this Ticket changed only Rust source under `crates/yoi` and no dependency/package/source-filter files changed。
+
+Final state:
+- Orchestrator worktree clean at `5e0b023a` after validation。
+- Implementation worktree remains available for cleanup after Ticket completion records are committed。
+- Plugin instance lifecycle Coder continues in parallel。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-20T13:56:11Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Implementation was merged into Orchestrator branch at `5e0b023a`, review approved, and final Orchestrator validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p yoi mcp`, `cargo check -p yoi`, top-level help grep for MCP commands, and `TicketDoctor` with 0 errors.
+
+---

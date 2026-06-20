@@ -1,8 +1,8 @@
 ---
 title: 'MCP: add yoi CLI inspection commands'
-state: 'inprogress'
+state: 'done'
 created_at: '2026-06-20T13:29:16Z'
-updated_at: '2026-06-20T13:54:05Z'
+updated_at: '2026-06-20T13:56:11Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-20T13:31:00Z'
