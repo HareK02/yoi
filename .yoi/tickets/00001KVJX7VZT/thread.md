@@ -507,3 +507,22 @@ CLI resume UX を explicit `yoi resume` subcommand model に変更し、top-leve
 - LLM-facing Pod scope/tool visibility には変更を加えていない。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T17:00:46Z -->
+
+## Implementation report
+
+Post-close cleanup completed。
+
+- Stopped child Pods and reclaimed scope:
+  - `yoi-coder-00001KVJX7VZT`
+  - `yoi-reviewer-00001KVJX7VZT-r1`
+- Removed implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVJX7VZT-cli-resume-subcommand`
+- Deleted implementation branch:
+  - `impl/00001KVJX7VZT-cli-resume-subcommand`
+- Orchestrator worktree remains clean on `orchestration` at `19c3ec45`。
+
+Root/original workspace was not used for merge/validation/cleanup operations。
+
+---

@@ -2,7 +2,7 @@
 title: 'CLI: `resume` サブコマンド化と Pod 名の暗黙解釈廃止'
 state: 'closed'
 created_at: '2026-06-20T16:18:52Z'
-updated_at: '2026-06-20T17:00:25Z'
+updated_at: '2026-06-20T17:00:46Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['cli-ux', 'pod-metadata', 'workspace-scope', 'backward-compatibility']
