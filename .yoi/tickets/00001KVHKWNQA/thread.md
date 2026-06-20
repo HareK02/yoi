@@ -104,3 +104,55 @@ Next action:
 - Wait for Coder implementation report, then inspect branch diff/validation evidence and route to Reviewer.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T05:16:16Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVHKWNQA`.
+
+Implementation commit:
+- `06287aca plugin: add rust pdk template`
+
+Changed areas reported:
+- Added workspace crate `crates/plugin-pdk` / `yoi-plugin-pdk`:
+  - guest-side PDK helpers;
+  - typed JSON input parsing via `parse_json_input` / `run_json_tool`;
+  - typed JSON output via `ToolOutput::json`;
+  - bounded structured `ToolError` and error-code helpers;
+  - `ToolContext` with selected tool name;
+  - `wit_bindgen` re-export and `export_component_tool!` macro to avoid raw pointer/length ABI plumbing;
+  - tests for happy path, error path, oversized output, template validation, and host-runtime dependency exclusion。
+- Added embedded starter template under `resources/plugin/templates/rust-component-tool/` with `Cargo.toml`, `src/lib.rs`, `plugin.toml`, and `README.md`。
+- Added embedded template constants in `crates/manifest/src/plugin.rs` for future authoring CLI use without remote fetching。
+- Updated Component Model example to use the PDK。
+- Added runtime decoder test confirming PDK-produced ToolOutput JSON shape is accepted。
+- Updated Plugin development/design/package docs。
+- Updated workspace/package metadata: root `Cargo.toml`, `Cargo.lock`, `package.nix` cargo hash。
+
+Coder validation reported as passing:
+- `cargo test -p yoi-plugin-pdk`
+- `cargo test -p manifest embedded_rust_component_tool_template_is_valid_package_shape`
+- `cargo test -p pod pdk_tool_output_shape_is_accepted_by_wasm_decoder`
+- `cargo check`
+- `cargo fmt --check`
+- `git diff --check`
+- `git diff --check --cached`
+- `cargo tree -p yoi-plugin-pdk --edges normal`
+- `nix build .#yoi --no-link`
+
+Known deferrals reported:
+- No `yoi plugin new/check/pack`, remote template fetch, or crates.io publication。
+- Full deterministic sample component build/pack execution remains deferred to future authoring CLI/tooling; current sample/template are fixture-validated and use current WIT/PDK shape。
+- Raw core-Wasm ABI remains compatibility/transitional runtime support。
+
+Orchestrator evidence checked before review dispatch:
+- Implementation worktree is clean on `impl/00001KVHKWNQA-plugin-rust-pdk-templates`。
+- HEAD is `06287aca`。
+- Diff from acceptance `5f7f81bd..HEAD` is one implementation commit touching 17 files, about 857 insertions / 35 deletions。
+- `git diff --check 5f7f81bd..HEAD` produced no diagnostics。
+
+Next action:
+- Dispatch Reviewer for r1 review against Ticket requirements, with focus on guest-only PDK boundary, no host-runtime deps, authority/grant wording, template/resource packaging, sample/test boundary honesty, docs, and Nix/workspace changes。
+
+---
