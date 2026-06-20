@@ -292,3 +292,47 @@ Next action:
 - Route back to Reviewer for r2 verification of Dashboard state preservation and final acceptance criteria。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVHX0WBE-r1 at: 2026-06-20T09:33:16Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket contract / Orchestrator IntentPacket を再確認。
+- Fix diff: `5415a947..135343a2`。
+- Overall implementation diff: `7e35721a..135343a2`。
+- 主な対象: `crates/tui/src/dashboard/mod.rs`, `crates/tui/src/dashboard/tests.rs`, Dashboard/Console/TUI terminology, CLI help, `LaunchMode::Panel` routing, `yoi dashboard` alias absence, old `single_pod::run_panel` / `multi_pod` route absence, nested Console open 後の Dashboard state preservation。
+
+Previous blockers verification:
+- Recoverable Dashboard open failures no longer exit `yoi panel`。
+  - `finish_nested_console_open(...)` により recoverable errors は `app.finish_open(...)` 後に `Ok(())` を返し、Dashboard loop が継続する。
+  - Non-recoverable errors のみ fullscreen を離れて bubble する。
+- Successful Console return no longer replaces live `DashboardApp`。
+  - 以前の `app = load_app(runtime_command.clone()).await?` replacement は削除済み。
+  - Success は `app.finish_open(...)` 後に同じ `DashboardApp` で継続する。
+  - Regression tests は success / recoverable failure / non-recoverable failure を cover している。
+
+Blocking issues: none。
+
+Non-blocking concerns / follow-ups:
+- `dashboard/mod.rs` はまだ大きく複数責務を持つが、旧 `multi_pod.rs` / `single_pod.rs` boundary より materially better であり、この Ticket の acceptance では blocking ではない。
+- Package/source-filter/resource inclusion concern は見つからなかったため、Reviewer は Nix validation を実行していない。
+
+Reviewer validation:
+- `cargo fmt --check`: passed。
+- `git diff --check 7e35721a..HEAD`: passed。
+- `cargo test -p tui`: passed, 362 tests and doc-tests。
+- `cargo test -p yoi`: passed, 66 tests。
+- `cargo check --workspace --all-targets`: passed。
+- Additional help/grep checks passed:
+  - `yoi panel` help remains。
+  - Console / Dashboard / TUI terminology appears as expected。
+  - no `yoi dashboard` alias found。
+  - old `single_pod.rs` / `multi_pod.rs` absent。
+  - `LaunchMode::Panel => dashboard::launch(runtime_command).await` confirmed。
+
+Worktree status at review end: tracked source tree clean; ignored `target/` only。
+
+---
