@@ -684,3 +684,22 @@ Plugin Service/Ingress component lifecycle surface を実装し、Orchestrator w
 - Discord Bridge 本体、public registry/install/update/signature tooling、arbitrary Plugin UI channel、hidden context injection、Service/Ingress による model-visible Tool schema mutation は実装していない。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T15:23:35Z -->
+
+## Implementation report
+
+Post-close cleanup completed。
+
+- Stopped child Pods and reclaimed scope:
+  - `yoi-coder-00001KVJHYP4Q`
+  - `yoi-reviewer-00001KVJHYP4Q-r1`
+- Removed implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVJHYP4Q-plugin-instance-lifecycle`
+- Deleted implementation branch:
+  - `impl/00001KVJHYP4Q-plugin-instance-lifecycle`
+- Orchestrator worktree remains clean on `orchestration` at `bc484338`。
+
+Root/original workspace was not used for merge/validation/cleanup operations beyond observing the worktree list output from the Orchestrator worktree command。
+
+---

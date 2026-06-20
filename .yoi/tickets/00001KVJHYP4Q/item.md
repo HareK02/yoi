@@ -2,7 +2,7 @@
 title: 'Plugin Service/Ingress component lifecycle surface'
 state: 'closed'
 created_at: '2026-06-20T13:01:37Z'
-updated_at: '2026-06-20T15:23:11Z'
+updated_at: '2026-06-20T15:23:35Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-20T13:28:19Z'
