@@ -92,3 +92,18 @@ Next action:
 User explicitly authorized implementation when no blocker exists. Ticket body/thread, relation metadata, closed MCP tool-registration dependency, closed resources/prompts context, Orchestrator worktree state, visible Pods, existing branch/worktree, and bounded list_changed/schema/history context were checked. Dependency `00001KVHR3WS6` is closed, no inprogress/capacity blocker exists, no matching worktree/branch exists, and no missing planning decision was found. Accepting this queued Ticket for implementation before worktree/Pod side effects.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T10:08:05Z -->
+
+## Implementation report
+
+Implementation orchestration start:
+- Acceptance records were committed on Orchestrator branch: `d31b8907 ticket: accept mcp list changed handling`。
+- Created implementation worktree `/home/hare/Projects/yoi/.worktree/00001KVHR3WSW-mcp-list-changed` on branch `impl/00001KVHR3WSW-mcp-list-changed` at `d31b8907`。
+- Spawned Coder Pod `yoi-coder-00001KVHR3WSW` with write scope limited to the implementation worktree and read-only root scope only for runtime workspace identity。
+- Coder task explicitly forbids root/original workspace implementation, hidden context injection, unsafe active-run schema mutation, sampling/elicitation scope creep, merge, Ticket close, and cleanup。
+
+Next action:
+- Wait for Coder implementation report, then inspect branch diff/validation evidence and route to Reviewer。
+
+---
