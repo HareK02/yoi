@@ -251,3 +251,58 @@ Reviewer validation:
 Worktree status at review end: clean。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T14:43:43Z -->
+
+## Implementation report
+
+Coder r1-fix report received from `yoi-coder-00001KVJHYP4Q`.
+
+New fix commit:
+- `870bcc76 plugin: fix instance lifecycle blockers`
+
+Branch commits now:
+- `870bcc76 plugin: fix instance lifecycle blockers`
+- `147a6005 plugin: add instance lifecycle surface`
+
+Fix summary:
+- `crates/plugin-pdk/src/lib.rs`:
+  - Reworked instance PDK export macro to use generated `wit-bindgen` `Guest` / `export!` shape instead of raw placeholder exports。
+  - Added coherent instance-world helpers/status/error JSON handling。
+- `resources/plugin/templates/rust-component-instance/`:
+  - Added empty `[workspace]` so template checks as an in-tree standalone authoring package。
+  - Fixed template API mismatch by using existing `ToolOutput::json`。
+  - Added `wit_bindgen::generate!` for `instance` world and updated export macro usage。
+- `crates/pod/src/feature/plugin.rs`:
+  - Component instance lifecycle now decodes `start` / `stop` returned JSON and fails closed on returned errors / failed status。
+  - Host now calls component `status` export and includes component status in `PluginInstanceStatus`。
+  - Service/Ingress-capable installs create and retain host-managed instances even without Tool registration。
+  - Added retained registry handle and bounded installed-path Ingress dispatch API。
+  - Added tests for component start error handling, component status/stop reporting, service-only instance retention, and installed-path Tool/Ingress shared-instance dispatch。
+- No `Cargo.lock`, dependency, or `package.nix` changes。
+
+Coder validation reported as passing:
+- `cargo test -p manifest plugin -- --nocapture`
+- `cargo test -p pod plugin -- --nocapture`
+- `cargo test -p yoi plugin -- --nocapture`
+- `cargo check -p yoi`
+- `cargo check -p yoi-plugin-pdk`
+- `CARGO_TARGET_DIR=target/review-template cargo check --manifest-path resources/plugin/templates/rust-component-instance/Cargo.toml`
+- `cargo fmt --check`
+- `git diff --check 5ec8bae9..HEAD`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Remaining deferral / risk:
+- Instance PDK now uses `wit-bindgen` export glue and template checks, but `yoi:plugin/instance@1.0.0` remains first public shape and should be reviewed before broad external stability promises。
+
+Orchestrator evidence checked before r2 review:
+- Implementation worktree is clean。
+- HEAD is `870bcc76`。
+- Fix diff from `147a6005..HEAD` touches 4 files, about 506 insertions / 119 deletions。
+- Overall `git diff --check 5ec8bae9..HEAD` produced no diagnostics。
+
+Next action:
+- Route back to Reviewer for r2 verification of the PDK/template export glue, lifecycle status/error parsing, Service/Ingress instance retention, installed-path ingress dispatch, and final acceptance criteria。
+
+---
