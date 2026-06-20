@@ -320,6 +320,21 @@ fn workspace_worktree_delegation(workspace_root: &Path) -> ScopeConfig {
     }
 }
 
+fn append_missing_rules(target: &mut Vec<ScopeRule>, defaults: Vec<ScopeRule>) {
+    for rule in defaults {
+        if !target.contains(&rule) {
+            target.push(rule);
+        }
+    }
+}
+
+fn apply_scope_launch_defaults(scope: &mut ScopeConfig, defaults: ScopeConfig) {
+    // Profile resolution has already applied explicit profile/workspace override scope rules.
+    // Launch policy contributes runtime defaults on top rather than replacing those grants.
+    append_missing_rules(&mut scope.allow, defaults.allow);
+    append_missing_rules(&mut scope.deny, defaults.deny);
+}
+
 fn apply_profile_launch_policy(
     manifest: &mut PodManifest,
     workspace_root: &Path,
@@ -333,24 +348,28 @@ fn apply_profile_launch_policy(
     };
     match role {
         Some(TicketRole::Orchestrator) => {
-            manifest.scope = workspace_scope(workspace_root, Permission::Read, &[]);
+            let default_scope = workspace_scope(workspace_root, Permission::Read, &[]);
+            apply_scope_launch_defaults(&mut manifest.scope, default_scope);
             manifest.delegation_scope = workspace_worktree_delegation(workspace_root);
         }
         Some(TicketRole::Intake) | Some(TicketRole::Reviewer) => {
-            manifest.scope = workspace_scope(workspace_root, Permission::Read, &[]);
+            let default_scope = workspace_scope(workspace_root, Permission::Read, &[]);
+            apply_scope_launch_defaults(&mut manifest.scope, default_scope);
             manifest.delegation_scope = ScopeConfig::default();
         }
         Some(TicketRole::Coder) => {
-            manifest.scope = workspace_scope(workspace_root, Permission::Write, &[]);
+            let default_scope = workspace_scope(workspace_root, Permission::Write, &[]);
+            apply_scope_launch_defaults(&mut manifest.scope, default_scope);
             manifest.delegation_scope = ScopeConfig::default();
         }
         None => {
             let worktree_root = workspace_root.join(".worktree");
-            manifest.scope = workspace_scope(
+            let default_scope = workspace_scope(
                 workspace_root,
                 Permission::Write,
                 std::slice::from_ref(&worktree_root),
             );
+            apply_scope_launch_defaults(&mut manifest.scope, default_scope);
             manifest.delegation_scope = workspace_worktree_delegation(workspace_root);
         }
     }
@@ -665,6 +684,22 @@ permission = "write"
         )
     }
 
+    fn scope_rule(target: &Path, permission: Permission) -> ScopeRule {
+        ScopeRule {
+            target: target.to_path_buf(),
+            permission,
+            recursive: true,
+        }
+    }
+
+    fn assert_scope_contains(rules: &[ScopeRule], target: &Path, permission: Permission) {
+        let expected = scope_rule(target, permission);
+        assert!(
+            rules.contains(&expected),
+            "expected scope rules to contain {expected:?}; got {rules:?}"
+        );
+    }
+
     #[test]
     fn user_manifest_flag_is_not_accepted() {
         let err = Cli::try_parse_from(["yoi pod", "--user-manifest", "manifest.toml"]).unwrap_err();
@@ -752,6 +787,68 @@ permission = "write"
 
         assert_eq!(manifest.pod.name, "from-single-file");
         assert_eq!(manifest.worker.language, "manifest");
+    }
+
+    #[test]
+    fn profile_launch_preserves_workspace_override_scope_allow_in_final_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("runtime-workspace");
+        let external = tmp.path().join("external-readable");
+        let yoi_dir = workspace.join(".yoi");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&external).unwrap();
+        std::fs::create_dir_all(&yoi_dir).unwrap();
+        write(
+            &yoi_dir.join("override.local.toml"),
+            &format!(
+                r#"
+[[scope.allow]]
+target = "{}"
+permission = "read"
+recursive = true
+"#,
+                external.display()
+            ),
+        );
+        let profile = tmp.path().join("profile.lua");
+        write(
+            &profile,
+            r#"
+local yoi = require("yoi")
+return yoi.profile {
+  slug = "override-scope",
+  model = { scheme = "anthropic", model_id = "test-model" },
+}
+"#,
+        );
+        let cli = Cli::try_parse_from([
+            "yoi pod",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--profile",
+            profile.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let (manifest, _loader) = resolve_manifest(&cli).unwrap();
+        let snapshot = serde_json::to_value(&manifest).unwrap();
+        let snapshot_scope: ScopeConfig =
+            serde_json::from_value(snapshot["scope"].clone()).unwrap();
+
+        assert_scope_contains(&manifest.scope.allow, &external, Permission::Read);
+        assert_scope_contains(&manifest.scope.allow, &workspace, Permission::Write);
+        assert_scope_contains(
+            &manifest.scope.deny,
+            &workspace.join(".worktree"),
+            Permission::Write,
+        );
+        assert_scope_contains(&snapshot_scope.allow, &external, Permission::Read);
+        assert_scope_contains(&snapshot_scope.allow, &workspace, Permission::Write);
+        assert_scope_contains(
+            &snapshot_scope.deny,
+            &workspace.join(".worktree"),
+            Permission::Write,
+        );
     }
 
     #[test]
@@ -883,15 +980,15 @@ permission = "write"
 
         assert!(called);
         assert_eq!(manifest.pod.name, "runtime-workspace");
-        assert_eq!(manifest.scope.allow.len(), 1);
-        assert_eq!(manifest.scope.allow[0].target, workspace);
-        assert_eq!(manifest.scope.allow[0].permission, Permission::Write);
+        assert_eq!(manifest.scope.allow.len(), 2);
+        assert_scope_contains(&manifest.scope.allow, tmp.path(), Permission::Write);
+        assert_scope_contains(&manifest.scope.allow, &workspace, Permission::Write);
         assert_eq!(manifest.scope.deny.len(), 1);
-        assert_eq!(
-            manifest.scope.deny[0].target,
-            tmp.path().join("runtime-workspace/.worktree")
+        assert_scope_contains(
+            &manifest.scope.deny,
+            &tmp.path().join("runtime-workspace/.worktree"),
+            Permission::Write,
         );
-        assert_eq!(manifest.scope.deny[0].permission, Permission::Write);
         assert_eq!(manifest.delegation_scope.allow.len(), 2);
         assert_eq!(
             manifest.delegation_scope.allow[0].target,
@@ -944,9 +1041,9 @@ permission = "write"
             })
             .unwrap();
 
-        assert_eq!(manifest.scope.allow.len(), 1);
-        assert_eq!(manifest.scope.allow[0].target, workspace);
-        assert_eq!(manifest.scope.allow[0].permission, Permission::Read);
+        assert_eq!(manifest.scope.allow.len(), 2);
+        assert_scope_contains(&manifest.scope.allow, tmp.path(), Permission::Write);
+        assert_scope_contains(&manifest.scope.allow, &workspace, Permission::Read);
         assert!(manifest.scope.deny.is_empty());
         assert_eq!(manifest.delegation_scope.allow.len(), 2);
         assert_eq!(

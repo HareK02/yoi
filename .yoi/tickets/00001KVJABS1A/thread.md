@@ -152,3 +152,154 @@ Next action:
 - Dispatch Reviewer for r1 review against Ticket requirements, with focus on scope allow/deny merge semantics, authority boundary/no broadening beyond explicit override + defaults, workspace write / `.worktree` deny preservation, Ticket role policy preservation, snapshot/tool-visible scope consistency, and whether the full `cargo test -p pod` failure is unrelated/pre-existing。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-20T12:07:00Z -->
+
+## Plan
+
+Review dispatch:
+- Spawned Reviewer Pod `yoi-reviewer-00001KVJABS1A-r1` against implementation branch `impl/00001KVJABS1A-profile-override-scope`。
+- Review target commit: `0717aae3 pod: preserve profile override scope`。
+- Review baseline: `72e9f2f1`。
+- Reviewer task focuses on scope allow/deny merge semantics, no authority broadening beyond explicit override + launch defaults, workspace write / `.worktree` deny preservation, Ticket role launch/delegation constraints, metadata snapshot/effective scope consistency, restore non-goal, and reported full `cargo test -p pod` failure triage。
+- Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KVJABS1A-r1 at: 2026-06-20T12:12:10Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket contract / Orchestrator IntentPacket。
+- Implementation diff: `72e9f2f1..0717aae3`。
+- 変更ファイル: `crates/pod/src/entrypoint.rs` のみ。
+- Launch-policy change、snapshot/tool-visible scope path、restore path、focused tests を確認。
+
+Approval evidence:
+- `append_missing_rules` / `apply_scope_launch_defaults` により、launch-policy defaults は既に解決済みの Profile / override scope を置換せず、missing rules として append される。
+- Normal launch は workspace-root write scope と `.worktree` write deny を引き続き append する。
+- Ticket role launch は role-specific default direct scope と delegation defaults を引き続き適用する。
+- `resolve_manifest()` は `apply_profile_launch_policy()` 後の final manifest を返す。
+- `Pod::from_manifest_with_context` は `manifest.scope` から tool-visible scope を作る。
+- Pod metadata snapshot serialization は final manifest を使う。
+- Restore path は existing `resolved_manifest_snapshot` がある場合それを使うため、この変更で restore 時に override を再評価する挙動は入っていない。
+- Focused tests は override-local `scope.allow` survival、normal profile launch defaults、Orchestrator role default scope/delegation preservation を cover している。
+
+Blocking issues: none。
+
+Non-blocking concerns / follow-ups:
+- Full `cargo test -p pod` は以下 2 件の prompt-guidance assertion failure で失敗する。
+  - `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`
+  - `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`
+  - Missing asserted text: `"worktree status, diff, and test results"`
+- Reviewer判断: この branch diff は `crates/pod/src/entrypoint.rs` のみであり、prompt rendering/assertion paths / prompt resources / catalog tests を変更していないため、この failure は unrelated/pre-existing。
+
+Reviewer validation:
+- `cargo fmt --all --check`: passed。
+- `git diff --check 72e9f2f1..HEAD`: passed。
+- `cargo test -p pod entrypoint::tests::`: passed, 22 tests。
+- `cargo check -p pod`: passed。
+- `cargo test -p pod`: unrelated prompt assertion failures only; 410 passed, 2 failed。
+
+Worktree status at review end: clean。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T12:13:03Z -->
+
+## Implementation report
+
+Merge and final validation report:
+
+Merged implementation branch into Orchestrator branch:
+- Merge commit: `a1386881 merge: profile override scope`
+- Implementation commit included:
+  - `0717aae3 pod: preserve profile override scope`
+
+Reviewer outcome:
+- r1 approved with no blocking issues。
+- Reviewer confirmed explicit Profile/workspace override `scope.allow` preservation, no wholesale `manifest.scope` replacement, workspace root write / `.worktree` deny default preservation, Ticket role launch/delegation defaults, final snapshot/tool-visible scope consistency, and restore non-goal preservation。
+
+Orchestrator validation after merge passed:
+- `cargo fmt --all --check`
+- `git diff --check HEAD^1..HEAD`
+- `cargo test -p pod entrypoint::tests::`
+- `cargo check -p pod`
+
+Validation log:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/bash-WNUQvw.log`
+
+Known unrelated validation note:
+- Full `cargo test -p pod` was not used as a final gate because Reviewer confirmed unrelated/pre-existing prompt-guidance assertion failures outside this branch's diff。
+
+Nix validation:
+- Not run because this Ticket changed only Rust source in `crates/pod/src/entrypoint.rs` and no dependency/package/source-filter files changed。
+
+Final state:
+- Orchestrator worktree clean at `a1386881` after validation。
+- Implementation worktree remains available for cleanup after Ticket completion records are committed。
+- WebFetch PDF and Intake investigation gate Coder Pods continue in parallel。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-20T12:13:11Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Implementation was merged into Orchestrator branch at `a1386881`, review approved, and final Orchestrator validation passed: `cargo fmt --all --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p pod entrypoint::tests::`, and `cargo check -p pod`.
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-20T12:13:32Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-20T12:13:32Z status: closed -->
+
+## 完了
+
+## Resolution
+
+`00001KVJABS1A` を完了しました。
+
+実装内容:
+- Profile launch policy が `manifest.scope` を wholesale replacement しないように修正しました。
+- 既に解決済みの Profile / workspace override scope に対して、launch-policy default rules を missing rules として append するようにしました。
+- `.yoi/override.local.toml` 等で指定された追加 `scope.allow` / `scope.deny` は保持されます。
+- Normal launch の workspace root write scope と `.worktree` write deny は維持されます。
+- Ticket role launch の default direct scope / delegation defaults は維持されます。
+- Final manifest/snapshot と tool-visible scope が同じ final effective scope を見るように維持しました。
+- Restore path は existing `resolved_manifest_snapshot` を使う挙動のままで、override 再評価は追加していません。
+
+主な commit:
+- `0717aae3 pod: preserve profile override scope`
+- `a1386881 merge: profile override scope`
+
+Review:
+- r1 は `approve`。
+- Reviewer は scope merge semantics、no authority broadening、workspace write / `.worktree` deny preservation、Ticket role defaults、snapshot/tool-visible scope consistency、restore non-goal preservation を確認しました。
+
+最終 validation:
+- `cargo fmt --all --check`
+- `git diff --check HEAD^1..HEAD`
+- `cargo test -p pod entrypoint::tests::`
+- `cargo check -p pod`
+
+Known unrelated note:
+- Full `cargo test -p pod` は branch 外の既存 prompt-guidance assertion failure で失敗するため final gate にしませんでした。Reviewer はこの failure が `crates/pod/src/entrypoint.rs` の diff に起因しないことを確認済みです。
+
+Nix validation:
+- Not run because no dependency/package/source-filter files changed。
+
+Validation log:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/bash-WNUQvw.log`
+
+---
