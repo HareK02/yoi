@@ -22,3 +22,12 @@ Marked ready by `yoi ticket state`.
 
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-20T11:52:33Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---

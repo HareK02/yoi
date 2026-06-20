@@ -1,9 +1,11 @@
 ---
 title: 'Profile launch should preserve override scope allowances'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-20T10:48:57Z'
-updated_at: '2026-06-20T10:49:26Z'
+updated_at: '2026-06-20T11:52:33Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-20T11:52:33Z'
 ---
 
 ## 背景
