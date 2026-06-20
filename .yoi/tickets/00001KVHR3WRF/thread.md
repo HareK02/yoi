@@ -114,3 +114,47 @@ Next action:
 - Wait for Coder implementation report, then inspect branch diff/validation evidence and route to Reviewer。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T07:18:35Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVHR3WRF`.
+
+Implementation commit:
+- `e0680cce mcp: add stdio server config`
+
+Changed areas reported:
+- Added typed MCP config schema in `crates/manifest`:
+  - `mcp.stdio_server` list with explicit `name`, `command`, `args`, `cwd`, and `env`。
+  - explicit env policy with `inherit` and `set`。
+  - env values support `literal`, `secret_ref`, and `env_ref`。
+  - literal env values are redacted in `Debug`。
+- Added validation for duplicate names, empty/NUL command and args, cwd policy/path, env variable names, secret refs, and bounded diagnostics without secret/env value leakage。
+- Integrated MCP config through Profile resolution and child manifest inheritance without adding process spawning。
+- Added focused tests for valid config, invalid command/duplicate names, invalid secret refs/redaction, nonexistent command accepted as no auto-start proof, and Lua Profile MCP config resolution。
+- Updated docs in `docs/design/profiles-manifests-prompts.md` with local stdio MCP config and trust boundary。
+- Updated Nix cargo hash due manifest dependency graph change。
+
+Coder validation reported:
+- `cargo test -p manifest mcp --lib`: passed。
+- `cargo check`: passed。
+- `cargo fmt --all --check`: passed。
+- `git diff --check`: passed。
+- `nix build .#yoi --no-link`: passed。
+- `cargo test -p manifest --lib`: failed on pre-existing/unrelated `plugin::tests::template_includes_current_pdk_version`, reportedly due `resources/plugin-templates/rust/Cargo.toml` PDK version `0.2.0` vs `CARGO_PKG_VERSION` `0.1.0`。
+
+Known deferrals:
+- No MCP subprocess spawning, initialize/capability negotiation, tool/resource/prompt registration, HTTP/OAuth, or JSON-RPC lifecycle added。
+- Command executability intentionally not checked at config-parse time; only structural validation is performed。
+
+Orchestrator evidence checked before review dispatch:
+- Implementation worktree is clean。
+- HEAD is `e0680cce`。
+- Diff from acceptance `b0225e48..HEAD` is one implementation commit touching 8 files, about 515 insertions / 10 deletions。
+- `git diff --check b0225e48..HEAD` produced no diagnostics。
+
+Next action:
+- Dispatch Reviewer for r1 review against Ticket requirements, with focus on config schema fit, validation/redaction boundaries, no process spawning/no auto-start, Profile/config layering, docs trust boundary, and whether the reported `manifest --lib` failure is unrelated or must be fixed。
+
+---
