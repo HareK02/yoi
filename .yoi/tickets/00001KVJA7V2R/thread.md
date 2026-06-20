@@ -105,3 +105,53 @@ Next action:
 - Wait for Coder implementation report, then inspect branch diff/validation evidence and route to Reviewer。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T12:24:02Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVJA7V2R`.
+
+Implementation commit:
+- `b1af95ad web: fetch pdf text by pages`
+
+Changed areas reported:
+- `crates/tools/src/web.rs`:
+  - Added `application/pdf` handling for `WebFetch`。
+  - PDF bytes bypass UTF-8 / `reject_binary()` text path。
+  - Uses `pdf_extract::extract_text_from_mem_by_pages()` inside `tokio::task::spawn_blocking`。
+  - Returns Markdown-ish page sections like `## Page 1`, `## Page 2`。
+  - Adds `pdf_extraction` metadata with method/page/readability/diagnostic fields。
+  - Keeps existing `html_extraction` semantics intact。
+  - Preserves unsupported binary MIME rejection。
+  - Added deterministic in-memory PDF test fixtures and tests for PDF page-delimited output, output truncation, malformed PDF diagnostic error, and unsupported binary MIME rejection。
+- `crates/tools/Cargo.toml`: added `pdf-extract = "0.10.0"`。
+- `Cargo.lock`: updated for `pdf-extract` and transitive dependencies。
+- `package.nix`: updated `cargoHash` to `sha256-rvsjn4BBxd9vt4nytPgUh4l/OQCRpqHbUR4jHoH589U=`。
+
+Coder validation reported as passing:
+- `cargo fmt --check`
+- `cargo test -p tools web`
+- `cargo check -p tools`
+- `git diff --check`
+- `nix build .#yoi --no-link`
+
+Dependency / package impact:
+- New Rust dependency: `pdf-extract 0.10.0`。
+- Nix vendor hash updated and `nix build .#yoi --no-link` passed。
+
+Known risks / deferrals:
+- Only `application/pdf` is supported; no extension sniffing or `application/octet-stream` PDF guessing。
+- No OCR, scanned-PDF support, table reconstruction, cache, subprocess, Poppler, or Pdfium integration。
+- Malformed PDFs return diagnostic extraction error; textless PDFs are represented with `readable=false` metadata when extraction succeeds but no text is found。
+
+Orchestrator evidence checked before review dispatch:
+- Implementation worktree is clean。
+- HEAD is `b1af95ad`。
+- Diff from acceptance `e752a720..HEAD` is one implementation commit touching 4 files, about 552 insertions / 23 deletions。
+- `git diff --check e752a720..HEAD` produced no diagnostics。
+
+Next action:
+- Dispatch Reviewer for r1 review against Ticket requirements, with focus on WebFetch network/binary safety preservation, PDF extraction bounds/metadata, dependency/Nix impact, malformed/textless behavior, unsupported binary rejection, and HTML/text regression safety。
+
+---
