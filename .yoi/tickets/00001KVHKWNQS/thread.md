@@ -173,3 +173,16 @@ Next action:
 - Dispatch Reviewer for r1 review against Ticket requirements, with focus on non-execution safety, archive/path traversal safety, deterministic pack/digest behavior, placeholder artifact policy, JSON report stability, discoverability, workspace/config non-mutation, CLI UX, tests, and Nix/package validation feasibility。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-20T06:26:24Z -->
+
+## Plan
+
+Review dispatch:
+- Spawned Reviewer Pod `yoi-reviewer-00001KVHKWNQS-r1` against implementation branch `impl/00001KVHKWNQS-plugin-authoring-cli`。
+- Review target commit: `945ecdf6 plugin: add authoring cli`。
+- Review baseline: `d1095f85`。
+- Reviewer task focuses on non-execution safety, archive/path traversal safety, deterministic pack/digest behavior, placeholder artifact policy, JSON report stability, discoverability, workspace/config non-mutation, CLI UX, tests, and Nix/package validation feasibility。
+- Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
+
+---
