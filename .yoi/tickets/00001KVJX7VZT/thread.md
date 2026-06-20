@@ -423,3 +423,87 @@ Worktree status:
 - Clean at `d25ca6ff3cdec0e3ee0a62f7ea0cffd3b73bfb1e` on `impl/00001KVJX7VZT-cli-resume-subcommand`。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T17:00:09Z -->
+
+## Implementation report
+
+Reviewer r2 approvalを受けて、実装ブランチを Orchestrator worktree の `orchestration` branch に統合した。
+
+統合:
+- Merge commit: `bdc11c77 merge: explicit resume command`
+- Merged branch: `impl/00001KVJX7VZT-cli-resume-subcommand`
+- Implementation commits:
+  - `861c351a feat: add explicit resume command`
+  - `d25ca6ff fix: update resume guidance`
+
+Orchestrator worktree validation:
+- `cargo fmt --check`: passed
+- `git diff --check HEAD^1..HEAD`: passed
+- `cargo test -p yoi parse_`: passed
+- `cargo test -p tui picker_`: passed
+- `cargo test -p tui workspace`: passed
+- `cargo check -p yoi -p tui`: passed
+- `cargo build -p yoi`: passed
+- `target/debug/yoi ticket doctor`: passed (`doctor: ok`)
+- CLI smoke:
+  - `target/debug/yoi --help`: passed and includes `yoi resume [--workspace <PATH>] [--all]`
+  - `target/debug/yoi resume --help`: passed and documents `--workspace <PATH>` and `--all`
+  - `target/debug/yoi agent`: nonzero and reports `unknown command \`agent\``
+  - `target/debug/yoi -r`: nonzero and reports `unknown argument: -r`
+  - `target/debug/yoi --resume`: nonzero and reports `unknown argument: --resume`
+  - `target/debug/yoi resume --all --workspace /tmp/ws`: nonzero and reports mutual exclusion
+- Active guidance grep:
+  - `rg -n 'yoi -r|--resume|\[POD_NAME\]' crates resources --glob '!target/**' --glob '!Cargo.lock'`
+  - only hit is parser test expectation for `unknown argument: --resume`, not active user guidance。
+
+Final Orchestrator worktree status after validation: clean on `orchestration` at `bdc11c77`。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-20T17:00:13Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Reviewer approval、Orchestrator worktree への統合、focused parser / TUI tests、cargo check/build、CLI smoke、Ticket doctor が完了したため `done` に遷移する。
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-20T17:00:25Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-20T17:00:25Z status: closed -->
+
+## 完了
+
+CLI resume UX を explicit `yoi resume` subcommand model に変更し、top-level bare Pod name inference と legacy `-r` / `--resume` resume path を廃止した。
+
+主な成果:
+- `yoi resume` を explicit subcommand として追加。
+- `yoi resume --workspace <PATH>` で指定 workspace scoped picker を開くようにした。
+- `yoi resume --all` で host/data-dir-wide Pod listing を明示 opt-in にした。
+- Default `yoi resume` は workspace-scoped picker にし、stored Pod metadata `workspace_root` semantics を使う。
+- Top-level bare word (`yoi agent` など) は Pod name inference ではなく unknown command になる。
+- `yoi -r` / `yoi --resume` は legacy resume alias ではなく unknown argument になる。
+- Explicit `yoi --pod <NAME>` path は維持。
+- Help から `[POD_NAME]` と `-r, --resume` guidance を削除し、`yoi resume [--workspace <PATH>] [--all]` を案内。
+- Dashboard / picker no-pods guidance を新 CLI に合わせて更新し、workspace-scoped empty result から `yoi resume --all` を案内。
+- Parser / picker / workspace tests を更新。
+
+統合・検証:
+- Merge commit: `bdc11c77 merge: explicit resume command`
+- Implementation commits: `861c351a`, `d25ca6ff`
+- Reviewer final verdict: approve
+- Validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p yoi parse_`, `cargo test -p tui picker_`, `cargo test -p tui workspace`, `cargo check -p yoi -p tui`, `cargo build -p yoi`, `target/debug/yoi ticket doctor`, and CLI smoke for help/resume help/unknown bare word/-r/--resume/mutually-exclusive resume args。
+
+範囲外:
+- Legacy `-r` / `--resume` compatibility alias は意図的に追加していない。
+- LLM-facing Pod scope/tool visibility には変更を加えていない。
+
+---
