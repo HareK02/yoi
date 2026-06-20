@@ -1,11 +1,13 @@
 ---
 title: 'CLI: `resume` サブコマンド化と Pod 名の暗黙解釈廃止'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-20T16:18:52Z'
-updated_at: '2026-06-20T16:18:52Z'
+updated_at: '2026-06-20T16:29:26Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['cli-ux', 'pod-metadata', 'workspace-scope', 'backward-compatibility']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-20T16:29:26Z'
 ---
 
 ## User claims / request snapshot
