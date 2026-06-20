@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fmt;
 use std::path::PathBuf;
@@ -350,6 +350,67 @@ pub struct McpContentBlock {
     pub fields: BTreeMap<String, Value>,
 }
 
+/// MCP list surface whose `notifications/*/list_changed` signal was observed.
+///
+/// The notification is only a freshness signal. The stdio client records this
+/// bounded enum state and deliberately ignores notification params so a server
+/// cannot inject resource/prompt content or alter model-visible tool schemas
+/// through an out-of-band notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum McpListChangedKind {
+    Tools,
+    Resources,
+    Prompts,
+}
+
+impl McpListChangedKind {
+    fn from_notification_method(method: &str) -> Option<Self> {
+        match method {
+            "notifications/tools/list_changed" => Some(Self::Tools),
+            "notifications/resources/list_changed" => Some(Self::Resources),
+            "notifications/prompts/list_changed" => Some(Self::Prompts),
+            _ => None,
+        }
+    }
+
+    pub fn notification_method(self) -> &'static str {
+        match self {
+            Self::Tools => "notifications/tools/list_changed",
+            Self::Resources => "notifications/resources/list_changed",
+            Self::Prompts => "notifications/prompts/list_changed",
+        }
+    }
+
+    pub fn list_method(self) -> &'static str {
+        match self {
+            Self::Tools => "tools/list",
+            Self::Resources => "resources/list",
+            Self::Prompts => "prompts/list",
+        }
+    }
+}
+
+/// Bounded snapshot of list-change signals observed from one stdio server.
+#[derive(Debug, Clone)]
+pub struct McpListChangedSnapshot {
+    pub server_name: String,
+    kinds: BTreeSet<McpListChangedKind>,
+}
+
+impl McpListChangedSnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.kinds.is_empty()
+    }
+
+    pub fn contains(&self, kind: McpListChangedKind) -> bool {
+        self.kinds.contains(&kind)
+    }
+
+    pub fn kinds(&self) -> impl Iterator<Item = McpListChangedKind> + '_ {
+        self.kinds.iter().copied()
+    }
+}
+
 /// A resolved, explicit local stdio MCP server process specification.
 #[derive(Clone)]
 pub struct McpStdioServerSpec {
@@ -515,6 +576,7 @@ pub struct McpStdioClient {
     limits: McpStdioLimits,
     redactor: Redactor,
     diagnostics: Arc<Mutex<BoundedDiagnostics>>,
+    list_changes: Arc<Mutex<BoundedListChanged>>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     child: Option<Child>,
     responses: mpsc::Receiver<ReaderEvent>,
@@ -607,6 +669,7 @@ impl McpStdioClient {
             limits.max_diagnostic_lines,
             redactor.clone(),
         )));
+        let list_changes = Arc::new(Mutex::new(BoundedListChanged::new(spec.name.clone())));
         let (tx, rx) = mpsc::channel(16);
         let reader_task = spawn_stdout_reader(
             spec.name.clone(),
@@ -615,6 +678,7 @@ impl McpStdioClient {
             tx,
             limits.clone(),
             redactor.clone(),
+            list_changes.clone(),
         );
         let stderr_task = spawn_stderr_reader(stderr, diagnostics.clone(), limits.clone());
 
@@ -623,6 +687,7 @@ impl McpStdioClient {
             limits,
             redactor,
             diagnostics,
+            list_changes,
             stdin,
             child: Some(child),
             responses: rx,
@@ -806,6 +871,21 @@ impl McpStdioClient {
 
     pub async fn snapshot_diagnostics(&self) -> McpDiagnostics {
         self.diagnostics.lock().await.snapshot()
+    }
+
+    /// Return bounded list-change signals observed so far for this connection.
+    ///
+    /// This is diagnostic/freshness state only. It never contains notification
+    /// params and must not be used to mutate an active run's model-visible tool
+    /// schema outside an explicit safe boundary.
+    pub async fn snapshot_list_changes(&self) -> McpListChangedSnapshot {
+        self.list_changes.lock().await.snapshot()
+    }
+
+    /// Clear observed list-change signals before an explicit safe-boundary
+    /// refresh. New notifications received after this call will be recorded.
+    pub async fn clear_list_changes(&self) {
+        self.list_changes.lock().await.clear();
     }
 
     pub async fn request<T: for<'de> Deserialize<'de>>(
@@ -1235,6 +1315,7 @@ fn spawn_stdout_reader(
     tx: mpsc::Sender<ReaderEvent>,
     limits: McpStdioLimits,
     redactor: Redactor,
+    list_changes: Arc<Mutex<BoundedListChanged>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut stdout = BufReader::new(stdout);
@@ -1248,6 +1329,7 @@ fn spawn_stdout_reader(
                             &tx,
                             &limits,
                             &redactor,
+                            &list_changes,
                             message,
                         )
                         .await
@@ -1290,6 +1372,7 @@ async fn handle_incoming_message(
     tx: &mpsc::Sender<ReaderEvent>,
     limits: &McpStdioLimits,
     redactor: &Redactor,
+    list_changes: &Arc<Mutex<BoundedListChanged>>,
     message: IncomingMessage,
 ) {
     if message.method.is_some() && message.id.is_some() {
@@ -1315,7 +1398,10 @@ async fn handle_incoming_message(
         return;
     }
 
-    if message.method.is_some() {
+    if let Some(method) = message.method.as_deref() {
+        if let Some(kind) = McpListChangedKind::from_notification_method(method) {
+            list_changes.lock().await.mark(kind);
+        }
         let _ = tx.send(ReaderEvent::Notification).await;
         return;
     }
@@ -1340,6 +1426,36 @@ async fn handle_incoming_message(
             ),
         )))
         .await;
+}
+
+#[derive(Debug)]
+struct BoundedListChanged {
+    server_name: String,
+    kinds: BTreeSet<McpListChangedKind>,
+}
+
+impl BoundedListChanged {
+    fn new(server_name: String) -> Self {
+        Self {
+            server_name,
+            kinds: BTreeSet::new(),
+        }
+    }
+
+    fn mark(&mut self, kind: McpListChangedKind) {
+        self.kinds.insert(kind);
+    }
+
+    fn clear(&mut self) {
+        self.kinds.clear();
+    }
+
+    fn snapshot(&self) -> McpListChangedSnapshot {
+        McpListChangedSnapshot {
+            server_name: self.server_name.clone(),
+            kinds: self.kinds.clone(),
+        }
+    }
 }
 
 fn spawn_stderr_reader(

@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use mcp::stdio::{
-    CallToolRequest, McpErrorKind, McpPhase, McpStdioClient, McpStdioLimits, McpStdioServerSpec,
-    McpToolListLimits,
+    CallToolRequest, McpErrorKind, McpListChangedKind, McpPhase, McpStdioClient, McpStdioLimits,
+    McpStdioServerSpec, McpToolListLimits,
 };
 
 fn mock_server(mode: &str) -> McpStdioServerSpec {
@@ -237,6 +237,36 @@ async fn shutdown_terminates_or_kills_uncooperative_server() {
         .expect("initialize succeeds");
     let shutdown = client.shutdown().await.expect("shutdown succeeds");
     assert!(shutdown.terminated || shutdown.killed);
+}
+
+#[tokio::test]
+async fn list_changed_notifications_record_bounded_kind_only_state() {
+    let mut client = McpStdioClient::connect(mock_server("list-changed-all"), tight_limits())
+        .await
+        .expect("initialize succeeds");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let snapshot = client.snapshot_list_changes().await;
+    assert_eq!(snapshot.server_name, "mock");
+    assert!(snapshot.contains(McpListChangedKind::Tools));
+    assert!(snapshot.contains(McpListChangedKind::Resources));
+    assert!(snapshot.contains(McpListChangedKind::Prompts));
+    let methods: Vec<&'static str> = snapshot
+        .kinds()
+        .map(McpListChangedKind::notification_method)
+        .collect();
+    assert_eq!(
+        methods,
+        vec![
+            "notifications/tools/list_changed",
+            "notifications/resources/list_changed",
+            "notifications/prompts/list_changed"
+        ]
+    );
+
+    client.clear_list_changes().await;
+    assert!(client.snapshot_list_changes().await.is_empty());
+    client.shutdown().await.expect("shutdown succeeds");
 }
 
 #[tokio::test]

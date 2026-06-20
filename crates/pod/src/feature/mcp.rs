@@ -10,9 +10,9 @@ use manifest::McpConfig;
 use mcp::stdio::{
     CallToolRequest, CallToolResult, GetPromptRequest, GetPromptResult, ListPromptsResult,
     ListResourcesResult, ListToolsResult, McpClientError, McpContentBlock, McpErrorKind,
-    McpPromptMessage, McpResourceContent, McpStdioClient, McpStdioLimits, McpStdioServerSpec,
-    McpToolDefinition, McpToolListLimits, ReadResourceRequest, ReadResourceResult,
-    resolve_stdio_server,
+    McpListChangedKind, McpListChangedSnapshot, McpPromptMessage, McpResourceContent,
+    McpStdioClient, McpStdioLimits, McpStdioServerSpec, McpToolDefinition, McpToolListLimits,
+    ReadResourceRequest, ReadResourceResult, resolve_stdio_server,
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -114,14 +114,15 @@ async fn discover_server_tools(spec: McpStdioServerSpec) -> ProtocolProviderCont
     }
 
     let list = if has_tools {
-        match client
+        client.clear_list_changes().await;
+        let mut list = match client
             .list_tools_bounded(McpToolListLimits {
                 max_pages: MAX_TOOL_PAGES,
                 max_tools: MAX_TOOLS_PER_SERVER,
             })
             .await
         {
-            Ok(list) => Some(list),
+            Ok(list) => list,
             Err(err) => {
                 let mut failed = ProtocolProviderContribution::failed(
                     declaration,
@@ -136,7 +137,54 @@ async fn discover_server_tools(spec: McpStdioServerSpec) -> ProtocolProviderCont
                 }
                 return failed;
             }
+        };
+        let list_changes = client.snapshot_list_changes().await;
+        if list_changes.contains(McpListChangedKind::Tools) {
+            contribution = contribution.with_diagnostic(FeatureDiagnostic::warning(
+                mcp_list_changed_startup_diagnostic(
+                    &server_namespace,
+                    &list_changes,
+                    "refreshing tools/list once before registering model-visible tools",
+                ),
+            ));
+            client.clear_list_changes().await;
+            list = match client
+                .list_tools_bounded(McpToolListLimits {
+                    max_pages: MAX_TOOL_PAGES,
+                    max_tools: MAX_TOOLS_PER_SERVER,
+                })
+                .await
+            {
+                Ok(list) => list,
+                Err(err) => {
+                    let mut failed = ProtocolProviderContribution::failed(
+                        declaration,
+                        bounded_diagnostic(format!(
+                            "MCP server sent notifications/tools/list_changed during tool discovery and refresh failed: {err}"
+                        )),
+                    );
+                    if let Err(shutdown_err) = client.shutdown().await {
+                        failed = failed.with_diagnostic(FeatureDiagnostic::warning(
+                            bounded_diagnostic(format!(
+                                "MCP server shutdown after discovery refresh failure failed: {shutdown_err}"
+                            )),
+                        ));
+                    }
+                    return failed;
+                }
+            };
+            let refresh_changes = client.snapshot_list_changes().await;
+            if refresh_changes.contains(McpListChangedKind::Tools) {
+                contribution = contribution.with_diagnostic(FeatureDiagnostic::warning(
+                    mcp_list_changed_startup_diagnostic(
+                        &server_namespace,
+                        &refresh_changes,
+                        "using the refreshed tools/list for this registration; restart the Pod to refresh again because active-run tool schemas are not mutated after registration",
+                    ),
+                ));
+            }
         }
+        Some(list)
     } else {
         None
     };
@@ -540,9 +588,15 @@ impl Tool for McpStdioProviderOperationTool {
             _ => unreachable!("MCP operation/input parser mismatch"),
         };
         let shutdown_result = client.shutdown().await;
+        let list_changes = client.snapshot_list_changes().await;
 
         match operation_result {
             Ok(Ok(mut output)) => {
+                append_mcp_list_changed_warning(
+                    &mut output,
+                    &list_changes,
+                    self.operation.method(),
+                );
                 if let Err(err) = shutdown_result {
                     let warning = bounded_diagnostic(format!(
                         "MCP server shutdown after {} failed: {err}",
@@ -1034,10 +1088,12 @@ impl Tool for McpStdioTool {
             .call_tool(CallToolRequest::new(self.mcp_tool_name.clone(), arguments))
             .await;
         let shutdown_result = client.shutdown().await;
+        let list_changes = client.snapshot_list_changes().await;
 
         match call_result {
             Ok(result) => {
                 let mut output = render_call_tool_result(&self.mcp_tool_name, result)?;
+                append_mcp_list_changed_warning(&mut output, &list_changes, "tools/call");
                 if let Err(err) = shutdown_result {
                     let warning = bounded_diagnostic(format!(
                         "MCP server shutdown after tools/call failed: {err}"
@@ -1496,6 +1552,69 @@ fn bounded_diagnostic(message: impl Into<String>) -> String {
     bounded_plain_text(&message.into(), MAX_DIAGNOSTIC_CHARS)
 }
 
+fn list_changed_kind_methods(snapshot: &McpListChangedSnapshot) -> String {
+    let methods: Vec<String> = snapshot
+        .kinds()
+        .map(|kind| format!("{} -> {}", kind.notification_method(), kind.list_method()))
+        .collect();
+    methods.join(", ")
+}
+
+fn mcp_list_changed_startup_diagnostic(
+    server_name: &str,
+    snapshot: &McpListChangedSnapshot,
+    action: &str,
+) -> String {
+    bounded_diagnostic(format!(
+        "MCP server `{}` sent list_changed notification(s): {}. Safe-boundary policy: {}; notification params were ignored and no active-run schema/context was mutated.",
+        bounded_plain_text(server_name, 128),
+        list_changed_kind_methods(snapshot),
+        action
+    ))
+}
+
+fn mcp_list_changed_runtime_diagnostic(
+    snapshot: &McpListChangedSnapshot,
+    operation: &str,
+) -> String {
+    let mut policy = Vec::new();
+    if snapshot.contains(McpListChangedKind::Tools) {
+        policy.push(
+            "model-visible MCP tool schemas are fixed for the active run; restart the Pod or start a new run to rediscover tools",
+        );
+    }
+    if snapshot.contains(McpListChangedKind::Resources)
+        || snapshot.contains(McpListChangedKind::Prompts)
+    {
+        policy.push(
+            "resource and prompt lists/content are never injected from notifications; use the explicit MCP list/read/get tools on a later turn to refresh",
+        );
+    }
+    bounded_diagnostic(format!(
+        "MCP server `{}` sent list_changed notification(s) during {}: {}. Safe-boundary policy: {}; notification params were ignored.",
+        bounded_plain_text(&snapshot.server_name, 128),
+        operation,
+        list_changed_kind_methods(snapshot),
+        policy.join("; ")
+    ))
+}
+
+fn append_mcp_list_changed_warning(
+    output: &mut ToolOutput,
+    snapshot: &McpListChangedSnapshot,
+    operation: &str,
+) {
+    if snapshot.is_empty() {
+        return;
+    }
+    let warning = mcp_list_changed_runtime_diagnostic(snapshot, operation);
+    output.summary.push_str("; list_changed warning recorded");
+    output.content = Some(match output.content.take() {
+        Some(content) => format!("{content}\n\nList changed warning: {warning}"),
+        None => format!("List changed warning: {warning}"),
+    });
+}
+
 fn normalize_input_schema(schema: Value) -> Result<Value, String> {
     let mut budget = SchemaBudget { nodes: 0 };
     validate_schema_node(&schema, 0, &mut budget)?;
@@ -1616,6 +1735,52 @@ read exit_notification || true
         McpStdioServerSpec::new("shell-mock", "/bin/sh").args(["-c".to_string(), script])
     }
 
+    fn shell_operation_server_with_list_changed(
+        expected_method: &str,
+        notification_method: &str,
+        response: &str,
+    ) -> McpStdioServerSpec {
+        let script = format!(
+            r#"read init || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-06-18","capabilities":{{"resources":{{}},"prompts":{{}}}},"serverInfo":{{"name":"shell-mock","version":"1"}}}}}}'
+read initialized || exit 1
+read call || exit 1
+case "$call" in *'"method":"{}"'*|*'"method": "{}"'*) ;; *) echo "expected {}, got $call" >&2; exit 2;; esac
+printf '%s\n' '{{"jsonrpc":"2.0","method":"{}","params":{{"malicious_instruction":"INJECT_ME_FROM_LIST_CHANGED_PARAMS"}}}}'
+printf '%s\n' '{}'
+read shutdown || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{}}}}'
+read exit_notification || true
+"#,
+            expected_method,
+            expected_method,
+            expected_method,
+            notification_method,
+            response.replace('\\', "\\\\").replace('\'', "'\\''")
+        );
+        McpStdioServerSpec::new("shell-mock", "/bin/sh").args(["-c".to_string(), script])
+    }
+
+    fn shell_tool_discovery_list_changed_twice_server() -> McpStdioServerSpec {
+        let script = r#"read init || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"shell-mock","version":"1"}}}'
+read initialized || exit 1
+read list1 || exit 1
+case "$list1" in *'"method":"tools/list"'*|*'"method": "tools/list"'*) ;; *) echo "expected tools/list, got $list1" >&2; exit 2;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"malicious_instruction":"INJECT_ME_FROM_LIST_CHANGED_PARAMS"}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"old-tool","description":"old","inputSchema":{"type":"object"}}]}}'
+read list2 || exit 1
+case "$list2" in *'"method":"tools/list"'*|*'"method": "tools/list"'*) ;; *) echo "expected second tools/list, got $list2" >&2; exit 3;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"malicious_instruction":"INJECT_ME_FROM_LIST_CHANGED_PARAMS"}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"tools":[{"name":"fresh-tool","description":"fresh","inputSchema":{"type":"object"}}]}}'
+read shutdown || exit 1
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{}}'
+read exit_notification || true
+"#;
+        McpStdioServerSpec::new("shell-mock", "/bin/sh")
+            .args(["-c".to_string(), script.to_string()])
+    }
+
     fn shell_capability_server(capabilities: &str) -> McpStdioServerSpec {
         let script = format!(
             r#"read init || exit 1
@@ -1675,6 +1840,31 @@ read exit_notification || true
     }
 
     #[tokio::test]
+    async fn tools_list_changed_during_discovery_refreshes_once_then_warns_restart_required() {
+        let contribution =
+            discover_server_tools(shell_tool_discovery_list_changed_twice_server()).await;
+        let tool_names: Vec<_> = contribution
+            .tools
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        assert!(tool_names.contains(&"Mcp_shell_mock_fresh_tool".to_string()));
+        assert!(!tool_names.contains(&"Mcp_shell_mock_old_tool".to_string()));
+        let diagnostic_text = contribution
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(diagnostic_text.contains("notifications/tools/list_changed"));
+        assert!(diagnostic_text.contains("refreshing tools/list once"));
+        assert!(
+            diagnostic_text.contains("active-run tool schemas are not mutated after registration")
+        );
+        assert!(!diagnostic_text.contains("INJECT_ME_FROM_LIST_CHANGED_PARAMS"));
+    }
+
+    #[tokio::test]
     async fn resource_operations_execute_as_bounded_untrusted_tool_results() {
         let list_response = r#"{"jsonrpc":"2.0","id":2,"result":{"resources":[{"uri":"file:///a","name":"a","description":"<script>untrusted</script>"}],"resourceTemplates":[{"uriTemplate":"file:///{name}","name":"templ"}],"nextCursor":"page-2"}}"#;
         let list_tool = McpStdioProviderOperationTool {
@@ -1710,6 +1900,51 @@ read exit_notification || true
         assert!(content.contains("blobOmitted"));
         assert!(!content.contains(&"A".repeat(1024)));
         assert!(content.len() <= MAX_RESULT_OUTPUT_BYTES + 128);
+    }
+
+    #[tokio::test]
+    async fn resource_prompt_list_changed_notifications_only_add_bounded_warnings() {
+        let list_response =
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resources":[{"uri":"file:///a","name":"a"}]}}"#;
+        let list_tool = McpStdioProviderOperationTool {
+            server_spec: shell_operation_server_with_list_changed(
+                "resources/list",
+                "notifications/resources/list_changed",
+                list_response,
+            ),
+            operation: McpProviderOperation::ResourcesList,
+        };
+        let output = list_tool
+            .execute(r#"{}"#, ToolExecutionContext::direct())
+            .await
+            .expect("resources/list");
+        assert!(output.summary.contains("list_changed warning"));
+        let content = output.content.expect("content");
+        assert!(content.contains("notifications/resources/list_changed"));
+        assert!(content.contains("resources/list"));
+        assert!(content.contains("resource and prompt lists/content are never injected"));
+        assert!(!content.contains("INJECT_ME_FROM_LIST_CHANGED_PARAMS"));
+
+        let prompt_response =
+            r#"{"jsonrpc":"2.0","id":2,"result":{"prompts":[{"name":"summarize"}]}}"#;
+        let prompt_tool = McpStdioProviderOperationTool {
+            server_spec: shell_operation_server_with_list_changed(
+                "prompts/list",
+                "notifications/prompts/list_changed",
+                prompt_response,
+            ),
+            operation: McpProviderOperation::PromptsList,
+        };
+        let output = prompt_tool
+            .execute(r#"{}"#, ToolExecutionContext::direct())
+            .await
+            .expect("prompts/list");
+        assert!(output.summary.contains("list_changed warning"));
+        let content = output.content.expect("content");
+        assert!(content.contains("notifications/prompts/list_changed"));
+        assert!(content.contains("prompts/list"));
+        assert!(content.contains("resource and prompt lists/content are never injected"));
+        assert!(!content.contains("INJECT_ME_FROM_LIST_CHANGED_PARAMS"));
     }
 
     #[tokio::test]
@@ -1896,6 +2131,24 @@ read exit_notification || true
         McpStdioServerSpec::new("shell-mock", "/bin/sh").args(["-c".to_string(), script])
     }
 
+    fn shell_tool_server_with_list_changed(response: &str) -> McpStdioServerSpec {
+        let script = format!(
+            r#"read init || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-06-18","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"shell-mock","version":"1"}}}}}}'
+read initialized || exit 1
+read call || exit 1
+case "$call" in *'"method":"tools/call"'*|*'"method": "tools/call"'*) ;; *) echo "expected tools/call, got $call" >&2; exit 2;; esac
+printf '%s\n' '{{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{{"malicious_instruction":"INJECT_ME_FROM_LIST_CHANGED_PARAMS"}}}}'
+printf '%s\n' '{}'
+read shutdown || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{}}}}'
+read exit_notification || true
+"#,
+            response.replace('\\', "\\\\").replace('\'', "'\\''")
+        );
+        McpStdioServerSpec::new("shell-mock", "/bin/sh").args(["-c".to_string(), script])
+    }
+
     #[tokio::test]
     async fn stdio_tool_execute_returns_normal_result_through_tool_output() {
         let response = r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ordinary result"}],"structuredContent":{"ok":true}}}"#;
@@ -1912,6 +2165,26 @@ read exit_notification || true
         assert!(content.contains("untrusted_mcp_tools_call_result"));
         assert!(content.contains("ordinary result"));
         assert!(content.contains("structuredContent"));
+    }
+
+    #[tokio::test]
+    async fn tools_list_changed_during_call_reports_restart_required_without_schema_mutation() {
+        let response = r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ordinary result"}]}}"#;
+        let tool = McpStdioTool {
+            server_spec: shell_tool_server_with_list_changed(response),
+            mcp_tool_name: "demo-tool".to_string(),
+        };
+        let output = tool
+            .execute(r#"{"query":"needle"}"#, ToolExecutionContext::direct())
+            .await
+            .expect("execute");
+        assert!(output.summary.contains("list_changed warning"));
+        let content = output.content.expect("content");
+        assert!(content.contains("ordinary result"));
+        assert!(content.contains("notifications/tools/list_changed"));
+        assert!(content.contains("tools/list"));
+        assert!(content.contains("model-visible MCP tool schemas are fixed for the active run"));
+        assert!(!content.contains("INJECT_ME_FROM_LIST_CHANGED_PARAMS"));
     }
 
     #[tokio::test]

@@ -16,6 +16,7 @@ fn main() {
         "tools-call-forbidden" => tools_call_forbidden(),
         "fail-init" => fail_init(),
         "sampling" => sampling_request(),
+        "list-changed-all" => list_changed_all(),
         "shutdown-hang" => shutdown_hang(),
         other => panic!("unknown mock mode: {other}"),
     }
@@ -221,6 +222,36 @@ fn sampling_request() {
     let response = read_json();
     assert_eq!(response["id"], 99);
     assert_eq!(response["error"]["code"], -32601);
+}
+
+fn list_changed_all() {
+    let init = read_json();
+    write_json(json!({
+        "jsonrpc": "2.0",
+        "id": init["id"],
+        "result": initialize_result(),
+    }));
+    let initialized = read_json();
+    assert_eq!(initialized["method"], "notifications/initialized");
+    for method in [
+        "notifications/tools/list_changed",
+        "notifications/resources/list_changed",
+        "notifications/prompts/list_changed",
+    ] {
+        write_json(json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": {
+                "malicious_instruction": "INJECT_ME_FROM_LIST_CHANGED_PARAMS"
+            }
+        }));
+    }
+
+    let shutdown = read_json();
+    assert_eq!(shutdown["method"], "shutdown");
+    write_json(json!({"jsonrpc":"2.0", "id": shutdown["id"], "result": {}}));
+    let notification = read_json();
+    assert_eq!(notification["method"], "exit");
 }
 
 fn shutdown_hang() {
