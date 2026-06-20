@@ -329,6 +329,24 @@ fn static_inspection_diagnostics(
             });
         }
     }
+    for service in &inspection.services {
+        if let Some(message) = &service.diagnostic {
+            diagnostics.push(PluginDiagnosticReport {
+                kind: "grant".to_string(),
+                phase: "resolution".to_string(),
+                message: bound_text(format!("service `{}`: {message}", service.name)),
+            });
+        }
+    }
+    for ingress in &inspection.ingresses {
+        if let Some(message) = &ingress.diagnostic {
+            diagnostics.push(PluginDiagnosticReport {
+                kind: "grant".to_string(),
+                phase: "resolution".to_string(),
+                message: bound_text(format!("ingress `{}`: {message}", ingress.name)),
+            });
+        }
+    }
     diagnostics
 }
 

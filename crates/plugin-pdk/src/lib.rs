@@ -38,6 +38,8 @@ use serde_json::Value;
 
 pub use wit_bindgen;
 
+pub type Result<T> = std::result::Result<T, ToolError>;
+
 /// Current Yoi Component Model Tool world targeted by this PDK.
 pub const TOOL_WORLD: &str = "yoi:plugin/tool@1.0.0";
 
@@ -98,7 +100,10 @@ impl ToolOutput {
     }
 
     /// Create a Tool output whose content is typed JSON.
-    pub fn json(summary: impl Into<String>, value: impl Serialize) -> Result<Self, ToolError> {
+    pub fn json(
+        summary: impl Into<String>,
+        value: impl Serialize,
+    ) -> std::result::Result<Self, ToolError> {
         let content = serde_json::to_string(&value).map_err(ToolError::serialization)?;
         let output = Self {
             summary: normalize_summary(summary.into()),
@@ -292,7 +297,7 @@ impl ToolError {
 }
 
 /// Parse the WIT `input-json` string into a typed input value.
-pub fn parse_json_input<T>(input_json: &str) -> Result<T, ToolError>
+pub fn parse_json_input<T>(input_json: &str) -> std::result::Result<T, ToolError>
 where
     T: DeserializeOwned,
 {
@@ -311,7 +316,7 @@ where
 pub fn run_json_tool<I, F>(tool_name: &str, input_json: &str, handler: F) -> String
 where
     I: DeserializeOwned,
-    F: FnOnce(ToolContext, I) -> Result<ToolOutput, ToolError>,
+    F: FnOnce(ToolContext, I) -> std::result::Result<ToolOutput, ToolError>,
 {
     let result = parse_json_input::<I>(input_json).and_then(|input| {
         let context = ToolContext::new(tool_name);
@@ -473,4 +478,170 @@ mod tests {
         assert!(HOST_WIT.contains("interface fs"));
         assert!(HOST_WIT.contains("%list: func"));
     }
+}
+
+/// Versioned Component Model instance world handled by the host-managed
+/// PluginInstanceRegistry.
+pub const PLUGIN_INSTANCE_WORLD: &str = "yoi:plugin/instance@1.0.0";
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PluginIngressEvent {
+    pub kind: String,
+    pub source: String,
+    #[serde(default)]
+    pub payload: Value,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PluginStatus {
+    pub state: String,
+    #[serde(default)]
+    pub data: Value,
+}
+
+impl PluginStatus {
+    pub fn ready(data: Value) -> Self {
+        Self {
+            state: "ready".to_string(),
+            data,
+        }
+    }
+
+    pub fn stopped() -> Self {
+        Self {
+            state: "stopped".to_string(),
+            data: Value::Null,
+        }
+    }
+}
+
+/// Rust-facing instance Plugin contract. Hosts call `start` once, then route
+/// Tool/Ingress surfaces through the same mutable instance.
+pub trait Plugin: Sized + 'static {
+    fn start(config: Value) -> Result<Self>;
+    fn handle_tool(&mut self, name: &str, input: Value) -> Result<ToolOutput>;
+    fn handle_ingress(&mut self, name: &str, event: PluginIngressEvent) -> Result<Value>;
+    fn status(&self) -> Result<PluginStatus> {
+        Ok(PluginStatus::ready(Value::Null))
+    }
+    fn stop(&mut self) -> Result<PluginStatus> {
+        Ok(PluginStatus::stopped())
+    }
+}
+
+#[doc(hidden)]
+pub fn plugin_instance_error(message: impl Into<String>) -> String {
+    serde_json::json!({ "error": message.into() }).to_string()
+}
+
+/// Export the simple string-json instance ABI used by
+/// `yoi:plugin/instance@1.0.0`.
+#[macro_export]
+macro_rules! export_plugin_instance {
+    ($plugin:ty) => {
+        mod __yoi_plugin_instance_export {
+            use super::*;
+            use std::cell::RefCell;
+
+            thread_local! {
+                static INSTANCE: RefCell<Option<$plugin>> = const { RefCell::new(None) };
+            }
+
+            #[unsafe(export_name = "start")]
+            pub extern "C" fn __yoi_start(
+                _config_json_ptr: *const u8,
+                _config_json_len: usize,
+            ) -> usize {
+                // This low-level symbol is a placeholder for non-component raw builds.
+                // Component builds should bind this macro through generated WIT glue.
+                0
+            }
+
+            pub struct InstanceGuest;
+
+            impl InstanceGuest {
+                pub fn start(config_json: String) -> String {
+                    let config =
+                        serde_json::from_str(&config_json).unwrap_or(serde_json::Value::Null);
+                    match <$plugin as $crate::Plugin>::start(config) {
+                        Ok(plugin) => {
+                            INSTANCE.with(|slot| *slot.borrow_mut() = Some(plugin));
+                            serde_json::to_string(&$crate::PluginStatus::ready(
+                                serde_json::Value::Null,
+                            ))
+                            .unwrap()
+                        }
+                        Err(error) => $crate::plugin_instance_error(error.to_string()),
+                    }
+                }
+
+                pub fn handle_tool(name: String, input_json: String) -> String {
+                    let input =
+                        serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
+                    INSTANCE.with(|slot| {
+                        let mut slot = slot.borrow_mut();
+                        let Some(plugin) = slot.as_mut() else {
+                            return $crate::plugin_instance_error(
+                                "plugin instance has not been started",
+                            );
+                        };
+                        match plugin.handle_tool(&name, input) {
+                            Ok(output) => serde_json::to_string(&output).unwrap(),
+                            Err(error) => $crate::plugin_instance_error(error.to_string()),
+                        }
+                    })
+                }
+
+                pub fn handle_ingress(name: String, event_json: String) -> String {
+                    let event =
+                        match serde_json::from_str::<$crate::PluginIngressEvent>(&event_json) {
+                            Ok(event) => event,
+                            Err(error) => return $crate::plugin_instance_error(error.to_string()),
+                        };
+                    INSTANCE.with(|slot| {
+                        let mut slot = slot.borrow_mut();
+                        let Some(plugin) = slot.as_mut() else {
+                            return $crate::plugin_instance_error(
+                                "plugin instance has not been started",
+                            );
+                        };
+                        match plugin.handle_ingress(&name, event) {
+                            Ok(output) => serde_json::to_string(&output).unwrap(),
+                            Err(error) => $crate::plugin_instance_error(error.to_string()),
+                        }
+                    })
+                }
+
+                pub fn status() -> String {
+                    INSTANCE.with(|slot| {
+                        let slot = slot.borrow();
+                        let Some(plugin) = slot.as_ref() else {
+                            return $crate::plugin_instance_error(
+                                "plugin instance has not been started",
+                            );
+                        };
+                        match plugin.status() {
+                            Ok(status) => serde_json::to_string(&status).unwrap(),
+                            Err(error) => $crate::plugin_instance_error(error.to_string()),
+                        }
+                    })
+                }
+
+                pub fn stop() -> String {
+                    INSTANCE.with(|slot| {
+                        let mut slot = slot.borrow_mut();
+                        let Some(plugin) = slot.as_mut() else {
+                            return $crate::plugin_instance_error(
+                                "plugin instance has not been started",
+                            );
+                        };
+                        match plugin.stop() {
+                            Ok(status) => serde_json::to_string(&status).unwrap(),
+                            Err(error) => $crate::plugin_instance_error(error.to_string()),
+                        }
+                    })
+                }
+            }
+        }
+    };
 }
