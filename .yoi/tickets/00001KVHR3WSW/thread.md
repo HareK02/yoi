@@ -107,3 +107,52 @@ Next action:
 - Wait for Coder implementation report, then inspect branch diff/validation evidence and route to Reviewer。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T10:26:13Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVHR3WSW`.
+
+Implementation commit:
+- `e33dee19 mcp: handle list changed notifications`
+
+Changed areas reported:
+- `crates/mcp/src/stdio.rs`:
+  - Records bounded `notifications/tools/list_changed`, `notifications/resources/list_changed`, and `notifications/prompts/list_changed` state。
+  - Ignores notification params entirely so notifications cannot inject prompt/resource content or hidden context。
+  - Exposes snapshot/clear APIs for safe-boundary refresh decisions。
+- `crates/pod/src/feature/mcp.rs`:
+  - During startup tool discovery, refreshes `tools/list` once if `tools/list_changed` is observed before registration。
+  - If list changes continue during refresh, emits a restart-required diagnostic and does not mutate active-run tool schema after registration。
+  - During MCP tool/resource/prompt operations, appends bounded warnings to explicit tool output when list_changed is observed。
+  - Preserves explicit operations for `tools/call`, `resources/list/read`, and `prompts/list/get`; no notification-driven content injection。
+- Tests:
+  - Added stdio notification state coverage for tools/resources/prompts。
+  - Added provider/runtime tests for safe-boundary tool refresh, restart-required fallback, and resource/prompt warning behavior without leaking notification params。
+
+Coder validation reported:
+- `cargo test -p mcp list_changed -- --nocapture`: passed。
+- `cargo test -p pod mcp::tests:: -- --nocapture`: passed。
+- `cargo check --workspace`: passed。
+- `cargo test -p mcp`: passed。
+- `cargo test -p pod mcp::tests::`: passed。
+- `cargo fmt --all -- --check`: passed。
+- `git diff --check`: passed。
+- `nix build .#yoi --no-link`: passed; dirty-tree warning expected before commit。
+
+Known risks / deferrals:
+- Live mutation of already-presented model-visible MCP tool schemas is intentionally not implemented。
+- Continued `tools/list_changed` after one startup safe-boundary refresh produces bounded restart-required diagnostic。
+- Resource/prompt list refresh remains explicit via existing MCP list/read/get tools on later turns; notifications alone do not inject or fetch content。
+
+Orchestrator evidence checked before review dispatch:
+- Implementation worktree is clean。
+- HEAD is `e33dee19`。
+- Diff from acceptance `d31b8907..HEAD` is one implementation commit touching 4 files, about 459 insertions / 9 deletions。
+- `git diff --check d31b8907..HEAD` produced no diagnostics。
+
+Next action:
+- Dispatch Reviewer for r1 review against Ticket requirements, with focus on current-run schema/history invariants, safe-boundary refresh policy, bounded diagnostics, no hidden prompt/resource injection, tools/resources/prompts notification coverage, and tests。
+
+---
