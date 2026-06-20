@@ -204,3 +204,42 @@ Reviewer validation:
 - `git status --short`: clean。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T12:19:49Z -->
+
+## Implementation report
+
+Merge and final validation report:
+
+Merged implementation branch into Orchestrator branch:
+- Merge commit: `f62ed4db merge: intake investigation gate`
+- Implementation commit included:
+  - `1143ae1c workflow: add intake investigation gate`
+
+Reviewer outcome:
+- r1 approved with no blocking issues。
+- Reviewer confirmed Intake non-scheduler boundary, user agreement before official Ticket creation, pre-`TicketCreate` investigation conditions, draft / `spike_needed` / `requirements_sync_needed` stop behavior, claims/facts/hypotheses/open questions separation, bundled/workspace workflow boundary, stale vocabulary removal, and prompt/workflow-only change scope。
+
+Orchestrator validation after merge passed:
+- `git diff --check HEAD^1..HEAD`
+- grep confirmed no `Action required` / `Attention required` in touched prompt/workflow files。
+- grep confirmed expected investigation-gate vocabulary in touched files。
+- `TicketDoctor`: 0 errors, 4 existing warnings unrelated to this Ticket。
+
+Validation log:
+- inline Bash output and TicketDoctor tool output。
+
+Final state:
+- Orchestrator worktree clean at `f62ed4db` after validation。
+- Implementation worktree remains available for cleanup after Ticket completion records are committed。
+- WebFetch PDF Coder continues in parallel。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-20T12:19:57Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Implementation was merged into Orchestrator branch at `f62ed4db`, review approved, and final Orchestrator validation passed: `git diff --check HEAD^1..HEAD`, stale vocabulary grep, investigation-gate vocabulary grep, and `TicketDoctor` with 0 errors.
+
+---
