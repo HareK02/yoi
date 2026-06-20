@@ -264,3 +264,40 @@ Next action:
 - Route back to Reviewer for r2 verification of duplicate/collision fail-closed behavior and final acceptance criteria。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVHR3WS6-r1 at: 2026-06-20T08:44:25Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket contract / Orchestrator IntentPacket。
+- Fix diff: `66fa9d55..0080c5b3`。
+- Overall diff: `a59e5c1e..0080c5b3`。
+- 主な対象: `crates/pod/src/feature/mcp.rs`、MCP registration boundaries、ToolRegistry contribution path、no `tools/call` / no resources/prompts、bounded `tools/list` pagination、metadata/schema/name normalization、discovery-only stub behavior、Cargo/Nix changes。
+
+Previous blocker verification:
+- `normalize_listed_tools` は valid candidates を先に構築し、normalized namespaced name を count するようになった。
+- count > 1 の names には bounded duplicate diagnostic を出す。
+- 登録されるのは normalized name が exactly once の candidate のみ。
+- Updated test `duplicate_names_after_normalization_are_not_model_visible` は、`search-files` / `search files` の collision が `Mcp_demo_search_files` を model-visible にしないこと、および unrelated valid `Mcp_demo_unique` は register されることを確認している。
+- これにより duplicate/colliding MCP tool names が fail-closed になるという Ticket requirement を満たしている。
+
+Blocking issues: none。
+
+Non-blocking follow-up:
+- 複数 configured MCP servers 間の sanitized server namespace collision について、将来 explicit coverage を追加してもよいが、この Ticket の discovered-tool name collision acceptance path では blocker ではない。
+
+Reviewer validation:
+- `cargo fmt --check`: passed。
+- `git diff --check a59e5c1e..HEAD`: passed。
+- `cargo test -p mcp list_tools --test stdio_lifecycle`: passed, 3 tests。
+- `cargo test -p pod feature::mcp --lib`: passed, 5 tests。
+- `cargo test -p mcp`: passed, 8 tests。
+- `cargo check -p pod -p mcp`: passed。
+- `nix build .#yoi --no-link`: passed。
+
+Worktree status at review end: clean。
+
+---
