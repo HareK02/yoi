@@ -177,3 +177,16 @@ Next action:
 - Dispatch Reviewer for r1 review against Ticket requirements, with focus on instance registry boundary, legacy compatibility, ToolRegistry run-stability, no hidden context/action paths, per-surface grants, Service/Ingress lifecycle semantics, static inspection/CLI reporting, WIT/PDK/template correctness, bounds/resource limits, and validation evidence。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-20T14:17:31Z -->
+
+## Plan
+
+Review dispatch:
+- Spawned Reviewer Pod `yoi-reviewer-00001KVJHYP4Q-r1` against implementation branch `impl/00001KVJHYP4Q-plugin-instance-lifecycle`。
+- Review target commit: `147a6005 plugin: add instance lifecycle surface`。
+- Review baseline: `5ec8bae9`。
+- Reviewer task focuses on instance registry boundary, legacy Tool compatibility, ordinary Tool result/history path, Service/Ingress no hidden action/context paths, ToolRegistry run-stability, per-surface and host API grant independence, no ambient WASI/network authority, bounded ingress/events/diagnostics, static inspection no-exec behavior, WIT/PDK/template coherence, tests, and Nix/package evidence。
+- Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
+
+---
