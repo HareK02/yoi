@@ -2,7 +2,7 @@
 title: 'Profile launch should preserve override scope allowances'
 state: 'inprogress'
 created_at: '2026-06-20T10:48:57Z'
-updated_at: '2026-06-20T11:53:45Z'
+updated_at: '2026-06-20T11:54:59Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-20T11:52:33Z'
