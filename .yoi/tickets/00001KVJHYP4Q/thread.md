@@ -190,3 +190,64 @@ Review dispatch:
 - Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVJHYP4Q-r1 at: 2026-06-20T14:24:40Z status: request_changes -->
+
+## Review: request changes
+
+Verdict: `request_changes`
+
+確認範囲:
+- Ticket contract / Orchestrator IntentPacket。
+- Implementation diff: `5ec8bae9..147a6005`。
+- 主な対象:
+  - `crates/pod/src/feature/plugin.rs`
+  - `crates/manifest/src/plugin.rs`
+  - `crates/yoi/src/plugin_cli.rs`
+  - `crates/plugin-pdk/src/lib.rs`
+  - `resources/plugin/wit/yoi-plugin-instance-v1.wit`
+  - `resources/plugin/templates/rust-component-instance/*`
+  - Plugin component docs/templates and focused tests。
+- Hidden history/context injection、ToolRegistry bypass、Ingress/Service production call path、ambient WASI/network authority の有無を確認。
+
+Blocking issues:
+
+1. Rust instance PDK/template が buildable ではなく、WIT component instance ABI を実際に export していない。
+   - `resources/plugin/templates/rust-component-instance/Cargo.toml` は repository 配下 package だが `[workspace]` がなく、direct authoring check が workspace membership error で失敗する。
+   - `resources/plugin/templates/rust-component-instance/src/lib.rs` は `ToolOutput::text(...)` を呼ぶが、`crates/plugin-pdk/src/lib.rs` には `ToolOutput::new`, `ToolOutput::json`, `ToolOutput::summary` しかない。
+   - `export_plugin_instance!` は generated WIT bindings / generated `export!` macro for `world instance` を実装していない。raw placeholder `#[unsafe(export_name = "start")]` と private Rust methods を定義するだけで、host が期待する component-model exports (`start`, `handle-tool`, `handle-ingress`, `status`, `stop`) を生成しない。
+   - Ticket が要求する WIT/PDK/template coherence と instance-oriented authoring surface を満たしていない。
+
+2. Component instance lifecycle が status/error outputs を parse せず、component `status` export が実質 unused。
+   - `PluginInstance::status` は host-side lifecycle/diagnostics のみを返し、component runtime の `status` export を呼ばない。
+   - `PluginComponentInstanceRuntime::start` は component `start` export の returned string を捨てている。
+   - `PluginComponentInstanceRuntime::stop` も returned string を捨てている。
+   - WIT は `status` を export しているが、host-side runtime method がない。
+   - Component が `{"error": ...}` を `start` から返しても host が started と扱い得るため、lifecycle/status/diagnostics acceptance criteria を満たしていない。
+
+3. Service/Ingress surfaces が Tool 登録なしでは host-managed Plugin instance を作成・保持しない。
+   - `PluginToolFeature::install` の実 install path では Service declarations は metadata only、Ingress declarations は authorization-check only。
+   - Instance は Tool registration loop 内でのみ作られる。
+   - Service-only / Ingress-only instance-capable plugin は host-managed instance、lifecycle start、status、diagnostics、retained ingress dispatch handle を得られない。
+   - `deliver_ingress` は production caller に接続されておらず、focused ingress test は synthetic `TestIngress` instance を使っている。
+   - Ticket intent の “Tool / Service / Ingress as surfaces of the same Plugin instance” を満たしていない。
+
+Non-blocking concerns / follow-ups:
+- Human `yoi plugin show` output でも Service/Ingress eligibility を明示すると JSON なしでも rejected surfaces が分かりやすい。
+- Real instance-component tests が弱い。Rust/PDK generated `yoi:plugin/instance@1.0.0` component の build/execution through start/tool/ingress/status/stop coverage が欲しい。
+
+Reviewer validation:
+- `git diff --check 5ec8bae9..HEAD`: passed。
+- `cargo fmt --check`: passed。
+- `cargo test -p manifest plugin -- --nocapture`: passed。
+- `cargo test -p pod plugin -- --nocapture`: passed。
+- `cargo test -p yoi plugin -- --nocapture`: passed。
+- `cargo check -p yoi`: passed。
+- `cargo check -p yoi-plugin-pdk`: passed。
+- `yoi ticket doctor`: passed。
+- `nix build .#yoi --no-link`: passed。
+- Additional focused template validation failed: `CARGO_TARGET_DIR=target/review-template cargo check --manifest-path resources/plugin/templates/rust-component-instance/Cargo.toml` with workspace membership error。
+
+Worktree status at review end: clean。
+
+---
