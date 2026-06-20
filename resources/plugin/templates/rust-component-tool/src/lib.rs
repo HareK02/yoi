@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
+use yoi_plugin_pdk::wit_bindgen;
 use yoi_plugin_pdk::{ToolContext, ToolError, ToolOutput};
 
-yoi_plugin_pdk::wit_bindgen::generate!({
+wit_bindgen::generate!({
     world: "tool",
     path: "../../../../resources/plugin/wit",
+    generate_all,
+    runtime_path: "yoi_plugin_pdk::wit_bindgen::rt",
 });
 
 #[derive(Debug, Deserialize)]

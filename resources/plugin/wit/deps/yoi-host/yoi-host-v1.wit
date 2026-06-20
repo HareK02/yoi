@@ -10,6 +10,6 @@ interface https {
 /// Grant-bound filesystem host API. No ambient WASI filesystem is exposed.
 interface fs {
   read: func(request-json: string) -> string;
-  list: func(request-json: string) -> string;
+  %list: func(request-json: string) -> string;
   write: func(request-json: string) -> string;
 }

@@ -14,7 +14,7 @@ The PDK is guest-side only. It does not grant filesystem, network, or environmen
 
 ## Checkout/development dependency
 
-Inside the Yoi checkout this template uses a local path dependency:
+Inside the Yoi checkout this template uses a local path dependency and declares an empty `[workspace]` so it can be checked in place without becoming a member of Yoi's root workspace:
 
 ```toml
 yoi-plugin-pdk = { path = "../../../../crates/plugin-pdk" }

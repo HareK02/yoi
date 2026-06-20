@@ -10,9 +10,13 @@
 //! [`export_component_tool!`] macro:
 //!
 //! ```ignore
-//! yoi_plugin_pdk::wit_bindgen::generate!({
+//! use yoi_plugin_pdk::wit_bindgen;
+//!
+//! wit_bindgen::generate!({
 //!     world: "tool",
 //!     path: "../../../../resources/plugin/wit",
+//!     generate_all,
+//!     runtime_path: "yoi_plugin_pdk::wit_bindgen::rt",
 //! });
 //!
 //! fn echo(
@@ -42,7 +46,8 @@ pub const TOOL_WORLD: &str = "yoi:plugin/tool@1.0.0";
 pub const TOOL_WIT: &str = include_str!("../../../resources/plugin/wit/yoi-plugin-tool-v1.wit");
 
 /// Repository WIT for the grant-bound host APIs importable by Tool components.
-pub const HOST_WIT: &str = include_str!("../../../resources/plugin/wit/yoi-host-v1.wit");
+pub const HOST_WIT: &str =
+    include_str!("../../../resources/plugin/wit/deps/yoi-host/yoi-host-v1.wit");
 
 /// Maximum serialized ToolOutput JSON accepted by Yoi's current Plugin runtime.
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024;
@@ -321,9 +326,11 @@ where
 /// Implement the generated Component Model `Guest` trait for a typed JSON
 /// handler and export it with the `wit-bindgen` generated `export!` macro.
 ///
-/// The caller must invoke `yoi_plugin_pdk::wit_bindgen::generate!` for the
-/// `tool` world first, which defines the `Guest` trait and `export!` macro in
-/// the current module. The generated component still imports only WIT-declared
+/// The caller must import the PDK's `wit_bindgen` re-export and invoke
+/// `wit_bindgen::generate!` for the `tool` world first, with
+/// `runtime_path: "yoi_plugin_pdk::wit_bindgen::rt"`. That defines the
+/// `Guest` trait and `export!` macro in the current module. The generated
+/// component still imports only WIT-declared
 /// host APIs; this macro does not grant filesystem, network, or environment
 /// authority.
 #[macro_export]
@@ -464,5 +471,6 @@ mod tests {
         assert_eq!(TOOL_WORLD, "yoi:plugin/tool@1.0.0");
         assert!(HOST_WIT.contains("interface https"));
         assert!(HOST_WIT.contains("interface fs"));
+        assert!(HOST_WIT.contains("%list: func"));
     }
 }

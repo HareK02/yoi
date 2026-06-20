@@ -5,6 +5,10 @@ edition = "2024"
 license = "MIT"
 publish = false
 
+# Keep the embedded template checkable in-place without making it a member of
+# Yoi's root workspace. A copied starter remains a normal standalone package.
+[workspace]
+
 [lib]
 crate-type = ["cdylib"]
 
