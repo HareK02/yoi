@@ -179,3 +179,62 @@ Review dispatch:
 - Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVHR3WSN-r1 at: 2026-06-20T10:03:26Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket contract / Orchestrator IntentPacket。
+- Implementation diff: `b2b4764f..3a22360a`。
+- 変更 source files:
+  - `crates/mcp/src/stdio.rs`
+  - `crates/pod/src/feature/mcp.rs`
+- Focus: explicit tool exposure、capability-gated registration、ordinary `ToolOutput` execution、untrusted/bounded serialization、pagination behavior、diagnostics、hidden context injection / sampling / elicitation / `list_changed` scope creep absence。
+
+Blocking issues: none。
+
+Approval evidence:
+- `crates/mcp/src/stdio.rs` に resources/prompts protocol structs and request helpers が追加されている。
+  - `ListResourcesResult`, `ReadResourceRequest`, `ReadResourceResult`
+  - `ListPromptsResult`, `GetPromptRequest`, `GetPromptResult`
+  - `McpPromptMessage` and resource/prompt metadata fields。
+- `McpStdioClient` exposes explicit request methods only:
+  - `list_resources_page` -> `resources/list`
+  - `read_resource` -> `resources/read`
+  - `list_prompts_page` -> `prompts/list`
+  - `get_prompt` -> `prompts/get`
+- Registration is capability-gated:
+  - `resources` capability registers only `Mcp_<server>_resources_list` and `Mcp_<server>_resources_read`。
+  - `prompts` capability registers only `Mcp_<server>_prompts_list` and `Mcp_<server>_prompts_get`。
+  - Existing `tools/list` discovery is also gated by advertised `tools` capability。
+- Resource/prompt operations are ordinary `Tool` implementations:
+  - `McpStdioProviderOperationTool` implements `Tool::execute`。
+  - Results are returned as `ToolOutput { summary, content }`。
+  - No new `SystemItem`, hidden history append, hidden user/system message append, or direct context injection path found。
+- Returned content is serialized as JSON-ish untrusted data with explicit marker fields:
+  - `untrusted_mcp_resources_list_result`
+  - `untrusted_mcp_resources_read_result`
+  - `untrusted_mcp_prompts_list_result`
+  - `untrusted_mcp_prompts_get_result`
+- Bounds are applied to list items, resource content count, prompt message count, text fields, `_meta`, extra/structured JSON depth/node count, rich image/audio blob omitted-data markers, and final rendered content bytes。
+- Stdio reader remains fail-closed for unsupported server-to-client requests; no sampling, elicitation, or `list_changed` refresh was added。
+- Tests cover operation namespacing, capability-gated registration without `tools`, resource list/read happy paths, prompt list/get happy paths, untrusted/bounded output, and existing MCP tool execution result serialization/bounds。
+
+Non-blocking follow-ups:
+- “no context injection” は operation tool path / `ToolOutput` content unit testsで確認されており、E2E history inspection ではない。E2E 未設計の現状では許容だが、将来 MCP/history integration test があるとよい。
+- Shutdown-warning text は result serialization 後に append される。`bounded_diagnostic` では bounded だが、厳密に post-append final content <= max result output bytes を要求するなら follow-up で final re-bound を追加してもよい。
+
+Reviewer validation:
+- `git diff --check b2b4764f..HEAD`: passed。
+- `cargo fmt --all --check`: passed。
+- `cargo test -p pod mcp::tests`: passed, 13 tests。
+- `cargo test -p mcp`: passed, 12 tests。
+- `cargo check -p pod -p mcp`: passed。
+- `nix build .#yoi --no-link`: passed。
+
+Worktree status at review end: clean。
+
+---
