@@ -172,3 +172,56 @@ Review dispatch:
 - Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVJKHAFE-r1 at: 2026-06-20T13:54:05Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket contract / Orchestrator IntentPacket。
+- Implementation diff: `12d7e69f..c91f5fc9`。
+- 主な対象:
+  - `crates/yoi/src/mcp_cli.rs`
+  - `crates/yoi/src/main.rs`
+- MCP CLI path の process spawn / MCP client / tool-call / resource-read / prompt-get behavior を検索。
+- `crates/yoi/src/main.rs` の merge conflict risk も確認。
+
+Blocking issues: none。
+
+Approval evidence:
+- MCP CLI は static/read-only に留まっている。
+  - `mcp_cli.rs` は manifest/profile config types を使い、MCP runtime/client path を import していない。
+  - `inspect_static_config` は Profile/config を resolve して static-only diagnostics を report し、stdio lifecycle/client API を呼ばない。
+  - CLI implementation から `std::process::Command`, `Command::new`, `spawn`, MCP lifecycle/client calls, ToolRegistry calls, `tools/call` path は見つからない。
+- Resource/prompt content fetch はない。
+  - `resources/read` / `prompts/get` は operation label / stable name としてだけ出ており、`registration_status: "not_live"`, `content_state: "not_fetched"` を返す。
+- Static vs live state is explicit。
+  - JSON includes `inspection_mode` booleans: `starts_servers: false`, `calls_tools: false`, `fetches_resource_or_prompt_content: false`。
+  - Reports include `live_state.status = "not_live"`; human output says `live: not live / unavailable`。
+- Secrets/args are redacted。
+  - stdio args are summarized as `arg_count` plus `args_redacted: true`。
+  - env config is summarized by counts/kinds with `values_redacted: true`; env literal values, secret refs, and env refs are not emitted。
+  - Tests cover non-leakage for arg secret, literal env value, secret ref, and env ref。
+- MCP namespace remains separate。
+  - `main.rs` adds distinct top-level `mcp` parser/dispatcher path; Plugin CLI is not mixed beyond adjacency in top-level help/parsing。
+- Top-level `yoi --help` shows MCP namespace and commands。
+
+Non-blocking concerns / follow-ups:
+- Implementation is intentionally static-only. It does not surface real live provider-discovered tools/resources/prompts or live `notifications/*/list_changed` restart/reinitialize diagnostics. It clearly reports unavailable/not live, which matches this implementation boundary; future live-state inspection can extend it。
+- `yoi mcp --help` / subcommand help may flow through `ParseError` and error exit rather than normal help exit. Top-level `yoi --help` satisfies the stated acceptance criterion, so this is not blocking。
+
+Reviewer validation:
+- `cargo fmt --check`: passed。
+- `git diff --check 12d7e69f..HEAD`: passed。
+- `cargo test -p yoi mcp`: passed, 8 tests。
+- `cargo check -p yoi`: passed。
+- `cargo run -p yoi -- --help`: passed; output includes `yoi mcp list`, `show`, and `tools|resources|prompts`。
+- `cargo run -p yoi -- ticket doctor`: passed, `doctor: ok`。
+- Conflict-risk check: `main.rs` merge risk low; trivial merge check produced no conflict markers。
+- `nix build .#yoi --no-link` not run because no package/source-filter concern was found。
+
+Worktree status at review end: source tree clean; ignored `target/` only。
+
+---
