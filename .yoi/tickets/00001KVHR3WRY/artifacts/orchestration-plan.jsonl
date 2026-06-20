@@ -1,0 +1,1 @@
+{"id":"orch-plan-20260620-060022-1","ticket_id":"00001KVHR3WRY","kind":"blocked_by","related_ticket":"00001KVHR3WRF","note":"Lifecycle client requires explicit local stdio MCP config/trust policy. `00001KVHR3WRF` is queued and not yet implemented; leave this Ticket queued until that dependency is closed.","author":"yoi-orchestrator","at":"2026-06-20T06:00:22Z"}
