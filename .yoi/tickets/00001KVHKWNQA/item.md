@@ -1,8 +1,8 @@
 ---
 title: 'Plugin: add Rust PDK and embedded authoring templates for Component Model Tools'
-state: 'inprogress'
+state: 'done'
 created_at: '2026-06-20T04:16:14Z'
-updated_at: '2026-06-20T05:47:13Z'
+updated_at: '2026-06-20T05:51:42Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['plugin', 'pdk', 'component-model', 'authoring', 'templates', 'sdk', 'no-crates-io']

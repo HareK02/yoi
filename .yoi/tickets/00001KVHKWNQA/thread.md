@@ -327,3 +327,54 @@ Reviewer validation:
 Worktree status at review end: source tree clean; ignored artifacts under normal `target/` only。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T05:51:33Z -->
+
+## Implementation report
+
+Merge and final validation report:
+
+Merged implementation branch into Orchestrator branch:
+- Merge commit: `edc53a6b merge: plugin rust pdk templates`
+- Implementation commits included:
+  - `06287aca plugin: add rust pdk template`
+  - `0a9e585c plugin: fix rust pdk wit template probes`
+
+Reviewer outcome:
+- r1 requested changes for WIT parse failure (`list` keyword) and embedded template Cargo workspace check failure。
+- Coder fixed WIT package layout / `%list` escaping, added actual `wit_bindgen::generate!` probe, and made the embedded template standalone-checkable。
+- r2 approved with no blocking issues。
+
+Orchestrator validation after merge passed:
+- `cargo fmt --check`
+- `git diff --check HEAD^1..HEAD`
+- `cargo test -p yoi-plugin-pdk`
+- `cargo test -p manifest embedded_rust_component_tool_template_is_valid_package_shape`
+- `cargo test -p pod pdk_tool_output_shape_is_accepted_by_wasm_decoder`
+- `cargo check`
+- `cargo tree -p yoi-plugin-pdk --edges normal`
+- `cargo check --manifest-path resources/plugin/templates/rust-component-tool/Cargo.toml --target wasm32-unknown-unknown`
+- `nix build .#yoi --no-link`
+
+Validation log:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/bash-o9gvGb.log`
+
+Package impact:
+- `nix path-info -S .#yoi`: `112156384`
+
+Cleanup note:
+- Direct template cargo-check creates local `resources/plugin/templates/rust-component-tool/Cargo.lock` and `target/`; Orchestrator removed those untracked artifacts after validation. Worktree is clean。
+
+Final state:
+- Orchestrator worktree clean at `edc53a6b` after validation。
+- Implementation worktree remains available for cleanup after Ticket completion records are committed。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-20T05:51:42Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Implementation was merged into Orchestrator branch at `edc53a6b`, r2 review approved, and final Orchestrator validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, focused PDK/manifest/pod tests, `cargo check`, PDK dependency tree check, embedded template wasm32 check, and `nix build .#yoi --no-link`.
+
+---
