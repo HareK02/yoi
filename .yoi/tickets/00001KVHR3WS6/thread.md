@@ -108,3 +108,51 @@ Next action:
 - Wait for Coder implementation report, then inspect branch diff/validation evidence and route to Reviewer。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T08:29:21Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVHR3WS6`.
+
+Implementation commit:
+- `66fa9d55 mcp: register stdio server tools`
+
+Changed areas reported:
+- `crates/mcp`:
+  - Added MCP `tools/list` protocol result/tool types。
+  - Added `list_tools_page` and bounded paginated `list_tools_bounded`。
+  - Added mock-server coverage for paginated `tools/list` and assertion that `tools/call` is not sent。
+- `crates/pod`:
+  - Added MCP stdio discovery feature module。
+  - Resolves configured stdio servers, initializes them, calls bounded `tools/list`, normalizes discovered tools, and registers them through existing protocol-provider / ToolRegistry contribution paths。
+  - Namespaces tools as stable names like `Mcp_<server>_<tool>`。
+  - Rejects invalid schemas and duplicate normalized names with bounded diagnostics。
+  - Ignores untrusted MCP metadata/annotations/instructions for authority purposes。
+  - Registered tools are discovery-only and return explicit not-implemented error if invoked; no MCP `tools/call` execution is implemented in this Ticket。
+- `package.nix` / `Cargo.lock`: updated for new `pod -> mcp` dependency and refreshed `cargoHash`。
+
+Coder validation reported:
+- `cargo test -p mcp list_tools --test stdio_lifecycle`
+- `cargo test -p pod feature::mcp --lib`
+- `cargo test -p mcp`
+- `cargo fmt --check`
+- `cargo check -p pod -p mcp`
+- `git diff --check`
+- `nix build .#yoi --no-link` after refreshing stale `cargoHash`。
+
+Known risks / deferrals reported:
+- MCP tool execution remains intentionally unimplemented; registered discovery-only stubs never send `tools/call`。
+- Resources/prompts and `list_changed` handling are deferred。
+- Secret-backed MCP stdio env resolution currently passes no Pod secret store from this integration path; non-secret stdio configs are supported by this Ticket。
+
+Orchestrator evidence checked before review dispatch:
+- Implementation worktree is clean。
+- HEAD is `66fa9d55`。
+- Diff from acceptance `a59e5c1e..HEAD` is one implementation commit touching 9 files, about 852 insertions / 4 deletions。
+- `git diff --check a59e5c1e..HEAD` produced no diagnostics。
+
+Next action:
+- Dispatch Reviewer for r1 review against Ticket requirements, with focus on ToolRegistry contribution path, schema/name normalization, no `tools/call`, discovery-only invocation behavior, metadata authority boundaries, secret-store deferral, and tests。
+
+---
