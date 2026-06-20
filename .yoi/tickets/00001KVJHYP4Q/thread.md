@@ -379,3 +379,51 @@ Reviewer validation:
 Worktree status at end: clean。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T14:59:25Z -->
+
+## Implementation report
+
+Coder r2-fix report received from `yoi-coder-00001KVJHYP4Q`.
+
+New fix commit:
+- `79ca0f7f plugin: enforce enabled lifecycle surfaces`
+
+Branch commits now:
+- `79ca0f7f plugin: enforce enabled lifecycle surfaces`
+- `870bcc76 plugin: fix instance lifecycle blockers`
+- `147a6005 plugin: add instance lifecycle surface`
+
+Fix summary:
+- `crates/pod/src/feature/plugin.rs`:
+  - Added per-surface `record.enabled_surfaces` gating for Plugin descriptor construction。
+  - Filtered install loops so Tool / Service / Ingress setup only processes selected surfaces。
+  - Changed install denial/exposure accounting to consider selected surfaces only。
+  - Added runtime dispatch guards so unselected Tool/Ingress surfaces cannot be used even if grants exist。
+  - Added focused tests for mixed-surface partial enablement:
+    - Service selected, Tool declared but not selected: Service installs, Tool does not register, missing Tool grants do not fail install。
+    - Tool selected, Service/Ingress declared but not selected: no Service descriptor/install exposure, Ingress dispatch denied even with grants。
+  - Kept previous lifecycle/status/ingress retention tests passing。
+
+Coder validation reported as passing:
+- `cargo test -p manifest plugin -- --nocapture`
+- `cargo test -p pod plugin -- --nocapture`
+- `cargo test -p yoi plugin -- --nocapture`
+- `cargo check -p yoi`
+- `cargo check -p yoi-plugin-pdk`
+- `CARGO_TARGET_DIR=target/review-template cargo check --manifest-path resources/plugin/templates/rust-component-instance/Cargo.toml`
+- `cargo fmt --check`
+- `git diff --check 5ec8bae9..HEAD`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Orchestrator evidence checked before r3 review:
+- Implementation worktree is clean。
+- HEAD is `79ca0f7f`。
+- Fix diff from `870bcc76..HEAD` touches only `crates/pod/src/feature/plugin.rs`, about 190 insertions / 97 deletions。
+- Overall `git diff --check 5ec8bae9..HEAD` produced no diagnostics。
+
+Next action:
+- Route back to Reviewer for r3 verification of per-surface enabled selection enforcement and final acceptance criteria。
+
+---
