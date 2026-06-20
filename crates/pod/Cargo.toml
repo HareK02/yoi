@@ -12,6 +12,7 @@ llm-worker = { workspace = true }
 session-store = { workspace = true }
 pod-store = { workspace = true }
 manifest = { workspace = true }
+mcp = { workspace = true }
 protocol = { workspace = true }
 provider = { workspace = true }
 client = { workspace = true }

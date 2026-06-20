@@ -51,6 +51,54 @@ impl Default for McpStdioLimits {
     }
 }
 
+/// Host bounds for MCP `tools/list` pagination during discovery.
+#[derive(Debug, Clone, Copy)]
+pub struct McpToolListLimits {
+    pub max_pages: usize,
+    pub max_tools: usize,
+}
+
+impl Default for McpToolListLimits {
+    fn default() -> Self {
+        Self {
+            max_pages: 8,
+            max_tools: 128,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToolDefinition {
+    pub name: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub input_schema: Value,
+    #[serde(default)]
+    pub output_schema: Option<Value>,
+    #[serde(default)]
+    pub annotations: Option<Value>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListToolsResult {
+    #[serde(default)]
+    pub tools: Vec<McpToolDefinition>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
 /// A resolved, explicit local stdio MCP server process specification.
 #[derive(Clone)]
 pub struct McpStdioServerSpec {
@@ -362,6 +410,71 @@ impl McpStdioClient {
 
     pub fn initialize_result(&self) -> Option<&InitializeResult> {
         self.initialized.as_ref()
+    }
+
+    /// Request one page of the MCP `tools/list` surface after initialization.
+    ///
+    /// This performs discovery only. It never sends `tools/call` and does not
+    /// expose resources or prompts.
+    pub async fn list_tools_page(
+        &mut self,
+        cursor: Option<String>,
+    ) -> Result<ListToolsResult, McpClientError> {
+        let params = cursor
+            .map(|cursor| json!({ "cursor": cursor }))
+            .unwrap_or_else(|| json!({}));
+        self.request(McpPhase::Running, "tools/list", params).await
+    }
+
+    /// Request pages from `tools/list` up to a host-supplied page/tool bound.
+    ///
+    /// Bounds are enforced by the host so a server cannot make startup discovery
+    /// unbounded through pagination.
+    pub async fn list_tools_bounded(
+        &mut self,
+        limits: McpToolListLimits,
+    ) -> Result<ListToolsResult, McpClientError> {
+        let mut tools = Vec::new();
+        let mut cursor = None;
+        let mut pages = 0usize;
+        loop {
+            if pages >= limits.max_pages {
+                return Err(McpClientError::new(
+                    &self.server_name,
+                    McpPhase::Running,
+                    McpErrorKind::Protocol(format!(
+                        "tools/list exceeded {} page(s)",
+                        limits.max_pages
+                    )),
+                )
+                .with_diagnostics(self.snapshot_diagnostics().await));
+            }
+            pages += 1;
+            let result = self.list_tools_page(cursor.take()).await?;
+            for tool in result.tools {
+                if tools.len() >= limits.max_tools {
+                    return Err(McpClientError::new(
+                        &self.server_name,
+                        McpPhase::Running,
+                        McpErrorKind::Protocol(format!(
+                            "tools/list exceeded {} tool(s)",
+                            limits.max_tools
+                        )),
+                    )
+                    .with_diagnostics(self.snapshot_diagnostics().await));
+                }
+                tools.push(tool);
+            }
+            cursor = result.next_cursor;
+            if cursor.is_none() {
+                return Ok(ListToolsResult {
+                    tools,
+                    next_cursor: None,
+                    meta: result.meta,
+                    extra: BTreeMap::new(),
+                });
+            }
+        }
     }
 
     pub async fn snapshot_diagnostics(&self) -> McpDiagnostics {

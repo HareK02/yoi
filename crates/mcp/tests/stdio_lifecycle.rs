@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use mcp::stdio::{McpErrorKind, McpPhase, McpStdioClient, McpStdioLimits, McpStdioServerSpec};
+use mcp::stdio::{
+    McpErrorKind, McpPhase, McpStdioClient, McpStdioLimits, McpStdioServerSpec, McpToolListLimits,
+};
 
 fn mock_server(mode: &str) -> McpStdioServerSpec {
     McpStdioServerSpec::new("mock", env!("CARGO_BIN_EXE_mcp-stdio-mock-server"))
@@ -59,6 +61,63 @@ async fn initializes_mock_stdio_server() {
     assert!(!shutdown.terminated);
     assert!(!shutdown.killed);
     assert!(shutdown.exit_status.is_some_and(|status| status.success()));
+}
+
+#[tokio::test]
+async fn list_tools_paginates_and_never_calls_tools_call() {
+    let mut client = McpStdioClient::connect(mock_server("tools"), tight_limits())
+        .await
+        .expect("connect mock server");
+    let tools = client
+        .list_tools_bounded(McpToolListLimits {
+            max_pages: 4,
+            max_tools: 8,
+        })
+        .await
+        .expect("list mock tools");
+    assert_eq!(tools.tools.len(), 2);
+    assert_eq!(tools.tools[0].name, "search-files");
+    assert_eq!(tools.tools[1].name, "summarize");
+    assert_eq!(tools.tools[0].input_schema["type"], "object");
+    client.shutdown().await.expect("shutdown after list");
+}
+
+#[tokio::test]
+async fn list_tools_page_bound_fails_closed() {
+    let mut client = McpStdioClient::connect(mock_server("tools"), tight_limits())
+        .await
+        .expect("connect mock server");
+    let err = client
+        .list_tools_bounded(McpToolListLimits {
+            max_pages: 1,
+            max_tools: 8,
+        })
+        .await
+        .expect_err("pagination beyond bound must fail");
+    assert_eq!(err.phase, McpPhase::Running);
+    assert!(
+        matches!(&err.kind, McpErrorKind::Protocol(message) if message.contains("exceeded 1 page"))
+    );
+    let _ = client.shutdown().await;
+}
+
+#[tokio::test]
+async fn list_tools_tool_bound_fails_closed() {
+    let mut client = McpStdioClient::connect(mock_server("tools"), tight_limits())
+        .await
+        .expect("connect mock server");
+    let err = client
+        .list_tools_bounded(McpToolListLimits {
+            max_pages: 4,
+            max_tools: 1,
+        })
+        .await
+        .expect_err("tool count beyond bound must fail");
+    assert_eq!(err.phase, McpPhase::Running);
+    assert!(
+        matches!(&err.kind, McpErrorKind::Protocol(message) if message.contains("exceeded 1 tool"))
+    );
+    let _ = client.shutdown().await;
 }
 
 #[tokio::test]
