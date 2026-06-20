@@ -306,3 +306,76 @@ Next action:
 - Route back to Reviewer for r2 verification of the PDK/template export glue, lifecycle status/error parsing, Service/Ingress instance retention, installed-path ingress dispatch, and final acceptance criteria。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVJHYP4Q-r1 at: 2026-06-20T14:50:21Z status: request_changes -->
+
+## Review: request changes
+
+Verdict: `request_changes`
+
+確認範囲:
+- Ticket authority / Orchestrator IntentPacket。
+- Fix diff: `147a6005..870bcc76`。
+- Overall implementation shape: `5ec8bae9..870bcc76`。
+- 主な対象:
+  - `crates/plugin-pdk/src/lib.rs`
+  - `resources/plugin/templates/rust-component-instance/Cargo.toml`
+  - `resources/plugin/templates/rust-component-instance/src/lib.rs`
+  - `resources/plugin/wit/yoi-plugin-instance-v1.wit`
+  - `crates/pod/src/feature/plugin.rs`
+  - `crates/manifest/src/plugin.rs`
+  - `crates/yoi/src/plugin_cli.rs`
+
+Previous blocker verification:
+- Rust instance PDK/template buildability / WIT export shape: substantially addressed。
+  - `export_plugin_instance!` now targets generated `wit-bindgen` `Guest` / `export!` shape。
+  - Instance template has empty `[workspace]`, uses `ToolOutput::json`, and includes `wit_bindgen::generate!`。
+  - Focused template validation passes。
+- Component lifecycle start/status/stop handling: substantially addressed。
+  - Host parses lifecycle JSON and fails closed on error/failure status。
+  - Component `status` export is called and reflected in instance status。
+  - Stop output is decoded/reported。
+- Service/Ingress instance retention and installed-path dispatch: substantially addressed。
+  - `PluginToolFeature` retains a `PluginInstanceRegistry`。
+  - Service/Ingress-capable installs can create/retain instance without Tool registration。
+  - Installed-path `dispatch_ingress` exists and tests cover shared Tool/Ingress dispatch。
+
+Blocking issue:
+
+1. Enabled surface selection is not enforced per surface during descriptor/install, so mixed-surface plugins can expose or block the wrong surfaces。
+   - `PluginToolFeature` is gated at coarse whole-record level by whether any of Tool/Service/Ingress appears in `record.enabled_surfaces`。
+   - Once feature exists, descriptor and install paths iterate over all declared manifest services/tools/ingresses, not only selected/enabled surfaces。
+   - Concrete risk:
+     - Plugin declaring both Tool and Service with only Service selected can still attempt to authorize/register Tool。
+     - Missing Tool grant can fail selected Service install。
+     - If Tool grant exists, unselected Tool can become model-visible。
+     - Unselected Service/Ingress can be provided/started if their grants exist。
+   - This violates the Ticket requirement that Tool / Service / Ingress grants and exposure remain independent and explicitly gated。
+
+Required fix:
+- Filter descriptor/install loops by `record.enabled_surfaces`。
+- Ensure registered/denial behavior accounts for selected surface set, not all manifest declarations。
+- Add focused tests for mixed-surface packages with partial enabled surfaces:
+  - Service selected, Tool declared but not selected: Service installs and Tool does not register。
+  - Tool selected, Service/Ingress declared but not selected: no Service/Ingress instance/dispatch exposure。
+  - Missing grants for unselected surfaces do not fail selected-surface install。
+  - Grants for unselected surfaces do not cause exposure。
+
+Non-blocking concern:
+- Existing disabled-surface test only clears all enabled surfaces and does not cover mixed-surface partial enablement。
+
+Reviewer validation:
+- `cargo fmt --check`: passed。
+- `git diff --check 5ec8bae9..HEAD`: passed。
+- `CARGO_TARGET_DIR=target/review-template cargo check --manifest-path resources/plugin/templates/rust-component-instance/Cargo.toml`: passed。
+- `cargo test -p manifest plugin -- --nocapture`: passed。
+- `cargo test -p pod plugin -- --nocapture`: passed。
+- `cargo test -p yoi plugin -- --nocapture`: passed。
+- `cargo check -p yoi`: passed。
+- `cargo check -p yoi-plugin-pdk`: passed。
+- `yoi ticket doctor`: passed。
+- `nix build .#yoi --no-link`: passed。
+
+Worktree status at end: clean。
+
+---
