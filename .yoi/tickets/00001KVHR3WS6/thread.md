@@ -156,3 +156,16 @@ Next action:
 - Dispatch Reviewer for r1 review against Ticket requirements, with focus on ToolRegistry contribution path, schema/name normalization, no `tools/call`, discovery-only invocation behavior, metadata authority boundaries, secret-store deferral, and tests。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-20T08:30:22Z -->
+
+## Plan
+
+Review dispatch:
+- Spawned Reviewer Pod `yoi-reviewer-00001KVHR3WS6-r1` against implementation branch `impl/00001KVHR3WS6-mcp-tool-registration`。
+- Review target commit: `66fa9d55 mcp: register stdio server tools`。
+- Review baseline: `a59e5c1e`。
+- Reviewer task focuses on normal ToolRegistry contribution path, untrusted metadata/schema/name normalization, no `tools/call`, discovery-only invocation behavior, no resources/prompts/list_changed registration, diagnostics bounds, secret-store deferral, and tests。
+- Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
+
+---
