@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -62,7 +62,6 @@ async fn discover_server_tools(spec: McpStdioServerSpec) -> ProtocolProviderCont
     let declaration = provider_declaration(&spec.name, None);
     let mut contribution = ProtocolProviderContribution::ready(declaration.clone());
     let server_namespace = sanitize_segment(&spec.name);
-    let mut seen_names = HashSet::new();
 
     let mut client = match McpStdioClient::connect(spec, McpStdioLimits::default()).await {
         Ok(client) => client,
@@ -128,7 +127,6 @@ async fn discover_server_tools(spec: McpStdioServerSpec) -> ProtocolProviderCont
         server_namespace,
         server_version,
         list,
-        &mut seen_names,
     );
     contribution
 }
@@ -139,8 +137,10 @@ fn normalize_listed_tools(
     server_namespace: String,
     server_version: Option<String>,
     list: ListToolsResult,
-    seen_names: &mut HashSet<String>,
 ) -> ProtocolProviderContribution {
+    let mut candidates = Vec::new();
+    let mut name_counts = BTreeMap::<String, usize>::new();
+
     for tool in list.tools {
         match mcp_tool_contribution(
             &declaration,
@@ -149,18 +149,28 @@ fn normalize_listed_tools(
             tool,
         ) {
             Ok((name, tool_contribution)) => {
-                if !seen_names.insert(name.clone()) {
-                    contribution =
-                        contribution.with_diagnostic(FeatureDiagnostic::error(bounded_diagnostic(
-                            format!("duplicate MCP tool name `{name}` after namespacing; skipped"),
-                        )));
-                    continue;
-                }
-                contribution = contribution.with_tool(tool_contribution);
+                *name_counts.entry(name.clone()).or_default() += 1;
+                candidates.push((name, tool_contribution));
             }
             Err(message) => {
                 contribution = contribution.with_diagnostic(FeatureDiagnostic::error(message));
             }
+        }
+    }
+
+    for (name, count) in &name_counts {
+        if *count > 1 {
+            contribution = contribution.with_diagnostic(FeatureDiagnostic::error(bounded_diagnostic(
+                format!(
+                    "duplicate MCP tool name `{name}` after namespacing ({count} definitions); all colliding definitions skipped"
+                ),
+            )));
+        }
+    }
+
+    for (name, tool_contribution) in candidates {
+        if name_counts.get(&name).copied().unwrap_or_default() == 1 {
+            contribution = contribution.with_tool(tool_contribution);
         }
     }
     contribution
@@ -557,13 +567,13 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_names_after_normalization_are_diagnostic_only() {
+    fn duplicate_names_after_normalization_are_not_model_visible() {
         let declaration = provider_declaration("demo", None);
-        let mut seen = HashSet::new();
         let list = ListToolsResult {
             tools: vec![
                 mcp_tool("search-files", "one", json!({"type":"object"})),
                 mcp_tool("search files", "two", json!({"type":"object"})),
+                mcp_tool("unique", "three", json!({"type":"object"})),
             ],
             next_cursor: None,
             meta: None,
@@ -575,16 +585,32 @@ mod tests {
             "demo".to_string(),
             None,
             list,
-            &mut seen,
         );
-        assert_eq!(seen.len(), 1);
         assert!(
             contribution
                 .diagnostics
                 .iter()
                 .any(|diag| diag.severity == FeatureDiagnosticSeverity::Error
-                    && diag.message.contains("duplicate"))
+                    && diag.message.contains("duplicate")
+                    && diag.message.contains("all colliding definitions skipped"))
         );
+
+        let mut feature = McpStdioToolFeature::new();
+        feature.add_contribution(contribution);
+        let mut pending_tools = Vec::new();
+        let mut hook_builder = HookRegistryBuilder::default();
+        FeatureRegistryBuilder::new()
+            .with_module(feature)
+            .install_into_pending(&mut pending_tools, &mut hook_builder);
+        let names: Vec<_> = pending_tools
+            .iter()
+            .map(|definition| {
+                let (meta, _) = definition();
+                meta.name
+            })
+            .collect();
+        assert!(!names.iter().any(|name| name == "Mcp_demo_search_files"));
+        assert!(names.iter().any(|name| name == "Mcp_demo_unique"));
     }
 
     #[test]
