@@ -2032,6 +2032,7 @@ dependencies = [
  "llm-worker",
  "mlua",
  "protocol",
+ "secrets",
  "serde",
  "serde_ignored",
  "serde_json",

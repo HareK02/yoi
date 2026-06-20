@@ -6,7 +6,7 @@
 //! via [`PodManifestConfig::merge`] and the final config is converted to
 //! a validated [`PodManifest`] via `TryFrom`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
@@ -17,10 +17,10 @@ use crate::defaults;
 use crate::model::{AuthRef, ModelManifest, ReasoningControl};
 use crate::plugin::PluginConfig;
 use crate::{
-    CompactionConfig, FeatureConfig, FeatureFlagConfig, FileUploadLimits, MemoryConfig,
-    PodManifest, PodMeta, ScopeConfig, SessionConfig, SkillsConfig, TicketFeatureAccessConfig,
-    TicketFeatureConfig, ToolOutputLimits, ToolPermissionConfig, ToolPermissionRule, WebConfig,
-    WorkerManifest,
+    CompactionConfig, FeatureConfig, FeatureFlagConfig, FileUploadLimits, McpConfig, McpEnvValue,
+    McpStdioCwdPolicy, MemoryConfig, PodManifest, PodMeta, ScopeConfig, SessionConfig,
+    SkillsConfig, TicketFeatureAccessConfig, TicketFeatureConfig, ToolOutputLimits,
+    ToolPermissionConfig, ToolPermissionRule, WebConfig, WorkerManifest,
 };
 
 /// Partial-form Pod manifest. Every field is optional; one or more
@@ -57,6 +57,10 @@ pub struct PodManifestConfig {
     /// separate step and does not run during config merge.
     #[serde(default)]
     pub plugins: PluginConfig,
+    /// Explicit Model Context Protocol provider declarations. Config parsing
+    /// never starts a local MCP subprocess.
+    #[serde(default)]
+    pub mcp: McpConfig,
     #[serde(default)]
     pub compaction: Option<CompactionConfigPartial>,
     /// First-class web tool opt-in. See [`WebConfig`].
@@ -322,6 +326,11 @@ pub enum ResolveError {
     MissingField(&'static str),
     #[error("path must be absolute ({field}): {}", .path.display())]
     RelativePath { field: &'static str, path: PathBuf },
+    #[error("invalid MCP config ({field}): {message}")]
+    InvalidMcpConfig {
+        field: &'static str,
+        message: String,
+    },
 }
 
 /// Reject manifest fields that were intentionally removed and must not be
@@ -436,6 +445,11 @@ impl PodManifestConfig {
                 *dir = join_if_relative(base, dir);
             }
         }
+        for server in &mut self.mcp.stdio_servers {
+            if let Some(McpStdioCwdPolicy::Path { path }) = &mut server.cwd {
+                *path = join_if_relative(base, path);
+            }
+        }
         self
     }
 
@@ -458,6 +472,7 @@ impl PodManifestConfig {
             ),
             feature: self.feature.merge(upper.feature),
             plugins: merge_plugin_config(self.plugins, upper.plugins),
+            mcp: merge_mcp_config(self.mcp, upper.mcp),
             compaction: merge_option(
                 self.compaction,
                 upper.compaction,
@@ -484,6 +499,11 @@ fn merge_plugin_config(mut base: PluginConfig, upper: PluginConfig) -> PluginCon
         base.resolved = upper.resolved;
         base.diagnostics = upper.diagnostics;
     }
+    base
+}
+
+fn merge_mcp_config(mut base: McpConfig, upper: McpConfig) -> McpConfig {
+    base.stdio_servers.extend(upper.stdio_servers);
     base
 }
 
@@ -708,6 +728,149 @@ fn validate_model_paths(model: &ModelManifest, field: &'static str) -> Result<()
     Ok(())
 }
 
+pub(crate) fn validate_mcp_config(mcp: &McpConfig) -> Result<(), ResolveError> {
+    let mut names = BTreeSet::new();
+    for server in &mcp.stdio_servers {
+        if server.name.trim().is_empty() {
+            return Err(invalid_mcp(
+                "mcp.stdio_server.name",
+                "server name must not be empty",
+            ));
+        }
+        if contains_nul(&server.name) {
+            return Err(invalid_mcp(
+                "mcp.stdio_server.name",
+                "server name must not contain NUL",
+            ));
+        }
+        if !names.insert(server.name.as_str()) {
+            return Err(invalid_mcp(
+                "mcp.stdio_server.name",
+                format!(
+                    "duplicate stdio server name `{}`",
+                    bounded_label(&server.name)
+                ),
+            ));
+        }
+
+        if server.command.trim().is_empty() {
+            return Err(invalid_mcp(
+                "mcp.stdio_server.command",
+                "command must not be empty",
+            ));
+        }
+        if contains_nul(&server.command) {
+            return Err(invalid_mcp(
+                "mcp.stdio_server.command",
+                "command must not contain NUL",
+            ));
+        }
+        for arg in &server.args {
+            if contains_nul(arg) {
+                return Err(invalid_mcp(
+                    "mcp.stdio_server.args",
+                    "argument must not contain NUL",
+                ));
+            }
+        }
+
+        if let Some(McpStdioCwdPolicy::Path { path }) = &server.cwd {
+            if path.as_os_str().is_empty() {
+                return Err(invalid_mcp(
+                    "mcp.stdio_server.cwd.path",
+                    "cwd path must not be empty",
+                ));
+            }
+            if !path.is_absolute() {
+                return Err(invalid_mcp(
+                    "mcp.stdio_server.cwd.path",
+                    "cwd path must be absolute after profile/manifest path resolution",
+                ));
+            }
+        }
+
+        for name in &server.env.inherit {
+            validate_env_name("mcp.stdio_server.env.inherit", name)?;
+        }
+        for (name, value) in &server.env.set {
+            validate_env_name("mcp.stdio_server.env.set", name)?;
+            match value {
+                McpEnvValue::Literal { value } => {
+                    if contains_nul(value) {
+                        return Err(invalid_mcp(
+                            "mcp.stdio_server.env.set",
+                            "literal env value must not contain NUL",
+                        ));
+                    }
+                }
+                McpEnvValue::SecretRef { ref_ } => {
+                    if secrets::validate_id(ref_).is_err() {
+                        return Err(invalid_mcp(
+                            "mcp.stdio_server.env.set.secret_ref",
+                            "secret_ref must be a valid local secret id",
+                        ));
+                    }
+                }
+                McpEnvValue::EnvRef { name } => {
+                    validate_env_name("mcp.stdio_server.env.set.env_ref", name)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_env_name(field: &'static str, name: &str) -> Result<(), ResolveError> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(invalid_mcp(
+            field,
+            "environment variable name must not be empty",
+        ));
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return Err(invalid_mcp(
+            field,
+            "environment variable name must start with ASCII letter or underscore",
+        ));
+    }
+    if !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+        return Err(invalid_mcp(
+            field,
+            "environment variable name must contain only ASCII letters, digits, and underscore",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_mcp(field: &'static str, message: impl Into<String>) -> ResolveError {
+    ResolveError::InvalidMcpConfig {
+        field,
+        message: message.into(),
+    }
+}
+
+fn contains_nul(value: &str) -> bool {
+    value.as_bytes().contains(&0)
+}
+
+fn bounded_label(value: &str) -> String {
+    const MAX: usize = 80;
+    let mut out = String::new();
+    for (idx, ch) in value.chars().enumerate() {
+        if idx >= MAX {
+            out.push('…');
+            break;
+        }
+        if ch.is_control() {
+            out.push('?');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 impl TryFrom<PodManifestConfig> for PodManifest {
     type Error = ResolveError;
 
@@ -842,6 +1005,8 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             }
         }
 
+        validate_mcp_config(&cfg.mcp)?;
+
         Ok(PodManifest {
             pod: PodMeta { name, prompt_pack },
             model: cfg.model,
@@ -852,6 +1017,7 @@ impl TryFrom<PodManifestConfig> for PodManifest {
             permissions,
             feature: FeatureConfig::from(cfg.feature),
             plugins: cfg.plugins,
+            mcp: cfg.mcp,
             compaction,
             web: cfg.web,
             memory: cfg.memory,
@@ -899,6 +1065,7 @@ mod tests {
             permissions: None,
             feature: FeatureConfigPartial::default(),
             plugins: PluginConfig::default(),
+            mcp: McpConfig::default(),
             session: None,
             compaction: None,
             web: None,
@@ -913,6 +1080,139 @@ mod tests {
         assert_eq!(manifest.pod.name, "test");
         assert_eq!(manifest.model.scheme, Some(SchemeKind::Anthropic));
         assert!(manifest.permissions.is_none());
+    }
+
+    #[test]
+    fn resolve_mcp_stdio_config_preserves_explicit_policy() {
+        let mut cfg = minimal_valid();
+        cfg.mcp.stdio_servers.push(crate::McpStdioServerConfig {
+            name: "filesystem".into(),
+            command: "node".into(),
+            args: vec!["server.js".into(), "--root".into()],
+            cwd: Some(McpStdioCwdPolicy::Path { path: abs("/mcp") }),
+            env: crate::McpEnvConfig {
+                inherit: vec!["PATH".into()],
+                set: std::collections::BTreeMap::from([
+                    (
+                        "SAFE_MODE".into(),
+                        McpEnvValue::Literal { value: "1".into() },
+                    ),
+                    (
+                        "TOKEN".into(),
+                        McpEnvValue::SecretRef {
+                            ref_: "providers/mcp-token".into(),
+                        },
+                    ),
+                    (
+                        "UPSTREAM".into(),
+                        McpEnvValue::EnvRef {
+                            name: "MCP_UPSTREAM_TOKEN".into(),
+                        },
+                    ),
+                ]),
+            },
+        });
+
+        let manifest: PodManifest = cfg.try_into().unwrap();
+
+        assert_eq!(manifest.mcp.stdio_servers.len(), 1);
+        let server = &manifest.mcp.stdio_servers[0];
+        assert_eq!(server.name, "filesystem");
+        assert_eq!(server.command, "node");
+        assert_eq!(server.env.inherit, ["PATH"]);
+        assert!(matches!(
+            server.env.set["TOKEN"],
+            McpEnvValue::SecretRef { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_mcp_rejects_empty_command_and_duplicates() {
+        let mut cfg = minimal_valid();
+        cfg.mcp.stdio_servers.push(crate::McpStdioServerConfig {
+            name: "dup".into(),
+            command: "".into(),
+            args: Vec::new(),
+            cwd: None,
+            env: crate::McpEnvConfig::default(),
+        });
+
+        let err = PodManifest::try_from(cfg).unwrap_err();
+        assert!(matches!(
+            err,
+            ResolveError::InvalidMcpConfig {
+                field: "mcp.stdio_server.command",
+                ..
+            }
+        ));
+
+        let mut cfg = minimal_valid();
+        for command in ["one", "two"] {
+            cfg.mcp.stdio_servers.push(crate::McpStdioServerConfig {
+                name: "dup".into(),
+                command: command.into(),
+                args: Vec::new(),
+                cwd: None,
+                env: crate::McpEnvConfig::default(),
+            });
+        }
+
+        let err = PodManifest::try_from(cfg).unwrap_err();
+        assert!(matches!(
+            err,
+            ResolveError::InvalidMcpConfig {
+                field: "mcp.stdio_server.name",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn resolve_mcp_rejects_invalid_env_and_secret_ref_without_leaking_values() {
+        let mut cfg = minimal_valid();
+        cfg.mcp.stdio_servers.push(crate::McpStdioServerConfig {
+            name: "secret".into(),
+            command: "no-such-command-is-not-started".into(),
+            args: Vec::new(),
+            cwd: None,
+            env: crate::McpEnvConfig {
+                inherit: Vec::new(),
+                set: std::collections::BTreeMap::from([(
+                    "TOKEN".into(),
+                    McpEnvValue::SecretRef {
+                        ref_: "bad secret id with spaces".into(),
+                    },
+                )]),
+            },
+        });
+
+        let err = PodManifest::try_from(cfg).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("secret_ref"));
+        assert!(!rendered.contains("bad secret id with spaces"));
+
+        let value = McpEnvValue::Literal {
+            value: "plaintext-secret-value".into(),
+        };
+        assert!(!format!("{value:?}").contains("plaintext-secret-value"));
+    }
+
+    #[test]
+    fn resolve_mcp_accepts_nonexistent_command_without_autostart() {
+        let mut cfg = minimal_valid();
+        cfg.mcp.stdio_servers.push(crate::McpStdioServerConfig {
+            name: "later".into(),
+            command: "definitely-not-a-command-yoi-must-spawn".into(),
+            args: Vec::new(),
+            cwd: None,
+            env: crate::McpEnvConfig::default(),
+        });
+
+        let manifest: PodManifest = cfg.try_into().unwrap();
+        assert_eq!(
+            manifest.mcp.stdio_servers[0].command,
+            "definitely-not-a-command-yoi-must-spawn"
+        );
     }
 
     #[test]
