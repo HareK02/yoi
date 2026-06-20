@@ -159,3 +159,16 @@ Next action:
 - Dispatch Reviewer for r1 review against Ticket requirements, with focus on read-only inspection boundary, no process start/no tools-call/no resource-prompt content fetch, static vs live unavailable honesty, redaction, JSON/human shape, help/tests, and conflict risk。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-20T13:49:28Z -->
+
+## Plan
+
+Review dispatch:
+- Spawned Reviewer Pod `yoi-reviewer-00001KVJKHAFE-r1` against implementation branch `impl/00001KVJKHAFE-mcp-cli-inspection`。
+- Review target commit: `c91f5fc9 mcp: add cli inspection`。
+- Review baseline: `12d7e69f`。
+- Reviewer task focuses on read-only inspection boundary, no process start/no tools-call/no resource/prompt content fetch, static vs live unavailable honesty, secret/content redaction, JSON/human report shape, namespace separation from Plugin CLI, help/tests, scope creep absence, and parallel CLI merge conflict risk。
+- Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
+
+---
