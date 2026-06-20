@@ -301,3 +301,56 @@ Worktree status:
 - Clean on `impl/00001KVJX7VZT-cli-resume-subcommand`。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T16:54:23Z -->
+
+## Implementation report
+
+Coder r1-fix report received from `yoi-coder-00001KVJX7VZT`.
+
+New fix commit:
+- `d25ca6ff fix: update resume guidance`
+
+Branch commits now:
+- `861c351a feat: add explicit resume command`
+- `d25ca6ff fix: update resume guidance`
+
+Changed files in r1 fix:
+- `crates/tui/src/dashboard/mod.rs`
+- `crates/tui/src/picker.rs`
+
+Fix summary:
+- Updated Dashboard no-pods guidance from removed `yoi -r` to `yoi resume`。
+- Searched active product guidance for `yoi -r`, `--resume`, and `[POD_NAME]` excluding historical docs/reports and Ticket records; no remaining active stale guidance found。
+- Addressed Reviewer non-blocking concern:
+  - Workspace-scoped resume empty result now says: `no pods found in this workspace — use yoi resume --all to list all host/data-dir Pods`
+  - Host-wide `--all` empty result keeps the fresh Pod hint。
+  - Added picker tests for these messages。
+
+Coder validation reported:
+- `cargo fmt --check`: passed
+- `git diff --check`: passed
+- `cargo test -p tui picker_`: passed
+- `cargo test -p yoi parse_`: passed
+- `cargo test -p tui workspace`: passed
+- `cargo check -p yoi -p tui`: passed
+- `target/debug/yoi ticket doctor`: passed
+- `cargo build -p yoi`: passed
+- CLI smoke:
+  - `target/debug/yoi --help`: passed
+  - `target/debug/yoi resume --help`: passed
+  - `target/debug/yoi agent`: nonzero with `unknown command \`agent\``
+  - `target/debug/yoi -r`: nonzero with `unknown argument: -r`
+  - `target/debug/yoi --resume`: nonzero with `unknown argument: --resume`
+
+Orchestrator evidence checked:
+- Implementation worktree clean on `impl/00001KVJX7VZT-cli-resume-subcommand`。
+- HEAD is `d25ca6ff`。
+- r1-fix diff `861c351a..HEAD` touches only `crates/tui/src/dashboard/mod.rs` and `crates/tui/src/picker.rs`。
+- Active product-guidance grep under `crates` / `resources` for `yoi -r|--resume|[POD_NAME]` returned only the parser test expectation for `unknown argument: --resume`, not active user guidance。
+- `git diff --check a63b40f4..HEAD` produced no diagnostics。
+
+Next action:
+- Route back to Reviewer for r2 verification and final acceptance review。
+
+---
