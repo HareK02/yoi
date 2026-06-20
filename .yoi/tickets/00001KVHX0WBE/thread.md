@@ -336,3 +336,51 @@ Reviewer validation:
 Worktree status at review end: tracked source tree clean; ignored `target/` only。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T09:35:21Z -->
+
+## Implementation report
+
+Merge and final validation report:
+
+Merged implementation branch into Orchestrator branch:
+- Merge commit: `23ec2bbd merge: dashboard console tui refactor`
+- Implementation commits included:
+  - `5415a947 tui: introduce dashboard console boundaries`
+  - `135343a2 tui: preserve dashboard after console return`
+
+Reviewer outcome:
+- r1 requested changes because recoverable Dashboard open failures could exit `yoi panel` and successful Console return replaced live `DashboardApp` state。
+- Coder preserved existing `DashboardApp` across nested Console success/recoverable failure and added regression tests。
+- r2 approved with no blocking issues。
+
+Orchestrator validation after merge passed:
+- `cargo fmt --check`
+- `git diff --check HEAD^1..HEAD`
+- `cargo test -p tui`
+- `cargo test -p yoi`
+- `cargo check --workspace --all-targets`
+- `cargo run -q -p yoi -- --help` targeted help smoke。
+- `test ! -e crates/tui/src/single_pod.rs`
+- `test ! -e crates/tui/src/multi_pod.rs`
+- targeted grep confirmed no `yoi dashboard` alias, no old `single_pod::run_panel` / `mod single_pod` / `mod multi_pod` / Panel-to-Console route, and expected Dashboard/Console launch terminology。
+
+Validation log:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/bash-crXxMR.log`
+
+Nix validation:
+- Not run for this Ticket because changes are Rust/docs/prompt/module-boundary only and no package/source-filter/resource inclusion concern was found。
+
+Final state:
+- Orchestrator worktree clean at `23ec2bbd` after validation。
+- Implementation worktree remains available for cleanup after Ticket completion records are committed。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-20T09:35:30Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Implementation was merged into Orchestrator branch at `23ec2bbd`, r2 review approved, and final Orchestrator validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p tui`, `cargo test -p yoi`, `cargo check --workspace --all-targets`, and targeted help/grep checks for Dashboard/Console terminology and no `yoi dashboard` alias.
+
+---
