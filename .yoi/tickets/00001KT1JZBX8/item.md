@@ -1,8 +1,8 @@
 ---
 title: "Audit external dependencies and license posture"
-state: "planning"
+state: 'closed'
 created_at: "2026-06-01T12:36:41Z"
-updated_at: "2026-06-01T13:08:45Z"
+updated_at: '2026-06-20T16:45:54Z'
 ---
 
 ## Background

@@ -1,0 +1,1 @@
+Closed as completed. The crate responsibility boundary audit was already performed and recorded in artifacts/audit.md with concrete findings; any implementation cleanup should be handled by narrower follow-up tickets.

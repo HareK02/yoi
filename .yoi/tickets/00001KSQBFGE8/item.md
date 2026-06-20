@@ -1,8 +1,8 @@
 ---
 title: "Audit crate responsibility boundaries"
-state: "planning"
+state: 'closed'
 created_at: "2026-05-28T13:13:17Z"
-updated_at: "2026-05-28T13:13:17Z"
+updated_at: '2026-06-20T16:45:54Z'
 ---
 
 ## Background
