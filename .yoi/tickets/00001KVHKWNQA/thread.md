@@ -278,3 +278,52 @@ Next action:
 - Route back to Reviewer for r2 verification of the WIT parse/template compile blockers and final acceptance criteria。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVHKWNQA-r1 at: 2026-06-20T05:47:13Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket body/thread / Orchestrator IntentPacket
+- r2 fix diff: `06287aca..0a9e585c`
+- 全体実装 diff: `5f7f81bd..0a9e585c`
+- 主な対象: `resources/plugin/wit/deps/yoi-host/yoi-host-v1.wit`, `resources/plugin/wit/yoi-plugin-tool-v1.wit`, embedded template, `crates/plugin-pdk/*`, `crates/manifest/src/plugin.rs`, `crates/pod/src/feature/plugin.rs`, docs, `package.nix`。
+
+Previous blockers verification:
+- Host WIT は `resources/plugin/wit/deps/yoi-host/yoi-host-v1.wit` に配置され、`resources/plugin/wit` は current package directory として `wit-bindgen` が parse できる形になった。
+- Keyword function は `%list` として escape され、import name semantics を保持している。
+- Embedded template の `Cargo.toml` には empty `[workspace]` があり、root workspace 配下の non-member package として拒否されない。
+- `crates/plugin-pdk/tests/wit_bindgen_probe.rs` は実際に `wit_bindgen::generate!` を `resources/plugin/wit` に対して実行している。
+- Embedded template は `wasm32-unknown-unknown` target で cargo-check できる。
+
+Overall Ticket fit:
+- PDK は guest-side に留まり、host/runtime Yoi crates への dependency は見当たらない。
+- PDK / template は authority を付与せず、host-side Plugin manifest grants が authority boundary であることを維持している。
+- Ambient fs/network/env authority は露出していない。
+- crates.io publication / remote template fetch / `yoi plugin new/check/pack` は実装していない。
+- Docs は full build/pack boundary と deferral を概ね正直に記述している。
+
+Blocking issues: none。
+
+Non-blocking concerns / follow-ups:
+- `cargo check --manifest-path resources/plugin/templates/rust-component-tool/Cargo.toml --target wasm32-unknown-unknown` を直接実行すると template-local `Cargo.lock` と `target/` ができる。Reviewer は検証後に untracked artifacts を削除した。テスト自体は temporary target dir を使い template lockfile を消すため blocking ではないが、将来 docs/CI では explicit `--target-dir` を推奨するとよい。
+- Reviewer r2 の `nix build .#yoi --no-link` は final artifact copy 中に `No space left on device` で environment-fail。cargo hash/source-filter/code diagnostic ではない。Coder 側では同コマンド成功済み。Orchestrator final validation で再確認する。
+
+Reviewer validation:
+- `cargo test -p yoi-plugin-pdk`: passed
+- `cargo test -p manifest embedded_rust_component_tool_template_is_valid_package_shape`: passed
+- `cargo test -p pod pdk_tool_output_shape_is_accepted_by_wasm_decoder`: passed
+- `cargo check --manifest-path resources/plugin/templates/rust-component-tool/Cargo.toml --target wasm32-unknown-unknown`: passed
+- `cargo tree -p yoi-plugin-pdk --edges normal`: passed; host/runtime Yoi crate dependencyなし
+- `cargo fmt --check`: passed
+- `git diff --check 5f7f81bd..HEAD`: passed
+- `git diff --check`: passed
+- `git diff --check --cached`: passed
+- `cargo check`: passed
+- `nix build .#yoi --no-link`: attempted, environment failed with `No space left on device` during final artifact copying
+
+Worktree status at review end: source tree clean; ignored artifacts under normal `target/` only。
+
+---
