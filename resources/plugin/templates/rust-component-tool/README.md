@@ -26,14 +26,12 @@ If this template is copied elsewhere before crates.io publication exists, pin a 
 yoi-plugin-pdk = { git = "https://github.com/example/yoi.git", package = "yoi-plugin-pdk", rev = "<pinned-yoi-revision>" }
 ```
 
-Crates.io publication, remote template fetching, and `yoi plugin new/check/pack` are intentionally deferred to later authoring-tooling work.
+`plugin.component.wasm` in the template is a text placeholder so `yoi plugin check` and `yoi plugin pack` can exercise deterministic local package validation immediately. Replace it with a real built component before enabling or executing the Plugin.
 
 ## Next steps
 
 1. Replace package/plugin ids, names, descriptions, and Tool schema.
 2. Replace `EchoInput` / `EchoOutput` and `handle_echo` with your Tool logic.
-3. Build a component for `wasm32-unknown-unknown` with the Component Model tooling used by your environment.
-4. Package `plugin.toml` and `plugin.component.wasm` into a `.yoi-plugin` archive.
-5. Use `yoi plugin list` / `yoi plugin show` plus focused runtime tests to inspect and validate the package.
-
-The exact component build/pack command is not part of this template yet because deterministic `yoi plugin new/check/pack` authoring commands are a separate planned Ticket.
+3. Build a component for `wasm32-unknown-unknown` with the Component Model tooling used by your environment, replacing the placeholder `plugin.component.wasm`.
+4. Run `yoi plugin check .` and `yoi plugin pack . --output ./my-plugin.yoi-plugin`.
+5. Copy the package to a Plugin store and add explicit enablement with pinned digest/grants after review.
