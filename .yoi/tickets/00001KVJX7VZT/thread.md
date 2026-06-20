@@ -219,3 +219,85 @@ Reviewer focus:
 Orchestrator will wait for reviewer verdict before integration。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVJX7VZT-r1 at: 2026-06-20T16:50:49Z status: request_changes -->
+
+## Review: request changes
+
+Verdict: `request_changes`
+
+確認範囲:
+- Ticket authority:
+  - `.yoi/tickets/00001KVJX7VZT/item.md`
+  - `.yoi/tickets/00001KVJX7VZT/thread.md`
+- Implementation diff `a63b40f4..861c351a`:
+  - `crates/yoi/src/main.rs`
+  - `crates/tui/src/lib.rs`
+  - `crates/tui/src/console/mod.rs`
+  - `crates/tui/src/picker.rs`
+- Related inspected file for stale user-facing guidance:
+  - `crates/tui/src/dashboard/mod.rs`
+- Related workspace filtering authority:
+  - `crates/tui/src/pod_list.rs`
+
+Core implementation assessment:
+- `resume` is parsed as an explicit subcommand。
+- Legacy `-r` / `--resume` no longer parse as resume。
+- Bare top-level words are no longer inferred as Pod names。
+- `--pod <NAME>` remains the explicit direct path。
+- Default resume uses `PickerOptions::workspace(...)` / `PodList::from_workspace_sources(...)`。
+- `resume --all` uses host/data-dir-wide sources。
+
+Blocking issue:
+
+1. Stale user-facing guidance still tells users to run removed `yoi -r`。
+
+Evidence:
+
+```rust
+// crates/tui/src/dashboard/mod.rs:91-94
+Self::NoPods => write!(
+    f,
+    "no Tickets or Pods found — create a Ticket with `yoi ticket create` or restore a Pod with `yoi -r`"
+),
+```
+
+This is misleading because `yoi -r` intentionally fails:
+
+```text
+$ target/debug/yoi -r
+yoi: unknown argument: -r
+try `yoi --help` for usage.
+exit=1
+```
+
+This conflicts with the Ticket’s explicit CLI replacement intent and the reviewer focus that parser/help/user-facing errors should be discoverable and not misleading. Update the guidance to `yoi resume`, or if this Dashboard no-pods case intends host/data-dir-wide discovery, use explicit `yoi resume --all` wording。
+
+Non-blocking concern:
+- `PickerError::NoPods` still says `no pods found — start a fresh pod with `yoi` and try again`。
+- For default workspace-scoped `yoi resume`, this can be ambiguous if Pods exist outside the current workspace。Consider a scope-aware message such as `no pods found in this workspace; use `yoi resume --all` to list all host/data-dir Pods` either in this fix or as follow-up。This is not blocking by itself。
+
+Reviewer validation:
+- `cargo fmt --check`: passed
+- `git diff --check a63b40f4..HEAD`: passed
+- `cargo test -p yoi parse_`: passed, 32 tests
+- `cargo test -p tui picker_`: passed, 7 tests
+- `cargo test -p tui workspace`: passed, 37 tests
+- `cargo check -p yoi -p tui`: passed
+- `target/debug/yoi ticket doctor`: passed (`doctor: ok`)
+- CLI smoke:
+  - `target/debug/yoi --help`: exit 0; no `[POD_NAME]`, no `-r, --resume`, includes `yoi resume [--workspace <PATH>] [--all]`
+  - `target/debug/yoi resume --help`: exit 0; documents `--workspace` and `--all`
+  - `target/debug/yoi agent`: exit 1; `unknown command 'agent'`
+  - `target/debug/yoi -r`: exit 1; `unknown argument: -r`
+  - `target/debug/yoi --resume`: exit 1; `unknown argument: --resume`
+  - `target/debug/yoi memory other`: exit 1; usage error, not Pod-name inference
+  - `target/debug/yoi resume --all --workspace /tmp/ws`: exit 1; mutually exclusive error
+- Stale-alias search:
+  - `rg 'yoi -r|--resume|\[POD_NAME\]' . --glob '!target/**' --glob '!Cargo.lock'`
+  - Found blocking active product-code stale guidance at `crates/tui/src/dashboard/mod.rs:93`; historical docs/report mentions were not treated as product guidance。
+
+Worktree status:
+- Clean on `impl/00001KVJX7VZT-cli-resume-subcommand`。
+
+---
