@@ -1,11 +1,13 @@
 ---
 title: 'MCP: implement stdio JSON-RPC lifecycle client'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-20T05:30:04Z'
-updated_at: '2026-06-20T05:33:03Z'
+updated_at: '2026-06-20T05:58:54Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['mcp', 'stdio', 'json-rpc', 'process-lifecycle', 'diagnostics']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-20T05:58:54Z'
 ---
 
 ## Background
