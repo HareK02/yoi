@@ -1,3 +1,4 @@
+mod mcp_cli;
 mod memory_lint;
 mod objective_cli;
 mod plugin_cli;
@@ -18,6 +19,7 @@ enum Mode {
     Help,
     MemoryLintHelp,
     MemoryLint(LintCliOptions),
+    Mcp(mcp_cli::McpCliCommand),
     Plugin(plugin_cli::PluginCliCommand),
     Objective(objective_cli::ObjectiveCli),
     Session(session_cli::SessionCli),
@@ -67,6 +69,13 @@ async fn main() -> ExitCode {
             Ok(LintStatus::Failed) => ExitCode::FAILURE,
             Err(e) => {
                 eprintln!("yoi memory lint: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Mode::Mcp(command) => match mcp_cli::run(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("yoi mcp: {e}");
                 ExitCode::FAILURE
             }
         },
@@ -185,6 +194,10 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
         "plugin" => {
             let plugin_cli = parse_plugin_args(&args[1..])?;
             return Ok(Mode::Plugin(plugin_cli));
+        }
+        "mcp" => {
+            let mcp_cli = parse_mcp_args(&args[1..])?;
+            return Ok(Mode::Mcp(mcp_cli));
         }
         "panel" => {
             return Ok(Mode::Tui {
@@ -593,6 +606,147 @@ fn plugin_usage() -> &'static str {
     "usage: yoi plugin new rust-component-tool <path-or-name> [--json]\n       yoi plugin check <path-or-package> [--json]\n       yoi plugin pack <path> [--output <file>] [--json]\n       yoi plugin list [--workspace PATH] [--profile REF] [--json]\n       yoi plugin show <ref> [--workspace PATH] [--profile REF] [--json]"
 }
 
+fn parse_mcp_args(args: &[String]) -> Result<mcp_cli::McpCliCommand, ParseError> {
+    let Some((subcommand, rest)) = args.split_first() else {
+        return Err(ParseError(
+            "yoi mcp requires `list`, `show <server>`, `tools [server]`, `resources [server]`, or `prompts [server]`".to_string(),
+        ));
+    };
+    match subcommand.as_str() {
+        "list" => {
+            let (mcp_args, positional) = parse_mcp_common_args(rest)?;
+            if !positional.is_empty() {
+                return Err(ParseError(
+                    "yoi mcp list does not accept positional arguments".to_string(),
+                ));
+            }
+            Ok(mcp_cli::McpCliCommand::List(mcp_args))
+        }
+        "show" => {
+            let (mcp_args, positional) = parse_mcp_common_args(rest)?;
+            match positional.as_slice() {
+                [server] => Ok(mcp_cli::McpCliCommand::Show {
+                    server: server.clone(),
+                    args: mcp_args,
+                }),
+                [] => Err(ParseError(
+                    "yoi mcp show requires a server name".to_string(),
+                )),
+                _ => Err(ParseError(
+                    "yoi mcp show accepts exactly one server name".to_string(),
+                )),
+            }
+        }
+        "tools" => {
+            let (mcp_args, positional) = parse_mcp_common_args(rest)?;
+            match positional.as_slice() {
+                [] => Ok(mcp_cli::McpCliCommand::Tools {
+                    server: None,
+                    args: mcp_args,
+                }),
+                [server] => Ok(mcp_cli::McpCliCommand::Tools {
+                    server: Some(server.clone()),
+                    args: mcp_args,
+                }),
+                _ => Err(ParseError(
+                    "yoi mcp tools accepts at most one server name".to_string(),
+                )),
+            }
+        }
+        "resources" => {
+            let (mcp_args, positional) = parse_mcp_common_args(rest)?;
+            match positional.as_slice() {
+                [] => Ok(mcp_cli::McpCliCommand::Resources {
+                    server: None,
+                    args: mcp_args,
+                }),
+                [server] => Ok(mcp_cli::McpCliCommand::Resources {
+                    server: Some(server.clone()),
+                    args: mcp_args,
+                }),
+                _ => Err(ParseError(
+                    "yoi mcp resources accepts at most one server name".to_string(),
+                )),
+            }
+        }
+        "prompts" => {
+            let (mcp_args, positional) = parse_mcp_common_args(rest)?;
+            match positional.as_slice() {
+                [] => Ok(mcp_cli::McpCliCommand::Prompts {
+                    server: None,
+                    args: mcp_args,
+                }),
+                [server] => Ok(mcp_cli::McpCliCommand::Prompts {
+                    server: Some(server.clone()),
+                    args: mcp_args,
+                }),
+                _ => Err(ParseError(
+                    "yoi mcp prompts accepts at most one server name".to_string(),
+                )),
+            }
+        }
+        "--help" | "-h" => Err(ParseError(mcp_usage().to_string())),
+        other => Err(ParseError(format!("unknown yoi mcp command: {other}"))),
+    }
+}
+
+fn parse_mcp_common_args(
+    args: &[String],
+) -> Result<(mcp_cli::McpCliArgs, Vec<String>), ParseError> {
+    let mut mcp_args = mcp_cli::McpCliArgs::default();
+    let mut positional = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--json" {
+            mcp_args.json = true;
+            index += 1;
+        } else if arg == "--workspace" {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| ParseError("--workspace requires a value".to_string()))?;
+            if value.starts_with('-') {
+                return Err(ParseError("--workspace requires a value".to_string()));
+            }
+            mcp_args.workspace = Some(PathBuf::from(value));
+            index += 2;
+        } else if let Some(value) = arg.strip_prefix("--workspace=") {
+            if value.is_empty() {
+                return Err(ParseError("--workspace requires a value".to_string()));
+            }
+            mcp_args.workspace = Some(PathBuf::from(value));
+            index += 1;
+        } else if arg == "--profile" {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| ParseError("--profile requires a value".to_string()))?;
+            if value.starts_with('-') {
+                return Err(ParseError("--profile requires a value".to_string()));
+            }
+            mcp_args.profile = Some(value.clone());
+            index += 2;
+        } else if let Some(value) = arg.strip_prefix("--profile=") {
+            if value.is_empty() {
+                return Err(ParseError("--profile requires a value".to_string()));
+            }
+            mcp_args.profile = Some(value.to_string());
+            index += 1;
+        } else if arg == "--help" || arg == "-h" {
+            return Err(ParseError(mcp_usage().to_string()));
+        } else if arg.starts_with('-') {
+            return Err(ParseError(format!("unknown yoi mcp argument: {arg}")));
+        } else {
+            positional.push(arg.clone());
+            index += 1;
+        }
+    }
+    Ok((mcp_args, positional))
+}
+
+fn mcp_usage() -> &'static str {
+    "usage: yoi mcp list [--workspace PATH] [--profile REF] [--json]\n       yoi mcp show <server> [--workspace PATH] [--profile REF] [--json]\n       yoi mcp tools [server] [--workspace PATH] [--profile REF] [--json]\n       yoi mcp resources [server] [--workspace PATH] [--profile REF] [--json]\n       yoi mcp prompts [server] [--workspace PATH] [--profile REF] [--json]"
+}
+
 fn parse_panel_workspace(args: &[String]) -> Result<PathBuf, ParseError> {
     match args {
         [] => std::env::current_dir()
@@ -623,7 +777,7 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
 
 fn print_help() {
     println!(
-        "yoi\n\nUsage:\n  yoi [OPTIONS] [POD_NAME]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi pod [POD_OPTIONS]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi plugin new rust-component-tool <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Pod chat/client surface (default, --pod, --resume)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n  -r, --resume           Open the Pod Console picker and resume/attach a Pod\n      --workspace <PATH> Runtime workspace root (defaults to cwd)\n      --pod <NAME>       Open the Pod Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Pod Console to a specific socket with --pod\n      --session <UUID>   Resume a specific session segment in the Pod Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
+        "yoi\n\nUsage:\n  yoi [OPTIONS] [POD_NAME]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi pod [POD_OPTIONS]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi plugin new rust-component-tool <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Pod chat/client surface (default, --pod, --resume)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n  -r, --resume           Open the Pod Console picker and resume/attach a Pod\n      --workspace <PATH> Runtime workspace root (defaults to cwd)\n      --pod <NAME>       Open the Pod Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Pod Console to a specific socket with --pod\n      --session <UUID>   Resume a specific session segment in the Pod Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
     );
 }
 
@@ -812,6 +966,57 @@ mod tests {
             }
             _ => panic!("expected Plugin show mode"),
         }
+    }
+
+    #[test]
+    fn parse_mcp_commands() {
+        match parse_args_from(["mcp", "list", "--workspace=/tmp/ws", "--json"]).unwrap() {
+            Mode::Mcp(mcp_cli::McpCliCommand::List(options)) => {
+                assert_eq!(options.workspace, Some(PathBuf::from("/tmp/ws")));
+                assert!(options.json);
+            }
+            _ => panic!("expected MCP list mode"),
+        }
+
+        match parse_args_from(["mcp", "show", "filesystem", "--profile", "project:mcp"]).unwrap() {
+            Mode::Mcp(mcp_cli::McpCliCommand::Show { server, args }) => {
+                assert_eq!(server, "filesystem");
+                assert_eq!(args.profile.as_deref(), Some("project:mcp"));
+            }
+            _ => panic!("expected MCP show mode"),
+        }
+
+        match parse_args_from(["mcp", "tools", "filesystem"]).unwrap() {
+            Mode::Mcp(mcp_cli::McpCliCommand::Tools { server, .. }) => {
+                assert_eq!(server.as_deref(), Some("filesystem"));
+            }
+            _ => panic!("expected MCP tools mode"),
+        }
+
+        match parse_args_from(["mcp", "resources"]).unwrap() {
+            Mode::Mcp(mcp_cli::McpCliCommand::Resources { server, .. }) => {
+                assert!(server.is_none());
+            }
+            _ => panic!("expected MCP resources mode"),
+        }
+
+        match parse_args_from(["mcp", "prompts", "filesystem"]).unwrap() {
+            Mode::Mcp(mcp_cli::McpCliCommand::Prompts { server, .. }) => {
+                assert_eq!(server.as_deref(), Some("filesystem"));
+            }
+            _ => panic!("expected MCP prompts mode"),
+        }
+    }
+
+    #[test]
+    fn parse_mcp_rejects_usage_errors() {
+        let err = parse_args_from(["mcp", "show"]).unwrap_err();
+        assert_eq!(err.to_string(), "yoi mcp show requires a server name");
+        let err = parse_args_from(["mcp", "list", "extra"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "yoi mcp list does not accept positional arguments"
+        );
     }
 
     #[test]
