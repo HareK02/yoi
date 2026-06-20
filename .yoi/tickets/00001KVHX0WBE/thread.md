@@ -247,3 +247,48 @@ Reviewer validation:
 Worktree status at review end: tracked source tree clean; ignored `target/` only。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T09:30:11Z -->
+
+## Implementation report
+
+Coder r1-fix report received from `yoi-coder-00001KVHX0WBE`.
+
+New fix commit:
+- `135343a2 tui: preserve dashboard after console return`
+
+Branch commits now:
+- `135343a2 tui: preserve dashboard after console return`
+- `5415a947 tui: introduce dashboard console boundaries`
+
+Fix summary:
+- `crates/tui/src/dashboard/mod.rs`:
+  - Added `finish_nested_console_open(...)` helper。
+  - Successful nested Console return now calls `app.finish_open(...)` and continues the Dashboard loop with the same `DashboardApp`。
+  - Recoverable nested Console failures now call `app.finish_open(...)` and continue the Dashboard loop instead of leaving fullscreen / exiting。
+  - Non-recoverable errors still leave Dashboard fullscreen and bubble the error。
+  - Removed fresh `load_app(...)` replacement after Console return, preserving selection, composer draft, diagnostics, notices, and other local Dashboard state。
+- `crates/tui/src/dashboard/tests.rs`:
+  - Added regression coverage for nested Console success continuing without dropping Dashboard state。
+  - Added regression coverage for recoverable nested Console failure continuing without dropping Dashboard state。
+  - Added regression coverage for non-recoverable nested Console failure bubbling without incorrectly finishing/mutating Dashboard open state。
+
+Coder validation reported as passing:
+- `cargo fmt --check`
+- `git diff --check`
+- `git diff --check 7e35721a..HEAD`
+- `cargo test -p tui`
+- `cargo test -p yoi`
+- `cargo check --workspace --all-targets`
+- Targeted grep/help checks for Dashboard/Console/TUI terminology, `LaunchMode::Panel => dashboard::launch(...)`, no `single_pod::run_panel`, and no `yoi dashboard` alias。
+
+Orchestrator evidence checked before r2 review:
+- Implementation worktree is clean。
+- HEAD is `135343a2`。
+- Fix diff from `5415a947..HEAD` touches `crates/tui/src/dashboard/mod.rs` and `crates/tui/src/dashboard/tests.rs`, about 95 insertions / 15 deletions。
+- Overall `git diff --check 7e35721a..HEAD` produced no diagnostics。
+
+Next action:
+- Route back to Reviewer for r2 verification of Dashboard state preservation and final acceptance criteria。
+
+---
