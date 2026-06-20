@@ -15,6 +15,42 @@ const ZIP_COMPRESSION_STORED: u16 = 0;
 const ZIP_UNIX_SYMLINK_TYPE: u32 = 0o120000;
 const ZIP_UNIX_FILE_TYPE_MASK: u32 = 0o170000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PluginTemplateResource {
+    pub path: &'static str,
+    pub contents: &'static str,
+}
+
+/// Embedded starter template for Rust Component Model Tool Plugins.
+///
+/// The template is data only: it performs no filesystem/network operations and
+/// grants no authority. Future authoring CLI commands can materialize these
+/// files into a chosen destination after applying their own overwrite policy.
+pub const RUST_COMPONENT_TOOL_TEMPLATE: &[PluginTemplateResource] = &[
+    PluginTemplateResource {
+        path: "Cargo.toml",
+        contents: include_str!(
+            "../../../resources/plugin/templates/rust-component-tool/Cargo.toml"
+        ),
+    },
+    PluginTemplateResource {
+        path: "src/lib.rs",
+        contents: include_str!(
+            "../../../resources/plugin/templates/rust-component-tool/src/lib.rs"
+        ),
+    },
+    PluginTemplateResource {
+        path: "plugin.toml",
+        contents: include_str!(
+            "../../../resources/plugin/templates/rust-component-tool/plugin.toml"
+        ),
+    },
+    PluginTemplateResource {
+        path: "README.md",
+        contents: include_str!("../../../resources/plugin/templates/rust-component-tool/README.md"),
+    },
+];
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PluginConfig {
@@ -1956,6 +1992,40 @@ fn is_safe_id(value: &str) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn embedded_rust_component_tool_template_is_valid_package_shape() {
+        let paths: BTreeSet<_> = RUST_COMPONENT_TOOL_TEMPLATE
+            .iter()
+            .map(|file| file.path)
+            .collect();
+        assert_eq!(
+            paths,
+            BTreeSet::from(["Cargo.toml", "src/lib.rs", "plugin.toml", "README.md"])
+        );
+        assert!(
+            RUST_COMPONENT_TOOL_TEMPLATE
+                .iter()
+                .all(|file| !file.path.starts_with('/') && !file.path.contains(".."))
+        );
+
+        let manifest_text = RUST_COMPONENT_TOOL_TEMPLATE
+            .iter()
+            .find(|file| file.path == "plugin.toml")
+            .unwrap()
+            .contents;
+        let manifest: PluginPackageManifest = toml::from_str(manifest_text).unwrap();
+        assert_eq!(manifest.schema_version, SUPPORTED_PLUGIN_API_VERSION);
+        assert_eq!(
+            manifest.runtime.as_ref().unwrap().kind,
+            PLUGIN_RUNTIME_COMPONENT_KIND
+        );
+        assert_eq!(
+            manifest.runtime.as_ref().unwrap().world.as_deref(),
+            Some(PLUGIN_COMPONENT_TOOL_WORLD)
+        );
+        assert_eq!(manifest.tools.len(), 1);
+    }
 
     #[test]
     fn discovers_valid_user_and_workspace_packages() {

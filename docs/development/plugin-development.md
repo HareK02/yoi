@@ -20,13 +20,15 @@ Implemented foundation:
 - Plugin permission grants;
 - raw core-Wasm Tool runtime;
 - Component Model Tool runtime;
+- first-party Rust PDK helpers for Component Model Tool guests;
+- embedded Rust Component Tool starter template;
 - `https` and `fs` host APIs for Tool runtime;
 - read-only `yoi plugin list/show` inspection.
 
 Still intentionally separate/future work:
 
 - `yoi plugin new/check/pack` authoring commands;
-- polished multi-language SDK/PDK crates;
+- multi-language SDK/PDK crates;
 - Service / Ingress surfaces;
 - WebSocket or inbound HTTP for bidirectional bridges;
 - public registry/install/update/signature tooling.
@@ -90,9 +92,24 @@ abi = "yoi-plugin-wasm-1"
 
 Do not rely on package presence to activate anything. Discovery only records inventory.
 
-## Component Model authoring sketch
+## Component Model + Rust PDK authoring
 
-Yoi's Component Model Tool world is stored in `resources/plugin/wit/`. A minimal Rust sketch is available at:
+Component Model authoring with `yoi-plugin-pdk` is the preferred path for new Tool Plugins. The raw core-Wasm ABI remains available only as compatibility/transitional runtime support.
+
+Yoi's Component Model Tool world is stored in `resources/plugin/wit/`. The embedded Rust starter template is available as data in the Yoi source tree at:
+
+```text
+resources/plugin/templates/rust-component-tool/
+```
+
+It contains:
+
+- `Cargo.toml` with a checkout-local `yoi-plugin-pdk` path dependency;
+- `src/lib.rs` with WIT binding generation and typed JSON Tool handling;
+- `plugin.toml` targeting `kind = "wasm-component"` and `world = "yoi:plugin/tool@1.0.0"`;
+- README next steps and the future out-of-tree pinned git `rev` dependency pattern.
+
+A minimal PDK-backed Rust sketch is also available at:
 
 ```text
 docs/examples/plugin-component-tool/lib.rs
@@ -101,27 +118,43 @@ docs/examples/plugin-component-tool/lib.rs
 The important authoring shape is:
 
 ```rust
-wit_bindgen::generate!({
+use serde::{Deserialize, Serialize};
+use yoi_plugin_pdk::{ToolContext, ToolError, ToolOutput};
+
+yoi_plugin_pdk::wit_bindgen::generate!({
     world: "tool",
     path: "../../../resources/plugin/wit",
 });
 
-struct Plugin;
-
-impl Guest for Plugin {
-    fn call(tool_name: String, input_json: String) -> String {
-        format!(
-            r#"{{"summary":"component tool {tool_name}","content":"input was {input_json}"}}"#
-        )
-    }
+#[derive(Deserialize)]
+struct EchoInput {
+    text: String,
 }
 
-export!(Plugin);
+#[derive(Serialize)]
+struct EchoOutput<'a> {
+    tool: &'a str,
+    text: String,
+}
+
+fn handle_echo(ctx: ToolContext, input: EchoInput) -> Result<ToolOutput, ToolError> {
+    ToolOutput::json(
+        format!("{} ok", ctx.tool_name()),
+        EchoOutput {
+            tool: ctx.tool_name(),
+            text: input.text,
+        },
+    )
+}
+
+yoi_plugin_pdk::export_component_tool!(Plugin, handle_echo);
 ```
 
-The returned string is ordinary `ToolOutput` JSON. It is routed through the normal Tool result path; the component cannot inject hidden context.
+`run_json_tool` parses the WIT `input-json` string into a typed input, passes a `ToolContext` containing the selected Tool name, and serializes `ToolOutput` JSON accepted by the current component runtime. `ToolError` values are structured and bounded, then rendered through the ordinary Tool result path; the component cannot inject hidden context.
 
-The exact build pipeline depends on the authoring toolchain (`wit-bindgen`, component adapter tooling, etc.). Until `yoi plugin new/check/pack` exists, Plugin authors should treat the example as the ABI contract sketch and use `yoi plugin list/show` plus focused runtime tests to verify packages.
+The PDK is guest-side only. It does not depend on Yoi host/runtime crates and does not grant filesystem, network, or environment authority. Host-side Plugin manifests and explicit enablement grants remain the authority boundary for Tool execution and for WIT host APIs such as `yoi:host/https` and `yoi:host/fs`.
+
+The exact component build pipeline depends on the authoring toolchain (`wit-bindgen`, component adapter tooling, etc.). Crates.io publication, remote template fetching, and `yoi plugin new/check/pack` are intentionally deferred. Until they exist, Plugin authors should treat the template/example as the ABI contract sketch and use `yoi plugin list/show` plus focused runtime tests to verify packages.
 
 ## Enabling a Plugin in a workspace
 

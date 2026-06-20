@@ -100,7 +100,7 @@ The migration should be phased:
 2. Add manifest/schema support for `runtime.kind = "wasm-component"` without executing it during discovery.
 3. Add a component runtime backend and typed host import/export binding.
 4. Port `https` and `fs` host API designs to WIT-compatible interfaces.
-5. Add a Rust authoring SDK/template around the component world.
+5. Add a Rust PDK/template around the component world.
 6. Decide whether the raw ABI remains supported, becomes legacy-only, or is deprecated after examples and tests move.
 
 ## Runtime/backend caution
@@ -161,10 +161,14 @@ Wrong `world`, missing artifact metadata, missing `call` export, unsupported
 imports, or core-Wasm bytes in a component package all fail closed with bounded
 Plugin diagnostics or ordinary Tool errors.
 
-See `docs/examples/plugin-component-tool/lib.rs` for a minimal
-`wit-bindgen`/SDK-style authoring sketch. Package authors should generate
-bindings from `resources/plugin/wit`, build a component artifact, and set the
-component runtime metadata above.
+See `docs/examples/plugin-component-tool/lib.rs` and the embedded
+`resources/plugin/templates/rust-component-tool/` starter for the preferred
+Rust PDK authoring path. `yoi-plugin-pdk` is guest-side only: it re-exports
+`wit-bindgen`, provides typed JSON input/output helpers, renders bounded
+`ToolError` values as ordinary ToolOutput JSON, and does not depend on host
+runtime crates or grant authority. Package authors should generate bindings from
+`resources/plugin/wit`, build a component artifact, and set the component
+runtime metadata above.
 
 ### v1 request/response shape
 
