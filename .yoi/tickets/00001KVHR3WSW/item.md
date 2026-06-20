@@ -12,7 +12,7 @@ queued_at: '2026-06-20T05:59:05Z'
 
 ## Background
 
-MCP servers can notify that tools/resources/prompts lists changed. Yoi must not silently go stale, but it also must not mutate the model-visible tool schema or context in a way that violates history/prompt-cache invariants during a run.
+MCP servers can notify that tools/resources/prompts lists changed. Yoi must not silently go stale, but it also must not mutate the active run's model-visible tool schema or context in a way that violates history/prompt-cache invariants. This Ticket defines provider tool-list refresh behavior at safe boundaries.
 
 ## Requirements
 

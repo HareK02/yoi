@@ -10,7 +10,7 @@ linked_tickets: ['00001KTR81P9X', '00001KV0SP0TY', '00001KVHR3WRF', '00001KVHR3W
 
 Add MCP local stdio integration to Yoi without weakening Worker history, prompt-context, scoped tool permission, or Plugin/Feature layering invariants.
 
-MCP is a protocol-backed integration layer on top of `pod::feature`. `pod::feature` supplies contribution/lifecycle/dynamic registration substrate; MCP owns its own enablement, local server trust model, command/env/secret policy, and MCP-specific permission decisions. MCP is not the Plugin model, and Plugin permission policy is not implemented by feature-layer authority grants.
+MCP is a protocol-backed integration layer on top of `pod::feature`. `pod::feature` supplies contribution/lifecycle/runtime-discovered registration substrate; MCP owns its own enablement, local server trust model, command/env/secret policy, and MCP-specific permission decisions. MCP is not the Plugin model, and Plugin permission policy is not implemented by feature-layer authority grants.
 
 ## Strategic direction
 
@@ -29,14 +29,14 @@ MCP is a protocol-backed integration layer on top of `pod::feature`. `pod::featu
 ## Layering decisions
 
 - `pod::feature` is an API/contribution substrate.
-  - It owns contribution declarations, provider/service lifecycle hooks, diagnostics, dynamic registration plumbing, and integration with normal Worker/ToolRegistry paths.
+  - It owns contribution declarations, provider/service lifecycle hooks, diagnostics, runtime-discovered registration plumbing, and integration with normal Worker/ToolRegistry paths.
   - It does not own Plugin permission policy or MCP server trust policy.
 - Plugin is a user-facing package/config/runtime layer over `pod::feature`.
   - Plugin permissions are Plugin-layer policy.
   - Plugin package discovery/enablement must not be conflated with MCP local server execution.
 - MCP is a separate feature-backed integration layer.
   - MCP enablement, command/env/secret handling, server trust, and MCP-specific permission decisions live in MCP config/implementation.
-  - MCP dynamic tools/resources/prompts are exposed through the feature API and ordinary Yoi tool paths.
+  - MCP provider-discovered tools/resources/prompts are exposed through the feature API and ordinary Yoi tool paths.
 
 ## Concrete implementation tickets
 
@@ -52,7 +52,7 @@ Concrete MCP implementation sequence:
 2. `00001KVHR3WRY` — MCP stdio JSON-RPC lifecycle client.
    - subprocess lifecycle, initialize/capability negotiation, diagnostics, shutdown.
 3. `00001KVHR3WS6` — MCP tools/list registration into ToolRegistry.
-   - stable namespacing, schema validation, untrusted metadata normalization, no tools/call yet.
+   - provider-discovered tools, stable namespacing, schema validation, untrusted metadata normalization, no tools/call yet.
 4. `00001KVHR3WSD` — MCP tools/call execution through ordinary Tool path.
    - PreToolCall gate before server call, bounded result serialization, history path.
 5. `00001KVHR3WSN` — MCP resources/prompts as explicit tool operations.
@@ -61,6 +61,19 @@ Concrete MCP implementation sequence:
    - deterministic safe refresh/diagnostic behavior without breaking tool schema or prompt-cache invariants.
 
 The old broad implementation Ticket `00001KTR82RB7` is superseded by this sequence and should not be used as an implementation work item.
+
+## Terminology
+
+Use `runtime-discovered` or `provider-discovered` for MCP tools/resources/prompts discovered from `tools/list`, `resources/list`, or `prompts/list`. Avoid `dynamic tools` / `dynamic registry` in new MCP design prose because those phrases imply that model-visible tool schemas may change during an active LLM run.
+
+The intended invariant is:
+
+```text
+provider-discovered at startup / provider initialization;
+registered into the ordinary ToolRegistry before model exposure;
+run-stable for the duration of a model request/run;
+refreshed only at a safe boundary or reported as a diagnostic.
+```
 
 ## Later follow-ups
 

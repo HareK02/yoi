@@ -13,7 +13,7 @@
       "ticket_id": "00001KVHR3WS6",
       "kind": "related",
       "target": "00001KTR81P9X",
-      "note": "MCP tool registration uses feature dynamic contribution plumbing.",
+      "note": "MCP tool registration uses feature runtime-discovered contribution plumbing.",
       "author": "yoi ticket",
       "at": "2026-06-20T05:33:03Z"
     }
