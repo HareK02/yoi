@@ -186,3 +186,48 @@ Review dispatch:
 - Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVHKWNQS-r1 at: 2026-06-20T06:36:52Z status: request_changes -->
+
+## Review: request changes
+
+Verdict: `request_changes`
+
+確認範囲:
+- Ticket body/thread / Orchestrator IntentPacket
+- Implementation diff: `d1095f85..945ecdf6`
+- 主な対象: `crates/yoi/src/plugin_cli.rs`, `crates/yoi/src/main.rs`, `crates/manifest/src/plugin.rs`, `resources/plugin/templates/rust-component-tool/*`, `docs/development/plugin-development.md`, `package.nix`。
+
+Blocking issues:
+1. `yoi plugin new` が symlink destination を辿り、物理的な requested destination 外へ書き込める。
+   - `materialize_template` は `fs::metadata(destination)` / `fs::read_dir(destination)` を使い、destination symlink を拒否せず `destination.join(relative)` に書く。
+   - Reviewer smoke: `linkdest -> target` に対して `plugin new rust-component-tool "$tmp/linkdest"` を実行すると、`target/plugin.toml` が作られた。
+   - Ticket invariant: `new` は requested destination にだけ書き、non-empty destination を拒否する。symlink destination はこの境界を破る。
+
+2. Generated placeholder component が `check` で enablement-ready に見える。
+   - Template は text placeholder `resources/plugin/templates/rust-component-tool/plugin.component.wasm` を含む。
+   - `new` output は next steps で一度 warning するが、fresh generated template に対する `check --json` は `status=active diagnostics=0` になり、generic enablement guidance を出す。
+   - Reviewer smoke: generated template check output に placeholder/non-executable warning がなく、`To enable after review...` guidance が出る。
+   - Ticket/reviewer contract: check/pack may pass, but output must not imply executable component is ready for enablement if placeholder is not executable。
+
+Required fixes:
+- `plugin new` destination symlink を `symlink_metadata` 等で拒否し、symlink write-through を防ぐ。関連する overwrite/destination tests を追加する。
+- Generated placeholder artifact を `check` が検出し、bounded diagnostic / next step を出す。Status は `partial` など enablement-ready でない表現にすることを優先する。少なくとも `active diagnostics=0` と enablement guidance の組み合わせは避ける。
+- `check --json` and human output tests should cover generated template placeholder warning/status。
+
+Non-blocking concerns:
+- `nix build .#yoi --no-link` は environment storage (`No space left on device`) で失敗。source-filter/resource-packaging issue は見えていないが、最終 Orchestrator validation で再試行する。
+- `pack --json` digest is nested under `package.digest`, not top-level. Acceptable if documented/stable, but consider documenting shape。
+
+Reviewer validation:
+- `cargo fmt --check`: passed
+- `git diff --check d1095f85..HEAD`: passed
+- `cargo check -p yoi`: passed
+- `cargo test -p yoi plugin_cli`: passed (`15 tests`)
+- `cargo test -p yoi-plugin-pdk template`: passed
+- CLI smoke for `new`, `check --json`, `pack --json`, packed package check/list discovery, invalid check rejected: passed except blocker findings above。
+- `nix build .#yoi --no-link`: failed due `No space left on device`。
+
+Worktree status at review end: clean。
+
+---
