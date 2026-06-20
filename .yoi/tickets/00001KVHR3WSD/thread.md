@@ -167,3 +167,53 @@ Review dispatch:
 - Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVHR3WSD-r1 at: 2026-06-20T09:16:53Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket contract / Orchestrator IntentPacket。
+- Implementation diff: `92432ad7..9a245403`。
+- 主な対象: `crates/pod/src/feature/mcp.rs`, `crates/mcp/src/stdio.rs`, `crates/mcp/tests/stdio_lifecycle.rs`, `crates/mcp/tests/fixtures/mock_server.rs`。
+- Ordinary Worker/permission path: `crates/llm-worker/src/worker.rs`, `crates/pod/src/permission.rs`, `crates/pod/src/feature.rs`。
+- Out-of-scope MCP surfaces (`resources/read`, `prompts/get`, `list_changed`, sampling/elicitation) の追加有無。
+
+Blocking issues: none。
+
+Critical risk checks:
+- Permission denial occurs before `tools/call` can be sent:
+  - MCP-discovered tools are ordinary `ToolDefinition`s wrapping `McpStdioTool`。
+  - Protocol-provider contributions install through `register_tool_contribution`, not a private bypass。
+  - Worker executes `pre_tool_call` first and only executes approved tools afterward。
+  - Pod manifest permissions are `PreToolCall` hooks returning deny as synthetic results。
+- Result flow uses ordinary Tool result/history path:
+  - `McpStdioTool::execute` returns `ToolOutput`。
+  - Worker converts to `ToolResult` and commits through existing history append path。
+  - No hidden context injection or out-of-band model context path found。
+- Normal MCP result / MCP `isError: true` / JSON-RPC protocol error are distinct:
+  - `CallToolResult` carries `is_error` separately from JSON-RPC error。
+  - MCP `isError: true` renders as model-visible untrusted data with `"status": "mcp_is_error"`。
+  - JSON-RPC error becomes `ToolError::ExecutionFailed` with protocol error wording。
+- Output bounding/untrusted handling exists for content blocks, text/string caps, JSON depth/node caps, rich image/audio data omission, and final byte cap。
+- Result root is marked `untrusted_mcp_tools_call_result` and preserves server payload as data。
+- Existing lifecycle/redaction/shutdown behavior is preserved。
+- No resources/prompts/list_changed/sampling/elicitation scope creep found。
+
+Non-blocking concerns / follow-ups:
+- MCP-specific permission-denial test is lifecycle no-call style, while actual Worker deny/no-execute behavior is covered by generic Worker synthetic-result test path. Code inspection confirms MCP tools use ordinary Worker path, so this is not blocking. Future MCP-specific Worker-level regression would make the invariant more direct。
+- Minor wording nit: successful `tools/call` with shutdown failure says “shutdown after tools/call failed”; functionally non-blocking。
+
+Reviewer validation:
+- `git diff --check 92432ad7..HEAD`: passed。
+- `cargo fmt --check`: passed。
+- `cargo test -p mcp --test stdio_lifecycle`: passed, 12 tests。
+- `cargo test -p pod feature::mcp`: passed, 9 tests。
+- `cargo check -p mcp -p pod`: passed。
+- `nix build .#yoi --no-link` not run by Reviewer because diff has no Cargo/Nix/source-filter changes and focused Rust checks passed。
+
+Worktree status at review end: clean。
+
+---
