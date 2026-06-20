@@ -427,3 +427,77 @@ Next action:
 - Route back to Reviewer for r3 verification of per-surface enabled selection enforcement and final acceptance criteria。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVJHYP4Q-r1 at: 2026-06-20T15:04:08Z status: request_changes -->
+
+## Review: request changes
+
+Verdict: `request_changes`
+
+確認範囲:
+- Ticket authority / Orchestrator IntentPacket。
+- r3 fix diff: `870bcc76..79ca0f7f`。
+- Relevant overall implementation shape: `5ec8bae9..79ca0f7f`。
+- 主な対象:
+  - `crates/pod/src/feature/plugin.rs`
+  - `crates/yoi/src/plugin_cli.rs`
+  - `crates/manifest/src/plugin.rs`
+  - `crates/plugin-pdk/src/lib.rs`
+  - `resources/plugin/templates/rust-component-instance/*`
+  - `resources/plugin/wit/yoi-plugin-instance-v1.wit`
+
+Previous r2 blocker verification:
+- Runtime/registration side is mostly fixed。
+- Descriptor construction is gated by `record.enabled_surfaces`。
+- Install loops now gate Service / Ingress / Tool setup independently。
+- Install denial accounting counts selected exposed surfaces rather than only Tools。
+- Runtime dispatch guards exist for unselected Tool/Ingress use。
+- Tests cover requested selected/unselected mixed-surface cases。
+
+Blocking issue:
+
+1. Static inspection / `yoi plugin list/show` still evaluates unselected surfaces and can mark valid partial-surface enablement as rejected。
+   - Runtime install now filters enabled surfaces, but static inspection still treats all declared manifest Tool / Service / Ingress surfaces as active eligibility requirements。
+   - `PluginStaticInspection::statically_eligible()` requires all inspected tools, services, and ingresses to be eligible。
+   - `inspect_resolved_plugin_static()` still iterates over all declared manifest tools/services/ingresses rather than selected/enabled surfaces。
+   - `yoi plugin list/show` uses this unfiltered static inspection for resolved items。
+   - Status calculation can classify the resolved item as `rejected` when no usable Tool exists and `static_eligible` is false。
+
+Concrete failure mode:
+- Mixed package declares Tool + Service。
+- Enablement selects only Service。
+- Service grants are present; Tool grants are absent because Tool is not selected。
+- Runtime install correctly ignores unselected Tool。
+- Static inspection still checks unselected Tool and records missing Tool grant diagnostics, so `static_eligible = false`。
+- For service-only selection with no usable Tool, `yoi plugin list/show` can report the resolved plugin as `rejected` even though selected Service surface is valid/installable。
+
+Why this blocks approval:
+- Ticket requires Tool / Service / Ingress grants to be independent。
+- Unselected surfaces must not block selected surfaces。
+- Ticket also requires `yoi plugin check/list/show` to report legacy vs instance-capable/rejected surfaces accurately。
+- Runtime path is fixed, but inspection/status can still be blocked by unselected surfaces, creating authority/reporting mismatch。
+
+Required fix:
+- Make resolved static inspection eligibility account for `record.enabled_surfaces`。
+- Alternatively, separate declared-surface inspection from enabled-surface inspection and compute resolved `list/show` status from enabled surfaces only。
+- Keep `plugin check` free to inspect full package declaration if appropriate, but `plugin list/show` for a resolved enablement must not mark selected Service/Ingress invalid because unrelated unselected Tool grants are absent。
+- Add focused `yoi plugin` tests for mixed-surface partial enablement status/reporting。
+
+Non-blocking concern:
+- Runtime install tests now cover partial enablement, but focused `yoi plugin list/show` tests are still missing and should be added with the fix。
+
+Reviewer validation:
+- `cargo fmt --check`: passed。
+- `git diff --check 5ec8bae9..HEAD`: passed。
+- Template cargo-check: passed。
+- `cargo test -p manifest plugin -- --nocapture`: passed。
+- `cargo test -p pod plugin -- --nocapture`: passed。
+- `cargo test -p yoi plugin -- --nocapture`: passed。
+- `cargo check -p yoi`: passed。
+- `cargo check -p yoi-plugin-pdk`: passed。
+- `yoi ticket doctor`: passed。
+- `nix build .#yoi --no-link`: passed。
+
+Worktree status at end: clean。
+
+---

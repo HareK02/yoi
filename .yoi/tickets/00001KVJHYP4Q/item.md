@@ -2,7 +2,7 @@
 title: 'Plugin Service/Ingress component lifecycle surface'
 state: 'inprogress'
 created_at: '2026-06-20T13:01:37Z'
-updated_at: '2026-06-20T14:59:25Z'
+updated_at: '2026-06-20T15:04:08Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-20T13:28:19Z'
