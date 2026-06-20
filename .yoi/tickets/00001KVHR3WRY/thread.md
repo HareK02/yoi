@@ -223,3 +223,46 @@ Reviewer validation:
 Worktree status at review end: clean。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T07:55:55Z -->
+
+## Implementation report
+
+Coder r1-fix report received from `yoi-coder-00001KVHR3WRY`.
+
+New fix commit:
+- `f396e1a2 mcp: redact stdio server spec debug`
+
+Branch commits now:
+- `f396e1a2 mcp: redact stdio server spec debug`
+- `a114fa9d mcp: implement stdio lifecycle client`
+
+Fix summary:
+- Removed derived `Debug` from `McpStdioServerSpec`。
+- Added custom redacted `Debug` implementation。
+- Debug output preserves useful non-sensitive fields: `name`, `command`, `args`, `cwd`, env keys, and redaction count。
+- Debug output never prints resolved env values or redaction values。
+- Added regression test verifying `format!("{:?}", spec)` does not contain literal/inherited/env-ref/secret-ref plaintext values while still showing non-sensitive metadata。
+
+Coder validation reported as passing:
+- `cargo fmt --check`
+- `cargo test -p mcp`
+- `cargo check`
+- `git diff --check c0e760d7..HEAD`
+- `cargo tree -p mcp --depth 1`
+- `nix build .#yoi --no-link`
+
+Remaining deferrals:
+- Protocol-version compatibility enforcement before downstream tools/resources/prompts registration。
+- Downstream callers should prefer explicit `shutdown()` over best-effort `Drop` cleanup。
+
+Orchestrator evidence checked before r2 review:
+- Implementation worktree is clean。
+- HEAD is `f396e1a2`。
+- Fix diff from `a114fa9d..HEAD` touches `crates/mcp/src/stdio.rs` and `crates/mcp/tests/stdio_lifecycle.rs`, about 47 insertions / 1 deletion。
+- Overall `git diff --check c0e760d7..HEAD` produced no diagnostics。
+
+Next action:
+- Route back to Reviewer for r2 verification of the redacted `Debug` blocker and final acceptance criteria。
+
+---
