@@ -152,3 +152,16 @@ Next action:
 - Dispatch Reviewer for r1 review against Ticket requirements, with focus on scope allow/deny merge semantics, authority boundary/no broadening beyond explicit override + defaults, workspace write / `.worktree` deny preservation, Ticket role policy preservation, snapshot/tool-visible scope consistency, and whether the full `cargo test -p pod` failure is unrelated/pre-existing。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-20T12:07:00Z -->
+
+## Plan
+
+Review dispatch:
+- Spawned Reviewer Pod `yoi-reviewer-00001KVJABS1A-r1` against implementation branch `impl/00001KVJABS1A-profile-override-scope`。
+- Review target commit: `0717aae3 pod: preserve profile override scope`。
+- Review baseline: `72e9f2f1`。
+- Reviewer task focuses on scope allow/deny merge semantics, no authority broadening beyond explicit override + launch defaults, workspace write / `.worktree` deny preservation, Ticket role launch/delegation constraints, metadata snapshot/effective scope consistency, restore non-goal, and reported full `cargo test -p pod` failure triage。
+- Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
+
+---
