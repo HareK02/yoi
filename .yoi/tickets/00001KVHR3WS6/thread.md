@@ -169,3 +169,55 @@ Review dispatch:
 - Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVHR3WS6-r1 at: 2026-06-20T08:35:07Z status: request_changes -->
+
+## Review: request changes
+
+Verdict: `request_changes`
+
+確認範囲:
+- Ticket contract / Orchestrator IntentPacket。
+- Diff: `a59e5c1e..66fa9d55`。
+- 主な対象: `crates/pod/src/feature/mcp.rs`, `crates/pod/src/controller.rs`, `crates/pod/src/feature.rs`, `crates/mcp/src/stdio.rs`, `crates/mcp/tests/stdio_lifecycle.rs`, `crates/mcp/tests/fixtures/mock_server.rs`, `crates/pod/Cargo.toml`, `Cargo.lock`, `package.nix`。
+- `tools/call`, resources/prompts registration, `list_changed`/`listChanged` handlingを確認。
+
+Blocking issue:
+1. Duplicate/colliding MCP tool names が fail-closed で reject されていない。
+   - Path: `crates/pod/src/feature/mcp.rs`
+   - `normalize_listed_tools` は最初の normalized name を登録し、後続 duplicate は diagnostic を出して skip するだけ。
+   - Test `duplicate_names_after_normalization_are_diagnostic_only` はこの挙動を期待している。
+   - Ticket / IntentPacket は invalid schemas / duplicates / collisions を fail-closed with bounded diagnostics と要求している。
+   - Server-controlled ordering で衝突する片方が model-visible tool として勝つため、normalized tool identity に対して fail-closed ではない。
+
+Required fix:
+- Duplicate/colliding normalized names は、少なくとも該当 normalized identity の tool を model-visible にしないこと。
+- より安全には、その server contribution/tool set 全体を reject/diagnostic-only にすること。
+- Test を更新し、colliding normalized name が model-visible tool として登録されないことを確認する。
+
+Non-blocking concerns / follow-ups:
+- Acceptance criteria の run-stable schema behavior について、active-run refresh/list_changed mutation は見当たらないが、明示テストはない。可能なら追加するとよい。
+- Secret-backed stdio env は integration path が `resolve_stdio_server(..., None)` のため bounded diagnostic で fail し、silent support claim はしていない。これは今回の deferral と整合。
+
+Positive findings:
+- `tools/list` は initialize 後に `McpStdioClient::list_tools_bounded` 経由で呼ばれる。
+- Pagination / tool-count bounds がある。
+- `tools/call` execution path は追加されていない。model-visible stub は not-implemented error を返す。
+- Resources/prompts は登録されていない。
+- Registration は既存 `pod::feature` protocol-provider contribution path を通って Worker/ToolRegistry に入る。
+- Server `instructions`, annotations, `_meta`, output schema は authority として使われていない。
+- Lifecycle redaction/shutdown behavior は保持されている。
+- Nix/Cargo dependency updates は minimal/consistent。
+
+Reviewer validation:
+- `cargo fmt --check`: passed。
+- `git diff --check a59e5c1e..HEAD`: passed。
+- `cargo test -p mcp list_tools --test stdio_lifecycle`: passed。
+- `cargo test -p pod feature::mcp --lib`: passed。
+- `cargo test -p mcp`: passed。
+- `cargo check -p pod -p mcp`: passed。
+- `nix build .#yoi --no-link`: passed。
+
+Worktree status at review end: clean。
+
+---
