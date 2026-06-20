@@ -234,7 +234,8 @@ impl PodController {
             runtime_dir.socket_path(),
             runtime_base.to_path_buf(),
             spawned_registry.clone(),
-        )?;
+        )
+        .await?;
 
         install_ticket_event_companion_notify_hook(
             &mut pod,
@@ -587,7 +588,7 @@ fn is_ticket_orchestrator_role(role: Option<&str>) -> bool {
 /// and the Pod-orchestration tools (SpawnPod + comm) on the Pod's
 /// Worker. Returns the `ScopedFs` clone used to attach a `PodFsView` to
 /// the shared state.
-fn register_pod_tools<C, St>(
+async fn register_pod_tools<C, St>(
     pod: &mut Pod<C, St>,
     bash_output_dir: PathBuf,
     spawner_socket: PathBuf,
@@ -607,6 +608,7 @@ where
     let session_id_for_usage = pod.segment_id().to_string();
     let memory_config = pod.manifest().memory.clone();
     let web_config = pod.manifest().web.clone();
+    let mcp_config = pod.manifest().mcp.clone();
     let feature_config = pod.manifest().feature.clone();
     let spawner_name = pod.manifest().pod.name.clone();
     let spawner_manifest = pod.manifest().clone();
@@ -663,6 +665,11 @@ where
         feature_config.plugins.enabled,
         &pod.manifest().plugins,
     ) {
+        feature_registry = feature_registry.with_module(module);
+    }
+    if let Some(module) =
+        crate::feature::mcp::discover_stdio_tool_feature(&mcp_config, &workspace_root).await
+    {
         feature_registry = feature_registry.with_module(module);
     }
 

@@ -169,3 +169,235 @@ Review dispatch:
 - Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVHR3WS6-r1 at: 2026-06-20T08:35:07Z status: request_changes -->
+
+## Review: request changes
+
+Verdict: `request_changes`
+
+確認範囲:
+- Ticket contract / Orchestrator IntentPacket。
+- Diff: `a59e5c1e..66fa9d55`。
+- 主な対象: `crates/pod/src/feature/mcp.rs`, `crates/pod/src/controller.rs`, `crates/pod/src/feature.rs`, `crates/mcp/src/stdio.rs`, `crates/mcp/tests/stdio_lifecycle.rs`, `crates/mcp/tests/fixtures/mock_server.rs`, `crates/pod/Cargo.toml`, `Cargo.lock`, `package.nix`。
+- `tools/call`, resources/prompts registration, `list_changed`/`listChanged` handlingを確認。
+
+Blocking issue:
+1. Duplicate/colliding MCP tool names が fail-closed で reject されていない。
+   - Path: `crates/pod/src/feature/mcp.rs`
+   - `normalize_listed_tools` は最初の normalized name を登録し、後続 duplicate は diagnostic を出して skip するだけ。
+   - Test `duplicate_names_after_normalization_are_diagnostic_only` はこの挙動を期待している。
+   - Ticket / IntentPacket は invalid schemas / duplicates / collisions を fail-closed with bounded diagnostics と要求している。
+   - Server-controlled ordering で衝突する片方が model-visible tool として勝つため、normalized tool identity に対して fail-closed ではない。
+
+Required fix:
+- Duplicate/colliding normalized names は、少なくとも該当 normalized identity の tool を model-visible にしないこと。
+- より安全には、その server contribution/tool set 全体を reject/diagnostic-only にすること。
+- Test を更新し、colliding normalized name が model-visible tool として登録されないことを確認する。
+
+Non-blocking concerns / follow-ups:
+- Acceptance criteria の run-stable schema behavior について、active-run refresh/list_changed mutation は見当たらないが、明示テストはない。可能なら追加するとよい。
+- Secret-backed stdio env は integration path が `resolve_stdio_server(..., None)` のため bounded diagnostic で fail し、silent support claim はしていない。これは今回の deferral と整合。
+
+Positive findings:
+- `tools/list` は initialize 後に `McpStdioClient::list_tools_bounded` 経由で呼ばれる。
+- Pagination / tool-count bounds がある。
+- `tools/call` execution path は追加されていない。model-visible stub は not-implemented error を返す。
+- Resources/prompts は登録されていない。
+- Registration は既存 `pod::feature` protocol-provider contribution path を通って Worker/ToolRegistry に入る。
+- Server `instructions`, annotations, `_meta`, output schema は authority として使われていない。
+- Lifecycle redaction/shutdown behavior は保持されている。
+- Nix/Cargo dependency updates は minimal/consistent。
+
+Reviewer validation:
+- `cargo fmt --check`: passed。
+- `git diff --check a59e5c1e..HEAD`: passed。
+- `cargo test -p mcp list_tools --test stdio_lifecycle`: passed。
+- `cargo test -p pod feature::mcp --lib`: passed。
+- `cargo test -p mcp`: passed。
+- `cargo check -p pod -p mcp`: passed。
+- `nix build .#yoi --no-link`: passed。
+
+Worktree status at review end: clean。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T08:40:48Z -->
+
+## Implementation report
+
+Coder r1-fix report received from `yoi-coder-00001KVHR3WS6`.
+
+New fix commit:
+- `0080c5b3 mcp: reject colliding tool names`
+
+Branch commits now:
+- `0080c5b3 mcp: reject colliding tool names`
+- `66fa9d55 mcp: register stdio server tools`
+
+Fix summary:
+- Changed duplicate/collision handling in `crates/pod/src/feature/mcp.rs` to fail closed for the normalized tool identity。
+- Implementation now normalizes all valid candidate tools first, counts namespaced normalized names, emits bounded duplicate diagnostics, and registers only candidates whose normalized name appears exactly once。
+- Server-controlled ordering can no longer cause the first colliding definition to become model-visible。
+- Updated test to prove `Mcp_demo_search_files` is not model-visible when produced by two colliding MCP tool names, while unrelated valid `Mcp_demo_unique` still registers。
+
+Coder validation reported as passing:
+- `cargo fmt --check`
+- `git diff --check a59e5c1e..HEAD`
+- `cargo test -p mcp list_tools --test stdio_lifecycle`
+- `cargo test -p pod feature::mcp --lib`
+- `cargo test -p mcp`
+- `cargo check -p pod -p mcp`
+- `nix build .#yoi --no-link`
+
+Remaining deferrals unchanged:
+- MCP `tools/call` execution remains intentionally unimplemented。
+- Resources/prompts and `list_changed` handling remain out of scope。
+
+Orchestrator evidence checked before r2 review:
+- Implementation worktree is clean。
+- HEAD is `0080c5b3`。
+- Fix diff from `66fa9d55..HEAD` touches only `crates/pod/src/feature/mcp.rs`, about 43 insertions / 17 deletions。
+- Overall `git diff --check a59e5c1e..HEAD` produced no diagnostics。
+
+Next action:
+- Route back to Reviewer for r2 verification of duplicate/collision fail-closed behavior and final acceptance criteria。
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KVHR3WS6-r1 at: 2026-06-20T08:44:25Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket contract / Orchestrator IntentPacket。
+- Fix diff: `66fa9d55..0080c5b3`。
+- Overall diff: `a59e5c1e..0080c5b3`。
+- 主な対象: `crates/pod/src/feature/mcp.rs`、MCP registration boundaries、ToolRegistry contribution path、no `tools/call` / no resources/prompts、bounded `tools/list` pagination、metadata/schema/name normalization、discovery-only stub behavior、Cargo/Nix changes。
+
+Previous blocker verification:
+- `normalize_listed_tools` は valid candidates を先に構築し、normalized namespaced name を count するようになった。
+- count > 1 の names には bounded duplicate diagnostic を出す。
+- 登録されるのは normalized name が exactly once の candidate のみ。
+- Updated test `duplicate_names_after_normalization_are_not_model_visible` は、`search-files` / `search files` の collision が `Mcp_demo_search_files` を model-visible にしないこと、および unrelated valid `Mcp_demo_unique` は register されることを確認している。
+- これにより duplicate/colliding MCP tool names が fail-closed になるという Ticket requirement を満たしている。
+
+Blocking issues: none。
+
+Non-blocking follow-up:
+- 複数 configured MCP servers 間の sanitized server namespace collision について、将来 explicit coverage を追加してもよいが、この Ticket の discovered-tool name collision acceptance path では blocker ではない。
+
+Reviewer validation:
+- `cargo fmt --check`: passed。
+- `git diff --check a59e5c1e..HEAD`: passed。
+- `cargo test -p mcp list_tools --test stdio_lifecycle`: passed, 3 tests。
+- `cargo test -p pod feature::mcp --lib`: passed, 5 tests。
+- `cargo test -p mcp`: passed, 8 tests。
+- `cargo check -p pod -p mcp`: passed。
+- `nix build .#yoi --no-link`: passed。
+
+Worktree status at review end: clean。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T08:46:04Z -->
+
+## Implementation report
+
+Merge and final validation report:
+
+Merged implementation branch into Orchestrator branch:
+- Merge commit: `a1f904b8 merge: mcp tool registration`
+- Implementation commits included:
+  - `66fa9d55 mcp: register stdio server tools`
+  - `0080c5b3 mcp: reject colliding tool names`
+
+Reviewer outcome:
+- r1 requested changes because duplicate/colliding normalized MCP tool names were diagnostic-only and allowed the first colliding definition to become model-visible。
+- Coder changed normalization to count all valid names first and register only identities that occur exactly once, plus updated tests。
+- r2 approved with no blocking issues。
+
+Orchestrator validation after merge passed:
+- `cargo fmt --check`
+- `git diff --check HEAD^1..HEAD`
+- `cargo test -p mcp list_tools --test stdio_lifecycle`
+- `cargo test -p pod feature::mcp --lib`
+- `cargo test -p mcp`
+- `cargo check -p pod -p mcp`
+- `nix build .#yoi --no-link`
+- `nix path-info -S .#yoi`: `113089912`
+
+Validation log:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/bash-SnBew4.log`
+
+Final state:
+- Orchestrator worktree clean at `a1f904b8` after validation。
+- Implementation worktree remains available for cleanup after Ticket completion records are committed。
+- Dashboard/Console refactor is now running in parallel in separate child worktree and is unaffected by this merge。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-20T08:46:10Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Implementation was merged into Orchestrator branch at `a1f904b8`, r2 review approved, and final Orchestrator validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, focused `mcp` and `pod feature::mcp` tests, `cargo check -p pod -p mcp`, and `nix build .#yoi --no-link`.
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-20T08:46:32Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-20T08:46:32Z status: closed -->
+
+## 完了
+
+## Resolution
+
+`00001KVHR3WS6` を完了しました。
+
+実装内容:
+- MCP `tools/list` protocol result/tool types と bounded pagination helper を `crates/mcp` に追加しました。
+- MCP stdio discovery feature module を `crates/pod` に追加しました。
+- Configured stdio server を initialize し、bounded `tools/list` を呼び、server-provided tool metadata を untrusted data として検証・正規化して ToolRegistry contribution path に登録します。
+- Tool names は server namespace を含む stable namespaced name（例: `Mcp_<server>_<tool>`）に正規化されます。
+- Invalid schema、duplicate/colliding normalized names は bounded diagnostics で fail-closed になります。Collision 時は該当 normalized identity は model-visible tool になりません。
+- Server metadata / annotations / instructions は Yoi instructions, scope, permissions, system/developer instructions を弱める authority として扱いません。
+- Registration は existing protocol-provider / ToolRegistry contribution path を通ります。
+- This Ticket は `tools/call` execution を実装していません。Registered discovery-only stub は explicit not-implemented error を返し、MCP `tools/call` は送信しません。
+- Resources/prompts/list_changed は実装していません。
+
+主な commit:
+- `66fa9d55 mcp: register stdio server tools`
+- `0080c5b3 mcp: reject colliding tool names`
+- `a1f904b8 merge: mcp tool registration`
+
+Review:
+- r1 は duplicate/colliding normalized MCP tool names が diagnostic-only で fail-closed でないため `request_changes`。
+- Coder が collision handling を修正し、該当 identity が model-visible にならない test を追加。
+- r2 は `approve`。
+
+最終 validation:
+- `cargo fmt --check`
+- `git diff --check HEAD^1..HEAD`
+- `cargo test -p mcp list_tools --test stdio_lifecycle`
+- `cargo test -p pod feature::mcp --lib`
+- `cargo test -p mcp`
+- `cargo check -p pod -p mcp`
+- `nix build .#yoi --no-link`
+
+Package impact:
+- `nix path-info -S .#yoi`: `113089912`
+
+Validation log:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/bash-SnBew4.log`
+
+---

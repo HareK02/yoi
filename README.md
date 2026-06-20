@@ -13,7 +13,7 @@ Main highlights:
 - Multi-agent orchestration with scoped coder/reviewer Pods.
 - Profile, Manifest, and prompt-based runtime configuration.
 - Local Tickets and workflow files for auditable project coordination.
-- TUI and CLI entry points, including a multi-Pod dashboard.
+- TUI and CLI entry points, including the `yoi panel` workspace Dashboard and single-Pod Console.
 
 Yoi is actively dogfooded in this repository. Public APIs, configuration formats, and workflows may still change.
 
@@ -38,7 +38,7 @@ nix build .#yoi
 ```sh
 yoi --help
 yoi
-yoi --multi
+yoi panel
 yoi --pod <name>
 yoi pod --help
 ```
@@ -46,7 +46,7 @@ yoi pod --help
 Typical flow:
 
 1. Configure providers, models, profiles, prompts, and scopes.
-2. Start or attach to a named Pod from the CLI/TUI.
+2. Start or attach to a named Pod in the Console, or inspect workspace activity in the Dashboard.
 3. Use explicit tools and scoped delegation for multi-agent work.
 4. Record project work through Tickets, workflow files, and git history.
 

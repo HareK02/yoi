@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fmt;
 use std::path::PathBuf;
@@ -48,6 +48,366 @@ impl Default for McpStdioLimits {
             shutdown_timeout: Duration::from_secs(2),
             kill_timeout: Duration::from_secs(2),
         }
+    }
+}
+
+/// Host bounds for MCP `tools/list` pagination during discovery.
+#[derive(Debug, Clone, Copy)]
+pub struct McpToolListLimits {
+    pub max_pages: usize,
+    pub max_tools: usize,
+}
+
+impl Default for McpToolListLimits {
+    fn default() -> Self {
+        Self {
+            max_pages: 8,
+            max_tools: 128,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToolDefinition {
+    pub name: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub input_schema: Value,
+    #[serde(default)]
+    pub output_schema: Option<Value>,
+    #[serde(default)]
+    pub annotations: Option<Value>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListToolsResult {
+    #[serde(default)]
+    pub tools: Vec<McpToolDefinition>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct McpResourceListLimits {
+    pub max_pages: usize,
+    pub max_resources: usize,
+    pub max_resource_templates: usize,
+}
+
+impl Default for McpResourceListLimits {
+    fn default() -> Self {
+        Self {
+            max_pages: 8,
+            max_resources: 128,
+            max_resource_templates: 128,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct McpPromptListLimits {
+    pub max_pages: usize,
+    pub max_prompts: usize,
+}
+
+impl Default for McpPromptListLimits {
+    fn default() -> Self {
+        Self {
+            max_pages: 8,
+            max_prompts: 128,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpResourceDefinition {
+    pub uri: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub annotations: Option<Value>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpResourceTemplateDefinition {
+    pub uri_template: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub annotations: Option<Value>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListResourcesResult {
+    #[serde(default)]
+    pub resources: Vec<McpResourceDefinition>,
+    #[serde(default)]
+    pub resource_templates: Vec<McpResourceTemplateDefinition>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadResourceRequest {
+    pub uri: String,
+}
+
+impl ReadResourceRequest {
+    pub fn new(uri: impl Into<String>) -> Self {
+        Self { uri: uri.into() }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpResourceContent {
+    pub uri: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadResourceResult {
+    #[serde(default)]
+    pub contents: Vec<McpResourceContent>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpPromptArgumentDefinition {
+    pub name: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: Option<bool>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpPromptDefinition {
+    pub name: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub arguments: Vec<McpPromptArgumentDefinition>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPromptsResult {
+    #[serde(default)]
+    pub prompts: Vec<McpPromptDefinition>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetPromptRequest {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Value>,
+}
+
+impl GetPromptRequest {
+    pub fn new(name: impl Into<String>, arguments: Option<Value>) -> Self {
+        Self {
+            name: name.into(),
+            arguments,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpPromptMessage {
+    pub role: String,
+    pub content: McpContentBlock,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetPromptResult {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub messages: Vec<McpPromptMessage>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallToolRequest {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub arguments: Value,
+}
+
+impl CallToolRequest {
+    pub fn new(name: impl Into<String>, arguments: Value) -> Self {
+        Self {
+            name: name.into(),
+            arguments,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallToolResult {
+    #[serde(default)]
+    pub content: Vec<McpContentBlock>,
+    #[serde(default)]
+    pub structured_content: Option<Value>,
+    #[serde(default)]
+    pub is_error: bool,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// One untrusted MCP `tools/call` content block.
+///
+/// The `type` discriminator is kept explicit and all server-owned fields stay
+/// data in `fields`; this crate does not turn rich MCP content into hidden host
+/// context.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpContentBlock {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
+}
+
+/// MCP list surface whose `notifications/*/list_changed` signal was observed.
+///
+/// The notification is only a freshness signal. The stdio client records this
+/// bounded enum state and deliberately ignores notification params so a server
+/// cannot inject resource/prompt content or alter model-visible tool schemas
+/// through an out-of-band notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum McpListChangedKind {
+    Tools,
+    Resources,
+    Prompts,
+}
+
+impl McpListChangedKind {
+    fn from_notification_method(method: &str) -> Option<Self> {
+        match method {
+            "notifications/tools/list_changed" => Some(Self::Tools),
+            "notifications/resources/list_changed" => Some(Self::Resources),
+            "notifications/prompts/list_changed" => Some(Self::Prompts),
+            _ => None,
+        }
+    }
+
+    pub fn notification_method(self) -> &'static str {
+        match self {
+            Self::Tools => "notifications/tools/list_changed",
+            Self::Resources => "notifications/resources/list_changed",
+            Self::Prompts => "notifications/prompts/list_changed",
+        }
+    }
+
+    pub fn list_method(self) -> &'static str {
+        match self {
+            Self::Tools => "tools/list",
+            Self::Resources => "resources/list",
+            Self::Prompts => "prompts/list",
+        }
+    }
+}
+
+/// Bounded snapshot of list-change signals observed from one stdio server.
+#[derive(Debug, Clone)]
+pub struct McpListChangedSnapshot {
+    pub server_name: String,
+    kinds: BTreeSet<McpListChangedKind>,
+}
+
+impl McpListChangedSnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.kinds.is_empty()
+    }
+
+    pub fn contains(&self, kind: McpListChangedKind) -> bool {
+        self.kinds.contains(&kind)
+    }
+
+    pub fn kinds(&self) -> impl Iterator<Item = McpListChangedKind> + '_ {
+        self.kinds.iter().copied()
     }
 }
 
@@ -216,6 +576,7 @@ pub struct McpStdioClient {
     limits: McpStdioLimits,
     redactor: Redactor,
     diagnostics: Arc<Mutex<BoundedDiagnostics>>,
+    list_changes: Arc<Mutex<BoundedListChanged>>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     child: Option<Child>,
     responses: mpsc::Receiver<ReaderEvent>,
@@ -308,6 +669,7 @@ impl McpStdioClient {
             limits.max_diagnostic_lines,
             redactor.clone(),
         )));
+        let list_changes = Arc::new(Mutex::new(BoundedListChanged::new(spec.name.clone())));
         let (tx, rx) = mpsc::channel(16);
         let reader_task = spawn_stdout_reader(
             spec.name.clone(),
@@ -316,6 +678,7 @@ impl McpStdioClient {
             tx,
             limits.clone(),
             redactor.clone(),
+            list_changes.clone(),
         );
         let stderr_task = spawn_stderr_reader(stderr, diagnostics.clone(), limits.clone());
 
@@ -324,6 +687,7 @@ impl McpStdioClient {
             limits,
             redactor,
             diagnostics,
+            list_changes,
             stdin,
             child: Some(child),
             responses: rx,
@@ -364,8 +728,164 @@ impl McpStdioClient {
         self.initialized.as_ref()
     }
 
+    /// Request one page of the MCP `tools/list` surface after initialization.
+    ///
+    /// This performs discovery only. It never sends `tools/call` and does not
+    /// expose resources or prompts.
+    pub async fn list_tools_page(
+        &mut self,
+        cursor: Option<String>,
+    ) -> Result<ListToolsResult, McpClientError> {
+        let params = cursor
+            .map(|cursor| json!({ "cursor": cursor }))
+            .unwrap_or_else(|| json!({}));
+        self.request(McpPhase::Running, "tools/list", params).await
+    }
+
+    /// Execute an initialized MCP `tools/call` request.
+    ///
+    /// The caller is responsible for applying Yoi tool permissions before this
+    /// method is reached and for bounding/serializing the untrusted result before
+    /// it is exposed to model-visible tool history.
+    pub async fn call_tool(
+        &mut self,
+        request: CallToolRequest,
+    ) -> Result<CallToolResult, McpClientError> {
+        let params = serde_json::to_value(request).map_err(|err| {
+            McpClientError::new(
+                &self.server_name,
+                McpPhase::Running,
+                McpErrorKind::Protocol(format!("failed to serialize tools/call request: {err}")),
+            )
+        })?;
+        self.request(McpPhase::Running, "tools/call", params).await
+    }
+
+    /// Request one page of the MCP `resources/list` surface after initialization.
+    pub async fn list_resources_page(
+        &mut self,
+        cursor: Option<String>,
+    ) -> Result<ListResourcesResult, McpClientError> {
+        let params = cursor
+            .map(|cursor| json!({ "cursor": cursor }))
+            .unwrap_or_else(|| json!({}));
+        self.request(McpPhase::Running, "resources/list", params)
+            .await
+    }
+
+    /// Read one MCP resource by URI after initialization.
+    pub async fn read_resource(
+        &mut self,
+        request: ReadResourceRequest,
+    ) -> Result<ReadResourceResult, McpClientError> {
+        let params = serde_json::to_value(request).map_err(|err| {
+            McpClientError::new(
+                &self.server_name,
+                McpPhase::Running,
+                McpErrorKind::Protocol(format!(
+                    "failed to serialize resources/read request: {err}"
+                )),
+            )
+        })?;
+        self.request(McpPhase::Running, "resources/read", params)
+            .await
+    }
+
+    /// Request one page of the MCP `prompts/list` surface after initialization.
+    pub async fn list_prompts_page(
+        &mut self,
+        cursor: Option<String>,
+    ) -> Result<ListPromptsResult, McpClientError> {
+        let params = cursor
+            .map(|cursor| json!({ "cursor": cursor }))
+            .unwrap_or_else(|| json!({}));
+        self.request(McpPhase::Running, "prompts/list", params)
+            .await
+    }
+
+    /// Get one MCP prompt template by name after initialization.
+    pub async fn get_prompt(
+        &mut self,
+        request: GetPromptRequest,
+    ) -> Result<GetPromptResult, McpClientError> {
+        let params = serde_json::to_value(request).map_err(|err| {
+            McpClientError::new(
+                &self.server_name,
+                McpPhase::Running,
+                McpErrorKind::Protocol(format!("failed to serialize prompts/get request: {err}")),
+            )
+        })?;
+        self.request(McpPhase::Running, "prompts/get", params).await
+    }
+
+    /// Request pages from `tools/list` up to a host-supplied page/tool bound.
+    ///
+    /// Bounds are enforced by the host so a server cannot make startup discovery
+    /// unbounded through pagination.
+    pub async fn list_tools_bounded(
+        &mut self,
+        limits: McpToolListLimits,
+    ) -> Result<ListToolsResult, McpClientError> {
+        let mut tools = Vec::new();
+        let mut cursor = None;
+        let mut pages = 0usize;
+        loop {
+            if pages >= limits.max_pages {
+                return Err(McpClientError::new(
+                    &self.server_name,
+                    McpPhase::Running,
+                    McpErrorKind::Protocol(format!(
+                        "tools/list exceeded {} page(s)",
+                        limits.max_pages
+                    )),
+                )
+                .with_diagnostics(self.snapshot_diagnostics().await));
+            }
+            pages += 1;
+            let result = self.list_tools_page(cursor.take()).await?;
+            for tool in result.tools {
+                if tools.len() >= limits.max_tools {
+                    return Err(McpClientError::new(
+                        &self.server_name,
+                        McpPhase::Running,
+                        McpErrorKind::Protocol(format!(
+                            "tools/list exceeded {} tool(s)",
+                            limits.max_tools
+                        )),
+                    )
+                    .with_diagnostics(self.snapshot_diagnostics().await));
+                }
+                tools.push(tool);
+            }
+            cursor = result.next_cursor;
+            if cursor.is_none() {
+                return Ok(ListToolsResult {
+                    tools,
+                    next_cursor: None,
+                    meta: result.meta,
+                    extra: BTreeMap::new(),
+                });
+            }
+        }
+    }
+
     pub async fn snapshot_diagnostics(&self) -> McpDiagnostics {
         self.diagnostics.lock().await.snapshot()
+    }
+
+    /// Return bounded list-change signals observed so far for this connection.
+    ///
+    /// This is diagnostic/freshness state only. It never contains notification
+    /// params and must not be used to mutate an active run's model-visible tool
+    /// schema outside an explicit safe boundary.
+    pub async fn snapshot_list_changes(&self) -> McpListChangedSnapshot {
+        self.list_changes.lock().await.snapshot()
+    }
+
+    /// Clear observed list-change signals before an explicit safe-boundary
+    /// refresh. New notifications received after this call will be recorded.
+    pub async fn clear_list_changes(&self) {
+        self.list_changes.lock().await.clear();
     }
 
     pub async fn request<T: for<'de> Deserialize<'de>>(
@@ -795,6 +1315,7 @@ fn spawn_stdout_reader(
     tx: mpsc::Sender<ReaderEvent>,
     limits: McpStdioLimits,
     redactor: Redactor,
+    list_changes: Arc<Mutex<BoundedListChanged>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut stdout = BufReader::new(stdout);
@@ -808,6 +1329,7 @@ fn spawn_stdout_reader(
                             &tx,
                             &limits,
                             &redactor,
+                            &list_changes,
                             message,
                         )
                         .await
@@ -850,6 +1372,7 @@ async fn handle_incoming_message(
     tx: &mpsc::Sender<ReaderEvent>,
     limits: &McpStdioLimits,
     redactor: &Redactor,
+    list_changes: &Arc<Mutex<BoundedListChanged>>,
     message: IncomingMessage,
 ) {
     if message.method.is_some() && message.id.is_some() {
@@ -875,7 +1398,10 @@ async fn handle_incoming_message(
         return;
     }
 
-    if message.method.is_some() {
+    if let Some(method) = message.method.as_deref() {
+        if let Some(kind) = McpListChangedKind::from_notification_method(method) {
+            list_changes.lock().await.mark(kind);
+        }
         let _ = tx.send(ReaderEvent::Notification).await;
         return;
     }
@@ -900,6 +1426,36 @@ async fn handle_incoming_message(
             ),
         )))
         .await;
+}
+
+#[derive(Debug)]
+struct BoundedListChanged {
+    server_name: String,
+    kinds: BTreeSet<McpListChangedKind>,
+}
+
+impl BoundedListChanged {
+    fn new(server_name: String) -> Self {
+        Self {
+            server_name,
+            kinds: BTreeSet::new(),
+        }
+    }
+
+    fn mark(&mut self, kind: McpListChangedKind) {
+        self.kinds.insert(kind);
+    }
+
+    fn clear(&mut self) {
+        self.kinds.clear();
+    }
+
+    fn snapshot(&self) -> McpListChangedSnapshot {
+        McpListChangedSnapshot {
+            server_name: self.server_name.clone(),
+            kinds: self.kinds.clone(),
+        }
+    }
 }
 
 fn spawn_stderr_reader(

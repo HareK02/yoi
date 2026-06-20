@@ -1,8 +1,8 @@
 ---
 title: 'MCP: register server tools into ToolRegistry'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-06-20T05:30:04Z'
-updated_at: '2026-06-20T08:30:22Z'
+updated_at: '2026-06-20T08:46:32Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['mcp', 'tools-list', 'tool-registry', 'schema', 'untrusted-metadata']

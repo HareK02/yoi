@@ -671,7 +671,11 @@ coder = "profiles/coder.lua"
         .unwrap();
 
         let (choices, default_index) = profile_choices_for_cwd(&project);
-        assert_eq!(default_index, 1);
+        let default_choice = choices
+            .iter()
+            .position(|choice| choice.selector.as_deref() == Some("project:coder"))
+            .expect("project default choice is present");
+        assert_eq!(default_index, default_choice);
         let selected = &choices[default_index];
         assert_eq!(selected.selector.as_deref(), Some("project:coder"));
         assert_eq!(selected.label, "project:coder (default)");
@@ -701,9 +705,19 @@ description = "Project coder"
             choices[0].label,
             "builtin:default — Bundled default Yoi coding profile"
         );
-        assert_eq!(default_index, 1);
-        assert_eq!(choices[1].selector.as_deref(), Some("project:coder"));
-        assert_eq!(choices[1].label, "project:coder (default) — Project coder");
+        let project_index = choices
+            .iter()
+            .position(|choice| choice.selector.as_deref() == Some("project:coder"))
+            .expect("project default choice is present");
+        assert_eq!(default_index, project_index);
+        assert_eq!(
+            choices[project_index].selector.as_deref(),
+            Some("project:coder")
+        );
+        assert_eq!(
+            choices[project_index].label,
+            "project:coder (default) — Project coder"
+        );
     }
 
     #[test]

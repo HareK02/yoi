@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use mcp::stdio::{McpErrorKind, McpPhase, McpStdioClient, McpStdioLimits, McpStdioServerSpec};
+use mcp::stdio::{
+    CallToolRequest, McpErrorKind, McpListChangedKind, McpPhase, McpStdioClient, McpStdioLimits,
+    McpStdioServerSpec, McpToolListLimits,
+};
 
 fn mock_server(mode: &str) -> McpStdioServerSpec {
     McpStdioServerSpec::new("mock", env!("CARGO_BIN_EXE_mcp-stdio-mock-server"))
@@ -62,6 +65,63 @@ async fn initializes_mock_stdio_server() {
 }
 
 #[tokio::test]
+async fn list_tools_paginates_and_never_calls_tools_call() {
+    let mut client = McpStdioClient::connect(mock_server("tools"), tight_limits())
+        .await
+        .expect("connect mock server");
+    let tools = client
+        .list_tools_bounded(McpToolListLimits {
+            max_pages: 4,
+            max_tools: 8,
+        })
+        .await
+        .expect("list mock tools");
+    assert_eq!(tools.tools.len(), 2);
+    assert_eq!(tools.tools[0].name, "search-files");
+    assert_eq!(tools.tools[1].name, "summarize");
+    assert_eq!(tools.tools[0].input_schema["type"], "object");
+    client.shutdown().await.expect("shutdown after list");
+}
+
+#[tokio::test]
+async fn list_tools_page_bound_fails_closed() {
+    let mut client = McpStdioClient::connect(mock_server("tools"), tight_limits())
+        .await
+        .expect("connect mock server");
+    let err = client
+        .list_tools_bounded(McpToolListLimits {
+            max_pages: 1,
+            max_tools: 8,
+        })
+        .await
+        .expect_err("pagination beyond bound must fail");
+    assert_eq!(err.phase, McpPhase::Running);
+    assert!(
+        matches!(&err.kind, McpErrorKind::Protocol(message) if message.contains("exceeded 1 page"))
+    );
+    let _ = client.shutdown().await;
+}
+
+#[tokio::test]
+async fn list_tools_tool_bound_fails_closed() {
+    let mut client = McpStdioClient::connect(mock_server("tools"), tight_limits())
+        .await
+        .expect("connect mock server");
+    let err = client
+        .list_tools_bounded(McpToolListLimits {
+            max_pages: 4,
+            max_tools: 1,
+        })
+        .await
+        .expect_err("tool count beyond bound must fail");
+    assert_eq!(err.phase, McpPhase::Running);
+    assert!(
+        matches!(&err.kind, McpErrorKind::Protocol(message) if message.contains("exceeded 1 tool"))
+    );
+    let _ = client.shutdown().await;
+}
+
+#[tokio::test]
 async fn initialize_failure_reports_server_phase_and_redacted_bounded_stderr() {
     let spec = mock_server("fail-init").env("MCP_TEST_SECRET", "super-secret-token");
     let err = match McpStdioClient::connect(spec, tight_limits()).await {
@@ -103,12 +163,110 @@ async fn initialize_failure_reports_server_phase_and_redacted_bounded_stderr() {
 }
 
 #[tokio::test]
+async fn call_tool_returns_normal_result() {
+    let mut client = McpStdioClient::connect(mock_server("tools-call-normal"), tight_limits())
+        .await
+        .expect("connect");
+    let result = client
+        .call_tool(CallToolRequest::new(
+            "search-files",
+            serde_json::json!({"query": "needle"}),
+        ))
+        .await
+        .expect("call tool");
+    assert!(!result.is_error);
+    assert_eq!(result.content.len(), 1);
+    assert_eq!(result.content[0].kind, "text");
+    assert_eq!(result.content[0].fields["text"], "found needle");
+    assert_eq!(
+        result.structured_content.as_ref().unwrap()["matches"][0],
+        "needle.rs"
+    );
+    assert_eq!(result.meta.as_ref().unwrap()["server"], "mock");
+    client.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn call_tool_preserves_mcp_is_error_result() {
+    let mut client = McpStdioClient::connect(mock_server("tools-call-is-error"), tight_limits())
+        .await
+        .expect("connect");
+    let result = client
+        .call_tool(CallToolRequest::new(
+            "search-files",
+            serde_json::json!({"query": "needle"}),
+        ))
+        .await
+        .expect("call tool");
+    assert!(result.is_error);
+    assert_eq!(result.content[0].fields["text"], "tool-level failure");
+    client.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn call_tool_reports_json_rpc_protocol_error_distinctly() {
+    let mut client =
+        McpStdioClient::connect(mock_server("tools-call-protocol-error"), tight_limits())
+            .await
+            .expect("connect");
+    let err = client
+        .call_tool(CallToolRequest::new(
+            "search-files",
+            serde_json::json!({"query": "needle"}),
+        ))
+        .await
+        .expect_err("protocol error");
+    assert!(matches!(err.kind, McpErrorKind::JsonRpcError { .. }));
+    client.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn permission_denial_style_shutdown_sends_no_tools_call() {
+    let mut client = McpStdioClient::connect(mock_server("tools-call-forbidden"), tight_limits())
+        .await
+        .expect("connect");
+    // This mirrors Worker pre-tool-call denial: the ordinary Tool execution body
+    // is never entered, so the MCP server sees lifecycle shutdown but no call.
+    client.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn shutdown_terminates_or_kills_uncooperative_server() {
     let mut client = McpStdioClient::connect(mock_server("shutdown-hang"), tight_limits())
         .await
         .expect("initialize succeeds");
     let shutdown = client.shutdown().await.expect("shutdown succeeds");
     assert!(shutdown.terminated || shutdown.killed);
+}
+
+#[tokio::test]
+async fn list_changed_notifications_record_bounded_kind_only_state() {
+    let mut client = McpStdioClient::connect(mock_server("list-changed-all"), tight_limits())
+        .await
+        .expect("initialize succeeds");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let snapshot = client.snapshot_list_changes().await;
+    assert_eq!(snapshot.server_name, "mock");
+    assert!(snapshot.contains(McpListChangedKind::Tools));
+    assert!(snapshot.contains(McpListChangedKind::Resources));
+    assert!(snapshot.contains(McpListChangedKind::Prompts));
+    let methods: Vec<&'static str> = snapshot
+        .kinds()
+        .map(McpListChangedKind::notification_method)
+        .collect();
+    assert_eq!(
+        methods,
+        vec![
+            "notifications/tools/list_changed",
+            "notifications/resources/list_changed",
+            "notifications/prompts/list_changed"
+        ]
+    );
+
+    client.clear_list_changes().await;
+    assert!(client.snapshot_list_changes().await.is_empty());
+    client.shutdown().await.expect("shutdown succeeds");
 }
 
 #[tokio::test]
