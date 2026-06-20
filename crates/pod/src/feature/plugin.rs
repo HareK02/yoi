@@ -98,6 +98,11 @@ impl PluginToolFeature {
         ingress_name: &str,
         event: PluginIngressEvent,
     ) -> Result<PluginIngressDispatchReport, PluginWasmError> {
+        if !surface_enabled(&self.record, PluginSurface::Ingress) {
+            return Err(PluginWasmError::Module(
+                "plugin ingress surface is not enabled".to_string(),
+            ));
+        }
         let handle = self
             .registry
             .handle(&self.record.identity.to_string())
@@ -117,6 +122,10 @@ impl PluginToolFeature {
             surface: "tool".into(),
         }
     }
+}
+
+fn surface_enabled(record: &ResolvedPluginRecord, surface: PluginSurface) -> bool {
+    record.enabled_surfaces.contains(&surface)
 }
 
 fn plugin_tool_origin(record: &ResolvedPluginRecord) -> ToolOrigin {
@@ -461,118 +470,134 @@ impl FeatureModule for PluginToolFeature {
                 requires_services: Vec::new(),
                 protocol_providers: Vec::new(),
             };
-        for service in &self.record.manifest.services {
-            descriptor.provides_services.push(ServiceDeclaration::new(
-                plugin_service_id(&self.record, &service.name),
-                self.record.manifest.version.clone(),
-                service.description.clone(),
-            ));
+        if surface_enabled(&self.record, PluginSurface::Service) {
+            for service in &self.record.manifest.services {
+                descriptor.provides_services.push(ServiceDeclaration::new(
+                    plugin_service_id(&self.record, &service.name),
+                    self.record.manifest.version.clone(),
+                    service.description.clone(),
+                ));
+            }
         }
-        for tool in &self.record.manifest.tools {
-            descriptor = descriptor.with_tool(ToolDeclaration::new(
-                tool.name.clone(),
-                tool.description.clone(),
-            ));
+        if surface_enabled(&self.record, PluginSurface::Tool) {
+            for tool in &self.record.manifest.tools {
+                descriptor = descriptor.with_tool(ToolDeclaration::new(
+                    tool.name.clone(),
+                    tool.description.clone(),
+                ));
+            }
         }
         descriptor
     }
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
-        validate_declared_tool_names(&self.record)?;
+        if surface_enabled(&self.record, PluginSurface::Tool) {
+            validate_declared_tool_names(&self.record)?;
+        }
         let mut instance: Option<PluginInstanceHandle> = None;
-        let mut registered = 0usize;
+        let mut exposed = 0usize;
         let mut denied = Vec::new();
-        for service in &self.record.manifest.services {
-            validate_tool_name(&service.name).map_err(|reason| {
-                FeatureInstallError::Install(format!(
-                    "plugin {} service {} has invalid name: {reason}",
-                    self.record.identity, service.name
-                ))
-            })?;
-            if let Err(error) = authorize_plugin_service(&self.record, &service.name) {
-                let message = format!(
-                    "plugin {} service {} registration denied: {}",
-                    self.record.identity,
-                    service.name,
-                    error.bounded_message()
-                );
-                context.diagnostics().warning(message.clone());
-                denied.push(message);
-                continue;
-            }
-            if instance.is_none() {
-                instance = Some(self.ensure_instance()?);
-            }
-            context.services().provide(ServiceDeclaration::new(
-                plugin_service_id(&self.record, &service.name),
-                self.record.manifest.version.clone(),
-                service.description.clone(),
-            ))?;
-        }
-        for ingress in &self.record.manifest.ingresses {
-            validate_tool_name(&ingress.name).map_err(|reason| {
-                FeatureInstallError::Install(format!(
-                    "plugin {} ingress {} has invalid name: {reason}",
-                    self.record.identity, ingress.name
-                ))
-            })?;
-            if let Err(error) = authorize_plugin_ingress(&self.record, &ingress.name) {
-                let message = format!(
-                    "plugin {} ingress {} registration denied: {}",
-                    self.record.identity,
-                    ingress.name,
-                    error.bounded_message()
-                );
-                context.diagnostics().warning(message.clone());
-                denied.push(message);
-            } else if instance.is_none() {
-                instance = Some(self.ensure_instance()?);
-            }
-        }
-        for tool in &self.record.manifest.tools {
-            validate_tool_name(&tool.name).map_err(|reason| {
-                FeatureInstallError::Install(format!(
-                    "plugin {} tool {} has invalid name: {reason}",
-                    self.record.identity, tool.name
-                ))
-            })?;
-            validate_input_schema(&tool.input_schema).map_err(|reason| {
-                FeatureInstallError::Install(format!(
-                    "plugin {} tool {} has invalid input_schema: {reason}",
-                    self.record.identity, tool.name
-                ))
-            })?;
-            if let Err(error) = authorize_plugin_tool(&self.record, tool) {
-                let message = format!(
-                    "plugin {} tool {} registration denied: {}",
-                    self.record.identity,
-                    tool.name,
-                    error.bounded_message()
-                );
-                context.diagnostics().warning(message.clone());
-                denied.push(message);
-                continue;
-            }
-            let tool_instance = match &instance {
-                Some(instance) => instance.clone(),
-                None => {
-                    let created = self.ensure_instance()?;
-                    instance = Some(created.clone());
-                    created
+        if surface_enabled(&self.record, PluginSurface::Service) {
+            for service in &self.record.manifest.services {
+                validate_tool_name(&service.name).map_err(|reason| {
+                    FeatureInstallError::Install(format!(
+                        "plugin {} service {} has invalid name: {reason}",
+                        self.record.identity, service.name
+                    ))
+                })?;
+                if let Err(error) = authorize_plugin_service(&self.record, &service.name) {
+                    let message = format!(
+                        "plugin {} service {} registration denied: {}",
+                        self.record.identity,
+                        service.name,
+                        error.bounded_message()
+                    );
+                    context.diagnostics().warning(message.clone());
+                    denied.push(message);
+                    continue;
                 }
-            };
-            context.tools().register(ToolContribution::new(
-                tool.name.clone(),
-                plugin_instance_tool_definition(
-                    tool_instance,
-                    tool.name.clone(),
-                    tool.description.clone(),
-                    tool.input_schema.clone(),
-                ),
-            ))?;
-            registered += 1;
+                if instance.is_none() {
+                    instance = Some(self.ensure_instance()?);
+                }
+                context.services().provide(ServiceDeclaration::new(
+                    plugin_service_id(&self.record, &service.name),
+                    self.record.manifest.version.clone(),
+                    service.description.clone(),
+                ))?;
+                exposed += 1;
+            }
         }
-        if registered == 0 && !denied.is_empty() {
+        if surface_enabled(&self.record, PluginSurface::Ingress) {
+            for ingress in &self.record.manifest.ingresses {
+                validate_tool_name(&ingress.name).map_err(|reason| {
+                    FeatureInstallError::Install(format!(
+                        "plugin {} ingress {} has invalid name: {reason}",
+                        self.record.identity, ingress.name
+                    ))
+                })?;
+                if let Err(error) = authorize_plugin_ingress(&self.record, &ingress.name) {
+                    let message = format!(
+                        "plugin {} ingress {} registration denied: {}",
+                        self.record.identity,
+                        ingress.name,
+                        error.bounded_message()
+                    );
+                    context.diagnostics().warning(message.clone());
+                    denied.push(message);
+                } else {
+                    if instance.is_none() {
+                        instance = Some(self.ensure_instance()?);
+                    }
+                    exposed += 1;
+                }
+            }
+        }
+        if surface_enabled(&self.record, PluginSurface::Tool) {
+            for tool in &self.record.manifest.tools {
+                validate_tool_name(&tool.name).map_err(|reason| {
+                    FeatureInstallError::Install(format!(
+                        "plugin {} tool {} has invalid name: {reason}",
+                        self.record.identity, tool.name
+                    ))
+                })?;
+                validate_input_schema(&tool.input_schema).map_err(|reason| {
+                    FeatureInstallError::Install(format!(
+                        "plugin {} tool {} has invalid input_schema: {reason}",
+                        self.record.identity, tool.name
+                    ))
+                })?;
+                if let Err(error) = authorize_plugin_tool(&self.record, tool) {
+                    let message = format!(
+                        "plugin {} tool {} registration denied: {}",
+                        self.record.identity,
+                        tool.name,
+                        error.bounded_message()
+                    );
+                    context.diagnostics().warning(message.clone());
+                    denied.push(message);
+                    continue;
+                }
+                let tool_instance = match &instance {
+                    Some(instance) => instance.clone(),
+                    None => {
+                        let created = self.ensure_instance()?;
+                        instance = Some(created.clone());
+                        created
+                    }
+                };
+                context.tools().register(ToolContribution::new(
+                    tool.name.clone(),
+                    plugin_instance_tool_definition(
+                        tool_instance,
+                        tool.name.clone(),
+                        tool.description.clone(),
+                        tool.input_schema.clone(),
+                    ),
+                ))?;
+                exposed += 1;
+            }
+        }
+        if exposed == 0 && !denied.is_empty() {
             let summary = if denied.len() == 1 {
                 denied.remove(0)
             } else {
@@ -2137,6 +2162,11 @@ impl PluginInstance {
         tool_name: &str,
         input: Vec<u8>,
     ) -> Result<ToolOutput, PluginWasmError> {
+        if !surface_enabled(&self.record, PluginSurface::Tool) {
+            return Err(PluginWasmError::Module(
+                "plugin tool surface is not enabled".to_string(),
+            ));
+        }
         let tool = self
             .record
             .manifest
@@ -2177,6 +2207,11 @@ impl PluginInstance {
         ingress_name: &str,
         event: PluginIngressEvent,
     ) -> Result<PluginIngressDispatchReport, PluginWasmError> {
+        if !surface_enabled(&self.record, PluginSurface::Ingress) {
+            return Err(PluginWasmError::Module(
+                "plugin ingress surface is not enabled".to_string(),
+            ));
+        }
         if serde_json::to_vec(&event)
             .map(|bytes| bytes.len())
             .unwrap_or(usize::MAX)
@@ -3838,6 +3873,64 @@ mod tests {
             .grants
             .permissions
             .push(PluginPermission::ingress(name));
+    }
+
+    #[test]
+    fn service_selected_ignores_unselected_tool_without_grants() {
+        let mut record = record(vec![tool("hidden_tool")]);
+        add_service(&mut record, "svc");
+        record.enabled_surfaces = vec![PluginSurface::Service];
+        record.manifest.permissions = vec![
+            PluginPermission::surface(PluginSurface::Service),
+            PluginPermission::service("svc"),
+        ];
+        record.grants.permissions = record.manifest.permissions.clone();
+        let feature = PluginToolFeature::new(record);
+        assert!(feature.descriptor().tools.is_empty());
+        assert_eq!(feature.descriptor().provides_services.len(), 1);
+        let (report, pending) = install_feature(feature.clone());
+        assert!(
+            report.reports.iter().all(|report| report.installed),
+            "{report:#?}"
+        );
+        assert!(pending.is_empty(), "unselected Tool must not register");
+        assert_eq!(report.reports[0].provided_services.len(), 1);
+        assert_eq!(
+            feature.instance_status().unwrap().lifecycle,
+            PluginInstanceLifecycleState::Ready
+        );
+    }
+
+    #[test]
+    fn tool_selected_ignores_unselected_service_ingress_even_with_grants() {
+        let mut record = record(vec![tool("visible_tool")]);
+        add_service(&mut record, "hidden_service");
+        add_ingress(&mut record, "hidden_ingress");
+        record.enabled_surfaces = vec![PluginSurface::Tool];
+        let feature = PluginToolFeature::new(record);
+        assert!(feature.descriptor().provides_services.is_empty());
+        assert_eq!(feature.descriptor().tools.len(), 1);
+        let (report, pending) = install_feature(feature.clone());
+        assert!(
+            report.reports.iter().all(|report| report.installed),
+            "{report:#?}"
+        );
+        assert_eq!(pending.len(), 1);
+        assert!(report.reports[0].provided_services.is_empty());
+        let dispatch = feature.dispatch_ingress(
+            "hidden_ingress",
+            PluginIngressEvent {
+                kind: "test".into(),
+                source: "unit".into(),
+                payload: serde_json::json!({}),
+            },
+        );
+        assert!(
+            dispatch
+                .unwrap_err()
+                .bounded_message()
+                .contains("not enabled")
+        );
     }
 
     #[test]
