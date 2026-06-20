@@ -484,6 +484,10 @@ mod tests {
 /// PluginInstanceRegistry.
 pub const PLUGIN_INSTANCE_WORLD: &str = "yoi:plugin/instance@1.0.0";
 
+/// Repository WIT for the current instance world.
+pub const INSTANCE_WIT: &str =
+    include_str!("../../../resources/plugin/wit/yoi-plugin-instance-v1.wit");
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PluginIngressEvent {
     pub kind: String,
@@ -531,117 +535,110 @@ pub trait Plugin: Sized + 'static {
 
 #[doc(hidden)]
 pub fn plugin_instance_error(message: impl Into<String>) -> String {
-    serde_json::json!({ "error": message.into() }).to_string()
+    serde_json::json!({ "error": { "message": message.into() } }).to_string()
 }
 
-/// Export the simple string-json instance ABI used by
-/// `yoi:plugin/instance@1.0.0`.
+#[doc(hidden)]
+pub fn plugin_instance_status(status: &PluginStatus) -> String {
+    serde_json::to_string(status).unwrap_or_else(|error| plugin_instance_error(error.to_string()))
+}
+
+/// Implement the generated Component Model `Guest` trait for an instance Plugin
+/// and export it with the `wit-bindgen` generated `export!` macro.
+///
+/// The caller must invoke `wit_bindgen::generate!` for the `instance` world
+/// first, with `runtime_path: "yoi_plugin_pdk::wit_bindgen::rt"`. That defines
+/// the `Guest` trait and `export!` macro in the current module.
 #[macro_export]
 macro_rules! export_plugin_instance {
-    ($plugin:ty) => {
-        mod __yoi_plugin_instance_export {
-            use super::*;
-            use std::cell::RefCell;
+    ($adapter:ident, $plugin:ty) => {
+        struct $adapter;
 
-            thread_local! {
-                static INSTANCE: RefCell<Option<$plugin>> = const { RefCell::new(None) };
+        thread_local! {
+            static YOI_PLUGIN_INSTANCE: ::std::cell::RefCell<::std::option::Option<$plugin>> = const { ::std::cell::RefCell::new(None) };
+        }
+
+        impl Guest for $adapter {
+            fn start(config_json: ::std::string::String) -> ::std::string::String {
+                let config = serde_json::from_str(&config_json).unwrap_or(serde_json::Value::Null);
+                match <$plugin as $crate::Plugin>::start(config) {
+                    Ok(plugin) => {
+                        YOI_PLUGIN_INSTANCE.with(|slot| *slot.borrow_mut() = Some(plugin));
+                        $crate::plugin_instance_status(&$crate::PluginStatus::ready(serde_json::Value::Null))
+                    }
+                    Err(error) => $crate::plugin_instance_error(error.to_string()),
+                }
             }
 
-            #[unsafe(export_name = "start")]
-            pub extern "C" fn __yoi_start(
-                _config_json_ptr: *const u8,
-                _config_json_len: usize,
-            ) -> usize {
-                // This low-level symbol is a placeholder for non-component raw builds.
-                // Component builds should bind this macro through generated WIT glue.
-                0
+            fn handle_tool(
+                name: ::std::string::String,
+                input_json: ::std::string::String,
+            ) -> ::std::string::String {
+                let input = serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
+                YOI_PLUGIN_INSTANCE.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    let Some(plugin) = slot.as_mut() else {
+                        return $crate::plugin_instance_error("plugin instance has not been started");
+                    };
+                    match plugin.handle_tool(&name, input) {
+                        Ok(output) => output.to_json_string(),
+                        Err(error) => error.into_tool_output().to_json_string(),
+                    }
+                })
             }
 
-            pub struct InstanceGuest;
+            fn handle_ingress(
+                name: ::std::string::String,
+                event_json: ::std::string::String,
+            ) -> ::std::string::String {
+                let event = match serde_json::from_str::<$crate::PluginIngressEvent>(&event_json) {
+                    Ok(event) => event,
+                    Err(error) => return $crate::plugin_instance_error(error.to_string()),
+                };
+                YOI_PLUGIN_INSTANCE.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    let Some(plugin) = slot.as_mut() else {
+                        return $crate::plugin_instance_error("plugin instance has not been started");
+                    };
+                    match plugin.handle_ingress(&name, event) {
+                        Ok(output) => serde_json::to_string(&output)
+                            .unwrap_or_else(|error| $crate::plugin_instance_error(error.to_string())),
+                        Err(error) => $crate::plugin_instance_error(error.to_string()),
+                    }
+                })
+            }
 
-            impl InstanceGuest {
-                pub fn start(config_json: String) -> String {
-                    let config =
-                        serde_json::from_str(&config_json).unwrap_or(serde_json::Value::Null);
-                    match <$plugin as $crate::Plugin>::start(config) {
-                        Ok(plugin) => {
-                            INSTANCE.with(|slot| *slot.borrow_mut() = Some(plugin));
-                            serde_json::to_string(&$crate::PluginStatus::ready(
-                                serde_json::Value::Null,
-                            ))
-                            .unwrap()
+            fn status() -> ::std::string::String {
+                YOI_PLUGIN_INSTANCE.with(|slot| {
+                    let slot = slot.borrow();
+                    let Some(plugin) = slot.as_ref() else {
+                        return $crate::plugin_instance_error("plugin instance has not been started");
+                    };
+                    match plugin.status() {
+                        Ok(status) => $crate::plugin_instance_status(&status),
+                        Err(error) => $crate::plugin_instance_error(error.to_string()),
+                    }
+                })
+            }
+
+            fn stop() -> ::std::string::String {
+                YOI_PLUGIN_INSTANCE.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    let Some(plugin) = slot.as_mut() else {
+                        return $crate::plugin_instance_error("plugin instance has not been started");
+                    };
+                    match plugin.stop() {
+                        Ok(status) => {
+                            let output = $crate::plugin_instance_status(&status);
+                            *slot = None;
+                            output
                         }
                         Err(error) => $crate::plugin_instance_error(error.to_string()),
                     }
-                }
-
-                pub fn handle_tool(name: String, input_json: String) -> String {
-                    let input =
-                        serde_json::from_str(&input_json).unwrap_or(serde_json::Value::Null);
-                    INSTANCE.with(|slot| {
-                        let mut slot = slot.borrow_mut();
-                        let Some(plugin) = slot.as_mut() else {
-                            return $crate::plugin_instance_error(
-                                "plugin instance has not been started",
-                            );
-                        };
-                        match plugin.handle_tool(&name, input) {
-                            Ok(output) => serde_json::to_string(&output).unwrap(),
-                            Err(error) => $crate::plugin_instance_error(error.to_string()),
-                        }
-                    })
-                }
-
-                pub fn handle_ingress(name: String, event_json: String) -> String {
-                    let event =
-                        match serde_json::from_str::<$crate::PluginIngressEvent>(&event_json) {
-                            Ok(event) => event,
-                            Err(error) => return $crate::plugin_instance_error(error.to_string()),
-                        };
-                    INSTANCE.with(|slot| {
-                        let mut slot = slot.borrow_mut();
-                        let Some(plugin) = slot.as_mut() else {
-                            return $crate::plugin_instance_error(
-                                "plugin instance has not been started",
-                            );
-                        };
-                        match plugin.handle_ingress(&name, event) {
-                            Ok(output) => serde_json::to_string(&output).unwrap(),
-                            Err(error) => $crate::plugin_instance_error(error.to_string()),
-                        }
-                    })
-                }
-
-                pub fn status() -> String {
-                    INSTANCE.with(|slot| {
-                        let slot = slot.borrow();
-                        let Some(plugin) = slot.as_ref() else {
-                            return $crate::plugin_instance_error(
-                                "plugin instance has not been started",
-                            );
-                        };
-                        match plugin.status() {
-                            Ok(status) => serde_json::to_string(&status).unwrap(),
-                            Err(error) => $crate::plugin_instance_error(error.to_string()),
-                        }
-                    })
-                }
-
-                pub fn stop() -> String {
-                    INSTANCE.with(|slot| {
-                        let mut slot = slot.borrow_mut();
-                        let Some(plugin) = slot.as_mut() else {
-                            return $crate::plugin_instance_error(
-                                "plugin instance has not been started",
-                            );
-                        };
-                        match plugin.stop() {
-                            Ok(status) => serde_json::to_string(&status).unwrap(),
-                            Err(error) => $crate::plugin_instance_error(error.to_string()),
-                        }
-                    })
-                }
+                })
             }
         }
+
+        export!($adapter);
     };
 }

@@ -67,17 +67,42 @@ pub fn plugin_tool_features(config: &PluginConfig) -> Vec<PluginToolFeature> {
         .collect()
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PluginToolFeature {
     record: ResolvedPluginRecord,
     feature_id: FeatureId,
+    registry: PluginInstanceRegistry,
 }
 
 impl PluginToolFeature {
     pub fn new(record: ResolvedPluginRecord) -> Self {
         let feature_id = FeatureId::new(format!("plugin:{}:tool", record.identity))
             .expect("source-qualified plugin identity yields non-empty feature id");
-        Self { record, feature_id }
+        Self {
+            record,
+            feature_id,
+            registry: PluginInstanceRegistry::default(),
+        }
+    }
+
+    fn ensure_instance(&self) -> Result<PluginInstanceHandle, FeatureInstallError> {
+        self.registry.register(self.record.clone())
+    }
+
+    pub fn instance_status(&self) -> Option<PluginInstanceStatus> {
+        self.registry.status(&self.record.identity.to_string())
+    }
+
+    pub fn dispatch_ingress(
+        &self,
+        ingress_name: &str,
+        event: PluginIngressEvent,
+    ) -> Result<PluginIngressDispatchReport, PluginWasmError> {
+        let handle = self
+            .registry
+            .handle(&self.record.identity.to_string())
+            .ok_or_else(|| PluginWasmError::Module("plugin instance is not started".to_string()))?;
+        handle.deliver_ingress(ingress_name, event)
     }
 
     pub fn origin(&self) -> ToolOrigin {
@@ -454,7 +479,6 @@ impl FeatureModule for PluginToolFeature {
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
         validate_declared_tool_names(&self.record)?;
-        let registry = PluginInstanceRegistry::default();
         let mut instance: Option<PluginInstanceHandle> = None;
         let mut registered = 0usize;
         let mut denied = Vec::new();
@@ -475,6 +499,9 @@ impl FeatureModule for PluginToolFeature {
                 context.diagnostics().warning(message.clone());
                 denied.push(message);
                 continue;
+            }
+            if instance.is_none() {
+                instance = Some(self.ensure_instance()?);
             }
             context.services().provide(ServiceDeclaration::new(
                 plugin_service_id(&self.record, &service.name),
@@ -498,6 +525,8 @@ impl FeatureModule for PluginToolFeature {
                 );
                 context.diagnostics().warning(message.clone());
                 denied.push(message);
+            } else if instance.is_none() {
+                instance = Some(self.ensure_instance()?);
             }
         }
         for tool in &self.record.manifest.tools {
@@ -527,7 +556,7 @@ impl FeatureModule for PluginToolFeature {
             let tool_instance = match &instance {
                 Some(instance) => instance.clone(),
                 None => {
-                    let created = registry.register(self.record.clone())?;
+                    let created = self.ensure_instance()?;
                     instance = Some(created.clone());
                     created
                 }
@@ -1939,10 +1968,11 @@ impl PluginInstanceDiagnostic {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PluginInstanceStatus {
     pub plugin_ref: String,
     pub lifecycle: PluginInstanceLifecycleState,
+    pub component_status: Option<Value>,
     pub diagnostics: Vec<PluginInstanceDiagnostic>,
 }
 
@@ -1998,6 +2028,14 @@ impl PluginInstanceRegistry {
             .map(PluginInstanceHandle::status)
     }
 
+    pub fn handle(&self, plugin_ref: &str) -> Option<PluginInstanceHandle> {
+        self.instances
+            .lock()
+            .expect("plugin instance registry poisoned")
+            .get(plugin_ref)
+            .cloned()
+    }
+
     pub fn stop(&self, plugin_ref: &str) -> Result<Option<PluginInstanceStatus>, PluginWasmError> {
         let handle = self
             .instances
@@ -2019,6 +2057,7 @@ impl PluginInstanceHandle {
             record,
             runtime,
             lifecycle: PluginInstanceLifecycleState::Ready,
+            component_status: None,
             diagnostics: Vec::new(),
         };
         instance.start()?;
@@ -2044,13 +2083,14 @@ impl PluginInstanceHandle {
     }
 
     pub fn status(&self) -> PluginInstanceStatus {
-        self.0.lock().expect("plugin instance poisoned").status()
+        let mut instance = self.0.lock().expect("plugin instance poisoned");
+        instance.status()
     }
 
     pub fn stop(&self) -> Result<PluginInstanceStatus, PluginWasmError> {
         let mut instance = self.0.lock().expect("plugin instance poisoned");
         instance.stop()?;
-        Ok(instance.status())
+        Ok(instance.snapshot_status())
     }
 
     fn record_diagnostic(&self, diagnostic: PluginInstanceDiagnostic) {
@@ -2065,6 +2105,7 @@ struct PluginInstance {
     record: ResolvedPluginRecord,
     runtime: PluginInstanceRuntime,
     lifecycle: PluginInstanceLifecycleState,
+    component_status: Option<Value>,
     diagnostics: Vec<PluginInstanceDiagnostic>,
 }
 
@@ -2083,7 +2124,8 @@ impl PluginInstance {
                 self.lifecycle = PluginInstanceLifecycleState::Started;
             }
             PluginInstanceRuntime::ComponentInstance(runtime) => {
-                runtime.start(&self.record)?;
+                let status = runtime.start(&self.record)?;
+                self.component_status = Some(status);
                 self.lifecycle = PluginInstanceLifecycleState::Started;
             }
         }
@@ -2200,16 +2242,43 @@ impl PluginInstance {
             PluginInstanceRuntime::LegacyToolAdapter => {}
             #[cfg(test)]
             PluginInstanceRuntime::TestIngress { .. } => {}
-            PluginInstanceRuntime::ComponentInstance(runtime) => runtime.stop()?,
+            PluginInstanceRuntime::ComponentInstance(runtime) => {
+                self.component_status = Some(runtime.stop()?);
+            }
         }
         self.lifecycle = PluginInstanceLifecycleState::Stopped;
         Ok(())
     }
 
-    fn status(&self) -> PluginInstanceStatus {
+    fn snapshot_status(&self) -> PluginInstanceStatus {
         PluginInstanceStatus {
             plugin_ref: self.record.identity.to_string(),
             lifecycle: self.lifecycle.clone(),
+            component_status: self.component_status.clone(),
+            diagnostics: self.diagnostics.clone(),
+        }
+    }
+
+    fn status(&mut self) -> PluginInstanceStatus {
+        if let PluginInstanceRuntime::ComponentInstance(runtime) = &mut self.runtime {
+            match runtime.status() {
+                Ok(status) => self.component_status = Some(status),
+                Err(error) => {
+                    self.lifecycle = PluginInstanceLifecycleState::Failed;
+                    self.diagnostics.push(PluginInstanceDiagnostic::new(
+                        PluginInstanceLifecycleState::Failed,
+                        format!(
+                            "plugin component status failed: {}",
+                            error.bounded_message()
+                        ),
+                    ));
+                }
+            }
+        }
+        PluginInstanceStatus {
+            plugin_ref: self.record.identity.to_string(),
+            lifecycle: self.lifecycle.clone(),
+            component_status: self.component_status.clone(),
             diagnostics: self.diagnostics.clone(),
         }
     }
@@ -2230,6 +2299,8 @@ impl PluginInstanceRuntime {
             return Ok(Self::LegacyToolAdapter);
         };
         match runtime.kind.as_str() {
+            #[cfg(test)]
+            "test-ingress" => Ok(Self::TestIngress { calls: 0 }),
             PLUGIN_RUNTIME_WASM_KIND => Ok(Self::LegacyToolAdapter),
             PLUGIN_RUNTIME_COMPONENT_KIND
                 if runtime.world.as_deref() == Some(PLUGIN_COMPONENT_INSTANCE_WORLD) =>
@@ -2299,7 +2370,7 @@ impl PluginComponentInstanceRuntime {
             .map_err(|error| PluginWasmError::Execution(error.to_string()))
     }
 
-    fn start(&mut self, record: &ResolvedPluginRecord) -> Result<(), PluginWasmError> {
+    fn start(&mut self, record: &ResolvedPluginRecord) -> Result<Value, PluginWasmError> {
         self.reset_fuel()?;
         let start = self
             .instance
@@ -2311,10 +2382,10 @@ impl PluginComponentInstanceRuntime {
                 ))
             })?;
         let config_json = plugin_config_json(record);
-        let (_status,) = start
+        let (status,) = start
             .call(&mut self.store, (&config_json,))
             .map_err(|error| PluginWasmError::Execution(error.to_string()))?;
-        Ok(())
+        decode_plugin_lifecycle_output("start", &status)
     }
 
     fn handle_tool(
@@ -2372,7 +2443,7 @@ impl PluginComponentInstanceRuntime {
         })
     }
 
-    fn stop(&mut self) -> Result<(), PluginWasmError> {
+    fn stop(&mut self) -> Result<Value, PluginWasmError> {
         self.reset_fuel()?;
         let stop = self
             .instance
@@ -2383,11 +2454,55 @@ impl PluginComponentInstanceRuntime {
                     PLUGIN_COMPONENT_INSTANCE_WORLD
                 ))
             })?;
-        let (_status,) = stop
+        let (status,) = stop
             .call(&mut self.store, ())
             .map_err(|error| PluginWasmError::Execution(error.to_string()))?;
-        Ok(())
+        decode_plugin_lifecycle_output("stop", &status)
     }
+
+    fn status(&mut self) -> Result<Value, PluginWasmError> {
+        self.reset_fuel()?;
+        let status = self
+            .instance
+            .get_typed_func::<(), (String,)>(&mut self.store, "status")
+            .map_err(|error| {
+                PluginWasmError::Module(format!(
+                    "component does not export expected `{}` status function: {error}",
+                    PLUGIN_COMPONENT_INSTANCE_WORLD
+                ))
+            })?;
+        let (status,) = status
+            .call(&mut self.store, ())
+            .map_err(|error| PluginWasmError::Execution(error.to_string()))?;
+        decode_plugin_lifecycle_output("status", &status)
+    }
+}
+
+fn decode_plugin_lifecycle_output(phase: &str, output: &str) -> Result<Value, PluginWasmError> {
+    if output.len() > PLUGIN_WASM_MAX_OUTPUT_BYTES {
+        return Err(PluginWasmError::Output(format!(
+            "plugin component {phase} output exceeds {} bytes",
+            PLUGIN_WASM_MAX_OUTPUT_BYTES
+        )));
+    }
+    let value: Value = serde_json::from_str(output).map_err(|error| {
+        PluginWasmError::Output(format!(
+            "plugin component {phase} output is not JSON: {error}"
+        ))
+    })?;
+    if let Some(error) = value.get("error") {
+        return Err(PluginWasmError::Execution(format!(
+            "plugin component {phase} returned error: {}",
+            bounded_message(error.to_string())
+        )));
+    }
+    if value.get("state").and_then(Value::as_str) == Some("failed") {
+        return Err(PluginWasmError::Execution(format!(
+            "plugin component {phase} returned failed status: {}",
+            bounded_message(value.to_string())
+        )));
+    }
+    Ok(value)
 }
 
 fn plugin_config_json(record: &ResolvedPluginRecord) -> String {
@@ -3608,6 +3723,188 @@ mod tests {
         permissions
     }
 
+    fn install_feature(
+        feature: PluginToolFeature,
+    ) -> (
+        super::super::FeatureRegistryInstallReport,
+        Vec<ToolDefinition>,
+    ) {
+        let mut pending = Vec::new();
+        let mut hooks = crate::hook::HookRegistryBuilder::new();
+        let report = super::super::FeatureRegistryBuilder::default()
+            .with_module(feature)
+            .install_into_pending(&mut pending, &mut hooks);
+        (report, pending)
+    }
+
+    #[test]
+    fn component_lifecycle_rejects_start_error_status() {
+        let component = component_instance_with_outputs(
+            br#"{"error":{"message":"boom"}}"#,
+            br#"{"state":"ready"}"#,
+            br#"{"state":"stopped"}"#,
+            br#"{"summary":"tool"}"#,
+            br#"{"accepted":true}"#,
+        );
+        let (_dir, mut record) = resolved_record_with_component(component);
+        record.manifest.runtime.as_mut().unwrap().world =
+            Some(PLUGIN_COMPONENT_INSTANCE_WORLD.into());
+        let error = match PluginInstanceHandle::new(record) {
+            Ok(_) => panic!("component start error should fail instance creation"),
+            Err(error) => error,
+        };
+        assert!(error.bounded_message().contains("start returned error"));
+    }
+
+    #[test]
+    fn component_lifecycle_reports_status_and_stop_outputs() {
+        let component = component_instance_with_outputs(
+            br#"{"state":"ready","data":{"phase":"start"}}"#,
+            br#"{"state":"ready","data":{"phase":"status"}}"#,
+            br#"{"state":"stopped","data":{"phase":"stop"}}"#,
+            br#"{"summary":"tool"}"#,
+            br#"{"accepted":true}"#,
+        );
+        let (_dir, mut record) = resolved_record_with_component(component);
+        record.manifest.runtime.as_mut().unwrap().world =
+            Some(PLUGIN_COMPONENT_INSTANCE_WORLD.into());
+        let handle = PluginInstanceHandle::new(record).unwrap();
+        let status = handle.status();
+        assert_eq!(status.lifecycle, PluginInstanceLifecycleState::Started);
+        assert_eq!(status.component_status.unwrap()["data"]["phase"], "status");
+        let stopped = handle.stop().unwrap();
+        assert_eq!(stopped.lifecycle, PluginInstanceLifecycleState::Stopped);
+        assert_eq!(stopped.component_status.unwrap()["data"]["phase"], "stop");
+    }
+
+    fn add_service(record: &mut ResolvedPluginRecord, name: &str) {
+        record.manifest.surfaces.push(PluginSurface::Service);
+        record.enabled_surfaces.push(PluginSurface::Service);
+        record
+            .manifest
+            .services
+            .push(manifest::plugin::PluginServiceManifest {
+                name: name.into(),
+                description: "test service".into(),
+                lifecycle: "host-managed".into(),
+                status_schema: None,
+                side_effects: Vec::new(),
+            });
+        record
+            .manifest
+            .permissions
+            .push(PluginPermission::surface(PluginSurface::Service));
+        record
+            .manifest
+            .permissions
+            .push(PluginPermission::service(name));
+        record
+            .grants
+            .permissions
+            .push(PluginPermission::surface(PluginSurface::Service));
+        record
+            .grants
+            .permissions
+            .push(PluginPermission::service(name));
+    }
+
+    fn add_ingress(record: &mut ResolvedPluginRecord, name: &str) {
+        record.manifest.surfaces.push(PluginSurface::Ingress);
+        record.enabled_surfaces.push(PluginSurface::Ingress);
+        record
+            .manifest
+            .ingresses
+            .push(manifest::plugin::PluginIngressManifest {
+                name: name.into(),
+                description: "test ingress".into(),
+                event_kinds: vec!["test".into()],
+                input_schema: None,
+                sources: Vec::new(),
+                side_effects: Vec::new(),
+            });
+        record
+            .manifest
+            .permissions
+            .push(PluginPermission::surface(PluginSurface::Ingress));
+        record
+            .manifest
+            .permissions
+            .push(PluginPermission::ingress(name));
+        record
+            .grants
+            .permissions
+            .push(PluginPermission::surface(PluginSurface::Ingress));
+        record
+            .grants
+            .permissions
+            .push(PluginPermission::ingress(name));
+    }
+
+    #[test]
+    fn service_only_install_retains_host_managed_instance() {
+        let mut record = record(Vec::new());
+        add_service(&mut record, "svc");
+        record.manifest.runtime = Some(manifest::plugin::PluginRuntimeManifest {
+            kind: "test-ingress".into(),
+            entry: None,
+            abi: None,
+            component: None,
+            world: Some(PLUGIN_COMPONENT_INSTANCE_WORLD.into()),
+        });
+        let feature = PluginToolFeature::new(record);
+        let (report, _pending) = install_feature(feature.clone());
+        assert!(
+            report.reports.iter().all(|report| report.installed),
+            "{report:#?}"
+        );
+        let status = feature.instance_status().expect("service instance started");
+        assert_eq!(status.lifecycle, PluginInstanceLifecycleState::Started);
+    }
+
+    #[test]
+    fn installed_ingress_dispatch_uses_retained_shared_instance() {
+        let mut record = record(vec![tool("shared_tool")]);
+        add_ingress(&mut record, "shared_ingress");
+        record.manifest.runtime = Some(manifest::plugin::PluginRuntimeManifest {
+            kind: "test-ingress".into(),
+            entry: None,
+            abi: None,
+            component: None,
+            world: Some(PLUGIN_COMPONENT_INSTANCE_WORLD.into()),
+        });
+        let feature = PluginToolFeature::new(record);
+        let (report, pending) = install_feature(feature.clone());
+        assert!(
+            report.reports.iter().all(|report| report.installed),
+            "{report:#?}"
+        );
+        let (_meta, tool) = pending
+            .into_iter()
+            .map(|definition| definition())
+            .find(|(meta, _tool)| meta.name == "shared_tool")
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let output = runtime
+            .block_on(tool.execute(r#"{"first":true}"#, ToolExecutionContext::default()))
+            .unwrap();
+        assert!(output.summary.contains("shared_tool"));
+        let report = feature
+            .dispatch_ingress(
+                "shared_ingress",
+                PluginIngressEvent {
+                    kind: "test".into(),
+                    source: "unit".into(),
+                    payload: serde_json::json!({ "hello": "world" }),
+                },
+            )
+            .unwrap();
+        assert!(report.accepted);
+        assert_eq!(report.output["calls"], 1);
+    }
+
     #[test]
     fn instance_ingress_dispatch_uses_shared_in_process_instance() {
         let mut record = record(vec![tool("shared_tool")]);
@@ -3644,6 +3941,7 @@ mod tests {
             record,
             runtime: PluginInstanceRuntime::TestIngress { calls: 0 },
             lifecycle: PluginInstanceLifecycleState::Started,
+            component_status: None,
             diagnostics: Vec::new(),
         })));
 
@@ -4927,6 +5225,81 @@ input_schema = {{ type = "object", additionalProperties = true }}
             fs: Vec::new(),
         };
         (dir, record)
+    }
+
+    fn component_instance_with_outputs(
+        start: &[u8],
+        status: &[u8],
+        stop: &[u8],
+        tool: &[u8],
+        ingress: &[u8],
+    ) -> Vec<u8> {
+        wat::parse_str(format!(
+            r#"(component
+              (core module $m
+                (memory (export "memory") 1)
+                (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+                  (if (result i32) (i32.eqz (local.get 0))
+                    (then (i32.const 8192))
+                    (else (local.get 0))))
+                (data (i32.const 1024) "{}")
+                (data (i32.const 2048) "{}")
+                (data (i32.const 3072) "{}")
+                (data (i32.const 4096) "{}")
+                (data (i32.const 5120) "{}")
+                (func $write (param i32 i32)
+                  (i32.store (i32.const 6144) (local.get 0))
+                  (i32.store (i32.const 6148) (local.get 1)))
+                (func (export "start") (param i32 i32) (result i32)
+                  (call $write (i32.const 1024) (i32.const {}))
+                  (i32.const 6144))
+                (func (export "status") (result i32)
+                  (call $write (i32.const 2048) (i32.const {}))
+                  (i32.const 6144))
+                (func (export "stop") (result i32)
+                  (call $write (i32.const 3072) (i32.const {}))
+                  (i32.const 6144))
+                (func (export "tool") (param i32 i32 i32 i32) (result i32)
+                  (call $write (i32.const 4096) (i32.const {}))
+                  (i32.const 6144))
+                (func (export "ingress") (param i32 i32 i32 i32) (result i32)
+                  (call $write (i32.const 5120) (i32.const {}))
+                  (i32.const 6144))
+              )
+              (core instance $i (instantiate $m))
+              (alias core export $i "memory" (core memory $mem))
+              (alias core export $i "realloc" (core func $realloc))
+              (alias core export $i "start" (core func $start_core))
+              (alias core export $i "status" (core func $status_core))
+              (alias core export $i "stop" (core func $stop_core))
+              (alias core export $i "tool" (core func $tool_core))
+              (alias core export $i "ingress" (core func $ingress_core))
+              (type $start_ty (func (param "config-json" string) (result string)))
+              (type $noarg_ty (func (result string)))
+              (type $twoarg_ty (func (param "name" string) (param "json" string) (result string)))
+              (func $start (type $start_ty) (canon lift (core func $start_core) (memory $mem) (realloc $realloc) string-encoding=utf8))
+              (func $status (type $noarg_ty) (canon lift (core func $status_core) (memory $mem) (realloc $realloc) string-encoding=utf8))
+              (func $stop (type $noarg_ty) (canon lift (core func $stop_core) (memory $mem) (realloc $realloc) string-encoding=utf8))
+              (func $tool (type $twoarg_ty) (canon lift (core func $tool_core) (memory $mem) (realloc $realloc) string-encoding=utf8))
+              (func $ingress (type $twoarg_ty) (canon lift (core func $ingress_core) (memory $mem) (realloc $realloc) string-encoding=utf8))
+              (export "start" (func $start))
+              (export "status" (func $status))
+              (export "stop" (func $stop))
+              (export "handle-tool" (func $tool))
+              (export "handle-ingress" (func $ingress))
+            )"#,
+            wat_bytes(start),
+            wat_bytes(status),
+            wat_bytes(stop),
+            wat_bytes(tool),
+            wat_bytes(ingress),
+            start.len(),
+            status.len(),
+            stop.len(),
+            tool.len(),
+            ingress.len(),
+        ))
+        .unwrap()
     }
 
     fn component_tool_that_returns(output: &[u8]) -> Vec<u8> {
