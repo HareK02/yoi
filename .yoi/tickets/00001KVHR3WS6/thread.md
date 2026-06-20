@@ -301,3 +301,48 @@ Reviewer validation:
 Worktree status at review end: clean。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T08:46:04Z -->
+
+## Implementation report
+
+Merge and final validation report:
+
+Merged implementation branch into Orchestrator branch:
+- Merge commit: `a1f904b8 merge: mcp tool registration`
+- Implementation commits included:
+  - `66fa9d55 mcp: register stdio server tools`
+  - `0080c5b3 mcp: reject colliding tool names`
+
+Reviewer outcome:
+- r1 requested changes because duplicate/colliding normalized MCP tool names were diagnostic-only and allowed the first colliding definition to become model-visible。
+- Coder changed normalization to count all valid names first and register only identities that occur exactly once, plus updated tests。
+- r2 approved with no blocking issues。
+
+Orchestrator validation after merge passed:
+- `cargo fmt --check`
+- `git diff --check HEAD^1..HEAD`
+- `cargo test -p mcp list_tools --test stdio_lifecycle`
+- `cargo test -p pod feature::mcp --lib`
+- `cargo test -p mcp`
+- `cargo check -p pod -p mcp`
+- `nix build .#yoi --no-link`
+- `nix path-info -S .#yoi`: `113089912`
+
+Validation log:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/bash-SnBew4.log`
+
+Final state:
+- Orchestrator worktree clean at `a1f904b8` after validation。
+- Implementation worktree remains available for cleanup after Ticket completion records are committed。
+- Dashboard/Console refactor is now running in parallel in separate child worktree and is unaffected by this merge。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-20T08:46:10Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Implementation was merged into Orchestrator branch at `a1f904b8`, r2 review approved, and final Orchestrator validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, focused `mcp` and `pod feature::mcp` tests, `cargo check -p pod -p mcp`, and `nix build .#yoi --no-link`.
+
+---
