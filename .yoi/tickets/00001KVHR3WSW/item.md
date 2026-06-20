@@ -1,8 +1,8 @@
 ---
 title: 'MCP: handle list_changed notifications safely'
-state: 'queued'
+state: 'inprogress'
 created_at: '2026-06-20T05:30:04Z'
-updated_at: '2026-06-20T06:00:44Z'
+updated_at: '2026-06-20T10:07:07Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['mcp', 'notifications', 'tool-schema', 'prompt-cache', 'refresh']
