@@ -8,90 +8,202 @@ assignee: null
 
 ## 背景
 
-現行の外部 Plugin 実装は Tool surface のみを提供しており、`yoi plugin new rust-component-tool` で作れるものは「モデルが明示的に呼ぶ Tool」に限られる。Discord Bridge のような Gateway/WebSocket 接続、常駐 lifecycle、外部イベント受信、Yoi 内部への通知/配送を持つ Plugin には Service / Ingress surface が必要だが、まだ外部 Wasm Plugin runtime として実装されていない。
+現行の外部 Plugin 実装は Tool surface のみを提供しており、実行モデルも Tool call ごとの artifact 実行に寄っている。Discord Bridge や Minecraft Plugin 的な拡張では、Tool / Service / Ingress が同じ Plugin instance とその内部構造・状態・設定・diagnostics を共有できる必要がある。
 
-方針として、Service は専用の Component interface を定義し、Wasm 側がそれを実装する。Yoi host は enabled package / grants / digest を確認したうえで Service instance を生成・保持し、start/stop/status/event delivery を host-managed lifecycle として管理する。Wasm component が勝手に常駐 daemon や unmanaged socket を持つのではなく、host が instance と権限付き host API を所有し、外部イベントや host-managed I/O event に応じて component export を呼び出す。
-
-Ingress は外部から Yoi に入る event boundary として扱う。Discord message、Webhook、file watcher event などは Ingress event として bounded/typed data に正規化され、Service instance または handler export に渡される。Plugin が返す action は host が grant と policy を再確認して、Notify / SystemItem / Companion message / Tool-visible diagnostics など既存の durable/visible path に適用する。
+この Ticket では、Plugin を「Tool call のたびに実行される wasm artifact」ではなく、Pod lifetime に紐づいて host が管理する **Plugin instance** として再設計し、一気に実装する。mutable state を持たない Plugin も意味論上は instance として扱い、per-call instantiate / pooling / lightweight execution は host runtime の最適化または legacy adapter の実装詳細に留める。
 
 既存前提:
 
 - `00001KT6Q08R9` で Feature contribution registry は Tool / Hook / BackgroundTask / Service provider descriptor 境界を導入済み。
 - 現行 Plugin package/runtime は Tool registration/execution まで実装済み。
+- `PluginSurface` には Tool / Service / Ingress などの概念があるが、実際の external wasm Plugin runtime は Tool only。
 - Plugin output は hidden context injection ではなく、Tool result、committed history、explicit notification/history path へ流す原則を維持する。
 
-## 設計方針
+## Core model
 
-- Plugin は原則として host-managed instance として扱い、Tool / Service / Ingress はその instance が提供する surface とする。
-  - mutable state を持たない Plugin でも、instance として構造化された lifecycle / configuration / grants / diagnostics / exports を持つ方が authoring と host 管理が単純になる。
-  - Minecraft Plugin 的に、Plugin instance は command handler / event listener / lifecycle hook をまとめる単位であり、Tool/Service/Ingress から不可分な実行対象である。
-  - Tool は transient worker state ではなく、host が保持する Plugin instance へ command/query として dispatch される。
-  - Tool schema/model-visible registration と Service lifecycle は別 surface だが、実行先 instance は同一である。
-- Wasm component は Plugin instance interface の export を実装する。
-  - 例: `start(config)`, `handle_event(event)`, `handle_tool(tool, input)`, `status()`, `stop(reason)` 相当。
-  - exact schema / naming は実装時に詰めるが、Tool export も instance lifecycle 配下の dispatch として扱う。
-- Yoi host は Plugin instance を保持し、lifecycle / restart / diagnostics / resource bounds / call serialization を管理する。
-- 長寿命 network/socket/process ownership は原則 host 側に置く。
-  - Wasm に raw ambient network/WASI socket を渡して unmanaged runtime loop を作らせない。
-  - 必要な outbound/inbound は host API と grant で明示する。
-- Ingress は外部 event を Yoi 内部 event/action に変換する境界とする。
-  - external event は bounded, typed, untrusted input として扱う。
-  - event delivery は session history / prompt context を直接改ざんしない。
-- Plugin action application は host-mediated とする。
-  - Notify / SystemItem / Companion message / diagnostics 等、既存または明示的に追加した durable/visible path にだけ反映する。
-  - arbitrary UI channel や hidden context injection は作らない。
-- Service state は短期状態なら instance 内保持を許すが、永続状態は明示的な persisted state API / scoped fs 等に逃がす。
-- package discovery は inventory only、enablement/grants/digest approval が Service/Ingress 登録の前提。
+- Plugin package は enabled/digest/grant 検証後、Pod 内に 1 個以上の host-managed `PluginInstance` として登録される。
+- Tool / Service / Ingress は Plugin instance が提供する surface であり、独立した実行主体ではない。
+- Tool call は model-visible ToolRegistry から thin dispatch handle を通り、同じ Plugin instance の command/query handler に入る。
+- Ingress event は host-managed external/internal event source から bounded typed event として入り、同じ Plugin instance の event handler に入る。
+- Service は Plugin instance lifecycle / background-owned capability / status/diagnostics を表す surface であり、Tool の代替ではない。
+- Wasm component は Plugin instance interface を実装する。Tool-only Plugin も instance interface に乗せる。
+- 既存の Tool-only component/raw wasm runtime は互換 adapter として維持し、長期意味論は instance-oriented に揃える。
 
-## 要件
+概念図:
 
-- Plugin manifest / static inspection が Service / Ingress contribution を表現できる。
-  - `surfaces = ["service", "ingress"]` または同等の明示 surface。
-  - service id/version, ingress event kinds, required host APIs, side effects, secrets/network requirements を reviewable にする。
-- Component Plugin runtime が Tool surface registration と instance lifecycle を分離して扱う。
-  - Tool schema/model-visible registration と Plugin instance lifecycle registration を混同しない。
-  - Tool-only package でも host-managed Plugin instance として起動し、Tool execution はその instance の command/query export へ dispatch できる。
-  - mutable state を持たない場合の lightweight instantiation / pooling / per-call optimization は実装詳細として許すが、意味論上は instance-oriented model を保つ。
-  - Service component artifact / interface compatibility を static check できる。
-- Host-managed Plugin instance registry を追加する。
-  - enabled Plugin instance を start/stop/status できる。
-  - 同一 Plugin package の Tool / Ingress / Service 呼び出しが同じ Plugin instance を参照できる。
-  - instance への同時呼び出し、reentrancy、timeout、crash isolation の方針を定義する。
-  - failure/restart/backoff/diagnostics を bounded に記録/表示できる。
-  - Pod shutdown / restore / config change 時の lifecycle を明確化する。
-- Ingress event delivery path を追加する。
-  - external event を bounded typed input として Service export に渡す。
-  - Plugin response action は grant/policy check 後に既存 Yoi path へ適用する。
-- Permission/grant model を Service/Ingress 用に拡張する。
-  - host API, network host, secret refs, event sources, output actions を個別に grant-gated にする。
-  - SDK/PDK helper availability と authority grant を混同しない。
-- Rust PDK/template は Tool 用と Service/Ingress 用を分ける。
-  - Tool authoring docs が Service/Ingress capability を誤って約束しないようにする。
-  - Service/Ingress authoring docs は host-managed lifecycle と event-driven export 呼び出しを明記する。
+```text
+Enabled Plugin Package
+  -> PluginInstanceRegistry
+     -> PluginInstance
+        -> lifecycle: start/status/stop
+        -> tool dispatch: handle_tool(tool_name, input_json)
+        -> ingress dispatch: handle_ingress(event_kind, event_json)
+        -> diagnostics/status/actions via host-mediated paths
+
+ToolRegistry entry
+  -> PluginInstanceTool { plugin_ref, tool_name, registry }
+  -> registry.call_tool(plugin_ref, tool_name, input)
+
+Ingress source
+  -> registry.deliver_ingress(plugin_ref, ingress_name, event)
+```
+
+## Wasm / PDK interface direction
+
+Define a new Component world/interface, e.g. `yoi:plugin/instance@1.0.0`, separate from the current Tool-only world. Exact WIT/schema names can change during implementation, but the implemented interface must represent the following lifecycle:
+
+- `start(config_json) -> result/status`
+- `handle_tool(tool_name, input_json) -> tool_result_json`
+- `handle_ingress(ingress_name, event_json) -> action_batch_json/status`
+- `status() -> status_json`
+- `stop(reason_json) -> result/status`
+
+PDK shape should be instance-oriented, for example:
+
+```rust
+struct MyPlugin {
+    // Mutable state is allowed but not required.
+}
+
+impl yoi_plugin_pdk::Plugin for MyPlugin {
+    fn start(ctx: StartContext) -> Result<Self, Error>;
+    fn handle_tool(&mut self, ctx: ToolContext, tool: &str, input: JsonValue) -> Result<ToolOutput, Error>;
+    fn handle_ingress(&mut self, ctx: IngressContext, ingress: &str, event: JsonValue) -> Result<ActionBatch, Error>;
+    fn status(&self, ctx: StatusContext) -> Result<PluginStatus, Error>;
+    fn stop(self, ctx: StopContext) -> Result<(), Error>;
+}
+
+yoi_plugin_pdk::export_plugin_instance!(MyPlugin);
+```
+
+Tool-only helper macros may remain, but should become compatibility/convenience wrappers over the instance model where practical.
+
+## Host runtime design
+
+Add a `PluginInstanceRegistry` in the Pod feature/plugin layer.
+
+Responsibilities:
+
+- Build instance descriptors from discovered + enabled Plugin records.
+- Validate digest/version/source/grants before instance registration.
+- Start instances during Pod/Worker setup at the point where Tool registration can receive registry handles.
+- Register Tool surface entries as dispatch handles, not self-contained artifact executors.
+- Route Tool calls to `PluginInstance::handle_tool`.
+- Route Ingress events to `PluginInstance::handle_ingress`.
+- Provide status/diagnostics for `yoi plugin list/show` or equivalent inspection.
+- Stop instances on Pod shutdown/runtime teardown.
+- Keep model-visible Tool schemas run-stable for a Worker run; instance state must not mutate Tool schema mid-run.
+
+Instance execution should be serialized per Plugin instance initially:
+
+- Each instance owns its Wasm `Store`/component instance or legacy adapter state.
+- Calls enter through an actor/queue or equivalent single-flight guard.
+- Reentrancy is disallowed initially.
+- Concurrent Tool/Ingress calls to the same instance are queued or rejected with bounded diagnostics.
+- Timeout/trap/cancel marks the instance failed and either restarts according to policy or returns a bounded error.
+- Crash/restart/backoff/status are visible in diagnostics, not hidden in Tool prose.
+
+## Runtime compatibility
+
+Implement all active paths in one change set, but preserve compatibility:
+
+- New instance world:
+  - `world = "yoi:plugin/instance@1.0.0"` or equivalent.
+  - Host keeps component instance alive across calls.
+  - Tool/Ingress/Service dispatch share that instance.
+- Existing Component Tool world:
+  - Continue supporting `world = "yoi:plugin/tool@1.0.0"`.
+  - Wrap as a legacy `PluginInstance` adapter.
+  - Adapter may still instantiate per call internally, but ToolRegistry sees an instance dispatch target.
+- Existing raw core-Wasm Tool runtime:
+  - Continue supporting current `kind = "wasm"` / `abi = "yoi-plugin-wasm-1"` as a legacy Tool adapter.
+  - No Service/Ingress support for raw ABI unless explicitly added later.
+
+This avoids breaking existing Tool Plugin packages while moving Pod/plugin architecture to the instance model immediately.
+
+## Manifest / package model
+
+Extend manifest/static inspection so a package can declare instance-backed surfaces:
+
+- `surfaces = ["tool"]` remains valid.
+- `surfaces = ["tool", "service", "ingress"]` becomes valid when runtime/interface supports it.
+- `[[tools]]` remains the model-visible Tool schema declaration source.
+- Add Service declarations with id/name/description/lifecycle/required host APIs/side effects/status metadata.
+- Add Ingress declarations with id/name/event kinds/input schema/source expectations/side effects/action outputs.
+- Static validation must reject Service/Ingress declarations for runtimes/interfaces that cannot implement them.
+- `yoi plugin check/list/show` must report Tool/Service/Ingress eligibility, grants, rejected surfaces, runtime compatibility, diagnostics, and whether a package is legacy Tool-only or instance-capable.
+
+Permission/grant model:
+
+- Surface grants stay explicit: `surface=tool`, `surface=service`, `surface=ingress`.
+- Tool grants remain per Tool name.
+- Service grants are per Service id/name.
+- Ingress grants are per Ingress id/name and event source/kind where applicable.
+- Host APIs (`https`, `fs`, future secrets/network/event sources) remain separately grant-gated.
+- Output actions from Ingress/Service must be separately constrained; Plugin instance access does not imply arbitrary Yoi mutation authority.
+- SDK/PDK helper availability is never authority.
+
+## Tool / Service / Ingress interaction
+
+- Tool processing must be able to access the same Plugin instance used by Service/Ingress.
+- Tool execution remains model/user initiated and returns through the ordinary Tool result/history path.
+- Service/Ingress must not secretly call model Tools or mutate context/history directly.
+- Service/Ingress may return host-mediated actions; host applies only approved actions to explicit durable/visible paths.
+- Long-running work started from a Tool should return an accepted/status result and continue through instance/service diagnostics or explicit action paths rather than blocking the Tool indefinitely.
+
+## Ingress and action paths
+
+Ingress is the boundary for external events entering Yoi.
+
+- Events are untrusted, bounded, typed inputs.
+- Event delivery must not insert hidden context.
+- Allowed outputs must be explicit action variants, initially limited to safe host-mediated paths such as diagnostics/status and, if implemented, Notify/SystemItem/Companion-visible messages through existing durable mechanisms.
+- Arbitrary UI channels are prohibited.
+- If an action path does not yet have a safe host API, the implementation should expose diagnostics/status rather than inventing an unsafe path.
+
+## Implementation scope
+
+This Ticket is no longer design-only. Implement the complete instance-oriented plugin runtime boundary in one integrated change:
+
+1. Instance model and registry in Pod plugin feature code.
+2. ToolRegistry dispatch through Plugin instance handles.
+3. New Component instance world/resource files and Rust PDK support.
+4. Legacy Tool component/raw wasm adapters behind the instance registry.
+5. Manifest/static validation additions for Service/Ingress declarations.
+6. `yoi plugin check/list/show` reporting updates.
+7. Host-managed start/status/stop lifecycle and bounded diagnostics.
+8. Ingress dispatch API and at least one test/in-process ingress delivery path.
+9. Grant checks for Tool/Service/Ingress surfaces and host APIs.
+10. Docs/templates updated so Tool-only vs instance-capable Plugin authoring is explicit.
+
+Discord Bridge itself remains out of scope, but the implemented runtime must be sufficient for a Discord Bridge Plugin to be designed on top of it without another foundational runtime redesign.
 
 ## Non-goals
 
-- Discord Bridge そのものの実装。
-- raw ambient WASI network/socket を Plugin に渡して常駐 daemon 化すること。
-- arbitrary Plugin UI channel。
-- hidden prompt/context injection。
-- public registry/install/update/signature tooling。
-- Tool surface を Service 代替として拡張すること。
+- Implementing Discord Bridge itself.
+- Granting raw ambient WASI network/socket access to Plugin code.
+- Public registry/install/update/signature tooling.
+- Arbitrary Plugin UI channel.
+- Hidden prompt/context injection.
+- Allowing Service/Ingress to mutate model-visible Tool schema mid-run.
 
 ## 受け入れ条件
 
-- Service/Ingress surface の design record または implementation design が repository 内に追加され、Tool surface との違い、host-managed Plugin instance lifecycle、Ingress event boundary、permission/grant model が明文化されている。
-- `plugin.toml` / package inspection / enablement model に Service/Ingress contribution をどう表現するかが決まっている。
-- Wasm 側が実装する Plugin instance interface と、host が保持・呼び出す lifecycle の責務境界が決まっている。
-- Tool が同じ Plugin instance に command/query としてアクセスする方式が決まっている。
-- Ingress event がどの durable/visible Yoi path に変換され得るか、どの path が禁止かが決まっている。
-- 既存 Tool Plugin runtime/docs が「現時点では Tool surface」であることを誤解なく示す。
-- 実装を一度に詰め込まず、必要なら follow-up Ticket に分割できる状態になっている。
-- 既存 Feature contribution registry (`00001KT6Q08R9`) との接続方針が明記されている。
-
-## Validation
-
-- design/doc diff review。
-- `git diff --check`。
-- docs/resource を変更した場合は `nix build .#yoi --no-link`。
-- Ticket 整合性確認: `yoi ticket doctor`。
+- Pod/plugin architecture uses a `PluginInstanceRegistry` or equivalent host-managed instance boundary.
+- Existing Tool Plugin packages still work through the instance registry compatibility path.
+- A new instance-capable Component Plugin can expose at least one Tool and have multiple Tool calls reach the same Plugin instance during a Pod run.
+- A new instance-capable Component Plugin can expose at least one Ingress handler and receive a bounded in-process test event through the registry.
+- Service lifecycle/status is represented and visible in inspection/diagnostics, even if the first implementation only supports host-managed start/status/stop and no real external socket source.
+- Tool / Service / Ingress grants are validated independently; sharing a Plugin instance does not bypass per-surface authorization.
+- Tool schemas remain run-stable and model-visible only through normal ToolRegistry construction.
+- Plugin output/event effects use Tool results or explicit durable/visible host-mediated paths; no hidden context injection is introduced.
+- `yoi plugin check/list/show` distinguishes legacy Tool-only packages from instance-capable packages and explains rejected Service/Ingress surfaces.
+- Rust PDK/template/docs include instance-oriented authoring in addition to legacy/convenience Tool-only authoring.
+- Focused tests cover:
+  - manifest validation for Tool/Service/Ingress declarations;
+  - legacy Tool component execution through the instance registry;
+  - instance state persistence across two Tool calls;
+  - Tool call dispatch to the same instance used by Ingress delivery;
+  - grant denial for missing Service/Ingress grants;
+  - timeout/trap/failure diagnostics for an instance call.
+- Validation before completion includes `cargo fmt --check`, relevant `cargo test`, `cargo check`, `git diff --check`, `yoi ticket doctor`, and `nix build .#yoi --no-link`.
