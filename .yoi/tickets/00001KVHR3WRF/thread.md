@@ -158,3 +158,16 @@ Next action:
 - Dispatch Reviewer for r1 review against Ticket requirements, with focus on config schema fit, validation/redaction boundaries, no process spawning/no auto-start, Profile/config layering, docs trust boundary, and whether the reported `manifest --lib` failure is unrelated or must be fixed。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-20T07:19:20Z -->
+
+## Plan
+
+Review dispatch:
+- Spawned Reviewer Pod `yoi-reviewer-00001KVHR3WRF-r1` against implementation branch `impl/00001KVHR3WRF-mcp-stdio-config-trust`。
+- Review target commit: `e0680cce mcp: add stdio server config`。
+- Review baseline: `b0225e48`。
+- Reviewer task focuses on config-only boundary, no process spawning/no auto-start, secret/env redaction, fail-closed validation, Profile/config layering, trust-boundary docs, MCP vs Plugin/feature authority separation, and the reported `cargo test -p manifest --lib` failure。
+- Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
+
+---
