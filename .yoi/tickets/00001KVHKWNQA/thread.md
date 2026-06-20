@@ -156,3 +156,16 @@ Next action:
 - Dispatch Reviewer for r1 review against Ticket requirements, with focus on guest-only PDK boundary, no host-runtime deps, authority/grant wording, template/resource packaging, sample/test boundary honesty, docs, and Nix/workspace changes。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-20T05:16:53Z -->
+
+## Plan
+
+Review dispatch:
+- Spawned Reviewer Pod `yoi-reviewer-00001KVHKWNQA-r1` against implementation branch `impl/00001KVHKWNQA-plugin-rust-pdk-templates`。
+- Review target commit: `06287aca plugin: add rust pdk template`。
+- Review baseline: `5f7f81bd`。
+- Reviewer task focuses on guest-only PDK boundary, absence of host-runtime deps, authority/grant wording, no ambient fs/network/env, template/resource packaging, current WIT/runtime compatibility, sample/test honesty, docs, and Nix/workspace changes。
+- Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
+
+---
