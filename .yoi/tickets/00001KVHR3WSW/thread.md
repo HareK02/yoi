@@ -156,3 +156,16 @@ Next action:
 - Dispatch Reviewer for r1 review against Ticket requirements, with focus on current-run schema/history invariants, safe-boundary refresh policy, bounded diagnostics, no hidden prompt/resource injection, tools/resources/prompts notification coverage, and tests。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-20T10:26:52Z -->
+
+## Plan
+
+Review dispatch:
+- Spawned Reviewer Pod `yoi-reviewer-00001KVHR3WSW-r1` against implementation branch `impl/00001KVHR3WSW-mcp-list-changed`。
+- Review target commit: `e33dee19 mcp: handle list changed notifications`。
+- Review baseline: `d31b8907`。
+- Reviewer task focuses on current-run schema/history invariants, safe-boundary refresh policy, bounded diagnostics, no hidden prompt/resource injection, notification param handling, tools/resources/prompts coverage, no sampling/elicitation/remote scope creep, tests, and package validation。
+- Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
+
+---
