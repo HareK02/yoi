@@ -169,3 +169,47 @@ Review dispatch:
 - Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVHR3WSW-r1 at: 2026-06-20T10:31:26Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket `00001KVHR3WSW` item/thread、Orchestrator IntentPacket、binding invariants。
+- Diff: `d31b8907..e33dee19`。
+- 主な対象:
+  - `crates/mcp/src/stdio.rs`
+  - `crates/mcp/tests/stdio_lifecycle.rs`
+  - `crates/mcp/tests/fixtures/mock_server.rs`
+  - `crates/pod/src/feature/mcp.rs`
+- Hidden context/history append、post-registration live ToolRegistry mutation、notification param usage/leakage、sampling/elicitation/remote transport scope creep の有無を確認。
+
+Blocking issues: none。
+
+Approval evidence:
+- `crates/mcp/src/stdio.rs` は `notifications/tools/list_changed`, `notifications/resources/list_changed`, `notifications/prompts/list_changed` を bounded enum state としてのみ記録している。
+- Notification `params` は incoming message shape として deserialize されるが、保存・render・behavior には使われない。
+- Startup discovery は model-visible tool registration 前に `tools/list_changed` を検出した場合、`tools/list` refresh を最大 1 回だけ行う。
+- Refresh 後も changes が続く場合は restart-required diagnostic を出し、post-registration ToolRegistry/schema mutation は行わない。
+- Runtime MCP tool/resource/prompt operations は list-change notification を ordinary Tool output の bounded warning として明示的に返す。Hidden resource/prompt content injection はない。
+- Sampling / elicitation / remote transport scope creep はない。
+- Tests は kind-only notification state、safe-boundary tool refresh、continued-change restart diagnostic、resources/prompts warnings、malicious notification params が漏れないことを cover している。
+
+Non-blocking follow-ups:
+- Runtime diagnostic wording に “restart the Pod or start a new run to rediscover tools” とある。MCP discovery が Pod-startup scoped であるなら、将来 “restart/reinitialize the Pod” のみに絞るとより明確。
+- Resources/prompts `list_changed` notifications observed during startup discovery は、explicit resource/prompt tool operations 中でない限り別途 surface されない。ただし resources/prompts lists は startup で cache されないため、この Ticket では blocking ではない。将来 persistent resource cache を持つなら明示 diagnostics が必要。
+
+Reviewer validation:
+- `cargo fmt --all --check`: passed。
+- `git diff --check d31b8907..HEAD`: passed。
+- `cargo test -p mcp list_changed -- --nocapture`: passed。
+- `cargo test -p pod mcp::tests:: -- --nocapture`: passed, 16 tests。
+- `cargo test -p mcp`: passed, 13 tests。
+- `cargo check --workspace`: passed。
+- `nix build .#yoi --no-link`: not run by Reviewer。
+
+Worktree status at review end: source tree clean; ignored `target/` only。
+
+---
