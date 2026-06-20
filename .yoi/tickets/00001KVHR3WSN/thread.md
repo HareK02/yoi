@@ -166,3 +166,16 @@ Next action:
 - Dispatch Reviewer for r1 review against Ticket requirements, with focus on explicit tool operations, ordinary Tool result/history path, no hidden context injection, untrusted/bounded content serialization, capability-gated registration, pagination/bounds, no list_changed/sampling/elicitation scope creep, and tests。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-20T09:57:57Z -->
+
+## Plan
+
+Review dispatch:
+- Spawned Reviewer Pod `yoi-reviewer-00001KVHR3WSN-r1` against implementation branch `impl/00001KVHR3WSN-mcp-resources-prompts-tools`。
+- Review target commit: `3a22360a mcp: expose resources prompts tools`。
+- Review baseline: `b2b4764f`。
+- Reviewer task focuses on explicit tool operations, ordinary Tool result/history path, no hidden context injection, untrusted/bounded resource/prompt content serialization, capability-gated registration, pagination/bounds, diagnostics redaction, no list_changed/sampling/elicitation scope creep, tests, and package validation。
+- Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
+
+---
