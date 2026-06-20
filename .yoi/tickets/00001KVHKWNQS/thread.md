@@ -280,3 +280,45 @@ Next action:
 - Route back to Reviewer for r2 verification of symlink destination refusal, placeholder partial/check behavior, and final acceptance criteria。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVHKWNQS-r1 at: 2026-06-20T06:50:40Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket body/thread / Orchestrator IntentPacket
+- r2 fix diff: `945ecdf6..699db538`
+- 全体実装 diff: `d1095f85..699db538`
+- 主な対象: `crates/yoi/src/plugin_cli.rs`, `docs/development/plugin-development.md`, and prior `new` / `check` / `pack` implementation surface。
+
+Previous blocker verification:
+1. `plugin new` symlink destination write-through
+   - `materialize_template` now uses `fs::symlink_metadata` and rejects destination symlink before writing。
+   - Regression test `plugin_new_refuses_symlink_destination_without_following_it` verifies refusal and no write-through。
+   - CLI smoke confirmed symlink destination is rejected and target directory does not receive `plugin.toml`。
+
+2. Placeholder component reported as enablement-ready
+   - `check` now compares runtime component bytes against embedded template placeholder and adds bounded `placeholder` diagnostic。
+   - Generated template now reports `status=partial` when static validation is otherwise clean but placeholder remains。
+   - Enablement guidance is suppressed for `partial` and says the package is not ready to enable。
+   - CLI smoke confirmed generated directory and packed `.yoi-plugin` both report `partial` with placeholder diagnostic; `partial` exits successfully, while invalid/missing paths remain non-zero rejected。
+
+Blocking issues: none。
+
+Non-blocking concerns / follow-ups:
+- None required for this Ticket. The hardening keeps status vocabulary aligned with existing Plugin inspection (`active` / `partial` / `rejected`)。
+
+Reviewer validation:
+- `cargo fmt --check`: passed
+- `git diff --check d1095f85..HEAD`: passed
+- `cargo check -p yoi`: passed
+- `cargo test -p yoi plugin_cli`: passed (`16 tests`)
+- `cargo test -p yoi-plugin-pdk template`: passed (`2 template tests`)
+- CLI smoke after `cargo build -p yoi`: passed for `new`, generated `check --json partial`, human `[partial]`, `pack --json`, packed package `check --json partial`, invalid check rejected/non-zero, symlink destination refusal, and `plugin list --workspace ... --json` discoverability as `disabled`。
+- `nix build .#yoi --no-link`: passed
+
+Worktree status at review end: source tree clean。
+
+---
