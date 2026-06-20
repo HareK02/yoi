@@ -109,3 +109,46 @@ Next action:
 - Wait for Coder implementation report, then inspect branch diff/validation evidence and route to Reviewer。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T12:06:19Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVJABS1A`.
+
+Implementation commit:
+- `0717aae3 pod: preserve profile override scope`
+
+Changed areas reported:
+- `crates/pod/src/entrypoint.rs`:
+  - Profile launch policy no longer replaces `manifest.scope` wholesale。
+  - It appends missing launch-policy default scope rules onto the already-resolved Profile/override scope。
+  - Explicit `scope.allow` / `scope.deny` entries from Profile and `.yoi/override.local.toml` are preserved。
+  - Normal workspace write scope and `.worktree` write deny remain applied for normal launches。
+  - Ticket role launch defaults/delegation behavior remains applied。
+  - Added focused tests for:
+    - `.yoi/override.local.toml` extra `[[scope.allow]]` surviving Profile launch in final manifest/snapshot serialization。
+    - Normal launch keeping workspace write + `.worktree` deny while preserving explicit Profile scope。
+    - Orchestrator role launch keeping read-root/worktree delegation defaults while preserving explicit Profile scope。
+
+Coder validation reported:
+- `cargo test -p pod entrypoint::tests::`: passed, 22 tests。
+- `cargo check -p pod`: passed。
+- `cargo fmt --all --check`: passed。
+- `git diff --check`: passed。
+- `cargo test -p pod`: ran but failed on two existing prompt guidance assertions unrelated to this change:
+  - `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`
+  - `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`
+  - Missing text asserted: `"worktree status, diff, and test results"`。
+- Nix not run because no packaging/source-filter/dependency files changed。
+
+Orchestrator evidence checked before review dispatch:
+- Implementation worktree is clean。
+- HEAD is `0717aae3`。
+- Diff from acceptance `72e9f2f1..HEAD` is one implementation commit touching only `crates/pod/src/entrypoint.rs`, about 111 insertions / 14 deletions。
+- `git diff --check 72e9f2f1..HEAD` produced no diagnostics。
+
+Next action:
+- Dispatch Reviewer for r1 review against Ticket requirements, with focus on scope allow/deny merge semantics, authority boundary/no broadening beyond explicit override + defaults, workspace write / `.worktree` deny preservation, Ticket role policy preservation, snapshot/tool-visible scope consistency, and whether the full `cargo test -p pod` failure is unrelated/pre-existing。
+
+---
