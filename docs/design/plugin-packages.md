@@ -52,7 +52,7 @@ entry = "plugin.wasm"
 abi = "yoi-plugin-wasm-1"
 ```
 
-The preferred future WASM authoring/runtime shape is the WebAssembly Component Model, recorded in [Plugin Component Model migration](plugin-component-model.md). Component packages should be explicit and source-compatible rather than silently changing the existing raw core-Wasm runtime:
+The preferred WASM authoring/runtime shape is the WebAssembly Component Model, recorded in [Plugin Component Model migration](plugin-component-model.md). Component packages should be explicit and source-compatible rather than silently changing the existing raw core-Wasm runtime:
 
 ```toml
 [runtime]
@@ -215,6 +215,13 @@ kind = "wasm-component"
 component = "plugin.component.wasm"
 world = "yoi:plugin/tool@1.0.0"
 ```
+
+For new Rust Tool packages, the preferred authoring path is the first-party
+`yoi-plugin-pdk` plus the embedded `resources/plugin/templates/rust-component-tool/`
+starter. The template uses a checkout-local path dependency for development and
+documents a future out-of-tree pinned git `rev` dependency pattern. Crates.io
+publication, remote template fetching, and package authoring commands are not
+part of the current package/runtime contract.
 
 This is separate from the legacy raw core-Wasm runtime:
 

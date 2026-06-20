@@ -3868,6 +3868,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pdk_tool_output_shape_is_accepted_by_wasm_decoder() {
+        let pdk_output =
+            yoi_plugin_pdk::ToolOutput::json("pdk ok", serde_json::json!({"answer": 42}))
+                .unwrap()
+                .to_json_string();
+
+        let output = decode_plugin_wasm_output(pdk_output.as_bytes()).unwrap();
+        assert_eq!(output.summary, "pdk ok");
+        assert_eq!(output.content.as_deref(), Some(r#"{"answer":42}"#));
+    }
+
     #[tokio::test]
     async fn malformed_input_json_fails_before_wasm_execution() {
         let (_dir, record) = resolved_record_with_wasm(input_reaches_guest_module());

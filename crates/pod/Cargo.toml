@@ -44,6 +44,7 @@ dotenv = "0.15.0"
 futures = { workspace = true }
 tempfile = { workspace = true }
 wat = "1.241.2"
+yoi-plugin-pdk = { workspace = true }
 
 [build-dependencies]
 toml = { workspace = true }

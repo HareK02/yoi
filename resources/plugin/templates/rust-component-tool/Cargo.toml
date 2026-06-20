@@ -1,0 +1,21 @@
+[package]
+name = "yoi-rust-component-tool-template"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# Keep the embedded template checkable in-place without making it a member of
+# Yoi's root workspace. A copied starter remains a normal standalone package.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+yoi-plugin-pdk = { path = "../../../../crates/plugin-pdk" }
+
+# Future out-of-tree Plugin packages should pin the Yoi revision instead of
+# relying on crates.io publication or remote template fetching, for example:
+# yoi-plugin-pdk = { git = "https://github.com/example/yoi.git", package = "yoi-plugin-pdk", rev = "<pinned-yoi-revision>" }
