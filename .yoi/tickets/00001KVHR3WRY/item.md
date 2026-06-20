@@ -2,7 +2,7 @@
 title: 'MCP: implement stdio JSON-RPC lifecycle client'
 state: 'inprogress'
 created_at: '2026-06-20T05:30:04Z'
-updated_at: '2026-06-20T07:45:58Z'
+updated_at: '2026-06-20T07:46:38Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['mcp', 'stdio', 'json-rpc', 'process-lifecycle', 'diagnostics']

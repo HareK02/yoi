@@ -167,3 +167,16 @@ Next action:
 - Dispatch Reviewer for r1 review against Ticket requirements, with focus on process lifecycle cleanup, JSON-RPC framing/bounds, stdout/stderr handling, secret redaction, sampling/elicitation fail-closed, no ToolRegistry/resources/prompts exposure, test determinism, and package/Nix impact。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-20T07:46:38Z -->
+
+## Plan
+
+Review dispatch:
+- Spawned Reviewer Pod `yoi-reviewer-00001KVHR3WRY-r1` against implementation branch `impl/00001KVHR3WRY-mcp-stdio-lifecycle-client`。
+- Review target commit: `a114fa9d mcp: implement stdio lifecycle client`。
+- Review baseline: `c0e760d7`。
+- Reviewer task focuses on process lifecycle cleanup, JSON-RPC framing/bounds, initialize negotiation, stderr diagnostics/redaction, sampling/elicitation fail-closed behavior, no ToolRegistry/resources/prompts exposure, crate layering, deterministic tests, and Nix/package impact。
+- Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
+
+---
