@@ -105,3 +105,210 @@ Next action:
 - Wait for Coder implementation report, then inspect branch diff/validation evidence and route to Reviewer。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T12:24:02Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVJA7V2R`.
+
+Implementation commit:
+- `b1af95ad web: fetch pdf text by pages`
+
+Changed areas reported:
+- `crates/tools/src/web.rs`:
+  - Added `application/pdf` handling for `WebFetch`。
+  - PDF bytes bypass UTF-8 / `reject_binary()` text path。
+  - Uses `pdf_extract::extract_text_from_mem_by_pages()` inside `tokio::task::spawn_blocking`。
+  - Returns Markdown-ish page sections like `## Page 1`, `## Page 2`。
+  - Adds `pdf_extraction` metadata with method/page/readability/diagnostic fields。
+  - Keeps existing `html_extraction` semantics intact。
+  - Preserves unsupported binary MIME rejection。
+  - Added deterministic in-memory PDF test fixtures and tests for PDF page-delimited output, output truncation, malformed PDF diagnostic error, and unsupported binary MIME rejection。
+- `crates/tools/Cargo.toml`: added `pdf-extract = "0.10.0"`。
+- `Cargo.lock`: updated for `pdf-extract` and transitive dependencies。
+- `package.nix`: updated `cargoHash` to `sha256-rvsjn4BBxd9vt4nytPgUh4l/OQCRpqHbUR4jHoH589U=`。
+
+Coder validation reported as passing:
+- `cargo fmt --check`
+- `cargo test -p tools web`
+- `cargo check -p tools`
+- `git diff --check`
+- `nix build .#yoi --no-link`
+
+Dependency / package impact:
+- New Rust dependency: `pdf-extract 0.10.0`。
+- Nix vendor hash updated and `nix build .#yoi --no-link` passed。
+
+Known risks / deferrals:
+- Only `application/pdf` is supported; no extension sniffing or `application/octet-stream` PDF guessing。
+- No OCR, scanned-PDF support, table reconstruction, cache, subprocess, Poppler, or Pdfium integration。
+- Malformed PDFs return diagnostic extraction error; textless PDFs are represented with `readable=false` metadata when extraction succeeds but no text is found。
+
+Orchestrator evidence checked before review dispatch:
+- Implementation worktree is clean。
+- HEAD is `b1af95ad`。
+- Diff from acceptance `e752a720..HEAD` is one implementation commit touching 4 files, about 552 insertions / 23 deletions。
+- `git diff --check e752a720..HEAD` produced no diagnostics。
+
+Next action:
+- Dispatch Reviewer for r1 review against Ticket requirements, with focus on WebFetch network/binary safety preservation, PDF extraction bounds/metadata, dependency/Nix impact, malformed/textless behavior, unsupported binary rejection, and HTML/text regression safety。
+
+---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-20T12:24:42Z -->
+
+## Plan
+
+Review dispatch:
+- Spawned Reviewer Pod `yoi-reviewer-00001KVJA7V2R-r1` against implementation branch `impl/00001KVJA7V2R-webfetch-pdf-text`。
+- Review target commit: `b1af95ad web: fetch pdf text by pages`。
+- Review baseline: `e752a720`。
+- Reviewer task focuses on WebFetch network safety preservation, PDF binary path separation, response/output bounds, `pdf_text_by_pages` metadata accuracy, malformed/textless behavior, unsupported binary rejection, existing HTML/text regression safety, dependency/package impact, and Nix validation。
+- Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KVJA7V2R-r1 at: 2026-06-20T12:28:18Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket contract / Orchestrator IntentPacket。
+- Implementation diff: `e752a720..b1af95ad`。
+- 主な対象:
+  - `crates/tools/src/web.rs`
+  - `crates/tools/Cargo.toml`
+  - `Cargo.lock`
+  - `package.nix`
+
+Approval evidence:
+- WebFetch safety pipeline は PDF rendering 前にも共有されている。
+  - URL validation。
+  - Redirect validation。
+  - Content-Length rejection。
+  - Bounded body read。
+- PDF classification は exact `application/pdf` のみで、extension sniffing や `application/octet-stream` guessing は追加されていない。
+- PDF path は `reject_binary()` / UTF-8 text decoding を bypass し、`pdf_extract::extract_text_from_mem_by_pages()` を `spawn_blocking` 内で使っている。
+- Output は `## Page N` 形式の page-delimited text。
+- `transformed_as` / `pdf_extraction.method` は `pdf_text_by_pages` を使い、semantic Markdown fidelity は主張していない。
+- PDF rendering 後も `max_output_bytes` truncation が適用されている。
+- Existing HTML extraction metadata は維持され、PDF result は `html_extraction = null` / `pdf_extraction` populated になる。
+- `pdf-extract` dependency inspection では Poppler/Pdfium/subprocess/OCR runtime dependency は見つからない。
+
+Blocking issues: none。
+
+Non-blocking concerns / follow-ups:
+- Valid multi-page PDF、PDF output truncation、malformed PDF error、unsupported non-PDF binary rejection の tests はあるが、encrypted/textless PDF と oversized PDF `Content-Length` の dedicated tests は無い。実装上は textless pages は readable=false metadata、Content-Length rejection は content-type rendering 前の shared path で covered されるため、この Ticket では blocking ではない。
+- Malformed PDF は `pdf_extraction` metadata付き JSON result ではなく `ToolError` を返すが、Ticket は “diagnostic error or readable=false metadata” を許容しているため OK。
+
+Reviewer validation:
+- `cargo fmt --check`: passed。
+- `git diff --check e752a720..HEAD`: passed。
+- `cargo test -p tools web`: passed, 19 tests。
+- `cargo check -p tools`: passed。
+- `cargo tree -p pdf-extract`: inspected; native PDF runtime dependencyなし。
+- `nix build .#yoi --no-link`: passed。
+
+Worktree status at review end: source tree clean; ignored `target/` only。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T12:30:53Z -->
+
+## Implementation report
+
+Merge and final validation report:
+
+Merged implementation branch into Orchestrator branch:
+- Merge commit: `97edfe8a merge: webfetch pdf text`
+- Implementation commit included:
+  - `b1af95ad web: fetch pdf text by pages`
+
+Reviewer outcome:
+- r1 approved with no blocking issues。
+- Reviewer confirmed WebFetch safety pipeline preservation, exact `application/pdf` handling only, no extension/octet-stream guessing, PDF binary path separation, `pdf_text_by_pages` metadata, output truncation, unsupported binary rejection, existing HTML metadata preservation, and no Poppler/Pdfium/subprocess/OCR runtime dependency。
+
+Orchestrator validation after merge passed:
+- `cargo fmt --check`
+- `git diff --check HEAD^1..HEAD`
+- `cargo test -p tools web`
+- `cargo check -p tools`
+- `cargo tree -p pdf-extract`
+- `nix build .#yoi --no-link`
+- `nix path-info -S .#yoi`: `115259736`
+
+Validation log:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/bash-z7rcEU.log`
+
+Final state:
+- Orchestrator worktree clean at `97edfe8a` after validation。
+- Implementation worktree remains available for cleanup after Ticket completion records are committed。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-20T12:31:02Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Implementation was merged into Orchestrator branch at `97edfe8a`, review approved, and final Orchestrator validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p tools web`, `cargo check -p tools`, `cargo tree -p pdf-extract`, and `nix build .#yoi --no-link`.
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-20T12:31:33Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-20T12:31:33Z status: closed -->
+
+## 完了
+
+## Resolution
+
+`00001KVJA7V2R` を完了しました。
+
+実装内容:
+- `WebFetch` に `application/pdf` handling を追加しました。
+- PDF bytes は UTF-8 / `reject_binary()` text path を bypass します。
+- `pdf_extract::extract_text_from_mem_by_pages()` を `tokio::task::spawn_blocking` 内で使用します。
+- PDF output は `## Page 1`, `## Page 2` のような page-delimited text として返します。
+- `transformed_as` / `pdf_extraction.method` は `pdf_text_by_pages` を使い、semantic Markdown とは主張しません。
+- `pdf_extraction` metadata に method/page/readability/diagnostic 情報を追加しました。
+- `max_response_bytes` / `max_output_bytes` / redirects / private-local host rejection / embedded credential rejection など既存 WebFetch safety pipeline は維持しました。
+- `application/pdf` のみ対応し、extension sniffing や `application/octet-stream` PDF guessing は追加していません。
+- Unsupported binary MIME rejection は維持しました。
+- Existing HTML/text behavior and `html_extraction` metadata は維持しました。
+- Tests for valid page-delimited PDF output、PDF truncation、malformed PDF diagnostic error、unsupported binary rejection を追加しました。
+- `pdf-extract = "0.10.0"` dependency を追加し、`Cargo.lock` / `package.nix` `cargoHash` を更新しました。
+
+主な commit:
+- `b1af95ad web: fetch pdf text by pages`
+- `97edfe8a merge: webfetch pdf text`
+
+Review:
+- r1 は `approve`。
+- Reviewer は WebFetch safety pipeline、exact `application/pdf` handling、binary path separation、`pdf_text_by_pages` metadata、output bounds、unsupported binary rejection、HTML metadata preservation、native PDF runtime dependency が無いことを確認しました。
+
+最終 validation:
+- `cargo fmt --check`
+- `git diff --check HEAD^1..HEAD`
+- `cargo test -p tools web`
+- `cargo check -p tools`
+- `cargo tree -p pdf-extract`
+- `nix build .#yoi --no-link`
+
+Package impact:
+- New Rust dependency: `pdf-extract 0.10.0`
+- `nix path-info -S .#yoi`: `115259736`
+
+Validation log:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/bash-z7rcEU.log`
+
+---

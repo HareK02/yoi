@@ -16,6 +16,7 @@ llm-worker = { workspace = true }
 manifest = { workspace = true }
 secrets = { workspace = true }
 markup5ever_rcdom = "0.2"
+pdf-extract = "0.10.0"
 reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls"] }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
