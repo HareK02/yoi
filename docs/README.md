@@ -12,9 +12,10 @@ It is not a dumping ground for external research, old plans, API inventories, or
 4. [`design/profiles-manifests-prompts.md`](design/profiles-manifests-prompts.md) — reusable Profiles, resolved Manifests, and prompt resources.
 5. [`design/tool-permissions-scope.md`](design/tool-permissions-scope.md) — tool policy and filesystem scope.
 6. [`design/plugin-packages.md`](design/plugin-packages.md) — plugin package distribution, discovery, and enablement boundaries.
-7. [`design/memory-knowledge.md`](design/memory-knowledge.md) — generated memory, Knowledge, and audit records.
-8. [`development/work-items.md`](development/work-items.md) — how project work is recorded and reviewed.
-9. [`development/validation.md`](development/validation.md) — how to check changes.
+7. [`development/plugin-development.md`](development/plugin-development.md) — how to build, package, enable, and inspect Yoi Plugins.
+8. [`design/memory-knowledge.md`](design/memory-knowledge.md) — generated memory, Knowledge, and audit records.
+9. [`development/work-items.md`](development/work-items.md) — how project work is recorded and reviewed.
+10. [`development/validation.md`](development/validation.md) — how to check changes.
 
 ## What belongs here
 

@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KVHKWNQA",
+      "kind": "depends_on",
+      "target": "00001KVG0HR96",
+      "note": "PDK targets the Component Model Tool runtime.",
+      "author": "yoi ticket",
+      "at": "2026-06-20T04:17:24Z"
+    },
+    {
+      "ticket_id": "00001KVHKWNQA",
+      "kind": "related",
+      "target": "00001KVFD3YSV",
+      "note": "PDK authoring flow should pair with read-only plugin inspection.",
+      "author": "yoi ticket",
+      "at": "2026-06-20T04:17:24Z"
+    },
+    {
+      "ticket_id": "00001KVHKWNQA",
+      "kind": "related",
+      "target": "00001KVFDX9AF",
+      "note": "PDK should later wrap https host API ergonomically.",
+      "author": "yoi ticket",
+      "at": "2026-06-20T04:17:24Z"
+    },
+    {
+      "ticket_id": "00001KVHKWNQA",
+      "kind": "related",
+      "target": "00001KVFDX9AY",
+      "note": "PDK should later wrap fs host API ergonomically.",
+      "author": "yoi ticket",
+      "at": "2026-06-20T04:17:24Z"
+    }
+  ]
+}

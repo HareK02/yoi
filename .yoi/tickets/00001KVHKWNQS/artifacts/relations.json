@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KVHKWNQS",
+      "kind": "depends_on",
+      "target": "00001KVHKWNQA",
+      "note": "Authoring new/check/pack uses the Rust PDK and embedded templates.",
+      "author": "yoi ticket",
+      "at": "2026-06-20T04:17:24Z"
+    },
+    {
+      "ticket_id": "00001KVHKWNQS",
+      "kind": "related",
+      "target": "00001KVFD3YSV",
+      "note": "Authoring check/pack diagnostics should align with plugin list/show inspection.",
+      "author": "yoi ticket",
+      "at": "2026-06-20T04:17:24Z"
+    },
+    {
+      "ticket_id": "00001KVHKWNQS",
+      "kind": "related",
+      "target": "00001KVG0HR96",
+      "note": "Authoring CLI validates Component Model Tool package metadata.",
+      "author": "yoi ticket",
+      "at": "2026-06-20T04:17:24Z"
+    }
+  ]
+}
