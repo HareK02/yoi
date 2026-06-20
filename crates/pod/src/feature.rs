@@ -170,6 +170,7 @@ impl ProtocolProviderLifecycleDiagnostic {
 /// into the normal Worker tool path as stable metadata plus executable tool
 /// handles for the remainder of the run. Execution still flows through the
 /// Worker, permission, history, and bounded-result machinery.
+#[derive(Clone)]
 pub struct ProtocolProviderContribution {
     declaration: ProtocolProviderDeclaration,
     state: ProtocolProviderLifecycleState,
@@ -275,6 +276,7 @@ impl ToolDeclaration {
 }
 
 /// Executable tool contribution wrapper.
+#[derive(Clone)]
 pub struct ToolContribution {
     name: String,
     definition: ToolDefinition,
@@ -1475,6 +1477,7 @@ pub enum FeatureInstallError {
 }
 
 pub mod builtin;
+pub mod mcp;
 pub mod plugin;
 
 #[cfg(test)]
