@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use manifest::plugin::{
@@ -59,7 +60,7 @@ pub(crate) fn run(command: PluginCliCommand) -> Result<()> {
         let report = build_check_report(&input);
         let rendered = render_check_report(&report, &args)?;
         print!("{rendered}");
-        if report.status != "active" {
+        if report.status == "rejected" {
             return Err("plugin check failed; see diagnostics above".into());
         }
         return Ok(());
@@ -113,24 +114,34 @@ fn render_new(template: &str, destination: &Path, args: &PluginCliArgs) -> Resul
 }
 
 fn materialize_template(destination: &Path) -> Result<()> {
-    if destination.exists() {
-        let metadata = fs::metadata(destination)?;
-        if !metadata.is_dir() {
-            return Err(format!(
-                "plugin template destination `{}` already exists and is not a directory",
-                destination.display()
-            )
-            .into());
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "plugin template destination `{}` is a symlink; refusing to follow it",
+                    destination.display()
+                )
+                .into());
+            }
+            if !metadata.is_dir() {
+                return Err(format!(
+                    "plugin template destination `{}` already exists and is not a directory",
+                    destination.display()
+                )
+                .into());
+            }
+            if fs::read_dir(destination)?.next().is_some() {
+                return Err(format!(
+                    "plugin template destination `{}` is not empty",
+                    destination.display()
+                )
+                .into());
+            }
         }
-        if fs::read_dir(destination)?.next().is_some() {
-            return Err(format!(
-                "plugin template destination `{}` is not empty",
-                destination.display()
-            )
-            .into());
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(destination)?;
         }
-    } else {
-        fs::create_dir_all(destination)?;
+        Err(error) => return Err(error.into()),
     }
 
     for resource in RUST_COMPONENT_TOOL_TEMPLATE {
@@ -219,12 +230,17 @@ fn build_check_report(input: &Path) -> CheckReport {
     match result {
         Ok(materialized) => {
             let static_inspection = inspect_materialized_package(&materialized);
-            let diagnostics = static_inspection_diagnostics(&static_inspection);
-            let status = if diagnostics.is_empty() {
-                "active"
-            } else {
+            let static_diagnostics = static_inspection_diagnostics(&static_inspection);
+            let placeholder_diagnostic = placeholder_component_diagnostic(&materialized);
+            let status = if !static_diagnostics.is_empty() {
                 "rejected"
+            } else if placeholder_diagnostic.is_some() {
+                "partial"
+            } else {
+                "active"
             };
+            let mut diagnostics = static_diagnostics;
+            diagnostics.extend(placeholder_diagnostic);
             let reference = package_reference(&materialized.package.identity);
             CheckReport {
                 command: "check",
@@ -316,18 +332,48 @@ fn static_inspection_diagnostics(
     diagnostics
 }
 
+fn placeholder_component_diagnostic(
+    materialized: &MaterializedPluginPackage,
+) -> Option<PluginDiagnosticReport> {
+    let runtime = materialized.package.manifest.runtime.as_ref()?;
+    let component = runtime.component.as_deref()?;
+    let component_bytes = materialized.files.get(component)?;
+    let placeholder_bytes = RUST_COMPONENT_TOOL_TEMPLATE
+        .iter()
+        .find(|resource| resource.path == "plugin.component.wasm")?
+        .contents
+        .as_bytes();
+    if component_bytes != placeholder_bytes {
+        return None;
+    }
+    Some(PluginDiagnosticReport {
+        kind: "placeholder".to_string(),
+        phase: "runtime".to_string(),
+        message: format!(
+            "plugin component runtime artifact `{component}` is the generated placeholder; replace it with a real built component before enabling or execution"
+        ),
+    })
+}
+
 fn check_next_steps(status: &str, reference: &str) -> Vec<String> {
-    if status == "active" {
-        vec![
+    match status {
+        "active" => vec![
             "Package metadata is valid without executing Plugin code.".to_string(),
             format!(
                 "To enable after review, add an explicit plugin enablement entry for `{reference}` with matching digest and grants."
             ),
             "Run `yoi plugin pack <path>` to create a deterministic .yoi-plugin archive."
                 .to_string(),
-        ]
-    } else {
-        vec!["Fix the reported diagnostics before enabling or packing this Plugin.".to_string()]
+        ],
+        "partial" => vec![
+            "Replace the generated placeholder component artifact with a real built component."
+                .to_string(),
+            "Run `yoi plugin check <path>` again before enabling or execution.".to_string(),
+            "Do not enable this Plugin while check status is partial.".to_string(),
+        ],
+        _ => {
+            vec!["Fix the reported diagnostics before enabling or packing this Plugin.".to_string()]
+        }
     }
 }
 
@@ -376,11 +422,21 @@ fn render_check_human(report: &CheckReport) -> Result<String> {
             join_or_none(&package.surfaces),
             package.tools.len()
         )?;
-        writeln!(
-            out,
-            "enablement guidance: pin reference `{}` and digest `{}` explicitly; this command does not mutate config",
-            package.reference, package.digest
-        )?;
+        match report.status {
+            "active" => writeln!(
+                out,
+                "enablement guidance: pin reference `{}` and digest `{}` explicitly; this command does not mutate config",
+                package.reference, package.digest
+            )?,
+            "partial" => writeln!(
+                out,
+                "enablement guidance: not ready to enable; replace the generated placeholder component and rerun check; this command does not mutate config"
+            )?,
+            _ => writeln!(
+                out,
+                "enablement guidance: not ready to enable; fix diagnostics first; this command does not mutate config"
+            )?,
+        }
     }
     if report.diagnostics.is_empty() {
         writeln!(out, "diagnostics: none")?;
@@ -1821,7 +1877,24 @@ mod tests {
         )
         .unwrap();
         let check_value: serde_json::Value = serde_json::from_str(&check_json).unwrap();
-        assert_eq!(check_value["status"], "active");
+        assert_eq!(check_value["status"], "partial");
+        assert_eq!(check_value["diagnostics"][0]["kind"], "placeholder");
+        assert!(
+            check_value["diagnostics"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("generated placeholder")
+        );
+        assert!(
+            check_value["next_steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step.as_str().unwrap_or_default().contains("Do not enable"))
+        );
+        let human_check = render_check(&destination, &PluginCliArgs::default()).unwrap();
+        assert!(human_check.contains("[partial]"));
+        assert!(human_check.contains("not ready to enable"));
         let error = render_new(
             "rust-component-tool",
             &destination,
@@ -1830,6 +1903,23 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("not empty"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_new_refuses_symlink_destination_without_following_it() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+        let link = dir.path().join("linkdest");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let error = render_new("rust-component-tool", &link, &PluginCliArgs::default())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("symlink"));
+        assert!(!target.join("plugin.toml").exists());
     }
 
     #[test]

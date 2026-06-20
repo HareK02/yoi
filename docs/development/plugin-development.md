@@ -64,7 +64,7 @@ Create a Rust Component Tool starter from embedded resources:
 yoi plugin new rust-component-tool ./my-plugin
 ```
 
-`new` writes only inside the requested destination and refuses an existing non-empty destination. The generated template includes `plugin.toml`, Rust source, Cargo metadata, README next steps, and a placeholder `plugin.component.wasm` artifact so local `check`/`pack` validation can run immediately. Replace the placeholder with a real built component before enabling or executing the Plugin.
+`new` writes only inside the requested destination and refuses an existing non-empty destination or destination symlink. The generated template includes `plugin.toml`, Rust source, Cargo metadata, README next steps, and a placeholder `plugin.component.wasm` artifact so local `check`/`pack` validation can run immediately. Replace the placeholder with a real built component before enabling or executing the Plugin.
 
 Validate a source directory or an existing `.yoi-plugin` archive:
 
@@ -74,7 +74,7 @@ yoi plugin check ./my-plugin --json
 yoi plugin check ./my-plugin.yoi-plugin --json
 ```
 
-`check` performs bounded static validation of the directory/archive shape, manifest, runtime declaration, referenced artifact presence, Tool schemas, permission declarations, host API declarations, archive safety, and deterministic digest when a package can be materialized. Component-world validation is metadata-only: it verifies the declared world string and runtime manifest shape, but it does not instantiate or execute the component. Invalid checks print the same structured report and exit non-zero.
+`check` performs bounded static validation of the directory/archive shape, manifest, runtime declaration, referenced artifact presence, Tool schemas, permission declarations, host API declarations, archive safety, and deterministic digest when a package can be materialized. Component-world validation is metadata-only: it verifies the declared world string and runtime manifest shape, but it does not instantiate or execute the component. A generated placeholder component produces `status = "partial"` plus a diagnostic and is not enablement-ready until replaced. Invalid checks print the same structured report and exit non-zero.
 
 Pack a source directory into a deterministic stored `.yoi-plugin` archive:
 
