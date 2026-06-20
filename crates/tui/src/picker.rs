@@ -20,7 +20,7 @@ use ratatui::{Frame, TerminalOptions, Viewport};
 use session_store::FsStore;
 
 use crate::pod_list::{
-    PodList, PodListEntry, PodVisibilitySource, StoredMetadataState,
+    LivePodInfo, PodList, PodListEntry, PodVisibilitySource, StoredMetadataState, StoredPodInfo,
     live_socket_for_pod as pod_list_live_socket_for_pod, read_reachable_live_pod_infos,
     read_stored_pod_infos,
 };
@@ -73,6 +73,31 @@ pub enum PickerOutcome {
     Cancelled,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PickerOptions {
+    scope: PickerScope,
+}
+
+impl PickerOptions {
+    pub(crate) fn workspace(workspace_root: PathBuf) -> Self {
+        Self {
+            scope: PickerScope::Workspace(workspace_root),
+        }
+    }
+
+    pub(crate) fn all() -> Self {
+        Self {
+            scope: PickerScope::All,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum PickerScope {
+    Workspace(PathBuf),
+    All,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PodRowState {
     Live,
@@ -100,7 +125,31 @@ impl PodRowState {
     }
 }
 
-pub async fn run() -> Result<PickerOutcome, PickerError> {
+fn list_for_options(
+    options: &PickerOptions,
+    stored_pods: Vec<StoredPodInfo>,
+    live_pods: Vec<LivePodInfo>,
+) -> PodList {
+    match &options.scope {
+        PickerScope::Workspace(workspace_root) => PodList::from_workspace_sources(
+            PodVisibilitySource::ResumePicker,
+            stored_pods,
+            live_pods,
+            None,
+            MAX_ROWS,
+            workspace_root,
+        ),
+        PickerScope::All => PodList::from_sources(
+            PodVisibilitySource::ResumePicker,
+            stored_pods,
+            live_pods,
+            None,
+            MAX_ROWS,
+        ),
+    }
+}
+
+pub async fn run(options: PickerOptions) -> Result<PickerOutcome, PickerError> {
     let store_dir = default_store_dir()?;
     let store = FsStore::new(&store_dir)?;
     let pod_store = FsPodStore::new(default_pod_store_dir()?).map_err(io::Error::other)?;
@@ -108,13 +157,7 @@ pub async fn run() -> Result<PickerOutcome, PickerError> {
     let live_pods = read_reachable_live_pod_infos(&store)
         .await
         .unwrap_or_default();
-    let mut list = PodList::from_sources(
-        PodVisibilitySource::ResumePicker,
-        stored_pods,
-        live_pods,
-        None,
-        MAX_ROWS,
-    );
+    let mut list = list_for_options(&options, stored_pods, live_pods);
     if list.entries.is_empty() {
         return Err(PickerError::NoPods);
     }
@@ -359,6 +402,58 @@ mod tests {
     #[test]
     fn picker_title_names_pods_not_sessions() {
         assert_eq!(picker_title(), "resume pod   pick a pod");
+    }
+
+    #[test]
+    fn picker_workspace_options_filter_by_workspace_metadata() {
+        let list = list_for_options(
+            &PickerOptions::workspace(PathBuf::from("/workspace/current")),
+            vec![
+                stored_pod("current", Some("/workspace/current"), 3),
+                stored_pod("other", Some("/workspace/other"), 2),
+                stored_pod("legacy", None, 1),
+            ],
+            vec![],
+        );
+
+        let names: Vec<_> = list
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["current"]);
+    }
+
+    #[test]
+    fn picker_all_options_include_host_wide_and_legacy_pods() {
+        let list = list_for_options(
+            &PickerOptions::all(),
+            vec![
+                stored_pod("current", Some("/workspace/current"), 3),
+                stored_pod("other", Some("/workspace/other"), 2),
+                stored_pod("legacy", None, 1),
+            ],
+            vec![],
+        );
+
+        let names: Vec<_> = list
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["current", "other", "legacy"]);
+    }
+
+    fn stored_pod(name: &str, workspace_root: Option<&str>, updated_at: u64) -> StoredPodInfo {
+        StoredPodInfo {
+            pod_name: name.to_string(),
+            metadata_state: StoredMetadataState::Present,
+            active_session_id: None,
+            active_segment_id: None,
+            updated_at,
+            workspace_root: workspace_root.map(PathBuf::from),
+            preview: None,
+        }
     }
 
     #[test]

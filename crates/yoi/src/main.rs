@@ -17,6 +17,7 @@ use tui::{LaunchMode, LaunchOptions};
 #[derive(Debug)]
 enum Mode {
     Help,
+    ResumeHelp,
     MemoryLintHelp,
     MemoryLint(LintCliOptions),
     Mcp(mcp_cli::McpCliCommand),
@@ -58,6 +59,10 @@ async fn main() -> ExitCode {
     match mode {
         Mode::Help => {
             print_help();
+            ExitCode::SUCCESS
+        }
+        Mode::ResumeHelp => {
+            print_resume_help();
             ExitCode::SUCCESS
         }
         Mode::MemoryLintHelp => {
@@ -168,13 +173,13 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
                 pod_name: None,
                 profile: None,
             },
-            workspace_root: std::env::current_dir()
-                .map_err(|e| ParseError(format!("failed to resolve current directory: {e}")))?,
+            workspace_root: current_dir()?,
         });
     }
 
     match args[0].as_str() {
         "--help" | "-h" => return Ok(Mode::Help),
+        "resume" => return parse_resume_args(&args[1..]),
         "pod" => return Ok(Mode::PodRuntime(args[1..].to_vec())),
         "objective" => {
             let objective_cli = objective_cli::parse_objective_args(&args[1..])
@@ -229,35 +234,30 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
             return Ok(Mode::MemoryLint(options));
         }
         "memory" => {
-            return Ok(Mode::Tui {
-                mode: LaunchMode::PodName {
-                    pod_name: "memory".to_string(),
-                    socket_override: None,
-                },
-                workspace_root: std::env::current_dir()
-                    .map_err(|e| ParseError(format!("failed to resolve current directory: {e}")))?,
-            });
+            return Err(ParseError(
+                "yoi memory requires the `lint` subcommand".to_string(),
+            ));
+        }
+        other if !other.starts_with('-') => {
+            return Err(ParseError(format!("unknown command `{other}`")));
         }
         _ => {}
     }
 
-    let mut workspace_root = std::env::current_dir()
-        .map_err(|e| ParseError(format!("failed to resolve current directory: {e}")))?;
-    let mut resume = false;
+    parse_console_options(args)
+}
+
+fn parse_console_options(args: &[String]) -> Result<Mode, ParseError> {
+    let mut workspace_root = current_dir()?;
     let mut session = None;
     let mut pod_name = None;
     let mut socket_override = None;
     let mut profile = None;
-    let mut positional = None;
 
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
         match arg.as_str() {
-            "--resume" | "-r" => {
-                resume = true;
-                i += 1;
-            }
             "--session" => {
                 let value = args
                     .get(i + 1)
@@ -349,51 +349,21 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
                 return Err(ParseError(format!("unknown argument: {arg}")));
             }
             value => {
-                if positional.replace(value.to_string()).is_some() {
-                    return Err(ParseError(
-                        "only one positional Pod name is supported".to_string(),
-                    ));
-                }
-                i += 1;
+                return Err(ParseError(format!(
+                    "unknown command `{value}`; use --pod <NAME> to open a Pod by name"
+                )));
             }
         }
     }
 
-    if pod_name.is_some() && positional.is_some() {
-        return Err(ParseError(
-            "--pod and a positional Pod name are mutually exclusive".to_string(),
-        ));
-    }
-
-    if profile.is_some()
-        && (resume || session.is_some() || positional.is_some() || socket_override.is_some())
-    {
+    if profile.is_some() && (session.is_some() || socket_override.is_some()) {
         return Err(ParseError(
             "--profile can only be used for fresh spawn".to_string(),
         ));
     }
-    if pod_name.is_some() && resume {
-        return Err(ParseError(
-            "--pod and --resume are mutually exclusive".to_string(),
-        ));
+    if socket_override.is_some() && pod_name.is_none() {
+        return Err(ParseError("--socket requires --pod".to_string()));
     }
-    if positional.is_some() && resume {
-        return Err(ParseError(
-            "--resume cannot be used with a positional Pod name".to_string(),
-        ));
-    }
-    if socket_override.is_some() && pod_name.is_none() && positional.is_none() {
-        return Err(ParseError(
-            "--socket requires --pod or a positional Pod name".to_string(),
-        ));
-    }
-    if resume && session.is_some() {
-        return Err(ParseError(
-            "--resume and --session are mutually exclusive".to_string(),
-        ));
-    }
-
-    let pod_name = pod_name.or(positional);
     if socket_override.is_some() && session.is_some() {
         return Err(ParseError(
             "--socket can only be used with --pod attach mode".to_string(),
@@ -424,12 +394,6 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
             workspace_root,
         });
     }
-    if resume {
-        return Ok(Mode::Tui {
-            mode: LaunchMode::Resume,
-            workspace_root,
-        });
-    }
     Ok(Mode::Tui {
         mode: LaunchMode::Spawn {
             pod_name: None,
@@ -437,6 +401,75 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
         },
         workspace_root,
     })
+}
+
+fn parse_resume_args(args: &[String]) -> Result<Mode, ParseError> {
+    let mut workspace_root = current_dir()?;
+    let mut workspace_set = false;
+    let mut all = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "--help" | "-h" => {
+                if args.len() == 1 {
+                    return Ok(Mode::ResumeHelp);
+                }
+                return Err(ParseError(
+                    "yoi resume --help does not accept other arguments".to_string(),
+                ));
+            }
+            "--all" => {
+                all = true;
+                i += 1;
+            }
+            "--workspace" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError("--workspace requires a value".to_string()))?;
+                if value.starts_with('-') {
+                    return Err(ParseError("--workspace requires a value".to_string()));
+                }
+                workspace_root = PathBuf::from(value);
+                workspace_set = true;
+                i += 2;
+            }
+            arg if arg.starts_with("--workspace=") => {
+                let value = arg.trim_start_matches("--workspace=");
+                if value.is_empty() {
+                    return Err(ParseError("--workspace requires a value".to_string()));
+                }
+                workspace_root = PathBuf::from(value);
+                workspace_set = true;
+                i += 1;
+            }
+            arg if arg.starts_with('-') => {
+                return Err(ParseError(format!("unknown yoi resume option `{arg}`")));
+            }
+            value => {
+                return Err(ParseError(format!(
+                    "yoi resume does not accept positional argument `{value}`"
+                )));
+            }
+        }
+    }
+
+    if all && workspace_set {
+        return Err(ParseError(
+            "yoi resume --all and --workspace are mutually exclusive".to_string(),
+        ));
+    }
+
+    Ok(Mode::Tui {
+        mode: LaunchMode::Resume { all },
+        workspace_root,
+    })
+}
+
+fn current_dir() -> Result<PathBuf, ParseError> {
+    std::env::current_dir()
+        .map_err(|e| ParseError(format!("failed to resolve current directory: {e}")))
 }
 
 fn parse_plugin_args(args: &[String]) -> Result<plugin_cli::PluginCliCommand, ParseError> {
@@ -777,7 +810,13 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
 
 fn print_help() {
     println!(
-        "yoi\n\nUsage:\n  yoi [OPTIONS] [POD_NAME]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi pod [POD_OPTIONS]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi plugin new rust-component-tool <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Pod chat/client surface (default, --pod, --resume)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n  -r, --resume           Open the Pod Console picker and resume/attach a Pod\n      --workspace <PATH> Runtime workspace root (defaults to cwd)\n      --pod <NAME>       Open the Pod Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Pod Console to a specific socket with --pod\n      --session <UUID>   Resume a specific session segment in the Pod Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
+        "yoi\n\nUsage:\n  yoi [OPTIONS]\n  yoi resume [--workspace <PATH>] [--all]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi pod [POD_OPTIONS]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi plugin new rust-component-tool <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Pod chat/client surface (default, --pod, yoi resume)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n      --workspace <PATH> Runtime workspace root for default Console/--pod (defaults to cwd)\n      --pod <NAME>       Open the Pod Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Pod Console to a specific socket with --pod\n      --session <UUID>   Resume a specific session segment in the Pod Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
+    );
+}
+
+fn print_resume_help() {
+    println!(
+        "yoi resume\n\nUsage:\n  yoi resume [--workspace <PATH>] [--all]\n\nOptions:\n      --workspace <PATH> Open the Pod Console picker scoped to this workspace (defaults to cwd)\n      --all              Open the Pod Console picker across this host/data dir\n  -h, --help             Print help\n"
     );
 }
 
@@ -810,38 +849,50 @@ mod tests {
     }
 
     #[test]
-    fn parse_positional_name_uses_pod_name_mode() {
-        match parse_args_from(["agent"]).unwrap() {
+    fn parse_bare_word_is_unknown_command() {
+        let err = parse_args_from(["agent"]).unwrap_err();
+        assert_eq!(err.to_string(), "unknown command `agent`");
+    }
+
+    #[test]
+    fn parse_memory_without_lint_is_usage_error() {
+        let err = parse_args_from(["memory"]).unwrap_err();
+        assert_eq!(err.to_string(), "yoi memory requires the `lint` subcommand");
+    }
+
+    #[test]
+    fn parse_resume_subcommand_defaults_to_workspace_scope() {
+        match parse_args_from(["resume"]).unwrap() {
             Mode::Tui {
-                mode:
-                    LaunchMode::PodName {
-                        pod_name,
-                        socket_override,
-                    },
+                mode: LaunchMode::Resume { all },
                 ..
-            } => {
-                assert_eq!(pod_name, "agent");
-                assert_eq!(socket_override, None);
-            }
-            _ => panic!("expected PodName mode"),
+            } => assert!(!all),
+            _ => panic!("expected Resume mode"),
         }
     }
 
     #[test]
-    fn parse_memory_alone_remains_positional_pod_name() {
-        match parse_args_from(["memory"]).unwrap() {
+    fn parse_resume_workspace_scope() {
+        match parse_args_from(["resume", "--workspace", "/tmp/resume-workspace"]).unwrap() {
             Mode::Tui {
-                mode:
-                    LaunchMode::PodName {
-                        pod_name,
-                        socket_override,
-                    },
-                ..
+                mode: LaunchMode::Resume { all },
+                workspace_root,
             } => {
-                assert_eq!(pod_name, "memory");
-                assert_eq!(socket_override, None);
+                assert!(!all);
+                assert_eq!(workspace_root, PathBuf::from("/tmp/resume-workspace"));
             }
-            _ => panic!("expected PodName mode"),
+            _ => panic!("expected Resume mode"),
+        }
+    }
+
+    #[test]
+    fn parse_resume_all_scope() {
+        match parse_args_from(["resume", "--all"]).unwrap() {
+            Mode::Tui {
+                mode: LaunchMode::Resume { all },
+                ..
+            } => assert!(all),
+            _ => panic!("expected Resume mode"),
         }
     }
 
@@ -1038,14 +1089,9 @@ mod tests {
     }
 
     #[test]
-    fn memory_lint_with_other_second_word_remains_positional_pod_name() {
-        match parse_args_from(["memory", "other"]).unwrap() {
-            Mode::Tui {
-                mode: LaunchMode::PodName { pod_name, .. },
-                ..
-            } => assert_eq!(pod_name, "memory"),
-            _ => panic!("expected PodName mode"),
-        }
+    fn memory_lint_with_other_second_word_is_usage_error() {
+        let err = parse_args_from(["memory", "other"]).unwrap_err();
+        assert_eq!(err.to_string(), "yoi memory requires the `lint` subcommand");
     }
 
     #[test]
@@ -1075,19 +1121,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_resume_and_pod_name_selection() {
+    fn parse_rejects_legacy_resume_flags() {
         let cases = [
-            (
-                vec!["-r".to_string(), "--pod".to_string(), "agent".to_string()],
-                "--pod and --resume are mutually exclusive",
-            ),
+            (vec!["-r".to_string()], "unknown argument: -r"),
+            (vec!["--resume".to_string()], "unknown argument: --resume"),
             (
                 vec!["--pod".to_string(), "agent".to_string(), "-r".to_string()],
-                "--pod and --resume are mutually exclusive",
-            ),
-            (
-                vec!["-r".to_string(), "agent".to_string()],
-                "--resume cannot be used with a positional Pod name",
+                "unknown argument: -r",
             ),
         ];
 
@@ -1095,6 +1135,15 @@ mod tests {
             let err = parse_args_from(args).unwrap_err();
             assert_eq!(err.to_string(), message);
         }
+    }
+
+    #[test]
+    fn parse_resume_rejects_workspace_with_all() {
+        let err = parse_args_from(["resume", "--workspace", "/tmp/ws", "--all"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "yoi resume --all and --workspace are mutually exclusive"
+        );
     }
 
     #[test]
@@ -1129,14 +1178,6 @@ mod tests {
                 vec![
                     "--profile".to_string(),
                     "p.lua".to_string(),
-                    "--resume".to_string(),
-                ],
-                "--profile can only be used for fresh spawn",
-            ),
-            (
-                vec![
-                    "--profile".to_string(),
-                    "p.lua".to_string(),
                     "--session".to_string(),
                     segment_id,
                 ],
@@ -1148,14 +1189,6 @@ mod tests {
                     "p.lua".to_string(),
                     "--socket".to_string(),
                     "/tmp/yoi/sock".to_string(),
-                ],
-                "--profile can only be used for fresh spawn",
-            ),
-            (
-                vec![
-                    "--profile".to_string(),
-                    "p.lua".to_string(),
-                    "agent".to_string(),
                 ],
                 "--profile can only be used for fresh spawn",
             ),
@@ -1179,15 +1212,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_dashboard_word_remains_a_pod_console_name_not_an_alias() {
-        let config = parse_args_from(["dashboard"]).unwrap();
-        match config {
-            Mode::Tui {
-                mode: LaunchMode::PodName { pod_name, .. },
-                ..
-            } => assert_eq!(pod_name, "dashboard"),
-            other => panic!("expected PodName TUI mode, got {other:?}"),
-        }
+    fn parse_dashboard_word_is_not_an_alias_or_pod_name() {
+        let err = parse_args_from(["dashboard"]).unwrap_err();
+        assert_eq!(err.to_string(), "unknown command `dashboard`");
     }
 
     #[test]
@@ -1201,6 +1228,14 @@ mod tests {
         match parse_args_from(["--help"]).unwrap() {
             Mode::Help => {}
             _ => panic!("expected Help mode"),
+        }
+    }
+
+    #[test]
+    fn parse_resume_help() {
+        match parse_args_from(["resume", "--help"]).unwrap() {
+            Mode::ResumeHelp => {}
+            _ => panic!("expected ResumeHelp mode"),
         }
     }
 
