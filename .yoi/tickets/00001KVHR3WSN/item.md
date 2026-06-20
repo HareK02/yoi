@@ -1,11 +1,13 @@
 ---
 title: 'MCP: expose resources and prompts as explicit tool operations'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-20T05:30:04Z'
-updated_at: '2026-06-20T05:33:03Z'
+updated_at: '2026-06-20T05:58:57Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['mcp', 'resources', 'prompts', 'prompt-context', 'history', 'untrusted-content']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-20T05:58:57Z'
 ---
 
 ## Background
