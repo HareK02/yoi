@@ -111,3 +111,28 @@ Critical risks / reviewer focus:
 Human authorized queue routing from Workspace Dashboard. Ticket has concrete acceptance criteria and no recorded blockers, so Orchestrator accepts implementation and will create a child implementation worktree before spawning sibling Coder/Reviewer roles.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T16:31:44Z -->
+
+## Implementation report
+
+Implementation start report:
+
+- Created child implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVJX7VZT-cli-resume-subcommand`
+- Created branch:
+  - `impl/00001KVJX7VZT-cli-resume-subcommand`
+- Base commit:
+  - `a63b40f4 ticket: accept resume cli routing`
+- Confirmed tracked Ticket project records are visible in the child worktree.
+- Confirmed `.yoi/memory` has no tracked/untracked entries in the child worktree check.
+- Spawned sibling Coder Pod:
+  - `yoi-coder-00001KVJX7VZT`
+- Coder scope:
+  - read: `/home/hare/Projects/yoi`
+  - write: `/home/hare/Projects/yoi/.worktree/00001KVJX7VZT-cli-resume-subcommand`
+
+Next action:
+- Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff. Orchestrator will not merge/close until reviewer approval and validation evidence are available。
+
+---
