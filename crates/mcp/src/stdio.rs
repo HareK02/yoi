@@ -99,6 +99,212 @@ pub struct ListToolsResult {
     pub extra: BTreeMap<String, Value>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct McpResourceListLimits {
+    pub max_pages: usize,
+    pub max_resources: usize,
+    pub max_resource_templates: usize,
+}
+
+impl Default for McpResourceListLimits {
+    fn default() -> Self {
+        Self {
+            max_pages: 8,
+            max_resources: 128,
+            max_resource_templates: 128,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct McpPromptListLimits {
+    pub max_pages: usize,
+    pub max_prompts: usize,
+}
+
+impl Default for McpPromptListLimits {
+    fn default() -> Self {
+        Self {
+            max_pages: 8,
+            max_prompts: 128,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpResourceDefinition {
+    pub uri: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub annotations: Option<Value>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpResourceTemplateDefinition {
+    pub uri_template: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub annotations: Option<Value>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListResourcesResult {
+    #[serde(default)]
+    pub resources: Vec<McpResourceDefinition>,
+    #[serde(default)]
+    pub resource_templates: Vec<McpResourceTemplateDefinition>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadResourceRequest {
+    pub uri: String,
+}
+
+impl ReadResourceRequest {
+    pub fn new(uri: impl Into<String>) -> Self {
+        Self { uri: uri.into() }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpResourceContent {
+    pub uri: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadResourceResult {
+    #[serde(default)]
+    pub contents: Vec<McpResourceContent>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpPromptArgumentDefinition {
+    pub name: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: Option<bool>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpPromptDefinition {
+    pub name: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub arguments: Vec<McpPromptArgumentDefinition>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPromptsResult {
+    #[serde(default)]
+    pub prompts: Vec<McpPromptDefinition>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetPromptRequest {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Value>,
+}
+
+impl GetPromptRequest {
+    pub fn new(name: impl Into<String>, arguments: Option<Value>) -> Self {
+        Self {
+            name: name.into(),
+            arguments,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpPromptMessage {
+    pub role: String,
+    pub content: McpContentBlock,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetPromptResult {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub messages: Vec<McpPromptMessage>,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CallToolRequest {
@@ -488,6 +694,63 @@ impl McpStdioClient {
             )
         })?;
         self.request(McpPhase::Running, "tools/call", params).await
+    }
+
+    /// Request one page of the MCP `resources/list` surface after initialization.
+    pub async fn list_resources_page(
+        &mut self,
+        cursor: Option<String>,
+    ) -> Result<ListResourcesResult, McpClientError> {
+        let params = cursor
+            .map(|cursor| json!({ "cursor": cursor }))
+            .unwrap_or_else(|| json!({}));
+        self.request(McpPhase::Running, "resources/list", params)
+            .await
+    }
+
+    /// Read one MCP resource by URI after initialization.
+    pub async fn read_resource(
+        &mut self,
+        request: ReadResourceRequest,
+    ) -> Result<ReadResourceResult, McpClientError> {
+        let params = serde_json::to_value(request).map_err(|err| {
+            McpClientError::new(
+                &self.server_name,
+                McpPhase::Running,
+                McpErrorKind::Protocol(format!(
+                    "failed to serialize resources/read request: {err}"
+                )),
+            )
+        })?;
+        self.request(McpPhase::Running, "resources/read", params)
+            .await
+    }
+
+    /// Request one page of the MCP `prompts/list` surface after initialization.
+    pub async fn list_prompts_page(
+        &mut self,
+        cursor: Option<String>,
+    ) -> Result<ListPromptsResult, McpClientError> {
+        let params = cursor
+            .map(|cursor| json!({ "cursor": cursor }))
+            .unwrap_or_else(|| json!({}));
+        self.request(McpPhase::Running, "prompts/list", params)
+            .await
+    }
+
+    /// Get one MCP prompt template by name after initialization.
+    pub async fn get_prompt(
+        &mut self,
+        request: GetPromptRequest,
+    ) -> Result<GetPromptResult, McpClientError> {
+        let params = serde_json::to_value(request).map_err(|err| {
+            McpClientError::new(
+                &self.server_name,
+                McpPhase::Running,
+                McpErrorKind::Protocol(format!("failed to serialize prompts/get request: {err}")),
+            )
+        })?;
+        self.request(McpPhase::Running, "prompts/get", params).await
     }
 
     /// Request pages from `tools/list` up to a host-supplied page/tool bound.
