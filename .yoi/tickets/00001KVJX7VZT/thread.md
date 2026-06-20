@@ -354,3 +354,72 @@ Next action:
 - Route back to Reviewer for r2 verification and final acceptance review。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVJX7VZT-r1 at: 2026-06-20T16:58:30Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket authority:
+  - `.yoi/tickets/00001KVJX7VZT/item.md`
+  - `.yoi/tickets/00001KVJX7VZT/thread.md`
+- r1 blocker fix diff `861c351a..d25ca6ff`:
+  - `crates/tui/src/dashboard/mod.rs`
+  - `crates/tui/src/picker.rs`
+- Overall diff `a63b40f4..d25ca6ff`:
+  - `crates/yoi/src/main.rs`
+  - `crates/tui/src/lib.rs`
+  - `crates/tui/src/console/mod.rs`
+  - `crates/tui/src/picker.rs`
+  - `crates/tui/src/dashboard/mod.rs`
+- Workspace filtering reference:
+  - `crates/tui/src/pod_list.rs`
+
+Blocking issues:
+- None。
+
+Previous blocker verification:
+- Dashboard no-pods guidance now says `yoi resume`, not removed `yoi -r`。
+- Workspace-scoped picker empty result now points users to explicit `yoi resume --all`。
+- Host-wide `--all` empty result keeps the fresh-Pod hint。
+- Active stale-guidance search found only the parser test expectation for rejecting `--resume`, not active user guidance。
+
+Acceptance / critical focus verification:
+- Legacy top-level `-r` / `--resume` no longer parse as resume; both fail as unknown arguments。
+- Top-level bare word such as `agent` fails as unknown command; no positional Pod-name inference remains。
+- `yoi resume` is an explicit subcommand and defaults to workspace-scoped picker behavior。
+- `yoi resume --workspace <PATH>` is supported and mutually exclusive with `--all`。
+- `yoi resume --all` is the explicit host/data-dir-wide listing path。
+- Default workspace filtering uses stored Pod metadata `workspace_root` semantics, with live entries included only when tied to matching stored metadata names。
+- `yoi --pod <NAME>` and explicit subcommands remain covered by parser tests。
+- Help advertises `yoi resume [--workspace <PATH>] [--all]` and no longer advertises `[POD_NAME]` or `-r, --resume`。
+
+Non-blocking concerns:
+- None for this Ticket。
+
+Reviewer validation:
+- `cargo fmt --check`: passed
+- `git diff --check a63b40f4..HEAD`: passed
+- `cargo test -p tui picker_`: passed, 9 tests
+- `cargo test -p yoi parse_`: passed, 32 tests
+- `cargo test -p tui workspace`: passed, 38 tests
+- `cargo check -p yoi -p tui`: passed
+- `target/debug/yoi ticket doctor`: passed (`doctor: ok`)
+- `cargo build -p yoi`: passed
+- CLI smoke:
+  - `target/debug/yoi --help`: exit 0; includes resume usage, excludes `[POD_NAME]` and `-r, --resume`
+  - `target/debug/yoi resume --help`: exit 0; documents `--workspace <PATH>` and `--all`
+  - `target/debug/yoi agent`: exit 1; `unknown command 'agent'`
+  - `target/debug/yoi -r`: exit 1; `unknown argument: -r`
+  - `target/debug/yoi --resume`: exit 1; `unknown argument: --resume`
+  - `target/debug/yoi resume --all --workspace /tmp/ws`: exit 1; mutually exclusive error
+- Stale active guidance search:
+  - `rg -n 'yoi -r|--resume|\[POD_NAME\]' crates resources --glob '!target/**' --glob '!Cargo.lock'`
+  - Only hit: parser test expectation for `unknown argument: --resume`。
+
+Worktree status:
+- Clean at `d25ca6ff3cdec0e3ee0a62f7ea0cffd3b73bfb1e` on `impl/00001KVJX7VZT-cli-resume-subcommand`。
+
+---
