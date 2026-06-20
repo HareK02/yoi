@@ -165,3 +165,45 @@ Review dispatch:
 - Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVJABS1A-r1 at: 2026-06-20T12:12:10Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket contract / Orchestrator IntentPacket。
+- Implementation diff: `72e9f2f1..0717aae3`。
+- 変更ファイル: `crates/pod/src/entrypoint.rs` のみ。
+- Launch-policy change、snapshot/tool-visible scope path、restore path、focused tests を確認。
+
+Approval evidence:
+- `append_missing_rules` / `apply_scope_launch_defaults` により、launch-policy defaults は既に解決済みの Profile / override scope を置換せず、missing rules として append される。
+- Normal launch は workspace-root write scope と `.worktree` write deny を引き続き append する。
+- Ticket role launch は role-specific default direct scope と delegation defaults を引き続き適用する。
+- `resolve_manifest()` は `apply_profile_launch_policy()` 後の final manifest を返す。
+- `Pod::from_manifest_with_context` は `manifest.scope` から tool-visible scope を作る。
+- Pod metadata snapshot serialization は final manifest を使う。
+- Restore path は existing `resolved_manifest_snapshot` がある場合それを使うため、この変更で restore 時に override を再評価する挙動は入っていない。
+- Focused tests は override-local `scope.allow` survival、normal profile launch defaults、Orchestrator role default scope/delegation preservation を cover している。
+
+Blocking issues: none。
+
+Non-blocking concerns / follow-ups:
+- Full `cargo test -p pod` は以下 2 件の prompt-guidance assertion failure で失敗する。
+  - `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`
+  - `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`
+  - Missing asserted text: `"worktree status, diff, and test results"`
+- Reviewer判断: この branch diff は `crates/pod/src/entrypoint.rs` のみであり、prompt rendering/assertion paths / prompt resources / catalog tests を変更していないため、この failure は unrelated/pre-existing。
+
+Reviewer validation:
+- `cargo fmt --all --check`: passed。
+- `git diff --check 72e9f2f1..HEAD`: passed。
+- `cargo test -p pod entrypoint::tests::`: passed, 22 tests。
+- `cargo check -p pod`: passed。
+- `cargo test -p pod`: unrelated prompt assertion failures only; 410 passed, 2 failed。
+
+Worktree status at review end: clean。
+
+---
