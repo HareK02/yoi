@@ -110,3 +110,60 @@ Next action:
 - Wait for Coder implementation report, then inspect branch diff/validation evidence and route to Reviewer。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T07:45:58Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVHR3WRY`.
+
+Implementation commit:
+- `a114fa9d mcp: implement stdio lifecycle client`
+
+Changed areas reported:
+- Added new internal reusable crate `crates/mcp`。
+- Implemented stdio MCP lifecycle foundation:
+  - explicit resolved stdio server spec/config bridge from typed manifest MCP config。
+  - Tokio child process spawn with `stdin` / `stdout` / `stderr`。
+  - newline-delimited JSON-RPC request/response handling。
+  - `initialize` capability negotiation。
+  - `notifications/initialized`。
+  - bounded stdout/stderr/protocol payload handling。
+  - bounded/redacted stderr diagnostics。
+  - server-name + phase-aware errors。
+  - safe shutdown via stdin close, wait, terminate, and kill fallback。
+  - fail-closed server-to-client request handling including sampling/elicitation。
+- Added mock local stdio MCP server test binary scoped to `crates/mcp` tests。
+- Updated workspace membership and `package.nix` cargo hash。
+
+Coder validation reported:
+- `cargo test -p mcp`: passed。
+- `cargo check`: passed。
+- `cargo fmt --check`: passed。
+- `git diff --check`: passed。
+- `nix build .#yoi --no-link`: passed。
+
+Acceptance notes reported:
+- Mock stdio MCP server initializes successfully。
+- Initialize failure includes server name and `initialize` phase。
+- stderr diagnostics are bounded and secret/env values are redacted。
+- Shutdown is deterministic with terminate/kill fallback for uncooperative server。
+- Client capabilities do not advertise sampling or elicitation。
+- Server sampling requests receive JSON-RPC `-32601` fail-closed response。
+- No ToolRegistry/tool/resource/prompt registration was added。
+
+Known deferrals:
+- No MCP tools/resources/prompts exposure。
+- No remote MCP / Streamable HTTP / OAuth。
+- Downstream list/call/resource/prompt support remains for later Tickets。
+
+Orchestrator evidence checked before review dispatch:
+- Implementation worktree is clean。
+- HEAD is `a114fa9d`。
+- Diff from acceptance `c0e760d7..HEAD` is one implementation commit touching 8 files, about 1369 insertions / 1 deletion。
+- `git diff --check c0e760d7..HEAD` produced no diagnostics。
+
+Next action:
+- Dispatch Reviewer for r1 review against Ticket requirements, with focus on process lifecycle cleanup, JSON-RPC framing/bounds, stdout/stderr handling, secret redaction, sampling/elicitation fail-closed, no ToolRegistry/resources/prompts exposure, test determinism, and package/Nix impact。
+
+---
