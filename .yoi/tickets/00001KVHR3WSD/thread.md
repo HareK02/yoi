@@ -217,3 +217,45 @@ Reviewer validation:
 Worktree status at review end: clean。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T09:18:04Z -->
+
+## Implementation report
+
+Merge and final validation report:
+
+Merged implementation branch into Orchestrator branch:
+- Merge commit: `399a9d43 merge: mcp tools call`
+- Implementation commit included:
+  - `9a245403 mcp: execute stdio tool calls`
+
+Reviewer outcome:
+- r1 approved with no blocking issues。
+- Reviewer confirmed permission-before-call through ordinary Worker PreToolCall path, ordinary Tool result/history path, distinct MCP `isError` vs JSON-RPC protocol error, bounded/untrusted result serialization, and no resources/prompts/list_changed/sampling/elicitation scope creep。
+
+Orchestrator validation after merge passed:
+- `cargo fmt --check`
+- `git diff --check HEAD^1..HEAD`
+- `cargo test -p mcp --test stdio_lifecycle`
+- `cargo test -p pod feature::mcp`
+- `cargo check -p mcp -p pod`
+- `nix build .#yoi --no-link`
+- `nix path-info -S .#yoi`: `113196368`
+
+Validation log:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/bash-lkjYsX.log`
+
+Final state:
+- Orchestrator worktree clean at `399a9d43` after validation。
+- Implementation worktree remains available for cleanup after Ticket completion records are committed。
+- Dashboard/Console review remains active in parallel and is unaffected by this merge。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-20T09:18:12Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Implementation was merged into Orchestrator branch at `399a9d43`, review approved, and final Orchestrator validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p mcp --test stdio_lifecycle`, `cargo test -p pod feature::mcp`, `cargo check -p mcp -p pod`, and `nix build .#yoi --no-link`.
+
+---
