@@ -136,3 +136,55 @@ Next action:
 - Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff. Orchestrator will not merge/close until reviewer approval and validation evidence are available。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T16:46:22Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVJX7VZT`.
+
+Implementation commit:
+- `861c351a feat: add explicit resume command`
+
+Changed files:
+- `crates/yoi/src/main.rs`
+- `crates/tui/src/lib.rs`
+- `crates/tui/src/console/mod.rs`
+- `crates/tui/src/picker.rs`
+
+Coder summary:
+- Added explicit `yoi resume` subcommand。
+- Added `yoi resume --workspace <PATH>` workspace-scoped picker behavior。
+- Added `yoi resume --all` host/data-dir-wide picker behavior。
+- Removed legacy top-level `-r` / `--resume` resume mode。
+- Removed bare positional Pod-name inference (`yoi agent` now errors as unknown command)。
+- Preserved explicit `--pod <NAME>` routing。
+- Updated help to remove `[POD_NAME]` and `-r, --resume`, and document `yoi resume [--workspace <PATH>] [--all]`。
+- Reused `PodList::from_workspace_sources(...)` for workspace-scoped resume filtering。
+- Added parser and picker/workspace tests for new behavior。
+
+Coder validation reported:
+- `cargo fmt --check`: passed
+- `cargo test -p yoi parse_`: passed (`32 passed`)
+- `cargo test -p tui picker_`: passed (`7 passed`)
+- `cargo test -p tui workspace`: passed (`37 passed`)
+- `cargo check -p yoi -p tui`: passed
+- `git diff --check`: passed
+- `target/debug/yoi ticket doctor`: passed (`doctor: ok`)
+- CLI smoke:
+  - `target/debug/yoi --help`: passed
+  - `target/debug/yoi resume --help`: passed
+  - `target/debug/yoi agent`: nonzero with `unknown command \`agent\``
+  - `target/debug/yoi -r`: nonzero with `unknown argument: -r`
+  - `target/debug/yoi --pod cli-smoke --socket /tmp/yoi-cli-smoke.sock`: reached TUI launch path and failed raw-mode due non-TTY environment as expected; parser tests cover explicit `--pod` routing。
+
+Orchestrator evidence checked:
+- Implementation worktree is clean on `impl/00001KVJX7VZT-cli-resume-subcommand`。
+- HEAD is `861c351a`。
+- Diff `a63b40f4..HEAD` touches 4 expected files with 282 insertions / 142 deletions。
+- `git diff --check a63b40f4..HEAD` produced no diagnostics。
+
+Next action:
+- Route to read-only Reviewer Pod for acceptance review against the Ticket and IntentPacket。
+
+---
