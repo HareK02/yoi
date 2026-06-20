@@ -2725,7 +2725,7 @@ mod completion_flow_tests {
         let _ = app.refresh_completion();
         app.completion.as_mut().unwrap().entries = vec![
             CompletionEntry {
-                value: "crates/daemon".into(),
+                value: "crates/client".into(),
                 is_dir: true,
             },
             CompletionEntry {
@@ -2810,7 +2810,7 @@ mod completion_flow_tests {
         }
         let _ = app.refresh_completion();
         app.completion.as_mut().unwrap().entries = vec![CompletionEntry {
-            value: "crates/daemon".into(),
+            value: "crates/client".into(),
             is_dir: true,
         }];
         assert!(!app.chipify_completion_if_exact_match());

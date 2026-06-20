@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/client",
-    "crates/daemon",
     "crates/llm-worker",
     "crates/llm-worker-macros",
     "crates/session-store",
@@ -29,7 +28,6 @@ members = [
 ]
 default-members = [
     "crates/client",
-    "crates/daemon",
     "crates/llm-worker",
     "crates/llm-worker-macros",
     "crates/session-store",

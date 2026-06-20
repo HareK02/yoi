@@ -1,8 +1,8 @@
 ---
 title: 'Remove obsolete daemon crate'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-06-20T13:36:13Z'
-updated_at: '2026-06-20T13:36:51Z'
+updated_at: '2026-06-20T13:41:19Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-06-20T13:36:51Z'

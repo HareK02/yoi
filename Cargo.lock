@@ -791,15 +791,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "daemon"
-version = "0.1.0"
-dependencies = [
- "manifest",
- "protocol",
- "tokio",
-]
-
-[[package]]
 name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4297,7 +4288,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
