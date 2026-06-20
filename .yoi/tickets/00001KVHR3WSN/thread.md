@@ -238,3 +238,44 @@ Reviewer validation:
 Worktree status at review end: clean。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T10:04:45Z -->
+
+## Implementation report
+
+Merge and final validation report:
+
+Merged implementation branch into Orchestrator branch:
+- Merge commit: `4a4590f8 merge: mcp resources prompts tools`
+- Implementation commit included:
+  - `3a22360a mcp: expose resources prompts tools`
+
+Reviewer outcome:
+- r1 approved with no blocking issues。
+- Reviewer confirmed explicit resources/prompts tool operations, capability-gated registration, ordinary `ToolOutput` execution, no hidden context injection path, untrusted/bounded serialization, no sampling/elicitation/list_changed scope creep, and focused tests。
+
+Orchestrator validation after merge passed:
+- `cargo fmt --all --check`
+- `git diff --check HEAD^1..HEAD`
+- `cargo test -p pod mcp::tests`
+- `cargo test -p mcp`
+- `cargo check -p pod -p mcp`
+- `nix build .#yoi --no-link`
+- `nix path-info -S .#yoi`: `113403880`
+
+Validation log:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/bash-4oVSE2.log`
+
+Final state:
+- Orchestrator worktree clean at `4a4590f8` after validation。
+- Implementation worktree remains available for cleanup after Ticket completion records are committed。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-20T10:04:54Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Implementation was merged into Orchestrator branch at `4a4590f8`, review approved, and final Orchestrator validation passed: `cargo fmt --all --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p pod mcp::tests`, `cargo test -p mcp`, `cargo check -p pod -p mcp`, and `nix build .#yoi --no-link`.
+
+---

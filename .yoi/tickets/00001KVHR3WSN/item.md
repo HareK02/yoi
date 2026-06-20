@@ -1,8 +1,8 @@
 ---
 title: 'MCP: expose resources and prompts as explicit tool operations'
-state: 'inprogress'
+state: 'done'
 created_at: '2026-06-20T05:30:04Z'
-updated_at: '2026-06-20T10:03:26Z'
+updated_at: '2026-06-20T10:04:54Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['mcp', 'resources', 'prompts', 'prompt-context', 'history', 'untrusted-content']
