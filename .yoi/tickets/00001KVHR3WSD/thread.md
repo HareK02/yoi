@@ -154,3 +154,16 @@ Next action:
 - Dispatch Reviewer for r1 review against Ticket requirements, with focus on permission-before-call, ordinary Tool result/history path, `isError` vs protocol error distinction, output bounds/untrusted content, no resources/prompts/list_changed scope creep, and test coverage。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-20T09:09:50Z -->
+
+## Plan
+
+Review dispatch:
+- Spawned Reviewer Pod `yoi-reviewer-00001KVHR3WSD-r1` against implementation branch `impl/00001KVHR3WSD-mcp-tools-call`。
+- Review target commit: `9a245403 mcp: execute stdio tool calls`。
+- Review baseline: `92432ad7`。
+- Reviewer task focuses on permission-before-call, ordinary Tool result/history path, `isError` vs protocol error semantics, output bounds/untrusted content, lifecycle redaction/shutdown preservation, no resources/prompts/list_changed/sampling/elicitation scope creep, tests, and package validation。
+- Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
+
+---
