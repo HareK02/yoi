@@ -221,3 +221,46 @@ Reviewer validation:
 Worktree status at review end: clean。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T08:40:48Z -->
+
+## Implementation report
+
+Coder r1-fix report received from `yoi-coder-00001KVHR3WS6`.
+
+New fix commit:
+- `0080c5b3 mcp: reject colliding tool names`
+
+Branch commits now:
+- `0080c5b3 mcp: reject colliding tool names`
+- `66fa9d55 mcp: register stdio server tools`
+
+Fix summary:
+- Changed duplicate/collision handling in `crates/pod/src/feature/mcp.rs` to fail closed for the normalized tool identity。
+- Implementation now normalizes all valid candidate tools first, counts namespaced normalized names, emits bounded duplicate diagnostics, and registers only candidates whose normalized name appears exactly once。
+- Server-controlled ordering can no longer cause the first colliding definition to become model-visible。
+- Updated test to prove `Mcp_demo_search_files` is not model-visible when produced by two colliding MCP tool names, while unrelated valid `Mcp_demo_unique` still registers。
+
+Coder validation reported as passing:
+- `cargo fmt --check`
+- `git diff --check a59e5c1e..HEAD`
+- `cargo test -p mcp list_tools --test stdio_lifecycle`
+- `cargo test -p pod feature::mcp --lib`
+- `cargo test -p mcp`
+- `cargo check -p pod -p mcp`
+- `nix build .#yoi --no-link`
+
+Remaining deferrals unchanged:
+- MCP `tools/call` execution remains intentionally unimplemented。
+- Resources/prompts and `list_changed` handling remain out of scope。
+
+Orchestrator evidence checked before r2 review:
+- Implementation worktree is clean。
+- HEAD is `0080c5b3`。
+- Fix diff from `66fa9d55..HEAD` touches only `crates/pod/src/feature/mcp.rs`, about 43 insertions / 17 deletions。
+- Overall `git diff --check a59e5c1e..HEAD` produced no diagnostics。
+
+Next action:
+- Route back to Reviewer for r2 verification of duplicate/collision fail-closed behavior and final acceptance criteria。
+
+---
