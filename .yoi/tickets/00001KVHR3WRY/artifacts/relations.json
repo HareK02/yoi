@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KVHR3WRY",
+      "kind": "depends_on",
+      "target": "00001KVHR3WRF",
+      "note": "Lifecycle client requires explicit local stdio MCP config/trust policy.",
+      "author": "yoi ticket",
+      "at": "2026-06-20T05:33:03Z"
+    },
+    {
+      "ticket_id": "00001KVHR3WRY",
+      "kind": "related",
+      "target": "00001KTR81P9X",
+      "note": "MCP lifecycle uses the protocol-backed provider feature substrate.",
+      "author": "yoi ticket",
+      "at": "2026-06-20T05:33:03Z"
+    }
+  ]
+}

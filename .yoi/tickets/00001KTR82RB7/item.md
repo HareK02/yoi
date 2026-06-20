@@ -1,8 +1,8 @@
 ---
 title: 'Implement MCP 2025-11-25 local stdio server-feature bridge'
-state: 'planning'
+state: 'closed'
 created_at: '2026-06-10T07:48:49Z'
-updated_at: '2026-06-13T15:29:21Z'
+updated_at: '2026-06-20T05:33:15Z'
 assignee: null
 readiness: 'blocked'
 risk_flags: ['mcp', 'prompt-context', 'permission-scope', 'secrets', 'process-exec', 'feature-api', 'trust-boundary']

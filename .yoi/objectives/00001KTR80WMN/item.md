@@ -1,24 +1,25 @@
 ---
-title: 'MCP local stdio integration architecture'
+title: 'MCP local stdio integration roadmap'
 state: 'active'
 created_at: '2026-06-10T07:48:45Z'
-updated_at: '2026-06-13T15:30:22Z'
+updated_at: '2026-06-20T05:34:00Z'
+linked_tickets: ['00001KTR81P9X', '00001KV0SP0TY', '00001KVHR3WRF', '00001KVHR3WRY', '00001KVHR3WS6', '00001KVHR3WSD', '00001KVHR3WSN', '00001KVHR3WSW']
 ---
 
 ## Objective
 
 Add MCP local stdio integration to Yoi without weakening Worker history, prompt-context, scoped tool permission, or Plugin/Feature layering invariants.
 
-MCP should be implemented as a protocol-backed integration layer on top of `pod::feature`. `pod::feature` supplies the contribution/lifecycle API substrate; MCP owns its own enablement, local server trust model, command/env/secret policy, and MCP-specific permissions. MCP is not the Plugin model, and Plugin permission policy is not implemented by feature-layer authority grants.
+MCP is a protocol-backed integration layer on top of `pod::feature`. `pod::feature` supplies contribution/lifecycle/dynamic registration substrate; MCP owns its own enablement, local server trust model, command/env/secret policy, and MCP-specific permission decisions. MCP is not the Plugin model, and Plugin permission policy is not implemented by feature-layer authority grants.
 
 ## Strategic direction
 
-- Baseline the implementation on MCP specification `2025-11-25`.
+- Baseline the initial implementation on MCP specification `2025-11-25`.
 - Start with local stdio MCP servers only.
 - Treat MCP server metadata, tools, resources, prompts, and results as untrusted content.
-- Do not allow MCP resources/prompts to be hidden context injection.
+- Do not allow MCP resources/prompts to become hidden context injection.
   - They must be explicit tool operations with history records.
-- Use the normal Yoi tool registry, PreToolCall permission, history, and bounded result paths.
+- Use the normal Yoi ToolRegistry, PreToolCall permission, history, and bounded result paths.
 - Do not add private MCP-only bypasses around Worker/tool invariants.
 - Keep sampling and elicitation fail-closed initially.
 - Keep Streamable HTTP, remote auth, OAuth, and MCP Registry/distribution out of the first slice.
@@ -37,28 +38,37 @@ MCP should be implemented as a protocol-backed integration layer on top of `pod:
   - MCP enablement, command/env/secret handling, server trust, and MCP-specific permission decisions live in MCP config/implementation.
   - MCP dynamic tools/resources/prompts are exposed through the feature API and ordinary Yoi tool paths.
 
-## Work breakdown
+## Concrete implementation tickets
 
-1. `00001KTR81P9X` — Extend `pod::feature` API for protocol-backed external providers.
-   - provider/service lifecycle
-   - startup discovery and dynamic contribution registration
-   - bounded refresh semantics
-   - metadata/result normalization
-   - no feature-layer authority model for MCP/Plugin permissions
-2. `00001KTR82RB7` — Implement MCP `2025-11-25` local stdio server bridge.
-   - explicit MCP config and trust model
-   - initialize/capability negotiation
-   - tools/resources/prompts list/call/read/get
-   - bounded result serialization
-   - list-changed diagnostics/refresh behavior
-3. `00001KV0SP0TY` — Remove feature-layer HostAuthority model.
-   - remove authority/grant terminology from `pod::feature`
-   - keep real permission/trust policy in owning Plugin/MCP/manifest/tool layers
-4. Later follow-ups, if needed.
-   - richer MCP tasks / task-support integration
-   - remote/HTTP transports
-   - OAuth / registry / package distribution
-   - Plugin package/runtime alignment, if an explicit MCP/plugin bridge is later approved
+Completed prerequisites:
+
+- `00001KTR81P9X` — Extend `pod::feature` API for external protocol-backed capability providers.
+- `00001KV0SP0TY` — Remove feature-layer HostAuthority model.
+
+Concrete MCP implementation sequence:
+
+1. `00001KVHR3WRF` — MCP local stdio server config and trust policy.
+   - explicit config, command/env/secret redaction, local executable trust boundary, no auto-start.
+2. `00001KVHR3WRY` — MCP stdio JSON-RPC lifecycle client.
+   - subprocess lifecycle, initialize/capability negotiation, diagnostics, shutdown.
+3. `00001KVHR3WS6` — MCP tools/list registration into ToolRegistry.
+   - stable namespacing, schema validation, untrusted metadata normalization, no tools/call yet.
+4. `00001KVHR3WSD` — MCP tools/call execution through ordinary Tool path.
+   - PreToolCall gate before server call, bounded result serialization, history path.
+5. `00001KVHR3WSN` — MCP resources/prompts as explicit tool operations.
+   - resources/list/read and prompts/list/get without hidden context injection.
+6. `00001KVHR3WSW` — MCP list_changed notification handling.
+   - deterministic safe refresh/diagnostic behavior without breaking tool schema or prompt-cache invariants.
+
+The old broad implementation Ticket `00001KTR82RB7` is superseded by this sequence and should not be used as an implementation work item.
+
+## Later follow-ups
+
+- Richer MCP task/task-support integration if ordinary tool-call fallback is insufficient.
+- Streamable HTTP transport.
+- OAuth / remote auth.
+- Registry/package distribution.
+- Explicit MCP/Plugin bridge only if separately approved; do not conflate Plugin packages with MCP local server execution.
 
 ## Success criteria
 
