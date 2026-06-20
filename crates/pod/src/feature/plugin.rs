@@ -21,10 +21,10 @@ use llm_worker::tool::{
     Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOrigin, ToolOutput,
 };
 use manifest::plugin::{
-    PLUGIN_COMPONENT_TOOL_WORLD, PLUGIN_RUNTIME_COMPONENT_KIND, PLUGIN_RUNTIME_WASM_ABI,
-    PLUGIN_RUNTIME_WASM_KIND, PluginConfig, PluginDiscoveryLimits, PluginFsGrant,
-    PluginFsOperation, PluginHostApi, PluginPermission, PluginSurface, PluginToolManifest,
-    ResolvedPluginRecord, read_resolved_plugin_runtime_component,
+    PLUGIN_COMPONENT_INSTANCE_WORLD, PLUGIN_COMPONENT_TOOL_WORLD, PLUGIN_RUNTIME_COMPONENT_KIND,
+    PLUGIN_RUNTIME_WASM_ABI, PLUGIN_RUNTIME_WASM_KIND, PluginConfig, PluginDiscoveryLimits,
+    PluginFsGrant, PluginFsOperation, PluginHostApi, PluginPermission, PluginSurface,
+    PluginToolManifest, ResolvedPluginRecord, read_resolved_plugin_runtime_component,
     read_resolved_plugin_runtime_module,
 };
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,7 @@ use serde_json::Value;
 
 use super::{
     FeatureDescriptor, FeatureId, FeatureInstallContext, FeatureInstallError, FeatureModule,
-    FeatureRuntimeKind, ToolContribution, ToolDeclaration,
+    FeatureRuntimeKind, ServiceDeclaration, ServiceId, ToolContribution, ToolDeclaration,
 };
 
 /// Build Feature modules for enabled plugin packages when the profile exposes
@@ -47,29 +47,67 @@ pub fn plugin_tool_features_if_enabled(
     plugin_tool_features(config)
 }
 
-/// Build Feature modules for enabled plugin packages that declare Tool surfaces.
+/// Build Feature modules for enabled plugin packages that declare Tool/Service/Ingress surfaces.
 pub fn plugin_tool_features(config: &PluginConfig) -> Vec<PluginToolFeature> {
     config
         .resolved
         .iter()
-        .filter(|record| record.enabled_surfaces.contains(&PluginSurface::Tool))
-        .filter(|record| !record.manifest.tools.is_empty())
+        .filter(|record| {
+            record.enabled_surfaces.contains(&PluginSurface::Tool)
+                || record.enabled_surfaces.contains(&PluginSurface::Service)
+                || record.enabled_surfaces.contains(&PluginSurface::Ingress)
+        })
+        .filter(|record| {
+            !record.manifest.tools.is_empty()
+                || !record.manifest.services.is_empty()
+                || !record.manifest.ingresses.is_empty()
+        })
         .cloned()
         .map(PluginToolFeature::new)
         .collect()
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PluginToolFeature {
     record: ResolvedPluginRecord,
     feature_id: FeatureId,
+    registry: PluginInstanceRegistry,
 }
 
 impl PluginToolFeature {
     pub fn new(record: ResolvedPluginRecord) -> Self {
         let feature_id = FeatureId::new(format!("plugin:{}:tool", record.identity))
             .expect("source-qualified plugin identity yields non-empty feature id");
-        Self { record, feature_id }
+        Self {
+            record,
+            feature_id,
+            registry: PluginInstanceRegistry::default(),
+        }
+    }
+
+    fn ensure_instance(&self) -> Result<PluginInstanceHandle, FeatureInstallError> {
+        self.registry.register(self.record.clone())
+    }
+
+    pub fn instance_status(&self) -> Option<PluginInstanceStatus> {
+        self.registry.status(&self.record.identity.to_string())
+    }
+
+    pub fn dispatch_ingress(
+        &self,
+        ingress_name: &str,
+        event: PluginIngressEvent,
+    ) -> Result<PluginIngressDispatchReport, PluginWasmError> {
+        if !surface_enabled(&self.record, PluginSurface::Ingress) {
+            return Err(PluginWasmError::Module(
+                "plugin ingress surface is not enabled".to_string(),
+            ));
+        }
+        let handle = self
+            .registry
+            .handle(&self.record.identity.to_string())
+            .ok_or_else(|| PluginWasmError::Module("plugin instance is not started".to_string()))?;
+        handle.deliver_ingress(ingress_name, event)
     }
 
     pub fn origin(&self) -> ToolOrigin {
@@ -86,6 +124,28 @@ impl PluginToolFeature {
     }
 }
 
+fn surface_enabled(record: &ResolvedPluginRecord, surface: PluginSurface) -> bool {
+    record.enabled_surfaces.contains(&surface)
+}
+
+fn plugin_tool_origin(record: &ResolvedPluginRecord) -> ToolOrigin {
+    ToolOrigin {
+        kind: "plugin".into(),
+        plugin_id: record.manifest.id.clone(),
+        plugin_ref: record.identity.to_string(),
+        source: record.identity.source.to_string(),
+        digest: record.digest.clone(),
+        package_version: record.version.clone(),
+        package_api_version: record.manifest.schema_version,
+        surface: "tool".into(),
+    }
+}
+
+fn plugin_service_id(record: &ResolvedPluginRecord, name: &str) -> ServiceId {
+    ServiceId::new(format!("plugin:{}:{name}", record.identity.to_string()))
+        .expect("plugin service id is generated from safe plugin identity/name")
+}
+
 /// Static, read-only eligibility information for a resolved plugin package.
 ///
 /// This inspection mirrors the registration-time permission checks without
@@ -95,6 +155,8 @@ pub struct PluginStaticInspection {
     pub runtime: PluginRuntimeEligibility,
     pub host_apis: Vec<PluginPermissionEligibility>,
     pub tools: Vec<PluginToolEligibility>,
+    pub services: Vec<PluginSurfaceEligibility>,
+    pub ingresses: Vec<PluginSurfaceEligibility>,
 }
 
 impl PluginStaticInspection {
@@ -102,6 +164,8 @@ impl PluginStaticInspection {
         self.runtime.eligible
             && self.host_apis.iter().all(|api| api.eligible)
             && self.tools.iter().all(|tool| tool.eligible)
+            && self.services.iter().all(|service| service.eligible)
+            && self.ingresses.iter().all(|ingress| ingress.eligible)
     }
 }
 
@@ -129,6 +193,16 @@ pub struct PluginToolEligibility {
     pub granted: bool,
     pub eligible: bool,
     pub external_write: bool,
+    pub diagnostic: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PluginSurfaceEligibility {
+    pub name: String,
+    pub permission: String,
+    pub requested: bool,
+    pub granted: bool,
+    pub eligible: bool,
     pub diagnostic: Option<String>,
 }
 
@@ -160,12 +234,22 @@ pub fn inspect_resolved_plugin_static(record: &ResolvedPluginRecord) -> PluginSt
         }
         Some(runtime)
             if runtime.kind == PLUGIN_RUNTIME_COMPONENT_KIND
-                && runtime.world.as_deref() == Some(PLUGIN_COMPONENT_TOOL_WORLD)
+                && matches!(
+                    runtime.world.as_deref(),
+                    Some(PLUGIN_COMPONENT_TOOL_WORLD) | Some(PLUGIN_COMPONENT_INSTANCE_WORLD)
+                )
                 && runtime.component.is_some() =>
         {
             PluginRuntimeEligibility {
                 eligible: true,
-                status: format!("{PLUGIN_RUNTIME_COMPONENT_KIND}/{PLUGIN_COMPONENT_TOOL_WORLD}"),
+                status: format!(
+                    "{}/{}",
+                    PLUGIN_RUNTIME_COMPONENT_KIND,
+                    runtime
+                        .world
+                        .as_deref()
+                        .unwrap_or(PLUGIN_COMPONENT_TOOL_WORLD)
+                ),
                 diagnostic: None,
             }
         }
@@ -219,35 +303,108 @@ pub fn inspect_resolved_plugin_static(record: &ResolvedPluginRecord) -> PluginSt
         .collect();
 
     let duplicate_tool_names = duplicate_tool_names(record);
-    let tools = record
-        .manifest
-        .tools
-        .iter()
-        .map(|tool| {
-            let permission = PluginPermission::tool(&tool.name);
-            let requested = permission_requested(record, &permission);
-            let granted = grant_allows(record, &permission);
-            let mut diagnostics = validate_plugin_tool_definition(tool, &duplicate_tool_names);
-            if let Err(error) = authorize_plugin_tool(record, tool) {
-                diagnostics.push(error.bounded_message());
-            }
-            let diagnostic = join_tool_diagnostics(diagnostics);
-            PluginToolEligibility {
-                name: tool.name.clone(),
-                permission: permission.label(),
-                requested,
-                granted,
-                eligible: diagnostic.is_none(),
-                external_write: tool.external_write,
-                diagnostic,
-            }
-        })
-        .collect();
+    let tools = if surface_enabled(record, PluginSurface::Tool) {
+        record
+            .manifest
+            .tools
+            .iter()
+            .map(|tool| {
+                let permission = PluginPermission::tool(&tool.name);
+                let requested = permission_requested(record, &permission);
+                let granted = grant_allows(record, &permission);
+                let mut diagnostics = validate_plugin_tool_definition(tool, &duplicate_tool_names);
+                if let Err(error) = authorize_plugin_tool(record, tool) {
+                    diagnostics.push(error.bounded_message());
+                }
+                let diagnostic = join_tool_diagnostics(diagnostics);
+                PluginToolEligibility {
+                    name: tool.name.clone(),
+                    permission: permission.label(),
+                    requested,
+                    granted,
+                    eligible: diagnostic.is_none(),
+                    external_write: tool.external_write,
+                    diagnostic,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let instance_world = record.manifest.runtime.as_ref().is_some_and(|runtime| {
+        runtime.kind == PLUGIN_RUNTIME_COMPONENT_KIND
+            && runtime.world.as_deref() == Some(PLUGIN_COMPONENT_INSTANCE_WORLD)
+    });
+    let services = if surface_enabled(record, PluginSurface::Service) {
+        record
+            .manifest
+            .services
+            .iter()
+            .map(|service| {
+                let permission = PluginPermission::service(&service.name);
+                let requested = permission_requested(record, &permission);
+                let granted = grant_allows(record, &permission);
+                let mut diagnostics = Vec::new();
+                if !instance_world {
+                    diagnostics
+                        .push("service requires instance-capable component world".to_string());
+                }
+                if let Err(error) = authorize_plugin_service(record, &service.name) {
+                    diagnostics.push(error.bounded_message());
+                }
+                let diagnostic = join_tool_diagnostics(diagnostics);
+                PluginSurfaceEligibility {
+                    name: service.name.clone(),
+                    permission: permission.label(),
+                    requested,
+                    granted,
+                    eligible: diagnostic.is_none(),
+                    diagnostic,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let ingresses = if surface_enabled(record, PluginSurface::Ingress) {
+        record
+            .manifest
+            .ingresses
+            .iter()
+            .map(|ingress| {
+                let permission = PluginPermission::ingress(&ingress.name);
+                let requested = permission_requested(record, &permission);
+                let granted = grant_allows(record, &permission);
+                let mut diagnostics = Vec::new();
+                if !instance_world {
+                    diagnostics
+                        .push("ingress requires instance-capable component world".to_string());
+                }
+                if let Err(error) = authorize_plugin_ingress(record, &ingress.name) {
+                    diagnostics.push(error.bounded_message());
+                }
+                let diagnostic = join_tool_diagnostics(diagnostics);
+                PluginSurfaceEligibility {
+                    name: ingress.name.clone(),
+                    permission: permission.label(),
+                    requested,
+                    granted,
+                    eligible: diagnostic.is_none(),
+                    diagnostic,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     PluginStaticInspection {
         runtime,
         host_apis,
         tools,
+        services,
+        ingresses,
     }
 }
 
@@ -327,57 +484,134 @@ impl FeatureModule for PluginToolFeature {
                 requires_services: Vec::new(),
                 protocol_providers: Vec::new(),
             };
-        for tool in &self.record.manifest.tools {
-            descriptor = descriptor.with_tool(ToolDeclaration::new(
-                tool.name.clone(),
-                tool.description.clone(),
-            ));
+        if surface_enabled(&self.record, PluginSurface::Service) {
+            for service in &self.record.manifest.services {
+                descriptor.provides_services.push(ServiceDeclaration::new(
+                    plugin_service_id(&self.record, &service.name),
+                    self.record.manifest.version.clone(),
+                    service.description.clone(),
+                ));
+            }
+        }
+        if surface_enabled(&self.record, PluginSurface::Tool) {
+            for tool in &self.record.manifest.tools {
+                descriptor = descriptor.with_tool(ToolDeclaration::new(
+                    tool.name.clone(),
+                    tool.description.clone(),
+                ));
+            }
         }
         descriptor
     }
 
     fn install(&self, context: &mut FeatureInstallContext<'_>) -> Result<(), FeatureInstallError> {
-        validate_declared_tool_names(&self.record)?;
-        let origin = self.origin();
-        let mut registered = 0usize;
-        let mut denied = Vec::new();
-        for tool in &self.record.manifest.tools {
-            validate_tool_name(&tool.name).map_err(|reason| {
-                FeatureInstallError::Install(format!(
-                    "plugin `{}` tool `{}` has invalid name: {reason}",
-                    self.record.identity, tool.name
-                ))
-            })?;
-            validate_input_schema(&tool.input_schema).map_err(|reason| {
-                FeatureInstallError::Install(format!(
-                    "plugin `{}` tool `{}` has invalid input_schema: {reason}",
-                    self.record.identity, tool.name
-                ))
-            })?;
-            if let Err(error) = authorize_plugin_tool(&self.record, tool) {
-                let message = format!(
-                    "plugin `{}` tool `{}` registration denied: {}",
-                    self.record.identity,
-                    tool.name,
-                    error.bounded_message()
-                );
-                context.diagnostics().warning(message.clone());
-                denied.push(message);
-                continue;
-            }
-            context.tools().register(ToolContribution::new(
-                tool.name.clone(),
-                plugin_wasm_tool_definition(
-                    self.record.clone(),
-                    tool.name.clone(),
-                    tool.description.clone(),
-                    tool.input_schema.clone(),
-                    origin.clone(),
-                ),
-            ))?;
-            registered += 1;
+        if surface_enabled(&self.record, PluginSurface::Tool) {
+            validate_declared_tool_names(&self.record)?;
         }
-        if registered == 0 && !denied.is_empty() {
+        let mut instance: Option<PluginInstanceHandle> = None;
+        let mut exposed = 0usize;
+        let mut denied = Vec::new();
+        if surface_enabled(&self.record, PluginSurface::Service) {
+            for service in &self.record.manifest.services {
+                validate_tool_name(&service.name).map_err(|reason| {
+                    FeatureInstallError::Install(format!(
+                        "plugin {} service {} has invalid name: {reason}",
+                        self.record.identity, service.name
+                    ))
+                })?;
+                if let Err(error) = authorize_plugin_service(&self.record, &service.name) {
+                    let message = format!(
+                        "plugin {} service {} registration denied: {}",
+                        self.record.identity,
+                        service.name,
+                        error.bounded_message()
+                    );
+                    context.diagnostics().warning(message.clone());
+                    denied.push(message);
+                    continue;
+                }
+                if instance.is_none() {
+                    instance = Some(self.ensure_instance()?);
+                }
+                context.services().provide(ServiceDeclaration::new(
+                    plugin_service_id(&self.record, &service.name),
+                    self.record.manifest.version.clone(),
+                    service.description.clone(),
+                ))?;
+                exposed += 1;
+            }
+        }
+        if surface_enabled(&self.record, PluginSurface::Ingress) {
+            for ingress in &self.record.manifest.ingresses {
+                validate_tool_name(&ingress.name).map_err(|reason| {
+                    FeatureInstallError::Install(format!(
+                        "plugin {} ingress {} has invalid name: {reason}",
+                        self.record.identity, ingress.name
+                    ))
+                })?;
+                if let Err(error) = authorize_plugin_ingress(&self.record, &ingress.name) {
+                    let message = format!(
+                        "plugin {} ingress {} registration denied: {}",
+                        self.record.identity,
+                        ingress.name,
+                        error.bounded_message()
+                    );
+                    context.diagnostics().warning(message.clone());
+                    denied.push(message);
+                } else {
+                    if instance.is_none() {
+                        instance = Some(self.ensure_instance()?);
+                    }
+                    exposed += 1;
+                }
+            }
+        }
+        if surface_enabled(&self.record, PluginSurface::Tool) {
+            for tool in &self.record.manifest.tools {
+                validate_tool_name(&tool.name).map_err(|reason| {
+                    FeatureInstallError::Install(format!(
+                        "plugin {} tool {} has invalid name: {reason}",
+                        self.record.identity, tool.name
+                    ))
+                })?;
+                validate_input_schema(&tool.input_schema).map_err(|reason| {
+                    FeatureInstallError::Install(format!(
+                        "plugin {} tool {} has invalid input_schema: {reason}",
+                        self.record.identity, tool.name
+                    ))
+                })?;
+                if let Err(error) = authorize_plugin_tool(&self.record, tool) {
+                    let message = format!(
+                        "plugin {} tool {} registration denied: {}",
+                        self.record.identity,
+                        tool.name,
+                        error.bounded_message()
+                    );
+                    context.diagnostics().warning(message.clone());
+                    denied.push(message);
+                    continue;
+                }
+                let tool_instance = match &instance {
+                    Some(instance) => instance.clone(),
+                    None => {
+                        let created = self.ensure_instance()?;
+                        instance = Some(created.clone());
+                        created
+                    }
+                };
+                context.tools().register(ToolContribution::new(
+                    tool.name.clone(),
+                    plugin_instance_tool_definition(
+                        tool_instance,
+                        tool.name.clone(),
+                        tool.description.clone(),
+                        tool.input_schema.clone(),
+                    ),
+                ))?;
+                exposed += 1;
+            }
+        }
+        if exposed == 0 && !denied.is_empty() {
             let summary = if denied.len() == 1 {
                 denied.remove(0)
             } else {
@@ -1416,6 +1650,64 @@ fn authorize_plugin_tool(
     Ok(())
 }
 
+fn authorize_plugin_service(
+    record: &ResolvedPluginRecord,
+    service_name: &str,
+) -> Result<(), PluginPermissionError> {
+    validate_grant_binding(record)?;
+    require_permission(
+        &record.manifest.permissions,
+        &PluginPermission::surface(PluginSurface::Service),
+        "requested surfaces.service permission is missing",
+    )?;
+    require_permission(
+        &record.grants.permissions,
+        &PluginPermission::surface(PluginSurface::Service),
+        "granted surfaces.service permission is missing",
+    )?;
+    let permission = PluginPermission::service(service_name);
+    require_permission(
+        &record.manifest.permissions,
+        &permission,
+        &format!("requested service permission for `{service_name}` is missing"),
+    )?;
+    require_permission(
+        &record.grants.permissions,
+        &permission,
+        &format!("granted service permission for `{service_name}` is missing"),
+    )?;
+    Ok(())
+}
+
+fn authorize_plugin_ingress(
+    record: &ResolvedPluginRecord,
+    ingress_name: &str,
+) -> Result<(), PluginPermissionError> {
+    validate_grant_binding(record)?;
+    require_permission(
+        &record.manifest.permissions,
+        &PluginPermission::surface(PluginSurface::Ingress),
+        "requested surfaces.ingress permission is missing",
+    )?;
+    require_permission(
+        &record.grants.permissions,
+        &PluginPermission::surface(PluginSurface::Ingress),
+        "granted surfaces.ingress permission is missing",
+    )?;
+    let permission = PluginPermission::ingress(ingress_name);
+    require_permission(
+        &record.manifest.permissions,
+        &permission,
+        &format!("requested ingress permission for `{ingress_name}` is missing"),
+    )?;
+    require_permission(
+        &record.grants.permissions,
+        &permission,
+        &format!("granted ingress permission for `{ingress_name}` is missing"),
+    )?;
+    Ok(())
+}
+
 fn authorize_plugin_host_api(
     record: &ResolvedPluginRecord,
     api: PluginHostApi,
@@ -1692,21 +1984,598 @@ impl PluginHttpsError {
     }
 }
 
-fn plugin_wasm_tool_definition(
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub enum PluginInstanceLifecycleState {
+    Ready,
+    Started,
+    Stopped,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PluginInstanceDiagnostic {
+    pub state: PluginInstanceLifecycleState,
+    pub message: String,
+}
+
+impl PluginInstanceDiagnostic {
+    pub fn new(state: PluginInstanceLifecycleState, message: impl Into<String>) -> Self {
+        Self {
+            state,
+            message: bounded_message(message.into()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PluginInstanceStatus {
+    pub plugin_ref: String,
+    pub lifecycle: PluginInstanceLifecycleState,
+    pub component_status: Option<Value>,
+    pub diagnostics: Vec<PluginInstanceDiagnostic>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PluginIngressEvent {
+    pub kind: String,
+    pub source: String,
+    pub payload: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PluginIngressDispatchReport {
+    pub plugin_ref: String,
+    pub ingress: String,
+    pub accepted: bool,
+    pub output: Value,
+    pub diagnostics: Vec<PluginInstanceDiagnostic>,
+}
+
+#[derive(Clone, Default)]
+pub struct PluginInstanceRegistry {
+    instances: Arc<Mutex<HashMap<String, PluginInstanceHandle>>>,
+}
+
+impl PluginInstanceRegistry {
+    pub fn register(
+        &self,
+        record: ResolvedPluginRecord,
+    ) -> Result<PluginInstanceHandle, FeatureInstallError> {
+        let key = record.identity.to_string();
+        let mut instances = self
+            .instances
+            .lock()
+            .expect("plugin instance registry poisoned");
+        if let Some(existing) = instances.get(&key) {
+            return Ok(existing.clone());
+        }
+        let handle = PluginInstanceHandle::new(record).map_err(|error| {
+            FeatureInstallError::Install(format!(
+                "plugin instance startup failed closed: {}",
+                error.bounded_message()
+            ))
+        })?;
+        instances.insert(key, handle.clone());
+        Ok(handle)
+    }
+
+    pub fn status(&self, plugin_ref: &str) -> Option<PluginInstanceStatus> {
+        self.instances
+            .lock()
+            .expect("plugin instance registry poisoned")
+            .get(plugin_ref)
+            .map(PluginInstanceHandle::status)
+    }
+
+    pub fn handle(&self, plugin_ref: &str) -> Option<PluginInstanceHandle> {
+        self.instances
+            .lock()
+            .expect("plugin instance registry poisoned")
+            .get(plugin_ref)
+            .cloned()
+    }
+
+    pub fn stop(&self, plugin_ref: &str) -> Result<Option<PluginInstanceStatus>, PluginWasmError> {
+        let handle = self
+            .instances
+            .lock()
+            .expect("plugin instance registry poisoned")
+            .get(plugin_ref)
+            .cloned();
+        handle.map(|handle| handle.stop()).transpose()
+    }
+}
+
+#[derive(Clone)]
+pub struct PluginInstanceHandle(Arc<Mutex<PluginInstance>>);
+
+impl PluginInstanceHandle {
+    fn new(record: ResolvedPluginRecord) -> Result<Self, PluginWasmError> {
+        let runtime = PluginInstanceRuntime::new(&record)?;
+        let mut instance = PluginInstance {
+            record,
+            runtime,
+            lifecycle: PluginInstanceLifecycleState::Ready,
+            component_status: None,
+            diagnostics: Vec::new(),
+        };
+        instance.start()?;
+        Ok(Self(Arc::new(Mutex::new(instance))))
+    }
+
+    fn handle_tool(&self, tool_name: &str, input: Vec<u8>) -> Result<ToolOutput, PluginWasmError> {
+        self.0
+            .lock()
+            .expect("plugin instance poisoned")
+            .handle_tool(tool_name, input)
+    }
+
+    pub fn deliver_ingress(
+        &self,
+        ingress_name: &str,
+        event: PluginIngressEvent,
+    ) -> Result<PluginIngressDispatchReport, PluginWasmError> {
+        self.0
+            .lock()
+            .expect("plugin instance poisoned")
+            .deliver_ingress(ingress_name, event)
+    }
+
+    pub fn status(&self) -> PluginInstanceStatus {
+        let mut instance = self.0.lock().expect("plugin instance poisoned");
+        instance.status()
+    }
+
+    pub fn stop(&self) -> Result<PluginInstanceStatus, PluginWasmError> {
+        let mut instance = self.0.lock().expect("plugin instance poisoned");
+        instance.stop()?;
+        Ok(instance.snapshot_status())
+    }
+
+    fn record_diagnostic(&self, diagnostic: PluginInstanceDiagnostic) {
+        if let Ok(mut instance) = self.0.lock() {
+            instance.lifecycle = diagnostic.state.clone();
+            instance.diagnostics.push(diagnostic);
+        }
+    }
+}
+
+struct PluginInstance {
     record: ResolvedPluginRecord,
+    runtime: PluginInstanceRuntime,
+    lifecycle: PluginInstanceLifecycleState,
+    component_status: Option<Value>,
+    diagnostics: Vec<PluginInstanceDiagnostic>,
+}
+
+impl PluginInstance {
+    fn start(&mut self) -> Result<(), PluginWasmError> {
+        match &mut self.runtime {
+            PluginInstanceRuntime::LegacyToolAdapter => {
+                self.lifecycle = PluginInstanceLifecycleState::Ready;
+                self.diagnostics.push(PluginInstanceDiagnostic::new(
+                    PluginInstanceLifecycleState::Ready,
+                    "legacy tool runtime adapted behind PluginInstanceRegistry",
+                ));
+            }
+            #[cfg(test)]
+            PluginInstanceRuntime::TestIngress { .. } => {
+                self.lifecycle = PluginInstanceLifecycleState::Started;
+            }
+            PluginInstanceRuntime::ComponentInstance(runtime) => {
+                let status = runtime.start(&self.record)?;
+                self.component_status = Some(status);
+                self.lifecycle = PluginInstanceLifecycleState::Started;
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_tool(
+        &mut self,
+        tool_name: &str,
+        input: Vec<u8>,
+    ) -> Result<ToolOutput, PluginWasmError> {
+        if !surface_enabled(&self.record, PluginSurface::Tool) {
+            return Err(PluginWasmError::Module(
+                "plugin tool surface is not enabled".to_string(),
+            ));
+        }
+        let tool = self
+            .record
+            .manifest
+            .tools
+            .iter()
+            .find(|tool| tool.name == tool_name)
+            .ok_or_else(|| {
+                PluginWasmError::Module(
+                    "requested tool is not declared by plugin manifest".to_string(),
+                )
+            })?;
+        authorize_plugin_tool(&self.record, tool).map_err(|error| {
+            PluginWasmError::Module(format!(
+                "plugin permission denied: {}",
+                error.bounded_message()
+            ))
+        })?;
+        match &mut self.runtime {
+            PluginInstanceRuntime::LegacyToolAdapter => {
+                run_plugin_tool(self.record.clone(), tool_name.to_string(), input)
+            }
+            #[cfg(test)]
+            PluginInstanceRuntime::TestIngress { calls } => {
+                *calls += 1;
+                Ok(ToolOutput {
+                    summary: format!("{tool_name}: {calls}"),
+                    content: Some(String::from_utf8_lossy(&input).to_string()),
+                })
+            }
+            PluginInstanceRuntime::ComponentInstance(runtime) => {
+                runtime.handle_tool(tool_name, input)
+            }
+        }
+    }
+
+    fn deliver_ingress(
+        &mut self,
+        ingress_name: &str,
+        event: PluginIngressEvent,
+    ) -> Result<PluginIngressDispatchReport, PluginWasmError> {
+        if !surface_enabled(&self.record, PluginSurface::Ingress) {
+            return Err(PluginWasmError::Module(
+                "plugin ingress surface is not enabled".to_string(),
+            ));
+        }
+        if serde_json::to_vec(&event)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX)
+            > PLUGIN_WASM_MAX_INPUT_BYTES
+        {
+            return Err(PluginWasmError::Module(format!(
+                "plugin ingress event exceeds {} bytes",
+                PLUGIN_WASM_MAX_INPUT_BYTES
+            )));
+        }
+        self.record
+            .manifest
+            .ingresses
+            .iter()
+            .find(|ingress| ingress.name == ingress_name)
+            .ok_or_else(|| {
+                PluginWasmError::Module(
+                    "requested ingress is not declared by plugin manifest".to_string(),
+                )
+            })?;
+        authorize_plugin_ingress(&self.record, ingress_name).map_err(|error| {
+            PluginWasmError::Module(format!(
+                "plugin ingress permission denied: {}",
+                error.bounded_message()
+            ))
+        })?;
+        match &mut self.runtime {
+            PluginInstanceRuntime::LegacyToolAdapter => Err(PluginWasmError::Module(
+                "legacy tool runtime does not expose ingress dispatch".to_string(),
+            )),
+            #[cfg(test)]
+            PluginInstanceRuntime::TestIngress { calls } => {
+                let output = serde_json::json!({
+                    "ingress": ingress_name,
+                    "kind": event.kind,
+                    "source": event.source,
+                    "calls": *calls,
+                    "payload": event.payload,
+                });
+                Ok(PluginIngressDispatchReport {
+                    plugin_ref: self.record.identity.to_string(),
+                    ingress: ingress_name.to_string(),
+                    accepted: true,
+                    output,
+                    diagnostics: self.diagnostics.clone(),
+                })
+            }
+            PluginInstanceRuntime::ComponentInstance(runtime) => {
+                let output = runtime.handle_ingress(ingress_name, &event)?;
+                Ok(PluginIngressDispatchReport {
+                    plugin_ref: self.record.identity.to_string(),
+                    ingress: ingress_name.to_string(),
+                    accepted: true,
+                    output,
+                    diagnostics: self.diagnostics.clone(),
+                })
+            }
+        }
+    }
+
+    fn stop(&mut self) -> Result<(), PluginWasmError> {
+        match &mut self.runtime {
+            PluginInstanceRuntime::LegacyToolAdapter => {}
+            #[cfg(test)]
+            PluginInstanceRuntime::TestIngress { .. } => {}
+            PluginInstanceRuntime::ComponentInstance(runtime) => {
+                self.component_status = Some(runtime.stop()?);
+            }
+        }
+        self.lifecycle = PluginInstanceLifecycleState::Stopped;
+        Ok(())
+    }
+
+    fn snapshot_status(&self) -> PluginInstanceStatus {
+        PluginInstanceStatus {
+            plugin_ref: self.record.identity.to_string(),
+            lifecycle: self.lifecycle.clone(),
+            component_status: self.component_status.clone(),
+            diagnostics: self.diagnostics.clone(),
+        }
+    }
+
+    fn status(&mut self) -> PluginInstanceStatus {
+        if let PluginInstanceRuntime::ComponentInstance(runtime) = &mut self.runtime {
+            match runtime.status() {
+                Ok(status) => self.component_status = Some(status),
+                Err(error) => {
+                    self.lifecycle = PluginInstanceLifecycleState::Failed;
+                    self.diagnostics.push(PluginInstanceDiagnostic::new(
+                        PluginInstanceLifecycleState::Failed,
+                        format!(
+                            "plugin component status failed: {}",
+                            error.bounded_message()
+                        ),
+                    ));
+                }
+            }
+        }
+        PluginInstanceStatus {
+            plugin_ref: self.record.identity.to_string(),
+            lifecycle: self.lifecycle.clone(),
+            component_status: self.component_status.clone(),
+            diagnostics: self.diagnostics.clone(),
+        }
+    }
+}
+
+enum PluginInstanceRuntime {
+    LegacyToolAdapter,
+    #[cfg(test)]
+    TestIngress {
+        calls: u64,
+    },
+    ComponentInstance(PluginComponentInstanceRuntime),
+}
+
+impl PluginInstanceRuntime {
+    fn new(record: &ResolvedPluginRecord) -> Result<Self, PluginWasmError> {
+        let Some(runtime) = record.manifest.runtime.as_ref() else {
+            return Ok(Self::LegacyToolAdapter);
+        };
+        match runtime.kind.as_str() {
+            #[cfg(test)]
+            "test-ingress" => Ok(Self::TestIngress { calls: 0 }),
+            PLUGIN_RUNTIME_WASM_KIND => Ok(Self::LegacyToolAdapter),
+            PLUGIN_RUNTIME_COMPONENT_KIND
+                if runtime.world.as_deref() == Some(PLUGIN_COMPONENT_INSTANCE_WORLD) =>
+            {
+                Ok(Self::ComponentInstance(
+                    PluginComponentInstanceRuntime::instantiate(record)?,
+                ))
+            }
+            PLUGIN_RUNTIME_COMPONENT_KIND => Ok(Self::LegacyToolAdapter),
+            other => Err(PluginWasmError::Module(format!(
+                "unsupported plugin runtime kind `{other}`"
+            ))),
+        }
+    }
+}
+
+struct PluginComponentInstanceRuntime {
+    store: wasmtime::Store<PluginComponentHostState>,
+    instance: wasmtime::component::Instance,
+}
+
+impl PluginComponentInstanceRuntime {
+    fn instantiate(record: &ResolvedPluginRecord) -> Result<Self, PluginWasmError> {
+        let limits = PluginDiscoveryLimits::default();
+        let component_bytes = read_resolved_plugin_runtime_component(record, &limits)
+            .map_err(|diagnostic| PluginWasmError::Package(diagnostic.message))?;
+        if component_bytes.len() > limits.max_file_size_bytes as usize {
+            return Err(PluginWasmError::Package(format!(
+                "WASM component runtime artifact exceeds {} bytes",
+                limits.max_file_size_bytes
+            )));
+        }
+        let mut config = wasmtime::Config::new();
+        config.wasm_component_model(true);
+        config.consume_fuel(true);
+        config.max_wasm_stack(8 * 1024 * 1024);
+        let engine = wasmtime::Engine::new(&config)
+            .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+        let component =
+            wasmtime::component::Component::new(&engine, &component_bytes).map_err(|error| {
+                PluginWasmError::Module(format!("component is incompatible: {error:?}"))
+            })?;
+        validate_component_imports(record, &engine, &component)?;
+        let mut linker = wasmtime::component::Linker::<PluginComponentHostState>::new(&engine);
+        define_plugin_component_host_imports(&mut linker)?;
+        let mut store = wasmtime::Store::new(
+            &engine,
+            PluginComponentHostState {
+                record: record.clone(),
+                https_client: Arc::new(ReqwestPluginHttpsClient),
+                store_limits: wasm_component_store_limits(),
+            },
+        );
+        store.limiter(|state| &mut state.store_limits);
+        store
+            .set_fuel(PLUGIN_WASM_FUEL)
+            .map_err(|error| PluginWasmError::Execution(error.to_string()))?;
+        let instance = linker
+            .instantiate(&mut store, &component)
+            .map_err(|error| PluginWasmError::Execution(error.to_string()))?;
+        Ok(Self { store, instance })
+    }
+
+    fn reset_fuel(&mut self) -> Result<(), PluginWasmError> {
+        self.store
+            .set_fuel(PLUGIN_WASM_FUEL)
+            .map_err(|error| PluginWasmError::Execution(error.to_string()))
+    }
+
+    fn start(&mut self, record: &ResolvedPluginRecord) -> Result<Value, PluginWasmError> {
+        self.reset_fuel()?;
+        let start = self
+            .instance
+            .get_typed_func::<(&str,), (String,)>(&mut self.store, "start")
+            .map_err(|error| {
+                PluginWasmError::Module(format!(
+                    "component does not export expected `{}` start function: {error}",
+                    PLUGIN_COMPONENT_INSTANCE_WORLD
+                ))
+            })?;
+        let config_json = plugin_config_json(record);
+        let (status,) = start
+            .call(&mut self.store, (&config_json,))
+            .map_err(|error| PluginWasmError::Execution(error.to_string()))?;
+        decode_plugin_lifecycle_output("start", &status)
+    }
+
+    fn handle_tool(
+        &mut self,
+        tool_name: &str,
+        input: Vec<u8>,
+    ) -> Result<ToolOutput, PluginWasmError> {
+        self.reset_fuel()?;
+        let call = self
+            .instance
+            .get_typed_func::<(&str, &str), (String,)>(&mut self.store, "handle-tool")
+            .map_err(|error| {
+                PluginWasmError::Module(format!(
+                    "component does not export expected `{}` handle-tool function: {error}",
+                    PLUGIN_COMPONENT_INSTANCE_WORLD
+                ))
+            })?;
+        let input_json = std::str::from_utf8(&input).map_err(|error| {
+            PluginWasmError::Output(format!("plugin component input is not UTF-8: {error}"))
+        })?;
+        let (output,) = call
+            .call(&mut self.store, (tool_name, input_json))
+            .map_err(|error| PluginWasmError::Execution(error.to_string()))?;
+        decode_plugin_wasm_output(output.as_bytes())
+    }
+
+    fn handle_ingress(
+        &mut self,
+        ingress_name: &str,
+        event: &PluginIngressEvent,
+    ) -> Result<Value, PluginWasmError> {
+        self.reset_fuel()?;
+        let call = self
+            .instance
+            .get_typed_func::<(&str, &str), (String,)>(&mut self.store, "handle-ingress")
+            .map_err(|error| {
+                PluginWasmError::Module(format!(
+                    "component does not export expected `{}` handle-ingress function: {error}",
+                    PLUGIN_COMPONENT_INSTANCE_WORLD
+                ))
+            })?;
+        let event_json = serde_json::to_string(event)
+            .map_err(|error| PluginWasmError::Output(error.to_string()))?;
+        let (output,) = call
+            .call(&mut self.store, (ingress_name, event_json.as_str()))
+            .map_err(|error| PluginWasmError::Execution(error.to_string()))?;
+        if output.len() > PLUGIN_WASM_MAX_OUTPUT_BYTES {
+            return Err(PluginWasmError::Output(format!(
+                "plugin ingress output exceeds {} bytes",
+                PLUGIN_WASM_MAX_OUTPUT_BYTES
+            )));
+        }
+        serde_json::from_str(&output).map_err(|error| {
+            PluginWasmError::Output(format!("plugin ingress output is not JSON: {error}"))
+        })
+    }
+
+    fn stop(&mut self) -> Result<Value, PluginWasmError> {
+        self.reset_fuel()?;
+        let stop = self
+            .instance
+            .get_typed_func::<(), (String,)>(&mut self.store, "stop")
+            .map_err(|error| {
+                PluginWasmError::Module(format!(
+                    "component does not export expected `{}` stop function: {error}",
+                    PLUGIN_COMPONENT_INSTANCE_WORLD
+                ))
+            })?;
+        let (status,) = stop
+            .call(&mut self.store, ())
+            .map_err(|error| PluginWasmError::Execution(error.to_string()))?;
+        decode_plugin_lifecycle_output("stop", &status)
+    }
+
+    fn status(&mut self) -> Result<Value, PluginWasmError> {
+        self.reset_fuel()?;
+        let status = self
+            .instance
+            .get_typed_func::<(), (String,)>(&mut self.store, "status")
+            .map_err(|error| {
+                PluginWasmError::Module(format!(
+                    "component does not export expected `{}` status function: {error}",
+                    PLUGIN_COMPONENT_INSTANCE_WORLD
+                ))
+            })?;
+        let (status,) = status
+            .call(&mut self.store, ())
+            .map_err(|error| PluginWasmError::Execution(error.to_string()))?;
+        decode_plugin_lifecycle_output("status", &status)
+    }
+}
+
+fn decode_plugin_lifecycle_output(phase: &str, output: &str) -> Result<Value, PluginWasmError> {
+    if output.len() > PLUGIN_WASM_MAX_OUTPUT_BYTES {
+        return Err(PluginWasmError::Output(format!(
+            "plugin component {phase} output exceeds {} bytes",
+            PLUGIN_WASM_MAX_OUTPUT_BYTES
+        )));
+    }
+    let value: Value = serde_json::from_str(output).map_err(|error| {
+        PluginWasmError::Output(format!(
+            "plugin component {phase} output is not JSON: {error}"
+        ))
+    })?;
+    if let Some(error) = value.get("error") {
+        return Err(PluginWasmError::Execution(format!(
+            "plugin component {phase} returned error: {}",
+            bounded_message(error.to_string())
+        )));
+    }
+    if value.get("state").and_then(Value::as_str) == Some("failed") {
+        return Err(PluginWasmError::Execution(format!(
+            "plugin component {phase} returned failed status: {}",
+            bounded_message(value.to_string())
+        )));
+    }
+    Ok(value)
+}
+
+fn plugin_config_json(record: &ResolvedPluginRecord) -> String {
+    serde_json::to_string(&record.config).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn plugin_instance_tool_definition(
+    instance: PluginInstanceHandle,
     name: String,
     description: String,
     input_schema: Value,
-    origin: ToolOrigin,
 ) -> ToolDefinition {
+    let origin = {
+        let guard = instance.0.lock().expect("plugin instance poisoned");
+        plugin_tool_origin(&guard.record)
+    };
     Arc::new(move || {
         (
             ToolMeta::new(name.clone())
                 .description(description.clone())
                 .input_schema(input_schema.clone())
                 .origin(origin.clone()),
-            Arc::new(PluginWasmTool {
-                record: record.clone(),
+            Arc::new(PluginInstanceTool {
+                instance: instance.clone(),
                 name: name.clone(),
                 origin: origin.clone(),
             }) as Arc<dyn Tool>,
@@ -1714,12 +2583,77 @@ fn plugin_wasm_tool_definition(
     })
 }
 
+struct PluginInstanceTool {
+    instance: PluginInstanceHandle,
+    name: String,
+    origin: ToolOrigin,
+}
+
+#[async_trait]
+impl Tool for PluginInstanceTool {
+    async fn execute(
+        &self,
+        input_json: &str,
+        _ctx: ToolExecutionContext,
+    ) -> Result<ToolOutput, ToolError> {
+        if input_json.len() > PLUGIN_WASM_MAX_INPUT_BYTES {
+            return Err(ToolError::InvalidArgument(format!(
+                "plugin tool `{}` input exceeds {} bytes",
+                self.name, PLUGIN_WASM_MAX_INPUT_BYTES
+            )));
+        }
+        serde_json::from_str::<Value>(input_json).map_err(|error| {
+            ToolError::InvalidArgument(format!(
+                "plugin tool `{}` input is not valid JSON: {}",
+                self.name,
+                bounded_message(error.to_string())
+            ))
+        })?;
+        let instance = self.instance.clone();
+        let name = self.name.clone();
+        let plugin_ref = self.origin.plugin_ref.clone();
+        let digest = self.origin.digest.clone();
+        let input = input_json.as_bytes().to_vec();
+        let execution = tokio::task::spawn_blocking(move || instance.handle_tool(&name, input));
+        match tokio::time::timeout(PLUGIN_WASM_TIMEOUT, execution).await {
+            Ok(Ok(Ok(output))) => Ok(output),
+            Ok(Ok(Err(error))) => Err(ToolError::ExecutionFailed(format!(
+                "plugin tool `{}` from `{}` (digest {}) failed closed: {}",
+                self.name,
+                plugin_ref,
+                digest,
+                error.bounded_message()
+            ))),
+            Ok(Err(error)) => Err(ToolError::ExecutionFailed(format!(
+                "plugin tool `{}` from `{}` (digest {}) cancelled/failed to join: {}",
+                self.name,
+                plugin_ref,
+                digest,
+                bounded_message(error.to_string())
+            ))),
+            Err(_) => {
+                self.instance
+                    .record_diagnostic(PluginInstanceDiagnostic::new(
+                        PluginInstanceLifecycleState::Failed,
+                        format!("plugin tool timed out after {:?}", PLUGIN_WASM_TIMEOUT),
+                    ));
+                Err(ToolError::ExecutionFailed(format!(
+                    "plugin tool `{}` from `{}` (digest {}) timed out after {:?}",
+                    self.name, plugin_ref, digest, PLUGIN_WASM_TIMEOUT
+                )))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 struct PluginWasmTool {
     record: ResolvedPluginRecord,
     name: String,
     origin: ToolOrigin,
 }
 
+#[cfg(test)]
 #[async_trait]
 impl Tool for PluginWasmTool {
     async fn execute(
@@ -1740,7 +2674,6 @@ impl Tool for PluginWasmTool {
                 bounded_message(error.to_string())
             ))
         })?;
-
         let record = self.record.clone();
         let name = self.name.clone();
         let plugin_ref = self.origin.plugin_ref.clone();
@@ -1772,7 +2705,7 @@ impl Tool for PluginWasmTool {
 }
 
 #[derive(Debug)]
-enum PluginWasmError {
+pub enum PluginWasmError {
     Package(String),
     Module(String),
     Execution(String),
@@ -2812,6 +3745,8 @@ mod tests {
                 runtime: None,
                 hooks: Vec::new(),
                 tools,
+                services: Vec::new(),
+                ingresses: Vec::new(),
                 permissions: permissions.clone(),
             },
             enabled_surfaces: vec![PluginSurface::Tool],
@@ -2835,6 +3770,304 @@ mod tests {
                 .map(|tool| PluginPermission::tool(tool.name.clone())),
         );
         permissions
+    }
+
+    fn install_feature(
+        feature: PluginToolFeature,
+    ) -> (
+        super::super::FeatureRegistryInstallReport,
+        Vec<ToolDefinition>,
+    ) {
+        let mut pending = Vec::new();
+        let mut hooks = crate::hook::HookRegistryBuilder::new();
+        let report = super::super::FeatureRegistryBuilder::default()
+            .with_module(feature)
+            .install_into_pending(&mut pending, &mut hooks);
+        (report, pending)
+    }
+
+    #[test]
+    fn component_lifecycle_rejects_start_error_status() {
+        let component = component_instance_with_outputs(
+            br#"{"error":{"message":"boom"}}"#,
+            br#"{"state":"ready"}"#,
+            br#"{"state":"stopped"}"#,
+            br#"{"summary":"tool"}"#,
+            br#"{"accepted":true}"#,
+        );
+        let (_dir, mut record) = resolved_record_with_component(component);
+        record.manifest.runtime.as_mut().unwrap().world =
+            Some(PLUGIN_COMPONENT_INSTANCE_WORLD.into());
+        let error = match PluginInstanceHandle::new(record) {
+            Ok(_) => panic!("component start error should fail instance creation"),
+            Err(error) => error,
+        };
+        assert!(error.bounded_message().contains("start returned error"));
+    }
+
+    #[test]
+    fn component_lifecycle_reports_status_and_stop_outputs() {
+        let component = component_instance_with_outputs(
+            br#"{"state":"ready","data":{"phase":"start"}}"#,
+            br#"{"state":"ready","data":{"phase":"status"}}"#,
+            br#"{"state":"stopped","data":{"phase":"stop"}}"#,
+            br#"{"summary":"tool"}"#,
+            br#"{"accepted":true}"#,
+        );
+        let (_dir, mut record) = resolved_record_with_component(component);
+        record.manifest.runtime.as_mut().unwrap().world =
+            Some(PLUGIN_COMPONENT_INSTANCE_WORLD.into());
+        let handle = PluginInstanceHandle::new(record).unwrap();
+        let status = handle.status();
+        assert_eq!(status.lifecycle, PluginInstanceLifecycleState::Started);
+        assert_eq!(status.component_status.unwrap()["data"]["phase"], "status");
+        let stopped = handle.stop().unwrap();
+        assert_eq!(stopped.lifecycle, PluginInstanceLifecycleState::Stopped);
+        assert_eq!(stopped.component_status.unwrap()["data"]["phase"], "stop");
+    }
+
+    fn add_service(record: &mut ResolvedPluginRecord, name: &str) {
+        record.manifest.surfaces.push(PluginSurface::Service);
+        record.enabled_surfaces.push(PluginSurface::Service);
+        record
+            .manifest
+            .services
+            .push(manifest::plugin::PluginServiceManifest {
+                name: name.into(),
+                description: "test service".into(),
+                lifecycle: "host-managed".into(),
+                status_schema: None,
+                side_effects: Vec::new(),
+            });
+        record
+            .manifest
+            .permissions
+            .push(PluginPermission::surface(PluginSurface::Service));
+        record
+            .manifest
+            .permissions
+            .push(PluginPermission::service(name));
+        record
+            .grants
+            .permissions
+            .push(PluginPermission::surface(PluginSurface::Service));
+        record
+            .grants
+            .permissions
+            .push(PluginPermission::service(name));
+    }
+
+    fn add_ingress(record: &mut ResolvedPluginRecord, name: &str) {
+        record.manifest.surfaces.push(PluginSurface::Ingress);
+        record.enabled_surfaces.push(PluginSurface::Ingress);
+        record
+            .manifest
+            .ingresses
+            .push(manifest::plugin::PluginIngressManifest {
+                name: name.into(),
+                description: "test ingress".into(),
+                event_kinds: vec!["test".into()],
+                input_schema: None,
+                sources: Vec::new(),
+                side_effects: Vec::new(),
+            });
+        record
+            .manifest
+            .permissions
+            .push(PluginPermission::surface(PluginSurface::Ingress));
+        record
+            .manifest
+            .permissions
+            .push(PluginPermission::ingress(name));
+        record
+            .grants
+            .permissions
+            .push(PluginPermission::surface(PluginSurface::Ingress));
+        record
+            .grants
+            .permissions
+            .push(PluginPermission::ingress(name));
+    }
+
+    #[test]
+    fn service_selected_ignores_unselected_tool_without_grants() {
+        let mut record = record(vec![tool("hidden_tool")]);
+        add_service(&mut record, "svc");
+        record.enabled_surfaces = vec![PluginSurface::Service];
+        record.manifest.permissions = vec![
+            PluginPermission::surface(PluginSurface::Service),
+            PluginPermission::service("svc"),
+        ];
+        record.grants.permissions = record.manifest.permissions.clone();
+        let feature = PluginToolFeature::new(record);
+        assert!(feature.descriptor().tools.is_empty());
+        assert_eq!(feature.descriptor().provides_services.len(), 1);
+        let (report, pending) = install_feature(feature.clone());
+        assert!(
+            report.reports.iter().all(|report| report.installed),
+            "{report:#?}"
+        );
+        assert!(pending.is_empty(), "unselected Tool must not register");
+        assert_eq!(report.reports[0].provided_services.len(), 1);
+        assert_eq!(
+            feature.instance_status().unwrap().lifecycle,
+            PluginInstanceLifecycleState::Ready
+        );
+    }
+
+    #[test]
+    fn tool_selected_ignores_unselected_service_ingress_even_with_grants() {
+        let mut record = record(vec![tool("visible_tool")]);
+        add_service(&mut record, "hidden_service");
+        add_ingress(&mut record, "hidden_ingress");
+        record.enabled_surfaces = vec![PluginSurface::Tool];
+        let feature = PluginToolFeature::new(record);
+        assert!(feature.descriptor().provides_services.is_empty());
+        assert_eq!(feature.descriptor().tools.len(), 1);
+        let (report, pending) = install_feature(feature.clone());
+        assert!(
+            report.reports.iter().all(|report| report.installed),
+            "{report:#?}"
+        );
+        assert_eq!(pending.len(), 1);
+        assert!(report.reports[0].provided_services.is_empty());
+        let dispatch = feature.dispatch_ingress(
+            "hidden_ingress",
+            PluginIngressEvent {
+                kind: "test".into(),
+                source: "unit".into(),
+                payload: serde_json::json!({}),
+            },
+        );
+        assert!(
+            dispatch
+                .unwrap_err()
+                .bounded_message()
+                .contains("not enabled")
+        );
+    }
+
+    #[test]
+    fn service_only_install_retains_host_managed_instance() {
+        let mut record = record(Vec::new());
+        add_service(&mut record, "svc");
+        record.manifest.runtime = Some(manifest::plugin::PluginRuntimeManifest {
+            kind: "test-ingress".into(),
+            entry: None,
+            abi: None,
+            component: None,
+            world: Some(PLUGIN_COMPONENT_INSTANCE_WORLD.into()),
+        });
+        let feature = PluginToolFeature::new(record);
+        let (report, _pending) = install_feature(feature.clone());
+        assert!(
+            report.reports.iter().all(|report| report.installed),
+            "{report:#?}"
+        );
+        let status = feature.instance_status().expect("service instance started");
+        assert_eq!(status.lifecycle, PluginInstanceLifecycleState::Started);
+    }
+
+    #[test]
+    fn installed_ingress_dispatch_uses_retained_shared_instance() {
+        let mut record = record(vec![tool("shared_tool")]);
+        add_ingress(&mut record, "shared_ingress");
+        record.manifest.runtime = Some(manifest::plugin::PluginRuntimeManifest {
+            kind: "test-ingress".into(),
+            entry: None,
+            abi: None,
+            component: None,
+            world: Some(PLUGIN_COMPONENT_INSTANCE_WORLD.into()),
+        });
+        let feature = PluginToolFeature::new(record);
+        let (report, pending) = install_feature(feature.clone());
+        assert!(
+            report.reports.iter().all(|report| report.installed),
+            "{report:#?}"
+        );
+        let (_meta, tool) = pending
+            .into_iter()
+            .map(|definition| definition())
+            .find(|(meta, _tool)| meta.name == "shared_tool")
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let output = runtime
+            .block_on(tool.execute(r#"{"first":true}"#, ToolExecutionContext::default()))
+            .unwrap();
+        assert!(output.summary.contains("shared_tool"));
+        let report = feature
+            .dispatch_ingress(
+                "shared_ingress",
+                PluginIngressEvent {
+                    kind: "test".into(),
+                    source: "unit".into(),
+                    payload: serde_json::json!({ "hello": "world" }),
+                },
+            )
+            .unwrap();
+        assert!(report.accepted);
+        assert_eq!(report.output["calls"], 1);
+    }
+
+    #[test]
+    fn instance_ingress_dispatch_uses_shared_in_process_instance() {
+        let mut record = record(vec![tool("shared_tool")]);
+        record.manifest.surfaces.push(PluginSurface::Ingress);
+        record.enabled_surfaces.push(PluginSurface::Ingress);
+        record
+            .manifest
+            .ingresses
+            .push(manifest::plugin::PluginIngressManifest {
+                name: "shared_ingress".into(),
+                description: "test ingress".into(),
+                event_kinds: vec!["test".into()],
+                input_schema: None,
+                sources: Vec::new(),
+                side_effects: Vec::new(),
+            });
+        record
+            .manifest
+            .permissions
+            .push(PluginPermission::surface(PluginSurface::Ingress));
+        record
+            .manifest
+            .permissions
+            .push(PluginPermission::ingress("shared_ingress"));
+        record
+            .grants
+            .permissions
+            .push(PluginPermission::surface(PluginSurface::Ingress));
+        record
+            .grants
+            .permissions
+            .push(PluginPermission::ingress("shared_ingress"));
+        let handle = PluginInstanceHandle(Arc::new(Mutex::new(PluginInstance {
+            record,
+            runtime: PluginInstanceRuntime::TestIngress { calls: 0 },
+            lifecycle: PluginInstanceLifecycleState::Started,
+            component_status: None,
+            diagnostics: Vec::new(),
+        })));
+
+        let _tool = handle
+            .handle_tool("shared_tool", br#"{"first":true}"#.to_vec())
+            .unwrap();
+        let report = handle
+            .deliver_ingress(
+                "shared_ingress",
+                PluginIngressEvent {
+                    kind: "test".into(),
+                    source: "unit".into(),
+                    payload: serde_json::json!({ "hello": "world" }),
+                },
+            )
+            .unwrap();
+        assert!(report.accepted);
+        assert_eq!(report.output["calls"], 1);
+        assert_eq!(report.output["ingress"], "shared_ingress");
     }
 
     fn skipped_count(report: &super::super::FeatureRegistryInstallReport) -> usize {
@@ -4099,6 +5332,81 @@ input_schema = {{ type = "object", additionalProperties = true }}
             fs: Vec::new(),
         };
         (dir, record)
+    }
+
+    fn component_instance_with_outputs(
+        start: &[u8],
+        status: &[u8],
+        stop: &[u8],
+        tool: &[u8],
+        ingress: &[u8],
+    ) -> Vec<u8> {
+        wat::parse_str(format!(
+            r#"(component
+              (core module $m
+                (memory (export "memory") 1)
+                (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+                  (if (result i32) (i32.eqz (local.get 0))
+                    (then (i32.const 8192))
+                    (else (local.get 0))))
+                (data (i32.const 1024) "{}")
+                (data (i32.const 2048) "{}")
+                (data (i32.const 3072) "{}")
+                (data (i32.const 4096) "{}")
+                (data (i32.const 5120) "{}")
+                (func $write (param i32 i32)
+                  (i32.store (i32.const 6144) (local.get 0))
+                  (i32.store (i32.const 6148) (local.get 1)))
+                (func (export "start") (param i32 i32) (result i32)
+                  (call $write (i32.const 1024) (i32.const {}))
+                  (i32.const 6144))
+                (func (export "status") (result i32)
+                  (call $write (i32.const 2048) (i32.const {}))
+                  (i32.const 6144))
+                (func (export "stop") (result i32)
+                  (call $write (i32.const 3072) (i32.const {}))
+                  (i32.const 6144))
+                (func (export "tool") (param i32 i32 i32 i32) (result i32)
+                  (call $write (i32.const 4096) (i32.const {}))
+                  (i32.const 6144))
+                (func (export "ingress") (param i32 i32 i32 i32) (result i32)
+                  (call $write (i32.const 5120) (i32.const {}))
+                  (i32.const 6144))
+              )
+              (core instance $i (instantiate $m))
+              (alias core export $i "memory" (core memory $mem))
+              (alias core export $i "realloc" (core func $realloc))
+              (alias core export $i "start" (core func $start_core))
+              (alias core export $i "status" (core func $status_core))
+              (alias core export $i "stop" (core func $stop_core))
+              (alias core export $i "tool" (core func $tool_core))
+              (alias core export $i "ingress" (core func $ingress_core))
+              (type $start_ty (func (param "config-json" string) (result string)))
+              (type $noarg_ty (func (result string)))
+              (type $twoarg_ty (func (param "name" string) (param "json" string) (result string)))
+              (func $start (type $start_ty) (canon lift (core func $start_core) (memory $mem) (realloc $realloc) string-encoding=utf8))
+              (func $status (type $noarg_ty) (canon lift (core func $status_core) (memory $mem) (realloc $realloc) string-encoding=utf8))
+              (func $stop (type $noarg_ty) (canon lift (core func $stop_core) (memory $mem) (realloc $realloc) string-encoding=utf8))
+              (func $tool (type $twoarg_ty) (canon lift (core func $tool_core) (memory $mem) (realloc $realloc) string-encoding=utf8))
+              (func $ingress (type $twoarg_ty) (canon lift (core func $ingress_core) (memory $mem) (realloc $realloc) string-encoding=utf8))
+              (export "start" (func $start))
+              (export "status" (func $status))
+              (export "stop" (func $stop))
+              (export "handle-tool" (func $tool))
+              (export "handle-ingress" (func $ingress))
+            )"#,
+            wat_bytes(start),
+            wat_bytes(status),
+            wat_bytes(stop),
+            wat_bytes(tool),
+            wat_bytes(ingress),
+            start.len(),
+            status.len(),
+            stop.len(),
+            tool.len(),
+            ingress.len(),
+        ))
+        .unwrap()
     }
 
     fn component_tool_that_returns(output: &[u8]) -> Vec<u8> {

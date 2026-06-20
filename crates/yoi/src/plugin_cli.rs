@@ -329,6 +329,24 @@ fn static_inspection_diagnostics(
             });
         }
     }
+    for service in &inspection.services {
+        if let Some(message) = &service.diagnostic {
+            diagnostics.push(PluginDiagnosticReport {
+                kind: "grant".to_string(),
+                phase: "resolution".to_string(),
+                message: bound_text(format!("service `{}`: {message}", service.name)),
+            });
+        }
+    }
+    for ingress in &inspection.ingresses {
+        if let Some(message) = &ingress.diagnostic {
+            diagnostics.push(PluginDiagnosticReport {
+                kind: "grant".to_string(),
+                phase: "resolution".to_string(),
+                message: bound_text(format!("ingress `{}`: {message}", ingress.name)),
+            });
+        }
+    }
     diagnostics
 }
 
@@ -1072,6 +1090,18 @@ fn fill_resolved(builder: &mut ItemBuilder, resolved: &ResolvedPlugin) {
                 .iter()
                 .filter_map(|tool| tool.diagnostic.as_ref()),
         )
+        .chain(
+            static_runtime
+                .services
+                .iter()
+                .filter_map(|service| service.diagnostic.as_ref()),
+        )
+        .chain(
+            static_runtime
+                .ingresses
+                .iter()
+                .filter_map(|ingress| ingress.diagnostic.as_ref()),
+        )
     {
         builder.diagnostics.push(DiagnosticSummary {
             kind: "static_eligibility".to_string(),
@@ -1471,6 +1501,58 @@ mod tests {
         assert!(show.contains("package_path:"));
         assert!(show.contains("echo.yoi-plugin"));
         assert!(show.contains("configured_grants: surfaces.tool, tool.Echo"));
+    }
+
+    #[test]
+    fn service_only_enablement_ignores_unselected_tool_static_grants() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let digest = write_mixed_tool_service_package(workspace, "mixed");
+        let mut config = PluginConfig::default();
+        config.enabled.push(PluginEnablementConfig {
+            id: "project:mixed".to_string(),
+            digest: Some(digest.clone()),
+            version: Some(PluginExactVersion("0.1.0".to_string())),
+            surfaces: vec![PluginSurface::Service],
+            grants: PluginGrantConfig {
+                id: Some("project:mixed".to_string()),
+                version: Some(PluginExactVersion("0.1.0".to_string())),
+                digest: Some(digest),
+                permissions: vec![
+                    PluginPermission::surface(PluginSurface::Service),
+                    PluginPermission::service("svc"),
+                ],
+                https: Vec::new(),
+                fs: Vec::new(),
+            },
+            config: None,
+        });
+
+        let snapshot = inspect_snapshot(workspace, &config);
+        let item = select_item(&snapshot, "project:mixed").unwrap();
+
+        assert_eq!(item.status, "active");
+        assert!(item.static_eligible);
+        assert_eq!(item.enabled_surfaces, vec!["service"]);
+        assert!(
+            item.tools.is_empty(),
+            "unselected Tool must not be reported"
+        );
+        assert!(
+            item.diagnostics
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("tool.Echo")),
+            "unselected Tool grant diagnostics must not affect service-only enablement: {:#?}",
+            item.diagnostics
+        );
+
+        let show_json = serde_json::to_value(item).unwrap();
+        assert_eq!(show_json["status"], "active");
+        assert_eq!(
+            show_json["enabled_surfaces"],
+            serde_json::json!(["service"])
+        );
+        assert_eq!(show_json["tools"], serde_json::json!([]));
     }
 
     #[test]
@@ -2078,6 +2160,61 @@ mod tests {
 
         assert!(error.contains("ambiguous"));
         assert!(error.len() < 160);
+    }
+
+    fn write_mixed_tool_service_package(workspace: &Path, id: &str) -> String {
+        let package_dir = workspace.join(".yoi/plugins");
+        fs::create_dir_all(&package_dir).unwrap();
+        let package = package_dir.join(format!("{id}.yoi-plugin"));
+        let manifest = format!(
+            r#"schema_version = 1
+id = "{id}"
+name = "{id}"
+version = "0.1.0"
+description = "mixed surface package"
+surfaces = ["tool", "service"]
+permissions = [
+  {{ kind = "surface", surface = "tool" }},
+  {{ kind = "tool", name = "Echo" }},
+  {{ kind = "surface", surface = "service" }},
+  {{ kind = "service", name = "svc" }},
+]
+
+[runtime]
+kind = "wasm-component"
+world = "yoi:plugin/instance@1.0.0"
+component = "plugin.component.wasm"
+
+[[tools]]
+name = "Echo"
+description = "unselected tool"
+input_schema = {{ type = "object" }}
+
+[[services]]
+name = "svc"
+description = "selected service"
+lifecycle = "host-managed"
+"#,
+        );
+        write_stored_zip(
+            &package,
+            &[
+                ("plugin.toml", manifest.as_bytes()),
+                ("plugin.component.wasm", b"placeholder component bytes"),
+            ],
+        );
+        let discovery = discover_plugins(&PluginDiscoveryOptions {
+            workspace_root: workspace.to_path_buf(),
+            user_data_home: None,
+            limits: PluginDiscoveryLimits::default(),
+        });
+        discovery
+            .packages
+            .iter()
+            .find(|package| package.identity.local_id == id)
+            .unwrap()
+            .digest
+            .clone()
     }
 
     fn inspect_snapshot(workspace: &Path, config: &PluginConfig) -> PluginInspectionSnapshot {

@@ -5375,6 +5375,8 @@ permission = "read"
                 runtime: None,
                 hooks: vec![],
                 tools: vec![],
+                services: vec![],
+                ingresses: vec![],
                 permissions: vec![],
             },
             enabled_surfaces: vec![manifest::plugin::PluginSurface::Hook],
