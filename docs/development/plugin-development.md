@@ -2,13 +2,30 @@
 
 This guide is for building a Yoi Plugin outside the Yoi runtime codebase. It describes the current Plugin package shape, how to author a Tool Plugin, how to enable it in a workspace, and how to inspect/debug it.
 
-Yoi Plugins are intentionally explicit:
+Yoi Plugins are intentionally explicit. The Plugin system is designed around the following host-side principles:
 
-- putting a package in `.yoi/plugins` only makes it discoverable;
-- a Profile/config entry must explicitly enable it;
-- Plugin grants must allow its surfaces and host APIs;
+- package discovery is inventory only; putting a package in `.yoi/plugins` does not enable, register, or execute it;
+- a Profile/config entry must explicitly enable each Plugin package by source-qualified id, version, and digest;
+- Plugin grants must allow each surface and host API before registration or execution can use it;
 - Plugin code runs only through the configured sandbox runtime;
-- Tool calls and Tool results use the ordinary Yoi Tool/Worker history path.
+- Plugin packages do not inherit Pod workspace filesystem, network, environment, or Ticket authority;
+- Tool calls and Tool results use the ordinary Yoi Tool/Worker history path;
+- Plugin metadata, output, and diagnostics are untrusted unless Yoi host policy says otherwise.
+
+## Design intent
+
+Yoi's Plugin platform is meant to make extension behavior reviewable before it becomes model-visible. A Plugin package should answer four separate questions:
+
+1. **What is this package?** `plugin.toml` declares identity, version, runtime, surfaces, requested permissions, and Tool schemas.
+2. **Is it enabled here?** Workspace/Profile config chooses exact package refs and pinned digests.
+3. **What may it do?** Plugin grants authorize Tool surfaces and host APIs such as `https` and `fs`.
+4. **How does it interact with the model?** Tool schemas/results enter through ordinary ToolRegistry and Tool history paths.
+
+Keep these layers separate when designing a Plugin. Do not make package discovery imply enablement. Do not make SDK/PDK convenience imply authority. Do not treat Rust helper APIs or host API wrappers as permission grants. The host always re-checks authority at registration/execution/API-call boundaries.
+
+Yoi's preferred Plugin shape is **Tool first**. A good Tool Plugin has a narrow schema, deterministic input/output behavior, explicit side-effect metadata, and a minimal grant set. Long-running services, inbound events, and autonomous routing are future Service/Ingress work; they should not be hidden inside a Tool package.
+
+Component Model authoring is the preferred path for new Plugins. The raw core-Wasm ABI exists for compatibility and tests, but authors should use the Rust PDK/template unless they are deliberately testing the low-level runtime.
 
 ## Current status
 
@@ -30,7 +47,7 @@ Still intentionally separate/future work:
 
 - multi-language SDK/PDK crates;
 - Service / Ingress surfaces;
-- WebSocket or inbound HTTP for bidirectional bridges;
+- WebSocket or inbound HTTP for bidirectional external event integrations;
 - public registry/install/update/signature tooling.
 
 ## Package locations
@@ -85,6 +102,29 @@ yoi plugin pack ./my-plugin --output ./my-plugin.yoi-plugin --json
 
 `pack` rejects malformed manifests, missing runtime artifacts, symlinks/root escapes, and unsupported package shapes. The JSON output contains the stable package reference, output path, digest, entries, and safety flags. After review, copy the package to `.yoi/plugins/` (or the user Plugin store) and add explicit Profile/config enablement with pinned digest and grants; packing and checking do not do this for you.
 
+## Designing a Plugin
+
+Design a Plugin around the smallest reviewable contract that is useful to the model.
+
+For Tool Plugins:
+
+- expose one clear operation per Tool name;
+- keep the input schema narrow and explicit;
+- make side effects visible in the Tool name, description, and `external_write` / permission metadata;
+- request only the host APIs needed for that Tool;
+- prefer deterministic, structured output over conversational prose;
+- return bounded summaries and content that are useful as Tool results;
+- avoid hiding long workflows, background daemons, or inbound event handling inside a Tool call.
+
+A Tool should be a capability the model may choose to call, not a second agent runtime. If the desired behavior needs a long-lived connection, incoming events, or autonomous routing, treat that as future Service/Ingress design rather than stretching the Tool surface.
+
+Design package permissions as a review surface. A reviewer should be able to read `plugin.toml` plus the enablement grants and understand:
+
+- what Tools become model-visible;
+- what external side effects are possible;
+- what hosts or paths can be touched;
+- what data can flow back into ordinary Tool results.
+
 ## Manifest: `plugin.toml`
 
 A minimal Component Model Tool Plugin manifest looks like this:
@@ -123,42 +163,38 @@ abi = "yoi-plugin-wasm-1"
 
 Do not rely on package presence to activate anything. Discovery only records inventory.
 
-## Component Model + Rust PDK authoring
+## Rust PDK authoring
 
-Component Model authoring with `yoi-plugin-pdk` is the preferred path for new Tool Plugins. The raw core-Wasm ABI remains available only as compatibility/transitional runtime support.
+Rust authoring with `yoi-plugin-pdk` is the preferred path for new Tool Plugins. The raw core-Wasm ABI remains available only as compatibility/transitional runtime support.
 
-Yoi's Component Model Tool world is stored in `resources/plugin/wit/`. The embedded Rust starter template is available as data in the Yoi source tree at:
+Create a starter with:
 
-```text
-resources/plugin/templates/rust-component-tool/
+```bash
+yoi plugin new rust-component-tool ./my-plugin
 ```
 
-It contains:
+The generated package contains:
 
 - `Cargo.toml` with a checkout-local `yoi-plugin-pdk` path dependency;
-- `src/lib.rs` with WIT binding generation and typed JSON Tool handling;
-- `plugin.toml` targeting `kind = "wasm-component"` and `world = "yoi:plugin/tool@1.0.0"`;
-- README next steps and the future out-of-tree pinned git `rev` dependency pattern.
+- `src/lib.rs` with the runtime binding setup and typed JSON Tool handling;
+- `plugin.toml` targeting `kind = "wasm-component"`;
+- README next steps and the out-of-tree pinned git `rev` dependency pattern.
 
-A minimal PDK-backed Rust sketch is also available at:
+For an independent Plugin repository, replace the checkout-local path dependency with a pinned Yoi source revision. Use the repository root `.git` URL, not the browser `/src/branch/...` URL, and pin `rev` instead of tracking a moving branch:
 
-```text
-docs/examples/plugin-component-tool/lib.rs
+```toml
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+yoi-plugin-pdk = { git = "https://gitea.hareworks.net/Hare/yoi.git", package = "yoi-plugin-pdk", rev = "<pinned-yoi-commit-sha>" }
 ```
+
+As a Plugin author, treat the generated binding setup as template code. Edit the typed input/output structs and handler function rather than hand-writing runtime ABI glue.
 
 The important authoring shape is:
 
 ```rust
 use serde::{Deserialize, Serialize};
-use yoi_plugin_pdk::wit_bindgen;
 use yoi_plugin_pdk::{ToolContext, ToolError, ToolOutput};
-
-wit_bindgen::generate!({
-    world: "tool",
-    path: "../../../resources/plugin/wit",
-    generate_all,
-    runtime_path: "yoi_plugin_pdk::wit_bindgen::rt",
-});
 
 #[derive(Deserialize)]
 struct EchoInput {
@@ -184,11 +220,11 @@ fn handle_echo(ctx: ToolContext, input: EchoInput) -> Result<ToolOutput, ToolErr
 yoi_plugin_pdk::export_component_tool!(Plugin, handle_echo);
 ```
 
-`run_json_tool` parses the WIT `input-json` string into a typed input, passes a `ToolContext` containing the selected Tool name, and serializes `ToolOutput` JSON accepted by the current component runtime. `ToolError` values are structured and bounded, then rendered through the ordinary Tool result path; the component cannot inject hidden context.
+The PDK parses the runtime input string into a typed Rust value, passes a `ToolContext` containing the selected Tool name, and serializes `ToolOutput` JSON accepted by the current component runtime. `ToolError` values are structured and bounded, then rendered through the ordinary Tool result path; the component cannot inject hidden context.
 
-The PDK is guest-side only. It does not depend on Yoi host/runtime crates and does not grant filesystem, network, or environment authority. Host-side Plugin manifests and explicit enablement grants remain the authority boundary for Tool execution and for WIT host APIs such as `yoi:host/https` and `yoi:host/fs`.
+The PDK is guest-side only. It does not depend on Yoi host/runtime crates and does not grant filesystem, network, or environment authority. Host-side Plugin manifests and explicit enablement grants remain the authority boundary for Tool execution and for host APIs such as `https` and `fs`.
 
-The exact component build pipeline depends on the authoring toolchain (`wit-bindgen`, component adapter tooling, etc.). Crates.io publication, remote template fetching, and `yoi plugin new/check/pack` are intentionally deferred. Until they exist, Plugin authors should treat the template/example as the ABI contract sketch and use `yoi plugin list/show` plus focused runtime tests to verify packages.
+The expected authoring flow is Rust-first: generate the starter, edit `src/lib.rs`, replace the local path dependency with a pinned `git` + `rev` dependency when the Plugin lives outside the Yoi checkout, build the Rust component artifact for `plugin.component.wasm`, run `yoi plugin check`, then `yoi plugin pack`. Crates.io publication and remote template fetching are intentionally deferred. Use `yoi plugin list/show` to inspect the packaged/enabled state before trying to execute the Tool.
 
 ## Enabling a Plugin in a workspace
 
@@ -260,7 +296,7 @@ partial   usable package with some rejected surfaces/tools
 
 ## `https` host API
 
-The `https` host API is outbound-only and grant-gated. It is meant for Tool calls such as webhook posting or REST requests. It is not a WebSocket/Gateway or inbound HTTP bridge.
+The `https` host API is outbound-only and grant-gated. It is meant for Tool calls such as JSON POSTs or REST requests. It is not a WebSocket/Gateway or inbound HTTP surface.
 
 Manifest permissions should request `host_api.https` in addition to the Tool permissions. Enablement grants must then allow the API and constrain hosts/methods.
 
@@ -270,14 +306,14 @@ Example grant shape:
 [plugins.enabled.grants]
 permissions = [
   { kind = "surface", surface = "tool" },
-  { kind = "tool", name = "discord_post" },
+  { kind = "tool", name = "http_post_json" },
   { kind = "host_api", api = "https" },
 ]
 
 [[plugins.enabled.grants.https]]
-host = "discord.com"
+host = "api.example.com"
 methods = ["POST"]
-path_prefixes = ["/api/webhooks/"]
+path_prefixes = ["/v1/"]
 ```
 
 Yoi rejects `http://`, localhost/private/link-local targets, disallowed hosts/methods, oversize requests/responses, and missing grants. Credentials must come from explicit config/secret references, not ambient environment variables.
@@ -302,22 +338,6 @@ operations = ["read", "list"]
 ```
 
 Yoi normalizes paths, rejects `..` traversal, rejects symlink/root escapes, and applies read/write/list bounds. Diagnostics must not include file contents.
-
-## Outbound vs bridge integrations
-
-After `https`, an outbound Discord webhook Tool is feasible:
-
-```text
-Yoi Tool call -> Plugin Tool -> yoi:host/https -> Discord REST/webhook
-```
-
-A bidirectional Discord bridge is different. It needs a Service surface plus Ingress and either WebSocket/Gateway support or inbound HTTP interactions:
-
-```text
-Discord Gateway/Webhook -> Plugin Service/Ingress -> host routing policy -> notify/run/drop/diagnostic
-```
-
-Do not model bidirectional bridge work as an `https` Tool alone.
 
 ## Development checklist
 

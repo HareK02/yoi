@@ -16,6 +16,6 @@ crate-type = ["cdylib"]
 serde = { version = "1.0", features = ["derive"] }
 yoi-plugin-pdk = { path = "../../../../crates/plugin-pdk" }
 
-# Future out-of-tree Plugin packages should pin the Yoi revision instead of
-# relying on crates.io publication or remote template fetching, for example:
-# yoi-plugin-pdk = { git = "https://github.com/example/yoi.git", package = "yoi-plugin-pdk", rev = "<pinned-yoi-revision>" }
+# Out-of-tree Plugin packages should replace the local path with a pinned
+# Yoi source revision. Use rev, not branch, for reproducible builds:
+# yoi-plugin-pdk = { git = "https://gitea.hareworks.net/Hare/yoi.git", package = "yoi-plugin-pdk", rev = "<pinned-yoi-commit-sha>" }
