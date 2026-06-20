@@ -180,3 +180,16 @@ Next action:
 - Dispatch Reviewer for r1 review against Ticket requirements, with focus on behavior preservation, `yoi panel` command preservation/no alias, Dashboard/Console/TUI terminology, entrypoint/module boundary, large-file split quality, tests, and whether changed prompt/help wording is appropriate。
 
 ---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-20T09:14:08Z -->
+
+## Plan
+
+Review dispatch:
+- Spawned Reviewer Pod `yoi-reviewer-00001KVHX0WBE-r1` against implementation branch `impl/00001KVHX0WBE-dashboard-console-tui-boundary`。
+- Review target commit: `5415a947 tui: introduce dashboard console boundaries`。
+- Review baseline: `7e35721a`。
+- Reviewer task focuses on behavior preservation, `yoi panel` command preservation / no `yoi dashboard` alias, Dashboard/Console/TUI terminology, entrypoint/module boundaries, large-file split quality, prompt/help/doc wording, tests, and package/source-filter impact。
+- Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
+
+---
