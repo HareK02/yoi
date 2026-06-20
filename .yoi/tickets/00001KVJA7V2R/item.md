@@ -1,8 +1,8 @@
 ---
 title: 'WebFetch: PDF を page-delimited text として取得できるようにする'
-state: 'inprogress'
+state: 'done'
 created_at: '2026-06-20T10:46:48Z'
-updated_at: '2026-06-20T12:28:18Z'
+updated_at: '2026-06-20T12:31:02Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['security', 'dependency', 'public-api', 'output-bounds']

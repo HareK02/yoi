@@ -215,3 +215,44 @@ Reviewer validation:
 Worktree status at review end: source tree clean; ignored `target/` only。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T12:30:53Z -->
+
+## Implementation report
+
+Merge and final validation report:
+
+Merged implementation branch into Orchestrator branch:
+- Merge commit: `97edfe8a merge: webfetch pdf text`
+- Implementation commit included:
+  - `b1af95ad web: fetch pdf text by pages`
+
+Reviewer outcome:
+- r1 approved with no blocking issues。
+- Reviewer confirmed WebFetch safety pipeline preservation, exact `application/pdf` handling only, no extension/octet-stream guessing, PDF binary path separation, `pdf_text_by_pages` metadata, output truncation, unsupported binary rejection, existing HTML metadata preservation, and no Poppler/Pdfium/subprocess/OCR runtime dependency。
+
+Orchestrator validation after merge passed:
+- `cargo fmt --check`
+- `git diff --check HEAD^1..HEAD`
+- `cargo test -p tools web`
+- `cargo check -p tools`
+- `cargo tree -p pdf-extract`
+- `nix build .#yoi --no-link`
+- `nix path-info -S .#yoi`: `115259736`
+
+Validation log:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/bash-z7rcEU.log`
+
+Final state:
+- Orchestrator worktree clean at `97edfe8a` after validation。
+- Implementation worktree remains available for cleanup after Ticket completion records are committed。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-20T12:31:02Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Implementation was merged into Orchestrator branch at `97edfe8a`, review approved, and final Orchestrator validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p tools web`, `cargo check -p tools`, `cargo tree -p pdf-extract`, and `nix build .#yoi --no-link`.
+
+---
