@@ -92,3 +92,19 @@ Next action:
 User explicitly authorized parallel implementation when no blocker exists. Ticket body/thread, relation metadata, closed MCP tool-registration dependency, Orchestrator worktree state, visible Pods, existing branch/worktree, and bounded MCP tools/call context were checked. Dependency `00001KVHR3WS6` is closed, no matching worktree/branch exists, and no missing planning decision was found. Accepting this queued Ticket for parallel implementation before worktree/Pod side effects.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T08:49:21Z -->
+
+## Implementation report
+
+Implementation orchestration start:
+- User explicitly authorized parallel work for Tickets without blockers。
+- Acceptance records were committed on Orchestrator branch: `92432ad7 ticket: accept mcp tools call`。
+- Created implementation worktree `/home/hare/Projects/yoi/.worktree/00001KVHR3WSD-mcp-tools-call` on branch `impl/00001KVHR3WSD-mcp-tools-call` at `92432ad7`。
+- Spawned Coder Pod `yoi-coder-00001KVHR3WSD` with write scope limited to the implementation worktree and read-only root scope only for runtime workspace identity。
+- Coder task explicitly forbids root/original workspace implementation, resources/prompts/list_changed scope creep, merge, Ticket close, and cleanup。
+
+Next action:
+- Let MCP tools/call Coder proceed in parallel with Dashboard/Console Coder. Inspect implementation reports and route each to Reviewer when ready。
+
+---
