@@ -223,3 +223,58 @@ Reviewer validation:
 Worktree status at review end: source tree clean; ignored artifacts under `target/` only。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T05:40:15Z -->
+
+## Implementation report
+
+Coder r1-fix report received from `yoi-coder-00001KVHKWNQA`.
+
+New fix commit:
+- `0a9e585c plugin: fix rust pdk wit template probes`
+
+Branch commits now:
+- `0a9e585c plugin: fix rust pdk wit template probes`
+- `06287aca plugin: add rust pdk template`
+
+Fix summary:
+- Moved host WIT to dependency package path `resources/plugin/wit/deps/yoi-host/yoi-host-v1.wit` so `resources/plugin/wit` is a valid WIT package directory with `yoi:host` resolved as dependency。
+- Escaped WIT keyword function as `%list` while preserving import name semantics。
+- Added empty `[workspace]` to embedded template `Cargo.toml` so it can be checked in-place without becoming an undeclared member of Yoi root workspace。
+- Updated template/example/docs/PDK snippets to the compile-tested binding pattern with PDK `wit_bindgen` re-export, `generate_all`, and `runtime_path: "yoi_plugin_pdk::wit_bindgen::rt"`。
+- Added compile-time probe `crates/plugin-pdk/tests/wit_bindgen_probe.rs` that runs `wit_bindgen::generate!` against `resources/plugin/wit`。
+- Added embedded template cargo-check probe for `wasm32-unknown-unknown` in `crates/plugin-pdk/tests/template.rs`。
+- Added `%list` WIT assertion and updated host WIT include path。
+- Updated `Cargo.lock` and `package.nix` for new dev dependency edge / cargo hash。
+
+Coder validation reported as passing:
+- `cargo test -p yoi-plugin-pdk` including PDK tests, WIT constants, actual `wit_bindgen::generate!` probe, and embedded template wasm32 check probe。
+- `cargo test -p manifest embedded_rust_component_tool_template_is_valid_package_shape`
+- `cargo test -p pod pdk_tool_output_shape_is_accepted_by_wasm_decoder`
+- `cargo check`
+- `cargo tree -p yoi-plugin-pdk --edges normal`
+- `cargo check --manifest-path resources/plugin/templates/rust-component-tool/Cargo.toml --target wasm32-unknown-unknown`
+- `cargo fmt --check`
+- `git diff --check 5f7f81bd..HEAD`
+- `git diff --check`
+- `git diff --check --cached`
+- `nix build .#yoi --no-link`
+
+Operational note:
+- `nix build .#yoi --no-link` initially hit disk exhaustion after accepting the updated vendor hash; Coder removed local implementation worktree `target/` cache and reran successfully。
+
+Remaining deferrals:
+- No `yoi plugin new/check/pack`。
+- No crates.io publication or remote template fetching。
+- Full packaged component execution remains deferred; the current WIT parses with `wit-bindgen` and embedded Rust template compiles to the wasm target boundary。
+
+Orchestrator evidence checked before r2 review:
+- Implementation worktree is clean。
+- HEAD is `0a9e585c`。
+- Fix diff from `06287aca..HEAD` touches 12 files, about 105 insertions / 13 deletions。
+- Overall `git diff --check 5f7f81bd..HEAD` produced no diagnostics。
+
+Next action:
+- Route back to Reviewer for r2 verification of the WIT parse/template compile blockers and final acceptance criteria。
+
+---
