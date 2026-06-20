@@ -104,3 +104,122 @@ Next action:
 - Wait for Coder implementation report, then inspect branch diff/validation evidence and route to Reviewer.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T05:16:16Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVHKWNQA`.
+
+Implementation commit:
+- `06287aca plugin: add rust pdk template`
+
+Changed areas reported:
+- Added workspace crate `crates/plugin-pdk` / `yoi-plugin-pdk`:
+  - guest-side PDK helpers;
+  - typed JSON input parsing via `parse_json_input` / `run_json_tool`;
+  - typed JSON output via `ToolOutput::json`;
+  - bounded structured `ToolError` and error-code helpers;
+  - `ToolContext` with selected tool name;
+  - `wit_bindgen` re-export and `export_component_tool!` macro to avoid raw pointer/length ABI plumbing;
+  - tests for happy path, error path, oversized output, template validation, and host-runtime dependency exclusion。
+- Added embedded starter template under `resources/plugin/templates/rust-component-tool/` with `Cargo.toml`, `src/lib.rs`, `plugin.toml`, and `README.md`。
+- Added embedded template constants in `crates/manifest/src/plugin.rs` for future authoring CLI use without remote fetching。
+- Updated Component Model example to use the PDK。
+- Added runtime decoder test confirming PDK-produced ToolOutput JSON shape is accepted。
+- Updated Plugin development/design/package docs。
+- Updated workspace/package metadata: root `Cargo.toml`, `Cargo.lock`, `package.nix` cargo hash。
+
+Coder validation reported as passing:
+- `cargo test -p yoi-plugin-pdk`
+- `cargo test -p manifest embedded_rust_component_tool_template_is_valid_package_shape`
+- `cargo test -p pod pdk_tool_output_shape_is_accepted_by_wasm_decoder`
+- `cargo check`
+- `cargo fmt --check`
+- `git diff --check`
+- `git diff --check --cached`
+- `cargo tree -p yoi-plugin-pdk --edges normal`
+- `nix build .#yoi --no-link`
+
+Known deferrals reported:
+- No `yoi plugin new/check/pack`, remote template fetch, or crates.io publication。
+- Full deterministic sample component build/pack execution remains deferred to future authoring CLI/tooling; current sample/template are fixture-validated and use current WIT/PDK shape。
+- Raw core-Wasm ABI remains compatibility/transitional runtime support。
+
+Orchestrator evidence checked before review dispatch:
+- Implementation worktree is clean on `impl/00001KVHKWNQA-plugin-rust-pdk-templates`。
+- HEAD is `06287aca`。
+- Diff from acceptance `5f7f81bd..HEAD` is one implementation commit touching 17 files, about 857 insertions / 35 deletions。
+- `git diff --check 5f7f81bd..HEAD` produced no diagnostics。
+
+Next action:
+- Dispatch Reviewer for r1 review against Ticket requirements, with focus on guest-only PDK boundary, no host-runtime deps, authority/grant wording, template/resource packaging, sample/test boundary honesty, docs, and Nix/workspace changes。
+
+---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-20T05:16:53Z -->
+
+## Plan
+
+Review dispatch:
+- Spawned Reviewer Pod `yoi-reviewer-00001KVHKWNQA-r1` against implementation branch `impl/00001KVHKWNQA-plugin-rust-pdk-templates`。
+- Review target commit: `06287aca plugin: add rust pdk template`。
+- Review baseline: `5f7f81bd`。
+- Reviewer task focuses on guest-only PDK boundary, absence of host-runtime deps, authority/grant wording, no ambient fs/network/env, template/resource packaging, current WIT/runtime compatibility, sample/test honesty, docs, and Nix/workspace changes。
+- Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KVHKWNQA-r1 at: 2026-06-20T05:21:50Z status: request_changes -->
+
+## Review: request changes
+
+Verdict: `request_changes`
+
+確認範囲:
+- Ticket body/thread / Orchestrator IntentPacket
+- Diff: `5f7f81bd..06287aca`
+- 主な対象: `crates/plugin-pdk/*`, embedded template `resources/plugin/templates/rust-component-tool/*`, `resources/plugin/wit/*`, `crates/manifest/src/plugin.rs`, `crates/pod/src/feature/plugin.rs`, workspace/package docs/Nix/Cargo paths。
+
+良い点:
+- PDK は guest-side only として提示され、Yoi host/runtime crates への normal dependency は見当たらない。
+- docs/templates は host-side Plugin grants が authority boundary であること、crates.io publication / remote template fetch を要求しないことを概ね維持している。
+- `ToolError` / `ToolOutput` bounds と runtime decoder test は現在の ToolOutput JSON bridge と整合している。
+
+Blocking issues:
+1. PDK/template authoring path が現在の WIT で実際に compile/parse できない。
+   - Template/example/docs は次の generated binding path を示している。
+     - `resources/plugin/templates/rust-component-tool/src/lib.rs`
+     - `docs/examples/plugin-component-tool/lib.rs`
+     - `crates/plugin-pdk/src/lib.rs`
+   - しかし `resources/plugin/wit/yoi-host-v1.wit` の interface `fs` が `list: func(...)` を使っており、`wit-bindgen` probe で `list` が keyword として扱われ parse error になった。
+   - これは “author does not need to hand-write raw pointer/length ABI code” と “template/sample compile or honest validated fixture boundary” の Ticket contract に反する。
+
+2. Embedded template を source tree 内で Cargo package として check できない。
+   - `cargo check --manifest-path resources/plugin/templates/rust-component-tool/Cargo.toml --target wasm32-unknown-unknown` が root workspace 配下の non-member package として失敗した。
+   - Template を workspace member にするか、workspace exclude / embedded template 側の empty `[workspace]` 等で standalone fixture として check 可能にする必要がある。
+   - 現在の shape tests は `wit_bindgen::generate!` や WIT parse を実行していないため、この問題を捕捉できていない。
+
+Required fix:
+- Current WIT を `wit-bindgen` が parse できるよう修正する。`list` は WIT keyword なので `%list` escape など、runtime import name semantics を壊さない形を優先すること。
+- Embedded template を in-place または controlled fixture copy で Cargo check できるようにする。
+- `wit_bindgen::generate!` against `resources/plugin/wit` を実際に通す test/probe を追加する。string-shape assertion だけでは不可。
+- Template/example/PDK docs が full build boundary と deferral を正直に表現していることを確認する。
+
+Reviewer validation:
+- Passed:
+  - `cargo fmt --check`
+  - `git diff --check 5f7f81bd..HEAD`
+  - `cargo test -p yoi-plugin-pdk`
+  - `cargo test -p manifest embedded_rust_component_tool_template_is_valid_package_shape`
+  - `cargo test -p pod pdk_tool_output_shape_is_accepted_by_wasm_decoder`
+  - `cargo check`
+  - `cargo tree -p yoi-plugin-pdk --edges normal`
+  - `nix build .#yoi --no-link`
+- Failed reviewer probes:
+  - `cargo check --manifest-path resources/plugin/templates/rust-component-tool/Cargo.toml --target wasm32-unknown-unknown`: workspace membership/standalone failure。
+  - copied template probe with adjusted relative paths and empty `[workspace]`: WIT parse failure at `resources/plugin/wit/yoi-host-v1.wit` because `list` is keyword。
+
+Worktree status at review end: source tree clean; ignored artifacts under `target/` only。
+
+---
