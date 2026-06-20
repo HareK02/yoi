@@ -501,3 +501,54 @@ Reviewer validation:
 Worktree status at end: clean。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T15:13:56Z -->
+
+## Implementation report
+
+Coder r3-fix report received from `yoi-coder-00001KVJHYP4Q`.
+
+New fix commit:
+- `627c8f36 plugin: filter static enabled surfaces`
+
+Branch commits now:
+- `627c8f36 plugin: filter static enabled surfaces`
+- `79ca0f7f plugin: enforce enabled lifecycle surfaces`
+- `870bcc76 plugin: fix instance lifecycle blockers`
+- `147a6005 plugin: add instance lifecycle surface`
+
+Fix summary:
+- `crates/pod/src/feature/plugin.rs`:
+  - `inspect_resolved_plugin_static()` now filters Tool / Service / Ingress inspection by `record.enabled_surfaces`。
+  - `PluginStaticInspection::statically_eligible()` therefore reflects enabled/selected surfaces only for resolved Plugin records。
+  - `plugin check` remains full-declaration oriented because check-time inspection uses all declared manifest surfaces as enabled。
+- `crates/yoi/src/plugin_cli.rs`:
+  - Resolved `plugin list/show` diagnostics now use filtered static inspection。
+  - Added focused CLI inspection test for mixed Tool+Service package where only Service is enabled and Tool grants are absent:
+    - status remains `active`。
+    - static eligibility remains true。
+    - unselected Tool is not listed/reported。
+    - unselected Tool missing grants do not produce diagnostics/rejection。
+
+Coder validation reported as passing:
+- `cargo test -p manifest plugin -- --nocapture`
+- `cargo test -p pod plugin -- --nocapture`
+- `cargo test -p yoi plugin -- --nocapture`
+- `cargo check -p yoi`
+- `cargo check -p yoi-plugin-pdk`
+- `CARGO_TARGET_DIR=target/review-template cargo check --manifest-path resources/plugin/templates/rust-component-instance/Cargo.toml`
+- `cargo fmt --check`
+- `git diff --check 5ec8bae9..HEAD`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Orchestrator evidence checked before r4 review:
+- Implementation worktree is clean。
+- HEAD is `627c8f36`。
+- Fix diff from `79ca0f7f..HEAD` touches `crates/pod/src/feature/plugin.rs` and `crates/yoi/src/plugin_cli.rs`, about 209 insertions / 76 deletions。
+- Overall `git diff --check 5ec8bae9..HEAD` produced no diagnostics。
+
+Next action:
+- Route back to Reviewer for r4 verification of static inspection / `plugin list/show` partial-surface reporting and final acceptance criteria。
+
+---
