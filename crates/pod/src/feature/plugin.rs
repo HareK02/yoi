@@ -303,87 +303,101 @@ pub fn inspect_resolved_plugin_static(record: &ResolvedPluginRecord) -> PluginSt
         .collect();
 
     let duplicate_tool_names = duplicate_tool_names(record);
-    let tools = record
-        .manifest
-        .tools
-        .iter()
-        .map(|tool| {
-            let permission = PluginPermission::tool(&tool.name);
-            let requested = permission_requested(record, &permission);
-            let granted = grant_allows(record, &permission);
-            let mut diagnostics = validate_plugin_tool_definition(tool, &duplicate_tool_names);
-            if let Err(error) = authorize_plugin_tool(record, tool) {
-                diagnostics.push(error.bounded_message());
-            }
-            let diagnostic = join_tool_diagnostics(diagnostics);
-            PluginToolEligibility {
-                name: tool.name.clone(),
-                permission: permission.label(),
-                requested,
-                granted,
-                eligible: diagnostic.is_none(),
-                external_write: tool.external_write,
-                diagnostic,
-            }
-        })
-        .collect();
+    let tools = if surface_enabled(record, PluginSurface::Tool) {
+        record
+            .manifest
+            .tools
+            .iter()
+            .map(|tool| {
+                let permission = PluginPermission::tool(&tool.name);
+                let requested = permission_requested(record, &permission);
+                let granted = grant_allows(record, &permission);
+                let mut diagnostics = validate_plugin_tool_definition(tool, &duplicate_tool_names);
+                if let Err(error) = authorize_plugin_tool(record, tool) {
+                    diagnostics.push(error.bounded_message());
+                }
+                let diagnostic = join_tool_diagnostics(diagnostics);
+                PluginToolEligibility {
+                    name: tool.name.clone(),
+                    permission: permission.label(),
+                    requested,
+                    granted,
+                    eligible: diagnostic.is_none(),
+                    external_write: tool.external_write,
+                    diagnostic,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let instance_world = record.manifest.runtime.as_ref().is_some_and(|runtime| {
         runtime.kind == PLUGIN_RUNTIME_COMPONENT_KIND
             && runtime.world.as_deref() == Some(PLUGIN_COMPONENT_INSTANCE_WORLD)
     });
-    let services = record
-        .manifest
-        .services
-        .iter()
-        .map(|service| {
-            let permission = PluginPermission::service(&service.name);
-            let requested = permission_requested(record, &permission);
-            let granted = grant_allows(record, &permission);
-            let mut diagnostics = Vec::new();
-            if !instance_world {
-                diagnostics.push("service requires instance-capable component world".to_string());
-            }
-            if let Err(error) = authorize_plugin_service(record, &service.name) {
-                diagnostics.push(error.bounded_message());
-            }
-            let diagnostic = join_tool_diagnostics(diagnostics);
-            PluginSurfaceEligibility {
-                name: service.name.clone(),
-                permission: permission.label(),
-                requested,
-                granted,
-                eligible: diagnostic.is_none(),
-                diagnostic,
-            }
-        })
-        .collect();
-    let ingresses = record
-        .manifest
-        .ingresses
-        .iter()
-        .map(|ingress| {
-            let permission = PluginPermission::ingress(&ingress.name);
-            let requested = permission_requested(record, &permission);
-            let granted = grant_allows(record, &permission);
-            let mut diagnostics = Vec::new();
-            if !instance_world {
-                diagnostics.push("ingress requires instance-capable component world".to_string());
-            }
-            if let Err(error) = authorize_plugin_ingress(record, &ingress.name) {
-                diagnostics.push(error.bounded_message());
-            }
-            let diagnostic = join_tool_diagnostics(diagnostics);
-            PluginSurfaceEligibility {
-                name: ingress.name.clone(),
-                permission: permission.label(),
-                requested,
-                granted,
-                eligible: diagnostic.is_none(),
-                diagnostic,
-            }
-        })
-        .collect();
+    let services = if surface_enabled(record, PluginSurface::Service) {
+        record
+            .manifest
+            .services
+            .iter()
+            .map(|service| {
+                let permission = PluginPermission::service(&service.name);
+                let requested = permission_requested(record, &permission);
+                let granted = grant_allows(record, &permission);
+                let mut diagnostics = Vec::new();
+                if !instance_world {
+                    diagnostics
+                        .push("service requires instance-capable component world".to_string());
+                }
+                if let Err(error) = authorize_plugin_service(record, &service.name) {
+                    diagnostics.push(error.bounded_message());
+                }
+                let diagnostic = join_tool_diagnostics(diagnostics);
+                PluginSurfaceEligibility {
+                    name: service.name.clone(),
+                    permission: permission.label(),
+                    requested,
+                    granted,
+                    eligible: diagnostic.is_none(),
+                    diagnostic,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let ingresses = if surface_enabled(record, PluginSurface::Ingress) {
+        record
+            .manifest
+            .ingresses
+            .iter()
+            .map(|ingress| {
+                let permission = PluginPermission::ingress(&ingress.name);
+                let requested = permission_requested(record, &permission);
+                let granted = grant_allows(record, &permission);
+                let mut diagnostics = Vec::new();
+                if !instance_world {
+                    diagnostics
+                        .push("ingress requires instance-capable component world".to_string());
+                }
+                if let Err(error) = authorize_plugin_ingress(record, &ingress.name) {
+                    diagnostics.push(error.bounded_message());
+                }
+                let diagnostic = join_tool_diagnostics(diagnostics);
+                PluginSurfaceEligibility {
+                    name: ingress.name.clone(),
+                    permission: permission.label(),
+                    requested,
+                    granted,
+                    eligible: diagnostic.is_none(),
+                    diagnostic,
+                }
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     PluginStaticInspection {
         runtime,
