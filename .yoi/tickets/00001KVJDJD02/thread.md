@@ -158,3 +158,49 @@ Review dispatch:
 - Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVJDJD02-r1 at: 2026-06-20T12:19:14Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket authority / Orchestrator IntentPacket。
+- Implementation diff: `e752a720..1143ae1c`。
+- Changed files:
+  - `resources/prompts/role/intake.md`
+  - `resources/workflows/ticket-intake-workflow.md`
+  - `.yoi/workflow/ticket-intake-workflow.md`
+
+Blocking issues: none。
+
+Approval evidence:
+- Intake non-scheduler boundary is preserved and strengthened。
+  - Coder/Reviewer/read-only helper Pod spawn、worktree作成、implementation/review routing、merge、close、implementation side effects をしないことが明記されている。
+- Official Ticket creation 前の user agreement rule は維持されている。
+  - Draft presentation と explicit approval / creation instruction before `TicketCreate` が必要。
+- Pre-`TicketCreate` investigation conditions are now model-facing。
+  - Duplicate/related existing Ticket checks、targeted existing Ticket read-before-update、ambiguous/current-behavior/authority-boundary/workflow-source change cases の workflow/prompt/docs/code/config/history inspection が明示された。
+- Investigation stop behavior is explicit。
+  - Gate を満たせない場合、Intake は draft で停止し `requirements_sync_needed` / `spike_needed` / `blocked` として分類する。
+- User claims / confirmed facts / unverified hypotheses / undecided points are separated in prompt, draft template, and recommended Ticket body。
+- “User said so” is explicitly barred from becoming requirements / acceptance criteria without confirmation。
+- Bundled workflow vs workspace override boundary is coherent。
+  - Bundled は reusable minimum procedure、workspace override は dogfooding-specific details を足せるが bundled invariants を弱めない、と説明されている。
+- Stale `Action required` / `Attention required` wording was removed from touched templates。
+- Changed files are limited to prompt/workflow Markdown resources; no code/runtime behavior changes found。
+
+Non-blocking concerns / follow-ups:
+- Live Intake scenario は未実行。ただし本 Ticket は prompt/workflow text only であり、acceptance validation に E2E は要求されていないため blocking ではない。
+- Reviewer は `TicketDoctor` を実行していないが、implementation worktree 側で Ticket record structure は変更されておらず、Ticket consistency concern は見つからなかった。
+
+Reviewer validation:
+- `git diff --check e752a720..HEAD`: passed。
+- `grep -RInE 'Action required|Attention required' ...`: no matches。
+- Investigation vocabulary grep: expected terms present; count `59`。
+- `git diff --stat e752a720..HEAD`: 3 files changed, 186 insertions, 19 deletions。
+- `git diff --name-only e752a720..HEAD`: only expected prompt/workflow Markdown files。
+- `git status --short`: clean。
+
+---
