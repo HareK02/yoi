@@ -6,9 +6,11 @@ requires: []
 ---
 # Ticket Intake Workflow
 
-Yoi の multi-agent 運用で、ユーザーの依頼をいきなり実装委譲せず、まず **合意済み Ticket** に変換するための Workflow。
+Yoi の multi-agent 運用で、ユーザーの依頼をいきなり実装委譲せず、まず **合意済み Ticket** または「まだ Ticket 化しない」判断に変換するための Workflow。
 
-Intake の目的は、ユーザーの意図・要件・制約・受け入れ条件・未決定点を明確にし、Orchestrator が次の routing を判断できる Ticket を作ることである。Intake は scheduler ではなく、coder / reviewer Pod を起動しない。
+この workspace workflow は bundled `resources/workflows/ticket-intake-workflow.md` を dogfooding 用に詳述した override である。Objective / split policy / local Ticket 運用の説明を追加するが、bundled workflow の調査ゲート、Ticket 作成前の user agreement、Intake の非 scheduler 境界を弱めてはならない。
+
+Intake の目的は、ユーザーの意図・要件・制約・受け入れ条件・未決定点を明確にし、Orchestrator が次の routing を判断できる Ticket を作ることである。Intake は scheduler ではなく、coder / reviewer / read-only investigation helper Pod を起動しない。
 
 ## 位置づけ
 
@@ -36,18 +38,19 @@ Intake は以下を行う。
 
 - ユーザー依頼の主語と目的を確認する。
 - 既存 Ticket を確認し、duplicate / related work を探す。
-- 必要に応じて関連 docs / code / workflow / history を読む。
+- 曖昧な依頼、現在挙動への claim、authority boundary、workflow/source-of-truth 変更では、Ticket 化前の最小調査ゲートとして関連 docs / code / workflow / history を読む。
 - 不足している要件を質問する。
 - 作成または refinement する Ticket が、実装・レビュー・検証・完了判断を単独で行える concrete work item であるか確認する。
 - 広い依頼を分割する場合は、進捗コンテナとしての umbrella Ticket ではなく、concrete Ticket / Objective context / split decision record に責務を分ける。
 - Objective-to-Ticket links を提案する場合は canonical opaque Ticket ID だけを使い、dependency / blocking / ordering relation として扱わない。
 - Ticket の title / body/request snapshot / acceptance criteria / priority / readiness / risk flags を、現在の要件として意味がある範囲で提案する。
 - canonical ID は Ticket 作成/storage が opaque な path-derived value として割り当てるため、Intake はユーザー向け metadata として提案しない。
+- ユーザー主張、Intake が確認した事実、未確認仮説、未決定点を分けて整理する。
 - background / requirements / acceptance criteria / escalation conditions を整理する。
 - binding decisions / invariants と implementation latitude を分けて書く。
 - 具体的な除外や触れてはいけない境界が binding decision である場合は、generic な除外リストではなく invariant / escalation condition として明記する。
 - readiness / open questions / risk flags を明示する。
-- ユーザー合意後に Ticket を作成する。
+- ユーザー合意後にだけ official Ticket を作成する。
 - 既存 Ticket の refinement を求められた場合は、TicketComment で経緯を残す。
 
 ## Intake がしないこと
@@ -89,7 +92,7 @@ Ticket tools が利用できない環境では、勝手に file write で代替�
 - 既に決まっていること。
 - まだ未決定のこと。
 
-この段階では Ticket を作らない。
+この段階では Ticket を作らない。ユーザー発話は request snapshot / claim として扱い、確認済み requirements と混同しない。
 
 ### 2. 既存 Ticket を確認する
 
@@ -103,6 +106,33 @@ Ticket tools が利用できない環境では、勝手に file write で代替�
 - 既存 concrete follow-up Ticket や Objective context で足りるか、新規 concrete Ticket が必要か。
 
 既存 Ticket の更新で足りる場合、新規 Ticket を作らず、ユーザーに更新案を提示する。
+
+### 2.1. Ticket 化前の最小調査ゲート
+
+`TicketCreate` または material な `TicketComment` の前に、以下の gate を通す。
+
+必ず行うこと:
+
+- duplicate / related / blocking-looking Ticket を確認する。
+- 既存 Ticket を更新するなら、その Ticket の item/thread/artifacts を読む。
+- ユーザー claim と、Intake が読んで確認した fact を分ける。
+
+次のいずれかに当たる場合は、Ticket 作成前に関連 docs / code / workflow / prompt / config / history を読む。
+
+- 依頼が曖昧、または複数の concrete work item を含む。
+- 「現在の挙動」「既存仕様」「壊れている」「既にある」など、事実確認を要する claim がある。
+- scope / permission / history / prompt context / persistence / public API など authority boundary に触れる。
+- prompt / workflow resource、Ticket schema、source-of-truth 境界の変更に触れる。
+- 既存実装の map がないと requirements / acceptance criteria を誤って固定しそうである。
+
+Gate output は draft に以下を分けて残す。
+
+- User claims / request snapshot: ユーザーが述べたこと。
+- Confirmed facts / sources: Intake が読んで確認したことと source。
+- Unverified hypotheses: ありそうだが未確認の推測。
+- Undecided points / open questions: ユーザーまたは Orchestrator の判断が必要なこと。
+
+調査が大きい、current-code map がない、または仕様同期が足りない場合は、official Ticket を作らず draft で止める。readiness は `spike_needed` / `requirements_sync_needed` / `blocked` のいずれかを付け、次に必要な調査や質問を報告する。確認できない claim を requirements / acceptance criteria として保存しない。
 
 ### 2.5. Broad request の split policy
 
@@ -121,6 +151,7 @@ Ticket tools が利用できない環境では、勝手に file write で代替�
 
 最低限、以下を確認する。
 
+- ユーザー claim のうち、どれが確認済み fact で、どれが未確認仮説か。
 - observable な完了条件は何か。
 - 作業の種類・影響範囲は prose として body に書けばよいが、current Ticket core metadata として扱わない。
 - 受け入れ条件は何か。
@@ -130,7 +161,7 @@ Ticket tools が利用できない環境では、勝手に file write で代替�
 - validation は何で確認できるか。
 - 人間判断が必要な論点は何か。
 
-不足がある場合は、Ticket 作成前に質問する。質問は多すぎず、Ticket 作成に必要な最小限に絞る。
+不足がある場合は、Ticket 作成前に質問する。質問は多すぎず、Ticket 作成に必要な最小限に絞る。調査が先に必要な場合は `spike_needed`、仕様同期が先に必要な場合は `requirements_sync_needed` として draft に留める。
 
 ### 4. readiness を分類する
 
@@ -145,9 +176,11 @@ implementation_ready:
 
 requirements_sync_needed:
 - 目的は見えているが、仕様・用語・UX・責務境界・受け入れ条件が未同期。
+- ユーザー claim を requirements として固定するには合意や確認が足りない。
 
 spike_needed:
 - 技術調査、依存関係、性能、license、diagnostics、現在コード map が先に必要。
+- どの files/workflows/Tickets を読むべきかは見えているが、Intake の最小調査では実装可能な要件まで確定できない。
 
 blocked:
 - 人間判断、外部イベント、別 Ticket の完了が必要。
@@ -188,11 +221,16 @@ Title:
 
 Priority:
 Readiness:
-Action required:
-Attention required:
+Next Ticket operation: draft_only | create_after_user_agreement | update_existing_after_user_agreement | no_ticket
 Risk flags:
 
-Body / request snapshot:
+User claims / request snapshot:
+
+Confirmed facts / sources:
+
+Unverified hypotheses:
+
+Undecided points / open questions:
 
 Background:
 
@@ -208,12 +246,12 @@ Escalation conditions:
 
 Validation:
 
-Related tickets/docs:
+Related tickets/docs/files:
 ```
 
 canonical ID は作成時に storage が opaque/path-derived value として割り当てるため、draft では提案しない。
 
-この時点ではまだ Ticket を作らない。
+この時点ではまだ Ticket を作らない。`Next Ticket operation` が `draft_only` / `no_ticket` の場合は、ユーザー合意があっても `TicketCreate` ではなく追加同期または調査へ戻す。
 
 ### 7. ユーザー合意を取る
 
@@ -222,7 +260,7 @@ canonical ID は作成時に storage が opaque/path-derived value として割�
 - ユーザーが draft を明示的に承認する。
 - ユーザーが「作って」「切って」「記録して」など、作成を明示する。
 
-未決定のまま記録する場合は、`requirements_sync_needed` / `spike_needed` / `blocked` として未決定点を明示する。
+未決定のまま記録する場合は、`requirements_sync_needed` / `spike_needed` / `blocked` として未決定点を明示する。ユーザー合意は「この未決定状態で記録する」ことへの合意であり、未確認仮説を requirements 化する許可ではない。
 
 ### 8. Ticket を作成または更新する
 
@@ -231,6 +269,7 @@ canonical ID は作成時に storage が opaque/path-derived value として割�
 - `TicketCreate` を使う。
 - title / priority / body と、必要な readiness / risk flags を指定する。canonical ID は storage が割り当てる。
 - body に readiness / open questions / risk flags と、binding decisions / invariants、implementation latitude、escalation conditions を Markdown で明記する。
+- user claims、confirmed facts、unverified hypotheses、undecided points / open questions を分けて書き、未確認 claim を requirements / acceptance criteria として保存しない。
 
 既存 Ticket refinement の場合:
 
@@ -253,6 +292,14 @@ Intake はここで止まる。implementation / worktree / coder / reviewer 起�
 ## Ticket body の推奨形
 
 ```markdown
+## User claims / request snapshot
+
+## Confirmed facts / sources
+
+## Unverified hypotheses
+
+## Undecided points / open questions
+
 ## Background
 
 ## Requirements
