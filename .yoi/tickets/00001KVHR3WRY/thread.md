@@ -180,3 +180,46 @@ Review dispatch:
 - Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVHR3WRY-r1 at: 2026-06-20T07:51:30Z status: request_changes -->
+
+## Review: request changes
+
+Verdict: `request_changes`
+
+確認範囲:
+- Ticket contract。
+- Diff: `c0e760d7..a114fa9d`。
+- 主な対象: `crates/mcp/src/stdio.rs`, `crates/mcp/src/lib.rs`, `crates/mcp/tests/stdio_lifecycle.rs`, `crates/mcp/tests/fixtures/mock_server.rs`, `crates/mcp/Cargo.toml`, root `Cargo.toml`, `Cargo.lock`, `package.nix`。
+- ToolRegistry/resource/prompt registration leakage と remote MCP/OAuth/HTTP scope creep を確認。
+
+良い点:
+- stdio child spawn、newline JSON-RPC framing、initialize + initialized notification、bounded stdout/stderr handling、stderr-as-diagnostics、fail-closed server-to-client requests、shutdown/terminate/kill fallback、no model-visible registration surface は Ticket intent に概ね沿っている。
+
+Blocking issue:
+1. Resolved stdio server spec の derived `Debug` が secret/env values を leak できる。
+   - `crates/mcp/src/stdio.rs`
+   - `McpStdioServerSpec` derives `Debug`。
+   - `env: BTreeMap<String, String>` に inherited/env/literal/secret-derived values が入る。
+   - `Redactions` は stderr/protocol diagnostics には使われているが、resolved spec 自体を `{:?}` で format/log すると env values が plaintext で出る。
+   - これは Ticket の secret/env redaction 要件に反する。
+
+Required fix:
+- `McpStdioServerSpec` から `Debug` を外す、または env values を出さない custom redacted `Debug` を実装する。
+- custom `Debug` を残す場合は regression test を追加する。
+
+Non-blocking concerns:
+- Initialize response の `protocolVersion` compatibility enforcement は今後 tools/resources/prompts registration 前に判断が必要。Lifecycle slice としては follow-up で可。
+- `Drop` cleanup は best-effort `start_kill` / `kill_on_drop`。Downstream code should prefer explicit `shutdown()`。
+
+Reviewer validation:
+- `git diff --check c0e760d7..HEAD`: passed。
+- `cargo fmt --check`: passed。
+- `cargo test -p mcp`: passed。
+- `cargo check`: passed。
+- `nix build .#yoi --no-link`: passed。
+- `cargo tree -p mcp --depth 1`: inspected; no product façade dependency found。
+
+Worktree status at review end: clean。
+
+---
