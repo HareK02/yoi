@@ -21,3 +21,12 @@ LocalTicketBackend によって作成されました。
 Intake 済み。Orchestrator は implementation routing として扱える。実装 side effect / worktree 作成 / coder 起動はここでは行っていない。
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-20T12:06:29Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
