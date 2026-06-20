@@ -110,3 +110,52 @@ Next action:
 - Wait for Coder implementation report, then inspect branch diff/validation evidence and route to Reviewer。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T13:48:38Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVJKHAFE`.
+
+Implementation commit:
+- `c91f5fc9 mcp: add cli inspection`
+
+Changed areas reported:
+- Added `crates/yoi/src/mcp_cli.rs`:
+  - Read-only `yoi mcp` inspection reports。
+  - Commands: `list`, `show`, `tools`, `resources`, `prompts`。
+  - Human and `--json` output。
+  - Static resolved config inspection only; no MCP server processes are started。
+  - Live/provider-discovered state is explicitly reported as `not_live` / `unavailable`。
+  - Env values, secret refs, env refs, args, resource content, and prompt content are redacted/omitted。
+  - Resource/prompt operation eligibility is reported without content fetch。
+- Updated `crates/yoi/src/main.rs`:
+  - Added `mcp` namespace to parser, dispatcher, help output, and parser tests。
+
+Coder validation reported:
+- `cargo test -p yoi mcp`: passed。
+- `cargo check -p yoi`: passed。
+- `cargo fmt --check`: passed。
+- `git diff --check`: passed。
+- `cargo run -p yoi -- --help | grep -E 'yoi mcp (list|show|tools)'`: passed; help shows MCP namespace。
+- `yoi ticket doctor`: passed。
+
+Package impact:
+- No dependency, lockfile, source-filter, or `package.nix` changes。
+- Nix not run because packaging inputs were not changed。
+
+Known risks / deferrals:
+- Live Pod MCP state is not integrated; provider-discovered tools/resources/prompts are therefore reported as `not_live` / `unavailable` rather than stale or fabricated。
+- `tools` cannot list Yoi stable provider tool names without live discovery; JSON schema includes future item shape, but item list is empty in static mode。
+- Touched `crates/yoi/src/main.rs` CLI parser/help, so there is possible narrow conflict risk with parallel Plugin Service/Ingress work. No Plugin Service/Ingress files were touched。
+
+Orchestrator evidence checked before review dispatch:
+- Implementation worktree is clean。
+- HEAD is `c91f5fc9`。
+- Diff from acceptance `12d7e69f..HEAD` is one implementation commit touching 2 files, about 1438 insertions / 1 deletion。
+- `git diff --check 12d7e69f..HEAD` produced no diagnostics。
+
+Next action:
+- Dispatch Reviewer for r1 review against Ticket requirements, with focus on read-only inspection boundary, no process start/no tools-call/no resource-prompt content fetch, static vs live unavailable honesty, redaction, JSON/human shape, help/tests, and conflict risk。
+
+---
