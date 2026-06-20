@@ -1,8 +1,8 @@
 ---
 title: 'Panel Queue action should allow ready Tickets whose blockers are already queued or in progress'
-state: 'done'
+state: 'closed'
 created_at: '2026-06-20T05:18:00Z'
-updated_at: '2026-06-20T05:19:32Z'
+updated_at: '2026-06-20T12:27:08Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['ticket', 'panel', 'queue', 'dependency', 'blocker', 'orchestrator']
