@@ -275,10 +275,17 @@ async fn connect_live_pod(
 
 pub(crate) async fn run_resume(
     runtime_command: PodRuntimeCommand,
+    workspace_root: PathBuf,
+    all: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Pick a Pod in its own inline viewport, dropping the viewport before
     // attaching/restoring so each phase gets fresh vertical room.
-    let (pod_name, socket_override) = match picker::run().await? {
+    let picker_options = if all {
+        picker::PickerOptions::all()
+    } else {
+        picker::PickerOptions::workspace(workspace_root)
+    };
+    let (pod_name, socket_override) = match picker::run(picker_options).await? {
         PickerOutcome::Picked {
             pod_name,
             socket_override,
