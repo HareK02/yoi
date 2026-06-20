@@ -169,3 +169,57 @@ Review dispatch:
 - Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVHKWNQA-r1 at: 2026-06-20T05:21:50Z status: request_changes -->
+
+## Review: request changes
+
+Verdict: `request_changes`
+
+確認範囲:
+- Ticket body/thread / Orchestrator IntentPacket
+- Diff: `5f7f81bd..06287aca`
+- 主な対象: `crates/plugin-pdk/*`, embedded template `resources/plugin/templates/rust-component-tool/*`, `resources/plugin/wit/*`, `crates/manifest/src/plugin.rs`, `crates/pod/src/feature/plugin.rs`, workspace/package docs/Nix/Cargo paths。
+
+良い点:
+- PDK は guest-side only として提示され、Yoi host/runtime crates への normal dependency は見当たらない。
+- docs/templates は host-side Plugin grants が authority boundary であること、crates.io publication / remote template fetch を要求しないことを概ね維持している。
+- `ToolError` / `ToolOutput` bounds と runtime decoder test は現在の ToolOutput JSON bridge と整合している。
+
+Blocking issues:
+1. PDK/template authoring path が現在の WIT で実際に compile/parse できない。
+   - Template/example/docs は次の generated binding path を示している。
+     - `resources/plugin/templates/rust-component-tool/src/lib.rs`
+     - `docs/examples/plugin-component-tool/lib.rs`
+     - `crates/plugin-pdk/src/lib.rs`
+   - しかし `resources/plugin/wit/yoi-host-v1.wit` の interface `fs` が `list: func(...)` を使っており、`wit-bindgen` probe で `list` が keyword として扱われ parse error になった。
+   - これは “author does not need to hand-write raw pointer/length ABI code” と “template/sample compile or honest validated fixture boundary” の Ticket contract に反する。
+
+2. Embedded template を source tree 内で Cargo package として check できない。
+   - `cargo check --manifest-path resources/plugin/templates/rust-component-tool/Cargo.toml --target wasm32-unknown-unknown` が root workspace 配下の non-member package として失敗した。
+   - Template を workspace member にするか、workspace exclude / embedded template 側の empty `[workspace]` 等で standalone fixture として check 可能にする必要がある。
+   - 現在の shape tests は `wit_bindgen::generate!` や WIT parse を実行していないため、この問題を捕捉できていない。
+
+Required fix:
+- Current WIT を `wit-bindgen` が parse できるよう修正する。`list` は WIT keyword なので `%list` escape など、runtime import name semantics を壊さない形を優先すること。
+- Embedded template を in-place または controlled fixture copy で Cargo check できるようにする。
+- `wit_bindgen::generate!` against `resources/plugin/wit` を実際に通す test/probe を追加する。string-shape assertion だけでは不可。
+- Template/example/PDK docs が full build boundary と deferral を正直に表現していることを確認する。
+
+Reviewer validation:
+- Passed:
+  - `cargo fmt --check`
+  - `git diff --check 5f7f81bd..HEAD`
+  - `cargo test -p yoi-plugin-pdk`
+  - `cargo test -p manifest embedded_rust_component_tool_template_is_valid_package_shape`
+  - `cargo test -p pod pdk_tool_output_shape_is_accepted_by_wasm_decoder`
+  - `cargo check`
+  - `cargo tree -p yoi-plugin-pdk --edges normal`
+  - `nix build .#yoi --no-link`
+- Failed reviewer probes:
+  - `cargo check --manifest-path resources/plugin/templates/rust-component-tool/Cargo.toml --target wasm32-unknown-unknown`: workspace membership/standalone failure。
+  - copied template probe with adjusted relative paths and empty `[workspace]`: WIT parse failure at `resources/plugin/wit/yoi-host-v1.wit` because `list` is keyword。
+
+Worktree status at review end: source tree clean; ignored artifacts under `target/` only。
+
+---
