@@ -1,8 +1,8 @@
 ---
 title: "Improve Pod notification injection guidance"
-state: "planning"
+state: 'closed'
 created_at: "2026-06-07T07:33:13Z"
-updated_at: "2026-06-07T07:33:13Z"
+updated_at: '2026-06-20T16:23:37Z'
 ---
 
 ## Background

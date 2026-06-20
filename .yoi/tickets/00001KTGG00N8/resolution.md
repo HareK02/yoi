@@ -1,0 +1,1 @@
+Closed as stale/currently not needed. Orchestrator role/profile/workflow notification guidance has since improved, and the broad planning issue is not currently reproducing. If similar notification-as-user-turn confusion recurs in default profiles or generic notification wrappers, create a narrower ticket against the current prompt/profile state.
