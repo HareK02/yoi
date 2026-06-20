@@ -552,3 +552,59 @@ Next action:
 - Route back to Reviewer for r4 verification of static inspection / `plugin list/show` partial-surface reporting and final acceptance criteria。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVJHYP4Q-r1 at: 2026-06-20T15:18:34Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket contract:
+  - `.yoi/tickets/00001KVJHYP4Q/item.md`
+  - `.yoi/tickets/00001KVJHYP4Q/thread.md`
+- r4 fix diff: `79ca0f7f..627c8f36`
+- overall implementation shape: `5ec8bae9..627c8f36`
+- Focused files:
+  - `crates/pod/src/feature/plugin.rs`
+  - `crates/yoi/src/plugin_cli.rs`
+  - `crates/manifest/src/plugin.rs`
+  - `crates/plugin-pdk/src/lib.rs`
+  - `resources/plugin/templates/rust-component-instance/*`
+  - `resources/plugin/wit/yoi-plugin-instance-v1.wit`
+
+r3 blocker verification:
+- Previous static-inspection/list-show blocker is resolved。
+- `inspect_resolved_plugin_static()` now filters Tool / Service / Ingress eligibility by `record.enabled_surfaces`。
+- `PluginStaticInspection::statically_eligible()` now operates over filtered/selected surface vectors for resolved records。
+- `plugin check` remains full-declaration oriented because check-time inspection constructs the record with all declared manifest surfaces enabled。
+- Resolved `plugin list/show` diagnostics now use filtered static inspection and include selected Service/Ingress diagnostics。
+- Focused CLI test `service_only_enablement_ignores_unselected_tool_static_grants` confirms a mixed Tool+Service package with only Service enabled remains `active`, is statically eligible, does not report the unselected Tool, and does not emit missing Tool grant diagnostics。
+
+Earlier blocker re-check:
+- Instance PDK/template shape, lifecycle returned JSON/status handling, Service/Ingress instance retention, installed-path ingress dispatch, and per-surface runtime guards remain present at a high level。
+
+Blocking issues:
+- None found。
+
+Non-blocking follow-ups:
+- None requiring this Ticket to remain blocked。
+
+Reviewer validation passed:
+- `cargo fmt --check`
+- `git diff --check 5ec8bae9..HEAD`
+- `CARGO_TARGET_DIR=target/review-template cargo check --manifest-path resources/plugin/templates/rust-component-instance/Cargo.toml`
+- `cargo test -p manifest plugin -- --nocapture`
+- `cargo test -p pod plugin -- --nocapture`
+- `cargo test -p yoi plugin -- --nocapture`
+- `cargo check -p yoi`
+- `cargo check -p yoi-plugin-pdk`
+- `/home/hare/Projects/yoi/target/debug/yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Template check generated `resources/plugin/templates/rust-component-instance/Cargo.lock`; reviewer removed it after validation。
+
+Worktree status:
+- Clean at commit `627c8f36` on `impl/00001KVJHYP4Q-plugin-instance-lifecycle`。
+
+---
