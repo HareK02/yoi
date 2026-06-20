@@ -109,3 +109,60 @@ Next action:
 - Wait for Coder implementation report, then inspect branch diff/validation evidence and route to Reviewer。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T09:57:12Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVHR3WSN`.
+
+Implementation commit:
+- `3a22360a mcp: expose resources prompts tools`
+
+Changed areas reported:
+- `crates/mcp/src/stdio.rs`:
+  - Added typed MCP protocol structs/helpers for `resources/list`, `resources/read`, `prompts/list`, and `prompts/get`。
+  - Added resource/prompt request/result models preserving untrusted server-owned fields as data。
+- `crates/pod/src/feature/mcp.rs`:
+  - Registers explicit namespaced MCP operation tools when server capabilities advertise resources/prompts:
+    - `Mcp_<server>_resources_list`
+    - `Mcp_<server>_resources_read`
+    - `Mcp_<server>_prompts_list`
+    - `Mcp_<server>_prompts_get`
+  - Executes these through ordinary `Tool` path using `ToolOutput`。
+  - Serializes resource/prompt content as bounded untrusted JSON tool-result data。
+  - Bounds list items, resource contents, prompt messages, text fields, JSON depth/node count, rich embedded blobs/images/audio, and total output bytes。
+  - Preserves existing MCP `tools/call` behavior and redacted diagnostics。
+  - Does not add hidden context injection; prompt/resource data is not appended as user/system messages。
+
+Tests reported:
+- Operation tool naming/origin/schema。
+- Discovery registers resource/prompt operations without requiring `tools` capability。
+- `resources/list` and `resources/read` happy paths through ordinary tool output。
+- `prompts/list` and `prompts/get` happy paths through ordinary tool output。
+- Untrusted prompt/resource content remains data。
+- Rich/oversize resource/prompt content is bounded/omitted/truncated。
+
+Coder validation reported:
+- `cargo test -p pod mcp::tests`: passed, 13 tests。
+- `cargo check -p pod -p mcp`: passed。
+- `cargo fmt --all --check`: passed。
+- `git diff --check`: passed。
+- `cargo test -p mcp`: passed, 12 stdio lifecycle tests。
+- `nix build .#yoi --no-link`: passed; dirty-tree warning expected because validation ran before commit。
+
+Known deferrals / notes:
+- `list_changed` refresh remains deferred。
+- Sampling/elicitation not implemented。
+- MCP resources/prompts tools are registered from advertised server capabilities; unsupported capabilities are not exposed as model-visible tools。
+
+Orchestrator evidence checked before review dispatch:
+- Implementation worktree is clean。
+- HEAD is `3a22360a`。
+- Diff from acceptance `b2b4764f..HEAD` is one implementation commit touching 2 files, about 1225 insertions / 36 deletions。
+- `git diff --check b2b4764f..HEAD` produced no diagnostics。
+
+Next action:
+- Dispatch Reviewer for r1 review against Ticket requirements, with focus on explicit tool operations, ordinary Tool result/history path, no hidden context injection, untrusted/bounded content serialization, capability-gated registration, pagination/bounds, no list_changed/sampling/elicitation scope creep, and tests。
+
+---
