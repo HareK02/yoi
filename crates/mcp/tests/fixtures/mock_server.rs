@@ -10,7 +10,10 @@ fn main() {
     match mode.as_str() {
         "success" => success(),
         "tools" => tools_list(),
-        "tools-call-forbidden" => tools_list(),
+        "tools-call-normal" => tools_call_normal(),
+        "tools-call-is-error" => tools_call_is_error(),
+        "tools-call-protocol-error" => tools_call_protocol_error(),
+        "tools-call-forbidden" => tools_call_forbidden(),
         "fail-init" => fail_init(),
         "sampling" => sampling_request(),
         "shutdown-hang" => shutdown_hang(),
@@ -94,6 +97,94 @@ fn tools_list() {
             break;
         }
     }
+}
+
+fn tools_call_normal() {
+    tools_call(|request| {
+        assert_eq!(request["params"]["name"], "search-files");
+        assert_eq!(request["params"]["arguments"]["query"], "needle");
+        json!({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "content": [{"type": "text", "text": "found needle"}],
+                "structuredContent": {"matches": ["needle.rs"]},
+                "_meta": {"server": "mock"}
+            }
+        })
+    });
+}
+
+fn tools_call_is_error() {
+    tools_call(|request| {
+        assert_eq!(request["params"]["name"], "search-files");
+        json!({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "isError": true,
+                "content": [{"type": "text", "text": "tool-level failure"}]
+            }
+        })
+    });
+}
+
+fn tools_call_protocol_error() {
+    tools_call(|request| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "error": {"code": -32010, "message": "server refused tools/call"}
+        })
+    });
+}
+
+fn tools_call_forbidden() {
+    let init = read_json();
+    assert_eq!(init["method"], "initialize");
+    write_json(json!({
+        "jsonrpc": "2.0",
+        "id": init["id"],
+        "result": initialize_result(),
+    }));
+    let initialized = read_json();
+    assert_eq!(initialized["method"], "notifications/initialized");
+
+    loop {
+        let request = read_json();
+        assert_ne!(
+            request["method"], "tools/call",
+            "permission denial path must not send MCP tools/call"
+        );
+        if request["method"] == "shutdown" {
+            write_json(json!({"jsonrpc":"2.0", "id": request["id"], "result": {}}));
+            let notification = read_json();
+            assert_eq!(notification["method"], "exit");
+            break;
+        }
+    }
+}
+
+fn tools_call(response: impl FnOnce(&Value) -> Value) {
+    let init = read_json();
+    assert_eq!(init["method"], "initialize");
+    write_json(json!({
+        "jsonrpc": "2.0",
+        "id": init["id"],
+        "result": initialize_result(),
+    }));
+    let initialized = read_json();
+    assert_eq!(initialized["method"], "notifications/initialized");
+
+    let call = read_json();
+    assert_eq!(call["method"], "tools/call");
+    write_json(response(&call));
+
+    let shutdown = read_json();
+    assert_eq!(shutdown["method"], "shutdown");
+    write_json(json!({"jsonrpc":"2.0", "id": shutdown["id"], "result": {}}));
+    let notification = read_json();
+    assert_eq!(notification["method"], "exit");
 }
 
 fn fail_init() {

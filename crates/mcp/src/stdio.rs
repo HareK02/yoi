@@ -99,6 +99,51 @@ pub struct ListToolsResult {
     pub extra: BTreeMap<String, Value>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallToolRequest {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub arguments: Value,
+}
+
+impl CallToolRequest {
+    pub fn new(name: impl Into<String>, arguments: Value) -> Self {
+        Self {
+            name: name.into(),
+            arguments,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallToolResult {
+    #[serde(default)]
+    pub content: Vec<McpContentBlock>,
+    #[serde(default)]
+    pub structured_content: Option<Value>,
+    #[serde(default)]
+    pub is_error: bool,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// One untrusted MCP `tools/call` content block.
+///
+/// The `type` discriminator is kept explicit and all server-owned fields stay
+/// data in `fields`; this crate does not turn rich MCP content into hidden host
+/// context.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct McpContentBlock {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, Value>,
+}
+
 /// A resolved, explicit local stdio MCP server process specification.
 #[derive(Clone)]
 pub struct McpStdioServerSpec {
@@ -424,6 +469,25 @@ impl McpStdioClient {
             .map(|cursor| json!({ "cursor": cursor }))
             .unwrap_or_else(|| json!({}));
         self.request(McpPhase::Running, "tools/list", params).await
+    }
+
+    /// Execute an initialized MCP `tools/call` request.
+    ///
+    /// The caller is responsible for applying Yoi tool permissions before this
+    /// method is reached and for bounding/serializing the untrusted result before
+    /// it is exposed to model-visible tool history.
+    pub async fn call_tool(
+        &mut self,
+        request: CallToolRequest,
+    ) -> Result<CallToolResult, McpClientError> {
+        let params = serde_json::to_value(request).map_err(|err| {
+            McpClientError::new(
+                &self.server_name,
+                McpPhase::Running,
+                McpErrorKind::Protocol(format!("failed to serialize tools/call request: {err}")),
+            )
+        })?;
+        self.request(McpPhase::Running, "tools/call", params).await
     }
 
     /// Request pages from `tools/list` up to a host-supplied page/tool bound.

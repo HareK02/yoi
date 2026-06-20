@@ -8,7 +8,8 @@ use llm_worker::tool::{
 };
 use manifest::McpConfig;
 use mcp::stdio::{
-    ListToolsResult, McpStdioClient, McpStdioLimits, McpStdioServerSpec, McpToolDefinition,
+    CallToolRequest, CallToolResult, ListToolsResult, McpClientError, McpContentBlock,
+    McpErrorKind, McpStdioClient, McpStdioLimits, McpStdioServerSpec, McpToolDefinition,
     McpToolListLimits, resolve_stdio_server,
 };
 use serde_json::{Map, Value};
@@ -29,6 +30,12 @@ const MAX_SCHEMA_STRING_CHARS: usize = 4096;
 const MAX_DIAGNOSTIC_CHARS: usize = 512;
 const MAX_TOOL_PAGES: usize = 8;
 const MAX_TOOLS_PER_SERVER: usize = 128;
+const MAX_RESULT_CONTENT_BLOCKS: usize = 16;
+const MAX_RESULT_TEXT_CHARS: usize = 8192;
+const MAX_RESULT_JSON_DEPTH: usize = 12;
+const MAX_RESULT_JSON_NODES: usize = 512;
+const MAX_RESULT_STRING_CHARS: usize = 4096;
+const MAX_RESULT_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// Discover enabled MCP stdio server tools and return a single feature module
 /// containing startup contributions for normal ToolRegistry installation.
@@ -62,6 +69,7 @@ async fn discover_server_tools(spec: McpStdioServerSpec) -> ProtocolProviderCont
     let declaration = provider_declaration(&spec.name, None);
     let mut contribution = ProtocolProviderContribution::ready(declaration.clone());
     let server_namespace = sanitize_segment(&spec.name);
+    let execution_spec = spec.clone();
 
     let mut client = match McpStdioClient::connect(spec, McpStdioLimits::default()).await {
         Ok(client) => client,
@@ -122,6 +130,7 @@ async fn discover_server_tools(spec: McpStdioServerSpec) -> ProtocolProviderCont
     }
 
     contribution = normalize_listed_tools(
+        execution_spec,
         contribution,
         declaration,
         server_namespace,
@@ -132,6 +141,7 @@ async fn discover_server_tools(spec: McpStdioServerSpec) -> ProtocolProviderCont
 }
 
 fn normalize_listed_tools(
+    execution_spec: McpStdioServerSpec,
     mut contribution: ProtocolProviderContribution,
     declaration: ProtocolProviderDeclaration,
     server_namespace: String,
@@ -143,6 +153,7 @@ fn normalize_listed_tools(
 
     for tool in list.tools {
         match mcp_tool_contribution(
+            execution_spec.clone(),
             &declaration,
             &server_namespace,
             server_version.as_deref(),
@@ -177,11 +188,13 @@ fn normalize_listed_tools(
 }
 
 fn mcp_tool_contribution(
+    execution_spec: McpStdioServerSpec,
     declaration: &ProtocolProviderDeclaration,
     server_namespace: &str,
     server_version: Option<&str>,
     tool: McpToolDefinition,
 ) -> Result<(String, ToolContribution), String> {
+    let mcp_tool_name = tool.name.clone();
     let tool_segment = sanitize_segment(&tool.name);
     if tool_segment == "unnamed" {
         return Err(bounded_diagnostic(
@@ -215,13 +228,18 @@ fn mcp_tool_contribution(
         let description = description.clone();
         let schema = schema.clone();
         let origin = origin.clone();
+        let execution_spec = execution_spec.clone();
+        let mcp_tool_name = mcp_tool_name.clone();
         move || {
             (
                 ToolMeta::new(name.clone())
                     .description(description.clone())
                     .input_schema(schema.clone())
                     .origin(origin.clone()),
-                Arc::new(McpDiscoveryOnlyTool) as Arc<dyn Tool>,
+                Arc::new(McpStdioTool {
+                    server_spec: execution_spec.clone(),
+                    mcp_tool_name: mcp_tool_name.clone(),
+                }) as Arc<dyn Tool>,
             )
         }
     });
@@ -232,20 +250,334 @@ fn mcp_tool_contribution(
 }
 
 #[derive(Debug)]
-struct McpDiscoveryOnlyTool;
+struct McpStdioTool {
+    server_spec: McpStdioServerSpec,
+    mcp_tool_name: String,
+}
 
 #[async_trait]
-impl Tool for McpDiscoveryOnlyTool {
+impl Tool for McpStdioTool {
     async fn execute(
         &self,
-        _input_json: &str,
+        input_json: &str,
         _ctx: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        Err(ToolError::ExecutionFailed(
-            "MCP tool execution is not implemented in this release; registration is discovery-only"
-                .to_string(),
-        ))
+        let arguments = parse_tool_arguments(input_json)?;
+        let mut client =
+            McpStdioClient::connect(self.server_spec.clone(), McpStdioLimits::default())
+                .await
+                .map_err(|err| ToolError::ExecutionFailed(mcp_call_error_message(&err)))?;
+
+        let call_result = client
+            .call_tool(CallToolRequest::new(self.mcp_tool_name.clone(), arguments))
+            .await;
+        let shutdown_result = client.shutdown().await;
+
+        match call_result {
+            Ok(result) => {
+                let mut output = render_call_tool_result(&self.mcp_tool_name, result)?;
+                if let Err(err) = shutdown_result {
+                    let warning = bounded_diagnostic(format!(
+                        "MCP server shutdown after tools/call failed: {err}"
+                    ));
+                    output.summary.push_str("; shutdown warning recorded");
+                    output.content = Some(match output.content.take() {
+                        Some(content) => format!("{content}\n\nShutdown warning: {warning}"),
+                        None => format!("Shutdown warning: {warning}"),
+                    });
+                }
+                Ok(output)
+            }
+            Err(err) => {
+                let mut message = mcp_call_error_message(&err);
+                if let Err(shutdown_err) = shutdown_result {
+                    message.push_str("; shutdown after failure also failed: ");
+                    message.push_str(&bounded_diagnostic(shutdown_err.to_string()));
+                }
+                Err(ToolError::ExecutionFailed(message))
+            }
+        }
     }
+}
+
+fn parse_tool_arguments(input_json: &str) -> Result<Value, ToolError> {
+    let input = input_json.trim();
+    if input.is_empty() {
+        return Ok(Value::Object(Map::new()));
+    }
+    let value: Value = serde_json::from_str(input).map_err(|err| {
+        ToolError::InvalidArgument(format!("invalid MCP tool arguments JSON: {err}"))
+    })?;
+    Ok(match value {
+        Value::Null => Value::Object(Map::new()),
+        other => other,
+    })
+}
+
+fn mcp_call_error_message(err: &McpClientError) -> String {
+    match &err.kind {
+        McpErrorKind::JsonRpcError { .. } => {
+            format!("MCP tools/call JSON-RPC protocol error: {err}")
+        }
+        _ => format!("MCP tools/call transport/protocol failure: {err}"),
+    }
+}
+
+fn render_call_tool_result(
+    mcp_tool_name: &str,
+    result: CallToolResult,
+) -> Result<ToolOutput, ToolError> {
+    let mut truncated = false;
+    let omitted_blocks = result
+        .content
+        .len()
+        .saturating_sub(MAX_RESULT_CONTENT_BLOCKS);
+    let blocks: Vec<Value> = result
+        .content
+        .iter()
+        .take(MAX_RESULT_CONTENT_BLOCKS)
+        .map(|block| serialize_content_block(block, &mut truncated))
+        .collect();
+
+    let mut budget = ResultJsonBudget {
+        nodes: 0,
+        truncated: false,
+    };
+    let structured_content = result
+        .structured_content
+        .as_ref()
+        .map(|value| bound_result_json(value, 0, &mut budget));
+    let meta = result
+        .meta
+        .as_ref()
+        .map(|value| bound_result_json(value, 0, &mut budget));
+    let extra = if result.extra.is_empty() {
+        None
+    } else {
+        Some(bound_result_json(
+            &Value::Object(result.extra.into_iter().collect()),
+            0,
+            &mut budget,
+        ))
+    };
+    truncated |= budget.truncated || omitted_blocks > 0;
+
+    let status = if result.is_error {
+        "mcp_is_error"
+    } else {
+        "ok"
+    };
+    let mut root = Map::new();
+    root.insert("untrusted_mcp_tools_call_result".into(), Value::Bool(true));
+    root.insert(
+        "tool".into(),
+        Value::String(bounded_plain_text(mcp_tool_name, 256)),
+    );
+    root.insert("status".into(), Value::String(status.to_string()));
+    root.insert("isError".into(), Value::Bool(result.is_error));
+    root.insert("content".into(), Value::Array(blocks));
+    if omitted_blocks > 0 {
+        root.insert("omittedContentBlocks".into(), Value::from(omitted_blocks));
+    }
+    if let Some(value) = structured_content {
+        root.insert("structuredContent".into(), value);
+    }
+    if let Some(value) = meta {
+        root.insert("_meta".into(), value);
+    }
+    if let Some(value) = extra {
+        root.insert("extra".into(), value);
+    }
+    if truncated {
+        root.insert("truncated".into(), Value::Bool(true));
+    }
+
+    let mut content = serde_json::to_string_pretty(&Value::Object(root)).map_err(|err| {
+        ToolError::ExecutionFailed(format!("failed to serialize MCP tools/call result: {err}"))
+    })?;
+    if content.len() > MAX_RESULT_OUTPUT_BYTES {
+        truncate_utf8(&mut content, MAX_RESULT_OUTPUT_BYTES);
+        truncated = true;
+    }
+
+    let status_label = if result.is_error {
+        "MCP isError=true"
+    } else {
+        "success"
+    };
+    let mut summary = format!(
+        "MCP tool `{}` returned {status_label} ({} content block(s)",
+        bounded_plain_text(mcp_tool_name, 96),
+        result.content.len()
+    );
+    if result.structured_content.is_some() {
+        summary.push_str(", structuredContent");
+    }
+    if result.meta.is_some() {
+        summary.push_str(", _meta");
+    }
+    if truncated {
+        summary.push_str(", truncated");
+    }
+    summary.push(')');
+
+    Ok(ToolOutput {
+        summary,
+        content: Some(content),
+    })
+}
+
+fn serialize_content_block(block: &McpContentBlock, truncated: &mut bool) -> Value {
+    let mut out = Map::new();
+    out.insert(
+        "type".to_string(),
+        Value::String(bounded_plain_text(&block.kind, 64)),
+    );
+    match block.kind.as_str() {
+        "text" => {
+            if let Some(text) = block.fields.get("text").and_then(Value::as_str) {
+                out.insert(
+                    "text".to_string(),
+                    Value::String(bounded_text_field(text, MAX_RESULT_TEXT_CHARS, truncated)),
+                );
+            }
+        }
+        "image" | "audio" => {
+            copy_bounded_field(&mut out, block, "mimeType", truncated);
+            if let Some(data) = block.fields.get("data").and_then(Value::as_str) {
+                out.insert("dataBytes".to_string(), Value::from(data.len()));
+                out.insert("dataOmitted".to_string(), Value::Bool(true));
+                *truncated = true;
+            }
+        }
+        "resource_link" => {
+            for key in ["uri", "name", "title", "description", "mimeType"] {
+                copy_bounded_field(&mut out, block, key, truncated);
+            }
+        }
+        "resource" => {
+            if let Some(resource) = block.fields.get("resource") {
+                let mut budget = ResultJsonBudget {
+                    nodes: 0,
+                    truncated: false,
+                };
+                out.insert(
+                    "resource".to_string(),
+                    bound_result_json(resource, 0, &mut budget),
+                );
+                *truncated |= budget.truncated;
+            }
+        }
+        _ => {
+            let mut budget = ResultJsonBudget {
+                nodes: 0,
+                truncated: false,
+            };
+            out.insert(
+                "fields".to_string(),
+                bound_result_json(
+                    &Value::Object(block.fields.clone().into_iter().collect()),
+                    0,
+                    &mut budget,
+                ),
+            );
+            *truncated |= budget.truncated;
+        }
+    }
+    Value::Object(out)
+}
+
+fn copy_bounded_field(
+    out: &mut Map<String, Value>,
+    block: &McpContentBlock,
+    key: &str,
+    truncated: &mut bool,
+) {
+    if let Some(value) = block.fields.get(key) {
+        let mut budget = ResultJsonBudget {
+            nodes: 0,
+            truncated: false,
+        };
+        out.insert(key.to_string(), bound_result_json(value, 0, &mut budget));
+        *truncated |= budget.truncated;
+    }
+}
+
+struct ResultJsonBudget {
+    nodes: usize,
+    truncated: bool,
+}
+
+fn bound_result_json(value: &Value, depth: usize, budget: &mut ResultJsonBudget) -> Value {
+    budget.nodes += 1;
+    if depth > MAX_RESULT_JSON_DEPTH || budget.nodes > MAX_RESULT_JSON_NODES {
+        budget.truncated = true;
+        return Value::String("[truncated: MCP JSON result bounds exceeded]".to_string());
+    }
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
+        Value::String(text) => Value::String(bounded_text_field(
+            text,
+            MAX_RESULT_STRING_CHARS,
+            &mut budget.truncated,
+        )),
+        Value::Array(values) => {
+            let remaining = MAX_RESULT_JSON_NODES.saturating_sub(budget.nodes).max(1);
+            if values.len() > remaining {
+                budget.truncated = true;
+            }
+            Value::Array(
+                values
+                    .iter()
+                    .take(remaining)
+                    .map(|item| bound_result_json(item, depth + 1, budget))
+                    .collect(),
+            )
+        }
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (key, value) in map {
+                if budget.nodes > MAX_RESULT_JSON_NODES {
+                    budget.truncated = true;
+                    break;
+                }
+                out.insert(
+                    bounded_plain_text(key, 128),
+                    bound_result_json(value, depth + 1, budget),
+                );
+            }
+            Value::Object(out)
+        }
+    }
+}
+
+fn bounded_text_field(input: &str, max_chars: usize, truncated: &mut bool) -> String {
+    let total = input.chars().count();
+    if total <= max_chars {
+        input.to_string()
+    } else {
+        *truncated = true;
+        let mut output: String = input.chars().take(max_chars).collect();
+        output.push_str(&format!(
+            "\n[truncated: {} chars omitted]",
+            total - max_chars
+        ));
+        output
+    }
+}
+
+fn truncate_utf8(input: &mut String, max_bytes: usize) {
+    if input.len() <= max_bytes {
+        return;
+    }
+    let marker = format!("\n[truncated: {} bytes omitted]", input.len() - max_bytes);
+    let keep = max_bytes.saturating_sub(marker.len());
+    let mut boundary = keep;
+    while !input.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    input.truncate(boundary);
+    input.push_str(&marker);
 }
 
 fn provider_declaration(name: &str, version: Option<&str>) -> ProtocolProviderDeclaration {
@@ -282,7 +614,7 @@ impl McpStdioToolFeature {
 impl FeatureModule for McpStdioToolFeature {
     fn descriptor(&self) -> FeatureDescriptor {
         let mut descriptor = FeatureDescriptor::builtin(FEATURE_ID, "MCP stdio tools")
-            .with_description("Discovery-only MCP stdio tool registration");
+            .with_description("MCP stdio tool discovery and ordinary tool execution");
         descriptor.runtime = FeatureRuntimeKind::ProtocolProvider;
         for contribution in &self.contributions {
             descriptor = descriptor.with_protocol_provider(contribution.declaration.clone());
@@ -477,6 +809,10 @@ mod tests {
     use crate::feature::{FeatureDiagnosticSeverity, FeatureRegistryBuilder};
     use crate::hook::HookRegistryBuilder;
 
+    fn server_spec() -> McpStdioServerSpec {
+        McpStdioServerSpec::new("demo", "mock-mcp-server")
+    }
+
     fn mcp_tool(name: &str, description: &str, schema: Value) -> McpToolDefinition {
         McpToolDefinition {
             name: name.to_string(),
@@ -494,6 +830,7 @@ mod tests {
     fn valid_mcp_tool_normalizes_to_model_visible_definition() {
         let declaration = provider_declaration("demo server", Some("1.2.3"));
         let (name, contribution) = mcp_tool_contribution(
+            server_spec(),
             &declaration,
             "demo_server",
             Some("1.2.3"),
@@ -523,6 +860,7 @@ mod tests {
     fn valid_mcp_tool_installs_as_pending_model_visible_tool() {
         let declaration = provider_declaration("demo", Some("1.0.0"));
         let (_, tool) = mcp_tool_contribution(
+            server_spec(),
             &declaration,
             "demo",
             Some("1.0.0"),
@@ -554,6 +892,7 @@ mod tests {
     fn invalid_schema_is_rejected_with_bounded_diagnostic() {
         let declaration = provider_declaration("demo", None);
         let error = match mcp_tool_contribution(
+            server_spec(),
             &declaration,
             "demo",
             None,
@@ -580,6 +919,7 @@ mod tests {
             extra: BTreeMap::new(),
         };
         let contribution = normalize_listed_tools(
+            server_spec(),
             ProtocolProviderContribution::ready(declaration.clone()),
             declaration,
             "demo".to_string(),
@@ -611,6 +951,119 @@ mod tests {
             .collect();
         assert!(!names.iter().any(|name| name == "Mcp_demo_search_files"));
         assert!(names.iter().any(|name| name == "Mcp_demo_unique"));
+    }
+
+    fn shell_tool_server(response: &str) -> McpStdioServerSpec {
+        let script = format!(
+            r#"read init || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2025-06-18","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"shell-mock","version":"1"}}}}}}'
+read initialized || exit 1
+read call || exit 1
+case "$call" in *'"method":"tools/call"'*|*'"method": "tools/call"'*) ;; *) echo "expected tools/call, got $call" >&2; exit 2;; esac
+printf '%s\n' '{}'
+read shutdown || exit 1
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{}}}}'
+read exit_notification || true
+"#,
+            response.replace('\\', "\\\\").replace('\'', "'\\''")
+        );
+        McpStdioServerSpec::new("shell-mock", "/bin/sh").args(["-c".to_string(), script])
+    }
+
+    #[tokio::test]
+    async fn stdio_tool_execute_returns_normal_result_through_tool_output() {
+        let response = r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ordinary result"}],"structuredContent":{"ok":true}}}"#;
+        let tool = McpStdioTool {
+            server_spec: shell_tool_server(response),
+            mcp_tool_name: "demo-tool".to_string(),
+        };
+        let output = tool
+            .execute(r#"{"query":"needle"}"#, ToolExecutionContext::direct())
+            .await
+            .expect("execute");
+        assert!(output.summary.contains("returned success"));
+        let content = output.content.unwrap();
+        assert!(content.contains("untrusted_mcp_tools_call_result"));
+        assert!(content.contains("ordinary result"));
+        assert!(content.contains("structuredContent"));
+    }
+
+    #[tokio::test]
+    async fn stdio_tool_execute_reports_protocol_failure_distinctly() {
+        let response = r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"boom"}}"#;
+        let tool = McpStdioTool {
+            server_spec: shell_tool_server(response),
+            mcp_tool_name: "demo-tool".to_string(),
+        };
+        let err = tool
+            .execute(r#"{}"#, ToolExecutionContext::direct())
+            .await
+            .expect_err("protocol error");
+        assert!(
+            err.to_string()
+                .contains("MCP tools/call JSON-RPC protocol error")
+        );
+    }
+
+    #[test]
+    fn call_tool_result_renderer_marks_untrusted_mcp_error() {
+        let result = CallToolResult {
+            content: vec![McpContentBlock {
+                kind: "text".to_string(),
+                fields: BTreeMap::from([(
+                    "text".to_string(),
+                    Value::String("tool-level failure".to_string()),
+                )]),
+            }],
+            structured_content: Some(json!({"diagnostic": "visible"})),
+            is_error: true,
+            meta: Some(json!({"trace": "metadata"})),
+            extra: BTreeMap::new(),
+        };
+        let output = render_call_tool_result("search-files", result).expect("render");
+        assert!(output.summary.contains("MCP isError=true"));
+        let content = output.content.unwrap();
+        assert!(content.contains("untrusted_mcp_tools_call_result"));
+        assert!(content.contains("\"status\": \"mcp_is_error\""));
+        assert!(content.contains("tool-level failure"));
+        assert!(content.contains("structuredContent"));
+        assert!(content.contains("_meta"));
+    }
+
+    #[test]
+    fn call_tool_result_renderer_bounds_rich_outputs() {
+        let result = CallToolResult {
+            content: vec![
+                McpContentBlock {
+                    kind: "text".to_string(),
+                    fields: BTreeMap::from([(
+                        "text".to_string(),
+                        Value::String("x".repeat(MAX_RESULT_TEXT_CHARS + 128)),
+                    )]),
+                },
+                McpContentBlock {
+                    kind: "image".to_string(),
+                    fields: BTreeMap::from([
+                        (
+                            "mimeType".to_string(),
+                            Value::String("image/png".to_string()),
+                        ),
+                        ("data".to_string(), Value::String("A".repeat(1024))),
+                    ]),
+                },
+            ],
+            structured_content: Some(json!({"long": "y".repeat(MAX_RESULT_STRING_CHARS + 64)})),
+            is_error: false,
+            meta: None,
+            extra: BTreeMap::new(),
+        };
+        let output = render_call_tool_result("rich", result).expect("render");
+        assert!(output.summary.contains("truncated"));
+        let content = output.content.unwrap();
+        assert!(content.len() <= MAX_RESULT_OUTPUT_BYTES + 128);
+        assert!(content.contains("dataOmitted"));
+        assert!(content.contains("truncated"));
+        assert!(!content.contains(&"A".repeat(512)));
     }
 
     #[test]
