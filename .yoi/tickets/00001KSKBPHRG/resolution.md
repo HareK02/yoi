@@ -1,0 +1,1 @@
+Closed as superseded/no longer needed. Workflow evaluation metrics and improvement planning have moved under the newer Memory redesign / team-workspace memory objectives, so this old prompt/workflow metrics ticket should not remain as a standalone planning item.

@@ -1,8 +1,8 @@
 ---
 title: "Prompt / Workflow 評価メトリクスと改善 Offer"
-state: "planning"
+state: 'closed'
 created_at: "2026-05-27T00:00:10Z"
-updated_at: "2026-05-27T00:00:10Z"
+updated_at: '2026-06-20T16:31:29Z'
 ---
 
 ## Migration reference

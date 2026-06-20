@@ -1,0 +1,1 @@
+Closed as no longer needed. Arbitrary-turn Pod/session fork and multi-turn rewind are not part of the current desired workflow; current restore/rewind/fork behavior is sufficient for active use, and future history editing should be reopened as a narrower current-runtime design if needed.

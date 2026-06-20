@@ -1,8 +1,8 @@
 ---
 title: "TUI: navigation mode / block focus の設計"
-state: "planning"
+state: 'closed'
 created_at: "2026-05-27T00:00:15Z"
-updated_at: "2026-05-27T00:00:15Z"
+updated_at: '2026-06-20T16:31:29Z'
 ---
 
 ## Migration reference

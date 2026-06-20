@@ -1,8 +1,8 @@
 ---
 title: "Pod: 任意ターンからの Fork（複数ターン巻き戻し）"
-state: "planning"
+state: 'closed'
 created_at: "2026-05-27T00:00:09Z"
-updated_at: "2026-05-27T00:00:09Z"
+updated_at: '2026-06-20T16:31:29Z'
 ---
 
 ## Migration reference
