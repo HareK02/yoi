@@ -2,7 +2,7 @@
 title: 'Plugin: add authoring CLI new/check/pack'
 state: 'queued'
 created_at: '2026-06-20T04:16:14Z'
-updated_at: '2026-06-20T05:23:14Z'
+updated_at: '2026-06-20T05:23:44Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['plugin', 'cli', 'authoring', 'templates', 'package-validation', 'packaging', 'read-only-check']
