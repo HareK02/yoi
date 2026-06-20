@@ -209,3 +209,46 @@ Reviewer validation:
 Worktree status at review end: clean。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T07:28:20Z -->
+
+## Implementation report
+
+Merge and final validation report:
+
+Merged implementation branch into Orchestrator branch:
+- Merge commit: `9b7c4e27 merge: mcp stdio config trust`
+- Implementation commit included:
+  - `e0680cce mcp: add stdio server config`
+
+Reviewer outcome:
+- r1 approved with no blocking issues。
+- Reviewer confirmed config-only boundary, no subprocess/MCP lifecycle implementation, redaction behavior, Profile/config integration, docs trust boundary, and that `cargo test -p manifest --lib` failure is unrelated/pre-existing plugin template test mismatch。
+
+Orchestrator validation after merge passed:
+- `cargo fmt --all --check`
+- `git diff --check HEAD^1..HEAD`
+- `cargo test -p manifest mcp --lib`
+- `cargo check`
+- `nix build .#yoi --no-link`
+- `nix path-info -S .#yoi`: `112615056`
+
+Validation log:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/bash-uxMpR3.log`
+
+Known unrelated validation note:
+- Full `cargo test -p manifest --lib` was not used as a final gate because Reviewer confirmed an unrelated/pre-existing plugin template-shape failure outside this branch's diff。
+
+Final state:
+- Orchestrator worktree clean at `9b7c4e27` after validation。
+- Implementation worktree remains available for cleanup after Ticket completion records are committed。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-20T07:28:26Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Implementation was merged into Orchestrator branch at `9b7c4e27`, review approved, and final Orchestrator validation passed: `cargo fmt --all --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p manifest mcp --lib`, `cargo check`, and `nix build .#yoi --no-link`.
+
+---
