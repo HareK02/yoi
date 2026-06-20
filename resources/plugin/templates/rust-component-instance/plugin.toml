@@ -1,0 +1,35 @@
+schema_version = 1
+id = "example.rust_instance_plugin"
+name = "Rust Instance Plugin Template"
+version = "0.1.0"
+description = "Example instance-oriented Yoi Plugin with shared Tool/Ingress state."
+surfaces = ["tool", "service", "ingress"]
+permissions = [
+  { kind = "surface", surface = "tool" },
+  { kind = "tool", name = "example_instance_tool" },
+  { kind = "surface", surface = "service" },
+  { kind = "service", name = "example_instance_service" },
+  { kind = "surface", surface = "ingress" },
+  { kind = "ingress", name = "example_instance_ingress" },
+]
+
+[runtime]
+kind = "wasm-component"
+world = "yoi:plugin/instance@1.0.0"
+component = "plugin.component.wasm"
+
+[[tools]]
+name = "example_instance_tool"
+description = "Return the input and increment shared instance state."
+input_schema = { type = "object" }
+
+[[services]]
+name = "example_instance_service"
+description = "Reports shared plugin instance lifecycle status."
+lifecycle = "host-managed"
+
+[[ingresses]]
+name = "example_instance_ingress"
+description = "Accepts bounded in-process ingress events."
+event_kinds = ["example"]
+input_schema = { type = "object" }

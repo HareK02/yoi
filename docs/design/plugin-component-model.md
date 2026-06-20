@@ -179,3 +179,26 @@ semantics while moving package authors onto WIT/canonical ABI bindings.
 Structured WIT records for Tool requests/responses/errors and host HTTPS/FS
 payloads are deferred to a follow-up API-design step rather than accidentally
 omitted.
+
+## Instance lifecycle surface
+
+The first instance-capable world is `yoi:plugin/instance@1.0.0`. It moves
+runtime ownership from per-Tool artifact execution to a host-managed
+`PluginInstance`. The same instance handles Tool, Service, and Ingress surfaces,
+so Plugin state/config/diagnostics can be shared without bypassing Yoi's normal
+authority model.
+
+Important boundaries:
+
+- Tool calls still enter through `ToolRegistry` and return ordinary `ToolOutput`
+  that is visible in the Worker history path.
+- Service and Ingress grants are separate from Tool grants. Sharing an instance
+  does not authorize a surface that lacks its own `surface.*` and per-surface
+  permission/grant.
+- Ingress delivery accepts bounded typed untrusted events and returns explicit
+  JSON to the host. It does not call model Tools or mutate LLM context/history.
+- Legacy raw-wasm and `yoi:plugin/tool@1.0.0` component packages are adapted
+  behind `PluginInstanceRegistry` for compatibility rather than executed through
+  a separate authority path.
+- Host APIs such as `https` and `fs` remain independently grant-gated and still
+  reject ambient filesystem/network authority.

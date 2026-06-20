@@ -57,6 +57,40 @@ pub const RUST_COMPONENT_TOOL_TEMPLATE: &[PluginTemplateResource] = &[
     },
 ];
 
+/// Embedded starter template for Rust Component Model instance Plugins.
+pub const RUST_COMPONENT_INSTANCE_TEMPLATE: &[PluginTemplateResource] = &[
+    PluginTemplateResource {
+        path: "Cargo.toml",
+        contents: include_str!(
+            "../../../resources/plugin/templates/rust-component-instance/Cargo.toml"
+        ),
+    },
+    PluginTemplateResource {
+        path: "src/lib.rs",
+        contents: include_str!(
+            "../../../resources/plugin/templates/rust-component-instance/src/lib.rs"
+        ),
+    },
+    PluginTemplateResource {
+        path: "plugin.toml",
+        contents: include_str!(
+            "../../../resources/plugin/templates/rust-component-instance/plugin.toml"
+        ),
+    },
+    PluginTemplateResource {
+        path: "plugin.component.wasm",
+        contents: include_str!(
+            "../../../resources/plugin/templates/rust-component-instance/plugin.component.wasm"
+        ),
+    },
+    PluginTemplateResource {
+        path: "README.md",
+        contents: include_str!(
+            "../../../resources/plugin/templates/rust-component-instance/README.md"
+        ),
+    },
+];
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PluginConfig {
@@ -170,6 +204,8 @@ pub enum PluginPermission {
     Surface { surface: PluginSurface },
     Tool { name: String },
     ToolNamespace { namespace: String },
+    Service { name: String },
+    Ingress { name: String },
     ExternalWrite,
     HostApi { api: PluginHostApi },
 }
@@ -249,6 +285,8 @@ impl PluginPermission {
             Self::Surface { surface } => format!("surfaces.{surface}"),
             Self::Tool { name } => format!("tool.{name}"),
             Self::ToolNamespace { namespace } => format!("tool_namespace.{namespace}"),
+            Self::Service { name } => format!("service.{name}"),
+            Self::Ingress { name } => format!("ingress.{name}"),
             Self::ExternalWrite => "external_write".to_string(),
             Self::HostApi { api } => format!("host_api.{api}"),
         }
@@ -266,6 +304,14 @@ impl PluginPermission {
         Self::ToolNamespace {
             namespace: namespace.into(),
         }
+    }
+
+    pub fn service(name: impl Into<String>) -> Self {
+        Self::Service { name: name.into() }
+    }
+
+    pub fn ingress(name: impl Into<String>) -> Self {
+        Self::Ingress { name: name.into() }
     }
 
     pub fn host_api(api: PluginHostApi) -> Self {
@@ -382,7 +428,7 @@ pub enum PluginIdParseError {
     InvalidLocalId,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginPackageManifest {
     pub schema_version: u32,
@@ -398,6 +444,10 @@ pub struct PluginPackageManifest {
     pub hooks: Vec<PluginHookManifest>,
     #[serde(default)]
     pub tools: Vec<PluginToolManifest>,
+    #[serde(default)]
+    pub services: Vec<PluginServiceManifest>,
+    #[serde(default)]
+    pub ingresses: Vec<PluginIngressManifest>,
     /// Permission requests declared by the package. These are requests only;
     /// enablement grants must match them before runtime surfaces are exposed.
     #[serde(default)]
@@ -412,6 +462,12 @@ impl PluginPackageManifest {
         }
         if !self.tools.is_empty() {
             surfaces.insert(PluginSurface::Tool);
+        }
+        if !self.services.is_empty() {
+            surfaces.insert(PluginSurface::Service);
+        }
+        if !self.ingresses.is_empty() {
+            surfaces.insert(PluginSurface::Ingress);
         }
         if self.runtime.is_some() {
             surfaces.insert(PluginSurface::Wasm);
@@ -429,6 +485,7 @@ pub const PLUGIN_RUNTIME_WASM_ABI: &str = "yoi-plugin-wasm-1";
 /// packages remain explicit `kind = "wasm"` plus `abi = "yoi-plugin-wasm-1"`.
 pub const PLUGIN_RUNTIME_COMPONENT_KIND: &str = "wasm-component";
 pub const PLUGIN_COMPONENT_TOOL_WORLD: &str = "yoi:plugin/tool@1.0.0";
+pub const PLUGIN_COMPONENT_INSTANCE_WORLD: &str = "yoi:plugin/instance@1.0.0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -462,6 +519,34 @@ pub struct PluginToolManifest {
     /// request and grant before registration or execution.
     #[serde(default)]
     pub external_write: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginServiceManifest {
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub lifecycle: String,
+    #[serde(default)]
+    pub status_schema: Option<serde_json::Value>,
+    #[serde(default)]
+    pub side_effects: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginIngressManifest {
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub event_kinds: Vec<String>,
+    #[serde(default)]
+    pub input_schema: Option<serde_json::Value>,
+    #[serde(default)]
+    pub sources: Vec<String>,
+    #[serde(default)]
+    pub side_effects: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -514,7 +599,7 @@ impl PluginDiscoveryOptions {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DiscoveredPluginPackage {
     pub identity: SourceQualifiedPluginId,
     pub package_path: PathBuf,
@@ -529,19 +614,19 @@ pub struct DiscoveredPluginPackage {
 /// This is data-only metadata and bytes. Constructing it parses manifests and
 /// validates package/archive shape, but it does not load, instantiate, or
 /// execute Plugin code.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MaterializedPluginPackage {
     pub package: DiscoveredPluginPackage,
     pub files: BTreeMap<String, Vec<u8>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PackedPluginPackage {
     pub output_path: PathBuf,
     pub package: DiscoveredPluginPackage,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PluginDiscoveryReport {
     pub packages: Vec<DiscoveredPluginPackage>,
     pub diagnostics: Vec<PluginDiagnostic>,
@@ -1072,7 +1157,10 @@ pub fn read_resolved_plugin_runtime_component(
         .with_package(&record.package_label)
         .with_digest(&record.digest));
     }
-    if runtime.world.as_deref() != Some(PLUGIN_COMPONENT_TOOL_WORLD) {
+    if !matches!(
+        runtime.world.as_deref(),
+        Some(PLUGIN_COMPONENT_TOOL_WORLD) | Some(PLUGIN_COMPONENT_INSTANCE_WORLD)
+    ) {
         return Err(PluginDiagnostic::new(
             PluginDiagnosticKind::Api,
             PluginDiagnosticPhase::Manifest,
@@ -1918,7 +2006,10 @@ fn validate_manifest(
                     .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
                     .with_package(label));
                 }
-                if runtime.world.as_deref() != Some(PLUGIN_COMPONENT_TOOL_WORLD) {
+                if !matches!(
+                    runtime.world.as_deref(),
+                    Some(PLUGIN_COMPONENT_TOOL_WORLD) | Some(PLUGIN_COMPONENT_INSTANCE_WORLD)
+                ) {
                     return Err(PluginDiagnostic::new(
                         PluginDiagnosticKind::Api,
                         PluginDiagnosticPhase::Manifest,
@@ -1950,6 +2041,44 @@ fn validate_manifest(
                 .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
                 .with_package(label));
             }
+        }
+    }
+    let instance_capable = manifest.runtime.as_ref().is_some_and(|runtime| {
+        runtime.kind == PLUGIN_RUNTIME_COMPONENT_KIND
+            && runtime.world.as_deref() == Some(PLUGIN_COMPONENT_INSTANCE_WORLD)
+    });
+    if (!manifest.services.is_empty() || !manifest.ingresses.is_empty()) && !instance_capable {
+        return Err(PluginDiagnostic::new(
+            PluginDiagnosticKind::Surface,
+            PluginDiagnosticPhase::Manifest,
+            "plugin service/ingress declarations require the yoi:plugin/instance@1.0.0 component world",
+        )
+        .with_source(source)
+        .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
+        .with_package(label));
+    }
+    for service in &manifest.services {
+        if !is_safe_id(&service.name) {
+            return Err(PluginDiagnostic::new(
+                PluginDiagnosticKind::Malformed,
+                PluginDiagnosticPhase::Manifest,
+                "plugin service name is not safe",
+            )
+            .with_source(source)
+            .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
+            .with_package(label));
+        }
+    }
+    for ingress in &manifest.ingresses {
+        if !is_safe_id(&ingress.name) {
+            return Err(PluginDiagnostic::new(
+                PluginDiagnosticKind::Malformed,
+                PluginDiagnosticPhase::Manifest,
+                "plugin ingress name is not safe",
+            )
+            .with_source(source)
+            .with_identity(SourceQualifiedPluginId::new(source, manifest.id.clone()))
+            .with_package(label));
         }
     }
     for hook in &manifest.hooks {
@@ -2425,7 +2554,13 @@ mod tests {
             .collect();
         assert_eq!(
             paths,
-            BTreeSet::from(["Cargo.toml", "src/lib.rs", "plugin.toml", "README.md"])
+            BTreeSet::from([
+                "Cargo.toml",
+                "src/lib.rs",
+                "plugin.toml",
+                "plugin.component.wasm",
+                "README.md",
+            ])
         );
         assert!(
             RUST_COMPONENT_TOOL_TEMPLATE
@@ -2449,6 +2584,86 @@ mod tests {
             Some(PLUGIN_COMPONENT_TOOL_WORLD)
         );
         assert_eq!(manifest.tools.len(), 1);
+    }
+
+    #[test]
+    fn embedded_rust_component_instance_template_is_valid_package_shape() {
+        let paths: BTreeSet<_> = RUST_COMPONENT_INSTANCE_TEMPLATE
+            .iter()
+            .map(|file| file.path)
+            .collect();
+        assert_eq!(
+            paths,
+            BTreeSet::from([
+                "Cargo.toml",
+                "src/lib.rs",
+                "plugin.toml",
+                "plugin.component.wasm",
+                "README.md"
+            ])
+        );
+        assert!(
+            RUST_COMPONENT_INSTANCE_TEMPLATE
+                .iter()
+                .all(|file| !file.path.starts_with('/') && !file.path.contains(".."))
+        );
+        let manifest_text = RUST_COMPONENT_INSTANCE_TEMPLATE
+            .iter()
+            .find(|file| file.path == "plugin.toml")
+            .unwrap()
+            .contents;
+        let manifest: PluginPackageManifest = toml::from_str(manifest_text).unwrap();
+        assert_eq!(
+            manifest.runtime.as_ref().unwrap().world.as_deref(),
+            Some(PLUGIN_COMPONENT_INSTANCE_WORLD)
+        );
+        assert_eq!(manifest.services.len(), 1);
+        assert_eq!(manifest.ingresses.len(), 1);
+        assert!(
+            manifest
+                .declared_surfaces()
+                .contains(&PluginSurface::Service)
+        );
+        assert!(
+            manifest
+                .declared_surfaces()
+                .contains(&PluginSurface::Ingress)
+        );
+    }
+
+    #[test]
+    fn service_ingress_require_instance_component_world() {
+        let manifest: PluginPackageManifest = toml::from_str(
+            r#"
+schema_version = 1
+id = "bad.service"
+name = "Bad Service"
+version = "0.1.0"
+surfaces = ["service"]
+permissions = [{ kind = "surface", surface = "service" }, { kind = "service", name = "svc" }]
+
+[runtime]
+kind = "wasm-component"
+world = "yoi:plugin/tool@1.0.0"
+component = "plugin.component.wasm"
+
+[[services]]
+name = "svc"
+description = "bad"
+"#,
+        )
+        .unwrap();
+        let archive = StoredArchive {
+            files: BTreeMap::from([("plugin.component.wasm".to_string(), b"placeholder".to_vec())]),
+        };
+        let err = validate_manifest(
+            &manifest,
+            &archive,
+            "bad.service",
+            PluginSourceKind::Project,
+        )
+        .unwrap_err();
+        assert!(err.message.contains("service/ingress"));
     }
 
     #[test]
