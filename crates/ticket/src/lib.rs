@@ -1650,11 +1650,15 @@ impl TicketBackend for LocalTicketBackend {
         let item = dir.join("item.md");
         let meta = ticket_meta_for_dir(&dir, read_item_file(&item)?.frontmatter)?;
         let blockers = self.relation_blockers_for_meta(&meta)?;
-        if !blockers.is_empty() {
+        let active_blockers = blockers
+            .into_iter()
+            .filter(|blocker| !relation_blocker_allows_queue(blocker))
+            .collect::<Vec<_>>();
+        if !active_blockers.is_empty() {
             return Err(TicketError::Conflict(format!(
                 "ticket {} has unresolved blocking relation(s): {}",
                 meta.id,
-                format_relation_blockers(&blockers)
+                format_relation_blockers(&active_blockers)
             )));
         }
         let at = now_utc();
@@ -2548,6 +2552,13 @@ fn relation_view_from_records(
             .then_with(|| a.related_ticket.cmp(&b.related_ticket))
     });
     view
+}
+
+fn relation_blocker_allows_queue(blocker: &TicketRelationBlocker) -> bool {
+    matches!(
+        blocker.blocking_state,
+        TicketWorkflowState::Queued | TicketWorkflowState::InProgress
+    )
 }
 
 fn format_relation_blockers(blockers: &[TicketRelationBlocker]) -> String {
@@ -4406,6 +4417,65 @@ state: planning
             .unwrap();
         assert_eq!(queried.len(), 1);
         assert_eq!(backend.doctor().unwrap().error_count(), 0);
+    }
+
+    #[test]
+    fn queue_gate_allows_ready_ticket_when_blocking_relation_is_already_queued_or_inprogress() {
+        let tmp = TempDir::new().unwrap();
+        let backend = backend(&tmp);
+        let mut waiter_input = NewTicket::new("Ready After Queued Dependency");
+        waiter_input.workflow_state = Some(TicketWorkflowState::Ready);
+        let waiter = backend.create(waiter_input).unwrap();
+        let mut dependency_input = NewTicket::new("Queued Dependency");
+        dependency_input.workflow_state = Some(TicketWorkflowState::Queued);
+        let dependency = backend.create(dependency_input).unwrap();
+        backend
+            .add_ticket_relation(
+                TicketIdOrSlug::Id(waiter.id.clone()),
+                NewTicketRelation {
+                    kind: TicketRelationKind::DependsOn,
+                    target: dependency.id.clone(),
+                    note: None,
+                    author: Some("test".to_string()),
+                },
+            )
+            .unwrap();
+
+        backend
+            .queue_ready(TicketIdOrSlug::Id(waiter.id.clone()), "test")
+            .unwrap();
+        let queued = backend.show(TicketIdOrSlug::Id(waiter.id.clone())).unwrap();
+        assert_eq!(queued.meta.workflow_state, TicketWorkflowState::Queued);
+        assert_eq!(queued.meta.queued_by.as_deref(), Some("test"));
+
+        let mut incoming_input = NewTicket::new("Ready After Inprogress Blocker");
+        incoming_input.workflow_state = Some(TicketWorkflowState::Ready);
+        let incoming = backend.create(incoming_input).unwrap();
+        let mut blocker_input = NewTicket::new("Inprogress Blocker");
+        blocker_input.workflow_state = Some(TicketWorkflowState::InProgress);
+        let blocker = backend.create(blocker_input).unwrap();
+        backend
+            .add_ticket_relation(
+                TicketIdOrSlug::Id(blocker.id.clone()),
+                NewTicketRelation {
+                    kind: TicketRelationKind::Blocks,
+                    target: incoming.id.clone(),
+                    note: None,
+                    author: Some("test".to_string()),
+                },
+            )
+            .unwrap();
+
+        backend
+            .queue_ready(TicketIdOrSlug::Id(incoming.id.clone()), "test")
+            .unwrap();
+        let queued_incoming = backend
+            .show(TicketIdOrSlug::Id(incoming.id.clone()))
+            .unwrap();
+        assert_eq!(
+            queued_incoming.meta.workflow_state,
+            TicketWorkflowState::Queued
+        );
     }
 
     #[test]
