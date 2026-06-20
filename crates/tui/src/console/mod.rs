@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -30,9 +31,15 @@ use crate::app::{ActionbarNoticeLevel, ActionbarNoticeSource, App};
 use crate::composer_keys::{ComposerEditAction, composer_edit_action};
 use crate::picker::PickerOutcome;
 use crate::spawn::{SpawnOutcome, SpawnReady};
-use crate::{multi_pod, picker, spawn, ui};
+use crate::{picker, spawn, ui};
 
-type FullscreenTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+pub(crate) type ConsoleTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+
+/// Narrow request bridge used when the workspace Dashboard opens a Pod Console.
+pub(crate) struct DashboardConsoleOpenRequest {
+    pub(crate) pod_name: String,
+    pub(crate) socket_override: Option<PathBuf>,
+}
 
 /// Enable SGR coordinates plus normal mouse tracking. This captures clicks,
 /// releases, and wheel events without drag-capture modes (`?1002h`/`?1003h`)
@@ -58,13 +65,13 @@ impl Command for EnableSinglePodMouseCapture {
     }
 }
 
-/// Enable Panel mouse input without drag tracking. The Panel only needs button
-/// presses/releases and wheel events; enabling `?1002h` can make terminal drag
-/// selection look captured and is intentionally avoided for Panel startup.
+/// Enable Dashboard mouse input without drag tracking. The Dashboard only needs
+/// button presses/releases and wheel events; enabling `?1002h` can make terminal
+/// drag selection look captured and is intentionally avoided before startup.
 #[derive(Debug, Clone, Copy)]
-struct EnablePanelMouseCapture;
+struct EnableDashboardMouseCapture;
 
-impl Command for EnablePanelMouseCapture {
+impl Command for EnableDashboardMouseCapture {
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
         // 1006: SGR extended coordinates used by crossterm's parser
         // 1000: normal mouse tracking (button presses/releases and wheel)
@@ -165,7 +172,7 @@ pub(crate) async fn run_pod_name(
 }
 
 async fn run_connected_pod(
-    terminal: &mut FullscreenTerminal,
+    terminal: &mut ConsoleTerminal,
     pod_name: String,
     client: PodClient,
     runtime_command: PodRuntimeCommand,
@@ -176,12 +183,12 @@ async fn run_connected_pod(
     run_loop(terminal, &mut app, client, runtime_command).await
 }
 
-async fn run_pod_name_nested(
-    terminal: &mut FullscreenTerminal,
-    request: multi_pod::OpenPodRequest,
+pub(crate) async fn open_from_dashboard(
+    terminal: &mut ConsoleTerminal,
+    request: DashboardConsoleOpenRequest,
     runtime_command: PodRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let multi_pod::OpenPodRequest {
+    let DashboardConsoleOpenRequest {
         pod_name,
         socket_override,
     } = request;
@@ -196,7 +203,7 @@ async fn run_pod_name_nested(
 }
 
 async fn spawn_pod_name_from_fullscreen(
-    terminal: &mut FullscreenTerminal,
+    terminal: &mut ConsoleTerminal,
     pod_name: &str,
     runtime_command: PodRuntimeCommand,
 ) -> Result<SpawnReady, Box<dyn std::error::Error>> {
@@ -233,7 +240,7 @@ impl std::fmt::Display for NestedOpenCancelled {
 impl std::error::Error for NestedOpenCancelled {}
 
 async fn run_ready_pod(
-    terminal: &mut FullscreenTerminal,
+    terminal: &mut ConsoleTerminal,
     ready: SpawnReady,
     runtime_command: PodRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -281,36 +288,7 @@ pub(crate) async fn run_resume(
     run_pod_name(pod_name, socket_override, runtime_command).await
 }
 
-pub(crate) async fn run_panel(
-    runtime_command: PodRuntimeCommand,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut app = multi_pod::load_app(runtime_command.clone()).await?;
-    let mut terminal = enter_panel_fullscreen()?;
-
-    loop {
-        match multi_pod::run(&mut terminal, &mut app).await? {
-            multi_pod::MultiPodOutcome::Quit => {
-                let _ = leave_fullscreen(&mut terminal);
-                return Ok(());
-            }
-            multi_pod::MultiPodOutcome::Open(request) => {
-                let pod_name = request.pod_name.clone();
-                match run_pod_name_nested(&mut terminal, request, runtime_command.clone()).await {
-                    Ok(()) => app.finish_open(&pod_name, Ok(())),
-                    Err(error) if is_recoverable_multi_open_error(error.as_ref()) => {
-                        app.finish_open(&pod_name, Err(error.as_ref()));
-                    }
-                    Err(error) => {
-                        let _ = leave_fullscreen(&mut terminal);
-                        return Err(error);
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn is_recoverable_multi_open_error(error: &(dyn std::error::Error + 'static)) -> bool {
+pub(crate) fn is_recoverable_dashboard_open_error(error: &(dyn Error + 'static)) -> bool {
     error.is::<spawn::SpawnError>() || error.is::<NestedOpenCancelled>()
 }
 
@@ -353,7 +331,7 @@ pub(crate) async fn run_spawn(
     result
 }
 
-fn enter_fullscreen() -> Result<FullscreenTerminal, Box<dyn std::error::Error>> {
+fn enter_fullscreen() -> Result<ConsoleTerminal, Box<dyn std::error::Error>> {
     let mut stdout = io::stdout();
     // Enable button-event tracking so the transcript can own drag selection;
     // avoid all-motion capture because hover-motion reports are unnecessary.
@@ -362,17 +340,17 @@ fn enter_fullscreen() -> Result<FullscreenTerminal, Box<dyn std::error::Error>> 
     Ok(Terminal::new(backend)?)
 }
 
-fn enter_panel_fullscreen() -> Result<FullscreenTerminal, Box<dyn std::error::Error>> {
+pub(crate) fn enter_dashboard_fullscreen() -> Result<ConsoleTerminal, Box<dyn std::error::Error>> {
     let mut stdout = io::stdout();
-    // Panel needs clicks and wheel input only; do not capture drag motion before
+    // Dashboard needs clicks and wheel input only; do not capture drag motion before
     // the first visible frame.
-    execute!(stdout, EnterAlternateScreen, EnablePanelMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableDashboardMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     Ok(Terminal::new(backend)?)
 }
 
 fn enter_fullscreen_existing(
-    terminal: &mut FullscreenTerminal,
+    terminal: &mut ConsoleTerminal,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Re-enable the same least-intrusive wheel mouse mode after returning from
     // nested inline screens.
@@ -384,7 +362,7 @@ fn enter_fullscreen_existing(
     Ok(())
 }
 
-fn leave_fullscreen(terminal: &mut FullscreenTerminal) -> io::Result<()> {
+fn leave_fullscreen(terminal: &mut ConsoleTerminal) -> io::Result<()> {
     execute!(
         terminal.backend_mut(),
         DisableMouseCapture,
@@ -392,8 +370,12 @@ fn leave_fullscreen(terminal: &mut FullscreenTerminal) -> io::Result<()> {
     )
 }
 
+pub(crate) fn leave_dashboard_fullscreen(terminal: &mut ConsoleTerminal) -> io::Result<()> {
+    leave_fullscreen(terminal)
+}
+
 async fn run(
-    terminal: &mut FullscreenTerminal,
+    terminal: &mut ConsoleTerminal,
     pod_name: String,
     socket_path: &std::path::Path,
     runtime_command: PodRuntimeCommand,
@@ -480,7 +462,7 @@ fn read_terminal_events(stop: Arc<AtomicBool>, tx: mpsc::UnboundedSender<Termina
 
 #[cfg(feature = "e2e-test")]
 async fn run_e2e_rewind_fixture(
-    terminal: &mut FullscreenTerminal,
+    terminal: &mut ConsoleTerminal,
     pod_name: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));

@@ -22,7 +22,7 @@ A Ticket may represent a feature, bug, cleanup, design decision, investigation, 
 
 Use the highest-level interface that matches the work:
 
-- Use `yoi panel` for the Ticket/Intake/Orchestrator workspace UI and role-launch actions.
+- Use `yoi panel` for the Ticket/Intake/Orchestrator workspace Dashboard and role-launch actions.
 - Use `yoi objective ...` for lightweight medium-term Objective records and their non-blocking canonical Ticket links.
 - Inside Pods, use typed Ticket tools to create, inspect, comment, review, and close Tickets.
 - For multi-step work, follow the Ticket Intake, Orchestrator Routing, planning/requirements-sync, and Multi-agent workflows.
@@ -268,9 +268,9 @@ Before closing, verify concrete evidence:
 
 Close with a resolution that summarizes what changed, key commits, validation, review state, and remaining follow-ups.
 
-## Workspace panel Ticket role actions
+## Workspace Dashboard Ticket role actions
 
-`yoi panel` is the active Ticket/Intake/Orchestrator UI. It owns fixed Ticket role-launch actions and uses the shared client Ticket role launcher. The single-Pod TUI no longer supports `:ticket ...` commands; typing them in command mode is treated like any other unknown command.
+`yoi panel` is the active Ticket/Intake/Orchestrator Dashboard. It owns fixed Ticket role-launch actions and uses the shared client Ticket role launcher. The single-Pod Console no longer supports `:ticket ...` commands; typing them in command mode is treated like any other unknown command.
 
 Role actions map to the same fixed roles configured in `.yoi/ticket.config.toml`:
 
@@ -279,24 +279,24 @@ Role actions map to the same fixed roles configured in `.yoi/ticket.config.toml`
 - implement launches the coder role for an implementation assignment.
 - review launches the reviewer role for review.
 
-All actions are explicit and user-triggered. They are not a scheduler, queue, spawned-Pod panel, or automatic maintainer loop.
+All actions are explicit and user-triggered. They are not a scheduler, queue, spawned-Pod Dashboard, or automatic maintainer loop.
 
-### Panel execution path
+### Dashboard execution path
 
 The role-launch path is:
 
 ```text
 User triggers a Ticket action in yoi panel
-  -> panel builds a TicketRoleLaunchContext
+  -> Dashboard builds a TicketRoleLaunchContext
   -> client Ticket role launcher reads .yoi/ticket.config.toml
   -> launcher selects the role Profile and workflow
   -> launcher spawns the role Pod
   -> launcher sends Method::Run with WorkflowInvoke + Text segments
   -> launcher waits for run-acceptance evidence
-  -> panel reports success/failure
+  -> Dashboard reports success/failure
 ```
 
-The launched Pod receives dynamic Ticket/action context as its first committed run input. The panel does not inject hidden context, does not write Ticket files directly, and does not construct prompt/workflow segments by hand.
+The launched Pod receives dynamic Ticket/action context as its first committed run input. The Dashboard does not inject hidden context, does not write Ticket files directly, and does not construct prompt/workflow segments by hand.
 
 The first run input contains:
 
@@ -308,9 +308,9 @@ The first run input contains:
 
 The selected Profile supplies durable system/role behavior. `ticket.config.toml` does not override system instruction.
 
-### Panel setup
+### Dashboard setup
 
-Because top-level role launches cannot inherit a parent Profile, configure concrete role profiles before using panel role actions:
+Because top-level role launches cannot inherit a parent Profile, configure concrete role profiles before using Dashboard role actions:
 
 ```toml
 # .yoi/ticket.config.toml
@@ -336,9 +336,9 @@ profile = "project:reviewer"
 workflow = "multi-agent-workflow"
 ```
 
-If a role still uses `profile = "inherit"`, the panel fails closed with a diagnostic explaining that a concrete profile is required.
+If a role still uses `profile = "inherit"`, the Dashboard fails closed with a diagnostic explaining that a concrete profile is required.
 
-### Panel troubleshooting
+### Dashboard troubleshooting
 
 - `profile = "inherit"`: configure a concrete role Profile in `.yoi/ticket.config.toml`.
 - malformed `.yoi/ticket.config.toml`: fix the config and retry.
