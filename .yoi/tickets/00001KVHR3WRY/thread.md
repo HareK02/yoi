@@ -302,3 +302,46 @@ Reviewer validation:
 Worktree status at review end: clean。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T07:59:04Z -->
+
+## Implementation report
+
+Merge and final validation report:
+
+Merged implementation branch into Orchestrator branch:
+- Merge commit: `9cf5344f merge: mcp stdio lifecycle client`
+- Implementation commits included:
+  - `a114fa9d mcp: implement stdio lifecycle client`
+  - `f396e1a2 mcp: redact stdio server spec debug`
+
+Reviewer outcome:
+- r1 requested changes for `McpStdioServerSpec` derived `Debug` leaking resolved env/secret-derived values。
+- Coder added custom redacted `Debug` and regression test。
+- r2 approved with no blocking issues。
+
+Orchestrator validation after merge passed:
+- `cargo fmt --check`
+- `git diff --check HEAD^1..HEAD`
+- `cargo test -p mcp`
+- `cargo check`
+- `cargo tree -p mcp --depth 1`
+- `nix build .#yoi --no-link`
+- `nix path-info -S .#yoi`: `112615056`
+
+Validation log:
+- inline Bash output for final validation command。
+
+Final state:
+- Orchestrator worktree clean at `9cf5344f` after validation。
+- Implementation worktree remains available for cleanup after Ticket completion records are committed。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-20T07:59:10Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Implementation was merged into Orchestrator branch at `9cf5344f`, r2 review approved, and final Orchestrator validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p mcp`, `cargo check`, `cargo tree -p mcp --depth 1`, and `nix build .#yoi --no-link`.
+
+---
