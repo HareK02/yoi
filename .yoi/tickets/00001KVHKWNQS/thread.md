@@ -231,3 +231,52 @@ Reviewer validation:
 Worktree status at review end: clean。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T06:46:09Z -->
+
+## Implementation report
+
+Coder r1-fix report received from `yoi-coder-00001KVHKWNQS`.
+
+New fix commit:
+- `699db538 plugin: harden authoring checks`
+
+Branch commits now:
+- `699db538 plugin: harden authoring checks`
+- `945ecdf6 plugin: add authoring cli`
+
+Fix summary:
+- `plugin new` rejects an existing destination symlink via `symlink_metadata` before writes。
+- Added regression test ensuring symlink destination is refused and target is not written。
+- `plugin check` detects embedded generated placeholder `plugin.component.wasm`。
+- Fresh generated templates report `status: "partial"` instead of `active`。
+- JSON/human diagnostics include bounded placeholder warning。
+- Enablement guidance no longer says a package is ready to enable while placeholder artifact remains。
+- `partial` checks exit successfully; `rejected` checks remain non-zero。
+- Docs updated for symlink refusal and placeholder/partial behavior。
+
+Coder validation reported as passing:
+- `cargo fmt --check`
+- `git diff --check d1095f85..HEAD`
+- `cargo check -p yoi`
+- `cargo test -p yoi plugin_cli`
+- `cargo test -p yoi-plugin-pdk template`
+- CLI smoke:
+  - `plugin new ... --json`
+  - `plugin check <generated> --json` => `partial` with placeholder diagnostic。
+  - `plugin pack ... --json` => `packed`。
+  - `plugin check <packed .yoi-plugin> --json` => `partial`。
+  - copied packed archive into `.yoi/plugins` and confirmed `plugin list --workspace ... --json` discovers it。
+  - invalid check after removing runtime artifact => `rejected` and non-zero。
+- Freed only child-worktree Cargo build artifacts with `cargo clean` and reran `nix build .#yoi --no-link`; it completed successfully。
+
+Orchestrator evidence checked before r2 review:
+- Implementation worktree is clean。
+- HEAD is `699db538`。
+- Fix diff from `945ecdf6..HEAD` touches `crates/yoi/src/plugin_cli.rs` and `docs/development/plugin-development.md`, about 124 insertions / 34 deletions。
+- Overall `git diff --check d1095f85..HEAD` produced no diagnostics。
+
+Next action:
+- Route back to Reviewer for r2 verification of symlink destination refusal, placeholder partial/check behavior, and final acceptance criteria。
+
+---
