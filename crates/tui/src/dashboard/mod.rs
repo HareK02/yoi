@@ -90,7 +90,7 @@ impl std::fmt::Display for DashboardError {
             Self::Store(e) => write!(f, "session store error: {e}"),
             Self::NoPods => write!(
                 f,
-                "no Tickets or Pods found — create a Ticket with `yoi ticket create` or restore a Pod with `yoi -r`"
+                "no Tickets or Pods found — create a Ticket with `yoi ticket create` or restore a Pod with `yoi resume`"
             ),
         }
     }

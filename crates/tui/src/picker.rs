@@ -32,7 +32,7 @@ const VIEWPORT_LINES: u16 = MAX_ROWS as u16 + 4;
 pub enum PickerError {
     Io(io::Error),
     Store(session_store::StoreError),
-    NoPods,
+    NoPods { all: bool },
 }
 
 impl std::fmt::Display for PickerError {
@@ -40,9 +40,13 @@ impl std::fmt::Display for PickerError {
         match self {
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Store(e) => write!(f, "session store error: {e}"),
-            Self::NoPods => write!(
+            Self::NoPods { all: true } => write!(
                 f,
                 "no pods found — start a fresh pod with `yoi` and try again"
+            ),
+            Self::NoPods { all: false } => write!(
+                f,
+                "no pods found in this workspace — use `yoi resume --all` to list all host/data-dir Pods"
             ),
         }
     }
@@ -159,7 +163,9 @@ pub async fn run(options: PickerOptions) -> Result<PickerOutcome, PickerError> {
         .unwrap_or_default();
     let mut list = list_for_options(&options, stored_pods, live_pods);
     if list.entries.is_empty() {
-        return Err(PickerError::NoPods);
+        return Err(PickerError::NoPods {
+            all: matches!(options.scope, PickerScope::All),
+        });
     }
 
     let mut terminal = make_inline_terminal()?;
@@ -402,6 +408,20 @@ mod tests {
     #[test]
     fn picker_title_names_pods_not_sessions() {
         assert_eq!(picker_title(), "resume pod   pick a pod");
+    }
+
+    #[test]
+    fn picker_no_pods_message_mentions_all_for_workspace_scope() {
+        let message = PickerError::NoPods { all: false }.to_string();
+        assert!(message.contains("no pods found in this workspace"));
+        assert!(message.contains("yoi resume --all"));
+    }
+
+    #[test]
+    fn picker_no_pods_message_keeps_fresh_pod_hint_for_all_scope() {
+        let message = PickerError::NoPods { all: true }.to_string();
+        assert!(message.contains("start a fresh pod with `yoi`"));
+        assert!(!message.contains("yoi resume --all"));
     }
 
     #[test]
