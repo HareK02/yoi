@@ -2174,24 +2174,96 @@ fn dashboard_loading_app_defers_initial_snapshot_to_enter_reload() {
 }
 
 #[test]
-fn dashboard_open_success_requests_background_reload_without_dropping_state() {
-    let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
+fn dashboard_nested_console_success_continues_without_dropping_state() {
+    let mut app = test_app(vec![
+        live_info("alpha", PodStatus::Idle),
+        live_info("beta", PodStatus::Idle),
+    ]);
+    app.select_next();
     app.input.insert_str("keep this draft");
+    app.panel_diagnostic = Some(PanelDiagnostic {
+        title: "diagnostic stays".to_string(),
+        details: "details stay".to_string(),
+    });
+    app.panel_diagnostic_open = true;
 
-    app.finish_open("alpha", Ok(()));
+    finish_nested_console_open(&mut app, "beta", Ok(())).unwrap();
 
     assert_eq!(input_text(&app), "keep this draft");
+    assert_eq!(app.list.selected_entry().unwrap().name, "beta");
+    assert_eq!(
+        app.panel_diagnostic
+            .as_ref()
+            .map(|diagnostic| (diagnostic.title.as_str(), diagnostic.details.as_str(),)),
+        Some(("diagnostic stays", "details stay"))
+    );
+    assert!(app.panel_diagnostic_open);
     assert!(
         app.notice
             .as_deref()
             .unwrap()
-            .contains("Refreshing workspace")
+            .contains("Returned from beta. Refreshing workspace")
     );
     assert!(app.refreshing);
     assert!(matches!(
         app.enter_reload,
         Some(OrchestratorLifecycleMode::Observe)
     ));
+}
+
+#[test]
+fn dashboard_nested_console_recoverable_failure_continues_without_dropping_state() {
+    let mut app = test_app(vec![
+        live_info("alpha", PodStatus::Idle),
+        live_info("beta", PodStatus::Idle),
+    ]);
+    app.select_next();
+    app.input.insert_str("keep this draft");
+    app.panel_diagnostic = Some(PanelDiagnostic {
+        title: "diagnostic stays".to_string(),
+        details: "details stay".to_string(),
+    });
+    app.panel_diagnostic_open = true;
+    let error = crate::spawn::SpawnError::Io(io::Error::other("spawn failed"));
+
+    finish_nested_console_open(&mut app, "beta", Err(Box::new(error))).unwrap();
+
+    assert_eq!(input_text(&app), "keep this draft");
+    assert_eq!(app.list.selected_entry().unwrap().name, "beta");
+    assert_eq!(
+        app.panel_diagnostic
+            .as_ref()
+            .map(|diagnostic| (diagnostic.title.as_str(), diagnostic.details.as_str(),)),
+        Some(("diagnostic stays", "details stay"))
+    );
+    assert!(app.panel_diagnostic_open);
+    assert!(
+        app.notice
+            .as_deref()
+            .unwrap()
+            .contains("Open failed for beta: io error: spawn failed. Refreshing workspace")
+    );
+    assert!(app.refreshing);
+    assert!(matches!(
+        app.enter_reload,
+        Some(OrchestratorLifecycleMode::Observe)
+    ));
+}
+
+#[test]
+fn dashboard_nested_console_nonrecoverable_failure_bubbles_without_state_finish() {
+    let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
+    app.input.insert_str("keep this draft");
+    app.notice = Some("opening alpha".to_string());
+    let error = io::Error::other("fatal console error");
+
+    let err = finish_nested_console_open(&mut app, "alpha", Err(Box::new(error))).unwrap_err();
+
+    assert_eq!(err.to_string(), "fatal console error");
+    assert_eq!(input_text(&app), "keep this draft");
+    assert_eq!(app.notice.as_deref(), Some("opening alpha"));
+    assert!(!app.refreshing);
+    assert!(app.enter_reload.is_none());
 }
 
 #[test]

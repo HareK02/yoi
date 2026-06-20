@@ -136,22 +136,30 @@ pub(crate) async fn launch(runtime_command: PodRuntimeCommand) -> Result<(), Box
                     runtime_command.clone(),
                 )
                 .await;
-                if let Err(error) = result {
-                    app.finish_open(&pod_name, Err(&error));
+                if let Err(error) = finish_nested_console_open(&mut app, &pod_name, result) {
                     crate::console::leave_dashboard_fullscreen(&mut terminal)?;
-                    if crate::console::is_recoverable_dashboard_open_error(error.as_ref()) {
-                        return Ok(());
-                    }
                     return Err(error);
-                }
-                app.finish_open(&pod_name, Ok(()));
-                app = load_app(runtime_command.clone()).await?;
-                let key = PanelRowKey::Pod(pod_name);
-                if app.panel.row(&key).is_some() {
-                    app.select_panel_key(key);
                 }
             }
         }
+    }
+}
+
+fn finish_nested_console_open(
+    app: &mut DashboardApp,
+    pod_name: &str,
+    result: Result<(), Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
+    match result {
+        Ok(()) => {
+            app.finish_open(pod_name, Ok(()));
+            Ok(())
+        }
+        Err(error) if crate::console::is_recoverable_dashboard_open_error(error.as_ref()) => {
+            app.finish_open(pod_name, Err(error.as_ref()));
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 
