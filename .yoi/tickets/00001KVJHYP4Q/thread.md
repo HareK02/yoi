@@ -107,3 +107,18 @@ Next action:
 Ticket body/thread, relation metadata, Orchestrator worktree state, visible Pods, existing branch/worktree, and bounded Plugin instance lifecycle context were checked. There is no unresolved blocking dependency, no inprogress/capacity blocker, and no missing planning decision. Accepting this queued Ticket for implementation before worktree/Pod side effects.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T13:30:38Z -->
+
+## Implementation report
+
+Implementation orchestration start:
+- Acceptance records were committed on Orchestrator branch: `5ec8bae9 ticket: accept plugin instance lifecycle`。
+- Created implementation worktree `/home/hare/Projects/yoi/.worktree/00001KVJHYP4Q-plugin-instance-lifecycle` on branch `impl/00001KVJHYP4Q-plugin-instance-lifecycle` at `5ec8bae9`。
+- Spawned Coder Pod `yoi-coder-00001KVJHYP4Q` with write scope limited to the implementation worktree and read-only root scope only for runtime workspace identity。
+- Coder task explicitly forbids root/original workspace implementation, unsafe hidden context/action paths, broad ToolRegistry bypasses, merge, Ticket close, and cleanup。
+
+Next action:
+- Wait for Coder implementation report, then inspect branch diff/validation evidence and route to Reviewer。
+
+---
