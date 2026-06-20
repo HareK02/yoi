@@ -108,3 +108,49 @@ Next action:
 - Let MCP tools/call Coder proceed in parallel with Dashboard/Console Coder. Inspect implementation reports and route each to Reviewer when ready。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T09:08:42Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVHR3WSD`.
+
+Implementation commit:
+- `9a245403 mcp: execute stdio tool calls`
+
+Changed areas reported:
+- `crates/mcp/src/stdio.rs`:
+  - Added typed `CallToolRequest`, `CallToolResult`, and `McpContentBlock`。
+  - Added `McpStdioClient::call_tool(...)` for MCP `tools/call`。
+- `crates/pod/src/feature/mcp.rs`:
+  - Replaced discovery-only MCP tool stub with executable `McpStdioTool`。
+  - Execution spawns/initializes the configured stdio MCP server, sends `tools/call`, then shuts down。
+  - Result serialization is deterministic/model-visible/untrusted and bounded: content block cap, text/string truncation, JSON depth/node caps, binary/rich image/audio data omitted with size metadata, final output byte cap。
+  - MCP `isError: true` is represented as an MCP tool-level result distinct from JSON-RPC protocol errors。
+- `crates/mcp/tests/fixtures/mock_server.rs`:
+  - Added mock modes for normal `tools/call`, MCP `isError`, JSON-RPC protocol error, and no-call assertion。
+- `crates/mcp/tests/stdio_lifecycle.rs`:
+  - Added focused lifecycle/client tests for normal result, `isError`, protocol error, and permission-denial-style no-call。
+
+Coder validation reported:
+- `cargo test -p mcp --test stdio_lifecycle`: passed, 12 tests。
+- `cargo test -p pod feature::mcp`: passed, 9 tests。
+- `cargo check -p mcp -p pod`: passed。
+- `cargo fmt --check`: passed。
+- `git diff --check`: passed。
+- `nix build .#yoi --no-link`: passed。
+
+Known deferrals:
+- MCP resources/read, prompts/get, list_changed, sampling, and elicitation remain unimplemented as requested。
+- MCP `isError: true` is returned through ordinary `ToolOutput` with explicit `status: "mcp_is_error"` / `isError: true`; JSON-RPC failures remain `ToolError`s。
+
+Orchestrator evidence checked before review dispatch:
+- Implementation worktree is clean。
+- HEAD is `9a245403`。
+- Diff from acceptance `92432ad7..HEAD` is one implementation commit touching 4 files, about 688 insertions / 11 deletions。
+- `git diff --check 92432ad7..HEAD` produced no diagnostics。
+
+Next action:
+- Dispatch Reviewer for r1 review against Ticket requirements, with focus on permission-before-call, ordinary Tool result/history path, `isError` vs protocol error distinction, output bounds/untrusted content, no resources/prompts/list_changed scope creep, and test coverage。
+
+---
