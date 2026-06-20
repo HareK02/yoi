@@ -87,3 +87,61 @@ Next action:
 - Wait for Coder implementation report, then inspect branch diff/validation evidence and route to Reviewer。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T12:16:24Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVJDJD02`.
+
+Implementation commit:
+- `1143ae1c workflow: add intake investigation gate`
+
+Changed areas reported:
+- `resources/prompts/role/intake.md`:
+  - Added explicit minimum investigation gate before `TicketCreate` / material refinement。
+  - Reinforced user agreement before official Ticket creation。
+  - Added separation of user claims, confirmed facts, unverified hypotheses, and undecided points。
+  - Preserved Intake non-scheduler boundaries: no coder/reviewer/helper Pods, no worktrees, no routing/merge/close。
+- `resources/workflows/ticket-intake-workflow.md`:
+  - Expanded bundled workflow from thin pointer into concrete reusable Intake procedure。
+  - Added Ticket化前の最小調査ゲート。
+  - Added `spike_needed` / `requirements_sync_needed` draft stop behavior。
+  - Replaced stale `Action required` / `Attention required` draft wording with `Next Ticket operation`。
+  - Added recommended Ticket body sections for claims/facts/hypotheses/open questions。
+  - Documented bundled-vs-workspace workflow boundary。
+- `.yoi/workflow/ticket-intake-workflow.md`:
+  - Reconciled workspace override with bundled workflow while preserving dogfooding-specific details。
+  - Added explicit local investigation gate conditions and outputs。
+  - Updated draft template and Ticket body guidance。
+  - Clarified that workspace override may add Objective/split/local policy details but must not weaken bundled invariants。
+
+Coder validation reported:
+- `git diff --check`: passed。
+- Stale vocabulary grep for `Action required` / `Attention required` in touched prompt/workflow files: no matches。
+- Investigation-gate grep confirmed new terms are present:
+  - `minimum investigation gate`
+  - `Ticket 化前の最小調査ゲート`
+  - `spike_needed`
+  - `requirements_sync_needed`
+  - `Confirmed facts / sources`
+  - `Unverified hypotheses`
+  - `Undecided points / open questions`
+- Workflow/prompt test search: no dedicated workflow prompt tests found; only unrelated Dashboard test reference。
+- No code tests run because changes are prompt/workflow Markdown only。
+
+Known risks / deferrals:
+- No runtime schema/code changes were made。
+- `.yoi/workflow/ticket-intake-workflow.md` intentionally remains a more detailed workspace override; bundled workflow is compact reusable baseline。
+- `TicketDoctor` not run by Coder; no Ticket record structure was changed。
+
+Orchestrator evidence checked before review dispatch:
+- Implementation worktree is clean。
+- HEAD is `1143ae1c`。
+- Diff from acceptance `e752a720..HEAD` is one implementation commit touching 3 files, 186 insertions / 19 deletions。
+- `git diff --check e752a720..HEAD` produced no diagnostics。
+
+Next action:
+- Dispatch Reviewer for r1 review against Ticket requirements, with focus on model-facing Intake behavior, Ticket化前 investigation gate clarity, user-agreement preservation, stale vocabulary removal, bundled/workspace workflow boundary, and Intake non-scheduler boundaries。
+
+---
