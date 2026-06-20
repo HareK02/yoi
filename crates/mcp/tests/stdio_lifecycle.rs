@@ -19,6 +19,34 @@ fn tight_limits() -> McpStdioLimits {
     }
 }
 
+#[test]
+fn stdio_server_spec_debug_redacts_resolved_env_values() {
+    let spec = McpStdioServerSpec::new("debug-mock", "/bin/mock-mcp")
+        .arg("--stdio")
+        .cwd("/tmp/mock-mcp")
+        .env("LITERAL_VALUE", "literal-plaintext")
+        .env("INHERITED_VALUE", "inherited-plaintext")
+        .env("ENV_REF_VALUE", "env-ref-plaintext")
+        .env("SECRET_REF_VALUE", "secret-ref-plaintext");
+
+    let debug = format!("{spec:?}");
+
+    assert!(debug.contains("debug-mock"));
+    assert!(debug.contains("/bin/mock-mcp"));
+    assert!(debug.contains("--stdio"));
+    assert!(debug.contains("/tmp/mock-mcp"));
+    assert!(debug.contains("LITERAL_VALUE"));
+    assert!(debug.contains("INHERITED_VALUE"));
+    assert!(debug.contains("ENV_REF_VALUE"));
+    assert!(debug.contains("SECRET_REF_VALUE"));
+    assert!(debug.contains("[redacted]"));
+
+    assert!(!debug.contains("literal-plaintext"));
+    assert!(!debug.contains("inherited-plaintext"));
+    assert!(!debug.contains("env-ref-plaintext"));
+    assert!(!debug.contains("secret-ref-plaintext"));
+}
+
 #[tokio::test]
 async fn initializes_mock_stdio_server() {
     let mut client = McpStdioClient::connect(mock_server("success"), tight_limits())

@@ -52,7 +52,7 @@ impl Default for McpStdioLimits {
 }
 
 /// A resolved, explicit local stdio MCP server process specification.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct McpStdioServerSpec {
     pub name: String,
     pub command: String,
@@ -104,6 +104,24 @@ impl McpStdioServerSpec {
 
     fn redactor(&self) -> Redactor {
         Redactor::new(self.redactions.clone())
+    }
+}
+
+impl fmt::Debug for McpStdioServerSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let env: BTreeMap<&str, &str> = self
+            .env
+            .keys()
+            .map(|name| (name.as_str(), "[redacted]"))
+            .collect();
+        f.debug_struct("McpStdioServerSpec")
+            .field("name", &self.name)
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field("cwd", &self.cwd)
+            .field("env", &env)
+            .field("redaction_count", &self.redactions.len())
+            .finish()
     }
 }
 
