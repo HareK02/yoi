@@ -8,6 +8,7 @@ members = [
     "crates/session-store",
     "crates/secrets",
     "crates/manifest",
+    "crates/mcp",
     "crates/pod",
     "crates/plugin-pdk",
     "crates/yoi",
@@ -34,6 +35,7 @@ default-members = [
     "crates/session-store",
     "crates/secrets",
     "crates/manifest",
+    "crates/mcp",
     "crates/pod",
     "crates/plugin-pdk",
     "crates/yoi",
@@ -62,6 +64,7 @@ client = { path = "crates/client" }
 llm-worker = { path = "crates/llm-worker", version = "0.2" }
 llm-worker-macros = { path = "crates/llm-worker-macros", version = "0.2" }
 manifest = { path = "crates/manifest" }
+mcp = { path = "crates/mcp" }
 lint-common = { path = "crates/lint-common" }
 memory = { path = "crates/memory" }
 ticket = { path = "crates/ticket" }

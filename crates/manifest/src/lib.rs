@@ -24,10 +24,12 @@ pub use profile::{
 pub use protocol::{Permission, ScopeRule};
 pub use scope::{DelegationScope, Scope, ScopeError, SharedScope};
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
 /// Declarative configuration for a Pod.
@@ -62,6 +64,12 @@ pub struct PodManifest {
     /// source-qualified entries listed here may resolve to active plugin metadata.
     #[serde(default)]
     pub plugins: plugin::PluginConfig,
+    /// Explicit external Model Context Protocol provider configuration. This
+    /// is config data only: declaring a server never starts a subprocess or
+    /// grants OS sandboxing. Runtime MCP lifecycle/registration is a separate
+    /// consumer boundary.
+    #[serde(default)]
+    pub mcp: McpConfig,
     #[serde(default)]
     pub compaction: Option<CompactionConfig>,
     /// Memory subsystem configuration. Presence of `[memory]` configures memory
@@ -192,6 +200,92 @@ pub struct SkillsConfig {
     /// [`PodManifest`] is materialised.
     #[serde(default)]
     pub directories: Vec<PathBuf>,
+}
+
+/// Explicit Model Context Protocol configuration.
+///
+/// The manifest layer records local stdio MCP server declarations but never
+/// starts them. Future lifecycle code must opt in to spawning and must keep MCP
+/// process authority separate from Plugin permissions and `pod::feature` flags.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpConfig {
+    /// Named local stdio servers. The list form keeps declarations explicit and
+    /// lets validation reject duplicate names after profile/override merging.
+    #[serde(default, rename = "stdio_server")]
+    pub stdio_servers: Vec<McpStdioServerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpStdioServerConfig {
+    /// Stable profile-local name used by later lifecycle/tool-surface code.
+    pub name: String,
+    /// Executable path/name passed directly to process-spawn code in a later
+    /// ticket. This is not a shell string and is not executed by config parsing.
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Optional working-directory policy for the future subprocess. Omitted
+    /// means no config-level cwd override. Relative `path` values are resolved
+    /// against the manifest/profile layer before final validation.
+    #[serde(default)]
+    pub cwd: Option<McpStdioCwdPolicy>,
+    /// Explicit environment policy. There is no implicit environment discovery;
+    /// future spawn code should inherit only names listed here and set only
+    /// entries declared here.
+    #[serde(default)]
+    pub env: McpEnvConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum McpStdioCwdPolicy {
+    /// Leave cwd selection to the lifecycle caller.
+    Inherit,
+    /// Use this absolute (after path resolution) working directory.
+    Path { path: PathBuf },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpEnvConfig {
+    /// Host environment variable names to copy explicitly at spawn time.
+    #[serde(default)]
+    pub inherit: Vec<String>,
+    /// Environment variables to set explicitly.
+    #[serde(default)]
+    pub set: BTreeMap<String, McpEnvValue>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum McpEnvValue {
+    /// Literal value. Use only for non-secret values; Debug/diagnostics redact
+    /// it defensively because env values often become credentials over time.
+    Literal { value: String },
+    /// Local secret-store id. The plaintext is resolved only by a future runtime
+    /// consumer and is never loaded during manifest/profile parsing.
+    #[serde(rename = "secret_ref")]
+    SecretRef {
+        #[serde(rename = "ref")]
+        ref_: String,
+    },
+    /// Name of a host environment variable to read explicitly at spawn time.
+    EnvRef { name: String },
+}
+
+impl fmt::Debug for McpEnvValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Literal { .. } => f
+                .debug_struct("Literal")
+                .field("value", &"[redacted]")
+                .finish(),
+            Self::SecretRef { ref_ } => f.debug_struct("SecretRef").field("ref_", ref_).finish(),
+            Self::EnvRef { name } => f.debug_struct("EnvRef").field("name", name).finish(),
+        }
+    }
 }
 
 /// Configuration for WebSearch and WebFetch built-in tools.
@@ -712,7 +806,10 @@ impl PodManifest {
     /// Parse a manifest from a TOML string.
     pub fn from_toml(s: &str) -> Result<Self, toml::de::Error> {
         config::reject_removed_manifest_fields(s)?;
-        toml::from_str(s)
+        let manifest: Self = toml::from_str(s)?;
+        config::validate_mcp_config(&manifest.mcp)
+            .map_err(|error| toml::de::Error::custom(error.to_string()))?;
+        Ok(manifest)
     }
 }
 

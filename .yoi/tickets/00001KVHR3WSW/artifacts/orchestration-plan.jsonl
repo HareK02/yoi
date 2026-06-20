@@ -1,0 +1,1 @@
+{"id":"orch-plan-20260620-060022-1","ticket_id":"00001KVHR3WSW","kind":"blocked_by","related_ticket":"00001KVHR3WS6","note":"list_changed handling requires initial tools/list registration. `00001KVHR3WS6` is queued and depends on lifecycle; leave this Ticket queued until tool registration is closed.","author":"yoi-orchestrator","at":"2026-06-20T06:00:22Z"}

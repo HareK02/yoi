@@ -124,3 +124,304 @@ Next action:
 - Wait for Coder implementation report, then inspect branch diff/validation evidence and route to Reviewer。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T06:25:39Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVHKWNQS`.
+
+Implementation commit:
+- `945ecdf6 plugin: add authoring cli`
+
+Changed areas reported:
+- Added `yoi plugin new rust-component-tool <path-or-name>`。
+- Added `yoi plugin check <path-or-package> [--json]`。
+- Added `yoi plugin pack <path> [--output <file>] [--json]`。
+- Added manifest-level materialized package helpers for safe directory/package reading, deterministic digesting, deterministic stored `.yoi-plugin` writing, and symlink/root-escape rejection。
+- Reused existing static Plugin inspection for Tool schema / permission / host API declaration checks without Plugin execution。
+- Added embedded `plugin.component.wasm` placeholder to Rust component Tool template so generated templates can be checked/packed immediately; docs instruct replacing it before enabling/execution。
+- Updated CLI parsing/help and Plugin development docs。
+- Added focused tests for generated file set, overwrite refusal, valid directory check, invalid manifest, missing runtime artifact, unsafe package archive, deterministic pack digest, package discoverability, and JSON report shape。
+
+Coder validation reported:
+- `cargo fmt`
+- `cargo fmt --check`
+- `cargo check -p yoi`
+- `cargo test -p yoi plugin_cli`
+- `cargo test -p yoi-plugin-pdk template`
+- `git diff --check`
+- CLI smoke:
+  - `cargo run -q -p yoi -- plugin new rust-component-tool ... --json`
+  - `cargo run -q -p yoi -- plugin check ... --json`
+  - `cargo run -q -p yoi -- plugin pack ... --output ... --json`
+  - invalid check reports `"status": "rejected"` and exits non-zero。
+- `nix build .#yoi --no-link` was attempted but failed due environment/storage: `No space left on device`。
+- No Cargo dependency or `Cargo.lock` changes were introduced。
+
+Known risks / deferrals reported:
+- Component validation remains metadata/static only; no component instantiation/execution is performed by design。
+- Template includes a placeholder artifact solely for deterministic authoring check/pack; docs instruct replacing it before enabling/execution。
+
+Orchestrator evidence checked before review dispatch:
+- Implementation worktree is clean on `impl/00001KVHKWNQS-plugin-authoring-cli`。
+- HEAD is `945ecdf6`。
+- Diff from acceptance `d1095f85..HEAD` is one implementation commit touching 6 files, about 1274 insertions / 24 deletions。
+- `git diff --check d1095f85..HEAD` produced no diagnostics。
+
+Next action:
+- Dispatch Reviewer for r1 review against Ticket requirements, with focus on non-execution safety, archive/path traversal safety, deterministic pack/digest behavior, placeholder artifact policy, JSON report stability, discoverability, workspace/config non-mutation, CLI UX, tests, and Nix/package validation feasibility。
+
+---
+
+<!-- event: plan author: yoi-orchestrator at: 2026-06-20T06:26:24Z -->
+
+## Plan
+
+Review dispatch:
+- Spawned Reviewer Pod `yoi-reviewer-00001KVHKWNQS-r1` against implementation branch `impl/00001KVHKWNQS-plugin-authoring-cli`。
+- Review target commit: `945ecdf6 plugin: add authoring cli`。
+- Review baseline: `d1095f85`。
+- Reviewer task focuses on non-execution safety, archive/path traversal safety, deterministic pack/digest behavior, placeholder artifact policy, JSON report stability, discoverability, workspace/config non-mutation, CLI UX, tests, and Nix/package validation feasibility。
+- Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KVHKWNQS-r1 at: 2026-06-20T06:36:52Z status: request_changes -->
+
+## Review: request changes
+
+Verdict: `request_changes`
+
+確認範囲:
+- Ticket body/thread / Orchestrator IntentPacket
+- Implementation diff: `d1095f85..945ecdf6`
+- 主な対象: `crates/yoi/src/plugin_cli.rs`, `crates/yoi/src/main.rs`, `crates/manifest/src/plugin.rs`, `resources/plugin/templates/rust-component-tool/*`, `docs/development/plugin-development.md`, `package.nix`。
+
+Blocking issues:
+1. `yoi plugin new` が symlink destination を辿り、物理的な requested destination 外へ書き込める。
+   - `materialize_template` は `fs::metadata(destination)` / `fs::read_dir(destination)` を使い、destination symlink を拒否せず `destination.join(relative)` に書く。
+   - Reviewer smoke: `linkdest -> target` に対して `plugin new rust-component-tool "$tmp/linkdest"` を実行すると、`target/plugin.toml` が作られた。
+   - Ticket invariant: `new` は requested destination にだけ書き、non-empty destination を拒否する。symlink destination はこの境界を破る。
+
+2. Generated placeholder component が `check` で enablement-ready に見える。
+   - Template は text placeholder `resources/plugin/templates/rust-component-tool/plugin.component.wasm` を含む。
+   - `new` output は next steps で一度 warning するが、fresh generated template に対する `check --json` は `status=active diagnostics=0` になり、generic enablement guidance を出す。
+   - Reviewer smoke: generated template check output に placeholder/non-executable warning がなく、`To enable after review...` guidance が出る。
+   - Ticket/reviewer contract: check/pack may pass, but output must not imply executable component is ready for enablement if placeholder is not executable。
+
+Required fixes:
+- `plugin new` destination symlink を `symlink_metadata` 等で拒否し、symlink write-through を防ぐ。関連する overwrite/destination tests を追加する。
+- Generated placeholder artifact を `check` が検出し、bounded diagnostic / next step を出す。Status は `partial` など enablement-ready でない表現にすることを優先する。少なくとも `active diagnostics=0` と enablement guidance の組み合わせは避ける。
+- `check --json` and human output tests should cover generated template placeholder warning/status。
+
+Non-blocking concerns:
+- `nix build .#yoi --no-link` は environment storage (`No space left on device`) で失敗。source-filter/resource-packaging issue は見えていないが、最終 Orchestrator validation で再試行する。
+- `pack --json` digest is nested under `package.digest`, not top-level. Acceptable if documented/stable, but consider documenting shape。
+
+Reviewer validation:
+- `cargo fmt --check`: passed
+- `git diff --check d1095f85..HEAD`: passed
+- `cargo check -p yoi`: passed
+- `cargo test -p yoi plugin_cli`: passed (`15 tests`)
+- `cargo test -p yoi-plugin-pdk template`: passed
+- CLI smoke for `new`, `check --json`, `pack --json`, packed package check/list discovery, invalid check rejected: passed except blocker findings above。
+- `nix build .#yoi --no-link`: failed due `No space left on device`。
+
+Worktree status at review end: clean。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T06:46:09Z -->
+
+## Implementation report
+
+Coder r1-fix report received from `yoi-coder-00001KVHKWNQS`.
+
+New fix commit:
+- `699db538 plugin: harden authoring checks`
+
+Branch commits now:
+- `699db538 plugin: harden authoring checks`
+- `945ecdf6 plugin: add authoring cli`
+
+Fix summary:
+- `plugin new` rejects an existing destination symlink via `symlink_metadata` before writes。
+- Added regression test ensuring symlink destination is refused and target is not written。
+- `plugin check` detects embedded generated placeholder `plugin.component.wasm`。
+- Fresh generated templates report `status: "partial"` instead of `active`。
+- JSON/human diagnostics include bounded placeholder warning。
+- Enablement guidance no longer says a package is ready to enable while placeholder artifact remains。
+- `partial` checks exit successfully; `rejected` checks remain non-zero。
+- Docs updated for symlink refusal and placeholder/partial behavior。
+
+Coder validation reported as passing:
+- `cargo fmt --check`
+- `git diff --check d1095f85..HEAD`
+- `cargo check -p yoi`
+- `cargo test -p yoi plugin_cli`
+- `cargo test -p yoi-plugin-pdk template`
+- CLI smoke:
+  - `plugin new ... --json`
+  - `plugin check <generated> --json` => `partial` with placeholder diagnostic。
+  - `plugin pack ... --json` => `packed`。
+  - `plugin check <packed .yoi-plugin> --json` => `partial`。
+  - copied packed archive into `.yoi/plugins` and confirmed `plugin list --workspace ... --json` discovers it。
+  - invalid check after removing runtime artifact => `rejected` and non-zero。
+- Freed only child-worktree Cargo build artifacts with `cargo clean` and reran `nix build .#yoi --no-link`; it completed successfully。
+
+Orchestrator evidence checked before r2 review:
+- Implementation worktree is clean。
+- HEAD is `699db538`。
+- Fix diff from `945ecdf6..HEAD` touches `crates/yoi/src/plugin_cli.rs` and `docs/development/plugin-development.md`, about 124 insertions / 34 deletions。
+- Overall `git diff --check d1095f85..HEAD` produced no diagnostics。
+
+Next action:
+- Route back to Reviewer for r2 verification of symlink destination refusal, placeholder partial/check behavior, and final acceptance criteria。
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KVHKWNQS-r1 at: 2026-06-20T06:50:40Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket body/thread / Orchestrator IntentPacket
+- r2 fix diff: `945ecdf6..699db538`
+- 全体実装 diff: `d1095f85..699db538`
+- 主な対象: `crates/yoi/src/plugin_cli.rs`, `docs/development/plugin-development.md`, and prior `new` / `check` / `pack` implementation surface。
+
+Previous blocker verification:
+1. `plugin new` symlink destination write-through
+   - `materialize_template` now uses `fs::symlink_metadata` and rejects destination symlink before writing。
+   - Regression test `plugin_new_refuses_symlink_destination_without_following_it` verifies refusal and no write-through。
+   - CLI smoke confirmed symlink destination is rejected and target directory does not receive `plugin.toml`。
+
+2. Placeholder component reported as enablement-ready
+   - `check` now compares runtime component bytes against embedded template placeholder and adds bounded `placeholder` diagnostic。
+   - Generated template now reports `status=partial` when static validation is otherwise clean but placeholder remains。
+   - Enablement guidance is suppressed for `partial` and says the package is not ready to enable。
+   - CLI smoke confirmed generated directory and packed `.yoi-plugin` both report `partial` with placeholder diagnostic; `partial` exits successfully, while invalid/missing paths remain non-zero rejected。
+
+Blocking issues: none。
+
+Non-blocking concerns / follow-ups:
+- None required for this Ticket. The hardening keeps status vocabulary aligned with existing Plugin inspection (`active` / `partial` / `rejected`)。
+
+Reviewer validation:
+- `cargo fmt --check`: passed
+- `git diff --check d1095f85..HEAD`: passed
+- `cargo check -p yoi`: passed
+- `cargo test -p yoi plugin_cli`: passed (`16 tests`)
+- `cargo test -p yoi-plugin-pdk template`: passed (`2 template tests`)
+- CLI smoke after `cargo build -p yoi`: passed for `new`, generated `check --json partial`, human `[partial]`, `pack --json`, packed package `check --json partial`, invalid check rejected/non-zero, symlink destination refusal, and `plugin list --workspace ... --json` discoverability as `disabled`。
+- `nix build .#yoi --no-link`: passed
+
+Worktree status at review end: source tree clean。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-20T06:54:35Z -->
+
+## Implementation report
+
+Merge and final validation report:
+
+Merged implementation branch into Orchestrator branch:
+- Merge commit: `87704ad4 merge: plugin authoring cli`
+- Implementation commits included:
+  - `945ecdf6 plugin: add authoring cli`
+  - `699db538 plugin: harden authoring checks`
+
+Reviewer outcome:
+- r1 requested changes for symlink destination write-through and placeholder component being reported as enablement-ready。
+- Coder added symlink destination refusal, placeholder detection, `partial` status / diagnostics, and tests。
+- r2 approved with no blocking issues。
+
+Orchestrator validation after merge:
+- Passed before Nix:
+  - `cargo fmt --check`
+  - `git diff --check HEAD^1..HEAD`
+  - `cargo check -p yoi`
+  - `cargo test -p yoi plugin_cli`
+  - `cargo test -p yoi-plugin-pdk template`
+- Initial `nix build .#yoi --no-link` failed with environment storage exhaustion while building `aws-lc-sys` (`No space left on device`), not a source/package diagnostic。
+- Orchestrator freed only Orchestrator-worktree Cargo build artifacts with `cargo clean` (`43.3GiB`) and reran:
+  - `nix build .#yoi --no-link`: passed。
+  - `nix path-info -S .#yoi`: `112260512`。
+
+Validation log for first grouped run:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/bash-Q0KE3A.log`
+
+Final state:
+- Orchestrator worktree clean at `87704ad4` after successful Nix validation。
+- Implementation worktree remains available for cleanup after Ticket completion records are committed。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-20T06:54:45Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Implementation was merged into Orchestrator branch at `87704ad4`, r2 review approved, and final Orchestrator validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, `cargo check -p yoi`, focused `yoi plugin_cli` / `yoi-plugin-pdk template` tests, and `nix build .#yoi --no-link` after freeing Orchestrator worktree build artifacts.
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-20T06:55:06Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-20T06:55:06Z status: closed -->
+
+## 完了
+
+## Resolution
+
+`00001KVHKWNQS` を完了しました。
+
+実装内容:
+- `yoi plugin new rust-component-tool <path-or-name>` を追加しました。
+- `yoi plugin check <path-or-package> [--json]` を追加しました。
+- `yoi plugin pack <path> [--output <file>] [--json]` を追加しました。
+- Safe directory/package reading、deterministic digesting、deterministic `.yoi-plugin` writing、symlink/root-escape rejection を含む materialized package helpers を追加しました。
+- `check` / `pack` は Plugin code を実行せず、既存 static Plugin inspection を再利用して manifest/runtime/schema/permission/host API declarations を検査します。
+- Embedded Rust Component Tool template を `new` で利用し、generated template を check/pack できるよう placeholder `plugin.component.wasm` を追加しました。
+- Placeholder artifact は `check` で検出され、generated template / packed archive は `partial` と bounded diagnostic を返します。placeholder が残る間は enablement-ready guidance を出しません。
+- `plugin new` は existing destination symlink を拒否し、write-through を防ぎます。
+- JSON report shape、human output、CLI help/docs を更新しました。
+- Focused tests と CLI smoke coverage を追加しました。
+
+主な commit:
+- `945ecdf6 plugin: add authoring cli`
+- `699db538 plugin: harden authoring checks`
+- `87704ad4 merge: plugin authoring cli`
+
+Review:
+- r1 は destination symlink write-through と placeholder artifact の enablement-ready 表示で `request_changes`。
+- Coder が symlink refusal、placeholder detection、`partial` status/diagnostics、tests/docs を追加。
+- r2 は `approve`。
+
+最終 validation:
+- `cargo fmt --check`
+- `git diff --check HEAD^1..HEAD`
+- `cargo check -p yoi`
+- `cargo test -p yoi plugin_cli`
+- `cargo test -p yoi-plugin-pdk template`
+- `nix build .#yoi --no-link`
+
+補足:
+- 初回 `nix build .#yoi --no-link` は `aws-lc-sys` build 中に `No space left on device` で environment failure。
+- Orchestrator worktree の Cargo build artifacts を `cargo clean` で削除してから再実行し、Nix build は成功しました。
+- `nix path-info -S .#yoi`: `112260512`
+
+Validation log:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/bash-Q0KE3A.log`
+
+---

@@ -14,3 +14,16 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-20T06:00:44Z -->
+
+## Decision
+
+Routing decision: blocked_pending_dependency
+
+Panel Queue により routing 対象として確認したが、`00001KVHR3WSW` は `00001KVHR3WS6` に `depends_on` している。list_changed handling は initial tools/list registration を前提にするため、`00001KVHR3WS6` が closed になるまで実装開始せず queued のまま保持する。
+
+Next:
+- `00001KVHR3WS6` が closed になった後、改めて reroute する。
+
+---

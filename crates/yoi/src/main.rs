@@ -429,10 +429,58 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
 fn parse_plugin_args(args: &[String]) -> Result<plugin_cli::PluginCliCommand, ParseError> {
     let Some((subcommand, rest)) = args.split_first() else {
         return Err(ParseError(
-            "yoi plugin requires `list` or `show <ref>`".to_string(),
+            "yoi plugin requires `new`, `check`, `pack`, `list`, or `show <ref>`".to_string(),
         ));
     };
     match subcommand.as_str() {
+        "new" => {
+            let (plugin_args, positional) = parse_plugin_common_args(rest)?;
+            match positional.as_slice() {
+                [template, destination] => Ok(plugin_cli::PluginCliCommand::New {
+                    template: template.clone(),
+                    destination: PathBuf::from(destination),
+                    args: plugin_args,
+                }),
+                [] | [_] => Err(ParseError(
+                    "yoi plugin new requires a template and destination".to_string(),
+                )),
+                _ => Err(ParseError(
+                    "yoi plugin new accepts exactly a template and destination".to_string(),
+                )),
+            }
+        }
+        "check" => {
+            let (plugin_args, positional) = parse_plugin_common_args(rest)?;
+            match positional.as_slice() {
+                [input] => Ok(plugin_cli::PluginCliCommand::Check {
+                    input: PathBuf::from(input),
+                    args: plugin_args,
+                }),
+                [] => Err(ParseError(
+                    "yoi plugin check requires a plugin directory or .yoi-plugin path".to_string(),
+                )),
+                _ => Err(ParseError(
+                    "yoi plugin check accepts exactly one plugin directory or .yoi-plugin path"
+                        .to_string(),
+                )),
+            }
+        }
+        "pack" => {
+            let (plugin_args, positional, output) = parse_plugin_pack_args(rest)?;
+            match positional.as_slice() {
+                [input] => Ok(plugin_cli::PluginCliCommand::Pack {
+                    input: PathBuf::from(input),
+                    output,
+                    args: plugin_args,
+                }),
+                [] => Err(ParseError(
+                    "yoi plugin pack requires a plugin directory".to_string(),
+                )),
+                _ => Err(ParseError(
+                    "yoi plugin pack accepts exactly one plugin directory".to_string(),
+                )),
+            }
+        }
         "list" => {
             let (plugin_args, positional) = parse_plugin_common_args(rest)?;
             if !positional.is_empty() {
@@ -513,8 +561,36 @@ fn parse_plugin_common_args(
     Ok((parsed, positional))
 }
 
+fn parse_plugin_pack_args(
+    args: &[String],
+) -> Result<(plugin_cli::PluginCliArgs, Vec<String>, Option<PathBuf>), ParseError> {
+    let mut normalized = Vec::new();
+    let mut output = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--output" {
+            index += 1;
+            let Some(value) = args.get(index) else {
+                return Err(ParseError("--output requires a value".to_string()));
+            };
+            output = Some(PathBuf::from(value));
+        } else if let Some(value) = arg.strip_prefix("--output=") {
+            if value.is_empty() {
+                return Err(ParseError("--output requires a value".to_string()));
+            }
+            output = Some(PathBuf::from(value));
+        } else {
+            normalized.push(arg.clone());
+        }
+        index += 1;
+    }
+    let (plugin_args, positional) = parse_plugin_common_args(&normalized)?;
+    Ok((plugin_args, positional, output))
+}
+
 fn plugin_usage() -> &'static str {
-    "usage: yoi plugin list [--workspace PATH] [--profile REF] [--json]\n       yoi plugin show <ref> [--workspace PATH] [--profile REF] [--json]"
+    "usage: yoi plugin new rust-component-tool <path-or-name> [--json]\n       yoi plugin check <path-or-package> [--json]\n       yoi plugin pack <path> [--output <file>] [--json]\n       yoi plugin list [--workspace PATH] [--profile REF] [--json]\n       yoi plugin show <ref> [--workspace PATH] [--profile REF] [--json]"
 }
 
 fn parse_panel_workspace(args: &[String]) -> Result<PathBuf, ParseError> {
@@ -547,7 +623,7 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
 
 fn print_help() {
     println!(
-        "yoi\n\nUsage:\n  yoi [OPTIONS] [POD_NAME]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi pod [POD_OPTIONS]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nOptions:\n  -r, --resume           Open the Pod picker and resume/attach a Pod\n      --workspace <PATH> Runtime workspace root (defaults to cwd)\n      --pod <NAME>       Attach/restore/create a Pod by name\n      --socket <PATH>    Attach to a specific Pod socket with --pod\n      --session <UUID>   Resume a specific session segment\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
+        "yoi\n\nUsage:\n  yoi [OPTIONS] [POD_NAME]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi pod [POD_OPTIONS]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi plugin new rust-component-tool <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nOptions:\n  -r, --resume           Open the Pod picker and resume/attach a Pod\n      --workspace <PATH> Runtime workspace root (defaults to cwd)\n      --pod <NAME>       Attach/restore/create a Pod by name\n      --socket <PATH>    Attach to a specific Pod socket with --pod\n      --session <UUID>   Resume a specific session segment\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
     );
 }
 

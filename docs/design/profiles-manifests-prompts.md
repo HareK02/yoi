@@ -29,6 +29,37 @@ Source/partial layers may omit fields. Resolved manifests should be explicit eno
 
 For normal Profile/default startup, a workspace may add `.yoi/override.local.toml` as a final local manifest layer. Yoi discovers the nearest ancestor `.yoi/override.local.toml` from the workspace base used for profile resolution, resolves relative paths in that file against its containing `.yoi` directory, and applies it after the selected Profile and builtin defaults. This file is intended for machine-local choices such as provider/model, worker language, prompt pack, and permission policy tweaks; it is ignored by git via the repository `*.local.*` rule. It is not applied in explicit `--manifest <path>` mode, and it cannot set `pod.name` because Pod identity remains a runtime input.
 
+## Local stdio MCP server declarations
+
+Profiles and manifest layers may declare named local stdio MCP servers under `mcp.stdio_server`. This is a typed configuration surface only. Declaring a server does not start a subprocess, discover packages, negotiate MCP capabilities, or register tools/resources/prompts.
+
+Example Lua Profile fragment:
+
+```lua
+mcp = {
+  stdio_server = {
+    {
+      name = "filesystem",
+      command = "node",
+      args = { "server.js", "--root", "." },
+      cwd = { kind = "path", path = "./mcp" },
+      env = {
+        inherit = { "PATH" },
+        set = {
+          SAFE_MODE = { kind = "literal", value = "1" },
+          API_TOKEN = { kind = "secret_ref", ref = "providers/mcp-token" },
+          UPSTREAM_TOKEN = { kind = "env_ref", name = "MCP_UPSTREAM_TOKEN" },
+        },
+      },
+    },
+  },
+}
+```
+
+`command` is a direct executable name/path, not a shell string. `args` are passed as argv entries by future lifecycle code. `cwd.kind = "path"` is resolved relative to the Profile or manifest layer; omit `cwd` or use `{ kind = "inherit" }` when the lifecycle caller should choose. Environment handling is explicit: future spawn code should inherit only names listed in `env.inherit` and set only variables in `env.set`. `literal` values are for non-secret data; credentials should use `secret_ref` or explicit `env_ref`. Diagnostics and Debug output must redact env literal values and must not print secret plaintext.
+
+Local stdio MCP servers are ordinary local executables running with the user's OS permissions. Yoi's feature flags, Plugin permissions, and MCP config validation are not an operating-system sandbox and cannot prevent filesystem/network/process side effects once a later lifecycle implementation chooses to spawn a configured server.
+
 ## Spawned Pods
 
 `SpawnPod.profile` is optional and resolves through defaults when omitted. The only concrete capability delegation in the tool call is `SpawnPod.scope`, and it must be a subset of the parent's effective scope.

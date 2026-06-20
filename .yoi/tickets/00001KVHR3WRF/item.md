@@ -1,8 +1,8 @@
 ---
 title: 'MCP: add local stdio server config and trust policy'
-state: 'queued'
+state: 'closed'
 created_at: '2026-06-20T05:30:04Z'
-updated_at: '2026-06-20T05:58:46Z'
+updated_at: '2026-06-20T07:28:55Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['mcp', 'config', 'trust-boundary', 'secrets', 'process-exec']

@@ -23,11 +23,11 @@ Implemented foundation:
 - first-party Rust PDK helpers for Component Model Tool guests;
 - embedded Rust Component Tool starter template;
 - `https` and `fs` host APIs for Tool runtime;
-- read-only `yoi plugin list/show` inspection.
+- read-only `yoi plugin list/show` inspection;
+- local first-party authoring commands: `yoi plugin new`, `yoi plugin check`, and `yoi plugin pack`.
 
 Still intentionally separate/future work:
 
-- `yoi plugin new/check/pack` authoring commands;
 - multi-language SDK/PDK crates;
 - Service / Ingress surfaces;
 - WebSocket or inbound HTTP for bidirectional bridges;
@@ -53,6 +53,37 @@ A `.yoi-plugin` package is currently a bounded ZIP archive. For now, create it w
 ```
 
 The archive root must contain `plugin.toml`. Runtime files referenced by the manifest must also be inside the archive. Yoi rejects path traversal, root escapes, malformed manifests, unsupported API/runtime versions, and other unsafe archive shapes.
+
+## Authoring CLI
+
+Use the local authoring commands for first-party deterministic authoring. These commands never fetch remote templates, never run Plugin code, never mutate enablement configuration, and never generate or embed secrets.
+
+Create a Rust Component Tool starter from embedded resources:
+
+```bash
+yoi plugin new rust-component-tool ./my-plugin
+```
+
+`new` writes only inside the requested destination and refuses an existing non-empty destination or destination symlink. The generated template includes `plugin.toml`, Rust source, Cargo metadata, README next steps, and a placeholder `plugin.component.wasm` artifact so local `check`/`pack` validation can run immediately. Replace the placeholder with a real built component before enabling or executing the Plugin.
+
+Validate a source directory or an existing `.yoi-plugin` archive:
+
+```bash
+yoi plugin check ./my-plugin
+yoi plugin check ./my-plugin --json
+yoi plugin check ./my-plugin.yoi-plugin --json
+```
+
+`check` performs bounded static validation of the directory/archive shape, manifest, runtime declaration, referenced artifact presence, Tool schemas, permission declarations, host API declarations, archive safety, and deterministic digest when a package can be materialized. Component-world validation is metadata-only: it verifies the declared world string and runtime manifest shape, but it does not instantiate or execute the component. A generated placeholder component produces `status = "partial"` plus a diagnostic and is not enablement-ready until replaced. Invalid checks print the same structured report and exit non-zero.
+
+Pack a source directory into a deterministic stored `.yoi-plugin` archive:
+
+```bash
+yoi plugin pack ./my-plugin
+yoi plugin pack ./my-plugin --output ./my-plugin.yoi-plugin --json
+```
+
+`pack` rejects malformed manifests, missing runtime artifacts, symlinks/root escapes, and unsupported package shapes. The JSON output contains the stable package reference, output path, digest, entries, and safety flags. After review, copy the package to `.yoi/plugins/` (or the user Plugin store) and add explicit Profile/config enablement with pinned digest and grants; packing and checking do not do this for you.
 
 ## Manifest: `plugin.toml`
 
