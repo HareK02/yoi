@@ -193,3 +193,57 @@ Review dispatch:
 - Reviewer is instructed not to edit source, commit, merge, close the Ticket, or use TicketReview directly; it will report verdict/evidence back to Orchestrator。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVHX0WBE-r1 at: 2026-06-20T09:22:25Z status: request_changes -->
+
+## Review: request changes
+
+Verdict: `request_changes`
+
+確認範囲:
+- Ticket contract / Orchestrator IntentPacket。
+- Implementation diff: `7e35721a..5415a947`。
+- 主な対象: `crates/tui/src/lib.rs`, `crates/tui/src/dashboard/mod.rs`, `crates/tui/src/dashboard/render.rs`, `crates/tui/src/dashboard/tests.rs`, `crates/tui/src/console/mod.rs`, `crates/yoi/src/main.rs`, `crates/yoi/src/ticket_cli.rs`, `crates/tui/src/spawn.rs`, README / TUI README / development docs / prompt resource terminology changes。
+
+Positive findings:
+- `yoi panel` remains the CLI command。
+- `yoi dashboard` alias は見つからない。
+- `LaunchMode::Panel` は Dashboard boundary を通るようになり、`single_pod::run_panel` path は見つからない。
+- `single_pod.rs` / `multi_pod.rs` は `console/` / `dashboard/` に置換されている。
+
+Blocking issues:
+
+1. Recoverable Dashboard open failures now exit `yoi panel`。
+   - Path: `crates/tui/src/dashboard/mod.rs`。
+   - Dashboard から Pod を開き、nested Console open が spawn failure/cancel など recoverable error を返すと、`app.finish_open(...)` 後に Dashboard fullscreen を抜けて function が `Ok(())` を返すように見える。
+   - Baseline `single_pod::run_panel` では recoverable nested-open failures は既存 Panel/Dashboard state に折り返され、Panel loop は継続した。
+   - Cancelled/failed Console open が workspace Dashboard を閉じるのは、Ticket の behavior preservation / Panel action model preservation 要件に反する。
+
+2. Successful return from Console discards live Dashboard state。
+   - Path: `crates/tui/src/dashboard/mod.rs`。
+   - `console::run_pod_name_nested(...)` 成功後、`app.finish_open(...)` の後に `app = load_app(runtime_command.clone()).await?;` で fresh app に置き換えている。
+   - これは baseline と `finish_open` の intent に反し、selection context、composer draft/target、notices、diagnostics、Dashboard-local UI state を失う可能性がある。
+   - Ticket は boundary/terminology refactor であり、Dashboard state preservation は reviewer focus。Live `DashboardApp` を保持し、`finish_open(...)` + existing reload/reconcile mechanism を使うべき。
+
+Required fix:
+- Successful nested Console return と recoverable nested Console failure の両方で、existing `DashboardApp` を保持して Dashboard loop を継続する。
+- `finish_open(...)` と既存 reload mechanism を使い、function return / fresh app replacement で Dashboard session state を捨てない。
+- Regression tests を追加または既存 tests を拡張し、nested open success/failure が Dashboard state/draft/selection/diagnostic を壊さず loop 継続することを可能な範囲で確認する。
+
+Non-blocking concerns:
+- `dashboard/mod.rs` はまだ大きく、action/lifecycle/snapshot/model/diagnostics/E2E fixture helpers が混在している。追加分割は follow-up でもよいが、今回の blocker fix で触るなら改善可。
+- `console/mod.rs` に Dashboard/fullscreen helper concepts が少し残る。terminal-mode bridge として許容可能だが、Console focus は維持すること。
+- `workspace_panel` / `WorkspacePanel*` naming は internal model names と見えるため blocking ではない。
+
+Reviewer validation:
+- `cargo fmt --check`: passed。
+- `git diff --check 7e35721a..HEAD`: passed。
+- `cargo test -p tui`: passed。
+- `cargo test -p yoi`: passed。
+- `cargo check --workspace --all-targets`: passed。
+- Targeted help/grep checks: no `yoi dashboard` alias or old `single_pod::run_panel` route found。
+- `nix build .#yoi --no-link` not run because no package/source-filter concern found。
+
+Worktree status at review end: tracked source tree clean; ignored `target/` only。
+
+---

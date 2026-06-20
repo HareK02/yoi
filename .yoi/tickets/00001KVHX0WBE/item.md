@@ -2,7 +2,7 @@
 title: 'Dashboard / Console 呼称導入と TUI モジュール境界整理'
 state: 'inprogress'
 created_at: '2026-06-20T06:55:49Z'
-updated_at: '2026-06-20T09:14:08Z'
+updated_at: '2026-06-20T09:22:25Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['ux-naming', 'module-boundary', 'public-cli', 'test-coverage']
