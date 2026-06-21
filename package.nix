@@ -29,6 +29,9 @@ let
       || isExcludedTree ".worktree"
       || isExcludedTree "work-items"
       || isExcludedTree "docs/report"
+      || isExcludedTree "web/workspace/node_modules"
+      || isExcludedTree "web/workspace/.svelte-kit"
+      || isExcludedTree "web/workspace/build"
     );
 in
 rustPlatform.buildRustPackage rec {
@@ -40,7 +43,7 @@ rustPlatform.buildRustPackage rec {
     filter = sourceFilter;
   };
 
-  cargoHash = "sha256-GUqhvq+JhJokk1R4VVeVz5cZe/6oSrVMyKjcltZEWqE=";
+  cargoHash = "sha256-RER/UXd74C2VhPHAeF36u6ruNBg0oLnR4YeQ/zLag88=";
 
   depsExtraArgs = {
     # Older fetchCargoVendor utilities used crates.io's API download endpoint,
