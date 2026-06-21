@@ -331,3 +331,85 @@ Worktree status:
 - Ignored validation artifacts remain in the implementation worktree: `web/workspace/node_modules/`, `web/workspace/.svelte-kit/`, `web/workspace/build/`。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T07:45:59Z -->
+
+## Implementation report
+
+Reviewer r1 approvalを受けて、実装ブランチを Orchestrator worktree の `orchestration` branch に統合した。
+
+統合:
+- Merge commit: `3e03e536 merge: workspace web control plane`
+- Merged branch: `impl/00001KVMFFYVX-workspace-web-control-plane`
+- Implementation commit:
+  - `ab7658c1 feat: bootstrap workspace web control plane`
+
+Orchestrator worktree validation:
+- `cargo fmt --check`: passed
+- `git diff --check HEAD^1..HEAD`: passed
+- `cargo test -p yoi-workspace-server`: passed
+- `cargo check -p yoi-workspace-server`: passed
+- `cargo check -p yoi`: passed
+- `cd web/workspace && npm ci && npm run check && npm run build`: passed
+  - `npm ci` reported 4 low severity vulnerabilities via npm audit output; build/check succeeded and no blocking validation failure occurred。
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `cargo run -p yoi -- objective doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+
+Validation generated ignored frontend artifacts in Orchestrator worktree:
+- `web/workspace/node_modules/`
+- `web/workspace/.svelte-kit/`
+- `web/workspace/build/`
+
+These were removed after validation. Final Orchestrator worktree status after validation cleanup is clean on `orchestration` at `3e03e536`。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-21T07:46:04Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Reviewer approval、Orchestrator worktree への統合、Rust/frontend/Nix/doctor validation が完了したため `done` に遷移する。
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-21T07:46:19Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-21T07:46:19Z status: closed -->
+
+## 完了
+
+Workspace web control plane bootstrap を実装し、Orchestrator worktree の `orchestration` branch に統合した。
+
+主な成果:
+- New backend library crate `yoi-workspace-server` / `crates/workspace-server` を追加。
+- Axum-based read-only HTTP API と static/SPA serving surface を追加。
+- `/api/...` と static/SPA fallback を分離し、API route miss を SPA fallback に飲ませない設計にした。
+- `ControlPlaneStore` trait と SQLite implementation `SqliteWorkspaceStore` を追加。
+- SQLite migration/version table、WAL、foreign keys、busy timeout を設定。
+- `.yoi/tickets` と `.yoi/objectives` を canonical read sources として扱う local project-record bridge を追加し、既存 record workflow を移行・変更しない。
+- Read APIs: `/api/workspace`, `/api/tickets`, `/api/tickets/{id}`, `/api/objectives`, `/api/objectives/{id}`, `/api/runs`, `/api/runners`。
+- Future runner/event-stream extension seams を response/state shape に用意しつつ、scheduler/runner dispatch/write API は実装しない。
+- SvelteKit static SPA skeleton を `web/workspace` に追加し、npm lockfile、static adapter、README、generated artifact ignore/source-filter handling を追加。
+- `Cargo.lock` と `package.nix` cargo hash / source filtering を更新。
+
+統合・検証:
+- Merge commit: `3e03e536 merge: workspace web control plane`
+- Implementation commit: `ab7658c1 feat: bootstrap workspace web control plane`
+- Reviewer final verdict: approve
+- Validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p yoi-workspace-server`, `cargo check -p yoi-workspace-server`, `cargo check -p yoi`, `cd web/workspace && npm ci && npm run check && npm run build`, `cargo run -p yoi -- ticket doctor`, `cargo run -p yoi -- objective doctor`, and `nix build .#yoi --no-link`。
+
+範囲外 / deferrals:
+- Product CLI/server launch command は未追加。backend library exposes `serve(...)`; launch surface は future Ticket で設計する。
+- Write API、runner job dispatch、scheduler、hosted/multi-tenant auth、billing/quota、memory migration は実装していない。
+- Event stream implementation は未実装で、extension seam のみ。
+- Generated SPA assets are not committed; configured static directory such as `web/workspace/build` can be served after frontend build。
+
+---
