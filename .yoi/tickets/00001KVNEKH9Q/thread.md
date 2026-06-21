@@ -288,3 +288,80 @@ Worktree status:
 - Ignored generated frontend artifacts remain as listed above。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T16:38:57Z -->
+
+## Implementation report
+
+Reviewer r1 approvalを受けて、実装ブランチを Orchestrator worktree の `orchestration` branch に統合した。
+
+統合:
+- Merge commit: `c884d517 merge: workspace host workers`
+- Merged branch: `impl/00001KVNEKH9Q-workspace-host-workers`
+- Implementation commit:
+  - `58143ead feat: expose workspace hosts and workers`
+
+Orchestrator worktree validation:
+- `cargo fmt --check`: passed
+- `git diff --check HEAD^1..HEAD`: passed
+- `cargo test -p yoi-workspace-server`: passed
+- `cargo check -p yoi-workspace-server`: passed
+- `cd web/workspace && rm -rf node_modules .svelte-kit build && deno task check`: passed (`svelte-check found 0 errors and 0 warnings`)
+- `cd web/workspace && deno task build`: passed
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+
+Validation generated ignored frontend artifacts in Orchestrator worktree:
+- `web/workspace/node_modules/`
+- `web/workspace/.svelte-kit/`
+- `web/workspace/build/`
+
+These were removed after validation. Final Orchestrator worktree status after validation cleanup is clean on `orchestration` at `c884d517`。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-21T16:39:02Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Reviewer approval、Orchestrator worktree への統合、workspace-server tests/check、Deno check/build、Ticket doctor、Nix build が完了したため `done` に遷移する。
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-21T16:39:15Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-21T16:39:15Z status: closed -->
+
+## 完了
+
+Workspace backend に local Host / Worker read API を追加し、Web UI に Host / Worker list を表示する変更を統合した。
+
+主な成果:
+- Workspace backend に `/api/hosts`, `/api/workers`, `/api/hosts/{host_id}/workers` を追加。
+- `/api/runners` placeholder を削除 / Host-Worker naming に移行。
+- Local Pod metadata を read-only bridge として Worker domain object に投影。
+- Pod は primary domain ではなく `implementation: { kind: "local_pod", pod_name: ... }` として表現。
+- Worker response includes bounded `worker_id`, `host_id`, label/pod name, role/profile when known, `workspace_root`, state/status, implementation detail, and diagnostics。
+- Missing/unreadable Pod metadata root は process/server failure ではなく empty workers + bounded diagnostics / unavailable capability に degrade。
+- Session transcript / tool result / prompt contents / raw session JSONL は読まない。
+- Web UI static SPA に Host / Worker list を追加。
+- Existing Ticket / Objective canonical workflows remain unchanged。
+
+統合・検証:
+- Merge commit: `c884d517 merge: workspace host workers`
+- Implementation commit: `58143ead feat: expose workspace hosts and workers`
+- Reviewer final verdict: approve
+- Validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p yoi-workspace-server`, `cargo check -p yoi-workspace-server`, `deno task check`, `deno task build`, `cargo run -p yoi -- ticket doctor`, and `nix build .#yoi --no-link`。
+
+範囲外:
+- Remote/cloud runner registration, scheduling, start/stop/attach/notify operations, and full run-worker correlation were not implemented。
+- Frontend remains static SPA and does not own backend business/lifecycle authority。
+
+---
