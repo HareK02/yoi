@@ -270,3 +270,24 @@ Next action:
 - Wait for Coder hygiene fix, then route code-only implementation diff to Reviewer。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T12:32:21Z -->
+
+## Implementation report
+
+Coder hygiene fix received from `yoi-coder-00001KVMGAEJN`.
+
+New commit:
+- `ce62d235 chore: keep plugin websocket branch code-only`
+
+Result:
+- Implementation branch now contains code/docs/package changes only; child-worktree Ticket record edits were removed from the branch diff。
+- `git diff --name-status 3eac7f8e..HEAD -- .yoi/tickets/00001KVMGAEJN`: no output。
+- Worktree clean at `ce62d235`。
+- Diff `3eac7f8e..HEAD` now touches 11 expected files: Cargo/package, manifest/pod/yoi plugin CLI, docs, and WIT resources。
+- `git diff --check 3eac7f8e..HEAD`: passed。
+
+Next action:
+- Route to read-only Reviewer Pod for acceptance review against the Ticket。
+
+---
