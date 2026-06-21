@@ -413,3 +413,26 @@ Workspace web control plane bootstrap を実装し、Orchestrator worktree の `
 - Generated SPA assets are not committed; configured static directory such as `web/workspace/build` can be served after frontend build。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T07:46:46Z -->
+
+## Implementation report
+
+Post-close cleanup completed。
+
+- Stopped child Pods and reclaimed scope:
+  - `yoi-coder-00001KVMFFYVX`
+  - `yoi-reviewer-00001KVMFFYVX-r1`
+- Removed ignored frontend validation artifacts from child worktree before worktree removal:
+  - `web/workspace/node_modules/`
+  - `web/workspace/.svelte-kit/`
+  - `web/workspace/build/`
+- Removed implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVMFFYVX-workspace-web-control-plane`
+- Deleted implementation branch:
+  - `impl/00001KVMFFYVX-workspace-web-control-plane`
+- Orchestrator worktree remains clean on `orchestration` at `f33415c7`。
+
+Root/original workspace was not used for merge/validation/cleanup operations。
+
+---
