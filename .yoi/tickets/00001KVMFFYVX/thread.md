@@ -225,3 +225,34 @@ Next action:
 - Route to read-only Reviewer Pod for acceptance review against the Ticket and Objective context。
 
 ---
+
+<!-- event: comment author: yoi-orchestrator at: 2026-06-21T07:38:14Z -->
+
+## Comment
+
+Review routing:
+
+Spawned read-only Reviewer Pod:
+- `yoi-reviewer-00001KVMFFYVX-r1`
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVMFFYVX-workspace-web-control-plane`
+- Branch: `impl/00001KVMFFYVX-workspace-web-control-plane`
+- Baseline: `1d27f6c9`
+- Implementation commit: `ab7658c1 feat: bootstrap workspace web control plane`
+- Diff: `1d27f6c9..ab7658c1`
+
+Reviewer scope:
+- read-only `/home/hare/Projects/yoi`
+
+Reviewer focus:
+- Acceptance criteria for backend crate, store abstraction + SQLite, static SPA, bounded read APIs, static/API route separation, package/Nix/frontend hygiene。
+- No write API / scheduler / SaaS overreach。
+- `.yoi` Ticket / Objective records remain canonical and read-only。
+- SQLite migrations/settings are deterministic and server-appropriate。
+- Frontend generated artifacts are not committed and source filtering is safe。
+- Validation evidence includes Rust tests/checks, frontend check/build, doctors, and `nix build .#yoi --no-link`。
+
+Orchestrator will wait for reviewer verdict before integration。
+
+---
