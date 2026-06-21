@@ -138,3 +138,64 @@ Next action:
 - Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff. Orchestrator will not merge/close until reviewer approval and validation evidence are available。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T07:48:07Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVMG8FTW`.
+
+Implementation commit:
+- `962b7699 plugin: replace https host api with request grants`
+
+Changed areas:
+- `crates/manifest/src/plugin.rs`
+  - Replaced active host API/grant naming with `request`。
+  - Added manifest-declared `[[request]]` URL targets with `scheme`, `host`, optional `port`, `methods`, and `path_prefixes`。
+  - Added request grant parsing/labels/broad diagnostics and tests that legacy HTTPS-facing names are not accepted。
+- `crates/pod/src/feature/plugin.rs`
+  - Renamed runtime path/imports to request-oriented naming。
+  - Runtime now requires both manifest request target declaration and enabled request grant before network I/O。
+  - Checks scheme/host/port/path/method, rejects embedded credentials, credential-like headers, WebSocket URLs/upgrades, and SSE/event-stream requests。
+  - Allows loopback/local/private targets only when explicitly declared and granted。
+  - Adds static inspection entries for requested/granted/missing/grant-only/broad request targets。
+- `crates/yoi/src/plugin_cli.rs`
+  - Shows configured request grants and request target eligibility diagnostics, including broad/missing/grant-only states。
+- `resources/plugin/wit/*`
+  - Updated WIT import/interface from HTTPS host API to `yoi:host/request@1.0.0`。
+- `docs/development/plugin-development.md`
+  - Rewrote host API docs for `request`, including manifest targets, enablement grants, loopback policy, broad target diagnostics, and WebSocket/SSE exclusion。
+- `docs/design/plugin-component-model.md`
+  - Updated design wording/import references。
+- `crates/pod/src/pod.rs`
+  - Updated test fixture initialization for the new manifest request target field。
+
+Coder validation reported:
+- `cargo fmt --check`: passed
+- `cargo test -p manifest request`: passed
+- `cargo test -p pod feature::plugin::tests --lib`: passed
+- `cargo test -p yoi plugin_cli::tests`: passed
+- `cargo check -p manifest -p pod -p yoi`: passed
+- `git diff --check`: passed
+- Active naming grep for `host_api.https|grants.https|PluginHttps|yoi:host/https|yoi:https` under `crates docs resources`: no matches
+- `target/debug/yoi ticket doctor`: passed
+
+Coder dependency/package report:
+- No `Cargo.lock`, `package.nix`, or flake changes。
+- No dependency/package churn。
+
+Known deferrals:
+- Regex URL target matching was not added。
+- WebSocket/SSE/persistent connection support remains explicitly outside `host_api.request`。
+
+Orchestrator evidence checked:
+- Implementation worktree is clean on `impl/00001KVMG8FTW-plugin-request-host-api`。
+- HEAD is `962b7699`。
+- Diff `4cd4a06e..HEAD` touches 9 expected manifest/pod/plugin-doc/WIT files, about 768 insertions / 448 deletions。
+- Active stale naming grep under `crates docs resources` returned no matches。
+- `git diff --check 4cd4a06e..HEAD` produced no diagnostics。
+
+Next action:
+- Route to read-only Reviewer Pod for acceptance review against the Ticket and IntentPacket。
+
+---
