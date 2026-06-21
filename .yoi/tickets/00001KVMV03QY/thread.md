@@ -175,3 +175,34 @@ Next action:
 - Route to read-only Reviewer Pod for acceptance review against the Ticket。
 
 ---
+
+<!-- event: comment author: yoi-orchestrator at: 2026-06-21T11:06:03Z -->
+
+## Comment
+
+Review routing:
+
+Spawned read-only Reviewer Pod:
+- `yoi-reviewer-00001KVMV03QY-r1`
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVMV03QY-workspace-spa-deno`
+- Branch: `impl/00001KVMV03QY-workspace-spa-deno`
+- Baseline: `155e039e`
+- Implementation commit: `66f04e04 feat: migrate workspace spa tooling to deno`
+- Diff: `155e039e..66f04e04`
+
+Reviewer scope:
+- read-only `/home/hare/Projects/yoi`
+
+Reviewer focus:
+- Deno task check/build works from clean generated-artifact state。
+- `deno.json` / `deno.lock` are canonical source of truth。
+- `package.json` remains only compatibility metadata if retained; no npm scripts / Node-only guidance remains active。
+- Static output path and Rust backend serving assumptions remain valid。
+- Generated artifacts remain ignored/source-filtered and are not committed。
+- No protocol/backend authority scope creep。
+
+Orchestrator will wait for reviewer verdict before integration。
+
+---
