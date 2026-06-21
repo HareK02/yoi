@@ -592,3 +592,22 @@ URL permission based Plugin WebSocket host API を実装し、Orchestrator workt
 - SecretRef-based credential injection は future follow-up。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T13:27:28Z -->
+
+## Implementation report
+
+Post-close cleanup completed。
+
+- Stopped child Pods and reclaimed scope:
+  - `yoi-coder-00001KVMGAEJN`
+  - `yoi-reviewer-00001KVMGAEJN-r1`
+- Removed implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVMGAEJN-plugin-websocket-host-api`
+- Deleted implementation branch:
+  - `impl/00001KVMGAEJN-plugin-websocket-host-api`
+- Orchestrator worktree remains clean on `orchestration` at `e8103477`。
+
+Root/original workspace was not used for merge/validation/cleanup operations。
+
+---
