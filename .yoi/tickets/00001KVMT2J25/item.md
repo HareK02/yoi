@@ -2,7 +2,7 @@
 title: 'Pod protocol: in-flight LLM response reconnect snapshot should include unfinished blocks'
 state: 'inprogress'
 created_at: '2026-06-21T10:02:01Z'
-updated_at: '2026-06-21T11:31:55Z'
+updated_at: '2026-06-21T11:37:35Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['protocol', 'session-history', 'persistence', 'tui-reconnect', 'stream-state']

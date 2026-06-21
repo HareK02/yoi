@@ -308,3 +308,74 @@ Reviewer focus:
 Orchestrator will wait for reviewer verdict before integration。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVMT2J25-r1 at: 2026-06-21T11:37:35Z status: request_changes -->
+
+## Review: request changes
+
+Verdict: `request_changes`
+
+確認範囲:
+- Ticket authority:
+  - `.yoi/tickets/00001KVMT2J25/item.md`
+  - `.yoi/tickets/00001KVMT2J25/thread.md`
+- Diff `155e039e..74aca6f6`, including:
+  - `crates/protocol/src/lib.rs`
+  - `crates/pod/src/in_flight.rs`
+  - `crates/pod/src/controller.rs`
+  - `crates/pod/src/ipc/alerter.rs`
+  - `crates/pod/src/ipc/server.rs`
+  - `crates/pod/src/pod.rs`
+  - `crates/pod/src/segment_log_sink.rs`
+  - `crates/tui/src/app.rs`
+  - constructor/test updates in pod/TUI/discovery/spawn/dashboard-related test files
+
+Blocking issue:
+
+1. Snapshot/live boundary still has a gap for finalized assistant items committed between the session-log snapshot and the in-flight snapshot。
+
+The implementation makes in-flight streaming deltas mostly gap-free by holding the in-flight mutex across subscribe/snapshot, but the full connection snapshot is not atomic across the committed session-log mirror and the new in-flight accumulator。
+
+Relevant path:
+- `crates/pod/src/ipc/server.rs:112` takes `handle.sink.subscribe_with_snapshot()` first。
+- `crates/pod/src/ipc/server.rs:118-120` then subscribes/snapshots alerts + in-flight state。
+- `crates/pod/src/pod.rs:182-191` persists an entry, clears matching in-flight state for `LogEntry::AssistantItem`, then publishes to the session-log sink。
+- `crates/pod/src/segment_log_sink.rs:90-103` documents that `AssistantItem` is mirror-only and not live-broadcast。
+- `crates/pod/src/segment_log_sink.rs:120-127` confirms only `SegmentStart`, `UserInput`, `SystemItem`, and `Invoke` are live-relevant。
+
+Race:
+1. New client connects。
+2. Server snapshots session-log entries at N。
+3. LLM response finalizes and appends `LogEntry::AssistantItem`。
+4. `append_entry` clears the matching in-flight text/thinking block。
+5. `SegmentLogSink::publish` mirrors the `AssistantItem`, but does not broadcast it live。
+6. Server snapshots in-flight state, now empty/cleared。
+7. Client receives `Event::Snapshot` with no finalized assistant item in `entries`, no unfinished/finalized in-flight block, and no live committed assistant event forthcoming。
+
+This violates the Ticket invariant that Snapshot and post-Snapshot live events must be gap-free and duplicate-free。
+
+Required fix:
+- Make the connection snapshot atomic enough across session-log mirror and in-flight state, or otherwise ensure committed assistant items cannot disappear in this boundary。
+- Add an integrated regression test around session-log snapshot + in-flight snapshot + mirror-only assistant commit boundary。
+- Ensure the fix still avoids persisting unfinished output as final history and still does not duplicate content when final AssistantItem is included in committed snapshot。
+
+Non-blocking concerns:
+- The suggested focused test name `subscribe_with_alerts_and_in_flight_snapshot_splits_snapshot_and_live_deltas` selected 0 tests; no matching test exists。Add/rename an integrated focused test so validation can target the boundary reliably。
+- Minor protocol doc issue: `Greeting` doc comment appears displaced so “Pod self-description...” now sits immediately before `InFlightSnapshot` in `crates/protocol/src/lib.rs`。Not blocking but should be cleaned up if easy。
+
+Reviewer validation:
+- `git diff --check 155e039e..HEAD`: passed
+- `cargo fmt --all --check`: passed
+- `cargo test -p protocol`: passed, 40 tests
+- `cargo test -p pod in_flight`: passed selected tests
+- `cargo test -p pod subscribe_with_alerts_and_in_flight_snapshot_splits_snapshot_and_live_deltas`: selected 0 tests / no matching test
+- `cargo test -p tui snapshot_in_flight_blocks_continue_with_live_deltas`: passed
+- `cargo test -p tui`: passed, 367 tests
+- `cargo check -p protocol -p pod -p tui`: passed
+- `target/debug/yoi ticket doctor`: passed (`doctor: ok`)
+- Full `cargo test -p pod`: failed only on the two known unrelated prompt-resource assertion tests。
+
+Worktree status:
+- Clean on `impl/00001KVMT2J25-inflight-snapshot`。
+
+---
