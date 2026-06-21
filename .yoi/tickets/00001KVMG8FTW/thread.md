@@ -490,3 +490,22 @@ Plugin host API の one-shot outbound request capability を `host_api.https` / 
 - WebSocket/SSE/persistent connection support は `host_api.request` に含めていない。WebSocket は別 capability / design Ticket 側で扱う。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T08:12:34Z -->
+
+## Implementation report
+
+Post-close cleanup completed。
+
+- Stopped child Pods and reclaimed scope:
+  - `yoi-coder-00001KVMG8FTW`
+  - `yoi-reviewer-00001KVMG8FTW-r1`
+- Removed implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVMG8FTW-plugin-request-host-api`
+- Deleted implementation branch:
+  - `impl/00001KVMG8FTW-plugin-request-host-api`
+- Orchestrator worktree remains clean on `orchestration` at `2601bfa9`。
+
+Root/original workspace was not used for merge/validation/cleanup operations。
+
+---
