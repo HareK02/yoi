@@ -1,9 +1,11 @@
 ---
 title: 'Workspace backend: expose local host and worker list'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-21T16:00:49Z'
-updated_at: '2026-06-21T16:01:33Z'
+updated_at: '2026-06-21T16:09:10Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-21T16:09:10Z'
 ---
 
 ## 背景
