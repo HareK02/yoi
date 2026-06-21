@@ -2,7 +2,7 @@
 title: "Team workspace control plane and runner architecture"
 state: "active"
 created_at: "2026-06-20T14:26:29Z"
-updated_at: "2026-06-20T15:28:00Z"
+updated_at: "2026-06-20T15:45:00Z"
 linked_tickets: []
 ---
 
@@ -119,19 +119,22 @@ Ticket には次の概念が必要になる。
 - Board / queue / planning / review / done / archived views.
 - Conflict handling and concurrent editing policy.
 
-### 4. Memory / Knowledge を team 用に再設計する
+### 4. Memory / Knowledge の本格再設計は後回しにする
 
-Memory / Knowledge は Ticket / Run / Artifact のコピーではない。再利用可能な文脈、方針、学習された制約、保守された知識として扱う。
+Memory / Knowledge は Ticket / Run / Artifact のコピーではない。再利用可能な文脈、方針、学習された制約、保守された知識として扱う。ただし、Memory の意味論・抽出・承認・検索・staleness 処理を今この Objective で先に作り込まない。
 
-最低限、次を分ける。
+理由は、Memory の正しい設計が Workspace control plane の record model、Actor / visibility / permission、Ticket と Run の分離、Artifact / evidence、RepositoryPoint、Runner に渡す context の監査方法に依存するためである。これらが固まる前に Memory schema だけを作ると、local `.yoi` 前提や現行 agent runtime 前提に引っ張られ、後で再設計が必要になる。
 
-- Personal Memory: 個人の好みや作業スタイル。
-- Workspace Memory: チームまたはプロジェクトの方針、繰り返し出る制約、設計判断。
-- Run Summary: 個別 Run や session の要約。必ず provenance を持つ。
-- Maintained Knowledge: 人間が保守する資料、設計判断、API notes、運用知識。
-- Ticket / Objective / Run / Artifact: 作業と実行結果の正本。
+この Objective では、Memory / Knowledge について以下の platform contract だけを維持する。
 
-Generated Memory には provenance、visibility、approval、audit を持たせる。Memory は Ticket や Run audit log の代替にしない。
+- Memory / Knowledge は Control plane が扱う record だが、Ticket / Run / Artifact の authority を置き換えない。
+- 将来、Memory / Knowledge の canonical storage は Workspace control plane 側に置く。
+- local `.yoi` memory は compatibility、offline/export/import、runner-local projection、migration bridge として扱う。
+- Personal Memory、Workspace Memory、Run Summary、Maintained Knowledge は分離が必要である。
+- Generated Memory には provenance、visibility、approval、audit が必要である。
+- Runner / agent に渡した Memory/Knowledge context は、将来 ContextPack などとして Run に記録できる必要がある。
+
+本格的な Memory 再設計は、Memory の保存先を Workspace backend / control plane record に移すタイミングで回収する。それまでは低リスクな観察、問題例の収集、既存 local memory の互換維持に留める。
 
 ### 5. 管理システムと実行環境を弱結合にする
 
@@ -191,8 +194,8 @@ Cloud/remote execution を成立させるには、多数のエージェント実
    - Ticket / Objective / Target / Run / Artifact / Actor / Permission / Audit / Memory / Knowledge の entity/event model を設計する。
 3. **Ticket and Run separation**
    - Ticket lifecycle と execution attempt / orchestration run / validation run を分離し、Ticket thread と Run evidence の責務を明確化する。
-4. **Memory model for team workspace**
-   - Personal / Workspace / Run Summary / Maintained Knowledge / provenance / visibility / approval を設計する。
+4. **Memory storage migration boundary**
+   - Memory / Knowledge の本格再設計は後回しにし、まずは Workspace backend に移す時の platform contract、compatibility/cache/export 方針、将来の provenance / visibility / approval 要件だけを固定する。
 5. **Control plane backend architecture**
    - local `.yoi` backend と server-side canonical backend の境界、migration/export/import、compatibility mode を設計する。
 6. **Web control plane MVP design**
@@ -221,12 +224,12 @@ Cloud/remote execution を成立させるには、多数のエージェント実
 - Workspace / Repository / RepositoryPoint / Execution Workspace / Runner / Control Plane / Run / Ticket / Memory / Knowledge の境界が文書化されている。
 - Ticket が team coordination record として、target selector / Run / Artifact / Actor / Permission / Audit と分離された model を持つ。
 - `.yoi` local backend は compatibility/local backend として整理され、server-side canonical backend の設計を阻害しない。
-- Web UI/API が Ticket / Objective / Memory / Knowledge / Runner state の read-only view を提供できる設計または MVP を持つ。
+- Web UI/API が Ticket / Objective / Runner state を中心とした read-only view を提供できる設計または MVP を持つ。Memory / Knowledge は既存 record の表示または将来 placeholder に留め、本格再設計をこの段階の必須条件にしない。
 - Control plane から local runner に対して、現在のローカル管理画面相当の安全な操作を実行できる design/protocol がある。
 - Git Repository root に依存しない Workspace model があり、Git Repository は Repository provider の一種として扱われている。
 - Ticket と Objective は Workspace 配下に平たく存在し、Repository への所属ではなく target selector / scope hint で対象を表現する。
 - Git worktree 相当は Execution Workspace materialization strategy として扱われ、Run が immutable な RepositoryPoint を記録する。
-- Memory / Knowledge の personal/workspace/run-summary/provenance/visibility 方針が決まっている。
+- Memory / Knowledge は Ticket / Run / Artifact の authority を置き換えない record として platform contract だけを持つ。本格的な意味論・抽出・承認・検索・staleness 処理は、Memory の保存先を Workspace backend / control plane record に移すタイミングで回収する。
 - Hosted runner / resource allocation / SaaS offering に進むための後続 Ticket が切れる状態になっている。
 - 既存 local dogfooding runtime を壊さず、local use と remote-capable architecture が両立している。
 
@@ -238,3 +241,4 @@ Cloud/remote execution を成立させるには、多数のエージェント実
 - Web frontend を最初の primary team UI とする。Desktop app は web/control-plane model が安定した後に検討する。
 - Git は重要な Repository provider / materialization backend として使うが、Workspace identity と authority を Git Repository root に固定しない。
 - Ticket と Objective は Workspace 配下に平たく持つ。対象コードベースや ref は Repository target selector として表現し、Run が concrete RepositoryPoint に解決する。
+- Memory の本格再設計は後回しにする。先に Workspace / Ticket / Run / Repository / Runner / Control plane の基盤を固め、Memory の保存先を Workspace backend に移すタイミングで、意味論・抽出・承認・検索・staleness 処理をまとめて回収する。
