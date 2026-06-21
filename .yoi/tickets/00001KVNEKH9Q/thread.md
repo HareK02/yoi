@@ -365,3 +365,29 @@ Workspace backend に local Host / Worker read API を追加し、Web UI に Hos
 - Frontend remains static SPA and does not own backend business/lifecycle authority。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T16:39:43Z -->
+
+## Implementation report
+
+Post-close cleanup completed。
+
+- Stopped child Pods and reclaimed scope:
+  - `yoi-coder-00001KVNEKH9Q`
+  - `yoi-reviewer-00001KVNEKH9Q-r1`
+- Removed ignored frontend validation artifacts from child worktree before worktree removal:
+  - `web/workspace/node_modules/`
+  - `web/workspace/.svelte-kit/`
+  - `web/workspace/build/`
+- Removed implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVNEKH9Q-workspace-host-workers`
+- Deleted implementation branch:
+  - `impl/00001KVNEKH9Q-workspace-host-workers`
+- Orchestrator worktree remains clean on `orchestration` at `a4ed5fb0`。
+
+Root/original workspace was not used for merge/validation/cleanup operations。
+
+Note for related active work:
+- `00001KVNG9B9Z` sidebar UI work was branched before this merge and may need to integrate the Host/Worker UI/API changes from `c884d517` during review/merge。
+
+---

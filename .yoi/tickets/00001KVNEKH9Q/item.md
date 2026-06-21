@@ -2,7 +2,7 @@
 title: 'Workspace backend: expose local host and worker list'
 state: 'closed'
 created_at: '2026-06-21T16:00:49Z'
-updated_at: '2026-06-21T16:39:15Z'
+updated_at: '2026-06-21T16:39:43Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-21T16:09:10Z'
