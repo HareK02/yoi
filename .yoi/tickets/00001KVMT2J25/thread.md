@@ -218,3 +218,60 @@ Next action:
 - Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T11:31:12Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVMT2J25`.
+
+Implementation commit:
+- `74aca6f6 fix: snapshot in-flight stream state`
+
+Changed areas:
+- `crates/protocol/src/lib.rs`
+  - Added typed `InFlightSnapshot` / `InFlightBlock` state on `Event::Snapshot`。
+  - Added serialization/default compatibility coverage。
+- `crates/pod/src/in_flight.rs`
+  - New in-flight accumulator for assistant text, thinking/reasoning, and tool-call args。
+  - Snapshot/live boundary tests for no gap/duplicate。
+- `crates/pod/src/controller.rs`
+  - Streaming callbacks update the in-flight accumulator and broadcast live deltas from the same path。
+- `crates/pod/src/ipc/alerter.rs`, `crates/pod/src/ipc/server.rs`
+  - Connect-time snapshot now includes alerts plus typed in-flight stream state while subscribing live events。
+- `crates/pod/src/pod.rs`
+  - Clears matching in-flight blocks once committed assistant items reach durable session log entries。
+- `crates/tui/src/app.rs`
+  - Snapshot restore seeds unfinished assistant text/thinking/tool-call blocks。
+  - Live deltas continue those seeded blocks。
+  - Added regression coverage for snapshot seeding plus live continuation。
+- Other touched files update test Snapshot constructors for the new `in_flight` field。
+
+Coder validation reported:
+- `cargo fmt --all --check`: passed
+- `cargo test -p protocol`: passed
+- `cargo test -p protocol event_snapshot_in_flight_roundtrip_and_default`: passed
+- `cargo test -p pod in_flight`: passed
+- `cargo test -p pod subscribe_with_alerts_and_in_flight_snapshot_splits_snapshot_and_live_deltas`: passed
+- `cargo test -p tui`: passed
+- `cargo test -p tui snapshot_in_flight_blocks_continue_with_live_deltas`: passed
+- `cargo check -p protocol -p pod -p tui`: passed
+- `git diff --check`: passed
+- `target/debug/yoi ticket doctor`: passed
+
+Known unrelated validation note:
+- Full `cargo test -p pod` still fails on two prompt-resource assertion tests unrelated to this change:
+  - `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`
+  - `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`
+  - Both assert missing text: `worktree status, diff, and test results`。
+
+Orchestrator evidence checked:
+- Implementation worktree is clean on `impl/00001KVMT2J25-inflight-snapshot`。
+- HEAD is `74aca6f6`。
+- Diff `155e039e..HEAD` touches 17 protocol/pod/TUI files, adding `crates/pod/src/in_flight.rs` and updating Snapshot constructors/tests。
+- `git diff --check 155e039e..HEAD` produced no diagnostics。
+
+Next action:
+- Route to read-only Reviewer Pod for acceptance review against the Ticket。
+
+---
