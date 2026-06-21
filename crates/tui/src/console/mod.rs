@@ -1922,6 +1922,7 @@ mod tests {
             greeting: test_greeting(),
             entries: vec![],
             status: PodStatus::Idle,
+            in_flight: Default::default(),
         });
         app.handle_pod_event(Event::RewindApplied {
             entries: vec![],
@@ -1947,6 +1948,7 @@ mod tests {
             greeting: test_greeting(),
             entries: vec![],
             status: PodStatus::Idle,
+            in_flight: Default::default(),
         });
         type_keys(&mut app, "draft");
 

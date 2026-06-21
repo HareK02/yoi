@@ -123,6 +123,7 @@ fn accept_one_method(listener: UnixListener) -> tokio::task::JoinHandle<Option<M
                     context_tokens: 0,
                 },
                 status: protocol::PodStatus::Idle,
+                in_flight: Default::default(),
             })
             .await
             .is_err()

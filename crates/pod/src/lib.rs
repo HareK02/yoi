@@ -6,6 +6,7 @@ pub mod entrypoint;
 pub mod feature;
 pub mod fs_view;
 pub mod hook;
+pub(crate) mod in_flight;
 pub mod ipc;
 pub mod prompt;
 pub mod runtime;
