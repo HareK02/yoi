@@ -91,3 +91,31 @@ Validation plan:
 Human authorized queue routing from Workspace Dashboard. Ticket has concrete acceptance criteria, no recorded blockers, and is semantically separate from the protocol reconnect Ticket, so Orchestrator accepts implementation.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T11:00:00Z -->
+
+## Implementation report
+
+Implementation start report:
+
+- Created child implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVMV03QY-workspace-spa-deno`
+- Created branch:
+  - `impl/00001KVMV03QY-workspace-spa-deno`
+- Base commit:
+  - `155e039e ticket: route deno and inflight snapshot work`
+- Confirmed tracked Ticket project records are visible in the child worktree。
+- Confirmed `.yoi/memory` has no tracked/untracked entries in the child worktree check。
+- Spawned sibling Coder Pod:
+  - `yoi-coder-00001KVMV03QY`
+- Coder scope:
+  - read: `/home/hare/Projects/yoi`
+  - write: `/home/hare/Projects/yoi/.worktree/00001KVMV03QY-workspace-spa-deno`
+
+Parallelization note:
+- `00001KVMT2J25` is active in a separate child worktree and targets protocol/pod/TUI stream state. This Ticket should stay limited to `web/workspace` frontend tooling and package/source-filter docs as needed。
+
+Next action:
+- Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff。
+
+---

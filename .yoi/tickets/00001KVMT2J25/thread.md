@@ -190,3 +190,31 @@ Validation plan:
 Human authorized queue routing from Workspace Dashboard. Ticket has concrete acceptance criteria, no recorded blockers, and is semantically separate from the frontend Deno tooling Ticket, so Orchestrator accepts implementation.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T11:00:09Z -->
+
+## Implementation report
+
+Implementation start report:
+
+- Created child implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVMT2J25-inflight-snapshot`
+- Created branch:
+  - `impl/00001KVMT2J25-inflight-snapshot`
+- Base commit:
+  - `155e039e ticket: route deno and inflight snapshot work`
+- Confirmed tracked Ticket project records are visible in the child worktree。
+- Confirmed `.yoi/memory` has no tracked/untracked entries in the child worktree check。
+- Spawned sibling Coder Pod:
+  - `yoi-coder-00001KVMT2J25`
+- Coder scope:
+  - read: `/home/hare/Projects/yoi`
+  - write: `/home/hare/Projects/yoi/.worktree/00001KVMT2J25-inflight-snapshot`
+
+Parallelization note:
+- `00001KVMV03QY` is active in a separate child worktree and targets frontend Deno tooling. This Ticket should stay limited to protocol/pod/TUI in-flight snapshot semantics。
+
+Next action:
+- Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff。
+
+---
