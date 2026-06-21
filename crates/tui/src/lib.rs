@@ -48,16 +48,17 @@ pub enum LaunchMode {
         pod_name: Option<String>,
         profile: Option<String>,
     },
-    /// `yoi <name>` / `yoi --pod <name>`: attach to a live Pod by name if
-    /// possible; otherwise launch the Pod runtime command with `--pod <name>` so it
+    /// `yoi --pod <name>`: attach to a live Pod by name if possible;
+    /// otherwise launch the Pod runtime command with `--pod <name>` so it
     /// resumes from name-keyed state or creates a fresh same-name Pod.
     PodName {
         pod_name: String,
         socket_override: Option<PathBuf>,
     },
-    /// `yoi -r` / `yoi --resume`: open the Pod picker, then attach to the
-    /// selected live Pod or restore the selected stopped Pod by name.
-    Resume,
+    /// `yoi resume`: open the Pod picker, then attach to the selected live Pod
+    /// or restore the selected stopped Pod by name. Without `--all`, the picker
+    /// is scoped to the current runtime workspace.
+    Resume { all: bool },
     /// `yoi --session <UUID>`: skip the picker, go straight to the
     /// resume name dialog with `id` baked in.
     ResumeWithSession {
@@ -101,7 +102,9 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
             pod_name,
             socket_override,
         } => console::run_pod_name(pod_name, socket_override, runtime_command).await,
-        LaunchMode::Resume => console::run_resume(runtime_command).await,
+        LaunchMode::Resume { all } => {
+            console::run_resume(runtime_command, workspace_root.clone(), all).await
+        }
         LaunchMode::ResumeWithSession { id, pod_name } => {
             console::run_spawn(Some(id), pod_name, None, runtime_command).await
         }
