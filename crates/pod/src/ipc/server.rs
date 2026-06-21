@@ -115,7 +115,9 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
     // warnings emitted before this client connected are replayed
     // exactly once — they appear in the snapshot, and any alert
     // arriving afterwards reaches us through `rx`.
-    let (alert_snapshot, mut rx) = handle.alerter.subscribe_with_snapshot();
+    let (alert_snapshot, in_flight, mut rx) = handle
+        .alerter
+        .subscribe_with_alerts_and_in_flight_snapshot(&handle.in_flight);
     for alert in alert_snapshot {
         if writer.write(&Event::Alert(alert)).await.is_err() {
             return;
@@ -131,6 +133,7 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
             .collect(),
         greeting: handle.shared_state.greeting.clone(),
         status: handle.shared_state.get_status(),
+        in_flight,
     };
     if writer.write(&snapshot_event).await.is_err() {
         return;

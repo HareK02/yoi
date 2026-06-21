@@ -12,6 +12,10 @@ fn is_true(value: &bool) -> bool {
     *value
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 // ---------------------------------------------------------------------------
 // Method (Client → Pod via Unix Socket)
 // ---------------------------------------------------------------------------
@@ -453,6 +457,10 @@ pub enum Event {
         greeting: Greeting,
         #[serde(default)]
         status: PodStatus,
+        /// Unfinished model output that has already streamed in the current
+        /// run but is not yet represented by committed snapshot entries.
+        #[serde(default, skip_serializing_if = "InFlightSnapshot::is_empty")]
+        in_flight: InFlightSnapshot,
     },
     /// Server-side segment log rotated to a fresh `SegmentStart`.
     ///
@@ -636,6 +644,62 @@ pub struct RewindSummary {
 /// Built once in the Pod controller from the resolved manifest and
 /// transmitted alongside `Event::Snapshot` so clients don't need
 /// their own view of the manifest.
+/// Unfinished model output included in `Event::Snapshot` for clients that
+/// attach while an LLM response is still streaming.
+///
+/// These blocks are presentation state only: they are reconstructed from the
+/// active Pod controller and must not be treated as committed assistant
+/// history. Finalized assistant items continue to come from ordinary snapshot
+/// entries.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InFlightSnapshot {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<InFlightBlock>,
+}
+
+impl InFlightSnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InFlightBlock {
+    Text {
+        text: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        finished: bool,
+    },
+    Thinking {
+        text: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        finished: bool,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        args: String,
+        #[serde(default, skip_serializing_if = "InFlightToolCallState::is_pending")]
+        state: InFlightToolCallState,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InFlightToolCallState {
+    #[default]
+    Pending,
+    StreamingArgs,
+    Done,
+}
+
+impl InFlightToolCallState {
+    pub fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Greeting {
     pub pod_name: String,
@@ -1129,6 +1193,7 @@ mod tests {
                 context_tokens: 42_000,
             },
             status: PodStatus::Paused,
+            in_flight: InFlightSnapshot::default(),
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1140,6 +1205,62 @@ mod tests {
         assert_eq!(parsed["data"]["greeting"]["context_window"], 200_000);
         assert_eq!(parsed["data"]["greeting"]["context_tokens"], 42_000);
         assert_eq!(parsed["data"]["status"], "paused");
+    }
+
+    #[test]
+    fn event_snapshot_in_flight_roundtrip_and_default() {
+        let inbound = r#"{"event":"snapshot","data":{"entries":[],"greeting":{"pod_name":"test","cwd":"/tmp","provider":"p","model":"m","scope_summary":"s","tools":[]},"status":"running"}}"#;
+        let decoded: Event = serde_json::from_str(inbound).unwrap();
+        match decoded {
+            Event::Snapshot { in_flight, .. } => assert!(in_flight.is_empty()),
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+
+        let event = Event::Snapshot {
+            entries: Vec::new(),
+            greeting: Greeting {
+                pod_name: "test".into(),
+                cwd: "/tmp".into(),
+                provider: "p".into(),
+                model: "m".into(),
+                scope_summary: "s".into(),
+                tools: Vec::new(),
+                context_window: 0,
+                context_tokens: 0,
+            },
+            status: PodStatus::Running,
+            in_flight: InFlightSnapshot {
+                blocks: vec![
+                    InFlightBlock::Text {
+                        text: "hel".into(),
+                        finished: false,
+                    },
+                    InFlightBlock::Thinking {
+                        text: "why".into(),
+                        finished: true,
+                    },
+                    InFlightBlock::ToolCall {
+                        id: "call_1".into(),
+                        name: "Read".into(),
+                        args: r#"{"file"#.into(),
+                        state: InFlightToolCallState::StreamingArgs,
+                    },
+                ],
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["data"]["in_flight"]["blocks"][0]["text"], "hel");
+        assert_eq!(parsed["data"]["in_flight"]["blocks"][1]["finished"], true);
+        assert_eq!(
+            parsed["data"]["in_flight"]["blocks"][2]["state"],
+            "streaming_args"
+        );
+
+        match serde_json::from_str::<Event>(&json).unwrap() {
+            Event::Snapshot { in_flight, .. } => assert_eq!(in_flight.blocks.len(), 3),
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
     }
 
     #[test]

@@ -35,6 +35,7 @@ use crate::hook::{
     Hook, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd, PostToolCall, PreLlmRequest,
     PreToolCall,
 };
+use crate::in_flight::InFlightEvents;
 use crate::ipc::alerter::Alerter;
 use crate::ipc::interceptor::PodInterceptor;
 use crate::ipc::notify_buffer::NotifyBuffer;
@@ -167,6 +168,7 @@ pub struct LogWriterHandle<St: Clone> {
     pub store: St,
     pub state: Arc<SegmentState>,
     pub sink: SegmentLogSink,
+    pub in_flight: Option<InFlightEvents>,
 }
 
 impl<St> LogWriterHandle<St>
@@ -181,6 +183,11 @@ where
         let loc = self.state.location();
         self.store.append(loc.session_id, loc.segment_id, &entry)?;
         self.state.increment_entries();
+        if let Some(in_flight) = &self.in_flight {
+            if let LogEntry::AssistantItem { item, .. } = &entry {
+                in_flight.clear_for_committed_item(item);
+            }
+        }
         self.sink.publish(entry);
         Ok(())
     }
@@ -296,6 +303,7 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// notifications, events sent here are NOT replayed to clients that
     /// connect after the fact — they are fire-and-forget broadcasts.
     event_tx: Option<broadcast::Sender<Event>>,
+    in_flight: Option<InFlightEvents>,
     /// Monotonic counter incremented by worker event bridges when an
     /// assistant-side execution artifact becomes visible to clients before
     /// it is necessarily committed to history (e.g. streaming text deltas).
@@ -449,6 +457,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
             system_prompt_template: None,
             alerter: self.alerter.clone(),
             event_tx: self.event_tx.clone(),
+            in_flight: self.in_flight.clone(),
             ai_activity_counter: self.ai_activity_counter.clone(),
             pending_notifies: NotifyBuffer::new(),
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
@@ -484,6 +493,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
             store: self.store.clone(),
             state: self.segment_state.clone(),
             sink: self.sink.clone(),
+            in_flight: self.in_flight.clone(),
         }
     }
 
@@ -493,6 +503,10 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
     /// Idempotent: subsequent calls overwrite the previous handle.
     pub fn attach_log_writer(&mut self, writer: Arc<dyn SystemItemCommitter>) {
         self.log_writer = Some(writer);
+    }
+
+    pub fn attach_in_flight_events(&mut self, in_flight: InFlightEvents) {
+        self.in_flight = Some(in_flight);
     }
 
     /// Wire `Worker::on_history_append` to commit each appended item
@@ -633,6 +647,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             system_prompt_template: None,
             alerter: None,
             event_tx: None,
+            in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
@@ -3842,6 +3857,7 @@ where
             system_prompt_template: common.system_prompt_template,
             alerter: None,
             event_tx: None,
+            in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
@@ -3951,6 +3967,7 @@ where
             system_prompt_template: common.system_prompt_template,
             alerter: None,
             event_tx: None,
+            in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),
@@ -4187,6 +4204,7 @@ where
             system_prompt_template: None,
             alerter: None,
             event_tx: None,
+            in_flight: None,
             ai_activity_counter: Arc::new(AtomicUsize::new(0)),
             pending_notifies: NotifyBuffer::new(),
             pending_attachments: Arc::new(Mutex::new(Vec::<SystemItem>::new())),

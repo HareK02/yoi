@@ -129,6 +129,7 @@ fn empty_snapshot() -> Event {
             context_tokens: 0,
         },
         status: protocol::PodStatus::Idle,
+        in_flight: Default::default(),
     }
 }
 
@@ -203,6 +204,7 @@ fn serve_history(listener: UnixListener, items: Vec<Item>) -> JoinHandle<()> {
                     context_tokens: 0,
                 },
                 status: protocol::PodStatus::Idle,
+                in_flight: Default::default(),
             };
             let _ = writer.write(&event).await;
         }

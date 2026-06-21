@@ -3,8 +3,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use protocol::{
-    AlertLevel, AlertSource, CompletionEntry, CompletionKind, ErrorCode, Event, Method, PodStatus,
-    RewindTarget, RunResult, Segment,
+    AlertLevel, AlertSource, CompletionEntry, CompletionKind, ErrorCode, Event, InFlightBlock,
+    InFlightSnapshot, InFlightToolCallState, Method, PodStatus, RewindTarget, RunResult, Segment,
 };
 
 use crate::block::{
@@ -1279,9 +1279,10 @@ impl App {
                 entries,
                 greeting,
                 status,
+                in_flight,
             } => {
                 self.rewind_refresh_fence = false;
-                self.restore_snapshot(&entries, greeting);
+                self.restore_snapshot(&entries, greeting, in_flight);
                 self.set_pod_status(status);
             }
             Event::Status { status } => {
@@ -1408,6 +1409,50 @@ impl App {
             source: AlertSource::Pod,
             message: hint,
         });
+    }
+
+    fn apply_in_flight_snapshot(&mut self, snapshot: InFlightSnapshot) {
+        for block in snapshot.blocks {
+            match block {
+                InFlightBlock::Text { text, finished } => {
+                    self.blocks.push(Block::AssistantText { text });
+                    self.assistant_streaming = !finished;
+                }
+                InFlightBlock::Thinking { text, finished } => {
+                    let state = if finished {
+                        ThinkingState::Finished { elapsed_secs: None }
+                    } else {
+                        ThinkingState::Streaming {
+                            started_at: Instant::now(),
+                        }
+                    };
+                    self.blocks
+                        .push(Block::Thinking(ThinkingBlock { text, state }));
+                }
+                InFlightBlock::ToolCall {
+                    id,
+                    name,
+                    args,
+                    state,
+                } => {
+                    let (tool_state, arguments) = match state {
+                        InFlightToolCallState::Pending => (ToolCallState::Pending, None),
+                        InFlightToolCallState::StreamingArgs => (ToolCallState::Streaming, None),
+                        InFlightToolCallState::Done => {
+                            (ToolCallState::Executing, Some(args.clone()))
+                        }
+                    };
+                    self.blocks.push(Block::ToolCall(ToolCallBlock {
+                        id,
+                        name,
+                        args_stream: args,
+                        arguments,
+                        state: tool_state,
+                        edit_snapshot: None,
+                    }));
+                }
+            }
+        }
     }
 
     fn append_assistant_text(&mut self, text: &str) {
@@ -1913,11 +1958,17 @@ impl App {
     /// LogEntry variant into the same blocks live events would have
     /// produced. Followed by `Event::Entry` updates for anything
     /// committed after the snapshot.
-    fn restore_snapshot(&mut self, entries: &[serde_json::Value], greeting: protocol::Greeting) {
+    fn restore_snapshot(
+        &mut self,
+        entries: &[serde_json::Value],
+        greeting: protocol::Greeting,
+        in_flight: InFlightSnapshot,
+    ) {
         self.greeting = Some(greeting.clone());
         self.context_window = greeting.context_window;
         self.session_context_tokens = greeting.context_tokens;
         self.restore_entries(entries, Some(greeting));
+        self.apply_in_flight_snapshot(in_flight);
     }
 
     /// Restore after a successful destructive rewind. The Pod's
@@ -3151,6 +3202,7 @@ mod completion_flow_tests {
             greeting: test_greeting(),
             entries: vec![session_start_value],
             status: PodStatus::Running,
+            in_flight: Default::default(),
         });
 
         assert!(matches!(app.pod_status, PodStatus::Running));
@@ -3158,6 +3210,54 @@ mod completion_flow_tests {
         assert!(matches!(
             app.blocks.get(1),
             Some(Block::SystemMessage { text }) if text == "[File: src/main.rs]\nfn main() {}"
+        ));
+    }
+
+    #[test]
+    fn snapshot_in_flight_blocks_continue_with_live_deltas() {
+        let mut app = App::new("test".into());
+        app.handle_pod_event(Event::Snapshot {
+            greeting: test_greeting(),
+            entries: Vec::new(),
+            status: PodStatus::Running,
+            in_flight: InFlightSnapshot {
+                blocks: vec![
+                    InFlightBlock::Thinking {
+                        text: "why".into(),
+                        finished: false,
+                    },
+                    InFlightBlock::ToolCall {
+                        id: "call_1".into(),
+                        name: "Read".into(),
+                        args: r#"{\"file"#.into(),
+                        state: InFlightToolCallState::StreamingArgs,
+                    },
+                    InFlightBlock::Text {
+                        text: "hel".into(),
+                        finished: false,
+                    },
+                ],
+            },
+        });
+
+        app.handle_pod_event(Event::TextDelta { text: "lo".into() });
+        app.handle_pod_event(Event::ThinkingDelta { text: "?".into() });
+        app.handle_pod_event(Event::ToolCallArgsDelta {
+            id: "call_1".into(),
+            json: r#"\":\"src/lib.rs\"}"#.into(),
+        });
+
+        assert!(matches!(
+            app.blocks.iter().find(|block| matches!(block, Block::AssistantText { .. })),
+            Some(Block::AssistantText { text }) if text == "hello"
+        ));
+        assert!(matches!(
+            app.blocks.iter().find(|block| matches!(block, Block::Thinking(_))),
+            Some(Block::Thinking(thinking)) if thinking.text == "why?"
+        ));
+        assert!(matches!(
+            app.blocks.iter().find(|block| matches!(block, Block::ToolCall(_))),
+            Some(Block::ToolCall(call)) if call.args_stream == r#"{\"file\":\"src/lib.rs\"}"#
         ));
     }
 
@@ -3294,6 +3394,7 @@ mod completion_flow_tests {
             entries: Vec::new(),
             greeting,
             status: PodStatus::Idle,
+            in_flight: Default::default(),
         });
 
         assert_eq!(app.context_window, 123_000);
@@ -3492,6 +3593,7 @@ mod completion_flow_tests {
             greeting: test_greeting(),
             entries: assistant_item_entries,
             status: PodStatus::Running,
+            in_flight: Default::default(),
         });
 
         let tasks = app.task_store.tasks();
