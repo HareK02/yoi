@@ -275,3 +275,82 @@ Worktree status:
 - Tracked status clean at `66f04e04` on `impl/00001KVMV03QY-workspace-spa-deno`。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T11:13:42Z -->
+
+## Implementation report
+
+Reviewer r1 approvalを受けて、実装ブランチを Orchestrator worktree の `orchestration` branch に統合した。
+
+統合:
+- Merge commit: `6dc78e3f merge: workspace spa deno tooling`
+- Merged branch: `impl/00001KVMV03QY-workspace-spa-deno`
+- Implementation commit:
+  - `66f04e04 feat: migrate workspace spa tooling to deno`
+
+Orchestrator worktree validation:
+- `git diff --check HEAD^1..HEAD`: passed
+- `cd web/workspace && rm -rf node_modules .svelte-kit build && deno task check`: passed (`svelte-check found 0 errors and 0 warnings`)
+- `cd web/workspace && deno task build`: passed and wrote static site to `build/`
+- `cd web/workspace && deno task install`: passed
+- `cargo check -p yoi-workspace-server`: passed
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+
+Validation generated ignored frontend artifacts in Orchestrator worktree:
+- `web/workspace/node_modules/`
+- `web/workspace/.svelte-kit/`
+- `web/workspace/build/`
+
+These were removed after validation. Final Orchestrator worktree status after validation cleanup is clean on `orchestration` at `6dc78e3f`。
+
+Non-blocking note:
+- Upstream SvelteKit/Vite still prints generic `Run npm run preview...` during build; project README and `deno.json` provide `deno task preview`, and no npm scripts remain, so this is accepted as upstream output rather than project guidance。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-21T11:13:48Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Reviewer approval、Orchestrator worktree への統合、Deno check/build/install、workspace-server check、Ticket doctor、Nix build が完了したため `done` に遷移する。
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-21T11:14:00Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-21T11:14:00Z status: closed -->
+
+## 完了
+
+Workspace web SPA の frontend tooling を npm/Node-primary から Deno-primary に移行し、Orchestrator worktree の `orchestration` branch に統合した。
+
+主な成果:
+- `web/workspace/deno.json` を追加し、Deno task を canonical workflow にした。
+- `web/workspace/deno.lock` を追加。
+- `web/workspace/package-lock.json` を削除。
+- `web/workspace/package.json` は SvelteKit/Vite ecosystem compatibility metadata のみに縮小し、scripts/dependencies を削除。
+- README を Deno workflow (`deno install`, `deno task check`, `deno task build`, `deno task preview`) と source-of-truth 説明に更新。
+- Static SPA output path `web/workspace/build/` と `@sveltejs/adapter-static` assumptions を維持。
+- Rust backend/static serving code、Workspace API authority、Ticket/Objectives authority、`.yoi` canonical record workflows には変更を加えていない。
+- Generated artifacts (`node_modules`, `.svelte-kit`, `build`) は ignored/source-filtered のまま。
+
+統合・検証:
+- Merge commit: `6dc78e3f merge: workspace spa deno tooling`
+- Implementation commit: `66f04e04 feat: migrate workspace spa tooling to deno`
+- Reviewer final verdict: approve
+- Validation passed: `git diff --check HEAD^1..HEAD`, `deno task check`, `deno task build`, `deno task install`, `cargo check -p yoi-workspace-server`, `cargo run -p yoi -- ticket doctor`, and `nix build .#yoi --no-link`。
+
+範囲外:
+- Backend API / static serving implementation は変更していない。
+- Protocol reconnect work (`00001KVMT2J25`) には触れていない。
+- SSR / Deno runtime server / Deno Deploy assumptions は追加していない。
+
+---
