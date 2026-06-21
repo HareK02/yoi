@@ -2,7 +2,7 @@
 title: 'Workspace web SPA の frontend tooling を npm/Node から Deno に移行する'
 state: 'inprogress'
 created_at: '2026-06-21T10:18:10Z'
-updated_at: '2026-06-21T11:06:03Z'
+updated_at: '2026-06-21T11:12:52Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['frontend-tooling', 'packaging', 'nix-source-filter', 'validation']

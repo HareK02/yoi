@@ -206,3 +206,72 @@ Reviewer focus:
 Orchestrator will wait for reviewer verdict before integration。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVMV03QY-r1 at: 2026-06-21T11:12:52Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket authority:
+  - `.yoi/tickets/00001KVMV03QY/item.md`
+  - `.yoi/tickets/00001KVMV03QY/thread.md`
+- Diff `155e039e..66f04e04`:
+  - `web/workspace/README.md`
+  - `web/workspace/deno.json`
+  - `web/workspace/deno.lock`
+  - `web/workspace/package.json`
+  - deleted `web/workspace/package-lock.json`
+- Boundary / generated artifact files:
+  - `web/workspace/.gitignore`
+  - `web/workspace/svelte.config.js`
+  - `web/workspace/vite.config.ts`
+  - `web/workspace/tsconfig.json`
+  - `web/workspace/src/routes/+layout.ts`
+  - `package.nix`
+  - `devshell.nix`
+
+Blocking issues:
+- None。
+
+Findings:
+- Deno is now the clear frontend tooling source of truth:
+  - `web/workspace/deno.json` defines Deno tasks and pinned npm-compat dependencies。
+  - `web/workspace/deno.lock` is committed。
+  - `package-lock.json` is removed。
+  - `package.json` is reduced to package metadata only, with no scripts or dependencies。
+  - README explicitly says canonical tooling is `deno.json` / `deno.lock`, and `package.json` is compatibility metadata only。
+- Static SPA assumptions are preserved:
+  - `svelte.config.js` still uses `@sveltejs/adapter-static`。
+  - output remains `web/workspace/build/`。
+  - `+layout.ts` still has `ssr = false` and `prerender = true`。
+  - diff does not touch Rust backend/API authority, protocol reconnect scope, or `.yoi` canonical records。
+- Generated artifact boundaries remain intact:
+  - `.gitignore` ignores `node_modules`, `.svelte-kit`, and `build`。
+  - `package.nix` still excludes `web/workspace/node_modules`, `web/workspace/.svelte-kit`, and `web/workspace/build`。
+  - `devshell.nix` already provides `deno`。
+
+Non-blocking concern:
+- `deno task build` succeeds but upstream SvelteKit/Vite emits generic `Run npm run preview to preview your production build locally.` The project README and `deno.json` correctly provide `deno task preview`, and there are no npm scripts in the repo, so this is not blocking。
+
+Reviewer validation:
+- `git diff --check 155e039e..66f04e04`: passed
+- `cd web/workspace && deno --version && rm -rf node_modules .svelte-kit build && deno task check && deno task build`: passed with Deno `2.7.14`; `svelte-check found 0 errors and 0 warnings`; build completed to `build`
+- `cd web/workspace && deno task install`: passed
+- `target/debug/yoi ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+- `git show --no-patch --format='%H %s' 66f04e04` and `git diff --quiet 66f04e04..HEAD`: HEAD matches implementation commit
+
+Generated artifacts:
+- Reviewer did not clean generated ignored artifacts after validation。
+- Ignored artifacts present in implementation worktree:
+  - `web/workspace/node_modules/`
+  - `web/workspace/.svelte-kit/`
+  - `web/workspace/build/`
+- `git check-ignore -v` confirms all three are ignored by `web/workspace/.gitignore`; `package.nix` excludes same paths。
+
+Worktree status:
+- Tracked status clean at `66f04e04` on `impl/00001KVMV03QY-workspace-spa-deno`。
+
+---
