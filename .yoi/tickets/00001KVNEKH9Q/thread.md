@@ -114,3 +114,28 @@ Validation plan:
 Human authorized queue routing from Workspace Dashboard. Ticket has concrete acceptance criteria, related bootstrap work is complete, and no blockers are recorded, so Orchestrator accepts implementation.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T16:11:47Z -->
+
+## Implementation report
+
+Implementation start report:
+
+- Created child implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVNEKH9Q-workspace-host-workers`
+- Created branch:
+  - `impl/00001KVNEKH9Q-workspace-host-workers`
+- Base commit:
+  - `e1f02ffc ticket: accept workspace host workers`
+- Confirmed tracked Ticket project records are visible in the child worktree。
+- Confirmed `.yoi/memory` has no tracked/untracked entries in the child worktree check。
+- Spawned sibling Coder Pod:
+  - `yoi-coder-00001KVNEKH9Q`
+- Coder scope:
+  - read: `/home/hare/Projects/yoi`
+  - write: `/home/hare/Projects/yoi/.worktree/00001KVNEKH9Q-workspace-host-workers`
+
+Next action:
+- Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff。
+
+---
