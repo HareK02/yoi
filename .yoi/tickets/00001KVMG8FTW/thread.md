@@ -308,3 +308,50 @@ Worktree status:
 - Clean on `impl/00001KVMG8FTW-plugin-request-host-api`。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T08:04:50Z -->
+
+## Implementation report
+
+Coder r1-fix report received from `yoi-coder-00001KVMG8FTW`.
+
+New fix commit:
+- `0e14e7c1 plugin: align request grant inspection coverage`
+
+Branch commits now:
+- `962b7699 plugin: replace https host api with request grants`
+- `0e14e7c1 plugin: align request grant inspection coverage`
+
+Fix summary:
+- `crates/pod/src/feature/plugin.rs`
+  - Static inspection now uses request target coverage/intersection semantics instead of exact equality。
+  - Broad/covering grants are reported as granted/eligible when they cover or intersect manifest targets in a way runtime can allow。
+  - Broad manifest + narrower grant is also reported as eligible with partial-coverage diagnostics。
+  - Truly grant-only/no-manifest-intersection grants remain ineligible。
+  - Added focused static inspection tests for exact manifest target + broad grant and broad manifest target + narrower exact grant。
+- `crates/yoi/src/plugin_cli.rs`
+  - Updated CLI/static inspection test expectations to match aligned broad grant semantics。
+- `docs/development/plugin-development.md`
+  - Documented that explicit request authority is URL-host based, and a granted DNS hostname may resolve to loopback/private addresses if that hostname was intentionally declared/granted。
+
+Coder validation reported:
+- `cargo fmt --check`: passed
+- `git diff --check 4cd4a06e..HEAD`: passed
+- `cargo test -p manifest request --quiet`: passed
+- `cargo test -p pod feature::plugin::tests --lib --quiet`: passed
+- `cargo test -p yoi plugin_cli::tests --quiet`: passed
+- `cargo check -p manifest -p pod -p yoi --quiet`: passed
+- `target/debug/yoi ticket doctor`: passed
+- stale active naming grep under `crates docs resources` for old HTTPS names: no matches
+
+Orchestrator evidence checked:
+- Implementation worktree clean on `impl/00001KVMG8FTW-plugin-request-host-api`。
+- HEAD is `0e14e7c1`。
+- r1-fix diff `962b7699..HEAD` touches only `crates/pod/src/feature/plugin.rs`, `crates/yoi/src/plugin_cli.rs`, and `docs/development/plugin-development.md`。
+- Active stale naming grep under `crates docs resources` returned no matches。
+- `git diff --check 4cd4a06e..HEAD` produced no diagnostics。
+
+Next action:
+- Route back to Reviewer for r2 verification of static inspection/runtime coverage alignment and final acceptance。
+
+---
