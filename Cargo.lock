@@ -2885,6 +2885,7 @@ dependencies = [
  "dotenv",
  "fs4",
  "futures",
+ "futures-util",
  "include_dir",
  "libc",
  "llm-worker",
@@ -2906,6 +2907,7 @@ dependencies = [
  "thiserror 2.0.18",
  "ticket",
  "tokio",
+ "tokio-tungstenite",
  "toml",
  "tools",
  "tracing",
@@ -4469,6 +4471,20 @@ checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
  "rustls",
  "tokio",
+]
+
+[[package]]
+name = "tokio-tungstenite"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d25a406cddcc431a75d3d9afc6a7c0f7428d4891dd973e4d54c56b46127bf857"
+dependencies = [
+ "futures-util",
+ "log",
+ "native-tls",
+ "tokio",
+ "tokio-native-tls",
+ "tungstenite",
 ]
 
 [[package]]
