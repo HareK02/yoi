@@ -15,7 +15,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true
 ticket.workspace = true
-tokio = { workspace = true, features = ["fs", "net", "rt", "sync"] }
+tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "sync"] }
 tracing.workspace = true
 
 [dev-dependencies]

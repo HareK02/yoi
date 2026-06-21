@@ -5,9 +5,10 @@ mod plugin_cli;
 mod session_cli;
 mod ticket_cli;
 
+use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use client::PodRuntimeCommand;
 use memory_lint::{LintCliOptions, LintStatus};
@@ -25,6 +26,8 @@ enum Mode {
     Objective(objective_cli::ObjectiveCli),
     Session(session_cli::SessionCli),
     Ticket(ticket_cli::TicketCli),
+    WorkspaceHelp,
+    WorkspaceServe(Vec<String>),
     PodRuntime(Vec<String>),
     Keys,
     SetupModel,
@@ -69,6 +72,11 @@ async fn main() -> ExitCode {
             print_memory_lint_help();
             ExitCode::SUCCESS
         }
+        Mode::WorkspaceHelp => {
+            print_workspace_help();
+            ExitCode::SUCCESS
+        }
+        Mode::WorkspaceServe(args) => run_workspace_server(args),
         Mode::MemoryLint(options) => match memory_lint::run(&options) {
             Ok(LintStatus::Clean) => ExitCode::SUCCESS,
             Ok(LintStatus::Failed) => ExitCode::FAILURE,
@@ -199,6 +207,9 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
         "plugin" => {
             let plugin_cli = parse_plugin_args(&args[1..])?;
             return Ok(Mode::Plugin(plugin_cli));
+        }
+        "workspace" => {
+            return parse_workspace_args(&args[1..]);
         }
         "mcp" => {
             let mcp_cli = parse_mcp_args(&args[1..])?;
@@ -470,6 +481,63 @@ fn parse_resume_args(args: &[String]) -> Result<Mode, ParseError> {
 fn current_dir() -> Result<PathBuf, ParseError> {
     std::env::current_dir()
         .map_err(|e| ParseError(format!("failed to resolve current directory: {e}")))
+}
+
+fn parse_workspace_args(args: &[String]) -> Result<Mode, ParseError> {
+    let Some((subcommand, rest)) = args.split_first() else {
+        return Err(ParseError(
+            "yoi workspace requires `serve` (try `yoi workspace --help`)".to_string(),
+        ));
+    };
+    match subcommand.as_str() {
+        "serve" => {
+            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
+                return Ok(Mode::WorkspaceHelp);
+            }
+            Ok(Mode::WorkspaceServe(rest.to_vec()))
+        }
+        "--help" | "-h" => Ok(Mode::WorkspaceHelp),
+        other => Err(ParseError(format!(
+            "unknown yoi workspace subcommand `{other}`"
+        ))),
+    }
+}
+
+fn run_workspace_server(args: Vec<String>) -> ExitCode {
+    let command = match resolve_workspace_server_command() {
+        Ok(command) => command,
+        Err(error) => {
+            eprintln!("yoi workspace: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut child = Command::new(&command);
+    child.arg("serve");
+    child.args(args);
+    match child.status() {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1).min(255) as u8),
+        Err(error) => {
+            eprintln!(
+                "yoi workspace: failed to launch `{}`: {error}",
+                command.to_string_lossy()
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn resolve_workspace_server_command() -> Result<OsString, ParseError> {
+    if let Some(value) = std::env::var_os("YOI_WORKSPACE_SERVER_COMMAND") {
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
+    let current = std::env::current_exe()
+        .map_err(|error| ParseError(format!("failed to resolve current executable: {error}")))?;
+    let sibling = current.with_file_name("yoi-workspace-server");
+    Ok(sibling.into_os_string())
 }
 
 fn parse_plugin_args(args: &[String]) -> Result<plugin_cli::PluginCliCommand, ParseError> {
@@ -810,7 +878,13 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
 
 fn print_help() {
     println!(
-        "yoi\n\nUsage:\n  yoi [OPTIONS]\n  yoi resume [--workspace <PATH>] [--all]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi pod [POD_OPTIONS]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi plugin new rust-component-tool <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Pod chat/client surface (default, --pod, yoi resume)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n      --workspace <PATH> Runtime workspace root for default Console/--pod (defaults to cwd)\n      --pod <NAME>       Open the Pod Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Pod Console to a specific socket with --pod\n      --session <UUID>   Resume a specific session segment in the Pod Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
+        "yoi\n\nUsage:\n  yoi [OPTIONS]\n  yoi resume [--workspace <PATH>] [--all]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi pod [POD_OPTIONS]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi workspace serve [OPTIONS]\n  yoi plugin new rust-component-tool <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Pod chat/client surface (default, --pod, yoi resume)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n      --workspace <PATH> Runtime workspace root for default Console/--pod (defaults to cwd)\n      --pod <NAME>       Open the Pod Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Pod Console to a specific socket with --pod\n      --session <UUID>   Resume a specific session segment in the Pod Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
+    );
+}
+
+fn print_workspace_help() {
+    println!(
+        "yoi workspace\n\nUsage:\n  yoi workspace serve [OPTIONS]\n\nDescription:\n  Launches the separate yoi-workspace-server executable. The yoi binary does not link the workspace server crate.\n\nOptions forwarded to yoi-workspace-server serve:\n      --workspace <PATH>  Workspace root containing .yoi project records (defaults to cwd)\n      --db <PATH>         SQLite database path (defaults to <workspace>/.yoi/workspace.db)\n      --frontend <PATH>   Static SPA build directory to serve\n      --listen <ADDR>     Listen address (defaults to 127.0.0.1:8787)\n  -h, --help              Print help\n\nEnvironment:\n  YOI_WORKSPACE_SERVER_COMMAND  Path to yoi-workspace-server executable override\n"
     );
 }
 
@@ -929,6 +1003,22 @@ mod tests {
             Mode::Ticket(ticket_cli::TicketCli::Help) => {}
             _ => panic!("expected Ticket help mode"),
         }
+    }
+
+    #[test]
+    fn parse_workspace_serve_passthrough() {
+        match parse_args_from(["workspace", "serve", "--listen", "127.0.0.1:0"]).unwrap() {
+            Mode::WorkspaceServe(args) => assert_eq!(args, vec!["--listen", "127.0.0.1:0"]),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_workspace_help() {
+        assert!(matches!(
+            parse_args_from(["workspace", "--help"]).unwrap(),
+            Mode::WorkspaceHelp
+        ));
     }
 
     #[test]

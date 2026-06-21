@@ -91,10 +91,30 @@ rustPlatform.buildRustPackage rec {
     "yoi"
   ];
 
+  postBuild = ''
+    cargo build --offline --profile release -p yoi-workspace-server --bin yoi-workspace-server
+  '';
+
   # The package check is a credential-free install smoke check below. Running the
   # workspace test suite is intentionally left to cargo-based CI because this
   # derivation is scoped to packaging the user-facing binaries.
   doCheck = false;
+
+  installPhase = ''
+    runHook preInstall
+
+    yoi_bin=$(find . -type f -name yoi | head -n 1)
+    workspace_server_bin=$(find . -type f -name yoi-workspace-server | head -n 1)
+    if [ -z "$yoi_bin" ] || [ -z "$workspace_server_bin" ]; then
+      echo "built binaries not found" >&2
+      find . -maxdepth 6 -type f \( -name yoi -o -name yoi-workspace-server \) -print >&2
+      exit 1
+    fi
+    install -Dm755 "$yoi_bin" "$out/bin/yoi"
+    install -Dm755 "$workspace_server_bin" "$out/bin/yoi-workspace-server"
+
+    runHook postInstall
+  '';
 
   doInstallCheck = true;
   installCheckPhase = ''
@@ -102,6 +122,8 @@ rustPlatform.buildRustPackage rec {
 
     "$out/bin/yoi" pod --help >/dev/null
     test -x "$out/bin/yoi"
+    test -x "$out/bin/yoi-workspace-server"
+    "$out/bin/yoi-workspace-server" --help >/dev/null
     test ! -e "$out/bin/yoi-pod"
     test ! -e "$out/share/yoi/resources"
     if "$out/bin/yoi" --session not-a-uuid 2>yoi.err; then
