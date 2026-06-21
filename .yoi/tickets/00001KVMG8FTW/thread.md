@@ -14,3 +14,99 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-21T07:17:14Z -->
+
+## Decision
+
+Routing decision: `implementation_ready`
+
+Reason:
+- Ticket body は `host_api.https` 廃止、`host_api.request` 統一、manifest-declared URL/request target permissions、enablement grant 照合、runtime fail-closed、local/private target 明示 grant、broad/arbitrary URL 表示、docs/tests/diagnostics 更新まで具体化されている。
+- `readiness: implementation_ready` で、relations / orchestration plan に blocker はない。
+- Current active implementation `00001KVMFFYVX` は Workspace web control plane bootstrap で、主対象は backend/frontend/store/Nix packaging。This Ticket の主対象は plugin manifest/pod runtime/plugin CLI/docs/tests で直接の semantic blocker はない。過去のユーザー指示「blocker無いなら並列に」に従い、並列実装可能と判断する。
+- Orchestrator worktree is clean on `orchestration` at `f164483e` で、対象 Ticket 用 worktree / branch は未作成。
+- Visible Pods に対象 Ticket の child Pod は存在しない。
+
+Evidence checked:
+- Ticket body / thread / artifacts via `TicketShow` and direct `item.md` read。
+- `TicketRelationQuery(00001KVMG8FTW)`: no relations / blockers。
+- `TicketOrchestrationPlanQuery(00001KVMG8FTW)`: no records。
+- `ListPods`: active child is only `yoi-coder-00001KVMFFYVX`; no child for this Ticket。
+- Orchestrator git state / worktree list / branch list checked from `/home/hare/Projects/yoi/.worktree/orchestration` only。
+- Bounded code map:
+  - `crates/manifest/src/plugin.rs`: `PluginGrantConfig.https`, `PluginHttpsGrant`, `PluginHostApi::Https`, permission/grant resolution/tests。
+  - `crates/pod/src/feature/plugin.rs`: `PluginHttps*` runtime request path, `yoi:host/https@1.0.0` / raw wasm `yoi:https` imports, URL validation, request bounds, credential header checks, public-IP guard, allowlist checks, plugin tests。
+  - `crates/yoi/src/plugin_cli.rs`: inspection formatting for configured HTTPS grants。
+  - `docs/development/plugin-development.md`: active `host_api.https` / `grants.https` docs。
+
+IntentPacket:
+
+Intent:
+- Replace public/model/config-facing `host_api.https` with URL-permission based one-shot `host_api.request`.
+- Keep existing safe outbound request behavior where applicable, but generalize schemes/targets so explicit manifest + enablement grants can authorize loopback/private/local targets.
+- Keep WebSocket / SSE / persistent connections out of `request`.
+
+Binding decisions / invariants:
+- Do not add backward compatibility aliases for `host_api.https`, `PluginHttps*`, or `grants.https` in active APIs unless explicitly escalated and reapproved。
+- Model/config-facing naming must be `request`; internal names should also avoid `PluginHttps*` unless truly private transitional code is justified and not exposed。
+- Runtime authorization requires both manifest-declared request target permission and enablement grant for that target。
+- Grant-only without manifest request must fail closed or be explicitly diagnosed as unsafe/unused override; do not silently expand authority。
+- Requested-but-ungranted target must fail closed before network I/O。
+- Localhost/loopback/private/local targets are not ambient; they require manifest declaration and enablement grant。
+- Arbitrary URL / broad network access must be visibly distinguished from normal target grants in inspection/diagnostics。
+- Embedded credentials, credential-like headers, request/response bounds, external-content untrusted treatment, and no hidden context injection remain mandatory。
+- WebSocket URL / upgrade / persistent stream must be rejected or explicitly unsupported by `request`。
+- Existing HTTPS request use cases must continue under `host_api.request` with explicit request permission/grant。
+
+Requirements / acceptance criteria:
+- Active API naming uses `host_api.request` / request grant naming。
+- Plugin manifest statically declares request target permissions readable from manifest alone。
+- Enablement config grants request targets and is matched against manifest-declared targets。
+- Runtime checks method/scheme/host/port/path prefix against declared+granted URL permission。
+- `http://localhost` / loopback request can be allowed only with explicit declaration+grant。
+- Existing public HTTPS use case works as request。
+- Broad/arbitrary URL is supported only with clear broad display/diagnostic if implemented。
+- `yoi plugin show` / static inspection distinguishes requested, granted, denied/missing, and broad request permissions。
+- Docs/templates/tests/diagnostics are updated to request naming and WebSocket separate-capability policy。
+
+Implementation latitude:
+- Exact Rust/TOML type names are up to Coder, but active names should be request-oriented, e.g. `PluginRequestGrant`, `PluginRequestTarget`, `host_api.request`.
+- Regex support is optional. If added, it must include review-readable normalized display/warning/label and tests for broad/opaque handling。
+- Request target schema may start with exact scheme/host/optional port/method/path prefix. Keep permission review human-readable。
+- Internal runtime can reuse/refactor existing HTTPS client/request code, but reviewer should see active API renaming and policy changes。
+- Raw wasm/component import migration may choose new import names with tests; if keeping an internal compatibility import is unavoidable, escalate before committing.
+
+Escalate if:
+- Compatibility alias for old `host_api.https` / `grants.https` seems required。
+- Local/private target policy would open without both manifest declaration and grant。
+- Arbitrary URL access becomes visually indistinguishable from normal grants。
+- WebSocket/SSE/daemon lifecycle begins to enter `request`。
+- Secret-bearing headers/env/config would flow from guest memory without explicit SecretRef/grant design。
+- Regex support becomes opaque or hard to review。
+- Parallel active `00001KVMFFYVX` work creates unavoidable `Cargo.lock` / `package.nix` conflict; report rather than broad-rebasing alone。
+
+Validation plan:
+- `cargo fmt --check`
+- Focused manifest plugin tests for request permission parsing/resolution and naming removal。
+- Focused pod plugin tests for grant allow/deny, requested-but-ungranted, granted-but-unrequested, loopback/local allow/deny, WebSocket/upgrade rejection, request/response bounds/credential-header safety。
+- Focused yoi plugin CLI tests for request permission/grant/broad/missing diagnostics。
+- Docs/template grep ensuring active `host_api.https` / `grants.https` / `PluginHttps*` naming is removed except historical Ticket text or explicitly justified migration notes。
+- `cargo check` for affected crates, `git diff --check`, `yoi ticket doctor`。
+
+Reviewer focus:
+- Breaking-change intent is real: no stale active docs/templates/CLI inspection still teaching `host_api.https`。
+- Authorization must be two-stage: manifest request + grant。
+- Local/private network must not become ambient。
+- Old public HTTPS use case must still work under request naming。
+- External content and hidden context constraints remain intact。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-21T07:17:18Z from: queued to: inprogress reason: human_authorized_unblocked_parallel_implementation field: state -->
+
+## State changed
+
+Human authorized queue routing from Workspace Dashboard. Ticket has concrete acceptance criteria and no recorded blockers; active Workspace web control plane implementation is semantically separate enough for parallel implementation. Orchestrator accepts this Plugin host API refactor into implementation.
+
+---
