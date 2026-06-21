@@ -216,3 +216,67 @@ Reviewer focus:
 Orchestrator will wait for reviewer verdict before integration。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVNG9B9Z-r1 at: 2026-06-21T17:00:16Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket authority:
+  - `.yoi/tickets/00001KVNG9B9Z/item.md`
+  - `.yoi/tickets/00001KVNG9B9Z/thread.md`
+- Implementation diff:
+  - `git diff --name-status orchestration..HEAD`
+  - implementation-only diff against merge-base `a607a1f20d0622b1f556c36cca155da68109fe25..HEAD`
+- Frontend files:
+  - `web/workspace/src/routes/+page.svelte`
+  - `web/workspace/src/lib/workspace-sidebar/WorkspaceSidebar.svelte`
+  - `web/workspace/src/lib/workspace-sidebar/RepositoriesNavSection.svelte`
+  - `web/workspace/src/lib/workspace-sidebar/ObjectivesNavSection.svelte`
+  - `web/workspace/src/lib/workspace-sidebar/WorkersNavSection.svelte`
+  - `web/workspace/src/lib/workspace-sidebar/types.ts`
+- API shape spot-check:
+  - `crates/workspace-server/src/server.rs`
+  - `crates/workspace-server/src/hosts.rs`
+  - `crates/workspace-server/src/records.rs`
+
+Blocking issues:
+- None。
+
+Acceptance verification:
+- Left sidebar is wired into `+page.svelte` and layout is separated from main content。
+- Sidebar header shows workspace label/name and disabled settings placeholder。
+- `repositories`, `objectives`, and `workers` sections are present。
+- Objectives section fetches `/api/objectives` and handles loading/error/empty locally。
+- Workers section fetches `/api/workers`, uses Worker naming in visible UI, and handles 404/empty/error locally。
+- Main Host/Worker content from current orchestration branch is preserved。
+- No backend/API authority changes were introduced by the implementation-only diff。
+- Responsive CSS uses a two-column layout on wide viewports and single-column layout below 760px, with `min-width: 0`, wrapping, and table overflow containment。
+
+Non-blocking concerns:
+- `orchestration..HEAD` currently shows apparent `.yoi/tickets/00001KVNG9B9Z/item.md` / `thread.md` reversions because `orchestration` has newer review-routing/report commits after the implementation branch’s merge-base. The implementation-only diff against the merge-base is frontend-only, and `git merge-tree --write-tree orchestration HEAD` reports a clean merge. This should not block a normal merge, but avoid applying the literal `orchestration..HEAD` patch/squash in a way that drops newer ticket thread entries。
+
+Reviewer validation:
+- `git diff --check`: passed
+- `git diff --check orchestration..HEAD`: passed
+- `git diff --check $(git merge-base orchestration HEAD)..HEAD`: passed
+- `cd web/workspace && deno task check`: passed (`svelte-check found 0 errors and 0 warnings`)
+- `cd web/workspace && deno task build`: passed; static adapter wrote site to `build`
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+- `cargo test -p yoi-workspace-server`: passed (`6 passed; 0 failed`)
+- `git merge-tree --write-tree orchestration HEAD`: passed with status 0; produced merged tree `24e0e026264333fc63d60c0e2d649839445acb64`
+
+Generated artifacts:
+- Reviewer did not clean generated ignored artifacts after validation:
+  - `web/workspace/.svelte-kit/`
+  - `web/workspace/build/`
+  - `web/workspace/node_modules/`
+- They are ignored and not tracked; `git ls-files --others --exclude-standard` reports `0`。
+
+Worktree status:
+- Clean tracked state on `impl/00001KVNG9B9Z-workspace-sidebar` at `4ab696b4`。
+
+---
