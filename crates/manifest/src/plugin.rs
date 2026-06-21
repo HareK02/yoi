@@ -152,13 +152,18 @@ pub struct PluginGrantConfig {
     pub permissions: Vec<PluginPermission>,
     /// Bounded outbound request allowlist entries for `host_api.request`.
     pub request: Vec<PluginRequestGrant>,
+    /// Bounded outbound WebSocket target allowlist entries for `host_api.websocket`.
+    pub websocket: Vec<PluginWebSocketGrant>,
     /// Scoped filesystem allowlist entries for `host_api.fs`.
     pub fs: Vec<PluginFsGrant>,
 }
 
 impl PluginGrantConfig {
     pub fn is_empty(&self) -> bool {
-        self.permissions.is_empty() && self.request.is_empty() && self.fs.is_empty()
+        self.permissions.is_empty()
+            && self.request.is_empty()
+            && self.websocket.is_empty()
+            && self.fs.is_empty()
     }
 
     pub fn binding_error(
@@ -263,6 +268,50 @@ impl PluginRequestGrant {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct PluginWebSocketGrant {
+    /// Exact URL scheme allowed by this WebSocket target: `wss` or `ws`; `*` is broad.
+    pub scheme: String,
+    /// Exact WebSocket host allowed by this target. `*` is broad and must be surfaced in diagnostics.
+    pub host: String,
+    /// Optional exact port. `None` means the scheme default or any explicit port for that host.
+    pub port: Option<u16>,
+    /// Optional path prefixes allowed for this target. Empty means any absolute path on the host.
+    pub path_prefixes: Vec<String>,
+}
+
+impl PluginWebSocketGrant {
+    pub fn label(&self) -> String {
+        let scheme = if self.scheme.trim().is_empty() {
+            "<no-scheme>"
+        } else {
+            self.scheme.as_str()
+        };
+        let host = if self.host.trim().is_empty() {
+            "<no-host>"
+        } else {
+            self.host.as_str()
+        };
+        let port = self.port.map(|port| format!(":{port}")).unwrap_or_default();
+        let paths = if self.path_prefixes.is_empty() {
+            "*".to_string()
+        } else {
+            self.path_prefixes.join(",")
+        };
+        let broad = if self.is_broad() {
+            " [broad-websocket]"
+        } else {
+            ""
+        };
+        format!("{scheme}://{host}{port} {paths}{broad}")
+    }
+
+    pub fn is_broad(&self) -> bool {
+        self.scheme.trim() == "*" || self.host.trim() == "*" || self.path_prefixes.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct PluginFsGrant {
     /// Absolute host path that bounds every relative `host_api.fs` request.
     pub root: String,
@@ -347,6 +396,8 @@ impl PluginPermission {
 #[serde(rename_all = "snake_case")]
 pub enum PluginHostApi {
     Request,
+    #[serde(rename = "websocket")]
+    WebSocket,
     Fs,
 }
 
@@ -354,6 +405,7 @@ impl fmt::Display for PluginHostApi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Request => f.write_str("request"),
+            Self::WebSocket => f.write_str("websocket"),
             Self::Fs => f.write_str("fs"),
         }
     }
@@ -480,6 +532,10 @@ pub struct PluginPackageManifest {
     /// enablement grants must explicitly approve matching targets.
     #[serde(default)]
     pub request: Vec<PluginRequestGrant>,
+    /// Manifest-declared URL targets for `host_api.websocket`. These are independent from
+    /// `host_api.request` targets and require independent enablement grants.
+    #[serde(default)]
+    pub websocket: Vec<PluginWebSocketGrant>,
 }
 
 impl PluginPackageManifest {
@@ -3190,6 +3246,7 @@ input_schema = { type = "object", properties = { query = { type = "string" } }, 
             digest: Some(digest.clone()),
             permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
             request: Vec::new(),
+            websocket: Vec::new(),
             fs: Vec::new(),
         };
         let resolution = resolve_enabled_plugins(
@@ -3217,6 +3274,7 @@ input_schema = { type = "object", properties = { query = { type = "string" } }, 
                 digest: Some(digest.clone()),
                 permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
                 request: Vec::new(),
+                websocket: Vec::new(),
                 fs: Vec::new(),
             },
             PluginGrantConfig {
@@ -3225,6 +3283,7 @@ input_schema = { type = "object", properties = { query = { type = "string" } }, 
                 digest: Some(digest.clone()),
                 permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
                 request: Vec::new(),
+                websocket: Vec::new(),
                 fs: Vec::new(),
             },
             PluginGrantConfig {
@@ -3233,6 +3292,7 @@ input_schema = { type = "object", properties = { query = { type = "string" } }, 
                 digest: Some("sha256:unrelated".to_string()),
                 permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
                 request: Vec::new(),
+                websocket: Vec::new(),
                 fs: Vec::new(),
             },
         ] {
@@ -3448,5 +3508,76 @@ kind = "ambient_shell"
 
     fn write_u32(out: &mut Vec<u8>, value: u32) {
         out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn websocket_manifest_and_grants_parse_independently_from_request() {
+        let manifest: PluginPackageManifest = toml::from_str(
+            r#"
+schema_version = 1
+id = "project:example"
+name = "example"
+version = "1.0.0"
+surfaces = ["tool"]
+
+[runtime]
+kind = "wasm"
+entry = "plugin.wasm"
+abi = "yoi-plugin-wasm-1"
+
+[[permissions]]
+kind = "host_api"
+api = "request"
+
+[[permissions]]
+kind = "host_api"
+api = "websocket"
+
+[[request]]
+scheme = "https"
+host = "api.example.com"
+methods = ["GET"]
+path_prefixes = ["/v1"]
+
+[[websocket]]
+scheme = "wss"
+host = "gateway.example.com"
+path_prefixes = ["/gateway"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(manifest.request.len(), 1);
+        assert_eq!(manifest.websocket.len(), 1);
+        assert_eq!(
+            manifest.request[0].label(),
+            "https://api.example.com GET /v1"
+        );
+        assert_eq!(
+            manifest.websocket[0].label(),
+            "wss://gateway.example.com /gateway"
+        );
+        assert_eq!(
+            manifest.permissions[1],
+            PluginPermission::host_api(PluginHostApi::WebSocket)
+        );
+
+        let grants: PluginGrantConfig = toml::from_str(
+            r#"
+[[request]]
+scheme = "https"
+host = "api.example.com"
+methods = ["GET"]
+path_prefixes = ["/v1"]
+
+[[websocket]]
+scheme = "wss"
+host = "gateway.example.com"
+path_prefixes = ["/gateway"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(grants.request.len(), 1);
+        assert_eq!(grants.websocket.len(), 1);
+        assert!(!grants.is_empty());
     }
 }

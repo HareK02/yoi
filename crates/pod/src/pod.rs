@@ -5401,6 +5401,7 @@ permission = "read"
                 ingresses: vec![],
                 permissions: vec![],
                 request: vec![],
+                websocket: vec![],
             },
             enabled_surfaces: vec![manifest::plugin::PluginSurface::Hook],
             grants: manifest::plugin::PluginGrantConfig::default(),

@@ -293,6 +293,7 @@ fn inspect_materialized_package(
             digest: Some(materialized.package.digest.clone()),
             permissions: requested_permissions,
             request: Vec::new(),
+            websocket: Vec::new(),
             fs: Vec::new(),
         },
         config: None,
@@ -804,6 +805,11 @@ fn render_item_human(item: &PluginInspectionItem) -> Result<String> {
     )?;
     writeln!(
         out,
+        "  configured_websocket_grants: {}",
+        join_or_none(&item.configured_websocket_grants)
+    )?;
+    writeln!(
+        out,
         "  configured_fs_grants: {}",
         join_or_none(&item.configured_fs_grants)
     )?;
@@ -977,6 +983,7 @@ fn snapshot_from_resolution(
         builder.enabled_surfaces = surface_strings(enablement.surfaces.iter().copied());
         builder.configured_grants = permission_strings(&enablement.grants.permissions);
         builder.configured_request_grants = request_grant_strings(&enablement.grants.request);
+        builder.configured_websocket_grants = websocket_grant_strings(&enablement.grants.websocket);
         builder.configured_fs_grants = fs_grant_strings(&enablement.grants.fs);
         if let Ok(identity) = SourceQualifiedPluginId::parse(&enablement.id) {
             builder
@@ -1070,6 +1077,7 @@ fn fill_resolved(builder: &mut ItemBuilder, resolved: &ResolvedPlugin) {
     builder.requested_permissions = permission_strings(&resolved.manifest.permissions);
     builder.configured_grants = permission_strings(&resolved.grants.permissions);
     builder.configured_request_grants = request_grant_strings(&resolved.grants.request);
+    builder.configured_websocket_grants = websocket_grant_strings(&resolved.grants.websocket);
     builder.configured_fs_grants = fs_grant_strings(&resolved.grants.fs);
 
     let record = ResolvedPluginRecord::from_resolved(resolved);
@@ -1185,6 +1193,13 @@ fn request_grant_strings(grants: &[manifest::plugin::PluginRequestGrant]) -> Vec
     values
 }
 
+fn websocket_grant_strings(grants: &[manifest::plugin::PluginWebSocketGrant]) -> Vec<String> {
+    let mut values: Vec<_> = grants.iter().map(|grant| grant.label()).collect();
+    values.sort();
+    values.dedup();
+    values
+}
+
 fn fs_grant_strings(grants: &[manifest::plugin::PluginFsGrant]) -> Vec<String> {
     let mut values: Vec<_> = grants.iter().map(|grant| grant.label()).collect();
     values.sort();
@@ -1263,6 +1278,7 @@ struct PluginInspectionItem {
     requested_permissions: Vec<String>,
     configured_grants: Vec<String>,
     configured_request_grants: Vec<String>,
+    configured_websocket_grants: Vec<String>,
     configured_fs_grants: Vec<String>,
     tools: Vec<ToolSummary>,
     static_runtime: Option<PluginStaticInspection>,
@@ -1332,6 +1348,7 @@ struct ItemBuilder {
     requested_permissions: Vec<String>,
     configured_grants: Vec<String>,
     configured_request_grants: Vec<String>,
+    configured_websocket_grants: Vec<String>,
     configured_fs_grants: Vec<String>,
     tools: Vec<ToolSummary>,
     static_runtime: Option<PluginStaticInspection>,
@@ -1359,6 +1376,7 @@ impl ItemBuilder {
             requested_permissions: Vec::new(),
             configured_grants: Vec::new(),
             configured_request_grants: Vec::new(),
+            configured_websocket_grants: Vec::new(),
             configured_fs_grants: Vec::new(),
             tools: Vec::new(),
             static_runtime: None,
@@ -1431,6 +1449,7 @@ impl ItemBuilder {
             requested_permissions: self.requested_permissions,
             configured_grants: self.configured_grants,
             configured_request_grants: self.configured_request_grants,
+            configured_websocket_grants: self.configured_websocket_grants,
             configured_fs_grants: self.configured_fs_grants,
             tools: self.tools,
             static_runtime: self.static_runtime,
@@ -1523,9 +1542,10 @@ mod tests {
             static_eligible: true,
             declared_surfaces: vec!["tool".to_string()],
             enabled_surfaces: vec!["tool".to_string()],
-            requested_permissions: vec!["host_api.request".to_string()],
-            configured_grants: vec!["host_api.request".to_string()],
+            requested_permissions: vec!["host_api.request".to_string(), "host_api.websocket".to_string()],
+            configured_grants: vec!["host_api.request".to_string(), "host_api.websocket".to_string()],
             configured_request_grants: vec!["*://* GET * [broad-request]".to_string()],
+            configured_websocket_grants: vec!["*://* * [broad-websocket]".to_string()],
             configured_fs_grants: Vec::new(),
             tools: Vec::new(),
             static_runtime: Some(PluginStaticInspection {
@@ -1556,6 +1576,27 @@ mod tests {
                                 .to_string(),
                         ),
                     },
+                    PluginPermissionEligibility {
+                        permission: "host_api.websocket target wss://gateway.example.test /gateway"
+                            .to_string(),
+                        requested: true,
+                        granted: false,
+                        eligible: false,
+                        diagnostic: Some(
+                            "missing enabled WebSocket grant for manifest target".to_string(),
+                        ),
+                    },
+                    PluginPermissionEligibility {
+                        permission: "host_api.websocket grant-only *://* * [broad-websocket]"
+                            .to_string(),
+                        requested: false,
+                        granted: true,
+                        eligible: false,
+                        diagnostic: Some(
+                            "enabled WebSocket grant has no matching manifest declaration; broad/arbitrary target"
+                                .to_string(),
+                        ),
+                    },
                 ],
                 tools: Vec::new(),
                 services: Vec::new(),
@@ -1569,10 +1610,18 @@ mod tests {
             json["configured_request_grants"][0],
             "*://* GET * [broad-request]"
         );
+        assert_eq!(
+            json["configured_websocket_grants"][0],
+            "*://* * [broad-websocket]"
+        );
         let human = render_item_human(&item).unwrap();
+        assert!(human.contains("configured_websocket_grants: *://* * [broad-websocket]"));
         assert!(human.contains("host_api.request target https://api.example.test"));
         assert!(human.contains("requested=true granted=true eligible=true"));
         assert!(human.contains("host_api.request grant *://*"));
+        assert!(human.contains("host_api.websocket target wss://gateway.example.test"));
+        assert!(human.contains("host_api.websocket grant-only *://*"));
+        assert!(human.contains("missing enabled WebSocket grant"));
         assert!(human.contains("broad/arbitrary"));
     }
 
@@ -1596,6 +1645,7 @@ mod tests {
                     PluginPermission::service("svc"),
                 ],
                 request: Vec::new(),
+                websocket: Vec::new(),
                 fs: Vec::new(),
             },
             config: None,
@@ -1650,6 +1700,7 @@ mod tests {
                     PluginPermission::tool("Echo"),
                 ],
                 request: Vec::new(),
+                websocket: Vec::new(),
                 fs: Vec::new(),
             },
             config: None,
@@ -1668,6 +1719,7 @@ mod tests {
                     PluginPermission::tool("Echo"),
                 ],
                 request: Vec::new(),
+                websocket: Vec::new(),
                 fs: Vec::new(),
             },
             config: None,
@@ -1786,6 +1838,7 @@ mod tests {
                     PluginPermission::tool("Echo"),
                 ],
                 request: Vec::new(),
+                websocket: Vec::new(),
                 fs: Vec::new(),
             },
             config: None,
@@ -2321,6 +2374,7 @@ lifecycle = "host-managed"
                         PluginPermission::tool("Echo"),
                     ],
                     request: Vec::new(),
+                    websocket: Vec::new(),
                     fs: Vec::new(),
                 },
                 config: None,
@@ -2352,6 +2406,7 @@ lifecycle = "host-managed"
                 digest: Some(digest),
                 permissions,
                 request: Vec::new(),
+                websocket: Vec::new(),
                 fs: Vec::new(),
             },
             config: None,
@@ -2380,6 +2435,7 @@ lifecycle = "host-managed"
                 digest: None,
                 permissions,
                 request: Vec::new(),
+                websocket: Vec::new(),
                 fs: Vec::new(),
             },
             config: None,

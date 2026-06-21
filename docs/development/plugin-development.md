@@ -335,6 +335,43 @@ path_prefixes = ["/v1/"]
 
 Yoi checks method, scheme, host, optional port, and path prefix against both the manifest declaration and enablement grant before any network I/O. `http://localhost`, loopback, private, and other local targets are never ambient; they require an explicit manifest request target and an explicit matching grant. The explicit request target is the declared URL authority; a granted DNS hostname may resolve to a loopback/private address without requiring a separate literal-IP grant, so reviewers should grant hostnames only when that resolution behavior is intended. Broad targets such as `host = "*"` are supported only as visibly broad request permissions in inspection/diagnostics. Embedded credentials, credential-like headers, oversize requests/responses, WebSocket URLs/upgrades, and SSE/event-stream requests are rejected.
 
+## `websocket` host API
+
+The `websocket` host API is a separate grant-gated capability named `host_api.websocket`, not an extension of `host_api.request`. It opens host-owned WebSocket connections only when both the package manifest and enablement config declare matching targets. Plugin code drives the lifecycle explicitly through `open`, `send-text`, `recv`, and `close`; incoming messages are returned only from bounded `recv` calls and are not injected into model context, history, Dashboard state, or Ticket state.
+
+Example manifest shape:
+
+```toml
+permissions = [
+  { kind = "surface", surface = "tool" },
+  { kind = "tool", name = "gateway_step" },
+  { kind = "host_api", api = "websocket" },
+]
+
+[[websocket]]
+scheme = "wss"
+host = "gateway.example.com"
+path_prefixes = ["/gateway"]
+```
+
+Example enablement grant shape:
+
+```toml
+[plugins.enabled.grants]
+permissions = [
+  { kind = "surface", surface = "tool" },
+  { kind = "tool", name = "gateway_step" },
+  { kind = "host_api", api = "websocket" },
+]
+
+[[plugins.enabled.grants.websocket]]
+scheme = "wss"
+host = "gateway.example.com"
+path_prefixes = ["/gateway"]
+```
+
+Yoi checks scheme (`ws`/`wss`), host, optional port, and path prefix against both declarations before opening the connection. Loopback/private/local targets are not ambient; they require explicit matching manifest and grant entries. Broad WebSocket targets such as `host = "*"` are reported as broad WebSocket diagnostics. v1 is text-only: `send-text` requires UTF-8, binary receive fails closed, guest-supplied handshake headers and embedded URL credentials are rejected, and SecretRef-based credential/header injection is future work. The host bounds open descriptors, text/message size, receive timeout, connection count, handle lifetime, and cleanup on close/instance stop/drop.
+
 ## `fs` host API
 
 The `fs` host API is Plugin-scoped and grant-gated. Plugins do not inherit the Pod/workspace filesystem authority automatically.

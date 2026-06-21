@@ -2,6 +2,7 @@ package yoi:plugin@1.0.0;
 
 world tool {
   import yoi:host/request@1.0.0;
+  import yoi:host/websocket@1.0.0;
   import yoi:host/fs@1.0.0;
 
   /// Execute a manifest-declared Tool. `input-json` is the normal Tool input
