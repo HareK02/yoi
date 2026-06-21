@@ -182,3 +182,34 @@ Next action:
 - Route to read-only Reviewer Pod for acceptance review against the Ticket。
 
 ---
+
+<!-- event: comment author: yoi-orchestrator at: 2026-06-21T16:32:22Z -->
+
+## Comment
+
+Review routing:
+
+Spawned read-only Reviewer Pod:
+- `yoi-reviewer-00001KVNEKH9Q-r1`
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVNEKH9Q-workspace-host-workers`
+- Branch: `impl/00001KVNEKH9Q-workspace-host-workers`
+- Baseline: `e1f02ffc`
+- Implementation commit: `58143ead feat: expose workspace hosts and workers`
+- Diff: `e1f02ffc..58143ead`
+
+Reviewer scope:
+- read-only `/home/hare/Projects/yoi`
+
+Reviewer focus:
+- Host / Worker API domain shape and redaction/bounding。
+- Safe read-only local Pod metadata bridge。
+- Missing/unreadable Pod metadata dir degradation。
+- `/api/runners` placeholder migration/removal and frontend/test updates。
+- Static SPA displays Host / Worker list without backend authority changes。
+- Package/Nix/frontend generated artifact hygiene。
+
+Orchestrator will wait for reviewer verdict before integration。
+
+---
