@@ -103,3 +103,12 @@ Next routing recommendation:
 Deno 移行 refinement は誤付与として分離済み。`00001KVMT2J25` は元の protocol reconnect / unfinished block snapshot Ticket として Orchestrator routing 可能な ready 状態へ戻す。queue routing や implementation start は行わない。
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-21T10:56:32Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
