@@ -110,3 +110,31 @@ Reviewer focus:
 Human authorized queue routing from Workspace Dashboard. Ticket has concrete acceptance criteria and no recorded blockers; active Workspace web control plane implementation is semantically separate enough for parallel implementation. Orchestrator accepts this Plugin host API refactor into implementation.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T07:18:48Z -->
+
+## Implementation report
+
+Implementation start report:
+
+- Created child implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVMG8FTW-plugin-request-host-api`
+- Created branch:
+  - `impl/00001KVMG8FTW-plugin-request-host-api`
+- Base commit:
+  - `4cd4a06e ticket: route plugin request capabilities`
+- Confirmed tracked Ticket project records are visible in the child worktree。
+- Confirmed `.yoi/memory` has no tracked/untracked entries in the child worktree check。
+- Spawned sibling Coder Pod:
+  - `yoi-coder-00001KVMG8FTW`
+- Coder scope:
+  - read: `/home/hare/Projects/yoi`
+  - write: `/home/hare/Projects/yoi/.worktree/00001KVMG8FTW-plugin-request-host-api`
+
+Parallelization note:
+- `00001KVMFFYVX` remains in progress in a separate child worktree. Coder was instructed to avoid unnecessary Cargo.lock/package.nix churn and report if unavoidable conflicts appear。
+
+Next action:
+- Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff. Orchestrator will not merge/close until reviewer approval and validation evidence are available。
+
+---
