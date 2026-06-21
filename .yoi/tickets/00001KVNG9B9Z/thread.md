@@ -360,3 +360,29 @@ Workspace web UI に sidebar navigation panel を追加し、Orchestrator worktr
 - Settings page, Repository CRUD/API, Objective edit/detail UI, Worker start/stop/attach controls, drag/drop/collapsible tree, auth, multi-workspace switcher は実装していない。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T17:01:46Z -->
+
+## Implementation report
+
+Post-close cleanup completed。
+
+- Stopped child Pods and reclaimed scope:
+  - `yoi-coder-00001KVNG9B9Z`
+  - `yoi-reviewer-00001KVNG9B9Z-r1`
+- Removed ignored frontend validation artifacts from child worktree before worktree removal:
+  - `web/workspace/node_modules/`
+  - `web/workspace/.svelte-kit/`
+  - `web/workspace/build/`
+- Removed implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVNG9B9Z-workspace-sidebar`
+- Deleted implementation branch:
+  - `impl/00001KVNG9B9Z-workspace-sidebar`
+- Orchestrator worktree remains clean on `orchestration` at `c29eba0c`。
+
+Root/original workspace was not used for merge/validation/cleanup operations。
+
+Follow-up note:
+- `00001KVNGJPRG` had been left queued behind this sidebar work due `do_not_parallelize`; this blocker is now cleared for re-routing on top of the settled sidebar/navigation structure。
+
+---
