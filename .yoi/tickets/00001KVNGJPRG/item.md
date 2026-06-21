@@ -1,9 +1,11 @@
 ---
 title: 'Workspace web: repository and objective pages'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-21T16:35:19Z'
-updated_at: '2026-06-21T16:36:06Z'
+updated_at: '2026-06-21T16:40:35Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-21T16:40:35Z'
 ---
 
 ## 背景
