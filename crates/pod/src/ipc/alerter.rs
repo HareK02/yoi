@@ -14,9 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::broadcast;
 
-use protocol::{Alert, AlertLevel, AlertSource, Event, InFlightSnapshot};
-
-use crate::in_flight::{InFlightEvents, snapshot_from_guard};
+use protocol::{Alert, AlertLevel, AlertSource, Event};
 
 /// Upper bound on buffered alerts. When exceeded, the oldest
 /// entries are discarded so a long-running session cannot leak
@@ -86,22 +84,6 @@ impl Alerter {
         let rx = self.inner.event_tx.subscribe();
         let snapshot: Vec<Alert> = buf.iter().cloned().collect();
         (snapshot, rx)
-    }
-
-    pub fn subscribe_with_alerts_and_in_flight_snapshot(
-        &self,
-        in_flight: &InFlightEvents,
-    ) -> (Vec<Alert>, InFlightSnapshot, broadcast::Receiver<Event>) {
-        let buf = self
-            .inner
-            .buffer
-            .lock()
-            .expect("alerter buffer mutex poisoned");
-        let in_flight_guard = in_flight.snapshot_guard();
-        let rx = self.inner.event_tx.subscribe();
-        let alerts: Vec<Alert> = buf.iter().cloned().collect();
-        let in_flight = snapshot_from_guard(&in_flight_guard);
-        (alerts, in_flight, rx)
     }
 }
 

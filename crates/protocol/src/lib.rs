@@ -639,11 +639,6 @@ pub struct RewindSummary {
     pub tool_side_effect_warning: bool,
 }
 
-/// Pod self-description rendered by the TUI when a session starts empty.
-///
-/// Built once in the Pod controller from the resolved manifest and
-/// transmitted alongside `Event::Snapshot` so clients don't need
-/// their own view of the manifest.
 /// Unfinished model output included in `Event::Snapshot` for clients that
 /// attach while an LLM response is still streaming.
 ///
@@ -700,6 +695,11 @@ impl InFlightToolCallState {
     }
 }
 
+/// Pod self-description rendered by the TUI when a session starts empty.
+///
+/// Built once in the Pod controller from the resolved manifest and
+/// transmitted alongside `Event::Snapshot` so clients don't need
+/// their own view of the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Greeting {
     pub pod_name: String,

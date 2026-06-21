@@ -7,6 +7,7 @@ use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 
 use crate::controller::PodHandle;
+use crate::in_flight::snapshot_from_guard;
 use protocol::{Event, Method};
 
 /// Unix socket server for Pod Protocol.
@@ -104,20 +105,22 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: PodHandle) {
     let mut reader = JsonLineReader::new(reader);
     let mut writer = JsonLineWriter::new(writer);
 
-    // Atomically subscribe to the session-log mirror first. The
-    // returned (snapshot, rx) pair partitions the entry timeline:
-    // entries committed before this call appear in `entries`, every
-    // entry after lands on `entry_rx`. Doing this before the alert
-    // snapshot keeps both ordering pairs internally consistent.
-    let (entries_snapshot, mut entry_rx) = handle.sink.subscribe_with_snapshot();
+    // Hold the in-flight stream lock while taking the session-log mirror
+    // snapshot. `LogEntry::AssistantItem` is mirror-only for live clients,
+    // so a finalized assistant block must be observed either as an already
+    // committed entry or as the still-present in-flight block. This lock
+    // order matches `append_entry` (in-flight clear before sink publish) and
+    // keeps the snapshot/live boundary gap-free.
+    let (entries_snapshot, mut entry_rx, alert_snapshot, mut rx, in_flight) = {
+        let in_flight_guard = handle.in_flight.snapshot_guard();
+        let (entries_snapshot, entry_rx) = handle.sink.subscribe_with_snapshot();
 
-    // Atomically subscribe and snapshot buffered alerts so that
-    // warnings emitted before this client connected are replayed
-    // exactly once — they appear in the snapshot, and any alert
-    // arriving afterwards reaches us through `rx`.
-    let (alert_snapshot, in_flight, mut rx) = handle
-        .alerter
-        .subscribe_with_alerts_and_in_flight_snapshot(&handle.in_flight);
+        // Atomically subscribe and snapshot buffered alerts so that warnings
+        // emitted before this client connected are replayed exactly once.
+        let (alert_snapshot, rx) = handle.alerter.subscribe_with_snapshot();
+        let in_flight = snapshot_from_guard(&in_flight_guard);
+        (entries_snapshot, entry_rx, alert_snapshot, rx, in_flight)
+    };
     for alert in alert_snapshot {
         if writer.write(&Event::Alert(alert)).await.is_err() {
             return;

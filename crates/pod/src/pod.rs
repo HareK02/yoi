@@ -185,7 +185,11 @@ where
         self.state.increment_entries();
         if let Some(in_flight) = &self.in_flight {
             if let LogEntry::AssistantItem { item, .. } = &entry {
-                in_flight.clear_for_committed_item(item);
+                let item_for_clear = item.clone();
+                in_flight.clear_for_committed_item_then(&item_for_clear, || {
+                    self.sink.publish(entry);
+                });
+                return Ok(());
             }
         }
         self.sink.publish(entry);

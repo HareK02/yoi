@@ -191,31 +191,14 @@ impl InFlightEvents {
         });
     }
 
-    pub(crate) fn clear_for_committed_item(&self, item: &LoggedItem) {
+    pub(crate) fn clear_for_committed_item_then<R>(
+        &self,
+        item: &LoggedItem,
+        f: impl FnOnce() -> R,
+    ) -> R {
         let mut inner = self.lock();
-        match item {
-            LoggedItem::Message { role, content }
-                if matches!(role, session_store::LoggedRole::Assistant) =>
-            {
-                let text = content
-                    .iter()
-                    .filter_map(|part| match part {
-                        LoggedContentPart::Text { text } => Some(text.as_str()),
-                        LoggedContentPart::Refusal { refusal } => Some(refusal.as_str()),
-                    })
-                    .collect::<String>();
-                if !text.is_empty() {
-                    inner.remove_first_text_matching(&text);
-                }
-            }
-            LoggedItem::Reasoning { text, .. } => {
-                inner.remove_first_thinking_matching(text);
-            }
-            LoggedItem::ToolCall { call_id, .. } => {
-                inner.remove_tool_call(call_id);
-            }
-            _ => {}
-        }
+        inner.clear_for_committed_item(item);
+        f()
     }
 
     fn lock(&self) -> MutexGuard<'_, InFlightInner> {
@@ -234,6 +217,32 @@ impl InFlightInner {
         self.blocks
             .iter_mut()
             .find(|block| block.block_id() == block_id)
+    }
+
+    fn clear_for_committed_item(&mut self, item: &LoggedItem) {
+        match item {
+            LoggedItem::Message { role, content }
+                if matches!(role, session_store::LoggedRole::Assistant) =>
+            {
+                let text = content
+                    .iter()
+                    .filter_map(|part| match part {
+                        LoggedContentPart::Text { text } => Some(text.as_str()),
+                        LoggedContentPart::Refusal { refusal } => Some(refusal.as_str()),
+                    })
+                    .collect::<String>();
+                if !text.is_empty() {
+                    self.remove_first_text_matching(&text);
+                }
+            }
+            LoggedItem::Reasoning { text, .. } => {
+                self.remove_first_thinking_matching(text);
+            }
+            LoggedItem::ToolCall { call_id, .. } => {
+                self.remove_tool_call(call_id);
+            }
+            _ => {}
+        }
     }
 
     fn snapshot(&self) -> InFlightSnapshot {
@@ -352,17 +361,115 @@ mod tests {
     }
 
     #[test]
+    fn session_log_and_in_flight_snapshot_prevents_mirror_only_assistant_gap() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        use crate::segment_log_sink::SegmentLogSink;
+        use session_store::{LogEntry, LoggedRole};
+
+        let (event_tx, _) = broadcast::channel(16);
+        let sink = SegmentLogSink::new();
+        let in_flight = InFlightEvents::new(event_tx);
+        let block_id = in_flight.start_text_block();
+        in_flight.text_delta(block_id, "done".into());
+        in_flight.text_done(block_id, "done".into());
+
+        let assistant_item = LoggedItem::Message {
+            role: LoggedRole::Assistant,
+            content: vec![LoggedContentPart::Text {
+                text: "done".into(),
+            }],
+        };
+        let assistant_entry = LogEntry::AssistantItem {
+            ts: 1,
+            item: assistant_item.clone(),
+        };
+
+        let in_flight_guard = in_flight.snapshot_guard();
+        let in_flight_for_commit = in_flight.clone();
+        let sink_for_commit = sink.clone();
+        let (committed_tx, committed_rx) = mpsc::channel();
+        let commit_thread = thread::spawn(move || {
+            // This mirrors Pod::append_entry ordering: clear in-flight first,
+            // then publish the finalized AssistantItem. AssistantItem entries
+            // are mirror-only and are not delivered as live entry events.
+            in_flight_for_commit.clear_for_committed_item_then(&assistant_item, || {
+                sink_for_commit.publish(assistant_entry);
+            });
+            committed_tx.send(()).unwrap();
+        });
+
+        let (entries_snapshot, mut entry_rx) = sink.subscribe_with_snapshot();
+        let in_flight_snapshot = snapshot_from_guard(&in_flight_guard);
+        drop(in_flight_guard);
+
+        committed_rx.recv().unwrap();
+        commit_thread.join().unwrap();
+
+        assert!(entries_snapshot.is_empty());
+        assert!(matches!(
+            in_flight_snapshot.blocks.as_slice(),
+            [InFlightBlock::Text { text, finished: true }] if text == "done"
+        ));
+        assert!(entry_rx.try_recv().is_err());
+        let post_commit_guard = in_flight.snapshot_guard();
+        assert!(snapshot_from_guard(&post_commit_guard).is_empty());
+    }
+
+    #[test]
+    fn committed_assistant_snapshot_does_not_duplicate_in_flight_block() {
+        use crate::segment_log_sink::SegmentLogSink;
+        use session_store::{LogEntry, LoggedRole};
+
+        let (event_tx, _) = broadcast::channel(16);
+        let sink = SegmentLogSink::new();
+        let in_flight = InFlightEvents::new(event_tx);
+        let block_id = in_flight.start_text_block();
+        in_flight.text_delta(block_id, "done".into());
+        in_flight.text_done(block_id, "done".into());
+
+        let assistant_item = LoggedItem::Message {
+            role: LoggedRole::Assistant,
+            content: vec![LoggedContentPart::Text {
+                text: "done".into(),
+            }],
+        };
+        let assistant_entry = LogEntry::AssistantItem {
+            ts: 1,
+            item: assistant_item.clone(),
+        };
+
+        in_flight.clear_for_committed_item_then(&assistant_item, || {
+            sink.publish(assistant_entry);
+        });
+
+        let in_flight_guard = in_flight.snapshot_guard();
+        let (entries_snapshot, _entry_rx) = sink.subscribe_with_snapshot();
+        let in_flight_snapshot = snapshot_from_guard(&in_flight_guard);
+
+        assert!(matches!(
+            entries_snapshot.as_slice(),
+            [LogEntry::AssistantItem { item, .. }] if item == &assistant_item
+        ));
+        assert!(in_flight_snapshot.is_empty());
+    }
+
+    #[test]
     fn committed_item_clears_matching_in_flight_block() {
         let (event_tx, _) = broadcast::channel(16);
         let in_flight = InFlightEvents::new(event_tx);
         let block_id = in_flight.start_text_block();
         in_flight.text_delta(block_id, "done".into());
-        in_flight.clear_for_committed_item(&LoggedItem::Message {
-            role: session_store::LoggedRole::Assistant,
-            content: vec![LoggedContentPart::Text {
-                text: "done".into(),
-            }],
-        });
+        in_flight.clear_for_committed_item_then(
+            &LoggedItem::Message {
+                role: session_store::LoggedRole::Assistant,
+                content: vec![LoggedContentPart::Text {
+                    text: "done".into(),
+                }],
+            },
+            || (),
+        );
 
         let guard = in_flight.snapshot_guard();
         assert!(snapshot_from_guard(&guard).is_empty());
