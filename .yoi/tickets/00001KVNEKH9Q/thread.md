@@ -213,3 +213,78 @@ Reviewer focus:
 Orchestrator will wait for reviewer verdict before integration。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVNEKH9Q-r1 at: 2026-06-21T16:38:05Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket authority:
+  - `.yoi/tickets/00001KVNEKH9Q/item.md`
+  - `.yoi/tickets/00001KVNEKH9Q/thread.md`
+- Diff/changed areas `e1f02ffc..58143ead`:
+  - `crates/workspace-server/src/hosts.rs`
+  - `crates/workspace-server/src/server.rs`
+  - `crates/workspace-server/src/store.rs`
+  - `crates/workspace-server/src/lib.rs`
+  - `crates/workspace-server/src/main.rs`
+  - `crates/workspace-server/Cargo.toml`
+  - `Cargo.lock`
+  - `package.nix`
+  - `web/workspace/src/routes/+page.svelte`
+  - `web/workspace/svelte.config.js`
+- Supporting inspection:
+  - `crates/pod-store/src/lib.rs`
+  - `runners` references and session/prompt/tool-result exposure grep。
+
+Blocking issues:
+- None。
+
+Acceptance verification:
+- API domain naming is Host / Worker:
+  - Routes added for `/api/hosts`, `/api/workers`, and `/api/hosts/{host_id}/workers`。
+  - `/api/runners` placeholder is removed and test-covered as `404`。
+- Local Pods are implementation detail:
+  - Worker model exposes domain fields (`worker_id`, `host_id`, `label`, `state`, `status`, etc.)。
+  - Pod-specific detail is limited to `pod_name` and `implementation: { kind: "local_pod", pod_name: ... }`。
+- Local Pod bridge is read-only:
+  - Reads local Pod `metadata.json` under configured local data dir。
+  - No mutation of Pod runtime metadata, session logs, Tickets, or Objectives observed。
+- Redaction / sensitive data:
+  - No session JSONL/transcript/tool-result/prompt content reads introduced。
+  - `resolved_manifest_snapshot` is not serialized wholesale; role/profile extraction is bounded/sanitized。
+  - Tests include a snapshot containing `secret_token` / `system_prompt` and assert they are not returned。
+- Missing/unreadable metadata degradation:
+  - Missing Pod metadata root returns empty workers plus bounded diagnostics。
+  - Host capability degrades to unavailable instead of failing the server。
+- Frontend:
+  - Static Svelte page fetches/displays Hosts and Workers。
+  - No SSR/business authority addition observed。
+- Existing Ticket/Objective workflows remain preserved; `ticket doctor` passes。
+
+Non-blocking concerns:
+- None。
+
+Reviewer validation:
+- `cargo fmt --check`: passed
+- `git diff --check e1f02ffc..HEAD`: passed
+- `cargo test -p yoi-workspace-server`: passed (`6 passed`)
+- `cargo check -p yoi-workspace-server`: passed
+- `cd web/workspace && deno task check && deno task build`: passed (`svelte-check found 0 errors and 0 warnings`; static build completed)
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+
+Generated artifacts:
+- Frontend validation produced ignored generated artifacts only:
+  - `web/workspace/.svelte-kit/`
+  - `web/workspace/build/`
+  - `web/workspace/node_modules/`
+- Reviewer did not clean them due review-only scope; they are ignored and not tracked。
+
+Worktree status:
+- Tracked/untracked status is clean on `impl/00001KVNEKH9Q-workspace-host-workers`。
+- Ignored generated frontend artifacts remain as listed above。
+
+---
