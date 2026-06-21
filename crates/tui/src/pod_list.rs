@@ -819,6 +819,7 @@ mod tests {
                 entries: vec![],
                 greeting: test_greeting(),
                 status: PodStatus::Idle,
+                in_flight: Default::default(),
             },
         ];
 

@@ -1,8 +1,8 @@
 ---
 title: 'Plugin: URL 権限ベースの WebSocket host API を実装する'
-state: 'queued'
+state: 'closed'
 created_at: '2026-06-21T07:11:34Z'
-updated_at: '2026-06-21T11:34:07Z'
+updated_at: '2026-06-21T13:27:28Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['plugin', 'host-api', 'websocket', 'service', 'ingress', 'lifecycle', 'permissions', 'security', 'persistence']

@@ -868,6 +868,7 @@ async fn ticket_queue_notification_sends_notify_when_socket_available() {
                     context_tokens: 0,
                 },
                 status: PodStatus::Idle,
+                in_flight: Default::default(),
             })
             .await
             .unwrap();
@@ -908,6 +909,7 @@ async fn send_notify_only_can_deliver_weak_notification_without_auto_run() {
                     context_tokens: 0,
                 },
                 status: PodStatus::Idle,
+                in_flight: Default::default(),
             })
             .await
             .unwrap();

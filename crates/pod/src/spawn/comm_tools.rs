@@ -515,6 +515,7 @@ mod tests {
                 context_tokens: 0,
             },
             status: PodStatus::Idle,
+            in_flight: Default::default(),
         }
     }
 

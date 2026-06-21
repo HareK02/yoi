@@ -7,6 +7,16 @@ interface request {
   request: func(request-json: string) -> string;
 }
 
+/// Grant-bound host-owned WebSocket API. Authority requires a manifest `host_api.websocket`
+/// target and an enablement grant; messages are delivered only by explicit bounded recv calls.
+/// v1 supports text messages only and rejects guest-supplied handshake headers.
+interface websocket {
+  open: func(request-json: string) -> string;
+  send-text: func(handle: u32, text: string) -> string;
+  recv: func(handle: u32, timeout-ms: u32) -> string;
+  close: func(handle: u32) -> string;
+}
+
 /// Grant-bound filesystem host API. No ambient WASI filesystem is exposed.
 interface fs {
   read: func(request-json: string) -> string;

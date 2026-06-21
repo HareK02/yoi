@@ -91,6 +91,7 @@ fn empty_snapshot() -> Event {
             context_tokens: 0,
         },
         status: PodStatus::Idle,
+        in_flight: Default::default(),
     }
 }
 

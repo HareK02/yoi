@@ -14,6 +14,7 @@ use tracing::{debug, warn};
 
 use crate::discovery::{PodDiscovery, list_pods_tool, restore_pod_tool, send_to_peer_pod_tool};
 use crate::feature::FeatureRegistryBuilder;
+use crate::in_flight::InFlightEvents;
 use crate::ipc::alerter::Alerter;
 use crate::ipc::notify_buffer::NotifyBuffer;
 use crate::ipc::server::SocketServer;
@@ -47,6 +48,7 @@ pub struct PodHandle {
     pub shared_state: Arc<PodSharedState>,
     pub runtime_dir: Arc<RuntimeDir>,
     pub alerter: Alerter,
+    pub in_flight: InFlightEvents,
     /// Segment-log mirror + broadcast handle. The IPC server snapshots
     /// it on every new connection (Event::Snapshot) and forwards
     /// subsequent commits (Event::Entry) on the receiver.
@@ -159,6 +161,8 @@ impl PodController {
         let (method_tx, method_rx) = mpsc::channel::<Method>(32);
         let (event_tx, _) = broadcast::channel::<Event>(256);
         let alerter = Alerter::new(event_tx.clone());
+        let in_flight = InFlightEvents::new(event_tx.clone());
+        pod.attach_in_flight_events(in_flight.clone());
 
         // Runtime directory is created before tool registration because
         // the spawn-tool factories need its socket path, and before the
@@ -225,7 +229,7 @@ impl PodController {
         pod.wire_history_persistence();
 
         // === 2. Worker event bridge wiring ===
-        wire_event_bridges_on_worker(&mut pod, &event_tx, &alerter);
+        wire_event_bridges_on_worker(&mut pod, &event_tx, &alerter, &in_flight);
 
         // === 3. Tool registration (builtin / memory / spawn-orchestration) ===
         let fs_for_view = register_pod_tools(
@@ -289,6 +293,7 @@ impl PodController {
             shared_state: shared_state.clone(),
             runtime_dir: runtime_dir.clone(),
             alerter: alerter.clone(),
+            in_flight: in_flight.clone(),
             sink: pod.sink(),
         };
 
@@ -333,6 +338,7 @@ fn wire_event_bridges_on_worker<C, St>(
     pod: &mut Pod<C, St>,
     event_tx: &broadcast::Sender<Event>,
     alerter: &Alerter,
+    in_flight: &InFlightEvents,
 ) where
     C: LlmClient + Clone + 'static,
     St: Store + PodMetadataStore + Clone + 'static,
@@ -386,83 +392,66 @@ fn wire_event_bridges_on_worker<C, St>(
         });
     });
 
-    let tx = event_tx.clone();
+    let in_flight_text = in_flight.clone();
     let activity = ai_activity.clone();
     worker.on_text_block(move |block| {
-        let tx_d = tx.clone();
+        let block_id = in_flight_text.start_text_block();
+        let in_flight_d = in_flight_text.clone();
         let activity_d = activity.clone();
         block.on_delta(move |text| {
             activity_d.fetch_add(1, Ordering::SeqCst);
-            let _ = tx_d.send(Event::TextDelta {
-                text: text.to_owned(),
-            });
+            in_flight_d.text_delta(block_id, text.to_owned());
         });
-        let tx_s = tx.clone();
+        let in_flight_s = in_flight_text.clone();
         let activity_s = activity.clone();
         block.on_stop(move |text| {
             if !text.is_empty() {
                 activity_s.fetch_add(1, Ordering::SeqCst);
             }
-            let _ = tx_s.send(Event::TextDone {
-                text: text.to_owned(),
-            });
+            in_flight_s.text_done(block_id, text.to_owned());
         });
     });
 
-    let tx = event_tx.clone();
+    let in_flight_thinking = in_flight.clone();
     let activity = ai_activity.clone();
     worker.on_thinking_block(move |block| {
         // Start fires unconditionally so the TUI can show "Thinking..."
         // even when the provider doesn't emit plaintext deltas.
         activity.fetch_add(1, Ordering::SeqCst);
-        let _ = tx.send(Event::ThinkingStart);
-        let tx_d = tx.clone();
+        let block_id = in_flight_thinking.thinking_start();
+        let in_flight_d = in_flight_thinking.clone();
         let activity_d = activity.clone();
         block.on_delta(move |text| {
             activity_d.fetch_add(1, Ordering::SeqCst);
-            let _ = tx_d.send(Event::ThinkingDelta {
-                text: text.to_owned(),
-            });
+            in_flight_d.thinking_delta(block_id, text.to_owned());
         });
-        let tx_s = tx.clone();
+        let in_flight_s = in_flight_thinking.clone();
         let activity_s = activity.clone();
         block.on_stop(move |text| {
             if !text.is_empty() {
                 activity_s.fetch_add(1, Ordering::SeqCst);
             }
-            let _ = tx_s.send(Event::ThinkingDone {
-                text: text.to_owned(),
-            });
+            in_flight_s.thinking_done(block_id, text.to_owned());
         });
     });
 
-    let tx = event_tx.clone();
+    let in_flight_tool = in_flight.clone();
     let activity = ai_activity.clone();
     worker.on_tool_use_block(move |start, block| {
         activity.fetch_add(1, Ordering::SeqCst);
-        let _ = tx.send(Event::ToolCallStart {
-            id: start.id.clone(),
-            name: start.name.clone(),
-        });
+        let block_id = in_flight_tool.tool_call_start(start.id.clone(), start.name.clone());
         let id_for_delta = start.id.clone();
-        let tx_d = tx.clone();
+        let in_flight_d = in_flight_tool.clone();
         let activity_d = activity.clone();
         block.on_delta(move |json| {
             activity_d.fetch_add(1, Ordering::SeqCst);
-            let _ = tx_d.send(Event::ToolCallArgsDelta {
-                id: id_for_delta.clone(),
-                json: json.to_owned(),
-            });
+            in_flight_d.tool_call_args_delta(block_id, id_for_delta.clone(), json.to_owned());
         });
-        let tx_s = tx.clone();
+        let in_flight_s = in_flight_tool.clone();
         let activity_s = activity.clone();
         block.on_stop(move |call| {
             activity_s.fetch_add(1, Ordering::SeqCst);
-            let _ = tx_s.send(Event::ToolCallDone {
-                id: call.id.clone(),
-                name: call.name.clone(),
-                arguments: call.input.to_string(),
-            });
+            in_flight_s.tool_call_done(block_id, call.id.clone(), call.input.to_string());
         });
     });
 
@@ -1535,6 +1524,7 @@ mod tests {
                         context_tokens: 0,
                     },
                     status: PodStatus::Idle,
+                    in_flight: Default::default(),
                 })
                 .await
                 .ok()?;

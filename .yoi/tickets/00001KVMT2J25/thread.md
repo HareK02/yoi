@@ -308,3 +308,276 @@ Reviewer focus:
 Orchestrator will wait for reviewer verdict before integration。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVMT2J25-r1 at: 2026-06-21T11:37:35Z status: request_changes -->
+
+## Review: request changes
+
+Verdict: `request_changes`
+
+確認範囲:
+- Ticket authority:
+  - `.yoi/tickets/00001KVMT2J25/item.md`
+  - `.yoi/tickets/00001KVMT2J25/thread.md`
+- Diff `155e039e..74aca6f6`, including:
+  - `crates/protocol/src/lib.rs`
+  - `crates/pod/src/in_flight.rs`
+  - `crates/pod/src/controller.rs`
+  - `crates/pod/src/ipc/alerter.rs`
+  - `crates/pod/src/ipc/server.rs`
+  - `crates/pod/src/pod.rs`
+  - `crates/pod/src/segment_log_sink.rs`
+  - `crates/tui/src/app.rs`
+  - constructor/test updates in pod/TUI/discovery/spawn/dashboard-related test files
+
+Blocking issue:
+
+1. Snapshot/live boundary still has a gap for finalized assistant items committed between the session-log snapshot and the in-flight snapshot。
+
+The implementation makes in-flight streaming deltas mostly gap-free by holding the in-flight mutex across subscribe/snapshot, but the full connection snapshot is not atomic across the committed session-log mirror and the new in-flight accumulator。
+
+Relevant path:
+- `crates/pod/src/ipc/server.rs:112` takes `handle.sink.subscribe_with_snapshot()` first。
+- `crates/pod/src/ipc/server.rs:118-120` then subscribes/snapshots alerts + in-flight state。
+- `crates/pod/src/pod.rs:182-191` persists an entry, clears matching in-flight state for `LogEntry::AssistantItem`, then publishes to the session-log sink。
+- `crates/pod/src/segment_log_sink.rs:90-103` documents that `AssistantItem` is mirror-only and not live-broadcast。
+- `crates/pod/src/segment_log_sink.rs:120-127` confirms only `SegmentStart`, `UserInput`, `SystemItem`, and `Invoke` are live-relevant。
+
+Race:
+1. New client connects。
+2. Server snapshots session-log entries at N。
+3. LLM response finalizes and appends `LogEntry::AssistantItem`。
+4. `append_entry` clears the matching in-flight text/thinking block。
+5. `SegmentLogSink::publish` mirrors the `AssistantItem`, but does not broadcast it live。
+6. Server snapshots in-flight state, now empty/cleared。
+7. Client receives `Event::Snapshot` with no finalized assistant item in `entries`, no unfinished/finalized in-flight block, and no live committed assistant event forthcoming。
+
+This violates the Ticket invariant that Snapshot and post-Snapshot live events must be gap-free and duplicate-free。
+
+Required fix:
+- Make the connection snapshot atomic enough across session-log mirror and in-flight state, or otherwise ensure committed assistant items cannot disappear in this boundary。
+- Add an integrated regression test around session-log snapshot + in-flight snapshot + mirror-only assistant commit boundary。
+- Ensure the fix still avoids persisting unfinished output as final history and still does not duplicate content when final AssistantItem is included in committed snapshot。
+
+Non-blocking concerns:
+- The suggested focused test name `subscribe_with_alerts_and_in_flight_snapshot_splits_snapshot_and_live_deltas` selected 0 tests; no matching test exists。Add/rename an integrated focused test so validation can target the boundary reliably。
+- Minor protocol doc issue: `Greeting` doc comment appears displaced so “Pod self-description...” now sits immediately before `InFlightSnapshot` in `crates/protocol/src/lib.rs`。Not blocking but should be cleaned up if easy。
+
+Reviewer validation:
+- `git diff --check 155e039e..HEAD`: passed
+- `cargo fmt --all --check`: passed
+- `cargo test -p protocol`: passed, 40 tests
+- `cargo test -p pod in_flight`: passed selected tests
+- `cargo test -p pod subscribe_with_alerts_and_in_flight_snapshot_splits_snapshot_and_live_deltas`: selected 0 tests / no matching test
+- `cargo test -p tui snapshot_in_flight_blocks_continue_with_live_deltas`: passed
+- `cargo test -p tui`: passed, 367 tests
+- `cargo check -p protocol -p pod -p tui`: passed
+- `target/debug/yoi ticket doctor`: passed (`doctor: ok`)
+- Full `cargo test -p pod`: failed only on the two known unrelated prompt-resource assertion tests。
+
+Worktree status:
+- Clean on `impl/00001KVMT2J25-inflight-snapshot`。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T11:53:00Z -->
+
+## Implementation report
+
+Coder r1-fix report received from `yoi-coder-00001KVMT2J25`.
+
+New fix commit:
+- `061136d7 fix: close in-flight snapshot commit race`
+
+Branch commits now:
+- `74aca6f6 fix: snapshot in-flight stream state`
+- `061136d7 fix: close in-flight snapshot commit race`
+
+Fix summary:
+- `crates/pod/src/ipc/server.rs`
+  - Connect-time snapshot now holds the in-flight stream lock while taking the session-log mirror snapshot, preventing finalized mirror-only `AssistantItem` entries from falling between committed snapshot entries and in-flight snapshot state。
+- `crates/pod/src/pod.rs`
+  - `append_entry` now clears matching in-flight assistant state and publishes finalized `AssistantItem` to the mirror under the same in-flight critical section。
+- `crates/pod/src/in_flight.rs`
+  - Added `clear_for_committed_item_then` helper for atomic clear + publish ordering。
+  - Added integrated regression tests:
+    - `session_log_and_in_flight_snapshot_prevents_mirror_only_assistant_gap`
+    - `committed_assistant_snapshot_does_not_duplicate_in_flight_block`
+- `crates/pod/src/ipc/alerter.rs`
+  - Removed earlier non-atomic combined alert/in-flight snapshot helper。
+- `crates/protocol/src/lib.rs`
+  - Fixed displaced `Greeting` doc comment。
+
+Coder validation reported:
+- `cargo fmt --all --check`: passed
+- `cargo test -p protocol`: passed
+- `cargo test -p pod --lib in_flight`: passed
+- `cargo test -p pod session_log_and_in_flight_snapshot_prevents_mirror_only_assistant_gap`: passed
+- `cargo test -p pod committed_assistant_snapshot_does_not_duplicate_in_flight_block`: passed
+- `cargo test -p tui snapshot_in_flight_blocks_continue_with_live_deltas`: passed
+- `cargo test -p tui`: passed
+- `cargo check -p protocol -p pod -p tui`: passed
+- `git diff --check`: passed
+- `target/debug/yoi ticket doctor`: passed
+
+Known unrelated validation note:
+- Full `cargo test -p pod` still fails only on the known unrelated prompt-resource assertions:
+  - `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`
+  - `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`
+
+Orchestrator evidence checked:
+- Implementation worktree clean on `impl/00001KVMT2J25-inflight-snapshot`。
+- HEAD is `061136d7`。
+- r1-fix diff `74aca6f6..HEAD` touches expected protocol/pod files: `crates/pod/src/in_flight.rs`, `crates/pod/src/ipc/alerter.rs`, `crates/pod/src/ipc/server.rs`, `crates/pod/src/pod.rs`, and `crates/protocol/src/lib.rs`。
+- `git diff --check 155e039e..HEAD` produced no diagnostics。
+
+Next action:
+- Route back to Reviewer for r2 verification of the commit-boundary race fix and final acceptance。
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KVMT2J25-r1 at: 2026-06-21T11:56:44Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+r2 review result:
+- r1 blocker is resolved。
+- The fix establishes a single critical section around session-log mirror snapshot and in-flight snapshot, and uses the same in-flight lock while clearing/publishing finalized `AssistantItem`s。
+
+Relevant safe interleavings:
+- If connect-time snapshot gets the in-flight lock first: session-log snapshot may not include finalized mirror-only `AssistantItem`, but unfinished/finished in-flight block is still present in `Event::Snapshot.in_flight`。
+- If commit gets the in-flight lock first: it clears in-flight and publishes to session-log mirror under that lock, so later session-log snapshot includes finalized `AssistantItem` and `in_flight` is empty。
+- Since `AssistantItem` remains mirror-only for live clients, this avoids the previous “absent from both snapshot and live events” gap。
+- Duplicate prevention is preserved by clearing matching in-flight state before publishing finalized assistant entry。
+
+Files / diff inspected:
+- r1-fix diff `74aca6f6..061136d7`:
+  - `crates/pod/src/in_flight.rs`
+  - `crates/pod/src/ipc/alerter.rs`
+  - `crates/pod/src/ipc/server.rs`
+  - `crates/pod/src/pod.rs`
+  - `crates/protocol/src/lib.rs`
+- Overall scope/diff `155e039e..061136d7` against Ticket authority:
+  - `.yoi/tickets/00001KVMT2J25/item.md`
+  - `.yoi/tickets/00001KVMT2J25/thread.md`
+
+Blocking issues:
+- None。
+
+Non-blocking concerns:
+- None requiring changes. Integrated regression tests cover the r1 commit-boundary race and duplicate case。
+
+Reviewer validation:
+- `git diff --check 155e039e..HEAD`: passed
+- `cargo fmt --all --check`: passed
+- `cargo test -p protocol`: passed, 40 tests
+- `cargo test -p pod --lib in_flight`: passed, 5 selected tests
+- `cargo test -p pod session_log_and_in_flight_snapshot_prevents_mirror_only_assistant_gap`: passed
+- `cargo test -p pod committed_assistant_snapshot_does_not_duplicate_in_flight_block`: passed
+- `cargo test -p tui snapshot_in_flight_blocks_continue_with_live_deltas`: passed
+- `cargo test -p tui`: passed, 367 tests
+- `cargo check -p protocol -p pod -p tui`: passed
+- `target/debug/yoi ticket doctor`: passed (`doctor: ok`)
+- `cargo test -p pod`: failed only on the known unrelated prompt-resource assertions; summary 424 passed, 2 failed。
+
+Worktree status:
+- Clean on `impl/00001KVMT2J25-inflight-snapshot` at `061136d7`。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T11:59:39Z -->
+
+## Implementation report
+
+Reviewer r2 approvalを受けて、実装ブランチを Orchestrator worktree の `orchestration` branch に統合した。
+
+統合:
+- Merge commit: `b21638f5 merge: inflight reconnect snapshot`
+- Merged branch: `impl/00001KVMT2J25-inflight-snapshot`
+- Implementation commits:
+  - `74aca6f6 fix: snapshot in-flight stream state`
+  - `061136d7 fix: close in-flight snapshot commit race`
+
+Orchestrator worktree validation:
+- `cargo fmt --all --check`: passed
+- `git diff --check HEAD^1..HEAD`: passed
+- `cargo test -p protocol`: passed (`40 passed`)
+- `cargo test -p pod --lib in_flight`: passed (`5 selected tests`)
+- `cargo test -p pod session_log_and_in_flight_snapshot_prevents_mirror_only_assistant_gap`: passed
+- `cargo test -p pod committed_assistant_snapshot_does_not_duplicate_in_flight_block`: passed
+- `cargo test -p tui snapshot_in_flight_blocks_continue_with_live_deltas`: passed
+- `cargo test -p tui`: passed (`367 passed`)
+- `cargo check -p protocol -p pod -p tui`: passed
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+
+Known unrelated validation note:
+- Full `cargo test -p pod` was not repeated in Orchestrator after merge because Reviewer confirmed it still fails only on pre-existing prompt-resource assertions unrelated to this diff。
+
+Final Orchestrator worktree status after validation: clean on `orchestration` at `b21638f5`。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-21T11:59:47Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Reviewer approval、Orchestrator worktree への統合、protocol/pod/TUI focused tests、cargo check、Ticket doctor が完了したため `done` に遷移する。
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-21T12:00:02Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-21T12:00:02Z status: closed -->
+
+## 完了
+
+In-flight LLM response 中の reconnect / late attach snapshot に unfinished blocks を含める protocol/pod/TUI 実装を統合した。
+
+主な成果:
+- `Event::Snapshot` に typed `InFlightSnapshot` / `InFlightBlock` を追加。
+- Pod 側に assistant text / thinking / tool-call args の in-flight accumulator を追加。
+- Streaming callbacks が accumulator 更新と live delta broadcast を同じ stream path で行うようにした。
+- Connect-time snapshot が in-flight stream state を含むようにした。
+- Session-log mirror snapshot と in-flight snapshot、および finalized `AssistantItem` publish/clear の critical section を揃え、mirror-only assistant commit が snapshot/live boundary で消える race を防止した。
+- Finalized assistant item が committed snapshot に含まれる場合は matching in-flight state を clear して duplicate を防ぐ。
+- TUI snapshot restore が unfinished text/thinking/tool-call args blocks を seed し、後続 live deltas が同じ logical block に continuation されるようにした。
+- Serialization/default compatibility、snapshot/live no-gap/no-duplicate、TUI continuation の focused regression tests を追加。
+
+統合・検証:
+- Merge commit: `b21638f5 merge: inflight reconnect snapshot`
+- Implementation commits: `74aca6f6`, `061136d7`
+- Reviewer final verdict: approve
+- Validation passed: `cargo fmt --all --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p protocol`, `cargo test -p pod --lib in_flight`, `cargo test -p pod session_log_and_in_flight_snapshot_prevents_mirror_only_assistant_gap`, `cargo test -p pod committed_assistant_snapshot_does_not_duplicate_in_flight_block`, `cargo test -p tui snapshot_in_flight_blocks_continue_with_live_deltas`, `cargo test -p tui`, `cargo check -p protocol -p pod -p tui`, and `cargo run -p yoi -- ticket doctor`。
+
+既知の無関係事項:
+- Full `cargo test -p pod` は既存の prompt-resource assertion 2 件で失敗することが reviewer により確認済み。この Ticket の差分とは無関係。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T12:00:31Z -->
+
+## Implementation report
+
+Post-close cleanup completed。
+
+- Stopped child Pods and reclaimed scope:
+  - `yoi-coder-00001KVMT2J25`
+  - `yoi-reviewer-00001KVMT2J25-r1`
+- Removed implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVMT2J25-inflight-snapshot`
+- Deleted implementation branch:
+  - `impl/00001KVMT2J25-inflight-snapshot`
+- Orchestrator worktree remains clean on `orchestration` at `77b5276f`。
+
+Root/original workspace was not used for merge/validation/cleanup operations。
+
+---
