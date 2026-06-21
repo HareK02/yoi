@@ -1,11 +1,13 @@
 ---
 title: 'Workspace web SPA の frontend tooling を npm/Node から Deno に移行する'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-21T10:18:10Z'
-updated_at: '2026-06-21T10:18:10Z'
+updated_at: '2026-06-21T10:56:31Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['frontend-tooling', 'packaging', 'nix-source-filter', 'validation']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-21T10:56:31Z'
 ---
 
 ## User claims / request snapshot
