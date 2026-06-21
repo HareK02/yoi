@@ -1,30 +1,69 @@
-# Workspace web SPA
+# Workspace web UI
 
-This is the static SvelteKit shell for the local Yoi Workspace control plane.
-It is intentionally a read-only UI bootstrap: `.yoi/tickets` and
-`.yoi/objectives` remain canonical, and the Rust backend owns all business/API
-semantics.
+SvelteKit static SPA for the Yoi workspace control plane.
 
-Canonical frontend tooling: Deno. Dependency versions, tasks, and the committed
-lockfile are managed by `deno.json` and `deno.lock`.
+The frontend is intentionally static. Workspace authority, validation, and API behavior live in the Rust `yoi-workspace-server` backend.
 
-`package.json` is intentionally kept only as minimal SvelteKit/Vite ecosystem
-metadata (`type: module`, private package identity). It does not define scripts
-or dependencies and is not the package-manager source of truth.
+## Development
 
-Commands:
+Use two terminals from the repository checkout.
 
-```sh
-deno install
-deno task check
+Backend terminal:
+
+```bash
+cd web/workspace
+deno task dev:backend
+```
+
+Frontend terminal:
+
+```bash
+cd web/workspace
+deno task dev
+```
+
+The Vite dev server proxies `/api/*` to `http://127.0.0.1:8787`, so frontend hot reload works while the Rust backend serves the workspace API. Open the Vite URL printed by `deno task dev`.
+
+If you want to run the backend from the repository root instead:
+
+```bash
+cargo run -p yoi-workspace-server -- serve \
+  --workspace . \
+  --db .yoi/workspace.db \
+  --listen 127.0.0.1:8787
+```
+
+## Static build served by Rust backend
+
+Build the SPA:
+
+```bash
 deno task build
 ```
 
-`deno task dev` and `deno task preview` are available for local frontend work.
-Deno uses npm compatibility for the SvelteKit/Vite toolchain, so `node_modules/`
-may be created as generated local state; do not check it in.
+Then serve the static build and API from the Rust backend:
 
-Build output is `web/workspace/build/` and is not checked in. Point the Rust
-backend `ServerConfig.static_assets_dir` at that directory (or another static
-asset directory) to serve the SPA. `node_modules/`, `.svelte-kit/`, and `build/`
-are generated local state and must remain ignored/excluded from package sources.
+```bash
+cargo run -p yoi-workspace-server -- serve \
+  --workspace ../.. \
+  --db ../../.yoi/workspace.db \
+  --frontend build \
+  --listen 127.0.0.1:8787
+```
+
+From the repository root, the equivalent command is:
+
+```bash
+cargo run -p yoi-workspace-server -- serve \
+  --workspace . \
+  --db .yoi/workspace.db \
+  --frontend web/workspace/build \
+  --listen 127.0.0.1:8787
+```
+
+## Checks
+
+```bash
+deno task check
+deno task build
+```

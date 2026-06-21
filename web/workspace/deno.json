@@ -4,6 +4,7 @@
   "tasks": {
     "install": "deno install",
     "dev": "deno run -A npm:vite@7.2.7 dev",
+    "dev:backend": "cd ../.. && cargo run -p yoi-workspace-server -- serve --workspace . --db .yoi/workspace.db --listen 127.0.0.1:8787",
     "check": "deno run -A npm:@sveltejs/kit@2.49.4 sync && deno run -A npm:svelte-check@4.3.4 --tsconfig ./tsconfig.json",
     "build": "deno run -A npm:vite@7.2.7 build",
     "preview": "deno run -A npm:vite@7.2.7 preview"
