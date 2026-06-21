@@ -186,3 +186,31 @@ Validation plan:
 Human authorized queue routing from Workspace Dashboard. Previously recorded dependency on `00001KVMG8FTW` is now satisfied because `host_api.request` is closed/integrated, and this Ticket now has implementation-ready WebSocket host API requirements. Orchestrator accepts implementation.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T11:37:01Z -->
+
+## Implementation report
+
+Implementation start report:
+
+- Created child implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVMGAEJN-plugin-websocket-host-api`
+- Created branch:
+  - `impl/00001KVMGAEJN-plugin-websocket-host-api`
+- Base commit:
+  - `3eac7f8e ticket: accept plugin websocket host api`
+- Confirmed tracked Ticket project records are visible in the child worktree。
+- Confirmed `.yoi/memory` has no tracked/untracked entries in the child worktree check。
+- Spawned sibling Coder Pod:
+  - `yoi-coder-00001KVMGAEJN`
+- Coder scope:
+  - read: `/home/hare/Projects/yoi`
+  - write: `/home/hare/Projects/yoi/.worktree/00001KVMGAEJN-plugin-websocket-host-api`
+
+Parallelization note:
+- `00001KVMT2J25` remains active in review and targets protocol/pod/TUI reconnect snapshot semantics. This Ticket should stay limited to Plugin WebSocket host API / manifest / runtime / CLI / docs / tests。
+
+Next action:
+- Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff。
+
+---
