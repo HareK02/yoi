@@ -6027,6 +6027,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "manifest",
+ "pod-store",
  "project-record",
  "rusqlite",
  "serde",

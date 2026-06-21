@@ -4,6 +4,7 @@
 //! it is not the product CLI facade. Existing `.yoi` Ticket and Objective files
 //! remain the canonical project records and are read through bounded bridge APIs.
 
+pub mod hosts;
 pub mod records;
 pub mod server;
 pub mod store;
@@ -30,6 +31,8 @@ pub enum Error {
     InvalidRecordId(String),
     #[error("record `{0}` is missing frontmatter")]
     MissingFrontmatter(String),
+    #[error("unknown local host `{0}`")]
+    UnknownHost(String),
     #[error("store error: {0}")]
     Store(String),
 }

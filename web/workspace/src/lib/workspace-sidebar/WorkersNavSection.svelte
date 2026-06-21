@@ -1,11 +1,11 @@
 <script lang="ts">
-  import type { WorkerSummary } from './types';
+  import type { ListResponse, Worker } from './types';
 
   const MAX_VISIBLE_WORKERS = 6;
 
   let loading = $state(true);
   let error = $state<string | null>(null);
-  let workers = $state<WorkerSummary[]>([]);
+  let workers = $state<Worker[]>([]);
   let placeholder = $state<string | null>(null);
 
   $effect(() => {
@@ -28,8 +28,8 @@
       if (!response.ok) {
         throw new Error(`workers request failed (${response.status})`);
       }
-      const payload = await response.json();
-      workers = normalizeWorkers(payload).slice(0, MAX_VISIBLE_WORKERS);
+      const payload = (await response.json()) as ListResponse<Worker>;
+      workers = Array.isArray(payload.items) ? payload.items.slice(0, MAX_VISIBLE_WORKERS) : [];
       if (workers.length === 0) {
         placeholder = 'No workers reported by the current API.';
       }
@@ -44,47 +44,6 @@
         loading = false;
       }
     }
-  }
-
-  function normalizeWorkers(payload: unknown): WorkerSummary[] {
-    const items = Array.isArray(payload)
-      ? payload
-      : isRecord(payload) && Array.isArray(payload.items)
-        ? payload.items
-        : [];
-
-    return items.map((item, index) => normalizeWorker(item, index));
-  }
-
-  function normalizeWorker(item: unknown, index: number): WorkerSummary {
-    if (!isRecord(item)) {
-      return {
-        id: `worker-${index + 1}`,
-        label: `worker ${index + 1}`,
-        status: 'unknown'
-      };
-    }
-
-    const id = readText(item, ['id', 'worker_id', 'name']) ?? `worker-${index + 1}`;
-    const label = readText(item, ['display_name', 'label', 'name', 'worker_id', 'id']) ?? id;
-    const status = readText(item, ['status', 'state', 'lifecycle']) ?? 'unknown';
-    const detail = readText(item, ['role', 'profile', 'note']);
-
-    return { id, label, status, detail };
-  }
-
-  function readText(record: Record<string, unknown>, keys: string[]): string | null {
-    for (const key of keys) {
-      const value = record[key];
-      if (typeof value === 'string' && value.trim().length > 0) {
-        return value;
-      }
-    }
-    return null;
-  }
-
-  function isRecord(value: unknown): value is Record<string, unknown> {
-    return typeof value === 'object' && value !== null;
   }
 </script>
 
@@ -104,11 +63,11 @@
     <p class="section-state">{placeholder ?? 'Workers will appear here when an API is connected.'}</p>
   {:else}
     <ul class="nav-list" aria-label="Workers">
-      {#each workers as worker (worker.id)}
+      {#each workers as worker (worker.worker_id)}
         <li class="nav-item">
           <span class="item-title">{worker.label}</span>
           <span class="item-meta">
-            {worker.status}{worker.detail ? ` · ${worker.detail}` : ''}
+            {worker.state} · {worker.status}{worker.role ? ` · ${worker.role}` : ''}
           </span>
         </li>
       {/each}

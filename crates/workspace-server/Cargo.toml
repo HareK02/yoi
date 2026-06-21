@@ -8,6 +8,8 @@ publish = false
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true
+manifest = { workspace = true }
+pod-store = { workspace = true }
 project-record.workspace = true
 rusqlite.workspace = true
 serde = { workspace = true, features = ["derive"] }

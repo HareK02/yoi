@@ -107,3 +107,31 @@ Validation plan:
 Human authorized queue routing from Workspace Dashboard. Ticket has concrete frontend acceptance criteria and no blocking relation; related Host/Worker API work is in review and creates merge-conflict risk but not an authority blocker. Orchestrator accepts implementation with narrow frontend scope.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T16:37:34Z -->
+
+## Implementation report
+
+Implementation start report:
+
+- Created child implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVNG9B9Z-workspace-sidebar`
+- Created branch:
+  - `impl/00001KVNG9B9Z-workspace-sidebar`
+- Base commit:
+  - `2c7ef24a ticket: accept workspace sidebar ui`
+- Confirmed tracked Ticket project records are visible in the child worktree。
+- Confirmed `.yoi/memory` has no tracked/untracked entries in the child worktree check。
+- Spawned sibling Coder Pod:
+  - `yoi-coder-00001KVNG9B9Z`
+- Coder scope:
+  - read: `/home/hare/Projects/yoi`
+  - write: `/home/hare/Projects/yoi/.worktree/00001KVNG9B9Z-workspace-sidebar`
+
+Parallelization note:
+- `00001KVNEKH9Q` remains active in review and may merge Host/Worker API plus `web/workspace/src/routes/+page.svelte` changes. Coder was instructed to keep sidebar work narrow/componentized and report if conflicts become non-trivial。
+
+Next action:
+- Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff。
+
+---

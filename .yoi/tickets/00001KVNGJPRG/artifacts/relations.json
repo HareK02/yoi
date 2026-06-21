@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KVNGJPRG",
+      "kind": "related",
+      "target": "00001KVMFFYVX",
+      "note": "Extends workspace web bootstrap with repository/objective pages",
+      "author": "yoi ticket",
+      "at": "2026-06-21T16:36:06Z"
+    },
+    {
+      "ticket_id": "00001KVNGJPRG",
+      "kind": "related",
+      "target": "00001KVNG9B9Z",
+      "note": "Sidebar navigation should link to repository and objective pages",
+      "author": "yoi ticket",
+      "at": "2026-06-21T16:36:06Z"
+    }
+  ]
+}
