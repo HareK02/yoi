@@ -324,3 +324,74 @@ Reviewer focus:
 Orchestrator will wait for reviewer verdict before integration。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVMGAEJN-r1 at: 2026-06-21T12:43:06Z status: request_changes -->
+
+## Review: request changes
+
+Verdict: `request_changes`
+
+確認範囲:
+- Diff `3eac7f8e..ce62d235` in worktree `/home/hare/Projects/yoi/.worktree/00001KVMGAEJN-plugin-websocket-host-api`:
+  - `Cargo.lock`
+  - `crates/manifest/src/plugin.rs`
+  - `crates/pod/Cargo.toml`
+  - `crates/pod/src/feature/plugin.rs`
+  - `crates/pod/src/pod.rs`
+  - `crates/yoi/src/plugin_cli.rs`
+  - `docs/development/plugin-development.md`
+  - `package.nix`
+  - `resources/plugin/wit/deps/yoi-host/yoi-host-v1.wit`
+  - `resources/plugin/wit/yoi-plugin-instance-v1.wit`
+  - `resources/plugin/wit/yoi-plugin-tool-v1.wit`
+- Ticket authority:
+  - `.yoi/tickets/00001KVMGAEJN/item.md`
+  - `.yoi/tickets/00001KVMGAEJN/thread.md`
+
+Blocking issue:
+
+1. WebSocket open が実際には bounded / cancellable ではなく、open-connection limit も network I/O 後にしか適用されていない。
+
+Evidence:
+- `crates/pod/src/feature/plugin.rs:922-931`
+  - `execute_plugin_websocket_open` は URL/grant validation 後に `client.open(...)` を呼び、その後で handle table に insert している。
+- `crates/pod/src/feature/plugin.rs:2536-2558`
+  - `TungstenitePluginWebSocketClient::open` は最初に `tungstenite::client::connect_with_config(...)` を呼ぶ。
+  - `set_system_websocket_timeouts(...)` は connection established 後にしか呼ばれない。
+- `crates/pod/src/feature/plugin.rs:2687-2698`
+  - `PLUGIN_WEBSOCKET_MAX_OPEN_CONNECTIONS` は `PluginWebSocketHandleTable::insert` 内で check されるため、`client.open(...)` 完了後、つまり network I/O 後にしか適用されない。
+
+Implications:
+- DNS/TCP/TLS/WebSocket handshake が Yoi の WebSocket timeout 適用前に OS/library behavior に従って block し得る。
+- `PLUGIN_WASM_TIMEOUT` wrapper は plugin Tool execution に timeout を返すが、spawned blocking task の open 自体は cancel しないため background で継続し得る。
+- handle table が満杯でも、新しい outbound WebSocket connection を開いた後で reject するため、max open connections の resource-bound intent を破り、意図しない network side effect が発生し得る。
+
+Why this blocks:
+- Ticket は WebSocket API に bounded handle lifetime、max open connections、timeout/cancellation behavior、cleanup を要求している。
+- capacity / timeout / cancellation の enforcement が network I/O 前に fail closed していないため、この acceptance criteria を満たしていない。
+
+Required fix:
+- Network I/O 前に capacity を reserve/check する。
+- Open path を bounded/cancellable にする、または bound を保証できない場合は dialing 前に fail closed する。
+- Timeout/cancellation/resource-bound semantics を tests で固定する。
+
+Non-blocking concerns:
+- WebSocket host API は component/tool WIT surface に追加され、raw helper path tests はあるが、「long-lived WebSocket connection を Tool call 内に隠さず Plugin instance/Service lifecycle として扱う」という Ticket invariant を pin する integration test/diagnostic は見当たらなかった。現行 Plugin instance が Tool/Service state を共有するなら許容可能だが、lifecycle boundary の regression test/diagnostic があるとより明確。
+- `close_all` / drop cleanup と component `stop` cleanup はあるが、active blocking host calls は blocking operation が戻るまで handle-table mutex を保持し得る。これは open timeout/cancellation blocker の副次的問題。
+
+Reviewer validation:
+- `cargo fmt --check`: passed
+- `git diff --check 3eac7f8e..HEAD`: passed
+- `cargo test -p manifest websocket`: passed
+- `cargo test -p pod websocket`: passed, 6 focused pod WebSocket tests
+- `cargo test -p yoi render_show_distinguishes_request_grant_statuses_and_broad_targets`: passed
+- `cargo test -p manifest request_host_api_manifest_and_grant_parse_with_request_names`: passed
+- `cargo check -p manifest -p pod -p yoi`: passed
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed; reviewer did not reproduce earlier disk-space failure。
+- Boundary/stale grep over docs/resources/manifest/pod/yoi CLI for `host_api.request`, `host_api.websocket`, WebSocket/SSE, hidden context/history, Dashboard/Ticket/Discord/reconnect terms found no hidden context injection, Ticket mutation, Dashboard channel, reconnect daemon, or Discord-specific overreach in inspected changes。
+
+Worktree status:
+- Clean on `impl/00001KVMGAEJN-plugin-websocket-host-api`。
+
+---
