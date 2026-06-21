@@ -127,3 +127,28 @@ Critical risks / reviewer focus:
 Human authorized queue routing from Workspace Dashboard. Ticket has concrete acceptance criteria and no recorded blockers, so Orchestrator accepts implementation and will create a child implementation worktree before spawning sibling Coder/Reviewer roles.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T07:15:03Z -->
+
+## Implementation report
+
+Implementation start report:
+
+- Created child implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVMFFYVX-workspace-web-control-plane`
+- Created branch:
+  - `impl/00001KVMFFYVX-workspace-web-control-plane`
+- Base commit:
+  - `1d27f6c9 ticket: accept workspace web control plane`
+- Confirmed tracked Ticket project records are visible in the child worktree。
+- Confirmed `.yoi/memory` has no tracked/untracked entries in the child worktree check。
+- Spawned sibling Coder Pod:
+  - `yoi-coder-00001KVMFFYVX`
+- Coder scope:
+  - read: `/home/hare/Projects/yoi`
+  - write: `/home/hare/Projects/yoi/.worktree/00001KVMFFYVX-workspace-web-control-plane`
+
+Next action:
+- Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff. Orchestrator will not merge/close until reviewer approval and validation evidence are available。
+
+---

@@ -2,7 +2,7 @@
 title: 'Workspace web control plane bootstrap'
 state: 'inprogress'
 created_at: '2026-06-21T06:57:06Z'
-updated_at: '2026-06-21T07:13:37Z'
+updated_at: '2026-06-21T07:15:03Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-21T07:11:58Z'
