@@ -50,14 +50,6 @@ CREATE TABLE IF NOT EXISTS objective_projections (
     PRIMARY KEY (workspace_id, objective_id)
 );
 
-CREATE TABLE IF NOT EXISTS runners (
-    runner_id TEXT PRIMARY KEY,
-    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
-    label TEXT NOT NULL,
-    status TEXT NOT NULL,
-    last_seen_at TEXT
-);
-
 CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
@@ -106,22 +98,12 @@ pub struct RunSummary {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RunnerSummary {
-    pub runner_id: String,
-    pub workspace_id: String,
-    pub label: String,
-    pub status: String,
-    pub last_seen_at: Option<String>,
-}
-
 #[async_trait]
 pub trait ControlPlaneStore: Send + Sync {
     async fn schema_version(&self) -> Result<i64>;
     async fn upsert_workspace(&self, record: &WorkspaceRecord) -> Result<()>;
     async fn get_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceRecord>>;
     async fn list_runs(&self, workspace_id: &str, limit: usize) -> Result<Vec<RunSummary>>;
-    async fn list_runners(&self, workspace_id: &str, limit: usize) -> Result<Vec<RunnerSummary>>;
 }
 
 #[derive(Clone)]
@@ -229,27 +211,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Error::from)
         })
     }
-
-    async fn list_runners(&self, workspace_id: &str, limit: usize) -> Result<Vec<RunnerSummary>> {
-        self.with_conn(|conn| {
-            let limit = limit.min(200) as i64;
-            let mut stmt = conn.prepare(
-                r#"SELECT runner_id, workspace_id, label, status, last_seen_at
-                   FROM runners WHERE workspace_id = ?1 ORDER BY runner_id ASC LIMIT ?2"#,
-            )?;
-            let rows = stmt.query_map(params![workspace_id, limit], |row| {
-                Ok(RunnerSummary {
-                    runner_id: row.get(0)?,
-                    workspace_id: row.get(1)?,
-                    label: row.get(2)?,
-                    status: row.get(3)?,
-                    last_seen_at: row.get(4)?,
-                })
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(Error::from)
-        })
-    }
 }
 
 fn configure_sqlite(conn: &Connection) -> Result<()> {
@@ -326,13 +287,6 @@ mod tests {
         assert!(
             reopened
                 .list_runs("local-dev", 20)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            reopened
-                .list_runners("local-dev", 20)
                 .await
                 .unwrap()
                 .is_empty()

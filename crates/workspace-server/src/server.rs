@@ -10,8 +10,9 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
+use crate::hosts::{HostSummary, LocalRuntimeBridge, RuntimeDiagnostic, WorkerSummary};
 use crate::records::{LocalProjectRecordReader, ObjectiveDetail, ProjectRecordList, TicketDetail};
-use crate::store::{ControlPlaneStore, RunSummary, RunnerSummary, WorkspaceRecord};
+use crate::store::{ControlPlaneStore, RunSummary, WorkspaceRecord};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,6 +29,7 @@ pub struct ServerConfig {
     pub static_assets_dir: Option<PathBuf>,
     pub auth: AuthConfig,
     pub max_records: usize,
+    pub local_runtime_data_dir: Option<PathBuf>,
 }
 
 impl ServerConfig {
@@ -45,6 +47,7 @@ impl ServerConfig {
                 token_configured: false,
             },
             max_records: 200,
+            local_runtime_data_dir: manifest::paths::data_dir(),
         }
     }
 }
@@ -84,6 +87,14 @@ impl WorkspaceApi {
     pub fn workspace_id(&self) -> &str {
         self.config.workspace_id.as_str()
     }
+
+    fn local_runtime_bridge(&self) -> LocalRuntimeBridge {
+        LocalRuntimeBridge::new(
+            self.config.workspace_id.clone(),
+            self.config.workspace_root.clone(),
+            self.config.local_runtime_data_dir.clone(),
+        )
+    }
 }
 
 pub fn build_router(api: WorkspaceApi) -> Router {
@@ -94,7 +105,9 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route("/api/objectives", get(list_objectives))
         .route("/api/objectives/{id}", get(get_objective))
         .route("/api/runs", get(list_runs))
-        .route("/api/runners", get(list_runners))
+        .route("/api/hosts", get(list_hosts))
+        .route("/api/workers", get(list_workers))
+        .route("/api/hosts/{host_id}/workers", get(list_host_workers))
         .fallback(get(static_or_spa_fallback))
         .with_state(api)
 }
@@ -124,7 +137,7 @@ pub struct WorkspaceResponse {
 pub struct ExtensionPoints {
     pub store: String,
     pub event_stream: ExtensionPointState,
-    pub runner_connection: ExtensionPointState,
+    pub host_worker_bridge: ExtensionPointState,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -148,6 +161,7 @@ pub struct RuntimeListResponse<T> {
     pub limit: usize,
     pub items: Vec<T>,
     pub source: String,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
 async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<WorkspaceResponse>> {
@@ -177,9 +191,9 @@ async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<Worksp
                 status: "reserved".to_string(),
                 note: "No event stream is exposed in this bootstrap; route/state seams are reserved.".to_string(),
             },
-            runner_connection: ExtensionPointState {
-                status: "reserved".to_string(),
-                note: "Runner connections are modeled, but no job dispatch or scheduler is implemented.".to_string(),
+            host_worker_bridge: ExtensionPointState {
+                status: "read_only_local".to_string(),
+                note: "Local Hosts and Workers are exposed as a read-only bridge over existing Pod metadata; no scheduling or lifecycle control is implemented.".to_string(),
             },
         },
     }))
@@ -245,20 +259,53 @@ async fn list_runs(
         limit,
         items,
         source: "sqlite_runtime_tables".to_string(),
+        diagnostics: Vec::new(),
     }))
 }
 
-async fn list_runners(
+async fn list_hosts(
     State(api): State<WorkspaceApi>,
-) -> ApiResult<Json<RuntimeListResponse<RunnerSummary>>> {
+) -> ApiResult<Json<RuntimeListResponse<HostSummary>>> {
     let limit = api.config.max_records.min(200);
-    let items = api.store.list_runners(api.workspace_id(), limit).await?;
+    let bridge = api.local_runtime_bridge();
+    let (items, diagnostics) = bridge.list_hosts(limit);
     Ok(Json(RuntimeListResponse {
         workspace_id: api.config.workspace_id,
         limit,
         items,
-        source: "sqlite_runtime_tables".to_string(),
+        source: "local_pod_metadata".to_string(),
+        diagnostics,
     }))
+}
+
+async fn list_workers(
+    State(api): State<WorkspaceApi>,
+) -> ApiResult<Json<RuntimeListResponse<WorkerSummary>>> {
+    workers_response(api).map(Json)
+}
+
+async fn list_host_workers(
+    State(api): State<WorkspaceApi>,
+    AxumPath(host_id): AxumPath<String>,
+) -> ApiResult<Json<RuntimeListResponse<WorkerSummary>>> {
+    let bridge = api.local_runtime_bridge();
+    if host_id != bridge.host_id() {
+        return Err(Error::UnknownHost(host_id).into());
+    }
+    workers_response(api).map(Json)
+}
+
+fn workers_response(api: WorkspaceApi) -> ApiResult<RuntimeListResponse<WorkerSummary>> {
+    let limit = api.config.max_records.min(200);
+    let bridge = api.local_runtime_bridge();
+    let (items, diagnostics) = bridge.list_workers(limit);
+    Ok(RuntimeListResponse {
+        workspace_id: api.config.workspace_id,
+        limit,
+        items,
+        source: "local_pod_metadata".to_string(),
+        diagnostics,
+    })
 }
 
 async fn static_or_spa_fallback(State(api): State<WorkspaceApi>, uri: Uri) -> Response {
@@ -360,7 +407,9 @@ impl From<Error> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.0 {
-            Error::InvalidRecordId(_) | Error::MissingFrontmatter(_) => StatusCode::NOT_FOUND,
+            Error::InvalidRecordId(_) | Error::MissingFrontmatter(_) | Error::UnknownHost(_) => {
+                StatusCode::NOT_FOUND
+            }
             Error::Ticket(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -401,6 +450,7 @@ mod tests {
         let mut config = ServerConfig::local_dev(dir.path());
         config.workspace_id = "local:test".to_string();
         config.static_assets_dir = Some(static_dir);
+        config.local_runtime_data_dir = Some(dir.path().join("data"));
         let api = WorkspaceApi::new(config, Arc::new(store)).await.unwrap();
         let app = build_router(api);
 
@@ -408,8 +458,8 @@ mod tests {
         assert_eq!(workspace["workspace_id"], "local:test");
         assert_eq!(workspace["record_authority"], "local_yoi_project_records");
         assert_eq!(
-            workspace["extension_points"]["runner_connection"]["status"],
-            "reserved"
+            workspace["extension_points"]["host_worker_bridge"]["status"],
+            "read_only_local"
         );
 
         let tickets = get_json(app.clone(), "/api/tickets").await;
@@ -419,8 +469,35 @@ mod tests {
         let objectives = get_json(app.clone(), "/api/objectives").await;
         assert_eq!(objectives["items"][0]["id"], "00000000001J3");
 
-        let runners = get_json(app.clone(), "/api/runners").await;
-        assert!(runners["items"].as_array().unwrap().is_empty());
+        let hosts = get_json(app.clone(), "/api/hosts").await;
+        assert_eq!(hosts["items"][0]["host_id"], "local-local-test");
+        assert_eq!(hosts["items"][0]["kind"], "local_host");
+        assert_eq!(
+            hosts["items"][0]["capabilities"]["local_pod_inspection"],
+            "unavailable"
+        );
+
+        let workers = get_json(app.clone(), "/api/workers").await;
+        assert!(workers["items"].as_array().unwrap().is_empty());
+        assert_eq!(
+            workers["diagnostics"][0]["code"],
+            "local_pod_metadata_root_missing"
+        );
+
+        let host_workers = get_json(app.clone(), "/api/hosts/local-local-test/workers").await;
+        assert!(host_workers["items"].as_array().unwrap().is_empty());
+
+        let runners_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runners")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runners_response.status(), StatusCode::NOT_FOUND);
 
         let static_response = app
             .clone()
