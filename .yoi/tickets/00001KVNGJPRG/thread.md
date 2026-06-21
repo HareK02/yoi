@@ -238,3 +238,69 @@ Reviewer focus:
 Orchestrator will wait for reviewer verdict before integration。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVNGJPRG-r1 at: 2026-06-21T17:30:09Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket authority:
+  - `.yoi/tickets/00001KVNGJPRG/item.md`
+  - `.yoi/tickets/00001KVNGJPRG/thread.md`
+- Diff `0f7e78c1..ceb1ee3b`:
+  - `crates/workspace-server/src/lib.rs`
+  - `crates/workspace-server/src/records.rs`
+  - `crates/workspace-server/src/repositories.rs`
+  - `crates/workspace-server/src/server.rs`
+  - `web/workspace/src/lib/workspace-sidebar/ObjectivesNavSection.svelte`
+  - `web/workspace/src/lib/workspace-sidebar/RepositoriesNavSection.svelte`
+  - `web/workspace/src/lib/workspace-sidebar/types.ts`
+  - `web/workspace/src/routes/+page.svelte`
+
+Blocking issues:
+- None found。
+
+Acceptance verification:
+- Repository APIs are read-only `GET` routes only。
+- Git commands use fixed argument vectors through `Command::new("git").arg("-C").arg(workspace_root).args(args)`; no shell interpolation。
+- Git summary/log is bounded:
+  - log limit clamps to `1..=50`
+  - command output capped at `4096`
+  - fields capped at `240`, hash at `40`
+  - no diff/patch/file content/blame/config commands are used。
+- Remote URL summary strips URL-scheme userinfo and marks `redacted`。
+- Non-Git workspaces return `git.status = "unavailable"` plus diagnostics rather than failing the Repository page model。
+- Ticket Kanban reads filesystem Ticket summaries and groups by state; no Ticket mutation route/UI was added。
+- Objective list continues to use filesystem read-through `/api/objectives`; no Objective mutation/API authority added。
+- Frontend remains static SPA/hash navigation; no SSR/business authority introduced。
+- Nix build succeeds with the new Rust source file。
+
+Non-blocking concerns:
+- `ObjectivesNavSection.svelte` only shows the “All objectives” sidebar link when objectives are successfully loaded and non-empty. In an empty/error state, the page is still reachable from hero links, but the sidebar itself does not provide a stable top-level Objectives link. Consider keeping `#/objectives` visible in all non-loading states in a follow-up。
+- Remote sanitization removes URL-scheme userinfo, but does not attempt query-param or SCP-like token redaction. Acceptable for the initial bounded summary, but worth tightening if remote URLs may include local secret-bearing config。
+
+Reviewer validation:
+- `cargo fmt --check`: passed
+- `git diff --check 0f7e78c1..HEAD`: passed
+- `cargo test -p yoi-workspace-server`: passed (`8 passed`)
+- `cargo check -p yoi-workspace-server`: passed
+- `cd web/workspace && deno task check`: passed (`svelte-check found 0 errors and 0 warnings`)
+- `cd web/workspace && deno task build`: passed
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+
+Generated artifacts:
+- Reviewer did not clean generated ignored artifacts after validation。
+- Ignored generated artifacts present:
+  - `target/`
+  - `web/workspace/.svelte-kit/`
+  - `web/workspace/build/`
+  - `web/workspace/node_modules/`
+- No untracked non-ignored files。
+
+Worktree status:
+- Clean tracked/non-ignored state on `impl/00001KVNGJPRG-repository-objective-pages` at `ceb1ee3b`。
+
+---
