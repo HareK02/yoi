@@ -182,3 +182,37 @@ Next action:
 - Route to read-only Reviewer Pod for acceptance review。
 
 ---
+
+<!-- event: comment author: yoi-orchestrator at: 2026-06-21T16:54:49Z -->
+
+## Comment
+
+Review routing:
+
+Spawned read-only Reviewer Pod:
+- `yoi-reviewer-00001KVNG9B9Z-r1`
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVNG9B9Z-workspace-sidebar`
+- Branch: `impl/00001KVNG9B9Z-workspace-sidebar`
+- Current implementation HEAD: `4ab696b4`
+- Implementation commits:
+  - `d3b8bdfd feat: add workspace sidebar skeleton`
+  - `4ab696b4` merge/conflict-resolution commit from current `orchestration`
+- Primary review diff: `orchestration..HEAD` inside implementation worktree, so review sees final sidebar changes on top of current Host/Worker API/UI state。
+
+Reviewer scope:
+- read-only `/home/hare/Projects/yoi`
+
+Reviewer focus:
+- Sidebar visibility/layout/responsive behavior。
+- Workspace header/settings placeholder。
+- Repositories/objectives/workers sections。
+- Objective and worker section bounded loading/empty/error handling。
+- Worker naming avoids Pod-primary UI。
+- Main Host/Worker content from `00001KVNEKH9Q` remains preserved after conflict resolution。
+- No backend authority/SSR/business logic changes。
+
+Orchestrator will wait for reviewer verdict before integration。
+
+---
