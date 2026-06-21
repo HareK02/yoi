@@ -292,7 +292,7 @@ fn inspect_materialized_package(
             )),
             digest: Some(materialized.package.digest.clone()),
             permissions: requested_permissions,
-            https: Vec::new(),
+            request: Vec::new(),
             fs: Vec::new(),
         },
         config: None,
@@ -723,7 +723,7 @@ fn render_show(reference: &str, args: &PluginCliArgs) -> Result<String> {
         return Ok(format!("{}\n", serde_json::to_string_pretty(item)?));
     }
 
-    render_item_human(item)
+    render_item_human(&item)
 }
 
 fn render_item_human(item: &PluginInspectionItem) -> Result<String> {
@@ -799,8 +799,8 @@ fn render_item_human(item: &PluginInspectionItem) -> Result<String> {
     )?;
     writeln!(
         out,
-        "  configured_https_grants: {}",
-        join_or_none(&item.configured_https_grants)
+        "  configured_request_grants: {}",
+        join_or_none(&item.configured_request_grants)
     )?;
     writeln!(
         out,
@@ -976,7 +976,7 @@ fn snapshot_from_resolution(
         builder.configured = true;
         builder.enabled_surfaces = surface_strings(enablement.surfaces.iter().copied());
         builder.configured_grants = permission_strings(&enablement.grants.permissions);
-        builder.configured_https_grants = https_grant_strings(&enablement.grants.https);
+        builder.configured_request_grants = request_grant_strings(&enablement.grants.request);
         builder.configured_fs_grants = fs_grant_strings(&enablement.grants.fs);
         if let Ok(identity) = SourceQualifiedPluginId::parse(&enablement.id) {
             builder
@@ -1069,7 +1069,7 @@ fn fill_resolved(builder: &mut ItemBuilder, resolved: &ResolvedPlugin) {
     builder.enabled_surfaces = surface_strings(resolved.enabled_surfaces.iter().copied());
     builder.requested_permissions = permission_strings(&resolved.manifest.permissions);
     builder.configured_grants = permission_strings(&resolved.grants.permissions);
-    builder.configured_https_grants = https_grant_strings(&resolved.grants.https);
+    builder.configured_request_grants = request_grant_strings(&resolved.grants.request);
     builder.configured_fs_grants = fs_grant_strings(&resolved.grants.fs);
 
     let record = ResolvedPluginRecord::from_resolved(resolved);
@@ -1178,7 +1178,7 @@ fn permission_strings(permissions: &[PluginPermission]) -> Vec<String> {
     values
 }
 
-fn https_grant_strings(grants: &[manifest::plugin::PluginHttpsGrant]) -> Vec<String> {
+fn request_grant_strings(grants: &[manifest::plugin::PluginRequestGrant]) -> Vec<String> {
     let mut values: Vec<_> = grants.iter().map(|grant| grant.label()).collect();
     values.sort();
     values.dedup();
@@ -1262,7 +1262,7 @@ struct PluginInspectionItem {
     enabled_surfaces: Vec<String>,
     requested_permissions: Vec<String>,
     configured_grants: Vec<String>,
-    configured_https_grants: Vec<String>,
+    configured_request_grants: Vec<String>,
     configured_fs_grants: Vec<String>,
     tools: Vec<ToolSummary>,
     static_runtime: Option<PluginStaticInspection>,
@@ -1331,7 +1331,7 @@ struct ItemBuilder {
     enabled_surfaces: Vec<String>,
     requested_permissions: Vec<String>,
     configured_grants: Vec<String>,
-    configured_https_grants: Vec<String>,
+    configured_request_grants: Vec<String>,
     configured_fs_grants: Vec<String>,
     tools: Vec<ToolSummary>,
     static_runtime: Option<PluginStaticInspection>,
@@ -1358,7 +1358,7 @@ impl ItemBuilder {
             enabled_surfaces: Vec::new(),
             requested_permissions: Vec::new(),
             configured_grants: Vec::new(),
-            configured_https_grants: Vec::new(),
+            configured_request_grants: Vec::new(),
             configured_fs_grants: Vec::new(),
             tools: Vec::new(),
             static_runtime: None,
@@ -1430,7 +1430,7 @@ impl ItemBuilder {
             enabled_surfaces: self.enabled_surfaces,
             requested_permissions: self.requested_permissions,
             configured_grants: self.configured_grants,
-            configured_https_grants: self.configured_https_grants,
+            configured_request_grants: self.configured_request_grants,
             configured_fs_grants: self.configured_fs_grants,
             tools: self.tools,
             static_runtime: self.static_runtime,
@@ -1443,6 +1443,7 @@ impl ItemBuilder {
 mod tests {
     use super::*;
     use manifest::plugin::{PluginEnablementConfig, PluginExactVersion, PluginGrantConfig};
+    use pod::feature::plugin::{PluginPermissionEligibility, PluginRuntimeEligibility};
     use tempfile::tempdir;
 
     #[test]
@@ -1494,13 +1495,85 @@ mod tests {
         assert_eq!(show_json["configured_grants"][0], "surfaces.tool");
         assert_eq!(show_json["tools"][0]["permission"], "tool.Echo");
 
-        let show = render_item_human(item).unwrap();
+        let show = render_item_human(&item).unwrap();
         assert!(show.contains("status: active"));
         assert!(show.contains("schema_version: 1"));
         assert!(show.contains("api_version: 1"));
         assert!(show.contains("package_path:"));
         assert!(show.contains("echo.yoi-plugin"));
         assert!(show.contains("configured_grants: surfaces.tool, tool.Echo"));
+    }
+
+    #[test]
+    fn render_show_distinguishes_request_grant_statuses_and_broad_targets() {
+        let item = PluginInspectionItem {
+            reference: "project:req".to_string(),
+            local_ref: Some("project:req".to_string()),
+            status: "configured".to_string(),
+            source: Some("project".to_string()),
+            package: Some("req".to_string()),
+            package_path: None,
+            version: Some("0.1.0".to_string()),
+            schema_version: Some(1),
+            api_version: Some(1),
+            digest: None,
+            configured: true,
+            discovered: true,
+            resolved: true,
+            static_eligible: true,
+            declared_surfaces: vec!["tool".to_string()],
+            enabled_surfaces: vec!["tool".to_string()],
+            requested_permissions: vec!["host_api.request".to_string()],
+            configured_grants: vec!["host_api.request".to_string()],
+            configured_request_grants: vec!["*://* GET * [broad-request]".to_string()],
+            configured_fs_grants: Vec::new(),
+            tools: Vec::new(),
+            static_runtime: Some(PluginStaticInspection {
+                runtime: PluginRuntimeEligibility {
+                    eligible: true,
+                    status: "component".to_string(),
+                    diagnostic: None,
+                },
+                host_apis: vec![
+                    PluginPermissionEligibility {
+                        permission: "host_api.request target https://api.example.test GET /v1/"
+                            .to_string(),
+                        requested: true,
+                        granted: true,
+                        eligible: true,
+                        diagnostic: Some(
+                            "covered by broad/arbitrary enabled request grant".to_string(),
+                        ),
+                    },
+                    PluginPermissionEligibility {
+                        permission: "host_api.request grant *://* GET * [broad-request]"
+                            .to_string(),
+                        requested: true,
+                        granted: true,
+                        eligible: true,
+                        diagnostic: Some(
+                            "broad/arbitrary enabled request grant is constrained by manifest declarations"
+                                .to_string(),
+                        ),
+                    },
+                ],
+                tools: Vec::new(),
+                services: Vec::new(),
+                ingresses: Vec::new(),
+            }),
+            diagnostics: Vec::new(),
+        };
+
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(
+            json["configured_request_grants"][0],
+            "*://* GET * [broad-request]"
+        );
+        let human = render_item_human(&item).unwrap();
+        assert!(human.contains("host_api.request target https://api.example.test"));
+        assert!(human.contains("requested=true granted=true eligible=true"));
+        assert!(human.contains("host_api.request grant *://*"));
+        assert!(human.contains("broad/arbitrary"));
     }
 
     #[test]
@@ -1522,7 +1595,7 @@ mod tests {
                     PluginPermission::surface(PluginSurface::Service),
                     PluginPermission::service("svc"),
                 ],
-                https: Vec::new(),
+                request: Vec::new(),
                 fs: Vec::new(),
             },
             config: None,
@@ -1576,7 +1649,7 @@ mod tests {
                     PluginPermission::surface(PluginSurface::Tool),
                     PluginPermission::tool("Echo"),
                 ],
-                https: Vec::new(),
+                request: Vec::new(),
                 fs: Vec::new(),
             },
             config: None,
@@ -1594,7 +1667,7 @@ mod tests {
                     PluginPermission::surface(PluginSurface::Tool),
                     PluginPermission::tool("Echo"),
                 ],
-                https: Vec::new(),
+                request: Vec::new(),
                 fs: Vec::new(),
             },
             config: None,
@@ -1712,7 +1785,7 @@ mod tests {
                     PluginPermission::surface(PluginSurface::Tool),
                     PluginPermission::tool("Echo"),
                 ],
-                https: Vec::new(),
+                request: Vec::new(),
                 fs: Vec::new(),
             },
             config: None,
@@ -2247,7 +2320,7 @@ lifecycle = "host-managed"
                         PluginPermission::surface(PluginSurface::Tool),
                         PluginPermission::tool("Echo"),
                     ],
-                    https: Vec::new(),
+                    request: Vec::new(),
                     fs: Vec::new(),
                 },
                 config: None,
@@ -2278,7 +2351,7 @@ lifecycle = "host-managed"
                 version: Some(PluginExactVersion(version.to_string())),
                 digest: Some(digest),
                 permissions,
-                https: Vec::new(),
+                request: Vec::new(),
                 fs: Vec::new(),
             },
             config: None,
@@ -2306,7 +2379,7 @@ lifecycle = "host-managed"
                 version: Some(PluginExactVersion(version.to_string())),
                 digest: None,
                 permissions,
-                https: Vec::new(),
+                request: Vec::new(),
                 fs: Vec::new(),
             },
             config: None,

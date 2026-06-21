@@ -5378,6 +5378,7 @@ permission = "read"
                 services: vec![],
                 ingresses: vec![],
                 permissions: vec![],
+                request: vec![],
             },
             enabled_surfaces: vec![manifest::plugin::PluginSurface::Hook],
             grants: manifest::plugin::PluginGrantConfig::default(),

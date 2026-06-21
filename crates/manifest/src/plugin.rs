@@ -150,15 +150,15 @@ pub struct PluginGrantConfig {
     pub digest: Option<String>,
     /// Explicit capabilities granted for the pinned package identity/version/digest.
     pub permissions: Vec<PluginPermission>,
-    /// Bounded outbound HTTPS allowlist entries for `host_api.https`.
-    pub https: Vec<PluginHttpsGrant>,
+    /// Bounded outbound request allowlist entries for `host_api.request`.
+    pub request: Vec<PluginRequestGrant>,
     /// Scoped filesystem allowlist entries for `host_api.fs`.
     pub fs: Vec<PluginFsGrant>,
 }
 
 impl PluginGrantConfig {
     pub fn is_empty(&self) -> bool {
-        self.permissions.is_empty() && self.https.is_empty() && self.fs.is_empty()
+        self.permissions.is_empty() && self.request.is_empty() && self.fs.is_empty()
     }
 
     pub fn binding_error(
@@ -212,17 +212,32 @@ pub enum PluginPermission {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct PluginHttpsGrant {
-    /// Exact HTTPS request host allowed by this grant. Wildcards are intentionally unsupported.
+pub struct PluginRequestGrant {
+    /// Exact URL scheme allowed by this target, for example `https` or `http`; `*` is broad.
+    pub scheme: String,
+    /// Exact request host allowed by this target. `*` is broad and must be surfaced in diagnostics.
     pub host: String,
-    /// Uppercase HTTP methods allowed for this host, for example `GET` or `POST`.
+    /// Optional exact port. `None` means the scheme default or any explicit port for that host.
+    pub port: Option<u16>,
+    /// Uppercase HTTP methods allowed for this target, for example `GET` or `POST`.
     pub methods: Vec<String>,
-    /// Optional path prefixes allowed for this host. Empty means any absolute path on the host.
+    /// Optional path prefixes allowed for this target. Empty means any absolute path on the host.
     pub path_prefixes: Vec<String>,
 }
 
-impl PluginHttpsGrant {
+impl PluginRequestGrant {
     pub fn label(&self) -> String {
+        let scheme = if self.scheme.trim().is_empty() {
+            "<no-scheme>"
+        } else {
+            self.scheme.as_str()
+        };
+        let host = if self.host.trim().is_empty() {
+            "<no-host>"
+        } else {
+            self.host.as_str()
+        };
+        let port = self.port.map(|port| format!(":{port}")).unwrap_or_default();
         let methods = if self.methods.is_empty() {
             "<no-methods>".to_string()
         } else {
@@ -233,7 +248,16 @@ impl PluginHttpsGrant {
         } else {
             self.path_prefixes.join(",")
         };
-        format!("{} {} {}", self.host, methods, paths)
+        let broad = if self.is_broad() {
+            " [broad-request]"
+        } else {
+            ""
+        };
+        format!("{scheme}://{host}{port} {methods} {paths}{broad}")
+    }
+
+    pub fn is_broad(&self) -> bool {
+        self.scheme.trim() == "*" || self.host.trim() == "*" || self.path_prefixes.is_empty()
     }
 }
 
@@ -322,14 +346,14 @@ impl PluginPermission {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginHostApi {
-    Https,
+    Request,
     Fs,
 }
 
 impl fmt::Display for PluginHostApi {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Https => f.write_str("https"),
+            Self::Request => f.write_str("request"),
             Self::Fs => f.write_str("fs"),
         }
     }
@@ -452,6 +476,10 @@ pub struct PluginPackageManifest {
     /// enablement grants must match them before runtime surfaces are exposed.
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
+    /// Manifest-declared URL targets for `host_api.request`. These are static permission requests;
+    /// enablement grants must explicitly approve matching targets.
+    #[serde(default)]
+    pub request: Vec<PluginRequestGrant>,
 }
 
 impl PluginPackageManifest {
@@ -2587,6 +2615,100 @@ mod tests {
     }
 
     #[test]
+    fn request_host_api_manifest_and_grant_parse_with_request_names() {
+        let manifest: PluginPackageManifest = toml::from_str(
+            r#"
+schema_version = 1
+id = "example"
+name = "Example"
+version = "1.0.0"
+description = "Example plugin"
+surfaces = ["tool"]
+
+[[permissions]]
+kind = "host_api"
+api = "request"
+
+[[request]]
+scheme = "https"
+host = "api.example.com"
+port = 443
+methods = ["GET", "POST"]
+path_prefixes = ["/v1/"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.permissions,
+            vec![PluginPermission::host_api(PluginHostApi::Request)]
+        );
+        assert_eq!(manifest.request.len(), 1);
+        assert_eq!(manifest.request[0].scheme, "https");
+        assert_eq!(manifest.request[0].host, "api.example.com");
+        assert_eq!(manifest.request[0].port, Some(443));
+        assert_eq!(
+            manifest.request[0].label(),
+            "https://api.example.com:443 GET,POST /v1/"
+        );
+
+        let grants: PluginGrantConfig = toml::from_str(
+            r#"
+permissions = [{ kind = "host_api", api = "request" }]
+
+[[request]]
+scheme = "http"
+host = "localhost"
+port = 8080
+methods = ["GET"]
+path_prefixes = ["/health"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            grants.permissions,
+            vec![PluginPermission::host_api(PluginHostApi::Request)]
+        );
+        assert_eq!(grants.request[0].scheme, "http");
+        assert_eq!(grants.request[0].host, "localhost");
+    }
+
+    #[test]
+    fn legacy_https_request_names_are_not_accepted() {
+        let manifest_error = toml::from_str::<PluginPackageManifest>(
+            r#"
+schema_version = 1
+id = "example"
+name = "Example"
+version = "1.0.0"
+description = "Example plugin"
+surfaces = ["tool"]
+
+[[permissions]]
+kind = "host_api"
+api = "https"
+"#,
+        )
+        .expect_err(concat!(
+            "host_api.",
+            "https",
+            " must not be an active alias"
+        ));
+        assert!(manifest_error.to_string().contains("unknown variant"));
+
+        let grant_error = toml::from_str::<PluginGrantConfig>(
+            r#"
+permissions = [{ kind = "host_api", api = "request" }]
+
+[[https]]
+host = "api.example.com"
+methods = ["GET"]
+"#,
+        )
+        .expect_err(concat!("grants.", "https", " must not be an active alias"));
+        assert!(grant_error.to_string().contains("unknown field"));
+    }
+
+    #[test]
     fn embedded_rust_component_instance_template_is_valid_package_shape() {
         let paths: BTreeSet<_> = RUST_COMPONENT_INSTANCE_TEMPLATE
             .iter()
@@ -3067,7 +3189,7 @@ input_schema = { type = "object", properties = { query = { type = "string" } }, 
             version: Some(PluginExactVersion("0.1.0".to_string())),
             digest: Some(digest.clone()),
             permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
-            https: Vec::new(),
+            request: Vec::new(),
             fs: Vec::new(),
         };
         let resolution = resolve_enabled_plugins(
@@ -3094,7 +3216,7 @@ input_schema = { type = "object", properties = { query = { type = "string" } }, 
                 version: Some(PluginExactVersion("0.1.0".to_string())),
                 digest: Some(digest.clone()),
                 permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
-                https: Vec::new(),
+                request: Vec::new(),
                 fs: Vec::new(),
             },
             PluginGrantConfig {
@@ -3102,7 +3224,7 @@ input_schema = { type = "object", properties = { query = { type = "string" } }, 
                 version: Some(PluginExactVersion("0.1.1".to_string())),
                 digest: Some(digest.clone()),
                 permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
-                https: Vec::new(),
+                request: Vec::new(),
                 fs: Vec::new(),
             },
             PluginGrantConfig {
@@ -3110,7 +3232,7 @@ input_schema = { type = "object", properties = { query = { type = "string" } }, 
                 version: Some(PluginExactVersion("0.1.0".to_string())),
                 digest: Some("sha256:unrelated".to_string()),
                 permissions: vec![PluginPermission::surface(PluginSurface::Hook)],
-                https: Vec::new(),
+                request: Vec::new(),
                 fs: Vec::new(),
             },
         ] {

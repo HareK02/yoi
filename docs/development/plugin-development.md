@@ -294,29 +294,46 @@ rejected  invalid manifest, incompatible API, digest mismatch, grant denial, etc
 partial   usable package with some rejected surfaces/tools
 ```
 
-## `https` host API
+## `request` host API
 
-The `https` host API is outbound-only and grant-gated. It is meant for Tool calls such as JSON POSTs or REST requests. It is not a WebSocket/Gateway or inbound HTTP surface.
+The `request` host API is a one-shot outbound HTTP request API. It is meant for bounded Tool calls such as JSON POSTs or REST requests. It is not a WebSocket, SSE/event-stream, gateway, daemon, or inbound HTTP surface; persistent transports require a separate Plugin capability.
 
-Manifest permissions should request `host_api.https` in addition to the Tool permissions. Enablement grants must then allow the API and constrain hosts/methods.
+Manifest permissions should request `host_api.request` in addition to the Tool permissions, and the package manifest must statically declare the URL targets it may call. Enablement grants must then allow the API and grant matching request targets. A grant without a matching manifest target is unsafe/unused and is shown as ineligible rather than expanding authority.
 
-Example grant shape:
+Example manifest shape:
+
+```toml
+permissions = [
+  { kind = "surface", surface = "tool" },
+  { kind = "tool", name = "http_post_json" },
+  { kind = "host_api", api = "request" },
+]
+
+[[request]]
+scheme = "https"
+host = "api.example.com"
+methods = ["POST"]
+path_prefixes = ["/v1/"]
+```
+
+Example enablement grant shape:
 
 ```toml
 [plugins.enabled.grants]
 permissions = [
   { kind = "surface", surface = "tool" },
   { kind = "tool", name = "http_post_json" },
-  { kind = "host_api", api = "https" },
+  { kind = "host_api", api = "request" },
 ]
 
-[[plugins.enabled.grants.https]]
+[[plugins.enabled.grants.request]]
+scheme = "https"
 host = "api.example.com"
 methods = ["POST"]
 path_prefixes = ["/v1/"]
 ```
 
-Yoi rejects `http://`, localhost/private/link-local targets, disallowed hosts/methods, oversize requests/responses, and missing grants. Credentials must come from explicit config/secret references, not ambient environment variables.
+Yoi checks method, scheme, host, optional port, and path prefix against both the manifest declaration and enablement grant before any network I/O. `http://localhost`, loopback, private, and other local targets are never ambient; they require an explicit manifest request target and an explicit matching grant. The explicit request target is the declared URL authority; a granted DNS hostname may resolve to a loopback/private address without requiring a separate literal-IP grant, so reviewers should grant hostnames only when that resolution behavior is intended. Broad targets such as `host = "*"` are supported only as visibly broad request permissions in inspection/diagnostics. Embedded credentials, credential-like headers, oversize requests/responses, WebSocket URLs/upgrades, and SSE/event-stream requests are rejected.
 
 ## `fs` host API
 
