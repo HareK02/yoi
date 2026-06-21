@@ -256,3 +256,78 @@ Reviewer focus:
 Orchestrator will wait for reviewer verdict before integration。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVMFFYVX-r1 at: 2026-06-21T07:44:49Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket/context:
+  - `.yoi/tickets/00001KVMFFYVX/item.md`
+  - `.yoi/tickets/00001KVMFFYVX/thread.md`
+  - `.yoi/objectives/00001KVJPT2PP/item.md`
+- Diff `1d27f6c9..ab7658c1`:
+  - `Cargo.toml`
+  - `Cargo.lock`
+  - `crates/workspace-server/Cargo.toml`
+  - `crates/workspace-server/src/lib.rs`
+  - `crates/workspace-server/src/server.rs`
+  - `crates/workspace-server/src/store.rs`
+  - `crates/workspace-server/src/records.rs`
+  - `package.nix`
+  - `web/workspace/package.json`
+  - `web/workspace/package-lock.json`
+  - `web/workspace/.gitignore`
+  - `web/workspace/README.md`
+  - `web/workspace/svelte.config.js`
+  - `web/workspace/vite.config.ts`
+  - `web/workspace/tsconfig.json`
+  - `web/workspace/src/app.html`
+  - `web/workspace/src/routes/+layout.ts`
+  - `web/workspace/src/routes/+page.svelte`
+
+Blocking issues:
+- None found。
+
+Acceptance verification:
+- New `yoi-workspace-server` crate is a library/backend crate, not a product CLI façade。
+- Existing `yoi` CLI ownership is preserved; `yoi` does not depend on the new crate。
+- HTTP routes are read-only `GET` routes for `/api/workspace`, `/api/tickets`, `/api/tickets/{id}`, `/api/objectives`, `/api/objectives/{id}`, `/api/runs`, `/api/runners`。
+- SPA/static fallback explicitly rejects `/api` and `/api/...`, so API paths are not swallowed by SPA fallback。
+- `.yoi/tickets` and `.yoi/objectives` remain canonical read sources; no `.yoi` write/migration path was introduced。
+- Store abstraction is explicit via `ControlPlaneStore`; SQLite is behind `SqliteWorkspaceStore`。
+- SQLite setup includes migrations/version table, WAL, foreign keys, and busy timeout。
+- Runtime tables for runs/runners are skeletal/read-only and do not implement scheduling or dispatch。
+- Auth is explicitly represented as local/dev placeholder, not production SaaS auth。
+- SvelteKit frontend is static SPA skeleton with npm lockfile; generated `node_modules`, `.svelte-kit`, and `build` are ignored/excluded。
+- `package.nix` source filtering excludes frontend generated artifacts; `nix build .#yoi --no-link` passed with updated cargo hash。
+
+Non-blocking concerns:
+- No committed CLI/binary entrypoint or full listener smoke test for starting the server end-to-end. Library exposes `serve(...)` and router tests cover API/static separation, acceptable for bootstrap; follow-up should add launch surface when product command is designed。
+- Detail responses for tickets/objectives do not include `workspace_id`, while list/runtime responses do. Future multi-workspace API expansion should make detail shapes consistently workspace-qualified。
+- Missing valid objective IDs appear likely to map filesystem `Io` errors to HTTP 500 rather than 404. Tighten when read API contract is hardened。
+- Static path traversal rejects `..`, but symlink escape hardening is not implemented. Acceptable for configured local build/static directory and local/dev bootstrap, revisit before non-local exposure。
+
+Reviewer validation:
+- `cargo fmt --check`: passed
+- `git diff --check 1d27f6c9..HEAD`: passed
+- `cargo test -p yoi-workspace-server`: passed
+- `cargo check -p yoi-workspace-server`: passed
+- `cargo check -p yoi`: passed
+- `cd web/workspace && npm run check && npm run build`: initially failed because `node_modules` absent。
+- `cd web/workspace && npm ci && npm run check && npm run build`: passed
+- `cargo run -p yoi -- ticket doctor`: passed
+- `cargo run -p yoi -- objective doctor`: passed
+- `nix build .#yoi --no-link`: passed
+- Focused route/static validation:
+  - Inspected router definitions and fallback logic。
+  - Existing `yoi-workspace-server` tests exercise `/api/workspace`, `/api/tickets`, `/api/objectives`, `/api/runners`, static asset serving, SPA fallback, and `/api/...` miss separation。
+  - Store migration/persistence and local record read bridge are covered by crate tests。
+
+Worktree status:
+- Tracked worktree clean at `ab7658c1` on `impl/00001KVMFFYVX-workspace-web-control-plane`。
+- Ignored validation artifacts remain in the implementation worktree: `web/workspace/node_modules/`, `web/workspace/.svelte-kit/`, `web/workspace/build/`。
+
+---
