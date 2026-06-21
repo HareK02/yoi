@@ -139,3 +139,46 @@ Next action:
 - Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T16:31:48Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVNEKH9Q`.
+
+Implementation commit:
+- `58143ead feat: expose workspace hosts and workers`
+
+Changed areas observed by Orchestrator:
+- `crates/workspace-server/src/hosts.rs` added:
+  - Host / Worker API domain models and local Pod metadata bridge。
+  - Safe degradation for missing/unreadable Pod metadata directory via bounded diagnostics。
+  - Redaction/bounding tests。
+- `crates/workspace-server/src/server.rs` updated:
+  - Host / Worker API routes added。
+  - `/api/runners` placeholder removed/migrated away from runner naming。
+  - Tests updated for host/worker API and static/API separation。
+- `crates/workspace-server/src/store.rs` updated:
+  - Runners placeholder removed。
+- `web/workspace/src/routes/+page.svelte` updated:
+  - UI displays Host / Worker list instead of runners placeholder。
+- Package/dependency updates:
+  - `crates/workspace-server/Cargo.toml`
+  - `Cargo.lock`
+  - `package.nix`
+
+Orchestrator evidence checked:
+- Implementation worktree clean on `impl/00001KVNEKH9Q-workspace-host-workers`。
+- HEAD is `58143ead`。
+- Diff `e1f02ffc..HEAD` touches 8 expected backend/frontend/package files, about 913 insertions / 75 deletions。
+- `git diff --check e1f02ffc..HEAD` produced no diagnostics。
+- Validation had produced ignored frontend artifacts in child worktree:
+  - `web/workspace/node_modules/`
+  - `web/workspace/.svelte-kit/`
+  - `web/workspace/build/`
+- Orchestrator removed those ignored artifacts before reviewer routing; tracked worktree remains clean。
+
+Next action:
+- Route to read-only Reviewer Pod for acceptance review against the Ticket。
+
+---
