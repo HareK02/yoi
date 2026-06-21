@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KVNEKH9Q",
+      "kind": "related",
+      "target": "00001KVMFFYVX",
+      "note": "Extends workspace web control plane bootstrap with local host/worker inspection",
+      "author": "yoi ticket",
+      "at": "2026-06-21T16:01:33Z"
+    }
+  ]
+}
