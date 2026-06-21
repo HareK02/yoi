@@ -304,3 +304,88 @@ Worktree status:
 - Clean tracked/non-ignored state on `impl/00001KVNGJPRG-repository-objective-pages` at `ceb1ee3b`。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T17:30:51Z -->
+
+## Implementation report
+
+Reviewer r1 approvalを受けて、実装ブランチを Orchestrator worktree の `orchestration` branch に統合した。
+
+統合:
+- Merge commit: `7ee702b1 merge: repository objective pages`
+- Merged branch: `impl/00001KVNGJPRG-repository-objective-pages`
+- Implementation commit:
+  - `ceb1ee3b feat: add repository objective pages`
+
+Orchestrator worktree validation:
+- `cargo fmt --check`: passed
+- `git diff --check HEAD^1..HEAD`: passed
+- `cargo test -p yoi-workspace-server`: passed (`8 passed`)
+- `cargo check -p yoi-workspace-server`: passed
+- `cd web/workspace && rm -rf node_modules .svelte-kit build && deno task check`: passed (`svelte-check found 0 errors and 0 warnings`)
+- `cd web/workspace && deno task build`: passed
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+
+Validation generated ignored frontend artifacts in Orchestrator worktree:
+- `web/workspace/node_modules/`
+- `web/workspace/.svelte-kit/`
+- `web/workspace/build/`
+
+These were removed after validation. Final Orchestrator worktree status after validation cleanup is clean on `orchestration` at `7ee702b1`。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-21T17:30:58Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Reviewer approval、Orchestrator worktree への統合、workspace-server tests/check、Deno check/build、Ticket doctor、Nix build が完了したため `done` に遷移する。
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-21T17:31:14Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-21T17:31:14Z status: closed -->
+
+## 完了
+
+Workspace web に Repository / Objective pages を追加し、Orchestrator worktree の `orchestration` branch に統合した。
+
+主な成果:
+- Read-only Repository backend APIs を追加:
+  - `/api/repositories`
+  - `/api/repositories/local`
+  - `/api/repositories/local/log`
+  - `/api/repositories/local/tickets`
+- Current workspace root を local Repository として扱う bounded repository summary を追加。
+- Git repository では bounded branch/head/root/dirty/remote/recent log summary を返す。
+- Non-Git workspace では `git.status = unavailable` と bounded diagnostics に degrade。
+- Git log summary は recent commit hash/subject/author/timestamp に限定し、diff/patch/file content/blame/config は読まない。
+- Remote URL summary は URL-scheme userinfo を redact。
+- Read-only Ticket Kanban を Ticket state ごとに grouping し、workspace-local Ticket fallback diagnostic を含めた。
+- Objective list summaries を filesystem Objective records から追加。
+- Static SPA に hash-navigation Repository / Objectives pages を追加。
+- Sidebar Repository/Objectives links を新 pages に接続。
+- Repository page に summary, Git summary/log, diagnostics, read-only Ticket Kanban を表示。
+- Objective page に title/state/updated_at/summary と detail placeholder links を表示。
+- Ticket / Objective canonical authority remains filesystem read-through records; mutation API / DB canonical migration は追加していない。
+
+統合・検証:
+- Merge commit: `7ee702b1 merge: repository objective pages`
+- Implementation commit: `ceb1ee3b feat: add repository objective pages`
+- Reviewer final verdict: approve
+- Validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p yoi-workspace-server`, `cargo check -p yoi-workspace-server`, `deno task check`, `deno task build`, `cargo run -p yoi -- ticket doctor`, and `nix build .#yoi --no-link`。
+
+範囲外 / follow-up notes:
+- Repository CRUD/API, Objective edit/detail mutation, full Git browser/diff/file views, drag/drop Kanban, and write APIs were not implemented。
+- Reviewer noted possible follow-ups: keep `#/objectives` sidebar link visible even on objective empty/error states, and further tighten remote URL sanitization for query-param or SCP-like token forms if needed。
+
+---
