@@ -152,3 +152,76 @@ Next action:
 - Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff. Orchestrator will not merge/close until reviewer approval and validation evidence are available。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T07:37:30Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVMFFYVX`.
+
+Implementation commit:
+- `ab7658c1 feat: bootstrap workspace web control plane`
+
+Changed areas:
+- New Cargo workspace crate:
+  - `crates/workspace-server`
+  - HTTP router with `/api/...` separation from static/SPA fallback。
+  - Local/dev workspace API state carrying `workspace_id`。
+  - Bounded read APIs for `/api/workspace`, `/api/tickets`, `/api/tickets/{id}`, `/api/objectives`, `/api/objectives/{id}`, `/api/runs`, `/api/runners`。
+  - Reserved extension-point response fields for future event streams and runner connections。
+- Store abstraction and SQLite implementation:
+  - `ControlPlaneStore` trait。
+  - `SqliteWorkspaceStore`。
+  - migration/version table。
+  - WAL, foreign keys, busy timeout。
+  - initial schema for workspace/runtime/projection seams while keeping `.yoi` records canonical。
+- Local project-record bridge:
+  - reads existing `.yoi/tickets`。
+  - reads existing `.yoi/objectives`。
+  - does not migrate or mutate canonical records。
+- SvelteKit static SPA skeleton:
+  - `web/workspace`
+  - npm + committed `package-lock.json`
+  - static adapter build output to `web/workspace/build`
+  - generated artifact handling documented in `web/workspace/README.md`。
+- Packaging/source handling:
+  - added Rust dependencies and updated `Cargo.lock`。
+  - updated `package.nix` cargo hash。
+  - excluded generated frontend directories from Nix package source filtering。
+
+Coder validation reported:
+- `cargo fmt --check`: passed
+- `cargo test -p yoi-workspace-server`: passed
+- `cargo check -p yoi-workspace-server`: passed
+- `cargo check -p yoi`: passed
+- `cd web/workspace && npm run check && npm run build`: passed
+- `git diff --check`: passed
+- `cargo run -p yoi -- ticket doctor`: passed
+- `cargo run -p yoi -- objective doctor`: passed
+- `nix build .#yoi --no-link`: passed after updating `cargoHash`
+
+Coder dependency/package/frontend decisions:
+- Used `axum` for HTTP routing。
+- Used `rusqlite` with bundled SQLite to avoid system SQLite packaging requirements。
+- Backend remains a library crate, not a product CLI façade。
+- No product `yoi` CLI command was added in this slice。
+- Frontend uses npm/SvelteKit static adapter with committed lockfile; generated build output is not checked in。
+- Nix package does not build frontend in this bootstrap; it excludes generated frontend artifacts from source filtering。
+
+Known deferrals reported:
+- No write API。
+- No runner job dispatch or scheduler。
+- No hosted/multi-tenant auth or SaaS behavior。
+- No event stream implementation yet; only reserved extension-point seam。
+- No checked-in generated SPA assets; backend can serve configured static directory such as `web/workspace/build` after running frontend build。
+
+Orchestrator evidence checked:
+- Implementation worktree is clean on `impl/00001KVMFFYVX-workspace-web-control-plane`。
+- HEAD is `ab7658c1`。
+- Diff `1d27f6c9..HEAD` touches expected backend/frontend/package files: 18 files, about 3377 insertions / 1 deletion。
+- `git diff --check 1d27f6c9..HEAD` produced no diagnostics。
+
+Next action:
+- Route to read-only Reviewer Pod for acceptance review against the Ticket and Objective context。
+
+---
