@@ -2,7 +2,7 @@
 title: 'Workspace web UI: add sidebar navigation panel'
 state: 'inprogress'
 created_at: '2026-06-21T16:30:12Z'
-updated_at: '2026-06-21T16:37:34Z'
+updated_at: '2026-06-21T16:54:08Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-21T16:35:06Z'

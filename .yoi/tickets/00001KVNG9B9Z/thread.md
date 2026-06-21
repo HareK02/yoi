@@ -135,3 +135,50 @@ Next action:
 - Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T16:54:08Z -->
+
+## Implementation report
+
+Coder conflict-resolution report received from `yoi-coder-00001KVNG9B9Z`.
+
+Final implementation HEAD:
+- `4ab696b4` merge commit from current `orchestration` into `impl/00001KVNG9B9Z-workspace-sidebar`
+
+Relevant commits:
+- `d3b8bdfd feat: add workspace sidebar skeleton`
+- `4ab696b4` merge/conflict-resolution commit
+
+Conflict resolution summary:
+- Resolved `web/workspace/src/routes/+page.svelte` conflict after Host/Worker API/UI from `00001KVNEKH9Q` landed。
+- Preserved merged Host/Worker main content/cards/table。
+- Preserved sidebar navigation skeleton。
+- Updated sidebar Workers section to consume available `/api/workers` response through typed `ListResponse<Worker>`。
+- Kept Pod naming out of sidebar, presenting workers by label/state/status/role。
+- Changes remain scoped to Workspace frontend。
+
+Coder validation reported:
+- `cd web/workspace && deno task check`: passed
+- `cd web/workspace && deno task build`: passed
+- `git diff --check`: passed
+- `git diff --check orchestration..HEAD`: passed
+- `cargo run -p yoi -- ticket doctor`: passed
+- `nix build .#yoi --no-link`: passed
+- `cargo test -p yoi-workspace-server`: not run because backend code was not changed during conflict resolution
+
+Generated artifact cleanup:
+- Coder removed generated/ignored frontend artifacts after validation:
+  - `web/workspace/.svelte-kit`
+  - `web/workspace/build`
+  - `web/workspace/node_modules`
+
+Orchestrator evidence checked:
+- Worktree clean on `impl/00001KVNG9B9Z-workspace-sidebar` at `4ab696b4`。
+- Diff `orchestration..HEAD` touches expected frontend files only: new `web/workspace/src/lib/workspace-sidebar/*` components and `web/workspace/src/routes/+page.svelte`。
+- `git diff --check orchestration..HEAD`: passed。
+- Merge-tree conflict scan vs current `orchestration`: no conflict markers / no changed-in-both diagnostics。
+
+Next action:
+- Route to read-only Reviewer Pod for acceptance review。
+
+---
