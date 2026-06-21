@@ -422,23 +422,73 @@ fn append_request_target_inspection(
     host_apis: &mut Vec<PluginPermissionEligibility>,
 ) {
     for target in &record.manifest.request {
-        let granted = record.grants.request.iter().any(|grant| grant == target);
-        let broad = if target.is_broad() {
-            "; broad/arbitrary target"
-        } else {
-            ""
+        let covering_grant = record
+            .grants
+            .request
+            .iter()
+            .find(|grant| request_target_covers(grant, target));
+        let intersecting_grant = covering_grant.or_else(|| {
+            record
+                .grants
+                .request
+                .iter()
+                .find(|grant| request_targets_intersect(target, grant))
+        });
+        let granted = intersecting_grant.is_some();
+        let diagnostic = match (granted, covering_grant, target.is_broad()) {
+            (false, _, broad) => Some(format!(
+                "missing enabled request grant for manifest target{}",
+                if broad { "; broad/arbitrary target" } else { "" }
+            )),
+            (true, None, true) => Some(
+                "partially covered by enabled request grant; broad manifest target is constrained by narrower grants"
+                    .to_string(),
+            ),
+            (true, None, false) => Some(
+                "partially covered by enabled request grant; only intersecting URLs are allowed"
+                    .to_string(),
+            ),
+            (true, Some(grant), _) if grant.is_broad() => {
+                Some("covered by broad/arbitrary enabled request grant".to_string())
+            }
+            _ => None,
         };
         host_apis.push(PluginPermissionEligibility {
             permission: format!("host_api.request target {}", target.label()),
             requested: true,
             granted,
             eligible: granted,
-            diagnostic: (!granted)
-                .then(|| format!("missing enabled request grant for manifest target{broad}")),
+            diagnostic,
         });
     }
     for grant in &record.grants.request {
-        if !record.manifest.request.iter().any(|target| target == grant) {
+        let matching_manifest = record
+            .manifest
+            .request
+            .iter()
+            .find(|target| request_targets_intersect(target, grant));
+        if let Some(target) = matching_manifest {
+            let diagnostic = if grant.is_broad() {
+                Some(
+                    "broad/arbitrary enabled request grant is constrained by manifest declarations"
+                        .to_string(),
+                )
+            } else if !request_target_covers(target, grant) {
+                Some(
+                    "enabled request grant is only usable where it intersects manifest declarations"
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            host_apis.push(PluginPermissionEligibility {
+                permission: format!("host_api.request grant {}", grant.label()),
+                requested: true,
+                granted: true,
+                eligible: true,
+                diagnostic,
+            });
+        } else {
             let broad = if grant.is_broad() {
                 "; broad/arbitrary target"
             } else {
@@ -1447,6 +1497,104 @@ fn request_target_allows(target: &PluginRequestGrant, method: &str, url: &reqwes
             .path_prefixes
             .iter()
             .any(|prefix| !prefix.is_empty() && url.path().starts_with(prefix))
+}
+
+fn request_targets_intersect(left: &PluginRequestGrant, right: &PluginRequestGrant) -> bool {
+    request_scheme_intersects(&left.scheme, &right.scheme)
+        && request_host_intersects(&left.host, &right.host)
+        && request_port_intersects(left.port, right.port)
+        && request_methods_intersect(&left.methods, &right.methods)
+        && request_paths_intersect(&left.path_prefixes, &right.path_prefixes)
+}
+
+fn request_target_covers(covering: &PluginRequestGrant, covered: &PluginRequestGrant) -> bool {
+    request_scheme_covers(&covering.scheme, &covered.scheme)
+        && request_host_covers(&covering.host, &covered.host)
+        && request_port_covers(covering.port, covered.port)
+        && request_methods_cover(&covering.methods, &covered.methods)
+        && request_paths_cover(&covering.path_prefixes, &covered.path_prefixes)
+}
+
+fn request_scheme_intersects(left: &str, right: &str) -> bool {
+    let left = left.trim().to_ascii_lowercase();
+    let right = right.trim().to_ascii_lowercase();
+    !left.is_empty() && !right.is_empty() && (left == "*" || right == "*" || left == right)
+}
+
+fn request_scheme_covers(covering: &str, covered: &str) -> bool {
+    let covering = covering.trim().to_ascii_lowercase();
+    let covered = covered.trim().to_ascii_lowercase();
+    !covering.is_empty() && !covered.is_empty() && (covering == "*" || covering == covered)
+}
+
+fn request_host_intersects(left: &str, right: &str) -> bool {
+    let left = normalize_host_literal(left);
+    let right = normalize_host_literal(right);
+    !left.is_empty() && !right.is_empty() && (left == "*" || right == "*" || left == right)
+}
+
+fn request_host_covers(covering: &str, covered: &str) -> bool {
+    let covering = normalize_host_literal(covering);
+    let covered = normalize_host_literal(covered);
+    !covering.is_empty() && !covered.is_empty() && (covering == "*" || covering == covered)
+}
+
+fn request_port_intersects(left: Option<u16>, right: Option<u16>) -> bool {
+    left.is_none() || right.is_none() || left == right
+}
+
+fn request_port_covers(covering: Option<u16>, covered: Option<u16>) -> bool {
+    covering.is_none() || covering == covered
+}
+
+fn request_methods_intersect(left: &[String], right: &[String]) -> bool {
+    !left.is_empty()
+        && !right.is_empty()
+        && left.iter().any(|left_method| {
+            right
+                .iter()
+                .any(|right_method| left_method.trim().eq_ignore_ascii_case(right_method.trim()))
+        })
+}
+
+fn request_methods_cover(covering: &[String], covered: &[String]) -> bool {
+    !covering.is_empty()
+        && !covered.is_empty()
+        && covered.iter().all(|covered_method| {
+            covering.iter().any(|covering_method| {
+                covering_method
+                    .trim()
+                    .eq_ignore_ascii_case(covered_method.trim())
+            })
+        })
+}
+
+fn request_paths_intersect(left: &[String], right: &[String]) -> bool {
+    left.is_empty()
+        || right.is_empty()
+        || left.iter().any(|left_prefix| {
+            !left_prefix.is_empty()
+                && right.iter().any(|right_prefix| {
+                    !right_prefix.is_empty()
+                        && (left_prefix.starts_with(right_prefix)
+                            || right_prefix.starts_with(left_prefix))
+                })
+        })
+}
+
+fn request_paths_cover(covering: &[String], covered: &[String]) -> bool {
+    if covering.is_empty() {
+        return true;
+    }
+    if covered.is_empty() {
+        return false;
+    }
+    covered.iter().all(|covered_prefix| {
+        !covered_prefix.is_empty()
+            && covering.iter().any(|covering_prefix| {
+                !covering_prefix.is_empty() && covered_prefix.starts_with(covering_prefix)
+            })
+    })
 }
 
 fn normalize_host_literal(host: &str) -> String {
@@ -5762,6 +5910,101 @@ input_schema = {{ type = "object", additionalProperties = true }}
         assert_eq!(pending.len(), 1);
         let (meta, _) = pending[0]();
         assert_eq!(meta.name, "PluginEcho");
+    }
+
+    #[test]
+    fn static_inspection_reports_covering_request_grants_as_runtime_eligible() {
+        let mut exact_manifest_broad_grant = record_with_request_grant();
+        exact_manifest_broad_grant.grants.request = vec![PluginRequestGrant {
+            scheme: "*".to_string(),
+            host: "*".to_string(),
+            port: None,
+            methods: vec!["GET".to_string()],
+            path_prefixes: Vec::new(),
+        }];
+
+        let inspection = inspect_resolved_plugin_static(&exact_manifest_broad_grant);
+        let target = inspection
+            .host_apis
+            .iter()
+            .find(|api| {
+                api.permission
+                    .starts_with("host_api.request target https://api.example.test")
+            })
+            .expect("manifest request target inspection");
+        assert!(target.requested);
+        assert!(target.granted);
+        assert!(target.eligible);
+        let diagnostic = target.diagnostic.as_deref().unwrap_or_default();
+        assert!(
+            diagnostic.contains("broad/arbitrary") || diagnostic.contains("partially covered"),
+            "{target:#?}"
+        );
+        let broad_grant = inspection
+            .host_apis
+            .iter()
+            .find(|api| api.permission.starts_with("host_api.request grant *://*"))
+            .expect("broad grant inspection");
+        assert!(broad_grant.requested);
+        assert!(broad_grant.granted);
+        assert!(broad_grant.eligible);
+        assert!(
+            !inspection
+                .host_apis
+                .iter()
+                .any(|api| api.permission.starts_with("host_api.request grant-only")),
+            "{:#?}",
+            inspection.host_apis
+        );
+    }
+
+    #[test]
+    fn static_inspection_reports_request_grant_intersections_as_runtime_eligible() {
+        let mut broad_manifest_exact_grant = record_with_request_grant();
+        broad_manifest_exact_grant.manifest.request = vec![PluginRequestGrant {
+            scheme: "*".to_string(),
+            host: "*".to_string(),
+            port: None,
+            methods: vec!["GET".to_string(), "POST".to_string()],
+            path_prefixes: Vec::new(),
+        }];
+
+        let inspection = inspect_resolved_plugin_static(&broad_manifest_exact_grant);
+        let target = inspection
+            .host_apis
+            .iter()
+            .find(|api| api.permission.starts_with("host_api.request target *://*"))
+            .expect("broad manifest target inspection");
+        assert!(target.requested);
+        assert!(target.granted);
+        assert!(target.eligible);
+        assert!(
+            target
+                .diagnostic
+                .as_deref()
+                .unwrap_or_default()
+                .contains("partially covered"),
+            "{target:#?}"
+        );
+        let exact_grant = inspection
+            .host_apis
+            .iter()
+            .find(|api| {
+                api.permission
+                    .starts_with("host_api.request grant https://api.example.test")
+            })
+            .expect("exact grant inspection");
+        assert!(exact_grant.requested);
+        assert!(exact_grant.granted);
+        assert!(exact_grant.eligible);
+        assert!(
+            !inspection
+                .host_apis
+                .iter()
+                .any(|api| api.permission.starts_with("host_api.request grant-only")),
+            "{:#?}",
+            inspection.host_apis
+        );
     }
 
     #[test]

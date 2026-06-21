@@ -1520,7 +1520,7 @@ mod tests {
             configured: true,
             discovered: true,
             resolved: true,
-            static_eligible: false,
+            static_eligible: true,
             declared_surfaces: vec!["tool".to_string()],
             enabled_surfaces: vec!["tool".to_string()],
             requested_permissions: vec!["host_api.request".to_string()],
@@ -1539,18 +1539,20 @@ mod tests {
                         permission: "host_api.request target https://api.example.test GET /v1/"
                             .to_string(),
                         requested: true,
-                        granted: false,
-                        eligible: false,
-                        diagnostic: Some("missing enabled request grant for manifest target".to_string()),
+                        granted: true,
+                        eligible: true,
+                        diagnostic: Some(
+                            "covered by broad/arbitrary enabled request grant".to_string(),
+                        ),
                     },
                     PluginPermissionEligibility {
-                        permission: "host_api.request grant-only *://* GET * [broad-request]"
+                        permission: "host_api.request grant *://* GET * [broad-request]"
                             .to_string(),
-                        requested: false,
+                        requested: true,
                         granted: true,
-                        eligible: false,
+                        eligible: true,
                         diagnostic: Some(
-                            "enabled request grant has no matching manifest declaration; broad/arbitrary target"
+                            "broad/arbitrary enabled request grant is constrained by manifest declarations"
                                 .to_string(),
                         ),
                     },
@@ -1569,9 +1571,9 @@ mod tests {
         );
         let human = render_item_human(&item).unwrap();
         assert!(human.contains("host_api.request target https://api.example.test"));
-        assert!(human.contains("requested=true granted=false eligible=false"));
-        assert!(human.contains("host_api.request grant-only *://*"));
-        assert!(human.contains("broad/arbitrary target"));
+        assert!(human.contains("requested=true granted=true eligible=true"));
+        assert!(human.contains("host_api.request grant *://*"));
+        assert!(human.contains("broad/arbitrary"));
     }
 
     #[test]

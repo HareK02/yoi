@@ -333,7 +333,7 @@ methods = ["POST"]
 path_prefixes = ["/v1/"]
 ```
 
-Yoi checks method, scheme, host, optional port, and path prefix against both the manifest declaration and enablement grant before any network I/O. `http://localhost`, loopback, private, and other local targets are never ambient; they require an explicit manifest request target and an explicit matching grant. Broad targets such as `host = "*"` are supported only as visibly broad request permissions in inspection/diagnostics. Embedded credentials, credential-like headers, oversize requests/responses, WebSocket URLs/upgrades, and SSE/event-stream requests are rejected.
+Yoi checks method, scheme, host, optional port, and path prefix against both the manifest declaration and enablement grant before any network I/O. `http://localhost`, loopback, private, and other local targets are never ambient; they require an explicit manifest request target and an explicit matching grant. The explicit request target is the declared URL authority; a granted DNS hostname may resolve to a loopback/private address without requiring a separate literal-IP grant, so reviewers should grant hostnames only when that resolution behavior is intended. Broad targets such as `host = "*"` are supported only as visibly broad request permissions in inspection/diagnostics. Embedded credentials, credential-like headers, oversize requests/responses, WebSocket URLs/upgrades, and SSE/event-stream requests are rejected.
 
 ## `fs` host API
 
