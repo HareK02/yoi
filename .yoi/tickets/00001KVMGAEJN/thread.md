@@ -444,3 +444,70 @@ Next action:
 - Route back to Reviewer for r2 verification of WebSocket open capacity/timeout/cancellation bounds and final acceptance。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVMGAEJN-r1 at: 2026-06-21T13:20:53Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+r1-fix diff inspected:
+- Reviewed `ce62d235..a766048f`:
+  - `Cargo.lock`
+  - `crates/pod/Cargo.toml`
+  - `crates/pod/src/feature/plugin.rs`
+  - `package.nix`
+- Also re-checked overall implementation diff `3eac7f8e..a766048f` against Ticket authority and previous r1 blocker。
+
+Previous blocker verification:
+- Resolved。
+
+Evidence in `crates/pod/src/feature/plugin.rs`:
+- `execute_plugin_websocket_open` now:
+  - validates URL / manifest / grant before dialing。
+  - fails closed if selected client cannot guarantee bounded open。
+  - reserves WebSocket capacity before `client.open(...)`。
+  - commits reservation only after successful open。
+- `PluginWebSocketHandles` / `PluginWebSocketHandleTable` now track reserved slots separately from active handles, so `PLUGIN_WEBSOCKET_MAX_OPEN_CONNECTIONS` rejects before network I/O。
+- Reservation cleanup is RAII-style:
+  - failed open drops the reservation。
+  - failed commit also drops/releases reservation。
+- `TungstenitePluginWebSocketClient` now uses `tokio-tungstenite` async connect under `tokio::time::timeout(...)`, replacing previous synchronous `tungstenite::client::connect_with_config(...)` path。
+- Focused tests cover:
+  - max-open rejecting before network open。
+  - open failure releasing reservation。
+  - unbounded clients failing closed before dialing。
+
+Overall Ticket fit:
+- `host_api.websocket` remains separate from `host_api.request`。
+- Manifest `[[websocket]]` targets and `grants.websocket` remain independent from request targets/grants。
+- Runtime connect requires both manifest target and grant before network I/O。
+- URL matching covers scheme, host, port, and path prefix。
+- WebSocket API is text-only, explicit receive only, and does not inject incoming messages into hidden context/history。
+- Guest arbitrary handshake headers / embedded credentials remain rejected。
+- Request API continues to reject WebSocket/SSE/persistent request attempts。
+- Static inspection / `yoi plugin show` diagnostics distinguish request and WebSocket grant/target states。
+- No Ticket mutation, Dashboard channel, scheduler/reconnect daemon, direct model Tool call, or Discord-specific overreach found in reviewed branch。
+
+Blocking issues:
+- None。
+
+Non-blocking concerns:
+- None requiring changes。
+
+Reviewer validation:
+- `cargo fmt --check`: passed
+- `git diff --check 3eac7f8e..HEAD`: passed
+- `cargo test -p pod websocket`: passed
+- `cargo test -p manifest websocket`: passed
+- `cargo test -p yoi render_show_distinguishes_request_grant_statuses_and_broad_targets`: passed
+- `cargo test -p manifest request_host_api_manifest_and_grant_parse_with_request_names`: passed
+- `cargo check -p manifest -p pod -p yoi`: passed
+- `cargo run -p yoi -- ticket doctor`: passed
+- `nix build .#yoi --no-link`: passed; disk-space failure did not reproduce。
+
+Worktree status:
+- Clean on `impl/00001KVMGAEJN-plugin-websocket-host-api` at `a766048f`。
+- Branch diff no longer includes `.yoi/tickets/00001KVMGAEJN/*`。
+
+---
