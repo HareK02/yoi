@@ -199,3 +199,36 @@ Next action:
 - Route to read-only Reviewer Pod for acceptance review against the Ticket and IntentPacket。
 
 ---
+
+<!-- event: comment author: yoi-orchestrator at: 2026-06-21T07:48:53Z -->
+
+## Comment
+
+Review routing:
+
+Spawned read-only Reviewer Pod:
+- `yoi-reviewer-00001KVMG8FTW-r1`
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVMG8FTW-plugin-request-host-api`
+- Branch: `impl/00001KVMG8FTW-plugin-request-host-api`
+- Baseline: `4cd4a06e`
+- Implementation commit: `962b7699 plugin: replace https host api with request grants`
+- Diff: `4cd4a06e..962b7699`
+
+Reviewer scope:
+- read-only `/home/hare/Projects/yoi`
+
+Reviewer focus:
+- Active API/docs/WIT/CLI naming uses request, not stale https names。
+- No compatibility alias remains for old `host_api.https` / `grants.https` unless explicitly justified。
+- Runtime authorization requires both manifest request target and enablement grant before network I/O。
+- Grant-only and missing-grant cases fail closed / diagnose clearly。
+- Local/private/loopback targets require explicit declaration and grant。
+- WebSocket/SSE/persistent stream behavior is rejected or explicitly unsupported by `request`。
+- Broad/arbitrary URL grants are visibly distinguished。
+- Existing public HTTPS use case still works through request naming。
+
+Orchestrator will wait for reviewer verdict before integration。
+
+---
