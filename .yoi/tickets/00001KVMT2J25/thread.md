@@ -379,3 +379,59 @@ Worktree status:
 - Clean on `impl/00001KVMT2J25-inflight-snapshot`。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T11:53:00Z -->
+
+## Implementation report
+
+Coder r1-fix report received from `yoi-coder-00001KVMT2J25`.
+
+New fix commit:
+- `061136d7 fix: close in-flight snapshot commit race`
+
+Branch commits now:
+- `74aca6f6 fix: snapshot in-flight stream state`
+- `061136d7 fix: close in-flight snapshot commit race`
+
+Fix summary:
+- `crates/pod/src/ipc/server.rs`
+  - Connect-time snapshot now holds the in-flight stream lock while taking the session-log mirror snapshot, preventing finalized mirror-only `AssistantItem` entries from falling between committed snapshot entries and in-flight snapshot state。
+- `crates/pod/src/pod.rs`
+  - `append_entry` now clears matching in-flight assistant state and publishes finalized `AssistantItem` to the mirror under the same in-flight critical section。
+- `crates/pod/src/in_flight.rs`
+  - Added `clear_for_committed_item_then` helper for atomic clear + publish ordering。
+  - Added integrated regression tests:
+    - `session_log_and_in_flight_snapshot_prevents_mirror_only_assistant_gap`
+    - `committed_assistant_snapshot_does_not_duplicate_in_flight_block`
+- `crates/pod/src/ipc/alerter.rs`
+  - Removed earlier non-atomic combined alert/in-flight snapshot helper。
+- `crates/protocol/src/lib.rs`
+  - Fixed displaced `Greeting` doc comment。
+
+Coder validation reported:
+- `cargo fmt --all --check`: passed
+- `cargo test -p protocol`: passed
+- `cargo test -p pod --lib in_flight`: passed
+- `cargo test -p pod session_log_and_in_flight_snapshot_prevents_mirror_only_assistant_gap`: passed
+- `cargo test -p pod committed_assistant_snapshot_does_not_duplicate_in_flight_block`: passed
+- `cargo test -p tui snapshot_in_flight_blocks_continue_with_live_deltas`: passed
+- `cargo test -p tui`: passed
+- `cargo check -p protocol -p pod -p tui`: passed
+- `git diff --check`: passed
+- `target/debug/yoi ticket doctor`: passed
+
+Known unrelated validation note:
+- Full `cargo test -p pod` still fails only on the known unrelated prompt-resource assertions:
+  - `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`
+  - `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`
+
+Orchestrator evidence checked:
+- Implementation worktree clean on `impl/00001KVMT2J25-inflight-snapshot`。
+- HEAD is `061136d7`。
+- r1-fix diff `74aca6f6..HEAD` touches expected protocol/pod files: `crates/pod/src/in_flight.rs`, `crates/pod/src/ipc/alerter.rs`, `crates/pod/src/ipc/server.rs`, `crates/pod/src/pod.rs`, and `crates/protocol/src/lib.rs`。
+- `git diff --check 155e039e..HEAD` produced no diagnostics。
+
+Next action:
+- Route back to Reviewer for r2 verification of the commit-boundary race fix and final acceptance。
+
+---
