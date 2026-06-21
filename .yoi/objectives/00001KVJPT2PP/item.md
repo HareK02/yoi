@@ -2,8 +2,8 @@
 title: "Team workspace control plane and runner architecture"
 state: "active"
 created_at: "2026-06-20T14:26:29Z"
-updated_at: "2026-06-20T15:45:00Z"
-linked_tickets: []
+updated_at: "2026-06-21T06:57:06Z"
+linked_tickets: ["00001KVMFFYVX"]
 ---
 
 ## Goal
