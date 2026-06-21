@@ -119,3 +119,59 @@ Next action:
 - Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T11:05:28Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVMV03QY`.
+
+Implementation commit:
+- `66f04e04 feat: migrate workspace spa tooling to deno`
+
+Changed areas:
+- Added Deno-primary frontend tooling:
+  - `web/workspace/deno.json`
+  - `web/workspace/deno.lock`
+- Removed npm lockfile:
+  - deleted `web/workspace/package-lock.json`
+- Reduced `web/workspace/package.json` to minimal SvelteKit/Vite ecosystem metadata only:
+  - no scripts
+  - no dependencies
+  - `deno.json` / `deno.lock` are canonical source of truth
+- Updated `web/workspace/README.md` with Deno workflow:
+  - `deno install`
+  - `deno task check`
+  - `deno task build`
+  - npm compatibility usage and generated artifact boundaries
+- Preserved static SPA output path:
+  - `web/workspace/build/`
+
+Coder validation reported:
+- `cd web/workspace && deno task check`: passed
+- `cd web/workspace && deno task build`: passed
+- `cd web/workspace && deno task install`: passed
+- `git diff --check`: passed
+- `target/debug/yoi ticket doctor`: passed (`doctor: ok`)
+- Generated artifact ignore/source-filter check:
+  - `web/workspace/node_modules`, `.svelte-kit`, and `build` are ignored by `web/workspace/.gitignore`
+  - existing `package.nix` source filter already excludes those same trees
+
+Not run by Coder:
+- `nix build .#yoi --no-link`: not run because `package.nix` / source filter were not changed。
+- `cargo check -p yoi-workspace-server`: not run because Rust backend/static-serving assumptions and code were not changed。
+
+Generated artifacts cleanup:
+- Removed `web/workspace/node_modules/`, `.svelte-kit/`, and `build/` after validation。
+
+Orchestrator evidence checked:
+- Implementation worktree is clean on `impl/00001KVMV03QY-workspace-spa-deno`。
+- HEAD is `66f04e04`。
+- Diff `155e039e..HEAD` touches expected frontend tooling files only: `README.md`, `deno.json`, `deno.lock`, `package.json`, and deleted `package-lock.json`。
+- `git diff --check 155e039e..HEAD` produced no diagnostics。
+- `git status --ignored --short web/workspace` showed no remaining generated frontend artifacts。
+
+Next action:
+- Route to read-only Reviewer Pod for acceptance review against the Ticket。
+
+---
