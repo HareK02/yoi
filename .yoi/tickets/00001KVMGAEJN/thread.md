@@ -395,3 +395,52 @@ Worktree status:
 - Clean on `impl/00001KVMGAEJN-plugin-websocket-host-api`。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T13:16:05Z -->
+
+## Implementation report
+
+Coder r1-fix report received from `yoi-coder-00001KVMGAEJN`.
+
+New fix commit:
+- `a766048f fix: bound plugin websocket open`
+
+Branch commits now:
+- `4c1b8c3d feat: add plugin websocket host api`
+- `ce62d235 chore: keep plugin websocket branch code-only`
+- `a766048f fix: bound plugin websocket open`
+
+Fix summary:
+- `crates/pod/src/feature/plugin.rs`
+  - Added pre-dial WebSocket capacity reservation / permit flow。
+  - Max-open-connections now fails before invoking network client/open path。
+  - Reservation is released on open failure。
+  - Replaced sync `tungstenite` open path with bounded async `tokio-tungstenite` open under `tokio::time::timeout`。
+  - Added deterministic fail-closed abstraction for clients that cannot guarantee bounded/cancellable open。
+  - Added focused tests for max-open pre-dial rejection, open failure reservation cleanup, and unbounded open client fail-closed before dialing。
+- `crates/pod/Cargo.toml` / `Cargo.lock`
+  - Added `tokio-tungstenite` and `futures-util`。
+- `package.nix`
+  - Updated `cargoHash` to `sha256-cZxkmM42kbDp1Rv9gn4sCD5WIQLc0wCbjj4GbKjuA9Q=`。
+
+Coder validation reported:
+- `cargo fmt --check`: passed
+- `cargo test -p pod websocket`: passed
+- `cargo test -p manifest websocket`: passed
+- `cargo test -p yoi render_show_distinguishes_request_grant_statuses_and_broad_targets`: passed
+- `cargo test -p manifest request_host_api_manifest_and_grant_parse_with_request_names`: passed
+- `cargo check -p manifest -p pod -p yoi`: passed
+- `git diff --check 3eac7f8e..HEAD`: passed
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+
+Orchestrator evidence checked:
+- Worktree clean on `impl/00001KVMGAEJN-plugin-websocket-host-api` at `a766048f`。
+- r1-fix diff `ce62d235..HEAD` touches only `Cargo.lock`, `crates/pod/Cargo.toml`, `crates/pod/src/feature/plugin.rs`, and `package.nix`。
+- `git diff --name-status 3eac7f8e..HEAD -- .yoi/tickets/00001KVMGAEJN`: no output。
+- `git diff --check 3eac7f8e..HEAD`: passed。
+
+Next action:
+- Route back to Reviewer for r2 verification of WebSocket open capacity/timeout/cancellation bounds and final acceptance。
+
+---
