@@ -389,3 +389,26 @@ Workspace web に Repository / Objective pages を追加し、Orchestrator workt
 - Reviewer noted possible follow-ups: keep `#/objectives` sidebar link visible even on objective empty/error states, and further tighten remote URL sanitization for query-param or SCP-like token forms if needed。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T17:31:43Z -->
+
+## Implementation report
+
+Post-close cleanup completed。
+
+- Stopped child Pods and reclaimed scope:
+  - `yoi-coder-00001KVNGJPRG`
+  - `yoi-reviewer-00001KVNGJPRG-r1`
+- Removed ignored frontend validation artifacts from child worktree before worktree removal:
+  - `web/workspace/node_modules/`
+  - `web/workspace/.svelte-kit/`
+  - `web/workspace/build/`
+- Removed implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVNGJPRG-repository-objective-pages`
+- Deleted implementation branch:
+  - `impl/00001KVNGJPRG-repository-objective-pages`
+- Orchestrator worktree remains clean on `orchestration` at `4b1f1e59`。
+
+Root/original workspace was not used for merge/validation/cleanup operations。
+
+---
