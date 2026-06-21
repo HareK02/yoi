@@ -95,3 +95,94 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-21T11:35:44Z -->
+
+## Decision
+
+Routing decision: `implementation_ready`
+
+Reason:
+- Ticket was previously returned to planning because it needed concrete WebSocket connection ownership / lifecycle / permission model decisions。
+- Current Ticket body is now retitled and refined as implementation work: `Plugin: URL 権限ベースの WebSocket host API を実装する`。
+- It defines explicit `host_api.websocket` semantics, URL permission/grant model, lifecycle/bounds/non-goals, acceptance criteria, tests, docs, and validation。
+- Recorded dependency `00001KVMGAEJN depends_on 00001KVMG8FTW` is now satisfied because `00001KVMG8FTW` is `closed` and `host_api.request` URL permission model is integrated。
+- Relations / orchestration plan have no remaining blockers。
+- Active `00001KVMT2J25` work is protocol/pod/TUI reconnect snapshot and is semantically separate from Plugin WebSocket host API; parallel implementation is acceptable。
+- Orchestrator worktree is clean on `orchestration` at `d8027781` before routing side effects; target worktree / branch is not present。
+
+Evidence checked:
+- Ticket body / thread / artifacts via `TicketShow` and direct `item.md` read。
+- `TicketRelationQuery(00001KVMGAEJN)`: one `depends_on 00001KVMG8FTW`, target Ticket is `closed`。
+- `TicketOrchestrationPlanQuery(00001KVMGAEJN)`: no records。
+- `TicketList(state=queued)`: this Ticket is the only queued Ticket。
+- `ListPods`: only active child for other work is `yoi-reviewer-00001KVMT2J25-r1`。
+- Orchestrator git state / worktree list / branch list checked from `/home/hare/Projects/yoi/.worktree/orchestration` only。
+- Bounded code map:
+  - `crates/manifest/src/plugin.rs` now has `host_api.request`, `PluginRequestGrant`, and manifest request target schema。
+  - `crates/pod/src/feature/plugin.rs` has `PluginRequestClient`, `validate_plugin_request_request`, request allowlist inspection, and explicit WebSocket rejection in request path。
+  - No existing tungstenite/tokio-tungstenite/websocket dependency found in Cargo manifests。
+  - Docs currently state WebSocket/persistent transports require a separate Plugin capability。
+
+IntentPacket:
+
+Intent:
+- Add a separate URL-permission-based Plugin WebSocket host API, not an extension of `host_api.request`, suitable as a foundation for Discord/gateway-like integrations without implementing Discord itself。
+
+Binding decisions / invariants:
+- API name is `host_api.websocket`; do not fold WebSocket into `host_api.request`。
+- URL permission model should mirror/reuse the `host_api.request` target/grant review semantics where sensible, while keeping websocket-specific lifecycle/bounds explicit。
+- Authority requires both manifest-declared WebSocket target and enablement grant before opening a connection。
+- WebSocket connection is host-owned and Plugin-driven: guest requests open/send/recv/close via host API, but host enforces handles, bounds, timeouts, and shutdown cleanup。
+- No ambient network/socket access, no raw WASI sockets, no arbitrary URL by default。
+- Secrets/auth headers are not solved by guest-memory arbitrary credential headers; keep credential-bearing header policy conservative and explicit。
+- Incoming messages from WebSocket are delivered to the guest through explicit host API return values or bounded polling/receive operations, not hidden model context injection。
+- No direct model Tool calls, Ticket mutation, Dashboard UI channel, or hidden history/context mutation。
+- `host_api.request` must keep rejecting WebSocket/SSE/persistent connection attempts。
+- First slice should avoid full background daemon scheduler unless it is minimal and bounded; preserve instance lifecycle cleanup。
+
+Requirements / acceptance criteria:
+- Manifest can declare WebSocket targets independently from request targets。
+- Enablement config can grant WebSocket targets independently from request grants。
+- Static inspection / `yoi plugin show` reports WebSocket requested/granted/missing/broad diagnostics separately from request。
+- Runtime refuses connect unless manifest target and grant both allow the URL。
+- URL checks cover scheme (`ws`/`wss`), host, port, path prefix, and any method/protocol constraints chosen for handshake。
+- Local/private/loopback WebSocket targets require explicit declaration+grant。
+- WebSocket API has bounded handle lifetime, max frame/message size, max open connections per Plugin instance, timeout/cancellation behavior, and cleanup on instance stop/trap/drop。
+- Send/receive operations are bounded and typed; binary/text behavior is documented。
+- Credential-like headers are rejected or explicitly not supported until SecretRef/grants exist。
+- Tests cover allow/deny, grant-only/missing-grant, loopback allow/deny, broad diagnostics, request API still rejecting WebSocket, bounds/cleanup, and no hidden context mutation。
+
+Implementation latitude:
+- Rust dependency choice is Coder’s decision, e.g. `tokio-tungstenite` if suitable, but dependency/package/Nix implications must be handled。
+- WIT/API shape can be handle-based with `open`, `send_text`/`send_binary`, `recv`, `close`, or similar. Keep it minimal and reviewable。
+- If a fully live network integration test is hard, use local test server / mock client abstraction to validate runtime policy and handle lifecycle。
+- Reuse request target/grant matching helpers where appropriate, but avoid overgeneralizing if it obscures WebSocket semantics。
+
+Escalate if:
+- Implementing safe host-owned connection handles requires a broader Plugin service/instance actor redesign than current runtime supports。
+- SecretRef/auth header requirements become necessary for useful functionality。
+- Background receive delivery requires hidden context/history mutation or direct model Tool invocation。
+- Cargo/Nix dependency updates become blocked by unavailable crates or source filtering。
+- Public API compatibility for new WIT world/import names becomes unclear。
+
+Validation plan:
+- `cargo fmt --check`
+- Focused manifest tests for websocket permission/target/grant parsing and independence from request。
+- Focused pod plugin tests for connection allow/deny policy, loopback explicit grants, grant-only/missing-grant, bounds, handle cleanup, and request API rejection of WebSocket。
+- Focused yoi plugin CLI tests for WebSocket diagnostics。
+- `cargo check` for affected crates。
+- `git diff --check`
+- stale/boundary grep to ensure request docs still reject WebSocket and WebSocket docs do not claim hidden event injection。
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link` if dependencies/package/source-filter changed。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-21T11:35:51Z from: queued to: inprogress reason: human_authorized_dependency_satisfied_websocket_implementation field: state -->
+
+## State changed
+
+Human authorized queue routing from Workspace Dashboard. Previously recorded dependency on `00001KVMG8FTW` is now satisfied because `host_api.request` is closed/integrated, and this Ticket now has implementation-ready WebSocket host API requirements. Orchestrator accepts implementation.
+
+---
