@@ -1,9 +1,11 @@
 ---
 title: 'Workspace web control plane bootstrap'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-21T06:57:06Z'
-updated_at: '2026-06-21T06:58:09Z'
+updated_at: '2026-06-21T07:11:58Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-21T07:11:58Z'
 ---
 
 ## 背景
