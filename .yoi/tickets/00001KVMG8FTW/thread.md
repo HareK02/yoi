@@ -355,3 +355,63 @@ Next action:
 - Route back to Reviewer for r2 verification of static inspection/runtime coverage alignment and final acceptance。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVMG8FTW-r1 at: 2026-06-21T08:08:04Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- r1-fix diff `962b7699..0e14e7c1`:
+  - `crates/pod/src/feature/plugin.rs`
+  - `crates/yoi/src/plugin_cli.rs`
+  - `docs/development/plugin-development.md`
+- Overall changed-file set `4cd4a06e..0e14e7c1`:
+  - `crates/manifest/src/plugin.rs`
+  - `crates/pod/src/feature/plugin.rs`
+  - `crates/pod/src/pod.rs`
+  - `crates/yoi/src/plugin_cli.rs`
+  - `docs/design/plugin-component-model.md`
+  - `docs/development/plugin-development.md`
+  - `resources/plugin/wit/deps/yoi-host/yoi-host-v1.wit`
+  - `resources/plugin/wit/yoi-plugin-instance-v1.wit`
+  - `resources/plugin/wit/yoi-plugin-tool-v1.wit`
+
+Previous blocker verification:
+- r1 blocker is resolved。
+- Static inspection now evaluates request grant coverage/intersection rather than exact equality。
+- Exact manifest target + broad grant is now reported as granted/eligible with broad diagnostics, not `grant-only`。
+- Broad manifest target + narrower exact grant is now reported as runtime-eligible with partial-coverage diagnostics。
+- CLI/static inspection expectations were updated so broad grants are shown as usable grants, not ineligible grant-only。
+- DNS/private-target reviewer concern is documented in `docs/development/plugin-development.md`。
+
+Blocking issues:
+- None。
+
+Non-blocking concerns:
+- None requiring changes before merge。
+
+Overall Ticket satisfaction spot-check:
+- Active API/docs/WIT naming use `request`; stale active `host_api.https` / `grants.https` / `PluginHttps*` / old WIT names were not found under `crates docs resources`。
+- No compatibility alias for old HTTPS naming was visible in active code/docs。
+- Runtime still requires both manifest `host_api.request` / request target declaration and enablement `host_api.request` / matching request grant。
+- Runtime URL checks remain method/scheme/host/port/path based。
+- WebSocket URLs, upgrade headers, and SSE/event-stream requests remain rejected。
+- Embedded URL credentials and credential-like headers remain rejected。
+- Local/private/loopback targets are not ambient; documented authority is URL-host declaration + grant。
+
+Reviewer validation passed:
+- `cargo fmt --check`
+- `git diff --check 4cd4a06e..HEAD`
+- `cargo test -p manifest request --quiet` (`7 passed`)
+- `cargo test -p pod feature::plugin::tests --lib --quiet` (`69 passed`)
+- `cargo test -p yoi plugin_cli::tests --quiet` (`18 passed`)
+- `cargo check -p manifest -p pod -p yoi --quiet`
+- `target/debug/yoi ticket doctor` (`doctor: ok`)
+- Stale active naming grep under `crates docs resources`: no matches。
+
+Worktree status:
+- Clean at HEAD `0e14e7c1` on `impl/00001KVMG8FTW-plugin-request-host-api`。
+
+---
