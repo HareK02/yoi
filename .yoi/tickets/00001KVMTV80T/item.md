@@ -1,8 +1,8 @@
 ---
 title: 'Workspace server binary and CLI launcher'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-06-21T10:15:30Z'
-updated_at: '2026-06-21T10:16:04Z'
+updated_at: '2026-06-21T10:41:20Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-06-21T10:16:04Z'
