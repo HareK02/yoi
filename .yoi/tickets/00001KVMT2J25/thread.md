@@ -435,3 +435,54 @@ Next action:
 - Route back to Reviewer for r2 verification of the commit-boundary race fix and final acceptance。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVMT2J25-r1 at: 2026-06-21T11:56:44Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+r2 review result:
+- r1 blocker is resolved。
+- The fix establishes a single critical section around session-log mirror snapshot and in-flight snapshot, and uses the same in-flight lock while clearing/publishing finalized `AssistantItem`s。
+
+Relevant safe interleavings:
+- If connect-time snapshot gets the in-flight lock first: session-log snapshot may not include finalized mirror-only `AssistantItem`, but unfinished/finished in-flight block is still present in `Event::Snapshot.in_flight`。
+- If commit gets the in-flight lock first: it clears in-flight and publishes to session-log mirror under that lock, so later session-log snapshot includes finalized `AssistantItem` and `in_flight` is empty。
+- Since `AssistantItem` remains mirror-only for live clients, this avoids the previous “absent from both snapshot and live events” gap。
+- Duplicate prevention is preserved by clearing matching in-flight state before publishing finalized assistant entry。
+
+Files / diff inspected:
+- r1-fix diff `74aca6f6..061136d7`:
+  - `crates/pod/src/in_flight.rs`
+  - `crates/pod/src/ipc/alerter.rs`
+  - `crates/pod/src/ipc/server.rs`
+  - `crates/pod/src/pod.rs`
+  - `crates/protocol/src/lib.rs`
+- Overall scope/diff `155e039e..061136d7` against Ticket authority:
+  - `.yoi/tickets/00001KVMT2J25/item.md`
+  - `.yoi/tickets/00001KVMT2J25/thread.md`
+
+Blocking issues:
+- None。
+
+Non-blocking concerns:
+- None requiring changes. Integrated regression tests cover the r1 commit-boundary race and duplicate case。
+
+Reviewer validation:
+- `git diff --check 155e039e..HEAD`: passed
+- `cargo fmt --all --check`: passed
+- `cargo test -p protocol`: passed, 40 tests
+- `cargo test -p pod --lib in_flight`: passed, 5 selected tests
+- `cargo test -p pod session_log_and_in_flight_snapshot_prevents_mirror_only_assistant_gap`: passed
+- `cargo test -p pod committed_assistant_snapshot_does_not_duplicate_in_flight_block`: passed
+- `cargo test -p tui snapshot_in_flight_blocks_continue_with_live_deltas`: passed
+- `cargo test -p tui`: passed, 367 tests
+- `cargo check -p protocol -p pod -p tui`: passed
+- `target/debug/yoi ticket doctor`: passed (`doctor: ok`)
+- `cargo test -p pod`: failed only on the known unrelated prompt-resource assertions; summary 424 passed, 2 failed。
+
+Worktree status:
+- Clean on `impl/00001KVMT2J25-inflight-snapshot` at `061136d7`。
+
+---
