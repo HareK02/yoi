@@ -275,3 +275,36 @@ Next action:
 - Route to read-only Reviewer Pod for acceptance review against the Ticket。
 
 ---
+
+<!-- event: comment author: yoi-orchestrator at: 2026-06-21T11:31:55Z -->
+
+## Comment
+
+Review routing:
+
+Spawned read-only Reviewer Pod:
+- `yoi-reviewer-00001KVMT2J25-r1`
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVMT2J25-inflight-snapshot`
+- Branch: `impl/00001KVMT2J25-inflight-snapshot`
+- Baseline: `155e039e`
+- Implementation commit: `74aca6f6 fix: snapshot in-flight stream state`
+- Diff: `155e039e..74aca6f6`
+
+Reviewer scope:
+- read-only `/home/hare/Projects/yoi`
+
+Reviewer focus:
+- Snapshot/live subscription ordering is gap-free。
+- Seeded unfinished blocks and later live deltas do not duplicate content。
+- Accumulator lifecycle clears after durable assistant commit and does not leak across runs。
+- Tool-call args partial JSON string deltas accumulate correctly。
+- Thinking/reasoning blocks remain separated and safe。
+- Finished-run reconnect still restores finalized transcript normally。
+- No unfinished model output is persisted as finalized history。
+- TUI restore seeding is compatible with existing live delta handlers。
+
+Orchestrator will wait for reviewer verdict before integration。
+
+---
