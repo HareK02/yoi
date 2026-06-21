@@ -5,15 +5,24 @@ It is intentionally a read-only UI bootstrap: `.yoi/tickets` and
 `.yoi/objectives` remain canonical, and the Rust backend owns all business/API
 semantics.
 
-Package manager: npm with `package-lock.json` committed.
+Canonical frontend tooling: Deno. Dependency versions, tasks, and the committed
+lockfile are managed by `deno.json` and `deno.lock`.
+
+`package.json` is intentionally kept only as minimal SvelteKit/Vite ecosystem
+metadata (`type: module`, private package identity). It does not define scripts
+or dependencies and is not the package-manager source of truth.
 
 Commands:
 
 ```sh
-npm install
-npm run check
-npm run build
+deno install
+deno task check
+deno task build
 ```
+
+`deno task dev` and `deno task preview` are available for local frontend work.
+Deno uses npm compatibility for the SvelteKit/Vite toolchain, so `node_modules/`
+may be created as generated local state; do not check it in.
 
 Build output is `web/workspace/build/` and is not checked in. Point the Rust
 backend `ServerConfig.static_assets_dir` at that directory (or another static

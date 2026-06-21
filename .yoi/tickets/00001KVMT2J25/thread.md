@@ -112,3 +112,199 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-21T10:58:27Z -->
+
+## Decision
+
+Routing decision: `implementation_ready`
+
+Reason:
+- Ticket body は in-flight LLM response reconnect snapshot の問題、affected blocks、protocol/pod/TUI relevant files、acceptance criteria、validation が具体化されている。
+- `readiness: implementation_ready` で、relations / orchestration plan に blocker はない。
+- Requirements sync で Deno refinement は誤付与として分離済みで、この Ticket は original protocol reconnect scope に戻されている。
+- 同時 queued の `00001KVMV03QY` は frontend Deno tooling migration であり、この Ticket の protocol/pod/TUI stream-state work と主対象が異なるため並列実装可能と判断する。
+- Orchestrator worktree は clean on `orchestration` at `b4786b40` で、対象 Ticket 用 worktree / branch は未作成。
+
+Evidence checked:
+- Ticket body / thread / artifacts via `TicketShow` and direct `item.md` read。
+- `TicketRelationQuery(00001KVMT2J25)`: no relations / blockers。
+- `TicketOrchestrationPlanQuery(00001KVMT2J25)`: no records。
+- Orchestrator git state / worktree list / branch list checked from `/home/hare/Projects/yoi/.worktree/orchestration` only。
+- Bounded code map:
+  - `crates/protocol/src/lib.rs`: `Event::Snapshot`, `TextDelta`, `ThinkingDelta`, `ToolCallArgsDelta`, serialization tests。
+  - `crates/pod/src/segment_log_sink.rs`: committed `LogEntry` snapshot / live entry receiver。
+  - `crates/pod/src/controller.rs`: direct broadcast of streaming deltas and current controller comments around stream reconstruction。
+  - `crates/pod/src/ipc/server.rs`: connect-time snapshot event construction。
+  - `crates/tui/src/app.rs`: `restore_snapshot` and live delta handling for text/thinking/tool-call args。
+
+IntentPacket:
+
+Intent:
+- Ensure late attach / reconnect during an in-flight LLM response can display already-generated unfinished text/thinking/tool-call args, then continue live deltas without gaps or duplicates。
+
+Binding decisions / invariants:
+- Fix at protocol/pod state level, not TUI-only workaround。
+- Do not persist unfinished model output as finalized assistant history。
+- Do not mutate/replay provider stream itself。
+- Preserve committed session-log gap-free semantics。
+- Preserve post-run reconnect behavior from finalized Snapshot entries。
+- No hidden context/history injection。
+- Keep in-flight snapshot bounded and typed; if large/unbounded policy is required, escalate。
+
+Requirements / acceptance criteria:
+- New client connecting during response sees unfinished assistant text, thinking/reasoning, and tool-call args generated before connect。
+- Live deltas after connect append to same logical block without missing or duplicated content。
+- Completed run reconnect still restores finalized transcript from normal Snapshot entries。
+- Snapshot/live boundary gap-free / duplicate-free behavior is tested。
+- TUI Snapshot restore + live delta handling has regression coverage。
+- Focused validation covers protocol/pod/TUI relevant paths。
+
+Implementation latitude:
+- Add structured `in_flight` state to `Event::Snapshot`, or implement bounded/sequence replay buffer if cleaner。
+- Controller/Pod may keep current accumulators for text/thinking/tool-call args。
+- TUI may seed unfinished blocks from Snapshot and continue applying live deltas to the same block。
+- Wire compatibility should be minimal; prioritize type safety and maintainability。
+
+Escalate if:
+- Design requires persisting unfinished output as durable history item。
+- In-flight snapshot state becomes large enough to need truncation/bounding policy beyond a straightforward current-turn accumulator。
+- Public protocol compatibility policy becomes a product decision。
+- Scope spreads to Dashboard/Pod list preview or broader UX surfaces beyond TUI/console attach。
+
+Validation plan:
+- `cargo fmt --check`
+- Focused `cargo test -p protocol` roundtrip/serialization tests for snapshot in-flight state。
+- Focused `cargo test -p pod` tests for connect-time snapshot/live boundary and accumulator behavior。
+- Focused `cargo test -p tui` tests for snapshot seeding plus live delta continuation。
+- `cargo check -p protocol -p pod -p tui`
+- `git diff --check`
+- `yoi ticket doctor`。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-21T10:58:33Z from: queued to: inprogress reason: human_authorized_unblocked_protocol_stream_state_implementation field: state -->
+
+## State changed
+
+Human authorized queue routing from Workspace Dashboard. Ticket has concrete acceptance criteria, no recorded blockers, and is semantically separate from the frontend Deno tooling Ticket, so Orchestrator accepts implementation.
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T11:00:09Z -->
+
+## Implementation report
+
+Implementation start report:
+
+- Created child implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVMT2J25-inflight-snapshot`
+- Created branch:
+  - `impl/00001KVMT2J25-inflight-snapshot`
+- Base commit:
+  - `155e039e ticket: route deno and inflight snapshot work`
+- Confirmed tracked Ticket project records are visible in the child worktree。
+- Confirmed `.yoi/memory` has no tracked/untracked entries in the child worktree check。
+- Spawned sibling Coder Pod:
+  - `yoi-coder-00001KVMT2J25`
+- Coder scope:
+  - read: `/home/hare/Projects/yoi`
+  - write: `/home/hare/Projects/yoi/.worktree/00001KVMT2J25-inflight-snapshot`
+
+Parallelization note:
+- `00001KVMV03QY` is active in a separate child worktree and targets frontend Deno tooling. This Ticket should stay limited to protocol/pod/TUI in-flight snapshot semantics。
+
+Next action:
+- Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T11:31:12Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVMT2J25`.
+
+Implementation commit:
+- `74aca6f6 fix: snapshot in-flight stream state`
+
+Changed areas:
+- `crates/protocol/src/lib.rs`
+  - Added typed `InFlightSnapshot` / `InFlightBlock` state on `Event::Snapshot`。
+  - Added serialization/default compatibility coverage。
+- `crates/pod/src/in_flight.rs`
+  - New in-flight accumulator for assistant text, thinking/reasoning, and tool-call args。
+  - Snapshot/live boundary tests for no gap/duplicate。
+- `crates/pod/src/controller.rs`
+  - Streaming callbacks update the in-flight accumulator and broadcast live deltas from the same path。
+- `crates/pod/src/ipc/alerter.rs`, `crates/pod/src/ipc/server.rs`
+  - Connect-time snapshot now includes alerts plus typed in-flight stream state while subscribing live events。
+- `crates/pod/src/pod.rs`
+  - Clears matching in-flight blocks once committed assistant items reach durable session log entries。
+- `crates/tui/src/app.rs`
+  - Snapshot restore seeds unfinished assistant text/thinking/tool-call blocks。
+  - Live deltas continue those seeded blocks。
+  - Added regression coverage for snapshot seeding plus live continuation。
+- Other touched files update test Snapshot constructors for the new `in_flight` field。
+
+Coder validation reported:
+- `cargo fmt --all --check`: passed
+- `cargo test -p protocol`: passed
+- `cargo test -p protocol event_snapshot_in_flight_roundtrip_and_default`: passed
+- `cargo test -p pod in_flight`: passed
+- `cargo test -p pod subscribe_with_alerts_and_in_flight_snapshot_splits_snapshot_and_live_deltas`: passed
+- `cargo test -p tui`: passed
+- `cargo test -p tui snapshot_in_flight_blocks_continue_with_live_deltas`: passed
+- `cargo check -p protocol -p pod -p tui`: passed
+- `git diff --check`: passed
+- `target/debug/yoi ticket doctor`: passed
+
+Known unrelated validation note:
+- Full `cargo test -p pod` still fails on two prompt-resource assertion tests unrelated to this change:
+  - `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`
+  - `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`
+  - Both assert missing text: `worktree status, diff, and test results`。
+
+Orchestrator evidence checked:
+- Implementation worktree is clean on `impl/00001KVMT2J25-inflight-snapshot`。
+- HEAD is `74aca6f6`。
+- Diff `155e039e..HEAD` touches 17 protocol/pod/TUI files, adding `crates/pod/src/in_flight.rs` and updating Snapshot constructors/tests。
+- `git diff --check 155e039e..HEAD` produced no diagnostics。
+
+Next action:
+- Route to read-only Reviewer Pod for acceptance review against the Ticket。
+
+---
+
+<!-- event: comment author: yoi-orchestrator at: 2026-06-21T11:31:55Z -->
+
+## Comment
+
+Review routing:
+
+Spawned read-only Reviewer Pod:
+- `yoi-reviewer-00001KVMT2J25-r1`
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVMT2J25-inflight-snapshot`
+- Branch: `impl/00001KVMT2J25-inflight-snapshot`
+- Baseline: `155e039e`
+- Implementation commit: `74aca6f6 fix: snapshot in-flight stream state`
+- Diff: `155e039e..74aca6f6`
+
+Reviewer scope:
+- read-only `/home/hare/Projects/yoi`
+
+Reviewer focus:
+- Snapshot/live subscription ordering is gap-free。
+- Seeded unfinished blocks and later live deltas do not duplicate content。
+- Accumulator lifecycle clears after durable assistant commit and does not leak across runs。
+- Tool-call args partial JSON string deltas accumulate correctly。
+- Thinking/reasoning blocks remain separated and safe。
+- Finished-run reconnect still restores finalized transcript normally。
+- No unfinished model output is persisted as finalized history。
+- TUI restore seeding is compatible with existing live delta handlers。
+
+Orchestrator will wait for reviewer verdict before integration。
+
+---
