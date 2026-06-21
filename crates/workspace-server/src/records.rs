@@ -8,6 +8,7 @@ use ticket::{LocalTicketBackend, TicketFilter, TicketIdOrSlug};
 use crate::{Error, Result};
 
 const DETAIL_BODY_LIMIT: usize = 64 * 1024;
+const SUMMARY_BODY_LIMIT: usize = 240;
 
 #[derive(Debug, Clone)]
 pub struct LocalProjectRecordReader {
@@ -201,6 +202,7 @@ pub struct ObjectiveSummary {
     pub title: String,
     pub state: String,
     pub updated_at: Option<String>,
+    pub summary: String,
     pub linked_tickets: Vec<String>,
     pub record_source: String,
 }
@@ -233,13 +235,14 @@ struct ObjectiveFrontmatter {
 fn read_objective_summary(path: &Path, id: &str) -> Result<ObjectiveSummary> {
     validate_project_id(id)?;
     let raw = fs::read_to_string(path.join("item.md"))?;
-    let (frontmatter, _) = split_frontmatter(&raw, id)?;
+    let (frontmatter, body) = split_frontmatter(&raw, id)?;
     let meta: ObjectiveFrontmatter = serde_yaml::from_str(frontmatter)?;
     Ok(ObjectiveSummary {
         id: id.to_string(),
         title: meta.title,
         state: meta.state,
         updated_at: meta.updated_at,
+        summary: summarize_body(body),
         linked_tickets: meta.linked_tickets,
         record_source: "local_yoi_objective".to_string(),
     })
@@ -257,6 +260,20 @@ fn split_frontmatter<'a>(raw: &'a str, label: &str) -> Result<(&'a str, &'a str)
 
 fn validate_project_id(id: &str) -> Result<()> {
     validate_record_id(id).map_err(|_| Error::InvalidRecordId(id.to_string()))
+}
+
+fn summarize_body(body: &str) -> String {
+    let summary = body
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .unwrap_or_default();
+    let (summary, truncated) = truncate_body(summary, SUMMARY_BODY_LIMIT);
+    if truncated {
+        format!("{summary}…")
+    } else {
+        summary
+    }
 }
 
 fn truncate_body(body: &str, limit: usize) -> (String, bool) {

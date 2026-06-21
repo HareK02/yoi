@@ -15,15 +15,16 @@
   </div>
 
   <ul class="nav-list" aria-label="Repositories">
-    <li class="nav-item active">
-      <span class="item-title">{workspace?.display_name ?? 'local workspace'}</span>
-      <span class="item-meta">local project records</span>
+    <li>
+      <a class="nav-item active" href="#/repositories/local">
+        <span class="item-title">{workspace?.display_name ?? 'local workspace'}</span>
+        <span class="item-meta">local repository · read-only</span>
+      </a>
     </li>
   </ul>
 
   <p class="section-note">
-    Repository API is not wired yet; this placeholder keeps the navigation seam
-    ready without adding repository authority.
+    Repository authority remains the current workspace root and canonical project records.
   </p>
 </section>
 
@@ -74,6 +75,8 @@
     background: rgba(15, 23, 42, 0.64);
     padding: 10px 12px;
     min-width: 0;
+    color: inherit;
+    text-decoration: none;
   }
 
   .nav-item.active {

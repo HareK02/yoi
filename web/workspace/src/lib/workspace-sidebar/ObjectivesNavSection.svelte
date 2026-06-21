@@ -56,10 +56,18 @@
     <p class="section-state">No objectives found.</p>
   {:else}
     <ul class="nav-list" aria-label="Objectives">
+      <li>
+        <a class="nav-item active" href="#/objectives">
+          <span class="item-title">All objectives</span>
+          <span class="item-meta">read-only list</span>
+        </a>
+      </li>
       {#each objectives as objective (objective.id)}
-        <li class="nav-item">
-          <span class="item-title">{objective.title}</span>
-          <span class="item-meta">{objective.state}</span>
+        <li>
+          <a class="nav-item" href={`#/objectives/${objective.id}`}>
+            <span class="item-title">{objective.title}</span>
+            <span class="item-meta">{objective.state}</span>
+          </a>
         </li>
       {/each}
     </ul>
@@ -117,6 +125,8 @@
     background: rgba(15, 23, 42, 0.64);
     padding: 10px 12px;
     min-width: 0;
+    color: inherit;
+    text-decoration: none;
   }
 
   .item-title,
