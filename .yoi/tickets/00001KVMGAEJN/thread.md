@@ -214,3 +214,59 @@ Next action:
 - Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T12:20:55Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVMGAEJN`.
+
+Implementation commit reported:
+- `4c1b8c3d feat: add plugin websocket host api`
+
+Changed areas reported:
+- Manifest/config schema:
+  - Added independent `host_api.websocket` capability。
+  - Added manifest `[[websocket]]` targets and enablement `grants.websocket`。
+- Runtime:
+  - Added host-owned WebSocket handle lifecycle for raw Wasm and component imports。
+  - Added `open`, `send_text` / `send-text`, `recv`, and `close`。
+  - Enforces manifest+grant URL allowlist before network I/O。
+  - Bounds open descriptor size, text/message size, max open connections, recv timeout, handle lifetime, and cleanup。
+  - Rejects embedded credentials, guest handshake headers, unsupported subprotocols, non-`ws`/`wss` schemes, and binary message receive。
+- Static inspection / CLI:
+  - Reports WebSocket requested/granted/missing/grant-only/broad diagnostics separately from request diagnostics。
+  - `yoi plugin show` now includes `configured_websocket_grants`。
+- Docs/WIT:
+  - Added `yoi:host/websocket@1.0.0` WIT interface。
+  - Documented text-only API, explicit bounded receive, no hidden context/history injection, and future SecretRef credential follow-up。
+- Dependency/package:
+  - Added `tungstenite` to `crates/pod`。
+  - Updated `Cargo.lock`。
+  - Updated `package.nix` cargo hash to `sha256-TZrw6nJclXVRpFIUlYvimGTDXlxBMaQt6oM5C5DIGIU=`。
+
+Coder validation reported:
+- `cargo fmt --check`: passed
+- `cargo test -p manifest websocket`: passed
+- `cargo test -p pod websocket`: passed
+- `cargo test -p yoi render_show_distinguishes_request_grant_statuses_and_broad_targets`: passed
+- `cargo test -p manifest request_host_api_manifest_and_grant_parse_with_request_names`: passed
+- `cargo check -p manifest -p pod -p yoi`: passed
+- `git diff --check`: passed
+- stale/boundary grep for request/WebSocket docs and hidden context claims: passed
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+
+Nix status reported:
+- First `nix build .#yoi --no-link` exposed expected cargo hash mismatch; Coder updated `package.nix`。
+- After hash update, build advanced into dependency compilation then failed in sandbox compiling `aws-lc-sys` with `No space left on device`。
+- Coder treated this as environmental disk-space failure, not Rust/package hash failure。
+
+Orchestrator evidence checked:
+- Worktree clean at `4c1b8c3d`。
+- Diff `3eac7f8e..HEAD` includes expected code/docs/package areas but also includes child worktree edits to `.yoi/tickets/00001KVMGAEJN/{item.md,thread.md}`。
+- Because Orchestrator owns durable Ticket records in this workflow, Coder was asked to remove those `.yoi/tickets` edits from the implementation branch before Reviewer routing。
+
+Next action:
+- Wait for Coder hygiene fix, then route code-only implementation diff to Reviewer。
+
+---
