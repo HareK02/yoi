@@ -150,3 +150,58 @@ Next action:
 - Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T17:23:16Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVNGJPRG`.
+
+Implementation commit:
+- `ceb1ee3b feat: add repository objective pages`
+
+Changed areas:
+- Backend repository read APIs:
+  - Added `crates/workspace-server/src/repositories.rs`。
+  - Added bounded local repository/Git summary and log reader。
+  - Added endpoints:
+    - `/api/repositories`
+    - `/api/repositories/local`
+    - `/api/repositories/local/log`
+    - `/api/repositories/local/tickets`
+  - Added read-only Ticket Kanban grouping by Ticket state with workspace-local fallback diagnostic。
+  - Added Objective list summaries from existing filesystem Objective records。
+- Frontend Workspace SPA:
+  - Added hash-navigation pages for Repository and Objectives。
+  - Wired sidebar Repository/Objectives links to the new pages。
+  - Added Repository summary, Git summary/log, diagnostics, and read-only Ticket Kanban UI。
+  - Added Objective list with title/state/updated_at/summary and detail placeholder links。
+- Tests:
+  - Extended workspace-server API tests for repository endpoints and Objective summary。
+  - Added Git URL sanitization/log parsing unit tests。
+
+Coder validation reported:
+- `cargo fmt --all`: passed
+- `cargo fmt --check`: passed
+- `cargo test -p yoi-workspace-server`: passed
+- `cargo check -p yoi-workspace-server`: passed
+- `cd web/workspace && deno task check`: passed
+- `cd web/workspace && deno task build`: passed
+- `git diff --check`: passed
+- `cargo run -p yoi -- ticket doctor`: passed
+- `nix build .#yoi --no-link`: passed after staging newly added `repositories.rs` so Git-backed flake source filtering included it。
+
+Generated artifact cleanup:
+- Coder removed `web/workspace/build` and `web/workspace/.svelte-kit`。
+- Orchestrator additionally removed ignored `web/workspace/node_modules/` before Reviewer routing。
+
+Orchestrator evidence checked:
+- Worktree clean on `impl/00001KVNGJPRG-repository-objective-pages` at `ceb1ee3b`。
+- Diff `0f7e78c1..HEAD` touches 8 expected backend/frontend files, about 1228 insertions / 142 deletions。
+- `git diff --check 0f7e78c1..HEAD`: passed。
+- No generated frontend artifacts remain in child worktree status。
+
+Next action:
+- Route to read-only Reviewer Pod for acceptance review。
+
+---

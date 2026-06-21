@@ -2,7 +2,7 @@
 title: 'Workspace web: repository and objective pages'
 state: 'inprogress'
 created_at: '2026-06-21T16:35:19Z'
-updated_at: '2026-06-21T17:03:39Z'
+updated_at: '2026-06-21T17:23:16Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-21T16:40:35Z'
