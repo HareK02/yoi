@@ -1,11 +1,13 @@
 ---
 title: 'Plugin: URL 権限ベースの別 capability として WebSocket support を設計する'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-21T07:11:34Z'
-updated_at: '2026-06-21T07:14:05Z'
+updated_at: '2026-06-21T07:15:42Z'
 assignee: null
 readiness: 'requirements_sync_needed'
 risk_flags: ['plugin', 'host-api', 'websocket', 'service', 'ingress', 'lifecycle', 'permissions', 'security', 'persistence']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-21T07:15:42Z'
 ---
 
 ## User claims / request snapshot
