@@ -1,9 +1,9 @@
 package yoi:host@1.0.0;
 
-/// Grant-bound HTTPS host API. Importing this interface does not grant
+/// Grant-bound one-shot HTTP request host API. Importing this interface does not grant
 /// authority; package grants are checked before registration/execution and on
 /// every host call.
-interface https {
+interface request {
   request: func(request-json: string) -> string;
 }
 

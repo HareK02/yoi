@@ -152,3 +152,287 @@ Next action:
 - Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff. Orchestrator will not merge/close until reviewer approval and validation evidence are available。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T07:37:30Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVMFFYVX`.
+
+Implementation commit:
+- `ab7658c1 feat: bootstrap workspace web control plane`
+
+Changed areas:
+- New Cargo workspace crate:
+  - `crates/workspace-server`
+  - HTTP router with `/api/...` separation from static/SPA fallback。
+  - Local/dev workspace API state carrying `workspace_id`。
+  - Bounded read APIs for `/api/workspace`, `/api/tickets`, `/api/tickets/{id}`, `/api/objectives`, `/api/objectives/{id}`, `/api/runs`, `/api/runners`。
+  - Reserved extension-point response fields for future event streams and runner connections。
+- Store abstraction and SQLite implementation:
+  - `ControlPlaneStore` trait。
+  - `SqliteWorkspaceStore`。
+  - migration/version table。
+  - WAL, foreign keys, busy timeout。
+  - initial schema for workspace/runtime/projection seams while keeping `.yoi` records canonical。
+- Local project-record bridge:
+  - reads existing `.yoi/tickets`。
+  - reads existing `.yoi/objectives`。
+  - does not migrate or mutate canonical records。
+- SvelteKit static SPA skeleton:
+  - `web/workspace`
+  - npm + committed `package-lock.json`
+  - static adapter build output to `web/workspace/build`
+  - generated artifact handling documented in `web/workspace/README.md`。
+- Packaging/source handling:
+  - added Rust dependencies and updated `Cargo.lock`。
+  - updated `package.nix` cargo hash。
+  - excluded generated frontend directories from Nix package source filtering。
+
+Coder validation reported:
+- `cargo fmt --check`: passed
+- `cargo test -p yoi-workspace-server`: passed
+- `cargo check -p yoi-workspace-server`: passed
+- `cargo check -p yoi`: passed
+- `cd web/workspace && npm run check && npm run build`: passed
+- `git diff --check`: passed
+- `cargo run -p yoi -- ticket doctor`: passed
+- `cargo run -p yoi -- objective doctor`: passed
+- `nix build .#yoi --no-link`: passed after updating `cargoHash`
+
+Coder dependency/package/frontend decisions:
+- Used `axum` for HTTP routing。
+- Used `rusqlite` with bundled SQLite to avoid system SQLite packaging requirements。
+- Backend remains a library crate, not a product CLI façade。
+- No product `yoi` CLI command was added in this slice。
+- Frontend uses npm/SvelteKit static adapter with committed lockfile; generated build output is not checked in。
+- Nix package does not build frontend in this bootstrap; it excludes generated frontend artifacts from source filtering。
+
+Known deferrals reported:
+- No write API。
+- No runner job dispatch or scheduler。
+- No hosted/multi-tenant auth or SaaS behavior。
+- No event stream implementation yet; only reserved extension-point seam。
+- No checked-in generated SPA assets; backend can serve configured static directory such as `web/workspace/build` after running frontend build。
+
+Orchestrator evidence checked:
+- Implementation worktree is clean on `impl/00001KVMFFYVX-workspace-web-control-plane`。
+- HEAD is `ab7658c1`。
+- Diff `1d27f6c9..HEAD` touches expected backend/frontend/package files: 18 files, about 3377 insertions / 1 deletion。
+- `git diff --check 1d27f6c9..HEAD` produced no diagnostics。
+
+Next action:
+- Route to read-only Reviewer Pod for acceptance review against the Ticket and Objective context。
+
+---
+
+<!-- event: comment author: yoi-orchestrator at: 2026-06-21T07:38:14Z -->
+
+## Comment
+
+Review routing:
+
+Spawned read-only Reviewer Pod:
+- `yoi-reviewer-00001KVMFFYVX-r1`
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVMFFYVX-workspace-web-control-plane`
+- Branch: `impl/00001KVMFFYVX-workspace-web-control-plane`
+- Baseline: `1d27f6c9`
+- Implementation commit: `ab7658c1 feat: bootstrap workspace web control plane`
+- Diff: `1d27f6c9..ab7658c1`
+
+Reviewer scope:
+- read-only `/home/hare/Projects/yoi`
+
+Reviewer focus:
+- Acceptance criteria for backend crate, store abstraction + SQLite, static SPA, bounded read APIs, static/API route separation, package/Nix/frontend hygiene。
+- No write API / scheduler / SaaS overreach。
+- `.yoi` Ticket / Objective records remain canonical and read-only。
+- SQLite migrations/settings are deterministic and server-appropriate。
+- Frontend generated artifacts are not committed and source filtering is safe。
+- Validation evidence includes Rust tests/checks, frontend check/build, doctors, and `nix build .#yoi --no-link`。
+
+Orchestrator will wait for reviewer verdict before integration。
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KVMFFYVX-r1 at: 2026-06-21T07:44:49Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket/context:
+  - `.yoi/tickets/00001KVMFFYVX/item.md`
+  - `.yoi/tickets/00001KVMFFYVX/thread.md`
+  - `.yoi/objectives/00001KVJPT2PP/item.md`
+- Diff `1d27f6c9..ab7658c1`:
+  - `Cargo.toml`
+  - `Cargo.lock`
+  - `crates/workspace-server/Cargo.toml`
+  - `crates/workspace-server/src/lib.rs`
+  - `crates/workspace-server/src/server.rs`
+  - `crates/workspace-server/src/store.rs`
+  - `crates/workspace-server/src/records.rs`
+  - `package.nix`
+  - `web/workspace/package.json`
+  - `web/workspace/package-lock.json`
+  - `web/workspace/.gitignore`
+  - `web/workspace/README.md`
+  - `web/workspace/svelte.config.js`
+  - `web/workspace/vite.config.ts`
+  - `web/workspace/tsconfig.json`
+  - `web/workspace/src/app.html`
+  - `web/workspace/src/routes/+layout.ts`
+  - `web/workspace/src/routes/+page.svelte`
+
+Blocking issues:
+- None found。
+
+Acceptance verification:
+- New `yoi-workspace-server` crate is a library/backend crate, not a product CLI façade。
+- Existing `yoi` CLI ownership is preserved; `yoi` does not depend on the new crate。
+- HTTP routes are read-only `GET` routes for `/api/workspace`, `/api/tickets`, `/api/tickets/{id}`, `/api/objectives`, `/api/objectives/{id}`, `/api/runs`, `/api/runners`。
+- SPA/static fallback explicitly rejects `/api` and `/api/...`, so API paths are not swallowed by SPA fallback。
+- `.yoi/tickets` and `.yoi/objectives` remain canonical read sources; no `.yoi` write/migration path was introduced。
+- Store abstraction is explicit via `ControlPlaneStore`; SQLite is behind `SqliteWorkspaceStore`。
+- SQLite setup includes migrations/version table, WAL, foreign keys, and busy timeout。
+- Runtime tables for runs/runners are skeletal/read-only and do not implement scheduling or dispatch。
+- Auth is explicitly represented as local/dev placeholder, not production SaaS auth。
+- SvelteKit frontend is static SPA skeleton with npm lockfile; generated `node_modules`, `.svelte-kit`, and `build` are ignored/excluded。
+- `package.nix` source filtering excludes frontend generated artifacts; `nix build .#yoi --no-link` passed with updated cargo hash。
+
+Non-blocking concerns:
+- No committed CLI/binary entrypoint or full listener smoke test for starting the server end-to-end. Library exposes `serve(...)` and router tests cover API/static separation, acceptable for bootstrap; follow-up should add launch surface when product command is designed。
+- Detail responses for tickets/objectives do not include `workspace_id`, while list/runtime responses do. Future multi-workspace API expansion should make detail shapes consistently workspace-qualified。
+- Missing valid objective IDs appear likely to map filesystem `Io` errors to HTTP 500 rather than 404. Tighten when read API contract is hardened。
+- Static path traversal rejects `..`, but symlink escape hardening is not implemented. Acceptable for configured local build/static directory and local/dev bootstrap, revisit before non-local exposure。
+
+Reviewer validation:
+- `cargo fmt --check`: passed
+- `git diff --check 1d27f6c9..HEAD`: passed
+- `cargo test -p yoi-workspace-server`: passed
+- `cargo check -p yoi-workspace-server`: passed
+- `cargo check -p yoi`: passed
+- `cd web/workspace && npm run check && npm run build`: initially failed because `node_modules` absent。
+- `cd web/workspace && npm ci && npm run check && npm run build`: passed
+- `cargo run -p yoi -- ticket doctor`: passed
+- `cargo run -p yoi -- objective doctor`: passed
+- `nix build .#yoi --no-link`: passed
+- Focused route/static validation:
+  - Inspected router definitions and fallback logic。
+  - Existing `yoi-workspace-server` tests exercise `/api/workspace`, `/api/tickets`, `/api/objectives`, `/api/runners`, static asset serving, SPA fallback, and `/api/...` miss separation。
+  - Store migration/persistence and local record read bridge are covered by crate tests。
+
+Worktree status:
+- Tracked worktree clean at `ab7658c1` on `impl/00001KVMFFYVX-workspace-web-control-plane`。
+- Ignored validation artifacts remain in the implementation worktree: `web/workspace/node_modules/`, `web/workspace/.svelte-kit/`, `web/workspace/build/`。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T07:45:59Z -->
+
+## Implementation report
+
+Reviewer r1 approvalを受けて、実装ブランチを Orchestrator worktree の `orchestration` branch に統合した。
+
+統合:
+- Merge commit: `3e03e536 merge: workspace web control plane`
+- Merged branch: `impl/00001KVMFFYVX-workspace-web-control-plane`
+- Implementation commit:
+  - `ab7658c1 feat: bootstrap workspace web control plane`
+
+Orchestrator worktree validation:
+- `cargo fmt --check`: passed
+- `git diff --check HEAD^1..HEAD`: passed
+- `cargo test -p yoi-workspace-server`: passed
+- `cargo check -p yoi-workspace-server`: passed
+- `cargo check -p yoi`: passed
+- `cd web/workspace && npm ci && npm run check && npm run build`: passed
+  - `npm ci` reported 4 low severity vulnerabilities via npm audit output; build/check succeeded and no blocking validation failure occurred。
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `cargo run -p yoi -- objective doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+
+Validation generated ignored frontend artifacts in Orchestrator worktree:
+- `web/workspace/node_modules/`
+- `web/workspace/.svelte-kit/`
+- `web/workspace/build/`
+
+These were removed after validation. Final Orchestrator worktree status after validation cleanup is clean on `orchestration` at `3e03e536`。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-21T07:46:04Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Reviewer approval、Orchestrator worktree への統合、Rust/frontend/Nix/doctor validation が完了したため `done` に遷移する。
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-21T07:46:19Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-21T07:46:19Z status: closed -->
+
+## 完了
+
+Workspace web control plane bootstrap を実装し、Orchestrator worktree の `orchestration` branch に統合した。
+
+主な成果:
+- New backend library crate `yoi-workspace-server` / `crates/workspace-server` を追加。
+- Axum-based read-only HTTP API と static/SPA serving surface を追加。
+- `/api/...` と static/SPA fallback を分離し、API route miss を SPA fallback に飲ませない設計にした。
+- `ControlPlaneStore` trait と SQLite implementation `SqliteWorkspaceStore` を追加。
+- SQLite migration/version table、WAL、foreign keys、busy timeout を設定。
+- `.yoi/tickets` と `.yoi/objectives` を canonical read sources として扱う local project-record bridge を追加し、既存 record workflow を移行・変更しない。
+- Read APIs: `/api/workspace`, `/api/tickets`, `/api/tickets/{id}`, `/api/objectives`, `/api/objectives/{id}`, `/api/runs`, `/api/runners`。
+- Future runner/event-stream extension seams を response/state shape に用意しつつ、scheduler/runner dispatch/write API は実装しない。
+- SvelteKit static SPA skeleton を `web/workspace` に追加し、npm lockfile、static adapter、README、generated artifact ignore/source-filter handling を追加。
+- `Cargo.lock` と `package.nix` cargo hash / source filtering を更新。
+
+統合・検証:
+- Merge commit: `3e03e536 merge: workspace web control plane`
+- Implementation commit: `ab7658c1 feat: bootstrap workspace web control plane`
+- Reviewer final verdict: approve
+- Validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p yoi-workspace-server`, `cargo check -p yoi-workspace-server`, `cargo check -p yoi`, `cd web/workspace && npm ci && npm run check && npm run build`, `cargo run -p yoi -- ticket doctor`, `cargo run -p yoi -- objective doctor`, and `nix build .#yoi --no-link`。
+
+範囲外 / deferrals:
+- Product CLI/server launch command は未追加。backend library exposes `serve(...)`; launch surface は future Ticket で設計する。
+- Write API、runner job dispatch、scheduler、hosted/multi-tenant auth、billing/quota、memory migration は実装していない。
+- Event stream implementation は未実装で、extension seam のみ。
+- Generated SPA assets are not committed; configured static directory such as `web/workspace/build` can be served after frontend build。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T07:46:46Z -->
+
+## Implementation report
+
+Post-close cleanup completed。
+
+- Stopped child Pods and reclaimed scope:
+  - `yoi-coder-00001KVMFFYVX`
+  - `yoi-reviewer-00001KVMFFYVX-r1`
+- Removed ignored frontend validation artifacts from child worktree before worktree removal:
+  - `web/workspace/node_modules/`
+  - `web/workspace/.svelte-kit/`
+  - `web/workspace/build/`
+- Removed implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVMFFYVX-workspace-web-control-plane`
+- Deleted implementation branch:
+  - `impl/00001KVMFFYVX-workspace-web-control-plane`
+- Orchestrator worktree remains clean on `orchestration` at `f33415c7`。
+
+Root/original workspace was not used for merge/validation/cleanup operations。
+
+---

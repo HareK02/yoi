@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KVMGAEJN",
+      "kind": "depends_on",
+      "target": "00001KVMG8FTW",
+      "note": "WebSocket capability design should reuse or deliberately diverge from the URL permission/request-target schema produced by `host_api.request`; current Ticket remains requirements_sync_needed until those design decisions are resolved.",
+      "author": "yoi-orchestrator",
+      "at": "2026-06-21T07:17:46Z"
+    }
+  ]
+}

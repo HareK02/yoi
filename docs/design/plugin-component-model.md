@@ -150,7 +150,7 @@ runtime, so registration and execution still flow through the existing
 ToolRegistry and Worker Tool-result history path.
 
 Host imports are stable names under `yoi:host/*@1.0.0`; the repository WIT files
-live in `resources/plugin/wit/`. Importing `yoi:host/https@1.0.0` or
+live in `resources/plugin/wit/`. Importing `yoi:host/request@1.0.0` or
 `yoi:host/fs@1.0.0` is not authority. The runtime checks package grants before
 component instantiation and checks again on every host call. No WASI filesystem,
 network, environment, or other ambient imports are linked.
@@ -176,7 +176,7 @@ The v1 component world intentionally keeps Tool input, Tool output, and host API
 payloads as JSON strings. This is a migration bridge that preserves the existing
 ToolOutput schema, Tool history behavior, grant checks, and raw-Wasm host API
 semantics while moving package authors onto WIT/canonical ABI bindings.
-Structured WIT records for Tool requests/responses/errors and host HTTPS/FS
+Structured WIT records for Tool requests/responses/errors and host request/FS
 payloads are deferred to a follow-up API-design step rather than accidentally
 omitted.
 
