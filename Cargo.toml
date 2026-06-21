@@ -24,6 +24,7 @@ members = [
     "crates/ticket",
     "crates/project-record",
     "crates/workflow",
+    "crates/workspace-server",
     "tests/e2e",
 ]
 default-members = [
@@ -50,6 +51,7 @@ default-members = [
     "crates/ticket",
     "crates/project-record",
     "crates/workflow",
+    "crates/workspace-server",
 ]
 
 [workspace.package]
@@ -80,21 +82,26 @@ session-store = { path = "crates/session-store" }
 secrets = { path = "crates/secrets" }
 tools = { path = "crates/tools" }
 tui = { path = "crates/tui" }
+yoi-workspace-server = { path = "crates/workspace-server" }
 
 # External
 # Note: `reqwest` and `chrono` are not aggregated here because some crates
 # need `default-features = false`, which workspace inheritance cannot override.
 async-trait = "0.1"
+axum = "0.8"
 fs4 = "0.13"
 futures = "0.3"
 libc = "0.2"
 schemars = "1.2"
 serde = "1.0"
 serde_json = "1.0"
+serde_yaml = "0.9.34"
+rusqlite = { version = "0.37", features = ["bundled"] }
 sha2 = "0.11"
 tempfile = "3.27"
 thiserror = "2.0"
 tokio = "1.52"
+tower = "0.5"
 toml = "1.1"
 tracing = "0.1"
 uuid = "1.23"

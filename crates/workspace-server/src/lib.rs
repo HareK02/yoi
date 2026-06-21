@@ -1,0 +1,35 @@
+//! Local workspace web control plane backend bootstrap.
+//!
+//! This crate deliberately provides backend building blocks and an HTTP router;
+//! it is not the product CLI facade. Existing `.yoi` Ticket and Objective files
+//! remain the canonical project records and are read through bounded bridge APIs.
+
+pub mod records;
+pub mod server;
+pub mod store;
+
+pub use records::{
+    LocalProjectRecordReader, ObjectiveDetail, ObjectiveSummary, TicketDetail, TicketSummary,
+};
+pub use server::{AuthConfig, ServerConfig, WorkspaceApi, build_router, serve};
+pub use store::{ControlPlaneStore, SqliteWorkspaceStore, WorkspaceRecord};
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("sqlite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("ticket error: {0}")]
+    Ticket(#[from] ticket::TicketError),
+    #[error("yaml error: {0}")]
+    Yaml(#[from] serde_yaml::Error),
+    #[error("invalid project record id `{0}`")]
+    InvalidRecordId(String),
+    #[error("record `{0}` is missing frontmatter")]
+    MissingFrontmatter(String),
+    #[error("store error: {0}")]
+    Store(String),
+}
