@@ -205,3 +205,36 @@ Next action:
 - Route to read-only Reviewer Pod for acceptance review。
 
 ---
+
+<!-- event: comment author: yoi-orchestrator at: 2026-06-21T17:23:58Z -->
+
+## Comment
+
+Review routing:
+
+Spawned read-only Reviewer Pod:
+- `yoi-reviewer-00001KVNGJPRG-r1`
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVNGJPRG-repository-objective-pages`
+- Branch: `impl/00001KVNGJPRG-repository-objective-pages`
+- Baseline: `0f7e78c1`
+- Implementation commit: `ceb1ee3b feat: add repository objective pages`
+- Diff: `0f7e78c1..ceb1ee3b`
+
+Reviewer scope:
+- read-only `/home/hare/Projects/yoi`
+
+Reviewer focus:
+- Read-only bounded Repository APIs and Git summaries。
+- No diffs/file contents/blame/secret-like config exposure。
+- Sanitized remote URL summary。
+- Non-Git degradation。
+- Read-only Ticket Kanban grouped by state。
+- Objective list uses filesystem read-through records。
+- Static SPA navigation/pages and section-local error handling。
+- Generated artifact / Nix source filtering hygiene。
+
+Orchestrator will wait for reviewer verdict before integration。
+
+---
