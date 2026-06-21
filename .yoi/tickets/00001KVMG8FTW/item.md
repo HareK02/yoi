@@ -1,8 +1,8 @@
 ---
 title: 'Plugin: host_api.https を廃止して URL 権限ベースの host_api.request に統合する'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-06-21T07:10:30Z'
-updated_at: '2026-06-21T08:08:04Z'
+updated_at: '2026-06-21T08:12:06Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['plugin', 'host-api', 'public-api', 'permissions', 'security', 'local-network', 'breaking-change']

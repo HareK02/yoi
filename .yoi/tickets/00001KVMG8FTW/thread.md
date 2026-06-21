@@ -415,3 +415,78 @@ Worktree status:
 - Clean at HEAD `0e14e7c1` on `impl/00001KVMG8FTW-plugin-request-host-api`。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T08:11:43Z -->
+
+## Implementation report
+
+Reviewer r2 approvalを受けて、実装ブランチを Orchestrator worktree の `orchestration` branch に統合した。
+
+統合:
+- Merge commit: `8a15cca5 merge: plugin request host api`
+- Merged branch: `impl/00001KVMG8FTW-plugin-request-host-api`
+- Implementation commits:
+  - `962b7699 plugin: replace https host api with request grants`
+  - `0e14e7c1 plugin: align request grant inspection coverage`
+
+Orchestrator worktree validation:
+- `cargo fmt --check`: passed
+- `git diff --check HEAD^1..HEAD`: passed
+- `cargo test -p manifest request --quiet`: passed (`7 passed`)
+- `cargo test -p pod feature::plugin::tests --lib --quiet`: passed (`69 passed`)
+- `cargo test -p yoi plugin_cli::tests --quiet`: passed (`18 passed`)
+- `cargo check -p manifest -p pod -p yoi --quiet`: passed
+- Stale active naming grep: `git grep -n -E 'host_api\.https|grants\.https|PluginHttps|yoi:host/https|yoi:https' -- crates docs resources`: no matches
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+
+Final Orchestrator worktree status after validation: clean on `orchestration` at `8a15cca5`。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-21T08:11:51Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Reviewer approval、Orchestrator worktree への統合、focused plugin request tests/checks、stale naming grep、Ticket doctor、Nix build が完了したため `done` に遷移する。
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-21T08:12:06Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-21T08:12:06Z status: closed -->
+
+## 完了
+
+Plugin host API の one-shot outbound request capability を `host_api.https` / `grants.https` から URL permission based `host_api.request` に置き換え、Orchestrator worktree の `orchestration` branch に統合した。
+
+主な成果:
+- Active API / docs / WIT naming を `request` に移行。
+- Manifest に `host_api.request` と `[[request]]` target declaration を追加。
+- Enablement grant を request target grant として扱うよう変更。
+- Runtime authorization を manifest-declared request target と enabled request grant の両方が URL/method/scheme/host/port/path coverage で許可する場合のみ network I/O に進む形にした。
+- Grant-only / missing-grant / broad / partial-coverage states を static inspection と `yoi plugin show` diagnostics で区別。
+- Broad/covering grant と broad manifest + narrower grant の intersection semantics を runtime と static inspection で一致させた。
+- Loopback/local/private target は ambient ではなく、URL host declaration + grant に基づく明示 authority として扱う方針を docs に記録。
+- Embedded credentials、credential-like headers、WebSocket URLs/upgrades、SSE/event-stream requests を reject/unsupported にした。
+- Old `host_api.https` / `grants.https` / `PluginHttps*` / old WIT names は active code/docs/resources から削除。
+- Focused manifest / pod / yoi plugin CLI tests を追加・更新。
+
+統合・検証:
+- Merge commit: `8a15cca5 merge: plugin request host api`
+- Implementation commits: `962b7699`, `0e14e7c1`
+- Reviewer final verdict: approve
+- Validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p manifest request --quiet`, `cargo test -p pod feature::plugin::tests --lib --quiet`, `cargo test -p yoi plugin_cli::tests --quiet`, `cargo check -p manifest -p pod -p yoi --quiet`, stale active naming grep, `cargo run -p yoi -- ticket doctor`, and `nix build .#yoi --no-link`。
+
+範囲外:
+- Regex URL target matching は追加していない。
+- WebSocket/SSE/persistent connection support は `host_api.request` に含めていない。WebSocket は別 capability / design Ticket 側で扱う。
+
+---
