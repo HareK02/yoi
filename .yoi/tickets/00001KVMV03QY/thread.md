@@ -354,3 +354,26 @@ Workspace web SPA の frontend tooling を npm/Node-primary から Deno-primary 
 - SSR / Deno runtime server / Deno Deploy assumptions は追加していない。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T11:14:27Z -->
+
+## Implementation report
+
+Post-close cleanup completed。
+
+- Stopped child Pods and reclaimed scope:
+  - `yoi-coder-00001KVMV03QY`
+  - `yoi-reviewer-00001KVMV03QY-r1`
+- Removed ignored frontend validation artifacts from child worktree before worktree removal:
+  - `web/workspace/node_modules/`
+  - `web/workspace/.svelte-kit/`
+  - `web/workspace/build/`
+- Removed implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVMV03QY-workspace-spa-deno`
+- Deleted implementation branch:
+  - `impl/00001KVMV03QY-workspace-spa-deno`
+- Orchestrator worktree remains clean on `orchestration` at `54d325ae`。
+
+Root/original workspace was not used for merge/validation/cleanup operations。
+
+---
