@@ -69,3 +69,20 @@ Required next planning output before queueing again:
 Ticket remains `requirements_sync_needed` and has unresolved design questions around connection ownership, incoming-message dispatch path, lifecycle bounds, auth/secrets handling, and design-vs-implementation scope. Returning to planning rather than starting implementation side effects.
 
 ---
+
+<!-- event: intake_summary author: hare at: 2026-06-21T11:01:20Z -->
+
+## Intake summary
+
+Marked ready by `yoi ticket state`.
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-06-21T11:01:20Z from: planning to: ready reason: cli_state field: state -->
+
+## State changed
+
+Marked ready by `yoi ticket state`.
+
+
+---
