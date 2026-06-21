@@ -232,3 +232,79 @@ Reviewer focus:
 Orchestrator will wait for reviewer verdict before integration。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVMG8FTW-r1 at: 2026-06-21T07:58:08Z status: request_changes -->
+
+## Review: request changes
+
+Verdict: `request_changes`
+
+確認範囲:
+- Ticket authority:
+  - `.yoi/tickets/00001KVMG8FTW/item.md`
+  - `.yoi/tickets/00001KVMG8FTW/thread.md`
+- Implementation diff `4cd4a06e..962b7699`:
+  - `crates/manifest/src/plugin.rs`
+  - `crates/pod/src/feature/plugin.rs`
+  - `crates/pod/src/pod.rs`
+  - `crates/yoi/src/plugin_cli.rs`
+  - `docs/design/plugin-component-model.md`
+  - `docs/development/plugin-development.md`
+  - `resources/plugin/wit/deps/yoi-host/yoi-host-v1.wit`
+  - `resources/plugin/wit/yoi-plugin-instance-v1.wit`
+  - `resources/plugin/wit/yoi-plugin-tool-v1.wit`
+
+Blocking issue:
+
+1. Static inspection and runtime authorization disagree for broad / covering request grants。
+
+Static inspection currently treats request target grants as matching only by exact equality:
+- `crates/pod/src/feature/plugin.rs:420-425`
+  - `let granted = record.grants.request.iter().any(|grant| grant == target);`
+- `crates/pod/src/feature/plugin.rs:440-455`
+  - grants without exact equality are reported as `grant-only`, `eligible=false`。
+
+Runtime authorization checks manifest targets and grants independently by URL coverage:
+- `crates/pod/src/feature/plugin.rs:1397-1409`
+  - URL must be allowed by some manifest target and some enabled grant。
+- `crates/pod/src/feature/plugin.rs:1420-1449`
+  - broad grants such as `*://*` or broader path/host scopes can cover a concrete URL even when not equal to the manifest target。
+
+Concrete mismatch:
+- Manifest declares exact target: `https://api.example.test ... /v1`
+- Enablement grants broad target: `*://* GET *`
+- Inspection reports:
+  - manifest target `requested=true granted=false eligible=false`
+  - broad grant as `grant-only ... eligible=false`
+- Runtime still allows `GET https://api.example.test/v1/data`, because URL is covered by both manifest target and broad grant。
+
+The added CLI test appears to codify this inconsistent reporting:
+- `crates/yoi/src/plugin_cli.rs:1566-1574`
+  - expects broad grant display as `grant-only`
+  - expects requested target as `granted=false eligible=false`
+
+This violates the Ticket acceptance/invariants that inspection distinguish requested/granted/denied/broad request permissions accurately, and that grant-only / requested-but-ungranted cases do not silently diverge from runtime behavior。
+
+Required fix:
+- Align static inspection and runtime semantics。
+- If broad / covering grants are valid authorization for declared manifest targets, inspection should report the manifest target as covered/granted, while visibly labeling the covering grant as broad。
+- If only exact target grants are intended to authorize, runtime should deny non-equal grant coverage before network I/O。
+- Apply same reasoning to the inverse shape: broad manifest request plus narrower exact grant can be runtime-allowed for URLs in the intersection while inspection currently reports both sides as ineligible/grant-only。
+
+Non-blocking concern:
+- DNS/private-target semantics are now URL-permission based rather than resolved-address-category based。There is an explicit test allowing a declared/granted hostname to resolve to `127.0.0.1` (`crates/pod/src/feature/plugin.rs:4841-4847`)。This may be acceptable under the new model, but it should be documented/reconfirmed because the Ticket says local/private communication must not be ambient。The implementation interprets “explicit” as declared/granted URL host, not necessarily literal `localhost` / private IP grant。
+
+Reviewer validation passed:
+- `cargo fmt --check`
+- `git diff --check 4cd4a06e..HEAD`
+- `cargo test -p manifest request --quiet` (`7 passed`)
+- `cargo test -p pod feature::plugin::tests --lib --quiet` (`67 passed`)
+- `cargo test -p yoi plugin_cli::tests --quiet` (`18 passed`)
+- `cargo check -p manifest -p pod -p yoi --quiet`
+- `target/debug/yoi ticket doctor`
+- Stale active naming grep under `crates docs resources` for `host_api.https|grants.https|PluginHttps|yoi:host/https|yoi:https`: no matches。
+
+Worktree status:
+- Clean on `impl/00001KVMG8FTW-plugin-request-host-api`。
+
+---
