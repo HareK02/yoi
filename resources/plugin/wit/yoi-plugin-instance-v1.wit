@@ -2,6 +2,7 @@ package yoi:plugin@1.0.0;
 
 world instance {
   import yoi:host/request@1.0.0;
+  import yoi:host/websocket@1.0.0;
   import yoi:host/fs@1.0.0;
 
   export start: func(config-json: string) -> string;

@@ -186,3 +186,37 @@ Validation plan:
 Human authorized queue routing from Workspace Dashboard. Previously recorded dependency on `00001KVMG8FTW` is now satisfied because `host_api.request` is closed/integrated, and this Ticket now has implementation-ready WebSocket host API requirements. Orchestrator accepts implementation.
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-21T12:18:54Z -->
+
+## Implementation report
+
+Implemented a separate `host_api.websocket` Plugin host API foundation.
+
+Summary:
+- Added independent manifest and enablement `websocket` URL target/grant schema with `host_api.websocket` permission naming.
+- Added static inspection/CLI diagnostics for requested/granted/missing/grant-only/broad WebSocket targets independently from request targets.
+- Added host-owned WebSocket handles for raw Wasm and component imports: open, send_text/send-text, recv, close.
+- Runtime enforces manifest+grant URL allowlist before network I/O; checks ws/wss scheme, host, port, path prefix, embedded credentials, and unsupported handshake headers/subprotocols.
+- Added bounded text-only send/recv behavior, connection-count/handle-lifetime/message-size/timeouts, and cleanup on close/instance stop/drop.
+- Kept `host_api.request` WebSocket/SSE rejection intact.
+- Documented WIT and plugin development guidance including no hidden context/history injection and future SecretRef credential injection.
+
+Validation run:
+- `cargo fmt --check`
+- `cargo test -p manifest websocket`
+- `cargo test -p pod websocket`
+- `cargo test -p yoi render_show_distinguishes_request_grant_statuses_and_broad_targets`
+- `cargo test -p manifest request_host_api_manifest_and_grant_parse_with_request_names`
+- `cargo check -p manifest -p pod -p yoi`
+- `git diff --check`
+- stale/boundary grep for request/WebSocket docs and hidden context claims
+- `cargo run -p yoi -- ticket doctor` -> `doctor: ok`
+
+Dependency/package notes:
+- Added sync `tungstenite` dependency to `crates/pod` with `native-tls`, `handshake`, and `url` features.
+- Updated `Cargo.lock` and `package.nix` `cargoHash` to `sha256-TZrw6nJclXVRpFIUlYvimGTDXlxBMaQt6oM5C5DIGIU=`.
+- `nix build .#yoi --no-link` advanced past the cargo hash mismatch after updating the hash, then failed in the sandbox while compiling `aws-lc-sys` due `No space left on device`; this appears environmental rather than a Rust/package hash error.
+
+
+---

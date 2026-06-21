@@ -14,7 +14,7 @@ use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use llm_worker::tool::{
@@ -24,11 +24,14 @@ use manifest::plugin::{
     PLUGIN_COMPONENT_INSTANCE_WORLD, PLUGIN_COMPONENT_TOOL_WORLD, PLUGIN_RUNTIME_COMPONENT_KIND,
     PLUGIN_RUNTIME_WASM_ABI, PLUGIN_RUNTIME_WASM_KIND, PluginConfig, PluginDiscoveryLimits,
     PluginFsGrant, PluginFsOperation, PluginHostApi, PluginPermission, PluginRequestGrant,
-    PluginSurface, PluginToolManifest, ResolvedPluginRecord,
+    PluginSurface, PluginToolManifest, PluginWebSocketGrant, ResolvedPluginRecord,
     read_resolved_plugin_runtime_component, read_resolved_plugin_runtime_module,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tungstenite::client::IntoClientRequest;
+use tungstenite::protocol::{Message, WebSocketConfig};
+use tungstenite::stream::MaybeTlsStream;
 
 use super::{
     FeatureDescriptor, FeatureId, FeatureInstallContext, FeatureInstallError, FeatureModule,
@@ -280,28 +283,33 @@ pub fn inspect_resolved_plugin_static(record: &ResolvedPluginRecord) -> PluginSt
         },
     };
 
-    let mut host_apis: Vec<_> = [PluginHostApi::Request, PluginHostApi::Fs]
-        .into_iter()
-        .filter_map(|api| {
-            let permission = PluginPermission::host_api(api);
-            let requested = permission_requested(record, &permission);
-            let granted = grant_allows(record, &permission);
-            if !requested && !granted {
-                return None;
-            }
-            let diagnostic = authorize_plugin_host_api(record, api)
-                .err()
-                .map(|error| error.bounded_message());
-            Some(PluginPermissionEligibility {
-                permission: permission.label(),
-                requested,
-                granted,
-                eligible: diagnostic.is_none(),
-                diagnostic,
-            })
+    let mut host_apis: Vec<_> = [
+        PluginHostApi::Request,
+        PluginHostApi::WebSocket,
+        PluginHostApi::Fs,
+    ]
+    .into_iter()
+    .filter_map(|api| {
+        let permission = PluginPermission::host_api(api);
+        let requested = permission_requested(record, &permission);
+        let granted = grant_allows(record, &permission);
+        if !requested && !granted {
+            return None;
+        }
+        let diagnostic = authorize_plugin_host_api(record, api)
+            .err()
+            .map(|error| error.bounded_message());
+        Some(PluginPermissionEligibility {
+            permission: permission.label(),
+            requested,
+            granted,
+            eligible: diagnostic.is_none(),
+            diagnostic,
         })
-        .collect();
+    })
+    .collect();
     append_request_target_inspection(record, &mut host_apis);
+    append_websocket_target_inspection(record, &mut host_apis);
 
     let duplicate_tool_names = duplicate_tool_names(record);
     let tools = if surface_enabled(record, PluginSurface::Tool) {
@@ -501,6 +509,96 @@ fn append_request_target_inspection(
                 eligible: false,
                 diagnostic: Some(format!(
                     "enabled request grant has no matching manifest declaration{broad}"
+                )),
+            });
+        }
+    }
+}
+
+fn append_websocket_target_inspection(
+    record: &ResolvedPluginRecord,
+    host_apis: &mut Vec<PluginPermissionEligibility>,
+) {
+    for target in &record.manifest.websocket {
+        let covering_grant = record
+            .grants
+            .websocket
+            .iter()
+            .find(|grant| websocket_target_covers(grant, target));
+        let intersecting_grant = covering_grant.or_else(|| {
+            record
+                .grants
+                .websocket
+                .iter()
+                .find(|grant| websocket_targets_intersect(target, grant))
+        });
+        let granted = intersecting_grant.is_some();
+        let diagnostic = match (granted, covering_grant, target.is_broad()) {
+            (false, _, broad) => Some(format!(
+                "missing enabled WebSocket grant for manifest target{}",
+                if broad { "; broad/arbitrary target" } else { "" }
+            )),
+            (true, None, true) => Some(
+                "partially covered by enabled WebSocket grant; broad manifest target is constrained by narrower grants"
+                    .to_string(),
+            ),
+            (true, None, false) => Some(
+                "partially covered by enabled WebSocket grant; only intersecting URLs are allowed"
+                    .to_string(),
+            ),
+            (true, Some(grant), _) if grant.is_broad() => {
+                Some("covered by broad/arbitrary enabled WebSocket grant".to_string())
+            }
+            _ => None,
+        };
+        host_apis.push(PluginPermissionEligibility {
+            permission: format!("host_api.websocket target {}", target.label()),
+            requested: true,
+            granted,
+            eligible: granted,
+            diagnostic,
+        });
+    }
+    for grant in &record.grants.websocket {
+        let matching_manifest = record
+            .manifest
+            .websocket
+            .iter()
+            .find(|target| websocket_targets_intersect(target, grant));
+        if let Some(target) = matching_manifest {
+            let diagnostic = if grant.is_broad() {
+                Some(
+                    "broad/arbitrary enabled WebSocket grant is constrained by manifest declarations"
+                        .to_string(),
+                )
+            } else if !websocket_target_covers(target, grant) {
+                Some(
+                    "enabled WebSocket grant is only usable where it intersects manifest declarations"
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            host_apis.push(PluginPermissionEligibility {
+                permission: format!("host_api.websocket grant {}", grant.label()),
+                requested: true,
+                granted: true,
+                eligible: true,
+                diagnostic,
+            });
+        } else {
+            let broad = if grant.is_broad() {
+                "; broad/arbitrary target"
+            } else {
+                ""
+            };
+            host_apis.push(PluginPermissionEligibility {
+                permission: format!("host_api.websocket grant-only {}", grant.label()),
+                requested: false,
+                granted: true,
+                eligible: false,
+                diagnostic: Some(format!(
+                    "enabled WebSocket grant has no matching manifest declaration{broad}"
                 )),
             });
         }
@@ -821,6 +919,64 @@ fn execute_plugin_request_request(
     })
 }
 
+fn execute_plugin_websocket_open(
+    record: &ResolvedPluginRecord,
+    client: &dyn PluginWebSocketClient,
+    handles: &PluginWebSocketHandles,
+    bytes: &[u8],
+) -> Result<Vec<u8>, PluginWebSocketError> {
+    let (request, url) = validate_plugin_websocket_open_request(record, bytes)?;
+    let limits = PluginWebSocketLimits::default();
+    let connection = client.open(&request, &url, limits)?;
+    let handle = handles.insert(connection)?;
+    serde_json::to_vec(&PluginWebSocketOpenResponse {
+        handle,
+        url: safe_url(&url),
+    })
+    .map_err(|error| PluginWebSocketError::new(error.to_string()))
+}
+
+fn execute_plugin_websocket_send_text(
+    handles: &PluginWebSocketHandles,
+    handle: u32,
+    bytes: &[u8],
+) -> Result<Vec<u8>, PluginWebSocketError> {
+    if bytes.len() > PLUGIN_WEBSOCKET_MAX_TEXT_BYTES {
+        return Err(PluginWebSocketError::new(format!(
+            "WebSocket text frame exceeds {} bytes",
+            PLUGIN_WEBSOCKET_MAX_TEXT_BYTES
+        )));
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| PluginWebSocketError::new("WebSocket send_text requires UTF-8 text"))?;
+    handles.with_connection(handle, |connection| connection.send_text(text))?;
+    serde_json::to_vec(&PluginWebSocketSendResponse {
+        sent: true,
+        bytes: bytes.len(),
+    })
+    .map_err(|error| PluginWebSocketError::new(error.to_string()))
+}
+
+fn execute_plugin_websocket_recv(
+    handles: &PluginWebSocketHandles,
+    handle: u32,
+    timeout_ms: u32,
+) -> Result<Vec<u8>, PluginWebSocketError> {
+    let timeout = websocket_timeout(timeout_ms);
+    let response = handles.with_connection(handle, |connection| {
+        connection.recv_text(timeout, PLUGIN_WEBSOCKET_MAX_MESSAGE_BYTES)
+    })?;
+    serde_json::to_vec(&response).map_err(|error| PluginWebSocketError::new(error.to_string()))
+}
+
+fn execute_plugin_websocket_close(
+    handles: &PluginWebSocketHandles,
+    handle: u32,
+) -> Result<Vec<u8>, PluginWebSocketError> {
+    let closed = handles.close(handle)?;
+    serde_json::to_vec(&PluginWebSocketCloseResponse { closed })
+        .map_err(|error| PluginWebSocketError::new(error.to_string()))
+}
 fn execute_plugin_fs_request(
     record: &ResolvedPluginRecord,
     operation: PluginFsRuntimeOperation,
@@ -1461,6 +1617,86 @@ fn authorize_request_allowlist(
     Ok(())
 }
 
+fn validate_plugin_websocket_open_request(
+    record: &ResolvedPluginRecord,
+    bytes: &[u8],
+) -> Result<(PluginWebSocketOpenRequest, reqwest::Url), PluginWebSocketError> {
+    if bytes.len() > PLUGIN_WEBSOCKET_MAX_OPEN_REQUEST_BYTES {
+        return Err(PluginWebSocketError::new(format!(
+            "WebSocket open descriptor exceeds {} bytes",
+            PLUGIN_WEBSOCKET_MAX_OPEN_REQUEST_BYTES
+        )));
+    }
+    let request: PluginWebSocketOpenRequest = serde_json::from_slice(bytes).map_err(|error| {
+        PluginWebSocketError::new(format!("invalid WebSocket open request JSON: {error}"))
+    })?;
+    if !request.protocols.is_empty() {
+        return Err(PluginWebSocketError::new(
+            "WebSocket subprotocol negotiation is not supported by host_api.websocket v1",
+        ));
+    }
+    if !request.headers.is_empty() {
+        return Err(PluginWebSocketError::new(
+            "WebSocket handshake headers from guest memory are not supported; future secret-ref grants must inject credential-bearing headers explicitly",
+        ));
+    }
+    let url = reqwest::Url::parse(&request.url)
+        .map_err(|error| PluginWebSocketError::new(format!("invalid WebSocket URL: {error}")))?;
+    match url.scheme() {
+        "ws" | "wss" => {}
+        "http" | "https" => {
+            return Err(PluginWebSocketError::new(
+                "HTTP URLs are not supported by host_api.websocket",
+            ));
+        }
+        scheme => {
+            return Err(PluginWebSocketError::new(format!(
+                "unsupported WebSocket URL scheme {scheme:?}; only ws and wss are allowed"
+            )));
+        }
+    }
+    if url.host_str().is_none() {
+        return Err(PluginWebSocketError::new(
+            "WebSocket URL must include a host",
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(PluginWebSocketError::new(
+            "WebSocket URLs with embedded credentials are not allowed",
+        ));
+    }
+    validate_static_request_target(&url).map_err(|error| PluginWebSocketError::new(error.0))?;
+    authorize_websocket_allowlist(record, &url)?;
+    Ok((request, url))
+}
+
+fn authorize_websocket_allowlist(
+    record: &ResolvedPluginRecord,
+    url: &reqwest::Url,
+) -> Result<(), PluginWebSocketError> {
+    if !websocket_targets_allow(&record.manifest.websocket, url) {
+        return Err(PluginWebSocketError::new(format!(
+            "host_api.websocket target {} is not declared by the plugin manifest",
+            safe_url(url)
+        )));
+    }
+    if !websocket_targets_allow(&record.grants.websocket, url) {
+        return Err(PluginWebSocketError::new(format!(
+            "host_api.websocket target {} is not covered by enabled WebSocket grants",
+            safe_url(url)
+        )));
+    }
+    Ok(())
+}
+
+fn websocket_timeout(timeout_ms: u32) -> Duration {
+    if timeout_ms == 0 {
+        return PLUGIN_WEBSOCKET_DEFAULT_TIMEOUT;
+    }
+    let requested = Duration::from_millis(u64::from(timeout_ms));
+    requested.min(PLUGIN_WEBSOCKET_MAX_TIMEOUT)
+}
+
 fn request_targets_allow(targets: &[PluginRequestGrant], method: &str, url: &reqwest::Url) -> bool {
     targets
         .iter()
@@ -1512,6 +1748,53 @@ fn request_target_covers(covering: &PluginRequestGrant, covered: &PluginRequestG
         && request_host_covers(&covering.host, &covered.host)
         && request_port_covers(covering.port, covered.port)
         && request_methods_cover(&covering.methods, &covered.methods)
+        && request_paths_cover(&covering.path_prefixes, &covered.path_prefixes)
+}
+
+fn websocket_targets_allow(targets: &[PluginWebSocketGrant], url: &reqwest::Url) -> bool {
+    targets
+        .iter()
+        .any(|target| websocket_target_allows(target, url))
+}
+
+fn websocket_target_allows(target: &PluginWebSocketGrant, url: &reqwest::Url) -> bool {
+    let scheme = target.scheme.trim().to_ascii_lowercase();
+    if scheme.is_empty() || (scheme != "*" && scheme != url.scheme()) {
+        return false;
+    }
+    let Ok(host) = canonical_host(url) else {
+        return false;
+    };
+    let target_host = normalize_host_literal(&target.host);
+    if target_host.is_empty() || (target_host != "*" && target_host != host) {
+        return false;
+    }
+    if let Some(port) = target.port {
+        if url.port_or_known_default() != Some(port) {
+            return false;
+        }
+    }
+    target.path_prefixes.is_empty()
+        || target
+            .path_prefixes
+            .iter()
+            .any(|prefix| !prefix.is_empty() && url.path().starts_with(prefix))
+}
+
+fn websocket_targets_intersect(left: &PluginWebSocketGrant, right: &PluginWebSocketGrant) -> bool {
+    request_scheme_intersects(&left.scheme, &right.scheme)
+        && request_host_intersects(&left.host, &right.host)
+        && request_port_intersects(left.port, right.port)
+        && request_paths_intersect(&left.path_prefixes, &right.path_prefixes)
+}
+
+fn websocket_target_covers(
+    covering: &PluginWebSocketGrant,
+    covered: &PluginWebSocketGrant,
+) -> bool {
+    request_scheme_covers(&covering.scheme, &covered.scheme)
+        && request_host_covers(&covering.host, &covered.host)
+        && request_port_covers(covering.port, covered.port)
         && request_paths_cover(&covering.path_prefixes, &covered.path_prefixes)
 }
 
@@ -1623,6 +1906,20 @@ fn has_declared_request_target(record: &ResolvedPluginRecord) -> bool {
                 let method = method.trim().to_ascii_uppercase();
                 PLUGIN_REQUEST_ALLOWED_METHODS.contains(&method.as_str())
             })
+    })
+}
+
+fn has_usable_websocket_grant(record: &ResolvedPluginRecord) -> bool {
+    record.grants.websocket.iter().any(|grant| {
+        let scheme = grant.scheme.trim().to_ascii_lowercase();
+        (scheme == "ws" || scheme == "wss" || scheme == "*") && !grant.host.trim().is_empty()
+    })
+}
+
+fn has_declared_websocket_target(record: &ResolvedPluginRecord) -> bool {
+    record.manifest.websocket.iter().any(|target| {
+        let scheme = target.scheme.trim().to_ascii_lowercase();
+        (scheme == "ws" || scheme == "wss" || scheme == "*") && !target.host.trim().is_empty()
     })
 }
 
@@ -1921,6 +2218,19 @@ fn authorize_plugin_host_api(
             }
             Ok(())
         }
+        PluginHostApi::WebSocket => {
+            if !has_declared_websocket_target(record) {
+                return Err(PluginPermissionError(
+                    "manifest host_api.websocket target declaration is missing".to_string(),
+                ));
+            }
+            if !has_usable_websocket_grant(record) {
+                return Err(PluginPermissionError(
+                    "enabled host_api.websocket grants are missing".to_string(),
+                ));
+            }
+            Ok(())
+        }
         PluginHostApi::Fs => {
             if !has_usable_fs_grant(record) {
                 return Err(PluginPermissionError(
@@ -1974,6 +2284,7 @@ const PLUGIN_WASM_TIMEOUT: Duration = Duration::from_secs(1);
 const PLUGIN_WASM_MEMORY_BYTES: usize = 2 * 1024 * 1024;
 const PLUGIN_WASM_TABLE_ELEMENTS: usize = 256;
 const PLUGIN_WASM_REQUEST_MODULE: &str = "yoi:request";
+const PLUGIN_WASM_WEBSOCKET_MODULE: &str = "yoi:websocket";
 const PLUGIN_WASM_FS_MODULE: &str = "yoi:fs";
 const PLUGIN_REQUEST_MAX_REQUEST_BYTES: usize = 48 * 1024;
 const PLUGIN_REQUEST_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024;
@@ -1985,6 +2296,15 @@ const PLUGIN_REQUEST_MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const PLUGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const PLUGIN_REQUEST_ALLOWED_METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE"];
 const PLUGIN_REQUEST_REDACTION: &str = "<redacted>";
+const PLUGIN_WEBSOCKET_MAX_OPEN_REQUEST_BYTES: usize = 8 * 1024;
+const PLUGIN_WEBSOCKET_MAX_TEXT_BYTES: usize = 32 * 1024;
+const PLUGIN_WEBSOCKET_MAX_FRAME_BYTES: usize = 32 * 1024;
+const PLUGIN_WEBSOCKET_MAX_MESSAGE_BYTES: usize = 64 * 1024;
+const PLUGIN_WEBSOCKET_MAX_OPEN_CONNECTIONS: usize = 4;
+const PLUGIN_WEBSOCKET_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+const PLUGIN_WEBSOCKET_MAX_TIMEOUT: Duration = Duration::from_secs(30);
+const PLUGIN_WEBSOCKET_MAX_HANDLE_AGE: Duration = Duration::from_secs(15 * 60);
+const PLUGIN_WEBSOCKET_MAX_CONTROL_FRAMES: usize = 16;
 const PLUGIN_FS_MAX_REQUEST_BYTES: usize = 64 * 1024;
 const PLUGIN_FS_MAX_PATH_BYTES: usize = 4096;
 const PLUGIN_FS_MAX_READ_BYTES: usize = 64 * 1024;
@@ -2112,6 +2432,340 @@ struct PluginRequestResponse {
     headers: Vec<PluginRequestHeader>,
     body: String,
     truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginWebSocketOpenRequest {
+    url: String,
+    #[serde(default)]
+    protocols: Vec<String>,
+    #[serde(default)]
+    headers: Vec<PluginRequestHeader>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PluginWebSocketOpenResponse {
+    handle: u32,
+    url: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PluginWebSocketSendResponse {
+    sent: bool,
+    bytes: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PluginWebSocketRecvResponse {
+    Text { text: String },
+    Closed,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PluginWebSocketCloseResponse {
+    closed: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PluginWebSocketLimits {
+    timeout: Duration,
+    max_message_bytes: usize,
+}
+
+impl Default for PluginWebSocketLimits {
+    fn default() -> Self {
+        Self {
+            timeout: PLUGIN_WEBSOCKET_DEFAULT_TIMEOUT,
+            max_message_bytes: PLUGIN_WEBSOCKET_MAX_MESSAGE_BYTES,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PluginWebSocketError(String);
+
+impl PluginWebSocketError {
+    fn new(message: impl Into<String>) -> Self {
+        Self(redact_secret_like(&bounded_message(message.into())))
+    }
+}
+
+impl std::fmt::Display for PluginWebSocketError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PluginWebSocketError {}
+
+trait PluginWebSocketConnection: Send {
+    fn send_text(&mut self, text: &str) -> Result<(), PluginWebSocketError>;
+    fn recv_text(
+        &mut self,
+        timeout: Duration,
+        max_message_bytes: usize,
+    ) -> Result<PluginWebSocketRecvResponse, PluginWebSocketError>;
+    fn close(&mut self) -> Result<(), PluginWebSocketError>;
+}
+
+trait PluginWebSocketClient: Send + Sync {
+    fn open(
+        &self,
+        request: &PluginWebSocketOpenRequest,
+        url: &reqwest::Url,
+        limits: PluginWebSocketLimits,
+    ) -> Result<Box<dyn PluginWebSocketConnection>, PluginWebSocketError>;
+}
+
+struct TungstenitePluginWebSocketClient;
+
+type SystemWebSocket = tungstenite::WebSocket<MaybeTlsStream<std::net::TcpStream>>;
+
+struct TungstenitePluginWebSocketConnection {
+    socket: SystemWebSocket,
+}
+
+impl PluginWebSocketClient for TungstenitePluginWebSocketClient {
+    fn open(
+        &self,
+        _request: &PluginWebSocketOpenRequest,
+        url: &reqwest::Url,
+        limits: PluginWebSocketLimits,
+    ) -> Result<Box<dyn PluginWebSocketConnection>, PluginWebSocketError> {
+        let mut request = url.as_str().into_client_request().map_err(|error| {
+            PluginWebSocketError::new(format!("WebSocket request build failed: {error}"))
+        })?;
+        request.headers_mut().insert(
+            tungstenite::http::header::USER_AGENT,
+            tungstenite::http::HeaderValue::from_static("yoi-plugin-host/1"),
+        );
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(limits.max_message_bytes))
+            .max_frame_size(Some(PLUGIN_WEBSOCKET_MAX_FRAME_BYTES))
+            .accept_unmasked_frames(false);
+        let (mut socket, _response) =
+            tungstenite::client::connect_with_config(request, Some(config), 0).map_err(
+                |error| {
+                    PluginWebSocketError::new(format!(
+                        "WebSocket connection failed for {}: {error}",
+                        safe_url(url)
+                    ))
+                },
+            )?;
+        set_system_websocket_timeouts(&mut socket, limits.timeout);
+        Ok(Box::new(TungstenitePluginWebSocketConnection { socket }))
+    }
+}
+
+impl PluginWebSocketConnection for TungstenitePluginWebSocketConnection {
+    fn send_text(&mut self, text: &str) -> Result<(), PluginWebSocketError> {
+        self.socket
+            .send(Message::Text(text.to_string().into()))
+            .map_err(|error| PluginWebSocketError::new(format!("WebSocket send failed: {error}")))
+    }
+
+    fn recv_text(
+        &mut self,
+        timeout: Duration,
+        max_message_bytes: usize,
+    ) -> Result<PluginWebSocketRecvResponse, PluginWebSocketError> {
+        set_system_websocket_timeouts(&mut self.socket, timeout);
+        for _ in 0..PLUGIN_WEBSOCKET_MAX_CONTROL_FRAMES {
+            let message = self.socket.read().map_err(|error| {
+                PluginWebSocketError::new(format!("WebSocket receive failed: {error}"))
+            })?;
+            match message {
+                Message::Text(text) => {
+                    if text.len() > max_message_bytes {
+                        return Err(PluginWebSocketError::new(format!(
+                            "WebSocket text message exceeds {} bytes",
+                            max_message_bytes
+                        )));
+                    }
+                    return Ok(PluginWebSocketRecvResponse::Text {
+                        text: text.to_string(),
+                    });
+                }
+                Message::Binary(_) => {
+                    return Err(PluginWebSocketError::new(
+                        "binary WebSocket messages are not supported by host_api.websocket v1",
+                    ));
+                }
+                Message::Close(_) => return Ok(PluginWebSocketRecvResponse::Closed),
+                Message::Ping(payload) => {
+                    self.socket.send(Message::Pong(payload)).map_err(|error| {
+                        PluginWebSocketError::new(format!("WebSocket pong failed: {error}"))
+                    })?
+                }
+                Message::Pong(_) | Message::Frame(_) => continue,
+            }
+        }
+        Err(PluginWebSocketError::new(
+            "WebSocket receive exceeded bounded control-frame budget",
+        ))
+    }
+
+    fn close(&mut self) -> Result<(), PluginWebSocketError> {
+        self.socket
+            .close(None)
+            .map_err(|error| PluginWebSocketError::new(format!("WebSocket close failed: {error}")))
+    }
+}
+
+fn set_system_websocket_timeouts(socket: &mut SystemWebSocket, timeout: Duration) {
+    match socket.get_mut() {
+        MaybeTlsStream::Plain(stream) => {
+            let _ = stream.set_read_timeout(Some(timeout));
+            let _ = stream.set_write_timeout(Some(timeout));
+        }
+        #[allow(unreachable_patterns)]
+        MaybeTlsStream::NativeTls(stream) => {
+            let stream = stream.get_ref();
+            let _ = stream.set_read_timeout(Some(timeout));
+            let _ = stream.set_write_timeout(Some(timeout));
+        }
+        #[allow(unreachable_patterns)]
+        _ => {}
+    }
+}
+
+#[derive(Clone, Default)]
+struct PluginWebSocketHandles {
+    inner: Arc<Mutex<PluginWebSocketHandleTable>>,
+}
+
+impl PluginWebSocketHandles {
+    fn insert(
+        &self,
+        connection: Box<dyn PluginWebSocketConnection>,
+    ) -> Result<u32, PluginWebSocketError> {
+        self.inner
+            .lock()
+            .expect("plugin websocket handle table poisoned")
+            .insert(connection)
+    }
+
+    fn with_connection<T>(
+        &self,
+        handle: u32,
+        f: impl FnOnce(&mut dyn PluginWebSocketConnection) -> Result<T, PluginWebSocketError>,
+    ) -> Result<T, PluginWebSocketError> {
+        self.inner
+            .lock()
+            .expect("plugin websocket handle table poisoned")
+            .with_connection(handle, f)
+    }
+
+    fn close(&self, handle: u32) -> Result<bool, PluginWebSocketError> {
+        self.inner
+            .lock()
+            .expect("plugin websocket handle table poisoned")
+            .close(handle)
+    }
+
+    fn close_all(&self) {
+        self.inner
+            .lock()
+            .expect("plugin websocket handle table poisoned")
+            .close_all();
+    }
+}
+
+#[derive(Default)]
+struct PluginWebSocketHandleTable {
+    next: u32,
+    connections: HashMap<u32, PluginWebSocketHandleEntry>,
+}
+
+struct PluginWebSocketHandleEntry {
+    opened_at: Instant,
+    connection: Box<dyn PluginWebSocketConnection>,
+}
+
+impl PluginWebSocketHandleTable {
+    fn insert(
+        &mut self,
+        connection: Box<dyn PluginWebSocketConnection>,
+    ) -> Result<u32, PluginWebSocketError> {
+        self.expire_stale();
+        if self.connections.len() >= PLUGIN_WEBSOCKET_MAX_OPEN_CONNECTIONS {
+            return Err(PluginWebSocketError::new(format!(
+                "host_api.websocket open connection limit ({}) exceeded",
+                PLUGIN_WEBSOCKET_MAX_OPEN_CONNECTIONS
+            )));
+        }
+        let mut attempts = 0usize;
+        loop {
+            self.next = self.next.wrapping_add(1).max(1);
+            attempts += 1;
+            if !self.connections.contains_key(&self.next) {
+                let handle = self.next;
+                self.connections.insert(
+                    handle,
+                    PluginWebSocketHandleEntry {
+                        opened_at: Instant::now(),
+                        connection,
+                    },
+                );
+                return Ok(handle);
+            }
+            if attempts > u32::MAX as usize {
+                return Err(PluginWebSocketError::new(
+                    "WebSocket handle space exhausted",
+                ));
+            }
+        }
+    }
+
+    fn with_connection<T>(
+        &mut self,
+        handle: u32,
+        f: impl FnOnce(&mut dyn PluginWebSocketConnection) -> Result<T, PluginWebSocketError>,
+    ) -> Result<T, PluginWebSocketError> {
+        self.expire_stale();
+        let entry = self.connections.get_mut(&handle).ok_or_else(|| {
+            PluginWebSocketError::new(format!("unknown WebSocket handle {handle}"))
+        })?;
+        f(entry.connection.as_mut())
+    }
+
+    fn close(&mut self, handle: u32) -> Result<bool, PluginWebSocketError> {
+        if let Some(mut entry) = self.connections.remove(&handle) {
+            entry.connection.close()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn close_all(&mut self) {
+        for (_, mut entry) in self.connections.drain() {
+            let _ = entry.connection.close();
+        }
+    }
+
+    fn expire_stale(&mut self) {
+        let now = Instant::now();
+        let stale: Vec<_> = self
+            .connections
+            .iter()
+            .filter_map(|(handle, entry)| {
+                (now.duration_since(entry.opened_at) > PLUGIN_WEBSOCKET_MAX_HANDLE_AGE)
+                    .then_some(*handle)
+            })
+            .collect();
+        for handle in stale {
+            let _ = self.close(handle);
+        }
+    }
+}
+
+impl Drop for PluginWebSocketHandleTable {
+    fn drop(&mut self) {
+        self.close_all();
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2588,6 +3242,8 @@ impl PluginComponentInstanceRuntime {
             PluginComponentHostState {
                 record: record.clone(),
                 request_client: Arc::new(ReqwestPluginRequestClient),
+                websocket_client: Arc::new(TungstenitePluginWebSocketClient),
+                websocket_handles: PluginWebSocketHandles::default(),
                 store_limits: wasm_component_store_limits(),
             },
         );
@@ -2694,6 +3350,7 @@ impl PluginComponentInstanceRuntime {
         let (status,) = stop
             .call(&mut self.store, ())
             .map_err(|error| PluginWasmError::Execution(error.to_string()))?;
+        self.store.data().websocket_handles.close_all();
         decode_plugin_lifecycle_output("stop", &status)
     }
 
@@ -2916,11 +3573,14 @@ impl PluginWasmError {
 struct PluginWasmHostState {
     record: ResolvedPluginRecord,
     request_client: Arc<dyn PluginRequestClient>,
+    websocket_client: Arc<dyn PluginWebSocketClient>,
+    websocket_handles: PluginWebSocketHandles,
     tool_name: Vec<u8>,
     input: Vec<u8>,
     output: Vec<u8>,
     output_error: Option<String>,
     request_response: Vec<u8>,
+    websocket_response: Vec<u8>,
     fs_response: Vec<u8>,
     store_limits: wasmi::StoreLimits,
 }
@@ -3012,11 +3672,14 @@ fn run_plugin_wasm_tool_with_request_client(
         PluginWasmHostState {
             record: record.clone(),
             request_client,
+            websocket_client: Arc::new(TungstenitePluginWebSocketClient),
+            websocket_handles: PluginWebSocketHandles::default(),
             tool_name: tool_name.into_bytes(),
             input,
             output: Vec::new(),
             output_error: None,
             request_response: Vec::new(),
+            websocket_response: Vec::new(),
             fs_response: Vec::new(),
             store_limits,
         },
@@ -3048,6 +3711,8 @@ fn run_plugin_wasm_tool_with_request_client(
 struct PluginComponentHostState {
     record: ResolvedPluginRecord,
     request_client: Arc<dyn PluginRequestClient>,
+    websocket_client: Arc<dyn PluginWebSocketClient>,
+    websocket_handles: PluginWebSocketHandles,
     store_limits: wasmtime::StoreLimits,
 }
 
@@ -3114,6 +3779,8 @@ fn run_plugin_component_tool_with_request_client(
         PluginComponentHostState {
             record: record.clone(),
             request_client,
+            websocket_client: Arc::new(TungstenitePluginWebSocketClient),
+            websocket_handles: PluginWebSocketHandles::default(),
             store_limits: wasm_component_store_limits(),
         },
     );
@@ -3156,6 +3823,14 @@ fn validate_component_imports(
         match name {
             "yoi:host/request@1.0.0" => {
                 authorize_plugin_host_api(record, PluginHostApi::Request).map_err(|error| {
+                    PluginWasmError::Module(format!(
+                        "plugin host API dispatch denied: {}",
+                        error.bounded_message()
+                    ))
+                })?;
+            }
+            "yoi:host/websocket@1.0.0" => {
+                authorize_plugin_host_api(record, PluginHostApi::WebSocket).map_err(|error| {
                     PluginWasmError::Module(format!(
                         "plugin host API dispatch denied: {}",
                         error.bounded_message()
@@ -3206,6 +3881,75 @@ fn define_plugin_component_host_imports(
         .map_err(|error| PluginWasmError::Module(error.to_string()))?;
 
     let mut root = linker.root();
+    let mut websocket = root
+        .instance("yoi:host/websocket@1.0.0")
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    websocket
+        .func_wrap(
+            "open",
+            |store: wasmtime::StoreContextMut<'_, PluginComponentHostState>,
+             (request,): (String,)|
+             -> wasmtime::Result<(String,)> {
+                authorize_plugin_host_api(&store.data().record, PluginHostApi::WebSocket)
+                    .map_err(|error| wasmtime::Error::msg(error.bounded_message()))?;
+                execute_plugin_websocket_open(
+                    &store.data().record,
+                    store.data().websocket_client.as_ref(),
+                    &store.data().websocket_handles,
+                    request.as_bytes(),
+                )
+                .map(|bytes| (String::from_utf8_lossy(&bytes).into_owned(),))
+                .map_err(|error| wasmtime::Error::msg(error.0))
+            },
+        )
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    websocket
+        .func_wrap(
+            "send-text",
+            |store: wasmtime::StoreContextMut<'_, PluginComponentHostState>,
+             (handle, text): (u32, String)|
+             -> wasmtime::Result<(String,)> {
+                authorize_plugin_host_api(&store.data().record, PluginHostApi::WebSocket)
+                    .map_err(|error| wasmtime::Error::msg(error.bounded_message()))?;
+                execute_plugin_websocket_send_text(
+                    &store.data().websocket_handles,
+                    handle,
+                    text.as_bytes(),
+                )
+                .map(|bytes| (String::from_utf8_lossy(&bytes).into_owned(),))
+                .map_err(|error| wasmtime::Error::msg(error.0))
+            },
+        )
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    websocket
+        .func_wrap(
+            "recv",
+            |store: wasmtime::StoreContextMut<'_, PluginComponentHostState>,
+             (handle, timeout_ms): (u32, u32)|
+             -> wasmtime::Result<(String,)> {
+                authorize_plugin_host_api(&store.data().record, PluginHostApi::WebSocket)
+                    .map_err(|error| wasmtime::Error::msg(error.bounded_message()))?;
+                execute_plugin_websocket_recv(&store.data().websocket_handles, handle, timeout_ms)
+                    .map(|bytes| (String::from_utf8_lossy(&bytes).into_owned(),))
+                    .map_err(|error| wasmtime::Error::msg(error.0))
+            },
+        )
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    websocket
+        .func_wrap(
+            "close",
+            |store: wasmtime::StoreContextMut<'_, PluginComponentHostState>,
+             (handle,): (u32,)|
+             -> wasmtime::Result<(String,)> {
+                authorize_plugin_host_api(&store.data().record, PluginHostApi::WebSocket)
+                    .map_err(|error| wasmtime::Error::msg(error.bounded_message()))?;
+                execute_plugin_websocket_close(&store.data().websocket_handles, handle)
+                    .map(|bytes| (String::from_utf8_lossy(&bytes).into_owned(),))
+                    .map_err(|error| wasmtime::Error::msg(error.0))
+            },
+        )
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+
     let mut fs = root
         .instance("yoi:host/fs@1.0.0")
         .map_err(|error| PluginWasmError::Module(error.to_string()))?;
@@ -3262,7 +4006,6 @@ fn define_plugin_component_host_imports(
     .map_err(|error| PluginWasmError::Module(error.to_string()))?;
     Ok(())
 }
-
 fn validate_wasm_imports(
     record: &ResolvedPluginRecord,
     module: &wasmi::Module,
@@ -3295,6 +4038,22 @@ fn validate_wasm_imports(
                     }
                 }
             }
+            PLUGIN_WASM_WEBSOCKET_MODULE => {
+                authorize_plugin_host_api(record, PluginHostApi::WebSocket).map_err(|error| {
+                    PluginWasmError::Module(format!(
+                        "plugin host API dispatch denied: {}",
+                        error.bounded_message()
+                    ))
+                })?;
+                match import.name() {
+                    "open" | "send_text" | "recv" | "close" | "response_len" | "response_read" => {}
+                    other => {
+                        return Err(PluginWasmError::Module(format!(
+                            "unsupported websocket host import `{other}`"
+                        )));
+                    }
+                }
+            }
             PLUGIN_WASM_FS_MODULE => {
                 authorize_plugin_host_api(record, PluginHostApi::Fs).map_err(|error| {
                     PluginWasmError::Module(format!(
@@ -3313,10 +4072,11 @@ fn validate_wasm_imports(
             }
             other => {
                 return Err(PluginWasmError::Module(format!(
-                    "unsupported import module `{}`; only `{}`, `{}`, and `{}` are available",
+                    "unsupported import module `{}`; only `{}`, `{}`, `{}`, and `{}` are available",
                     other,
                     PLUGIN_WASM_HOST_MODULE,
                     PLUGIN_WASM_REQUEST_MODULE,
+                    PLUGIN_WASM_WEBSOCKET_MODULE,
                     PLUGIN_WASM_FS_MODULE
                 )));
             }
@@ -3373,6 +4133,7 @@ fn define_plugin_wasm_host_imports(
             },
         )
         .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+
     linker
         .func_wrap(
             PLUGIN_WASM_REQUEST_MODULE,
@@ -3400,6 +4161,65 @@ fn define_plugin_wasm_host_imports(
             },
         )
         .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+
+    linker
+        .func_wrap(
+            PLUGIN_WASM_WEBSOCKET_MODULE,
+            "open",
+            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, ptr: i32, len: i32| -> i32 {
+                read_guest_websocket_open(&mut caller, ptr, len)
+            },
+        )
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    linker
+        .func_wrap(
+            PLUGIN_WASM_WEBSOCKET_MODULE,
+            "send_text",
+            |mut caller: wasmi::Caller<'_, PluginWasmHostState>,
+             handle: i32,
+             ptr: i32,
+             len: i32|
+             -> i32 { read_guest_websocket_send_text(&mut caller, handle, ptr, len) },
+        )
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    linker
+        .func_wrap(
+            PLUGIN_WASM_WEBSOCKET_MODULE,
+            "recv",
+            |mut caller: wasmi::Caller<'_, PluginWasmHostState>,
+             handle: i32,
+             timeout_ms: i32|
+             -> i32 { read_guest_websocket_recv(&mut caller, handle, timeout_ms) },
+        )
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    linker
+        .func_wrap(
+            PLUGIN_WASM_WEBSOCKET_MODULE,
+            "close",
+            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, handle: i32| -> i32 {
+                read_guest_websocket_close(&mut caller, handle)
+            },
+        )
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    linker
+        .func_wrap(
+            PLUGIN_WASM_WEBSOCKET_MODULE,
+            "response_len",
+            |caller: wasmi::Caller<'_, PluginWasmHostState>| -> i32 {
+                caller.data().websocket_response.len() as i32
+            },
+        )
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+    linker
+        .func_wrap(
+            PLUGIN_WASM_WEBSOCKET_MODULE,
+            "response_read",
+            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, ptr: i32, len: i32| -> i32 {
+                write_host_bytes_to_guest(&mut caller, ptr, len, HostBuffer::WebSocketResponse)
+            },
+        )
+        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
+
     linker
         .func_wrap(
             PLUGIN_WASM_FS_MODULE,
@@ -3447,12 +4267,12 @@ fn define_plugin_wasm_host_imports(
         .map_err(|error| PluginWasmError::Module(error.to_string()))?;
     Ok(())
 }
-
 #[derive(Clone, Copy, Debug)]
 enum HostBuffer {
     ToolName,
     Input,
     RequestResponse,
+    WebSocketResponse,
     FsResponse,
 }
 
@@ -3469,6 +4289,7 @@ fn write_host_bytes_to_guest(
         HostBuffer::ToolName => caller.data().tool_name.clone(),
         HostBuffer::Input => caller.data().input.clone(),
         HostBuffer::RequestResponse => caller.data().request_response.clone(),
+        HostBuffer::WebSocketResponse => caller.data().websocket_response.clone(),
         HostBuffer::FsResponse => caller.data().fs_response.clone(),
     };
     if len as usize != bytes.len() {
@@ -3512,6 +4333,103 @@ fn read_guest_request_request(
     }
 }
 
+fn read_guest_websocket_open(
+    caller: &mut wasmi::Caller<'_, PluginWasmHostState>,
+    ptr: i32,
+    len: i32,
+) -> i32 {
+    let bytes = match read_guest_bytes(caller, ptr, len, PLUGIN_WEBSOCKET_MAX_OPEN_REQUEST_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            caller.data_mut().output_error = Some(error);
+            return -1;
+        }
+    };
+    let record = caller.data().record.clone();
+    let websocket_client = caller.data().websocket_client.clone();
+    let websocket_handles = caller.data().websocket_handles.clone();
+    match execute_plugin_websocket_open(
+        &record,
+        websocket_client.as_ref(),
+        &websocket_handles,
+        &bytes,
+    ) {
+        Ok(response) => {
+            caller.data_mut().websocket_response = response;
+            caller.data().websocket_response.len() as i32
+        }
+        Err(error) => {
+            caller.data_mut().output_error = Some(error.0);
+            -1
+        }
+    }
+}
+
+fn read_guest_websocket_send_text(
+    caller: &mut wasmi::Caller<'_, PluginWasmHostState>,
+    handle: i32,
+    ptr: i32,
+    len: i32,
+) -> i32 {
+    let bytes = match read_guest_bytes(caller, ptr, len, PLUGIN_WEBSOCKET_MAX_TEXT_BYTES) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            caller.data_mut().output_error = Some(error);
+            return -1;
+        }
+    };
+    match execute_plugin_websocket_send_text(
+        &caller.data().websocket_handles,
+        handle as u32,
+        &bytes,
+    ) {
+        Ok(response) => {
+            caller.data_mut().websocket_response = response;
+            caller.data().websocket_response.len() as i32
+        }
+        Err(error) => {
+            caller.data_mut().output_error = Some(error.0);
+            -1
+        }
+    }
+}
+
+fn read_guest_websocket_recv(
+    caller: &mut wasmi::Caller<'_, PluginWasmHostState>,
+    handle: i32,
+    timeout_ms: i32,
+) -> i32 {
+    match execute_plugin_websocket_recv(
+        &caller.data().websocket_handles,
+        handle as u32,
+        timeout_ms.max(0) as u32,
+    ) {
+        Ok(response) => {
+            caller.data_mut().websocket_response = response;
+            caller.data().websocket_response.len() as i32
+        }
+        Err(error) => {
+            caller.data_mut().output_error = Some(error.0);
+            -1
+        }
+    }
+}
+
+fn read_guest_websocket_close(
+    caller: &mut wasmi::Caller<'_, PluginWasmHostState>,
+    handle: i32,
+) -> i32 {
+    match execute_plugin_websocket_close(&caller.data().websocket_handles, handle as u32) {
+        Ok(response) => {
+            caller.data_mut().websocket_response = response;
+            caller.data().websocket_response.len() as i32
+        }
+        Err(error) => {
+            caller.data_mut().output_error = Some(error.0);
+            -1
+        }
+    }
+}
 fn read_guest_fs_request(
     caller: &mut wasmi::Caller<'_, PluginWasmHostState>,
     ptr: i32,
@@ -3897,7 +4815,7 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::path::Path;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     fn tool(name: &str) -> manifest::plugin::PluginToolManifest {
@@ -3940,6 +4858,7 @@ mod tests {
                 ingresses: Vec::new(),
                 permissions: permissions.clone(),
                 request: Vec::new(),
+                websocket: Vec::new(),
             },
             enabled_surfaces: vec![PluginSurface::Tool],
             grants: PluginGrantConfig {
@@ -3948,6 +4867,7 @@ mod tests {
                 digest: Some("sha256:abc".to_string()),
                 permissions,
                 request: Vec::new(),
+                websocket: Vec::new(),
                 fs: Vec::new(),
             },
             config: None,
@@ -5513,6 +6433,7 @@ mod tests {
             digest: Some(record.digest.clone()),
             permissions: tool_permissions(&record.manifest.tools),
             request: Vec::new(),
+            websocket: Vec::new(),
             fs: Vec::new(),
         };
         (dir, record)
@@ -5586,6 +6507,7 @@ input_schema = {{ type = "object", additionalProperties = true }}
             digest: Some(record.digest.clone()),
             permissions: tool_permissions(&record.manifest.tools),
             request: Vec::new(),
+            websocket: Vec::new(),
             fs: Vec::new(),
         };
         (dir, record)
@@ -6357,5 +7279,281 @@ input_schema = { type = "object", additionalProperties = true }
             }
         }
         !crc
+    }
+
+    #[derive(Clone, Default)]
+    struct MockWebSocketClient {
+        closed: Arc<std::sync::atomic::AtomicUsize>,
+        opens: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl PluginWebSocketClient for MockWebSocketClient {
+        fn open(
+            &self,
+            _request: &PluginWebSocketOpenRequest,
+            _url: &reqwest::Url,
+            _limits: PluginWebSocketLimits,
+        ) -> Result<Box<dyn PluginWebSocketConnection>, PluginWebSocketError> {
+            self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(MockWebSocketConnection {
+                closed: self.closed.clone(),
+                next_recv: Some(PluginWebSocketRecvResponse::Text {
+                    text: "hello".to_string(),
+                }),
+            }))
+        }
+    }
+
+    struct MockWebSocketConnection {
+        closed: Arc<std::sync::atomic::AtomicUsize>,
+        next_recv: Option<PluginWebSocketRecvResponse>,
+    }
+
+    impl PluginWebSocketConnection for MockWebSocketConnection {
+        fn send_text(&mut self, _text: &str) -> Result<(), PluginWebSocketError> {
+            Ok(())
+        }
+
+        fn recv_text(
+            &mut self,
+            _timeout: Duration,
+            _max_message_bytes: usize,
+        ) -> Result<PluginWebSocketRecvResponse, PluginWebSocketError> {
+            Ok(self
+                .next_recv
+                .take()
+                .unwrap_or(PluginWebSocketRecvResponse::Closed))
+        }
+
+        fn close(&mut self) -> Result<(), PluginWebSocketError> {
+            self.closed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn websocket_grant(
+        scheme: &str,
+        host: &str,
+        port: Option<u16>,
+        paths: &[&str],
+    ) -> PluginWebSocketGrant {
+        PluginWebSocketGrant {
+            scheme: scheme.to_string(),
+            host: host.to_string(),
+            port,
+            path_prefixes: paths.iter().map(|path| (*path).to_string()).collect(),
+        }
+    }
+
+    fn record_with_websocket(
+        manifest_targets: Vec<PluginWebSocketGrant>,
+        grants: Vec<PluginWebSocketGrant>,
+    ) -> ResolvedPluginRecord {
+        let mut record = record(vec![]);
+        record.manifest.permissions = vec![PluginPermission::host_api(PluginHostApi::WebSocket)];
+        record.manifest.websocket = manifest_targets;
+        record.grants.websocket = grants;
+        record
+    }
+
+    #[test]
+    fn websocket_open_send_recv_close_is_bounded_and_explicit() {
+        let record = record_with_websocket(
+            vec![websocket_grant(
+                "wss",
+                "gateway.example.com",
+                None,
+                &["/gateway"],
+            )],
+            vec![websocket_grant(
+                "wss",
+                "gateway.example.com",
+                None,
+                &["/gateway"],
+            )],
+        );
+        let client = MockWebSocketClient::default();
+        let handles = PluginWebSocketHandles::default();
+        let open = execute_plugin_websocket_open(
+            &record,
+            &client,
+            &handles,
+            br#"{"url":"wss://gateway.example.com/gateway?v=10"}"#,
+        )
+        .unwrap();
+        let open: PluginWebSocketOpenResponse = serde_json::from_slice(&open).unwrap();
+        assert_eq!(open.handle, 1);
+        assert_eq!(open.url, "wss://gateway.example.com/gateway");
+
+        let send = execute_plugin_websocket_send_text(&handles, open.handle, b"ping").unwrap();
+        assert_eq!(send, br#"{"sent":true,"bytes":4}"#);
+        let recv = execute_plugin_websocket_recv(&handles, open.handle, 1).unwrap();
+        assert_eq!(recv, br#"{"type":"text","text":"hello"}"#);
+        let close = execute_plugin_websocket_close(&handles, open.handle).unwrap();
+        assert_eq!(close, br#"{"closed":true}"#);
+        assert_eq!(client.closed.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn websocket_open_requires_manifest_and_grant() {
+        let client = MockWebSocketClient::default();
+        let handles = PluginWebSocketHandles::default();
+        let missing_grant = record_with_websocket(
+            vec![websocket_grant(
+                "wss",
+                "gateway.example.com",
+                None,
+                &["/gateway"],
+            )],
+            vec![],
+        );
+        let error = execute_plugin_websocket_open(
+            &missing_grant,
+            &client,
+            &handles,
+            br#"{"url":"wss://gateway.example.com/gateway"}"#,
+        )
+        .unwrap_err();
+        assert!(error.0.contains("enabled WebSocket grants"));
+
+        let missing_manifest = record_with_websocket(
+            vec![],
+            vec![websocket_grant(
+                "wss",
+                "gateway.example.com",
+                None,
+                &["/gateway"],
+            )],
+        );
+        let error = execute_plugin_websocket_open(
+            &missing_manifest,
+            &client,
+            &handles,
+            br#"{"url":"wss://gateway.example.com/gateway"}"#,
+        )
+        .unwrap_err();
+        assert!(error.0.contains("not declared"));
+        assert_eq!(client.opens.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn websocket_loopback_requires_explicit_manifest_and_grant() {
+        let client = MockWebSocketClient::default();
+        let handles = PluginWebSocketHandles::default();
+        let denied = record_with_websocket(
+            vec![websocket_grant("ws", "127.0.0.1", Some(8080), &["/socket"])],
+            vec![],
+        );
+        assert!(
+            execute_plugin_websocket_open(
+                &denied,
+                &client,
+                &handles,
+                br#"{"url":"ws://127.0.0.1:8080/socket"}"#,
+            )
+            .is_err()
+        );
+        let allowed = record_with_websocket(
+            vec![websocket_grant("ws", "127.0.0.1", Some(8080), &["/socket"])],
+            vec![websocket_grant("ws", "127.0.0.1", Some(8080), &["/socket"])],
+        );
+        assert!(
+            execute_plugin_websocket_open(
+                &allowed,
+                &client,
+                &handles,
+                br#"{"url":"ws://127.0.0.1:8080/socket"}"#,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn websocket_rejects_guest_headers_and_binary_send_surface() {
+        let record = record_with_websocket(
+            vec![websocket_grant(
+                "wss",
+                "gateway.example.com",
+                None,
+                &["/gateway"],
+            )],
+            vec![websocket_grant(
+                "wss",
+                "gateway.example.com",
+                None,
+                &["/gateway"],
+            )],
+        );
+        let error = validate_plugin_websocket_open_request(
+            &record,
+            br#"{"url":"wss://gateway.example.com/gateway","headers":[{"name":"authorization","value":"secret"}]}"#,
+        )
+        .unwrap_err();
+        assert!(error.0.contains("handshake headers"));
+        let handles = PluginWebSocketHandles::default();
+        let invalid_utf8 = [0xff, 0xfe];
+        let error = execute_plugin_websocket_send_text(&handles, 1, &invalid_utf8).unwrap_err();
+        assert!(error.0.contains("UTF-8"));
+    }
+
+    #[test]
+    fn websocket_static_inspection_reports_grant_only_missing_and_broad() {
+        let grant_only = record_with_websocket(
+            vec![websocket_grant(
+                "wss",
+                "declared.example.com",
+                None,
+                &["/gateway"],
+            )],
+            vec![websocket_grant("*", "*", None, &[])],
+        );
+        let inspection = inspect_resolved_plugin_static(&grant_only);
+        let ws: Vec<_> = inspection
+            .host_apis
+            .iter()
+            .filter(|item| item.permission.contains("host_api.websocket"))
+            .collect();
+        assert!(ws.iter().any(|item| item.permission.contains("target")));
+        assert!(ws.iter().any(|item| {
+            item.permission.contains("grant")
+                && item
+                    .diagnostic
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("broad")
+        }));
+
+        let missing = record_with_websocket(
+            vec![websocket_grant(
+                "wss",
+                "missing.example.com",
+                None,
+                &["/gateway"],
+            )],
+            vec![],
+        );
+        let inspection = inspect_resolved_plugin_static(&missing);
+        assert!(inspection.host_apis.iter().any(|item| {
+            item.permission.contains("host_api.websocket target")
+                && item
+                    .diagnostic
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("missing")
+        }));
+    }
+
+    #[test]
+    fn request_host_api_still_rejects_websocket_urls() {
+        let record = record_with_request_grant();
+        let client = MockRequestClient::default();
+        let error = execute_plugin_request_request(
+            &record,
+            &client,
+            br#"{"method":"GET","url":"wss://api.example.com/socket"}"#,
+        )
+        .unwrap_err();
+        assert!(error.0.contains("WebSocket"));
     }
 }
