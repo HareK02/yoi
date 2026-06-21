@@ -291,3 +291,36 @@ Next action:
 - Route to read-only Reviewer Pod for acceptance review against the Ticket。
 
 ---
+
+<!-- event: comment author: yoi-orchestrator at: 2026-06-21T12:33:03Z -->
+
+## Comment
+
+Review routing:
+
+Spawned read-only Reviewer Pod:
+- `yoi-reviewer-00001KVMGAEJN-r1`
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVMGAEJN-plugin-websocket-host-api`
+- Branch: `impl/00001KVMGAEJN-plugin-websocket-host-api`
+- Baseline: `3eac7f8e`
+- Implementation commits:
+  - `4c1b8c3d feat: add plugin websocket host api`
+  - `ce62d235 chore: keep plugin websocket branch code-only`
+- Diff: `3eac7f8e..ce62d235`
+
+Reviewer scope:
+- read-only `/home/hare/Projects/yoi`
+
+Reviewer focus:
+- `host_api.websocket` remains distinct from `host_api.request`。
+- Manifest target + enablement grant are both required before opening a connection。
+- Host-owned WebSocket handle lifecycle is bounded and cleaned up。
+- Credential/header, binary/text, local/private/loopback, broad diagnostics, and no-hidden-context semantics are safe。
+- Request API still rejects WebSocket/SSE/persistent attempts。
+- Cargo/package/Nix changes are sound; Coder reported Nix advanced past hash check then failed due `No space left on device` in `aws-lc-sys` build。
+
+Orchestrator will wait for reviewer verdict before integration。
+
+---
