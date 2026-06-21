@@ -562,3 +562,22 @@ In-flight LLM response 中の reconnect / late attach snapshot に unfinished bl
 - Full `cargo test -p pod` は既存の prompt-resource assertion 2 件で失敗することが reviewer により確認済み。この Ticket の差分とは無関係。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-21T12:00:31Z -->
+
+## Implementation report
+
+Post-close cleanup completed。
+
+- Stopped child Pods and reclaimed scope:
+  - `yoi-coder-00001KVMT2J25`
+  - `yoi-reviewer-00001KVMT2J25-r1`
+- Removed implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVMT2J25-inflight-snapshot`
+- Deleted implementation branch:
+  - `impl/00001KVMT2J25-inflight-snapshot`
+- Orchestrator worktree remains clean on `orchestration` at `77b5276f`。
+
+Root/original workspace was not used for merge/validation/cleanup operations。
+
+---
