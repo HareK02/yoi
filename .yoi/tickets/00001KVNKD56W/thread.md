@@ -218,3 +218,84 @@ Reviewer focus:
 Orchestrator will wait for reviewer verdict before integration。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVNKD56W-r1 at: 2026-06-22T09:13:06Z status: request_changes -->
+
+## Review: request changes
+
+Verdict: `request_changes`
+
+確認範囲:
+- Ticket/design authority:
+  - `.yoi/tickets/00001KVNKD56W/item.md`
+  - `.yoi/tickets/00001KVNKD56W/thread.md`
+  - `.yoi/tickets/00001KVNKD56W/artifacts/schema-v0.md`
+- Implementation diff `f17a458a..5149ab70`:
+  - `crates/workspace-server/src/store.rs`
+  - `crates/workspace-server/src/server.rs`
+  - `web/workspace/src/routes/+page.svelte`
+  - schema artifact updates
+- Target branch/head:
+  - Branch: `impl/00001KVNKD56W-workspace-db-schema-v0`
+  - Head: `5149ab703f63`
+
+Blocking issue:
+
+1. Legacy-upgraded `workspaces` table remains non-canonical and can reject new workspace inserts。
+
+Fresh schema defines canonical `workspaces` as:
+- `workspace_id`
+- `display_name`
+- `state`
+- `created_at`
+- `updated_at`
+
+This matches `schema-v0.md`。
+
+However, legacy migration does not rebuild or demote the old bootstrap `workspaces` table. It only adds `state`:
+- `crates/workspace-server/src/store.rs:198-200`
+  - `ALTER TABLE workspaces ADD COLUMN state TEXT NOT NULL DEFAULT 'active';`
+
+Then `create_schema_v0_tables()` is called, but because it uses `CREATE TABLE IF NOT EXISTS workspaces`, the old table is left in place:
+- `crates/workspace-server/src/store.rs:218-227`
+
+The old v1 bootstrap `workspaces` table had extra `local_root TEXT NOT NULL` and `record_authority TEXT NOT NULL` columns. Those remain on upgraded DBs even though they are not part of canonical v0。
+
+This is not merely cosmetic: `upsert_workspace()` now inserts only v0 columns:
+- `crates/workspace-server/src/store.rs:87-89`
+
+For an upgraded legacy DB, inserting a new `workspace_id` would fail on old `local_root` / `record_authority` NOT NULL columns because the insert no longer supplies them. Updating the already-existing legacy workspace may pass due conflict/update path, which is why current tests do not catch this。
+
+Why this blocks:
+- Upgraded canonical schema does not actually match `schema-v0.md`。
+- Legacy handling is not safe enough because active canonical `workspaces` remains partly old schema and incompatible with the new write path。
+
+Required fix:
+- Rebuild/copy `workspaces` into canonical v0 shape, or otherwise explicitly preserve old workspace data without leaving obsolete NOT NULL columns on the active canonical table。
+- Add tests asserting upgraded `workspaces` column set。
+- Add a post-upgrade insert/upsert test for a new workspace id。
+
+Non-blocking concerns:
+- Existing tests cover fresh forbidden table absence and legacy demotion for old `runs` / projections / artifact / repository tables, but not upgraded `workspaces` column set or post-upgrade insert; add coverage with the fix。
+- Runs card/reference removal is narrow and `/api/runs` removal is test-covered with 404 assertion。
+
+Reviewer validation:
+- `cargo fmt --check`: passed
+- `git diff --check f17a458a..HEAD`: passed
+- `cargo test -p yoi-workspace-server`: passed (`10 passed`)
+- `cargo check -p yoi-workspace-server`: passed
+- `cd web/workspace && rm -rf node_modules .svelte-kit build && deno task check && deno task build`: passed
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+- `nix build .#yoi --no-link --print-out-paths`: passed/cached output `/nix/store/i0dr920x6kf217zddbnaqyljh8l1gwri-yoi-0.1.0`
+
+Generated/ignored artifacts remain in reviewer worktree after validation:
+- `target/`
+- `web/workspace/node_modules/`
+- `web/workspace/.svelte-kit/`
+- `web/workspace/build/`
+
+Worktree status:
+- Tracked status clean; only ignored generated artifacts present。
+
+---
