@@ -27,7 +27,6 @@
     { label: 'Repositories', path: '/api/repositories' },
     { label: 'Repository log', path: '/api/repositories/local/log' },
     { label: 'Repository tickets', path: '/api/repositories/local/tickets' },
-    { label: 'Runs', path: '/api/runs' },
     { label: 'Hosts', path: '/api/hosts' },
     { label: 'Workers', path: '/api/workers' }
   ];

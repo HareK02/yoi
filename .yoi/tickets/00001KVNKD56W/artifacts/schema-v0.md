@@ -512,3 +512,9 @@ If implementation is included in this Ticket, prefer a small non-breaking migrat
 - Do not create a full `actors` table in v0.
 - Do not create `hosts` / `workers` canonical tables in v0.
 - Do not create a separate `runs` table in v0; use structured Ticket events and TicketWorkerLink relationships.
+
+## Implementation alignment notes
+
+The `yoi-workspace-server` SQLite bootstrap migration implements this v0 schema as schema version 2. Fresh databases create the typed tables listed above and deliberately do not create canonical `runs`, `hosts`, `workers`, `actors`, or check/validation result tables. Host and Worker HTTP read APIs remain live runtime views backed by local inspection, not DB tables.
+
+For databases created by the earlier workspace-server bootstrap, migration version 2 preserves old `workspaces`, `repositories`, `runs`, `artifacts`, `ticket_projections`, and `objective_projections` data by renaming those tables to `legacy_workspaces`, `legacy_repositories`, `legacy_runs`, `legacy_artifacts`, `legacy_ticket_projections`, and `legacy_objective_projections`, then creating the v0 typed tables. Existing legacy workspace rows are copied into the canonical v0 `workspaces` table with `state = active` when the old row had no typed state. The legacy names are compatibility preservation only and are not canonical schema tables or active write authority.
