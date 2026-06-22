@@ -31,3 +31,84 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-22T08:49:46Z -->
+
+## Decision
+
+Routing decision: `implementation_ready`
+
+Reason:
+- Ticket includes a concrete `schema-v0.md` artifact defining the Workspace DB canonical schema target and migration stance。
+- Artifact is precise enough to implement a non-breaking schema/migration alignment slice and/or finish design documentation without inventing semantics。
+- Relations are non-blocking context relations; no blocker relation is recorded。
+- Current Workspace backend has an older bootstrap SQLite schema in `crates/workspace-server/src/store.rs` with `runs`, `ticket_projections`, `objective_projections`, and run-linked artifacts, while `schema-v0.md` explicitly says no separate `Run` entity and Host/Worker are live views. This gives a concrete implementation alignment target。
+- Orchestrator worktree is clean on `orchestration` at `b7c890d3`; target worktree / branch is not present。
+- Current queued Ticket is this Ticket only。
+
+Evidence checked:
+- Ticket body / thread / artifacts via `TicketShow` and direct read of `artifacts/schema-v0.md`。
+- `TicketRelationQuery(00001KVNKD56W)`: 2 relation records, no blocking relation reported。
+- `TicketOrchestrationPlanQuery(00001KVNKD56W)`: no records。
+- `TicketList(state=queued)`: this Ticket is the only queued Ticket。
+- Orchestrator git state / branch list checked from `/home/hare/Projects/yoi/.worktree/orchestration` only。
+- Bounded code map:
+  - `crates/workspace-server/src/store.rs` currently owns SQLite migrations and schema versioning。
+  - Current store still has bootstrap `runs` and projection-oriented tables; `schema-v0.md` says v0 should not include separate `runs`, Host/Worker canonical DB tables, generic JSON blobs, or validation result tables。
+  - Current repository/objective/ticket read APIs are filesystem read-through and must keep working。
+
+IntentPacket:
+
+Intent:
+- Turn the Workspace DB canonical schema v0 design into a durable implementation/design artifact and align the current SQLite bootstrap migration where safely non-breaking。
+
+Binding decisions / invariants:
+- Ticket and Objective filesystem records remain the active authority; do not switch write authority to DB。
+- No generic JSON/payload/metadata columns in the v0 canonical schema。
+- Do not add canonical `hosts` / `workers` DB tables; Host/Worker remain live runtime views。
+- Do not add a top-level `runs` canonical table; execution history belongs to Ticket events, TicketWorkerLinks, and Artifacts。
+- Do not add CI/validation result tables in this Ticket。
+- Do not add Actor table in v0; authorship is embedded typed snapshot fields。
+- Keep existing Workspace APIs/tests working。
+- Non-breaking migration is acceptable; destructive migration of existing user DBs is not required in this slice unless clearly safe and tested。
+
+Requirements / acceptance criteria:
+- `schema-v0.md` remains consistent with implemented/bootstrap migration semantics。
+- Workspace-server migration/schema tests cover new v0 schema version and expected tables/absence of forbidden tables。
+- Empty/safe tables from minimal implementation guidance may be added: `repositories`, `ticket_targets`, `ticket_target_paths`, `ticket_worker_links`, `artifacts`, `audit_events`, and supporting Ticket/Objective current/event tables if included。
+- Remove or replace obsolete `runs` table/API/store concept if it conflicts with v0, or clearly demote it to non-canonical compatibility only if removal is out of scope。
+- No canonical host/worker tables are added。
+- Existing filesystem read-through APIs for Tickets/Objectives/Repository pages keep passing。
+- Docs/tests make clear that Host/Worker API is live view and Ticket thread/events are execution authority。
+
+Implementation latitude:
+- If full schema migration is too large, implement the smallest safe migration alignment plus tests and record remaining tables as future follow-up comments。
+- Prefer typed tables/columns over catch-all text/json columns。
+- SQLite schema version can advance if migrations change。
+- `runs` API placeholder may be removed if no longer used; ensure frontend/tests do not depend on it。
+- Keep API surface read-only unless Ticket explicitly requires otherwise; this one does not require write APIs。
+
+Escalate if:
+- Removing current `runs` table/API would break existing accepted frontend or tests in a way that needs product decision。
+- Existing DB migration compatibility requires a complex destructive migration or data backfill policy。
+- Implementing full TicketEvents/TicketWorkerLinks/Artifacts read/write surfaces grows beyond schema/bootstrap alignment。
+- Schema design conflicts with recent Repository/Objectives pages in a way not anticipated by artifact。
+
+Validation plan:
+- `cargo fmt --check`
+- `cargo test -p yoi-workspace-server`
+- `cargo check -p yoi-workspace-server`
+- `git diff --check`
+- `cargo run -p yoi -- ticket doctor`
+- `nix build .#yoi --no-link` if package/source/dependency behavior changes。
+- Deno check/build only if frontend/runs API removal touches frontend。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-22T08:49:57Z from: queued to: inprogress reason: human_authorized_schema_design_alignment field: state -->
+
+## State changed
+
+Human authorized queue routing from Workspace Dashboard. Ticket has a concrete schema-v0 design artifact and current workspace-server migration has a clear non-breaking alignment target, so Orchestrator accepts implementation/design alignment.
+
+---
