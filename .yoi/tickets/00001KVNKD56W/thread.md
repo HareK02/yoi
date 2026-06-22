@@ -358,3 +358,69 @@ Next action:
 - Route back to Reviewer for r2 verification of legacy `workspaces` canonicalization and final acceptance。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVNKD56W-r1 at: 2026-06-22T09:24:03Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- r1-fix diff `5149ab70..d89ace5b`:
+  - `crates/workspace-server/src/store.rs`
+  - `.yoi/tickets/00001KVNKD56W/artifacts/schema-v0.md`
+- Overall diff `f17a458a..d89ace5b`:
+  - `.yoi/tickets/00001KVNKD56W/artifacts/schema-v0.md`
+  - `crates/workspace-server/src/server.rs`
+  - `crates/workspace-server/src/store.rs`
+  - `web/workspace/src/routes/+page.svelte`
+
+Previous blocker verification:
+- Resolved。
+
+Evidence:
+- Non-canonical legacy `workspaces` is now detected by exact v0 column comparison and renamed to `legacy_workspaces`。
+- Canonical v0 `workspaces` is then created with exactly:
+  - `workspace_id`
+  - `display_name`
+  - `state`
+  - `created_at`
+  - `updated_at`
+- Legacy workspace rows are copied into canonical `workspaces`, with `state` defaulted to `active` when absent。
+- Tests assert:
+  - upgraded `workspaces` columns exactly match v0。
+  - `legacy_workspaces` preserves old obsolete columns。
+  - legacy workspace data is readable through canonical `get_workspace`。
+  - post-upgrade `upsert_workspace()` succeeds for a new workspace id。
+
+Blocking issues:
+- None。
+
+Non-blocking concerns:
+- None requiring changes。
+
+Ticket/design fit:
+- Fresh schema creates typed v0 tables and does not create canonical top-level `runs`, `hosts`, `workers`, `actors`, or validation/CI result tables。
+- Legacy `runs` is preserved only as `legacy_runs`; it does not masquerade as canonical。
+- Host/Worker APIs remain live runtime views, not DB authority。
+- `/api/runs` remains removed/404-tested。
+- Canonical schema avoids generic `metadata_json`, `payload_json`, `diagnostics_json`, and catch-all payload columns。
+- `schema-v0.md` update is narrow and consistent with migration behavior。
+- No accidental frontend authority/business-logic expansion found。
+
+Reviewer validation:
+- `cargo fmt --check`: passed
+- `git diff --check f17a458a..HEAD`: passed
+- `cargo test -p yoi-workspace-server`: passed (`10 passed`)
+- `cargo check -p yoi-workspace-server`: passed
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link --print-out-paths`: passed, output `/nix/store/fnz7650sshl3md2vdwb4a1q8dc0hf542-yoi-0.1.0`
+
+Not rerun in r2:
+- Deno frontend check/build, because r1-fix diff touches only `store.rs` and `schema-v0.md`; r1 had already validated frontend for original `/api/runs` card removal。
+
+Worktree status:
+- Clean tracked status on `impl/00001KVNKD56W-workspace-db-schema-v0` at `d89ace5b`。
+- Ignored artifact present: `target/` only; no ignored frontend artifacts under `web/workspace`。
+
+---
