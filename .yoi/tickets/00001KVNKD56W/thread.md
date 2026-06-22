@@ -299,3 +299,62 @@ Worktree status:
 - Tracked status clean; only ignored generated artifacts present。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-22T09:18:29Z -->
+
+## Implementation report
+
+Coder r1-fix report received from `yoi-coder-00001KVNKD56W`.
+
+New fix commit:
+- `d89ace5b workspace: canonicalize legacy workspaces`
+
+Branch commits now:
+- `5149ab70 workspace: implement db schema v0 bootstrap`
+- `d89ace5b workspace: canonicalize legacy workspaces`
+
+Fix summary:
+- `crates/workspace-server/src/store.rs`
+  - Legacy migration now preserves old non-canonical `workspaces` by renaming it to `legacy_workspaces`。
+  - Active canonical v0 `workspaces` is created with only:
+    - `workspace_id`
+    - `display_name`
+    - `state`
+    - `created_at`
+    - `updated_at`
+  - Existing legacy workspace rows are copied into canonical `workspaces`, defaulting `state` to `active` when no typed state existed。
+  - Previous legacy demotion for `repositories`, `runs`, `artifacts`, `ticket_projections`, and `objective_projections` is preserved。
+  - Added upgrade test assertions for:
+    - upgraded `workspaces` column set exactly matches v0。
+    - `legacy_workspaces` preserves old obsolete columns。
+    - old workspace data is copied into canonical table。
+    - post-upgrade `upsert_workspace()` succeeds for a new workspace id。
+- `.yoi/tickets/00001KVNKD56W/artifacts/schema-v0.md`
+  - Updated implementation alignment notes to document `legacy_workspaces` preservation and canonical copy behavior。
+
+Coder validation reported:
+- `cargo fmt --check`: passed
+- `cargo test -p yoi-workspace-server`: passed
+- `cargo check -p yoi-workspace-server`: passed
+- `git diff --check f17a458a..HEAD`: passed
+- `cargo run -p yoi -- ticket doctor`: passed
+
+Not rerun by Coder for the r1 fix:
+- Deno check/build and Nix build, because the fix touched only schema artifact and workspace-server store code and Reviewer had validated frontend/Nix before the blocker。
+
+Generated artifact cleanup:
+- Coder removed reviewer-generated frontend artifacts:
+  - `web/workspace/node_modules/`
+  - `web/workspace/.svelte-kit/`
+  - `web/workspace/build/`
+
+Orchestrator evidence checked:
+- Worktree clean on `impl/00001KVNKD56W-workspace-db-schema-v0` at `d89ace5b`。
+- r1-fix diff `5149ab70..HEAD` touches only `crates/workspace-server/src/store.rs` and `schema-v0.md`。
+- `git diff --check f17a458a..HEAD`: passed。
+- No ignored frontend artifacts remain under `web/workspace`。
+
+Next action:
+- Route back to Reviewer for r2 verification of legacy `workspaces` canonicalization and final acceptance。
+
+---
