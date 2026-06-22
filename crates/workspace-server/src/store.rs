@@ -8,6 +8,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
+const WORKSPACES_V0_COLUMNS: &[&str] = &[
+    "workspace_id",
+    "display_name",
+    "state",
+    "created_at",
+    "updated_at",
+];
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -195,12 +203,54 @@ fn align_legacy_bootstrap_schema(conn: &Connection) -> Result<()> {
             "legacy_objective_projections",
         )?;
     }
-    if table_exists(conn, "workspaces")? && !column_exists(conn, "workspaces", "state")? {
-        conn.execute_batch(
-            "ALTER TABLE workspaces ADD COLUMN state TEXT NOT NULL DEFAULT 'active';",
-        )?;
+
+    let legacy_workspaces = preserve_noncanonical_workspaces(conn)?;
+    create_schema_v0_tables(conn)?;
+    if let Some(legacy_table) = legacy_workspaces {
+        copy_legacy_workspaces(conn, &legacy_table)?;
     }
-    create_schema_v0_tables(conn)
+    Ok(())
+}
+
+fn preserve_noncanonical_workspaces(conn: &Connection) -> Result<Option<String>> {
+    if !table_exists(conn, "workspaces")? {
+        return Ok(None);
+    }
+    let columns = table_columns(conn, "workspaces")?;
+    if columns
+        .iter()
+        .map(String::as_str)
+        .eq(WORKSPACES_V0_COLUMNS.iter().copied())
+    {
+        return Ok(None);
+    }
+    let legacy_table = "legacy_workspaces";
+    rename_legacy_table(conn, "workspaces", legacy_table)?;
+    Ok(Some(legacy_table.to_string()))
+}
+
+fn copy_legacy_workspaces(conn: &Connection, legacy_table: &str) -> Result<()> {
+    let columns = table_columns(conn, legacy_table)?;
+    for required_column in ["workspace_id", "display_name", "created_at", "updated_at"] {
+        if !columns.iter().any(|column| column == required_column) {
+            return Err(Error::Store(format!(
+                "cannot migrate legacy workspaces: `{legacy_table}` is missing `{required_column}`"
+            )));
+        }
+    }
+    let state_expr = if columns.iter().any(|column| column == "state") {
+        "COALESCE(NULLIF(state, ''), 'active')"
+    } else {
+        "'active'"
+    };
+    conn.execute_batch(&format!(
+        r#"INSERT OR IGNORE INTO workspaces (
+            workspace_id, display_name, state, created_at, updated_at
+        )
+        SELECT workspace_id, display_name, {state_expr}, created_at, updated_at
+        FROM {legacy_table};"#
+    ))?;
+    Ok(())
 }
 
 fn rename_legacy_table(conn: &Connection, table_name: &str, legacy_name: &str) -> Result<()> {
@@ -618,6 +668,20 @@ mod tests {
         configure_sqlite(&conn).unwrap();
         conn.execute_batch(LEGACY_BOOTSTRAP_SQL).unwrap();
         conn.execute(
+            r#"INSERT INTO workspaces (
+                workspace_id, display_name, local_root, record_authority, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+            params![
+                "legacy-workspace",
+                "Legacy Workspace",
+                "/tmp/legacy-workspace",
+                "local_yoi_project_records",
+                "2026-01-01T00:00:00Z",
+                "2026-01-02T00:00:00Z",
+            ],
+        )
+        .unwrap();
+        conn.execute(
             "INSERT INTO __yoi_schema_migrations (version, name) VALUES (1, 'bootstrap workspace control plane')",
             [],
         )
@@ -637,6 +701,7 @@ mod tests {
                     "ticket_worker_links",
                     "artifacts",
                     "audit_events",
+                    "legacy_workspaces",
                     "legacy_repositories",
                     "legacy_runs",
                     "legacy_artifacts",
@@ -654,14 +719,58 @@ mod tests {
                         "upgraded schema must not retain forbidden canonical table {forbidden}"
                     );
                 }
-                let workspace_columns = table_columns(conn, "workspaces")?;
-                assert!(workspace_columns.iter().any(|column| column == "state"));
+                assert_columns(
+                    conn,
+                    "workspaces",
+                    [
+                        "workspace_id",
+                        "display_name",
+                        "state",
+                        "created_at",
+                        "updated_at",
+                    ],
+                );
+                let legacy_workspace_columns = table_columns(conn, "legacy_workspaces")?;
+                assert!(
+                    legacy_workspace_columns
+                        .iter()
+                        .any(|column| column == "local_root")
+                );
+                assert!(
+                    legacy_workspace_columns
+                        .iter()
+                        .any(|column| column == "record_authority")
+                );
                 let artifact_columns = table_columns(conn, "artifacts")?;
                 assert!(artifact_columns.iter().any(|column| column == "uri"));
                 assert!(!artifact_columns.iter().any(|column| column == "run_id"));
                 Ok(())
             })
             .unwrap();
+
+        assert_eq!(
+            store.get_workspace("legacy-workspace").await.unwrap(),
+            Some(WorkspaceRecord {
+                workspace_id: "legacy-workspace".to_string(),
+                display_name: "Legacy Workspace".to_string(),
+                state: "active".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-02T00:00:00Z".to_string(),
+            })
+        );
+
+        let new_record = WorkspaceRecord {
+            workspace_id: "new-workspace".to_string(),
+            display_name: "New Workspace".to_string(),
+            state: "active".to_string(),
+            created_at: "2026-02-01T00:00:00Z".to_string(),
+            updated_at: "2026-02-01T00:00:00Z".to_string(),
+        };
+        store.upsert_workspace(&new_record).await.unwrap();
+        assert_eq!(
+            store.get_workspace("new-workspace").await.unwrap(),
+            Some(new_record)
+        );
     }
 
     fn table_names(conn: &Connection) -> BTreeSet<String> {
