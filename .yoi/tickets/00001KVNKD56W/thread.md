@@ -516,3 +516,26 @@ Workspace DB canonical schema v0 design を `schema-v0.md` artifact と workspac
 - Full TicketEvents/TicketWorkerLinks/Artifacts write surfaces are not implemented beyond schema/bootstrap alignment。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-22T09:27:06Z -->
+
+## Implementation report
+
+Post-close cleanup completed。
+
+- Stopped child Pods and reclaimed scope:
+  - `yoi-coder-00001KVNKD56W`
+  - `yoi-reviewer-00001KVNKD56W-r1`
+- Removed ignored frontend validation artifacts from child worktree before worktree removal if present:
+  - `web/workspace/node_modules/`
+  - `web/workspace/.svelte-kit/`
+  - `web/workspace/build/`
+- Removed implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVNKD56W-workspace-db-schema-v0`
+- Deleted implementation branch:
+  - `impl/00001KVNKD56W-workspace-db-schema-v0`
+- Orchestrator worktree remains clean on `orchestration` at `7a7891d4`。
+
+Root/original workspace was not used for merge/validation/cleanup operations。
+
+---
