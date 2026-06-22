@@ -137,3 +137,53 @@ Next action:
 - Wait for Coder implementation/design-alignment report, then spawn Reviewer read-only for the implementation diff。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-22T09:02:51Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVNKD56W`.
+
+Implementation commit:
+- `5149ab70 workspace: implement db schema v0 bootstrap`
+
+Changed areas:
+- `.yoi/tickets/00001KVNKD56W/artifacts/schema-v0.md`
+  - Added implementation alignment notes for SQLite schema version 2。
+  - Documented legacy preservation/demotion for old bootstrap tables。
+- `crates/workspace-server/src/store.rs`
+  - Replaced old bootstrap schema with Workspace DB canonical schema v0 tables。
+  - Advanced schema version to `2`。
+  - Added typed v0 tables: `tickets`, `ticket_events`, `ticket_relations`, `objectives`, `objective_ticket_links`, `repositories`, `ticket_targets`, `ticket_target_paths`, `ticket_worker_links`, `artifacts`, `audit_events`。
+  - Removed active/canonical `runs` store concept and `RunSummary`。
+  - Added legacy migration handling that renames old bootstrap tables to `legacy_*` preservation tables instead of treating them as canonical。
+  - Added tests for fresh v0 schema boundaries and legacy upgrade behavior, including forbidden table absence。
+- `crates/workspace-server/src/server.rs`
+  - Removed `/api/runs` route。
+  - Kept Host/Worker APIs as live runtime views。
+  - Added test coverage that `/api/runs` is no longer served。
+- `web/workspace/src/routes/+page.svelte`
+  - Removed Runs endpoint card/reference。
+
+Coder validation reported:
+- `cargo fmt --check`: passed
+- `cargo test -p yoi-workspace-server`: passed
+- `cargo check -p yoi-workspace-server`: passed
+- `git diff --check`: passed
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `cd web/workspace && deno task check`: passed
+- `cd web/workspace && deno task build`: passed
+
+Not run by Coder:
+- `nix build .#yoi --no-link`: not run because no dependency/package/source-filter changes。
+
+Orchestrator evidence checked:
+- Worktree clean on `impl/00001KVNKD56W-workspace-db-schema-v0` at `5149ab70`。
+- Diff `f17a458a..HEAD` touches expected design/backend/frontend files only。
+- `git diff --check f17a458a..HEAD`: passed。
+- Deno validation generated ignored frontend artifacts; Orchestrator removed `web/workspace/node_modules/`, `.svelte-kit/`, and `build/` before Reviewer routing。
+
+Next action:
+- Route to read-only Reviewer Pod for acceptance review。
+
+---
