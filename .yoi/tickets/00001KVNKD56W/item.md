@@ -1,9 +1,11 @@
 ---
 title: 'Workspace DB canonical schema design'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-21T17:24:43Z'
-updated_at: '2026-06-21T18:10:00Z'
+updated_at: '2026-06-22T08:48:39Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-22T08:48:39Z'
 ---
 
 ## 背景
