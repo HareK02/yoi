@@ -187,3 +187,34 @@ Next action:
 - Route to read-only Reviewer Pod for acceptance review。
 
 ---
+
+<!-- event: comment author: yoi-orchestrator at: 2026-06-22T09:03:49Z -->
+
+## Comment
+
+Review routing:
+
+Spawned read-only Reviewer Pod:
+- `yoi-reviewer-00001KVNKD56W-r1`
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVNKD56W-workspace-db-schema-v0`
+- Branch: `impl/00001KVNKD56W-workspace-db-schema-v0`
+- Baseline: `f17a458a`
+- Implementation commit: `5149ab70 workspace: implement db schema v0 bootstrap`
+- Diff: `f17a458a..5149ab70`
+
+Reviewer scope:
+- read-only `/home/hare/Projects/yoi`
+
+Reviewer focus:
+- Consistency between `schema-v0.md` and implemented SQLite migration/version 2。
+- Absence of canonical `runs`, `hosts`, `workers`, `actors`, generic JSON/payload/metadata columns, and validation/CI result tables。
+- Legacy table preservation/demotion behavior。
+- Existing read APIs for Tickets/Objectives/Repositories/Hosts/Workers still work。
+- `/api/runs` removal is intentional and test-covered。
+- Design artifact updates remain concise and consistent。
+
+Orchestrator will wait for reviewer verdict before integration。
+
+---
