@@ -1,7 +1,7 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::hosts::{HostSummary, LocalRuntimeBridge, RuntimeDiagnostic, WorkerSummary};
-use crate::records::{LocalProjectRecordReader, ObjectiveDetail, ProjectRecordList, TicketDetail};
+use crate::records::{
+    LocalProjectRecordReader, ObjectiveDetail, ProjectRecordList, TicketDetail, TicketSummary,
+};
+use crate::repositories::{LocalRepositoryReader, RepositoryLogRead, RepositorySummary};
 use crate::store::{ControlPlaneStore, RunSummary, WorkspaceRecord};
 use crate::{Error, Result};
 
@@ -95,6 +98,19 @@ impl WorkspaceApi {
             self.config.local_runtime_data_dir.clone(),
         )
     }
+
+    fn local_repository_reader(&self) -> LocalRepositoryReader {
+        LocalRepositoryReader::new(self.config.workspace_root.clone())
+    }
+
+    fn workspace_display_name(&self) -> String {
+        self.config
+            .workspace_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("workspace")
+            .to_string()
+    }
 }
 
 pub fn build_router(api: WorkspaceApi) -> Router {
@@ -104,6 +120,13 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route("/api/tickets/{id}", get(get_ticket))
         .route("/api/objectives", get(list_objectives))
         .route("/api/objectives/{id}", get(get_objective))
+        .route("/api/repositories", get(list_repositories))
+        .route("/api/repositories/{repository_id}", get(repository_detail))
+        .route("/api/repositories/{repository_id}/log", get(repository_log))
+        .route(
+            "/api/repositories/{repository_id}/tickets",
+            get(repository_tickets),
+        )
         .route("/api/runs", get(list_runs))
         .route("/api/hosts", get(list_hosts))
         .route("/api/workers", get(list_workers))
@@ -162,6 +185,58 @@ pub struct RuntimeListResponse<T> {
     pub items: Vec<T>,
     pub source: String,
     pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepositoryListResponse {
+    pub workspace_id: String,
+    pub items: Vec<RepositorySummary>,
+    pub source: String,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepositoryDetailResponse {
+    pub workspace_id: String,
+    pub item: RepositorySummary,
+    pub source: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepositoryLogResponse {
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub limit: usize,
+    pub items: Vec<crate::repositories::GitCommitSummary>,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepositoryTicketsResponse {
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub limit: usize,
+    pub columns: Vec<TicketKanbanColumn>,
+    pub invalid_records: Vec<crate::records::InvalidProjectRecord>,
+    pub record_authority: String,
+    pub source: String,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TicketKanbanColumn {
+    pub state: String,
+    pub items: Vec<TicketSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LogQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TicketKanbanQuery {
+    limit: Option<usize>,
 }
 
 async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<WorkspaceResponse>> {
@@ -249,6 +324,80 @@ async fn get_objective(
     Ok(Json(api.records.objective(&id)?))
 }
 
+async fn list_repositories(
+    State(api): State<WorkspaceApi>,
+) -> ApiResult<Json<RepositoryListResponse>> {
+    let reader = api.local_repository_reader();
+    let items = reader.list(&api.workspace_display_name());
+    Ok(Json(RepositoryListResponse {
+        workspace_id: api.config.workspace_id,
+        items,
+        source: "local_workspace_root".to_string(),
+        diagnostics: Vec::new(),
+    }))
+}
+
+async fn repository_detail(
+    State(api): State<WorkspaceApi>,
+    AxumPath(repository_id): AxumPath<String>,
+) -> ApiResult<Json<RepositoryDetailResponse>> {
+    ensure_local_repository(&repository_id)?;
+    let reader = api.local_repository_reader();
+    Ok(Json(RepositoryDetailResponse {
+        workspace_id: api.config.workspace_id.clone(),
+        item: reader.summary(&api.workspace_display_name()),
+        source: "local_workspace_root".to_string(),
+    }))
+}
+
+async fn repository_log(
+    State(api): State<WorkspaceApi>,
+    AxumPath(repository_id): AxumPath<String>,
+    Query(query): Query<LogQuery>,
+) -> ApiResult<Json<RepositoryLogResponse>> {
+    ensure_local_repository(&repository_id)?;
+    let RepositoryLogRead {
+        limit,
+        items,
+        diagnostics,
+    } = api.local_repository_reader().recent_log(query.limit);
+    Ok(Json(RepositoryLogResponse {
+        workspace_id: api.config.workspace_id,
+        repository_id,
+        limit,
+        items,
+        diagnostics,
+    }))
+}
+
+async fn repository_tickets(
+    State(api): State<WorkspaceApi>,
+    AxumPath(repository_id): AxumPath<String>,
+    Query(query): Query<TicketKanbanQuery>,
+) -> ApiResult<Json<RepositoryTicketsResponse>> {
+    ensure_local_repository(&repository_id)?;
+    let limit = query.limit.unwrap_or(api.config.max_records).min(200);
+    let ProjectRecordList {
+        items,
+        invalid_records,
+        record_authority,
+    } = api.records.list_tickets(limit)?;
+    Ok(Json(RepositoryTicketsResponse {
+        workspace_id: api.config.workspace_id,
+        repository_id,
+        limit,
+        columns: ticket_kanban_columns(items),
+        invalid_records,
+        record_authority,
+        source: "workspace_local_ticket_fallback".to_string(),
+        diagnostics: vec![RuntimeDiagnostic {
+            code: "repository_ticket_target_metadata_absent".to_string(),
+            severity: "info".to_string(),
+            message: "Ticket target Repository metadata is not available yet; Kanban groups all workspace-local Tickets by state as a read-only fallback.".to_string(),
+        }],
+    }))
+}
+
 async fn list_runs(
     State(api): State<WorkspaceApi>,
 ) -> ApiResult<Json<RuntimeListResponse<RunSummary>>> {
@@ -306,6 +455,60 @@ fn workers_response(api: WorkspaceApi) -> ApiResult<RuntimeListResponse<WorkerSu
         source: "local_pod_metadata".to_string(),
         diagnostics,
     })
+}
+
+fn ensure_local_repository(repository_id: &str) -> Result<()> {
+    if LocalRepositoryReader::is_local_repository_id(repository_id) {
+        Ok(())
+    } else {
+        Err(Error::UnknownRepository(repository_id.to_string()))
+    }
+}
+
+fn ticket_kanban_columns(items: Vec<TicketSummary>) -> Vec<TicketKanbanColumn> {
+    let mut columns = vec![
+        TicketKanbanColumn {
+            state: "planning".to_string(),
+            items: Vec::new(),
+        },
+        TicketKanbanColumn {
+            state: "ready".to_string(),
+            items: Vec::new(),
+        },
+        TicketKanbanColumn {
+            state: "queued".to_string(),
+            items: Vec::new(),
+        },
+        TicketKanbanColumn {
+            state: "inprogress".to_string(),
+            items: Vec::new(),
+        },
+        TicketKanbanColumn {
+            state: "done".to_string(),
+            items: Vec::new(),
+        },
+        TicketKanbanColumn {
+            state: "closed".to_string(),
+            items: Vec::new(),
+        },
+        TicketKanbanColumn {
+            state: "other".to_string(),
+            items: Vec::new(),
+        },
+    ];
+    for item in items {
+        let index = match item.state.as_str() {
+            "planning" => 0,
+            "ready" => 1,
+            "queued" => 2,
+            "inprogress" => 3,
+            "done" => 4,
+            "closed" => 5,
+            _ => 6,
+        };
+        columns[index].items.push(item);
+    }
+    columns
 }
 
 async fn static_or_spa_fallback(State(api): State<WorkspaceApi>, uri: Uri) -> Response {
@@ -407,9 +610,10 @@ impl From<Error> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.0 {
-            Error::InvalidRecordId(_) | Error::MissingFrontmatter(_) | Error::UnknownHost(_) => {
-                StatusCode::NOT_FOUND
-            }
+            Error::InvalidRecordId(_)
+            | Error::MissingFrontmatter(_)
+            | Error::UnknownHost(_)
+            | Error::UnknownRepository(_) => StatusCode::NOT_FOUND,
             Error::Ticket(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -468,6 +672,44 @@ mod tests {
 
         let objectives = get_json(app.clone(), "/api/objectives").await;
         assert_eq!(objectives["items"][0]["id"], "00000000001J3");
+        assert_eq!(objectives["items"][0]["summary"], "Objective body.");
+
+        let repositories = get_json(app.clone(), "/api/repositories").await;
+        assert_eq!(repositories["items"][0]["id"], "local");
+        assert_eq!(repositories["items"][0]["kind"], "local");
+
+        let repository_detail = get_json(app.clone(), "/api/repositories/local").await;
+        assert_eq!(repository_detail["item"]["id"], "local");
+
+        let repository_log = get_json(app.clone(), "/api/repositories/local/log?limit=3").await;
+        assert_eq!(repository_log["repository_id"], "local");
+        assert_eq!(repository_log["limit"], 3);
+
+        let repository_tickets = get_json(app.clone(), "/api/repositories/local/tickets").await;
+        assert_eq!(repository_tickets["repository_id"], "local");
+        let ready_column = repository_tickets["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|column| column["state"] == "ready")
+            .unwrap();
+        assert_eq!(ready_column["items"][0]["id"], "00000000001J2");
+        assert_eq!(
+            repository_tickets["diagnostics"][0]["code"],
+            "repository_ticket_target_metadata_absent"
+        );
+
+        let unknown_repository_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/repositories/nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown_repository_response.status(), StatusCode::NOT_FOUND);
 
         let hosts = get_json(app.clone(), "/api/hosts").await;
         assert_eq!(hosts["items"][0]["host_id"], "local-local-test");

@@ -6,11 +6,16 @@
 
 pub mod hosts;
 pub mod records;
+pub mod repositories;
 pub mod server;
 pub mod store;
 
 pub use records::{
     LocalProjectRecordReader, ObjectiveDetail, ObjectiveSummary, TicketDetail, TicketSummary,
+};
+pub use repositories::{
+    GitCommitSummary, GitRemoteSummary, GitRepositorySummary, LocalRepositoryReader,
+    RepositoryLogRead, RepositorySummary,
 };
 pub use server::{AuthConfig, ServerConfig, WorkspaceApi, build_router, serve};
 pub use store::{ControlPlaneStore, SqliteWorkspaceStore, WorkspaceRecord};
@@ -33,6 +38,8 @@ pub enum Error {
     MissingFrontmatter(String),
     #[error("unknown local host `{0}`")]
     UnknownHost(String),
+    #[error("unknown local repository `{0}`")]
+    UnknownRepository(String),
     #[error("store error: {0}")]
     Store(String),
 }
