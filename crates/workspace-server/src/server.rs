@@ -15,7 +15,7 @@ use crate::records::{
     LocalProjectRecordReader, ObjectiveDetail, ProjectRecordList, TicketDetail, TicketSummary,
 };
 use crate::repositories::{LocalRepositoryReader, RepositoryLogRead, RepositorySummary};
-use crate::store::{ControlPlaneStore, RunSummary, WorkspaceRecord};
+use crate::store::{ControlPlaneStore, WorkspaceRecord};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,8 +74,7 @@ impl WorkspaceApi {
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: config.workspace_id.clone(),
                 display_name,
-                local_root: config.workspace_root.clone(),
-                record_authority: "local_yoi_project_records".to_string(),
+                state: "active".to_string(),
                 created_at: "1970-01-01T00:00:00Z".to_string(),
                 updated_at: "1970-01-01T00:00:00Z".to_string(),
             })
@@ -127,7 +126,6 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             "/api/repositories/{repository_id}/tickets",
             get(repository_tickets),
         )
-        .route("/api/runs", get(list_runs))
         .route("/api/hosts", get(list_hosts))
         .route("/api/workers", get(list_workers))
         .route("/api/hosts/{host_id}/workers", get(list_host_workers))
@@ -395,20 +393,6 @@ async fn repository_tickets(
             severity: "info".to_string(),
             message: "Ticket target Repository metadata is not available yet; Kanban groups all workspace-local Tickets by state as a read-only fallback.".to_string(),
         }],
-    }))
-}
-
-async fn list_runs(
-    State(api): State<WorkspaceApi>,
-) -> ApiResult<Json<RuntimeListResponse<RunSummary>>> {
-    let limit = api.config.max_records.min(200);
-    let items = api.store.list_runs(api.workspace_id(), limit).await?;
-    Ok(Json(RuntimeListResponse {
-        workspace_id: api.config.workspace_id,
-        limit,
-        items,
-        source: "sqlite_runtime_tables".to_string(),
-        diagnostics: Vec::new(),
     }))
 }
 
@@ -728,6 +712,18 @@ mod tests {
 
         let host_workers = get_json(app.clone(), "/api/hosts/local-local-test/workers").await;
         assert!(host_workers["items"].as_array().unwrap().is_empty());
+
+        let runs_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runs_response.status(), StatusCode::NOT_FOUND);
 
         let runners_response = app
             .clone()
