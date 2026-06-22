@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KVNKD56W",
+      "kind": "related",
+      "target": "00001KVMFFYVX",
+      "note": "Defines canonical DB model for workspace web control plane",
+      "author": "yoi ticket",
+      "at": "2026-06-21T17:25:34Z"
+    },
+    {
+      "ticket_id": "00001KVNKD56W",
+      "kind": "related",
+      "target": "00001KVNEKH9Q",
+      "note": "Host/Worker naming and local execution state should align with canonical DB schema",
+      "author": "yoi ticket",
+      "at": "2026-06-21T17:25:34Z"
+    }
+  ]
+}

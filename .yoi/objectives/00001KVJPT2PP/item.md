@@ -2,7 +2,7 @@
 title: "Team workspace control plane and runner architecture"
 state: "active"
 created_at: "2026-06-20T14:26:29Z"
-updated_at: "2026-06-21T06:57:06Z"
+updated_at: "2026-06-21T18:10:00Z"
 linked_tickets: ["00001KVMFFYVX"]
 ---
 
@@ -175,6 +175,10 @@ Web UI は Ticket、Objective、Memory、Knowledge、Run、Runner、Artifact を
 
 Cloud/remote execution を成立させるには、多数のエージェント実行を安く管理できる必要がある。logical agent session と runtime process/resource placement を分ける。
 
+初期 Workspace DB では、Worker を canonical table として永続化しない。Host / Worker 一覧は backend-local runtime inspection や将来の Host protocol から逐次取得する live view とし、Ticket に関わった Worker は Ticket thread events と WorkerRef snapshot / TicketWorkerLink として記録する。
+
+Worker の一元管理、データ永続化、アーカイブは将来的には必要になる。これは Host protocol、remote/self-hosted/hosted worker lifecycle、worker identity、retention policy、audit requirements が固まった後に、dedicated Worker registry / archive model として追加する。v0 で Pod metadata の代替として Worker table を作らない。
+
 検討対象:
 
 - Agent identity と process/runtime placement の分離。
@@ -241,4 +245,5 @@ Cloud/remote execution を成立させるには、多数のエージェント実
 - Web frontend を最初の primary team UI とする。Desktop app は web/control-plane model が安定した後に検討する。
 - Git は重要な Repository provider / materialization backend として使うが、Workspace identity と authority を Git Repository root に固定しない。
 - Ticket と Objective は Workspace 配下に平たく持つ。対象コードベースや ref は Repository target selector として表現し、Run が concrete RepositoryPoint に解決する。
-- Memory の本格再設計は後回しにする。先に Workspace / Ticket / Run / Repository / Runner / Control plane の基盤を固め、Memory の保存先を Workspace backend に移すタイミングで、意味論・抽出・承認・検索・staleness 処理をまとめて回収する。
+- Memory の本格再設計は後回しにする。先に Workspace / Ticket / Repository / Host/Worker live view / Control plane の基盤を固め、Memory の保存先を Workspace backend に移すタイミングで、意味論・抽出・承認・検索・staleness 処理をまとめて回収する。
+- Worker の一元管理・データ永続化・アーカイブも後続設計に回す。初期 DB では Worker を Pod metadata の代替として永続化せず、live view と Ticket-linked WorkerRef 記録に留める。
