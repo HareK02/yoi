@@ -112,3 +112,28 @@ Validation plan:
 Human authorized queue routing from Workspace Dashboard. Ticket has a concrete schema-v0 design artifact and current workspace-server migration has a clear non-breaking alignment target, so Orchestrator accepts implementation/design alignment.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-22T08:51:00Z -->
+
+## Implementation report
+
+Implementation start report:
+
+- Created child implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVNKD56W-workspace-db-schema-v0`
+- Created branch:
+  - `impl/00001KVNKD56W-workspace-db-schema-v0`
+- Base commit:
+  - `f17a458a ticket: accept workspace db schema v0`
+- Confirmed tracked Ticket project records are visible in the child worktree。
+- Confirmed `.yoi/memory` has no tracked/untracked entries in the child worktree check。
+- Spawned sibling Coder Pod:
+  - `yoi-coder-00001KVNKD56W`
+- Coder scope:
+  - read: `/home/hare/Projects/yoi`
+  - write: `/home/hare/Projects/yoi/.worktree/00001KVNKD56W-workspace-db-schema-v0`
+
+Next action:
+- Wait for Coder implementation/design-alignment report, then spawn Reviewer read-only for the implementation diff。
+
+---
