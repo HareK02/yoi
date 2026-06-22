@@ -2,4 +2,4 @@
   import WorkspacePage from '$lib/workspace-pages/WorkspacePage.svelte';
 </script>
 
-<WorkspacePage view="overview" />
+<WorkspacePage view="repository" />

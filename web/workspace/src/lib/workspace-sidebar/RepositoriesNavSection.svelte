@@ -3,9 +3,10 @@
 
   type Props = {
     workspace: WorkspaceResponse | null;
+    currentPath?: string;
   };
 
-  let { workspace }: Props = $props();
+  let { workspace, currentPath = '/' }: Props = $props();
 </script>
 
 <section class="nav-section" aria-labelledby="repositories-heading">
@@ -16,7 +17,7 @@
 
   <ul class="nav-list" aria-label="Repositories">
     <li>
-      <a class="nav-item active" href="#/repositories/local">
+      <a class="nav-item" class:active={currentPath.startsWith('/repositories')} href="/repositories/local">
         <span class="item-title">{workspace?.display_name ?? 'local workspace'}</span>
         <span class="item-meta">local repository · read-only</span>
       </a>
@@ -27,83 +28,3 @@
     Repository authority remains the current workspace root and canonical project records.
   </p>
 </section>
-
-<style>
-  .nav-section {
-    display: grid;
-    gap: 10px;
-  }
-
-  .section-heading-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-  }
-
-  h2 {
-    margin: 0;
-    color: #94a3b8;
-    font-size: 0.72rem;
-    font-weight: 800;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
-  }
-
-  .section-count {
-    border: 1px solid rgba(148, 163, 184, 0.22);
-    border-radius: 999px;
-    color: #cbd5e1;
-    font-size: 0.72rem;
-    line-height: 1;
-    padding: 4px 8px;
-  }
-
-  .nav-list {
-    display: grid;
-    gap: 6px;
-    margin: 0;
-    padding: 0;
-    list-style: none;
-  }
-
-  .nav-item {
-    display: grid;
-    gap: 3px;
-    border: 1px solid rgba(148, 163, 184, 0.18);
-    border-radius: 14px;
-    background: rgba(15, 23, 42, 0.64);
-    padding: 10px 12px;
-    min-width: 0;
-    color: inherit;
-    text-decoration: none;
-  }
-
-  .nav-item.active {
-    border-color: rgba(56, 189, 248, 0.36);
-    background: rgba(14, 165, 233, 0.1);
-  }
-
-  .item-title,
-  .item-meta {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .item-title {
-    color: #e2e8f0;
-    font-weight: 700;
-  }
-
-  .item-meta,
-  .section-note {
-    color: #94a3b8;
-    font-size: 0.78rem;
-  }
-
-  .section-note {
-    margin: 0;
-    line-height: 1.45;
-  }
-</style>

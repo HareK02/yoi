@@ -144,6 +144,18 @@ export type ObjectiveSummary = {
   record_source?: string;
 };
 
+export type ObjectiveDetail = {
+  id: string;
+  title: string;
+  state: string;
+  created_at?: string | null;
+  updated_at?: string | null;
+  linked_tickets: string[];
+  body: string;
+  body_truncated: boolean;
+  record_source: string;
+};
+
 export type InvalidProjectRecord = {
   label: string;
   reason: string;
