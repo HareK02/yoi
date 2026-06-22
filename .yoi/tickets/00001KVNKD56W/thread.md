@@ -424,3 +424,95 @@ Worktree status:
 - Ignored artifact present: `target/` only; no ignored frontend artifacts under `web/workspace`。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-22T09:25:49Z -->
+
+## Implementation report
+
+Reviewer r2 approvalを受けて、実装ブランチを Orchestrator worktree の `orchestration` branch に統合した。
+
+統合:
+- Merge commit: `38bd122d merge: workspace db schema v0`
+- Merged branch: `impl/00001KVNKD56W-workspace-db-schema-v0`
+- Implementation commits:
+  - `5149ab70 workspace: implement db schema v0 bootstrap`
+  - `d89ace5b workspace: canonicalize legacy workspaces`
+
+Orchestrator worktree validation:
+- `cargo fmt --check`: passed
+- `git diff --check HEAD^1..HEAD`: passed
+- `cargo test -p yoi-workspace-server`: passed (`10 passed`)
+- `cargo check -p yoi-workspace-server`: passed
+- `cd web/workspace && rm -rf node_modules .svelte-kit build && deno task check`: passed (`svelte-check found 0 errors and 0 warnings`)
+- `cd web/workspace && deno task build`: passed
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+
+Validation generated ignored frontend artifacts in Orchestrator worktree:
+- `web/workspace/node_modules/`
+- `web/workspace/.svelte-kit/`
+- `web/workspace/build/`
+
+These were removed after validation. Final Orchestrator worktree status after validation cleanup is clean on `orchestration` at `38bd122d`。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-22T09:26:02Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Reviewer approval、Orchestrator worktree への統合、workspace-server tests/check、Deno check/build、Ticket doctor、Nix build が完了したため `done` に遷移する。
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-22T09:26:19Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-22T09:26:19Z status: closed -->
+
+## 完了
+
+Workspace DB canonical schema v0 design を `schema-v0.md` artifact と workspace-server SQLite bootstrap/migrations に整合させ、Orchestrator worktree の `orchestration` branch に統合した。
+
+主な成果:
+- SQLite schema version を `2` に進め、canonical schema v0 を実装。
+- Typed v0 tables を追加:
+  - `tickets`
+  - `ticket_events`
+  - `ticket_relations`
+  - `objectives`
+  - `objective_ticket_links`
+  - `repositories`
+  - `ticket_targets`
+  - `ticket_target_paths`
+  - `ticket_worker_links`
+  - `artifacts`
+  - `audit_events`
+- Canonical v0 から top-level `runs`, `hosts`, `workers`, `actors`, validation/CI result tables を除外。
+- Generic `metadata_json`, `payload_json`, `diagnostics_json` のような catch-all payload columns を canonical v0 tables に追加しない方針を維持。
+- `/api/runs` と frontend Runs card/reference を削除し、404 test を追加。
+- Host/Worker APIs は DB authority ではなく live runtime views として維持。
+- Legacy bootstrap tables は non-canonical `legacy_*` preservation tables に demote。
+- Legacy `workspaces` は `legacy_workspaces` に preserve し、active canonical `workspaces` を v0 column set で作り直して既存行を copy。
+- Post-upgrade `upsert_workspace()` for new workspace id が通る regression test を追加。
+- `schema-v0.md` に SQLite version 2 / legacy preservation alignment notes を追加。
+
+統合・検証:
+- Merge commit: `38bd122d merge: workspace db schema v0`
+- Implementation commits: `5149ab70`, `d89ace5b`
+- Reviewer final verdict: approve
+- Validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p yoi-workspace-server`, `cargo check -p yoi-workspace-server`, `deno task check`, `deno task build`, `cargo run -p yoi -- ticket doctor`, and `nix build .#yoi --no-link`。
+
+範囲外:
+- Ticket/Objective write authority migration to DB is not implemented。
+- Host/Worker canonical DB tables are not added。
+- Validation/CI result tables and Actor table are not added。
+- Full TicketEvents/TicketWorkerLinks/Artifacts write surfaces are not implemented beyond schema/bootstrap alignment。
+
+---
