@@ -126,3 +126,60 @@ Next action:
 - Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T06:09:42Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVSEBF56`.
+
+Implementation commit:
+- `a13fb693 protocol: generate workspace TypeScript types`
+
+Changed areas:
+- `crates/protocol`
+  - Made `stream` optional behind default feature `stream`。
+  - Added optional `typescript` feature using `ts-rs`。
+  - Added `cfg_attr(feature = "typescript", derive(ts_rs::TS))` to protocol DTOs。
+  - Added deterministic generator module and example:
+    - `crates/protocol/src/typescript.rs`
+    - `crates/protocol/examples/generate_typescript.rs`
+  - Added drift check:
+    - `cargo test -p protocol --features typescript generated_protocol_types_are_current`
+- `web/workspace`
+  - Added generated TypeScript artifact:
+    - `web/workspace/src/lib/generated/protocol.ts`
+  - Re-exported generated root protocol types from workspace sidebar types:
+    - `PodProtocolMethod`
+    - `PodProtocolEvent`
+    - `PodProtocolSegment`
+- `crates/workspace-server`
+  - Updated extension-point notes to explicitly preserve no direct browser-to-Pod socket exposure and require future Workspace-server proxy enforcement of Worker identity / method allow-block boundaries。
+- Packaging/dependencies:
+  - Updated `Cargo.lock`。
+  - Updated `package.nix` `cargoHash`。
+
+Coder validation reported:
+- `cargo fmt --check`: passed
+- `cargo test -p protocol`: passed
+- `cargo test -p protocol --features typescript generated_protocol_types_are_current`: passed
+- `cargo test -p protocol --features typescript`: passed
+- `cargo check -p protocol --target wasm32-unknown-unknown --no-default-features`: passed
+- `cd web/workspace && deno task check && deno task build`: passed
+- `cargo run -p yoi -- ticket doctor`: passed
+- `git diff --check`: passed
+- `nix build .#yoi --no-link`: passed
+
+Generated artifact cleanup:
+- Only intended generated TypeScript import artifact is tracked。
+- Orchestrator removed ignored `web/workspace/node_modules/` before Reviewer routing; no ignored frontend artifacts remain under `web/workspace`。
+
+Orchestrator evidence checked:
+- Worktree clean on `impl/00001KVSEBF56-protocol-typescript-types` at `a13fb693`。
+- Diff `746c51c7..HEAD` touches expected protocol/frontend/workspace-server/package files only。
+- `git diff --check 746c51c7..HEAD`: passed。
+
+Next action:
+- Route to read-only Reviewer Pod for acceptance review。
+
+---
