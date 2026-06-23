@@ -2,7 +2,7 @@
 title: 'Improve Workspace web ticket Kanban grouping and lazy rows'
 state: 'closed'
 created_at: '2026-06-23T05:50:36Z'
-updated_at: '2026-06-23T06:15:22Z'
+updated_at: '2026-06-23T06:16:10Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-23T05:53:22Z'

@@ -347,3 +347,26 @@ Workspace web Repository Ticket Kanban の grouping / lazy rows 改善を統合�
 - Backend pagination、Ticket state mutation UI、drag/drop Kanban、browser/manual scroll E2E tests は追加していない。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T06:16:10Z -->
+
+## Implementation report
+
+Post-close cleanup completed。
+
+- Stopped child Pods and reclaimed scope:
+  - `yoi-coder-00001KVSGFM65`
+  - `yoi-reviewer-00001KVSGFM65-r1`
+- Removed ignored frontend validation artifacts from child worktree before worktree removal if present:
+  - `web/workspace/node_modules/`
+  - `web/workspace/.svelte-kit/`
+  - `web/workspace/build/`
+- Removed implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVSGFM65-kanban-lazy-rows`
+- Deleted implementation branch:
+  - `impl/00001KVSGFM65-kanban-lazy-rows`
+- Orchestrator worktree remains clean on `orchestration` at `9de04f72`。
+
+Root/original workspace was not used for merge/validation/cleanup operations。
+
+---
