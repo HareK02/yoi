@@ -5,11 +5,13 @@
 //! remain the canonical project records and are read through bounded bridge APIs.
 
 pub mod hosts;
+pub mod identity;
 pub mod records;
 pub mod repositories;
 pub mod server;
 pub mod store;
 
+pub use identity::{WORKSPACE_IDENTITY_RELATIVE_PATH, WorkspaceIdentity};
 pub use records::{
     LocalProjectRecordReader, ObjectiveDetail, ObjectiveSummary, TicketDetail, TicketSummary,
 };
@@ -40,6 +42,8 @@ pub enum Error {
     UnknownHost(String),
     #[error("unknown local repository `{0}`")]
     UnknownRepository(String),
+    #[error("workspace identity error: {0}")]
+    WorkspaceIdentity(String),
     #[error("store error: {0}")]
     Store(String),
 }

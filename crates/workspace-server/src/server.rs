@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::hosts::{HostSummary, LocalRuntimeBridge, RuntimeDiagnostic, WorkerSummary};
+use crate::identity::WorkspaceIdentity;
 use crate::records::{
     LocalProjectRecordReader, ObjectiveDetail, ProjectRecordList, TicketDetail, TicketSummary,
 };
@@ -28,6 +29,8 @@ pub enum AuthConfig {
 #[derive(Clone)]
 pub struct ServerConfig {
     pub workspace_id: String,
+    pub workspace_display_name: String,
+    pub workspace_created_at: String,
     pub workspace_root: PathBuf,
     pub static_assets_dir: Option<PathBuf>,
     pub auth: AuthConfig,
@@ -36,11 +39,12 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    pub fn local_dev(workspace_root: impl Into<PathBuf>) -> Self {
+    pub fn local_dev(workspace_root: impl Into<PathBuf>, identity: WorkspaceIdentity) -> Self {
         let workspace_root = workspace_root.into();
-        let display = workspace_display_name_from_root(&workspace_root);
         Self {
-            workspace_id: format!("local:{display}"),
+            workspace_id: identity.workspace_id,
+            workspace_display_name: identity.display_name,
+            workspace_created_at: identity.created_at,
             workspace_root,
             static_assets_dir: None,
             auth: AuthConfig::LocalDevToken {
@@ -61,14 +65,13 @@ pub struct WorkspaceApi {
 
 impl WorkspaceApi {
     pub async fn new(config: ServerConfig, store: Arc<dyn ControlPlaneStore>) -> Result<Self> {
-        let display_name = workspace_display_name_from_root(&config.workspace_root);
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: config.workspace_id.clone(),
-                display_name,
+                display_name: config.workspace_display_name.clone(),
                 state: "active".to_string(),
-                created_at: "1970-01-01T00:00:00Z".to_string(),
-                updated_at: "1970-01-01T00:00:00Z".to_string(),
+                created_at: config.workspace_created_at.clone(),
+                updated_at: config.workspace_created_at.clone(),
             })
             .await?;
         Ok(Self {
@@ -91,20 +94,19 @@ impl WorkspaceApi {
     }
 
     fn local_repository_reader(&self) -> LocalRepositoryReader {
-        LocalRepositoryReader::new(self.config.workspace_root.clone())
+        LocalRepositoryReader::new(
+            self.config.workspace_root.clone(),
+            self.config.workspace_id.clone(),
+        )
     }
 
-    fn workspace_display_name(&self) -> String {
-        workspace_display_name_from_root(&self.config.workspace_root)
+    fn local_repository_id(&self) -> String {
+        LocalRepositoryReader::repository_id_for_workspace(self.workspace_id())
     }
-}
 
-fn workspace_display_name_from_root(workspace_root: &std::path::Path) -> String {
-    workspace_root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .expect("workspace root must have a final path component")
-        .to_string()
+    fn workspace_display_name(&self) -> &str {
+        self.config.workspace_display_name.as_str()
+    }
 }
 
 pub fn build_router(api: WorkspaceApi) -> Router {
@@ -238,7 +240,7 @@ async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<Worksp
     let display_name = stored
         .as_ref()
         .map(|record| record.display_name.clone())
-        .unwrap_or_else(|| workspace_display_name_from_root(&api.config.workspace_root));
+        .unwrap_or_else(|| api.config.workspace_display_name.clone());
     Ok(Json(WorkspaceResponse {
         workspace_id: api.config.workspace_id.clone(),
         display_name,
@@ -314,7 +316,7 @@ async fn list_repositories(
     State(api): State<WorkspaceApi>,
 ) -> ApiResult<Json<RepositoryListResponse>> {
     let reader = api.local_repository_reader();
-    let items = reader.list(&api.workspace_display_name());
+    let items = reader.list(api.workspace_display_name());
     Ok(Json(RepositoryListResponse {
         workspace_id: api.config.workspace_id,
         items,
@@ -327,11 +329,11 @@ async fn repository_detail(
     State(api): State<WorkspaceApi>,
     AxumPath(repository_id): AxumPath<String>,
 ) -> ApiResult<Json<RepositoryDetailResponse>> {
-    ensure_local_repository(&repository_id)?;
+    let _canonical_repository_id = ensure_local_repository(&api, &repository_id)?;
     let reader = api.local_repository_reader();
     Ok(Json(RepositoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
-        item: reader.summary(&api.workspace_display_name()),
+        item: reader.summary(api.workspace_display_name()),
         source: "local_workspace_root".to_string(),
     }))
 }
@@ -341,7 +343,7 @@ async fn repository_log(
     AxumPath(repository_id): AxumPath<String>,
     Query(query): Query<LogQuery>,
 ) -> ApiResult<Json<RepositoryLogResponse>> {
-    ensure_local_repository(&repository_id)?;
+    let canonical_repository_id = ensure_local_repository(&api, &repository_id)?;
     let RepositoryLogRead {
         limit,
         items,
@@ -349,7 +351,7 @@ async fn repository_log(
     } = api.local_repository_reader().recent_log(query.limit);
     Ok(Json(RepositoryLogResponse {
         workspace_id: api.config.workspace_id,
-        repository_id,
+        repository_id: canonical_repository_id,
         limit,
         items,
         diagnostics,
@@ -361,7 +363,7 @@ async fn repository_tickets(
     AxumPath(repository_id): AxumPath<String>,
     Query(query): Query<TicketKanbanQuery>,
 ) -> ApiResult<Json<RepositoryTicketsResponse>> {
-    ensure_local_repository(&repository_id)?;
+    let canonical_repository_id = ensure_local_repository(&api, &repository_id)?;
     let limit = query.limit.unwrap_or(api.config.max_records).min(200);
     let ProjectRecordList {
         items,
@@ -370,7 +372,7 @@ async fn repository_tickets(
     } = api.records.list_tickets(limit)?;
     Ok(Json(RepositoryTicketsResponse {
         workspace_id: api.config.workspace_id,
-        repository_id,
+        repository_id: canonical_repository_id,
         limit,
         columns: ticket_kanban_columns(items),
         invalid_records,
@@ -429,9 +431,10 @@ fn workers_response(api: WorkspaceApi) -> ApiResult<RuntimeListResponse<WorkerSu
     })
 }
 
-fn ensure_local_repository(repository_id: &str) -> Result<()> {
-    if LocalRepositoryReader::is_local_repository_id(repository_id) {
-        Ok(())
+fn ensure_local_repository(api: &WorkspaceApi, repository_id: &str) -> Result<String> {
+    let canonical_repository_id = api.local_repository_id();
+    if LocalRepositoryReader::is_local_repository_id(repository_id, api.workspace_id()) {
+        Ok(canonical_repository_id)
     } else {
         Err(Error::UnknownRepository(repository_id.to_string()))
     }
@@ -612,6 +615,18 @@ mod tests {
 
     use crate::store::SqliteWorkspaceStore;
 
+    const TEST_WORKSPACE_ID: &str = "0192f0e8-4d84-7d6e-a000-000000000001";
+    const TEST_REPOSITORY_ID: &str = "local-0192f0e8-4d84-7d6e-a000-000000000001";
+    const TEST_CREATED_AT: &str = "2026-06-23T06:43:28Z";
+
+    fn test_identity() -> WorkspaceIdentity {
+        WorkspaceIdentity {
+            workspace_id: TEST_WORKSPACE_ID.to_string(),
+            display_name: "Test Workspace".to_string(),
+            created_at: TEST_CREATED_AT.to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn serves_bounded_read_apis_and_static_spa_separately() {
         let dir = tempfile::tempdir().unwrap();
@@ -623,15 +638,15 @@ mod tests {
         std::fs::write(static_dir.join("assets/app.js"), "console.log('yoi');").unwrap();
 
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        let mut config = ServerConfig::local_dev(dir.path());
-        config.workspace_id = "local:test".to_string();
+        let mut config = ServerConfig::local_dev(dir.path(), test_identity());
         config.static_assets_dir = Some(static_dir);
         config.local_runtime_data_dir = Some(dir.path().join("data"));
         let api = WorkspaceApi::new(config, Arc::new(store)).await.unwrap();
         let app = build_router(api);
 
         let workspace = get_json(app.clone(), "/api/workspace").await;
-        assert_eq!(workspace["workspace_id"], "local:test");
+        assert_eq!(workspace["workspace_id"], TEST_WORKSPACE_ID);
+        assert_eq!(workspace["display_name"], "Test Workspace");
         assert_eq!(workspace["record_authority"], "local_yoi_project_records");
         assert_eq!(
             workspace["extension_points"]["host_worker_bridge"]["status"],
@@ -647,18 +662,18 @@ mod tests {
         assert_eq!(objectives["items"][0]["summary"], "Objective body.");
 
         let repositories = get_json(app.clone(), "/api/repositories").await;
-        assert_eq!(repositories["items"][0]["id"], "local");
+        assert_eq!(repositories["items"][0]["id"], TEST_REPOSITORY_ID);
         assert_eq!(repositories["items"][0]["kind"], "local");
 
         let repository_detail = get_json(app.clone(), "/api/repositories/local").await;
-        assert_eq!(repository_detail["item"]["id"], "local");
+        assert_eq!(repository_detail["item"]["id"], TEST_REPOSITORY_ID);
 
         let repository_log = get_json(app.clone(), "/api/repositories/local/log?limit=3").await;
-        assert_eq!(repository_log["repository_id"], "local");
+        assert_eq!(repository_log["repository_id"], TEST_REPOSITORY_ID);
         assert_eq!(repository_log["limit"], 3);
 
         let repository_tickets = get_json(app.clone(), "/api/repositories/local/tickets").await;
-        assert_eq!(repository_tickets["repository_id"], "local");
+        assert_eq!(repository_tickets["repository_id"], TEST_REPOSITORY_ID);
         let ready_column = repository_tickets["columns"]
             .as_array()
             .unwrap()
@@ -684,7 +699,7 @@ mod tests {
         assert_eq!(unknown_repository_response.status(), StatusCode::NOT_FOUND);
 
         let hosts = get_json(app.clone(), "/api/hosts").await;
-        assert_eq!(hosts["items"][0]["host_id"], "local-local-test");
+        assert_eq!(hosts["items"][0]["host_id"], TEST_REPOSITORY_ID);
         assert_eq!(hosts["items"][0]["kind"], "local_host");
         assert_eq!(
             hosts["items"][0]["capabilities"]["local_pod_inspection"],
@@ -698,7 +713,11 @@ mod tests {
             "local_pod_metadata_root_missing"
         );
 
-        let host_workers = get_json(app.clone(), "/api/hosts/local-local-test/workers").await;
+        let host_workers = get_json(
+            app.clone(),
+            &format!("/api/hosts/{TEST_REPOSITORY_ID}/workers"),
+        )
+        .await;
         assert!(host_workers["items"].as_array().unwrap().is_empty());
 
         let runs_response = app
