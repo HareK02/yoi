@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
-use yoi_workspace_server::{ServerConfig, SqliteWorkspaceStore, serve};
+use yoi_workspace_server::{ServerConfig, SqliteWorkspaceStore, WorkspaceIdentity, serve};
 
 #[derive(Debug)]
 struct ServeOptions {
@@ -64,6 +64,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Error>> {
+    let identity = WorkspaceIdentity::load_or_init(&options.workspace)?;
     let db = options
         .db
         .unwrap_or_else(|| options.workspace.join(".yoi/workspace.db"));
@@ -72,7 +73,7 @@ async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
     }
 
     let store = Arc::new(SqliteWorkspaceStore::open(&db)?);
-    let mut config = ServerConfig::local_dev(&options.workspace);
+    let mut config = ServerConfig::local_dev(&options.workspace, identity);
     config.static_assets_dir = options.frontend;
     let listener = TcpListener::bind(options.listen).await?;
     eprintln!(

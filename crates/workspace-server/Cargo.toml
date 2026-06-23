@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 manifest = { workspace = true }
 pod-store = { workspace = true }
 project-record.workspace = true
@@ -18,7 +19,9 @@ serde_yaml.workspace = true
 thiserror.workspace = true
 ticket.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "sync"] }
+toml.workspace = true
 tracing.workspace = true
+uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
 tempfile.workspace = true
