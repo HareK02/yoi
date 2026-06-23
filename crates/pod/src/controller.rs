@@ -900,12 +900,36 @@ async fn controller_loop<C, St>(
                 pending = Some(PendingRun::Resume);
             }
 
-            Method::Cancel => {
-                let _ = event_tx.send(Event::Error {
-                    code: ErrorCode::NotRunning,
-                    message: "Pod is not running".into(),
-                });
-            }
+            Method::Cancel => match shared_state.get_status() {
+                PodStatus::Paused => match pod.cancel_paused_turn() {
+                    Ok(()) => {
+                        set_controller_status(
+                            &shared_state,
+                            &runtime_dir,
+                            &event_tx,
+                            PodStatus::Idle,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        let _ = event_tx.send(Event::Error {
+                            code: worker_error_code(&error),
+                            message: error.to_string(),
+                        });
+                    }
+                },
+                PodStatus::Idle => {
+                    let _ = event_tx.send(Event::Error {
+                        code: ErrorCode::NotRunning,
+                        message: "Pod is not running".into(),
+                    });
+                }
+                PodStatus::Running => {
+                    // Running turns receive Cancel through drive_turn; this is
+                    // only reachable across a defensive race window.
+                    let _ = cancel_tx.try_send(());
+                }
+            },
 
             Method::Pause => {
                 // Already paused → idempotent no-op. Otherwise the

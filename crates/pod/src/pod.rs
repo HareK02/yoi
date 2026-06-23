@@ -1863,6 +1863,28 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         Ok(())
     }
 
+    /// Abandon a paused/interrupted turn without resuming it.
+    ///
+    /// This uses the same explicit interrupt preparation as the next fresh
+    /// `run` would have used, then clears the worker's interrupted marker so
+    /// future input is treated as a normal new turn instead of a resume.
+    /// The `RunCompleted` marker is a state-reset record for session replay;
+    /// no provider stream is resumed or mutated here.
+    pub fn cancel_paused_turn(&mut self) -> Result<(), PodError> {
+        if !self.worker().last_run_interrupted() {
+            return Ok(());
+        }
+
+        self.apply_interrupt_prep()?;
+        self.worker_mut().set_last_run_interrupted(false);
+        self.commit_entry(LogEntry::RunCompleted {
+            ts: segment_log::now_millis(),
+            result: WorkerResult::Finished,
+            interrupted: false,
+        })?;
+        Ok(())
+    }
+
     /// Validate explicit workflow invocations without reading dependency
     /// bodies. Called from `Pod::run` entry so an invalid slug aborts
     /// the turn before any session-log commit or interrupt-prep side
