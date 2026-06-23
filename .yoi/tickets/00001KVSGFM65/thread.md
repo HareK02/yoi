@@ -273,3 +273,77 @@ Worktree status:
 - Clean tracked state on `impl/00001KVSGFM65-kanban-lazy-rows` at `6f68bb8d`。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T06:15:01Z -->
+
+## Implementation report
+
+Reviewer r1 approvalを受けて、実装ブランチを Orchestrator worktree の `orchestration` branch に統合した。
+
+統合:
+- Merge commit: `eea26f91 merge: kanban lazy rows`
+- Merged branch: `impl/00001KVSGFM65-kanban-lazy-rows`
+- Implementation commit:
+  - `6f68bb8d web: group repository ticket kanban rows`
+
+Orchestrator worktree validation:
+- `git diff --check HEAD^1..HEAD`: passed
+- `cd web/workspace && rm -rf node_modules .svelte-kit build && deno task check`: passed (`svelte-check found 0 errors and 0 warnings`)
+- `cd web/workspace && deno task build`: passed
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+
+Validation generated ignored frontend artifacts in Orchestrator worktree:
+- `web/workspace/node_modules/`
+- `web/workspace/.svelte-kit/`
+- `web/workspace/build/`
+
+These were removed after validation. Final Orchestrator worktree status after validation cleanup is clean on `orchestration` at `eea26f91`。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-23T06:15:09Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Reviewer approval、Orchestrator worktree への統合、Deno check/build、Ticket doctor、Nix build が完了したため `done` に遷移する。
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-23T06:15:22Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-23T06:15:22Z status: closed -->
+
+## 完了
+
+Workspace web Repository Ticket Kanban の grouping / lazy rows 改善を統合した。
+
+主な成果:
+- Repository Ticket Kanban を `RepositoryTicketKanban.svelte` component に分離。
+- `planning` + `ready` を display-only group とし、`ready` を `planning` より上に表示。
+- `queued` + `inprogress` を display-only group とし、`inprogress` を `queued` より上に表示。
+- `done`, `closed`, `other` は独立 group として維持。
+- 各 row に original Ticket state を表示。
+- 各 group の初期表示行数を 30 に cap。
+- 各 group に独立 scroll area と independent lazy visible count を実装。
+- High-volume `closed` group が page height を無制限に伸ばさないようにした。
+- `WorkspacePage.svelte` から inline Kanban logic/markup を削減。
+- Styling は existing design tokens を使い、backend/API/Ticket lifecycle semantics は変更していない。
+
+統合・検証:
+- Merge commit: `eea26f91 merge: kanban lazy rows`
+- Implementation commit: `6f68bb8d web: group repository ticket kanban rows`
+- Reviewer final verdict: approve
+- Validation passed: `git diff --check HEAD^1..HEAD`, `deno task check`, `deno task build`, `cargo run -p yoi -- ticket doctor`, and `nix build .#yoi --no-link`。
+
+範囲外:
+- Backend pagination、Ticket state mutation UI、drag/drop Kanban、browser/manual scroll E2E tests は追加していない。
+
+---
