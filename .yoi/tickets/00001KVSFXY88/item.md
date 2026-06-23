@@ -1,11 +1,13 @@
 ---
 title: 'TUI Dashboard の冗長な key hints と selected-row 状態表示を削る'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-23T05:40:56Z'
-updated_at: '2026-06-23T05:40:56Z'
+updated_at: '2026-06-23T06:08:42Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['tui-ux', 'terminal-layout']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-23T06:08:42Z'
 ---
 
 ## User claims / request snapshot
