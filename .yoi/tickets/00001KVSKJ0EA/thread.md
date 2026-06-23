@@ -192,3 +192,45 @@ Reviewer focus:
 Orchestrator will wait for reviewer verdict before integration。
 
 ---
+
+<!-- event: review author: yoi-orchestrator at: 2026-06-23T07:23:02Z status: approve -->
+
+## Review: approve
+
+Reviewer Pod `yoi-reviewer-00001KVSKJ0EA-r1` approved the implementation.
+
+Reviewed target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVSKJ0EA-dashboard-no-auto-selection`
+- Branch: `impl/00001KVSKJ0EA-dashboard-no-auto-selection`
+- Implementation: `5c242d96 fix: keep dashboard row selection explicit`
+- Diff: `4cda83b7..5c242d96`
+
+Reviewer evidence:
+- 初期表示 / reload path は row selection を自動生成しない。
+- `selected_row = None` は `Esc` 後も reload/snapshot reconciliation を跨いで維持される。
+- 明示的な keyboard navigation は no-selection から selection を作成できる。
+- 明示的 selection は row が visible な間は維持される。
+- 消えた / stale row selection は `None` へ落ちる。
+- `list.selected_name` は no-selection / non-Pod selection で clear され、実際の Pod row selection のみで設定される。
+- no-selection + `TicketIntake` submit は global/new Intake launch へ進む。
+- mouse click は selection-only のまま。
+- 差分は Dashboard selection logic と focused tests に限定され、layout / render / workflow semantic の不要変更はない。
+
+Blocking issues:
+- なし。
+
+Non-blocking concerns:
+- なし。
+
+Reviewer validation:
+- `cargo fmt --check`: passed
+- `git diff --check 4cda83b7..HEAD`: passed
+- `cargo test -q -p tui workspace_panel`: passed (`27 passed`)
+- `cargo test -q -p tui dashboard`: passed (`111 passed`)
+- `cargo run -q -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `cargo test -q -p tui`: passed (`372 passed`)
+
+Worktree status:
+- clean at `5c242d96`。
+
+---
