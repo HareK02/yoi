@@ -76,3 +76,31 @@ Validation plan:
 Human authorized queue routing from Workspace Dashboard. Ticket has concrete Dashboard render acceptance criteria and no recorded blockers, so Orchestrator accepts implementation.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T06:12:36Z -->
+
+## Implementation report
+
+Implementation start report:
+
+- Created child implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVSFXY88-dashboard-hint-cleanup`
+- Created branch:
+  - `impl/00001KVSFXY88-dashboard-hint-cleanup`
+- Base commit:
+  - `3bfd1ca0 ticket: accept dashboard hint cleanup`
+- Confirmed tracked Ticket project records are visible in the child worktree。
+- Confirmed `.yoi/memory` has no tracked/untracked entries in the child worktree check。
+- Spawned sibling Coder Pod:
+  - `yoi-coder-00001KVSFXY88`
+- Coder scope:
+  - read: `/home/hare/Projects/yoi`
+  - write: `/home/hare/Projects/yoi/.worktree/00001KVSFXY88-dashboard-hint-cleanup`
+
+Parallelization note:
+- Active Workspace web / protocol work is separate from TUI Dashboard rendering. This Ticket should stay limited to `crates/tui/src/dashboard/*` unless tests reveal a narrow shared helper impact。
+
+Next action:
+- Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff。
+
+---
