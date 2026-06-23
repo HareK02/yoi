@@ -104,3 +104,46 @@ Next action:
 - Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T06:28:12Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVSFXY88`.
+
+Implementation commit:
+- `03ad525f tui: trim dashboard redundant hints`
+
+Changed areas:
+- `crates/tui/src/dashboard/render.rs`
+  - Removed top title key-hint guidance。
+  - Made selected-row/composer target status line blank。
+  - Minimized actionbar to notices/diagnostic-only text。
+  - Preserved row marker/highlighting rendering。
+- `crates/tui/src/dashboard/mod.rs`
+  - Removed now-unused selected-row display-status helper。
+- `crates/tui/src/dashboard/tests.rs`
+  - Updated render/unit expectations for no redundant hints/status。
+  - Added title guidance cleanup assertion。
+  - Kept assertions that selected rows remain visibly marked。
+
+Coder validation reported:
+- `cargo fmt --check`: passed
+- `cargo test -p tui dashboard --lib`: passed
+- `cargo test -p tui workspace_panel --lib`: passed
+- `git diff --check`: passed
+- `cargo run -p yoi -- ticket doctor`: passed
+
+Manual/PTY `yoi panel` check:
+- Not run; focused render/unit tests were used as primary validation。
+
+Orchestrator evidence checked:
+- Worktree clean on `impl/00001KVSFXY88-dashboard-hint-cleanup`。
+- HEAD is `03ad525f`。
+- Diff `3bfd1ca0..HEAD` touches expected dashboard render/module/tests files only。
+- `git diff --check 3bfd1ca0..HEAD`: passed。
+
+Next action:
+- Route to read-only Reviewer Pod for acceptance review。
+
+---
