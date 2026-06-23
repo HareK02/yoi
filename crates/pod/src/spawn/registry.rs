@@ -35,10 +35,12 @@ type RegistryStateWriter = Arc<dyn Fn(&[SpawnedPodRecord]) -> io::Result<()> + S
 type RegistryReclaimWriter = Arc<dyn Fn(&SpawnedPodRecord) -> io::Result<()> + Send + Sync>;
 
 const RESTORE_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(500);
+const REGISTRY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct SpawnedPodRegistry {
     records: Mutex<Vec<SpawnedPodRecord>>,
     cursors: Mutex<HashMap<String, usize>>,
+    mutations: Mutex<()>,
     runtime_dir: Arc<RuntimeDir>,
     state_writer: Option<RegistryStateWriter>,
     reclaim_writer: Option<RegistryReclaimWriter>,
@@ -56,6 +58,7 @@ impl SpawnedPodRegistry {
         Arc::new(Self {
             records: Mutex::new(Vec::new()),
             cursors: Mutex::new(HashMap::new()),
+            mutations: Mutex::new(()),
             runtime_dir,
             state_writer: None,
             reclaim_writer: None,
@@ -164,6 +167,7 @@ impl SpawnedPodRegistry {
             registry: Arc::new(Self {
                 records: Mutex::new(records),
                 cursors: Mutex::new(HashMap::new()),
+                mutations: Mutex::new(()),
                 runtime_dir,
                 state_writer: Some(state_writer),
                 reclaim_writer: Some(reclaim_writer),
@@ -178,9 +182,13 @@ impl SpawnedPodRegistry {
     /// error if either persisted write fails; the in-memory state is still
     /// updated in that case — the next successful write will reconcile.
     pub async fn add(&self, record: SpawnedPodRecord) -> io::Result<()> {
-        let mut records = self.records.lock().await;
-        records.push(record);
-        self.persist_records(records.as_slice()).await
+        let _mutation = self.mutations.lock().await;
+        let snapshot = {
+            let mut records = self.records.lock().await;
+            records.push(record);
+            records.clone()
+        };
+        self.persist_records(&snapshot).await
     }
 
     /// Look up a record by pod name. Cloned so callers can drop the lock.
@@ -201,29 +209,39 @@ impl SpawnedPodRegistry {
     /// reclaim any delegated Write scope owned by that child. Returns the
     /// removed record (if any).
     pub async fn remove(&self, pod_name: &str) -> io::Result<Option<SpawnedPodRecord>> {
-        let removed = {
+        let _mutation = self.mutations.lock().await;
+        let (removed, snapshot) = {
             let mut records = self.records.lock().await;
             let idx = records.iter().position(|r| r.pod_name == pod_name);
             let removed = idx.map(|i| records.remove(i));
-            self.persist_records(records.as_slice()).await?;
-            removed
+            let snapshot = records.clone();
+            (removed, snapshot)
         };
+        self.persist_records(&snapshot).await?;
         self.cursors.lock().await.remove(pod_name);
         if let Some(record) = &removed {
-            self.reclaim_record(record)?;
-            if let Some(write_reclaim) = &self.reclaim_writer {
-                write_reclaim(record)?;
-            }
+            self.reclaim_removed_record(record.clone()).await?;
         }
         Ok(removed)
     }
 
-    fn reclaim_record(&self, record: &SpawnedPodRecord) -> io::Result<()> {
-        let Some(parent_name) = &self.parent_name else {
-            release_child_allocation(&record.pod_name)?;
-            return Ok(());
-        };
-        reclaim_record(parent_name, self.parent_scope.as_ref(), record)
+    async fn reclaim_removed_record(&self, record: SpawnedPodRecord) -> io::Result<()> {
+        let parent_name = self.parent_name.clone();
+        let parent_scope = self.parent_scope.clone();
+        let reclaim_writer = self.reclaim_writer.clone();
+        let pod_name = record.pod_name.clone();
+        let reclaim = tokio::task::spawn_blocking(move || {
+            reclaim_removed_record_blocking(parent_name, parent_scope, reclaim_writer, record)
+        });
+        tokio::time::timeout(REGISTRY_CLEANUP_TIMEOUT, reclaim)
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("timed out reclaiming spawned pod `{pod_name}`"),
+                )
+            })?
+            .map_err(|err| io::Error::other(format!("spawned-pod reclaim task failed: {err}")))?
     }
 
     /// Read-only cursor lookup. Returns 0 when no cursor has been set.
@@ -286,6 +304,23 @@ where
             .map(|_| ())
             .map_err(store_error_to_io)
     })
+}
+
+fn reclaim_removed_record_blocking(
+    parent_name: Option<String>,
+    parent_scope: Option<SharedScope>,
+    reclaim_writer: Option<RegistryReclaimWriter>,
+    record: SpawnedPodRecord,
+) -> io::Result<()> {
+    if let Some(parent_name) = parent_name {
+        reclaim_record(&parent_name, parent_scope.as_ref(), &record)?;
+    } else {
+        release_child_allocation(&record.pod_name)?;
+    }
+    if let Some(write_reclaim) = reclaim_writer {
+        write_reclaim(&record)?;
+    }
+    Ok(())
 }
 
 fn reclaim_record(

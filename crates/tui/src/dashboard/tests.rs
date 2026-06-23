@@ -16,14 +16,15 @@ fn orchestration_worktree_layout_is_stable_under_original_workspace_root() {
 }
 
 #[test]
-fn orchestrator_launch_context_uses_orchestration_root_for_runtime_workspace() {
+fn orchestrator_launch_context_uses_original_root_for_runtime_workspace_and_worktree_cwd() {
     let original = PathBuf::from("/repo/yoi");
     let orchestration = original
         .join(".worktree")
         .join("orchestration")
         .join("yoi-orchestrator");
     let context = build_orchestrator_launch_context(&original, &orchestration, "yoi-orchestrator");
-    assert_eq!(context.workspace_root, orchestration);
+    assert_eq!(context.workspace_root, original);
+    assert_eq!(context.cwd.as_deref(), Some(orchestration.as_path()));
     assert_eq!(
         context.original_workspace_root.as_deref(),
         Some(original.as_path())

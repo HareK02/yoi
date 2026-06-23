@@ -547,9 +547,6 @@ fn append_operation_targets(out: &mut String, context: &TicketRoleLaunchContext)
     if context.role != TicketRole::Orchestrator {
         return;
     }
-    if context.original_workspace_root.is_none() && context.target_workspace_root.is_none() {
-        return;
-    }
 
     out.push_str("\nOrchestrator operation targets:\n");
     push_bounded_bullet(
@@ -557,13 +554,6 @@ fn append_operation_targets(out: &mut String, context: &TicketRoleLaunchContext)
         "implementation_worktree_root",
         &context.implementation_worktree_root().display().to_string(),
     );
-    if context.target_workspace_root.is_some() {
-        push_bounded_bullet(
-            out,
-            "merge_target_workspace_root",
-            &context.target_workspace_root().display().to_string(),
-        );
-    }
 }
 
 fn default_pod_name(role: TicketRole, ticket: Option<&TicketRef>) -> String {
@@ -706,6 +696,7 @@ mod tests {
                 context_tokens: 0,
             },
             status: PodStatus::Idle,
+            in_flight: protocol::InFlightSnapshot::default(),
         }
     }
 
@@ -1152,7 +1143,7 @@ workflow = "ticket-review-workflow"
 
         assert!(text.contains("Orchestrator operation targets:"));
         assert!(text.contains("implementation_worktree_root"));
-        assert!(text.contains("merge_target_workspace_root"));
+        assert!(!text.contains("merge_target_workspace_root"));
         assert!(!text.contains("Workspace routing context:"));
         assert!(!text.contains("role_workspace_root"));
         assert!(!text.contains("role_cwd"));

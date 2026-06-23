@@ -2890,7 +2890,7 @@ fn build_orchestrator_launch_context(
     pod_name: &str,
 ) -> TicketRoleLaunchContext {
     let mut context = TicketRoleLaunchContext::new(
-        orchestration_workspace_root.to_path_buf(),
+        original_workspace_root.to_path_buf(),
         TicketRole::Orchestrator,
     )
     .with_cwd(orchestration_workspace_root.to_path_buf())

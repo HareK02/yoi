@@ -4,11 +4,16 @@ use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use fs4::fs_std::FileExt;
 use manifest::{ScopeRule, paths};
 use serde::{Deserialize, Serialize};
 use session_store::SegmentId;
+
+const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const LOCK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// On-disk representation of the allocation table.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -119,7 +124,37 @@ impl LockFileGuard {
             .truncate(false)
             .mode(0o600)
             .open(path)?;
-        FileExt::lock_exclusive(&file)?;
+        let started = Instant::now();
+        loop {
+            match FileExt::try_lock_exclusive(&file) {
+                Ok(true) => break,
+                Ok(false) => {
+                    if started.elapsed() >= LOCK_WAIT_TIMEOUT {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "timed out waiting for pod registry lock `{}`",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    thread::sleep(LOCK_WAIT_POLL_INTERVAL);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if started.elapsed() >= LOCK_WAIT_TIMEOUT {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "timed out waiting for pod registry lock `{}`",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    thread::sleep(LOCK_WAIT_POLL_INTERVAL);
+                }
+                Err(error) => return Err(error),
+            }
+        }
         let mut this = Self {
             file,
             data: LockFile::default(),
