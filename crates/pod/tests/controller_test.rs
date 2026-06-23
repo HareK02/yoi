@@ -1946,6 +1946,152 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
     );
 }
 
+#[tokio::test]
+async fn paused_cancel_abandons_resume_and_next_input_is_fresh_run() {
+    let tool_name = "HangyTool";
+    let first = MockResponse::Complete(vec![
+        LlmEvent::tool_use_start(0, "call_cancelled", tool_name),
+        LlmEvent::tool_input_delta(0, "{}"),
+        LlmEvent::tool_use_stop(0),
+        LlmEvent::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ]);
+    let second = MockResponse::Complete(vec![
+        LlmEvent::text_block_start(0),
+        LlmEvent::text_delta(0, "fresh output"),
+        LlmEvent::text_block_stop(0, None),
+        LlmEvent::Status(StatusEvent {
+            status: ResponseStatus::Completed,
+        }),
+    ]);
+    let client = MockClient::sequential(vec![first, second]);
+    let client_for_assert = client.clone();
+    let mut pod = make_pod(client).await;
+    pod.worker_mut()
+        .register_tool(hanging_tool_definition(tool_name));
+    let handle = spawn_controller(pod).await;
+    let mut rx = handle.subscribe();
+
+    handle.send(Method::run_text("first")).await.unwrap();
+    assert!(
+        drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
+            e,
+            Event::ToolCallDone { .. }
+        ))
+        .await,
+        "tool_call_done should arrive before pause"
+    );
+
+    handle.send(Method::Pause).await.unwrap();
+    assert!(
+        drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
+            e,
+            Event::RunEnd {
+                result: protocol::RunResult::Paused
+            }
+        ))
+        .await,
+        "expected RunEnd::Paused"
+    );
+    wait_for_status(&handle, PodStatus::Paused).await;
+
+    handle.send(Method::Cancel).await.unwrap();
+    wait_for_status(&handle, PodStatus::Idle).await;
+    let (entries_after_cancel, _rx_after_cancel) = handle.sink.subscribe_with_snapshot();
+    assert!(
+        entries_after_cancel
+            .iter()
+            .any(|entry| matches!(entry, LogEntry::PausedTurnAbandoned { .. })),
+        "paused cancel should have an explicit lifecycle log entry: {entries_after_cancel:?}"
+    );
+    assert!(
+        !entries_after_cancel.iter().any(|entry| matches!(
+            entry,
+            LogEntry::RunCompleted {
+                result: llm_worker::WorkerResult::Finished,
+                interrupted: false,
+                ..
+            }
+        )),
+        "paused cancel must not be logged as a normal finished run: {entries_after_cancel:?}"
+    );
+    assert_eq!(
+        client_for_assert.captured_requests().len(),
+        1,
+        "paused cancel must not resume or start another LLM request"
+    );
+
+    handle.send(Method::Resume).await.unwrap();
+    assert!(
+        drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
+            e,
+            Event::Error {
+                code: pod::ErrorCode::NotPaused,
+                ..
+            }
+        ))
+        .await,
+        "resume after paused cancel should be rejected as not paused"
+    );
+    assert_eq!(
+        client_for_assert.captured_requests().len(),
+        1,
+        "rejected resume must not call the LLM"
+    );
+
+    handle
+        .send(Method::run_text("fresh request"))
+        .await
+        .unwrap();
+    assert!(
+        drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
+            e,
+            Event::RunEnd {
+                result: protocol::RunResult::Finished
+            }
+        ))
+        .await,
+        "expected RunEnd::Finished for fresh run"
+    );
+
+    let requests = client_for_assert.captured_requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "fresh input should start exactly one new LLM request"
+    );
+    let items = &requests[1].items;
+    assert!(
+        items.iter().any(|item| matches!(
+            item,
+            llm_worker::Item::ToolResult { call_id, summary, .. }
+                if call_id == "call_cancelled" && summary == "[Interrupted by user]"
+        )),
+        "paused cancel should close orphan tool_use before future requests: {items:?}"
+    );
+    assert!(
+        items.iter().any(|item| matches!(
+            item,
+            llm_worker::Item::Message {
+                role: llm_worker::Role::System,
+                ..
+            } if item_text_contains(item, "interrupted by the user")
+        )),
+        "paused cancel should record an explicit interruption note: {items:?}"
+    );
+    assert!(
+        items.iter().any(|item| matches!(
+            item,
+            llm_worker::Item::Message {
+                role: llm_worker::Role::User,
+                ..
+            } if item_text_contains(item, "fresh request")
+        )),
+        "fresh user input should be part of the next normal run: {items:?}"
+    );
+}
+
 fn item_text_contains(item: &Item, needle: &str) -> bool {
     item.as_text().unwrap_or_default().contains(needle)
 }

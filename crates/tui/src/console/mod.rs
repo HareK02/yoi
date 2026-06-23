@@ -938,11 +938,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
         }
         KeyCode::Char('c') if ctrl => Some(handle_pause_or_quit(app)),
         KeyCode::Char('x') if ctrl => Some(match app.pod_status {
-            PodStatus::Running => {
+            PodStatus::Running | PodStatus::Paused => {
                 app.clear_queued_inputs();
                 Some(Method::Cancel)
             }
-            PodStatus::Paused | PodStatus::Idle => Some(Method::Shutdown),
+            PodStatus::Idle => Some(Method::Shutdown),
         }),
         KeyCode::Char('d') if ctrl => {
             app.quit = true;
@@ -1516,6 +1516,30 @@ mod tests {
         );
         assert!(matches!(cancel, Some(Method::Cancel)));
         assert_eq!(app.queued_input_count(), 0);
+    }
+
+    #[test]
+    fn ctrl_x_cancels_paused_turn_without_shutdown() {
+        let mut app = App::new("agent".to_string());
+        app.set_pod_status(PodStatus::Paused);
+
+        let cancel = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(cancel, Some(Method::Cancel)));
+    }
+
+    #[test]
+    fn ctrl_x_shutdown_while_idle_is_unchanged() {
+        let mut app = App::new("agent".to_string());
+        app.set_pod_status(PodStatus::Idle);
+
+        let shutdown = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(shutdown, Some(Method::Shutdown)));
     }
 
     #[test]
