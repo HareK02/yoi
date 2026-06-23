@@ -2,7 +2,7 @@
 title: 'Abstract Workspace Worker runtime spawn operations'
 state: 'inprogress'
 created_at: '2026-06-23T16:34:39Z'
-updated_at: '2026-06-23T19:27:22Z'
+updated_at: '2026-06-23T19:31:58Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-23T19:25:09Z'

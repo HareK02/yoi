@@ -122,3 +122,29 @@ Orchestrator acceptance: queued -> inprogress
 - これ以降に worktree-workflow で `/home/hare/Projects/yoi/.worktree/00001KVTNAY20-worker-runtime-spawn` を作成し、multi-agent-workflow に接続する。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T19:30:10Z -->
+
+## Implementation report
+
+Implementation orchestration update:
+
+- worktree-workflow に従い、implementation worktree `/home/hare/Projects/yoi/.worktree/00001KVTNAY20-worker-runtime-spawn` と branch `work/00001KVTNAY20-worker-runtime-spawn` を作成した。
+- child worktree では sparse-checkout を設定し、tracked `.yoi` project records は見える一方で `.yoi/memory`、local/runtime/log/lock/secret-like `.yoi` paths を除外する方針にした。
+- Coder Pod `yoi-coder-00001KVTNAY20-worker-runtime` を sibling として起動した。write scope は child worktree に限定し、runtime workspace root `/home/hare/Projects/yoi` は startup 要件を満たすため non-recursive read のみにした。Coder には root/original workspace と orchestration worktree で read/write/validation/git operation を行わないよう明示した。
+- 初回 spawn は workspace root read scope が不足して失敗したため、implementation side effect は残さず scope を修正して再試行した。現在 reachable child Pod として起動済み。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T19:31:58Z -->
+
+## Implementation report
+
+Implementation orchestration recovery:
+
+- `yoi-coder-00001KVTNAY20-worker-runtime` は provider API error `Unsupported content type` で初回実行・再送とも assistant output を生成できなかった。
+- child worktree `/home/hare/Projects/yoi/.worktree/00001KVTNAY20-worker-runtime-spawn` は実装差分なしで、last commit は routing acceptance commit `5a8bcebd ticket: accept worker runtime spawn task` のままだった。
+- 失敗 Pod は停止して scope を回収した。
+- 実装 side effect の回復として、同じ child worktree/branch を使い、別 profile で Coder role を再起動する。
+
+---
