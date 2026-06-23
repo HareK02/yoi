@@ -126,3 +126,67 @@ Next action:
 - Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T07:13:47Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVSKGDYS`.
+
+Implementation commit:
+- `31565c9b feat: persist workspace identity`
+
+Changed areas:
+- Added tracked project identity record:
+  - `.yoi/workspace.toml`
+  - current contents are safe project identity fields only: `workspace_id`, `created_at`, `display_name`。
+- Added Workspace identity schema/loader:
+  - `crates/workspace-server/src/identity.rs`
+  - strict TOML parser with `workspace_id`, `created_at`, `display_name`。
+  - UUIDv7 validation。
+  - UTC RFC3339 `created_at` validation。
+  - unknown fields rejected。
+  - create-if-missing behavior。
+  - invalid existing file fails closed without rewrite。
+  - tests for missing creation, stable existing identity, invalid file, no path leakage。
+- Integrated persisted identity into workspace server/bootstrap:
+  - `crates/workspace-server/src/main.rs`
+  - `crates/workspace-server/src/server.rs`
+  - workspace API uses persisted `workspace_id` / display metadata。
+- Updated repository ID behavior:
+  - `crates/workspace-server/src/repositories.rs`
+  - local repository ids derive from persisted Workspace id。
+  - legacy `/api/repositories/local` remains accepted as an alias。
+- Host ID derivation now receives persisted Workspace id through existing API flow。
+- Added dependencies / packaging update:
+  - `crates/workspace-server/Cargo.toml`
+  - `Cargo.lock`
+  - `package.nix` cargo hash。
+
+Coder validation reported:
+- `cargo fmt --check`: passed
+- `cargo test -p yoi-workspace-server`: passed
+- `cargo check -p yoi-workspace-server`: passed
+- `cd web/workspace && deno task check && deno task build`: passed
+- `git diff --check`: passed
+- `git diff --cached --check`: passed
+- `cargo run -p yoi -- ticket doctor`: passed
+- `nix build .#yoi --no-link`: passed
+
+Generated artifact cleanup:
+- Coder removed generated frontend artifacts:
+  - `web/workspace/.svelte-kit`
+  - `web/workspace/build`
+  - `web/workspace/node_modules`
+- Coder removed generated Rust build cache:
+  - `target`
+
+Orchestrator evidence checked:
+- Worktree clean on `impl/00001KVSKGDYS-workspace-identity` at `31565c9b`。
+- Diff `4cda83b7..HEAD` touches expected Workspace identity/backend/package files and adds `.yoi/workspace.toml`。
+- `git diff --check 4cda83b7..HEAD`: passed。
+
+Next action:
+- Route to read-only Reviewer Pod for acceptance review。
+
+---
