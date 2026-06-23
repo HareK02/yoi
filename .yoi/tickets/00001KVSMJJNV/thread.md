@@ -171,3 +171,27 @@ Next:
 - Reviewer Pod に recorded IntentPacket と commit diff を基準に review を依頼する。
 
 ---
+
+<!-- event: review author: reviewer-00001KVSMJJNV-ctrlx-cancel at: 2026-06-23T13:42:48Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+Findings:
+- `crates/pod/src/pod.rs:1871-1884` は paused cancel cleanup を `LogEntry::RunCompleted { result: WorkerResult::Finished, interrupted: false }` として記録している。しかしここでは `run()` / `resume()` が完了したわけではなく、paused turn を明示的に abandon している。`crates/session-store/src/segment_log.rs:31` および `:100-106` の session log semantics では、`RunCompleted` は `run()` / `resume()` call の終了を表し、`Finished` は通常の Worker completion を意味する。現在の immediate replay は `interrupted` を使うため focused behavior は通るが、durable session/audit stream が cancel 後に normal `Finished` run を記録してしまう。
+- Ticket の invariant は cancel を explicit typed lifecycle semantics で表現することなので、typed paused-cancel / abandoned-turn lifecycle record を追加するか、log schema / consumers / tests を更新して durable history が normal `Finished` run を主張しないようにする必要がある。
+
+Validation performed:
+- `cargo test -p tui ctrl_x -- --nocapture` passed
+- `cargo test -p pod paused_cancel_abandons_resume_and_next_input_is_fresh_run -- --nocapture` passed
+- `git diff --check 5954021c..90b1a1fc` passed
+- `cargo fmt --check` passed
+- `git status --short` clean
+
+Rationale:
+- TUI key handling separation は正しい。`Paused` の `Ctrl+X` は `Method::Cancel`、`Idle` は `Shutdown` のまま、`Ctrl+C` quit/pause behavior も変更されていない。
+- controller test は Pod を実際に `Paused` にし、cancel 後の `Resume` rejection と次入力の fresh `Run` を確認している。
+- blocker は persisted lifecycle representation。functional state reset は実装されているが、session log が abandoned paused turn を normal finished run として記録している点が durable semantics と不一致。
+
+---
