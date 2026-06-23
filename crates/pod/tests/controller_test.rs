@@ -1998,6 +1998,24 @@ async fn paused_cancel_abandons_resume_and_next_input_is_fresh_run() {
 
     handle.send(Method::Cancel).await.unwrap();
     wait_for_status(&handle, PodStatus::Idle).await;
+    let (entries_after_cancel, _rx_after_cancel) = handle.sink.subscribe_with_snapshot();
+    assert!(
+        entries_after_cancel
+            .iter()
+            .any(|entry| matches!(entry, LogEntry::PausedTurnAbandoned { .. })),
+        "paused cancel should have an explicit lifecycle log entry: {entries_after_cancel:?}"
+    );
+    assert!(
+        !entries_after_cancel.iter().any(|entry| matches!(
+            entry,
+            LogEntry::RunCompleted {
+                result: llm_worker::WorkerResult::Finished,
+                interrupted: false,
+                ..
+            }
+        )),
+        "paused cancel must not be logged as a normal finished run: {entries_after_cancel:?}"
+    );
     assert_eq!(
         client_for_assert.captured_requests().len(),
         1,

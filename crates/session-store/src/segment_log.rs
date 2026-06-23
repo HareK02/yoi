@@ -29,6 +29,7 @@ use crate::system_item::SystemItem;
 ///   run completion); the fork-point seq for `at_turn_index` is the
 ///   preceding `Invoke` entry, not the TurnEnd.
 /// - `RunCompleted` / `RunErrored` — marks end of a `run()` or `resume()` call
+/// - `PausedTurnAbandoned` — explicit abandon/cancel of a paused interrupted turn
 /// - `ConfigChanged` — `RequestConfig` mutation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -113,6 +114,11 @@ pub enum LogEntry {
         interrupted: bool,
         message: String,
     },
+
+    /// A paused interrupted turn was explicitly abandoned without calling
+    /// `run()` or `resume()` again. Replay clears the interrupted marker so
+    /// the restored Pod is idle and future user input starts a normal new turn.
+    PausedTurnAbandoned { ts: u64 },
 
     /// `RequestConfig` changed.
     ConfigChanged { ts: u64, config: RequestConfig },
@@ -256,6 +262,9 @@ pub fn collect_state(entries: &[LogEntry]) -> RestoredState {
             }
             LogEntry::RunErrored { interrupted, .. } => {
                 state.last_run_interrupted = *interrupted;
+            }
+            LogEntry::PausedTurnAbandoned { .. } => {
+                state.last_run_interrupted = false;
             }
             LogEntry::ConfigChanged { config, .. } => {
                 state.config = config.clone();
@@ -567,6 +576,41 @@ mod tests {
         ]);
         assert_eq!(state.history.len(), 1);
         assert_eq!(state.turn_count, 1);
+    }
+
+    #[test]
+    fn replay_paused_turn_abandoned_clears_interrupted_marker() {
+        let state = collect_state(&[
+            LogEntry::SegmentStart {
+                ts: 0,
+                session_id: uuid::Uuid::nil(),
+                system_prompt: None,
+                config: RequestConfig::default(),
+                history: vec![],
+                forked_from: None,
+                compacted_from: None,
+            },
+            LogEntry::RunCompleted {
+                ts: 100,
+                interrupted: true,
+                result: WorkerResult::Paused,
+            },
+            LogEntry::PausedTurnAbandoned { ts: 200 },
+        ]);
+        assert!(!state.last_run_interrupted);
+    }
+
+    #[test]
+    fn paused_turn_abandoned_entry_round_trip_via_json() {
+        let entry = LogEntry::PausedTurnAbandoned { ts: 12345 };
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["kind"], "paused_turn_abandoned");
+        let decoded: LogEntry = serde_json::from_str(&json).unwrap();
+        match decoded {
+            LogEntry::PausedTurnAbandoned { ts } => assert_eq!(ts, 12345),
+            other => panic!("expected PausedTurnAbandoned, got {other:?}"),
+        }
     }
 
     #[test]

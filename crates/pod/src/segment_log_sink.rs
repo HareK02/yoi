@@ -94,8 +94,8 @@ impl SegmentLogSink {
     ///   - `LogEntry::SystemItem`   → `Event::SystemItem`.
     ///   - `LogEntry::Invoke`       → `Event::InvokeStart`.
     /// Everything else (AssistantItem, ToolResult, TurnEnd,
-    /// RunCompleted, RunErrored, LlmUsage, Extension, ConfigChanged) is
-    /// reflected in the mirror so reconnect snapshots stay accurate,
+    /// RunCompleted, RunErrored, PausedTurnAbandoned, LlmUsage, Extension,
+    /// ConfigChanged) is reflected in the mirror so reconnect snapshots stay accurate,
     /// but is not sent live — the streaming events (TextDelta /
     /// ToolCallStart / ToolResult / TurnEnd / etc.) already provide
     /// that data, and re-broadcasting it as a typed entry would just
