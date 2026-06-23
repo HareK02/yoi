@@ -190,3 +190,33 @@ Next action:
 - Route to read-only Reviewer Pod for acceptance review。
 
 ---
+
+<!-- event: comment author: yoi-orchestrator at: 2026-06-23T07:14:37Z -->
+
+## Comment
+
+Review routing:
+
+Spawned read-only Reviewer Pod:
+- `yoi-reviewer-00001KVSKGDYS-r1`
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVSKGDYS-workspace-identity`
+- Branch: `impl/00001KVSKGDYS-workspace-identity`
+- Baseline: `4cda83b7`
+- Implementation commit: `31565c9b feat: persist workspace identity`
+- Diff: `4cda83b7..31565c9b`
+
+Reviewer scope:
+- read-only `/home/hare/Projects/yoi`
+
+Reviewer focus:
+- Safety and tracked-project-record suitability of `.yoi/workspace.toml`。
+- Stable persisted id usage in Workspace API / repository / host ids。
+- Missing/existing/invalid file behavior。
+- No local path/secret leakage。
+- Package/Nix updates。
+
+Orchestrator will wait for reviewer verdict before integration。
+
+---
