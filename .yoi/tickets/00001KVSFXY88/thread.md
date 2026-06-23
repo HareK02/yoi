@@ -176,3 +176,45 @@ Reviewer focus:
 Orchestrator will wait for reviewer verdict before integration。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVSFXY88-r1 at: 2026-06-23T06:31:21Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket authority:
+  - `.yoi/tickets/00001KVSFXY88/item.md`
+  - `.yoi/tickets/00001KVSFXY88/thread.md`
+- Diff `3bfd1ca0..03ad525f`:
+  - `crates/tui/src/dashboard/render.rs`
+  - `crates/tui/src/dashboard/mod.rs`
+  - `crates/tui/src/dashboard/tests.rs`
+
+Evidence:
+- Top title guidance was removed; `title_line` now keeps only `workspace dashboard` plus companion/orchestrator status。
+- `target_status_line` now renders blank, removing selected Ticket / Pod / Intake / no-row textual status。
+- Actionbar is reduced to sending/refreshing/notices/diagnostic text; always-on key hint groups are gone。
+- Row marker/highlighting paths remain; tests assert selected row marker strings such as `▶ ready`, `▶ queued`, and `  ▶ live`。
+- Keyboard/action behavior was not altered in the diff; removed helpers were display-only and no remaining references exist。
+- No Console/single-Pod TUI files changed。
+- No direct selected-Pod send was reintroduced; existing dashboard behavior tests still pass。
+
+Blocking issues:
+- None。
+
+Non-blocking concerns:
+- Manual `yoi panel` PTY visual check was not run; focused render/unit coverage was used as primary validation, as suggested。
+
+Reviewer validation:
+- `cargo fmt --check`: passed
+- `git diff --check 3bfd1ca0..HEAD`: passed
+- `cargo test -p tui dashboard --lib`: passed (`107 passed`)
+- `cargo test -p tui workspace_panel --lib`: passed (`23 passed`)
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+
+Worktree status:
+- Clean on `impl/00001KVSFXY88-dashboard-hint-cleanup` at `03ad525f`。
+
+---

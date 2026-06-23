@@ -2,7 +2,7 @@
 title: 'TUI Dashboard の冗長な key hints と selected-row 状態表示を削る'
 state: 'inprogress'
 created_at: '2026-06-23T05:40:56Z'
-updated_at: '2026-06-23T06:28:54Z'
+updated_at: '2026-06-23T06:31:21Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['tui-ux', 'terminal-layout']
