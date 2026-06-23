@@ -160,3 +160,35 @@ Next action:
 - Route to read-only Reviewer Pod for acceptance review。
 
 ---
+
+<!-- event: comment author: yoi-orchestrator at: 2026-06-23T07:16:33Z -->
+
+## Comment
+
+Review routing:
+
+Spawned read-only Reviewer Pod:
+- `yoi-reviewer-00001KVSKJ0EA-r1`
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVSKJ0EA-dashboard-no-auto-selection`
+- Branch: `impl/00001KVSKJ0EA-dashboard-no-auto-selection`
+- Baseline: `4cda83b7`
+- Implementation commit: `5c242d96 fix: keep dashboard row selection explicit`
+- Diff: `4cda83b7..5c242d96`
+
+Reviewer scope:
+- read-only `/home/hare/Projects/yoi`
+
+Reviewer focus:
+- Initial/reload no-auto-selection semantics。
+- Esc clear persistence and composer draft preservation。
+- Explicit keyboard/mouse selection still works。
+- Stale selection falls back to none。
+- No-selection TicketIntake composer routing。
+- `list.selected_name` sync and no stale Pod selection。
+- No row-action / workflow semantic regressions。
+
+Orchestrator will wait for reviewer verdict before integration。
+
+---
