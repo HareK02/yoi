@@ -206,3 +206,70 @@ Reviewer focus:
 Orchestrator will wait for reviewer verdict before integration。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVSGFM65-r1 at: 2026-06-23T06:13:34Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket authority:
+  - `.yoi/tickets/00001KVSGFM65/item.md`
+  - `.yoi/tickets/00001KVSGFM65/thread.md`
+- Diff `a6f9019e..6f68bb8d`:
+  - `web/workspace/src/lib/workspace-pages/RepositoryTicketKanban.svelte`
+  - `web/workspace/src/lib/workspace-pages/WorkspacePage.svelte`
+  - `web/workspace/src/app.css`
+
+Review evidence:
+- Grouping/sort:
+  - `planning` + `ready` are grouped as `ready-planning`, labelled `Ready / Planning`。
+  - `queued` + `inprogress` are grouped as `inprogress-queued`, labelled `In progress / Queued`。
+  - `statePriority()` places `ready` before `planning`, and `inprogress` before `queued`。
+- Other states:
+  - `done`, `closed`, and `other` remain separate group keys via `state:${state}` / `state:other`。
+- Per-group lazy state:
+  - `visibleRowsByGroup` is keyed by group key。
+  - Initial visible rows are `INITIAL_VISIBLE_ROWS = 30`。
+  - Scroll handling updates only `[group.key]`。
+  - Near-bottom threshold is `NEAR_BOTTOM_PX = 96`。
+- High-volume containment:
+  - Each non-empty group row list has its own `.ticket-list-scroll`。
+  - `.ticket-list-scroll` uses `max-height: 34rem; overflow-y: auto;`, so `closed` cannot expand page vertically without bound。
+- Original row state:
+  - Each ticket row renders `<span class="ticket-state">{ticket.state}</span>`。
+- Component boundary:
+  - Kanban logic and row rendering moved into `RepositoryTicketKanban.svelte`。
+  - `WorkspacePage.svelte` now delegates with `<RepositoryTicketKanban tickets={repositoryTickets} />`。
+- Design / boundary:
+  - Styling uses existing CSS tokens such as `var(--space-*)`, `var(--line)`, `var(--text-muted)`, `var(--text-faint)`, `var(--text-strong)`。
+  - No backend/API/protocol TypeScript generation scope touched。
+  - No mutation UI added。
+
+Blocking issues:
+- None found。
+
+Non-blocking concerns:
+- No browser/manual scroll interaction test was run; validation is by code inspection plus Svelte check/build. Given the ticket’s frontend-only scope and current test tooling, this is acceptable。
+
+Reviewer validation:
+- `git diff --check a6f9019e..6f68bb8d`: passed
+- `git diff --check a6f9019e..HEAD`: passed
+- `cd web/workspace && rm -rf node_modules .svelte-kit build && deno task check && deno task build`: passed (`svelte-check found 0 errors and 0 warnings`; static build completed)
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+- `cargo test -p yoi-workspace-server`: not run; no backend/API changes were made。
+
+Generated artifacts:
+- Ignored validation artifacts present after review:
+  - `target/`
+  - `web/workspace/.svelte-kit/`
+  - `web/workspace/build/`
+  - `web/workspace/node_modules/`
+- No generated artifacts are tracked。
+
+Worktree status:
+- Clean tracked state on `impl/00001KVSGFM65-kanban-lazy-rows` at `6f68bb8d`。
+
+---
