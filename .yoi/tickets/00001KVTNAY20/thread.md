@@ -148,3 +148,22 @@ Implementation orchestration recovery:
 - 実装 side effect の回復として、同じ child worktree/branch を使い、別 profile で Coder role を再起動する。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T19:33:48Z -->
+
+## Implementation report
+
+Implementation orchestration blocked:
+
+- Coder sibling execution is blocked by runtime/provider failures, not by Ticket requirements or repository state.
+- `builtin:coder` Pod `yoi-coder-00001KVTNAY20-worker-runtime` started, but both initial run and retry failed before assistant output with provider API error: `Unsupported content type`.
+- That Pod was stopped and scope reclaimed. child worktree status remained clean with no implementation diff.
+- Recovery attempts using `inherit` (`yoi-coder-00001KVTNAY20-worker-runtime-2`), `builtin:default` (`...-3`), and `builtin:companion` (`...-4`) did not produce sockets within 10s.
+- Worktree `/home/hare/Projects/yoi/.worktree/00001KVTNAY20-worker-runtime-spawn` and branch `work/00001KVTNAY20-worker-runtime-spawn` are prepared and clean at orchestration commit `b8388655`.
+- `orch-plan-20260623-193340-2` に waiting-capacity note を残した。
+
+Next action:
+- Coder Pod/profile/provider startup issue の解消後に同じ worktree/branch で multi-agent workflow を再開する。
+- あるいは人間が明示的に Orchestrator direct implementation を許可する場合のみ、Orchestrator がこの child worktree で実装へ進む。
+
+---
