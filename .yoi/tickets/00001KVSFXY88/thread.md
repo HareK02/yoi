@@ -218,3 +218,70 @@ Worktree status:
 - Clean on `impl/00001KVSFXY88-dashboard-hint-cleanup` at `03ad525f`。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T06:32:25Z -->
+
+## Implementation report
+
+Reviewer r1 approvalを受けて、実装ブランチを Orchestrator worktree の `orchestration` branch に統合した。
+
+統合:
+- Merge commit: `5abf16f9 merge: dashboard hint cleanup`
+- Merged branch: `impl/00001KVSFXY88-dashboard-hint-cleanup`
+- Implementation commit:
+  - `03ad525f tui: trim dashboard redundant hints`
+
+Orchestrator worktree validation:
+- `cargo fmt --check`: passed
+- `git diff --check HEAD^1..HEAD`: passed
+- `cargo test -p tui dashboard --lib`: passed (`107 passed`)
+- `cargo test -p tui workspace_panel --lib`: passed (`23 passed`)
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+
+Final Orchestrator worktree status after validation is clean on `orchestration` at `5abf16f9`。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-23T06:32:37Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Reviewer approval、Orchestrator worktree への統合、focused Dashboard / workspace_panel tests、Ticket doctor が完了したため `done` に遷移する。
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-23T06:32:49Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-23T06:32:49Z status: closed -->
+
+## 完了
+
+TUI Dashboard の冗長な key hints と selected-row textual status display を削除し、Orchestrator worktree の `orchestration` branch に統合した。
+
+主な成果:
+- Top title line から `Row selection`, `blank Enter`, `Tab target` などの key hint guidance を削除。
+- Selected Ticket / Pod / Intake / no-row selected textual status line を blank にした。
+- Composer bottom actionbar を always-on key hints ではなく notices / diagnostics only に最小化。
+- Row marker / highlighting rendering は維持。
+- Keyboard/action behavior は変更していない。
+- Unused selected-row display-status helper を削除。
+- Dashboard render/unit tests を新 display contract に更新し、selected row marker の visibility assertion は維持。
+
+統合・検証:
+- Merge commit: `5abf16f9 merge: dashboard hint cleanup`
+- Implementation commit: `03ad525f tui: trim dashboard redundant hints`
+- Reviewer final verdict: approve
+- Validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p tui dashboard --lib`, `cargo test -p tui workspace_panel --lib`, and `cargo run -p yoi -- ticket doctor`。
+
+範囲外:
+- Console / single-Pod TUI hints は変更していない。
+- Manual/PTY `yoi panel` visual check は実施していない。Focused render/unit tests を主 validation とした。
+
+---
