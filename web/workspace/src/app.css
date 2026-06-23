@@ -347,8 +347,7 @@
         border-top: 0;
     }
 
-    .runtime-card,
-    .kanban-column {
+    .runtime-card {
         padding: var(--space-4) 0 0;
         border-top: 1px solid var(--line);
     }
@@ -421,36 +420,6 @@
         font-size: 0.78rem;
         letter-spacing: 0.08em;
         text-transform: uppercase;
-    }
-
-    .kanban {
-        display: grid;
-        gap: var(--space-5);
-        grid-template-columns: repeat(auto-fit, minmax(min(190px, 100%), 1fr));
-        margin-top: var(--space-4);
-    }
-
-    .kanban-column h3 {
-        display: flex;
-        justify-content: space-between;
-        gap: var(--space-3);
-        color: var(--text-muted);
-        font-size: 0.9rem;
-        letter-spacing: 0.07em;
-        text-transform: uppercase;
-    }
-
-    .kanban-column ul {
-        display: grid;
-        gap: var(--space-3);
-        margin: 0;
-        padding: 0;
-        list-style: none;
-    }
-
-    .kanban-column li {
-        padding-left: var(--space-3);
-        border-left: 2px solid var(--line);
     }
 
     .diagnostics {

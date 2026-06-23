@@ -1,4 +1,5 @@
 <script lang="ts">
+  import RepositoryTicketKanban from '$lib/workspace-pages/RepositoryTicketKanban.svelte';
   import WorkspaceSidebar from '$lib/workspace-sidebar/WorkspaceSidebar.svelte';
   import type {
     Diagnostic,
@@ -355,25 +356,7 @@
           Read-only grouping of canonical Ticket records. No drag/drop or lifecycle mutation is exposed.
         </p>
         {#if repositoryTickets}
-          <div class="kanban">
-            {#each repositoryTickets.columns as column (column.state)}
-              <article class="kanban-column">
-                <h3>{column.state} <span>{column.items.length}</span></h3>
-                {#if column.items.length === 0}
-                  <p class="muted">No tickets.</p>
-                {:else}
-                  <ul>
-                    {#each column.items as ticket (ticket.id)}
-                      <li>
-                        <strong>{ticket.title}</strong>
-                        <small><code>{ticket.id}</code> · updated {formatDate(ticket.updated_at)}</small>
-                      </li>
-                    {/each}
-                  </ul>
-                {/if}
-              </article>
-            {/each}
-          </div>
+          <RepositoryTicketKanban tickets={repositoryTickets} />
         {:else if repositoryTicketsError}
           <p class="error">{repositoryTicketsError}</p>
         {:else}
