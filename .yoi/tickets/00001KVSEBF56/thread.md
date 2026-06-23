@@ -214,3 +214,69 @@ Reviewer focus:
 Orchestrator will wait for reviewer verdict before integration。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVSEBF56-r1 at: 2026-06-23T06:16:54Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket authority:
+  - `.yoi/tickets/00001KVSEBF56/item.md`
+  - `.yoi/tickets/00001KVSEBF56/thread.md`
+- Diff `746c51c7..a13fb693`:
+  - `crates/protocol/Cargo.toml`
+  - `crates/protocol/src/lib.rs`
+  - `crates/protocol/src/typescript.rs`
+  - `crates/protocol/examples/generate_typescript.rs`
+  - `web/workspace/src/lib/generated/protocol.ts`
+  - `web/workspace/src/lib/workspace-sidebar/types.ts`
+  - `crates/workspace-server/src/server.rs`
+  - `Cargo.lock`
+  - `package.nix`
+
+Blocking issues:
+- None。
+
+Non-blocking concerns:
+- `cargo test -p protocol --features typescript` emits `ts-rs` warnings for `#[serde(other)]` on `Segment::Unknown`: `ts-rs failed to parse this attribute. It will be ignored.` The generated artifact still includes `{ "kind": "unknown" }`, and this does not break current validation, but TS generator is not fully understanding serde fallback semantics。
+- Some `Option<T>` fields with `skip_serializing_if = "Option::is_none"` are generated as required nullable rather than optional nullable, e.g. `RewindTarget.disabled_reason: string | null` and `warning: string | null`. Acceptable for this initial generated-types ticket, but future UI code should be careful because runtime JSON may omit those fields。
+
+Review findings:
+- `crates/protocol` remains Rust DTO authority。
+- `stream` is now an optional default feature:
+  - `default = ["stream"]`
+  - `stream = ["dep:tokio"]`
+  - `tokio` is optional。
+- DTO-only/no-default protocol build compiles for wasm without `tokio`。
+- `typescript` feature is optional and uses `ts-rs`。
+- Generated TS root includes `Method`, `Event`, `Segment`, plus related DTOs such as `PodEvent`, `ScopeRule`, `Greeting`, `InFlight*`, rewind DTOs, completion DTOs, status/result/error enums。
+- Generated TS file is committed at `web/workspace/src/lib/generated/protocol.ts`。
+- Workspace web re-exports generated root protocol types as `PodProtocolMethod`, `PodProtocolEvent`, and `PodProtocolSegment`。
+- Generated TS tagged enums and casing match observed serde wire shape for critical roots:
+  - `Method`: `{ "method": "...", "params": ... }`
+  - `Event`: `{ "event": "...", "data": ... }`
+  - `Segment` / `PodEvent` / `InFlightBlock`: internal `"kind"` tags with snake_case variants。
+- Drift check `generated_protocol_types_are_current` compares committed generated artifact to deterministic generator output。
+- Backend proxy stance is represented in Workspace API extension-point notes and does not add direct browser-to-Pod socket access or broad Worker operation UI。
+
+Reviewer validation:
+- `cargo fmt --check`: passed
+- `git diff --check 746c51c7..HEAD`: passed
+- `cargo test -p protocol`: passed (`40 passed`)
+- `cargo test -p protocol --features typescript generated_protocol_types_are_current`: passed; emitted non-blocking `ts-rs` warning for `serde(other)`。
+- `cargo test -p protocol --features typescript`: passed (`41 passed`); emitted same non-blocking warning。
+- `cargo check -p protocol --target wasm32-unknown-unknown --no-default-features`: passed
+- `cd web/workspace && deno task check && deno task build`: passed (`svelte-check found 0 errors and 0 warnings`; build succeeded)
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+
+Generated artifact status:
+- `web/workspace/src/lib/generated/protocol.ts` remained unchanged after validation。
+- SHA-256 after validation: `3984a043ded1179545656e5402171c49b2d22b5529aa17f016b675e394b7e553`。
+
+Worktree status:
+- Clean on `impl/00001KVSEBF56-protocol-typescript-types` at `a13fb693`。
+
+---
