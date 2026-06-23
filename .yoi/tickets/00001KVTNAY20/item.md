@@ -1,8 +1,8 @@
 ---
 title: 'Abstract Workspace Worker runtime spawn operations'
-state: 'queued'
+state: 'inprogress'
 created_at: '2026-06-23T16:34:39Z'
-updated_at: '2026-06-23T19:25:09Z'
+updated_at: '2026-06-23T19:27:22Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-23T19:25:09Z'
