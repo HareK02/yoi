@@ -1,11 +1,13 @@
 ---
 title: 'Dashboard reload と初期表示で row を自動選択しない'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-23T06:44:20Z'
-updated_at: '2026-06-23T06:46:36Z'
+updated_at: '2026-06-23T06:47:17Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['tui-ux', 'panel-selection', 'reload-state']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-23T06:47:17Z'
 ---
 
 ## User claims / request snapshot

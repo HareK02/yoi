@@ -21,3 +21,12 @@ LocalTicketBackend によって作成されました。
 ユーザーから `readyにして` の明示指示があり、対象 Ticket の item/thread を確認した。要件・受け入れ条件・risk flags・validation が揃っており、Orchestrator が routing 可能なため `ready` に遷移する。
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-23T06:47:17Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
