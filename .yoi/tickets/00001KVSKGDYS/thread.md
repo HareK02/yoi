@@ -305,3 +305,53 @@ Validation requested after fix:
 Coder was also asked to remove ignored validation artifacts before reporting。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T07:30:46Z -->
+
+## Implementation report
+
+Coder fix report received from `yoi-coder-00001KVSKGDYS` after request_changes。
+
+New commit:
+- `49c9e190 fix: return persisted workspace identity`
+
+Fix summary:
+- Replaced temp-file + `rename` finalization in `crates/workspace-server/src/identity.rs`。
+- New creation path uses `OpenOptions::create_new(true)` directly on `.yoi/workspace.toml`。
+- If creation succeeds, generated identity is written and returned。
+- If creation fails because the file already exists from a concurrent bootstrap race, the existing file is read/parsed and that persisted identity is returned。
+- Removed fixed `workspace.toml.tmp` path and the `path.exists()` + `rename` TOCTOU overwrite risk。
+
+Test coverage:
+- Added deterministic unit test `create_new_race_returns_existing_persisted_identity`。
+- Test verifies an already-persisted identity wins over a generated candidate, returned identity matches the file, and the file is not rewritten。
+- Existing tests for missing creation, stable existing identity, invalid fail-closed behavior, no path leakage, and unknown field rejection remain。
+
+Coder validation reported:
+- `cargo fmt --check`: passed
+- `cargo test -p yoi-workspace-server`: passed
+- `cargo check -p yoi-workspace-server`: passed
+- `cd web/workspace && deno task check && deno task build`: passed
+- `git diff --check`: passed
+- `git diff --cached --check`: passed
+- `cargo run -p yoi -- ticket doctor`: passed
+- `nix build .#yoi --no-link`: passed
+
+Cleanup reported:
+- Removed ignored validation artifacts:
+  - `target/`
+  - `web/workspace/node_modules/`
+  - `web/workspace/.svelte-kit/`
+  - `web/workspace/build/`
+
+Orchestrator evidence checked:
+- Worktree clean on `impl/00001KVSKGDYS-workspace-identity` at `49c9e190`。
+- Diff `4cda83b7..HEAD` still touches expected Workspace identity/backend/package files。
+- Latest fix commit changes only `crates/workspace-server/src/identity.rs`。
+- `git diff --check 4cda83b7..HEAD`: passed。
+- Spot-check of `identity.rs` confirmed `write_new_or_read_existing` returns parsed persisted identity on `AlreadyExists` and no longer uses fixed temp file / rename finalization。
+
+Next action:
+- Route back to Reviewer Pod for re-review of request_changes fix。
+
+---
