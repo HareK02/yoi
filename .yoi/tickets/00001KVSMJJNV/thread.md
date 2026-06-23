@@ -225,3 +225,29 @@ Next:
 - Reviewer に再 review を依頼する。
 
 ---
+
+<!-- event: review author: reviewer-00001KVSMJJNV-ctrlx-cancel at: 2026-06-23T13:53:16Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Findings:
+- なし。
+
+Validation performed by Reviewer:
+- `cargo test -p session-store paused_turn_abandoned -- --nocapture` — passed
+- `cargo test -p pod paused_cancel_abandons_resume_and_next_input_is_fresh_run -- --nocapture` — passed
+- `cargo test -p tui ctrl_x -- --nocapture` — passed
+- `git diff --check 5954021c..HEAD` — passed
+- `cargo fmt --check` — passed
+- `git status --short` — clean
+
+Rationale:
+- prior blocker は解消済み。`Pod::cancel_paused_turn()` は fake `RunCompleted { Finished, interrupted: false }` ではなく `LogEntry::PausedTurnAbandoned` を記録する。
+- typed lifecycle entry は session log schema / replay に含まれ、`last_run_interrupted` を clear するため restore 後も resume 不可になる。
+- tests は JSON kind `paused_turn_abandoned`、replay semantics、explicit lifecycle log、fake normal-finished run が残らないことを確認している。
+- TUI acceptance criteria も満たしている。Paused `Ctrl+X` は `Method::Cancel`、Idle `Ctrl+X` は shutdown のまま、Running cancel は queued input clear を含む既存 behavior を維持している。
+- controller test は Paused 到達、cancel 後 Idle、resume rejection、cancel/resume で追加 LLM request が発生しないこと、次入力が fresh run になることを確認している。
+
+---
