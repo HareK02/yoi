@@ -1,8 +1,8 @@
 ---
 title: 'Abstract Workspace Worker runtime spawn operations'
-state: 'planning'
+state: 'ready'
 created_at: '2026-06-23T16:34:39Z'
-updated_at: '2026-06-23T16:50:00Z'
+updated_at: '2026-06-23T18:26:48Z'
 assignee: null
 ---
 
