@@ -1,11 +1,13 @@
 ---
 title: 'TUI Console: Paused 中の Ctrl+X で中断ターンをキャンセルできるようにする'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-23T07:02:07Z'
-updated_at: '2026-06-23T07:02:07Z'
+updated_at: '2026-06-23T08:41:00Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['tui-keybinding', 'pod-lifecycle']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-23T08:41:00Z'
 ---
 
 ## User claims / request snapshot
