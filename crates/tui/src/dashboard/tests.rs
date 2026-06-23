@@ -1072,7 +1072,9 @@ fn mouse_click_selects_panel_row_for_blank_enter_action() {
     );
     assert_eq!(app.selected_panel_row().unwrap().title, "Queued");
     assert_eq!(app.selected_ticket_action(), Some(NextUserAction::Wait));
-    assert!(plain_line(&target_status_line(&app)).contains("blank Enter Wait"));
+    let selected_title =
+        plain_line(&panel_row_lines(app.selected_panel_row().unwrap(), true, 80)[0]);
+    assert!(selected_title.starts_with("▶ queued"));
     assert!(matches!(
         app.handle_key(key(KeyCode::Enter)),
         DashboardAction::DispatchTicketAction(request) if request.ticket_id == "TICKET-2"
@@ -1152,7 +1154,7 @@ fn mouse_click_does_not_override_existing_composer_keyboard_behavior() {
 }
 
 #[test]
-fn selected_ticket_row_with_non_empty_composer_shows_composer_enter_behavior() {
+fn selected_ticket_row_with_non_empty_composer_hides_redundant_status_hints() {
     let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
     panel.header.companion = Some(CompanionPanelState::new(
         "yoi",
@@ -1185,14 +1187,12 @@ fn selected_ticket_row_with_non_empty_composer_shows_composer_enter_behavior() {
     let actionbar_right = actionbar_right_text(&app);
     let target_status = plain_line(&target_status_line(&app));
 
-    assert!(actionbar_left.contains("Companion target: Enter sends composer text"));
-    assert!(actionbar_right.contains("Enter composer target"));
-    assert!(!actionbar_left.contains("Queue"));
-    assert!(!actionbar_right.contains("selected row"));
-    assert!(target_status.contains("composer target Companion"));
-    assert!(target_status.contains("draft Enter send composer text to workspace Companion"));
-    assert!(target_status.contains("row selection waits until composer is blank"));
-    assert!(!target_status.contains("blank Enter Queue"));
+    assert_eq!(actionbar_left, "");
+    assert_eq!(actionbar_right, "");
+    assert_eq!(target_status, "");
+    let selected_title =
+        plain_line(&panel_row_lines(app.selected_panel_row().unwrap(), true, 80)[0]);
+    assert!(selected_title.starts_with("▶ ready"));
 }
 
 #[test]
@@ -1529,7 +1529,6 @@ fn dashboard_idle_live_selected_target_is_open_eligible() {
     let app = test_app(vec![live_info("idle", PodStatus::Idle)]);
 
     assert_eq!(app.selected_open_eligibility(), OpenEligibility::OpenNow);
-    assert!(app.selected_open_disabled_reason().is_none());
 }
 
 #[test]
@@ -1555,6 +1554,35 @@ fn dashboard_status_labels_preserve_explicit_live_statuses() {
 
         assert_eq!(label, expected_label);
     }
+}
+
+#[test]
+fn dashboard_title_omits_redundant_key_hint_guidance() {
+    let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
+    panel.header.ticket_configured = true;
+    panel.header.companion = Some(CompanionPanelState::new(
+        "yoi",
+        CompanionPanelStatus::Live,
+        Some("idle".to_string()),
+    ));
+    let app = app_with_panel(
+        PodList::from_sources(
+            PodVisibilitySource::ResumePicker,
+            vec![],
+            vec![live_info("yoi", PodStatus::Idle)],
+            None,
+            10,
+        ),
+        panel,
+    );
+
+    let title = plain_line(&title_line(&app));
+
+    assert!(title.contains("workspace dashboard"));
+    assert!(title.contains("companion live"));
+    assert!(!title.contains("Row selection"));
+    assert!(!title.contains("blank Enter"));
+    assert!(!title.contains("Tab target"));
 }
 
 #[test]
@@ -1725,7 +1753,7 @@ fn panel_ticket_intake_child_rows_render_as_indented_single_line() {
 }
 
 #[test]
-fn selected_ticket_intake_child_status_is_not_rendered_as_generic_ticket_or_pod() {
+fn selected_ticket_intake_child_keeps_row_marker_without_status_line() {
     let ticket_id = "00001TICKET";
     let pod_name = "intake-live";
     let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
@@ -1750,11 +1778,11 @@ fn selected_ticket_intake_child_status_is_not_rendered_as_generic_ticket_or_pod(
 
     let status = plain_line(&target_status_line(&app));
 
-    assert!(status.contains("selected Intake Pod live"));
-    assert!(status.contains("Ticket 00001TICKET"));
-    assert!(status.contains("blank Enter open/attach"));
-    assert!(!status.contains("selected Ticket"));
-    assert!(!status.contains("selected Pod live"));
+    assert_eq!(status, "");
+
+    let title_line = plain_line(&panel_row_lines(app.selected_panel_row().unwrap(), true, 80)[0]);
+    assert!(title_line.starts_with("  ▶ live"));
+    assert!(title_line.contains("Intake"));
 }
 
 #[test]
@@ -1828,15 +1856,12 @@ fn dashboard_running_paused_and_stopped_targets_are_open_eligible() {
     app.ensure_selection_visible();
 
     assert_eq!(app.selected_open_eligibility(), OpenEligibility::OpenNow);
-    assert!(app.selected_open_disabled_reason().is_none());
     app.select_next();
     assert_eq!(app.list.selected_entry().unwrap().name, "paused");
     assert_eq!(app.selected_open_eligibility(), OpenEligibility::OpenNow);
-    assert!(app.selected_open_disabled_reason().is_none());
     app.select_next();
     assert_eq!(app.list.selected_entry().unwrap().name, "stopped");
     assert_eq!(app.selected_open_eligibility(), OpenEligibility::OpenNow);
-    assert!(app.selected_open_disabled_reason().is_none());
 }
 
 #[test]
