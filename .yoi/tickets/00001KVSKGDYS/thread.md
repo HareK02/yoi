@@ -377,3 +377,57 @@ Review target:
 Reviewer was asked to verify the prior blocking issue is fixed and re-run validation including workspace-server tests/checks, web check/build, TicketDoctor, and Nix build。
 
 ---
+
+<!-- event: review author: yoi-orchestrator at: 2026-06-23T07:35:05Z status: approve -->
+
+## Review: approve
+
+Reviewer Pod `yoi-reviewer-00001KVSKGDYS-r1` approved the request_changes fix and the full implementation.
+
+Reviewed target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVSKGDYS-workspace-identity`
+- Branch: `impl/00001KVSKGDYS-workspace-identity`
+- Final HEAD: `49c9e190 fix: return persisted workspace identity`
+- Full diff: `4cda83b7..49c9e190`
+- Fix diff: `31565c9b..49c9e190`
+
+Reviewer result:
+- Prior blocker is fixed。
+- `write_new_or_read_existing` now uses `OpenOptions::new().write(true).create_new(true).open(path)` for no-overwrite creation。
+- On successful create, generated identity is written/synced and returned。
+- On `AlreadyExists`, existing `.yoi/workspace.toml` is read/parsed and the persisted identity is returned。
+- Fixed temp path and `path.exists() + rename` finalization are gone。
+- This satisfies the invariant that the returned identity is the persisted/read authority under a local bootstrap race。
+
+Blocking issues:
+- なし。
+
+Non-blocking concern:
+- Direct final-file `create_new` write can expose an empty/partial file to a concurrent reader during the short write window or after crash/write failure, but this fails closed rather than returning the wrong identity and was not considered blocking for local bootstrap scope。
+
+Requirement checks:
+- Missing-file creation writes minimal v0 TOML schema。
+- Invalid existing file fails closed without overwrite。
+- Unknown fields remain denied and tested。
+- UUIDv7 validation is real: UUID parse + version check + canonical lowercase hyphenated form check。
+- `ServerConfig::local_dev` no longer constructs `local:{display}`。
+- SQLite `workspaces` upsert uses `.yoi/workspace.toml` identity values。
+- Repository ids and host ids derive from persisted workspace id。
+- Legacy `/api/repositories/local` alias remains accepted。
+- Existing `local:*` DB rows are not destructively migrated。
+- `.yoi/workspace.toml` remains safe to track and contains only `workspace_id`, `created_at`, `display_name`。
+
+Reviewer validation:
+- `cargo fmt --check`: passed
+- `git diff --check 4cda83b7..HEAD`: passed
+- `cargo test -p yoi-workspace-server`: passed (`16 passed`)
+- `cargo check -p yoi-workspace-server`: passed
+- `cd web/workspace && deno task check && deno task build`: passed
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+
+Worktree status:
+- clean for tracked/untracked files at `49c9e190`。
+- Reviewer validation left only ignored generated artifacts in the child worktree。
+
+---
