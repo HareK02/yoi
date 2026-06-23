@@ -1,5 +1,5 @@
-use std::fs;
-use std::io::ErrorKind;
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{SecondsFormat, Utc};
@@ -67,10 +67,6 @@ impl WorkspaceIdentity {
     }
 
     fn init(workspace_root: &Path, path: &Path, created_at: String) -> Result<Self> {
-        if path.exists() {
-            let raw = fs::read_to_string(path)?;
-            return Self::parse_str(&raw, path);
-        }
         validate_created_at(&created_at, path)?;
         let display_name = workspace_display_name_from_root(workspace_root, path)?;
         let workspace_id = Uuid::now_v7().to_string();
@@ -79,8 +75,7 @@ impl WorkspaceIdentity {
             created_at,
             display_name,
         };
-        identity.write_new(path)?;
-        Ok(identity)
+        identity.write_new_or_read_existing(path)
     }
 
     fn from_file(parsed: WorkspaceIdentityFile, path: &Path) -> Result<Self> {
@@ -94,7 +89,7 @@ impl WorkspaceIdentity {
         })
     }
 
-    fn write_new(&self, path: &Path) -> Result<()> {
+    fn write_new_or_read_existing(&self, path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -106,15 +101,19 @@ impl WorkspaceIdentity {
         .map_err(|error| {
             workspace_identity_error(path, format!("failed to encode TOML: {error}"))
         })?;
-        let tmp = path.with_extension("toml.tmp");
-        fs::write(&tmp, raw)?;
-        if path.exists() {
-            let _ = fs::remove_file(&tmp);
-            let raw = fs::read_to_string(path)?;
-            return Self::parse_str(&raw, path).map(|_| ());
+
+        match OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(mut file) => {
+                file.write_all(raw.as_bytes())?;
+                file.sync_all()?;
+                Ok(self.clone())
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                let raw = fs::read_to_string(path)?;
+                Self::parse_str(&raw, path)
+            }
+            Err(error) => Err(Error::Io(error)),
         }
-        fs::rename(tmp, path)?;
-        Ok(())
     }
 }
 
@@ -246,6 +245,29 @@ mod tests {
         assert_eq!(identity.created_at, FIXED_CREATED_AT);
         assert_eq!(identity.display_name, "Stable Project");
         assert_eq!(fs::read_to_string(path).unwrap(), raw);
+    }
+
+    #[test]
+    fn create_new_race_returns_existing_persisted_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(".yoi/workspace.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let persisted_raw = format!(
+            "workspace_id = \"{FIXED_WORKSPACE_ID}\"\ncreated_at = \"{FIXED_CREATED_AT}\"\ndisplay_name = \"Persisted Project\"\n"
+        );
+        fs::write(&path, &persisted_raw).unwrap();
+        let generated = WorkspaceIdentity {
+            workspace_id: "0192f0e8-4d84-7d6e-b000-000000000002".to_string(),
+            created_at: "2026-06-24T00:00:00Z".to_string(),
+            display_name: "Generated Project".to_string(),
+        };
+
+        let returned = generated.write_new_or_read_existing(&path).unwrap();
+
+        assert_eq!(returned.workspace_id, FIXED_WORKSPACE_ID);
+        assert_eq!(returned.created_at, FIXED_CREATED_AT);
+        assert_eq!(returned.display_name, "Persisted Project");
+        assert_eq!(fs::read_to_string(path).unwrap(), persisted_raw);
     }
 
     #[test]
