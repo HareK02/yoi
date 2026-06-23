@@ -16,14 +16,16 @@
 <aside class="workspace-sidebar" aria-label="Workspace navigation">
   <header class="sidebar-header">
     <div class="workspace-label">
-      <span class="eyebrow">workspace</span>
-      <h1>{workspace?.display_name ?? 'Yoi workspace'}</h1>
-      {#if workspaceError}
-        <p class="workspace-status error">Workspace summary unavailable.</p>
-      {:else if workspace}
+      {#if workspace}
         <p class="workspace-status">{workspace.workspace_id}</p>
+        <h1>{workspace.display_name}</h1>
       {:else}
-        <p class="workspace-status">Loading workspace…</p>
+        <h1>Yoi workspace</h1>
+        {#if workspaceError}
+          <p class="workspace-status error">Workspace summary unavailable.</p>
+        {:else}
+          <p class="workspace-status">Loading workspace…</p>
+        {/if}
       {/if}
     </div>
 
