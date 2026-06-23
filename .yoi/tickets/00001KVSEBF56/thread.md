@@ -183,3 +183,34 @@ Next action:
 - Route to read-only Reviewer Pod for acceptance review。
 
 ---
+
+<!-- event: comment author: yoi-orchestrator at: 2026-06-23T06:10:31Z -->
+
+## Comment
+
+Review routing:
+
+Spawned read-only Reviewer Pod:
+- `yoi-reviewer-00001KVSEBF56-r1`
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVSEBF56-protocol-typescript-types`
+- Branch: `impl/00001KVSEBF56-protocol-typescript-types`
+- Baseline: `746c51c7`
+- Implementation commit: `a13fb693 protocol: generate workspace TypeScript types`
+- Diff: `746c51c7..a13fb693`
+
+Reviewer scope:
+- read-only `/home/hare/Projects/yoi`
+
+Reviewer focus:
+- Generated TS shape vs serde wire shape。
+- `Method` / `Event` / `Segment` coverage。
+- Deterministic drift check。
+- `stream` feature gating and wasm/no-default protocol compile。
+- No direct browser-to-Pod socket implication。
+- Package/Nix updates。
+
+Orchestrator will wait for reviewer verdict before integration。
+
+---
