@@ -118,3 +118,45 @@ Next action:
 - Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T07:15:44Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVSKJ0EA`.
+
+Implementation commit:
+- `5c242d96 fix: keep dashboard row selection explicit`
+
+Changed areas:
+- `crates/tui/src/dashboard/mod.rs`
+  - Reload/snapshot reconciliation preserves only an explicitly selected visible row。
+  - Initial/reload visibility correction no longer auto-selects a row。
+  - Stale/disappeared selections fall back to `None`。
+  - `Esc` clear state remains no-selection across reload。
+  - Keyboard navigation from no-selection explicitly creates selection on first visible row。
+  - `list.selected_name` stays aligned with actual Pod row selection and clears for non-Pod/no-selection states。
+- `crates/tui/src/dashboard/tests.rs`
+  - Added focused coverage for initial visible rows with no selected row。
+  - Added `Esc` clear surviving reload while preserving composer draft。
+  - Added no-selection + `TicketIntake` submit routing to global/new Intake。
+  - Added keyboard navigation creating selection explicitly。
+  - Added reload fallback to no-selection when selected row disappears。
+  - Updated existing Dashboard tests to explicitly select rows where previous behavior depended on auto-selection。
+
+Coder validation reported:
+- `cargo fmt --check`: passed
+- `cargo test -q -p tui workspace_panel`: passed
+- `cargo test -q -p tui dashboard`: passed
+- `git diff --check`: passed
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+
+Orchestrator evidence checked:
+- Worktree clean on `impl/00001KVSKJ0EA-dashboard-no-auto-selection` at `5c242d96`。
+- Diff `4cda83b7..HEAD` touches expected Dashboard model/tests only。
+- `git diff --check 4cda83b7..HEAD`: passed。
+
+Next action:
+- Route to read-only Reviewer Pod for acceptance review。
+
+---
