@@ -264,6 +264,7 @@ fn init(workspace: &Path) -> Result<TicketCliOutput, TicketCliError> {
     fs::create_dir_all(&yoi_dir)?;
     let tickets_dir = workspace.join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH);
     fs::create_dir_all(&tickets_dir)?;
+    fs::write(tickets_dir.join(".gitkeep"), b"")?;
 
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -1117,6 +1118,7 @@ mod tests {
         );
         assert!(initialized.stdout.contains("ensured\t.yoi/tickets"));
         assert!(temp.path().join(".yoi/tickets").exists());
+        assert!(temp.path().join(".yoi/tickets/.gitkeep").exists());
 
         let config = fs::read_to_string(temp.path().join(".yoi/ticket.config.toml")).unwrap();
         assert!(config.contains("[backend]\n"));
