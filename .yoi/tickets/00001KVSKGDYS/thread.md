@@ -220,3 +220,62 @@ Reviewer focus:
 Orchestrator will wait for reviewer verdict before integration。
 
 ---
+
+<!-- event: review author: yoi-orchestrator at: 2026-06-23T07:24:58Z status: request_changes -->
+
+## Review: request changes
+
+Reviewer Pod `yoi-reviewer-00001KVSKGDYS-r1` requested changes.
+
+Reviewed target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVSKGDYS-workspace-identity`
+- Branch: `impl/00001KVSKGDYS-workspace-identity`
+- Implementation: `31565c9b feat: persist workspace identity`
+- Diff: `4cda83b7..31565c9b`
+
+Blocking issue:
+1. Missing-file create path can return/use an identity that is not the persisted `.yoi/workspace.toml` identity under a local bootstrap race。
+
+Evidence:
+- `crates/workspace-server/src/identity.rs` generates a new `WorkspaceIdentity`, calls `identity.write_new(path)?`, and then returns the generated identity。
+- In `write_new`, if another process creates `workspace.toml` after the initial missing-file path, the code validates the existing file but discards the parsed identity:
+
+```rust
+if path.exists() {
+    let _ = fs::remove_file(&tmp);
+    let raw = fs::read_to_string(path)?;
+    return Self::parse_str(&raw, path).map(|_| ());
+}
+```
+
+- The caller still returns the newly generated identity, so a server instance can upsert SQLite / serve Workspace API / repository / host ids using an id that is not the tracked file and will not survive restart。
+- Related TOCTOU risk: `path.exists()` followed by `fs::rename(tmp, path)` can overwrite a concurrently created file on Unix, and fixed temp path `workspace.toml.tmp` can be clobbered by concurrent creators。
+
+Required fix direction:
+- Ensure the returned `WorkspaceIdentity` is always the identity actually persisted or read from `.yoi/workspace.toml`。
+- Use a no-overwrite / create-new style finalization or equivalent safe retry/read behavior for local bootstrap races。
+- Add focused test coverage for the race/return-authority behavior if feasible。
+
+Non-blocking reviewer findings:
+- `.yoi/workspace.toml` contents look safe to track。
+- Unknown fields are intentionally denied and documented/tested。
+- `ServerConfig::local_dev` no longer derives `local:{display}` internally。
+- Workspace API/store/repository/host plumbing appears correctly based on persisted identity once loaded。
+- Existing `local:*` rows are not destructively migrated。
+
+Reviewer validation all passed before request_changes:
+- `cargo fmt --check`
+- `git diff --check 4cda83b7..HEAD`
+- `cargo test -p yoi-workspace-server` (`15 passed`)
+- `cargo check -p yoi-workspace-server`
+- `cd web/workspace && deno task check && deno task build`
+- `cargo run -p yoi -- ticket doctor`
+- `nix build .#yoi --no-link`
+
+Reviewer notes generated ignored artifacts from validation remained in worktree:
+- `target/`
+- `web/workspace/node_modules/`
+- `web/workspace/.svelte-kit/`
+- `web/workspace/build/`
+
+---
