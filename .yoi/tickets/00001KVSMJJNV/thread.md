@@ -195,3 +195,33 @@ Rationale:
 - blocker は persisted lifecycle representation。functional state reset は実装されているが、session log が abandoned paused turn を normal finished run として記録している点が durable semantics と不一致。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T13:49:36Z -->
+
+## Implementation report
+
+Implementation report update after review request
+
+Reviewer-requested change addressed in implementation worktree:
+- `/home/hare/Projects/yoi/.worktree/00001KVSMJJNV-paused-ctrlx-cancel`
+- branch `work/00001KVSMJJNV-paused-ctrlx-cancel`
+
+New commit:
+- `8c8fb014 fix: log paused cancel lifecycle explicitly`
+
+Change summary:
+- `crates/session-store/src/segment_log.rs`: typed `LogEntry::PausedTurnAbandoned { ts }` を追加し、replay / `collect_state` で `last_run_interrupted` を clear するようにした。JSON round-trip と replay semantics の tests を追加。
+- `crates/pod/src/pod.rs`: paused cancel cleanup で fake `RunCompleted { result: Finished }` を記録せず、`PausedTurnAbandoned` を記録するように変更。
+- `crates/pod/src/segment_log_sink.rs`: lifecycle コメントを更新。
+- `crates/pod/tests/controller_test.rs`: paused cancel が `PausedTurnAbandoned` を記録し、normal finished run としては記録されないことを確認する assertion を追加。
+
+Validation run by Orchestrator:
+- `cargo test -p session-store paused_turn_abandoned -- --nocapture`
+- `cargo test -p pod paused_cancel_abandons_resume_and_next_input_is_fresh_run -- --nocapture`
+- `cargo test -p tui ctrl_x -- --nocapture`
+- `git diff --check 5954021c..HEAD`
+
+Next:
+- Reviewer に再 review を依頼する。
+
+---
