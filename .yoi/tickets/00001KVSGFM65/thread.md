@@ -129,3 +129,49 @@ Next action:
 - Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T06:05:59Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVSGFM65`.
+
+Implementation commit:
+- `6f68bb8d web: group repository ticket kanban rows`
+
+Changed areas:
+- `web/workspace/src/lib/workspace-pages/RepositoryTicketKanban.svelte`
+  - New reusable Kanban component。
+  - Groups `ready + planning`, with `ready` sorted above `planning`。
+  - Groups `inprogress + queued`, with `inprogress` sorted above `queued`。
+  - Keeps `done`, `closed`, and `other` as distinct display groups。
+  - Shows each row’s original `ticket.state`。
+  - Caps initial rendered rows per group at 30。
+  - Adds independent per-group scroll/lazy row expansion。
+  - Uses design tokens from `app.css`。
+- `web/workspace/src/lib/workspace-pages/WorkspacePage.svelte`
+  - Replaced inline Repository Ticket Kanban markup with extracted component。
+- `web/workspace/src/app.css`
+  - Removed now-unused global inline Kanban styles。
+
+Coder validation reported:
+- `cd web/workspace && deno task check`: passed
+- `cd web/workspace && deno task build`: passed
+- `git diff --check HEAD~1..HEAD`: passed
+- `cargo run -p yoi -- ticket doctor`: passed
+- `nix build .#yoi --no-link`: passed
+
+Notes:
+- No backend API changes; `cargo test -p yoi-workspace-server` was not run。
+- No protocol TypeScript generation scope touched。
+
+Orchestrator evidence checked:
+- Worktree clean on `impl/00001KVSGFM65-kanban-lazy-rows` at `6f68bb8d`。
+- Diff `a6f9019e..HEAD` touches expected frontend files only。
+- `git diff --check a6f9019e..HEAD`: passed。
+- Validation generated ignored frontend artifacts; Orchestrator removed `web/workspace/node_modules/`, `.svelte-kit/`, and `build/` before Reviewer routing。
+
+Next action:
+- Route to read-only Reviewer Pod for acceptance review。
+
+---
