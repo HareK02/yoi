@@ -115,7 +115,7 @@ impl LocalRuntimeBridge {
                 self.workspace_root
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .unwrap_or("workspace")
+                    .expect("workspace root must have a final path component")
             ),
             kind: "local_host".to_string(),
             status,

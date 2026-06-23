@@ -38,10 +38,7 @@ pub struct ServerConfig {
 impl ServerConfig {
     pub fn local_dev(workspace_root: impl Into<PathBuf>) -> Self {
         let workspace_root = workspace_root.into();
-        let display = workspace_root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("workspace");
+        let display = workspace_display_name_from_root(&workspace_root);
         Self {
             workspace_id: format!("local:{display}"),
             workspace_root,
@@ -64,12 +61,7 @@ pub struct WorkspaceApi {
 
 impl WorkspaceApi {
     pub async fn new(config: ServerConfig, store: Arc<dyn ControlPlaneStore>) -> Result<Self> {
-        let display_name = config
-            .workspace_root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("workspace")
-            .to_string();
+        let display_name = workspace_display_name_from_root(&config.workspace_root);
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: config.workspace_id.clone(),
@@ -103,13 +95,16 @@ impl WorkspaceApi {
     }
 
     fn workspace_display_name(&self) -> String {
-        self.config
-            .workspace_root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("workspace")
-            .to_string()
+        workspace_display_name_from_root(&self.config.workspace_root)
     }
+}
+
+fn workspace_display_name_from_root(workspace_root: &std::path::Path) -> String {
+    workspace_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("workspace root must have a final path component")
+        .to_string()
 }
 
 pub fn build_router(api: WorkspaceApi) -> Router {
@@ -243,14 +238,7 @@ async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<Worksp
     let display_name = stored
         .as_ref()
         .map(|record| record.display_name.clone())
-        .or_else(|| {
-            api.config
-                .workspace_root
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| "workspace".to_string());
+        .unwrap_or_else(|| workspace_display_name_from_root(&api.config.workspace_root));
     Ok(Json(WorkspaceResponse {
         workspace_id: api.config.workspace_id.clone(),
         display_name,

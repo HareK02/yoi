@@ -147,6 +147,13 @@ fn parse_serve_options(args: &[String]) -> Result<ServeOptions, CliError> {
         index += 1;
     }
 
+    let workspace = workspace.canonicalize().map_err(|error| {
+        CliError(format!(
+            "failed to canonicalize workspace `{}`: {error}",
+            workspace.display()
+        ))
+    })?;
+
     Ok(ServeOptions {
         workspace,
         db,
