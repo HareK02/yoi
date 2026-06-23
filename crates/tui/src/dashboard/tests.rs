@@ -481,6 +481,7 @@ fn ready_ticket_intake_enter_prepares_planning_return_not_queue_or_generic_launc
         "ready",
     ));
     let mut app = app_with_panel(empty_test_list(), panel);
+    app.select_next();
     app.cycle_composer_target();
     app.input.insert_str("clarify expected behavior");
 
@@ -939,6 +940,111 @@ fn no_ticket_selection_keeps_enter_pod_centric() {
 }
 
 #[test]
+fn workspace_panel_initial_display_does_not_auto_select_visible_rows() {
+    let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
+    panel.rows.push(panel_test_ticket_row(
+        "TICKET-1",
+        "Ready",
+        ActionPriority::ReadyForQueue,
+        NextUserAction::Queue,
+        "ready",
+    ));
+    let app = app_with_panel(
+        PodList::from_sources(
+            PodVisibilitySource::ResumePicker,
+            vec![],
+            vec![live_info("alpha", PodStatus::Idle)],
+            None,
+            10,
+        ),
+        panel,
+    );
+
+    assert!(visible_panel_keys(&app.panel, &app.list).len() > 1);
+    assert!(app.selected_row.is_none());
+    assert!(app.list.selected_name.is_none());
+}
+
+#[test]
+fn workspace_panel_clear_selection_survives_reload_and_keeps_draft() {
+    let mut app = test_app(vec![live_info_with_updated_at(
+        "alpha",
+        PodStatus::Idle,
+        10,
+    )]);
+    app.select_next();
+    assert_eq!(
+        app.selected_row,
+        Some(PanelRowKey::Pod("alpha".to_string()))
+    );
+    app.input.insert_str("draft survives");
+
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Esc)),
+        DashboardAction::None
+    ));
+    assert!(app.selected_row.is_none());
+    assert!(app.list.selected_name.is_none());
+
+    app.apply_reloaded_list(PodList::from_sources(
+        PodVisibilitySource::ResumePicker,
+        vec![],
+        vec![live_info_with_updated_at("alpha", PodStatus::Running, 20)],
+        None,
+        10,
+    ));
+
+    assert!(app.selected_row.is_none());
+    assert!(app.list.selected_name.is_none());
+    assert_eq!(input_text(&app), "draft survives");
+}
+
+#[test]
+fn workspace_panel_no_selection_ticket_intake_submit_uses_global_intake() {
+    let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
+    panel.composer = crate::workspace_panel::WorkspacePanelComposer::ticket_enabled();
+    panel.rows.push(panel_test_ticket_row(
+        "TICKET-1",
+        "Ready",
+        ActionPriority::ReadyForQueue,
+        NextUserAction::Queue,
+        "ready",
+    ));
+    let mut app = app_with_panel(empty_test_list(), panel);
+    app.cycle_composer_target();
+    app.input.insert_str("new planning request");
+
+    let request = match app.handle_key(key(KeyCode::Enter)) {
+        DashboardAction::LaunchIntake(request) => request,
+        _ => panic!("no selection should launch global Intake"),
+    };
+
+    assert!(request.context.ticket.is_none());
+    assert_eq!(
+        request.context.user_instruction.as_deref(),
+        Some("new planning request")
+    );
+}
+
+#[test]
+fn workspace_panel_keyboard_navigation_explicitly_creates_selection() {
+    let mut app = test_app(vec![
+        live_info("alpha", PodStatus::Idle),
+        live_info("beta", PodStatus::Idle),
+    ]);
+    assert!(app.selected_row.is_none());
+
+    app.select_next();
+    assert_eq!(
+        app.selected_row,
+        Some(PanelRowKey::Pod("alpha".to_string()))
+    );
+
+    app.select_next();
+    assert_eq!(app.selected_row, Some(PanelRowKey::Pod("beta".to_string())));
+}
+
+#[test]
 fn dashboard_ticket_action_rows_precede_pods_and_pod_actions_still_work() {
     let temp = TempDir::new().unwrap();
     fs::create_dir_all(temp.path().join(".yoi")).unwrap();
@@ -960,6 +1066,8 @@ fn dashboard_ticket_action_rows_precede_pods_and_pod_actions_still_work() {
     );
     let panel = build_workspace_panel(temp.path(), &list);
     let mut app = app_with_panel(list, panel);
+    assert!(app.selected_row.is_none());
+    app.select_next();
 
     assert_eq!(app.selected_panel_row().unwrap().title, "Ready Ticket");
     assert_eq!(app.selected_open_eligibility(), OpenEligibility::Disabled);
@@ -1176,6 +1284,7 @@ fn selected_ticket_row_with_non_empty_composer_hides_redundant_status_hints() {
         10,
     );
     let mut app = app_with_panel(list, panel);
+    app.select_next();
     app.input.insert_str("draft to companion");
 
     assert_eq!(
@@ -1201,7 +1310,7 @@ fn dashboard_bare_panel_letters_append_to_composer_and_arrows_select_when_blank(
         live_info("alpha", PodStatus::Idle),
         live_info("beta", PodStatus::Idle),
     ]);
-    assert_eq!(app.list.selected_entry().unwrap().name, "alpha");
+    assert!(app.selected_row.is_none());
 
     for c in ['j', 'k', 'o', 'r'] {
         assert!(matches!(
@@ -1211,14 +1320,14 @@ fn dashboard_bare_panel_letters_append_to_composer_and_arrows_select_when_blank(
     }
 
     assert_eq!(input_text(&app), "jkor");
-    assert_eq!(app.list.selected_entry().unwrap().name, "alpha");
+    assert!(app.selected_row.is_none());
 
     assert!(matches!(
         app.handle_key(key(KeyCode::Down)),
         DashboardAction::None
     ));
     assert_eq!(input_text(&app), "jkor");
-    assert_eq!(app.list.selected_entry().unwrap().name, "alpha");
+    assert!(app.selected_row.is_none());
 
     app.input.clear();
     assert!(matches!(
@@ -1226,6 +1335,12 @@ fn dashboard_bare_panel_letters_append_to_composer_and_arrows_select_when_blank(
         DashboardAction::None
     ));
     assert_eq!(input_text(&app), "");
+    assert_eq!(app.list.selected_entry().unwrap().name, "alpha");
+
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Down)),
+        DashboardAction::None
+    ));
     assert_eq!(app.list.selected_entry().unwrap().name, "beta");
 
     assert!(matches!(
@@ -1248,7 +1363,7 @@ fn dashboard_selection_changes_preserve_composer_contents() {
     app.select_next();
 
     assert_eq!(input_text(&app), before);
-    assert_eq!(app.list.selected_entry().unwrap().name, "beta");
+    assert_eq!(app.list.selected_entry().unwrap().name, "alpha");
 }
 
 #[test]
@@ -1258,7 +1373,7 @@ fn dashboard_poll_reload_preserves_selection_composer_and_notice() {
         live_info_with_updated_at("beta", PodStatus::Idle, 20),
     ]);
     app.select_next();
-    assert_eq!(app.list.selected_entry().unwrap().name, "alpha");
+    assert_eq!(app.list.selected_entry().unwrap().name, "beta");
     app.input.insert_str("draft survives polling");
     app.notice = Some("keep this notice".to_string());
     let refreshed = PodList::from_sources(
@@ -1275,7 +1390,7 @@ fn dashboard_poll_reload_preserves_selection_composer_and_notice() {
 
     app.apply_reloaded_list(refreshed);
 
-    assert_eq!(app.list.selected_entry().unwrap().name, "alpha");
+    assert_eq!(app.list.selected_entry().unwrap().name, "beta");
     assert_eq!(
         app.list
             .selected_entry()
@@ -1284,7 +1399,7 @@ fn dashboard_poll_reload_preserves_selection_composer_and_notice() {
             .as_ref()
             .unwrap()
             .status,
-        Some(PodStatus::Running)
+        Some(PodStatus::Idle)
     );
     assert_eq!(input_text(&app), "draft survives polling");
     assert_eq!(app.notice.as_deref(), Some("keep this notice"));
@@ -1296,6 +1411,8 @@ fn dashboard_poll_reload_falls_back_when_selected_pod_disappears() {
         live_info_with_updated_at("alpha", PodStatus::Idle, 10),
         live_info_with_updated_at("beta", PodStatus::Running, 20),
     ]);
+    app.select_next();
+    app.select_next();
     assert_eq!(app.list.selected_entry().unwrap().name, "beta");
     let refreshed = PodList::from_sources(
         PodVisibilitySource::ResumePicker,
@@ -1307,7 +1424,8 @@ fn dashboard_poll_reload_falls_back_when_selected_pod_disappears() {
 
     app.apply_reloaded_list(refreshed);
 
-    assert_eq!(app.list.selected_entry().unwrap().name, "alpha");
+    assert!(app.selected_row.is_none());
+    assert!(app.list.selected_name.is_none());
     assert_eq!(visible_entry_indices(&app.list), vec![0, 1]);
 }
 
@@ -1526,7 +1644,8 @@ async fn dashboard_quit_aborts_background_reload_and_notice_without_waiting() {
 
 #[test]
 fn dashboard_idle_live_selected_target_is_open_eligible() {
-    let app = test_app(vec![live_info("idle", PodStatus::Idle)]);
+    let mut app = test_app(vec![live_info("idle", PodStatus::Idle)]);
+    app.select_next();
 
     assert_eq!(app.selected_open_eligibility(), OpenEligibility::OpenNow);
 }
@@ -1855,6 +1974,9 @@ fn dashboard_running_paused_and_stopped_targets_are_open_eligible() {
     app.selected_row = None;
     app.ensure_selection_visible();
 
+    assert_eq!(app.selected_open_eligibility(), OpenEligibility::Disabled);
+    app.select_next();
+    assert_eq!(app.list.selected_entry().unwrap().name, "running");
     assert_eq!(app.selected_open_eligibility(), OpenEligibility::OpenNow);
     app.select_next();
     assert_eq!(app.list.selected_entry().unwrap().name, "paused");
@@ -1933,6 +2055,8 @@ fn dashboard_selection_follows_visible_section_order_without_hidden_closed_rows(
     );
     let mut app = app_with_list(list);
 
+    assert!(app.selected_row.is_none());
+    app.select_next();
     assert_eq!(app.list.selected_entry().unwrap().name, "idle");
     app.select_next();
     assert_eq!(app.list.selected_entry().unwrap().name, "running");
@@ -1969,7 +2093,7 @@ fn dashboard_selection_does_not_default_to_orchestrator_only_row() {
 }
 
 #[test]
-fn dashboard_selection_prefers_non_orchestrator_pod_by_default() {
+fn dashboard_selection_has_no_default_when_orchestrator_pod_exists() {
     let list = PodList::from_sources(
         PodVisibilitySource::ResumePicker,
         vec![],
@@ -1988,7 +2112,8 @@ fn dashboard_selection_prefers_non_orchestrator_pod_by_default() {
     ));
     let app = app_with_panel(list, panel);
 
-    assert_eq!(app.list.selected_entry().unwrap().name, "worker");
+    assert!(app.selected_row.is_none());
+    assert!(app.list.selected_name.is_none());
 }
 
 #[test]
@@ -2139,6 +2264,7 @@ fn dashboard_companion_finish_success_clears_composer() {
 fn dashboard_open_request_keeps_dashboard_state_for_nested_console() {
     let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
     app.input.insert_str("draft survives open");
+    app.select_next();
 
     let request = app.prepare_open().unwrap();
 
@@ -2207,6 +2333,7 @@ fn dashboard_nested_console_success_continues_without_dropping_state() {
         live_info("beta", PodStatus::Idle),
     ]);
     app.select_next();
+    app.select_next();
     app.input.insert_str("keep this draft");
     app.panel_diagnostic = Some(PanelDiagnostic {
         title: "diagnostic stays".to_string(),
@@ -2244,6 +2371,7 @@ fn dashboard_nested_console_recoverable_failure_continues_without_dropping_state
         live_info("alpha", PodStatus::Idle),
         live_info("beta", PodStatus::Idle),
     ]);
+    app.select_next();
     app.select_next();
     app.input.insert_str("keep this draft");
     app.panel_diagnostic = Some(PanelDiagnostic {
@@ -2299,6 +2427,7 @@ fn dashboard_open_disabled_target_stays_in_dashboard() {
     live.reachable = false;
     live.status = None;
     let mut app = test_app(vec![live]);
+    app.select_next();
 
     assert!(app.prepare_open().is_none());
     assert!(app.notice.as_deref().unwrap().contains("cannot be opened"));
@@ -2307,6 +2436,7 @@ fn dashboard_open_disabled_target_stays_in_dashboard() {
 #[test]
 fn dashboard_empty_enter_uses_open_action() {
     let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
+    app.select_next();
 
     assert!(matches!(
         app.handle_key(key(KeyCode::Enter)),
@@ -2331,6 +2461,7 @@ fn dashboard_empty_enter_uses_open_action() {
 #[test]
 fn dashboard_whitespace_only_enter_uses_open_action() {
     let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
+    app.select_next();
     app.input.insert_str("  \n\t");
 
     assert!(matches!(
@@ -2407,6 +2538,7 @@ fn dashboard_alt_enter_on_blank_ticket_action_inserts_newline_without_dispatch()
         PodList::from_sources(PodVisibilitySource::ResumePicker, vec![], vec![], None, 10),
         panel,
     );
+    app.select_next();
     let selected_before = app.selected_row.clone();
     assert_eq!(app.selected_ticket_action(), Some(NextUserAction::Queue));
 
@@ -2450,6 +2582,7 @@ fn dashboard_composer_shared_word_motion_and_delete_keys() {
 #[test]
 fn dashboard_esc_clears_row_selection_without_quitting_and_preserves_draft() {
     let mut app = ticket_enabled_app(vec![live_info("alpha", PodStatus::Idle)]);
+    app.select_next();
     app.input.insert_str("draft message");
 
     assert!(app.selected_row.is_some());
@@ -2793,6 +2926,7 @@ fn intake_registry_update_claim_conflict_is_diagnostic_not_overwrite() {
 #[test]
 fn dashboard_empty_enter_on_non_openable_row_reports_open_diagnostic() {
     let mut app = test_app(vec![unreachable_live_info("unreachable")]);
+    app.select_next();
     assert!(matches!(
         app.handle_key(key(KeyCode::Enter)),
         DashboardAction::Open

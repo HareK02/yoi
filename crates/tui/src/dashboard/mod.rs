@@ -1266,8 +1266,7 @@ impl DashboardApp {
             .list
             .selected_name
             .clone()
-            .filter(|name| list.entries.iter().any(|entry| entry.name == *name))
-            .or_else(|| list.entries.first().map(|entry| entry.name.clone()));
+            .filter(|name| list.entries.iter().any(|entry| entry.name == *name));
         let panel = build_workspace_panel(&current_workspace_root(), &list);
         self.apply_reloaded_snapshot(DashboardSnapshot { list, panel });
     }
@@ -1276,25 +1275,17 @@ impl DashboardApp {
         self.apply_companion_lifecycle_memory(&mut snapshot.panel);
         self.apply_orchestrator_lifecycle_memory(&mut snapshot.panel);
         let previous_selected_pod = self.list.selected_name.clone();
-        snapshot.list.selected_name = previous_selected_pod
-            .filter(|name| {
-                snapshot
-                    .list
-                    .entries
-                    .iter()
-                    .any(|entry| entry.name == *name)
-            })
-            .or_else(|| {
-                snapshot
-                    .list
-                    .entries
-                    .first()
-                    .map(|entry| entry.name.clone())
-            });
+        snapshot.list.selected_name = previous_selected_pod.filter(|name| {
+            snapshot
+                .list
+                .entries
+                .iter()
+                .any(|entry| entry.name == *name)
+        });
         let previous_row = self.selected_row.clone();
         self.list = snapshot.list;
         self.panel = snapshot.panel;
-        self.selected_row = previous_row.filter(|key| self.panel.row(key).is_some());
+        self.selected_row = previous_row;
         self.ensure_selection_visible();
         self.ensure_composer_target_available();
         self.refresh_orchestrator_work_set();
@@ -1444,12 +1435,14 @@ impl DashboardApp {
             self.list.selected_name = None;
             return;
         }
-        let selected_pos = self
+        let next_pos = match self
             .selected_row
             .as_ref()
             .and_then(|key| visible.iter().position(|visible_key| visible_key == key))
-            .unwrap_or(0);
-        let next_pos = (selected_pos + 1).min(visible.len() - 1);
+        {
+            Some(selected_pos) => (selected_pos + 1).min(visible.len() - 1),
+            None => 0,
+        };
         self.select_panel_key(visible[next_pos].clone());
     }
 
@@ -1460,12 +1453,15 @@ impl DashboardApp {
             self.list.selected_name = None;
             return;
         }
-        let selected_pos = self
+        let prev_pos = match self
             .selected_row
             .as_ref()
             .and_then(|key| visible.iter().position(|visible_key| visible_key == key))
-            .unwrap_or(0);
-        self.select_panel_key(visible[selected_pos.saturating_sub(1)].clone());
+        {
+            Some(selected_pos) => selected_pos.saturating_sub(1),
+            None => 0,
+        };
+        self.select_panel_key(visible[prev_pos].clone());
     }
 
     fn handle_mouse_event(&mut self, event: MouseEvent) -> bool {
@@ -1623,55 +1619,32 @@ impl DashboardApp {
 
     fn ensure_selection_visible(&mut self) {
         let visible = visible_panel_keys(&self.panel, &self.list);
-        if visible.is_empty() {
-            self.selected_row = None;
+        let Some(selected_key) = self.selected_row.as_ref() else {
             self.list.selected_name = None;
             return;
-        }
-        let selected_visible = self
-            .selected_row
-            .as_ref()
-            .is_some_and(|key| visible.iter().any(|visible_key| visible_key == key));
-        if !selected_visible {
-            let has_action_rows = self.panel.rows.iter().any(|row| row.is_ticket_action());
-            let orchestrator_pod_name = self
-                .panel
-                .header
-                .orchestrator
-                .as_ref()
-                .map(|state| state.pod_name.as_str());
-            if !has_action_rows {
-                if let Some(selected_name) = self.list.selected_name.as_ref() {
-                    if Some(selected_name.as_str()) != orchestrator_pod_name {
-                        let key = PanelRowKey::Pod(selected_name.clone());
-                        if visible.iter().any(|visible_key| visible_key == &key) {
-                            self.select_panel_key(key);
-                            return;
-                        }
-                    }
-                }
-                if let Some(key) = visible.iter().find(|key| match key {
-                    PanelRowKey::Pod(name) => Some(name.as_str()) != orchestrator_pod_name,
-                    PanelRowKey::Ticket(_)
-                    | PanelRowKey::InvalidTicket(_)
-                    | PanelRowKey::TicketIntakePod { .. } => true,
-                }) {
-                    self.select_panel_key(key.clone());
-                    return;
-                }
-                self.selected_row = None;
-                self.list.selected_name = None;
-                return;
+        };
+        if visible
+            .iter()
+            .any(|visible_key| visible_key == selected_key)
+        {
+            match selected_key {
+                PanelRowKey::Pod(name) => self.list.selected_name = Some(name.clone()),
+                PanelRowKey::Ticket(_)
+                | PanelRowKey::InvalidTicket(_)
+                | PanelRowKey::TicketIntakePod { .. } => self.list.selected_name = None,
             }
-            self.select_panel_key(visible[0].clone());
-        } else if let Some(PanelRowKey::Pod(name)) = self.selected_row.as_ref() {
-            self.list.selected_name = Some(name.clone());
+        } else {
+            self.selected_row = None;
+            self.list.selected_name = None;
         }
     }
 
     fn select_panel_key(&mut self, key: PanelRowKey) {
-        if let PanelRowKey::Pod(name) = &key {
-            self.list.selected_name = Some(name.clone());
+        match &key {
+            PanelRowKey::Pod(name) => self.list.selected_name = Some(name.clone()),
+            PanelRowKey::Ticket(_)
+            | PanelRowKey::InvalidTicket(_)
+            | PanelRowKey::TicketIntakePod { .. } => self.list.selected_name = None,
         }
         #[cfg(feature = "e2e-test")]
         let selected_key = key.clone();
