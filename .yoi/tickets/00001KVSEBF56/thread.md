@@ -280,3 +280,90 @@ Worktree status:
 - Clean on `impl/00001KVSEBF56-protocol-typescript-types` at `a13fb693`。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T06:20:49Z -->
+
+## Implementation report
+
+Reviewer r1 approvalを受けて、実装ブランチを Orchestrator worktree の `orchestration` branch に統合した。
+
+統合:
+- Merge commit: `9728b533 merge: protocol typescript generation`
+- Merged branch: `impl/00001KVSEBF56-protocol-typescript-types`
+- Implementation commit:
+  - `a13fb693 protocol: generate workspace TypeScript types`
+
+Orchestrator worktree validation:
+- `cargo fmt --check`: passed
+- `git diff --check HEAD^1..HEAD`: passed
+- `cargo test -p protocol`: passed
+- `cargo test -p protocol --features typescript generated_protocol_types_are_current`: passed
+- `cargo test -p protocol --features typescript`: passed
+  - Non-blocking `ts-rs` warning for `#[serde(other)]` on `Segment::Unknown` remains as reviewer noted。
+- `cargo check -p protocol --target wasm32-unknown-unknown --no-default-features`: passed
+- `cd web/workspace && rm -rf node_modules .svelte-kit build && deno task check`: passed (`svelte-check found 0 errors and 0 warnings`)
+- `cd web/workspace && deno task build`: passed
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+
+Validation generated ignored frontend artifacts in Orchestrator worktree:
+- `web/workspace/node_modules/`
+- `web/workspace/.svelte-kit/`
+- `web/workspace/build/`
+
+These were removed after validation. Final Orchestrator worktree status after validation cleanup is clean on `orchestration` at `9728b533`。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-23T06:21:01Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Reviewer approval、Orchestrator worktree への統合、protocol tests/drift check/wasm no-default check、Deno check/build、Ticket doctor、Nix build が完了したため `done` に遷移する。
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-23T06:21:19Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-23T06:21:19Z status: closed -->
+
+## 完了
+
+Protocol crate 由来の Workspace web TypeScript type generation を実装し、Orchestrator worktree の `orchestration` branch に統合した。
+
+主な成果:
+- `crates/protocol` の `stream` module / tokio dependency を default `stream` feature に分離し、DTO-only build で tokio を不要にした。
+- Optional `typescript` feature と `ts-rs` による TypeScript export を追加。
+- Protocol DTOs に `cfg_attr(feature = "typescript", derive(ts_rs::TS))` を追加。
+- Deterministic generator を追加:
+  - `crates/protocol/src/typescript.rs`
+  - `crates/protocol/examples/generate_typescript.rs`
+- Drift check を追加:
+  - `cargo test -p protocol --features typescript generated_protocol_types_are_current`
+- Generated artifact を追加:
+  - `web/workspace/src/lib/generated/protocol.ts`
+- Workspace web が generated root protocol types を re-export:
+  - `PodProtocolMethod`
+  - `PodProtocolEvent`
+  - `PodProtocolSegment`
+- Workspace backend extension-point notes に、browser が Pod Unix socket に直接接続せず、将来の backend proxy が Worker identity と method allow/block boundary を enforce する方針を記録。
+- `Cargo.lock` と `package.nix` cargo hash を更新。
+
+統合・検証:
+- Merge commit: `9728b533 merge: protocol typescript generation`
+- Implementation commit: `a13fb693 protocol: generate workspace TypeScript types`
+- Reviewer final verdict: approve
+- Validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p protocol`, `cargo test -p protocol --features typescript generated_protocol_types_are_current`, `cargo test -p protocol --features typescript`, `cargo check -p protocol --target wasm32-unknown-unknown --no-default-features`, `deno task check`, `deno task build`, `cargo run -p yoi -- ticket doctor`, and `nix build .#yoi --no-link`。
+
+既知の非ブロッキング事項:
+- `ts-rs` は `#[serde(other)]` on `Segment::Unknown` に warning を出すが、generated artifact には `{ "kind": "unknown" }` が含まれ、current validation は pass。
+- 一部 `Option<T>` + `skip_serializing_if` fields は TS で optional field ではなく required nullable に出る。将来 UI が該当 field を使う際は注意。
+
+---

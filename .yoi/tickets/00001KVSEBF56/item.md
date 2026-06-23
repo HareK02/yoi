@@ -1,8 +1,8 @@
 ---
 title: 'Generate Workspace web TypeScript types from protocol crate'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-06-23T05:13:22Z'
-updated_at: '2026-06-23T06:16:54Z'
+updated_at: '2026-06-23T06:21:19Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-23T05:40:01Z'
