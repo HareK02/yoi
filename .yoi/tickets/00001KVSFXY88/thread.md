@@ -285,3 +285,22 @@ TUI Dashboard の冗長な key hints と selected-row textual status display を
 - Manual/PTY `yoi panel` visual check は実施していない。Focused render/unit tests を主 validation とした。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T06:33:21Z -->
+
+## Implementation report
+
+Post-close cleanup completed。
+
+- Stopped child Pods and reclaimed scope:
+  - `yoi-coder-00001KVSFXY88`
+  - `yoi-reviewer-00001KVSFXY88-r1`
+- Removed implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVSFXY88-dashboard-hint-cleanup`
+- Deleted implementation branch:
+  - `impl/00001KVSFXY88-dashboard-hint-cleanup`
+- Orchestrator worktree remains clean on `orchestration` at `10866666`。
+
+Root/original workspace was not used for merge/validation/cleanup operations。
+
+---
