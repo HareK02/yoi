@@ -279,3 +279,29 @@ Reviewer notes generated ignored artifacts from validation remained in worktree:
 - `web/workspace/build/`
 
 ---
+
+<!-- event: comment author: yoi-orchestrator at: 2026-06-23T07:25:27Z -->
+
+## Comment
+
+Rerouted request-changes feedback to Coder Pod `yoi-coder-00001KVSKGDYS`.
+
+Requested fix:
+- `WorkspaceIdentity::load_or_init` must return the identity actually persisted/read from `.yoi/workspace.toml`。
+- Missing-file creation must handle local bootstrap races without returning an unpersisted generated identity。
+- Avoid or safely handle TOCTOU / fixed temp-file clobbering around `workspace.toml.tmp`。
+- Add focused deterministic test coverage if feasible。
+
+Validation requested after fix:
+- `cargo fmt --check`
+- `cargo test -p yoi-workspace-server`
+- `cargo check -p yoi-workspace-server`
+- `cd web/workspace && deno task check && deno task build`
+- `git diff --check`
+- `git diff --cached --check`
+- `cargo run -p yoi -- ticket doctor`
+- `nix build .#yoi --no-link`
+
+Coder was also asked to remove ignored validation artifacts before reporting。
+
+---
