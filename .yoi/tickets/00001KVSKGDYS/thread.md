@@ -355,3 +355,25 @@ Next action:
 - Route back to Reviewer Pod for re-review of request_changes fix。
 
 ---
+
+<!-- event: comment author: yoi-orchestrator at: 2026-06-23T07:31:34Z -->
+
+## Comment
+
+Re-review routing:
+
+Sent the request_changes fix back to Reviewer Pod:
+- `yoi-reviewer-00001KVSKGDYS-r1`
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVSKGDYS-workspace-identity`
+- Branch: `impl/00001KVSKGDYS-workspace-identity`
+- Baseline: `4cda83b7`
+- Previous implementation: `31565c9b feat: persist workspace identity`
+- Fix commit: `49c9e190 fix: return persisted workspace identity`
+- Main review diff: `4cda83b7..49c9e190`
+- Focus diff: `31565c9b..49c9e190`
+
+Reviewer was asked to verify the prior blocking issue is fixed and re-run validation including workspace-server tests/checks, web check/build, TicketDoctor, and Nix build。
+
+---
