@@ -1,8 +1,8 @@
 ---
 title: 'Persist local Workspace identity in .yoi/workspace.toml'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-06-23T06:43:28Z'
-updated_at: '2026-06-23T07:35:05Z'
+updated_at: '2026-06-23T07:39:10Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-23T06:47:18Z'

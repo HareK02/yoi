@@ -431,3 +431,106 @@ Worktree status:
 - Reviewer validation left only ignored generated artifacts in the child worktree。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T07:38:38Z -->
+
+## Implementation report
+
+Merge and validation completed.
+
+Merged implementation:
+- Merge commit: `2745f3d5 merge: workspace identity persistence`
+- Implementation commits:
+  - `31565c9b feat: persist workspace identity`
+  - `49c9e190 fix: return persisted workspace identity`
+
+Post-merge validation in orchestration worktree:
+- `cargo fmt --check`: passed
+- `git diff --check HEAD^1..HEAD`: passed
+- `cargo test -p yoi-workspace-server`: passed
+- `cargo check -p yoi-workspace-server`: passed
+- `cd web/workspace && deno task check && deno task build`: passed (`svelte-check` 0 errors / 0 warnings; build completed)
+- `cargo run -q -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+
+Generated artifact cleanup:
+- Removed validation artifacts from orchestration worktree:
+  - `target/`
+  - `web/workspace/node_modules/`
+  - `web/workspace/.svelte-kit/`
+  - `web/workspace/build/`
+- `git status --short --branch --ignored` shows only ignored `.yoi/tickets/.ticket-backend.lock`。
+
+Outcome:
+- Local Workspace identity now persists in tracked `.yoi/workspace.toml`。
+- New ids are UUIDv7 and no longer derived from path/display basename。
+- `.yoi/workspace.toml` parsing validates UUIDv7, UTC RFC3339 timestamp, non-empty display name, canonical id form, and denies unknown fields。
+- Invalid existing identity files fail closed and are not overwritten。
+- Missing-file creation returns the identity actually persisted/read, including `AlreadyExists` race handling。
+- Workspace API / SQLite upsert / repository ids / host ids use the persisted Workspace identity。
+- Existing legacy `local:*` DB rows are not destructively migrated。
+- `.yoi/workspace.toml` remains a minimal safe project identity record, not a runtime/settings/secret store。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-23T07:38:42Z from: inprogress to: done reason: merged_and_validated field: state -->
+
+## State changed
+
+Reviewer approval 後に implementation を orchestration worktree へ merge し、post-merge validation と生成物 cleanup が完了したため done とする。
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-23T07:39:10Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-23T07:39:10Z status: closed -->
+
+## 完了
+
+Local Workspace identity を tracked `.yoi/workspace.toml` に永続化する実装を完了した。
+
+完了内容:
+- `.yoi/workspace.toml` を local Workspace identity の authority として追加。
+- v0 schema は `workspace_id`, `created_at`, `display_name` のみ。
+- `workspace_id` は UUIDv7 canonical string として検証し、path / display basename から導出しない。
+- `created_at` は UTC RFC3339 timestamp として検証。
+- `display_name` は空文字列を拒否。
+- unknown fields は v0 では明示的に deny。
+- invalid existing file は fail closed し、自動上書きしない。
+- missing file 初期化では `OpenOptions::create_new(true)` を使い、既存 file が race で作られた場合は persisted identity を read/parse して返す。
+- fixed temp file / `path.exists()` + `rename` finalization は使わない。
+- `ServerConfig::local_dev` は `local:{display}` を生成せず、persisted `WorkspaceIdentity` を受け取る。
+- SQLite `workspaces` upsert、Workspace API、repository ids、host ids は persisted Workspace id を使う。
+- legacy `/api/repositories/local` alias は維持。
+- 既存 `local:*` DB rows の destructive migration はしない。
+- `.yoi/workspace.toml` は絶対 path / secret / socket / runtime data を含まない安全な project identity record として維持。
+
+統合:
+- Implementation: `31565c9b feat: persist workspace identity`
+- Fix: `49c9e190 fix: return persisted workspace identity`
+- Merge: `2745f3d5 merge: workspace identity persistence`
+
+検証:
+- Reviewer approval: `yoi-reviewer-00001KVSKGDYS-r1`
+- `cargo fmt --check`: passed
+- `git diff --check HEAD^1..HEAD`: passed
+- `cargo test -p yoi-workspace-server`: passed
+- `cargo check -p yoi-workspace-server`: passed
+- `cd web/workspace && deno task check && deno task build`: passed
+- `cargo run -q -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+
+生成物 cleanup:
+- orchestration worktree の `target/`, `web/workspace/node_modules/`, `web/workspace/.svelte-kit/`, `web/workspace/build/` を削除済み。
+
+残作業:
+- なし。将来必要なら legacy `local:*` row cleanup / migration policy は別 Ticket で扱う。
+
+---
