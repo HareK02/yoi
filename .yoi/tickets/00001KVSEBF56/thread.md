@@ -367,3 +367,26 @@ Protocol crate 由来の Workspace web TypeScript type generation を実装し�
 - 一部 `Option<T>` + `skip_serializing_if` fields は TS で optional field ではなく required nullable に出る。将来 UI が該当 field を使う際は注意。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T06:22:01Z -->
+
+## Implementation report
+
+Post-close cleanup completed。
+
+- Stopped child Pods and reclaimed scope:
+  - `yoi-coder-00001KVSEBF56`
+  - `yoi-reviewer-00001KVSEBF56-r1`
+- Removed ignored frontend validation artifacts from child worktree before worktree removal if present:
+  - `web/workspace/node_modules/`
+  - `web/workspace/.svelte-kit/`
+  - `web/workspace/build/`
+- Removed implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVSEBF56-protocol-typescript-types`
+- Deleted implementation branch:
+  - `impl/00001KVSEBF56-protocol-typescript-types`
+- Orchestrator worktree remains clean on `orchestration` at `b547203f`。
+
+Root/original workspace was not used for merge/validation/cleanup operations。
+
+---
