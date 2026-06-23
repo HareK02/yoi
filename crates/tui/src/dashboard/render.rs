@@ -57,24 +57,14 @@ pub(super) fn input_area_height(render: &crate::input::InputRender, terminal_hei
 }
 
 pub(super) fn draw_title(frame: &mut Frame<'_>, app: &DashboardApp, area: Rect) {
-    let guidance = if app
-        .panel
-        .composer
-        .is_available(ComposerTarget::TicketIntake)
-    {
-        "  Row selection: blank Enter opens/dispatches · text Enter uses target · Tab target"
-    } else if app.panel.header.ticket_configured {
-        "  Row selection: blank Enter opens/dispatches · text Enter sends to Companion"
-    } else {
-        "  Pod-centric view · Row selection: blank Enter opens · text Enter sends to Companion"
-    };
-    let mut spans = vec![
-        Span::styled(
-            "workspace dashboard",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(guidance, Style::default().fg(Color::DarkGray)),
-    ];
+    frame.render_widget(Paragraph::new(title_line(app)), area);
+}
+
+pub(super) fn title_line(app: &DashboardApp) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        "workspace dashboard",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
     if let Some(companion) = &app.panel.header.companion {
         spans.push(Span::styled(
             " · companion ",
@@ -101,7 +91,7 @@ pub(super) fn draw_title(frame: &mut Frame<'_>, app: &DashboardApp, area: Rect) 
             orchestrator_status_style(orchestrator.status),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    Line::from(spans)
 }
 
 pub(super) fn companion_status_style(status: CompanionPanelStatus) -> Style {
@@ -688,115 +678,8 @@ pub(super) fn draw_target_status(frame: &mut Frame<'_>, app: &DashboardApp, area
     frame.render_widget(Paragraph::new(target_status_line(app)), area);
 }
 
-pub(super) fn target_status_line(app: &DashboardApp) -> Line<'static> {
-    if !app.composer_is_blank() {
-        return Line::from(vec![
-            Span::styled("composer target ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                app.composer_target().label(),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" · draft Enter ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                composer_enter_status_text(app),
-                Style::default().fg(Color::Green),
-            ),
-            Span::styled(
-                " · row selection waits until composer is blank",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]);
-    }
-
-    if let Some(row) = app
-        .selected_panel_row()
-        .filter(|row| row.is_ticket_action())
-    {
-        let action = row
-            .next_action
-            .map(|action| panel_ticket_action_label(row, action))
-            .unwrap_or("View");
-        let mut spans = vec![
-            Span::styled("composer target ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                app.composer_target().label(),
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" · selected Ticket ", Style::default().fg(Color::DarkGray)),
-            Span::styled(row.status.clone(), panel_priority_style(row.priority)),
-            Span::styled(" · blank Enter ", Style::default().fg(Color::DarkGray)),
-            Span::styled(action, Style::default().fg(Color::Magenta)),
-        ];
-        if let Some(reason) = panel_ticket_reason(row) {
-            spans.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
-            spans.push(Span::styled(
-                truncate_with_ellipsis(reason, 100),
-                ticket_detail_style(row),
-            ));
-        }
-        Line::from(spans)
-    } else if let Some(row) = app
-        .selected_panel_row()
-        .filter(|row| row.kind == PanelRowKind::TicketIntakePod)
-    {
-        let ticket_id = panel_ticket_reference(row);
-        let action = if row.next_action == Some(NextUserAction::OpenPod) {
-            "open/attach"
-        } else {
-            "unavailable"
-        };
-        Line::from(vec![
-            Span::styled("composer target ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                app.composer_target().label(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " · selected Intake Pod ",
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(row.status.clone(), intake_status_style(&row.status)),
-            Span::styled(
-                format!(" · Ticket {ticket_id} · blank Enter {action}"),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])
-    } else if let Some(entry) = app.selected_pod_entry() {
-        let (status, status_style) = row_status_label(entry);
-        Line::from(vec![
-            Span::styled("composer target ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                app.composer_target().label(),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" · selected Pod ", Style::default().fg(Color::DarkGray)),
-            Span::styled(status.to_string(), status_style),
-            Span::styled(
-                " · blank Enter open/attach",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled("composer target ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                app.composer_target().label(),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(
-                " · no row selected · ↑/↓ selects a row",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])
-    }
+pub(super) fn target_status_line(_app: &DashboardApp) -> Line<'static> {
+    Line::from(Span::raw(""))
 }
 
 pub(super) fn draw_input(frame: &mut Frame<'_>, render: &crate::input::InputRender, area: Rect) {
@@ -817,103 +700,6 @@ pub(super) fn draw_input(frame: &mut Frame<'_>, render: &crate::input::InputRend
     }
 }
 
-pub(super) fn composer_enter_status_text(app: &DashboardApp) -> String {
-    match app.composer_target() {
-        ComposerTarget::Companion => companion_enter_status_text(app),
-        ComposerTarget::TicketIntake
-            if app.selected_ticket_action() == Some(NextUserAction::Queue) =>
-        {
-            "return selected ready Ticket to planning".to_string()
-        }
-        ComposerTarget::TicketIntake => "launch Intake with composer text".to_string(),
-    }
-}
-
-pub(super) fn composer_enter_actionbar_text(app: &DashboardApp) -> String {
-    match app.composer_target() {
-        ComposerTarget::Companion => companion_enter_actionbar_text(app),
-        ComposerTarget::TicketIntake if app.selected_ticket_action() == Some(NextUserAction::Queue) => {
-            "Ticket Intake target: Enter records instructions and returns selected ready Ticket to planning".to_string()
-        }
-        ComposerTarget::TicketIntake => {
-            "Ticket Intake target: Enter launches Intake with composer text".to_string()
-        }
-    }
-}
-
-pub(super) fn companion_enter_status_text(app: &DashboardApp) -> String {
-    match companion_send_availability(app) {
-        CompanionSendAvailability::Ready => "send composer text to workspace Companion".to_string(),
-        CompanionSendAvailability::Unavailable(reason) => format!("keep draft; {reason}"),
-    }
-}
-
-pub(super) fn companion_enter_actionbar_text(app: &DashboardApp) -> String {
-    match companion_send_availability(app) {
-        CompanionSendAvailability::Ready => {
-            "Companion target: Enter sends composer text to workspace Companion".to_string()
-        }
-        CompanionSendAvailability::Unavailable(reason) => {
-            format!("Companion target: Enter keeps draft; {reason}")
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum CompanionSendAvailability {
-    Ready,
-    Unavailable(String),
-}
-
-pub(super) fn companion_send_availability(app: &DashboardApp) -> CompanionSendAvailability {
-    let Some(companion) = app.panel.header.companion.as_ref() else {
-        return CompanionSendAvailability::Unavailable(
-            "workspace Companion is unavailable".to_string(),
-        );
-    };
-    if matches!(
-        companion.status,
-        CompanionPanelStatus::Unavailable
-            | CompanionPanelStatus::Missing
-            | CompanionPanelStatus::Stopped
-    ) {
-        return CompanionSendAvailability::Unavailable(format!(
-            "workspace Companion is {}",
-            companion.status.label()
-        ));
-    }
-    let Some(entry) = app
-        .list
-        .entries
-        .iter()
-        .find(|entry| entry.name == companion.pod_name)
-    else {
-        return CompanionSendAvailability::Unavailable(format!(
-            "workspace Companion `{}` is not in the Pod list",
-            companion.pod_name
-        ));
-    };
-    let Some(live) = entry.live.as_ref() else {
-        return CompanionSendAvailability::Unavailable(format!(
-            "workspace Companion `{}` is stopped",
-            companion.pod_name
-        ));
-    };
-    if !live.reachable {
-        return CompanionSendAvailability::Unavailable(format!(
-            "workspace Companion `{}` is unreachable",
-            companion.pod_name
-        ));
-    }
-    if live.status == Some(PodStatus::Running) {
-        return CompanionSendAvailability::Unavailable(format!(
-            "workspace Companion `{}` is running",
-            companion.pod_name
-        ));
-    }
-    CompanionSendAvailability::Ready
-}
-
 pub(super) fn actionbar_left_text(app: &DashboardApp) -> String {
     if app.sending && app.composer_target() == ComposerTarget::TicketIntake {
         "launching Ticket Intake…".to_string()
@@ -927,52 +713,20 @@ pub(super) fn actionbar_left_text(app: &DashboardApp) -> String {
             Some(notice) => format!("{notice} Refreshing workspace…"),
             None => "Refreshing workspace…".to_string(),
         }
-    } else if !app.composer_is_blank() {
-        composer_enter_actionbar_text(app)
     } else if let Some(notice) = app.notice.as_deref() {
         notice.to_string()
-    } else if let Some(reason) = app.selected_open_disabled_reason() {
-        reason
     } else {
-        match app.composer_target() {
-            ComposerTarget::Companion => {
-                "Composer target: Companion; type text to send, or use ↑/↓ then blank Enter for rows"
-                    .to_string()
-            }
-            ComposerTarget::TicketIntake => {
-                if app.selected_ticket_action() == Some(NextUserAction::Queue) {
-                    "Composer target: Ticket Intake; text + Enter returns selected ready Ticket to planning".to_string()
-                } else {
-                    "Composer target: Ticket Intake; type a request, then Enter launches Intake".to_string()
-                }
-            }
-        }
+        String::new()
     }
 }
 
 pub(super) fn actionbar_right_text(app: &DashboardApp) -> &'static str {
     if app.panel_diagnostic_open {
-        "F2/Esc close details  Ctrl+C quit"
+        "F2/Esc close details"
     } else if app.panel_diagnostic.is_some() {
-        "F2 details  ↑/↓ select row  Enter selected row  Tab target  Esc clear selection  Left/Right cursor  Ctrl+C quit"
-    } else if !app.composer_is_blank() {
-        if app
-            .panel
-            .composer
-            .is_available(ComposerTarget::TicketIntake)
-        {
-            "↑/↓ draft lines  Left/Right cursor  Enter composer target  Tab target  Esc clear selection  Ctrl+C quit"
-        } else {
-            "↑/↓ draft lines  Left/Right cursor  Enter composer target  Esc clear selection  Ctrl+C quit"
-        }
-    } else if app
-        .panel
-        .composer
-        .is_available(ComposerTarget::TicketIntake)
-    {
-        "↑/↓ select row  Enter selected row  Tab target  Esc clear selection  Left/Right cursor  Ctrl+C quit"
+        "F2 details"
     } else {
-        "↑/↓ select row  Enter selected row  Esc clear selection  Left/Right cursor  Ctrl+C quit"
+        ""
     }
 }
 

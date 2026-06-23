@@ -126,3 +126,267 @@ Next action:
 - Wait for Coder implementation report, then spawn Reviewer read-only for the implementation diff。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T06:09:42Z -->
+
+## Implementation report
+
+Coder implementation report received from `yoi-coder-00001KVSEBF56`.
+
+Implementation commit:
+- `a13fb693 protocol: generate workspace TypeScript types`
+
+Changed areas:
+- `crates/protocol`
+  - Made `stream` optional behind default feature `stream`。
+  - Added optional `typescript` feature using `ts-rs`。
+  - Added `cfg_attr(feature = "typescript", derive(ts_rs::TS))` to protocol DTOs。
+  - Added deterministic generator module and example:
+    - `crates/protocol/src/typescript.rs`
+    - `crates/protocol/examples/generate_typescript.rs`
+  - Added drift check:
+    - `cargo test -p protocol --features typescript generated_protocol_types_are_current`
+- `web/workspace`
+  - Added generated TypeScript artifact:
+    - `web/workspace/src/lib/generated/protocol.ts`
+  - Re-exported generated root protocol types from workspace sidebar types:
+    - `PodProtocolMethod`
+    - `PodProtocolEvent`
+    - `PodProtocolSegment`
+- `crates/workspace-server`
+  - Updated extension-point notes to explicitly preserve no direct browser-to-Pod socket exposure and require future Workspace-server proxy enforcement of Worker identity / method allow-block boundaries。
+- Packaging/dependencies:
+  - Updated `Cargo.lock`。
+  - Updated `package.nix` `cargoHash`。
+
+Coder validation reported:
+- `cargo fmt --check`: passed
+- `cargo test -p protocol`: passed
+- `cargo test -p protocol --features typescript generated_protocol_types_are_current`: passed
+- `cargo test -p protocol --features typescript`: passed
+- `cargo check -p protocol --target wasm32-unknown-unknown --no-default-features`: passed
+- `cd web/workspace && deno task check && deno task build`: passed
+- `cargo run -p yoi -- ticket doctor`: passed
+- `git diff --check`: passed
+- `nix build .#yoi --no-link`: passed
+
+Generated artifact cleanup:
+- Only intended generated TypeScript import artifact is tracked。
+- Orchestrator removed ignored `web/workspace/node_modules/` before Reviewer routing; no ignored frontend artifacts remain under `web/workspace`。
+
+Orchestrator evidence checked:
+- Worktree clean on `impl/00001KVSEBF56-protocol-typescript-types` at `a13fb693`。
+- Diff `746c51c7..HEAD` touches expected protocol/frontend/workspace-server/package files only。
+- `git diff --check 746c51c7..HEAD`: passed。
+
+Next action:
+- Route to read-only Reviewer Pod for acceptance review。
+
+---
+
+<!-- event: comment author: yoi-orchestrator at: 2026-06-23T06:10:31Z -->
+
+## Comment
+
+Review routing:
+
+Spawned read-only Reviewer Pod:
+- `yoi-reviewer-00001KVSEBF56-r1`
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVSEBF56-protocol-typescript-types`
+- Branch: `impl/00001KVSEBF56-protocol-typescript-types`
+- Baseline: `746c51c7`
+- Implementation commit: `a13fb693 protocol: generate workspace TypeScript types`
+- Diff: `746c51c7..a13fb693`
+
+Reviewer scope:
+- read-only `/home/hare/Projects/yoi`
+
+Reviewer focus:
+- Generated TS shape vs serde wire shape。
+- `Method` / `Event` / `Segment` coverage。
+- Deterministic drift check。
+- `stream` feature gating and wasm/no-default protocol compile。
+- No direct browser-to-Pod socket implication。
+- Package/Nix updates。
+
+Orchestrator will wait for reviewer verdict before integration。
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KVSEBF56-r1 at: 2026-06-23T06:16:54Z status: approve -->
+
+## Review: approve
+
+Verdict: `approve`
+
+確認範囲:
+- Ticket authority:
+  - `.yoi/tickets/00001KVSEBF56/item.md`
+  - `.yoi/tickets/00001KVSEBF56/thread.md`
+- Diff `746c51c7..a13fb693`:
+  - `crates/protocol/Cargo.toml`
+  - `crates/protocol/src/lib.rs`
+  - `crates/protocol/src/typescript.rs`
+  - `crates/protocol/examples/generate_typescript.rs`
+  - `web/workspace/src/lib/generated/protocol.ts`
+  - `web/workspace/src/lib/workspace-sidebar/types.ts`
+  - `crates/workspace-server/src/server.rs`
+  - `Cargo.lock`
+  - `package.nix`
+
+Blocking issues:
+- None。
+
+Non-blocking concerns:
+- `cargo test -p protocol --features typescript` emits `ts-rs` warnings for `#[serde(other)]` on `Segment::Unknown`: `ts-rs failed to parse this attribute. It will be ignored.` The generated artifact still includes `{ "kind": "unknown" }`, and this does not break current validation, but TS generator is not fully understanding serde fallback semantics。
+- Some `Option<T>` fields with `skip_serializing_if = "Option::is_none"` are generated as required nullable rather than optional nullable, e.g. `RewindTarget.disabled_reason: string | null` and `warning: string | null`. Acceptable for this initial generated-types ticket, but future UI code should be careful because runtime JSON may omit those fields。
+
+Review findings:
+- `crates/protocol` remains Rust DTO authority。
+- `stream` is now an optional default feature:
+  - `default = ["stream"]`
+  - `stream = ["dep:tokio"]`
+  - `tokio` is optional。
+- DTO-only/no-default protocol build compiles for wasm without `tokio`。
+- `typescript` feature is optional and uses `ts-rs`。
+- Generated TS root includes `Method`, `Event`, `Segment`, plus related DTOs such as `PodEvent`, `ScopeRule`, `Greeting`, `InFlight*`, rewind DTOs, completion DTOs, status/result/error enums。
+- Generated TS file is committed at `web/workspace/src/lib/generated/protocol.ts`。
+- Workspace web re-exports generated root protocol types as `PodProtocolMethod`, `PodProtocolEvent`, and `PodProtocolSegment`。
+- Generated TS tagged enums and casing match observed serde wire shape for critical roots:
+  - `Method`: `{ "method": "...", "params": ... }`
+  - `Event`: `{ "event": "...", "data": ... }`
+  - `Segment` / `PodEvent` / `InFlightBlock`: internal `"kind"` tags with snake_case variants。
+- Drift check `generated_protocol_types_are_current` compares committed generated artifact to deterministic generator output。
+- Backend proxy stance is represented in Workspace API extension-point notes and does not add direct browser-to-Pod socket access or broad Worker operation UI。
+
+Reviewer validation:
+- `cargo fmt --check`: passed
+- `git diff --check 746c51c7..HEAD`: passed
+- `cargo test -p protocol`: passed (`40 passed`)
+- `cargo test -p protocol --features typescript generated_protocol_types_are_current`: passed; emitted non-blocking `ts-rs` warning for `serde(other)`。
+- `cargo test -p protocol --features typescript`: passed (`41 passed`); emitted same non-blocking warning。
+- `cargo check -p protocol --target wasm32-unknown-unknown --no-default-features`: passed
+- `cd web/workspace && deno task check && deno task build`: passed (`svelte-check found 0 errors and 0 warnings`; build succeeded)
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+
+Generated artifact status:
+- `web/workspace/src/lib/generated/protocol.ts` remained unchanged after validation。
+- SHA-256 after validation: `3984a043ded1179545656e5402171c49b2d22b5529aa17f016b675e394b7e553`。
+
+Worktree status:
+- Clean on `impl/00001KVSEBF56-protocol-typescript-types` at `a13fb693`。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T06:20:49Z -->
+
+## Implementation report
+
+Reviewer r1 approvalを受けて、実装ブランチを Orchestrator worktree の `orchestration` branch に統合した。
+
+統合:
+- Merge commit: `9728b533 merge: protocol typescript generation`
+- Merged branch: `impl/00001KVSEBF56-protocol-typescript-types`
+- Implementation commit:
+  - `a13fb693 protocol: generate workspace TypeScript types`
+
+Orchestrator worktree validation:
+- `cargo fmt --check`: passed
+- `git diff --check HEAD^1..HEAD`: passed
+- `cargo test -p protocol`: passed
+- `cargo test -p protocol --features typescript generated_protocol_types_are_current`: passed
+- `cargo test -p protocol --features typescript`: passed
+  - Non-blocking `ts-rs` warning for `#[serde(other)]` on `Segment::Unknown` remains as reviewer noted。
+- `cargo check -p protocol --target wasm32-unknown-unknown --no-default-features`: passed
+- `cd web/workspace && rm -rf node_modules .svelte-kit build && deno task check`: passed (`svelte-check found 0 errors and 0 warnings`)
+- `cd web/workspace && deno task build`: passed
+- `cargo run -p yoi -- ticket doctor`: passed (`doctor: ok`)
+- `nix build .#yoi --no-link`: passed
+
+Validation generated ignored frontend artifacts in Orchestrator worktree:
+- `web/workspace/node_modules/`
+- `web/workspace/.svelte-kit/`
+- `web/workspace/build/`
+
+These were removed after validation. Final Orchestrator worktree status after validation cleanup is clean on `orchestration` at `9728b533`。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-23T06:21:01Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Reviewer approval、Orchestrator worktree への統合、protocol tests/drift check/wasm no-default check、Deno check/build、Ticket doctor、Nix build が完了したため `done` に遷移する。
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-23T06:21:19Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-23T06:21:19Z status: closed -->
+
+## 完了
+
+Protocol crate 由来の Workspace web TypeScript type generation を実装し、Orchestrator worktree の `orchestration` branch に統合した。
+
+主な成果:
+- `crates/protocol` の `stream` module / tokio dependency を default `stream` feature に分離し、DTO-only build で tokio を不要にした。
+- Optional `typescript` feature と `ts-rs` による TypeScript export を追加。
+- Protocol DTOs に `cfg_attr(feature = "typescript", derive(ts_rs::TS))` を追加。
+- Deterministic generator を追加:
+  - `crates/protocol/src/typescript.rs`
+  - `crates/protocol/examples/generate_typescript.rs`
+- Drift check を追加:
+  - `cargo test -p protocol --features typescript generated_protocol_types_are_current`
+- Generated artifact を追加:
+  - `web/workspace/src/lib/generated/protocol.ts`
+- Workspace web が generated root protocol types を re-export:
+  - `PodProtocolMethod`
+  - `PodProtocolEvent`
+  - `PodProtocolSegment`
+- Workspace backend extension-point notes に、browser が Pod Unix socket に直接接続せず、将来の backend proxy が Worker identity と method allow/block boundary を enforce する方針を記録。
+- `Cargo.lock` と `package.nix` cargo hash を更新。
+
+統合・検証:
+- Merge commit: `9728b533 merge: protocol typescript generation`
+- Implementation commit: `a13fb693 protocol: generate workspace TypeScript types`
+- Reviewer final verdict: approve
+- Validation passed: `cargo fmt --check`, `git diff --check HEAD^1..HEAD`, `cargo test -p protocol`, `cargo test -p protocol --features typescript generated_protocol_types_are_current`, `cargo test -p protocol --features typescript`, `cargo check -p protocol --target wasm32-unknown-unknown --no-default-features`, `deno task check`, `deno task build`, `cargo run -p yoi -- ticket doctor`, and `nix build .#yoi --no-link`。
+
+既知の非ブロッキング事項:
+- `ts-rs` は `#[serde(other)]` on `Segment::Unknown` に warning を出すが、generated artifact には `{ "kind": "unknown" }` が含まれ、current validation は pass。
+- 一部 `Option<T>` + `skip_serializing_if` fields は TS で optional field ではなく required nullable に出る。将来 UI が該当 field を使う際は注意。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T06:22:01Z -->
+
+## Implementation report
+
+Post-close cleanup completed。
+
+- Stopped child Pods and reclaimed scope:
+  - `yoi-coder-00001KVSEBF56`
+  - `yoi-reviewer-00001KVSEBF56-r1`
+- Removed ignored frontend validation artifacts from child worktree before worktree removal if present:
+  - `web/workspace/node_modules/`
+  - `web/workspace/.svelte-kit/`
+  - `web/workspace/build/`
+- Removed implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KVSEBF56-protocol-typescript-types`
+- Deleted implementation branch:
+  - `impl/00001KVSEBF56-protocol-typescript-types`
+- Orchestrator worktree remains clean on `orchestration` at `b547203f`。
+
+Root/original workspace was not used for merge/validation/cleanup operations。
+
+---

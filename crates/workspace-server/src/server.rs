@@ -250,11 +250,11 @@ async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<Worksp
             store: "sqlite".to_string(),
             event_stream: ExtensionPointState {
                 status: "reserved".to_string(),
-                note: "No event stream is exposed in this bootstrap; route/state seams are reserved.".to_string(),
+                note: "No browser-to-Pod socket path is exposed in this bootstrap; any future stream must be a Workspace server proxy that resolves Worker identity and enforces method allow/block boundaries.".to_string(),
             },
             host_worker_bridge: ExtensionPointState {
                 status: "read_only_local".to_string(),
-                note: "Local Hosts and Workers are exposed as a read-only bridge over existing Pod metadata; no scheduling or lifecycle control is implemented.".to_string(),
+                note: "Local Hosts and Workers are exposed as a read-only bridge over existing Pod metadata; no direct Pod socket, scheduling, or lifecycle control is implemented.".to_string(),
             },
         },
     }))

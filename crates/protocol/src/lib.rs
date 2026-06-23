@@ -1,4 +1,7 @@
+#[cfg(feature = "stream")]
 pub mod stream;
+#[cfg(feature = "typescript")]
+pub mod typescript;
 
 use std::path::PathBuf;
 
@@ -21,6 +24,7 @@ fn is_false(value: &bool) -> bool {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Method {
     Run {
@@ -103,6 +107,7 @@ pub enum Method {
 /// delivery (e.g. `TurnEnded` arriving after `ShutDown` for the same
 /// child Pod).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PodEvent {
     /// Child finished one turn and is back to IDLE.
@@ -175,6 +180,7 @@ impl PodEvent {
 /// placeholder into the LLM context so neither user nor LLM is blind to
 /// the dropped intent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Segment {
     /// Free-form text. The fallback every client can produce.
@@ -266,6 +272,7 @@ impl Method {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum Event {
     /// A user input message was accepted, persisted as
@@ -294,6 +301,7 @@ pub enum Event {
     /// One event per `LogEntry::SystemItem` commit. Disk-side and
     /// wire-side are 1:1.
     SystemItem {
+        #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
         item: serde_json::Value,
     },
     /// A new self-driving cycle has begun (IDLE → active transition).
@@ -453,6 +461,7 @@ pub enum Event {
     /// role-specific entry events (`SegmentRotated` / `SystemItem`) —
     /// there is no generic "every committed entry" broadcast.
     Snapshot {
+        #[cfg_attr(feature = "typescript", ts(type = "Array<unknown>"))]
         entries: Vec<serde_json::Value>,
         greeting: Greeting,
         #[serde(default)]
@@ -471,6 +480,7 @@ pub enum Event {
     ///
     /// Payload is the JSON form of `session_store::LogEntry::SegmentStart`.
     SegmentRotated {
+        #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
         entry: serde_json::Value,
     },
     /// Current Pod controller status. Broadcast on every controller-level
@@ -495,6 +505,7 @@ pub enum Event {
     /// A rewind has truncated the authoritative session. `entries` is the
     /// retained session-log prefix clients should use to reseed display state.
     RewindApplied {
+        #[cfg_attr(feature = "typescript", ts(type = "Array<unknown>"))]
         entries: Vec<serde_json::Value>,
         input: Vec<Segment>,
         summary: RewindSummary,
@@ -503,14 +514,17 @@ pub enum Event {
     /// crate can evolve discovery fields without introducing a protocol
     /// dependency on session-store.
     PodsListed {
+        #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
         pods: serde_json::Value,
     },
     /// Reply to `Method::RestorePod`.
     PodRestored {
+        #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
         result: serde_json::Value,
     },
     /// Reply to `Method::RegisterPeer`.
     PeerRegistered {
+        #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
         result: serde_json::Value,
     },
     Alert(Alert),
@@ -530,6 +544,7 @@ pub enum Event {
     /// `new_segment_id` is the UUID of the freshly created session that
     /// replaced the old history.
     CompactDone {
+        #[cfg_attr(feature = "typescript", ts(type = "string"))]
         new_segment_id: uuid::Uuid,
     },
     /// Compaction failed. The session is unchanged.
@@ -546,6 +561,7 @@ pub enum Event {
 /// surfaced to the person driving the client. Keep messages short and
 /// human-readable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct Alert {
     pub level: AlertLevel,
     pub source: AlertSource,
@@ -555,6 +571,7 @@ pub struct Alert {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct MemoryWorkerEvent {
     pub worker: String,
     pub status: String,
@@ -568,6 +585,7 @@ pub struct MemoryWorkerEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum AlertLevel {
     Warn,
@@ -575,6 +593,7 @@ pub enum AlertLevel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum AlertSource {
     Pod,
@@ -591,6 +610,7 @@ pub enum AlertSource {
 /// nailed down here so the TUI side can ship without waiting for
 /// the memory / workflow tickets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum CompletionKind {
     File,
@@ -605,6 +625,7 @@ pub enum CompletionKind {
 /// keep a trailing `/` after a directory selection so the user can
 /// drill in without re-typing the prefix.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct CompletionEntry {
     pub value: String,
     #[serde(default)]
@@ -612,12 +633,15 @@ pub struct CompletionEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct RewindTargetId {
+    #[cfg_attr(feature = "typescript", ts(type = "string"))]
     pub segment_id: uuid::Uuid,
     pub user_input_entry_index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct RewindTarget {
     pub id: RewindTargetId,
     pub expected_head_entries: usize,
@@ -633,6 +657,7 @@ pub struct RewindTarget {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct RewindSummary {
     pub truncated_to_entries: usize,
     pub discarded_entries: usize,
@@ -647,6 +672,7 @@ pub struct RewindSummary {
 /// history. Finalized assistant items continue to come from ordinary snapshot
 /// entries.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct InFlightSnapshot {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<InFlightBlock>,
@@ -659,6 +685,7 @@ impl InFlightSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InFlightBlock {
     Text {
@@ -681,6 +708,7 @@ pub enum InFlightBlock {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum InFlightToolCallState {
     #[default]
@@ -701,6 +729,7 @@ impl InFlightToolCallState {
 /// transmitted alongside `Event::Snapshot` so clients don't need
 /// their own view of the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct Greeting {
     pub pod_name: String,
     pub cwd: String,
@@ -721,6 +750,7 @@ pub struct Greeting {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum PodStatus {
     #[default]
@@ -730,6 +760,7 @@ pub enum PodStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum TurnResult {
     Finished,
@@ -743,6 +774,7 @@ pub enum TurnResult {
 /// notify message, pod event body) is delivered by the immediately
 /// following Turn entry, not by the marker itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum InvokeKind {
     /// `Method::Run` — a user submission.
@@ -762,6 +794,7 @@ pub enum InvokeKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum RunResult {
     Finished,
@@ -775,6 +808,7 @@ pub enum RunResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     AlreadyRunning,
@@ -796,6 +830,7 @@ pub enum ErrorCode {
 
 /// A single allow or deny rule inside a scope configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct ScopeRule {
     /// Target path. Must be absolute by the time a `Scope` is built from
     /// this rule — relative paths are resolved per-layer against the
@@ -822,6 +857,7 @@ fn default_recursive() -> bool {
 /// everything below); deny rules cap the effective level **strictly
 /// below** the stated level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "lowercase")]
 pub enum Permission {
     Read,

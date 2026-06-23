@@ -1,3 +1,9 @@
+export type {
+  Event as PodProtocolEvent,
+  Method as PodProtocolMethod,
+  Segment as PodProtocolSegment,
+} from '$lib/generated/protocol';
+
 export type ExtensionPoint = {
   status: string;
   note: string;

@@ -1437,31 +1437,6 @@ impl DashboardApp {
         }
     }
 
-    pub(crate) fn selected_open_disabled_reason(&self) -> Option<String> {
-        if let Some(row) = self
-            .selected_panel_row()
-            .filter(|row| row.is_ticket_action())
-        {
-            return Some(
-                row.disabled_reason
-                    .clone()
-                    .or_else(|| row.key_hint.clone())
-                    .unwrap_or_else(|| {
-                        "Enter dispatches this Ticket action after re-checking current Ticket authority."
-                            .to_string()
-                    }),
-            );
-        }
-        if let Some(entry) = self.selected_pod_entry() {
-            if entry.actions.can_open {
-                return None;
-            }
-            return Some(open_disabled_reason(entry));
-        }
-        self.selected_panel_row()
-            .and_then(|row| row.disabled_reason.clone().or_else(|| row.key_hint.clone()))
-    }
-
     pub(crate) fn select_next(&mut self) {
         let visible = visible_panel_keys(&self.panel, &self.list);
         if visible.is_empty() {
@@ -5035,33 +5010,6 @@ fn segments_are_blank(segments: &[Segment]) -> bool {
         Segment::Text { content } => content.trim().is_empty(),
         _ => false,
     })
-}
-
-fn open_disabled_reason(entry: &PodListEntry) -> String {
-    if let Some(live) = entry.live.as_ref() {
-        if !live.reachable {
-            return "Selected live Pod is unreachable.".to_string();
-        }
-        return match live.status {
-            Some(PodStatus::Running) => {
-                "Selected Pod is running; Enter opens/attaches for inspection.".to_string()
-            }
-            Some(PodStatus::Paused) => {
-                "Selected Pod is paused; open it explicitly to resume or start a new turn."
-                    .to_string()
-            }
-            Some(PodStatus::Idle) => "Selected Pod can be opened/attached.".to_string(),
-            None => "Selected Pod did not report a live status.".to_string(),
-        };
-    }
-    if entry.stored.is_some() {
-        return "Selected Pod is stopped; Enter restores/opens for inspection.".to_string();
-    }
-    entry
-        .actions
-        .disabled_reason
-        .clone()
-        .unwrap_or_else(|| "Selected Pod cannot be opened from this row.".to_string())
 }
 
 fn selected_ticket_notice(row: Option<&PanelRow>) -> String {
