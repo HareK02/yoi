@@ -6050,6 +6050,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "chrono",
  "manifest",
  "pod-store",
  "project-record",
@@ -6061,8 +6062,10 @@ dependencies = [
  "thiserror 2.0.18",
  "ticket",
  "tokio",
+ "toml",
  "tower",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

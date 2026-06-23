@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::hosts::RuntimeDiagnostic;
 
-const LOCAL_REPOSITORY_ID: &str = "local";
+const LEGACY_LOCAL_REPOSITORY_ID: &str = "local";
+const LOCAL_REPOSITORY_PREFIX: &str = "local-";
 const MAX_COMMAND_OUTPUT: usize = 4096;
 const DEFAULT_LOG_LIMIT: usize = 10;
 const MAX_LOG_LIMIT: usize = 50;
@@ -14,12 +15,14 @@ const MAX_FIELD_LEN: usize = 240;
 #[derive(Debug, Clone)]
 pub struct LocalRepositoryReader {
     workspace_root: PathBuf,
+    workspace_id: String,
 }
 
 impl LocalRepositoryReader {
-    pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+    pub fn new(workspace_root: impl Into<PathBuf>, workspace_id: impl Into<String>) -> Self {
         Self {
             workspace_root: workspace_root.into(),
+            workspace_id: workspace_id.into(),
         }
     }
 
@@ -30,7 +33,7 @@ impl LocalRepositoryReader {
     pub fn summary(&self, workspace_display_name: &str) -> RepositorySummary {
         let git = inspect_git(&self.workspace_root);
         RepositorySummary {
-            id: LOCAL_REPOSITORY_ID.to_string(),
+            id: Self::repository_id_for_workspace(&self.workspace_id),
             display_name: workspace_display_name.to_string(),
             kind: "local".to_string(),
             workspace_root: self.workspace_root.clone(),
@@ -46,8 +49,42 @@ impl LocalRepositoryReader {
         git_log(&self.workspace_root, limit)
     }
 
-    pub fn is_local_repository_id(id: &str) -> bool {
-        id == LOCAL_REPOSITORY_ID
+    pub fn repository_id_for_workspace(workspace_id: &str) -> String {
+        format!(
+            "{LOCAL_REPOSITORY_PREFIX}{}",
+            sanitize_identifier_fragment(workspace_id)
+        )
+    }
+
+    pub fn is_local_repository_id(id: &str, workspace_id: &str) -> bool {
+        id == LEGACY_LOCAL_REPOSITORY_ID || id == Self::repository_id_for_workspace(workspace_id)
+    }
+}
+
+fn sanitize_identifier_fragment(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut previous_dash = false;
+    for ch in value.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+        if mapped == '-' {
+            if !previous_dash {
+                output.push(mapped);
+            }
+            previous_dash = true;
+        } else {
+            output.push(mapped);
+            previous_dash = false;
+        }
+    }
+    let output = output.trim_matches('-').to_string();
+    if output.is_empty() {
+        "workspace".to_string()
+    } else {
+        output
     }
 }
 
