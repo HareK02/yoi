@@ -141,3 +141,33 @@ Critical risks / reviewer focus:
 - tests が実際に app status を Paused に更新した状態をカバーしているか。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-23T13:37:51Z -->
+
+## Implementation report
+
+Implementation report
+
+Worktree / branch:
+- `/home/hare/Projects/yoi/.worktree/00001KVSMJJNV-paused-ctrlx-cancel`
+- `work/00001KVSMJJNV-paused-ctrlx-cancel`
+
+Commit:
+- `90b1a1fc tui: cancel paused turns with ctrl-x`
+
+Implemented changes:
+- `crates/tui/src/console/mod.rs`: `Ctrl+X` key handling を Paused 状態でも cancel path に乗せ、Idle の shutdown behavior と分離。
+- `crates/tui/src/ui.rs`: Paused UI hint を cancel 操作に合わせて更新。
+- `crates/pod/src/controller.rs` / `crates/pod/src/pod.rs`: Paused 状態の `Method::Cancel` を `NotRunning` ではなく paused turn cancel として処理し、resume 可能な interrupted state を破棄して次入力を fresh run として扱う経路を追加。
+- `crates/pod/tests/controller_test.rs`: Paused cancel 後に resume されず、次入力が fresh run になることを確認する focused test を追加。
+
+Validation run by Orchestrator:
+- `cargo test -p tui ctrl_x -- --nocapture`
+- `cargo test -p pod paused_cancel_abandons_resume_and_next_input_is_fresh_run -- --nocapture`
+- `git diff --check`
+- `cargo fmt --check`
+
+Next:
+- Reviewer Pod に recorded IntentPacket と commit diff を基準に review を依頼する。
+
+---
