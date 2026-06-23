@@ -175,3 +175,34 @@ Next action:
 - Route to read-only Reviewer Pod for acceptance review。
 
 ---
+
+<!-- event: comment author: yoi-orchestrator at: 2026-06-23T06:06:45Z -->
+
+## Comment
+
+Review routing:
+
+Spawned read-only Reviewer Pod:
+- `yoi-reviewer-00001KVSGFM65-r1`
+
+Review target:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVSGFM65-kanban-lazy-rows`
+- Branch: `impl/00001KVSGFM65-kanban-lazy-rows`
+- Baseline: `a6f9019e`
+- Implementation commit: `6f68bb8d web: group repository ticket kanban rows`
+- Diff: `a6f9019e..6f68bb8d`
+
+Reviewer scope:
+- read-only `/home/hare/Projects/yoi`
+
+Reviewer focus:
+- Display grouping/sort order: `ready > planning`, `inprogress > queued`。
+- Per-group independent visible count and scroll expansion。
+- High-volume `closed` bounded by group scroll area。
+- Original Ticket state visible per row。
+- Component boundary and design-token styling。
+- No backend/lifecycle/protocol scope creep。
+
+Orchestrator will wait for reviewer verdict before integration。
+
+---
