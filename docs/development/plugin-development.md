@@ -25,7 +25,7 @@ Keep these layers separate when designing a Plugin. Do not make package discover
 
 Yoi's preferred Plugin shape is **Tool first**. A good Tool Plugin has a narrow schema, deterministic input/output behavior, explicit side-effect metadata, and a minimal grant set. Long-running services, inbound events, and autonomous routing are future Service/Ingress work; they should not be hidden inside a Tool package.
 
-Component Model authoring is the preferred path for new Plugins. The raw core-Wasm ABI exists for compatibility and tests, but authors should use the Rust PDK/template unless they are deliberately testing the low-level runtime.
+Component Model authoring is the supported path for Plugins. Legacy raw core-Wasm manifests (`kind = "wasm"` / `abi = "yoi-plugin-wasm-1"`) are retired and rejected by `yoi plugin check`, discovery, `list`, and `show`; use the Rust PDK/template and `kind = "wasm-component"` instead.
 
 ## Current status
 
@@ -35,7 +35,6 @@ Implemented foundation:
 - explicit enablement resolution;
 - Tool surface registration;
 - Plugin permission grants;
-- raw core-Wasm Tool runtime;
 - Component Model Tool runtime;
 - first-party Rust PDK helpers for Component Model Tool guests;
 - embedded Rust Component Tool starter template;
@@ -152,20 +151,13 @@ input_schema = { type = "object", properties = { text = { type = "string" } }, r
 external_write = false
 ```
 
-The preferred new runtime is `wasm-component`. The older raw core-Wasm runtime remains explicit for compatibility:
-
-```toml
-[runtime]
-kind = "wasm"
-entry = "plugin.wasm"
-abi = "yoi-plugin-wasm-1"
-```
+`wasm-component` is the public runtime kind. Legacy raw core-Wasm declarations such as `kind = "wasm"` / `abi = "yoi-plugin-wasm-1"` are no longer compatibility paths: static validation rejects them with a bounded diagnostic and they are not displayed as active/eligible Plugins.
 
 Do not rely on package presence to activate anything. Discovery only records inventory.
 
 ## Rust PDK authoring
 
-Rust authoring with `yoi-plugin-pdk` is the preferred path for new Tool Plugins. The raw core-Wasm ABI remains available only as compatibility/transitional runtime support.
+Rust authoring with `yoi-plugin-pdk` is the supported path for new Tool Plugins. Raw core-Wasm ABI packages are retired and should be rewritten as Component Model packages before enabling.
 
 Create a starter with:
 
@@ -412,4 +404,4 @@ Yoi normalizes paths, rejects `..` traversal, rejects symlink/root escapes, and 
 - Request only the minimal host APIs and grants needed.
 - Keep Tool output bounded and structured.
 - Prefer Component Model authoring for new Plugins.
-- Treat raw core-Wasm ABI support as transitional compatibility.
+- Treat raw core-Wasm ABI support as retired; migration diagnostics may mention it, but authors should publish `wasm-component` packages.

@@ -6,7 +6,7 @@ The initial goal is a durable `.yoi-plugin` package format that later Tickets ca
 
 ## Package shape
 
-A `.yoi-plugin` file is a single-file archive. The initial archive format should be a constrained ZIP profile because it is easy to inspect without executing code and can carry text manifests, WASM modules, schemas, and license material.
+A `.yoi-plugin` file is a single-file archive. The archive format is a constrained ZIP profile because it is easy to inspect without executing code and can carry text manifests, WebAssembly Component Model modules, schemas, and license material.
 
 The archive root must contain `plugin.toml` directly at the root. Packages should not require a wrapping directory whose name must match the plugin id.
 
@@ -14,7 +14,7 @@ Recommended root layout:
 
 ```text
 plugin.toml              # required package manifest
-module.wasm              # optional; required when plugin.toml declares a WASM runtime
+plugin.component.wasm    # required when plugin.toml declares the component runtime
 hooks/*.toml             # optional declarative hook definitions
 schemas/*.schema.json    # optional JSON schemas for configuration or tool input/output
 README.md                # recommended human description
@@ -43,16 +43,7 @@ id = "summary"
 file = "hooks/summary.md"
 ```
 
-The package archive must contain both root `plugin.toml` and the referenced `hooks/summary.md` entry. Optional WASM metadata is accepted only for the declared future runtime boundary and is not executed:
-
-```toml
-[runtime]
-kind = "wasm"
-entry = "plugin.wasm"
-abi = "yoi-plugin-wasm-1"
-```
-
-The preferred WASM authoring/runtime shape is the WebAssembly Component Model, recorded in [Plugin Component Model migration](plugin-component-model.md). Component packages should be explicit and source-compatible rather than silently changing the existing raw core-Wasm runtime:
+The package archive must contain both root `plugin.toml` and referenced runtime/content entries. Component runtime metadata is explicit and static inspection never executes the artifact:
 
 ```toml
 [runtime]
@@ -61,13 +52,15 @@ component = "plugin.component.wasm"
 world = "yoi:plugin/tool@1.0.0"
 ```
 
+`wasm-component` is the public/recommended runtime kind, recorded in [Plugin Component Model migration](plugin-component-model.md). Legacy raw core-Wasm declarations (`kind = "wasm"` / `abi = "yoi-plugin-wasm-1"`) are retired: manifest validation rejects them and CLI inspection reports the package as rejected rather than active/eligible.
+
 First-pass fields accepted by the parser:
 
 - `schema_version`: required integer; unsupported versions fail closed.
 - `id`: required unqualified local id. It is scoped by the source that discovered the package; it is not globally unique by itself.
 - `name`, `version`, `description`: human metadata used in listings and diagnostics.
 - `surfaces`: optional declared contribution surface names.
-- `runtime`: optional WASM metadata only. Discovery records metadata and never executes it.
+- `runtime`: optional component runtime metadata. Discovery records metadata and never executes it; unsupported/retired runtime kinds fail closed.
 - `hooks`: optional hook metadata. Discovery records metadata and does not register hooks.
 
 Future descriptor sections such as `[package]`, `[permissions]`, richer `contributions`, or `runtime.kind = "declarative"` are aspirational and are intentionally rejected by the current strict parser until implemented safely.
@@ -223,17 +216,4 @@ documents a future out-of-tree pinned git `rev` dependency pattern. Crates.io
 publication, remote template fetching, and package authoring commands are not
 part of the current package/runtime contract.
 
-This is separate from the legacy raw core-Wasm runtime:
-
-```toml
-[runtime]
-kind = "wasm"
-entry = "plugin.wasm"
-abi = "yoi-plugin-wasm-1"
-```
-
-Component packages must not use `entry`/`abi`; raw packages must not use
-`component`/`world`. Discovery reports the selected runtime kind/world without
-executing the artifact. Component execution still requires explicit package
-enablement, exact source/version/digest grants, and matching Tool/host API
-permissions.
+Legacy raw core-Wasm metadata remains documented only as a rejected migration diagnostic. Packages must not use `entry`/`abi`; discovery reports `kind = "wasm"` / `abi = "yoi-plugin-wasm-1"` packages as rejected without executing the artifact. Component execution still requires explicit package enablement, exact source/version/digest grants, and matching Tool/host API permissions.
