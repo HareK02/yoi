@@ -15,6 +15,7 @@ client = { workspace = true }
 memory = { workspace = true }
 manifest = { workspace = true }
 pod = { workspace = true }
+pod-store = { workspace = true }
 session-store = { workspace = true }
 session-analytics = { workspace = true }
 ticket = { workspace = true }

@@ -2,6 +2,7 @@ mod mcp_cli;
 mod memory_lint;
 mod objective_cli;
 mod plugin_cli;
+mod pod_cleanup_cli;
 mod session_cli;
 mod ticket_cli;
 
@@ -25,6 +26,7 @@ enum Mode {
     Plugin(plugin_cli::PluginCliCommand),
     Objective(objective_cli::ObjectiveCli),
     Session(session_cli::SessionCli),
+    PodCleanup(pod_cleanup_cli::PodCleanupCli),
     Ticket(ticket_cli::TicketCli),
     WorkspaceHelp,
     WorkspaceServe(Vec<String>),
@@ -117,10 +119,24 @@ async fn main() -> ExitCode {
                 print!("{}", output.stdout);
                 match output.status {
                     session_cli::SessionCliStatus::Success => ExitCode::SUCCESS,
+                    session_cli::SessionCliStatus::Failure => ExitCode::FAILURE,
                 }
             }
             Err(e) => {
                 eprintln!("yoi session: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Mode::PodCleanup(cli) => match pod_cleanup_cli::run(cli).await {
+            Ok(output) => {
+                print!("{}", output.stdout);
+                match output.status {
+                    pod_cleanup_cli::PodCleanupCliStatus::Success => ExitCode::SUCCESS,
+                    pod_cleanup_cli::PodCleanupCliStatus::Failure => ExitCode::FAILURE,
+                }
+            }
+            Err(e) => {
+                eprintln!("yoi pod: {e}");
                 ExitCode::FAILURE
             }
         },
@@ -188,7 +204,14 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
     match args[0].as_str() {
         "--help" | "-h" => return Ok(Mode::Help),
         "resume" => return parse_resume_args(&args[1..]),
-        "pod" => return Ok(Mode::PodRuntime(args[1..].to_vec())),
+        "pod" => {
+            if let Some(cli) = pod_cleanup_cli::parse_pod_management_args(&args[1..])
+                .map_err(|e| ParseError(e.to_string()))?
+            {
+                return Ok(Mode::PodCleanup(cli));
+            }
+            return Ok(Mode::PodRuntime(args[1..].to_vec()));
+        }
         "objective" => {
             let objective_cli = objective_cli::parse_objective_args(&args[1..])
                 .map_err(|e| ParseError(e.to_string()))?;
@@ -878,7 +901,7 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
 
 fn print_help() {
     println!(
-        "yoi\n\nUsage:\n  yoi [OPTIONS]\n  yoi resume [--workspace <PATH>] [--all]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi pod [POD_OPTIONS]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi workspace serve [OPTIONS]\n  yoi plugin new rust-component-tool <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Pod chat/client surface (default, --pod, yoi resume)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n      --workspace <PATH> Runtime workspace root for default Console/--pod (defaults to cwd)\n      --pod <NAME>       Open the Pod Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Pod Console to a specific socket with --pod\n      --session <UUID>   Resume a specific session segment in the Pod Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
+        "yoi\n\nUsage:\n  yoi [OPTIONS]\n  yoi resume [--workspace <PATH>] [--all]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi pod [POD_OPTIONS]\n  yoi pod delete <NAME> [--force] [--dry-run]\n  yoi pod prune --older-than <DURATION> [--force] [--dry-run]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi session prune --unreferenced [--older-than <DURATION>] [--force] [--dry-run]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi workspace serve [OPTIONS]\n  yoi plugin new rust-component-tool <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Pod chat/client surface (default, --pod, yoi resume)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n      --workspace <PATH> Runtime workspace root for default Console/--pod (defaults to cwd)\n      --pod <NAME>       Open the Pod Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Pod Console to a specific socket with --pod\n      --session <UUID>   Resume a specific session segment in the Pod Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
     );
 }
 
@@ -975,6 +998,31 @@ mod tests {
         match parse_args_from(["pod", "--pod", "agent", "--profile", "default"]).unwrap() {
             Mode::PodRuntime(args) => assert_eq!(args, ["--pod", "agent", "--profile", "default"]),
             _ => panic!("expected PodRuntime mode"),
+        }
+    }
+
+    #[test]
+    fn parse_pod_delete_uses_cleanup_mode() {
+        match parse_args_from(["pod", "delete", "agent", "--dry-run"]).unwrap() {
+            Mode::PodCleanup(pod_cleanup_cli::PodCleanupCli::Delete(options)) => {
+                assert_eq!(options.name, "agent");
+                assert!(options.dry_run);
+                assert!(!options.force);
+            }
+            _ => panic!("expected Pod cleanup delete mode"),
+        }
+    }
+
+    #[test]
+    fn parse_pod_prune_uses_cleanup_mode() {
+        match parse_args_from(["pod", "prune", "--older-than", "30d"]).unwrap() {
+            Mode::PodCleanup(pod_cleanup_cli::PodCleanupCli::Prune(options)) => {
+                assert_eq!(
+                    options.older_than,
+                    std::time::Duration::from_secs(30 * 24 * 60 * 60)
+                );
+            }
+            _ => panic!("expected Pod cleanup prune mode"),
         }
     }
 

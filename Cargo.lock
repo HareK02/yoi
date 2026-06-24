@@ -6010,6 +6010,7 @@ dependencies = [
  "manifest",
  "memory",
  "pod",
+ "pod-store",
  "project-record",
  "serde",
  "serde_json",
