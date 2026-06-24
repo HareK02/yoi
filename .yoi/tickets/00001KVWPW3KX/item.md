@@ -1,11 +1,13 @@
 ---
 title: 'TUI Console: 連続した Thinking block を一つの表示グループにまとめる'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-24T11:39:59Z'
-updated_at: '2026-06-24T11:56:52Z'
+updated_at: '2026-06-24T12:01:41Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['tui-rendering', 'reasoning-display', 'block-aggregation', 'text-selection']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-24T12:01:41Z'
 ---
 
 ## User claims / request snapshot

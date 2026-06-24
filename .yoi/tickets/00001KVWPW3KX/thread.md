@@ -21,3 +21,12 @@ LocalTicketBackend によって作成されました。
 ユーザー確認済みのため planning から ready へ移行する。blocking open questions はなく、Orchestrator は通常の routing 判断に進める。
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-06-24T12:01:41Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
