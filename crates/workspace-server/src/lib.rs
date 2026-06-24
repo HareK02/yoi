@@ -40,6 +40,15 @@ pub enum Error {
     MissingFrontmatter(String),
     #[error("unknown local host `{0}`")]
     UnknownHost(String),
+    #[error("unknown local worker `{0}`")]
+    UnknownWorker(String),
+    #[error("invalid runtime {kind} `{value}`")]
+    InvalidRuntimeIdentifier { kind: String, value: String },
+    #[error("runtime `{runtime_id}` does not support `{capability}`")]
+    RuntimeCapabilityUnsupported {
+        runtime_id: String,
+        capability: String,
+    },
     #[error("unknown local repository `{0}`")]
     UnknownRepository(String),
     #[error("workspace identity error: {0}")]

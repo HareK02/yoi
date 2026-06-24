@@ -3,7 +3,7 @@ use std::process::{Command, Output};
 
 use serde::{Deserialize, Serialize};
 
-use crate::hosts::RuntimeDiagnostic;
+use crate::hosts::{DiagnosticSeverity, RuntimeDiagnostic};
 
 const LEGACY_LOCAL_REPOSITORY_ID: &str = "local";
 const LOCAL_REPOSITORY_PREFIX: &str = "local-";
@@ -340,7 +340,11 @@ fn truncate_field(value: &str, limit: usize) -> String {
 fn diagnostic(code: &str, severity: &str, message: String) -> RuntimeDiagnostic {
     RuntimeDiagnostic {
         code: code.to_string(),
-        severity: severity.to_string(),
+        severity: match severity {
+            "error" => DiagnosticSeverity::Error,
+            "warning" => DiagnosticSeverity::Warning,
+            _ => DiagnosticSeverity::Info,
+        },
         message,
     }
 }
