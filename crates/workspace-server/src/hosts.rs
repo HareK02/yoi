@@ -63,6 +63,118 @@ pub struct WorkerImplementation {
     pub pod_name: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeList<T> {
+    pub items: Vec<T>,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerLookupResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker: Option<WorkerSummary>,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+/// Browser-safe worker spawn request shape.
+///
+/// The request intentionally carries only workspace policy intents and stable
+/// worker identifiers. Raw workspace roots, child cwd, executable path, and raw
+/// profile selectors are resolved by the host/runtime service and never accepted
+/// from Workspace API callers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerSpawnRequest {
+    pub intent: WorkerSpawnIntent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_worker_name: Option<String>,
+    pub acceptance: WorkerSpawnAcceptanceRequirement,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkerSpawnIntent {
+    WorkspaceCompanion,
+    WorkspaceOrchestrator,
+    TicketRole {
+        ticket_id: String,
+        role: TicketWorkerRole,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketWorkerRole {
+    Intake,
+    Orchestrator,
+    Coder,
+    Reviewer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkerSpawnAcceptanceRequirement {
+    SocketReady,
+    RunAccepted { expected_segments: usize },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerSpawnResult {
+    pub state: WorkerOperationState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker: Option<WorkerSummary>,
+    pub acceptance_evidence: Vec<WorkerSpawnAcceptanceEvidence>,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerOperationState {
+    Accepted,
+    Unsupported,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerSpawnAcceptanceEvidence {
+    pub kind: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerStopRequest {
+    pub worker_id: String,
+    pub mode: WorkerStopMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerStopMode {
+    Graceful,
+    Force,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerStopResult {
+    pub state: WorkerOperationState,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerProxyConnectPoint {
+    pub kind: String,
+    pub status: String,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+pub trait WorkspaceWorkerRuntime: Send + Sync {
+    fn list_hosts(&self, limit: usize) -> RuntimeList<HostSummary>;
+    fn list_workers(&self, limit: usize) -> RuntimeList<WorkerSummary>;
+    fn worker(&self, worker_id: &str) -> WorkerLookupResult;
+    fn spawn_worker(&self, request: WorkerSpawnRequest) -> WorkerSpawnResult;
+    fn stop_worker(&self, request: WorkerStopRequest) -> WorkerStopResult;
+    fn proxy_connect_points(&self, worker_id: &str) -> Vec<WorkerProxyConnectPoint>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalRuntimeBridge {
     workspace_id: String,
@@ -247,6 +359,85 @@ impl LocalRuntimeBridge {
     }
 }
 
+impl WorkspaceWorkerRuntime for LocalRuntimeBridge {
+    fn list_hosts(&self, limit: usize) -> RuntimeList<HostSummary> {
+        let (items, diagnostics) = LocalRuntimeBridge::list_hosts(self, limit);
+        RuntimeList { items, diagnostics }
+    }
+
+    fn list_workers(&self, limit: usize) -> RuntimeList<WorkerSummary> {
+        let (items, diagnostics) = LocalRuntimeBridge::list_workers(self, limit);
+        RuntimeList { items, diagnostics }
+    }
+
+    fn worker(&self, worker_id: &str) -> WorkerLookupResult {
+        let RuntimeList {
+            items,
+            mut diagnostics,
+        } = WorkspaceWorkerRuntime::list_workers(self, 200);
+        let worker = items
+            .into_iter()
+            .find(|worker| worker.worker_id == worker_id);
+        if worker.is_none() {
+            diagnostics.push(RuntimeDiagnostic::new(
+                "worker_not_found",
+                "info",
+                format!("worker '{worker_id}' was not found on the local runtime"),
+            ));
+        }
+        truncate_diagnostics(&mut diagnostics);
+        WorkerLookupResult {
+            worker,
+            diagnostics,
+        }
+    }
+
+    fn spawn_worker(&self, request: WorkerSpawnRequest) -> WorkerSpawnResult {
+        let diagnostic = RuntimeDiagnostic::new(
+            "worker_spawn_resolver_pending",
+            "info",
+            format!(
+                "worker spawn intent '{}' was accepted as a typed request shape, but local launch resolution is not implemented by this ticket",
+                worker_spawn_intent_label(&request.intent)
+            ),
+        );
+        WorkerSpawnResult {
+            state: WorkerOperationState::Unsupported,
+            worker: None,
+            acceptance_evidence: Vec::new(),
+            diagnostics: vec![diagnostic],
+        }
+    }
+
+    fn stop_worker(&self, request: WorkerStopRequest) -> WorkerStopResult {
+        WorkerStopResult {
+            state: WorkerOperationState::Unsupported,
+            diagnostics: vec![RuntimeDiagnostic::new(
+                "worker_stop_pending",
+                "info",
+                format!(
+                    "worker stop for '{}' is reserved for the runtime service boundary and is not implemented by this ticket",
+                    request.worker_id
+                ),
+            )],
+        }
+    }
+
+    fn proxy_connect_points(&self, worker_id: &str) -> Vec<WorkerProxyConnectPoint> {
+        vec![WorkerProxyConnectPoint {
+            kind: "stream_proxy".to_string(),
+            status: "not_implemented".to_string(),
+            diagnostics: vec![RuntimeDiagnostic::new(
+                "worker_stream_proxy_pending",
+                "info",
+                format!(
+                    "future stream/proxy connection point for '{worker_id}' is reserved without opening a protocol surface"
+                ),
+            )],
+        }]
+    }
+}
+
 impl RuntimeDiagnostic {
     pub fn new(
         code: impl Into<String>,
@@ -391,6 +582,14 @@ fn safe_metadata_label(value: &str) -> Option<String> {
         return None;
     }
     Some(value.to_string())
+}
+
+fn worker_spawn_intent_label(intent: &WorkerSpawnIntent) -> &'static str {
+    match intent {
+        WorkerSpawnIntent::WorkspaceCompanion => "workspace_companion",
+        WorkerSpawnIntent::WorkspaceOrchestrator => "workspace_orchestrator",
+        WorkerSpawnIntent::TicketRole { .. } => "ticket_role",
+    }
 }
 
 fn stable_local_host_id(workspace_id: &str) -> String {

@@ -10,7 +10,9 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use crate::hosts::{HostSummary, LocalRuntimeBridge, RuntimeDiagnostic, WorkerSummary};
+use crate::hosts::{
+    HostSummary, LocalRuntimeBridge, RuntimeDiagnostic, WorkerSummary, WorkspaceWorkerRuntime,
+};
 use crate::identity::WorkspaceIdentity;
 use crate::records::{
     LocalProjectRecordReader, ObjectiveDetail, ProjectRecordList, TicketDetail, TicketSummary,
@@ -61,6 +63,7 @@ pub struct WorkspaceApi {
     config: ServerConfig,
     store: Arc<dyn ControlPlaneStore>,
     records: LocalProjectRecordReader,
+    runtime: Arc<dyn WorkspaceWorkerRuntime>,
 }
 
 impl WorkspaceApi {
@@ -74,23 +77,21 @@ impl WorkspaceApi {
                 updated_at: config.workspace_created_at.clone(),
             })
             .await?;
+        let runtime = Arc::new(LocalRuntimeBridge::new(
+            config.workspace_id.clone(),
+            config.workspace_root.clone(),
+            config.local_runtime_data_dir.clone(),
+        ));
         Ok(Self {
             records: LocalProjectRecordReader::new(config.workspace_root.clone()),
             config,
             store,
+            runtime,
         })
     }
 
     pub fn workspace_id(&self) -> &str {
         self.config.workspace_id.as_str()
-    }
-
-    fn local_runtime_bridge(&self) -> LocalRuntimeBridge {
-        LocalRuntimeBridge::new(
-            self.config.workspace_id.clone(),
-            self.config.workspace_root.clone(),
-            self.config.local_runtime_data_dir.clone(),
-        )
     }
 
     fn local_repository_reader(&self) -> LocalRepositoryReader {
@@ -390,14 +391,13 @@ async fn list_hosts(
     State(api): State<WorkspaceApi>,
 ) -> ApiResult<Json<RuntimeListResponse<HostSummary>>> {
     let limit = api.config.max_records.min(200);
-    let bridge = api.local_runtime_bridge();
-    let (items, diagnostics) = bridge.list_hosts(limit);
+    let runtime_hosts = api.runtime.list_hosts(limit);
     Ok(Json(RuntimeListResponse {
         workspace_id: api.config.workspace_id,
         limit,
-        items,
-        source: "local_pod_metadata".to_string(),
-        diagnostics,
+        items: runtime_hosts.items,
+        source: "worker_runtime".to_string(),
+        diagnostics: runtime_hosts.diagnostics,
     }))
 }
 
@@ -411,8 +411,13 @@ async fn list_host_workers(
     State(api): State<WorkspaceApi>,
     AxumPath(host_id): AxumPath<String>,
 ) -> ApiResult<Json<RuntimeListResponse<WorkerSummary>>> {
-    let bridge = api.local_runtime_bridge();
-    if host_id != bridge.host_id() {
+    let runtime_hosts = api.runtime.list_hosts(1);
+    let expected_host_id = runtime_hosts
+        .items
+        .first()
+        .map(|host| host.host_id.as_str())
+        .ok_or_else(|| Error::UnknownHost(host_id.clone()))?;
+    if host_id != expected_host_id {
         return Err(Error::UnknownHost(host_id).into());
     }
     workers_response(api).map(Json)
@@ -420,14 +425,13 @@ async fn list_host_workers(
 
 fn workers_response(api: WorkspaceApi) -> ApiResult<RuntimeListResponse<WorkerSummary>> {
     let limit = api.config.max_records.min(200);
-    let bridge = api.local_runtime_bridge();
-    let (items, diagnostics) = bridge.list_workers(limit);
+    let runtime_workers = api.runtime.list_workers(limit);
     Ok(RuntimeListResponse {
         workspace_id: api.config.workspace_id,
         limit,
-        items,
-        source: "local_pod_metadata".to_string(),
-        diagnostics,
+        items: runtime_workers.items,
+        source: "worker_runtime".to_string(),
+        diagnostics: runtime_workers.diagnostics,
     })
 }
 

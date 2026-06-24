@@ -378,7 +378,6 @@ async fn wait_for_ready(
         runtime_command: runtime_command.clone(),
         pod_name: form.name.clone(),
         profile: form.selected_profile_selector(),
-        ticket_role: None,
         workspace_root: form.cwd.clone(),
         cwd: None,
         resume_from: form.resume_from,
