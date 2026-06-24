@@ -212,3 +212,80 @@ Next action:
 
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVTNAY20-worker-runtime at: 2026-06-24T10:33:54Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+Read-only で Ticket `00001KVTNAY20`、implementation report、`a729d686..HEAD` の差分を確認した。ファイル変更・Ticket review 記録・merge/cleanup は reviewer では行っていない。
+
+確認した主な点:
+- 低レベル Pod launcher は `crates/client/src/spawn.rs` の `PodProcessLaunchConfig` / options に分離され、Ticket/role/orchestration 固有の型や field は入っていない。`--workspace` と process `cwd` も別 field のまま扱われている。
+- Ticket role 起動は `crates/client/src/ticket_role.rs` 側に寄せられ、role/profile/workflow/prompt/初回 `Run` の組み立ては launcher ではなく role 層で処理されている。
+- 起動成功は単なる process start ではなく、既存 socket readiness に加えて Ticket role launch では `Method::Run` 送信後の `UserMessage` / `InvokeStart(UserSend)` / `TurnStart` を待つ形になっている。
+- Workspace server 側は `WorkspaceWorkerRuntime` trait と `WorkerSpawnRequest` / `WorkerStopRequest` / `WorkerProtocolProxyRequest` を導入し、現在の local 実装は Pod metadata read boundary + unsupported lifecycle operation として明示されている。Browser/API request shape に `workspace_root` / `cwd` / executable path / raw profile selector は受けていない。
+- Dedicated Orchestrator launch では runtime `workspace_root` と process `cwd` を混同しないテストが追加されており、original workspace と orchestration checkout が分離されている。
+- 非ゴールである実 scheduler、E2E、merge/cleanup automation 等の scope creep は入っていない。
+
+Validation evidence:
+- reviewer は read-only 制約のため build/test は再実行していない。
+- 実装報告の検証結果として `cargo test -p yoi-workspace-server`、`cargo check -p yoi`、`cd web/workspace && deno task check && deno task build`、`cargo test -p client`、`git diff --check` の成功を確認した。
+- reviewer 側では read-only な `git diff --check a729d686..HEAD` を実行し、問題なし。
+
+Non-blocking notes:
+- `WorkerSpawnRequest` はまだ実 endpoint 未接続かつ local runtime では `Unsupported` なのでこの Ticket では問題ない。今後実装時は `requested_worker_name` を backend 側で厳格に validate し、Browser 由来の値を Pod authority として扱わないことを明示すると安全。
+- `launch_ticket_role_pod` の acceptance 待ちは fresh spawn 前提では妥当。将来既存 Pod restore/競合を扱う場合は、connect-time `Snapshot`/`Alert` の drain と「送信した Run に対応する evidence」の対応付けをより強くするとよい。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-24T10:34:55Z -->
+
+## Implementation report
+
+Integration outcome:
+
+- Coder retry `yoi-coder-00001KVTNAY20-worker-runtime-retry1` が完走し、implementation branch `work/00001KVTNAY20-worker-runtime-spawn` に実装を commit した。
+- Reviewer `yoi-reviewer-00001KVTNAY20-worker-runtime` は read-only review で `approve`。低レベル launcher と Ticket/role/orchestration resolver の分離、Workspace runtime abstraction、raw authority input 非受理、`workspace_root`/`cwd` 分離、acceptance evidence、scope creep なしを確認した。
+- Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration` で branch `work/00001KVTNAY20-worker-runtime-spawn` を merge 済み。
+  - merge commit: `97555bb5 merge: 00001KVTNAY20 worker runtime spawn`
+  - implementation commit: `217a4828 feat: abstract worker runtime spawn boundary`
+  - implementation report commit: `d62ab6e1 docs: record worker runtime implementation report`
+
+Validation in Orchestrator worktree:
+- `cargo test -p yoi-workspace-server`: success
+- `cargo check -p yoi`: success
+- `cd web/workspace && deno task check`: success
+- `cd web/workspace && deno task build`: success
+- `git diff --check`: success
+
+Notes:
+- Reviewer non-blocking note: future actual spawn endpoint should validate any requested worker name server-side and avoid treating Browser-provided values as Pod authority.
+- Reviewer non-blocking note: future restore/competition handling may need stronger association between a sent `Run` and acceptance evidence after connect-time `Snapshot`/`Alert` drain.
+
+Next action:
+- Mark Ticket done after this integration/validation evidence.
+- Then stop related child Pods and remove only the child implementation worktree/branch.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-24T10:35:01Z from: inprogress to: done reason: merged_validated field: state -->
+
+## State changed
+
+Implementation is merged into the orchestration branch and validated.
+
+Evidence:
+- merge commit: `97555bb5 merge: 00001KVTNAY20 worker runtime spawn`
+- reviewer result: approve
+- validation in `/home/hare/Projects/yoi/.worktree/orchestration` succeeded:
+  - `cargo test -p yoi-workspace-server`
+  - `cargo check -p yoi`
+  - `cd web/workspace && deno task check`
+  - `cd web/workspace && deno task build`
+  - `git diff --check`
+
+Closure is not performed here; this state records implementation completion after merge/validation.
+
+---
