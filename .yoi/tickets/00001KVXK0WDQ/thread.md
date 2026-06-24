@@ -136,3 +136,69 @@ Implementation orchestration update:
 - Coder には root/original workspace と orchestration worktree で read/write/validation/git operation を行わないよう明示した。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVXK0WDQ-service-lifecycle at: 2026-06-24T21:43:56Z -->
+
+## Implementation report
+
+Implementation report:
+
+対象 Ticket:
+- `00001KVXK0WDQ` — Define Plugin Service lifecycle and ingress queue runtime
+
+変更ファイル:
+- `crates/pod/src/feature/plugin.rs`
+
+主な実装:
+- Plugin Service の host-managed lifecycle を追加。
+  - `Ready / Starting / Running / Stopping / Stopped / Failed`
+- in-process bounded ingress queue を追加。
+  - v0 は per-plugin serial dispatch。
+  - Tool Plugin 実行は従来通り request-response のまま維持。
+- `PluginIngressEvent` に以下を追加。
+  - `source`
+  - `ingress_name`
+  - `payload`
+  - `created_at`
+  - `attempt`
+  - `correlation_id`
+- typed ingress dispatch error / diagnostic を追加。
+  - invalid event
+  - queue full
+  - service unavailable / failed / stopped
+  - dispatch timeout
+  - dispatch failure
+- status diagnostics に以下を追加。
+  - lifecycle state
+  - queue depth / capacity
+  - last error
+  - dispatch counters
+- Unit tests を追加・更新。
+  - lifecycle start/stop/failure
+  - bounded queue full
+  - serial dispatch
+  - timeout diagnostic
+  - dispatch failure diagnostic
+  - stopped service rejection
+  - invalid event rejection
+  - Tool execution regression
+
+Commit:
+- `4e138b7e365d940bf31397aa64cf14a58b6bc51a feat: add plugin service ingress queue`
+
+Validation:
+- `cargo test -p pod feature::plugin::tests`: success (`73 passed`)
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `git diff --check HEAD~1 HEAD`: success
+- `nix build .#yoi --no-link`: success
+- `cargo test -p pod`: failed in existing prompt guidance assertions outside this Ticket:
+  - `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`
+  - `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`
+  - failure: `assertion failed: rendered.contains("worktree status, diff, and test results")`
+
+Residual risks / notes:
+- Full `cargo test -p pod` remains blocked by unrelated prompt/resource snapshot assertions; Plugin-focused tests pass.
+- v0 dispatch timeout is implemented as elapsed check after synchronous dispatch completion and typed diagnostic. Force-cancelling executing Wasm in a separate worker is broader runtime redesign and remains non-goal.
+
+---
