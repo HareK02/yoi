@@ -37,7 +37,6 @@ workflow-crate = { package = "workflow", path = "../workflow" }
 uuid = { workspace = true, features = ["v7"] }
 session-metrics = { workspace = true }
 arc-swap = "1.9.1"
-wasmi = { version = "0.51.1", default-features = false, features = ["std", "extra-checks"] }
 wasmtime = { version = "45.0.2", default-features = false, features = ["std", "runtime", "cranelift", "component-model"] }
 tungstenite = { version = "0.28.0", default-features = false, features = ["handshake", "native-tls", "url"] }
 tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["native-tls", "connect"] }
