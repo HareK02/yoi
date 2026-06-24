@@ -319,3 +319,59 @@ Non-blocking notes:
 - reported validation は通過とのことだが、reviewer では再実行していない。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-24T11:15:04Z -->
+
+## Implementation report
+
+Integration outcome:
+
+- Coder `yoi-coder-00001KVWECEQG-worker-registry` が implementation branch `work/00001KVWECEQG-worker-runtime-registry` に実装を commit した。
+- Reviewer `yoi-reviewer-00001KVWECEQG-worker-registry` は初回 review で `worker_id` opaque lookup / bounded unique id の blocker を指摘し、Coder が `38d25582 fix: make worker runtime ids resolvable` で修正した。
+- Follow-up review は `approve`。`LocalPodRuntime::worker()` の backend 内部 scan/照合、bounded digest 付き id 生成、list→lookup roundtrip tests、raw path/session 非公開、unsupported capability boundary が確認された。
+- Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration` で branch `work/00001KVWECEQG-worker-runtime-registry` を merge 済み。
+  - merge commit: `1251c0ca merge: 00001KVWECEQG worker runtime registry`
+  - implementation commit: `9bd15507 feat: add worker runtime registry overview`
+  - fix commit: `38d25582 fix: make worker runtime ids resolvable`
+- `sha2.workspace = true` 追加により `Cargo.lock` が変わったため、Nix package cargoHash を更新した。
+  - package hash commit: `b975812c nix: update yoi cargo hash`
+
+Validation in Orchestrator worktree:
+- `cargo test -p yoi-workspace-server`: success
+- `cargo check -p yoi`: success
+- `cd web/workspace && deno task check`: success
+- `cd web/workspace && deno task build`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success after updating `package.nix` cargoHash to `sha256-rR8mrMDg1CCXb3Y5MnhUqSd0vAsI5OStFQCRIrvx8fg=`
+
+Notes:
+- Initial `nix build .#yoi --no-link` failed only because cargoHash was stale after the new dependency; this was fixed and revalidated.
+- Reviewer non-blocking note: generated `worker_id` still includes a sanitized body fragment, but as an operation key it is now backend-resolved opaque id and acceptable for this Ticket.
+
+Next action:
+- Mark Ticket done after this integration/validation evidence.
+- Then stop related child Pods and remove only the child implementation worktree/branch.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-24T11:15:13Z from: inprogress to: done reason: merged_validated field: state -->
+
+## State changed
+
+Implementation is merged into the orchestration branch and validated.
+
+Evidence:
+- merge commit: `1251c0ca merge: 00001KVWECEQG worker runtime registry`
+- package hash commit: `b975812c nix: update yoi cargo hash`
+- reviewer result: approve after requested changes were fixed
+- validation in `/home/hare/Projects/yoi/.worktree/orchestration` succeeded:
+  - `cargo test -p yoi-workspace-server`
+  - `cargo check -p yoi`
+  - `cd web/workspace && deno task check`
+  - `cd web/workspace && deno task build`
+  - `git diff --check`
+  - `nix build .#yoi --no-link`
+
+Closure is not performed here; this state records implementation completion after merge/validation.
+
+---
