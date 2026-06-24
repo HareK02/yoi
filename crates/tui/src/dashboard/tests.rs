@@ -2766,6 +2766,11 @@ fn dashboard_ticket_intake_finish_success_clears_composer_and_reports_pod() {
                 pod_name: "intake-pod".to_string(),
                 socket_path: PathBuf::from("/tmp/intake.sock"),
             },
+            acceptance_evidence: client::ticket_role::TicketRoleLaunchAcceptanceEvidence {
+                pod_name: "intake-pod".to_string(),
+                accepted_run_segments: 0,
+                event: client::ticket_role::TicketRoleLaunchAcceptanceEvent::UserMessage,
+            },
             pre_run_warnings: vec![],
         },
         peer_registration: IntakePeerRegistrationStatus::Registered {

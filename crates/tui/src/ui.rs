@@ -363,6 +363,13 @@ pub fn compute_history(app: &App, width: u16) -> HistoryLayout {
             previous_selectable = false;
             continue;
         }
+        if matches!(block, Block::Thinking(_)) {
+            let out = render_thinking_aggregate(&app.blocks, i, width, app.mode);
+            logical.extend(out.lines.into_iter().map(|line| (line, false)));
+            i += out.consumed.max(1);
+            previous_selectable = false;
+            continue;
+        }
         let mut block_lines = Vec::new();
         render_block_into(&mut block_lines, block, width, app.mode);
         logical.extend(
@@ -1226,11 +1233,181 @@ fn count_visual_rows(text: &str, width: u16) -> usize {
     total.max(1)
 }
 
-fn render_thinking(lines: &mut Vec<Line<'static>>, t: &ThinkingBlock, width: u16, mode: Mode) {
+struct ThinkingRenderOutput {
+    lines: Vec<Line<'static>>,
+    /// How many blocks were consumed from `blocks[start..]`. Always >= 1.
+    consumed: usize,
+}
+
+fn render_thinking_aggregate(
+    blocks: &[Block],
+    start: usize,
+    width: u16,
+    mode: Mode,
+) -> ThinkingRenderOutput {
+    let Some(Block::Thinking(_)) = blocks.get(start) else {
+        return ThinkingRenderOutput {
+            lines: Vec::new(),
+            consumed: 1,
+        };
+    };
+
+    let mut end = start + 1;
+    while matches!(blocks.get(end), Some(Block::Thinking(_))) {
+        end += 1;
+    }
+
+    let group: Vec<&ThinkingBlock> = blocks[start..end]
+        .iter()
+        .filter_map(|block| match block {
+            Block::Thinking(thinking) => Some(thinking),
+            _ => None,
+        })
+        .collect();
+
+    let mut lines = Vec::new();
+    if let [single] = group.as_slice() {
+        render_thinking(&mut lines, single, width, mode);
+    } else {
+        render_thinking_group(&mut lines, &group, width, mode);
+    }
+
+    ThinkingRenderOutput {
+        lines,
+        consumed: end - start,
+    }
+}
+
+fn render_thinking_group(
+    lines: &mut Vec<Line<'static>>,
+    group: &[&ThinkingBlock],
+    width: u16,
+    mode: Mode,
+) {
+    let header = thinking_group_header(group);
+    if matches!(mode, Mode::Overview) {
+        push_overview_line(lines, &header, width, MessageKind::Thinking, "");
+        return;
+    }
+
     let header_style = kind_style(MessageKind::Thinking);
     let body_style = Style::default().fg(Color::DarkGray);
+    lines.push(Line::from(Span::styled(header, header_style)));
 
-    let header = match &t.state {
+    match mode {
+        Mode::Detail => {
+            let item_style = body_style.add_modifier(Modifier::ITALIC);
+            for (idx, thinking) in group.iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", body_style),
+                    Span::styled(
+                        format!("[{}] {}", idx + 1, thinking_header(thinking)),
+                        item_style,
+                    ),
+                ]));
+                for raw in thinking.text.lines() {
+                    lines.push(Line::from(vec![
+                        Span::styled("    ", body_style),
+                        Span::styled(raw.to_owned(), body_style),
+                    ]));
+                }
+            }
+        }
+        Mode::Normal => {
+            let preview = thinking_group_preview(group);
+            if !preview.is_empty() {
+                let budget = width.saturating_sub(2) as usize;
+                let truncated = truncate_with_ellipsis(&preview, budget);
+                lines.push(Line::from(vec![
+                    Span::styled("  ", body_style),
+                    Span::styled(truncated, body_style),
+                ]));
+            }
+        }
+        Mode::Overview => unreachable!("handled above"),
+    }
+}
+
+fn thinking_group_header(group: &[&ThinkingBlock]) -> String {
+    let count = group.len();
+    let block_count = format!("{count} block{}", plural_suffix(count));
+    let streaming = group
+        .iter()
+        .filter(|thinking| matches!(thinking.state, ThinkingState::Streaming { .. }))
+        .count();
+    let incomplete = group
+        .iter()
+        .filter(|thinking| matches!(thinking.state, ThinkingState::Incomplete { .. }))
+        .count();
+    let finished = count.saturating_sub(streaming + incomplete);
+
+    if streaming > 0 {
+        let mut parts = vec![block_count];
+        if streaming > 1 {
+            parts.push(format!("{streaming} live"));
+        }
+        if incomplete > 0 {
+            parts.push(format!("{incomplete} interrupted"));
+        }
+        let elapsed = group
+            .iter()
+            .rev()
+            .find_map(|thinking| match &thinking.state {
+                ThinkingState::Streaming { started_at } => Some(started_at.elapsed().as_secs()),
+                _ => None,
+            })
+            .map(fmt_elapsed);
+        match elapsed {
+            Some(elapsed) => format!("Thinking... ({}, {elapsed})", parts.join(", ")),
+            None => format!("Thinking... ({})", parts.join(", ")),
+        }
+    } else if incomplete > 0 {
+        let mut parts = vec![block_count];
+        if finished > 0 {
+            parts.push(format!("{finished} finished"));
+        }
+        parts.push(format!("{incomplete} interrupted"));
+        format!("Thoughts interrupted ({})", parts.join(", "))
+    } else {
+        format!("Thoughts — {block_count}")
+    }
+}
+
+fn thinking_group_preview(group: &[&ThinkingBlock]) -> String {
+    if let Some(preview) = group
+        .iter()
+        .rev()
+        .find_map(|thinking| match thinking.state {
+            ThinkingState::Streaming { .. } => {
+                non_empty_preview(trailing_line_preview(&thinking.text))
+            }
+            _ => None,
+        })
+    {
+        return preview;
+    }
+
+    group
+        .iter()
+        .find_map(|thinking| match thinking.state {
+            ThinkingState::Streaming { .. } => {
+                non_empty_preview(trailing_line_preview(&thinking.text))
+            }
+            _ => non_empty_preview(first_line_preview(&thinking.text)),
+        })
+        .unwrap_or_default()
+}
+
+fn non_empty_preview(preview: String) -> Option<String> {
+    if preview.is_empty() {
+        None
+    } else {
+        Some(preview)
+    }
+}
+
+fn thinking_header(t: &ThinkingBlock) -> String {
+    match &t.state {
         ThinkingState::Streaming { started_at } => {
             let secs = started_at.elapsed().as_secs();
             format!("Thinking... ({})", fmt_elapsed(secs))
@@ -1243,7 +1420,18 @@ fn render_thinking(lines: &mut Vec<Line<'static>>, t: &ThinkingBlock, width: u16
             Some(s) => format!("Thinking interrupted ({})", fmt_elapsed(*s)),
             None => "Thinking interrupted".to_owned(),
         },
-    };
+    }
+}
+
+fn plural_suffix(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
+fn render_thinking(lines: &mut Vec<Line<'static>>, t: &ThinkingBlock, width: u16, mode: Mode) {
+    let header_style = kind_style(MessageKind::Thinking);
+    let body_style = Style::default().fg(Color::DarkGray);
+
+    let header = thinking_header(t);
 
     if matches!(mode, Mode::Overview) {
         push_overview_line(lines, &header, width, MessageKind::Thinking, "");
@@ -1810,6 +1998,229 @@ mod tests {
             actionbar_left_item(&app, now + Duration::from_secs(1)).map(|(text, _)| text),
             Some("retrying LLM request".into())
         );
+    }
+
+    fn row_texts(app: &App) -> Vec<String> {
+        compute_history(app, 80)
+            .rows
+            .into_iter()
+            .map(|row| row.text)
+            .collect()
+    }
+
+    fn finished_thinking(text: &str) -> Block {
+        Block::Thinking(ThinkingBlock {
+            text: text.to_string(),
+            state: ThinkingState::Finished {
+                elapsed_secs: Some(2),
+            },
+        })
+    }
+
+    fn incomplete_thinking(text: &str) -> Block {
+        Block::Thinking(ThinkingBlock {
+            text: text.to_string(),
+            state: ThinkingState::Incomplete {
+                elapsed_secs: Some(4),
+            },
+        })
+    }
+
+    fn streaming_thinking(text: &str) -> Block {
+        Block::Thinking(ThinkingBlock {
+            text: text.to_string(),
+            state: ThinkingState::Streaming {
+                started_at: Instant::now() - Duration::from_secs(3),
+            },
+        })
+    }
+
+    #[test]
+    fn consecutive_thinking_blocks_render_as_one_normal_group() {
+        let mut app = App::new("pod".to_string());
+        app.mode = Mode::Normal;
+        app.blocks = vec![finished_thinking("alpha"), finished_thinking("beta")];
+
+        let rows = row_texts(&app);
+
+        assert!(rows.iter().any(|text| text == "Thoughts — 2 blocks"));
+        assert_eq!(
+            rows.iter()
+                .filter(|text| text.starts_with("Thought"))
+                .count(),
+            1
+        );
+        assert!(rows.iter().any(|text| text == "  alpha"));
+    }
+
+    #[test]
+    fn thinking_group_detail_keeps_each_body_readable() {
+        let mut app = App::new("pod".to_string());
+        app.mode = Mode::Detail;
+        app.blocks = vec![
+            finished_thinking("alpha line 1\nalpha line 2"),
+            finished_thinking("beta line"),
+        ];
+
+        let rows = row_texts(&app);
+
+        assert!(rows.iter().any(|text| text == "Thoughts — 2 blocks"));
+        assert!(rows.iter().any(|text| text == "  [1] Thought for 2s"));
+        assert!(rows.iter().any(|text| text == "    alpha line 1"));
+        assert!(rows.iter().any(|text| text == "    alpha line 2"));
+        assert!(rows.iter().any(|text| text == "  [2] Thought for 2s"));
+        assert!(rows.iter().any(|text| text == "    beta line"));
+    }
+
+    #[test]
+    fn non_thinking_separator_breaks_thinking_group() {
+        let mut app = App::new("pod".to_string());
+        app.mode = Mode::Normal;
+        app.blocks = vec![
+            finished_thinking("alpha"),
+            Block::AssistantText {
+                text: "assistant separator".to_string(),
+            },
+            finished_thinking("beta"),
+        ];
+
+        let rows = row_texts(&app);
+
+        assert_eq!(
+            rows.iter()
+                .filter(|text| text.as_str() == "Thought for 2s")
+                .count(),
+            2
+        );
+        assert!(!rows.iter().any(|text| text == "Thoughts — 2 blocks"));
+    }
+
+    #[test]
+    fn turn_header_breaks_thinking_group() {
+        let mut app = App::new("pod".to_string());
+        app.mode = Mode::Normal;
+        app.blocks = vec![
+            Block::TurnHeader { turn: 1 },
+            finished_thinking("alpha"),
+            Block::TurnHeader { turn: 2 },
+            finished_thinking("beta"),
+        ];
+
+        let rows = row_texts(&app);
+
+        assert_eq!(
+            rows.iter()
+                .filter(|text| text.as_str() == "Thought for 2s")
+                .count(),
+            2
+        );
+        assert!(!rows.iter().any(|text| text == "Thoughts — 2 blocks"));
+    }
+
+    #[test]
+    fn thinking_group_preserves_streaming_and_incomplete_state_visibility() {
+        let mut app = App::new("pod".to_string());
+        app.mode = Mode::Normal;
+        app.blocks = vec![
+            finished_thinking("finished"),
+            incomplete_thinking("interrupted"),
+            streaming_thinking("live first\nlive tail"),
+        ];
+
+        let layout = compute_history(&app, 80);
+        let rows: Vec<_> = layout.rows.iter().map(|row| row.text.as_str()).collect();
+
+        assert!(rows.iter().any(|text| {
+            text.starts_with("Thinking...")
+                && text.contains("3 blocks")
+                && text.contains("interrupted")
+        }));
+        assert!(rows.iter().any(|text| *text == "  live tail"));
+        assert!(layout.rows.iter().all(|row| !row.selectable));
+    }
+
+    #[test]
+    fn single_thinking_block_rendering_stays_unchanged() {
+        let mut app = App::new("pod".to_string());
+        app.mode = Mode::Normal;
+        app.blocks = vec![Block::Thinking(ThinkingBlock {
+            text: "private reasoning".to_string(),
+            state: ThinkingState::Finished { elapsed_secs: None },
+        })];
+
+        let rows = row_texts(&app);
+
+        assert!(rows.iter().any(|text| text == "Thought"));
+        assert!(rows.iter().any(|text| text == "  private reasoning"));
+        assert!(!rows.iter().any(|text| text.starts_with("Thoughts —")));
+    }
+
+    #[test]
+    fn single_tool_block_rendering_stays_unchanged() {
+        use crate::block::{ToolCallBlock, ToolCallState};
+
+        let mut app = App::new("pod".to_string());
+        app.mode = Mode::Normal;
+        app.blocks = vec![Block::ToolCall(ToolCallBlock {
+            id: "bash-1".to_string(),
+            name: "Bash".to_string(),
+            args_stream: r#"{"command":"echo hi"}"#.to_string(),
+            arguments: Some(r#"{"command":"echo hi"}"#.to_string()),
+            state: ToolCallState::Done {
+                summary: "hi".to_string(),
+                output: None,
+            },
+            edit_snapshot: None,
+        })];
+
+        let rows = row_texts(&app);
+
+        assert!(rows.iter().any(|text| text == "Bash — done"));
+        assert!(rows.iter().any(|text| text == "  hi"));
+    }
+
+    #[test]
+    fn read_tool_aggregation_still_consumes_consecutive_tool_blocks() {
+        use crate::block::{ToolCallBlock, ToolCallState};
+
+        let mut app = App::new("pod".to_string());
+        app.mode = Mode::Normal;
+        app.blocks = vec![
+            Block::ToolCall(ToolCallBlock {
+                id: "read-1".to_string(),
+                name: "Read".to_string(),
+                args_stream: String::new(),
+                arguments: Some(r#"{"file_path":"/tmp/a"}"#.to_string()),
+                state: ToolCallState::Done {
+                    summary: "read".to_string(),
+                    output: None,
+                },
+                edit_snapshot: None,
+            }),
+            Block::ToolCall(ToolCallBlock {
+                id: "read-2".to_string(),
+                name: "Read".to_string(),
+                args_stream: String::new(),
+                arguments: Some(r#"{"file_path":"/tmp/b"}"#.to_string()),
+                state: ToolCallState::Done {
+                    summary: "read".to_string(),
+                    output: None,
+                },
+                edit_snapshot: None,
+            }),
+        ];
+
+        let rows = row_texts(&app);
+
+        assert!(rows.iter().any(|text| text == "Read — 2 files read"));
+        assert_eq!(
+            rows.iter()
+                .filter(|text| text.starts_with("Read —"))
+                .count(),
+            1
+        );
+        assert!(rows.iter().any(|text| text == "  /tmp/a"));
+        assert!(rows.iter().any(|text| text == "  /tmp/b"));
     }
 
     #[test]
