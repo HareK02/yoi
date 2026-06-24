@@ -206,3 +206,52 @@ Non-blocking notes:
 - 新規 design doc は diff 上 EOF newline が無いように見えたが、`git diff --check` は通っており blocker ではない。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-24T19:15:35Z -->
+
+## Implementation report
+
+Integration outcome:
+
+- Coder `yoi-coder-00001KVWSQM22-backend-orch-runtime` が implementation branch `work/00001KVWSQM22-backend-orch-runtime` に design artifact を commit した。
+  - design commit: `f901b9be docs: design backend internal orchestrator runtime`
+- Reviewer `yoi-reviewer-00001KVWSQM22-backend-orch-runtime` は read-only review で `approve`。durable orchestration event、ack/defer/fail、Backend internal Orchestrator tool surface、spawn intent、runtime/worker identity、DB projection、failure semantics、non-goals が future implementation Ticket の入力として十分に具体化されていることを確認した。
+- Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration` で branch `work/00001KVWSQM22-backend-orch-runtime` を merge 済み。
+  - merge commit: `4e713fce merge: 00001KVWSQM22 backend orchestrator design`
+
+Changed files:
+- `docs/design/workspace-kanban-orchestrator-runtime.md`
+- `docs/README.md`
+- `docs/design/overview.md`
+
+Validation in Orchestrator worktree:
+- `git diff --check HEAD~1..HEAD`: success
+- `git diff --check f367d732..HEAD -- docs .yoi/tickets/00001KVWSQM22`: success
+
+Notes:
+- docs/design-only change のため Cargo validation は実施していない。
+- Reviewer non-blocking note: child worktree 側の Ticket thread には Orchestrator 側 report が見えなかったが、Orchestrator 側 Ticket record には report/review/outcome を記録済み。
+- Backend internal Orchestrator 本体、Kanban UI completion、Coder/Reviewer spawn 実装、remote runtime protocol、raw session DB ingest、Ticket DB migration、permission/auth completion は non-goal のまま。
+
+Next action:
+- Mark Ticket done after this integration/validation evidence.
+- Then stop related child Pods and remove only the child implementation worktree/branch.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-24T19:15:42Z from: inprogress to: done reason: merged_validated field: state -->
+
+## State changed
+
+Design/planning artifact is merged into the orchestration branch and validated.
+
+Evidence:
+- merge commit: `4e713fce merge: 00001KVWSQM22 backend orchestrator design`
+- reviewer result: approve
+- validation in `/home/hare/Projects/yoi/.worktree/orchestration` succeeded:
+  - `git diff --check HEAD~1..HEAD`
+  - `git diff --check f367d732..HEAD -- docs .yoi/tickets/00001KVWSQM22`
+
+Closure is not performed here; this state records implementation/design completion after merge/validation.
+
+---
