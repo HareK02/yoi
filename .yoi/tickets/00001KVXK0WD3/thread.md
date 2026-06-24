@@ -259,3 +259,15 @@ Evidence:
 Closure is not performed here; this state records implementation completion after merge/review/focused validation.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-24T20:51:02Z -->
+
+## Implementation report
+
+Correction:
+
+- 直前の integration outcome / state-change body に記載した merge commit `29953111` は誤記。
+- 正しい merge commit は `bedbb670 merge: 00001KVXK0WD3 legacy wasm removal`。
+- 実装 commit `741d7132`、review approve、validation results、Ticket done 判断には変更なし。
+
+---

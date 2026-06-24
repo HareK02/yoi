@@ -2,7 +2,7 @@
 title: 'Remove legacy raw WASM Plugin runtime'
 state: 'done'
 created_at: '2026-06-24T19:51:56Z'
-updated_at: '2026-06-24T20:50:45Z'
+updated_at: '2026-06-24T20:51:02Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-24T20:11:56Z'
