@@ -120,3 +120,29 @@ Implementation orchestration update:
 - Coder には root/original workspace と orchestration worktree で read/write/validation/git operation を行わないよう明示した。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVWPVHFJ-cleanup-cli at: 2026-06-24T12:30:40Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+確認内容:
+- child worktree `/home/hare/Projects/yoi/.worktree/00001KVWPVHFJ-storage-cleanup-cli` のみを read-only 確認。
+- Ticket 要件・acceptance criteria・IntentPacket / implementation report、`5c9331e8..HEAD` の差分、主な実装箇所 `crates/yoi/src/main.rs`, `crates/yoi/src/pod_cleanup_cli.rs`, `crates/yoi/src/session_cli.rs`, `crates/pod-store/src/lib.rs`, `crates/session-store/src/fs_store.rs` を確認。
+- read-only 指示のため validation は再実行していない。
+
+承認根拠:
+- `yoi pod delete <NAME> [--force] [--dry-run]`, `yoi pod prune --older-than <DURATION> ...`, `yoi session prune --unreferenced ...` の command spelling と product CLI routing が追加されている。
+- `pod delete` は `FsPodStore::delete_by_name` 経由で Pod metadata のみを削除し、session logs/history を削除しない。出力にも preserve が明示される。
+- live/reachable Pod は Unix socket connect 成功時に拒否され、権限エラー等の uncertain liveness も fail-safe で拒否される。`--force` でも live/uncertain は override しない。
+- destructive deletion は `--force && !--dry-run` の場合のみ実行され、通常時/dry-run は report-only になる。
+- `pod prune` は `--older-than` 必須で、暗黙の old threshold を持たない。
+- `session prune --unreferenced` は Pod metadata の active `session_id` を保護集合にしており、referenced session を削除対象から外す。削除は `SessionId` ベースの session-store API 経由で、path traversal 的な広範削除には見えない。
+- Panel/TUI/scheduler や legacy resume/bare Pod-name inference の scope creep は見当たらない。
+- Coder reported validation は Ticket 指定範囲を概ね満たしており、広い Pod lib test の失敗は既存 prompt assertion と説明され、対象 discovery test は再実行成功と記録されている。
+
+Non-blocking note:
+- dry-run/失敗 path でも既存 store constructor が root directory を初期作成し得る設計に見える。削除は発生しないため今回の blocker とは見なさないが、将来「dry-run は完全 no-write」と定義するなら follow-up で明確化するとよい。
+
+---
