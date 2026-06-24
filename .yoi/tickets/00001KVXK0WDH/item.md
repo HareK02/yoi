@@ -1,9 +1,11 @@
 ---
 title: 'Reject legacy Plugin runtime in manifest and CLI diagnostics'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-24T19:51:56Z'
-updated_at: '2026-06-24T19:55:30Z'
+updated_at: '2026-06-24T20:11:58Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-24T20:11:58Z'
 ---
 
 ## 背景
