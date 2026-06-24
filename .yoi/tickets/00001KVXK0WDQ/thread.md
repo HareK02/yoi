@@ -202,3 +202,41 @@ Residual risks / notes:
 - v0 dispatch timeout is implemented as elapsed check after synchronous dispatch completion and typed diagnostic. Force-cancelling executing Wasm in a separate worker is broader runtime redesign and remains non-goal.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVXK0WDQ-service-lifecycle at: 2026-06-24T21:49:35Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+確認範囲:
+- child worktree `/home/hare/Projects/yoi/.worktree/00001KVXK0WDQ-plugin-service-lifecycle`
+- branch `work/00001KVXK0WDQ-plugin-service-lifecycle`
+- HEAD `4e138b7e365d940bf31397aa64cf14a58b6bc51a`
+- base `f26c7e0d`
+- diff `f26c7e0d..HEAD`
+- Ticket `00001KVXK0WDQ` の `item.md` / `thread.md` / orchestration plan
+
+判断:
+- Ticket intent / IntentPacket に対して実装は妥当。
+- 変更は `crates/pod/src/feature/plugin.rs` のみで、WebSocket driver / output command model / WIT/PDK/templates / durable queue への scope creep は見当たらない。
+- Component Model-only runtime と legacy raw wasm rejection は維持されている。
+
+主な確認根拠:
+- `PluginInstanceLifecycleState` が `Ready / Starting / Running / Stopping / Stopped / Failed` に拡張され、start/stop/status/dispatch failure で lifecycle と diagnostics が更新される。
+- `PluginIngressEvent` に `source / ingress_name / payload / created_at / attempt / correlation_id` が揃っている。
+- `VecDeque` + capacity による in-process bounded queue、`QueueFull` / `InvalidEvent` / `ServiceFailed` / `ServiceStopped` / `DispatchTimeout` / `DispatchFailed` の typed error/diagnostic が追加されている。
+- dispatch は `Mutex` 下の per-plugin serial dispatch で、concurrent per-plugin execution にはしていない。
+- Tool execution path は `PluginInstanceTool::execute -> handle_tool` の request-response のままで、Service queue に流していない。
+- status に `queue_depth / queue_capacity / last_error / dispatch_counters / diagnostics` が出る。
+- unit tests は lifecycle、queue full、serial dispatch、timeout/failure、stopped rejection、invalid event、Tool regression をカバーしている。
+
+検証:
+- reviewer: `git diff --check f26c7e0d..HEAD`: success
+- cargo/nix は read-only 指示のため再実行せず、coder 報告を確認対象として扱った。
+
+Non-blocking notes:
+- queue processing は sync-step driven で、現 public delivery は enqueue 直後に同じ lock 内で dispatch するため、通常経路では queue depth はほぼ 0 になる。Ticket の implementation latitude 内だが、後続の WebSocket driver 側で backpressure/queue depth をどう見せるかは改めて注意が必要。
+- `cargo test -p pod` は coder 報告では既存の prompt guidance assertion 由来の失敗あり。Plugin-focused tests / `cargo check -p yoi` / nix build は成功報告で、本 Ticket の blocker とは判断しない。
+
+---
