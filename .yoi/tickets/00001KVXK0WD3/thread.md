@@ -199,3 +199,63 @@ Non-blocking notes:
 - `docs/development/plugin-development.md` には raw core-Wasm compatibility がまだ有効に読める文言が残っている。今回 Ticket の主目的は active runtime removal で、外向き rejection/docs 全面更新は後続範囲なので blocker ではないが、後続 Ticket で整理した方がよい。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-24T20:50:37Z -->
+
+## Implementation report
+
+Integration outcome:
+
+- Coder `yoi-coder-00001KVXK0WD3-legacy-wasm-removal` が implementation branch `work/00001KVXK0WD3-remove-legacy-wasm-runtime` に実装を commit した。
+  - implementation commit: `741d7132 refactor: remove legacy wasm plugin runtime`
+- Reviewer `yoi-reviewer-00001KVXK0WD3-legacy-wasm-removal` は read-only review で `approve`。legacy raw-WASM fallback execution path が削除され、Component Model Tool path、host API grant、digest binding、ToolRegistry registration が維持され、manifest/CLI rejection や Service/Ingress/WebSocket/WIT/PDK へ scope creep していないことを確認した。
+- Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration` で branch `work/00001KVXK0WD3-remove-legacy-wasm-runtime` を merge 済み。
+  - merge commit: `29953111 merge: 00001KVXK0WD3 legacy wasm removal`
+
+Implemented behavior:
+- `crates/pod/src/feature/plugin.rs` から `LegacyToolAdapter` / raw core-WASM Tool execution helper / `wasmi` host adapter 系を削除。
+- raw `wasm` runtime は static inspection と instance startup で fail-closed / non-executable diagnostic になり、active fallback execution path は残していない。
+- Component Model Tool runtime path は `ComponentToolAdapter` / `run_plugin_component_tool` / `wasmtime::component` に整理。
+- `crates/pod/Cargo.toml` から `wasmi` dependency を削除し、`Cargo.lock` と `package.nix` cargoHash を更新。
+- `docs/design/plugin-component-model.md` の transitional runtime wording を active runtime removal に合わせて最小更新。
+
+Validation in Orchestrator worktree:
+- `cargo test -p pod feature::plugin --lib`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+- `cargo test -p pod`: failed in two prompt guidance snapshot assertions that are outside this Plugin diff:
+  - `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`
+  - `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`
+  - Plugin focused tests within the same full run passed, including `core_wasm_is_not_silently_reinterpreted_as_component`, component execution, component grant/import, lifecycle, memory/table/output cap tests.
+
+Notes:
+- Full `cargo test -p pod` failure is recorded as an existing/unrelated prompt-resource assertion issue and not treated as this Ticket blocker because changed files do not touch prompt resources or those test modules, focused Plugin tests pass, reviewer approved, and `nix build .#yoi --no-link` succeeds.
+- Follow-up `00001KVXK0WDH` remains responsible for external manifest/CLI rejection diagnostics and broader docs cleanup such as `docs/development/plugin-development.md` compatibility wording.
+
+Next action:
+- Mark Ticket done after this integration/validation evidence.
+- Then stop related child Pods and remove only the child implementation worktree/branch.
+- Dependency-unblocked queued Ticket `00001KVXK0WDH` can be re-routed next.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-24T20:50:45Z from: inprogress to: done reason: merged_validated_with_unrelated_full_suite_caveat field: state -->
+
+## State changed
+
+Implementation is merged into the orchestration branch and validated with one unrelated existing full-suite caveat.
+
+Evidence:
+- merge commit: `29953111 merge: 00001KVXK0WD3 legacy wasm removal`
+- reviewer result: approve
+- validation in `/home/hare/Projects/yoi/.worktree/orchestration`:
+  - `cargo test -p pod feature::plugin --lib`: success
+  - `cargo check -p yoi`: success
+  - `git diff --check`: success
+  - `nix build .#yoi --no-link`: success
+  - `cargo test -p pod`: failed only in prompt guidance snapshot assertions outside this Plugin diff; focused Plugin tests in the same run passed.
+
+Closure is not performed here; this state records implementation completion after merge/review/focused validation.
+
+---
