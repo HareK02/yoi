@@ -16,7 +16,10 @@ pub mod ticket_role;
 pub use runtime_command::PodRuntimeCommand;
 
 pub use pod_client::PodClient;
-pub use spawn::{SpawnConfig, SpawnError, SpawnReady, spawn_pod};
+pub use spawn::{
+    PodProcessLaunchConfig, PodProcessLaunchOptions, SpawnConfig, SpawnError, SpawnReady,
+    spawn_pod, spawn_pod_with_options,
+};
 pub use ticket_role::{
     TicketRef, TicketRoleLaunchContext, TicketRoleLaunchError, TicketRoleLaunchOptions,
     TicketRoleLaunchPlan, TicketRoleLaunchResult, TicketRolePreRunWarning, launch_ticket_role_pod,

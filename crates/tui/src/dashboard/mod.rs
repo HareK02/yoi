@@ -11,7 +11,9 @@ use client::ticket_role::{
     TicketRoleLaunchOptions, TicketRoleLaunchResult, launch_ticket_role_pod,
     launch_ticket_role_pod_with_options, plan_ticket_role_launch,
 };
-use client::{PodRuntimeCommand, SpawnConfig, spawn_pod};
+use client::{
+    PodProcessLaunchOptions, PodRuntimeCommand, SpawnConfig, spawn_pod, spawn_pod_with_options,
+};
 use crossterm::event::{
     Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     poll, read,
@@ -3281,7 +3283,6 @@ async fn restore_workspace_companion_pod(
         runtime_command,
         pod_name: pod_name.to_string(),
         profile: None,
-        ticket_role: None,
         workspace_root: workspace_root.to_path_buf(),
         cwd: None,
         resume_from: None,
@@ -3298,7 +3299,6 @@ async fn spawn_workspace_companion_pod(
         runtime_command,
         pod_name: pod_name.to_string(),
         profile: None,
-        ticket_role: None,
         workspace_root: workspace_root.to_path_buf(),
         cwd: None,
         resume_from: None,
@@ -3316,12 +3316,17 @@ async fn restore_orchestrator_pod(
         runtime_command,
         pod_name: pod_name.to_string(),
         profile: None,
-        ticket_role: Some("orchestrator".to_string()),
         workspace_root: original_workspace_root.to_path_buf(),
         cwd: Some(workspace_root.to_path_buf()),
         resume_from: None,
     };
-    spawn_pod(config, |_| {}).await.map(|_| ())
+    spawn_pod_with_options(
+        config,
+        PodProcessLaunchOptions::default().with_hidden_arg("--ticket-role", "orchestrator"),
+        |_| {},
+    )
+    .await
+    .map(|_| ())
 }
 
 async fn spawn_orchestrator_pod(
