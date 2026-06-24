@@ -22,6 +22,7 @@ use crate::{SegmentId, SessionId};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Filesystem-backed JSONL store.
 ///
@@ -39,6 +40,50 @@ impl FsStore {
         let root = root.into();
         fs::create_dir_all(&root)?;
         Ok(Self { root })
+    }
+
+    /// Return the filesystem root used by this store.
+    pub fn root_dir(&self) -> &Path {
+        &self.root
+    }
+
+    /// Return the latest filesystem mtime under a Session directory.
+    ///
+    /// Missing Sessions return `Ok(None)`. This is intentionally Session-scoped
+    /// so cleanup callers can apply age thresholds without reaching around the
+    /// Session store's directory authority.
+    pub fn session_modified_at(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<SystemTime>, StoreError> {
+        let session_dir = self.session_dir(session_id);
+        let dir_metadata = match fs::metadata(&session_dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let mut latest = Some(dir_metadata.modified()?);
+        for entry in fs::read_dir(&session_dir)? {
+            let entry = entry?;
+            let modified = entry.metadata()?.modified()?;
+            if latest.map(|current| modified > current).unwrap_or(true) {
+                latest = Some(modified);
+            }
+        }
+        Ok(latest)
+    }
+
+    /// Delete an entire Session directory owned by this Session store.
+    ///
+    /// Returns `Ok(true)` when a Session directory was removed and `Ok(false)`
+    /// when it was already absent.
+    pub fn delete_session(&self, session_id: SessionId) -> Result<bool, StoreError> {
+        let session_dir = self.session_dir(session_id);
+        match fs::remove_dir_all(&session_dir) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn session_dir(&self, session_id: SessionId) -> PathBuf {
@@ -218,5 +263,44 @@ impl Store for FsStore {
     ) -> Result<(), StoreError> {
         let line = serde_json::to_string(entry)?;
         self.append_line(&self.trace_path(session_id, segment_id), &line)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{new_segment_id, new_session_id};
+
+    #[test]
+    fn delete_session_removes_session_directory_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FsStore::new(tmp.path()).unwrap();
+        let keep_session = new_session_id();
+        let keep_segment = new_segment_id();
+        let delete_session = new_session_id();
+        let delete_segment = new_segment_id();
+        store
+            .create_segment(keep_session, keep_segment, &[])
+            .unwrap();
+        store
+            .create_segment(delete_session, delete_segment, &[])
+            .unwrap();
+
+        assert!(store.delete_session(delete_session).unwrap());
+        assert!(!store.exists(delete_session, delete_segment).unwrap());
+        assert!(store.exists(keep_session, keep_segment).unwrap());
+        assert!(!store.delete_session(delete_session).unwrap());
+    }
+
+    #[test]
+    fn session_modified_at_is_store_scoped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = FsStore::new(tmp.path()).unwrap();
+        let session_id = new_session_id();
+        let segment_id = new_segment_id();
+
+        assert!(store.session_modified_at(session_id).unwrap().is_none());
+        store.create_segment(session_id, segment_id, &[]).unwrap();
+        assert!(store.session_modified_at(session_id).unwrap().is_some());
     }
 }
