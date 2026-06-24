@@ -215,3 +215,38 @@ Residual risks / notes:
 - `nix build .#yoi --no-link` は Cargo/Deno validation が通過済みだが、最終統合 confidence を上げる場合は Orchestrator 側判断で実行可能。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVWECEQG-worker-registry at: 2026-06-24T11:01:43Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+確認範囲:
+- child worktree `/home/hare/Projects/yoi/.worktree/00001KVWECEQG-worker-runtime-registry` のみで read-only inspection。
+- Ticket `item.md` / `thread.md` / orchestration plan、`371fd7c6..HEAD` の差分、主に `crates/workspace-server/src/hosts.rs` / `server.rs` / web 型・表示を確認。
+- read-only のため、テスト・ビルド・`git diff --check` は実行していない。
+
+良い点:
+- `WorkspaceWorkerRuntime` trait、`WorkerRuntimeRegistry`、`LocalPodRuntime` が導入され、`WorkspaceApi` は `Arc<WorkerRuntimeRegistry>` を保持し、`/api/hosts` / `/api/workers` / `/api/hosts/{host_id}/workers` / 新規 `/api/runtimes` が registry 経由になっている。
+- `HostSummary` / `WorkerSummary` は raw `workspace_root` / metadata path / socket path / raw session を直接返さない形に整理されており、UI 側も新しい safe summary shape に追随している。
+- spawn/stop/proxy/stream は unsupported/reserved の型・diagnostic に留めており、scheduler / remote host protocol / raw session ingest には踏み込んでいない。
+
+Blockers:
+1. worker detail/lookup の id 解決が opaque id 境界を満たしていない。
+   - `worker_id_for_pod()` は `pod_name` を sanitize/lowercase/truncate して `local-pod-*` を作る一方、`LocalPodRuntime::worker()` は `local-pod-` を strip した値をそのまま `pod_root/<pod_name>/metadata.json` のディレクトリ名として使っている。
+   - 実 Pod 名に大文字、`.` などの置換対象文字、truncate 対象が含まれると、`list_workers()` が返した `worker_id` から同じ Worker を lookup できない。
+   - Yoi の実 Pod 名には Ticket ID 由来の大文字を含むものがあり得るため現実的に壊れる。これは Ticket の「worker detail / lookup」「`pod_name` を external operation key にしない」「worker_id は backend が解決する opaque id」という要件に反する。
+2. id の bounded/unique 性が full id に対して保証されていない。
+   - `sanitize_identifier()` は fragment を最大 120 にするが、`local-pod-` / `local-` prefix 付与後の id は `validate_backend_identifier()` の `MAX_IDENTIFIER_LEN = 120` を超え得る。
+   - sanitize による衝突（例: `foo.bar` と `foo-bar`）も避けられていない。将来 detail endpoint や operation routing を足した時に、一覧で返した id が lookup/validation で拒否される・別 Worker に衝突するリスクがある。
+
+Required fixes:
+- `worker_id` は返却後に確実に backend で再解決できる opaque/stable id にする。raw pod name を authority として外へ出さず、scan した metadata/dir entry から `generated_worker_id -> actual pod dir` を backend 内で照合する、または衝突しない hash/digest を含める。
+- `MAX_IDENTIFIER_LEN` は prefix を含む full id に対して満たすようにし、生成側と検証側の不一致をなくす。
+- 大文字 Ticket ID を含む Pod 名、`.` など sanitize される Pod 名、長い Pod 名、衝突ケースについて、`list_workers()` が返した `worker_id` を `registry.worker()` / `LocalPodRuntime::worker()` で引けるテストを追加する。
+
+Non-blocking note:
+- Ticket acceptance には `nix build .#yoi --no-link` も含まれている一方、coder 報告にはない。必要なら修正後に Orchestrator 判断で実施・明示すること。
+
+---
