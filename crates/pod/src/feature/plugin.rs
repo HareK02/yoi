@@ -22,10 +22,9 @@ use llm_worker::tool::{
 };
 use manifest::plugin::{
     PLUGIN_COMPONENT_INSTANCE_WORLD, PLUGIN_COMPONENT_TOOL_WORLD, PLUGIN_RUNTIME_COMPONENT_KIND,
-    PLUGIN_RUNTIME_WASM_KIND, PluginConfig, PluginDiscoveryLimits, PluginFsGrant,
-    PluginFsOperation, PluginHostApi, PluginPermission, PluginRequestGrant, PluginSurface,
-    PluginToolManifest, PluginWebSocketGrant, ResolvedPluginRecord,
-    read_resolved_plugin_runtime_component,
+    PluginConfig, PluginDiscoveryLimits, PluginFsGrant, PluginFsOperation, PluginHostApi,
+    PluginPermission, PluginRequestGrant, PluginSurface, PluginToolManifest, PluginWebSocketGrant,
+    ResolvedPluginRecord, read_resolved_plugin_runtime_component,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,6 +33,8 @@ use tokio::runtime::{
 };
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+
+const LEGACY_PLUGIN_RUNTIME_WASM_KIND: &str = "wasm";
 
 use super::{
     FeatureDescriptor, FeatureId, FeatureInstallContext, FeatureInstallError, FeatureModule,
@@ -235,12 +236,12 @@ pub fn inspect_resolved_plugin_static(record: &ResolvedPluginRecord) -> PluginSt
                 diagnostic: None,
             }
         }
-        Some(runtime) if runtime.kind == PLUGIN_RUNTIME_WASM_KIND => {
+        Some(runtime) if runtime.kind == LEGACY_PLUGIN_RUNTIME_WASM_KIND => {
             let status = runtime
                 .abi
                 .as_deref()
-                .map(|abi| format!("{PLUGIN_RUNTIME_WASM_KIND}/{abi}"))
-                .unwrap_or_else(|| format!("{PLUGIN_RUNTIME_WASM_KIND}/<missing-abi>"));
+                .map(|abi| format!("{LEGACY_PLUGIN_RUNTIME_WASM_KIND}/{abi}"))
+                .unwrap_or_else(|| format!("{LEGACY_PLUGIN_RUNTIME_WASM_KIND}/<missing-abi>"));
             PluginRuntimeEligibility {
                 eligible: false,
                 status,
@@ -3312,7 +3313,7 @@ impl PluginInstanceRuntime {
             PLUGIN_RUNTIME_COMPONENT_KIND => Err(PluginWasmError::Module(
                 "unsupported or missing plugin component world".to_string(),
             )),
-            PLUGIN_RUNTIME_WASM_KIND => Err(PluginWasmError::Module(
+            LEGACY_PLUGIN_RUNTIME_WASM_KIND => Err(PluginWasmError::Module(
                 "legacy raw wasm plugin runtime is not supported; use wasm-component".to_string(),
             )),
             other => Err(PluginWasmError::Module(format!(
@@ -6036,7 +6037,7 @@ input_schema = {{ type = "object", additionalProperties = true }}
     fn legacy_raw_wasm_runtime_is_rejected_without_fallback_execution() {
         let mut record = record(vec![tool("PluginEcho")]);
         record.manifest.runtime = Some(PluginRuntimeManifest {
-            kind: PLUGIN_RUNTIME_WASM_KIND.to_string(),
+            kind: LEGACY_PLUGIN_RUNTIME_WASM_KIND.to_string(),
             entry: Some("plugin.wasm".to_string()),
             abi: Some("yoi-plugin-wasm-1".to_string()),
             component: None,
