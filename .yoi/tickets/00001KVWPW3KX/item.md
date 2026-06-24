@@ -2,7 +2,7 @@
 title: 'TUI Console: 連続した Thinking block を一つの表示グループにまとめる'
 state: 'inprogress'
 created_at: '2026-06-24T11:39:59Z'
-updated_at: '2026-06-24T12:04:07Z'
+updated_at: '2026-06-24T12:05:13Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['tui-rendering', 'reasoning-display', 'block-aggregation', 'text-selection']

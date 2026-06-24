@@ -115,3 +115,16 @@ Orchestrator acceptance: queued -> inprogress
 - これ以降に worktree-workflow で `/home/hare/Projects/yoi/.worktree/00001KVWPW3KX-thinking-group` を作成し、multi-agent-workflow に接続する。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-24T12:05:13Z -->
+
+## Implementation report
+
+Implementation orchestration update:
+
+- worktree-workflow に従い、implementation worktree `/home/hare/Projects/yoi/.worktree/00001KVWPW3KX-thinking-group` と branch `work/00001KVWPW3KX-thinking-group` を作成した。
+- child worktree では tracked `.yoi` project records を見える状態にし、`.yoi/memory`、local/runtime/log/lock/secret-like `.yoi` paths を sparse-checkout で除外する方針にした。
+- Coder Pod `yoi-coder-00001KVWPW3KX-thinking-group` を sibling として起動した。write scope は child worktree に限定し、runtime workspace root `/home/hare/Projects/yoi` は startup 要件を満たすため non-recursive read のみにした。
+- Coder には root/original workspace と orchestration worktree で read/write/validation/git operation を行わないよう明示した。
+
+---
