@@ -165,3 +165,53 @@ Implementation orchestration update:
 - Coder には root/original workspace と orchestration worktree で read/write/validation/git operation を行わないよう明示した。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVWECEQG-worker-registry at: 2026-06-24T10:57:04Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装概要:
+- `crates/workspace-server/src/hosts.rs`
+  - `WorkerRuntimeRegistry` を追加。
+  - `WorkspaceWorkerRuntime` trait を runtime entry の抽象境界として再整理。
+  - 既存 local Pod metadata 読み取りを `LocalPodRuntime` adapter として registry に登録。
+  - `RuntimeSummary`, `RuntimeCapabilitySummary`, `WorkerCapabilitySummary`, `WorkerWorkspaceSummary`, typed `RuntimeDiagnostic` を追加。
+  - API caller 由来の `host_id` / `worker_id` を backend 側で bounded identifier として検証。
+  - raw session contents / socket path / metadata file path / raw workspace path を summary に出さないよう整理。
+  - metadata の `workspace_root` は runtime workspace identity との照合にだけ使い、API には `current_workspace` summary として出す。
+  - 他 workspace / workspace_root missing の Pod metadata は通常 worker overview から除外し、typed diagnostic のみ返す。
+  - 先行 Ticket `00001KVTNAY20` の low-level launch 境界用 typed request/intent/result shape は維持。
+- `crates/workspace-server/src/server.rs`
+  - server state を `Arc<WorkerRuntimeRegistry>` に変更。
+  - `/api/hosts`, `/api/workers`, `/api/hosts/{host_id}/workers` を registry 経由に変更。
+  - `/api/runtimes` を追加し、runtime overview を返せるようにした。
+  - invalid runtime identifier / unknown worker / unsupported capability の API error mapping を追加。
+  - server tests を registry source / runtime overview / safe summary 仕様に更新。
+- `crates/workspace-server/src/lib.rs`
+  - registry/worker/capability 用 error variant を追加。
+- `crates/workspace-server/src/repositories.rs`
+  - shared typed diagnostic severity に合わせて更新。
+- `web/workspace/src/lib/workspace-sidebar/types.ts`
+  - runtime / capability / worker workspace summary 型を更新。
+  - raw `workspace_root` / local `pod_name` 前提を削除。
+- `web/workspace/src/lib/workspace-pages/WorkspacePage.svelte`
+  - Host/Worker overview 表示を safe summary fields に合わせて更新。
+
+Validation:
+- `cargo test -p yoi-workspace-server`: success
+- `cargo check -p yoi`: success
+- `cd web/workspace && deno task check`: success
+- `cd web/workspace && deno task build`: success
+- `git diff --check`: success
+
+Commit:
+- `9bd15507 feat: add worker runtime registry overview`
+
+Residual risks / notes:
+- remote Host protocol / scheduler / stream proxy / worker control operation は non-goal のまま、typed capability/diagnostic で unsupported/pending を返す境界に留めた。
+- API response から raw workspace/session/private path は出さない方針に寄せたため、UI は workspace path ではなく `current_workspace` scope/identity summary を表示する。
+- `nix build .#yoi --no-link` は Cargo/Deno validation が通過済みだが、最終統合 confidence を上げる場合は Orchestrator 側判断で実行可能。
+
+---
