@@ -1,0 +1,1 @@
+{"id":"orch-plan-20260624-201335-1","ticket_id":"00001KVXK0WEA","kind":"blocked_by","related_ticket":"00001KVXK0WE4","note":"Queue review: `00001KVXK0WEA` は WIT/PDK/templates finishing slice で、implemented WebSocket event/command model `00001KVXK0WE4` に depends_on している。prerequisite completion 後に再 routing する。","author":"yoi-orchestrator","at":"2026-06-24T20:13:35Z"}
