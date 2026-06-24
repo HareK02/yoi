@@ -1,8 +1,8 @@
 ---
 title: 'Abstract Worker runtime registry and overview reporting'
-state: 'planning'
+state: 'ready'
 created_at: '2026-06-24T09:11:38Z'
-updated_at: '2026-06-24T09:11:38Z'
+updated_at: '2026-06-24T09:21:22Z'
 assignee: null
 ---
 
