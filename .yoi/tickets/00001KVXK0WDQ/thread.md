@@ -240,3 +240,64 @@ Non-blocking notes:
 - `cargo test -p pod` は coder 報告では既存の prompt guidance assertion 由来の失敗あり。Plugin-focused tests / `cargo check -p yoi` / nix build は成功報告で、本 Ticket の blocker とは判断しない。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-24T21:51:01Z -->
+
+## Implementation report
+
+Integration outcome:
+
+- Coder `yoi-coder-00001KVXK0WDQ-service-lifecycle` が implementation branch `work/00001KVXK0WDQ-plugin-service-lifecycle` に実装を commit した。
+  - implementation commit: `4e138b7e feat: add plugin service ingress queue`
+- Reviewer `yoi-reviewer-00001KVXK0WDQ-service-lifecycle` は read-only review で `approve`。host-managed in-process lifecycle/queue、bounded queue、serial dispatch、typed diagnostics、Tool path non-regression、scope creep なしを確認した。
+- Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration` で branch `work/00001KVXK0WDQ-plugin-service-lifecycle` を merge 済み。
+  - merge commit: `000afbbe merge: 00001KVXK0WDQ plugin service lifecycle`
+
+Implemented behavior:
+- `crates/pod/src/feature/plugin.rs` に Plugin Service lifecycle state を追加。
+  - `Ready / Starting / Running / Stopping / Stopped / Failed`
+- in-process bounded ingress queue と per-plugin serial dispatch を追加。
+- `PluginIngressEvent` に `source`, `ingress_name`, `payload`, `created_at`, `attempt`, `correlation_id` を追加。
+- `QueueFull`, `InvalidEvent`, `ServiceFailed`, `ServiceStopped`, `DispatchTimeout`, `DispatchFailed` など typed error/diagnostic を追加。
+- status diagnostics に queue depth/capacity, last_error, dispatch_counters, lifecycle diagnostics を追加。
+- Tool Plugin execution は従来の request-response path のまま維持。
+
+Validation in Orchestrator worktree:
+- `cargo test -p pod feature::plugin::tests`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+- `cargo test -p pod`: failed only in known prompt guidance snapshot assertions outside this Plugin diff:
+  - `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`
+  - `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`
+  - Plugin-focused tests in the same run passed, including service lifecycle/queue/timeout/Tool regression coverage.
+
+Notes:
+- Reviewer non-blocking note: current queue processing is sync-step driven, and public delivery enqueues then dispatches immediately under the lock, so normal queue depth is usually 0. This remains within Ticket latitude, but follow-up WebSocket driver/backpressure work should revisit how queue depth is exposed.
+- Follow-up `00001KVXK0WDX` is dependency-unblocked and can be re-routed next.
+
+Next action:
+- Mark Ticket done after this integration/validation evidence.
+- Then stop related child Pods and remove only the child implementation worktree/branch.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-24T21:51:13Z from: inprogress to: done reason: merged_validated_with_unrelated_full_suite_caveat field: state -->
+
+## State changed
+
+Implementation is merged into the orchestration branch and validated with one unrelated known full-suite caveat.
+
+Evidence:
+- merge commit: `000afbbe merge: 00001KVXK0WDQ plugin service lifecycle`
+- reviewer result: approve
+- validation in `/home/hare/Projects/yoi/.worktree/orchestration`:
+  - `cargo test -p pod feature::plugin::tests`: success
+  - `cargo check -p yoi`: success
+  - `git diff --check`: success
+  - `nix build .#yoi --no-link`: success
+  - `cargo test -p pod`: failed only in prompt guidance snapshot assertions outside this Plugin diff; Plugin-focused tests passed.
+
+Closure is not performed here; this state records implementation completion after merge/review/focused validation.
+
+---
