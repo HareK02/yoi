@@ -118,3 +118,18 @@ Orchestrator acceptance: queued -> inprogress
 - これ以降に worktree-workflow で `/home/hare/Projects/yoi/.worktree/00001KVXK0WD3-remove-legacy-wasm-runtime` を作成し、multi-agent-workflow に接続する。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-24T20:14:56Z -->
+
+## Implementation report
+
+Implementation orchestration update:
+
+- queue review で dependency chain を確認し、`00001KVXK0WD3` のみを先頭 prerequisite として受理した。
+- 後続 queued Tickets (`00001KVXK0WDH`, `00001KVXK0WDQ`, `00001KVXK0WDX`, `00001KVXK0WE4`, `00001KVXK0WEA`) は relation/orchestration plan 上の dependency blocker として待機理由を記録した。
+- worktree-workflow に従い、implementation worktree `/home/hare/Projects/yoi/.worktree/00001KVXK0WD3-remove-legacy-wasm-runtime` と branch `work/00001KVXK0WD3-remove-legacy-wasm-runtime` を作成した。
+- child worktree では tracked `.yoi` project records を見える状態にし、`.yoi/memory`、local/runtime/log/lock/secret-like `.yoi` paths を sparse-checkout で除外する方針にした。
+- Coder Pod `yoi-coder-00001KVXK0WD3-legacy-wasm-removal` を sibling として起動した。write scope は child worktree に限定し、runtime workspace root `/home/hare/Projects/yoi` は startup 要件を満たすため non-recursive read のみにした。
+- Coder には root/original workspace と orchestration worktree で read/write/validation/git operation を行わないよう明示した。
+
+---
