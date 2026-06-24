@@ -63,3 +63,92 @@ Next action:
 - その後、この Ticket を再 routing し、必要なら `00001KVTNAY20` の実装結果に合わせて registry abstraction の IntentPacket を作る。
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-24T10:37:25Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- ユーザーから「進めて」と明示 follow-up があり、以前 `queued` のまま待機させた blocker を再確認した。
+- Ticket body は Worker runtime registry / overview reporting / runtime capability / identity / visibility / raw-session boundary / local Pod runtime migration を具体的に列挙しており、observable な acceptance criteria と reviewer focus がある。
+- `TicketRelationQuery` は blocking relation 0 件。
+- 以前の `do_not_parallelize` / waiting-capacity note は `00001KVTNAY20` が `done` になり、merge/validation 済みになったことで解消済みとして扱える。
+- 現在の `crates/workspace-server/src/hosts.rs` には `00001KVTNAY20` の結果として `WorkspaceWorkerRuntime`、typed spawn/stop/proxy request/result、local Pod metadata overview が入り、今回の registry/capability/overview abstraction をその上に重ねられる。残る不確実性は local tactic / bounded investigation に収まる。
+- orchestration worktree は clean で、同一 Ticket 用 worktree/branch はまだ無い。
+
+Evidence checked:
+- Ticket body / thread: `00001KVWECEQG` の item/thread。前回 routing decision 以降の missing planning question はなし。
+- Relations / orchestration plan: relation 0 件。既存 plan は前回の `do_not_parallelize` / waiting-capacity と、今回記録した accepted plan `orch-plan-20260624-103655-3`。
+- Related Ticket: `00001KVTNAY20` は `done`。review approve、orchestration merge、validation success、child cleanup 済み。
+- Code map: `crates/workspace-server/src/hosts.rs`, `crates/workspace-server/src/server.rs` を current orchestration branch で確認。
+- Workspace state: `/home/hare/Projects/yoi/.worktree/orchestration` は clean。
+
+IntentPacket:
+
+Intent:
+- Workspace backend の Worker runtime surface を、single local bridge から registry / host / capability / overview reporting の境界へ抽象化し、Dashboard/API が runtime 一覧・worker 一覧・capability/diagnostic を安全に表示できる基盤を作る。
+
+Binding decisions / invariants:
+- registry/overview は local Pod metadata と role-session/runtime metadata の安全な summary を扱う。raw session contents や unchecked private/runtime paths を API response に出さない。
+- Browser/API 由来の値を runtime authority として扱わない。worker/host id は backend が解決・検証した bounded identifier として扱う。
+- runtime identity / workspace_root / process cwd / role-session claim は混同しない。
+- `00001KVTNAY20` で入った low-level launch boundary と Ticket/role/orchestration resolver separation を崩さない。
+- remote Host protocol、full scheduler、operation UI、stream/proxy 実装、permission/auth の完成、raw session inspection は non-goal。
+
+Requirements / acceptance criteria:
+- Worker runtime registry/service abstraction が、複数 runtime/host summary と capability/diagnostic reporting を表現できる。
+- `LocalRuntimeBridge` 由来の local runtime が registry の一実装/entry として扱われ、API handler が concrete bridge に直接密結合しすぎない。
+- overview response は bounded/safe fields のみで、local Pod metadata failure や unavailable capability を diagnostic として返せる。
+- existing `/api/hosts` / `/api/workers` semantics を維持または明確に migration し、UI が使う shape を壊す場合は対応も含める。
+- validation として少なくとも `cargo test -p yoi-workspace-server`, `cargo check -p yoi`, `cd web/workspace && deno task check && deno task build`, `git diff --check` を実施する。
+
+Implementation latitude:
+- registry trait/struct 名、module split、capability enum/string shape、diagnostic aggregation の詳細は coder が既存 code style に合わせて決めてよい。
+- API の大規模追加ではなく、current endpoints の内部境界整理と typed overview/capability shape の初期導入を優先してよい。
+- UI 変更は必要最小限でよい。既存 web build/typecheck を通すための追随は行ってよい。
+
+Escalate if:
+- Browser/API から raw path/session/executable/profile 等を受けないと実装できない。
+- runtime registry を scheduler/lease/remote Host protocol として固定する必要が出る。
+- `00001KVTNAY20` の launch boundary を戻す/破る必要が出る。
+- raw session content や private metadata を overview に出す必要がある。
+
+Validation:
+- `cargo test -p yoi-workspace-server`
+- `cargo check -p yoi`
+- `cd web/workspace && deno task check && deno task build`
+- `git diff --check`
+- 影響範囲に応じて追加 Rust tests。
+
+Current code map:
+- Primary: `crates/workspace-server/src/hosts.rs`, `crates/workspace-server/src/server.rs`。
+- Secondary: Workspace web API consumers under `web/workspace`, role-session/local metadata helpers if needed, `crates/client/src/spawn.rs` / `crates/client/src/ticket_role.rs` only to preserve boundaries.
+- Avoid: root/original workspace operations, unrelated Panel UI completion, remote Host protocol, scheduler/queue implementation, raw session reading.
+
+Critical risks / reviewer focus:
+- registry abstraction becoming a scheduler or authority layer by accident.
+- leaking raw session/private paths/unchecked metadata into overview responses.
+- host/worker ids derived from user-controlled strings without bounding/validation.
+- breaking the launch boundary from `00001KVTNAY20`.
+- conflating runtime workspace root, process cwd, role-session claim, and local metadata hints.
+
+Next action:
+- `queued -> inprogress` を記録してから、worktree-workflow で `/home/hare/Projects/yoi/.worktree/00001KVWECEQG-worker-runtime-registry` を作成し、multi-agent-workflow で Coder/Reviewer sibling loop に進める。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-24T10:37:43Z from: queued to: inprogress reason: orchestrator_acceptance_unblocked field: state -->
+
+## State changed
+
+Orchestrator acceptance: queued -> inprogress
+
+- 直前確認で `TicketShow` は state `queued`、blocking relation は 0 件。
+- 以前の blocker だった `00001KVTNAY20` は `done` になり、orchestration branch に merge/validated 済み。
+- `TicketOrchestrationPlanQuery` では過去の do_not_parallelize / waiting-capacity note と、今回の accepted plan `orch-plan-20260624-103655-3` を確認した。過去 blocker は解消済みとして扱う。
+- routing decision と IntentPacket は Ticket thread に記録済み。
+- これ以降に worktree-workflow で `/home/hare/Projects/yoi/.worktree/00001KVWECEQG-worker-runtime-registry` を作成し、multi-agent-workflow に接続する。
+
+---
