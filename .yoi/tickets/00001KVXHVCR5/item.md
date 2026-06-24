@@ -1,9 +1,11 @@
 ---
 title: 'Redesign Plugin WASM runtime API and execution model'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-24T19:31:28Z'
-updated_at: '2026-06-24T19:39:33Z'
+updated_at: '2026-06-24T19:39:36Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-24T19:39:36Z'
 ---
 
 ## 背景
