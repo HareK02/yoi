@@ -128,3 +128,28 @@ Implementation orchestration update:
 - Coder には root/original workspace と orchestration worktree で read/write/validation/git operation を行わないよう明示した。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVWPW3KX-thinking-group at: 2026-06-24T12:18:51Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+確認内容:
+- child worktree の `.yoi/tickets/00001KVWPW3KX/item.md` / `thread.md` / implementation report / `5c9331e8..HEAD` diff を read-only 確認。
+- 変更範囲は `crates/tui/src/ui.rs` の Console history rendering と、既存 dashboard test fixture の必須 field 追加に限定されている。
+- `compute_history` で `Block::Thinking` のみを render-time に連続消費し、source block sequence / history / protocol / persistence は変更していない。
+- 単独 Thinking は既存 `render_thinking` に委譲され、複数 Thinking のみ `render_thinking_group` で集約される。
+- `TurnHeader` や `AssistantText` など non-Thinking を跨ぐ grouping は起きない構造で、focused tests も追加されている。
+- streaming / incomplete は group header と preview/detail に反映され、未完了 Thinking を finalized text と混同する変更はない。
+- group 行は `selectable=false` で追加されており、Thinking を copyable transcript text にする変更はない。
+- Read tool aggregation / single ToolCall rendering の回帰確認テストも追加されている。
+
+Validation:
+- reviewer: `git diff --check 5c9331e8..HEAD`: PASS
+- cargo 系は read-only/no-write 指示に合わせて再実行せず、implementation report の結果を確認した。
+
+Non-blocking note:
+- 実端末での目視確認は未実施だが、`compute_history` の行生成・selectable 属性を中心にテストされており、Ticket acceptance には十分。
+
+---
