@@ -133,3 +133,43 @@ Implementation orchestration update:
 - Coder には root/original workspace と orchestration worktree で read/write/validation/git operation を行わないよう明示した。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVXK0WD3-legacy-wasm-removal at: 2026-06-24T20:43:50Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装概要:
+- `PluginInstanceRuntime::LegacyToolAdapter` 相当の raw core-WASM fallback 実行経路を削除した。
+- `wasm-component` の Tool world は `ComponentToolAdapter` として明示的に扱い、ToolRegistry 経由の実行は `run_plugin_component_tool` のみを使うよう変更した。
+- raw `wasm` runtime metadata は static inspection / instance startup の両方で非対応として扱い、実行 fallback しないようにした。
+- Component Model Plugin Tool / Component Instance 実行経路、host API grant boundary、ToolRegistry 登録経路は維持した。
+- raw WASM 実行用の `wasmi` 依存・テスト・古い helper を削除した。
+- `package.nix` の `cargoHash` を更新した。
+- Component Model design doc の現状記述を active runtime に合わせて更新した。
+
+変更ファイル:
+- `crates/pod/src/feature/plugin.rs`
+- `crates/pod/Cargo.toml`
+- `Cargo.lock`
+- `package.nix`
+- `docs/design/plugin-component-model.md`
+
+Validation:
+- `cargo test -p pod feature::plugin --lib`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+- `cargo test -p pod`: failed in unrelated prompt snapshot tests:
+  - `workflow::tests::workflow_usage_guidance_contract_snapshot_matches_prompt_resource`
+  - `tests::companion_prompt_matches_resource_snapshot`
+
+Commit:
+- `741d71327aec213e564d47a4b4c37141c727803c refactor: remove legacy wasm plugin runtime`
+
+Residual risks / notes:
+- Full `cargo test -p pod` failure appears unrelated to this Plugin runtime change and was not fixed here.
+- Follow-up Ticket `00001KVXK0WDH` remains responsible for manifest / CLI legacy runtime rejection UX. This implementation only removes active runtime fallback and minimal static inspection consistency.
+
+---
