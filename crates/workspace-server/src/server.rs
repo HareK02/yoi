@@ -726,7 +726,10 @@ mod tests {
         let hosts = get_json(app.clone(), "/api/hosts").await;
         assert_eq!(hosts["source"], "worker_runtime_registry");
         assert_eq!(hosts["items"][0]["runtime_id"], "local-pod-runtime");
-        assert_eq!(hosts["items"][0]["host_id"], TEST_REPOSITORY_ID);
+        let host_id = hosts["items"][0]["host_id"].as_str().unwrap().to_string();
+        assert!(host_id.starts_with("local-"));
+        assert!(host_id.len() <= 120);
+        assert_ne!(host_id, TEST_REPOSITORY_ID);
         assert_eq!(hosts["items"][0]["kind"], "local-pod-host");
         assert_eq!(
             hosts["items"][0]["capabilities"]["local_pod_inspection"],
@@ -741,7 +744,7 @@ mod tests {
         let runtimes = get_json(app.clone(), "/api/runtimes").await;
         assert_eq!(runtimes["source"], "worker_runtime_registry");
         assert_eq!(runtimes["items"][0]["runtime_id"], "local-pod-runtime");
-        assert_eq!(runtimes["items"][0]["host_ids"][0], TEST_REPOSITORY_ID);
+        assert_eq!(runtimes["items"][0]["host_ids"][0], host_id);
 
         let workers = get_json(app.clone(), "/api/workers").await;
         assert!(workers["items"].as_array().unwrap().is_empty());
@@ -750,11 +753,7 @@ mod tests {
             "local_pod_registry_unreadable"
         );
 
-        let host_workers = get_json(
-            app.clone(),
-            &format!("/api/hosts/{TEST_REPOSITORY_ID}/workers"),
-        )
-        .await;
+        let host_workers = get_json(app.clone(), &format!("/api/hosts/{host_id}/workers")).await;
         assert!(host_workers["items"].as_array().unwrap().is_empty());
 
         let runs_response = app

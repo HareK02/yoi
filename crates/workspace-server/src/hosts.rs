@@ -3,6 +3,7 @@ use chrono::Utc;
 use pod_store::PodMetadata;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs,
@@ -15,6 +16,7 @@ const LOCAL_HOST_KIND: &str = "local-pod-host";
 const MAX_DIAGNOSTICS: usize = 16;
 const MAX_HOST_SCAN: usize = 256;
 const MAX_IDENTIFIER_LEN: usize = 120;
+const ID_DIGEST_HEX_LEN: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeDiagnostic {
@@ -448,6 +450,31 @@ impl LocalPodRuntime {
         self.data_dir.as_ref().map(|dir| dir.join("pods"))
     }
 
+    fn pod_names(&self, pod_root: &Path) -> Result<BTreeSet<String>, RuntimeDiagnostic> {
+        let entries = fs::read_dir(pod_root).map_err(|err| {
+            diagnostic(
+                "local_pod_registry_unreadable",
+                DiagnosticSeverity::Warning,
+                format!("local Pod registry could not be read: {err}"),
+            )
+        })?;
+
+        let mut pod_names = BTreeSet::new();
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(|name| name.to_string()) else {
+                continue;
+            };
+            pod_names.insert(name);
+        }
+        Ok(pod_names)
+    }
+
     fn read_worker(&self, pod_root: &Path, pod_name: &str) -> WorkerReadOutcome {
         let metadata_path = pod_root.join(pod_name).join("metadata.json");
         let data = match fs::read_to_string(metadata_path) {
@@ -618,33 +645,10 @@ impl WorkspaceWorkerRuntime for LocalPodRuntime {
 
         let mut workers = Vec::new();
         let mut diagnostics = Vec::new();
-        let entries = match fs::read_dir(&pod_root) {
-            Ok(entries) => entries,
-            Err(err) => {
-                return RuntimeList::new(
-                    Vec::new(),
-                    vec![diagnostic(
-                        "local_pod_registry_unreadable",
-                        DiagnosticSeverity::Warning,
-                        format!("local Pod registry could not be read: {err}"),
-                    )],
-                );
-            }
+        let pod_names = match self.pod_names(&pod_root) {
+            Ok(pod_names) => pod_names,
+            Err(diag) => return RuntimeList::new(Vec::new(), vec![diag]),
         };
-
-        let mut pod_names = BTreeSet::new();
-        for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-            let Some(name) = entry.file_name().to_str().map(|name| name.to_string()) else {
-                continue;
-            };
-            pod_names.insert(name);
-        }
 
         for pod_name in pod_names {
             if workers.len() >= limit {
@@ -663,22 +667,43 @@ impl WorkspaceWorkerRuntime for LocalPodRuntime {
     }
 
     fn worker(&self, worker_id: &str) -> WorkerLookupResult {
-        let worker = worker_id
-            .strip_prefix("local-pod-")
-            .and_then(|pod_name| {
-                self.pod_root()
-                    .map(|pod_root| (pod_root, pod_name.to_string()))
-            })
-            .and_then(
-                |(pod_root, pod_name)| match self.read_worker(&pod_root, &pod_name) {
-                    WorkerReadOutcome::Worker(worker) if worker.worker_id == worker_id => {
-                        Some(worker)
-                    }
-                    _ => None,
+        let Some(pod_root) = self.pod_root() else {
+            return WorkerLookupResult {
+                worker: None,
+                diagnostics: vec![diagnostic(
+                    "local_pod_registry_unavailable",
+                    DiagnosticSeverity::Warning,
+                    "local Pod data directory is not configured; worker discovery is unavailable"
+                        .to_string(),
+                )],
+            };
+        };
+        let pod_names = match self.pod_names(&pod_root) {
+            Ok(pod_names) => pod_names,
+            Err(diag) => {
+                return WorkerLookupResult {
+                    worker: None,
+                    diagnostics: vec![diag],
+                };
+            }
+        };
+        for pod_name in pod_names {
+            if worker_id_for_pod(&pod_name) != worker_id {
+                continue;
+            }
+            return match self.read_worker(&pod_root, &pod_name) {
+                WorkerReadOutcome::Worker(worker) => WorkerLookupResult {
+                    worker: Some(worker),
+                    diagnostics: Vec::new(),
                 },
-            );
+                WorkerReadOutcome::Diagnostic(diag) => WorkerLookupResult {
+                    worker: None,
+                    diagnostics: vec![diag],
+                },
+            };
+        }
         WorkerLookupResult {
-            worker,
+            worker: None,
             diagnostics: Vec::new(),
         }
     }
@@ -733,14 +758,47 @@ fn diagnostic(
 }
 
 fn host_id_for_workspace(workspace_id: &str) -> String {
-    format!("local-{}", sanitize_identifier(workspace_id))
+    bounded_backend_identifier("local-", workspace_id)
 }
 
 fn worker_id_for_pod(pod_name: &str) -> String {
-    format!("local-pod-{}", sanitize_identifier(pod_name))
+    bounded_backend_identifier("local-pod-", pod_name)
 }
 
-fn sanitize_identifier(value: &str) -> String {
+fn bounded_backend_identifier(prefix: &str, value: &str) -> String {
+    let digest = digest_hex(value.as_bytes(), ID_DIGEST_HEX_LEN);
+    let mut body = sanitize_identifier_body(value);
+    if body.is_empty() {
+        body = "id".to_string();
+    }
+
+    let suffix_len = 1 + ID_DIGEST_HEX_LEN;
+    let body_budget = MAX_IDENTIFIER_LEN
+        .saturating_sub(prefix.len())
+        .saturating_sub(suffix_len)
+        .max(1);
+    if body.len() > body_budget {
+        body.truncate(body_budget);
+        body = body.trim_matches('-').to_string();
+        if body.is_empty() {
+            body = "id".to_string();
+        }
+    }
+
+    let mut id = format!("{prefix}{body}-{digest}");
+    if id.len() > MAX_IDENTIFIER_LEN {
+        let digest_suffix = format!("-{digest}");
+        let prefix_budget = MAX_IDENTIFIER_LEN.saturating_sub(digest_suffix.len());
+        id = format!(
+            "{}{}",
+            prefix.chars().take(prefix_budget).collect::<String>(),
+            digest_suffix
+        );
+    }
+    id
+}
+
+fn sanitize_identifier_body(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         if ch.is_ascii_alphanumeric() {
@@ -751,14 +809,20 @@ fn sanitize_identifier(value: &str) -> String {
             out.push('-');
         }
     }
-    let out = out.trim_matches('-').to_string();
-    if out.is_empty() {
-        "workspace".to_string()
-    } else if out.len() > MAX_IDENTIFIER_LEN {
-        out.chars().take(MAX_IDENTIFIER_LEN).collect()
-    } else {
-        out
+    out.trim_matches('-').to_string()
+}
+
+fn digest_hex(bytes: &[u8], hex_len: usize) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(hex_len);
+    for byte in digest {
+        if out.len() >= hex_len {
+            break;
+        }
+        out.push_str(&format!("{byte:02x}"));
     }
+    out.truncate(hex_len);
+    out
 }
 
 fn validate_backend_identifier(
@@ -917,6 +981,15 @@ mod tests {
         metadata
     }
 
+    fn assert_valid_generated_id(id: &str) {
+        assert!(id.len() <= MAX_IDENTIFIER_LEN, "id too long: {id}");
+        validate_backend_identifier("test_id", id).unwrap();
+    }
+
+    fn host_id() -> String {
+        host_id_for_workspace("local:test")
+    }
+
     #[test]
     fn local_runtime_reports_host_without_private_paths() {
         let bridge = LocalPodRuntime::new("local:test", "/workspace/project", None);
@@ -924,7 +997,8 @@ mod tests {
         assert_eq!(hosts.items.len(), 1);
         let host = &hosts.items[0];
         assert_eq!(host.runtime_id, LOCAL_RUNTIME_ID);
-        assert_eq!(host.host_id, "local-local-test");
+        assert_eq!(host.host_id, host_id());
+        assert_valid_generated_id(&host.host_id);
         assert_eq!(host.capabilities.local_pod_inspection, "unavailable");
         assert_eq!(host.capabilities.workspace_scope, "current_workspace");
         let json = serde_json::to_string(host).unwrap();
@@ -944,17 +1018,19 @@ mod tests {
 
         let runtimes = registry.list_runtimes(10);
         assert_eq!(runtimes.items[0].runtime_id, LOCAL_RUNTIME_ID);
-        assert_eq!(runtimes.items[0].host_ids, vec!["local-local-test"]);
+        assert_eq!(runtimes.items[0].host_ids, vec![host_id()]);
 
         let hosts = registry.list_hosts(10);
-        assert_eq!(hosts.items[0].host_id, "local-local-test");
+        assert_eq!(hosts.items[0].host_id, host_id());
+        assert_valid_generated_id(&hosts.items[0].host_id);
 
         let workers = registry.list_workers(10);
         assert_eq!(workers.items.len(), 1);
         let worker = &workers.items[0];
         assert_eq!(worker.runtime_id, LOCAL_RUNTIME_ID);
-        assert_eq!(worker.worker_id, "local-pod-coder");
-        assert_eq!(worker.host_id, "local-local-test");
+        assert_eq!(worker.worker_id, worker_id_for_pod("coder"));
+        assert_valid_generated_id(&worker.worker_id);
+        assert_eq!(worker.host_id, host_id());
         assert_eq!(worker.workspace.visibility, "current_workspace");
         assert_eq!(worker.implementation.display_hint, "coder");
         let json = serde_json::to_string(worker).unwrap();
@@ -972,9 +1048,7 @@ mod tests {
             Some(temp.path().to_path_buf()),
         ));
 
-        let workers = registry
-            .list_workers_for_host("local-local-test", 10)
-            .unwrap();
+        let workers = registry.list_workers_for_host(&host_id(), 10).unwrap();
         assert_eq!(workers.items.len(), 1);
         assert!(matches!(
             registry.list_workers_for_host("../secret", 10),
@@ -1021,9 +1095,66 @@ mod tests {
             "/workspace/project",
             Some(temp.path().to_path_buf()),
         );
-        let worker = bridge.worker("local-pod-coder").worker.unwrap();
+        let worker_id = worker_id_for_pod("coder");
+        let worker = bridge.worker(&worker_id).worker.unwrap();
         assert_eq!(worker.label, "coder");
         assert_eq!(worker.workspace.identity, "runtime_workspace");
-        assert!(bridge.worker("local-pod-missing").worker.is_none());
+        assert!(
+            bridge
+                .worker(&worker_id_for_pod("missing"))
+                .worker
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn generated_worker_ids_are_opaque_bounded_unique_and_resolvable() {
+        let temp = TempDir::new().unwrap();
+        let long_a = format!("{}-A", "TicketWorkerWithVeryLongName".repeat(8));
+        let long_b = format!("{}-B", "TicketWorkerWithVeryLongName".repeat(8));
+        let pod_names = vec![
+            "00001KVWECEQG-Coder.Pod".to_string(),
+            "foo.bar".to_string(),
+            "foo-bar".to_string(),
+            "Ticket#Worker@Reviewer".to_string(),
+            long_a,
+            long_b,
+        ];
+        for pod_name in &pod_names {
+            write_metadata(temp.path(), pod_name, &metadata(Some("/workspace/project")));
+        }
+        let bridge = LocalPodRuntime::new(
+            "local:test",
+            "/workspace/project",
+            Some(temp.path().to_path_buf()),
+        );
+        let registry = WorkerRuntimeRegistry::for_local_pods(bridge.clone());
+
+        let listed = registry.list_workers(100);
+        assert_eq!(listed.items.len(), pod_names.len());
+        let mut ids = BTreeSet::new();
+        for worker in listed.items {
+            assert_valid_generated_id(&worker.worker_id);
+            assert!(
+                ids.insert(worker.worker_id.clone()),
+                "duplicate id: {}",
+                worker.worker_id
+            );
+            assert!(!worker.worker_id.contains('.'));
+            assert!(!worker.worker_id.contains('@'));
+            assert!(!worker.worker_id.contains('#'));
+
+            let from_registry = registry.worker(&worker.worker_id).unwrap();
+            assert_eq!(from_registry.worker_id, worker.worker_id);
+            let from_runtime = bridge.worker(&worker.worker_id).worker.unwrap();
+            assert_eq!(from_runtime.worker_id, worker.worker_id);
+        }
+
+        let dotted = worker_id_for_pod("foo.bar");
+        let dashed = worker_id_for_pod("foo-bar");
+        assert_ne!(dotted, dashed);
+        assert!(ids.contains(&dotted));
+        assert!(ids.contains(&dashed));
+        assert!(ids.iter().any(|id| id.len() == MAX_IDENTIFIER_LEN));
     }
 }
