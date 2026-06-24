@@ -173,3 +173,29 @@ Residual risks / notes:
 - Follow-up Ticket `00001KVXK0WDH` remains responsible for manifest / CLI legacy runtime rejection UX. This implementation only removes active runtime fallback and minimal static inspection consistency.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVXK0WD3-legacy-wasm-removal at: 2026-06-24T20:48:55Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+確認範囲:
+- child worktree `/home/hare/Projects/yoi/.worktree/00001KVXK0WD3-remove-legacy-wasm-runtime` のみで read-only inspection。
+- Ticket / IntentPacket / `1b5a39db..HEAD` の diff を確認。
+- reviewer では cargo/nix は再実行していない。`git diff --check 1b5a39db..HEAD` は問題なし。
+
+承認根拠:
+- Ticket / IntentPacket の核心である「Pod Plugin runtime の active execution path から legacy raw core-WASM Tool adapter を削除し、Component Model path に一本化」が満たされている。
+- `crates/pod/src/feature/plugin.rs` から `LegacyToolAdapter` / `PluginWasmTool` / `run_plugin_wasm_tool` / `wasmi` host adapter 系が削除され、`crates/pod/Cargo.toml` からも `wasmi` dependency が削除されている。
+- raw `wasm` runtime は static inspection で `eligible: false` かつ active execution path ではない diagnostic になり、`PluginInstanceRuntime::new` でも `PLUGIN_RUNTIME_WASM_KIND` が fail-closed するため、fallback 実行は残っていない。
+- Component Model Tool path は `ComponentToolAdapter -> run_plugin_component_tool -> read_resolved_plugin_runtime_component -> wasmtime::component` に整理され、ToolRegistry 登録も既存の `ToolContribution` / `plugin_instance_tool_definition` 経由を維持している。
+- Host API grant / digest binding / tool permission validation は `authorize_plugin_tool`、`authorize_plugin_host_api`、`validate_component_imports` 側で維持され、component import permission/grant check tests も残っている。
+- Manifest / CLI rejection UX には踏み込んでおらず、raw `wasm` constants / manifest parsing が残っているのは後続 Ticket `00001KVXK0WDH` の範囲として許容できる。
+- Service / Ingress / WebSocket / WIT / PDK runtime への不要な scope creep は見当たらない。
+
+Non-blocking notes:
+- 報告された `cargo test -p pod` 全体失敗は prompt snapshot 2 件で、今回 diff の変更対象外に見えるため blocker とは判断しない。ただし完了処理時には既知 unrelated failure として扱う根拠を残すか、別対応後に再実行するのが安全。
+- `docs/development/plugin-development.md` には raw core-Wasm compatibility がまだ有効に読める文言が残っている。今回 Ticket の主目的は active runtime removal で、外向き rejection/docs 全面更新は後続範囲なので blocker ではないが、後続 Ticket で整理した方がよい。
+
+---
