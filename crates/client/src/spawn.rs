@@ -23,7 +23,7 @@ const READY_PREFIX: &str = "YOI-READY\t";
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpawnConfig {
+pub struct PodProcessLaunchConfig {
     pub runtime_command: PodRuntimeCommand,
     /// `pod.name` として使う識別子。runtime ディレクトリ
     /// (`manifest::paths::pod_runtime_dir`) の解決と、ready 行に乗る
@@ -32,9 +32,6 @@ pub struct SpawnConfig {
     /// Optional reusable Profile selector. Pod identity is always supplied
     /// separately with `--pod`; profile selection must not imply a name.
     pub profile: Option<String>,
-    /// Process-local Ticket role marker supplied only by Ticket role launches.
-    /// This does not alter prompts, manifests, or Ticket claim records.
-    pub ticket_role: Option<String>,
     /// Explicit runtime workspace root. The child receives it via
     /// `--workspace` so startup does not infer workspace identity from the
     /// parent process cwd.
@@ -47,6 +44,28 @@ pub struct SpawnConfig {
     /// resume させる。
     pub resume_from: Option<Uuid>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PodProcessLaunchOptions {
+    /// Extra child CLI arguments supplied by an upper resolver layer. The
+    /// low-level launch config intentionally does not model Ticket IDs,
+    /// Ticket roles, orchestration roles, executable authority, or raw
+    /// browser-provided profile/cwd/workspace inputs.
+    pub extra_args: Vec<String>,
+}
+
+impl PodProcessLaunchOptions {
+    pub fn with_hidden_arg(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_args.extend([name.into(), value.into()]);
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.extra_args.is_empty()
+    }
+}
+
+pub type SpawnConfig = PodProcessLaunchConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnReady {
@@ -112,7 +131,7 @@ impl From<io::Error> for SpawnError {
     }
 }
 
-fn runtime_args(config: &SpawnConfig) -> Vec<String> {
+fn runtime_args(config: &PodProcessLaunchConfig, options: &PodProcessLaunchOptions) -> Vec<String> {
     let mut args = vec![
         "--workspace".to_string(),
         config.workspace_root.display().to_string(),
@@ -130,9 +149,7 @@ fn runtime_args(config: &SpawnConfig) -> Vec<String> {
             args.extend(["--profile".to_string(), profile.clone()]);
         }
     }
-    if let Some(ticket_role) = &config.ticket_role {
-        args.extend(["--ticket-role".to_string(), ticket_role.clone()]);
-    }
+    args.extend(options.extra_args.clone());
     args
 }
 
@@ -140,7 +157,21 @@ fn runtime_args(config: &SpawnConfig) -> Vec<String> {
 ///
 /// `progress` は ready 行を見つけるまでに観測した stderr の各行で呼ばれる
 /// (ready 行自体は除外される)。UI の表示更新や E2E ログ取得に使う。
-pub async fn spawn_pod<F>(config: SpawnConfig, mut progress: F) -> Result<SpawnReady, SpawnError>
+pub async fn spawn_pod<F>(
+    config: PodProcessLaunchConfig,
+    progress: F,
+) -> Result<SpawnReady, SpawnError>
+where
+    F: FnMut(&str),
+{
+    spawn_pod_with_options(config, PodProcessLaunchOptions::default(), progress).await
+}
+
+pub async fn spawn_pod_with_options<F>(
+    config: PodProcessLaunchConfig,
+    options: PodProcessLaunchOptions,
+    mut progress: F,
+) -> Result<SpawnReady, SpawnError>
 where
     F: FnMut(&str),
 {
@@ -158,7 +189,7 @@ where
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_file))
         .process_group(0);
-    for arg in runtime_args(&config) {
+    for arg in runtime_args(&config, &options) {
         command.arg(arg);
     }
     let mut child = command
@@ -332,12 +363,11 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
 
-    fn base_config() -> SpawnConfig {
-        SpawnConfig {
+    fn base_config() -> PodProcessLaunchConfig {
+        PodProcessLaunchConfig {
             runtime_command: PodRuntimeCommand::new("/bin/yoi", vec![OsString::from("pod")]),
             pod_name: "explicit-pod".to_string(),
             profile: Some("project:companion".to_string()),
-            ticket_role: None,
             workspace_root: PathBuf::from("/work/other-project"),
             cwd: None,
             resume_from: None,
@@ -347,7 +377,7 @@ mod tests {
     #[test]
     fn runtime_args_keep_workspace_pod_and_profile_separate() {
         assert_eq!(
-            runtime_args(&base_config()),
+            runtime_args(&base_config(), &PodProcessLaunchOptions::default()),
             vec![
                 "--workspace",
                 "/work/other-project",
@@ -364,7 +394,7 @@ mod tests {
         let mut config = base_config();
         config.resume_from = Some(Uuid::nil());
         assert_eq!(
-            runtime_args(&config),
+            runtime_args(&config, &PodProcessLaunchOptions::default()),
             vec![
                 "--workspace",
                 "/work/other-project",
@@ -377,13 +407,16 @@ mod tests {
     }
 
     #[test]
-    fn runtime_args_do_not_include_child_cwd() {
+    fn runtime_args_include_upper_resolver_extra_args_without_child_cwd() {
         let mut config = base_config();
-        config.ticket_role = Some("orchestrator".to_string());
         config.cwd = Some(PathBuf::from("/work/main/.worktree/orchestration/yoi"));
 
         assert_eq!(
-            runtime_args(&config),
+            runtime_args(
+                &config,
+                &PodProcessLaunchOptions::default()
+                    .with_hidden_arg("--ticket-role", "orchestrator"),
+            ),
             vec![
                 "--workspace",
                 "/work/other-project",

@@ -25,35 +25,70 @@ export type Diagnostic = {
   message: string;
 };
 
+export type RuntimeCapabilities = {
+  can_list_hosts: boolean;
+  can_list_workers: boolean;
+  can_get_worker: boolean;
+  can_spawn_worker: boolean;
+  can_stop_worker: boolean;
+  can_accept_input: boolean;
+  can_stream_events: boolean;
+  can_read_bounded_transcript: boolean;
+  has_workspace_fs: boolean;
+  has_shell: boolean;
+  has_git: boolean;
+  supports_worktrees: boolean;
+  supports_backend_internal_tools: boolean;
+  local_pod_inspection: string;
+  workspace_scope: string;
+  os: string;
+  arch: string;
+  max_workers: number;
+};
+
+export type Runtime = {
+  runtime_id: string;
+  label: string;
+  kind: string;
+  status: string;
+  host_ids: string[];
+  capabilities: RuntimeCapabilities;
+  diagnostics: Diagnostic[];
+};
+
 export type Host = {
+  runtime_id: string;
   host_id: string;
   label: string;
   kind: string;
   status: string;
   observed_at: string;
-  last_seen_at: string;
-  capabilities: {
-    local_pod_inspection: string;
-    workspace_root: string;
-    os: string;
-    arch: string;
-    max_workers: number;
-  };
+  last_seen_at: string | null;
+  capabilities: RuntimeCapabilities;
   diagnostics: Diagnostic[];
 };
 
+export type WorkerCapabilities = {
+  can_accept_input: boolean;
+  can_stream_events: boolean;
+  can_stop: boolean;
+  can_spawn_followup: boolean;
+  can_read_bounded_transcript: boolean;
+};
+
 export type Worker = {
+  runtime_id: string;
   worker_id: string;
   host_id: string;
   label: string;
-  pod_name: string;
-  role?: string;
-  profile?: string;
-  workspace_root?: string;
+  role?: string | null;
+  profile?: string | null;
+  workspace: { visibility: string; identity: string };
   state: string;
   status: string;
-  last_seen_at?: string;
-  implementation: { kind: string; pod_name: string };
+  last_seen_at?: string | null;
+  implementation: { kind: string; display_hint: string };
+  capabilities: WorkerCapabilities;
   diagnostics: Diagnostic[];
 };
 

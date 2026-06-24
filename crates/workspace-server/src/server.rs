@@ -10,7 +10,10 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use crate::hosts::{HostSummary, LocalRuntimeBridge, RuntimeDiagnostic, WorkerSummary};
+use crate::hosts::{
+    DiagnosticSeverity, HostSummary, LocalPodRuntime, RuntimeDiagnostic, RuntimeSummary,
+    WorkerRuntimeRegistry, WorkerSummary,
+};
 use crate::identity::WorkspaceIdentity;
 use crate::records::{
     LocalProjectRecordReader, ObjectiveDetail, ProjectRecordList, TicketDetail, TicketSummary,
@@ -61,6 +64,7 @@ pub struct WorkspaceApi {
     config: ServerConfig,
     store: Arc<dyn ControlPlaneStore>,
     records: LocalProjectRecordReader,
+    runtime: Arc<WorkerRuntimeRegistry>,
 }
 
 impl WorkspaceApi {
@@ -74,23 +78,21 @@ impl WorkspaceApi {
                 updated_at: config.workspace_created_at.clone(),
             })
             .await?;
+        let runtime = Arc::new(WorkerRuntimeRegistry::for_local_pods(LocalPodRuntime::new(
+            config.workspace_id.clone(),
+            config.workspace_root.clone(),
+            config.local_runtime_data_dir.clone(),
+        )));
         Ok(Self {
             records: LocalProjectRecordReader::new(config.workspace_root.clone()),
             config,
             store,
+            runtime,
         })
     }
 
     pub fn workspace_id(&self) -> &str {
         self.config.workspace_id.as_str()
-    }
-
-    fn local_runtime_bridge(&self) -> LocalRuntimeBridge {
-        LocalRuntimeBridge::new(
-            self.config.workspace_id.clone(),
-            self.config.workspace_root.clone(),
-            self.config.local_runtime_data_dir.clone(),
-        )
     }
 
     fn local_repository_reader(&self) -> LocalRepositoryReader {
@@ -124,6 +126,7 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             get(repository_tickets),
         )
         .route("/api/hosts", get(list_hosts))
+        .route("/api/runtimes", get(list_runtimes))
         .route("/api/workers", get(list_workers))
         .route("/api/hosts/{host_id}/workers", get(list_host_workers))
         .fallback(get(static_or_spa_fallback))
@@ -380,7 +383,7 @@ async fn repository_tickets(
         source: "workspace_local_ticket_fallback".to_string(),
         diagnostics: vec![RuntimeDiagnostic {
             code: "repository_ticket_target_metadata_absent".to_string(),
-            severity: "info".to_string(),
+            severity: DiagnosticSeverity::Info,
             message: "Ticket target Repository metadata is not available yet; Kanban groups all workspace-local Tickets by state as a read-only fallback.".to_string(),
         }],
     }))
@@ -390,14 +393,27 @@ async fn list_hosts(
     State(api): State<WorkspaceApi>,
 ) -> ApiResult<Json<RuntimeListResponse<HostSummary>>> {
     let limit = api.config.max_records.min(200);
-    let bridge = api.local_runtime_bridge();
-    let (items, diagnostics) = bridge.list_hosts(limit);
+    let runtime_hosts = api.runtime.list_hosts(limit);
     Ok(Json(RuntimeListResponse {
         workspace_id: api.config.workspace_id,
         limit,
-        items,
-        source: "local_pod_metadata".to_string(),
-        diagnostics,
+        items: runtime_hosts.items,
+        source: "worker_runtime_registry".to_string(),
+        diagnostics: runtime_hosts.diagnostics,
+    }))
+}
+
+async fn list_runtimes(
+    State(api): State<WorkspaceApi>,
+) -> ApiResult<Json<RuntimeListResponse<RuntimeSummary>>> {
+    let limit = api.config.max_records.min(200);
+    let runtimes = api.runtime.list_runtimes(limit);
+    Ok(Json(RuntimeListResponse {
+        workspace_id: api.config.workspace_id,
+        limit,
+        items: runtimes.items,
+        source: "worker_runtime_registry".to_string(),
+        diagnostics: runtimes.diagnostics,
     }))
 }
 
@@ -411,23 +427,29 @@ async fn list_host_workers(
     State(api): State<WorkspaceApi>,
     AxumPath(host_id): AxumPath<String>,
 ) -> ApiResult<Json<RuntimeListResponse<WorkerSummary>>> {
-    let bridge = api.local_runtime_bridge();
-    if host_id != bridge.host_id() {
-        return Err(Error::UnknownHost(host_id).into());
-    }
-    workers_response(api).map(Json)
+    let limit = api.config.max_records.min(200);
+    let runtime_workers = api
+        .runtime
+        .list_workers_for_host(&host_id, limit)
+        .map_err(|err| err.into_error())?;
+    Ok(Json(RuntimeListResponse {
+        workspace_id: api.config.workspace_id,
+        limit,
+        items: runtime_workers.items,
+        source: "worker_runtime_registry".to_string(),
+        diagnostics: runtime_workers.diagnostics,
+    }))
 }
 
 fn workers_response(api: WorkspaceApi) -> ApiResult<RuntimeListResponse<WorkerSummary>> {
     let limit = api.config.max_records.min(200);
-    let bridge = api.local_runtime_bridge();
-    let (items, diagnostics) = bridge.list_workers(limit);
+    let runtime_workers = api.runtime.list_workers(limit);
     Ok(RuntimeListResponse {
         workspace_id: api.config.workspace_id,
         limit,
-        items,
-        source: "local_pod_metadata".to_string(),
-        diagnostics,
+        items: runtime_workers.items,
+        source: "worker_runtime_registry".to_string(),
+        diagnostics: runtime_workers.diagnostics,
     })
 }
 
@@ -585,11 +607,14 @@ impl From<Error> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self.0 {
+            Error::InvalidRuntimeIdentifier { .. } => StatusCode::BAD_REQUEST,
             Error::InvalidRecordId(_)
             | Error::MissingFrontmatter(_)
             | Error::UnknownHost(_)
+            | Error::UnknownWorker(_)
             | Error::UnknownRepository(_) => StatusCode::NOT_FOUND,
             Error::Ticket(_) => StatusCode::NOT_FOUND,
+            Error::RuntimeCapabilityUnsupported { .. } => StatusCode::NOT_IMPLEMENTED,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (
@@ -699,25 +724,36 @@ mod tests {
         assert_eq!(unknown_repository_response.status(), StatusCode::NOT_FOUND);
 
         let hosts = get_json(app.clone(), "/api/hosts").await;
-        assert_eq!(hosts["items"][0]["host_id"], TEST_REPOSITORY_ID);
-        assert_eq!(hosts["items"][0]["kind"], "local_host");
+        assert_eq!(hosts["source"], "worker_runtime_registry");
+        assert_eq!(hosts["items"][0]["runtime_id"], "local-pod-runtime");
+        let host_id = hosts["items"][0]["host_id"].as_str().unwrap().to_string();
+        assert!(host_id.starts_with("local-"));
+        assert!(host_id.len() <= 120);
+        assert_ne!(host_id, TEST_REPOSITORY_ID);
+        assert_eq!(hosts["items"][0]["kind"], "local-pod-host");
         assert_eq!(
             hosts["items"][0]["capabilities"]["local_pod_inspection"],
-            "unavailable"
+            "available"
         );
+        assert_eq!(
+            hosts["items"][0]["capabilities"]["workspace_scope"],
+            "current_workspace"
+        );
+        assert!(!hosts.to_string().contains("metadata.json"));
+
+        let runtimes = get_json(app.clone(), "/api/runtimes").await;
+        assert_eq!(runtimes["source"], "worker_runtime_registry");
+        assert_eq!(runtimes["items"][0]["runtime_id"], "local-pod-runtime");
+        assert_eq!(runtimes["items"][0]["host_ids"][0], host_id);
 
         let workers = get_json(app.clone(), "/api/workers").await;
         assert!(workers["items"].as_array().unwrap().is_empty());
         assert_eq!(
             workers["diagnostics"][0]["code"],
-            "local_pod_metadata_root_missing"
+            "local_pod_registry_unreadable"
         );
 
-        let host_workers = get_json(
-            app.clone(),
-            &format!("/api/hosts/{TEST_REPOSITORY_ID}/workers"),
-        )
-        .await;
+        let host_workers = get_json(app.clone(), &format!("/api/hosts/{host_id}/workers")).await;
         assert!(host_workers["items"].as_array().unwrap().is_empty());
 
         let runs_response = app

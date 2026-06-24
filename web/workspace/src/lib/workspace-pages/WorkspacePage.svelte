@@ -547,6 +547,14 @@
                         <dd>{host.capabilities.local_pod_inspection}</dd>
                       </div>
                       <div>
+                        <dt>Runtime</dt>
+                        <dd><code>{host.runtime_id}</code></dd>
+                      </div>
+                      <div>
+                        <dt>Scope</dt>
+                        <dd>{host.capabilities.workspace_scope}</dd>
+                      </div>
+                      <div>
                         <dt>Platform</dt>
                         <dd>{host.capabilities.os} / {host.capabilities.arch}</dd>
                       </div>
@@ -590,7 +598,7 @@
                         </td>
                         <td><code>{worker.host_id}</code></td>
                         <td>{worker.state} · {worker.status}</td>
-                        <td>{worker.workspace_root ?? 'unknown'}</td>
+                        <td>{worker.workspace.visibility} · {worker.workspace.identity}</td>
                         <td>{worker.implementation.kind}</td>
                       </tr>
                     {/each}

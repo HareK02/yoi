@@ -14,7 +14,10 @@ use thiserror::Error;
 pub use ticket::config::TicketRole;
 use ticket::config::{TicketConfig, TicketConfigError, TicketRoleLaunchConfigError};
 
-use crate::{PodClient, PodRuntimeCommand, SpawnConfig, SpawnError, SpawnReady, spawn_pod};
+use crate::{
+    PodClient, PodProcessLaunchConfig, PodProcessLaunchOptions, PodRuntimeCommand, SpawnError,
+    SpawnReady, spawn_pod_with_options,
+};
 
 const MAX_FIELD_CHARS: usize = 8_000;
 const MAX_POD_NAME_CHARS: usize = 80;
@@ -170,19 +173,23 @@ impl TicketRoleLaunchPlan {
     pub fn spawn_config(
         &self,
         runtime_command: PodRuntimeCommand,
-    ) -> Result<SpawnConfig, TicketRoleLaunchError> {
+    ) -> Result<PodProcessLaunchConfig, TicketRoleLaunchError> {
         if self.profile == "inherit" {
             return Err(TicketRoleLaunchError::UnsupportedInheritProfile);
         }
-        Ok(SpawnConfig {
+        Ok(PodProcessLaunchConfig {
             runtime_command,
             pod_name: self.pod_name.clone(),
             profile: Some(self.profile.clone()),
-            ticket_role: Some(self.role.as_str().to_string()),
             workspace_root: self.workspace_root.clone(),
             cwd: self.cwd.clone(),
             resume_from: None,
         })
+    }
+
+    pub fn spawn_options(&self) -> PodProcessLaunchOptions {
+        PodProcessLaunchOptions::default()
+            .with_hidden_arg("--ticket-role", self.role.as_str().to_string())
     }
 }
 
@@ -191,7 +198,26 @@ impl TicketRoleLaunchPlan {
 pub struct TicketRoleLaunchResult {
     pub plan: TicketRoleLaunchPlan,
     pub ready: SpawnReady,
+    /// Evidence that the spawned worker accepted the initial Run request.
+    /// This is intentionally distinct from process readiness: a socket
+    /// snapshot only proves that the runtime is reachable, not that the
+    /// worker operation was durably queued/started.
+    pub acceptance_evidence: TicketRoleLaunchAcceptanceEvidence,
     pub pre_run_warnings: Vec<TicketRolePreRunWarning>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketRoleLaunchAcceptanceEvidence {
+    pub pod_name: String,
+    pub accepted_run_segments: usize,
+    pub event: TicketRoleLaunchAcceptanceEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TicketRoleLaunchAcceptanceEvent {
+    UserMessage,
+    UserSendInvokeStart,
+    TurnStart,
 }
 
 /// Non-fatal diagnostic produced by bounded pre-run launch actions.
@@ -369,7 +395,9 @@ where
     F: FnMut(&str),
 {
     let plan = plan_ticket_role_launch(context)?;
-    let ready = spawn_pod(plan.spawn_config(runtime_command)?, progress).await?;
+    let spawn_config = plan.spawn_config(runtime_command)?;
+    let spawn_options = plan.spawn_options();
+    let ready = spawn_pod_with_options(spawn_config, spawn_options, progress).await?;
     let mut client = PodClient::connect(&ready.socket_path)
         .await
         .map_err(|source| TicketRoleLaunchError::Connect {
@@ -377,10 +405,17 @@ where
             source,
         })?;
     let pre_run_warnings = run_pre_run_options_then_send_run(&mut client, &plan, &options).await?;
-    wait_for_run_acceptance(&mut client, &plan.run_segments, RUN_ACCEPTANCE_TIMEOUT).await?;
+    let acceptance_event =
+        wait_for_run_acceptance(&mut client, &plan.run_segments, RUN_ACCEPTANCE_TIMEOUT).await?;
+    let acceptance_evidence = TicketRoleLaunchAcceptanceEvidence {
+        pod_name: ready.pod_name.clone(),
+        accepted_run_segments: plan.run_segments.len(),
+        event: acceptance_event,
+    };
     Ok(TicketRoleLaunchResult {
         plan,
         ready,
+        acceptance_evidence,
         pre_run_warnings,
     })
 }
@@ -471,18 +506,20 @@ async fn wait_for_run_acceptance(
     client: &mut PodClient,
     expected_segments: &[Segment],
     timeout: Duration,
-) -> Result<(), TicketRoleLaunchError> {
+) -> Result<TicketRoleLaunchAcceptanceEvent, TicketRoleLaunchError> {
     let wait = async {
         loop {
             let Some(event) = client.next_event().await else {
                 return Err(TicketRoleLaunchError::RunAcceptanceClosed);
             };
             match event {
-                Event::UserMessage { segments } if segments == expected_segments => return Ok(()),
+                Event::UserMessage { segments } if segments == expected_segments => {
+                    return Ok(TicketRoleLaunchAcceptanceEvent::UserMessage);
+                }
                 Event::InvokeStart {
                     kind: InvokeKind::UserSend,
-                }
-                | Event::TurnStart { .. } => return Ok(()),
+                } => return Ok(TicketRoleLaunchAcceptanceEvent::UserSendInvokeStart),
+                Event::TurnStart { .. } => return Ok(TicketRoleLaunchAcceptanceEvent::TurnStart),
                 Event::Error { code, message } => {
                     return Err(TicketRoleLaunchError::RunRejected { code, message });
                 }
@@ -1026,8 +1063,12 @@ workflow = "ticket-review-workflow"
             .unwrap();
         assert_eq!(spawn.pod_name, "reviewer-fixed");
         assert_eq!(spawn.profile.as_deref(), Some("builtin:default"));
-        assert_eq!(spawn.ticket_role.as_deref(), Some("reviewer"));
         assert_eq!(spawn.workspace_root, temp.path());
+        assert!(spawn.cwd.is_none());
+        assert_eq!(
+            plan.spawn_options().extra_args,
+            vec!["--ticket-role".to_string(), "reviewer".to_string()]
+        );
     }
 
     #[test]
