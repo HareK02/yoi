@@ -108,3 +108,17 @@ Next action:
 - `queued -> inprogress` を記録してから worktree-workflow で `/home/hare/Projects/yoi/.worktree/00001KVXK0WDH-plugin-manifest-reject-legacy` を作成し、multi-agent-workflow で Coder/Reviewer sibling loop に進める。
 
 ---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-24T20:53:45Z from: queued to: inprogress reason: orchestrator_acceptance_unblocked field: state -->
+
+## State changed
+
+Orchestrator acceptance: queued -> inprogress
+
+- 直前確認で `TicketShow` は state `queued`、derived blockers は空。
+- outgoing dependency `00001KVXK0WD3` は done / merged / reviewed / validated 済み。
+- accepted plan `orch-plan-20260624-205226-2` を確認した。
+- routing decision と IntentPacket は Ticket thread に記録済み。
+- これ以降に worktree-workflow で `/home/hare/Projects/yoi/.worktree/00001KVXK0WDH-plugin-manifest-reject-legacy` を作成し、multi-agent-workflow に接続する。
+
+---
