@@ -107,3 +107,38 @@ Orchestrator acceptance: queued -> inprogress
 - これ以降に worktree-workflow で `/home/hare/Projects/yoi/.worktree/00001KVWPVHFJ-storage-cleanup-cli` を作成し、multi-agent-workflow に接続する。
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-24T12:22:48Z -->
+
+## Implementation report
+
+実装報告（Ticket 00001KVWPVHFJ）
+
+実装コミット: `80d6861a` (`feat: add pod and session cleanup CLI`)
+
+変更ファイル:
+- `crates/yoi/src/main.rs`: `yoi pod delete/prune` と `yoi session prune` の CLI ルーティング・help・終了ステータス処理を追加。
+- `crates/yoi/src/pod_cleanup_cli.rs`: Pod メタデータ cleanup CLI を追加。`delete` は Pod メタデータのみ削除し、session logs/history は保持。`prune` は明示された `--older-than` のみで候補化。live/reachable または liveness 不確実時は拒否。`--force` がない場合および `--dry-run` は report-only。
+- `crates/yoi/src/session_cli.rs`: `session prune --unreferenced [--older-than <DURATION>] [--force] [--dry-run]` を追加。Pod metadata の active session 参照を保護し、unreferenced Session のみ Session store API 経由で削除。
+- `crates/session-store/src/fs_store.rs`: Session store authority 内に `root_dir` / `session_modified_at` / `delete_session` を追加し、Session 単位削除と age 判定を store 側 API に寄せた。
+- `crates/yoi/Cargo.toml`, `Cargo.lock`: `yoi` から `pod-store` を直接利用する依存を追加。
+
+検証結果:
+- `cargo fmt --check`: 成功。
+- `cargo test -p yoi`: 成功（95 tests）。
+- `cargo test -p session-store --lib`: 成功（33 tests）。
+- `cargo test -p pod-store --lib`: 成功（6 tests）。
+- `cargo test -p pod discovery:: --lib`: 成功（8 tests）。
+- `cargo check -p yoi -p pod -p pod-store -p session-store`: 成功。
+- `cargo run -p yoi -- ticket doctor`: 成功（`doctor: ok`）。
+- `git diff --check`: 成功。
+
+補足:
+- 途中で `cargo test -p yoi -p pod-store -p session-store -p pod --lib` も実行したが、今回触れていない Pod prompt guidance の文言 assertion 2 件（`worktree status, diff, and test results`）で失敗したため、要求どおり `pod discovery::` に絞って再検証した。
+
+残リスク:
+- Pod liveness 判定は runtime socket への Unix socket connect に基づく。接続成功は live/reachable として拒否し、権限エラー等の不確実な結果も fail-safe で拒否する。socket が存在しない/接続拒否の stale socket は停止扱い。
+- `session prune --unreferenced` は現行 Pod metadata の `active.session_id` を authority として保護する。過去の非 active 参照は cleanup 対象になり得るため、設計どおり dry-run/report-first と `--force` 必須で運用する前提。
+
+
+---
