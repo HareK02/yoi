@@ -137,3 +137,45 @@ Implementation orchestration update:
 - この Ticket は full implementation ではなく design/planning artifact として進める。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVWSQM22-backend-orch-runtime at: 2026-06-24T19:12:33Z -->
+
+## Implementation report
+
+Implementation report:
+
+- 対象: Ticket `00001KVWSQM22`
+- 作業ブランチ: `work/00001KVWSQM22-backend-orch-runtime`
+- 作業場所: `/home/hare/Projects/yoi/.worktree/00001KVWSQM22-backend-orch-runtime`
+- コミット: `f901b9bee37a03faf380894926241107362da360`
+- コミットメッセージ: `docs: design backend internal orchestrator runtime`
+
+変更ファイル:
+
+- `docs/design/workspace-kanban-orchestrator-runtime.md`
+  - Kanban/API 操作から Backend internal Orchestrator Worker へ接続するための設計文書を追加。
+  - durable orchestration event の形、`ack` / `defer` / `fail`、idempotency/restart/retry 方針を整理。
+  - Backend internal Orchestrator が routing/control-plane Worker であり、Bash/filesystem/git/raw socket/session authority を持たないことを明記。
+  - Coder/Reviewer/helper など filesystem-capable work は typed spawn intent と `WorkerRuntimeRegistry` 経由で委譲する設計として整理。
+  - runtime/worker identity、API 形状、DB projection 方針、`display_ref` / `pod_name` が authority ではないことを明記。
+  - raw session は通常 projection ではなく bounded debug-only とする境界を整理。
+  - dependency/conflict/dirty workspace/missing requirement/runtime unavailable などの waiting/blocker reason を整理。
+
+- `docs/README.md`
+  - 新しい設計文書を docs index に追加。
+
+- `docs/design/overview.md`
+  - `workspace-server` を local Workspace control-plane seam として位置づけ、raw path/socket/Pod/session を browser/API authority にしない方針を追記。
+
+検証:
+
+- `git diff --check`: success
+- docs-only 変更のため `cargo fmt` / `cargo test` / `cargo check` は実行していません。
+
+残リスク / エスカレーション:
+
+- 本 Ticket の意図どおり、設計・計画 artifact の作成までで停止しています。
+- Backend internal Orchestrator 本体、Kanban UI 完成、spawn 実装、remote runtime protocol、raw session DB ingest、Ticket storage DB migration、permission/auth completion は未実装のまま non-goal として明記しました。
+- merge / close は行っていません。
+
+---
