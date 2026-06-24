@@ -235,8 +235,15 @@ impl InFlightInner {
                     self.remove_first_text_matching(&text);
                 }
             }
-            LoggedItem::Reasoning { text, .. } => {
-                self.remove_first_thinking_matching(text);
+            LoggedItem::Reasoning { text, summary, .. } => {
+                if !text.is_empty() {
+                    self.remove_first_thinking_matching(text);
+                }
+                for summary_text in summary {
+                    if !summary_text.is_empty() {
+                        self.remove_first_thinking_matching(summary_text);
+                    }
+                }
             }
             LoggedItem::ToolCall { call_id, .. } => {
                 self.remove_tool_call(call_id);
@@ -467,6 +474,31 @@ mod tests {
                 content: vec![LoggedContentPart::Text {
                     text: "done".into(),
                 }],
+            },
+            || (),
+        );
+
+        let guard = in_flight.snapshot_guard();
+        assert!(snapshot_from_guard(&guard).is_empty());
+    }
+
+    #[test]
+    fn committed_reasoning_summary_clears_matching_in_flight_thinking_blocks() {
+        let (event_tx, _) = broadcast::channel(16);
+        let in_flight = InFlightEvents::new(event_tx);
+        let first = in_flight.thinking_start();
+        in_flight.thinking_delta(first, "summary A".into());
+        in_flight.thinking_done(first, "".into());
+        let second = in_flight.thinking_start();
+        in_flight.thinking_delta(second, "summary B".into());
+        in_flight.thinking_done(second, "".into());
+
+        in_flight.clear_for_committed_item_then(
+            &LoggedItem::Reasoning {
+                text: String::new(),
+                summary: vec!["summary A".into(), "summary B".into()],
+                encrypted_content: Some("opaque".into()),
+                signature: None,
             },
             || (),
         );
