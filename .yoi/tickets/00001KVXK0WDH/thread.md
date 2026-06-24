@@ -136,3 +136,60 @@ Implementation orchestration update:
 - Coder には root/original workspace と orchestration worktree で read/write/validation/git operation を行わないよう明示した。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVXK0WDH-plugin-manifest-reject at: 2026-06-24T21:11:58Z -->
+
+## Implementation report
+
+Implementation report:
+
+対象 Ticket:
+- `00001KVXK0WDH` — Reject legacy Plugin runtime in manifest and CLI diagnostics
+
+作業ブランチ / Worktree:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVXK0WDH-plugin-manifest-reject-legacy`
+- Branch: `work/00001KVXK0WDH-plugin-manifest-reject-legacy`
+
+変更内容:
+- `crates/manifest/src/plugin.rs`
+  - legacy raw `wasm` / `yoi-plugin-wasm-1` runtime を manifest validation で reject。
+  - `wasm-component` を現行 public runtime としてドキュメントコメントを更新。
+  - raw-WASM runtime module 読み込み helper を削除。
+  - legacy manifest rejection のテストを追加。
+- `crates/yoi/src/plugin_cli.rs`
+  - CLI テスト fixture を `wasm-component` package へ移行。
+  - `yoi plugin check` が legacy raw-WASM package を `rejected` として返すテストを追加。
+  - `list/show` inspection 上で legacy package が active/eligible 表示されないことをテスト。
+- `crates/pod/src/feature/plugin.rs`
+  - public manifest constant 依存を外し、legacy runtime 名は内部診断用 const に限定。
+  - 既存の runtime fallback rejection 経路を維持。
+- `docs/development/plugin-development.md`
+  - raw-WASM runtime を「互換/推奨」ではなく retired/rejected として記述更新。
+  - `wasm-component` を supported/public runtime として明示。
+- `docs/design/plugin-component-model.md`
+  - Component Model runtime を現行 supported runtime として更新。
+  - raw-WASM は bounded diagnostic 用の rejected metadata として整理。
+- `docs/design/plugin-packages.md`
+  - package runtime 記述を `wasm-component` 中心に更新。
+  - legacy raw-WASM package は active/eligible ではなく rejected として表示されることを明記。
+
+Validation:
+- `cargo fmt --check`: success
+- `cargo test -p manifest`: success
+- `cargo test -p yoi`: success
+- `cargo check -p yoi`: success
+- `cargo test -p pod legacy_raw_wasm_runtime_is_rejected_without_fallback_execution`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+  - dirty tree warning は未コミット検証時点の通常 warning。ビルド自体は成功。
+
+Commit:
+- `6086099fe4807b5b12c8d13333f5544a4174e3d9 feat: reject legacy plugin runtime manifests`
+
+Residual risks / notes:
+- 既知の残リスクなし。
+- raw-WASM execution fallback は再導入していない。
+- legacy runtime 名は manifest/pod 内部の rejected diagnostic fixture/判定用としてのみ残している。
+- Service/Ingress runtime、WebSocket driver、WIT/PDK/templates の service event 更新、broader runtime redesign は実施していない。
+
+---
