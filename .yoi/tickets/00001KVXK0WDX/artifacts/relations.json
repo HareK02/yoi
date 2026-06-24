@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KVXK0WDX",
+      "kind": "depends_on",
+      "target": "00001KVXK0WDQ",
+      "note": "Output commands are returned by service ingress dispatch.",
+      "author": "yoi ticket",
+      "at": "2026-06-24T19:55:30Z"
+    }
+  ]
+}

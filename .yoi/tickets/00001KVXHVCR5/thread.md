@@ -106,3 +106,30 @@ Next planning action:
 - Decide split plan / Objective context or convert this to an explicit design/planning artifact Ticket with a bounded v0 API decision before implementation routing.
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-24T19:55:18Z from: planning to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-24T19:55:18Z status: closed -->
+
+## 完了
+
+Decomposed into the Plugin objective and concrete implementation Tickets:
+
+- 00001KVXK0WD3 Remove legacy raw WASM Plugin runtime
+- 00001KVXK0WDH Reject legacy Plugin runtime in manifest and CLI diagnostics
+- 00001KVXK0WDQ Define Plugin Service lifecycle and ingress queue runtime
+- 00001KVXK0WDX Add Plugin service output command model
+- 00001KVXK0WE4 Add host-owned WebSocket driver for Plugin services
+- 00001KVXK0WEA Update Plugin WIT PDK templates for service event runtime
+
+The broad redesign record is no longer an implementation work item.
+
+
+---

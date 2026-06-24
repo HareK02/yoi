@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KVXK0WEA",
+      "kind": "depends_on",
+      "target": "00001KVXK0WE4",
+      "note": "Authoring templates should reflect the implemented WebSocket event/command model.",
+      "author": "yoi ticket",
+      "at": "2026-06-24T19:55:30Z"
+    }
+  ]
+}
