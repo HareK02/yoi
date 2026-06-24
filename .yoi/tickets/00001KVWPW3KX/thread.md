@@ -153,3 +153,59 @@ Non-blocking note:
 - 実端末での目視確認は未実施だが、`compute_history` の行生成・selectable 属性を中心にテストされており、Ticket acceptance には十分。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-24T12:20:02Z -->
+
+## Implementation report
+
+Integration outcome:
+
+- Coder `yoi-coder-00001KVWPW3KX-thinking-group` が implementation branch `work/00001KVWPW3KX-thinking-group` に実装を commit した。
+  - implementation commit: `0b2ce6ca tui: group consecutive thinking blocks`
+  - child ticket report commit: `7ee2b78b ticket: report thinking grouping implementation`
+- Reviewer `yoi-reviewer-00001KVWPW3KX-thinking-group` は read-only review で `approve`。render-time aggregation のみで history/protocol/persistence を変更していないこと、turn/non-Thinking boundary、streaming/incomplete visibility、selectable=false、tool rendering regression tests を確認した。
+- Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration` で branch `work/00001KVWPW3KX-thinking-group` を merge 済み。
+  - merge commit: `b52b7c96 merge: 00001KVWPW3KX thinking grouping`
+- merge 時に Ticket item/thread の append conflict が発生したため、orchestration 側の Ticket record を保持して merge し、この integration outcome に実装・review・validation evidence を集約して記録した。
+
+Implemented behavior:
+- `crates/tui/src/ui.rs` で `compute_history` の render-time 処理に連続 `Block::Thinking` aggregation を追加。
+- 単一 Thinking は既存 `render_thinking` に委譲。
+- 複数 Thinking group は Normal/Overview で一つの header、Detail で各 Thinking body を読める形にした。
+- streaming / incomplete state は header / preview / detail に残し、group rows は selectable=false を維持。
+- `crates/tui/src/dashboard/tests.rs` は current `TicketRoleLaunchResult.acceptance_evidence` 必須 field に追随。
+
+Validation in Orchestrator worktree:
+- `cargo test -p tui`: success
+- `cargo fmt --check`: success
+- `cargo check -p tui`: success
+- `git diff --check`: success
+
+Notes:
+- 実端末での目視確認は未実施。focused tests と full `cargo test -p tui` で `compute_history` rows/selectable/tool regression を確認済み。
+- dependency/package change は無いため `nix build .#yoi` は実施していない。
+
+Next action:
+- Mark Ticket done after this integration/validation evidence.
+- Then stop related child Pods and remove only the child implementation worktree/branch.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-24T12:20:08Z from: inprogress to: done reason: merged_validated field: state -->
+
+## State changed
+
+Implementation is merged into the orchestration branch and validated.
+
+Evidence:
+- merge commit: `b52b7c96 merge: 00001KVWPW3KX thinking grouping`
+- reviewer result: approve
+- validation in `/home/hare/Projects/yoi/.worktree/orchestration` succeeded:
+  - `cargo test -p tui`
+  - `cargo fmt --check`
+  - `cargo check -p tui`
+  - `git diff --check`
+
+Closure is not performed here; this state records implementation completion after merge/validation.
+
+---
