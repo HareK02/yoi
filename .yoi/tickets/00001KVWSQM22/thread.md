@@ -31,3 +31,95 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-24T19:06:45Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- Dashboard Queue により人間が Orchestrator routing を許可した queued Ticket として確認した。
+- Ticket body は Backend internal Orchestrator runtime / Kanban operation / durable orchestration event / WorkerRuntime registry identity / spawn intent / session overview boundary / safety authority を具体的に列挙している。
+- `TicketRelationQuery` は blocking relation 0 件、routing 前 `TicketOrchestrationPlanQuery` は既存 plan 0 件だった。
+- Ticket の受け入れ条件は「planning artifact を明文化する」性質であり、Backend internal Orchestrator の full implementation は non-goal と明記されている。したがって Coder に実装詳細を固定させるのではなく、maintained design/planning document と必要最小限の boundary alignment を作る task として bounded に進められる。
+- risk flags 相当の domain は orchestration authority / runtime identity / durable event / raw session boundary だが、Bash/raw filesystem/raw socket/raw session ingest を authority にしない、`queued -> inprogress` acceptance を守る、Browser が raw local path を渡さない、という invariant が明示されている。risk は reviewer focus と escalation condition に反映すればよく、planning return 理由にはならない。
+- 現在 inprogress Ticket は 0 件、orchestration worktree は clean。既存 worktree は unrelated paused Ctrl-X cancel worktree のみで、この Ticket の branch/worktree はまだ無い。
+
+Evidence checked:
+- Ticket body / thread: `item.md`, `thread.md`。thread は create、planning->ready、ready->queued のみで未解決 blocker は記録されていない。
+- Relations / orchestration plan: relation 0 件、routing 前 plan 0 件。accepted plan `orch-plan-20260624-190611-1` を記録済み。
+- Workspace/code context: recent Worker runtime registry / spawn boundary work in `crates/workspace-server/src/hosts.rs`, `crates/workspace-server/src/server.rs`; Dashboard/Kanban queue surface in `crates/tui/src/dashboard/mod.rs`; docs/design structure under `docs/design/`。
+- Workspace state: `/home/hare/Projects/yoi/.worktree/orchestration` は clean。visible Pods は current Orchestrator と stopped/restorable historical role Pods only, active child work is none。
+
+IntentPacket:
+
+Intent:
+- Kanban UI operation を Backend internal Orchestrator Worker へ安全に接続するための design/planning artifact を作る。Kanban operation は durable orchestration event として記録され、internal Orchestrator は domain-specific tools で event を処理し、実 filesystem-capable work は local/remote runtime 上の Coder/Reviewer/helper Worker へ委譲する境界を明確にする。
+
+Binding decisions / invariants:
+- Kanban click / API request から Backend process が直接 shell/git/filesystem を実行しない。
+- implementation side effect 前には既存 Ticket lifecycle authority、特に `queued -> inprogress` acceptance と decision record を保持する。
+- `ready -> queued` は Orchestrator routing human gate として扱い、unattended scheduler にしない。
+- Browser は raw local path / socket path / runtime registry path / raw session path / executable path を authority として渡さない。
+- UI display は `worker-name@runtime-name` 形式を使ってよいが、API authority にはしない。
+- canonical API identity は `runtime_id` + `worker_id` の runtime-scoped opaque id とする。
+- DB design は surrogate worker record id + `UNIQUE(runtime_id, worker_id)` を優先候補とし、run overview / lifecycle event / usage aggregate 参照に使える形にする。
+- Backend durable projection は raw transcript 全量ではなく overview / decision / lifecycle / usage aggregate を中心にする。raw session/provider trace は runtime-local source/debug log として bounded read に留める。
+- Backend internal Orchestrator の full implementation、Kanban UI completion、remote protocol、raw session full DB ingest、Ticket DB migration、permission/auth completion は non-goal。
+
+Requirements / acceptance criteria:
+- Kanban operation から durable orchestration event を生成する方針が明文化される。
+- Backend internal Orchestrator Worker の責務 / non-responsibility、domain-specific tool/operation surface、failure/blocker/retry/event ack semantics が整理される。
+- WorkerRuntime registry と spawn intent の接続方針が明記される。
+- runtime/worker identity, display label, DB identity, event and overview projection boundaries が明確化される。
+- filesystem-capable work は runtime 上の Coder/Reviewer/helper Worker に委譲する方針が明記される。
+- existing docs/code organization に沿って maintained design artifact が置かれる。
+
+Implementation latitude:
+- Primary output は docs/design などの maintained design document でよい。必要に応じて README/index や small comments/tests を追加してよい。
+- 既存 Workspace runtime registry / spawn boundary の code names に合わせて wording を調整してよい。
+- Full backend implementation や new DB schema migration はしない。
+
+Escalate if:
+- Backend process が direct shell/git/filesystem authority を持つ設計にしないと要件を満たせない。
+- raw session full ingest / raw socket path / raw workspace path を API authority にする必要が出る。
+- `ready -> queued` の human gate を scheduler/lease に置き換える必要が出る。
+- API canonical identity を display label や raw Pod name に寄せる必要が出る。
+- Ticket DB migration / permission-auth model completion / remote runtime protocol をこの Ticket で固定する必要が出る。
+
+Validation:
+- `git diff --check`
+- docs-only なら `cargo fmt --check` は不要だが、Rust/comments/tests を触るなら `cargo fmt --check` と relevant `cargo check` / `cargo test` を実施する。
+- If `crates/workspace-server` is touched: `cargo test -p yoi-workspace-server` and `cargo check -p yoi`。
+
+Current code/docs map:
+- Primary docs: `docs/design/` and docs index/README if appropriate。
+- Context code: `crates/workspace-server/src/hosts.rs`, `crates/workspace-server/src/server.rs`, `crates/tui/src/dashboard/mod.rs`。
+- Avoid: root/original workspace operations, broad scheduler implementation, Kanban UI completion, remote Host protocol, raw session DB ingest, Ticket storage migration。
+
+Critical risks / reviewer focus:
+- accidental scheduler/lease semantics。
+- Backend internal Orchestrator gaining raw shell/filesystem/socket authority。
+- display labels becoming API authority。
+- runtime workspace root / process cwd / worker id / DB surrogate id confusion。
+- raw session/provider trace becoming Backend durable projection instead of bounded debug source。
+- design doc that repeats Ticket text without resolving event/ack/failure/spawn-intent boundaries.
+
+Next action:
+- `queued -> inprogress` を記録してから worktree-workflow で `/home/hare/Projects/yoi/.worktree/00001KVWSQM22-backend-orch-runtime` を作成し、multi-agent-workflow で Coder/Reviewer sibling loop に進める。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-24T19:07:09Z from: queued to: inprogress reason: orchestrator_acceptance_unblocked field: state -->
+
+## State changed
+
+Orchestrator acceptance: queued -> inprogress
+
+- 直前確認で `TicketShow` は state `queued`、blocking relation は 0 件、accepted plan `orch-plan-20260624-190611-1` を確認した。
+- routing decision と IntentPacket は Ticket thread に記録済み。
+- `00001KVWSQM22` は planning/design artifact として implementation-ready であり、Backend internal Orchestrator の full implementation は non-goal として明示した。
+- これ以降に worktree-workflow で `/home/hare/Projects/yoi/.worktree/00001KVWSQM22-backend-orch-runtime` を作成し、multi-agent-workflow に接続する。
+
+---
