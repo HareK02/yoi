@@ -179,3 +179,30 @@ Implementation report:
 - merge / close は行っていません。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVWSQM22-backend-orch-runtime at: 2026-06-24T19:15:09Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+確認範囲:
+- child worktree `/home/hare/Projects/yoi/.worktree/00001KVWSQM22-backend-orch-runtime` のみ。
+- Ticket `item.md` / `thread.md` / `artifacts/orchestration-plan.jsonl`、commit `f901b9b...` の docs diff、追加 design doc を read-only で確認。
+- `git diff --check 8931227..f901b9b -- docs/...`: success。
+
+承認根拠:
+- 追加された `docs/design/workspace-kanban-orchestrator-runtime.md` は Ticket の単純コピーではなく、維持対象の設計 artifact として Core rule / durable events / ack-defer-fail / internal Orchestrator tool surface / spawn intent / API identity / DB projection / failure semantics / future implementation order まで具体化している。
+- Kanban/API 操作から durable orchestration event、Backend internal Orchestrator Worker、`WorkerRuntimeRegistry`、typed spawn intent、filesystem-capable Coder/Reviewer/helper Worker への委譲までの鎖が明記されている。
+- `ready -> queued` は human gate であり unattended scheduler / lease ではない、と明記されている。
+- Backend internal Orchestrator は routing/control-plane Worker で、`Bash`、raw filesystem、git/worktree/build、raw socket/session path、raw session full ingest を持たない境界が明確。
+- API authority は `runtime_id` + `worker_id` の opaque runtime-scoped identity に限定し、`worker-name@runtime-name` / `display_ref` / `pod_name` / path / socket / session を authority にしない方針が明記されている。
+- DB/projection は surrogate `workers.id` + `UNIQUE(runtime_id, worker_id)`、run overview / lifecycle / usage aggregate 参照方針まで記述されている。
+- failure/blocker/retry/ack/defer/fail semantics は future implementation Ticket の入力として十分な初期方針になっている。
+- Non-goals も維持されており、full backend implementation、Kanban UI completion、remote protocol、raw session DB ingest、Ticket DB migration、permission/auth completion に踏み込んでいない。
+
+Non-blocking notes:
+- child worktree 側の Ticket thread には Orchestrator 側で記録した implementation_report が見えなかったが、Orchestrator 側 Ticket record には report を記録済みであり、レビューは commit/diff と Coder report に基づいて行った。
+- 新規 design doc は diff 上 EOF newline が無いように見えたが、`git diff --check` は通っており blocker ではない。
+
+---
