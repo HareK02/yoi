@@ -16,6 +16,7 @@ That rule shapes the crate split. The runtime can restart, attach, compact, or d
 - `manifest` resolves Profiles, Manifests, model/provider references, scopes, prompts, and tool permission policy into a runtime contract.
 - `tools` implements built-in tools with bounded output and policy-aware execution.
 - `memory` owns generated memory, Knowledge records, linting, staging, and audit observations.
+- `workspace-server` is the local Workspace control-plane seam. It can project Tickets, Workers, lifecycle, usage, and orchestration events, but browser/API operations must stay on opaque backend identities instead of raw local paths, sockets, Pod names, or session files.
 - `tui` is a UI over Pod authority; it should not invent durable state.
 
 ## Why these boundaries exist
