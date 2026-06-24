@@ -105,9 +105,9 @@ The migration should be phased:
 
 ## Runtime/backend caution
 
-The current implementation uses `wasmi` for core Wasm. Component Model support will likely require a different backend or a significantly richer component adapter path, such as `wasmtime::component` plus generated bindings. That has consequences for binary size, Nix packaging, build time, runtime limits, and sandbox policy. The migration Ticket must measure and validate those effects explicitly.
+The legacy core-Wasm implementation used `wasmi` as a transitional backend. The active Plugin Tool runtime is now selected by package runtime metadata and executed through `wasmtime::component`; discovery and static inspection must continue to avoid executing package code.
 
-If a component backend is added, keep it selected by package runtime metadata and Profile/feature policy. Do not make all Plugin packages depend on component execution during discovery or inspection.
+Keep the component backend selected by package runtime metadata and Profile/feature policy. Do not make all Plugin packages depend on component execution during discovery or inspection.
 
 ## Relationship to pending host APIs
 
@@ -133,8 +133,7 @@ component = "plugin.component.wasm"
 world = "yoi:plugin/tool@1.0.0"
 ```
 
-The legacy core-Wasm ABI remains explicit and is not reinterpreted as a
-component:
+The legacy core-Wasm ABI remains explicit metadata for migration diagnostics and is not reinterpreted as a component or executed by the active runtime path:
 
 ```toml
 [runtime]
@@ -145,9 +144,9 @@ abi = "yoi-plugin-wasm-1"
 
 The component runtime uses `wasmtime::component` and expects the exported world
 `yoi:plugin/tool@1.0.0` with a `call(tool-name: string, input-json: string) ->
-string` export. The returned string is the same ToolOutput JSON used by the raw
-runtime, so registration and execution still flow through the existing
-ToolRegistry and Worker Tool-result history path.
+string` export. The returned string is the normal ToolOutput JSON, so
+registration and execution still flow through the existing ToolRegistry and
+Worker Tool-result history path.
 
 Host imports are stable names under `yoi:host/*@1.0.0`; the repository WIT files
 live in `resources/plugin/wit/`. Importing `yoi:host/request@1.0.0` or
