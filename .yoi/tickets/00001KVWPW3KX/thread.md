@@ -115,3 +115,44 @@ Orchestrator acceptance: queued -> inprogress
 - これ以降に worktree-workflow で `/home/hare/Projects/yoi/.worktree/00001KVWPW3KX-thinking-group` を作成し、multi-agent-workflow に接続する。
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-06-24T12:14:38Z -->
+
+## Implementation report
+
+実装報告: Ticket `00001KVWPW3KX` / TUI Console: 連続した Thinking block を一つの表示グループにまとめる
+
+変更内容:
+- `crates/tui/src/ui.rs`
+  - `compute_history` の render-time 処理で、連続する `Block::Thinking` だけをまとめて消費する `render_thinking_aggregate` を追加しました。
+  - 単一の Thinking block は既存 `render_thinking` へ委譲し、単体表示の互換性を維持しました。
+  - 複数 Thinking group は `Normal` / `Overview` では 1 つのヘッダーとして表示し、`Detail` では各 Thinking block の状態ヘッダーと本文を下位項目として読めるようにしました。
+  - streaming 中の group は `Thinking...` と最新 streaming tail preview を表示し、incomplete が含まれる場合はヘッダーに `interrupted` を含めるようにしました。
+  - group 行は `compute_history` 側で selectable=false のまま扱い、Thinking を選択・コピー可能な transcript text にしていません。
+  - 連続 Thinking、非 Thinking separator、turn boundary、streaming/incomplete、単一 Thinking、tool 表示回帰の単体テストを追加しました。
+- `crates/tui/src/dashboard/tests.rs`
+  - `cargo test -p tui` の validation を通すため、既存 dashboard test fixture の `TicketRoleLaunchResult` に現行必須 field `acceptance_evidence` を補いました。
+
+保持した不変条件:
+- history / session / protocol / reasoning persistence / source block sequence は変更していません。
+- group 化は Console TUI の render-time のみです。
+- `Block::Thinking` が連続している場合だけ group 化し、非 Thinking block や `TurnHeader` を跨ぎません。
+- streaming/incomplete 状態はヘッダーと preview/detail で見えるままにしています。
+
+検証結果:
+- `cargo test -p tui thinking -- --nocapture`: PASS（6 tests）
+- `cargo test -p tui tool -- --nocapture`: PASS（2 tests）
+- `cargo test -p tui`: PASS（382 tests）
+- `cargo fmt --check`: PASS
+- `cargo check -p tui`: PASS
+- `git diff --check`: PASS
+
+実装 commit:
+- `0b2ce6ca1f7ae44bc43bbf5afb440e35e69c705b` (`tui: group consecutive thinking blocks`)
+
+残リスク:
+- 実端末での目視確認は行っていません。テストは `compute_history` の行テキスト・selectable 属性を中心に確認しています。
+- group header の文言は既存 Console 表示に合わせて英語にしています。将来 UI 文言を整理する場合は別途調整してください。
+
+
+---
