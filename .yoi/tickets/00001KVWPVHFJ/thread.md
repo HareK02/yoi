@@ -146,3 +146,71 @@ Non-blocking note:
 - dry-run/失敗 path でも既存 store constructor が root directory を初期作成し得る設計に見える。削除は発生しないため今回の blocker とは見なさないが、将来「dry-run は完全 no-write」と定義するなら follow-up で明確化するとよい。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-24T12:36:01Z -->
+
+## Implementation report
+
+Integration outcome:
+
+- Coder `yoi-coder-00001KVWPVHFJ-cleanup-cli` が implementation branch `work/00001KVWPVHFJ-storage-cleanup-cli` に実装を commit した。
+  - implementation commit: `80d6861a feat: add pod and session cleanup CLI`
+  - child ticket report commit: `439f967c chore: record cleanup cli implementation report`
+- Reviewer `yoi-reviewer-00001KVWPVHFJ-cleanup-cli` は read-only review で `approve`。Pod metadata only delete、session preservation、live/uncertain refusal、force/dry-run semantics、explicit threshold、session active reference protection、path authority、scope creep なしを確認した。
+- Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration` で branch `work/00001KVWPVHFJ-storage-cleanup-cli` を merge 済み。
+  - merge commit: `4fb75ec3 merge: 00001KVWPVHFJ storage cleanup cli`
+- merge 時に Ticket item/thread の append conflict が発生したため、orchestration 側の Ticket record を保持して merge し、この integration outcome に実装・review・validation evidence を集約して記録した。
+- cleanup CLI 実装で Cargo dependencies / `Cargo.lock` が変わったため、Nix package cargoHash を更新した。
+  - package hash commit: `28d53aad nix: update yoi cleanup cargo hash`
+
+Implemented behavior:
+- `yoi pod delete <NAME> [--force] [--dry-run]`: stopped/restorable Pod metadata のみ削除。sessions/history は削除しない。live/uncertain liveness は拒否。
+- `yoi pod prune --older-than <DURATION> [--force] [--dry-run]`: explicit threshold required。Pod metadata のみ prune。
+- `yoi session prune --unreferenced [--older-than <DURATION>] [--force] [--dry-run]`: Pod metadata active session references を保護し、unreferenced session のみ対象。
+- `session-store` に session deletion / mtime support を追加。
+
+Validation in Orchestrator worktree:
+- `cargo fmt --check`: success
+- `cargo test -p yoi`: success
+- `cargo test -p session-store --lib`: success
+- `cargo test -p pod-store --lib`: success
+- `cargo test -p pod discovery:: --lib`: success
+- `cargo check -p yoi -p pod -p pod-store -p session-store`: success
+- `cargo run -p yoi -- ticket doctor`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success after updating `package.nix` cargoHash to `sha256-8mo2/IZMq3tfnv8fKRxJOdfb+T3NOheUmqT8TiR+Wag=`
+
+Notes:
+- 初回 `nix build .#yoi --no-link` は cargoHash stale のため失敗し、hash 更新後に成功した。
+- Reviewer non-blocking note: dry-run/失敗 path でも既存 store constructor が root directory を初期作成し得る設計に見える。削除は起きないため blocker ではないが、将来「dry-run は完全 no-write」と定義するなら follow-up で明確化可能。
+
+Next action:
+- Mark Ticket done after this integration/validation evidence.
+- Then stop related child Pods and remove only the child implementation worktree/branch.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-24T12:36:12Z from: inprogress to: done reason: merged_validated field: state -->
+
+## State changed
+
+Implementation is merged into the orchestration branch and validated.
+
+Evidence:
+- merge commit: `4fb75ec3 merge: 00001KVWPVHFJ storage cleanup cli`
+- package hash commit: `28d53aad nix: update yoi cleanup cargo hash`
+- reviewer result: approve
+- validation in `/home/hare/Projects/yoi/.worktree/orchestration` succeeded:
+  - `cargo fmt --check`
+  - `cargo test -p yoi`
+  - `cargo test -p session-store --lib`
+  - `cargo test -p pod-store --lib`
+  - `cargo test -p pod discovery:: --lib`
+  - `cargo check -p yoi -p pod -p pod-store -p session-store`
+  - `cargo run -p yoi -- ticket doctor`
+  - `git diff --check`
+  - `nix build .#yoi --no-link`
+
+Closure is not performed here; this state records implementation completion after merge/validation.
+
+---
