@@ -2,7 +2,7 @@
 title: 'Abstract Worker runtime registry and overview reporting'
 state: 'inprogress'
 created_at: '2026-06-24T09:11:38Z'
-updated_at: '2026-06-24T11:09:03Z'
+updated_at: '2026-06-24T11:10:55Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-24T09:22:55Z'

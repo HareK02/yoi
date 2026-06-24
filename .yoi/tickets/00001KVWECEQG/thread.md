@@ -294,3 +294,28 @@ Residual risks / notes:
 - raw session/private path leak、scheduler/remote protocol scope creep、`00001KVTNAY20` の low-level launch boundary は維持している。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVWECEQG-worker-registry at: 2026-06-24T11:10:55Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+確認内容:
+- child worktree のみで `9bd15507..HEAD` fix diff と必要箇所の現行実装を read-only 確認。
+- ビルド/テストは read-only 指示のため再実行せず、coder 報告を参照。
+
+判断:
+- 以前の blocker 2件は解消されている。
+
+根拠:
+- `LocalPodRuntime::worker()` は `local-pod-` strip で raw Pod dir 名へ戻す実装をやめ、`pod_names()` で registry を scan し、各 actual Pod dir name から生成した `worker_id_for_pod()` と照合して backend 内部で解決する形になっている。これにより、大文字・記号・sanitize 対象文字を含む Pod 名でも list→lookup が成立する。
+- `worker_id_for_pod()` / `host_id_for_workspace()` は `bounded_backend_identifier()` 経由になり、prefix を含む full id が `MAX_IDENTIFIER_LEN` 内に収まるよう body を切り詰め、SHA-256 digest suffix を付けて sanitize/truncation collision を避ける設計になっている。
+- 追加テストで Ticket-like uppercase Pod 名、`.`/`-` collision、`#`/`@`、長い Pod 名、duplicate-free、validation-compatible、registry/runtime lookup roundtrip がカバーされている。
+- raw metadata path / socket path / workspace root / raw session を overview API に出さない方針、registry 経由の read-only API、spawn/stop/proxy 非実装の unsupported 境界は維持されている。
+
+Non-blocking notes:
+- `worker_id` は sanitize 済み body を含むため完全な無意味 IDではないが、操作キーとしては backend 解決の opaque id になっており、今回の Ticket 意図には十分合っている。
+- reported validation は通過とのことだが、reviewer では再実行していない。
+
+---
