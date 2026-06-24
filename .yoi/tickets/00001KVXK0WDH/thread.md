@@ -238,3 +238,69 @@ Non-blocking note:
 - 親から指定された review base hash `187e6426` は誤記/存在しない hash だった。実レビューは child branch の実 parent `ef1d8d9a` を base として行われた。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-24T21:20:36Z -->
+
+## Implementation report
+
+Integration outcome:
+
+- Coder `yoi-coder-00001KVXK0WDH-plugin-manifest-reject` が implementation branch `work/00001KVXK0WDH-plugin-manifest-reject-legacy` に実装を commit した。
+  - implementation commit: `6086099f feat: reject legacy plugin runtime manifests`
+- Reviewer `yoi-reviewer-00001KVXK0WDH-plugin-manifest-reject` は read-only review で `approve`。legacy `wasm` / `yoi-plugin-wasm-1` manifest rejection、CLI check/list/show diagnostic behavior、component package non-regression、pod diagnostic alignment、docs update、scope creep なしを確認した。
+- Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration` で branch `work/00001KVXK0WDH-plugin-manifest-reject-legacy` を merge 済み。
+  - merge commit: `449745ee merge: 00001KVXK0WDH plugin manifest rejection`
+
+Implemented behavior:
+- `crates/manifest/src/plugin.rs`:
+  - legacy raw `wasm` / `yoi-plugin-wasm-1` runtime を manifest validation で rejected diagnostic にする。
+  - `wasm-component` を supported public runtime として維持。
+- `crates/yoi/src/plugin_cli.rs`:
+  - `yoi plugin check` は legacy package を `status: "rejected"` として bounded diagnostic に載せ、既存 check semantics 通り失敗扱いにする。
+  - list/show fixture は legacy package を active/eligible として表示しない。
+- `crates/pod/src/feature/plugin.rs`:
+  - legacy runtime public constant dependency を外し、legacy runtime name は internal diagnostic/rejection matching のみに限定。
+  - raw-WASM fallback execution は再導入していない。
+- docs:
+  - `docs/development/plugin-development.md`, `docs/design/plugin-component-model.md`, `docs/design/plugin-packages.md` で raw core-Wasm compatibility 前提を撤回し、`wasm-component` を supported/public runtime と明記。
+
+Validation in Orchestrator worktree:
+- `cargo fmt --check`: success
+- `cargo test -p manifest`: success
+- `cargo test -p yoi`: success
+- `cargo check -p yoi`: success
+- `cargo test -p pod legacy_raw_wasm_runtime_is_rejected_without_fallback_execution --lib`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Notes:
+- Reviewer non-blocking note: Orchestrator から渡した review base `187e6426` は誤記で、child branch の実 parent `ef1d8d9a` を base として review された。review scope は適切だった。
+- Follow-up `00001KVXK0WDQ` は this Ticket completion により dependency-unblocked and can be re-routed next.
+
+Next action:
+- Mark Ticket done after this integration/validation evidence.
+- Then stop related child Pods and remove only the child implementation worktree/branch.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-24T21:20:45Z from: inprogress to: done reason: merged_validated field: state -->
+
+## State changed
+
+Implementation is merged into the orchestration branch and validated.
+
+Evidence:
+- merge commit: `449745ee merge: 00001KVXK0WDH plugin manifest rejection`
+- reviewer result: approve
+- validation in `/home/hare/Projects/yoi/.worktree/orchestration` succeeded:
+  - `cargo fmt --check`
+  - `cargo test -p manifest`
+  - `cargo test -p yoi`
+  - `cargo check -p yoi`
+  - `cargo test -p pod legacy_raw_wasm_runtime_is_rejected_without_fallback_execution --lib`
+  - `git diff --check`
+  - `nix build .#yoi --no-link`
+
+Closure is not performed here; this state records implementation completion after merge/validation.
+
+---
