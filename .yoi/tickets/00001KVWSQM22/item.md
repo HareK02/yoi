@@ -1,9 +1,11 @@
 ---
 title: 'Backend internal Orchestrator runtime for Kanban operations'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-24T12:29:58Z'
-updated_at: '2026-06-24T13:20:54Z'
+updated_at: '2026-06-24T19:04:55Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-24T19:04:55Z'
 ---
 
 ## 背景
