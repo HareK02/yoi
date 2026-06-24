@@ -1,11 +1,13 @@
 ---
 title: 'Pod/session storage cleanup CLI を追加する'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-24T11:39:41Z'
-updated_at: '2026-06-24T11:39:41Z'
+updated_at: '2026-06-24T12:01:42Z'
 assignee: null
 readiness: 'implementation_ready'
 risk_flags: ['pod-lifecycle', 'persistence', 'destructive-operation', 'cli-ux', 'session-history', 'authority-boundary']
+queued_by: 'workspace-panel'
+queued_at: '2026-06-24T12:01:42Z'
 ---
 
 ## User claims / request snapshot
