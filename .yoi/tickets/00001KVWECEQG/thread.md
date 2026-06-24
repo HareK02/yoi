@@ -250,3 +250,47 @@ Non-blocking note:
 - Ticket acceptance には `nix build .#yoi --no-link` も含まれている一方、coder 報告にはない。必要なら修正後に Orchestrator 判断で実施・明示すること。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVWECEQG-worker-registry at: 2026-06-24T11:09:03Z -->
+
+## Implementation report
+
+Follow-up implementation report after review request_changes:
+
+対応内容:
+- `worker_id` を raw Pod dir 名から逆算する実装を廃止した。
+  - `LocalPodRuntime::worker()` は Pod registry を backend 側で scan し、生成済み opaque `worker_id` と実 Pod dir を照合して解決する。
+  - API caller が渡す `worker_id` は raw path / raw Pod name authority ではなく、backend-resolved identifier として扱う。
+- `worker_id` / `host_id` の生成を bounded + collision-resistant に変更した。
+  - prefix を含む full id が `MAX_IDENTIFIER_LEN = 120` 以下になるよう制御。
+  - `sha2` digest の短縮 hex を suffix として含め、`foo.bar` / `foo-bar` や長大名 truncation による collision を避ける。
+  - 生成 id は既存 validation を通る形式に限定。
+- focused tests を追加・更新した。
+  - uppercase Ticket-ID-like Pod name。
+  - `.` / `@` / `#` 等の sanitized char。
+  - `foo.bar` vs `foo-bar` collision case。
+  - long/truncated names。
+  - `list_workers()` が返す id を `registry.worker()` / `LocalPodRuntime::worker()` に渡して解決できること。
+  - id が bounded / validation-compatible / duplicate-free であること。
+
+変更ファイル:
+- `Cargo.lock`
+- `crates/workspace-server/Cargo.toml`
+- `crates/workspace-server/src/hosts.rs`
+- `crates/workspace-server/src/server.rs`
+
+Validation:
+- `cargo test -p yoi-workspace-server`: success
+- `cargo check -p yoi`: success
+- `cd web/workspace && deno task check`: success
+- `cd web/workspace && deno task build`: success
+- `git diff --check`: success
+
+Commit:
+- `38d25582 fix: make worker runtime ids resolvable`
+
+Residual risks / notes:
+- `sha2.workspace = true` を `yoi-workspace-server` に追加したため、`Cargo.lock` の workspace-server dependency entry が更新された。
+- raw session/private path leak、scheduler/remote protocol scope creep、`00001KVTNAY20` の low-level launch boundary は維持している。
+
+---
