@@ -105,3 +105,16 @@ Next action:
 - `queued -> inprogress` を記録してから worktree-workflow で `/home/hare/Projects/yoi/.worktree/00001KVXK0WD3-remove-legacy-wasm-runtime` を作成し、multi-agent-workflow で Coder/Reviewer sibling loop に進める。
 
 ---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-24T20:14:08Z from: queued to: inprogress reason: orchestrator_acceptance_unblocked field: state -->
+
+## State changed
+
+Orchestrator acceptance: queued -> inprogress
+
+- 直前確認で `TicketShow` は state `queued`、blocking outgoing relation は 0 件、accepted plan `orch-plan-20260624-201247-1` を確認した。
+- 後続 queued Tickets (`00001KVXK0WDH`, `00001KVXK0WDQ`, `00001KVXK0WDX`, `00001KVXK0WE4`, `00001KVXK0WEA`) は dependency chain 上この Ticket またはその後続 prerequisites に blocked として orchestration plan に記録済み。
+- routing decision と IntentPacket は Ticket thread に記録済み。
+- これ以降に worktree-workflow で `/home/hare/Projects/yoi/.worktree/00001KVXK0WD3-remove-legacy-wasm-runtime` を作成し、multi-agent-workflow に接続する。
+
+---
