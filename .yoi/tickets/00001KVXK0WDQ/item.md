@@ -1,9 +1,11 @@
 ---
 title: 'Define Plugin Service lifecycle and ingress queue runtime'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-24T19:51:56Z'
-updated_at: '2026-06-24T19:55:30Z'
+updated_at: '2026-06-24T20:12:00Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-24T20:12:00Z'
 ---
 
 ## 背景
