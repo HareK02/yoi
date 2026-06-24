@@ -193,3 +193,48 @@ Residual risks / notes:
 - Service/Ingress runtime、WebSocket driver、WIT/PDK/templates の service event 更新、broader runtime redesign は実施していない。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVXK0WDH-plugin-manifest-reject at: 2026-06-24T21:18:53Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+確認範囲:
+- child worktree `/home/hare/Projects/yoi/.worktree/00001KVXK0WDH-plugin-manifest-reject-legacy`
+- branch `work/00001KVXK0WDH-plugin-manifest-reject-legacy`
+- HEAD `6086099fe4807b5b12c8d13333f5544a4174e3d9`
+- 実履歴上の親 `ef1d8d9a` → HEAD の差分をレビューした。指定 base `187e6426` はこの worktree では object missing だったが、HEAD の直前 commit は `ticket: accept plugin manifest rejection task` で、レビュー対象差分として妥当と判断した。
+
+承認根拠:
+- Ticket / IntentPacket の要件と照合済み。
+- `crates/manifest/src/plugin.rs`:
+  - legacy `wasm` / `yoi-plugin-wasm-1` は public const ではなく internal rejection 用 const になっている。
+  - `validate_manifest` で `kind = "wasm"` を `legacy raw wasm ... retired; use wasm-component` として `Api/Manifest` diagnostic 付きで拒否している。
+  - `wasm-component` は正の runtime kind として `component` / `world` validation を維持している。
+  - legacy rejection test が追加され、discovery package には入らず diagnostic になることを確認している。
+- `crates/yoi/src/plugin_cli.rs`:
+  - `plugin check` は manifest/discovery rejection を `status: "rejected"` として bounded diagnostic に載せ、既存 check semantics 通り rejected で Err を返す。
+  - list/show snapshot は discovery/resolution diagnostics から rejected item を構成し、legacy package を active/eligible として扱わない。
+  - component fixture は `wasm-component` / `plugin.component.wasm` に更新され、legacy fixture は rejected fixture に変換されている。
+- `crates/pod/src/feature/plugin.rs`:
+  - manifest crate の legacy runtime public const 依存は削除済み。
+  - legacy name は internal diagnostic/rejection matching のみ。
+  - `PluginInstanceRuntime::new` は legacy `wasm` を即エラーにし、raw-WASM fallback 実行は戻っていない。
+- docs:
+  - `docs/development/plugin-development.md`
+  - `docs/design/plugin-component-model.md`
+  - `docs/design/plugin-packages.md`
+  で raw core-Wasm compatibility 前提は撤回され、`wasm-component` が supported/public runtime と明記されている。
+- `rg 'plugin\.wasm|kind = "wasm"|abi = "yoi-plugin-wasm-1"'` で残存箇所を確認。残りは rejection docs/tests/diagnostics と component build artifact 名の文脈のみで、active public compatibility 表現は見当たらない。
+- 差分対象は manifest / CLI / pod diagnostic alignment / docs の 6 files に限定され、Service/Ingress/WebSocket/WIT/PDK runtime redesign への scope creep は確認していない。
+
+Validation:
+- reviewer は read-only 制約のため `cargo test` / `cargo check` / `nix build` は再実行していない。
+- reviewer 側で `git diff --check HEAD^..HEAD`: success。
+- Coder reported validation (`cargo fmt --check`, `cargo test -p manifest`, `cargo test -p yoi`, `cargo check -p yoi`, focused pod test, `nix build .#yoi --no-link`) は実装内容と整合しており、追加で疑う材料はない。
+
+Non-blocking note:
+- 親から指定された review base hash `187e6426` は誤記/存在しない hash だった。実レビューは child branch の実 parent `ef1d8d9a` を base として行われた。
+
+---
