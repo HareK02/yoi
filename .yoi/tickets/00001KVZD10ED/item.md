@@ -1,9 +1,11 @@
 ---
 title: 'llm-worker crateをllm-engineへ改名する'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-25T12:45:38Z'
-updated_at: '2026-06-25T13:23:50Z'
+updated_at: '2026-06-25T13:24:26Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-25T13:24:26Z'
 ---
 
 ## 背景
