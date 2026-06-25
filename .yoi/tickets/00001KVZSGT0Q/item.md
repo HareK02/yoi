@@ -1,9 +1,11 @@
 ---
 title: 'Backend RuntimeRegistryにembedded worker-runtimeを接続する'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-25T16:23:58Z'
-updated_at: '2026-06-25T16:30:31Z'
+updated_at: '2026-06-25T16:31:30Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-25T16:31:30Z'
 ---
 
 ## 背景
