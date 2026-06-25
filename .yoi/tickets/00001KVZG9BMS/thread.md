@@ -674,3 +674,25 @@ Residual risks / notes:
 - child worktree は commit 後 clean。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZG9BMS-worker-rename at: 2026-06-25T16:15:07Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+読取専用で `60dbd724` の follow-up diff と grep を確認した。追加の blocker は見つからなかった。
+
+確認した点:
+- `crates/tui/src/picker.rs` の user-facing wording は `Workers` に更新済み。
+- `crates/tools/README.md` / `crates/manifest/README.md` は `Workers` terminology に更新済み。
+- `crates/pod-store/Cargo.toml` description は `Legacy-named durable Worker metadata/state persistence` となり、crate 名を残す Ticket invariant と current Worker terminology の両方に整合。
+- `crates/worker` は存在し、`crates/pod` は不在。
+- workspace/Cargo 上の旧 `pod` package/import は見当たらず、`worker` crate 参照になっている。
+- 指定 blocker phrase grep は空。
+- repo-wide の高リスク旧語 grep では、`SendToPeerPod` は `crates/session-analytics` の analytics-only legacy constant のみで、現行 `SendToPeerWorker` 分類と明示 comment があるため許容範囲。
+- `--pod` / `yoi pod` / `PodEvent` / `PodStatus` / `PodLaunchFailed` / `SpawnPod` / `pod-session-state.md` 等の active stale refs は見当たらなかった。
+
+検証コマンド自体は read-only 方針のため再実行していないが、報告された validation 内容と今回の差分・grep 確認から、これまでの request_changes blockers は解消済みと判断する。
+
+---
