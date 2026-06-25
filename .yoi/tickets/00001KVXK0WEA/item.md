@@ -2,7 +2,7 @@
 title: 'Update Plugin WIT PDK templates for service event runtime'
 state: 'inprogress'
 created_at: '2026-06-24T19:51:56Z'
-updated_at: '2026-06-25T07:08:46Z'
+updated_at: '2026-06-25T07:09:39Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-24T20:12:05Z'
