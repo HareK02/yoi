@@ -602,3 +602,37 @@ Residual risks / notes:
 - child worktree は commit 後 clean。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZG9BMS-worker-rename at: 2026-06-25T16:11:36Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+読取専用で `cb0c52e7` を確認した。前回指摘した `docs/development/workflows.md` / `docs/development/work-items.md` / `tests/e2e/tests/panel.rs` の blocker は解消している。指定 grep も報告通り空だった。
+
+ただし、Ticket の「public type / module / doc comment の Pod terminology を Worker terminology に更新」「active references は legacy context として明示」条件に対して、まだ active な旧 wording が残っている。
+
+Remaining blockers:
+
+- `crates/tui/src/picker.rs:49`
+  - user-facing error message: `list all host/data-dir Pods`
+  - 現在の CLI/UX surface では Worker を表示しているため `Workers` へ更新が必要。
+
+- `crates/tools/README.md:5`
+  - `used by Pods`
+  - crate README の active architecture doc なので `Workers` へ更新が必要。
+
+- `crates/manifest/README.md:5`
+  - `used to create or restore Pods`
+  - `Worker` terminology に更新が必要。
+
+- `crates/pod-store/Cargo.toml:3`
+  - description: `Durable Pod-name metadata/state persistence`
+  - `pod-store` crate 名を残すのは Ticket invariant 通りだが、metadata description は current Worker 実行単位に合わせるか、`legacy-named ... Worker metadata/state persistence` のように legacy context を明示する必要がある。
+
+補足:
+- `SendToPeerPod` の analytics-only legacy constant は、現行 `SendToPeerWorker` 分類と明示 comment があるため許容。
+- `YOI_POD_RUNTIME_COMMAND` や on-disk `pods` compatibility は、別途 legacy/process compatibility context として扱われているため今回の blocker にはしていない。
+
+---
