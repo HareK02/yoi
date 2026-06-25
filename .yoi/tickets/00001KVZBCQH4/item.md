@@ -1,9 +1,11 @@
 ---
 title: 'worker-runtime core crateと組み込みRuntime APIを作る'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-25T12:17:05Z'
-updated_at: '2026-06-25T16:18:21Z'
+updated_at: '2026-06-25T16:20:10Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-25T16:20:10Z'
 ---
 
 ## 背景
