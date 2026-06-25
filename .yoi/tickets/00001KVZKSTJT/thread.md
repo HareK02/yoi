@@ -125,3 +125,20 @@ Backend proxy は v0 では pass-through projection を基本にし、`protocol:
 権限系はこの Ticket で full auth / permission / redaction rule を実装しない。Backend proxy/projection layer に、後続で observe allow/deny、thinking/tool output/diagnostic redaction、action affordance、command API forwarding allow/deny を差し込める seam を作るに留める。
 
 ---
+
+<!-- event: intake_summary author: hare at: 2026-06-25T20:30:38Z -->
+
+## Intake summary
+
+Marked ready by `yoi ticket state`.
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-06-25T20:30:38Z from: planning to: ready reason: cli_state field: state -->
+
+## State changed
+
+Marked ready by `yoi ticket state`.
+
+
+---
