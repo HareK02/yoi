@@ -108,3 +108,16 @@ Next action:
 - `queued -> inprogress` を記録してから worktree-workflow で `/home/hare/Projects/yoi/.worktree/00001KVZD10ED-llm-engine-rename` を作成し、multi-agent-workflow で Coder/Reviewer sibling loop に進める。
 
 ---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-25T13:26:35Z from: queued to: inprogress reason: orchestrator_acceptance_unblocked field: state -->
+
+## State changed
+
+Orchestrator acceptance: queued -> inprogress
+
+- 直前確認で `TicketShow` は state `queued`、blocking relation は 0 件、accepted plan `orch-plan-20260625-132518-1` を確認した。
+- routing decision と IntentPacket は Ticket thread に記録済み。
+- orchestration worktree は clean。この Ticket 用 worktree/branch はまだ作成していない。
+- これ以降に worktree-workflow で `/home/hare/Projects/yoi/.worktree/00001KVZD10ED-llm-engine-rename` を作成し、multi-agent-workflow に接続する。
+
+---
