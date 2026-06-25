@@ -1,8 +1,8 @@
 ---
 title: 'RuntimeへProfile/config bundleを同期する'
-state: 'planning'
+state: 'ready'
 created_at: '2026-06-25T15:49:30Z'
-updated_at: '2026-06-25T15:51:07Z'
+updated_at: '2026-06-25T16:34:16Z'
 assignee: null
 ---
 

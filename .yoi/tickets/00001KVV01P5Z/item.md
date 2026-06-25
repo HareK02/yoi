@@ -2,7 +2,7 @@
 title: 'Planning Ticket API and UI without queue operations'
 state: 'planning'
 created_at: '2026-06-23T19:41:51Z'
-updated_at: '2026-06-23T19:41:51Z'
+updated_at: '2026-06-25T16:38:49Z'
 assignee: null
 ---
 

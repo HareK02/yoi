@@ -1,8 +1,8 @@
 ---
 title: 'worker-runtimeにFS永続化featureを追加する'
-state: 'planning'
+state: 'ready'
 created_at: '2026-06-25T14:44:02Z'
-updated_at: '2026-06-25T14:47:43Z'
+updated_at: '2026-06-25T16:34:16Z'
 assignee: null
 ---
 

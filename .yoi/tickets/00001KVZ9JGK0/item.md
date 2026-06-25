@@ -1,8 +1,8 @@
 ---
 title: 'Backend内蔵Companion RuntimeとWeb Console MVP'
-state: 'planning'
+state: 'ready'
 created_at: '2026-06-25T11:45:17Z'
-updated_at: '2026-06-25T13:25:34Z'
+updated_at: '2026-06-25T16:34:16Z'
 assignee: null
 ---
 
