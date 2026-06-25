@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::hosts::{
-    DiagnosticSeverity, HostSummary, LocalWorkerRuntime, RuntimeDiagnostic, RuntimeSummary,
-    WorkerRuntimeRegistry, WorkerSummary,
+    DiagnosticSeverity, HostSummary, LocalWorkerRuntime, RuntimeDiagnostic, RuntimeRegistry,
+    RuntimeSummary, WorkerSummary,
 };
 use crate::identity::WorkspaceIdentity;
 use crate::records::{
@@ -64,7 +64,7 @@ pub struct WorkspaceApi {
     config: ServerConfig,
     store: Arc<dyn ControlPlaneStore>,
     records: LocalProjectRecordReader,
-    runtime: Arc<WorkerRuntimeRegistry>,
+    runtime: Arc<RuntimeRegistry>,
 }
 
 impl WorkspaceApi {
@@ -78,13 +78,11 @@ impl WorkspaceApi {
                 updated_at: config.workspace_created_at.clone(),
             })
             .await?;
-        let runtime = Arc::new(WorkerRuntimeRegistry::for_local_pods(
-            LocalWorkerRuntime::new(
-                config.workspace_id.clone(),
-                config.workspace_root.clone(),
-                config.local_runtime_data_dir.clone(),
-            ),
-        ));
+        let runtime = Arc::new(RuntimeRegistry::for_local_pods(LocalWorkerRuntime::new(
+            config.workspace_id.clone(),
+            config.workspace_root.clone(),
+            config.local_runtime_data_dir.clone(),
+        )));
         Ok(Self {
             records: LocalProjectRecordReader::new(config.workspace_root.clone()),
             config,
@@ -746,6 +744,15 @@ mod tests {
         let runtimes = get_json(app.clone(), "/api/runtimes").await;
         assert_eq!(runtimes["source"], "worker_runtime_registry");
         assert_eq!(runtimes["items"][0]["runtime_id"], "local-worker-runtime");
+        assert_eq!(
+            runtimes["items"][0]["source"]["kind"],
+            "local_compatibility"
+        );
+        assert_eq!(
+            runtimes["items"][0]["source"]["identity_authority"],
+            "runtime_registry_projection"
+        );
+        assert!(!runtimes.to_string().contains("/workspace/demo"));
         assert_eq!(runtimes["items"][0]["host_ids"][0], host_id);
 
         let workers = get_json(app.clone(), "/api/workers").await;

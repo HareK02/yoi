@@ -44,6 +44,69 @@ pub enum DiagnosticSeverity {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSourceKind {
+    /// Compatibility projection over the existing local Pod metadata store.
+    LocalCompatibility,
+    /// Reserved boundary for the future in-process worker-runtime Runtime adapter.
+    EmbeddedWorkerRuntime,
+    /// Reserved boundary for a future remote Workspace Runtime adapter.
+    RemoteHttp,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSourceStatus {
+    Active,
+    Reserved,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeIdentityAuthority {
+    /// Public Runtime/Host/Worker ids are registry projections, never raw
+    /// compatibility-store names, socket addresses, session ids, or paths.
+    RuntimeRegistryProjection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeSourceSummary {
+    pub kind: RuntimeSourceKind,
+    pub status: RuntimeSourceStatus,
+    pub identity_authority: RuntimeIdentityAuthority,
+    pub note: String,
+}
+
+impl RuntimeSourceSummary {
+    pub fn local_compatibility() -> Self {
+        Self {
+            kind: RuntimeSourceKind::LocalCompatibility,
+            status: RuntimeSourceStatus::Active,
+            identity_authority: RuntimeIdentityAuthority::RuntimeRegistryProjection,
+            note: "read-only compatibility projection over local Worker metadata; no socket, session, or path authority is exposed".to_string(),
+        }
+    }
+
+    pub fn embedded_worker_runtime_reserved() -> Self {
+        Self {
+            kind: RuntimeSourceKind::EmbeddedWorkerRuntime,
+            status: RuntimeSourceStatus::Reserved,
+            identity_authority: RuntimeIdentityAuthority::RuntimeRegistryProjection,
+            note: "reserved boundary for a future embedded worker-runtime adapter; not connected in this registry foundation".to_string(),
+        }
+    }
+
+    pub fn remote_http_reserved() -> Self {
+        Self {
+            kind: RuntimeSourceKind::RemoteHttp,
+            status: RuntimeSourceStatus::Reserved,
+            identity_authority: RuntimeIdentityAuthority::RuntimeRegistryProjection,
+            note: "reserved boundary for a future remote Runtime adapter; no HTTP client or REST server is implemented here".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeCapabilitySummary {
     pub can_list_hosts: bool,
@@ -74,6 +137,7 @@ pub struct RuntimeSummary {
     pub label: String,
     pub kind: String,
     pub status: String,
+    pub source: RuntimeSourceSummary,
     pub host_ids: Vec<String>,
     pub capabilities: RuntimeCapabilitySummary,
     pub diagnostics: Vec<RuntimeDiagnostic>,
@@ -317,11 +381,11 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
 }
 
 #[derive(Clone)]
-pub struct WorkerRuntimeRegistry {
+pub struct RuntimeRegistry {
     runtimes: Vec<Arc<dyn WorkspaceWorkerRuntime>>,
 }
 
-impl WorkerRuntimeRegistry {
+impl RuntimeRegistry {
     pub fn new(runtimes: Vec<Arc<dyn WorkspaceWorkerRuntime>>) -> Self {
         Self { runtimes }
     }
@@ -582,6 +646,7 @@ impl WorkspaceWorkerRuntime for LocalWorkerRuntime {
             label: "Local Worker runtime".to_string(),
             kind: "local_pod".to_string(),
             status: "available".to_string(),
+            source: RuntimeSourceSummary::local_compatibility(),
             host_ids: host_list
                 .items
                 .iter()
@@ -1011,7 +1076,7 @@ mod tests {
     fn registry_lists_runtimes_hosts_and_workers() {
         let temp = TempDir::new().unwrap();
         write_metadata(temp.path(), "coder", &metadata(Some("/workspace/project")));
-        let registry = WorkerRuntimeRegistry::for_local_pods(LocalWorkerRuntime::new(
+        let registry = RuntimeRegistry::for_local_pods(LocalWorkerRuntime::new(
             "local:test",
             "/workspace/project",
             Some(temp.path().to_path_buf()),
@@ -1019,6 +1084,14 @@ mod tests {
 
         let runtimes = registry.list_runtimes(10);
         assert_eq!(runtimes.items[0].runtime_id, LOCAL_RUNTIME_ID);
+        assert_eq!(
+            runtimes.items[0].source.kind,
+            RuntimeSourceKind::LocalCompatibility
+        );
+        assert_eq!(
+            runtimes.items[0].source.identity_authority,
+            RuntimeIdentityAuthority::RuntimeRegistryProjection
+        );
         assert_eq!(runtimes.items[0].host_ids, vec![host_id()]);
 
         let hosts = registry.list_hosts(10);
@@ -1043,7 +1116,7 @@ mod tests {
     fn registry_resolves_backend_validated_host_ids() {
         let temp = TempDir::new().unwrap();
         write_metadata(temp.path(), "coder", &metadata(Some("/workspace/project")));
-        let registry = WorkerRuntimeRegistry::for_local_pods(LocalWorkerRuntime::new(
+        let registry = RuntimeRegistry::for_local_pods(LocalWorkerRuntime::new(
             "local:test",
             "/workspace/project",
             Some(temp.path().to_path_buf()),
@@ -1133,7 +1206,7 @@ mod tests {
             "/workspace/project",
             Some(temp.path().to_path_buf()),
         );
-        let registry = WorkerRuntimeRegistry::for_local_pods(bridge.clone());
+        let registry = RuntimeRegistry::for_local_pods(bridge.clone());
 
         let listed = registry.list_workers(100);
         assert_eq!(listed.items.len(), worker_names.len());
