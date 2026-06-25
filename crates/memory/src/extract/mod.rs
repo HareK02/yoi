@@ -1,10 +1,10 @@
 //! extract: 活動抽出。
 //!
-//! 通常 Pod の post-run hook で発火する disposable Worker と、その
+//! 通常 Pod の post-run hook で発火する disposable Engine と、その
 //! 出力を `<workspace>/.yoi/memory/_staging/<id>.json` に書き出す
 //! ヘルパーを提供する。Pod 側はこのモジュールから:
 //!
-//! - [`build_extract_input`] を sub-Worker の最初の user 入力に
+//! - [`build_extract_input`] を sub-Engine の最初の user 入力に
 //! - [`write_extracted_tool`] を唯一のツールとして
 //! - [`write_staging`] で受け取った JSON を staging に書き出し
 //!

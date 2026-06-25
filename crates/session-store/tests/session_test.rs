@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use common::MockLlmClient;
-use llm_worker::Worker;
-use llm_worker::interceptor::{Interceptor, TurnEndAction};
-use llm_worker::llm_client::event::{Event, ResponseStatus, StatusEvent};
-use llm_worker::llm_client::types::{Item, RequestConfig};
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use llm_engine::Engine;
+use llm_engine::interceptor::{Interceptor, TurnEndAction};
+use llm_engine::llm_client::event::{Event, ResponseStatus, StatusEvent};
+use llm_engine::llm_client::types::{Item, RequestConfig};
+use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use session_store::{FsStore, LogEntry, SegmentStartState, Store, collect_state};
 
 // =============================================================================
@@ -57,7 +57,7 @@ impl Tool for MockWeatherTool {
     async fn execute(
         &self,
         _input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         Ok("Sunny, 25C".to_string().into())
     }
@@ -97,12 +97,12 @@ fn make_store() -> (tempfile::TempDir, FsStore) {
 /// Run a worker turn and persist via session-store functions.
 /// Takes ownership of the worker (needed for lock/unlock) and returns it.
 async fn run_and_persist(
-    worker: Worker<MockLlmClient>,
+    worker: Engine<MockLlmClient>,
     store: &FsStore,
     session_id: session_store::SessionId,
     segment_id: session_store::SegmentId,
     input: &str,
-) -> (Worker<MockLlmClient>, llm_worker::WorkerResult) {
+) -> (Engine<MockLlmClient>, llm_engine::EngineResult) {
     // Mirror Pod's run-entry contract: log the user input as segments
     // before the worker pushes its flattened user_message; save_delta
     // skips the resulting user_message item to avoid double-write.
@@ -159,7 +159,7 @@ async fn run_and_persist(
 async fn session_run_logs_entries() {
     let (_dir, store) = make_store();
     let client = MockLlmClient::new(simple_text_events());
-    let worker = Worker::new(client);
+    let worker = Engine::new(client);
 
     let (sid, segid) = session_store::create_segment(
         &store,
@@ -191,7 +191,7 @@ async fn session_run_logs_entries() {
         matches!(
             e,
             LogEntry::RunCompleted {
-                result: llm_worker::WorkerResult::Finished,
+                result: llm_engine::EngineResult::Finished,
                 ..
             }
         )
@@ -203,7 +203,7 @@ async fn session_run_logs_entries() {
 async fn session_restore_round_trip() {
     let (_dir, store) = make_store();
     let client = MockLlmClient::new(simple_text_events());
-    let mut worker = Worker::new(client);
+    let mut worker = Engine::new(client);
     worker.set_system_prompt("You are helpful.");
 
     let (sid, segid) = session_store::create_segment(
@@ -242,7 +242,7 @@ async fn session_restore_round_trip() {
 async fn session_run_with_tool_call() {
     let (_dir, store) = make_store();
     let client = MockLlmClient::with_responses(tool_call_events());
-    let mut worker = Worker::new(client);
+    let mut worker = Engine::new(client);
     worker.register_tool(weather_tool_definition());
 
     let (sid, segid) = session_store::create_segment(
@@ -276,7 +276,7 @@ async fn session_resume_after_pause() {
 
     // First run: tool call with pause policy → Paused
     let client = MockLlmClient::with_responses(tool_call_events());
-    let mut worker = Worker::new(client);
+    let mut worker = Engine::new(client);
     worker.register_tool(weather_tool_definition());
     worker.set_interceptor(PausePolicy);
 
@@ -291,7 +291,7 @@ async fn session_resume_after_pause() {
     .unwrap();
 
     let (_worker, result) = run_and_persist(worker, &store, sid, segid, "Weather?").await;
-    assert!(matches!(result, llm_worker::WorkerResult::Paused));
+    assert!(matches!(result, llm_engine::EngineResult::Paused));
 
     // Check RunCompleted is Paused
     let entries = store.read_all(sid, segid).unwrap();
@@ -299,7 +299,7 @@ async fn session_resume_after_pause() {
         matches!(
             e,
             LogEntry::RunCompleted {
-                result: llm_worker::WorkerResult::Paused,
+                result: llm_engine::EngineResult::Paused,
                 ..
             }
         )
@@ -315,7 +315,7 @@ async fn session_resume_after_pause() {
 async fn session_fork_creates_new_session() {
     let (_dir, store) = make_store();
     let client = MockLlmClient::new(simple_text_events());
-    let mut worker = Worker::new(client);
+    let mut worker = Engine::new(client);
     worker.set_system_prompt("System prompt");
 
     let (sid, segid) = session_store::create_segment(
@@ -357,7 +357,7 @@ async fn session_fork_creates_new_session() {
 async fn session_fork_at_truncates_within_session() {
     let (_dir, store) = make_store();
     let client = MockLlmClient::new(simple_text_events());
-    let worker = Worker::new(client);
+    let worker = Engine::new(client);
 
     let (sid, segid) = session_store::create_segment(
         &store,
@@ -402,7 +402,7 @@ async fn session_fork_at_truncates_within_session() {
 async fn session_config_changed_logged() {
     let (_dir, store) = make_store();
     let client = MockLlmClient::new(vec![]);
-    let mut worker = Worker::new(client);
+    let mut worker = Engine::new(client);
 
     let (sid, segid) = session_store::create_segment(
         &store,
@@ -435,7 +435,7 @@ async fn session_auto_forks_on_conflict() {
 
     // Create a segment
     let client_a = MockLlmClient::new(simple_text_events());
-    let worker_a = Worker::new(client_a);
+    let worker_a = Engine::new(client_a);
 
     let (sid, original_segid) = session_store::create_segment(
         &store,
@@ -519,7 +519,7 @@ async fn session_auto_forks_on_conflict() {
 async fn nested_past_fork_leaves_ancestors_immutable() {
     let (_dir, store) = make_store();
     let client = MockLlmClient::new(simple_text_events());
-    let worker = Worker::new(client);
+    let worker = Engine::new(client);
 
     let (sid, root_segid) = session_store::create_segment(
         &store,

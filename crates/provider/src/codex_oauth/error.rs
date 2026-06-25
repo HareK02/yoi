@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use llm_worker::llm_client::ClientError;
+use llm_engine::llm_client::ClientError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]

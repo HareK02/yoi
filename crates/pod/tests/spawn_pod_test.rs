@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 use client::PodRuntimeCommand;
-use llm_worker::tool::{ToolError, ToolOutput};
+use llm_engine::tool::{ToolError, ToolOutput};
 use manifest::{
     AuthRef, ModelManifest, Permission, PodManifest, PodManifestConfig, PodMetaConfig, SchemeKind,
     Scope, ScopeConfig, ScopeRule, SharedScope,

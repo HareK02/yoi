@@ -2,7 +2,7 @@
 
 ## Role
 
-`provider` resolves model/provider configuration and constructs provider-specific LLM clients for `llm-worker`.
+`provider` resolves model/provider configuration and constructs provider-specific LLM clients for `llm-engine`.
 
 ## Boundaries
 
@@ -16,14 +16,14 @@ Owns:
 
 Does not own:
 
-- Worker turn lifecycle (`llm-worker`)
+- Engine turn lifecycle (`llm-engine`)
 - secret storage internals (`secrets`)
 - Pod lifecycle (`pod`)
 - product CLI parsing (`yoi`)
 
 ## Design notes
 
-Provider API facts drift. Keep wire-format, auth, catalog, and capability differences here so Worker semantics remain stable.
+Provider API facts drift. Keep wire-format, auth, catalog, and capability differences here so Engine semantics remain stable.
 
 Codex OAuth is a separate integration from normal provider secret refs because its local file shape and lifecycle differ.
 

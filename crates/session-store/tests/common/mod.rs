@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use futures::Stream;
-use llm_worker::llm_client::event::Event;
-use llm_worker::llm_client::{ClientError, LlmClient, Request};
+use llm_engine::llm_client::event::Event;
+use llm_engine::llm_client::{ClientError, LlmClient, Request};
 
 /// A mock LLM client that replays pre-defined event sequences.
 #[derive(Clone)]

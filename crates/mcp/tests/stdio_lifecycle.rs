@@ -225,7 +225,7 @@ async fn permission_denial_style_shutdown_sends_no_tools_call() {
     let mut client = McpStdioClient::connect(mock_server("tools-call-forbidden"), tight_limits())
         .await
         .expect("connect");
-    // This mirrors Worker pre-tool-call denial: the ordinary Tool execution body
+    // This mirrors Engine pre-tool-call denial: the ordinary Tool execution body
     // is never entered, so the MCP server sees lifecycle shutdown but no call.
     client.shutdown().await.expect("shutdown");
 }

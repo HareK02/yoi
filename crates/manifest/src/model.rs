@@ -14,9 +14,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-// `ModelCapability` は `llm-worker` 側に定義される runtime 構造だが、
+// `ModelCapability` は `llm-engine` 側に定義される runtime 構造だが、
 // マニフェストで任意に override できるよう型だけ再エクスポートする。
-pub use llm_worker::llm_client::capability::{ModelCapability, ReasoningControl, ReasoningEffort};
+pub use llm_engine::llm_client::capability::{ModelCapability, ReasoningControl, ReasoningEffort};
 
 /// Pod マニフェストの `[model]` セクション。
 ///

@@ -20,9 +20,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use futures::Stream;
-use llm_worker::Worker;
-use llm_worker::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
-use llm_worker::llm_client::{ClientError, LlmClient, Request};
+use llm_engine::Engine;
+use llm_engine::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
+use llm_engine::llm_client::{ClientError, LlmClient, Request};
 use memory::WorkspaceLayout;
 use memory::extract::{ExtractedPayload, write_staging};
 use memory::schema::SourceRef;
@@ -169,7 +169,7 @@ async fn make_pod_with(
     std::mem::forget(store_tmp);
 
     let scope = pod::Scope::writable(&pwd).unwrap();
-    let worker = Worker::new(client);
+    let worker = Engine::new(client);
     Pod::new(manifest, worker, store, pwd, scope).await.unwrap()
 }
 
@@ -388,7 +388,7 @@ async fn fires_on_threshold_and_cleans_up_consumed_entries() {
     write_n_staging(&layout, 2); // threshold is 2 — fires.
 
     // Sub-worker is given a single text-only response. The consolidation prompt
-    // tells it to call memory tools; the mock skips those, but `Worker::run`
+    // tells it to call memory tools; the mock skips those, but `Engine::run`
     // returns Ok regardless once the LLM closes with a final text.
     let client = MockClient::new(vec![done("ok")]);
     let mut pod = make_pod_with(FILES_THRESHOLD_TOML, pwd.path().to_path_buf(), client).await;

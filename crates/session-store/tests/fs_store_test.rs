@@ -1,5 +1,5 @@
-use llm_worker::WorkerResult;
-use llm_worker::llm_client::types::{Item, RequestConfig};
+use llm_engine::EngineResult;
+use llm_engine::llm_client::types::{Item, RequestConfig};
 use session_store::{
     FsStore, LogEntry, Store, TraceEntry, collect_state, new_segment_id, new_session_id,
 };
@@ -48,7 +48,7 @@ fn round_trip_write_and_read() {
         LogEntry::RunCompleted {
             ts: 3200,
             interrupted: false,
-            result: WorkerResult::Finished,
+            result: EngineResult::Finished,
         },
     ];
 
@@ -175,8 +175,8 @@ fn trace_entries_in_separate_file() {
         turn: 0,
         llm_call: Some(0),
         payload: session_store::TracePayload::StreamEvent {
-            event: llm_worker::llm_client::event::Event::Ping(
-                llm_worker::llm_client::event::PingEvent { timestamp: None },
+            event: llm_engine::llm_client::event::Event::Ping(
+                llm_engine::llm_client::event::PingEvent { timestamp: None },
             ),
         },
     };

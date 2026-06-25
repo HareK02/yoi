@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -633,7 +633,7 @@ impl Tool for TicketCreateTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketCreateParams = parse_input("TicketCreate", input_json)?;
         let mut input = NewTicket::new(params.title);
@@ -667,7 +667,7 @@ impl Tool for TicketListTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketListParams = parse_input("TicketList", input_json)?;
         let state = params.state.unwrap_or(TicketListStateParam::All);
@@ -707,7 +707,7 @@ impl Tool for TicketShowTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketShowParams = parse_input("TicketShow", input_json)?;
         let query = id_or_query(params.id, params.query)?;
@@ -743,7 +743,7 @@ impl Tool for TicketCommentTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketCommentParams = parse_input("TicketComment", input_json)?;
         let kind = match params.role {
@@ -770,7 +770,7 @@ impl Tool for TicketReviewTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketReviewParams = parse_input("TicketReview", input_json)?;
         let result = match params.result {
@@ -798,7 +798,7 @@ impl Tool for TicketIntakeReadyTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketIntakeReadyParams = parse_input("TicketIntakeReady", input_json)?;
         let from = TicketWorkflowState::Planning;
@@ -837,7 +837,7 @@ impl Tool for TicketWorkflowStateTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketWorkflowStateParams = parse_input("TicketWorkflowState", input_json)?;
         let from = params.from.into_state();
@@ -876,7 +876,7 @@ impl Tool for TicketCloseTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketCloseParams = parse_input("TicketClose", input_json)?;
         self.backend
@@ -897,7 +897,7 @@ impl Tool for TicketRelationRecordTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketRelationRecordParams = parse_input("TicketRelationRecord", input_json)?;
         let relation = NewTicketRelation {
@@ -925,7 +925,7 @@ impl Tool for TicketRelationQueryTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketRelationQueryParams = parse_input("TicketRelationQuery", input_json)?;
         let limit = bounded(params.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
@@ -963,7 +963,7 @@ impl Tool for TicketOrchestrationPlanRecordTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketOrchestrationPlanRecordParams =
             parse_input("TicketOrchestrationPlanRecord", input_json)?;
@@ -999,7 +999,7 @@ impl Tool for TicketOrchestrationPlanQueryTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketOrchestrationPlanQueryParams =
             parse_input("TicketOrchestrationPlanQuery", input_json)?;
@@ -1040,7 +1040,7 @@ impl Tool for TicketDoctorTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketDoctorParams = parse_input("TicketDoctor", input_json)?;
         let limit = bounded(params.limit, DEFAULT_DIAGNOSTIC_LIMIT, MAX_DIAGNOSTIC_LIMIT);

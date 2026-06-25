@@ -8,7 +8,7 @@ autobins = false
 [dependencies]
 async-trait = { workspace = true }
 clap = { version = "4.6.0", features = ["derive"] }
-llm-worker = { workspace = true }
+llm-engine = { workspace = true }
 session-store = { workspace = true }
 pod-store = { workspace = true }
 manifest = { workspace = true }

@@ -1,10 +1,10 @@
 # Provider and model boundary
 
-The Worker should be provider-independent. Provider-specific wire formats, auth mechanisms, model catalogs, reasoning knobs, and terminal error shapes belong below or beside it, not inside ordinary turn orchestration.
+The Engine should be provider-independent. Provider-specific wire formats, auth mechanisms, model catalogs, reasoning knobs, and terminal error shapes belong below or beside it, not inside ordinary turn orchestration.
 
-## Worker responsibility
+## Engine responsibility
 
-`llm-worker` owns turn lifecycle:
+`llm-engine` owns turn lifecycle:
 
 - committed history append
 - tool loops
@@ -42,4 +42,4 @@ Event trace sidecars are optional parsed lifecycle traces. They are not complete
 
 ## Why this boundary exists
 
-Provider APIs drift. If provider details leak into Worker logic, every new model behavior risks changing core orchestration. Keeping the boundary explicit lets Yoi adapt provider integrations while preserving stable turn semantics.
+Provider APIs drift. If provider details leak into Engine logic, every new model behavior risks changing core orchestration. Keeping the boundary explicit lets Yoi adapt provider integrations while preserving stable turn semantics.

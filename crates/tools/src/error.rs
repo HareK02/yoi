@@ -2,11 +2,11 @@
 //!
 //! `ToolsError` is the crate-level error returned by `ScopedFs` and each
 //! builtin tool's internal logic. Tool `execute()` impls convert it to
-//! [`llm_worker::tool::ToolError`] via the `From` impl defined here.
+//! [`llm_engine::tool::ToolError`] via the `From` impl defined here.
 
 use std::path::PathBuf;
 
-use llm_worker::tool::ToolError;
+use llm_engine::tool::ToolError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolsError {

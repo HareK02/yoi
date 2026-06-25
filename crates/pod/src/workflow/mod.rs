@@ -4,11 +4,11 @@
 //! dependency Knowledge bodies first, then the Workflow body. Resolution is
 //! strict for explicit user invocations: missing workflows, non-user-invocable
 //! workflows, and missing Knowledge requirements are returned as errors before
-//! the turn is handed to the Worker.
+//! the turn is handed to the Engine.
 
 use std::fmt;
 
-use llm_worker::Item;
+use llm_engine::Item;
 use memory::WorkspaceLayout;
 use memory::schema::split_frontmatter;
 use workflow_crate::{Slug, WorkflowRegistry};

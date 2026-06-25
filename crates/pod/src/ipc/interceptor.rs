@@ -12,13 +12,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use llm_worker::Item;
-use llm_worker::UsageRecord;
-use llm_worker::interceptor::{
+use llm_engine::Item;
+use llm_engine::UsageRecord;
+use llm_engine::interceptor::{
     Interceptor, PostToolAction, PreRequestAction, PreToolAction, PromptAction, ToolCallInfo,
     ToolResultInfo, TurnEndAction,
 };
-use llm_worker::tool::ToolOutput;
+use llm_engine::tool::ToolOutput;
 use tracing::info;
 use tracing::warn;
 
@@ -35,7 +35,7 @@ use crate::hook::{
 use crate::ipc::notify_buffer::{NotifyBuffer, build_system_item};
 use crate::pod::SystemItemCommitter;
 use crate::prompt::catalog::PromptCatalog;
-use llm_worker::token_counter::total_tokens;
+use llm_engine::token_counter::total_tokens;
 
 /// Maximum number of bytes copied into `TurnEndInfo::final_text_preview`.
 const FINAL_TEXT_PREVIEW_LIMIT: usize = 512;
@@ -53,7 +53,7 @@ pub(crate) struct PodInterceptor {
     usage_tracker: Option<Arc<UsageTracker>>,
     /// Pending-notification buffer drained into `worker.history`
     /// via [`Self::pending_history_appends`] just before the next LLM
-    /// request. The Worker `extend`s these into its persistent history
+    /// request. The Engine `extend`s these into its persistent history
     /// so the LLM has a visible trigger for any reaction it commits.
     pending_notifies: NotifyBuffer,
     /// Submit-scoped stash of resolver-produced typed system items.
@@ -495,14 +495,14 @@ mod tests {
         .expect("task tool definition");
         let (meta, tool) = def();
         ToolCallInfo {
-            call: llm_worker::tool::ToolCall {
+            call: llm_engine::tool::ToolCall {
                 id: "call-id".into(),
                 name: name.into(),
                 input,
             },
             meta,
             tool,
-            context: llm_worker::tool::ToolExecutionContext::new("call-id", "test-batch", 0),
+            context: llm_engine::tool::ToolExecutionContext::new("call-id", "test-batch", 0),
         }
     }
 
@@ -590,7 +590,7 @@ mod tests {
         let history = usage_handle_with(ctx_items.len(), 50);
         let usage_tracker = Arc::new(UsageTracker::new());
         usage_tracker.note_request(ctx_items.len());
-        usage_tracker.record_usage(&llm_worker::event::UsageEvent {
+        usage_tracker.record_usage(&llm_engine::event::UsageEvent {
             input_tokens: Some(150),
             output_tokens: Some(0),
             total_tokens: Some(150),
@@ -656,7 +656,7 @@ mod tests {
             cache_write_tokens: 0,
             output_tokens: 0,
         };
-        let prefix = llm_worker::token_counter::prefix_bytes(&ctx_items);
+        let prefix = llm_engine::token_counter::prefix_bytes(&ctx_items);
         let delta_bytes = prefix[2].saturating_sub(prefix[1]);
         let old_projection =
             11_124 + (delta_bytes as u128 * 11_124_u128 / prefix[1] as u128) as u64;
@@ -767,7 +767,7 @@ mod tests {
         assert!(matches!(
             &items[0],
             Item::Message {
-                role: llm_worker::Role::System,
+                role: llm_engine::Role::System,
                 ..
             }
         ));
@@ -912,7 +912,7 @@ mod tests {
         let info = task_tool_call_info("TaskList", serde_json::json!({}));
         let mut result_info = ToolResultInfo {
             call: info.call,
-            result: llm_worker::tool::ToolResult::from_output(
+            result: llm_engine::tool::ToolResult::from_output(
                 "call-id",
                 ToolOutput {
                     summary: "ok".into(),
@@ -1001,7 +1001,7 @@ mod tests {
             let mut ctx = ctx_items.clone();
             let action = interceptor.pre_llm_request(&mut ctx).await;
             assert!(matches!(action, PreRequestAction::Continue));
-            usage_tracker.record_usage(&llm_worker::event::UsageEvent {
+            usage_tracker.record_usage(&llm_engine::event::UsageEvent {
                 input_tokens: Some(10),
                 output_tokens: Some(0),
                 total_tokens: Some(10),
@@ -1017,7 +1017,7 @@ mod tests {
             other => panic!("expected reminder append, got {other:?}"),
         };
         assert_eq!(appended_len, 1);
-        usage_tracker.record_usage(&llm_worker::event::UsageEvent {
+        usage_tracker.record_usage(&llm_engine::event::UsageEvent {
             input_tokens: Some(11),
             output_tokens: Some(0),
             total_tokens: Some(11),

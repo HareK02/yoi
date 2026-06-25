@@ -68,7 +68,7 @@ Adopting the Component Model must not change Yoi's authority model:
 - Explicit enablement is required before any Tool surface is registered.
 - Plugin grants are required before runtime execution and before `https` / `fs` / future host API calls.
 - Component imports are not authority by themselves; host-side grant checks remain authoritative.
-- Tool calls and Tool results continue through the ordinary ToolRegistry and Worker history path.
+- Tool calls and Tool results continue through the ordinary ToolRegistry and Engine history path.
 - No hidden context injection is introduced by component imports, resources, prompts, or SDK helpers.
 - Plugin SDKs and templates are authoring aids, not trust boundaries.
 
@@ -120,7 +120,7 @@ The component runtime uses `wasmtime::component` and expects the exported world
 `yoi:plugin/tool@1.0.0` with a `call(tool-name: string, input-json: string) ->
 string` export. The returned string is the normal ToolOutput JSON, so
 registration and execution still flow through the existing ToolRegistry and
-Worker Tool-result history path.
+Engine Tool-result history path.
 
 Host imports are stable names under `yoi:host/*@1.0.0`; the repository WIT files
 live in `resources/plugin/wit/`. Importing `yoi:host/request@1.0.0` or
@@ -164,7 +164,7 @@ authority model.
 Important boundaries:
 
 - Tool calls still enter through `ToolRegistry` and return ordinary `ToolOutput`
-  that is visible in the Worker history path.
+  that is visible in the Engine history path.
 - Service and Ingress grants are separate from Tool grants. Sharing an instance
   does not authorize a surface that lacks its own `surface.*` and per-surface
   permission/grant.

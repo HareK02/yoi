@@ -4,11 +4,11 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
-use llm_worker::Worker;
-use llm_worker::llm_client::event::{ErrorEvent, Event as LlmEvent, ResponseStatus, StatusEvent};
-use llm_worker::llm_client::types::Item;
-use llm_worker::llm_client::{ClientError, LlmClient, Request};
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use llm_engine::Engine;
+use llm_engine::llm_client::event::{ErrorEvent, Event as LlmEvent, ResponseStatus, StatusEvent};
+use llm_engine::llm_client::types::Item;
+use llm_engine::llm_client::{ClientError, LlmClient, Request};
+use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use pod_store::{CombinedStore, FsPodStore};
 use session_store::{FsStore, LogEntry};
 
@@ -53,7 +53,7 @@ fn history_from_sink(handle: &PodHandle) -> Vec<Item> {
 enum MockResponse {
     /// Emit the events and let the stream terminate naturally.
     Complete(Vec<LlmEvent>),
-    /// Emit the events and then pend forever so the Worker blocks on
+    /// Emit the events and then pend forever so the Engine blocks on
     /// `stream.next()` — used to exercise the Cancel/Pause path while a
     /// turn is actively in flight.
     Hang(Vec<LlmEvent>),
@@ -183,7 +183,7 @@ async fn make_pod_with_pwd_and_manifest(
     let scope = manifest::Scope::writable(&pwd).unwrap();
     std::mem::forget(pwd_tmp);
 
-    let worker = Worker::new(client);
+    let worker = Engine::new(client);
     let pod = Pod::new(manifest, worker, store, pwd.clone(), scope)
         .await
         .unwrap();
@@ -518,7 +518,7 @@ async fn provider_stream_error_records_run_errored() {
         !entries.iter().any(|entry| matches!(
             entry,
             LogEntry::RunCompleted {
-                result: llm_worker::WorkerResult::Finished,
+                result: llm_engine::EngineResult::Finished,
                 ..
             }
         )),
@@ -854,7 +854,7 @@ async fn run_with_paste_segment_inlines_content_and_emits_typed_user_message() {
     let echoed = user_input_segments.expect("committed UserInput entry missing");
     assert_eq!(echoed, segments, "typed segments must round-trip unchanged");
 
-    // The Worker received a single user message whose text is the
+    // The Engine received a single user message whose text is the
     // flattened body — paste content inlined, no chip label.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let requests = client_for_assert.captured_requests();
@@ -1101,7 +1101,7 @@ async fn notify_while_idle_auto_starts_turn_and_injects_system_message() {
             .collect::<Vec<_>>()
     );
 
-    // The notification must also be persisted into the Worker history
+    // The notification must also be persisted into the Engine history
     // (and therefore eventually into history.json), per
     // tickets/notify-history-persist.md.
     let history = history_from_sink(&handle);
@@ -1638,7 +1638,7 @@ impl Tool for HangingTool {
     async fn execute(
         &self,
         _input: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         std::future::pending::<()>().await;
         unreachable!()
@@ -1681,7 +1681,7 @@ async fn drain_until<F: FnMut(&Event) -> bool>(
 #[tokio::test]
 async fn pause_then_resume_transitions_and_preserves_history_consistency() {
     // Response 1: hang after opening a text block (no stop / completed),
-    // so the Worker is parked inside the stream read and `cancel_rx`
+    // so the Engine is parked inside the stream read and `cancel_rx`
     // races it cleanly on Method::Pause.
     let hang = MockResponse::Hang(vec![
         LlmEvent::text_block_start(0),
@@ -1717,7 +1717,7 @@ async fn pause_then_resume_transitions_and_preserves_history_consistency() {
     handle.send(Method::Pause).await.unwrap();
 
     // The controller emits RunEnd { Paused } when the
-    // WorkerError::Cancelled is translated under pause_requested.
+    // EngineError::Cancelled is translated under pause_requested.
     assert!(
         drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
             e,
@@ -1756,9 +1756,9 @@ async fn pause_then_resume_transitions_and_preserves_history_consistency() {
         .iter()
         .filter_map(|i| match i {
             Item::Message { role, .. } => match role {
-                llm_worker::Role::User => Some("user"),
-                llm_worker::Role::Assistant => Some("assistant"),
-                llm_worker::Role::System => Some("system"),
+                llm_engine::Role::User => Some("user"),
+                llm_engine::Role::Assistant => Some("assistant"),
+                llm_engine::Role::System => Some("system"),
             },
             _ => None,
         })
@@ -1772,13 +1772,13 @@ async fn pause_then_resume_transitions_and_preserves_history_consistency() {
         .iter()
         .find_map(|i| match i {
             Item::Message {
-                role: llm_worker::Role::Assistant,
+                role: llm_engine::Role::Assistant,
                 content,
                 ..
             } => Some(
                 content
                     .iter()
-                    .map(|p: &llm_worker::ContentPart| p.as_text().to_owned())
+                    .map(|p: &llm_engine::ContentPart| p.as_text().to_owned())
                     .collect::<Vec<_>>()
                     .join(""),
             ),
@@ -1797,7 +1797,7 @@ async fn pause_then_resume_transitions_and_preserves_history_consistency() {
 #[tokio::test]
 async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
     // Response 1: emit a tool_use block (complete with stop) targeting
-    // our hanging tool. The Worker commits the ToolCall to history,
+    // our hanging tool. The Engine commits the ToolCall to history,
     // then parks inside `execute_tools` waiting on the tool — which is
     // where Method::Pause catches it.
     let tool_name = "HangyTool";
@@ -1821,7 +1821,7 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
     let client = MockClient::sequential(vec![first, second]);
     let client_for_assert = client.clone();
     let mut pod = make_pod(client).await;
-    pod.worker_mut()
+    pod.engine_mut()
         .register_tool(hanging_tool_definition(tool_name));
     let handle = spawn_controller(pod).await;
     let mut rx = handle.subscribe();
@@ -1829,7 +1829,7 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
     handle.send(Method::run_text("first")).await.unwrap();
 
     // Wait for ToolCallDone — the ToolCall is committed to history
-    // right before the Worker enters tool execution and pends.
+    // right before the Engine enters tool execution and pends.
     assert!(
         drain_until(&mut rx, std::time::Duration::from_secs(2), |e| matches!(
             e,
@@ -1882,21 +1882,21 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
     let mut saw_new_user = false;
     for item in items {
         match item {
-            llm_worker::Item::ToolResult {
+            llm_engine::Item::ToolResult {
                 call_id, summary, ..
             } if call_id == "call_orphan" => {
                 assert_eq!(summary, "[Interrupted by user]");
                 saw_synthetic_tool_result = true;
             }
-            llm_worker::Item::Message { role, content, .. }
-                if *role == llm_worker::Role::System =>
+            llm_engine::Item::Message { role, content, .. }
+                if *role == llm_engine::Role::System =>
             {
                 let text: String = content.iter().map(|p| p.as_text()).collect();
                 if text.contains("interrupted by the user") {
                     saw_interruption_note = true;
                 }
             }
-            llm_worker::Item::Message { role, content, .. } if *role == llm_worker::Role::User => {
+            llm_engine::Item::Message { role, content, .. } if *role == llm_engine::Role::User => {
                 let text: String = content.iter().map(|p| p.as_text()).collect();
                 if text.contains("new request") {
                     saw_new_user = true;
@@ -1921,13 +1921,13 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
     // Also confirm the closure chain is ordered: tool_result for the
     // orphan precedes the system note, which precedes the new user
     // message.
-    let idx = |pred: &dyn Fn(&llm_worker::Item) -> bool| items.iter().position(pred).unwrap();
+    let idx = |pred: &dyn Fn(&llm_engine::Item) -> bool| items.iter().position(pred).unwrap();
     let tool_result_idx = idx(
-        &|i| matches!(i, llm_worker::Item::ToolResult { call_id, .. } if call_id == "call_orphan"),
+        &|i| matches!(i, llm_engine::Item::ToolResult { call_id, .. } if call_id == "call_orphan"),
     );
     let sys_idx = idx(&|i| match i {
-        llm_worker::Item::Message {
-            role: llm_worker::Role::System,
+        llm_engine::Item::Message {
+            role: llm_engine::Role::System,
             content,
             ..
         } => content
@@ -1938,8 +1938,8 @@ async fn paused_then_run_closes_orphan_tool_use_for_next_request() {
         _ => false,
     });
     let user_idx = idx(&|i| match i {
-        llm_worker::Item::Message {
-            role: llm_worker::Role::User,
+        llm_engine::Item::Message {
+            role: llm_engine::Role::User,
             content,
             ..
         } => content
@@ -1981,7 +1981,7 @@ async fn paused_cancel_abandons_resume_and_next_input_is_fresh_run() {
     let client = MockClient::sequential(vec![first, second]);
     let client_for_assert = client.clone();
     let mut pod = make_pod(client).await;
-    pod.worker_mut()
+    pod.engine_mut()
         .register_tool(hanging_tool_definition(tool_name));
     let handle = spawn_controller(pod).await;
     let mut rx = handle.subscribe();
@@ -2022,7 +2022,7 @@ async fn paused_cancel_abandons_resume_and_next_input_is_fresh_run() {
         !entries_after_cancel.iter().any(|entry| matches!(
             entry,
             LogEntry::RunCompleted {
-                result: llm_worker::WorkerResult::Finished,
+                result: llm_engine::EngineResult::Finished,
                 interrupted: false,
                 ..
             }
@@ -2078,7 +2078,7 @@ async fn paused_cancel_abandons_resume_and_next_input_is_fresh_run() {
     assert!(
         items.iter().any(|item| matches!(
             item,
-            llm_worker::Item::ToolResult { call_id, summary, .. }
+            llm_engine::Item::ToolResult { call_id, summary, .. }
                 if call_id == "call_cancelled" && summary == "[Interrupted by user]"
         )),
         "paused cancel should close orphan tool_use before future requests: {items:?}"
@@ -2086,8 +2086,8 @@ async fn paused_cancel_abandons_resume_and_next_input_is_fresh_run() {
     assert!(
         items.iter().any(|item| matches!(
             item,
-            llm_worker::Item::Message {
-                role: llm_worker::Role::System,
+            llm_engine::Item::Message {
+                role: llm_engine::Role::System,
                 ..
             } if item_text_contains(item, "interrupted by the user")
         )),
@@ -2096,8 +2096,8 @@ async fn paused_cancel_abandons_resume_and_next_input_is_fresh_run() {
     assert!(
         items.iter().any(|item| matches!(
             item,
-            llm_worker::Item::Message {
-                role: llm_worker::Role::User,
+            llm_engine::Item::Message {
+                role: llm_engine::Role::User,
                 ..
             } if item_text_contains(item, "fresh request")
         )),

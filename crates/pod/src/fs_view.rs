@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use llm_worker::Item;
+use llm_engine::Item;
 use manifest::Scope;
 use tools::scoped_fs::first_symlink;
 use tools::{ScopedFs, ToolsError};
@@ -369,7 +369,7 @@ fn split_prefix(prefix: &str, cwd: &Path) -> (PathBuf, String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_worker::ContentPart;
+    use llm_engine::ContentPart;
     use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
     use tempfile::TempDir;
 

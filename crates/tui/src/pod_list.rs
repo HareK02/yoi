@@ -558,7 +558,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use llm_worker::llm_client::types::RequestConfig;
+    use llm_engine::llm_client::types::RequestConfig;
     use pod_store::FsPodStore;
     use pod_store::{PodActiveSegmentRef, PodMetadataStore};
     use protocol::stream::JsonLineWriter;

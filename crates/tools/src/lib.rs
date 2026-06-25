@@ -1,7 +1,7 @@
 //! Built-in tools for the Yoi LLM agent.
 //!
 //! Implements Read / Write / Edit / Glob / Grep / Bash on top of the
-//! `llm-worker` `Tool` infrastructure. Filesystem access is mediated by
+//! `llm-engine` `Tool` infrastructure. Filesystem access is mediated by
 //! two orthogonal concerns:
 //!
 //! - [`ScopedFs`] — Pod-process lifetime, expresses the write-block
@@ -12,7 +12,7 @@
 //!   Recreated fresh on each Pod start (including resume).
 //!
 //! The Pod layer owns both instances and passes them to
-//! [`core_builtin_tools`] when registering tools on a `Worker`.
+//! [`core_builtin_tools`] when registering tools on a `Engine`.
 //!
 //! `Bash` is the lone exception — its child processes bypass `ScopedFs`
 //! entirely. Safety for arbitrary command execution is delegated to the
@@ -57,7 +57,7 @@ pub fn core_builtin_tools(
     fs: ScopedFs,
     tracker: Tracker,
     bash_output_dir: std::path::PathBuf,
-) -> Vec<llm_worker::tool::ToolDefinition> {
+) -> Vec<llm_engine::tool::ToolDefinition> {
     vec![
         read_tool(fs.clone(), tracker.clone()),
         write_tool(fs.clone(), tracker.clone()),
@@ -70,7 +70,7 @@ pub fn core_builtin_tools(
 
 pub fn web_builtin_tools(
     web_config: Option<manifest::WebConfig>,
-) -> Vec<llm_worker::tool::ToolDefinition> {
+) -> Vec<llm_engine::tool::ToolDefinition> {
     vec![
         web_search_tool(web::WebTools::new(web_config.clone())),
         web_fetch_tool(web::WebTools::new(web_config)),

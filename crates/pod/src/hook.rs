@@ -1,15 +1,15 @@
 //! Pod-layer hook infrastructure
 //!
 //! Hooks are the **public** orchestration extension point. They receive
-//! event-specific context values about each event in the Worker execution loop
+//! event-specific context values about each event in the Engine execution loop
 //! and return a safe public control-flow action. Contexts may carry narrow
 //! host-created handles for approved side effects; hook return values remain
 //! flow-control decisions only.
 //!
-//! Hooks intentionally cannot mutate the Worker's context, history, tool
+//! Hooks intentionally cannot mutate the Engine's context, history, tool
 //! call, or tool result. Internal mechanisms that need such access (e.g.
 //! compaction, notification injection, output truncation) implement
-//! `llm_worker::Interceptor` directly inside Pod, never via this trait.
+//! `llm_engine::Interceptor` directly inside Pod, never via this trait.
 //!
 //! This separation lets Hooks be exposed safely to user-facing
 //! extension surfaces (scripting, plugins) in the future without
@@ -19,10 +19,10 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use llm_worker::interceptor::{
+use llm_engine::interceptor::{
     PostToolAction, PreRequestAction, PreToolAction, PromptAction, TurnEndAction,
 };
-use llm_worker::tool::{ToolOutput, ToolResult};
+use llm_engine::tool::{ToolOutput, ToolResult};
 use serde_json::Value;
 use session_store::{SystemItem, SystemReminder};
 
@@ -163,7 +163,7 @@ impl From<HookTurnEndAction> for TurnEndAction {
 /// event-specific context. The handle queues typed requests; the host drains the
 /// queue, commits each entry through `LogEntry::SystemItem`, and only then makes
 /// the matching system message visible to the model. It deliberately exposes no
-/// raw `llm_worker::Item`, history writer, event sender, `Pod`, `Worker`, or
+/// raw `llm_engine::Item`, history writer, event sender, `Pod`, `Engine`, or
 /// notification buffer.
 pub struct SystemItemAppendHandle {
     pending: Arc<Mutex<Vec<SystemItem>>>,
@@ -202,7 +202,7 @@ pub struct PromptSubmitInfo {
 
 /// Summary information included in `PreLlmRequest` contexts.
 pub struct PreRequestInfo {
-    /// Number of items currently in the Worker context.
+    /// Number of items currently in the Engine context.
     pub item_count: usize,
     /// Most recently observed `input_tokens` from the LLM provider.
     /// `None` when the Pod has no compaction state attached, or when

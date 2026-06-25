@@ -11,7 +11,7 @@
 //! returned inline and the file is cleaned up. When it is longer the
 //! full output is left on disk and only the **last 80 lines** are
 //! returned, prefixed with the saved file's path. This sidesteps the
-//! Worker's blanket `ToolOutputLimits` (default 64 KiB), which would
+//! Engine's blanket `ToolOutputLimits` (default 64 KiB), which would
 //! otherwise drop the *tail* of the output — usually the most useful
 //! part (errors, exit messages, summary). The saved file lives under
 //! a caller-supplied directory that the parent has added to the
@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 use tokio::process::Command;
 
@@ -56,7 +56,7 @@ const TAIL_LINES: usize = 80;
 
 /// Inline-return budget. Outputs at or below this are returned in full;
 /// above it triggers the spill-to-file path. Sized to leave headroom under
-/// the Worker's 64 KiB default `ToolOutputLimits` cap so the inline path
+/// the Engine's 64 KiB default `ToolOutputLimits` cap so the inline path
 /// reliably reaches the model intact.
 const INLINE_BYTE_BUDGET: usize = 12 * 1024;
 
@@ -104,7 +104,7 @@ impl Tool for BashTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: BashParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid Bash input: {e}")))?;
@@ -222,7 +222,7 @@ impl Tool for BashTool {
         }
 
         // Inline if the whole output fits in our tail-read window AND is
-        // small enough to ride under the Worker's default cap.
+        // small enough to ride under the Engine's default cap.
         let line_count = tail_text.lines().count();
         let fully_loaded = total_bytes <= tail_bytes.len();
         let fits_inline =

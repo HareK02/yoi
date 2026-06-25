@@ -1,8 +1,0 @@
-error[E0599]: no method named `register_tool` found for struct `Worker<HttpTransport<AnthropicScheme>, Locked>` in the current scope
-  --> tests/ui/locked_register_tool.rs:27:20
-   |
-27 |     let _ = locked.register_tool(def);
-   |                    ^^^^^^^^^^^^^ method not found in `Worker<HttpTransport<AnthropicScheme>, Locked>`
-   |
-   = note: the method was found for
-           - `Worker<C>`

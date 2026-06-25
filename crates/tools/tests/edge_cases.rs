@@ -2,14 +2,14 @@
 
 use std::sync::Arc;
 
-use llm_worker::tool::{Tool, ToolDefinition};
+use llm_engine::tool::{Tool, ToolDefinition};
 use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
 use serde_json::json;
 use tempfile::TempDir;
 use tools::{ScopedFs, Tracker, core_builtin_tools};
 
 struct Registry {
-    entries: Vec<(llm_worker::tool::ToolMeta, Arc<dyn Tool>)>,
+    entries: Vec<(llm_engine::tool::ToolMeta, Arc<dyn Tool>)>,
 }
 
 impl Registry {

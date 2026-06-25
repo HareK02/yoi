@@ -11,8 +11,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use llm_worker::llm_client::types::{ContentPart, Item, Role};
-use llm_worker::tool::ToolOutput;
+use llm_engine::llm_client::types::{ContentPart, Item, Role};
+use llm_engine::tool::ToolOutput;
 use manifest::{Permission, Scope, ScopeRule, SharedScope};
 use pod::runtime::dir::{RuntimeDir, SpawnedPodRecord};
 use pod::runtime::pod_registry::{self, LockFileGuard};

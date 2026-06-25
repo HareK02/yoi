@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::Scope;
 use serde::Deserialize;
 
@@ -38,7 +38,7 @@ impl Tool for GlobTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: GlobParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid Glob input: {e}")))?;

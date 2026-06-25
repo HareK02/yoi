@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
-use llm_worker::tool::{
+use llm_engine::tool::{
     Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOrigin, ToolOutput,
 };
 use manifest::plugin::{

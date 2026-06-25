@@ -18,7 +18,7 @@
 //! preserved only on the log/wire side; the LLM still sees plain
 //! system-message text.
 
-use llm_worker::llm_client::types::Item;
+use llm_engine::llm_client::types::Item;
 use protocol::PodEvent;
 use serde::{Deserialize, Serialize};
 

@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use llm_worker::llm_client::capability::ModelCapability;
+use llm_engine::llm_client::capability::ModelCapability;
 use manifest::{AuthRef, ModelManifest, SchemeKind};
 use serde::{Deserialize, Serialize};
 

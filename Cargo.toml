@@ -2,8 +2,8 @@
 resolver = "2"
 members = [
     "crates/client",
-    "crates/llm-worker",
-    "crates/llm-worker-macros",
+    "crates/llm-engine",
+    "crates/llm-engine-macros",
     "crates/session-store",
     "crates/secrets",
     "crates/manifest",
@@ -29,8 +29,8 @@ members = [
 ]
 default-members = [
     "crates/client",
-    "crates/llm-worker",
-    "crates/llm-worker-macros",
+    "crates/llm-engine",
+    "crates/llm-engine-macros",
     "crates/session-store",
     "crates/secrets",
     "crates/manifest",
@@ -61,8 +61,8 @@ license = "MIT"
 [workspace.dependencies]
 # Internal crates
 client = { path = "crates/client" }
-llm-worker = { path = "crates/llm-worker", version = "0.2" }
-llm-worker-macros = { path = "crates/llm-worker-macros", version = "0.2" }
+llm-engine = { path = "crates/llm-engine", version = "0.2" }
+llm-engine-macros = { path = "crates/llm-engine-macros", version = "0.2" }
 manifest = { path = "crates/manifest" }
 mcp = { path = "crates/mcp" }
 lint-common = { path = "crates/lint-common" }

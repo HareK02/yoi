@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use llm_worker::llm_client::types::{ContentPart, Item, Role};
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use llm_engine::llm_client::types::{ContentPart, Item, Role};
+use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use protocol::stream::{JsonLineReader, JsonLineWriter};
 use protocol::{ErrorCode, Event, InvokeKind, Method};
 use serde::Deserialize;
@@ -65,7 +65,7 @@ impl Tool for SendToPodTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let input: SendToPodInput = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid SendToPod input: {e}")))?;
@@ -130,7 +130,7 @@ impl Tool for ReadPodOutputTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let input: NameInput = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid ReadPodOutput input: {e}")))?;
@@ -208,7 +208,7 @@ impl Tool for StopPodTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let input: NameInput = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid StopPod input: {e}")))?;

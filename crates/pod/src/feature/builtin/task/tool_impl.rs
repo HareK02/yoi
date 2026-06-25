@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 
 use super::store::{TaskEntry, TaskStatus, TaskStore, render_snapshot, snapshot_overview};
@@ -76,7 +76,7 @@ impl Tool for TaskCreateTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TaskCreateParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid TaskCreate input: {e}")))?;
@@ -100,7 +100,7 @@ impl Tool for TaskListTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let _: TaskListParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid TaskList input: {e}")))?;
@@ -117,7 +117,7 @@ impl Tool for TaskGetTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TaskGetParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid TaskGet input: {e}")))?;
@@ -137,7 +137,7 @@ impl Tool for TaskUpdateTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TaskUpdateParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid TaskUpdate input: {e}")))?;

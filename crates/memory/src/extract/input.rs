@@ -1,13 +1,13 @@
-//! extract sub-Worker への入力テキスト組み立て。
+//! extract sub-Engine への入力テキスト組み立て。
 //!
 //! `crates/pod/src/pod.rs::build_summary_prompt` と同じ方針で
 //! Item 列を flat な行に落とす（reasoning は省く、tool call は名前のみ、
 //! tool result は summary のみ）。conversation 全体を Markdown の単一
 //! セクションとして渡し、抽出指示は system prompt 側に寄せる。
 
-use llm_worker::Item;
+use llm_engine::Item;
 
-/// 与えられた `items` を extract sub-Worker の最初の user 入力に整形する。
+/// 与えられた `items` を extract sub-Engine の最初の user 入力に整形する。
 pub fn build_extract_input(items: &[Item]) -> String {
     let mut out = String::new();
     out.push_str(
@@ -26,9 +26,9 @@ fn render_items(items: &[Item]) -> String {
         match item {
             Item::Message { role, content, .. } => {
                 let role_label = match role {
-                    llm_worker::Role::User => "User",
-                    llm_worker::Role::Assistant => "Assistant",
-                    llm_worker::Role::System => "System",
+                    llm_engine::Role::User => "User",
+                    llm_engine::Role::Assistant => "Assistant",
+                    llm_engine::Role::System => "System",
                 };
                 let text: String = content
                     .iter()

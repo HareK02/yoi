@@ -113,7 +113,7 @@ pub enum PodEvent {
     /// Child finished one turn and is back to IDLE.
     TurnEnded { pod_name: String },
 
-    /// Worker execution error occurred inside the child's turn.
+    /// Engine execution error occurred inside the child's turn.
     ///
     /// Limited to worker runtime failures (provider / tool errors) —
     /// does not include transient method-rejection responses such as
@@ -327,9 +327,9 @@ pub enum Event {
     /// result lands, a user interrupts, etc.), the next LLM call belongs
     /// to a new AgentTurn.
     ///
-    /// `turn` is the AgentTurn index from `Worker::turn_count`.
+    /// `turn` is the AgentTurn index from `Engine::turn_count`.
     ///
-    /// Currently retry is not yet implemented (`llm-worker-stream-continuation`)
+    /// Currently retry is not yet implemented (`llm-engine-stream-continuation`)
     /// so AgentTurn and `LlmCall` fire 1:1, but the contract here is
     /// the AgentTurn boundary; consumers that want per-LLM-call signals
     /// must subscribe to `LlmCallStart` / `LlmCallEnd` instead.
@@ -347,7 +347,7 @@ pub enum Event {
     /// they fire 1:1 because retry is not implemented.
     ///
     /// `llm_call` is the worker-wide running counter from
-    /// `Worker::llm_call_count`.
+    /// `Engine::llm_call_count`.
     LlmCallStart {
         llm_call: usize,
     },
@@ -597,7 +597,7 @@ pub enum AlertLevel {
 #[serde(rename_all = "snake_case")]
 pub enum AlertSource {
     Pod,
-    Worker,
+    Engine,
     Compactor,
     AgentsMd,
 }

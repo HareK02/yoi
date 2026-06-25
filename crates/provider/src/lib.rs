@@ -10,7 +10,7 @@
 //!    default_capability > scheme 既定 の順でフォールバック（上位 3 段は
 //!    `catalog::resolve_model_manifest` が [`ModelConfig`] に詰め込む）
 //!
-//! llm-worker は低レベル基盤に留める方針なので、高レベル側で必要に
+//! llm-engine は低レベル基盤に留める方針なので、高レベル側で必要に
 //! なる認証ストア解決（Codex OAuth の `~/.codex/auth.json` 読取等）は
 //! このクレートに追加する。
 
@@ -19,7 +19,7 @@ pub mod codex_oauth;
 
 use std::sync::Arc;
 
-use llm_worker::llm_client::{
+use llm_engine::llm_client::{
     LlmClient,
     capability::ModelCapability,
     scheme::{
