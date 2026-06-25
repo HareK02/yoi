@@ -222,3 +222,78 @@ Non-blocking note:
 - Coder 報告では `cargo test -p pod` が既知の prompt guidance snapshot assertion でのみ失敗、Plugin tests / `cargo check -p yoi` / `git diff --check` / `nix build .#yoi --no-link` は成功。最終統合時に既知 failure 扱いだけ確認すること。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-25T06:20:17Z -->
+
+## Implementation report
+
+Integration outcome:
+
+- Coder `yoi-coder-00001KVXK0WDX-output-commands` が implementation branch `work/00001KVXK0WDX-plugin-output-commands` に実装を commit した。
+  - implementation commit: `755d460f feat: add plugin service output commands`
+- Reviewer `yoi-reviewer-00001KVXK0WDX-output-commands` は read-only review で `approve`。Service output command path と ToolOutput path の分離、fail-closed validation/grant checks、placeholder command の non-transport behavior、diagnostic/status recording、scope creep なしを確認した。
+- Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration` で branch `work/00001KVXK0WDX-plugin-output-commands` を merge 済み。
+  - merge commit: `d2aa92a7 merge: 00001KVXK0WDX plugin output commands`
+
+Implemented behavior:
+- `crates/pod/src/feature/plugin.rs` に Service output command envelope handling を追加。
+- `output_commands` は `correlation_id`, `source_event_id`, `command_id`, `kind`, `payload`, `requested_at` を持つ。
+- v0 command kinds:
+  - `diagnostic_status_update`
+  - `host_request_dispatch`
+  - `websocket_send`
+- Host-side validation:
+  - envelope parse / unknown field rejection
+  - id and RFC3339 validation
+  - `source_event_id` と ingress event correlation id の照合
+  - payload size bound
+  - kind-specific payload validation
+  - manifest declaration + enablement grant / allowlist checks
+- malformed / ungranted / unsupported commands は typed diagnostic になり、実行しない。
+- `diagnostic_status_update` は bounded payload/message で component status / diagnostics / output command results に記録。
+- `host_request_dispatch` / `websocket_send` は grant-check 後に `Unsupported` として記録し、HTTP/WebSocket transport には踏み込まない。
+- `PluginIngressDispatchReport` と `PluginInstanceStatus.output_command_results` から command result を追跡可能。
+
+Validation in Orchestrator worktree:
+- `cargo fmt --check`: success
+- `cargo test -p pod service_output_command -- --nocapture`: success
+- `cargo test -p pod feature::plugin::tests`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+- `cargo test -p pod`: failed only in known prompt guidance snapshot assertions outside this Plugin diff:
+  - `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`
+  - `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`
+  - Plugin-focused tests in the same run passed.
+
+Notes:
+- Full `cargo test -p pod` failure is recorded as the same known unrelated prompt-resource assertion issue seen in previous Plugin Tickets, not a blocker for this Ticket.
+- Follow-up `00001KVXK0WE4` is dependency-unblocked and can be re-routed next.
+
+Next action:
+- Mark Ticket done after this integration/validation evidence.
+- Then stop related child Pods and remove only the child implementation worktree/branch.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-25T06:20:26Z from: inprogress to: done reason: merged_validated_with_unrelated_full_suite_caveat field: state -->
+
+## State changed
+
+Implementation is merged into the orchestration branch and validated with one unrelated known full-suite caveat.
+
+Evidence:
+- merge commit: `d2aa92a7 merge: 00001KVXK0WDX plugin output commands`
+- reviewer result: approve
+- validation in `/home/hare/Projects/yoi/.worktree/orchestration`:
+  - `cargo fmt --check`: success
+  - `cargo test -p pod service_output_command -- --nocapture`: success
+  - `cargo test -p pod feature::plugin::tests`: success
+  - `cargo check -p yoi`: success
+  - `git diff --check`: success
+  - `nix build .#yoi --no-link`: success
+  - `cargo test -p pod`: failed only in prompt guidance snapshot assertions outside this Plugin diff; Plugin-focused tests passed.
+
+Closure is not performed here; this state records implementation completion after merge/review/focused validation.
+
+---
