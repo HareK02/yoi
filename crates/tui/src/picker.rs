@@ -46,7 +46,7 @@ impl std::fmt::Display for PickerError {
             ),
             Self::NoWorkers { all: false } => write!(
                 f,
-                "no workers found in this workspace — use `yoi resume --all` to list all host/data-dir Pods"
+                "no workers found in this workspace — use `yoi resume --all` to list all host/data-dir Workers"
             ),
         }
     }

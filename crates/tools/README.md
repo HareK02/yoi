@@ -2,7 +2,7 @@
 
 ## Role
 
-`tools` implements built-in tools and shared tool execution helpers used by Pods.
+`tools` implements built-in tools and shared tool execution helpers used by Workers.
 
 ## Boundaries
 

@@ -2,7 +2,7 @@
 
 ## Role
 
-`manifest` resolves reusable profile/configuration inputs into the concrete runtime Manifest used to create or restore Pods.
+`manifest` resolves reusable profile/configuration inputs into the concrete runtime Manifest used to create or restore Workers.
 
 ## Boundaries
 
