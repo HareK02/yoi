@@ -264,3 +264,55 @@ Review result: approve
 - read-only 指示に従い、差分・実装・依存ツリー・scope creep の静的確認に留めた。`cargo test` / `nix build` は作業ツリーへ build artifact を作るため再実行せず、報告済み validation を前提確認として扱った。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-25T19:48:51Z -->
+
+## Implementation report
+
+Integration / validation report:
+
+Integration:
+- Implementation branch `work/00001KVZKST83-worker-runtime-fs-store` を orchestration branch に merge 済み。
+- Merge commit: `36ff7238 merge: 00001KVZKST83 worker runtime fs store`
+
+Included implementation commit:
+- `407134399685537da9590d424df6b1db05402965 feat: add worker runtime fs store`
+
+Validation in Orchestrator worktree:
+- `cargo fmt --all --check`: success
+- `cargo test -p worker-runtime --no-default-features`: success（8 tests passed）
+- `cargo test -p worker-runtime --features fs-store`: success（10 tests passed）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Review:
+- Reviewer approve 済み。feature gating、runtime_id/worker_id layout、atomic write/corrupt diagnostics、scope boundary に blocker なし。
+
+Outcome:
+- Acceptance criteria を満たしたため `done` へ進める。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-25T19:49:00Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+worker-runtime FS store feature の実装、review、merge、Orchestrator validation が完了した。
+
+Done evidence:
+- Merge commit: `36ff7238 merge: 00001KVZKST83 worker runtime fs store`
+- Reviewer approve 済み。
+- Orchestrator validation:
+  - `cargo fmt --all --check`: success
+  - `cargo test -p worker-runtime --no-default-features`: success（8 tests passed）
+  - `cargo test -p worker-runtime --features fs-store`: success（10 tests passed）
+  - `cargo check -p yoi`: success
+  - `git diff --check`: success
+  - `nix build .#yoi --no-link`: success
+
+Scope:
+- optional `fs-store` feature と FS persistence backend を追加。
+- REST command server / Backend integration / legacy migration / SQLite store は Non-goals として未実装。
+
+---
