@@ -9,6 +9,7 @@ members = [
     "crates/manifest",
     "crates/mcp",
     "crates/worker",
+    "crates/worker-runtime",
     "crates/plugin-pdk",
     "crates/yoi",
     "crates/pod-store",
@@ -36,6 +37,7 @@ default-members = [
     "crates/manifest",
     "crates/mcp",
     "crates/worker",
+    "crates/worker-runtime",
     "crates/plugin-pdk",
     "crates/yoi",
     "crates/pod-store",
@@ -70,6 +72,7 @@ memory = { path = "crates/memory" }
 ticket = { path = "crates/ticket" }
 project-record = { path = "crates/project-record" }
 worker = { path = "crates/worker" }
+worker-runtime = { path = "crates/worker-runtime" }
 yoi-plugin-pdk = { path = "crates/plugin-pdk" }
 yoi = { path = "crates/yoi" }
 pod-registry = { path = "crates/pod-registry" }

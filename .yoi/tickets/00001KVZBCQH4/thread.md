@@ -555,3 +555,154 @@ Review result: request_changes
   cargo/nix の再実行は、read-only 指示と上記 blocker があるため実施していません。
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-25T16:49:53Z -->
+
+## Decision
+
+Human follow-up:
+
+ユーザー確認: 「OK、よろしく」。
+
+運用判断:
+- 現在 queued の dependent Tickets は planning 差し戻し不要として扱う。
+- ただし、未解消 dependency があるものは queued のまま待機し、依存が解消したものだけ再 routing して `queued -> inprogress` を個別に記録してから implementation side effect に進む。
+- 途中で concrete missing decision / information が出た場合は、勝手に固定せず Ticket thread に理由を残して停止または planning return を行う。
+- 現在の最優先は `00001KVZBCQH4` の reviewer blocker 解消、再 review、merge、validation、done 記録。
+
+---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZBCQH4-worker-runtime at: 2026-06-25T16:50:47Z -->
+
+## Implementation report
+
+Follow-up implementation report after review request_changes:
+
+対応内容:
+- `crates/worker-runtime/src/runtime.rs`
+  - `Runtime::transition_worker` を修正。
+  - `Stopped` / `Cancelled` の terminal 状態にある Worker に反対側 terminal 操作が呼ばれても、既存 terminal 状態を保持し、同じ `event_id` で ack を返すようにした。
+  - 反対側 terminal 操作では追加 event を発生させない。
+- 追加テスト:
+  - `stop_then_cancel_preserves_stopped_terminal_state`
+  - `cancel_then_stop_preserves_cancelled_terminal_state`
+  - summary count と event history が反対 terminal 操作で変化しないことを検証。
+
+Commit:
+- `fbd358a1 fix: keep worker terminal lifecycle stable`
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo test -p worker-runtime`: success (8 tests passed)
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success（実行時点で dirty tree warning は出たが build 自体は成功）
+
+Residual risks / review focus:
+- terminal 状態への反対操作は reject ではなく「既存 terminal 状態を保持する idempotent 扱い」を選択。既存 API の ack semantics には自然だが、将来 UX/API で明示的 lifecycle conflict を出したい場合は typed error 方針へ切り替える余地がある。
+- child worktree は commit 後 clean。
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KVZBCQH4-worker-runtime at: 2026-06-25T16:52:45Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+確認結果:
+
+- 前回 blocker の terminal lifecycle は解消されています。
+  - `Runtime::transition_worker` は既に `Stopped` / `Cancelled` の Worker に対して、反対側の terminal 操作を受けても state を上書きせず、既存 `status` / `last_event_id` を返し、新規 event も追加しません。
+  - 該当: `crates/worker-runtime/src/runtime.rs:353-384`
+- 追加テストも妥当です。
+  - `stop_then_cancel_preserves_stopped_terminal_state`
+  - `cancel_then_stop_preserves_cancelled_terminal_state`
+  - summary counts と event history の非変化を確認しており、前回指摘した invariant を直接カバーしています。
+- `runtime_id + worker_id` / `WorkerRef` authority 境界に regression は見当たりません。
+- scope creep は見当たりません。変更範囲は `worker-runtime` crate、workspace 追加、`package.nix` cargoHash 更新に収まっています。
+- `worker-runtime` の依存は `serde` / `thiserror` のみで、HTTP/WS/FS/server/client 系依存の追加はありません。
+- `package.nix` の cargoHash 更新は維持されています。
+
+実施した確認:
+- `git status`, `git log`, `git show fbd358a1`
+- `runtime.rs` の lifecycle 実装・追加テスト読解
+- `worker-runtime` crate の依存/API 境界確認
+- legacy pod/socket/session authority や HTTP/WS/FS 依存の grep 確認
+- `git diff --check f8d3b1cc..HEAD`: success
+
+補足: read-only 指示を優先し、`cargo test` / `nix build` は再実行していません。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-25T16:53:37Z -->
+
+## Implementation report
+
+Integration / validation report:
+
+Integration:
+- Implementation branch `work/00001KVZBCQH4-worker-runtime-core` を orchestration branch に merge 済み。
+- Merge commit: `56bdf955 merge: 00001KVZBCQH4 worker runtime core`
+
+Included implementation commits:
+- `9b2cae32 feat: add memory worker runtime crate`
+- `593db951 fix: update nix cargo hash`
+- `fbd358a1 fix: keep worker terminal lifecycle stable`
+
+Validation in Orchestrator worktree:
+- `cargo fmt --all --check`: success
+- `cargo test -p worker-runtime`: success（8 tests passed）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Review:
+- Reviewer approve 済み。前回 blocker だった `stop_worker` / `cancel_worker` terminal lifecycle invariant は解消済み。
+
+Outcome:
+- Acceptance criteria を満たしたため `done` へ進める。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-25T16:53:46Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+worker-runtime core crate の実装、review、merge、Orchestrator validation が完了した。
+
+Done evidence:
+- Merge commit: `56bdf955 merge: 00001KVZBCQH4 worker runtime core`
+- Reviewer approve 済み。
+- Orchestrator validation:
+  - `cargo fmt --all --check`: success
+  - `cargo test -p worker-runtime`: success（8 tests passed）
+  - `cargo check -p yoi`: success
+  - `git diff --check`: success
+  - `nix build .#yoi --no-link`: success
+
+Scope:
+- `crates/worker-runtime` の memory-backed core Runtime API を追加。
+- HTTP/WS/FS/Backend integration/config bundle sync は Non-goals として未実装。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-25T16:54:19Z -->
+
+## Implementation report
+
+Cleanup report:
+
+- Child Workers stopped and scope reclaimed:
+  - `yoi-coder-00001KVZBCQH4-worker-runtime`
+  - `yoi-coder-00001KVZBCQH4-runtime-packaging`
+  - `yoi-reviewer-00001KVZBCQH4-worker-runtime`
+- Child implementation worktree removed:
+  - `/home/hare/Projects/yoi/.worktree/00001KVZBCQH4-worker-runtime-core`
+- Child implementation branch removed:
+  - `work/00001KVZBCQH4-worker-runtime-core`
+
+Remaining note:
+- Historical worker-rename child worktree remains separate and was not touched by this cleanup.
+
+---
