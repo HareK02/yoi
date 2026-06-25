@@ -1,4 +1,5 @@
 use crate::identity::{RuntimeId, WorkerId};
+use std::path::PathBuf;
 
 /// Errors returned by the embedded Runtime API.
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +33,27 @@ pub enum RuntimeError {
 
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+
+    #[error("runtime store {operation} failed at {}: {source}", path.display())]
+    StoreIo {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("runtime store {operation} missing data at {}", path.display())]
+    StoreMissing {
+        operation: &'static str,
+        path: PathBuf,
+    },
+
+    #[error("runtime store {operation} found corrupt data at {}: {message}", path.display())]
+    StoreCorrupt {
+        operation: &'static str,
+        path: PathBuf,
+        message: String,
+    },
 
     #[error("runtime state lock was poisoned")]
     StatePoisoned,

@@ -3,6 +3,10 @@ use crate::catalog::{
 };
 use crate::diagnostics::{DiagnosticSeverity, RuntimeDiagnostic};
 use crate::error::RuntimeError;
+#[cfg(feature = "fs-store")]
+use crate::fs_store::{
+    FsRuntimeStore, FsRuntimeStoreOptions, PersistedRuntimeState, PersistedWorkerRecord,
+};
 use crate::identity::{RuntimeId, WorkerId, WorkerRef};
 use crate::interaction::{WorkerInput, WorkerInputKind, WorkerInteractionAck};
 use crate::management::{
@@ -20,8 +24,9 @@ static NEXT_RUNTIME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Concrete embedded Runtime domain entity.
 ///
-/// The current implementation is memory-backed and tools/provider-less by
-/// design.  It provides a typed API boundary that can later be adapted by
+/// The default implementation is memory-backed and tools/provider-less by
+/// design.  An optional `fs-store` feature adds filesystem persistence while
+/// preserving the same typed authority boundary. It can later be adapted by
 /// backend registries or web servers without making sockets, sessions, or paths
 /// public authority.
 #[derive(Clone, Debug)]
@@ -45,6 +50,38 @@ impl Runtime {
         Self {
             inner: Arc::new(Mutex::new(state)),
         }
+    }
+
+    /// Create or restore a filesystem-backed Runtime.
+    ///
+    /// The store is scoped by typed Runtime identity under `options.root`; if the
+    /// Runtime directory already exists, persisted state is loaded and validated.
+    /// If it does not exist, a fresh Runtime is initialized and durable files are
+    /// created before the Runtime is returned.
+    #[cfg(feature = "fs-store")]
+    pub fn with_fs_store(options: FsRuntimeStoreOptions) -> Result<Self, RuntimeError> {
+        let runtime_id = options.runtime_id.unwrap_or_else(|| {
+            RuntimeId::generated(NEXT_RUNTIME_SEQUENCE.fetch_add(1, Ordering::Relaxed))
+        });
+        let opened = FsRuntimeStore::open_or_create(options.root, runtime_id.clone())?;
+        let state = if let Some(persisted) = opened.state {
+            RuntimeState::from_persisted(persisted, opened.store)?
+        } else {
+            let mut state = RuntimeState::new_fs_backed(
+                runtime_id,
+                options.display_name,
+                options.limits,
+                opened.store,
+            );
+            let event_id =
+                state.push_event(None, RuntimeEventKind::RuntimeStarted, "runtime started");
+            state.persist_runtime_snapshot()?;
+            state.persist_event_by_id(event_id)?;
+            state
+        };
+        Ok(Self {
+            inner: Arc::new(Mutex::new(state)),
+        })
     }
 
     /// Runtime id half of public Worker authority.
@@ -99,11 +136,15 @@ impl Runtime {
                 worker.status = WorkerStatus::Stopped;
             }
         }
-        Ok(state.push_event(
+        let event_id = state.push_event(
             None,
             RuntimeEventKind::RuntimeStopped,
             format!("runtime {runtime_id} stopped"),
-        ))
+        );
+        state.persist_runtime_snapshot()?;
+        state.persist_workers()?;
+        state.persist_event_by_id(event_id)?;
+        Ok(event_id)
     }
 
     /// Create a Worker in the embedded catalog.
@@ -135,7 +176,10 @@ impl Runtime {
         };
         let detail = record.detail(&state.runtime_id);
         state.emit_create_diagnostics(&detail);
-        state.workers.insert(worker_id, record);
+        state.workers.insert(worker_id.clone(), record);
+        state.persist_runtime_snapshot()?;
+        state.persist_worker(&worker_id)?;
+        state.persist_event_by_id(event_id)?;
         Ok(detail)
     }
 
@@ -198,9 +242,15 @@ impl Runtime {
             event_id,
         });
 
+        let status = worker.status;
+        state.persist_runtime_snapshot()?;
+        state.persist_worker(&worker_ref.worker_id)?;
+        state.persist_event_by_id(event_id)?;
+        state.persist_transcript_entry(&worker_ref.worker_id, transcript_sequence)?;
+
         Ok(WorkerInteractionAck {
             worker_ref: worker_ref.clone(),
-            status: worker.status,
+            status,
             transcript_sequence,
             event_id,
         })
@@ -376,9 +426,13 @@ impl Runtime {
         let worker = state.worker_mut(worker_ref)?;
         worker.status = status;
         worker.last_event_id = event_id;
+        let status = worker.status;
+        state.persist_runtime_snapshot()?;
+        state.persist_worker(&worker_ref.worker_id)?;
+        state.persist_event_by_id(event_id)?;
         Ok(WorkerLifecycleAck {
             worker_ref: worker_ref.clone(),
-            status: worker.status,
+            status,
             event_id,
         })
     }
@@ -388,11 +442,21 @@ impl Runtime {
     }
 }
 
+#[cfg_attr(not(feature = "fs-store"), allow(dead_code))]
+#[derive(Clone, Debug)]
+enum RuntimePersistence {
+    Memory,
+    #[cfg(feature = "fs-store")]
+    Fs(FsRuntimeStore),
+}
+
 #[derive(Debug)]
 struct RuntimeState {
     runtime_id: RuntimeId,
     display_name: Option<String>,
     backend: RuntimeBackendKind,
+    #[cfg_attr(not(feature = "fs-store"), allow(dead_code))]
+    persistence: RuntimePersistence,
     status: RuntimeStatus,
     limits: RuntimeLimits,
     next_worker_sequence: u64,
@@ -409,6 +473,7 @@ impl RuntimeState {
             runtime_id,
             display_name,
             backend: RuntimeBackendKind::Memory,
+            persistence: RuntimePersistence::Memory,
             status: RuntimeStatus::Running,
             limits,
             next_worker_sequence: 1,
@@ -418,6 +483,215 @@ impl RuntimeState {
             events: Vec::new(),
             diagnostics: Vec::new(),
         }
+    }
+
+    #[cfg(feature = "fs-store")]
+    fn new_fs_backed(
+        runtime_id: RuntimeId,
+        display_name: Option<String>,
+        limits: RuntimeLimits,
+        store: FsRuntimeStore,
+    ) -> Self {
+        Self {
+            runtime_id,
+            display_name,
+            backend: RuntimeBackendKind::FsStore,
+            persistence: RuntimePersistence::Fs(store),
+            status: RuntimeStatus::Running,
+            limits,
+            next_worker_sequence: 1,
+            next_event_id: 1,
+            next_diagnostic_id: 1,
+            workers: BTreeMap::new(),
+            events: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[cfg(feature = "fs-store")]
+    fn from_persisted(
+        persisted: PersistedRuntimeState,
+        store: FsRuntimeStore,
+    ) -> Result<Self, RuntimeError> {
+        if persisted.runtime_id != *store.runtime_id() {
+            return Err(RuntimeError::StoreCorrupt {
+                operation: "restore runtime state",
+                path: store.runtime_dir().to_path_buf(),
+                message: format!(
+                    "persisted runtime id {} does not match store runtime {}",
+                    persisted.runtime_id,
+                    store.runtime_id()
+                ),
+            });
+        }
+
+        let mut workers = BTreeMap::new();
+        for (worker_id, worker) in persisted.workers {
+            workers.insert(
+                worker_id,
+                WorkerRecord {
+                    worker_ref: worker.worker_ref,
+                    worker_id: worker.worker_id,
+                    status: worker.status,
+                    request: worker.request,
+                    transcript: worker.transcript,
+                    next_transcript_sequence: worker.next_transcript_sequence,
+                    last_event_id: worker.last_event_id,
+                },
+            );
+        }
+
+        Ok(Self {
+            runtime_id: persisted.runtime_id,
+            display_name: persisted.display_name,
+            backend: RuntimeBackendKind::FsStore,
+            persistence: RuntimePersistence::Fs(store),
+            status: persisted.status,
+            limits: persisted.limits,
+            next_worker_sequence: persisted.next_worker_sequence,
+            next_event_id: persisted.next_event_id,
+            next_diagnostic_id: persisted.next_diagnostic_id,
+            workers,
+            events: persisted.events,
+            diagnostics: persisted.diagnostics,
+        })
+    }
+
+    #[cfg(feature = "fs-store")]
+    fn persisted_state(&self) -> PersistedRuntimeState {
+        PersistedRuntimeState {
+            runtime_id: self.runtime_id.clone(),
+            display_name: self.display_name.clone(),
+            status: self.status,
+            limits: self.limits.clone(),
+            next_worker_sequence: self.next_worker_sequence,
+            next_event_id: self.next_event_id,
+            next_diagnostic_id: self.next_diagnostic_id,
+            workers: self
+                .workers
+                .iter()
+                .map(|(worker_id, worker)| (worker_id.clone(), worker.persisted_record()))
+                .collect(),
+            events: self.events.clone(),
+            diagnostics: self.diagnostics.clone(),
+        }
+    }
+
+    #[cfg(feature = "fs-store")]
+    fn fs_store(&self) -> Option<&FsRuntimeStore> {
+        match &self.persistence {
+            RuntimePersistence::Memory => None,
+            RuntimePersistence::Fs(store) => Some(store),
+        }
+    }
+
+    #[cfg(feature = "fs-store")]
+    fn persist_runtime_snapshot(&self) -> Result<(), RuntimeError> {
+        if let Some(store) = self.fs_store() {
+            store.write_runtime_snapshot(&self.persisted_state())?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "fs-store")]
+    fn persist_worker(&self, worker_id: &WorkerId) -> Result<(), RuntimeError> {
+        if let Some(store) = self.fs_store() {
+            let worker =
+                self.workers
+                    .get(worker_id)
+                    .ok_or_else(|| RuntimeError::WorkerNotFound {
+                        runtime_id: self.runtime_id.clone(),
+                        worker_id: worker_id.clone(),
+                    })?;
+            store.write_worker_snapshot(&worker.persisted_record())?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "fs-store")]
+    fn persist_event_by_id(&self, event_id: u64) -> Result<(), RuntimeError> {
+        if let Some(store) = self.fs_store() {
+            let event = self
+                .events
+                .iter()
+                .find(|event| event.id == event_id)
+                .ok_or_else(|| RuntimeError::StoreCorrupt {
+                    operation: "persist event",
+                    path: store.runtime_dir().to_path_buf(),
+                    message: format!("event {event_id} is missing from runtime state"),
+                })?;
+            store.append_event(event)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "fs-store")]
+    fn persist_transcript_entry(
+        &self,
+        worker_id: &WorkerId,
+        sequence: u64,
+    ) -> Result<(), RuntimeError> {
+        if let Some(store) = self.fs_store() {
+            let worker =
+                self.workers
+                    .get(worker_id)
+                    .ok_or_else(|| RuntimeError::WorkerNotFound {
+                        runtime_id: self.runtime_id.clone(),
+                        worker_id: worker_id.clone(),
+                    })?;
+            let entry = worker
+                .transcript
+                .iter()
+                .find(|entry| entry.sequence == sequence)
+                .ok_or_else(|| RuntimeError::StoreCorrupt {
+                    operation: "persist transcript",
+                    path: store.runtime_dir().to_path_buf(),
+                    message: format!(
+                        "transcript sequence {sequence} is missing from worker {worker_id}"
+                    ),
+                })?;
+            store.append_transcript_entry(entry)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "fs-store")]
+    fn persist_workers(&self) -> Result<(), RuntimeError> {
+        if self.fs_store().is_some() {
+            for worker_id in self.workers.keys() {
+                self.persist_worker(worker_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "fs-store"))]
+    fn persist_runtime_snapshot(&self) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    #[cfg(not(feature = "fs-store"))]
+    fn persist_worker(&self, _worker_id: &WorkerId) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    #[cfg(not(feature = "fs-store"))]
+    fn persist_event_by_id(&self, _event_id: u64) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    #[cfg(not(feature = "fs-store"))]
+    fn persist_transcript_entry(
+        &self,
+        _worker_id: &WorkerId,
+        _sequence: u64,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    #[cfg(not(feature = "fs-store"))]
+    fn persist_workers(&self) -> Result<(), RuntimeError> {
+        Ok(())
     }
 
     fn ensure_running(&self) -> Result<(), RuntimeError> {
@@ -566,6 +840,19 @@ impl WorkerRecord {
             workspace_refs: self.request.workspace_refs.clone(),
             mount_refs: self.request.mount_refs.clone(),
             transcript_len: self.transcript.len(),
+            last_event_id: self.last_event_id,
+        }
+    }
+
+    #[cfg(feature = "fs-store")]
+    fn persisted_record(&self) -> PersistedWorkerRecord {
+        PersistedWorkerRecord {
+            worker_ref: self.worker_ref.clone(),
+            worker_id: self.worker_id.clone(),
+            status: self.status,
+            request: self.request.clone(),
+            transcript: self.transcript.clone(),
+            next_transcript_sequence: self.next_transcript_sequence,
             last_event_id: self.last_event_id,
         }
     }
@@ -846,5 +1133,156 @@ mod tests {
         assert_eq!(next.events.len(), 1);
         assert_eq!(next.events[0].kind, RuntimeEventKind::WorkerInputAccepted);
         assert!(!next.has_more);
+    }
+
+    #[cfg(feature = "fs-store")]
+    static NEXT_FS_TEST_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    #[cfg(feature = "fs-store")]
+    fn fs_store_root(label: &str) -> std::path::PathBuf {
+        let sequence = NEXT_FS_TEST_ROOT.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "worker-runtime-fs-store-{label}-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    #[cfg(feature = "fs-store")]
+    fn runtime_store(runtime: &Runtime) -> FsRuntimeStore {
+        let state = runtime.lock().unwrap();
+        match &state.persistence {
+            RuntimePersistence::Fs(store) => store.clone(),
+            RuntimePersistence::Memory => panic!("expected fs-backed runtime"),
+        }
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn fs_store_restores_workers_events_and_transcripts() {
+        let root = fs_store_root("restore");
+        let runtime_id = RuntimeId::new("runtime-fs-authority").unwrap();
+        let runtime = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
+            root: root.clone(),
+            runtime_id: Some(runtime_id.clone()),
+            display_name: Some("filesystem runtime".to_string()),
+            limits: RuntimeLimits {
+                max_transcript_projection_items: 2,
+                max_event_batch_items: 2,
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            runtime.summary().unwrap().backend,
+            RuntimeBackendKind::FsStore
+        );
+
+        let worker = runtime.create_worker(task_request("persist me")).unwrap();
+        runtime
+            .send_input(&worker.worker_ref, WorkerInput::user("first"))
+            .unwrap();
+        runtime
+            .send_input(&worker.worker_ref, WorkerInput::system("second"))
+            .unwrap();
+        runtime
+            .stop_worker(&worker.worker_ref, Some("finished".to_string()))
+            .unwrap();
+        let store = runtime_store(&runtime);
+        drop(runtime);
+
+        let restored = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
+            root: root.clone(),
+            runtime_id: Some(runtime_id.clone()),
+            display_name: None,
+            limits: RuntimeLimits::default(),
+        })
+        .unwrap();
+        let restored_worker = restored.worker_detail(&worker.worker_ref).unwrap();
+        assert_eq!(restored_worker.status, WorkerStatus::Stopped);
+        assert_eq!(restored_worker.transcript_len, 2);
+
+        let projection = restored
+            .transcript_projection(&worker.worker_ref, TranscriptQuery::new(0, 1))
+            .unwrap();
+        assert_eq!(projection.total_items, 2);
+        assert_eq!(projection.items[0].content, "first");
+        assert_eq!(projection.next_start, Some(1));
+
+        let cursor = restored.event_cursor_from_start().unwrap();
+        let batch = restored.read_events(&cursor, 2).unwrap();
+        assert_eq!(batch.events.len(), 2);
+        assert!(batch.has_more);
+        assert_eq!(batch.events[0].kind, RuntimeEventKind::RuntimeStarted);
+        assert_eq!(batch.events[1].kind, RuntimeEventKind::WorkerCreated);
+
+        let direct_events = store.read_events(&cursor, 2, 2).unwrap();
+        assert_eq!(direct_events.events, batch.events);
+        let direct_transcript = store
+            .read_transcript(&worker.worker_ref, TranscriptQuery::new(1, 1), 2)
+            .unwrap();
+        assert_eq!(direct_transcript.items[0].content, "second");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn fs_store_reports_corrupt_and_missing_data() {
+        let corrupt_root = fs_store_root("corrupt");
+        let corrupt_runtime_id = RuntimeId::new("runtime-corrupt").unwrap();
+        let corrupt_runtime = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
+            root: corrupt_root.clone(),
+            runtime_id: Some(corrupt_runtime_id.clone()),
+            display_name: None,
+            limits: RuntimeLimits::default(),
+        })
+        .unwrap();
+        let corrupt_store = runtime_store(&corrupt_runtime);
+        std::fs::write(
+            corrupt_store.runtime_dir().join("runtime.json"),
+            b"not json",
+        )
+        .unwrap();
+        drop(corrupt_runtime);
+        let err = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
+            root: corrupt_root.clone(),
+            runtime_id: Some(corrupt_runtime_id),
+            display_name: None,
+            limits: RuntimeLimits::default(),
+        })
+        .unwrap_err();
+        assert!(matches!(err, RuntimeError::StoreCorrupt { .. }));
+        let _ = std::fs::remove_dir_all(corrupt_root);
+
+        let missing_root = fs_store_root("missing");
+        let missing_runtime_id = RuntimeId::new("runtime-missing").unwrap();
+        let missing_runtime = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
+            root: missing_root.clone(),
+            runtime_id: Some(missing_runtime_id.clone()),
+            display_name: None,
+            limits: RuntimeLimits::default(),
+        })
+        .unwrap();
+        missing_runtime
+            .create_worker(task_request("missing worker snapshot"))
+            .unwrap();
+        let missing_store = runtime_store(&missing_runtime);
+        let mut worker_dirs = std::fs::read_dir(missing_store.runtime_dir().join("workers"))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        worker_dirs.sort_by_key(|entry| entry.path());
+        std::fs::remove_file(worker_dirs[0].path().join("worker.json")).unwrap();
+        drop(missing_runtime);
+        let err = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
+            root: missing_root.clone(),
+            runtime_id: Some(missing_runtime_id),
+            display_name: None,
+            limits: RuntimeLimits::default(),
+        })
+        .unwrap_err();
+        assert!(matches!(err, RuntimeError::StoreMissing { .. }));
+        let _ = std::fs::remove_dir_all(missing_root);
     }
 }
