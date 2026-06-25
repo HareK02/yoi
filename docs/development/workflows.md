@@ -14,17 +14,17 @@ Current workflow themes include:
 - Orchestrator routing from Tickets to the next workflow/action
 - planning/requirements synchronization when concrete missing decisions or information block routing
 - worktree setup and cleanup
-- sibling coder/reviewer Pod orchestration
+- sibling coder/reviewer Worker orchestration
 - human-gated maintenance and merge readiness
 
-## Child Pods
+## Child Workers
 
-Spawned Pods are useful for scoped implementation, review, or exploration. They are not independent project authorities.
+Spawned Workers are useful for scoped implementation, review, or exploration. They are not independent project authorities.
 
 A parent/orchestrator must verify:
 
-- child output via `ReadPodOutput`
-- live/restorable state via Pod tools when relevant
+- child output via `ReadWorkerOutput`
+- live/restorable state via Worker tools when relevant
 - worktree state and diff
 - validation command output
 - Ticket requirements and acceptance criteria
@@ -35,7 +35,7 @@ Notifications are hints to inspect state. They are not proof of completion.
 
 Unless explicitly authorized otherwise, final merge, cleanup, design-boundary decisions, and ticket closure remain the orchestrator/human responsibility.
 
-Child Pods may commit in delegated worktrees when the workflow allows it, but the merge-ready dossier should make the final decision auditable from repository records.
+Child Workers may commit in delegated worktrees when the workflow allows it, but the merge-ready dossier should make the final decision auditable from repository records.
 
 ## Public and dogfood workflow split
 

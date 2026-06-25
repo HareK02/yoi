@@ -14,7 +14,7 @@ pub(crate) type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const MAX_SERVERS: usize = 128;
 const MAX_DIAGNOSTICS: usize = 48;
 const MAX_TEXT_CHARS: usize = 240;
-const MCP_STATIC_NOT_LIVE_REASON: &str = "CLI inspection reads resolved static MCP config only; provider-discovered state is unavailable without live Pod/runtime MCP state, and this command does not start MCP server processes.";
+const MCP_STATIC_NOT_LIVE_REASON: &str = "CLI inspection reads resolved static MCP config only; provider-discovered state is unavailable without live Worker/runtime MCP state, and this command does not start MCP server processes.";
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct McpCliArgs {
@@ -146,7 +146,7 @@ fn inspect_static_config(args: &McpCliArgs) -> StaticConfigSnapshot {
         .with_workspace_base(&workspace)
         .resolve(
             &selector,
-            ProfileResolveOptions::with_pod_name("mcp-inspect"),
+            ProfileResolveOptions::with_worker_name("mcp-inspect"),
         ) {
         Ok(resolved) => {
             let mut diagnostics = vec![DiagnosticReport::info(

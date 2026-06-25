@@ -1,17 +1,17 @@
 //! extract: 活動抽出。
 //!
-//! 通常 Pod の post-run hook で発火する disposable Engine と、その
+//! 通常 Worker の post-run hook で発火する disposable Engine と、その
 //! 出力を `<workspace>/.yoi/memory/_staging/<id>.json` に書き出す
-//! ヘルパーを提供する。Pod 側はこのモジュールから:
+//! ヘルパーを提供する。Worker 側はこのモジュールから:
 //!
 //! - [`build_extract_input`] を sub-Engine の最初の user 入力に
 //! - [`write_extracted_tool`] を唯一のツールとして
 //! - [`write_staging`] で受け取った JSON を staging に書き出し
 //!
-//! の順で組み立てる。system prompt は Pod の `PromptCatalog`
-//! (`PodPrompt::MemoryExtractSystem`) で管理される。pointer 永続化
+//! の順で組み立てる。system prompt は Worker の `PromptCatalog`
+//! (`WorkerPrompt::MemoryExtractSystem`) で管理される。pointer 永続化
 //! （session-store の `LogEntry::Extension`、domain `"memory.extract"`）は
-//! Pod 側が責務を持つ。
+//! Worker 側が責務を持つ。
 //!
 //! 出力 JSON の wrap は [`write_staging`] が `source: { segment_id, range }`
 //! を機械付与する形で担当し、LLM には source を推論させない。

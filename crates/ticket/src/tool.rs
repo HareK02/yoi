@@ -1,6 +1,6 @@
 //! LLM tool implementations for typed Ticket backend operations.
 //!
-//! These tools are intentionally owned by the `ticket` crate so Pod features can
+//! These tools are intentionally owned by the `ticket` crate so Worker features can
 //! install Ticket behavior without reimplementing domain/backend logic or
 //! granting generic filesystem write authority.
 
@@ -154,7 +154,7 @@ fn base_tool_description(name: &str) -> &'static str {
 ///
 /// `record_language` is the durable Ticket record/tool-body language, distinct from
 /// worker response language and Memory/Knowledge language. Keeping this on the tool
-/// surface ensures every Ticket-capable Pod sees the policy without hidden context
+/// surface ensures every Ticket-capable Worker sees the policy without hidden context
 /// injection or role-launch-only prose.
 pub fn ticket_tool_description(name: &str, record_language: Option<&str>) -> String {
     let mut description = base_tool_description(name).to_string();
@@ -1909,7 +1909,7 @@ mod tests {
                 &json!({
                     "ticket": created.id.clone(),
                     "intake_summary": "Requirements accepted; implementation can be queued.",
-                    "author": "intake-pod"
+                    "author": "intake-worker"
                 })
                 .to_string(),
                 Default::default(),

@@ -8,7 +8,7 @@ Yoi Plugins are intentionally explicit. The Plugin system is designed around the
 - a Profile/config entry must explicitly enable each Plugin package by source-qualified id, version, and digest;
 - Plugin grants must allow each surface and host API before registration or execution can use it;
 - Plugin code runs only through the configured sandbox runtime;
-- Plugin packages do not inherit Pod workspace filesystem, network, environment, or Ticket authority;
+- Plugin packages do not inherit Worker workspace filesystem, network, environment, or Ticket authority;
 - Tool calls and Tool results use the ordinary Yoi Tool/Engine history path;
 - Plugin metadata, output, and diagnostics are untrusted unless Yoi host policy says otherwise.
 
@@ -426,7 +426,7 @@ Yoi checks scheme (`ws`/`wss`), host, optional port, and path prefix against bot
 
 ## `fs` host API
 
-The `fs` host API is Plugin-scoped and grant-gated. Plugins do not inherit the Pod/workspace filesystem authority automatically.
+The `fs` host API is Plugin-scoped and grant-gated. Plugins do not inherit the Worker/workspace filesystem authority automatically.
 
 Example grant shape:
 

@@ -4,15 +4,15 @@
 
 export type AlertLevel = "warn" | "error";
 
-export type AlertSource = "pod" | "worker" | "compactor" | "agents_md";
+export type AlertSource = "worker" | "engine" | "compactor" | "agents_md";
 
 export type CompletionKind = "file" | "knowledge" | "workflow";
 
-export type PodStatus = "idle" | "running" | "paused";
+export type WorkerStatus = "idle" | "running" | "paused";
 
 export type TurnResult = "finished" | "paused";
 
-export type InvokeKind = "user_send" | "notify" | "pod_event" | "system_reminder" | "wakeup";
+export type InvokeKind = "user_send" | "notify" | "worker_event" | "system_reminder" | "wakeup";
 
 export type RunResult = "finished" | "paused" | "limit_reached" | "rolled_back";
 
@@ -53,9 +53,9 @@ export type InFlightBlock = { "kind": "text", text: string, finished?: boolean, 
 
 export type InFlightSnapshot = { blocks?: Array<InFlightBlock>, };
 
-export type Greeting = { pod_name: string, cwd: string, provider: string, model: string, scope_summary: string, tools: Array<string>,
+export type Greeting = { worker_name: string, cwd: string, provider: string, model: string, scope_summary: string, tools: Array<string>,
 /**
- * Model context window in tokens. Always filled by the Pod greeting.
+ * Model context window in tokens. Always filled by the Worker greeting.
  */
 context_window: number,
 /**
@@ -81,15 +81,15 @@ timestamp_ms: number, };
 
 export type Segment = { "kind": "text", content: string, } | { "kind": "paste", id: number, chars: number, lines: number, content: string, } | { "kind": "file_ref", path: string, } | { "kind": "knowledge_ref", slug: string, } | { "kind": "workflow_invoke", slug: string, } | { "kind": "unknown" };
 
-export type PodEvent = { "kind": "turn_ended", pod_name: string, } | { "kind": "errored", pod_name: string, message: string, } | { "kind": "shut_down", pod_name: string, } | { "kind": "scope_sub_delegated",
+export type WorkerEvent = { "kind": "turn_ended", worker_name: string, } | { "kind": "errored", worker_name: string, message: string, } | { "kind": "shut_down", worker_name: string, } | { "kind": "scope_sub_delegated",
 /**
- * Sub-delegating Pod (= the sender itself).
+ * Sub-delegating Worker (= the sender itself).
  */
-parent_pod: string,
+parent_worker: string,
 /**
- * Name of the grandchild Pod.
+ * Name of the grandchild Worker.
  */
-sub_pod: string,
+sub_worker: string,
 /**
  * Unix-socket path where the grandchild is reachable.
  */
@@ -99,7 +99,7 @@ sub_socket: string,
  */
 scope: Array<ScopeRule>, };
 
-export type Method = { "method": "run", "params": { input: Array<Segment>, } } | { "method": "notify", "params": { message: string, auto_run?: boolean, } } | { "method": "pod_event", "params": PodEvent } | { "method": "resume" } | { "method": "cancel" } | { "method": "pause" } | { "method": "compact" } | { "method": "list_rewind_targets" } | { "method": "rewind_to", "params": { target: RewindTargetId, expected_head_entries: number, } } | { "method": "shutdown" } | { "method": "list_completions", "params": { kind: CompletionKind, prefix: string, } } | { "method": "list_pods" } | { "method": "restore_pod", "params": { name: string, } } | { "method": "register_peer", "params": { name: string, } };
+export type Method = { "method": "run", "params": { input: Array<Segment>, } } | { "method": "notify", "params": { message: string, auto_run?: boolean, } } | { "method": "worker_event", "params": WorkerEvent } | { "method": "resume" } | { "method": "cancel" } | { "method": "pause" } | { "method": "compact" } | { "method": "list_rewind_targets" } | { "method": "rewind_to", "params": { target: RewindTargetId, expected_head_entries: number, } } | { "method": "shutdown" } | { "method": "list_completions", "params": { kind: CompletionKind, prefix: string, } } | { "method": "list_workers" } | { "method": "restore_worker", "params": { name: string, } } | { "method": "register_peer", "params": { name: string, } };
 
 export type Event = { "event": "user_message", "data": { segments: Array<Segment>, } } | { "event": "system_item", "data": { item: unknown, } } | { "event": "invoke_start", "data": { kind: InvokeKind, } } | { "event": "turn_start", "data": { turn: number, } } | { "event": "turn_end", "data": { turn: number, result: TurnResult, } } | { "event": "llm_call_start", "data": { llm_call: number, } } | { "event": "llm_call_end", "data": { llm_call: number, } } | { "event": "llm_retry", "data": { llm_call: number,
 /**
@@ -115,9 +115,9 @@ summary: string,
  * Full tool output. Absent when the tool chose to return
  * summary-only, or when the result was pruned.
  */
-output?: string | null, is_error: boolean, } } | { "event": "usage", "data": { input_tokens: number | null, output_tokens: number | null, cache_read_input_tokens?: number | null, } } | { "event": "run_end", "data": { result: RunResult, } } | { "event": "error", "data": { code: ErrorCode, message: string, } } | { "event": "snapshot", "data": { entries: Array<unknown>, greeting: Greeting, status: PodStatus,
+output?: string | null, is_error: boolean, } } | { "event": "usage", "data": { input_tokens: number | null, output_tokens: number | null, cache_read_input_tokens?: number | null, } } | { "event": "run_end", "data": { result: RunResult, } } | { "event": "error", "data": { code: ErrorCode, message: string, } } | { "event": "snapshot", "data": { entries: Array<unknown>, greeting: Greeting, status: WorkerStatus,
 /**
  * Unfinished model output that has already streamed in the current
  * run but is not yet represented by committed snapshot entries.
  */
-in_flight?: InFlightSnapshot, } } | { "event": "segment_rotated", "data": { entry: unknown, } } | { "event": "status", "data": { status: PodStatus, } } | { "event": "completions", "data": { kind: CompletionKind, entries: Array<CompletionEntry>, } } | { "event": "rewind_targets", "data": { head_entries: number, targets: Array<RewindTarget>, } } | { "event": "rewind_applied", "data": { entries: Array<unknown>, input: Array<Segment>, summary: RewindSummary, } } | { "event": "pods_listed", "data": { pods: unknown, } } | { "event": "pod_restored", "data": { result: unknown, } } | { "event": "peer_registered", "data": { result: unknown, } } | { "event": "alert", "data": Alert } | { "event": "memory_worker", "data": MemoryWorkerEvent } | { "event": "compact_start" } | { "event": "compact_done", "data": { new_segment_id: string, } } | { "event": "compact_failed", "data": { error: string, } } | { "event": "shutdown" };
+in_flight?: InFlightSnapshot, } } | { "event": "segment_rotated", "data": { entry: unknown, } } | { "event": "status", "data": { status: WorkerStatus, } } | { "event": "completions", "data": { kind: CompletionKind, entries: Array<CompletionEntry>, } } | { "event": "rewind_targets", "data": { head_entries: number, targets: Array<RewindTarget>, } } | { "event": "rewind_applied", "data": { entries: Array<unknown>, input: Array<Segment>, summary: RewindSummary, } } | { "event": "workers_listed", "data": { workers: unknown, } } | { "event": "worker_restored", "data": { result: unknown, } } | { "event": "peer_registered", "data": { result: unknown, } } | { "event": "alert", "data": Alert } | { "event": "memory_worker", "data": MemoryWorkerEvent } | { "event": "compact_start" } | { "event": "compact_done", "data": { new_segment_id: string, } } | { "event": "compact_failed", "data": { error: string, } } | { "event": "shutdown" };

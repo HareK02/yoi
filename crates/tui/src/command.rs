@@ -142,7 +142,7 @@ impl CommandRegistry {
             name: "compact",
             aliases: &[],
             usage: "compact",
-            description: "Request immediate Pod context compaction.",
+            description: "Request immediate Worker context compaction.",
             argument_parser: compact_args,
             can_execute: compact_available,
             executor: compact_command,
@@ -159,8 +159,8 @@ impl CommandRegistry {
         registry.register(CommandSpec {
             name: "peer",
             aliases: &[],
-            usage: "peer <pod-name>",
-            description: "Register another existing Pod as a reciprocal metadata peer.",
+            usage: "peer <worker-name>",
+            description: "Register another existing Worker as a reciprocal metadata peer.",
             argument_parser: peer_args,
             can_execute: peer_available,
             executor: peer_command,
@@ -317,7 +317,7 @@ fn peer_args(raw: &str) -> Result<CommandArgs, CommandDiagnostic> {
         Ok(args)
     } else {
         Err(CommandDiagnostic::new(
-            "Invalid arguments. Usage: peer <pod-name>",
+            "Invalid arguments. Usage: peer <worker-name>",
         ))
     }
 }
@@ -325,17 +325,17 @@ fn peer_args(raw: &str) -> Result<CommandArgs, CommandDiagnostic> {
 fn compact_available(environment: &CommandEnvironment) -> Result<(), CommandDiagnostic> {
     if !environment.connected {
         return Err(CommandDiagnostic::new(
-            "Cannot compact: not connected to a Pod.",
+            "Cannot compact: not connected to a Worker.",
         ));
     }
     if environment.running {
         return Err(CommandDiagnostic::new(
-            "Cannot compact while the Pod is running.",
+            "Cannot compact while the Worker is running.",
         ));
     }
     if environment.paused {
         return Err(CommandDiagnostic::new(
-            "Cannot compact while the Pod is paused; resume or start a fresh turn first.",
+            "Cannot compact while the Worker is paused; resume or start a fresh turn first.",
         ));
     }
     Ok(())
@@ -344,12 +344,12 @@ fn compact_available(environment: &CommandEnvironment) -> Result<(), CommandDiag
 fn rewind_available(environment: &CommandEnvironment) -> Result<(), CommandDiagnostic> {
     if !environment.connected {
         return Err(CommandDiagnostic::new(
-            "Cannot rewind before the Pod is connected.",
+            "Cannot rewind before the Worker is connected.",
         ));
     }
     if environment.running {
         return Err(CommandDiagnostic::new(
-            "Cannot rewind while the Pod is running.",
+            "Cannot rewind while the Worker is running.",
         ));
     }
     Ok(())
@@ -358,12 +358,12 @@ fn rewind_available(environment: &CommandEnvironment) -> Result<(), CommandDiagn
 fn peer_available(environment: &CommandEnvironment) -> Result<(), CommandDiagnostic> {
     if !environment.connected {
         return Err(CommandDiagnostic::new(
-            "Cannot register a peer before the Pod is connected.",
+            "Cannot register a peer before the Worker is connected.",
         ));
     }
     if environment.running {
         return Err(CommandDiagnostic::new(
-            "Cannot register a peer while the Pod is running.",
+            "Cannot register a peer while the Worker is running.",
         ));
     }
     Ok(())
@@ -596,7 +596,7 @@ mod tests {
         let registry = CommandRegistry::builtins();
         let result = registry.dispatch("help peer", &env());
         assert!(result.method.is_none());
-        assert!(result.diagnostics[0].message.contains("peer <pod-name>"));
+        assert!(result.diagnostics[0].message.contains("peer <worker-name>"));
         assert!(result.diagnostics[0].message.contains("metadata peer"));
     }
 

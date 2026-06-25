@@ -1,15 +1,15 @@
-//! Inline-viewport "pick a Pod to attach or restore" UX.
+//! Inline-viewport "pick a Worker to attach or restore" UX.
 //!
-//! Reads live Pod allocations from the runtime registry and stopped Pod state
+//! Reads live Worker allocations from the runtime registry and stopped Worker state
 //! from the pod-store name-keyed metadata. Picking a live row attaches to
-//! its socket; picking a stopped row restores via the Pod runtime command.
+//! its socket; picking a stopped row restores via the Worker runtime command.
 
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
-use pod_store::FsPodStore;
+use pod_store::FsWorkerStore;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
@@ -19,10 +19,10 @@ use ratatui::widgets::Paragraph;
 use ratatui::{Frame, TerminalOptions, Viewport};
 use session_store::FsStore;
 
-use crate::pod_list::{
-    LivePodInfo, PodList, PodListEntry, PodVisibilitySource, StoredMetadataState, StoredPodInfo,
-    live_socket_for_pod as pod_list_live_socket_for_pod, read_reachable_live_pod_infos,
-    read_stored_pod_infos,
+use crate::worker_list::{
+    LiveWorkerInfo, StoredMetadataState, StoredWorkerInfo, WorkerList, WorkerListEntry,
+    WorkerVisibilitySource, live_socket_for_pod as worker_list_live_socket_for_pod,
+    read_reachable_live_pod_infos, read_stored_worker_infos,
 };
 
 const MAX_ROWS: usize = 10;
@@ -32,7 +32,7 @@ const VIEWPORT_LINES: u16 = MAX_ROWS as u16 + 4;
 pub enum PickerError {
     Io(io::Error),
     Store(session_store::StoreError),
-    NoPods { all: bool },
+    NoWorkers { all: bool },
 }
 
 impl std::fmt::Display for PickerError {
@@ -40,13 +40,13 @@ impl std::fmt::Display for PickerError {
         match self {
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Store(e) => write!(f, "session store error: {e}"),
-            Self::NoPods { all: true } => write!(
+            Self::NoWorkers { all: true } => write!(
                 f,
-                "no pods found — start a fresh pod with `yoi` and try again"
+                "no workers found — start a fresh Worker with `yoi` and try again"
             ),
-            Self::NoPods { all: false } => write!(
+            Self::NoWorkers { all: false } => write!(
                 f,
-                "no pods found in this workspace — use `yoi resume --all` to list all host/data-dir Pods"
+                "no workers found in this workspace — use `yoi resume --all` to list all host/data-dir Workers"
             ),
         }
     }
@@ -67,11 +67,11 @@ impl From<session_store::StoreError> for PickerError {
 }
 
 pub enum PickerOutcome {
-    /// User picked a Pod. `socket_override` is set for live rows when the
+    /// User picked a Worker. `socket_override` is set for live rows when the
     /// runtime registry knows the exact socket path; stopped rows leave it
-    /// empty so the caller restores by spawning the Pod runtime command.
+    /// empty so the caller restores by spawning the Worker runtime command.
     Picked {
-        pod_name: String,
+        worker_name: String,
         socket_override: Option<PathBuf>,
     },
     Cancelled,
@@ -103,13 +103,13 @@ enum PickerScope {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PodRowState {
+enum WorkerRowState {
     Live,
     Stopped,
     Corrupt,
 }
 
-impl PodRowState {
+impl WorkerRowState {
     fn label(self) -> &'static str {
         match self {
             Self::Live => "live",
@@ -131,22 +131,22 @@ impl PodRowState {
 
 fn list_for_options(
     options: &PickerOptions,
-    stored_pods: Vec<StoredPodInfo>,
-    live_pods: Vec<LivePodInfo>,
-) -> PodList {
+    stored_workers: Vec<StoredWorkerInfo>,
+    live_workers: Vec<LiveWorkerInfo>,
+) -> WorkerList {
     match &options.scope {
-        PickerScope::Workspace(workspace_root) => PodList::from_workspace_sources(
-            PodVisibilitySource::ResumePicker,
-            stored_pods,
-            live_pods,
+        PickerScope::Workspace(workspace_root) => WorkerList::from_workspace_sources(
+            WorkerVisibilitySource::ResumePicker,
+            stored_workers,
+            live_workers,
             None,
             MAX_ROWS,
             workspace_root,
         ),
-        PickerScope::All => PodList::from_sources(
-            PodVisibilitySource::ResumePicker,
-            stored_pods,
-            live_pods,
+        PickerScope::All => WorkerList::from_sources(
+            WorkerVisibilitySource::ResumePicker,
+            stored_workers,
+            live_workers,
             None,
             MAX_ROWS,
         ),
@@ -156,14 +156,14 @@ fn list_for_options(
 pub async fn run(options: PickerOptions) -> Result<PickerOutcome, PickerError> {
     let store_dir = default_store_dir()?;
     let store = FsStore::new(&store_dir)?;
-    let pod_store = FsPodStore::new(default_pod_store_dir()?).map_err(io::Error::other)?;
-    let stored_pods = read_stored_pod_infos(&store, &pod_store)?;
-    let live_pods = read_reachable_live_pod_infos(&store)
+    let pod_store = FsWorkerStore::new(default_pod_store_dir()?).map_err(io::Error::other)?;
+    let stored_workers = read_stored_worker_infos(&store, &pod_store)?;
+    let live_workers = read_reachable_live_pod_infos(&store)
         .await
         .unwrap_or_default();
-    let mut list = list_for_options(&options, stored_pods, live_pods);
+    let mut list = list_for_options(&options, stored_workers, live_workers);
     if list.entries.is_empty() {
-        return Err(PickerError::NoPods {
+        return Err(PickerError::NoWorkers {
             all: matches!(options.scope, PickerScope::All),
         });
     }
@@ -185,9 +185,9 @@ pub async fn run(options: PickerOptions) -> Result<PickerOutcome, PickerError> {
             }
             Some(Action::Submit) => {
                 close_viewport(&mut terminal)?;
-                let entry = list.selected_entry().expect("non-empty pod list");
+                let entry = list.selected_entry().expect("non-empty worker list");
                 return Ok(PickerOutcome::Picked {
-                    pod_name: entry.name.clone(),
+                    worker_name: entry.name.clone(),
                     socket_override: entry.attach_socket_path().map(PathBuf::from),
                 });
             }
@@ -229,14 +229,14 @@ fn default_pod_store_dir() -> Result<PathBuf, PickerError> {
         .ok_or_else(|| {
             PickerError::Io(io::Error::new(
                 io::ErrorKind::NotFound,
-                "could not resolve pod state directory \
+                "could not resolve worker state directory \
              (set YOI_HOME, YOI_DATA_DIR, or HOME)",
             ))
         })
 }
 
-pub(crate) fn live_socket_for_pod(pod_name: &str) -> Option<PathBuf> {
-    pod_list_live_socket_for_pod(pod_name)
+pub(crate) fn live_socket_for_pod(worker_name: &str) -> Option<PathBuf> {
+    worker_list_live_socket_for_pod(worker_name)
 }
 
 fn make_inline_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
@@ -278,7 +278,7 @@ fn poll_event() -> io::Result<Option<Action>> {
     }
 }
 
-fn draw(f: &mut Frame<'_>, list: &PodList) {
+fn draw(f: &mut Frame<'_>, list: &WorkerList) {
     let area = f.area();
     let mut constraints: Vec<Constraint> = Vec::with_capacity(list.entries.len() + 3);
     constraints.push(Constraint::Length(1)); // title
@@ -320,10 +320,10 @@ fn draw(f: &mut Frame<'_>, list: &PodList) {
 }
 
 fn picker_title() -> &'static str {
-    "resume pod   pick a pod"
+    "resume worker   pick a worker"
 }
 
-fn row_line(entry: &PodListEntry, selected: bool) -> Line<'_> {
+fn row_line(entry: &WorkerListEntry, selected: bool) -> Line<'_> {
     let marker = if selected { "▶ " } else { "  " };
     let name_style = if selected {
         Style::default()
@@ -361,18 +361,18 @@ fn row_line(entry: &PodListEntry, selected: bool) -> Line<'_> {
     Line::from(spans)
 }
 
-fn row_state(entry: &PodListEntry) -> PodRowState {
+fn row_state(entry: &WorkerListEntry) -> WorkerRowState {
     if entry.live.as_ref().is_some_and(|live| live.reachable) {
-        return PodRowState::Live;
+        return WorkerRowState::Live;
     }
     if entry
         .stored
         .as_ref()
         .is_some_and(|stored| matches!(stored.metadata_state, StoredMetadataState::Corrupt(_)))
     {
-        return PodRowState::Corrupt;
+        return WorkerRowState::Corrupt;
     }
-    PodRowState::Stopped
+    WorkerRowState::Stopped
 }
 
 fn format_updated_at(updated_at: u64) -> String {
@@ -383,7 +383,7 @@ fn format_updated_at(updated_at: u64) -> String {
     }
 }
 
-fn debug_ids(entry: &PodListEntry) -> String {
+fn debug_ids(entry: &WorkerListEntry) -> String {
     let session = entry
         .summary
         .active_session_id
@@ -407,20 +407,20 @@ mod tests {
 
     #[test]
     fn picker_title_names_pods_not_sessions() {
-        assert_eq!(picker_title(), "resume pod   pick a pod");
+        assert_eq!(picker_title(), "resume worker   pick a worker");
     }
 
     #[test]
     fn picker_no_pods_message_mentions_all_for_workspace_scope() {
-        let message = PickerError::NoPods { all: false }.to_string();
-        assert!(message.contains("no pods found in this workspace"));
+        let message = PickerError::NoWorkers { all: false }.to_string();
+        assert!(message.contains("no workers found in this workspace"));
         assert!(message.contains("yoi resume --all"));
     }
 
     #[test]
     fn picker_no_pods_message_keeps_fresh_pod_hint_for_all_scope() {
-        let message = PickerError::NoPods { all: true }.to_string();
-        assert!(message.contains("start a fresh pod with `yoi`"));
+        let message = PickerError::NoWorkers { all: true }.to_string();
+        assert!(message.contains("start a fresh Worker with `yoi`"));
         assert!(!message.contains("yoi resume --all"));
     }
 
@@ -464,9 +464,9 @@ mod tests {
         assert_eq!(names, vec!["current", "other", "legacy"]);
     }
 
-    fn stored_pod(name: &str, workspace_root: Option<&str>, updated_at: u64) -> StoredPodInfo {
-        StoredPodInfo {
-            pod_name: name.to_string(),
+    fn stored_pod(name: &str, workspace_root: Option<&str>, updated_at: u64) -> StoredWorkerInfo {
+        StoredWorkerInfo {
+            worker_name: name.to_string(),
             metadata_state: StoredMetadataState::Present,
             active_session_id: None,
             active_segment_id: None,
@@ -479,16 +479,16 @@ mod tests {
     #[test]
     fn picker_row_shows_live_pending_preview_and_runtime_segment_id() {
         let segment_id = session_store::new_segment_id();
-        let entry = PodList::from_sources(
-            PodVisibilitySource::ResumePicker,
+        let entry = WorkerList::from_sources(
+            WorkerVisibilitySource::ResumePicker,
             vec![],
-            vec![crate::pod_list::LivePodInfo {
-                pod_name: "pending".to_string(),
+            vec![crate::worker_list::LiveWorkerInfo {
+                worker_name: "pending".to_string(),
                 socket_path: PathBuf::from("/tmp/pending.sock"),
-                status: Some(protocol::PodStatus::Idle),
+                status: Some(protocol::WorkerStatus::Idle),
                 reachable: true,
                 segment_id: Some(segment_id),
-                summary: crate::pod_list::PodEntrySummary::default(),
+                summary: crate::worker_list::WorkerEntrySummary::default(),
             }],
             None,
             10,

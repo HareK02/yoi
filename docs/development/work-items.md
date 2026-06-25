@@ -4,14 +4,14 @@ Yoi project work is tracked through Tickets. For normal use, interact with Ticke
 
 The current local backend stores each Ticket in the flat `.yoi/tickets/<ticket-id>/` layout. The directory name is the canonical opaque Ticket id: a fixed-width Crockford base32 Unix epoch millisecond timestamp. Slugs and frontmatter `id`/`slug` fields are not current-state authority. That storage detail matters for maintainers and backend compatibility, but it is not the primary user-facing workflow.
 
-Do not treat ad-hoc chat summaries, memory records, or Pod notifications as the final source of project state. Notifications are hints to inspect concrete state, not proof of completion.
+Do not treat ad-hoc chat summaries, memory records, or Worker notifications as the final source of project state. Notifications are hints to inspect concrete state, not proof of completion.
 
 ## Concepts
 
 - `Ticket`: durable project/orchestration record. It contains requirements, decisions, plans, implementation reports, reviews, artifacts, and resolution history.
 - `Objective`: first-class medium-term goal record. It stores goal, motivation/background, strategy/design direction, success criteria/exit conditions, decision context, current Objective lifecycle, and canonical Ticket links under `.yoi/objectives/<objective-id>/item.md`. Objective context is judgment/background context; it is not implementation authority and does not replace reading each Ticket body/thread/artifacts.
-- `Task`: session-local progress tracking inside a Pod. It is not the project record.
-- `Assignment`: a concrete delegation from an Orchestrator to a coder/reviewer Pod or task-specific helper Pod.
+- `Task`: session-local progress tracking inside a Worker. It is not the project record.
+- `Assignment`: a concrete delegation from an Orchestrator to a coder/reviewer Worker or task-specific helper Worker.
 - `IntentPacket`: the short implementation/review contract derived from a Ticket and handed to an Assignment.
 - `LocalTicketBackend`: the current `.yoi/tickets/` markdown/thread/artifacts storage backend.
 - `Ticket relation`: durable project-level Ticket-to-Ticket metadata stored as forward canonical-id relations (`depends_on`, `blocks`, `related`, `supersedes`, `duplicate_of`). Inverse views such as `blocked_by` are derived, not stored.
@@ -24,14 +24,14 @@ Use the highest-level interface that matches the work:
 
 - Use `yoi panel` for the Ticket/Intake/Orchestrator workspace Dashboard and role-launch actions.
 - Use `yoi objective ...` for lightweight medium-term Objective records and their non-blocking canonical Ticket links.
-- Inside Pods, use typed Ticket tools to create, inspect, comment, review, and close Tickets.
+- Inside Workers, use typed Ticket tools to create, inspect, comment, review, and close Tickets.
 - For multi-step work, follow the Ticket Intake, Orchestrator Routing, planning/requirements-sync, and Multi-agent workflows.
 
 Maintainers can inspect the local `.yoi/tickets/` files directly when debugging storage, but normal user instructions should go through `yoi panel`, Ticket tools, or `yoi ticket ...`.
 
-## Ticket tools inside Pods
+## Ticket tools inside Workers
 
-Pods with the Ticket built-in feature can use typed Ticket tools:
+Workers with the Ticket built-in feature can use typed Ticket tools:
 
 - `TicketCreate`
 - `TicketList` — lightweight bounded overview for selecting ids; it returns short summaries only and must not be used as body/thread/artifact authority.
@@ -46,9 +46,9 @@ Pods with the Ticket built-in feature can use typed Ticket tools:
 
 These tools operate through the typed Ticket backend. They are not arbitrary filesystem write permission to `.yoi/tickets/`.
 
-Relation tools are for non-hierarchical project metadata only. Use canonical opaque Ticket ids, store forward relations only, and keep runtime execution planning (capacity, ordering decisions, do-not-parallelize notes, Pod/session/worktree ownership) in OrchestrationPlan or session-local records instead of relation metadata. Unresolved `depends_on` and incoming unresolved `blocks` are queue/acceptance blockers; `related` is not blocking, and `supersedes` / `duplicate_of` are diagnostics rather than automatic lifecycle transitions.
+Relation tools are for non-hierarchical project metadata only. Use canonical opaque Ticket ids, store forward relations only, and keep runtime execution planning (capacity, ordering decisions, do-not-parallelize notes, Worker/session/worktree ownership) in OrchestrationPlan or session-local records instead of relation metadata. Unresolved `depends_on` and incoming unresolved `blocks` are queue/acceptance blockers; `related` is not blocking, and `supersedes` / `duplicate_of` are diagnostics rather than automatic lifecycle transitions.
 
-Use them when a Pod needs to materialize or update project records:
+Use them when a Worker needs to materialize or update project records:
 
 - Intake creates a new Ticket after user agreement.
 - Orchestrator records routing decisions and intent packets.
@@ -59,7 +59,7 @@ Do not bypass workflow gates just because Ticket tools are available. Ticket mut
 
 ## Objective records
 
-Objectives are lightweight medium-term project records, not Tickets, Ticket relations, OrchestrationPlan execution records, or Pod/session claims. Use them when a goal spans several concrete Tickets and the durable motivation, design direction, success criteria, or decision context would otherwise be repeated or lost.
+Objectives are lightweight medium-term project records, not Tickets, Ticket relations, OrchestrationPlan execution records, or Worker/session claims. Use them when a goal spans several concrete Tickets and the durable motivation, design direction, success criteria, or decision context would otherwise be repeated or lost.
 
 The local Objective surface stores records under:
 
@@ -90,7 +90,7 @@ The Markdown body should include these sections:
 - `## Success criteria / exit conditions`
 - `## Decision context`
 
-Linked Tickets must be canonical opaque Ticket ids that exist in the configured Ticket backend root. Objective-to-Ticket links are context links only: they are not dependency, blocking, ordering, ownership, or scheduling relations. Use typed Ticket relations for Ticket-to-Ticket dependency/blocking/related metadata, OrchestrationPlan records for routing/execution plans, and Pod/session claims for runtime ownership hints.
+Linked Tickets must be canonical opaque Ticket ids that exist in the configured Ticket backend root. Objective-to-Ticket links are context links only: they are not dependency, blocking, ordering, ownership, or scheduling relations. Use typed Ticket relations for Ticket-to-Ticket dependency/blocking/related metadata, OrchestrationPlan records for routing/execution plans, and Worker/session claims for runtime ownership hints.
 
 Objective lifecycle is only Objective lifecycle. `active`, `paused`, `done`, and `archived` do not drive Ticket `state`, do not authorize implementation, and do not close linked Tickets. A role reading Objective context must still inspect each Ticket body, thread, artifacts, explicit Ticket relations, and OrchestrationPlan records before acting.
 
@@ -146,9 +146,9 @@ Fixed roles are:
 
 This is not an arbitrary role registry. The fixed roles are the roles required by Ticket orchestration.
 Stale `[roles.investigator]` config is rejected as an unsupported fixed role; remove it and,
-when a spike is useful, let the Orchestrator create an ordinary task-specific read-only helper Pod.
+when a spike is useful, let the Orchestrator create an ordinary task-specific read-only helper Worker.
 
-`profile` selects the Pod runtime Profile for that role. The selected Profile owns durable role/system behavior. `ticket.config.toml` does not have a role-level `system_instruction` field.
+`profile` selects the Worker runtime Profile for that role. The selected Profile owns durable role/system behavior. `ticket.config.toml` does not have a role-level `system_instruction` field.
 
 `launch_prompt` is a per-action first-run prompt reference for future prompt resolution. Current launcher behavior exposes the ref but does not treat it as system instruction.
 
@@ -195,7 +195,7 @@ Intake should:
 - draft background, requirements, acceptance criteria, binding decisions/invariants, implementation latitude, readiness, risk flags, and validation;
 - create or update the Ticket only after user agreement.
 
-Intake should not schedule implementation, spawn coder/reviewer Pods, create worktrees, merge, or close Tickets.
+Intake should not schedule implementation, spawn coder/reviewer Workers, create worktrees, merge, or close Tickets.
 
 ### 2. Orchestrator routing
 
@@ -226,7 +226,7 @@ Planning sync should resolve or record:
 - critical risks and failure modes;
 - implementation-ready vs requirements-sync/spike/blocked classification.
 
-Do not send Tickets with unresolved concrete missing decisions/information directly to coder Pods. If no concrete missing item remains after bounded checks, risky-but-specified Tickets should proceed with an IntentPacket plus escalation conditions and reviewer focus.
+Do not send Tickets with unresolved concrete missing decisions/information directly to coder Workers. If no concrete missing item remains after bounded checks, risky-but-specified Tickets should proceed with an IntentPacket plus escalation conditions and reviewer focus.
 
 ### 4. Implementation assignment
 
@@ -243,11 +243,11 @@ The Orchestrator should prepare an `IntentPacket` with:
 - current code map;
 - critical risks.
 
-Implementation normally happens in a child git worktree created by the Orchestrator, not by the coder Pod. The coder Pod receives narrow write scope to the worktree and must report changed files, implementation summary, validation, unresolved risks, and review readiness.
+Implementation normally happens in a child git worktree created by the Orchestrator, not by the coder Worker. The coder Worker receives narrow write scope to the worktree and must report changed files, implementation summary, validation, unresolved risks, and review readiness.
 
 ### 5. Review
 
-Reviewer Pods should be sibling Pods, not children of coder Pods. They should read the Ticket, intent packet, diff, implementation report, and validation evidence.
+Reviewer Workers should be sibling Workers, not children of coder Workers. They should read the Ticket, intent packet, diff, implementation report, and validation evidence.
 
 Review results should be recorded with the `TicketReview` tool. Maintainers working directly with the local backend can use the `yoi ticket` CLI documented later.
 
@@ -259,7 +259,7 @@ Unless explicitly authorized otherwise, final merge, cleanup, design-boundary de
 
 Before closing, verify concrete evidence:
 
-- child Pod output via `ReadPodOutput`;
+- child Worker output via `ReadWorkerOutput`;
 - worktree state and diff;
 - validation command output;
 - review result;
@@ -270,7 +270,7 @@ Close with a resolution that summarizes what changed, key commits, validation, r
 
 ## Workspace Dashboard Ticket role actions
 
-`yoi panel` is the active Ticket/Intake/Orchestrator Dashboard. It owns fixed Ticket role-launch actions and uses the shared client Ticket role launcher. The single-Pod Console no longer supports `:ticket ...` commands; typing them in command mode is treated like any other unknown command.
+`yoi panel` is the active Ticket/Intake/Orchestrator Dashboard. It owns fixed Ticket role-launch actions and uses the shared client Ticket role launcher. The single-Worker Console no longer supports `:ticket ...` commands; typing them in command mode is treated like any other unknown command.
 
 Role actions map to the same fixed roles configured in `.yoi/ticket.config.toml`:
 
@@ -279,7 +279,7 @@ Role actions map to the same fixed roles configured in `.yoi/ticket.config.toml`
 - implement launches the coder role for an implementation assignment.
 - review launches the reviewer role for review.
 
-All actions are explicit and user-triggered. They are not a scheduler, queue, spawned-Pod Dashboard, or automatic maintainer loop.
+All actions are explicit and user-triggered. They are not a scheduler, queue, spawned-Worker Dashboard, or automatic maintainer loop.
 
 ### Dashboard execution path
 
@@ -290,13 +290,13 @@ User triggers a Ticket action in yoi panel
   -> Dashboard builds a TicketRoleLaunchContext
   -> client Ticket role launcher reads .yoi/ticket.config.toml
   -> launcher selects the role Profile and workflow
-  -> launcher spawns the role Pod
+  -> launcher spawns the role Worker
   -> launcher sends Method::Run with WorkflowInvoke + Text segments
   -> launcher waits for run-acceptance evidence
   -> Dashboard reports success/failure
 ```
 
-The launched Pod receives dynamic Ticket/action context as its first committed run input. The Dashboard does not inject hidden context, does not write Ticket files directly, and does not construct prompt/workflow segments by hand.
+The launched Worker receives dynamic Ticket/action context as its first committed run input. The Dashboard does not inject hidden context, does not write Ticket files directly, and does not construct prompt/workflow segments by hand.
 
 The first run input contains:
 
@@ -343,7 +343,7 @@ If a role still uses `profile = "inherit"`, the Dashboard fails closed with a di
 - `profile = "inherit"`: configure a concrete role Profile in `.yoi/ticket.config.toml`.
 - malformed `.yoi/ticket.config.toml`: fix the config and retry.
 - missing Ticket id for route, implement, or review actions: provide the target Ticket.
-- launch success but no visible completion: attach to or inspect the launched Pod; completion notifications are hints, not authority.
+- launch success but no visible completion: attach to or inspect the launched Worker; completion notifications are hints, not authority.
 
 ## Granularity
 
@@ -383,7 +383,7 @@ Do not store secrets, credentials, private prompt contents, or raw logs containi
 
 ## Backend/maintainer CLI: `yoi ticket`
 
-The product CLI exposes the typed Ticket backend for repository maintenance and validation. It operates on the configured `.yoi/tickets/` storage and is the preferred command-line surface when editing Tickets outside a Pod.
+The product CLI exposes the typed Ticket backend for repository maintenance and validation. It operates on the configured `.yoi/tickets/` storage and is the preferred command-line surface when editing Tickets outside a Worker.
 
 ```sh
 yoi ticket create --title "..." [--priority P2]

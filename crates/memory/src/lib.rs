@@ -3,7 +3,7 @@
 //! Self-contained: provides its own Tool implementations (read/write/edit)
 //! that target `<workspace>/memory/` and `<workspace>/knowledge/` only,
 //! with a pre-write Linter built in. Generic CRUD tools (in the `tools`
-//! crate) must not touch these directories — Pod is responsible for
+//! crate) must not touch these directories — Worker is responsible for
 //! denying them at the Scope level when memory is enabled.
 
 pub mod audit;

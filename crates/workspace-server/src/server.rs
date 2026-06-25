@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::hosts::{
-    DiagnosticSeverity, HostSummary, LocalPodRuntime, RuntimeDiagnostic, RuntimeSummary,
+    DiagnosticSeverity, HostSummary, LocalWorkerRuntime, RuntimeDiagnostic, RuntimeSummary,
     WorkerRuntimeRegistry, WorkerSummary,
 };
 use crate::identity::WorkspaceIdentity;
@@ -78,11 +78,13 @@ impl WorkspaceApi {
                 updated_at: config.workspace_created_at.clone(),
             })
             .await?;
-        let runtime = Arc::new(WorkerRuntimeRegistry::for_local_pods(LocalPodRuntime::new(
-            config.workspace_id.clone(),
-            config.workspace_root.clone(),
-            config.local_runtime_data_dir.clone(),
-        )));
+        let runtime = Arc::new(WorkerRuntimeRegistry::for_local_pods(
+            LocalWorkerRuntime::new(
+                config.workspace_id.clone(),
+                config.workspace_root.clone(),
+                config.local_runtime_data_dir.clone(),
+            ),
+        ));
         Ok(Self {
             records: LocalProjectRecordReader::new(config.workspace_root.clone()),
             config,
@@ -255,11 +257,11 @@ async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<Worksp
             store: "sqlite".to_string(),
             event_stream: ExtensionPointState {
                 status: "reserved".to_string(),
-                note: "No browser-to-Pod socket path is exposed in this bootstrap; any future stream must be a Workspace server proxy that resolves Worker identity and enforces method allow/block boundaries.".to_string(),
+                note: "No browser-to-Worker socket path is exposed in this bootstrap; any future stream must be a Workspace server proxy that resolves Worker identity and enforces method allow/block boundaries.".to_string(),
             },
             host_worker_bridge: ExtensionPointState {
                 status: "read_only_local".to_string(),
-                note: "Local Hosts and Workers are exposed as a read-only bridge over existing Pod metadata; no direct Pod socket, scheduling, or lifecycle control is implemented.".to_string(),
+                note: "Local Hosts and Workers are exposed as a read-only bridge over existing Worker metadata; no direct Worker socket, scheduling, or lifecycle control is implemented.".to_string(),
             },
         },
     }))
@@ -725,12 +727,12 @@ mod tests {
 
         let hosts = get_json(app.clone(), "/api/hosts").await;
         assert_eq!(hosts["source"], "worker_runtime_registry");
-        assert_eq!(hosts["items"][0]["runtime_id"], "local-pod-runtime");
+        assert_eq!(hosts["items"][0]["runtime_id"], "local-worker-runtime");
         let host_id = hosts["items"][0]["host_id"].as_str().unwrap().to_string();
         assert!(host_id.starts_with("local-"));
         assert!(host_id.len() <= 120);
         assert_ne!(host_id, TEST_REPOSITORY_ID);
-        assert_eq!(hosts["items"][0]["kind"], "local-pod-host");
+        assert_eq!(hosts["items"][0]["kind"], "local-worker-host");
         assert_eq!(
             hosts["items"][0]["capabilities"]["local_pod_inspection"],
             "available"
@@ -743,7 +745,7 @@ mod tests {
 
         let runtimes = get_json(app.clone(), "/api/runtimes").await;
         assert_eq!(runtimes["source"], "worker_runtime_registry");
-        assert_eq!(runtimes["items"][0]["runtime_id"], "local-pod-runtime");
+        assert_eq!(runtimes["items"][0]["runtime_id"], "local-worker-runtime");
         assert_eq!(runtimes["items"][0]["host_ids"][0], host_id);
 
         let workers = get_json(app.clone(), "/api/workers").await;

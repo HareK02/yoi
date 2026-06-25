@@ -296,7 +296,7 @@ pub(super) const TICKET_STATE_COLUMN_WIDTH: usize = 10;
 pub(super) const POD_STATUS_COLUMN_WIDTH: usize = 18;
 
 pub(super) fn panel_row_lines(row: &PanelRow, selected: bool, width: u16) -> Vec<Line<'static>> {
-    if row.kind == PanelRowKind::TicketIntakePod {
+    if row.kind == PanelRowKind::TicketIntakeWorker {
         vec![panel_intake_child_line(row, selected, width)]
     } else {
         vec![
@@ -438,7 +438,7 @@ pub(super) fn panel_ticket_detail(row: &PanelRow) -> String {
         return parts.join(" · ");
     }
 
-    if row.kind == PanelRowKind::TicketIntakePod {
+    if row.kind == PanelRowKind::TicketIntakeWorker {
         let mut parts = row
             .subtitle
             .as_ref()
@@ -538,8 +538,8 @@ pub(super) fn panel_ticket_reference(row: &PanelRow) -> String {
         .map(|ticket| ticket.id.clone())
         .unwrap_or_else(|| match &row.key {
             PanelRowKey::Ticket(id) | PanelRowKey::InvalidTicket(id) => id.clone(),
-            PanelRowKey::TicketIntakePod { ticket_id, .. } => ticket_id.clone(),
-            PanelRowKey::Pod(name) => name.clone(),
+            PanelRowKey::TicketIntakeWorker { ticket_id, .. } => ticket_id.clone(),
+            PanelRowKey::Worker(name) => name.clone(),
         })
 }
 
@@ -597,7 +597,7 @@ pub(super) fn intake_status_style(status: &str) -> Style {
 }
 
 pub(super) fn section_rows(
-    list: &PodList,
+    list: &WorkerList,
     section: &DashboardSection,
     selected: Option<&PanelRowKey>,
     width: u16,
@@ -616,7 +616,7 @@ pub(super) fn section_rows(
     )));
     for index in visible {
         if let Some(entry) = list.entries.get(index) {
-            let key = PanelRowKey::Pod(entry.name.clone());
+            let key = PanelRowKey::Worker(entry.name.clone());
             let selected = selected == Some(&key);
             rows.push(PanelListRow::selectable(
                 row_line(entry, selected, width),
@@ -627,7 +627,7 @@ pub(super) fn section_rows(
     rows
 }
 
-pub(super) fn row_line(entry: &PodListEntry, selected: bool, width: u16) -> Line<'static> {
+pub(super) fn row_line(entry: &WorkerListEntry, selected: bool, width: u16) -> Line<'static> {
     let marker = if selected { "▶ " } else { "  " };
     let name_style = if selected {
         Style::default()

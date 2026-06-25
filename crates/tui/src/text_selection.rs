@@ -1,4 +1,4 @@
-//! Local, non-persistent text selection state for the single-Pod transcript view.
+//! Local, non-persistent text selection state for the single-Worker transcript view.
 //!
 //! This module deliberately stores only the most recent rendered history rows and
 //! the active drag endpoints. Selected/copied text never leaves TUI-local state

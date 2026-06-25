@@ -9,10 +9,10 @@ use session_store::SegmentId;
 /// Errors raised by the mutating pod-registry operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ScopeLockError {
-    #[error("I/O error on pods.json: {0}")]
+    #[error("I/O error on workers.json: {0}")]
     Io(#[from] io::Error),
     #[error("pod name `{0}` is already registered")]
-    DuplicatePodName(String),
+    DuplicateWorkerName(String),
     #[error("requested scope `{}` conflicts with pod `{competitor}` rule `{}`", .rule.target.display(), .competitor_rule.target.display())]
     WriteConflict {
         competitor: String,
@@ -27,14 +27,14 @@ pub enum ScopeLockError {
     #[error("invalid delegation scope: {source}")]
     InvalidScope { source: ScopeError },
     #[error("pod `{0}` is not registered")]
-    UnknownPod(String),
+    UnknownWorker(String),
     #[error(
-        "session {segment_id} is already held by pod `{pod_name}` at {}",
+        "session {segment_id} is already held by pod `{worker_name}` at {}",
         .socket.display()
     )]
     SegmentConflict {
         segment_id: SegmentId,
-        pod_name: String,
+        worker_name: String,
         socket: PathBuf,
     },
 }

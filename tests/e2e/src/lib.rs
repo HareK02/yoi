@@ -357,7 +357,7 @@ impl ExpectedPanelTicketRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpectedDashboardContent {
     pub tickets: Vec<ExpectedPanelTicketRow>,
-    pub pod_names: Vec<String>,
+    pub worker_names: Vec<String>,
     pub companion_status: String,
     pub orchestrator_status: String,
 }
@@ -366,7 +366,7 @@ impl ExpectedDashboardContent {
     pub fn snapshot(&self) -> DashboardContentSnapshot {
         DashboardContentSnapshot {
             tickets: self.tickets.clone(),
-            pod_names: self.pod_names.clone(),
+            worker_names: self.worker_names.clone(),
             companion_status: self.companion_status.clone(),
             orchestrator_status: self.orchestrator_status.clone(),
         }
@@ -379,9 +379,9 @@ impl ExpectedDashboardContent {
             .map(ExpectedPanelTicketRow::description)
             .collect::<Vec<_>>()
             .join(", ");
-        let pods = self.pod_names.join(", ");
+        let workers = self.worker_names.join(", ");
         format!(
-            "tickets=[{tickets}] pods=[{pods}] companion={} orchestrator={}",
+            "tickets=[{tickets}] workers=[{workers}] companion={} orchestrator={}",
             self.companion_status, self.orchestrator_status
         )
     }
@@ -390,7 +390,7 @@ impl ExpectedDashboardContent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DashboardContentSnapshot {
     pub tickets: Vec<ExpectedPanelTicketRow>,
-    pub pod_names: Vec<String>,
+    pub worker_names: Vec<String>,
     pub companion_status: String,
     pub orchestrator_status: String,
 }
@@ -418,13 +418,13 @@ pub struct DashboardHeader {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardCompanionState {
-    pub pod_name: String,
+    pub worker_name: String,
     pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardOrchestratorState {
-    pub pod_name: String,
+    pub worker_name: String,
     pub status: String,
     pub detail: Option<String>,
 }
@@ -434,7 +434,7 @@ pub struct DashboardContentCategories {
     pub ticket_rows: usize,
     pub ready_ticket_rows: usize,
     pub planning_ticket_rows: usize,
-    pub pod_rows: usize,
+    pub worker_rows: usize,
     pub actionable_rows: usize,
 }
 
@@ -457,14 +457,14 @@ impl DashboardContentReady {
                 .filter(|ticket| self.snapshot.rows.iter().any(|row| ticket.matches(row)))
                 .cloned()
                 .collect(),
-            pod_names: expected
-                .pod_names
+            worker_names: expected
+                .worker_names
                 .iter()
-                .filter(|pod_name| {
+                .filter(|worker_name| {
                     self.snapshot
                         .rows
                         .iter()
-                        .any(|row| row.key.kind == "pod" && row.key.id == pod_name.as_str())
+                        .any(|row| row.key.kind == "worker" && row.key.id == worker_name.as_str())
                 })
                 .cloned()
                 .collect(),
@@ -491,7 +491,7 @@ pub struct DashboardSourceBreakdown {
     pub total_elapsed_ms: u128,
     pub sources: Vec<DashboardSourceTiming>,
     pub ticket_rows: usize,
-    pub pod_rows: usize,
+    pub worker_rows: usize,
     pub diagnostics: usize,
 }
 
@@ -870,7 +870,7 @@ impl PanelHarness {
 
     /// Waits for the dashboard-content-ready observer event. Unlike first-frame
     /// or row-count readiness, this requires representative user-visible content:
-    /// ready + planning Ticket rows and a Pod row, then checks the fixture-specific
+    /// ready + planning Ticket rows and a Worker row, then checks the fixture-specific
     /// rows as a small snapshot of the expected dashboard content.
     pub fn wait_for_dashboard_content_ready(
         &mut self,
@@ -1442,7 +1442,7 @@ impl FixtureWorkspace {
                 self.ready_overlay_ticket_row(),
                 self.planning_fixture_ticket_row(),
             ],
-            pod_names: vec!["workspace".to_string()],
+            worker_names: vec!["workspace".to_string()],
             companion_status: "spawned".to_string(),
             orchestrator_status: "unavailable".to_string(),
         }
@@ -1538,7 +1538,7 @@ impl FixtureWorkspace {
         config.command_args = vec![
             "--workspace".to_string(),
             self.workspace.display().to_string(),
-            "--pod".to_string(),
+            "--worker".to_string(),
             "e2e-rewind".to_string(),
         ];
         config.artifacts_dir = self.artifacts_dir.join("rewind");
@@ -1997,8 +1997,8 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_blocking_pod_metadata(data_home: &Path, pod_name: &str) -> Result<()> {
-    let dir = data_home.join("yoi").join("pods").join(pod_name);
+fn write_blocking_pod_metadata(data_home: &Path, worker_name: &str) -> Result<()> {
+    let dir = data_home.join("yoi").join("pods").join(worker_name);
     fs::create_dir_all(&dir)?;
     fs::write(dir.join("metadata.json"), b"not valid metadata for e2e\n")?;
     Ok(())

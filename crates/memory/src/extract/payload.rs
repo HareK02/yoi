@@ -1,6 +1,6 @@
 //! extract 抽出の出力 schema。
 //!
-//! LLM は [`ExtractedPayload`] そのもの（source 抜き）を返し、Pod 側
+//! LLM は [`ExtractedPayload`] そのもの（source 抜き）を返し、Worker 側
 //! ラッパーが [`StagingRecord`] に組み立てて staging へ書き出す。
 //! source は機械付与する契約 (`docs/plan/memory.md` §Extract)。
 
@@ -78,7 +78,7 @@ pub struct RequestEntry {
 
 /// staging に書き出される 1 ファイル分のレコード。
 ///
-/// `source` は Pod 側ラッパーが segment_id と log entry range を
+/// `source` は Worker 側ラッパーが segment_id と log entry range を
 /// 機械付与する。LLM はこのフィールドを見ない / 推論しない。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StagingRecord {

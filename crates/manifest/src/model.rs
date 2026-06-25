@@ -1,6 +1,6 @@
 //! LLM モデル宣言型
 //!
-//! Pod マニフェストの `[model]` セクションで記述する型。`ref`（プロバイダ
+//! Worker マニフェストの `[model]` セクションで記述する型。`ref`（プロバイダ
 //! とモデルを両方指し示す短縮形）と inline 指定（`scheme` / `model_id`
 //! 直書き）の両方を受け入れるため、すべてのフィールドを `Option` として
 //! 持つ 1 つの型 [`ModelManifest`] に統合している。実解決（ref をプロバイダ
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 // マニフェストで任意に override できるよう型だけ再エクスポートする。
 pub use llm_engine::llm_client::capability::{ModelCapability, ReasoningControl, ReasoningEffort};
 
-/// Pod マニフェストの `[model]` セクション。
+/// Worker マニフェストの `[model]` セクション。
 ///
 /// - ref だけ書く: `[model] ref = "anthropic/claude-sonnet-4-6"`
 /// - ref + 一部 override: ref で基底を引き、`auth` 等だけ書き換え

@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use protocol::{
     AlertLevel, AlertSource, CompletionEntry, CompletionKind, ErrorCode, Event, InFlightBlock,
-    InFlightSnapshot, InFlightToolCallState, Method, PodStatus, RewindTarget, RunResult, Segment,
+    InFlightSnapshot, InFlightToolCallState, Method, RewindTarget, RunResult, Segment,
+    WorkerStatus,
 };
 
 use crate::block::{
@@ -40,7 +41,7 @@ pub struct CompletionState {
     pub prefix_start: usize,
     /// Text typed after the sigil (sigil itself excluded).
     pub prefix: String,
-    /// Latest candidate set returned by the Pod for `(kind, prefix)`.
+    /// Latest candidate set returned by the Worker for `(kind, prefix)`.
     /// Initially empty until `Event::Completions` lands.
     pub entries: Vec<CompletionEntry>,
     pub selected: usize,
@@ -71,7 +72,7 @@ pub struct RewindPickerState {
     pub selected: usize,
     pub scroll: RewindPickerScroll,
     /// True after Enter submitted an authoritative `RewindTo` and before the
-    /// Pod replies with either `RewindApplied` or `Error`. While set, the
+    /// Worker replies with either `RewindApplied` or `Error`. While set, the
     /// picker remains visible but further submits/navigation are ignored so a
     /// destructive rewind cannot be queued multiple times by key repeat.
     pub applying: bool,
@@ -227,14 +228,14 @@ impl ActionbarNotice {
 }
 
 pub struct App {
-    pub pod_name: String,
+    pub worker_name: String,
     pub connected: bool,
-    /// Last controller status reported by the Pod. Drives the status line
+    /// Last controller status reported by the Worker. Drives the status line
     /// and Ctrl-key routing; do not infer this solely from replayed history.
-    pub pod_status: PodStatus,
-    /// True while the Pod is in `PodStatus::Running`.
+    pub worker_status: WorkerStatus,
+    /// True while the Worker is in `WorkerStatus::Running`.
     pub running: bool,
-    /// True while the Pod is in `PodStatus::Paused`.
+    /// True while the Worker is in `WorkerStatus::Paused`.
     pub paused: bool,
     pub run_requests: usize,
     /// Sum of `input_tokens - cache_read_input_tokens` across the
@@ -243,7 +244,7 @@ pub struct App {
     /// cache reads excluded). Reset on `RunEnd`.
     pub run_upload_tokens: u64,
     pub run_output_tokens: u64,
-    /// Latest session context tokens reported by the Pod. This is the raw
+    /// Latest session context tokens reported by the Worker. This is the raw
     /// `input_tokens` value and is independent from per-run upload totals.
     pub session_context_tokens: u64,
     pub context_window: u64,
@@ -264,9 +265,9 @@ pub struct App {
     pub command_registry: CommandRegistry,
     command_completion_selected: Option<usize>,
     pub quit: bool,
-    /// 2-tap guard for `Ctrl-C` when the Pod is not running. First press
+    /// 2-tap guard for `Ctrl-C` when the Worker is not running. First press
     /// records the instant; a second press within the timeout exits the
-    /// TUI (the Pod itself stays alive).
+    /// TUI (the Worker itself stays alive).
     pub quit_confirm: Option<std::time::Instant>,
     /// Full display history in render order.
     pub blocks: Vec<Block>,
@@ -284,18 +285,18 @@ pub struct App {
     pub rewind_picker: Option<RewindPickerState>,
     rewind_request_pending: bool,
     /// After a successful rewind restore, ignore any queued live-update events
-    /// until the authoritative Pod status/snapshot catches up. This prevents
+    /// until the authoritative Worker status/snapshot catches up. This prevents
     /// old stream tail events that were already in transit from re-polluting the
     /// just-restored display.
     rewind_refresh_fence: bool,
     greeting: Option<protocol::Greeting>,
-    /// In-TUI mirror of the Pod's session task store, reconstructed
+    /// In-TUI mirror of the Worker's session task store, reconstructed
     /// directly from observed `TaskCreate` / `TaskUpdate` tool calls and
     /// `[Session TaskStore snapshot]` system messages — no protocol
-    /// surface added on the Pod side.
+    /// surface added on the Worker side.
     pub task_store: TaskStore,
-    /// Transient single-Pod transcript text selection. This is viewport-local
-    /// UI state only; it is never sent to the Pod, persisted, or appended to
+    /// Transient single-Worker transcript text selection. This is viewport-local
+    /// UI state only; it is never sent to the Worker, persisted, or appended to
     /// session history/model context.
     pub text_selection: TextSelectionState,
     /// Whether the right-side task pane is currently open.
@@ -303,14 +304,14 @@ pub struct App {
     /// Top entry index of the task pane's visible window. Clamped on
     /// render so it never points past the end of the list.
     pub task_pane_scroll: usize,
-    /// TUI-local FIFO of user inputs submitted while the Pod is already running.
-    /// Entries have not been sent to the Pod yet, so they remain editable/cancellable locally.
+    /// TUI-local FIFO of user inputs submitted while the Worker is already running.
+    /// Entries have not been sent to the Worker yet, so they remain editable/cancellable locally.
     queued_inputs: VecDeque<QueuedInput>,
     /// TUI-local readline-style composer input history. This is intentionally
     /// client-side only: recalled entries are plain drafts until submitted again.
     input_history: ComposerInputHistory,
     /// User-data backed persistence for composer recall entries. The saved
-    /// contents are private input drafts and must not be logged or sent to Pod.
+    /// contents are private input drafts and must not be logged or sent to Worker.
     input_history_store: Option<ComposerHistoryStore>,
     /// Local submit state kept until the accepted run either completes
     /// normally or reports that the empty assistant turn was rolled back.
@@ -321,11 +322,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(pod_name: String) -> Self {
+    pub fn new(worker_name: String) -> Self {
         Self {
-            pod_name,
+            worker_name,
             connected: false,
-            pod_status: PodStatus::Idle,
+            worker_status: WorkerStatus::Idle,
             running: false,
             paused: false,
             run_requests: 0,
@@ -367,8 +368,8 @@ impl App {
         }
     }
 
-    pub fn new_with_persistent_input_history(pod_name: String, workspace_root: &Path) -> Self {
-        let mut app = Self::new(pod_name);
+    pub fn new_with_persistent_input_history(worker_name: String, workspace_root: &Path) -> Self {
+        let mut app = Self::new(worker_name);
         match ComposerHistoryStore::default_for_workspace(workspace_root) {
             Ok(Some(store)) => {
                 match store.load() {
@@ -407,8 +408,8 @@ impl App {
     }
 
     #[cfg(test)]
-    fn new_with_input_history_store(pod_name: String, store: ComposerHistoryStore) -> Self {
-        let mut app = Self::new(pod_name);
+    fn new_with_input_history_store(worker_name: String, store: ComposerHistoryStore) -> Self {
+        let mut app = Self::new(worker_name);
         match store.load() {
             Ok(entries) => {
                 app.input_history = ComposerInputHistory::with_entries(entries);
@@ -442,10 +443,10 @@ impl App {
         self.task_pane_scroll = self.task_pane_scroll.saturating_add(n);
     }
 
-    pub fn set_pod_status(&mut self, status: PodStatus) {
-        self.pod_status = status;
-        self.running = status == PodStatus::Running;
-        self.paused = status == PodStatus::Paused;
+    pub fn set_worker_status(&mut self, status: WorkerStatus) {
+        self.worker_status = status;
+        self.running = status == WorkerStatus::Running;
+        self.paused = status == WorkerStatus::Paused;
         if self.running {
             self.quit_confirm = None;
         }
@@ -639,7 +640,7 @@ impl App {
     pub fn submit_input(&mut self) -> Option<Method> {
         let segments = self.input.submit_segments();
         if segments_are_blank(&segments) {
-            // Empty Enter only does something meaningful when the Pod
+            // Empty Enter only does something meaningful when the Worker
             // is paused: resume the interrupted turn. Otherwise no-op.
             if self.paused {
                 self.input_history.cancel_browse();
@@ -660,7 +661,7 @@ impl App {
     }
 
     fn method_for_run(&mut self, segments: Vec<Segment>) -> Method {
-        // TurnHeader / UserMessage blocks are pushed only after the Pod
+        // TurnHeader / UserMessage blocks are pushed only after the Worker
         // emits `Event::UserMessage` from a committed `LogEntry::UserInput`.
         // Locally we only clear the input buffer and forward the method,
         // while remembering enough local state to undo the visible submit if
@@ -812,7 +813,7 @@ impl App {
     pub fn push_error(&mut self, message: impl Into<String>) {
         self.blocks.push(Block::Alert {
             level: AlertLevel::Error,
-            source: AlertSource::Pod,
+            source: AlertSource::Worker,
             message: message.into(),
         });
     }
@@ -856,7 +857,7 @@ impl App {
                         self.blocks.push(Block::TurnHeader {
                             turn: self.turn_index,
                         });
-                        // Pod attaches the original `Vec<Segment>` to user
+                        // Worker attaches the original `Vec<Segment>` to user
                         // messages from live submissions, so we can rebuild
                         // typed atoms (paste chips, refs) here. Seed history
                         // loaded post-compaction has no `segments` field —
@@ -971,7 +972,7 @@ impl App {
         }
     }
 
-    pub fn handle_pod_event(&mut self, event: Event) -> Option<Method> {
+    pub fn handle_worker_event(&mut self, event: Event) -> Option<Method> {
         if self.rewind_refresh_fence && event_is_stale_after_rewind(&event) {
             return None;
         }
@@ -995,7 +996,7 @@ impl App {
                 self.assistant_streaming = false;
             }
             Event::TurnStart { .. } => {
-                self.set_pod_status(PodStatus::Running);
+                self.set_worker_status(WorkerStatus::Running);
                 self.run_requests += 1;
                 self.current_tool = None;
                 self.latest_llm_wait_event = None;
@@ -1175,7 +1176,7 @@ impl App {
                     };
                     self.blocks.push(Block::Alert {
                         level,
-                        source: AlertSource::Pod,
+                        source: AlertSource::Worker,
                         message: format!("orphan tool result ({id}): {summary}"),
                     });
                 }
@@ -1211,9 +1212,9 @@ impl App {
                     });
                     self.pending_submit_rollback = None;
                     self.reset_run_state(match result {
-                        RunResult::Paused => PodStatus::Paused,
+                        RunResult::Paused => WorkerStatus::Paused,
                         RunResult::Finished | RunResult::LimitReached | RunResult::RolledBack => {
-                            PodStatus::Idle
+                            WorkerStatus::Idle
                         }
                     });
                     if matches!(result, RunResult::Finished | RunResult::LimitReached) {
@@ -1283,11 +1284,11 @@ impl App {
             } => {
                 self.rewind_refresh_fence = false;
                 self.restore_snapshot(&entries, greeting, in_flight);
-                self.set_pod_status(status);
+                self.set_worker_status(status);
             }
             Event::Status { status } => {
                 self.rewind_refresh_fence = false;
-                self.set_pod_status(status);
+                self.set_worker_status(status);
             }
             Event::Completions { kind, entries } => {
                 // Apply only if the popup is still on the same
@@ -1324,7 +1325,7 @@ impl App {
                 };
                 self.completion = None;
                 self.close_rewind_picker();
-                self.reset_run_state(self.pod_status);
+                self.reset_run_state(self.worker_status);
                 let mut message = if restored_composer {
                     format!(
                         "Rewound session: discarded {} log entries; restored selected input to composer.",
@@ -1343,20 +1344,20 @@ impl App {
                 }
                 self.blocks.push(Block::Alert {
                     level: AlertLevel::Warn,
-                    source: AlertSource::Pod,
+                    source: AlertSource::Worker,
                     message,
                 });
             }
-            Event::PodsListed { .. } | Event::PodRestored { .. } => {}
+            Event::WorkersListed { .. } | Event::WorkerRestored { .. } => {}
             Event::PeerRegistered { result } => {
                 let source = result
                     .get("source")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("this Pod");
+                    .unwrap_or("this Worker");
                 let peer = result
                     .get("peer")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("peer Pod");
+                    .unwrap_or("peer Worker");
                 self.flash_actionbar_notice(
                     format!("Peer metadata registered: `{source}` ↔ `{peer}`"),
                     ActionbarNoticeLevel::Info,
@@ -1372,8 +1373,8 @@ impl App {
         None
     }
 
-    fn reset_run_state(&mut self, status: PodStatus) {
-        self.set_pod_status(status);
+    fn reset_run_state(&mut self, status: WorkerStatus) {
+        self.set_worker_status(status);
         self.run_requests = 0;
         self.run_upload_tokens = 0;
         self.run_output_tokens = 0;
@@ -1403,10 +1404,10 @@ impl App {
             "Rolled back empty assistant turn; no local submitted input was available to restore."
                 .to_owned()
         };
-        self.reset_run_state(PodStatus::Idle);
+        self.reset_run_state(WorkerStatus::Idle);
         self.blocks.push(Block::Alert {
             level: AlertLevel::Warn,
-            source: AlertSource::Pod,
+            source: AlertSource::Worker,
             message: hint,
         });
     }
@@ -1706,15 +1707,17 @@ impl App {
 
     pub fn request_rewind_picker(&mut self) -> Option<Method> {
         if self.rewind_submit_pending() {
-            self.push_command_diagnostic("rewind is already applying; wait for the Pod response");
+            self.push_command_diagnostic(
+                "rewind is already applying; wait for the Worker response",
+            );
             return None;
         }
         if !self.connected {
-            self.push_command_diagnostic("cannot rewind before the Pod is connected");
+            self.push_command_diagnostic("cannot rewind before the Worker is connected");
             return None;
         }
         if self.running {
-            self.push_command_diagnostic("cannot rewind while the Pod is running");
+            self.push_command_diagnostic("cannot rewind while the Worker is running");
             return None;
         }
         self.completion = None;
@@ -1731,7 +1734,7 @@ impl App {
     pub fn cancel_rewind_picker(&mut self) {
         if self.rewind_submit_pending() {
             self.flash_actionbar_notice(
-                "Rewind is applying; wait for the Pod response.",
+                "Rewind is applying; wait for the Worker response.",
                 ActionbarNoticeLevel::Warn,
                 ActionbarNoticeSource::Tui,
                 Duration::from_secs(3),
@@ -1764,12 +1767,14 @@ impl App {
 
     pub fn submit_rewind_picker(&mut self) -> Option<Method> {
         if self.rewind_submit_pending() {
-            self.push_command_diagnostic("rewind is already applying; wait for the Pod response");
+            self.push_command_diagnostic(
+                "rewind is already applying; wait for the Worker response",
+            );
             return None;
         }
         if self.paused {
             self.push_command_diagnostic(
-                "cannot apply rewind while the Pod is paused; resume or wait for idle first",
+                "cannot apply rewind while the Worker is paused; resume or wait for idle first",
             );
             return None;
         }
@@ -1783,7 +1788,9 @@ impl App {
             return None;
         };
         if picker.applying {
-            self.push_command_diagnostic("rewind is already applying; wait for the Pod response");
+            self.push_command_diagnostic(
+                "rewind is already applying; wait for the Worker response",
+            );
             return None;
         }
         let (target_id, expected_head_entries) = match picker.selected_target() {
@@ -1849,7 +1856,7 @@ impl App {
     fn push_command_diagnostic(&mut self, message: impl Into<String>) {
         self.blocks.push(Block::Alert {
             level: AlertLevel::Warn,
-            source: AlertSource::Pod,
+            source: AlertSource::Worker,
             message: format!("TUI command: {}", message.into()),
         });
     }
@@ -1971,7 +1978,7 @@ impl App {
         self.apply_in_flight_snapshot(in_flight);
     }
 
-    /// Restore after a successful destructive rewind. The Pod's
+    /// Restore after a successful destructive rewind. The Worker's
     /// `RewindApplied` event already contains the authoritative post-rewind
     /// session tail; always clear/replay from it even if this TUI instance has
     /// somehow lost connect-time greeting metadata. Skipping the restore in
@@ -1993,7 +2000,7 @@ impl App {
         if missing_greeting {
             self.blocks.push(Block::Alert {
                 level: AlertLevel::Warn,
-                source: AlertSource::Pod,
+                source: AlertSource::Worker,
                 message: "Rewind applied, but greeting metadata was unavailable; restored the session tail without the header.".to_owned(),
             });
         }
@@ -2023,7 +2030,7 @@ impl App {
 
     /// Drop the derived view in preparation for replaying a new
     /// `SegmentStart` (compaction / fork). Greeting is preserved
-    /// because the Pod identity hasn't changed.
+    /// because the Worker identity hasn't changed.
     fn reset_for_rotation(&mut self) {
         let greeting = self.blocks.iter().find_map(|b| match b {
             Block::Greeting(g) => Some(g.clone()),
@@ -2084,7 +2091,7 @@ impl App {
     ///
     /// Kind-based routing replaces the old free-text `[Notification]` /
     /// `[File: …]` parsing path: each kind maps directly to a typed
-    /// block (`Block::Notify`, `Block::PodEvent`, …).
+    /// block (`Block::Notify`, `Block::WorkerEvent`, …).
     fn apply_system_item(&mut self, value: &serde_json::Value) {
         let Ok(item) = serde_json::from_value::<session_store::SystemItem>(value.clone()) else {
             // Unknown / forward-compat shape: fall back to rendering the
@@ -2101,8 +2108,8 @@ impl App {
             session_store::SystemItem::Notification { message, .. } => {
                 self.blocks.push(Block::Notify { message });
             }
-            session_store::SystemItem::PodEvent { event, .. } => {
-                self.blocks.push(Block::PodEvent { event });
+            session_store::SystemItem::WorkerEvent { event, .. } => {
+                self.blocks.push(Block::WorkerEvent { event });
             }
             session_store::SystemItem::FileAttachment { body, .. }
             | session_store::SystemItem::Knowledge { body, .. }
@@ -2230,7 +2237,7 @@ fn rollback_input_preview(text: &str) -> String {
 
 pub fn alert_source_label(source: AlertSource) -> &'static str {
     match source {
-        AlertSource::Pod => "pod",
+        AlertSource::Worker => "worker",
         AlertSource::Engine => "engine",
         AlertSource::Compactor => "compactor",
         AlertSource::AgentsMd => "AGENTS.md",
@@ -2244,7 +2251,7 @@ mod llm_wait_event_tests {
     #[test]
     fn llm_retry_updates_and_progress_clears_transient_status() {
         let mut app = App::new("test".into());
-        app.handle_pod_event(Event::LlmRetry {
+        app.handle_worker_event(Event::LlmRetry {
             llm_call: 2,
             failed_attempt: 1,
             max_attempts: 4,
@@ -2258,14 +2265,14 @@ mod llm_wait_event_tests {
             Some("retrying LLM request after HTTP 504 (attempt 2/4 in 1.2s)")
         );
 
-        app.handle_pod_event(Event::TextDelta { text: "ok".into() });
+        app.handle_worker_event(Event::TextDelta { text: "ok".into() });
         assert!(app.latest_llm_wait_event.is_none());
     }
 
     #[test]
     fn llm_continuation_updates_transient_status() {
         let mut app = App::new("test".into());
-        app.handle_pod_event(Event::LlmContinuation {
+        app.handle_worker_event(Event::LlmContinuation {
             llm_call: 3,
             attempt: 1,
             max_attempts: 3,
@@ -2289,7 +2296,7 @@ mod actionbar_notice_tests {
         let duration = Duration::from_secs(2);
 
         app.flash_actionbar_notice_at(
-            "Pod keeps running",
+            "Worker keeps running",
             ActionbarNoticeLevel::Warn,
             ActionbarNoticeSource::Tui,
             now,
@@ -2297,7 +2304,7 @@ mod actionbar_notice_tests {
         );
 
         let notice = app.current_actionbar_notice(now).expect("notice is active");
-        assert_eq!(notice.text, "Pod keeps running");
+        assert_eq!(notice.text, "Worker keeps running");
         assert_eq!(notice.level, ActionbarNoticeLevel::Warn);
         assert_eq!(notice.source, ActionbarNoticeSource::Tui);
         assert_eq!(notice.expires_at, now + duration);
@@ -2325,7 +2332,7 @@ mod rewind_refresh_tests {
             text: "old post-target output".into(),
         });
 
-        app.handle_pod_event(Event::RewindApplied {
+        app.handle_worker_event(Event::RewindApplied {
             entries: vec![],
             input: vec![Segment::text("selected rewind input")],
             summary: summary(3),
@@ -2344,7 +2351,7 @@ mod rewind_refresh_tests {
             text: "old live tail without greeting".into(),
         });
 
-        app.handle_pod_event(Event::RewindApplied {
+        app.handle_worker_event(Event::RewindApplied {
             entries: vec![],
             input: vec![Segment::text("rewound input")],
             summary: summary(1),
@@ -2367,7 +2374,7 @@ mod rewind_refresh_tests {
         assert!(app.rewind_picker.as_ref().unwrap().applying);
         assert!(app.submit_rewind_picker().is_none());
 
-        app.handle_pod_event(Event::Error {
+        app.handle_worker_event(Event::Error {
             code: ErrorCode::InvalidRequest,
             message: "stale rewind target".into(),
         });
@@ -2387,20 +2394,20 @@ mod rewind_refresh_tests {
             text: "old tail before rewind".into(),
         });
 
-        app.handle_pod_event(Event::RewindApplied {
+        app.handle_worker_event(Event::RewindApplied {
             entries: vec![],
             input: vec![Segment::text("rewound input")],
             summary: summary(2),
         });
-        app.handle_pod_event(Event::TextDelta {
+        app.handle_worker_event(Event::TextDelta {
             text: "stale tail after rewind".into(),
         });
         assert!(!blocks_contain(&app, "stale tail after rewind"));
 
-        app.handle_pod_event(Event::Status {
-            status: PodStatus::Idle,
+        app.handle_worker_event(Event::Status {
+            status: WorkerStatus::Idle,
         });
-        app.handle_pod_event(Event::TextDelta {
+        app.handle_worker_event(Event::TextDelta {
             text: "new live tail after status".into(),
         });
         assert!(blocks_contain(&app, "new live tail after status"));
@@ -2431,7 +2438,7 @@ mod rewind_refresh_tests {
 
     fn greeting() -> protocol::Greeting {
         protocol::Greeting {
-            pod_name: "test".into(),
+            worker_name: "test".into(),
             cwd: "/tmp".into(),
             provider: "mock".into(),
             model: "mock".into(),
@@ -2916,7 +2923,7 @@ mod completion_flow_tests {
         }
         let _ = app.refresh_completion();
         // Reply for a different kind shouldn't overwrite state.
-        app.handle_pod_event(Event::Completions {
+        app.handle_worker_event(Event::Completions {
             kind: CompletionKind::Workflow,
             entries: vec![CompletionEntry {
                 value: "stale".into(),
@@ -2939,10 +2946,10 @@ mod completion_flow_tests {
             compacted_from: None,
         };
 
-        app.handle_pod_event(Event::SegmentRotated {
+        app.handle_worker_event(Event::SegmentRotated {
             entry: serde_json::to_value(start).expect("LogEntry is Serialize"),
         });
-        app.handle_pod_event(Event::UserMessage {
+        app.handle_worker_event(Event::UserMessage {
             segments: vec![Segment::text("first persisted message")],
         });
 
@@ -2960,20 +2967,20 @@ mod completion_flow_tests {
         let submitted = submit_text(&mut app, "please wait");
         assert_eq!(input_text(&app), "");
 
-        app.handle_pod_event(Event::UserMessage {
+        app.handle_worker_event(Event::UserMessage {
             segments: submitted,
         });
         // Simulate run-derived attachment display after the submitted user line.
         app.blocks.push(Block::SystemMessage {
             text: "[File: README.md]".into(),
         });
-        app.handle_pod_event(Event::TurnStart { turn: 1 });
-        app.handle_pod_event(Event::Usage {
+        app.handle_worker_event(Event::TurnStart { turn: 1 });
+        app.handle_worker_event(Event::Usage {
             input_tokens: Some(100),
             output_tokens: Some(0),
             cache_read_input_tokens: Some(40),
         });
-        app.handle_pod_event(Event::RunEnd {
+        app.handle_worker_event(Event::RunEnd {
             result: RunResult::RolledBack,
         });
 
@@ -2987,7 +2994,7 @@ mod completion_flow_tests {
                 | Block::TurnStats { .. }
         )));
         assert!(warning_contains(&app, "restored your input"));
-        assert!(matches!(app.pod_status, PodStatus::Idle));
+        assert!(matches!(app.worker_status, WorkerStatus::Idle));
         assert!(!app.running);
         assert!(!app.paused);
         assert_eq!(app.run_requests, 0);
@@ -3000,14 +3007,14 @@ mod completion_flow_tests {
     fn rolled_back_run_does_not_overwrite_existing_unsent_input() {
         let mut app = App::new("test".into());
         let submitted = submit_text(&mut app, "original submit");
-        app.handle_pod_event(Event::UserMessage {
+        app.handle_worker_event(Event::UserMessage {
             segments: submitted,
         });
         for c in "draft while running".chars() {
             app.insert_char(c);
         }
 
-        app.handle_pod_event(Event::RunEnd {
+        app.handle_worker_event(Event::RunEnd {
             result: RunResult::RolledBack,
         });
 
@@ -3028,10 +3035,10 @@ mod completion_flow_tests {
         for result in [RunResult::Paused, RunResult::Finished] {
             let mut app = App::new("test".into());
             let submitted = submit_text(&mut app, "normal run");
-            app.handle_pod_event(Event::UserMessage {
+            app.handle_worker_event(Event::UserMessage {
                 segments: submitted,
             });
-            app.handle_pod_event(Event::RunEnd { result });
+            app.handle_worker_event(Event::RunEnd { result });
 
             assert_eq!(input_text(&app), "");
             assert!(
@@ -3057,7 +3064,7 @@ mod completion_flow_tests {
     #[test]
     fn running_submit_is_queued_locally_and_clears_composer() {
         let mut app = App::new("test".into());
-        app.set_pod_status(PodStatus::Running);
+        app.set_worker_status(WorkerStatus::Running);
         insert_text(&mut app, "queued turn");
 
         assert!(app.submit_input().is_none());
@@ -3070,11 +3077,11 @@ mod completion_flow_tests {
     #[test]
     fn finished_run_auto_sends_next_queued_input() {
         let mut app = App::new("test".into());
-        app.set_pod_status(PodStatus::Running);
+        app.set_worker_status(WorkerStatus::Running);
         insert_text(&mut app, "next turn");
         assert!(app.submit_input().is_none());
 
-        let method = app.handle_pod_event(Event::RunEnd {
+        let method = app.handle_worker_event(Event::RunEnd {
             result: RunResult::Finished,
         });
 
@@ -3090,11 +3097,11 @@ mod completion_flow_tests {
     #[test]
     fn limit_reached_run_auto_sends_next_queued_input() {
         let mut app = App::new("test".into());
-        app.set_pod_status(PodStatus::Running);
+        app.set_worker_status(WorkerStatus::Running);
         insert_text(&mut app, "next after limit");
         assert!(app.submit_input().is_none());
 
-        let method = app.handle_pod_event(Event::RunEnd {
+        let method = app.handle_worker_event(Event::RunEnd {
             result: RunResult::LimitReached,
         });
 
@@ -3111,11 +3118,11 @@ mod completion_flow_tests {
     fn paused_and_rolled_back_run_do_not_auto_send_queue() {
         for result in [RunResult::Paused, RunResult::RolledBack] {
             let mut app = App::new("test".into());
-            app.set_pod_status(PodStatus::Running);
+            app.set_worker_status(WorkerStatus::Running);
             insert_text(&mut app, "held turn");
             assert!(app.submit_input().is_none());
 
-            let method = app.handle_pod_event(Event::RunEnd { result });
+            let method = app.handle_worker_event(Event::RunEnd { result });
 
             assert!(method.is_none());
             assert_eq!(app.queued_input_count(), 1);
@@ -3126,7 +3133,7 @@ mod completion_flow_tests {
     #[test]
     fn paused_empty_submit_still_resumes_immediately() {
         let mut app = App::new("test".into());
-        app.set_pod_status(PodStatus::Paused);
+        app.set_worker_status(WorkerStatus::Paused);
 
         assert!(matches!(app.submit_input(), Some(Method::Resume)));
         assert_eq!(app.queued_input_count(), 0);
@@ -3135,7 +3142,7 @@ mod completion_flow_tests {
     #[test]
     fn queued_input_can_be_restored_to_composer_or_cleared() {
         let mut app = App::new("test".into());
-        app.set_pod_status(PodStatus::Running);
+        app.set_worker_status(WorkerStatus::Running);
         insert_text(&mut app, "edit me");
         assert!(app.submit_input().is_none());
 
@@ -3198,14 +3205,14 @@ mod completion_flow_tests {
             compacted_from: None,
         };
         let session_start_value = serde_json::to_value(&session_start).unwrap();
-        app.handle_pod_event(Event::Snapshot {
+        app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             entries: vec![session_start_value],
-            status: PodStatus::Running,
+            status: WorkerStatus::Running,
             in_flight: Default::default(),
         });
 
-        assert!(matches!(app.pod_status, PodStatus::Running));
+        assert!(matches!(app.worker_status, WorkerStatus::Running));
         assert!(app.running);
         assert!(matches!(
             app.blocks.get(1),
@@ -3216,10 +3223,10 @@ mod completion_flow_tests {
     #[test]
     fn snapshot_in_flight_blocks_continue_with_live_deltas() {
         let mut app = App::new("test".into());
-        app.handle_pod_event(Event::Snapshot {
+        app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             entries: Vec::new(),
-            status: PodStatus::Running,
+            status: WorkerStatus::Running,
             in_flight: InFlightSnapshot {
                 blocks: vec![
                     InFlightBlock::Thinking {
@@ -3240,9 +3247,9 @@ mod completion_flow_tests {
             },
         });
 
-        app.handle_pod_event(Event::TextDelta { text: "lo".into() });
-        app.handle_pod_event(Event::ThinkingDelta { text: "?".into() });
-        app.handle_pod_event(Event::ToolCallArgsDelta {
+        app.handle_worker_event(Event::TextDelta { text: "lo".into() });
+        app.handle_worker_event(Event::ThinkingDelta { text: "?".into() });
+        app.handle_worker_event(Event::ToolCallArgsDelta {
             id: "call_1".into(),
             json: r#"\":\"src/lib.rs\"}"#.into(),
         });
@@ -3269,7 +3276,7 @@ mod completion_flow_tests {
             "slug": "build",
             "body": "[Workflow /build]\nRun the build",
         });
-        app.handle_pod_event(Event::SystemItem { item });
+        app.handle_worker_event(Event::SystemItem { item });
 
         assert!(matches!(
             app.blocks.as_slice(),
@@ -3285,7 +3292,7 @@ mod completion_flow_tests {
             "message": "hi",
             "body": "[Notification] hi",
         });
-        app.handle_pod_event(Event::SystemItem { item });
+        app.handle_worker_event(Event::SystemItem { item });
         assert!(matches!(
             app.blocks.as_slice(),
             [Block::Notify { message }] if message == "hi"
@@ -3293,20 +3300,20 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn live_system_item_pod_event_appends_pod_event_block() {
+    fn live_system_item_worker_event_appends_worker_event_block() {
         let mut app = App::new("test".into());
         let item = serde_json::json!({
-            "kind": "pod_event",
-            "event": { "kind": "turn_ended", "pod_name": "child" },
-            "body": "[Notification] pod `child` finished a turn",
+            "kind": "worker_event",
+            "event": { "kind": "turn_ended", "worker_name": "child" },
+            "body": "[Notification] worker `child` finished a turn",
         });
-        app.handle_pod_event(Event::SystemItem { item });
+        app.handle_worker_event(Event::SystemItem { item });
         assert_eq!(app.blocks.len(), 1);
         match &app.blocks[0] {
-            Block::PodEvent {
-                event: protocol::PodEvent::TurnEnded { pod_name },
-            } => assert_eq!(pod_name, "child"),
-            _ => panic!("expected a PodEvent block"),
+            Block::WorkerEvent {
+                event: protocol::WorkerEvent::TurnEnded { worker_name },
+            } => assert_eq!(worker_name, "child"),
+            _ => panic!("expected a WorkerEvent block"),
         }
     }
 
@@ -3315,8 +3322,8 @@ mod completion_flow_tests {
         let mut app = App::new("test".into());
         let id = uuid::Uuid::parse_str("12345678-1234-5678-1234-567812345678").unwrap();
 
-        app.handle_pod_event(Event::CompactStart);
-        app.handle_pod_event(Event::CompactDone { new_segment_id: id });
+        app.handle_worker_event(Event::CompactStart);
+        app.handle_worker_event(Event::CompactDone { new_segment_id: id });
 
         assert_eq!(compact_block_count(&app), 1);
         assert!(matches!(
@@ -3332,8 +3339,8 @@ mod completion_flow_tests {
     fn compact_failed_replaces_live_block() {
         let mut app = App::new("test".into());
 
-        app.handle_pod_event(Event::CompactStart);
-        app.handle_pod_event(Event::CompactFailed {
+        app.handle_worker_event(Event::CompactStart);
+        app.handle_worker_event(Event::CompactFailed {
             error: "provider 429".into(),
         });
 
@@ -3351,8 +3358,8 @@ mod completion_flow_tests {
     fn shutdown_marks_live_compact_incomplete() {
         let mut app = App::new("test".into());
 
-        app.handle_pod_event(Event::CompactStart);
-        app.handle_pod_event(Event::Shutdown);
+        app.handle_worker_event(Event::CompactStart);
+        app.handle_worker_event(Event::Shutdown);
 
         assert!(app.quit);
         assert!(matches!(
@@ -3372,7 +3379,7 @@ mod completion_flow_tests {
 
     fn test_greeting() -> protocol::Greeting {
         protocol::Greeting {
-            pod_name: "test".into(),
+            worker_name: "test".into(),
             cwd: "/tmp".into(),
             provider: "test-provider".into(),
             model: "test-model".into(),
@@ -3390,10 +3397,10 @@ mod completion_flow_tests {
         greeting.context_window = 123_000;
         greeting.context_tokens = 45_000;
 
-        app.handle_pod_event(Event::Snapshot {
+        app.handle_worker_event(Event::Snapshot {
             entries: Vec::new(),
             greeting,
-            status: PodStatus::Idle,
+            status: WorkerStatus::Idle,
             in_flight: Default::default(),
         });
 
@@ -3405,7 +3412,7 @@ mod completion_flow_tests {
     fn usage_updates_session_context_tokens_without_cache_discount() {
         let mut app = App::new("test".into());
 
-        app.handle_pod_event(Event::Usage {
+        app.handle_worker_event(Event::Usage {
             input_tokens: Some(42_000),
             output_tokens: Some(9),
             cache_read_input_tokens: Some(40_000),
@@ -3420,7 +3427,7 @@ mod completion_flow_tests {
     fn memory_worker_event_updates_actionbar_state() {
         let mut app = App::new("test".into());
 
-        app.handle_pod_event(Event::MemoryWorker(protocol::MemoryWorkerEvent {
+        app.handle_worker_event(Event::MemoryWorker(protocol::MemoryWorkerEvent {
             worker: "extract".into(),
             status: "done".into(),
             run_id: "00000000-0000-0000-0000-000000000000".into(),
@@ -3441,7 +3448,7 @@ mod completion_flow_tests {
         let mut app = App::new("test".into());
         app.session_context_tokens = 42_000;
 
-        app.handle_pod_event(Event::CompactDone {
+        app.handle_worker_event(Event::CompactDone {
             new_segment_id: uuid::Uuid::nil(),
         });
 
@@ -3453,8 +3460,8 @@ mod completion_flow_tests {
         let mut app = App::new("test".into());
         app.session_context_tokens = 42_000;
 
-        app.handle_pod_event(Event::TurnStart { turn: 1 });
-        app.handle_pod_event(Event::RunEnd {
+        app.handle_worker_event(Event::TurnStart { turn: 1 });
+        app.handle_worker_event(Event::RunEnd {
             result: RunResult::Finished,
         });
 
@@ -3464,11 +3471,11 @@ mod completion_flow_tests {
     #[test]
     fn live_task_create_updates_task_store() {
         let mut app = App::new("test".into());
-        app.handle_pod_event(Event::ToolCallStart {
+        app.handle_worker_event(Event::ToolCallStart {
             id: "c1".into(),
             name: "TaskCreate".into(),
         });
-        app.handle_pod_event(Event::ToolCallDone {
+        app.handle_worker_event(Event::ToolCallDone {
             id: "c1".into(),
             name: "TaskCreate".into(),
             arguments: r#"{"subject":"impl tasks","description":"do it"}"#.into(),
@@ -3491,11 +3498,11 @@ mod completion_flow_tests {
             } else {
                 "TaskUpdate"
             };
-            app.handle_pod_event(Event::ToolCallStart {
+            app.handle_worker_event(Event::ToolCallStart {
                 id: id.into(),
                 name: name.into(),
             });
-            app.handle_pod_event(Event::ToolCallDone {
+            app.handle_worker_event(Event::ToolCallDone {
                 id: id.into(),
                 name: name.into(),
                 arguments: args.into(),
@@ -3511,11 +3518,11 @@ mod completion_flow_tests {
     fn live_system_snapshot_replaces_task_store() {
         let mut app = App::new("test".into());
         // Stale entry that the snapshot must wipe out.
-        app.handle_pod_event(Event::ToolCallStart {
+        app.handle_worker_event(Event::ToolCallStart {
             id: "c1".into(),
             name: "TaskCreate".into(),
         });
-        app.handle_pod_event(Event::ToolCallDone {
+        app.handle_worker_event(Event::ToolCallDone {
             id: "c1".into(),
             name: "TaskCreate".into(),
             arguments: r#"{"subject":"stale","description":""}"#.into(),
@@ -3528,7 +3535,7 @@ mod completion_flow_tests {
             \"description\": \"d\"\n    }\n  ]\n}\n```\n";
         // Snapshot text injected as a workflow body (kind doesn't matter
         // for task-store parsing, only the text contents do).
-        app.handle_pod_event(Event::SystemItem {
+        app.handle_worker_event(Event::SystemItem {
             item: serde_json::json!({
                 "kind": "workflow",
                 "slug": "task-snapshot",
@@ -3547,11 +3554,11 @@ mod completion_flow_tests {
         let mut app = App::new("test".into());
         // Live tool call before the snapshot lands — restore must wipe
         // this so it doesn't double-count after replay.
-        app.handle_pod_event(Event::ToolCallStart {
+        app.handle_worker_event(Event::ToolCallStart {
             id: "live".into(),
             name: "TaskCreate".into(),
         });
-        app.handle_pod_event(Event::ToolCallDone {
+        app.handle_worker_event(Event::ToolCallDone {
             id: "live".into(),
             name: "TaskCreate".into(),
             arguments: r#"{"subject":"live","description":""}"#.into(),
@@ -3589,10 +3596,10 @@ mod completion_flow_tests {
                 },
             }),
         ];
-        app.handle_pod_event(Event::Snapshot {
+        app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             entries: assistant_item_entries,
-            status: PodStatus::Running,
+            status: WorkerStatus::Running,
             in_flight: Default::default(),
         });
 

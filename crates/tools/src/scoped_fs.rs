@@ -1,7 +1,7 @@
 //! Scope-aware filesystem primitive.
 //!
 //! `ScopedFs` is the write/read gate layered on top of a [`manifest::Scope`]
-//! and a Pod's working directory. The scope decides which paths are
+//! and a Worker's working directory. The scope decides which paths are
 //! readable and writable; the cwd is carried alongside for convenience
 //! (Glob/Grep default their search base to it).
 //!
@@ -27,7 +27,7 @@ struct ScopedFsInner {
 ///
 /// The wrapped [`SharedScope`] is shared with every clone of this
 /// `ScopedFs` and with whoever else holds the same `SharedScope`
-/// handle (typically the owning Pod). Mutations to that `SharedScope`
+/// handle (typically the owning Worker). Mutations to that `SharedScope`
 /// propagate atomically; the next permission check inside any
 /// `ScopedFs` reads the new view.
 #[derive(Debug, Clone)]
@@ -63,7 +63,7 @@ impl ScopedFs {
     /// Create a new [`ScopedFs`] wrapping `scope` and `cwd` in a fresh
     /// [`SharedScope`]. Use [`ScopedFs::with_shared_scope`] when you
     /// need the resulting `ScopedFs` to share scope state with another
-    /// holder of the `SharedScope` (typically the Pod).
+    /// holder of the `SharedScope` (typically the Worker).
     pub fn new(scope: Scope, cwd: PathBuf) -> Self {
         Self::with_shared_scope(SharedScope::new(scope), cwd)
     }
@@ -85,13 +85,13 @@ impl ScopedFs {
     }
 
     /// Shared scope handle backing this `ScopedFs`. Cloning it lets a
-    /// caller (usually the Pod) hold the same view and push updates
+    /// caller (usually the Worker) hold the same view and push updates
     /// that are immediately reflected in subsequent permission checks.
     pub fn shared_scope(&self) -> &SharedScope {
         &self.inner.scope
     }
 
-    /// The Pod's working directory. Glob/Grep default their search base
+    /// The Worker's working directory. Glob/Grep default their search base
     /// to this path when callers omit an explicit `path` parameter.
     pub fn cwd(&self) -> &Path {
         &self.inner.cwd

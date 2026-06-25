@@ -2874,52 +2874,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
-name = "pod"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "async-trait",
- "chrono",
- "clap",
- "client",
- "dotenv",
- "fs4",
- "futures",
- "futures-util",
- "include_dir",
- "libc",
- "llm-engine",
- "manifest",
- "mcp",
- "memory",
- "minijinja",
- "pod-registry",
- "pod-store",
- "protocol",
- "provider",
- "reqwest",
- "schemars",
- "serde",
- "serde_json",
- "session-metrics",
- "session-store",
- "tempfile",
- "thiserror 2.0.18",
- "ticket",
- "tokio",
- "tokio-tungstenite",
- "toml",
- "tools",
- "tracing",
- "tungstenite",
- "uuid",
- "wasmtime",
- "wat",
- "workflow",
- "yoi-plugin-pdk",
-]
-
-[[package]]
 name = "pod-registry"
 version = "0.1.0"
 dependencies = [
@@ -5902,6 +5856,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "worker"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "chrono",
+ "clap",
+ "client",
+ "dotenv",
+ "fs4",
+ "futures",
+ "futures-util",
+ "include_dir",
+ "libc",
+ "llm-engine",
+ "manifest",
+ "mcp",
+ "memory",
+ "minijinja",
+ "pod-registry",
+ "pod-store",
+ "protocol",
+ "provider",
+ "reqwest",
+ "schemars",
+ "serde",
+ "serde_json",
+ "session-metrics",
+ "session-store",
+ "tempfile",
+ "thiserror 2.0.18",
+ "ticket",
+ "tokio",
+ "tokio-tungstenite",
+ "toml",
+ "tools",
+ "tracing",
+ "tungstenite",
+ "uuid",
+ "wasmtime",
+ "wat",
+ "workflow",
+ "yoi-plugin-pdk",
+]
+
+[[package]]
 name = "workflow"
 version = "0.1.0"
 dependencies = [
@@ -5942,7 +5942,6 @@ dependencies = [
  "client",
  "manifest",
  "memory",
- "pod",
  "pod-store",
  "project-record",
  "serde",
@@ -5954,6 +5953,7 @@ dependencies = [
  "ticket",
  "tokio",
  "tui",
+ "worker",
 ]
 
 [[package]]

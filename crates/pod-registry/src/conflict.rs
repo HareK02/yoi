@@ -80,18 +80,18 @@ pub fn is_within_effective_write(lock: &LockFile, parent: &str, rule: &ScopeRule
     !child_conflict
 }
 
-/// The Pod and rule that actually own a conflicting write scope.
+/// The Worker and rule that actually own a conflicting write scope.
 #[derive(Debug, Clone)]
 pub struct ConflictOwner {
-    pub pod_name: String,
+    pub worker_name: String,
     pub rule: ScopeRule,
 }
 
-/// Find the Pod/rule that actually owns a write scope overlapping `rule`.
+/// Find the Worker/rule that actually owns a write scope overlapping `rule`.
 ///
 /// Walks the delegation tree: if an allocation overlaps `rule`, we
 /// descend into its children and return the deepest overlapping node
-/// as the true owner. `exempt` names a Pod whose ownership is
+/// as the true owner. `exempt` names a Worker whose ownership is
 /// permitted (used during delegation: the spawner itself is allowed
 /// to still own the rule's region because it is handing it down).
 pub fn find_conflict_owner(
@@ -115,7 +115,7 @@ pub fn find_conflict_owners(
         .iter()
         .filter(|a| a.delegated_from.is_none())
         .filter_map(|alloc| find_conflict_in_subtree(lock, alloc, rule))
-        .filter(|owner| Some(owner.pod_name.as_str()) != exempt)
+        .filter(|owner| Some(owner.worker_name.as_str()) != exempt)
         .collect()
 }
 
@@ -142,14 +142,14 @@ fn find_conflict_in_subtree(
     for child in lock
         .allocations
         .iter()
-        .filter(|a| a.delegated_from.as_deref() == Some(alloc.pod_name.as_str()))
+        .filter(|a| a.delegated_from.as_deref() == Some(alloc.worker_name.as_str()))
     {
         if let Some(owner) = find_conflict_in_subtree(lock, child, rule) {
             return Some(owner);
         }
     }
     Some(ConflictOwner {
-        pod_name: alloc.pod_name.clone(),
+        worker_name: alloc.worker_name.clone(),
         rule: overlapping_rule.clone(),
     })
 }
@@ -158,7 +158,7 @@ fn find_conflict_in_subtree(
 mod tests {
     use super::*;
     use crate::test_util::*;
-    use crate::{ScopeLockError, delegate_scope, register_pod, register_pod_with_deny};
+    use crate::{ScopeLockError, delegate_scope, register_pod, register_worker_with_deny};
     use tempfile::TempDir;
 
     #[test]
@@ -192,9 +192,9 @@ mod tests {
     #[test]
     fn conflict_detection_descends_to_real_owner() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("pods.json");
+        let path = dir.path().join("workers.json");
         let mut g = open_empty(&path);
-        register_pod(
+        register_worker(
             &mut g,
             "a".into(),
             std::process::id(),
@@ -213,9 +213,9 @@ mod tests {
             &delegation_scope(vec![write_rule("/src", true)]),
         )
         .unwrap();
-        // A different top-level Pod trying to register /src/core/x
+        // A different top-level Worker trying to register /src/core/x
         // should be blamed on B (deepest owner), not A.
-        let err = register_pod(
+        let err = register_worker(
             &mut g,
             "x".into(),
             std::process::id(),
@@ -233,9 +233,9 @@ mod tests {
     #[test]
     fn denied_write_region_is_not_claimed_by_restored_parent() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("pods.json");
+        let path = dir.path().join("workers.json");
         let mut g = open_empty(&path);
-        register_pod_with_deny(
+        register_worker_with_deny(
             &mut g,
             "parent".into(),
             std::process::id(),
@@ -245,7 +245,7 @@ mod tests {
             sid(),
         )
         .unwrap();
-        register_pod(
+        register_worker(
             &mut g,
             "child".into(),
             std::process::id(),
@@ -259,9 +259,9 @@ mod tests {
     #[test]
     fn partial_deny_does_not_hide_parent_conflict() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("pods.json");
+        let path = dir.path().join("workers.json");
         let mut g = open_empty(&path);
-        register_pod_with_deny(
+        register_worker_with_deny(
             &mut g,
             "parent".into(),
             std::process::id(),
@@ -272,7 +272,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = register_pod(
+        let err = register_worker(
             &mut g,
             "other".into(),
             std::process::id(),

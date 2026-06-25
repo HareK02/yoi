@@ -1,9 +1,9 @@
-//! Inline-viewport "spawn Pod and attach" UX.
+//! Inline-viewport "spawn Worker and attach" UX.
 //!
 //! Rendered at the user's current cursor position when `yoi` is invoked
 //! with no positional argument. Discovers `.yoi/profiles.toml` profile
 //! choices plus bundled profiles, defaults to the builtin profile, prompts for
-//! the Pod's name, and on confirmation launches the Pod runtime command as an
+//! the Worker's name, and on confirmation launches the Worker runtime command as an
 //! independent process. Once the process reports its socket via the
 //! `YOI-READY` stderr line, the dialog hands control back so main can
 //! switch the terminal to alternate-screen mode.
@@ -15,7 +15,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use client::{PodRuntimeCommand, SpawnConfig, spawn_pod};
+use client::{SpawnConfig, WorkerRuntimeCommand, spawn_worker};
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
 use manifest::ProfileDiscovery;
 use ratatui::Terminal;
@@ -30,7 +30,7 @@ use session_store::SegmentId;
 const VIEWPORT_LINES: u16 = 6;
 
 pub struct SpawnReady {
-    pub pod_name: String,
+    pub worker_name: String,
     pub socket_path: PathBuf,
 }
 
@@ -71,13 +71,13 @@ impl From<client::SpawnError> for SpawnError {
 type InlineTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
 /// Source session for a resume run. `None` = fresh spawn (current
-/// behaviour); `Some(id)` swaps the dialog into "Resume Pod" mode and
-/// passes `--session <id>` to the spawned Pod runtime child.
+/// behaviour); `Some(id)` swaps the dialog into "Resume Worker" mode and
+/// passes `--session <id>` to the spawned Worker runtime child.
 pub async fn run(
     resume_from: Option<SegmentId>,
-    pod_name: Option<String>,
+    worker_name: Option<String>,
     profile: Option<String>,
-    runtime_command: PodRuntimeCommand,
+    runtime_command: WorkerRuntimeCommand,
 ) -> Result<SpawnOutcome, SpawnError> {
     let defaults = load_spawn_defaults()?;
     let mut profile_choices = if resume_from.is_some() {
@@ -91,7 +91,7 @@ pub async fn run(
         defaults.default_profile_index,
     );
 
-    let selected_name = pod_name.unwrap_or(defaults.default_name);
+    let selected_name = worker_name.unwrap_or(defaults.default_name);
     let immediate = resume_from.is_some() || profile.is_some() && !selected_name.is_empty();
     let mut form = Form {
         cwd: defaults.cwd.clone(),
@@ -145,18 +145,18 @@ pub async fn run(
         )));
     }
 
-    // Phase 2: launch pod and wait for ready line. Drop the cursor
+    // Phase 2: launch worker and wait for ready line. Drop the cursor
     // out of the name field — subsequent frames are passive status
     // updates, not input — so the cursor doesn't end up parked there
     // when the inline terminal is finally dropped.
     form.editing = false;
-    form.message = Some(("starting pod...".to_string(), MessageKind::Progress));
+    form.message = Some(("starting worker...".to_string(), MessageKind::Progress));
     terminal.draw(|f| draw_form(f, &form))?;
 
     match wait_for_ready(&mut terminal, &mut form, &runtime_command).await {
         Ok(ready) => {
             form.message = Some((
-                format!("ready: {}  attaching...", ready.pod_name),
+                format!("ready: {}  attaching...", ready.worker_name),
                 MessageKind::Ok,
             ));
             terminal.draw(|f| draw_form(f, &form))?;
@@ -172,22 +172,22 @@ pub async fn run(
     }
 }
 
-/// Launch a Pod runtime command with `--pod <name>` without opening the name dialog. The child Pod
-/// resolves persisted Pod metadata if present, or creates a fresh same-name Pod
+/// Launch a Worker runtime command with `--worker <name>` without opening the name dialog. The child Worker
+/// resolves persisted Worker metadata if present, or creates a fresh same-name Worker
 /// from the default profile.
-pub async fn run_pod_name(
-    pod_name: String,
-    runtime_command: PodRuntimeCommand,
+pub async fn run_worker_name(
+    worker_name: String,
+    runtime_command: WorkerRuntimeCommand,
 ) -> Result<SpawnOutcome, SpawnError> {
     let defaults = load_spawn_defaults()?;
-    let mut form = form_for_pod_name(pod_name, defaults);
+    let mut form = form_for_worker_name(worker_name, defaults);
     let mut terminal = make_inline_terminal()?;
     terminal.draw(|f| draw_form(f, &form))?;
 
     match wait_for_ready(&mut terminal, &mut form, &runtime_command).await {
         Ok(ready) => {
             form.message = Some((
-                format!("ready: {}  attaching...", ready.pod_name),
+                format!("ready: {}  attaching...", ready.worker_name),
                 MessageKind::Ok,
             ));
             terminal.draw(|f| draw_form(f, &form))?;
@@ -226,7 +226,7 @@ fn load_spawn_defaults() -> Result<SpawnDefaults, SpawnError> {
         .and_then(|s| s.to_str())
         .map(sanitise_default_name)
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "pod".to_string());
+        .unwrap_or_else(|| "worker".to_string());
 
     let (profile_choices, default_profile_index) = profile_choices_for_cwd(&cwd);
 
@@ -290,13 +290,13 @@ fn initial_profile_index(
     choices.len() - 1
 }
 
-fn form_for_pod_name(pod_name: String, defaults: SpawnDefaults) -> Form {
+fn form_for_worker_name(worker_name: String, defaults: SpawnDefaults) -> Form {
     Form {
         cwd: defaults.cwd,
         scope_origin: defaults.scope_origin,
-        name_cursor: pod_name.chars().count(),
-        name: pod_name,
-        message: Some(("resuming pod...".to_string(), MessageKind::Progress)),
+        name_cursor: worker_name.chars().count(),
+        name: worker_name,
+        message: Some(("resuming worker...".to_string(), MessageKind::Progress)),
         editing: false,
         resume_from: None,
         profile_choices: Vec::new(),
@@ -359,7 +359,7 @@ fn poll_event() -> io::Result<Option<Action>> {
 }
 
 fn is_safe_name_char(c: char) -> bool {
-    // Filesystem-safe; pod.name becomes a runtime-dir name.
+    // Filesystem-safe; worker.name becomes a runtime-dir name.
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')
 }
 
@@ -372,23 +372,23 @@ fn sanitise_default_name(s: &str) -> String {
 async fn wait_for_ready(
     terminal: &mut InlineTerminal,
     form: &mut Form,
-    runtime_command: &PodRuntimeCommand,
+    runtime_command: &WorkerRuntimeCommand,
 ) -> Result<SpawnReady, SpawnError> {
     let config = SpawnConfig {
         runtime_command: runtime_command.clone(),
-        pod_name: form.name.clone(),
+        worker_name: form.name.clone(),
         profile: form.selected_profile_selector(),
         workspace_root: form.cwd.clone(),
         cwd: None,
         resume_from: form.resume_from,
     };
-    let ready = spawn_pod(config, |line| {
+    let ready = spawn_worker(config, |line| {
         form.message = Some((line.to_string(), MessageKind::Progress));
         let _ = terminal.draw(|f| draw_form(f, form));
     })
     .await?;
     Ok(SpawnReady {
-        pod_name: ready.pod_name,
+        worker_name: ready.worker_name,
         socket_path: ready.socket_path,
     })
 }
@@ -421,14 +421,14 @@ struct Form {
     /// cursor stays out so it does not collide with the shell prompt
     /// after the inline terminal is dropped.
     editing: bool,
-    /// `Some(id)` flips the dialog into "Resume Pod" mode: the title
+    /// `Some(id)` flips the dialog into "Resume Worker" mode: the title
     /// switches, the source session is shown to the user, and the
-    /// child pod is launched with `--session <id>` so it restores
+    /// child worker is launched with `--session <id>` so it restores
     /// from `id` and appends to the same session log.
     resume_from: Option<SegmentId>,
     /// Optional profile choices passed with `--profile` for
     /// fresh spawns. This is not used for resume/attach flows because those must
-    /// restore Pod state rather than re-evaluate a profile source.
+    /// restore Worker state rather than re-evaluate a profile source.
     profile_choices: Vec<ProfileChoice>,
     profile_index: usize,
 }
@@ -526,8 +526,8 @@ fn draw_form(f: &mut Frame<'_>, form: &Form) {
     .split(area);
 
     let title_text = match form.resume_from {
-        Some(id) => format!("resume pod   session: {}", short_segment(id)),
-        None => "spawn pod".to_string(),
+        Some(id) => format!("resume worker   session: {}", short_segment(id)),
+        None => "spawn worker".to_string(),
     };
     let title = Paragraph::new(Line::from(vec![Span::styled(
         title_text,
@@ -633,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn pod_name_form_restores_or_creates_by_pod_name() {
+    fn worker_name_form_restores_or_creates_by_worker_name() {
         let defaults = SpawnDefaults {
             cwd: PathBuf::from("/work/example"),
             scope_origin: ScopeOrigin::FromProfile,
@@ -641,7 +641,7 @@ mod tests {
             default_profile_index: 0,
             profile_choices: Vec::new(),
         };
-        let f = form_for_pod_name("agent".to_string(), defaults);
+        let f = form_for_worker_name("agent".to_string(), defaults);
 
         assert_eq!(f.name, "agent");
         assert_eq!(f.name_cursor, "agent".chars().count());
@@ -649,7 +649,7 @@ mod tests {
         assert!(!f.editing);
         assert_eq!(
             f.message,
-            Some(("resuming pod...".to_string(), MessageKind::Progress))
+            Some(("resuming worker...".to_string(), MessageKind::Progress))
         );
     }
 

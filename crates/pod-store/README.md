@@ -2,13 +2,13 @@
 
 ## Role
 
-`pod-store` owns current Pod metadata keyed by Pod name.
+`pod-store` is the legacy-named crate that owns current Worker metadata keyed by Worker name.
 
 ## Boundaries
 
 Owns:
 
-- persisted Pod metadata files
+- persisted Worker metadata files
 - current active/pending session pointers
 - resolved manifest snapshots for restoration
 - parent-visible spawned-child metadata
@@ -23,8 +23,8 @@ Does not own:
 
 ## Design notes
 
-Pod metadata is intentionally thin. It should answer current-state questions without duplicating transcripts or becoming a second session log.
+Worker metadata is intentionally thin. It should answer current-state questions without duplicating transcripts or becoming a second session log.
 
 ## See also
 
-- [`../../docs/design/pod-session-state.md`](../../docs/design/pod-session-state.md)
+- [`../../docs/design/worker-session-state.md`](../../docs/design/worker-session-state.md)

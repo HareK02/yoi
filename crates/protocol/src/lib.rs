@@ -20,7 +20,7 @@ fn is_false(value: &bool) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Method (Client → Pod via Unix Socket)
+// Method (Client → Worker via Unix Socket)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,34 +30,34 @@ pub enum Method {
     Run {
         input: Vec<Segment>,
     },
-    /// Human-readable text injected into the target Pod's LLM context
+    /// Human-readable text injected into the target Worker's LLM context
     /// as a non-blocking system message. `auto_run` controls whether an
     /// idle target is kicked into `RunForNotification`; weak notifications
     /// (`auto_run: false`) are only queued for the next turn/resume/run.
-    /// No side effects beyond LLM context; use `PodEvent` for typed
+    /// No side effects beyond LLM context; use `WorkerEvent` for typed
     /// lifecycle reports.
     Notify {
         message: String,
         #[serde(default = "default_true", skip_serializing_if = "is_true")]
         auto_run: bool,
     },
-    /// Typed lifecycle report from a child Pod to its direct parent.
-    PodEvent(PodEvent),
+    /// Typed lifecycle report from a child Worker to its direct parent.
+    WorkerEvent(WorkerEvent),
     Resume,
     Cancel,
     /// Stop the in-flight turn and transition to `Paused`.
     ///
     /// Unlike `Cancel` (which discards and returns to `Idle`), a paused
-    /// Pod can resume the interrupted work via `Resume`, or start a
+    /// Worker can resume the interrupted work via `Resume`, or start a
     /// fresh turn via `Run` (orphan `tool_use` items are closed with a
     /// synthetic tool result before the new user message is appended).
     Pause,
-    /// Request an explicit compaction while the Pod is otherwise idle.
+    /// Request an explicit compaction while the Worker is otherwise idle.
     ///
     /// This is a typed control method: clients must not send `compact` as a
     /// `Method::Run` user message.
     Compact,
-    /// Ask the Pod to list valid rewind targets from its authoritative session log.
+    /// Ask the Worker to list valid rewind targets from its authoritative session log.
     ListRewindTargets,
     /// Truncate the current session back to the selected rewind target and
     /// return the selected user input to the client composer.
@@ -66,7 +66,7 @@ pub enum Method {
         expected_head_entries: usize,
     },
     Shutdown,
-    /// Request a list of completion candidates from the Pod.
+    /// Request a list of completion candidates from the Worker.
     ///
     /// Reply is sent on the same socket as `Event::Completions` (not
     /// broadcast). The IPC server handles this directly and writes
@@ -77,15 +77,15 @@ pub enum Method {
         kind: CompletionKind,
         prefix: String,
     },
-    /// List Pods visible to this Pod from durable Pod state and the spawned-child
-    /// registry. This is not a host-wide Pod universe query.
-    ListPods,
-    /// Restore a visible stopped/restorable Pod, or report that it is already
+    /// List Workers visible to this Worker from durable Worker state and the spawned-child
+    /// registry. This is not a host-wide Worker universe query.
+    ListWorkers,
+    /// Restore a visible stopped/restorable Worker, or report that it is already
     /// live. Missing state and not-visible state are distinct errors.
-    RestorePod {
+    RestoreWorker {
         name: String,
     },
-    /// Register another existing Pod as a reciprocal peer of this Pod.
+    /// Register another existing Worker as a reciprocal peer of this Worker.
     ///
     /// This is metadata/control state only: it does not ask the target's live
     /// controller for consent, and it must not grant delegated scope,
@@ -95,9 +95,9 @@ pub enum Method {
     },
 }
 
-/// Typed lifecycle events sent from a child Pod to its parent.
+/// Typed lifecycle events sent from a child Worker to its parent.
 ///
-/// Delivered as `Method::PodEvent` over the parent's Unix socket. The
+/// Delivered as `Method::WorkerEvent` over the parent's Unix socket. The
 /// parent Controller always applies variant-specific side effects
 /// (registry / pod-registry updates). Agent-visible variants are also
 /// queued into the notification buffer; control-plane-only variants are
@@ -105,39 +105,42 @@ pub enum Method {
 ///
 /// Transport is fire-and-forget; receivers must tolerate out-of-order
 /// delivery (e.g. `TurnEnded` arriving after `ShutDown` for the same
-/// child Pod).
+/// child Worker).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PodEvent {
+pub enum WorkerEvent {
     /// Child finished one turn and is back to IDLE.
-    TurnEnded { pod_name: String },
+    TurnEnded { worker_name: String },
 
     /// Engine execution error occurred inside the child's turn.
     ///
     /// Limited to worker runtime failures (provider / tool errors) —
     /// does not include transient method-rejection responses such as
     /// `AlreadyRunning`.
-    Errored { pod_name: String, message: String },
+    Errored {
+        worker_name: String,
+        message: String,
+    },
 
     /// Child has stopped (controller loop is exiting).
-    ShutDown { pod_name: String },
+    ShutDown { worker_name: String },
 
-    /// Child sub-delegated scope to a grandchild Pod via `SpawnPod`.
+    /// Child sub-delegated scope to a grandchild Worker via `SpawnWorker`.
     ///
     /// Control-plane only: receivers apply registry side effects and
     /// propagate upward, but do not expose this as an agent notification.
     ///
     /// The parent uses this to add the grandchild to its own
-    /// `spawned_pods.json` so it can manage the grandchild directly
+    /// `spawned_workers.json` so it can manage the grandchild directly
     /// even if the intermediate child dies. The parent then re-fires
     /// this event upward (if it has a parent of its own) to maintain
     /// the chain to root.
     ScopeSubDelegated {
-        /// Sub-delegating Pod (= the sender itself).
-        parent_pod: String,
-        /// Name of the grandchild Pod.
-        sub_pod: String,
+        /// Sub-delegating Worker (= the sender itself).
+        parent_worker: String,
+        /// Name of the grandchild Worker.
+        sub_worker: String,
         /// Unix-socket path where the grandchild is reachable.
         sub_socket: PathBuf,
         /// Scope delegated to the grandchild.
@@ -145,7 +148,7 @@ pub enum PodEvent {
     },
 }
 
-impl PodEvent {
+impl WorkerEvent {
     /// Whether this event should become an agent-visible notification/history item.
     ///
     /// Control-plane-only events still travel over the same wire enum and still
@@ -153,10 +156,10 @@ impl PodEvent {
     /// the notification buffer.
     pub fn should_notify_agent(&self) -> bool {
         match self {
-            PodEvent::TurnEnded { .. } | PodEvent::Errored { .. } | PodEvent::ShutDown { .. } => {
-                true
-            }
-            PodEvent::ScopeSubDelegated { .. } => false,
+            WorkerEvent::TurnEnded { .. }
+            | WorkerEvent::Errored { .. }
+            | WorkerEvent::ShutDown { .. } => true,
+            WorkerEvent::ScopeSubDelegated { .. } => false,
         }
     }
 }
@@ -171,11 +174,11 @@ impl PodEvent {
 /// clients (CLI piping, scripts) only need to produce a single
 /// `Segment::Text`; richer clients (TUI / GUI) construct typed atoms
 /// (paste chips, file refs, knowledge refs, workflow invocations) and
-/// send them through directly so the Pod side never has to re-parse a
+/// send them through directly so the Worker side never has to re-parse a
 /// flattened string.
 ///
 /// Forward compat: payloads with unknown `kind` deserialize to
-/// `Segment::Unknown`. Pod treats this the same as known-but-unresolved
+/// `Segment::Unknown`. Worker treats this the same as known-but-unresolved
 /// variants — emits an alert and inserts a `[unknown input segment]`
 /// placeholder into the LLM context so neither user nor LLM is blind to
 /// the dropped intent.
@@ -195,7 +198,7 @@ pub enum Segment {
         lines: u32,
         content: String,
     },
-    /// `@<path>` file-system reference. Pod resolves readable files to
+    /// `@<path>` file-system reference. Worker resolves readable files to
     /// `[File: <path>]` attachments and readable normal directories to shallow
     /// `[Dir: <path>]` listings; the flattened user text keeps the literal
     /// `@<path>` placeholder either way.
@@ -204,7 +207,7 @@ pub enum Segment {
     KnowledgeRef { slug: String },
     /// `/<slug>` Workflow invocation (see `docs/plan/workflow.md`).
     WorkflowInvoke { slug: String },
-    /// Unknown variant from a newer client. Pod treats this as an
+    /// Unknown variant from a newer client. Worker treats this as an
     /// unresolved input — surfaces an alert and inserts a placeholder.
     /// Round-trip is lossy: re-serializing yields `{"kind":"unknown"}`.
     #[serde(other)]
@@ -220,7 +223,7 @@ impl Segment {
     /// Flatten a segment slice into the single string the LLM receives
     /// as a user message. Pure — no I/O, no alerts. Callers that need
     /// to surface user-visible alerts for unresolved refs should do so
-    /// alongside this call (Pod does so at submit time).
+    /// alongside this call (Worker does so at submit time).
     ///
     /// Sigil-prefixed variants (`FileRef` / `KnowledgeRef` / `WorkflowInvoke`)
     /// flatten back to their literal sigil form (`@<path>`, `#<slug>`,
@@ -258,7 +261,7 @@ impl Segment {
 
 impl Method {
     /// Convenience: a `Run` carrying a single `Segment::Text`.
-    /// Used by dumb clients, inter-Pod tools, and tests that only have
+    /// Used by dumb clients, inter-Worker tools, and tests that only have
     /// a string to forward.
     pub fn run_text(s: impl Into<String>) -> Self {
         Self::Run {
@@ -268,7 +271,7 @@ impl Method {
 }
 
 // ---------------------------------------------------------------------------
-// Event (Pod → Client via Unix Socket broadcast)
+// Event (Worker → Client via Unix Socket broadcast)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,8 +294,8 @@ pub enum Event {
     /// One agent-injected system item committed to history.
     ///
     /// Carries the JSON form of `session_store::SystemItem`. Covers
-    /// `Method::Notify` echoes, child-Pod lifecycle events from
-    /// `Method::PodEvent`, `@<path>` / `#<slug>` / `/<slug>`
+    /// `Method::Notify` echoes, child-Worker lifecycle events from
+    /// `Method::WorkerEvent`, `@<path>` / `#<slug>` / `/<slug>`
     /// resolution payloads, and any future agent-side injection kind.
     /// Clients dispatch on the `kind` tag for typed rendering instead
     /// of parsing free-text prefixes like `[Notification] …` or
@@ -309,13 +312,13 @@ pub enum Event {
     /// Marker event for the start of an Invoke range; the range extends
     /// implicitly until the next `InvokeStart`. Fires for every accepted
     /// `Method::Run` (kind=`UserSend`), `Method::Notify` (kind=`Notify`),
-    /// `Method::PodEvent` re-injection (kind=`PodEvent`), and any other
+    /// `Method::WorkerEvent` re-injection (kind=`WorkerEvent`), and any other
     /// IDLE-breaking trigger. Mid-run interrupts (e.g. hook output,
     /// `<system-reminder>` injection that doesn't break IDLE) do not
     /// emit `InvokeStart` — they appear as `SystemItem` only.
     ///
     /// Carries `kind` only; the payload (user text / notify message /
-    /// pod event body) is delivered separately via the immediately
+    /// worker event body) is delivered separately via the immediately
     /// following `UserMessage` / `SystemItem` event.
     InvokeStart {
         kind: InvokeKind,
@@ -453,7 +456,7 @@ pub enum Event {
     /// derived view.
     ///
     /// `greeting` and `status` accompany the snapshot so clients render
-    /// pod identity and current controller state without an extra round
+    /// worker identity and current controller state without an extra round
     /// trip.
     ///
     /// Live updates after the snapshot arrive through the streaming
@@ -465,7 +468,7 @@ pub enum Event {
         entries: Vec<serde_json::Value>,
         greeting: Greeting,
         #[serde(default)]
-        status: PodStatus,
+        status: WorkerStatus,
         /// Unfinished model output that has already streamed in the current
         /// run but is not yet represented by committed snapshot entries.
         #[serde(default, skip_serializing_if = "InFlightSnapshot::is_empty")]
@@ -483,10 +486,10 @@ pub enum Event {
         #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
         entry: serde_json::Value,
     },
-    /// Current Pod controller status. Broadcast on every controller-level
+    /// Current Worker controller status. Broadcast on every controller-level
     /// transition and included in `History` snapshots for late attach.
     Status {
-        status: PodStatus,
+        status: WorkerStatus,
     },
     /// Reply to `Method::ListCompletions`. Delivered only to the
     /// requesting socket (not broadcast). `entries` is empty when no
@@ -510,15 +513,15 @@ pub enum Event {
         input: Vec<Segment>,
         summary: RewindSummary,
     },
-    /// Reply to `Method::ListPods`. Payload is a stable JSON value so the Pod
+    /// Reply to `Method::ListWorkers`. Payload is a stable JSON value so the Worker
     /// crate can evolve discovery fields without introducing a protocol
     /// dependency on session-store.
-    PodsListed {
+    WorkersListed {
         #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
-        pods: serde_json::Value,
+        workers: serde_json::Value,
     },
-    /// Reply to `Method::RestorePod`.
-    PodRestored {
+    /// Reply to `Method::RestoreWorker`.
+    WorkerRestored {
         #[cfg_attr(feature = "typescript", ts(type = "unknown"))]
         result: serde_json::Value,
     },
@@ -533,7 +536,7 @@ pub enum Event {
     /// This is not part of LLM history or prompt context; clients may display it
     /// briefly as operational status.
     MemoryWorker(MemoryWorkerEvent),
-    /// Pod has started compacting the current session.
+    /// Worker has started compacting the current session.
     ///
     /// Fired immediately before a compaction run. Success is signalled by
     /// `CompactDone` (with the new `SegmentId`); failure by `CompactFailed`.
@@ -554,10 +557,10 @@ pub enum Event {
     Shutdown,
 }
 
-/// User-facing alert emitted from the Pod layer.
+/// User-facing alert emitted from the Worker layer.
 ///
 /// This is a separate channel from `tracing` (developer logs): entries
-/// here are assembled explicitly by the Pod when a condition should be
+/// here are assembled explicitly by the Worker when a condition should be
 /// surfaced to the person driving the client. Keep messages short and
 /// human-readable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -596,7 +599,7 @@ pub enum AlertLevel {
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum AlertSource {
-    Pod,
+    Worker,
     Engine,
     Compactor,
     AgentsMd,
@@ -668,7 +671,7 @@ pub struct RewindSummary {
 /// attach while an LLM response is still streaming.
 ///
 /// These blocks are presentation state only: they are reconstructed from the
-/// active Pod controller and must not be treated as committed assistant
+/// active Worker controller and must not be treated as committed assistant
 /// history. Finalized assistant items continue to come from ordinary snapshot
 /// entries.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -723,21 +726,21 @@ impl InFlightToolCallState {
     }
 }
 
-/// Pod self-description rendered by the TUI when a session starts empty.
+/// Worker self-description rendered by the TUI when a session starts empty.
 ///
-/// Built once in the Pod controller from the resolved manifest and
+/// Built once in the Worker controller from the resolved manifest and
 /// transmitted alongside `Event::Snapshot` so clients don't need
 /// their own view of the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct Greeting {
-    pub pod_name: String,
+    pub worker_name: String,
     pub cwd: String,
     pub provider: String,
     pub model: String,
     pub scope_summary: String,
     pub tools: Vec<String>,
-    /// Model context window in tokens. Always filled by the Pod greeting.
+    /// Model context window in tokens. Always filled by the Worker greeting.
     #[serde(default)]
     pub context_window: u64,
     /// Estimated current session context tokens at connect time.
@@ -752,7 +755,7 @@ pub struct Greeting {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
-pub enum PodStatus {
+pub enum WorkerStatus {
     #[default]
     Idle,
     Running,
@@ -771,7 +774,7 @@ pub enum TurnResult {
 ///
 /// One Invoke groups all entries from this trigger up to the next
 /// `Invoke` marker. The kind is the only payload — content (user text,
-/// notify message, pod event body) is delivered by the immediately
+/// notify message, worker event body) is delivered by the immediately
 /// following Turn entry, not by the marker itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -781,8 +784,8 @@ pub enum InvokeKind {
     UserSend,
     /// `Method::Notify` — free-text notification injected into history.
     Notify,
-    /// `Method::PodEvent` — typed lifecycle report from a child Pod.
-    PodEvent,
+    /// `Method::WorkerEvent` — typed lifecycle report from a child Worker.
+    WorkerEvent,
     /// `<system-reminder>` etc. that crosses an IDLE boundary (mid-run
     /// reminders that don't break IDLE are SystemItem-only and do not
     /// open a new Invoke).
@@ -801,8 +804,8 @@ pub enum RunResult {
     Paused,
     LimitReached,
     /// The accepted Method::Run produced no assistant/tool output before
-    /// user interruption, so the Pod rolled the submit-time turn state back
-    /// to its pre-submit snapshot. Clients should treat the Pod as Idle and
+    /// user interruption, so the Worker rolled the submit-time turn state back
+    /// to its pre-submit snapshot. Clients should treat the Worker as Idle and
     /// restore the just-submitted input into the editable composer if desired.
     RolledBack,
 }
@@ -824,7 +827,7 @@ pub enum ErrorCode {
 // Scope rule / permission (wire type)
 //
 // Defined here so that both `manifest` (config parsing) and `protocol`
-// itself (inter-pod messaging such as `PodEvent::ScopeSubDelegated`) can
+// itself (inter-worker messaging such as `WorkerEvent::ScopeSubDelegated`) can
 // reference the same type without introducing a reverse dependency.
 // ---------------------------------------------------------------------------
 
@@ -925,9 +928,9 @@ mod tests {
 
     #[test]
     fn segment_unknown_variant_decodes_as_unknown() {
-        // A future client sends a segment kind this Pod has never heard of.
+        // A future client sends a segment kind this Worker has never heard of.
         // Forward compat requirement: deserialization must succeed and the
-        // unknown payload must surface as `Segment::Unknown` so the Pod
+        // unknown payload must surface as `Segment::Unknown` so the Worker
         // fallback path (placeholder + alert) can fire.
         let json = r#"{"kind":"image_ref","url":"https://example.com/x.png"}"#;
         let seg: Segment = serde_json::from_str(json).unwrap();
@@ -1028,7 +1031,7 @@ mod tests {
         for kind in [
             InvokeKind::UserSend,
             InvokeKind::Notify,
-            InvokeKind::PodEvent,
+            InvokeKind::WorkerEvent,
             InvokeKind::SystemReminder,
             InvokeKind::Wakeup,
         ] {
@@ -1219,7 +1222,7 @@ mod tests {
         let event = Event::Snapshot {
             entries: vec![serde_json::json!({"kind": "user_input", "ts": 1, "segments": []})],
             greeting: Greeting {
-                pod_name: "test".into(),
+                worker_name: "test".into(),
                 cwd: "/tmp".into(),
                 provider: "anthropic".into(),
                 model: "claude".into(),
@@ -1228,7 +1231,7 @@ mod tests {
                 context_window: 200_000,
                 context_tokens: 42_000,
             },
-            status: PodStatus::Paused,
+            status: WorkerStatus::Paused,
             in_flight: InFlightSnapshot::default(),
         };
         let json = serde_json::to_string(&event).unwrap();
@@ -1236,7 +1239,7 @@ mod tests {
         assert_eq!(parsed["event"], "snapshot");
         assert!(parsed["data"]["entries"].is_array());
         assert_eq!(parsed["data"]["entries"][0]["kind"], "user_input");
-        assert_eq!(parsed["data"]["greeting"]["pod_name"], "test");
+        assert_eq!(parsed["data"]["greeting"]["worker_name"], "test");
         assert_eq!(parsed["data"]["greeting"]["tools"][0], "Read");
         assert_eq!(parsed["data"]["greeting"]["context_window"], 200_000);
         assert_eq!(parsed["data"]["greeting"]["context_tokens"], 42_000);
@@ -1245,7 +1248,7 @@ mod tests {
 
     #[test]
     fn event_snapshot_in_flight_roundtrip_and_default() {
-        let inbound = r#"{"event":"snapshot","data":{"entries":[],"greeting":{"pod_name":"test","cwd":"/tmp","provider":"p","model":"m","scope_summary":"s","tools":[]},"status":"running"}}"#;
+        let inbound = r#"{"event":"snapshot","data":{"entries":[],"greeting":{"worker_name":"test","cwd":"/tmp","provider":"p","model":"m","scope_summary":"s","tools":[]},"status":"running"}}"#;
         let decoded: Event = serde_json::from_str(inbound).unwrap();
         match decoded {
             Event::Snapshot { in_flight, .. } => assert!(in_flight.is_empty()),
@@ -1255,7 +1258,7 @@ mod tests {
         let event = Event::Snapshot {
             entries: Vec::new(),
             greeting: Greeting {
-                pod_name: "test".into(),
+                worker_name: "test".into(),
                 cwd: "/tmp".into(),
                 provider: "p".into(),
                 model: "m".into(),
@@ -1264,7 +1267,7 @@ mod tests {
                 context_window: 0,
                 context_tokens: 0,
             },
-            status: PodStatus::Running,
+            status: WorkerStatus::Running,
             in_flight: InFlightSnapshot {
                 blocks: vec![
                     InFlightBlock::Text {
@@ -1334,7 +1337,7 @@ mod tests {
     #[test]
     fn event_status_format() {
         let event = Event::Status {
-            status: PodStatus::Running,
+            status: WorkerStatus::Running,
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1345,20 +1348,20 @@ mod tests {
         assert!(matches!(
             decoded,
             Event::Status {
-                status: PodStatus::Running
+                status: WorkerStatus::Running
             }
         ));
     }
 
     #[test]
     fn event_snapshot_legacy_without_status_defaults_to_idle() {
-        let json = r#"{"event":"snapshot","data":{"entries":[],"greeting":{"pod_name":"test","cwd":"/tmp","provider":"anthropic","model":"claude","scope_summary":"","tools":[]}}}"#;
+        let json = r#"{"event":"snapshot","data":{"entries":[],"greeting":{"worker_name":"test","cwd":"/tmp","provider":"anthropic","model":"claude","scope_summary":"","tools":[]}}}"#;
         let decoded: Event = serde_json::from_str(json).unwrap();
         match decoded {
             Event::Snapshot {
                 status, greeting, ..
             } => {
-                assert_eq!(status, PodStatus::Idle);
+                assert_eq!(status, WorkerStatus::Idle);
                 assert_eq!(greeting.context_window, 0);
                 assert_eq!(greeting.context_tokens, 0);
             }
@@ -1367,34 +1370,37 @@ mod tests {
     }
 
     #[test]
-    fn method_pod_event_turn_ended_roundtrip() {
-        let method = Method::PodEvent(PodEvent::TurnEnded {
-            pod_name: "child".into(),
+    fn method_worker_event_turn_ended_roundtrip() {
+        let method = Method::WorkerEvent(WorkerEvent::TurnEnded {
+            worker_name: "child".into(),
         });
         let json = serde_json::to_string(&method).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["method"], "pod_event");
+        assert_eq!(parsed["method"], "worker_event");
         assert_eq!(parsed["params"]["kind"], "turn_ended");
-        assert_eq!(parsed["params"]["pod_name"], "child");
+        assert_eq!(parsed["params"]["worker_name"], "child");
 
         let decoded: Method = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             decoded,
-            Method::PodEvent(PodEvent::TurnEnded { ref pod_name }) if pod_name == "child"
+            Method::WorkerEvent(WorkerEvent::TurnEnded { ref worker_name }) if worker_name == "child"
         ));
     }
 
     #[test]
-    fn method_pod_event_errored_roundtrip() {
-        let method = Method::PodEvent(PodEvent::Errored {
-            pod_name: "child".into(),
+    fn method_worker_event_errored_roundtrip() {
+        let method = Method::WorkerEvent(WorkerEvent::Errored {
+            worker_name: "child".into(),
             message: "provider 429".into(),
         });
         let json = serde_json::to_string(&method).unwrap();
         let decoded: Method = serde_json::from_str(&json).unwrap();
         match decoded {
-            Method::PodEvent(PodEvent::Errored { pod_name, message }) => {
-                assert_eq!(pod_name, "child");
+            Method::WorkerEvent(WorkerEvent::Errored {
+                worker_name,
+                message,
+            }) => {
+                assert_eq!(worker_name, "child");
                 assert_eq!(message, "provider 429");
             }
             other => panic!("expected Errored, got {other:?}"),
@@ -1402,43 +1408,43 @@ mod tests {
     }
 
     #[test]
-    fn method_pod_event_shutdown_roundtrip() {
-        let method = Method::PodEvent(PodEvent::ShutDown {
-            pod_name: "child".into(),
+    fn method_worker_event_shutdown_roundtrip() {
+        let method = Method::WorkerEvent(WorkerEvent::ShutDown {
+            worker_name: "child".into(),
         });
         let json = serde_json::to_string(&method).unwrap();
         let decoded: Method = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             decoded,
-            Method::PodEvent(PodEvent::ShutDown { ref pod_name }) if pod_name == "child"
+            Method::WorkerEvent(WorkerEvent::ShutDown { ref worker_name }) if worker_name == "child"
         ));
     }
 
     #[test]
-    fn pod_event_agent_notification_classification() {
+    fn worker_event_agent_notification_classification() {
         assert!(
-            PodEvent::TurnEnded {
-                pod_name: "child".into()
+            WorkerEvent::TurnEnded {
+                worker_name: "child".into()
             }
             .should_notify_agent()
         );
         assert!(
-            PodEvent::Errored {
-                pod_name: "child".into(),
+            WorkerEvent::Errored {
+                worker_name: "child".into(),
                 message: "boom".into()
             }
             .should_notify_agent()
         );
         assert!(
-            PodEvent::ShutDown {
-                pod_name: "child".into()
+            WorkerEvent::ShutDown {
+                worker_name: "child".into()
             }
             .should_notify_agent()
         );
         assert!(
-            !PodEvent::ScopeSubDelegated {
-                parent_pod: "child".into(),
-                sub_pod: "grandchild".into(),
+            !WorkerEvent::ScopeSubDelegated {
+                parent_worker: "child".into(),
+                sub_worker: "grandchild".into(),
                 sub_socket: "/tmp/grandchild.sock".into(),
                 scope: vec![],
             }
@@ -1447,10 +1453,10 @@ mod tests {
     }
 
     #[test]
-    fn method_pod_event_scope_sub_delegated_roundtrip() {
-        let method = Method::PodEvent(PodEvent::ScopeSubDelegated {
-            parent_pod: "child".into(),
-            sub_pod: "grandchild".into(),
+    fn method_worker_event_scope_sub_delegated_roundtrip() {
+        let method = Method::WorkerEvent(WorkerEvent::ScopeSubDelegated {
+            parent_worker: "child".into(),
+            sub_worker: "grandchild".into(),
             sub_socket: "/run/yoi/grandchild/sock".into(),
             scope: vec![ScopeRule {
                 target: "/tmp/work".into(),
@@ -1461,14 +1467,14 @@ mod tests {
         let json = serde_json::to_string(&method).unwrap();
         let decoded: Method = serde_json::from_str(&json).unwrap();
         match decoded {
-            Method::PodEvent(PodEvent::ScopeSubDelegated {
-                parent_pod,
-                sub_pod,
+            Method::WorkerEvent(WorkerEvent::ScopeSubDelegated {
+                parent_worker,
+                sub_worker,
                 sub_socket,
                 scope,
             }) => {
-                assert_eq!(parent_pod, "child");
-                assert_eq!(sub_pod, "grandchild");
+                assert_eq!(parent_worker, "child");
+                assert_eq!(sub_worker, "grandchild");
                 assert_eq!(sub_socket, PathBuf::from("/run/yoi/grandchild/sock"));
                 assert_eq!(scope.len(), 1);
                 assert_eq!(scope[0].target, PathBuf::from("/tmp/work"));
@@ -1619,7 +1625,7 @@ mod tests {
     fn event_error_format() {
         let event = Event::Error {
             code: ErrorCode::AlreadyRunning,
-            message: "Pod is already executing a turn".into(),
+            message: "Worker is already executing a turn".into(),
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1652,10 +1658,10 @@ mod tests {
     }
 
     #[test]
-    fn pod_discovery_methods_roundtrip() {
+    fn worker_discovery_methods_roundtrip() {
         let methods = [
-            Method::ListPods,
-            Method::RestorePod {
+            Method::ListWorkers,
+            Method::RestoreWorker {
                 name: "child".into(),
             },
             Method::RegisterPeer {
@@ -1666,8 +1672,8 @@ mod tests {
             let json = serde_json::to_string(&method).unwrap();
             let decoded: Method = serde_json::from_str(&json).unwrap();
             match (decoded, method) {
-                (Method::ListPods, Method::ListPods)
-                | (Method::RestorePod { .. }, Method::RestorePod { .. })
+                (Method::ListWorkers, Method::ListWorkers)
+                | (Method::RestoreWorker { .. }, Method::RestoreWorker { .. })
                 | (Method::RegisterPeer { .. }, Method::RegisterPeer { .. }) => {}
                 (decoded, expected) => panic!("decoded {decoded:?}, expected {expected:?}"),
             }
@@ -1675,12 +1681,12 @@ mod tests {
     }
 
     #[test]
-    fn pod_discovery_events_roundtrip() {
+    fn worker_discovery_events_roundtrip() {
         let events = [
-            Event::PodsListed {
-                pods: serde_json::json!([{ "pod_name": "child" }]),
+            Event::WorkersListed {
+                workers: serde_json::json!([{ "worker_name": "child" }]),
             },
-            Event::PodRestored {
+            Event::WorkerRestored {
                 result: serde_json::json!({ "action": "already_live" }),
             },
             Event::PeerRegistered {
@@ -1691,10 +1697,10 @@ mod tests {
             let json = serde_json::to_string(&event).unwrap();
             let decoded: Event = serde_json::from_str(&json).unwrap();
             match (decoded, event) {
-                (Event::PodsListed { pods }, Event::PodsListed { pods: expected }) => {
-                    assert_eq!(pods, expected)
+                (Event::WorkersListed { workers }, Event::WorkersListed { workers: expected }) => {
+                    assert_eq!(workers, expected)
                 }
-                (Event::PodRestored { result }, Event::PodRestored { result: expected }) => {
+                (Event::WorkerRestored { result }, Event::WorkerRestored { result: expected }) => {
                     assert_eq!(result, expected)
                 }
                 (Event::PeerRegistered { result }, Event::PeerRegistered { result: expected }) => {

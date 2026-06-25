@@ -5,8 +5,8 @@ use ts_rs::{Config, TS};
 use crate::{
     Alert, AlertLevel, AlertSource, CompletionEntry, CompletionKind, ErrorCode, Event, Greeting,
     InFlightBlock, InFlightSnapshot, InFlightToolCallState, InvokeKind, MemoryWorkerEvent, Method,
-    Permission, PodEvent, PodStatus, RewindSummary, RewindTarget, RewindTargetId, RunResult,
-    ScopeRule, Segment, TurnResult,
+    Permission, RewindSummary, RewindTarget, RewindTargetId, RunResult, ScopeRule, Segment,
+    TurnResult, WorkerEvent, WorkerStatus,
 };
 
 const GENERATED_RELATIVE_PATH: &str = "../../web/workspace/src/lib/generated/protocol.ts";
@@ -16,7 +16,7 @@ pub fn generated_typescript_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(GENERATED_RELATIVE_PATH)
 }
 
-/// Render Workspace web TypeScript bindings for the Pod wire protocol DTOs.
+/// Render Workspace web TypeScript bindings for the Worker wire protocol DTOs.
 ///
 /// Rust DTOs in this crate remain the source of truth; this function is used by
 /// both the checked-in artifact generator and the stale-output drift test.
@@ -31,7 +31,7 @@ pub fn generated_protocol_types() -> String {
     push_decl::<AlertLevel>(&cfg, &mut output);
     push_decl::<AlertSource>(&cfg, &mut output);
     push_decl::<CompletionKind>(&cfg, &mut output);
-    push_decl::<PodStatus>(&cfg, &mut output);
+    push_decl::<WorkerStatus>(&cfg, &mut output);
     push_decl::<TurnResult>(&cfg, &mut output);
     push_decl::<InvokeKind>(&cfg, &mut output);
     push_decl::<RunResult>(&cfg, &mut output);
@@ -49,7 +49,7 @@ pub fn generated_protocol_types() -> String {
     push_decl::<Alert>(&cfg, &mut output);
     push_decl::<MemoryWorkerEvent>(&cfg, &mut output);
     push_decl::<Segment>(&cfg, &mut output);
-    push_decl::<PodEvent>(&cfg, &mut output);
+    push_decl::<WorkerEvent>(&cfg, &mut output);
     push_decl::<Method>(&cfg, &mut output);
     push_decl::<Event>(&cfg, &mut output);
 

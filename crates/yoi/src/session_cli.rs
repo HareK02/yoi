@@ -4,10 +4,10 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use manifest::paths;
-use pod_store::{FsPodStore, PodMetadataStore};
+use pod_store::{FsWorkerStore, WorkerMetadataStore};
 use session_store::{FsStore, SessionId, Store};
 
-use crate::pod_cleanup_cli::parse_duration;
+use crate::worker_cleanup_cli::parse_duration;
 
 const MAX_REPORT_ITEMS: usize = 50;
 
@@ -203,7 +203,7 @@ pub fn run_prune_with_roots(
         ));
     }
     let session_store = FsStore::new(data_dir.join("sessions")).map_err(to_error)?;
-    let pod_store = FsPodStore::new(data_dir.join("pods")).map_err(to_error)?;
+    let pod_store = FsWorkerStore::new(data_dir.join("pods")).map_err(to_error)?;
     let referenced_sessions = referenced_sessions(&pod_store)?;
     let cutoff = options
         .older_than
@@ -241,7 +241,7 @@ pub fn run_prune_with_roots(
                 index,
                 "kept",
                 *session_id,
-                "referenced by pod metadata",
+                "referenced by worker metadata",
             );
             continue;
         }
@@ -315,7 +315,7 @@ pub fn run_prune_with_roots(
     })
 }
 
-fn referenced_sessions(pod_store: &FsPodStore) -> Result<BTreeSet<SessionId>, SessionCliError> {
+fn referenced_sessions(pod_store: &FsWorkerStore) -> Result<BTreeSet<SessionId>, SessionCliError> {
     let mut sessions = BTreeSet::new();
     for name in pod_store.list_names().map_err(to_error)? {
         let metadata = pod_store
@@ -323,7 +323,7 @@ fn referenced_sessions(pod_store: &FsPodStore) -> Result<BTreeSet<SessionId>, Se
             .map_err(to_error)?
             .ok_or_else(|| {
                 SessionCliError(format!(
-                    "pod metadata for `{name}` disappeared while checking references"
+                    "worker metadata for `{name}` disappeared while checking references"
                 ))
             })?;
         if let Some(active) = metadata.active {
@@ -352,13 +352,13 @@ fn to_error<E: fmt::Display>(error: E) -> SessionCliError {
 }
 
 pub fn help_text() -> &'static str {
-    "yoi session\n\nUsage:\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi session prune --unreferenced [--older-than <DURATION>] [--force] [--dry-run]\n\nOptions:\n      --json          Emit a machine-readable JSON analytics report\n      --unreferenced  Prune only Sessions not referenced by Pod metadata\n      --older-than    Optional explicit age threshold for unreferenced cleanup (units: s, m, h, d, w)\n      --force         Perform deletion after safety checks\n      --dry-run       Report only, even with --force\n  -h, --help          Print help\n"
+    "yoi session\n\nUsage:\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi session prune --unreferenced [--older-than <DURATION>] [--force] [--dry-run]\n\nOptions:\n      --json          Emit a machine-readable JSON analytics report\n      --unreferenced  Prune only Sessions not referenced by Worker metadata\n      --older-than    Optional explicit age threshold for unreferenced cleanup (units: s, m, h, d, w)\n      --force         Perform deletion after safety checks\n      --dry-run       Report only, even with --force\n  -h, --help          Print help\n"
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pod_store::{PodActiveSegmentRef, PodMetadata};
+    use pod_store::{WorkerActiveSegmentRef, WorkerMetadata};
     use session_store::{Store, new_segment_id, new_session_id};
     use std::io::Write;
 
@@ -441,7 +441,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         let session_store = FsStore::new(data_dir.join("sessions")).unwrap();
-        let pod_store = FsPodStore::new(data_dir.join("pods")).unwrap();
+        let pod_store = FsWorkerStore::new(data_dir.join("pods")).unwrap();
         let referenced_session = new_session_id();
         let referenced_segment = new_segment_id();
         let orphan_session = new_session_id();
@@ -453,9 +453,9 @@ mod tests {
             .create_segment(orphan_session, orphan_segment, &[])
             .unwrap();
         pod_store
-            .write(&PodMetadata::new(
+            .write(&WorkerMetadata::new(
                 "agent",
-                Some(PodActiveSegmentRef::active_segment(
+                Some(WorkerActiveSegmentRef::active_segment(
                     referenced_session,
                     referenced_segment,
                 )),

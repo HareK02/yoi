@@ -1,7 +1,7 @@
 //! Helpers for constructing `ScopeRule` entries that exclude the
 //! memory tree from the generic CRUD tools' write surface.
 //!
-//! Pod is expected to call [`deny_write_rules`] when memory is enabled
+//! Worker is expected to call [`deny_write_rules`] when memory is enabled
 //! and append the result to the manifest's `scope.deny` list before
 //! constructing the [`Scope`] passed to `tools::ScopedFs`. The memory
 //! tools themselves bypass `ScopedFs` and write directly under the

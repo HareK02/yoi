@@ -7,7 +7,7 @@ p.feature = {
     task = { enabled = false },
     memory = { enabled = true },
     web = { enabled = true },
-    pods = { enabled = true },
+    workers = { enabled = true },
     ticket = { enabled = true, access = "lifecycle" },
     ticket_orchestration = { enabled = true },
 }

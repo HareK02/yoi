@@ -1,7 +1,7 @@
 //! Single source of truth for manifest default values.
 //!
 //! Every default that would otherwise be duplicated between serde
-//! `#[serde(default = "...")]` attributes (on [`crate::PodManifest`])
+//! `#[serde(default = "...")]` attributes (on [`crate::WorkerManifest`])
 //! and the cascade resolution in [`crate::config`] lives here as a
 //! `pub const`. Both paths read from this module, so changing a
 //! default requires editing exactly one line.
@@ -48,7 +48,7 @@ pub const COMPACT_OVERVIEW_DEADLINE_TOKENS: u64 = 40_000;
 pub const DEFAULT_INSTRUCTION: &str = "$yoi/default";
 
 /// Default language policy used by the main worker for normal prose
-/// responses. See [`crate::WorkerManifest::language`].
+/// responses. See [`crate::EngineManifest::language`].
 pub const WORKER_LANGUAGE: &str =
     "match the user's language unless they explicitly request another language";
 

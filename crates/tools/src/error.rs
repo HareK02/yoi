@@ -17,7 +17,7 @@ pub enum ToolsError {
     OutOfScope(PathBuf),
 
     #[error(
-        "path resolves through a symlink outside allowed {required_permission} scope: {} -> {}; add the symlink target to the Pod {required_permission} scope, copy it into the workspace, or recreate the symlink with the correct target",
+        "path resolves through a symlink outside allowed {required_permission} scope: {} -> {}; add the symlink target to the Worker {required_permission} scope, copy it into the workspace, or recreate the symlink with the correct target",
         .path.display(),
         .target.display()
     )]

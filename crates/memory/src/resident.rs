@@ -1,6 +1,6 @@
 //! Workspace memory resident-enumeration helpers.
 //!
-//! Surfaces used by the Pod system-prompt assembler:
+//! Surfaces used by the Worker system-prompt assembler:
 //!
 //! - [`collect_resident_knowledge`] — resident-injection candidates
 //!   (`model_invokation: true`) returned as `(slug, description)` pairs.
@@ -8,7 +8,7 @@
 //!   `<workspace>/.yoi/memory/summary.md` when it parses as a summary
 //!   record and has non-empty body.
 //! - [`list_knowledge_slugs`] — every slug whose file parses, regardless
-//!   of `model_invokation`. Used by the Pod IPC layer to answer TUI `#`
+//!   of `model_invokation`. Used by the Worker IPC layer to answer TUI `#`
 //!   completion (`model_invokation` is a resident-injection flag, not a
 //!   user-visibility flag).
 //!

@@ -32,7 +32,7 @@ impl ComposerEditAction {
     }
 }
 
-/// Shared readline-style composer editing keymap used by the normal Pod TUI
+/// Shared readline-style composer editing keymap used by the normal Worker TUI
 /// and the workspace panel. Callers still own higher-level routing such as
 /// completion popups, Enter submission, Tab target switching, Esc focus, and
 /// row/list navigation.

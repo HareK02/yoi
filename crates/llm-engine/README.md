@@ -16,10 +16,10 @@ Owns:
 
 Does not own:
 
-- Pod names, sockets, process lifecycle, or scope delegation (`pod`)
+- Worker names, sockets, process lifecycle, or scope delegation (`worker`)
 - product CLI shape (`yoi`)
 - provider catalog and secret resolution (`provider`, `secrets`)
-- durable Pod current state (`pod-store`)
+- durable Worker current state (`pod-store`)
 
 ## Design notes
 

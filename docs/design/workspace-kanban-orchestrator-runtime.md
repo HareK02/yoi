@@ -1,6 +1,6 @@
 # Workspace Kanban to backend Orchestrator runtime
 
-Workspace Kanban operations are control-plane requests. They may change Ticket state and request orchestration, but they must not directly execute shell, git, filesystem work, or send authority-bearing messages to raw local Pod sockets. The durable boundary is an orchestration event consumed by a backend-internal Orchestrator Worker.
+Workspace Kanban operations are control-plane requests. They may change Ticket state and request orchestration, but they must not directly execute shell, git, filesystem work, or send authority-bearing messages to raw local Worker sockets. The durable boundary is an orchestration event consumed by a backend-internal Orchestrator Worker.
 
 This document records the design boundary for connecting Kanban operations, Tickets, the Workspace backend, `WorkerRuntimeRegistry`, and filesystem-capable Workers. It is intentionally a planning artifact: it does not require the Workspace backend to implement every table, API, remote protocol, or spawn adapter immediately.
 
@@ -22,7 +22,7 @@ The minimum chain for implementation work is:
 
 ## Durable orchestration events
 
-Orchestration events are immutable control-plane records derived from Ticket operations. They are not raw LLM messages, Pod notifications, or socket writes.
+Orchestration events are immutable control-plane records derived from Ticket operations. They are not raw LLM messages, Worker notifications, or socket writes.
 
 Initial event kinds:
 
@@ -94,8 +94,8 @@ Non-responsibilities:
 - No `Bash` authority.
 - No raw workspace `Read`/`Write`/`Edit` authority.
 - No direct git/worktree/build execution.
-- No raw local Pod socket or session path authority.
-- No use of browser-supplied local paths, executable paths, runtime registry paths, `display_ref`, `pod_name`, or runtime display names as operation authority.
+- No raw local Worker socket or session path authority.
+- No use of browser-supplied local paths, executable paths, runtime registry paths, `display_ref`, `worker_name`, or runtime display names as operation authority.
 - No raw session transcript full ingest into the Workspace database.
 - No permission/auth, remote runtime protocol, Ticket DB migration, Kanban UI completion, or Coder/Reviewer spawn implementation completion in this design step.
 
@@ -103,7 +103,7 @@ If routing needs evidence that only filesystem access can provide, the Orchestra
 
 ## Domain-specific tool surface
 
-The internal Orchestrator should receive backend tools, not generic Pod tools. The tools should be narrow enough to enforce lifecycle and authority rules and broad enough to let future Orchestrator prompts reason without hidden context injection.
+The internal Orchestrator should receive backend tools, not generic Worker tools. The tools should be narrow enough to enforce lifecycle and authority rules and broad enough to let future Orchestrator prompts reason without hidden context injection.
 
 Required operation groups:
 
@@ -144,7 +144,7 @@ Forbidden operation groups for the internal Orchestrator:
 - raw filesystem read/write/edit over repository paths;
 - raw Unix socket connects or socket path notification;
 - raw session full transcript ingest;
-- local Pod metadata path or session path access as authority;
+- local Worker metadata path or session path access as authority;
 - browser-provided display labels, paths, or executable strings as authority.
 
 ## WorkerRuntime registry and spawn intents
@@ -171,12 +171,12 @@ worker_spawn_intent {
 }
 ```
 
-The browser must not provide raw workspace roots, child cwd, executable paths, raw profile files, socket paths, local Pod names, or runtime display names in this intent. API callers can request high-level operations such as "queue this Ticket" or "open this canonical Worker"; the backend and runtime adapters resolve launch details from trusted workspace records, runtime configuration, and capability policy.
+The browser must not provide raw workspace roots, child cwd, executable paths, raw profile files, socket paths, local Worker names, or runtime display names in this intent. API callers can request high-level operations such as "queue this Ticket" or "open this canonical Worker"; the backend and runtime adapters resolve launch details from trusted workspace records, runtime configuration, and capability policy.
 
 Runtime adapters are responsible for translating an accepted intent:
 
 - A backend-internal runtime may create routing-only/intake/dashboard-assistant Workers with backend tools and no filesystem scope.
-- A local Pod runtime may resolve a Coder/Reviewer intent into Pod launch arguments, scope, delegated filesystem paths, branch/worktree policy, prompt/profile/workflow selection, and acceptance evidence.
+- A local Worker runtime may resolve a Coder/Reviewer intent into Worker launch arguments, scope, delegated filesystem paths, branch/worktree policy, prompt/profile/workflow selection, and acceptance evidence.
 - A remote runtime may perform the same adaptation on a different machine without exposing local paths to the browser or storing them as API authority.
 
 Dispatch success means the runtime accepted the typed intent and returned durable acceptance evidence. It does not by itself prove the Ticket is done. Worker progress is projected through lifecycle, overview, review, and Ticket state records.
@@ -198,7 +198,7 @@ External API identity is runtime-scoped and opaque:
 - Worker detail: `GET /api/runtimes/{runtime_id}/workers/{worker_id}`.
 - Cross-runtime list: `GET /api/workers`, with each item carrying `runtime_id`, `worker_id`, and display fields.
 
-`worker-name@runtime-name` is a display label (`display_ref`) only. It is not unique enough for authority and must not be accepted as the target of mutating operations. Similarly, local Pod `pod_name`, runtime display names, raw runtime registry paths, and socket/session paths are implementation diagnostics, not API authority.
+`worker-name@runtime-name` is a display label (`display_ref`) only. It is not unique enough for authority and must not be accepted as the target of mutating operations. Similarly, local Worker `worker_name`, runtime display names, raw runtime registry paths, and socket/session paths are implementation diagnostics, not API authority.
 
 A browser-safe Worker summary can expose:
 
@@ -215,7 +215,7 @@ worker_summary {
   implementation: {
     kind,
     display_hint,
-    pod_name?       # local Pod runtime only; diagnostic/display hint, not authority
+    worker_name?       # local Worker runtime only; diagnostic/display hint, not authority
   }
 }
 ```
@@ -250,7 +250,7 @@ The Workspace backend durable projection should center on:
 - Ticket state/relation/plan projections;
 - usage aggregates.
 
-Raw session JSONL, provider traces, verbose event streams, local sockets, and local Pod metadata files remain runtime-local source/debug logs. The backend may expose bounded debug reads later, but that surface must be explicit, purpose-limited, permissioned, size-limited, and never treated as the normal Kanban/Orchestration UI data model.
+Raw session JSONL, provider traces, verbose event streams, local sockets, and local Worker metadata files remain runtime-local source/debug logs. The backend may expose bounded debug reads later, but that surface must be explicit, purpose-limited, permissioned, size-limited, and never treated as the normal Kanban/Orchestration UI data model.
 
 This keeps dashboard views stable across local/remote runtimes and prevents raw transcript contents from becoming hidden durable authority for why a control-plane decision happened. If a decision matters, it must be written as a decision/audit/overview record.
 
@@ -279,7 +279,7 @@ This design suggests the following order without making any of it part of this T
 2. Add event delivery tools and decision/audit append tools for a backend-internal Orchestrator Worker.
 3. Add runtime-scoped Worker detail APIs and backend worker projection records with surrogate ids and `UNIQUE(runtime_id, worker_id)`.
 4. Add spawn intent persistence and registry dispatch stubs that preserve authority boundaries.
-5. Implement local Pod runtime adaptation for Coder/Reviewer/helper intents.
+5. Implement local Worker runtime adaptation for Coder/Reviewer/helper intents.
 6. Add remote runtime protocol only after the local typed-intent boundary is stable.
 
 At every step, keep the invariant that durable control-plane records explain why the system acted, while runtime-specific sockets, sessions, paths, and process launch details remain adapter-local implementation details.
