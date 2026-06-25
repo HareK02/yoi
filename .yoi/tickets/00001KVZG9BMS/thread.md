@@ -636,3 +636,41 @@ Remaining blockers:
 - `YOI_POD_RUNTIME_COMMAND` や on-disk `pods` compatibility は、別途 legacy/process compatibility context として扱われているため今回の blocker にはしていない。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZG9BMS-worker-rename at: 2026-06-25T16:13:43Z -->
+
+## Implementation report
+
+Fifth follow-up implementation report after review request_changes:
+
+対応内容:
+
+- `crates/tui/src/picker.rs`
+  - user-facing error message: `list all host/data-dir Pods` → `list all host/data-dir Workers`
+- `crates/tools/README.md`
+  - `used by Pods` → `used by Workers`
+- `crates/manifest/README.md`
+  - `used to create or restore Pods` → `used to create or restore Workers`
+- `crates/pod-store/Cargo.toml`
+  - description: `Durable Pod-name metadata/state persistence` → `Legacy-named durable Worker metadata/state persistence`
+  - crate 名 `pod-store` は invariant 通り維持。
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo check -p yoi`: success
+- `cargo test -p yoi`: success
+- `git diff --check`: success
+
+今回の変更は README / Cargo description / user-facing string の小修正のみのため、重い検証は追加していない。
+
+Grep evidence:
+- `rg -n -S 'list all host/data-dir Pods|used by Pods|used to create or restore Pods|Durable Pod-name metadata/state persistence' crates docs tests --glob '!target' --glob '!docs/report/**'`: no matches.
+- `rg -n -S '\bPod\b|\bPods\b|\bpod-name\b|\bPod-name\b' crates docs tests --glob '!target' --glob '!docs/report/**'`: no matches.
+
+Commit:
+- `60dbd724c5496e80c7fe31a51f1425a7688e50ee fix: clean remaining worker wording`
+
+Residual risks / notes:
+- child worktree は commit 後 clean。
+
+---
