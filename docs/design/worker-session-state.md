@@ -36,7 +36,7 @@ Delegated write scope is a capability loan. Stopping, shutting down, or pruning 
 
 Peer visibility is also Worker metadata, but it is distinct from spawned-child delegation. A TUI user can run `:peer <worker-name>` while attached to an idle Worker to register reciprocal peer metadata with another existing Worker. This is a metadata-level registration, not live target-controller consent.
 
-A peer relationship only makes the Workers mutually visible through `ListWorkers` with visibility source `peer`. It does not grant filesystem scope, create a child output cursor, make either Worker the other's parent, or imply child completion notifications. Peer messages use `SendToPeerPod`, which delivers a labeled notification into the target Worker's normal durable notification/history path. `SendToPeerPod` requires the peer to be live and fails clearly for non-live peers rather than auto-restoring them.
+A peer relationship only makes the Workers mutually visible through `ListWorkers` with visibility source `peer`. It does not grant filesystem scope, create a child output cursor, make either Worker the other's parent, or imply child completion notifications. Peer messages use `SendToPeerWorker`, which delivers a labeled notification into the target Worker's normal durable notification/history path. `SendToPeerWorker` requires the peer to be live and fails clearly for non-live peers rather than auto-restoring them.
 
 ## Notifications are not authority
 

@@ -20,5 +20,5 @@ Queued Tickets retained in the session work set but currently waiting:
 Additional queued Tickets omitted from this bounded notice: {{ omitted_ticket_count }}
 {% endif -%}
 
-Preserve the existing human gate, dependency/conflict/capacity/dirty-workspace checks, and duplicate-start checks using actual Ticket state, role/session claims, visible Pods, and worktrees.
+Preserve the existing human gate, dependency/conflict/capacity/dirty-workspace checks, and duplicate-start checks using actual Ticket state, role/session claims, visible Workers, and worktrees.
 </system-reminder>

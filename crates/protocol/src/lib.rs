@@ -1658,7 +1658,7 @@ mod tests {
     }
 
     #[test]
-    fn pod_discovery_methods_roundtrip() {
+    fn worker_discovery_methods_roundtrip() {
         let methods = [
             Method::ListWorkers,
             Method::RestoreWorker {
@@ -1681,7 +1681,7 @@ mod tests {
     }
 
     #[test]
-    fn pod_discovery_events_roundtrip() {
+    fn worker_discovery_events_roundtrip() {
         let events = [
             Event::WorkersListed {
                 workers: serde_json::json!([{ "worker_name": "child" }]),
@@ -1698,7 +1698,7 @@ mod tests {
             let decoded: Event = serde_json::from_str(&json).unwrap();
             match (decoded, event) {
                 (Event::WorkersListed { workers }, Event::WorkersListed { workers: expected }) => {
-                    assert_eq!(pods, expected)
+                    assert_eq!(workers, expected)
                 }
                 (Event::WorkerRestored { result }, Event::WorkerRestored { result: expected }) => {
                     assert_eq!(result, expected)

@@ -78,7 +78,7 @@ pub enum SpawnError {
     Io(io::Error),
     /// runtime ディレクトリが解決できなかった (環境変数未設定等)。
     RuntimeDirUnavailable,
-    PodLaunchFailed {
+    WorkerLaunchFailed {
         command: WorkerRuntimeCommand,
         source: io::Error,
     },
@@ -96,7 +96,7 @@ impl std::fmt::Display for SpawnError {
                 f,
                 "could not resolve runtime directory (set YOI_HOME, YOI_RUNTIME_DIR, XDG_RUNTIME_DIR, or HOME)"
             ),
-            Self::PodLaunchFailed { command, source } => write!(
+            Self::WorkerLaunchFailed { command, source } => write!(
                 f,
                 "failed to launch worker runtime command `{command}`: {source}"
             ),
@@ -119,7 +119,7 @@ impl std::fmt::Display for SpawnError {
 impl std::error::Error for SpawnError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(error) | Self::PodLaunchFailed { source: error, .. } => Some(error),
+            Self::Io(error) | Self::WorkerLaunchFailed { source: error, .. } => Some(error),
             Self::RuntimeDirUnavailable | Self::WorkerExitedEarly { .. } | Self::Timeout => None,
         }
     }
@@ -197,7 +197,7 @@ where
     }
     let mut child = command
         .spawn()
-        .map_err(|source| SpawnError::PodLaunchFailed {
+        .map_err(|source| SpawnError::WorkerLaunchFailed {
             command: config.runtime_command.clone(),
             source,
         })?;
