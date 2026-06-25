@@ -139,3 +139,46 @@ Implementation orchestration update:
 - Coder には root/original workspace と orchestration worktree で read/write/validation/git operation を行わないよう明示した。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVXK0WE4-websocket-driver at: 2026-06-25T06:56:37Z -->
+
+## Implementation report
+
+Implementation report:
+
+- Ticket: `00001KVXK0WE4`
+- Branch/worktree: `work/00001KVXK0WE4-plugin-websocket-driver` / `/home/hare/Projects/yoi/.worktree/00001KVXK0WE4-plugin-websocket-driver`
+- Commit: `f2c51ffe399fc4eaa0ab4e4052867d55e534b229`
+- Commit message: `feat: add plugin websocket service driver`
+
+変更ファイル:
+- `crates/pod/src/feature/plugin.rs`
+  - Service Plugin 用の host-owned WebSocket driver を追加。
+  - `ingress.sources` の `websocket:wss://...` / `ws(s)://...` を Service WebSocket 接続として扱う実装を追加。
+  - incoming text frame を既存の bounded Service ingress queue へ `websocket_text` event として enqueue。
+  - close/error を `websocket_close` / `websocket_error` ingress event と status diagnostic に反映。
+  - `websocket_send` Service output command を host-owned connection 経由の text send に接続。
+  - manifest declaration + enabled grant / allowlist を通らない open/send は fail-closed。
+  - status に connection state、last frame time、last error、received/sent count、queue drops、send failures を追加。
+  - driver lifecycle / incoming / send success / send rejection / send failure / close-error diagnostics / binary-like frame error の focused tests を追加。
+- `docs/development/plugin-development.md`
+  - Service Plugin の推奨 WebSocket integration を、guest long-lived recv loop ではなく host-owned Service WebSocket driver + `websocket_send` output command に更新。
+
+検証結果:
+- `cargo test -p pod --lib websocket_`: success (`14 passed`)
+- `cargo test -p pod --lib service_output_command`: success (`4 passed`)
+- `cargo check -p pod`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+  - Nix dirty warning は worktree の ignored `target/` によるもので、tracked changes はなし。
+- `cargo test -p pod`: failed only in known prompt guidance snapshot tests outside this Ticket (`438 passed; 2 failed`)
+  - `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`
+  - `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`
+
+Residual risks / notes:
+- v0 は自動 reconnect/resume policy を実装せず、close/error は diagnostic/event 化に留めている。
+- Service WebSocket source の manifest 表現は既存 `ingress.sources` の文字列規約として追加。WIT/PDK/templates 更新は Ticket `00001KVXK0WEA` 側に残している。
+- 実ネットワーク test は non-goal のため、mock WebSocket client/connection による bounded focused tests で検証している。
+
+---

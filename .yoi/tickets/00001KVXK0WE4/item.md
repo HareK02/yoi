@@ -2,7 +2,7 @@
 title: 'Add host-owned WebSocket driver for Plugin services'
 state: 'inprogress'
 created_at: '2026-06-24T19:51:56Z'
-updated_at: '2026-06-25T06:24:16Z'
+updated_at: '2026-06-25T06:56:37Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-24T20:12:03Z'
