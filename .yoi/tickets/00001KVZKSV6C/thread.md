@@ -195,3 +195,43 @@ Next action:
 - Wait for Coder implementation report, then route to reviewer.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZKSV6C-runtime-registry at: 2026-06-25T19:33:11Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装完了。Ticket ファイル/project records は変更していない。merge/close/cleanup 前で停止。
+
+Commit:
+- `f6fd7b63 feat: add workspace runtime registry source boundary`
+
+変更ファイル:
+- `crates/workspace-server/src/hosts.rs`
+- `crates/workspace-server/src/server.rs`
+
+実装/API 概要:
+- `WorkerRuntimeRegistry` を `RuntimeRegistry` に改名し、workspace-server 内の Runtime/Worker domain 側の registry 名を明確化。
+- `RuntimeSummary` に `source: RuntimeSourceSummary` を追加。
+  - `RuntimeSourceKind`: `local_compatibility`, `embedded_worker_runtime`, `remote_http`
+  - `RuntimeSourceStatus`: `active`, `reserved`
+  - `RuntimeIdentityAuthority`: `runtime_registry_projection`
+- 現行 local Pod metadata 由来の互換 source は `local_compatibility` として明示。
+- embedded worker-runtime / remote HTTP は reserved boundary として型だけ用意し、実接続・HTTP client/server・dynamic registration は未実装のまま保持。
+- API response に source boundary / identity authority を追加し、Runtime public identity が socket/session/path ではなく registry projection であることをテストで確認。
+- 既存 local compatibility behavior は維持し、既存テストに source boundary の assert を追加。
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo test -p yoi-workspace-server`: success（19 passed）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success（dirty warning は出たが build 成功）
+
+Residual risks / review focus:
+- API top-level `source: "worker_runtime_registry"` は既存互換のため維持。一方で Runtime item 側に typed `source.kind` / `identity_authority` を追加。
+- embedded/remote source は reserved constructor と enum boundary のみで、実際の registry composition や Runtime 接続は次 Ticket 側の責務。
+- `RuntimeSourceSummary.note` は human-readable な API payload なので、Web 側で表示するなら文言の粒度を確認してほしい。
+
+---
