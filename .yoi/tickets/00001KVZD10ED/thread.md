@@ -239,3 +239,79 @@ Non-blocking note:
 - `pod` 側には local variable や既存 runtime/manifest 文脈としての `worker` 語が残っているが、今回の acceptance 対象である old crate/import/API 名や `llm_engine::Worker` 互換 alias ではないため問題なし。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-25T13:57:16Z -->
+
+## Implementation report
+
+Integration outcome:
+
+- Coder `yoi-coder-00001KVZD10ED-llm-engine` が implementation branch `work/00001KVZD10ED-llm-engine-rename` に実装を commit した。
+  - implementation commit: `292fc4ea refactor: rename llm worker crate to engine`
+- Reviewer `yoi-reviewer-00001KVZD10ED-llm-engine` は read-only review で `approve`。old crate directories removal、Cargo/Nix consistency、public Engine API、old active references なし、compatibility alias なし、behavior/responsibility movement なしを確認した。
+- Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration` で branch `work/00001KVZD10ED-llm-engine-rename` を merge 済み。
+  - merge commit: `254ecccb merge: 00001KVZD10ED llm engine rename`
+
+Implemented behavior:
+- `crates/llm-worker` -> `crates/llm-engine`
+- `crates/llm-worker-macros` -> `crates/llm-engine-macros`
+- Cargo package/dependency/import path を `llm-engine` / `llm_engine`, `llm-engine-macros` / `llm_engine_macros` に更新。
+- Public turn-engine API を Engine 系へ rename。
+  - `Worker` -> `Engine`
+  - `WorkerConfig` -> `EngineConfig`
+  - `WorkerError` -> `EngineError`
+  - `WorkerResult` -> `EngineResult`
+  - `WorkerState` -> `EngineState`
+  - `RunOutput` -> `EngineRunOutput`
+- `pod`, `manifest`, docs, examples, tests, Nix, `Cargo.lock`, `package.nix` hash を更新。
+- old crate directories は削除済み。compatibility alias は追加していない。
+
+Validation in Orchestrator worktree:
+- `cargo test -p llm-engine`: success
+- `cargo test -p pod`: success
+- `cargo check -p yoi`: success
+- active old reference grep excluding `.yoi/tickets/**` and `docs/report/**`: success, none found for:
+  - `llm-worker`
+  - `llm_worker`
+  - `llm-worker-macros`
+  - `llm_worker_macros`
+- `crates/llm-engine` / `crates/llm-engine-macros` old public Worker API grep: success, none found for:
+  - `\bWorker\b`
+  - `WorkerConfig`
+  - `WorkerError`
+  - `WorkerResult`
+  - `WorkerState`
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Notes:
+- Historical `.yoi/tickets/**` and `docs/report/**` references to old names remain as durable history/report context and are not active API/docs guidance.
+- Unlike recent Plugin full `cargo test -p pod` runs, this validation passed `cargo test -p pod` fully.
+
+Next action:
+- Mark Ticket done after this integration/validation evidence.
+- Then stop related child Pods and remove only the child implementation worktree/branch.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-25T13:57:29Z from: inprogress to: done reason: merged_validated field: state -->
+
+## State changed
+
+Implementation is merged into the orchestration branch and validated.
+
+Evidence:
+- merge commit: `254ecccb merge: 00001KVZD10ED llm engine rename`
+- reviewer result: approve
+- validation in `/home/hare/Projects/yoi/.worktree/orchestration` succeeded:
+  - `cargo test -p llm-engine`
+  - `cargo test -p pod`
+  - `cargo check -p yoi`
+  - active old reference grep excluding `.yoi/tickets/**` and `docs/report/**`
+  - old public Worker API grep in `crates/llm-engine` / `crates/llm-engine-macros`
+  - `git diff --check`
+  - `nix build .#yoi --no-link`
+
+Closure is not performed here; this state records implementation completion after merge/validation.
+
+---
