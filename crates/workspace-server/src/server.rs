@@ -611,7 +611,8 @@ impl IntoResponse for ApiError {
             Error::InvalidRecordId(_)
             | Error::MissingFrontmatter(_)
             | Error::UnknownHost(_)
-            | Error::UnknownWorker(_)
+            | Error::UnknownRuntime(_)
+            | Error::UnknownWorker { .. }
             | Error::UnknownRepository(_) => StatusCode::NOT_FOUND,
             Error::Ticket(_) => StatusCode::NOT_FOUND,
             Error::RuntimeCapabilityUnsupported { .. } => StatusCode::NOT_IMPLEMENTED,
