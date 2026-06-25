@@ -430,3 +430,23 @@ Dashboard Queue による human-authorized routing を受け、Ticket body/threa
 これ以降、worktree creation / coder/reviewer Worker routing などの implementation side effect に進める。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-25T16:23:24Z -->
+
+## Implementation report
+
+Implementation kickoff:
+
+- Worktree created: `/home/hare/Projects/yoi/.worktree/00001KVZBCQH4-worker-runtime-core`
+- Branch: `work/00001KVZBCQH4-worker-runtime-core`
+- Coder Worker spawned: `yoi-coder-00001KVZBCQH4-worker-runtime`
+
+Scope notes:
+- Coder has read access to the implementation worktree and non-recursive workspace root identity path needed by runtime startup.
+- Coder write scope is intentionally narrow: `crates/**`, root `Cargo.toml`, and root `Cargo.lock` only.
+- Coder is instructed not to modify Ticket records and not to operate in root/orchestration worktrees.
+
+Startup note:
+- The first spawn attempt failed before child creation because the runtime workspace root path itself was not readable in the delegated scope. Retried with non-recursive read on `/home/hare/Projects/yoi` plus implementation worktree read/write scope; second spawn succeeded.
+
+---
