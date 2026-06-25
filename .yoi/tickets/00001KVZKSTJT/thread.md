@@ -50,3 +50,31 @@ Before this can be ready, define the event model and protocol boundary concretel
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-25T20:05:49Z -->
+
+## Decision
+
+Runtime WebSocket event stream は、新しい Worker output protocol を作らず `crates/protocol` の `protocol::Event` を Backend-facing observation payload として流す方針にする。Runtime WS は `protocol::Event` の variant allowlist / subset を定義せず、worker-scoped envelope に event id / cursor / worker id を付けて Worker event bus の `protocol::Event` を forward する。
+
+Browser / Web UI は Runtime WS に直接接続しない。Backend が Runtime WS client になり、Browser-facing stream は Backend-owned projection layer を通す。この projection layer を、後続の Web 権限制御で observation allow/deny、thinking/tool output/diagnostic redaction、operation-capable command API forwarding allow/deny を差し込む境界にする。STJT では full auth model は実装せず、この seam を型と責務として作る。
+
+
+---
+
+<!-- event: intake_summary author: hare at: 2026-06-25T20:10:54Z -->
+
+## Intake summary
+
+Marked ready by `yoi ticket state`.
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-06-25T20:10:54Z from: planning to: ready reason: cli_state field: state -->
+
+## State changed
+
+Marked ready by `yoi ticket state`.
+
+
+---
