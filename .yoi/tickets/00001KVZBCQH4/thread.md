@@ -571,3 +571,35 @@ Human follow-up:
 - 現在の最優先は `00001KVZBCQH4` の reviewer blocker 解消、再 review、merge、validation、done 記録。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZBCQH4-worker-runtime at: 2026-06-25T16:50:47Z -->
+
+## Implementation report
+
+Follow-up implementation report after review request_changes:
+
+対応内容:
+- `crates/worker-runtime/src/runtime.rs`
+  - `Runtime::transition_worker` を修正。
+  - `Stopped` / `Cancelled` の terminal 状態にある Worker に反対側 terminal 操作が呼ばれても、既存 terminal 状態を保持し、同じ `event_id` で ack を返すようにした。
+  - 反対側 terminal 操作では追加 event を発生させない。
+- 追加テスト:
+  - `stop_then_cancel_preserves_stopped_terminal_state`
+  - `cancel_then_stop_preserves_cancelled_terminal_state`
+  - summary count と event history が反対 terminal 操作で変化しないことを検証。
+
+Commit:
+- `fbd358a1 fix: keep worker terminal lifecycle stable`
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo test -p worker-runtime`: success (8 tests passed)
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success（実行時点で dirty tree warning は出たが build 自体は成功）
+
+Residual risks / review focus:
+- terminal 状態への反対操作は reject ではなく「既存 terminal 状態を保持する idempotent 扱い」を選択。既存 API の ack semantics には自然だが、将来 UX/API で明示的 lifecycle conflict を出したい場合は typed error 方針へ切り替える余地がある。
+- child worktree は commit 後 clean。
+
+---
