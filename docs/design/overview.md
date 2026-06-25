@@ -7,8 +7,8 @@ That rule shapes the crate split. The runtime can restart, attach, compact, or d
 ## Core layers
 
 - `yoi` owns the product CLI and top-level command shape. It is the façade that wires profile selection, memory linting, and normal TUI launch.
-- `pod` turns a `Worker` into a named runtime entity with scope, session persistence, protocol handling, tools, and Pod metadata integration.
-- `llm-worker` owns model-facing turns: history append, retries, continuation, pruning/compaction mechanics, tool loops, and provider-independent callbacks.
+- `pod` turns a `Engine` into a named runtime entity with scope, session persistence, protocol handling, tools, and Pod metadata integration.
+- `llm-engine` owns model-facing turns: history append, retries, continuation, pruning/compaction mechanics, tool loops, and provider-independent callbacks.
 - `session-store` owns replayable append-only conversation/session logs.
 - `pod-store` owns current Pod metadata keyed by Pod name.
 - `protocol` defines the socket message boundary between clients and Pods.
@@ -21,9 +21,9 @@ That rule shapes the crate split. The runtime can restart, attach, compact, or d
 
 ## Why these boundaries exist
 
-The Worker should not know process identity, Pod names, live sockets, spawned children, or UI state. It should know how to run an LLM turn over committed history and tools.
+The Engine should not know process identity, Pod names, live sockets, spawned children, or UI state. It should know how to run an LLM turn over committed history and tools.
 
-The Pod should not make provider-specific wire decisions. It coordinates runtime identity, persistence, scope, and protocol delivery around a Worker.
+The Pod should not make provider-specific wire decisions. It coordinates runtime identity, persistence, scope, and protocol delivery around a Engine.
 
 The TUI should not be an alternate source of truth. It may queue local input, show optimistic affordances, and render snapshots, but durable state comes from Pod/session records.
 

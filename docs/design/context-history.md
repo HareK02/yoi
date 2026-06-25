@@ -28,7 +28,7 @@ Forbidden examples:
 - Rewriting old messages to include new facts.
 - Letting UI/controller-only state become model-visible without a committed record.
 
-If new information should affect the model, append it to history and commit it. `history.json` / session persistence follows from the Worker history path.
+If new information should affect the model, append it to history and commit it. `history.json` / session persistence follows from the Engine history path.
 
 ## Prompt cache implications
 

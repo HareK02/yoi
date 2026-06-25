@@ -2102,7 +2102,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
-name = "llm-worker"
+name = "llm-engine"
 version = "0.2.1"
 dependencies = [
  "async-trait",
@@ -2110,7 +2110,7 @@ dependencies = [
  "dotenv",
  "eventsource-stream",
  "futures",
- "llm-worker-macros",
+ "llm-engine-macros",
  "reqwest",
  "schemars",
  "serde",
@@ -2127,7 +2127,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "llm-worker-macros"
+name = "llm-engine-macros"
 version = "0.2.0"
 dependencies = [
  "proc-macro2",
@@ -2242,7 +2242,7 @@ name = "manifest"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
- "llm-worker",
+ "llm-engine",
  "mlua",
  "protocol",
  "secrets",
@@ -2373,7 +2373,7 @@ dependencies = [
  "chrono",
  "libc",
  "lint-common",
- "llm-worker",
+ "llm-engine",
  "manifest",
  "schemars",
  "serde",
@@ -2888,7 +2888,7 @@ dependencies = [
  "futures-util",
  "include_dir",
  "libc",
- "llm-worker",
+ "llm-engine",
  "manifest",
  "mcp",
  "memory",
@@ -3045,7 +3045,7 @@ dependencies = [
  "async-trait",
  "base64",
  "chrono",
- "llm-worker",
+ "llm-engine",
  "manifest",
  "reqwest",
  "secrets",
@@ -3901,7 +3901,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
- "llm-worker",
+ "llm-engine",
  "protocol",
  "serde",
  "serde_json",
@@ -4352,7 +4352,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "fs4",
- "llm-worker",
+ "llm-engine",
  "project-record",
  "schemars",
  "serde",
@@ -4535,7 +4535,7 @@ dependencies = [
  "grep-searcher",
  "html5ever",
  "ignore",
- "llm-worker",
+ "llm-engine",
  "manifest",
  "markup5ever_rcdom",
  "pdf-extract",
@@ -4715,7 +4715,7 @@ dependencies = [
  "base64",
  "client",
  "crossterm 0.28.1",
- "llm-worker",
+ "llm-engine",
  "manifest",
  "minijinja",
  "pod-registry",

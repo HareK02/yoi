@@ -6,7 +6,7 @@
 //!
 //! Sync (rather than async) is intentional: a segment log append is a single
 //! `< 1 KiB` line on local fs and completes well below a millisecond. Going
-//! through `tokio::fs` would force every caller — including `Worker`'s sync
+//! through `tokio::fs` would force every caller — including `Engine`'s sync
 //! `on_history_append` callback — to bridge sync → async via a channel +
 //! drain task. Keeping the store sync lets the worker callback, Pod commit
 //! paths, and `PodInterceptor` all share one direct `append_entry` call.

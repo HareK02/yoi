@@ -1,6 +1,6 @@
-//! `write_extracted` ツール実装と sub-Worker 用 context。
+//! `write_extracted` ツール実装と sub-Engine 用 context。
 //!
-//! sub-Worker からは extract worker が出した [`ExtractedPayload`] を
+//! sub-Engine からは extract worker が出した [`ExtractedPayload`] を
 //! 受け取って `Mutex` 越しに [`ExtractWorkerContext`] に置くだけ。
 //! Pod 側はランループ完了後に `take_payload()` で取り出して
 //! [`super::staging::write_staging`] に渡す。
@@ -8,7 +8,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 
 use crate::extract::payload::ExtractedPayload;
 
@@ -17,7 +17,7 @@ Pass an object with `decisions`, `discussions`, `attempts`, and `requests` array
 Call this exactly once and end the turn. Do not include `source`, session metadata, or free-form prose — \
 the wrapper attaches provenance mechanically.";
 
-/// extract sub-Worker の出力受け口。`ExtractedPayload` 1 件をホストする。
+/// extract sub-Engine の出力受け口。`ExtractedPayload` 1 件をホストする。
 #[derive(Debug, Default)]
 pub struct ExtractWorkerContext {
     payload: Mutex<Option<ExtractedPayload>>,
@@ -31,7 +31,7 @@ impl ExtractWorkerContext {
         Self::default()
     }
 
-    /// sub-Worker 終了後に Pod が呼んで payload を取り出す。
+    /// sub-Engine 終了後に Pod が呼んで payload を取り出す。
     /// 一度も `write_extracted` が呼ばれなければ `None`。
     pub fn take_payload(&self) -> Option<ExtractedPayload> {
         self.payload
@@ -57,7 +57,7 @@ impl Tool for WriteExtractedTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let payload: ExtractedPayload = serde_json::from_str(input_json).map_err(|e| {
             ToolError::InvalidArgument(format!("invalid write_extracted input: {e}"))
@@ -92,7 +92,7 @@ impl Tool for WriteExtractedTool {
     }
 }
 
-/// sub-Worker に register する `write_extracted` ツール定義を返す。
+/// sub-Engine に register する `write_extracted` ツール定義を返す。
 pub fn write_extracted_tool(ctx: Arc<ExtractWorkerContext>) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(ExtractedPayload);
@@ -109,7 +109,7 @@ pub fn write_extracted_tool(ctx: Arc<ExtractWorkerContext>) -> ToolDefinition {
 mod tests {
     use super::*;
 
-    use llm_worker::tool::Tool;
+    use llm_engine::tool::Tool;
 
     #[tokio::test]
     async fn write_extracted_records_payload() {

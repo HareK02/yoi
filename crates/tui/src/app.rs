@@ -2051,7 +2051,7 @@ impl App {
         match entry {
             session_store::LogEntry::SegmentStart { history, .. } => {
                 for logged in history {
-                    let item: llm_worker::Item = logged.into();
+                    let item: llm_engine::Item = logged.into();
                     let item_value = serde_json::to_value(&item).expect("Item is Serialize");
                     self.push_history_item(&item_value);
                 }
@@ -2067,7 +2067,7 @@ impl App {
             }
             session_store::LogEntry::AssistantItem { item, .. }
             | session_store::LogEntry::ToolResult { item, .. } => {
-                let it: llm_worker::Item = item.into();
+                let it: llm_engine::Item = item.into();
                 let item_value = serde_json::to_value(&it).expect("Item is Serialize");
                 self.push_history_item(&item_value);
             }
@@ -2231,7 +2231,7 @@ fn rollback_input_preview(text: &str) -> String {
 pub fn alert_source_label(source: AlertSource) -> &'static str {
     match source {
         AlertSource::Pod => "pod",
-        AlertSource::Worker => "worker",
+        AlertSource::Engine => "engine",
         AlertSource::Compactor => "compactor",
         AlertSource::AgentsMd => "AGENTS.md",
     }
@@ -2780,7 +2780,7 @@ mod completion_flow_tests {
                 is_dir: true,
             },
             CompletionEntry {
-                value: "crates/llm-worker".into(),
+                value: "crates/llm-engine".into(),
                 is_dir: true,
             },
         ];
@@ -2933,7 +2933,7 @@ mod completion_flow_tests {
             ts: session_store::segment_log::now_millis(),
             session_id: uuid::Uuid::nil(),
             system_prompt: None,
-            config: llm_worker::llm_client::RequestConfig::default(),
+            config: llm_engine::llm_client::RequestConfig::default(),
             history: vec![],
             forked_from: None,
             compacted_from: None,
@@ -3192,7 +3192,7 @@ mod completion_flow_tests {
             system_prompt: None,
             config: Default::default(),
             history: vec![session_store::LoggedItem::from(
-                &llm_worker::Item::system_message("[File: src/main.rs]\nfn main() {}"),
+                &llm_engine::Item::system_message("[File: src/main.rs]\nfn main() {}"),
             )],
             forked_from: None,
             compacted_from: None,

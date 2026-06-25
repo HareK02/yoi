@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use llm_worker::llm_client::client::LlmClient;
+use llm_engine::llm_client::client::LlmClient;
 use manifest::{ToolPermissionAction, ToolPermissionConfig};
 use serde_json::Value;
 use session_store::Store;

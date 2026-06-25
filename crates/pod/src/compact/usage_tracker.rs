@@ -1,6 +1,6 @@
 //! Tracks per-LLM-request Usage measurements within a Pod run.
 //!
-//! Bridge between two sync touchpoints in the Worker lifecycle:
+//! Bridge between two sync touchpoints in the Engine lifecycle:
 //!
 //! - **`pre_llm_request` hook** (async, but synchronously accessed via the
 //!   tracker): captures `history.len()` at the moment a request goes out.
@@ -16,8 +16,8 @@
 
 use std::sync::Mutex;
 
-use llm_worker::UsageRecord;
-use llm_worker::timeline::event::UsageEvent;
+use llm_engine::UsageRecord;
+use llm_engine::timeline::event::UsageEvent;
 
 /// One drained measurement: the underlying `UsageRecord` plus an optional
 /// `correlation_id` stamped by the prune projection (or any other future

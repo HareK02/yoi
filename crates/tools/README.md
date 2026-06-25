@@ -16,7 +16,7 @@ Owns:
 Does not own:
 
 - manifest permission policy definition (`manifest`)
-- Worker tool-loop semantics (`llm-worker`)
+- Engine tool-loop semantics (`llm-engine`)
 - Pod lifecycle decisions (`pod`)
 - UI presentation (`tui`)
 

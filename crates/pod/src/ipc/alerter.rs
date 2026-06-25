@@ -137,7 +137,7 @@ mod tests {
         let alerter = Alerter::new(tx);
 
         for i in 0..(MAX_BUFFERED_ALERTS + 50) {
-            alerter.alert(AlertLevel::Warn, AlertSource::Worker, format!("msg-{i}"));
+            alerter.alert(AlertLevel::Warn, AlertSource::Engine, format!("msg-{i}"));
         }
 
         let (snapshot, _rx) = alerter.subscribe_with_snapshot();
@@ -153,9 +153,9 @@ mod tests {
         let (tx, _keep) = broadcast::channel::<Event>(8);
         let alerter = Alerter::new(tx);
 
-        alerter.alert(AlertLevel::Warn, AlertSource::Worker, "historic".into());
+        alerter.alert(AlertLevel::Warn, AlertSource::Engine, "historic".into());
         let (snapshot, mut rx) = alerter.subscribe_with_snapshot();
-        alerter.alert(AlertLevel::Error, AlertSource::Worker, "live".into());
+        alerter.alert(AlertLevel::Error, AlertSource::Engine, "live".into());
 
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].message, "historic");

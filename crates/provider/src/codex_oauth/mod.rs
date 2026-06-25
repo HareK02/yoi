@@ -4,8 +4,8 @@
 //!
 //! 設計:
 //!
-//! - llm-worker は [`AuthProvider`] trait しか知らず、実体である
-//!   [`CodexAuthProvider`] はこのクレートに置く（feedback_llm_worker_scope）
+//! - llm-engine は [`AuthProvider`] trait しか知らず、実体である
+//!   [`CodexAuthProvider`] はこのクレートに置く（feedback_llm_engine_scope）
 //! - access_token JWT の `exp` を読み、`now` 以下で proactive refresh
 //!   （Codex CLI と同じバッファなし）
 //! - 並行する Codex CLI / 別 yoi の refresh と取り違えないよう、
@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use llm_worker::llm_client::{ClientError, auth::AuthProvider};
+use llm_engine::llm_client::{ClientError, auth::AuthProvider};
 use reqwest::header::{HeaderName, HeaderValue};
 use tokio::sync::Mutex;
 

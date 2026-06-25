@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use llm_worker::Item;
-use llm_worker::tool::{
+use llm_engine::Item;
+use llm_engine::tool::{
     Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOutput,
 };
 use serde::{Deserialize, Serialize};
@@ -308,7 +308,7 @@ fn has_active_workflow_hint(item: &Item) -> bool {
 
 fn item_system_text(item: &Item) -> Option<String> {
     match item {
-        Item::Message { role, content, .. } if *role == llm_worker::Role::System => Some(
+        Item::Message { role, content, .. } if *role == llm_engine::Role::System => Some(
             content
                 .iter()
                 .map(|part| part.as_text())

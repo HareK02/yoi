@@ -3,14 +3,14 @@
 //! Each [`LogEntry`] represents a single state transition within one
 //! segment, serialized as one line in a `.jsonl` file. Reading all
 //! entries and collecting them via [`collect_state`] reconstructs the
-//! full [`Worker`] state at that segment.
+//! full [`Engine`] state at that segment.
 //!
 //! The on-disk format is one `LogEntry` per line — entries are positionally
 //! ordered. Fork lineage references between segments use turn-number indices
 //! (`SegmentOrigin.at_turn_index`) rather than per-entry hashes.
 
-use llm_worker::llm_client::types::{Item, RequestConfig};
-use llm_worker::{UsageRecord, WorkerResult};
+use llm_engine::llm_client::types::{Item, RequestConfig};
+use llm_engine::{EngineResult, UsageRecord};
 use protocol::{InvokeKind, Segment};
 use serde::{Deserialize, Serialize};
 
@@ -19,7 +19,7 @@ use crate::system_item::SystemItem;
 
 /// A single segment log entry, serialized as one JSONL line.
 ///
-/// Variants correspond to specific mutation points in `Worker`:
+/// Variants correspond to specific mutation points in `Engine`:
 /// - `SegmentStart` — always the first entry; captures initial state
 /// - `Invoke` — IDLE → active marker (start of a new self-driving cycle)
 /// - `UserInput` / `AssistantItem` / `ToolResult` / `SystemItem` — history appends
@@ -98,16 +98,16 @@ pub enum LogEntry {
     /// Turn boundary. Records the turn count after increment.
     TurnEnd { ts: u64, turn_count: usize },
 
-    /// `run()` / `resume()` が `WorkerResult` で正常終了した。
+    /// `run()` / `resume()` が `EngineResult` で正常終了した。
     /// Audit-only metadata: replay は `interrupted` のみ反映する。
     RunCompleted {
         ts: u64,
         interrupted: bool,
-        result: WorkerResult,
+        result: EngineResult,
     },
 
-    /// `run()` / `resume()` が `WorkerError` で終了した。
-    /// `WorkerError` は `Serialize` 不可なので `message` のみ lossy 保持する。
+    /// `run()` / `resume()` が `EngineError` で終了した。
+    /// `EngineError` は `Serialize` 不可なので `message` のみ lossy 保持する。
     /// Audit-only metadata: replay は `interrupted` のみ反映する。
     RunErrored {
         ts: u64,
@@ -360,7 +360,7 @@ mod tests {
             LogEntry::RunCompleted {
                 ts: 3200,
                 interrupted: false,
-                result: WorkerResult::Finished,
+                result: EngineResult::Finished,
             },
         ]);
         assert_eq!(state.history.len(), 2);
@@ -593,7 +593,7 @@ mod tests {
             LogEntry::RunCompleted {
                 ts: 100,
                 interrupted: true,
-                result: WorkerResult::Paused,
+                result: EngineResult::Paused,
             },
             LogEntry::PausedTurnAbandoned { ts: 200 },
         ]);
@@ -711,14 +711,14 @@ mod tests {
             },
             parsed,
         ]);
-        // Worker history gets a flattened user_message item.
+        // Engine history gets a flattened user_message item.
         assert_eq!(state.history.len(), 1);
         match &state.history[0] {
             Item::Message { role, content, .. } => {
-                assert!(matches!(role, llm_worker::Role::User));
+                assert!(matches!(role, llm_engine::Role::User));
                 assert_eq!(content.len(), 1);
                 match &content[0] {
-                    llm_worker::ContentPart::Text { text } => {
+                    llm_engine::ContentPart::Text { text } => {
                         assert_eq!(text, "see line1\nline2@src/main.rs");
                     }
                     other => panic!("unexpected content: {other:?}"),

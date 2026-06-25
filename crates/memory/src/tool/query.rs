@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::{Deserialize, Serialize};
 
 use crate::audit::{AuditStatus, RecordUsageAudit, append_record_usage};
@@ -129,7 +129,7 @@ impl Tool for MemoryQueryTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: MemoryQueryParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid MemoryQuery input: {e}")))?;
@@ -247,7 +247,7 @@ impl Tool for KnowledgeQueryTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: KnowledgeQueryParams = serde_json::from_str(input_json).map_err(|e| {
             ToolError::InvalidArgument(format!("invalid KnowledgeQuery input: {e}"))

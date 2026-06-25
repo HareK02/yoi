@@ -1,6 +1,6 @@
 //! Central catalog of Pod-level prompt strings.
 //!
-//! Prompts that Pod injects into a Worker (compaction system prompt,
+//! Prompts that Pod injects into a Engine (compaction system prompt,
 //! notification wrapper, interrupt notes, system-prompt trailing
 //! sections, AGENTS.md truncation notice, ...) are enumerated by
 //! [`PodPrompt`] and rendered through a single [`PromptCatalog`]. Direct
@@ -59,11 +59,11 @@ const INTERNAL_TOML: &str = include_str!("../../../../resources/prompts/internal
 /// `resources/prompts/internal.toml`; the build fails otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PodPrompt {
-    /// System prompt of the compaction (summary) Worker.
+    /// System prompt of the compaction (summary) Engine.
     CompactSystem,
-    /// System prompt of the memory extract Worker.
+    /// System prompt of the memory extract Engine.
     MemoryExtractSystem,
-    /// System prompt of the memory consolidation (integration + tidy) Worker.
+    /// System prompt of the memory consolidation (integration + tidy) Engine.
     MemoryConsolidationSystem,
     /// Wrapper around an incoming `Method::Notify` message injected into
     /// the next LLM request context as a transient system message.

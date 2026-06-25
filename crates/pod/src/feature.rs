@@ -3,11 +3,11 @@
 //! This module defines the Pod-side feature boundary used to collect
 //! descriptor metadata, tool contributions, safe hook contributions, background
 //! task declarations, service declarations, and protocol-backed provider
-//! startup discovery before installing them into the existing Worker/HookRegistry
+//! startup discovery before installing them into the existing Engine/HookRegistry
 //! host surfaces.
 //!
 //! The implementation is intentionally host-mediated: tools are installed through
-//! the normal Worker tool path, hooks are installed through
+//! the normal Engine tool path, hooks are installed through
 //! [`crate::hook::HookRegistryBuilder`], and provider output is represented as
 //! ordinary feature reports/diagnostics instead of a separate authority layer.
 
@@ -15,10 +15,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use llm_worker::Worker;
-use llm_worker::llm_client::client::LlmClient;
-use llm_worker::state::Mutable;
-use llm_worker::tool::ToolDefinition;
+use llm_engine::Engine;
+use llm_engine::llm_client::client::LlmClient;
+use llm_engine::state::Mutable;
+use llm_engine::tool::ToolDefinition;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -167,9 +167,9 @@ impl ProtocolProviderLifecycleDiagnostic {
 /// Startup-discovered contribution set returned by a protocol-backed provider.
 ///
 /// Tool definitions are materialized exactly once when registered, then inserted
-/// into the normal Worker tool path as stable metadata plus executable tool
+/// into the normal Engine tool path as stable metadata plus executable tool
 /// handles for the remainder of the run. Execution still flows through the
-/// Worker, permission, history, and bounded-result machinery.
+/// Engine, permission, history, and bounded-result machinery.
 #[derive(Clone)]
 pub struct ProtocolProviderContribution {
     declaration: ProtocolProviderDeclaration,
@@ -1285,10 +1285,10 @@ impl FeatureRegistryBuilder {
             .collect()
     }
 
-    /// Install modules into the existing Worker tool path and hook builder.
-    pub(crate) fn install_into_worker<C: LlmClient>(
+    /// Install modules into the existing Engine tool path and hook builder.
+    pub(crate) fn install_into_engine<C: LlmClient>(
         self,
-        worker: &mut Worker<C, Mutable>,
+        worker: &mut Engine<C, Mutable>,
         hook_builder: &mut HookRegistryBuilder,
     ) -> FeatureRegistryInstallReport {
         let mut pending_tools = Vec::new();
@@ -1485,8 +1485,8 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use futures::stream;
-    use llm_worker::llm_client::{ClientError, Request, ResponseStream};
-    use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+    use llm_engine::llm_client::{ClientError, Request, ResponseStream};
+    use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1511,7 +1511,7 @@ mod tests {
         async fn execute(
             &self,
             _input_json: &str,
-            _ctx: llm_worker::tool::ToolExecutionContext,
+            _ctx: llm_engine::tool::ToolExecutionContext,
         ) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput::from("ok".to_string()))
         }
@@ -1695,7 +1695,7 @@ mod tests {
         let descriptor = FeatureDescriptor::builtin("provider-feature", "Provider feature")
             .with_protocol_provider(provider.clone());
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut worker = Worker::new(DummyClient);
+        let mut worker = Engine::new(DummyClient);
         let mut hook_builder = HookRegistryBuilder::default();
 
         let report = FeatureRegistryBuilder::new()
@@ -1705,7 +1705,7 @@ mod tests {
                 calls: Arc::clone(&calls),
                 state: ProtocolProviderLifecycleState::Ready,
             })
-            .install_into_worker(&mut worker, &mut hook_builder);
+            .install_into_engine(&mut worker, &mut hook_builder);
 
         worker.tool_server_handle().flush_pending();
         let tool_names: Vec<_> = worker
@@ -1848,13 +1848,13 @@ mod tests {
         }
 
         let calls = Arc::new(AtomicUsize::new(0));
-        let mut worker = Worker::new(DummyClient);
+        let mut worker = Engine::new(DummyClient);
         let mut hook_builder = HookRegistryBuilder::default();
         let report = FeatureRegistryBuilder::new()
             .with_module(StatefulToolFeature {
                 calls: Arc::clone(&calls),
             })
-            .install_into_worker(&mut worker, &mut hook_builder);
+            .install_into_engine(&mut worker, &mut hook_builder);
 
         worker.tool_server_handle().flush_pending();
         let names: Vec<_> = worker
@@ -2220,11 +2220,11 @@ mod tests {
 
     #[test]
     fn builtin_task_feature_installs_through_worker_tool_path() {
-        let mut worker = Worker::new(DummyClient);
+        let mut worker = Engine::new(DummyClient);
         let mut hook_builder = HookRegistryBuilder::default();
         let report = FeatureRegistryBuilder::new()
             .with_module(builtin::task_tools_feature())
-            .install_into_worker(&mut worker, &mut hook_builder);
+            .install_into_engine(&mut worker, &mut hook_builder);
 
         worker.tool_server_handle().flush_pending();
         let names: Vec<_> = worker

@@ -12,7 +12,7 @@ grep-regex = "0.1.14"
 grep-searcher = "0.1.16"
 ignore = "0.4.25"
 html5ever = "0.26"
-llm-worker = { workspace = true }
+llm-engine = { workspace = true }
 manifest = { workspace = true }
 secrets = { workspace = true }
 markup5ever_rcdom = "0.2"

@@ -1,0 +1,10 @@
+error[E0624]: method `register_tool` is private
+  --> tests/ui/tool_server_handle_register_tool.rs:27:20
+   |
+27 |     let _ = handle.register_tool(def);
+   |                    ^^^^^^^^^^^^^ private method
+   |
+  ::: src/tool_server.rs
+   |
+   |     pub(crate) fn register_tool(&self, factory: EngineToolDefinition) {
+   |     ----------------------------------------------------------------- private method defined here

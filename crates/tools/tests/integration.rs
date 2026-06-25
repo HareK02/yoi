@@ -1,13 +1,13 @@
 //! Cross-tool integration tests exercising `core_builtin_tools()` end-to-end.
 //!
 //! `ToolServerHandle::register_tool` / `flush_pending` are `pub(crate)` in
-//! llm-worker, so from here we exercise the factories directly — the same
+//! llm-engine, so from here we exercise the factories directly — the same
 //! code path that `flush_pending()` runs at production time.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use llm_worker::tool::{Tool, ToolDefinition, ToolMeta};
+use llm_engine::tool::{Tool, ToolDefinition, ToolMeta};
 use manifest::{Permission, Scope, ScopeConfig, ScopeRule};
 use serde_json::json;
 use tempfile::TempDir;
@@ -60,13 +60,13 @@ fn setup() -> (TempDir, TempDir, Registry) {
     (dir, spill, reg)
 }
 
-async fn call(tool: &Arc<dyn Tool>, input: serde_json::Value) -> llm_worker::tool::ToolOutput {
+async fn call(tool: &Arc<dyn Tool>, input: serde_json::Value) -> llm_engine::tool::ToolOutput {
     tool.execute(&input.to_string(), Default::default())
         .await
         .expect("tool execution failed")
 }
 
-async fn call_err(tool: &Arc<dyn Tool>, input: serde_json::Value) -> llm_worker::tool::ToolError {
+async fn call_err(tool: &Arc<dyn Tool>, input: serde_json::Value) -> llm_engine::tool::ToolError {
     tool.execute(&input.to_string(), Default::default())
         .await
         .expect_err("expected error")

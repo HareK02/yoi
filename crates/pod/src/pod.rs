@@ -4,12 +4,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use llm_worker::Item;
-use llm_worker::llm_client::RequestConfig;
-use llm_worker::llm_client::client::LlmClient;
-use llm_worker::llm_client::types::Role;
-use llm_worker::state::Mutable;
-use llm_worker::{ToolOutputLimits, UsageRecord, Worker, WorkerError, WorkerResult};
+use llm_engine::Item;
+use llm_engine::llm_client::RequestConfig;
+use llm_engine::llm_client::client::LlmClient;
+use llm_engine::llm_client::types::Role;
+use llm_engine::state::Mutable;
+use llm_engine::{Engine, EngineError, EngineResult, ToolOutputLimits, UsageRecord};
 use pod_store::{
     PodActiveSegmentRef, PodMetadata, PodMetadataStore, PodReclaimedChild, PodSpawnedChild,
     PodSpawnedScopeRule, PodStoreError,
@@ -233,12 +233,12 @@ where
 
 /// An independent agent execution unit.
 ///
-/// Holds a [`Worker`] directly and persists session state via
+/// Holds a [`Engine`] directly and persists session state via
 /// `session-store` functions after each turn.
 pub struct Pod<C: LlmClient, St: Store> {
     manifest: PodManifest,
     /// Always `Some` outside of `run()`/`resume()`.
-    worker: Option<Worker<C, Mutable>>,
+    engine: Option<Engine<C, Mutable>>,
     store: St,
     /// Optional write-through hook for name-keyed Pod metadata. Production
     /// constructors install this from the same FsStore that owns the session
@@ -269,7 +269,7 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// Captures `(history_len, UsageEvent)` pairs during a run; drained
     /// in `persist_turn` and persisted as `LogEntry::LlmUsage` entries.
     usage_tracker: Arc<UsageTracker>,
-    /// Sync-side buffer for `Metric` values queued from inside Worker
+    /// Sync-side buffer for `Metric` values queued from inside Engine
     /// callbacks (currently the prune observer). Drained in `persist_turn`
     /// and written via `session_metrics::record_metric` alongside
     /// `LogEntry::LlmUsage`. Always present after construction.
@@ -279,7 +279,7 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// Read by token-accounting APIs (`Pod::total_tokens`, etc.).
     ///
     /// Wrapped in `Arc<Mutex>` so that callbacks injected into the
-    /// Worker (e.g. the savings estimator used by the prune projection)
+    /// Engine (e.g. the savings estimator used by the prune projection)
     /// can share the same view via [`Pod::usage_history_handle`].
     usage_history: Arc<Mutex<Vec<UsageRecord>>>,
     /// Pod-lifetime file-operation tracker from the builtin `tools`
@@ -402,7 +402,7 @@ pub struct Pod<C: LlmClient, St: Store> {
     /// on disk.
     sink: SegmentLogSink,
     /// `true` once `wire_history_persistence` has installed the
-    /// `Worker::on_history_append` callback that commits each appended
+    /// `Engine::on_history_append` callback that commits each appended
     /// item as a singular `LogEntry::AssistantItem` / `ToolResult`
     /// directly through the writer. Tests that drive `Pod::new` without
     /// going through the controller leave this `false`; `persist_turn`
@@ -436,12 +436,12 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
         // methods using `worker.client()` as fallback when no override
         // model is configured. system_prompt / request_config / cache_key
         // are unused on this path, so we deliberately skip copying them.
-        let source_worker = self.worker.as_ref().expect("worker present");
-        let mut worker = Worker::new(source_worker.client().clone());
+        let source_worker = self.engine.as_ref().expect("worker present");
+        let mut worker = Engine::new(source_worker.client().clone());
         worker.set_history(source_worker.history().to_vec());
         Self {
             manifest: self.manifest.clone(),
-            worker: Some(worker),
+            engine: Some(worker),
             store: self.store.clone(),
             pod_metadata_writer: None,
             segment_state: self.segment_state.clone(),
@@ -513,7 +513,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
         self.in_flight = Some(in_flight);
     }
 
-    /// Wire `Worker::on_history_append` to commit each appended item
+    /// Wire `Engine::on_history_append` to commit each appended item
     /// directly as a singular `LogEntry::AssistantItem` / `ToolResult`
     /// through the writer. The controller calls this once per spawned
     /// Pod after the worker is built; tests that drive `Pod::new` may
@@ -528,14 +528,14 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
     /// callback would otherwise double-write them.
     pub fn wire_history_persistence(&mut self) {
         let writer = self.log_writer_handle();
-        self.worker_mut().on_history_append(move |item| {
+        self.engine_mut().on_history_append(move |item| {
             if item.is_user_message() {
                 return;
             }
             if matches!(
                 item,
                 Item::Message {
-                    role: llm_worker::Role::System,
+                    role: llm_engine::Role::System,
                     ..
                 }
             ) {
@@ -548,7 +548,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
         });
         if self.manifest.session.record_event_trace {
             let writer = self.log_writer_handle();
-            self.worker_mut()
+            self.engine_mut()
                 .on_stream_event(move |turn, llm_call, event| {
                     let entry = session_store::TraceEntry {
                         ts: segment_log::now_millis(),
@@ -563,7 +563,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
                     }
                 });
             let writer = self.log_writer_handle();
-            self.worker_mut()
+            self.engine_mut()
                 .on_lifecycle_trace(move |turn, llm_call, label, data| {
                     let entry = session_store::TraceEntry {
                         ts: segment_log::now_millis(),
@@ -604,7 +604,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Pod<C, St> {
 }
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
-    /// Create a new Pod from a pre-built Worker and store.
+    /// Create a new Pod from a pre-built Engine and store.
     ///
     /// Callers must pre-resolve `cwd` (absolute) and build a [`Scope`]
     /// — typically via [`Scope::from_config`] when coming from a
@@ -616,7 +616,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// should parse it themselves and call [`set_system_prompt_template`].
     pub async fn new(
         manifest: PodManifest,
-        worker: Worker<C>,
+        worker: Engine<C>,
         store: St,
         cwd: PathBuf,
         scope: Scope,
@@ -631,7 +631,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             DelegationScope::from_config(&manifest.delegation_scope).map_err(PodError::Scope)?;
         let mut pod = Self {
             manifest,
-            worker: Some(worker),
+            engine: Some(worker),
             store,
             pod_metadata_writer: None,
             segment_state: SegmentState::new(session_id, segment_id, 0),
@@ -825,17 +825,17 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.sink.clone()
     }
 
-    /// Direct access to the underlying Worker.
-    pub fn worker(&self) -> &Worker<C, Mutable> {
-        self.worker.as_ref().expect("worker taken during run")
+    /// Direct access to the underlying Engine.
+    pub fn engine(&self) -> &Engine<C, Mutable> {
+        self.engine.as_ref().expect("worker taken during run")
     }
 
-    /// Mutable access to the underlying Worker.
+    /// Mutable access to the underlying Engine.
     ///
     /// Use this to register tools, hooks, or subscribers before calling
     /// [`run`](Self::run).
-    pub fn worker_mut(&mut self) -> &mut Worker<C, Mutable> {
-        self.worker.as_mut().expect("worker taken during run")
+    pub fn engine_mut(&mut self) -> &mut Engine<C, Mutable> {
+        self.engine.as_mut().expect("worker taken during run")
     }
 
     /// Install enabled feature modules into the Pod host surfaces.
@@ -843,7 +843,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         &mut self,
         registry: FeatureRegistryBuilder,
     ) -> FeatureRegistryInstallReport {
-        let worker = self.worker.as_mut().expect("worker taken during run");
+        let worker = self.engine.as_mut().expect("worker taken during run");
         let active_workflow_committer = self.log_writer.clone().map(|writer| {
             Arc::new(move |entry| writer.commit_log_entry(entry))
                 as active_workflow::LogEntryCommitter
@@ -852,7 +852,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             self.active_workflows.clone(),
             active_workflow_committer,
         ));
-        let report = registry.install_into_worker(worker, &mut self.hook_builder);
+        let report = registry.install_into_engine(worker, &mut self.hook_builder);
         report
     }
 
@@ -920,10 +920,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .restore_from_history_and_extensions(&state.history, &state.extensions);
         let mut history = state.history;
         active_workflow::strip_rehydration_messages(&mut history);
-        self.worker_mut().set_history(history);
-        self.worker_mut().set_request_config(state.config);
-        self.worker_mut().set_turn_count(state.turn_count);
-        self.worker_mut()
+        self.engine_mut().set_history(history);
+        self.engine_mut().set_request_config(state.config);
+        self.engine_mut().set_turn_count(state.turn_count);
+        self.engine_mut()
             .set_last_run_interrupted(state.last_run_interrupted);
         self.user_segments = state.user_segments;
         *self.usage_history.lock().expect("usage_history poisoned") = state.usage_history;
@@ -980,9 +980,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.write_pod_metadata_pending()
     }
 
-    /// Current history items held by the underlying Worker.
+    /// Current history items held by the underlying Engine.
     pub fn history(&self) -> &[Item] {
-        self.worker().history()
+        self.engine().history()
     }
 
     /// Snapshot of the cumulative LLM Usage measurement timeline.
@@ -990,7 +990,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// One entry per LLM call. Restored on `restore` and appended in
     /// `persist_turn`. Used by token-accounting APIs in [`token_counter`].
     /// Returns a clone since the underlying vector is shared with hooks
-    /// running on the Worker.
+    /// running on the Engine.
     pub fn usage_history(&self) -> Vec<UsageRecord> {
         self.usage_history
             .lock()
@@ -1033,7 +1033,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Shared handle to the cumulative Usage history.
     ///
     /// Callbacks that need live access to the latest measurements (e.g.
-    /// the savings estimator that `attach_prune` installs on the Worker)
+    /// the savings estimator that `attach_prune` installs on the Engine)
     /// clone this `Arc` and read it at request time. The handle outlives
     /// any individual run.
     ///
@@ -1057,7 +1057,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
     /// Handle to the synchronous `MetricsTracker` buffer.
     ///
-    /// Worker callbacks (e.g. the prune observer) clone this `Arc` and
+    /// Engine callbacks (e.g. the prune observer) clone this `Arc` and
     /// `.push(metric)` into it; Pod drains it in `persist_turn` and
     /// writes each metric via `session_metrics::record_metric`.
     pub(crate) fn metrics_tracker_handle(
@@ -1068,7 +1068,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
     /// Attach the session-scoped file-operation tracker from the builtin
     /// `tools` crate. Called by the Controller immediately after it
-    /// registers the builtin tools on the Worker. Overwrites any
+    /// registers the builtin tools on the Engine. Overwrites any
     /// previously attached tracker.
     pub fn attach_tracker(&mut self, tracker: tools::Tracker) {
         self.tracker = Some(tracker);
@@ -1227,7 +1227,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         self.hook_builder.add_on_abort(hook);
     }
 
-    /// Install the hook-based interceptor on the Worker if not already done.
+    /// Install the hook-based interceptor on the Engine if not already done.
     ///
     /// When either compaction threshold (`threshold` or
     /// `request_threshold`) is configured in the manifest, allocates
@@ -1246,7 +1246,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 .unwrap_or((None, None, manifest::defaults::COMPACT_RETAINED_TOKENS));
 
             let tracker_for_usage = self.usage_tracker.clone();
-            self.worker_mut().on_usage(move |event| {
+            self.engine_mut().on_usage(move |event| {
                 tracker_for_usage.record_usage(event);
             });
 
@@ -1285,7 +1285,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 self.active_workflows.clone(),
             )
             .with_usage_tracker(self.usage_tracker.clone());
-            self.worker_mut().set_interceptor(interceptor);
+            self.engine_mut().set_interceptor(interceptor);
             self.interceptor_installed = true;
         }
     }
@@ -1293,7 +1293,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Render the manifest-supplied instruction template exactly once,
     /// just before the first LLM turn, append the fixed trailing
     /// section (scope summary + optional AGENTS.md), and hand the
-    /// resulting string to the Worker via `set_system_prompt`.
+    /// resulting string to the Engine via `set_system_prompt`.
     /// Subsequent invocations are no-ops: the template field is
     /// consumed with `Option::take()`, so the materialised value
     /// persists across all later turns and compaction.
@@ -1303,10 +1303,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         };
         let alerter = self.alerter.clone();
         let tool_names: Vec<String> = {
-            let worker = self.worker.as_mut().expect("worker present");
+            let worker = self.engine.as_mut().expect("worker present");
             // Materialise any pending tool factories so the template sees the
             // full list of tool names. Redundant with the flush inside
-            // `Worker::lock()`; safe because `flush_pending` is idempotent.
+            // `Engine::lock()`; safe because `flush_pending` is idempotent.
             worker.tool_server_handle().flush_pending();
             worker
                 .tool_server_handle()
@@ -1386,7 +1386,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let rendered = template
             .render(&ctx)
             .map_err(|source| PodError::SystemPromptRender { source })?;
-        self.worker
+        self.engine
             .as_mut()
             .expect("worker present")
             .set_system_prompt(rendered);
@@ -1461,30 +1461,30 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .expect("usage_history poisoned")
             .len();
         EmptyTurnRollbackSnapshot {
-            history_len: self.worker().history().len(),
+            history_len: self.engine().history().len(),
             user_segments_len: self.user_segments.len(),
             entries_written: self.segment_state.entries_written(),
             sink_len: self.sink.len(),
             pending_attachments,
             usage_history_len,
             ai_activity_count: self.ai_activity_counter.load(Ordering::SeqCst),
-            last_run_interrupted: self.worker().last_run_interrupted(),
+            last_run_interrupted: self.engine().last_run_interrupted(),
             active_workflows: self.active_workflows.snapshot(),
         }
     }
 
     fn should_rollback_empty_turn(
         &self,
-        result: &Result<WorkerResult, WorkerError>,
+        result: &Result<EngineResult, EngineError>,
         snapshot: &EmptyTurnRollbackSnapshot,
     ) -> bool {
-        if !matches!(result, Err(WorkerError::Cancelled)) {
+        if !matches!(result, Err(EngineError::Cancelled)) {
             return false;
         }
         if self.ai_activity_counter.load(Ordering::SeqCst) != snapshot.ai_activity_count {
             return false;
         }
-        !self.worker().history()[snapshot.history_len..]
+        !self.engine().history()[snapshot.history_len..]
             .iter()
             .any(is_ai_materialized_item)
     }
@@ -1493,8 +1493,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         &mut self,
         snapshot: EmptyTurnRollbackSnapshot,
     ) -> Result<(), StoreError> {
-        self.worker_mut().truncate_history(snapshot.history_len);
-        self.worker_mut()
+        self.engine_mut().truncate_history(snapshot.history_len);
+        self.engine_mut()
             .set_last_run_interrupted(snapshot.last_run_interrupted);
         self.user_segments.truncate(snapshot.user_segments_len);
         *self
@@ -1523,12 +1523,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     ///
     /// `input` is a typed segment list (see [`protocol::Segment`]). The
     /// Pod flattens it into a single user-message string for the
-    /// underlying Worker, expanding paste content inline, resolving file refs
+    /// underlying Engine, expanding paste content inline, resolving file refs
     /// into adjacent attachments where possible, and surfacing alerts for
     /// unresolved refs / unsupported segment kinds.
     ///
     /// If the between-turns compaction threshold is exceeded mid-run,
-    /// the Worker is aborted, history is compacted, and execution resumes
+    /// the Engine is aborted, history is compacted, and execution resumes
     /// automatically.
     pub async fn run(&mut self, input: Vec<Segment>) -> Result<PodRunResult, PodError> {
         // Validate workflow invocations up front so an invalid slug
@@ -1547,7 +1547,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // `last_run_interrupted` flag; `Pod::resume` reuses the prior
         // context via a different entry point and never triggers this
         // path.
-        if self.worker.as_ref().unwrap().last_run_interrupted() {
+        if self.engine.as_ref().unwrap().last_run_interrupted() {
             self.apply_interrupt_prep()?;
         }
 
@@ -1575,7 +1575,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // workflow invocations to system messages stashed for the
         // PodInterceptor to attach right after the user message. File and
         // Knowledge failures are non-fatal alerts; explicit workflow invocation
-        // failures abort before the Worker sees the turn.
+        // failures abort before the Engine sees the turn.
         let mut attachments = self.resolve_file_refs(&input);
         attachments.extend(self.resolve_knowledge_refs(&input));
         attachments.extend(self.resolve_workflow_invocations(&input)?);
@@ -1594,13 +1594,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 .expect("pending_attachments poisoned") = attachments;
         }
 
-        let history_before = self.worker.as_ref().unwrap().history().len();
+        let history_before = self.engine.as_ref().unwrap().history().len();
 
         // lock → run → unlock
-        let worker = self.worker.take().expect("worker taken during run");
+        let worker = self.engine.take().expect("worker taken during run");
         let mut locked = worker.lock();
         let result = locked.run(flattened).await;
-        self.worker = Some(locked.unlock());
+        self.engine = Some(locked.unlock());
 
         if self.should_rollback_empty_turn(&result, &rollback_snapshot) {
             self.rollback_empty_turn(rollback_snapshot)?;
@@ -1844,11 +1844,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .map_err(PodError::from)?;
 
         let closures = crate::interrupt_prep::orphan_tool_result_closures(
-            self.worker().history(),
+            self.engine().history(),
             &tool_result_summary,
         );
         if !closures.is_empty() {
-            self.worker_mut().append_history(closures);
+            self.engine_mut().append_history(closures);
         }
         self.commit_entry(LogEntry::SystemItem {
             ts: segment_log::now_millis(),
@@ -1856,8 +1856,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 body: system_note.clone(),
             },
         })?;
-        self.worker_mut()
-            .append_history(std::iter::once(llm_worker::Item::system_message(
+        self.engine_mut()
+            .append_history(std::iter::once(llm_engine::Item::system_message(
                 system_note,
             )));
         Ok(())
@@ -1871,12 +1871,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// The explicit `PausedTurnAbandoned` marker preserves durable lifecycle
     /// semantics without claiming another `run` / `resume` completed.
     pub fn cancel_paused_turn(&mut self) -> Result<(), PodError> {
-        if !self.worker().last_run_interrupted() {
+        if !self.engine().last_run_interrupted() {
             return Ok(());
         }
 
         self.apply_interrupt_prep()?;
-        self.worker_mut().set_last_run_interrupted(false);
+        self.engine_mut().set_last_run_interrupted(false);
         self.commit_entry(LogEntry::PausedTurnAbandoned {
             ts: segment_log::now_millis(),
         })?;
@@ -1920,7 +1920,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .unwrap_or_default()
     }
 
-    /// Flatten a typed segment list into the single string the Worker
+    /// Flatten a typed segment list into the single string the Engine
     /// receives as the user message, and emit user-facing alerts for
     /// segments that fall through to placeholder (knowledge / workflow
     /// refs without a resolver, or unknown variants from a newer client).
@@ -1964,7 +1964,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// history. The `PodInterceptor::pre_llm_request` drains the
     /// pending-notification buffer and injects each entry as an
     /// `Item::system_message` into the per-request context, then the
-    /// Worker's resume path issues the LLM request without a new
+    /// Engine's resume path issues the LLM request without a new
     /// user turn.
     pub async fn run_for_notification(
         &mut self,
@@ -1990,12 +1990,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             trigger: kind,
         })?;
 
-        let history_before = self.worker.as_ref().unwrap().history().len();
+        let history_before = self.engine.as_ref().unwrap().history().len();
 
-        let worker = self.worker.take().expect("worker taken during run");
+        let worker = self.engine.take().expect("worker taken during run");
         let mut locked = worker.lock();
         let result = locked.resume().await;
-        self.worker = Some(locked.unlock());
+        self.engine = Some(locked.unlock());
 
         self.handle_worker_result(result, history_before).await
     }
@@ -2004,13 +2004,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     pub async fn resume(&mut self) -> Result<PodRunResult, PodError> {
         self.prepare_for_run().await?;
 
-        let history_before = self.worker.as_ref().unwrap().history().len();
+        let history_before = self.engine.as_ref().unwrap().history().len();
 
         // lock → resume → unlock
-        let worker = self.worker.take().expect("worker taken during run");
+        let worker = self.engine.take().expect("worker taken during run");
         let mut locked = worker.lock();
         let result = locked.resume().await;
-        self.worker = Some(locked.unlock());
+        self.engine = Some(locked.unlock());
 
         self.handle_worker_result(result, history_before).await
     }
@@ -2025,7 +2025,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// calls fall through to entry-count comparison, which auto-forks
     /// when another writer has appended behind our back.
     fn ensure_segment_head(&mut self) -> Result<(), PodError> {
-        let w = self.worker.as_ref().unwrap();
+        let w = self.engine.as_ref().unwrap();
         let loc = self.segment_state.location();
         let entries_written = self.segment_state.entries_written();
         if entries_written == 0 {
@@ -2090,7 +2090,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         Ok(())
     }
 
-    /// Handle Worker result: always persist the turn first, then if
+    /// Handle Engine result: always persist the turn first, then if
     /// `Yielded`, perform compaction and resume.
     ///
     /// Persisting before compaction ensures that if compact fails, the
@@ -2098,12 +2098,12 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// `Yielded`), so restore remains consistent.
     async fn handle_worker_result(
         &mut self,
-        result: Result<WorkerResult, WorkerError>,
+        result: Result<EngineResult, EngineError>,
         history_before: usize,
     ) -> Result<PodRunResult, PodError> {
         self.persist_turn(history_before, &result).await?;
 
-        if matches!(result, Ok(WorkerResult::Yielded)) {
+        if matches!(result, Ok(EngineResult::Yielded)) {
             return self.do_compact_and_resume().await;
         }
 
@@ -2112,7 +2112,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 state.set_just_compacted(false);
             }
         }
-        result.map(PodRunResult::from).map_err(PodError::Worker)
+        result.map(PodRunResult::from).map_err(PodError::Engine)
     }
 
     /// Perform compaction after a `compact_needed` abort and resume execution.
@@ -2218,7 +2218,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     /// Run an explicit user-requested compaction between turns.
     ///
     /// The controller only calls this while Idle. Paused turns keep their
-    /// interrupted Worker state intact and are intentionally rejected before
+    /// interrupted Engine state intact and are intentionally rejected before
     /// this method is reached.
     pub async fn manual_compact(&mut self) -> Result<ManualCompactResult, PodError> {
         if self.manifest.compaction.is_none() {
@@ -2294,7 +2294,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     async fn persist_turn(
         &mut self,
         history_before: usize,
-        result: &Result<WorkerResult, WorkerError>,
+        result: &Result<EngineResult, EngineError>,
     ) -> Result<(), StoreError> {
         // Per-item commits for AssistantItem / ToolResult / SystemItem
         // entries are expected to have landed synchronously: the
@@ -2310,7 +2310,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // slice from `history_before` inline so the test's
         // `restore`-style assertions still see entries on disk.
         if !self.history_persistence_wired {
-            let new_items: Vec<Item> = self.worker.as_ref().unwrap().history()[history_before..]
+            let new_items: Vec<Item> = self.engine.as_ref().unwrap().history()[history_before..]
                 .iter()
                 .cloned()
                 .collect();
@@ -2322,7 +2322,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 if matches!(
                     item,
                     Item::Message {
-                        role: llm_worker::Role::System,
+                        role: llm_engine::Role::System,
                         ..
                     }
                 ) {
@@ -2333,7 +2333,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             }
         }
 
-        let turn_count = self.worker.as_ref().unwrap().turn_count();
+        let turn_count = self.engine.as_ref().unwrap().turn_count();
         self.commit_entry(LogEntry::TurnEnd {
             ts: segment_log::now_millis(),
             turn_count,
@@ -2392,7 +2392,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 .push(record);
         }
 
-        let interrupted = self.worker.as_ref().unwrap().last_run_interrupted();
+        let interrupted = self.engine.as_ref().unwrap().last_run_interrupted();
         match result {
             Ok(r) => {
                 self.commit_entry(LogEntry::RunCompleted {
@@ -2414,10 +2414,10 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
     }
 
     /// Compact the current session by summarising history via a
-    /// disposable Worker, then replacing history with
+    /// disposable Engine, then replacing history with
     /// `[summary, ...recent_turns]` and creating a new session.
     ///
-    /// The summary Worker uses:
+    /// The summary Engine uses:
     /// - `compaction.model` from the manifest if configured, or
     /// - a clone of the main LlmClient via `clone_boxed()`.
     ///
@@ -2435,7 +2435,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // within `retained_tokens`. Item-granular, turn boundaries ignored.
         let cut = self.split_for_retained(retained_tokens);
 
-        let worker = self.worker.as_ref().expect("worker taken during run");
+        let worker = self.engine.as_ref().expect("worker taken during run");
         let history = worker.history();
         let retain_from = cut.index.min(history.len());
         let mut retained_items = history[retain_from..].to_vec();
@@ -2537,7 +2537,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             );
         }
 
-        // Worker-side state collected by the compact worker's tool calls.
+        // Engine-side state collected by the compact worker's tool calls.
         let ctx = Arc::new(std::sync::Mutex::new(CompactWorkerContext::with_budget(
             auto_read_budget,
         )));
@@ -2553,7 +2553,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             .prompts
             .compact_system()
             .map_err(PodError::PromptCatalog)?;
-        let mut summary_worker = Worker::new(summary_client).system_prompt(summary_system_prompt);
+        let mut summary_worker = Engine::new(summary_client).system_prompt(summary_system_prompt);
         summary_worker.set_cache_key(Some(self.segment_id().to_string()));
 
         // Occupancy-based input-token meter + interceptor. The tracker pairs
@@ -2594,8 +2594,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         let out = summary_worker
             .run(summary_input.text)
             .await
-            .map_err(PodError::Worker)?;
-        let mut locked_worker = out.worker;
+            .map_err(PodError::Engine)?;
+        let mut locked_engine = out.engine;
 
         // Guard: nudge the worker once more if the expected outputs
         // (summary, and any auto-read nominations when default refs
@@ -2624,7 +2624,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             }
         };
         if let Some(prompt) = nudge {
-            let _ = locked_worker.run(prompt).await.map_err(PodError::Worker)?;
+            let _ = locked_engine.run(prompt).await.map_err(PodError::Engine)?;
         }
 
         let mut final_ctx = ctx.lock().expect("compact ctx poisoned").clone();
@@ -2639,7 +2639,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                  {summary_max_tokens}). Rewrite it now with `write_summary`, preserving the \
                  same five sections but making it concise. Target ≈{summary_target_tokens} tokens."
             );
-            let _ = locked_worker.run(prompt).await.map_err(PodError::Worker)?;
+            let _ = locked_engine.run(prompt).await.map_err(PodError::Engine)?;
             final_ctx = ctx.lock().expect("compact ctx poisoned").clone();
             summary_text = final_ctx
                 .summary
@@ -2728,7 +2728,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             self.task_feature.snapshot_overview(),
             task_snapshot_text.clone(),
         ));
-        let result_estimate = llm_worker::token_counter::total_tokens(&new_history, &[]);
+        let result_estimate = llm_engine::token_counter::total_tokens(&new_history, &[]);
         if result_context_max_tokens > 0 && result_estimate.tokens > result_context_max_tokens {
             return Err(PodError::CompactResultContextTooLarge {
                 tokens: result_estimate.tokens,
@@ -2744,8 +2744,8 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         // { compacted_from }` and reset their view.
         let new_segment_id = session_store::new_segment_id();
         let old_loc = self.segment_state.location();
-        let source_turn_count = self.worker.as_ref().unwrap().turn_count();
-        let w = self.worker.as_ref().unwrap();
+        let source_turn_count = self.engine.as_ref().unwrap().turn_count();
+        let w = self.engine.as_ref().unwrap();
         let entry = LogEntry::SegmentStart {
             ts: segment_log::now_millis(),
             session_id: old_loc.session_id,
@@ -2798,13 +2798,13 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             self.user_segments.drain(..drop_n);
         }
 
-        self.worker.as_mut().unwrap().set_history(new_history);
+        self.engine.as_mut().unwrap().set_history(new_history);
         // Compaction-introduced system messages are part of the new
         // SegmentStart's history (broadcast above) — clients derive
         // their blocks from `SegmentStart.history`. No per-item
         // broadcast is required.
         let _ = &compact_introduced_system_messages;
-        let worker = self.worker.as_mut().unwrap();
+        let worker = self.engine.as_mut().unwrap();
         // Anchor the prompt cache at the summary item so that Anthropic
         // can place a durable `cache_control` breakpoint there — our
         // compact layout guarantees history[0] is the summary.
@@ -2833,7 +2833,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         Ok(new_segment_id)
     }
 
-    /// Build the LlmClient for the compactor Worker.
+    /// Build the LlmClient for the compactor Engine.
     ///
     /// Uses `compaction.model` from manifest if set, otherwise clones
     /// the main client.
@@ -2844,11 +2844,11 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 return Ok(client);
             }
         }
-        let worker = self.worker.as_ref().expect("worker taken during run");
+        let worker = self.engine.as_ref().expect("worker taken during run");
         Ok(worker.client().clone_boxed())
     }
 
-    /// Build the LlmClient for the extract (memory.extract) Worker.
+    /// Build the LlmClient for the extract (memory.extract) Engine.
     ///
     /// Uses `memory.extract_model` from manifest if set, otherwise clones
     /// the main client.
@@ -2860,7 +2860,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             let client = provider::build_client(m)?;
             return Ok(client);
         }
-        let worker = self.worker.as_ref().expect("worker taken during run");
+        let worker = self.engine.as_ref().expect("worker taken during run");
         Ok(worker.client().clone_boxed())
     }
 
@@ -3027,9 +3027,9 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         }
 
         let current_history_len = self
-            .worker
+            .engine
             .as_ref()
-            .expect("worker present")
+            .expect("engine present")
             .history()
             .len();
         if current_history_len <= processed_history_len {
@@ -3108,7 +3108,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             None,
         );
 
-        let items_to_extract = self.worker.as_ref().expect("worker present").history()
+        let items_to_extract = self.engine.as_ref().expect("worker present").history()
             [processed_history_len..current_history_len]
             .to_vec();
 
@@ -3147,7 +3147,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 return Err(PodError::PromptCatalog(err));
             }
         };
-        let mut extract_worker = Worker::new(client).system_prompt(extract_system_prompt);
+        let mut extract_worker = Engine::new(client).system_prompt(extract_system_prompt);
         extract_worker.set_cache_key(Some(self.segment_id().to_string()));
 
         extract_worker.set_max_turns(extract_worker_max_turns);
@@ -3179,7 +3179,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                 Some(extract_audit_base),
                 None,
             );
-            return Err(PodError::Worker(err));
+            return Err(PodError::Engine(err));
         }
 
         let payload = ctx.take_payload().unwrap_or_else(|| {
@@ -3271,7 +3271,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
         Ok(ExtractDecision::Completed)
     }
 
-    /// Build the LlmClient for the consolidation (memory.consolidation) Worker.
+    /// Build the LlmClient for the consolidation (memory.consolidation) Engine.
     ///
     /// Uses `memory.consolidation_model` from manifest if set, otherwise
     /// clones the main client. Mirrors [`build_extractor_client`].
@@ -3283,7 +3283,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             let client = provider::build_client(m)?;
             return Ok(client);
         }
-        let worker = self.worker.as_ref().expect("worker taken during run");
+        let worker = self.engine.as_ref().expect("worker taken during run");
         Ok(worker.client().clone_boxed())
     }
 
@@ -3534,7 +3534,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                     return Err(PodError::PromptCatalog(e));
                 }
             };
-        let mut worker = Worker::new(client).system_prompt(consolidation_system_prompt);
+        let mut worker = Engine::new(client).system_prompt(consolidation_system_prompt);
         worker.set_cache_key(Some(self.segment_id().to_string()));
 
         let usage_capture = Arc::new(Mutex::new(None));
@@ -3548,7 +3548,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
 
         // Memory tools are self-contained — they bypass ScopedFs and write
         // directly under the workspace via WorkspaceLayout. Resident section
-        // injection is a Pod-level concern; this disposable Worker is built
+        // injection is a Pod-level concern; this disposable Engine is built
         // without it by construction, in keeping with `docs/plan/memory.md`
         // §Consolidation のKnowledgeアクセス (agent pulls knowledge through
         // the search tool instead of via system-prompt residency).
@@ -3616,14 +3616,14 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
                     None,
                     Some(base_consolidation),
                 );
-                Err(PodError::Worker(e))
+                Err(PodError::Engine(e))
             }
         }
     }
 }
 
-fn lifecycle_status_for_worker_error(err: &WorkerError) -> memory::audit::WorkerLifecycleStatus {
-    if matches!(err, WorkerError::Cancelled) {
+fn lifecycle_status_for_worker_error(err: &EngineError) -> memory::audit::WorkerLifecycleStatus {
+    if matches!(err, EngineError::Cancelled) {
         memory::audit::WorkerLifecycleStatus::Cancelled
     } else {
         memory::audit::WorkerLifecycleStatus::Failed
@@ -3631,7 +3631,7 @@ fn lifecycle_status_for_worker_error(err: &WorkerError) -> memory::audit::Worker
 }
 
 fn usage_audit_from_event(
-    event: &llm_worker::llm_client::event::UsageEvent,
+    event: &llm_engine::llm_client::event::UsageEvent,
 ) -> memory::audit::UsageAudit {
     memory::audit::UsageAudit {
         input_tokens: event.input_tokens,
@@ -3854,14 +3854,14 @@ where
             segment_id,
         )?;
 
-        let mut worker = Worker::new(common.client);
+        let mut worker = Engine::new(common.client);
         apply_worker_manifest(&mut worker, &manifest.worker);
         worker.set_cache_key(Some(segment_id.to_string()));
         let pod_metadata_writer = Some(pod_metadata_writer_for_store(&store));
 
         let mut pod = Self {
             manifest,
-            worker: Some(worker),
+            engine: Some(worker),
             store,
             pod_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, 0),
@@ -3964,14 +3964,14 @@ where
             segment_id,
         )?;
 
-        let mut worker = Worker::new(common.client);
+        let mut worker = Engine::new(common.client);
         apply_worker_manifest(&mut worker, &manifest.worker);
         worker.set_cache_key(Some(segment_id.to_string()));
         let pod_metadata_writer = Some(pod_metadata_writer_for_store(&store));
 
         let mut pod = Self {
             manifest,
-            worker: Some(worker),
+            engine: Some(worker),
             store,
             pod_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, 0),
@@ -4087,7 +4087,7 @@ where
     /// Restore a Pod from an existing session log.
     ///
     /// Uses the resolved manifest supplied by the caller, seeds a
-    /// fresh Worker from the source session's `RestoredState`, and
+    /// fresh Engine from the source session's `RestoredState`, and
     /// reuses the same `segment_id` so subsequent turns append to the
     /// source jsonl as a continuation of the same conversation.
     ///
@@ -4171,7 +4171,7 @@ where
 
         // Build the worker and apply the manifest defaults first, then
         // overwrite the pieces the session log is authoritative for.
-        let mut worker = Worker::new(common.client);
+        let mut worker = Engine::new(common.client);
         apply_worker_manifest(&mut worker, &manifest.worker);
         worker.set_cache_key(Some(segment_id.to_string()));
         if let Some(ref prompt) = state.system_prompt {
@@ -4184,7 +4184,7 @@ where
         let anchored_on_summary = matches!(
             state.history.first(),
             Some(Item::Message {
-                role: llm_worker::Role::System,
+                role: llm_engine::Role::System,
                 ..
             })
         );
@@ -4206,7 +4206,7 @@ where
 
         let mut pod = Self {
             manifest,
-            worker: Some(worker),
+            engine: Some(worker),
             store,
             pod_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, state.entries_count),
@@ -4327,12 +4327,12 @@ where
     }
 }
 
-/// Apply worker-level manifest settings to a Worker.
+/// Apply worker-level manifest settings to a Engine.
 ///
 /// Note: `system_prompt` is intentionally not applied here. It is a
 /// minijinja template that is parsed by `Pod::from_manifest` and
 /// rendered once at first turn in `ensure_system_prompt_materialized`.
-pub fn apply_worker_manifest<C: LlmClient>(worker: &mut Worker<C>, wm: &WorkerManifest) {
+pub fn apply_worker_manifest<C: LlmClient>(worker: &mut Engine<C>, wm: &WorkerManifest) {
     worker.set_request_config(request_config_from_worker_manifest(wm));
     worker.set_max_turns(wm.max_turns.map(|n| n.get()));
     worker.set_tool_output_limits(Some(ToolOutputLimits {
@@ -4415,15 +4415,15 @@ pub enum ManualCompactResult {
     Skipped { message: String },
 }
 
-impl From<WorkerResult> for PodRunResult {
-    fn from(r: WorkerResult) -> Self {
+impl From<EngineResult> for PodRunResult {
+    fn from(r: EngineResult) -> Self {
         match r {
-            WorkerResult::Finished => PodRunResult::Finished,
-            WorkerResult::Paused => PodRunResult::Paused,
-            WorkerResult::LimitReached => PodRunResult::LimitReached,
+            EngineResult::Finished => PodRunResult::Finished,
+            EngineResult::Paused => PodRunResult::Paused,
+            EngineResult::LimitReached => PodRunResult::LimitReached,
             // Yielded is internal to Pod: it's always caught by
             // handle_worker_result and never converted to PodRunResult.
-            WorkerResult::Yielded => unreachable!("Yielded never converts to PodRunResult"),
+            EngineResult::Yielded => unreachable!("Yielded never converts to PodRunResult"),
         }
     }
 }
@@ -4644,9 +4644,9 @@ fn message_overview_entry(idx: usize, item: &Item, max_chars: usize) -> Option<S
         return None;
     };
     let role_label = match role {
-        llm_worker::Role::User => "User",
-        llm_worker::Role::Assistant => "Assistant",
-        llm_worker::Role::System => "System",
+        llm_engine::Role::User => "User",
+        llm_engine::Role::Assistant => "Assistant",
+        llm_engine::Role::System => "System",
     };
     let text: String = content
         .iter()
@@ -4785,7 +4785,7 @@ fn preview_segments(segments: &[Segment]) -> String {
 #[derive(Debug, thiserror::Error)]
 pub enum PodError {
     #[error(transparent)]
-    Worker(#[from] WorkerError),
+    Engine(#[from] EngineError),
 
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -5644,19 +5644,19 @@ mod build_summary_prompt_tests {
     impl LlmClient for NoopClient {
         async fn stream(
             &self,
-            _request: llm_worker::llm_client::Request,
+            _request: llm_engine::llm_client::Request,
         ) -> Result<
             std::pin::Pin<
                 Box<
                     dyn futures::Stream<
                             Item = Result<
-                                llm_worker::llm_client::event::Event,
-                                llm_worker::llm_client::ClientError,
+                                llm_engine::llm_client::event::Event,
+                                llm_engine::llm_client::ClientError,
                             >,
                         > + Send,
                 >,
             >,
-            llm_worker::llm_client::ClientError,
+            llm_engine::llm_client::ClientError,
         > {
             Ok(Box::pin(futures::stream::empty()))
         }
@@ -5679,7 +5679,7 @@ mod build_summary_prompt_tests {
         let cwd = dir.path().join("workspace");
         std::fs::create_dir_all(&cwd).unwrap();
         let scope = Scope::writable(&cwd).unwrap();
-        let mut pod = Pod::new(manifest, Worker::new(NoopClient), store, cwd, scope)
+        let mut pod = Pod::new(manifest, Engine::new(NoopClient), store, cwd, scope)
             .await
             .unwrap();
         pod.ensure_segment_head().unwrap();
@@ -5794,9 +5794,9 @@ mod build_summary_prompt_tests {
                 .len(),
             expected_truncate_entries
         );
-        assert_eq!(pod.worker().history().len(), 1);
+        assert_eq!(pod.engine().history().len(), 1);
         assert_eq!(
-            pod.worker().history()[0].as_text().unwrap(),
+            pod.engine().history()[0].as_text().unwrap(),
             "first message"
         );
     }
@@ -5824,18 +5824,18 @@ mod build_summary_prompt_tests {
         let cwd = dir.path().join("workspace");
         std::fs::create_dir_all(&cwd).unwrap();
         let scope = Scope::writable(&cwd).unwrap();
-        let mut pod = Pod::new(manifest, Worker::new(NoopClient), store, cwd, scope)
+        let mut pod = Pod::new(manifest, Engine::new(NoopClient), store, cwd, scope)
             .await
             .unwrap();
 
         pod.ensure_segment_head().unwrap();
         pod.wire_history_persistence();
-        pod.worker_mut()
+        pod.engine_mut()
             .set_history(vec![Item::tool_call("call-1", "Read", "{}")]);
 
         pod.apply_interrupt_prep().unwrap();
 
-        let history = pod.worker().history();
+        let history = pod.engine().history();
         assert_eq!(history.len(), 3);
         assert!(matches!(history[1], Item::ToolResult { ref call_id, .. } if call_id == "call-1"));
         assert!(matches!(
@@ -5950,7 +5950,7 @@ mod build_summary_prompt_tests {
         let mut manifest = minimal_manifest_with_skills(vec![]);
         manifest.memory = memory_config;
         let scope = Scope::writable(&cwd).unwrap();
-        let mut pod = Pod::new(manifest, Worker::new(NoopClient), store, cwd.clone(), scope)
+        let mut pod = Pod::new(manifest, Engine::new(NoopClient), store, cwd.clone(), scope)
             .await
             .unwrap();
         pod.memory_layout = pod
@@ -5975,7 +5975,7 @@ mod build_summary_prompt_tests {
         .unwrap();
         pod.set_system_prompt_template(template);
         pod.ensure_system_prompt_materialized().unwrap();
-        pod.worker().get_system_prompt().unwrap().to_string()
+        pod.engine().get_system_prompt().unwrap().to_string()
     }
 
     fn summary_doc(body: &str) -> String {

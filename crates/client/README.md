@@ -18,7 +18,7 @@ Does not own:
 - product command names (`yoi`)
 - Pod state authority (`pod`, `pod-store`, `session-store`)
 - UI rendering (`tui`)
-- Worker turn semantics (`llm-worker`)
+- Engine turn semantics (`llm-engine`)
 
 ## Design notes
 

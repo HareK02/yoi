@@ -9,7 +9,7 @@ project-record = { workspace = true }
 async-trait = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 fs4 = { workspace = true, features = ["sync"] }
-llm-worker = { workspace = true }
+llm-engine = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

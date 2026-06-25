@@ -10,7 +10,7 @@ Owns:
 
 - session identifiers and segment lineage
 - JSONL log entries for replayable conversation/runtime history
-- restoring Worker/session state from committed records
+- restoring Engine/session state from committed records
 - schema surfaces that should make drift compile-visible
 
 Does not own:

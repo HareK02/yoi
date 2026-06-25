@@ -70,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 5. Extract the assistant's reply from history
-    let history = pod.worker().history();
+    let history = pod.engine().history();
     if let Some(text) = history
         .iter()
         .rev()

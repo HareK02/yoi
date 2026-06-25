@@ -1,19 +1,19 @@
-//! Prune integration — wires the Worker's prune projection to the Pod's
+//! Prune integration — wires the Engine's prune projection to the Pod's
 //! usage-history-backed token accounting.
 //!
-//! Worker 自身がコンテキスト射影を行う（`worker.rs` の `request_context` 構築
-//! 直後）。Worker は usage 履歴を知らないので、`min_savings` 判定に使う savings
+//! Engine 自身がコンテキスト射影を行う（`worker.rs` の `request_context` 構築
+//! 直後）。Engine は usage 履歴を知らないので、`min_savings` 判定に使う savings
 //! の見積もりはコールバックで外部から注入する。このモジュールはそのコールバック
-//! を組み立てて Worker に差し込むための `impl Pod` を提供する。
+//! を組み立てて Engine に差し込むための `impl Pod` を提供する。
 //!
 //! 同じ経路で `PruneObserver` も install し、評価のたびに `prune.fire` /
 //! `prune.skip` metric を `MetricsTracker` に積む。`Fired` 時は uuid を
 //! `UsageTracker` にも stash しておき、後続の `LlmUsage` と組で
 //! `prune.post_request` を吐けるようにする。
 
-use llm_worker::Item;
-use llm_worker::llm_client::client::LlmClient;
-use llm_worker::prune::{
+use llm_engine::Item;
+use llm_engine::llm_client::client::LlmClient;
+use llm_engine::prune::{
     PruneConfig, PruneDecision, PruneObserver, SavingsEstimator, TokenEstimator,
 };
 use session_metrics::Metric;
@@ -25,9 +25,9 @@ use crate::compact::token_counter::{
 };
 
 impl<C: LlmClient, St: Store> Pod<C, St> {
-    /// Enable prune projection on the underlying Worker.
+    /// Enable prune projection on the underlying Engine.
     ///
-    /// Registers the config and token/savings-estimator closures on the Worker.
+    /// Registers the config and token/savings-estimator closures on the Engine.
     /// The estimators combine persisted [`Pod::usage_history_handle`] records
     /// with in-flight `UsageTracker` records so multi-request tool loops can
     /// prune before the surrounding Pod run finishes.
@@ -100,7 +100,7 @@ impl<C: LlmClient, St: Store> Pod<C, St> {
             }
         });
 
-        let worker = self.worker_mut();
+        let worker = self.engine_mut();
         worker.set_prune_config(Some(config));
         worker.set_token_estimator(Some(token_estimator));
         worker.set_savings_estimator(Some(estimator));

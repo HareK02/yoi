@@ -2,7 +2,7 @@
 //!
 //! Entries are queued here by the Controller (on receipt of the
 //! corresponding IPC method) and drained by
-//! `PodInterceptor::pending_history_appends`, which the Worker calls
+//! `PodInterceptor::pending_history_appends`, which the Engine calls
 //! at the head of each turn loop iteration. The drain renders each
 //! pending entry into a typed `SystemItem` (with the `notify_wrapper`
 //! prompt applied), commits a `LogEntry::SystemItem` per entry through

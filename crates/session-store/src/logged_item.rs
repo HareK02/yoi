@@ -1,4 +1,4 @@
-//! Persistence-stable mirror of `llm_worker::Item`.
+//! Persistence-stable mirror of `llm_engine::Item`.
 //!
 //! `LogEntry` does not embed `Item` directly because that couples the on-disk
 //! schema to the LLM worker's internal type — a field rename or addition there
@@ -12,7 +12,7 @@
 //! `Reasoning::encrypted_content` is preserved because OpenAI Responses ZDR
 //! requires it on stateless re-send.
 
-use llm_worker::llm_client::types::{ContentPart, Item, Role};
+use llm_engine::llm_client::types::{ContentPart, Item, Role};
 use serde::{Deserialize, Serialize};
 
 fn is_false(value: &bool) -> bool {

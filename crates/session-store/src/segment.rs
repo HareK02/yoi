@@ -1,7 +1,7 @@
 //! Free functions for segment persistence operations.
 //!
-//! These functions record and restore segment state without owning a Worker.
-//! The caller (typically Pod) holds the Worker directly and calls these
+//! These functions record and restore segment state without owning a Engine.
+//! The caller (typically Pod) holds the Engine directly and calls these
 //! functions after state-mutating operations.
 
 use crate::logged_item::{LoggedItem, to_logged};
@@ -9,9 +9,9 @@ use crate::segment_log::{self, LogEntry, SegmentOrigin};
 use crate::store::{Store, StoreError};
 use crate::system_item::SystemItem;
 use crate::{SegmentId, SessionId};
-use llm_worker::WorkerResult;
-use llm_worker::llm_client::RequestConfig;
-use llm_worker::llm_client::types::Item;
+use llm_engine::EngineResult;
+use llm_engine::llm_client::RequestConfig;
+use llm_engine::llm_client::types::Item;
 use protocol::Segment;
 
 /// State snapshot for creating a SegmentStart entry.
@@ -89,7 +89,7 @@ pub fn create_compacted_segment(
 /// Restore segment state from a stored log.
 ///
 /// Returns the reconstructed state. The caller is responsible for
-/// applying it to a Worker.
+/// applying it to a Engine.
 pub fn restore(
     store: &impl Store,
     session_id: SessionId,
@@ -287,12 +287,12 @@ pub fn save_turn_end(
     )
 }
 
-/// Log a `RunCompleted` entry — `run()` / `resume()` returned `Ok(WorkerResult)`.
+/// Log a `RunCompleted` entry — `run()` / `resume()` returned `Ok(EngineResult)`.
 pub fn save_run_completed(
     store: &impl Store,
     session_id: SessionId,
     segment_id: SegmentId,
-    result: WorkerResult,
+    result: EngineResult,
     interrupted: bool,
 ) -> Result<(), StoreError> {
     append_entry(
@@ -307,9 +307,9 @@ pub fn save_run_completed(
     )
 }
 
-/// Log a `RunErrored` entry — `run()` / `resume()` returned `Err(WorkerError)`.
+/// Log a `RunErrored` entry — `run()` / `resume()` returned `Err(EngineError)`.
 ///
-/// `WorkerError` is not `Serialize`, so the caller passes a lossy
+/// `EngineError` is not `Serialize`, so the caller passes a lossy
 /// `to_string()` rendering as `message`.
 pub fn save_run_errored(
     store: &impl Store,

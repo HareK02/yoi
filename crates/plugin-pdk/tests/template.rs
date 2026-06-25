@@ -179,7 +179,7 @@ fn pdk_runtime_dependencies_are_guest_side_only() {
     let forbidden = [
         "pod",
         "yoi-pod",
-        "llm-worker",
+        "llm-engine",
         "tui",
         "yoi-tui",
         "client",

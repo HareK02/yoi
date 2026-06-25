@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use llm_worker::Item;
+use llm_engine::Item;
 
 mod store;
 mod tool_impl;

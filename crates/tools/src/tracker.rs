@@ -40,7 +40,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
 
-use llm_worker::tool::ToolExecutionContext;
+use llm_engine::tool::ToolExecutionContext;
 use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
@@ -142,7 +142,7 @@ impl Tracker {
     /// Acquire the per-target-file mutation guard shared by `Write` and `Edit`.
     ///
     /// The guard is keyed by canonical target path where possible so equivalent
-    /// paths serialize through the same lock. Worker still executes tool calls in
+    /// paths serialize through the same lock. Engine still executes tool calls in
     /// parallel; this only gates the critical filesystem mutation section for
     /// builtin file mutation tools.
     pub(crate) async fn acquire_mutation(
