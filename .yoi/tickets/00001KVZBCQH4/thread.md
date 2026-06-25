@@ -501,3 +501,26 @@ Residual risks / review focus:
 - Event subscription は意図通り poll-only placeholder。後続 streaming 実装時に cursor semantics が十分か確認する。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZBCQH4-runtime-packaging at: 2026-06-25T16:37:25Z -->
+
+## Implementation report
+
+Packaging follow-up implementation report:
+
+対応内容:
+- `package.nix` の `cargoHash` のみ更新。
+- New hash: `sha256-RHo2b6dVClqu32wpgES/RQeBMXaqyqXZaooeSH5SveM=`
+
+Commit:
+- `593db95175ff8537af2401a5def21fc32dd4846d fix: update nix cargo hash`
+
+Validation:
+- `nix build .#yoi --no-link`: success
+- `git diff --check`: success
+
+Residual notes:
+- 作業ツリーは clean。
+- merge / close / cleanup は未実施。
+
+---
