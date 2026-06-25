@@ -155,3 +155,23 @@ Recovery needed:
 - If retry remains impossible, use an explicit human-authorized alternative implementation route.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-25T19:24:59Z -->
+
+## Implementation report
+
+Implementation recovery / kickoff:
+
+- User reported the previous SpawnPod failure was caused by a development environment variable forcing child launch from `target` binary. The variable was removed and installed binary is now used.
+- Retried Coder Worker spawn for the already accepted worktree; spawn succeeded.
+
+Active implementation:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KVZKST83-worker-runtime-fs-store`
+- Branch: `work/00001KVZKST83-worker-runtime-fs-store`
+- Coder Worker: `yoi-coder-00001KVZKST83-fs-store`
+- Scope: read implementation worktree + non-recursive workspace root, write `crates/worker-runtime/**`, root `Cargo.toml`, `Cargo.lock`, and `package.nix` only.
+
+Next action:
+- Wait for Coder implementation report, then route to reviewer.
+
+---
