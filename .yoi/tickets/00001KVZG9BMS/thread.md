@@ -696,3 +696,35 @@ Review result: approve
 検証コマンド自体は read-only 方針のため再実行していないが、報告された validation 内容と今回の差分・grep 確認から、これまでの request_changes blockers は解消済みと判断する。
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-25T16:17:59Z -->
+
+## Decision
+
+Routing decision: blocked_by_dependency_or_missing_authority
+
+Reason:
+- Dashboard 起点の `/ticket-orchestrator-routing` で target Ticket は未指定だったため、queue 状態を再確認した。
+- `TicketList` では `queued` 0 件、`ready` 0 件、`inprogress` 1 件のみ。追加で受理すべき queued Ticket はない。
+- 唯一の active Ticket は本 Ticket `00001KVZG9BMS`。実装 branch は reviewer approve 済みで、orchestration worktree には merge commit `2a7e8775 merge: 00001KVZG9BMS worker crate rename` がある。
+- ただし Orchestrator 側の最終 validation 実行はユーザー割り込みで中断され、merge 後の Orchestrator validation / done 遷移 / child worktree cleanup の evidence はまだ Ticket に記録されていない。
+- 今回の workflow invocation は「Dashboard opened... wait for explicit follow-up before spawning role Pods」という指示付きであり、この routing pass では新規 role Pod は spawn しない。
+
+Evidence checked:
+- Ticket body / thread: rename 要件、accepted IntentPacket、Coder implementation reports、Reviewer approve (`60dbd724` follow-up) を確認。
+- Relations: outgoing dependency `00001KVZD10ED`、incoming dependent `00001KVZBCQH4`。derived blockers は空。
+- Orchestration plan: accepted plan `orch-plan-20260625-141406-1` は implementation worktree `/home/hare/Projects/yoi/.worktree/00001KVZG9BMS-worker-crate-rename` / branch `work/00001KVZG9BMS-worker-crate-rename`。
+- Repository/worktree: orchestration branch HEAD は `2a7e8775` merge commit、working tree は clean。implementation worktree remains at `60dbd724` and clean per prior checks.
+- Visible Workers/Pods: existing coder/reviewer child Workers are idle; no new child Worker was spawned in this routing pass.
+
+Next action:
+- 明示 follow-up があれば、orchestration worktree で interrupted final validation を再開する。
+- validation が通れば結果を implementation_report として記録し、`inprogress -> done`、必要な cleanup（child Workers stop、implementation worktree/branch cleanup）へ進む。
+- validation/review evidence に新 blocker が出た場合だけ、追加修正または reviewer loop を検討する。新規 role Worker spawn は明示 follow-up/authority のもとで行う。
+
+Escalate if:
+- merge 後 validation が失敗する。
+- cleanup が dirty worktree / branch divergence / live Worker scope conflict で blocked になる。
+- `develop` など merge target への反映権限・タイミングについて追加判断が必要になる。
+
+---
