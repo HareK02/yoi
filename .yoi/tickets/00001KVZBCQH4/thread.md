@@ -634,3 +634,55 @@ Review result: approve
 補足: read-only 指示を優先し、`cargo test` / `nix build` は再実行していません。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-25T16:53:37Z -->
+
+## Implementation report
+
+Integration / validation report:
+
+Integration:
+- Implementation branch `work/00001KVZBCQH4-worker-runtime-core` を orchestration branch に merge 済み。
+- Merge commit: `56bdf955 merge: 00001KVZBCQH4 worker runtime core`
+
+Included implementation commits:
+- `9b2cae32 feat: add memory worker runtime crate`
+- `593db951 fix: update nix cargo hash`
+- `fbd358a1 fix: keep worker terminal lifecycle stable`
+
+Validation in Orchestrator worktree:
+- `cargo fmt --all --check`: success
+- `cargo test -p worker-runtime`: success（8 tests passed）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Review:
+- Reviewer approve 済み。前回 blocker だった `stop_worker` / `cancel_worker` terminal lifecycle invariant は解消済み。
+
+Outcome:
+- Acceptance criteria を満たしたため `done` へ進める。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-25T16:53:46Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+worker-runtime core crate の実装、review、merge、Orchestrator validation が完了した。
+
+Done evidence:
+- Merge commit: `56bdf955 merge: 00001KVZBCQH4 worker runtime core`
+- Reviewer approve 済み。
+- Orchestrator validation:
+  - `cargo fmt --all --check`: success
+  - `cargo test -p worker-runtime`: success（8 tests passed）
+  - `cargo check -p yoi`: success
+  - `git diff --check`: success
+  - `nix build .#yoi --no-link`: success
+
+Scope:
+- `crates/worker-runtime` の memory-backed core Runtime API を追加。
+- HTTP/WS/FS/Backend integration/config bundle sync は Non-goals として未実装。
+
+---
