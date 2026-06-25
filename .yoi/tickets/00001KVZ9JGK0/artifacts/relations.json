@@ -4,6 +4,14 @@
     {
       "ticket_id": "00001KVZ9JGK0",
       "kind": "depends_on",
+      "target": "00001KVZKSTJT",
+      "note": "Companion Web Console MVP has response stream / transcript projection choices and must not fix WS/SSE/polling behavior before `00001KVZKSTJT` resolves the WebSocket/event-stream transport design decision.",
+      "author": "yoi-orchestrator",
+      "at": "2026-06-25T20:22:58Z"
+    },
+    {
+      "ticket_id": "00001KVZ9JGK0",
+      "kind": "depends_on",
       "target": "00001KVZSGT0Q",
       "note": "Backend internal Companion Web Console should build on embedded worker-runtime registration in Backend RuntimeRegistry.",
       "author": "yoi ticket",
