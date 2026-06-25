@@ -18,7 +18,7 @@
 //! `.yoi/workflow/`.
 //!
 //! `memory.workspace_root` pins this root explicitly. Without an explicit
-//! root, resolution searches upward from the Pod pwd for a `.yoi/memory`
+//! root, resolution searches upward from the Worker pwd for a `.yoi/memory`
 //! marker; `.yoi` project records alone are not a memory marker.
 
 use std::path::{Path, PathBuf};

@@ -1,6 +1,6 @@
 //! `LogEntry::Extension { domain: "memory.extract", payload }` の payload 形式と
 //! restore 時の fold ヘルパー。memory crate がドメインを所有するので、
-//! session-store / Pod は payload 構造を知らない。
+//! session-store / Worker は payload 構造を知らない。
 
 use serde::{Deserialize, Serialize};
 

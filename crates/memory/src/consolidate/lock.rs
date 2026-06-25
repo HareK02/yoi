@@ -2,7 +2,7 @@
 //!
 //! `docs/plan/memory.md` §並走防止 に従い:
 //!
-//! - ファイルが存在し、記録された Pod が動作している間、その Pod が排他占有
+//! - ファイルが存在し、記録された Worker が動作している間、その Worker が排他占有
 //! - クラッシュで残った stale lock は、所有者 PID が死んでいれば次回 spawn
 //!   時に上書き取得できる
 //! - cleanup は consumed ID の staging エントリのみ削除し、実行中に extract
@@ -22,12 +22,12 @@ use crate::workspace::WorkspaceLayout;
 
 const LOCK_FILE: &str = ".consolidation.lock";
 
-/// 占有ファイルの中身。`pid` で stale 判定し、`pod_name` / `started_at` /
+/// 占有ファイルの中身。`pid` で stale 判定し、`worker_name` / `started_at` /
 /// `consumed_ids` は診断とクラッシュ復旧時の参照に使う。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockRecord {
     pub pid: u32,
-    pub pod_name: String,
+    pub worker_name: String,
     pub started_at: DateTime<Utc>,
     /// この consolidation run が起動時スナップショットで確定した consumed staging
     /// entry の UUIDv7 列。完了時はこの列のみ削除し、追加分は残す。
@@ -38,8 +38,8 @@ pub struct LockRecord {
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
     /// 占有ファイルが既にあり、所有者 PID が生きているのでスキップ。
-    #[error("consolidation lock held by live pid {pid} (pod {pod_name:?})")]
-    InUse { pid: u32, pod_name: String },
+    #[error("consolidation lock held by live pid {pid} (worker {worker_name:?})")]
+    InUse { pid: u32, worker_name: String },
     #[error("io error at {}: {source}", .path.display())]
     Io {
         path: PathBuf,
@@ -85,7 +85,7 @@ impl StagingLock {
     pub fn acquire(
         layout: &WorkspaceLayout,
         pid: u32,
-        pod_name: impl Into<String>,
+        worker_name: impl Into<String>,
         consumed_ids: Vec<Uuid>,
     ) -> Result<Self, LockError> {
         let staging_dir = layout.staging_dir();
@@ -99,12 +99,12 @@ impl StagingLock {
                 if pid_is_alive(existing.pid) {
                     return Err(LockError::InUse {
                         pid: existing.pid,
-                        pod_name: existing.pod_name,
+                        worker_name: existing.worker_name,
                     });
                 }
                 tracing::warn!(
                     stale_pid = existing.pid,
-                    stale_pod = %existing.pod_name,
+                    stale_pod = %existing.worker_name,
                     "consolidation stale lock detected, taking over"
                 );
             } else {
@@ -114,7 +114,7 @@ impl StagingLock {
 
         let record = LockRecord {
             pid,
-            pod_name: pod_name.into(),
+            worker_name: worker_name.into(),
             started_at: Utc::now(),
             consumed_ids,
         };
@@ -213,11 +213,11 @@ mod tests {
     #[test]
     fn acquire_writes_lock_file() {
         let (_dir, layout) = make_layout();
-        let lock = StagingLock::acquire(&layout, std::process::id(), "pod", Vec::new()).unwrap();
+        let lock = StagingLock::acquire(&layout, std::process::id(), "worker", Vec::new()).unwrap();
         let path = layout.staging_dir().join(LOCK_FILE);
         assert!(path.exists());
         assert_eq!(lock.record().pid, std::process::id());
-        assert_eq!(lock.record().pod_name, "pod");
+        assert_eq!(lock.record().worker_name, "worker");
     }
 
     #[test]
@@ -225,8 +225,8 @@ mod tests {
         let (_dir, layout) = make_layout();
         // Use this test process's pid — it's definitely alive.
         let _first =
-            StagingLock::acquire(&layout, std::process::id(), "pod-a", Vec::new()).unwrap();
-        let err = StagingLock::acquire(&layout, std::process::id(), "pod-b", Vec::new())
+            StagingLock::acquire(&layout, std::process::id(), "worker-a", Vec::new()).unwrap();
+        let err = StagingLock::acquire(&layout, std::process::id(), "worker-b", Vec::new())
             .expect_err("expected InUse");
         assert!(matches!(err, LockError::InUse { .. }));
     }
@@ -239,7 +239,7 @@ mod tests {
         // dead on every platform we target.
         let stale = LockRecord {
             pid: u32::MAX,
-            pod_name: "ghost".into(),
+            worker_name: "ghost".into(),
             started_at: Utc::now(),
             consumed_ids: Vec::new(),
         };
@@ -249,7 +249,7 @@ mod tests {
         )
         .unwrap();
 
-        let lock = StagingLock::acquire(&layout, std::process::id(), "pod", Vec::new())
+        let lock = StagingLock::acquire(&layout, std::process::id(), "worker", Vec::new())
             .expect("stale lock must be overwritable");
         assert_eq!(lock.record().pid, std::process::id());
     }
@@ -276,7 +276,7 @@ mod tests {
         )
         .unwrap();
 
-        let lock = StagingLock::acquire(&layout, std::process::id(), "pod", vec![id_a]).unwrap();
+        let lock = StagingLock::acquire(&layout, std::process::id(), "worker", vec![id_a]).unwrap();
         let lock_path = lock.path().to_path_buf();
         lock.release_with_cleanup(&layout);
 
@@ -295,7 +295,8 @@ mod tests {
     fn release_is_resilient_to_missing_consumed_entries() {
         let (_dir, layout) = make_layout();
         let phantom = uuid::Uuid::now_v7();
-        let lock = StagingLock::acquire(&layout, std::process::id(), "pod", vec![phantom]).unwrap();
+        let lock =
+            StagingLock::acquire(&layout, std::process::id(), "worker", vec![phantom]).unwrap();
         let lock_path = lock.path().to_path_buf();
         // No file at <staging>/<phantom>.json — release must not panic.
         lock.release_with_cleanup(&layout);

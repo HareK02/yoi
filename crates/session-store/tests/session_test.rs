@@ -103,7 +103,7 @@ async fn run_and_persist(
     segment_id: session_store::SegmentId,
     input: &str,
 ) -> (Engine<MockLlmClient>, llm_engine::EngineResult) {
-    // Mirror Pod's run-entry contract: log the user input as segments
+    // Mirror Worker's run-entry contract: log the user input as segments
     // before the worker pushes its flattened user_message; save_delta
     // skips the resulting user_message item to avoid double-write.
     session_store::save_user_input(
@@ -450,7 +450,7 @@ async fn session_auto_forks_on_conflict() {
     // Writer tracked: just the SegmentStart we wrote.
     let mut entries_written: usize = 1;
 
-    // Simulate another Pod writing to the same segment behind our back.
+    // Simulate another Worker writing to the same segment behind our back.
     let extra_entry = LogEntry::UserInput {
         ts: 9999,
         segments: vec![protocol::Segment::text("Interloper")],

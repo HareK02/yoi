@@ -1,15 +1,15 @@
 # ============================================================================
-# Pod Manifest リファレンス
+# Worker Manifest リファレンス
 # ============================================================================
-# Pod の宣言的設定 (`PodManifest` / `PodManifestConfig`)。
+# Worker の宣言的設定 (`WorkerManifest` / `WorkerManifestConfig`)。
 #
 # このファイル形式は低レベル runtime manifest。通常起動は profile discovery/default
 # (`profiles.toml` と bundled builtin profile) から manifest を生成する。
-# `yoi pod --manifest <path>` の one-file compatibility/debug mode では、
+# `yoi worker --manifest <path>` の one-file compatibility/debug mode では、
 # 指定した TOML 1 枚に builtin defaults を merge し、required validation を行う。
 # user/project `manifest.toml` を暗黙に merge する通常起動 cascade は使わない。
 #
-# `PodManifestConfig` の merge 規則: 上の層が同名フィールドを上書き、scope rule と
+# `WorkerManifestConfig` の merge 規則: 上の層が同名フィールドを上書き、scope rule と
 # skills.directories は累積マージ、tool_output.per_tool は key 単位でマージ。
 #
 # パス解決: `--manifest <path>` では相対パスはその manifest ファイルの親ディレクトリ
@@ -23,11 +23,11 @@
 # ----------------------------------------------------------------------------
 
 
-# ===== [pod] ================================================================
-# Pod メタデータ。
-[pod]
+# ===== [worker] ================================================================
+# Worker メタデータ。
+[worker]
 
-# 必須。Pod の表示名 (ResolveError::MissingField("pod.name") の対象)。
+# 必須。Worker の表示名 (ResolveError::MissingField("worker.name") の対象)。
 name = "example-agent"
 
 # 任意。デフォルト: なし。
@@ -91,9 +91,9 @@ ref = "anthropic/claude-sonnet-4-6"
 # prompt_caching    = { kind = "explicit", max_breakpoints = 4 }
 
 
-# ===== [worker] =============================================================
+# ===== [engine] =============================================================
 # ワーカーの生成パラメータ等。セクション自体省略可 (全フィールド任意)。
-[worker]
+[engine]
 
 # 任意。デフォルト: "$yoi/default" (`defaults::DEFAULT_INSTRUCTION`)。
 # システムプロンプト本体の `PromptLoader` 参照。
@@ -148,7 +148,7 @@ ref = "anthropic/claude-sonnet-4-6"
 
 
 # ===== [scope] ==============================================================
-# Pod がアクセスできるディレクトリ／ファイル範囲。
+# Worker がアクセスできるディレクトリ／ファイル範囲。
 #   - allow: 最低 1 件必要 (空だと ResolveError / ScopeError::EmptyAllow)。
 #            複数 allow がマッチした場合は最大の permission が採用される。
 #   - deny : 任意。マッチした deny の最小 permission *未満* に effective を
@@ -202,7 +202,7 @@ permission = "write"
 # compact_threshold = 80000
 #
 # # 任意。デフォルト: なし (safety-net compact 無効)。
-# # ターン中チェック (PodInterceptor::pre_llm_request)。期待される関係:
+# # ターン中チェック (WorkerInterceptor::pre_llm_request)。期待される関係:
 # #   compact_threshold < compact_request_threshold (proactive を先に発火)。
 # # 逆順設定は許容するが warn ログを出す。
 # compact_request_threshold = 90000
@@ -233,12 +233,12 @@ permission = "write"
 # Memory subsystem の opt-in。
 #   - セクションが *ある*    … memory tools (MemoryRead/Write/Edit) を登録、
 #                              `<workspace>/memory/` と `<workspace>/knowledge/`
-#                              の通常 write を Pod 自体に対して deny する。
+#                              の通常 write を Worker 自体に対して deny する。
 #   - セクションが *無い*    … 何も起きない (legacy 動作)。
 # `[memory]` だけ書いて中身を省略するのも有効 (全フィールド既定値で有効化)。
 # [memory]
 #
-# # 任意。デフォルト: Pod の pwd (構築時)。
+# # 任意。デフォルト: Worker の pwd (構築時)。
 # # 必ず絶対パス (相対なら manifest base 起点で resolve)。
 # workspace_root = "/abs/path/to/workspace"
 #

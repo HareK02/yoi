@@ -16,7 +16,7 @@ Does not own:
 
 - generated memory records (`memory`)
 - Ticket file lifecycle (`crates/ticket`, `.yoi/tickets/`)
-- Pod orchestration decisions (`pod`, workflows executed by agents)
+- Worker orchestration decisions (`worker`, workflows executed by agents)
 - product CLI command shape (`yoi`)
 
 ## Design notes

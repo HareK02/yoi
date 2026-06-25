@@ -58,10 +58,10 @@ pub enum LogEntry {
     /// IDLE → active marker. Records the start of a new self-driving
     /// cycle (Invoke range). The range extends implicitly until the
     /// next `Invoke` entry; this entry carries the trigger only — the
-    /// actual payload (user text / notify message / pod event body) is
+    /// actual payload (user text / notify message / worker event body) is
     /// in the immediately following Turn entry (`UserInput` / `SystemItem`).
     ///
-    /// Used by `pod-session-fork` style operations: the fork-point seq
+    /// Used by `worker-session-fork` style operations: the fork-point seq
     /// (`at_turn_index` in persistence-semantics) points at one of these
     /// `Invoke` entries so "back to N-th send" maps cleanly to the
     /// IDLE-break boundary the user sees.
@@ -87,7 +87,7 @@ pub enum LogEntry {
     /// One tool-execution result appended to history.
     ToolResult { ts: u64, item: LoggedItem },
 
-    /// One typed agent-injected system item: notification, child-Pod
+    /// One typed agent-injected system item: notification, child-Worker
     /// lifecycle event, `@<path>` / `#<slug>` / `/<slug>` resolution
     /// payload. Each `SystemItem` carries kind metadata that the LLM
     /// itself never sees (the LLM gets `Item::system_message` with the
@@ -117,7 +117,7 @@ pub enum LogEntry {
 
     /// A paused interrupted turn was explicitly abandoned without calling
     /// `run()` or `resume()` again. Replay clears the interrupted marker so
-    /// the restored Pod is idle and future user input starts a normal new turn.
+    /// the restored Worker is idle and future user input starts a normal new turn.
     PausedTurnAbandoned { ts: u64 },
 
     /// `RequestConfig` changed.

@@ -1,7 +1,7 @@
 //! Read-only analytics for Yoi session JSONL logs.
 //!
 //! This crate intentionally parses the persisted JSON shape tolerantly with
-//! `serde_json::Value` rather than depending on Pod runtime or TUI crates. The
+//! `serde_json::Value` rather than depending on Worker runtime or TUI crates. The
 //! report contains counts, paths, sizes, line/turn indexes, and bounded
 //! diagnostics; raw user messages, tool arguments, and tool output snippets are
 //! not emitted.
@@ -1592,12 +1592,17 @@ fn line_count(value: &str) -> usize {
 }
 
 fn tool_kind(name: &str) -> &'static str {
+    const LEGACY_SEND_TO_PEER_POD_TOOL: &str = "SendToPeerPod";
+
     match name {
         "Read" | "Write" | "Edit" | "Glob" | "Grep" => "filesystem",
         "Bash" => "shell",
         "WebFetch" | "WebSearch" => "web",
-        "SpawnPod" | "SendToPod" | "ReadPodOutput" | "ListPods" | "StopPod" | "RestorePod"
-        | "SendToPeerPod" => "pod",
+        "SpawnWorker" | "SendToWorker" | "SendToPeerWorker" | "ReadWorkerOutput"
+        | "ListWorkers" | "StopWorker" | "RestoreWorker" => "worker",
+        // Legacy session logs used the pre-rename peer tool name; keep analytics classification only.
+        /* legacy session-log tool name only */
+        LEGACY_SEND_TO_PEER_POD_TOOL => "worker",
         name if name.starts_with("Memory") || name.starts_with("Knowledge") => "memory",
         name if name.starts_with("Ticket") => "ticket",
         name if name.starts_with("Task") => "task",

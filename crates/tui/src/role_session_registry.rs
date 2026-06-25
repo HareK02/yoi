@@ -28,7 +28,7 @@ pub(crate) struct RoleSessionRegistry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RoleSessionRecord {
     pub role: String,
-    pub pod_name: String,
+    pub worker_name: String,
     pub origin: RoleSessionOrigin,
     pub created_at: String,
     pub updated_at: String,
@@ -58,7 +58,7 @@ pub(crate) struct TicketClaim {
     pub ticket_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket_slug: Option<String>,
-    pub pod_name: String,
+    pub worker_name: String,
     pub role: String,
 }
 
@@ -89,7 +89,7 @@ impl std::fmt::Display for PanelRegistryError {
             Self::TicketAlreadyClaimed(claim) => write!(
                 f,
                 "Ticket {} is already claimed locally by {} ({})",
-                claim.ticket_id, claim.pod_name, claim.role
+                claim.ticket_id, claim.worker_name, claim.role
             ),
         }
     }
@@ -165,33 +165,33 @@ impl PanelRegistryStore {
 
     pub(crate) fn record_session(
         &self,
-        pod_name: impl Into<String>,
+        worker_name: impl Into<String>,
         role: impl Into<String>,
         origin: RoleSessionOrigin,
         session_id: Option<String>,
         related_tickets: impl IntoIterator<Item = RelatedTicketRef>,
     ) -> Result<(), PanelRegistryError> {
-        let pod_name = pod_name.into();
+        let worker_name = worker_name.into();
         let role = role.into();
         let related_tickets: Vec<RelatedTicketRef> = related_tickets.into_iter().collect();
         self.update_registry(|registry| {
             let now = now_timestamp_string();
             let mut tickets: BTreeSet<RelatedTicketRef> = registry
                 .sessions
-                .get(&pod_name)
+                .get(&worker_name)
                 .map(|record| record.related_tickets.iter().cloned().collect())
                 .unwrap_or_default();
             tickets.extend(related_tickets);
             let created_at = registry
                 .sessions
-                .get(&pod_name)
+                .get(&worker_name)
                 .map(|record| record.created_at.clone())
                 .unwrap_or_else(|| now.clone());
             registry.sessions.insert(
-                pod_name.clone(),
+                worker_name.clone(),
                 RoleSessionRecord {
                     role,
-                    pod_name,
+                    worker_name,
                     origin,
                     created_at,
                     updated_at: now,
@@ -207,7 +207,7 @@ impl PanelRegistryStore {
         &self,
         ticket_id: &str,
         ticket_slug: Option<&str>,
-        pod_name: &str,
+        worker_name: &str,
         role: &str,
     ) -> Result<TicketClaimResult, PanelRegistryError> {
         fs::create_dir_all(self.claims_dir())?;
@@ -215,13 +215,13 @@ impl PanelRegistryStore {
         let claim = TicketClaim {
             ticket_id: ticket_id.to_string(),
             ticket_slug: ticket_slug.map(ToOwned::to_owned),
-            pod_name: pod_name.to_string(),
+            worker_name: worker_name.to_string(),
             role: role.to_string(),
         };
         match self.create_claim_file(&claim_path, &claim) {
             Ok(()) => {
                 if let Err(error) = self.record_session(
-                    pod_name.to_string(),
+                    worker_name.to_string(),
                     role.to_string(),
                     RoleSessionOrigin::TicketClaim,
                     None,
@@ -237,7 +237,7 @@ impl PanelRegistryStore {
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let existing = self.load_claim(ticket_id)?;
-                if existing.pod_name == pod_name && existing.role == role {
+                if existing.worker_name == worker_name && existing.role == role {
                     Ok(TicketClaimResult::AlreadyOwned(existing))
                 } else {
                     Err(PanelRegistryError::TicketAlreadyClaimed(existing))
@@ -485,7 +485,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, PanelRegistryError::TicketAlreadyClaimed(_)));
         let claim = store.claim_for_ticket("T-1").unwrap().unwrap();
-        assert_eq!(claim.pod_name, "ticket-one-intake");
+        assert_eq!(claim.worker_name, "ticket-one-intake");
         assert_eq!(claim.ticket_slug.as_deref(), Some("ticket-one"));
     }
 
@@ -526,12 +526,12 @@ mod tests {
         let preticket = snapshot
             .sessions
             .iter()
-            .find(|session| session.pod_name == "ticket-intake-preticket")
+            .find(|session| session.worker_name == "ticket-intake-preticket")
             .unwrap();
         let shared = snapshot
             .sessions
             .iter()
-            .find(|session| session.pod_name == "ticket-intake-shared")
+            .find(|session| session.worker_name == "ticket-intake-shared")
             .unwrap();
 
         assert!(preticket.related_tickets.is_empty());

@@ -11,24 +11,24 @@ use crate::conflict::{find_conflict_owner, find_conflict_owners};
 use crate::error::ScopeLockError;
 use crate::table::{Allocation, LockFileGuard};
 
-/// Register a top-level Pod (started directly by a human, no
+/// Register a top-level Worker (started directly by a human, no
 /// delegation parent). Reclaims stale entries before checking
-/// conflicts so a crashed Pod's allocation doesn't block the new one.
+/// conflicts so a crashed Worker's allocation doesn't block the new one.
 ///
 /// Rejects when another live allocation is already writing to
 /// `segment_id`, so two `restore_from_manifest` calls under different
-/// `pod_name`s cannot both grab the same session log.
-pub fn register_pod(
+/// `worker_name`s cannot both grab the same session log.
+pub fn register_worker(
     guard: &mut LockFileGuard,
-    pod_name: String,
+    worker_name: String,
     pid: u32,
     socket: PathBuf,
     scope_allow: Vec<ScopeRule>,
     segment_id: SegmentId,
 ) -> Result<(), ScopeLockError> {
-    register_pod_with_deny(
+    register_worker_with_deny(
         guard,
-        pod_name,
+        worker_name,
         pid,
         socket,
         scope_allow,
@@ -37,21 +37,21 @@ pub fn register_pod(
     )
 }
 
-/// Register a top-level Pod with explicit deny rules that reduce the
+/// Register a top-level Worker with explicit deny rules that reduce the
 /// claimed effective write scope.
 ///
-/// Conflict semantics: if every Pod overlapping a requested allow rule
+/// Conflict semantics: if every Worker overlapping a requested allow rule
 /// is fully covered by one of `scope_deny`, the conflict is suppressed
 /// and the registration proceeds. The check is structural (deny ⊇
 /// competitor.rule), not relational — it does not verify that the
-/// competitor actually descends from this Pod's prior delegations.
+/// competitor actually descends from this Worker's prior delegations.
 /// In practice this is safe because the canonical restore caller derives
 /// `scope_deny` from outstanding `pod-store` child delegations, so any
 /// covered competitor is expected to be a descendant of the original
 /// allocation. Direct callers must uphold the same invariant.
-pub fn register_pod_with_deny(
+pub fn register_worker_with_deny(
     guard: &mut LockFileGuard,
-    pod_name: String,
+    worker_name: String,
     pid: u32,
     socket: PathBuf,
     scope_allow: Vec<ScopeRule>,
@@ -59,13 +59,13 @@ pub fn register_pod_with_deny(
     segment_id: SegmentId,
 ) -> Result<(), ScopeLockError> {
     reclaim_stale(guard);
-    if guard.data().find(&pod_name).is_some() {
-        return Err(ScopeLockError::DuplicatePodName(pod_name));
+    if guard.data().find(&worker_name).is_some() {
+        return Err(ScopeLockError::DuplicateWorkerName(worker_name));
     }
     if let Some(existing) = guard.data().find_by_segment(segment_id) {
         return Err(ScopeLockError::SegmentConflict {
             segment_id,
-            pod_name: existing.pod_name.clone(),
+            worker_name: existing.worker_name.clone(),
             socket: existing.socket.clone(),
         });
     }
@@ -86,14 +86,14 @@ pub fn register_pod_with_deny(
         }
         if let Some(competitor) = conflicts.into_iter().next() {
             return Err(ScopeLockError::WriteConflict {
-                competitor: competitor.pod_name,
+                competitor: competitor.worker_name,
                 rule: rule.clone(),
                 competitor_rule: competitor.rule,
             });
         }
     }
     guard.data_mut().allocations.push(Allocation {
-        pod_name,
+        worker_name,
         pid,
         socket,
         scope_allow,
@@ -105,9 +105,9 @@ pub fn register_pod_with_deny(
     Ok(())
 }
 
-/// Register a spawned Pod whose scope is delegated from `spawner`.
+/// Register a spawned Worker whose scope is delegated from `spawner`.
 /// The requested scope must be within the spawner's delegation authority;
-/// overlap with any Pod other than `spawner` is a conflict.
+/// overlap with any Worker other than `spawner` is a conflict.
 pub fn delegate_scope(
     guard: &mut LockFileGuard,
     spawner: &str,
@@ -119,10 +119,10 @@ pub fn delegate_scope(
 ) -> Result<(), ScopeLockError> {
     reclaim_stale(guard);
     if guard.data().find(&spawned).is_some() {
-        return Err(ScopeLockError::DuplicatePodName(spawned));
+        return Err(ScopeLockError::DuplicateWorkerName(spawned));
     }
     if guard.data().find(spawner).is_none() {
-        return Err(ScopeLockError::UnknownPod(spawner.into()));
+        return Err(ScopeLockError::UnknownWorker(spawner.into()));
     }
     for rule in &scope_allow {
         let allowed = delegation_scope
@@ -137,7 +137,7 @@ pub fn delegate_scope(
         if rule.permission == Permission::Write {
             if let Some(competitor) = find_conflict_owner(guard.data(), rule, Some(spawner)) {
                 return Err(ScopeLockError::WriteConflict {
-                    competitor: competitor.pod_name,
+                    competitor: competitor.worker_name,
                     rule: rule.clone(),
                     competitor_rule: competitor.rule,
                 });
@@ -145,7 +145,7 @@ pub fn delegate_scope(
         }
     }
     guard.data_mut().allocations.push(Allocation {
-        pod_name: spawned,
+        worker_name: spawned,
         pid,
         socket,
         scope_allow,
@@ -159,21 +159,21 @@ pub fn delegate_scope(
     Ok(())
 }
 
-/// Remove a Pod's allocation. Surviving children are reparented to
-/// the removed Pod's own `delegated_from`, so the delegation tree
+/// Remove a Worker's allocation. Surviving children are reparented to
+/// the removed Worker's own `delegated_from`, so the delegation tree
 /// stays connected.
-pub fn release_pod(guard: &mut LockFileGuard, pod_name: &str) -> Result<(), ScopeLockError> {
+pub fn release_worker(guard: &mut LockFileGuard, worker_name: &str) -> Result<(), ScopeLockError> {
     let idx = guard
         .data()
         .allocations
         .iter()
-        .position(|a| a.pod_name == pod_name);
+        .position(|a| a.worker_name == worker_name);
     let Some(idx) = idx else {
-        return Err(ScopeLockError::UnknownPod(pod_name.into()));
+        return Err(ScopeLockError::UnknownWorker(worker_name.into()));
     };
     let removed = guard.data().allocations[idx].clone();
     for alloc in guard.data_mut().allocations.iter_mut() {
-        if alloc.delegated_from.as_deref() == Some(pod_name) {
+        if alloc.delegated_from.as_deref() == Some(worker_name) {
             alloc.delegated_from.clone_from(&removed.delegated_from);
         }
     }
@@ -187,7 +187,7 @@ pub fn release_pod(guard: &mut LockFileGuard, pod_name: &str) -> Result<(), Scop
 /// This is idempotent for missing deny entries. For each delegated Write rule,
 /// at most one exact matching deny rule is removed from the parent's `scope_deny`
 /// even when the child allocation is already absent; restore reconciliation uses
-/// that case when durable Pod-state still records an outstanding delegation but
+/// that case when durable Worker-state still records an outstanding delegation but
 /// the live lock file no longer has a child allocation.
 pub fn reclaim_delegated_scope(
     guard: &mut LockFileGuard,
@@ -199,7 +199,7 @@ pub fn reclaim_delegated_scope(
         .data()
         .allocations
         .iter()
-        .position(|a| a.pod_name == child);
+        .position(|a| a.worker_name == child);
     let removed_child_parent = child_idx
         .map(|idx| guard.data().allocations[idx].delegated_from.clone())
         .unwrap_or(None);
@@ -229,8 +229,8 @@ pub fn reclaim_delegated_scope(
 }
 
 /// Remove allocations whose PID is dead, reparenting children to the
-/// dead Pod's `delegated_from`. Idempotent and best-effort — I/O
-/// errors on save are swallowed so a crashed Pod's entry never blocks
+/// dead Worker's `delegated_from`. Idempotent and best-effort — I/O
+/// errors on save are swallowed so a crashed Worker's entry never blocks
 /// forward progress.
 pub fn reclaim_stale(guard: &mut LockFileGuard) {
     reclaim_stale_with(guard, pid_alive);
@@ -243,7 +243,7 @@ pub fn reclaim_stale_with(guard: &mut LockFileGuard, mut is_alive: impl FnMut(u3
         .allocations
         .iter()
         .filter(|a| !is_alive(a.pid))
-        .map(|a| a.pod_name.clone())
+        .map(|a| a.worker_name.clone())
         .collect();
     if dead.is_empty() {
         return;
@@ -253,7 +253,7 @@ pub fn reclaim_stale_with(guard: &mut LockFileGuard, mut is_alive: impl FnMut(u3
             .data()
             .allocations
             .iter()
-            .position(|a| a.pod_name == *name)
+            .position(|a| a.worker_name == *name)
         else {
             continue;
         };
@@ -294,9 +294,9 @@ mod tests {
     #[test]
     fn register_detects_write_conflict() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("pods.json");
+        let path = dir.path().join("workers.json");
         let mut g = open_empty(&path);
-        register_pod(
+        register_worker(
             &mut g,
             "a".into(),
             std::process::id(),
@@ -305,7 +305,7 @@ mod tests {
             sid(),
         )
         .unwrap();
-        let err = register_pod(
+        let err = register_worker(
             &mut g,
             "b".into(),
             std::process::id(),
@@ -321,11 +321,11 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_pod_name_rejected() {
+    fn duplicate_worker_name_rejected() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("pods.json");
+        let path = dir.path().join("workers.json");
         let mut g = open_empty(&path);
-        register_pod(
+        register_worker(
             &mut g,
             "a".into(),
             std::process::id(),
@@ -334,7 +334,7 @@ mod tests {
             sid(),
         )
         .unwrap();
-        let err = register_pod(
+        let err = register_worker(
             &mut g,
             "a".into(),
             std::process::id(),
@@ -343,15 +343,15 @@ mod tests {
             sid(),
         )
         .unwrap_err();
-        assert!(matches!(err, ScopeLockError::DuplicatePodName(ref n) if n == "a"));
+        assert!(matches!(err, ScopeLockError::DuplicateWorkerName(ref n) if n == "a"));
     }
 
     #[test]
     fn delegate_must_be_subset() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("pods.json");
+        let path = dir.path().join("workers.json");
         let mut g = open_empty(&path);
-        register_pod(
+        register_worker(
             &mut g,
             "a".into(),
             std::process::id(),
@@ -376,9 +376,9 @@ mod tests {
     #[test]
     fn delegate_uses_delegation_scope_not_direct_effective_write() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("pods.json");
+        let path = dir.path().join("workers.json");
         let mut g = open_empty(&path);
-        register_pod(
+        register_worker(
             &mut g,
             "orchestrator".into(),
             std::process::id(),
@@ -406,9 +406,9 @@ mod tests {
     #[test]
     fn delegate_succeeds_within_parent_scope() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("pods.json");
+        let path = dir.path().join("workers.json");
         let mut g = open_empty(&path);
-        register_pod(
+        register_worker(
             &mut g,
             "a".into(),
             std::process::id(),
@@ -445,9 +445,9 @@ mod tests {
     #[test]
     fn delegate_rejects_sibling_overlap() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("pods.json");
+        let path = dir.path().join("workers.json");
         let mut g = open_empty(&path);
-        register_pod(
+        register_worker(
             &mut g,
             "a".into(),
             std::process::id(),
@@ -486,9 +486,9 @@ mod tests {
     #[test]
     fn release_reparents_children() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("pods.json");
+        let path = dir.path().join("workers.json");
         let mut g = open_empty(&path);
-        register_pod(
+        register_worker(
             &mut g,
             "a".into(),
             std::process::id(),
@@ -517,7 +517,7 @@ mod tests {
             &delegation_scope(vec![write_rule("/src/core", true)]),
         )
         .unwrap();
-        release_pod(&mut g, "b").unwrap();
+        release_worker(&mut g, "b").unwrap();
         // D should now list A as its delegated_from.
         let d = g.data().find("d").unwrap();
         assert_eq!(d.delegated_from.as_deref(), Some("a"));
@@ -527,10 +527,10 @@ mod tests {
     #[test]
     fn reclaim_delegated_scope_removes_child_and_one_parent_deny_layer() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("pods.json");
+        let path = dir.path().join("workers.json");
         let mut g = open_empty(&path);
         let delegated_rule = write_rule("/src/core", true);
-        register_pod_with_deny(
+        register_worker_with_deny(
             &mut g,
             "a".into(),
             std::process::id(),
@@ -540,7 +540,7 @@ mod tests {
             sid(),
         )
         .unwrap();
-        register_pod(
+        register_worker(
             &mut g,
             "b".into(),
             std::process::id(),
@@ -566,10 +566,10 @@ mod tests {
     #[test]
     fn reclaim_delegated_scope_removes_parent_deny_when_child_allocation_missing() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("pods.json");
+        let path = dir.path().join("workers.json");
         let mut g = open_empty(&path);
         let delegated_rule = write_rule("/src/core", true);
-        register_pod_with_deny(
+        register_worker_with_deny(
             &mut g,
             "a".into(),
             std::process::id(),
@@ -595,9 +595,9 @@ mod tests {
     #[test]
     fn reclaim_stale_reparents_and_removes_dead_entries() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("pods.json");
+        let path = dir.path().join("workers.json");
         let mut g = open_empty(&path);
-        register_pod(
+        register_worker(
             &mut g,
             "a".into(),
             std::process::id(),
@@ -630,7 +630,7 @@ mod tests {
         // will treat as dead.
         let fake_dead_pid: u32 = 0xffff_fff0;
         for alloc in g.data_mut().allocations.iter_mut() {
-            if alloc.pod_name == "b" {
+            if alloc.worker_name == "b" {
                 alloc.pid = fake_dead_pid;
             }
         }
@@ -643,9 +643,9 @@ mod tests {
     #[test]
     fn read_rules_do_not_conflict_with_write() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("pods.json");
+        let path = dir.path().join("workers.json");
         let mut g = open_empty(&path);
-        register_pod(
+        register_worker(
             &mut g,
             "a".into(),
             std::process::id(),
@@ -655,7 +655,7 @@ mod tests {
         )
         .unwrap();
         // B only reads under the same tree — allowed.
-        register_pod(
+        register_worker(
             &mut g,
             "b".into(),
             std::process::id(),
@@ -670,9 +670,9 @@ mod tests {
     #[test]
     fn releasing_pod_reopens_scope_for_fresh_registration() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("pods.json");
+        let path = dir.path().join("workers.json");
         let mut g = open_empty(&path);
-        register_pod(
+        register_worker(
             &mut g,
             "a".into(),
             std::process::id(),
@@ -681,8 +681,8 @@ mod tests {
             sid(),
         )
         .unwrap();
-        release_pod(&mut g, "a").unwrap();
-        register_pod(
+        release_worker(&mut g, "a").unwrap();
+        register_worker(
             &mut g,
             "b".into(),
             std::process::id(),
@@ -696,9 +696,9 @@ mod tests {
     #[test]
     fn delegated_scope_returns_to_parent_on_release() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("pods.json");
+        let path = dir.path().join("workers.json");
         let mut g = open_empty(&path);
-        register_pod(
+        register_worker(
             &mut g,
             "a".into(),
             std::process::id(),
@@ -722,7 +722,7 @@ mod tests {
             "a",
             &write_rule("/src/core", true)
         ));
-        release_pod(&mut g, "b").unwrap();
+        release_worker(&mut g, "b").unwrap();
         // /src/core is back in A's effective write scope.
         assert!(is_within_effective_write(
             g.data(),
@@ -734,10 +734,10 @@ mod tests {
     #[test]
     fn register_pod_rejects_session_id_collision() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("pods.json");
+        let path = dir.path().join("workers.json");
         let mut g = open_empty(&path);
         let shared_session = sid();
-        register_pod(
+        register_worker(
             &mut g,
             "first".into(),
             std::process::id(),
@@ -747,9 +747,9 @@ mod tests {
         )
         .unwrap();
         // Second registration tries to grab the same segment_id under
-        // a different pod_name. Without the SegmentConflict check both
+        // a different worker_name. Without the SegmentConflict check both
         // would succeed and race on the same jsonl.
-        let err = register_pod(
+        let err = register_worker(
             &mut g,
             "second".into(),
             std::process::id(),
@@ -761,11 +761,11 @@ mod tests {
         match err {
             ScopeLockError::SegmentConflict {
                 segment_id,
-                pod_name,
+                worker_name,
                 ..
             } => {
                 assert_eq!(segment_id, shared_session);
-                assert_eq!(pod_name, "first");
+                assert_eq!(worker_name, "first");
             }
             other => panic!("expected SegmentConflict, got {other:?}"),
         }

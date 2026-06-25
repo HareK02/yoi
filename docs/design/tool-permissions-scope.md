@@ -1,6 +1,6 @@
 # Tool permissions and scope
 
-Yoi treats tools as explicit capabilities. Model-visible tool names are not permission by themselves; the resolved Manifest and Pod scope decide whether a call is allowed.
+Yoi treats tools as explicit capabilities. Model-visible tool names are not permission by themselves; the resolved Manifest and Worker scope decide whether a call is allowed.
 
 ## Permission policy
 
@@ -22,7 +22,7 @@ Directory traversal tools should not follow symlink directories as a way around 
 
 ## Delegation
 
-Child Pods receive an explicit subset of the parent's scope. Delegation is a capability loan, not a copy of all parent authority.
+Child Workers receive an explicit subset of the parent's scope. Delegation is a capability loan, not a copy of all parent authority.
 
 When a child stops, shuts down, or is pruned as unreachable, delegated write permissions must be reclaimed. Explicit base denies remain in force.
 

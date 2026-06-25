@@ -1,8 +1,8 @@
-//! Runtime representation of a Pod's access scope.
+//! Runtime representation of a Worker's access scope.
 //!
 //! Built from [`crate::ScopeConfig`] via [`Scope::from_config`]. Every
 //! rule `target` must already be an absolute path — per-layer path
-//! resolution runs earlier, inside [`crate::PodManifestConfig::resolve_paths`].
+//! resolution runs earlier, inside [`crate::WorkerManifestConfig::resolve_paths`].
 //! All rule `target` paths inside the [`Scope`] are canonicalised (where
 //! possible) so access checks are pure path comparisons.
 
@@ -14,7 +14,7 @@ use arc_swap::{ArcSwap, Guard};
 
 use crate::{Permission, ScopeConfig, ScopeRule};
 
-/// Parsed, pwd-resolved set of allow/deny rules for a Pod.
+/// Parsed, pwd-resolved set of allow/deny rules for a Worker.
 ///
 /// Read/write access decisions are pure functions of the path being
 /// queried and these rules — see [`Scope::permission_at`].
@@ -32,7 +32,7 @@ struct ResolvedRule {
     recursive: bool,
 }
 
-/// Parsed filesystem authority this Pod may pass to spawned children.
+/// Parsed filesystem authority this Worker may pass to spawned children.
 ///
 /// Unlike [`Scope`], an empty allow list is valid and means no delegation
 /// authority. Direct tools never consult this type.
@@ -173,7 +173,7 @@ impl Scope {
     ///
     /// Every `target` in `config` must already be absolute — per-layer
     /// resolution happens upstream in
-    /// [`crate::PodManifestConfig::resolve_paths`] so that cascade merge
+    /// [`crate::WorkerManifestConfig::resolve_paths`] so that cascade merge
     /// operates on fully-qualified paths. A lingering relative target
     /// here signals an upstream bug and is rejected.
     pub fn from_config(config: &ScopeConfig) -> Result<Self, ScopeError> {
@@ -266,7 +266,7 @@ impl Scope {
 
     /// Allow rules with their targets resolved to absolute paths.
     ///
-    /// Used by the pod-registry, where every Pod's allocation
+    /// Used by the pod-registry, where every Worker's allocation
     /// must be expressed in absolute terms so prefix comparisons are
     /// meaningful across processes.
     pub fn allow_rules(&self) -> Vec<ScopeRule> {
@@ -324,7 +324,7 @@ impl Scope {
 
     /// Build a new [`Scope`] equal to `self` with `extra_deny` appended
     /// to the deny set. Used by dynamic-scope shrink paths
-    /// (e.g. SpawnPod-style delegation that strips Write from the
+    /// (e.g. SpawnWorker-style delegation that strips Write from the
     /// spawner without touching its allow rules).
     pub fn with_added_deny_rules(
         &self,
@@ -420,7 +420,7 @@ impl Scope {
 /// not lose each other's contributions.
 ///
 /// All clones share the same underlying state — a `SharedScope` cloned
-/// out to multiple consumers (Pod, ScopedFs, future grant/revoke
+/// out to multiple consumers (Worker, ScopedFs, future grant/revoke
 /// callers) sees every update.
 #[derive(Debug, Clone)]
 pub struct SharedScope {

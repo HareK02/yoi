@@ -177,8 +177,8 @@ fn pdk_runtime_dependencies_are_guest_side_only() {
         .as_table()
         .expect("dependencies table");
     let forbidden = [
-        "pod",
-        "yoi-pod",
+        "worker",
+        "yoi-worker",
         "llm-engine",
         "tui",
         "yoi-tui",

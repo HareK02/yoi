@@ -2,7 +2,7 @@
 
 ## Role
 
-`protocol` defines the JSONL message boundary between Pod clients and Pod servers.
+`protocol` defines the JSONL message boundary between Worker clients and Worker servers.
 
 ## Boundaries
 
@@ -14,7 +14,7 @@ Owns:
 
 Does not own:
 
-- Unix socket implementation details (`client`, `pod`)
+- Unix socket implementation details (`client`, `worker`)
 - TUI rendering (`tui`)
 - Engine history semantics (`llm-engine`)
 - durable storage (`session-store`, `pod-store`)
@@ -23,9 +23,9 @@ Does not own:
 
 The exact enum variants are code authority. The README should describe the boundary, not duplicate every message shape.
 
-Protocol events can inform UI and orchestration, but durable state changes still need to flow through Pod/session/metadata records.
+Protocol events can inform UI and orchestration, but durable state changes still need to flow through Worker/session/metadata records.
 
 ## See also
 
-- [`../../docs/design/pod-session-state.md`](../../docs/design/pod-session-state.md)
+- [`../../docs/design/worker-session-state.md`](../../docs/design/worker-session-state.md)
 - [`../../docs/design/context-history.md`](../../docs/design/context-history.md)

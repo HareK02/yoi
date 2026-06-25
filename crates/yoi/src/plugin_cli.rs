@@ -15,8 +15,8 @@ use manifest::plugin::{
     read_plugin_package_file, resolve_enabled_plugins, write_plugin_package_file,
 };
 use manifest::{ProfileResolveOptions, ProfileResolver, ProfileSelector, paths};
-use pod::feature::plugin::{PluginStaticInspection, inspect_resolved_plugin_static};
 use serde::Serialize;
+use worker::feature::plugin::{PluginStaticInspection, inspect_resolved_plugin_static};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -944,7 +944,7 @@ fn load_plugin_config(args: &PluginCliArgs, workspace: &Path) -> Result<PluginCo
         .with_workspace_base(workspace)
         .resolve(
             &selector,
-            ProfileResolveOptions::with_pod_name("plugin-inspect"),
+            ProfileResolveOptions::with_worker_name("plugin-inspect"),
         )?;
     Ok(resolved.manifest.plugins)
 }
@@ -1480,8 +1480,8 @@ impl ItemBuilder {
 mod tests {
     use super::*;
     use manifest::plugin::{PluginEnablementConfig, PluginExactVersion, PluginGrantConfig};
-    use pod::feature::plugin::{PluginPermissionEligibility, PluginRuntimeEligibility};
     use tempfile::tempdir;
+    use worker::feature::plugin::{PluginPermissionEligibility, PluginRuntimeEligibility};
 
     #[test]
     fn active_list_and_show_json_are_structured_and_non_executing() {

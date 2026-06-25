@@ -1,4 +1,4 @@
-//! Pod-lifetime tracker for file operations performed by the builtin
+//! Worker-lifetime tracker for file operations performed by the builtin
 //! file-manipulation tools.
 //!
 //! A `Tracker` serves two orthogonal purposes:
@@ -9,7 +9,7 @@
 //!    verify that the file has not been externally modified since then.
 //!
 //! 2. **Recency of touched files.** It keeps an LRU-ordered list of
-//!    files that have been touched by any of the tools, so the Pod
+//!    files that have been touched by any of the tools, so the Worker
 //!    layer can ask "which files did the agent recently look at?" —
 //!    used e.g. as a default reference set passed to context compaction.
 //!
@@ -18,12 +18,12 @@
 //!
 //! # Lifetime
 //!
-//! A `Tracker` is **Pod-process scoped**: the Pod layer creates a fresh
-//! instance at the start of each Pod run (including resume) and discards
+//! A `Tracker` is **Worker-process scoped**: the Worker layer creates a fresh
+//! instance at the start of each Worker run (including resume) and discards
 //! it when the process exits — it is not persisted, so a resumed
 //! conversation starts with an empty read/edit history. The `ScopedFs`
-//! write boundary is likewise Pod-process scoped (derived from the
-//! manifest). The two are orthogonal and the Pod wires them together
+//! write boundary is likewise Worker-process scoped (derived from the
+//! manifest). The two are orthogonal and the Worker wires them together
 //! when registering builtin tools.
 //!
 //! ```no_run
@@ -31,7 +31,7 @@
 //! # use manifest::Scope;
 //! # use tools::{ScopedFs, Tracker, core_builtin_tools};
 //! let scope = Scope::writable("/workspace").unwrap();
-//! let fs = ScopedFs::new(scope, PathBuf::from("/workspace")); // pod lifetime
+//! let fs = ScopedFs::new(scope, PathBuf::from("/workspace")); // worker lifetime
 //! let tracker = Tracker::new();    // session lifetime
 //! let bash_outputs = PathBuf::from("/run/yoi/bash-output");
 //! let defs = core_builtin_tools(fs, tracker, bash_outputs, None);
@@ -204,7 +204,7 @@ impl Tracker {
 
     /// Return up to `n` most recently touched file paths, most-recent first.
     ///
-    /// Intended for callers like the Pod's context-compaction path, which
+    /// Intended for callers like the Worker's context-compaction path, which
     /// wants to know which files the agent has been working with so it
     /// can pass them as default references to the compaction worker.
     pub fn recent_files(&self, n: usize) -> Vec<PathBuf> {

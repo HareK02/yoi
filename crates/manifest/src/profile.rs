@@ -2,7 +2,7 @@
 //!
 //! Profiles are reusable, human-authored recipes. They are intentionally not
 //! complete runtime manifests: runtime-bound and authority-bearing fields such
-//! as `pod.name` and concrete `scope.allow` rules are supplied by the resolver
+//! as `worker.name` and concrete `scope.allow` rules are supplied by the resolver
 //! from launch context.
 
 use std::cell::RefCell;
@@ -19,9 +19,9 @@ use crate::config::{
 use crate::model::{AuthRef, ModelManifest};
 use crate::plugin::PluginConfig;
 use crate::{
-    McpConfig, McpStdioCwdPolicy, MemoryConfig, Permission, PodManifest, PodManifestConfig,
-    PodMetaConfig, ResolveError, ScopeConfig, ScopeRule, SkillsConfig, WebConfig,
-    WorkerManifestConfig, paths,
+    EngineManifestConfig, McpConfig, McpStdioCwdPolicy, MemoryConfig, Permission, ResolveError,
+    ScopeConfig, ScopeRule, SkillsConfig, WebConfig, WorkerManifest, WorkerManifestConfig,
+    WorkerMetaConfig, paths,
 };
 
 const PROFILE_FORMAT_V1: &str = "yoi.lua-profile.v1";
@@ -408,26 +408,26 @@ pub struct WorkspaceOverrideSnapshot {
 #[derive(Debug)]
 struct WorkspaceOverrideLayer {
     path: PathBuf,
-    config: PodManifestConfig,
+    config: WorkerManifestConfig,
 }
 
 #[derive(Debug, Clone)]
 pub struct ResolvedProfile {
     pub source: ProfileSource,
     pub profile: Option<ProfileMetadata>,
-    pub manifest: PodManifest,
+    pub manifest: WorkerManifest,
     pub manifest_snapshot: serde_json::Value,
     pub raw_artifact: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ProfileResolveOptions {
-    pub pod_name: Option<String>,
+    pub worker_name: Option<String>,
 }
 impl ProfileResolveOptions {
-    pub fn with_pod_name(name: impl Into<String>) -> Self {
+    pub fn with_worker_name(name: impl Into<String>) -> Self {
         Self {
-            pod_name: Some(name.into()),
+            worker_name: Some(name.into()),
         }
     }
 }
@@ -469,8 +469,8 @@ impl ProfileResolver {
         }
     }
     /// Resolve a registry/default selector against an already-discovered
-    /// registry. Callers such as SpawnPod use this to bind discovery to the
-    /// Pod's cwd instead of the process current directory.
+    /// registry. Callers such as SpawnWorker use this to bind discovery to the
+    /// Worker's cwd instead of the process current directory.
     pub fn resolve_from_registry(
         &self,
         selector: &ProfileSelector,
@@ -604,22 +604,22 @@ fn resolve_lua_profile_value(
     let profile: ProfileConfig = serde_json::from_value(value.clone())
         .map_err(|source| ProfileError::ProfileDeserialize { source })?;
     validate_profile_paths(&profile)?;
-    let pod_name = options
-        .pod_name
-        .ok_or(ProfileError::MissingRuntimePodName)?;
+    let worker_name = options
+        .worker_name
+        .ok_or(ProfileError::MissingRuntimeWorkerName)?;
     let profile_meta = Some(ProfileMetadata {
         name: profile.slug.clone().or_else(|| source_name(&source)),
         description: profile.description.clone(),
         format: Some(PROFILE_FORMAT_V1.to_string()),
     });
     let compaction = profile_compaction_to_partial(profile.compaction, &profile.model)?;
-    let config = PodManifestConfig {
-        pod: PodMetaConfig {
-            name: Some(pod_name),
+    let config = WorkerManifestConfig {
+        worker: WorkerMetaConfig {
+            name: Some(worker_name),
             prompt_pack: None,
         },
         model: profile.model.unwrap_or_default(),
-        worker: profile.worker.unwrap_or_default(),
+        engine: profile.engine.unwrap_or_default(),
         scope: profile_scope_to_config(profile.scope, workspace_base)?,
         delegation_scope: profile_delegation_scope_to_config(
             profile.delegation_scope,
@@ -635,7 +635,8 @@ fn resolve_lua_profile_value(
         memory: profile.memory,
         skills: profile.skills,
     };
-    let mut config = PodManifestConfig::builtin_defaults().merge(config.resolve_paths(profile_dir));
+    let mut config =
+        WorkerManifestConfig::builtin_defaults().merge(config.resolve_paths(profile_dir));
     let workspace_override_snapshot = if let Some(override_layer) = workspace_override {
         let override_base =
             override_layer
@@ -652,7 +653,7 @@ fn resolve_lua_profile_value(
     } else {
         None
     };
-    let mut manifest = PodManifest::try_from(config).map_err(ProfileError::ManifestResolve)?;
+    let mut manifest = WorkerManifest::try_from(config).map_err(ProfileError::ManifestResolve)?;
     manifest.profile = Some(ProfileManifestSnapshot {
         source: source.clone(),
         profile: profile_meta.clone(),
@@ -679,7 +680,7 @@ struct ProfileConfig {
     #[serde(default)]
     model: Option<ModelManifest>,
     #[serde(default)]
-    worker: Option<WorkerManifestConfig>,
+    engine: Option<EngineManifestConfig>,
     #[serde(default)]
     scope: Option<ProfileScopeConfig>,
     #[serde(default)]
@@ -814,16 +815,16 @@ fn load_workspace_override_file(path: &Path) -> Result<WorkspaceOverrideLayer, P
             path: path.to_path_buf(),
             source,
         })?;
-    let config = PodManifestConfig::from_toml(&content).map_err(|source| {
+    let config = WorkerManifestConfig::from_toml(&content).map_err(|source| {
         ProfileError::WorkspaceOverrideParse {
             path: path.to_path_buf(),
             source,
         }
     })?;
-    if config.pod.name.is_some() {
+    if config.worker.name.is_some() {
         return Err(ProfileError::InvalidWorkspaceOverride {
             path: path.to_path_buf(),
-            message: "workspace-local manifest overrides cannot set pod.name; Pod identity is a runtime input".into(),
+            message: "workspace-local manifest overrides cannot set worker.name; Worker identity is a runtime input".into(),
         });
     }
     Ok(WorkspaceOverrideLayer {
@@ -1209,8 +1210,8 @@ fn reject_manifest_shaped_profile(value: &serde_json::Value) -> Result<(), Profi
             )));
         }
     }
-    if map.contains_key("pod") {
-        return Err(ProfileError::InvalidProfile("field `pod` is runtime-bound and is not allowed in reusable Profiles; pass the Pod name via CLI/TUI runtime inputs".into()));
+    if map.contains_key("worker") {
+        return Err(ProfileError::InvalidProfile("field `worker` is runtime-bound and is not allowed in reusable Profiles; pass the Worker name via CLI/TUI runtime inputs".into()));
     }
     if let Some(scope) = map.get("scope").and_then(|v| v.as_object()) {
         for key in ["allow", "deny"] {
@@ -1442,7 +1443,7 @@ pub fn resolve_profile_artifact(
         source,
         base_dir,
         base_dir,
-        ProfileResolveOptions::with_pod_name("artifact-pod"),
+        ProfileResolveOptions::with_worker_name("artifact-worker"),
         raw_artifact.clone(),
         raw_artifact,
         None,
@@ -1489,8 +1490,8 @@ pub enum ProfileError {
     InvalidWorkspaceOverride { path: PathBuf, message: String },
     #[error("no default profile is configured")]
     NoDefaultProfile,
-    #[error("profile resolution requires an explicit runtime Pod name")]
-    MissingRuntimePodName,
+    #[error("profile resolution requires an explicit runtime Worker name")]
+    MissingRuntimeWorkerName,
     #[error("profile not found: {selector}")]
     ProfileNotFound { selector: String },
     #[error("ambiguous profile name `{name}`; use a source-qualified selector such as {matches:?}")]
@@ -1574,17 +1575,17 @@ mod tests {
                 .with_workspace_base(tmp.path())
                 .resolve(
                     &ProfileSelector::source_named(ProfileRegistrySource::Builtin, expected),
-                    ProfileResolveOptions::with_pod_name("role-pod"),
+                    ProfileResolveOptions::with_worker_name("role-worker"),
                 )
                 .unwrap();
             assert_eq!(
                 resolved.profile.as_ref().unwrap().name.as_deref(),
                 Some(expected)
             );
-            assert_eq!(resolved.manifest.pod.name, "role-pod");
+            assert_eq!(resolved.manifest.worker.name, "role-worker");
             if matches!(expected, "intake" | "orchestrator" | "coder" | "reviewer") {
                 let expected_instruction = format!("$yoi/role/{expected}");
-                assert_eq!(resolved.manifest.worker.instruction, expected_instruction);
+                assert_eq!(resolved.manifest.engine.instruction, expected_instruction);
             }
         }
     }
@@ -1597,7 +1598,7 @@ mod tests {
                 .with_workspace_base(tmp.path())
                 .resolve(
                     &ProfileSelector::source_named(ProfileRegistrySource::Builtin, role),
-                    ProfileResolveOptions::with_pod_name("role-pod"),
+                    ProfileResolveOptions::with_worker_name("role-worker"),
                 )
                 .unwrap()
                 .manifest
@@ -1605,7 +1606,7 @@ mod tests {
 
         let companion = resolve("companion");
         assert!(companion.feature.task.enabled);
-        assert!(companion.feature.pods.enabled);
+        assert!(companion.feature.workers.enabled);
         assert!(companion.feature.ticket.enabled);
         assert!(companion.scope.allow.is_empty());
         assert!(companion.scope.deny.is_empty());
@@ -1615,7 +1616,7 @@ mod tests {
 
         let intake = resolve("intake");
         assert!(!intake.feature.task.enabled);
-        assert!(!intake.feature.pods.enabled);
+        assert!(!intake.feature.workers.enabled);
         assert!(intake.feature.ticket.enabled);
         assert!(intake.scope.allow.is_empty());
         assert!(intake.delegation_scope.allow.is_empty());
@@ -1625,7 +1626,7 @@ mod tests {
 
         let orchestrator = resolve("orchestrator");
         assert!(!orchestrator.feature.task.enabled);
-        assert!(orchestrator.feature.pods.enabled);
+        assert!(orchestrator.feature.workers.enabled);
         assert!(orchestrator.feature.ticket.enabled);
         assert!(orchestrator.feature.ticket_orchestration.enabled);
         assert!(orchestrator.scope.allow.is_empty());
@@ -1638,7 +1639,7 @@ mod tests {
 
         let coder = resolve("coder");
         assert!(coder.feature.task.enabled);
-        assert!(!coder.feature.pods.enabled);
+        assert!(!coder.feature.workers.enabled);
         assert!(coder.scope.allow.is_empty());
         assert!(coder.delegation_scope.allow.is_empty());
         assert_eq!(coder.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
@@ -1646,7 +1647,7 @@ mod tests {
 
         let reviewer = resolve("reviewer");
         assert!(!reviewer.feature.task.enabled);
-        assert!(!reviewer.feature.pods.enabled);
+        assert!(!reviewer.feature.workers.enabled);
         assert!(!reviewer.feature.ticket.enabled);
         assert!(reviewer.scope.allow.is_empty());
         assert!(reviewer.delegation_scope.allow.is_empty());
@@ -1655,17 +1656,17 @@ mod tests {
     }
 
     #[test]
-    fn profile_resolution_requires_runtime_pod_name() {
+    fn profile_resolution_requires_runtime_worker_name() {
         let tmp = TempDir::new().unwrap();
         let err = ProfileResolver::new()
             .with_workspace_base(tmp.path())
             .resolve(&ProfileSelector::Default, ProfileResolveOptions::default())
             .unwrap_err();
-        assert!(matches!(err, ProfileError::MissingRuntimePodName));
+        assert!(matches!(err, ProfileError::MissingRuntimeWorkerName));
     }
 
     #[test]
-    fn resolves_plain_lua_profile_with_runtime_pod_name_and_scope_intent() {
+    fn resolves_plain_lua_profile_with_runtime_worker_name_and_scope_intent() {
         let tmp = TempDir::new().unwrap();
         let profile = write_profile(
             tmp.path(),
@@ -1676,7 +1677,7 @@ local scope = require("yoi.scope")
 return profile {
   slug = "coder",
   model = { scheme = "anthropic", model_id = "claude-sonnet-4-20250514" },
-  worker = { reasoning = "high" },
+  engine = { reasoning = "high" },
   scope = scope.workspace_read(),
 }
 "#,
@@ -1687,13 +1688,13 @@ return profile {
             .with_workspace_base(&workspace)
             .resolve(
                 &ProfileSelector::path(&profile),
-                ProfileResolveOptions::with_pod_name("runtime-pod"),
+                ProfileResolveOptions::with_worker_name("runtime-worker"),
             )
             .unwrap();
-        assert_eq!(resolved.manifest.pod.name, "runtime-pod");
+        assert_eq!(resolved.manifest.worker.name, "runtime-worker");
         assert_eq!(resolved.manifest.model.scheme, Some(SchemeKind::Anthropic));
         assert_eq!(
-            resolved.manifest.worker.reasoning,
+            resolved.manifest.engine.reasoning,
             Some(ReasoningControl::Effort(ReasoningEffort::High))
         );
         assert_eq!(resolved.manifest.scope.allow[0].target, workspace);
@@ -1748,7 +1749,7 @@ return profile {
             .with_workspace_base(&workspace)
             .resolve(
                 &ProfileSelector::path(&profile),
-                ProfileResolveOptions::with_pod_name("runtime-pod"),
+                ProfileResolveOptions::with_worker_name("runtime-worker"),
             )
             .unwrap();
 
@@ -1785,7 +1786,7 @@ return profile {
     task = { enabled = true },
     memory = { enabled = false },
     web = { enabled = true },
-    pods = { enabled = true },
+    workers = { enabled = true },
     ticket = { enabled = true, access = "read_only" },
     ticket_orchestration = { enabled = false },
   },
@@ -1798,14 +1799,14 @@ return profile {
             .with_workspace_base(&workspace)
             .resolve(
                 &ProfileSelector::path(&profile),
-                ProfileResolveOptions::with_pod_name("runtime-pod"),
+                ProfileResolveOptions::with_worker_name("runtime-worker"),
             )
             .unwrap();
-        assert_eq!(resolved.manifest.pod.name, "runtime-pod");
+        assert_eq!(resolved.manifest.worker.name, "runtime-worker");
         assert!(resolved.manifest.feature.task.enabled);
         assert!(!resolved.manifest.feature.memory.enabled);
         assert!(resolved.manifest.feature.web.enabled);
-        assert!(resolved.manifest.feature.pods.enabled);
+        assert!(resolved.manifest.feature.workers.enabled);
         assert!(resolved.manifest.feature.ticket.enabled);
         assert_eq!(
             resolved.manifest.feature.ticket.access,
@@ -1844,7 +1845,7 @@ return yoi.profile {
             .with_workspace_base(tmp.path())
             .resolve(
                 &ProfileSelector::path(profile),
-                ProfileResolveOptions::with_pod_name("p"),
+                ProfileResolveOptions::with_worker_name("p"),
             )
             .unwrap();
         assert_eq!(
@@ -1877,7 +1878,7 @@ p.slug = "assigned"
 p.model = yoi.models.catalog("anthropic/claude-sonnet-4-6")
 p.feature = {
   task = { enabled = false },
-  pods = { enabled = true },
+  workers = { enabled = true },
 }
 p.web = { enabled = false }
 p.compaction = yoi.compact.tokens { threshold = 123, request_threshold = 456 }
@@ -1888,7 +1889,7 @@ return p
             .with_workspace_base(tmp.path())
             .resolve(
                 &ProfileSelector::path(profile),
-                ProfileResolveOptions::with_pod_name("p"),
+                ProfileResolveOptions::with_worker_name("p"),
             )
             .unwrap();
         assert_eq!(
@@ -1896,7 +1897,7 @@ return p
             Some("anthropic/claude-sonnet-4-6")
         );
         assert!(!resolved.manifest.feature.task.enabled);
-        assert!(resolved.manifest.feature.pods.enabled);
+        assert!(resolved.manifest.feature.workers.enabled);
         assert_eq!(resolved.manifest.web.as_ref().unwrap().enabled, Some(false));
         assert!(resolved.manifest.web.as_ref().unwrap().search.is_none());
         assert_eq!(
@@ -1925,7 +1926,7 @@ return yoi.profile.extend("builtin:default", {
             .with_workspace_base(tmp.path())
             .resolve(
                 &ProfileSelector::path(profile),
-                ProfileResolveOptions::with_pod_name("p"),
+                ProfileResolveOptions::with_worker_name("p"),
             )
             .unwrap_err();
         let message = err.to_string();
@@ -1948,7 +1949,7 @@ return yoi.profile.extend("builtin:default", {
                 .with_workspace_base(tmp.path())
                 .resolve(
                     &ProfileSelector::path(path),
-                    ProfileResolveOptions::with_pod_name("p"),
+                    ProfileResolveOptions::with_worker_name("p"),
                 )
                 .unwrap_err();
             assert!(matches!(
@@ -1962,7 +1963,7 @@ return yoi.profile.extend("builtin:default", {
         for (value, needle) in [
             (serde_json::json!({"manifest": {}}), "manifest"),
             (serde_json::json!({"config": {}}), "config"),
-            (serde_json::json!({"pod": {"name": "bad"}}), "pod"),
+            (serde_json::json!({"worker": {"name": "bad"}}), "worker"),
             (
                 serde_json::json!({"model": {"ref": "codex-oauth/gpt-5.5"}, "scope": {"allow": []}}),
                 "scope.allow",
@@ -2008,7 +2009,7 @@ return profile {
             .with_workspace_base(tmp.path())
             .resolve(
                 &ProfileSelector::path(profile),
-                ProfileResolveOptions::with_pod_name("p"),
+                ProfileResolveOptions::with_worker_name("p"),
             )
             .unwrap();
         let c = resolved.manifest.compaction.unwrap();
@@ -2023,10 +2024,10 @@ return profile {
             .with_workspace_base(tmp.path())
             .resolve(
                 &ProfileSelector::source_named(ProfileRegistrySource::Builtin, "default"),
-                ProfileResolveOptions::with_pod_name("runtime-workspace"),
+                ProfileResolveOptions::with_worker_name("runtime-workspace"),
             )
             .unwrap();
-        assert_eq!(resolved.manifest.pod.name, "runtime-workspace");
+        assert_eq!(resolved.manifest.worker.name, "runtime-workspace");
         assert_eq!(
             resolved.manifest.model.ref_.as_deref(),
             Some("codex-oauth/gpt-5.5")
@@ -2060,9 +2061,9 @@ return profile {
         std::fs::write(
             &override_path,
             r#"
-[pod]
-prompt_pack = "prompts.toml"
 [worker]
+prompt_pack = "prompts.toml"
+[engine]
 language = "ja"
 [session]
 record_event_trace = false
@@ -2074,15 +2075,15 @@ record_event_trace = false
             .with_workspace_base(&nested)
             .resolve(
                 &ProfileSelector::Default,
-                ProfileResolveOptions::with_pod_name("runtime-pod"),
+                ProfileResolveOptions::with_worker_name("runtime-worker"),
             )
             .unwrap();
 
-        assert_eq!(resolved.manifest.pod.name, "runtime-pod");
-        assert_eq!(resolved.manifest.worker.language, "ja");
+        assert_eq!(resolved.manifest.worker.name, "runtime-worker");
+        assert_eq!(resolved.manifest.engine.language, "ja");
         assert!(!resolved.manifest.session.record_event_trace);
         assert_eq!(
-            resolved.manifest.pod.prompt_pack.as_deref(),
+            resolved.manifest.worker.prompt_pack.as_deref(),
             Some(yoi_dir.join("prompts.toml").as_path())
         );
         assert!(resolved.manifest.scope.allow.is_empty());
@@ -2111,9 +2112,9 @@ record_event_trace = false
         std::fs::write(
             parent_yoi.join(WORKSPACE_OVERRIDE_LOCAL_FILENAME),
             r#"
-[pod]
-prompt_pack = "parent-prompts.toml"
 [worker]
+prompt_pack = "parent-prompts.toml"
+[engine]
 language = "parent"
 "#,
         )
@@ -2122,9 +2123,9 @@ language = "parent"
         std::fs::write(
             &nested_override_path,
             r#"
-[pod]
-prompt_pack = "nested-prompts.toml"
 [worker]
+prompt_pack = "nested-prompts.toml"
+[engine]
 language = "nested"
 "#,
         )
@@ -2134,13 +2135,13 @@ language = "nested"
             .with_workspace_base(&child)
             .resolve(
                 &ProfileSelector::Default,
-                ProfileResolveOptions::with_pod_name("runtime-pod"),
+                ProfileResolveOptions::with_worker_name("runtime-worker"),
             )
             .unwrap();
 
-        assert_eq!(resolved.manifest.worker.language, "nested");
+        assert_eq!(resolved.manifest.engine.language, "nested");
         assert_eq!(
-            resolved.manifest.pod.prompt_pack.as_deref(),
+            resolved.manifest.worker.prompt_pack.as_deref(),
             Some(nested_yoi.join("nested-prompts.toml").as_path())
         );
         assert_eq!(
@@ -2155,13 +2156,13 @@ language = "nested"
     }
 
     #[test]
-    fn workspace_local_override_rejects_runtime_pod_name() {
+    fn workspace_local_override_rejects_runtime_worker_name() {
         let tmp = TempDir::new().unwrap();
         let yoi_dir = tmp.path().join(".yoi");
         std::fs::create_dir_all(&yoi_dir).unwrap();
         std::fs::write(
             yoi_dir.join(WORKSPACE_OVERRIDE_LOCAL_FILENAME),
-            "[pod]\nname = \"not-local\"\n",
+            "[worker]\nname = \"not-local\"\n",
         )
         .unwrap();
 
@@ -2169,11 +2170,11 @@ language = "nested"
             .with_workspace_base(tmp.path())
             .resolve(
                 &ProfileSelector::Default,
-                ProfileResolveOptions::with_pod_name("runtime-pod"),
+                ProfileResolveOptions::with_worker_name("runtime-worker"),
             )
             .unwrap_err();
         assert!(matches!(err, ProfileError::InvalidWorkspaceOverride { .. }));
-        assert!(err.to_string().contains("pod.name"));
+        assert!(err.to_string().contains("worker.name"));
     }
 
     #[test]

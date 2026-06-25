@@ -8,7 +8,7 @@ It is not a dumping ground for external research, old plans, API inventories, or
 
 1. [`design/overview.md`](design/overview.md) — the system map.
 2. [`design/context-history.md`](design/context-history.md) — the highest-risk invariant: inputs that affect the model must be committed to history before they enter context.
-3. [`design/pod-session-state.md`](design/pod-session-state.md) — Pod identity, replayable session logs, current metadata, and live process hints.
+3. [`design/worker-session-state.md`](design/worker-session-state.md) — Worker identity, replayable session logs, current metadata, and live process hints.
 4. [`design/profiles-manifests-prompts.md`](design/profiles-manifests-prompts.md) — reusable Profiles, resolved Manifests, and prompt resources.
 5. [`design/tool-permissions-scope.md`](design/tool-permissions-scope.md) — tool policy and filesystem scope.
 6. [`design/plugin-packages.md`](design/plugin-packages.md) — plugin package distribution, discovery, and enablement boundaries.
@@ -24,10 +24,10 @@ Keep documentation when it records a stable design boundary, a non-obvious ratio
 
 Examples that belong:
 
-- Why Pod metadata is not the session log.
+- Why Worker metadata is not the session log.
 - Why `Profile` and resolved `Manifest` are different layers.
 - Why context-only event injection is forbidden.
-- Why child Pod notifications are hints rather than completion proof.
+- Why child Worker notifications are hints rather than completion proof.
 
 ## What does not belong here
 

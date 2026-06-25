@@ -7,9 +7,9 @@ mod profile;
 mod scope;
 
 pub use config::{
-    CompactionConfigPartial, FileUploadLimitsPartial, PermissionConfigPartial, PodManifestConfig,
-    PodMetaConfig, ResolveError, SessionConfigPartial, ToolOutputLimitsPartial,
-    WorkerManifestConfig,
+    CompactionConfigPartial, EngineManifestConfig, FileUploadLimitsPartial,
+    PermissionConfigPartial, ResolveError, SessionConfigPartial, ToolOutputLimitsPartial,
+    WorkerManifestConfig, WorkerMetaConfig,
 };
 pub use model::{
     AuthRef, ModelCapability, ModelManifest, ReasoningControl, ReasoningEffort, SchemeKind,
@@ -32,20 +32,20 @@ use std::path::PathBuf;
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 
-/// Declarative configuration for a Pod.
+/// Declarative configuration for a Worker.
 ///
 /// Parsed from a TOML manifest file. Describes the model, system prompt,
-/// and directory scope (required). The Pod's working directory is **not**
+/// and directory scope (required). The Worker's working directory is **not**
 /// part of the manifest — it is the process's `std::env::current_dir()`
 /// at construction time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PodManifest {
-    pub pod: PodMeta,
+pub struct WorkerManifest {
+    pub worker: WorkerMeta,
     pub model: ModelManifest,
-    pub worker: WorkerManifest,
-    /// Direct filesystem authority for this Pod's own tools.
+    pub engine: EngineManifest,
+    /// Direct filesystem authority for this Worker's own tools.
     pub scope: ScopeConfig,
-    /// Filesystem authority this Pod may pass to spawned children. Missing
+    /// Filesystem authority this Worker may pass to spawned children. Missing
     /// metadata/config defaults to no delegation authority.
     #[serde(default)]
     pub delegation_scope: ScopeConfig,
@@ -91,14 +91,14 @@ pub struct PodManifest {
     #[serde(default)]
     pub skills: Option<SkillsConfig>,
     /// Optional profile provenance for manifests produced by profile resolution.
-    /// Stored only after profile resolution so Pod restore can prefer the
+    /// Stored only after profile resolution so Worker restore can prefer the
     /// validated snapshot over current profile files or one-file Manifest input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<profile::ProfileManifestSnapshot>,
 }
 
 /// Explicit built-in feature/tool-surface enablement. These flags are
-/// profile/config data only: they do not carry runtime Pod names, sockets,
+/// profile/config data only: they do not carry runtime Worker names, sockets,
 /// sessions, secrets, or resolved host state. Tool registration still applies
 /// the normal scope, host-authority, backend, memory, and network checks.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -110,7 +110,7 @@ pub struct FeatureConfig {
     #[serde(default)]
     pub web: FeatureFlagConfig,
     #[serde(default)]
-    pub pods: FeatureFlagConfig,
+    pub workers: FeatureFlagConfig,
     #[serde(default)]
     pub ticket: TicketFeatureConfig,
     #[serde(default)]
@@ -125,7 +125,7 @@ impl Default for FeatureConfig {
             task: FeatureFlagConfig::disabled(),
             memory: FeatureFlagConfig::disabled(),
             web: FeatureFlagConfig::disabled(),
-            pods: FeatureFlagConfig::disabled(),
+            workers: FeatureFlagConfig::disabled(),
             ticket: TicketFeatureConfig::default(),
             ticket_orchestration: FeatureFlagConfig::disabled(),
             plugins: FeatureFlagConfig::disabled(),
@@ -197,7 +197,7 @@ pub struct SkillsConfig {
     /// Skills *roots*. Children of each root must be individual
     /// `<name>/SKILL.md` bundles; the directory itself is not a skill.
     /// Resolved against the manifest base directory before
-    /// [`PodManifest`] is materialised.
+    /// [`WorkerManifest`] is materialised.
     #[serde(default)]
     pub directories: Vec<PathBuf>,
 }
@@ -206,7 +206,7 @@ pub struct SkillsConfig {
 ///
 /// The manifest layer records local stdio MCP server declarations but never
 /// starts them. Future lifecycle code must opt in to spawning and must keep MCP
-/// process authority separate from Plugin permissions and `pod::feature` flags.
+/// process authority separate from Plugin permissions and `worker::feature` flags.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct McpConfig {
@@ -363,7 +363,7 @@ pub struct WebFetchConfig {
 
 /// Memory subsystem configuration. Presence in the manifest enables
 /// memory; `workspace_root` pins the memory workspace explicitly. When it
-/// is absent, memory resolution searches upward from the Pod's pwd for a
+/// is absent, memory resolution searches upward from the Worker's pwd for a
 /// `.yoi/memory` marker rather than treating `.yoi` project records alone
 /// as a memory root.
 ///
@@ -396,7 +396,7 @@ pub struct MemoryConfig {
     #[serde(default)]
     pub language: Option<String>,
     /// Optional model for the extract worker. When `None`,
-    /// the main pod model is cloned via `clone_boxed()`. Lightweight
+    /// the main engine model is cloned via `clone_boxed()`. Lightweight
     /// reasoning-capable models (Haiku / 4o-mini / Flash class) are
     /// recommended.
     #[serde(default)]
@@ -414,7 +414,7 @@ pub struct MemoryConfig {
     #[serde(default)]
     pub extract_worker_max_turns: Option<u32>,
     /// Optional model for the consolidation worker. When
-    /// `None`, the main pod model is cloned via `clone_boxed()`.
+    /// `None`, the main engine model is cloned via `clone_boxed()`.
     /// Reasoning-class models are recommended.
     #[serde(default)]
     pub consolidation_model: Option<ModelManifest>,
@@ -432,12 +432,12 @@ pub struct MemoryConfig {
     pub consolidation_threshold_bytes: Option<u64>,
 }
 
-/// Pod metadata.
+/// Worker metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PodMeta {
+pub struct WorkerMeta {
     pub name: String,
     /// Optional path to a TOML override file read as the top layer of
-    /// `pod::PromptCatalog`. Subject to the same relative-path
+    /// `worker::PromptCatalog`. Subject to the same relative-path
     /// resolution as other manifest paths (joined against the
     /// manifest's base directory). `None` leaves the 4th overlay layer
     /// empty; auto-discovered user and workspace packs still apply.
@@ -453,7 +453,7 @@ pub struct PodMeta {
 
 /// Worker-level configuration embedded in the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerManifest {
+pub struct EngineManifest {
     /// Reference to the instruction prompt asset used as the body of
     /// the worker's system prompt. Uses the `PromptLoader` prefix
     /// addressing scheme (`$yoi/...`, `$user/...`,
@@ -572,7 +572,7 @@ impl ToolOutputLimits {
 
 /// Declarative scope configuration.
 ///
-/// A Pod may only touch paths whose effective permission (computed from
+/// A Worker may only touch paths whose effective permission (computed from
 /// allow/deny rules below) is at least `Read` / `Write`. See
 /// [`Scope`] for the resolved runtime form.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -653,7 +653,7 @@ pub struct CompactionConfig {
 
     /// Safety-net (between-requests) compaction threshold.
     ///
-    /// Checked by `PodInterceptor::pre_llm_request` inside a turn. When
+    /// Checked by `WorkerInterceptor::pre_llm_request` inside a turn. When
     /// current occupancy exceeds this value, the run yields so that the
     /// Controller can compact before the next LLM request. `None`
     /// disables the between-requests check.
@@ -802,7 +802,7 @@ impl Default for CompactionConfig {
     }
 }
 
-impl PodManifest {
+impl WorkerManifest {
     /// Parse a manifest from a TOML string.
     pub fn from_toml(s: &str) -> Result<Self, toml::de::Error> {
         config::reject_removed_manifest_fields(s)?;
@@ -818,14 +818,14 @@ mod tests {
     use super::*;
 
     const MINIMAL_REQUIRED: &str = r#"
-[pod]
+[worker]
 name = "test-agent"
 
 [model]
 scheme = "anthropic"
 model_id = "claude-sonnet-4-20250514"
 
-[worker]
+[engine]
 
 [[scope.allow]]
 target = "/abs/scope"
@@ -834,8 +834,8 @@ permission = "write"
 
     #[test]
     fn parse_minimal_manifest() {
-        let manifest = PodManifest::from_toml(MINIMAL_REQUIRED).unwrap();
-        assert_eq!(manifest.pod.name, "test-agent");
+        let manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        assert_eq!(manifest.worker.name, "test-agent");
         assert_eq!(manifest.model.scheme, Some(SchemeKind::Anthropic));
         assert_eq!(
             manifest.model.model_id.as_deref(),
@@ -846,19 +846,19 @@ permission = "write"
         assert!(manifest.scope.deny.is_empty());
         assert!(manifest.delegation_scope.allow.is_empty());
         assert!(manifest.delegation_scope.deny.is_empty());
-        assert_eq!(manifest.worker.instruction, defaults::DEFAULT_INSTRUCTION);
-        assert!(manifest.worker.top_p.is_none());
-        assert!(manifest.worker.top_k.is_none());
-        assert!(manifest.worker.stop_sequences.is_empty());
+        assert_eq!(manifest.engine.instruction, defaults::DEFAULT_INSTRUCTION);
+        assert!(manifest.engine.top_p.is_none());
+        assert!(manifest.engine.top_k.is_none());
+        assert!(manifest.engine.stop_sequences.is_empty());
         assert!(manifest.web.is_none());
     }
 
     #[test]
     fn deserialize_old_manifest_snapshot_defaults_to_no_delegation() {
-        let manifest = PodManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        let manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
         let mut snapshot = serde_json::to_value(&manifest).unwrap();
         snapshot.as_object_mut().unwrap().remove("delegation_scope");
-        let restored: PodManifest = serde_json::from_value(snapshot).unwrap();
+        let restored: WorkerManifest = serde_json::from_value(snapshot).unwrap();
         assert_eq!(restored.scope.allow.len(), 1);
         assert!(restored.delegation_scope.allow.is_empty());
         assert!(restored.delegation_scope.deny.is_empty());
@@ -870,7 +870,7 @@ permission = "write"
             "{}\n[web]\nenabled = true\n\n[web.search]\nprovider = \"brave\"\napi_key_secret = \"web/brave/default\"\ntimeout_secs = 12\n\n[web.fetch]\ntimeout_secs = 7\nredirect_limit = 3\nmax_response_bytes = 12345\nmax_output_bytes = 2048\n",
             MINIMAL_REQUIRED
         );
-        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let manifest = WorkerManifest::from_toml(&toml).unwrap();
         let web = manifest.web.unwrap();
         assert_eq!(web.enabled, Some(true));
         let search = web.search.unwrap();
@@ -886,7 +886,7 @@ permission = "write"
     #[test]
     fn parse_full_manifest() {
         let toml = r#"
-[pod]
+[worker]
 name = "code-reviewer"
 
 [model]
@@ -894,7 +894,7 @@ scheme = "anthropic"
 model_id = "claude-sonnet-4-20250514"
 auth = { kind = "api_key", file = "/abs/keys/anthropic" }
 
-[worker]
+[engine]
 instruction = "$user/reviewer"
 max_tokens = 4096
 temperature = 0.3
@@ -924,21 +924,21 @@ permission = "write"
 target = "/abs/project/tasks/private"
 permission = "write"
 "#;
-        let manifest = PodManifest::from_toml(toml).unwrap();
-        assert_eq!(manifest.pod.name, "code-reviewer");
+        let manifest = WorkerManifest::from_toml(toml).unwrap();
+        assert_eq!(manifest.worker.name, "code-reviewer");
         let file = match manifest.model.auth.as_ref() {
             Some(AuthRef::ApiKey { file, .. }) => file.as_deref(),
             _ => panic!("expected ApiKey"),
         };
         assert_eq!(file, Some(std::path::Path::new("/abs/keys/anthropic")));
-        assert_eq!(manifest.worker.instruction, "$user/reviewer");
-        assert_eq!(manifest.worker.max_tokens, Some(4096));
-        assert_eq!(manifest.worker.temperature, Some(0.3));
-        assert_eq!(manifest.worker.top_p, Some(0.9));
-        assert_eq!(manifest.worker.top_k, Some(40));
-        assert_eq!(manifest.worker.stop_sequences, vec!["\n\n", "</stop>"]);
+        assert_eq!(manifest.engine.instruction, "$user/reviewer");
+        assert_eq!(manifest.engine.max_tokens, Some(4096));
+        assert_eq!(manifest.engine.temperature, Some(0.3));
+        assert_eq!(manifest.engine.top_p, Some(0.9));
+        assert_eq!(manifest.engine.top_k, Some(40));
+        assert_eq!(manifest.engine.stop_sequences, vec!["\n\n", "</stop>"]);
         assert_eq!(
-            manifest.worker.reasoning,
+            manifest.engine.reasoning,
             Some(ReasoningControl::Effort(ReasoningEffort::Medium))
         );
         let allow = &manifest.scope.allow;
@@ -960,16 +960,16 @@ permission = "write"
     #[test]
     fn reject_missing_scope() {
         let toml = r#"
-[pod]
+[worker]
 name = "missing-scope"
 
 [model]
 scheme = "anthropic"
 model_id = "claude-sonnet-4-20250514"
 
-[worker]
+[engine]
 "#;
-        assert!(PodManifest::from_toml(toml).is_err());
+        assert!(WorkerManifest::from_toml(toml).is_err());
     }
 
     #[test]
@@ -984,7 +984,7 @@ model_id = "claude-sonnet-4-20250514"
              [plugins.enabled.config]\n\
              greeting = \"hello\"\n"
         );
-        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let manifest = WorkerManifest::from_toml(&toml).unwrap();
         assert_eq!(manifest.plugins.enabled.len(), 1);
         let enabled = &manifest.plugins.enabled[0];
         assert_eq!(enabled.id, "project:example");
@@ -1005,37 +1005,37 @@ model_id = "claude-sonnet-4-20250514"
 
     #[test]
     fn parse_max_turns() {
-        let toml = MINIMAL_REQUIRED.replace("[worker]\n", "[worker]\nmax_turns = 50\n");
-        let manifest = PodManifest::from_toml(&toml).unwrap();
-        assert_eq!(manifest.worker.max_turns.unwrap().get(), 50);
+        let toml = MINIMAL_REQUIRED.replace("[engine]\n", "[engine]\nmax_turns = 50\n");
+        let manifest = WorkerManifest::from_toml(&toml).unwrap();
+        assert_eq!(manifest.engine.max_turns.unwrap().get(), 50);
     }
 
     #[test]
     fn parse_reasoning_budget() {
-        let toml = MINIMAL_REQUIRED.replace("[worker]\n", "[worker]\nreasoning = -1\n");
-        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let toml = MINIMAL_REQUIRED.replace("[engine]\n", "[engine]\nreasoning = -1\n");
+        let manifest = WorkerManifest::from_toml(&toml).unwrap();
         assert_eq!(
-            manifest.worker.reasoning,
+            manifest.engine.reasoning,
             Some(ReasoningControl::BudgetTokens(-1))
         );
     }
 
     #[test]
     fn omitted_max_turns_is_none() {
-        let manifest = PodManifest::from_toml(MINIMAL_REQUIRED).unwrap();
-        assert!(manifest.worker.max_turns.is_none());
+        let manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        assert!(manifest.engine.max_turns.is_none());
     }
 
     #[test]
     fn reject_max_turns_zero() {
-        let toml = MINIMAL_REQUIRED.replace("[worker]\n", "[worker]\nmax_turns = 0\n");
-        assert!(PodManifest::from_toml(&toml).is_err());
+        let toml = MINIMAL_REQUIRED.replace("[engine]\n", "[engine]\nmax_turns = 0\n");
+        assert!(WorkerManifest::from_toml(&toml).is_err());
     }
 
     #[test]
     fn parse_compaction_config() {
         let toml = format!("{MINIMAL_REQUIRED}\n[compaction]\nthreshold = 80000\n");
-        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let manifest = WorkerManifest::from_toml(&toml).unwrap();
         let c = manifest.compaction.unwrap();
         assert_eq!(c.prune_protected_tokens, 8000);
         assert_eq!(c.prune_min_savings, 4096);
@@ -1048,7 +1048,7 @@ model_id = "claude-sonnet-4-20250514"
     #[test]
     fn reject_removed_prune_protected_turns_field() {
         let toml = format!("{MINIMAL_REQUIRED}\n[compaction]\nprune_protected_turns = 3\n");
-        let err = PodManifest::from_toml(&toml).unwrap_err();
+        let err = WorkerManifest::from_toml(&toml).unwrap_err();
         assert!(
             err.to_string().contains("compaction.prune_protected_turns"),
             "unexpected error: {err}"
@@ -1062,7 +1062,7 @@ model_id = "claude-sonnet-4-20250514"
              [compaction]\n\
              worker_max_turns = 7\n"
         );
-        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let manifest = WorkerManifest::from_toml(&toml).unwrap();
         let c = manifest.compaction.unwrap();
         assert_eq!(c.worker_max_turns, Some(7));
     }
@@ -1075,7 +1075,7 @@ model_id = "claude-sonnet-4-20250514"
              threshold = 80000\n\
              request_threshold = 90000\n"
         );
-        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let manifest = WorkerManifest::from_toml(&toml).unwrap();
         let c = manifest.compaction.unwrap();
         assert_eq!(c.threshold, Some(80000));
         assert_eq!(c.request_threshold, Some(90000));
@@ -1088,7 +1088,7 @@ model_id = "claude-sonnet-4-20250514"
              [compaction]\n\
              request_threshold = 90000\n"
         );
-        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let manifest = WorkerManifest::from_toml(&toml).unwrap();
         let c = manifest.compaction.unwrap();
         assert_eq!(c.threshold, None);
         assert_eq!(c.request_threshold, Some(90000));
@@ -1104,7 +1104,7 @@ model_id = "claude-sonnet-4-20250514"
              scheme = \"gemini\"\n\
              model_id = \"gemini-2.0-flash\"\n"
         );
-        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let manifest = WorkerManifest::from_toml(&toml).unwrap();
         let c = manifest.compaction.unwrap();
         let p = c.model.unwrap();
         assert_eq!(p.scheme, Some(SchemeKind::Gemini));
@@ -1113,20 +1113,20 @@ model_id = "claude-sonnet-4-20250514"
 
     #[test]
     fn omitted_compaction_is_none() {
-        let manifest = PodManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        let manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
         assert!(manifest.compaction.is_none());
     }
 
     #[test]
     fn omitted_memory_is_none() {
-        let manifest = PodManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        let manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
         assert!(manifest.memory.is_none());
     }
 
     #[test]
     fn empty_memory_section_enables_with_default_root() {
         let toml = format!("{MINIMAL_REQUIRED}\n[memory]\n");
-        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let manifest = WorkerManifest::from_toml(&toml).unwrap();
         let mem = manifest.memory.expect("memory section parsed");
         assert!(mem.workspace_root.is_none());
         assert_eq!(mem.inject_summary, None);
@@ -1135,7 +1135,7 @@ model_id = "claude-sonnet-4-20250514"
     #[test]
     fn memory_section_with_inject_summary_false() {
         let toml = format!("{MINIMAL_REQUIRED}\n[memory]\ninject_summary = false\n");
-        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let manifest = WorkerManifest::from_toml(&toml).unwrap();
         let mem = manifest.memory.unwrap();
         assert_eq!(mem.inject_summary, Some(false));
     }
@@ -1143,7 +1143,7 @@ model_id = "claude-sonnet-4-20250514"
     #[test]
     fn memory_section_with_explicit_root() {
         let toml = format!("{MINIMAL_REQUIRED}\n[memory]\nworkspace_root = \"/some/where\"\n");
-        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let manifest = WorkerManifest::from_toml(&toml).unwrap();
         let mem = manifest.memory.unwrap();
         assert_eq!(
             mem.workspace_root.unwrap(),
@@ -1154,7 +1154,7 @@ model_id = "claude-sonnet-4-20250514"
     #[test]
     fn memory_section_with_language() {
         let toml = format!("{MINIMAL_REQUIRED}\n[memory]\nlanguage = \"Japanese\"\n");
-        let manifest = PodManifest::from_toml(&toml).unwrap();
+        let manifest = WorkerManifest::from_toml(&toml).unwrap();
         let mem = manifest.memory.unwrap();
         assert_eq!(mem.language.as_deref(), Some("Japanese"));
     }
@@ -1163,62 +1163,62 @@ model_id = "claude-sonnet-4-20250514"
     fn reject_unknown_scheme() {
         let toml =
             MINIMAL_REQUIRED.replace("scheme = \"anthropic\"", "scheme = \"unknown_scheme\"");
-        assert!(PodManifest::from_toml(&toml).is_err());
+        assert!(WorkerManifest::from_toml(&toml).is_err());
     }
 
     #[test]
     fn omitted_limits_fall_back_to_defaults() {
-        let manifest = PodManifest::from_toml(MINIMAL_REQUIRED).unwrap();
-        let limits = &manifest.worker.tool_output;
+        let manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        let limits = &manifest.engine.tool_output;
         assert_eq!(limits.default_max_bytes, defaults::TOOL_OUTPUT_MAX_BYTES);
         assert!(limits.per_tool.is_empty());
         assert_eq!(
-            manifest.worker.file_upload.max_bytes,
+            manifest.engine.file_upload.max_bytes,
             defaults::FILE_UPLOAD_MAX_BYTES
         );
     }
 
     #[test]
     fn worker_language_defaults_and_parses() {
-        let manifest = PodManifest::from_toml(MINIMAL_REQUIRED).unwrap();
-        assert_eq!(manifest.worker.language, defaults::WORKER_LANGUAGE);
+        let manifest = WorkerManifest::from_toml(MINIMAL_REQUIRED).unwrap();
+        assert_eq!(manifest.engine.language, defaults::WORKER_LANGUAGE);
 
-        let toml = MINIMAL_REQUIRED.replace("[worker]\n", "[worker]\nlanguage = \"Japanese\"\n");
-        let manifest = PodManifest::from_toml(&toml).unwrap();
-        assert_eq!(manifest.worker.language, "Japanese");
+        let toml = MINIMAL_REQUIRED.replace("[engine]\n", "[engine]\nlanguage = \"Japanese\"\n");
+        let manifest = WorkerManifest::from_toml(&toml).unwrap();
+        assert_eq!(manifest.engine.language, "Japanese");
     }
 
     #[test]
     fn parse_worker_output_limits() {
         let toml = MINIMAL_REQUIRED.replace(
-            "[worker]\n",
-            "[worker]\n\
+            "[engine]\n",
+            "[engine]\n\
              [worker.tool_output]\n\
              default_max_bytes = 8192\n\n\
              [worker.tool_output.per_tool]\n\
              Read = 32768\n\
              Grep = 4096\n\n\
-             [worker.file_upload]\n\
+             [engine.file_upload]\n\
              max_bytes = 12345\n",
         );
-        let manifest = PodManifest::from_toml(&toml).unwrap();
-        let limits = &manifest.worker.tool_output;
+        let manifest = WorkerManifest::from_toml(&toml).unwrap();
+        let limits = &manifest.engine.tool_output;
         assert_eq!(limits.default_max_bytes, 8192);
         assert_eq!(limits.limit_for("Read"), 32768);
         assert_eq!(limits.limit_for("Grep"), 4096);
         assert_eq!(limits.limit_for("Unknown"), 8192);
-        assert_eq!(manifest.worker.file_upload.max_bytes, 12345);
+        assert_eq!(manifest.engine.file_upload.max_bytes, 12345);
     }
 
     #[test]
     fn empty_tool_output_section_uses_default_max_bytes() {
         let toml = MINIMAL_REQUIRED.replace(
-            "[worker]\n",
-            "[worker]\n\
+            "[engine]\n",
+            "[engine]\n\
              [worker.tool_output]\n",
         );
-        let manifest = PodManifest::from_toml(&toml).unwrap();
-        let limits = &manifest.worker.tool_output;
+        let manifest = WorkerManifest::from_toml(&toml).unwrap();
+        let limits = &manifest.engine.tool_output;
         assert_eq!(limits.default_max_bytes, defaults::TOOL_OUTPUT_MAX_BYTES);
         assert!(limits.per_tool.is_empty());
     }

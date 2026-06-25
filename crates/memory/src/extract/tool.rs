@@ -2,7 +2,7 @@
 //!
 //! sub-Engine からは extract worker が出した [`ExtractedPayload`] を
 //! 受け取って `Mutex` 越しに [`ExtractWorkerContext`] に置くだけ。
-//! Pod 側はランループ完了後に `take_payload()` で取り出して
+//! Worker 側はランループ完了後に `take_payload()` で取り出して
 //! [`super::staging::write_staging`] に渡す。
 
 use std::sync::{Arc, Mutex};
@@ -22,7 +22,7 @@ the wrapper attaches provenance mechanically.";
 pub struct ExtractWorkerContext {
     payload: Mutex<Option<ExtractedPayload>>,
     /// `write_extracted` が複数回呼ばれた回数（debug 用）。
-    /// 後勝ちで上書きするが、Pod 側で warn を出したい場合に参照する。
+    /// 後勝ちで上書きするが、Worker 側で warn を出したい場合に参照する。
     call_count: Mutex<usize>,
 }
 
@@ -31,7 +31,7 @@ impl ExtractWorkerContext {
         Self::default()
     }
 
-    /// sub-Engine 終了後に Pod が呼んで payload を取り出す。
+    /// sub-Engine 終了後に Worker が呼んで payload を取り出す。
     /// 一度も `write_extracted` が呼ばれなければ `None`。
     pub fn take_payload(&self) -> Option<ExtractedPayload> {
         self.payload

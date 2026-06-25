@@ -1,6 +1,6 @@
 use crate::Error;
 use chrono::Utc;
-use pod_store::PodMetadata;
+use pod_store::WorkerMetadata;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -11,8 +11,8 @@ use std::{
     sync::Arc,
 };
 
-const LOCAL_RUNTIME_ID: &str = "local-pod-runtime";
-const LOCAL_HOST_KIND: &str = "local-pod-host";
+const LOCAL_RUNTIME_ID: &str = "local-worker-runtime";
+const LOCAL_HOST_KIND: &str = "local-worker-host";
 const MAX_DIAGNOSTICS: usize = 16;
 const MAX_HOST_SCAN: usize = 256;
 const MAX_IDENTIFIER_LEN: usize = 120;
@@ -326,7 +326,7 @@ impl WorkerRuntimeRegistry {
         Self { runtimes }
     }
 
-    pub fn for_local_pods(runtime: LocalPodRuntime) -> Self {
+    pub fn for_local_pods(runtime: LocalWorkerRuntime) -> Self {
         Self::new(vec![Arc::new(runtime)])
     }
 
@@ -423,16 +423,16 @@ impl WorkerRuntimeRegistry {
 }
 
 #[derive(Clone)]
-pub struct LocalPodRuntime {
+pub struct LocalWorkerRuntime {
     runtime_id: String,
     host_id: String,
     workspace_root: PathBuf,
     data_dir: Option<PathBuf>,
 }
 
-pub type LocalRuntimeBridge = LocalPodRuntime;
+pub type LocalRuntimeBridge = LocalWorkerRuntime;
 
-impl LocalPodRuntime {
+impl LocalWorkerRuntime {
     pub fn new(
         workspace_id: impl AsRef<str>,
         workspace_root: impl Into<PathBuf>,
@@ -450,16 +450,16 @@ impl LocalPodRuntime {
         self.data_dir.as_ref().map(|dir| dir.join("pods"))
     }
 
-    fn pod_names(&self, pod_root: &Path) -> Result<BTreeSet<String>, RuntimeDiagnostic> {
+    fn worker_names(&self, pod_root: &Path) -> Result<BTreeSet<String>, RuntimeDiagnostic> {
         let entries = fs::read_dir(pod_root).map_err(|err| {
             diagnostic(
                 "local_pod_registry_unreadable",
                 DiagnosticSeverity::Warning,
-                format!("local Pod registry could not be read: {err}"),
+                format!("local Worker registry could not be read: {err}"),
             )
         })?;
 
-        let mut pod_names = BTreeSet::new();
+        let mut worker_names = BTreeSet::new();
         for entry in entries.flatten() {
             let Ok(file_type) = entry.file_type() else {
                 continue;
@@ -470,30 +470,30 @@ impl LocalPodRuntime {
             let Some(name) = entry.file_name().to_str().map(|name| name.to_string()) else {
                 continue;
             };
-            pod_names.insert(name);
+            worker_names.insert(name);
         }
-        Ok(pod_names)
+        Ok(worker_names)
     }
 
-    fn read_worker(&self, pod_root: &Path, pod_name: &str) -> WorkerReadOutcome {
-        let metadata_path = pod_root.join(pod_name).join("metadata.json");
+    fn read_worker(&self, pod_root: &Path, worker_name: &str) -> WorkerReadOutcome {
+        let metadata_path = pod_root.join(worker_name).join("metadata.json");
         let data = match fs::read_to_string(metadata_path) {
             Ok(data) => data,
             Err(err) => {
                 return WorkerReadOutcome::Diagnostic(diagnostic(
                     "local_pod_metadata_unreadable",
                     DiagnosticSeverity::Warning,
-                    format!("local Pod metadata could not be read: {err}"),
+                    format!("local Worker metadata could not be read: {err}"),
                 ));
             }
         };
-        let metadata: PodMetadata = match serde_json::from_str(&data) {
+        let metadata: WorkerMetadata = match serde_json::from_str(&data) {
             Ok(metadata) => metadata,
             Err(err) => {
                 return WorkerReadOutcome::Diagnostic(diagnostic(
                     "local_pod_metadata_invalid",
                     DiagnosticSeverity::Warning,
-                    format!("local Pod metadata could not be parsed: {err}"),
+                    format!("local Worker metadata could not be parsed: {err}"),
                 ));
             }
         };
@@ -502,7 +502,7 @@ impl LocalPodRuntime {
             return WorkerReadOutcome::Diagnostic(diagnostic(
                 "local_pod_workspace_root_missing",
                 DiagnosticSeverity::Warning,
-                "local Pod metadata did not include a workspace identity and was not included"
+                "local Worker metadata did not include a workspace identity and was not included"
                     .to_string(),
             ));
         };
@@ -510,15 +510,16 @@ impl LocalPodRuntime {
             return WorkerReadOutcome::Diagnostic(diagnostic(
                 "local_pod_workspace_not_visible",
                 DiagnosticSeverity::Info,
-                "local Pod metadata belongs to another workspace and was not included".to_string(),
+                "local Worker metadata belongs to another workspace and was not included"
+                    .to_string(),
             ));
         }
 
-        let label = safe_display_hint(&metadata.pod_name);
+        let label = safe_display_hint(&metadata.worker_name);
         let role = manifest_hint_string(&metadata.resolved_manifest_snapshot, "role");
         let profile =
             manifest_hint_string(&metadata.resolved_manifest_snapshot, "profile_selector");
-        let worker_id = worker_id_for_pod(pod_name);
+        let worker_id = worker_id_for_pod(worker_name);
         let status = match metadata
             .active
             .as_ref()
@@ -550,7 +551,7 @@ impl LocalPodRuntime {
             last_seen_at,
             implementation: WorkerImplementationSummary {
                 kind: "local_pod".to_string(),
-                display_hint: safe_display_hint(pod_name),
+                display_hint: safe_display_hint(worker_name),
             },
             capabilities: WorkerCapabilitySummary {
                 can_accept_input: true,
@@ -569,7 +570,7 @@ impl LocalPodRuntime {
     }
 }
 
-impl WorkspaceWorkerRuntime for LocalPodRuntime {
+impl WorkspaceWorkerRuntime for LocalWorkerRuntime {
     fn runtime_id(&self) -> &str {
         &self.runtime_id
     }
@@ -578,7 +579,7 @@ impl WorkspaceWorkerRuntime for LocalPodRuntime {
         let host_list = self.list_hosts(1);
         RuntimeSummary {
             runtime_id: self.runtime_id.clone(),
-            label: "Local Pod runtime".to_string(),
+            label: "Local Worker runtime".to_string(),
             kind: "local_pod".to_string(),
             status: "available".to_string(),
             host_ids: host_list
@@ -603,7 +604,7 @@ impl WorkspaceWorkerRuntime for LocalPodRuntime {
             diagnostics.push(diagnostic(
                 "local_pod_registry_unavailable",
                 DiagnosticSeverity::Warning,
-                "local Pod data directory is not configured; worker discovery is unavailable"
+                "local Worker data directory is not configured; worker discovery is unavailable"
                     .to_string(),
             ));
         }
@@ -634,7 +635,7 @@ impl WorkspaceWorkerRuntime for LocalPodRuntime {
                 vec![diagnostic(
                     "local_pod_registry_unavailable",
                     DiagnosticSeverity::Warning,
-                    "local Pod data directory is not configured; worker discovery is unavailable"
+                    "local Worker data directory is not configured; worker discovery is unavailable"
                         .to_string(),
                 )],
             );
@@ -645,16 +646,16 @@ impl WorkspaceWorkerRuntime for LocalPodRuntime {
 
         let mut workers = Vec::new();
         let mut diagnostics = Vec::new();
-        let pod_names = match self.pod_names(&pod_root) {
-            Ok(pod_names) => pod_names,
+        let worker_names = match self.worker_names(&pod_root) {
+            Ok(worker_names) => worker_names,
             Err(diag) => return RuntimeList::new(Vec::new(), vec![diag]),
         };
 
-        for pod_name in pod_names {
+        for worker_name in worker_names {
             if workers.len() >= limit {
                 break;
             }
-            match self.read_worker(&pod_root, &pod_name) {
+            match self.read_worker(&pod_root, &worker_name) {
                 WorkerReadOutcome::Worker(worker) => workers.push(worker),
                 WorkerReadOutcome::Diagnostic(diag) => {
                     if diagnostics.len() < MAX_DIAGNOSTICS {
@@ -673,13 +674,13 @@ impl WorkspaceWorkerRuntime for LocalPodRuntime {
                 diagnostics: vec![diagnostic(
                     "local_pod_registry_unavailable",
                     DiagnosticSeverity::Warning,
-                    "local Pod data directory is not configured; worker discovery is unavailable"
+                    "local Worker data directory is not configured; worker discovery is unavailable"
                         .to_string(),
                 )],
             };
         };
-        let pod_names = match self.pod_names(&pod_root) {
-            Ok(pod_names) => pod_names,
+        let worker_names = match self.worker_names(&pod_root) {
+            Ok(worker_names) => worker_names,
             Err(diag) => {
                 return WorkerLookupResult {
                     worker: None,
@@ -687,11 +688,11 @@ impl WorkspaceWorkerRuntime for LocalPodRuntime {
                 };
             }
         };
-        for pod_name in pod_names {
-            if worker_id_for_pod(&pod_name) != worker_id {
+        for worker_name in worker_names {
+            if worker_id_for_pod(&worker_name) != worker_id {
                 continue;
             }
-            return match self.read_worker(&pod_root, &pod_name) {
+            return match self.read_worker(&pod_root, &worker_name) {
                 WorkerReadOutcome::Worker(worker) => WorkerLookupResult {
                     worker: Some(worker),
                     diagnostics: Vec::new(),
@@ -761,8 +762,8 @@ fn host_id_for_workspace(workspace_id: &str) -> String {
     bounded_backend_identifier("local-", workspace_id)
 }
 
-fn worker_id_for_pod(pod_name: &str) -> String {
-    bounded_backend_identifier("local-pod-", pod_name)
+fn worker_id_for_pod(worker_name: &str) -> String {
+    bounded_backend_identifier("local-worker-", worker_name)
 }
 
 fn bounded_backend_identifier(prefix: &str, value: &str) -> String {
@@ -961,8 +962,8 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    fn write_metadata(dir: &Path, pod_name: &str, metadata: &PodMetadata) {
-        let pod_dir = dir.join("pods").join(pod_name);
+    fn write_metadata(dir: &Path, worker_name: &str, metadata: &WorkerMetadata) {
+        let pod_dir = dir.join("pods").join(worker_name);
         fs::create_dir_all(&pod_dir).unwrap();
         fs::write(
             pod_dir.join("metadata.json"),
@@ -971,8 +972,8 @@ mod tests {
         .unwrap();
     }
 
-    fn metadata(workspace_root: Option<&str>) -> PodMetadata {
-        let mut metadata = PodMetadata::new("coder", None);
+    fn metadata(workspace_root: Option<&str>) -> WorkerMetadata {
+        let mut metadata = WorkerMetadata::new("coder", None);
         metadata.workspace_root = workspace_root.map(PathBuf::from);
         metadata.resolved_manifest_snapshot = Some(json!({
             "role": "coder",
@@ -992,7 +993,7 @@ mod tests {
 
     #[test]
     fn local_runtime_reports_host_without_private_paths() {
-        let bridge = LocalPodRuntime::new("local:test", "/workspace/project", None);
+        let bridge = LocalWorkerRuntime::new("local:test", "/workspace/project", None);
         let hosts = bridge.list_hosts(10);
         assert_eq!(hosts.items.len(), 1);
         let host = &hosts.items[0];
@@ -1010,7 +1011,7 @@ mod tests {
     fn registry_lists_runtimes_hosts_and_workers() {
         let temp = TempDir::new().unwrap();
         write_metadata(temp.path(), "coder", &metadata(Some("/workspace/project")));
-        let registry = WorkerRuntimeRegistry::for_local_pods(LocalPodRuntime::new(
+        let registry = WorkerRuntimeRegistry::for_local_pods(LocalWorkerRuntime::new(
             "local:test",
             "/workspace/project",
             Some(temp.path().to_path_buf()),
@@ -1042,7 +1043,7 @@ mod tests {
     fn registry_resolves_backend_validated_host_ids() {
         let temp = TempDir::new().unwrap();
         write_metadata(temp.path(), "coder", &metadata(Some("/workspace/project")));
-        let registry = WorkerRuntimeRegistry::for_local_pods(LocalPodRuntime::new(
+        let registry = WorkerRuntimeRegistry::for_local_pods(LocalWorkerRuntime::new(
             "local:test",
             "/workspace/project",
             Some(temp.path().to_path_buf()),
@@ -1065,7 +1066,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         write_metadata(temp.path(), "other", &metadata(Some("/workspace/other")));
         write_metadata(temp.path(), "missing", &metadata(None));
-        let bridge = LocalPodRuntime::new(
+        let bridge = LocalWorkerRuntime::new(
             "local:test",
             "/workspace/project",
             Some(temp.path().to_path_buf()),
@@ -1090,7 +1091,7 @@ mod tests {
     fn local_runtime_worker_detail_is_safe_and_bounded() {
         let temp = TempDir::new().unwrap();
         write_metadata(temp.path(), "coder", &metadata(Some("/workspace/project")));
-        let bridge = LocalPodRuntime::new(
+        let bridge = LocalWorkerRuntime::new(
             "local:test",
             "/workspace/project",
             Some(temp.path().to_path_buf()),
@@ -1112,18 +1113,22 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let long_a = format!("{}-A", "TicketWorkerWithVeryLongName".repeat(8));
         let long_b = format!("{}-B", "TicketWorkerWithVeryLongName".repeat(8));
-        let pod_names = vec![
-            "00001KVWECEQG-Coder.Pod".to_string(),
+        let worker_names = vec![
+            "00001KVWECEQG-Coder.Worker".to_string(),
             "foo.bar".to_string(),
             "foo-bar".to_string(),
             "Ticket#Worker@Reviewer".to_string(),
             long_a,
             long_b,
         ];
-        for pod_name in &pod_names {
-            write_metadata(temp.path(), pod_name, &metadata(Some("/workspace/project")));
+        for worker_name in &worker_names {
+            write_metadata(
+                temp.path(),
+                worker_name,
+                &metadata(Some("/workspace/project")),
+            );
         }
-        let bridge = LocalPodRuntime::new(
+        let bridge = LocalWorkerRuntime::new(
             "local:test",
             "/workspace/project",
             Some(temp.path().to_path_buf()),
@@ -1131,7 +1136,7 @@ mod tests {
         let registry = WorkerRuntimeRegistry::for_local_pods(bridge.clone());
 
         let listed = registry.list_workers(100);
-        assert_eq!(listed.items.len(), pod_names.len());
+        assert_eq!(listed.items.len(), worker_names.len());
         let mut ids = BTreeSet::new();
         for worker in listed.items {
             assert_valid_generated_id(&worker.worker_id);

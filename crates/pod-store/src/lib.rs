@@ -1,14 +1,14 @@
-//! Durable Pod-name metadata/state persistence.
+//! Durable Worker-name metadata/state persistence.
 //!
-//! This crate owns the name-keyed Pod state surface under a Pod-state root,
-//! e.g. `{data_dir}/pods/{pod_name}/metadata.json`. Session JSONL replay stays
-//! in `session-store`; Pod metadata may point at a `(SessionId, SegmentId)` but
+//! This crate owns the name-keyed Worker state surface under a Worker-state root,
+//! e.g. `{data_dir}/workers/{worker_name}/metadata.json`. Session JSONL replay stays
+//! in `session-store`; Worker metadata may point at a `(SessionId, SegmentId)` but
 //! does not own or replay session logs.
 //!
-//! `resolved_manifest_snapshot` is authority only for Pod-name restore before
+//! `resolved_manifest_snapshot` is authority only for Worker-name restore before
 //! loading the session log. Existing segment replay still uses `SegmentStart`
 //! entries from `session-store`. `spawned_children` is durable current parent
-//! Pod state for child registry/reclaim; child lifecycle messages shown to the
+//! Worker state for child registry/reclaim; child lifecycle messages shown to the
 //! model remain session JSONL history. Socket and callback paths are last-known
 //! runtime hints, not proof of liveness.
 
@@ -17,9 +17,9 @@ use session_store::{SegmentId, SessionId};
 use std::fs;
 use std::path::PathBuf;
 
-/// Errors from Pod metadata persistence.
+/// Errors from Worker metadata persistence.
 #[derive(Debug, thiserror::Error)]
-pub enum PodStoreError {
+pub enum WorkerStoreError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -30,15 +30,15 @@ pub enum PodStoreError {
     InvalidPodName(String),
 }
 
-/// Active Session/Segment pointer for a Pod.
+/// Active Session/Segment pointer for a Worker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PodActiveSegmentRef {
+pub struct WorkerActiveSegmentRef {
     pub session_id: SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segment_id: Option<SegmentId>,
 }
 
-impl PodActiveSegmentRef {
+impl WorkerActiveSegmentRef {
     /// Create a reference whose active Segment is not known yet.
     pub fn pending_segment(session_id: SessionId) -> Self {
         Self {
@@ -57,21 +57,21 @@ impl PodActiveSegmentRef {
 }
 
 /// One delegated scope rule for a spawned child, kept local to avoid depending
-/// on manifest scope types in durable Pod state.
+/// on manifest scope types in durable Worker state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PodSpawnedScopeRule {
+pub struct WorkerSpawnedScopeRule {
     pub target: PathBuf,
     pub permission: String,
     pub recursive: bool,
 }
 
-/// One child Pod spawned by this Pod and persisted with the spawner's
-/// name-keyed Pod state. Runtime paths are last-known hints only.
+/// One child Worker spawned by this Worker and persisted with the spawner's
+/// name-keyed Worker state. Runtime paths are last-known hints only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PodSpawnedChild {
-    pub pod_name: String,
+pub struct WorkerSpawnedChild {
+    pub worker_name: String,
     pub socket_path: PathBuf,
-    pub scope_delegated: Vec<PodSpawnedScopeRule>,
+    pub scope_delegated: Vec<WorkerSpawnedScopeRule>,
     pub callback_address: PathBuf,
 }
 
@@ -79,44 +79,44 @@ pub struct PodSpawnedChild {
 /// restore can distinguish outstanding delegated scope from already-reclaimed
 /// child state without consulting session logs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PodReclaimedChild {
-    pub pod_name: String,
-    pub scope_delegated: Vec<PodSpawnedScopeRule>,
+pub struct WorkerReclaimedChild {
+    pub worker_name: String,
+    pub scope_delegated: Vec<WorkerSpawnedScopeRule>,
 }
 
-/// One peer Pod made visible by an explicit peer handshake.
+/// One peer Worker made visible by an explicit peer handshake.
 ///
 /// Peer visibility is intentionally separate from spawned-child delegation: it
 /// does not carry filesystem scope, callback ownership, output cursors, or
 /// lifecycle-notification authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PodPeer {
-    pub pod_name: String,
+pub struct WorkerPeer {
+    pub worker_name: String,
 }
 
-/// Persistent metadata for a Pod name.
+/// Persistent metadata for a Worker name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PodMetadata {
-    pub pod_name: String,
+pub struct WorkerMetadata {
+    pub worker_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active: Option<PodActiveSegmentRef>,
+    pub active: Option<WorkerActiveSegmentRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub spawned_children: Vec<PodSpawnedChild>,
+    pub spawned_children: Vec<WorkerSpawnedChild>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub reclaimed_children: Vec<PodReclaimedChild>,
+    pub reclaimed_children: Vec<WorkerReclaimedChild>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub peers: Vec<PodPeer>,
+    pub peers: Vec<WorkerPeer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_manifest_snapshot: Option<serde_json::Value>,
 }
 
-impl PodMetadata {
-    /// Create Pod metadata for `pod_name`.
-    pub fn new(pod_name: impl Into<String>, active: Option<PodActiveSegmentRef>) -> Self {
+impl WorkerMetadata {
+    /// Create Worker metadata for `worker_name`.
+    pub fn new(worker_name: impl Into<String>, active: Option<WorkerActiveSegmentRef>) -> Self {
         Self {
-            pod_name: pod_name.into(),
+            worker_name: worker_name.into(),
             active,
             workspace_root: None,
             spawned_children: Vec::new(),
@@ -132,35 +132,39 @@ impl PodMetadata {
     }
 }
 
-/// Sync persistence backend for Pod metadata.
-pub trait PodMetadataStore: Send + Sync {
-    /// Create or replace metadata for its `pod_name` key.
-    fn write(&self, metadata: &PodMetadata) -> Result<(), PodStoreError>;
+/// Sync persistence backend for Worker metadata.
+pub trait WorkerMetadataStore: Send + Sync {
+    /// Create or replace metadata for its `worker_name` key.
+    fn write(&self, metadata: &WorkerMetadata) -> Result<(), WorkerStoreError>;
 
-    /// Read metadata by Pod name. Returns `None` when no metadata exists.
-    fn read_by_name(&self, pod_name: &str) -> Result<Option<PodMetadata>, PodStoreError>;
+    /// Read metadata by Worker name. Returns `None` when no metadata exists.
+    fn read_by_name(&self, worker_name: &str) -> Result<Option<WorkerMetadata>, WorkerStoreError>;
 
-    /// List persisted Pod metadata keys.
-    fn list_names(&self) -> Result<Vec<String>, PodStoreError>;
+    /// List persisted Worker metadata keys.
+    fn list_names(&self) -> Result<Vec<String>, WorkerStoreError>;
 
     /// Return the metadata root directory when this backend is path-backed.
     fn root_dir(&self) -> Option<PathBuf> {
         None
     }
 
-    /// Delete metadata by Pod name. Missing metadata is a successful no-op.
-    fn delete_by_name(&self, pod_name: &str) -> Result<(), PodStoreError>;
+    /// Delete metadata by Worker name. Missing metadata is a successful no-op.
+    fn delete_by_name(&self, worker_name: &str) -> Result<(), WorkerStoreError>;
 
-    /// Merge an update into one Pod's metadata, preserving unrelated fields.
-    fn update_by_name<F>(&self, pod_name: &str, update: F) -> Result<PodMetadata, PodStoreError>
+    /// Merge an update into one Worker's metadata, preserving unrelated fields.
+    fn update_by_name<F>(
+        &self,
+        worker_name: &str,
+        update: F,
+    ) -> Result<WorkerMetadata, WorkerStoreError>
     where
-        F: FnOnce(&mut PodMetadata),
+        F: FnOnce(&mut WorkerMetadata),
     {
         let mut metadata = self
-            .read_by_name(pod_name)?
-            .unwrap_or_else(|| PodMetadata::new(pod_name, None));
+            .read_by_name(worker_name)?
+            .unwrap_or_else(|| WorkerMetadata::new(worker_name, None));
         update(&mut metadata);
-        metadata.pod_name = pod_name.to_string();
+        metadata.worker_name = worker_name.to_string();
         self.write(&metadata)?;
         Ok(metadata)
     }
@@ -168,22 +172,22 @@ pub trait PodMetadataStore: Send + Sync {
     /// Set the active pointer while preserving spawned children, workspace ownership, and manifest snapshot.
     fn set_active(
         &self,
-        pod_name: &str,
-        active: Option<PodActiveSegmentRef>,
+        worker_name: &str,
+        active: Option<WorkerActiveSegmentRef>,
         resolved_manifest_snapshot: Option<serde_json::Value>,
-    ) -> Result<PodMetadata, PodStoreError> {
-        self.set_active_with_workspace_root(pod_name, active, resolved_manifest_snapshot, None)
+    ) -> Result<WorkerMetadata, WorkerStoreError> {
+        self.set_active_with_workspace_root(worker_name, active, resolved_manifest_snapshot, None)
     }
 
     /// Set the active pointer and workspace ownership while preserving unrelated fields.
     fn set_active_with_workspace_root(
         &self,
-        pod_name: &str,
-        active: Option<PodActiveSegmentRef>,
+        worker_name: &str,
+        active: Option<WorkerActiveSegmentRef>,
         resolved_manifest_snapshot: Option<serde_json::Value>,
         workspace_root: Option<PathBuf>,
-    ) -> Result<PodMetadata, PodStoreError> {
-        self.update_by_name(pod_name, |metadata| {
+    ) -> Result<WorkerMetadata, WorkerStoreError> {
+        self.update_by_name(worker_name, |metadata| {
             metadata.active = active;
             metadata.resolved_manifest_snapshot = resolved_manifest_snapshot;
             if let Some(workspace_root) = workspace_root {
@@ -195,38 +199,56 @@ pub trait PodMetadataStore: Send + Sync {
     /// Set spawned-child registry state while preserving active pointer and manifest snapshot.
     fn set_spawned_children(
         &self,
-        pod_name: &str,
-        children: Vec<PodSpawnedChild>,
-    ) -> Result<PodMetadata, PodStoreError> {
-        self.update_by_name(pod_name, |metadata| {
+        worker_name: &str,
+        children: Vec<WorkerSpawnedChild>,
+    ) -> Result<WorkerMetadata, WorkerStoreError> {
+        self.update_by_name(worker_name, |metadata| {
             metadata.spawned_children = children;
         })
     }
 
     /// Set peer visibility state while preserving active pointer, child state,
     /// and manifest snapshot.
-    fn set_peers(&self, pod_name: &str, peers: Vec<PodPeer>) -> Result<PodMetadata, PodStoreError> {
-        self.update_by_name(pod_name, |metadata| {
+    fn set_peers(
+        &self,
+        worker_name: &str,
+        peers: Vec<WorkerPeer>,
+    ) -> Result<WorkerMetadata, WorkerStoreError> {
+        self.update_by_name(worker_name, |metadata| {
             metadata.peers = peers;
         })
     }
 
     /// Add one peer if absent while preserving every other metadata field.
-    fn add_peer(&self, pod_name: &str, peer_name: &str) -> Result<PodMetadata, PodStoreError> {
-        self.update_by_name(pod_name, |metadata| {
-            if !metadata.peers.iter().any(|peer| peer.pod_name == peer_name) {
-                metadata.peers.push(PodPeer {
-                    pod_name: peer_name.to_string(),
+    fn add_peer(
+        &self,
+        worker_name: &str,
+        peer_name: &str,
+    ) -> Result<WorkerMetadata, WorkerStoreError> {
+        self.update_by_name(worker_name, |metadata| {
+            if !metadata
+                .peers
+                .iter()
+                .any(|peer| peer.worker_name == peer_name)
+            {
+                metadata.peers.push(WorkerPeer {
+                    worker_name: peer_name.to_string(),
                 });
-                metadata.peers.sort_by(|a, b| a.pod_name.cmp(&b.pod_name));
+                metadata
+                    .peers
+                    .sort_by(|a, b| a.worker_name.cmp(&b.worker_name));
             }
         })
     }
 
     /// Remove one peer while preserving every other metadata field.
-    fn remove_peer(&self, pod_name: &str, peer_name: &str) -> Result<PodMetadata, PodStoreError> {
-        self.update_by_name(pod_name, |metadata| {
-            metadata.peers.retain(|peer| peer.pod_name != peer_name);
+    fn remove_peer(
+        &self,
+        worker_name: &str,
+        peer_name: &str,
+    ) -> Result<WorkerMetadata, WorkerStoreError> {
+        self.update_by_name(worker_name, |metadata| {
+            metadata.peers.retain(|peer| peer.worker_name != peer_name);
         })
     }
 
@@ -234,47 +256,47 @@ pub trait PodMetadataStore: Send + Sync {
     /// them in durable reclaim history.
     fn reclaim_spawned_children(
         &self,
-        pod_name: &str,
-        reclaimed: Vec<PodReclaimedChild>,
-    ) -> Result<PodMetadata, PodStoreError> {
-        self.update_by_name(pod_name, |metadata| {
+        worker_name: &str,
+        reclaimed: Vec<WorkerReclaimedChild>,
+    ) -> Result<WorkerMetadata, WorkerStoreError> {
+        self.update_by_name(worker_name, |metadata| {
             for reclaimed_child in &reclaimed {
                 metadata
                     .spawned_children
-                    .retain(|child| child.pod_name != reclaimed_child.pod_name);
+                    .retain(|child| child.worker_name != reclaimed_child.worker_name);
             }
             metadata.reclaimed_children.extend(reclaimed);
         })
     }
 }
 
-/// Filesystem-backed Pod metadata store.
+/// Filesystem-backed Worker metadata store.
 #[derive(Clone)]
-pub struct FsPodStore {
+pub struct FsWorkerStore {
     root: PathBuf,
 }
 
-impl FsPodStore {
-    /// Create a store rooted at the Pod-state directory, usually `{data_dir}/pods`.
-    pub fn new(root: impl Into<PathBuf>) -> Result<Self, PodStoreError> {
+impl FsWorkerStore {
+    /// Create a store rooted at the Worker-state directory, usually `{data_dir}/workers`.
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self, WorkerStoreError> {
         let root = root.into();
         fs::create_dir_all(&root)?;
         Ok(Self { root })
     }
 
-    fn pod_dir(&self, pod_name: &str) -> Result<PathBuf, PodStoreError> {
-        validate_pod_name(pod_name)?;
-        Ok(self.root.join(pod_name))
+    fn pod_dir(&self, worker_name: &str) -> Result<PathBuf, WorkerStoreError> {
+        validate_worker_name(worker_name)?;
+        Ok(self.root.join(worker_name))
     }
 
-    fn metadata_path(&self, pod_name: &str) -> Result<PathBuf, PodStoreError> {
-        Ok(self.pod_dir(pod_name)?.join("metadata.json"))
+    fn metadata_path(&self, worker_name: &str) -> Result<PathBuf, WorkerStoreError> {
+        Ok(self.pod_dir(worker_name)?.join("metadata.json"))
     }
 }
 
-impl PodMetadataStore for FsPodStore {
-    fn write(&self, metadata: &PodMetadata) -> Result<(), PodStoreError> {
-        let path = self.metadata_path(&metadata.pod_name)?;
+impl WorkerMetadataStore for FsWorkerStore {
+    fn write(&self, metadata: &WorkerMetadata) -> Result<(), WorkerStoreError> {
+        let path = self.metadata_path(&metadata.worker_name)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -283,17 +305,17 @@ impl PodMetadataStore for FsPodStore {
         Ok(())
     }
 
-    fn read_by_name(&self, pod_name: &str) -> Result<Option<PodMetadata>, PodStoreError> {
-        let path = self.metadata_path(pod_name)?;
+    fn read_by_name(&self, worker_name: &str) -> Result<Option<WorkerMetadata>, WorkerStoreError> {
+        let path = self.metadata_path(worker_name)?;
         let content = match fs::read_to_string(path) {
             Ok(content) => content,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(PodStoreError::Io(err)),
+            Err(err) => return Err(WorkerStoreError::Io(err)),
         };
         Ok(Some(serde_json::from_str(&content)?))
     }
 
-    fn list_names(&self) -> Result<Vec<String>, PodStoreError> {
+    fn list_names(&self) -> Result<Vec<String>, WorkerStoreError> {
         let mut names = Vec::new();
         if !self.root.exists() {
             return Ok(names);
@@ -309,7 +331,7 @@ impl PodMetadataStore for FsPodStore {
             let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
                 continue;
             };
-            if validate_pod_name(&name).is_ok() {
+            if validate_worker_name(&name).is_ok() {
                 names.push(name);
             }
         }
@@ -321,12 +343,12 @@ impl PodMetadataStore for FsPodStore {
         Some(self.root.clone())
     }
 
-    fn delete_by_name(&self, pod_name: &str) -> Result<(), PodStoreError> {
-        let path = self.metadata_path(pod_name)?;
+    fn delete_by_name(&self, worker_name: &str) -> Result<(), WorkerStoreError> {
+        let path = self.metadata_path(worker_name)?;
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => return Err(PodStoreError::Io(err)),
+            Err(err) => return Err(WorkerStoreError::Io(err)),
         }
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir(parent);
@@ -335,20 +357,20 @@ impl PodMetadataStore for FsPodStore {
     }
 }
 
-pub fn validate_pod_name(pod_name: &str) -> Result<(), PodStoreError> {
-    if pod_name.is_empty()
-        || pod_name == "."
-        || pod_name == ".."
-        || pod_name.contains('/')
-        || pod_name.contains('\0')
+pub fn validate_worker_name(worker_name: &str) -> Result<(), WorkerStoreError> {
+    if worker_name.is_empty()
+        || worker_name == "."
+        || worker_name == ".."
+        || worker_name.contains('/')
+        || worker_name.contains('\0')
     {
-        return Err(PodStoreError::InvalidPodName(pod_name.to_string()));
+        return Err(WorkerStoreError::InvalidPodName(worker_name.to_string()));
     }
     Ok(())
 }
 
 /// Convenience composition for callers that want one handle carrying separate
-/// session-log and Pod-state roots.
+/// session-log and Worker-state roots.
 #[derive(Clone)]
 pub struct CombinedStore<S, P> {
     pub session_store: S,
@@ -442,25 +464,25 @@ where
     }
 }
 
-impl<S, P> PodMetadataStore for CombinedStore<S, P>
+impl<S, P> WorkerMetadataStore for CombinedStore<S, P>
 where
     S: Send + Sync,
-    P: PodMetadataStore,
+    P: WorkerMetadataStore,
 {
-    fn write(&self, metadata: &PodMetadata) -> Result<(), PodStoreError> {
+    fn write(&self, metadata: &WorkerMetadata) -> Result<(), WorkerStoreError> {
         self.pod_store.write(metadata)
     }
-    fn read_by_name(&self, pod_name: &str) -> Result<Option<PodMetadata>, PodStoreError> {
-        self.pod_store.read_by_name(pod_name)
+    fn read_by_name(&self, worker_name: &str) -> Result<Option<WorkerMetadata>, WorkerStoreError> {
+        self.pod_store.read_by_name(worker_name)
     }
-    fn list_names(&self) -> Result<Vec<String>, PodStoreError> {
+    fn list_names(&self) -> Result<Vec<String>, WorkerStoreError> {
         self.pod_store.list_names()
     }
     fn root_dir(&self) -> Option<PathBuf> {
         self.pod_store.root_dir()
     }
-    fn delete_by_name(&self, pod_name: &str) -> Result<(), PodStoreError> {
-        self.pod_store.delete_by_name(pod_name)
+    fn delete_by_name(&self, worker_name: &str) -> Result<(), WorkerStoreError> {
+        self.pod_store.delete_by_name(worker_name)
     }
 }
 
@@ -470,9 +492,9 @@ mod tests {
 
     #[test]
     fn pod_metadata_manifest_snapshot_roundtrips() {
-        let mut metadata = PodMetadata::new(
+        let mut metadata = WorkerMetadata::new(
             "profile-pod",
-            Some(PodActiveSegmentRef::pending_segment(
+            Some(WorkerActiveSegmentRef::pending_segment(
                 session_store::new_session_id(),
             )),
         );
@@ -482,7 +504,7 @@ mod tests {
         }));
 
         let json = serde_json::to_string(&metadata).unwrap();
-        let restored: PodMetadata = serde_json::from_str(&json).unwrap();
+        let restored: WorkerMetadata = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored, metadata);
     }
@@ -491,29 +513,29 @@ mod tests {
     fn fs_store_writes_under_pod_state_root_only() {
         let tmp = tempfile::TempDir::new().unwrap();
         let session_root = tmp.path().join("sessions");
-        let pod_root = tmp.path().join("pods");
+        let pod_root = tmp.path().join("workers");
         fs::create_dir_all(&session_root).unwrap();
-        let store = FsPodStore::new(&pod_root).unwrap();
+        let store = FsWorkerStore::new(&pod_root).unwrap();
         store
-            .write(&PodMetadata::new(
+            .write(&WorkerMetadata::new(
                 "agent",
-                Some(PodActiveSegmentRef::pending_segment(
+                Some(WorkerActiveSegmentRef::pending_segment(
                     session_store::new_session_id(),
                 )),
             ))
             .unwrap();
 
         assert!(pod_root.join("agent/metadata.json").exists());
-        assert!(!session_root.join("pods/agent/metadata.json").exists());
+        assert!(!session_root.join("workers/agent/metadata.json").exists());
     }
 
     #[test]
     fn active_updates_preserve_children_and_manifest_snapshot() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let store = FsPodStore::new(tmp.path()).unwrap();
-        let mut metadata = PodMetadata::new("agent", None);
-        metadata.spawned_children.push(PodSpawnedChild {
-            pod_name: "child".into(),
+        let store = FsWorkerStore::new(tmp.path()).unwrap();
+        let mut metadata = WorkerMetadata::new("agent", None);
+        metadata.spawned_children.push(WorkerSpawnedChild {
+            worker_name: "child".into(),
             socket_path: std::path::Path::new("/tmp/child.sock").into(),
             scope_delegated: vec![],
             callback_address: std::path::Path::new("/tmp/parent.sock").into(),
@@ -525,7 +547,7 @@ mod tests {
         store
             .set_active(
                 "agent",
-                Some(PodActiveSegmentRef::active_segment(
+                Some(WorkerActiveSegmentRef::active_segment(
                     session_store::new_session_id(),
                     session_store::new_segment_id(),
                 )),
@@ -540,8 +562,8 @@ mod tests {
     #[test]
     fn child_updates_preserve_active_and_manifest_snapshot() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let store = FsPodStore::new(tmp.path()).unwrap();
-        let active = PodActiveSegmentRef::active_segment(
+        let store = FsWorkerStore::new(tmp.path()).unwrap();
+        let active = WorkerActiveSegmentRef::active_segment(
             session_store::new_session_id(),
             session_store::new_segment_id(),
         );
@@ -552,8 +574,8 @@ mod tests {
         store
             .set_spawned_children(
                 "agent",
-                vec![PodSpawnedChild {
-                    pod_name: "child".into(),
+                vec![WorkerSpawnedChild {
+                    worker_name: "child".into(),
                     socket_path: std::path::Path::new("/tmp/child.sock").into(),
                     scope_delegated: vec![],
                     callback_address: std::path::Path::new("/tmp/parent.sock").into(),
@@ -568,8 +590,8 @@ mod tests {
     #[test]
     fn peer_updates_preserve_active_children_and_manifest_snapshot() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let store = FsPodStore::new(tmp.path()).unwrap();
-        let active = PodActiveSegmentRef::active_segment(
+        let store = FsWorkerStore::new(tmp.path()).unwrap();
+        let active = WorkerActiveSegmentRef::active_segment(
             session_store::new_session_id(),
             session_store::new_segment_id(),
         );
@@ -580,8 +602,8 @@ mod tests {
         store
             .set_spawned_children(
                 "agent",
-                vec![PodSpawnedChild {
-                    pod_name: "child".into(),
+                vec![WorkerSpawnedChild {
+                    worker_name: "child".into(),
                     socket_path: std::path::Path::new("/tmp/child.sock").into(),
                     scope_delegated: vec![],
                     callback_address: std::path::Path::new("/tmp/parent.sock").into(),
@@ -600,7 +622,7 @@ mod tests {
             restored
                 .peers
                 .iter()
-                .map(|peer| peer.pod_name.as_str())
+                .map(|peer| peer.worker_name.as_str())
                 .collect::<Vec<_>>(),
             vec!["peer-a", "peer-b"]
         );
@@ -608,14 +630,14 @@ mod tests {
         store.remove_peer("agent", "peer-a").unwrap();
         let restored = store.read_by_name("agent").unwrap().unwrap();
         assert_eq!(restored.peers.len(), 1);
-        assert_eq!(restored.peers[0].pod_name, "peer-b");
+        assert_eq!(restored.peers[0].worker_name, "peer-b");
     }
 
     #[test]
     fn reclaim_children_removes_outstanding_and_records_history() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let store = FsPodStore::new(tmp.path()).unwrap();
-        let scope = PodSpawnedScopeRule {
+        let store = FsWorkerStore::new(tmp.path()).unwrap();
+        let scope = WorkerSpawnedScopeRule {
             target: std::path::Path::new("/tmp/delegated").into(),
             permission: "write".into(),
             recursive: true,
@@ -623,8 +645,8 @@ mod tests {
         store
             .set_spawned_children(
                 "agent",
-                vec![PodSpawnedChild {
-                    pod_name: "child".into(),
+                vec![WorkerSpawnedChild {
+                    worker_name: "child".into(),
                     socket_path: std::path::Path::new("/tmp/child.sock").into(),
                     scope_delegated: vec![scope.clone()],
                     callback_address: std::path::Path::new("/tmp/parent.sock").into(),
@@ -635,8 +657,8 @@ mod tests {
         store
             .reclaim_spawned_children(
                 "agent",
-                vec![PodReclaimedChild {
-                    pod_name: "child".into(),
+                vec![WorkerReclaimedChild {
+                    worker_name: "child".into(),
                     scope_delegated: vec![scope.clone()],
                 }],
             )

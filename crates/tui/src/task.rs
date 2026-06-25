@@ -1,18 +1,18 @@
 //! In-TUI mirror of the session-lifetime task store.
 //!
-//! This deliberately does NOT depend on the Pod TaskStore. The TUI is a
-//! presentation layer; pulling in `pod` would drag along the runtime
+//! This deliberately does NOT depend on the Worker TaskStore. The TUI is a
+//! presentation layer; pulling in `worker` would drag along the runtime
 //! feature surface. Instead we mirror the small subset we
 //! need:
 //!
-//! - `TaskEntry` / `TaskStatus`: shaped to round-trip with Pod Task JSON
+//! - `TaskEntry` / `TaskStatus`: shaped to round-trip with Worker Task JSON
 //!   serialization (`#[serde(rename_all = "lowercase")]` on the status,
 //!   matching field names on the entry).
 //! - Just enough state machine to apply `TaskCreate` / `TaskUpdate`
 //!   tool-call arguments and the `[Session TaskStore snapshot]` system
 //!   message that compaction emits.
 //!
-//! The snapshot text format is owned by the Pod Task feature. The TUI keeps
+//! The snapshot text format is owned by the Worker Task feature. The TUI keeps
 //! local compatibility fixtures for the `[Session TaskStore snapshot]` system
 //! message shape emitted during compaction and restored on resume.
 
@@ -90,7 +90,7 @@ impl TaskStore {
 
     /// Apply a completed `TaskCreate` / `TaskUpdate` tool_call. Other
     /// tool names and unparseable JSON are silent no-ops, matching the
-    /// resilience of the Pod TaskStore history replay.
+    /// resilience of the Worker TaskStore history replay.
     pub fn apply_tool_call(&mut self, name: &str, arguments: &str) {
         match name {
             "TaskCreate" => {
@@ -236,8 +236,8 @@ mod tests {
         assert_eq!(c.active(), 2);
     }
 
-    /// Snapshot text matches the wrapping `Pod::try_pre_run_compact` and the
-    /// Pod Task feature snapshot fixture shape: header line, blank, overview
+    /// Snapshot text matches the wrapping `Worker::try_pre_run_compact` and the
+    /// Worker Task feature snapshot fixture shape: header line, blank, overview
     /// line, blank, fenced JSON, trailing prose.
     fn wrap_snapshot(json_body: &str, overview: &str) -> String {
         format!(
@@ -314,16 +314,16 @@ mod tests {
 }
 
 /// Snapshot format compatibility tests. The TUI deliberately re-implements a
-/// stripped-down TaskStore mirror instead of depending on the Pod Task feature;
+/// stripped-down TaskStore mirror instead of depending on the Worker Task feature;
 /// it only consumes task tool calls and `[Session TaskStore snapshot]` system
-/// messages. These fixtures encode the Pod-owned Task snapshot JSON/text shape
+/// messages. These fixtures encode the Worker-owned Task snapshot JSON/text shape
 /// so accidental TUI parser drift still fails locally without making `tui`
-/// depend on `pod` or `tools`.
+/// depend on `worker` or `tools`.
 #[cfg(test)]
 mod snapshot_format_contract {
     use super::*;
 
-    /// Mirrors the envelope `Pod::try_pre_run_compact` wraps the raw
+    /// Mirrors the envelope `Worker::try_pre_run_compact` wraps the raw
     /// snapshot text in. Hand-rolled here so the test fails loudly if
     /// the prose around the JSON fence ever shifts.
     fn wrap_pod_style(snapshot_text: &str) -> String {
@@ -397,7 +397,7 @@ mod snapshot_format_contract {
 
     #[test]
     fn taskentry_field_shape_deserializes_into_tui_taskentry() {
-        // A single Pod TaskEntry as JSON. Field renames like `taskid` →
+        // A single Worker TaskEntry as JSON. Field renames like `taskid` →
         // `task_id` or status case changes surface here as serde failures or
         // wrong-status assertions.
         let json = r#"{

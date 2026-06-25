@@ -9,7 +9,7 @@
 
 use std::time::Instant;
 
-use protocol::{AlertLevel, AlertSource, Greeting, PodEvent, Segment};
+use protocol::{AlertLevel, AlertSource, Greeting, Segment, WorkerEvent};
 
 pub enum Block {
     Greeting(Greeting),
@@ -25,16 +25,16 @@ pub enum Block {
     SystemMessage {
         text: String,
     },
-    /// Echo of `Method::Notify` received by this Pod, surfaced as a log
+    /// Echo of `Method::Notify` received by this Worker, surfaced as a log
     /// element so subscribers see the external input that drove any
     /// following auto-kicked turn.
     Notify {
         message: String,
     },
-    /// Echo of `Method::PodEvent` received by this Pod. Same role as
+    /// Echo of `Method::WorkerEvent` received by this Worker. Same role as
     /// `Notify` — an input log element, not a turn-control signal.
-    PodEvent {
-        event: PodEvent,
+    WorkerEvent {
+        event: WorkerEvent,
     },
     AssistantText {
         text: String,

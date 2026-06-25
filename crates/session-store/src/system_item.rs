@@ -1,8 +1,8 @@
 //! Typed system-message items injected by the agent system.
 //!
 //! Items in worker history with `role:system` are never produced by the
-//! LLM — they are always inserted by the Pod itself (notifications,
-//! file/knowledge/workflow ref resolutions, child-pod lifecycle events,
+//! LLM — they are always inserted by the Worker itself (notifications,
+//! file/knowledge/workflow ref resolutions, child-worker lifecycle events,
 //! future `<system-reminder>` tags, …). [`SystemItem`] carries the
 //! typed shape of each such injection so clients can dispatch on
 //! `kind` instead of parsing text prefixes like `[Notification] …` or
@@ -19,7 +19,7 @@
 //! system-message text.
 
 use llm_engine::llm_client::types::Item;
-use protocol::PodEvent;
+use protocol::WorkerEvent;
 use serde::{Deserialize, Serialize};
 
 const SYSTEM_REMINDER_OPEN: &str = "<system-reminder>";
@@ -105,7 +105,7 @@ fn render_system_reminder(body: &str) -> String {
 /// One agent-injected system item, tagged by origin.
 ///
 /// Each variant carries the kind-specific raw data clients use for
-/// typed rendering (`Notification.message`, `PodEvent.event`, file
+/// typed rendering (`Notification.message`, `WorkerEvent.event`, file
 /// path / knowledge slug / workflow slug / etc.), plus a pre-rendered
 /// `body` (where applicable) that is the exact `role:system` text the
 /// LLM actually saw at commit time. `body` is denormalised so that
@@ -122,15 +122,15 @@ fn render_system_reminder(body: &str) -> String {
 pub enum SystemItem {
     /// Free-form notification sent in by an external caller via
     /// `Method::Notify`. `message` is the raw caller-supplied text;
-    /// `body` is the wrapped LLM-context form (Pod renders it via
+    /// `body` is the wrapped LLM-context form (Worker renders it via
     /// `notify_wrapper` at commit time).
     Notification { message: String, body: String },
 
-    /// Lifecycle event reported by a child Pod via `Method::PodEvent`.
+    /// Lifecycle event reported by a child Worker via `Method::WorkerEvent`.
     /// `event` is the typed payload (so the TUI can render per-child
     /// banners without re-parsing); `body` is the wrapped LLM-context
     /// form (same `notify_wrapper` path as `Notification`).
-    PodEvent { event: PodEvent, body: String },
+    WorkerEvent { event: WorkerEvent, body: String },
 
     /// `@<path>` file reference resolution. `body` is the rendered
     /// LLM-context text (`[File: <path>]\n…` for regular files,
@@ -140,7 +140,7 @@ pub enum SystemItem {
     FileAttachment { path: String, body: String },
 
     /// `#<slug>` Knowledge reference resolution. `body` is the
-    /// rendered text the LLM saw (Pod composes the `[Knowledge: …]`
+    /// rendered text the LLM saw (Worker composes the `[Knowledge: …]`
     /// header + body).
     Knowledge { slug: String, body: String },
 
@@ -169,7 +169,7 @@ impl SystemItem {
     pub fn history_text(&self) -> String {
         match self {
             SystemItem::Notification { body, .. } => body.clone(),
-            SystemItem::PodEvent { body, .. } => body.clone(),
+            SystemItem::WorkerEvent { body, .. } => body.clone(),
             SystemItem::FileAttachment { body, .. } => body.clone(),
             SystemItem::Knowledge { body, .. } => body.clone(),
             SystemItem::Workflow { body, .. } => body.clone(),
@@ -189,7 +189,7 @@ impl SystemItem {
     pub fn kind_label(&self) -> &'static str {
         match self {
             SystemItem::Notification { .. } => "notification",
-            SystemItem::PodEvent { .. } => "pod_event",
+            SystemItem::WorkerEvent { .. } => "worker_event",
             SystemItem::FileAttachment { .. } => "file_attachment",
             SystemItem::Knowledge { .. } => "knowledge",
             SystemItem::Workflow { .. } => "workflow",
@@ -199,22 +199,25 @@ impl SystemItem {
     }
 }
 
-/// Render a `PodEvent` as the one-line notification text the agent
+/// Render a `WorkerEvent` as the one-line notification text the agent
 /// sees. Centralised here (rather than at the controller's render
 /// site) so persistence and broadcast share the same rendering.
-pub fn render_pod_event(event: &PodEvent) -> String {
+pub fn render_worker_event(event: &WorkerEvent) -> String {
     match event {
-        PodEvent::TurnEnded { pod_name } => format!("pod `{pod_name}` finished a turn"),
-        PodEvent::Errored { pod_name, message } => {
-            format!("pod `{pod_name}` errored: {message}")
+        WorkerEvent::TurnEnded { worker_name } => format!("worker `{worker_name}` finished a turn"),
+        WorkerEvent::Errored {
+            worker_name,
+            message,
+        } => {
+            format!("worker `{worker_name}` errored: {message}")
         }
-        PodEvent::ShutDown { pod_name } => format!("pod `{pod_name}` shut down"),
-        PodEvent::ScopeSubDelegated {
-            parent_pod,
-            sub_pod,
+        WorkerEvent::ShutDown { worker_name } => format!("worker `{worker_name}` shut down"),
+        WorkerEvent::ScopeSubDelegated {
+            parent_worker,
+            sub_worker,
             ..
         } => {
-            format!("pod `{parent_pod}` sub-delegated scope to `{sub_pod}`")
+            format!("worker `{parent_worker}` sub-delegated scope to `{sub_worker}`")
         }
     }
 }
@@ -236,10 +239,10 @@ mod tests {
     }
 
     #[test]
-    fn pod_event_history_text_returns_stored_body() {
-        let item = SystemItem::PodEvent {
-            event: PodEvent::TurnEnded {
-                pod_name: "child".into(),
+    fn worker_event_history_text_returns_stored_body() {
+        let item = SystemItem::WorkerEvent {
+            event: WorkerEvent::TurnEnded {
+                worker_name: "child".into(),
             },
             body: "[Notification]\npod `child` finished a turn\n\n(non-blocking hint…)".into(),
         };
@@ -321,21 +324,21 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_pod_event() {
-        let item = SystemItem::PodEvent {
-            event: PodEvent::TurnEnded {
-                pod_name: "child".into(),
+    fn round_trip_worker_event() {
+        let item = SystemItem::WorkerEvent {
+            event: WorkerEvent::TurnEnded {
+                worker_name: "child".into(),
             },
-            body: "[Notification] pod `child` finished a turn".into(),
+            body: "[Notification] worker `child` finished a turn".into(),
         };
         let json = serde_json::to_string(&item).unwrap();
         let parsed: SystemItem = serde_json::from_str(&json).unwrap();
         match parsed {
-            SystemItem::PodEvent {
-                event: PodEvent::TurnEnded { pod_name },
+            SystemItem::WorkerEvent {
+                event: WorkerEvent::TurnEnded { worker_name },
                 body,
             } => {
-                assert_eq!(pod_name, "child");
+                assert_eq!(worker_name, "child");
                 assert!(body.contains("`child`"));
             }
             other => panic!("unexpected: {other:?}"),

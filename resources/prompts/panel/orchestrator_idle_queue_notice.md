@@ -1,5 +1,5 @@
 <system-reminder>
-Workspace Dashboard observed that this Orchestrator Pod is idle while queued Ticket work is present.
+Workspace Dashboard observed that this Orchestrator Worker is idle while queued Ticket work is present.
 
 This is bounded attention only, not scheduler authority. Do not drain the queue automatically. Before implementation side effects, verify the Ticket state and record the normal `queued -> inprogress` acceptance through Ticket tools.
 
@@ -20,5 +20,5 @@ Queued Tickets retained in the session work set but currently waiting:
 Additional queued Tickets omitted from this bounded notice: {{ omitted_ticket_count }}
 {% endif -%}
 
-Preserve the existing human gate, dependency/conflict/capacity/dirty-workspace checks, and duplicate-start checks using actual Ticket state, role/session claims, visible Pods, and worktrees.
+Preserve the existing human gate, dependency/conflict/capacity/dirty-workspace checks, and duplicate-start checks using actual Ticket state, role/session claims, visible Workers, and worktrees.
 </system-reminder>

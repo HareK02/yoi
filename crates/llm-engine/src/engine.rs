@@ -213,7 +213,7 @@ pub struct Engine<C: LlmClient, S: EngineState = Mutable> {
     /// stream events become visible.
     lifecycle_trace_cbs: Vec<Arc<dyn Fn(usize, usize, &str, &Value) + Send + Sync>>,
     /// Non-fatal warning callbacks. Invoked when the Engine wants to
-    /// surface an advisory message to the upper layer (e.g. Pod) so it
+    /// surface an advisory message to the upper layer (e.g. Worker) so it
     /// can be forwarded to the user — distinct from `tracing::warn!`,
     /// which is for developer-facing logs.
     warning_cbs: Vec<Box<dyn Fn(&str) + Send + Sync>>,
@@ -253,7 +253,7 @@ pub struct Engine<C: LlmClient, S: EngineState = Mutable> {
     /// Plumbed into [`Request::cache_anchor`] at request build time.
     cache_anchor: Option<usize>,
     /// Conversation-scoped cache key, set by higher layers. Plumbed into
-    /// [`Request::cache_key`] at request build time. Pod 側では
+    /// [`Request::cache_key`] at request build time. Worker 側では
     /// `SegmentId` を渡す。
     cache_key: Option<String>,
     /// State marker
@@ -487,7 +487,7 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
     /// Fired after `post_tool_call` interceptors and any `content`
     /// truncation from `tool_output_limits`, so the callback observes
     /// exactly what is persisted to history. Intended for upper layers
-    /// (e.g. Pod) to forward tool results to clients.
+    /// (e.g. Worker) to forward tool results to clients.
     pub fn on_tool_result(&mut self, callback: impl Fn(&ToolResult) + Send + Sync + 'static) {
         self.tool_result_cbs.push(Box::new(callback));
     }
@@ -1121,7 +1121,7 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
             }
 
             // Drain interceptor-side inputs that are meant to land in
-            // history (notifications, cross-Pod events, system
+            // history (notifications, cross-Worker events, system
             // reminders). These are committed *before* the per-request
             // clone so they participate in the LLM request below and
             // get persisted by the upper layer that owns history.json.
@@ -1302,7 +1302,7 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
 
             // Collect and commit assistant items. Routed through
             // `append_history_items` so observers (e.g. the
-            // Pod-side per-item session-log committer) see each item
+            // Worker-side per-item session-log committer) see each item
             // as it lands.
             let reasoning_items = self.thinking_block_collector.take_collected();
             let text_blocks = self.text_block_collector.take_collected();
@@ -1603,7 +1603,7 @@ impl<C: LlmClient, S: EngineState> Engine<C, S> {
             }
             Ok(ToolExecutionResult::Completed(results)) => {
                 // Route per-result pushes through the callback path so
-                // observers (e.g. the Pod-side per-item session-log
+                // observers (e.g. the Worker-side per-item session-log
                 // committer) see each tool result as it lands.
                 let items = results.into_iter().map(|result| {
                     Item::tool_result_item(
@@ -1708,7 +1708,7 @@ impl<C: LlmClient> Engine<C, Mutable> {
     /// Install byte-size caps for tool execution `content`.
     ///
     /// Passing `None` (the default) disables truncation. Higher layers
-    /// (e.g. Pod) translate manifest configuration into a concrete
+    /// (e.g. Worker) translate manifest configuration into a concrete
     /// [`ToolOutputLimits`] and install it here.
     pub fn set_tool_output_limits(&mut self, limits: Option<ToolOutputLimits>) {
         self.tool_output_limits = limits;

@@ -1,4 +1,4 @@
-//! Pod マニフェストの [`ModelManifest`] を [`Box<dyn LlmClient>`]
+//! Worker マニフェストの [`ModelManifest`] を [`Box<dyn LlmClient>`]
 //! に落とすファクトリ。
 //!
 //! 段階:

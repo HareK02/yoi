@@ -2,7 +2,7 @@
 
 ## Role
 
-`yoi` is the product CLI facade. It owns the installed binary name, top-level argument parsing, normal TUI launch, and product subcommands such as `yoi pod` and `yoi memory lint`.
+`yoi` is the product CLI facade. It owns the installed binary name, top-level argument parsing, normal TUI launch, and product subcommands such as `yoi worker` and `yoi memory lint`.
 
 ## Boundaries
 
@@ -15,7 +15,7 @@ Owns:
 
 Does not own:
 
-- Pod runtime internals (`pod`)
+- Worker runtime internals (`worker`)
 - socket client mechanics (`client`)
 - model turn orchestration (`llm-engine`)
 - TUI rendering/runtime implementation (`tui`)

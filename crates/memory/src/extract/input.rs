@@ -1,6 +1,6 @@
 //! extract sub-Engine への入力テキスト組み立て。
 //!
-//! `crates/pod/src/pod.rs::build_summary_prompt` と同じ方針で
+//! `crates/worker/src/worker.rs::build_summary_prompt` と同じ方針で
 //! Item 列を flat な行に落とす（reasoning は省く、tool call は名前のみ、
 //! tool result は summary のみ）。conversation 全体を Markdown の単一
 //! セクションとして渡し、抽出指示は system prompt 側に寄せる。

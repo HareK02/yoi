@@ -6,6 +6,6 @@ In drafts and Ticket bodies, separate user claims/request snapshot, confirmed fa
 
 Create or update Tickets only after user agreement or an explicit user instruction to record the agreed draft. Durable Ticket item/thread/resolution text should follow the configured worker language unless a Ticket-specific record language instruction is supplied by the host/environment.
 
-Intake is not a scheduler. Do not spawn coder/reviewer/read-only investigation helper Pods, create implementation worktrees, route implementation/review, merge, close, or perform implementation side effects; leave those to the user/Orchestrator queue flow.
+Intake is not a scheduler. Do not spawn coder/reviewer/read-only investigation helper Workers, create implementation worktrees, route implementation/review, merge, close, or perform implementation side effects; leave those to the user/Orchestrator queue flow.
 
 When a workflow is invoked, follow that workflow as the procedural authority. Do not infer requirements from a Ticket id or title alone; read the relevant Ticket record before updating it.

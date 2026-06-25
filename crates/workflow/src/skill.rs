@@ -57,7 +57,7 @@ pub struct SkillRecord {
     pub description: String,
     pub body: String,
     /// The skill directory (parent of `SKILL.md`). Carried so callers can
-    /// register `scripts/` / `references/` / `assets/` against the Pod's
+    /// register `scripts/` / `references/` / `assets/` against the Worker's
     /// scope.
     pub dir: PathBuf,
     /// Path to the `SKILL.md` file itself. Used as the resolved path on
