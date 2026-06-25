@@ -15,18 +15,18 @@ Owns:
 
 Does not own:
 
-- current Pod-name metadata (`pod-store`)
+- current Worker-name metadata (`pod-store`)
 - live process/socket discovery (`pod-registry`, `client`)
 - UI state (`tui`)
 - generated memory summaries (`memory`)
 
 ## Design notes
 
-A session log records what happened. It is not the current Pod registry and should not be queried as the only source of "what does Pod X mean now?"
+A session log records what happened. It is not the current Worker registry and should not be queried as the only source of "what does Worker X mean now?"
 
 Prefer explicit current log variants over broad legacy compatibility when schema changes; hidden compatibility can make future replay bugs silent.
 
 ## See also
 
-- [`../../docs/design/pod-session-state.md`](../../docs/design/pod-session-state.md)
+- [`../../docs/design/worker-session-state.md`](../../docs/design/worker-session-state.md)
 - [`../../docs/design/context-history.md`](../../docs/design/context-history.md)

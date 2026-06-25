@@ -43,7 +43,7 @@ rustPlatform.buildRustPackage rec {
     filter = sourceFilter;
   };
 
-  cargoHash = "sha256-GnzrlfCbLv09XH8J3cTeaOXl+tcelfQVtSG7aZVS82E=";
+  cargoHash = "sha256-+wsw/NKSCrouBhXgm4Mt5yk2gU87uTRYWwRSvJyiMLI=";
 
   depsExtraArgs = {
     # Older fetchCargoVendor utilities used crates.io's API download endpoint,
@@ -120,7 +120,7 @@ rustPlatform.buildRustPackage rec {
   installCheckPhase = ''
     runHook preInstallCheck
 
-    "$out/bin/yoi" pod --help >/dev/null
+    "$out/bin/yoi" worker --help >/dev/null
     test -x "$out/bin/yoi"
     test -x "$out/bin/yoi-workspace-server"
     "$out/bin/yoi-workspace-server" --help >/dev/null
@@ -136,7 +136,7 @@ rustPlatform.buildRustPackage rec {
   '';
 
   meta = {
-    description = "Agentic coding Pod runtime and terminal UI";
+    description = "Agentic coding Worker runtime and terminal UI";
     license = lib.licenses.mit;
     mainProgram = "yoi";
     platforms = lib.platforms.unix;

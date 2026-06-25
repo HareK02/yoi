@@ -2,7 +2,7 @@
 //!
 //! The config file lives at `.yoi/ticket.config.toml` under a workspace root.
 //! It intentionally stores lightweight string references for Profile selectors,
-//! launch prompts, and workflows so this crate remains independent from `pod`
+//! launch prompts, and workflows so this crate remains independent from `worker`
 //! and `manifest` runtime resolution.
 
 use std::collections::{BTreeMap, BTreeSet};

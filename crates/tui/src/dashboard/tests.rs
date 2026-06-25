@@ -309,7 +309,9 @@ fn run_test_git_output(root: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-use crate::pod_list::{LivePodInfo, PodEntrySummary, StoredMetadataState, StoredPodInfo};
+use crate::worker_list::{
+    LiveWorkerInfo, StoredMetadataState, StoredWorkerInfo, WorkerEntrySummary,
+};
 use std::fs;
 use tempfile::TempDir;
 use ticket::{
@@ -390,7 +392,7 @@ fn planning_return_request(
         ticket_id,
         user_instruction: instruction.to_string(),
         followup: ReadyTicketPlanningReturnFollowup::BlockedByStaleClaim {
-            pod_name: "stale-intake".to_string(),
+            worker_name: "stale-intake".to_string(),
         },
     }
 }
@@ -516,7 +518,7 @@ async fn planning_return_with_launch_followup_changes_state_before_launch_follow
         user_instruction: "launch intake after state change".to_string(),
         followup: ReadyTicketPlanningReturnFollowup::LaunchIntake(IntakeLaunchRequest {
             context: TicketRoleLaunchContext::new(temp.path().to_path_buf(), TicketRole::Intake),
-            runtime_command: PodRuntimeCommand::for_executable("/tmp/yoi"),
+            runtime_command: WorkerRuntimeCommand::for_executable("/tmp/yoi"),
             peer_registration: IntakePeerRegistrationRequest::Skip {
                 reason: "test".to_string(),
             },
@@ -821,7 +823,7 @@ fn ticket_queue_notification_message_carries_routing_contract() {
     assert!(message.contains("Read the Ticket"));
     assert!(message.contains("inspect current Orchestrator workspace state"));
     assert!(message.contains("transition state queued -> inprogress"));
-    assert!(message.contains("before any worktree/SpawnPod implementation side effects"));
+    assert!(message.contains("before any worktree/SpawnWorker implementation side effects"));
     assert!(message.contains("After inprogress acceptance"));
     assert!(message.contains("worktree-workflow"));
     assert!(message.contains("`.worktree/<task-name>`"));
@@ -860,7 +862,7 @@ async fn ticket_queue_notification_sends_notify_when_socket_available() {
             .write(&Event::Snapshot {
                 entries: Vec::new(),
                 greeting: protocol::Greeting {
-                    pod_name: "test-orchestrator".to_string(),
+                    worker_name: "test-orchestrator".to_string(),
                     cwd: temp.path().display().to_string(),
                     provider: "test".to_string(),
                     model: "test".to_string(),
@@ -869,7 +871,7 @@ async fn ticket_queue_notification_sends_notify_when_socket_available() {
                     context_window: 0,
                     context_tokens: 0,
                 },
-                status: PodStatus::Idle,
+                status: WorkerStatus::Idle,
                 in_flight: Default::default(),
             })
             .await
@@ -901,7 +903,7 @@ async fn send_notify_only_can_deliver_weak_notification_without_auto_run() {
             .write(&Event::Snapshot {
                 entries: Vec::new(),
                 greeting: protocol::Greeting {
-                    pod_name: "yoi".to_string(),
+                    worker_name: "yoi".to_string(),
                     cwd: temp.path().display().to_string(),
                     provider: "test".to_string(),
                     model: "test".to_string(),
@@ -910,7 +912,7 @@ async fn send_notify_only_can_deliver_weak_notification_without_auto_run() {
                     context_window: 0,
                     context_tokens: 0,
                 },
-                status: PodStatus::Idle,
+                status: WorkerStatus::Idle,
                 in_flight: Default::default(),
             })
             .await
@@ -930,7 +932,7 @@ async fn send_notify_only_can_deliver_weak_notification_without_auto_run() {
 
 #[test]
 fn no_ticket_selection_keeps_enter_pod_centric() {
-    let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
+    let mut app = test_app(vec![live_info("alpha", WorkerStatus::Idle)]);
 
     assert!(matches!(
         app.handle_key(key(KeyCode::Enter)),
@@ -951,10 +953,10 @@ fn workspace_panel_initial_display_does_not_auto_select_visible_rows() {
         "ready",
     ));
     let app = app_with_panel(
-        PodList::from_sources(
-            PodVisibilitySource::ResumePicker,
+        WorkerList::from_sources(
+            WorkerVisibilitySource::ResumePicker,
             vec![],
-            vec![live_info("alpha", PodStatus::Idle)],
+            vec![live_info("alpha", WorkerStatus::Idle)],
             None,
             10,
         ),
@@ -970,13 +972,13 @@ fn workspace_panel_initial_display_does_not_auto_select_visible_rows() {
 fn workspace_panel_clear_selection_survives_reload_and_keeps_draft() {
     let mut app = test_app(vec![live_info_with_updated_at(
         "alpha",
-        PodStatus::Idle,
+        WorkerStatus::Idle,
         10,
     )]);
     app.select_next();
     assert_eq!(
         app.selected_row,
-        Some(PanelRowKey::Pod("alpha".to_string()))
+        Some(PanelRowKey::Worker("alpha".to_string()))
     );
     app.input.insert_str("draft survives");
 
@@ -987,10 +989,14 @@ fn workspace_panel_clear_selection_survives_reload_and_keeps_draft() {
     assert!(app.selected_row.is_none());
     assert!(app.list.selected_name.is_none());
 
-    app.apply_reloaded_list(PodList::from_sources(
-        PodVisibilitySource::ResumePicker,
+    app.apply_reloaded_list(WorkerList::from_sources(
+        WorkerVisibilitySource::ResumePicker,
         vec![],
-        vec![live_info_with_updated_at("alpha", PodStatus::Running, 20)],
+        vec![live_info_with_updated_at(
+            "alpha",
+            WorkerStatus::Running,
+            20,
+        )],
         None,
         10,
     ));
@@ -1030,19 +1036,22 @@ fn workspace_panel_no_selection_ticket_intake_submit_uses_global_intake() {
 #[test]
 fn workspace_panel_keyboard_navigation_explicitly_creates_selection() {
     let mut app = test_app(vec![
-        live_info("alpha", PodStatus::Idle),
-        live_info("beta", PodStatus::Idle),
+        live_info("alpha", WorkerStatus::Idle),
+        live_info("beta", WorkerStatus::Idle),
     ]);
     assert!(app.selected_row.is_none());
 
     app.select_next();
     assert_eq!(
         app.selected_row,
-        Some(PanelRowKey::Pod("alpha".to_string()))
+        Some(PanelRowKey::Worker("alpha".to_string()))
     );
 
     app.select_next();
-    assert_eq!(app.selected_row, Some(PanelRowKey::Pod("beta".to_string())));
+    assert_eq!(
+        app.selected_row,
+        Some(PanelRowKey::Worker("beta".to_string()))
+    );
 }
 
 #[test]
@@ -1058,10 +1067,10 @@ fn dashboard_ticket_action_rows_precede_pods_and_pod_actions_still_work() {
     let mut ticket = NewTicket::new("Ready Ticket");
     ticket.workflow_state = Some(TicketWorkflowState::Ready);
     backend.create(ticket).unwrap();
-    let list = PodList::from_sources(
-        PodVisibilitySource::ResumePicker,
+    let list = WorkerList::from_sources(
+        WorkerVisibilitySource::ResumePicker,
         vec![],
-        vec![live_info("idle", PodStatus::Idle)],
+        vec![live_info("idle", WorkerStatus::Idle)],
         None,
         10,
     );
@@ -1087,7 +1096,7 @@ fn dashboard_ticket_action_rows_precede_pods_and_pod_actions_still_work() {
     assert_eq!(app.list.selected_entry().unwrap().name, "idle");
     assert_eq!(app.selected_open_eligibility(), OpenEligibility::OpenNow);
     let open = app.prepare_open().unwrap();
-    assert_eq!(open.pod_name, "idle");
+    assert_eq!(open.worker_name, "idle");
     assert_eq!(open.socket_override, Some(PathBuf::from("/tmp/idle.sock")));
 
     app.input.insert_str("draft after ticket row");
@@ -1122,10 +1131,10 @@ fn row_hit_testing_maps_only_visible_selectable_rows() {
         NextUserAction::Wait,
         "queued",
     ));
-    let list = PodList::from_sources(
-        PodVisibilitySource::ResumePicker,
+    let list = WorkerList::from_sources(
+        WorkerVisibilitySource::ResumePicker,
         vec![],
-        vec![live_info("alpha", PodStatus::Idle)],
+        vec![live_info("alpha", WorkerStatus::Idle)],
         None,
         10,
     );
@@ -1139,7 +1148,7 @@ fn row_hit_testing_maps_only_visible_selectable_rows() {
     assert_eq!(boxes[0].rect, Rect::new(3, 6, 80, 2));
     assert_eq!(boxes[1].key, PanelRowKey::Ticket("TICKET-2".into()));
     assert_eq!(boxes[1].rect, Rect::new(3, 8, 80, 2));
-    assert_eq!(boxes[2].key, PanelRowKey::Pod("alpha".into()));
+    assert_eq!(boxes[2].key, PanelRowKey::Worker("alpha".into()));
     assert_eq!(boxes[2].rect, Rect::new(3, 11, 80, 1));
     assert!(boxes.iter().all(|hit| !hit.contains(2, hit.rect.y)));
 }
@@ -1162,7 +1171,13 @@ fn mouse_click_selects_panel_row_for_blank_enter_action() {
         "queued",
     ));
     let mut app = app_with_panel(
-        PodList::from_sources(PodVisibilitySource::ResumePicker, vec![], vec![], None, 10),
+        WorkerList::from_sources(
+            WorkerVisibilitySource::ResumePicker,
+            vec![],
+            vec![],
+            None,
+            10,
+        ),
         panel,
     );
     let rows = list_rows(&app, 80, 6);
@@ -1201,7 +1216,13 @@ fn mouse_non_row_click_is_noop_and_preserves_composer_draft() {
         "ready",
     ));
     let mut app = app_with_panel(
-        PodList::from_sources(PodVisibilitySource::ResumePicker, vec![], vec![], None, 10),
+        WorkerList::from_sources(
+            WorkerVisibilitySource::ResumePicker,
+            vec![],
+            vec![],
+            None,
+            10,
+        ),
         panel,
     );
     let rows = list_rows(&app, 80, 6);
@@ -1232,7 +1253,13 @@ fn mouse_click_does_not_override_existing_composer_keyboard_behavior() {
         "queued",
     ));
     let mut app = app_with_panel(
-        PodList::from_sources(PodVisibilitySource::ResumePicker, vec![], vec![], None, 10),
+        WorkerList::from_sources(
+            WorkerVisibilitySource::ResumePicker,
+            vec![],
+            vec![],
+            None,
+            10,
+        ),
         panel,
     );
     let rows = list_rows(&app, 80, 6);
@@ -1277,10 +1304,10 @@ fn selected_ticket_row_with_non_empty_composer_hides_redundant_status_hints() {
         NextUserAction::Queue,
         "ready",
     ));
-    let list = PodList::from_sources(
-        PodVisibilitySource::ResumePicker,
+    let list = WorkerList::from_sources(
+        WorkerVisibilitySource::ResumePicker,
         vec![],
-        vec![live_info("yoi", PodStatus::Idle)],
+        vec![live_info("yoi", WorkerStatus::Idle)],
         None,
         10,
     );
@@ -1308,8 +1335,8 @@ fn selected_ticket_row_with_non_empty_composer_hides_redundant_status_hints() {
 #[test]
 fn dashboard_bare_panel_letters_append_to_composer_and_arrows_select_when_blank() {
     let mut app = test_app(vec![
-        live_info("alpha", PodStatus::Idle),
-        live_info("beta", PodStatus::Idle),
+        live_info("alpha", WorkerStatus::Idle),
+        live_info("beta", WorkerStatus::Idle),
     ]);
     assert!(app.selected_row.is_none());
 
@@ -1355,8 +1382,8 @@ fn dashboard_bare_panel_letters_append_to_composer_and_arrows_select_when_blank(
 #[test]
 fn dashboard_selection_changes_preserve_composer_contents() {
     let mut app = test_app(vec![
-        live_info("alpha", PodStatus::Idle),
-        live_info("beta", PodStatus::Idle),
+        live_info("alpha", WorkerStatus::Idle),
+        live_info("beta", WorkerStatus::Idle),
     ]);
     app.input.insert_str("draft message");
     let before = input_text(&app);
@@ -1370,20 +1397,20 @@ fn dashboard_selection_changes_preserve_composer_contents() {
 #[test]
 fn dashboard_poll_reload_preserves_selection_composer_and_notice() {
     let mut app = test_app(vec![
-        live_info_with_updated_at("alpha", PodStatus::Idle, 10),
-        live_info_with_updated_at("beta", PodStatus::Idle, 20),
+        live_info_with_updated_at("alpha", WorkerStatus::Idle, 10),
+        live_info_with_updated_at("beta", WorkerStatus::Idle, 20),
     ]);
     app.select_next();
     assert_eq!(app.list.selected_entry().unwrap().name, "beta");
     app.input.insert_str("draft survives polling");
     app.notice = Some("keep this notice".to_string());
-    let refreshed = PodList::from_sources(
-        PodVisibilitySource::ResumePicker,
+    let refreshed = WorkerList::from_sources(
+        WorkerVisibilitySource::ResumePicker,
         vec![],
         vec![
-            live_info_with_updated_at("gamma", PodStatus::Idle, 60),
-            live_info_with_updated_at("alpha", PodStatus::Running, 50),
-            live_info_with_updated_at("beta", PodStatus::Idle, 40),
+            live_info_with_updated_at("gamma", WorkerStatus::Idle, 60),
+            live_info_with_updated_at("alpha", WorkerStatus::Running, 50),
+            live_info_with_updated_at("beta", WorkerStatus::Idle, 40),
         ],
         None,
         10,
@@ -1400,7 +1427,7 @@ fn dashboard_poll_reload_preserves_selection_composer_and_notice() {
             .as_ref()
             .unwrap()
             .status,
-        Some(PodStatus::Idle)
+        Some(WorkerStatus::Idle)
     );
     assert_eq!(input_text(&app), "draft survives polling");
     assert_eq!(app.notice.as_deref(), Some("keep this notice"));
@@ -1409,16 +1436,16 @@ fn dashboard_poll_reload_preserves_selection_composer_and_notice() {
 #[test]
 fn dashboard_poll_reload_falls_back_when_selected_pod_disappears() {
     let mut app = test_app(vec![
-        live_info_with_updated_at("alpha", PodStatus::Idle, 10),
-        live_info_with_updated_at("beta", PodStatus::Running, 20),
+        live_info_with_updated_at("alpha", WorkerStatus::Idle, 10),
+        live_info_with_updated_at("beta", WorkerStatus::Running, 20),
     ]);
     app.select_next();
     app.select_next();
     assert_eq!(app.list.selected_entry().unwrap().name, "beta");
-    let refreshed = PodList::from_sources(
-        PodVisibilitySource::ResumePicker,
+    let refreshed = WorkerList::from_sources(
+        WorkerVisibilitySource::ResumePicker,
         vec![stopped_info_with_updated_at("closed", 30)],
-        vec![live_info_with_updated_at("alpha", PodStatus::Idle, 40)],
+        vec![live_info_with_updated_at("alpha", WorkerStatus::Idle, 40)],
         None,
         10,
     );
@@ -1432,7 +1459,7 @@ fn dashboard_poll_reload_falls_back_when_selected_pod_disappears() {
 
 #[test]
 fn dashboard_poll_reload_error_keeps_previous_list_and_composer() {
-    let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
+    let mut app = test_app(vec![live_info("alpha", WorkerStatus::Idle)]);
     app.input.insert_str("keep draft");
 
     app.apply_reload_result(Err(DashboardError::Io(io::Error::other("boom"))));
@@ -1555,7 +1582,7 @@ fn dashboard_orchestrator_failure_supersedes_prior_failure() {
 
 #[tokio::test]
 async fn dashboard_poll_reload_does_not_overlap_in_flight_reload() {
-    let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
+    let mut app = test_app(vec![live_info("alpha", WorkerStatus::Idle)]);
     let mut pending = PendingReload::default();
 
     assert!(pending.start_with_handle(tokio::spawn(async {
@@ -1563,10 +1590,10 @@ async fn dashboard_poll_reload_does_not_overlap_in_flight_reload() {
         Err(DashboardError::Io(io::Error::other("boom")))
     })));
     assert!(!pending.start_with_handle(tokio::spawn(async {
-        let list = PodList::from_sources(
-            PodVisibilitySource::ResumePicker,
+        let list = WorkerList::from_sources(
+            WorkerVisibilitySource::ResumePicker,
             vec![],
-            vec![live_info("beta", PodStatus::Idle)],
+            vec![live_info("beta", WorkerStatus::Idle)],
             None,
             10,
         );
@@ -1645,7 +1672,7 @@ async fn dashboard_quit_aborts_background_reload_and_notice_without_waiting() {
 
 #[test]
 fn dashboard_idle_live_selected_target_is_open_eligible() {
-    let mut app = test_app(vec![live_info("idle", PodStatus::Idle)]);
+    let mut app = test_app(vec![live_info("idle", WorkerStatus::Idle)]);
     app.select_next();
 
     assert_eq!(app.selected_open_eligibility(), OpenEligibility::OpenNow);
@@ -1653,7 +1680,7 @@ fn dashboard_idle_live_selected_target_is_open_eligible() {
 
 #[test]
 fn dashboard_status_label_for_live_without_reported_status_is_softened() {
-    let mut live = live_info("probing", PodStatus::Idle);
+    let mut live = live_info("probing", WorkerStatus::Idle);
     live.status = None;
     let app = test_app(vec![live]);
 
@@ -1665,11 +1692,11 @@ fn dashboard_status_label_for_live_without_reported_status_is_softened() {
 #[test]
 fn dashboard_status_labels_preserve_explicit_live_statuses() {
     for (status, expected_label) in [
-        (PodStatus::Idle, "live idle"),
-        (PodStatus::Running, "live running"),
-        (PodStatus::Paused, "live paused"),
+        (WorkerStatus::Idle, "live idle"),
+        (WorkerStatus::Running, "live running"),
+        (WorkerStatus::Paused, "live paused"),
     ] {
-        let app = test_app(vec![live_info("pod", status)]);
+        let app = test_app(vec![live_info("worker", status)]);
         let (label, _) = row_status_label(app.list.selected_entry().unwrap());
 
         assert_eq!(label, expected_label);
@@ -1686,10 +1713,10 @@ fn dashboard_title_omits_redundant_key_hint_guidance() {
         Some("idle".to_string()),
     ));
     let app = app_with_panel(
-        PodList::from_sources(
-            PodVisibilitySource::ResumePicker,
+        WorkerList::from_sources(
+            WorkerVisibilitySource::ResumePicker,
             vec![],
-            vec![live_info("yoi", PodStatus::Idle)],
+            vec![live_info("yoi", WorkerStatus::Idle)],
             None,
             10,
         ),
@@ -1850,7 +1877,7 @@ fn panel_ticket_intake_child_rows_render_as_indented_single_line() {
         "00001TICKET",
         "intake-live",
         TicketLocalClaimStatus::Live,
-        Some(NextUserAction::OpenPod),
+        Some(NextUserAction::OpenWorker),
     );
 
     let lines = panel_row_lines(&row, false, 160);
@@ -1862,38 +1889,38 @@ fn panel_ticket_intake_child_rows_render_as_indented_single_line() {
     assert!(line.starts_with("  └ live"));
     assert_eq!(display_column(&line, "live"), status_start);
     assert_eq!(
-        display_column(&line, "Intake Pod: intake-live"),
+        display_column(&line, "Intake Worker: intake-live"),
         title_start
     );
     assert!(!line.starts_with("  live"));
 
     let selected_line = plain_line(&panel_row_lines(&row, true, 160)[0]);
     assert!(selected_line.starts_with("  ▶ live"));
-    assert!(selected_line.contains("Intake Pod: intake-live"));
+    assert!(selected_line.contains("Intake Worker: intake-live"));
 }
 
 #[test]
 fn selected_ticket_intake_child_keeps_row_marker_without_status_line() {
     let ticket_id = "00001TICKET";
-    let pod_name = "intake-live";
+    let worker_name = "intake-live";
     let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
     panel.rows.push(panel_test_intake_child_row(
         ticket_id,
-        pod_name,
+        worker_name,
         TicketLocalClaimStatus::Live,
-        Some(NextUserAction::OpenPod),
+        Some(NextUserAction::OpenWorker),
     ));
-    let list = PodList::from_sources(
-        PodVisibilitySource::ResumePicker,
+    let list = WorkerList::from_sources(
+        WorkerVisibilitySource::ResumePicker,
         vec![],
-        vec![live_info(pod_name, PodStatus::Idle)],
+        vec![live_info(worker_name, WorkerStatus::Idle)],
         None,
         10,
     );
     let mut app = app_with_panel(list, panel);
-    app.select_panel_key(PanelRowKey::TicketIntakePod {
+    app.select_panel_key(PanelRowKey::TicketIntakeWorker {
         ticket_id: ticket_id.to_string(),
-        pod_name: pod_name.to_string(),
+        worker_name: worker_name.to_string(),
     });
 
     let status = plain_line(&target_status_line(&app));
@@ -1906,10 +1933,10 @@ fn selected_ticket_intake_child_keeps_row_marker_without_status_line() {
 }
 
 #[test]
-fn panel_pod_rows_use_aligned_columns_before_pod_name() {
+fn panel_worker_rows_use_aligned_columns_before_worker_name() {
     let app = test_app(vec![
-        live_info("companion", PodStatus::Idle),
-        live_info("very-long-background-worker-name", PodStatus::Running),
+        live_info("companion", WorkerStatus::Idle),
+        live_info("very-long-background-worker-name", WorkerStatus::Running),
     ]);
     let idle = app
         .list
@@ -1939,10 +1966,10 @@ fn panel_pod_rows_use_aligned_columns_before_pod_name() {
 }
 
 #[test]
-fn panel_pod_name_truncates_after_status() {
+fn panel_worker_name_truncates_after_status() {
     let app = test_app(vec![live_info(
         "very-long-background-worker-name-that-keeps-going",
-        PodStatus::Running,
+        WorkerStatus::Running,
     )]);
     let entry = app.list.selected_entry().unwrap();
 
@@ -1958,16 +1985,16 @@ fn panel_pod_name_truncates_after_status() {
 #[test]
 fn dashboard_running_paused_and_stopped_targets_are_open_eligible() {
     let mut app = test_app(vec![
-        live_info("running", PodStatus::Running),
-        live_info("paused", PodStatus::Paused),
+        live_info("running", WorkerStatus::Running),
+        live_info("paused", WorkerStatus::Paused),
     ]);
     let stopped = stopped_info("stopped");
-    app.list = PodList::from_sources(
-        PodVisibilitySource::ResumePicker,
+    app.list = WorkerList::from_sources(
+        WorkerVisibilitySource::ResumePicker,
         vec![stopped],
         vec![
-            live_info_with_updated_at("running", PodStatus::Running, 30),
-            live_info_with_updated_at("paused", PodStatus::Paused, 20),
+            live_info_with_updated_at("running", WorkerStatus::Running, 30),
+            live_info_with_updated_at("paused", WorkerStatus::Paused, 20),
         ],
         Some("running".to_string()),
         10,
@@ -1989,13 +2016,13 @@ fn dashboard_running_paused_and_stopped_targets_are_open_eligible() {
 
 #[test]
 fn dashboard_sections_classify_pending_working_and_closed() {
-    let list = PodList::from_sources(
-        PodVisibilitySource::ResumePicker,
+    let list = WorkerList::from_sources(
+        WorkerVisibilitySource::ResumePicker,
         vec![stopped_info_with_updated_at("closed", 60)],
         vec![
-            live_info_with_updated_at("idle", PodStatus::Idle, 50),
-            live_info_with_updated_at("running", PodStatus::Running, 40),
-            live_info_with_updated_at("paused", PodStatus::Paused, 30),
+            live_info_with_updated_at("idle", WorkerStatus::Idle, 50),
+            live_info_with_updated_at("running", WorkerStatus::Running, 40),
+            live_info_with_updated_at("paused", WorkerStatus::Paused, 30),
         ],
         Some("idle".to_string()),
         10,
@@ -2042,14 +2069,14 @@ fn dashboard_closed_section_is_limited_to_three_visible_rows() {
 
 #[test]
 fn dashboard_selection_follows_visible_section_order_without_hidden_closed_rows() {
-    let list = PodList::from_sources(
-        PodVisibilitySource::ResumePicker,
+    let list = WorkerList::from_sources(
+        WorkerVisibilitySource::ResumePicker,
         (0..5)
             .map(|index| stopped_info_with_updated_at(&format!("closed-{index}"), 50 - index))
             .collect(),
         vec![
-            live_info_with_updated_at("running", PodStatus::Running, 70),
-            live_info_with_updated_at("idle", PodStatus::Idle, 60),
+            live_info_with_updated_at("running", WorkerStatus::Running, 70),
+            live_info_with_updated_at("idle", WorkerStatus::Idle, 60),
         ],
         Some("idle".to_string()),
         20,
@@ -2073,10 +2100,10 @@ fn dashboard_selection_follows_visible_section_order_without_hidden_closed_rows(
 
 #[test]
 fn dashboard_selection_does_not_default_to_orchestrator_only_row() {
-    let list = PodList::from_sources(
-        PodVisibilitySource::ResumePicker,
+    let list = WorkerList::from_sources(
+        WorkerVisibilitySource::ResumePicker,
         vec![],
-        vec![live_info("test-orchestrator", PodStatus::Idle)],
+        vec![live_info("test-orchestrator", WorkerStatus::Idle)],
         None,
         10,
     );
@@ -2094,13 +2121,13 @@ fn dashboard_selection_does_not_default_to_orchestrator_only_row() {
 }
 
 #[test]
-fn dashboard_selection_has_no_default_when_orchestrator_pod_exists() {
-    let list = PodList::from_sources(
-        PodVisibilitySource::ResumePicker,
+fn dashboard_selection_has_no_default_when_workspace_orchestrator_worker_exists() {
+    let list = WorkerList::from_sources(
+        WorkerVisibilitySource::ResumePicker,
         vec![],
         vec![
-            live_info_with_updated_at("test-orchestrator", PodStatus::Idle, 80),
-            live_info_with_updated_at("worker", PodStatus::Idle, 70),
+            live_info_with_updated_at("test-orchestrator", WorkerStatus::Idle, 80),
+            live_info_with_updated_at("worker", WorkerStatus::Idle, 70),
         ],
         None,
         10,
@@ -2125,10 +2152,10 @@ fn dashboard_list_renders_workspace_diagnostics_before_rows() {
         .diagnostics
         .push("Ticket config is unusable".to_string());
     let app = app_with_panel(
-        PodList::from_sources(
-            PodVisibilitySource::ResumePicker,
+        WorkerList::from_sources(
+            WorkerVisibilitySource::ResumePicker,
             vec![],
-            vec![live_info("idle", PodStatus::Idle)],
+            vec![live_info("idle", WorkerStatus::Idle)],
             None,
             10,
         ),
@@ -2145,14 +2172,14 @@ fn dashboard_list_renders_workspace_diagnostics_before_rows() {
 
 #[test]
 fn dashboard_list_pins_closed_section_below_live_flexible_area() {
-    let list = PodList::from_sources(
-        PodVisibilitySource::ResumePicker,
+    let list = WorkerList::from_sources(
+        WorkerVisibilitySource::ResumePicker,
         (0..3)
             .map(|index| stopped_info_with_updated_at(&format!("closed-{index}"), 50 - index))
             .collect(),
         vec![
-            live_info_with_updated_at("running", PodStatus::Running, 70),
-            live_info_with_updated_at("idle", PodStatus::Idle, 60),
+            live_info_with_updated_at("running", WorkerStatus::Running, 70),
+            live_info_with_updated_at("idle", WorkerStatus::Idle, 60),
         ],
         Some("idle".to_string()),
         20,
@@ -2187,8 +2214,8 @@ fn dashboard_layout_uses_single_boundary_separator_between_list_and_composer() {
 fn dashboard_companion_submit_routes_to_workspace_companion_not_selected_pod() {
     let mut app = companion_app(
         vec![
-            live_info("alpha", PodStatus::Idle),
-            live_info("yoi", PodStatus::Idle),
+            live_info("alpha", WorkerStatus::Idle),
+            live_info("yoi", WorkerStatus::Idle),
         ],
         CompanionPanelStatus::Live,
     );
@@ -2206,7 +2233,7 @@ fn dashboard_companion_submit_routes_to_workspace_companion_not_selected_pod() {
         _ => panic!("Companion target should send to the workspace Companion"),
     };
 
-    assert_eq!(request.pod_name, "yoi");
+    assert_eq!(request.worker_name, "yoi");
     assert_eq!(request.socket_path, PathBuf::from("/tmp/yoi.sock"));
     assert!(app.sending);
     assert_eq!(input_text(&app), "send to companion");
@@ -2232,7 +2259,7 @@ fn dashboard_companion_submit_unavailable_keeps_composer_contents() {
 #[test]
 fn dashboard_companion_submit_empty_reports_empty_composer() {
     let mut app = companion_app(
-        vec![live_info("yoi", PodStatus::Idle)],
+        vec![live_info("yoi", WorkerStatus::Idle)],
         CompanionPanelStatus::Live,
     );
 
@@ -2246,7 +2273,7 @@ fn dashboard_companion_submit_empty_reports_empty_composer() {
 #[test]
 fn dashboard_companion_finish_success_clears_composer() {
     let mut app = companion_app(
-        vec![live_info("yoi", PodStatus::Idle)],
+        vec![live_info("yoi", WorkerStatus::Idle)],
         CompanionPanelStatus::Live,
     );
     app.input.insert_str("done");
@@ -2263,13 +2290,13 @@ fn dashboard_companion_finish_success_clears_composer() {
 
 #[test]
 fn dashboard_open_request_keeps_dashboard_state_for_nested_console() {
-    let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
+    let mut app = test_app(vec![live_info("alpha", WorkerStatus::Idle)]);
     app.input.insert_str("draft survives open");
     app.select_next();
 
     let request = app.prepare_open().unwrap();
 
-    assert_eq!(request.pod_name, "alpha");
+    assert_eq!(request.worker_name, "alpha");
     assert_eq!(
         request.socket_override,
         Some(PathBuf::from("/tmp/alpha.sock"))
@@ -2286,7 +2313,7 @@ fn dashboard_open_request_keeps_dashboard_state_for_nested_console() {
 
 #[test]
 fn dashboard_open_failure_keeps_composer_and_sets_notice() {
-    let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
+    let mut app = test_app(vec![live_info("alpha", WorkerStatus::Idle)]);
     app.input.insert_str("keep this draft");
     let before = input_text(&app);
     let error = io::Error::other("boom");
@@ -2310,7 +2337,7 @@ fn dashboard_open_failure_keeps_composer_and_sets_notice() {
 
 #[test]
 fn dashboard_loading_app_defers_initial_snapshot_to_enter_reload() {
-    let app = DashboardApp::loading(PodRuntimeCommand::for_executable("/tmp/yoi"));
+    let app = DashboardApp::loading(WorkerRuntimeCommand::for_executable("/tmp/yoi"));
 
     assert!(app.panel.rows.is_empty());
     assert!(
@@ -2330,8 +2357,8 @@ fn dashboard_loading_app_defers_initial_snapshot_to_enter_reload() {
 #[test]
 fn dashboard_nested_console_success_continues_without_dropping_state() {
     let mut app = test_app(vec![
-        live_info("alpha", PodStatus::Idle),
-        live_info("beta", PodStatus::Idle),
+        live_info("alpha", WorkerStatus::Idle),
+        live_info("beta", WorkerStatus::Idle),
     ]);
     app.select_next();
     app.select_next();
@@ -2369,8 +2396,8 @@ fn dashboard_nested_console_success_continues_without_dropping_state() {
 #[test]
 fn dashboard_nested_console_recoverable_failure_continues_without_dropping_state() {
     let mut app = test_app(vec![
-        live_info("alpha", PodStatus::Idle),
-        live_info("beta", PodStatus::Idle),
+        live_info("alpha", WorkerStatus::Idle),
+        live_info("beta", WorkerStatus::Idle),
     ]);
     app.select_next();
     app.select_next();
@@ -2408,7 +2435,7 @@ fn dashboard_nested_console_recoverable_failure_continues_without_dropping_state
 
 #[test]
 fn dashboard_nested_console_nonrecoverable_failure_bubbles_without_state_finish() {
-    let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
+    let mut app = test_app(vec![live_info("alpha", WorkerStatus::Idle)]);
     app.input.insert_str("keep this draft");
     app.notice = Some("opening alpha".to_string());
     let error = io::Error::other("fatal console error");
@@ -2424,7 +2451,7 @@ fn dashboard_nested_console_nonrecoverable_failure_bubbles_without_state_finish(
 
 #[test]
 fn dashboard_open_disabled_target_stays_in_dashboard() {
-    let mut live = live_info("unreachable", PodStatus::Idle);
+    let mut live = live_info("unreachable", WorkerStatus::Idle);
     live.reachable = false;
     live.status = None;
     let mut app = test_app(vec![live]);
@@ -2436,7 +2463,7 @@ fn dashboard_open_disabled_target_stays_in_dashboard() {
 
 #[test]
 fn dashboard_empty_enter_uses_open_action() {
-    let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
+    let mut app = test_app(vec![live_info("alpha", WorkerStatus::Idle)]);
     app.select_next();
 
     assert!(matches!(
@@ -2445,7 +2472,7 @@ fn dashboard_empty_enter_uses_open_action() {
     ));
     let request = app.prepare_open().unwrap();
 
-    assert_eq!(request.pod_name, "alpha");
+    assert_eq!(request.worker_name, "alpha");
     assert_eq!(
         request.socket_override,
         Some(PathBuf::from("/tmp/alpha.sock"))
@@ -2461,7 +2488,7 @@ fn dashboard_empty_enter_uses_open_action() {
 
 #[test]
 fn dashboard_whitespace_only_enter_uses_open_action() {
-    let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
+    let mut app = test_app(vec![live_info("alpha", WorkerStatus::Idle)]);
     app.select_next();
     app.input.insert_str("  \n\t");
 
@@ -2471,13 +2498,13 @@ fn dashboard_whitespace_only_enter_uses_open_action() {
     ));
     let request = app.prepare_open().unwrap();
 
-    assert_eq!(request.pod_name, "alpha");
+    assert_eq!(request.worker_name, "alpha");
     assert_eq!(input_text(&app), "  \n\t");
 }
 
 #[test]
 fn dashboard_non_empty_enter_reports_companion_unavailable() {
-    let mut app = test_app(vec![live_info("idle", PodStatus::Idle)]);
+    let mut app = test_app(vec![live_info("idle", WorkerStatus::Idle)]);
     app.input.insert_str("keep this draft");
 
     assert!(matches!(
@@ -2497,7 +2524,7 @@ fn dashboard_non_empty_enter_reports_companion_unavailable() {
 
 #[test]
 fn dashboard_alt_enter_inserts_newline_without_companion_send() {
-    let mut app = ticket_enabled_app(vec![live_info("idle", PodStatus::Idle)]);
+    let mut app = ticket_enabled_app(vec![live_info("idle", WorkerStatus::Idle)]);
     app.input.insert_str("first line");
 
     assert!(matches!(
@@ -2512,7 +2539,7 @@ fn dashboard_alt_enter_inserts_newline_without_companion_send() {
 
 #[test]
 fn dashboard_alt_enter_on_blank_pod_selection_inserts_newline_without_opening() {
-    let mut app = test_app(vec![live_info("alpha", PodStatus::Idle)]);
+    let mut app = test_app(vec![live_info("alpha", WorkerStatus::Idle)]);
     let selected_before = app.selected_row.clone();
 
     assert!(matches!(
@@ -2536,7 +2563,13 @@ fn dashboard_alt_enter_on_blank_ticket_action_inserts_newline_without_dispatch()
         "ready",
     ));
     let mut app = app_with_panel(
-        PodList::from_sources(PodVisibilitySource::ResumePicker, vec![], vec![], None, 10),
+        WorkerList::from_sources(
+            WorkerVisibilitySource::ResumePicker,
+            vec![],
+            vec![],
+            None,
+            10,
+        ),
         panel,
     );
     app.select_next();
@@ -2556,7 +2589,7 @@ fn dashboard_alt_enter_on_blank_ticket_action_inserts_newline_without_dispatch()
 
 #[test]
 fn dashboard_composer_shared_word_motion_and_delete_keys() {
-    let mut app = ticket_enabled_app(vec![live_info("idle", PodStatus::Idle)]);
+    let mut app = ticket_enabled_app(vec![live_info("idle", WorkerStatus::Idle)]);
     app.input.insert_str("hello world");
 
     assert!(matches!(
@@ -2582,7 +2615,7 @@ fn dashboard_composer_shared_word_motion_and_delete_keys() {
 
 #[test]
 fn dashboard_esc_clears_row_selection_without_quitting_and_preserves_draft() {
-    let mut app = ticket_enabled_app(vec![live_info("alpha", PodStatus::Idle)]);
+    let mut app = ticket_enabled_app(vec![live_info("alpha", WorkerStatus::Idle)]);
     app.select_next();
     app.input.insert_str("draft message");
 
@@ -2607,7 +2640,7 @@ fn dashboard_esc_clears_row_selection_without_quitting_and_preserves_draft() {
 
 #[test]
 fn dashboard_composer_target_switch_preserves_typed_text() {
-    let mut app = ticket_enabled_app(vec![live_info("idle", PodStatus::Idle)]);
+    let mut app = ticket_enabled_app(vec![live_info("idle", WorkerStatus::Idle)]);
     app.input.insert_str("draft intake request");
 
     assert!(matches!(app.composer_target(), ComposerTarget::Companion));
@@ -2627,7 +2660,7 @@ fn dashboard_composer_target_switch_preserves_typed_text() {
 
 #[test]
 fn dashboard_ctrl_t_does_not_switch_composer_target() {
-    let mut app = ticket_enabled_app(vec![live_info("idle", PodStatus::Idle)]);
+    let mut app = ticket_enabled_app(vec![live_info("idle", WorkerStatus::Idle)]);
     app.input.insert_str("draft intake request");
 
     assert!(matches!(app.composer_target(), ComposerTarget::Companion));
@@ -2642,7 +2675,7 @@ fn dashboard_ctrl_t_does_not_switch_composer_target() {
 
 #[test]
 fn dashboard_no_ticket_workspace_exposes_only_companion_target() {
-    let mut app = test_app(vec![live_info("idle", PodStatus::Idle)]);
+    let mut app = test_app(vec![live_info("idle", WorkerStatus::Idle)]);
     app.input.insert_str("draft message");
 
     app.cycle_composer_target();
@@ -2658,7 +2691,7 @@ fn dashboard_no_ticket_workspace_exposes_only_companion_target() {
 
 #[test]
 fn dashboard_blank_ticket_intake_enter_uses_selected_row_and_preserves_input() {
-    let mut app = ticket_enabled_app(vec![live_info("idle", PodStatus::Idle)]);
+    let mut app = ticket_enabled_app(vec![live_info("idle", WorkerStatus::Idle)]);
     app.cycle_composer_target();
     app.input.insert_str("  \n\t");
 
@@ -2683,7 +2716,7 @@ fn dashboard_blank_ticket_intake_enter_uses_selected_row_and_preserves_input() {
 
 #[test]
 fn dashboard_ticket_intake_enter_builds_launch_request_not_direct_send() {
-    let mut app = ticket_enabled_app(vec![live_info("idle", PodStatus::Idle)]);
+    let mut app = ticket_enabled_app(vec![live_info("idle", WorkerStatus::Idle)]);
     app.cycle_composer_target();
     app.input.insert_str("please intake this work");
 
@@ -2705,7 +2738,7 @@ fn dashboard_ticket_intake_enter_builds_launch_request_not_direct_send() {
     assert_eq!(
         request.peer_registration,
         IntakePeerRegistrationRequest::Register {
-            orchestrator_pod: "test-orchestrator".to_string()
+            workspace_orchestrator_worker: "test-orchestrator".to_string()
         }
     );
     assert!(app.sending);
@@ -2716,7 +2749,7 @@ fn dashboard_ticket_intake_enter_builds_launch_request_not_direct_send() {
 #[test]
 fn dashboard_ticket_intake_handoff_skips_peer_registration_when_orchestrator_not_live() {
     let mut app = ticket_enabled_app_with_orchestrator(
-        vec![live_info("idle", PodStatus::Idle)],
+        vec![live_info("idle", WorkerStatus::Idle)],
         OrchestratorPanelStatus::Unavailable,
     );
     app.cycle_composer_target();
@@ -2742,7 +2775,7 @@ fn dashboard_ticket_intake_handoff_skips_peer_registration_when_orchestrator_not
 
 #[test]
 fn dashboard_ticket_intake_finish_success_clears_composer_and_reports_pod() {
-    let mut app = ticket_enabled_app(vec![live_info("idle", PodStatus::Idle)]);
+    let mut app = ticket_enabled_app(vec![live_info("idle", WorkerStatus::Idle)]);
     app.cycle_composer_target();
     app.input.insert_str("please intake this work");
     app.sending = true;
@@ -2756,25 +2789,25 @@ fn dashboard_ticket_intake_finish_success_clears_composer_and_reports_pod() {
                 target_workspace_root: PathBuf::from("/tmp/workspace"),
                 implementation_worktree_root: PathBuf::from("/tmp/workspace/.worktree"),
                 role: TicketRole::Intake,
-                pod_name: "intake-pod".to_string(),
+                worker_name: "intake-worker".to_string(),
                 profile: "builtin:default".to_string(),
                 workflow: "ticket-intake-workflow".to_string(),
                 launch_prompt_ref: None,
                 run_segments: vec![],
             },
             ready: client::SpawnReady {
-                pod_name: "intake-pod".to_string(),
+                worker_name: "intake-worker".to_string(),
                 socket_path: PathBuf::from("/tmp/intake.sock"),
             },
             acceptance_evidence: client::ticket_role::TicketRoleLaunchAcceptanceEvidence {
-                pod_name: "intake-pod".to_string(),
+                worker_name: "intake-worker".to_string(),
                 accepted_run_segments: 0,
                 event: client::ticket_role::TicketRoleLaunchAcceptanceEvent::UserMessage,
             },
             pre_run_warnings: vec![],
         },
         peer_registration: IntakePeerRegistrationStatus::Registered {
-            orchestrator_pod: "test-orchestrator".to_string(),
+            workspace_orchestrator_worker: "test-orchestrator".to_string(),
         },
         registry_warning: None,
     }));
@@ -2782,18 +2815,18 @@ fn dashboard_ticket_intake_finish_success_clears_composer_and_reports_pod() {
     assert!(!app.sending);
     assert_eq!(input_text(&app), "");
     let notice = app.notice.as_deref().unwrap();
-    assert!(notice.contains("intake-pod"));
+    assert!(notice.contains("intake-worker"));
     assert!(notice.contains("Handoff peer registered"));
 }
 
 #[test]
 fn dashboard_ticket_intake_finish_failure_keeps_composer() {
-    let mut app = ticket_enabled_app(vec![live_info("idle", PodStatus::Idle)]);
+    let mut app = ticket_enabled_app(vec![live_info("idle", WorkerStatus::Idle)]);
     app.cycle_composer_target();
     app.input.insert_str("please keep this");
     app.sending = true;
 
-    app.finish_intake_launch(Err(TicketRoleLaunchError::EmptyPodName));
+    app.finish_intake_launch(Err(TicketRoleLaunchError::EmptyWorkerName));
 
     assert!(!app.sending);
     assert_eq!(input_text(&app), "please keep this");
@@ -2809,7 +2842,7 @@ fn intake_registry_update_claim_is_durable_only_after_commit() {
         registry_root: root,
         ticket_id: "20260608-000000-existing".to_string(),
         ticket_slug: Some("existing".to_string()),
-        pod_name: "existing-intake".to_string(),
+        worker_name: "existing-intake".to_string(),
     };
 
     assert!(
@@ -2833,7 +2866,7 @@ fn intake_registry_update_claim_is_durable_only_after_commit() {
     let snapshot = store.snapshot().unwrap();
     assert_eq!(snapshot.claims.len(), 1);
     assert_eq!(snapshot.sessions.len(), 1);
-    assert_eq!(snapshot.sessions[0].pod_name, "existing-intake");
+    assert_eq!(snapshot.sessions[0].worker_name, "existing-intake");
     assert_eq!(snapshot.sessions[0].origin, RoleSessionOrigin::TicketClaim);
     assert_eq!(snapshot.sessions[0].related_tickets.len(), 1);
     assert_eq!(
@@ -2843,7 +2876,7 @@ fn intake_registry_update_claim_is_durable_only_after_commit() {
 }
 
 #[test]
-fn intake_registry_claims_launched_ticket_with_accepted_pod_name() {
+fn intake_registry_claims_launched_ticket_with_accepted_worker_name() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("registry");
     let store = PanelRegistryStore::from_root(root.clone());
@@ -2858,17 +2891,17 @@ fn intake_registry_claims_launched_ticket_with_accepted_pod_name() {
     let claim = store
         .claim_for_ticket("20260608-000000-ready")
         .unwrap()
-        .expect("launched Intake Pod is claimed after accepted launch");
-    assert_eq!(claim.pod_name, "launched-intake");
+        .expect("launched Intake Worker is claimed after accepted launch");
+    assert_eq!(claim.worker_name, "launched-intake");
     let snapshot = store.snapshot().unwrap();
     assert_eq!(snapshot.claims.len(), 1);
     assert_eq!(snapshot.sessions.len(), 1);
     assert_eq!(snapshot.sessions[0].origin, RoleSessionOrigin::TicketClaim);
-    assert_eq!(snapshot.sessions[0].pod_name, "launched-intake");
+    assert_eq!(snapshot.sessions[0].worker_name, "launched-intake");
 }
 
 #[test]
-fn intake_registry_launched_ticket_claim_without_pod_name_is_diagnostic() {
+fn intake_registry_launched_ticket_claim_without_worker_name_is_diagnostic() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("registry");
     let store = PanelRegistryStore::from_root(root.clone());
@@ -2881,9 +2914,9 @@ fn intake_registry_launched_ticket_claim_without_pod_name_is_diagnostic() {
         },
         None,
     )
-    .expect("missing launched Pod name should be diagnostic");
+    .expect("missing launched Worker name should be diagnostic");
 
-    assert!(warning.contains("missing launched Pod name"));
+    assert!(warning.contains("missing launched Worker name"));
     assert!(
         store
             .claim_for_ticket("20260608-000000-ready")
@@ -2911,7 +2944,7 @@ fn intake_registry_update_claim_conflict_is_diagnostic_not_overwrite() {
             registry_root: root,
             ticket_id: "20260608-000001-existing".to_string(),
             ticket_slug: Some("existing".to_string()),
-            pod_name: "second-intake".to_string(),
+            worker_name: "second-intake".to_string(),
         },
         None,
     )
@@ -2922,11 +2955,11 @@ fn intake_registry_update_claim_conflict_is_diagnostic_not_overwrite() {
         .claim_for_ticket("20260608-000001-existing")
         .unwrap()
         .unwrap();
-    assert_eq!(claim.pod_name, "first-intake");
+    assert_eq!(claim.worker_name, "first-intake");
     let snapshot = store.snapshot().unwrap();
     assert_eq!(snapshot.claims.len(), 1);
     assert_eq!(snapshot.sessions.len(), 1);
-    assert_eq!(snapshot.sessions[0].pod_name, "first-intake");
+    assert_eq!(snapshot.sessions[0].worker_name, "first-intake");
 }
 
 #[test]
@@ -2944,7 +2977,7 @@ fn dashboard_empty_enter_on_non_openable_row_reports_open_diagnostic() {
 
 #[test]
 fn idle_orchestrator_gets_bounded_attention_for_new_queued_work() {
-    let mut app = ticket_enabled_app(vec![live_info("test-orchestrator", PodStatus::Idle)]);
+    let mut app = ticket_enabled_app(vec![live_info("test-orchestrator", WorkerStatus::Idle)]);
     app.panel.rows = vec![panel_test_ticket_row(
         "00001QUEUE",
         "Queued work",
@@ -2958,7 +2991,7 @@ fn idle_orchestrator_gets_bounded_attention_for_new_queued_work() {
         .prepare_orchestrator_queue_attention_notice()
         .expect("idle orchestrator should receive queued-work attention");
 
-    assert_eq!(request.pod_name, "test-orchestrator");
+    assert_eq!(request.worker_name, "test-orchestrator");
     assert!(request.notice.message.contains("00001QUEUE"));
     assert!(request.notice.message.contains("new_queued"));
     assert!(request.notice.message.contains("queued -> inprogress"));
@@ -2966,7 +2999,7 @@ fn idle_orchestrator_gets_bounded_attention_for_new_queued_work() {
 
 #[test]
 fn active_inprogress_suppresses_queued_attention_and_retains_waiting_reason() {
-    let mut app = ticket_enabled_app(vec![live_info("test-orchestrator", PodStatus::Idle)]);
+    let mut app = ticket_enabled_app(vec![live_info("test-orchestrator", WorkerStatus::Idle)]);
     app.panel.rows = vec![
         panel_test_ticket_row(
             "00001ACTIVE",
@@ -3019,7 +3052,7 @@ fn active_inprogress_suppresses_queued_attention_and_retains_waiting_reason() {
 
 #[test]
 fn planned_queued_prompts_when_active_work_clears() {
-    let mut app = ticket_enabled_app(vec![live_info("test-orchestrator", PodStatus::Idle)]);
+    let mut app = ticket_enabled_app(vec![live_info("test-orchestrator", WorkerStatus::Idle)]);
     app.panel.rows = vec![
         panel_test_ticket_row(
             "00001ACTIVE",
@@ -3062,7 +3095,7 @@ fn planned_queued_prompts_when_active_work_clears() {
 
 #[test]
 fn queued_attention_is_suppressed_when_existing_claim_prevents_duplicate_start() {
-    let mut app = ticket_enabled_app(vec![live_info("test-orchestrator", PodStatus::Idle)]);
+    let mut app = ticket_enabled_app(vec![live_info("test-orchestrator", WorkerStatus::Idle)]);
     let mut row = panel_test_ticket_row(
         "00001QUEUE",
         "Queued work",
@@ -3072,11 +3105,11 @@ fn queued_attention_is_suppressed_when_existing_claim_prevents_duplicate_start()
     );
     row.ticket.as_mut().unwrap().local_claim =
         Some(crate::workspace_panel::TicketLocalClaimEntry {
-            pod_name: "coder-00001QUEUE".to_string(),
+            worker_name: "coder-00001QUEUE".to_string(),
             role: "coder".to_string(),
             status: TicketLocalClaimStatus::Live,
         });
-    row.related_pods.push("reviewer-00001QUEUE".to_string());
+    row.related_workers.push("reviewer-00001QUEUE".to_string());
     app.panel.rows = vec![row];
     app.refresh_orchestrator_work_set();
     app.apply_orchestrator_work_set_detail();
@@ -3092,7 +3125,7 @@ fn queued_attention_is_suppressed_when_existing_claim_prevents_duplicate_start()
 
 #[test]
 fn rediscovered_queued_work_is_actionable_when_session_work_set_is_empty() {
-    let mut app = ticket_enabled_app(vec![live_info("test-orchestrator", PodStatus::Idle)]);
+    let mut app = ticket_enabled_app(vec![live_info("test-orchestrator", WorkerStatus::Idle)]);
     app.orchestrator_work_set = OrchestratorWorkSet::default();
     app.panel.rows = vec![panel_test_ticket_row(
         "00001QUEUE",
@@ -3112,7 +3145,7 @@ fn rediscovered_queued_work_is_actionable_when_session_work_set_is_empty() {
 
 #[test]
 fn queued_attention_requires_idle_orchestrator_to_avoid_duplicate_rekick() {
-    let mut app = ticket_enabled_app(vec![live_info("test-orchestrator", PodStatus::Running)]);
+    let mut app = ticket_enabled_app(vec![live_info("test-orchestrator", WorkerStatus::Running)]);
     app.panel.rows = vec![panel_test_ticket_row(
         "00001QUEUE",
         "Queued work",
@@ -3125,9 +3158,9 @@ fn queued_attention_requires_idle_orchestrator_to_avoid_duplicate_rekick() {
     assert!(app.prepare_orchestrator_queue_attention_notice().is_none());
 }
 
-fn test_app(live: Vec<LivePodInfo>) -> DashboardApp {
-    app_with_list(PodList::from_sources(
-        PodVisibilitySource::ResumePicker,
+fn test_app(live: Vec<LiveWorkerInfo>) -> DashboardApp {
+    app_with_list(WorkerList::from_sources(
+        WorkerVisibilitySource::ResumePicker,
         vec![],
         live,
         None,
@@ -3135,21 +3168,21 @@ fn test_app(live: Vec<LivePodInfo>) -> DashboardApp {
     ))
 }
 
-fn companion_app(live: Vec<LivePodInfo>, status: CompanionPanelStatus) -> DashboardApp {
+fn companion_app(live: Vec<LiveWorkerInfo>, status: CompanionPanelStatus) -> DashboardApp {
     let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
     panel.header.companion = Some(CompanionPanelState::new("yoi", status, None));
     app_with_panel(
-        PodList::from_sources(PodVisibilitySource::ResumePicker, vec![], live, None, 10),
+        WorkerList::from_sources(WorkerVisibilitySource::ResumePicker, vec![], live, None, 10),
         panel,
     )
 }
 
-fn ticket_enabled_app(live: Vec<LivePodInfo>) -> DashboardApp {
+fn ticket_enabled_app(live: Vec<LiveWorkerInfo>) -> DashboardApp {
     ticket_enabled_app_with_orchestrator(live, OrchestratorPanelStatus::Live)
 }
 
 fn ticket_enabled_app_with_orchestrator(
-    live: Vec<LivePodInfo>,
+    live: Vec<LiveWorkerInfo>,
     orchestrator_status: OrchestratorPanelStatus,
 ) -> DashboardApp {
     let mut panel = WorkspacePanelViewModel::empty(Path::new("test"));
@@ -3165,17 +3198,23 @@ fn ticket_enabled_app_with_orchestrator(
         None,
     ));
     app_with_panel(
-        PodList::from_sources(PodVisibilitySource::ResumePicker, vec![], live, None, 10),
+        WorkerList::from_sources(WorkerVisibilitySource::ResumePicker, vec![], live, None, 10),
         panel,
     )
 }
 
-fn app_with_list(list: PodList) -> DashboardApp {
+fn app_with_list(list: WorkerList) -> DashboardApp {
     app_with_panel(list, WorkspacePanelViewModel::empty(Path::new("test")))
 }
 
-fn empty_test_list() -> PodList {
-    PodList::from_sources(PodVisibilitySource::ResumePicker, vec![], vec![], None, 10)
+fn empty_test_list() -> WorkerList {
+    WorkerList::from_sources(
+        WorkerVisibilitySource::ResumePicker,
+        vec![],
+        vec![],
+        None,
+        10,
+    )
 }
 
 fn panel_with_orchestrator(
@@ -3194,7 +3233,7 @@ fn panel_with_orchestrator(
     panel
 }
 
-fn app_with_panel(list: PodList, panel: WorkspacePanelViewModel) -> DashboardApp {
+fn app_with_panel(list: WorkerList, panel: WorkspacePanelViewModel) -> DashboardApp {
     let last_companion_lifecycle_failure = companion_lifecycle_failure_from_panel(&panel);
     let last_orchestrator_lifecycle_failure = orchestrator_lifecycle_failure_from_panel(&panel);
     let mut app = DashboardApp {
@@ -3210,7 +3249,7 @@ fn app_with_panel(list: PodList, panel: WorkspacePanelViewModel) -> DashboardApp
         sending: false,
         refreshing: false,
         enter_reload: None,
-        runtime_command: PodRuntimeCommand::for_executable("/tmp/yoi"),
+        runtime_command: WorkerRuntimeCommand::for_executable("/tmp/yoi"),
         last_companion_lifecycle_failure,
         last_orchestrator_lifecycle_failure,
         orchestrator_work_set: OrchestratorWorkSet::default(),
@@ -3242,9 +3281,9 @@ fn panel_test_ticket_row(
         latest_event_kind: Some("implementation_report".to_string()),
         latest_event_excerpt: Some("latest event stays out of the primary row".to_string()),
         blocked_reason: None,
-        related_pods: Vec::new(),
+        related_workers: Vec::new(),
         local_claim: None,
-        intake_pods: Vec::new(),
+        intake_workers: Vec::new(),
     };
     PanelRow {
         key: PanelRowKey::Ticket(ticket.id.clone()),
@@ -3255,7 +3294,7 @@ fn panel_test_ticket_row(
         priority,
         next_action: Some(next_action),
         ticket: Some(ticket),
-        related_pods: Vec::new(),
+        related_workers: Vec::new(),
         disabled_reason: None,
         key_hint: Some("Enter".to_string()),
     }
@@ -3263,17 +3302,17 @@ fn panel_test_ticket_row(
 
 fn panel_test_intake_child_row(
     ticket_id: &str,
-    pod_name: &str,
+    worker_name: &str,
     status: TicketLocalClaimStatus,
     next_action: Option<NextUserAction>,
 ) -> PanelRow {
     PanelRow {
-        key: PanelRowKey::TicketIntakePod {
+        key: PanelRowKey::TicketIntakeWorker {
             ticket_id: ticket_id.to_string(),
-            pod_name: pod_name.to_string(),
+            worker_name: worker_name.to_string(),
         },
-        kind: PanelRowKind::TicketIntakePod,
-        title: format!("Intake Pod: {pod_name}"),
+        kind: PanelRowKind::TicketIntakeWorker,
+        title: format!("Intake Worker: {worker_name}"),
         subtitle: Some(format!("Intake claim for Ticket {ticket_id}")),
         status: status.label().to_string(),
         priority: match status {
@@ -3284,16 +3323,16 @@ fn panel_test_intake_child_row(
         },
         next_action,
         ticket: None,
-        related_pods: vec![pod_name.to_string()],
+        related_workers: vec![worker_name.to_string()],
         disabled_reason: (status == TicketLocalClaimStatus::Stale)
             .then(|| "claim metadata is stale".to_string()),
-        key_hint: Some(format!("Ticket {ticket_id} Intake Pod {pod_name}")),
+        key_hint: Some(format!("Ticket {ticket_id} Intake Worker {worker_name}")),
     }
 }
 
-fn closed_list(count: usize, selected: Option<&str>) -> PodList {
-    PodList::from_sources(
-        PodVisibilitySource::ResumePicker,
+fn closed_list(count: usize, selected: Option<&str>) -> WorkerList {
+    WorkerList::from_sources(
+        WorkerVisibilitySource::ResumePicker,
         (0..count)
             .map(|index| {
                 stopped_info_with_updated_at(&format!("closed-{index}"), 100 - index as u64)
@@ -3305,25 +3344,29 @@ fn closed_list(count: usize, selected: Option<&str>) -> PodList {
     )
 }
 
-fn live_info(pod_name: &str, status: PodStatus) -> LivePodInfo {
-    live_info_with_updated_at(pod_name, status, 0)
+fn live_info(worker_name: &str, status: WorkerStatus) -> LiveWorkerInfo {
+    live_info_with_updated_at(worker_name, status, 0)
 }
 
-fn unreachable_live_info(pod_name: &str) -> LivePodInfo {
-    let mut live = live_info(pod_name, PodStatus::Idle);
+fn unreachable_live_info(worker_name: &str) -> LiveWorkerInfo {
+    let mut live = live_info(worker_name, WorkerStatus::Idle);
     live.reachable = false;
     live.status = None;
     live
 }
 
-fn live_info_with_updated_at(pod_name: &str, status: PodStatus, updated_at: u64) -> LivePodInfo {
-    LivePodInfo {
-        pod_name: pod_name.to_string(),
-        socket_path: PathBuf::from(format!("/tmp/{pod_name}.sock")),
+fn live_info_with_updated_at(
+    worker_name: &str,
+    status: WorkerStatus,
+    updated_at: u64,
+) -> LiveWorkerInfo {
+    LiveWorkerInfo {
+        worker_name: worker_name.to_string(),
+        socket_path: PathBuf::from(format!("/tmp/{worker_name}.sock")),
         status: Some(status),
         reachable: true,
         segment_id: None,
-        summary: PodEntrySummary {
+        summary: WorkerEntrySummary {
             active_session_id: None,
             active_segment_id: None,
             updated_at,
@@ -3332,13 +3375,13 @@ fn live_info_with_updated_at(pod_name: &str, status: PodStatus, updated_at: u64)
     }
 }
 
-fn stopped_info(pod_name: &str) -> StoredPodInfo {
-    stopped_info_with_updated_at(pod_name, 10)
+fn stopped_info(worker_name: &str) -> StoredWorkerInfo {
+    stopped_info_with_updated_at(worker_name, 10)
 }
 
-fn stopped_info_with_updated_at(pod_name: &str, updated_at: u64) -> StoredPodInfo {
-    StoredPodInfo {
-        pod_name: pod_name.to_string(),
+fn stopped_info_with_updated_at(worker_name: &str, updated_at: u64) -> StoredWorkerInfo {
+    StoredWorkerInfo {
+        worker_name: worker_name.to_string(),
         metadata_state: StoredMetadataState::Present,
         active_session_id: None,
         active_segment_id: None,
@@ -3348,7 +3391,7 @@ fn stopped_info_with_updated_at(pod_name: &str, updated_at: u64) -> StoredPodInf
     }
 }
 
-fn section_names<'a>(list: &'a PodList, section: &DashboardSection) -> Vec<&'a str> {
+fn section_names<'a>(list: &'a WorkerList, section: &DashboardSection) -> Vec<&'a str> {
     section
         .entries
         .iter()
@@ -3358,7 +3401,7 @@ fn section_names<'a>(list: &'a PodList, section: &DashboardSection) -> Vec<&'a s
 
 #[test]
 fn ticket_action_error_records_f2_diagnostic_details() {
-    let mut app = DashboardApp::loading(PodRuntimeCommand::for_executable("/tmp/yoi"));
+    let mut app = DashboardApp::loading(WorkerRuntimeCommand::for_executable("/tmp/yoi"));
     let long_error = "root-clean failed for Ticket 00001KTWPE3KQ at /home/hare/Projects/yoi: dirty file crates/tui/src/dashboard.rs";
 
     app.finish_ticket_action_dispatch(Err(TicketActionError::Stale(long_error.to_string())));

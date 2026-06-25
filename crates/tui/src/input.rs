@@ -8,7 +8,7 @@
 //!
 //! Display form: paste atoms render as
 //! `[Clipboard #N | X chars, Y lines]`. Submit form: paste atoms expand
-//! back to their original captured content so the Pod sees the full
+//! back to their original captured content so the Worker sees the full
 //! pasted text (without the placeholder label).
 
 use ratatui::style::{Color, Style};
@@ -33,7 +33,7 @@ impl PasteRef {
 }
 
 /// `@<path>` chip — confirmed completion of a file-system reference.
-/// Directories remain valid chips because Pod resolves normal directory refs
+/// Directories remain valid chips because Worker resolves normal directory refs
 /// to shallow `[Dir: <path>]` listings at submit time.
 #[derive(Debug, Clone)]
 pub struct FileRefAtom {

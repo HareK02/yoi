@@ -8,7 +8,7 @@
 //!
 //! Prune は **コンテキスト射影** であり、history の変換ではない。
 //! この crate が提供するのは pure な候補抽出 [`prunable_indices`] のみで、
-//! 射影の適用は上位層（`pod::prune_hook` 等）が LLM に送る一時コンテキスト
+//! 射影の適用は上位層（`worker::prune_hook` 等）が LLM に送る一時コンテキスト
 //! に対してだけ行う。Engine の永続履歴は決して変更されない。
 //!
 //! 保護境界は末尾 token budget で決めるが、この crate は usage 履歴を
@@ -75,7 +75,7 @@ pub enum PruneDecision {
 }
 
 /// Optional observer invoked after each prune evaluation, regardless of
-/// branch. Pod 等の上位層が install して metrics を発行する。
+/// branch. Worker 等の上位層が install して metrics を発行する。
 pub type PruneObserver = Box<dyn Fn(&PruneEvaluation) + Send + Sync>;
 
 /// Configuration for the Prune algorithm.

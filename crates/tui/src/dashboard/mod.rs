@@ -8,19 +8,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use client::ticket_role::{
     TicketIntakeHandoff, TicketRef, TicketRole, TicketRoleLaunchContext, TicketRoleLaunchError,
-    TicketRoleLaunchOptions, TicketRoleLaunchResult, launch_ticket_role_pod,
-    launch_ticket_role_pod_with_options, plan_ticket_role_launch,
+    TicketRoleLaunchOptions, TicketRoleLaunchResult, launch_ticket_role_worker,
+    launch_ticket_role_worker_with_options, plan_ticket_role_launch,
 };
 use client::{
-    PodProcessLaunchOptions, PodRuntimeCommand, SpawnConfig, spawn_pod, spawn_pod_with_options,
+    SpawnConfig, WorkerProcessLaunchOptions, WorkerRuntimeCommand, spawn_worker,
+    spawn_worker_with_options,
 };
 use crossterm::event::{
     Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     poll, read,
 };
-use pod_store::FsPodStore;
+use pod_store::FsWorkerStore;
 use protocol::stream::{JsonLineReader, JsonLineWriter};
-use protocol::{ErrorCode, Event, Method, PodStatus, Segment};
+use protocol::{ErrorCode, Event, Method, Segment, WorkerStatus};
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -40,12 +41,12 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::composer_keys::{ComposerEditAction, composer_edit_action};
 use crate::input::InputBuffer;
-use crate::pod_list::{
-    PodList, PodListEntry, PodVisibilitySource, StoredMetadataState, read_reachable_live_pod_infos,
-    read_stored_pod_infos,
-};
 use crate::role_session_registry::{
     PanelRegistryStore, RelatedTicketRef, RoleSessionOrigin, TicketClaimResult,
+};
+use crate::worker_list::{
+    StoredMetadataState, WorkerList, WorkerListEntry, WorkerVisibilitySource,
+    read_reachable_live_pod_infos, read_stored_worker_infos,
 };
 #[cfg(not(feature = "e2e-test"))]
 use crate::workspace_panel::build_workspace_panel;
@@ -53,13 +54,13 @@ use crate::workspace_panel::build_workspace_panel;
 use crate::workspace_panel::build_workspace_panel_with_e2e_timings;
 use crate::workspace_panel::{
     ActionPriority, CompanionLifecyclePlan, CompanionPanelState, CompanionPanelStatus,
-    CompanionPodPresence, ComposerTarget, NextUserAction, OrchestratorLifecyclePlan,
-    OrchestratorPanelState, OrchestratorPanelStatus, OrchestratorPodPresence, PanelRow,
+    CompanionWorkerPresence, ComposerTarget, NextUserAction, OrchestratorLifecyclePlan,
+    OrchestratorPanelState, OrchestratorPanelStatus, OrchestratorWorkerPresence, PanelRow,
     PanelRowKey, PanelRowKind, TicketConfigAvailability, TicketLocalClaimStatus,
     WorkspacePanelViewModel, bounded_panel_diagnostic, build_current_ticket_row,
     companion_pod_presence, decide_companion_lifecycle, decide_orchestrator_lifecycle,
-    local_claim_status_for_pod, orchestrator_pod_presence, ticket_config_availability,
-    workspace_companion_pod_name, workspace_orchestrator_pod_name,
+    local_claim_status_for_pod, ticket_config_availability, workspace_companion_worker_name,
+    workspace_orchestrator_worker_name, workspace_orchestrator_worker_presence,
 };
 
 mod render;
@@ -82,7 +83,7 @@ const PANEL_READY_REFINEMENT_MAX_INSTRUCTION_CHARS: usize = 4_000;
 pub(crate) enum DashboardError {
     Io(io::Error),
     Store(session_store::StoreError),
-    NoPods,
+    NoWorkers,
 }
 
 impl std::fmt::Display for DashboardError {
@@ -90,9 +91,9 @@ impl std::fmt::Display for DashboardError {
         match self {
             Self::Io(e) => write!(f, "io error: {e}"),
             Self::Store(e) => write!(f, "session store error: {e}"),
-            Self::NoPods => write!(
+            Self::NoWorkers => write!(
                 f,
-                "no Tickets or Pods found — create a Ticket with `yoi ticket create` or restore a Pod with `yoi resume`"
+                "no Tickets or Pods found — create a Ticket with `yoi ticket create` or restore a Worker with `yoi resume`"
             ),
         }
     }
@@ -114,10 +115,10 @@ impl From<session_store::StoreError> for DashboardError {
 
 pub(crate) enum DashboardOutcome {
     Quit,
-    Open(OpenPodRequest),
+    Open(OpenWorkerRequest),
 }
 
-pub(crate) async fn launch(runtime_command: PodRuntimeCommand) -> Result<(), Box<dyn Error>> {
+pub(crate) async fn launch(runtime_command: WorkerRuntimeCommand) -> Result<(), Box<dyn Error>> {
     let mut app = load_app(runtime_command.clone()).await?;
     let mut terminal = crate::console::enter_dashboard_fullscreen()?;
     loop {
@@ -127,9 +128,9 @@ pub(crate) async fn launch(runtime_command: PodRuntimeCommand) -> Result<(), Box
                 return Ok(());
             }
             DashboardOutcome::Open(request) => {
-                let pod_name = request.pod_name.clone();
+                let worker_name = request.worker_name.clone();
                 let console_request = crate::console::DashboardConsoleOpenRequest {
-                    pod_name: request.pod_name,
+                    worker_name: request.worker_name,
                     socket_override: request.socket_override,
                 };
                 let result = crate::console::open_from_dashboard(
@@ -138,7 +139,7 @@ pub(crate) async fn launch(runtime_command: PodRuntimeCommand) -> Result<(), Box
                     runtime_command.clone(),
                 )
                 .await;
-                if let Err(error) = finish_nested_console_open(&mut app, &pod_name, result) {
+                if let Err(error) = finish_nested_console_open(&mut app, &worker_name, result) {
                     crate::console::leave_dashboard_fullscreen(&mut terminal)?;
                     return Err(error);
                 }
@@ -149,16 +150,16 @@ pub(crate) async fn launch(runtime_command: PodRuntimeCommand) -> Result<(), Box
 
 fn finish_nested_console_open(
     app: &mut DashboardApp,
-    pod_name: &str,
+    worker_name: &str,
     result: Result<(), Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
     match result {
         Ok(()) => {
-            app.finish_open(pod_name, Ok(()));
+            app.finish_open(worker_name, Ok(()));
             Ok(())
         }
         Err(error) if crate::console::is_recoverable_dashboard_open_error(error.as_ref()) => {
-            app.finish_open(pod_name, Err(error.as_ref()));
+            app.finish_open(worker_name, Err(error.as_ref()));
             Ok(())
         }
         Err(error) => Err(error),
@@ -166,13 +167,13 @@ fn finish_nested_console_open(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct OpenPodRequest {
-    pub(crate) pod_name: String,
+pub(crate) struct OpenWorkerRequest {
+    pub(crate) worker_name: String,
     pub(crate) socket_override: Option<PathBuf>,
 }
 
 pub(crate) async fn load_app(
-    runtime_command: PodRuntimeCommand,
+    runtime_command: WorkerRuntimeCommand,
 ) -> Result<DashboardApp, DashboardError> {
     Ok(DashboardApp::loading(runtime_command))
 }
@@ -185,7 +186,7 @@ async fn run_loop(
         && app.panel.header.diagnostics.is_empty()
         && app.enter_reload.is_none()
     {
-        return Err(DashboardError::NoPods);
+        return Err(DashboardError::NoWorkers);
     }
 
     let mut pending_reload = PendingReload::default();
@@ -527,7 +528,7 @@ fn default_pod_store_dir() -> Result<PathBuf, DashboardError> {
         .ok_or_else(|| {
             DashboardError::Io(io::Error::new(
                 io::ErrorKind::NotFound,
-                "could not resolve pod state directory",
+                "could not resolve worker state directory",
             ))
         })
 }
@@ -542,7 +543,7 @@ pub(crate) enum OpenEligibility {
 #[derive(Debug)]
 pub(crate) struct IntakeLaunchRequest {
     context: TicketRoleLaunchContext,
-    runtime_command: PodRuntimeCommand,
+    runtime_command: WorkerRuntimeCommand,
     peer_registration: IntakePeerRegistrationRequest,
     registry_update: IntakeRegistryUpdate,
 }
@@ -551,7 +552,7 @@ pub(crate) struct IntakeLaunchRequest {
 pub(crate) enum IntakeRegistryUpdate {
     RecordSession {
         registry_root: PathBuf,
-        pod_name: String,
+        worker_name: String,
         origin: RoleSessionOrigin,
         related_tickets: Vec<RelatedTicketRef>,
     },
@@ -559,7 +560,7 @@ pub(crate) enum IntakeRegistryUpdate {
         registry_root: PathBuf,
         ticket_id: String,
         ticket_slug: Option<String>,
-        pod_name: String,
+        worker_name: String,
     },
     ClaimLaunchedTicket {
         registry_root: PathBuf,
@@ -580,12 +581,12 @@ pub(crate) struct ReadyTicketPlanningReturnRequest {
 pub(crate) enum ReadyTicketPlanningReturnFollowup {
     LaunchIntake(IntakeLaunchRequest),
     NotifyLiveClaimedIntake {
-        pod_name: String,
+        worker_name: String,
         socket_path: PathBuf,
     },
-    OpenRestorableClaimedIntake(OpenPodRequest),
+    OpenRestorableClaimedIntake(OpenWorkerRequest),
     BlockedByStaleClaim {
-        pod_name: String,
+        worker_name: String,
     },
 }
 
@@ -598,14 +599,18 @@ struct ReadyTicketPlanningReturnOutcome {
 #[derive(Debug)]
 enum ReadyTicketPlanningReturnAfterMutation {
     LaunchIntake(IntakeLaunchRequest),
-    OpenClaim(OpenPodRequest),
+    OpenClaim(OpenWorkerRequest),
     None,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum IntakePeerRegistrationRequest {
-    Register { orchestrator_pod: String },
-    Skip { reason: String },
+    Register {
+        workspace_orchestrator_worker: String,
+    },
+    Skip {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -617,8 +622,12 @@ pub(crate) struct IntakeLaunchOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum IntakePeerRegistrationStatus {
-    Registered { orchestrator_pod: String },
-    Warning { message: String },
+    Registered {
+        workspace_orchestrator_worker: String,
+    },
+    Warning {
+        message: String,
+    },
 }
 
 impl IntakePeerRegistrationStatus {
@@ -637,11 +646,11 @@ pub(crate) async fn dispatch_companion_message(
     let stream = tokio::time::timeout(SOCKET_OP_TIMEOUT, UnixStream::connect(&request.socket_path))
         .await
         .map_err(|_| CompanionSendError::Rejected {
-            pod_name: request.pod_name.clone(),
+            worker_name: request.worker_name.clone(),
             message: "connect timed out".to_string(),
         })?
         .map_err(|source| CompanionSendError::Connect {
-            pod_name: request.pod_name.clone(),
+            worker_name: request.worker_name.clone(),
             source,
         })?;
     let (read_half, write_half) = stream.into_split();
@@ -652,11 +661,11 @@ pub(crate) async fn dispatch_companion_message(
         let event = tokio::time::timeout(SOCKET_OP_TIMEOUT, reader.next::<Event>())
             .await
             .map_err(|_| CompanionSendError::Rejected {
-                pod_name: request.pod_name.clone(),
+                worker_name: request.worker_name.clone(),
                 message: "initial Snapshot timed out".to_string(),
             })?
             .map_err(|source| CompanionSendError::Read {
-                pod_name: request.pod_name.clone(),
+                worker_name: request.worker_name.clone(),
                 source,
             })?;
         match event {
@@ -664,14 +673,14 @@ pub(crate) async fn dispatch_companion_message(
             Some(Event::Alert(_)) => continue,
             Some(Event::Error { message, .. }) => {
                 return Err(CompanionSendError::Rejected {
-                    pod_name: request.pod_name,
+                    worker_name: request.worker_name,
                     message,
                 });
             }
             Some(_) => continue,
             None => {
                 return Err(CompanionSendError::Closed {
-                    pod_name: request.pod_name,
+                    worker_name: request.worker_name,
                 });
             }
         }
@@ -685,11 +694,11 @@ pub(crate) async fn dispatch_companion_message(
     )
     .await
     .map_err(|_| CompanionSendError::Rejected {
-        pod_name: request.pod_name.clone(),
+        worker_name: request.worker_name.clone(),
         message: "write timed out".to_string(),
     })?
     .map_err(|source| CompanionSendError::Write {
-        pod_name: request.pod_name.clone(),
+        worker_name: request.worker_name.clone(),
         source,
     })?;
 
@@ -697,12 +706,12 @@ pub(crate) async fn dispatch_companion_message(
         match tokio::time::timeout(SOCKET_OP_TIMEOUT, reader.next::<Event>()).await {
             Ok(Ok(Some(Event::UserMessage { .. }))) => {
                 return Ok(CompanionSendOutcome {
-                    notice: format!("Sent to Companion {}.", request.pod_name),
+                    notice: format!("Sent to Companion {}.", request.worker_name),
                 });
             }
             Ok(Ok(Some(Event::Error { message, .. }))) => {
                 return Err(CompanionSendError::Rejected {
-                    pod_name: request.pod_name,
+                    worker_name: request.worker_name,
                     message,
                 });
             }
@@ -710,18 +719,18 @@ pub(crate) async fn dispatch_companion_message(
             Ok(Ok(Some(_))) => continue,
             Ok(Ok(None)) => {
                 return Err(CompanionSendError::Closed {
-                    pod_name: request.pod_name,
+                    worker_name: request.worker_name,
                 });
             }
             Ok(Err(source)) => {
                 return Err(CompanionSendError::Read {
-                    pod_name: request.pod_name,
+                    worker_name: request.worker_name,
                     source,
                 });
             }
             Err(_) => {
                 return Err(CompanionSendError::Rejected {
-                    pod_name: request.pod_name,
+                    worker_name: request.worker_name,
                     message: "acceptance read timed out".to_string(),
                 });
             }
@@ -730,22 +739,25 @@ pub(crate) async fn dispatch_companion_message(
 }
 
 async fn launch_intake_with_handoff(request: IntakeLaunchRequest) -> IntakeLaunchResult {
-    let (options, orchestrator_pod, skip_warning) = match request.peer_registration.clone() {
-        IntakePeerRegistrationRequest::Register { orchestrator_pod } => (
-            TicketRoleLaunchOptions::default()
-                .with_pre_run_peer_registration(orchestrator_pod.clone()),
-            Some(orchestrator_pod),
-            None,
-        ),
-        IntakePeerRegistrationRequest::Skip { reason } => (
-            TicketRoleLaunchOptions::default(),
-            None,
-            Some(IntakePeerRegistrationStatus::warning(format!(
-                "handoff peer registration skipped: {reason}"
-            ))),
-        ),
-    };
-    let launch = launch_ticket_role_pod_with_options(
+    let (options, workspace_orchestrator_worker, skip_warning) =
+        match request.peer_registration.clone() {
+            IntakePeerRegistrationRequest::Register {
+                workspace_orchestrator_worker,
+            } => (
+                TicketRoleLaunchOptions::default()
+                    .with_pre_run_peer_registration(workspace_orchestrator_worker.clone()),
+                Some(workspace_orchestrator_worker),
+                None,
+            ),
+            IntakePeerRegistrationRequest::Skip { reason } => (
+                TicketRoleLaunchOptions::default(),
+                None,
+                Some(IntakePeerRegistrationStatus::warning(format!(
+                    "handoff peer registration skipped: {reason}"
+                ))),
+            ),
+        };
+    let launch = launch_ticket_role_worker_with_options(
         request.context,
         request.runtime_command,
         |_| {},
@@ -753,11 +765,13 @@ async fn launch_intake_with_handoff(request: IntakeLaunchRequest) -> IntakeLaunc
     )
     .await?;
     let registry_warning =
-        commit_intake_registry_update(request.registry_update, Some(&launch.plan.pod_name));
-    let peer_registration = match (orchestrator_pod, skip_warning) {
+        commit_intake_registry_update(request.registry_update, Some(&launch.plan.worker_name));
+    let peer_registration = match (workspace_orchestrator_worker, skip_warning) {
         (_, Some(warning)) => warning,
-        (Some(orchestrator_pod), None) if launch.pre_run_warnings.is_empty() => {
-            IntakePeerRegistrationStatus::Registered { orchestrator_pod }
+        (Some(workspace_orchestrator_worker), None) if launch.pre_run_warnings.is_empty() => {
+            IntakePeerRegistrationStatus::Registered {
+                workspace_orchestrator_worker,
+            }
         }
         (Some(_), None) => IntakePeerRegistrationStatus::warning(
             launch
@@ -780,17 +794,17 @@ async fn launch_intake_with_handoff(request: IntakeLaunchRequest) -> IntakeLaunc
 
 fn commit_intake_registry_update(
     update: IntakeRegistryUpdate,
-    launched_pod_name: Option<&str>,
+    launched_worker_name: Option<&str>,
 ) -> Option<String> {
     match update {
         IntakeRegistryUpdate::RecordSession {
             registry_root,
-            pod_name,
+            worker_name,
             origin,
             related_tickets,
         } => PanelRegistryStore::from_root(registry_root)
             .record_session(
-                pod_name,
+                worker_name,
                 TicketRole::Intake.as_str().to_string(),
                 origin,
                 None,
@@ -806,11 +820,11 @@ fn commit_intake_registry_update(
             registry_root,
             ticket_id,
             ticket_slug,
-            pod_name,
+            worker_name,
         } => match PanelRegistryStore::from_root(registry_root).claim_ticket(
             &ticket_id,
             ticket_slug.as_deref(),
-            &pod_name,
+            &worker_name,
             TicketRole::Intake.as_str(),
         ) {
             Ok(TicketClaimResult::Claimed) | Ok(TicketClaimResult::AlreadyOwned(_)) => None,
@@ -823,16 +837,16 @@ fn commit_intake_registry_update(
             ticket_id,
             ticket_slug,
         } => {
-            let Some(pod_name) = launched_pod_name else {
+            let Some(worker_name) = launched_worker_name else {
                 return Some(
-                    "local Ticket Intake claim could not be committed after launch acceptance: missing launched Pod name"
+                    "local Ticket Intake claim could not be committed after launch acceptance: missing launched Worker name"
                         .to_string(),
                 );
             };
             match PanelRegistryStore::from_root(registry_root).claim_ticket(
                 &ticket_id,
                 ticket_slug.as_deref(),
-                pod_name,
+                worker_name,
                 TicketRole::Intake.as_str(),
             ) {
                 Ok(TicketClaimResult::Claimed) | Ok(TicketClaimResult::AlreadyOwned(_)) => None,
@@ -922,7 +936,7 @@ struct OrchestratorQueueAttentionNotice {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OrchestratorQueueAttentionNoticeRequest {
-    pod_name: String,
+    worker_name: String,
     socket_path: PathBuf,
     notice: OrchestratorQueueAttentionNotice,
 }
@@ -1033,14 +1047,14 @@ struct PanelE2eDashboardHeader {
 #[cfg(feature = "e2e-test")]
 #[derive(Debug, Clone, Serialize)]
 struct PanelE2eCompanionState {
-    pod_name: String,
+    worker_name: String,
     status: &'static str,
 }
 
 #[cfg(feature = "e2e-test")]
 #[derive(Debug, Clone, Serialize)]
 struct PanelE2eOrchestratorState {
-    pod_name: String,
+    worker_name: String,
     status: &'static str,
     detail: Option<String>,
 }
@@ -1065,7 +1079,7 @@ struct PanelE2eDashboardCategories {
     ticket_rows: usize,
     ready_ticket_rows: usize,
     planning_ticket_rows: usize,
-    pod_rows: usize,
+    worker_rows: usize,
     actionable_rows: usize,
 }
 
@@ -1082,7 +1096,7 @@ struct PanelE2eDashboardSourceBreakdown {
     total_elapsed_ms: u128,
     sources: Vec<PanelE2eSourceTiming>,
     ticket_rows: usize,
-    pod_rows: usize,
+    worker_rows: usize,
     diagnostics: usize,
 }
 
@@ -1097,15 +1111,15 @@ fn panel_e2e_row_key(key: &PanelRowKey) -> PanelE2eRowKey {
             kind: "invalid_ticket",
             id: label.clone(),
         },
-        PanelRowKey::TicketIntakePod {
+        PanelRowKey::TicketIntakeWorker {
             ticket_id,
-            pod_name,
+            worker_name,
         } => PanelE2eRowKey {
             kind: "ticket_intake_pod",
-            id: format!("{ticket_id}:{pod_name}"),
+            id: format!("{ticket_id}:{worker_name}"),
         },
-        PanelRowKey::Pod(name) => PanelE2eRowKey {
-            kind: "pod",
+        PanelRowKey::Worker(name) => PanelE2eRowKey {
+            kind: "worker",
             id: name.clone(),
         },
     }
@@ -1135,7 +1149,7 @@ fn panel_e2e_dashboard_categories(rows: &[PanelE2eRenderedRow]) -> PanelE2eDashb
                 row.key.kind == "ticket" && row.local_state.as_deref() == Some("planning")
             })
             .count(),
-        pod_rows: rows.iter().filter(|row| row.key.kind == "pod").count(),
+        worker_rows: rows.iter().filter(|row| row.key.kind == "worker").count(),
         actionable_rows: rows.iter().filter(|row| row.action.is_some()).count(),
     }
 }
@@ -1149,7 +1163,7 @@ fn panel_e2e_dashboard_header(panel: &WorkspacePanelViewModel) -> PanelE2eDashbo
             .companion
             .as_ref()
             .map(|state| PanelE2eCompanionState {
-                pod_name: state.pod_name.clone(),
+                worker_name: state.worker_name.clone(),
                 status: state.status.label(),
             }),
         orchestrator: panel
@@ -1157,7 +1171,7 @@ fn panel_e2e_dashboard_header(panel: &WorkspacePanelViewModel) -> PanelE2eDashbo
             .orchestrator
             .as_ref()
             .map(|state| PanelE2eOrchestratorState {
-                pod_name: state.pod_name.clone(),
+                worker_name: state.worker_name.clone(),
                 status: state.status.label(),
                 detail: state.detail.clone(),
             }),
@@ -1175,7 +1189,7 @@ fn panel_e2e_dashboard_content_is_ready(
         && snapshot.header.orchestrator.is_some()
         && categories.ready_ticket_rows > 0
         && categories.planning_ticket_rows > 0
-        && categories.pod_rows > 0
+        && categories.worker_rows > 0
         && snapshot.rows.iter().any(|row| {
             row.key.kind == "ticket"
                 && row.local_state.as_deref() == Some("ready")
@@ -1192,7 +1206,7 @@ fn panel_e2e_dashboard_content_is_ready(
 }
 
 pub(crate) struct DashboardApp {
-    pub(crate) list: PodList,
+    pub(crate) list: WorkerList,
     pub(crate) panel: WorkspacePanelViewModel,
     pub(crate) input: InputBuffer,
     selected_row: Option<PanelRowKey>,
@@ -1204,7 +1218,7 @@ pub(crate) struct DashboardApp {
     sending: bool,
     refreshing: bool,
     enter_reload: Option<OrchestratorLifecycleMode>,
-    runtime_command: PodRuntimeCommand,
+    runtime_command: WorkerRuntimeCommand,
     last_companion_lifecycle_failure: Option<CompanionPanelState>,
     last_orchestrator_lifecycle_failure: Option<OrchestratorPanelState>,
     orchestrator_work_set: OrchestratorWorkSet,
@@ -1214,7 +1228,7 @@ pub(crate) struct DashboardApp {
 }
 
 impl DashboardApp {
-    fn loading(runtime_command: PodRuntimeCommand) -> Self {
+    fn loading(runtime_command: WorkerRuntimeCommand) -> Self {
         let workspace_root = current_workspace_root();
         let mut panel = WorkspacePanelViewModel::empty(&workspace_root);
         panel
@@ -1222,8 +1236,8 @@ impl DashboardApp {
             .diagnostics
             .push("Loading workspace dashboard…".to_string());
         Self {
-            list: PodList::from_sources(
-                PodVisibilitySource::ResumePicker,
+            list: WorkerList::from_sources(
+                WorkerVisibilitySource::ResumePicker,
                 Vec::new(),
                 Vec::new(),
                 None,
@@ -1263,7 +1277,7 @@ impl DashboardApp {
     }
 
     #[cfg(test)]
-    fn apply_reloaded_list(&mut self, mut list: PodList) {
+    fn apply_reloaded_list(&mut self, mut list: WorkerList) {
         list.selected_name = self
             .list
             .selected_name
@@ -1311,7 +1325,7 @@ impl DashboardApp {
             return None;
         }
         Some(OrchestratorQueueAttentionNoticeRequest {
-            pod_name: target.pod_name,
+            worker_name: target.worker_name,
             socket_path: target.socket_path,
             notice,
         })
@@ -1365,7 +1379,7 @@ impl DashboardApp {
             }
             CompanionPanelStatus::Missing | CompanionPanelStatus::Stopped => {
                 if let Some(previous) = self.last_companion_lifecycle_failure.clone() {
-                    if previous.pod_name == state.pod_name {
+                    if previous.worker_name == state.worker_name {
                         panel.header.companion = Some(previous.clone());
                         append_unique_diagnostic(panel, previous.detail.as_deref());
                     } else {
@@ -1394,7 +1408,7 @@ impl DashboardApp {
             }
             OrchestratorPanelStatus::Missing | OrchestratorPanelStatus::Stopped => {
                 if let Some(previous) = self.last_orchestrator_lifecycle_failure.clone() {
-                    if previous.pod_name == state.pod_name {
+                    if previous.worker_name == state.worker_name {
                         panel.header.orchestrator = Some(previous.clone());
                         append_unique_diagnostic(panel, previous.detail.as_deref());
                     } else {
@@ -1417,8 +1431,11 @@ impl DashboardApp {
             .and_then(|row| row.next_action)
     }
 
-    fn selected_pod_entry(&self) -> Option<&PodListEntry> {
-        let name = self.selected_row.as_ref().and_then(PanelRowKey::pod_name)?;
+    fn selected_pod_entry(&self) -> Option<&WorkerListEntry> {
+        let name = self
+            .selected_row
+            .as_ref()
+            .and_then(PanelRowKey::worker_name)?;
         self.list.entries.iter().find(|entry| entry.name == name)
     }
 
@@ -1567,14 +1584,14 @@ impl DashboardApp {
                         )
                     }
                     None => match &hit.key {
-                        PanelRowKey::Pod(name) => {
+                        PanelRowKey::Worker(name) => {
                             (name.clone(), None, None, None, None, None, None)
                         }
                         PanelRowKey::Ticket(id) | PanelRowKey::InvalidTicket(id) => {
                             (id.clone(), None, None, None, None, None, None)
                         }
-                        PanelRowKey::TicketIntakePod { pod_name, .. } => {
-                            (pod_name.clone(), None, None, None, None, None, None)
+                        PanelRowKey::TicketIntakeWorker { worker_name, .. } => {
+                            (worker_name.clone(), None, None, None, None, None, None)
                         }
                     },
                 };
@@ -1630,10 +1647,10 @@ impl DashboardApp {
             .any(|visible_key| visible_key == selected_key)
         {
             match selected_key {
-                PanelRowKey::Pod(name) => self.list.selected_name = Some(name.clone()),
+                PanelRowKey::Worker(name) => self.list.selected_name = Some(name.clone()),
                 PanelRowKey::Ticket(_)
                 | PanelRowKey::InvalidTicket(_)
-                | PanelRowKey::TicketIntakePod { .. } => self.list.selected_name = None,
+                | PanelRowKey::TicketIntakeWorker { .. } => self.list.selected_name = None,
             }
         } else {
             self.selected_row = None;
@@ -1643,10 +1660,10 @@ impl DashboardApp {
 
     fn select_panel_key(&mut self, key: PanelRowKey) {
         match &key {
-            PanelRowKey::Pod(name) => self.list.selected_name = Some(name.clone()),
+            PanelRowKey::Worker(name) => self.list.selected_name = Some(name.clone()),
             PanelRowKey::Ticket(_)
             | PanelRowKey::InvalidTicket(_)
-            | PanelRowKey::TicketIntakePod { .. } => self.list.selected_name = None,
+            | PanelRowKey::TicketIntakeWorker { .. } => self.list.selected_name = None,
         }
         #[cfg(feature = "e2e-test")]
         let selected_key = key.clone();
@@ -1698,8 +1715,8 @@ impl DashboardApp {
         self.composer_target
     }
 
-    pub(crate) fn prepare_open(&mut self) -> Option<OpenPodRequest> {
-        let (pod_name, socket_override, progress) = {
+    pub(crate) fn prepare_open(&mut self) -> Option<OpenWorkerRequest> {
+        let (worker_name, socket_override, progress) = {
             let entry = match self.selected_pod_entry() {
                 Some(entry) => entry,
                 None => {
@@ -1708,7 +1725,7 @@ impl DashboardApp {
                 }
             };
             if !entry.actions.can_open {
-                self.notice = Some("Selected Pod cannot be opened from this view.".to_string());
+                self.notice = Some("Selected Worker cannot be opened from this view.".to_string());
                 return None;
             }
             let progress = if entry.live.as_ref().is_some_and(|live| live.reachable) {
@@ -1724,25 +1741,27 @@ impl DashboardApp {
                 progress,
             )
         };
-        self.notice = Some(format!("{progress} {pod_name}…"));
-        Some(OpenPodRequest {
-            pod_name,
+        self.notice = Some(format!("{progress} {worker_name}…"));
+        Some(OpenWorkerRequest {
+            worker_name,
             socket_override,
         })
     }
 
     pub(crate) fn finish_open(
         &mut self,
-        pod_name: &str,
+        worker_name: &str,
         result: Result<(), &dyn std::fmt::Display>,
     ) {
         match result {
             Ok(()) => {
-                self.notice = Some(format!("Returned from {pod_name}. Refreshing workspace…"));
+                self.notice = Some(format!(
+                    "Returned from {worker_name}. Refreshing workspace…"
+                ));
             }
             Err(error) => {
                 self.notice = Some(format!(
-                    "Open failed for {pod_name}: {error}. Refreshing workspace…"
+                    "Open failed for {worker_name}: {error}. Refreshing workspace…"
                 ));
             }
         }
@@ -1776,7 +1795,7 @@ impl DashboardApp {
                 .unwrap_or("workspace Companion is not live yet");
             self.notice = Some(bounded_panel_diagnostic(format!(
                 "Companion {} is {}: {detail}; draft kept.",
-                companion.pod_name,
+                companion.worker_name,
                 companion.status.label()
             )));
             return None;
@@ -1785,32 +1804,32 @@ impl DashboardApp {
             .list
             .entries
             .iter()
-            .find(|entry| entry.name == companion.pod_name)
+            .find(|entry| entry.name == companion.worker_name)
         else {
             self.notice = Some(format!(
-                "Companion {} is not in the current Pod list; refresh and retry. Draft kept.",
-                companion.pod_name
+                "Companion {} is not in the current Worker list; refresh and retry. Draft kept.",
+                companion.worker_name
             ));
             return None;
         };
         let Some(live) = entry.live.as_ref().filter(|live| live.reachable) else {
             self.notice = Some(format!(
                 "Companion {} is not reachable; refresh and retry. Draft kept.",
-                companion.pod_name
+                companion.worker_name
             ));
             return None;
         };
-        if live.status == Some(PodStatus::Running) {
+        if live.status == Some(WorkerStatus::Running) {
             self.notice = Some(format!(
                 "Companion {} is busy; wait for it to become idle or open it for inspection. Draft kept.",
-                companion.pod_name
+                companion.worker_name
             ));
             return None;
         }
         self.sending = true;
-        self.notice = Some(format!("Sending to Companion {}…", companion.pod_name));
+        self.notice = Some(format!("Sending to Companion {}…", companion.worker_name));
         Some(CompanionSendRequest {
-            pod_name: companion.pod_name.clone(),
+            worker_name: companion.worker_name.clone(),
             socket_path: live.socket_path.clone(),
             segments,
         })
@@ -1922,8 +1941,8 @@ impl DashboardApp {
         }
         let mut context =
             TicketRoleLaunchContext::new(current_workspace_root(), TicketRole::Intake);
-        let pod_name = unique_preticket_intake_pod_name();
-        context.pod_name = Some(pod_name.clone());
+        let worker_name = unique_preticket_intake_worker_name();
+        context.worker_name = Some(worker_name.clone());
         context.user_instruction = Some(body);
         let store = match PanelRegistryStore::default_for_workspace(&context.workspace_root) {
             Ok(store) => store,
@@ -1941,7 +1960,7 @@ impl DashboardApp {
             peer_registration,
             registry_update: IntakeRegistryUpdate::RecordSession {
                 registry_root: store.root().to_path_buf(),
-                pod_name,
+                worker_name,
                 origin: RoleSessionOrigin::PreTicketIntake,
                 related_tickets: Vec::new(),
             },
@@ -1955,18 +1974,18 @@ impl DashboardApp {
         match self.panel.header.orchestrator.as_ref() {
             Some(orchestrator) => {
                 context.intake_handoff = Some(TicketIntakeHandoff::new(
-                    orchestrator.pod_name.clone(),
+                    orchestrator.worker_name.clone(),
                     self.panel.header.workspace_label.clone(),
                 ));
                 if orchestrator_status_is_peer_reachable(orchestrator.status) {
                     IntakePeerRegistrationRequest::Register {
-                        orchestrator_pod: orchestrator.pod_name.clone(),
+                        workspace_orchestrator_worker: orchestrator.worker_name.clone(),
                     }
                 } else {
                     IntakePeerRegistrationRequest::Skip {
                         reason: format!(
                             "workspace Orchestrator {} is {}; launch input still carries the auditable handoff target",
-                            orchestrator.pod_name,
+                            orchestrator.worker_name,
                             orchestrator.status.label()
                         ),
                     }
@@ -2028,10 +2047,10 @@ impl DashboardApp {
         };
         match store.claim_for_ticket(&ticket_id) {
             Ok(Some(claim)) => {
-                let status = local_claim_status_for_pod(&claim.pod_name, &self.list);
+                let status = local_claim_status_for_pod(&claim.worker_name, &self.list);
                 self.notice = Some(existing_ticket_claim_notice(
                     &ticket_id,
-                    &claim.pod_name,
+                    &claim.worker_name,
                     status,
                 ));
                 return None;
@@ -2052,13 +2071,13 @@ impl DashboardApp {
                 return None;
             }
         };
-        context.pod_name = Some(planned.pod_name.clone());
-        let pod_name = planned.pod_name.clone();
+        context.worker_name = Some(planned.worker_name.clone());
+        let worker_name = planned.worker_name.clone();
         let peer_registration = self.prepare_intake_peer_registration(&mut context);
         self.sending = true;
         self.notice = Some(format!(
             "Launching Ticket Intake for {} as {}…",
-            ticket_id, planned.pod_name
+            ticket_id, planned.worker_name
         ));
         Some(IntakeLaunchRequest {
             context,
@@ -2068,7 +2087,7 @@ impl DashboardApp {
                 registry_root: store.root().to_path_buf(),
                 ticket_id,
                 ticket_slug: None,
-                pod_name,
+                worker_name,
             },
         })
     }
@@ -2147,33 +2166,35 @@ impl DashboardApp {
             }
         };
         let followup = match store.claim_for_ticket(&ticket_id) {
-            Ok(Some(claim)) => match local_claim_status_for_pod(&claim.pod_name, &self.list) {
+            Ok(Some(claim)) => match local_claim_status_for_pod(&claim.worker_name, &self.list) {
                 TicketLocalClaimStatus::Live => match self
                     .list
                     .entries
                     .iter()
-                    .find(|entry| entry.name == claim.pod_name)
-                    .and_then(PodListEntry::attach_socket_path)
+                    .find(|entry| entry.name == claim.worker_name)
+                    .and_then(WorkerListEntry::attach_socket_path)
                 {
                     Some(socket_path) => {
                         ReadyTicketPlanningReturnFollowup::NotifyLiveClaimedIntake {
-                            pod_name: claim.pod_name,
+                            worker_name: claim.worker_name,
                             socket_path: socket_path.to_path_buf(),
                         }
                     }
                     None => ReadyTicketPlanningReturnFollowup::BlockedByStaleClaim {
-                        pod_name: claim.pod_name,
+                        worker_name: claim.worker_name,
                     },
                 },
                 TicketLocalClaimStatus::Restorable => {
-                    ReadyTicketPlanningReturnFollowup::OpenRestorableClaimedIntake(OpenPodRequest {
-                        pod_name: claim.pod_name,
-                        socket_override: None,
-                    })
+                    ReadyTicketPlanningReturnFollowup::OpenRestorableClaimedIntake(
+                        OpenWorkerRequest {
+                            worker_name: claim.worker_name,
+                            socket_override: None,
+                        },
+                    )
                 }
                 TicketLocalClaimStatus::Stale => {
                     ReadyTicketPlanningReturnFollowup::BlockedByStaleClaim {
-                        pod_name: claim.pod_name,
+                        worker_name: claim.worker_name,
                     }
                 }
             },
@@ -2247,10 +2268,12 @@ impl DashboardApp {
         self.input.clear();
         match result {
             Ok(result) => {
-                let pod_name = result.launch.plan.pod_name;
+                let worker_name = result.launch.plan.worker_name;
                 let peer_notice = match result.peer_registration {
-                    IntakePeerRegistrationStatus::Registered { orchestrator_pod } => {
-                        format!(" Handoff peer registered with {orchestrator_pod}.")
+                    IntakePeerRegistrationStatus::Registered {
+                        workspace_orchestrator_worker,
+                    } => {
+                        format!(" Handoff peer registered with {workspace_orchestrator_worker}.")
                     }
                     IntakePeerRegistrationStatus::Warning { message } => {
                         format!(" Handoff warning: {message}")
@@ -2261,7 +2284,7 @@ impl DashboardApp {
                     .map(|warning| format!(" Registry warning: {warning}"))
                     .unwrap_or_default();
                 self.notice = Some(bounded_panel_diagnostic(format!(
-                    "{planning_notice} Launched Ticket Intake Pod {pod_name}.{peer_notice}{registry_notice}"
+                    "{planning_notice} Launched Ticket Intake Worker {worker_name}.{peer_notice}{registry_notice}"
                 )));
             }
             Err(error) => {
@@ -2280,11 +2303,13 @@ impl DashboardApp {
         self.sending = false;
         match result {
             Ok(result) => {
-                let pod_name = result.launch.plan.pod_name;
+                let worker_name = result.launch.plan.worker_name;
                 self.input.clear();
                 let peer_notice = match result.peer_registration {
-                    IntakePeerRegistrationStatus::Registered { orchestrator_pod } => {
-                        format!(" Handoff peer registered with {orchestrator_pod}.")
+                    IntakePeerRegistrationStatus::Registered {
+                        workspace_orchestrator_worker,
+                    } => {
+                        format!(" Handoff peer registered with {workspace_orchestrator_worker}.")
                     }
                     IntakePeerRegistrationStatus::Warning { message } => {
                         format!(" Handoff warning: {message}")
@@ -2295,7 +2320,7 @@ impl DashboardApp {
                     .map(|warning| format!(" Registry warning: {warning}"))
                     .unwrap_or_default();
                 self.notice = Some(bounded_panel_diagnostic(format!(
-                    "Launched Ticket Intake Pod {pod_name}.{peer_notice}{registry_notice}"
+                    "Launched Ticket Intake Worker {worker_name}.{peer_notice}{registry_notice}"
                 )));
             }
             Err(error) => {
@@ -2435,7 +2460,7 @@ enum DashboardAction {
 
 #[derive(Debug, Clone)]
 struct DashboardSnapshot {
-    list: PodList,
+    list: WorkerList,
     panel: WorkspacePanelViewModel,
 }
 
@@ -2477,7 +2502,9 @@ fn append_unique_diagnostic(panel: &mut WorkspacePanelViewModel, diagnostic: Opt
 
 #[derive(Debug, Clone)]
 enum OrchestratorLifecycleMode {
-    Ensure { runtime_command: PodRuntimeCommand },
+    Ensure {
+        runtime_command: WorkerRuntimeCommand,
+    },
     Observe,
 }
 
@@ -2490,14 +2517,14 @@ async fn load_dashboard_snapshot(
     let load_started = Instant::now();
     #[cfg(feature = "e2e-test")]
     let mut source_timings = Vec::new();
-    let companion_pod_name = workspace_companion_pod_name(&workspace_root);
+    let companion_worker_name = workspace_companion_worker_name(&workspace_root);
     let list_selected_name = selected_name
         .clone()
-        .or_else(|| Some(companion_pod_name.clone()));
+        .or_else(|| Some(companion_worker_name.clone()));
 
     #[cfg(feature = "e2e-test")]
     let source_started = Instant::now();
-    let mut list = load_pod_list(list_selected_name.clone(), MAX_ENTRIES).await?;
+    let mut list = load_worker_list(list_selected_name.clone(), MAX_ENTRIES).await?;
     #[cfg(feature = "e2e-test")]
     source_timings.push(PanelE2eSourceTiming {
         source: "pod_metadata_status_probe.initial",
@@ -2506,7 +2533,7 @@ async fn load_dashboard_snapshot(
 
     #[cfg(feature = "e2e-test")]
     let source_started = Instant::now();
-    let companion_presence = companion_pod_presence(&companion_pod_name, &list);
+    let companion_presence = companion_pod_presence(&companion_worker_name, &list);
     #[cfg(feature = "e2e-test")]
     source_timings.push(PanelE2eSourceTiming {
         source: "companion.presence.from_initial_list",
@@ -2519,14 +2546,14 @@ async fn load_dashboard_snapshot(
         OrchestratorLifecycleMode::Ensure { runtime_command } => {
             ensure_workspace_companion(
                 &workspace_root,
-                companion_pod_name,
+                companion_worker_name,
                 companion_presence,
                 runtime_command,
             )
             .await
         }
         OrchestratorLifecycleMode::Observe => {
-            observe_workspace_companion(companion_pod_name, companion_presence)
+            observe_workspace_companion(companion_worker_name, companion_presence)
         }
     };
     #[cfg(feature = "e2e-test")]
@@ -2534,10 +2561,10 @@ async fn load_dashboard_snapshot(
         source: "companion.lifecycle",
         elapsed_ms: source_started.elapsed().as_millis(),
     });
-    if companion.reload_pods {
+    if companion.reload_workers {
         #[cfg(feature = "e2e-test")]
         let source_started = Instant::now();
-        list = load_pod_list(list_selected_name.clone(), MAX_ENTRIES).await?;
+        list = load_worker_list(list_selected_name.clone(), MAX_ENTRIES).await?;
         #[cfg(feature = "e2e-test")]
         source_timings.push(PanelE2eSourceTiming {
             source: "pod_metadata_status_probe.after_companion_reload",
@@ -2554,14 +2581,15 @@ async fn load_dashboard_snapshot(
         elapsed_ms: source_started.elapsed().as_millis(),
     });
 
-    let orchestrator_pod_name = workspace_orchestrator_pod_name(&workspace_root);
+    let orchestrator_worker_name = workspace_orchestrator_worker_name(&workspace_root);
     #[cfg(feature = "e2e-test")]
     let source_started = Instant::now();
     let orchestrator_presence = match &config {
         TicketConfigAvailability::Absent | TicketConfigAvailability::Unusable(_) => None,
-        TicketConfigAvailability::Usable => {
-            Some(orchestrator_pod_presence(&orchestrator_pod_name, &list))
-        }
+        TicketConfigAvailability::Usable => Some(workspace_orchestrator_worker_presence(
+            &orchestrator_worker_name,
+            &list,
+        )),
     };
     #[cfg(feature = "e2e-test")]
     source_timings.push(PanelE2eSourceTiming {
@@ -2576,14 +2604,14 @@ async fn load_dashboard_snapshot(
             ensure_workspace_orchestrator(
                 &workspace_root,
                 config,
-                orchestrator_pod_name,
+                orchestrator_worker_name,
                 orchestrator_presence,
                 runtime_command,
             )
             .await
         }
         OrchestratorLifecycleMode::Observe => {
-            observe_workspace_orchestrator(config, orchestrator_pod_name, orchestrator_presence)
+            observe_workspace_orchestrator(config, orchestrator_worker_name, orchestrator_presence)
         }
     };
     #[cfg(feature = "e2e-test")]
@@ -2591,10 +2619,10 @@ async fn load_dashboard_snapshot(
         source: "orchestrator.lifecycle",
         elapsed_ms: source_started.elapsed().as_millis(),
     });
-    if orchestrator.reload_pods {
+    if orchestrator.reload_workers {
         #[cfg(feature = "e2e-test")]
         let source_started = Instant::now();
-        list = load_pod_list(list_selected_name, MAX_ENTRIES).await?;
+        list = load_worker_list(list_selected_name, MAX_ENTRIES).await?;
         #[cfg(feature = "e2e-test")]
         source_timings.push(PanelE2eSourceTiming {
             source: "pod_metadata_status_probe.after_orchestrator_reload",
@@ -2639,7 +2667,7 @@ async fn load_dashboard_snapshot(
                 .iter()
                 .filter(|row| row.is_ticket_action())
                 .count(),
-            pod_rows: list.entries.len(),
+            worker_rows: list.entries.len(),
             diagnostics: panel.header.diagnostics.len(),
         },
     );
@@ -2650,7 +2678,7 @@ async fn load_dashboard_snapshot(
 struct CompanionLifecycleReport {
     state: Option<CompanionPanelState>,
     diagnostics: Vec<String>,
-    reload_pods: bool,
+    reload_workers: bool,
 }
 
 impl CompanionLifecycleReport {
@@ -2658,95 +2686,96 @@ impl CompanionLifecycleReport {
         Self {
             state: Some(state),
             diagnostics: Vec::new(),
-            reload_pods: false,
+            reload_workers: false,
         }
     }
 
-    fn unavailable(pod_name: String, detail: String) -> Self {
+    fn unavailable(worker_name: String, detail: String) -> Self {
         let detail = bounded_panel_diagnostic(detail);
         Self {
             state: Some(CompanionPanelState::new(
-                pod_name,
+                worker_name,
                 CompanionPanelStatus::Unavailable,
                 Some(detail.clone()),
             )),
             diagnostics: vec![detail],
-            reload_pods: false,
+            reload_workers: false,
         }
     }
 
     fn mark_reload(mut self) -> Self {
-        self.reload_pods = true;
+        self.reload_workers = true;
         self
     }
 }
 
 async fn ensure_workspace_companion(
     workspace_root: &Path,
-    pod_name: String,
-    presence: CompanionPodPresence,
-    runtime_command: PodRuntimeCommand,
+    worker_name: String,
+    presence: CompanionWorkerPresence,
+    runtime_command: WorkerRuntimeCommand,
 ) -> CompanionLifecycleReport {
     match decide_companion_lifecycle(&presence) {
         CompanionLifecyclePlan::ReportLive => CompanionLifecycleReport::with_state(
-            CompanionPanelState::new(pod_name, CompanionPanelStatus::Live, None),
+            CompanionPanelState::new(worker_name, CompanionPanelStatus::Live, None),
         ),
         CompanionLifecyclePlan::Restore => {
             match restore_workspace_companion_pod(
                 workspace_root,
-                &pod_name,
+                &worker_name,
                 runtime_command.clone(),
             )
             .await
             {
                 Ok(()) => CompanionLifecycleReport::with_state(CompanionPanelState::new(
-                    pod_name,
+                    worker_name,
                     CompanionPanelStatus::Restored,
-                    Some("restored existing Pod state".to_string()),
+                    Some("restored existing Worker state".to_string()),
                 ))
                 .mark_reload(),
                 Err(error) => CompanionLifecycleReport::unavailable(
-                    pod_name,
+                    worker_name,
                     format!("could not restore workspace Companion: {error}"),
                 ),
             }
         }
         CompanionLifecyclePlan::Spawn => {
-            match spawn_workspace_companion_pod(workspace_root, &pod_name, runtime_command).await {
+            match spawn_workspace_companion_pod(workspace_root, &worker_name, runtime_command).await
+            {
                 Ok(()) => CompanionLifecycleReport::with_state(CompanionPanelState::new(
-                    pod_name,
+                    worker_name,
                     CompanionPanelStatus::Spawned,
                     Some("launched with default Companion profile".to_string()),
                 ))
                 .mark_reload(),
                 Err(error) => CompanionLifecycleReport::unavailable(
-                    pod_name,
+                    worker_name,
                     format!("could not spawn workspace Companion: {error}"),
                 ),
             }
         }
         CompanionLifecyclePlan::Unavailable(message) => {
-            CompanionLifecycleReport::unavailable(pod_name, message)
+            CompanionLifecycleReport::unavailable(worker_name, message)
         }
     }
 }
 
 fn observe_workspace_companion(
-    pod_name: String,
-    presence: CompanionPodPresence,
+    worker_name: String,
+    presence: CompanionWorkerPresence,
 ) -> CompanionLifecycleReport {
     match presence {
-        CompanionPodPresence::Live => CompanionLifecycleReport::with_state(
-            CompanionPanelState::new(pod_name, CompanionPanelStatus::Live, None),
+        CompanionWorkerPresence::Live => CompanionLifecycleReport::with_state(
+            CompanionPanelState::new(worker_name, CompanionPanelStatus::Live, None),
         ),
-        CompanionPodPresence::Restorable => CompanionLifecycleReport::with_state(
-            CompanionPanelState::new(pod_name, CompanionPanelStatus::Stopped, None),
+        CompanionWorkerPresence::Restorable => CompanionLifecycleReport::with_state(
+            CompanionPanelState::new(worker_name, CompanionPanelStatus::Stopped, None),
         ),
-        CompanionPodPresence::Missing => CompanionLifecycleReport::with_state(
-            CompanionPanelState::new(pod_name, CompanionPanelStatus::Missing, None),
+        CompanionWorkerPresence::Missing => CompanionLifecycleReport::with_state(
+            CompanionPanelState::new(worker_name, CompanionPanelStatus::Missing, None),
         ),
-        CompanionPodPresence::Unavailable(message) => {
-            CompanionLifecycleReport::unavailable(pod_name, message)
+        CompanionWorkerPresence::Unavailable(message) => {
+            CompanionLifecycleReport::unavailable(worker_name, message)
         }
     }
 }
@@ -2755,7 +2784,7 @@ fn observe_workspace_companion(
 struct OrchestratorLifecycleReport {
     state: Option<OrchestratorPanelState>,
     diagnostics: Vec<String>,
-    reload_pods: bool,
+    reload_workers: bool,
 }
 
 impl OrchestratorLifecycleReport {
@@ -2763,7 +2792,7 @@ impl OrchestratorLifecycleReport {
         Self {
             state: None,
             diagnostics: Vec::new(),
-            reload_pods: false,
+            reload_workers: false,
         }
     }
 
@@ -2771,25 +2800,25 @@ impl OrchestratorLifecycleReport {
         Self {
             state: Some(state),
             diagnostics: Vec::new(),
-            reload_pods: false,
+            reload_workers: false,
         }
     }
 
-    fn unavailable(pod_name: String, detail: String) -> Self {
+    fn unavailable(worker_name: String, detail: String) -> Self {
         let detail = bounded_panel_diagnostic(detail);
         Self {
             state: Some(OrchestratorPanelState::new(
-                pod_name,
+                worker_name,
                 OrchestratorPanelStatus::Unavailable,
                 Some(detail.clone()),
             )),
             diagnostics: vec![detail],
-            reload_pods: false,
+            reload_workers: false,
         }
     }
 
     fn mark_reload(mut self) -> Self {
-        self.reload_pods = true;
+        self.reload_workers = true;
         self
     }
 }
@@ -2797,39 +2826,46 @@ impl OrchestratorLifecycleReport {
 async fn ensure_workspace_orchestrator(
     workspace_root: &Path,
     config: TicketConfigAvailability,
-    pod_name: String,
-    presence: Option<OrchestratorPodPresence>,
-    runtime_command: PodRuntimeCommand,
+    worker_name: String,
+    presence: Option<OrchestratorWorkerPresence>,
+    runtime_command: WorkerRuntimeCommand,
 ) -> OrchestratorLifecycleReport {
-    orchestrator_lifecycle(workspace_root, config, pod_name, presence, runtime_command).await
+    orchestrator_lifecycle(
+        workspace_root,
+        config,
+        worker_name,
+        presence,
+        runtime_command,
+    )
+    .await
 }
 
 fn observe_workspace_orchestrator(
     config: TicketConfigAvailability,
-    pod_name: String,
-    presence: Option<OrchestratorPodPresence>,
+    worker_name: String,
+    presence: Option<OrchestratorWorkerPresence>,
 ) -> OrchestratorLifecycleReport {
     if matches!(config, TicketConfigAvailability::Absent) {
         return OrchestratorLifecycleReport::skipped();
     }
     if let TicketConfigAvailability::Unusable(message) = config {
         return OrchestratorLifecycleReport::unavailable(
-            pod_name,
+            worker_name,
             format!("Ticket config is unusable; workspace Orchestrator not observed: {message}"),
         );
     }
-    match presence.unwrap_or(OrchestratorPodPresence::Missing) {
-        OrchestratorPodPresence::Live => OrchestratorLifecycleReport::with_state(
-            OrchestratorPanelState::new(pod_name, OrchestratorPanelStatus::Live, None),
+    match presence.unwrap_or(OrchestratorWorkerPresence::Missing) {
+        OrchestratorWorkerPresence::Live => OrchestratorLifecycleReport::with_state(
+            OrchestratorPanelState::new(worker_name, OrchestratorPanelStatus::Live, None),
         ),
-        OrchestratorPodPresence::Restorable => OrchestratorLifecycleReport::with_state(
-            OrchestratorPanelState::new(pod_name, OrchestratorPanelStatus::Stopped, None),
+        OrchestratorWorkerPresence::Restorable => OrchestratorLifecycleReport::with_state(
+            OrchestratorPanelState::new(worker_name, OrchestratorPanelStatus::Stopped, None),
         ),
-        OrchestratorPodPresence::Missing => OrchestratorLifecycleReport::with_state(
-            OrchestratorPanelState::new(pod_name, OrchestratorPanelStatus::Missing, None),
+        OrchestratorWorkerPresence::Missing => OrchestratorLifecycleReport::with_state(
+            OrchestratorPanelState::new(worker_name, OrchestratorPanelStatus::Missing, None),
         ),
-        OrchestratorPodPresence::Unavailable(message) => {
-            OrchestratorLifecycleReport::unavailable(pod_name, message)
+        OrchestratorWorkerPresence::Unavailable(message) => {
+            OrchestratorLifecycleReport::unavailable(worker_name, message)
         }
     }
 }
@@ -2889,7 +2925,7 @@ fn resolved_orchestration_worktree_layout(
 fn build_orchestrator_launch_context(
     original_workspace_root: &Path,
     orchestration_workspace_root: &Path,
-    pod_name: &str,
+    worker_name: &str,
 ) -> TicketRoleLaunchContext {
     let mut context = TicketRoleLaunchContext::new(
         original_workspace_root.to_path_buf(),
@@ -2898,7 +2934,7 @@ fn build_orchestrator_launch_context(
     .with_cwd(orchestration_workspace_root.to_path_buf())
     .with_original_workspace_root(original_workspace_root.to_path_buf())
     .with_target_workspace_root(original_workspace_root.to_path_buf());
-    context.pod_name = Some(pod_name.to_string());
+    context.worker_name = Some(worker_name.to_string());
     context.user_instruction = Some(
         "Workspace Dashboard opened for this Ticket-enabled workspace. Coordinate Ticket routing and wait for explicit follow-up before spawning role Pods."
             .to_string(),
@@ -2975,7 +3011,7 @@ fn prepare_orchestration_worktree_for_restore(
     let layout = resolved_orchestration_worktree_layout(workspace_root)?;
     if !layout.path.exists() {
         return Err(format!(
-            "orchestration worktree is missing; cannot restore existing Pod state: {}",
+            "orchestration worktree is missing; cannot restore existing Worker state: {}",
             layout.path.display()
         ));
     }
@@ -3179,36 +3215,36 @@ fn run_git_command(mut command: Command, action: &str) -> Result<(), String> {
 async fn orchestrator_lifecycle(
     workspace_root: &Path,
     config: TicketConfigAvailability,
-    pod_name: String,
-    presence: Option<OrchestratorPodPresence>,
-    runtime_command: PodRuntimeCommand,
+    worker_name: String,
+    presence: Option<OrchestratorWorkerPresence>,
+    runtime_command: WorkerRuntimeCommand,
 ) -> OrchestratorLifecycleReport {
     if matches!(config, TicketConfigAvailability::Absent) {
         return OrchestratorLifecycleReport::skipped();
     }
-    let presence = presence.unwrap_or(OrchestratorPodPresence::Missing);
+    let presence = presence.unwrap_or(OrchestratorWorkerPresence::Missing);
     match decide_orchestrator_lifecycle(&config, &presence) {
         OrchestratorLifecyclePlan::SkipNoTicketConfig => OrchestratorLifecycleReport::skipped(),
         OrchestratorLifecyclePlan::ReportLive => OrchestratorLifecycleReport::with_state(
-            OrchestratorPanelState::new(pod_name, OrchestratorPanelStatus::Live, None),
+            OrchestratorPanelState::new(worker_name, OrchestratorPanelStatus::Live, None),
         ),
         OrchestratorLifecyclePlan::Restore => {
             match prepare_orchestration_worktree_for_restore(workspace_root) {
                 Ok(worktree) => {
-                    match restore_orchestrator_pod(
+                    match restore_workspace_orchestrator_worker(
                         workspace_root,
                         &worktree.layout.path,
-                        &pod_name,
+                        &worker_name,
                         runtime_command.clone(),
                     )
                     .await
                     {
                         Ok(()) => {
                             OrchestratorLifecycleReport::with_state(OrchestratorPanelState::new(
-                                pod_name,
+                                worker_name,
                                 OrchestratorPanelStatus::Restored,
                                 Some(format!(
-                                    "restored existing Pod state in orchestration worktree {} on branch {}",
+                                    "restored existing Worker state in orchestration worktree {} on branch {}",
                                     worktree.layout.path.display(),
                                     worktree.layout.branch
                                 )),
@@ -3216,13 +3252,13 @@ async fn orchestrator_lifecycle(
                             .mark_reload()
                         }
                         Err(error) => OrchestratorLifecycleReport::unavailable(
-                            pod_name,
+                            worker_name,
                             format!("could not restore workspace Orchestrator: {error}"),
                         ),
                     }
                 }
                 Err(error) => OrchestratorLifecycleReport::unavailable(
-                    pod_name,
+                    worker_name,
                     format!("could not prepare orchestration worktree for restore: {error}"),
                 ),
             }
@@ -3241,106 +3277,106 @@ async fn orchestrator_lifecycle(
                         worktree.layout.branch
                     ),
                 };
-                match spawn_orchestrator_pod(
+                match spawn_workspace_orchestrator_worker(
                     workspace_root,
                     &worktree.layout.path,
-                    &pod_name,
+                    &worker_name,
                     runtime_command,
                 )
                 .await
                 {
                     Ok(profile) => {
                         OrchestratorLifecycleReport::with_state(OrchestratorPanelState::new(
-                            pod_name,
+                            worker_name,
                             OrchestratorPanelStatus::Spawned,
                             Some(format!("launched with profile {profile}; {worktree_note}")),
                         ))
                         .mark_reload()
                     }
                     Err(error) => OrchestratorLifecycleReport::unavailable(
-                        pod_name,
+                        worker_name,
                         format!("could not spawn workspace Orchestrator: {error}"),
                     ),
                 }
             }
             Err(error) => OrchestratorLifecycleReport::unavailable(
-                pod_name,
+                worker_name,
                 format!("could not prepare orchestration worktree: {error}"),
             ),
         },
         OrchestratorLifecyclePlan::Unavailable(message) => {
-            OrchestratorLifecycleReport::unavailable(pod_name, message)
+            OrchestratorLifecycleReport::unavailable(worker_name, message)
         }
     }
 }
 
 async fn restore_workspace_companion_pod(
     workspace_root: &Path,
-    pod_name: &str,
-    runtime_command: PodRuntimeCommand,
+    worker_name: &str,
+    runtime_command: WorkerRuntimeCommand,
 ) -> Result<(), client::SpawnError> {
     let config = SpawnConfig {
         runtime_command,
-        pod_name: pod_name.to_string(),
+        worker_name: worker_name.to_string(),
         profile: None,
         workspace_root: workspace_root.to_path_buf(),
         cwd: None,
         resume_from: None,
     };
-    spawn_pod(config, |_| {}).await.map(|_| ())
+    spawn_worker(config, |_| {}).await.map(|_| ())
 }
 
 async fn spawn_workspace_companion_pod(
     workspace_root: &Path,
-    pod_name: &str,
-    runtime_command: PodRuntimeCommand,
+    worker_name: &str,
+    runtime_command: WorkerRuntimeCommand,
 ) -> Result<(), client::SpawnError> {
     let config = SpawnConfig {
         runtime_command,
-        pod_name: pod_name.to_string(),
+        worker_name: worker_name.to_string(),
         profile: None,
         workspace_root: workspace_root.to_path_buf(),
         cwd: None,
         resume_from: None,
     };
-    spawn_pod(config, |_| {}).await.map(|_| ())
+    spawn_worker(config, |_| {}).await.map(|_| ())
 }
 
-async fn restore_orchestrator_pod(
+async fn restore_workspace_orchestrator_worker(
     original_workspace_root: &Path,
     workspace_root: &Path,
-    pod_name: &str,
-    runtime_command: PodRuntimeCommand,
+    worker_name: &str,
+    runtime_command: WorkerRuntimeCommand,
 ) -> Result<(), client::SpawnError> {
     let config = SpawnConfig {
         runtime_command,
-        pod_name: pod_name.to_string(),
+        worker_name: worker_name.to_string(),
         profile: None,
         workspace_root: original_workspace_root.to_path_buf(),
         cwd: Some(workspace_root.to_path_buf()),
         resume_from: None,
     };
-    spawn_pod_with_options(
+    spawn_worker_with_options(
         config,
-        PodProcessLaunchOptions::default().with_hidden_arg("--ticket-role", "orchestrator"),
+        WorkerProcessLaunchOptions::default().with_hidden_arg("--ticket-role", "orchestrator"),
         |_| {},
     )
     .await
     .map(|_| ())
 }
 
-async fn spawn_orchestrator_pod(
+async fn spawn_workspace_orchestrator_worker(
     original_workspace_root: &Path,
     orchestration_workspace_root: &Path,
-    pod_name: &str,
-    runtime_command: PodRuntimeCommand,
+    worker_name: &str,
+    runtime_command: WorkerRuntimeCommand,
 ) -> Result<String, client::TicketRoleLaunchError> {
     let context = build_orchestrator_launch_context(
         original_workspace_root,
         orchestration_workspace_root,
-        pod_name,
+        worker_name,
     );
-    let result = launch_ticket_role_pod(context, runtime_command, |_| {}).await?;
+    let result = launch_ticket_role_worker(context, runtime_command, |_| {}).await?;
     Ok(result.plan.profile)
 }
 
@@ -3357,7 +3393,7 @@ fn orchestrator_status_is_peer_reachable(status: OrchestratorPanelStatus) -> boo
     )
 }
 
-fn unique_preticket_intake_pod_name() -> String {
+fn unique_preticket_intake_worker_name() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -3367,33 +3403,33 @@ fn unique_preticket_intake_pod_name() -> String {
 
 fn existing_ticket_claim_notice(
     ticket_id: &str,
-    pod_name: &str,
+    worker_name: &str,
     status: TicketLocalClaimStatus,
 ) -> String {
     match status {
         TicketLocalClaimStatus::Live | TicketLocalClaimStatus::Restorable => format!(
-            "Ticket {ticket_id} is already claimed by local Intake Pod {pod_name} ({}); open that Pod instead of starting a second Intake.",
+            "Ticket {ticket_id} is already claimed by local Intake Worker {worker_name} ({}); open that Worker instead of starting a second Intake.",
             status.label()
         ),
         TicketLocalClaimStatus::Stale => format!(
-            "Ticket {ticket_id} has a stale local Intake claim for {pod_name}; explicit reclaim/diagnostic is required before starting a replacement."
+            "Ticket {ticket_id} has a stale local Intake claim for {worker_name}; explicit reclaim/diagnostic is required before starting a replacement."
         ),
     }
 }
 
-async fn load_pod_list(
+async fn load_worker_list(
     selected_name: Option<String>,
     max_entries: usize,
-) -> Result<PodList, DashboardError> {
+) -> Result<WorkerList, DashboardError> {
     let store_dir = default_store_dir()?;
     let store = FsStore::new(&store_dir)?;
-    let pod_store = FsPodStore::new(default_pod_store_dir()?).map_err(io::Error::other)?;
-    let stored = read_stored_pod_infos(&store, &pod_store)?;
+    let pod_store = FsWorkerStore::new(default_pod_store_dir()?).map_err(io::Error::other)?;
+    let stored = read_stored_worker_infos(&store, &pod_store)?;
     let live = read_reachable_live_pod_infos(&store)
         .await
         .unwrap_or_default();
-    Ok(PodList::from_workspace_sources(
-        PodVisibilitySource::ResumePicker,
+    Ok(WorkerList::from_workspace_sources(
+        WorkerVisibilitySource::ResumePicker,
         stored,
         live,
         selected_name,
@@ -3404,7 +3440,7 @@ async fn load_pod_list(
 
 #[derive(Debug, Clone)]
 pub(crate) struct CompanionSendRequest {
-    pub(crate) pod_name: String,
+    pub(crate) worker_name: String,
     pub(crate) socket_path: PathBuf,
     pub(crate) segments: Vec<Segment>,
 }
@@ -3417,45 +3453,60 @@ pub(crate) struct CompanionSendOutcome {
 #[derive(Debug)]
 pub(crate) enum CompanionSendError {
     Connect {
-        pod_name: String,
+        worker_name: String,
         source: std::io::Error,
     },
     Write {
-        pod_name: String,
+        worker_name: String,
         source: std::io::Error,
     },
     Read {
-        pod_name: String,
+        worker_name: String,
         source: std::io::Error,
     },
     Rejected {
-        pod_name: String,
+        worker_name: String,
         message: String,
     },
     Closed {
-        pod_name: String,
+        worker_name: String,
     },
 }
 
 impl fmt::Display for CompanionSendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Connect { pod_name, source } => {
-                write!(f, "Companion {pod_name} is unreachable: {source}")
+            Self::Connect {
+                worker_name,
+                source,
+            } => {
+                write!(f, "Companion {worker_name} is unreachable: {source}")
             }
-            Self::Write { pod_name, source } => {
-                write!(f, "Failed to send to Companion {pod_name}: {source}")
+            Self::Write {
+                worker_name,
+                source,
+            } => {
+                write!(f, "Failed to send to Companion {worker_name}: {source}")
             }
-            Self::Read { pod_name, source } => {
-                write!(f, "Failed while waiting for Companion {pod_name}: {source}")
-            }
-            Self::Rejected { pod_name, message } => {
-                write!(f, "Companion {pod_name} rejected the message: {message}")
-            }
-            Self::Closed { pod_name } => {
+            Self::Read {
+                worker_name,
+                source,
+            } => {
                 write!(
                     f,
-                    "Companion {pod_name} closed the socket before accepting the message"
+                    "Failed while waiting for Companion {worker_name}: {source}"
+                )
+            }
+            Self::Rejected {
+                worker_name,
+                message,
+            } => {
+                write!(f, "Companion {worker_name} rejected the message: {message}")
+            }
+            Self::Closed { worker_name } => {
+                write!(
+                    f,
+                    "Companion {worker_name} closed the socket before accepting the message"
                 )
             }
         }
@@ -3474,13 +3525,13 @@ pub(crate) struct TicketActionRequest {
 
 #[derive(Debug, Clone)]
 struct OrchestratorNotifyTarget {
-    pod_name: String,
+    worker_name: String,
     socket_path: PathBuf,
 }
 
 fn orchestrator_queue_attention_notice_target(
     panel: &WorkspacePanelViewModel,
-    list: &PodList,
+    list: &WorkerList,
 ) -> Option<OrchestratorNotifyTarget> {
     let orchestrator = panel.header.orchestrator.as_ref()?;
     if !matches!(orchestrator.status, OrchestratorPanelStatus::Live) {
@@ -3489,16 +3540,16 @@ fn orchestrator_queue_attention_notice_target(
     let entry = list
         .entries
         .iter()
-        .find(|entry| entry.name == orchestrator.pod_name)?;
+        .find(|entry| entry.name == orchestrator.worker_name)?;
     if !entry.actions.can_open {
         return None;
     }
     let live = entry.live.as_ref()?;
-    if !live.reachable || live.status != Some(PodStatus::Idle) {
+    if !live.reachable || live.status != Some(WorkerStatus::Idle) {
         return None;
     }
     Some(OrchestratorNotifyTarget {
-        pod_name: orchestrator.pod_name.clone(),
+        worker_name: orchestrator.worker_name.clone(),
         socket_path: live.socket_path.clone(),
     })
 }
@@ -3604,13 +3655,17 @@ fn queued_duplicate_guard(
         guards.push(format!(
             "local {} claim {} ({})",
             claim.role,
-            claim.pod_name,
+            claim.worker_name,
             claim.status.label()
         ));
     }
-    for pod in ticket.related_pods.iter().chain(row.related_pods.iter()) {
-        if !guards.iter().any(|guard| guard.contains(pod)) {
-            guards.push(format!("related pod/worktree {pod}"));
+    for worker in ticket
+        .related_workers
+        .iter()
+        .chain(row.related_workers.iter())
+    {
+        if !guards.iter().any(|guard| guard.contains(worker)) {
+            guards.push(format!("related worker/worktree {worker}"));
         }
     }
     if let Some(overlay) = ticket.orchestration_overlay.as_ref() {
@@ -3624,7 +3679,7 @@ fn queued_duplicate_guard(
         None
     } else {
         Some(format!(
-            "waiting on existing role/session or visible pod/worktree before duplicate start: {}",
+            "waiting on existing role/session or visible worker/worktree before duplicate start: {}",
             guards.join(", ")
         ))
     }
@@ -3840,7 +3895,7 @@ async fn dispatch_orchestrator_queue_attention_notice(
         }
         Err(err) => OrchestratorQueueAttentionNoticeResult::failed(
             fingerprint,
-            format!("{}: {}", request.pod_name, err),
+            format!("{}: {}", request.worker_name, err),
         ),
     }
 }
@@ -3926,7 +3981,7 @@ async fn dispatch_ready_ticket_planning_return(
             }
         }
         ReadyTicketPlanningReturnFollowup::NotifyLiveClaimedIntake {
-            pod_name,
+            worker_name,
             socket_path,
         } => {
             let message =
@@ -3934,35 +3989,35 @@ async fn dispatch_ready_ticket_planning_return(
             match send_notify_only(&socket_path, message, true).await {
                 Ok(()) => ReadyTicketPlanningReturnOutcome {
                     notice: format!(
-                        "Ticket {} returned to planning for refinement; notified live Intake Pod {}.",
-                        ticket.meta.id, pod_name
+                        "Ticket {} returned to planning for refinement; notified live Intake Worker {}.",
+                        ticket.meta.id, worker_name
                     ),
                     followup: ReadyTicketPlanningReturnAfterMutation::None,
                 },
                 Err(error) => ReadyTicketPlanningReturnOutcome {
                     notice: bounded_panel_diagnostic(format!(
-                        "Ticket {} returned to planning and instruction was recorded, but notifying Intake Pod {} failed: {}",
-                        ticket.meta.id, pod_name, error
+                        "Ticket {} returned to planning and instruction was recorded, but notifying Intake Worker {} failed: {}",
+                        ticket.meta.id, worker_name, error
                     )),
                     followup: ReadyTicketPlanningReturnAfterMutation::None,
                 },
             }
         }
         ReadyTicketPlanningReturnFollowup::OpenRestorableClaimedIntake(request) => {
-            let pod_name = request.pod_name.clone();
+            let worker_name = request.worker_name.clone();
             ReadyTicketPlanningReturnOutcome {
                 notice: format!(
-                    "Ticket {} returned to planning for refinement; opening/restoring claimed Intake Pod {}…",
-                    ticket.meta.id, pod_name
+                    "Ticket {} returned to planning for refinement; opening/restoring claimed Intake Worker {}…",
+                    ticket.meta.id, worker_name
                 ),
                 followup: ReadyTicketPlanningReturnAfterMutation::OpenClaim(request),
             }
         }
-        ReadyTicketPlanningReturnFollowup::BlockedByStaleClaim { pod_name } => {
+        ReadyTicketPlanningReturnFollowup::BlockedByStaleClaim { worker_name } => {
             ReadyTicketPlanningReturnOutcome {
                 notice: bounded_panel_diagnostic(format!(
-                    "Ticket {} returned to planning and instruction was recorded, but Intake launch was not attempted because existing Intake claim {} is stale; inspect or clear the local claim before launching another Intake Pod.",
-                    ticket.meta.id, pod_name
+                    "Ticket {} returned to planning and instruction was recorded, but Intake launch was not attempted because existing Intake claim {} is stale; inspect or clear the local claim before launching another Intake Worker.",
+                    ticket.meta.id, worker_name
                 )),
                 followup: ReadyTicketPlanningReturnAfterMutation::None,
             }
@@ -3997,7 +4052,7 @@ impl std::error::Error for TicketActionError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OrchestratorNotificationOutcome {
-    Sent { pod_name: String },
+    Sent { worker_name: String },
     Skipped(String),
     Warning(String),
 }
@@ -4005,7 +4060,7 @@ enum OrchestratorNotificationOutcome {
 impl OrchestratorNotificationOutcome {
     fn sentence(&self) -> String {
         match self {
-            Self::Sent { pod_name } => format!("workspace Orchestrator {pod_name} notified"),
+            Self::Sent { worker_name } => format!("workspace Orchestrator {worker_name} notified"),
             Self::Skipped(reason) => format!("workspace Orchestrator not notified: {reason}"),
             Self::Warning(message) => {
                 format!("workspace Orchestrator notification warning: {message}")
@@ -4016,7 +4071,7 @@ impl OrchestratorNotificationOutcome {
 
 fn ticket_action_orchestrator_target(
     panel: &WorkspacePanelViewModel,
-    list: &PodList,
+    list: &WorkerList,
 ) -> Option<OrchestratorNotifyTarget> {
     let orchestrator = panel.header.orchestrator.as_ref()?;
     if !orchestrator_status_is_peer_reachable(orchestrator.status) {
@@ -4025,7 +4080,7 @@ fn ticket_action_orchestrator_target(
     let entry = list
         .entries
         .iter()
-        .find(|entry| entry.name == orchestrator.pod_name)?;
+        .find(|entry| entry.name == orchestrator.worker_name)?;
     if !entry.actions.can_open {
         return None;
     }
@@ -4034,7 +4089,7 @@ fn ticket_action_orchestrator_target(
         return None;
     }
     Some(OrchestratorNotifyTarget {
-        pod_name: orchestrator.pod_name.clone(),
+        worker_name: orchestrator.worker_name.clone(),
         socket_path: live.socket_path.clone(),
     })
 }
@@ -4063,8 +4118,8 @@ async fn dispatch_ticket_action(
     if request.action == NextUserAction::Close {
         return dispatch_panel_close(&backend, &request.ticket_id);
     }
-    let authority_pods = PodList::from_sources(
-        PodVisibilitySource::ResumePicker,
+    let authority_pods = WorkerList::from_sources(
+        WorkerVisibilitySource::ResumePicker,
         Vec::new(),
         Vec::new(),
         None,
@@ -4099,7 +4154,7 @@ async fn dispatch_ticket_action(
             .await
         }
         NextUserAction::Close => unreachable!("Close action is handled before row dispatch"),
-        NextUserAction::Clarify | NextUserAction::OpenPod | NextUserAction::Wait => {
+        NextUserAction::Clarify | NextUserAction::OpenWorker | NextUserAction::Wait => {
             Ok(TicketActionOutcome {
                 notice: format!(
                     "{} for Ticket {} has no safe inline workspace-panel dispatch; use the Ticket workflow.",
@@ -4893,7 +4948,7 @@ fn orchestrator_queue_notification_message(
 ) -> String {
     let title = ticket.title.replace(['\r', '\n'], " ");
     format!(
-        "Workspace Dashboard Queue for Ticket `{}`, title `{}`: human authorized Orchestrator routing; this is not an unattended scheduler. Read the Ticket and inspect current Orchestrator workspace state. If unblocked, record routing and transition state queued -> inprogress before any worktree/SpawnPod implementation side effects. After inprogress acceptance, use worktree-workflow for `.worktree/<task-name>` creation with tracked `.yoi` project records visible and `.yoi/memory` plus local/runtime/log/lock/secret-like `.yoi` paths excluded, then use multi-agent-workflow to run sibling coder/reviewer Pods (coder narrow child-worktree write scope, reviewer read-only by default). After reviewer approval and blocker resolution, integrate the implementation branch into the orchestration branch automatically, validate in the Orchestrator worktree, record the outcome, and clean up only child implementation worktrees/branches. Do not read, write, validate, merge, clean up, or run git operations in the root/original workspace. If blocked, record a concise reason and leave the Ticket queued or return it to planning with the missing-information reason.",
+        "Workspace Dashboard Queue for Ticket `{}`, title `{}`: human authorized Orchestrator routing; this is not an unattended scheduler. Read the Ticket and inspect current Orchestrator workspace state. If unblocked, record routing and transition state queued -> inprogress before any worktree/SpawnWorker implementation side effects. After inprogress acceptance, use worktree-workflow for `.worktree/<task-name>` creation with tracked `.yoi` project records visible and `.yoi/memory` plus local/runtime/log/lock/secret-like `.yoi` paths excluded, then use multi-agent-workflow to run sibling coder/reviewer Pods (coder narrow child-worktree write scope, reviewer read-only by default). After reviewer approval and blocker resolution, integrate the implementation branch into the orchestration branch automatically, validate in the Orchestrator worktree, record the outcome, and clean up only child implementation worktrees/branches. Do not read, write, validate, merge, clean up, or run git operations in the root/original workspace. If blocked, record a concise reason and leave the Ticket queued or return it to planning with the missing-information reason.",
         ticket.id,
         title.trim()
     )
@@ -4911,11 +4966,11 @@ async fn notify_workspace_orchestrator(
     let message = orchestrator_queue_notification_message(ticket);
     match send_notify_only(&target.socket_path, message, true).await {
         Ok(()) => OrchestratorNotificationOutcome::Sent {
-            pod_name: target.pod_name,
+            worker_name: target.worker_name,
         },
         Err(error) => OrchestratorNotificationOutcome::Warning(format!(
             "{} at {}: {}",
-            target.pod_name,
+            target.worker_name,
             target.socket_path.display(),
             error
         )),
@@ -4999,23 +5054,23 @@ fn selected_ticket_notice(row: Option<&PanelRow>) -> String {
                 row.title
             )
         }
-        Some(row) if row.kind == PanelRowKind::TicketIntakePod => row
+        Some(row) if row.kind == PanelRowKind::TicketIntakeWorker => row
             .disabled_reason
             .clone()
             .or_else(|| row.key_hint.clone())
             .unwrap_or_else(|| {
-                "Open/attach this Ticket's Intake Pod from the associated row.".to_string()
+                "Open/attach this Ticket's Intake Worker from the associated row.".to_string()
             }),
         Some(row) if row.kind == PanelRowKind::InvalidTicket => row
             .disabled_reason
             .clone()
             .or_else(|| row.key_hint.clone())
             .unwrap_or_else(|| "Invalid Ticket record placeholder has no actions.".to_string()),
-        _ => "No Pod is selected.".to_string(),
+        _ => "No Worker is selected.".to_string(),
     }
 }
 
-fn row_status_label(entry: &PodListEntry) -> (&'static str, Style) {
+fn row_status_label(entry: &WorkerListEntry) -> (&'static str, Style) {
     if let Some(live) = entry.live.as_ref() {
         if !live.reachable {
             return (
@@ -5024,19 +5079,19 @@ fn row_status_label(entry: &PodListEntry) -> (&'static str, Style) {
             );
         }
         return match live.status {
-            Some(PodStatus::Idle) => (
+            Some(WorkerStatus::Idle) => (
                 "live idle",
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
-            Some(PodStatus::Running) => (
+            Some(WorkerStatus::Running) => (
                 "live running",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Some(PodStatus::Paused) => (
+            Some(WorkerStatus::Paused) => (
                 "live paused",
                 Style::default()
                     .fg(Color::Cyan)
@@ -5079,7 +5134,7 @@ impl DashboardSection {
     }
 }
 
-fn classify_entry(entry: &PodListEntry) -> DashboardSectionKind {
+fn classify_entry(entry: &WorkerListEntry) -> DashboardSectionKind {
     if entry.live.is_some() {
         if entry.actions.can_send_now {
             DashboardSectionKind::Pending
@@ -5091,7 +5146,7 @@ fn classify_entry(entry: &PodListEntry) -> DashboardSectionKind {
     }
 }
 
-fn sectioned_entries(list: &PodList) -> Vec<DashboardSection> {
+fn sectioned_entries(list: &WorkerList) -> Vec<DashboardSection> {
     let mut pending = DashboardSection {
         kind: DashboardSectionKind::Pending,
         entries: Vec::new(),
@@ -5116,14 +5171,14 @@ fn sectioned_entries(list: &PodList) -> Vec<DashboardSection> {
     vec![pending, working, closed]
 }
 
-fn visible_entry_indices(list: &PodList) -> Vec<usize> {
+fn visible_entry_indices(list: &WorkerList) -> Vec<usize> {
     sectioned_entries(list)
         .into_iter()
         .flat_map(|section| visible_section_indices(&section))
         .collect()
 }
 
-fn visible_panel_keys(panel: &WorkspacePanelViewModel, list: &PodList) -> Vec<PanelRowKey> {
+fn visible_panel_keys(panel: &WorkspacePanelViewModel, list: &WorkerList) -> Vec<PanelRowKey> {
     let mut keys = panel
         .rows
         .iter()
@@ -5134,7 +5189,7 @@ fn visible_panel_keys(panel: &WorkspacePanelViewModel, list: &PodList) -> Vec<Pa
         visible_entry_indices(list)
             .into_iter()
             .filter_map(|index| list.entries.get(index))
-            .map(|entry| PanelRowKey::Pod(entry.name.clone())),
+            .map(|entry| PanelRowKey::Worker(entry.name.clone())),
     );
     keys
 }

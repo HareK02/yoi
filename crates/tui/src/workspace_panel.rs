@@ -4,7 +4,7 @@ use std::process::Command;
 #[cfg(feature = "e2e-test")]
 use std::time::Instant;
 
-use protocol::PodStatus;
+use protocol::WorkerStatus;
 use ticket::config::{
     DEFAULT_TICKET_BACKEND_RELATIVE_PATH, TICKET_CONFIG_RELATIVE_PATH, TicketConfig,
     TicketOrchestrationConfig,
@@ -14,8 +14,8 @@ use ticket::{
     TicketInvalidRecord, TicketMeta, TicketRelationBlocker, TicketSummary, TicketWorkflowState,
 };
 
-use crate::pod_list::{PodList, PodListEntry, StoredMetadataState};
 use crate::role_session_registry::{PanelRegistrySnapshot, PanelRegistryStore};
+use crate::worker_list::{StoredMetadataState, WorkerList, WorkerListEntry};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkspacePanelViewModel {
@@ -100,19 +100,19 @@ impl WorkspacePanelComposer {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompanionPanelState {
-    pub(crate) pod_name: String,
+    pub(crate) worker_name: String,
     pub(crate) status: CompanionPanelStatus,
     pub(crate) detail: Option<String>,
 }
 
 impl CompanionPanelState {
     pub(crate) fn new(
-        pod_name: impl Into<String>,
+        worker_name: impl Into<String>,
         status: CompanionPanelStatus,
         detail: Option<String>,
     ) -> Self {
         Self {
-            pod_name: pod_name.into(),
+            worker_name: worker_name.into(),
             status,
             detail,
         }
@@ -144,19 +144,19 @@ impl CompanionPanelStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OrchestratorPanelState {
-    pub(crate) pod_name: String,
+    pub(crate) worker_name: String,
     pub(crate) status: OrchestratorPanelStatus,
     pub(crate) detail: Option<String>,
 }
 
 impl OrchestratorPanelState {
     pub(crate) fn new(
-        pod_name: impl Into<String>,
+        worker_name: impl Into<String>,
         status: OrchestratorPanelStatus,
         detail: Option<String>,
     ) -> Self {
         Self {
-            pod_name: pod_name.into(),
+            worker_name: worker_name.into(),
             status,
             detail,
         }
@@ -190,14 +190,20 @@ impl OrchestratorPanelStatus {
 pub(crate) enum PanelRowKey {
     Ticket(String),
     InvalidTicket(String),
-    TicketIntakePod { ticket_id: String, pod_name: String },
-    Pod(String),
+    TicketIntakeWorker {
+        ticket_id: String,
+        worker_name: String,
+    },
+    Worker(String),
 }
 
 impl PanelRowKey {
-    pub(crate) fn pod_name(&self) -> Option<&str> {
+    pub(crate) fn worker_name(&self) -> Option<&str> {
         match self {
-            Self::Pod(name) | Self::TicketIntakePod { pod_name: name, .. } => Some(name),
+            Self::Worker(name)
+            | Self::TicketIntakeWorker {
+                worker_name: name, ..
+            } => Some(name),
             Self::Ticket(_) | Self::InvalidTicket(_) => None,
         }
     }
@@ -209,8 +215,8 @@ pub(crate) enum PanelRowKind {
     Ticket,
     Review,
     ActiveWork,
-    TicketIntakePod,
-    Pod,
+    TicketIntakeWorker,
+    Worker,
     InvalidTicket,
 }
 
@@ -227,7 +233,7 @@ pub(crate) enum NextUserAction {
     Queue,
     Close,
     Wait,
-    OpenPod,
+    OpenWorker,
 }
 
 impl NextUserAction {
@@ -237,7 +243,7 @@ impl NextUserAction {
             Self::Queue => "Queue",
             Self::Close => "Close",
             Self::Wait => "Wait",
-            Self::OpenPod => "Open",
+            Self::OpenWorker => "Open",
         }
     }
 }
@@ -255,9 +261,9 @@ pub(crate) struct TicketPanelEntry {
     pub(crate) latest_event_kind: Option<String>,
     pub(crate) latest_event_excerpt: Option<String>,
     pub(crate) blocked_reason: Option<String>,
-    pub(crate) related_pods: Vec<String>,
+    pub(crate) related_workers: Vec<String>,
     pub(crate) local_claim: Option<TicketLocalClaimEntry>,
-    pub(crate) intake_pods: Vec<TicketAssociatedIntakeEntry>,
+    pub(crate) intake_workers: Vec<TicketAssociatedIntakeEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,7 +275,7 @@ pub(crate) struct TicketStateOverlay {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TicketAssociatedIntakeEntry {
     pub(crate) ticket_id: String,
-    pub(crate) pod_name: String,
+    pub(crate) worker_name: String,
     pub(crate) status: TicketLocalClaimStatus,
     pub(crate) source: TicketAssociatedIntakeSource,
 }
@@ -291,7 +297,7 @@ impl TicketAssociatedIntakeSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TicketLocalClaimEntry {
-    pub(crate) pod_name: String,
+    pub(crate) worker_name: String,
     pub(crate) role: String,
     pub(crate) status: TicketLocalClaimStatus,
 }
@@ -323,7 +329,7 @@ pub(crate) struct PanelRow {
     pub(crate) priority: ActionPriority,
     pub(crate) next_action: Option<NextUserAction>,
     pub(crate) ticket: Option<TicketPanelEntry>,
-    pub(crate) related_pods: Vec<String>,
+    pub(crate) related_workers: Vec<String>,
     pub(crate) disabled_reason: Option<String>,
     pub(crate) key_hint: Option<String>,
 }
@@ -343,7 +349,7 @@ impl PanelRow {
         self.is_ticket_action()
             || matches!(
                 self.kind,
-                PanelRowKind::TicketIntakePod | PanelRowKind::InvalidTicket
+                PanelRowKind::TicketIntakeWorker | PanelRowKind::InvalidTicket
             )
     }
 }
@@ -361,7 +367,7 @@ pub(crate) enum TicketConfigAvailability {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CompanionPodPresence {
+pub(crate) enum CompanionWorkerPresence {
     Live,
     Restorable,
     Missing,
@@ -377,7 +383,7 @@ pub(crate) enum CompanionLifecyclePlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum OrchestratorPodPresence {
+pub(crate) enum OrchestratorWorkerPresence {
     Live,
     Restorable,
     Missing,
@@ -414,29 +420,29 @@ struct OrchestrationWorktreeLayout {
     branch: String,
 }
 
-pub(crate) fn workspace_companion_pod_name(workspace_root: &Path) -> String {
+pub(crate) fn workspace_companion_worker_name(workspace_root: &Path) -> String {
     let seed = workspace_root
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("workspace");
-    sanitise_pod_name_component(seed, MAX_POD_NAME_CHARS)
+    sanitise_worker_name_component(seed, MAX_POD_NAME_CHARS)
         .filter(|component| !component.is_empty())
         .unwrap_or_else(|| "workspace".to_string())
 }
 
-pub(crate) fn workspace_orchestrator_pod_name(workspace_root: &Path) -> String {
+pub(crate) fn workspace_orchestrator_worker_name(workspace_root: &Path) -> String {
     let seed = workspace_root
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("workspace");
     let max_component_chars = MAX_POD_NAME_CHARS.saturating_sub(ORCHESTRATOR_SUFFIX.len());
-    let component = sanitise_pod_name_component(seed, max_component_chars)
+    let component = sanitise_worker_name_component(seed, max_component_chars)
         .filter(|component| !component.is_empty())
         .unwrap_or_else(|| "workspace".to_string());
     format!("{component}{ORCHESTRATOR_SUFFIX}")
 }
 
-fn sanitise_pod_name_component(value: &str, max_chars: usize) -> Option<String> {
+fn sanitise_worker_name_component(value: &str, max_chars: usize) -> Option<String> {
     let mut out = String::new();
     let mut last_was_dash = false;
     for ch in value.trim().chars() {
@@ -463,15 +469,22 @@ fn sanitise_pod_name_component(value: &str, max_chars: usize) -> Option<String> 
     }
 }
 
-pub(crate) fn companion_pod_presence(pod_name: &str, pods: &PodList) -> CompanionPodPresence {
-    let Some(entry) = pods.entries.iter().find(|entry| entry.name == pod_name) else {
-        return CompanionPodPresence::Missing;
+pub(crate) fn companion_pod_presence(
+    worker_name: &str,
+    workers: &WorkerList,
+) -> CompanionWorkerPresence {
+    let Some(entry) = workers
+        .entries
+        .iter()
+        .find(|entry| entry.name == worker_name)
+    else {
+        return CompanionWorkerPresence::Missing;
     };
     if entry.live.as_ref().is_some_and(|live| live.reachable) {
-        return CompanionPodPresence::Live;
+        return CompanionWorkerPresence::Live;
     }
     if entry.actions.can_restore {
-        return CompanionPodPresence::Restorable;
+        return CompanionWorkerPresence::Restorable;
     }
     let reason = entry
         .actions
@@ -483,32 +496,39 @@ pub(crate) fn companion_pod_presence(pod_name: &str, pods: &PodList) -> Companio
                 .first()
                 .map(|diagnostic| diagnostic.message.clone())
         })
-        .unwrap_or_else(|| "pod state is not live, restorable, or spawn-safe".to_string());
-    CompanionPodPresence::Unavailable(reason)
+        .unwrap_or_else(|| "worker state is not live, restorable, or spawn-safe".to_string());
+    CompanionWorkerPresence::Unavailable(reason)
 }
 
 pub(crate) fn decide_companion_lifecycle(
-    presence: &CompanionPodPresence,
+    presence: &CompanionWorkerPresence,
 ) -> CompanionLifecyclePlan {
     match presence {
-        CompanionPodPresence::Live => CompanionLifecyclePlan::ReportLive,
-        CompanionPodPresence::Restorable => CompanionLifecyclePlan::Restore,
-        CompanionPodPresence::Missing => CompanionLifecyclePlan::Spawn,
-        CompanionPodPresence::Unavailable(message) => CompanionLifecyclePlan::Unavailable(format!(
-            "Workspace Companion Pod state is unusable: {message}"
-        )),
+        CompanionWorkerPresence::Live => CompanionLifecyclePlan::ReportLive,
+        CompanionWorkerPresence::Restorable => CompanionLifecyclePlan::Restore,
+        CompanionWorkerPresence::Missing => CompanionLifecyclePlan::Spawn,
+        CompanionWorkerPresence::Unavailable(message) => CompanionLifecyclePlan::Unavailable(
+            format!("Workspace Companion Worker state is unusable: {message}"),
+        ),
     }
 }
 
-pub(crate) fn orchestrator_pod_presence(pod_name: &str, pods: &PodList) -> OrchestratorPodPresence {
-    let Some(entry) = pods.entries.iter().find(|entry| entry.name == pod_name) else {
-        return OrchestratorPodPresence::Missing;
+pub(crate) fn workspace_orchestrator_worker_presence(
+    worker_name: &str,
+    workers: &WorkerList,
+) -> OrchestratorWorkerPresence {
+    let Some(entry) = workers
+        .entries
+        .iter()
+        .find(|entry| entry.name == worker_name)
+    else {
+        return OrchestratorWorkerPresence::Missing;
     };
     if entry.live.as_ref().is_some_and(|live| live.reachable) {
-        return OrchestratorPodPresence::Live;
+        return OrchestratorWorkerPresence::Live;
     }
     if entry.actions.can_restore {
-        return OrchestratorPodPresence::Restorable;
+        return OrchestratorWorkerPresence::Restorable;
     }
     let reason = entry
         .actions
@@ -520,13 +540,13 @@ pub(crate) fn orchestrator_pod_presence(pod_name: &str, pods: &PodList) -> Orche
                 .first()
                 .map(|diagnostic| diagnostic.message.clone())
         })
-        .unwrap_or_else(|| "pod state is not live, restorable, or spawn-safe".to_string());
-    OrchestratorPodPresence::Unavailable(reason)
+        .unwrap_or_else(|| "worker state is not live, restorable, or spawn-safe".to_string());
+    OrchestratorWorkerPresence::Unavailable(reason)
 }
 
 pub(crate) fn decide_orchestrator_lifecycle(
     config: &TicketConfigAvailability,
-    presence: &OrchestratorPodPresence,
+    presence: &OrchestratorWorkerPresence,
 ) -> OrchestratorLifecyclePlan {
     match config {
         TicketConfigAvailability::Absent => OrchestratorLifecyclePlan::SkipNoTicketConfig,
@@ -534,12 +554,12 @@ pub(crate) fn decide_orchestrator_lifecycle(
             format!("Ticket config is unusable; workspace Orchestrator not started: {message}"),
         ),
         TicketConfigAvailability::Usable => match presence {
-            OrchestratorPodPresence::Live => OrchestratorLifecyclePlan::ReportLive,
-            OrchestratorPodPresence::Restorable => OrchestratorLifecyclePlan::Restore,
-            OrchestratorPodPresence::Missing => OrchestratorLifecyclePlan::Spawn,
-            OrchestratorPodPresence::Unavailable(message) => {
+            OrchestratorWorkerPresence::Live => OrchestratorLifecyclePlan::ReportLive,
+            OrchestratorWorkerPresence::Restorable => OrchestratorLifecyclePlan::Restore,
+            OrchestratorWorkerPresence::Missing => OrchestratorLifecyclePlan::Spawn,
+            OrchestratorWorkerPresence::Unavailable(message) => {
                 OrchestratorLifecyclePlan::Unavailable(format!(
-                    "Workspace Orchestrator Pod state is unusable: {message}"
+                    "Workspace Orchestrator Worker state is unusable: {message}"
                 ))
             }
         },
@@ -736,7 +756,7 @@ fn git_output(worktree_root: &Path, args: &[&str]) -> Result<String, String> {
 #[cfg_attr(feature = "e2e-test", allow(dead_code))]
 pub(crate) fn build_workspace_panel(
     workspace_root: &Path,
-    pods: &PodList,
+    workers: &WorkerList,
 ) -> WorkspacePanelViewModel {
     let registry = match PanelRegistryStore::default_for_workspace(workspace_root)
         .and_then(|store| store.snapshot())
@@ -753,12 +773,12 @@ pub(crate) fn build_workspace_panel(
             return build_workspace_panel_with_registry_model(
                 model,
                 workspace_root,
-                pods,
+                workers,
                 &PanelRegistrySnapshot::empty(),
             );
         }
     };
-    build_workspace_panel_with_registry(workspace_root, pods, &registry)
+    build_workspace_panel_with_registry(workspace_root, workers, &registry)
 }
 
 #[cfg(feature = "e2e-test")]
@@ -771,7 +791,7 @@ pub(crate) struct WorkspacePanelE2eSourceTiming {
 #[cfg(feature = "e2e-test")]
 pub(crate) fn build_workspace_panel_with_e2e_timings(
     workspace_root: &Path,
-    pods: &PodList,
+    workers: &WorkerList,
 ) -> (WorkspacePanelViewModel, Vec<WorkspacePanelE2eSourceTiming>) {
     let mut timings = Vec::new();
     let started = Instant::now();
@@ -795,7 +815,7 @@ pub(crate) fn build_workspace_panel_with_e2e_timings(
                 build_workspace_panel_with_registry_model(
                     model,
                     workspace_root,
-                    pods,
+                    workers,
                     &PanelRegistrySnapshot::empty(),
                 ),
                 timings,
@@ -839,7 +859,7 @@ pub(crate) fn build_workspace_panel_with_e2e_timings(
                     let started = Instant::now();
                     match build_ticket_rows(
                         &backend,
-                        pods,
+                        workers,
                         &registry,
                         &orchestration_overlay.states,
                     ) {
@@ -895,7 +915,7 @@ pub(crate) fn build_workspace_panel_with_e2e_timings(
     }
 
     let started = Instant::now();
-    model.rows.extend(pod_rows(pods));
+    model.rows.extend(worker_rows(workers));
     timings.push(WorkspacePanelE2eSourceTiming {
         source: "pod_row_materialization",
         elapsed_ms: started.elapsed().as_millis(),
@@ -905,21 +925,21 @@ pub(crate) fn build_workspace_panel_with_e2e_timings(
 
 fn build_workspace_panel_with_registry(
     workspace_root: &Path,
-    pods: &PodList,
+    workers: &WorkerList,
     registry: &PanelRegistrySnapshot,
 ) -> WorkspacePanelViewModel {
     let model = WorkspacePanelViewModel::empty(workspace_root);
-    build_workspace_panel_with_registry_model(model, workspace_root, pods, registry)
+    build_workspace_panel_with_registry_model(model, workspace_root, workers, registry)
 }
 
 fn build_workspace_panel_with_registry_model(
     mut model: WorkspacePanelViewModel,
     workspace_root: &Path,
-    pods: &PodList,
+    workers: &WorkerList,
     registry: &PanelRegistrySnapshot,
 ) -> WorkspacePanelViewModel {
-    let pods = pods.filter_for_workspace(workspace_root);
-    let pods = &pods;
+    let workers = workers.filter_for_workspace(workspace_root);
+    let workers = &workers;
     match ticket_config_availability(workspace_root) {
         TicketConfigAvailability::Absent => {}
         TicketConfigAvailability::Usable => {
@@ -932,8 +952,12 @@ fn build_workspace_panel_with_registry_model(
                         .with_record_language(config.ticket_record_language());
                     let orchestration_overlay =
                         load_orchestration_ticket_overlay(workspace_root, &config);
-                    match build_ticket_rows(&backend, pods, registry, &orchestration_overlay.states)
-                    {
+                    match build_ticket_rows(
+                        &backend,
+                        workers,
+                        registry,
+                        &orchestration_overlay.states,
+                    ) {
                         Ok(ticket_rows) => {
                             model.rows.extend(ticket_rows.rows);
                             model.header.diagnostics.extend(ticket_rows.diagnostics);
@@ -971,14 +995,14 @@ fn build_workspace_panel_with_registry_model(
         }
     }
 
-    model.rows.extend(pod_rows(pods));
+    model.rows.extend(worker_rows(workers));
     model
 }
 
 pub(crate) fn build_current_ticket_row(
     backend: &LocalTicketBackend,
     ticket_id: &str,
-    pods: &PodList,
+    workers: &WorkerList,
 ) -> ticket::Result<PanelRow> {
     let ticket = backend.show(TicketIdOrSlug::Id(ticket_id.to_owned()))?;
     if ticket.meta.workflow_state == TicketWorkflowState::Closed {
@@ -992,7 +1016,7 @@ pub(crate) fn build_current_ticket_row(
         summary,
         &ticket.events,
         &ticket.relations.blockers,
-        pods,
+        workers,
         &registry,
         None,
     ))
@@ -1024,7 +1048,7 @@ struct TicketRowsBuild {
 
 fn build_ticket_rows(
     backend: &LocalTicketBackend,
-    pods: &PodList,
+    workers: &WorkerList,
     registry: &PanelRegistrySnapshot,
     orchestration_overlay: &BTreeMap<String, TicketStateOverlay>,
 ) -> ticket::Result<TicketRowsBuild> {
@@ -1050,7 +1074,7 @@ fn build_ticket_rows(
                     summary,
                     &ticket.ticket.events,
                     &ticket.ticket.relations.blockers,
-                    pods,
+                    workers,
                     registry,
                     overlay,
                 ));
@@ -1070,7 +1094,7 @@ fn build_ticket_rows(
 
     let mut rows = Vec::new();
     for row in ticket_rows {
-        let intake_rows = ticket_intake_pod_rows(&row);
+        let intake_rows = ticket_intake_worker_rows(&row);
         rows.push(row);
         rows.extend(intake_rows);
     }
@@ -1131,7 +1155,7 @@ fn invalid_ticket_row(record: &TicketInvalidRecord) -> PanelRow {
         priority: ActionPriority::Background,
         next_action: None,
         ticket: None,
-        related_pods: Vec::new(),
+        related_workers: Vec::new(),
         disabled_reason: Some(
             "Invalid Ticket record is diagnostics-only; lifecycle actions are disabled."
                 .to_string(),
@@ -1146,20 +1170,26 @@ fn ticket_row(
     summary: TicketSummary,
     events: &[TicketEvent],
     relation_blockers: &[TicketRelationBlocker],
-    pods: &PodList,
+    workers: &WorkerList,
     registry: &PanelRegistrySnapshot,
     orchestration_overlay: Option<&TicketStateOverlay>,
 ) -> PanelRow {
-    let local_claim = local_claim_for_ticket(&summary, pods, registry);
-    let intake_pods =
-        associated_intake_entries_for_ticket(&summary, pods, registry, local_claim.as_ref());
-    let mut related_pods = Vec::new();
+    let local_claim = local_claim_for_ticket(&summary, workers, registry);
+    let intake_workers =
+        associated_intake_entries_for_ticket(&summary, workers, registry, local_claim.as_ref());
+    let mut related_workers = Vec::new();
     if let Some(claim) = local_claim.as_ref() {
-        related_pods.push(claim.pod_name.clone());
+        related_workers.push(claim.worker_name.clone());
     }
-    for pod_name in intake_pods.iter().map(|intake| intake.pod_name.clone()) {
-        if !related_pods.iter().any(|existing| existing == &pod_name) {
-            related_pods.push(pod_name);
+    for worker_name in intake_workers
+        .iter()
+        .map(|intake| intake.worker_name.clone())
+    {
+        if !related_workers
+            .iter()
+            .any(|existing| existing == &worker_name)
+        {
+            related_workers.push(worker_name);
         }
     }
     let visible_overlay = orchestration_overlay
@@ -1185,9 +1215,9 @@ fn ticket_row(
         latest_event_kind: latest_event.map(|event| event.kind.as_str().to_string()),
         latest_event_excerpt: latest_event.and_then(|event| excerpt(event.body.as_str(), 72)),
         blocked_reason: derived.blocked_reason.clone(),
-        related_pods: related_pods.clone(),
+        related_workers: related_workers.clone(),
         local_claim,
-        intake_pods,
+        intake_workers,
     };
     let subtitle = ticket_subtitle(&entry);
     PanelRow {
@@ -1199,7 +1229,7 @@ fn ticket_row(
         priority: derived.priority,
         next_action: derived.action,
         ticket: Some(entry),
-        related_pods,
+        related_workers,
         disabled_reason: derived.disabled_reason,
         key_hint: derived.key_hint,
     }
@@ -1442,7 +1472,7 @@ fn derive_ticket_state(
 
 fn associated_intake_entries_for_ticket(
     summary: &TicketSummary,
-    pods: &PodList,
+    workers: &WorkerList,
     registry: &PanelRegistrySnapshot,
     local_claim: Option<&TicketLocalClaimEntry>,
 ) -> Vec<TicketAssociatedIntakeEntry> {
@@ -1450,7 +1480,7 @@ fn associated_intake_entries_for_ticket(
     if let Some(claim) = local_claim.filter(|claim| is_intake_role(&claim.role)) {
         entries.push(TicketAssociatedIntakeEntry {
             ticket_id: summary.id.clone(),
-            pod_name: claim.pod_name.clone(),
+            worker_name: claim.worker_name.clone(),
             status: claim.status,
             source: TicketAssociatedIntakeSource::LocalClaim,
         });
@@ -1466,19 +1496,19 @@ fn associated_intake_entries_for_ticket(
                     .iter()
                     .any(|related| related.id == summary.id.as_str())
         })
-        .map(|session| session.pod_name.clone())
+        .map(|session| session.worker_name.clone())
         .collect::<Vec<_>>();
     related_sessions.sort();
     related_sessions.dedup();
 
-    for pod_name in related_sessions {
-        if entries.iter().any(|entry| entry.pod_name == pod_name) {
+    for worker_name in related_sessions {
+        if entries.iter().any(|entry| entry.worker_name == worker_name) {
             continue;
         }
         entries.push(TicketAssociatedIntakeEntry {
             ticket_id: summary.id.clone(),
-            status: local_claim_status_for_pod(&pod_name, pods),
-            pod_name,
+            status: local_claim_status_for_pod(&worker_name, workers),
+            worker_name,
             source: TicketAssociatedIntakeSource::RelatedSession,
         });
         if entries.len() >= MAX_ASSOCIATED_INTAKE_ROWS_PER_TICKET {
@@ -1494,12 +1524,12 @@ fn is_intake_role(role: &str) -> bool {
     role.eq_ignore_ascii_case("intake")
 }
 
-fn ticket_intake_pod_rows(row: &PanelRow) -> Vec<PanelRow> {
+fn ticket_intake_worker_rows(row: &PanelRow) -> Vec<PanelRow> {
     row.ticket
         .as_ref()
         .map(|ticket| {
             ticket
-                .intake_pods
+                .intake_workers
                 .iter()
                 .map(ticket_intake_pod_row)
                 .collect()
@@ -1510,12 +1540,12 @@ fn ticket_intake_pod_rows(row: &PanelRow) -> Vec<PanelRow> {
 fn ticket_intake_pod_row(intake: &TicketAssociatedIntakeEntry) -> PanelRow {
     let stale = intake.status == TicketLocalClaimStatus::Stale;
     PanelRow {
-        key: PanelRowKey::TicketIntakePod {
+        key: PanelRowKey::TicketIntakeWorker {
             ticket_id: intake.ticket_id.clone(),
-            pod_name: intake.pod_name.clone(),
+            worker_name: intake.worker_name.clone(),
         },
-        kind: PanelRowKind::TicketIntakePod,
-        title: format!("Intake Pod: {}", intake.pod_name),
+        kind: PanelRowKind::TicketIntakeWorker,
+        title: format!("Intake Worker: {}", intake.worker_name),
         subtitle: Some(format!(
             "Ticket {} · {} · {}",
             intake.ticket_id,
@@ -1527,13 +1557,13 @@ fn ticket_intake_pod_row(intake: &TicketAssociatedIntakeEntry) -> PanelRow {
         next_action: if stale {
             None
         } else {
-            Some(NextUserAction::OpenPod)
+            Some(NextUserAction::OpenWorker)
         },
         ticket: None,
-        related_pods: vec![intake.pod_name.clone()],
+        related_workers: vec![intake.worker_name.clone()],
         disabled_reason: if stale {
             Some(
-                "Associated Intake Pod is stale; no live or restorable Pod entry is available."
+                "Associated Intake Worker is stale; no live or restorable Worker entry is available."
                     .to_string(),
             )
         } else {
@@ -1542,27 +1572,34 @@ fn ticket_intake_pod_row(intake: &TicketAssociatedIntakeEntry) -> PanelRow {
         key_hint: Some(if stale {
             "Stale Intake claim/session; restore is unavailable".to_string()
         } else {
-            "Open/attach this Ticket's Intake Pod".to_string()
+            "Open/attach this Ticket's Intake Worker".to_string()
         }),
     }
 }
 
 fn local_claim_for_ticket(
     summary: &TicketSummary,
-    pods: &PodList,
+    workers: &WorkerList,
     registry: &PanelRegistrySnapshot,
 ) -> Option<TicketLocalClaimEntry> {
     let claim = registry.claim_for_ticket(&summary.id)?;
-    let status = local_claim_status_for_pod(&claim.pod_name, pods);
+    let status = local_claim_status_for_pod(&claim.worker_name, workers);
     Some(TicketLocalClaimEntry {
-        pod_name: claim.pod_name.clone(),
+        worker_name: claim.worker_name.clone(),
         role: claim.role.clone(),
         status,
     })
 }
 
-pub(crate) fn local_claim_status_for_pod(pod_name: &str, pods: &PodList) -> TicketLocalClaimStatus {
-    let Some(entry) = pods.entries.iter().find(|entry| entry.name == pod_name) else {
+pub(crate) fn local_claim_status_for_pod(
+    worker_name: &str,
+    workers: &WorkerList,
+) -> TicketLocalClaimStatus {
+    let Some(entry) = workers
+        .entries
+        .iter()
+        .find(|entry| entry.name == worker_name)
+    else {
         return TicketLocalClaimStatus::Stale;
     };
     if entry.live.as_ref().is_some_and(|live| live.reachable) {
@@ -1583,12 +1620,12 @@ fn ticket_subtitle(entry: &TicketPanelEntry) -> Option<String> {
     if let Some(claim) = entry.local_claim.as_ref() {
         parts.push(format!(
             "claim: {} ({})",
-            claim.pod_name,
+            claim.worker_name,
             claim.status.label()
         ));
     }
-    if !entry.related_pods.is_empty() {
-        parts.push(format!("pods: {}", entry.related_pods.join(", ")));
+    if !entry.related_workers.is_empty() {
+        parts.push(format!("workers: {}", entry.related_workers.join(", ")));
     }
     if let Some(excerpt) = entry.latest_event_excerpt.as_ref() {
         parts.push(format!("latest: {excerpt}"));
@@ -1596,14 +1633,14 @@ fn ticket_subtitle(entry: &TicketPanelEntry) -> Option<String> {
     Some(parts.join("  "))
 }
 
-fn pod_rows(pods: &PodList) -> Vec<PanelRow> {
-    pods.entries.iter().map(pod_row).collect()
+fn worker_rows(workers: &WorkerList) -> Vec<PanelRow> {
+    workers.entries.iter().map(pod_row).collect()
 }
 
-fn pod_row(entry: &PodListEntry) -> PanelRow {
-    let status = pod_status_label(entry).to_string();
+fn pod_row(entry: &WorkerListEntry) -> PanelRow {
+    let status = worker_status_label(entry).to_string();
     let next_action = if entry.actions.can_open {
-        Some(NextUserAction::OpenPod)
+        Some(NextUserAction::OpenWorker)
     } else {
         None
     };
@@ -1618,29 +1655,29 @@ fn pod_row(entry: &PodListEntry) -> PanelRow {
     }
 
     PanelRow {
-        key: PanelRowKey::Pod(entry.name.clone()),
-        kind: PanelRowKind::Pod,
+        key: PanelRowKey::Worker(entry.name.clone()),
+        kind: PanelRowKind::Worker,
         title: entry.name.clone(),
         subtitle,
         status,
         priority: ActionPriority::Background,
         next_action,
         ticket: None,
-        related_pods: Vec::new(),
+        related_workers: Vec::new(),
         disabled_reason: entry.actions.disabled_reason.clone(),
         key_hint: Some("Enter opens/attaches for inspection".to_string()),
     }
 }
 
-fn pod_status_label(entry: &PodListEntry) -> &'static str {
+fn worker_status_label(entry: &WorkerListEntry) -> &'static str {
     if let Some(live) = entry.live.as_ref() {
         if !live.reachable {
             return "unreachable";
         }
         return match live.status {
-            Some(PodStatus::Idle) => "live idle",
-            Some(PodStatus::Running) => "live running",
-            Some(PodStatus::Paused) => "live paused",
+            Some(WorkerStatus::Idle) => "live idle",
+            Some(WorkerStatus::Running) => "live running",
+            Some(WorkerStatus::Paused) => "live paused",
             None => "live",
         };
     }
@@ -1687,8 +1724,8 @@ fn excerpt(markdown: &str, max_chars: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pod_list::{LivePodInfo, PodEntrySummary, StoredPodInfo};
     use crate::role_session_registry::{PanelRegistryStore, RelatedTicketRef, RoleSessionOrigin};
+    use crate::worker_list::{LiveWorkerInfo, StoredWorkerInfo, WorkerEntrySummary};
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -1697,9 +1734,9 @@ mod tests {
         TicketWorkflowState,
     };
 
-    fn empty_pods() -> PodList {
-        PodList::from_sources(
-            crate::pod_list::PodVisibilitySource::ResumePicker,
+    fn empty_pods() -> WorkerList {
+        WorkerList::from_sources(
+            crate::worker_list::WorkerVisibilitySource::ResumePicker,
             vec![],
             vec![],
             None,
@@ -1831,11 +1868,11 @@ mod tests {
             .unwrap_or_else(|| panic!("missing row for {title}"))
     }
 
-    fn live_pods(workspace_root: &Path, names: &[&str]) -> PodList {
+    fn live_workers(workspace_root: &Path, names: &[&str]) -> WorkerList {
         let stored = names
             .iter()
-            .map(|name| StoredPodInfo {
-                pod_name: (*name).to_string(),
+            .map(|name| StoredWorkerInfo {
+                worker_name: (*name).to_string(),
                 metadata_state: StoredMetadataState::Present,
                 active_session_id: None,
                 active_segment_id: None,
@@ -1844,18 +1881,18 @@ mod tests {
                 preview: None,
             })
             .collect();
-        PodList::from_sources(
-            crate::pod_list::PodVisibilitySource::ResumePicker,
+        WorkerList::from_sources(
+            crate::worker_list::WorkerVisibilitySource::ResumePicker,
             stored,
             names
                 .iter()
-                .map(|name| LivePodInfo {
-                    pod_name: (*name).to_string(),
+                .map(|name| LiveWorkerInfo {
+                    worker_name: (*name).to_string(),
                     socket_path: PathBuf::from(format!("/tmp/{name}.sock")),
-                    status: Some(PodStatus::Idle),
+                    status: Some(WorkerStatus::Idle),
                     reachable: true,
                     segment_id: None,
-                    summary: PodEntrySummary::default(),
+                    summary: WorkerEntrySummary::default(),
                 })
                 .collect(),
             None,
@@ -1869,7 +1906,7 @@ mod tests {
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
         create_ticket(&backend, "Hidden Without Config", |_| {});
 
-        let model = build_workspace_panel(temp.path(), &live_pods(temp.path(), &["idle"]));
+        let model = build_workspace_panel(temp.path(), &live_workers(temp.path(), &["idle"]));
 
         assert!(model.header.diagnostics.is_empty());
         assert_eq!(
@@ -1877,7 +1914,7 @@ mod tests {
             vec![ComposerTarget::Companion]
         );
         assert_eq!(model.rows.len(), 1);
-        assert_eq!(model.rows[0].key, PanelRowKey::Pod("idle".to_string()));
+        assert_eq!(model.rows[0].key, PanelRowKey::Worker("idle".to_string()));
         assert!(model.rows[0].ticket.is_none());
     }
 
@@ -2083,7 +2120,7 @@ mod tests {
             .unwrap();
         let model = build_workspace_panel_with_registry(
             temp.path(),
-            &live_pods(temp.path(), &["ready-intake"]),
+            &live_workers(temp.path(), &["ready-intake"]),
             &registry.snapshot().unwrap(),
         );
 
@@ -2097,9 +2134,9 @@ mod tests {
         assert!(ready_row.is_ticket_action());
         assert_eq!(
             model.rows[ready_index + 1].key,
-            PanelRowKey::TicketIntakePod {
+            PanelRowKey::TicketIntakeWorker {
                 ticket_id: ready.id.clone(),
-                pod_name: "ready-intake".to_string(),
+                worker_name: "ready-intake".to_string(),
             }
         );
 
@@ -2201,7 +2238,7 @@ mod tests {
         )
         .unwrap();
 
-        let model = build_workspace_panel(temp.path(), &live_pods(temp.path(), &["idle"]));
+        let model = build_workspace_panel(temp.path(), &live_workers(temp.path(), &["idle"]));
 
         let diagnostics = model.header.diagnostics.join("\n");
         assert!(diagnostics.contains("Ticket config is unusable"));
@@ -2219,7 +2256,7 @@ mod tests {
             model
                 .rows
                 .iter()
-                .any(|row| row.key == PanelRowKey::Pod("idle".to_string()))
+                .any(|row| row.key == PanelRowKey::Worker("idle".to_string()))
         );
     }
     #[test]
@@ -2393,7 +2430,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_panel_shows_ticket_associated_intake_pods_adjacent_to_ticket() {
+    fn workspace_panel_shows_ticket_associated_intake_workers_adjacent_to_ticket() {
         let temp = TempDir::new().unwrap();
         write_ticket_config(temp.path());
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
@@ -2434,12 +2471,15 @@ mod tests {
             )
             .unwrap();
 
-        let pods = live_pods(
+        let workers = live_workers(
             temp.path(),
             &["claimed-intake", "shared-intake", &preticket_pod],
         );
-        let model =
-            build_workspace_panel_with_registry(temp.path(), &pods, &registry.snapshot().unwrap());
+        let model = build_workspace_panel_with_registry(
+            temp.path(),
+            &workers,
+            &registry.snapshot().unwrap(),
+        );
 
         let ticket_index = model
             .rows
@@ -2450,39 +2490,42 @@ mod tests {
         let ticket = ticket_row.ticket.as_ref().unwrap();
         assert_eq!(
             ticket
-                .intake_pods
+                .intake_workers
                 .iter()
-                .map(|entry| entry.pod_name.as_str())
+                .map(|entry| entry.worker_name.as_str())
                 .collect::<Vec<_>>(),
             vec!["claimed-intake", "shared-intake"]
         );
-        assert_eq!(ticket.related_pods, vec!["claimed-intake", "shared-intake"]);
+        assert_eq!(
+            ticket.related_workers,
+            vec!["claimed-intake", "shared-intake"]
+        );
         assert_eq!(
             model.rows[ticket_index + 1].key,
-            PanelRowKey::TicketIntakePod {
+            PanelRowKey::TicketIntakeWorker {
                 ticket_id: ticket_id.clone(),
-                pod_name: "claimed-intake".to_string(),
+                worker_name: "claimed-intake".to_string(),
             }
         );
         assert_eq!(
             model.rows[ticket_index + 1].kind,
-            PanelRowKind::TicketIntakePod
+            PanelRowKind::TicketIntakeWorker
         );
         assert_eq!(model.rows[ticket_index + 1].status, "live");
         assert_eq!(
             model.rows[ticket_index + 1].next_action,
-            Some(NextUserAction::OpenPod)
+            Some(NextUserAction::OpenWorker)
         );
         assert_eq!(
             model.rows[ticket_index + 2].key,
-            PanelRowKey::TicketIntakePod {
+            PanelRowKey::TicketIntakeWorker {
                 ticket_id: ticket_id.clone(),
-                pod_name: "shared-intake".to_string(),
+                worker_name: "shared-intake".to_string(),
             }
         );
         assert!(model.rows.iter().all(|row| {
-            row.kind != PanelRowKind::TicketIntakePod
-                || row.key.pod_name() != Some(preticket_pod.as_str())
+            row.kind != PanelRowKind::TicketIntakeWorker
+                || row.key.worker_name() != Some(preticket_pod.as_str())
         }));
     }
 
@@ -2501,7 +2544,7 @@ mod tests {
 
         let model = build_workspace_panel_with_registry(
             temp.path(),
-            &live_pods(temp.path(), &["ticket-claimed-intake"]),
+            &live_workers(temp.path(), &["ticket-claimed-intake"]),
             &registry,
         );
         let row = model
@@ -2511,9 +2554,9 @@ mod tests {
             .unwrap();
         let claim = row.ticket.as_ref().unwrap().local_claim.as_ref().unwrap();
 
-        assert_eq!(claim.pod_name, "ticket-claimed-intake");
+        assert_eq!(claim.worker_name, "ticket-claimed-intake");
         assert_eq!(claim.status, TicketLocalClaimStatus::Live);
-        assert_eq!(row.related_pods, vec!["ticket-claimed-intake"]);
+        assert_eq!(row.related_workers, vec!["ticket-claimed-intake"]);
         assert!(
             row.subtitle
                 .as_deref()
@@ -2523,45 +2566,45 @@ mod tests {
     }
 
     #[test]
-    fn workspace_companion_pod_name_is_workspace_basename_without_suffix() {
+    fn workspace_companion_worker_name_is_workspace_basename_without_suffix() {
         assert_eq!(
-            workspace_companion_pod_name(Path::new("/home/hare/Projects/yoi")),
+            workspace_companion_worker_name(Path::new("/home/hare/Projects/yoi")),
             "yoi"
         );
         assert_eq!(
-            workspace_companion_pod_name(Path::new("/tmp/Yoi Workspace")),
+            workspace_companion_worker_name(Path::new("/tmp/Yoi Workspace")),
             "yoi-workspace"
         );
         assert_eq!(
-            workspace_companion_pod_name(Path::new("/tmp/.strange_日本語!!")),
+            workspace_companion_worker_name(Path::new("/tmp/.strange_日本語!!")),
             "strange"
         );
         assert_eq!(
-            workspace_companion_pod_name(Path::new("/tmp/___")),
+            workspace_companion_worker_name(Path::new("/tmp/___")),
             "workspace"
         );
         let long = "a".repeat(120);
-        let name = workspace_companion_pod_name(&PathBuf::from(format!("/tmp/{long}")));
+        let name = workspace_companion_worker_name(&PathBuf::from(format!("/tmp/{long}")));
         assert_eq!(name.chars().count(), 80);
         assert!(!name.ends_with("-companion"));
     }
 
     #[test]
-    fn companion_lifecycle_decisions_follow_pod_state_without_ticket_gate() {
+    fn companion_lifecycle_decisions_follow_worker_state_without_ticket_gate() {
         assert_eq!(
-            decide_companion_lifecycle(&CompanionPodPresence::Live),
+            decide_companion_lifecycle(&CompanionWorkerPresence::Live),
             CompanionLifecyclePlan::ReportLive
         );
         assert_eq!(
-            decide_companion_lifecycle(&CompanionPodPresence::Restorable),
+            decide_companion_lifecycle(&CompanionWorkerPresence::Restorable),
             CompanionLifecyclePlan::Restore
         );
         assert_eq!(
-            decide_companion_lifecycle(&CompanionPodPresence::Missing),
+            decide_companion_lifecycle(&CompanionWorkerPresence::Missing),
             CompanionLifecyclePlan::Spawn
         );
         assert!(matches!(
-            decide_companion_lifecycle(&CompanionPodPresence::Unavailable(
+            decide_companion_lifecycle(&CompanionWorkerPresence::Unavailable(
                 "corrupt metadata".to_string()
             )),
             CompanionLifecyclePlan::Unavailable(message) if message.contains("corrupt metadata")
@@ -2569,66 +2612,66 @@ mod tests {
     }
 
     #[test]
-    fn workspace_orchestrator_pod_name_is_stable_and_safe() {
+    fn workspace_orchestrator_worker_name_is_stable_and_safe() {
         assert_eq!(
-            workspace_orchestrator_pod_name(Path::new("/tmp/Yoi Workspace")),
+            workspace_orchestrator_worker_name(Path::new("/tmp/Yoi Workspace")),
             "yoi-workspace-orchestrator"
         );
         assert_eq!(
-            workspace_orchestrator_pod_name(Path::new("/tmp/.strange_日本語!!")),
+            workspace_orchestrator_worker_name(Path::new("/tmp/.strange_日本語!!")),
             "strange-orchestrator"
         );
         assert_eq!(
-            workspace_orchestrator_pod_name(Path::new("/tmp/___")),
+            workspace_orchestrator_worker_name(Path::new("/tmp/___")),
             "workspace-orchestrator"
         );
         let long = "a".repeat(120);
-        let name = workspace_orchestrator_pod_name(&PathBuf::from(format!("/tmp/{long}")));
+        let name = workspace_orchestrator_worker_name(&PathBuf::from(format!("/tmp/{long}")));
         assert_eq!(name.chars().count(), 80);
         assert!(name.ends_with("-orchestrator"));
     }
 
     #[test]
-    fn orchestrator_lifecycle_decisions_follow_ticket_gate_and_pod_state() {
+    fn orchestrator_lifecycle_decisions_follow_ticket_gate_and_worker_state() {
         assert_eq!(
             decide_orchestrator_lifecycle(
                 &TicketConfigAvailability::Absent,
-                &OrchestratorPodPresence::Missing,
+                &OrchestratorWorkerPresence::Missing,
             ),
             OrchestratorLifecyclePlan::SkipNoTicketConfig
         );
         assert!(matches!(
             decide_orchestrator_lifecycle(
                 &TicketConfigAvailability::Unusable("bad config".to_string()),
-                &OrchestratorPodPresence::Missing,
+                &OrchestratorWorkerPresence::Missing,
             ),
             OrchestratorLifecyclePlan::Unavailable(message) if message.contains("bad config")
         ));
         assert_eq!(
             decide_orchestrator_lifecycle(
                 &TicketConfigAvailability::Usable,
-                &OrchestratorPodPresence::Live,
+                &OrchestratorWorkerPresence::Live,
             ),
             OrchestratorLifecyclePlan::ReportLive
         );
         assert_eq!(
             decide_orchestrator_lifecycle(
                 &TicketConfigAvailability::Usable,
-                &OrchestratorPodPresence::Restorable,
+                &OrchestratorWorkerPresence::Restorable,
             ),
             OrchestratorLifecyclePlan::Restore
         );
         assert_eq!(
             decide_orchestrator_lifecycle(
                 &TicketConfigAvailability::Usable,
-                &OrchestratorPodPresence::Missing,
+                &OrchestratorWorkerPresence::Missing,
             ),
             OrchestratorLifecyclePlan::Spawn
         );
         assert!(matches!(
             decide_orchestrator_lifecycle(
                 &TicketConfigAvailability::Usable,
-                &OrchestratorPodPresence::Unavailable("corrupt metadata".to_string()),
+                &OrchestratorWorkerPresence::Unavailable("corrupt metadata".to_string()),
             ),
             OrchestratorLifecyclePlan::Unavailable(message) if message.contains("corrupt metadata")
         ));
@@ -2661,32 +2704,32 @@ mod tests {
     #[test]
     fn orchestrator_presence_can_be_decided_from_untruncated_authority() {
         let live = (0..60)
-            .map(|index| LivePodInfo {
-                pod_name: format!("pod-{index:02}"),
-                socket_path: PathBuf::from(format!("/tmp/pod-{index:02}.sock")),
-                status: Some(PodStatus::Idle),
+            .map(|index| LiveWorkerInfo {
+                worker_name: format!("worker-{index:02}"),
+                socket_path: PathBuf::from(format!("/tmp/worker-{index:02}.sock")),
+                status: Some(WorkerStatus::Idle),
                 reachable: true,
                 segment_id: None,
-                summary: PodEntrySummary::default(),
+                summary: WorkerEntrySummary::default(),
             })
-            .chain(std::iter::once(LivePodInfo {
-                pod_name: "zz-workspace-orchestrator".to_string(),
+            .chain(std::iter::once(LiveWorkerInfo {
+                worker_name: "zz-workspace-orchestrator".to_string(),
                 socket_path: PathBuf::from("/tmp/zz-workspace-orchestrator.sock"),
-                status: Some(PodStatus::Idle),
+                status: Some(WorkerStatus::Idle),
                 reachable: true,
                 segment_id: None,
-                summary: PodEntrySummary::default(),
+                summary: WorkerEntrySummary::default(),
             }))
             .collect::<Vec<_>>();
-        let visible = PodList::from_sources(
-            crate::pod_list::PodVisibilitySource::ResumePicker,
+        let visible = WorkerList::from_sources(
+            crate::worker_list::WorkerVisibilitySource::ResumePicker,
             vec![],
             live.clone(),
             None,
             50,
         );
-        let authority = PodList::from_sources(
-            crate::pod_list::PodVisibilitySource::ResumePicker,
+        let authority = WorkerList::from_sources(
+            crate::worker_list::WorkerVisibilitySource::ResumePicker,
             vec![],
             live,
             None,
@@ -2694,26 +2737,26 @@ mod tests {
         );
 
         assert_eq!(
-            orchestrator_pod_presence("zz-workspace-orchestrator", &visible),
-            OrchestratorPodPresence::Missing
+            workspace_orchestrator_worker_presence("zz-workspace-orchestrator", &visible),
+            OrchestratorWorkerPresence::Missing
         );
         assert_eq!(
-            orchestrator_pod_presence("zz-workspace-orchestrator", &authority),
-            OrchestratorPodPresence::Live
+            workspace_orchestrator_worker_presence("zz-workspace-orchestrator", &authority),
+            OrchestratorWorkerPresence::Live
         );
         assert_eq!(
             decide_orchestrator_lifecycle(
                 &TicketConfigAvailability::Usable,
-                &orchestrator_pod_presence("zz-workspace-orchestrator", &authority),
+                &workspace_orchestrator_worker_presence("zz-workspace-orchestrator", &authority),
             ),
             OrchestratorLifecyclePlan::ReportLive
         );
     }
 
-    fn mixed_workspace_pods(current: &Path, external: &Path) -> PodList {
+    fn mixed_workspace_pods(current: &Path, external: &Path) -> WorkerList {
         let stored = vec![
-            StoredPodInfo {
-                pod_name: "current".to_string(),
+            StoredWorkerInfo {
+                worker_name: "current".to_string(),
                 metadata_state: StoredMetadataState::Present,
                 active_session_id: None,
                 active_segment_id: None,
@@ -2721,8 +2764,8 @@ mod tests {
                 workspace_root: Some(current.to_path_buf()),
                 preview: None,
             },
-            StoredPodInfo {
-                pod_name: "current-coder".to_string(),
+            StoredWorkerInfo {
+                worker_name: "current-coder".to_string(),
                 metadata_state: StoredMetadataState::Present,
                 active_session_id: None,
                 active_segment_id: None,
@@ -2730,8 +2773,8 @@ mod tests {
                 workspace_root: Some(current.to_path_buf()),
                 preview: None,
             },
-            StoredPodInfo {
-                pod_name: "external".to_string(),
+            StoredWorkerInfo {
+                worker_name: "external".to_string(),
                 metadata_state: StoredMetadataState::Present,
                 active_session_id: None,
                 active_segment_id: None,
@@ -2739,8 +2782,8 @@ mod tests {
                 workspace_root: Some(external.to_path_buf()),
                 preview: None,
             },
-            StoredPodInfo {
-                pod_name: "legacy".to_string(),
+            StoredWorkerInfo {
+                worker_name: "legacy".to_string(),
                 metadata_state: StoredMetadataState::Present,
                 active_session_id: None,
                 active_segment_id: None,
@@ -2748,8 +2791,8 @@ mod tests {
                 workspace_root: None,
                 preview: None,
             },
-            StoredPodInfo {
-                pod_name: "corrupt".to_string(),
+            StoredWorkerInfo {
+                worker_name: "corrupt".to_string(),
                 metadata_state: StoredMetadataState::Corrupt("bad metadata".to_string()),
                 active_session_id: None,
                 active_segment_id: None,
@@ -2766,17 +2809,17 @@ mod tests {
             "live-only",
         ]
         .iter()
-        .map(|name| LivePodInfo {
-            pod_name: (*name).to_string(),
+        .map(|name| LiveWorkerInfo {
+            worker_name: (*name).to_string(),
             socket_path: PathBuf::from(format!("/tmp/{name}.sock")),
-            status: Some(PodStatus::Idle),
+            status: Some(WorkerStatus::Idle),
             reachable: true,
             segment_id: None,
-            summary: PodEntrySummary::default(),
+            summary: WorkerEntrySummary::default(),
         })
         .collect();
-        PodList::from_sources(
-            crate::pod_list::PodVisibilitySource::ResumePicker,
+        WorkerList::from_sources(
+            crate::worker_list::WorkerVisibilitySource::ResumePicker,
             stored,
             live,
             None,
@@ -2785,28 +2828,28 @@ mod tests {
     }
 
     #[test]
-    fn workspace_panel_filters_pod_rows_to_current_workspace_metadata() {
+    fn workspace_panel_filters_worker_rows_to_current_workspace_metadata() {
         let current = TempDir::new().unwrap();
         let external = TempDir::new().unwrap();
-        let pods = mixed_workspace_pods(current.path(), external.path());
+        let workers = mixed_workspace_pods(current.path(), external.path());
 
-        let model = build_workspace_panel(current.path(), &pods);
-        let pod_names = model
+        let model = build_workspace_panel(current.path(), &workers);
+        let worker_names = model
             .rows
             .iter()
             .filter_map(|row| match &row.key {
-                PanelRowKey::Pod(name) => Some(name.as_str()),
+                PanelRowKey::Worker(name) => Some(name.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(pod_names, vec!["current-coder", "current"]);
+        assert_eq!(worker_names, vec!["current-coder", "current"]);
         assert!(
             model
                 .rows
                 .iter()
-                .filter(|row| matches!(row.key, PanelRowKey::Pod(_)))
-                .all(|row| row.next_action == Some(NextUserAction::OpenPod))
+                .filter(|row| matches!(row.key, PanelRowKey::Worker(_)))
+                .all(|row| row.next_action == Some(NextUserAction::OpenWorker))
         );
     }
 }

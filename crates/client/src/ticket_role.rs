@@ -1,8 +1,8 @@
-//! Ticket-role Pod launch planning and execution.
+//! Ticket-role Worker launch planning and execution.
 //!
 //! This module keeps Ticket role configuration, generated first-run input, and
-//! host-side Pod spawning behind the `client` crate so UI callers do not need to
-//! depend on `pod` internals.
+//! host-side Worker spawning behind the `client` crate so UI callers do not need to
+//! depend on `worker` internals.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,8 +15,8 @@ pub use ticket::config::TicketRole;
 use ticket::config::{TicketConfig, TicketConfigError, TicketRoleLaunchConfigError};
 
 use crate::{
-    PodClient, PodProcessLaunchConfig, PodProcessLaunchOptions, PodRuntimeCommand, SpawnError,
-    SpawnReady, spawn_pod_with_options,
+    SpawnError, SpawnReady, WorkerClient, WorkerProcessLaunchConfig, WorkerProcessLaunchOptions,
+    WorkerRuntimeCommand, spawn_worker_with_options,
 };
 
 const MAX_FIELD_CHARS: usize = 8_000;
@@ -37,7 +37,7 @@ impl TicketRef {
         }
     }
 
-    fn pod_name_seed(&self) -> Option<&str> {
+    fn worker_name_seed(&self) -> Option<&str> {
         non_empty(self.id.as_deref())
     }
 
@@ -55,14 +55,17 @@ impl TicketRef {
 /// Auditable panel handoff target included in a Ticket Intake launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketIntakeHandoff {
-    pub orchestrator_pod: String,
+    pub workspace_orchestrator_worker: String,
     pub workspace_label: String,
 }
 
 impl TicketIntakeHandoff {
-    pub fn new(orchestrator_pod: impl Into<String>, workspace_label: impl Into<String>) -> Self {
+    pub fn new(
+        workspace_orchestrator_worker: impl Into<String>,
+        workspace_label: impl Into<String>,
+    ) -> Self {
         Self {
-            orchestrator_pod: orchestrator_pod.into(),
+            workspace_orchestrator_worker: workspace_orchestrator_worker.into(),
             workspace_label: workspace_label.into(),
         }
     }
@@ -70,7 +73,11 @@ impl TicketIntakeHandoff {
     fn append_submit_lines(&self, out: &mut String) {
         out.push_str("\nPanel handoff:\n");
         push_bounded_bullet(out, "workspace", &self.workspace_label);
-        push_bounded_bullet(out, "workspace_orchestrator_pod", &self.orchestrator_pod);
+        push_bounded_bullet(
+            out,
+            "workspace_workspace_orchestrator_worker",
+            &self.workspace_orchestrator_worker,
+        );
     }
 }
 
@@ -82,7 +89,7 @@ pub struct TicketRoleLaunchContext {
     pub original_workspace_root: Option<PathBuf>,
     pub target_workspace_root: Option<PathBuf>,
     pub role: TicketRole,
-    pub pod_name: Option<String>,
+    pub worker_name: Option<String>,
     pub ticket: Option<TicketRef>,
     pub user_instruction: Option<String>,
     pub intake_handoff: Option<TicketIntakeHandoff>,
@@ -102,7 +109,7 @@ impl TicketRoleLaunchContext {
             original_workspace_root: None,
             target_workspace_root: None,
             role,
-            pod_name: None,
+            worker_name: None,
             ticket: None,
             user_instruction: None,
             intake_handoff: None,
@@ -156,7 +163,7 @@ pub struct TicketRoleLaunchPlan {
     pub target_workspace_root: PathBuf,
     pub implementation_worktree_root: PathBuf,
     pub role: TicketRole,
-    pub pod_name: String,
+    pub worker_name: String,
     pub profile: String,
     pub workflow: String,
     pub launch_prompt_ref: Option<String>,
@@ -172,14 +179,14 @@ impl TicketRoleLaunchPlan {
 
     pub fn spawn_config(
         &self,
-        runtime_command: PodRuntimeCommand,
-    ) -> Result<PodProcessLaunchConfig, TicketRoleLaunchError> {
+        runtime_command: WorkerRuntimeCommand,
+    ) -> Result<WorkerProcessLaunchConfig, TicketRoleLaunchError> {
         if self.profile == "inherit" {
             return Err(TicketRoleLaunchError::UnsupportedInheritProfile);
         }
-        Ok(PodProcessLaunchConfig {
+        Ok(WorkerProcessLaunchConfig {
             runtime_command,
-            pod_name: self.pod_name.clone(),
+            worker_name: self.worker_name.clone(),
             profile: Some(self.profile.clone()),
             workspace_root: self.workspace_root.clone(),
             cwd: self.cwd.clone(),
@@ -187,8 +194,8 @@ impl TicketRoleLaunchPlan {
         })
     }
 
-    pub fn spawn_options(&self) -> PodProcessLaunchOptions {
-        PodProcessLaunchOptions::default()
+    pub fn spawn_options(&self) -> WorkerProcessLaunchOptions {
+        WorkerProcessLaunchOptions::default()
             .with_hidden_arg("--ticket-role", self.role.as_str().to_string())
     }
 }
@@ -208,7 +215,7 @@ pub struct TicketRoleLaunchResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketRoleLaunchAcceptanceEvidence {
-    pub pod_name: String,
+    pub worker_name: String,
     pub accepted_run_segments: usize,
     pub event: TicketRoleLaunchAcceptanceEvent,
 }
@@ -233,8 +240,8 @@ pub struct TicketRoleLaunchOptions {
 }
 
 impl TicketRoleLaunchOptions {
-    pub fn with_pre_run_peer_registration(mut self, pod_name: impl Into<String>) -> Self {
-        self.pre_run_peer_registrations.push(pod_name.into());
+    pub fn with_pre_run_peer_registration(mut self, worker_name: impl Into<String>) -> Self {
+        self.pre_run_peer_registrations.push(worker_name.into());
         self
     }
 }
@@ -253,30 +260,30 @@ pub enum TicketRoleLaunchError {
         selector: String,
         message: String,
     },
-    #[error("Ticket role Pod name must not be empty")]
-    EmptyPodName,
+    #[error("Ticket role Worker name must not be empty")]
+    EmptyWorkerName,
     #[error(
         "Ticket role profile 'inherit' cannot be used for top-level launch execution; configure a concrete role profile selector"
     )]
     UnsupportedInheritProfile,
     #[error(transparent)]
     Spawn(#[from] SpawnError),
-    #[error("failed to connect to spawned Ticket role Pod at {}: {source}", .socket_path.display())]
+    #[error("failed to connect to spawned Ticket role Worker at {}: {source}", .socket_path.display())]
     Connect {
         socket_path: PathBuf,
         #[source]
         source: io::Error,
     },
-    #[error("failed to send first run input to spawned Ticket role Pod: {source}")]
+    #[error("failed to send first run input to spawned Ticket role Worker: {source}")]
     SendRun {
         #[source]
         source: io::Error,
     },
-    #[error("Ticket role Pod rejected first run input with {code:?}: {message}")]
+    #[error("Ticket role Worker rejected first run input with {code:?}: {message}")]
     RunRejected { code: ErrorCode, message: String },
-    #[error("Ticket role Pod closed before confirming first run acceptance")]
+    #[error("Ticket role Worker closed before confirming first run acceptance")]
     RunAcceptanceClosed,
-    #[error("timed out waiting for Ticket role Pod to confirm first run acceptance")]
+    #[error("timed out waiting for Ticket role Worker to confirm first run acceptance")]
     RunAcceptanceTimeout,
 }
 
@@ -303,12 +310,17 @@ pub fn plan_ticket_role_launch_with_config(
         .launch_prompt
         .as_ref()
         .map(|prompt| prompt.as_str().to_string());
-    let pod_name = match context.pod_name.as_deref().map(str::trim) {
-        Some("") => return Err(TicketRoleLaunchError::EmptyPodName),
+    let worker_name = match context.worker_name.as_deref().map(str::trim) {
+        Some("") => return Err(TicketRoleLaunchError::EmptyWorkerName),
         Some(name) => name.to_string(),
-        None => default_pod_name(context.role, context.ticket.as_ref()),
+        None => default_worker_name(context.role, context.ticket.as_ref()),
     };
-    validate_ticket_role_profile(context.role, &profile, &context.workspace_root, &pod_name)?;
+    validate_ticket_role_profile(
+        context.role,
+        &profile,
+        &context.workspace_root,
+        &worker_name,
+    )?;
     let prompt = build_launch_prompt(&context);
 
     let original_workspace_root = context.original_workspace_root().to_path_buf();
@@ -322,7 +334,7 @@ pub fn plan_ticket_role_launch_with_config(
         target_workspace_root,
         implementation_worktree_root,
         role: context.role,
-        pod_name,
+        worker_name,
         profile,
         workflow: workflow.clone(),
         launch_prompt_ref,
@@ -339,7 +351,7 @@ fn validate_ticket_role_profile(
     role: TicketRole,
     profile: &str,
     workspace_root: &std::path::Path,
-    pod_name: &str,
+    worker_name: &str,
 ) -> Result<(), TicketRoleLaunchError> {
     let selector = ProfileSelector::parse_cli(profile);
     let registry = ProfileDiscovery::for_cwd(workspace_root)
@@ -354,7 +366,7 @@ fn validate_ticket_role_profile(
         .resolve_from_registry(
             &selector,
             &registry,
-            ProfileResolveOptions::with_pod_name(pod_name),
+            ProfileResolveOptions::with_worker_name(worker_name),
         )
         .map(|_| ())
         .map_err(|source| TicketRoleLaunchError::ProfileResolution {
@@ -364,17 +376,17 @@ fn validate_ticket_role_profile(
         })
 }
 
-/// Spawn the Pod, connect to its socket, send the first `Method::Run` input,
-/// and wait for bounded acceptance evidence from the Pod event stream.
-pub async fn launch_ticket_role_pod<F>(
+/// Spawn the Worker, connect to its socket, send the first `Method::Run` input,
+/// and wait for bounded acceptance evidence from the Worker event stream.
+pub async fn launch_ticket_role_worker<F>(
     context: TicketRoleLaunchContext,
-    runtime_command: PodRuntimeCommand,
+    runtime_command: WorkerRuntimeCommand,
     progress: F,
 ) -> Result<TicketRoleLaunchResult, TicketRoleLaunchError>
 where
     F: FnMut(&str),
 {
-    launch_ticket_role_pod_with_options(
+    launch_ticket_role_worker_with_options(
         context,
         runtime_command,
         progress,
@@ -383,11 +395,11 @@ where
     .await
 }
 
-/// Spawn the Pod, run bounded pre-run launch options while it is still idle,
+/// Spawn the Worker, run bounded pre-run launch options while it is still idle,
 /// then send the first `Method::Run` input and wait for acceptance evidence.
-pub async fn launch_ticket_role_pod_with_options<F>(
+pub async fn launch_ticket_role_worker_with_options<F>(
     context: TicketRoleLaunchContext,
-    runtime_command: PodRuntimeCommand,
+    runtime_command: WorkerRuntimeCommand,
     progress: F,
     options: TicketRoleLaunchOptions,
 ) -> Result<TicketRoleLaunchResult, TicketRoleLaunchError>
@@ -397,8 +409,8 @@ where
     let plan = plan_ticket_role_launch(context)?;
     let spawn_config = plan.spawn_config(runtime_command)?;
     let spawn_options = plan.spawn_options();
-    let ready = spawn_pod_with_options(spawn_config, spawn_options, progress).await?;
-    let mut client = PodClient::connect(&ready.socket_path)
+    let ready = spawn_worker_with_options(spawn_config, spawn_options, progress).await?;
+    let mut client = WorkerClient::connect(&ready.socket_path)
         .await
         .map_err(|source| TicketRoleLaunchError::Connect {
             socket_path: ready.socket_path.clone(),
@@ -408,7 +420,7 @@ where
     let acceptance_event =
         wait_for_run_acceptance(&mut client, &plan.run_segments, RUN_ACCEPTANCE_TIMEOUT).await?;
     let acceptance_evidence = TicketRoleLaunchAcceptanceEvidence {
-        pod_name: ready.pod_name.clone(),
+        worker_name: ready.worker_name.clone(),
         accepted_run_segments: plan.run_segments.len(),
         event: acceptance_event,
     };
@@ -421,7 +433,7 @@ where
 }
 
 async fn run_pre_run_options_then_send_run(
-    client: &mut PodClient,
+    client: &mut WorkerClient,
     plan: &TicketRoleLaunchPlan,
     options: &TicketRoleLaunchOptions,
 ) -> Result<Vec<TicketRolePreRunWarning>, TicketRoleLaunchError> {
@@ -439,7 +451,7 @@ async fn run_pre_run_options_then_send_run(
 }
 
 async fn perform_pre_run_peer_registrations(
-    client: &mut PodClient,
+    client: &mut WorkerClient,
     peer_names: &[String],
     timeout: Duration,
 ) -> Vec<TicketRolePreRunWarning> {
@@ -447,7 +459,7 @@ async fn perform_pre_run_peer_registrations(
     for peer_name in peer_names {
         if peer_name.trim().is_empty() {
             warnings.push(TicketRolePreRunWarning {
-                message: "pre-run peer registration skipped: peer Pod name is empty".to_string(),
+                message: "pre-run peer registration skipped: peer Worker name is empty".to_string(),
             });
             continue;
         }
@@ -459,7 +471,7 @@ async fn perform_pre_run_peer_registrations(
 }
 
 async fn pre_run_register_peer(
-    client: &mut PodClient,
+    client: &mut WorkerClient,
     peer_name: &str,
     timeout: Duration,
 ) -> Result<(), String> {
@@ -503,7 +515,7 @@ async fn pre_run_register_peer(
 }
 
 async fn wait_for_run_acceptance(
-    client: &mut PodClient,
+    client: &mut WorkerClient,
     expected_segments: &[Segment],
     timeout: Duration,
 ) -> Result<TicketRoleLaunchAcceptanceEvent, TicketRoleLaunchError> {
@@ -593,10 +605,10 @@ fn append_operation_targets(out: &mut String, context: &TicketRoleLaunchContext)
     );
 }
 
-fn default_pod_name(role: TicketRole, ticket: Option<&TicketRef>) -> String {
+fn default_worker_name(role: TicketRole, ticket: Option<&TicketRef>) -> String {
     let mut name = format!("ticket-{}", role.as_str());
-    if let Some(seed) = ticket.and_then(TicketRef::pod_name_seed) {
-        let suffix = sanitise_pod_name_component(seed);
+    if let Some(seed) = ticket.and_then(TicketRef::worker_name_seed) {
+        let suffix = sanitise_worker_name_component(seed);
         if !suffix.is_empty() {
             name.push('-');
             name.push_str(&suffix);
@@ -605,7 +617,7 @@ fn default_pod_name(role: TicketRole, ticket: Option<&TicketRef>) -> String {
     name.chars().take(MAX_POD_NAME_CHARS).collect()
 }
 
-fn sanitise_pod_name_component(value: &str) -> String {
+fn sanitise_worker_name_component(value: &str) -> String {
     let mut out = String::new();
     let mut last_was_dash = false;
     for ch in value.trim().chars() {
@@ -680,7 +692,7 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{Greeting, PodStatus};
+    use protocol::{Greeting, WorkerStatus};
     use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
@@ -723,7 +735,7 @@ mod tests {
         Event::Snapshot {
             entries: vec![],
             greeting: Greeting {
-                pod_name: "ticket-intake".to_string(),
+                worker_name: "ticket-intake".to_string(),
                 cwd: "/tmp".to_string(),
                 provider: "test".to_string(),
                 model: "test".to_string(),
@@ -732,7 +744,7 @@ mod tests {
                 context_window: 0,
                 context_tokens: 0,
             },
-            status: PodStatus::Idle,
+            status: WorkerStatus::Idle,
             in_flight: protocol::InFlightSnapshot::default(),
         }
     }
@@ -745,7 +757,7 @@ mod tests {
             target_workspace_root: workspace.to_path_buf(),
             implementation_worktree_root: workspace.join(".worktree"),
             role: TicketRole::Intake,
-            pod_name: "ticket-intake".to_string(),
+            worker_name: "ticket-intake".to_string(),
             profile: "project:intake".to_string(),
             workflow: "ticket-intake-workflow".to_string(),
             launch_prompt_ref: None,
@@ -758,7 +770,7 @@ mod tests {
     #[tokio::test]
     async fn pre_run_peer_registration_is_sent_before_first_run_submission() {
         let temp = TempDir::new().unwrap();
-        let socket_path = temp.path().join("pod.sock");
+        let socket_path = temp.path().join("worker.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -793,7 +805,7 @@ mod tests {
             }
         });
 
-        let mut client = PodClient::connect(&socket_path).await.unwrap();
+        let mut client = WorkerClient::connect(&socket_path).await.unwrap();
         let options = TicketRoleLaunchOptions::default()
             .with_pre_run_peer_registration("workspace-orchestrator");
         let warnings = run_pre_run_options_then_send_run(
@@ -811,7 +823,7 @@ mod tests {
     #[tokio::test]
     async fn pre_run_peer_registration_failure_warns_but_still_sends_run() {
         let temp = TempDir::new().unwrap();
-        let socket_path = temp.path().join("pod.sock");
+        let socket_path = temp.path().join("worker.sock");
         let listener = UnixListener::bind(&socket_path).unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -842,7 +854,7 @@ mod tests {
             ));
         });
 
-        let mut client = PodClient::connect(&socket_path).await.unwrap();
+        let mut client = WorkerClient::connect(&socket_path).await.unwrap();
         let options = TicketRoleLaunchOptions::default()
             .with_pre_run_peer_registration("workspace-orchestrator");
         let warnings = run_pre_run_options_then_send_run(
@@ -863,7 +875,7 @@ mod tests {
     fn default_config_role_launch_plan_requires_explicit_role_config() {
         let temp = TempDir::new().unwrap();
         let mut context = TicketRoleLaunchContext::new(temp.path(), TicketRole::Coder);
-        context.ticket = Some(TicketRef::id("Ticket Role Pod Launcher"));
+        context.ticket = Some(TicketRef::id("Ticket Role Worker Launcher"));
 
         let err = plan_ticket_role_launch(context).unwrap_err();
 
@@ -1007,7 +1019,7 @@ profile = "builtin:default"
         plan.profile = "inherit".to_string();
 
         let err = plan
-            .spawn_config(PodRuntimeCommand::for_executable("/bin/yoi"))
+            .spawn_config(WorkerRuntimeCommand::for_executable("/bin/yoi"))
             .unwrap_err();
 
         assert!(matches!(
@@ -1030,14 +1042,14 @@ workflow = "ticket-review-workflow"
 "#,
         );
         let mut context = TicketRoleLaunchContext::new(temp.path(), TicketRole::Reviewer);
-        context.pod_name = Some("reviewer-fixed".to_string());
-        context.ticket = Some(TicketRef::id("20260605-190330-ticket-role-pod-launcher"));
+        context.worker_name = Some("reviewer-fixed".to_string());
+        context.ticket = Some(TicketRef::id("20260605-190330-ticket-role-worker-launcher"));
         context.user_instruction = Some("Review the submitted implementation.".to_string());
 
         let plan = plan_ticket_role_launch(context).unwrap();
         let text = text_segment(&plan);
 
-        assert_eq!(plan.pod_name, "reviewer-fixed");
+        assert_eq!(plan.worker_name, "reviewer-fixed");
         assert_eq!(plan.profile, "builtin:default");
         assert_eq!(plan.workflow, "ticket-review-workflow");
         assert_eq!(
@@ -1055,13 +1067,13 @@ workflow = "ticket-review-workflow"
         assert!(!text.contains("Role: reviewer"));
         assert!(!text.contains("system_instruction"));
         assert!(text.contains("Target Ticket:"));
-        assert!(text.contains("id: 20260605-190330-ticket-role-pod-launcher"));
+        assert!(text.contains("id: 20260605-190330-ticket-role-worker-launcher"));
         assert!(text.contains("Action instruction:"));
         assert!(text.contains("Review the submitted implementation."));
         let spawn = plan
-            .spawn_config(PodRuntimeCommand::for_executable("/bin/yoi"))
+            .spawn_config(WorkerRuntimeCommand::for_executable("/bin/yoi"))
             .unwrap();
-        assert_eq!(spawn.pod_name, "reviewer-fixed");
+        assert_eq!(spawn.worker_name, "reviewer-fixed");
         assert_eq!(spawn.profile.as_deref(), Some("builtin:default"));
         assert_eq!(spawn.workspace_root, temp.path());
         assert!(spawn.cwd.is_none());
@@ -1102,7 +1114,10 @@ workflow = "ticket-review-workflow"
         let handoff_plan = plan_ticket_role_launch(handoff_intake).unwrap();
         let handoff_text = text_segment(&handoff_plan);
         assert!(handoff_text.contains("Panel handoff:"));
-        assert!(handoff_text.contains("workspace_orchestrator_pod: panel-orchestrator-demo"));
+        assert!(
+            handoff_text
+                .contains("workspace_workspace_orchestrator_worker: panel-orchestrator-demo")
+        );
         assert!(handoff_text.contains("workspace: Demo workspace"));
         assert!(!handoff_text.contains("created_or_updated_ticket_id"));
         assert!(!handoff_text.contains("Ticket tool surface"));
@@ -1125,15 +1140,15 @@ workflow = "ticket-review-workflow"
         assert!(!orchestrator_text.contains("role_cwd"));
 
         let mut coder = TicketRoleLaunchContext::new(temp.path(), TicketRole::Coder);
-        coder.ticket = Some(TicketRef::id("20260605-190330-ticket-role-pod-launcher"));
+        coder.ticket = Some(TicketRef::id("20260605-190330-ticket-role-worker-launcher"));
         coder.worktree_path = Some(PathBuf::from("/tmp/yoi-code"));
-        coder.branch = Some("work/ticket-role-pod-launcher".into());
+        coder.branch = Some("work/ticket-role-worker-launcher".into());
         coder.validation = vec!["cargo test -p client ticket_role".into()];
         coder.report_expectations = vec!["implementation report with validation".into()];
         let coder_plan = plan_ticket_role_launch(coder).unwrap();
         let coder_text = text_segment(&coder_plan);
         assert!(coder_text.contains("path: /tmp/yoi-code"));
-        assert!(coder_text.contains("branch: work/ticket-role-pod-launcher"));
+        assert!(coder_text.contains("branch: work/ticket-role-worker-launcher"));
         assert!(coder_text.contains("cargo test -p client ticket_role"));
         assert!(coder_text.contains("implementation report with validation"));
         assert!(!coder_text.contains("provided child worktree/branch"));
@@ -1141,14 +1156,14 @@ workflow = "ticket-review-workflow"
         assert!(!coder_text.contains("Do not merge, push"));
 
         let mut reviewer = TicketRoleLaunchContext::new(temp.path(), TicketRole::Reviewer);
-        reviewer.ticket = Some(TicketRef::id("20260605-190330-ticket-role-pod-launcher"));
+        reviewer.ticket = Some(TicketRef::id("20260605-190330-ticket-role-worker-launcher"));
         reviewer.worktree_path = Some(PathBuf::from("/tmp/yoi-review"));
-        reviewer.branch = Some("work/ticket-role-pod-launcher".into());
+        reviewer.branch = Some("work/ticket-role-worker-launcher".into());
         reviewer.report_expectations = vec!["approve or request changes".into()];
         let reviewer_plan = plan_ticket_role_launch(reviewer).unwrap();
         let reviewer_text = text_segment(&reviewer_plan);
         assert!(reviewer_text.contains("path: /tmp/yoi-review"));
-        assert!(reviewer_text.contains("branch: work/ticket-role-pod-launcher"));
+        assert!(reviewer_text.contains("branch: work/ticket-role-worker-launcher"));
         assert!(reviewer_text.contains("approve or request changes"));
         assert!(!reviewer_text.contains("read-only by default"));
         assert!(!reviewer_text.contains("Orchestrator-side integration"));
@@ -1177,7 +1192,7 @@ workflow = "ticket-review-workflow"
         );
         assert_eq!(plan.target_workspace_root, temp.path().join("target"));
         let spawn_config = plan
-            .spawn_config(PodRuntimeCommand::for_executable("/bin/yoi"))
+            .spawn_config(WorkerRuntimeCommand::for_executable("/bin/yoi"))
             .unwrap();
         assert_eq!(spawn_config.workspace_root, temp.path());
         assert_eq!(spawn_config.cwd, None);
@@ -1194,15 +1209,15 @@ workflow = "ticket-review-workflow"
         assert!(!text.contains("Orchestrator implementation integration guidance"));
     }
     #[test]
-    fn caller_provided_pod_name_is_used_exactly() {
+    fn caller_provided_worker_name_is_used_exactly() {
         let temp = TempDir::new().unwrap();
         write_builtin_role_config(temp.path(), &[TicketRole::Intake]);
         let mut context = TicketRoleLaunchContext::new(temp.path(), TicketRole::Intake);
-        context.pod_name = Some("custom-intake-pod".into());
+        context.worker_name = Some("custom-intake-worker".into());
 
         let plan = plan_ticket_role_launch(context).unwrap();
 
-        assert_eq!(plan.pod_name, "custom-intake-pod");
+        assert_eq!(plan.worker_name, "custom-intake-worker");
     }
 
     #[test]

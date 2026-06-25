@@ -130,13 +130,13 @@ mod tests {
         let mut timeline = Timeline::new();
         timeline.on_tool_use_block(collector.clone());
 
-        timeline.dispatch(&Event::tool_use_start(0, "tool_empty", "ListPods"));
+        timeline.dispatch(&Event::tool_use_start(0, "tool_empty", "ListWorkers"));
         timeline.dispatch(&Event::tool_use_stop(0));
 
         let calls = collector.take_collected();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "tool_empty");
-        assert_eq!(calls[0].name, "ListPods");
+        assert_eq!(calls[0].name, "ListWorkers");
         assert!(calls[0].input.is_object());
         assert_eq!(
             calls[0].input,

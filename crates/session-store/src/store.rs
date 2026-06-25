@@ -8,8 +8,8 @@
 //! `< 1 KiB` line on local fs and completes well below a millisecond. Going
 //! through `tokio::fs` would force every caller — including `Engine`'s sync
 //! `on_history_append` callback — to bridge sync → async via a channel +
-//! drain task. Keeping the store sync lets the worker callback, Pod commit
-//! paths, and `PodInterceptor` all share one direct `append_entry` call.
+//! drain task. Keeping the store sync lets the worker callback, Worker commit
+//! paths, and `WorkerInterceptor` all share one direct `append_entry` call.
 
 use crate::event_trace::TraceEntry;
 use crate::segment_log::LogEntry;
@@ -81,7 +81,7 @@ pub trait Store: Send + Sync {
 
     /// Truncate a segment log to `entries_len` entries.
     ///
-    /// Used by Pod's submit-time empty-turn rollback after it has proven
+    /// Used by Worker's submit-time empty-turn rollback after it has proven
     /// that no LLM output from the accepted turn was materialized. The
     /// default implementation rewrites the retained prefix through
     /// `create_segment`, matching the append-only logical model while still

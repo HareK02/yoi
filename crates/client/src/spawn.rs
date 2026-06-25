@@ -1,13 +1,13 @@
-//! Pod runtime command をサブプロセスとして立ち上げ、`YOI-READY` を待つ
+//! Worker runtime command をサブプロセスとして立ち上げ、`YOI-READY` を待つ
 //! ハンドシェイク。
 //!
 //! - 親プロセス (TUI / GUI / E2E) は profile/default/typed restore flags を
-//!   指定してこの関数に渡す。pod はそれを受けて socket を bind し、stderr に
+//!   指定してこの関数に渡す。worker はそれを受けて socket を bind し、stderr に
 //!   `YOI-READY\t<name>\t<socket>` を吐く。
 //! - 待機中の stderr 行は `progress` コールバック越しに呼び出し側へ流す。
 //!   UI の進捗表示や E2E のログ収集はここで賄う。
 //! - `kill_on_drop = false` + `process_group(0)` により、親プロセス
-//!   ライフサイクルから切り離した detached pod を作る。ready 後の lifecycle
+//!   ライフサイクルから切り離した detached worker を作る。ready 後の lifecycle
 //!   管理は runtime ディレクトリ / socket を介して行う。
 
 use std::io;
@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use crate::PodRuntimeCommand;
+use crate::WorkerRuntimeCommand;
 use tokio::process::Command;
 use uuid::Uuid;
 
@@ -23,14 +23,14 @@ const READY_PREFIX: &str = "YOI-READY\t";
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PodProcessLaunchConfig {
-    pub runtime_command: PodRuntimeCommand,
-    /// `pod.name` として使う識別子。runtime ディレクトリ
-    /// (`manifest::paths::pod_runtime_dir`) の解決と、ready 行に乗る
+pub struct WorkerProcessLaunchConfig {
+    pub runtime_command: WorkerRuntimeCommand,
+    /// `worker.name` として使う識別子。runtime ディレクトリ
+    /// (`manifest::paths::worker_runtime_dir`) の解決と、ready 行に乗る
     /// 名前との突き合わせに使う。
-    pub pod_name: String,
-    /// Optional reusable Profile selector. Pod identity is always supplied
-    /// separately with `--pod`; profile selection must not imply a name.
+    pub worker_name: String,
+    /// Optional reusable Profile selector. Worker identity is always supplied
+    /// separately with `--worker`; profile selection must not imply a name.
     pub profile: Option<String>,
     /// Explicit runtime workspace root. The child receives it via
     /// `--workspace` so startup does not infer workspace identity from the
@@ -46,7 +46,7 @@ pub struct PodProcessLaunchConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct PodProcessLaunchOptions {
+pub struct WorkerProcessLaunchOptions {
     /// Extra child CLI arguments supplied by an upper resolver layer. The
     /// low-level launch config intentionally does not model Ticket IDs,
     /// Ticket roles, orchestration roles, executable authority, or raw
@@ -54,7 +54,7 @@ pub struct PodProcessLaunchOptions {
     pub extra_args: Vec<String>,
 }
 
-impl PodProcessLaunchOptions {
+impl WorkerProcessLaunchOptions {
     pub fn with_hidden_arg(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.extra_args.extend([name.into(), value.into()]);
         self
@@ -65,11 +65,11 @@ impl PodProcessLaunchOptions {
     }
 }
 
-pub type SpawnConfig = PodProcessLaunchConfig;
+pub type SpawnConfig = WorkerProcessLaunchConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnReady {
-    pub pod_name: String,
+    pub worker_name: String,
     pub socket_path: PathBuf,
 }
 
@@ -79,10 +79,10 @@ pub enum SpawnError {
     /// runtime ディレクトリが解決できなかった (環境変数未設定等)。
     RuntimeDirUnavailable,
     PodLaunchFailed {
-        command: PodRuntimeCommand,
+        command: WorkerRuntimeCommand,
         source: io::Error,
     },
-    PodExitedEarly {
+    WorkerExitedEarly {
         stderr_tail: String,
     },
     Timeout,
@@ -98,18 +98,18 @@ impl std::fmt::Display for SpawnError {
             ),
             Self::PodLaunchFailed { command, source } => write!(
                 f,
-                "failed to launch pod runtime command `{command}`: {source}"
+                "failed to launch worker runtime command `{command}`: {source}"
             ),
-            Self::PodExitedEarly { stderr_tail } => {
+            Self::WorkerExitedEarly { stderr_tail } => {
                 if stderr_tail.is_empty() {
-                    write!(f, "pod exited before becoming ready")
+                    write!(f, "worker exited before becoming ready")
                 } else {
-                    write!(f, "pod exited before becoming ready: {stderr_tail}")
+                    write!(f, "worker exited before becoming ready: {stderr_tail}")
                 }
             }
             Self::Timeout => write!(
                 f,
-                "pod did not become ready within {}s",
+                "worker did not become ready within {}s",
                 READY_TIMEOUT.as_secs()
             ),
         }
@@ -120,7 +120,7 @@ impl std::error::Error for SpawnError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) | Self::PodLaunchFailed { source: error, .. } => Some(error),
-            Self::RuntimeDirUnavailable | Self::PodExitedEarly { .. } | Self::Timeout => None,
+            Self::RuntimeDirUnavailable | Self::WorkerExitedEarly { .. } | Self::Timeout => None,
         }
     }
 }
@@ -131,7 +131,10 @@ impl From<io::Error> for SpawnError {
     }
 }
 
-fn runtime_args(config: &PodProcessLaunchConfig, options: &PodProcessLaunchOptions) -> Vec<String> {
+fn runtime_args(
+    config: &WorkerProcessLaunchConfig,
+    options: &WorkerProcessLaunchOptions,
+) -> Vec<String> {
     let mut args = vec![
         "--workspace".to_string(),
         config.workspace_root.display().to_string(),
@@ -140,11 +143,11 @@ fn runtime_args(config: &PodProcessLaunchConfig, options: &PodProcessLaunchOptio
         args.extend([
             "--session".to_string(),
             id.to_string(),
-            "--pod".to_string(),
-            config.pod_name.clone(),
+            "--worker".to_string(),
+            config.worker_name.clone(),
         ]);
     } else {
-        args.extend(["--pod".to_string(), config.pod_name.clone()]);
+        args.extend(["--worker".to_string(), config.worker_name.clone()]);
         if let Some(profile) = &config.profile {
             args.extend(["--profile".to_string(), profile.clone()]);
         }
@@ -153,32 +156,32 @@ fn runtime_args(config: &PodProcessLaunchConfig, options: &PodProcessLaunchOptio
     args
 }
 
-/// pod を spawn し、`YOI-READY` ハンドシェイクが終わるまで待つ。
+/// worker を spawn し、`YOI-READY` ハンドシェイクが終わるまで待つ。
 ///
 /// `progress` は ready 行を見つけるまでに観測した stderr の各行で呼ばれる
 /// (ready 行自体は除外される)。UI の表示更新や E2E ログ取得に使う。
-pub async fn spawn_pod<F>(
-    config: PodProcessLaunchConfig,
+pub async fn spawn_worker<F>(
+    config: WorkerProcessLaunchConfig,
     progress: F,
 ) -> Result<SpawnReady, SpawnError>
 where
     F: FnMut(&str),
 {
-    spawn_pod_with_options(config, PodProcessLaunchOptions::default(), progress).await
+    spawn_worker_with_options(config, WorkerProcessLaunchOptions::default(), progress).await
 }
 
-pub async fn spawn_pod_with_options<F>(
-    config: PodProcessLaunchConfig,
-    options: PodProcessLaunchOptions,
+pub async fn spawn_worker_with_options<F>(
+    config: WorkerProcessLaunchConfig,
+    options: WorkerProcessLaunchOptions,
     mut progress: F,
 ) -> Result<SpawnReady, SpawnError>
 where
     F: FnMut(&str),
 {
-    let pod_runtime_dir = manifest::paths::pod_runtime_dir(&config.pod_name)
+    let worker_runtime_dir = manifest::paths::worker_runtime_dir(&config.worker_name)
         .ok_or(SpawnError::RuntimeDirUnavailable)?;
-    std::fs::create_dir_all(&pod_runtime_dir).map_err(SpawnError::Io)?;
-    let stderr_path = pod_runtime_dir.join("stderr.log");
+    std::fs::create_dir_all(&worker_runtime_dir).map_err(SpawnError::Io)?;
+    let stderr_path = worker_runtime_dir.join("stderr.log");
     let stderr_file = std::fs::File::create(&stderr_path).map_err(SpawnError::Io)?;
 
     let mut command = Command::new(config.runtime_command.program());
@@ -200,9 +203,9 @@ where
         })?;
 
     // Default `kill_on_drop = false` plus `process_group(0)` makes this
-    // a detached Pod once startup succeeds: dropping the handle does not
+    // a detached Worker once startup succeeds: dropping the handle does not
     // terminate it, and terminal-generated signals for the parent's
-    // process group do not hit the Pod. Runtime state/socket files are
+    // process group do not hit the Worker. Runtime state/socket files are
     // the source of truth after that point.
     let ready = match wait_for_ready_file(&mut progress, &stderr_path, &mut child).await {
         Ok(ready) => ready,
@@ -240,10 +243,10 @@ where
             for line in content[offset..].lines() {
                 if let Some(rest) = line.strip_prefix(READY_PREFIX) {
                     let mut parts = rest.splitn(2, '\t');
-                    let pod_name = parts.next().unwrap_or("").to_string();
+                    let worker_name = parts.next().unwrap_or("").to_string();
                     let socket_str = parts.next().unwrap_or("").to_string();
-                    if pod_name.is_empty() || socket_str.is_empty() {
-                        return Err(SpawnError::PodExitedEarly {
+                    if worker_name.is_empty() || socket_str.is_empty() {
+                        return Err(SpawnError::WorkerExitedEarly {
                             stderr_tail: format!("malformed ready line: {line}"),
                         });
                     }
@@ -258,7 +261,7 @@ where
                     )
                     .await?;
                     return Ok(SpawnReady {
-                        pod_name,
+                        worker_name,
                         socket_path,
                     });
                 }
@@ -274,11 +277,11 @@ where
         tokio::select! {
             status = child.wait() => {
                 let _ = status;
-                // Pod は exit 直前に最終 stderr 行を flush することがある。
+                // Worker は exit 直前に最終 stderr 行を flush することがある。
                 // child.wait() が解決した後に再読みして、原因行を取りこ
-                // ぼさず PodExitedEarly に載せる。
+                // ぼさず WorkerExitedEarly に載せる。
                 drain_stderr_into_tail(stderr_path, &mut tail, &mut offset).await;
-                return Err(SpawnError::PodExitedEarly {
+                return Err(SpawnError::WorkerExitedEarly {
                     stderr_tail: tail.into_string(),
                 });
             }
@@ -310,7 +313,7 @@ async fn wait_for_socket(
             status = child.wait() => {
                 let _ = status;
                 drain_stderr_into_tail(stderr_path, tail, offset).await;
-                return Err(SpawnError::PodExitedEarly {
+                return Err(SpawnError::WorkerExitedEarly {
                     stderr_tail: tail.as_string(),
                 });
             }
@@ -363,10 +366,10 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
 
-    fn base_config() -> PodProcessLaunchConfig {
-        PodProcessLaunchConfig {
-            runtime_command: PodRuntimeCommand::new("/bin/yoi", vec![OsString::from("pod")]),
-            pod_name: "explicit-pod".to_string(),
+    fn base_config() -> WorkerProcessLaunchConfig {
+        WorkerProcessLaunchConfig {
+            runtime_command: WorkerRuntimeCommand::new("/bin/yoi", vec![OsString::from("worker")]),
+            worker_name: "explicit-worker".to_string(),
             profile: Some("project:companion".to_string()),
             workspace_root: PathBuf::from("/work/other-project"),
             cwd: None,
@@ -375,14 +378,14 @@ mod tests {
     }
 
     #[test]
-    fn runtime_args_keep_workspace_pod_and_profile_separate() {
+    fn runtime_args_keep_workspace_worker_and_profile_separate() {
         assert_eq!(
-            runtime_args(&base_config(), &PodProcessLaunchOptions::default()),
+            runtime_args(&base_config(), &WorkerProcessLaunchOptions::default()),
             vec![
                 "--workspace",
                 "/work/other-project",
-                "--pod",
-                "explicit-pod",
+                "--worker",
+                "explicit-worker",
                 "--profile",
                 "project:companion",
             ]
@@ -394,14 +397,14 @@ mod tests {
         let mut config = base_config();
         config.resume_from = Some(Uuid::nil());
         assert_eq!(
-            runtime_args(&config, &PodProcessLaunchOptions::default()),
+            runtime_args(&config, &WorkerProcessLaunchOptions::default()),
             vec![
                 "--workspace",
                 "/work/other-project",
                 "--session",
                 "00000000-0000-0000-0000-000000000000",
-                "--pod",
-                "explicit-pod",
+                "--worker",
+                "explicit-worker",
             ]
         );
     }
@@ -414,14 +417,14 @@ mod tests {
         assert_eq!(
             runtime_args(
                 &config,
-                &PodProcessLaunchOptions::default()
+                &WorkerProcessLaunchOptions::default()
                     .with_hidden_arg("--ticket-role", "orchestrator"),
             ),
             vec![
                 "--workspace",
                 "/work/other-project",
-                "--pod",
-                "explicit-pod",
+                "--worker",
+                "explicit-worker",
                 "--profile",
                 "project:companion",
                 "--ticket-role",

@@ -2,16 +2,16 @@ mod mcp_cli;
 mod memory_lint;
 mod objective_cli;
 mod plugin_cli;
-mod pod_cleanup_cli;
 mod session_cli;
 mod ticket_cli;
+mod worker_cleanup_cli;
 
 use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
-use client::PodRuntimeCommand;
+use client::WorkerRuntimeCommand;
 use memory_lint::{LintCliOptions, LintStatus};
 use session_store::SegmentId;
 use tui::{LaunchMode, LaunchOptions};
@@ -26,11 +26,11 @@ enum Mode {
     Plugin(plugin_cli::PluginCliCommand),
     Objective(objective_cli::ObjectiveCli),
     Session(session_cli::SessionCli),
-    PodCleanup(pod_cleanup_cli::PodCleanupCli),
+    WorkerCleanup(worker_cleanup_cli::WorkerCleanupCli),
     Ticket(ticket_cli::TicketCli),
     WorkspaceHelp,
     WorkspaceServe(Vec<String>),
-    PodRuntime(Vec<String>),
+    WorkerRuntime(Vec<String>),
     Keys,
     SetupModel,
     Tui {
@@ -127,16 +127,16 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Mode::PodCleanup(cli) => match pod_cleanup_cli::run(cli).await {
+        Mode::WorkerCleanup(cli) => match worker_cleanup_cli::run(cli).await {
             Ok(output) => {
                 print!("{}", output.stdout);
                 match output.status {
-                    pod_cleanup_cli::PodCleanupCliStatus::Success => ExitCode::SUCCESS,
-                    pod_cleanup_cli::PodCleanupCliStatus::Failure => ExitCode::FAILURE,
+                    worker_cleanup_cli::WorkerCleanupCliStatus::Success => ExitCode::SUCCESS,
+                    worker_cleanup_cli::WorkerCleanupCliStatus::Failure => ExitCode::FAILURE,
                 }
             }
             Err(e) => {
-                eprintln!("yoi pod: {e}");
+                eprintln!("yoi worker: {e}");
                 ExitCode::FAILURE
             }
         },
@@ -153,17 +153,17 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Mode::PodRuntime(args) => pod::entrypoint::run_cli_from("yoi pod", args).await,
+        Mode::WorkerRuntime(args) => worker::entrypoint::run_cli_from("yoi worker", args).await,
         Mode::Keys => tui::keys::launch().await,
         Mode::SetupModel => tui::setup_model::launch().await,
         Mode::Tui {
             mode,
             workspace_root,
         } => {
-            let runtime_command = match PodRuntimeCommand::resolve() {
+            let runtime_command = match WorkerRuntimeCommand::resolve() {
                 Ok(command) => command,
                 Err(e) => {
-                    eprintln!("yoi: failed to resolve Pod runtime command: {e}");
+                    eprintln!("yoi: failed to resolve Worker runtime command: {e}");
                     return ExitCode::FAILURE;
                 }
             };
@@ -194,7 +194,7 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
     if args.is_empty() {
         return Ok(Mode::Tui {
             mode: LaunchMode::Spawn {
-                pod_name: None,
+                worker_name: None,
                 profile: None,
             },
             workspace_root: current_dir()?,
@@ -204,13 +204,13 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
     match args[0].as_str() {
         "--help" | "-h" => return Ok(Mode::Help),
         "resume" => return parse_resume_args(&args[1..]),
-        "pod" => {
-            if let Some(cli) = pod_cleanup_cli::parse_pod_management_args(&args[1..])
+        "worker" => {
+            if let Some(cli) = worker_cleanup_cli::parse_worker_management_args(&args[1..])
                 .map_err(|e| ParseError(e.to_string()))?
             {
-                return Ok(Mode::PodCleanup(cli));
+                return Ok(Mode::WorkerCleanup(cli));
             }
-            return Ok(Mode::PodRuntime(args[1..].to_vec()));
+            return Ok(Mode::WorkerRuntime(args[1..].to_vec()));
         }
         "objective" => {
             let objective_cli = objective_cli::parse_objective_args(&args[1..])
@@ -284,7 +284,7 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
 fn parse_console_options(args: &[String]) -> Result<Mode, ParseError> {
     let mut workspace_root = current_dir()?;
     let mut session = None;
-    let mut pod_name = None;
+    let mut worker_name = None;
     let mut socket_override = None;
     let mut profile = None;
 
@@ -299,14 +299,14 @@ fn parse_console_options(args: &[String]) -> Result<Mode, ParseError> {
                 session = Some(parse_session_id(value)?);
                 i += 2;
             }
-            "--pod" => {
+            "--worker" => {
                 let value = args
                     .get(i + 1)
-                    .ok_or_else(|| ParseError("--pod requires a value".to_string()))?;
+                    .ok_or_else(|| ParseError("--worker requires a value".to_string()))?;
                 if value.starts_with('-') {
-                    return Err(ParseError("--pod requires a value".to_string()));
+                    return Err(ParseError("--worker requires a value".to_string()));
                 }
-                pod_name = Some(value.clone());
+                worker_name = Some(value.clone());
                 i += 2;
             }
             "--socket" => {
@@ -347,12 +347,12 @@ fn parse_console_options(args: &[String]) -> Result<Mode, ParseError> {
                 session = Some(parse_session_id(value)?);
                 i += 1;
             }
-            arg if arg.starts_with("--pod=") => {
-                let value = arg.trim_start_matches("--pod=");
+            arg if arg.starts_with("--worker=") => {
+                let value = arg.trim_start_matches("--worker=");
                 if value.is_empty() {
-                    return Err(ParseError("--pod requires a value".to_string()));
+                    return Err(ParseError("--worker requires a value".to_string()));
                 }
-                pod_name = Some(value.to_string());
+                worker_name = Some(value.to_string());
                 i += 1;
             }
             arg if arg.starts_with("--socket=") => {
@@ -384,7 +384,7 @@ fn parse_console_options(args: &[String]) -> Result<Mode, ParseError> {
             }
             value => {
                 return Err(ParseError(format!(
-                    "unknown command `{value}`; use --pod <NAME> to open a Pod by name"
+                    "unknown command `{value}`; use --worker <NAME> to open a Worker by name"
                 )));
             }
         }
@@ -395,19 +395,19 @@ fn parse_console_options(args: &[String]) -> Result<Mode, ParseError> {
             "--profile can only be used for fresh spawn".to_string(),
         ));
     }
-    if socket_override.is_some() && pod_name.is_none() {
-        return Err(ParseError("--socket requires --pod".to_string()));
+    if socket_override.is_some() && worker_name.is_none() {
+        return Err(ParseError("--socket requires --worker".to_string()));
     }
     if socket_override.is_some() && session.is_some() {
         return Err(ParseError(
-            "--socket can only be used with --pod attach mode".to_string(),
+            "--socket can only be used with --worker attach mode".to_string(),
         ));
     }
 
     if let Some(profile) = profile {
         return Ok(Mode::Tui {
             mode: LaunchMode::Spawn {
-                pod_name,
+                worker_name,
                 profile: Some(profile),
             },
             workspace_root,
@@ -415,14 +415,14 @@ fn parse_console_options(args: &[String]) -> Result<Mode, ParseError> {
     }
     if let Some(id) = session {
         return Ok(Mode::Tui {
-            mode: LaunchMode::ResumeWithSession { id, pod_name },
+            mode: LaunchMode::ResumeWithSession { id, worker_name },
             workspace_root,
         });
     }
-    if let Some(pod_name) = pod_name {
+    if let Some(worker_name) = worker_name {
         return Ok(Mode::Tui {
-            mode: LaunchMode::PodName {
-                pod_name,
+            mode: LaunchMode::WorkerName {
+                worker_name,
                 socket_override,
             },
             workspace_root,
@@ -430,7 +430,7 @@ fn parse_console_options(args: &[String]) -> Result<Mode, ParseError> {
     }
     Ok(Mode::Tui {
         mode: LaunchMode::Spawn {
-            pod_name: None,
+            worker_name: None,
             profile: None,
         },
         workspace_root,
@@ -901,7 +901,7 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
 
 fn print_help() {
     println!(
-        "yoi\n\nUsage:\n  yoi [OPTIONS]\n  yoi resume [--workspace <PATH>] [--all]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi pod [POD_OPTIONS]\n  yoi pod delete <NAME> [--force] [--dry-run]\n  yoi pod prune --older-than <DURATION> [--force] [--dry-run]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi session prune --unreferenced [--older-than <DURATION>] [--force] [--dry-run]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi workspace serve [OPTIONS]\n  yoi plugin new <rust-component-tool|rust-component-service> <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Pod chat/client surface (default, --pod, yoi resume)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n      --workspace <PATH> Runtime workspace root for default Console/--pod (defaults to cwd)\n      --pod <NAME>       Open the Pod Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Pod Console to a specific socket with --pod\n      --session <UUID>   Resume a specific session segment in the Pod Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
+        "yoi\n\nUsage:\n  yoi [OPTIONS]\n  yoi resume [--workspace <PATH>] [--all]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi worker [WORKER_OPTIONS]\n  yoi worker delete <NAME> [--force] [--dry-run]\n  yoi worker prune --older-than <DURATION> [--force] [--dry-run]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi session prune --unreferenced [--older-than <DURATION>] [--force] [--dry-run]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi workspace serve [OPTIONS]\n  yoi plugin new <rust-component-tool|rust-component-service> <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Worker chat/client surface (default, --worker, yoi resume)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n      --workspace <PATH> Runtime workspace root for default Console/--worker (defaults to cwd)\n      --worker <NAME>       Open the Worker Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Worker Console to a specific socket with --worker\n      --session <UUID>   Resume a specific session segment in the Worker Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
     );
 }
 
@@ -913,7 +913,7 @@ fn print_workspace_help() {
 
 fn print_resume_help() {
     println!(
-        "yoi resume\n\nUsage:\n  yoi resume [--workspace <PATH>] [--all]\n\nOptions:\n      --workspace <PATH> Open the Pod Console picker scoped to this workspace (defaults to cwd)\n      --all              Open the Pod Console picker across this host/data dir\n  -h, --help             Print help\n"
+        "yoi resume\n\nUsage:\n  yoi resume [--workspace <PATH>] [--all]\n\nOptions:\n      --workspace <PATH> Open the Worker Console picker scoped to this workspace (defaults to cwd)\n      --all              Open the Worker Console picker across this host/data dir\n  -h, --help             Print help\n"
     );
 }
 
@@ -928,20 +928,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_pod_name_mode() {
-        match parse_args_from(["--pod", "agent", "--socket", "/tmp/agent.sock"]).unwrap() {
+    fn parse_worker_name_mode() {
+        match parse_args_from(["--worker", "agent", "--socket", "/tmp/agent.sock"]).unwrap() {
             Mode::Tui {
                 mode:
-                    LaunchMode::PodName {
-                        pod_name,
+                    LaunchMode::WorkerName {
+                        worker_name,
                         socket_override,
                     },
                 ..
             } => {
-                assert_eq!(pod_name, "agent");
+                assert_eq!(worker_name, "agent");
                 assert_eq!(socket_override, Some(PathBuf::from("/tmp/agent.sock")));
             }
-            _ => panic!("expected PodName mode"),
+            _ => panic!("expected WorkerName mode"),
         }
     }
 
@@ -994,35 +994,37 @@ mod tests {
     }
 
     #[test]
-    fn parse_pod_subcommand_uses_runtime_mode() {
-        match parse_args_from(["pod", "--pod", "agent", "--profile", "default"]).unwrap() {
-            Mode::PodRuntime(args) => assert_eq!(args, ["--pod", "agent", "--profile", "default"]),
-            _ => panic!("expected PodRuntime mode"),
+    fn parse_worker_subcommand_uses_runtime_mode() {
+        match parse_args_from(["worker", "--worker", "agent", "--profile", "default"]).unwrap() {
+            Mode::WorkerRuntime(args) => {
+                assert_eq!(args, ["--worker", "agent", "--profile", "default"])
+            }
+            _ => panic!("expected WorkerRuntime mode"),
         }
     }
 
     #[test]
-    fn parse_pod_delete_uses_cleanup_mode() {
-        match parse_args_from(["pod", "delete", "agent", "--dry-run"]).unwrap() {
-            Mode::PodCleanup(pod_cleanup_cli::PodCleanupCli::Delete(options)) => {
+    fn parse_worker_delete_uses_cleanup_mode() {
+        match parse_args_from(["worker", "delete", "agent", "--dry-run"]).unwrap() {
+            Mode::WorkerCleanup(worker_cleanup_cli::WorkerCleanupCli::Delete(options)) => {
                 assert_eq!(options.name, "agent");
                 assert!(options.dry_run);
                 assert!(!options.force);
             }
-            _ => panic!("expected Pod cleanup delete mode"),
+            _ => panic!("expected Worker cleanup delete mode"),
         }
     }
 
     #[test]
-    fn parse_pod_prune_uses_cleanup_mode() {
-        match parse_args_from(["pod", "prune", "--older-than", "30d"]).unwrap() {
-            Mode::PodCleanup(pod_cleanup_cli::PodCleanupCli::Prune(options)) => {
+    fn parse_worker_prune_uses_cleanup_mode() {
+        match parse_args_from(["worker", "prune", "--older-than", "30d"]).unwrap() {
+            Mode::WorkerCleanup(worker_cleanup_cli::WorkerCleanupCli::Prune(options)) => {
                 assert_eq!(
                     options.older_than,
                     std::time::Duration::from_secs(30 * 24 * 60 * 60)
                 );
             }
-            _ => panic!("expected Pod cleanup prune mode"),
+            _ => panic!("expected Worker cleanup prune mode"),
         }
     }
 
@@ -1092,20 +1094,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_literal_pod_name_still_available_with_flag() {
-        match parse_args_from(["--pod", "pod"]).unwrap() {
+    fn parse_literal_worker_name_still_available_with_flag() {
+        match parse_args_from(["--worker", "worker"]).unwrap() {
             Mode::Tui {
                 mode:
-                    LaunchMode::PodName {
-                        pod_name,
+                    LaunchMode::WorkerName {
+                        worker_name,
                         socket_override,
                     },
                 ..
             } => {
-                assert_eq!(pod_name, "pod");
+                assert_eq!(worker_name, "worker");
                 assert_eq!(socket_override, None);
             }
-            _ => panic!("expected PodName mode"),
+            _ => panic!("expected WorkerName mode"),
         }
     }
 
@@ -1238,7 +1240,7 @@ mod tests {
         match parse_args_from([
             "--session",
             &segment_id.to_string(),
-            "--pod",
+            "--worker",
             "explicit-name",
         ])
         .unwrap()
@@ -1247,14 +1249,14 @@ mod tests {
                 mode:
                     LaunchMode::ResumeWithSession {
                         id,
-                        pod_name: Some(pod_name),
+                        worker_name: Some(worker_name),
                     },
                 ..
             } => {
                 assert_eq!(id, segment_id);
-                assert_eq!(pod_name, "explicit-name");
+                assert_eq!(worker_name, "explicit-name");
             }
-            _ => panic!("expected ResumeWithSession mode with explicit pod name"),
+            _ => panic!("expected ResumeWithSession mode with explicit worker name"),
         }
     }
 
@@ -1264,7 +1266,11 @@ mod tests {
             (vec!["-r".to_string()], "unknown argument: -r"),
             (vec!["--resume".to_string()], "unknown argument: --resume"),
             (
-                vec!["--pod".to_string(), "agent".to_string(), "-r".to_string()],
+                vec![
+                    "--worker".to_string(),
+                    "agent".to_string(),
+                    "-r".to_string(),
+                ],
                 "unknown argument: -r",
             ),
         ];
@@ -1291,16 +1297,20 @@ mod tests {
             "/tmp/other-workspace",
             "--profile",
             "project:companion",
-            "--pod",
+            "--worker",
             "agent",
         ])
         .unwrap()
         {
             Mode::Tui {
-                mode: LaunchMode::Spawn { pod_name, profile },
+                mode:
+                    LaunchMode::Spawn {
+                        worker_name,
+                        profile,
+                    },
                 workspace_root,
             } => {
-                assert_eq!(pod_name, Some("agent".to_string()));
+                assert_eq!(worker_name, Some("agent".to_string()));
                 assert_eq!(profile, Some("project:companion".to_string()));
                 assert_eq!(workspace_root, PathBuf::from("/tmp/other-workspace"));
             }
@@ -1350,7 +1360,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_dashboard_word_is_not_an_alias_or_pod_name() {
+    fn parse_dashboard_word_is_not_an_alias_or_worker_name() {
         let err = parse_args_from(["dashboard"]).unwrap_err();
         assert_eq!(err.to_string(), "unknown command `dashboard`");
     }

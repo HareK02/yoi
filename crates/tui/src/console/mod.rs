@@ -18,14 +18,14 @@ use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{Command, execute};
 #[cfg(feature = "e2e-test")]
 use protocol::{Event, Greeting, RewindSummary, RewindTarget, RewindTargetId, Segment};
-use protocol::{Method, PodStatus};
+use protocol::{Method, WorkerStatus};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use session_store::SegmentId;
 use tokio::sync::mpsc;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use client::{PodClient, PodRuntimeCommand};
+use client::{WorkerClient, WorkerRuntimeCommand};
 
 use crate::app::{ActionbarNoticeLevel, ActionbarNoticeSource, App};
 use crate::composer_keys::{ComposerEditAction, composer_edit_action};
@@ -35,9 +35,9 @@ use crate::{picker, spawn, ui};
 
 pub(crate) type ConsoleTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
-/// Narrow request bridge used when the workspace Dashboard opens a Pod Console.
+/// Narrow request bridge used when the workspace Dashboard opens a Worker Console.
 pub(crate) struct DashboardConsoleOpenRequest {
-    pub(crate) pod_name: String,
+    pub(crate) worker_name: String,
     pub(crate) socket_override: Option<PathBuf>,
 }
 
@@ -128,39 +128,39 @@ fn copy_selection_to_terminal(app: &mut App) -> bool {
     copy_selection_to_writer(app, &mut stdout)
 }
 
-fn resolve_socket(pod_name: &str, override_path: Option<PathBuf>) -> PathBuf {
+fn resolve_socket(worker_name: &str, override_path: Option<PathBuf>) -> PathBuf {
     if let Some(p) = override_path {
         return p;
     }
-    manifest::paths::pod_socket_path(pod_name).unwrap_or_else(|| {
+    manifest::paths::pod_socket_path(worker_name).unwrap_or_else(|| {
         PathBuf::from("/tmp")
             .join("yoi")
-            .join(pod_name)
+            .join(worker_name)
             .join("sock")
     })
 }
 
-pub(crate) async fn run_pod_name(
-    pod_name: String,
+pub(crate) async fn run_worker_name(
+    worker_name: String,
     socket_override: Option<PathBuf>,
-    runtime_command: PodRuntimeCommand,
+    runtime_command: WorkerRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "e2e-test")]
     if std::env::var_os("YOI_TUI_TEST_REWIND_FIXTURE").is_some() {
         let mut terminal = enter_fullscreen()?;
         terminal.clear()?;
-        let result = run_e2e_rewind_fixture(&mut terminal, pod_name).await;
+        let result = run_e2e_rewind_fixture(&mut terminal, worker_name).await;
         let _ = leave_fullscreen(&mut terminal);
         return result;
     }
 
-    if let Some(client) = try_connect_live_pod(&pod_name, socket_override.clone()).await {
+    if let Some(client) = try_connect_live_pod(&worker_name, socket_override.clone()).await {
         let mut terminal = enter_fullscreen()?;
-        run_connected_pod(&mut terminal, pod_name, client, runtime_command.clone()).await?;
+        run_connected_pod(&mut terminal, worker_name, client, runtime_command.clone()).await?;
         return Ok(());
     }
 
-    let ready = match spawn::run_pod_name(pod_name, runtime_command.clone()).await? {
+    let ready = match spawn::run_worker_name(worker_name, runtime_command.clone()).await? {
         SpawnOutcome::Ready(r) => r,
         SpawnOutcome::Cancelled => return Ok(()),
     };
@@ -173,12 +173,12 @@ pub(crate) async fn run_pod_name(
 
 async fn run_connected_pod(
     terminal: &mut ConsoleTerminal,
-    pod_name: String,
-    client: PodClient,
-    runtime_command: PodRuntimeCommand,
+    worker_name: String,
+    client: WorkerClient,
+    runtime_command: WorkerRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let mut app = App::new_with_persistent_input_history(pod_name, &workspace_root);
+    let mut app = App::new_with_persistent_input_history(worker_name, &workspace_root);
     app.connected = true;
     run_loop(terminal, &mut app, client, runtime_command).await
 }
@@ -186,29 +186,29 @@ async fn run_connected_pod(
 pub(crate) async fn open_from_dashboard(
     terminal: &mut ConsoleTerminal,
     request: DashboardConsoleOpenRequest,
-    runtime_command: PodRuntimeCommand,
+    runtime_command: WorkerRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let DashboardConsoleOpenRequest {
-        pod_name,
+        worker_name,
         socket_override,
     } = request;
 
-    if let Some(client) = try_connect_live_pod(&pod_name, socket_override).await {
-        return run_connected_pod(terminal, pod_name, client, runtime_command.clone()).await;
+    if let Some(client) = try_connect_live_pod(&worker_name, socket_override).await {
+        return run_connected_pod(terminal, worker_name, client, runtime_command.clone()).await;
     }
 
     let ready =
-        spawn_pod_name_from_fullscreen(terminal, &pod_name, runtime_command.clone()).await?;
+        spawn_worker_name_from_fullscreen(terminal, &worker_name, runtime_command.clone()).await?;
     run_ready_pod(terminal, ready, runtime_command).await
 }
 
-async fn spawn_pod_name_from_fullscreen(
+async fn spawn_worker_name_from_fullscreen(
     terminal: &mut ConsoleTerminal,
-    pod_name: &str,
-    runtime_command: PodRuntimeCommand,
+    worker_name: &str,
+    runtime_command: WorkerRuntimeCommand,
 ) -> Result<SpawnReady, Box<dyn std::error::Error>> {
     leave_fullscreen(terminal)?;
-    let outcome = spawn::run_pod_name(pod_name.to_string(), runtime_command).await;
+    let outcome = spawn::run_worker_name(worker_name.to_string(), runtime_command).await;
     enter_fullscreen_existing(terminal)?;
     terminal.clear()?;
 
@@ -219,11 +219,11 @@ async fn spawn_pod_name_from_fullscreen(
 }
 
 async fn try_connect_live_pod(
-    pod_name: &str,
+    worker_name: &str,
     socket_override: Option<PathBuf>,
-) -> Option<PodClient> {
-    let preferred_socket = resolve_socket(pod_name, socket_override.clone());
-    connect_live_pod(pod_name, preferred_socket, socket_override.is_none())
+) -> Option<WorkerClient> {
+    let preferred_socket = resolve_socket(worker_name, socket_override.clone());
+    connect_live_pod(worker_name, preferred_socket, socket_override.is_none())
         .await
         .map(|(_, client)| client)
 }
@@ -233,7 +233,7 @@ struct NestedOpenCancelled;
 
 impl std::fmt::Display for NestedOpenCancelled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Pod open was cancelled")
+        f.write_str("Worker open was cancelled")
     }
 }
 
@@ -242,57 +242,57 @@ impl std::error::Error for NestedOpenCancelled {}
 async fn run_ready_pod(
     terminal: &mut ConsoleTerminal,
     ready: SpawnReady,
-    runtime_command: PodRuntimeCommand,
+    runtime_command: WorkerRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let SpawnReady {
-        pod_name,
+        worker_name,
         socket_path,
     } = ready;
-    run(terminal, pod_name, &socket_path, runtime_command).await
+    run(terminal, worker_name, &socket_path, runtime_command).await
 }
 
 async fn connect_live_pod(
-    pod_name: &str,
+    worker_name: &str,
     preferred_socket: PathBuf,
     allow_registry_fallback: bool,
-) -> Option<(PathBuf, PodClient)> {
-    if let Ok(client) = PodClient::connect(&preferred_socket).await {
+) -> Option<(PathBuf, WorkerClient)> {
+    if let Ok(client) = WorkerClient::connect(&preferred_socket).await {
         return Some((preferred_socket, client));
     }
 
     if !allow_registry_fallback {
         return None;
     }
-    let registry_socket = picker::live_socket_for_pod(pod_name)?;
+    let registry_socket = picker::live_socket_for_pod(worker_name)?;
     if registry_socket == preferred_socket {
         return None;
     }
-    PodClient::connect(&registry_socket)
+    WorkerClient::connect(&registry_socket)
         .await
         .ok()
         .map(|client| (registry_socket, client))
 }
 
 pub(crate) async fn run_resume(
-    runtime_command: PodRuntimeCommand,
+    runtime_command: WorkerRuntimeCommand,
     workspace_root: PathBuf,
     all: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Pick a Pod in its own inline viewport, dropping the viewport before
+    // Pick a Worker in its own inline viewport, dropping the viewport before
     // attaching/restoring so each phase gets fresh vertical room.
     let picker_options = if all {
         picker::PickerOptions::all()
     } else {
         picker::PickerOptions::workspace(workspace_root)
     };
-    let (pod_name, socket_override) = match picker::run(picker_options).await? {
+    let (worker_name, socket_override) = match picker::run(picker_options).await? {
         PickerOutcome::Picked {
-            pod_name,
+            worker_name,
             socket_override,
-        } => (pod_name, socket_override),
+        } => (worker_name, socket_override),
         PickerOutcome::Cancelled => return Ok(()),
     };
-    run_pod_name(pod_name, socket_override, runtime_command).await
+    run_worker_name(worker_name, socket_override, runtime_command).await
 }
 
 pub(crate) fn is_recoverable_dashboard_open_error(error: &(dyn Error + 'static)) -> bool {
@@ -301,32 +301,33 @@ pub(crate) fn is_recoverable_dashboard_open_error(error: &(dyn Error + 'static))
 
 pub(crate) async fn run_spawn(
     resume_from: Option<SegmentId>,
-    pod_name: Option<String>,
+    worker_name: Option<String>,
     profile: Option<String>,
-    runtime_command: PodRuntimeCommand,
+    runtime_command: WorkerRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "e2e-test")]
     if std::env::var_os("YOI_TUI_TEST_REWIND_FIXTURE").is_some() {
         let mut terminal = enter_fullscreen()?;
         terminal.clear()?;
-        let fixture_pod_name = pod_name.unwrap_or_else(|| "e2e-rewind".to_string());
-        let result = run_e2e_rewind_fixture(&mut terminal, fixture_pod_name).await;
+        let fixture_worker_name = worker_name.unwrap_or_else(|| "e2e-rewind".to_string());
+        let result = run_e2e_rewind_fixture(&mut terminal, fixture_worker_name).await;
         let _ = leave_fullscreen(&mut terminal);
         return result;
     }
 
-    let ready = match spawn::run(resume_from, pod_name, profile, runtime_command.clone()).await? {
+    let ready = match spawn::run(resume_from, worker_name, profile, runtime_command.clone()).await?
+    {
         SpawnOutcome::Ready(r) => r,
         SpawnOutcome::Cancelled => return Ok(()),
     };
 
     let SpawnReady {
-        pod_name,
+        worker_name,
         socket_path,
     } = ready;
 
     let mut terminal = enter_fullscreen()?;
-    let result = run(&mut terminal, pod_name, &socket_path, runtime_command).await;
+    let result = run(&mut terminal, worker_name, &socket_path, runtime_command).await;
 
     // Leave alt-screen explicitly before `main`'s terminal restore path.
     let _ = execute!(
@@ -383,17 +384,17 @@ pub(crate) fn leave_dashboard_fullscreen(terminal: &mut ConsoleTerminal) -> io::
 
 async fn run(
     terminal: &mut ConsoleTerminal,
-    pod_name: String,
+    worker_name: String,
     socket_path: &std::path::Path,
-    runtime_command: PodRuntimeCommand,
+    runtime_command: WorkerRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let mut app = App::new_with_persistent_input_history(pod_name, &workspace_root);
+    let mut app = App::new_with_persistent_input_history(worker_name, &workspace_root);
 
-    match PodClient::connect(socket_path).await {
+    match WorkerClient::connect(socket_path).await {
         Ok(client) => {
             app.connected = true;
-            // The Pod sends `Event::Snapshot` automatically on connect;
+            // The Worker sends `Event::Snapshot` automatically on connect;
             // no explicit method call is required to fetch history.
             run_loop(terminal, &mut app, client, runtime_command).await?;
         }
@@ -470,16 +471,16 @@ fn read_terminal_events(stop: Arc<AtomicBool>, tx: mpsc::UnboundedSender<Termina
 #[cfg(feature = "e2e-test")]
 async fn run_e2e_rewind_fixture(
     terminal: &mut ConsoleTerminal,
-    pod_name: String,
+    worker_name: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let mut app = App::new_with_persistent_input_history(pod_name.clone(), &workspace_root);
+    let mut app = App::new_with_persistent_input_history(worker_name.clone(), &workspace_root);
     app.connected = true;
-    app.handle_pod_event(Event::Snapshot {
+    app.handle_worker_event(Event::Snapshot {
         entries: Vec::new(),
-        status: PodStatus::Idle,
+        status: WorkerStatus::Idle,
         greeting: Greeting {
-            pod_name: pod_name.clone(),
+            worker_name: worker_name.clone(),
             cwd: workspace_root.display().to_string(),
             provider: "e2e-fixture".to_string(),
             model: "canned".to_string(),
@@ -500,9 +501,9 @@ async fn run_e2e_rewind_fixture(
     let apply_delay = Duration::from_millis(400);
     #[cfg(feature = "e2e-test")]
     crate::e2e_observer::emit(
-        "single_pod",
+        "single_worker",
         "rewind_fixture_ready",
-        serde_json::json!({ "pod": pod_name.clone() }),
+        serde_json::json!({ "worker": worker_name.clone() }),
     );
     terminal.draw(|frame| ui::draw(frame, &mut app))?;
 
@@ -539,7 +540,7 @@ async fn run_e2e_rewind_fixture(
                 if let Some(method) = handle_key(&mut app, key) {
                     match method {
                         Method::ListRewindTargets => {
-                            app.handle_pod_event(Event::RewindTargets {
+                            app.handle_worker_event(Event::RewindTargets {
                                 head_entries: 3,
                                 targets: vec![RewindTarget {
                                     id: target_id.clone(),
@@ -554,7 +555,7 @@ async fn run_e2e_rewind_fixture(
                                 }],
                             });
                             crate::e2e_observer::emit(
-                                "single_pod",
+                                "single_worker",
                                 "rewind_picker_opened",
                                 serde_json::json!({
                                     "targets": 1,
@@ -569,7 +570,7 @@ async fn run_e2e_rewind_fixture(
                             rewind_submit_count += 1;
                             pending_apply = Some(std::time::Instant::now());
                             crate::e2e_observer::emit(
-                                "single_pod",
+                                "single_worker",
                                 "rewind_submit_sent",
                                 serde_json::json!({
                                     "segment_id": target.segment_id.to_string(),
@@ -583,7 +584,7 @@ async fn run_e2e_rewind_fixture(
                     }
                 } else if duplicate_enter_pending {
                     crate::e2e_observer::emit(
-                        "single_pod",
+                        "single_worker",
                         "rewind_duplicate_enter_suppressed",
                         serde_json::json!({ "submit_count": rewind_submit_count }),
                     );
@@ -601,7 +602,7 @@ async fn run_e2e_rewind_fixture(
 
         if let Some(submitted_at) = pending_apply {
             if submitted_at.elapsed() >= apply_delay {
-                app.handle_pod_event(Event::RewindApplied {
+                app.handle_worker_event(Event::RewindApplied {
                     entries: Vec::new(),
                     input: vec![Segment::text("rewind-live-refresh")],
                     summary: RewindSummary {
@@ -613,7 +614,7 @@ async fn run_e2e_rewind_fixture(
                 pending_apply = None;
                 let composer_text = Segment::flatten_to_text(&app.input.submit_segments());
                 crate::e2e_observer::emit(
-                    "single_pod",
+                    "single_worker",
                     "rewind_applied",
                     serde_json::json!({
                         "composer_text": composer_text,
@@ -644,7 +645,7 @@ enum E2eRewindInput {
 
 enum LoopInput<P> {
     Terminal(TerminalEventResult),
-    Pod(Option<P>),
+    Worker(Option<P>),
 }
 
 async fn next_loop_input<P, F>(
@@ -666,15 +667,15 @@ where
                 ))
             }))
         }
-        event = pod_next, if connected => LoopInput::Pod(event),
+        event = pod_next, if connected => LoopInput::Worker(event),
     }
 }
 
 async fn drain_terminal_events(
     app: &mut App,
-    client: &mut PodClient,
+    client: &mut WorkerClient,
     term_rx: &mut mpsc::UnboundedReceiver<TerminalEventResult>,
-    runtime_command: &PodRuntimeCommand,
+    runtime_command: &WorkerRuntimeCommand,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut handled = false;
     for _ in 0..TERMINAL_EVENT_DRAIN_LIMIT {
@@ -698,16 +699,16 @@ async fn drain_terminal_events(
     Ok(handled)
 }
 
-async fn drain_pod_events(
+async fn drain_worker_events(
     app: &mut App,
-    client: &mut PodClient,
+    client: &mut WorkerClient,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut handled = false;
     for _ in 0..POD_EVENT_DRAIN_LIMIT {
         match client.try_next_event() {
             Some(ev) => {
                 handled = true;
-                if let Some(method) = app.handle_pod_event(ev) {
+                if let Some(method) = app.handle_worker_event(ev) {
                     client.send(&method).await?;
                 }
             }
@@ -720,8 +721,8 @@ async fn drain_pod_events(
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    mut client: PodClient,
-    runtime_command: PodRuntimeCommand,
+    mut client: WorkerClient,
+    runtime_command: WorkerRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_terminal_reader, mut term_rx) = TerminalEventReader::spawn()?;
 
@@ -737,8 +738,8 @@ async fn run_loop(
         if app.quit {
             break;
         }
-        let handled_pod_event = drain_pod_events(app, &mut client).await?;
-        if handled_term_event || handled_pod_event {
+        let handled_worker_event = drain_worker_events(app, &mut client).await?;
+        if handled_term_event || handled_worker_event {
             terminal.draw(|f| ui::draw(f, app))?;
             continue;
         }
@@ -747,9 +748,9 @@ async fn run_loop(
             LoopInput::Terminal(term_event) => {
                 handle_terminal_event(app, &mut client, term_event?, &runtime_command).await?;
             }
-            LoopInput::Pod(event) => match event {
+            LoopInput::Worker(event) => match event {
                 Some(ev) => {
-                    if let Some(method) = app.handle_pod_event(ev) {
+                    if let Some(method) = app.handle_worker_event(ev) {
                         client.send(&method).await?;
                     }
                 }
@@ -769,9 +770,9 @@ async fn run_loop(
 
 async fn handle_terminal_event(
     app: &mut App,
-    client: &mut PodClient,
+    client: &mut WorkerClient,
     event: TermEvent,
-    _runtime_command: &PodRuntimeCommand,
+    _runtime_command: &WorkerRuntimeCommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match event {
         TermEvent::Key(key) => {
@@ -937,12 +938,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Option<Method> {
             Some(None)
         }
         KeyCode::Char('c') if ctrl => Some(handle_pause_or_quit(app)),
-        KeyCode::Char('x') if ctrl => Some(match app.pod_status {
-            PodStatus::Running | PodStatus::Paused => {
+        KeyCode::Char('x') if ctrl => Some(match app.worker_status {
+            WorkerStatus::Running | WorkerStatus::Paused => {
                 app.clear_queued_inputs();
                 Some(Method::Cancel)
             }
-            PodStatus::Idle => Some(Method::Shutdown),
+            WorkerStatus::Idle => Some(Method::Shutdown),
         }),
         KeyCode::Char('d') if ctrl => {
             app.quit = true;
@@ -1196,9 +1197,9 @@ fn handle_command_key(app: &mut App, key: KeyEvent) -> Option<Method> {
 const CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Running → send `Method::Pause`.
-/// Idle / Paused → 2-tap to quit the TUI (the Pod keeps running).
+/// Idle / Paused → 2-tap to quit the TUI (the Worker keeps running).
 fn handle_pause_or_quit(app: &mut App) -> Option<Method> {
-    if app.pod_status == PodStatus::Running {
+    if app.worker_status == WorkerStatus::Running {
         app.clear_queued_inputs();
         return Some(Method::Pause);
     }
@@ -1211,7 +1212,7 @@ fn handle_pause_or_quit(app: &mut App) -> Option<Method> {
     }
     app.quit_confirm = Some(std::time::Instant::now());
     app.flash_actionbar_notice(
-        "Press Ctrl-C again within 3 s to exit the TUI (the Pod keeps running).",
+        "Press Ctrl-C again within 3 s to exit the TUI (the Worker keeps running).",
         ActionbarNoticeLevel::Warn,
         ActionbarNoticeSource::Tui,
         CONFIRM_TIMEOUT,
@@ -1226,7 +1227,7 @@ mod tests {
     use protocol::{Event, RewindTarget, RewindTargetId, Segment};
 
     #[test]
-    fn single_pod_mouse_capture_avoids_drag_and_all_motion_modes() {
+    fn single_worker_mouse_capture_avoids_drag_and_all_motion_modes() {
         let mut ansi = String::new();
         Command::write_ansi(&EnableSinglePodMouseCapture, &mut ansi).unwrap();
 
@@ -1238,7 +1239,7 @@ mod tests {
 
     #[test]
     fn mouse_drag_updates_selection_state() {
-        let mut app = App::new("pod".into());
+        let mut app = App::new("worker".into());
         app.text_selection.set_history_snapshot(
             HistoryViewport {
                 x: 1,
@@ -1285,7 +1286,7 @@ mod tests {
 
     #[test]
     fn esc_clears_selection_without_editing_composer() {
-        let mut app = App::new("pod".into());
+        let mut app = App::new("worker".into());
         app.text_selection.set_history_snapshot(
             HistoryViewport {
                 x: 0,
@@ -1306,7 +1307,7 @@ mod tests {
 
     #[test]
     fn copy_selection_writes_osc52_and_clears_selection() {
-        let mut app = App::new("pod".into());
+        let mut app = App::new("worker".into());
         app.text_selection.set_history_snapshot(
             HistoryViewport {
                 x: 0,
@@ -1333,7 +1334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_event_is_selected_before_ready_pod_event() {
+    async fn terminal_event_is_selected_before_ready_worker_event() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         tx.send(Ok(TermEvent::Key(KeyEvent::new(
             KeyCode::Char('x'),
@@ -1345,17 +1346,17 @@ mod tests {
             LoopInput::Terminal(Ok(TermEvent::Key(key))) => {
                 assert_eq!(key.code, KeyCode::Char('x'));
             }
-            _ => panic!("ready terminal input should win over a ready Pod event"),
+            _ => panic!("ready terminal input should win over a ready Worker event"),
         }
     }
 
     #[tokio::test]
-    async fn terminal_event_is_preserved_after_pod_event_wins() {
+    async fn terminal_event_is_preserved_after_worker_event_wins() {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         match next_loop_input(&mut rx, true, std::future::ready(Some(1_u8))).await {
-            LoopInput::Pod(Some(1)) => {}
-            _ => panic!("expected the first ready Pod event to win before any terminal input"),
+            LoopInput::Worker(Some(1)) => {}
+            _ => panic!("expected the first ready Worker event to win before any terminal input"),
         }
 
         tx.send(Ok(TermEvent::Key(KeyEvent::new(
@@ -1368,14 +1369,14 @@ mod tests {
             LoopInput::Terminal(Ok(TermEvent::Key(key))) => {
                 assert_eq!(key.code, KeyCode::Char('y'));
             }
-            _ => panic!("queued terminal input should not be lost to subsequent Pod events"),
+            _ => panic!("queued terminal input should not be lost to subsequent Worker events"),
         }
     }
 
     #[test]
     fn running_status_still_allows_text_editing() {
         let mut app = App::new("agent".to_string());
-        app.set_pod_status(PodStatus::Running);
+        app.set_worker_status(WorkerStatus::Running);
 
         assert!(
             handle_key(
@@ -1409,7 +1410,7 @@ mod tests {
     #[test]
     fn running_enter_queues_instead_of_sending_run() {
         let mut app = App::new("agent".to_string());
-        app.set_pod_status(PodStatus::Running);
+        app.set_worker_status(WorkerStatus::Running);
         for c in "queued".chars() {
             assert!(
                 handle_key(
@@ -1430,7 +1431,7 @@ mod tests {
     #[test]
     fn queued_input_keybindings_restore_and_clear() {
         let mut app = App::new("agent".to_string());
-        app.set_pod_status(PodStatus::Running);
+        app.set_worker_status(WorkerStatus::Running);
         for c in "edit queued".chars() {
             assert!(
                 handle_key(
@@ -1478,7 +1479,7 @@ mod tests {
     #[test]
     fn pause_and_cancel_clear_queued_input() {
         let mut app = App::new("agent".to_string());
-        app.set_pod_status(PodStatus::Running);
+        app.set_worker_status(WorkerStatus::Running);
         for c in "queued".chars() {
             assert!(
                 handle_key(
@@ -1521,7 +1522,7 @@ mod tests {
     #[test]
     fn ctrl_x_cancels_paused_turn_without_shutdown() {
         let mut app = App::new("agent".to_string());
-        app.set_pod_status(PodStatus::Paused);
+        app.set_worker_status(WorkerStatus::Paused);
 
         let cancel = handle_key(
             &mut app,
@@ -1533,7 +1534,7 @@ mod tests {
     #[test]
     fn ctrl_x_shutdown_while_idle_is_unchanged() {
         let mut app = App::new("agent".to_string());
-        app.set_pod_status(PodStatus::Idle);
+        app.set_worker_status(WorkerStatus::Idle);
 
         let shutdown = handle_key(
             &mut app,
@@ -1854,7 +1855,7 @@ mod tests {
     #[test]
     fn ctrl_c_quit_guard_uses_actionbar_notice_without_transcript_alert() {
         let mut app = App::new("agent".to_string());
-        app.set_pod_status(PodStatus::Idle);
+        app.set_worker_status(WorkerStatus::Idle);
 
         let method = handle_key(
             &mut app,
@@ -1866,10 +1867,10 @@ mod tests {
         let notice = app
             .current_actionbar_notice(std::time::Instant::now())
             .expect("quit guard notice is active");
-        assert!(notice.text.contains("Pod keeps running"));
+        assert!(notice.text.contains("Worker keeps running"));
         assert_eq!(notice.level, ActionbarNoticeLevel::Warn);
         assert_eq!(notice.source, ActionbarNoticeSource::Tui);
-        assert!(!has_alert(&app, "Pod keeps running"));
+        assert!(!has_alert(&app, "Worker keeps running"));
 
         let method = handle_key(
             &mut app,
@@ -1889,7 +1890,7 @@ mod tests {
         );
         assert!(matches!(idle, Some(Method::ListRewindTargets)));
 
-        app.set_pod_status(PodStatus::Paused);
+        app.set_worker_status(WorkerStatus::Paused);
         let paused = handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
@@ -1901,7 +1902,7 @@ mod tests {
     fn ctrl_r_is_rejected_while_running() {
         let mut app = App::new("agent".to_string());
         app.connected = true;
-        app.set_pod_status(PodStatus::Running);
+        app.set_worker_status(WorkerStatus::Running);
 
         let method = handle_key(
             &mut app,
@@ -1909,14 +1910,14 @@ mod tests {
         );
 
         assert!(method.is_none());
-        assert!(has_alert(&app, "cannot rewind while the Pod is running"));
+        assert!(has_alert(&app, "cannot rewind while the Worker is running"));
     }
 
     #[test]
     fn rewind_picker_close_returns_to_history_view() {
         let mut app = App::new("agent".to_string());
         app.connected = true;
-        app.handle_pod_event(Event::RewindTargets {
+        app.handle_worker_event(Event::RewindTargets {
             head_entries: 1,
             targets: vec![],
         });
@@ -1927,7 +1928,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
         );
         assert!(matches!(method, Some(Method::ListRewindTargets)));
-        app.handle_pod_event(Event::RewindTargets {
+        app.handle_worker_event(Event::RewindTargets {
             head_entries: 1,
             targets: vec![],
         });
@@ -1942,13 +1943,13 @@ mod tests {
     #[test]
     fn rewind_applied_reseeds_display_and_restores_composer() {
         let mut app = App::new("agent".to_string());
-        app.handle_pod_event(Event::Snapshot {
+        app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             entries: vec![],
-            status: PodStatus::Idle,
+            status: WorkerStatus::Idle,
             in_flight: Default::default(),
         });
-        app.handle_pod_event(Event::RewindApplied {
+        app.handle_worker_event(Event::RewindApplied {
             entries: vec![],
             input: vec![Segment::Text {
                 content: "retry this".into(),
@@ -1968,15 +1969,15 @@ mod tests {
     #[test]
     fn rewind_applied_keeps_non_empty_composer() {
         let mut app = App::new("agent".to_string());
-        app.handle_pod_event(Event::Snapshot {
+        app.handle_worker_event(Event::Snapshot {
             greeting: test_greeting(),
             entries: vec![],
-            status: PodStatus::Idle,
+            status: WorkerStatus::Idle,
             in_flight: Default::default(),
         });
         type_keys(&mut app, "draft");
 
-        app.handle_pod_event(Event::RewindApplied {
+        app.handle_worker_event(Event::RewindApplied {
             entries: vec![],
             input: vec![Segment::Text {
                 content: "retry this".into(),
@@ -2005,11 +2006,11 @@ mod tests {
 
         let mut app = App::new("agent".to_string());
         app.rewind_picker = Some(crate::app::RewindPickerState::new(1, vec![rewind_target()]));
-        app.set_pod_status(PodStatus::Paused);
+        app.set_worker_status(WorkerStatus::Paused);
         assert!(app.submit_rewind_picker().is_none());
         assert!(has_alert(
             &app,
-            "cannot apply rewind while the Pod is paused"
+            "cannot apply rewind while the Worker is paused"
         ));
     }
 
@@ -2055,7 +2056,7 @@ mod tests {
 
     fn test_greeting() -> protocol::Greeting {
         protocol::Greeting {
-            pod_name: "agent".into(),
+            worker_name: "agent".into(),
             cwd: "/tmp".into(),
             provider: "test".into(),
             model: "test".into(),

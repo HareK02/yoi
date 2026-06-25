@@ -14,7 +14,7 @@ Intake の目的は、曖昧な依頼をいきなり実装委譲せず、Orchest
 
 Intake は以下をしない。
 
-- coder / reviewer / read-only investigation helper Pod を起動しない。
+- coder / reviewer / read-only investigation helper Worker を起動しない。
 - implementation worktree を作らない。
 - implementation / review routing、merge、close、branch cleanup をしない。
 - unattended scheduler として自動実行しない。

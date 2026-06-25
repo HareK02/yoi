@@ -1,10 +1,10 @@
-//! Partial-form of [`crate::PodManifest`] used as cascade layers.
+//! Partial-form of [`crate::WorkerManifest`] used as cascade layers.
 //!
-//! `PodManifestConfig` mirrors `PodManifest` but every field is optional
+//! `WorkerManifestConfig` mirrors `WorkerManifest` but every field is optional
 //! so individual layers (builtin defaults, user manifest, project
 //! manifest, programmatic overlay) can be partial. Layers are combined
-//! via [`PodManifestConfig::merge`] and the final config is converted to
-//! a validated [`PodManifest`] via `TryFrom`.
+//! via [`WorkerManifestConfig::merge`] and the final config is converted to
+//! a validated [`WorkerManifest`] via `TryFrom`.
 
 use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroU32;
@@ -17,19 +17,19 @@ use crate::defaults;
 use crate::model::{AuthRef, ModelManifest, ReasoningControl};
 use crate::plugin::PluginConfig;
 use crate::{
-    CompactionConfig, FeatureConfig, FeatureFlagConfig, FileUploadLimits, McpConfig, McpEnvValue,
-    McpStdioCwdPolicy, MemoryConfig, PodManifest, PodMeta, ScopeConfig, SessionConfig,
+    CompactionConfig, EngineManifest, FeatureConfig, FeatureFlagConfig, FileUploadLimits,
+    McpConfig, McpEnvValue, McpStdioCwdPolicy, MemoryConfig, ScopeConfig, SessionConfig,
     SkillsConfig, TicketFeatureAccessConfig, TicketFeatureConfig, ToolOutputLimits,
-    ToolPermissionConfig, ToolPermissionRule, WebConfig, WorkerManifest,
+    ToolPermissionConfig, ToolPermissionRule, WebConfig, WorkerManifest, WorkerMeta,
 };
 
-/// Partial-form Pod manifest. Every field is optional; one or more
-/// instances merge via [`PodManifestConfig::merge`] before being
-/// converted to a validated [`PodManifest`] via `TryFrom`.
+/// Partial-form Worker manifest. Every field is optional; one or more
+/// instances merge via [`WorkerManifestConfig::merge`] before being
+/// converted to a validated [`WorkerManifest`] via `TryFrom`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PodManifestConfig {
+pub struct WorkerManifestConfig {
     #[serde(default)]
-    pub pod: PodMetaConfig,
+    pub worker: WorkerMetaConfig,
     /// `[model]` セクションは partial でも完成形でも同じ
     /// [`ModelManifest`] を使う。ref / inline の両形を受け入れるための
     /// 全 Optional 構造なので、カスケード層と最終マニフェストで型を
@@ -37,7 +37,7 @@ pub struct PodManifestConfig {
     #[serde(default)]
     pub model: ModelManifest,
     #[serde(default)]
-    pub worker: WorkerManifestConfig,
+    pub engine: EngineManifestConfig,
     #[serde(default)]
     pub scope: ScopeConfig,
     /// Scope that may be subdelegated to spawned child Pods. Defaults empty.
@@ -83,7 +83,7 @@ pub struct FeatureConfigPartial {
     #[serde(default)]
     pub web: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
-    pub pods: Option<FeatureFlagConfigPartial>,
+    pub workers: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
     pub ticket: Option<TicketFeatureConfigPartial>,
     #[serde(default)]
@@ -98,7 +98,7 @@ impl FeatureConfigPartial {
             task: merge_option(self.task, other.task, FeatureFlagConfigPartial::merge),
             memory: merge_option(self.memory, other.memory, FeatureFlagConfigPartial::merge),
             web: merge_option(self.web, other.web, FeatureFlagConfigPartial::merge),
-            pods: merge_option(self.pods, other.pods, FeatureFlagConfigPartial::merge),
+            workers: merge_option(self.workers, other.workers, FeatureFlagConfigPartial::merge),
             ticket: merge_option(self.ticket, other.ticket, TicketFeatureConfigPartial::merge),
             ticket_orchestration: merge_option(
                 self.ticket_orchestration,
@@ -150,7 +150,10 @@ impl From<FeatureConfigPartial> for FeatureConfig {
                 .map(FeatureFlagConfig::from)
                 .unwrap_or_default(),
             web: value.web.map(FeatureFlagConfig::from).unwrap_or_default(),
-            pods: value.pods.map(FeatureFlagConfig::from).unwrap_or_default(),
+            workers: value
+                .workers
+                .map(FeatureFlagConfig::from)
+                .unwrap_or_default(),
             ticket: value
                 .ticket
                 .map(TicketFeatureConfig::from)
@@ -207,7 +210,7 @@ impl From<FeatureConfig> for FeatureConfigPartial {
             task: Some(value.task.into()),
             memory: Some(value.memory.into()),
             web: Some(value.web.into()),
-            pods: Some(value.pods.into()),
+            workers: Some(value.workers.into()),
             ticket: Some(value.ticket.into()),
             ticket_orchestration: Some(value.ticket_orchestration.into()),
             plugins: Some(value.plugins.into()),
@@ -216,18 +219,18 @@ impl From<FeatureConfig> for FeatureConfigPartial {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PodMetaConfig {
+pub struct WorkerMetaConfig {
     #[serde(default)]
     pub name: Option<String>,
     /// Optional `PromptCatalog` manifest pack override. See
-    /// [`crate::PodMeta::prompt_pack`] for semantics. Relative paths
-    /// are resolved through [`PodManifestConfig::resolve_paths`].
+    /// [`crate::WorkerMeta::prompt_pack`] for semantics. Relative paths
+    /// are resolved through [`WorkerManifestConfig::resolve_paths`].
     #[serde(default)]
     pub prompt_pack: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct WorkerManifestConfig {
+pub struct EngineManifestConfig {
     #[serde(default)]
     pub instruction: Option<String>,
     #[serde(default)]
@@ -318,8 +321,8 @@ pub struct CompactionConfigPartial {
     pub model: Option<ModelManifest>,
 }
 
-/// Errors raised when converting a [`PodManifestConfig`] to a validated
-/// [`PodManifest`] via `TryFrom`.
+/// Errors raised when converting a [`WorkerManifestConfig`] to a validated
+/// [`WorkerManifest`] via `TryFrom`.
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
     #[error("missing required field: {0}")]
@@ -359,7 +362,7 @@ pub(crate) fn reject_removed_manifest_fields(s: &str) -> Result<(), toml::de::Er
     Ok(())
 }
 
-impl PodManifestConfig {
+impl WorkerManifestConfig {
     /// Parse a partial manifest from a TOML string. Unknown top-level or
     /// nested fields emit a `tracing::warn!` and are ignored; use
     /// `tracing_subscriber` with `WARN` enabled to surface them to the
@@ -378,12 +381,12 @@ impl PodManifestConfig {
     /// from this layer so every per-field default lives at exactly one
     /// call site (the `defaults` module).
     ///
-    /// `TryFrom<PodManifestConfig>` also reads the same constants as a
+    /// `TryFrom<WorkerManifestConfig>` also reads the same constants as a
     /// belt-and-suspenders fallback, so a manually-constructed config
     /// that skips this layer still resolves to the same values.
     pub fn builtin_defaults() -> Self {
         Self {
-            worker: WorkerManifestConfig {
+            engine: EngineManifestConfig {
                 tool_output: ToolOutputLimitsPartial {
                     default_max_bytes: Some(defaults::TOOL_OUTPUT_MAX_BYTES),
                     per_tool: HashMap::new(),
@@ -415,7 +418,7 @@ impl PodManifestConfig {
             base.display()
         );
         resolve_auth_file(&mut self.model.auth, base);
-        if let Some(ref mut pack) = self.pod.prompt_pack {
+        if let Some(ref mut pack) = self.worker.prompt_pack {
             *pack = join_if_relative(base, pack);
         }
         for rule in &mut self.scope.allow {
@@ -457,11 +460,11 @@ impl PodManifestConfig {
     /// fields from `self`. Map entries merge key-wise with `upper`
     /// winning on conflict. Scope rules from both layers accumulate
     /// (see [`ScopeConfig`] semantics).
-    pub fn merge(self, upper: PodManifestConfig) -> Self {
+    pub fn merge(self, upper: WorkerManifestConfig) -> Self {
         Self {
-            pod: self.pod.merge(upper.pod),
-            model: self.model.merge(upper.model),
             worker: self.worker.merge(upper.worker),
+            model: self.model.merge(upper.model),
+            engine: self.engine.merge(upper.engine),
             scope: merge_scope(self.scope, upper.scope),
             delegation_scope: merge_scope(self.delegation_scope, upper.delegation_scope),
             session: merge_option(self.session, upper.session, SessionConfigPartial::merge),
@@ -575,7 +578,7 @@ impl MemoryConfig {
     }
 }
 
-impl PodMetaConfig {
+impl WorkerMetaConfig {
     fn merge(self, upper: Self) -> Self {
         Self {
             name: upper.name.or(self.name),
@@ -584,7 +587,7 @@ impl PodMetaConfig {
     }
 }
 
-impl WorkerManifestConfig {
+impl EngineManifestConfig {
     fn merge(self, upper: Self) -> Self {
         Self {
             instruction: upper.instruction.or(self.instruction),
@@ -696,9 +699,9 @@ fn join_if_relative(base: &Path, p: &Path) -> PathBuf {
     }
 }
 
-/// Invariant check: every path in a fully-resolved [`PodManifestConfig`]
+/// Invariant check: every path in a fully-resolved [`WorkerManifestConfig`]
 /// must be absolute. Relative paths are resolved per-layer via
-/// [`PodManifestConfig::resolve_paths`]; if one reaches `TryFrom` it
+/// [`WorkerManifestConfig::resolve_paths`]; if one reaches `TryFrom` it
 /// indicates a caller skipped the per-layer resolve step.
 fn ensure_absolute(field: &'static str, path: &Path) -> Result<(), ResolveError> {
     if path.is_absolute() {
@@ -871,45 +874,48 @@ fn bounded_label(value: &str) -> String {
     out
 }
 
-impl TryFrom<PodManifestConfig> for PodManifest {
+impl TryFrom<WorkerManifestConfig> for WorkerManifest {
     type Error = ResolveError;
 
-    fn try_from(cfg: PodManifestConfig) -> Result<Self, Self::Error> {
-        let name = cfg.pod.name.ok_or(ResolveError::MissingField("pod.name"))?;
-        let prompt_pack = cfg.pod.prompt_pack;
+    fn try_from(cfg: WorkerManifestConfig) -> Result<Self, Self::Error> {
+        let name = cfg
+            .worker
+            .name
+            .ok_or(ResolveError::MissingField("worker.name"))?;
+        let prompt_pack = cfg.worker.prompt_pack;
         if let Some(ref p) = prompt_pack {
-            ensure_absolute("pod.prompt_pack", p)?;
+            ensure_absolute("worker.prompt_pack", p)?;
         }
 
         validate_model_paths(&cfg.model, "model.auth.file")?;
 
-        let worker = WorkerManifest {
+        let engine = EngineManifest {
             instruction: cfg
-                .worker
+                .engine
                 .instruction
                 .unwrap_or_else(|| defaults::DEFAULT_INSTRUCTION.to_string()),
             language: cfg
-                .worker
+                .engine
                 .language
                 .unwrap_or_else(|| defaults::WORKER_LANGUAGE.to_string()),
-            max_tokens: cfg.worker.max_tokens,
-            max_turns: cfg.worker.max_turns,
-            temperature: cfg.worker.temperature,
-            top_p: cfg.worker.top_p,
-            top_k: cfg.worker.top_k,
-            stop_sequences: cfg.worker.stop_sequences.unwrap_or_default(),
-            reasoning: cfg.worker.reasoning,
+            max_tokens: cfg.engine.max_tokens,
+            max_turns: cfg.engine.max_turns,
+            temperature: cfg.engine.temperature,
+            top_p: cfg.engine.top_p,
+            top_k: cfg.engine.top_k,
+            stop_sequences: cfg.engine.stop_sequences.unwrap_or_default(),
+            reasoning: cfg.engine.reasoning,
             tool_output: ToolOutputLimits {
                 default_max_bytes: cfg
-                    .worker
+                    .engine
                     .tool_output
                     .default_max_bytes
                     .unwrap_or(defaults::TOOL_OUTPUT_MAX_BYTES),
-                per_tool: cfg.worker.tool_output.per_tool,
+                per_tool: cfg.engine.tool_output.per_tool,
             },
             file_upload: FileUploadLimits {
                 max_bytes: cfg
-                    .worker
+                    .engine
                     .file_upload
                     .max_bytes
                     .unwrap_or(defaults::FILE_UPLOAD_MAX_BYTES),
@@ -1007,10 +1013,10 @@ impl TryFrom<PodManifestConfig> for PodManifest {
 
         validate_mcp_config(&cfg.mcp)?;
 
-        Ok(PodManifest {
-            pod: PodMeta { name, prompt_pack },
+        Ok(WorkerManifest {
+            worker: WorkerMeta { name, prompt_pack },
             model: cfg.model,
-            worker,
+            engine,
             scope: cfg.scope,
             delegation_scope: cfg.delegation_scope,
             session,
@@ -1041,9 +1047,9 @@ mod tests {
         AuthRef::ApiKey { file: Some(path) }
     }
 
-    fn minimal_valid() -> PodManifestConfig {
-        PodManifestConfig {
-            pod: PodMetaConfig {
+    fn minimal_valid() -> WorkerManifestConfig {
+        WorkerManifestConfig {
+            worker: WorkerMetaConfig {
                 name: Some("test".into()),
                 prompt_pack: None,
             },
@@ -1052,10 +1058,10 @@ mod tests {
                 model_id: Some("claude-sonnet-4-20250514".into()),
                 ..Default::default()
             },
-            worker: WorkerManifestConfig::default(),
+            engine: EngineManifestConfig::default(),
             scope: ScopeConfig {
                 allow: vec![ScopeRule {
-                    target: abs("/pod"),
+                    target: abs("/worker"),
                     permission: Permission::Write,
                     recursive: true,
                 }],
@@ -1076,8 +1082,8 @@ mod tests {
 
     #[test]
     fn resolve_minimal_succeeds() {
-        let manifest: PodManifest = minimal_valid().try_into().unwrap();
-        assert_eq!(manifest.pod.name, "test");
+        let manifest: WorkerManifest = minimal_valid().try_into().unwrap();
+        assert_eq!(manifest.worker.name, "test");
         assert_eq!(manifest.model.scheme, Some(SchemeKind::Anthropic));
         assert!(manifest.permissions.is_none());
     }
@@ -1113,7 +1119,7 @@ mod tests {
             },
         });
 
-        let manifest: PodManifest = cfg.try_into().unwrap();
+        let manifest: WorkerManifest = cfg.try_into().unwrap();
 
         assert_eq!(manifest.mcp.stdio_servers.len(), 1);
         let server = &manifest.mcp.stdio_servers[0];
@@ -1137,7 +1143,7 @@ mod tests {
             env: crate::McpEnvConfig::default(),
         });
 
-        let err = PodManifest::try_from(cfg).unwrap_err();
+        let err = WorkerManifest::try_from(cfg).unwrap_err();
         assert!(matches!(
             err,
             ResolveError::InvalidMcpConfig {
@@ -1157,7 +1163,7 @@ mod tests {
             });
         }
 
-        let err = PodManifest::try_from(cfg).unwrap_err();
+        let err = WorkerManifest::try_from(cfg).unwrap_err();
         assert!(matches!(
             err,
             ResolveError::InvalidMcpConfig {
@@ -1186,7 +1192,7 @@ mod tests {
             },
         });
 
-        let err = PodManifest::try_from(cfg).unwrap_err();
+        let err = WorkerManifest::try_from(cfg).unwrap_err();
         let rendered = err.to_string();
         assert!(rendered.contains("secret_ref"));
         assert!(!rendered.contains("bad secret id with spaces"));
@@ -1208,7 +1214,7 @@ mod tests {
             env: crate::McpEnvConfig::default(),
         });
 
-        let manifest: PodManifest = cfg.try_into().unwrap();
+        let manifest: WorkerManifest = cfg.try_into().unwrap();
         assert_eq!(
             manifest.mcp.stdio_servers[0].command,
             "definitely-not-a-command-yoi-must-spawn"
@@ -1222,7 +1228,7 @@ mod tests {
             record_event_trace: Some(true),
         });
 
-        let manifest: PodManifest = cfg.try_into().unwrap();
+        let manifest: WorkerManifest = cfg.try_into().unwrap();
         assert!(manifest.session.record_event_trace);
     }
 
@@ -1234,7 +1240,7 @@ mod tests {
             rules: Vec::new(),
         });
 
-        let err = PodManifest::try_from(cfg).unwrap_err();
+        let err = WorkerManifest::try_from(cfg).unwrap_err();
 
         assert!(matches!(
             err,
@@ -1261,7 +1267,7 @@ mod tests {
             ],
         });
 
-        let manifest: PodManifest = cfg.try_into().unwrap();
+        let manifest: WorkerManifest = cfg.try_into().unwrap();
         let permissions = manifest.permissions.unwrap();
 
         assert_eq!(permissions.default_action, crate::ToolPermissionAction::Ask);
@@ -1318,7 +1324,7 @@ mod tests {
     fn try_from_invariant_rejects_lingering_relative_auth_file() {
         let mut cfg = minimal_valid();
         cfg.model.auth = Some(api_key_file_auth(PathBuf::from("keys/relative")));
-        let err = PodManifest::try_from(cfg).unwrap_err();
+        let err = WorkerManifest::try_from(cfg).unwrap_err();
         assert!(matches!(
             err,
             ResolveError::RelativePath {
@@ -1332,7 +1338,7 @@ mod tests {
     fn try_from_invariant_rejects_lingering_relative_scope_target() {
         let mut cfg = minimal_valid();
         cfg.scope.allow[0].target = PathBuf::from("docs");
-        let err = PodManifest::try_from(cfg).unwrap_err();
+        let err = WorkerManifest::try_from(cfg).unwrap_err();
         assert!(matches!(
             err,
             ResolveError::RelativePath {
@@ -1343,25 +1349,25 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rejects_missing_pod_name() {
+    fn resolve_rejects_missing_worker_name() {
         let mut cfg = minimal_valid();
-        cfg.pod.name = None;
-        let err = PodManifest::try_from(cfg).unwrap_err();
-        assert!(matches!(err, ResolveError::MissingField("pod.name")));
+        cfg.worker.name = None;
+        let err = WorkerManifest::try_from(cfg).unwrap_err();
+        assert!(matches!(err, ResolveError::MissingField("worker.name")));
     }
 
     #[test]
     fn resolve_accepts_empty_scope_for_profile_launch_policy() {
         let mut cfg = minimal_valid();
         cfg.scope.allow.clear();
-        let manifest = PodManifest::try_from(cfg).unwrap();
+        let manifest = WorkerManifest::try_from(cfg).unwrap();
         assert!(manifest.scope.allow.is_empty());
     }
 
     #[test]
     fn merge_scalar_upper_wins() {
-        let lower = PodManifestConfig {
-            pod: PodMetaConfig {
+        let lower = WorkerManifestConfig {
+            worker: WorkerMetaConfig {
                 name: Some("lower".into()),
                 prompt_pack: None,
             },
@@ -1371,30 +1377,30 @@ mod tests {
             },
             ..Default::default()
         };
-        let upper = PodManifestConfig {
-            pod: PodMetaConfig {
+        let upper = WorkerManifestConfig {
+            worker: WorkerMetaConfig {
                 name: Some("upper".into()),
                 prompt_pack: None,
             },
             ..Default::default()
         };
         let merged = lower.merge(upper);
-        assert_eq!(merged.pod.name.as_deref(), Some("upper"));
+        assert_eq!(merged.worker.name.as_deref(), Some("upper"));
         // model_id not present in upper — retain lower
         assert_eq!(merged.model.model_id.as_deref(), Some("lower-model"));
     }
 
     #[test]
     fn merge_worker_reasoning_upper_wins() {
-        let lower = PodManifestConfig {
-            worker: WorkerManifestConfig {
+        let lower = WorkerManifestConfig {
+            engine: EngineManifestConfig {
                 reasoning: Some(ReasoningControl::Effort(ReasoningEffort::Low)),
                 ..Default::default()
             },
             ..Default::default()
         };
-        let upper = PodManifestConfig {
-            worker: WorkerManifestConfig {
+        let upper = WorkerManifestConfig {
+            engine: EngineManifestConfig {
                 reasoning: Some(ReasoningControl::BudgetTokens(4096)),
                 ..Default::default()
             },
@@ -1404,15 +1410,15 @@ mod tests {
         let merged = lower.merge(upper);
 
         assert_eq!(
-            merged.worker.reasoning,
+            merged.engine.reasoning,
             Some(ReasoningControl::BudgetTokens(4096))
         );
     }
 
     #[test]
     fn merge_worker_generation_settings_upper_wins() {
-        let lower = PodManifestConfig {
-            worker: WorkerManifestConfig {
+        let lower = WorkerManifestConfig {
+            engine: EngineManifestConfig {
                 top_p: Some(0.8),
                 top_k: Some(20),
                 stop_sequences: Some(vec!["lower".into()]),
@@ -1420,8 +1426,8 @@ mod tests {
             },
             ..Default::default()
         };
-        let upper = PodManifestConfig {
-            worker: WorkerManifestConfig {
+        let upper = WorkerManifestConfig {
+            engine: EngineManifestConfig {
                 top_p: Some(0.9),
                 stop_sequences: Some(vec!["upper".into()]),
                 ..Default::default()
@@ -1431,14 +1437,14 @@ mod tests {
 
         let merged = lower.merge(upper);
 
-        assert_eq!(merged.worker.top_p, Some(0.9));
-        assert_eq!(merged.worker.top_k, Some(20));
-        assert_eq!(merged.worker.stop_sequences, Some(vec!["upper".into()]));
+        assert_eq!(merged.engine.top_p, Some(0.9));
+        assert_eq!(merged.engine.top_k, Some(20));
+        assert_eq!(merged.engine.stop_sequences, Some(vec!["upper".into()]));
     }
 
     #[test]
     fn merge_scope_accumulates_allow_and_deny() {
-        let lower = PodManifestConfig {
+        let lower = WorkerManifestConfig {
             scope: ScopeConfig {
                 allow: vec![ScopeRule {
                     target: abs("/a"),
@@ -1449,7 +1455,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let upper = PodManifestConfig {
+        let upper = WorkerManifestConfig {
             scope: ScopeConfig {
                 allow: vec![ScopeRule {
                     target: abs("/b"),
@@ -1471,7 +1477,7 @@ mod tests {
 
     #[test]
     fn merge_permissions_accumulates_rules_and_upper_default_wins() {
-        let lower = PodManifestConfig {
+        let lower = WorkerManifestConfig {
             permissions: Some(PermissionConfigPartial {
                 default_action: Some(crate::ToolPermissionAction::Allow),
                 rules: vec![ToolPermissionRule {
@@ -1482,7 +1488,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let upper = PodManifestConfig {
+        let upper = WorkerManifestConfig {
             permissions: Some(PermissionConfigPartial {
                 default_action: Some(crate::ToolPermissionAction::Deny),
                 rules: vec![ToolPermissionRule {
@@ -1507,8 +1513,8 @@ mod tests {
 
     #[test]
     fn merge_tool_output_per_tool_keywise() {
-        let lower = PodManifestConfig {
-            worker: WorkerManifestConfig {
+        let lower = WorkerManifestConfig {
+            engine: EngineManifestConfig {
                 tool_output: ToolOutputLimitsPartial {
                     default_max_bytes: Some(8192),
                     per_tool: [("Read".to_string(), 1024)].into_iter().collect(),
@@ -1517,8 +1523,8 @@ mod tests {
             },
             ..Default::default()
         };
-        let upper = PodManifestConfig {
-            worker: WorkerManifestConfig {
+        let upper = WorkerManifestConfig {
+            engine: EngineManifestConfig {
                 tool_output: ToolOutputLimitsPartial {
                     default_max_bytes: None,
                     per_tool: [("Read".to_string(), 2048), ("Grep".to_string(), 512)]
@@ -1530,7 +1536,7 @@ mod tests {
             ..Default::default()
         };
         let merged = lower.merge(upper);
-        let to = &merged.worker.tool_output;
+        let to = &merged.engine.tool_output;
         assert_eq!(to.default_max_bytes, Some(8192));
         assert_eq!(to.per_tool.get("Read"), Some(&2048));
         assert_eq!(to.per_tool.get("Grep"), Some(&512));
@@ -1538,8 +1544,8 @@ mod tests {
 
     #[test]
     fn merge_file_upload_max_bytes_upper_wins() {
-        let lower = PodManifestConfig {
-            worker: WorkerManifestConfig {
+        let lower = WorkerManifestConfig {
+            engine: EngineManifestConfig {
                 file_upload: FileUploadLimitsPartial {
                     max_bytes: Some(8192),
                 },
@@ -1547,8 +1553,8 @@ mod tests {
             },
             ..Default::default()
         };
-        let upper = PodManifestConfig {
-            worker: WorkerManifestConfig {
+        let upper = WorkerManifestConfig {
+            engine: EngineManifestConfig {
                 file_upload: FileUploadLimitsPartial {
                     max_bytes: Some(54_321),
                 },
@@ -1557,11 +1563,11 @@ mod tests {
             ..Default::default()
         };
         let merged = lower.merge(upper);
-        assert_eq!(merged.worker.file_upload.max_bytes, Some(54_321));
+        assert_eq!(merged.engine.file_upload.max_bytes, Some(54_321));
     }
     #[test]
     fn merge_option_struct_field_wise() {
-        let lower = PodManifestConfig {
+        let lower = WorkerManifestConfig {
             compaction: Some(CompactionConfigPartial {
                 threshold: Some(50_000),
                 prune_protected_tokens: Some(5_000),
@@ -1577,7 +1583,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let upper = PodManifestConfig {
+        let upper = WorkerManifestConfig {
             compaction: Some(CompactionConfigPartial {
                 threshold: Some(80_000),
                 ..Default::default()
@@ -1604,32 +1610,32 @@ mod tests {
     #[test]
     fn from_toml_type_mismatch_is_hard_error() {
         let bad = r#"
-[pod]
+[worker]
 name = "x"
 
-[worker]
+[engine]
 max_tokens = "not-a-number"
 "#;
-        assert!(PodManifestConfig::from_toml(bad).is_err());
+        assert!(WorkerManifestConfig::from_toml(bad).is_err());
     }
 
     #[test]
     fn from_toml_accepts_unknown_field() {
         // Unknown keys are warn-and-ignored, not hard errors.
-        // `pod.pwd` specifically is silently dropped after the
+        // `worker.pwd` specifically is silently dropped after the
         // path-resolution ticket — keep it in the fixture to exercise
         // that code path.
         let ok = r#"
-[pod]
+[worker]
 name = "x"
 pwd = "/obsolete"
 
-[worker]
+[engine]
 max_tokens = 1000
 unknown_future_field = "tolerated"
 "#;
-        let cfg = PodManifestConfig::from_toml(ok).unwrap();
-        assert_eq!(cfg.worker.max_tokens, Some(1000));
+        let cfg = WorkerManifestConfig::from_toml(ok).unwrap();
+        assert_eq!(cfg.engine.max_tokens, Some(1000));
     }
 
     #[test]
@@ -1638,7 +1644,7 @@ unknown_future_field = "tolerated"
 [compaction]
 prune_protected_turns = 3
 "#;
-        let err = PodManifestConfig::from_toml(bad).unwrap_err();
+        let err = WorkerManifestConfig::from_toml(bad).unwrap_err();
         assert!(
             err.to_string().contains("compaction.prune_protected_turns"),
             "unexpected error: {err}"
@@ -1651,7 +1657,7 @@ prune_protected_turns = 3
 [memory]
 extract_worker_max_input_tokens = 30000
 "#;
-        let err = PodManifestConfig::from_toml(bad).unwrap_err();
+        let err = WorkerManifestConfig::from_toml(bad).unwrap_err();
         assert!(
             err.to_string()
                 .contains("memory.extract_worker_max_input_tokens"),
@@ -1661,7 +1667,7 @@ extract_worker_max_input_tokens = 30000
 
     #[test]
     fn from_toml_accepts_extract_worker_max_turns() {
-        let cfg = PodManifestConfig::from_toml(
+        let cfg = WorkerManifestConfig::from_toml(
             r#"
 [memory]
 extract_worker_max_turns = 2
@@ -1673,36 +1679,36 @@ extract_worker_max_turns = 2
 
     #[test]
     fn from_toml_accepts_worker_reasoning_string_or_integer() {
-        let effort = PodManifestConfig::from_toml(
+        let effort = WorkerManifestConfig::from_toml(
             r#"
-[worker]
+[engine]
 reasoning = "xhigh"
 "#,
         )
         .unwrap();
         assert_eq!(
-            effort.worker.reasoning,
+            effort.engine.reasoning,
             Some(ReasoningControl::Effort(ReasoningEffort::XHigh))
         );
 
-        let budget = PodManifestConfig::from_toml(
+        let budget = WorkerManifestConfig::from_toml(
             r#"
-[worker]
+[engine]
 reasoning = -1
 "#,
         )
         .unwrap();
         assert_eq!(
-            budget.worker.reasoning,
+            budget.engine.reasoning,
             Some(ReasoningControl::BudgetTokens(-1))
         );
     }
 
     #[test]
     fn from_toml_accepts_worker_generation_settings() {
-        let cfg = PodManifestConfig::from_toml(
+        let cfg = WorkerManifestConfig::from_toml(
             r#"
-[worker]
+[engine]
 top_p = 0.9
 top_k = 40
 stop_sequences = ["\n\n", "</stop>"]
@@ -1710,17 +1716,17 @@ stop_sequences = ["\n\n", "</stop>"]
         )
         .unwrap();
 
-        assert_eq!(cfg.worker.top_p, Some(0.9));
-        assert_eq!(cfg.worker.top_k, Some(40));
+        assert_eq!(cfg.engine.top_p, Some(0.9));
+        assert_eq!(cfg.engine.top_k, Some(40));
         assert_eq!(
-            cfg.worker.stop_sequences,
+            cfg.engine.stop_sequences,
             Some(vec!["\n\n".into(), "</stop>".into()])
         );
     }
 
     #[test]
     fn from_toml_accepts_worker_max_turns() {
-        let cfg = PodManifestConfig::from_toml(
+        let cfg = WorkerManifestConfig::from_toml(
             r#"
 [compaction]
 worker_max_turns = 7
@@ -1736,7 +1742,7 @@ worker_max_turns = 7
         let mut cfg = minimal_valid();
         cfg.compaction = Some(CompactionConfigPartial::default());
 
-        let manifest = PodManifest::try_from(cfg).unwrap();
+        let manifest = WorkerManifest::try_from(cfg).unwrap();
 
         assert_eq!(
             manifest.compaction.unwrap().worker_max_turns,
@@ -1746,18 +1752,18 @@ worker_max_turns = 7
 
     #[test]
     fn feature_flags_default_disabled_in_resolved_manifest() {
-        let manifest: PodManifest = minimal_valid().try_into().unwrap();
+        let manifest: WorkerManifest = minimal_valid().try_into().unwrap();
         assert!(!manifest.feature.task.enabled);
         assert!(!manifest.feature.memory.enabled);
         assert!(!manifest.feature.web.enabled);
-        assert!(!manifest.feature.pods.enabled);
+        assert!(!manifest.feature.workers.enabled);
         assert!(!manifest.feature.ticket.enabled);
         assert!(!manifest.feature.ticket_orchestration.enabled);
     }
 
     #[test]
     fn from_toml_parses_explicit_feature_flags() {
-        let cfg = PodManifestConfig::from_toml(
+        let cfg = WorkerManifestConfig::from_toml(
             r#"
 [feature.task]
 enabled = true
@@ -1771,10 +1777,10 @@ enabled = true
 "#,
         )
         .unwrap();
-        let manifest: PodManifest = PodManifestConfig::builtin_defaults()
+        let manifest: WorkerManifest = WorkerManifestConfig::builtin_defaults()
             .merge(cfg)
-            .merge(PodManifestConfig {
-                pod: PodMetaConfig {
+            .merge(WorkerManifestConfig {
+                worker: WorkerMetaConfig {
                     name: Some("feature-test".into()),
                     prompt_pack: None,
                 },
@@ -1785,7 +1791,7 @@ enabled = true
                 },
                 scope: ScopeConfig {
                     allow: vec![ScopeRule {
-                        target: abs("/pod"),
+                        target: abs("/worker"),
                         permission: Permission::Read,
                         recursive: true,
                     }],
@@ -1807,7 +1813,7 @@ enabled = true
 
     #[test]
     fn feature_flags_merge_as_partial_profile_layers() {
-        let base = PodManifestConfig::from_toml(
+        let base = WorkerManifestConfig::from_toml(
             r#"
 [feature.memory]
 enabled = true
@@ -1818,7 +1824,7 @@ access = "read_only"
 "#,
         )
         .unwrap();
-        let upper = PodManifestConfig::from_toml(
+        let upper = WorkerManifestConfig::from_toml(
             r#"
 [feature.ticket]
 access = "lifecycle"
@@ -1828,11 +1834,11 @@ enabled = true
 "#,
         )
         .unwrap();
-        let manifest: PodManifest = PodManifestConfig::builtin_defaults()
+        let manifest: WorkerManifest = WorkerManifestConfig::builtin_defaults()
             .merge(base)
             .merge(upper)
-            .merge(PodManifestConfig {
-                pod: PodMetaConfig {
+            .merge(WorkerManifestConfig {
+                worker: WorkerMetaConfig {
                     name: Some("feature-merge-test".into()),
                     prompt_pack: None,
                 },
@@ -1843,7 +1849,7 @@ enabled = true
                 },
                 scope: ScopeConfig {
                     allow: vec![ScopeRule {
-                        target: abs("/pod"),
+                        target: abs("/worker"),
                         permission: Permission::Read,
                         recursive: true,
                     }],
@@ -1860,7 +1866,7 @@ enabled = true
             TicketFeatureAccessConfig::Lifecycle
         );
         assert!(manifest.feature.web.enabled);
-        assert!(!manifest.feature.pods.enabled);
+        assert!(!manifest.feature.workers.enabled);
     }
 
     #[test]
@@ -1871,20 +1877,20 @@ enabled = true
 target = "/abs/project"
 permission = "write"
 "#;
-        let cfg = PodManifestConfig::from_toml(toml).unwrap();
-        assert!(cfg.pod.name.is_none());
+        let cfg = WorkerManifestConfig::from_toml(toml).unwrap();
+        assert!(cfg.worker.name.is_none());
         assert_eq!(cfg.scope.allow.len(), 1);
     }
 
     #[test]
     fn builtin_defaults_populates_worker_limit_defaults() {
-        let cfg = PodManifestConfig::builtin_defaults();
+        let cfg = WorkerManifestConfig::builtin_defaults();
         assert_eq!(
-            cfg.worker.tool_output.default_max_bytes,
+            cfg.engine.tool_output.default_max_bytes,
             Some(defaults::TOOL_OUTPUT_MAX_BYTES)
         );
         assert_eq!(
-            cfg.worker.file_upload.max_bytes,
+            cfg.engine.file_upload.max_bytes,
             Some(defaults::FILE_UPLOAD_MAX_BYTES)
         );
     }
@@ -1892,10 +1898,10 @@ permission = "write"
     #[test]
     fn builtin_defaults_merged_into_minimal_resolves_with_defaults() {
         // Starting from builtin_defaults and overlaying only the
-        // required fields must resolve to a PodManifest carrying the
+        // required fields must resolve to a WorkerManifest carrying the
         // centralised default values.
-        let overlay = PodManifestConfig {
-            pod: PodMetaConfig {
+        let overlay = WorkerManifestConfig {
+            worker: WorkerMetaConfig {
                 name: Some("x".into()),
                 prompt_pack: None,
             },
@@ -1906,7 +1912,7 @@ permission = "write"
             },
             scope: ScopeConfig {
                 allow: vec![ScopeRule {
-                    target: abs("/pod"),
+                    target: abs("/worker"),
                     permission: Permission::Write,
                     recursive: true,
                 }],
@@ -1914,22 +1920,22 @@ permission = "write"
             },
             ..Default::default()
         };
-        let merged = PodManifestConfig::builtin_defaults().merge(overlay);
-        let manifest: PodManifest = merged.try_into().unwrap();
+        let merged = WorkerManifestConfig::builtin_defaults().merge(overlay);
+        let manifest: WorkerManifest = merged.try_into().unwrap();
         assert_eq!(
-            manifest.worker.tool_output.default_max_bytes,
+            manifest.engine.tool_output.default_max_bytes,
             defaults::TOOL_OUTPUT_MAX_BYTES
         );
         assert_eq!(
-            manifest.worker.file_upload.max_bytes,
+            manifest.engine.file_upload.max_bytes,
             defaults::FILE_UPLOAD_MAX_BYTES
         );
     }
 
     #[test]
     fn end_to_end_cascade() {
-        let builtin = PodManifestConfig::default();
-        let user = PodManifestConfig::from_toml(
+        let builtin = WorkerManifestConfig::default();
+        let user = WorkerManifestConfig::from_toml(
             r#"
 [model]
 scheme = "anthropic"
@@ -1937,7 +1943,7 @@ model_id = "claude-sonnet-4-20250514"
 "#,
         )
         .unwrap();
-        let project = PodManifestConfig::from_toml(
+        let project = WorkerManifestConfig::from_toml(
             r#"
 [[scope.allow]]
 target = "/abs/project"
@@ -1945,17 +1951,17 @@ permission = "write"
 "#,
         )
         .unwrap();
-        let overlay = PodManifestConfig::from_toml(
+        let overlay = WorkerManifestConfig::from_toml(
             r#"
-[pod]
+[worker]
 name = "dbg"
 "#,
         )
         .unwrap();
 
         let merged = builtin.merge(user).merge(project).merge(overlay);
-        let manifest: PodManifest = merged.try_into().unwrap();
-        assert_eq!(manifest.pod.name, "dbg");
+        let manifest: WorkerManifest = merged.try_into().unwrap();
+        assert_eq!(manifest.worker.name, "dbg");
         assert_eq!(manifest.model.scheme, Some(SchemeKind::Anthropic));
         assert_eq!(manifest.scope.allow.len(), 1);
     }
@@ -1981,7 +1987,7 @@ name = "dbg"
         cfg.skills = Some(SkillsConfig {
             directories: vec![PathBuf::from("relative/skills")],
         });
-        let err = PodManifest::try_from(cfg).unwrap_err();
+        let err = WorkerManifest::try_from(cfg).unwrap_err();
         assert!(matches!(
             err,
             ResolveError::RelativePath {
@@ -1993,13 +1999,13 @@ name = "dbg"
 
     #[test]
     fn skills_merge_extends_directories() {
-        let lower = PodManifestConfig {
+        let lower = WorkerManifestConfig {
             skills: Some(SkillsConfig {
                 directories: vec![PathBuf::from("/a")],
             }),
             ..Default::default()
         };
-        let upper = PodManifestConfig {
+        let upper = WorkerManifestConfig {
             skills: Some(SkillsConfig {
                 directories: vec![PathBuf::from("/b")],
             }),
@@ -2013,13 +2019,13 @@ name = "dbg"
     #[test]
     fn from_toml_parses_skills_section() {
         let toml = r#"
-[pod]
+[worker]
 name = "x"
 
 [skills]
 directories = [".claude/skills", ".cursor/skills"]
 "#;
-        let cfg = PodManifestConfig::from_toml(toml).unwrap();
+        let cfg = WorkerManifestConfig::from_toml(toml).unwrap();
         let dirs = cfg.skills.unwrap().directories;
         assert_eq!(
             dirs,
@@ -2032,14 +2038,14 @@ directories = [".claude/skills", ".cursor/skills"]
 
     #[test]
     fn merge_preserves_ref() {
-        let lower = PodManifestConfig {
+        let lower = WorkerManifestConfig {
             model: ModelManifest {
                 ref_: Some("anthropic/claude-sonnet-4-6".into()),
                 ..Default::default()
             },
             ..Default::default()
         };
-        let upper = PodManifestConfig {
+        let upper = WorkerManifestConfig {
             model: ModelManifest {
                 // only override auth
                 auth: Some(AuthRef::None),

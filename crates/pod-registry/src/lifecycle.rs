@@ -8,21 +8,21 @@ use manifest::ScopeRule;
 use session_store::SegmentId;
 
 use crate::error::ScopeLockError;
-use crate::mutate::release_pod;
+use crate::mutate::release_worker;
 use crate::table::{LockFileGuard, default_registry_path};
 
 /// Owned allocation: on drop, opens the lock file and releases this
-/// Pod's entry. The guard keeps only the name + lock-file path; it
-/// does not hold the `flock` for the Pod's lifetime.
+/// Worker's entry. The guard keeps only the name + lock-file path; it
+/// does not hold the `flock` for the Worker's lifetime.
 #[derive(Debug)]
 pub struct ScopeAllocationGuard {
-    pod_name: String,
+    worker_name: String,
     lock_path: PathBuf,
 }
 
 impl ScopeAllocationGuard {
-    pub fn pod_name(&self) -> &str {
-        &self.pod_name
+    pub fn worker_name(&self) -> &str {
+        &self.worker_name
     }
 
     pub fn lock_path(&self) -> &Path {
@@ -33,28 +33,35 @@ impl ScopeAllocationGuard {
 impl Drop for ScopeAllocationGuard {
     fn drop(&mut self) {
         if let Ok(mut guard) = LockFileGuard::open(&self.lock_path) {
-            let _ = release_pod(&mut guard, &self.pod_name);
+            let _ = release_worker(&mut guard, &self.worker_name);
         }
     }
 }
 
-/// Open the default lock file, register a top-level Pod, and return a
+/// Open the default lock file, register a top-level Worker, and return a
 /// guard that will release the allocation on drop.
 pub fn install_top_level(
-    pod_name: String,
+    worker_name: String,
     pid: u32,
     socket: PathBuf,
     scope_allow: Vec<ScopeRule>,
     segment_id: SegmentId,
 ) -> Result<ScopeAllocationGuard, ScopeLockError> {
-    install_top_level_with_deny(pod_name, pid, socket, scope_allow, Vec::new(), segment_id)
+    install_top_level_with_deny(
+        worker_name,
+        pid,
+        socket,
+        scope_allow,
+        Vec::new(),
+        segment_id,
+    )
 }
 
-/// Open the default lock file, register a top-level Pod with explicit
+/// Open the default lock file, register a top-level Worker with explicit
 /// deny rules, and return a guard that will release the allocation on
 /// drop.
 pub fn install_top_level_with_deny(
-    pod_name: String,
+    worker_name: String,
     pid: u32,
     socket: PathBuf,
     scope_allow: Vec<ScopeRule>,
@@ -63,9 +70,9 @@ pub fn install_top_level_with_deny(
 ) -> Result<ScopeAllocationGuard, ScopeLockError> {
     let lock_path = default_registry_path()?;
     let mut guard = LockFileGuard::open(&lock_path)?;
-    crate::mutate::register_pod_with_deny(
+    crate::mutate::register_worker_with_deny(
         &mut guard,
-        pod_name.clone(),
+        worker_name.clone(),
         pid,
         socket,
         scope_allow,
@@ -73,13 +80,13 @@ pub fn install_top_level_with_deny(
         segment_id,
     )?;
     Ok(ScopeAllocationGuard {
-        pod_name,
+        worker_name,
         lock_path,
     })
 }
 
 /// Take ownership of an existing allocation that was pre-registered by
-/// a spawning Pod.
+/// a spawning Worker.
 ///
 /// The spawning flow is two-stage: the spawner calls
 /// [`crate::delegate_scope`] (with its own pid as a live placeholder,
@@ -88,7 +95,7 @@ pub fn install_top_level_with_deny(
 /// segment_id to its own and claim the [`ScopeAllocationGuard`] so
 /// the entry is released when the child exits.
 pub fn adopt_allocation(
-    pod_name: String,
+    worker_name: String,
     new_pid: u32,
     segment_id: SegmentId,
 ) -> Result<ScopeAllocationGuard, ScopeLockError> {
@@ -96,24 +103,24 @@ pub fn adopt_allocation(
     let mut guard = LockFileGuard::open(&lock_path)?;
     let alloc = guard
         .data_mut()
-        .find_mut(&pod_name)
-        .ok_or_else(|| ScopeLockError::UnknownPod(pod_name.clone()))?;
+        .find_mut(&worker_name)
+        .ok_or_else(|| ScopeLockError::UnknownWorker(worker_name.clone()))?;
     alloc.pid = new_pid;
     alloc.segment_id = Some(segment_id);
     guard.save()?;
     Ok(ScopeAllocationGuard {
-        pod_name,
+        worker_name,
         lock_path,
     })
 }
 
-/// Rewrite the `segment_id` recorded for `pod_name` to
+/// Rewrite the `segment_id` recorded for `worker_name` to
 /// `new_segment_id`.
 ///
-/// The Pod's in-memory `segment_id` can change underneath the
+/// The Worker's in-memory `segment_id` can change underneath the
 /// allocation in two normal places:
 ///
-/// - `Pod::compact` mints a fresh session and swaps it in.
+/// - `Worker::compact` mints a fresh session and swaps it in.
 /// - `session_store::ensure_head_or_fork` auto-forks when another
 ///   writer has advanced the store head behind our back.
 ///
@@ -121,37 +128,37 @@ pub fn adopt_allocation(
 /// find the live session id, not the old one. Without this update a
 /// concurrent `restore_from_manifest(new_id)` would see "no live
 /// writer" and proceed to register a competing allocation on the
-/// session this Pod just moved into.
+/// session this Worker just moved into.
 ///
 /// The lock is opened once and the allocation is rewritten inside the
 /// guard, so the segment_id collision check is atomic with the
 /// rewrite.
-pub fn update_segment(pod_name: &str, new_segment_id: SegmentId) -> Result<(), ScopeLockError> {
+pub fn update_segment(worker_name: &str, new_segment_id: SegmentId) -> Result<(), ScopeLockError> {
     let lock_path = default_registry_path()?;
     let mut guard = LockFileGuard::open(&lock_path)?;
     if let Some(other) = guard.data().find_by_segment(new_segment_id) {
-        if other.pod_name != pod_name {
+        if other.worker_name != worker_name {
             return Err(ScopeLockError::SegmentConflict {
                 segment_id: new_segment_id,
-                pod_name: other.pod_name.clone(),
+                worker_name: other.worker_name.clone(),
                 socket: other.socket.clone(),
             });
         }
     }
     let alloc = guard
         .data_mut()
-        .find_mut(pod_name)
-        .ok_or_else(|| ScopeLockError::UnknownPod(pod_name.into()))?;
+        .find_mut(worker_name)
+        .ok_or_else(|| ScopeLockError::UnknownWorker(worker_name.into()))?;
     alloc.segment_id = Some(new_segment_id);
     guard.save()?;
     Ok(())
 }
 
-/// Information about a Pod that currently holds an allocation for a
+/// Information about a Worker that currently holds an allocation for a
 /// given session.
 #[derive(Debug, Clone)]
 pub struct SegmentLockInfo {
-    pub pod_name: String,
+    pub worker_name: String,
     pub socket: PathBuf,
     pub pid: u32,
 }
@@ -159,7 +166,7 @@ pub struct SegmentLockInfo {
 /// Open the default lock file, reclaim stale entries, and return the
 /// allocation currently writing to `segment_id`, if any.
 ///
-/// Used by `Pod::restore_from_manifest` to refuse a resume that would
+/// Used by `Worker::restore_from_manifest` to refuse a resume that would
 /// race a live writer on the same source session.
 pub fn lookup_segment(segment_id: SegmentId) -> Result<Option<SegmentLockInfo>, ScopeLockError> {
     let lock_path = default_registry_path()?;
@@ -169,7 +176,7 @@ pub fn lookup_segment(segment_id: SegmentId) -> Result<Option<SegmentLockInfo>, 
         .data()
         .find_by_segment(segment_id)
         .map(|a| SegmentLockInfo {
-            pod_name: a.pod_name.clone(),
+            worker_name: a.worker_name.clone(),
             socket: a.socket.clone(),
             pid: a.pid,
         }))
@@ -185,11 +192,11 @@ mod tests {
     /// Mimic what the spawner does before the child comes up: push an
     /// allocation for the child carrying the spawner's (live) pid as a
     /// placeholder. Exists only in tests.
-    fn delegate_placeholder(g: &mut LockFileGuard, pod_name: &str, placeholder_pid: u32) {
+    fn delegate_placeholder(g: &mut LockFileGuard, worker_name: &str, placeholder_pid: u32) {
         g.data_mut().allocations.push(Allocation {
-            pod_name: pod_name.to_string(),
+            worker_name: worker_name.to_string(),
             pid: placeholder_pid,
-            socket: sock(pod_name),
+            socket: sock(worker_name),
             scope_allow: vec![write_rule("/tmp/child", true)],
             scope_deny: Vec::new(),
             delegated_from: None,
@@ -202,7 +209,7 @@ mod tests {
     fn scope_allocation_guard_releases_on_drop() {
         let dir = TempDir::new().unwrap();
         let _sandbox = RuntimeDirSandbox::new(dir.path());
-        let lock_path = dir.path().join("pods.json");
+        let lock_path = dir.path().join("workers.json");
         let guard = install_top_level(
             "a".into(),
             std::process::id(),
@@ -226,7 +233,7 @@ mod tests {
     fn adopt_allocation_rewrites_pid_and_releases_on_drop() {
         let dir = TempDir::new().unwrap();
         let _sandbox = RuntimeDirSandbox::new(dir.path());
-        let lock_path = dir.path().join("pods.json");
+        let lock_path = dir.path().join("workers.json");
         // Pre-register an allocation under spawner's pid, as delegate_scope would.
         {
             let mut g = LockFileGuard::open(&lock_path).unwrap();
@@ -251,7 +258,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _sandbox = RuntimeDirSandbox::new(dir.path());
         let err = adopt_allocation("ghost".into(), 42, sid()).unwrap_err();
-        assert!(matches!(err, ScopeLockError::UnknownPod(ref n) if n == "ghost"));
+        assert!(matches!(err, ScopeLockError::UnknownWorker(ref n) if n == "ghost"));
     }
 
     #[test]
@@ -268,7 +275,7 @@ mod tests {
         )
         .unwrap();
         let info = lookup_segment(s).unwrap().expect("expected live writer");
-        assert_eq!(info.pod_name, "live");
+        assert_eq!(info.worker_name, "live");
         assert_eq!(info.socket, sock("live"));
         drop(guard);
         // After the guard's release, the lookup goes back to None.
@@ -292,7 +299,7 @@ mod tests {
         update_segment("p", updated).unwrap();
         // lookup against the original is now empty, the updated id wins.
         assert!(lookup_segment(original).unwrap().is_none());
-        assert_eq!(lookup_segment(updated).unwrap().unwrap().pod_name, "p");
+        assert_eq!(lookup_segment(updated).unwrap().unwrap().worker_name, "p");
     }
 
     #[test]
@@ -321,11 +328,11 @@ mod tests {
         let err = update_segment("a", s_b).unwrap_err();
         match err {
             ScopeLockError::SegmentConflict {
-                pod_name,
+                worker_name,
                 segment_id,
                 ..
             } => {
-                assert_eq!(pod_name, "b");
+                assert_eq!(worker_name, "b");
                 assert_eq!(segment_id, s_b);
             }
             other => panic!("expected SegmentConflict, got {other:?}"),

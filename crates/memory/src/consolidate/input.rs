@@ -31,7 +31,7 @@ pub fn build_consolidate_input(
         "consolidation input. Run the integration step first \
          (fold the staging activity logs into memory and knowledge), then the \
          tidy step (clean up existing records). Use the memory tools for \
-         every write — direct file writes are denied by the pod scope.\n\n",
+         every write — direct file writes are denied by the worker scope.\n\n",
     );
 
     out.push_str("## Staging entries (consumed by this run)\n\n");

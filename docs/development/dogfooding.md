@@ -17,7 +17,7 @@ A report is useful when it explains:
 
 After rebuilding and restarting during dogfooding, `current_exe()` can point at a deleted binary path. Use typed runtime-command configuration and the development-only `YOI_POD_RUNTIME_COMMAND` executable override rather than reviving shell-command overrides.
 
-## Multi-Pod work
+## Multi-Worker work
 
 Use child Pods for scoped tasks and reviews, but keep orchestration decisions in visible project records. Do not merge, close, or clean up merely because a child notification arrived.
 

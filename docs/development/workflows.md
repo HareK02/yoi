@@ -14,7 +14,7 @@ Current workflow themes include:
 - Orchestrator routing from Tickets to the next workflow/action
 - planning/requirements synchronization when concrete missing decisions or information block routing
 - worktree setup and cleanup
-- sibling coder/reviewer Pod orchestration
+- sibling coder/reviewer Worker orchestration
 - human-gated maintenance and merge readiness
 
 ## Child Pods
@@ -23,8 +23,8 @@ Spawned Pods are useful for scoped implementation, review, or exploration. They 
 
 A parent/orchestrator must verify:
 
-- child output via `ReadPodOutput`
-- live/restorable state via Pod tools when relevant
+- child output via `ReadWorkerOutput`
+- live/restorable state via Worker tools when relevant
 - worktree state and diff
 - validation command output
 - Ticket requirements and acceptance criteria

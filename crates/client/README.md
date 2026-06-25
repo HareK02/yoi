@@ -8,7 +8,7 @@
 
 Owns:
 
-- one-shot Pod socket client behavior
+- one-shot Worker socket client behavior
 - request/reply delivery mechanics
 - runtime command construction below the product façade
 - shared attach/status probing helpers used by higher layers
@@ -16,15 +16,15 @@ Owns:
 Does not own:
 
 - product command names (`yoi`)
-- Pod state authority (`pod`, `pod-store`, `session-store`)
+- Worker state authority (`worker`, `pod-store`, `session-store`)
 - UI rendering (`tui`)
 - Engine turn semantics (`llm-engine`)
 
 ## Design notes
 
-The client boundary lets `tui` and `yoi` share Pod communication without making library crates depend on the product binary. Socket clients should drain connect-time snapshot/alert traffic before sending a method or deciding status.
+The client boundary lets `tui` and `yoi` share Worker communication without making library crates depend on the product binary. Socket clients should drain connect-time snapshot/alert traffic before sending a method or deciding status.
 
 ## See also
 
-- [`../../docs/design/pod-session-state.md`](../../docs/design/pod-session-state.md)
+- [`../../docs/design/worker-session-state.md`](../../docs/design/worker-session-state.md)
 - [`../../docs/design/overview.md`](../../docs/design/overview.md)

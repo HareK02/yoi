@@ -2,7 +2,7 @@
 //!
 //! Workflows live under `<workspace>/.yoi/workflow/<slug>.md`. They are
 //! human-authored Markdown documents with YAML frontmatter. The loader is
-//! intentionally strict about malformed records because Pod startup should
+//! intentionally strict about malformed records because Worker startup should
 //! fail rather than silently ignoring a broken procedural instruction.
 
 use std::collections::BTreeMap;

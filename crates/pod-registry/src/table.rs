@@ -22,33 +22,33 @@ pub struct LockFile {
     pub allocations: Vec<Allocation>,
 }
 
-/// One Pod's scope allocation.
+/// One Worker's scope allocation.
 ///
-/// `scope_allow` is the full set of allow rules the Pod was granted.
-/// Portions delegated out to child Pods are **not** subtracted in
+/// `scope_allow` is the full set of allow rules the Worker was granted.
+/// Portions delegated out to child Workers are **not** subtracted in
 /// storage — the effective write scope is derived on the fly by
-/// removing rules owned by any Pod whose `delegated_from` points to
+/// removing rules owned by any Worker whose `delegated_from` points to
 /// this one. Keeping the raw allow set makes reparenting (stale
 /// reclaim) trivial.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Allocation {
-    /// Pod name — also the identity used throughout orchestration.
-    pub pod_name: String,
+    /// Worker name — also the identity used throughout orchestration.
+    pub worker_name: String,
     /// Owning process. Checked with `kill(pid, 0)` for stale detection.
     pub pid: u32,
-    /// Pod's Unix socket path.
+    /// Worker's Unix socket path.
     pub socket: PathBuf,
-    /// Allow rules granted to this Pod (write + read).
+    /// Allow rules granted to this Worker (write + read).
     pub scope_allow: Vec<ScopeRule>,
-    /// Deny rules that cap this Pod's effective scope. Normally empty for
-    /// fresh allocations; restored Pods use this to avoid reclaiming
+    /// Deny rules that cap this Worker's effective scope. Normally empty for
+    /// fresh allocations; restored Workers use this to avoid reclaiming
     /// previously delegated write regions.
     #[serde(default)]
     pub scope_deny: Vec<ScopeRule>,
-    /// Name of the Pod that delegated scope to this one, or `None` for
-    /// a top-level Pod started directly by a human.
+    /// Name of the Worker that delegated scope to this one, or `None` for
+    /// a top-level Worker started directly by a human.
     pub delegated_from: Option<String>,
-    /// Segment ID this Pod is currently writing to. `None` means this
+    /// Segment ID this Worker is currently writing to. `None` means this
     /// is a pre-reservation made by a spawner via [`crate::delegate_scope`]
     /// before the child has come up; the child fills it in at
     /// [`crate::adopt_allocation`] time.
@@ -57,12 +57,16 @@ pub struct Allocation {
 }
 
 impl LockFile {
-    pub fn find(&self, pod_name: &str) -> Option<&Allocation> {
-        self.allocations.iter().find(|a| a.pod_name == pod_name)
+    pub fn find(&self, worker_name: &str) -> Option<&Allocation> {
+        self.allocations
+            .iter()
+            .find(|a| a.worker_name == worker_name)
     }
 
-    pub fn find_mut(&mut self, pod_name: &str) -> Option<&mut Allocation> {
-        self.allocations.iter_mut().find(|a| a.pod_name == pod_name)
+    pub fn find_mut(&mut self, worker_name: &str) -> Option<&mut Allocation> {
+        self.allocations
+            .iter_mut()
+            .find(|a| a.worker_name == worker_name)
     }
 
     /// Find the allocation currently writing to `segment_id`. Skips
@@ -74,7 +78,7 @@ impl LockFile {
     }
 }
 
-/// Default on-disk path: `<runtime_dir>/pods.json` resolved via
+/// Default on-disk path: `<runtime_dir>/workers.json` resolved via
 /// [`manifest::paths::pod_registry_path`]. Tests should point this
 /// elsewhere by setting `YOI_HOME` or `YOI_RUNTIME_DIR` to a
 /// tempdir.
@@ -82,7 +86,7 @@ pub fn default_registry_path() -> io::Result<PathBuf> {
     paths::pod_registry_path().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            "could not resolve pods.json path (no YOI_HOME / \
+            "could not resolve workers.json path (no YOI_HOME / \
              YOI_RUNTIME_DIR / XDG_RUNTIME_DIR / HOME)",
         )
     })
@@ -173,7 +177,7 @@ impl LockFileGuard {
             serde_json::from_str(&buf).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("pods.json parse error: {e}"),
+                    format!("workers.json parse error: {e}"),
                 )
             })?
         };
@@ -215,7 +219,7 @@ mod tests {
     #[test]
     fn open_creates_empty_lock_file() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("pods.json");
+        let path = dir.path().join("workers.json");
         let guard = LockFileGuard::open(&path).unwrap();
         assert!(guard.data().allocations.is_empty());
         assert!(path.exists());
@@ -226,7 +230,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new().unwrap();
         let parent = dir.path().join("yoi");
-        let path = parent.join("pods.json");
+        let path = parent.join("workers.json");
         let _guard = LockFileGuard::open(&path).unwrap();
         let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(file_mode, 0o600, "file mode = {file_mode:o}");
@@ -237,10 +241,10 @@ mod tests {
     #[test]
     fn save_and_reopen_roundtrip() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("pods.json");
+        let path = dir.path().join("workers.json");
         {
             let mut g = open_empty(&path);
-            register_pod(
+            register_worker(
                 &mut g,
                 "a".into(),
                 std::process::id(),
@@ -252,19 +256,19 @@ mod tests {
         }
         let guard = LockFileGuard::open(&path).unwrap();
         assert_eq!(guard.data().allocations.len(), 1);
-        assert_eq!(guard.data().allocations[0].pod_name, "a");
+        assert_eq!(guard.data().allocations[0].worker_name, "a");
     }
 
     #[test]
     fn find_by_session_skips_none_placeholders() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("pods.json");
+        let path = dir.path().join("workers.json");
         let mut g = open_empty(&path);
         // Pre-reservation: delegate_scope leaves segment_id = None
         // until adopt_allocation rewrites it. find_by_segment must not
         // match those placeholders, otherwise a freshly-spawning child
         // would shadow itself before it has even chosen a session.
-        register_pod(
+        register_worker(
             &mut g,
             "parent".into(),
             std::process::id(),
@@ -292,6 +296,6 @@ mod tests {
         // After adopt-style rewrite, the same allocation is now found.
         g.data_mut().find_mut("child").unwrap().segment_id = Some(target_session);
         let found = g.data().find_by_segment(target_session).unwrap();
-        assert_eq!(found.pod_name, "child");
+        assert_eq!(found.worker_name, "child");
     }
 }

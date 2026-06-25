@@ -99,7 +99,7 @@ fn prompt_model_choice(
     println!("yoi setup-model");
     println!();
     println!("Choose the default model Profile to write under the user config directory.");
-    println!("This command only writes Profile config; it does not start or attach a Pod.");
+    println!("This command only writes Profile config; it does not start or attach a Worker.");
     println!();
     for (idx, choice) in choices.iter().enumerate() {
         println!(
@@ -237,7 +237,7 @@ return profile {{
         task = {{ enabled = true }},
         memory = {{ enabled = true }},
         web = {{ enabled = true }},
-        pods = {{ enabled = false }},
+        workers = {{ enabled = false }},
         ticket = {{ enabled = false, access = "lifecycle" }},
         ticket_orchestration = {{ enabled = false }},
     }},

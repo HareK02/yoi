@@ -8,7 +8,7 @@
 
 Owns:
 
-- built-in filesystem, web, memory, and Pod-management tool implementations where applicable
+- built-in filesystem, web, memory, and Worker-management tool implementations where applicable
 - bounded tool output formatting
 - scope-aware file operation helpers
 - tool-facing diagnostics suitable for history/model consumption
@@ -17,7 +17,7 @@ Does not own:
 
 - manifest permission policy definition (`manifest`)
 - Engine tool-loop semantics (`llm-engine`)
-- Pod lifecycle decisions (`pod`)
+- Worker lifecycle decisions (`worker`)
 - UI presentation (`tui`)
 
 ## Design notes

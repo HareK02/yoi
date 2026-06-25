@@ -25,7 +25,7 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use protocol::{AlertLevel, CompletionEntry, Greeting, PodEvent, Segment};
+use protocol::{AlertLevel, CompletionEntry, Greeting, Segment, WorkerEvent};
 
 use crate::app::{ActionbarNoticeLevel, App, CompletionState, alert_source_label, fmt_tokens};
 use crate::block::{Block, CompactEvent, ThinkingBlock, ThinkingState};
@@ -509,7 +509,7 @@ fn draw_rewind_picker(
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" waiting for Pod response"),
+            Span::raw(" waiting for Worker response"),
         ]
     } else {
         vec![
@@ -871,7 +871,7 @@ fn render_block_into(lines: &mut Vec<Line<'static>>, block: &Block, width: u16, 
     match block {
         Block::Greeting(g) => match mode {
             Mode::Overview => {
-                let text = format!("{}  {} ({})", g.pod_name, g.model, g.provider);
+                let text = format!("{}  {} ({})", g.worker_name, g.model, g.provider);
                 lines.push(Line::from(Span::styled(
                     text,
                     Style::default().fg(Color::Cyan),
@@ -894,8 +894,8 @@ fn render_block_into(lines: &mut Vec<Line<'static>>, block: &Block, width: u16, 
                 _ => push_padded_lines(lines, &text, MessageKind::Notify),
             }
         }
-        Block::PodEvent { event } => {
-            let text = format_pod_event(event);
+        Block::WorkerEvent { event } => {
+            let text = format_worker_event(event);
             match mode {
                 Mode::Overview => push_overview_line(lines, &text, width, MessageKind::Notify, ""),
                 _ => push_padded_lines(lines, &text, MessageKind::Notify),
@@ -1595,7 +1595,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         conn,
         Span::raw(" "),
         Span::styled(
-            app.pod_name.clone(),
+            app.worker_name.clone(),
             Style::default().add_modifier(Modifier::BOLD),
         ),
     ];
@@ -1823,7 +1823,7 @@ fn greeting_lines(g: &Greeting) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     lines.push(Line::from(Span::styled(
-        g.pod_name.clone(),
+        g.worker_name.clone(),
         Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
@@ -1856,9 +1856,9 @@ fn greeting_lines(g: &Greeting) -> Vec<Line<'static>> {
 pub enum MessageKind {
     TurnHeader,
     User,
-    /// External-input echoes (`Method::Notify` / `Method::PodEvent`).
+    /// External-input echoes (`Method::Notify` / `Method::WorkerEvent`).
     /// Visually distinct from User / Assistant / Notice so it's clear
-    /// the line came from another Pod or operator, not the local user.
+    /// the line came from another Worker or operator, not the local user.
     Notify,
     /// Persisted role:system history item preview.
     System,
@@ -1891,27 +1891,30 @@ pub fn kind_style(kind: MessageKind) -> Style {
     }
 }
 
-/// One-line summary of a `PodEvent` for display in the activity log.
+/// One-line summary of a `WorkerEvent` for display in the activity log.
 /// Independent from the LLM-injection wrapper (`crate::ipc::event::render_event`
-/// in the pod crate) — that path applies prompt-pack wrapping, while
+/// in the worker crate) — that path applies prompt-pack wrapping, while
 /// this is the human-facing rendering of the raw structured event.
-fn format_pod_event(event: &PodEvent) -> String {
+fn format_worker_event(event: &WorkerEvent) -> String {
     match event {
-        PodEvent::TurnEnded { pod_name } => {
-            format!("[pod_event] {pod_name} → turn_ended")
+        WorkerEvent::TurnEnded { worker_name } => {
+            format!("[worker_event] {worker_name} → turn_ended")
         }
-        PodEvent::Errored { pod_name, message } => {
-            format!("[pod_event] {pod_name} → errored: {message}")
+        WorkerEvent::Errored {
+            worker_name,
+            message,
+        } => {
+            format!("[worker_event] {worker_name} → errored: {message}")
         }
-        PodEvent::ShutDown { pod_name } => {
-            format!("[pod_event] {pod_name} → shut_down")
+        WorkerEvent::ShutDown { worker_name } => {
+            format!("[worker_event] {worker_name} → shut_down")
         }
-        PodEvent::ScopeSubDelegated {
-            parent_pod,
-            sub_pod,
+        WorkerEvent::ScopeSubDelegated {
+            parent_worker,
+            sub_worker,
             ..
         } => {
-            format!("[pod_event] {parent_pod} → scope_sub_delegated: {sub_pod}")
+            format!("[worker_event] {parent_worker} → scope_sub_delegated: {sub_worker}")
         }
     }
 }
@@ -1920,13 +1923,13 @@ fn format_pod_event(event: &PodEvent) -> String {
 mod tests {
     use super::*;
     use crate::app::{ActionbarNoticeLevel, ActionbarNoticeSource, App};
-    use protocol::PodStatus;
+    use protocol::WorkerStatus;
     use std::time::{Duration, Instant};
 
     #[test]
     fn queue_status_text_includes_count_and_preview() {
         let mut app = App::new("test".into());
-        app.set_pod_status(PodStatus::Running);
+        app.set_worker_status(WorkerStatus::Running);
         for c in "queued preview".chars() {
             app.insert_char(c);
         }
@@ -1952,7 +1955,7 @@ mod tests {
         app.latest_llm_wait_event = Some("retrying LLM request".into());
         app.latest_memory_worker_event = Some("memory extract running".into());
         app.flash_actionbar_notice_at(
-            "Pod keeps running. Press Ctrl-C again to exit TUI.",
+            "Worker keeps running. Press Ctrl-C again to exit TUI.",
             ActionbarNoticeLevel::Warn,
             ActionbarNoticeSource::Tui,
             now,
@@ -1961,10 +1964,10 @@ mod tests {
 
         assert_eq!(
             actionbar_left_item(&app, now).map(|(text, _)| text),
-            Some("Pod keeps running. Press Ctrl-C again to exit TUI.".into())
+            Some("Worker keeps running. Press Ctrl-C again to exit TUI.".into())
         );
 
-        app.set_pod_status(PodStatus::Running);
+        app.set_worker_status(WorkerStatus::Running);
         for c in "queued turn".chars() {
             app.insert_char(c);
         }
@@ -2037,7 +2040,7 @@ mod tests {
 
     #[test]
     fn consecutive_thinking_blocks_render_as_one_normal_group() {
-        let mut app = App::new("pod".to_string());
+        let mut app = App::new("worker".to_string());
         app.mode = Mode::Normal;
         app.blocks = vec![finished_thinking("alpha"), finished_thinking("beta")];
 
@@ -2055,7 +2058,7 @@ mod tests {
 
     #[test]
     fn thinking_group_detail_keeps_each_body_readable() {
-        let mut app = App::new("pod".to_string());
+        let mut app = App::new("worker".to_string());
         app.mode = Mode::Detail;
         app.blocks = vec![
             finished_thinking("alpha line 1\nalpha line 2"),
@@ -2074,7 +2077,7 @@ mod tests {
 
     #[test]
     fn non_thinking_separator_breaks_thinking_group() {
-        let mut app = App::new("pod".to_string());
+        let mut app = App::new("worker".to_string());
         app.mode = Mode::Normal;
         app.blocks = vec![
             finished_thinking("alpha"),
@@ -2097,7 +2100,7 @@ mod tests {
 
     #[test]
     fn turn_header_breaks_thinking_group() {
-        let mut app = App::new("pod".to_string());
+        let mut app = App::new("worker".to_string());
         app.mode = Mode::Normal;
         app.blocks = vec![
             Block::TurnHeader { turn: 1 },
@@ -2119,7 +2122,7 @@ mod tests {
 
     #[test]
     fn thinking_group_preserves_streaming_and_incomplete_state_visibility() {
-        let mut app = App::new("pod".to_string());
+        let mut app = App::new("worker".to_string());
         app.mode = Mode::Normal;
         app.blocks = vec![
             finished_thinking("finished"),
@@ -2141,7 +2144,7 @@ mod tests {
 
     #[test]
     fn single_thinking_block_rendering_stays_unchanged() {
-        let mut app = App::new("pod".to_string());
+        let mut app = App::new("worker".to_string());
         app.mode = Mode::Normal;
         app.blocks = vec![Block::Thinking(ThinkingBlock {
             text: "private reasoning".to_string(),
@@ -2159,7 +2162,7 @@ mod tests {
     fn single_tool_block_rendering_stays_unchanged() {
         use crate::block::{ToolCallBlock, ToolCallState};
 
-        let mut app = App::new("pod".to_string());
+        let mut app = App::new("worker".to_string());
         app.mode = Mode::Normal;
         app.blocks = vec![Block::ToolCall(ToolCallBlock {
             id: "bash-1".to_string(),
@@ -2183,7 +2186,7 @@ mod tests {
     fn read_tool_aggregation_still_consumes_consecutive_tool_blocks() {
         use crate::block::{ToolCallBlock, ToolCallState};
 
-        let mut app = App::new("pod".to_string());
+        let mut app = App::new("worker".to_string());
         app.mode = Mode::Normal;
         app.blocks = vec![
             Block::ToolCall(ToolCallBlock {
@@ -2225,7 +2228,7 @@ mod tests {
 
     #[test]
     fn history_rows_mark_text_items_selectable_and_non_text_unselectable() {
-        let mut app = App::new("pod".to_string());
+        let mut app = App::new("worker".to_string());
         app.blocks = vec![
             Block::UserMessage {
                 segments: vec![Segment::Text {

@@ -6,7 +6,7 @@ This rule protects both explainability and prompt-cache behavior. If the model r
 
 ## Allowed context transformations
 
-A context transformation is acceptable when it is reproducible from durable Pod state and does not introduce new volatile facts.
+A context transformation is acceptable when it is reproducible from durable Worker state and does not introduce new volatile facts.
 
 Examples:
 
@@ -23,7 +23,7 @@ Do not insert turn-crossing information directly into context without first appe
 
 Forbidden examples:
 
-- Delivering a `Notify` or `PodEvent` only as a temporary context note.
+- Delivering a `Notify` or `WorkerEvent` only as a temporary context note.
 - Adding a `<system-reminder>` that explains behavior but is not persisted.
 - Rewriting old messages to include new facts.
 - Letting UI/controller-only state become model-visible without a committed record.

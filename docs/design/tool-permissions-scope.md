@@ -1,6 +1,6 @@
 # Tool permissions and scope
 
-Yoi treats tools as explicit capabilities. Model-visible tool names are not permission by themselves; the resolved Manifest and Pod scope decide whether a call is allowed.
+Yoi treats tools as explicit capabilities. Model-visible tool names are not permission by themselves; the resolved Manifest and Worker scope decide whether a call is allowed.
 
 ## Permission policy
 

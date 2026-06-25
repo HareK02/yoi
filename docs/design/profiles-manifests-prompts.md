@@ -4,11 +4,11 @@ Profiles are reusable recipes. Resolved Manifests are runtime contracts. Prompt 
 
 ## Profiles
 
-A Profile describes how a Pod should normally be built: worker language, model/provider selectors, prompt choices, tool policy defaults, and other reusable preferences.
+A Profile describes how a Worker should normally be built: worker language, model/provider selectors, prompt choices, tool policy defaults, and other reusable preferences.
 
 A Profile should not contain runtime-bound fields:
 
-- `pod.name`
+- `worker.name`
 - concrete delegated `scope.allow`
 - sockets or process identifiers
 - session pointers
@@ -21,13 +21,13 @@ Yoi is Lua Profile first. Lua gives project/user authors a controlled recipe lay
 
 ## Manifests
 
-A resolved Manifest is the concrete contract used to create or restore a Pod. It carries defaults, resolved paths, permissions, scope, prompt references, provider/model decisions, and runtime identity.
+A resolved Manifest is the concrete contract used to create or restore a Worker. It carries defaults, resolved paths, permissions, scope, prompt references, provider/model decisions, and runtime identity.
 
-Source/partial layers may omit fields. Resolved manifests should be explicit enough that Pod creation does not depend on ambient configuration later changing under it.
+Source/partial layers may omit fields. Resolved manifests should be explicit enough that Worker creation does not depend on ambient configuration later changing under it.
 
 `--manifest <path>` exists as an explicit low-level escape hatch. Normal fresh startup should select a Profile through `profiles.toml` / builtin defaults rather than ambient manifest cascades.
 
-For normal Profile/default startup, a workspace may add `.yoi/override.local.toml` as a final local manifest layer. Yoi discovers the nearest ancestor `.yoi/override.local.toml` from the workspace base used for profile resolution, resolves relative paths in that file against its containing `.yoi` directory, and applies it after the selected Profile and builtin defaults. This file is intended for machine-local choices such as provider/model, worker language, prompt pack, and permission policy tweaks; it is ignored by git via the repository `*.local.*` rule. It is not applied in explicit `--manifest <path>` mode, and it cannot set `pod.name` because Pod identity remains a runtime input.
+For normal Profile/default startup, a workspace may add `.yoi/override.local.toml` as a final local manifest layer. Yoi discovers the nearest ancestor `.yoi/override.local.toml` from the workspace base used for profile resolution, resolves relative paths in that file against its containing `.yoi` directory, and applies it after the selected Profile and builtin defaults. This file is intended for machine-local choices such as provider/model, worker language, prompt pack, and permission policy tweaks; it is ignored by git via the repository `*.local.*` rule. It is not applied in explicit `--manifest <path>` mode, and it cannot set `worker.name` because Worker identity remains a runtime input.
 
 ## Local stdio MCP server declarations
 
@@ -62,7 +62,7 @@ Local stdio MCP servers are ordinary local executables running with the user's O
 
 ## Spawned Pods
 
-`SpawnPod.profile` is optional and resolves through defaults when omitted. The only concrete capability delegation in the tool call is `SpawnPod.scope`, and it must be a subset of the parent's effective scope.
+`SpawnWorker.profile` is optional and resolves through defaults when omitted. The only concrete capability delegation in the tool call is `SpawnWorker.scope`, and it must be a subset of the parent's effective scope.
 
 `inherit` derives reusable settings from the parent's resolved Manifest while replacing child identity and delegated scope. It should not blindly reuse the parent's original Profile source or runtime state.
 
@@ -76,6 +76,6 @@ Builtin resources should be embedded at compile time. User/project profiles, exp
 
 ## Why this separation matters
 
-Without this split, configuration becomes unreproducible: a Profile might accidentally depend on a parent Pod's socket, a prompt override might act like hidden state, or a restored Pod might observe different defaults than the run that created it.
+Without this split, configuration becomes unreproducible: a Profile might accidentally depend on a parent Worker's socket, a prompt override might act like hidden state, or a restored Worker might observe different defaults than the run that created it.
 
 The boundaries make it clear which information is reusable authoring, which is resolved runtime contract, and which is durable run history.

@@ -79,7 +79,7 @@ Packages under `${XDG_DATA_HOME:-~/.local/share}/yoi/plugins/` or `<workspace>/.
 
 Trust differs by source, but none of the sources is self-authorizing:
 
-- Builtin packages can be trusted as shipped code/data, but still require explicit enablement for a Pod/Profile when they affect runtime behavior.
+- Builtin packages can be trusted as shipped code/data, but still require explicit enablement for a Worker/Profile when they affect runtime behavior.
 - User packages are local user-installed artifacts and should be visible to workspaces, but they cannot bypass manifest/profile/tool/scope/secret policy.
 - Project packages are repository-controlled artifacts and should be treated as untrusted until explicitly enabled by local policy. Cloning a repository must not be enough to execute a package.
 
@@ -99,7 +99,7 @@ Collision handling:
 
 Discovery is a read-only inventory operation. It may report package metadata, validation errors, source, canonical store path, and deterministic digest. It must not initialize any runtime contribution.
 
-Enablement is a resolved runtime plan. It should come from Profile/manifest configuration or another explicit local policy layer, then be recorded into the resolved Manifest/session metadata used to start the Pod. Restored Pods should use that resolved enabled-plugin plan instead of silently re-running fresh discovery and picking newer packages. Fresh discovery must not silently upgrade a restored Pod.
+Enablement is a resolved runtime plan. It should come from Profile/manifest configuration or another explicit local policy layer, then be recorded into the resolved Manifest/session metadata used to start the Worker. Restored Pods should use that resolved enabled-plugin plan instead of silently re-running fresh discovery and picking newer packages. Fresh discovery must not silently upgrade a restored Worker.
 
 A minimal implemented enablement record is shaped like this. `version` is an exact package-version requirement; richer range constraints are deferred. `digest` is optional in authoring config, but fresh startup records the resolved digest into runtime metadata.
 
@@ -111,7 +111,7 @@ digest = "sha256:..." # optional pin in authoring, resolved in runtime metadata
 config = { level = "concise" }
 ```
 
-If no digest is pinned in authoring, fresh startup may resolve the newest acceptable discovered package according to explicit policy. Once a Pod is started, the resolved manifest/session metadata should record the exact source-qualified id and digest so restore is stable.
+If no digest is pinned in authoring, fresh startup may resolve the newest acceptable discovered package according to explicit policy. Once a Worker is started, the resolved manifest/session metadata should record the exact source-qualified id and digest so restore is stable.
 
 ## Permissions and grants
 
@@ -125,7 +125,7 @@ Plugin permission declarations are requests, not grants. Effective grants are th
 - secret references and secret-store policy;
 - runtime limits for WASM or other execution engines.
 
-The Plugin package permission model must not reuse `pod::feature` HostAuthority or grant concepts. The feature layer is an API/contribution substrate; it is not a security boundary for untrusted plugin packages. Plugin grants need their own explicit policy that can fail closed before a Hook, Tool, WASM host function, provider bridge, or external runtime is exposed.
+The Plugin package permission model must not reuse `worker::feature` HostAuthority or grant concepts. The feature layer is an API/contribution substrate; it is not a security boundary for untrusted plugin packages. Plugin grants need their own explicit policy that can fail closed before a Hook, Tool, WASM host function, provider bridge, or external runtime is exposed.
 
 When a package requests authority outside policy, diagnostics should explain the denied category and package identity without leaking raw secret values, environment contents, full private config, or large plugin-provided text.
 
@@ -157,7 +157,7 @@ Optional lock behavior can be added in a later Ticket:
 
 - an authoring-time pin in Profile/manifest configuration;
 - a workspace lock file recording source-qualified id, version, source store, digest, and selected package path;
-- restore metadata that records the actual digest used by the Pod.
+- restore metadata that records the actual digest used by the Worker.
 
 A lock or pin is selection authority, not execution authority. Enablement and grants are still required.
 
@@ -192,7 +192,7 @@ Good follow-up Tickets are intentionally separable:
 1. Manifest/Profile plugin enablement schema and resolved-session metadata, including restore behavior and digest pins.
 2. Package discovery for builtin, user, and project stores with source-qualified identity and collision diagnostics.
 3. `.yoi-plugin` archive validation, deterministic digest computation, and digest-keyed cache materialization.
-4. Plugin-layer permission policy that combines package requests with existing tool/scope/web/secret/runtime allowlists without using `pod::feature` HostAuthority concepts.
+4. Plugin-layer permission policy that combines package requests with existing tool/scope/web/secret/runtime allowlists without using `worker::feature` HostAuthority concepts.
 5. Declarative hook package loading from enabled, materialized packages.
 6. WASM package ABI, initialization limits, host-function grants, and Tool/Hook contribution plumbing.
 7. Optional lock-file or pin update workflow for reproducible fresh startup.

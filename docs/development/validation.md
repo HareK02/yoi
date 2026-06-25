@@ -44,4 +44,4 @@ Use work item review to verify that the implementation satisfies the ticket, not
 
 ## Current limitation
 
-End-to-end tests that spawn real processes are not yet designed. When changing Pod restoration, socket behavior, or orchestration, compensate with targeted unit/integration tests and concrete manual evidence in the implementation report.
+End-to-end tests that spawn real processes are not yet designed. When changing Worker restoration, socket behavior, or orchestration, compensate with targeted unit/integration tests and concrete manual evidence in the implementation report.

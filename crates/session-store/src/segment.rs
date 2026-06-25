@@ -1,7 +1,7 @@
 //! Free functions for segment persistence operations.
 //!
 //! These functions record and restore segment state without owning a Engine.
-//! The caller (typically Pod) holds the Engine directly and calls these
+//! The caller (typically Worker) holds the Engine directly and calls these
 //! functions after state-mutating operations.
 
 use crate::logged_item::{LoggedItem, to_logged};
@@ -36,7 +36,7 @@ pub fn create_segment(
 /// Write a fresh `SegmentStart` entry using pre-generated IDs.
 ///
 /// Used by callers that need to reserve `(session_id, segment_id)`
-/// synchronously but defer the initial log append (e.g. Pod, which
+/// synchronously but defer the initial log append (e.g. Worker, which
 /// resolves a templated system prompt only at first turn).
 pub fn create_segment_with_ids(
     store: &impl Store,
@@ -102,7 +102,7 @@ pub fn restore(
 /// Restore segment state when only the segment ID is known. Uses
 /// [`Store::lookup_session_of`] to resolve the parent Session.
 ///
-/// Shim for legacy entry points (`pod-cli --session <UUID>` etc.) that
+/// Shim for legacy entry points (`worker-cli --session <UUID>` etc.) that
 /// receive a Segment ID without a Session ID.
 pub fn restore_by_segment(
     store: &impl Store,
@@ -174,7 +174,7 @@ pub fn ensure_head_or_fork(
 
 /// Log a `UserInput` entry from the original typed `Vec<Segment>`.
 ///
-/// Submit-time entry. Pod calls this at the head of a `Run` turn before
+/// Submit-time entry. Worker calls this at the head of a `Run` turn before
 /// the worker pushes its flattened user message into history; replay
 /// derives the worker `Item::user_message` from these segments via
 /// [`Segment::flatten_to_text`].
@@ -250,7 +250,7 @@ pub fn classify_history_item(item: &Item, ts: u64) -> LogEntry {
 }
 
 /// Append a single typed system item as `LogEntry::SystemItem`. Helper
-/// for the Pod-side interceptor commit path; mirrors the per-item
+/// for the Worker-side interceptor commit path; mirrors the per-item
 /// commit shape used for assistant / tool result entries.
 pub fn append_system_item(
     store: &impl Store,

@@ -11,7 +11,7 @@
 //! the same Session.
 //!
 //! This crate provides free functions for persistence operations.
-//! The caller (typically Pod) holds the Engine directly and calls these
+//! The caller (typically Worker) holds the Engine directly and calls these
 //! functions after state-mutating operations.
 //!
 //! Debug-mode [`TraceEntry`] records capture raw stream events in a separate
@@ -51,7 +51,7 @@ pub use segment::{
 };
 pub use segment_log::{LogEntry, RestoredState, SegmentOrigin, collect_state};
 pub use store::{Store, StoreError};
-pub use system_item::{SystemItem, SystemReminder, SystemReminderSource, render_pod_event};
+pub use system_item::{SystemItem, SystemReminder, SystemReminderSource, render_worker_event};
 
 /// Session identifier — the fork-tree root. UUID v7 (time-ordered).
 ///

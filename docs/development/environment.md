@@ -14,11 +14,11 @@ Yoi keeps environment variables for narrow bootstrap and development cases, whil
 - Prefer embedded builtin resources over installed runtime resource directories.
 - Use explicit secret refs for provider and WebSearch credentials.
 - Keep dev-only executable overrides clearly named and documented.
-- Avoid shell-command parser overrides for runtime Pod launch.
+- Avoid shell-command parser overrides for runtime Worker launch.
 - Tests should prefer typed fixtures/injection and mutate process environment only around thin env-reader behavior.
 
 ## Current surface
 
 Use `YOI_*` for current environment variables. Old project prefixes should not be reintroduced.
 
-`YOI_POD_RUNTIME_COMMAND` is a development-only executable-path override for typed `yoi pod` launch. It is not a general shell-command override.
+`YOI_POD_RUNTIME_COMMAND` is a legacy-named development-only executable-path override for typed `yoi worker` launch. It is not a general shell-command override.

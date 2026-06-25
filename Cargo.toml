@@ -8,7 +8,7 @@ members = [
     "crates/secrets",
     "crates/manifest",
     "crates/mcp",
-    "crates/pod",
+    "crates/worker",
     "crates/plugin-pdk",
     "crates/yoi",
     "crates/pod-store",
@@ -35,7 +35,7 @@ default-members = [
     "crates/secrets",
     "crates/manifest",
     "crates/mcp",
-    "crates/pod",
+    "crates/worker",
     "crates/plugin-pdk",
     "crates/yoi",
     "crates/pod-store",
@@ -69,7 +69,7 @@ lint-common = { path = "crates/lint-common" }
 memory = { path = "crates/memory" }
 ticket = { path = "crates/ticket" }
 project-record = { path = "crates/project-record" }
-pod = { path = "crates/pod" }
+worker = { path = "crates/worker" }
 yoi-plugin-pdk = { path = "crates/plugin-pdk" }
 yoi = { path = "crates/yoi" }
 pod-registry = { path = "crates/pod-registry" }

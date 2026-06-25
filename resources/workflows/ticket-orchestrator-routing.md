@@ -13,4 +13,4 @@ requires: [workflow-resource-boundary]
 4. child implementation worktree は recorded implementation worktree root 配下に作成し、implementation branch は Orchestrator workspace current HEAD / orchestration branch HEAD から切る。Coder/Reviewer は sibling Pods として route し、Ticket intent・binding decisions・validation/report expectations を concrete handoff として渡す。
 5. Reviewer が request-changes した場合は、scope 内で Coder に修正を戻すか、Orchestrator が blocked/escalation を記録する。approve evidence が揃うまで merge-ready とみなさない。
 6. merge completion authority が無い場合は、Ticket/branch/commit identity、intent/invariant check、implementation summary、coder/reviewer evidence、blocker resolution、validation、risks、dirty state、decision needs を含む merge-ready dossier で停止する。
-7. 明示 authority と clean reviewer evidence がある場合のみ、merge target workspace への統合、validation、Ticket close/completion processing、関連 Pod 停止、scope reclamation、worktree/branch cleanup、evidence reporting を進める。
+7. 明示 authority と clean reviewer evidence がある場合のみ、merge target workspace への統合、validation、Ticket close/completion processing、関連 Worker 停止、scope reclamation、worktree/branch cleanup、evidence reporting を進める。

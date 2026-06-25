@@ -12,7 +12,6 @@ mod input;
 pub mod keys;
 mod markdown;
 mod picker;
-mod pod_list;
 mod role_session_registry;
 mod scroll;
 pub mod setup_model;
@@ -22,6 +21,7 @@ mod text_selection;
 mod tool;
 mod ui;
 mod view_mode;
+mod worker_list;
 mod workspace_panel;
 
 use std::io;
@@ -33,37 +33,37 @@ use crossterm::execute;
 use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
 use session_store::SegmentId;
 
-use client::PodRuntimeCommand;
+use client::WorkerRuntimeCommand;
 
 #[derive(Debug, Clone)]
 pub struct LaunchOptions {
     pub mode: LaunchMode,
-    pub runtime_command: PodRuntimeCommand,
+    pub runtime_command: WorkerRuntimeCommand,
     pub workspace_root: PathBuf,
 }
 
 #[derive(Debug, Clone)]
 pub enum LaunchMode {
     Spawn {
-        pod_name: Option<String>,
+        worker_name: Option<String>,
         profile: Option<String>,
     },
-    /// `yoi --pod <name>`: attach to a live Pod by name if possible;
-    /// otherwise launch the Pod runtime command with `--pod <name>` so it
-    /// resumes from name-keyed state or creates a fresh same-name Pod.
-    PodName {
-        pod_name: String,
+    /// `yoi --worker <name>`: attach to a live Worker by name if possible;
+    /// otherwise launch the Worker runtime command with `--worker <name>` so it
+    /// resumes from name-keyed state or creates a fresh same-name Worker.
+    WorkerName {
+        worker_name: String,
         socket_override: Option<PathBuf>,
     },
-    /// `yoi resume`: open the Pod picker, then attach to the selected live Pod
-    /// or restore the selected stopped Pod by name. Without `--all`, the picker
+    /// `yoi resume`: open the Worker picker, then attach to the selected live Worker
+    /// or restore the selected stopped Worker by name. Without `--all`, the picker
     /// is scoped to the current runtime workspace.
     Resume { all: bool },
     /// `yoi --session <UUID>`: skip the picker, go straight to the
     /// resume name dialog with `id` baked in.
     ResumeWithSession {
         id: SegmentId,
-        pod_name: Option<String>,
+        worker_name: Option<String>,
     },
     /// `yoi panel`: open the workspace Dashboard from the current workspace.
     Panel,
@@ -95,18 +95,19 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
     }
 
     let result = match mode {
-        LaunchMode::Spawn { pod_name, profile } => {
-            console::run_spawn(None, pod_name, profile, runtime_command).await
-        }
-        LaunchMode::PodName {
-            pod_name,
+        LaunchMode::Spawn {
+            worker_name,
+            profile,
+        } => console::run_spawn(None, worker_name, profile, runtime_command).await,
+        LaunchMode::WorkerName {
+            worker_name,
             socket_override,
-        } => console::run_pod_name(pod_name, socket_override, runtime_command).await,
+        } => console::run_worker_name(worker_name, socket_override, runtime_command).await,
         LaunchMode::Resume { all } => {
             console::run_resume(runtime_command, workspace_root.clone(), all).await
         }
-        LaunchMode::ResumeWithSession { id, pod_name } => {
-            console::run_spawn(Some(id), pod_name, None, runtime_command).await
+        LaunchMode::ResumeWithSession { id, worker_name } => {
+            console::run_spawn(Some(id), worker_name, None, runtime_command).await
         }
         LaunchMode::Panel => dashboard::launch(runtime_command).await,
     };
@@ -138,7 +139,7 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
             // SpawnError has already been painted into the inline
             // viewport's final frame, so it's already visible in the
             // user's scrollback — printing it again would be a noisy
-            // duplicate. Other errors (pod-name failures, terminal setup
+            // duplicate. Other errors (worker-name failures, terminal setup
             // hiccups, etc.) need surfacing here.
             if e.downcast_ref::<spawn::SpawnError>().is_none() {
                 eprintln!("yoi: {e}");

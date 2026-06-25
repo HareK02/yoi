@@ -6,7 +6,7 @@
 //!   `providers.toml`, `models.toml`, `prompts/`, `prompts.toml` 等
 //! - **`data_dir`** — プログラムが書く永続データ。`sessions/` 等
 //! - **`runtime_dir`** — 再起動で消えてよいランタイム状態。socket,
-//!   `pods.json`, `pid` ファイル等
+//!   `workers.json`, `pid` ファイル等
 //!
 //! ## 解決順 (優先順位高 → 低)
 //!
@@ -46,7 +46,7 @@ pub fn data_dir() -> Option<PathBuf> {
     )
 }
 
-/// ランタイムディレクトリ。socket, `pods.json`, Pod ごとの `pid` /
+/// ランタイムディレクトリ。socket, `workers.json`, Worker ごとの `pid` /
 /// `status.json` 等が置かれる。再起動で消えて構わない。
 pub fn runtime_dir() -> Option<PathBuf> {
     resolve_runtime_dir_from_parts(
@@ -61,7 +61,7 @@ pub fn runtime_dir() -> Option<PathBuf> {
 
 /// `<config_dir>/profiles.toml` — user profile registry/default configuration.
 ///
-/// This is application/profile selection configuration, not a Pod manifest
+/// This is application/profile selection configuration, not a Worker manifest
 /// layer.
 pub fn user_profiles_path() -> Option<PathBuf> {
     user_profiles_path_from_config_dir(config_dir())
@@ -88,24 +88,24 @@ pub fn sessions_dir() -> Option<PathBuf> {
     sessions_dir_from_data_dir(data_dir())
 }
 
-/// `<runtime_dir>/pods.json` — machine-wide Pod allocation registry。
+/// `<runtime_dir>/workers.json` — machine-wide Worker allocation registry。
 pub fn pod_registry_path() -> Option<PathBuf> {
     pod_registry_path_from_runtime_dir(runtime_dir())
 }
 
-/// `<runtime_dir>/<pod_name>/` — Pod ごとのランタイムディレクトリ。
-pub fn pod_runtime_dir(pod_name: &str) -> Option<PathBuf> {
-    pod_runtime_dir_from_runtime_dir(runtime_dir(), pod_name)
+/// `<runtime_dir>/<worker_name>/` — Worker ごとのランタイムディレクトリ。
+pub fn worker_runtime_dir(worker_name: &str) -> Option<PathBuf> {
+    worker_runtime_dir_from_runtime_dir(runtime_dir(), worker_name)
 }
 
-/// `<runtime_dir>/<pod_name>/sock` — Pod の Unix socket パス。
+/// `<runtime_dir>/<worker_name>/sock` — Worker の Unix socket パス。
 ///
-/// Pod プロセス内で実際に socket を作成するのは `pod` crate の
-/// `RuntimeDir::socket_path()` で、Pod 名が分かっている外部 (TUI の
+/// Worker プロセス内で実際に socket を作成するのは `worker` crate の
+/// `RuntimeDir::socket_path()` で、Worker 名が分かっている外部 (TUI の
 /// attach フロー等) からの**予測**はこの関数で行う。両者は同じパス
 /// を返すことが期待される。
-pub fn pod_socket_path(pod_name: &str) -> Option<PathBuf> {
-    pod_socket_path_from_runtime_dir(runtime_dir(), pod_name)
+pub fn pod_socket_path(worker_name: &str) -> Option<PathBuf> {
+    pod_socket_path_from_runtime_dir(runtime_dir(), worker_name)
 }
 
 // ---- internals --------------------------------------------------------------
@@ -184,21 +184,21 @@ fn sessions_dir_from_data_dir(data_dir: Option<PathBuf>) -> Option<PathBuf> {
 }
 
 fn pod_registry_path_from_runtime_dir(runtime_dir: Option<PathBuf>) -> Option<PathBuf> {
-    Some(runtime_dir?.join("pods.json"))
+    Some(runtime_dir?.join("workers.json"))
 }
 
-fn pod_runtime_dir_from_runtime_dir(
+fn worker_runtime_dir_from_runtime_dir(
     runtime_dir: Option<PathBuf>,
-    pod_name: &str,
+    worker_name: &str,
 ) -> Option<PathBuf> {
-    Some(runtime_dir?.join(pod_name))
+    Some(runtime_dir?.join(worker_name))
 }
 
 fn pod_socket_path_from_runtime_dir(
     runtime_dir: Option<PathBuf>,
-    pod_name: &str,
+    worker_name: &str,
 ) -> Option<PathBuf> {
-    Some(pod_runtime_dir_from_runtime_dir(runtime_dir, pod_name)?.join("sock"))
+    Some(worker_runtime_dir_from_runtime_dir(runtime_dir, worker_name)?.join("sock"))
 }
 
 /// 空文字列の env は未設定として扱う。`std::env::var` は `Ok("")` と
@@ -397,10 +397,10 @@ mod tests {
         );
         assert_eq!(
             pod_registry_path_from_runtime_dir(runtime_dir.clone()).unwrap(),
-            PathBuf::from("/sand/run/pods.json")
+            PathBuf::from("/sand/run/workers.json")
         );
         assert_eq!(
-            pod_runtime_dir_from_runtime_dir(runtime_dir.clone(), "foo").unwrap(),
+            worker_runtime_dir_from_runtime_dir(runtime_dir.clone(), "foo").unwrap(),
             PathBuf::from("/sand/run/foo")
         );
         assert_eq!(

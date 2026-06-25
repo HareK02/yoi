@@ -18,7 +18,7 @@ Does not own:
 
 - Engine turn lifecycle (`llm-engine`)
 - secret storage internals (`secrets`)
-- Pod lifecycle (`pod`)
+- Worker lifecycle (`worker`)
 - product CLI parsing (`yoi`)
 
 ## Design notes

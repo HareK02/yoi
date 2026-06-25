@@ -1,5 +1,5 @@
 <system-reminder>
-Workspace Dashboard observed that this Orchestrator Pod is idle while queued Ticket work is present.
+Workspace Dashboard observed that this Orchestrator Worker is idle while queued Ticket work is present.
 
 This is bounded attention only, not scheduler authority. Do not drain the queue automatically. Before implementation side effects, verify the Ticket state and record the normal `queued -> inprogress` acceptance through Ticket tools.
 
