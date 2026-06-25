@@ -450,3 +450,77 @@ Startup note:
 - The first spawn attempt failed before child creation because the runtime workspace root path itself was not readable in the delegated scope. Retried with non-recursive read on `/home/hare/Projects/yoi` plus implementation worktree read/write scope; second spawn succeeded.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZBCQH4-worker-runtime at: 2026-06-25T16:32:52Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装完了。マージ・Ticket 更新・cleanup は未実施。
+
+Commit:
+- `9b2cae32 feat: add memory worker runtime crate`
+
+変更ファイル / API 概要:
+- `Cargo.toml`
+  - workspace member / default-member に `crates/worker-runtime` を追加。
+  - workspace dependency に `worker-runtime` を追加。
+- `Cargo.lock`
+  - `worker-runtime` package entry を追加。
+- `crates/worker-runtime/Cargo.toml`
+- `crates/worker-runtime/src/*`
+
+新規 crate `worker-runtime` の主な API 領域:
+- `Runtime`: concrete な memory-backed embedded Runtime domain entity。`Runtime::new_memory()`, `Runtime::with_options(...)`。
+- `identity`: `RuntimeId`, `WorkerId`, `WorkerRef`。Worker 操作は `runtime_id + worker_id` を持つ `WorkerRef` を authority として扱う。
+- `management`: `RuntimeOptions`, `RuntimeSummary`, `RuntimeStatus`, `RuntimeLimits`。
+- `catalog`: `CreateWorkerRequest`, `WorkerIntent`, `ProfileSelector`, `ConfigBundleRef`, `CapabilityRequest`, `WorkspaceRef`, `MountRef`, `WorkerSummary`, `WorkerDetail`, `WorkerStatus`。
+- `interaction`: `WorkerInput`, `send_input(...)` による transcript 追記。
+- `observation`: bounded transcript projection、`EventCursor`, `RuntimeEventBatch`, poll-only `EventSubscription` placeholder。
+- `diagnostics`: `RuntimeDiagnostic`, `DiagnosticSeverity`。
+
+実装範囲:
+- HTTP / WS / SSE / REST / FS persistence / Backend integration / config bundle sync は未実装。
+- provider/tool execution も未統合。
+- config bundle なし・requested capabilities なしの tools-less Worker 作成をサポート。
+- create/list/detail/send/stop/cancel/projection/events/diagnostics の unit tests を追加。
+
+Validation results:
+- `cargo fmt --all`: success
+- `cargo test -p worker-runtime`: success (6 tests passed)
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: failure
+  - 理由: `Cargo.lock` に新規 workspace crate `worker-runtime` が追加されたため、既存 `package.nix` の `cargoHash` / vendored lock consistency が古くなっている。
+  - `package.nix` は今回の delegated write scope 外なので未変更。
+
+Residual risks / review focus:
+- `package.nix` の `cargoHash` 更新が別途必要。今回の delegated write scope が `crates/**`, root `Cargo.toml`, root `Cargo.lock` のみだったため対応していない。
+- v0 は in-memory のみで、Runtime/Worker lifecycle semantics は最小実装。特に terminal Worker に対する再 stop/cancel の扱いを review 対象にする。
+- Event subscription は意図通り poll-only placeholder。後続 streaming 実装時に cursor semantics が十分か確認する。
+
+---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZBCQH4-runtime-packaging at: 2026-06-25T16:37:25Z -->
+
+## Implementation report
+
+Packaging follow-up implementation report:
+
+対応内容:
+- `package.nix` の `cargoHash` のみ更新。
+- New hash: `sha256-RHo2b6dVClqu32wpgES/RQeBMXaqyqXZaooeSH5SveM=`
+
+Commit:
+- `593db95175ff8537af2401a5def21fc32dd4846d fix: update nix cargo hash`
+
+Validation:
+- `nix build .#yoi --no-link`: success
+- `git diff --check`: success
+
+Residual notes:
+- 作業ツリーは clean。
+- merge / close / cleanup は未実施。
+
+---
