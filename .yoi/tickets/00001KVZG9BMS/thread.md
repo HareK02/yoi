@@ -728,3 +728,20 @@ Escalate if:
 - `develop` など merge target への反映権限・タイミングについて追加判断が必要になる。
 
 ---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-25T16:19:23Z from: inprogress to: done reason: user_confirmed_done_after_merge_and_review field: state -->
+
+## State changed
+
+ユーザー指示「StopPodでハングしてそうだったから再起しただけ / doneにしといて」を受け、完了済みとして記録する。
+
+完了根拠:
+- 実装 branch は orchestration worktree に merge 済み: `2a7e8775 merge: 00001KVZG9BMS worker crate rename`。
+- Reviewer は `60dbd724` follow-up を approve 済みで、残 blocker なし。
+- Coder 側 validation は `cargo test -p worker`、`cargo test -p yoi`、`cargo check -p yoi`、`cargo test -p protocol --features typescript`、`cargo check -p yoi-e2e`、`web/workspace deno task check`、`git diff --check`、`nix build .#yoi --no-link` 成功報告あり。
+- 最終 Orchestrator validation は operator restart により中断されていたが、ユーザーがその事情を説明し done 記録を明示許可した。
+
+補足:
+- この state change は close ではなく `done` 記録。必要なら別途 close / cleanup を扱う。
+
+---

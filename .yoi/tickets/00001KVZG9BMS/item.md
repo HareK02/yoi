@@ -1,8 +1,8 @@
 ---
 title: 'pod crateをworker crateへ改名する'
-state: 'inprogress'
+state: 'done'
 created_at: '2026-06-25T13:42:37Z'
-updated_at: '2026-06-25T16:17:59Z'
+updated_at: '2026-06-25T16:19:23Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-25T14:13:35Z'
