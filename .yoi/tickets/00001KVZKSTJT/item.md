@@ -1,8 +1,8 @@
 ---
 title: 'worker-runtimeにWebSocket event stream serverを追加する'
-state: 'ready'
+state: 'planning'
 created_at: '2026-06-25T14:44:02Z'
-updated_at: '2026-06-25T16:34:16Z'
+updated_at: '2026-06-25T20:21:27Z'
 assignee: null
 ---
 
