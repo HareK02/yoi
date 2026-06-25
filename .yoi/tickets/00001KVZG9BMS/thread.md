@@ -141,3 +141,70 @@ Implementation orchestration update:
 - Coder には root/original workspace と orchestration worktree で read/write/validation/git operation を行わないよう明示した。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZG9BMS-worker-rename at: 2026-06-25T15:07:12Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装概要:
+- `crates/pod` を `crates/worker` へ改名。
+  - Cargo package/import path を `pod` から `worker` へ更新。
+  - `worker::Worker`, `WorkerConfig`, `WorkerState`, `WorkerEvent`, `WorkerClient`, `WorkerRuntimeCommand` など Worker 用語へ更新。
+- CLI/process surface を `yoi pod` から `yoi worker` へ変更。
+  - 後方互換の `yoi pod` alias は追加していません。
+- `llm_engine::Engine` と `worker::Worker` の境界を明確化。
+  - 既存 manifest の turn-engine 側設定は `engine` 用語へ寄せ、Worker host 側設定と分離しました。
+- `pod-store` / `pod-registry` は crate/package としては改名していません。
+  - ただし Worker API と整合するよう、関連する型・呼び出し側は Worker 用語へ更新。
+  - 既存互換・内部文脈として、legacy on-disk metadata directory `pods` などは残しています。
+- resources/prompts、profiles、docs、Nix、Cargo workspace、Cargo.lock を更新。
+- `package.nix` の `cargoHash` を更新。
+
+主な変更ファイル:
+- `crates/pod/**` → `crates/worker/**`
+- `crates/client/src/pod_client.rs` → `crates/client/src/worker_client.rs`
+- `crates/tui/src/pod_list.rs` → `crates/tui/src/worker_list.rs`
+- `crates/yoi/src/pod_cleanup_cli.rs` → `crates/yoi/src/worker_cleanup_cli.rs`
+- `resources/prompts/pod/**` → `resources/prompts/worker/**`
+- `resources/prompts/common/pod-orchestration.md` → `resources/prompts/common/worker-orchestration.md`
+- `docs/design/pod-session-state.md` → `docs/design/worker-session-state.md`
+- `Cargo.toml`, `Cargo.lock`, `package.nix`
+- dependent crates: `protocol`, `manifest`, `tui`, `client`, `workspace-server`, `yoi`, docs/resources
+
+Validation:
+- `cargo test -p worker`: success
+- `cargo test -p yoi`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Grep evidence:
+- `crates/pod` refs: intentional `pod-store` / `pod-registry` path を除きなし
+- `pod::` refs: なし
+- package/import `pod` refs: intentional `pod-store` / `pod-registry` dependencies を除きなし
+- old public `Pod*` execution-unit type refs: intentional exclusions を除きなし
+- active CLI refs:
+  - `yoi pod`: なし
+  - `"pod" =>`: なし
+  - `--pod`: なし
+  - `POD_OPTIONS`: なし
+  - `parse_pod`: なし
+  - `pod_name`: intentional exclusions を除きなし
+
+残っている lower-case `pod` は主に以下の intentional legacy/internal context:
+- crate/package name として残す指定のある `pod-store`
+- crate/package name として残す指定のある `pod-registry`
+- legacy on-disk metadata directory `pods`
+- related comments/tests describing those legacy/internal boundaries
+
+Commit:
+- `6c59fe927b8094f735651ef0e18fad5e8b62ea83 refactor: rename pod crate to worker`
+
+Residual risks / notes:
+- `pod-store` / `pod-registry` crate 名は Ticket invariant に従って残しています。そのため grep 上の lower-case `pod` は完全にはゼロになりません。
+- legacy on-disk directory `pods` は既存 metadata/session compatibility のため維持しました。
+- merge / close / cleanup は実施していません。
+
+---
