@@ -44,6 +44,69 @@ pub enum DiagnosticSeverity {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSourceKind {
+    /// Compatibility projection over the existing local Pod metadata store.
+    LocalCompatibility,
+    /// Reserved boundary for the future in-process worker-runtime Runtime adapter.
+    EmbeddedWorkerRuntime,
+    /// Reserved boundary for a future remote Workspace Runtime adapter.
+    RemoteHttp,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSourceStatus {
+    Active,
+    Reserved,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeIdentityAuthority {
+    /// Public Runtime/Host/Worker ids are registry projections, never raw
+    /// compatibility-store names, socket addresses, session ids, or paths.
+    RuntimeRegistryProjection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeSourceSummary {
+    pub kind: RuntimeSourceKind,
+    pub status: RuntimeSourceStatus,
+    pub identity_authority: RuntimeIdentityAuthority,
+    pub note: String,
+}
+
+impl RuntimeSourceSummary {
+    pub fn local_compatibility() -> Self {
+        Self {
+            kind: RuntimeSourceKind::LocalCompatibility,
+            status: RuntimeSourceStatus::Active,
+            identity_authority: RuntimeIdentityAuthority::RuntimeRegistryProjection,
+            note: "read-only compatibility projection over local Worker metadata; no socket, session, or path authority is exposed".to_string(),
+        }
+    }
+
+    pub fn embedded_worker_runtime_reserved() -> Self {
+        Self {
+            kind: RuntimeSourceKind::EmbeddedWorkerRuntime,
+            status: RuntimeSourceStatus::Reserved,
+            identity_authority: RuntimeIdentityAuthority::RuntimeRegistryProjection,
+            note: "reserved boundary for a future embedded worker-runtime adapter; not connected in this registry foundation".to_string(),
+        }
+    }
+
+    pub fn remote_http_reserved() -> Self {
+        Self {
+            kind: RuntimeSourceKind::RemoteHttp,
+            status: RuntimeSourceStatus::Reserved,
+            identity_authority: RuntimeIdentityAuthority::RuntimeRegistryProjection,
+            note: "reserved boundary for a future remote Runtime adapter; no HTTP client or REST server is implemented here".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeCapabilitySummary {
     pub can_list_hosts: bool,
@@ -74,6 +137,7 @@ pub struct RuntimeSummary {
     pub label: String,
     pub kind: String,
     pub status: String,
+    pub source: RuntimeSourceSummary,
     pub host_ids: Vec<String>,
     pub capabilities: RuntimeCapabilitySummary,
     pub diagnostics: Vec<RuntimeDiagnostic>,
@@ -241,9 +305,16 @@ pub struct WorkerProxyConnectPoint {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeRegistryError {
-    InvalidIdentifier { kind: &'static str, value: String },
+    InvalidIdentifier {
+        kind: &'static str,
+        value: String,
+    },
+    UnknownRuntime(String),
     UnknownHost(String),
-    UnknownWorker(String),
+    UnknownWorker {
+        runtime_id: String,
+        worker_id: String,
+    },
 }
 
 impl RuntimeRegistryError {
@@ -253,8 +324,15 @@ impl RuntimeRegistryError {
                 kind: kind.to_string(),
                 value,
             },
+            Self::UnknownRuntime(runtime_id) => Error::UnknownRuntime(runtime_id),
             Self::UnknownHost(host_id) => Error::UnknownHost(host_id),
-            Self::UnknownWorker(worker_id) => Error::UnknownWorker(worker_id),
+            Self::UnknownWorker {
+                runtime_id,
+                worker_id,
+            } => Error::UnknownWorker {
+                runtime_id,
+                worker_id,
+            },
         }
     }
 }
@@ -317,11 +395,11 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
 }
 
 #[derive(Clone)]
-pub struct WorkerRuntimeRegistry {
+pub struct RuntimeRegistry {
     runtimes: Vec<Arc<dyn WorkspaceWorkerRuntime>>,
 }
 
-impl WorkerRuntimeRegistry {
+impl RuntimeRegistry {
     pub fn new(runtimes: Vec<Arc<dyn WorkspaceWorkerRuntime>>) -> Self {
         Self { runtimes }
     }
@@ -410,15 +488,25 @@ impl WorkerRuntimeRegistry {
         }
     }
 
-    pub fn worker(&self, worker_id: &str) -> Result<WorkerSummary, RuntimeRegistryError> {
+    pub fn worker(
+        &self,
+        runtime_id: &str,
+        worker_id: &str,
+    ) -> Result<WorkerSummary, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
-        for runtime in &self.runtimes {
-            let lookup = runtime.worker(worker_id);
-            if let Some(worker) = lookup.worker {
-                return Ok(worker);
-            }
-        }
-        Err(RuntimeRegistryError::UnknownWorker(worker_id.to_string()))
+        let runtime = self
+            .runtimes
+            .iter()
+            .find(|runtime| runtime.runtime_id() == runtime_id)
+            .ok_or_else(|| RuntimeRegistryError::UnknownRuntime(runtime_id.to_string()))?;
+        let lookup = runtime.worker(worker_id);
+        lookup
+            .worker
+            .ok_or_else(|| RuntimeRegistryError::UnknownWorker {
+                runtime_id: runtime_id.to_string(),
+                worker_id: worker_id.to_string(),
+            })
     }
 }
 
@@ -582,6 +670,7 @@ impl WorkspaceWorkerRuntime for LocalWorkerRuntime {
             label: "Local Worker runtime".to_string(),
             kind: "local_pod".to_string(),
             status: "available".to_string(),
+            source: RuntimeSourceSummary::local_compatibility(),
             host_ids: host_list
                 .items
                 .iter()
@@ -960,6 +1049,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn write_metadata(dir: &Path, worker_name: &str, metadata: &WorkerMetadata) {
@@ -991,6 +1081,184 @@ mod tests {
         host_id_for_workspace("local:test")
     }
 
+    #[derive(Clone)]
+    struct FixtureRuntime {
+        runtime_id: String,
+        host_id: String,
+        workers: Vec<WorkerSummary>,
+    }
+
+    impl FixtureRuntime {
+        fn with_worker(runtime_id: &str, host_id: &str, worker_id: &str, label: &str) -> Self {
+            Self {
+                runtime_id: runtime_id.to_string(),
+                host_id: host_id.to_string(),
+                workers: vec![WorkerSummary {
+                    runtime_id: runtime_id.to_string(),
+                    worker_id: worker_id.to_string(),
+                    host_id: host_id.to_string(),
+                    label: label.to_string(),
+                    role: None,
+                    profile: None,
+                    workspace: WorkerWorkspaceSummary {
+                        visibility: "opaque".to_string(),
+                        identity: host_id.to_string(),
+                    },
+                    state: "running".to_string(),
+                    status: "available".to_string(),
+                    last_seen_at: None,
+                    implementation: WorkerImplementationSummary {
+                        kind: "fixture".to_string(),
+                        display_hint: "test fixture".to_string(),
+                    },
+                    capabilities: WorkerCapabilitySummary {
+                        can_accept_input: false,
+                        can_stream_events: false,
+                        can_stop: false,
+                        can_spawn_followup: false,
+                        can_read_bounded_transcript: false,
+                    },
+                    diagnostics: Vec::new(),
+                }],
+            }
+        }
+    }
+
+    impl WorkspaceWorkerRuntime for FixtureRuntime {
+        fn runtime_id(&self) -> &str {
+            &self.runtime_id
+        }
+
+        fn runtime_summary(&self, _limit: usize) -> RuntimeSummary {
+            RuntimeSummary {
+                runtime_id: self.runtime_id.clone(),
+                label: self.runtime_id.clone(),
+                kind: "fixture".to_string(),
+                status: "available".to_string(),
+                source: RuntimeSourceSummary::embedded_worker_runtime_reserved(),
+                host_ids: vec![self.host_id.clone()],
+                capabilities: RuntimeCapabilitySummary {
+                    can_list_hosts: true,
+                    can_list_workers: true,
+                    can_get_worker: true,
+                    can_spawn_worker: false,
+                    can_stop_worker: false,
+                    can_accept_input: false,
+                    can_stream_events: false,
+                    can_read_bounded_transcript: false,
+                    has_workspace_fs: false,
+                    has_shell: false,
+                    has_git: false,
+                    supports_worktrees: false,
+                    supports_backend_internal_tools: false,
+                    local_pod_inspection: "none".to_string(),
+                    workspace_scope: "none".to_string(),
+                    max_workers: self.workers.len(),
+                    os: "test".to_string(),
+                    arch: "test".to_string(),
+                },
+                diagnostics: Vec::new(),
+            }
+        }
+
+        fn list_hosts(&self, _limit: usize) -> RuntimeList<HostSummary> {
+            RuntimeList::new(
+                vec![HostSummary {
+                    runtime_id: self.runtime_id.clone(),
+                    host_id: self.host_id.clone(),
+                    label: "fixture host".to_string(),
+                    kind: "fixture".to_string(),
+                    status: "available".to_string(),
+                    observed_at: "unknown".to_string(),
+                    last_seen_at: None,
+                    capabilities: self.runtime_summary(1).capabilities,
+                    diagnostics: Vec::new(),
+                }],
+                Vec::new(),
+            )
+        }
+
+        fn list_workers(&self, limit: usize) -> RuntimeList<WorkerSummary> {
+            RuntimeList::new(
+                self.workers.iter().take(limit).cloned().collect(),
+                Vec::new(),
+            )
+        }
+
+        fn worker(&self, worker_id: &str) -> WorkerLookupResult {
+            WorkerLookupResult {
+                worker: self
+                    .workers
+                    .iter()
+                    .find(|worker| worker.worker_id == worker_id)
+                    .cloned(),
+                diagnostics: Vec::new(),
+            }
+        }
+    }
+
+    #[test]
+    fn registry_worker_lookup_is_scoped_by_runtime_id() {
+        let registry = RuntimeRegistry::new(vec![
+            Arc::new(FixtureRuntime::with_worker(
+                "runtime-a",
+                "host-a",
+                "shared-worker",
+                "worker from runtime a",
+            )),
+            Arc::new(FixtureRuntime::with_worker(
+                "runtime-b",
+                "host-b",
+                "shared-worker",
+                "worker from runtime b",
+            )),
+        ]);
+
+        let from_runtime_b = registry.worker("runtime-b", "shared-worker").unwrap();
+        assert_eq!(from_runtime_b.runtime_id, "runtime-b");
+        assert_eq!(from_runtime_b.host_id, "host-b");
+        assert_eq!(from_runtime_b.label, "worker from runtime b");
+
+        let from_runtime_a = registry.worker("runtime-a", "shared-worker").unwrap();
+        assert_eq!(from_runtime_a.runtime_id, "runtime-a");
+        assert_eq!(from_runtime_a.host_id, "host-a");
+        assert_eq!(from_runtime_a.label, "worker from runtime a");
+    }
+
+    #[test]
+    fn registry_worker_lookup_reports_unknown_runtime_and_worker_separately() {
+        let registry = RuntimeRegistry::new(vec![Arc::new(FixtureRuntime::with_worker(
+            "runtime-a",
+            "host-a",
+            "worker-a",
+            "worker from runtime a",
+        ))]);
+
+        let unknown_runtime = registry.worker("runtime-missing", "worker-a").unwrap_err();
+        assert_eq!(
+            unknown_runtime,
+            RuntimeRegistryError::UnknownRuntime("runtime-missing".to_string())
+        );
+        assert!(matches!(
+            unknown_runtime.into_error(),
+            Error::UnknownRuntime(runtime_id) if runtime_id == "runtime-missing"
+        ));
+
+        let unknown_worker = registry.worker("runtime-a", "worker-missing").unwrap_err();
+        assert_eq!(
+            unknown_worker,
+            RuntimeRegistryError::UnknownWorker {
+                runtime_id: "runtime-a".to_string(),
+                worker_id: "worker-missing".to_string(),
+            }
+        );
+        assert!(matches!(
+            unknown_worker.into_error(),
+            Error::UnknownWorker { runtime_id, worker_id }
+                if runtime_id == "runtime-a" && worker_id == "worker-missing"
+        ));
+    }
+
     #[test]
     fn local_runtime_reports_host_without_private_paths() {
         let bridge = LocalWorkerRuntime::new("local:test", "/workspace/project", None);
@@ -1011,7 +1279,7 @@ mod tests {
     fn registry_lists_runtimes_hosts_and_workers() {
         let temp = TempDir::new().unwrap();
         write_metadata(temp.path(), "coder", &metadata(Some("/workspace/project")));
-        let registry = WorkerRuntimeRegistry::for_local_pods(LocalWorkerRuntime::new(
+        let registry = RuntimeRegistry::for_local_pods(LocalWorkerRuntime::new(
             "local:test",
             "/workspace/project",
             Some(temp.path().to_path_buf()),
@@ -1019,6 +1287,14 @@ mod tests {
 
         let runtimes = registry.list_runtimes(10);
         assert_eq!(runtimes.items[0].runtime_id, LOCAL_RUNTIME_ID);
+        assert_eq!(
+            runtimes.items[0].source.kind,
+            RuntimeSourceKind::LocalCompatibility
+        );
+        assert_eq!(
+            runtimes.items[0].source.identity_authority,
+            RuntimeIdentityAuthority::RuntimeRegistryProjection
+        );
         assert_eq!(runtimes.items[0].host_ids, vec![host_id()]);
 
         let hosts = registry.list_hosts(10);
@@ -1043,7 +1319,7 @@ mod tests {
     fn registry_resolves_backend_validated_host_ids() {
         let temp = TempDir::new().unwrap();
         write_metadata(temp.path(), "coder", &metadata(Some("/workspace/project")));
-        let registry = WorkerRuntimeRegistry::for_local_pods(LocalWorkerRuntime::new(
+        let registry = RuntimeRegistry::for_local_pods(LocalWorkerRuntime::new(
             "local:test",
             "/workspace/project",
             Some(temp.path().to_path_buf()),
@@ -1133,7 +1409,7 @@ mod tests {
             "/workspace/project",
             Some(temp.path().to_path_buf()),
         );
-        let registry = WorkerRuntimeRegistry::for_local_pods(bridge.clone());
+        let registry = RuntimeRegistry::for_local_pods(bridge.clone());
 
         let listed = registry.list_workers(100);
         assert_eq!(listed.items.len(), worker_names.len());
@@ -1149,7 +1425,9 @@ mod tests {
             assert!(!worker.worker_id.contains('@'));
             assert!(!worker.worker_id.contains('#'));
 
-            let from_registry = registry.worker(&worker.worker_id).unwrap();
+            let from_registry = registry
+                .worker(&worker.runtime_id, &worker.worker_id)
+                .unwrap();
             assert_eq!(from_registry.worker_id, worker.worker_id);
             let from_runtime = bridge.worker(&worker.worker_id).worker.unwrap();
             assert_eq!(from_runtime.worker_id, worker.worker_id);
