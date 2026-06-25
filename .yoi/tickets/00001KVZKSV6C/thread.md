@@ -324,3 +324,54 @@ Review result: approve
 前回ブロッカーは解消済みと判断する。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-25T20:44:19Z -->
+
+## Implementation report
+
+Integration / validation report:
+
+Integration:
+- Implementation branch `work/00001KVZKSV6C-backend-runtime-registry` を orchestration branch に merge 済み。
+- Merge commit: `fb023aab merge: 00001KVZKSV6C runtime registry foundation`
+
+Included implementation commits:
+- `f6fd7b63 feat: add workspace runtime registry source boundary`
+- `d7c4396c fix: scope workspace worker lookup by runtime`
+
+Validation in Orchestrator worktree:
+- `cargo fmt --all --check`: success
+- `cargo test -p yoi-workspace-server`: success（21 tests passed）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Review:
+- Reviewer approve 済み。前回 blocker だった `runtime_id + worker_id` authority と unknown-runtime / unknown-worker typed error boundary は解消済み。
+
+Outcome:
+- Acceptance criteria を満たしたため `done` へ進める。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-25T20:44:27Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Backend RuntimeRegistry foundation の実装、review、merge、Orchestrator validation が完了した。
+
+Done evidence:
+- Merge commit: `fb023aab merge: 00001KVZKSV6C runtime registry foundation`
+- Reviewer approve 済み。
+- Orchestrator validation:
+  - `cargo fmt --all --check`: success
+  - `cargo test -p yoi-workspace-server`: success（21 tests passed）
+  - `cargo check -p yoi`: success
+  - `git diff --check`: success
+  - `nix build .#yoi --no-link`: success
+
+Scope:
+- workspace-server の RuntimeRegistry foundation を worker-runtime 向け identity/projection/error boundary に整理。
+- embedded runtime connection / remote HTTP / REST server / Web Console は Non-goals として未実装。
+
+---
