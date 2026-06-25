@@ -343,3 +343,110 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-25T16:21:38Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- Dashboard Queue により本 Ticket の Orchestrator routing が明示許可された。
+- Ticket body / thread には core slice の範囲、Non-goals、API 分割、profile/config bundle sync の境界、`worker` crate との責務境界が十分に記録されている。
+- Relation blockers は解消済み。`00001KVZD10ED` は closed、`00001KVZG9BMS` は done。
+- `queued` は本 Ticket 1件のみ、`inprogress` は 0 件。追加並列受理候補はない。
+- Orchestration worktree は queue commit `30363e5e` 上で clean。既存の旧 worker-rename child worktree/Workers は残っているが、今回の child worktree path / branch / scope は分離できる。
+
+Evidence checked:
+- Ticket body: `crates/worker-runtime` core crate、memory-backed embedded Runtime API、Runtime/Worker identity、management/catalog/interaction/projection API、Non-goals、acceptance criteria。
+- Ticket thread decisions: implementation order、`pod-store` / `pod-registry` を standalone `worker-store` / `worker-registry` にしない、FS/REST/event-stream/Backend integration/config-bundle sync は別 Ticket。
+- Relations: depends_on `00001KVZD10ED` / `00001KVZG9BMS`; incoming dependent Tickets are later FS/REST/event-stream/config-bundle work and do not block this core slice.
+- OrchestrationPlan: 新規 accepted plan `orch-plan-20260625-162107-1` を記録。
+- Code map: root `Cargo.toml` workspace members/dependencies、既存 `crates/worker` single Worker host、`crates/workspace-server/src/hosts.rs` の現行 `WorkerRuntimeRegistry` / `WorkspaceWorkerRuntime` / local compatibility projection を確認。
+- Workspace state: `/home/hare/Projects/yoi/.worktree/orchestration` clean; implementation worktree target `/home/hare/Projects/yoi/.worktree/00001KVZBCQH4-worker-runtime-core` / branch `work/00001KVZBCQH4-worker-runtime-core` を採用。
+
+IntentPacket:
+
+Intent:
+- `crates/worker-runtime` を追加し、Backend 等へ組み込める memory-backed embedded Runtime core API を実装する。
+
+Binding decisions / invariants:
+- `Runtime` は concrete domain entity。trait object を public authority として設計しない。
+- API authority は `runtime_id + worker_id`。`pod_name` / socket path / session path を Runtime public API authority にしない。
+- `worker` crate は当面 single Worker host として残し、Runtime core は socket / attach / session file details や全 public Worker internals を再公開しない。
+- HTTP server / WebSocket/SSE server / REST command server / HTTP client / FS persistence / Backend RuntimeRegistry integration / Web Console は実装しない。
+- `worker-store` / `worker-registry` standalone crate は作らない。store/allocation は Runtime internal abstraction として定義する。
+- Profile/config bundle sync は別 Ticket。ここでは `ConfigBundleRef` placeholder と Profile selector 境界まで。
+- Existing process/socket/session compatibility の削除・大規模移植はしない。
+
+Requirements / acceptance criteria:
+- `crates/worker-runtime` を workspace に追加し、library として HTTP/WS/FS dependency なしで使える。
+- Runtime management、Worker catalog/lifecycle、Worker interaction、Worker observation/projection API が型として分離される。
+- Memory-backed embedded Runtime が summary/status、worker list/detail/create、send input、stop/cancel、bounded transcript projection、event cursor/subscription placeholder、diagnostics を持つ。
+- `CreateWorkerRequest` は `WorkerIntent`、Profile selector、optional `ConfigBundleRef`、requested capabilities、optional workspace/mount refs を表現する。
+- `ConfigBundleRef` なしでも Runtime-local builtin/default resources の範囲で toolsなし Worker を作れる型/挙動にする。
+- `cargo test -p worker-runtime`、`cargo check -p yoi`、`git diff --check`、必要に応じて `nix build .#yoi --no-link` が通る。
+
+Implementation latitude:
+- Module分割、型名、内部 store/allocation trait/struct の詳細、event cursor/subscription placeholder の最小実装、memory worker の transcript/event 表現は Coder が既存コード規約に合わせて選んでよい。
+- v0 は actual LLM/provider integration なし、または toolsなし minimal Worker projection でよい。ただし acceptance criteria の create/send/stop/cancel/projection observable behavior はテストで示す。
+
+Escalate if:
+- `worker` crate の public API 大規模変更や socket/session compatibility 変更が必要になる。
+- HTTP/WS/FS/Backend integration/config bundle sync を実装しないと acceptance を満たせないと判明する。
+- `pod-store` / `pod-registry` の削除または standalone rename が必要になりそうになる。
+- Runtime public API authority に socket/session/path identity を混ぜる必要が出る。
+
+Validation:
+- `cargo fmt --all`
+- `cargo test -p worker-runtime`
+- `cargo check -p yoi`
+- `git diff --check`
+- 依存/packaging変更があるため可能なら `nix build .#yoi --no-link`
+
+Current code map:
+- Add: `crates/worker-runtime/**`。
+- Update: root `Cargo.toml` workspace members/default-members/dependencies, `Cargo.lock` as needed, docs/tests only if needed for public API clarity。
+- Reference only as needed: `crates/worker/**` for single Worker host boundary, `crates/workspace-server/src/hosts.rs` for existing Backend registry/projection context。
+- Do not implement network/server/fs integration in this Ticket.
+
+Critical risks / reviewer focus:
+- Scope creep into REST/WS/FS/Backend integration。
+- Runtime API leaking legacy `pod_name` / socket/session authority。
+- Re-exporting or duplicating too much of `worker` internals instead of a bounded Runtime API。
+- Store/allocation becoming standalone `worker-store` / `worker-registry` crates instead of internal boundaries。
+- Config bundle sync accidentally implemented instead of placeholder boundary。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-25T16:21:46Z from: queued to: inprogress reason: routing_accepted_unblocked_worker_runtime_core field: state -->
+
+## State changed
+
+Routing decision: implementation_ready。
+
+Dashboard Queue による human-authorized routing を受け、Ticket body/thread、relations、orchestration plan、workspace state を確認した。`00001KVZD10ED` は closed、`00001KVZG9BMS` は done で relation blockers は解消済み。queued は本 Ticket 1件のみ、inprogress は 0 件。accepted plan と IntentPacket を thread / orchestration plan に記録済み。
+
+これ以降、worktree creation / coder/reviewer Worker routing などの implementation side effect に進める。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-25T16:23:24Z -->
+
+## Implementation report
+
+Implementation kickoff:
+
+- Worktree created: `/home/hare/Projects/yoi/.worktree/00001KVZBCQH4-worker-runtime-core`
+- Branch: `work/00001KVZBCQH4-worker-runtime-core`
+- Coder Worker spawned: `yoi-coder-00001KVZBCQH4-worker-runtime`
+
+Scope notes:
+- Coder has read access to the implementation worktree and non-recursive workspace root identity path needed by runtime startup.
+- Coder write scope is intentionally narrow: `crates/**`, root `Cargo.toml`, and root `Cargo.lock` only.
+- Coder is instructed not to modify Ticket records and not to operate in root/orchestration worktrees.
+
+Startup note:
+- The first spawn attempt failed before child creation because the runtime workspace root path itself was not readable in the delegated scope. Retried with non-recursive read on `/home/hare/Projects/yoi` plus implementation worktree read/write scope; second spawn succeeded.
+
+---
