@@ -516,3 +516,34 @@ Residual risks / notes:
 - child worktree は commit 後 clean。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZG9BMS-worker-rename at: 2026-06-25T16:00:39Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+読取専用で `da96d06f` を確認した。指定 grep は報告通り概ね解消しており、`--pod` / `yoi pod`、`pod_rows` / `pod_names` / `row.key.kind == "pod"` は見当たらなかった。
+
+ただし、前回 blocker の「active user/developer-facing guidance に旧 Pod terminology が残存」に対して、まだ active docs/test diagnostics に旧名が残っている。
+
+Remaining blockers:
+
+- `docs/development/workflows.md`
+  - `20: ## Child Pods`
+  - `38: Child Pods may commit ...`
+- `docs/development/work-items.md`
+  - `27: Inside Pods ...`
+  - `32: Ticket tools inside Pods`
+  - `34: Pods with the Ticket built-in feature ...`
+  - `198: spawn coder/reviewer Pods ...`
+  - `229: coder Pods ...`
+- `tests/e2e/tests/panel.rs`
+  - `77: fixture blocks host Pod launch`
+  - `626: host/fixture runtime Pod marker ...`
+
+これらは `pod-store` / `pod-registry` crate 名や on-disk `pods` compatibility の説明ではなく、現在の Worker 実行単位・workflow guidance・test diagnostics なので、Ticket の Worker rename intent に合わせて `Worker(s)` へ更新が必要。
+
+`SendToPeerPod` の analytics-only legacy constant は、現行 `SendToPeerWorker` 分類と明示 comment があるため許容。
+
+---
