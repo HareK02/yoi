@@ -1,8 +1,8 @@
 ---
 title: 'Abstract Worker runtime registry and overview reporting'
-state: 'done'
+state: 'closed'
 created_at: '2026-06-24T09:11:38Z'
-updated_at: '2026-06-24T11:15:13Z'
+updated_at: '2026-06-25T14:13:52Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-24T09:22:55Z'

@@ -361,3 +361,21 @@ Evidence:
 Closure is not performed here; this state records implementation completion after merge/validation.
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-25T14:13:52Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-25T14:13:52Z status: closed -->
+
+## 完了
+
+Implemented, reviewed, marked done, and merged into develop.
+
+
+---

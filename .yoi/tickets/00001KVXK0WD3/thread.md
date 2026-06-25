@@ -271,3 +271,21 @@ Correction:
 - 実装 commit `741d7132`、review approve、validation results、Ticket done 判断には変更なし。
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-25T14:13:52Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-25T14:13:52Z status: closed -->
+
+## 完了
+
+Implemented, reviewed, marked done, and merged into develop.
+
+
+---
