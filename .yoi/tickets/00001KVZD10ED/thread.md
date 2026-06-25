@@ -134,3 +134,59 @@ Implementation orchestration update:
 - Coder には root/original workspace と orchestration worktree で read/write/validation/git operation を行わないよう明示した。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZD10ED-llm-engine at: 2026-06-25T13:47:26Z -->
+
+## Implementation report
+
+Implementation report:
+
+対象 Ticket:
+- `00001KVZD10ED` — `llm-worker crateをllm-engineへ改名する`
+
+実装概要:
+- `crates/llm-worker` → `crates/llm-engine`
+- `crates/llm-worker-macros` → `crates/llm-engine-macros`
+- Cargo package / workspace dependency 名を `llm-engine` / `llm-engine-macros` へ更新。
+- Rust import path を `llm_engine` / `llm_engine_macros` へ更新。
+- turn-engine API を rename。
+  - `Worker` → `Engine`
+  - `WorkerConfig` → `EngineConfig`
+  - `WorkerError` → `EngineError`
+  - `WorkerResult` → `EngineResult`
+  - `WorkerState` → `EngineState`
+  - `RunOutput` → `EngineRunOutput`
+- `pod` 側の engine 保持 API / error / alert source 等も rename fallout として更新。
+- docs / tests / examples / Nix / `Cargo.lock` / `package.nix` hash を更新。
+- 旧 crate directory は削除済みで、互換 alias は追加していない。
+
+Commit:
+- `292fc4ea refactor: rename llm worker crate to engine`
+
+Validation:
+- `cargo test -p llm-engine`: success
+- `cargo test -p pod`: success
+  - 既知 caveat の prompt guidance snapshot failure は今回発生しなかった。
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Grep evidence:
+- `.yoi/tickets/**` と `docs/report/**` を除外した active tree で以下の旧 active references は 0 件。
+  - `llm-worker`
+  - `llm_worker`
+  - `llm-worker-macros`
+  - `llm_worker_macros`
+- `crates/llm-engine` / `crates/llm-engine-macros` 内の旧 public Worker API 名も 0 件。
+  - `\bWorker\b`
+  - `WorkerConfig`
+  - `WorkerError`
+  - `WorkerResult`
+  - `WorkerState`
+- historical `.yoi/tickets` / `docs/report` 内には旧語が残る。count: 786。これは Ticket 本文・過去 report 類の履歴文脈として意図的に残している。
+
+Residual risks / notes:
+- 互換 alias は入れていないため、外部未追跡コードが `llm-worker` / `llm_worker::Worker` を直接参照している場合は破壊的変更になる。ただし Ticket の binding invariant 通り。
+- merge / Ticket close / worktree cleanup は未実施。
+
+---
