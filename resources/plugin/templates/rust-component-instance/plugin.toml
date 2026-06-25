@@ -11,6 +11,7 @@ permissions = [
   { kind = "service", name = "example_service" },
   { kind = "surface", surface = "ingress" },
   { kind = "ingress", name = "example_ws" },
+  { kind = "host_api", api = "websocket" },
 ]
 
 [runtime]
@@ -34,3 +35,8 @@ description = "Handles host-owned WebSocket text events and returns websocket_se
 event_kinds = ["websocket_text"]
 sources = ["websocket:wss://example.com/socket"]
 input_schema = { type = "object" }
+
+[[websocket]]
+scheme = "wss"
+host = "example.com"
+path_prefixes = ["/socket"]

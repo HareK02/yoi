@@ -2188,6 +2188,10 @@ mod tests {
         assert!(manifest.contains("kind = \"wasm-component\""));
         assert!(manifest.contains("[[services]]"));
         assert!(manifest.contains("[[ingresses]]"));
+        assert!(manifest.contains("{ kind = \"host_api\", api = \"websocket\" }"));
+        assert!(manifest.contains("[[websocket]]"));
+        assert!(manifest.contains("host = \"example.com\""));
+        assert!(manifest.contains("path_prefixes = [\"/socket\"]"));
         let source = fs::read_to_string(service_destination.join("src/lib.rs")).unwrap();
         assert!(source.contains("ServiceOutput::websocket_send"));
         assert!(!source.contains("recv(timeout"));

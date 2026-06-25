@@ -352,6 +352,13 @@ A minimal manifest shape is:
 
 ```toml
 surfaces = ["tool", "service", "ingress"]
+permissions = [
+  { kind = "surface", surface = "service" },
+  { kind = "service", name = "example_service" },
+  { kind = "surface", surface = "ingress" },
+  { kind = "ingress", name = "example_ws" },
+  { kind = "host_api", api = "websocket" },
+]
 
 [runtime]
 kind = "wasm-component"
@@ -369,7 +376,14 @@ description = "Handles host-owned WebSocket text events."
 event_kinds = ["websocket_text", "websocket_close", "websocket_error"]
 sources = ["websocket:wss://gateway.example.com/gateway"]
 input_schema = { type = "object" }
+
+[[websocket]]
+scheme = "wss"
+host = "gateway.example.com"
+path_prefixes = ["/gateway"]
 ```
+
+The `host_api.websocket` permission and `[[websocket]]` target are required for `websocket_send` output commands. Runtime enablement grants must explicitly allow the same WebSocket target; the manifest declaration alone is not authority.
 
 Generate a fuller example with `yoi plugin new rust-component-service ./my-service-plugin`.
 

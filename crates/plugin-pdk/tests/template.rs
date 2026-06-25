@@ -72,6 +72,14 @@ fn rust_component_service_template_has_event_output_pattern() {
         plugin["runtime"]["world"].as_str(),
         Some("yoi:plugin/instance@1.0.0")
     );
+    assert!(
+        plugin["permissions"]
+            .as_array()
+            .expect("permissions array")
+            .iter()
+            .any(|permission| permission["kind"].as_str() == Some("host_api")
+                && permission["api"].as_str() == Some("websocket"))
+    );
     assert_eq!(
         plugin["services"].as_array().expect("services array").len(),
         1
@@ -89,10 +97,17 @@ fn rust_component_service_template_has_event_output_pattern() {
             .as_array()
             .expect("sources")
             .iter()
-            .any(|source| source
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("websocket:wss://"))
+            .any(|source| source.as_str() == Some("websocket:wss://example.com/socket"))
+    );
+    let websocket = &plugin["websocket"].as_array().expect("websocket targets")[0];
+    assert_eq!(websocket["scheme"].as_str(), Some("wss"));
+    assert_eq!(websocket["host"].as_str(), Some("example.com"));
+    assert!(
+        websocket["path_prefixes"]
+            .as_array()
+            .expect("websocket path prefixes")
+            .iter()
+            .any(|prefix| prefix.as_str() == Some("/socket"))
     );
 
     assert!(SERVICE_TEMPLATE_LIB.contains("world: \"instance\""));
