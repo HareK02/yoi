@@ -226,3 +226,45 @@ Validation:
 - Ticket item/thread、IntentPacket、`cd200630..HEAD` の変更、WIT / PDK / template / CLI / docs / runtime envelope 関連箇所を静的確認した。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVXK0WEA-pdk-service-events at: 2026-06-25T07:53:08Z -->
+
+## Implementation report
+
+Follow-up implementation report after review request_changes:
+
+対応内容:
+- Reviewer blocker に対応し、Service template の `websocket_send` output command に必要な runtime authority を追加した。
+
+変更点:
+- `resources/plugin/templates/rust-component-instance/plugin.toml`
+  - `permissions` に `{ kind = "host_api", api = "websocket" }` を追加。
+  - matching target として `[[websocket]]` を追加。
+    - `scheme = "wss"`
+    - `host = "example.com"`
+    - `path_prefixes = ["/socket"]`
+- `crates/plugin-pdk/tests/template.rs`
+  - service template manifest に `host_api.websocket` permission が含まれることを検証。
+  - `[[websocket]]` target が `wss://example.com/socket` に対応していることを検証。
+- `crates/yoi/src/plugin_cli.rs`
+  - `yoi plugin new rust-component-service ...` で生成される manifest に `host_api.websocket` permission / `[[websocket]]` declaration が含まれることを CLI test に追加。
+- `resources/plugin/templates/rust-component-instance/README.md`
+  - manifest 側の `host_api.websocket` / `[[websocket]]` declaration と、enablement grants 側でも同じ WebSocket target を明示許可する必要があることを追記。
+- `docs/development/plugin-development.md`
+  - Service ingress / output command の minimal manifest example に `host_api.websocket` permission と `[[websocket]]` target を追加。
+  - `websocket_send` output command には manifest declaration だけでなく runtime enablement grants も必要であることを明記。
+
+Validation:
+- `cargo test -p yoi-plugin-pdk`: success
+- `cargo test -p yoi plugin`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success (`nix-exit:0`)
+
+Commit:
+- `6c8998878dc1d59ad70da3280efd503a9a060ebb fix: declare plugin service websocket authority`
+
+Residual risks / notes:
+- なし。runtime envelope の再設計、raw wasm compatibility、protocol-specific integration、secret/reconnect policy、runtime reimplementation は行っていない。
+
+---
