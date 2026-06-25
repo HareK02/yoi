@@ -1,14 +1,22 @@
-[workspace]
-
 [package]
-name = "example-yoi-instance-plugin"
+name = "yoi-rust-component-service-template"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+publish = false
+
+# Keep the embedded template checkable in-place without making it a member of
+# Yoi's root workspace. A copied starter remains a normal standalone package.
+[workspace]
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 yoi-plugin-pdk = { path = "../../../../crates/plugin-pdk" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+
+# Out-of-tree Plugin packages should replace the local path with a pinned
+# Yoi source revision. Use rev, not branch, for reproducible builds:
+# yoi-plugin-pdk = { git = "https://gitea.hareworks.net/Hare/yoi.git", package = "yoi-plugin-pdk", rev = "<pinned-yoi-commit-sha>" }

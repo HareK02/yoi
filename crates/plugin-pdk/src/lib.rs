@@ -469,14 +469,47 @@ mod tests {
     }
 
     #[test]
+    fn service_output_helper_builds_runtime_command_envelope() {
+        let event = PluginIngressEvent {
+            kind: "websocket_text".to_string(),
+            source: "websocket:wss://example.test/socket".to_string(),
+            ingress_name: "example_ws".to_string(),
+            payload: json!({"text":"ping"}),
+            created_at: "2026-06-25T00:00:00Z".to_string(),
+            attempt: 1,
+            correlation_id: "event-1".to_string(),
+        };
+
+        assert_eq!(event.websocket_text(), Some("ping"));
+        let output =
+            ServiceOutput::websocket_send(&event, "reply-1", "wss://example.test/socket", "pong")
+                .unwrap();
+        let value = serde_json::to_value(output).unwrap();
+
+        assert_eq!(value["accepted"], true);
+        assert_eq!(value["output_commands"][0]["source_event_id"], "event-1");
+        assert_eq!(value["output_commands"][0]["command_id"], "reply-1");
+        assert_eq!(value["output_commands"][0]["kind"], "websocket_send");
+        assert_eq!(value["output_commands"][0]["payload"]["text"], "pong");
+        assert_eq!(
+            value["output_commands"][0]["requested_at"],
+            "2026-06-25T00:00:00Z"
+        );
+    }
+
+    #[test]
     fn wit_constants_match_current_world() {
         assert!(TOOL_WIT.contains("package yoi:plugin@1.0.0"));
         assert!(TOOL_WIT.contains("world tool"));
         assert!(TOOL_WIT.contains("export call"));
         assert_eq!(TOOL_WORLD, "yoi:plugin/tool@1.0.0");
-        assert!(HOST_WIT.contains("interface https"));
+        assert!(HOST_WIT.contains("interface request"));
+        assert!(HOST_WIT.contains("interface websocket"));
         assert!(HOST_WIT.contains("interface fs"));
         assert!(HOST_WIT.contains("%list: func"));
+        assert!(INSTANCE_WIT.contains("world instance"));
+        assert!(INSTANCE_WIT.contains("export handle-ingress"));
+        assert!(INSTANCE_WIT.contains("websocket_send"));
     }
 }
 
@@ -488,12 +521,48 @@ pub const PLUGIN_INSTANCE_WORLD: &str = "yoi:plugin/instance@1.0.0";
 pub const INSTANCE_WIT: &str =
     include_str!("../../../resources/plugin/wit/yoi-plugin-instance-v1.wit");
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PluginIngressEvent {
     pub kind: String,
     pub source: String,
     #[serde(default)]
+    pub ingress_name: String,
+    #[serde(default)]
     pub payload: Value,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default = "default_attempt")]
+    pub attempt: u32,
+    #[serde(default)]
+    pub correlation_id: String,
+}
+
+impl PluginIngressEvent {
+    /// Return the text payload carried by a host-owned WebSocket ingress event.
+    pub fn websocket_text(&self) -> Option<&str> {
+        self.payload.get("text").and_then(Value::as_str)
+    }
+
+    /// Build a `websocket_send` output command that replies through the
+    /// host-owned Service WebSocket driver. The host still validates the target
+    /// URL and matching grants before sending.
+    pub fn websocket_send(
+        &self,
+        command_id: impl Into<String>,
+        url: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Result<ServiceOutputCommand> {
+        ServiceOutputCommand::new(
+            self,
+            command_id,
+            ServiceOutputCommandKind::WebSocketSend,
+            serde_json::json!({ "url": url.into(), "text": text.into() }),
+        )
+    }
+}
+
+fn default_attempt() -> u32 {
+    1
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -519,12 +588,118 @@ impl PluginStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceOutputCommandKind {
+    DiagnosticStatusUpdate,
+    HostRequestDispatch,
+    #[serde(rename = "websocket_send")]
+    WebSocketSend,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ServiceOutputCommand {
+    pub correlation_id: String,
+    pub source_event_id: String,
+    pub command_id: String,
+    pub kind: ServiceOutputCommandKind,
+    pub payload: Value,
+    pub requested_at: String,
+}
+
+impl ServiceOutputCommand {
+    pub fn new(
+        event: &PluginIngressEvent,
+        command_id: impl Into<String>,
+        kind: ServiceOutputCommandKind,
+        payload: impl Serialize,
+    ) -> Result<Self> {
+        let command_id = sanitize_command_id(command_id.into());
+        if command_id.is_empty() {
+            return Err(ToolError::invalid_output(
+                "service output command_id must not be empty",
+            ));
+        }
+        let source_event_id = event.correlation_id.clone();
+        if source_event_id.is_empty() {
+            return Err(ToolError::invalid_output(
+                "service output command requires ingress event correlation_id",
+            ));
+        }
+        let requested_at = if event.created_at.is_empty() {
+            "1970-01-01T00:00:00Z".to_string()
+        } else {
+            event.created_at.clone()
+        };
+        Ok(Self {
+            correlation_id: sanitize_command_id(format!("{source_event_id}:{command_id}")),
+            source_event_id,
+            command_id,
+            kind,
+            payload: serde_json::to_value(payload).map_err(ToolError::serialization)?,
+            requested_at,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ServiceOutput {
+    #[serde(default)]
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub data: Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_commands: Vec<ServiceOutputCommand>,
+}
+
+impl ServiceOutput {
+    pub fn accepted(data: impl Serialize) -> Result<Self> {
+        Ok(Self {
+            accepted: true,
+            data: serde_json::to_value(data).map_err(ToolError::serialization)?,
+            output_commands: Vec::new(),
+        })
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            accepted: true,
+            data: Value::Null,
+            output_commands: Vec::new(),
+        }
+    }
+
+    pub fn with_command(mut self, command: ServiceOutputCommand) -> Self {
+        self.output_commands.push(command);
+        self
+    }
+
+    pub fn websocket_send(
+        event: &PluginIngressEvent,
+        command_id: impl Into<String>,
+        url: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Result<Self> {
+        Ok(Self::empty().with_command(event.websocket_send(command_id, url, text)?))
+    }
+}
+
+fn sanitize_command_id(value: String) -> String {
+    bounded_text(
+        value
+            .chars()
+            .map(|ch| if ch.is_control() { '-' } else { ch })
+            .collect(),
+        128,
+    )
+}
+
 /// Rust-facing instance Plugin contract. Hosts call `start` once, then route
 /// Tool/Ingress surfaces through the same mutable instance.
 pub trait Plugin: Sized + 'static {
     fn start(config: Value) -> Result<Self>;
     fn handle_tool(&mut self, name: &str, input: Value) -> Result<ToolOutput>;
-    fn handle_ingress(&mut self, name: &str, event: PluginIngressEvent) -> Result<Value>;
+    fn handle_ingress(&mut self, name: &str, event: PluginIngressEvent) -> Result<ServiceOutput>;
     fn status(&self) -> Result<PluginStatus> {
         Ok(PluginStatus::ready(Value::Null))
     }

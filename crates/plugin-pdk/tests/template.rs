@@ -12,6 +12,14 @@ const TEMPLATE_PLUGIN: &str =
     include_str!("../../../resources/plugin/templates/rust-component-tool/plugin.toml");
 const TEMPLATE_README: &str =
     include_str!("../../../resources/plugin/templates/rust-component-tool/README.md");
+const SERVICE_TEMPLATE_CARGO: &str =
+    include_str!("../../../resources/plugin/templates/rust-component-instance/Cargo.toml");
+const SERVICE_TEMPLATE_LIB: &str =
+    include_str!("../../../resources/plugin/templates/rust-component-instance/src/lib.rs");
+const SERVICE_TEMPLATE_PLUGIN: &str =
+    include_str!("../../../resources/plugin/templates/rust-component-instance/plugin.toml");
+const SERVICE_TEMPLATE_README: &str =
+    include_str!("../../../resources/plugin/templates/rust-component-instance/README.md");
 const SAMPLE_LIB: &str = include_str!("../../../docs/examples/plugin-component-tool/lib.rs");
 const PDK_CARGO: &str = include_str!("../Cargo.toml");
 
@@ -25,7 +33,7 @@ fn rust_component_tool_template_has_expected_files() {
         cargo["dependencies"]["yoi-plugin-pdk"]["path"].as_str(),
         Some("../../../../crates/plugin-pdk")
     );
-    assert!(TEMPLATE_CARGO.contains("rev = \"<pinned-yoi-revision>\""));
+    assert!(TEMPLATE_CARGO.contains("rev = \"<pinned-yoi-commit-sha>\""));
 
     let plugin: Value = toml::from_str(TEMPLATE_PLUGIN).expect("template plugin.toml parses");
     assert_eq!(plugin["schema_version"].as_integer(), Some(1));
@@ -46,6 +54,71 @@ fn rust_component_tool_template_has_expected_files() {
 }
 
 #[test]
+fn rust_component_service_template_has_event_output_pattern() {
+    let cargo: Value = toml::from_str(SERVICE_TEMPLATE_CARGO).expect("service Cargo.toml parses");
+    assert_eq!(cargo["package"]["edition"].as_str(), Some("2024"));
+    assert_eq!(cargo["lib"]["crate-type"][0].as_str(), Some("cdylib"));
+    assert_eq!(
+        cargo["dependencies"]["yoi-plugin-pdk"]["path"].as_str(),
+        Some("../../../../crates/plugin-pdk")
+    );
+    assert!(SERVICE_TEMPLATE_CARGO.contains("rev = \"<pinned-yoi-commit-sha>\""));
+
+    let plugin: Value =
+        toml::from_str(SERVICE_TEMPLATE_PLUGIN).expect("service plugin.toml parses");
+    assert_eq!(plugin["schema_version"].as_integer(), Some(1));
+    assert_eq!(plugin["runtime"]["kind"].as_str(), Some("wasm-component"));
+    assert_eq!(
+        plugin["runtime"]["world"].as_str(),
+        Some("yoi:plugin/instance@1.0.0")
+    );
+    assert!(
+        plugin["permissions"]
+            .as_array()
+            .expect("permissions array")
+            .iter()
+            .any(|permission| permission["kind"].as_str() == Some("host_api")
+                && permission["api"].as_str() == Some("websocket"))
+    );
+    assert_eq!(
+        plugin["services"].as_array().expect("services array").len(),
+        1
+    );
+    let ingress = &plugin["ingresses"].as_array().expect("ingresses array")[0];
+    assert!(
+        ingress["event_kinds"]
+            .as_array()
+            .expect("event kinds")
+            .iter()
+            .any(|kind| kind.as_str() == Some("websocket_text"))
+    );
+    assert!(
+        ingress["sources"]
+            .as_array()
+            .expect("sources")
+            .iter()
+            .any(|source| source.as_str() == Some("websocket:wss://example.com/socket"))
+    );
+    let websocket = &plugin["websocket"].as_array().expect("websocket targets")[0];
+    assert_eq!(websocket["scheme"].as_str(), Some("wss"));
+    assert_eq!(websocket["host"].as_str(), Some("example.com"));
+    assert!(
+        websocket["path_prefixes"]
+            .as_array()
+            .expect("websocket path prefixes")
+            .iter()
+            .any(|prefix| prefix.as_str() == Some("/socket"))
+    );
+
+    assert!(SERVICE_TEMPLATE_LIB.contains("world: \"instance\""));
+    assert!(SERVICE_TEMPLATE_LIB.contains("PluginIngressEvent"));
+    assert!(SERVICE_TEMPLATE_LIB.contains("ServiceOutput::websocket_send"));
+    assert!(!SERVICE_TEMPLATE_LIB.contains("recv(timeout"));
+    assert!(SERVICE_TEMPLATE_README.contains("output command"));
+    assert!(!SERVICE_TEMPLATE_PLUGIN.contains("kind = \"wasm\""));
+}
+
+#[test]
 fn documented_sample_uses_pdk_component_path() {
     assert!(SAMPLE_LIB.contains("use yoi_plugin_pdk::wit_bindgen"));
     assert!(SAMPLE_LIB.contains("wit_bindgen::generate!"));
@@ -57,8 +130,17 @@ fn documented_sample_uses_pdk_component_path() {
 
 #[test]
 fn embedded_template_cargo_checks_for_wasm_target() {
+    cargo_check_template("rust-component-tool");
+}
+
+#[test]
+fn embedded_service_template_cargo_checks_for_wasm_target() {
+    cargo_check_template("rust-component-instance");
+}
+
+fn cargo_check_template(template: &str) {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let template_dir = crate_dir.join("../../resources/plugin/templates/rust-component-tool");
+    let template_dir = crate_dir.join(format!("../../resources/plugin/templates/{template}"));
     let manifest_path = template_dir.join("Cargo.toml");
     let lock_path = template_dir.join("Cargo.lock");
     let _ = fs::remove_file(&lock_path);

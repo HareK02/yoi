@@ -1,16 +1,17 @@
 schema_version = 1
-id = "example.rust_instance_plugin"
-name = "Rust Instance Plugin Template"
+id = "example.rust_service_plugin"
+name = "Rust Service Plugin Template"
 version = "0.1.0"
-description = "Example instance-oriented Yoi Plugin with shared Tool/Ingress state."
+description = "Example Component Model Plugin with Tool and Service ingress handlers."
 surfaces = ["tool", "service", "ingress"]
 permissions = [
   { kind = "surface", surface = "tool" },
-  { kind = "tool", name = "example_instance_tool" },
+  { kind = "tool", name = "example_echo" },
   { kind = "surface", surface = "service" },
-  { kind = "service", name = "example_instance_service" },
+  { kind = "service", name = "example_service" },
   { kind = "surface", surface = "ingress" },
-  { kind = "ingress", name = "example_instance_ingress" },
+  { kind = "ingress", name = "example_ws" },
+  { kind = "host_api", api = "websocket" },
 ]
 
 [runtime]
@@ -19,17 +20,23 @@ world = "yoi:plugin/instance@1.0.0"
 component = "plugin.component.wasm"
 
 [[tools]]
-name = "example_instance_tool"
-description = "Return the input and increment shared instance state."
+name = "example_echo"
+description = "Echo input text through the shared Plugin instance."
 input_schema = { type = "object" }
 
 [[services]]
-name = "example_instance_service"
-description = "Reports shared plugin instance lifecycle status."
+name = "example_service"
+description = "Host-managed service instance for bounded ingress events."
 lifecycle = "host-managed"
 
 [[ingresses]]
-name = "example_instance_ingress"
-description = "Accepts bounded in-process ingress events."
-event_kinds = ["example"]
+name = "example_ws"
+description = "Handles host-owned WebSocket text events and returns websocket_send output commands."
+event_kinds = ["websocket_text"]
+sources = ["websocket:wss://example.com/socket"]
 input_schema = { type = "object" }
+
+[[websocket]]
+scheme = "wss"
+host = "example.com"
+path_prefixes = ["/socket"]

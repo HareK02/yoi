@@ -5,9 +5,55 @@ world instance {
   import yoi:host/websocket@1.0.0;
   import yoi:host/fs@1.0.0;
 
+  /// Start one host-managed Plugin instance. `config-json` is the opaque
+  /// enablement config copied from the Profile/plugin grant record. The return
+  /// string is PluginStatus JSON: `{ "state": "ready|running|stopped|...",
+  /// "data": <json> }`.
   export start: func(config-json: string) -> string;
+
+  /// Execute a manifest-declared Tool on the shared instance. `input-json` is
+  /// ordinary Tool input JSON and the return string is ToolOutput JSON.
   export handle-tool: func(name: string, input-json: string) -> string;
+
+  /// Handle one host-dispatched Service/Ingress event. `event-json` is an
+  /// ingress event envelope with at least:
+  ///
+  /// ```json
+  /// {
+  ///   "kind": "websocket_text|websocket_close|websocket_error|...",
+  ///   "source": "websocket:wss://host/path|...",
+  ///   "ingress_name": "manifest_ingress_name",
+  ///   "payload": { "text": "..." },
+  ///   "created_at": "RFC3339 timestamp",
+  ///   "attempt": 1,
+  ///   "correlation_id": "host event id"
+  /// }
+  /// ```
+  ///
+  /// The return string is ServiceOutput JSON. To request host-mediated side
+  /// effects, return top-level `output_commands`, for example:
+  ///
+  /// ```json
+  /// {
+  ///   "accepted": true,
+  ///   "output_commands": [{
+  ///     "correlation_id": "command correlation id",
+  ///     "source_event_id": "matching ingress correlation_id",
+  ///     "command_id": "guest command id",
+  ///     "kind": "websocket_send",
+  ///     "payload": { "url": "wss://host/path", "text": "reply" },
+  ///     "requested_at": "RFC3339 timestamp"
+  ///   }]
+  /// }
+  /// ```
+  ///
+  /// Output commands are parsed, bounded, grant-checked, and executed by the
+  /// host. They are not ordinary ToolOutput and do not inject hidden context.
   export handle-ingress: func(name: string, event-json: string) -> string;
+
+  /// Return PluginStatus JSON for the shared host-managed instance.
   export status: func() -> string;
+
+  /// Stop the shared instance and return final PluginStatus JSON.
   export stop: func() -> string;
 }
