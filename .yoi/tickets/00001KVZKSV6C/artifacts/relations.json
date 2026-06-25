@@ -4,34 +4,10 @@
     {
       "ticket_id": "00001KVZKSV6C",
       "kind": "depends_on",
-      "target": "00001KVZKST83",
-      "note": "Standalone remote Runtime should have FS persistence available before Backend integration.",
+      "target": "00001KVZBCQH4",
+      "note": "Backend RuntimeRegistry foundation should use worker-runtime core domain types.",
       "author": "yoi ticket",
-      "at": "2026-06-25T14:47:43Z"
-    },
-    {
-      "ticket_id": "00001KVZKSV6C",
-      "kind": "depends_on",
-      "target": "00001KVZKSTE2",
-      "note": "Backend remote Runtime routing needs the REST command API.",
-      "author": "yoi ticket",
-      "at": "2026-06-25T14:47:43Z"
-    },
-    {
-      "ticket_id": "00001KVZKSV6C",
-      "kind": "depends_on",
-      "target": "00001KVZKSTJT",
-      "note": "Backend event proxy/observation needs the Runtime event stream API.",
-      "author": "yoi ticket",
-      "at": "2026-06-25T14:47:43Z"
-    },
-    {
-      "ticket_id": "00001KVZKSV6C",
-      "kind": "related",
-      "target": "00001KVZQHPNY",
-      "note": "Backend RuntimeRegistry integration will eventually coordinate config bundle sync for remote runtimes, but v0 can use builtin/default fallback.",
-      "author": "yoi ticket",
-      "at": "2026-06-25T15:51:07Z"
+      "at": "2026-06-25T16:30:00Z"
     }
   ]
 }

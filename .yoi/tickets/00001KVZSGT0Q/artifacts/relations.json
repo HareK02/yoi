@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KVZSGT0Q",
+      "kind": "depends_on",
+      "target": "00001KVZKSV6C",
+      "note": "Embedded Runtime connection builds on the Backend RuntimeRegistry foundation.",
+      "author": "yoi ticket",
+      "at": "2026-06-25T16:30:00Z"
+    }
+  ]
+}
