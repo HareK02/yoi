@@ -555,3 +555,19 @@ Review result: request_changes
   cargo/nix の再実行は、read-only 指示と上記 blocker があるため実施していません。
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-25T16:49:53Z -->
+
+## Decision
+
+Human follow-up:
+
+ユーザー確認: 「OK、よろしく」。
+
+運用判断:
+- 現在 queued の dependent Tickets は planning 差し戻し不要として扱う。
+- ただし、未解消 dependency があるものは queued のまま待機し、依存が解消したものだけ再 routing して `queued -> inprogress` を個別に記録してから implementation side effect に進む。
+- 途中で concrete missing decision / information が出た場合は、勝手に固定せず Ticket thread に理由を残して停止または planning return を行う。
+- 現在の最優先は `00001KVZBCQH4` の reviewer blocker 解消、再 review、merge、validation、done 記録。
+
+---
