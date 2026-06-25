@@ -125,3 +125,17 @@ Orchestrator acceptance: queued -> inprogress
 - これ以降に worktree-workflow で `/home/hare/Projects/yoi/.worktree/00001KVXK0WE4-plugin-websocket-driver` を作成し、multi-agent-workflow に接続する。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-25T06:24:16Z -->
+
+## Implementation report
+
+Implementation orchestration update:
+
+- prerequisite `00001KVXK0WDX` が done になったため、`00001KVXK0WE4` を再 routing して受理した。
+- worktree-workflow に従い、implementation worktree `/home/hare/Projects/yoi/.worktree/00001KVXK0WE4-plugin-websocket-driver` と branch `work/00001KVXK0WE4-plugin-websocket-driver` を作成した。
+- child worktree では tracked `.yoi` project records を見える状態にし、`.yoi/memory`、local/runtime/log/lock/secret-like `.yoi` paths を sparse-checkout で除外する方針にした。
+- Coder Pod `yoi-coder-00001KVXK0WE4-websocket-driver` を sibling として起動した。write scope は child worktree に限定し、runtime workspace root `/home/hare/Projects/yoi` は startup 要件を満たすため non-recursive read のみにした。
+- Coder には root/original workspace と orchestration worktree で read/write/validation/git operation を行わないよう明示した。
+
+---
