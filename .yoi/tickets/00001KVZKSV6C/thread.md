@@ -305,3 +305,22 @@ Residual risks / review focus:
 - fixture runtime は routing/error 境界確認用の test-only 実装で、embedded/remote の実接続は次 Ticket の責務として残している。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZKSV6C-runtime-registry at: 2026-06-25T20:41:10Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+確認結果:
+- `RuntimeRegistry::worker(runtime_id, worker_id)` に変更され、`worker_id` 単独走査ではなく `runtime_id` で対象 Runtime を確定してから lookup する形になっている。
+- `UnknownRuntime` と `UnknownWorker { runtime_id, worker_id }` が分離され、crate `Error` / server 404 mapping も更新されている。
+- 同一 `worker_id` が複数 Runtime に存在する multi-runtime fixture test が追加され、誤 routing しないことを確認している。
+- unknown runtime / known runtime + missing worker の error mapping test も追加されている。
+- embedded worker-runtime 接続、remote HTTP、REST server 等の scope creep は見当たらない。
+- local compatibility source の既存 projection / path 非露出 / ID boundedness 系テストは維持されている。
+- read-only で `git diff --check f6fd7b63 d7c4396c` は問題なし。Cargo/Nix は read-only 指示のため再実行していない。
+
+前回ブロッカーは解消済みと判断する。
+
+---
