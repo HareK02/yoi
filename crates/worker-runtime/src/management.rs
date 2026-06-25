@@ -1,11 +1,13 @@
 use crate::identity::RuntimeId;
 use serde::{Deserialize, Serialize};
 
-/// Runtime backend kind.  v0 intentionally ships only an embedded memory backend.
+/// Runtime backend kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeBackendKind {
     Memory,
+    #[cfg(feature = "fs-store")]
+    FsStore,
 }
 
 /// Runtime lifecycle state.
