@@ -9,10 +9,10 @@ use manifest::plugin::{
     MaterializedPluginPackage, PluginConfig, PluginDiagnostic, PluginDiagnosticKind,
     PluginDiagnosticPhase, PluginDiscoveryLimits, PluginDiscoveryOptions, PluginDiscoveryReport,
     PluginExactVersion, PluginGrantConfig, PluginPackageManifest, PluginPermission,
-    PluginResolution, PluginSourceKind, PluginSurface, RUST_COMPONENT_TOOL_TEMPLATE,
-    ResolvedPlugin, ResolvedPluginRecord, SourceQualifiedPluginId, discover_plugins,
-    read_plugin_directory, read_plugin_package_file, resolve_enabled_plugins,
-    write_plugin_package_file,
+    PluginResolution, PluginSourceKind, PluginSurface, PluginTemplateResource,
+    RUST_COMPONENT_INSTANCE_TEMPLATE, RUST_COMPONENT_TOOL_TEMPLATE, ResolvedPlugin,
+    ResolvedPluginRecord, SourceQualifiedPluginId, discover_plugins, read_plugin_directory,
+    read_plugin_package_file, resolve_enabled_plugins, write_plugin_package_file,
 };
 use manifest::{ProfileResolveOptions, ProfileResolver, ProfileSelector, paths};
 use pod::feature::plugin::{PluginStaticInspection, inspect_resolved_plugin_static};
@@ -85,27 +85,29 @@ pub(crate) fn run(command: PluginCliCommand) -> Result<()> {
 }
 
 fn render_new(template: &str, destination: &Path, args: &PluginCliArgs) -> Result<String> {
-    if template != "rust-component-tool" {
-        return Err(format!(
-            "unsupported plugin template `{template}` (supported: rust-component-tool)"
-        )
-        .into());
+    let (template_name, resources) = embedded_template_resources(template)?;
+    materialize_template(destination, resources)?;
+    let mut next_steps = vec![
+        "Review plugin.toml and generated Rust source.".to_string(),
+        "Replace the placeholder plugin.component.wasm with a real built component before enabling or execution.".to_string(),
+        "Run `yoi plugin check <path>` and then `yoi plugin pack <path>`.".to_string(),
+    ];
+    if template == "rust-component-service" {
+        next_steps.insert(
+            1,
+            "Implement Service ingress logic in handle_ingress and return ServiceOutput output_commands for host-owned WebSocket sends.".to_string(),
+        );
     }
-    materialize_template(destination)?;
     let report = NewReport {
         command: "new",
-        template: "rust-component-tool",
+        template: template_name,
         destination: destination.display().to_string(),
-        files: RUST_COMPONENT_TOOL_TEMPLATE
+        files: resources
             .iter()
             .map(|resource| resource.path.to_string())
             .collect(),
         safety: AuthoringSafetyReport::default(),
-        next_steps: vec![
-            "Review plugin.toml and generated Rust source.".to_string(),
-            "Replace the placeholder plugin.component.wasm with a real built component before enabling or execution.".to_string(),
-            "Run `yoi plugin check <path>` and then `yoi plugin pack <path>`.".to_string(),
-        ],
+        next_steps,
     };
     if args.json {
         return Ok(format!("{}\n", serde_json::to_string_pretty(&report)?));
@@ -113,7 +115,23 @@ fn render_new(template: &str, destination: &Path, args: &PluginCliArgs) -> Resul
     render_new_human(&report)
 }
 
-fn materialize_template(destination: &Path) -> Result<()> {
+fn embedded_template_resources(
+    template: &str,
+) -> Result<(&'static str, &'static [PluginTemplateResource])> {
+    match template {
+        "rust-component-tool" => Ok(("rust-component-tool", RUST_COMPONENT_TOOL_TEMPLATE)),
+        "rust-component-service" => Ok(("rust-component-service", RUST_COMPONENT_INSTANCE_TEMPLATE)),
+        _ => Err(format!(
+            "unsupported plugin template `{template}` (supported: rust-component-tool, rust-component-service)"
+        )
+        .into()),
+    }
+}
+
+fn materialize_template(
+    destination: &Path,
+    resources: &'static [PluginTemplateResource],
+) -> Result<()> {
     match fs::symlink_metadata(destination) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
@@ -144,7 +162,7 @@ fn materialize_template(destination: &Path) -> Result<()> {
         Err(error) => return Err(error.into()),
     }
 
-    for resource in RUST_COMPONENT_TOOL_TEMPLATE {
+    for resource in resources {
         let relative = safe_template_relative_path(resource.path)?;
         let path = destination.join(relative);
         if let Some(parent) = path.parent() {
@@ -2136,6 +2154,61 @@ mod tests {
         let human_check = render_check(&destination, &PluginCliArgs::default()).unwrap();
         assert!(human_check.contains("[partial]"));
         assert!(human_check.contains("not ready to enable"));
+
+        let service_destination = dir.path().join("my-service-plugin");
+        let service_json = render_new(
+            "rust-component-service",
+            &service_destination,
+            &PluginCliArgs {
+                json: true,
+                ..PluginCliArgs::default()
+            },
+        )
+        .unwrap();
+        let service_value: serde_json::Value = serde_json::from_str(&service_json).unwrap();
+        assert_eq!(service_value["template"], "rust-component-service");
+        assert!(
+            service_value["next_steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Service ingress"))
+        );
+        for resource in RUST_COMPONENT_INSTANCE_TEMPLATE {
+            assert!(
+                service_destination.join(resource.path).is_file(),
+                "missing service {}",
+                resource.path
+            );
+        }
+        let manifest = fs::read_to_string(service_destination.join("plugin.toml")).unwrap();
+        assert!(manifest.contains("kind = \"wasm-component\""));
+        assert!(manifest.contains("[[services]]"));
+        assert!(manifest.contains("[[ingresses]]"));
+        let source = fs::read_to_string(service_destination.join("src/lib.rs")).unwrap();
+        assert!(source.contains("ServiceOutput::websocket_send"));
+        assert!(!source.contains("recv(timeout"));
+        let service_check = render_check(&service_destination, &PluginCliArgs::default()).unwrap();
+        assert!(service_check.contains("plugin check:"));
+        assert!(service_check.contains("service"));
+        let service_package = dir.path().join("my-service-plugin.yoi-plugin");
+        let service_pack_json = render_pack(
+            &service_destination,
+            Some(&service_package),
+            &PluginCliArgs {
+                json: true,
+                ..PluginCliArgs::default()
+            },
+        )
+        .unwrap();
+        let service_pack_value: serde_json::Value =
+            serde_json::from_str(&service_pack_json).unwrap();
+        assert_eq!(service_pack_value["status"], "packed");
+        assert!(service_package.is_file());
+
         let error = render_new(
             "rust-component-tool",
             &destination,

@@ -5,8 +5,8 @@ world tool {
   import yoi:host/websocket@1.0.0;
   import yoi:host/fs@1.0.0;
 
-  /// Execute a manifest-declared Tool. `input-json` is the normal Tool input
-  /// JSON and the returned string is the same ToolOutput JSON accepted by the
-  /// legacy raw-Wasm ABI.
+  /// Execute a manifest-declared Tool. `input-json` is ordinary Tool input JSON
+  /// and the returned string is ToolOutput JSON accepted by the current
+  /// Component Model Plugin runtime.
   export call: func(tool-name: string, input-json: string) -> string;
 }

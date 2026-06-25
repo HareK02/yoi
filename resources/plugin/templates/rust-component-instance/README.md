@@ -1,9 +1,10 @@
-# Yoi instance Plugin template
+# Rust Service Plugin Template
 
-This template targets `yoi:plugin/instance@1.0.0`. The host creates one
-`PluginInstance` for the package; Tool, Service, and Ingress surfaces share that
-instance state while each surface keeps separate permissions/grants.
+This template targets the Component Model-only runtime (`runtime.kind = "wasm-component"`) and exports the `yoi:plugin/instance@1.0.0` world.
 
-Tools still run only through ordinary model/user-initiated Tool calls. Ingress
-handlers receive bounded typed untrusted events and must return explicit JSON
-for host-mediated visible/durable paths.
+It demonstrates both authoring surfaces supported by a shared Plugin instance:
+
+- `example_echo` is an ordinary request/response Tool handler.
+- `example_ws` is a Service ingress handler. The host owns WebSocket receive/reconnect work and dispatches bounded `websocket_text` events into `handle_ingress`. The guest replies by returning a `websocket_send` output command in `ServiceOutput`; do not run a guest-side `recv(timeout)` polling loop.
+
+Build with `cargo component build --release` (or the project-specific build command used by your Plugin packaging flow), then run `yoi plugin check` / `yoi plugin pack` from the generated Plugin directory.

@@ -23,7 +23,7 @@ Yoi's Plugin platform is meant to make extension behavior reviewable before it b
 
 Keep these layers separate when designing a Plugin. Do not make package discovery imply enablement. Do not make SDK/PDK convenience imply authority. Do not treat Rust helper APIs or host API wrappers as permission grants. The host always re-checks authority at registration/execution/API-call boundaries.
 
-Yoi's preferred Plugin shape is **Tool first**. A good Tool Plugin has a narrow schema, deterministic input/output behavior, explicit side-effect metadata, and a minimal grant set. Long-running services, inbound events, and autonomous routing are future Service/Ingress work; they should not be hidden inside a Tool package.
+Yoi's preferred Plugin shapes are **Tool first** for request/response capabilities and **Service/Ingress** for host-dispatched inbound events. A good Tool Plugin has a narrow schema, deterministic input/output behavior, explicit side-effect metadata, and a minimal grant set. A Service Plugin should keep long-lived transport ownership in the host and react to bounded ingress events by returning output commands.
 
 Component Model authoring is the supported path for Plugins. Legacy raw core-Wasm manifests (`kind = "wasm"` / `abi = "yoi-plugin-wasm-1"`) are retired and rejected by `yoi plugin check`, discovery, `list`, and `show`; use the Rust PDK/template and `kind = "wasm-component"` instead.
 
@@ -42,10 +42,10 @@ Implemented foundation:
 - read-only `yoi plugin list/show` inspection;
 - local first-party authoring commands: `yoi plugin new`, `yoi plugin check`, and `yoi plugin pack`.
 
-Still intentionally separate/future work:
+Still intentionally limited or separate from this guide:
 
 - multi-language SDK/PDK crates;
-- Service / Ingress surfaces;
+- Service / Ingress surfaces, where the host owns transport lifecycle, dispatches bounded ingress events, and consumes output commands such as `websocket_send`;
 - WebSocket or inbound HTTP for bidirectional external event integrations;
 - public registry/install/update/signature tooling.
 
@@ -78,6 +78,8 @@ Create a Rust Component Tool starter from embedded resources:
 
 ```bash
 yoi plugin new rust-component-tool ./my-plugin
+# or, for a host-dispatched Service/Ingress example:
+yoi plugin new rust-component-service ./my-service-plugin
 ```
 
 `new` writes only inside the requested destination and refuses an existing non-empty destination or destination symlink. The generated template includes `plugin.toml`, Rust source, Cargo metadata, README next steps, and a placeholder `plugin.component.wasm` artifact so local `check`/`pack` validation can run immediately. Replace the placeholder with a real built component before enabling or executing the Plugin.
@@ -115,7 +117,7 @@ For Tool Plugins:
 - return bounded summaries and content that are useful as Tool results;
 - avoid hiding long workflows, background daemons, or inbound event handling inside a Tool call.
 
-A Tool should be a capability the model may choose to call, not a second agent runtime. If the desired behavior needs a long-lived connection, incoming events, or autonomous routing, treat that as future Service/Ingress design rather than stretching the Tool surface.
+A Tool should be a capability the model may choose to call, not a second agent runtime. If the desired behavior needs a long-lived connection, incoming events, or autonomous routing, put the transport lifecycle behind a Service/Ingress surface and let the host dispatch bounded events; do not stretch the Tool surface into a hidden polling loop.
 
 Design package permissions as a review surface. A reviewer should be able to read `plugin.toml` plus the enablement grants and understand:
 
@@ -163,6 +165,8 @@ Create a starter with:
 
 ```bash
 yoi plugin new rust-component-tool ./my-plugin
+# or, for a host-dispatched Service/Ingress example:
+yoi plugin new rust-component-service ./my-service-plugin
 ```
 
 The generated package contains:
@@ -326,6 +330,48 @@ path_prefixes = ["/v1/"]
 ```
 
 Yoi checks method, scheme, host, optional port, and path prefix against both the manifest declaration and enablement grant before any network I/O. `http://localhost`, loopback, private, and other local targets are never ambient; they require an explicit manifest request target and an explicit matching grant. The explicit request target is the declared URL authority; a granted DNS hostname may resolve to a loopback/private address without requiring a separate literal-IP grant, so reviewers should grant hostnames only when that resolution behavior is intended. Broad targets such as `host = "*"` are supported only as visibly broad request permissions in inspection/diagnostics. Embedded credentials, credential-like headers, oversize requests/responses, WebSocket URLs/upgrades, and SSE/event-stream requests are rejected.
+
+## Service ingress and output commands
+
+Service Plugins export the `yoi:plugin/instance@1.0.0` world. The host starts one Plugin instance, owns external ingress transports, and calls `handle_ingress(name, event_json)` with bounded event envelopes. A WebSocket ingress event contains fields such as `kind`, `source`, `ingress_name`, `payload`, `created_at`, `attempt`, and `correlation_id`; the Rust PDK maps this to `PluginIngressEvent`.
+
+Service handlers return `ServiceOutput`, not ordinary ToolOutput. Side effects are requested through top-level `output_commands`. For a WebSocket reply, use the PDK helper:
+
+```rust
+ServiceOutput::websocket_send(
+    &event,
+    "reply-1",
+    event.source.strip_prefix("websocket:").unwrap_or(&event.source),
+    "pong",
+)
+```
+
+This serializes a `websocket_send` command with `source_event_id`, `command_id`, `payload.url`, `payload.text`, and a request timestamp. The host parses, bounds, grant-checks, and dispatches the command through the host-owned WebSocket driver. Do not create a long-running guest receive loop for Service integrations; incoming messages should arrive as ingress events.
+
+A minimal manifest shape is:
+
+```toml
+surfaces = ["tool", "service", "ingress"]
+
+[runtime]
+kind = "wasm-component"
+world = "yoi:plugin/instance@1.0.0"
+component = "plugin.component.wasm"
+
+[[services]]
+name = "example_service"
+description = "Host-managed service instance."
+lifecycle = "host-managed"
+
+[[ingresses]]
+name = "example_ws"
+description = "Handles host-owned WebSocket text events."
+event_kinds = ["websocket_text", "websocket_close", "websocket_error"]
+sources = ["websocket:wss://gateway.example.com/gateway"]
+input_schema = { type = "object" }
+```
+
+Generate a fuller example with `yoi plugin new rust-component-service ./my-service-plugin`.
 
 ## `websocket` host API
 
