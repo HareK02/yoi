@@ -358,3 +358,56 @@ rg -n -S 'SendToPeerPod|pod-session-state\.md|sibling Pods|List Pods visible|Pod
 This grep should be empty or any remaining hit must be explicitly legacy/internal and justified.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZG9BMS-worker-rename at: 2026-06-25T15:44:18Z -->
+
+## Implementation report
+
+Second follow-up implementation report after review request_changes:
+
+対応内容:
+
+1. broken docs path 修正
+- `crates/pod-registry/README.md`
+  - `../../docs/design/pod-session-state.md` → `../../docs/design/worker-session-state.md`
+  - `pod-registry` は invariant に従って crate 名を維持しつつ、本文では legacy-named crate と明記して Worker 用語へ更新。
+
+2. old tool name classification 修正
+- `crates/session-analytics/src/lib.rs`
+  - current tool name `SendToPeerWorker` を worker tool classification に追加。
+  - historical session logs の分類維持のため、`SendToPeerPod` は `LEGACY_SEND_TO_PEER_POD_TOOL` として明示的な legacy analytics-only comment 付きで保持。
+
+3. active docs/comments の Pod guidance 修正
+- `docs/development/work-items.md`
+  - `Reviewer Pods should be sibling Pods...` → `Reviewer Workers should be sibling Workers...`
+- `crates/protocol/src/lib.rs`
+  - `List Pods visible...` → `List Workers visible...`
+- `AGENTS.md`
+  - `Podの状態` → `Workerの状態`
+  - `Notify / PodEvent / ...` → `Notify / WorkerEvent / ...`
+
+Validation:
+- `cargo test -p session-analytics`: success
+- `cargo test -p worker`: success
+- `cargo test -p yoi`: success
+- `cargo check -p yoi`: success
+- `cargo test -p protocol --features typescript`: success
+- `cd web/workspace && deno task check`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Specified grep evidence:
+```text
+crates/session-analytics/src/lib.rs:1595:    const LEGACY_SEND_TO_PEER_POD_TOOL: &str = "SendToPeerPod";
+```
+- この 1 件のみ残存。
+- historical session logs の分類維持のための analytics-only legacy tool name で、直下の classification branch にも legacy comment を付けている。
+- active prompt/protocol/docs/API guidance の旧 Pod 参照ではない。
+
+Commit:
+- `94c7aa793a179b377108dea841fe9d381affbd9c fix: clean remaining worker rename references`
+
+Residual risks / notes:
+- child worktree は commit 後 clean。
+
+---
