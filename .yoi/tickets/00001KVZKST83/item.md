@@ -2,7 +2,7 @@
 title: 'worker-runtimeにFS永続化featureを追加する'
 state: 'inprogress'
 created_at: '2026-06-25T14:44:02Z'
-updated_at: '2026-06-25T16:55:50Z'
+updated_at: '2026-06-25T16:58:41Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-25T16:39:26Z'

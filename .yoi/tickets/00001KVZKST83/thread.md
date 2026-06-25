@@ -132,3 +132,26 @@ Dependency `00001KVZBCQH4` worker-runtime core は done。Ticket body / relation
 これ以降、worktree creation / coder Worker routing などの implementation side effect に進める。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-25T16:58:41Z -->
+
+## Implementation report
+
+Implementation startup blocked after acceptance:
+
+- Worktree created:
+  - `/home/hare/Projects/yoi/.worktree/00001KVZKST83-worker-runtime-fs-store`
+  - branch `work/00001KVZKST83-worker-runtime-fs-store`
+- Coder Worker was not spawned because the immediately preceding SpawnPod attempt for parallel accepted Ticket `00001KVZKSV6C` failed with:
+  - `yoi: unknown command pod`
+
+Interpretation:
+- No implementation code changes have been made in this worktree yet.
+- This appears to be the same runtime/launcher compatibility issue after the Pod→Worker CLI rename.
+- Because this Ticket was already accepted (`queued -> inprogress`) and worktree creation completed, it remains inprogress with a recovery note rather than being silently returned to queued.
+
+Recovery needed:
+- Restart/restore Orchestrator on a consistent runtime binary or repair the launcher compatibility path, then spawn the Coder Worker for this accepted worktree.
+- If retry remains impossible, use an explicit human-authorized alternative implementation route.
+
+---
