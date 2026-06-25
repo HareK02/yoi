@@ -9,7 +9,7 @@ Yoi Plugins are intentionally explicit. The Plugin system is designed around the
 - Plugin grants must allow each surface and host API before registration or execution can use it;
 - Plugin code runs only through the configured sandbox runtime;
 - Plugin packages do not inherit Pod workspace filesystem, network, environment, or Ticket authority;
-- Tool calls and Tool results use the ordinary Yoi Tool/Worker history path;
+- Tool calls and Tool results use the ordinary Yoi Tool/Engine history path;
 - Plugin metadata, output, and diagnostics are untrusted unless Yoi host policy says otherwise.
 
 ## Design intent

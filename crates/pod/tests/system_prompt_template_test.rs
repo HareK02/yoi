@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use futures::Stream;
-use llm_worker::Worker;
-use llm_worker::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
-use llm_worker::llm_client::{ClientError, LlmClient, Request};
+use llm_engine::Engine;
+use llm_engine::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
+use llm_engine::llm_client::{ClientError, LlmClient, Request};
 use pod_store::{CombinedStore, FsPodStore};
 use session_store::{FsStore, LogEntry, Store};
 
@@ -122,7 +122,7 @@ async fn make_pod_with_body(
     let loader = PromptLoader::new(Some(user_prompts_tmp.path().to_path_buf()), None);
     std::mem::forget(user_prompts_tmp);
 
-    let worker = Worker::new(client);
+    let worker = Engine::new(client);
     let mut pod = Pod::new(manifest, worker, store, pwd.clone(), scope).await?;
 
     let template = SystemPromptTemplate::parse("$user/test", loader)
@@ -154,7 +154,7 @@ async fn template_is_not_materialised_before_first_run() {
     let client = MockClient::new(vec![single_text_events("ok")]);
     let (pod, _pwd) = make_pod_with_body("hello", client).await.unwrap();
     // Before first run, worker still has no system prompt.
-    assert!(pod.worker().get_system_prompt().is_none());
+    assert!(pod.engine().get_system_prompt().is_none());
 }
 
 #[tokio::test]
@@ -168,7 +168,7 @@ async fn materialise_on_first_turn_populates_worker() {
     .unwrap();
     pod.run_text("hi").await.unwrap();
     let rendered = pod
-        .worker()
+        .engine()
         .get_system_prompt()
         .expect("system prompt materialised")
         .to_string();
@@ -222,9 +222,9 @@ async fn materialise_runs_only_once_across_turns() {
         .await
         .unwrap();
     pod.run_text("one").await.unwrap();
-    let first = pod.worker().get_system_prompt().unwrap().to_string();
+    let first = pod.engine().get_system_prompt().unwrap().to_string();
     pod.run_text("two").await.unwrap();
-    let second = pod.worker().get_system_prompt().unwrap().to_string();
+    let second = pod.engine().get_system_prompt().unwrap().to_string();
     assert_eq!(first, second);
 }
 
@@ -235,7 +235,7 @@ async fn agents_md_is_injected_as_trailing_section_when_present() {
     std::fs::write(pwd.join("AGENTS.md"), "# project rules\nbe kind").unwrap();
 
     pod.run_text("hi").await.unwrap();
-    let rendered = pod.worker().get_system_prompt().unwrap().to_string();
+    let rendered = pod.engine().get_system_prompt().unwrap().to_string();
     assert!(rendered.starts_with("BODY"));
     assert!(rendered.contains("## Project instructions (AGENTS.md)"));
     assert!(rendered.contains("# project rules"));
@@ -247,7 +247,7 @@ async fn agents_md_absent_omits_trailing_section() {
     let client = MockClient::new(vec![single_text_events("ok")]);
     let (mut pod, _pwd) = make_pod_with_body("BODY", client).await.unwrap();
     pod.run_text("hi").await.unwrap();
-    let rendered = pod.worker().get_system_prompt().unwrap().to_string();
+    let rendered = pod.engine().get_system_prompt().unwrap().to_string();
     assert!(!rendered.contains("## Project instructions"));
     assert!(!rendered.contains("AGENTS.md"));
 }
@@ -266,7 +266,7 @@ async fn agents_md_not_reread_after_compact() {
     std::fs::write(&agents_path, "original").unwrap();
 
     pod.run_text("first").await.unwrap();
-    let before = pod.worker().get_system_prompt().unwrap().to_string();
+    let before = pod.engine().get_system_prompt().unwrap().to_string();
     assert!(before.contains("original"));
     pod.run_text("second").await.unwrap();
 
@@ -274,12 +274,12 @@ async fn agents_md_not_reread_after_compact() {
     // system prompt either on a subsequent turn or across compaction.
     std::fs::write(&agents_path, "mutated").unwrap();
     pod.compact(0).await.unwrap();
-    let after_compact = pod.worker().get_system_prompt().unwrap().to_string();
+    let after_compact = pod.engine().get_system_prompt().unwrap().to_string();
     assert!(after_compact.contains("original"));
     assert!(!after_compact.contains("mutated"));
 
     pod.run_text("third").await.unwrap();
-    let after_third = pod.worker().get_system_prompt().unwrap().to_string();
+    let after_third = pod.engine().get_system_prompt().unwrap().to_string();
     assert!(after_third.contains("original"));
     assert!(!after_third.contains("mutated"));
 }
@@ -329,14 +329,14 @@ async fn compact_preserves_system_prompt() {
         .unwrap();
 
     pod.run_text("first").await.unwrap();
-    let before = pod.worker().get_system_prompt().unwrap().to_string();
+    let before = pod.engine().get_system_prompt().unwrap().to_string();
     pod.run_text("second").await.unwrap();
 
     pod.compact(0).await.unwrap();
 
-    let after = pod.worker().get_system_prompt().unwrap().to_string();
+    let after = pod.engine().get_system_prompt().unwrap().to_string();
     assert_eq!(before, after);
 
     pod.run_text("third").await.unwrap();
-    assert_eq!(pod.worker().get_system_prompt().unwrap(), after.as_str());
+    assert_eq!(pod.engine().get_system_prompt().unwrap(), after.as_str());
 }

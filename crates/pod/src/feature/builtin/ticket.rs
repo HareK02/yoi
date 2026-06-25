@@ -256,7 +256,7 @@ mod tests {
     }
 
     fn pending_tool_description(
-        pending_tools: &[llm_worker::tool::ToolDefinition],
+        pending_tools: &[llm_engine::tool::ToolDefinition],
         name: &str,
     ) -> String {
         pending_tools

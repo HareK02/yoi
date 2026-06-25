@@ -12,10 +12,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use futures::Stream;
-use llm_worker::Worker;
-use llm_worker::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
-use llm_worker::llm_client::types::Item;
-use llm_worker::llm_client::{ClientError, LlmClient, Request};
+use llm_engine::Engine;
+use llm_engine::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
+use llm_engine::llm_client::types::Item;
+use llm_engine::llm_client::{ClientError, LlmClient, Request};
 use pod_store::{CombinedStore, FsPodStore, PodMetadataStore};
 use protocol::{Event, Method, RunResult};
 use session_store::{FsStore, LogEntry, Store};
@@ -163,7 +163,7 @@ async fn make_pod_with_manifest(
     let scope = pod::Scope::writable(&pwd).unwrap();
     std::mem::forget(pwd_tmp);
 
-    let worker = Worker::new(client);
+    let worker = Engine::new(client);
     let mut pod = Pod::new(manifest, worker, store, pwd, scope).await.unwrap();
     pod.enable_pod_metadata_write_through().unwrap();
     pod
@@ -189,7 +189,7 @@ fn drain(rx: &mut broadcast::Receiver<Event>) -> Vec<Event> {
 /// `SegmentStart.history` carries, by reading the sink mirror directly.
 fn system_texts_in_sink_session_start(
     pod: &pod::Pod<
-        impl llm_worker::llm_client::client::LlmClient + Clone + 'static,
+        impl llm_engine::llm_client::client::LlmClient + Clone + 'static,
         impl session_store::Store + Clone + 'static,
     >,
 ) -> Vec<String> {
@@ -202,7 +202,7 @@ fn system_texts_in_sink_session_start(
                     let item: Item = logged.into();
                     match item {
                         Item::Message {
-                            role: llm_worker::Role::System,
+                            role: llm_engine::Role::System,
                             content,
                             ..
                         } => Some(
@@ -462,7 +462,7 @@ async fn mid_turn_compact_success_broadcasts_start_and_done() {
     pod.run_text("first").await.unwrap();
     let _ = drain(&mut rx);
 
-    // Second run: pre_llm_request yields immediately, Worker returns
+    // Second run: pre_llm_request yields immediately, Engine returns
     // Yielded, handle_worker_result routes into do_compact_and_resume.
     pod.run_text("second").await.unwrap();
 

@@ -16,7 +16,7 @@ Does not own:
 
 - Unix socket implementation details (`client`, `pod`)
 - TUI rendering (`tui`)
-- Worker history semantics (`llm-worker`)
+- Engine history semantics (`llm-engine`)
 - durable storage (`session-store`, `pod-store`)
 
 ## Design notes

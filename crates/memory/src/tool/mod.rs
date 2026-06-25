@@ -15,7 +15,7 @@ pub use delete::delete_tool;
 
 use std::path::PathBuf;
 
-use llm_worker::tool::ToolError;
+use llm_engine::tool::ToolError;
 use serde::Deserialize;
 
 use crate::Slug;
@@ -27,7 +27,7 @@ pub use read::{read_tool, read_tool_with_usage};
 pub use write::write_tool;
 
 /// Kinds the memory tools accept as input. `Workflow` is intentionally
-/// excluded — workflows are sub-Worker context, not agent-editable.
+/// excluded — workflows are sub-Engine context, not agent-editable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryToolKind {

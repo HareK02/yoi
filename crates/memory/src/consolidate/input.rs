@@ -1,7 +1,7 @@
-//! consolidation sub-Worker への最初のユーザー入力を組み立てる。
+//! consolidation sub-Engine への最初のユーザー入力を組み立てる。
 //!
 //! extract (`extract::build_extract_input`) と同じ方針で、固定 schema の
-//! markdown セクション列にしてサブWorker に渡す。`docs/plan/memory.md`
+//! markdown セクション列にしてサブEngine に渡す。`docs/plan/memory.md`
 //! §Consolidation 入力 / §整理材料 の項目に従い:
 //!
 //! 1. consumed staging エントリ全文（`source` 込み）
@@ -19,7 +19,7 @@ use crate::consolidate::tidy::TidyHints;
 use crate::usage::UsageReport;
 use crate::workspace::{RecordKind, WorkspaceLayout};
 
-/// consolidation sub-Worker の最初の user 入力。
+/// consolidation sub-Engine の最初の user 入力。
 pub fn build_consolidate_input(
     layout: &WorkspaceLayout,
     staging: &[StagingEntry],

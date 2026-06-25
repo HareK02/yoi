@@ -6,7 +6,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use llm_worker::Item;
+use llm_engine::Item;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

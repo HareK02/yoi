@@ -245,7 +245,7 @@ mod tests {
     use crate::PodStatus;
     use crate::runtime::dir::RuntimeDir;
     use crate::spawn::registry::SpawnedPodRegistry;
-    use llm_worker::tool::ToolOutput;
+    use llm_engine::tool::ToolOutput;
     use pod_store::FsPodStore;
     use pod_store::PodMetadata;
     use protocol::stream::{JsonLineReader, JsonLineWriter};

@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use client::PodRuntimeCommand;
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{Permission, ScopeRule};
 use pod_store::{PodActiveSegmentRef, PodMetadata, PodMetadataStore, validate_pod_name};
 use protocol::stream::JsonLineReader;
@@ -845,7 +845,7 @@ where
     async fn execute(
         &self,
         _input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let items = self
             .discovery
@@ -872,7 +872,7 @@ where
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let input: PodNameInput = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid RestorePod input: {e}")))?;
@@ -948,7 +948,7 @@ where
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let input: SendToPeerPodInput = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid SendToPeerPod input: {e}")))?;

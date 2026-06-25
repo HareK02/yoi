@@ -17,7 +17,7 @@ Does not own:
 
 - Pod runtime internals (`pod`)
 - socket client mechanics (`client`)
-- model turn orchestration (`llm-worker`)
+- model turn orchestration (`llm-engine`)
 - TUI rendering/runtime implementation (`tui`)
 
 ## Design notes

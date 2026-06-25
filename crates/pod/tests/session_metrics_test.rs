@@ -21,10 +21,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use futures::Stream;
-use llm_worker::Worker;
-use llm_worker::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent, UsageEvent};
-use llm_worker::llm_client::{ClientError, LlmClient, Request};
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use llm_engine::Engine;
+use llm_engine::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent, UsageEvent};
+use llm_engine::llm_client::{ClientError, LlmClient, Request};
+use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use pod_store::{CombinedStore, FsPodStore};
 use session_metrics::{DOMAIN, Metric, metrics_from_extensions};
 use session_store::{FsStore, LogEntry, SegmentId, SessionId, Store, StoreError, TraceEntry};
@@ -82,7 +82,7 @@ impl Tool for BigContentTool {
     async fn execute(
         &self,
         _input: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         Ok(ToolOutput {
             summary: self.summary.into(),
@@ -187,7 +187,7 @@ async fn make_pod(
     let pwd = pwd_tmp.path().to_path_buf();
     let scope = pod::Scope::writable(&pwd).unwrap();
 
-    let mut worker = Worker::new(client);
+    let mut worker = Engine::new(client);
     worker.register_tool(big_content_tool_definition(tool_name));
 
     let pod = Pod::new(manifest, worker, store, pwd, scope).await.unwrap();
@@ -448,7 +448,7 @@ async fn metric_write_failure_emits_warn_alert_and_does_not_abort_run() {
     // protected token budget covers the only user message). That is enough to drive
     // the failure path: at least one metric attempts to write.
     let client = MockClient::new(vec![text_response_with_cache("hi", 0, 0)]);
-    let worker = Worker::new(client);
+    let worker = Engine::new(client);
     let mut pod = Pod::new(manifest, worker, store.clone(), pwd, scope)
         .await
         .unwrap();
@@ -517,7 +517,7 @@ permission = "write"
     let pwd_tmp = tempfile::tempdir().unwrap();
     let pwd = pwd_tmp.path().to_path_buf();
     let scope = pod::Scope::writable(&pwd).unwrap();
-    let worker = Worker::new(client);
+    let worker = Engine::new(client);
     let mut pod = Pod::new(manifest, worker, store.clone(), pwd, scope)
         .await
         .unwrap();

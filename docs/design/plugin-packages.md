@@ -173,7 +173,7 @@ Diagnostics should be safe, bounded, and attributable:
 
 ## Runtime notes
 
-Declarative hooks are data contributions. Loading a declarative hook still requires explicit package enablement. Hook text should enter the system through the normal Hook/Worker paths, preserving the rule that model-affecting inputs are committed to history before they affect context when applicable.
+Declarative hooks are data contributions. Loading a declarative hook still requires explicit package enablement. Hook text should enter the system through the normal Hook/Engine paths, preserving the rule that model-affecting inputs are committed to history before they affect context when applicable.
 
 WASM packages should initialize only from the digest-keyed cache after enablement and grant resolution. The host should use a narrow ABI, bounded memory, fuel/time limits, bounded output, and explicit host functions. A WASM module must not inherit filesystem, network, tool, secret, process, or MCP authority from the package store path.
 

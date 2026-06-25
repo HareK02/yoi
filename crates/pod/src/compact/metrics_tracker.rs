@@ -1,5 +1,5 @@
 //! Sync buffer for `session_metrics::Metric` values queued from inside
-//! Worker callbacks (which run synchronously and cannot themselves
+//! Engine callbacks (which run synchronously and cannot themselves
 //! perform `async` store writes).
 //!
 //! Pod drains this buffer in `persist_turn` and writes each metric via

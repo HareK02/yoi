@@ -6,12 +6,12 @@
 //! belonging to the same logical conversation. Each Segment is recorded
 //! as a sequence of [`LogEntry`] values, one per line in a `.jsonl`
 //! file. Reading a segment log and collecting entries reconstructs the
-//! Worker state at that segment — no separate snapshots or checkpoints
+//! Engine state at that segment — no separate snapshots or checkpoints
 //! needed. Compaction and fork operations mint a fresh Segment within
 //! the same Session.
 //!
 //! This crate provides free functions for persistence operations.
-//! The caller (typically Pod) holds the Worker directly and calls these
+//! The caller (typically Pod) holds the Engine directly and calls these
 //! functions after state-mutating operations.
 //!
 //! Debug-mode [`TraceEntry`] records capture raw stream events in a separate
@@ -40,8 +40,8 @@ pub mod system_item;
 
 pub use event_trace::{TraceEntry, TracePayload};
 pub use fs_store::FsStore;
-pub use llm_worker::UsageRecord;
-pub use llm_worker::llm_client::types::{ContentPart, Item, Role};
+pub use llm_engine::UsageRecord;
+pub use llm_engine::llm_client::types::{ContentPart, Item, Role};
 pub use logged_item::{LoggedContentPart, LoggedItem, LoggedRole, from_logged, to_logged};
 pub use segment::{
     SegmentStartState, append_entry, append_system_item, classify_history_item,

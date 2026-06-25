@@ -147,7 +147,7 @@ impl StagingLock {
     }
 
     /// 占有ファイルだけ削除し、staging エントリには触らない。consolidation
-    /// sub-Worker が途中で失敗した場合に使う: 入力 staging を残したまま
+    /// sub-Engine が途中で失敗した場合に使う: 入力 staging を残したまま
     /// 次回再評価で再処理させる（`docs/plan/memory.md` §並走防止 の
     /// 「重複作成は同一 slug update に自然収束」運用）。
     pub fn release_only(self) {

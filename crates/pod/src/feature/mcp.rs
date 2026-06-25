@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use llm_worker::tool::{
+use llm_engine::tool::{
     Tool, ToolDefinition, ToolError, ToolExecutionContext, ToolMeta, ToolOrigin, ToolOutput,
 };
 use manifest::McpConfig;

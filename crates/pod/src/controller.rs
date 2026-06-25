@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use llm_worker::WorkerError;
-use llm_worker::llm_client::client::LlmClient;
+use llm_engine::EngineError;
+use llm_engine::llm_client::client::LlmClient;
 use manifest::TicketFeatureAccessConfig;
 use pod_store::PodMetadataStore;
 use session_store::Store;
@@ -217,7 +217,7 @@ impl PodController {
 
         // === 1.5. Direct writer wiring ===
         //
-        // Worker callbacks fire `on_history_append` for each assistant
+        // Engine callbacks fire `on_history_append` for each assistant
         // item / tool result that lands in history. With the sync
         // writer in place, the callback commits each item directly
         // through a `LogWriterHandle` (no mpsc ferry, no drain task).
@@ -228,8 +228,8 @@ impl PodController {
         pod.attach_log_writer(writer_for_system);
         pod.wire_history_persistence();
 
-        // === 2. Worker event bridge wiring ===
-        wire_event_bridges_on_worker(&mut pod, &event_tx, &alerter, &in_flight);
+        // === 2. Engine event bridge wiring ===
+        wire_event_bridges_on_engine(&mut pod, &event_tx, &alerter, &in_flight);
 
         // === 3. Tool registration (builtin / memory / spawn-orchestration) ===
         let fs_for_view = register_pod_tools(
@@ -259,7 +259,7 @@ impl PodController {
 
         // Materialise pending tool factories so the greeting reflects
         // the actual registered set instead of a hand-maintained mirror.
-        pod.worker().tool_server_handle().flush_pending();
+        pod.engine().tool_server_handle().flush_pending();
 
         // === 4. Initial runtime files + PodSharedState + PodHandle +
         //         SocketServer ===
@@ -303,7 +303,7 @@ impl PodController {
         // Clone cancel sender and notification buffer before moving pod
         // into the controller task so the in-flight turn can be reached
         // via these handles while pod itself is borrowed by drive_turn.
-        let cancel_tx = pod.worker_mut().cancel_sender();
+        let cancel_tx = pod.engine_mut().cancel_sender();
         let notify_buffer = pod.notify_buffer_handle();
 
         tokio::spawn(controller_loop(
@@ -326,7 +326,7 @@ impl PodController {
     }
 }
 
-/// Wire the per-event broadcast bridges on the Pod's Worker. Each callback
+/// Wire the per-event broadcast bridges on the Pod's Engine. Each callback
 /// re-publishes a worker-level signal as a `protocol::Event` on `event_tx`
 /// so subscribers (TUI, socket clients) get a single typed stream.
 ///
@@ -334,7 +334,7 @@ impl PodController {
 /// per-item history commit callback so every assistant / tool item
 /// landing in `worker.history` becomes a singular `LogEntry::AssistantItem`
 /// / `ToolResult` commit through the sync writer.
-fn wire_event_bridges_on_worker<C, St>(
+fn wire_event_bridges_on_engine<C, St>(
     pod: &mut Pod<C, St>,
     event_tx: &broadcast::Sender<Event>,
     alerter: &Alerter,
@@ -344,7 +344,7 @@ fn wire_event_bridges_on_worker<C, St>(
     St: Store + PodMetadataStore + Clone + 'static,
 {
     let ai_activity = pod.ai_activity_counter();
-    let worker = pod.worker_mut();
+    let worker = pod.engine_mut();
 
     let tx = event_tx.clone();
     worker.on_turn_start(move |turn| {
@@ -486,7 +486,7 @@ fn wire_event_bridges_on_worker<C, St>(
 
     let alerter_for_worker = alerter.clone();
     worker.on_warning(move |message| {
-        alerter_for_worker.alert(AlertLevel::Warn, AlertSource::Worker, message.to_owned());
+        alerter_for_worker.alert(AlertLevel::Warn, AlertSource::Engine, message.to_owned());
     });
 
     // History-append broadcasts (previously `Event::SystemMessage`)
@@ -575,7 +575,7 @@ fn is_ticket_orchestrator_role(role: Option<&str>) -> bool {
 
 /// Register the builtin file-manipulation tools, optional memory tools,
 /// and the Pod-orchestration tools (SpawnPod + comm) on the Pod's
-/// Worker. Returns the `ScopedFs` clone used to attach a `PodFsView` to
+/// Engine. Returns the `ScopedFs` clone used to attach a `PodFsView` to
 /// the shared state.
 async fn register_pod_tools<C, St>(
     pod: &mut Pod<C, St>,
@@ -616,13 +616,13 @@ where
     // a clone for the FS view we attach below, since the tools consume
     // `fs` itself.
     let fs_for_view = fs.clone();
-    pod.worker_mut().register_tools(tools::core_builtin_tools(
+    pod.engine_mut().register_tools(tools::core_builtin_tools(
         fs,
         tracker.clone(),
         bash_output_dir,
     ));
     if feature_config.web.enabled {
-        pod.worker_mut()
+        pod.engine_mut()
             .register_tools(tools::web_builtin_tools(web_config));
     }
 
@@ -663,7 +663,7 @@ where
     }
 
     {
-        let worker = pod.worker_mut();
+        let worker = pod.engine_mut();
 
         // Memory tools require both explicit feature exposure and memory storage
         // configuration. This keeps resident-memory config separate from the
@@ -777,8 +777,8 @@ async fn controller_loop<C, St>(
             // Cancellation is meaningful only for an accepted running turn. Clear
             // idle/stale signals before the status flip; any Cancel/Pause received
             // after this point is delivered to the turn and must not be discarded by
-            // the Worker at run start.
-            pod.worker_mut().clear_pending_cancel();
+            // the Engine at run start.
+            pod.engine_mut().clear_pending_cancel();
             set_controller_status(&shared_state, &runtime_dir, &event_tx, PodStatus::Running).await;
             let parent_originated = run.is_parent_originated();
             let (new_status, shutdown) = match run {
@@ -1211,7 +1211,7 @@ where
                         }
                         (status, shutdown_requested)
                     }
-                    Err(PodError::Worker(WorkerError::Cancelled)) if pause_requested => {
+                    Err(PodError::Engine(EngineError::Cancelled)) if pause_requested => {
                         // User-initiated Pause. Report the transition to
                         // clients as a normal Paused run-end, and
                         // intentionally skip `PodEvent::Errored` upward:
@@ -1405,10 +1405,10 @@ where
         ),
     };
     // Tool list reflects whatever `spawn()` ended up registering on the
-    // Worker. Caller must have flushed pending factories first; without
+    // Engine. Caller must have flushed pending factories first; without
     // a flush the tool table is empty and this returns an empty vec.
     let tool_names: Vec<String> = pod
-        .worker()
+        .engine()
         .tool_server_handle()
         .tool_definitions_sorted()
         .into_iter()
@@ -1428,9 +1428,9 @@ where
 
 fn worker_error_code(e: &PodError) -> ErrorCode {
     match e {
-        PodError::Worker(we) => match we {
-            WorkerError::Tool(_) => ErrorCode::ToolError,
-            WorkerError::Client(_) => ErrorCode::ProviderError,
+        PodError::Engine(we) => match we {
+            EngineError::Tool(_) => ErrorCode::ToolError,
+            EngineError::Client(_) => ErrorCode::ProviderError,
             _ => ErrorCode::Internal,
         },
         PodError::Provider(_) => ErrorCode::ProviderError,
@@ -1628,7 +1628,7 @@ mod tests {
         let recv = tokio::spawn(recv_pod_event(listener, Duration::from_secs(2)));
 
         let pod_future = async {
-            Err::<PodRunResult, _>(PodError::Worker(WorkerError::Aborted(
+            Err::<PodRunResult, _>(PodError::Engine(EngineError::Aborted(
                 "boom from test".into(),
             )))
         };
@@ -1663,7 +1663,7 @@ mod tests {
         let listener = UnixListener::bind(&env.parent_socket_path).expect("bind listener");
 
         let pod_future = async {
-            Err::<PodRunResult, _>(PodError::Worker(WorkerError::Aborted(
+            Err::<PodRunResult, _>(PodError::Engine(EngineError::Aborted(
                 "boom from notify".into(),
             )))
         };

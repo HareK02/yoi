@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use client::PodRuntimeCommand;
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
+use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{
     CompactionConfigPartial, DelegationScope, FileUploadLimitsPartial, Permission,
     PermissionConfigPartial, PodManifest, PodManifestConfig, PodMetaConfig, ProfileDiscovery,
@@ -301,7 +301,7 @@ impl Tool for SpawnPodTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let input: SpawnPodInput = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid SpawnPod input: {e}")))?;

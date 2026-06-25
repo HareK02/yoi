@@ -9,7 +9,7 @@
 //! the rendered body is appended with a fixed trailing section carrying
 //! the Pod's `Scope` summary, (if present) the project's `AGENTS.md`
 //! contents, resident memory sections, and conditional Pod-orchestration
-//! guidance, then the whole string is handed to the Worker via
+//! guidance, then the whole string is handed to the Engine via
 //! `set_system_prompt`. Subsequent turns and compactions reuse that
 //! materialised string verbatim.
 

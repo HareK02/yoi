@@ -1,6 +1,6 @@
 //! Compact worker state and the four tools that drive it.
 //!
-//! The compact worker is a disposable `Worker` instance spun up by
+//! The compact worker is a disposable `Engine` instance spun up by
 //! [`Pod::compact`]. It receives the history to summarise plus a list of
 //! default reference files (from the session-lifetime `Tracker`) and runs
 //! a tool-driven LLM loop. The tools here let it:
@@ -22,9 +22,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use llm_worker::Item;
-use llm_worker::interceptor::{Interceptor, PreRequestAction, PreToolAction, ToolCallInfo};
-use llm_worker::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput, ToolResult};
+use llm_engine::Item;
+use llm_engine::interceptor::{Interceptor, PreRequestAction, PreToolAction, ToolCallInfo};
+use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput, ToolResult};
 use serde::Deserialize;
 use tools::ScopedFs;
 
@@ -154,7 +154,7 @@ impl Tool for SearchSessionLogTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: SearchSessionParams = serde_json::from_str(input_json).map_err(|e| {
             ToolError::InvalidArgument(format!("invalid search_session_log input: {e}"))
@@ -213,7 +213,7 @@ impl Tool for ReadSessionItemsTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: ReadSessionParams = serde_json::from_str(input_json).map_err(|e| {
             ToolError::InvalidArgument(format!("invalid read_session_items input: {e}"))
@@ -379,7 +379,7 @@ impl Tool for MarkReadRequiredTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: MarkParams = serde_json::from_str(input_json).map_err(|e| {
             ToolError::InvalidArgument(format!("invalid mark_read_required input: {e}"))
@@ -440,7 +440,7 @@ impl Tool for AddReferenceTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: ReferenceParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid add_reference input: {e}")))?;
@@ -468,7 +468,7 @@ impl Tool for WriteSummaryTool {
     async fn execute(
         &self,
         input_json: &str,
-        _ctx: llm_worker::tool::ToolExecutionContext,
+        _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: SummaryParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid write_summary input: {e}")))?;
@@ -623,7 +623,7 @@ impl CompactWorkerInterceptor {
 impl Interceptor for CompactWorkerInterceptor {
     async fn pre_llm_request(&self, context: &mut Vec<Item>) -> PreRequestAction {
         let records = self.usage_tracker.records();
-        let estimate = llm_worker::token_counter::total_tokens(context, &records);
+        let estimate = llm_engine::token_counter::total_tokens(context, &records);
         if estimate.tokens > self.max_input_tokens {
             return PreRequestAction::Cancel(format!(
                 "compact worker input occupancy exceeded {} tokens",
@@ -673,8 +673,8 @@ mod tests {
         ScopedFs::new(scope, tmp.to_path_buf())
     }
 
-    fn make_usage(input: u64) -> llm_worker::timeline::event::UsageEvent {
-        llm_worker::timeline::event::UsageEvent {
+    fn make_usage(input: u64) -> llm_engine::timeline::event::UsageEvent {
+        llm_engine::timeline::event::UsageEvent {
             input_tokens: Some(input),
             output_tokens: Some(0),
             total_tokens: Some(input),

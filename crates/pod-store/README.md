@@ -19,7 +19,7 @@ Does not own:
 - replayable conversation logs (`session-store`)
 - live process locks or socket reachability (`pod-registry`, `client`)
 - product CLI behavior (`yoi`)
-- model turn execution (`llm-worker`)
+- model turn execution (`llm-engine`)
 
 ## Design notes
 
