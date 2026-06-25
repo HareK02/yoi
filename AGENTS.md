@@ -11,12 +11,12 @@
 
 LLM に投げる context への割り込みは、大きく2種類に分かれる。**前者は許されるが、後者は禁止**。
 
-Podの状態から純粋に再現可能で、且つ揮発性の無い操作であることが望ましい。（pruning、tool result の content 切り詰め、prompt cache anchor の付与等）。
+Workerの状態から純粋に再現可能で、且つ揮発性の無い操作であることが望ましい。（pruning、tool result の content 切り詰め、prompt cache anchor の付与等）。
 原則として、コンテキストは積み重ねるものであり、一時的にメッセージを差し込むことや、過去のメッセージを改ざんすることはKVキャッシュのヒット率を下げる。
 
 **禁止**: ターンを跨ぐことができない情報に基づいて、history に記録せずに context だけにコンテンツを差し込むこと。これをやると LLM はそれに反応して生成を行う一方、次以降のターンでhistoryに残らないため、「自分がなぜその発言/tool call をしたか」の根拠が消えるうえ、prompt cache のヒット率も低下させることになる。
 
-新しい input を context に乗せたいなら、必ず先に `worker.history` に append して commit すること。`history.json` への永続化はそこから自動的についてくる。Notify / PodEvent / `<system-reminder>` 系はこの原則で扱う。
+新しい input を context に乗せたいなら、必ず先に `worker.history` に append して commit すること。`history.json` への永続化はそこから自動的についてくる。Notify / WorkerEvent / `<system-reminder>` 系はこの原則で扱う。
 また、キャッシュを破壊するタイミングは正確にコントロールされる必要があり、キャッシュ破壊とトークン消費のトレードオフに基づいて慎重に設計されるべきである。
 
 ---

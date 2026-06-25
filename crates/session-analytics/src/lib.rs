@@ -1592,12 +1592,17 @@ fn line_count(value: &str) -> usize {
 }
 
 fn tool_kind(name: &str) -> &'static str {
+    const LEGACY_SEND_TO_PEER_POD_TOOL: &str = "SendToPeerPod";
+
     match name {
         "Read" | "Write" | "Edit" | "Glob" | "Grep" => "filesystem",
         "Bash" => "shell",
         "WebFetch" | "WebSearch" => "web",
-        "SpawnWorker" | "SendToWorker" | "ReadWorkerOutput" | "ListWorkers" | "StopWorker"
-        | "RestoreWorker" | "SendToPeerPod" => "worker",
+        "SpawnWorker" | "SendToWorker" | "SendToPeerWorker" | "ReadWorkerOutput"
+        | "ListWorkers" | "StopWorker" | "RestoreWorker" => "worker",
+        // Legacy session logs used the pre-rename peer tool name; keep analytics classification only.
+        /* legacy session-log tool name only */
+        LEGACY_SEND_TO_PEER_POD_TOOL => "worker",
         name if name.starts_with("Memory") || name.starts_with("Knowledge") => "memory",
         name if name.starts_with("Ticket") => "ticket",
         name if name.starts_with("Task") => "task",

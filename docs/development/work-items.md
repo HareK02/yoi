@@ -247,7 +247,7 @@ Implementation normally happens in a child git worktree created by the Orchestra
 
 ### 5. Review
 
-Reviewer Pods should be sibling Pods, not children of coder Pods. They should read the Ticket, intent packet, diff, implementation report, and validation evidence.
+Reviewer Workers should be sibling Workers, not children of coder Workers. They should read the Ticket, intent packet, diff, implementation report, and validation evidence.
 
 Review results should be recorded with the `TicketReview` tool. Maintainers working directly with the local backend can use the `yoi ticket` CLI documented later.
 

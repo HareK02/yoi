@@ -77,7 +77,7 @@ pub enum Method {
         kind: CompletionKind,
         prefix: String,
     },
-    /// List Pods visible to this Worker from durable Worker state and the spawned-child
+    /// List Workers visible to this Worker from durable Worker state and the spawned-child
     /// registry. This is not a host-wide Worker universe query.
     ListWorkers,
     /// Restore a visible stopped/restorable Worker, or report that it is already
