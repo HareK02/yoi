@@ -190,3 +190,52 @@ Residual risks / notes:
 - merge / Ticket close / worktree cleanup は未実施。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZD10ED-llm-engine at: 2026-06-25T13:54:15Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+確認結果、Ticket `00001KVZD10ED` の IntentPacket / acceptance criteria に対してブロッカーは見つかりませんでした。
+
+Read-only 確認:
+- 対象 worktree / branch / commit:
+  - `work/00001KVZD10ED-llm-engine-rename`
+  - HEAD `292fc4ea`
+  - base `22598710` は ancestor。
+- Ticket 記録:
+  - `thread.md` の IntentPacket / acceptance criteria / reviewer focus を確認。
+  - 要件は `llm-worker` → `llm-engine`、public turn-engine API を `Worker` 系から `Engine` 系へ rename、互換 alias なし、責務移動なし。
+- crate / directory:
+  - `crates/llm-engine`, `crates/llm-engine-macros` が存在。
+  - `crates/llm-worker`, `crates/llm-worker-macros` は存在しない。
+- Cargo / Nix:
+  - root `Cargo.toml` の members/default-members/workspace deps が `llm-engine` / `llm-engine-macros`。
+  - `crates/pod/Cargo.toml` 等の依存も `llm-engine`。
+  - `Cargo.lock` は旧 package 名から新 package 名へ置換済み。
+  - `package.nix` の `cargoHash` 更新を確認。
+- public API:
+  - `crates/llm-engine/src/lib.rs` は `Engine`, `EngineConfig`, `EngineError`, `EngineResult`, `EngineRunOutput` を export。
+  - `WorkerConfig` / `WorkerError` / `WorkerResult` / `WorkerState` / bare `RunOutput` は active tree で検出されず。
+  - `llm-engine` / `llm-engine-macros` 内に `pub type Worker` 等の互換 alias は見つからず。
+- stale reference:
+  - `.yoi/tickets/**` と `docs/report/**` を除いた tracked active tree で `llm-worker`, `llm_worker`, `llm-worker-macros`, `llm_worker_macros` は検出されず。
+- behavior / responsibility risk:
+  - `crates/llm-worker/src/worker.rs` → `crates/llm-engine/src/engine.rs` は正規化比較で import order / formatting 程度の差分に収まっていることを確認。
+  - `crates/llm-engine/README.md` に Pod names / sockets / process lifecycle / scope delegation / durable Pod state を持たない境界が明記されており、Runtime/Worker identity や socket/session authority の責務移動は見当たらない。
+- whitespace:
+  - `git diff --check 22598710..HEAD`: success。
+
+未再実行:
+- `cargo test -p llm-engine`
+- `cargo test -p pod`
+- `cargo check -p yoi`
+- `nix build .#yoi --no-link`
+
+上記は reviewer の read-only/no-write 条件を優先して再実行していない。coder 報告では成功済み。
+
+Non-blocking note:
+- `pod` 側には local variable や既存 runtime/manifest 文脈としての `worker` 語が残っているが、今回の acceptance 対象である old crate/import/API 名や `llm_engine::Worker` 互換 alias ではないため問題なし。
+
+---
