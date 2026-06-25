@@ -151,3 +151,25 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-25T20:36:24Z -->
+
+## Decision
+
+Routing decision: blocked_by_dependency_or_missing_authority
+
+Reason:
+- Dashboard Queue 後に Ticket / relations / workspace state を確認した。
+- 本 Ticket は `00001KVZKSTE2` REST command server に depends_on。`00001KVZKSTE2` は本 routing pass で accepted され `inprogress` になった。
+- WS observation proxy は Runtime process server surface と Backend proxy/client-facing stream を扱うため、REST command API/process wrapper の形が確定してから開始する。
+
+Evidence checked:
+- Ticket body: `Runtime -> Backend -> Client` WebSocket observation proxy、Runtime worker-scoped WS、Backend Runtime WS client、Client-facing WS、cursor/backlog/permission seam。
+- Relations: outgoing `depends_on -> 00001KVZKSTE2`; incoming dependent Tickets include Web Console MVP, remote Runtime process, TUI migration。
+- Orchestration plan: blocker record `orch-plan-20260625-203613-1` を追加。
+
+Next action:
+- 本 Ticket は queued のまま待機。
+- `00001KVZKSTE2` が review/merge/validation/done になった後に再 routing する。
+
+---

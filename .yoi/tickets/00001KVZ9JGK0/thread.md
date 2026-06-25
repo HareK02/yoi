@@ -111,3 +111,25 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-25T20:36:54Z -->
+
+## Decision
+
+Routing decision: blocked_by_dependency_or_missing_authority
+
+Reason:
+- Dashboard Queue 後に Ticket / relations / workspace state を確認した。
+- 本 Ticket は Web Console MVP であり、WebSocket/event-stream transport/proxy `00001KVZKSTJT` と Backend embedded Runtime connection `00001KVZSGT0Q` を前提にする。
+- `00001KVZKSTJT` は queued/blocked、`00001KVZSGT0Q` も Backend Registry foundation chain 待ち。Web Console を先に始めると response delivery / stream semantics を UI/API 側で先取りして固定するため開始しない。
+
+Evidence checked:
+- Ticket body: Companion Runtime/Web Console MVP、message API、transcript/stream response choice、Safety/authority。
+- Relations: `depends_on -> 00001KVZKSTJT` と `depends_on -> 00001KVZSGT0Q`。
+- Orchestration plan: blocker record `orch-plan-20260625-203613-1` を追加。
+
+Next action:
+- 本 Ticket は queued のまま待機。
+- `00001KVZKSTJT` と `00001KVZSGT0Q` が done になった後、Web Console MVP の acceptance criteria を再確認して routing する。
+
+---
