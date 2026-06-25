@@ -411,3 +411,47 @@ Residual risks / notes:
 - child worktree は commit 後 clean。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZG9BMS-worker-rename at: 2026-06-25T15:46:40Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+読取専用で `94c7aa79` を確認した。前回指摘分のうち、以下は解消済み。
+
+- `crates/pod-registry/README.md` の `worker-session-state.md` link 更新。
+- `crates/protocol/src/lib.rs` の `List Workers...` comment 更新。
+- `AGENTS.md` / `docs/development/work-items.md:250` の前回 exact blocker 更新。
+- `SendToPeerPod` は `LEGACY_SEND_TO_PEER_POD_TOOL` として analytics-only legacy comment 付きで残り、現行 `SendToPeerWorker` 分類も追加済みなので、この残存は許容可能。
+
+Remaining blockers:
+
+1. active E2E helper に旧 `--pod` CLI が残存。
+   - `tests/e2e/src/lib.rs:1541`
+   - `config.command_args` がまだ `"--pod"` を渡している。
+   - `yoi pod` / `--pod` alias を作らない方針なので、これは現行 CLI に対して壊れた active test/helper。`--worker` へ更新が必要。
+
+2. active user-facing / developer-facing guidance に旧 Pod terminology が残存。
+   代表例:
+   - `crates/tui/src/dashboard/mod.rs:96` — `"no Tickets or Pods found ..."`
+   - `crates/tui/src/dashboard/mod.rs:2939` — `"spawning role Pods"`
+   - `crates/tui/src/dashboard/mod.rs:4951` — `"sibling coder/reviewer Pods"`
+   - `crates/tui/src/dashboard/tests.rs:837` — 旧文字列期待
+   - `crates/client/README.md:5` — “talking to Pods”
+   - `crates/manifest/src/config.rs:43` — “spawned child Pods”
+   - `docs/design/overview.md:14` — “between clients and Pods”
+   - `docs/development/workflows.md` / `docs/development/dogfooding.md` / `docs/development/work-items.md` にも current guidance としての `Pods` が残存。
+
+これらは `pod-store` / `pod-registry` crate 名や on-disk `pods` compatibility の説明ではなく、現在の実行単位・CLI・Dashboard guidance なので Worker terminology に寄せるべき。
+
+Required verification after fixes:
+```sh
+rg -n -S --glob '!target' --glob '!docs/report/**' -- '--pod|yoi pod' .
+rg -n -S --glob '!target' --glob '!docs/report/**' \
+  'sibling coder/reviewer Pods|role Pods|talking to Pods|between clients and Pods|Spawned Pods|child Pods|Pods found|Pod categories|Pod row' \
+  crates docs tests resources AGENTS.md README.md KNOWN_ISSUES.md
+```
+These should be empty or any remaining hit must be explicitly legacy/internal and justified.
+
+---
