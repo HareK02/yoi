@@ -329,7 +329,7 @@ Yoi checks method, scheme, host, optional port, and path prefix against both the
 
 ## `websocket` host API
 
-The `websocket` host API is a separate grant-gated capability named `host_api.websocket`, not an extension of `host_api.request`. It opens host-owned WebSocket connections only when both the package manifest and enablement config declare matching targets. Plugin code drives the lifecycle explicitly through `open`, `send-text`, `recv`, and `close`; incoming messages are returned only from bounded `recv` calls and are not injected into model context, history, Dashboard state, or Ticket state.
+The `websocket` host API is a separate grant-gated capability named `host_api.websocket`, not an extension of `host_api.request`. It opens host-owned WebSocket connections only when both the package manifest and enablement config declare matching targets. Tool-style/internal bounded use can still drive the lifecycle explicitly through `open`, `send-text`, `recv`, and `close`; incoming messages are returned only from bounded `recv` calls and are not injected into model context, history, Dashboard state, or Ticket state. Service Plugins should prefer the host-owned Service WebSocket driver instead of running a long-lived guest recv loop: declare a Service ingress source as `websocket:wss://host/path`, include the `websocket_text`/`websocket_close`/`websocket_error` event kinds you want delivered, and emit the Service output command `websocket_send` to send text back through the same grant-checked host connection.
 
 Example manifest shape:
 
