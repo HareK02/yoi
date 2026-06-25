@@ -219,3 +219,70 @@ Non-blocking notes:
 - close/error event の enqueue 失敗は text frame のような queue-drop counter には載せていないが、status diagnostic は記録されるため今回の acceptance 上は blocker ではない。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-25T07:06:19Z -->
+
+## Implementation report
+
+Integration outcome:
+
+- Coder `yoi-coder-00001KVXK0WE4-websocket-driver` が implementation branch `work/00001KVXK0WE4-plugin-websocket-driver` に実装を commit した。
+  - implementation commit: `f2c51ffe feat: add plugin websocket service driver`
+- Reviewer `yoi-reviewer-00001KVXK0WE4-websocket-driver` は read-only review で `approve`。host-owned connection authority、manifest/grant allowlist、ingress queue integration、`websocket_send` command validation、status diagnostics、scope creep なしを確認した。
+- Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration` で branch `work/00001KVXK0WE4-plugin-websocket-driver` を merge 済み。
+  - merge commit: `b9e786e1 merge: 00001KVXK0WE4 plugin websocket driver`
+
+Implemented behavior:
+- `crates/pod/src/feature/plugin.rs` に Service Plugin 用 host-owned WebSocket driver を追加。
+- `ingress.sources` の `websocket:wss://...` / `ws(s)://...` source を Service WebSocket connection として扱う。
+- incoming text frame を existing bounded Service ingress queue へ `websocket_text` event として enqueue。
+- close/error は `websocket_close` / `websocket_error` event と status diagnostic に反映。
+- `websocket_send` Service output command は host-owned connection 経由の text send に接続。
+- manifest declaration + enabled grant / allowlist を通らない open/send は fail-closed。
+- status に connection state, last frame time, last error, received/sent counts, queue drops, send failures を追加。
+- `docs/development/plugin-development.md` の Service Plugin 推奨 WebSocket integration を host-owned driver + `websocket_send` output command に更新。
+
+Validation in Orchestrator worktree:
+- `cargo test -p pod --lib websocket_`: success
+- `cargo test -p pod --lib service_output_command`: success
+- `cargo check -p pod`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+- `cargo test -p pod`: failed only in known prompt guidance snapshot assertions outside this Plugin diff:
+  - `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`
+  - `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`
+  - Plugin/WebSocket focused tests in the same run passed.
+
+Notes:
+- Reviewer non-blocking note: `docs/development/plugin-development.md` の “Current status” 付近にはまだ Service/Ingress/WebSocket を future work と読む余地が残る。後続 `00001KVXK0WEA` の docs/PDK/templates update で整理するのがよい。
+- Reviewer non-blocking note: close/error event enqueue failure は text frame と同じ queue-drop counter には載らないが、status diagnostic は記録されるため blocker ではない。
+- Follow-up `00001KVXK0WEA` is dependency-unblocked and can be re-routed next.
+
+Next action:
+- Mark Ticket done after this integration/validation evidence.
+- Then stop related child Pods and remove only the child implementation worktree/branch.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-25T07:06:30Z from: inprogress to: done reason: merged_validated_with_unrelated_full_suite_caveat field: state -->
+
+## State changed
+
+Implementation is merged into the orchestration branch and validated with one unrelated known full-suite caveat.
+
+Evidence:
+- merge commit: `b9e786e1 merge: 00001KVXK0WE4 plugin websocket driver`
+- reviewer result: approve
+- validation in `/home/hare/Projects/yoi/.worktree/orchestration`:
+  - `cargo test -p pod --lib websocket_`: success
+  - `cargo test -p pod --lib service_output_command`: success
+  - `cargo check -p pod`: success
+  - `cargo check -p yoi`: success
+  - `git diff --check`: success
+  - `nix build .#yoi --no-link`: success
+  - `cargo test -p pod`: failed only in prompt guidance snapshot assertions outside this Plugin diff; Plugin/WebSocket-focused tests passed.
+
+Closure is not performed here; this state records implementation completion after merge/review/focused validation.
+
+---
