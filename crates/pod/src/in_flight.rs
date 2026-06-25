@@ -235,14 +235,23 @@ impl InFlightInner {
                     self.remove_first_text_matching(&text);
                 }
             }
-            LoggedItem::Reasoning { text, summary, .. } => {
+            LoggedItem::Reasoning {
+                text,
+                summary,
+                encrypted_content,
+                ..
+            } => {
+                let mut removed = false;
                 if !text.is_empty() {
-                    self.remove_first_thinking_matching(text);
+                    removed |= self.remove_first_thinking_matching(text);
                 }
                 for summary_text in summary {
                     if !summary_text.is_empty() {
-                        self.remove_first_thinking_matching(summary_text);
+                        removed |= self.remove_first_thinking_matching(summary_text);
                     }
+                }
+                if !removed && encrypted_content.is_some() {
+                    self.remove_first_empty_finished_thinking();
                 }
             }
             LoggedItem::ToolCall { call_id, .. } => {
@@ -262,21 +271,39 @@ impl InFlightInner {
         }
     }
 
-    fn remove_first_text_matching(&mut self, committed: &str) {
+    fn remove_first_text_matching(&mut self, committed: &str) -> bool {
         if let Some(index) = self.blocks.iter().position(|block| match block {
             TrackedBlock::Text { text, .. } => text == committed,
             _ => false,
         }) {
             self.blocks.remove(index);
+            true
+        } else {
+            false
         }
     }
 
-    fn remove_first_thinking_matching(&mut self, committed: &str) {
+    fn remove_first_thinking_matching(&mut self, committed: &str) -> bool {
         if let Some(index) = self.blocks.iter().position(|block| match block {
             TrackedBlock::Thinking { text, .. } => text == committed,
             _ => false,
         }) {
             self.blocks.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn remove_first_empty_finished_thinking(&mut self) -> bool {
+        if let Some(index) = self.blocks.iter().position(|block| match block {
+            TrackedBlock::Thinking { text, finished, .. } => text.is_empty() && *finished,
+            _ => false,
+        }) {
+            self.blocks.remove(index);
+            true
+        } else {
+            false
         }
     }
 
@@ -311,10 +338,16 @@ impl TrackedBlock {
                     })
                 }
             }
-            TrackedBlock::Thinking { text, finished, .. } => Some(InFlightBlock::Thinking {
-                text: text.clone(),
-                finished: *finished,
-            }),
+            TrackedBlock::Thinking { text, finished, .. } => {
+                if text.is_empty() && *finished {
+                    None
+                } else {
+                    Some(InFlightBlock::Thinking {
+                        text: text.clone(),
+                        finished: *finished,
+                    })
+                }
+            }
             TrackedBlock::ToolCall {
                 id,
                 name,
@@ -505,5 +538,62 @@ mod tests {
 
         let guard = in_flight.snapshot_guard();
         assert!(snapshot_from_guard(&guard).is_empty());
+    }
+
+    #[test]
+    fn committed_encrypted_only_reasoning_clears_empty_finished_thinking_block() {
+        let (event_tx, _) = broadcast::channel(16);
+        let in_flight = InFlightEvents::new(event_tx);
+        let first = in_flight.thinking_start();
+        in_flight.thinking_done(first, "".into());
+        let second = in_flight.thinking_start();
+        in_flight.thinking_delta(second, "still running".into());
+
+        in_flight.clear_for_committed_item_then(
+            &LoggedItem::Reasoning {
+                text: String::new(),
+                summary: Vec::new(),
+                encrypted_content: Some("opaque".into()),
+                signature: None,
+            },
+            || (),
+        );
+
+        let guard = in_flight.snapshot_guard();
+        assert_eq!(
+            snapshot_from_guard(&guard).blocks,
+            vec![InFlightBlock::Thinking {
+                text: "still running".into(),
+                finished: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn snapshot_omits_empty_finished_thinking_blocks() {
+        let (event_tx, _) = broadcast::channel(16);
+        let in_flight = InFlightEvents::new(event_tx);
+        let empty_finished = in_flight.thinking_start();
+        in_flight.thinking_done(empty_finished, "".into());
+        let empty_running = in_flight.thinking_start();
+        let visible_finished = in_flight.thinking_start();
+        in_flight.thinking_delta(visible_finished, "visible".into());
+        in_flight.thinking_done(visible_finished, "".into());
+
+        let guard = in_flight.snapshot_guard();
+        assert_eq!(
+            snapshot_from_guard(&guard).blocks,
+            vec![
+                InFlightBlock::Thinking {
+                    text: String::new(),
+                    finished: false,
+                },
+                InFlightBlock::Thinking {
+                    text: "visible".into(),
+                    finished: true,
+                }
+            ]
+        );
+        assert_ne!(empty_running, empty_finished);
     }
 }
