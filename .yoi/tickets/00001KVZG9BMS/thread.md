@@ -547,3 +547,58 @@ Remaining blockers:
 `SendToPeerPod` の analytics-only legacy constant は、現行 `SendToPeerWorker` 分類と明示 comment があるため許容。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZG9BMS-worker-rename at: 2026-06-25T16:07:26Z -->
+
+## Implementation report
+
+Fourth follow-up implementation report after review request_changes:
+
+対応内容:
+
+1. 指摘箇所の Worker terminology 更新
+- `docs/development/workflows.md`
+  - `## Child Pods` → `## Child Workers`
+  - `Child Pods may commit ...` → `Child Workers may commit ...`
+- `docs/development/work-items.md`
+  - `Inside Pods ...` → `Inside Workers ...`
+  - `Ticket tools inside Pods` → `Ticket tools inside Workers`
+  - `Pods with the Ticket built-in feature ...` → `Workers with the Ticket built-in feature ...`
+  - `spawn coder/reviewer Pods ...` → `spawn coder/reviewer Workers ...`
+  - `coder Pods ...` → `coder Workers ...`
+- `tests/e2e/tests/panel.rs`
+  - `fixture blocks host Pod launch` → `fixture blocks host Worker launch`
+  - `host/fixture runtime Pod marker ...` → `host/fixture runtime Worker marker ...`
+
+2. 追加で見つかった docs/tests の active Pod 表現も更新
+- `docs/design/tool-permissions-scope.md`: `Child Pods` → `Child Workers`
+- `docs/design/compaction.md`: `long-running Pods` → `long-running Workers`
+- `docs/design/memory-knowledge.md`: `normal Pods` → `normal Workers`
+- `docs/design/plugin-packages.md`: `Restored Pods` → `Restored Workers`
+- `docs/development/environment.md`: `spawned Pods` → `spawned Workers`
+- `tests/e2e/tests/rewind.rs`: `single-pod rewind fixture` → `single-worker rewind fixture`
+- `tests/e2e/tests/panel.rs`: active test helper/fixture naming and diagnostics updated to Worker terminology.
+
+Validation:
+- `cargo test -p worker`: success
+- `cargo test -p yoi`: success
+- `cargo check -p yoi`: success
+- `cargo test -p protocol --features typescript`: success
+- `cargo check -p yoi-e2e`: success
+- `cd web/workspace && deno task check`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Grep evidence:
+- `rg -n -S --glob '!target' --glob '!docs/report/**' -- '--pod|yoi pod' .`: no matches.
+- `rg -n -S --glob '!target' --glob '!docs/report/**' 'sibling coder/reviewer Pods|role Pods|talking to Pods|between clients and Pods|Spawned Pods|child Pods|Pods found|Pod categories|Pod row' crates docs tests resources AGENTS.md README.md KNOWN_ISSUES.md`: no matches.
+- `rg -n -S 'Child Pods|Inside Pods|Ticket tools inside Pods|Pods with the Ticket built-in feature|spawn coder/reviewer Pods|coder Pods|host Pod launch|runtime Pod marker' docs/development/workflows.md docs/development/work-items.md tests/e2e/tests/panel.rs`: no matches.
+- `rg -n -S '\bPod\b|\bPods\b' docs tests --glob '!target' --glob '!docs/report/**'`: no matches.
+
+Commit:
+- `cb0c52e7871849b9482c37ae63cacf4a2898da90 fix: update remaining active worker wording`
+
+Residual risks / notes:
+- child worktree は commit 後 clean。
+
+---
