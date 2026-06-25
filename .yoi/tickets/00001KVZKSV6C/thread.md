@@ -235,3 +235,31 @@ Residual risks / review focus:
 - `RuntimeSourceSummary.note` は human-readable な API payload なので、Web 側で表示するなら文言の粒度を確認してほしい。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZKSV6C-runtime-registry at: 2026-06-25T19:37:41Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+ブロッカー:
+
+1. Runtime/Worker authority がまだ `runtime_id + worker_id` になっていない。
+   - `RuntimeRegistry::worker(&self, worker_id)` は `runtime_id` を受け取らず、全 Runtime を `worker_id` だけで走査している。
+   - `RuntimeRegistryError` にも `UnknownRuntime` 相当がない。
+   - Ticket の binding decision / 要件では Worker authority は `runtime_id + worker_id`、unknown runtime / unknown worker 等の error boundary を typed に分ける必要がある。
+   - 将来 embedded / remote source が増えた時に `worker_id` 衝突や誤 routing が起き得るため、foundation として不足。
+   - 該当: `crates/workspace-server/src/hosts.rs` `RuntimeRegistry::worker` / `RuntimeRegistryError`
+
+2. runtime-scoped routing/error mapping のテストが不足している。
+   - 追加テストは `local_compatibility` source / identity_authority / path 非露出は確認しているが、複数 Runtime または unknown runtime を想定した `runtime_id` scoped lookup / error boundary を確認していない。
+   - Acceptance の “Runtime identity / Worker routing key / error boundary” を満たすには、typed `runtime_id` lookup と unknown-runtime / unknown-worker の focused test が必要。
+
+確認できた良い点:
+- `RuntimeSourceKind::{LocalCompatibility, EmbeddedWorkerRuntime, RemoteHttp}` と `RuntimeSourceSummary` により、local compatibility / future embedded / future remote の source 境界は型として追加されている。
+- local source は `source.kind = local_compatibility`、`identity_authority = runtime_registry_projection` として API/test で確認されている。
+- socket/session/path authority の直接公開や embedded `worker_runtime::Runtime` 接続、remote HTTP client/server 実装などの scope creep は見当たらない。
+- 変更範囲は `workspace-server` の `hosts.rs` / `server.rs` のみで、`worker-runtime` public API 変更は見当たらない。
+- read-only で `git diff --check f6fd7b63^ f6fd7b63` は問題なし。Cargo/Nix 検証は read-only 指示を優先して再実行していない。
+
+---
