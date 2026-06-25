@@ -182,3 +182,40 @@ Residual risks / notes:
 - 実ネットワーク test は non-goal のため、mock WebSocket client/connection による bounded focused tests で検証している。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVXK0WE4-websocket-driver at: 2026-06-25T07:03:47Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+読み取り専用で Ticket / IntentPacket / `62e467c0..HEAD` diff を確認した。Ticket review 記録・merge・close・検証コマンド実行は reviewer では行っていない。
+
+確認した証拠:
+- 変更範囲は `crates/pod/src/feature/plugin.rs` と `docs/development/plugin-development.md` のみで、WIT / PDK / templates へのスコープ拡大はない。
+- Host-owned Service WebSocket driver:
+  - Service/Ingress 有効時に `ingress.sources` から `websocket:` / `ws(s)://` source を subscription 化している。
+  - instance start 後に host 側で connection start し、reader thread を生成している。
+- authority / fail-closed:
+  - open は `host_api.websocket` permission と manifest/grant allowlist を通した既存 validation を再利用している。
+  - `websocket_send` は Service output command envelope の validation/grant check 経由でのみ実行され、URL scheme/credentials/static target/manifest+grant allowlist を検査している。
+- ingress queue / diagnostics:
+  - text frame は `websocket_text` event として既存 `deliver_ingress` path に渡され、失敗時は queue drop と diagnostic を記録する。
+  - close/error は `websocket_close` / `websocket_error` event と status diagnostic に反映される。
+  - status には connection state, last frame, last error, received/sent counts, queue drops, send failures が出る。
+- output command send:
+  - `PluginServiceOutputCommandKind::WebSocketSend` が追加され、実行時は host-owned connection の `send_text` に接続され、send failure diagnostic も記録する。
+- docs:
+  - `recv(timeout)` は bounded/internal/tool-style use として残しつつ、Service Plugin では host-owned Service WebSocket driver + `websocket_send` を推奨する文面に更新されている。
+- tests:
+  - mock/fake client による incoming text/close、send success/failure、unauthorized target、receive error/binary相当 diagnostic のテストが追加されている。
+
+検証状況:
+- reviewer は cargo/nix 等を実行していない（read-only / no writes 指示のため）。
+- diff・対象コード・Ticket acceptance を静的確認し、coder 報告の `cargo check` / focused tests / nix build 結果を前提証跡として扱った。
+
+Non-blocking notes:
+- `docs/development/plugin-development.md` の “Current status” 付近にはまだ Service/Ingress/WebSocket を future work と読む余地が残っているが、本 Ticket の受け入れ条件である「pull recv を recommended service path にしない」は満たしている。後続の docs/PDK/templates Ticket で整理するとよい。
+- close/error event の enqueue 失敗は text frame のような queue-drop counter には載せていないが、status diagnostic は記録されるため今回の acceptance 上は blocker ではない。
+
+---
