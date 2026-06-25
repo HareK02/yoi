@@ -455,3 +455,64 @@ rg -n -S --glob '!target' --glob '!docs/report/**' \
 These should be empty or any remaining hit must be explicitly legacy/internal and justified.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZG9BMS-worker-rename at: 2026-06-25T15:58:35Z -->
+
+## Implementation report
+
+Third follow-up implementation report after review request_changes:
+
+対応内容:
+
+1. E2E helper の旧 CLI 引数修正
+- `tests/e2e/src/lib.rs`
+  - rewind fixture の起動引数を `--pod` から `--worker` に変更。
+  - 関連 helper 名・フィールド・説明も `worker_names` / `worker_rows` / Worker row に更新。
+- `tests/e2e/tests/panel.rs`
+  - 期待値・メッセージを Worker terminology に更新。
+
+2. Active user/developer guidance の Pod 表現修正
+- `crates/tui/src/dashboard/mod.rs`
+  - `no Tickets or Pods found ...` → `no Tickets or Workers found ...`
+  - `spawning role Pods` → `spawning role Workers`
+  - `sibling coder/reviewer Pods` → `sibling coder/reviewer Workers`
+- `crates/tui/src/dashboard/tests.rs`
+  - 期待文字列を Worker に更新。
+- `crates/client/README.md`
+  - `talking to Pods` → `talking to Workers`
+- `crates/manifest/src/config.rs`
+  - `spawned child Pods` → `spawned child Workers`
+- `docs/design/overview.md`
+  - `between clients and Pods` → `between clients and Workers`
+- `docs/design/profiles-manifests-prompts.md`
+  - `Spawned Pods` → `Spawned Workers`
+- `docs/development/dogfooding.md`
+  - `child Pods` → `child Workers`
+- `docs/development/workflows.md`
+  - `Spawned Pods` → `Spawned Workers`
+
+Validation:
+- `cargo test -p worker`: success
+- `cargo test -p yoi`: success
+- `cargo check -p yoi`: success
+- `cargo test -p protocol --features typescript`: success
+- `cargo check -p yoi-e2e`: success
+- `cd web/workspace && deno task check`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Notes:
+- `cargo check -p e2e` は package 名が存在しなかったため失敗し、正しい package 名 `yoi-e2e` で `cargo check -p yoi-e2e` を実行して成功。
+
+Specified grep evidence:
+- `rg -n -S --glob '!target' --glob '!docs/report/**' -- '--pod|yoi pod' .`: no matches.
+- `rg -n -S --glob '!target' --glob '!docs/report/**' 'sibling coder/reviewer Pods|role Pods|talking to Pods|between clients and Pods|Spawned Pods|child Pods|Pods found|Pod categories|Pod row' crates docs tests resources AGENTS.md README.md KNOWN_ISSUES.md`: no matches.
+- Additional E2E stale grep for `pod_rows`, `pod_names`, `row.key.kind == "pod"`, `"--pod"`: no matches.
+
+Commit:
+- `da96d06f25932ff60fc00a3fc516a276a2847125 fix: remove stale pod guidance references`
+
+Residual risks / notes:
+- child worktree は commit 後 clean。
+
+---
