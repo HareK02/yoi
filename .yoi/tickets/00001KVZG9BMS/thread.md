@@ -208,3 +208,48 @@ Residual risks / notes:
 - merge / close / cleanup は実施していません。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZG9BMS-worker-rename at: 2026-06-25T15:15:27Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+読取専用で Ticket / IntentPacket、`4c677640..HEAD` diff、grep/nl による focused inspection を行いました。`cargo`/`nix` 系の再実行は read-only 指示と書込み副作用回避のため行っていません。
+
+良い点:
+- `crates/worker` は存在し、`crates/pod` は削除済み。
+- workspace/Cargo.lock 上の package/import は `worker` に移行済みで、`pod-store` / `pod-registry` は standalone rename されていません。
+- CLI は `yoi worker` / `--worker` 側へ移行しており、明示的な `yoi pod` alias は見当たりませんでした。
+
+Blockers:
+
+1. 生成済み Web protocol が旧 Pod protocol のまま。
+   - `web/workspace/src/lib/generated/protocol.ts` が Rust 側の `Worker*` protocol と不整合です。
+   - 例: `PodStatus`, `Greeting { pod_name: ... }`, `PodEvent`, method `pod_event`, `list_pods`, `restore_pod`, events `pods_listed`, `pod_restored` など。
+   - `crates/protocol/src/lib.rs` は `WorkerStatus` / `WorkerEvent` / `worker_name` / `worker_event` 等へ更新済みのため、Web/TS client 側が socket protocol とズレるリスクがあります。
+
+2. public API に旧 Pod 名の enum variant が残存。
+   - `crates/client/src/spawn.rs` の `SpawnError::PodLaunchFailed { ... }`。
+   - `crates/client/src/lib.rs` で `SpawnError` は public re-export されているため、Ticket の “Public execution-unit type/API terminology is Worker, not Pod” に反します。
+
+3. model-facing prompts / workflows / active docs に旧 Pod guidance が残存。
+   - `resources/prompts/common/worker-orchestration.md`: “Peer Pods ...”
+   - `resources/workflows/ticket-orchestrator-routing.md`: “Coder/Reviewer は sibling Pods ...”
+   - `resources/prompts/role/intake.md`, `resources/prompts/role/orchestrator.md`, `resources/prompts/panel/orchestrator_idle_queue_notice.md` にも active orchestration guidance として “Pods” が残っています。
+   - `docs/design/worker-session-state.md` に `SendToPeerPod` と記載されていますが、実装側は `SendToPeerWorker`。
+   - これらは legacy/internal compatibility label ではなく current LLM/workflow guidance なので例外扱いできません。
+
+4. active documentation に壊れた旧パス / 旧型名が残存。
+   - `crates/pod-store/README.md` に削除済み `docs/design/pod-session-state.md` へのリンク。
+   - `KNOWN_ISSUES.md` に `crates/worker/src/pod.rs` / `Pod::ensure_segment_head` 等、存在しない path/type。
+
+Required fixes:
+- `web/workspace/src/lib/generated/protocol.ts` を Rust protocol と一致させる。
+- `client::SpawnError::PodLaunchFailed` を `WorkerLaunchFailed` に rename し、match/source mapping も更新する。
+- `resources/prompts/**` / `resources/workflows/**` の active “Pod(s)” guidance を Worker terminology に更新する。
+- `SendToPeerPod` など実装と不一致な docs を `SendToPeerWorker` に更新する。
+- 削除済み `docs/design/pod-session-state.md` へのリンク、存在しない `crates/worker/src/pod.rs` / `Pod::ensure_segment_head` 参照を修正する。
+- 修正後、報告済み validation に加えて stale grep を再実施する。
+
+---
