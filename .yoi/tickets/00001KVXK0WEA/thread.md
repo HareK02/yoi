@@ -300,3 +300,64 @@ Review result: approve
 - `7a4fd975..HEAD` と fix commit `6c899887` の静的レビューのみ実施。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-25T07:57:03Z -->
+
+## Implementation report
+
+Integration outcome:
+
+- Coder `yoi-coder-00001KVXK0WEA-pdk-service-events` が implementation branch `work/00001KVXK0WEA-plugin-pdk-service-events` に実装と review fix を commit した。
+  - implementation commit: `7a4fd975 feat: update plugin service authoring templates`
+  - fix commit: `6c899887 fix: declare plugin service websocket authority`
+- Reviewer `yoi-reviewer-00001KVXK0WEA-pdk-service-events` は初回 review で request_changes。Service template が `ServiceOutput::websocket_send` を返す一方で `host_api.websocket` permission と matching `[[websocket]]` target declaration を持たない点を blocker とした。
+- Coder は service template manifest / tests / docs を修正し、follow-up review は `approve`。template authority declaration、enablement grants guidance、runtime envelope alignment、raw-WASM compatibility 非復活を確認した。
+- Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration` で branch `work/00001KVXK0WEA-plugin-pdk-service-events` を merge 済み。
+  - merge commit: `8d4fee23 merge: 00001KVXK0WEA plugin pdk service events`
+
+Implemented behavior:
+- WIT docs/descriptionsを Service ingress event JSON と `output_commands` / `websocket_send` authoring に合わせて更新。
+- `crates/plugin-pdk` に `PluginIngressEvent` 拡張、`ServiceOutput` / `ServiceOutputCommand` / `ServiceOutputCommandKind`、`websocket_text` / `websocket_send` helpers を追加。
+- `Plugin::handle_ingress` returns `ServiceOutput`。
+- `resources/plugin/templates/rust-component-instance` を service-oriented template に更新し、`handle_ingress` + `ServiceOutput::websocket_send` pattern を示す。
+- service template `plugin.toml` は `runtime.kind = "wasm-component"`、`host_api.websocket` permission、matching `[[websocket]]` target を含む。
+- `yoi plugin new rust-component-service <path>` を追加し、new/check/pack consistency tests を更新。
+- docs は long-running guest `recv(timeout)` loop ではなく host-owned ingress event + output command model を推奨し、enablement grants でも matching websocket target が必要と明記。
+
+Validation in Orchestrator worktree:
+- `cargo test -p yoi-plugin-pdk`: success
+- `cargo test -p yoi plugin`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+- Template cargo-check is covered by `cargo test -p yoi-plugin-pdk` using temporary target dirs.
+
+Notes:
+- This Ticket completes the queued Plugin runtime redesign chain slices that were split from the original broad redesign request.
+- No runtime envelope redesign, protocol-specific integration, secret injection, reconnect policy, runtime reimplementation, or raw-WASM compatibility was introduced.
+
+Next action:
+- Mark Ticket done after this integration/validation evidence.
+- Then stop related child Pods and remove only the child implementation worktree/branch.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-25T07:57:15Z from: inprogress to: done reason: merged_validated field: state -->
+
+## State changed
+
+Implementation is merged into the orchestration branch and validated.
+
+Evidence:
+- merge commit: `8d4fee23 merge: 00001KVXK0WEA plugin pdk service events`
+- reviewer result: approve after requested changes were fixed
+- validation in `/home/hare/Projects/yoi/.worktree/orchestration` succeeded:
+  - `cargo test -p yoi-plugin-pdk`
+  - `cargo test -p yoi plugin`
+  - `cargo check -p yoi`
+  - `git diff --check`
+  - `nix build .#yoi --no-link`
+
+Closure is not performed here; this state records implementation completion after merge/validation.
+
+---
