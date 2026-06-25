@@ -1,8 +1,8 @@
 # Plugin Component Model migration
 
-Yoi's current Plugin Tool runtime uses a narrow core-WebAssembly ABI. That was the right MVP shape because it made sandboxing, bounded input/output, and fail-closed host imports explicit. It should not become the long-term authoring interface.
+Yoi's original Plugin Tool runtime used a narrow core-WebAssembly ABI. That was the right MVP shape because it made sandboxing, bounded input/output, and fail-closed host imports explicit, but it is no longer the public authoring interface.
 
-The preferred direction is to adopt the WebAssembly Component Model for Plugin Tool authoring and host APIs. Component Model adoption means Plugin interfaces are described as typed WIT worlds and lowered through the canonical ABI, instead of every Plugin author or SDK wrapper hand-writing pointer/length memory plumbing.
+The supported runtime kind is now `wasm-component`, using the WebAssembly Component Model for Plugin Tool authoring and host APIs. Component Model adoption means Plugin interfaces are described as typed WIT worlds and lowered through the canonical ABI, instead of every Plugin author or SDK wrapper hand-writing pointer/length memory plumbing.
 
 ## What Component Model changes
 
@@ -74,40 +74,21 @@ Adopting the Component Model must not change Yoi's authority model:
 
 ## Migration shape
 
-Yoi should support Component Model as an explicit runtime kind rather than silently changing existing raw-ABI packages.
+`runtime.kind = "wasm-component"` is the sole public Plugin runtime kind. Legacy raw core-Wasm declarations (`kind = "wasm"` / `abi = "yoi-plugin-wasm-1"`) are rejected by manifest validation and are surfaced only as bounded diagnostics; they are not active/eligible Plugins and are not executed.
 
-Possible manifest direction:
+The migration is now focused on the component surface:
 
-```toml
-[runtime]
-kind = "wasm-component"
-component = "plugin.component.wasm"
-world = "yoi:plugin/tool@1.0.0"
-```
-
-The current raw core-Wasm runtime can remain explicit during migration:
-
-```toml
-[runtime]
-kind = "wasm"
-entry = "plugin.wasm"
-abi = "yoi-plugin-wasm-1"
-```
-
-The migration should be phased:
-
-1. Define WIT packages/worlds for Tool Plugin and initial host APIs.
-2. Add manifest/schema support for `runtime.kind = "wasm-component"` without executing it during discovery.
-3. Add a component runtime backend and typed host import/export binding.
-4. Port `https` and `fs` host API designs to WIT-compatible interfaces.
-5. Add a Rust PDK/template around the component world.
-6. Decide whether the raw ABI remains supported, becomes legacy-only, or is deprecated after examples and tests move.
+1. Keep WIT packages/worlds for Tool Plugin and initial host APIs versioned under `resources/plugin/wit`.
+2. Keep manifest/schema support centered on `runtime.kind = "wasm-component"`.
+3. Keep the component runtime backend and typed host import/export binding as the active execution path.
+4. Port future host API designs to WIT-compatible interfaces.
+5. Keep the Rust PDK/template aligned with the component world.
 
 ## Runtime/backend caution
 
-The current implementation uses `wasmi` for core Wasm. Component Model support will likely require a different backend or a significantly richer component adapter path, such as `wasmtime::component` plus generated bindings. That has consequences for binary size, Nix packaging, build time, runtime limits, and sandbox policy. The migration Ticket must measure and validate those effects explicitly.
+The legacy core-Wasm implementation used `wasmi` as a transitional backend. The active Plugin Tool runtime is now selected by package runtime metadata and executed through `wasmtime::component`; discovery and static inspection must continue to avoid executing package code.
 
-If a component backend is added, keep it selected by package runtime metadata and Profile/feature policy. Do not make all Plugin packages depend on component execution during discovery or inspection.
+Keep the component backend selected by package runtime metadata and Profile/feature policy. Do not make all Plugin packages depend on component execution during discovery or inspection.
 
 ## Relationship to pending host APIs
 
@@ -133,21 +114,13 @@ component = "plugin.component.wasm"
 world = "yoi:plugin/tool@1.0.0"
 ```
 
-The legacy core-Wasm ABI remains explicit and is not reinterpreted as a
-component:
-
-```toml
-[runtime]
-kind = "wasm"
-entry = "plugin.wasm"
-abi = "yoi-plugin-wasm-1"
-```
+Legacy core-Wasm metadata is accepted only far enough to produce migration diagnostics: package checks and discovery reject `kind = "wasm"` / `abi = "yoi-plugin-wasm-1"`, `list`/`show` report those packages as rejected rather than active/eligible, and the active runtime path does not execute them.
 
 The component runtime uses `wasmtime::component` and expects the exported world
 `yoi:plugin/tool@1.0.0` with a `call(tool-name: string, input-json: string) ->
-string` export. The returned string is the same ToolOutput JSON used by the raw
-runtime, so registration and execution still flow through the existing
-ToolRegistry and Worker Tool-result history path.
+string` export. The returned string is the normal ToolOutput JSON, so
+registration and execution still flow through the existing ToolRegistry and
+Worker Tool-result history path.
 
 Host imports are stable names under `yoi:host/*@1.0.0`; the repository WIT files
 live in `resources/plugin/wit/`. Importing `yoi:host/request@1.0.0` or

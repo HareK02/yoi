@@ -31,3 +31,243 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-24T20:13:18Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- Dashboard Queue により人間が Orchestrator routing を許可した queued Ticket として確認した。
+- Ticket body は legacy raw `wasm` runtime redesign のうち最初の concrete slice として、Pod runtime 内の `PluginInstanceRuntime::LegacyToolAdapter` 相当 active execution path を削除し、`wasm-component` / Component Model path を唯一の active runtime path にする範囲に限定している。
+- Manifest / CLI diagnostics rejection、Service / Ingress event queue、WebSocket driver、WIT / PDK / templates は明示的に non-goal / 後続 Ticket に分割されている。
+- `TicketRelationQuery` は 1 件で、この Ticket は後続 Ticket から参照される dependency chain の先頭であり、blocking outgoing dependency はない。
+- `TicketOrchestrationPlanQuery` は routing 前 plan 0 件。accepted plan `orch-plan-20260624-201247-1` を記録済み。
+- bounded context check で `crates/pod/src/feature/plugin.rs` の `LegacyToolAdapter` / raw `wasm` active path、`crates/manifest/src/plugin.rs` と `crates/yoi/src/plugin_cli.rs` の legacy manifest/diagnostic fixtures、docs の transitional runtime 記述を確認した。Ticket は manifest rejection を後続 Ticket に分けているため、残る不確実性は local implementation / test update に収まる。
+
+Evidence checked:
+- Ticket body / thread: `item.md`, `thread.md`。thread は create、planning->ready、ready->queued のみで未解決 blocker は記録されていない。
+- Relations / orchestration plan: relation 1 件（後続 Ticket がこの Ticket に依存する view）、routing 前 plan 0 件。
+- Code/docs context: `crates/pod/src/feature/plugin.rs` の `LegacyToolAdapter` / raw WASM handling、`crates/manifest/src/plugin.rs` / `crates/yoi/src/plugin_cli.rs` の legacy runtime constants/tests、Plugin docs の current transition notes。
+- Workspace state: `/home/hare/Projects/yoi/.worktree/orchestration` は clean。inprogress Ticket は 0 件。
+- Queue context: 他の queued Plugin follow-up Tickets は dependency chain 上でこの Ticket の完了後に進める。
+
+IntentPacket:
+
+Intent:
+- Pod Plugin runtime の active execution path から legacy raw core-WASM Tool adapter を削除し、Plugin Tool execution を Component Model runtime path に一本化する。
+
+Binding decisions / invariants:
+- この Ticket では active runtime execution path を整理する。Manifest / CLI の外向き rejection UX は後続 `00001KVXK0WDH` の範囲として残す。
+- Component Model Plugin Tool execution、Host API grant boundary、package discovery、enablement、digest pinning、ToolRegistry registration は維持する。
+- raw core-WASM path を compatibility fallback として active execution に残さない。
+- Service / Ingress event runtime、WebSocket driver、WIT/PDK/templates service event update は実装しない。
+- broad Plugin redesign や public registry/install/update policy に範囲を広げない。
+
+Requirements / acceptance criteria:
+- `PluginInstanceRuntime::LegacyToolAdapter` または同等の legacy raw-WASM adapter が active runtime から削除される。
+- raw `wasm` runtime を通じた Plugin Tool execution path が使われない。
+- Component Model Plugin Tool execution tests が通る。
+- Legacy runtime 削除に伴う dead code / dead tests / obsolete fixtures が整理される。
+- Discovery / enablement / Tool registration / grant validation の既存挙動が壊れない。
+
+Implementation latitude:
+- `PluginInstanceRuntime` enum の shape を単一 component path に畳むか、名前を残して variant を整理するかは既存 code style に合わせてよい。
+- Manifest layer の legacy constants/tests は、active runtime removal に必要な最小限だけ調整してよい。ただし user-facing rejection/diagnostic completion は後続 Ticket に残す。
+- Docs の compatibility/transitional wording は、active runtime removal と矛盾する部分を最小限更新してよい。
+
+Escalate if:
+- Component Model path だけでは既存 Tool execution / grant validation / ToolRegistry registration を維持できない。
+- Manifest/CLI outward rejection を同時実装しないと build/test が成立しない。
+- Wasmtime/component runtime limits or sandbox boundaries を再設計する必要がある。
+- Service/Ingress/WebSocket/WIT/PDK の設計変更が必要になる。
+
+Validation:
+- `cargo test -p pod`
+- `cargo check -p yoi`
+- `git diff --check`
+- `nix build .#yoi --no-link`
+- 必要に応じて focused Plugin tests / `cargo test -p manifest` / `cargo test -p yoi plugin_cli`。
+
+Current code/docs map:
+- Primary: `crates/pod/src/feature/plugin.rs`。
+- Secondary: `crates/manifest/src/plugin.rs`, `crates/yoi/src/plugin_cli.rs`, Plugin docs/templates only as needed for active runtime removal consistency。
+- Avoid: full service runtime, WebSocket driver, WIT/PDK event model, remote plugin registry, root/original workspace operations。
+
+Critical risks / reviewer focus:
+- legacy raw-WASM execution path accidentally remains as fallback。
+- Component Model Tool execution regression。
+- host API grant / digest pinning / enablement / ToolRegistry registration regression。
+- scope creep into manifest rejection or Service/Ingress runtime beyond this slice。
+
+Next action:
+- `queued -> inprogress` を記録してから worktree-workflow で `/home/hare/Projects/yoi/.worktree/00001KVXK0WD3-remove-legacy-wasm-runtime` を作成し、multi-agent-workflow で Coder/Reviewer sibling loop に進める。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-24T20:14:08Z from: queued to: inprogress reason: orchestrator_acceptance_unblocked field: state -->
+
+## State changed
+
+Orchestrator acceptance: queued -> inprogress
+
+- 直前確認で `TicketShow` は state `queued`、blocking outgoing relation は 0 件、accepted plan `orch-plan-20260624-201247-1` を確認した。
+- 後続 queued Tickets (`00001KVXK0WDH`, `00001KVXK0WDQ`, `00001KVXK0WDX`, `00001KVXK0WE4`, `00001KVXK0WEA`) は dependency chain 上この Ticket またはその後続 prerequisites に blocked として orchestration plan に記録済み。
+- routing decision と IntentPacket は Ticket thread に記録済み。
+- これ以降に worktree-workflow で `/home/hare/Projects/yoi/.worktree/00001KVXK0WD3-remove-legacy-wasm-runtime` を作成し、multi-agent-workflow に接続する。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-24T20:14:56Z -->
+
+## Implementation report
+
+Implementation orchestration update:
+
+- queue review で dependency chain を確認し、`00001KVXK0WD3` のみを先頭 prerequisite として受理した。
+- 後続 queued Tickets (`00001KVXK0WDH`, `00001KVXK0WDQ`, `00001KVXK0WDX`, `00001KVXK0WE4`, `00001KVXK0WEA`) は relation/orchestration plan 上の dependency blocker として待機理由を記録した。
+- worktree-workflow に従い、implementation worktree `/home/hare/Projects/yoi/.worktree/00001KVXK0WD3-remove-legacy-wasm-runtime` と branch `work/00001KVXK0WD3-remove-legacy-wasm-runtime` を作成した。
+- child worktree では tracked `.yoi` project records を見える状態にし、`.yoi/memory`、local/runtime/log/lock/secret-like `.yoi` paths を sparse-checkout で除外する方針にした。
+- Coder Pod `yoi-coder-00001KVXK0WD3-legacy-wasm-removal` を sibling として起動した。write scope は child worktree に限定し、runtime workspace root `/home/hare/Projects/yoi` は startup 要件を満たすため non-recursive read のみにした。
+- Coder には root/original workspace と orchestration worktree で read/write/validation/git operation を行わないよう明示した。
+
+---
+
+<!-- event: implementation_report author: yoi-coder-00001KVXK0WD3-legacy-wasm-removal at: 2026-06-24T20:43:50Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装概要:
+- `PluginInstanceRuntime::LegacyToolAdapter` 相当の raw core-WASM fallback 実行経路を削除した。
+- `wasm-component` の Tool world は `ComponentToolAdapter` として明示的に扱い、ToolRegistry 経由の実行は `run_plugin_component_tool` のみを使うよう変更した。
+- raw `wasm` runtime metadata は static inspection / instance startup の両方で非対応として扱い、実行 fallback しないようにした。
+- Component Model Plugin Tool / Component Instance 実行経路、host API grant boundary、ToolRegistry 登録経路は維持した。
+- raw WASM 実行用の `wasmi` 依存・テスト・古い helper を削除した。
+- `package.nix` の `cargoHash` を更新した。
+- Component Model design doc の現状記述を active runtime に合わせて更新した。
+
+変更ファイル:
+- `crates/pod/src/feature/plugin.rs`
+- `crates/pod/Cargo.toml`
+- `Cargo.lock`
+- `package.nix`
+- `docs/design/plugin-component-model.md`
+
+Validation:
+- `cargo test -p pod feature::plugin --lib`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+- `cargo test -p pod`: failed in unrelated prompt snapshot tests:
+  - `workflow::tests::workflow_usage_guidance_contract_snapshot_matches_prompt_resource`
+  - `tests::companion_prompt_matches_resource_snapshot`
+
+Commit:
+- `741d71327aec213e564d47a4b4c37141c727803c refactor: remove legacy wasm plugin runtime`
+
+Residual risks / notes:
+- Full `cargo test -p pod` failure appears unrelated to this Plugin runtime change and was not fixed here.
+- Follow-up Ticket `00001KVXK0WDH` remains responsible for manifest / CLI legacy runtime rejection UX. This implementation only removes active runtime fallback and minimal static inspection consistency.
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KVXK0WD3-legacy-wasm-removal at: 2026-06-24T20:48:55Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+確認範囲:
+- child worktree `/home/hare/Projects/yoi/.worktree/00001KVXK0WD3-remove-legacy-wasm-runtime` のみで read-only inspection。
+- Ticket / IntentPacket / `1b5a39db..HEAD` の diff を確認。
+- reviewer では cargo/nix は再実行していない。`git diff --check 1b5a39db..HEAD` は問題なし。
+
+承認根拠:
+- Ticket / IntentPacket の核心である「Pod Plugin runtime の active execution path から legacy raw core-WASM Tool adapter を削除し、Component Model path に一本化」が満たされている。
+- `crates/pod/src/feature/plugin.rs` から `LegacyToolAdapter` / `PluginWasmTool` / `run_plugin_wasm_tool` / `wasmi` host adapter 系が削除され、`crates/pod/Cargo.toml` からも `wasmi` dependency が削除されている。
+- raw `wasm` runtime は static inspection で `eligible: false` かつ active execution path ではない diagnostic になり、`PluginInstanceRuntime::new` でも `PLUGIN_RUNTIME_WASM_KIND` が fail-closed するため、fallback 実行は残っていない。
+- Component Model Tool path は `ComponentToolAdapter -> run_plugin_component_tool -> read_resolved_plugin_runtime_component -> wasmtime::component` に整理され、ToolRegistry 登録も既存の `ToolContribution` / `plugin_instance_tool_definition` 経由を維持している。
+- Host API grant / digest binding / tool permission validation は `authorize_plugin_tool`、`authorize_plugin_host_api`、`validate_component_imports` 側で維持され、component import permission/grant check tests も残っている。
+- Manifest / CLI rejection UX には踏み込んでおらず、raw `wasm` constants / manifest parsing が残っているのは後続 Ticket `00001KVXK0WDH` の範囲として許容できる。
+- Service / Ingress / WebSocket / WIT / PDK runtime への不要な scope creep は見当たらない。
+
+Non-blocking notes:
+- 報告された `cargo test -p pod` 全体失敗は prompt snapshot 2 件で、今回 diff の変更対象外に見えるため blocker とは判断しない。ただし完了処理時には既知 unrelated failure として扱う根拠を残すか、別対応後に再実行するのが安全。
+- `docs/development/plugin-development.md` には raw core-Wasm compatibility がまだ有効に読める文言が残っている。今回 Ticket の主目的は active runtime removal で、外向き rejection/docs 全面更新は後続範囲なので blocker ではないが、後続 Ticket で整理した方がよい。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-24T20:50:37Z -->
+
+## Implementation report
+
+Integration outcome:
+
+- Coder `yoi-coder-00001KVXK0WD3-legacy-wasm-removal` が implementation branch `work/00001KVXK0WD3-remove-legacy-wasm-runtime` に実装を commit した。
+  - implementation commit: `741d7132 refactor: remove legacy wasm plugin runtime`
+- Reviewer `yoi-reviewer-00001KVXK0WD3-legacy-wasm-removal` は read-only review で `approve`。legacy raw-WASM fallback execution path が削除され、Component Model Tool path、host API grant、digest binding、ToolRegistry registration が維持され、manifest/CLI rejection や Service/Ingress/WebSocket/WIT/PDK へ scope creep していないことを確認した。
+- Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration` で branch `work/00001KVXK0WD3-remove-legacy-wasm-runtime` を merge 済み。
+  - merge commit: `29953111 merge: 00001KVXK0WD3 legacy wasm removal`
+
+Implemented behavior:
+- `crates/pod/src/feature/plugin.rs` から `LegacyToolAdapter` / raw core-WASM Tool execution helper / `wasmi` host adapter 系を削除。
+- raw `wasm` runtime は static inspection と instance startup で fail-closed / non-executable diagnostic になり、active fallback execution path は残していない。
+- Component Model Tool runtime path は `ComponentToolAdapter` / `run_plugin_component_tool` / `wasmtime::component` に整理。
+- `crates/pod/Cargo.toml` から `wasmi` dependency を削除し、`Cargo.lock` と `package.nix` cargoHash を更新。
+- `docs/design/plugin-component-model.md` の transitional runtime wording を active runtime removal に合わせて最小更新。
+
+Validation in Orchestrator worktree:
+- `cargo test -p pod feature::plugin --lib`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+- `cargo test -p pod`: failed in two prompt guidance snapshot assertions that are outside this Plugin diff:
+  - `prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`
+  - `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`
+  - Plugin focused tests within the same full run passed, including `core_wasm_is_not_silently_reinterpreted_as_component`, component execution, component grant/import, lifecycle, memory/table/output cap tests.
+
+Notes:
+- Full `cargo test -p pod` failure is recorded as an existing/unrelated prompt-resource assertion issue and not treated as this Ticket blocker because changed files do not touch prompt resources or those test modules, focused Plugin tests pass, reviewer approved, and `nix build .#yoi --no-link` succeeds.
+- Follow-up `00001KVXK0WDH` remains responsible for external manifest/CLI rejection diagnostics and broader docs cleanup such as `docs/development/plugin-development.md` compatibility wording.
+
+Next action:
+- Mark Ticket done after this integration/validation evidence.
+- Then stop related child Pods and remove only the child implementation worktree/branch.
+- Dependency-unblocked queued Ticket `00001KVXK0WDH` can be re-routed next.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-24T20:50:45Z from: inprogress to: done reason: merged_validated_with_unrelated_full_suite_caveat field: state -->
+
+## State changed
+
+Implementation is merged into the orchestration branch and validated with one unrelated existing full-suite caveat.
+
+Evidence:
+- merge commit: `29953111 merge: 00001KVXK0WD3 legacy wasm removal`
+- reviewer result: approve
+- validation in `/home/hare/Projects/yoi/.worktree/orchestration`:
+  - `cargo test -p pod feature::plugin --lib`: success
+  - `cargo check -p yoi`: success
+  - `git diff --check`: success
+  - `nix build .#yoi --no-link`: success
+  - `cargo test -p pod`: failed only in prompt guidance snapshot assertions outside this Plugin diff; focused Plugin tests in the same run passed.
+
+Closure is not performed here; this state records implementation completion after merge/review/focused validation.
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-24T20:51:02Z -->
+
+## Implementation report
+
+Correction:
+
+- 直前の integration outcome / state-change body に記載した merge commit `29953111` は誤記。
+- 正しい merge commit は `bedbb670 merge: 00001KVXK0WD3 legacy wasm removal`。
+- 実装 commit `741d7132`、review approve、validation results、Ticket done 判断には変更なし。
+
+---

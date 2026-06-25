@@ -9,10 +9,10 @@ use manifest::plugin::{
     MaterializedPluginPackage, PluginConfig, PluginDiagnostic, PluginDiagnosticKind,
     PluginDiagnosticPhase, PluginDiscoveryLimits, PluginDiscoveryOptions, PluginDiscoveryReport,
     PluginExactVersion, PluginGrantConfig, PluginPackageManifest, PluginPermission,
-    PluginResolution, PluginSourceKind, PluginSurface, RUST_COMPONENT_TOOL_TEMPLATE,
-    ResolvedPlugin, ResolvedPluginRecord, SourceQualifiedPluginId, discover_plugins,
-    read_plugin_directory, read_plugin_package_file, resolve_enabled_plugins,
-    write_plugin_package_file,
+    PluginResolution, PluginSourceKind, PluginSurface, PluginTemplateResource,
+    RUST_COMPONENT_INSTANCE_TEMPLATE, RUST_COMPONENT_TOOL_TEMPLATE, ResolvedPlugin,
+    ResolvedPluginRecord, SourceQualifiedPluginId, discover_plugins, read_plugin_directory,
+    read_plugin_package_file, resolve_enabled_plugins, write_plugin_package_file,
 };
 use manifest::{ProfileResolveOptions, ProfileResolver, ProfileSelector, paths};
 use pod::feature::plugin::{PluginStaticInspection, inspect_resolved_plugin_static};
@@ -85,27 +85,29 @@ pub(crate) fn run(command: PluginCliCommand) -> Result<()> {
 }
 
 fn render_new(template: &str, destination: &Path, args: &PluginCliArgs) -> Result<String> {
-    if template != "rust-component-tool" {
-        return Err(format!(
-            "unsupported plugin template `{template}` (supported: rust-component-tool)"
-        )
-        .into());
+    let (template_name, resources) = embedded_template_resources(template)?;
+    materialize_template(destination, resources)?;
+    let mut next_steps = vec![
+        "Review plugin.toml and generated Rust source.".to_string(),
+        "Replace the placeholder plugin.component.wasm with a real built component before enabling or execution.".to_string(),
+        "Run `yoi plugin check <path>` and then `yoi plugin pack <path>`.".to_string(),
+    ];
+    if template == "rust-component-service" {
+        next_steps.insert(
+            1,
+            "Implement Service ingress logic in handle_ingress and return ServiceOutput output_commands for host-owned WebSocket sends.".to_string(),
+        );
     }
-    materialize_template(destination)?;
     let report = NewReport {
         command: "new",
-        template: "rust-component-tool",
+        template: template_name,
         destination: destination.display().to_string(),
-        files: RUST_COMPONENT_TOOL_TEMPLATE
+        files: resources
             .iter()
             .map(|resource| resource.path.to_string())
             .collect(),
         safety: AuthoringSafetyReport::default(),
-        next_steps: vec![
-            "Review plugin.toml and generated Rust source.".to_string(),
-            "Replace the placeholder plugin.component.wasm with a real built component before enabling or execution.".to_string(),
-            "Run `yoi plugin check <path>` and then `yoi plugin pack <path>`.".to_string(),
-        ],
+        next_steps,
     };
     if args.json {
         return Ok(format!("{}\n", serde_json::to_string_pretty(&report)?));
@@ -113,7 +115,23 @@ fn render_new(template: &str, destination: &Path, args: &PluginCliArgs) -> Resul
     render_new_human(&report)
 }
 
-fn materialize_template(destination: &Path) -> Result<()> {
+fn embedded_template_resources(
+    template: &str,
+) -> Result<(&'static str, &'static [PluginTemplateResource])> {
+    match template {
+        "rust-component-tool" => Ok(("rust-component-tool", RUST_COMPONENT_TOOL_TEMPLATE)),
+        "rust-component-service" => Ok(("rust-component-service", RUST_COMPONENT_INSTANCE_TEMPLATE)),
+        _ => Err(format!(
+            "unsupported plugin template `{template}` (supported: rust-component-tool, rust-component-service)"
+        )
+        .into()),
+    }
+}
+
+fn materialize_template(
+    destination: &Path,
+    resources: &'static [PluginTemplateResource],
+) -> Result<()> {
     match fs::symlink_metadata(destination) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
@@ -144,7 +162,7 @@ fn materialize_template(destination: &Path) -> Result<()> {
         Err(error) => return Err(error.into()),
     }
 
-    for resource in RUST_COMPONENT_TOOL_TEMPLATE {
+    for resource in resources {
         let relative = safe_template_relative_path(resource.path)?;
         let path = destination.join(relative);
         if let Some(parent) = path.parent() {
@@ -1854,6 +1872,39 @@ mod tests {
     }
 
     #[test]
+    fn legacy_raw_wasm_package_is_rejected_not_active_or_eligible() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        fs::create_dir_all(workspace.join(".yoi/plugins")).unwrap();
+        write_stored_zip(
+            &workspace.join(".yoi/plugins/legacy.yoi-plugin"),
+            &[
+                ("plugin.toml", plugin_legacy_manifest("legacy").as_bytes()),
+                ("plugin.wasm", b"not wasm"),
+            ],
+        );
+
+        let snapshot = inspect_snapshot(workspace, &PluginConfig::default());
+        let legacy = select_item(&snapshot, "project:legacy").unwrap();
+        assert_eq!(legacy.status, "rejected");
+        assert!(!legacy.discovered);
+        assert!(!legacy.configured);
+        assert!(legacy.enabled_surfaces.is_empty());
+        assert!(legacy.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == "api"
+                && diagnostic.message.contains("legacy raw wasm")
+                && diagnostic.message.contains("wasm-component")
+        }));
+
+        let list_output = render_list_snapshot_human(&snapshot).unwrap();
+        assert!(list_output.contains("project:legacy [rejected]"));
+        assert!(!list_output.contains("project:legacy [active]"));
+        let show_output = render_item_human(legacy).unwrap();
+        assert!(show_output.contains("status: rejected"));
+        assert!(show_output.contains("legacy raw wasm"));
+    }
+
+    #[test]
     fn configured_invalid_or_incompatible_package_is_rejected_not_missing() {
         let dir = tempdir().unwrap();
         let workspace = dir.path();
@@ -1867,7 +1918,7 @@ mod tests {
             &workspace.join(".yoi/plugins/incompat.yoi-plugin"),
             &[
                 ("plugin.toml", incompatible_manifest.as_bytes()),
-                ("plugin.wasm", b"not wasm"),
+                ("plugin.component.wasm", b"not wasm"),
             ],
         );
         let mut config = PluginConfig::default();
@@ -1934,7 +1985,7 @@ mod tests {
         fs::create_dir_all(workspace.join(".yoi/plugins")).unwrap();
         write_stored_zip(
             &workspace.join(".yoi/plugins/no_manifest.yoi-plugin"),
-            &[("plugin.wasm", b"not wasm")],
+            &[("plugin.component.wasm", b"not wasm")],
         );
         let missing_runtime_manifest = plugin_manifest_missing_runtime_entry("missing_runtime");
         write_stored_zip(
@@ -2103,6 +2154,65 @@ mod tests {
         let human_check = render_check(&destination, &PluginCliArgs::default()).unwrap();
         assert!(human_check.contains("[partial]"));
         assert!(human_check.contains("not ready to enable"));
+
+        let service_destination = dir.path().join("my-service-plugin");
+        let service_json = render_new(
+            "rust-component-service",
+            &service_destination,
+            &PluginCliArgs {
+                json: true,
+                ..PluginCliArgs::default()
+            },
+        )
+        .unwrap();
+        let service_value: serde_json::Value = serde_json::from_str(&service_json).unwrap();
+        assert_eq!(service_value["template"], "rust-component-service");
+        assert!(
+            service_value["next_steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Service ingress"))
+        );
+        for resource in RUST_COMPONENT_INSTANCE_TEMPLATE {
+            assert!(
+                service_destination.join(resource.path).is_file(),
+                "missing service {}",
+                resource.path
+            );
+        }
+        let manifest = fs::read_to_string(service_destination.join("plugin.toml")).unwrap();
+        assert!(manifest.contains("kind = \"wasm-component\""));
+        assert!(manifest.contains("[[services]]"));
+        assert!(manifest.contains("[[ingresses]]"));
+        assert!(manifest.contains("{ kind = \"host_api\", api = \"websocket\" }"));
+        assert!(manifest.contains("[[websocket]]"));
+        assert!(manifest.contains("host = \"example.com\""));
+        assert!(manifest.contains("path_prefixes = [\"/socket\"]"));
+        let source = fs::read_to_string(service_destination.join("src/lib.rs")).unwrap();
+        assert!(source.contains("ServiceOutput::websocket_send"));
+        assert!(!source.contains("recv(timeout"));
+        let service_check = render_check(&service_destination, &PluginCliArgs::default()).unwrap();
+        assert!(service_check.contains("plugin check:"));
+        assert!(service_check.contains("service"));
+        let service_package = dir.path().join("my-service-plugin.yoi-plugin");
+        let service_pack_json = render_pack(
+            &service_destination,
+            Some(&service_package),
+            &PluginCliArgs {
+                json: true,
+                ..PluginCliArgs::default()
+            },
+        )
+        .unwrap();
+        let service_pack_value: serde_json::Value =
+            serde_json::from_str(&service_pack_json).unwrap();
+        assert_eq!(service_pack_value["status"], "packed");
+        assert!(service_package.is_file());
+
         let error = render_new(
             "rust-component-tool",
             &destination,
@@ -2140,7 +2250,7 @@ mod tests {
             plugin_manifest("echo", "echo", "object", &["echo"]),
         )
         .unwrap();
-        fs::write(plugin.join("plugin.wasm"), b"not wasm").unwrap();
+        fs::write(plugin.join("plugin.component.wasm"), b"not wasm").unwrap();
 
         let human = render_check(&plugin, &PluginCliArgs::default()).unwrap();
         assert!(human.contains("[active]"));
@@ -2161,6 +2271,42 @@ mod tests {
         assert_eq!(value["input_kind"], "directory");
         assert_eq!(value["package"]["reference"], "project:echo");
         assert_eq!(value["safety"]["no_plugin_execution"], true);
+    }
+
+    #[test]
+    fn plugin_check_rejects_legacy_raw_wasm_package() {
+        let dir = tempdir().unwrap();
+        let plugin = dir.path().join("legacy");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::write(plugin.join("plugin.toml"), plugin_legacy_manifest("legacy")).unwrap();
+        fs::write(plugin.join("plugin.wasm"), b"not wasm").unwrap();
+
+        let report = build_check_report(&plugin);
+        assert_eq!(report.status, "rejected");
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == "api"
+                && diagnostic.message.contains("legacy raw wasm")
+                && diagnostic.message.contains("wasm-component")
+        }));
+        let human = render_check_report(&report, &PluginCliArgs::default()).unwrap();
+        assert!(human.contains("[rejected]"));
+        assert!(human.contains("legacy raw wasm"));
+        let json = render_check_report(
+            &report,
+            &PluginCliArgs {
+                json: true,
+                ..PluginCliArgs::default()
+            },
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["status"], "rejected");
+        assert!(
+            value["diagnostics"][0]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("wasm-component")
+        );
     }
 
     #[test]
@@ -2228,7 +2374,7 @@ mod tests {
             plugin_manifest("echo", "echo", "object", &["echo"]),
         )
         .unwrap();
-        fs::write(plugin.join("plugin.wasm"), b"not wasm").unwrap();
+        fs::write(plugin.join("plugin.component.wasm"), b"not wasm").unwrap();
         let first = dir.path().join("first.yoi-plugin");
         let second = dir.path().join("second.yoi-plugin");
 
@@ -2466,9 +2612,9 @@ surfaces = ["tool"]
 permissions = [{{ kind = "surface", surface = "tool" }}, {{ kind = "tool", name = "Echo" }}]
 
 [runtime]
-kind = "wasm"
-entry = "missing.wasm"
-abi = "yoi-plugin-wasm-1"
+kind = "wasm-component"
+component = "missing.component.wasm"
+world = "yoi:plugin/tool@1.0.0"
 
 [[tools]]
 name = "Echo"
@@ -2500,14 +2646,36 @@ surfaces = ["tool"]
 permissions = [{{ kind = "surface", surface = "tool" }}, {permissions}]
 
 [runtime]
-kind = "wasm"
-entry = "plugin.wasm"
-abi = "yoi-plugin-wasm-1"
+kind = "wasm-component"
+component = "plugin.component.wasm"
+world = "yoi:plugin/tool@1.0.0"
 
 [[tools]]
 name = "{tool_name}"
 description = "Test tool"
 input_schema = {{ type = "{schema_type}" }}
+"#
+        )
+    }
+
+    fn plugin_legacy_manifest(id: &str) -> String {
+        format!(
+            r#"
+schema_version = 1
+id = "{id}"
+name = "{id}"
+version = "0.1.0"
+surfaces = ["tool"]
+
+[runtime]
+kind = "wasm"
+entry = "plugin.wasm"
+abi = "yoi-plugin-wasm-1"
+
+[[tools]]
+name = "Echo"
+description = "Legacy raw wasm tool"
+input_schema = {{ type = "object" }}
 "#
         )
     }
@@ -2523,9 +2691,9 @@ surfaces = ["tool"]
 permissions = [{{ kind = "surface", surface = "tool" }}, {{ kind = "tool", name = "Echo" }}]
 
 [runtime]
-kind = "wasm"
-entry = "plugin.wasm"
-abi = "yoi-plugin-wasm-1"
+kind = "wasm-component"
+component = "plugin.component.wasm"
+world = "yoi:plugin/tool@1.0.0"
 
 [[tools]]
 name = "Echo"
@@ -2547,9 +2715,9 @@ surfaces = ["tool"]
 permissions = [{{ kind = "surface", surface = "tool" }}, {{ kind = "tool", name = "Echo" }}, {{ kind = "tool", name = "Other" }}]
 
 [runtime]
-kind = "wasm"
-entry = "plugin.wasm"
-abi = "yoi-plugin-wasm-1"
+kind = "wasm-component"
+component = "plugin.component.wasm"
+world = "yoi:plugin/tool@1.0.0"
 
 [[tools]]
 name = "Echo"
@@ -2573,7 +2741,7 @@ input_schema = {{ type = "object" }}
             &package,
             &[
                 ("plugin.toml", manifest.as_bytes()),
-                ("plugin.wasm", b"not wasm"),
+                ("plugin.component.wasm", b"not wasm"),
             ],
         );
 

@@ -1,19 +1,21 @@
 //! Plugin package contributions for model-visible Tool schemas.
 //!
 //! This module registers *enabled* plugin package tool surface definitions and
-//! executes Tool calls through the minimal sandboxed `yoi-plugin-wasm-1` WASM
-//! ABI. It deliberately does not grant filesystem, environment, hook, service,
-//! ingress, or ambient network authority. WASM Tools can only reach outbound Request
-//! through the explicit `yoi:request` host import, and filesystem read/list/write
-//! through the explicit `yoi:fs` host import, with matching permissions and
-//! scoped allowlist grants.
+//! executes Tool calls through the sandboxed Component Model `wasm-component`
+//! runtime. It deliberately does not grant filesystem, environment, hook,
+//! service, ingress, or ambient network authority. Components can only reach
+//! host APIs through explicit imports with matching permissions and scoped
+//! allowlist grants.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -23,10 +25,9 @@ use llm_worker::tool::{
 };
 use manifest::plugin::{
     PLUGIN_COMPONENT_INSTANCE_WORLD, PLUGIN_COMPONENT_TOOL_WORLD, PLUGIN_RUNTIME_COMPONENT_KIND,
-    PLUGIN_RUNTIME_WASM_ABI, PLUGIN_RUNTIME_WASM_KIND, PluginConfig, PluginDiscoveryLimits,
-    PluginFsGrant, PluginFsOperation, PluginHostApi, PluginPermission, PluginRequestGrant,
-    PluginSurface, PluginToolManifest, PluginWebSocketGrant, ResolvedPluginRecord,
-    read_resolved_plugin_runtime_component, read_resolved_plugin_runtime_module,
+    PluginConfig, PluginDiscoveryLimits, PluginFsGrant, PluginFsOperation, PluginHostApi,
+    PluginPermission, PluginRequestGrant, PluginSurface, PluginToolManifest, PluginWebSocketGrant,
+    ResolvedPluginRecord, read_resolved_plugin_runtime_component,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,6 +36,9 @@ use tokio::runtime::{
 };
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+
+const LEGACY_PLUGIN_RUNTIME_WASM_KIND: &str = "wasm";
+const PLUGIN_SERVICE_WEBSOCKET_RECV_TIMEOUT: Duration = Duration::from_millis(250);
 
 use super::{
     FeatureDescriptor, FeatureId, FeatureInstallContext, FeatureInstallError, FeatureModule,
@@ -103,16 +107,18 @@ impl PluginToolFeature {
         &self,
         ingress_name: &str,
         event: PluginIngressEvent,
-    ) -> Result<PluginIngressDispatchReport, PluginWasmError> {
+    ) -> Result<PluginIngressDispatchReport, PluginIngressDispatchError> {
         if !surface_enabled(&self.record, PluginSurface::Ingress) {
-            return Err(PluginWasmError::Module(
+            return Err(PluginIngressDispatchError::InvalidEvent(
                 "plugin ingress surface is not enabled".to_string(),
             ));
         }
         let handle = self
             .registry
             .handle(&self.record.identity.to_string())
-            .ok_or_else(|| PluginWasmError::Module("plugin instance is not started".to_string()))?;
+            .ok_or_else(|| PluginIngressDispatchError::ServiceUnavailable {
+                state: PluginInstanceLifecycleState::Stopped,
+            })?;
         handle.deliver_ingress(ingress_name, event)
     }
 
@@ -216,29 +222,6 @@ pub struct PluginSurfaceEligibility {
 pub fn inspect_resolved_plugin_static(record: &ResolvedPluginRecord) -> PluginStaticInspection {
     let runtime = match &record.manifest.runtime {
         Some(runtime)
-            if runtime.kind == PLUGIN_RUNTIME_WASM_KIND
-                && runtime.abi.as_deref() == Some(PLUGIN_RUNTIME_WASM_ABI)
-                && runtime.entry.is_some() =>
-        {
-            PluginRuntimeEligibility {
-                eligible: true,
-                status: format!("{PLUGIN_RUNTIME_WASM_KIND}/{PLUGIN_RUNTIME_WASM_ABI}"),
-                diagnostic: None,
-            }
-        }
-        Some(runtime) if runtime.kind == PLUGIN_RUNTIME_WASM_KIND => {
-            let status = runtime
-                .abi
-                .as_deref()
-                .map(|abi| format!("{PLUGIN_RUNTIME_WASM_KIND}/{abi}"))
-                .unwrap_or_else(|| format!("{PLUGIN_RUNTIME_WASM_KIND}/<missing-abi>"));
-            PluginRuntimeEligibility {
-                eligible: false,
-                status,
-                diagnostic: Some("unsupported or missing plugin runtime ABI".to_string()),
-            }
-        }
-        Some(runtime)
             if runtime.kind == PLUGIN_RUNTIME_COMPONENT_KIND
                 && matches!(
                     runtime.world.as_deref(),
@@ -257,6 +240,21 @@ pub fn inspect_resolved_plugin_static(record: &ResolvedPluginRecord) -> PluginSt
                         .unwrap_or(PLUGIN_COMPONENT_TOOL_WORLD)
                 ),
                 diagnostic: None,
+            }
+        }
+        Some(runtime) if runtime.kind == LEGACY_PLUGIN_RUNTIME_WASM_KIND => {
+            let status = runtime
+                .abi
+                .as_deref()
+                .map(|abi| format!("{LEGACY_PLUGIN_RUNTIME_WASM_KIND}/{abi}"))
+                .unwrap_or_else(|| format!("{LEGACY_PLUGIN_RUNTIME_WASM_KIND}/<missing-abi>"));
+            PluginRuntimeEligibility {
+                eligible: false,
+                status,
+                diagnostic: Some(
+                    "legacy raw wasm plugin runtime is not an active execution path; use wasm-component"
+                        .to_string(),
+                ),
             }
         }
         Some(runtime) if runtime.kind == PLUGIN_RUNTIME_COMPONENT_KIND => {
@@ -2283,18 +2281,21 @@ fn permission_allows_tool(permissions: &[PluginPermission], tool_name: &str) -> 
     })
 }
 
-const PLUGIN_WASM_HOST_MODULE: &str = "yoi:tool";
-const PLUGIN_WASM_ENTRYPOINT: &str = "yoi_tool_call";
 const PLUGIN_WASM_MAX_INPUT_BYTES: usize = 64 * 1024;
 const PLUGIN_WASM_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const PLUGIN_WASM_MAX_SUMMARY_BYTES: usize = 1024;
 const PLUGIN_WASM_FUEL: u64 = 5_000_000;
 const PLUGIN_WASM_TIMEOUT: Duration = Duration::from_secs(1);
+const PLUGIN_SERVICE_INGRESS_QUEUE_CAPACITY: usize = 32;
+const PLUGIN_SERVICE_OUTPUT_COMMAND_MAX_COUNT: usize = 16;
+const PLUGIN_SERVICE_OUTPUT_COMMAND_MAX_PAYLOAD_BYTES: usize = 16 * 1024;
+const PLUGIN_SERVICE_OUTPUT_COMMAND_MAX_RESULTS: usize = 32;
+#[cfg(test)]
+const PLUGIN_SERVICE_INGRESS_DISPATCH_TIMEOUT: Duration = Duration::from_millis(25);
+#[cfg(not(test))]
+const PLUGIN_SERVICE_INGRESS_DISPATCH_TIMEOUT: Duration = Duration::from_secs(1);
 const PLUGIN_WASM_MEMORY_BYTES: usize = 2 * 1024 * 1024;
 const PLUGIN_WASM_TABLE_ELEMENTS: usize = 256;
-const PLUGIN_WASM_REQUEST_MODULE: &str = "yoi:request";
-const PLUGIN_WASM_WEBSOCKET_MODULE: &str = "yoi:websocket";
-const PLUGIN_WASM_FS_MODULE: &str = "yoi:fs";
 const PLUGIN_REQUEST_MAX_REQUEST_BYTES: usize = 48 * 1024;
 const PLUGIN_REQUEST_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024;
 const PLUGIN_REQUEST_MAX_REQUEST_HEADERS: usize = 16;
@@ -2443,7 +2444,7 @@ struct PluginRequestResponse {
     truncated: bool,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PluginWebSocketOpenRequest {
     url: String,
@@ -2451,6 +2452,22 @@ struct PluginWebSocketOpenRequest {
     protocols: Vec<String>,
     #[serde(default)]
     headers: Vec<PluginRequestHeader>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginServiceWebSocketSendCommandPayload {
+    url: String,
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginServiceDiagnosticStatusCommandPayload {
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    status: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2946,24 +2963,85 @@ impl PluginRequestError {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum PluginInstanceLifecycleState {
     Ready,
-    Started,
+    Starting,
+    Running,
+    Stopping,
     Stopped,
     Failed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub enum PluginInstanceDiagnosticKind {
+    Lifecycle,
+    InvalidEvent,
+    QueueFull,
+    DispatchTimeout,
+    DispatchFailed,
+    ServiceUnavailable,
+    ServiceFailed,
+    ServiceStopped,
+    ServiceOutputCommandRecorded,
+    ServiceOutputCommandRejected,
+    ServiceOutputCommandUnsupported,
+    ServiceWebSocketConnected,
+    ServiceWebSocketClosed,
+    ServiceWebSocketError,
+    ServiceWebSocketSendFailed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PluginInstanceDiagnostic {
+    pub kind: PluginInstanceDiagnosticKind,
     pub state: PluginInstanceLifecycleState,
     pub message: String,
 }
 
 impl PluginInstanceDiagnostic {
     pub fn new(state: PluginInstanceLifecycleState, message: impl Into<String>) -> Self {
+        Self::with_kind(PluginInstanceDiagnosticKind::Lifecycle, state, message)
+    }
+
+    pub fn with_kind(
+        kind: PluginInstanceDiagnosticKind,
+        state: PluginInstanceLifecycleState,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
+            kind,
             state,
-            message: bounded_message(message.into()),
+            message: bounded_message(redact_secret_like(&message.into())),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct PluginIngressDispatchCounters {
+    pub enqueued: u64,
+    pub dispatched: u64,
+    pub rejected: u64,
+    pub failed: u64,
+    pub timed_out: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub enum PluginServiceWebSocketConnectionState {
+    Connecting,
+    Connected,
+    Closed,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PluginServiceWebSocketConnectionStatus {
+    pub url: String,
+    pub ingress_name: String,
+    pub state: PluginServiceWebSocketConnectionState,
+    pub last_frame_at: Option<String>,
+    pub last_error: Option<String>,
+    pub received_text_frames: u64,
+    pub sent_text_frames: u64,
+    pub queue_drops: u64,
+    pub send_failures: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -2971,6 +3049,14 @@ pub struct PluginInstanceStatus {
     pub plugin_ref: String,
     pub lifecycle: PluginInstanceLifecycleState,
     pub component_status: Option<Value>,
+    pub queue_depth: usize,
+    pub queue_capacity: usize,
+    pub last_error: Option<String>,
+    pub dispatch_counters: PluginIngressDispatchCounters,
+    /// Last bounded Service output command outcomes. These are produced only by
+    /// Service/Ingress dispatch and are intentionally separate from ToolOutput.
+    pub output_command_results: Vec<PluginServiceOutputCommandResult>,
+    pub websocket_connections: Vec<PluginServiceWebSocketConnectionStatus>,
     pub diagnostics: Vec<PluginInstanceDiagnostic>,
 }
 
@@ -2978,7 +3064,153 @@ pub struct PluginInstanceStatus {
 pub struct PluginIngressEvent {
     pub kind: String,
     pub source: String,
+    pub ingress_name: String,
     pub payload: Value,
+    pub created_at: String,
+    pub attempt: u32,
+    pub correlation_id: String,
+}
+
+impl PluginIngressEvent {
+    pub fn new(
+        ingress_name: impl Into<String>,
+        kind: impl Into<String>,
+        source: impl Into<String>,
+        payload: Value,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            source: source.into(),
+            ingress_name: ingress_name.into(),
+            payload,
+            created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            attempt: 1,
+            correlation_id: uuid::Uuid::now_v7().to_string(),
+        }
+    }
+}
+
+/// Host-validated output command envelope returned by Service/Ingress handlers.
+///
+/// Service output commands are intentionally distinct from ordinary plugin
+/// `ToolOutput`: handlers can request bounded side effects, but the host parses,
+/// validates, grant-checks, records diagnostics, and fail-closes before executing
+/// any supported command.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginServiceOutputCommandEnvelope {
+    pub correlation_id: String,
+    pub source_event_id: String,
+    pub command_id: String,
+    pub kind: PluginServiceOutputCommandKind,
+    pub payload: Value,
+    pub requested_at: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginServiceOutputCommandKind {
+    DiagnosticStatusUpdate,
+    HostRequestDispatch,
+    #[serde(rename = "websocket_send")]
+    WebSocketSend,
+}
+
+impl PluginServiceOutputCommandKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DiagnosticStatusUpdate => "diagnostic_status_update",
+            Self::HostRequestDispatch => "host_request_dispatch",
+            Self::WebSocketSend => "websocket_send",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub enum PluginServiceOutputCommandStatus {
+    Recorded,
+    Rejected,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PluginServiceOutputCommandResult {
+    pub correlation_id: Option<String>,
+    pub source_event_id: Option<String>,
+    pub command_id: Option<String>,
+    pub kind: Option<PluginServiceOutputCommandKind>,
+    pub status: PluginServiceOutputCommandStatus,
+    pub message: String,
+    pub recorded_at: String,
+}
+
+impl PluginServiceOutputCommandResult {
+    fn rejected(message: impl Into<String>) -> Self {
+        Self::from_parts(
+            None,
+            None,
+            None,
+            None,
+            PluginServiceOutputCommandStatus::Rejected,
+            message,
+        )
+    }
+
+    fn rejected_for(
+        command: &PluginServiceOutputCommandEnvelope,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::from_command(command, PluginServiceOutputCommandStatus::Rejected, message)
+    }
+
+    fn unsupported(
+        command: &PluginServiceOutputCommandEnvelope,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::from_command(
+            command,
+            PluginServiceOutputCommandStatus::Unsupported,
+            message,
+        )
+    }
+
+    fn recorded(command: &PluginServiceOutputCommandEnvelope, message: impl Into<String>) -> Self {
+        Self::from_command(command, PluginServiceOutputCommandStatus::Recorded, message)
+    }
+
+    fn from_command(
+        command: &PluginServiceOutputCommandEnvelope,
+        status: PluginServiceOutputCommandStatus,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::from_parts(
+            Some(command.correlation_id.clone()),
+            Some(command.source_event_id.clone()),
+            Some(command.command_id.clone()),
+            Some(command.kind),
+            status,
+            message,
+        )
+    }
+
+    fn from_parts(
+        correlation_id: Option<String>,
+        source_event_id: Option<String>,
+        command_id: Option<String>,
+        kind: Option<PluginServiceOutputCommandKind>,
+        status: PluginServiceOutputCommandStatus,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            correlation_id,
+            source_event_id,
+            command_id,
+            kind,
+            status,
+            message: bounded_message(redact_secret_like(&message.into())),
+            recorded_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -2987,7 +3219,81 @@ pub struct PluginIngressDispatchReport {
     pub ingress: String,
     pub accepted: bool,
     pub output: Value,
+    /// Results of host-side Service output command parsing/validation/grant-checking.
+    /// This path never feeds ordinary plugin ToolOutput handling.
+    pub output_command_results: Vec<PluginServiceOutputCommandResult>,
+    pub queue_depth: usize,
+    pub dispatch_counters: PluginIngressDispatchCounters,
     pub diagnostics: Vec<PluginInstanceDiagnostic>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PluginIngressDispatchError {
+    InvalidEvent(String),
+    QueueFull { capacity: usize },
+    ServiceUnavailable { state: PluginInstanceLifecycleState },
+    ServiceFailed(String),
+    ServiceStopped { state: PluginInstanceLifecycleState },
+    DispatchTimeout { timeout: Duration },
+    DispatchFailed(String),
+}
+
+impl PluginIngressDispatchError {
+    fn bounded_message(&self) -> String {
+        match self {
+            Self::InvalidEvent(message) => bounded_message(format!(
+                "invalid plugin ingress event: {}",
+                redact_secret_like(message)
+            )),
+            Self::QueueFull { capacity } => bounded_message(format!(
+                "plugin ingress queue is full (capacity {capacity})"
+            )),
+            Self::ServiceUnavailable { state } => bounded_message(format!(
+                "plugin service is not running for ingress dispatch (state {state:?})"
+            )),
+            Self::ServiceFailed(message) => bounded_message(format!(
+                "plugin service is failed for ingress dispatch: {}",
+                redact_secret_like(message)
+            )),
+            Self::ServiceStopped { state } => bounded_message(format!(
+                "plugin service rejects ingress while stopping/stopped (state {state:?})"
+            )),
+            Self::DispatchTimeout { timeout } => bounded_message(format!(
+                "plugin ingress dispatch timed out after {timeout:?}"
+            )),
+            Self::DispatchFailed(message) => bounded_message(format!(
+                "plugin ingress dispatch failed closed: {}",
+                redact_secret_like(message)
+            )),
+        }
+    }
+
+    fn diagnostic_kind(&self) -> PluginInstanceDiagnosticKind {
+        match self {
+            Self::InvalidEvent(_) => PluginInstanceDiagnosticKind::InvalidEvent,
+            Self::QueueFull { .. } => PluginInstanceDiagnosticKind::QueueFull,
+            Self::ServiceUnavailable { .. } => PluginInstanceDiagnosticKind::ServiceUnavailable,
+            Self::ServiceFailed(_) => PluginInstanceDiagnosticKind::ServiceFailed,
+            Self::ServiceStopped { .. } => PluginInstanceDiagnosticKind::ServiceStopped,
+            Self::DispatchTimeout { .. } => PluginInstanceDiagnosticKind::DispatchTimeout,
+            Self::DispatchFailed(_) => PluginInstanceDiagnosticKind::DispatchFailed,
+        }
+    }
+}
+
+impl std::fmt::Display for PluginIngressDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.bounded_message())
+    }
+}
+
+impl std::error::Error for PluginIngressDispatchError {}
+
+#[derive(Clone, Debug)]
+struct QueuedPluginIngress {
+    ingress_name: String,
+    event: PluginIngressEvent,
+    enqueued_at: Instant,
 }
 
 #[derive(Clone, Default)]
@@ -3045,21 +3351,515 @@ impl PluginInstanceRegistry {
     }
 }
 
+#[derive(Clone, Debug)]
+struct PluginServiceWebSocketSubscription {
+    ingress_name: String,
+    source: String,
+    url: String,
+}
+
+#[derive(Clone, Default)]
+struct PluginServiceWebSocketDriver {
+    inner: Arc<Mutex<HashMap<String, PluginServiceWebSocketConnection>>>,
+}
+
+struct PluginServiceWebSocketConnection {
+    status: PluginServiceWebSocketConnectionStatus,
+    connection: Option<Arc<Mutex<Box<dyn PluginWebSocketConnection>>>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl PluginServiceWebSocketDriver {
+    fn start_connection(
+        &self,
+        handle: PluginInstanceHandle,
+        client: Arc<dyn PluginWebSocketClient>,
+        subscription: PluginServiceWebSocketSubscription,
+    ) {
+        if self.connection_count() >= PLUGIN_WEBSOCKET_MAX_OPEN_CONNECTIONS {
+            let message = format!(
+                "host-owned WebSocket connection limit ({}) exceeded for {}",
+                PLUGIN_WEBSOCKET_MAX_OPEN_CONNECTIONS, subscription.url
+            );
+            self.insert_failed_status(&subscription, message.clone());
+            handle.record_service_websocket_diagnostic(
+                PluginInstanceDiagnosticKind::ServiceWebSocketError,
+                message,
+                true,
+            );
+            return;
+        }
+
+        let request = PluginWebSocketOpenRequest {
+            url: subscription.url.clone(),
+            protocols: Vec::new(),
+            headers: Vec::new(),
+        };
+        self.insert_status(
+            &subscription,
+            PluginServiceWebSocketConnectionState::Connecting,
+            None,
+        );
+
+        let (request, url) = match validate_plugin_service_websocket_open_request(&handle, &request)
+        {
+            Ok(value) => value,
+            Err(message) => {
+                self.update_status_error(
+                    &subscription.url,
+                    PluginServiceWebSocketConnectionState::Failed,
+                    message.clone(),
+                );
+                handle.record_service_websocket_diagnostic(
+                    PluginInstanceDiagnosticKind::ServiceWebSocketError,
+                    message,
+                    true,
+                );
+                return;
+            }
+        };
+        if !client.supports_bounded_open() {
+            let message = "host-owned WebSocket client cannot guarantee bounded/cancellable open; refusing to dial".to_string();
+            self.update_status_error(
+                &subscription.url,
+                PluginServiceWebSocketConnectionState::Failed,
+                message.clone(),
+            );
+            handle.record_service_websocket_diagnostic(
+                PluginInstanceDiagnosticKind::ServiceWebSocketError,
+                message,
+                true,
+            );
+            return;
+        }
+        let connection = match client.open(&request, &url, PluginWebSocketLimits::default()) {
+            Ok(connection) => Arc::new(Mutex::new(connection)),
+            Err(error) => {
+                let message = format!(
+                    "host-owned WebSocket open failed for {}: {}",
+                    safe_url(&url),
+                    error.0
+                );
+                self.update_status_error(
+                    &subscription.url,
+                    PluginServiceWebSocketConnectionState::Failed,
+                    message.clone(),
+                );
+                handle.record_service_websocket_diagnostic(
+                    PluginInstanceDiagnosticKind::ServiceWebSocketError,
+                    message,
+                    true,
+                );
+                return;
+            }
+        };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        self.attach_connection(&subscription.url, connection.clone(), stop.clone());
+        self.update_status_connected(&subscription.url);
+        handle.record_service_websocket_diagnostic(
+            PluginInstanceDiagnosticKind::ServiceWebSocketConnected,
+            format!("host-owned WebSocket connected: {}", safe_url(&url)),
+            false,
+        );
+
+        let driver = self.clone();
+        std::thread::spawn(move || {
+            driver.reader_loop(handle, subscription, connection, stop);
+        });
+    }
+
+    fn reader_loop(
+        &self,
+        handle: PluginInstanceHandle,
+        subscription: PluginServiceWebSocketSubscription,
+        connection: Arc<Mutex<Box<dyn PluginWebSocketConnection>>>,
+        stop: Arc<AtomicBool>,
+    ) {
+        while !stop.load(Ordering::SeqCst) {
+            let recv = {
+                let mut connection = connection
+                    .lock()
+                    .expect("service websocket connection poisoned");
+                connection.recv_text(
+                    PLUGIN_SERVICE_WEBSOCKET_RECV_TIMEOUT,
+                    PLUGIN_WEBSOCKET_MAX_MESSAGE_BYTES,
+                )
+            };
+            match recv {
+                Ok(PluginWebSocketRecvResponse::Text { text }) => {
+                    self.record_frame(&subscription.url);
+                    let event = PluginIngressEvent::new(
+                        subscription.ingress_name.clone(),
+                        "websocket_text",
+                        subscription.source.clone(),
+                        serde_json::json!({
+                            "url": subscription.url,
+                            "text": text,
+                        }),
+                    );
+                    if let Err(error) = handle.deliver_ingress(&subscription.ingress_name, event) {
+                        let message = error.bounded_message();
+                        self.record_queue_drop(&subscription.url, message.clone());
+                        handle.record_service_websocket_diagnostic(
+                            error.diagnostic_kind(),
+                            format!("host-owned WebSocket ingress drop: {message}"),
+                            true,
+                        );
+                    }
+                }
+                Ok(PluginWebSocketRecvResponse::Closed) => {
+                    let message = "host-owned WebSocket closed by peer".to_string();
+                    self.update_status_error(
+                        &subscription.url,
+                        PluginServiceWebSocketConnectionState::Closed,
+                        message.clone(),
+                    );
+                    handle.record_service_websocket_diagnostic(
+                        PluginInstanceDiagnosticKind::ServiceWebSocketClosed,
+                        message.clone(),
+                        false,
+                    );
+                    let event = PluginIngressEvent::new(
+                        subscription.ingress_name.clone(),
+                        "websocket_close",
+                        subscription.source.clone(),
+                        serde_json::json!({"url": subscription.url, "reason": message}),
+                    );
+                    let _ = handle.deliver_ingress(&subscription.ingress_name, event);
+                    break;
+                }
+                Err(error) if error.0.contains("timed out") => continue,
+                Err(error) => {
+                    let message = format!("host-owned WebSocket receive failed: {}", error.0);
+                    self.update_status_error(
+                        &subscription.url,
+                        PluginServiceWebSocketConnectionState::Failed,
+                        message.clone(),
+                    );
+                    handle.record_service_websocket_diagnostic(
+                        PluginInstanceDiagnosticKind::ServiceWebSocketError,
+                        message.clone(),
+                        true,
+                    );
+                    let event = PluginIngressEvent::new(
+                        subscription.ingress_name.clone(),
+                        "websocket_error",
+                        subscription.source.clone(),
+                        serde_json::json!({"url": subscription.url, "error": message}),
+                    );
+                    let _ = handle.deliver_ingress(&subscription.ingress_name, event);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn send_text(&self, url: &str, text: &str) -> Result<String, String> {
+        if text.len() > PLUGIN_WEBSOCKET_MAX_TEXT_BYTES {
+            return Err(format!(
+                "websocket_send text exceeds {} bytes",
+                PLUGIN_WEBSOCKET_MAX_TEXT_BYTES
+            ));
+        }
+        let parsed =
+            reqwest::Url::parse(url).map_err(|error| format!("invalid WebSocket URL: {error}"))?;
+        let key = parsed.as_str().to_string();
+        let (display_url, connection) = {
+            let guard = self
+                .inner
+                .lock()
+                .expect("service websocket driver poisoned");
+            let entry = guard.get(&key).ok_or_else(|| {
+                format!(
+                    "no host-owned WebSocket connection is active for {}",
+                    safe_url(&parsed)
+                )
+            })?;
+            let Some(connection) = &entry.connection else {
+                return Err(format!(
+                    "host-owned WebSocket connection is not connected for {}",
+                    safe_url(&parsed)
+                ));
+            };
+            (entry.status.url.clone(), connection.clone())
+        };
+        let send = connection
+            .lock()
+            .expect("service websocket connection poisoned")
+            .send_text(text);
+        match send {
+            Ok(()) => {
+                self.record_send_success(&key);
+                Ok(format!(
+                    "websocket_send sent {} bytes to {display_url}",
+                    text.len()
+                ))
+            }
+            Err(error) => {
+                let message = format!("websocket_send failed for {display_url}: {}", error.0);
+                self.record_send_failure(&key, message.clone());
+                Err(message)
+            }
+        }
+    }
+
+    fn statuses(&self) -> Vec<PluginServiceWebSocketConnectionStatus> {
+        let mut statuses: Vec<_> = self
+            .inner
+            .lock()
+            .expect("service websocket driver poisoned")
+            .values()
+            .map(|entry| entry.status.clone())
+            .collect();
+        statuses.sort_by(|left, right| left.url.cmp(&right.url));
+        statuses
+    }
+
+    fn stop_all(&self) {
+        let connections: Vec<_> = {
+            let mut guard = self
+                .inner
+                .lock()
+                .expect("service websocket driver poisoned");
+            guard
+                .values_mut()
+                .filter_map(|entry| {
+                    entry.stop.store(true, Ordering::SeqCst);
+                    entry.status.state = PluginServiceWebSocketConnectionState::Closed;
+                    entry.connection.clone()
+                })
+                .collect()
+        };
+        for connection in connections {
+            if let Ok(mut connection) = connection.lock() {
+                let _ = connection.close();
+            }
+        }
+    }
+
+    fn connection_count(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("service websocket driver poisoned")
+            .len()
+    }
+
+    fn insert_status(
+        &self,
+        subscription: &PluginServiceWebSocketSubscription,
+        state: PluginServiceWebSocketConnectionState,
+        error: Option<String>,
+    ) {
+        let url = reqwest::Url::parse(&subscription.url)
+            .map(|url| safe_url(&url))
+            .unwrap_or_else(|_| safe_fs_path(&subscription.url));
+        self.inner
+            .lock()
+            .expect("service websocket driver poisoned")
+            .insert(
+                subscription.url.clone(),
+                PluginServiceWebSocketConnection {
+                    status: PluginServiceWebSocketConnectionStatus {
+                        url,
+                        ingress_name: subscription.ingress_name.clone(),
+                        state,
+                        last_frame_at: None,
+                        last_error: error,
+                        received_text_frames: 0,
+                        sent_text_frames: 0,
+                        queue_drops: 0,
+                        send_failures: 0,
+                    },
+                    connection: None,
+                    stop: Arc::new(AtomicBool::new(false)),
+                },
+            );
+    }
+
+    fn insert_failed_status(
+        &self,
+        subscription: &PluginServiceWebSocketSubscription,
+        error: String,
+    ) {
+        self.insert_status(
+            subscription,
+            PluginServiceWebSocketConnectionState::Failed,
+            Some(error),
+        );
+    }
+
+    fn attach_connection(
+        &self,
+        key: &str,
+        connection: Arc<Mutex<Box<dyn PluginWebSocketConnection>>>,
+        stop: Arc<AtomicBool>,
+    ) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("service websocket driver poisoned")
+            .get_mut(key)
+        {
+            entry.connection = Some(connection);
+            entry.stop = stop;
+        }
+    }
+
+    fn update_status_connected(&self, key: &str) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("service websocket driver poisoned")
+            .get_mut(key)
+        {
+            entry.status.state = PluginServiceWebSocketConnectionState::Connected;
+            entry.status.last_error = None;
+        }
+    }
+
+    fn update_status_error(
+        &self,
+        key: &str,
+        state: PluginServiceWebSocketConnectionState,
+        error: String,
+    ) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("service websocket driver poisoned")
+            .get_mut(key)
+        {
+            entry.status.state = state;
+            entry.status.last_error = Some(bounded_message(redact_secret_like(&error)));
+        }
+    }
+
+    fn record_frame(&self, key: &str) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("service websocket driver poisoned")
+            .get_mut(key)
+        {
+            entry.status.last_frame_at =
+                Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+            entry.status.received_text_frames += 1;
+        }
+    }
+
+    fn record_queue_drop(&self, key: &str, error: String) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("service websocket driver poisoned")
+            .get_mut(key)
+        {
+            entry.status.queue_drops += 1;
+            entry.status.last_error = Some(bounded_message(redact_secret_like(&error)));
+        }
+    }
+
+    fn record_send_success(&self, key: &str) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("service websocket driver poisoned")
+            .get_mut(key)
+        {
+            entry.status.sent_text_frames += 1;
+        }
+    }
+
+    fn record_send_failure(&self, key: &str, error: String) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("service websocket driver poisoned")
+            .get_mut(key)
+        {
+            entry.status.send_failures += 1;
+            entry.status.last_error = Some(bounded_message(redact_secret_like(&error)));
+        }
+    }
+}
+
+fn validate_plugin_service_websocket_open_request(
+    handle: &PluginInstanceHandle,
+    request: &PluginWebSocketOpenRequest,
+) -> Result<(PluginWebSocketOpenRequest, reqwest::Url), String> {
+    let record = {
+        let instance = handle.0.lock().expect("plugin instance poisoned");
+        instance.record.clone()
+    };
+    authorize_plugin_host_api(&record, PluginHostApi::WebSocket)
+        .map_err(|error| format!("host-owned websocket not granted: {}", error.0))?;
+    let bytes = serde_json::to_vec(request)
+        .map_err(|error| format!("failed to encode host-owned websocket open request: {error}"))?;
+    validate_plugin_websocket_open_request(&record, &bytes).map_err(|error| error.0)
+}
+
+fn parse_plugin_service_websocket_source(source: &str) -> Option<Result<String, String>> {
+    let trimmed = source.trim();
+    let raw = if let Some(rest) = trimmed.strip_prefix("websocket:") {
+        rest.trim()
+    } else if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
+        trimmed
+    } else {
+        return None;
+    };
+    if raw.is_empty() {
+        return Some(Err("websocket source URL is empty".to_string()));
+    }
+    let parsed = match reqwest::Url::parse(raw) {
+        Ok(parsed) => parsed,
+        Err(error) => return Some(Err(format!("invalid WebSocket URL: {error}"))),
+    };
+    match parsed.scheme() {
+        "ws" | "wss" => Some(Ok(parsed.as_str().to_string())),
+        other => Some(Err(format!("unsupported WebSocket URL scheme: {other}"))),
+    }
+}
+
 #[derive(Clone)]
 pub struct PluginInstanceHandle(Arc<Mutex<PluginInstance>>);
 
 impl PluginInstanceHandle {
     fn new(record: ResolvedPluginRecord) -> Result<Self, PluginWasmError> {
+        Self::new_with_service_websocket_client(record, Arc::new(TungstenitePluginWebSocketClient))
+    }
+
+    #[cfg(test)]
+    fn new_with_test_websocket_client(
+        record: ResolvedPluginRecord,
+        service_websocket_client: Arc<dyn PluginWebSocketClient>,
+    ) -> Result<Self, PluginWasmError> {
+        Self::new_with_service_websocket_client(record, service_websocket_client)
+    }
+
+    fn new_with_service_websocket_client(
+        record: ResolvedPluginRecord,
+        service_websocket_client: Arc<dyn PluginWebSocketClient>,
+    ) -> Result<Self, PluginWasmError> {
         let runtime = PluginInstanceRuntime::new(&record)?;
         let mut instance = PluginInstance {
             record,
             runtime,
             lifecycle: PluginInstanceLifecycleState::Ready,
             component_status: None,
+            ingress_queue: VecDeque::new(),
+            ingress_queue_capacity: PLUGIN_SERVICE_INGRESS_QUEUE_CAPACITY,
+            dispatch_counters: PluginIngressDispatchCounters::default(),
+            last_error: None,
+            output_command_results: Vec::new(),
+            service_websockets: PluginServiceWebSocketDriver::default(),
+            service_websocket_client,
             diagnostics: Vec::new(),
         };
         instance.start()?;
-        Ok(Self(Arc::new(Mutex::new(instance))))
+        let handle = Self(Arc::new(Mutex::new(instance)));
+        handle.start_service_websockets();
+        Ok(handle)
     }
 
     fn handle_tool(&self, tool_name: &str, input: Vec<u8>) -> Result<ToolOutput, PluginWasmError> {
@@ -3073,11 +3873,10 @@ impl PluginInstanceHandle {
         &self,
         ingress_name: &str,
         event: PluginIngressEvent,
-    ) -> Result<PluginIngressDispatchReport, PluginWasmError> {
-        self.0
-            .lock()
-            .expect("plugin instance poisoned")
-            .deliver_ingress(ingress_name, event)
+    ) -> Result<PluginIngressDispatchReport, PluginIngressDispatchError> {
+        let mut instance = self.0.lock().expect("plugin instance poisoned");
+        instance.enqueue_ingress(ingress_name, event)?;
+        instance.dispatch_next_ingress()
     }
 
     pub fn status(&self) -> PluginInstanceStatus {
@@ -3094,7 +3893,46 @@ impl PluginInstanceHandle {
     fn record_diagnostic(&self, diagnostic: PluginInstanceDiagnostic) {
         if let Ok(mut instance) = self.0.lock() {
             instance.lifecycle = diagnostic.state.clone();
+            instance.last_error = Some(diagnostic.message.clone());
             instance.diagnostics.push(diagnostic);
+        }
+    }
+
+    fn record_service_websocket_diagnostic(
+        &self,
+        kind: PluginInstanceDiagnosticKind,
+        message: impl Into<String>,
+        mark_error: bool,
+    ) {
+        if let Ok(mut instance) = self.0.lock() {
+            let message = bounded_message(redact_secret_like(&message.into()));
+            if mark_error {
+                instance.last_error = Some(message.clone());
+            }
+            let state = instance.lifecycle.clone();
+            instance
+                .diagnostics
+                .push(PluginInstanceDiagnostic::with_kind(kind, state, message));
+        }
+    }
+
+    fn start_service_websockets(&self) {
+        let (driver, client, subscriptions, diagnostics) = {
+            let instance = self.0.lock().expect("plugin instance poisoned");
+            let (subscriptions, diagnostics) = instance.service_websocket_subscriptions();
+            let driver = instance.service_websockets.clone();
+            let client = instance.service_websocket_client.clone();
+            (driver, client, subscriptions, diagnostics)
+        };
+        for diagnostic in diagnostics {
+            self.record_service_websocket_diagnostic(
+                PluginInstanceDiagnosticKind::ServiceWebSocketError,
+                diagnostic,
+                true,
+            );
+        }
+        for subscription in subscriptions {
+            driver.start_connection(self.clone(), client.clone(), subscription);
         }
     }
 }
@@ -3104,30 +3942,90 @@ struct PluginInstance {
     runtime: PluginInstanceRuntime,
     lifecycle: PluginInstanceLifecycleState,
     component_status: Option<Value>,
+    ingress_queue: VecDeque<QueuedPluginIngress>,
+    ingress_queue_capacity: usize,
+    dispatch_counters: PluginIngressDispatchCounters,
+    last_error: Option<String>,
+    output_command_results: Vec<PluginServiceOutputCommandResult>,
+    service_websockets: PluginServiceWebSocketDriver,
+    service_websocket_client: Arc<dyn PluginWebSocketClient>,
     diagnostics: Vec<PluginInstanceDiagnostic>,
 }
 
 impl PluginInstance {
     fn start(&mut self) -> Result<(), PluginWasmError> {
-        match &mut self.runtime {
-            PluginInstanceRuntime::LegacyToolAdapter => {
+        self.lifecycle = PluginInstanceLifecycleState::Starting;
+        let start_result = match &mut self.runtime {
+            PluginInstanceRuntime::ComponentToolAdapter => {
                 self.lifecycle = PluginInstanceLifecycleState::Ready;
                 self.diagnostics.push(PluginInstanceDiagnostic::new(
                     PluginInstanceLifecycleState::Ready,
-                    "legacy tool runtime adapted behind PluginInstanceRegistry",
+                    "component tool runtime registered behind PluginInstanceRegistry",
                 ));
+                Ok(())
             }
             #[cfg(test)]
             PluginInstanceRuntime::TestIngress { .. } => {
-                self.lifecycle = PluginInstanceLifecycleState::Started;
+                self.lifecycle = PluginInstanceLifecycleState::Running;
+                self.diagnostics.push(PluginInstanceDiagnostic::new(
+                    PluginInstanceLifecycleState::Running,
+                    "test ingress runtime initialized",
+                ));
+                Ok(())
             }
             PluginInstanceRuntime::ComponentInstance(runtime) => {
-                let status = runtime.start(&self.record)?;
-                self.component_status = Some(status);
-                self.lifecycle = PluginInstanceLifecycleState::Started;
+                match runtime.start(&self.record) {
+                    Ok(status) => {
+                        self.component_status = Some(status);
+                        self.lifecycle = PluginInstanceLifecycleState::Running;
+                        self.diagnostics.push(PluginInstanceDiagnostic::new(
+                        PluginInstanceLifecycleState::Running,
+                        "component instance start returned; host-managed ingress queue is running",
+                    ));
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
             }
+        };
+        if let Err(error) = start_result {
+            self.lifecycle = PluginInstanceLifecycleState::Failed;
+            self.record_runtime_error(
+                PluginInstanceDiagnosticKind::ServiceFailed,
+                format!("plugin component start failed: {}", error.bounded_message()),
+            );
+            return Err(error);
         }
         Ok(())
+    }
+
+    fn service_websocket_subscriptions(
+        &self,
+    ) -> (Vec<PluginServiceWebSocketSubscription>, Vec<String>) {
+        if !surface_enabled(&self.record, PluginSurface::Service)
+            || !surface_enabled(&self.record, PluginSurface::Ingress)
+        {
+            return (Vec::new(), Vec::new());
+        }
+        let mut subscriptions = Vec::new();
+        let mut diagnostics = Vec::new();
+        for ingress in &self.record.manifest.ingresses {
+            for source in &ingress.sources {
+                match parse_plugin_service_websocket_source(source) {
+                    None => {}
+                    Some(Ok(url)) => subscriptions.push(PluginServiceWebSocketSubscription {
+                        ingress_name: ingress.name.clone(),
+                        source: source.clone(),
+                        url,
+                    }),
+                    Some(Err(message)) => diagnostics.push(format!(
+                        "invalid WebSocket ingress source for {}: {message}",
+                        ingress.name
+                    )),
+                }
+            }
+        }
+        (subscriptions, diagnostics)
     }
 
     fn handle_tool(
@@ -3158,14 +4056,14 @@ impl PluginInstance {
             ))
         })?;
         match &mut self.runtime {
-            PluginInstanceRuntime::LegacyToolAdapter => {
-                run_plugin_tool(self.record.clone(), tool_name.to_string(), input)
+            PluginInstanceRuntime::ComponentToolAdapter => {
+                run_plugin_component_tool(self.record.clone(), tool_name.to_string(), input)
             }
             #[cfg(test)]
-            PluginInstanceRuntime::TestIngress { calls } => {
-                *calls += 1;
+            PluginInstanceRuntime::TestIngress { tool_calls, .. } => {
+                *tool_calls += 1;
                 Ok(ToolOutput {
-                    summary: format!("{tool_name}: {calls}"),
+                    summary: format!("{tool_name}: {tool_calls}"),
                     content: Some(String::from_utf8_lossy(&input).to_string()),
                 })
             }
@@ -3175,86 +4073,273 @@ impl PluginInstance {
         }
     }
 
-    fn deliver_ingress(
+    fn enqueue_ingress(
         &mut self,
         ingress_name: &str,
         event: PluginIngressEvent,
-    ) -> Result<PluginIngressDispatchReport, PluginWasmError> {
+    ) -> Result<(), PluginIngressDispatchError> {
+        self.validate_ingress_event(ingress_name, &event)
+            .map_err(|error| self.record_rejection(error))?;
+        if self.ingress_queue.len() >= self.ingress_queue_capacity {
+            let error = PluginIngressDispatchError::QueueFull {
+                capacity: self.ingress_queue_capacity,
+            };
+            return Err(self.record_rejection(error));
+        }
+        self.ingress_queue.push_back(QueuedPluginIngress {
+            ingress_name: ingress_name.to_string(),
+            event,
+            enqueued_at: Instant::now(),
+        });
+        self.dispatch_counters.enqueued += 1;
+        Ok(())
+    }
+
+    fn validate_ingress_event(
+        &self,
+        ingress_name: &str,
+        event: &PluginIngressEvent,
+    ) -> Result<(), PluginIngressDispatchError> {
         if !surface_enabled(&self.record, PluginSurface::Ingress) {
-            return Err(PluginWasmError::Module(
+            return Err(PluginIngressDispatchError::InvalidEvent(
                 "plugin ingress surface is not enabled".to_string(),
             ));
         }
-        if serde_json::to_vec(&event)
+        match self.lifecycle {
+            PluginInstanceLifecycleState::Running => {}
+            PluginInstanceLifecycleState::Failed => {
+                return Err(PluginIngressDispatchError::ServiceFailed(
+                    self.last_error
+                        .clone()
+                        .unwrap_or_else(|| "service is failed".to_string()),
+                ));
+            }
+            PluginInstanceLifecycleState::Stopping | PluginInstanceLifecycleState::Stopped => {
+                return Err(PluginIngressDispatchError::ServiceStopped {
+                    state: self.lifecycle.clone(),
+                });
+            }
+            _ => {
+                return Err(PluginIngressDispatchError::ServiceUnavailable {
+                    state: self.lifecycle.clone(),
+                });
+            }
+        }
+        if event.source.trim().is_empty() {
+            return Err(PluginIngressDispatchError::InvalidEvent(
+                "source must not be empty".to_string(),
+            ));
+        }
+        if event.ingress_name != ingress_name {
+            return Err(PluginIngressDispatchError::InvalidEvent(format!(
+                "event ingress `{}` does not match dispatch ingress `{ingress_name}`",
+                event.ingress_name
+            )));
+        }
+        if event.kind.trim().is_empty() {
+            return Err(PluginIngressDispatchError::InvalidEvent(
+                "event kind must not be empty".to_string(),
+            ));
+        }
+        if event.created_at.trim().is_empty() {
+            return Err(PluginIngressDispatchError::InvalidEvent(
+                "created_at must not be empty".to_string(),
+            ));
+        }
+        if event.attempt == 0 {
+            return Err(PluginIngressDispatchError::InvalidEvent(
+                "attempt must be greater than zero".to_string(),
+            ));
+        }
+        if event.correlation_id.trim().is_empty() {
+            return Err(PluginIngressDispatchError::InvalidEvent(
+                "correlation_id must not be empty".to_string(),
+            ));
+        }
+        if serde_json::to_vec(event)
             .map(|bytes| bytes.len())
             .unwrap_or(usize::MAX)
             > PLUGIN_WASM_MAX_INPUT_BYTES
         {
-            return Err(PluginWasmError::Module(format!(
+            return Err(PluginIngressDispatchError::InvalidEvent(format!(
                 "plugin ingress event exceeds {} bytes",
                 PLUGIN_WASM_MAX_INPUT_BYTES
             )));
         }
-        self.record
+        let ingress = self
+            .record
             .manifest
             .ingresses
             .iter()
             .find(|ingress| ingress.name == ingress_name)
             .ok_or_else(|| {
-                PluginWasmError::Module(
+                PluginIngressDispatchError::InvalidEvent(
                     "requested ingress is not declared by plugin manifest".to_string(),
                 )
             })?;
+        if !ingress.event_kinds.is_empty()
+            && !ingress.event_kinds.iter().any(|kind| kind == &event.kind)
+        {
+            return Err(PluginIngressDispatchError::InvalidEvent(format!(
+                "event kind `{}` is not declared for ingress `{ingress_name}`",
+                event.kind
+            )));
+        }
         authorize_plugin_ingress(&self.record, ingress_name).map_err(|error| {
-            PluginWasmError::Module(format!(
+            PluginIngressDispatchError::InvalidEvent(format!(
                 "plugin ingress permission denied: {}",
                 error.bounded_message()
             ))
         })?;
-        match &mut self.runtime {
-            PluginInstanceRuntime::LegacyToolAdapter => Err(PluginWasmError::Module(
-                "legacy tool runtime does not expose ingress dispatch".to_string(),
-            )),
-            #[cfg(test)]
-            PluginInstanceRuntime::TestIngress { calls } => {
-                let output = serde_json::json!({
-                    "ingress": ingress_name,
-                    "kind": event.kind,
-                    "source": event.source,
-                    "calls": *calls,
-                    "payload": event.payload,
-                });
-                Ok(PluginIngressDispatchReport {
-                    plugin_ref: self.record.identity.to_string(),
-                    ingress: ingress_name.to_string(),
-                    accepted: true,
-                    output,
-                    diagnostics: self.diagnostics.clone(),
-                })
+        Ok(())
+    }
+
+    fn dispatch_next_ingress(
+        &mut self,
+    ) -> Result<PluginIngressDispatchReport, PluginIngressDispatchError> {
+        let Some(queued) = self.ingress_queue.pop_front() else {
+            return Err(PluginIngressDispatchError::InvalidEvent(
+                "plugin ingress queue is empty".to_string(),
+            ));
+        };
+        let started_at = Instant::now();
+        let result = self.dispatch_ingress_now(&queued.ingress_name, queued.event);
+        let elapsed = started_at.elapsed();
+        if elapsed > PLUGIN_SERVICE_INGRESS_DISPATCH_TIMEOUT {
+            let error = PluginIngressDispatchError::DispatchTimeout {
+                timeout: PLUGIN_SERVICE_INGRESS_DISPATCH_TIMEOUT,
+            };
+            self.dispatch_counters.timed_out += 1;
+            self.dispatch_counters.failed += 1;
+            self.lifecycle = PluginInstanceLifecycleState::Failed;
+            self.record_dispatch_error(&error);
+            return Err(error);
+        }
+        match result {
+            Ok(mut report) => {
+                let queue_latency_ms = queued.enqueued_at.elapsed().as_millis() as u64;
+                if report.output.get("queue_latency_ms").is_none() {
+                    if let Some(map) = report.output.as_object_mut() {
+                        map.insert(
+                            "queue_latency_ms".to_string(),
+                            Value::from(queue_latency_ms),
+                        );
+                    }
+                }
+                self.dispatch_counters.dispatched += 1;
+                report.queue_depth = self.ingress_queue.len();
+                report.dispatch_counters = self.dispatch_counters.clone();
+                report.diagnostics = self.diagnostics.clone();
+                Ok(report)
             }
-            PluginInstanceRuntime::ComponentInstance(runtime) => {
-                let output = runtime.handle_ingress(ingress_name, &event)?;
-                Ok(PluginIngressDispatchReport {
-                    plugin_ref: self.record.identity.to_string(),
-                    ingress: ingress_name.to_string(),
-                    accepted: true,
-                    output,
-                    diagnostics: self.diagnostics.clone(),
-                })
+            Err(error) => {
+                self.dispatch_counters.failed += 1;
+                self.lifecycle = PluginInstanceLifecycleState::Failed;
+                let dispatch_error =
+                    PluginIngressDispatchError::DispatchFailed(error.bounded_message());
+                self.record_dispatch_error(&dispatch_error);
+                Err(dispatch_error)
             }
         }
     }
 
-    fn stop(&mut self) -> Result<(), PluginWasmError> {
-        match &mut self.runtime {
-            PluginInstanceRuntime::LegacyToolAdapter => {}
-            #[cfg(test)]
-            PluginInstanceRuntime::TestIngress { .. } => {}
-            PluginInstanceRuntime::ComponentInstance(runtime) => {
-                self.component_status = Some(runtime.stop()?);
+    fn dispatch_ingress_now(
+        &mut self,
+        ingress_name: &str,
+        event: PluginIngressEvent,
+    ) -> Result<PluginIngressDispatchReport, PluginWasmError> {
+        let output = match &mut self.runtime {
+            PluginInstanceRuntime::ComponentToolAdapter => {
+                return Err(PluginWasmError::Module(
+                    "component tool runtime does not expose ingress dispatch".to_string(),
+                ));
             }
+            #[cfg(test)]
+            PluginInstanceRuntime::TestIngress {
+                tool_calls,
+                ingress_calls,
+            } => {
+                if let Some(sleep_ms) = event.payload.get("sleep_ms").and_then(Value::as_u64) {
+                    std::thread::sleep(Duration::from_millis(sleep_ms));
+                }
+                if event.payload.get("fail").and_then(Value::as_bool) == Some(true) {
+                    return Err(PluginWasmError::Execution(
+                        "test ingress requested failure".to_string(),
+                    ));
+                }
+                *ingress_calls += 1;
+                let mut output = serde_json::json!({
+                    "ingress": ingress_name,
+                    "kind": event.kind.clone(),
+                    "source": event.source.clone(),
+                    "ingress_name": event.ingress_name.clone(),
+                    "attempt": event.attempt,
+                    "correlation_id": event.correlation_id.clone(),
+                    "calls": *tool_calls,
+                    "ingress_calls": *ingress_calls,
+                    "payload": event.payload.clone(),
+                });
+                if let (Some(map), Some(commands)) = (
+                    output.as_object_mut(),
+                    event.payload.get("output_commands").cloned(),
+                ) {
+                    map.insert("output_commands".to_string(), commands);
+                }
+                output
+            }
+            PluginInstanceRuntime::ComponentInstance(runtime) => {
+                runtime.handle_ingress(ingress_name, &event)?
+            }
+        };
+        let output_command_results = self.process_service_output_commands(&output, &event);
+        Ok(PluginIngressDispatchReport {
+            plugin_ref: self.record.identity.to_string(),
+            ingress: ingress_name.to_string(),
+            accepted: true,
+            output,
+            output_command_results,
+            queue_depth: self.ingress_queue.len(),
+            dispatch_counters: self.dispatch_counters.clone(),
+            diagnostics: self.diagnostics.clone(),
+        })
+    }
+
+    fn stop(&mut self) -> Result<(), PluginWasmError> {
+        if self.lifecycle == PluginInstanceLifecycleState::Stopped {
+            return Ok(());
+        }
+        self.lifecycle = PluginInstanceLifecycleState::Stopping;
+        self.diagnostics.push(PluginInstanceDiagnostic::new(
+            PluginInstanceLifecycleState::Stopping,
+            "plugin service stop requested; ingress queue is closed",
+        ));
+        self.ingress_queue.clear();
+        self.service_websockets.stop_all();
+        let stop_result = match &mut self.runtime {
+            PluginInstanceRuntime::ComponentToolAdapter => Ok(()),
+            #[cfg(test)]
+            PluginInstanceRuntime::TestIngress { .. } => Ok(()),
+            PluginInstanceRuntime::ComponentInstance(runtime) => match runtime.stop() {
+                Ok(status) => {
+                    self.component_status = Some(status);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            },
+        };
+        if let Err(error) = stop_result {
+            self.lifecycle = PluginInstanceLifecycleState::Failed;
+            self.record_runtime_error(
+                PluginInstanceDiagnosticKind::ServiceFailed,
+                format!("plugin component stop failed: {}", error.bounded_message()),
+            );
+            return Err(error);
         }
         self.lifecycle = PluginInstanceLifecycleState::Stopped;
+        self.diagnostics.push(PluginInstanceDiagnostic::new(
+            PluginInstanceLifecycleState::Stopped,
+            "plugin service stopped",
+        ));
         Ok(())
     }
 
@@ -3263,40 +4348,357 @@ impl PluginInstance {
             plugin_ref: self.record.identity.to_string(),
             lifecycle: self.lifecycle.clone(),
             component_status: self.component_status.clone(),
+            queue_depth: self.ingress_queue.len(),
+            queue_capacity: self.ingress_queue_capacity,
+            last_error: self.last_error.clone(),
+            dispatch_counters: self.dispatch_counters.clone(),
+            output_command_results: self.output_command_results.clone(),
+            websocket_connections: self.service_websockets.statuses(),
             diagnostics: self.diagnostics.clone(),
         }
     }
 
     fn status(&mut self) -> PluginInstanceStatus {
-        if let PluginInstanceRuntime::ComponentInstance(runtime) = &mut self.runtime {
-            match runtime.status() {
-                Ok(status) => self.component_status = Some(status),
-                Err(error) => {
-                    self.lifecycle = PluginInstanceLifecycleState::Failed;
-                    self.diagnostics.push(PluginInstanceDiagnostic::new(
-                        PluginInstanceLifecycleState::Failed,
-                        format!(
-                            "plugin component status failed: {}",
-                            error.bounded_message()
-                        ),
-                    ));
+        if self.lifecycle == PluginInstanceLifecycleState::Running {
+            if let PluginInstanceRuntime::ComponentInstance(runtime) = &mut self.runtime {
+                match runtime.status() {
+                    Ok(status) => self.component_status = Some(status),
+                    Err(error) => {
+                        self.lifecycle = PluginInstanceLifecycleState::Failed;
+                        self.record_runtime_error(
+                            PluginInstanceDiagnosticKind::ServiceFailed,
+                            format!(
+                                "plugin component status failed: {}",
+                                error.bounded_message()
+                            ),
+                        );
+                    }
                 }
             }
         }
-        PluginInstanceStatus {
-            plugin_ref: self.record.identity.to_string(),
-            lifecycle: self.lifecycle.clone(),
-            component_status: self.component_status.clone(),
-            diagnostics: self.diagnostics.clone(),
+        self.snapshot_status()
+    }
+
+    fn record_rejection(
+        &mut self,
+        error: PluginIngressDispatchError,
+    ) -> PluginIngressDispatchError {
+        self.dispatch_counters.rejected += 1;
+        self.record_dispatch_error(&error);
+        error
+    }
+
+    fn record_dispatch_error(&mut self, error: &PluginIngressDispatchError) {
+        let state = match error {
+            PluginIngressDispatchError::DispatchFailed(_)
+            | PluginIngressDispatchError::DispatchTimeout { .. }
+            | PluginIngressDispatchError::ServiceFailed(_) => PluginInstanceLifecycleState::Failed,
+            PluginIngressDispatchError::ServiceStopped { .. } => self.lifecycle.clone(),
+            _ => self.lifecycle.clone(),
+        };
+        self.record_runtime_error(error.diagnostic_kind(), error.bounded_message());
+        if matches!(state, PluginInstanceLifecycleState::Failed) {
+            self.lifecycle = PluginInstanceLifecycleState::Failed;
         }
+    }
+
+    fn process_service_output_commands(
+        &mut self,
+        output: &Value,
+        event: &PluginIngressEvent,
+    ) -> Vec<PluginServiceOutputCommandResult> {
+        let results = match self.validate_service_output_commands(output, event) {
+            Ok(commands) => {
+                let mut results = Vec::with_capacity(commands.len());
+                for command in commands {
+                    results.push(self.execute_service_output_command(command));
+                }
+                results
+            }
+            Err(results) => results,
+        };
+        self.record_service_output_command_results(&results);
+        results
+    }
+
+    fn validate_service_output_commands(
+        &self,
+        output: &Value,
+        event: &PluginIngressEvent,
+    ) -> Result<Vec<PluginServiceOutputCommandEnvelope>, Vec<PluginServiceOutputCommandResult>>
+    {
+        let Some(values) = output.get("output_commands") else {
+            return Ok(Vec::new());
+        };
+        let Some(values) = values.as_array() else {
+            return Err(vec![PluginServiceOutputCommandResult::rejected(
+                "service output_commands must be an array",
+            )]);
+        };
+        if values.len() > PLUGIN_SERVICE_OUTPUT_COMMAND_MAX_COUNT {
+            return Err(vec![PluginServiceOutputCommandResult::rejected(format!(
+                "service output_commands exceeds {} commands",
+                PLUGIN_SERVICE_OUTPUT_COMMAND_MAX_COUNT
+            ))]);
+        }
+
+        let mut commands = Vec::with_capacity(values.len());
+        let mut rejected = Vec::new();
+        for value in values {
+            let command: PluginServiceOutputCommandEnvelope =
+                match serde_json::from_value(value.clone()) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        rejected.push(PluginServiceOutputCommandResult::rejected(format!(
+                            "malformed service output command envelope: {error}"
+                        )));
+                        continue;
+                    }
+                };
+            if let Err(message) = self.validate_service_output_command_envelope(&command, event) {
+                rejected.push(PluginServiceOutputCommandResult::rejected_for(
+                    &command, message,
+                ));
+                continue;
+            }
+            if let Err(message) = self.grant_check_service_output_command(&command) {
+                rejected.push(PluginServiceOutputCommandResult::rejected_for(
+                    &command, message,
+                ));
+                continue;
+            }
+            commands.push(command);
+        }
+
+        if rejected.is_empty() {
+            Ok(commands)
+        } else {
+            Err(rejected)
+        }
+    }
+
+    fn validate_service_output_command_envelope(
+        &self,
+        command: &PluginServiceOutputCommandEnvelope,
+        event: &PluginIngressEvent,
+    ) -> Result<(), String> {
+        validate_output_command_id("correlation_id", &command.correlation_id)?;
+        validate_output_command_id("source_event_id", &command.source_event_id)?;
+        validate_output_command_id("command_id", &command.command_id)?;
+        if command.source_event_id != event.correlation_id {
+            return Err("source_event_id must match the ingress event correlation_id".to_string());
+        }
+        chrono::DateTime::parse_from_rfc3339(&command.requested_at)
+            .map_err(|error| format!("requested_at must be RFC3339: {error}"))?;
+        let payload_bytes = serde_json::to_vec(&command.payload)
+            .map_err(|error| format!("payload is not serializable JSON: {error}"))?;
+        if payload_bytes.len() > PLUGIN_SERVICE_OUTPUT_COMMAND_MAX_PAYLOAD_BYTES {
+            return Err(format!(
+                "payload exceeds {} bytes",
+                PLUGIN_SERVICE_OUTPUT_COMMAND_MAX_PAYLOAD_BYTES
+            ));
+        }
+        match command.kind {
+            PluginServiceOutputCommandKind::DiagnosticStatusUpdate => {
+                serde_json::from_value::<PluginServiceDiagnosticStatusCommandPayload>(
+                    command.payload.clone(),
+                )
+                .map_err(|error| format!("invalid diagnostic_status_update payload: {error}"))?;
+            }
+            PluginServiceOutputCommandKind::HostRequestDispatch => {
+                let request: PluginRequestRequest = serde_json::from_value(command.payload.clone())
+                    .map_err(|error| format!("invalid host_request_dispatch payload: {error}"))?;
+                validate_plugin_request_request(&self.record, &request)
+                    .map_err(|error| format!("host_request_dispatch target denied: {}", error.0))?;
+            }
+            PluginServiceOutputCommandKind::WebSocketSend => {
+                let payload: PluginServiceWebSocketSendCommandPayload =
+                    serde_json::from_value(command.payload.clone())
+                        .map_err(|error| format!("invalid websocket_send payload: {error}"))?;
+                self.validate_service_websocket_send_payload(&payload)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn grant_check_service_output_command(
+        &self,
+        command: &PluginServiceOutputCommandEnvelope,
+    ) -> Result<(), String> {
+        match command.kind {
+            PluginServiceOutputCommandKind::DiagnosticStatusUpdate => Ok(()),
+            PluginServiceOutputCommandKind::HostRequestDispatch => {
+                authorize_plugin_host_api(&self.record, PluginHostApi::Request)
+                    .map_err(|error| format!("host_request_dispatch not granted: {}", error.0))
+            }
+            PluginServiceOutputCommandKind::WebSocketSend => {
+                authorize_plugin_host_api(&self.record, PluginHostApi::WebSocket)
+                    .map_err(|error| format!("websocket_send not granted: {}", error.0))
+            }
+        }
+    }
+
+    fn validate_service_websocket_send_payload(
+        &self,
+        payload: &PluginServiceWebSocketSendCommandPayload,
+    ) -> Result<(), String> {
+        if payload.text.len() > PLUGIN_WEBSOCKET_MAX_TEXT_BYTES {
+            return Err(format!(
+                "websocket_send text exceeds {} bytes",
+                PLUGIN_WEBSOCKET_MAX_TEXT_BYTES
+            ));
+        }
+        let url = reqwest::Url::parse(&payload.url)
+            .map_err(|error| format!("invalid WebSocket URL: {error}"))?;
+        match url.scheme() {
+            "ws" | "wss" => {}
+            "http" | "https" => {
+                return Err("HTTP URLs are not supported by websocket_send".to_string());
+            }
+            scheme => {
+                return Err(format!(
+                    "unsupported WebSocket URL scheme {scheme:?}; only ws and wss are allowed"
+                ));
+            }
+        }
+        if url.host_str().is_none() {
+            return Err("WebSocket URL must include a host".to_string());
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err("WebSocket URLs with embedded credentials are not allowed".to_string());
+        }
+        validate_static_request_target(&url).map_err(|error| error.0)?;
+        authorize_websocket_allowlist(&self.record, &url).map_err(|error| error.0)?;
+        Ok(())
+    }
+
+    fn execute_service_output_command(
+        &mut self,
+        command: PluginServiceOutputCommandEnvelope,
+    ) -> PluginServiceOutputCommandResult {
+        match command.kind {
+            PluginServiceOutputCommandKind::DiagnosticStatusUpdate => {
+                let payload: PluginServiceDiagnosticStatusCommandPayload =
+                    match serde_json::from_value(command.payload.clone()) {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            return PluginServiceOutputCommandResult::rejected_for(
+                                &command,
+                                format!("invalid diagnostic_status_update payload: {error}"),
+                            );
+                        }
+                    };
+                if let Some(status) = payload.status {
+                    self.component_status = Some(status);
+                }
+                let message = payload
+                    .message
+                    .as_deref()
+                    .map(bounded_message)
+                    .unwrap_or_else(|| "plugin service status update recorded".to_string());
+                PluginServiceOutputCommandResult::recorded(&command, message)
+            }
+            PluginServiceOutputCommandKind::HostRequestDispatch => {
+                PluginServiceOutputCommandResult::unsupported(
+                    &command,
+                    "host_request_dispatch output command is grant-checked but transport dispatch is unsupported in v0",
+                )
+            }
+            PluginServiceOutputCommandKind::WebSocketSend => {
+                let payload: PluginServiceWebSocketSendCommandPayload =
+                    match serde_json::from_value(command.payload.clone()) {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            return PluginServiceOutputCommandResult::rejected_for(
+                                &command,
+                                format!("invalid websocket_send payload: {error}"),
+                            );
+                        }
+                    };
+                match self
+                    .service_websockets
+                    .send_text(&payload.url, &payload.text)
+                {
+                    Ok(message) => PluginServiceOutputCommandResult::recorded(&command, message),
+                    Err(message) => {
+                        self.diagnostics.push(PluginInstanceDiagnostic::with_kind(
+                            PluginInstanceDiagnosticKind::ServiceWebSocketSendFailed,
+                            self.lifecycle.clone(),
+                            bounded_message(redact_secret_like(&message)),
+                        ));
+                        PluginServiceOutputCommandResult::rejected_for(&command, message)
+                    }
+                }
+            }
+        }
+    }
+
+    fn record_service_output_command_results(
+        &mut self,
+        results: &[PluginServiceOutputCommandResult],
+    ) {
+        if results.is_empty() {
+            return;
+        }
+        for result in results {
+            let kind = match result.status {
+                PluginServiceOutputCommandStatus::Recorded => {
+                    PluginInstanceDiagnosticKind::ServiceOutputCommandRecorded
+                }
+                PluginServiceOutputCommandStatus::Rejected => {
+                    PluginInstanceDiagnosticKind::ServiceOutputCommandRejected
+                }
+                PluginServiceOutputCommandStatus::Unsupported => {
+                    PluginInstanceDiagnosticKind::ServiceOutputCommandUnsupported
+                }
+            };
+            let command_label = result.command_id.as_deref().unwrap_or("<malformed>");
+            let command_kind = result
+                .kind
+                .map(PluginServiceOutputCommandKind::as_str)
+                .unwrap_or("unknown");
+            let message = bounded_message(format!(
+                "service output command {command_label} ({command_kind}): {}",
+                result.message
+            ));
+            if !matches!(result.status, PluginServiceOutputCommandStatus::Recorded) {
+                self.last_error = Some(message.clone());
+            }
+            self.diagnostics.push(PluginInstanceDiagnostic::with_kind(
+                kind,
+                self.lifecycle.clone(),
+                message,
+            ));
+        }
+        self.output_command_results.extend_from_slice(results);
+        if self.output_command_results.len() > PLUGIN_SERVICE_OUTPUT_COMMAND_MAX_RESULTS {
+            let keep_from =
+                self.output_command_results.len() - PLUGIN_SERVICE_OUTPUT_COMMAND_MAX_RESULTS;
+            self.output_command_results.drain(0..keep_from);
+        }
+    }
+
+    fn record_runtime_error(
+        &mut self,
+        kind: PluginInstanceDiagnosticKind,
+        message: impl Into<String>,
+    ) {
+        let message = bounded_message(redact_secret_like(&message.into()));
+        self.last_error = Some(message.clone());
+        self.diagnostics.push(PluginInstanceDiagnostic::with_kind(
+            kind,
+            self.lifecycle.clone(),
+            message,
+        ));
     }
 }
 
 enum PluginInstanceRuntime {
-    LegacyToolAdapter,
+    ComponentToolAdapter,
     #[cfg(test)]
     TestIngress {
-        calls: u64,
+        tool_calls: u64,
+        ingress_calls: u64,
     },
     ComponentInstance(PluginComponentInstanceRuntime),
 }
@@ -3304,12 +4706,16 @@ enum PluginInstanceRuntime {
 impl PluginInstanceRuntime {
     fn new(record: &ResolvedPluginRecord) -> Result<Self, PluginWasmError> {
         let Some(runtime) = record.manifest.runtime.as_ref() else {
-            return Ok(Self::LegacyToolAdapter);
+            return Err(PluginWasmError::Module(
+                "plugin runtime is not declared".to_string(),
+            ));
         };
         match runtime.kind.as_str() {
             #[cfg(test)]
-            "test-ingress" => Ok(Self::TestIngress { calls: 0 }),
-            PLUGIN_RUNTIME_WASM_KIND => Ok(Self::LegacyToolAdapter),
+            "test-ingress" => Ok(Self::TestIngress {
+                tool_calls: 0,
+                ingress_calls: 0,
+            }),
             PLUGIN_RUNTIME_COMPONENT_KIND
                 if runtime.world.as_deref() == Some(PLUGIN_COMPONENT_INSTANCE_WORLD) =>
             {
@@ -3317,7 +4723,17 @@ impl PluginInstanceRuntime {
                     PluginComponentInstanceRuntime::instantiate(record)?,
                 ))
             }
-            PLUGIN_RUNTIME_COMPONENT_KIND => Ok(Self::LegacyToolAdapter),
+            PLUGIN_RUNTIME_COMPONENT_KIND
+                if runtime.world.as_deref() == Some(PLUGIN_COMPONENT_TOOL_WORLD) =>
+            {
+                Ok(Self::ComponentToolAdapter)
+            }
+            PLUGIN_RUNTIME_COMPONENT_KIND => Err(PluginWasmError::Module(
+                "unsupported or missing plugin component world".to_string(),
+            )),
+            LEGACY_PLUGIN_RUNTIME_WASM_KIND => Err(PluginWasmError::Module(
+                "legacy raw wasm plugin runtime is not supported; use wasm-component".to_string(),
+            )),
             other => Err(PluginWasmError::Module(format!(
                 "unsupported plugin runtime kind `{other}`"
             ))),
@@ -3608,64 +5024,6 @@ impl Tool for PluginInstanceTool {
     }
 }
 
-#[cfg(test)]
-struct PluginWasmTool {
-    record: ResolvedPluginRecord,
-    name: String,
-    origin: ToolOrigin,
-}
-
-#[cfg(test)]
-#[async_trait]
-impl Tool for PluginWasmTool {
-    async fn execute(
-        &self,
-        input_json: &str,
-        _ctx: ToolExecutionContext,
-    ) -> Result<ToolOutput, ToolError> {
-        if input_json.len() > PLUGIN_WASM_MAX_INPUT_BYTES {
-            return Err(ToolError::InvalidArgument(format!(
-                "plugin tool `{}` input exceeds {} bytes",
-                self.name, PLUGIN_WASM_MAX_INPUT_BYTES
-            )));
-        }
-        serde_json::from_str::<Value>(input_json).map_err(|error| {
-            ToolError::InvalidArgument(format!(
-                "plugin tool `{}` input is not valid JSON: {}",
-                self.name,
-                bounded_message(error.to_string())
-            ))
-        })?;
-        let record = self.record.clone();
-        let name = self.name.clone();
-        let plugin_ref = self.origin.plugin_ref.clone();
-        let digest = self.origin.digest.clone();
-        let input = input_json.as_bytes().to_vec();
-        let execution = tokio::task::spawn_blocking(move || run_plugin_tool(record, name, input));
-        match tokio::time::timeout(PLUGIN_WASM_TIMEOUT, execution).await {
-            Ok(Ok(Ok(output))) => Ok(output),
-            Ok(Ok(Err(error))) => Err(ToolError::ExecutionFailed(format!(
-                "plugin tool `{}` from `{}` (digest {}) failed closed: {}",
-                self.name,
-                plugin_ref,
-                digest,
-                error.bounded_message()
-            ))),
-            Ok(Err(error)) => Err(ToolError::ExecutionFailed(format!(
-                "plugin tool `{}` from `{}` (digest {}) cancelled/failed to join: {}",
-                self.name,
-                plugin_ref,
-                digest,
-                bounded_message(error.to_string())
-            ))),
-            Err(_) => Err(ToolError::ExecutionFailed(format!(
-                "plugin tool `{}` from `{}` (digest {}) timed out after {:?}",
-                self.name, plugin_ref, digest, PLUGIN_WASM_TIMEOUT
-            ))),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub enum PluginWasmError {
     Package(String),
@@ -3685,143 +5043,6 @@ impl PluginWasmError {
             Self::Output(message) => bounded_message(format!("WASM output error: {message}")),
         }
     }
-}
-
-struct PluginWasmHostState {
-    record: ResolvedPluginRecord,
-    request_client: Arc<dyn PluginRequestClient>,
-    websocket_client: Arc<dyn PluginWebSocketClient>,
-    websocket_handles: PluginWebSocketHandles,
-    tool_name: Vec<u8>,
-    input: Vec<u8>,
-    output: Vec<u8>,
-    output_error: Option<String>,
-    request_response: Vec<u8>,
-    websocket_response: Vec<u8>,
-    fs_response: Vec<u8>,
-    store_limits: wasmi::StoreLimits,
-}
-
-fn run_plugin_tool(
-    record: ResolvedPluginRecord,
-    tool_name: String,
-    input: Vec<u8>,
-) -> Result<ToolOutput, PluginWasmError> {
-    match record
-        .manifest
-        .runtime
-        .as_ref()
-        .map(|runtime| runtime.kind.as_str())
-    {
-        Some(PLUGIN_RUNTIME_WASM_KIND) => run_plugin_wasm_tool(record, tool_name, input),
-        Some(PLUGIN_RUNTIME_COMPONENT_KIND) => run_plugin_component_tool(record, tool_name, input),
-        Some(other) => Err(PluginWasmError::Module(format!(
-            "unsupported plugin runtime kind `{other}`"
-        ))),
-        None => Err(PluginWasmError::Package(
-            "plugin runtime is not declared".to_string(),
-        )),
-    }
-}
-
-fn run_plugin_wasm_tool(
-    record: ResolvedPluginRecord,
-    tool_name: String,
-    input: Vec<u8>,
-) -> Result<ToolOutput, PluginWasmError> {
-    run_plugin_wasm_tool_with_request_client(
-        record,
-        tool_name,
-        input,
-        Arc::new(ReqwestPluginRequestClient),
-    )
-}
-
-fn run_plugin_wasm_tool_with_request_client(
-    record: ResolvedPluginRecord,
-    tool_name: String,
-    input: Vec<u8>,
-    request_client: Arc<dyn PluginRequestClient>,
-) -> Result<ToolOutput, PluginWasmError> {
-    let tool = record
-        .manifest
-        .tools
-        .iter()
-        .find(|tool| tool.name == tool_name)
-        .ok_or_else(|| {
-            PluginWasmError::Module("requested tool is not declared by plugin manifest".to_string())
-        })?;
-    authorize_plugin_tool(&record, tool).map_err(|error| {
-        PluginWasmError::Module(format!(
-            "plugin permission denied: {}",
-            error.bounded_message()
-        ))
-    })?;
-    let limits = PluginDiscoveryLimits::default();
-    let module_bytes = read_resolved_plugin_runtime_module(&record, &limits)
-        .map_err(|diagnostic| PluginWasmError::Package(diagnostic.message))?;
-    if module_bytes.len() > limits.max_file_size_bytes as usize {
-        return Err(PluginWasmError::Package(format!(
-            "WASM runtime module exceeds {} bytes",
-            limits.max_file_size_bytes
-        )));
-    }
-
-    let mut config = wasmi::Config::default();
-    config.consume_fuel(true);
-    config.set_max_recursion_depth(64);
-    config.set_max_stack_height(8 * 1024 * 1024);
-    let engine = wasmi::Engine::new(&config);
-    let module = wasmi::Module::new(&engine, &module_bytes[..])
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-    validate_wasm_imports(&record, &module)?;
-
-    let store_limits = wasmi::StoreLimitsBuilder::new()
-        .memory_size(PLUGIN_WASM_MEMORY_BYTES)
-        .table_elements(PLUGIN_WASM_TABLE_ELEMENTS)
-        .instances(1)
-        .tables(1)
-        .memories(1)
-        .trap_on_grow_failure(true)
-        .build();
-    let mut store = wasmi::Store::new(
-        &engine,
-        PluginWasmHostState {
-            record: record.clone(),
-            request_client,
-            websocket_client: Arc::new(TungstenitePluginWebSocketClient),
-            websocket_handles: PluginWebSocketHandles::default(),
-            tool_name: tool_name.into_bytes(),
-            input,
-            output: Vec::new(),
-            output_error: None,
-            request_response: Vec::new(),
-            websocket_response: Vec::new(),
-            fs_response: Vec::new(),
-            store_limits,
-        },
-    );
-    store.limiter(|state| &mut state.store_limits);
-    store
-        .set_fuel(PLUGIN_WASM_FUEL)
-        .map_err(|error| PluginWasmError::Execution(error.to_string()))?;
-
-    let mut linker = wasmi::Linker::<PluginWasmHostState>::new(&engine);
-    define_plugin_wasm_host_imports(&mut linker)?;
-    let instance = linker
-        .instantiate_and_start(&mut store, &module)
-        .map_err(|error| PluginWasmError::Execution(error.to_string()))?;
-    let entry = instance
-        .get_typed_func::<(), ()>(&store, PLUGIN_WASM_ENTRYPOINT)
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-    entry
-        .call(&mut store, ())
-        .map_err(|error| PluginWasmError::Execution(error.to_string()))?;
-
-    if let Some(error) = store.data().output_error.clone() {
-        return Err(PluginWasmError::Output(error));
-    }
-    decode_plugin_wasm_output(&store.data().output)
 }
 
 #[derive(Clone)]
@@ -4123,515 +5344,6 @@ fn define_plugin_component_host_imports(
     .map_err(|error| PluginWasmError::Module(error.to_string()))?;
     Ok(())
 }
-fn validate_wasm_imports(
-    record: &ResolvedPluginRecord,
-    module: &wasmi::Module,
-) -> Result<(), PluginWasmError> {
-    for import in module.imports() {
-        match import.module() {
-            PLUGIN_WASM_HOST_MODULE => match import.name() {
-                "tool_name_len" | "tool_name_read" | "input_len" | "input_read"
-                | "output_write" => {}
-                other => {
-                    return Err(PluginWasmError::Module(format!(
-                        "unsupported host import `{}`; no filesystem, ambient network, environment, or WASI imports are available",
-                        other
-                    )));
-                }
-            },
-            PLUGIN_WASM_REQUEST_MODULE => {
-                authorize_plugin_host_api(record, PluginHostApi::Request).map_err(|error| {
-                    PluginWasmError::Module(format!(
-                        "plugin host API dispatch denied: {}",
-                        error.bounded_message()
-                    ))
-                })?;
-                match import.name() {
-                    "request" | "response_len" | "response_read" => {}
-                    other => {
-                        return Err(PluginWasmError::Module(format!(
-                            "unsupported request host import `{other}`"
-                        )));
-                    }
-                }
-            }
-            PLUGIN_WASM_WEBSOCKET_MODULE => {
-                authorize_plugin_host_api(record, PluginHostApi::WebSocket).map_err(|error| {
-                    PluginWasmError::Module(format!(
-                        "plugin host API dispatch denied: {}",
-                        error.bounded_message()
-                    ))
-                })?;
-                match import.name() {
-                    "open" | "send_text" | "recv" | "close" | "response_len" | "response_read" => {}
-                    other => {
-                        return Err(PluginWasmError::Module(format!(
-                            "unsupported websocket host import `{other}`"
-                        )));
-                    }
-                }
-            }
-            PLUGIN_WASM_FS_MODULE => {
-                authorize_plugin_host_api(record, PluginHostApi::Fs).map_err(|error| {
-                    PluginWasmError::Module(format!(
-                        "plugin host API dispatch denied: {}",
-                        error.bounded_message()
-                    ))
-                })?;
-                match import.name() {
-                    "read" | "list" | "write" | "response_len" | "response_read" => {}
-                    other => {
-                        return Err(PluginWasmError::Module(format!(
-                            "unsupported fs host import `{other}`"
-                        )));
-                    }
-                }
-            }
-            other => {
-                return Err(PluginWasmError::Module(format!(
-                    "unsupported import module `{}`; only `{}`, `{}`, `{}`, and `{}` are available",
-                    other,
-                    PLUGIN_WASM_HOST_MODULE,
-                    PLUGIN_WASM_REQUEST_MODULE,
-                    PLUGIN_WASM_WEBSOCKET_MODULE,
-                    PLUGIN_WASM_FS_MODULE
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn define_plugin_wasm_host_imports(
-    linker: &mut wasmi::Linker<PluginWasmHostState>,
-) -> Result<(), PluginWasmError> {
-    linker
-        .func_wrap(
-            PLUGIN_WASM_HOST_MODULE,
-            "tool_name_len",
-            |caller: wasmi::Caller<'_, PluginWasmHostState>| -> i32 {
-                caller.data().tool_name.len() as i32
-            },
-        )
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-    linker
-        .func_wrap(
-            PLUGIN_WASM_HOST_MODULE,
-            "input_len",
-            |caller: wasmi::Caller<'_, PluginWasmHostState>| -> i32 {
-                caller.data().input.len() as i32
-            },
-        )
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-    linker
-        .func_wrap(
-            PLUGIN_WASM_HOST_MODULE,
-            "tool_name_read",
-            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, ptr: i32, len: i32| -> i32 {
-                write_host_bytes_to_guest(&mut caller, ptr, len, HostBuffer::ToolName)
-            },
-        )
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-    linker
-        .func_wrap(
-            PLUGIN_WASM_HOST_MODULE,
-            "input_read",
-            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, ptr: i32, len: i32| -> i32 {
-                write_host_bytes_to_guest(&mut caller, ptr, len, HostBuffer::Input)
-            },
-        )
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-    linker
-        .func_wrap(
-            PLUGIN_WASM_HOST_MODULE,
-            "output_write",
-            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, ptr: i32, len: i32| -> i32 {
-                read_guest_output(&mut caller, ptr, len)
-            },
-        )
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-
-    linker
-        .func_wrap(
-            PLUGIN_WASM_REQUEST_MODULE,
-            "request",
-            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, ptr: i32, len: i32| -> i32 {
-                read_guest_request_request(&mut caller, ptr, len)
-            },
-        )
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-    linker
-        .func_wrap(
-            PLUGIN_WASM_REQUEST_MODULE,
-            "response_len",
-            |caller: wasmi::Caller<'_, PluginWasmHostState>| -> i32 {
-                caller.data().request_response.len() as i32
-            },
-        )
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-    linker
-        .func_wrap(
-            PLUGIN_WASM_REQUEST_MODULE,
-            "response_read",
-            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, ptr: i32, len: i32| -> i32 {
-                write_host_bytes_to_guest(&mut caller, ptr, len, HostBuffer::RequestResponse)
-            },
-        )
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-
-    linker
-        .func_wrap(
-            PLUGIN_WASM_WEBSOCKET_MODULE,
-            "open",
-            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, ptr: i32, len: i32| -> i32 {
-                read_guest_websocket_open(&mut caller, ptr, len)
-            },
-        )
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-    linker
-        .func_wrap(
-            PLUGIN_WASM_WEBSOCKET_MODULE,
-            "send_text",
-            |mut caller: wasmi::Caller<'_, PluginWasmHostState>,
-             handle: i32,
-             ptr: i32,
-             len: i32|
-             -> i32 { read_guest_websocket_send_text(&mut caller, handle, ptr, len) },
-        )
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-    linker
-        .func_wrap(
-            PLUGIN_WASM_WEBSOCKET_MODULE,
-            "recv",
-            |mut caller: wasmi::Caller<'_, PluginWasmHostState>,
-             handle: i32,
-             timeout_ms: i32|
-             -> i32 { read_guest_websocket_recv(&mut caller, handle, timeout_ms) },
-        )
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-    linker
-        .func_wrap(
-            PLUGIN_WASM_WEBSOCKET_MODULE,
-            "close",
-            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, handle: i32| -> i32 {
-                read_guest_websocket_close(&mut caller, handle)
-            },
-        )
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-    linker
-        .func_wrap(
-            PLUGIN_WASM_WEBSOCKET_MODULE,
-            "response_len",
-            |caller: wasmi::Caller<'_, PluginWasmHostState>| -> i32 {
-                caller.data().websocket_response.len() as i32
-            },
-        )
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-    linker
-        .func_wrap(
-            PLUGIN_WASM_WEBSOCKET_MODULE,
-            "response_read",
-            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, ptr: i32, len: i32| -> i32 {
-                write_host_bytes_to_guest(&mut caller, ptr, len, HostBuffer::WebSocketResponse)
-            },
-        )
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-
-    linker
-        .func_wrap(
-            PLUGIN_WASM_FS_MODULE,
-            "read",
-            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, ptr: i32, len: i32| -> i32 {
-                read_guest_fs_request(&mut caller, ptr, len, PluginFsRuntimeOperation::Read)
-            },
-        )
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-    linker
-        .func_wrap(
-            PLUGIN_WASM_FS_MODULE,
-            "list",
-            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, ptr: i32, len: i32| -> i32 {
-                read_guest_fs_request(&mut caller, ptr, len, PluginFsRuntimeOperation::List)
-            },
-        )
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-    linker
-        .func_wrap(
-            PLUGIN_WASM_FS_MODULE,
-            "write",
-            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, ptr: i32, len: i32| -> i32 {
-                read_guest_fs_request(&mut caller, ptr, len, PluginFsRuntimeOperation::Write)
-            },
-        )
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-    linker
-        .func_wrap(
-            PLUGIN_WASM_FS_MODULE,
-            "response_len",
-            |caller: wasmi::Caller<'_, PluginWasmHostState>| -> i32 {
-                caller.data().fs_response.len() as i32
-            },
-        )
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-    linker
-        .func_wrap(
-            PLUGIN_WASM_FS_MODULE,
-            "response_read",
-            |mut caller: wasmi::Caller<'_, PluginWasmHostState>, ptr: i32, len: i32| -> i32 {
-                write_host_bytes_to_guest(&mut caller, ptr, len, HostBuffer::FsResponse)
-            },
-        )
-        .map_err(|error| PluginWasmError::Module(error.to_string()))?;
-    Ok(())
-}
-#[derive(Clone, Copy, Debug)]
-enum HostBuffer {
-    ToolName,
-    Input,
-    RequestResponse,
-    WebSocketResponse,
-    FsResponse,
-}
-
-fn write_host_bytes_to_guest(
-    caller: &mut wasmi::Caller<'_, PluginWasmHostState>,
-    ptr: i32,
-    len: i32,
-    buffer: HostBuffer,
-) -> i32 {
-    if ptr < 0 || len < 0 {
-        return -1;
-    }
-    let bytes = match buffer {
-        HostBuffer::ToolName => caller.data().tool_name.clone(),
-        HostBuffer::Input => caller.data().input.clone(),
-        HostBuffer::RequestResponse => caller.data().request_response.clone(),
-        HostBuffer::WebSocketResponse => caller.data().websocket_response.clone(),
-        HostBuffer::FsResponse => caller.data().fs_response.clone(),
-    };
-    if len as usize != bytes.len() {
-        return -1;
-    }
-    let Some(memory) = caller
-        .get_export("memory")
-        .and_then(|export| export.into_memory())
-    else {
-        return -1;
-    };
-    match memory.write(caller, ptr as usize, &bytes) {
-        Ok(()) => bytes.len() as i32,
-        Err(_) => -1,
-    }
-}
-
-fn read_guest_request_request(
-    caller: &mut wasmi::Caller<'_, PluginWasmHostState>,
-    ptr: i32,
-    len: i32,
-) -> i32 {
-    let bytes = match read_guest_bytes(caller, ptr, len, PLUGIN_REQUEST_MAX_REQUEST_BYTES) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            caller.data_mut().output_error = Some(error);
-            return -1;
-        }
-    };
-    let record = caller.data().record.clone();
-    let request_client = caller.data().request_client.clone();
-    match execute_plugin_request_request(&record, request_client.as_ref(), &bytes) {
-        Ok(response) => {
-            caller.data_mut().request_response = response;
-            caller.data().request_response.len() as i32
-        }
-        Err(error) => {
-            caller.data_mut().output_error = Some(error.0);
-            -1
-        }
-    }
-}
-
-fn read_guest_websocket_open(
-    caller: &mut wasmi::Caller<'_, PluginWasmHostState>,
-    ptr: i32,
-    len: i32,
-) -> i32 {
-    let bytes = match read_guest_bytes(caller, ptr, len, PLUGIN_WEBSOCKET_MAX_OPEN_REQUEST_BYTES) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            caller.data_mut().output_error = Some(error);
-            return -1;
-        }
-    };
-    let record = caller.data().record.clone();
-    let websocket_client = caller.data().websocket_client.clone();
-    let websocket_handles = caller.data().websocket_handles.clone();
-    match execute_plugin_websocket_open(
-        &record,
-        websocket_client.as_ref(),
-        &websocket_handles,
-        &bytes,
-    ) {
-        Ok(response) => {
-            caller.data_mut().websocket_response = response;
-            caller.data().websocket_response.len() as i32
-        }
-        Err(error) => {
-            caller.data_mut().output_error = Some(error.0);
-            -1
-        }
-    }
-}
-
-fn read_guest_websocket_send_text(
-    caller: &mut wasmi::Caller<'_, PluginWasmHostState>,
-    handle: i32,
-    ptr: i32,
-    len: i32,
-) -> i32 {
-    let bytes = match read_guest_bytes(caller, ptr, len, PLUGIN_WEBSOCKET_MAX_TEXT_BYTES) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            caller.data_mut().output_error = Some(error);
-            return -1;
-        }
-    };
-    match execute_plugin_websocket_send_text(
-        &caller.data().websocket_handles,
-        handle as u32,
-        &bytes,
-    ) {
-        Ok(response) => {
-            caller.data_mut().websocket_response = response;
-            caller.data().websocket_response.len() as i32
-        }
-        Err(error) => {
-            caller.data_mut().output_error = Some(error.0);
-            -1
-        }
-    }
-}
-
-fn read_guest_websocket_recv(
-    caller: &mut wasmi::Caller<'_, PluginWasmHostState>,
-    handle: i32,
-    timeout_ms: i32,
-) -> i32 {
-    match execute_plugin_websocket_recv(
-        &caller.data().websocket_handles,
-        handle as u32,
-        timeout_ms.max(0) as u32,
-    ) {
-        Ok(response) => {
-            caller.data_mut().websocket_response = response;
-            caller.data().websocket_response.len() as i32
-        }
-        Err(error) => {
-            caller.data_mut().output_error = Some(error.0);
-            -1
-        }
-    }
-}
-
-fn read_guest_websocket_close(
-    caller: &mut wasmi::Caller<'_, PluginWasmHostState>,
-    handle: i32,
-) -> i32 {
-    match execute_plugin_websocket_close(&caller.data().websocket_handles, handle as u32) {
-        Ok(response) => {
-            caller.data_mut().websocket_response = response;
-            caller.data().websocket_response.len() as i32
-        }
-        Err(error) => {
-            caller.data_mut().output_error = Some(error.0);
-            -1
-        }
-    }
-}
-fn read_guest_fs_request(
-    caller: &mut wasmi::Caller<'_, PluginWasmHostState>,
-    ptr: i32,
-    len: i32,
-    operation: PluginFsRuntimeOperation,
-) -> i32 {
-    let bytes = match read_guest_bytes(caller, ptr, len, PLUGIN_FS_MAX_REQUEST_BYTES) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            caller.data_mut().output_error = Some(error);
-            return -1;
-        }
-    };
-    let record = caller.data().record.clone();
-    match execute_plugin_fs_request(&record, operation, &bytes) {
-        Ok(response) => {
-            caller.data_mut().fs_response = response;
-            caller.data().fs_response.len() as i32
-        }
-        Err(error) => {
-            caller.data_mut().output_error = Some(error.message);
-            -1
-        }
-    }
-}
-
-fn read_guest_bytes(
-    caller: &mut wasmi::Caller<'_, PluginWasmHostState>,
-    ptr: i32,
-    len: i32,
-    max_len: usize,
-) -> Result<Vec<u8>, String> {
-    if ptr < 0 || len < 0 {
-        return Err("guest input pointer/length is invalid".into());
-    }
-    let len = len as usize;
-    if len > max_len {
-        return Err(format!("guest input exceeds {max_len} bytes"));
-    }
-    let Some(memory) = caller
-        .get_export("memory")
-        .and_then(|export| export.into_memory())
-    else {
-        return Err("guest did not export linear memory".into());
-    };
-    let mut bytes = vec![0; len];
-    memory
-        .read(&*caller, ptr as usize, &mut bytes)
-        .map_err(|_| "guest input memory range is invalid".to_string())?;
-    Ok(bytes)
-}
-
-fn read_guest_output(
-    caller: &mut wasmi::Caller<'_, PluginWasmHostState>,
-    ptr: i32,
-    len: i32,
-) -> i32 {
-    if ptr < 0 || len < 0 {
-        caller.data_mut().output_error = Some("guest output pointer/length is invalid".into());
-        return -1;
-    }
-    let len = len as usize;
-    if len > PLUGIN_WASM_MAX_OUTPUT_BYTES {
-        caller.data_mut().output_error = Some(format!(
-            "guest output exceeds {} bytes",
-            PLUGIN_WASM_MAX_OUTPUT_BYTES
-        ));
-        return -1;
-    }
-    let Some(memory) = caller
-        .get_export("memory")
-        .and_then(|export| export.into_memory())
-    else {
-        caller.data_mut().output_error = Some("guest did not export linear memory".into());
-        return -1;
-    };
-    let mut output = vec![0; len];
-    if memory.read(&*caller, ptr as usize, &mut output).is_err() {
-        caller.data_mut().output_error = Some("guest output memory range is invalid".into());
-        return -1;
-    }
-    caller.data_mut().output = output;
-    len as i32
-}
-
 fn decode_plugin_wasm_output(bytes: &[u8]) -> Result<ToolOutput, PluginWasmError> {
     if bytes.is_empty() {
         return Err(PluginWasmError::Output(
@@ -4721,6 +5433,15 @@ fn bounded_message(message: impl Into<String>) -> String {
         }
     }
     sanitized
+}
+
+fn validate_output_command_id(field: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+        return Err(format!(
+            "{field} is empty, too long, or contains control characters"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_declared_tool_names(record: &ResolvedPluginRecord) -> Result<(), FeatureInstallError> {
@@ -4968,7 +5689,13 @@ mod tests {
                 version: "0.1.0".into(),
                 description: None,
                 surfaces: vec![PluginSurface::Tool],
-                runtime: None,
+                runtime: Some(manifest::plugin::PluginRuntimeManifest {
+                    kind: "test-ingress".to_string(),
+                    entry: None,
+                    abi: None,
+                    component: None,
+                    world: None,
+                }),
                 hooks: Vec::new(),
                 tools,
                 services: Vec::new(),
@@ -5048,7 +5775,7 @@ mod tests {
             Some(PLUGIN_COMPONENT_INSTANCE_WORLD.into());
         let handle = PluginInstanceHandle::new(record).unwrap();
         let status = handle.status();
-        assert_eq!(status.lifecycle, PluginInstanceLifecycleState::Started);
+        assert_eq!(status.lifecycle, PluginInstanceLifecycleState::Running);
         assert_eq!(status.component_status.unwrap()["data"]["phase"], "status");
         let stopped = handle.stop().unwrap();
         assert_eq!(stopped.lifecycle, PluginInstanceLifecycleState::Stopped);
@@ -5118,6 +5845,172 @@ mod tests {
             .push(PluginPermission::ingress(name));
     }
 
+    fn test_ingress_event(ingress_name: &str, payload: Value) -> PluginIngressEvent {
+        PluginIngressEvent::new(ingress_name, "test", "unit", payload)
+    }
+
+    fn service_output_command(
+        event: &PluginIngressEvent,
+        command_id: &str,
+        kind: &str,
+        payload: Value,
+    ) -> Value {
+        json!({
+            "correlation_id": event.correlation_id.clone(),
+            "source_event_id": event.correlation_id.clone(),
+            "command_id": command_id,
+            "kind": kind,
+            "payload": payload,
+            "requested_at": event.created_at.clone(),
+        })
+    }
+
+    fn add_request_output_grant(record: &mut ResolvedPluginRecord) {
+        let permission = PluginPermission::host_api(PluginHostApi::Request);
+        record.manifest.permissions.push(permission.clone());
+        record.grants.permissions.push(permission);
+        let target = PluginRequestGrant {
+            scheme: "https".to_string(),
+            host: "api.example.test".to_string(),
+            port: None,
+            methods: vec!["POST".to_string()],
+            path_prefixes: vec!["/v1".to_string()],
+        };
+        record.manifest.request.push(target.clone());
+        record.grants.request.push(target);
+    }
+
+    fn add_websocket_output_grant(record: &mut ResolvedPluginRecord) {
+        let permission = PluginPermission::host_api(PluginHostApi::WebSocket);
+        record.manifest.permissions.push(permission.clone());
+        record.grants.permissions.push(permission);
+        let target = PluginWebSocketGrant {
+            scheme: "wss".to_string(),
+            host: "ws.example.test".to_string(),
+            port: None,
+            path_prefixes: vec!["/events".to_string()],
+        };
+        record.manifest.websocket.push(target.clone());
+        record.grants.websocket.push(target);
+    }
+
+    fn add_websocket_ingress_source(record: &mut ResolvedPluginRecord, source: &str) {
+        let ingress = record
+            .manifest
+            .ingresses
+            .iter_mut()
+            .find(|ingress| ingress.name == "shared_ingress")
+            .expect("shared ingress");
+        ingress.event_kinds = vec![
+            "test".into(),
+            "websocket_text".into(),
+            "websocket_close".into(),
+            "websocket_error".into(),
+        ];
+        ingress.sources.push(source.to_string());
+    }
+
+    fn service_websocket_record() -> ResolvedPluginRecord {
+        let mut record = test_service_ingress_record();
+        add_websocket_output_grant(&mut record);
+        add_websocket_ingress_source(&mut record, "websocket:wss://ws.example.test/events");
+        record
+    }
+
+    #[derive(Clone, Default)]
+    struct ServiceWebSocketClient {
+        events: Arc<Mutex<VecDeque<Result<PluginWebSocketRecvResponse, String>>>>,
+        sent: Arc<Mutex<Vec<String>>>,
+        opens: Arc<std::sync::atomic::AtomicUsize>,
+        send_error: Arc<Mutex<Option<String>>>,
+    }
+
+    impl ServiceWebSocketClient {
+        fn with_events(events: Vec<Result<PluginWebSocketRecvResponse, String>>) -> Self {
+            Self {
+                events: Arc::new(Mutex::new(events.into())),
+                ..Self::default()
+            }
+        }
+
+        fn sent(&self) -> Vec<String> {
+            self.sent.lock().unwrap().clone()
+        }
+
+        fn fail_sends_with(&self, message: &str) {
+            *self.send_error.lock().unwrap() = Some(message.to_string());
+        }
+    }
+
+    impl PluginWebSocketClient for ServiceWebSocketClient {
+        fn supports_bounded_open(&self) -> bool {
+            true
+        }
+
+        fn open(
+            &self,
+            _request: &PluginWebSocketOpenRequest,
+            _url: &reqwest::Url,
+            _limits: PluginWebSocketLimits,
+        ) -> Result<Box<dyn PluginWebSocketConnection>, PluginWebSocketError> {
+            self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(ServiceWebSocketConnection {
+                events: self.events.clone(),
+                sent: self.sent.clone(),
+                send_error: self.send_error.clone(),
+                closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }))
+        }
+    }
+
+    struct ServiceWebSocketConnection {
+        events: Arc<Mutex<VecDeque<Result<PluginWebSocketRecvResponse, String>>>>,
+        sent: Arc<Mutex<Vec<String>>>,
+        send_error: Arc<Mutex<Option<String>>>,
+        closed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl PluginWebSocketConnection for ServiceWebSocketConnection {
+        fn send_text(&mut self, text: &str) -> Result<(), PluginWebSocketError> {
+            if let Some(error) = self.send_error.lock().unwrap().clone() {
+                return Err(PluginWebSocketError::new(error));
+            }
+            self.sent.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+
+        fn recv_text(
+            &mut self,
+            timeout: Duration,
+            _max_message_bytes: usize,
+        ) -> Result<PluginWebSocketRecvResponse, PluginWebSocketError> {
+            if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(PluginWebSocketRecvResponse::Closed);
+            }
+            if let Some(event) = self.events.lock().unwrap().pop_front() {
+                return event.map_err(PluginWebSocketError::new);
+            }
+            std::thread::sleep(timeout.min(Duration::from_millis(10)));
+            Err(PluginWebSocketError::new("receive timed out"))
+        }
+
+        fn close(&mut self) -> Result<(), PluginWebSocketError> {
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if condition() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(condition(), "condition did not become true before timeout");
+    }
+
     #[test]
     fn service_selected_ignores_unselected_tool_without_grants() {
         let mut record = record(vec![tool("hidden_tool")]);
@@ -5140,7 +6033,7 @@ mod tests {
         assert_eq!(report.reports[0].provided_services.len(), 1);
         assert_eq!(
             feature.instance_status().unwrap().lifecycle,
-            PluginInstanceLifecycleState::Ready
+            PluginInstanceLifecycleState::Running
         );
     }
 
@@ -5162,11 +6055,7 @@ mod tests {
         assert!(report.reports[0].provided_services.is_empty());
         let dispatch = feature.dispatch_ingress(
             "hidden_ingress",
-            PluginIngressEvent {
-                kind: "test".into(),
-                source: "unit".into(),
-                payload: serde_json::json!({}),
-            },
+            test_ingress_event("hidden_ingress", serde_json::json!({})),
         );
         assert!(
             dispatch
@@ -5194,7 +6083,522 @@ mod tests {
             "{report:#?}"
         );
         let status = feature.instance_status().expect("service instance started");
-        assert_eq!(status.lifecycle, PluginInstanceLifecycleState::Started);
+        assert_eq!(status.lifecycle, PluginInstanceLifecycleState::Running);
+        assert_eq!(status.queue_depth, 0);
+        assert_eq!(status.queue_capacity, PLUGIN_SERVICE_INGRESS_QUEUE_CAPACITY);
+        assert!(status.last_error.is_none());
+    }
+
+    fn test_service_ingress_record() -> ResolvedPluginRecord {
+        let mut record = record(Vec::new());
+        add_service(&mut record, "svc");
+        add_ingress(&mut record, "shared_ingress");
+        record.manifest.runtime = Some(manifest::plugin::PluginRuntimeManifest {
+            kind: "test-ingress".into(),
+            entry: None,
+            abi: None,
+            component: None,
+            world: Some(PLUGIN_COMPONENT_INSTANCE_WORLD.into()),
+        });
+        record
+    }
+
+    #[test]
+    fn ingress_queue_dispatches_serially_and_reports_status() {
+        let handle = PluginInstanceHandle::new(test_service_ingress_record()).unwrap();
+        assert_eq!(
+            handle.status().lifecycle,
+            PluginInstanceLifecycleState::Running
+        );
+
+        let first = handle
+            .deliver_ingress(
+                "shared_ingress",
+                test_ingress_event("shared_ingress", serde_json::json!({ "seq": 1 })),
+            )
+            .unwrap();
+        let second = handle
+            .deliver_ingress(
+                "shared_ingress",
+                test_ingress_event("shared_ingress", serde_json::json!({ "seq": 2 })),
+            )
+            .unwrap();
+
+        assert_eq!(first.output["ingress_calls"], 1);
+        assert_eq!(second.output["ingress_calls"], 2);
+        assert_eq!(second.queue_depth, 0);
+        assert_eq!(second.dispatch_counters.enqueued, 2);
+        assert_eq!(second.dispatch_counters.dispatched, 2);
+        let status = handle.status();
+        assert_eq!(status.queue_depth, 0);
+        assert_eq!(status.dispatch_counters.enqueued, 2);
+        assert_eq!(status.dispatch_counters.dispatched, 2);
+        assert!(status.last_error.is_none());
+    }
+
+    #[test]
+    fn bounded_ingress_queue_rejects_full_queue() {
+        let handle = PluginInstanceHandle::new(test_service_ingress_record()).unwrap();
+        let mut instance = handle.0.lock().unwrap();
+        instance.ingress_queue_capacity = 1;
+        instance
+            .enqueue_ingress(
+                "shared_ingress",
+                test_ingress_event("shared_ingress", serde_json::json!({ "seq": 1 })),
+            )
+            .unwrap();
+        let error = instance
+            .enqueue_ingress(
+                "shared_ingress",
+                test_ingress_event("shared_ingress", serde_json::json!({ "seq": 2 })),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PluginIngressDispatchError::QueueFull { capacity: 1 }
+        ));
+        assert_eq!(instance.ingress_queue.len(), 1);
+        assert_eq!(instance.dispatch_counters.rejected, 1);
+        assert_eq!(
+            instance.diagnostics.last().unwrap().kind,
+            PluginInstanceDiagnosticKind::QueueFull
+        );
+    }
+
+    #[test]
+    fn ingress_dispatch_failure_marks_service_failed_and_rejects_later_events() {
+        let handle = PluginInstanceHandle::new(test_service_ingress_record()).unwrap();
+        let error = handle
+            .deliver_ingress(
+                "shared_ingress",
+                test_ingress_event("shared_ingress", serde_json::json!({ "fail": true })),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PluginIngressDispatchError::DispatchFailed(_)
+        ));
+        let status = handle.status();
+        assert_eq!(status.lifecycle, PluginInstanceLifecycleState::Failed);
+        assert_eq!(status.dispatch_counters.failed, 1);
+        assert_eq!(
+            status.diagnostics.last().unwrap().kind,
+            PluginInstanceDiagnosticKind::DispatchFailed
+        );
+
+        let retry = handle
+            .deliver_ingress(
+                "shared_ingress",
+                test_ingress_event("shared_ingress", serde_json::json!({ "seq": 3 })),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            retry,
+            PluginIngressDispatchError::ServiceFailed(_)
+        ));
+    }
+
+    #[test]
+    fn ingress_dispatch_timeout_records_typed_diagnostic() {
+        let handle = PluginInstanceHandle::new(test_service_ingress_record()).unwrap();
+        let error = handle
+            .deliver_ingress(
+                "shared_ingress",
+                test_ingress_event("shared_ingress", serde_json::json!({ "sleep_ms": 50 })),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PluginIngressDispatchError::DispatchTimeout { .. }
+        ));
+        let status = handle.status();
+        assert_eq!(status.lifecycle, PluginInstanceLifecycleState::Failed);
+        assert_eq!(status.dispatch_counters.timed_out, 1);
+        assert_eq!(
+            status.diagnostics.last().unwrap().kind,
+            PluginInstanceDiagnosticKind::DispatchTimeout
+        );
+    }
+
+    #[test]
+    fn stopped_service_rejects_ingress_events() {
+        let handle = PluginInstanceHandle::new(test_service_ingress_record()).unwrap();
+        handle.stop().unwrap();
+        let error = handle
+            .deliver_ingress(
+                "shared_ingress",
+                test_ingress_event("shared_ingress", serde_json::json!({ "seq": 1 })),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PluginIngressDispatchError::ServiceStopped {
+                state: PluginInstanceLifecycleState::Stopped
+            }
+        ));
+    }
+
+    #[test]
+    fn invalid_ingress_event_is_typed_rejection() {
+        let handle = PluginInstanceHandle::new(test_service_ingress_record()).unwrap();
+        let mut event = test_ingress_event("shared_ingress", serde_json::json!({}));
+        event.correlation_id.clear();
+        let error = handle.deliver_ingress("shared_ingress", event).unwrap_err();
+        assert!(matches!(error, PluginIngressDispatchError::InvalidEvent(_)));
+        let status = handle.status();
+        assert_eq!(status.dispatch_counters.rejected, 1);
+        assert_eq!(
+            status.diagnostics.last().unwrap().kind,
+            PluginInstanceDiagnosticKind::InvalidEvent
+        );
+    }
+
+    #[test]
+    fn service_output_command_records_diagnostic_status_separately_from_tool_output() {
+        let handle = PluginInstanceHandle::new(test_service_ingress_record()).unwrap();
+        let mut event = test_ingress_event("shared_ingress", json!({}));
+        let command = service_output_command(
+            &event,
+            "cmd-status",
+            "diagnostic_status_update",
+            json!({
+                "message": "service became ready",
+                "status": {"ready": true}
+            }),
+        );
+        event.payload = json!({"output_commands": [command]});
+
+        let report = handle.deliver_ingress("shared_ingress", event).unwrap();
+
+        assert_eq!(report.output_command_results.len(), 1);
+        assert_eq!(
+            report.output_command_results[0].kind,
+            Some(PluginServiceOutputCommandKind::DiagnosticStatusUpdate)
+        );
+        assert_eq!(
+            report.output_command_results[0].status,
+            PluginServiceOutputCommandStatus::Recorded
+        );
+        assert_eq!(
+            report.output["payload"]["output_commands"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let status = handle.status();
+        assert_eq!(status.component_status, Some(json!({"ready": true})));
+        assert_eq!(status.output_command_results.len(), 1);
+        assert!(status.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == PluginInstanceDiagnosticKind::ServiceOutputCommandRecorded
+                && diagnostic.message.contains("cmd-status")
+        }));
+    }
+
+    #[test]
+    fn service_output_command_rejects_ungranted_request_without_executing_status_update() {
+        let handle = PluginInstanceHandle::new(test_service_ingress_record()).unwrap();
+        let mut event = test_ingress_event("shared_ingress", json!({}));
+        let status_command = service_output_command(
+            &event,
+            "cmd-status",
+            "diagnostic_status_update",
+            json!({"status": {"should_not_record": true}}),
+        );
+        let request_command = service_output_command(
+            &event,
+            "cmd-request",
+            "host_request_dispatch",
+            json!({
+                "method": "POST",
+                "url": "https://api.example.test/v1/events"
+            }),
+        );
+        event.payload = json!({"output_commands": [status_command, request_command]});
+
+        let report = handle.deliver_ingress("shared_ingress", event).unwrap();
+
+        assert_eq!(report.output_command_results.len(), 1);
+        assert_eq!(
+            report.output_command_results[0].status,
+            PluginServiceOutputCommandStatus::Rejected
+        );
+        assert_eq!(handle.status().component_status, None);
+        assert!(handle.status().diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == PluginInstanceDiagnosticKind::ServiceOutputCommandRejected
+                && diagnostic.message.contains("cmd-request")
+        }));
+    }
+
+    #[test]
+    fn service_output_commands_are_grant_checked_and_supported_transport_rejects_without_connection()
+     {
+        let mut record = test_service_ingress_record();
+        add_request_output_grant(&mut record);
+        add_websocket_output_grant(&mut record);
+        let handle = PluginInstanceHandle::new(record).unwrap();
+        let mut event = test_ingress_event("shared_ingress", json!({}));
+        let request_command = service_output_command(
+            &event,
+            "cmd-request",
+            "host_request_dispatch",
+            json!({
+                "method": "POST",
+                "url": "https://api.example.test/v1/events"
+            }),
+        );
+        let websocket_command = service_output_command(
+            &event,
+            "cmd-websocket",
+            "websocket_send",
+            json!({
+                "url": "wss://ws.example.test/events",
+                "text": "hello"
+            }),
+        );
+        event.payload = json!({"output_commands": [request_command, websocket_command]});
+
+        let report = handle.deliver_ingress("shared_ingress", event).unwrap();
+
+        assert_eq!(report.output_command_results.len(), 2);
+        let request_result = report
+            .output_command_results
+            .iter()
+            .find(|result| result.command_id.as_deref() == Some("cmd-request"))
+            .unwrap();
+        let websocket_result = report
+            .output_command_results
+            .iter()
+            .find(|result| result.command_id.as_deref() == Some("cmd-websocket"))
+            .unwrap();
+        assert_eq!(
+            request_result.status,
+            PluginServiceOutputCommandStatus::Unsupported
+        );
+        assert_eq!(
+            websocket_result.status,
+            PluginServiceOutputCommandStatus::Rejected
+        );
+        let status = handle.status();
+        assert_eq!(status.output_command_results.len(), 2);
+        assert!(status.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == PluginInstanceDiagnosticKind::ServiceOutputCommandUnsupported
+                && diagnostic.message.contains("cmd-request")
+        }));
+        assert!(status.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == PluginInstanceDiagnosticKind::ServiceOutputCommandRejected
+                && diagnostic.message.contains("cmd-websocket")
+        }));
+    }
+
+    #[test]
+    fn service_websocket_driver_enqueues_incoming_text_and_reports_close() {
+        let client = ServiceWebSocketClient::with_events(vec![
+            Ok(PluginWebSocketRecvResponse::Text {
+                text: "hello service".into(),
+            }),
+            Ok(PluginWebSocketRecvResponse::Closed),
+        ]);
+        let handle = PluginInstanceHandle::new_with_test_websocket_client(
+            service_websocket_record(),
+            Arc::new(client.clone()),
+        )
+        .unwrap();
+
+        wait_until(|| handle.status().dispatch_counters.dispatched >= 1);
+        let status = handle.status();
+        assert!(status.dispatch_counters.dispatched >= 1);
+        assert_eq!(status.websocket_connections.len(), 1);
+        let connection = &status.websocket_connections[0];
+        assert_eq!(connection.received_text_frames, 1);
+        assert!(connection.last_frame_at.is_some());
+        assert_eq!(connection.queue_drops, 0);
+        assert!(status.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == PluginInstanceDiagnosticKind::ServiceWebSocketClosed
+        }));
+        handle.stop().unwrap();
+    }
+
+    #[test]
+    fn websocket_send_output_command_sends_on_host_owned_connection() {
+        let client = ServiceWebSocketClient::default();
+        let handle = PluginInstanceHandle::new_with_test_websocket_client(
+            service_websocket_record(),
+            Arc::new(client.clone()),
+        )
+        .unwrap();
+        wait_until(|| {
+            handle
+                .status()
+                .websocket_connections
+                .iter()
+                .any(|connection| {
+                    connection.state == PluginServiceWebSocketConnectionState::Connected
+                })
+        });
+        let event = test_ingress_event("shared_ingress", json!({}));
+        let command_value = service_output_command(
+            &event,
+            "cmd-websocket",
+            "websocket_send",
+            json!({"url": "wss://ws.example.test/events", "text": "pong"}),
+        );
+        let command: PluginServiceOutputCommandEnvelope =
+            serde_json::from_value(command_value).unwrap();
+
+        let result = handle
+            .0
+            .lock()
+            .unwrap()
+            .execute_service_output_command(command);
+
+        assert_eq!(result.status, PluginServiceOutputCommandStatus::Recorded);
+        assert_eq!(client.sent(), vec!["pong".to_string()]);
+        let status = handle.status();
+        assert_eq!(status.websocket_connections[0].sent_text_frames, 1);
+        handle.stop().unwrap();
+    }
+
+    #[test]
+    fn websocket_send_output_command_records_send_failure_diagnostic() {
+        let client = ServiceWebSocketClient::default();
+        client.fail_sends_with("transport write failed");
+        let handle = PluginInstanceHandle::new_with_test_websocket_client(
+            service_websocket_record(),
+            Arc::new(client),
+        )
+        .unwrap();
+        wait_until(|| {
+            handle
+                .status()
+                .websocket_connections
+                .iter()
+                .any(|connection| {
+                    connection.state == PluginServiceWebSocketConnectionState::Connected
+                })
+        });
+        let event = test_ingress_event("shared_ingress", json!({}));
+        let command: PluginServiceOutputCommandEnvelope =
+            serde_json::from_value(service_output_command(
+                &event,
+                "cmd-websocket-fail",
+                "websocket_send",
+                json!({"url": "wss://ws.example.test/events", "text": "pong"}),
+            ))
+            .unwrap();
+
+        let result = handle
+            .0
+            .lock()
+            .unwrap()
+            .execute_service_output_command(command);
+
+        assert_eq!(result.status, PluginServiceOutputCommandStatus::Rejected);
+        let status = handle.status();
+        assert_eq!(status.websocket_connections[0].send_failures, 1);
+        assert!(status.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == PluginInstanceDiagnosticKind::ServiceWebSocketSendFailed
+                && diagnostic.message.contains("transport write failed")
+        }));
+        handle.stop().unwrap();
+    }
+
+    #[test]
+    fn websocket_send_rejects_unauthorized_target_before_execution() {
+        let mut record = service_websocket_record();
+        let handle = PluginInstanceHandle::new_with_test_websocket_client(
+            record.clone(),
+            Arc::new(ServiceWebSocketClient::default()),
+        )
+        .unwrap();
+        let event = test_ingress_event("shared_ingress", json!({}));
+        let command: PluginServiceOutputCommandEnvelope =
+            serde_json::from_value(service_output_command(
+                &event,
+                "cmd-websocket-denied",
+                "websocket_send",
+                json!({"url": "wss://ws.example.test/private", "text": "nope"}),
+            ))
+            .unwrap();
+
+        let error = handle
+            .0
+            .lock()
+            .unwrap()
+            .validate_service_output_command_envelope(&command, &event)
+            .unwrap_err();
+
+        assert!(
+            error.contains("websocket_send target denied")
+                || error.contains("not declared by the plugin manifest"),
+            "{error}"
+        );
+        assert_eq!(handle.status().websocket_connections[0].sent_text_frames, 0);
+        record.grants.permissions.retain(|permission| {
+            *permission != PluginPermission::host_api(PluginHostApi::WebSocket)
+        });
+        let denied_handle = PluginInstanceHandle::new_with_test_websocket_client(
+            record,
+            Arc::new(ServiceWebSocketClient::default()),
+        )
+        .unwrap();
+        wait_until(|| !denied_handle.status().diagnostics.is_empty());
+        assert!(denied_handle.status().diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == PluginInstanceDiagnosticKind::ServiceWebSocketError
+                && diagnostic.message.contains("not granted")
+        }));
+        handle.stop().unwrap();
+        denied_handle.stop().unwrap();
+    }
+
+    #[test]
+    fn service_websocket_driver_reports_receive_error_as_diagnostic() {
+        let client = ServiceWebSocketClient::with_events(vec![Err(
+            "binary frames are not supported by host-owned service websocket".into(),
+        )]);
+        let handle = PluginInstanceHandle::new_with_test_websocket_client(
+            service_websocket_record(),
+            Arc::new(client),
+        )
+        .unwrap();
+
+        wait_until(|| {
+            handle.status().websocket_connections[0].state
+                == PluginServiceWebSocketConnectionState::Failed
+        });
+        let status = handle.status();
+        assert!(status.diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == PluginInstanceDiagnosticKind::ServiceWebSocketError
+                && diagnostic.message.contains("binary frames")
+        }));
+        assert!(
+            status.websocket_connections[0]
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("binary frames")
+        );
+        handle.stop().unwrap();
+    }
+
+    #[test]
+    fn service_output_command_rejects_malformed_envelope() {
+        let handle = PluginInstanceHandle::new(test_service_ingress_record()).unwrap();
+        let mut event = test_ingress_event("shared_ingress", json!({}));
+        event.payload = json!({"output_commands": [{"kind": "diagnostic_status_update"}]});
+
+        let report = handle.deliver_ingress("shared_ingress", event).unwrap();
+
+        assert_eq!(report.output_command_results.len(), 1);
+        assert_eq!(
+            report.output_command_results[0].status,
+            PluginServiceOutputCommandStatus::Rejected
+        );
+        assert!(
+            report.output_command_results[0]
+                .message
+                .contains("malformed service output command envelope")
+        );
     }
 
     #[test]
@@ -5230,11 +6634,7 @@ mod tests {
         let report = feature
             .dispatch_ingress(
                 "shared_ingress",
-                PluginIngressEvent {
-                    kind: "test".into(),
-                    source: "unit".into(),
-                    payload: serde_json::json!({ "hello": "world" }),
-                },
+                test_ingress_event("shared_ingress", serde_json::json!({ "hello": "world" })),
             )
             .unwrap();
         assert!(report.accepted);
@@ -5275,9 +6675,19 @@ mod tests {
             .push(PluginPermission::ingress("shared_ingress"));
         let handle = PluginInstanceHandle(Arc::new(Mutex::new(PluginInstance {
             record,
-            runtime: PluginInstanceRuntime::TestIngress { calls: 0 },
-            lifecycle: PluginInstanceLifecycleState::Started,
+            runtime: PluginInstanceRuntime::TestIngress {
+                tool_calls: 0,
+                ingress_calls: 0,
+            },
+            lifecycle: PluginInstanceLifecycleState::Running,
             component_status: None,
+            ingress_queue: VecDeque::new(),
+            ingress_queue_capacity: PLUGIN_SERVICE_INGRESS_QUEUE_CAPACITY,
+            dispatch_counters: PluginIngressDispatchCounters::default(),
+            last_error: None,
+            output_command_results: Vec::new(),
+            service_websockets: PluginServiceWebSocketDriver::default(),
+            service_websocket_client: Arc::new(TungstenitePluginWebSocketClient),
             diagnostics: Vec::new(),
         })));
 
@@ -5287,11 +6697,7 @@ mod tests {
         let report = handle
             .deliver_ingress(
                 "shared_ingress",
-                PluginIngressEvent {
-                    kind: "test".into(),
-                    source: "unit".into(),
-                    payload: serde_json::json!({ "hello": "world" }),
-                },
+                test_ingress_event("shared_ingress", serde_json::json!({ "hello": "world" })),
             )
             .unwrap();
         assert!(report.accepted);
@@ -5431,34 +6837,6 @@ mod tests {
         json!({ "method": method, "url": url }).to_string()
     }
 
-    fn wasm_tool_that_calls_request(request: &str) -> Vec<u8> {
-        let output = br#"{"summary":"request ok","content":"ordinary tool result path"}"#;
-        wat::parse_str(format!(
-            r#"
-            (module
-              (import "yoi:tool" "output_write" (func $output_write (param i32 i32) (result i32)))
-              (import "yoi:request" "request" (func $request_request (param i32 i32) (result i32)))
-              (import "yoi:request" "response_len" (func $request_response_len (result i32)))
-              (memory (export "memory") 1)
-              (data (i32.const 16) "{}")
-              (data (i32.const 4096) "{}")
-              (func (export "yoi_tool_call")
-                (local $n i32)
-                (local.set $n (call $request_request (i32.const 16) (i32.const {})))
-                (if (i32.lt_s (local.get $n) (i32.const 0)) (then unreachable))
-                (drop (call $request_response_len))
-                (drop (call $output_write (i32.const 4096) (i32.const {})))
-              )
-            )
-            "#,
-            wat_bytes(request.as_bytes()),
-            wat_bytes(output),
-            request.len(),
-            output.len()
-        ))
-        .expect("valid wat")
-    }
-
     fn fs_request_json(path: &str) -> String {
         json!({ "path": path }).to_string()
     }
@@ -5482,73 +6860,6 @@ mod tests {
             operations,
         });
         record
-    }
-
-    fn runtime_record_with_fs_wasm(
-        wasm: Vec<u8>,
-        root: &Path,
-        operations: Vec<PluginFsOperation>,
-    ) -> (TempDir, ResolvedPluginRecord) {
-        let (dir, mut record) = resolved_record_with_wasm(wasm);
-        let fs_permission = PluginPermission::HostApi {
-            api: PluginHostApi::Fs,
-        };
-        record.manifest.permissions.push(fs_permission.clone());
-        record.grants.permissions.push(fs_permission);
-        record.grants.fs.push(PluginFsGrant {
-            root: root.to_string_lossy().into_owned(),
-            operations,
-        });
-        (dir, record)
-    }
-
-    fn wasm_tool_that_calls_fs_read(request: &str) -> Vec<u8> {
-        let output = br#"{"summary":"fs ok","content":"ordinary tool result path"}"#;
-        wat::parse_str(format!(
-            r#"
-            (module
-              (import "yoi:tool" "output_write" (func $output_write (param i32 i32) (result i32)))
-              (import "yoi:fs" "read" (func $fs_read (param i32 i32) (result i32)))
-              (import "yoi:fs" "response_len" (func $fs_response_len (result i32)))
-              (import "yoi:fs" "response_read" (func $fs_response_read (param i32 i32) (result i32)))
-              (memory (export "memory") 1)
-              (data (i32.const 16) "{}")
-              (data (i32.const 4096) "{}")
-              (func (export "yoi_tool_call")
-                (local $n i32)
-                (local.set $n (call $fs_read (i32.const 16) (i32.const {})))
-                (if (i32.lt_s (local.get $n) (i32.const 0)) (then unreachable))
-                (drop (call $fs_response_len))
-                (drop (call $fs_response_read (i32.const 8192) (i32.const 4096)))
-                (drop (call $output_write (i32.const 4096) (i32.const {})))
-              )
-            )
-            "#,
-            wat_bytes(request.as_bytes()),
-            wat_bytes(output),
-            request.len(),
-            output.len()
-        ))
-        .expect("valid wat")
-    }
-
-    fn empty_wasm_tool() -> Vec<u8> {
-        let output = br#"{"summary":"no network","content":"no request import"}"#;
-        wat::parse_str(format!(
-            r#"
-            (module
-              (import "yoi:tool" "output_write" (func $output_write (param i32 i32) (result i32)))
-              (memory (export "memory") 1)
-              (data (i32.const 4096) "{}")
-              (func (export "yoi_tool_call")
-                (drop (call $output_write (i32.const 4096) (i32.const {})))
-              )
-            )
-            "#,
-            wat_bytes(output),
-            output.len()
-        ))
-        .expect("valid wat")
     }
 
     #[test]
@@ -5631,21 +6942,6 @@ mod tests {
             "additionalProperties":{"type":"string"}
         }))
         .unwrap();
-    }
-
-    #[test]
-    fn wasm_tool_can_call_granted_fs_read_host_api() {
-        let root = TempDir::new().expect("temp root");
-        fs::write(root.path().join("allowed.txt"), "hello fs").expect("write fixture");
-        let (_dir, record) = runtime_record_with_fs_wasm(
-            wasm_tool_that_calls_fs_read(&fs_request_json("allowed.txt")),
-            root.path(),
-            vec![PluginFsOperation::Read],
-        );
-        let output = run_plugin_wasm_tool(record, "PluginEcho".to_string(), Vec::new())
-            .expect("tool output");
-        assert_eq!(output.summary, "fs ok");
-        assert_eq!(output.content.as_deref(), Some("ordinary tool result path"));
     }
 
     #[test]
@@ -5879,44 +7175,6 @@ mod tests {
     }
 
     #[test]
-    fn wasm_tool_can_call_granted_request_host_api() {
-        let (_dir, record) = runtime_record_with_request_wasm(wasm_tool_that_calls_request(
-            &request_request_json("GET", "https://api.example.test/v1/data"),
-        ));
-        let client = Arc::new(MockRequestClient::default());
-        let output = run_plugin_wasm_tool_with_request_client(
-            record,
-            "PluginEcho".to_string(),
-            Vec::new(),
-            client.clone(),
-        )
-        .expect("tool output");
-        assert_eq!(client.call_count(), 1);
-        assert_eq!(output.summary, "request ok");
-        assert_eq!(output.content.as_deref(), Some("ordinary tool result path"));
-    }
-
-    #[test]
-    fn missing_request_grant_denies_before_network() {
-        let (_dir, mut record) = resolved_record_with_wasm(wasm_tool_that_calls_request(
-            &request_request_json("GET", "https://api.example.test/v1/data"),
-        ));
-        record.manifest.permissions.push(PluginPermission::HostApi {
-            api: PluginHostApi::Request,
-        });
-        let client = Arc::new(MockRequestClient::default());
-        let error = run_plugin_wasm_tool_with_request_client(
-            record,
-            "PluginEcho".to_string(),
-            Vec::new(),
-            client.clone(),
-        )
-        .expect_err("grant denied");
-        assert_eq!(client.call_count(), 0);
-        assert!(error.bounded_message().contains("host_api.request"));
-    }
-
-    #[test]
     fn disallowed_request_targets_deny_before_network() {
         let record = record_with_request_grant();
         let client = MockRequestClient::default();
@@ -6074,21 +7332,6 @@ mod tests {
     }
 
     #[test]
-    fn no_network_without_request_import() {
-        let (_dir, record) = runtime_record_with_request_wasm(empty_wasm_tool());
-        let client = Arc::new(MockRequestClient::default());
-        let output = run_plugin_wasm_tool_with_request_client(
-            record,
-            "PluginEcho".to_string(),
-            Vec::new(),
-            client.clone(),
-        )
-        .expect("tool output");
-        assert_eq!(client.call_count(), 0);
-        assert_eq!(output.summary, "no network");
-    }
-
-    #[test]
     fn enabled_plugin_tool_registers_model_visible_schema_and_origin() {
         let mut pending = Vec::new();
         let mut hooks = crate::hook::HookRegistryBuilder::new();
@@ -6129,9 +7372,14 @@ mod tests {
             "granted surfaces.tool permission is missing"
         ));
 
-        let error = run_plugin_wasm_tool(record, "PluginSearch".into(), br#"{}"#.to_vec())
-            .unwrap_err()
-            .bounded_message();
+        let (_dir, mut runtime_record) = resolved_record_with_component(
+            component_tool_that_returns(br#"{"summary":"should not run"}"#),
+        );
+        runtime_record.grants = PluginGrantConfig::default();
+        let error =
+            run_plugin_component_tool(runtime_record, "PluginEcho".into(), br#"{}"#.to_vec())
+                .unwrap_err()
+                .bounded_message();
         assert!(error.contains("plugin permission denied"), "{error}");
         assert!(
             error.contains("granted surfaces.tool permission is missing"),
@@ -6229,11 +7477,33 @@ mod tests {
     }
 
     #[test]
-    fn future_host_api_imports_are_permission_checked_before_unimplemented_boundary() {
-        let (_dir, mut record) = resolved_record_with_wasm(request_import_module());
-        let error = run_plugin_wasm_tool(record.clone(), "PluginEcho".into(), br#"{}"#.to_vec())
-            .unwrap_err()
-            .bounded_message();
+    fn component_host_api_imports_are_permission_checked_by_manifest_and_grants() {
+        let (_dir, mut record) = resolved_record_with_component(component_tool_importing_request(
+            br#"{"summary":"should not run"}"#,
+        ));
+        record.manifest.permissions.retain(|permission| {
+            !matches!(
+                permission,
+                PluginPermission::HostApi {
+                    api: PluginHostApi::Request
+                }
+            )
+        });
+        record.manifest.request.clear();
+        record.grants.permissions.retain(|permission| {
+            !matches!(
+                permission,
+                PluginPermission::HostApi {
+                    api: PluginHostApi::Request
+                }
+            )
+        });
+        record.grants.request.clear();
+
+        let error =
+            run_plugin_component_tool(record.clone(), "PluginEcho".into(), br#"{}"#.to_vec())
+                .unwrap_err()
+                .bounded_message();
         assert!(
             error.contains("requested host_api.request permission is missing"),
             "{error}"
@@ -6247,9 +7517,10 @@ mod tests {
             .grants
             .permissions
             .push(PluginPermission::host_api(PluginHostApi::Request));
-        let error = run_plugin_wasm_tool(record.clone(), "PluginEcho".into(), br#"{}"#.to_vec())
-            .unwrap_err()
-            .bounded_message();
+        let error =
+            run_plugin_component_tool(record.clone(), "PluginEcho".into(), br#"{}"#.to_vec())
+                .unwrap_err()
+                .bounded_message();
         assert!(
             error.contains("manifest host_api.request target declaration is missing"),
             "{error}"
@@ -6262,7 +7533,7 @@ mod tests {
             methods: vec!["GET".to_string()],
             path_prefixes: vec!["/".to_string()],
         });
-        let error = run_plugin_wasm_tool(record, "PluginEcho".into(), br#"{}"#.to_vec())
+        let error = run_plugin_component_tool(record, "PluginEcho".into(), br#"{}"#.to_vec())
             .unwrap_err()
             .bounded_message();
         assert!(
@@ -6359,33 +7630,6 @@ mod tests {
         assert!(has_diagnostic(&report, "$.properties.query"));
     }
 
-    #[tokio::test]
-    async fn registered_plugin_tool_executes_wasm_and_returns_normal_tool_result() {
-        let (_dir, record) = resolved_record_with_wasm(input_reaches_guest_module());
-        let origin = PluginToolFeature::new(record.clone()).origin();
-        let tool = PluginWasmTool {
-            record,
-            name: "PluginEcho".into(),
-            origin,
-        };
-
-        let output = tool
-            .execute(r#"{"x":1}"#, ToolExecutionContext::default())
-            .await
-            .unwrap();
-        assert_eq!(output.summary, "input reached");
-        assert_eq!(output.content.as_deref(), Some("ordinary tool result path"));
-
-        let result = llm_worker::tool::ToolResult::from_output("call-1", output);
-        assert_eq!(result.summary, "input reached");
-        assert!(
-            result
-                .content
-                .unwrap()
-                .contains("ordinary tool result path")
-        );
-    }
-
     #[test]
     fn pdk_tool_output_shape_is_accepted_by_wasm_decoder() {
         let pdk_output =
@@ -6396,164 +7640,6 @@ mod tests {
         let output = decode_plugin_wasm_output(pdk_output.as_bytes()).unwrap();
         assert_eq!(output.summary, "pdk ok");
         assert_eq!(output.content.as_deref(), Some(r#"{"answer":42}"#));
-    }
-
-    #[tokio::test]
-    async fn malformed_input_json_fails_before_wasm_execution() {
-        let (_dir, record) = resolved_record_with_wasm(input_reaches_guest_module());
-        let origin = PluginToolFeature::new(record.clone()).origin();
-        let tool = PluginWasmTool {
-            record,
-            name: "PluginEcho".into(),
-            origin,
-        };
-
-        let error = tool
-            .execute("not json", ToolExecutionContext::default())
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("input is not valid JSON"));
-    }
-
-    #[tokio::test]
-    async fn malformed_output_fails_closed() {
-        let (_dir, record) = resolved_record_with_wasm(output_module(b"not json"));
-        let error =
-            run_plugin_wasm_tool(record, "PluginEcho".into(), br#"{}"#.to_vec()).unwrap_err();
-        assert!(error.bounded_message().contains("not valid JSON"));
-    }
-
-    #[tokio::test]
-    async fn schema_mismatch_output_fails_closed() {
-        let (_dir, record) = resolved_record_with_wasm(output_module(br#"{"summary":1}"#));
-        let error =
-            run_plugin_wasm_tool(record, "PluginEcho".into(), br#"{}"#.to_vec()).unwrap_err();
-        assert!(error.bounded_message().contains("summary must be a string"));
-    }
-
-    #[tokio::test]
-    async fn oversize_output_fails_closed() {
-        let (_dir, record) = resolved_record_with_wasm(oversize_output_module());
-        let error =
-            run_plugin_wasm_tool(record, "PluginEcho".into(), br#"{}"#.to_vec()).unwrap_err();
-        assert!(error.bounded_message().contains("exceeds"));
-    }
-
-    #[tokio::test]
-    async fn nonterminating_execution_fails_closed_with_fuel_boundary() {
-        let (_dir, record) = resolved_record_with_wasm(nonterminating_module());
-        let error =
-            run_plugin_wasm_tool(record, "PluginEcho".into(), br#"{}"#.to_vec()).unwrap_err();
-        let message = error.bounded_message();
-        assert!(
-            message.contains("Execution")
-                || message.contains("fuel")
-                || message.contains("execution"),
-            "{message}"
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_runtime_module_returns_safe_bounded_tool_error() {
-        let record = record_with_missing_package_runtime();
-        let origin = PluginToolFeature::new(record.clone()).origin();
-        let tool = PluginWasmTool {
-            record,
-            name: "PluginSearch".into(),
-            origin,
-        };
-
-        let error = tool
-            .execute("{}", ToolExecutionContext::default())
-            .await
-            .unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("failed closed"));
-        assert!(message.contains("metadata could not be read"));
-        assert!(message.len() < 900);
-        assert!(message.contains("project:example"));
-    }
-
-    #[tokio::test]
-    async fn ambient_wasi_fs_network_env_imports_are_unavailable() {
-        let (_dir, record) = resolved_record_with_wasm(wasi_import_module());
-        let error =
-            run_plugin_wasm_tool(record, "PluginEcho".into(), br#"{}"#.to_vec()).unwrap_err();
-        let message = error.bounded_message();
-        assert!(message.contains("unsupported import module"), "{message}");
-        assert!(message.contains("wasi_snapshot_preview1"), "{message}");
-    }
-
-    fn record_with_missing_package_runtime() -> ResolvedPluginRecord {
-        let mut record = record(vec![tool("PluginSearch")]);
-        record.manifest.runtime = Some(PluginRuntimeManifest {
-            kind: PLUGIN_RUNTIME_WASM_KIND.into(),
-            entry: Some("plugin.wasm".into()),
-            abi: Some(PLUGIN_RUNTIME_WASM_ABI.into()),
-            component: None,
-            world: None,
-        });
-        record
-    }
-
-    fn runtime_record_with_request_wasm(wasm: Vec<u8>) -> (TempDir, ResolvedPluginRecord) {
-        let (dir, mut record) = resolved_record_with_wasm(wasm);
-        let request_permission = PluginPermission::HostApi {
-            api: PluginHostApi::Request,
-        };
-        record.manifest.permissions.push(request_permission.clone());
-        record.manifest.request.push(PluginRequestGrant {
-            scheme: "https".to_string(),
-            host: "api.example.test".to_string(),
-            port: None,
-            methods: vec!["GET".to_string(), "POST".to_string()],
-            path_prefixes: vec!["/v1".to_string()],
-        });
-        record.grants.permissions.push(request_permission);
-        record.grants.request.push(PluginRequestGrant {
-            scheme: "https".to_string(),
-            host: "api.example.test".to_string(),
-            port: None,
-            methods: vec!["GET".to_string(), "POST".to_string()],
-            path_prefixes: vec!["/v1".to_string()],
-        });
-        (dir, record)
-    }
-
-    fn resolved_record_with_wasm(wasm: Vec<u8>) -> (TempDir, ResolvedPluginRecord) {
-        let dir = TempDir::new().unwrap();
-        let package_dir = dir.path().join(".yoi/plugins");
-        fs::create_dir_all(&package_dir).unwrap();
-        let package_path = package_dir.join("example.yoi-plugin");
-        write_plugin_package(&package_path, &wasm);
-        let config = PluginConfig {
-            enabled: vec![PluginEnablementConfig {
-                id: "project:example".parse().unwrap(),
-                surfaces: vec![PluginSurface::Tool],
-                ..PluginEnablementConfig::default()
-            }],
-            resolved: Vec::new(),
-            diagnostics: Vec::new(),
-        };
-        let options = PluginDiscoveryOptions::new(dir.path());
-        let resolved = resolve_plugin_config_for_startup(&config, &options);
-        assert!(
-            resolved.diagnostics.is_empty(),
-            "{:#?}",
-            resolved.diagnostics
-        );
-        assert_eq!(resolved.resolved.len(), 1);
-        let mut record = resolved.resolved[0].clone();
-        record.grants = PluginGrantConfig {
-            id: Some(record.identity.to_string()),
-            version: Some(PluginExactVersion(record.version.clone())),
-            digest: Some(record.digest.clone()),
-            permissions: tool_permissions(&record.manifest.tools),
-            request: Vec::new(),
-            websocket: Vec::new(),
-            fs: Vec::new(),
-        };
-        (dir, record)
     }
 
     fn write_component_plugin_package(path: &Path, component: &[u8], world: &str) {
@@ -6628,6 +7714,13 @@ input_schema = {{ type = "object", additionalProperties = true }}
             fs: Vec::new(),
         };
         (dir, record)
+    }
+
+    fn wat_bytes(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| format!(r#"\{:02x}"#, byte))
+            .collect()
     }
 
     fn component_instance_with_outputs(
@@ -7047,6 +8140,38 @@ input_schema = {{ type = "object", additionalProperties = true }}
     }
 
     #[test]
+    fn legacy_raw_wasm_runtime_is_rejected_without_fallback_execution() {
+        let mut record = record(vec![tool("PluginEcho")]);
+        record.manifest.runtime = Some(PluginRuntimeManifest {
+            kind: LEGACY_PLUGIN_RUNTIME_WASM_KIND.to_string(),
+            entry: Some("plugin.wasm".to_string()),
+            abi: Some("yoi-plugin-wasm-1".to_string()),
+            component: None,
+            world: None,
+        });
+
+        let inspection = inspect_resolved_plugin_static(&record);
+        assert!(!inspection.runtime.eligible);
+        assert!(
+            inspection
+                .runtime
+                .diagnostic
+                .as_deref()
+                .unwrap_or_default()
+                .contains("legacy raw wasm plugin runtime is not an active execution path")
+        );
+
+        let error = match PluginInstanceHandle::new(record) {
+            Ok(_) => panic!("legacy raw wasm runtime unexpectedly instantiated"),
+            Err(error) => error.bounded_message(),
+        };
+        assert!(
+            error.contains("legacy raw wasm plugin runtime is not supported"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn component_static_inspection_reports_component_runtime_without_execution() {
         let mut record = record(vec![tool("Echo")]);
         record.package_path = std::path::PathBuf::from("/no/such/component.wasm");
@@ -7068,159 +8193,16 @@ input_schema = {{ type = "object", additionalProperties = true }}
         assert!(inspection.runtime.diagnostic.is_none());
     }
 
-    fn write_plugin_package(path: &Path, wasm: &[u8]) {
-        let manifest = br#"schema_version = 1
-id = "example"
-name = "Example"
-version = "1.0.0"
-description = "Example plugin"
-surfaces = ["tool"]
-
-[runtime]
-kind = "wasm"
-entry = "plugin.wasm"
-abi = "yoi-plugin-wasm-1"
-
-[[permissions]]
-kind = "surface"
-surface = "tool"
-
-[[permissions]]
-kind = "tool"
-name = "PluginEcho"
-
-[[tools]]
-name = "PluginEcho"
-description = "Echo plugin tool"
-input_schema = { type = "object", additionalProperties = true }
-"#;
-        write_stored_zip(
-            path,
-            &[("plugin.toml", manifest.as_slice()), ("plugin.wasm", wasm)],
-        );
-    }
-
-    fn input_reaches_guest_module() -> Vec<u8> {
-        let ok = br#"{"summary":"input reached","content":"ordinary tool result path"}"#;
-        let bad = br#"{"summary":"input missing"}"#;
-        let wat = format!(
-            r#"(module
-                (import "yoi:tool" "input_len" (func $input_len (result i32)))
-                (import "yoi:tool" "input_read" (func $input_read (param i32 i32) (result i32)))
-                (import "yoi:tool" "output_write" (func $output_write (param i32 i32) (result i32)))
-                (memory (export "memory") 1)
-                (data (i32.const 0) "{}")
-                (data (i32.const 128) "{}")
-                (func (export "yoi_tool_call")
-                  (local $len i32)
-                  (local.set $len (call $input_len))
-                  (if (i32.eq (local.get $len) (i32.const 7))
-                    (then
-                      (drop (call $input_read (i32.const 512) (local.get $len)))
-                      (if (i32.eq (i32.load8_u (i32.const 517)) (i32.const 49))
-                        (then (drop (call $output_write (i32.const 0) (i32.const {}))))
-                        (else (drop (call $output_write (i32.const 128) (i32.const {}))))
-                      )
-                    )
-                    (else (drop (call $output_write (i32.const 128) (i32.const {}))))
-                  )
-                )
-              )"#,
-            wat_bytes(ok),
-            wat_bytes(bad),
-            ok.len(),
-            bad.len(),
-            bad.len()
-        );
-        wat::parse_str(wat).unwrap()
-    }
-
-    fn output_module(output: &[u8]) -> Vec<u8> {
-        let wat = format!(
-            r#"(module
-                (import "yoi:tool" "output_write" (func $output_write (param i32 i32) (result i32)))
-                (memory (export "memory") 1)
-                (data (i32.const 0) "{}")
-                (func (export "yoi_tool_call")
-                  (drop (call $output_write (i32.const 0) (i32.const {})))
-                )
-              )"#,
-            wat_bytes(output),
-            output.len()
-        );
-        wat::parse_str(wat).unwrap()
-    }
-
-    fn oversize_output_module() -> Vec<u8> {
-        let wat = format!(
-            r#"(module
-                (import "yoi:tool" "output_write" (func $output_write (param i32 i32) (result i32)))
-                (memory (export "memory") 2)
-                (func (export "yoi_tool_call")
-                  (drop (call $output_write (i32.const 0) (i32.const {})))
-                )
-              )"#,
-            PLUGIN_WASM_MAX_OUTPUT_BYTES + 1
-        );
-        wat::parse_str(wat).unwrap()
-    }
-
-    fn nonterminating_module() -> Vec<u8> {
-        wat::parse_str(
-            r#"(module
-                (memory (export "memory") 1)
-                (func (export "yoi_tool_call")
-                  (local $remaining i32)
-                  (local.set $remaining (i32.const 100000000))
-                  (loop $again
-                    (local.set $remaining (i32.sub (local.get $remaining) (i32.const 1)))
-                    (br_if $again (local.get $remaining))
-                  )
-                )
-              )"#,
-        )
-        .unwrap()
-    }
-
-    fn wasi_import_module() -> Vec<u8> {
-        wat::parse_str(
-            r#"(module
-                (import "wasi_snapshot_preview1" "fd_write" (func $fd_write))
-                (memory (export "memory") 1)
-                (func (export "yoi_tool_call"))
-              )"#,
-        )
-        .unwrap()
-    }
-
-    fn request_import_module() -> Vec<u8> {
-        wat::parse_str(
-            r#"(module
-                (import "yoi:request" "request" (func $request))
-                (memory (export "memory") 1)
-                (func (export "yoi_tool_call"))
-              )"#,
-        )
-        .unwrap()
-    }
-
-    fn wat_bytes(bytes: &[u8]) -> String {
-        bytes
-            .iter()
-            .map(|byte| format!(r#"\{:02x}"#, byte))
-            .collect()
-    }
-
     #[test]
     fn static_inspection_does_not_read_or_execute_package() {
         let mut record = record(vec![tool("Echo")]);
         record.package_path = std::path::PathBuf::from("/no/such/plugin.wasm");
         record.manifest.runtime = Some(PluginRuntimeManifest {
-            kind: PLUGIN_RUNTIME_WASM_KIND.to_string(),
-            entry: Some("plugin.wasm".to_string()),
-            abi: Some(PLUGIN_RUNTIME_WASM_ABI.to_string()),
-            component: None,
-            world: None,
+            kind: PLUGIN_RUNTIME_COMPONENT_KIND.to_string(),
+            entry: None,
+            abi: None,
+            component: Some("plugin.component.wasm".to_string()),
+            world: Some(PLUGIN_COMPONENT_TOOL_WORLD.to_string()),
         });
 
         let inspection = inspect_resolved_plugin_static(&record);
@@ -7235,11 +8217,11 @@ input_schema = { type = "object", additionalProperties = true }
     fn static_inspection_reports_missing_tool_grant() {
         let mut record = record(vec![tool("Echo")]);
         record.manifest.runtime = Some(PluginRuntimeManifest {
-            kind: PLUGIN_RUNTIME_WASM_KIND.to_string(),
-            entry: Some("plugin.wasm".to_string()),
-            abi: Some(PLUGIN_RUNTIME_WASM_ABI.to_string()),
-            component: None,
-            world: None,
+            kind: PLUGIN_RUNTIME_COMPONENT_KIND.to_string(),
+            entry: None,
+            abi: None,
+            component: Some("plugin.component.wasm".to_string()),
+            world: Some(PLUGIN_COMPONENT_TOOL_WORLD.to_string()),
         });
         record.grants.permissions = vec![PluginPermission::surface(PluginSurface::Tool)];
 
@@ -7262,11 +8244,11 @@ input_schema = { type = "object", additionalProperties = true }
         bad_schema.input_schema = json!({"type":"string"});
         let mut record = record(vec![bad_schema]);
         record.manifest.runtime = Some(PluginRuntimeManifest {
-            kind: PLUGIN_RUNTIME_WASM_KIND.to_string(),
-            entry: Some("plugin.wasm".to_string()),
-            abi: Some(PLUGIN_RUNTIME_WASM_ABI.to_string()),
-            component: None,
-            world: None,
+            kind: PLUGIN_RUNTIME_COMPONENT_KIND.to_string(),
+            entry: None,
+            abi: None,
+            component: Some("plugin.component.wasm".to_string()),
+            world: Some(PLUGIN_COMPONENT_TOOL_WORLD.to_string()),
         });
 
         let inspection = inspect_resolved_plugin_static(&record);
@@ -7291,11 +8273,11 @@ input_schema = { type = "object", additionalProperties = true }
         second_duplicate.input_schema = json!({"type":"object"});
         let mut record = record(vec![invalid, first_duplicate, second_duplicate]);
         record.manifest.runtime = Some(PluginRuntimeManifest {
-            kind: PLUGIN_RUNTIME_WASM_KIND.to_string(),
-            entry: Some("plugin.wasm".to_string()),
-            abi: Some(PLUGIN_RUNTIME_WASM_ABI.to_string()),
-            component: None,
-            world: None,
+            kind: PLUGIN_RUNTIME_COMPONENT_KIND.to_string(),
+            entry: None,
+            abi: None,
+            component: Some("plugin.component.wasm".to_string()),
+            world: Some(PLUGIN_COMPONENT_TOOL_WORLD.to_string()),
         });
 
         let inspection = inspect_resolved_plugin_static(&record);
