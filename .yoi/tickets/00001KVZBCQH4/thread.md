@@ -686,3 +686,23 @@ Scope:
 - HTTP/WS/FS/Backend integration/config bundle sync は Non-goals として未実装。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-25T16:54:19Z -->
+
+## Implementation report
+
+Cleanup report:
+
+- Child Workers stopped and scope reclaimed:
+  - `yoi-coder-00001KVZBCQH4-worker-runtime`
+  - `yoi-coder-00001KVZBCQH4-runtime-packaging`
+  - `yoi-reviewer-00001KVZBCQH4-worker-runtime`
+- Child implementation worktree removed:
+  - `/home/hare/Projects/yoi/.worktree/00001KVZBCQH4-worker-runtime-core`
+- Child implementation branch removed:
+  - `work/00001KVZBCQH4-worker-runtime-core`
+
+Remaining note:
+- Historical worker-rename child worktree remains separate and was not touched by this cleanup.
+
+---
