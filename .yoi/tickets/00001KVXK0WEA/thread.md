@@ -190,3 +190,39 @@ Residual risks / notes:
 - protocol-specific integration / secret injection / reconnect policy / runtime reimplementation は範囲外として未実装。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVXK0WEA-pdk-service-events at: 2026-06-25T07:44:48Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+実装は概ね Ticket の方向に沿っているが、Service WebSocket template の manifest が runtime の authority boundary と不整合で、生成テンプレートの中心例が実行時に `websocket_send` できない状態に見える。
+
+Blocker:
+- Service template が `websocket_send` に必要な manifest 権限/target を宣言していない。
+  - `resources/plugin/templates/rust-component-instance/src/lib.rs` は `ServiceOutput::websocket_send(...)` を返す Service/WebSocket 例になっている。
+  - `resources/plugin/templates/rust-component-instance/plugin.toml` は `surface/tool/service/ingress` と `tool/service/ingress` permission はあるが、`{ kind = "host_api", api = "websocket" }` がない。
+  - 同 `plugin.toml` には matching `[[websocket]]` target declaration もない。
+  - runtime 側の `websocket_send` 処理は manifest permissions の `host_api.websocket`、grants permissions の `host_api.websocket`、manifest の `[[websocket]]` target declaration、enablement 側の usable websocket grant を要求する。
+  - そのため生成された service template は `yoi plugin check/pack` は通っても、実行時に `requested host_api.websocket permission is missing` / `manifest host_api.websocket target declaration is missing` 系で拒否されるはず。
+
+Required fixes:
+- `resources/plugin/templates/rust-component-instance/plugin.toml` に少なくとも以下を追加する。
+  - `permissions` の `{ kind = "host_api", api = "websocket" }`
+  - `[[websocket]]` target declaration（例: `scheme = "wss"`, `host = "example.com"`, `path_prefixes = ["/socket"]`）
+- template/CLI tests に、service template が `host_api.websocket` permission と matching `[[websocket]]` declaration を含むことの assertion を追加する。
+- 必要なら README/docs で、enablement grants も同じ WebSocket target を明示的に許可する必要があることを補足する。
+
+Good points:
+- WIT は `handle-ingress`、ingress event envelope、`output_commands` / `websocket_send` 例を記述している。
+- PDK は `PluginIngressEvent`、`ServiceOutput`、`ServiceOutputCommand`、`websocket_text()` / `websocket_send()` helper を追加し、runtime envelope 形状に概ね合っている。
+- Service template は `recv(timeout)` polling loop を推奨しておらず、`handle_ingress` + `ServiceOutput::websocket_send` の形になっている。
+- template `runtime.kind` は `wasm-component` で、raw `wasm` template 復活は見当たらない。
+- `yoi plugin new rust-component-service` は既存の path-safety 方針上に追加されており、広い CLI redesign や runtime reimplementation は見当たらない。
+
+Validation:
+- reviewer は read-only 指示のため cargo/nix/git diff validation は再実行していない。
+- Ticket item/thread、IntentPacket、`cd200630..HEAD` の変更、WIT / PDK / template / CLI / docs / runtime envelope 関連箇所を静的確認した。
+
+---
