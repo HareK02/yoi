@@ -1,0 +1,95 @@
+use crate::identity::{RuntimeId, WorkerRef};
+use serde::{Deserialize, Serialize};
+
+/// Transcript role used by bounded projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptRole {
+    User,
+    System,
+}
+
+/// One projected transcript item.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptEntry {
+    pub sequence: u64,
+    pub worker_ref: WorkerRef,
+    pub role: TranscriptRole,
+    pub content: String,
+    pub event_id: u64,
+}
+
+/// Bounded transcript query.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptQuery {
+    pub start: usize,
+    pub limit: usize,
+}
+
+impl TranscriptQuery {
+    pub fn new(start: usize, limit: usize) -> Self {
+        Self { start, limit }
+    }
+}
+
+/// Bounded transcript projection response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptProjection {
+    pub worker_ref: WorkerRef,
+    pub start: usize,
+    pub limit: usize,
+    pub total_items: usize,
+    pub items: Vec<TranscriptEntry>,
+    pub next_start: Option<usize>,
+}
+
+/// Event cursor.  `next_event_id` is the first event id that should be returned
+/// by the next poll.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventCursor {
+    pub runtime_id: RuntimeId,
+    pub next_event_id: u64,
+}
+
+/// Placeholder subscription handle for future streaming APIs.  v0 is explicit
+/// poll-only so HTTP/WS/SSE dependencies are not pulled into this crate.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventSubscription {
+    pub runtime_id: RuntimeId,
+    pub cursor: EventCursor,
+    pub mode: EventSubscriptionMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventSubscriptionMode {
+    PollOnly,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeEvent {
+    pub id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_ref: Option<WorkerRef>,
+    pub kind: RuntimeEventKind,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RuntimeEventKind {
+    RuntimeStarted,
+    RuntimeStopped,
+    WorkerCreated,
+    WorkerInputAccepted,
+    WorkerStopped,
+    WorkerCancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeEventBatch {
+    pub runtime_id: RuntimeId,
+    pub cursor: EventCursor,
+    pub events: Vec<RuntimeEvent>,
+    pub has_more: bool,
+}
