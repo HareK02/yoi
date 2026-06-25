@@ -59,3 +59,76 @@ Escalate if:
 - FS feature を core Ticket に巻き戻す必要が出る。
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-25T16:55:42Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- `00001KVZBCQH4` worker-runtime core は done。dependency blocker は解消済み。
+- 本 Ticket は optional FS persistence feature であり、REST server / Backend Registry integration とは分離されている。
+- queued/inprogress 再確認時点で `00001KVZKSV6C` を受理したが、主変更面は Backend Registry foundation (`crates/workspace-server`) と FS feature (`crates/worker-runtime`) で分離できる。Cargo/package files の機械的 conflict は Orchestrator merge時に解消可能と判断する。
+
+Evidence checked:
+- Ticket body: `fs-store` feature、runtime/worker scoped layout、atomic write、corrupt diagnostics、bounded reads、Non-goals。
+- Relations: outgoing dependency `00001KVZBCQH4` は done。incoming remote Runtime Ticket は後続であり blocker ではない。
+- Orchestration plan: accepted plan `orch-plan-20260625-165525-2` を記録。
+- Workspace state: orchestration worktree clean。worker-runtime core merge/validation/done/cleanup 済み。
+
+IntentPacket:
+
+Intent:
+- `worker-runtime` に optional `fs-store` feature と filesystem persistence backend を追加する。
+
+Binding decisions / invariants:
+- Feature disabled 時に core library は FS store dependency を強制しない。
+- Store authority は `runtime_id + worker_id`。legacy pod path / socket path / session path を authority にしない。
+- Standalone `worker-store` crate は作らない。`worker-runtime` 内 feature/module として実装する。
+- REST command server / event stream / Backend integration / legacy Pod session migration / SQLite store は実装しない。
+- Existing memory store/core tests を壊さない。
+
+Requirements / acceptance criteria:
+- `fs-store` feature がある。
+- `cargo test -p worker-runtime --no-default-features` が通る。
+- `cargo test -p worker-runtime --features fs-store` が通る。
+- Worker create/state update/event append/transcript append/bounded read が FS store で動く。
+- Runtime/Worker scoped layout、atomic write、directory creation、corrupt/missing diagnostics を扱う。
+
+Implementation latitude:
+- FS layout、module split、serialization structs、atomic write helper、diagnostics typeの詳細は Coder が既存 style に合わせて選べる。
+- 旧 `pod-store` の atomic write pattern は参考にしてよいが、依存/責務移植は不要。
+
+Escalate if:
+- core Runtime store abstraction の大幅 rewrite が必要になる。
+- REST/Backend integration を同時実装しないと acceptance を満たせないと判明する。
+- `worker-store` standalone crate が必要に見える。
+
+Validation:
+- `cargo fmt --all`
+- `cargo test -p worker-runtime --no-default-features`
+- `cargo test -p worker-runtime --features fs-store`
+- `cargo check -p yoi`
+- `git diff --check`
+- 可能なら `nix build .#yoi --no-link`
+
+Critical risks / reviewer focus:
+- Feature gating failure causing core to pull FS dependencies。
+- FS layout leaking legacy Pod/session authority。
+- Atomic write / corrupt record handling が不十分。
+- Memory store semantics regression。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-25T16:55:50Z from: queued to: inprogress reason: routing_accepted_after_worker_runtime_core_done field: state -->
+
+## State changed
+
+Routing decision: implementation_ready。
+
+Dependency `00001KVZBCQH4` worker-runtime core は done。Ticket body / relations / workspace state / orchestration plan を確認し、optional FS store feature は unblocked と判断した。accepted plan と IntentPacket は thread / orchestration plan に記録済み。
+
+これ以降、worktree creation / coder Worker routing などの implementation side effect に進める。
+
+---
