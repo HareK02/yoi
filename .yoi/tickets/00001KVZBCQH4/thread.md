@@ -524,3 +524,34 @@ Residual notes:
 - merge / close / cleanup は未実施。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZBCQH4-worker-runtime at: 2026-06-25T16:46:17Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+主なブロッカー:
+
+- `stop_worker` / `cancel_worker` の terminal lifecycle が不安定です。
+  `Runtime::transition_worker` は「同じ status への再実行」だけを idempotent 扱いし、既に `Stopped` の Worker に `cancel_worker`、既に `Cancelled` の Worker に `stop_worker` を呼ぶと、terminal state を別の terminal state に上書きできます。
+  - 該当: `crates/worker-runtime/src/runtime.rs:209-235`, `353-385`
+  - 現状ロジック: `worker.status == status` の場合のみ早期 return、それ以外は `worker.status = status`
+  - 影響: stop/cancel が terminal lifecycle として安定せず、summary の `stopped_worker_count` / `cancelled_worker_count` や event history が後続操作で意味を変えられる。
+  - テストも `stop` と `cancel` を別 Worker で確認しているだけで、`stop -> cancel` / `cancel -> stop` の不変条件を覆っていません。
+  - 期待: terminal Worker への反対側 terminal 操作は拒否するか、既存 terminal state を保持する idempotent 応答にし、該当テストを追加してください。
+
+確認した範囲:
+
+- `crates/worker-runtime` は workspace / default-members / workspace.dependencies に追加済み。
+- crate 依存は `serde` / `thiserror` のみで、HTTP/WS/FS/provider 依存の追加は見当たりません。
+- API は `management`, `catalog`, `interaction`, `observation`, `diagnostics`, `identity` に分離されています。
+- `Runtime` は concrete entity として実装され、Worker 操作は `WorkerRef { runtime_id, worker_id }` を要求しています。pod/socket/session path を authority とする API は見当たりません。
+- event cursor/subscription placeholder は `runtime_id` 検証、bounded `read_events`、`PollOnly` subscription として概ね意図に合っています。
+- `CreateWorkerRequest` は `WorkerIntent`, `ProfileSelector`, optional `ConfigBundleRef`, requested capabilities, workspace/mount refs を保持しています。
+- tools-less 作成と diagnostics のテストは存在します。
+- `package.nix` の `cargoHash` 更新コミットは確認しました。
+- `git diff --check f8d3b1cc..HEAD` は成功。
+  cargo/nix の再実行は、read-only 指示と上記 blocker があるため実施していません。
+
+---
