@@ -193,3 +193,32 @@ Residual risks / notes:
 - Full `cargo test -p pod` の 2 failures は今回の Plugin diff 外の既知 prompt snapshot failure と一致している。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVXK0WDX-output-commands at: 2026-06-25T06:18:37Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+確認結果:
+- Ticket `00001KVXK0WDX` の IntentPacket / 受け入れ条件に対して、実装 commit `755d460f feat: add plugin service output commands` は妥当。
+
+承認根拠:
+- 差分は `crates/pod/src/feature/plugin.rs` のみで、scope creep は見当たらない。
+- Service/Ingress handler output の `output_commands` を読む専用経路が追加され、ordinary Tool Plugin `ToolOutput` path とは型・処理・report/status field が分離されている。
+- envelope は `correlation_id` / `source_event_id` / `command_id` / `kind` / `payload` / `requested_at` を持ち、unknown fields reject、id / RFC3339 / `source_event_id == ingress correlation_id` / payload size / kind-specific payload を検証している。
+- `host_request_dispatch` と `websocket_send` は既存の manifest declaration + enabled grant / allowlist 検査に乗っており、実行段階では `Unsupported` result を返すだけで HTTP/WebSocket transport 実装に踏み込んでいない。
+- malformed / ungranted command は `ServiceOutputCommandRejected` diagnostic になり、mixed batch でも安全側に倒して部分的な status update を実行しないテストがある。
+- `diagnostic_status_update` は bounded payload/message 経由で `component_status` / diagnostics / `output_command_results` に記録され、外部 side effect や hidden LLM context injection はない。
+- Service command results は `PluginIngressDispatchReport` と `PluginInstanceStatus.output_command_results` から追跡可能。
+- 追加テストは recorded diagnostic、ungranted rejection、placeholder unsupported、malformed envelope を押さえている。
+
+検証:
+- Ticket `item.md` / `thread.md` / orchestration plan / relations を確認。
+- child worktree で `git status` / `git log` / `git diff --stat` / diff 内容を read-only 確認。
+- read-only 指示のため cargo/nix 等は再実行していない。
+
+Non-blocking note:
+- Coder 報告では `cargo test -p pod` が既知の prompt guidance snapshot assertion でのみ失敗、Plugin tests / `cargo check -p yoi` / `git diff --check` / `nix build .#yoi --no-link` は成功。最終統合時に既知 failure 扱いだけ確認すること。
+
+---
