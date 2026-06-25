@@ -239,3 +239,28 @@ Residual risks / review focus:
 - Event/transcript read は bounded output だが、現状は JSONL 全体を読み込んでから slice している。大規模 log での streaming pagination は将来最適化候補。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZKST83-fs-store at: 2026-06-25T19:46:00Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+確認結果として、Ticket intent / binding decisions / acceptance criteria を満たしていると判断する。
+
+確認した点:
+- `worker-runtime` に `fs-store = ["dep:serde_json"]` が追加され、`default = []` のまま維持されている。
+- `fs_store` module / re-export / `Runtime::with_fs_store` / `RuntimeBackendKind::FsStore` は feature-gated。
+- `cargo tree -p worker-runtime --no-default-features` で `serde_json` が入らないことを確認。`--features fs-store` では `serde_json` のみ追加される。
+- FS layout は `runtimes/<encoded runtime_id>/workers/<encoded worker_id>/...` で、pod path / socket path / session path を authority にしていない。
+- standalone `worker-store` crate、REST command server、Backend integration、legacy migration、SQLite store の追加は見当たらない。
+- Runtime/Worker snapshot、event JSONL、transcript JSONL の永続化が実装され、runtime/worker 作成・state update・event append・transcript append・bounded read を満たしている。
+- snapshot 書き込みは same-dir temp + `sync_all` + rename + directory sync。missing/corrupt は `RuntimeError::{StoreIo, StoreMissing, StoreCorrupt}` で診断される。
+- memory backend 側は feature-off 時に persistence が no-op となり、既存 memory semantics を保つ構成。
+- `package.nix` の `cargoHash` 更新も確認済み。
+- `git diff --check` は問題なし。
+
+補足:
+- read-only 指示に従い、差分・実装・依存ツリー・scope creep の静的確認に留めた。`cargo test` / `nix build` は作業ツリーへ build artifact を作るため再実行せず、報告済み validation を前提確認として扱った。
+
+---
