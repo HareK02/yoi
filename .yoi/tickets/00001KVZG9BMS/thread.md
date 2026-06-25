@@ -319,3 +319,42 @@ Residual risks / notes:
 - なし。child worktree は commit 後 clean。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZG9BMS-worker-rename at: 2026-06-25T15:29:25Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+Follow-up を read-only で確認した。`6c59fe92..HEAD` の差分確認と blocker term grep を実施し、ビルド/テストは副作用回避のため再実行していない。
+
+解消確認:
+- `web/workspace/src/lib/generated/protocol.ts` は `WorkerStatus` / `worker_name` / `WorkerEvent` / `worker_event` / `list_workers` / `restore_worker` / `workers_listed` / `worker_restored` に更新済み。
+- `SpawnError::PodLaunchFailed` は `WorkerLaunchFailed` に更新済み。
+- 主要 prompt/workflow の `Peer Pods` / `sibling Pods` は一部修正済み。
+
+Remaining blockers:
+
+1. 削除済み docs path がまだ残存。
+   - `crates/pod-registry/README.md:29`
+   - `../../docs/design/pod-session-state.md` への link が残っている。対象 file は `worker-session-state.md` に移行済みなので、壊れた active doc link。
+
+2. 旧 tool 名 `SendToPeerPod` が active code に残存。
+   - `crates/session-analytics/src/lib.rs:1600`
+   - 実装側は `SendToPeerWorker` へ移行済みだが、analytics の分類に `SendToPeerWorker` がなく `SendToPeerPod` だけ残っている。stale name であるだけでなく、現行 tool の分類漏れに見える。legacy log 対応で旧名を残すなら、`SendToPeerWorker` を追加した上で legacy comment を付けるのが安全。
+
+3. active docs/comments に旧 Pod guidance がまだ残存。
+   - `docs/development/work-items.md:250`: `Reviewer Pods should be sibling Pods...`
+   - `crates/protocol/src/lib.rs:80`: `List Pods visible to this Worker...`
+   - `AGENTS.md:19`: `Notify / PodEvent / ...`
+   - いずれも compatibility/internal on-disk `pods` の説明ではなく、現在の active terminology / protocol guidance なので Worker terminology に寄せるべき。
+
+Required verification after fix:
+```sh
+rg -n -S 'SendToPeerPod|pod-session-state\.md|sibling Pods|List Pods visible|PodEvent' \
+  AGENTS.md crates resources docs web/workspace/src/lib/generated/protocol.ts \
+  --glob '!target' --glob '!docs/report/**'
+```
+This grep should be empty or any remaining hit must be explicitly legacy/internal and justified.
+
+---
