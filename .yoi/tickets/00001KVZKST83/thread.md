@@ -175,3 +175,67 @@ Next action:
 - Wait for Coder implementation report, then route to reviewer.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZKST83-fs-store at: 2026-06-25T19:41:50Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装完了。merge/close/cleanup は未実施。
+
+Commit:
+- `407134399685537da9590d424df6b1db05402965 feat: add worker runtime fs store`
+
+変更概要:
+- `worker-runtime` に optional feature `fs-store = ["dep:serde_json"]` を追加。default feature は空のまま。
+- `#[cfg(feature = "fs-store")]` で `fs_store` module を公開。
+- `Runtime::with_fs_store(FsRuntimeStoreOptions)` を追加。
+  - 既存 store があれば復元。
+  - なければ Runtime scoped layout を作成して初期化。
+- `FsRuntimeStore`, `FsRuntimeStoreOptions` を feature 有効時に re-export。
+- `RuntimeBackendKind::FsStore` を feature 有効時のみ追加。
+
+FS store:
+- layout は `runtime_id + worker_id` authority ベース。
+  - `<root>/runtimes/<encoded runtime_id>/runtime.json`
+  - `<root>/runtimes/<encoded runtime_id>/events.jsonl`
+  - `<root>/runtimes/<encoded runtime_id>/workers/<encoded worker_id>/worker.json`
+  - `<root>/runtimes/<encoded runtime_id>/workers/<encoded worker_id>/transcript.jsonl`
+- legacy pod path / socket / session path は authority として使用していない。
+- Worker create / state update / event append / transcript append を Runtime mutation から永続化。
+- snapshot 系は same-directory temp file + `sync_all` + rename の atomic write helper。
+- event/transcript は JSONL append。
+- restore 時に missing / corrupt / wrong runtime/worker scope を `RuntimeError::{StoreIo, StoreMissing, StoreCorrupt}` として診断。
+- `FsRuntimeStore::read_events` / `read_transcript` で bounded read を提供。
+
+テスト追加:
+- `fs-store` feature 有効時のみ:
+  - create/send/stop 後に drop/reopen して worker/event/transcript が復元されること。
+  - direct store bounded read が Runtime read と一致すること。
+  - corrupt `runtime.json` と missing `worker.json` が診断されること。
+
+変更ファイル:
+- `crates/worker-runtime/Cargo.toml`
+- `crates/worker-runtime/src/fs_store.rs`
+- `crates/worker-runtime/src/runtime.rs`
+- `crates/worker-runtime/src/lib.rs`
+- `crates/worker-runtime/src/management.rs`
+- `crates/worker-runtime/src/error.rs`
+- `Cargo.lock`
+- `package.nix`
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo test -p worker-runtime --no-default-features`: success（8 passed）
+- `cargo test -p worker-runtime --features fs-store`: success（10 passed）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Residual risks / review focus:
+- 永続化は per-file atomic write / append で、複数ファイルをまたぐ transaction ではない。途中 I/O failure 時の cross-file 整合性は review focus。
+- FS store は Runtime API に統合しているが、REST / Backend integration / legacy Pod migration / SQLite は未実装。
+- Event/transcript read は bounded output だが、現状は JSONL 全体を読み込んでから slice している。大規模 log での streaming pagination は将来最適化候補。
+
+---
