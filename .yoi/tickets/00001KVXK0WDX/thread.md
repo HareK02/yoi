@@ -137,3 +137,59 @@ Implementation orchestration update:
 - Coder には root/original workspace と orchestration worktree で read/write/validation/git operation を行わないよう明示した。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVXK0WDX-output-commands at: 2026-06-25T06:12:58Z -->
+
+## Implementation report
+
+Implementation report:
+
+対象 Ticket:
+- `00001KVXK0WDX` — Add Plugin service output command model
+
+変更ファイル:
+- `crates/pod/src/feature/plugin.rs`
+
+主な実装:
+- Service/Ingress handler の戻り値から `output_commands` を読む Service output command model を追加。
+- command envelope に以下を追加。
+  - `correlation_id`
+  - `source_event_id`
+  - `command_id`
+  - `kind`
+  - `payload`
+  - `requested_at`
+- v0 command kind を追加。
+  - `diagnostic_status_update`
+  - `host_request_dispatch`
+  - `websocket_send`
+- Host 側で envelope parse / field validation / `requested_at` RFC3339 validation / `source_event_id` と ingress event correlation id の照合 / payload size bound / kind-specific payload validation / request・websocket grant check を行うようにした。
+- malformed / ungranted / unsupported command は typed diagnostic として記録し、実行しない。
+- `diagnostic_status_update` は安全に `component_status` / diagnostics に記録する。
+- `host_request_dispatch` / `websocket_send` は grant-check 可能だが、v0 では transport 実行せず `Unsupported` として記録する。
+- Service output command results を `PluginIngressDispatchReport` と `PluginInstanceStatus` から見えるように追加。
+- ordinary Tool Plugin `ToolOutput` path と Service output command path が混ざらないよう、型・コメント・テストを分離。
+- focused tests を追加。
+  - diagnostic/status command の記録
+  - ungranted request command の reject と status side effect 非実行
+  - request/websocket placeholder の grant-check + unsupported 記録
+  - malformed envelope の reject
+
+Commit:
+- `755d460f0d4e2dccb3f75d9ad980b1e701464a4e feat: add plugin service output commands`
+
+Validation:
+- `cargo fmt --check`: success
+- `cargo test -p pod service_output_command -- --nocapture`: success (`4 passed`)
+- `cargo test -p pod feature::plugin::tests`: success (`77 passed`)
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+- `cargo test -p pod`: failed in known prompt guidance snapshot assertions outside this Ticket (`prompt::catalog::tests::pod_orchestration_guidance_section_renders_resource_body`, `prompt::system::tests::pod_orchestration_guidance_is_included_for_pod_management_tools`), with Plugin tests passing.
+
+Residual risks / notes:
+- WebSocket send transport と host request dispatch の実実行は Ticket non-goal に従い未実装で、grant-check 後に `Unsupported` diagnostic として記録する。
+- Service output command schema は Rust 側 JSON envelope として追加した。WIT/PDK/templates 更新は non-goal として触っていない。
+- Full `cargo test -p pod` の 2 failures は今回の Plugin diff 外の既知 prompt snapshot failure と一致している。
+
+---

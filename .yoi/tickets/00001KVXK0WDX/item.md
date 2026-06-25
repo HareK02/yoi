@@ -2,7 +2,7 @@
 title: 'Add Plugin service output command model'
 state: 'inprogress'
 created_at: '2026-06-24T19:51:56Z'
-updated_at: '2026-06-25T05:47:43Z'
+updated_at: '2026-06-25T06:12:58Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-24T20:12:02Z'
