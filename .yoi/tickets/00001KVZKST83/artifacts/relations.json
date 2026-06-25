@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KVZKST83",
+      "kind": "depends_on",
+      "target": "00001KVZBCQH4",
+      "note": "FS persistence is an optional feature on top of the worker-runtime core API.",
+      "author": "yoi ticket",
+      "at": "2026-06-25T14:47:43Z"
+    }
+  ]
+}

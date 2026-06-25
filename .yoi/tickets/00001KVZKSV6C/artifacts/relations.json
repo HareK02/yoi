@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KVZKSV6C",
+      "kind": "depends_on",
+      "target": "00001KVZKST83",
+      "note": "Standalone remote Runtime should have FS persistence available before Backend integration.",
+      "author": "yoi ticket",
+      "at": "2026-06-25T14:47:43Z"
+    },
+    {
+      "ticket_id": "00001KVZKSV6C",
+      "kind": "depends_on",
+      "target": "00001KVZKSTE2",
+      "note": "Backend remote Runtime routing needs the REST command API.",
+      "author": "yoi ticket",
+      "at": "2026-06-25T14:47:43Z"
+    },
+    {
+      "ticket_id": "00001KVZKSV6C",
+      "kind": "depends_on",
+      "target": "00001KVZKSTJT",
+      "note": "Backend event proxy/observation needs the Runtime event stream API.",
+      "author": "yoi ticket",
+      "at": "2026-06-25T14:47:43Z"
+    }
+  ]
+}

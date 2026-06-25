@@ -4,10 +4,10 @@
     {
       "ticket_id": "00001KVZ9JGK0",
       "kind": "depends_on",
-      "target": "00001KVZBCQH4",
-      "note": "Backend internal Companion should run on the embeddable Runtime API.",
+      "target": "00001KVZKSV6C",
+      "note": "Backend internal Companion Web Console should build on Backend RuntimeRegistry integration with worker-runtime.",
       "author": "yoi ticket",
-      "at": "2026-06-25T13:25:34Z"
+      "at": "2026-06-25T14:45:00Z"
     }
   ]
 }

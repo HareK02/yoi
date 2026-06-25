@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KVZKSTJT",
+      "kind": "depends_on",
+      "target": "00001KVZBCQH4",
+      "note": "Event stream server exposes the worker-runtime core event bus/log.",
+      "author": "yoi ticket",
+      "at": "2026-06-25T14:47:43Z"
+    },
+    {
+      "ticket_id": "00001KVZKSTJT",
+      "kind": "depends_on",
+      "target": "00001KVZKSTE2",
+      "note": "Observation endpoints share the Runtime process server surface with the REST command server.",
+      "author": "yoi ticket",
+      "at": "2026-06-25T14:47:43Z"
+    }
+  ]
+}

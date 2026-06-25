@@ -244,3 +244,42 @@ The pod -> worker step is a rename, not a rewrite. Runtime creation absorbs the 
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-25T14:41:12Z -->
+
+## Decision
+
+Decision update: worker-runtime should separate the embeddable Runtime core from optional persistence and network transports.
+
+- `worker-runtime/lib.rs` owns Runtime semantics and can be embedded by Backend.
+- `worker-runtime/main.rs` is only a Runtime process wrapper around the same Runtime.
+- Use features so embedding the library does not force FS store / HTTP server / WebSocket server dependencies.
+- v0 persistence should support memory store for embedded use and fs-store for standalone Runtime process use.
+- Backend <-> remote Runtime should be Backend-initiated: Browser -> Backend -> Runtime. Browser must not talk to Runtime directly.
+- Commands should be REST/HTTP. Observation should be REST polling, SSE, or WebSocket; REST server and WS/SSE server implementation may be split from core crate creation.
+- Runtime-initiated persistent connection back to Backend is not a v0 requirement because it complicates session, auth, reconnect, and delivery semantics.
+
+
+---
+
+<!-- event: decision author: hare at: 2026-06-25T14:48:23Z -->
+
+## Decision
+
+Decision update: split the former broad worker-runtime ticket into implementation-sized tickets.
+
+Current order:
+
+1. 00001KVZD10ED llm-worker crateをllm-engineへ改名する
+2. 00001KVZG9BMS pod crateをworker crateへ改名する
+3. 00001KVZBCQH4 worker-runtime core crateと組み込みRuntime APIを作る
+4. 00001KVZKST83 worker-runtimeにFS永続化featureを追加する
+5. 00001KVZKSTE2 worker-runtimeにREST command serverを追加する
+6. 00001KVZKSTJT worker-runtimeにevent stream serverを追加する
+7. 00001KVZKSV6C Backend RuntimeRegistryをworker-runtimeへ接続する
+8. 00001KVZ9JGK0 Backend内蔵Companion RuntimeとWeb Console MVP
+
+The core ticket must not absorb FS persistence, REST server, event stream server, or Backend remote client integration. Those are separate implementation tickets.
+
+
+---
