@@ -263,3 +263,45 @@ Review result: request_changes
 - read-only で `git diff --check f6fd7b63^ f6fd7b63` は問題なし。Cargo/Nix 検証は read-only 指示を優先して再実行していない。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZKSV6C-runtime-registry at: 2026-06-25T20:38:31Z -->
+
+## Implementation report
+
+Follow-up implementation report after review request_changes:
+
+Commit:
+- `d7c4396c fix: scope workspace worker lookup by runtime`
+
+対応内容:
+- `RuntimeRegistry::worker` を `worker_id` 単独 lookup から `runtime_id + worker_id` lookup に変更。
+  - 先に `runtime_id` を解決。
+  - runtime が存在しない場合は `UnknownRuntime`。
+  - runtime は存在するが worker が存在しない場合は `UnknownWorker { runtime_id, worker_id }`。
+  - worker_id 衝突時に別 runtime の worker を誤って返さない。
+- `RuntimeRegistryError` / workspace-server `Error` に typed error boundary を追加・整理。
+  - `UnknownRuntime(String)`
+  - `UnknownWorker { runtime_id, worker_id }`
+- server 側の error-to-status mapping 更新。
+  - `UnknownRuntime` / `UnknownWorker` は `404 NOT_FOUND`。
+- テスト追加。
+  - 同一 `worker_id` を持つ複数 runtime fixture で lookup が `runtime_id` scoped であることを確認。
+  - unknown runtime と unknown worker が別 error として返り、crate-level `Error` にも正しく mapping されることを確認。
+
+変更ファイル:
+- `crates/workspace-server/src/hosts.rs`
+- `crates/workspace-server/src/lib.rs`
+- `crates/workspace-server/src/server.rs`
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo test -p yoi-workspace-server`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Residual risks / review focus:
+- 現時点で worker detail API route はまだないため、`RuntimeRegistry::worker(runtime_id, worker_id)` の authority boundary は registry 内部 API とテストで確立している。将来 route を追加する際は path/query でも `runtime_id + worker_id` を必須にする必要がある。
+- fixture runtime は routing/error 境界確認用の test-only 実装で、embedded/remote の実接続は次 Ticket の責務として残している。
+
+---
