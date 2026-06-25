@@ -60,3 +60,28 @@ Escalate if:
 - Backend internal Runtime foundation の scope が Companion MVP requirements を満たさない。
 
 ---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-25T20:23:10Z from: queued to: planning reason: web_console_stream_transport_decision_missing field: state -->
+
+## State changed
+
+ユーザー指摘により queued から planning に戻す。
+
+Missing decision / information:
+- 本 Ticket は Web Console MVP の conversation/transcript model で「request/response 完了後に transcript を返す」または「SSE / streaming endpoint」を実装時に選んでよいとしており、実質的に WS/SSE/polling/streaming の transport 方針を固定し得る。
+- これは `00001KVZKSTJT` で決定すべき WebSocket/event-stream transport 設計点であり、未決定のまま queued に置くのは不適切。
+
+Context checked:
+- Ticket body: Web Console UI、Companion message API、assistant response 取得または stream、conversation/transcript projection、Safety/authority。
+- Existing relation: `00001KVZSGT0Q` への dependency。
+- Added relation: `00001KVZKSTJT` への `depends_on` を追加し、WS/SSE/polling transport decision が解決するまで本 Ticket を blocker 付き planning として扱う。
+- `00001KVZKSTE2` は REST command server であり、SSE/WebSocket event stream server は Non-goal と明記されているため、この差し戻し対象ではない。
+
+Why implementation latitude is insufficient:
+- Web Console の response delivery を request/response、SSE、WebSocket、polling のどれに寄せるかは後続 API/UI/Backend runtime integration の binding decision であり、Coder の local tactic として固定すべきではない。
+
+Next planning question/action:
+- `00001KVZKSTJT` で WebSocket/event-stream transport の採否、Backend-owned client / Browser-facing projection / cursor semantics / busy/error behavior を決める。
+- その決定に基づいて、本 Ticket の conversation/transcript model と Web API acceptance criteria を再同期してから ready/queued に戻す。
+
+---
