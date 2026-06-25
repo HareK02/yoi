@@ -40,7 +40,7 @@ pub struct WorkerManifestConfig {
     pub engine: EngineManifestConfig,
     #[serde(default)]
     pub scope: ScopeConfig,
-    /// Scope that may be subdelegated to spawned child Pods. Defaults empty.
+    /// Scope that may be subdelegated to spawned child Workers. Defaults empty.
     #[serde(default)]
     pub delegation_scope: ScopeConfig,
     #[serde(default)]

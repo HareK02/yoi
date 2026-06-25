@@ -60,7 +60,7 @@ mcp = {
 
 Local stdio MCP servers are ordinary local executables running with the user's OS permissions. Yoi's feature flags, Plugin permissions, and MCP config validation are not an operating-system sandbox and cannot prevent filesystem/network/process side effects once a later lifecycle implementation chooses to spawn a configured server.
 
-## Spawned Pods
+## Spawned Workers
 
 `SpawnWorker.profile` is optional and resolves through defaults when omitted. The only concrete capability delegation in the tool call is `SpawnWorker.scope`, and it must be a subset of the parent's effective scope.
 

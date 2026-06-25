@@ -19,7 +19,7 @@ After rebuilding and restarting during dogfooding, `current_exe()` can point at 
 
 ## Multi-Worker work
 
-Use child Pods for scoped tasks and reviews, but keep orchestration decisions in visible project records. Do not merge, close, or clean up merely because a child notification arrived.
+Use child Workers for scoped tasks and reviews, but keep orchestration decisions in visible project records. Do not merge, close, or clean up merely because a child notification arrived.
 
 ## Secrets and logs
 

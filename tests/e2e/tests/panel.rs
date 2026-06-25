@@ -68,11 +68,11 @@ fn ready_snapshot(rows: Vec<RenderedPanelRow>) -> DashboardContentReady {
             header: DashboardHeader {
                 ticket_configured: true,
                 companion: Some(DashboardCompanionState {
-                    pod_name: "workspace".to_string(),
+                    worker_name: "workspace".to_string(),
                     status: "unavailable".to_string(),
                 }),
                 orchestrator: Some(DashboardOrchestratorState {
-                    pod_name: "workspace-orchestrator".to_string(),
+                    worker_name: "workspace-orchestrator".to_string(),
                     status: "unavailable".to_string(),
                     detail: Some("fixture blocks host Pod launch".to_string()),
                 }),
@@ -84,7 +84,7 @@ fn ready_snapshot(rows: Vec<RenderedPanelRow>) -> DashboardContentReady {
             ticket_rows: 2,
             ready_ticket_rows: 1,
             planning_ticket_rows: 1,
-            pod_rows: 1,
+            worker_rows: 1,
             actionable_rows: 2,
         },
     }
@@ -147,7 +147,7 @@ fn dashboard_snapshot_rejects_missing_row_wrong_state_missing_overlay_and_missin
             .with_local_state("planning");
     let expected = ExpectedDashboardContent {
         tickets: vec![expected_ready.clone(), expected_planning.clone()],
-        pod_names: vec!["workspace".to_string()],
+        worker_names: vec!["workspace".to_string()],
         companion_status: "unavailable".to_string(),
         orchestrator_status: "unavailable".to_string(),
     };
@@ -330,8 +330,8 @@ fn panel_dashboard_content_ready_has_startup_budget() -> yoi_e2e::Result<()> {
     assert!(
         content_ready.categories.ready_ticket_rows > 0
             && content_ready.categories.planning_ticket_rows > 0
-            && content_ready.categories.pod_rows > 0,
-        "dashboard content ready must include ready Ticket, planning Ticket, and Pod categories; got {:?}; artifacts at {}",
+            && content_ready.categories.worker_rows > 0,
+        "dashboard content ready must include ready Ticket, planning Ticket, and Worker categories; got {:?}; artifacts at {}",
         content_ready.categories,
         panel.artifacts().dir.display()
     );

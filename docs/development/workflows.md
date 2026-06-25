@@ -19,7 +19,7 @@ Current workflow themes include:
 
 ## Child Pods
 
-Spawned Pods are useful for scoped implementation, review, or exploration. They are not independent project authorities.
+Spawned Workers are useful for scoped implementation, review, or exploration. They are not independent project authorities.
 
 A parent/orchestrator must verify:
 

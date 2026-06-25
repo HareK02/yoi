@@ -834,7 +834,7 @@ fn ticket_queue_notification_message_carries_routing_contract() {
         )
     );
     assert!(message.contains("multi-agent-workflow"));
-    assert!(message.contains("sibling coder/reviewer Pods"));
+    assert!(message.contains("sibling coder/reviewer Workers"));
     assert!(message.contains("coder narrow child-worktree write scope"));
     assert!(message.contains("reviewer read-only by default"));
     assert!(message.contains(

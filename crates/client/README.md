@@ -2,7 +2,7 @@
 
 ## Role
 
-`client` contains reusable socket-client and runtime-command mechanics for talking to Pods from CLI/TUI code.
+`client` contains reusable socket-client and runtime-command mechanics for talking to Workers from CLI/TUI code.
 
 ## Boundaries
 

@@ -11,7 +11,7 @@ That rule shapes the crate split. The runtime can restart, attach, compact, or d
 - `llm-engine` owns model-facing turns: history append, retries, continuation, pruning/compaction mechanics, tool loops, and provider-independent callbacks.
 - `session-store` owns replayable append-only conversation/session logs.
 - `pod-store` owns current Worker metadata keyed by Worker name.
-- `protocol` defines the socket message boundary between clients and Pods.
+- `protocol` defines the socket message boundary between clients and Workers.
 - `client` contains reusable one-shot socket/runtime-command mechanics so lower crates do not depend on the product CLI.
 - `manifest` resolves Profiles, Manifests, model/provider references, scopes, prompts, and tool permission policy into a runtime contract.
 - `tools` implements built-in tools with bounded output and policy-aware execution.

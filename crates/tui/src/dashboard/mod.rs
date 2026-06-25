@@ -93,7 +93,7 @@ impl std::fmt::Display for DashboardError {
             Self::Store(e) => write!(f, "session store error: {e}"),
             Self::NoWorkers => write!(
                 f,
-                "no Tickets or Pods found — create a Ticket with `yoi ticket create` or restore a Worker with `yoi resume`"
+                "no Tickets or Workers found — create a Ticket with `yoi ticket create` or restore a Worker with `yoi resume`"
             ),
         }
     }
@@ -2936,7 +2936,7 @@ fn build_orchestrator_launch_context(
     .with_target_workspace_root(original_workspace_root.to_path_buf());
     context.worker_name = Some(worker_name.to_string());
     context.user_instruction = Some(
-        "Workspace Dashboard opened for this Ticket-enabled workspace. Coordinate Ticket routing and wait for explicit follow-up before spawning role Pods."
+        "Workspace Dashboard opened for this Ticket-enabled workspace. Coordinate Ticket routing and wait for explicit follow-up before spawning role Workers."
             .to_string(),
     );
     context
@@ -4948,7 +4948,7 @@ fn orchestrator_queue_notification_message(
 ) -> String {
     let title = ticket.title.replace(['\r', '\n'], " ");
     format!(
-        "Workspace Dashboard Queue for Ticket `{}`, title `{}`: human authorized Orchestrator routing; this is not an unattended scheduler. Read the Ticket and inspect current Orchestrator workspace state. If unblocked, record routing and transition state queued -> inprogress before any worktree/SpawnWorker implementation side effects. After inprogress acceptance, use worktree-workflow for `.worktree/<task-name>` creation with tracked `.yoi` project records visible and `.yoi/memory` plus local/runtime/log/lock/secret-like `.yoi` paths excluded, then use multi-agent-workflow to run sibling coder/reviewer Pods (coder narrow child-worktree write scope, reviewer read-only by default). After reviewer approval and blocker resolution, integrate the implementation branch into the orchestration branch automatically, validate in the Orchestrator worktree, record the outcome, and clean up only child implementation worktrees/branches. Do not read, write, validate, merge, clean up, or run git operations in the root/original workspace. If blocked, record a concise reason and leave the Ticket queued or return it to planning with the missing-information reason.",
+        "Workspace Dashboard Queue for Ticket `{}`, title `{}`: human authorized Orchestrator routing; this is not an unattended scheduler. Read the Ticket and inspect current Orchestrator workspace state. If unblocked, record routing and transition state queued -> inprogress before any worktree/SpawnWorker implementation side effects. After inprogress acceptance, use worktree-workflow for `.worktree/<task-name>` creation with tracked `.yoi` project records visible and `.yoi/memory` plus local/runtime/log/lock/secret-like `.yoi` paths excluded, then use multi-agent-workflow to run sibling coder/reviewer Workers (coder narrow child-worktree write scope, reviewer read-only by default). After reviewer approval and blocker resolution, integrate the implementation branch into the orchestration branch automatically, validate in the Orchestrator worktree, record the outcome, and clean up only child implementation worktrees/branches. Do not read, write, validate, merge, clean up, or run git operations in the root/original workspace. If blocked, record a concise reason and leave the Ticket queued or return it to planning with the missing-information reason.",
         ticket.id,
         title.trim()
     )
