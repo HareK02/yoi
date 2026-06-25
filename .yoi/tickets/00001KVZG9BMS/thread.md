@@ -253,3 +253,69 @@ Required fixes:
 - 修正後、報告済み validation に加えて stale grep を再実施する。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZG9BMS-worker-rename at: 2026-06-25T15:26:07Z -->
+
+## Implementation report
+
+Follow-up implementation report after review request_changes:
+
+対応内容:
+
+1. Web generated protocol の Worker 用語追従
+- `web/workspace/src/lib/generated/protocol.ts` を Rust protocol から再生成。
+- 旧 Pod protocol 名を Worker に更新。
+  - `PodStatus` → `WorkerStatus`
+  - `Greeting { pod_name }` → `Greeting { worker_name }`
+  - `PodEvent` → `WorkerEvent`
+  - `pod_event` → `worker_event`
+  - `list_pods` → `list_workers`
+  - `restore_pod` → `restore_worker`
+  - `pods_listed` → `workers_listed`
+  - `pod_restored` → `worker_restored`
+
+2. public API enum variant の修正
+- `crates/client/src/spawn.rs`
+  - `SpawnError::PodLaunchFailed` → `SpawnError::WorkerLaunchFailed`
+  - public re-export される型なので、match / source mapping も更新。
+
+3. active model-facing guidance の Pod 表現修正
+- 以下を Worker 用語へ更新。
+  - `resources/prompts/common/worker-orchestration.md`
+  - `resources/workflows/ticket-orchestrator-routing.md`
+  - `resources/prompts/role/intake.md`
+  - `resources/prompts/role/orchestrator.md`
+  - `resources/prompts/panel/orchestrator_idle_queue_notice.md`
+
+4. stale docs/path/type の修正
+- `docs/design/worker-session-state.md`
+  - `SendToPeerPod` → `SendToPeerWorker`
+- `crates/pod-store/README.md`
+  - deleted path `docs/design/pod-session-state.md` → `docs/design/worker-session-state.md`
+  - crate 名は invariant に従い `pod-store` のまま、説明は legacy-named crate owning current Worker metadata と明記。
+- `KNOWN_ISSUES.md`
+  - `crates/worker/src/pod.rs` → `crates/worker/src/worker.rs`
+  - `Pod::ensure_segment_head` → `Worker::ensure_segment_head`
+  - `PodError::WorkflowResolve` → `WorkerError::WorkflowResolve`
+
+Validation:
+- `cargo test -p worker`: success
+- `cargo test -p yoi`: success
+- `cargo check -p yoi`: success
+- `cargo test -p protocol --features typescript`: success
+- `cd web/workspace && deno task check`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Stale grep evidence:
+- review blocker terms were checked and found no matches:
+  - `PodStatus`, `PodEvent`, `pod_name`, `pod_event`, `list_pods`, `restore_pod`, `pods_listed`, `pod_restored`, `PodLaunchFailed`, `SendToPeerPod`, `sibling Pods`, `Peer Pods`, `yoi pod`, `--pod`, `crates/worker/src/pod.rs`, `Pod::ensure_segment_head`, `pod-session-state.md`
+- Strict stale grep was rerun; intentional `pod-store` / `pod-registry` crate names aside, active public Pod protocol/prompt/API reference remains absent.
+
+Commit:
+- `ebf50baa94f76bb000f70f63e133c7883729de5c fix: align worker rename followups`
+
+Residual risks / notes:
+- なし。child worktree は commit 後 clean。
+
+---
