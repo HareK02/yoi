@@ -135,3 +135,58 @@ Implementation orchestration update:
 - Coder には root/original workspace と orchestration worktree で read/write/validation/git operation を行わないよう明示した。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVXK0WEA-pdk-service-events at: 2026-06-25T07:38:44Z -->
+
+## Implementation report
+
+Implementation report:
+
+対象 Ticket:
+- `00001KVXK0WEA` — Update Plugin WIT PDK templates for service event runtime
+
+実装概要:
+- Plugin authoring surface を Component Model-only / Service ingress event / output command model に合わせて更新した。
+
+変更ファイル:
+- `resources/plugin/wit/yoi-plugin-instance-v1.wit`
+  - Service ingress event JSON と `output_commands` / `websocket_send` の authoring 向け説明を追加。
+- `resources/plugin/wit/yoi-plugin-tool-v1.wit`
+  - current runtime 前提の説明に整理。
+- `crates/plugin-pdk/src/lib.rs`
+  - `PluginIngressEvent` に `ingress_name`, `created_at`, `attempt`, `correlation_id` を追加。
+  - `ServiceOutput`, `ServiceOutputCommand`, `ServiceOutputCommandKind` を追加。
+  - `PluginIngressEvent::websocket_text()`, `websocket_send()`, `ServiceOutput::websocket_send()` を追加。
+  - `Plugin::handle_ingress` の戻り値を `ServiceOutput` に変更。
+- `crates/plugin-pdk/tests/template.rs`
+  - PDK helper / WIT / template consistency tests を追加・更新。
+- `resources/plugin/templates/rust-component-instance/*`
+  - Service-oriented template に更新。
+  - guest-side `recv(timeout)` loop ではなく、`handle_ingress` で ingress event を受け、`ServiceOutput::websocket_send` で output command を返す構成に変更。
+  - `plugin.toml` は `runtime.kind = "wasm-component"` のみ。
+  - Tool handler も残し、Tool Plugin authoring support を維持。
+- `crates/yoi/src/plugin_cli.rs`, `crates/yoi/src/main.rs`
+  - `yoi plugin new rust-component-service <path>` を追加。
+  - service template の `new` / `check` / `pack` consistency を unit test で確認。
+  - CLI usage を更新。
+- `docs/development/plugin-development.md`
+  - Service/Ingress は host-owned ingress event + output command model として記述。
+  - Service WebSocket integration で long-running guest `recv(timeout)` loop を推奨しない内容に更新。
+
+Validation:
+- `cargo test -p yoi-plugin-pdk`: success
+- `cargo test -p yoi plugin`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success (`nix-exit:0`)
+- Template cargo-check: success
+  - `cargo test -p yoi-plugin-pdk` 内で `rust-component-tool` / `rust-component-instance` の `cargo check --target wasm32-unknown-unknown --offline --target-dir <temp>` を実行し、temporary target dir を使用。
+
+Commit:
+- `7a4fd975268b655dca2f0861b8f2bd767c1e914f feat: update plugin service authoring templates`
+
+Residual risks / notes:
+- Runtime envelope の再設計は行っていない。
+- protocol-specific integration / secret injection / reconnect policy / runtime reimplementation は範囲外として未実装。
+
+---
