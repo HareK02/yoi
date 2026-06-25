@@ -4,7 +4,7 @@ Environment variables are a minimized runtime boundary. Prefer explicit profile/
 
 ## Why minimize environment variables
 
-Ambient environment is hard to audit: it can differ between shells, services, spawned Pods, tests, and restored processes. If important runtime behavior depends on it, reproducing a session becomes harder.
+Ambient environment is hard to audit: it can differ between shells, services, spawned Workers, tests, and restored processes. If important runtime behavior depends on it, reproducing a session becomes harder.
 
 Yoi keeps environment variables for narrow bootstrap and development cases, while normal provider credentials and runtime configuration should be explicit records.
 

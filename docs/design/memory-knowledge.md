@@ -6,7 +6,7 @@ The authoritative record for work is still code, git history, work item files, t
 
 ## Record types
 
-- `summary.md` is resident background context for normal Pods.
+- `summary.md` is resident background context for normal Workers.
 - `decisions/` stores durable decisions that are useful across turns.
 - `requests/` stores durable user requests and preferences.
 - `.yoi/knowledge/` stores curated Knowledge records when available.

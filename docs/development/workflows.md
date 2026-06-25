@@ -17,7 +17,7 @@ Current workflow themes include:
 - sibling coder/reviewer Worker orchestration
 - human-gated maintenance and merge readiness
 
-## Child Pods
+## Child Workers
 
 Spawned Workers are useful for scoped implementation, review, or exploration. They are not independent project authorities.
 
@@ -35,7 +35,7 @@ Notifications are hints to inspect state. They are not proof of completion.
 
 Unless explicitly authorized otherwise, final merge, cleanup, design-boundary decisions, and ticket closure remain the orchestrator/human responsibility.
 
-Child Pods may commit in delegated worktrees when the workflow allows it, but the merge-ready dossier should make the final decision auditable from repository records.
+Child Workers may commit in delegated worktrees when the workflow allows it, but the merge-ready dossier should make the final decision auditable from repository records.
 
 ## Public and dogfood workflow split
 

@@ -55,7 +55,7 @@ fn single_pod_rewind_picker_applies_without_escape_and_suppresses_duplicate_ente
     let status = tui.expect_exit_within(PanelHarness::default_exit_wait())?;
     assert!(
         status.success(),
-        "single-pod rewind fixture should exit cleanly"
+        "single-worker rewind fixture should exit cleanly"
     );
     drop(tui);
     let cleanup = fixture.cleanup()?;

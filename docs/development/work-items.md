@@ -24,14 +24,14 @@ Use the highest-level interface that matches the work:
 
 - Use `yoi panel` for the Ticket/Intake/Orchestrator workspace Dashboard and role-launch actions.
 - Use `yoi objective ...` for lightweight medium-term Objective records and their non-blocking canonical Ticket links.
-- Inside Pods, use typed Ticket tools to create, inspect, comment, review, and close Tickets.
+- Inside Workers, use typed Ticket tools to create, inspect, comment, review, and close Tickets.
 - For multi-step work, follow the Ticket Intake, Orchestrator Routing, planning/requirements-sync, and Multi-agent workflows.
 
 Maintainers can inspect the local `.yoi/tickets/` files directly when debugging storage, but normal user instructions should go through `yoi panel`, Ticket tools, or `yoi ticket ...`.
 
-## Ticket tools inside Pods
+## Ticket tools inside Workers
 
-Pods with the Ticket built-in feature can use typed Ticket tools:
+Workers with the Ticket built-in feature can use typed Ticket tools:
 
 - `TicketCreate`
 - `TicketList` — lightweight bounded overview for selecting ids; it returns short summaries only and must not be used as body/thread/artifact authority.
@@ -195,7 +195,7 @@ Intake should:
 - draft background, requirements, acceptance criteria, binding decisions/invariants, implementation latitude, readiness, risk flags, and validation;
 - create or update the Ticket only after user agreement.
 
-Intake should not schedule implementation, spawn coder/reviewer Pods, create worktrees, merge, or close Tickets.
+Intake should not schedule implementation, spawn coder/reviewer Workers, create worktrees, merge, or close Tickets.
 
 ### 2. Orchestrator routing
 
@@ -226,7 +226,7 @@ Planning sync should resolve or record:
 - critical risks and failure modes;
 - implementation-ready vs requirements-sync/spike/blocked classification.
 
-Do not send Tickets with unresolved concrete missing decisions/information directly to coder Pods. If no concrete missing item remains after bounded checks, risky-but-specified Tickets should proceed with an IntentPacket plus escalation conditions and reviewer focus.
+Do not send Tickets with unresolved concrete missing decisions/information directly to coder Workers. If no concrete missing item remains after bounded checks, risky-but-specified Tickets should proceed with an IntentPacket plus escalation conditions and reviewer focus.
 
 ### 4. Implementation assignment
 

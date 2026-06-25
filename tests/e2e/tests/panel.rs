@@ -40,10 +40,10 @@ fn rendered_ticket_row(
     }
 }
 
-fn rendered_pod_row(name: &str) -> RenderedPanelRow {
+fn rendered_worker_row(name: &str) -> RenderedPanelRow {
     RenderedPanelRow {
         key: PanelRowKey {
-            kind: "pod".to_string(),
+            kind: "worker".to_string(),
             id: name.to_string(),
         },
         title: name.to_string(),
@@ -74,7 +74,7 @@ fn ready_snapshot(rows: Vec<RenderedPanelRow>) -> DashboardContentReady {
                 orchestrator: Some(DashboardOrchestratorState {
                     worker_name: "workspace-orchestrator".to_string(),
                     status: "unavailable".to_string(),
-                    detail: Some("fixture blocks host Pod launch".to_string()),
+                    detail: Some("fixture blocks host Worker launch".to_string()),
                 }),
                 diagnostics: vec![],
             },
@@ -106,7 +106,7 @@ fn panel_fixture_ticket_row_matcher_rejects_absent_fixture_data() {
     );
     let wrong_kind = RenderedPanelRow {
         key: PanelRowKey {
-            kind: "pod".to_string(),
+            kind: "worker".to_string(),
             id: "0000000000000".to_string(),
         },
         title: "Ready E2E Ticket".to_string(),
@@ -171,7 +171,7 @@ fn dashboard_snapshot_rejects_missing_row_wrong_state_missing_overlay_and_missin
                 Some("planning"),
                 None,
             ),
-            rendered_pod_row("workspace"),
+            rendered_worker_row("workspace"),
         ]
     };
     assert_eq!(
@@ -189,7 +189,7 @@ fn dashboard_snapshot_rejects_missing_row_wrong_state_missing_overlay_and_missin
             Some("ready"),
             Some("inprogress"),
         ),
-        rendered_pod_row("workspace"),
+        rendered_worker_row("workspace"),
     ]);
     assert_ne!(
         missing_row.snapshot_for_expected(&expected),
@@ -354,7 +354,7 @@ fn panel_dashboard_content_ready_has_startup_budget() -> yoi_e2e::Result<()> {
             && source_breakdown.has_source("ticket_scan_parse")
             && source_breakdown.has_source("orchestration_overlay_validation_read_git")
             && source_breakdown.has_source("workspace_panel.build.total"),
-        "dashboard source breakdown should include pod metadata/status, ticket scan/parse, overlay validation/read/git, local claim scan, and panel-build sources; got {:?}; artifacts at {}",
+        "dashboard source breakdown should include worker metadata/status, ticket scan/parse, overlay validation/read/git, local claim scan, and panel-build sources; got {:?}; artifacts at {}",
         source_breakdown,
         panel.artifacts().dir.display()
     );
@@ -623,7 +623,7 @@ fn assert_no_runtime_or_host_pod_leak(
     ] {
         assert!(
             !rendered.contains(marker),
-            "host/fixture runtime Pod marker {marker:?} leaked into panel rows; artifacts at {artifacts}\n{rendered}"
+            "host/fixture runtime Worker marker {marker:?} leaked into panel rows; artifacts at {artifacts}\n{rendered}"
         );
     }
     if let Some(host_runtime) = std::env::var_os("XDG_RUNTIME_DIR") {

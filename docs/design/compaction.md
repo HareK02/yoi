@@ -1,6 +1,6 @@
 # Compaction
 
-Compaction exists because long-running Pods need durable continuity without sending the entire transcript forever.
+Compaction exists because long-running Workers need durable continuity without sending the entire transcript forever.
 
 ## Pruning vs compaction
 
