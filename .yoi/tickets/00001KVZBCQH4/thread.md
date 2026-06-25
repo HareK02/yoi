@@ -603,3 +603,34 @@ Residual risks / review focus:
 - child worktree は commit 後 clean。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZBCQH4-worker-runtime at: 2026-06-25T16:52:45Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+確認結果:
+
+- 前回 blocker の terminal lifecycle は解消されています。
+  - `Runtime::transition_worker` は既に `Stopped` / `Cancelled` の Worker に対して、反対側の terminal 操作を受けても state を上書きせず、既存 `status` / `last_event_id` を返し、新規 event も追加しません。
+  - 該当: `crates/worker-runtime/src/runtime.rs:353-384`
+- 追加テストも妥当です。
+  - `stop_then_cancel_preserves_stopped_terminal_state`
+  - `cancel_then_stop_preserves_cancelled_terminal_state`
+  - summary counts と event history の非変化を確認しており、前回指摘した invariant を直接カバーしています。
+- `runtime_id + worker_id` / `WorkerRef` authority 境界に regression は見当たりません。
+- scope creep は見当たりません。変更範囲は `worker-runtime` crate、workspace 追加、`package.nix` cargoHash 更新に収まっています。
+- `worker-runtime` の依存は `serde` / `thiserror` のみで、HTTP/WS/FS/server/client 系依存の追加はありません。
+- `package.nix` の cargoHash 更新は維持されています。
+
+実施した確認:
+- `git status`, `git log`, `git show fbd358a1`
+- `runtime.rs` の lifecycle 実装・追加テスト読解
+- `worker-runtime` crate の依存/API 境界確認
+- legacy pod/socket/session authority や HTTP/WS/FS 依存の grep 確認
+- `git diff --check f8d3b1cc..HEAD`: success
+
+補足: read-only 指示を優先し、`cargo test` / `nix build` は再実行していません。
+
+---
