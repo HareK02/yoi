@@ -745,3 +745,43 @@ Escalate if:
 - この state change は close ではなく `done` 記録。必要なら別途 close / cleanup を扱う。
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-25T19:32:51Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-25T19:32:51Z status: closed -->
+
+## 完了
+
+Ticket `00001KVZG9BMS` (`pod crateをworker crateへ改名する`) はすでに `state: done` に到達していたため、workspace Dashboard から close しました。
+
+この Close action によって、実装作業、state 変更、Orchestrator/Companion launch、worker invocation は開始されていません。
+
+
+---
+
+<!-- event: decision author: hare at: 2026-06-25T19:40:49Z -->
+
+## Decision
+
+Decision update: the pod -> worker rename must include a repository-wide audit of user/model-visible wording, not only Rust crate/type names.
+
+Scope to check and update where the meaning is the new execution-unit Worker rather than intentionally legacy/internal compatibility:
+- prompt resources under `resources/prompts`;
+- TUI / Panel / Workspace UI labels and help text;
+- CLI command/help/output strings;
+- docs that describe current architecture or current user-facing behavior;
+- tests/assertions tied to current prompt/UI/CLI text;
+- README files for active crates;
+- protocol/event names where they are active public API and not legacy compatibility.
+
+Allowed remaining `pod` wording must be explicitly intentional legacy/internal context, such as historical reports, old compatibility notes, or on-disk/socket/session compatibility details that are being kept temporarily. The implementation should provide grep evidence for remaining active `pod`/`Pod` references and categorize them as replaced, legacy/internal, or historical.
+
+
+---
