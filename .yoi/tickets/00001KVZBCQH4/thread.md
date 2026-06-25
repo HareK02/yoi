@@ -283,3 +283,54 @@ The core ticket must not absorb FS persistence, REST server, event stream server
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-06-25T15:51:07Z -->
+
+## Decision
+
+Decision update: Profile/config bundle synchronization is a separate implementation ticket.
+
+The worker-runtime core ticket should only define the create-worker boundary:
+- create request accepts a Profile selector.
+- create request has an optional ConfigBundleRef placeholder.
+- if no bundle is supplied, Runtime may resolve against its local builtin/default resources for v0 testing.
+
+Full bundle sync is tracked by 00001KVZQHPNY and should cover digest/versioned bundle storage, Runtime-side profile resolution, Backend sync orchestration, and host-local secret/mount/plugin policy enforcement.
+
+
+---
+
+<!-- event: decision author: hare at: 2026-06-25T16:14:53Z -->
+
+## Decision
+
+Decision update: the worker-runtime core API must not be described as a vague list of capabilities.
+
+The API surface is split into:
+
+- Runtime management API: runtime summary/status/capabilities/diagnostics/store-allocation status.
+- Worker catalog/lifecycle API: list/detail/create/stop/cancel workers inside one Runtime.
+- Worker interaction API: send user input and start a run, with single-flight/busy semantics.
+- Worker observation/projection API: status, bounded transcript, event cursor/subscription placeholder, usage/overview diagnostics.
+
+The Runtime API should wrap the single-worker host functionality exposed by the renamed `worker` crate, but must not re-export all Worker internals. Socket protocol, attach details, session file layout, and legacy process details stay out of the Runtime public API.
+
+
+---
+
+<!-- event: intake_summary author: hare at: 2026-06-25T16:18:21Z -->
+
+## Intake summary
+
+Marked ready by `yoi ticket state`.
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-06-25T16:18:21Z from: planning to: ready reason: cli_state field: state -->
+
+## State changed
+
+Marked ready by `yoi ticket state`.
+
+
+---

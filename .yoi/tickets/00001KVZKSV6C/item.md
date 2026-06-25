@@ -2,7 +2,7 @@
 title: 'Backend RuntimeRegistryをworker-runtimeへ接続する'
 state: 'planning'
 created_at: '2026-06-25T14:44:03Z'
-updated_at: '2026-06-25T14:47:43Z'
+updated_at: '2026-06-25T15:51:07Z'
 assignee: null
 ---
 

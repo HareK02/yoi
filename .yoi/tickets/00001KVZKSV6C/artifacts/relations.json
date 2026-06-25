@@ -24,6 +24,14 @@
       "note": "Backend event proxy/observation needs the Runtime event stream API.",
       "author": "yoi ticket",
       "at": "2026-06-25T14:47:43Z"
+    },
+    {
+      "ticket_id": "00001KVZKSV6C",
+      "kind": "related",
+      "target": "00001KVZQHPNY",
+      "note": "Backend RuntimeRegistry integration will eventually coordinate config bundle sync for remote runtimes, but v0 can use builtin/default fallback.",
+      "author": "yoi ticket",
+      "at": "2026-06-25T15:51:07Z"
     }
   ]
 }

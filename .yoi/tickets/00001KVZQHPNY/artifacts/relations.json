@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KVZQHPNY",
+      "kind": "depends_on",
+      "target": "00001KVZBCQH4",
+      "note": "Config bundle sync builds on the worker-runtime core CreateWorkerRequest/Profile boundary.",
+      "author": "yoi ticket",
+      "at": "2026-06-25T15:51:07Z"
+    }
+  ]
+}

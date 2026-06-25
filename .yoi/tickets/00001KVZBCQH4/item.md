@@ -1,8 +1,8 @@
 ---
 title: 'worker-runtime core crateと組み込みRuntime APIを作る'
-state: 'planning'
+state: 'ready'
 created_at: '2026-06-25T12:17:05Z'
-updated_at: '2026-06-25T14:48:23Z'
+updated_at: '2026-06-25T16:18:21Z'
 assignee: null
 ---
 
@@ -43,18 +43,69 @@ Yoi は旧 `Pod` 相当の実行単位を今後 `Worker` として扱い、`Runt
 
 - Backend などの Rust process に `Runtime` を直接組み込める。
 - v0 は memory store でよい。
-- API は少なくとも以下を表現する。
-  - runtime summary / status。
-  - worker list / detail。
-  - create worker。
-  - send input。
-  - stop / cancel worker。
-  - bounded transcript projection。
-  - event subscription または event cursor。
-  - usage / overview projection placeholder。
-- v0 は tools なし Worker / mock or minimal engine を許容する。
-- v0 は single-flight / busy reject でよい。
-- raw provider trace / raw full session log を Runtime public authority にしない。
+- Runtime API は transport API ではなく、`worker-runtime/lib.rs` が公開する Rust API として定義する。
+- API surface は以下の責務に分ける。
+
+#### Runtime management API
+
+Runtime 自体の管理・観測を扱う。Worker 1体の操作とは分ける。
+
+- `runtime_summary` / `runtime_status`。
+- Runtime capabilities。
+- Runtime diagnostics。
+- Runtime-local store/allocation status。
+- Runtime が保持している Worker 数や busy summary。
+- v0 では Runtime config mutation は不要。config bundle sync も別 Ticket とする。
+
+#### Worker catalog / lifecycle API
+
+Runtime 内に存在する Worker の作成・一覧・停止を扱う。これは旧 `Pod` の process lifecycle をそのまま露出するのではなく、Runtime-scoped Worker lifecycle として定義する。
+
+- `list_workers(query)`。
+- `get_worker(worker_id)`。
+- `create_worker(CreateWorkerRequest)`。
+- `stop_worker(worker_id)`。
+- `cancel_worker(worker_id)` or active run cancel。
+- Unknown worker / duplicate worker / busy worker / unsupported capability を typed error にする。
+
+`CreateWorkerRequest` は Web/Dashboard intent を直接受けない。Backend resolver 後、Runtime が解決可能な profile-oriented request とする。
+
+- `display_name` / optional caller-provided worker id。
+- `WorkerIntent`。
+- `ProfileSelector`。
+- optional `ConfigBundleRef`。
+- requested capabilities。
+- optional workspace / mount references。
+
+Profile/config bundle sync は別 Ticket とし、この Ticket では `config_bundle` は optional placeholder として型に含める程度でよい。`config_bundle` が無い場合、Runtime-local builtin/default Profile resources の範囲で toolsなし Worker を作れるようにする。
+
+#### Worker interaction API
+
+Worker へ入力を送り、run を開始する経路を扱う。これは既存 `worker` crate が持つ single Worker の入力処理を Runtime 経由で呼べるようにする層であり、Worker 内部 API を無制限に継承しない。
+
+- `send_input(worker_id, WorkerInput)`。
+- v0 input は user message を最小単位とする。
+- v0 は per-worker single-flight / busy reject でよい。
+- acceptance result は accepted / rejected / busy / not found / failed を区別する。
+- Runtime は `pod_name` / socket path / session path を input authority にしない。
+
+#### Worker observation / projection API
+
+Worker の状態と UI 用 projection を扱う。raw provider trace / raw full session log は Runtime public authority にしない。
+
+- worker status / active run summary。
+- bounded transcript projection。
+- event cursor or subscription abstraction。
+- usage / overview projection placeholder。
+- diagnostics / last error。
+- v0 は in-memory event log / transcript projection でよい。
+
+#### Existing Worker APIとの関係
+
+- `worker` crate は当面 single Worker host として残る。
+- Runtime core は `worker` crate の全 public API を再公開しない。
+- Runtime が公開するのは複数 Worker 管理に必要な catalog / lifecycle / interaction / projection API のみ。
+- Worker 固有の socket protocol / attach details / session file details は Runtime API に漏らさない。
 
 ### Store / allocation core
 
@@ -80,13 +131,20 @@ Yoi は旧 `Pod` 相当の実行単位を今後 `Worker` として扱い、`Runt
 - Existing `pod-store` / `pod-registry` crate の即時削除。
 - Existing Worker process/socket/session model の削除。
 - Full remote Runtime protocol。
+- Profile/config bundle sync implementation。
+- Plugin package / grant / prompt resource synchronization。
 
 ## 受け入れ条件
 
 - `crates/worker-runtime` が追加されている。
 - `worker-runtime` core は HTTP / WS / FS store dependency なしで library として使える。
 - `Runtime` concrete struct と Runtime/Worker domain types が公開されている。
-- Memory-backed embedded Runtime が worker list/detail/create/send input/stop/transcript projection の最小 API を持つ。
+- Runtime management API、Worker catalog/lifecycle API、Worker interaction API、Worker observation/projection API が型として分離されている。
+- Memory-backed embedded Runtime が runtime summary/status、worker list/detail/create、send input、stop/cancel、bounded transcript projection、event cursor/subscription placeholder を持つ。
+- Worker create request は Web/Dashboard intent ではなく、`WorkerIntent`、Profile selector、optional `ConfigBundleRef`、requested capabilities を表現できる。
+- `ConfigBundleRef` が無い場合、Runtime-local builtin/default resources で toolsなし Worker を作れる。
+- `worker` crate の socket / attach / session file details が Runtime public API に再公開されていない。
+- Profile/config bundle sync は実装されていないが、後続 Ticket が接続できる型境界がある。
 - `runtime_id + worker_id` が authority であり、`pod_name` / socket path / session path を authority にしない。
 - Store / allocation abstraction が Runtime internal responsibility として定義されている。
 - `worker-store` / `worker-registry` standalone crate は作られていない。
