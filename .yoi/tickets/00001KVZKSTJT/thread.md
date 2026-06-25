@@ -78,3 +78,25 @@ Marked ready by `yoi ticket state`.
 
 
 ---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-06-25T20:24:40Z from: ready to: planning reason: cli_state field: state -->
+
+## State changed
+
+State changed to `planning`.
+
+
+---
+
+<!-- event: decision author: hare at: 2026-06-25T20:25:52Z -->
+
+## Decision
+
+STJT の主目的を Runtime WS server 単体から `Runtime -> Backend -> Client` の WebSocket observation proxy に広げる。Remote Runtime から Backend Runtime WS client が `protocol::Event` を受け取り、Backend-owned client-facing WS で `runtime_id + worker_id` keyed stream として流すところまでをこの Ticket の実装対象に含める。
+
+Backend proxy は v0 では pass-through projection を基本にし、`protocol::Event` を別 output model へ変換しない。一方で Browser / future TUI は Runtime WS に直接接続せず、Backend-owned cursor/envelope/diagnostic を持つ stream だけを見る。Runtime endpoint / credential / socket path / session path は Client-facing authority に出さない。
+
+権限系はこの Ticket で full auth / permission / redaction rule を実装しない。Backend proxy/projection layer に、後続で observe allow/deny、thinking/tool output/diagnostic redaction、action affordance、command API forwarding allow/deny を差し込める seam を作るに留める。
+
+
+---
