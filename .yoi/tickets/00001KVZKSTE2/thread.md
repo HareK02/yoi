@@ -135,3 +135,23 @@ Dependency `00001KVZBCQH4` worker-runtime core は done。以前の waiting-capa
 これ以降、worktree creation / coder Worker routing などの implementation side effect に進める。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-25T20:38:01Z -->
+
+## Implementation report
+
+Implementation kickoff:
+
+- Worktree created: `/home/hare/Projects/yoi/.worktree/00001KVZKSTE2-worker-runtime-rest-server`
+- Branch: `work/00001KVZKSTE2-worker-runtime-rest-server`
+- Coder Worker spawned: `yoi-coder-00001KVZKSTE2-rest-server`
+
+Scope notes:
+- Coder has read access to the implementation worktree and non-recursive workspace root identity path needed by runtime startup.
+- Coder write scope is limited to `crates/worker-runtime/**`, root `Cargo.toml`, `Cargo.lock`, and `package.nix`.
+- Coder is instructed not to modify Ticket records and not to operate in root/orchestration worktrees.
+
+Dependent queued Tickets:
+- `00001KVZKSTJT`, `00001KVZSGT14`, `00001KW04A8K6`, and `00001KVZ9JGK0` remain queued with blocker notes until their prerequisite chain is done.
+
+---
