@@ -739,7 +739,7 @@ compact_system = "PREFIX\n{% include \"$yoi/internal/compact_system\" %}"
         assert!(rendered.contains("spawned Pod notifications are background signals"));
         assert!(rendered.contains("does not need to keep a turn open"));
         assert!(rendered.contains("Do not use `sleep` or polling loops"));
-        assert!(rendered.contains("worktree status, diff, and test results"));
+        assert!(rendered.contains("worktree state, diff, and test results"));
         assert!(rendered.contains("not scheduler or auto-maintain authorization"));
         assert!(rendered.contains("bypass user/workflow authorization"));
     }
