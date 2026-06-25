@@ -268,3 +268,35 @@ Residual risks / notes:
 - なし。runtime envelope の再設計、raw wasm compatibility、protocol-specific integration、secret/reconnect policy、runtime reimplementation は行っていない。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVXK0WEA-pdk-service-events at: 2026-06-25T07:55:26Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+前回 blocker は解消されている。
+
+確認した証拠:
+- `resources/plugin/templates/rust-component-instance/plugin.toml`
+  - `permissions` に `{ kind = "host_api", api = "websocket" }` が追加済み。
+  - `[[websocket]]` target が追加済みで、`wss://example.com/socket` と一致する `scheme = "wss"`, `host = "example.com"`, `path_prefixes = ["/socket"]` を宣言している。
+  - `runtime.kind = "wasm-component"` のままで、raw `wasm` 互換は導入されていない。
+- Service template README:
+  - `websocket_send` には manifest の `host_api.websocket` と matching `[[websocket]]` target が必要で、enablement grants も同じ target を許可する必要がある、と明記済み。
+- Development docs:
+  - Service ingress/output command 節で `websocket_send` に必要な `host_api.websocket` permission / `[[websocket]]` target / enablement grant 境界を説明している。
+  - polling `recv(timeout)` loop ではなく ingress event / output command pattern を推奨する説明を維持している。
+- Tests:
+  - PDK template test が service template manifest の websocket permission と matching target を assert するよう更新されている。
+  - CLI `plugin new rust-component-service` test も生成 manifest に websocket permission / `[[websocket]]` / host / path_prefix が含まれることを assert している。
+
+リスク確認:
+- 前回懸念した「template は `ServiceOutput::websocket_send` を返すのに manifest authority が足りない」不整合は修正済み。
+- 今回差分は template/docs/tests の authority declaration 補正に閉じており、runtime redesign、protocol-specific integration、secret injection、raw-WASM compatibility の追加は見当たらない。
+
+検証:
+- reviewer は read-only 指定のため `cargo` / `nix` / `git diff --check` は再実行していない。
+- `7a4fd975..HEAD` と fix commit `6c899887` の静的レビューのみ実施。
+
+---
