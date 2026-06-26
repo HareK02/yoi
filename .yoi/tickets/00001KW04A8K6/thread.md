@@ -132,3 +132,23 @@ WebSocket observation proxy、RuntimeRegistry foundation、embedded/remote Runti
 これ以降、worktree creation / coder Worker routing などの implementation side effect に進める。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T08:11:15Z -->
+
+## Implementation report
+
+Implementation kickoff:
+
+- Worktree created: `/home/hare/Projects/yoi/.worktree/00001KW04A8K6-tui-runtime-api`
+- Branch: `work/00001KW04A8K6-tui-runtime-api`
+- Coder Worker spawned: `yoi-coder-00001KW04A8K6-tui-runtime`
+
+Scope notes:
+- Coder has read access to the implementation worktree and non-recursive workspace root identity path needed by runtime startup.
+- Coder write scope is limited to `crates/tui/**`, `crates/client/**`, `crates/protocol/**`, `crates/yoi/**`, `crates/workspace-server/**`, root `Cargo.toml`, `Cargo.lock`, and `package.nix` if dependency/package changes are needed.
+- Coder is instructed not to modify Ticket records and not to operate in root/orchestration worktrees.
+
+Queue status:
+- This was the last queued Ticket in the current chain; no other queued Ticket remains pending in this acceptance pass.
+
+---
