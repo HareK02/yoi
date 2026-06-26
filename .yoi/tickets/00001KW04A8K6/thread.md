@@ -312,3 +312,22 @@ Scope:
 - Full auth/multi-user permission model / raw session migration / perfect legacy socket compatibility は Non-goals として未実装。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T08:55:31Z -->
+
+## Implementation report
+
+Cleanup report:
+
+- Child Workers stopped one-by-one and scope reclaimed:
+  - `yoi-coder-00001KW04A8K6-tui-runtime`
+  - `yoi-reviewer-00001KW04A8K6-tui-runtime`
+- Child implementation worktree removed:
+  - `/home/hare/Projects/yoi/.worktree/00001KW04A8K6-tui-runtime-api`
+- Child implementation branch removed:
+  - `work/00001KW04A8K6-tui-runtime-api`
+
+Operational note:
+- StopPod was executed sequentially, not in parallel.
+
+---

@@ -2,7 +2,7 @@
 title: 'TUIをRuntime API/WebSocket接続へ移行する'
 state: 'done'
 created_at: '2026-06-25T19:32:38Z'
-updated_at: '2026-06-26T08:54:39Z'
+updated_at: '2026-06-26T08:55:31Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-25T20:34:42Z'
