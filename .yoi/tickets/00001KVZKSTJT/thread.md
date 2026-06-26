@@ -254,3 +254,23 @@ Dependency `00001KVZKSTE2` REST command server は done。Ticket body/thread、r
 これ以降、worktree creation / coder Worker routing などの implementation side effect に進める。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T04:23:22Z -->
+
+## Implementation report
+
+Implementation kickoff:
+
+- Worktree created: `/home/hare/Projects/yoi/.worktree/00001KVZKSTJT-websocket-observation-proxy`
+- Branch: `work/00001KVZKSTJT-websocket-observation-proxy`
+- Coder Worker spawned: `yoi-coder-00001KVZKSTJT-ws-proxy`
+
+Scope notes:
+- Coder has read access to the implementation worktree and non-recursive workspace root identity path needed by runtime startup.
+- Coder write scope is limited to `crates/worker-runtime/**`, `crates/workspace-server/**`, root `Cargo.toml`, `Cargo.lock`, and `package.nix`.
+- Coder is instructed not to modify Ticket records and not to operate in root/orchestration worktrees.
+
+Next action:
+- Wait for Coder implementation report, then route to reviewer.
+
+---
