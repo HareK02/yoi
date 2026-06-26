@@ -12,6 +12,10 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
+use crate::companion::{
+    CompanionCancelRequest, CompanionConsole, CompanionMessageRequest, CompanionMessageResponse,
+    CompanionStatusResponse, CompanionTranscriptProjection,
+};
 use crate::hosts::{
     ConfigBundleCheckResult, ConfigBundleSyncResult, DiagnosticSeverity, EmbeddedWorkerRuntime,
     HostSummary, LocalWorkerRuntime, RemoteRuntimeConfig, RemoteWorkerRuntime, RuntimeDiagnostic,
@@ -80,6 +84,7 @@ pub struct WorkspaceApi {
     store: Arc<dyn ControlPlaneStore>,
     records: LocalProjectRecordReader,
     runtime: Arc<RuntimeRegistry>,
+    companion: Arc<CompanionConsole>,
     observation_proxy: BackendObservationProxy,
 }
 
@@ -107,12 +112,14 @@ impl WorkspaceApi {
                 .register(RemoteWorkerRuntime::new(remote_config).map_err(|err| err.into_error())?);
         }
         let runtime = Arc::new(runtime);
+        let companion = Arc::new(CompanionConsole::new(runtime.clone()));
         let observation_proxy = BackendObservationProxy::new(config.runtime_event_sources.clone());
         Ok(Self {
             records: LocalProjectRecordReader::new(config.workspace_root.clone()),
             config,
             store,
             runtime,
+            companion,
             observation_proxy,
         })
     }
@@ -154,6 +161,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route("/api/hosts", get(list_hosts))
         .route("/api/runtimes", get(list_runtimes))
         .route("/api/workers", get(list_workers))
+        .route("/api/companion/status", get(get_companion_status))
+        .route("/api/companion/transcript", get(get_companion_transcript))
+        .route("/api/companion/messages", post(post_companion_message))
+        .route("/api/companion/cancel", post(post_companion_cancel))
         .route(
             "/api/runtimes/{runtime_id}/workers",
             post(create_runtime_worker),
@@ -221,6 +232,7 @@ pub struct ExtensionPoints {
     pub store: String,
     pub event_stream: ExtensionPointState,
     pub host_worker_bridge: ExtensionPointState,
+    pub companion_console: ExtensionPointState,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -328,6 +340,10 @@ async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<Worksp
             host_worker_bridge: ExtensionPointState {
                 status: "read_only_local".to_string(),
                 note: "Local Hosts and Workers are exposed as a read-only bridge over existing Worker metadata; no direct Worker socket, scheduling, or lifecycle control is implemented.".to_string(),
+            },
+            companion_console: ExtensionPointState {
+                status: "providerless_mvp".to_string(),
+                note: "Backend-internal tools-less Companion Worker is available through Workspace API status/transcript/message endpoints; v0 records browser messages and returns a resource-defined provider-less response instead of direct LLM generation.".to_string(),
             },
         },
     }))
@@ -489,6 +505,35 @@ async fn list_workers(
     State(api): State<WorkspaceApi>,
 ) -> ApiResult<Json<RuntimeListResponse<WorkerSummary>>> {
     workers_response(api).map(Json)
+}
+
+async fn get_companion_status(
+    State(api): State<WorkspaceApi>,
+) -> ApiResult<Json<CompanionStatusResponse>> {
+    Ok(Json(api.companion.status()))
+}
+
+async fn get_companion_transcript(
+    State(api): State<WorkspaceApi>,
+    Query(query): Query<TranscriptQuery>,
+) -> ApiResult<Json<CompanionTranscriptProjection>> {
+    let limit = query.limit.unwrap_or(api.config.max_records).min(200);
+    let start = query.start.unwrap_or(0);
+    Ok(Json(api.companion.transcript(start, limit)))
+}
+
+async fn post_companion_message(
+    State(api): State<WorkspaceApi>,
+    Json(request): Json<CompanionMessageRequest>,
+) -> ApiResult<Json<CompanionMessageResponse>> {
+    Ok(Json(api.companion.send_message(request)))
+}
+
+async fn post_companion_cancel(
+    State(api): State<WorkspaceApi>,
+    Json(request): Json<CompanionCancelRequest>,
+) -> ApiResult<Json<CompanionMessageResponse>> {
+    Ok(Json(api.companion.cancel(request)))
 }
 
 async fn get_runtime_worker(
@@ -1095,11 +1140,50 @@ mod tests {
         assert_eq!(runtimes["items"][0]["host_ids"][0], host_id);
 
         let workers = get_json(app.clone(), "/api/workers").await;
-        assert!(workers["items"].as_array().unwrap().is_empty());
+        let worker_items = workers["items"].as_array().unwrap();
+        let companion_worker = worker_items
+            .iter()
+            .find(|worker| worker["role"] == "workspace_companion")
+            .expect("companion worker is visible through runtime worker API");
+        assert_eq!(companion_worker["runtime_id"], "embedded-worker-runtime");
+        assert_eq!(companion_worker["capabilities"]["can_stop"], false);
         assert_eq!(
             workers["diagnostics"][0]["code"],
             "local_pod_registry_unreadable"
         );
+
+        let companion_status = get_json(app.clone(), "/api/companion/status").await;
+        assert_eq!(companion_status["state"], "ready");
+        assert_eq!(companion_status["worker"]["role"], "workspace_companion");
+        assert_eq!(
+            companion_status["transport"]["kind"],
+            "providerless_backend_internal"
+        );
+        assert!(!companion_status.to_string().contains("/workspace/demo"));
+
+        let companion_message = post_json(
+            app.clone(),
+            "/api/companion/messages",
+            json!({ "content": "hello companion" }),
+        )
+        .await;
+        assert_eq!(companion_message["state"], "accepted");
+        assert_eq!(companion_message["transcript"]["items"][0]["role"], "user");
+        assert_eq!(
+            companion_message["transcript"]["items"][1]["role"],
+            "assistant"
+        );
+        assert!(
+            companion_message["transcript"]["items"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("provider-less")
+        );
+        assert!(!companion_message.to_string().contains("/workspace/demo"));
+
+        let companion_transcript = get_json(app.clone(), "/api/companion/transcript").await;
+        assert_eq!(companion_transcript["total_items"], 2);
+        assert_eq!(companion_transcript["items"][1]["role"], "assistant");
 
         let host_workers = get_json(app.clone(), &format!("/api/hosts/{host_id}/workers")).await;
         assert!(host_workers["items"].as_array().unwrap().is_empty());

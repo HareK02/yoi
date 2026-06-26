@@ -16,6 +16,7 @@ export type WorkspaceResponse = {
   extension_points: {
     event_stream: ExtensionPoint;
     host_worker_bridge: ExtensionPoint;
+    companion_console: ExtensionPoint;
   };
 };
 
@@ -208,4 +209,58 @@ export type ObjectiveListResponse = {
   items: ObjectiveSummary[];
   invalid_records: InvalidProjectRecord[];
   record_authority: string;
+};
+
+export type CompanionState =
+  | 'ready'
+  | 'busy'
+  | 'error'
+  | 'timeout'
+  | 'cancelled'
+  | 'accepted'
+  | 'rejected';
+
+export type CompanionTransportSummary = {
+  kind: string;
+  completion: string;
+  limitation: string;
+};
+
+export type CompanionStatusResponse = {
+  state: CompanionState;
+  worker?: Worker | null;
+  transport: CompanionTransportSummary;
+  diagnostics: Diagnostic[];
+};
+
+export type CompanionTranscriptItem = {
+  sequence: number;
+  role: 'user' | 'assistant' | 'system' | string;
+  content: string;
+  created_at: string;
+  source: string;
+  status: string;
+};
+
+export type CompanionTranscriptProjection = {
+  state: CompanionState;
+  start: number;
+  limit: number;
+  total_items: number;
+  next_start?: number | null;
+  items: CompanionTranscriptItem[];
+  diagnostics: Diagnostic[];
+};
+
+export type CompanionMessageRequest = {
+  content: string;
+};
+
+export type CompanionMessageResponse = {
+  state: CompanionState;
+  worker?: Worker | null;
+  user_item?: CompanionTranscriptItem | null;
+  assistant_item?: CompanionTranscriptItem | null;
+  transcript: CompanionTranscriptProjection;
+  diagnostics: Diagnostic[];
 };
