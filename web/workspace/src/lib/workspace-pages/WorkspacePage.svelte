@@ -1,5 +1,6 @@
 <script lang="ts">
   import RepositoryTicketKanban from '$lib/workspace-pages/RepositoryTicketKanban.svelte';
+  import { workerConsoleHref } from '$lib/workspace-console/model';
   import WorkspaceSidebar from '$lib/workspace-sidebar/WorkspaceSidebar.svelte';
   import type {
     Diagnostic,
@@ -477,6 +478,7 @@
                       <th>State</th>
                       <th>Workspace</th>
                       <th>Implementation</th>
+                      <th>Attach</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -492,6 +494,7 @@
                         <td>{worker.state} · {worker.status}</td>
                         <td>{worker.workspace.visibility} · {worker.workspace.identity}</td>
                         <td>{worker.implementation.kind}</td>
+                        <td><a class="inline-link" href={workerConsoleHref(worker)}>Open Console</a></td>
                       </tr>
                     {/each}
                   </tbody>
