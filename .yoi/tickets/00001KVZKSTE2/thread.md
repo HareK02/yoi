@@ -222,3 +222,33 @@ Residual risks / review focus:
 - `tower` は router unit test helper 用にも使うが、`http-server` feature 配下の optional dependency。core / no-default build には入らない。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZKSTE2-rest-server at: 2026-06-26T03:14:43Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+ブロッカー:
+
+- Ticket 本文 / route packet では `worker-runtime/main.rs` または binary/process wrapper が必要。
+  - Ticket item: Runtime process wrapper / binary starts。
+  - Routing packet: “http-server feature と binary/process wrapper がある”。
+- しかし実装は `crates/worker-runtime` の lib target のみ。
+  - `cargo read-manifest --manifest-path crates/worker-runtime/Cargo.toml` で target は `lib` のみ。
+  - `crates/worker-runtime/src/main.rs` や `[[bin]]` は存在しない。
+  - `RuntimeHttpServer::bind/serve` は library helper としては良いが、Runtime process binary が起動して REST endpoints を公開する受け入れ条件は未達。
+
+確認できた良い点:
+- `http-server` feature は optional で追加されており、`cargo tree -p worker-runtime --no-default-features` では HTTP deps 漏れは見えない。
+- REST router は要求 endpoint を定義している。
+- handlers は `Runtime` API に委譲しており、Worker semantics の大きな重複は見えない。
+- Browser は Backend 経由で Runtime に直接接続しない旨の module/API comment がある。
+- Runtime/Worker identity を使い、legacy pod/socket/session path を authority にしていない。
+- typed response/error shape と RuntimeError の HTTP status mapping はある。
+- SSE/WebSocket scope creep は見えない。
+- `package.nix` の `cargoHash` 更新は commit に含まれている。
+
+検証は read-only inspection 中心で、テスト/ビルドは再実行せず、報告済み結果を参照した。
+
+---
