@@ -427,3 +427,22 @@ Scope:
 - Secret value sync / full Plugin package manager/signature policy / Web Console completion は Non-goals として未実装。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T07:40:38Z -->
+
+## Implementation report
+
+Cleanup report:
+
+- Child Workers stopped one-by-one and scope reclaimed:
+  - `yoi-coder-00001KVZQHPNY-config-bundles`
+  - `yoi-reviewer-00001KVZQHPNY-config-bundles`
+- Child implementation worktree removed:
+  - `/home/hare/Projects/yoi/.worktree/00001KVZQHPNY-runtime-config-bundles`
+- Child implementation branch removed:
+  - `work/00001KVZQHPNY-runtime-config-bundles`
+
+Operational note:
+- StopPod was executed sequentially, not in parallel.
+
+---
