@@ -304,3 +304,59 @@ Review result: approve
 - read-only のソース確認、git 状態確認、`find`/`rg` による route/API/sidebar 残存確認。ビルド・テスト再実行はファイル生成の可能性があるため未実施。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T18:21:56Z -->
+
+## Implementation report
+
+Integration / validation report:
+
+Integration:
+- Implementation branch `work/00001KW2GCPYF-worker-console-redesign` を orchestration branch に merge 済み。
+- Merge commit: `864efe32 merge: 00001KW2GCPYF worker console redesign`
+
+Included implementation commits:
+- `c3fed591095244223e6da7c84ac7f1a2e4cf8cb7 feat: worker attach workspace console`
+- `a1083908b681b420cd5fd911ac00da01ff8b7e5d fix: stabilize worker console refresh`
+
+Validation in Orchestrator worktree:
+- `cargo fmt --all --check`: success
+- `cargo check -p yoi`: success
+- `cd web/workspace && deno task test`: success（6 tests passed）
+- `cd web/workspace && deno task check`: success（0 errors / 0 warnings）
+- `cd web/workspace && deno task build`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Review:
+- Reviewer approve 済み。前回 blocker だった Svelte runes `$effect` / `reloadToken` dependency loop は解消済み。
+
+Outcome:
+- Acceptance criteria を満たしたため `done` へ進める。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-26T18:22:10Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Workspace Worker Console redesign の実装、review、merge、Orchestrator validation が完了した。
+
+Done evidence:
+- Merge commit: `864efe32 merge: 00001KW2GCPYF worker console redesign`
+- Reviewer approve 済み。
+- Orchestrator validation:
+  - `cargo fmt --all --check`: success
+  - `cargo check -p yoi`: success
+  - `cd web/workspace && deno task test`: success（6 tests passed）
+  - `cd web/workspace && deno task check`: success（0 errors / 0 warnings）
+  - `cd web/workspace && deno task build`: success
+  - `git diff --check`: success
+  - `nix build .#yoi --no-link`: success
+
+Scope:
+- Workspace Web Console を Companion-specific route/sidebar から Worker list driven arbitrary Worker attach route (`runtime_id + worker_id`) へ再設計。
+- Old `/console` canonical route and standalone Companion Console sidebar entry were removed.
+- Advanced controls / multi-worker split / raw provider trace viewer / full auth-redaction policy は Non-goals として未実装。
+
+---
