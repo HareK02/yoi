@@ -440,3 +440,240 @@
         white-space: pre-wrap;
     }
 }
+
+.console-shell {
+    gap: 1rem;
+}
+
+.console-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+}
+
+.console-status {
+    display: grid;
+    justify-items: end;
+    gap: 0.25rem;
+    min-width: 10rem;
+    padding: 0.75rem 0.9rem;
+    border-radius: 16px;
+    background: #ecfeff;
+    border: 1px solid #a5f3fc;
+    color: #0f766e;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-size: 0.78rem;
+}
+
+.console-status small {
+    text-transform: none;
+    letter-spacing: 0;
+    color: #475569;
+    font-weight: 600;
+}
+
+.console-status[data-state='busy'] {
+    background: #fff7ed;
+    border-color: #fed7aa;
+    color: #c2410c;
+}
+
+.console-status[data-state='error'],
+.console-status[data-state='timeout'] {
+    background: #fef2f2;
+    border-color: #fecaca;
+    color: #b91c1c;
+}
+
+.console-status[data-state='cancelled'],
+.console-status[data-state='rejected'] {
+    background: #f8fafc;
+    border-color: #cbd5e1;
+    color: #475569;
+}
+
+.console-transport {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+    gap: 0.75rem;
+}
+
+.console-transport div {
+    display: grid;
+    gap: 0.15rem;
+}
+
+.console-transport dt {
+    margin: 0;
+    color: #64748b;
+    font-size: 0.75rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+}
+
+.console-transport dd {
+    margin: 0;
+    color: #0f172a;
+    font-weight: 700;
+}
+
+.console-transport p {
+    grid-column: 1 / -1;
+    margin: 0;
+    color: #475569;
+    line-height: 1.5;
+}
+
+.console-diagnostics {
+    display: grid;
+    gap: 0.4rem;
+}
+
+.diagnostic {
+    margin: 0;
+    padding: 0.55rem 0.7rem;
+    border-radius: 10px;
+    background: #eff6ff;
+    color: #1d4ed8;
+    font-size: 0.86rem;
+}
+
+.diagnostic.warning,
+.diagnostic.warn {
+    background: #fff7ed;
+    color: #c2410c;
+}
+
+.diagnostic.error {
+    background: #fef2f2;
+    color: #b91c1c;
+}
+
+.transcript-card,
+.composer-card {
+    display: grid;
+    gap: 1rem;
+}
+
+.transcript-list {
+    display: grid;
+    gap: 0.85rem;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.transcript-item {
+    display: grid;
+    gap: 0.45rem;
+    padding: 0.85rem 1rem;
+    border-radius: 16px;
+    border: 1px solid #dbeafe;
+    background: #f8fafc;
+}
+
+.transcript-item.user {
+    margin-left: min(8vw, 4rem);
+    background: #eff6ff;
+    border-color: #bfdbfe;
+}
+
+.transcript-item.assistant {
+    margin-right: min(8vw, 4rem);
+    background: #f0fdf4;
+    border-color: #bbf7d0;
+}
+
+.message-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.55rem;
+    color: #64748b;
+    font-size: 0.78rem;
+}
+
+.message-meta strong {
+    color: #0f172a;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.message-meta time {
+    margin-left: auto;
+}
+
+.transcript-item p {
+    margin: 0;
+    white-space: pre-wrap;
+    line-height: 1.55;
+    color: #1f2937;
+}
+
+.empty-state {
+    margin: 0;
+    padding: 1rem;
+    border-radius: 14px;
+    background: #f8fafc;
+    color: #64748b;
+}
+
+.composer-card label {
+    font-weight: 800;
+    color: #0f172a;
+}
+
+.composer-card textarea {
+    width: 100%;
+    min-height: 8rem;
+    resize: vertical;
+    border: 1px solid #cbd5e1;
+    border-radius: 14px;
+    padding: 0.85rem 1rem;
+    font: inherit;
+    color: #0f172a;
+    background: #ffffff;
+}
+
+.composer-card textarea:disabled {
+    background: #f8fafc;
+    color: #64748b;
+}
+
+.composer-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.7rem;
+}
+
+.composer-actions span {
+    margin-right: auto;
+    color: #64748b;
+    font-size: 0.85rem;
+}
+
+.composer-actions button {
+    border: 0;
+    border-radius: 999px;
+    padding: 0.65rem 1rem;
+    background: #2563eb;
+    color: #ffffff;
+    font-weight: 800;
+    cursor: pointer;
+}
+
+.composer-actions button.secondary {
+    background: #e2e8f0;
+    color: #334155;
+}
+
+.composer-actions button:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+}
