@@ -1,8 +1,10 @@
-export type {
+import type {
   Event as PodProtocolEvent,
   Method as PodProtocolMethod,
-  Segment as PodProtocolSegment,
+  Segment as PodProtocolSegment
 } from '$lib/generated/protocol';
+
+export type { PodProtocolEvent, PodProtocolMethod, PodProtocolSegment };
 
 export type ExtensionPoint = {
   status: string;
@@ -92,6 +94,53 @@ export type Worker = {
   capabilities: WorkerCapabilities;
   diagnostics: Diagnostic[];
 };
+
+export type WorkerOperationState = 'accepted' | 'unsupported' | 'rejected';
+
+export type WorkerInputResult = {
+  state: WorkerOperationState;
+  runtime_id: string;
+  worker_id: string;
+  transcript_sequence?: number | null;
+  event_id?: number | null;
+  diagnostics: Diagnostic[];
+};
+
+export type WorkerTranscriptItem = {
+  sequence: number;
+  role: 'user' | 'assistant' | 'system' | string;
+  content: string;
+  event_id: number;
+};
+
+export type WorkerTranscriptProjection = {
+  state: WorkerOperationState;
+  runtime_id: string;
+  worker_id: string;
+  start: number;
+  limit: number;
+  total_items: number;
+  next_start?: number | null;
+  items: WorkerTranscriptItem[];
+  diagnostics: Diagnostic[];
+};
+
+export type ClientWorkerEventWsEnvelope = {
+  cursor: string;
+  event_id: string;
+  runtime_id: string;
+  worker_id: string;
+  payload: PodProtocolEvent;
+};
+
+export type ClientWorkerEventWsDiagnostic = {
+  code: string;
+  message: string;
+};
+
+export type ClientWorkerEventWsFrame =
+  | { kind: 'event'; envelope: ClientWorkerEventWsEnvelope }
+  | { kind: 'diagnostic'; diagnostic: ClientWorkerEventWsDiagnostic };
 
 export type ListResponse<T> = {
   workspace_id: string;

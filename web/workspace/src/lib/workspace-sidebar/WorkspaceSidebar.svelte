@@ -1,5 +1,4 @@
 <script lang="ts">
-  import CompanionNavSection from './CompanionNavSection.svelte';
   import ObjectivesNavSection from './ObjectivesNavSection.svelte';
   import RepositoriesNavSection from './RepositoriesNavSection.svelte';
   import WorkersNavSection from './WorkersNavSection.svelte';
@@ -42,9 +41,8 @@
   </header>
 
   <nav class="sidebar-sections" aria-label="Workspace sections">
-    <CompanionNavSection {currentPath} />
     <RepositoriesNavSection {workspace} {currentPath} />
     <ObjectivesNavSection {currentPath} />
-    <WorkersNavSection />
+    <WorkersNavSection {currentPath} />
   </nav>
 </aside>

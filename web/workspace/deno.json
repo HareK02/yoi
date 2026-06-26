@@ -6,10 +6,12 @@
     "dev": "deno run -A npm:vite@7.2.7 dev",
     "dev:backend": "cd ../.. && cargo run -p yoi-workspace-server -- serve --workspace . --db .yoi/workspace.db --listen 127.0.0.1:8787",
     "check": "deno run -A npm:@sveltejs/kit@2.49.4 sync && deno run -A npm:svelte-check@4.3.4 --tsconfig ./tsconfig.json",
+    "test": "deno test --allow-read=src src/lib/workspace-console/model.test.ts src/lib/workspace-console/worker-console.ui.test.ts",
     "build": "deno run -A npm:vite@7.2.7 build",
     "preview": "deno run -A npm:vite@7.2.7 preview"
   },
   "imports": {
+    "$lib/": "./src/lib/",
     "@sveltejs/adapter-static": "npm:@sveltejs/adapter-static@3.0.9",
     "@sveltejs/kit": "npm:@sveltejs/kit@2.49.4",
     "@sveltejs/vite-plugin-svelte": "npm:@sveltejs/vite-plugin-svelte@6.2.1",
