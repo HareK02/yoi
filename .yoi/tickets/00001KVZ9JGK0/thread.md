@@ -233,3 +233,83 @@ Queued capacity note:
 - `00001KW04A8K6` remains queued while Web Console MVP is inprogress because both are UI/control-surface consumers of the new Runtime APIs; TUI migration should start after this branch is reviewed/merged/done.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZ9JGK0-web-console at: 2026-06-26T08:02:43Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装完了。指定 worktree / branch 上で commit 済み。
+
+Commit:
+- `f3ad9c96b3fd48b5afce2a46b9c46efc5dce16f6 feat: add workspace companion console MVP`
+
+変更概要:
+
+### Backend
+
+変更ファイル:
+- `crates/workspace-server/src/companion.rs`
+- `crates/workspace-server/src/lib.rs`
+- `crates/workspace-server/src/server.rs`
+- `resources/prompts/worker/web_companion_providerless.md`
+
+実装内容:
+- Backend 内部の tools-less Companion Console 境界を追加。
+- `WorkspaceApi` 初期化時に `embedded-worker-runtime` 上へ `workspace_companion` Worker を spawn。
+  - runtime / worker API の `/api/workers` から visible。
+  - v0 capabilities は input / bounded transcript projection のみで、filesystem / shell / git / Ticket mutation authority は持たせていない。
+- Companion 専用 API を追加:
+  - `GET /api/companion/status`
+  - `GET /api/companion/transcript?start=&limit=`
+  - `POST /api/companion/messages`
+  - `POST /api/companion/cancel`
+- status / transcript / message response は typed state を返す:
+  - `ready`, `busy`, `error`, `timeout`, `cancelled`, `accepted`, `rejected`
+- Browser へは Backend API projection のみ返し、raw Worker socket/session/runtime path や provider credentials は返さない設計。
+- 実 LLM/provider 実行は既存 runtime foundation へ狭く接続できなかったため、fake せず provider-less/conversation boundary として実装。
+  - user message は backend-internal Worker へ input として記録。
+  - UI transcript には resource-defined assistant boundary response を返す。
+  - この制限は API diagnostics / UI transport description に明示。
+- prompt / assistant boundary prose は Rust hard-code ではなく `resources/prompts/worker/web_companion_providerless.md` に配置。
+
+### Web UI
+
+変更ファイル:
+- `web/workspace/src/routes/console/+page.svelte`
+- `web/workspace/src/lib/workspace-sidebar/CompanionNavSection.svelte`
+- `web/workspace/src/lib/workspace-sidebar/WorkspaceSidebar.svelte`
+- `web/workspace/src/lib/workspace-sidebar/types.ts`
+- `web/workspace/src/app.css`
+
+実装内容:
+- `/console` route を追加。
+- Sidebar に `Companion Console` 導線を追加。
+- Console UI:
+  - Companion status 表示
+  - transport / limitation 表示
+  - bounded transcript 表示
+  - user message composer
+  - Send / Refresh / Cancel UI
+  - busy / error / timeout / cancelled / rejected state 表示
+  - diagnostics 表示
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo test -p yoi-workspace-server`: success（36 passed）
+- `cargo check -p yoi`: success
+- `cd web/workspace && deno task check`: success（0 errors / 0 warnings）
+- `cd web/workspace && deno task build`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Residual risks / review focus:
+- 実 LLM 応答は未接続。今回の実装は intentionally provider-less boundary であり、assistant response は resource-defined limitation response。
+- 既存 worker-runtime へ安全に provider-backed completion を流すには、Worker engine integration / lifecycle / streaming boundary の追加設計が必要そう。
+- transcript は v0 in-memory projection。server restart で Companion UI transcript は消える。
+- Backend runtime 側には user input のみ記録され、assistant boundary response は Companion projection 側。
+- busy は single-flight typed state として用意しているが、provider-less response は同期即時完了のため見える場面は限定的。
+- UI は Console MVP に限定。tool call UI / thinking grouping / diff/file viewer / multi Worker attach は非対応。
+
+---
