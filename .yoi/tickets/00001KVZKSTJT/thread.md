@@ -480,3 +480,58 @@ Review result: approve
 検証は read-only inspection のみで、cargo/nix は再実行していない。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T05:16:01Z -->
+
+## Implementation report
+
+Integration / validation report:
+
+Integration:
+- Implementation branch `work/00001KVZKSTJT-websocket-observation-proxy` を orchestration branch に merge 済み。
+- Merge commit: `ae0f0d1d merge: 00001KVZKSTJT websocket observation proxy`
+
+Included implementation commits:
+- `9807accaf08f4322763dd7cd3536baf3dab8d10e feat: add worker observation websocket proxy`
+- `8cc9a594f78feef62aa7abd5bbf11b5cd40b4781 fix: preserve runtime websocket diagnostics`
+
+Validation in Orchestrator worktree:
+- `cargo fmt --all --check`: success
+- `cargo check -p worker-runtime`: success
+- `cargo test -p worker-runtime --features ws-server`: success（14 lib tests + 3 bin tests + doctests）
+- `cargo test -p yoi-workspace-server`: success（26 tests + bin/doc tests）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Review:
+- Reviewer approve 済み。前回 blocker だった Runtime diagnostic の Backend typed diagnostic mapping、HTTP 404 worker-not-found mapping、unknown cursor / upstream disconnect test coverage は解消済み。
+
+Outcome:
+- Acceptance criteria を満たしたため `done` へ進める。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-26T05:16:11Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Runtime/Backend WebSocket observation proxy の実装、review、merge、Orchestrator validation が完了した。
+
+Done evidence:
+- Merge commit: `ae0f0d1d merge: 00001KVZKSTJT websocket observation proxy`
+- Reviewer approve 済み。
+- Orchestrator validation:
+  - `cargo fmt --all --check`: success
+  - `cargo check -p worker-runtime`: success
+  - `cargo test -p worker-runtime --features ws-server`: success（14 lib tests + 3 bin tests + doctests）
+  - `cargo test -p yoi-workspace-server`: success（26 tests + bin/doc tests）
+  - `cargo check -p yoi`: success
+  - `git diff --check`: success
+  - `nix build .#yoi --no-link`: success
+
+Scope:
+- Runtime process worker-scoped WebSocket observation stream と Backend-owned client-facing WebSocket proxy boundary を追加。
+- command tunnel / SSE / remote lifecycle/discovery / full auth-redaction policy / Web Console UI は Non-goals として未実装。
+
+---
