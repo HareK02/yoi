@@ -141,3 +141,24 @@ worker-runtime core / Registry foundation / embedded+remote Runtime connection /
 これ以降、worktree creation / coder Worker routing などの implementation side effect に進める。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T06:35:25Z -->
+
+## Implementation report
+
+Implementation kickoff:
+
+- Worktree created: `/home/hare/Projects/yoi/.worktree/00001KVZQHPNY-runtime-config-bundles`
+- Branch: `work/00001KVZQHPNY-runtime-config-bundles`
+- Coder Worker spawned: `yoi-coder-00001KVZQHPNY-config-bundles`
+
+Scope notes:
+- Coder has read access to the implementation worktree and non-recursive workspace root identity path needed by runtime startup.
+- Coder write scope is limited to `crates/worker-runtime/**`, `crates/workspace-server/**`, root `Cargo.toml`, `Cargo.lock`, and `package.nix` if dependency/package changes are needed.
+- Coder is instructed not to modify Ticket records and not to operate in root/orchestration worktrees.
+
+Queued capacity notes:
+- `00001KVZ9JGK0` remains queued to avoid overlapping Web Console/API surface changes while Profile/config sync is inprogress.
+- `00001KW04A8K6` remains queued to avoid TUI migration against unstable worker creation/profile semantics.
+
+---

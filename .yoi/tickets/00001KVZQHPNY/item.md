@@ -2,7 +2,7 @@
 title: 'RuntimeへProfile/config bundleを同期する'
 state: 'inprogress'
 created_at: '2026-06-25T15:49:30Z'
-updated_at: '2026-06-26T06:32:50Z'
+updated_at: '2026-06-26T06:35:25Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-25T16:44:39Z'
