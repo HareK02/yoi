@@ -1,8 +1,7 @@
-use crate::catalog::ProfileSelector;
+use crate::catalog::{ConfigBundleRef, ProfileSelector};
 use crate::error::RuntimeError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::Path;
 
 pub const CONFIG_BUNDLE_DIGEST_ALGORITHM: &str = "sha256";
 
@@ -169,13 +168,14 @@ pub struct ConfigBundleSummary {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigBundleAvailability {
-    pub reference: crate::catalog::ConfigBundleRef,
+    pub reference: ConfigBundleRef,
     pub summary: ConfigBundleSummary,
 }
 
 pub(crate) fn validate_config_bundle(bundle: &ConfigBundle) -> Result<(), RuntimeError> {
-    validate_non_empty("config bundle id", &bundle.metadata.id)?;
+    validate_config_bundle_id(&bundle.metadata.id)?;
     validate_non_empty("config bundle digest", &bundle.metadata.digest)?;
+    validate_digest("config bundle digest", &bundle.metadata.digest)?;
     validate_non_empty("config bundle revision", &bundle.metadata.revision)?;
     validate_non_empty("config bundle workspace id", &bundle.metadata.workspace_id)?;
     validate_non_empty("config bundle created_at", &bundle.metadata.created_at)?;
@@ -212,9 +212,7 @@ pub(crate) fn validate_config_bundle(bundle: &ConfigBundle) -> Result<(), Runtim
 
     for declaration in &bundle.declarations {
         validate_non_empty("config declaration name", &declaration.name)?;
-        validate_non_empty("config declaration reference", &declaration.reference)?;
         validate_boundary_text("config declaration name", &declaration.name)?;
-        validate_boundary_text("config declaration reference", &declaration.reference)?;
         if declaration.kind == ConfigDeclarationKind::Unsupported {
             return Err(RuntimeError::UnsupportedConfigDeclaration {
                 bundle_id: bundle.metadata.id.clone(),
@@ -222,7 +220,15 @@ pub(crate) fn validate_config_bundle(bundle: &ConfigBundle) -> Result<(), Runtim
                 name: declaration.name.clone(),
             });
         }
+        validate_declaration_reference(&bundle.metadata.id, declaration)?;
     }
+    Ok(())
+}
+
+pub(crate) fn validate_config_bundle_ref(reference: &ConfigBundleRef) -> Result<(), RuntimeError> {
+    validate_config_bundle_id(&reference.id)?;
+    validate_non_empty("config bundle reference digest", &reference.digest)?;
+    validate_digest("config bundle reference digest", &reference.digest)?;
     Ok(())
 }
 
@@ -263,6 +269,117 @@ fn validate_non_empty(label: &'static str, value: &str) -> Result<(), RuntimeErr
     }
 }
 
+fn validate_config_bundle_id(value: &str) -> Result<(), RuntimeError> {
+    validate_non_empty("config bundle id", value)?;
+    let trimmed = value.trim();
+    if trimmed.len() > 128 {
+        return Err(RuntimeError::InvalidRequest(
+            "config bundle id is too large".to_string(),
+        ));
+    }
+    if trimmed != value {
+        return Err(RuntimeError::InvalidRequest(
+            "config bundle id must not contain surrounding whitespace".to_string(),
+        ));
+    }
+    if !trimmed
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        || !trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(RuntimeError::InvalidRequest(
+            "config bundle id must be a path-safe stable identifier".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_digest(label: &'static str, value: &str) -> Result<(), RuntimeError> {
+    let trimmed = value.trim();
+    if trimmed != value
+        || trimmed.len() != 64
+        || !trimmed.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(RuntimeError::InvalidRequest(format!(
+            "{label} must be a 64-character lowercase sha256 hex digest"
+        )));
+    }
+    if !trimmed
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(RuntimeError::InvalidRequest(format!(
+            "{label} must be a 64-character lowercase sha256 hex digest"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_declaration_reference(
+    bundle_id: &str,
+    declaration: &ConfigDeclaration,
+) -> Result<(), RuntimeError> {
+    validate_non_empty("config declaration reference", &declaration.reference)?;
+    validate_ref_boundary_text("config declaration reference", &declaration.reference)?;
+    let allowed_prefixes: &[&str] = match declaration.kind {
+        ConfigDeclarationKind::SecretRef => &["secret:", "secret-ref:", "vault:", "keyring:"],
+        ConfigDeclarationKind::MountGrant => &["mount:", "mount-grant:"],
+        ConfigDeclarationKind::NetworkPolicy => &["network:", "network-policy:"],
+        ConfigDeclarationKind::ShellPolicy => &["shell:", "shell-policy:"],
+        ConfigDeclarationKind::GitPolicy => &["git:", "git-policy:"],
+        ConfigDeclarationKind::CapabilityGrant => &["capability:", "capability-grant:"],
+        ConfigDeclarationKind::Unsupported => &[],
+    };
+    if !allowed_prefixes.iter().any(|prefix| {
+        declaration.reference.starts_with(prefix) && declaration.reference.len() > prefix.len()
+    }) {
+        return Err(RuntimeError::UnsupportedConfigDeclaration {
+            bundle_id: bundle_id.to_string(),
+            declaration_kind: declaration.kind.canonical_name().to_string(),
+            name: declaration.name.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_ref_boundary_text(label: &'static str, value: &str) -> Result<(), RuntimeError> {
+    let trimmed = value.trim();
+    validate_boundary_text(label, trimmed)?;
+    if trimmed != value
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains('?')
+        || trimmed.contains('&')
+        || trimmed.contains('#')
+        || trimmed.contains('%')
+        || trimmed.contains('=')
+        || trimmed.chars().any(char::is_whitespace)
+        || !trimmed.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'-' | b'_' | b'.' | b'@' | b'+')
+        })
+    {
+        return Err(RuntimeError::InvalidRequest(format!(
+            "{label} must be a typed ref/grant/policy token, not a secret value or path"
+        )));
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains(".cache")
+        || lower.contains(".yoi")
+        || lower.contains(".sock")
+        || lower.contains("socket=")
+        || lower.contains("session_path")
+        || lower.contains("cache_path")
+    {
+        return Err(RuntimeError::InvalidRequest(format!(
+            "{label} must not contain host-local cache/session/socket material"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_boundary_text(label: &'static str, value: &str) -> Result<(), RuntimeError> {
     let trimmed = value.trim();
     if trimmed.len() > 2048 {
@@ -275,16 +392,23 @@ fn validate_boundary_text(label: &'static str, value: &str) -> Result<(), Runtim
             "{label} must not contain control characters"
         )));
     }
-    if Path::new(trimmed).is_absolute()
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed.starts_with('/')
         || trimmed.starts_with('~')
-        || trimmed.contains("/.cache")
-        || trimmed.contains("\\.cache")
-        || trimmed.contains("/run/")
-        || trimmed.contains("\\run\\")
-        || trimmed.contains(".sock")
-        || trimmed.contains("socket=")
-        || trimmed.contains("session_path")
-        || trimmed.contains("cache_path")
+        || trimmed.contains(":\\")
+        || lower.contains(".cache")
+        || lower.contains(".yoi/sessions")
+        || lower.contains(".yoi\\sessions")
+        || lower.contains("/sessions/")
+        || lower.contains("\\sessions\\")
+        || lower.contains("/run/")
+        || lower.contains("\\run\\")
+        || lower.contains(".sock")
+        || lower.contains("/sock")
+        || lower.contains("\\sock")
+        || lower.contains("socket=")
+        || lower.contains("session_path")
+        || lower.contains("cache_path")
     {
         return Err(RuntimeError::InvalidRequest(format!(
             "{label} must be a stable ref/grant/policy declaration, not a host-local path"
@@ -316,4 +440,80 @@ fn hex_digest(bytes: &[u8]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bundle_with_declaration(reference: &str) -> ConfigBundle {
+        ConfigBundle {
+            metadata: ConfigBundleMetadata {
+                id: "bundle-1".to_string(),
+                digest: String::new(),
+                revision: "rev-1".to_string(),
+                workspace_id: "workspace-1".to_string(),
+                created_at: "2026-06-26T00:00:00Z".to_string(),
+                provenance: ConfigBundleProvenance {
+                    source: "test".to_string(),
+                    detail: None,
+                },
+            },
+            profiles: vec![ConfigProfileDescriptor {
+                selector: ProfileSelector::Builtin("builtin:coder".to_string()),
+                label: None,
+            }],
+            declarations: vec![ConfigDeclaration {
+                kind: ConfigDeclarationKind::SecretRef,
+                name: "credential".to_string(),
+                reference: reference.to_string(),
+            }],
+        }
+        .with_computed_digest()
+    }
+
+    #[test]
+    fn rejects_host_local_cache_session_socket_and_plaintext_secret_refs() {
+        for reference in [
+            ".cache/yoi",
+            ".yoi/sessions/foo.jsonl",
+            "pods/foo/sock",
+            "password=hunter2",
+            "hunter2-secret-value",
+        ] {
+            let error = validate_config_bundle(&bundle_with_declaration(reference)).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    RuntimeError::InvalidRequest(_)
+                        | RuntimeError::UnsupportedConfigDeclaration { .. }
+                ),
+                "unexpected error for {reference}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_typed_secret_refs() {
+        validate_config_bundle(&bundle_with_declaration("secret:github-token")).unwrap();
+        validate_config_bundle(&bundle_with_declaration("vault:team.api-key")).unwrap();
+    }
+
+    #[test]
+    fn rejects_unsafe_bundle_ids_and_refs() {
+        for id in ["bundle/1", "bundle?x", "bundle&x", "bundle#x", " bundle"] {
+            let mut bundle = bundle_with_declaration("secret:github-token");
+            bundle.metadata.id = id.to_string();
+            bundle = bundle.with_computed_digest();
+            assert!(validate_config_bundle(&bundle).is_err(), "accepted id {id}");
+        }
+
+        assert!(
+            validate_config_bundle_ref(&ConfigBundleRef {
+                id: "bundle/1".to_string(),
+                digest: "0".repeat(64),
+            })
+            .is_err()
+        );
+    }
 }

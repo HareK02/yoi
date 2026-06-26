@@ -1451,6 +1451,14 @@ impl RemoteWorkerRuntime {
         format!("{}{}", self.base_url, path)
     }
 
+    fn bundle_availability_path(reference: &ConfigBundleRef) -> String {
+        format!(
+            "/v1/config-bundles/{}/availability?digest={}",
+            url_path_segment_encode(&reference.id),
+            url_query_value_encode(&reference.digest)
+        )
+    }
+
     fn ws_endpoint(&self, worker_id: &str) -> String {
         let mut base = self.base_url.clone();
         if let Some(rest) = base.strip_prefix("https://") {
@@ -1782,10 +1790,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
     }
 
     fn check_config_bundle(&self, reference: ConfigBundleRef) -> ConfigBundleCheckResult {
-        let path = format!(
-            "/v1/config-bundles/{}/availability?digest={}",
-            reference.id, reference.digest
-        );
+        let path = Self::bundle_availability_path(&reference);
         match self.get_json::<RuntimeHttpConfigBundleAvailabilityResponse>(&path) {
             Ok(response) => ConfigBundleCheckResult {
                 state: WorkerOperationState::Accepted,
@@ -2428,6 +2433,30 @@ fn host_id_for_remote_runtime(runtime_id: &str) -> String {
     bounded_backend_identifier("remote-", runtime_id)
 }
 
+fn url_path_segment_encode(input: &str) -> String {
+    percent_encode(input, |byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b':')
+    })
+}
+
+fn url_query_value_encode(input: &str) -> String {
+    percent_encode(input, |byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~')
+    })
+}
+
+fn percent_encode(input: &str, keep: impl Fn(u8) -> bool) -> String {
+    let mut encoded = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        if keep(byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 fn remote_runtime_capabilities(limit: usize, available: bool) -> RuntimeCapabilitySummary {
     RuntimeCapabilitySummary {
         can_list_hosts: true,
@@ -2483,10 +2512,6 @@ fn remote_http_status_diagnostic(
         .as_ref()
         .map(|error| error.error.code.as_str())
         .unwrap_or("remote_http_error");
-    let remote_message = error
-        .as_ref()
-        .map(|error| error.error.message.clone())
-        .unwrap_or_else(|| format!("remote Runtime returned HTTP {status}"));
     let (code, severity) = match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
             ("remote_runtime_auth_failed", DiagnosticSeverity::Error)
@@ -2501,7 +2526,9 @@ fn remote_http_status_diagnostic(
     diagnostic(
         code,
         severity,
-        format!("Remote Runtime '{runtime_id}' rejected request ({remote_code}): {remote_message}"),
+        format!(
+            "Remote Runtime '{runtime_id}' rejected request ({remote_code}, HTTP {status}); internal details were sanitized"
+        ),
     )
 }
 
@@ -3413,6 +3440,76 @@ mod tests {
         );
         assert!(browser_payload.contains("runtime_id"));
         assert!(browser_payload.contains("worker_id"));
+    }
+
+    #[test]
+    fn remote_config_bundle_sync_and_check_diagnostics_are_sanitized_and_path_safe() {
+        let leaked_store_path = "/var/lib/yoi/runtime/bundles/bundle-1.json";
+        let leaked_session_path = ".yoi/sessions/session.jsonl";
+        let digest = "0".repeat(64);
+        let (base_url, server) = serve_mock_http(vec![
+            mock_response(
+                "POST",
+                "/v1/config-bundles",
+                true,
+                500,
+                json!({
+                    "error": {
+                        "code": "store_io",
+                        "message": format!("failed to write {leaked_store_path}")
+                    }
+                })
+                .to_string(),
+            ),
+            mock_response(
+                "GET",
+                "/v1/config-bundles/bundle%2F1%3Fx/availability?digest=0000000000000000000000000000000000000000000000000000000000000000",
+                true,
+                400,
+                json!({
+                    "error": {
+                        "code": "invalid_request",
+                        "message": format!("invalid path {leaked_session_path}")
+                    }
+                })
+                .to_string(),
+            ),
+        ]);
+        let mut registry = RuntimeRegistry::new(Vec::new());
+        registry.register(
+            RemoteWorkerRuntime::new(RemoteRuntimeConfig::new(
+                "remote:primary",
+                "Remote Primary",
+                base_url,
+                Some("secret-token".to_string()),
+            ))
+            .unwrap(),
+        );
+
+        let sync = registry
+            .sync_config_bundle("remote:primary", test_config_bundle())
+            .unwrap();
+        assert_eq!(sync.state, WorkerOperationState::Rejected);
+        let sync_payload = serde_json::to_string(&sync).unwrap();
+        assert!(!sync_payload.contains(leaked_store_path), "{sync_payload}");
+
+        let check = registry
+            .check_config_bundle(
+                "remote:primary",
+                ConfigBundleRef {
+                    id: "bundle/1?x".to_string(),
+                    digest,
+                },
+            )
+            .unwrap();
+        assert_eq!(check.state, WorkerOperationState::Rejected);
+        let check_payload = serde_json::to_string(&check).unwrap();
+        assert!(
+            !check_payload.contains(leaked_session_path),
+            "{check_payload}"
+        );
+        assert!(!check_payload.contains(".yoi/sessions"), "{check_payload}");
+        server.join().expect("mock remote server finished");
     }
 
     #[test]

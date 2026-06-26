@@ -4,7 +4,7 @@ use crate::catalog::{
 };
 use crate::config_bundle::{
     ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary, validate_config_bundle,
-    validate_profile_selector,
+    validate_config_bundle_ref, validate_profile_selector,
 };
 use crate::diagnostics::{DiagnosticSeverity, RuntimeDiagnostic};
 use crate::error::RuntimeError;
@@ -864,11 +864,7 @@ impl RuntimeState {
         &self,
         reference: &ConfigBundleRef,
     ) -> Result<ConfigBundleAvailability, RuntimeError> {
-        if reference.id.trim().is_empty() || reference.digest.trim().is_empty() {
-            return Err(RuntimeError::InvalidRequest(
-                "config bundle reference id and digest must not be empty".to_string(),
-            ));
-        }
+        validate_config_bundle_ref(reference)?;
         let bundle = self.config_bundles.get(&reference.id).ok_or_else(|| {
             RuntimeError::ConfigBundleMissing {
                 bundle_id: reference.id.clone(),
@@ -1274,7 +1270,7 @@ mod tests {
         let mismatch = runtime
             .check_config_bundle(&ConfigBundleRef {
                 id: bundle.metadata.id.clone(),
-                digest: "bad-digest".to_string(),
+                digest: "0".repeat(64),
             })
             .unwrap_err();
         assert!(matches!(
