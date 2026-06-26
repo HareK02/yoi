@@ -16,16 +16,16 @@ use crossterm::event::{
 };
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{Command, execute};
+use protocol::{Event, Method, WorkerStatus};
 #[cfg(feature = "e2e-test")]
-use protocol::{Event, Greeting, RewindSummary, RewindTarget, RewindTargetId, Segment};
-use protocol::{Method, WorkerStatus};
+use protocol::{Greeting, RewindSummary, RewindTarget, RewindTargetId, Segment};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use session_store::SegmentId;
 use tokio::sync::mpsc;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use client::{WorkerClient, WorkerRuntimeCommand};
+use client::{BackendRuntimeClient, BackendRuntimeTarget, WorkerClient, WorkerRuntimeCommand};
 
 use crate::app::{ActionbarNoticeLevel, ActionbarNoticeSource, App};
 use crate::composer_keys::{ComposerEditAction, composer_edit_action};
@@ -171,6 +171,54 @@ pub(crate) async fn run_worker_name(
     result
 }
 
+enum ConsoleConnection {
+    LegacySocket(WorkerClient),
+    BackendRuntime(BackendRuntimeClient),
+}
+
+impl ConsoleConnection {
+    fn try_next_event(&mut self) -> Option<Event> {
+        match self {
+            Self::LegacySocket(client) => client.try_next_event(),
+            Self::BackendRuntime(client) => client.try_next_event(),
+        }
+    }
+
+    async fn next_event(&mut self) -> Option<Event> {
+        match self {
+            Self::LegacySocket(client) => client.next_event().await,
+            Self::BackendRuntime(client) => client.next_event().await,
+        }
+    }
+
+    async fn send(&mut self, method: &Method) -> Result<(), Box<dyn std::error::Error>> {
+        match self {
+            Self::LegacySocket(client) => Ok(client.send(method).await?),
+            Self::BackendRuntime(client) => Ok(client.send(method).await?),
+        }
+    }
+}
+
+pub(crate) async fn run_backend_runtime(
+    target: BackendRuntimeTarget,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let worker_label = target.display_label();
+    let client = BackendRuntimeClient::connect(target).await?;
+    let mut terminal = enter_fullscreen()?;
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let mut app = App::new_with_persistent_input_history(worker_label, &workspace_root);
+    app.connected = true;
+    let result = run_loop(
+        &mut terminal,
+        &mut app,
+        ConsoleConnection::BackendRuntime(client),
+        None,
+    )
+    .await;
+    let _ = leave_fullscreen(&mut terminal);
+    result
+}
+
 async fn run_connected_pod(
     terminal: &mut ConsoleTerminal,
     worker_name: String,
@@ -180,7 +228,13 @@ async fn run_connected_pod(
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut app = App::new_with_persistent_input_history(worker_name, &workspace_root);
     app.connected = true;
-    run_loop(terminal, &mut app, client, runtime_command).await
+    run_loop(
+        terminal,
+        &mut app,
+        ConsoleConnection::LegacySocket(client),
+        Some(runtime_command),
+    )
+    .await
 }
 
 pub(crate) async fn open_from_dashboard(
@@ -396,7 +450,13 @@ async fn run(
             app.connected = true;
             // The Worker sends `Event::Snapshot` automatically on connect;
             // no explicit method call is required to fetch history.
-            run_loop(terminal, &mut app, client, runtime_command).await?;
+            run_loop(
+                terminal,
+                &mut app,
+                ConsoleConnection::LegacySocket(client),
+                Some(runtime_command),
+            )
+            .await?;
         }
         Err(e) => {
             app.push_error(format!(
@@ -673,9 +733,9 @@ where
 
 async fn drain_terminal_events(
     app: &mut App,
-    client: &mut WorkerClient,
+    client: &mut ConsoleConnection,
     term_rx: &mut mpsc::UnboundedReceiver<TerminalEventResult>,
-    runtime_command: &WorkerRuntimeCommand,
+    runtime_command: Option<&WorkerRuntimeCommand>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut handled = false;
     for _ in 0..TERMINAL_EVENT_DRAIN_LIMIT {
@@ -701,7 +761,7 @@ async fn drain_terminal_events(
 
 async fn drain_worker_events(
     app: &mut App,
-    client: &mut WorkerClient,
+    client: &mut ConsoleConnection,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut handled = false;
     for _ in 0..POD_EVENT_DRAIN_LIMIT {
@@ -721,8 +781,8 @@ async fn drain_worker_events(
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    mut client: WorkerClient,
-    runtime_command: WorkerRuntimeCommand,
+    mut client: ConsoleConnection,
+    runtime_command: Option<WorkerRuntimeCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (_terminal_reader, mut term_rx) = TerminalEventReader::spawn()?;
 
@@ -734,7 +794,7 @@ async fn run_loop(
         }
 
         let handled_term_event =
-            drain_terminal_events(app, &mut client, &mut term_rx, &runtime_command).await?;
+            drain_terminal_events(app, &mut client, &mut term_rx, runtime_command.as_ref()).await?;
         if app.quit {
             break;
         }
@@ -746,7 +806,8 @@ async fn run_loop(
 
         match next_loop_input(&mut term_rx, app.connected, client.next_event()).await {
             LoopInput::Terminal(term_event) => {
-                handle_terminal_event(app, &mut client, term_event?, &runtime_command).await?;
+                handle_terminal_event(app, &mut client, term_event?, runtime_command.as_ref())
+                    .await?;
             }
             LoopInput::Worker(event) => match event {
                 Some(ev) => {
@@ -770,9 +831,9 @@ async fn run_loop(
 
 async fn handle_terminal_event(
     app: &mut App,
-    client: &mut WorkerClient,
+    client: &mut ConsoleConnection,
     event: TermEvent,
-    _runtime_command: &WorkerRuntimeCommand,
+    _runtime_command: Option<&WorkerRuntimeCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match event {
         TermEvent::Key(key) => {
