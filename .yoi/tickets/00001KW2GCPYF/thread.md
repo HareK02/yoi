@@ -280,3 +280,27 @@ Residual risks / review focus:
 - 今回の fix は Svelte runes の dependency loop 解消に絞っている。WS の実接続タイミングや stale async response の UX は既存設計の範囲。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KW2GCPYF-worker-console at: 2026-06-26T18:21:17Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+確認結果:
+- 対象 worktree は branch `work/00001KW2GCPYF-worker-console-redesign`、HEAD は fix commit `a1083908b681b420cd5fd911ac00da01ff8b7e5d`。
+- 前回 blocker は解消済み。
+  - `reloadToken += 1` は残っていない。
+  - target-change `$effect` は `refreshConsole()` を呼ばず、`consoleTarget` を読んで `advanceReloadToken()` + `loadConsoleData(target)` のみ実行している。
+  - `advanceReloadToken()` は非 reactive な `nextReloadToken` を増やして `reloadToken` に代入する形で、同じ effect 内で `reloadToken` を read/write する依存ループにはなっていない。
+  - observation WS effect は `worker + reloadToken + consoleTarget` に依存し、manual refresh / target change で reconnect される構造として妥当。
+- regression なし。
+  - old `/console` route は存在しない。
+  - standalone `CompanionNavSection` / `/api/companion` 利用は Console 実装に戻っていない。
+  - Worker list/sidebar は `workerConsoleHref(worker)` 経由で `runtime_id + worker_id` route に attach している。
+  - Backend Worker detail/transcript/input/observation WS API の使用も維持されている。
+
+検証:
+- read-only のソース確認、git 状態確認、`find`/`rg` による route/API/sidebar 残存確認。ビルド・テスト再実行はファイル生成の可能性があるため未実施。
+
+---
