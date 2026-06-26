@@ -220,3 +220,40 @@ Residual risks / review focus:
 - default local spawn / legacy Worker-name attach 経路は既存互換として残る。Backend Runtime target 経路は `--backend + --runtime-id + --worker-id` による明示接続。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KW04A8K6-tui-runtime at: 2026-06-26T08:52:42Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+確認結果として、Ticket の主要要件は満たしていると判断する。
+
+確認内容:
+- Backend API authority:
+  - TUI 側は `backend_url + runtime_id + worker_id` の `BackendRuntimeTarget` を authority とし、Runtime endpoint/token/raw socket/session path を扱っていない。
+  - Backend/Runtime Registry/credential routing は TUI 内に実装されておらず、Backend API client として分離されている。
+- `runtime_id + worker_id`:
+  - CLI は `--backend` に加えて `--runtime-id`/`--runtime` と `--worker-id` を必須化しており、worker_id-only 回帰は見当たらない。
+  - legacy options との mixing reject も確認。
+- command / observation:
+  - input は Backend API の `/input`、cancel/stop は lifecycle API 経由。
+  - transcript 初期投影 + Backend-proxied WS observation stream を Console 既存 model に流す構成。
+  - `UserMessage` / assistant text delta/done / status / error は既存 `protocol::Event` として扱われ、Console rendering/composer/status を再利用している。
+- reconnect/cursor:
+  - sequence duplicate drop、cursor resume、cursor expired diagnostic + reset/reconnect が実装されている。
+  - unsupported command は diagnostic event として返す実装を確認。
+- legacy/debug path:
+  - raw `--socket` は explicit path として残り、BackendRuntime mode とは混在不可。
+  - help 文面上は `--socket` が compatibility/debug であることや backend options が十分に目立っていないため後続改善余地はあるが、今回の機能成立を阻害する blocker ではない。
+
+検証実施:
+- `cargo test -p yoi parse_backend_runtime_target`: success
+- `cargo test -p client backend_runtime::tests`: success
+- `cargo test -p tui`: success
+- `cargo check -p yoi`: success
+- `git diff --check HEAD^..HEAD`: success
+
+報告されている `cargo test -p client` full の既存 Lua builtin profile failure は、この差分の focused validation 上は blocker ではないと判断する。
+
+---
