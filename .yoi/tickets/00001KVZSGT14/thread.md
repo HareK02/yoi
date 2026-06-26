@@ -301,3 +301,54 @@ Review result: approve
 - read-only inspection のみ実施。テスト実行はしていない。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T06:29:53Z -->
+
+## Implementation report
+
+Integration / validation report:
+
+Integration:
+- Implementation branch `work/00001KVZSGT14-remote-runtime-registry` を orchestration branch に merge 済み。
+- Merge commit: `bbb5d68c merge: 00001KVZSGT14 remote runtime registry`
+
+Included implementation commits:
+- `aeb12b3b8e16a948e6f8387f6fb50fec60c53cc4 feat: add remote runtime registry source`
+- `38ff7d8f807256ec654fcf5655e04dcbad4d9041 fix: redact observation source debug output`
+
+Validation in Orchestrator worktree:
+- `cargo fmt --all --check`: success
+- `cargo test -p yoi-workspace-server`: success（33 tests passed）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Review:
+- Reviewer approve 済み。前回 blocker だった Debug/log-worthy endpoint/token redaction は解消済み。
+
+Outcome:
+- Acceptance criteria を満たしたため `done` へ進める。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-26T06:30:04Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Backend RuntimeRegistry remote worker-runtime process connection の実装、review、merge、Orchestrator validation が完了した。
+
+Done evidence:
+- Merge commit: `bbb5d68c merge: 00001KVZSGT14 remote runtime registry`
+- Reviewer approve 済み。
+- Orchestrator validation:
+  - `cargo fmt --all --check`: success
+  - `cargo test -p yoi-workspace-server`: success（33 tests passed）
+  - `cargo check -p yoi`: success
+  - `git diff --check`: success
+  - `nix build .#yoi --no-link`: success
+
+Scope:
+- Backend RuntimeRegistry に remote worker-runtime process source/handle を追加し、Backend-owned REST/WS client 経由で route/proxy できるようにした。
+- Dynamic registration / full auth / Web Console / Profile config sync は Non-goals として未実装。
+
+---
