@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use axum::http::StatusCode;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::{Error as TungsteniteError, Message as TungsteniteMessage};
 use worker_runtime::http_server::{RuntimeWorkerEventWsEnvelope, RuntimeWorkerEventWsFrame};
 
 /// Backend-private source for a runtime worker observation stream.
@@ -320,6 +321,47 @@ impl BackendObservationProxy {
     }
 }
 
+fn map_runtime_connect_error(error: TungsteniteError) -> ObservationProxyError {
+    match error {
+        TungsteniteError::Http(response) if response.status() == StatusCode::NOT_FOUND => {
+            ObservationProxyError::WorkerNotFound(
+                "runtime worker observation endpoint returned 404 not found".into(),
+            )
+        }
+        TungsteniteError::Http(response) if response.status() == StatusCode::BAD_REQUEST => {
+            ObservationProxyError::CursorMalformed(
+                "runtime worker observation endpoint rejected the request as malformed".into(),
+            )
+        }
+        TungsteniteError::Http(response) => ObservationProxyError::RuntimeUnavailable(format!(
+            "runtime worker observation endpoint rejected WebSocket upgrade with status {}",
+            response.status()
+        )),
+        error => ObservationProxyError::RuntimeUnavailable(format!(
+            "failed to connect runtime WebSocket: {error}"
+        )),
+    }
+}
+
+fn map_runtime_diagnostic(code: String, message: String) -> ObservationProxyError {
+    match code.as_str() {
+        "runtime.worker_not_found" => ObservationProxyError::WorkerNotFound(message),
+        "runtime.cursor_malformed" => ObservationProxyError::CursorMalformed(message),
+        "runtime.cursor_unknown_or_expired" | "runtime.cursor_expired" => {
+            ObservationProxyError::CursorUnknownOrExpired(message)
+        }
+        "runtime.unavailable" => ObservationProxyError::RuntimeUnavailable(message),
+        "runtime.upstream_closed" | "runtime.websocket_error" => {
+            ObservationProxyError::UpstreamDisconnect(message)
+        }
+        "runtime.serialize_failed" => ObservationProxyError::MalformedFrame(message),
+        "runtime.observation_only" => ObservationProxyError::ObservationOnly,
+        _ => ObservationProxyError::RuntimeUnavailable(format!(
+            "runtime diagnostic {code}: {message}"
+        )),
+    }
+}
+
 pub struct RuntimeWsObservationClient {
     runtime_id: String,
     worker_id: String,
@@ -355,11 +397,9 @@ impl RuntimeWsObservationClient {
                 })?,
             );
         }
-        let (stream, _) = connect_async(request).await.map_err(|error| {
-            ObservationProxyError::RuntimeUnavailable(format!(
-                "failed to connect runtime WebSocket: {error}"
-            ))
-        })?;
+        let (stream, _) = connect_async(request)
+            .await
+            .map_err(map_runtime_connect_error)?;
         Ok(Self {
             runtime_id: source.runtime_id.clone(),
             worker_id: source.worker_id.clone(),
@@ -417,10 +457,7 @@ impl RuntimeWsObservationClient {
                     return Ok(self.map_envelope(envelope));
                 }
                 RuntimeWorkerEventWsFrame::Diagnostic { diagnostic } => {
-                    return Err(ObservationProxyError::UpstreamDisconnect(format!(
-                        "runtime diagnostic {}: {}",
-                        diagnostic.code, diagnostic.message
-                    )));
+                    return Err(map_runtime_diagnostic(diagnostic.code, diagnostic.message));
                 }
             }
         }
