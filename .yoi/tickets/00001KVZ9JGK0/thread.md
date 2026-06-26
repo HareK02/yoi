@@ -313,3 +313,30 @@ Residual risks / review focus:
 - UI は Console MVP に限定。tool call UI / thinking grouping / diff/file viewer / multi Worker attach は非対応。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZ9JGK0-web-console at: 2026-06-26T08:07:24Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+確認結果として、Ticket 意図と binding invariants を満たしていると判断する。
+
+確認内容:
+- Provider-less 境界は十分に正直。実 LLM 応答ではなく、`resources/prompts/worker/web_companion_providerless.md` の文面を返す実装で、UI/API 側も limitation / diagnostic / `backend_providerless_boundary` として表示している。
+- Companion Worker は backend 内部の embedded runtime 上に作られ、runtime/worker API から見える構成。
+- Companion v0 に filesystem / shell / git / Ticket mutation authority を付与している箇所は見当たらない。workspace/mount refs なし、conversation-focused の内部 Worker として扱われている。
+- Browser に provider credential、socket path、session path、runtime file path、direct runtime endpoint/token、local session file path を渡す新規漏洩は見当たらない。
+- `/api/companion/status`、`/transcript`、`/messages`、`/cancel` と Web `/console` は status / transcript / send / cancelled/error/busy 系状態を typed projection として扱っている。
+- Prompt prose は Rust hard-code ではなく resource boundary に置かれている。
+- UI は full TUI parity、tool/file/diff viewer、thinking grouping、multi attach へ広がっておらず、MVP 範囲に収まっている。
+- Backend の focused tests と、報告済みの `cargo test/check`、frontend `deno task check/build`、`git diff --check`、`nix build` はこの変更範囲には十分。
+
+補足リスク:
+- provider-less v0 では backend Worker transcript は主に user message 記録で、assistant limitation response は Companion projection 側に出る設計。現状は source/diagnostic 付きなので許容するが、実 LLM 接続時は Worker transcript との永続的一貫性を再検討した方がよい。
+- busy reject は型として存在するが、将来の長時間 LLM 実行時には即時 reject/timeout 挙動を改めて検証する必要がある。
+
+検証:
+- read-only の静的確認と `git diff --check` 相当の確認。テスト/ビルドはファイル生成を避けるため再実行せず、報告内容と実装・テスト追加を照合した。
+
+---
