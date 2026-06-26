@@ -16,9 +16,15 @@ use crate::observation::{
     EventCursor, EventSubscription, EventSubscriptionMode, RuntimeEvent, RuntimeEventBatch,
     RuntimeEventKind, TranscriptEntry, TranscriptProjection, TranscriptQuery, TranscriptRole,
 };
+#[cfg(feature = "ws-server")]
+use crate::observation::{WorkerObservationCursor, WorkerObservationEvent};
 use std::collections::BTreeMap;
+#[cfg(feature = "ws-server")]
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+#[cfg(feature = "ws-server")]
+use tokio::sync::broadcast;
 
 static NEXT_RUNTIME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -395,6 +401,88 @@ impl Runtime {
         })
     }
 
+    /// Cursor pointing after the current worker-scoped protocol observation event.
+    #[cfg(feature = "ws-server")]
+    pub fn worker_observation_cursor_now(
+        &self,
+        worker_ref: &WorkerRef,
+    ) -> Result<WorkerObservationCursor, RuntimeError> {
+        let state = self.lock()?;
+        state.ensure_worker_ref(worker_ref)?;
+        let sequence = state
+            .observation_events
+            .iter()
+            .rev()
+            .find(|event| &event.worker_ref == worker_ref)
+            .map(|event| event.sequence)
+            .unwrap_or(0);
+        Ok(WorkerObservationCursor::new(sequence))
+    }
+
+    /// Build the current Worker Snapshot event used as the first observation frame.
+    #[cfg(feature = "ws-server")]
+    pub fn worker_observation_snapshot(
+        &self,
+        worker_ref: &WorkerRef,
+    ) -> Result<protocol::Event, RuntimeError> {
+        let state = self.lock()?;
+        let _worker = state.worker(worker_ref)?;
+        Ok(protocol::Event::Snapshot {
+            entries: Vec::new(),
+            greeting: protocol::Greeting {
+                worker_name: worker_ref.worker_id.to_string(),
+                cwd: String::new(),
+                provider: "worker-runtime".to_string(),
+                model: "worker-runtime".to_string(),
+                scope_summary: "runtime worker observation".to_string(),
+                tools: Vec::new(),
+                context_window: 0,
+                context_tokens: 0,
+            },
+            status: protocol::WorkerStatus::Idle,
+            in_flight: protocol::InFlightSnapshot { blocks: Vec::new() },
+        })
+    }
+
+    /// Replay retained worker-scoped protocol observation events after a cursor.
+    #[cfg(feature = "ws-server")]
+    pub fn read_worker_observation_events(
+        &self,
+        worker_ref: &WorkerRef,
+        cursor: WorkerObservationCursor,
+    ) -> Result<Vec<WorkerObservationEvent>, RuntimeError> {
+        let state = self.lock()?;
+        state.ensure_worker_ref(worker_ref)?;
+        state.validate_worker_observation_cursor(worker_ref, cursor)?;
+        Ok(state
+            .observation_events
+            .iter()
+            .filter(|event| &event.worker_ref == worker_ref && event.sequence > cursor.sequence)
+            .cloned()
+            .collect())
+    }
+
+    /// Subscribe to live protocol observation events.
+    #[cfg(feature = "ws-server")]
+    pub fn subscribe_worker_observation(
+        &self,
+    ) -> Result<broadcast::Receiver<WorkerObservationEvent>, RuntimeError> {
+        Ok(self.lock()?.observation_tx.subscribe())
+    }
+
+    /// Append a Worker protocol event to the observation bus.
+    #[cfg(feature = "ws-server")]
+    pub fn observe_worker_event(
+        &self,
+        worker_ref: &WorkerRef,
+        payload: protocol::Event,
+    ) -> Result<WorkerObservationEvent, RuntimeError> {
+        let mut state = self.lock()?;
+        state.ensure_worker_ref(worker_ref)?;
+        let event = state.push_worker_observation_event(worker_ref.clone(), payload);
+        Ok(event)
+    }
+
     /// Snapshot current diagnostics.
     pub fn diagnostics(&self) -> Result<Vec<RuntimeDiagnostic>, RuntimeError> {
         Ok(self.lock()?.diagnostics.clone())
@@ -465,6 +553,12 @@ struct RuntimeState {
     workers: BTreeMap<WorkerId, WorkerRecord>,
     events: Vec<RuntimeEvent>,
     diagnostics: Vec<RuntimeDiagnostic>,
+    #[cfg(feature = "ws-server")]
+    next_observation_sequence: u64,
+    #[cfg(feature = "ws-server")]
+    observation_events: VecDeque<WorkerObservationEvent>,
+    #[cfg(feature = "ws-server")]
+    observation_tx: broadcast::Sender<WorkerObservationEvent>,
 }
 
 impl RuntimeState {
@@ -482,6 +576,12 @@ impl RuntimeState {
             workers: BTreeMap::new(),
             events: Vec::new(),
             diagnostics: Vec::new(),
+            #[cfg(feature = "ws-server")]
+            next_observation_sequence: 1,
+            #[cfg(feature = "ws-server")]
+            observation_events: VecDeque::new(),
+            #[cfg(feature = "ws-server")]
+            observation_tx: broadcast::channel(256).0,
         }
     }
 
@@ -505,6 +605,12 @@ impl RuntimeState {
             workers: BTreeMap::new(),
             events: Vec::new(),
             diagnostics: Vec::new(),
+            #[cfg(feature = "ws-server")]
+            next_observation_sequence: 1,
+            #[cfg(feature = "ws-server")]
+            observation_events: VecDeque::new(),
+            #[cfg(feature = "ws-server")]
+            observation_tx: broadcast::channel(256).0,
         }
     }
 
@@ -760,6 +866,54 @@ impl RuntimeState {
 
     fn last_event_id(&self) -> u64 {
         self.next_event_id.saturating_sub(1)
+    }
+
+    #[cfg(feature = "ws-server")]
+    fn validate_worker_observation_cursor(
+        &self,
+        worker_ref: &WorkerRef,
+        cursor: WorkerObservationCursor,
+    ) -> Result<(), RuntimeError> {
+        if let Some(first) = self
+            .observation_events
+            .iter()
+            .find(|event| &event.worker_ref == worker_ref)
+        {
+            if cursor.sequence != 0 && cursor.sequence < first.sequence {
+                return Err(RuntimeError::InvalidRequest(format!(
+                    "worker observation cursor {} is expired for worker {}",
+                    cursor.encode(),
+                    worker_ref.worker_id
+                )));
+            }
+        }
+        if cursor.sequence >= self.next_observation_sequence {
+            return Err(RuntimeError::InvalidRequest(format!(
+                "worker observation cursor {} is unknown for worker {}",
+                cursor.encode(),
+                worker_ref.worker_id
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "ws-server")]
+    fn push_worker_observation_event(
+        &mut self,
+        worker_ref: WorkerRef,
+        payload: protocol::Event,
+    ) -> WorkerObservationEvent {
+        const MAX_OBSERVATION_BACKLOG: usize = 1024;
+
+        let sequence = self.next_observation_sequence;
+        self.next_observation_sequence += 1;
+        let event = WorkerObservationEvent::new(sequence, worker_ref, payload);
+        self.observation_events.push_back(event.clone());
+        while self.observation_events.len() > MAX_OBSERVATION_BACKLOG {
+            self.observation_events.pop_front();
+        }
+        let _ = self.observation_tx.send(event.clone());
+        event
     }
 
     fn push_diagnostic(

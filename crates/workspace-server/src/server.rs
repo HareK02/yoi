@@ -1,12 +1,14 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
@@ -15,6 +17,10 @@ use crate::hosts::{
     RuntimeSummary, WorkerSummary,
 };
 use crate::identity::WorkspaceIdentity;
+use crate::observation::{
+    BackendObservationProxy, ClientWorkerEventWsFrame, ClientWorkerEventsWsQuery,
+    ObservationProxyError, RuntimeObservationSourceConfig, RuntimeWsObservationClient,
+};
 use crate::records::{
     LocalProjectRecordReader, ObjectiveDetail, ProjectRecordList, TicketDetail, TicketSummary,
 };
@@ -39,6 +45,7 @@ pub struct ServerConfig {
     pub auth: AuthConfig,
     pub max_records: usize,
     pub local_runtime_data_dir: Option<PathBuf>,
+    pub runtime_event_sources: Vec<RuntimeObservationSourceConfig>,
 }
 
 impl ServerConfig {
@@ -55,6 +62,7 @@ impl ServerConfig {
             },
             max_records: 200,
             local_runtime_data_dir: manifest::paths::data_dir(),
+            runtime_event_sources: Vec::new(),
         }
     }
 }
@@ -65,6 +73,7 @@ pub struct WorkspaceApi {
     store: Arc<dyn ControlPlaneStore>,
     records: LocalProjectRecordReader,
     runtime: Arc<RuntimeRegistry>,
+    observation_proxy: BackendObservationProxy,
 }
 
 impl WorkspaceApi {
@@ -83,11 +92,13 @@ impl WorkspaceApi {
             config.workspace_root.clone(),
             config.local_runtime_data_dir.clone(),
         )));
+        let observation_proxy = BackendObservationProxy::new(config.runtime_event_sources.clone());
         Ok(Self {
             records: LocalProjectRecordReader::new(config.workspace_root.clone()),
             config,
             store,
             runtime,
+            observation_proxy,
         })
     }
 
@@ -128,6 +139,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route("/api/hosts", get(list_hosts))
         .route("/api/runtimes", get(list_runtimes))
         .route("/api/workers", get(list_workers))
+        .route(
+            "/api/runtimes/{runtime_id}/workers/{worker_id}/events/ws",
+            get(worker_observation_ws),
+        )
         .route("/api/hosts/{host_id}/workers", get(list_host_workers))
         .fallback(get(static_or_spa_fallback))
         .with_state(api)
@@ -423,6 +438,144 @@ async fn list_workers(
     workers_response(api).map(Json)
 }
 
+async fn worker_observation_ws(
+    State(api): State<WorkspaceApi>,
+    AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
+    Query(query): Query<ClientWorkerEventsWsQuery>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    match api.observation_proxy.source(&runtime_id, &worker_id) {
+        Ok(source) => ws.on_upgrade(move |socket| {
+            worker_observation_ws_session(api.observation_proxy, source, query, socket)
+        }),
+        Err(error) => {
+            let status = match error {
+                ObservationProxyError::WorkerNotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            (
+                status,
+                Json(serde_json::json!({
+                    "error": error.code(),
+                    "message": error.message(),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn worker_observation_ws_session(
+    proxy: BackendObservationProxy,
+    source: RuntimeObservationSourceConfig,
+    query: ClientWorkerEventsWsQuery,
+    mut socket: WebSocket,
+) {
+    let open = match proxy.open(
+        &source.runtime_id,
+        &source.worker_id,
+        query.cursor.as_deref(),
+    ) {
+        Ok(open) => open,
+        Err(error) => {
+            let _ = send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::diagnostic(error))
+                .await;
+            return;
+        }
+    };
+
+    let mut backend_cursor = open.backend_cursor;
+    for envelope in open.replay {
+        backend_cursor = crate::observation::BackendObservationCursor::decode(&envelope.cursor)
+            .unwrap_or(backend_cursor);
+        if !send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::event(envelope)).await {
+            return;
+        }
+    }
+
+    let mut upstream =
+        match RuntimeWsObservationClient::connect(&source, open.runtime_cursor.as_deref()).await {
+            Ok(client) => client,
+            Err(error) => {
+                let _ =
+                    send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::diagnostic(error))
+                        .await;
+                return;
+            }
+        };
+
+    loop {
+        tokio::select! {
+            inbound = socket.next() => {
+                match inbound {
+                    Some(Ok(WsMessage::Close(_))) | None => return,
+                    Some(Ok(WsMessage::Ping(payload))) => {
+                        if socket.send(WsMessage::Pong(payload)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Some(Ok(WsMessage::Pong(_))) => {}
+                    Some(Ok(_)) => {
+                        let _ = send_client_ws_frame(
+                            &mut socket,
+                            ClientWorkerEventWsFrame::diagnostic(ObservationProxyError::ObservationOnly),
+                        ).await;
+                        return;
+                    }
+                    Some(Err(error)) => {
+                        let _ = send_client_ws_frame(
+                            &mut socket,
+                            ClientWorkerEventWsFrame::diagnostic(
+                                ObservationProxyError::MalformedFrame(format!(
+                                    "client WebSocket receive error: {error}"
+                                )),
+                            ),
+                        ).await;
+                        return;
+                    }
+                }
+            }
+            upstream_event = upstream.next_event() => {
+                match upstream_event {
+                    Ok(event) => match proxy.store(event) {
+                        Ok(envelope) => {
+                            backend_cursor = crate::observation::BackendObservationCursor::decode(&envelope.cursor)
+                                .unwrap_or(backend_cursor);
+                            if !send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::event(envelope)).await {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::diagnostic(error)).await;
+                            return;
+                        }
+                    },
+                    Err(error) => {
+                        let _ = send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::diagnostic(error)).await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn send_client_ws_frame(socket: &mut WebSocket, frame: ClientWorkerEventWsFrame) -> bool {
+    match serde_json::to_string(&frame) {
+        Ok(text) => socket.send(WsMessage::Text(text.into())).await.is_ok(),
+        Err(error) => {
+            let fallback =
+                ClientWorkerEventWsFrame::diagnostic(ObservationProxyError::MalformedFrame(
+                    format!("failed to serialize backend observation frame: {error}"),
+                ));
+            let Ok(text) = serde_json::to_string(&fallback) else {
+                return false;
+            };
+            socket.send(WsMessage::Text(text.into())).await.is_ok()
+        }
+    }
+}
+
 async fn list_host_workers(
     State(api): State<WorkspaceApi>,
     AxumPath(host_id): AxumPath<String>,
@@ -636,7 +789,10 @@ mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
+    use futures::{SinkExt, StreamExt};
     use serde_json::Value;
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::Message;
     use tower::ServiceExt;
 
     use crate::store::SqliteWorkspaceStore;
@@ -842,6 +998,127 @@ mod tests {
                 .unwrap()
                 .contains("Yoi Workspace")
         );
+    }
+
+    #[tokio::test]
+    async fn proxies_worker_observation_ws_with_backend_cursors_and_diagnostics() {
+        let runtime = worker_runtime::Runtime::new_memory();
+        let worker = runtime
+            .create_worker(worker_runtime::catalog::CreateWorkerRequest::default())
+            .unwrap();
+        let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let runtime_addr = runtime_listener.local_addr().unwrap();
+        tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                worker_runtime::http_server::serve_runtime_http(runtime, runtime_listener, None)
+                    .await
+                    .unwrap()
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let mut config = ServerConfig::local_dev(dir.path(), test_identity());
+        config.local_runtime_data_dir = Some(dir.path().join("data"));
+        config
+            .runtime_event_sources
+            .push(RuntimeObservationSourceConfig {
+                runtime_id: "runtime-a".into(),
+                worker_id: "worker-a".into(),
+                endpoint: format!(
+                    "ws://{runtime_addr}/v1/workers/{}/events/ws",
+                    worker.worker_ref.worker_id
+                ),
+                bearer_token: None,
+            });
+        let api = WorkspaceApi::new(config, Arc::new(store)).await.unwrap();
+        let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app_addr = app_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(app_listener, build_router(api)).await.unwrap() });
+
+        let url = format!("ws://{app_addr}/api/runtimes/runtime-a/workers/worker-a/events/ws");
+        let (mut stream, _) = connect_async(&url).await.unwrap();
+        let snapshot = next_client_frame(&mut stream).await;
+        let ClientWorkerEventWsFrame::Event { envelope: snapshot } = snapshot else {
+            panic!("expected snapshot event");
+        };
+        assert_eq!(snapshot.runtime_id, "runtime-a");
+        assert_eq!(snapshot.worker_id, "worker-a");
+        assert!(matches!(snapshot.payload, protocol::Event::Snapshot { .. }));
+
+        runtime
+            .observe_worker_event(
+                &worker.worker_ref,
+                protocol::Event::TextDelta {
+                    text: "live".into(),
+                },
+            )
+            .unwrap();
+        let live = next_client_frame(&mut stream).await;
+        let ClientWorkerEventWsFrame::Event { envelope: live } = live else {
+            panic!("expected live event");
+        };
+        assert_eq!(live.runtime_id, "runtime-a");
+        assert_eq!(live.worker_id, "worker-a");
+        assert!(matches!(live.payload, protocol::Event::TextDelta { .. }));
+
+        let (mut resumed, _) = connect_async(format!("{url}?cursor={}", live.cursor))
+            .await
+            .unwrap();
+        let _snapshot = next_client_frame(&mut resumed).await;
+        runtime
+            .observe_worker_event(
+                &worker.worker_ref,
+                protocol::Event::TextDone {
+                    text: "done".into(),
+                },
+            )
+            .unwrap();
+        let resumed_event = next_client_frame(&mut resumed).await;
+        let ClientWorkerEventWsFrame::Event {
+            envelope: resumed_event,
+        } = resumed_event
+        else {
+            panic!("expected resumed live event");
+        };
+        assert_ne!(resumed_event.cursor, live.cursor);
+        assert!(matches!(
+            resumed_event.payload,
+            protocol::Event::TextDone { .. }
+        ));
+
+        let (mut malformed, _) = connect_async(format!("{url}?cursor=bad")).await.unwrap();
+        let diagnostic = next_client_frame(&mut malformed).await;
+        let ClientWorkerEventWsFrame::Diagnostic { diagnostic } = diagnostic else {
+            panic!("expected malformed cursor diagnostic");
+        };
+        assert_eq!(diagnostic.code, "backend.cursor_malformed");
+
+        stream.send(Message::Text("{}".into())).await.unwrap();
+        let mut saw_observation_only = false;
+        for _ in 0..3 {
+            if let ClientWorkerEventWsFrame::Diagnostic { diagnostic } =
+                next_client_frame(&mut stream).await
+            {
+                assert_eq!(diagnostic.code, "backend.observation_only");
+                saw_observation_only = true;
+                break;
+            }
+        }
+        assert!(saw_observation_only, "expected observation-only diagnostic");
+    }
+
+    async fn next_client_frame(
+        stream: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> ClientWorkerEventWsFrame {
+        let message = stream.next().await.unwrap().unwrap();
+        let Message::Text(text) = message else {
+            panic!("expected text frame");
+        };
+        serde_json::from_str(&text).unwrap()
     }
 
     async fn get_json(app: Router, uri: &str) -> Value {

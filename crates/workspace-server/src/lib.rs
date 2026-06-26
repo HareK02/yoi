@@ -6,6 +6,7 @@
 
 pub mod hosts;
 pub mod identity;
+pub mod observation;
 pub mod records;
 pub mod repositories;
 pub mod server;
