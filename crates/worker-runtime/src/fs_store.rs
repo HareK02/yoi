@@ -1,4 +1,5 @@
 use crate::catalog::{CreateWorkerRequest, WorkerStatus};
+use crate::config_bundle::ConfigBundle;
 use crate::diagnostics::RuntimeDiagnostic;
 use crate::error::RuntimeError;
 use crate::identity::{RuntimeId, WorkerId, WorkerRef};
@@ -364,6 +365,7 @@ pub(crate) struct PersistedRuntimeState {
     pub(crate) next_event_id: u64,
     pub(crate) next_diagnostic_id: u64,
     pub(crate) workers: BTreeMap<WorkerId, PersistedWorkerRecord>,
+    pub(crate) config_bundles: BTreeMap<String, ConfigBundle>,
     pub(crate) events: Vec<RuntimeEvent>,
     pub(crate) diagnostics: Vec<RuntimeDiagnostic>,
 }
@@ -390,6 +392,8 @@ struct RuntimeSnapshot {
     next_worker_sequence: u64,
     next_event_id: u64,
     next_diagnostic_id: u64,
+    #[serde(default)]
+    config_bundles: BTreeMap<String, ConfigBundle>,
     diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -405,6 +409,7 @@ impl RuntimeSnapshot {
             next_worker_sequence: state.next_worker_sequence,
             next_event_id: state.next_event_id,
             next_diagnostic_id: state.next_diagnostic_id,
+            config_bundles: state.config_bundles.clone(),
             diagnostics: state.diagnostics.clone(),
         }
     }
@@ -454,6 +459,7 @@ impl RuntimeSnapshot {
             next_event_id: self.next_event_id,
             next_diagnostic_id: self.next_diagnostic_id,
             workers,
+            config_bundles: self.config_bundles,
             events,
             diagnostics: self.diagnostics,
         }

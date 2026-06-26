@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::hosts::{
-    DiagnosticSeverity, EmbeddedWorkerRuntime, HostSummary, LocalWorkerRuntime,
-    RemoteRuntimeConfig, RemoteWorkerRuntime, RuntimeDiagnostic, RuntimeRegistry, RuntimeSummary,
-    WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest, WorkerLifecycleResult,
-    WorkerSpawnRequest, WorkerSpawnResult, WorkerSummary, WorkerTranscriptProjection,
+    ConfigBundleCheckResult, ConfigBundleSyncResult, DiagnosticSeverity, EmbeddedWorkerRuntime,
+    HostSummary, LocalWorkerRuntime, RemoteRuntimeConfig, RemoteWorkerRuntime, RuntimeDiagnostic,
+    RuntimeRegistry, RuntimeSummary, WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest,
+    WorkerLifecycleResult, WorkerSpawnRequest, WorkerSpawnResult, WorkerSummary,
+    WorkerTranscriptProjection,
 };
 use crate::identity::WorkspaceIdentity;
 use crate::observation::{
@@ -29,6 +30,8 @@ use crate::records::{
 use crate::repositories::{LocalRepositoryReader, RepositoryLogRead, RepositorySummary};
 use crate::store::{ControlPlaneStore, WorkspaceRecord};
 use crate::{Error, Result};
+use worker_runtime::catalog::ConfigBundleRef;
+use worker_runtime::config_bundle::ConfigBundle;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AuthConfig {
@@ -154,6 +157,14 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/runtimes/{runtime_id}/workers",
             post(create_runtime_worker),
+        )
+        .route(
+            "/api/runtimes/{runtime_id}/config-bundles",
+            post(sync_runtime_config_bundle),
+        )
+        .route(
+            "/api/runtimes/{runtime_id}/config-bundles/{bundle_id}/availability",
+            get(check_runtime_config_bundle),
         )
         .route(
             "/api/runtimes/{runtime_id}/workers/{worker_id}",
@@ -491,6 +502,16 @@ async fn get_runtime_worker(
     Ok(Json(worker))
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RuntimeConfigBundleSyncRequest {
+    pub bundle: ConfigBundle,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeConfigBundleAvailabilityQuery {
+    digest: String,
+}
+
 async fn create_runtime_worker(
     State(api): State<WorkspaceApi>,
     AxumPath(runtime_id): AxumPath<String>,
@@ -499,6 +520,36 @@ async fn create_runtime_worker(
     let result = api
         .runtime
         .spawn_worker(&runtime_id, request)
+        .map_err(|err| err.into_error())?;
+    Ok(Json(result))
+}
+
+async fn sync_runtime_config_bundle(
+    State(api): State<WorkspaceApi>,
+    AxumPath(runtime_id): AxumPath<String>,
+    Json(request): Json<RuntimeConfigBundleSyncRequest>,
+) -> ApiResult<Json<ConfigBundleSyncResult>> {
+    let result = api
+        .runtime
+        .sync_config_bundle(&runtime_id, request.bundle)
+        .map_err(|err| err.into_error())?;
+    Ok(Json(result))
+}
+
+async fn check_runtime_config_bundle(
+    State(api): State<WorkspaceApi>,
+    AxumPath((runtime_id, bundle_id)): AxumPath<(String, String)>,
+    Query(query): Query<RuntimeConfigBundleAvailabilityQuery>,
+) -> ApiResult<Json<ConfigBundleCheckResult>> {
+    let result = api
+        .runtime
+        .check_config_bundle(
+            &runtime_id,
+            ConfigBundleRef {
+                id: bundle_id,
+                digest: query.digest,
+            },
+        )
         .map_err(|err| err.into_error())?;
     Ok(Json(result))
 }

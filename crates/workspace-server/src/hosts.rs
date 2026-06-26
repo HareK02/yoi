@@ -16,11 +16,13 @@ use std::{
     time::Duration,
 };
 use worker_runtime::catalog::{
-    CreateWorkerRequest, ProfileSelector, WorkerDetail as EmbeddedWorkerDetail, WorkerIntent,
-    WorkerStatus as EmbeddedWorkerStatus,
+    CapabilityRequest, ConfigBundleRef, CreateWorkerRequest, ProfileSelector,
+    WorkerDetail as EmbeddedWorkerDetail, WorkerIntent, WorkerStatus as EmbeddedWorkerStatus,
 };
+use worker_runtime::config_bundle::{ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary};
 use worker_runtime::error::RuntimeError as EmbeddedRuntimeError;
 use worker_runtime::http_server::{
+    RuntimeHttpConfigBundleAvailabilityResponse, RuntimeHttpConfigBundleSyncRequest,
     RuntimeHttpErrorResponse, RuntimeHttpSummaryResponse, RuntimeHttpTranscriptResponse,
     RuntimeHttpWorkerInputResponse, RuntimeHttpWorkerLifecycleRequest,
     RuntimeHttpWorkerLifecycleResponse, RuntimeHttpWorkerResponse, RuntimeHttpWorkersResponse,
@@ -261,16 +263,24 @@ pub struct WorkerLookupResult {
 
 /// Browser-safe worker spawn request shape.
 ///
-/// The request intentionally carries only workspace policy intents and stable
-/// worker identifiers. Raw workspace roots, child cwd, executable path, and raw
-/// profile selectors are resolved by the runtime service and never accepted from
-/// Workspace API callers.
+/// The request intentionally carries only workspace policy intents, stable
+/// worker identifiers, optional profile selectors, config bundle refs, and
+/// requested capability names. Raw workspace roots, child cwd, executable path,
+/// Runtime endpoints/credentials, raw bundle storage paths, and host-local
+/// resolved WorkerSpec content are resolved by the runtime service and never
+/// accepted from Workspace API callers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerSpawnRequest {
     pub intent: WorkerSpawnIntent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_worker_name: Option<String>,
     pub acceptance: WorkerSpawnAcceptanceRequirement,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ProfileSelector>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_bundle: Option<ConfigBundleRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requested_capabilities: Vec<CapabilityRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -306,6 +316,28 @@ pub struct WorkerSpawnResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker: Option<WorkerSummary>,
     pub acceptance_evidence: Vec<WorkerSpawnAcceptanceEvidence>,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfigBundleSyncResult {
+    pub state: WorkerOperationState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub availability: Option<ConfigBundleAvailability>,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfigBundleCheckResult {
+    pub state: WorkerOperationState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub availability: Option<ConfigBundleAvailability>,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfigBundleListResult {
+    pub bundles: Vec<ConfigBundleSummary>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -488,6 +520,41 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
                     "worker spawn intent '{}' was accepted as a typed request shape, but launch resolution is not implemented by this registry surface",
                     worker_spawn_intent_label(&request.intent)
                 ),
+            )],
+        }
+    }
+
+    fn sync_config_bundle(&self, _bundle: ConfigBundle) -> ConfigBundleSyncResult {
+        ConfigBundleSyncResult {
+            state: WorkerOperationState::Unsupported,
+            availability: None,
+            diagnostics: vec![diagnostic(
+                "config_bundle_sync_unsupported",
+                DiagnosticSeverity::Info,
+                "runtime does not implement config bundle sync".to_string(),
+            )],
+        }
+    }
+
+    fn check_config_bundle(&self, _reference: ConfigBundleRef) -> ConfigBundleCheckResult {
+        ConfigBundleCheckResult {
+            state: WorkerOperationState::Unsupported,
+            availability: None,
+            diagnostics: vec![diagnostic(
+                "config_bundle_check_unsupported",
+                DiagnosticSeverity::Info,
+                "runtime does not implement config bundle availability checks".to_string(),
+            )],
+        }
+    }
+
+    fn list_config_bundles(&self) -> ConfigBundleListResult {
+        ConfigBundleListResult {
+            bundles: Vec::new(),
+            diagnostics: vec![diagnostic(
+                "config_bundle_list_unsupported",
+                DiagnosticSeverity::Info,
+                "runtime does not implement config bundle listing".to_string(),
             )],
         }
     }
@@ -727,6 +794,35 @@ impl RuntimeRegistry {
         validate_backend_identifier("runtime_id", runtime_id)?;
         let runtime = self.runtime(runtime_id)?;
         Ok(runtime.spawn_worker(request))
+    }
+
+    pub fn sync_config_bundle(
+        &self,
+        runtime_id: &str,
+        bundle: ConfigBundle,
+    ) -> Result<ConfigBundleSyncResult, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        Ok(runtime.sync_config_bundle(bundle))
+    }
+
+    pub fn check_config_bundle(
+        &self,
+        runtime_id: &str,
+        reference: ConfigBundleRef,
+    ) -> Result<ConfigBundleCheckResult, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        Ok(runtime.check_config_bundle(reference))
+    }
+
+    pub fn list_config_bundles(
+        &self,
+        runtime_id: &str,
+    ) -> Result<ConfigBundleListResult, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        Ok(runtime.list_config_bundles())
     }
 
     pub fn send_input(
@@ -1091,10 +1187,21 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             ));
         }
 
-        let create_request = CreateWorkerRequest::tools_less(
-            embedded_create_intent(&request.intent),
-            embedded_profile_selector(&request.intent),
-        );
+        let create_request = CreateWorkerRequest {
+            intent: embedded_create_intent(&request.intent),
+            profile: request
+                .profile
+                .clone()
+                .unwrap_or_else(|| embedded_profile_selector(&request.intent)),
+            config_bundle: request.config_bundle.clone(),
+            requested_capabilities: if request.requested_capabilities.is_empty() {
+                vec![CapabilityRequest::named("read")]
+            } else {
+                request.requested_capabilities.clone()
+            },
+            workspace_refs: Vec::new(),
+            mount_refs: Vec::new(),
+        };
         match self.runtime.create_worker(create_request) {
             Ok(detail) => WorkerSpawnResult {
                 state: WorkerOperationState::Accepted,
@@ -1123,6 +1230,49 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                     diagnostics,
                 }
             }
+        }
+    }
+
+    fn sync_config_bundle(&self, bundle: ConfigBundle) -> ConfigBundleSyncResult {
+        match self.runtime.store_config_bundle(bundle) {
+            Ok(availability) => ConfigBundleSyncResult {
+                state: WorkerOperationState::Accepted,
+                availability: Some(availability),
+                diagnostics: Vec::new(),
+            },
+            Err(error) => ConfigBundleSyncResult {
+                state: WorkerOperationState::Rejected,
+                availability: None,
+                diagnostics: vec![embedded_runtime_diagnostic(&error)],
+            },
+        }
+    }
+
+    fn check_config_bundle(&self, reference: ConfigBundleRef) -> ConfigBundleCheckResult {
+        match self.runtime.check_config_bundle(&reference) {
+            Ok(availability) => ConfigBundleCheckResult {
+                state: WorkerOperationState::Accepted,
+                availability: Some(availability),
+                diagnostics: Vec::new(),
+            },
+            Err(error) => ConfigBundleCheckResult {
+                state: WorkerOperationState::Rejected,
+                availability: None,
+                diagnostics: vec![embedded_runtime_diagnostic(&error)],
+            },
+        }
+    }
+
+    fn list_config_bundles(&self) -> ConfigBundleListResult {
+        match self.runtime.list_config_bundles() {
+            Ok(bundles) => ConfigBundleListResult {
+                bundles,
+                diagnostics: Vec::new(),
+            },
+            Err(error) => ConfigBundleListResult {
+                bundles: Vec::new(),
+                diagnostics: vec![embedded_runtime_diagnostic(&error)],
+            },
         }
     }
 
@@ -1299,6 +1449,14 @@ impl RemoteWorkerRuntime {
 
     fn endpoint(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
+    }
+
+    fn bundle_availability_path(reference: &ConfigBundleRef) -> String {
+        format!(
+            "/v1/config-bundles/{}/availability?digest={}",
+            url_path_segment_encode(&reference.id),
+            url_query_value_encode(&reference.digest)
+        )
     }
 
     fn ws_endpoint(&self, worker_id: &str) -> String {
@@ -1574,10 +1732,21 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 )],
             };
         }
-        let create = CreateWorkerRequest::tools_less(
-            embedded_create_intent(&request.intent),
-            embedded_profile_selector(&request.intent),
-        );
+        let create = CreateWorkerRequest {
+            intent: embedded_create_intent(&request.intent),
+            profile: request
+                .profile
+                .clone()
+                .unwrap_or_else(|| embedded_profile_selector(&request.intent)),
+            config_bundle: request.config_bundle.clone(),
+            requested_capabilities: if request.requested_capabilities.is_empty() {
+                vec![CapabilityRequest::named("read")]
+            } else {
+                request.requested_capabilities.clone()
+            },
+            workspace_refs: Vec::new(),
+            mount_refs: Vec::new(),
+        };
         match self.post_json::<_, RuntimeHttpWorkerResponse>("/v1/workers", &create) {
             Ok(response) => WorkerSpawnResult {
                 state: WorkerOperationState::Accepted,
@@ -1596,6 +1765,41 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 state: WorkerOperationState::Rejected,
                 worker: None,
                 acceptance_evidence: Vec::new(),
+                diagnostics: vec![diagnostic],
+            },
+        }
+    }
+
+    fn sync_config_bundle(&self, bundle: ConfigBundle) -> ConfigBundleSyncResult {
+        let request = RuntimeHttpConfigBundleSyncRequest { bundle };
+        match self.post_json::<_, RuntimeHttpConfigBundleAvailabilityResponse>(
+            "/v1/config-bundles",
+            &request,
+        ) {
+            Ok(response) => ConfigBundleSyncResult {
+                state: WorkerOperationState::Accepted,
+                availability: Some(response.availability),
+                diagnostics: Vec::new(),
+            },
+            Err(diagnostic) => ConfigBundleSyncResult {
+                state: WorkerOperationState::Rejected,
+                availability: None,
+                diagnostics: vec![diagnostic],
+            },
+        }
+    }
+
+    fn check_config_bundle(&self, reference: ConfigBundleRef) -> ConfigBundleCheckResult {
+        let path = Self::bundle_availability_path(&reference);
+        match self.get_json::<RuntimeHttpConfigBundleAvailabilityResponse>(&path) {
+            Ok(response) => ConfigBundleCheckResult {
+                state: WorkerOperationState::Accepted,
+                availability: Some(response.availability),
+                diagnostics: Vec::new(),
+            },
+            Err(diagnostic) => ConfigBundleCheckResult {
+                state: WorkerOperationState::Rejected,
+                availability: None,
                 diagnostics: vec![diagnostic],
             },
         }
@@ -2197,7 +2401,11 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             DiagnosticSeverity::Warning,
             format!("Requested limit {requested} exceeds embedded Runtime maximum {max}"),
         ),
-        EmbeddedRuntimeError::InvalidRequest(_) => diagnostic(
+        EmbeddedRuntimeError::InvalidRequest(_)
+        | EmbeddedRuntimeError::ConfigBundleMissing { .. }
+        | EmbeddedRuntimeError::ConfigBundleDigestMismatch { .. }
+        | EmbeddedRuntimeError::InvalidProfileSelector { .. }
+        | EmbeddedRuntimeError::UnsupportedConfigDeclaration { .. } => diagnostic(
             "embedded_runtime_invalid_request",
             DiagnosticSeverity::Warning,
             "Embedded Runtime rejected the request".to_string(),
@@ -2223,6 +2431,30 @@ fn host_id_for_embedded_workspace(workspace_id: &str) -> String {
 
 fn host_id_for_remote_runtime(runtime_id: &str) -> String {
     bounded_backend_identifier("remote-", runtime_id)
+}
+
+fn url_path_segment_encode(input: &str) -> String {
+    percent_encode(input, |byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b':')
+    })
+}
+
+fn url_query_value_encode(input: &str) -> String {
+    percent_encode(input, |byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~')
+    })
+}
+
+fn percent_encode(input: &str, keep: impl Fn(u8) -> bool) -> String {
+    let mut encoded = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        if keep(byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 fn remote_runtime_capabilities(limit: usize, available: bool) -> RuntimeCapabilitySummary {
@@ -2280,10 +2512,6 @@ fn remote_http_status_diagnostic(
         .as_ref()
         .map(|error| error.error.code.as_str())
         .unwrap_or("remote_http_error");
-    let remote_message = error
-        .as_ref()
-        .map(|error| error.error.message.clone())
-        .unwrap_or_else(|| format!("remote Runtime returned HTTP {status}"));
     let (code, severity) = match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
             ("remote_runtime_auth_failed", DiagnosticSeverity::Error)
@@ -2298,7 +2526,9 @@ fn remote_http_status_diagnostic(
     diagnostic(
         code,
         severity,
-        format!("Remote Runtime '{runtime_id}' rejected request ({remote_code}): {remote_message}"),
+        format!(
+            "Remote Runtime '{runtime_id}' rejected request ({remote_code}, HTTP {status}); internal details were sanitized"
+        ),
     )
 }
 
@@ -2590,6 +2820,32 @@ mod tests {
             "profile_selector": "builtin:coder"
         }));
         metadata
+    }
+
+    fn test_config_bundle() -> ConfigBundle {
+        ConfigBundle {
+            metadata: worker_runtime::config_bundle::ConfigBundleMetadata {
+                id: "bundle-1".to_string(),
+                digest: String::new(),
+                revision: "rev-1".to_string(),
+                workspace_id: "local:test".to_string(),
+                created_at: "2026-06-26T00:00:00Z".to_string(),
+                provenance: worker_runtime::config_bundle::ConfigBundleProvenance {
+                    source: "workspace-server-test".to_string(),
+                    detail: None,
+                },
+            },
+            profiles: vec![worker_runtime::config_bundle::ConfigProfileDescriptor {
+                selector: ProfileSelector::Builtin("builtin:coder".to_string()),
+                label: Some("Coder".to_string()),
+            }],
+            declarations: vec![worker_runtime::config_bundle::ConfigDeclaration {
+                kind: worker_runtime::config_bundle::ConfigDeclarationKind::CapabilityGrant,
+                name: "read".to_string(),
+                reference: "capability:read".to_string(),
+            }],
+        }
+        .with_computed_digest()
     }
 
     fn assert_valid_generated_id(id: &str) {
@@ -2941,6 +3197,9 @@ mod tests {
                     acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                         expected_segments: 0,
                     },
+                    profile: None,
+                    config_bundle: None,
+                    requested_capabilities: Vec::new(),
                 },
             )
             .unwrap();
@@ -3014,6 +3273,50 @@ mod tests {
     }
 
     #[test]
+    fn embedded_backend_syncs_config_bundle_and_spawns_with_bundle_ref() {
+        let registry = RuntimeRegistry::new(vec![Arc::new(EmbeddedWorkerRuntime::new_memory(
+            "local:test",
+        ))]);
+        let bundle = test_config_bundle();
+        let sync = registry
+            .sync_config_bundle(EMBEDDED_RUNTIME_ID, bundle.clone())
+            .unwrap();
+        assert_eq!(sync.state, WorkerOperationState::Accepted);
+        let reference = sync.availability.expect("bundle availability").reference;
+        assert_eq!(reference.id, bundle.metadata.id);
+        assert_eq!(reference.digest, bundle.metadata.digest);
+
+        let check = registry
+            .check_config_bundle(EMBEDDED_RUNTIME_ID, reference.clone())
+            .unwrap();
+        assert_eq!(check.state, WorkerOperationState::Accepted);
+
+        let spawned = registry
+            .spawn_worker(
+                EMBEDDED_RUNTIME_ID,
+                WorkerSpawnRequest {
+                    intent: WorkerSpawnIntent::TicketRole {
+                        ticket_id: "00001KVZSGT0Q".to_string(),
+                        role: TicketWorkerRole::Coder,
+                    },
+                    requested_worker_name: None,
+                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                        expected_segments: 0,
+                    },
+                    profile: Some(ProfileSelector::Builtin("builtin:coder".to_string())),
+                    config_bundle: Some(reference),
+                    requested_capabilities: vec![CapabilityRequest::named("read")],
+                },
+            )
+            .unwrap();
+        assert_eq!(spawned.state, WorkerOperationState::Accepted);
+        assert_eq!(
+            spawned.worker.unwrap().profile.as_deref(),
+            Some("builtin:coder")
+        );
+    }
+
+    #[test]
     fn embedded_runtime_rejects_socket_ready_acceptance_without_socket_identity() {
         let registry = RuntimeRegistry::new(vec![Arc::new(EmbeddedWorkerRuntime::new_memory(
             "local:test",
@@ -3025,6 +3328,9 @@ mod tests {
                     intent: WorkerSpawnIntent::WorkspaceCompanion,
                     requested_worker_name: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::SocketReady,
+                    profile: None,
+                    config_bundle: None,
+                    requested_capabilities: Vec::new(),
                 },
             )
             .unwrap();
@@ -3134,6 +3440,76 @@ mod tests {
         );
         assert!(browser_payload.contains("runtime_id"));
         assert!(browser_payload.contains("worker_id"));
+    }
+
+    #[test]
+    fn remote_config_bundle_sync_and_check_diagnostics_are_sanitized_and_path_safe() {
+        let leaked_store_path = "/var/lib/yoi/runtime/bundles/bundle-1.json";
+        let leaked_session_path = ".yoi/sessions/session.jsonl";
+        let digest = "0".repeat(64);
+        let (base_url, server) = serve_mock_http(vec![
+            mock_response(
+                "POST",
+                "/v1/config-bundles",
+                true,
+                500,
+                json!({
+                    "error": {
+                        "code": "store_io",
+                        "message": format!("failed to write {leaked_store_path}")
+                    }
+                })
+                .to_string(),
+            ),
+            mock_response(
+                "GET",
+                "/v1/config-bundles/bundle%2F1%3Fx/availability?digest=0000000000000000000000000000000000000000000000000000000000000000",
+                true,
+                400,
+                json!({
+                    "error": {
+                        "code": "invalid_request",
+                        "message": format!("invalid path {leaked_session_path}")
+                    }
+                })
+                .to_string(),
+            ),
+        ]);
+        let mut registry = RuntimeRegistry::new(Vec::new());
+        registry.register(
+            RemoteWorkerRuntime::new(RemoteRuntimeConfig::new(
+                "remote:primary",
+                "Remote Primary",
+                base_url,
+                Some("secret-token".to_string()),
+            ))
+            .unwrap(),
+        );
+
+        let sync = registry
+            .sync_config_bundle("remote:primary", test_config_bundle())
+            .unwrap();
+        assert_eq!(sync.state, WorkerOperationState::Rejected);
+        let sync_payload = serde_json::to_string(&sync).unwrap();
+        assert!(!sync_payload.contains(leaked_store_path), "{sync_payload}");
+
+        let check = registry
+            .check_config_bundle(
+                "remote:primary",
+                ConfigBundleRef {
+                    id: "bundle/1?x".to_string(),
+                    digest,
+                },
+            )
+            .unwrap();
+        assert_eq!(check.state, WorkerOperationState::Rejected);
+        let check_payload = serde_json::to_string(&check).unwrap();
+        assert!(
+            !check_payload.contains(leaked_session_path),
+            "{check_payload}"
+        );
+        assert!(!check_payload.contains(".yoi/sessions"), "{check_payload}");
+        server.join().expect("mock remote server finished");
     }
 
     #[test]

@@ -8,6 +8,7 @@
 //! can later adapt into registries or backend APIs.
 
 pub mod catalog;
+pub mod config_bundle;
 pub mod diagnostics;
 pub mod error;
 #[cfg(feature = "fs-store")]
