@@ -39,7 +39,15 @@
   let streamState = $state<'connecting' | 'open' | 'unsupported' | 'closed' | 'error'>('connecting');
   let streamDiagnostics = $state<Diagnostic[]>([]);
   let observedEvents = $state<Array<{ cursor: string; event: ClientWorkerEventWsFrame & { kind: 'event' } }>>([]);
-  let reloadToken = 0;
+  let nextReloadToken = 0;
+  let reloadToken = $state(0);
+
+  type ConsoleTarget = {
+    runtimeId: string;
+    workerId: string;
+  };
+
+  const consoleTarget = $derived({ runtimeId, workerId });
 
   const projection = $derived(
     projectConsole(
@@ -101,11 +109,11 @@
     }
   }
 
-  async function loadWorker() {
+  async function loadWorker(target: ConsoleTarget) {
     workerError = null;
     try {
       worker = await getJson<Worker>(
-        `/api/runtimes/${encodeURIComponent(runtimeId)}/workers/${encodeURIComponent(workerId)}`
+        `/api/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(target.workerId)}`
       );
     } catch (error) {
       workerError = error instanceof Error ? error.message : String(error);
@@ -113,11 +121,11 @@
     }
   }
 
-  async function loadTranscript() {
+  async function loadTranscript(target: ConsoleTarget) {
     transcriptError = null;
     try {
       transcript = await getJson<WorkerTranscriptProjection>(
-        `/api/runtimes/${encodeURIComponent(runtimeId)}/workers/${encodeURIComponent(workerId)}/transcript?limit=200`
+        `/api/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(target.workerId)}/transcript?limit=200`
       );
     } catch (error) {
       transcriptError = error instanceof Error ? error.message : String(error);
@@ -125,9 +133,19 @@
     }
   }
 
+  async function loadConsoleData(target: ConsoleTarget) {
+    await Promise.all([loadWorker(target), loadTranscript(target)]);
+  }
+
+  function advanceReloadToken(): number {
+    nextReloadToken += 1;
+    reloadToken = nextReloadToken;
+    return nextReloadToken;
+  }
+
   async function refreshConsole() {
-    reloadToken += 1;
-    await Promise.all([loadWorker(), loadTranscript()]);
+    advanceReloadToken();
+    await loadConsoleData(consoleTarget);
   }
 
   async function sendMessage(event: SubmitEvent) {
@@ -149,7 +167,7 @@
       } else {
         sendError = diagnosticsToText(result.diagnostics) || `Input was ${result.state}.`;
       }
-      await loadTranscript();
+      await loadTranscript(consoleTarget);
     } catch (error) {
       sendError = error instanceof Error ? error.message : String(error);
     } finally {
@@ -157,12 +175,12 @@
     }
   }
 
-  function connectObservation(target: Worker | null, token: number) {
-    if (!target) {
+  function connectObservation(targetWorker: Worker | null, token: number, target: ConsoleTarget) {
+    if (!targetWorker) {
       streamState = 'closed';
       return;
     }
-    if (!target.capabilities.can_stream_events) {
+    if (!targetWorker.capabilities.can_stream_events) {
       streamState = 'unsupported';
       streamDiagnostics = [
         {
@@ -177,8 +195,8 @@
     streamState = 'connecting';
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(
-      `${protocol}//${window.location.host}/api/runtimes/${encodeURIComponent(runtimeId)}/workers/${encodeURIComponent(
-        workerId
+      `${protocol}//${window.location.host}/api/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(
+        target.workerId
       )}/events/ws`
     );
 
@@ -261,12 +279,14 @@
   });
 
   $effect(() => {
+    const target = consoleTarget;
     observedEvents = [];
     streamDiagnostics = [];
-    void refreshConsole();
+    advanceReloadToken();
+    void loadConsoleData(target);
   });
 
-  $effect(() => connectObservation(worker, reloadToken));
+  $effect(() => connectObservation(worker, reloadToken, consoleTarget));
 </script>
 
 <svelte:head>

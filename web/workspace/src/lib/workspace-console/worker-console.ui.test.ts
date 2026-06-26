@@ -57,7 +57,7 @@ Deno.test("Worker Console page is routed by runtime_id and worker_id through bac
   );
   assert(
     consolePage.includes(
-      "/api/runtimes/${encodeURIComponent(runtimeId)}/workers/${encodeURIComponent(workerId)}",
+      "/api/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(target.workerId)}",
     ),
     "Worker detail should use the backend Worker detail API",
   );
@@ -74,5 +74,18 @@ Deno.test("Worker Console page is routed by runtime_id and worker_id through bac
     consolePage.includes("streaming observation is not available") ||
       consolePage.includes("Streaming observation is not available"),
     "Console should show an explicit non-streaming degradation path",
+  );
+  assert(
+    consolePage.includes("function advanceReloadToken()") &&
+      consolePage.includes("nextReloadToken += 1") &&
+      !consolePage.includes("reloadToken += 1"),
+    "reload token advancement should not synchronously read and write the rune state",
+  );
+  assert(
+    consolePage.includes(
+      "advanceReloadToken();\n    void loadConsoleData(target);",
+    ) &&
+      !consolePage.includes("void refreshConsole();\n  });\n\n  $effect"),
+    "target-change effect should load data without depending on manual refresh state reads",
   );
 });
