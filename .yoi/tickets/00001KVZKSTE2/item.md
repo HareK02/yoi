@@ -1,8 +1,8 @@
 ---
 title: 'worker-runtimeにREST command serverを追加する'
-state: 'inprogress'
+state: 'done'
 created_at: '2026-06-25T14:44:02Z'
-updated_at: '2026-06-26T03:23:55Z'
+updated_at: '2026-06-26T03:27:22Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-25T16:39:39Z'

@@ -328,3 +328,60 @@ Review result: approve
 実施した検証は read-only inspection と `cargo read-manifest` / `rg` / `git` による確認。報告済み cargo/nix validation は再実行していない。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T03:27:12Z -->
+
+## Implementation report
+
+Integration / validation report:
+
+Integration:
+- Implementation branch `work/00001KVZKSTE2-worker-runtime-rest-server` を orchestration branch に merge 済み。
+- Merge commit: `660b07e8 merge: 00001KVZKSTE2 worker runtime rest server`
+
+Included implementation commits:
+- `f43a6b84011024b68c03fd5b4211ab427614683b feat: add worker runtime REST server`
+- `d0db32fa6acb6efb5269de9793a63de92ef9eb4a fix: add worker runtime REST process binary`
+
+Validation in Orchestrator worktree:
+- `cargo fmt --all --check`: success
+- `cargo test -p worker-runtime --no-default-features`: success（8 tests passed）
+- `cargo test -p worker-runtime --features http-server`: success（lib 11 tests + bin 3 tests passed）
+- `cargo test -p worker-runtime --features fs-store,http-server`: success（lib 13 tests + bin 3 tests passed）
+- `cargo check -p worker-runtime --features http-server --bins`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Review:
+- Reviewer approve 済み。前回 blocker だった Runtime process wrapper / binary target 欠落は解消済み。
+
+Outcome:
+- Acceptance criteria を満たしたため `done` へ進める。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-26T03:27:22Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+worker-runtime REST command server の実装、review、merge、Orchestrator validation が完了した。
+
+Done evidence:
+- Merge commit: `660b07e8 merge: 00001KVZKSTE2 worker runtime rest server`
+- Reviewer approve 済み。
+- Orchestrator validation:
+  - `cargo fmt --all --check`: success
+  - `cargo test -p worker-runtime --no-default-features`: success（8 tests passed）
+  - `cargo test -p worker-runtime --features http-server`: success（lib 11 tests + bin 3 tests passed）
+  - `cargo test -p worker-runtime --features fs-store,http-server`: success（lib 13 tests + bin 3 tests passed）
+  - `cargo check -p worker-runtime --features http-server --bins`: success
+  - `cargo check -p yoi`: success
+  - `git diff --check`: success
+  - `nix build .#yoi --no-link`: success
+
+Scope:
+- optional `http-server` feature、REST command API、minimal `worker-runtime-rest-server` process binary を追加。
+- SSE / WebSocket / Backend integration / dynamic registration / Web Console / full auth model は Non-goals として未実装。
+
+---
