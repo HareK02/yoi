@@ -149,3 +149,74 @@ Queued capacity notes:
 - `00001KW04A8K6` remains queued because it depends on this remote Runtime source work.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZSGT14-remote-runtime at: 2026-06-26T06:16:32Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装完了。マージ・Ticket 更新・close・cleanup は行っていない。
+
+Commit:
+- `aeb12b3b8e16a948e6f8387f6fb50fec60c53cc4 feat: add remote runtime registry source`
+
+変更ファイル:
+- `crates/workspace-server/src/hosts.rs`
+- `crates/workspace-server/src/server.rs`
+- `crates/workspace-server/src/lib.rs`
+- `crates/workspace-server/Cargo.toml`
+- `Cargo.lock`
+- `package.nix`
+
+実装概要 / API 変更:
+- `RuntimeRegistry` に remote worker-runtime source を追加。
+  - `RemoteRuntimeConfig`
+  - `RemoteWorkerRuntime`
+  - backend-owned REST client による remote Runtime 操作
+  - backend-owned WS observation source の生成
+- Browser-facing の authority は `runtime_id + worker_id` のまま維持。
+  - remote base URL / token / direct endpoint は API payload に出さない設計。
+  - remote config の `Debug` も base URL/token を redaction。
+- remote Runtime source summary を embedded/local と区別。
+  - `RuntimeSourceKind::RemoteHttp` を active source として利用。
+  - diagnostics も remote backend proxy として区別。
+- routing 対応:
+  - runtime summary/status/capabilities
+  - host list
+  - worker list/detail
+  - worker create
+  - input
+  - stop
+  - cancel
+  - transcript
+  - WS event proxy source fallback
+- Browser/API endpoint 追加:
+  - `POST /api/runtimes/{runtime_id}/workers/{worker_id}/stop`
+  - `POST /api/runtimes/{runtime_id}/workers/{worker_id}/cancel`
+- error mapping:
+  - remote auth failure -> `RuntimeOperationFailed` / HTTP 401
+  - remote timeout -> HTTP 504
+  - unsupported -> HTTP 501
+  - other remote operation failures -> HTTP 502
+  - remote worker not found remains typed worker lookup failure path
+- tests:
+  - mocked remote HTTP routing test
+  - secret/base URL non-leak assertion
+  - backend-owned WS observation source assertion
+  - remote auth error typed mapping test
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo test -p yoi-workspace-server`: success（31 passed）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success after `package.nix` cargoHash update
+
+Residual risks / review focus:
+- remote HTTP client は `reqwest::blocking` を利用。現状の `RuntimeRegistry` trait が sync なので変更量を抑えているが、将来 remote 操作の並行性/latency を重視するなら async trait 化または server handler 側 blocking isolation を検討。
+- v0 remote config は static/in-memory registration で、dynamic registration / full auth model / Profile config sync は非実装。
+- remote Worker create は既存 embedded mapping と同じ `CreateWorkerRequest::tools_less` ベース。remote 側で Profile/config bundle sync が必要になる場合は別 Ticket 境界。
+- WS observation は backend-private source fallback を追加。実 remote WS e2e は mock HTTP unit test ではなく既存 proxy tests + source生成テストでの確認に留めている。
+
+---
