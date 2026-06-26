@@ -10,12 +10,26 @@ use tokio_tungstenite::tungstenite::{Error as TungsteniteError, Message as Tungs
 use worker_runtime::http_server::{RuntimeWorkerEventWsEnvelope, RuntimeWorkerEventWsFrame};
 
 /// Backend-private source for a runtime worker observation stream.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RuntimeObservationSourceConfig {
     pub runtime_id: String,
     pub worker_id: String,
     pub endpoint: String,
     pub bearer_token: Option<String>,
+}
+
+impl std::fmt::Debug for RuntimeObservationSourceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeObservationSourceConfig")
+            .field("runtime_id", &self.runtime_id)
+            .field("worker_id", &self.worker_id)
+            .field("endpoint", &"<backend-private>")
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// Event consumed from a Runtime-owned worker observation WebSocket.
@@ -181,10 +195,19 @@ pub struct BackendObservationOpen {
 }
 
 /// Backend-owned in-memory v0 observation proxy state.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BackendObservationProxy {
     sources: Arc<BTreeMap<ObservationKey, RuntimeObservationSourceConfig>>,
     state: Arc<Mutex<BackendObservationState>>,
+}
+
+impl std::fmt::Debug for BackendObservationProxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendObservationProxy")
+            .field("source_count", &self.sources.len())
+            .field("state", &"<omitted>")
+            .finish()
+    }
 }
 
 impl BackendObservationProxy {
@@ -472,6 +495,59 @@ impl RuntimeWsObservationClient {
             worker_id: self.worker_id.clone(),
             runtime_cursor: envelope.cursor,
             payload: envelope.payload,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sensitive_source() -> RuntimeObservationSourceConfig {
+        RuntimeObservationSourceConfig {
+            runtime_id: "remote-runtime".to_string(),
+            worker_id: "worker-1".to_string(),
+            endpoint: "wss://remote.example.invalid/private/workers/worker-1/events/ws".to_string(),
+            bearer_token: Some("top-secret-bearer-token".to_string()),
+        }
+    }
+
+    #[test]
+    fn runtime_observation_source_debug_redacts_endpoint_and_token() {
+        let debug = format!("{:?}", sensitive_source());
+
+        assert!(debug.contains("remote-runtime"));
+        assert!(debug.contains("worker-1"));
+        assert!(debug.contains("<backend-private>"));
+        assert!(debug.contains("<redacted>"));
+        for forbidden in [
+            "remote.example.invalid",
+            "/private/workers/worker-1/events/ws",
+            "top-secret-bearer-token",
+        ] {
+            assert!(
+                !debug.contains(forbidden),
+                "debug leaked {forbidden}: {debug}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_observation_proxy_debug_redacts_contained_sources() {
+        let proxy = BackendObservationProxy::new(vec![sensitive_source()]);
+        let debug = format!("{proxy:?}");
+
+        assert!(debug.contains("BackendObservationProxy"));
+        assert!(debug.contains("source_count"));
+        for forbidden in [
+            "remote.example.invalid",
+            "/private/workers/worker-1/events/ws",
+            "top-secret-bearer-token",
+        ] {
+            assert!(
+                !debug.contains(forbidden),
+                "debug leaked {forbidden}: {debug}"
+            );
         }
     }
 }

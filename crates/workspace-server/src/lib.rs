@@ -50,6 +50,12 @@ pub enum Error {
     },
     #[error("invalid runtime {kind} `{value}`")]
     InvalidRuntimeIdentifier { kind: String, value: String },
+    #[error("runtime `{runtime_id}` operation failed ({code}): {message}")]
+    RuntimeOperationFailed {
+        runtime_id: String,
+        code: String,
+        message: String,
+    },
     #[error("runtime `{runtime_id}` does not support `{capability}`")]
     RuntimeCapabilityUnsupported {
         runtime_id: String,
