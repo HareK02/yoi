@@ -251,3 +251,41 @@ Residual risks / review focus:
 - Backend API endpoint は sync/check のみ追加し、Browser 完成 UX や full Plugin package manager / signature policy は実装していない。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZQHPNY-config-bundles at: 2026-06-26T07:18:50Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+読取専用レビュー結果。`abab1af2` の差分・該当ソースを確認し、追加で `git diff --check HEAD^ HEAD` のみ実行した（cargo/nix はファイル生成を避けるため再実行せず、報告値として扱った）。
+
+ブロッカー:
+
+1. **bundle content の禁止境界がまだ満たせていない。**
+   `ConfigDeclaration.reference` は自由文字列で、検証は `validate_boundary_text` の限定的な substring 判定のみ。
+   - `crates/worker-runtime/src/config_bundle.rs:124-129`
+   - `crates/worker-runtime/src/config_bundle.rs:266-294`
+   例えば `.cache/yoi`、`.yoi/sessions/foo.jsonl`、`pods/foo/sock` のような相対 cache/session/socket 形や、`SecretRef.reference` に平文 secret 風文字列を入れても拒否されない。Ticket の invariant「Bundles must not contain secret values / raw socket/session paths / host-local cache paths」を API 型・検証境界として保証できていないため修正が必要。型を分けるか、少なくとも ref/grant/policy の許可形式を明示して拒否テストを追加すること。
+
+2. **Backend remote availability check の bundle id canonicalization/encoding が不十分。**
+   Runtime REST は `{bundle_id}` path segment を使うが、bundle id 側の検証は `/`, `?`, `&` などを拒否せず、remote client は URL encode せずに埋め込んでいる。
+   - REST route: `crates/worker-runtime/src/http_server.rs:172-177`
+   - remote client: `crates/workspace-server/src/hosts.rs:1784-1788`
+   direct/POST store では受け入れられる id が remote check では経路破壊・誤解釈され得るため、Remote/Embedded の sync/check semantics が一致しない。path-safe id へ正規化/検証するか、ID を安全にエンコード/別ボディ化し、対応テストを追加すること。
+
+3. **Browser-facing diagnostics に remote Runtime の raw store path が漏れる経路がある。**
+   Runtime REST error は `RuntimeError::to_string()` をそのまま返し、`StoreIo/StoreMissing/StoreCorrupt` は path を Display する。Backend remote client はその remote message を診断として Browser-facing `ConfigBundleSyncResult/CheckResult` に載せる。
+   - path を含む Display: `crates/worker-runtime/src/error.rs:65-80`
+   - REST error message: `crates/worker-runtime/src/http_server.rs:785-789`
+   - Backend diagnostic relay: `crates/workspace-server/src/hosts.rs:2476-2505`
+   「Backend must not expose ... raw bundle storage paths to Browser」に反する。remote Runtime の internal path は Backend 側でサニタイズし、embedded と同様に内部 path 非公開の診断へ畳む必要がある。
+
+確認できた良い点:
+- digest/revision/workspace_id/created_at/provenance を持つ bundle domain type は追加されている。
+- Runtime store/list/check、profile + bundle ref の Worker 作成検証、missing/mismatch/invalid profile/unsupported declaration の typed error は概ね入っている。
+- builtin/default fallback と synced bundle mode のテスト分離はある。
+- Embedded direct sync と remote REST sync/check の骨格はある。
+- package.nix の cargoHash は Cargo.lock 変更に合わせて更新されている。
+
+---
