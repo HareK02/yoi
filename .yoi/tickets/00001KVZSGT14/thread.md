@@ -282,3 +282,22 @@ Residual risks / review focus:
 - 将来 `Display` や手動ログで field を直接出す実装を追加する場合は別途注意が必要。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZSGT14-remote-runtime at: 2026-06-26T06:29:12Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+ブロッカーは解消済み。
+
+確認内容:
+- `RuntimeObservationSourceConfig` は manual `Debug` になり、`runtime_id` / `worker_id` のみ実値、`endpoint` は `<backend-private>`、`bearer_token` は `<redacted>` 表示になっている。
+- `BackendObservationProxy` も manual `Debug` になり、source map / state internals を出さず `source_count` と omitted marker だけを出すため、内包する remote endpoint/token が Debug 経由で漏れない。
+- 追加テストは source config と proxy Debug の forbidden host/path/token 非混入を検証している。
+- 差分は `observation.rs` の redaction/test に限定され、API/WS payload 形状や remote routing への scope creep は見当たらない。
+
+検証:
+- read-only inspection のみ実施。テスト実行はしていない。
+
+---
