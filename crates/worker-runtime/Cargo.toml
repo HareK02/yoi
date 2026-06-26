@@ -5,11 +5,20 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "worker-runtime-rest-server"
+path = "src/main.rs"
+required-features = ["http-server"]
+
 [features]
 default = []
 fs-store = ["dep:serde_json"]
+http-server = ["dep:axum", "dep:serde_json", "dep:tokio", "dep:tower"]
 
 [dependencies]
+axum = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt"], optional = true }
+tower = { workspace = true, features = ["util"], optional = true }
