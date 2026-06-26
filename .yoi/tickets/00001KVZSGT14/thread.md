@@ -248,3 +248,37 @@ Review result: request_changes
 検証: read-only で対象 commit/diff/source/tests を確認。テスト実行は未実施。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZSGT14-remote-runtime at: 2026-06-26T06:27:50Z -->
+
+## Implementation report
+
+Follow-up implementation report after review request_changes:
+
+Commit:
+- `38ff7d8f807256ec654fcf5655e04dcbad4d9041 fix: redact observation source debug output`
+
+修正内容:
+- `RuntimeObservationSourceConfig` の `Debug` derive を廃止し、手動 `Debug` 実装に変更。
+  - `runtime_id` / `worker_id` は残す。
+  - `endpoint` は `<backend-private>`。
+  - `bearer_token` は `<redacted>`。
+- `BackendObservationProxy` の `Debug` derive を廃止し、手動 `Debug` 実装に変更。
+  - source map / state の中身は出さず、`source_count` と omitted state のみ表示。
+- focused test を追加。
+  - source config の Debug に remote endpoint/base URL/path/token が含まれないこと。
+  - containing proxy の Debug に remote endpoint/base URL/path/token が含まれないこと。
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo test -p yoi-workspace-server`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Residual risks / review focus:
+- 今回の修正対象だった Debug/log-worthy 経路の漏洩は塞いだ。
+- `RuntimeObservationSourceConfig` 自体は Backend 内部で real endpoint/token を保持し続ける。これは remote WS proxy 実行に必要な内部保持であり、API/WS payload には出していない。
+- 将来 `Display` や手動ログで field を直接出す実装を追加する場合は別途注意が必要。
+
+---
