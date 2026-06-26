@@ -252,3 +252,60 @@ Review result: request_changes
 検証は read-only inspection 中心で、テスト/ビルドは再実行せず、報告済み結果を参照した。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZKSTE2-rest-server at: 2026-06-26T03:21:26Z -->
+
+## Implementation report
+
+Follow-up implementation report after review request_changes:
+
+追加 commit:
+- `d0db32fa6acb6efb5269de9793a63de92ef9eb4a fix: add worker runtime REST process binary`
+
+修正内容:
+- `crates/worker-runtime/Cargo.toml`
+  - `[[bin]]` target を追加。
+  - binary name: `worker-runtime-rest-server`
+  - path: `src/main.rs`
+  - `required-features = ["http-server"]`
+- `crates/worker-runtime/src/main.rs`
+  - minimal Runtime REST process wrapper を追加。
+
+Binary / process wrapper 概要:
+- `http-server` feature 有効時に `worker-runtime-rest-server` binary target が出る。
+- v0 config:
+  - `--bind <ADDR>`
+  - `--runtime-id <ID>`
+  - `--display-name <NAME>`
+  - `--store <memory|fs>`
+  - `--fs-root <PATH>`（`fs-store` feature 併用時のみ有効）
+  - `--local-token <TOKEN>`
+  - `--local-token-env <ENV>`
+  - `--max-transcript-projection-items <N>`
+  - `--max-event-batch-items <N>`
+
+Boundary notes:
+- binary は `http-server` required feature 付きなので、no-default build では HTTP deps / binary compile を強制しない。
+- process wrapper は既存の `RuntimeHttpServer::bind/serve` を使い、REST handlers は従来通り Runtime API に委譲する。
+- help / startup message に「trusted backend/proxy 向けであり Browser は Runtime process に直接接続しない」境界を明記。
+- SSE / WebSocket / Backend integration / dynamic registration / full auth model は追加していない。
+
+Manifest 確認:
+- `cargo read-manifest --manifest-path crates/worker-runtime/Cargo.toml | jq '.targets'` で `lib` に加えて `bin` target `worker-runtime-rest-server`、`required-features = ["http-server"]` を確認。
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo test -p worker-runtime --no-default-features`: success（8 passed）
+- `cargo test -p worker-runtime --features http-server`: success（lib 11 passed, bin `src/main.rs` 3 passed）
+- `cargo test -p worker-runtime --features fs-store,http-server`: success（lib 13 passed, bin `src/main.rs` 3 passed）
+- `cargo check -p worker-runtime --features http-server --bins`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Residual risks / review focus:
+- CLI は intentionally minimal。`clap` 等は追加せず手書き parser。
+- `--local-token` は placeholder であり、Browser-facing credential model ではない。必要なら後続 Ticket で Backend 側 auth / proxy 境界として設計する前提。
+- `fs` store は `fs-store` feature 併用時のみ有効で、`http-server` 単独 build では明示エラー。
+
+---
