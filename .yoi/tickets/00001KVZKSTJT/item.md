@@ -1,8 +1,8 @@
 ---
 title: 'Runtime/Backend WebSocket observation proxyを実装する'
-state: 'queued'
+state: 'inprogress'
 created_at: '2026-06-25T14:44:02Z'
-updated_at: '2026-06-25T20:36:24Z'
+updated_at: '2026-06-26T04:22:27Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-25T20:34:20Z'
