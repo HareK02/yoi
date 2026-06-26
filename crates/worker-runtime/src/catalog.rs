@@ -40,10 +40,11 @@ impl Default for ProfileSelector {
     }
 }
 
-/// Placeholder for future config-bundle synchronization.
+/// Backend-synced config bundle reference used during Worker creation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigBundleRef {
     pub id: String,
+    pub digest: String,
 }
 
 /// Requested capability name plus optional human-readable reason.

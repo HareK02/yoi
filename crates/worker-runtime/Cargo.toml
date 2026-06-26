@@ -21,6 +21,7 @@ axum = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 protocol = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
+sha2.workspace = true
 serde_json = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt"], optional = true }

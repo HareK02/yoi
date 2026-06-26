@@ -7,7 +7,10 @@
 //! credentials, registration, and policy.
 
 use crate::Runtime;
-use crate::catalog::{CreateWorkerRequest, WorkerDetail, WorkerLifecycleAck, WorkerSummary};
+use crate::catalog::{
+    ConfigBundleRef, CreateWorkerRequest, WorkerDetail, WorkerLifecycleAck, WorkerSummary,
+};
+use crate::config_bundle::{ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary};
 use crate::error::RuntimeError;
 #[cfg(feature = "fs-store")]
 use crate::fs_store::FsRuntimeStoreOptions;
@@ -165,6 +168,14 @@ pub fn runtime_http_router(runtime: Runtime, local_token: Option<String>) -> Rou
 
     let router = Router::new()
         .route("/v1/runtime", get(get_runtime))
+        .route(
+            "/v1/config-bundles",
+            get(list_config_bundles).post(store_config_bundle),
+        )
+        .route(
+            "/v1/config-bundles/{bundle_id}/availability",
+            get(check_config_bundle),
+        )
         .route("/v1/workers", get(list_workers).post(create_worker))
         .route("/v1/workers/{worker_id}", get(get_worker))
         .route("/v1/workers/{worker_id}/input", post(send_worker_input))
@@ -214,6 +225,29 @@ struct RuntimeHttpState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeHttpSummaryResponse {
     pub runtime: RuntimeSummary,
+}
+
+/// `GET /v1/config-bundles` response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeHttpConfigBundlesResponse {
+    pub bundles: Vec<ConfigBundleSummary>,
+}
+
+/// `POST /v1/config-bundles` request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeHttpConfigBundleSyncRequest {
+    pub bundle: ConfigBundle,
+}
+
+/// Config bundle availability response used by sync/check endpoints.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeHttpConfigBundleAvailabilityResponse {
+    pub availability: ConfigBundleAvailability,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RuntimeHttpConfigBundleAvailabilityQuery {
+    digest: String,
 }
 
 /// `GET /v1/workers` response.
@@ -370,6 +404,48 @@ async fn get_runtime(
         .summary()
         .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpSummaryResponse { runtime }))
+}
+
+async fn list_config_bundles(
+    State(state): State<RuntimeHttpState>,
+) -> RestResult<RuntimeHttpConfigBundlesResponse> {
+    let bundles = state
+        .runtime
+        .list_config_bundles()
+        .map_err(RuntimeHttpRestError::runtime)?;
+    Ok(Json(RuntimeHttpConfigBundlesResponse { bundles }))
+}
+
+async fn store_config_bundle(
+    State(state): State<RuntimeHttpState>,
+    body: Result<Json<RuntimeHttpConfigBundleSyncRequest>, JsonRejection>,
+) -> RestResult<RuntimeHttpConfigBundleAvailabilityResponse> {
+    let Json(request) = body.map_err(RuntimeHttpRestError::json_rejection)?;
+    let availability = state
+        .runtime
+        .store_config_bundle(request.bundle)
+        .map_err(RuntimeHttpRestError::runtime)?;
+    Ok(Json(RuntimeHttpConfigBundleAvailabilityResponse {
+        availability,
+    }))
+}
+
+async fn check_config_bundle(
+    State(state): State<RuntimeHttpState>,
+    Path(bundle_id): Path<String>,
+    query: Result<Query<RuntimeHttpConfigBundleAvailabilityQuery>, QueryRejection>,
+) -> RestResult<RuntimeHttpConfigBundleAvailabilityResponse> {
+    let Query(query) = query.map_err(RuntimeHttpRestError::query_rejection)?;
+    let availability = state
+        .runtime
+        .check_config_bundle(&ConfigBundleRef {
+            id: bundle_id,
+            digest: query.digest,
+        })
+        .map_err(RuntimeHttpRestError::runtime)?;
+    Ok(Json(RuntimeHttpConfigBundleAvailabilityResponse {
+        availability,
+    }))
 }
 
 async fn list_workers(
@@ -743,10 +819,15 @@ impl IntoResponse for RuntimeHttpRestError {
 
 fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
     match error {
-        RuntimeError::WorkerNotFound { .. } => StatusCode::NOT_FOUND,
+        RuntimeError::WorkerNotFound { .. } | RuntimeError::ConfigBundleMissing { .. } => {
+            StatusCode::NOT_FOUND
+        }
         RuntimeError::RuntimeStopped { .. } => StatusCode::CONFLICT,
         RuntimeError::LimitTooLarge { .. }
         | RuntimeError::InvalidRequest(_)
+        | RuntimeError::ConfigBundleDigestMismatch { .. }
+        | RuntimeError::InvalidProfileSelector { .. }
+        | RuntimeError::UnsupportedConfigDeclaration { .. }
         | RuntimeError::WrongRuntime { .. }
         | RuntimeError::WrongRuntimeCursor { .. } => StatusCode::BAD_REQUEST,
         RuntimeError::StoreIo { .. }
@@ -764,6 +845,10 @@ fn code_for_runtime_error(error: &RuntimeError) -> &'static str {
         RuntimeError::WorkerNotFound { .. } => "worker_not_found",
         RuntimeError::LimitTooLarge { .. } => "limit_too_large",
         RuntimeError::InvalidRequest(_) => "invalid_request",
+        RuntimeError::ConfigBundleMissing { .. } => "config_bundle_missing",
+        RuntimeError::ConfigBundleDigestMismatch { .. } => "config_bundle_digest_mismatch",
+        RuntimeError::InvalidProfileSelector { .. } => "invalid_profile_selector",
+        RuntimeError::UnsupportedConfigDeclaration { .. } => "unsupported_config_declaration",
         RuntimeError::StoreIo { .. } => "store_io",
         RuntimeError::StoreMissing { .. } => "store_missing",
         RuntimeError::StoreCorrupt { .. } => "store_corrupt",
