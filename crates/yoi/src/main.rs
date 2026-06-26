@@ -11,7 +11,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
-use client::WorkerRuntimeCommand;
+use client::{BackendRuntimeTarget, WorkerRuntimeCommand};
 use memory_lint::{LintCliOptions, LintStatus};
 use session_store::SegmentId;
 use tui::{LaunchMode, LaunchOptions};
@@ -286,6 +286,9 @@ fn parse_console_options(args: &[String]) -> Result<Mode, ParseError> {
     let mut session = None;
     let mut worker_name = None;
     let mut socket_override = None;
+    let mut backend_url = None;
+    let mut runtime_id = None;
+    let mut worker_id = None;
     let mut profile = None;
 
     let mut i = 0;
@@ -327,6 +330,36 @@ fn parse_console_options(args: &[String]) -> Result<Mode, ParseError> {
                     return Err(ParseError("--workspace requires a value".to_string()));
                 }
                 workspace_root = PathBuf::from(value);
+                i += 2;
+            }
+            "--backend" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError("--backend requires a URL".to_string()))?;
+                if value.starts_with('-') || value.is_empty() {
+                    return Err(ParseError("--backend requires a URL".to_string()));
+                }
+                backend_url = Some(value.clone());
+                i += 2;
+            }
+            "--runtime-id" | "--runtime" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError("--runtime-id requires a value".to_string()))?;
+                if value.starts_with('-') || value.is_empty() {
+                    return Err(ParseError("--runtime-id requires a value".to_string()));
+                }
+                runtime_id = Some(value.clone());
+                i += 2;
+            }
+            "--worker-id" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError("--worker-id requires a value".to_string()))?;
+                if value.starts_with('-') || value.is_empty() {
+                    return Err(ParseError("--worker-id requires a value".to_string()));
+                }
+                worker_id = Some(value.clone());
                 i += 2;
             }
             "--profile" => {
@@ -371,6 +404,38 @@ fn parse_console_options(args: &[String]) -> Result<Mode, ParseError> {
                 workspace_root = PathBuf::from(value);
                 i += 1;
             }
+            arg if arg.starts_with("--backend=") => {
+                let value = arg.trim_start_matches("--backend=");
+                if value.is_empty() {
+                    return Err(ParseError("--backend requires a URL".to_string()));
+                }
+                backend_url = Some(value.to_string());
+                i += 1;
+            }
+            arg if arg.starts_with("--runtime-id=") => {
+                let value = arg.trim_start_matches("--runtime-id=");
+                if value.is_empty() {
+                    return Err(ParseError("--runtime-id requires a value".to_string()));
+                }
+                runtime_id = Some(value.to_string());
+                i += 1;
+            }
+            arg if arg.starts_with("--runtime=") => {
+                let value = arg.trim_start_matches("--runtime=");
+                if value.is_empty() {
+                    return Err(ParseError("--runtime-id requires a value".to_string()));
+                }
+                runtime_id = Some(value.to_string());
+                i += 1;
+            }
+            arg if arg.starts_with("--worker-id=") => {
+                let value = arg.trim_start_matches("--worker-id=");
+                if value.is_empty() {
+                    return Err(ParseError("--worker-id requires a value".to_string()));
+                }
+                worker_id = Some(value.to_string());
+                i += 1;
+            }
             arg if arg.starts_with("--profile=") => {
                 let value = arg.trim_start_matches("--profile=");
                 if value.is_empty() {
@@ -390,6 +455,26 @@ fn parse_console_options(args: &[String]) -> Result<Mode, ParseError> {
         }
     }
 
+    let backend_target_present =
+        backend_url.is_some() || runtime_id.is_some() || worker_id.is_some();
+    if backend_target_present
+        && (backend_url.is_none() || runtime_id.is_none() || worker_id.is_none())
+    {
+        return Err(ParseError(
+            "--backend, --runtime-id, and --worker-id are required together".to_string(),
+        ));
+    }
+    if backend_target_present
+        && (session.is_some()
+            || worker_name.is_some()
+            || socket_override.is_some()
+            || profile.is_some())
+    {
+        return Err(ParseError(
+            "Backend Runtime API target cannot be combined with --worker, --socket, --session, or --profile".to_string(),
+        ));
+    }
+
     if profile.is_some() && (session.is_some() || socket_override.is_some()) {
         return Err(ParseError(
             "--profile can only be used for fresh spawn".to_string(),
@@ -402,6 +487,19 @@ fn parse_console_options(args: &[String]) -> Result<Mode, ParseError> {
         return Err(ParseError(
             "--socket can only be used with --worker attach mode".to_string(),
         ));
+    }
+
+    if backend_target_present {
+        return Ok(Mode::Tui {
+            mode: LaunchMode::BackendRuntime {
+                target: BackendRuntimeTarget::new(
+                    backend_url.expect("checked by backend_target_present"),
+                    runtime_id.expect("checked by backend_target_present"),
+                    worker_id.expect("checked by backend_target_present"),
+                ),
+            },
+            workspace_root,
+        });
     }
 
     if let Some(profile) = profile {
@@ -901,7 +999,7 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
 
 fn print_help() {
     println!(
-        "yoi\n\nUsage:\n  yoi [OPTIONS]\n  yoi resume [--workspace <PATH>] [--all]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi worker [WORKER_OPTIONS]\n  yoi worker delete <NAME> [--force] [--dry-run]\n  yoi worker prune --older-than <DURATION> [--force] [--dry-run]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi session prune --unreferenced [--older-than <DURATION>] [--force] [--dry-run]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi workspace serve [OPTIONS]\n  yoi plugin new <rust-component-tool|rust-component-service> <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Worker chat/client surface (default, --worker, yoi resume)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n      --workspace <PATH> Runtime workspace root for default Console/--worker (defaults to cwd)\n      --worker <NAME>       Open the Worker Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Worker Console to a specific socket with --worker\n      --session <UUID>   Resume a specific session segment in the Worker Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
+        "yoi\n\nUsage:\n  yoi [OPTIONS]\n  yoi resume [--workspace <PATH>] [--all]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi worker [WORKER_OPTIONS]\n  yoi worker delete <NAME> [--force] [--dry-run]\n  yoi worker prune --older-than <DURATION> [--force] [--dry-run]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi session prune --unreferenced [--older-than <DURATION>] [--force] [--dry-run]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi workspace serve [OPTIONS]\n  yoi plugin new <rust-component-tool|rust-component-service> <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Worker chat/client surface (default, --worker, yoi resume, Backend Runtime target)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n      --workspace <PATH> Runtime workspace root for default Console/--worker (defaults to cwd)\n      --worker <NAME>       Open the Worker Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Worker Console to a specific socket with --worker\n      --session <UUID>   Resume a specific session segment in the Worker Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
     );
 }
 
@@ -943,6 +1041,59 @@ mod tests {
             }
             _ => panic!("expected WorkerName mode"),
         }
+    }
+
+    #[test]
+    fn parse_backend_runtime_target_mode() {
+        match parse_args_from([
+            "--backend",
+            "http://127.0.0.1:8787",
+            "--runtime-id",
+            "runtime-a",
+            "--worker-id",
+            "worker-b",
+        ])
+        .unwrap()
+        {
+            Mode::Tui {
+                mode: LaunchMode::BackendRuntime { target },
+                ..
+            } => {
+                assert_eq!(target.base_url, "http://127.0.0.1:8787");
+                assert_eq!(target.runtime_id, "runtime-a");
+                assert_eq!(target.worker_id, "worker-b");
+            }
+            _ => panic!("expected BackendRuntime mode"),
+        }
+    }
+
+    #[test]
+    fn parse_backend_runtime_target_requires_complete_identity() {
+        let err = parse_args_from(["--backend", "http://127.0.0.1:8787", "--worker-id", "w"])
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "--backend, --runtime-id, and --worker-id are required together"
+        );
+    }
+
+    #[test]
+    fn parse_backend_runtime_target_rejects_legacy_socket_mix() {
+        let err = parse_args_from([
+            "--backend",
+            "http://127.0.0.1:8787",
+            "--runtime-id",
+            "r",
+            "--worker-id",
+            "w",
+            "--worker",
+            "agent",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Backend Runtime API target cannot be combined with --worker, --socket, --session, or --profile"
+        );
     }
 
     #[test]
