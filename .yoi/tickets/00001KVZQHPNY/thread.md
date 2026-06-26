@@ -162,3 +162,92 @@ Queued capacity notes:
 - `00001KW04A8K6` remains queued to avoid TUI migration against unstable worker creation/profile semantics.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZQHPNY-config-bundles at: 2026-06-26T07:08:31Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装完了。指定 worktree / branch 内で commit 済み。
+
+Commit:
+- `abab1af2 feat: add runtime config bundle sync`
+
+変更ファイル:
+- `Cargo.lock`
+- `package.nix`
+- `crates/worker-runtime/Cargo.toml`
+- `crates/worker-runtime/src/lib.rs`
+- `crates/worker-runtime/src/catalog.rs`
+- `crates/worker-runtime/src/config_bundle.rs`
+- `crates/worker-runtime/src/error.rs`
+- `crates/worker-runtime/src/fs_store.rs`
+- `crates/worker-runtime/src/http_server.rs`
+- `crates/worker-runtime/src/runtime.rs`
+- `crates/workspace-server/src/hosts.rs`
+- `crates/workspace-server/src/server.rs`
+
+実装概要:
+
+### worker-runtime
+
+- `config_bundle` module を追加。
+  - `ConfigBundle`
+  - `ConfigBundleMetadata`
+  - `ConfigBundleProvenance`
+  - `ConfigProfileDescriptor`
+  - `ConfigDeclaration`
+  - `ConfigBundleSummary`
+  - `ConfigBundleAvailability`
+- Bundle metadata に digest / revision / workspace id / created_at / provenance/source metadata を保持。
+- `ConfigBundleRef` を `id + digest` に拡張。
+- Runtime direct lib API を追加。
+  - `store_config_bundle`
+  - `list_config_bundles`
+  - `check_config_bundle`
+- Worker creation で profile selector + config_bundle ref を検証。
+  - bundle missing
+  - digest mismatch
+  - invalid profile selector
+  - unsupported declaration
+  を typed `RuntimeError` として返す。
+- builtin/default fallback と synced bundle mode を区別。
+  - bundle なしでは `RuntimeDefault` / `Builtin` fallback を許可。
+  - `Named` profile は synced bundle ref 必須。
+- FS snapshot に config bundle store を永続化。
+- Runtime REST API を追加。
+  - `GET /v1/config-bundles`
+  - `POST /v1/config-bundles`
+  - `GET /v1/config-bundles/{bundle_id}/availability?digest=...`
+- Bundle validation で secret values / host-local path 的な値を bundle content に持ち込まない前提の ref/grant/policy boundary を enforced する最小チェックを追加。
+
+### workspace-server / Backend
+
+- `WorkerSpawnRequest` に `profile` / `config_bundle` / `requested_capabilities` を追加。
+- `RuntimeRegistry` / runtime host boundary に bundle sync/check/list を追加。
+- Embedded Runtime backend で direct lib sync/check/create が動作。
+- Remote Runtime backend で Runtime REST sync/check endpoint を利用。
+- Workspace API に backend-facing endpoint を追加。
+  - `POST /api/runtimes/{runtime_id}/config-bundles`
+  - `GET /api/runtimes/{runtime_id}/config-bundles/{bundle_id}/availability?digest=...`
+- Browser/API 側に Runtime credentials / direct endpoint / raw bundle storage path は出していない。
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo test -p worker-runtime`: success（10 passed）
+- `cargo test -p yoi-workspace-server`: success（34 passed）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Notes:
+- `sha2` を `worker-runtime` direct dependency に追加したため、`Cargo.lock` と `package.nix` の `cargoHash` も更新。
+
+Residual risks / review focus:
+- Bundle digest canonicalization は v0 の typed domain fields ベース。将来 declaration schema が増える場合、digest 対象フィールドの拡張方針を確認してほしい。
+- Bundle content の secret value / host-local path 禁止は v0 として文字列フィールドへの conservative validation。完全な policy/signature/package-manager ではない。
+- Remote Runtime の bundle availability check は query string に digest を載せる最小 REST shape。bundle id の URL encoding 方針は今後必要なら強化対象。
+- Backend API endpoint は sync/check のみ追加し、Browser 完成 UX や full Plugin package manager / signature policy は実装していない。
+
+---
