@@ -132,3 +132,24 @@ Dependency `00001KVZKSV6C` Backend RuntimeRegistry foundation と `00001KVZBCQH4
 これ以降、worktree creation / coder Worker routing などの implementation side effect に進める。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T05:19:30Z -->
+
+## Implementation report
+
+Implementation kickoff:
+
+- Worktree created: `/home/hare/Projects/yoi/.worktree/00001KVZSGT0Q-embedded-runtime-registry`
+- Branch: `work/00001KVZSGT0Q-embedded-runtime-registry`
+- Coder Worker spawned: `yoi-coder-00001KVZSGT0Q-embedded-runtime`
+
+Scope notes:
+- Coder has read access to the implementation worktree and non-recursive workspace root identity path needed by runtime startup.
+- Coder write scope is limited to `crates/workspace-server/**` and root `Cargo.lock` if dependency lock changes are needed.
+- Coder is instructed not to modify Ticket records and not to operate in root/orchestration worktrees.
+
+Queued capacity note:
+- `00001KVZQHPNY` remains queued while this embedded Runtime connection is inprogress to avoid worker creation/profile boundary API churn.
+- Remote/WebConsole/TUI dependent Tickets remain queued until embedded/remote prerequisite chain is done.
+
+---
