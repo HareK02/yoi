@@ -394,3 +394,22 @@ Scope:
 - Full TUI parity / tool call UI / file/diff viewer / thinking grouping / multi Worker attach / real provider-backed Companion execution は Non-goals として未実装。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T08:09:07Z -->
+
+## Implementation report
+
+Cleanup report:
+
+- Child Workers stopped one-by-one and scope reclaimed:
+  - `yoi-coder-00001KVZ9JGK0-web-console`
+  - `yoi-reviewer-00001KVZ9JGK0-web-console`
+- Child implementation worktree removed:
+  - `/home/hare/Projects/yoi/.worktree/00001KVZ9JGK0-web-console-mvp`
+- Child implementation branch removed:
+  - `work/00001KVZ9JGK0-web-console-mvp`
+
+Operational note:
+- StopPod was executed sequentially, not in parallel.
+
+---
