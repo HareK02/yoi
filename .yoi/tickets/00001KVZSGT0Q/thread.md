@@ -294,3 +294,22 @@ Scope:
 - Remote process / FS/REST/WS server implementation / Web Console / Profile config sync は Non-goals として未実装。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T05:47:56Z -->
+
+## Implementation report
+
+Cleanup report:
+
+- Child Workers stopped one-by-one and scope reclaimed:
+  - `yoi-coder-00001KVZSGT0Q-embedded-runtime`
+  - `yoi-reviewer-00001KVZSGT0Q-embedded-runtime`
+- Child implementation worktree removed:
+  - `/home/hare/Projects/yoi/.worktree/00001KVZSGT0Q-embedded-runtime-registry`
+- Child implementation branch removed:
+  - `work/00001KVZSGT0Q-embedded-runtime-registry`
+
+Operational note:
+- StopPod was executed sequentially, not in parallel.
+
+---
