@@ -1,8 +1,8 @@
 ---
 title: 'Backend RuntimeRegistryの基盤をworker-runtime向けに整理する'
-state: 'done'
+state: 'closed'
 created_at: '2026-06-25T14:44:03Z'
-updated_at: '2026-06-26T03:09:01Z'
+updated_at: '2026-06-26T17:46:04Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-25T16:31:28Z'

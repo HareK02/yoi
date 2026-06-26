@@ -1,8 +1,8 @@
 ---
 title: 'Backend RuntimeRegistryにremote worker-runtime processを接続する'
-state: 'done'
+state: 'closed'
 created_at: '2026-06-25T16:23:58Z'
-updated_at: '2026-06-26T06:30:50Z'
+updated_at: '2026-06-26T17:46:04Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-25T20:34:35Z'

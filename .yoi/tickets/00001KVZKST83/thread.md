@@ -333,3 +333,21 @@ Operational note:
 - User noted StopPod should be run one-by-one rather than through parallel multi-tool execution; future cleanup will follow that.
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-06-26T17:46:04Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-26T17:46:04Z status: closed -->
+
+## 完了
+
+Completed, reviewed, validated, and merged into develop.
+
+
+---
