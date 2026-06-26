@@ -1,7 +1,14 @@
 <script lang="ts">
+  import { workerConsoleHref } from '$lib/workspace-console/model';
   import type { ListResponse, Worker } from './types';
 
   const MAX_VISIBLE_WORKERS = 6;
+
+  type Props = {
+    currentPath?: string;
+  };
+
+  let { currentPath = '/' }: Props = $props();
 
   let loading = $state(true);
   let error = $state<string | null>(null);
@@ -63,12 +70,15 @@
     <p class="section-state">{placeholder ?? 'Workers will appear here when an API is connected.'}</p>
   {:else}
     <ul class="nav-list" aria-label="Workers">
-      {#each workers as worker (worker.worker_id)}
-        <li class="nav-item">
-          <span class="item-title">{worker.label}</span>
-          <span class="item-meta">
-            {worker.state} · {worker.status}{worker.role ? ` · ${worker.role}` : ''}
-          </span>
+      {#each workers as worker (`${worker.runtime_id}:${worker.worker_id}`)}
+        {@const href = workerConsoleHref(worker)}
+        <li class="nav-item" class:active={currentPath === href}>
+          <a href={href} class="nav-link" aria-current={currentPath === href ? 'page' : undefined}>
+            <span class="item-title">{worker.label}</span>
+            <span class="item-meta">
+              {worker.state} · {worker.status}{worker.role ? ` · ${worker.role}` : ''}
+            </span>
+          </a>
         </li>
       {/each}
     </ul>
