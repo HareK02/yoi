@@ -23,8 +23,4 @@
       </a>
     </li>
   </ul>
-
-  <p class="section-note">
-    Repository authority remains the current workspace root and canonical project records.
-  </p>
 </section>

@@ -52,6 +52,8 @@
 
         --radius-soft: 8px;
         --radius-panel: 12px;
+        --interactive-hover: color-mix(in oklch, var(--bg-subtle) 88%, white 12%);
+        --interactive-selected: color-mix(in oklch, var(--bg-subtle) 88%, var(--accent) 12%);
         --font-sans:
             Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
             "Segoe UI", sans-serif;
@@ -143,7 +145,8 @@
     }
 
     .shell {
-        display: grid;
+        display: flex;
+        flex-direction: column;
         gap: var(--space-6);
         min-width: 0;
         min-height: 0;
@@ -296,18 +299,32 @@
         display: grid;
         gap: 3px;
         min-width: 0;
-        padding: var(--space-2) 0 var(--space-2) var(--space-3);
-        border-left: 2px solid transparent;
+        margin-inline: calc(-1 * var(--space-2));
+        padding: var(--space-2) var(--space-3);
+        border-radius: var(--radius-soft);
         color: inherit;
         text-align: left;
         text-decoration: none;
+        transition:
+            background-color 140ms ease,
+            color 140ms ease;
     }
 
-    .nav-item.active,
-    .objective-link.active,
-    .nav-item:hover,
-    .objective-link:hover {
-        border-left-color: var(--accent);
+    a.nav-item:hover,
+    a.nav-item:focus-visible,
+    a.objective-link:hover,
+    a.objective-link:focus-visible {
+        background: var(--interactive-hover);
+    }
+
+    a.nav-item.active,
+    a.objective-link.active {
+        background: var(--interactive-selected);
+    }
+
+    a.nav-item.active .item-title,
+    a.objective-link.active .item-title {
+        color: var(--accent);
     }
 
     .item-title,
@@ -320,6 +337,26 @@
     .item-title {
         color: var(--text-strong);
         font-weight: 650;
+    }
+
+    .worker-nav-item {
+        gap: 2px;
+    }
+
+    .worker-title-row {
+        display: grid;
+        grid-template-columns: minmax(0, max-content) minmax(0, 1fr);
+        align-items: baseline;
+        gap: var(--space-2);
+        min-width: 0;
+    }
+
+    .worker-task-title {
+        overflow: hidden;
+        color: var(--text-muted);
+        font-size: 0.82rem;
+        text-overflow: ellipsis;
+        white-space: nowrap;
     }
 
     .item-meta,
@@ -338,22 +375,107 @@
 
     .card {
         min-width: 0;
-        padding: var(--space-5) 0 0;
-        border-top: 1px solid var(--line);
-    }
-
-    .card:first-child {
-        padding-top: 0;
-        border-top: 0;
+        padding: 0;
     }
 
     .runtime-card {
-        padding: var(--space-4) 0 0;
-        border-top: 1px solid var(--line);
+        padding: 0;
     }
 
-    .selected-card.selected {
-        border-top-color: var(--accent);
+    .objective-list {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-2);
+        margin-top: var(--space-4);
+    }
+
+    .objective-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) max-content;
+        align-items: start;
+        gap: var(--space-4);
+        padding: var(--space-3) var(--space-4);
+        border-radius: var(--radius-panel);
+        background: var(--bg-raised);
+        color: inherit;
+        text-decoration: none;
+        transition: background-color 140ms ease;
+    }
+
+    .objective-row:hover,
+    .objective-row:focus-visible {
+        background: var(--interactive-hover);
+    }
+
+    .objective-row.selected {
+        background: var(--interactive-selected);
+    }
+
+    .objective-row.selected .objective-title {
+        color: var(--accent);
+    }
+
+    .objective-main {
+        display: grid;
+        gap: var(--space-1);
+        min-width: 0;
+    }
+
+    .objective-title-row {
+        display: flex;
+        align-items: baseline;
+        gap: var(--space-2);
+        min-width: 0;
+    }
+
+    .objective-title {
+        min-width: 0;
+        overflow: hidden;
+        color: var(--text-strong);
+        font-weight: 700;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .state-pill {
+        flex: 0 0 auto;
+        color: var(--success);
+        font-size: 0.76rem;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+    }
+
+    .objective-summary {
+        margin: 0;
+        color: var(--text-muted);
+        font-size: 0.88rem;
+        line-height: 1.4;
+    }
+
+    .objective-meta {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: var(--space-2);
+        color: var(--text-faint);
+        font-size: 0.78rem;
+        line-height: 1.35;
+        text-align: right;
+        white-space: nowrap;
+    }
+
+    @media (max-width: 900px) {
+        .objective-row {
+            grid-template-columns: 1fr;
+            gap: var(--space-2);
+        }
+
+        .objective-meta {
+            justify-content: flex-start;
+            text-align: left;
+            white-space: normal;
+        }
     }
 
     .runtime-heading,
@@ -384,18 +506,35 @@
 
     dl {
         display: grid;
+        gap: var(--space-1);
+        margin: 0;
+    }
+
+    dl > div {
+        display: grid;
+        grid-template-columns: minmax(6.5rem, 10rem) minmax(0, 1fr);
+        align-items: baseline;
         gap: var(--space-3);
+        min-width: 0;
     }
 
     dt {
         color: var(--text-faint);
-        font-size: 0.78rem;
+        font-size: 0.72rem;
         letter-spacing: 0.08em;
         text-transform: uppercase;
+        white-space: nowrap;
     }
 
     dd {
+        min-width: 0;
         margin: 0;
+    }
+
+    dd small {
+        display: inline;
+        margin-top: 0;
+        margin-left: var(--space-2);
     }
 
     .table-wrap {

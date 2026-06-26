@@ -64,10 +64,13 @@
   {:else}
     <ul class="nav-list" aria-label="Workers">
       {#each workers as worker (worker.worker_id)}
-        <li class="nav-item">
-          <span class="item-title">{worker.label}</span>
+        <li class="nav-item worker-nav-item">
+          <span class="worker-title-row">
+            <span class="item-title">{worker.label}</span>
+            <span class="worker-task-title">-</span>
+          </span>
           <span class="item-meta">
-            {worker.state} · {worker.status}{worker.role ? ` · ${worker.role}` : ''}
+            {worker.role ? `${worker.role} · ` : ''}{worker.state} · {worker.status}
           </span>
         </li>
       {/each}

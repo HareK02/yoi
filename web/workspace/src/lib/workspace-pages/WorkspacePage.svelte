@@ -8,7 +8,6 @@
     ObjectiveDetail,
     ObjectiveListResponse,
     RepositoryDetailResponse,
-    RepositoryLogResponse,
     RepositorySummary,
     RepositoryTicketsResponse,
     Worker,
@@ -33,7 +32,6 @@
     { label: 'Tickets', path: '/api/tickets' },
     { label: 'Objectives', path: '/api/objectives' },
     { label: 'Repositories', path: '/api/repositories' },
-    { label: 'Repository log', path: '/api/repositories/local/log' },
     { label: 'Repository tickets', path: '/api/repositories/local/tickets' },
     { label: 'Runs', path: '/api/runs' },
     { label: 'Hosts', path: '/api/hosts' },
@@ -44,7 +42,6 @@
   let hosts = $state<ListResponse<Host> | null>(null);
   let workers = $state<ListResponse<Worker> | null>(null);
   let repository = $state<RepositorySummary | null>(null);
-  let repositoryLog = $state<RepositoryLogResponse | null>(null);
   let repositoryTickets = $state<RepositoryTicketsResponse | null>(null);
   let objectives = $state<ObjectiveListResponse | null>(null);
   let objectiveDetail = $state<ObjectiveDetail | null>(null);
@@ -53,7 +50,6 @@
   let hostsError = $state<string | null>(null);
   let workersError = $state<string | null>(null);
   let repositoryError = $state<string | null>(null);
-  let repositoryLogError = $state<string | null>(null);
   let repositoryTicketsError = $state<string | null>(null);
   let objectivesError = $state<string | null>(null);
   let objectiveDetailError = $state<string | null>(null);
@@ -108,16 +104,6 @@
     } catch (error) {
       repositoryError = error instanceof Error ? error.message : String(error);
       repository = null;
-    }
-  }
-
-  async function loadRepositoryLog() {
-    repositoryLogError = null;
-    try {
-      repositoryLog = await getJson<RepositoryLogResponse>('/api/repositories/local/log?limit=10');
-    } catch (error) {
-      repositoryLogError = error instanceof Error ? error.message : String(error);
-      repositoryLog = null;
     }
   }
 
@@ -196,16 +182,11 @@
     return value ?? 'not recorded';
   }
 
-  function shortHash(hash: string | null | undefined): string {
-    return hash ? hash.slice(0, 12) : 'unknown';
-  }
-
   $effect(() => {
     void loadWorkspace();
     void loadHosts();
     void loadWorkers();
     void loadRepository();
-    void loadRepositoryLog();
     void loadRepositoryTickets();
     void loadObjectives();
   });
@@ -237,116 +218,35 @@
 
   <main class="shell">
     {#if route.page === 'repository'}
-      <section class="grid runtime">
-        <div class="card">
-          <h2>Repository summary</h2>
-          {#if repository}
-            <dl>
-              <div>
-                <dt>ID</dt>
-                <dd><code>{repository.id}</code></dd>
-              </div>
-              <div>
-                <dt>Kind</dt>
-                <dd>{repository.kind}</dd>
-              </div>
-              <div>
-                <dt>Workspace root</dt>
-                <dd><code>{repository.workspace_root}</code></dd>
-              </div>
-              <div>
-                <dt>Record authority</dt>
-                <dd>{repository.record_authority}</dd>
-              </div>
-              <div>
-                <dt>Git</dt>
-                <dd>{repository.git.status}</dd>
-              </div>
-            </dl>
-          {:else if repositoryError}
-            <p class="error">{repositoryError}</p>
-          {:else}
-            <p>Waiting for <code>/api/repositories/local</code>…</p>
-          {/if}
-        </div>
-
-        <div class="card">
-          <h2>Git summary</h2>
-          {#if repository}
-            {#if repository.git.status === 'available'}
-              <dl>
-                <div>
-                  <dt>Root</dt>
-                  <dd><code>{repository.git.root ?? 'unknown'}</code></dd>
-                </div>
-                <div>
-                  <dt>Branch</dt>
-                  <dd>{repository.git.branch ?? 'unknown'}</dd>
-                </div>
-                <div>
-                  <dt>HEAD</dt>
-                  <dd><code>{shortHash(repository.git.head)}</code></dd>
-                </div>
-                <div>
-                  <dt>Dirty</dt>
-                  <dd>{repository.git.dirty === null || repository.git.dirty === undefined ? 'unknown' : repository.git.dirty ? 'yes' : 'no'} <small>{repository.git.dirty_scope}</small></dd>
-                </div>
-                <div>
-                  <dt>Remote</dt>
-                  <dd>
-                    {#if repository.git.remote}
-                      <code>{repository.git.remote.name}</code> · {repository.git.remote.url}
-                      {#if repository.git.remote.redacted}<small>credentials redacted</small>{/if}
-                    {:else}
-                      not configured
-                    {/if}
-                  </dd>
-                </div>
-              </dl>
-            {:else}
-              <p>Git metadata is unavailable for this local Repository.</p>
-            {/if}
-          {:else if repositoryError}
-            <p class="error">{repositoryError}</p>
-          {:else}
-            <p>Waiting for Git summary…</p>
-          {/if}
-        </div>
-      </section>
-
       <section class="card">
-        <h2>Recent Git log</h2>
-        {#if repositoryLog}
-          {#if repositoryLog.items.length === 0}
-            <p>No recent commits are available from the bounded Git log API.</p>
-          {:else}
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Commit</th>
-                    <th>Subject</th>
-                    <th>Author</th>
-                    <th>Timestamp</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {#each repositoryLog.items as commit (commit.hash)}
-                    <tr>
-                      <td><code>{shortHash(commit.hash)}</code></td>
-                      <td>{commit.subject}</td>
-                      <td>{commit.author_name} <small>{commit.author_email}</small></td>
-                      <td>{commit.timestamp}</td>
-                    </tr>
-                  {/each}
-                </tbody>
-              </table>
+        <h2>Repository summary</h2>
+        {#if repository}
+          <dl>
+            <div>
+              <dt>ID</dt>
+              <dd><code>{repository.id}</code></dd>
             </div>
-          {/if}
-        {:else if repositoryLogError}
-          <p class="error">{repositoryLogError}</p>
+            <div>
+              <dt>Kind</dt>
+              <dd>{repository.kind}</dd>
+            </div>
+            <div>
+              <dt>Workspace root</dt>
+              <dd><code>{repository.workspace_root}</code></dd>
+            </div>
+            <div>
+              <dt>Record authority</dt>
+              <dd>{repository.record_authority}</dd>
+            </div>
+            <div>
+              <dt>Git</dt>
+              <dd>{repository.git.status}</dd>
+            </div>
+          </dl>
+        {:else if repositoryError}
+          <p class="error">{repositoryError}</p>
         {:else}
-          <p>Waiting for <code>/api/repositories/local/log</code>…</p>
+          <p>Waiting for <code>/api/repositories/local</code>…</p>
         {/if}
       </section>
 
@@ -364,7 +264,7 @@
         {/if}
       </section>
 
-      {@const repositoryDiagnostics = diagnosticsFor(repository?.git.diagnostics, repositoryLog?.diagnostics, repositoryTickets?.diagnostics)}
+      {@const repositoryDiagnostics = diagnosticsFor(repository?.git.diagnostics, repositoryTickets?.diagnostics)}
       {#if repositoryDiagnostics.length > 0}
         <section class="card diagnostics">
           <h2>Repository diagnostics</h2>
@@ -389,30 +289,22 @@
           {#if objectives.items.length === 0}
             <p>No Objective records are present.</p>
           {:else}
-            <div class="stack">
+            <div class="objective-list">
               {#each objectives.items as objective (objective.id)}
-                <article class="runtime-card selected-card" class:selected={route.page === 'objective' && route.objectiveId === objective.id}>
-                  <div class="runtime-heading">
-                    <strong>{objective.title}</strong>
-                    <span>{objective.state}</span>
+                <a class="objective-row" class:selected={route.page === 'objective' && route.objectiveId === objective.id} href={`/objectives/${objective.id}`}>
+                  <div class="objective-main">
+                    <div class="objective-title-row">
+                      <strong class="objective-title">{objective.title}</strong>
+                      <span class="state-pill">{objective.state}</span>
+                    </div>
+                    <p class="objective-summary">{objective.summary || 'No summary text is available.'}</p>
                   </div>
-                  <p>{objective.summary || 'No summary text is available.'}</p>
-                  <dl>
-                    <div>
-                      <dt>ID</dt>
-                      <dd><code>{objective.id}</code></dd>
-                    </div>
-                    <div>
-                      <dt>Updated</dt>
-                      <dd>{formatDate(objective.updated_at)}</dd>
-                    </div>
-                    <div>
-                      <dt>Linked tickets</dt>
-                      <dd>{objective.linked_tickets?.length ? objective.linked_tickets.join(', ') : 'none'}</dd>
-                    </div>
-                  </dl>
-                  <p><a href={`/objectives/${objective.id}`}>View detail</a></p>
-                </article>
+                  <div class="objective-meta" aria-label="Objective metadata">
+                    <span>Updated {formatDate(objective.updated_at)}</span>
+                    <span>{objective.linked_tickets?.length ? `${objective.linked_tickets.length} linked ticket(s)` : 'No linked tickets'}</span>
+                    <code>{objective.id}</code>
+                  </div>
+                </a>
               {/each}
             </div>
           {/if}
