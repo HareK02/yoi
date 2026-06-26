@@ -225,3 +225,22 @@ Residual risks / review focus:
 - `requested_worker_name` は authority として使わず、embedded Runtime 側の opaque worker id を採用。UX 的表示名が必要なら別 Ticket で profile/config bundle や display metadata の設計が必要。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZSGT0Q-embedded-runtime at: 2026-06-26T05:46:25Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+確認結果:
+- `RuntimeRegistry` に `LocalWorkerRuntime` と別種別の `EmbeddedWorkerRuntime` が登録され、`backend-internal` Runtime として summary/status/capabilities を返す構成になっている。
+- embedded 側は `worker_runtime::Runtime::new_memory` を保持し、worker list/detail/create/send input/transcript は adapter 経由で direct lib call している。REST/remote process/FS store/WebConsole/Profile sync などへの scope creep は見当たらない。
+- embedded Runtime summary/worker projection は endpoint/token/socket/session path/store path/provider credential を露出しておらず、capabilities も内部実装詳細を出さない形。
+- local compatibility source は `local-pod-runtime`、embedded source は `embedded-worker-runtime` として kind/diagnostics が分離されている。
+- API routing は detail/input/transcript が `/api/runtimes/{runtime_id}/workers/{worker_id}` 系で、worker_id-only の操作経路への回帰は見当たらない。
+- tests は registration/routing/projection/error/identity boundary を含み、embedded worker 作成・input acceptance・transcript projection と誤 runtime/worker の失敗系も確認されている。
+
+検証:
+- read-only 指示に従い、ビルド/テスト再実行やファイル変更は行わず、対象 commit の差分・実装・テストを静的確認した。報告済み validation 結果と矛盾する点はない。
+
+---
