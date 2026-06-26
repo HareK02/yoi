@@ -385,3 +385,22 @@ Scope:
 - SSE / WebSocket / Backend integration / dynamic registration / Web Console / full auth model は Non-goals として未実装。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T04:20:31Z -->
+
+## Implementation report
+
+Cleanup report:
+
+- Child Workers cleanup:
+  - `yoi-coder-00001KVZKSTE2-rest-server` was stopped one-by-one and scope reclaimed.
+  - `yoi-reviewer-00001KVZKSTE2-rest-server` StopPod retry reported `no spawned pod named`; `ListPods` then showed no spawned children remaining, so it was already gone from the spawned-child registry.
+- Child implementation worktree removed:
+  - `/home/hare/Projects/yoi/.worktree/00001KVZKSTE2-worker-runtime-rest-server`
+- Child implementation branch removed:
+  - `work/00001KVZKSTE2-worker-runtime-rest-server`
+
+Operational note:
+- StopPod will continue to be executed one-by-one rather than through parallel multi-tool execution.
+
+---
