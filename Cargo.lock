@@ -6036,6 +6036,7 @@ dependencies = [
  "pod-store",
  "project-record",
  "protocol",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
