@@ -535,3 +535,22 @@ Scope:
 - command tunnel / SSE / remote lifecycle/discovery / full auth-redaction policy / Web Console UI は Non-goals として未実装。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T05:16:51Z -->
+
+## Implementation report
+
+Cleanup report:
+
+- Child Workers stopped one-by-one and scope reclaimed:
+  - `yoi-coder-00001KVZKSTJT-ws-proxy`
+  - `yoi-reviewer-00001KVZKSTJT-ws-proxy`
+- Child implementation worktree removed:
+  - `/home/hare/Projects/yoi/.worktree/00001KVZKSTJT-websocket-observation-proxy`
+- Child implementation branch removed:
+  - `work/00001KVZKSTJT-websocket-observation-proxy`
+
+Operational note:
+- StopPod was executed sequentially, not in parallel.
+
+---
