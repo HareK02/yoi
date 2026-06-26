@@ -132,3 +132,91 @@ Scope notes:
 - Coder is instructed not to modify Ticket records and not to operate in root/orchestration worktrees.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KW2GCPYF-worker-console at: 2026-06-26T18:07:17Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装完了。merge / Ticket 更新 / close / cleanup は行っていない。
+
+Commit:
+- `c3fed591095244223e6da7c84ac7f1a2e4cf8cb7 feat: worker attach workspace console`
+
+変更概要:
+
+### UI / routing
+
+- 旧 canonical `/console` route を削除。
+  - `web/workspace/src/routes/console/+page.svelte` 削除。
+- 新 Console route を追加。
+  - `/runtimes/[runtimeId]/workers/[workerId]/console`
+  - Console target authority は `runtime_id + worker_id`。
+- standalone Console / Companion sidebar entry を削除。
+  - `CompanionNavSection.svelte` 削除。
+  - sidebar は Workers section から各 Worker Console へ attach する形に変更。
+- Workspace top Worker list に `Open Console` attach action を追加。
+- Companion は特別 route ではなく通常 Worker row として attach される想定に変更。
+
+### Worker Console
+
+- Backend Worker API のみを使う Console を追加。
+  - Worker detail: `/api/runtimes/{runtime_id}/workers/{worker_id}`
+  - bounded transcript: `/api/runtimes/{runtime_id}/workers/{worker_id}/transcript?limit=200`
+  - input: `/api/runtimes/{runtime_id}/workers/{worker_id}/input`
+  - observation WS: `/api/runtimes/{runtime_id}/workers/{worker_id}/events/ws`
+- Browser 側では Runtime endpoint / credential / socket path / session path を扱わない。
+- `protocol::Event` 由来の表示モデルを追加。
+  - user / assistant / thinking / tool / status / error / usage / snapshot / in-flight を区別表示。
+  - transcript-only item と observation event を source として分離。
+- streaming unsupported Worker には明示的 degrade 表示を追加。
+  - “bounded transcript + manual refresh” の経路を提示。
+- Worker detail / capabilities / diagnostics は右側 card の compact/collapsible 表示にして、transcript 幅を支配しない構成。
+
+### tests
+
+- Web Console projection/model tests 追加。
+  - protocol segment rendering
+  - event projection
+  - snapshot / in-flight state
+  - Worker target route href encoding
+- UI contract tests 追加。
+  - Worker list/sidebar が Worker Console href を使うこと。
+  - standalone Companion nav が canonical でないこと。
+  - Console page が backend Worker APIs を使い `/api/companion` を使わないこと。
+- `deno task test` を追加。
+
+主な変更ファイル:
+- `web/workspace/src/routes/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte`
+- `web/workspace/src/routes/runtimes/[runtimeId]/workers/[workerId]/console/+page.ts`
+- `web/workspace/src/lib/workspace-console/model.ts`
+- `web/workspace/src/lib/workspace-console/model.test.ts`
+- `web/workspace/src/lib/workspace-console/worker-console.ui.test.ts`
+- `web/workspace/src/lib/workspace-pages/WorkspacePage.svelte`
+- `web/workspace/src/lib/workspace-sidebar/WorkersNavSection.svelte`
+- `web/workspace/src/lib/workspace-sidebar/WorkspaceSidebar.svelte`
+- `web/workspace/src/lib/workspace-sidebar/types.ts`
+- `web/workspace/src/app.css`
+- `web/workspace/deno.json`
+- `web/workspace/tsconfig.json`
+
+削除:
+- `web/workspace/src/routes/console/+page.svelte`
+- `web/workspace/src/lib/workspace-sidebar/CompanionNavSection.svelte`
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo check -p yoi`: success
+- `cd web/workspace && deno task test`: success（6 tests passed）
+- `cd web/workspace && deno task check`: success（0 errors / 0 warnings）
+- `cd web/workspace && deno task build`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success（dirty tree warning は実装 commit 前の通常 warning。build 自体は完了）
+
+Residual risks / review focus:
+- 実 Runtime / live Worker に対するブラウザ手動操作は未実施。特に observation WS の実イベント順序と snapshot/in-flight 表示の見え方は reviewer 側で確認推奨。
+- `protocol::Event` projection は現在の generated protocol union を広く扱う実装だが、UI は raw trace viewer ではなく compact transcript 表示に寄せている。イベント種類ごとの表示粒度が過不足ないか確認してほしい。
+- `deno task test` の UI contract tests は component runtime harness ではなく、現行 Deno/Svelte 構成に合わせた focused contract tests。将来 component test harness が入るなら置き換え候補。
+
+---
