@@ -127,3 +127,25 @@ FS store、REST command server、WebSocket observation proxy、RuntimeRegistry f
 これ以降、worktree creation / coder Worker routing などの implementation side effect に進める。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T05:50:28Z -->
+
+## Implementation report
+
+Implementation kickoff:
+
+- Worktree created: `/home/hare/Projects/yoi/.worktree/00001KVZSGT14-remote-runtime-registry`
+- Branch: `work/00001KVZSGT14-remote-runtime-registry`
+- Coder Worker spawned: `yoi-coder-00001KVZSGT14-remote-runtime`
+
+Scope notes:
+- Coder has read access to the implementation worktree and non-recursive workspace root identity path needed by runtime startup.
+- Coder write scope is limited to `crates/workspace-server/**`, root `Cargo.toml`, `Cargo.lock`, and `package.nix` if dependency/package changes are needed.
+- Coder is instructed not to modify Ticket records and not to operate in root/orchestration worktrees.
+
+Queued capacity notes:
+- `00001KVZQHPNY` remains queued to avoid worker creation/config routing churn while remote Runtime source is inprogress.
+- `00001KVZ9JGK0` remains queued to avoid overlapping Backend/Web Console API surface changes while remote source routing stabilizes.
+- `00001KW04A8K6` remains queued because it depends on this remote Runtime source work.
+
+---
