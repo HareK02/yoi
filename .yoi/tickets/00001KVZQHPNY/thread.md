@@ -349,3 +349,28 @@ Residual risks / review focus:
 - Remote error message は全体的に sanitized されるため、詳細調査は backend/runtime logs 側を見る前提。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZQHPNY-config-bundles at: 2026-06-26T07:38:26Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+再レビュー結果: 前回ブロッカーは解消されていると判断する。
+
+確認内容:
+- `4867ab21 fix: harden runtime config bundle boundary` の差分と関連実装を読取専用で確認。
+- `git diff --check HEAD^ HEAD` は問題なし。
+- cargo/nix 系はファイル生成を避けるため再実行せず、報告された成功結果を前提確認扱い。
+
+確認できた解消点:
+- bundle id は path-safe に制限され、`/`, `?`, `&`, `#`, whitespace 等が拒否される。
+- digest は lowercase SHA-256 hex 64 chars として検証される。
+- `ConfigDeclaration.reference` は kind 別 prefix + token 制限になり、cache/session/socket/path 風・secret value 風の拒否テストも追加されている。
+- remote availability path は percent-encode され、Runtime 側でも unsafe id が拒否されるため remote/embedded の意味差が縮んでいる。
+- remote Runtime error の raw message は Backend 診断へ中継されず、Browser-facing result は HTTP status / remote code ベースにサニタイズされている。raw store/session path 非漏洩テストも確認。
+- builtin/default fallback と synced bundle mode の区別、typed error、sync/check API 境界は維持されている。
+- Plugin package manager/signature/WebConsole 方面の scope creep は見当たらない。
+- `package.nix` の `cargoHash` 更新も反映済み。
+
+---
