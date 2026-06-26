@@ -289,3 +289,63 @@ Review result: request_changes
 - package.nix の cargoHash は Cargo.lock 変更に合わせて更新されている。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZQHPNY-config-bundles at: 2026-06-26T07:34:04Z -->
+
+## Implementation report
+
+Follow-up implementation report after review request_changes:
+
+Commit:
+- `4867ab21 fix: harden runtime config bundle boundary`
+
+対応内容:
+
+### 1. Bundle content boundary 強化
+
+- `ConfigBundle` / `ConfigBundleRef` validation を強化。
+- Bundle id を path-safe stable identifier に制限。
+  - `/`, `?`, `&`, `#`, whitespace などを拒否。
+- digest を lowercase SHA-256 hex 64 chars として検証。
+- `ConfigDeclaration.reference` は free string のままにせず、kind ごとに許可 prefix を限定。
+  - `SecretRef`: `secret:`, `secret-ref:`, `vault:`, `keyring:`
+  - `MountGrant`: `mount:`, `mount-grant:`
+  - `NetworkPolicy`: `network:`, `network-policy:`
+  - `ShellPolicy`: `shell:`, `shell-policy:`
+  - `GitPolicy`: `git:`, `git-policy:`
+  - `CapabilityGrant`: `capability:`, `capability-grant:`
+- reference token では `/`, `\`, `?`, `&`, `#`, `%`, `=`, whitespace を拒否。
+- relative cache/session/socket/path-like forms を拒否するテストを追加。
+  - `.cache/yoi`
+  - `.yoi/sessions/foo.jsonl`
+  - `pods/foo/sock`
+  - `password=hunter2`
+  - `hunter2-secret-value`
+
+### 2. Remote availability check の path safety
+
+- Runtime 側で unsafe bundle id を拒否。
+- Remote client 側の bundle availability path construction で bundle id / digest を percent-encode。
+  - `bundle/1?x` が `/v1/config-bundles/bundle%2F1%3Fx/availability?...` になることを mock HTTP test で確認。
+- Direct/Embedded と Remote で path segment 解釈が分岐しにくいようにした。
+
+### 3. Browser-facing diagnostics の raw path leak 防止
+
+- Remote Runtime HTTP error diagnostic で remote error message をそのまま転送しないように変更。
+- Browser-facing diagnostic は remote code / HTTP status のみを含む sanitized message に変換。
+- mock remote response に raw store path / session path を含め、`ConfigBundleSyncResult` / `ConfigBundleCheckResult` に漏れないことをテスト追加。
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo test -p worker-runtime`: success（13 passed）
+- `cargo test -p yoi-workspace-server`: success（35 passed）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Residual risks / review focus:
+- `ConfigDeclaration.reference` は v0 として prefix/token allowlist で制限。将来、より構造化された enum payload に移す余地はある。
+- Secret ref は「値を同期しない」境界として typed prefix 必須にしたが、ref 名自体に何を許すかは今後 policy 化できる。
+- Remote error message は全体的に sanitized されるため、詳細調査は backend/runtime logs 側を見る前提。
+
+---
