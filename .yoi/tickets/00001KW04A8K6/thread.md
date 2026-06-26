@@ -152,3 +152,71 @@ Queue status:
 - This was the last queued Ticket in the current chain; no other queued Ticket remains pending in this acceptance pass.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KW04A8K6-tui-runtime at: 2026-06-26T08:43:52Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装完了。merge/close/cleanup は行っていない。
+
+Commit:
+- `63ec9f95 feat: add backend runtime console target`
+
+変更ファイル:
+- `Cargo.lock`
+- `crates/client/Cargo.toml`
+- `crates/client/src/backend_runtime.rs`
+- `crates/client/src/lib.rs`
+- `crates/tui/src/console/mod.rs`
+- `crates/tui/src/lib.rs`
+- `crates/yoi/src/main.rs`
+- `package.nix`
+
+実装概要:
+- `client` crate に Backend Runtime API 用クライアントを追加。
+  - authority は `Backend API base URL + runtime_id + worker_id`。
+  - Runtime endpoint / token / raw socket path / raw session path は TUI 側の authority として扱っていない。
+  - `POST /api/runtimes/{runtime_id}/workers/{worker_id}/input` で user/system input を送信。
+  - `POST .../cancel` / `POST .../stop` で cancel/stop を送信。
+  - `GET .../transcript` から初期 transcript 相当を TUI event に変換。
+  - `WS .../events/ws` で Backend-proxied Runtime observation stream を購読。
+  - cursor resume / duplicate sequence drop / cursor expiry diagnostic + reset/reconnect を実装。
+  - Backend diagnostic / unsupported command / HTTP decode/send failure は TUI に `Event::Error` として表示。
+- TUI Console に Backend Runtime 接続モードを追加。
+  - `LaunchMode::BackendRuntime { target }`
+  - 既存 Console rendering/composer/status の `App::handle_worker_event` へ `protocol::Event` を流して再利用。
+  - legacy socket path は `ConsoleConnection::LegacySocket` として明示分離。
+- CLI に Backend Runtime target selector を追加。
+  - `--backend <URL>`
+  - `--runtime-id <ID>` / alias `--runtime <ID>`
+  - `--worker-id <ID>`
+  - 3つは必須セット。
+  - `--worker` / `--socket` / `--session` / `--profile` との混在を拒否。
+  - help 上で `--socket` は compatibility/debug direct socket attach と明記。
+- Focused tests を追加。
+  - Backend command mapping。
+  - Backend WS URL generation using `runtime_id + worker_id`。
+  - Transcript projection → TUI Console event sequence。
+  - CLI Backend Runtime target parsing / incomplete identity rejection / legacy option mix rejection。
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo test -p tui`: success（382 passed）
+- `cargo test -p yoi parse_backend_runtime_target`: success（3 passed）
+- `cargo test -p client backend_runtime::tests`: success（3 passed）
+- `cargo check -p yoi`: success
+- `git diff --check` / `git diff HEAD --check`: success
+- `nix build .#yoi --no-link`: success
+
+Additional note:
+- `cargo test -p client` 全体も一度実行したが、既存の `ticket_role::tests::scaffold_config_allows_intake_and_orchestrator_launch_planning` が Lua builtin profile 評価エラーで失敗。今回追加した `backend_runtime::tests` は個別に成功。
+
+Residual risks / review focus:
+- Backend Runtime mode は既存 Backend endpoint 形状に合わせた薄い API client 実装で、Runtime routing / endpoint credential management は TUI 側に入れていない。
+- pause/resume/compact/rewind/completion lookup 等、Backend API にまだ対応 endpoint がない TUI commands は diagnostic 表示のみで送信しない。
+- 初期 transcript は Backend transcript projection から user/assistant chat event に変換。raw session log / provider trace は authority として使っていない。
+- default local spawn / legacy Worker-name attach 経路は既存互換として残る。Backend Runtime target 経路は `--backend + --runtime-id + --worker-id` による明示接続。
+
+---
