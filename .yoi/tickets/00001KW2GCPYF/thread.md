@@ -244,3 +244,39 @@ Review result: request_changes
 検証は read-only 方針に従い、ソース確認・`find`/`rg`・git 状態確認のみ実施しました。ビルド/テスト再実行は artifact/cache 作成の可能性があるため未実施です。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KW2GCPYF-worker-console at: 2026-06-26T18:19:12Z -->
+
+## Implementation report
+
+Follow-up implementation report after review request_changes:
+
+Commit:
+- `a1083908b681b420cd5fd911ac00da01ff8b7e5d fix: stabilize worker console refresh`
+
+修正内容:
+- Worker Console の target-change `$effect` が `refreshConsole()` を経由して `reloadToken += 1` する構造を解消。
+- `reloadToken` は rune state のまま、非 reactive な `nextReloadToken` から `advanceReloadToken()` で単調更新する形に変更。
+  - `reloadToken` 自体を同期 read/write しないため、target-change effect の dependency cycle を避ける。
+- 初期表示 / target-change refresh は `loadConsoleData(target)` を直接呼ぶように分離。
+- manual refresh は引き続き `advanceReloadToken()` してから Worker detail / transcript を再取得するため、WS reconnect semantics は維持。
+- observation WS effect は `worker + reloadToken + consoleTarget` に依存し、manual refresh / target-change で安定して reconnect。
+- focused static/contract test を追加・調整し、以下を確認。
+  - `reloadToken += 1` が残っていない。
+  - reload token advancement が `nextReloadToken` 経由。
+  - target-change effect が `refreshConsole()` 経由の dependency cycle に戻らない。
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo check -p yoi`: success
+- `cd web/workspace && deno task test`: success（6 passed）
+- `cd web/workspace && deno task check`: success（0 errors / 0 warnings）
+- `cd web/workspace && deno task build`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success（dirty tree warning は未 commit 差分によるもの。build は成功）
+
+Residual risks / review focus:
+- 実ブラウザ + live Worker での操作確認は未実施。
+- 今回の fix は Svelte runes の dependency loop 解消に絞っている。WS の実接続タイミングや stale async response の UX は既存設計の範囲。
+
+---
