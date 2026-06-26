@@ -460,3 +460,23 @@ Residual risks / review focus:
 - v0 cursor/backlog は引き続き in-memory bounded。再起動 / eviction 後は unknown/expired cursor diagnostic。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZKSTJT-ws-proxy at: 2026-06-26T05:15:04Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+読取専用で follow-up commit `8cc9a594f78feef62aa7abd5bbf11b5cd40b4781` を確認した。前回 blockers は解消済み。
+
+確認した点:
+- `RuntimeWsObservationClient::next_event` が Runtime diagnostic を `backend.*` typed diagnostic にマップし、`runtime.cursor_unknown_or_expired` / `runtime.worker_not_found` 等を `backend.upstream_disconnect` に潰さなくなっている。
+- 実際の socket close / receive error は引き続き `backend.upstream_disconnect` として区別されている。
+- Runtime WS connect の HTTP 404 が `backend.worker_not_found` にマップされている。
+- 追加テストで Backend unknown cursor、Runtime cursor diagnostic mapping、Runtime worker-not-found 404 mapping、actual upstream disconnect が検証されている。
+- Client-facing envelope は `cursor`, `event_id`, `runtime_id`, `worker_id`, `payload: protocol::Event` のみで、Runtime endpoint/token/socket/session path は含まれていない。
+- observation-only 境界を壊す command tunnel / SSE / lifecycle / full auth redesign の scope creep は見当たらない。
+
+検証は read-only inspection のみで、cargo/nix は再実行していない。
+
+---
