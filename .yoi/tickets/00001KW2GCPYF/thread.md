@@ -360,3 +360,22 @@ Scope:
 - Advanced controls / multi-worker split / raw provider trace viewer / full auth-redaction policy は Non-goals として未実装。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T18:22:51Z -->
+
+## Implementation report
+
+Cleanup report:
+
+- Child Workers stopped one-by-one and scope reclaimed:
+  - `yoi-coder-00001KW2GCPYF-worker-console`
+  - `yoi-reviewer-00001KW2GCPYF-worker-console`
+- Child implementation worktree removed:
+  - `/home/hare/Projects/yoi/.worktree/00001KW2GCPYF-worker-console-redesign`
+- Child implementation branch removed:
+  - `work/00001KW2GCPYF-worker-console-redesign`
+
+Operational note:
+- StopPod was executed sequentially, not in parallel.
+
+---
