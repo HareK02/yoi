@@ -274,3 +274,107 @@ Next action:
 - Wait for Coder implementation report, then route to reviewer.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZKSTJT-ws-proxy at: 2026-06-26T04:56:04Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装完了。Ticket ファイル / project records は変更していない。merge / close / cleanup 前で停止。
+
+Commit:
+- `9807accaf08f4322763dd7cd3536baf3dab8d10e feat: add worker observation websocket proxy`
+
+変更概要:
+
+### worker-runtime
+
+変更ファイル:
+- `crates/worker-runtime/Cargo.toml`
+- `crates/worker-runtime/src/observation.rs`
+- `crates/worker-runtime/src/runtime.rs`
+- `crates/worker-runtime/src/http_server.rs`
+
+実装内容:
+- optional feature `ws-server` を追加。
+  - `http-server` に加えて `axum/ws`, `protocol`, `futures`, `tokio/sync` を使用。
+  - feature 無効時の core compile も確認済み。
+- Runtime 側に Worker-scoped observation backlog / bus を追加。
+  - Runtime-local opaque cursor: `wo_<hex sequence>`
+  - bounded in-memory backlog v0
+  - `observe_worker_event(worker_ref, protocol::Event)` で `protocol::Event` payload をそのまま observation bus に投入。
+- Runtime HTTP server に worker-scoped WS endpoint を追加。
+  - `GET /v1/workers/{worker_id}/events/ws?cursor=...`
+- Runtime WS frame:
+  - `RuntimeWorkerEventWsFrame::Event { envelope }`
+  - `RuntimeWorkerEventWsFrame::Diagnostic { diagnostic }`
+- Runtime WS envelope:
+  - `cursor`
+  - `event_id`
+  - `worker_id`
+  - `payload: protocol::Event`
+- 接続時に `protocol::Event::Snapshot` を初期 projection として送信。
+- live update は observation bus の `protocol::Event` payload を転送。
+- client からの text/binary 等の入力は `runtime.observation_only` diagnostic で終了。
+- malformed cursor / unknown-or-expired cursor / worker not found / bus closed / lagged backlog などを typed diagnostic/error 化。
+
+### workspace-server
+
+変更ファイル:
+- `crates/workspace-server/Cargo.toml`
+- `crates/workspace-server/src/lib.rs`
+- `crates/workspace-server/src/observation.rs`
+- `crates/workspace-server/src/server.rs`
+
+実装内容:
+- Backend-owned observation proxy module を追加。
+- Runtime WS client を追加。
+  - Runtime WS envelope を decode。
+  - 内部表現として `runtime_id + worker_id + runtime_cursor + protocol::Event` を保持。
+- Backend client-facing WS endpoint を追加。
+  - `GET /api/runtimes/{runtime_id}/workers/{worker_id}/events/ws?cursor=...`
+- Backend-local cursor/envelope を追加。
+  - Backend cursor: `bo_<hex sequence>`
+  - Runtime endpoint / credential / socket / session path は client-facing payload に出さない。
+- Backend client-facing frame:
+  - `ClientWorkerEventWsFrame::Event { envelope }`
+  - `ClientWorkerEventWsFrame::Diagnostic { diagnostic }`
+- Backend client-facing envelope:
+  - `cursor`
+  - `event_id`
+  - `runtime_id`
+  - `worker_id`
+  - `payload: protocol::Event`
+- Backend source config は server 内部設定 `runtime_event_sources` として保持。
+- unknown worker/runtime source, malformed/unknown cursor, upstream disconnect, malformed upstream frame, observation-only client input を typed diagnostic/error 化。
+
+### workspace/root/package
+
+変更ファイル:
+- `Cargo.toml`
+- `Cargo.lock`
+- `package.nix`
+
+内容:
+- `tokio-tungstenite = "0.29"` を workspace dependency に追加。
+- `package.nix` の `cargoHash` を更新。
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo check -p worker-runtime`: success
+- `cargo test -p worker-runtime --features ws-server`: success（14 lib tests + 3 bin tests + doctests）
+- `cargo test -p yoi-workspace-server`: success（22 lib tests + bin/doctests）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `git diff --check --cached`: success
+- `nix build .#yoi --no-link`: success
+
+Review focus / residual risks:
+- v0 backlog は in-memory bounded。process restart / memory eviction 後の cursor は unknown/expired 扱い。
+- Runtime Snapshot projection は minimal projection。`protocol::Event::Snapshot` を使うが、entries / in-flight は現 Runtime adapter の範囲で空 projection。
+- Backend source discovery は `runtime_event_sources` 内部 config seam。remote lifecycle/discovery や full registry redesign は Non-goals として未実装。
+- Auth/redaction/policy は full 実装せず、後続拡張しやすい typed source/diagnostic/proxy boundary に留めた。
+- Browser / future TUI には Backend endpoint のみを公開し、Runtime endpoint / credential / socket / session path は envelope に含めていない。
+
+---
