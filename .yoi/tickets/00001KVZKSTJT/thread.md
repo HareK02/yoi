@@ -378,3 +378,26 @@ Review focus / residual risks:
 - Browser / future TUI には Backend endpoint のみを公開し、Runtime endpoint / credential / socket / session path は envelope に含めていない。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZKSTJT-ws-proxy at: 2026-06-26T05:02:45Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+読取専用で `9807acc...` の実装を確認した。`protocol::Event` payload の pass-through、Runtime/Backend の envelope 分離、observation-only 入力診断、Client envelope から Runtime endpoint/token/socket/session path を出さない点、`worker-runtime` の `ws-server` cfg 境界は概ね Ticket 意図に沿っている。
+
+ただし、以下は受け入れ条件上の blocker。
+
+1. Backend Runtime WS client の upstream 診断が型を失っている
+- `crates/workspace-server/src/observation.rs` の `RuntimeWsObservationClient::next_event` で、Runtime からの `RuntimeWorkerEventWsFrame::Diagnostic` をすべて `ObservationProxyError::UpstreamDisconnect` に畳み込んでいる。
+- そのため Runtime 側の `runtime.cursor_unknown_or_expired` / `runtime.worker_not_found` 等が Client-facing では `backend.upstream_disconnect` になり、Ticket 要件の「worker not found / unknown cursor / expired cursor / upstream disconnect を typed diagnostic として扱う」を満たさない。
+- 同様に Runtime WS connect 時の HTTP 404 等も `RuntimeUnavailable` 扱いで、worker-not-found として区別されない。
+
+2. 必須テストカバレッジが不足している
+- Ticket 受け入れ条件では、expired/unknown cursor diagnostics、upstream disconnect diagnostics、worker-scoped filtering 等の WS proxy tests が要求されている。
+- 現状確認できたテストは Runtime 側の snapshot/live/resume/filter と malformed cursor/observation-only、Backend 側の snapshot/live/resume/malformed cursor/observation-only が中心で、Backend の unknown/expired cursor、Runtime upstream diagnostic の型変換、upstream disconnect、Runtime worker-not-found 経路を検証していない。
+
+上記を修正し、Runtime diagnostic / HTTP failure を Backend の typed diagnostic に適切にマップするテストを追加すれば、設計境界自体は approve に近い状態。
+
+---
