@@ -220,3 +220,31 @@ Residual risks / review focus:
 - WS observation は backend-private source fallback を追加。実 remote WS e2e は mock HTTP unit test ではなく既存 proxy tests + source生成テストでの確認に留めている。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZSGT14-remote-runtime at: 2026-06-26T06:21:31Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+ブロッカー:
+
+- `RuntimeObservationSourceConfig` が `#[derive(Debug)]` のまま `endpoint` と `bearer_token` を保持している（`crates/workspace-server/src/observation.rs:13-19`）。さらに `BackendObservationProxy` も `#[derive(Debug)]` でこの source map を内包している（`observation.rs:184-187`）。
+- remote source ではここに実 remote WS endpoint と token が入る（`hosts.rs:1642-1647`）ため、`format!("{:?}", source/proxy)` や将来の debug log で base URL / direct endpoint / bearer token が漏れる。
+- ユーザー指定の focus「API/WS payloads or Debug/log-worthy types で漏らさない」に反している。
+
+確認できた良い点:
+- Browser-facing REST API は概ね `runtime_id + worker_id` routing になっており、worker_id-only route は見当たらない。
+- remote command は Backend-owned `reqwest::blocking` REST client、observation は Backend-owned WS proxy/client 境界で実装されている。
+- API/WS の通常 payload 型には remote base URL/token/direct endpoint は載っていない。
+- auth/timeout/unsupported/remote error/worker-not-found は typed diagnostic/error に寄せる実装になっている。
+- dynamic registration / full auth / WebConsole / Profile sync への scope creep は見当たらない。
+- `reqwest::blocking` は async handler 内で Tokio worker を最大 timeout 分ブロックするリスクがあるが、v0 の同期 `RuntimeRegistry` 境界かつ timeout ありなら今回は許容可能な設計負債と判断する。
+
+必要な修正:
+- `RuntimeObservationSourceConfig` と、それを内包する debug/log-worthy 型の `Debug` を手書き redaction にするか derive を外す。
+- base URL / endpoint / token が `Debug` 出力に含まれない focused test を追加する。
+
+検証: read-only で対象 commit/diff/source/tests を確認。テスト実行は未実施。
+
+---
