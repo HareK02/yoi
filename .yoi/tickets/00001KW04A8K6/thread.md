@@ -257,3 +257,58 @@ Review result: approve
 報告されている `cargo test -p client` full の既存 Lua builtin profile failure は、この差分の focused validation 上は blocker ではないと判断する。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T08:54:28Z -->
+
+## Implementation report
+
+Integration / validation report:
+
+Integration:
+- Implementation branch `work/00001KW04A8K6-tui-runtime-api` を orchestration branch に merge 済み。
+- Merge commit: `0a683bb2 merge: 00001KW04A8K6 tui runtime migration`
+
+Included implementation commit:
+- `63ec9f95 feat: add backend runtime console target`
+
+Validation in Orchestrator worktree:
+- `cargo fmt --all --check`: success
+- `cargo test -p tui`: success（382 tests passed）
+- `cargo test -p yoi parse_backend_runtime_target`: success（3 tests passed）
+- `cargo test -p client backend_runtime::tests`: success（3 tests passed）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Review:
+- Reviewer approve 済み。Backend API authority、`runtime_id + worker_id` target、event adapter、cursor/reconnect diagnostic、legacy/debug path separation に blocker なし。
+
+Outcome:
+- Acceptance criteria を満たしたため `done` へ進める。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-26T08:54:39Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+TUI Runtime API / WebSocket migration の実装、review、merge、Orchestrator validation が完了した。
+
+Done evidence:
+- Merge commit: `0a683bb2 merge: 00001KW04A8K6 tui runtime migration`
+- Reviewer approve 済み。
+- Orchestrator validation:
+  - `cargo fmt --all --check`: success
+  - `cargo test -p tui`: success（382 tests passed）
+  - `cargo test -p yoi parse_backend_runtime_target`: success（3 tests passed）
+  - `cargo test -p client backend_runtime::tests`: success（3 tests passed）
+  - `cargo check -p yoi`: success
+  - `git diff --check`: success
+  - `nix build .#yoi --no-link`: success
+
+Scope:
+- Backend Runtime API / Backend-proxied WebSocket observation stream を TUI Console target として追加。
+- Legacy direct socket attach は compatibility/debug path として明示分離。
+- Full auth/multi-user permission model / raw session migration / perfect legacy socket compatibility は Non-goals として未実装。
+
+---
