@@ -153,3 +153,75 @@ Queued capacity note:
 - Remote/WebConsole/TUI dependent Tickets remain queued until embedded/remote prerequisite chain is done.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZSGT0Q-embedded-runtime at: 2026-06-26T05:41:14Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装完了。現在のブランチにコミット済み。
+
+Commit:
+- `c8209285 feat: add embedded workspace runtime registry`
+
+変更ファイル:
+- `crates/workspace-server/src/hosts.rs`
+- `crates/workspace-server/src/server.rs`
+
+実装概要:
+- `RuntimeRegistry` に backend-internal な embedded `worker_runtime::Runtime` source を追加。
+  - `EmbeddedWorkerRuntime::new_memory(...)`
+  - `RuntimeRegistry::for_workspace(...)`
+  - `RuntimeRegistry::register(...)`
+- local compatibility source は既存の `local-worker-runtime` として維持し、embedded source は `embedded-worker-runtime` として distinct な kind / diagnostics に分離。
+- embedded Runtime は browser/API に対して以下を露出しない projection にしている。
+  - HTTP endpoint
+  - token / credential
+  - socket / session path
+  - store path
+  - provider identity
+- Worker 操作は `runtime_id + worker_id` で routing。
+  - worker create
+  - worker detail
+  - input acceptance
+  - bounded transcript projection
+- v0 として in-memory / tools-less Worker create を実装。
+  - Ticket role では builtin profile fallback (`builtin:coder` など)
+  - Workspace companion/orchestrator では runtime default profile fallback
+- `SocketReady` acceptance は embedded Runtime では明示的に reject。
+
+追加/拡張 API:
+- `POST /api/runtimes/{runtime_id}/workers`
+- `GET /api/runtimes/{runtime_id}/workers/{worker_id}`
+- `POST /api/runtimes/{runtime_id}/workers/{worker_id}/input`
+- `GET /api/runtimes/{runtime_id}/workers/{worker_id}/transcript?start=...&limit=...`
+
+既存 API への反映:
+- `GET /api/runtimes`
+- `GET /api/workers`
+にも embedded runtime / embedded worker projection が載る。
+
+テスト:
+- embedded runtime registration / routing
+- local compatibility source と embedded source の分離
+- embedded Worker create
+- input acceptance
+- transcript projection
+- wrong runtime_id での worker 操作が通らないこと
+- browser-facing projection に内部 path / credential / socket/session 類が混ざらないこと
+- `SocketReady` acceptance が embedded Runtime で reject されること
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo test -p yoi-workspace-server`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Residual risks / review focus:
+- v0 は intentionally in-memory + tools-less Worker。LLM 実行、remote Runtime process client、FS store、REST command server、event stream server、Web Console、Profile/config sync は未実装。
+- embedded runtime の API projection は内部情報を出さない方針だが、diagnostics / evidence / summary JSON に internal identity が混ざっていないか要確認。
+- `requested_worker_name` は authority として使わず、embedded Runtime 側の opaque worker id を採用。UX 的表示名が必要なら別 Ticket で profile/config bundle や display metadata の設計が必要。
+
+---
