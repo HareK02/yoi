@@ -340,3 +340,57 @@ Review result: approve
 - read-only の静的確認と `git diff --check` 相当の確認。テスト/ビルドはファイル生成を避けるため再実行せず、報告内容と実装・テスト追加を照合した。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T08:08:06Z -->
+
+## Implementation report
+
+Integration / validation report:
+
+Integration:
+- Implementation branch `work/00001KVZ9JGK0-web-console-mvp` を orchestration branch に merge 済み。
+- Merge commit: `bf834e83 merge: 00001KVZ9JGK0 web console mvp`
+
+Included implementation commit:
+- `f3ad9c96b3fd48b5afce2a46b9c46efc5dce16f6 feat: add workspace companion console MVP`
+
+Validation in Orchestrator worktree:
+- `cargo fmt --all --check`: success
+- `cargo test -p yoi-workspace-server`: success（36 tests passed）
+- `cargo check -p yoi`: success
+- `cd web/workspace && deno task check`: success（0 errors / 0 warnings）
+- `cd web/workspace && deno task build`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Review:
+- Reviewer approve 済み。provider-less boundary honesty、authority non-leak、prompt resource boundary、typed UI/API state、MVP scope に blocker なし。
+
+Outcome:
+- Acceptance criteria を満たしたため `done` へ進める。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-26T08:08:16Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Backend internal Companion Runtime / Web Console MVP の実装、review、merge、Orchestrator validation が完了した。
+
+Done evidence:
+- Merge commit: `bf834e83 merge: 00001KVZ9JGK0 web console mvp`
+- Reviewer approve 済み。
+- Orchestrator validation:
+  - `cargo fmt --all --check`: success
+  - `cargo test -p yoi-workspace-server`: success（36 tests passed）
+  - `cargo check -p yoi`: success
+  - `cd web/workspace && deno task check`: success
+  - `cd web/workspace && deno task build`: success
+  - `git diff --check`: success
+  - `nix build .#yoi --no-link`: success
+
+Scope:
+- Backend internal tools-less Companion Worker と provider-less Web Console MVP を追加。
+- Full TUI parity / tool call UI / file/diff viewer / thinking grouping / multi Worker attach / real provider-backed Companion execution は Non-goals として未実装。
+
+---

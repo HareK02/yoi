@@ -1,8 +1,8 @@
 ---
 title: 'Backend内蔵Companion RuntimeとWeb Console MVP'
-state: 'inprogress'
+state: 'done'
 created_at: '2026-06-25T11:45:17Z'
-updated_at: '2026-06-26T08:07:24Z'
+updated_at: '2026-06-26T08:08:16Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-25T20:34:27Z'
