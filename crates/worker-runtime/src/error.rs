@@ -34,6 +34,34 @@ pub enum RuntimeError {
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
+    #[error("config bundle `{bundle_id}` was not found")]
+    ConfigBundleMissing { bundle_id: String },
+
+    #[error(
+        "config bundle `{bundle_id}` digest mismatch: expected {expected_digest}, got {actual_digest}"
+    )]
+    ConfigBundleDigestMismatch {
+        bundle_id: String,
+        expected_digest: String,
+        actual_digest: String,
+    },
+
+    #[error("invalid profile selector `{profile}` for config bundle {bundle_id:?}: {message}")]
+    InvalidProfileSelector {
+        profile: String,
+        bundle_id: Option<String>,
+        message: String,
+    },
+
+    #[error(
+        "config bundle `{bundle_id}` contains unsupported declaration `{declaration_kind}` named `{name}`"
+    )]
+    UnsupportedConfigDeclaration {
+        bundle_id: String,
+        declaration_kind: String,
+        name: String,
+    },
+
     #[error("runtime store {operation} failed at {}: {source}", path.display())]
     StoreIo {
         operation: &'static str,

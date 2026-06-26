@@ -1,5 +1,10 @@
 use crate::catalog::{
-    CreateWorkerRequest, WorkerDetail, WorkerLifecycleAck, WorkerStatus, WorkerSummary,
+    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerDetail, WorkerLifecycleAck,
+    WorkerStatus, WorkerSummary,
+};
+use crate::config_bundle::{
+    ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary, validate_config_bundle,
+    validate_config_bundle_ref, validate_profile_selector,
 };
 use crate::diagnostics::{DiagnosticSeverity, RuntimeDiagnostic};
 use crate::error::RuntimeError;
@@ -16,9 +21,15 @@ use crate::observation::{
     EventCursor, EventSubscription, EventSubscriptionMode, RuntimeEvent, RuntimeEventBatch,
     RuntimeEventKind, TranscriptEntry, TranscriptProjection, TranscriptQuery, TranscriptRole,
 };
+#[cfg(feature = "ws-server")]
+use crate::observation::{WorkerObservationCursor, WorkerObservationEvent};
 use std::collections::BTreeMap;
+#[cfg(feature = "ws-server")]
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+#[cfg(feature = "ws-server")]
+use tokio::sync::broadcast;
 
 static NEXT_RUNTIME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -122,6 +133,45 @@ impl Runtime {
         Ok(self.lock()?.status)
     }
 
+    /// Store a backend-synced Profile/config bundle for later Worker creation.
+    pub fn store_config_bundle(
+        &self,
+        bundle: ConfigBundle,
+    ) -> Result<ConfigBundleAvailability, RuntimeError> {
+        validate_config_bundle(&bundle)?;
+        let mut state = self.lock()?;
+        state.ensure_running()?;
+        let reference = ConfigBundleRef {
+            id: bundle.metadata.id.clone(),
+            digest: bundle.metadata.digest.clone(),
+        };
+        let summary = bundle.summary();
+        state
+            .config_bundles
+            .insert(bundle.metadata.id.clone(), bundle);
+        state.persist_runtime_snapshot()?;
+        Ok(ConfigBundleAvailability { reference, summary })
+    }
+
+    /// List synced config bundles known to this Runtime.
+    pub fn list_config_bundles(&self) -> Result<Vec<ConfigBundleSummary>, RuntimeError> {
+        Ok(self
+            .lock()?
+            .config_bundles
+            .values()
+            .map(ConfigBundle::summary)
+            .collect())
+    }
+
+    /// Validate that a config bundle reference is present and digest-matched.
+    pub fn check_config_bundle(
+        &self,
+        reference: &ConfigBundleRef,
+    ) -> Result<ConfigBundleAvailability, RuntimeError> {
+        let state = self.lock()?;
+        state.check_config_bundle_ref(reference)
+    }
+
     /// Stop the Runtime.  v0 keeps data readable after stop, but rejects new
     /// create/send/worker lifecycle mutations.
     pub fn stop_runtime(&self) -> Result<u64, RuntimeError> {
@@ -155,6 +205,7 @@ impl Runtime {
         let mut state = self.lock()?;
         state.ensure_running()?;
         validate_create_worker_request(&request)?;
+        state.validate_worker_config_boundary(&request)?;
 
         let worker_id = WorkerId::generated(state.next_worker_sequence);
         state.next_worker_sequence += 1;
@@ -395,6 +446,88 @@ impl Runtime {
         })
     }
 
+    /// Cursor pointing after the current worker-scoped protocol observation event.
+    #[cfg(feature = "ws-server")]
+    pub fn worker_observation_cursor_now(
+        &self,
+        worker_ref: &WorkerRef,
+    ) -> Result<WorkerObservationCursor, RuntimeError> {
+        let state = self.lock()?;
+        state.ensure_worker_ref(worker_ref)?;
+        let sequence = state
+            .observation_events
+            .iter()
+            .rev()
+            .find(|event| &event.worker_ref == worker_ref)
+            .map(|event| event.sequence)
+            .unwrap_or(0);
+        Ok(WorkerObservationCursor::new(sequence))
+    }
+
+    /// Build the current Worker Snapshot event used as the first observation frame.
+    #[cfg(feature = "ws-server")]
+    pub fn worker_observation_snapshot(
+        &self,
+        worker_ref: &WorkerRef,
+    ) -> Result<protocol::Event, RuntimeError> {
+        let state = self.lock()?;
+        let _worker = state.worker(worker_ref)?;
+        Ok(protocol::Event::Snapshot {
+            entries: Vec::new(),
+            greeting: protocol::Greeting {
+                worker_name: worker_ref.worker_id.to_string(),
+                cwd: String::new(),
+                provider: "worker-runtime".to_string(),
+                model: "worker-runtime".to_string(),
+                scope_summary: "runtime worker observation".to_string(),
+                tools: Vec::new(),
+                context_window: 0,
+                context_tokens: 0,
+            },
+            status: protocol::WorkerStatus::Idle,
+            in_flight: protocol::InFlightSnapshot { blocks: Vec::new() },
+        })
+    }
+
+    /// Replay retained worker-scoped protocol observation events after a cursor.
+    #[cfg(feature = "ws-server")]
+    pub fn read_worker_observation_events(
+        &self,
+        worker_ref: &WorkerRef,
+        cursor: WorkerObservationCursor,
+    ) -> Result<Vec<WorkerObservationEvent>, RuntimeError> {
+        let state = self.lock()?;
+        state.ensure_worker_ref(worker_ref)?;
+        state.validate_worker_observation_cursor(worker_ref, cursor)?;
+        Ok(state
+            .observation_events
+            .iter()
+            .filter(|event| &event.worker_ref == worker_ref && event.sequence > cursor.sequence)
+            .cloned()
+            .collect())
+    }
+
+    /// Subscribe to live protocol observation events.
+    #[cfg(feature = "ws-server")]
+    pub fn subscribe_worker_observation(
+        &self,
+    ) -> Result<broadcast::Receiver<WorkerObservationEvent>, RuntimeError> {
+        Ok(self.lock()?.observation_tx.subscribe())
+    }
+
+    /// Append a Worker protocol event to the observation bus.
+    #[cfg(feature = "ws-server")]
+    pub fn observe_worker_event(
+        &self,
+        worker_ref: &WorkerRef,
+        payload: protocol::Event,
+    ) -> Result<WorkerObservationEvent, RuntimeError> {
+        let mut state = self.lock()?;
+        state.ensure_worker_ref(worker_ref)?;
+        let event = state.push_worker_observation_event(worker_ref.clone(), payload);
+        Ok(event)
+    }
+
     /// Snapshot current diagnostics.
     pub fn diagnostics(&self) -> Result<Vec<RuntimeDiagnostic>, RuntimeError> {
         Ok(self.lock()?.diagnostics.clone())
@@ -463,8 +596,15 @@ struct RuntimeState {
     next_event_id: u64,
     next_diagnostic_id: u64,
     workers: BTreeMap<WorkerId, WorkerRecord>,
+    config_bundles: BTreeMap<String, ConfigBundle>,
     events: Vec<RuntimeEvent>,
     diagnostics: Vec<RuntimeDiagnostic>,
+    #[cfg(feature = "ws-server")]
+    next_observation_sequence: u64,
+    #[cfg(feature = "ws-server")]
+    observation_events: VecDeque<WorkerObservationEvent>,
+    #[cfg(feature = "ws-server")]
+    observation_tx: broadcast::Sender<WorkerObservationEvent>,
 }
 
 impl RuntimeState {
@@ -480,8 +620,15 @@ impl RuntimeState {
             next_event_id: 1,
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
+            config_bundles: BTreeMap::new(),
             events: Vec::new(),
             diagnostics: Vec::new(),
+            #[cfg(feature = "ws-server")]
+            next_observation_sequence: 1,
+            #[cfg(feature = "ws-server")]
+            observation_events: VecDeque::new(),
+            #[cfg(feature = "ws-server")]
+            observation_tx: broadcast::channel(256).0,
         }
     }
 
@@ -503,8 +650,15 @@ impl RuntimeState {
             next_event_id: 1,
             next_diagnostic_id: 1,
             workers: BTreeMap::new(),
+            config_bundles: BTreeMap::new(),
             events: Vec::new(),
             diagnostics: Vec::new(),
+            #[cfg(feature = "ws-server")]
+            next_observation_sequence: 1,
+            #[cfg(feature = "ws-server")]
+            observation_events: VecDeque::new(),
+            #[cfg(feature = "ws-server")]
+            observation_tx: broadcast::channel(256).0,
         }
     }
 
@@ -552,6 +706,7 @@ impl RuntimeState {
             next_event_id: persisted.next_event_id,
             next_diagnostic_id: persisted.next_diagnostic_id,
             workers,
+            config_bundles: persisted.config_bundles,
             events: persisted.events,
             diagnostics: persisted.diagnostics,
         })
@@ -572,6 +727,7 @@ impl RuntimeState {
                 .iter()
                 .map(|(worker_id, worker)| (worker_id.clone(), worker.persisted_record()))
                 .collect(),
+            config_bundles: self.config_bundles.clone(),
             events: self.events.clone(),
             diagnostics: self.diagnostics.clone(),
         }
@@ -704,6 +860,65 @@ impl RuntimeState {
         }
     }
 
+    fn check_config_bundle_ref(
+        &self,
+        reference: &ConfigBundleRef,
+    ) -> Result<ConfigBundleAvailability, RuntimeError> {
+        validate_config_bundle_ref(reference)?;
+        let bundle = self.config_bundles.get(&reference.id).ok_or_else(|| {
+            RuntimeError::ConfigBundleMissing {
+                bundle_id: reference.id.clone(),
+            }
+        })?;
+        if bundle.metadata.digest != reference.digest {
+            return Err(RuntimeError::ConfigBundleDigestMismatch {
+                bundle_id: reference.id.clone(),
+                expected_digest: reference.digest.clone(),
+                actual_digest: bundle.metadata.digest.clone(),
+            });
+        }
+        Ok(ConfigBundleAvailability {
+            reference: reference.clone(),
+            summary: bundle.summary(),
+        })
+    }
+
+    fn validate_worker_config_boundary(
+        &self,
+        request: &CreateWorkerRequest,
+    ) -> Result<(), RuntimeError> {
+        match &request.config_bundle {
+            Some(reference) => {
+                let availability = self.check_config_bundle_ref(reference)?;
+                let bundle = self
+                    .config_bundles
+                    .get(&availability.reference.id)
+                    .ok_or_else(|| RuntimeError::ConfigBundleMissing {
+                        bundle_id: availability.reference.id.clone(),
+                    })?;
+                if !bundle.contains_profile(&request.profile) {
+                    return Err(RuntimeError::InvalidProfileSelector {
+                        profile: profile_label(&request.profile),
+                        bundle_id: Some(reference.id.clone()),
+                        message: "profile selector is not declared by synced config bundle"
+                            .to_string(),
+                    });
+                }
+                Ok(())
+            }
+            None => match &request.profile {
+                ProfileSelector::RuntimeDefault | ProfileSelector::Builtin(_) => {
+                    validate_profile_selector(request.profile.clone(), None)
+                }
+                ProfileSelector::Named(_) => Err(RuntimeError::InvalidProfileSelector {
+                    profile: profile_label(&request.profile),
+                    bundle_id: None,
+                    message: "named profiles require a synced config bundle reference".to_string(),
+                }),
+            },
+        }
+    }
+
     fn ensure_worker_ref(&self, worker_ref: &WorkerRef) -> Result<(), RuntimeError> {
         if worker_ref.runtime_id != self.runtime_id {
             return Err(RuntimeError::WrongRuntime {
@@ -760,6 +975,54 @@ impl RuntimeState {
 
     fn last_event_id(&self) -> u64 {
         self.next_event_id.saturating_sub(1)
+    }
+
+    #[cfg(feature = "ws-server")]
+    fn validate_worker_observation_cursor(
+        &self,
+        worker_ref: &WorkerRef,
+        cursor: WorkerObservationCursor,
+    ) -> Result<(), RuntimeError> {
+        if let Some(first) = self
+            .observation_events
+            .iter()
+            .find(|event| &event.worker_ref == worker_ref)
+        {
+            if cursor.sequence != 0 && cursor.sequence < first.sequence {
+                return Err(RuntimeError::InvalidRequest(format!(
+                    "worker observation cursor {} is expired for worker {}",
+                    cursor.encode(),
+                    worker_ref.worker_id
+                )));
+            }
+        }
+        if cursor.sequence >= self.next_observation_sequence {
+            return Err(RuntimeError::InvalidRequest(format!(
+                "worker observation cursor {} is unknown for worker {}",
+                cursor.encode(),
+                worker_ref.worker_id
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "ws-server")]
+    fn push_worker_observation_event(
+        &mut self,
+        worker_ref: WorkerRef,
+        payload: protocol::Event,
+    ) -> WorkerObservationEvent {
+        const MAX_OBSERVATION_BACKLOG: usize = 1024;
+
+        let sequence = self.next_observation_sequence;
+        self.next_observation_sequence += 1;
+        let event = WorkerObservationEvent::new(sequence, worker_ref, payload);
+        self.observation_events.push_back(event.clone());
+        while self.observation_events.len() > MAX_OBSERVATION_BACKLOG {
+            self.observation_events.pop_front();
+        }
+        let _ = self.observation_tx.send(event.clone());
+        event
     }
 
     fn push_diagnostic(
@@ -858,6 +1121,14 @@ impl WorkerRecord {
     }
 }
 
+fn profile_label(selector: &ProfileSelector) -> String {
+    match selector {
+        ProfileSelector::RuntimeDefault => "runtime_default".to_string(),
+        ProfileSelector::Builtin(value) => value.clone(),
+        ProfileSelector::Named(value) => value.clone(),
+    }
+}
+
 fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), RuntimeError> {
     if let crate::catalog::WorkerIntent::Task { objective } = &request.intent {
         if objective.trim().is_empty() {
@@ -889,6 +1160,10 @@ fn validate_worker_input(input: &WorkerInput) -> Result<(), RuntimeError> {
 mod tests {
     use super::*;
     use crate::catalog::{CapabilityRequest, ConfigBundleRef, ProfileSelector, WorkerIntent};
+    use crate::config_bundle::{
+        ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigDeclaration,
+        ConfigDeclarationKind, ConfigProfileDescriptor,
+    };
     use crate::management::RuntimeLimits;
 
     fn task_request(objective: &str) -> CreateWorkerRequest {
@@ -897,13 +1172,46 @@ mod tests {
                 objective: objective.to_string(),
             },
             profile: ProfileSelector::Builtin("builtin:coder".to_string()),
-            config_bundle: Some(ConfigBundleRef {
-                id: "bundle-1".to_string(),
-            }),
+            config_bundle: None,
             requested_capabilities: vec![CapabilityRequest::named("read")],
             workspace_refs: Vec::new(),
             mount_refs: Vec::new(),
         }
+    }
+
+    fn test_bundle() -> ConfigBundle {
+        ConfigBundle {
+            metadata: ConfigBundleMetadata {
+                id: "bundle-1".to_string(),
+                digest: String::new(),
+                revision: "rev-1".to_string(),
+                workspace_id: "workspace-1".to_string(),
+                created_at: "2026-06-26T00:00:00Z".to_string(),
+                provenance: ConfigBundleProvenance {
+                    source: "workspace-backend".to_string(),
+                    detail: Some("profile-sync".to_string()),
+                },
+            },
+            profiles: vec![ConfigProfileDescriptor {
+                selector: ProfileSelector::Builtin("builtin:coder".to_string()),
+                label: Some("Coder".to_string()),
+            }],
+            declarations: vec![ConfigDeclaration {
+                kind: ConfigDeclarationKind::CapabilityGrant,
+                name: "read".to_string(),
+                reference: "capability:read".to_string(),
+            }],
+        }
+        .with_computed_digest()
+    }
+
+    fn bundled_task_request(objective: &str, bundle: &ConfigBundle) -> CreateWorkerRequest {
+        let mut request = task_request(objective);
+        request.config_bundle = Some(ConfigBundleRef {
+            id: bundle.metadata.id.clone(),
+            digest: bundle.metadata.digest.clone(),
+        });
+        request
     }
 
     #[test]
@@ -913,7 +1221,7 @@ mod tests {
 
         assert_eq!(detail.worker_ref.runtime_id, runtime.runtime_id().unwrap());
         assert_eq!(detail.status, WorkerStatus::Running);
-        assert!(detail.config_bundle.is_some());
+        assert!(detail.config_bundle.is_none());
 
         let list = runtime.list_workers().unwrap();
         assert_eq!(list.len(), 1);
@@ -923,6 +1231,73 @@ mod tests {
         let fetched = runtime.worker_detail(&detail.worker_ref).unwrap();
         assert_eq!(fetched.worker_id, detail.worker_id);
         assert_eq!(fetched.intent, detail.intent);
+    }
+
+    #[test]
+    fn synced_config_bundle_is_stored_checked_and_used_for_worker_creation() {
+        let runtime = Runtime::new_memory();
+        let bundle = test_bundle();
+        let availability = runtime.store_config_bundle(bundle.clone()).unwrap();
+        assert_eq!(availability.reference.id, "bundle-1");
+        assert_eq!(availability.reference.digest, bundle.metadata.digest);
+
+        let listed = runtime.list_config_bundles().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "bundle-1");
+
+        let checked = runtime
+            .check_config_bundle(&availability.reference)
+            .unwrap();
+        assert_eq!(checked.summary.digest, availability.summary.digest);
+
+        let detail = runtime
+            .create_worker(bundled_task_request("synced", &bundle))
+            .unwrap();
+        assert_eq!(detail.config_bundle, Some(availability.reference));
+    }
+
+    #[test]
+    fn config_bundle_errors_are_typed() {
+        let runtime = Runtime::new_memory();
+        let bundle = test_bundle();
+
+        let missing = runtime
+            .create_worker(bundled_task_request("missing", &bundle))
+            .unwrap_err();
+        assert!(matches!(missing, RuntimeError::ConfigBundleMissing { .. }));
+
+        runtime.store_config_bundle(bundle.clone()).unwrap();
+        let mismatch = runtime
+            .check_config_bundle(&ConfigBundleRef {
+                id: bundle.metadata.id.clone(),
+                digest: "0".repeat(64),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            mismatch,
+            RuntimeError::ConfigBundleDigestMismatch { .. }
+        ));
+
+        let mut bad_profile = bundled_task_request("bad profile", &bundle);
+        bad_profile.profile = ProfileSelector::Builtin("builtin:reviewer".to_string());
+        let invalid_profile = runtime.create_worker(bad_profile).unwrap_err();
+        assert!(matches!(
+            invalid_profile,
+            RuntimeError::InvalidProfileSelector { .. }
+        ));
+
+        let mut unsupported = test_bundle();
+        unsupported.declarations.push(ConfigDeclaration {
+            kind: ConfigDeclarationKind::Unsupported,
+            name: "plugin-registry".to_string(),
+            reference: "plugin-registry:v0".to_string(),
+        });
+        unsupported = unsupported.with_computed_digest();
+        let unsupported_err = runtime.store_config_bundle(unsupported).unwrap_err();
+        assert!(matches!(
+            unsupported_err,
+            RuntimeError::UnsupportedConfigDeclaration { .. }
+        ));
     }
 
     #[test]

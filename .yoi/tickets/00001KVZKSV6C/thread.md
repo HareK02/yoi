@@ -263,3 +263,132 @@ Review result: request_changes
 - read-only で `git diff --check f6fd7b63^ f6fd7b63` は問題なし。Cargo/Nix 検証は read-only 指示を優先して再実行していない。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZKSV6C-runtime-registry at: 2026-06-25T20:38:31Z -->
+
+## Implementation report
+
+Follow-up implementation report after review request_changes:
+
+Commit:
+- `d7c4396c fix: scope workspace worker lookup by runtime`
+
+対応内容:
+- `RuntimeRegistry::worker` を `worker_id` 単独 lookup から `runtime_id + worker_id` lookup に変更。
+  - 先に `runtime_id` を解決。
+  - runtime が存在しない場合は `UnknownRuntime`。
+  - runtime は存在するが worker が存在しない場合は `UnknownWorker { runtime_id, worker_id }`。
+  - worker_id 衝突時に別 runtime の worker を誤って返さない。
+- `RuntimeRegistryError` / workspace-server `Error` に typed error boundary を追加・整理。
+  - `UnknownRuntime(String)`
+  - `UnknownWorker { runtime_id, worker_id }`
+- server 側の error-to-status mapping 更新。
+  - `UnknownRuntime` / `UnknownWorker` は `404 NOT_FOUND`。
+- テスト追加。
+  - 同一 `worker_id` を持つ複数 runtime fixture で lookup が `runtime_id` scoped であることを確認。
+  - unknown runtime と unknown worker が別 error として返り、crate-level `Error` にも正しく mapping されることを確認。
+
+変更ファイル:
+- `crates/workspace-server/src/hosts.rs`
+- `crates/workspace-server/src/lib.rs`
+- `crates/workspace-server/src/server.rs`
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo test -p yoi-workspace-server`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Residual risks / review focus:
+- 現時点で worker detail API route はまだないため、`RuntimeRegistry::worker(runtime_id, worker_id)` の authority boundary は registry 内部 API とテストで確立している。将来 route を追加する際は path/query でも `runtime_id + worker_id` を必須にする必要がある。
+- fixture runtime は routing/error 境界確認用の test-only 実装で、embedded/remote の実接続は次 Ticket の責務として残している。
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KVZKSV6C-runtime-registry at: 2026-06-25T20:41:10Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+確認結果:
+- `RuntimeRegistry::worker(runtime_id, worker_id)` に変更され、`worker_id` 単独走査ではなく `runtime_id` で対象 Runtime を確定してから lookup する形になっている。
+- `UnknownRuntime` と `UnknownWorker { runtime_id, worker_id }` が分離され、crate `Error` / server 404 mapping も更新されている。
+- 同一 `worker_id` が複数 Runtime に存在する multi-runtime fixture test が追加され、誤 routing しないことを確認している。
+- unknown runtime / known runtime + missing worker の error mapping test も追加されている。
+- embedded worker-runtime 接続、remote HTTP、REST server 等の scope creep は見当たらない。
+- local compatibility source の既存 projection / path 非露出 / ID boundedness 系テストは維持されている。
+- read-only で `git diff --check f6fd7b63 d7c4396c` は問題なし。Cargo/Nix は read-only 指示のため再実行していない。
+
+前回ブロッカーは解消済みと判断する。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-25T20:44:19Z -->
+
+## Implementation report
+
+Integration / validation report:
+
+Integration:
+- Implementation branch `work/00001KVZKSV6C-backend-runtime-registry` を orchestration branch に merge 済み。
+- Merge commit: `fb023aab merge: 00001KVZKSV6C runtime registry foundation`
+
+Included implementation commits:
+- `f6fd7b63 feat: add workspace runtime registry source boundary`
+- `d7c4396c fix: scope workspace worker lookup by runtime`
+
+Validation in Orchestrator worktree:
+- `cargo fmt --all --check`: success
+- `cargo test -p yoi-workspace-server`: success（21 tests passed）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Review:
+- Reviewer approve 済み。前回 blocker だった `runtime_id + worker_id` authority と unknown-runtime / unknown-worker typed error boundary は解消済み。
+
+Outcome:
+- Acceptance criteria を満たしたため `done` へ進める。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-25T20:44:27Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Backend RuntimeRegistry foundation の実装、review、merge、Orchestrator validation が完了した。
+
+Done evidence:
+- Merge commit: `fb023aab merge: 00001KVZKSV6C runtime registry foundation`
+- Reviewer approve 済み。
+- Orchestrator validation:
+  - `cargo fmt --all --check`: success
+  - `cargo test -p yoi-workspace-server`: success（21 tests passed）
+  - `cargo check -p yoi`: success
+  - `git diff --check`: success
+  - `nix build .#yoi --no-link`: success
+
+Scope:
+- workspace-server の RuntimeRegistry foundation を worker-runtime 向け identity/projection/error boundary に整理。
+- embedded runtime connection / remote HTTP / REST server / Web Console は Non-goals として未実装。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T03:09:01Z -->
+
+## Implementation report
+
+Cleanup report:
+
+- Registry Coder/Reviewer child Workers were no longer present in the spawned-child registry at cleanup time, so no StopPod action was available for them.
+- Child implementation worktree removed:
+  - `/home/hare/Projects/yoi/.worktree/00001KVZKSV6C-backend-runtime-registry`
+- Child implementation branch removed:
+  - `work/00001KVZKSV6C-backend-runtime-registry`
+
+Operational note:
+- User noted StopPod should be run one-by-one rather than through parallel multi-tool execution; future cleanup will follow that.
+
+---

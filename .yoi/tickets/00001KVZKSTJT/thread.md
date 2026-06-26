@@ -151,3 +151,406 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-25T20:36:24Z -->
+
+## Decision
+
+Routing decision: blocked_by_dependency_or_missing_authority
+
+Reason:
+- Dashboard Queue 後に Ticket / relations / workspace state を確認した。
+- 本 Ticket は `00001KVZKSTE2` REST command server に depends_on。`00001KVZKSTE2` は本 routing pass で accepted され `inprogress` になった。
+- WS observation proxy は Runtime process server surface と Backend proxy/client-facing stream を扱うため、REST command API/process wrapper の形が確定してから開始する。
+
+Evidence checked:
+- Ticket body: `Runtime -> Backend -> Client` WebSocket observation proxy、Runtime worker-scoped WS、Backend Runtime WS client、Client-facing WS、cursor/backlog/permission seam。
+- Relations: outgoing `depends_on -> 00001KVZKSTE2`; incoming dependent Tickets include Web Console MVP, remote Runtime process, TUI migration。
+- Orchestration plan: blocker record `orch-plan-20260625-203613-1` を追加。
+
+Next action:
+- 本 Ticket は queued のまま待機。
+- `00001KVZKSTE2` が review/merge/validation/done になった後に再 routing する。
+
+---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-26T04:22:18Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- `00001KVZKSTE2` REST command server は done。前回 blocker（REST process wrapper/API surface 未確定）は解消済み。
+- 本 Ticket はユーザー指摘後に `Runtime/Backend WebSocket observation proxy` として設計判断を反映し再queuedされた。Ticket thread には、Runtime WS は `protocol::Event` を observation payload として流し、Browser/future TUI は Runtime へ直接接続せず Backend-owned projection/proxy を見る、という binding decision が記録済み。
+- queued/inprogress 再確認時点で inprogress は 0 件。後続 remote/TUI/Web Console Tickets は本 Ticket に依存しているため、本 Ticket を次に受理する。
+
+Evidence checked:
+- Ticket body: `Runtime -> Backend -> Client` WebSocket observation proxy、Runtime worker-scoped WS、Backend Runtime WS client、Client-facing WS、cursor/backlog/permission seam、Non-goals。
+- Thread decisions: `protocol::Event` を payload authority とする、Runtime WS は command/mutation tunnel にしない、Backend projection/proxy seam を作る、full auth/redaction policy は後続。
+- Relations: outgoing dependencies `00001KVZBCQH4` core と `00001KVZKSTE2` REST server は done。incoming remote/Web Console/TUI Tickets は後続。
+- Orchestration plan: accepted plan `orch-plan-20260626-042150-2` を記録。
+- Workspace state: orchestration worktree clean; no inprogress Ticket.
+
+IntentPacket:
+
+Intent:
+- Runtime process の worker-scoped WebSocket observation stream と、Backend-owned client-facing WebSocket proxy boundary を実装する。
+
+Binding decisions / invariants:
+- Runtime WS は Backend-facing internal observation API。Browser/future TUI は Runtime WS に直接接続しない。
+- Payload authority は `crates/protocol` の `protocol::Event`。Runtime WS 独自の parallel output model や variant allowlist/subset を作らない。
+- Runtime WS は command/mutation/user input を受け付けず、`protocol::Method` tunnel を作らない。
+- Backend client-facing WS は Backend-owned opaque cursor/envelope/diagnostic を持ち、Runtime endpoint/credential/socket/session path を Client に露出しない。
+- v0 は worker-scoped stream。runtime-wide stream、full auth/permission/redaction policy、Web Console UI、TUI migration、remote process lifecycle/discovery は Non-goals。
+- REST command semantics は既存 `http-server` implementation に委譲し、この Ticket で再実装しない。
+
+Requirements / acceptance criteria:
+- `worker-runtime` に optional `ws-server` feature がある。
+- Feature disabled でも core compile が通る。
+- Runtime process exposes `GET /v1/workers/{worker_id}/events/ws?cursor=...` style worker-scoped observation endpoint。
+- Runtime WS envelope includes Runtime-local opaque cursor/event id, worker id, and `protocol::Event` payload。
+- Connect sends initial `protocol::Event::Snapshot` projection, then forwards Worker event bus `protocol::Event` payloads。
+- Backend Runtime WS client consumes Runtime envelope and preserves `runtime_id + worker_id + runtime_cursor + protocol::Event` internally。
+- Backend exposes Client-facing worker observation WS keyed by `runtime_id + worker_id` with Backend-local opaque cursor/envelope。
+- Unknown/expired cursor, worker not found, runtime unavailable, upstream disconnect, malformed frame are typed diagnostics/errors。
+- Tests cover Runtime WS, Backend upstream client/proxy delivery, cursor resume/duplicate-safe IDs, diagnostics, and worker-scoped filtering.
+
+Implementation latitude:
+- Exact Rust module split, WebSocket dependency, envelope structs, test fixtures, and Backend route shape may follow existing workspace-server/worker-runtime style。
+- Bounded backlog implementation can be in-memory v0, as long as cursor semantics and diagnostics are explicit.
+- Permission seam can be pass-through default with types/hooks for later policy.
+
+Escalate if:
+- Implementing this requires full auth/redaction policy, Web Console UI, TUI migration, remote process lifecycle/discovery, or Runtime command channel changes。
+- `protocol::Event` cannot be serialized/forwarded without changing protocol crate public semantics。
+- Backend Registry/Runtime handle shape from previous Tickets is insufficient and would require a broad redesign.
+
+Validation:
+- `cargo fmt --all`
+- `cargo test -p worker-runtime --features ws-server`
+- `cargo test -p yoi-workspace-server`
+- `cargo check -p yoi`
+- `git diff --check`
+- 可能なら `nix build .#yoi --no-link`
+
+Critical risks / reviewer focus:
+- Accidentally creating a command/mutation tunnel over WS。
+- Leaking Runtime endpoint/token/socket/session path to Client-facing WS。
+- Creating a second output/event model instead of forwarding `protocol::Event` payload。
+- Feature gating/dependency leakage。
+- Cursor/backlog/diagnostic semantics being too vague for remote/TUI/Web Console follow-ups。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-26T04:22:27Z from: queued to: inprogress reason: routing_accepted_after_rest_server_done field: state -->
+
+## State changed
+
+Routing decision: implementation_ready。
+
+Dependency `00001KVZKSTE2` REST command server は done。Ticket body/thread、relations、workspace state、accepted plan を確認し、Runtime/Backend WebSocket observation proxy は unblocked と判断した。accepted plan と IntentPacket は thread / orchestration plan に記録済み。
+
+これ以降、worktree creation / coder Worker routing などの implementation side effect に進める。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T04:23:22Z -->
+
+## Implementation report
+
+Implementation kickoff:
+
+- Worktree created: `/home/hare/Projects/yoi/.worktree/00001KVZKSTJT-websocket-observation-proxy`
+- Branch: `work/00001KVZKSTJT-websocket-observation-proxy`
+- Coder Worker spawned: `yoi-coder-00001KVZKSTJT-ws-proxy`
+
+Scope notes:
+- Coder has read access to the implementation worktree and non-recursive workspace root identity path needed by runtime startup.
+- Coder write scope is limited to `crates/worker-runtime/**`, `crates/workspace-server/**`, root `Cargo.toml`, `Cargo.lock`, and `package.nix`.
+- Coder is instructed not to modify Ticket records and not to operate in root/orchestration worktrees.
+
+Next action:
+- Wait for Coder implementation report, then route to reviewer.
+
+---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZKSTJT-ws-proxy at: 2026-06-26T04:56:04Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装完了。Ticket ファイル / project records は変更していない。merge / close / cleanup 前で停止。
+
+Commit:
+- `9807accaf08f4322763dd7cd3536baf3dab8d10e feat: add worker observation websocket proxy`
+
+変更概要:
+
+### worker-runtime
+
+変更ファイル:
+- `crates/worker-runtime/Cargo.toml`
+- `crates/worker-runtime/src/observation.rs`
+- `crates/worker-runtime/src/runtime.rs`
+- `crates/worker-runtime/src/http_server.rs`
+
+実装内容:
+- optional feature `ws-server` を追加。
+  - `http-server` に加えて `axum/ws`, `protocol`, `futures`, `tokio/sync` を使用。
+  - feature 無効時の core compile も確認済み。
+- Runtime 側に Worker-scoped observation backlog / bus を追加。
+  - Runtime-local opaque cursor: `wo_<hex sequence>`
+  - bounded in-memory backlog v0
+  - `observe_worker_event(worker_ref, protocol::Event)` で `protocol::Event` payload をそのまま observation bus に投入。
+- Runtime HTTP server に worker-scoped WS endpoint を追加。
+  - `GET /v1/workers/{worker_id}/events/ws?cursor=...`
+- Runtime WS frame:
+  - `RuntimeWorkerEventWsFrame::Event { envelope }`
+  - `RuntimeWorkerEventWsFrame::Diagnostic { diagnostic }`
+- Runtime WS envelope:
+  - `cursor`
+  - `event_id`
+  - `worker_id`
+  - `payload: protocol::Event`
+- 接続時に `protocol::Event::Snapshot` を初期 projection として送信。
+- live update は observation bus の `protocol::Event` payload を転送。
+- client からの text/binary 等の入力は `runtime.observation_only` diagnostic で終了。
+- malformed cursor / unknown-or-expired cursor / worker not found / bus closed / lagged backlog などを typed diagnostic/error 化。
+
+### workspace-server
+
+変更ファイル:
+- `crates/workspace-server/Cargo.toml`
+- `crates/workspace-server/src/lib.rs`
+- `crates/workspace-server/src/observation.rs`
+- `crates/workspace-server/src/server.rs`
+
+実装内容:
+- Backend-owned observation proxy module を追加。
+- Runtime WS client を追加。
+  - Runtime WS envelope を decode。
+  - 内部表現として `runtime_id + worker_id + runtime_cursor + protocol::Event` を保持。
+- Backend client-facing WS endpoint を追加。
+  - `GET /api/runtimes/{runtime_id}/workers/{worker_id}/events/ws?cursor=...`
+- Backend-local cursor/envelope を追加。
+  - Backend cursor: `bo_<hex sequence>`
+  - Runtime endpoint / credential / socket / session path は client-facing payload に出さない。
+- Backend client-facing frame:
+  - `ClientWorkerEventWsFrame::Event { envelope }`
+  - `ClientWorkerEventWsFrame::Diagnostic { diagnostic }`
+- Backend client-facing envelope:
+  - `cursor`
+  - `event_id`
+  - `runtime_id`
+  - `worker_id`
+  - `payload: protocol::Event`
+- Backend source config は server 内部設定 `runtime_event_sources` として保持。
+- unknown worker/runtime source, malformed/unknown cursor, upstream disconnect, malformed upstream frame, observation-only client input を typed diagnostic/error 化。
+
+### workspace/root/package
+
+変更ファイル:
+- `Cargo.toml`
+- `Cargo.lock`
+- `package.nix`
+
+内容:
+- `tokio-tungstenite = "0.29"` を workspace dependency に追加。
+- `package.nix` の `cargoHash` を更新。
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo check -p worker-runtime`: success
+- `cargo test -p worker-runtime --features ws-server`: success（14 lib tests + 3 bin tests + doctests）
+- `cargo test -p yoi-workspace-server`: success（22 lib tests + bin/doctests）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `git diff --check --cached`: success
+- `nix build .#yoi --no-link`: success
+
+Review focus / residual risks:
+- v0 backlog は in-memory bounded。process restart / memory eviction 後の cursor は unknown/expired 扱い。
+- Runtime Snapshot projection は minimal projection。`protocol::Event::Snapshot` を使うが、entries / in-flight は現 Runtime adapter の範囲で空 projection。
+- Backend source discovery は `runtime_event_sources` 内部 config seam。remote lifecycle/discovery や full registry redesign は Non-goals として未実装。
+- Auth/redaction/policy は full 実装せず、後続拡張しやすい typed source/diagnostic/proxy boundary に留めた。
+- Browser / future TUI には Backend endpoint のみを公開し、Runtime endpoint / credential / socket / session path は envelope に含めていない。
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KVZKSTJT-ws-proxy at: 2026-06-26T05:02:45Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+読取専用で `9807acc...` の実装を確認した。`protocol::Event` payload の pass-through、Runtime/Backend の envelope 分離、observation-only 入力診断、Client envelope から Runtime endpoint/token/socket/session path を出さない点、`worker-runtime` の `ws-server` cfg 境界は概ね Ticket 意図に沿っている。
+
+ただし、以下は受け入れ条件上の blocker。
+
+1. Backend Runtime WS client の upstream 診断が型を失っている
+- `crates/workspace-server/src/observation.rs` の `RuntimeWsObservationClient::next_event` で、Runtime からの `RuntimeWorkerEventWsFrame::Diagnostic` をすべて `ObservationProxyError::UpstreamDisconnect` に畳み込んでいる。
+- そのため Runtime 側の `runtime.cursor_unknown_or_expired` / `runtime.worker_not_found` 等が Client-facing では `backend.upstream_disconnect` になり、Ticket 要件の「worker not found / unknown cursor / expired cursor / upstream disconnect を typed diagnostic として扱う」を満たさない。
+- 同様に Runtime WS connect 時の HTTP 404 等も `RuntimeUnavailable` 扱いで、worker-not-found として区別されない。
+
+2. 必須テストカバレッジが不足している
+- Ticket 受け入れ条件では、expired/unknown cursor diagnostics、upstream disconnect diagnostics、worker-scoped filtering 等の WS proxy tests が要求されている。
+- 現状確認できたテストは Runtime 側の snapshot/live/resume/filter と malformed cursor/observation-only、Backend 側の snapshot/live/resume/malformed cursor/observation-only が中心で、Backend の unknown/expired cursor、Runtime upstream diagnostic の型変換、upstream disconnect、Runtime worker-not-found 経路を検証していない。
+
+上記を修正し、Runtime diagnostic / HTTP failure を Backend の typed diagnostic に適切にマップするテストを追加すれば、設計境界自体は approve に近い状態。
+
+---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZKSTJT-ws-proxy at: 2026-06-26T05:10:58Z -->
+
+## Implementation report
+
+Follow-up implementation report after review request_changes:
+
+Fix commit:
+- `8cc9a594f78feef62aa7abd5bbf11b5cd40b4781 fix: preserve runtime websocket diagnostics`
+
+修正内容:
+
+### 1. Runtime WS diagnostic の型を Backend で保持 / 変換
+
+`crates/workspace-server/src/observation.rs`
+
+- `RuntimeWsObservationClient::next_event` が Runtime diagnostic を全部 `backend.upstream_disconnect` に潰していた問題を修正。
+- Runtime diagnostic code を Backend typed diagnostic に変換:
+  - `runtime.worker_not_found` → `backend.worker_not_found`
+  - `runtime.cursor_malformed` → `backend.cursor_malformed`
+  - `runtime.cursor_unknown_or_expired` / `runtime.cursor_expired` → `backend.cursor_unknown_or_expired`
+  - `runtime.upstream_closed` / `runtime.websocket_error` → `backend.upstream_disconnect`
+  - `runtime.unavailable` → `backend.runtime_unavailable`
+  - `runtime.serialize_failed` → `backend.malformed_frame`
+  - `runtime.observation_only` → `backend.observation_only`
+- Runtime WS connect 時の HTTP 404 を `backend.worker_not_found` として扱うように変更。
+- 実際の socket close / receive error は引き続き `backend.upstream_disconnect` として区別。
+
+### 2. WS proxy テスト追加
+
+`crates/workspace-server/src/server.rs`
+
+追加 coverage:
+- Backend unknown/expired cursor:
+  - well-formed だが未知の `bo_...` cursor が `backend.cursor_unknown_or_expired` になること。
+- Runtime upstream diagnostic mapping:
+  - Runtime の `runtime.cursor_unknown_or_expired` が client-facing `backend.cursor_unknown_or_expired` に変換されること。
+- Runtime worker-not-found / HTTP 404 mapping:
+  - Runtime WS upgrade が 404 を返すケースを `backend.worker_not_found` として返すこと。
+- Upstream disconnect:
+  - Runtime upstream が WS 接続後に閉じた場合、`backend.upstream_disconnect` として返すこと。
+
+既存の snapshot/live/resume/filter/malformed cursor/observation-only coverage は維持。
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo check -p worker-runtime`: success
+- `cargo test -p worker-runtime --features ws-server`: success（14 tests passed + bin/doc tests）
+- `cargo test -p yoi-workspace-server`: success（26 tests passed + bin/doc tests）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Residual risks / review focus:
+- Runtime diagnostic code の Backend 変換は現 Runtime diagnostic set に対する明示 mapping。未知 code は `backend.runtime_unavailable` に安全側で畳む。
+- HTTP 404 は worker-not-found として扱う。Runtime 側で route miss と worker miss の HTTP body までは分離していないため、client-facing には endpoint/path/token 等を出さず typed diagnostic のみ返す。
+- v0 cursor/backlog は引き続き in-memory bounded。再起動 / eviction 後は unknown/expired cursor diagnostic。
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KVZKSTJT-ws-proxy at: 2026-06-26T05:15:04Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+読取専用で follow-up commit `8cc9a594f78feef62aa7abd5bbf11b5cd40b4781` を確認した。前回 blockers は解消済み。
+
+確認した点:
+- `RuntimeWsObservationClient::next_event` が Runtime diagnostic を `backend.*` typed diagnostic にマップし、`runtime.cursor_unknown_or_expired` / `runtime.worker_not_found` 等を `backend.upstream_disconnect` に潰さなくなっている。
+- 実際の socket close / receive error は引き続き `backend.upstream_disconnect` として区別されている。
+- Runtime WS connect の HTTP 404 が `backend.worker_not_found` にマップされている。
+- 追加テストで Backend unknown cursor、Runtime cursor diagnostic mapping、Runtime worker-not-found 404 mapping、actual upstream disconnect が検証されている。
+- Client-facing envelope は `cursor`, `event_id`, `runtime_id`, `worker_id`, `payload: protocol::Event` のみで、Runtime endpoint/token/socket/session path は含まれていない。
+- observation-only 境界を壊す command tunnel / SSE / lifecycle / full auth redesign の scope creep は見当たらない。
+
+検証は read-only inspection のみで、cargo/nix は再実行していない。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T05:16:01Z -->
+
+## Implementation report
+
+Integration / validation report:
+
+Integration:
+- Implementation branch `work/00001KVZKSTJT-websocket-observation-proxy` を orchestration branch に merge 済み。
+- Merge commit: `ae0f0d1d merge: 00001KVZKSTJT websocket observation proxy`
+
+Included implementation commits:
+- `9807accaf08f4322763dd7cd3536baf3dab8d10e feat: add worker observation websocket proxy`
+- `8cc9a594f78feef62aa7abd5bbf11b5cd40b4781 fix: preserve runtime websocket diagnostics`
+
+Validation in Orchestrator worktree:
+- `cargo fmt --all --check`: success
+- `cargo check -p worker-runtime`: success
+- `cargo test -p worker-runtime --features ws-server`: success（14 lib tests + 3 bin tests + doctests）
+- `cargo test -p yoi-workspace-server`: success（26 tests + bin/doc tests）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Review:
+- Reviewer approve 済み。前回 blocker だった Runtime diagnostic の Backend typed diagnostic mapping、HTTP 404 worker-not-found mapping、unknown cursor / upstream disconnect test coverage は解消済み。
+
+Outcome:
+- Acceptance criteria を満たしたため `done` へ進める。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-26T05:16:11Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Runtime/Backend WebSocket observation proxy の実装、review、merge、Orchestrator validation が完了した。
+
+Done evidence:
+- Merge commit: `ae0f0d1d merge: 00001KVZKSTJT websocket observation proxy`
+- Reviewer approve 済み。
+- Orchestrator validation:
+  - `cargo fmt --all --check`: success
+  - `cargo check -p worker-runtime`: success
+  - `cargo test -p worker-runtime --features ws-server`: success（14 lib tests + 3 bin tests + doctests）
+  - `cargo test -p yoi-workspace-server`: success（26 tests + bin/doc tests）
+  - `cargo check -p yoi`: success
+  - `git diff --check`: success
+  - `nix build .#yoi --no-link`: success
+
+Scope:
+- Runtime process worker-scoped WebSocket observation stream と Backend-owned client-facing WebSocket proxy boundary を追加。
+- command tunnel / SSE / remote lifecycle/discovery / full auth-redaction policy / Web Console UI は Non-goals として未実装。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T05:16:51Z -->
+
+## Implementation report
+
+Cleanup report:
+
+- Child Workers stopped one-by-one and scope reclaimed:
+  - `yoi-coder-00001KVZKSTJT-ws-proxy`
+  - `yoi-reviewer-00001KVZKSTJT-ws-proxy`
+- Child implementation worktree removed:
+  - `/home/hare/Projects/yoi/.worktree/00001KVZKSTJT-websocket-observation-proxy`
+- Child implementation branch removed:
+  - `work/00001KVZKSTJT-websocket-observation-proxy`
+
+Operational note:
+- StopPod was executed sequentially, not in parallel.
+
+---

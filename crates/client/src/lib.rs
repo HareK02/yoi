@@ -8,11 +8,13 @@
 //!
 //! TUI / GUI / E2E ハーネスはこの crate に依存して protocol を喋る。
 
+pub mod backend_runtime;
 pub mod runtime_command;
 pub mod spawn;
 pub mod ticket_role;
 mod worker_client;
 
+pub use backend_runtime::{BackendRuntimeClient, BackendRuntimeClientError, BackendRuntimeTarget};
 pub use runtime_command::WorkerRuntimeCommand;
 
 pub use spawn::{

@@ -2,7 +2,7 @@
 title: 'pod crateをworker crateへ改名する'
 state: 'closed'
 created_at: '2026-06-25T13:42:37Z'
-updated_at: '2026-06-25T19:40:49Z'
+updated_at: '2026-06-26T03:09:01Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-25T14:13:35Z'

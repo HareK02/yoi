@@ -1,26 +1,41 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
+use crate::companion::{
+    CompanionCancelRequest, CompanionConsole, CompanionMessageRequest, CompanionMessageResponse,
+    CompanionStatusResponse, CompanionTranscriptProjection,
+};
 use crate::hosts::{
-    DiagnosticSeverity, HostSummary, LocalWorkerRuntime, RuntimeDiagnostic, RuntimeSummary,
-    WorkerRuntimeRegistry, WorkerSummary,
+    ConfigBundleCheckResult, ConfigBundleSyncResult, DiagnosticSeverity, EmbeddedWorkerRuntime,
+    HostSummary, LocalWorkerRuntime, RemoteRuntimeConfig, RemoteWorkerRuntime, RuntimeDiagnostic,
+    RuntimeRegistry, RuntimeSummary, WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest,
+    WorkerLifecycleResult, WorkerSpawnRequest, WorkerSpawnResult, WorkerSummary,
+    WorkerTranscriptProjection,
 };
 use crate::identity::WorkspaceIdentity;
+use crate::observation::{
+    BackendObservationProxy, ClientWorkerEventWsFrame, ClientWorkerEventsWsQuery,
+    ObservationProxyError, RuntimeObservationSourceConfig, RuntimeWsObservationClient,
+};
 use crate::records::{
     LocalProjectRecordReader, ObjectiveDetail, ProjectRecordList, TicketDetail, TicketSummary,
 };
 use crate::repositories::{LocalRepositoryReader, RepositoryLogRead, RepositorySummary};
 use crate::store::{ControlPlaneStore, WorkspaceRecord};
 use crate::{Error, Result};
+use worker_runtime::catalog::ConfigBundleRef;
+use worker_runtime::config_bundle::ConfigBundle;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AuthConfig {
@@ -39,6 +54,8 @@ pub struct ServerConfig {
     pub auth: AuthConfig,
     pub max_records: usize,
     pub local_runtime_data_dir: Option<PathBuf>,
+    pub runtime_event_sources: Vec<RuntimeObservationSourceConfig>,
+    pub remote_runtime_sources: Vec<RemoteRuntimeConfig>,
 }
 
 impl ServerConfig {
@@ -55,6 +72,8 @@ impl ServerConfig {
             },
             max_records: 200,
             local_runtime_data_dir: manifest::paths::data_dir(),
+            runtime_event_sources: Vec::new(),
+            remote_runtime_sources: Vec::new(),
         }
     }
 }
@@ -64,7 +83,9 @@ pub struct WorkspaceApi {
     config: ServerConfig,
     store: Arc<dyn ControlPlaneStore>,
     records: LocalProjectRecordReader,
-    runtime: Arc<WorkerRuntimeRegistry>,
+    runtime: Arc<RuntimeRegistry>,
+    companion: Arc<CompanionConsole>,
+    observation_proxy: BackendObservationProxy,
 }
 
 impl WorkspaceApi {
@@ -78,18 +99,28 @@ impl WorkspaceApi {
                 updated_at: config.workspace_created_at.clone(),
             })
             .await?;
-        let runtime = Arc::new(WorkerRuntimeRegistry::for_local_pods(
+        let mut runtime = RuntimeRegistry::for_workspace(
             LocalWorkerRuntime::new(
                 config.workspace_id.clone(),
                 config.workspace_root.clone(),
                 config.local_runtime_data_dir.clone(),
             ),
-        ));
+            EmbeddedWorkerRuntime::new_memory(config.workspace_id.clone()),
+        );
+        for remote_config in config.remote_runtime_sources.iter().cloned() {
+            runtime
+                .register(RemoteWorkerRuntime::new(remote_config).map_err(|err| err.into_error())?);
+        }
+        let runtime = Arc::new(runtime);
+        let companion = Arc::new(CompanionConsole::new(runtime.clone()));
+        let observation_proxy = BackendObservationProxy::new(config.runtime_event_sources.clone());
         Ok(Self {
             records: LocalProjectRecordReader::new(config.workspace_root.clone()),
             config,
             store,
             runtime,
+            companion,
+            observation_proxy,
         })
     }
 
@@ -130,6 +161,46 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route("/api/hosts", get(list_hosts))
         .route("/api/runtimes", get(list_runtimes))
         .route("/api/workers", get(list_workers))
+        .route("/api/companion/status", get(get_companion_status))
+        .route("/api/companion/transcript", get(get_companion_transcript))
+        .route("/api/companion/messages", post(post_companion_message))
+        .route("/api/companion/cancel", post(post_companion_cancel))
+        .route(
+            "/api/runtimes/{runtime_id}/workers",
+            post(create_runtime_worker),
+        )
+        .route(
+            "/api/runtimes/{runtime_id}/config-bundles",
+            post(sync_runtime_config_bundle),
+        )
+        .route(
+            "/api/runtimes/{runtime_id}/config-bundles/{bundle_id}/availability",
+            get(check_runtime_config_bundle),
+        )
+        .route(
+            "/api/runtimes/{runtime_id}/workers/{worker_id}",
+            get(get_runtime_worker),
+        )
+        .route(
+            "/api/runtimes/{runtime_id}/workers/{worker_id}/input",
+            post(send_runtime_worker_input),
+        )
+        .route(
+            "/api/runtimes/{runtime_id}/workers/{worker_id}/stop",
+            post(stop_runtime_worker),
+        )
+        .route(
+            "/api/runtimes/{runtime_id}/workers/{worker_id}/cancel",
+            post(cancel_runtime_worker),
+        )
+        .route(
+            "/api/runtimes/{runtime_id}/workers/{worker_id}/transcript",
+            get(get_runtime_worker_transcript),
+        )
+        .route(
+            "/api/runtimes/{runtime_id}/workers/{worker_id}/events/ws",
+            get(worker_observation_ws),
+        )
         .route("/api/hosts/{host_id}/workers", get(list_host_workers))
         .fallback(get(static_or_spa_fallback))
         .with_state(api)
@@ -161,6 +232,7 @@ pub struct ExtensionPoints {
     pub store: String,
     pub event_stream: ExtensionPointState,
     pub host_worker_bridge: ExtensionPointState,
+    pub companion_console: ExtensionPointState,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -239,6 +311,12 @@ struct TicketKanbanQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+struct TranscriptQuery {
+    start: Option<usize>,
+    limit: Option<usize>,
+}
+
 async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<WorkspaceResponse>> {
     let schema_version = api.store.schema_version().await?;
     let stored = api.store.get_workspace(api.workspace_id()).await?;
@@ -262,6 +340,10 @@ async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<Worksp
             host_worker_bridge: ExtensionPointState {
                 status: "read_only_local".to_string(),
                 note: "Local Hosts and Workers are exposed as a read-only bridge over existing Worker metadata; no direct Worker socket, scheduling, or lifecycle control is implemented.".to_string(),
+            },
+            companion_console: ExtensionPointState {
+                status: "providerless_mvp".to_string(),
+                note: "Backend-internal tools-less Companion Worker is available through Workspace API status/transcript/message endpoints; v0 records browser messages and returns a resource-defined provider-less response instead of direct LLM generation.".to_string(),
             },
         },
     }))
@@ -423,6 +505,291 @@ async fn list_workers(
     State(api): State<WorkspaceApi>,
 ) -> ApiResult<Json<RuntimeListResponse<WorkerSummary>>> {
     workers_response(api).map(Json)
+}
+
+async fn get_companion_status(
+    State(api): State<WorkspaceApi>,
+) -> ApiResult<Json<CompanionStatusResponse>> {
+    Ok(Json(api.companion.status()))
+}
+
+async fn get_companion_transcript(
+    State(api): State<WorkspaceApi>,
+    Query(query): Query<TranscriptQuery>,
+) -> ApiResult<Json<CompanionTranscriptProjection>> {
+    let limit = query.limit.unwrap_or(api.config.max_records).min(200);
+    let start = query.start.unwrap_or(0);
+    Ok(Json(api.companion.transcript(start, limit)))
+}
+
+async fn post_companion_message(
+    State(api): State<WorkspaceApi>,
+    Json(request): Json<CompanionMessageRequest>,
+) -> ApiResult<Json<CompanionMessageResponse>> {
+    Ok(Json(api.companion.send_message(request)))
+}
+
+async fn post_companion_cancel(
+    State(api): State<WorkspaceApi>,
+    Json(request): Json<CompanionCancelRequest>,
+) -> ApiResult<Json<CompanionMessageResponse>> {
+    Ok(Json(api.companion.cancel(request)))
+}
+
+async fn get_runtime_worker(
+    State(api): State<WorkspaceApi>,
+    AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
+) -> ApiResult<Json<WorkerSummary>> {
+    let worker = api
+        .runtime
+        .worker(&runtime_id, &worker_id)
+        .map_err(|err| err.into_error())?;
+    Ok(Json(worker))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RuntimeConfigBundleSyncRequest {
+    pub bundle: ConfigBundle,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeConfigBundleAvailabilityQuery {
+    digest: String,
+}
+
+async fn create_runtime_worker(
+    State(api): State<WorkspaceApi>,
+    AxumPath(runtime_id): AxumPath<String>,
+    Json(request): Json<WorkerSpawnRequest>,
+) -> ApiResult<Json<WorkerSpawnResult>> {
+    let result = api
+        .runtime
+        .spawn_worker(&runtime_id, request)
+        .map_err(|err| err.into_error())?;
+    Ok(Json(result))
+}
+
+async fn sync_runtime_config_bundle(
+    State(api): State<WorkspaceApi>,
+    AxumPath(runtime_id): AxumPath<String>,
+    Json(request): Json<RuntimeConfigBundleSyncRequest>,
+) -> ApiResult<Json<ConfigBundleSyncResult>> {
+    let result = api
+        .runtime
+        .sync_config_bundle(&runtime_id, request.bundle)
+        .map_err(|err| err.into_error())?;
+    Ok(Json(result))
+}
+
+async fn check_runtime_config_bundle(
+    State(api): State<WorkspaceApi>,
+    AxumPath((runtime_id, bundle_id)): AxumPath<(String, String)>,
+    Query(query): Query<RuntimeConfigBundleAvailabilityQuery>,
+) -> ApiResult<Json<ConfigBundleCheckResult>> {
+    let result = api
+        .runtime
+        .check_config_bundle(
+            &runtime_id,
+            ConfigBundleRef {
+                id: bundle_id,
+                digest: query.digest,
+            },
+        )
+        .map_err(|err| err.into_error())?;
+    Ok(Json(result))
+}
+
+async fn send_runtime_worker_input(
+    State(api): State<WorkspaceApi>,
+    AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
+    Json(request): Json<WorkerInputRequest>,
+) -> ApiResult<Json<WorkerInputResult>> {
+    let result = api
+        .runtime
+        .send_input(&runtime_id, &worker_id, request)
+        .map_err(|err| err.into_error())?;
+    Ok(Json(result))
+}
+
+async fn stop_runtime_worker(
+    State(api): State<WorkspaceApi>,
+    AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
+    Json(request): Json<WorkerLifecycleRequest>,
+) -> ApiResult<Json<WorkerLifecycleResult>> {
+    let result = api
+        .runtime
+        .stop_worker(&runtime_id, &worker_id, request)
+        .map_err(|err| err.into_error())?;
+    Ok(Json(result))
+}
+
+async fn cancel_runtime_worker(
+    State(api): State<WorkspaceApi>,
+    AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
+    Json(request): Json<WorkerLifecycleRequest>,
+) -> ApiResult<Json<WorkerLifecycleResult>> {
+    let result = api
+        .runtime
+        .cancel_worker(&runtime_id, &worker_id, request)
+        .map_err(|err| err.into_error())?;
+    Ok(Json(result))
+}
+
+async fn get_runtime_worker_transcript(
+    State(api): State<WorkspaceApi>,
+    AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
+    Query(query): Query<TranscriptQuery>,
+) -> ApiResult<Json<WorkerTranscriptProjection>> {
+    let limit = query.limit.unwrap_or(api.config.max_records).min(200);
+    let start = query.start.unwrap_or(0);
+    let result = api
+        .runtime
+        .transcript(&runtime_id, &worker_id, start, limit)
+        .map_err(|err| err.into_error())?;
+    Ok(Json(result))
+}
+
+async fn worker_observation_ws(
+    State(api): State<WorkspaceApi>,
+    AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
+    Query(query): Query<ClientWorkerEventsWsQuery>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    match api.observation_proxy.source(&runtime_id, &worker_id) {
+        Ok(source) => ws.on_upgrade(move |socket| {
+            worker_observation_ws_session(api.observation_proxy, source, query, socket)
+        }),
+        Err(ObservationProxyError::WorkerNotFound(_)) => {
+            match api.runtime.observation_source(&runtime_id, &worker_id) {
+                Ok(source) => ws.on_upgrade(move |socket| {
+                    worker_observation_ws_session(api.observation_proxy, source, query, socket)
+                }),
+                Err(error) => ApiError(error.into_error()).into_response(),
+            }
+        }
+        Err(error) => {
+            let status = StatusCode::BAD_REQUEST;
+            (
+                status,
+                Json(serde_json::json!({
+                    "error": error.code(),
+                    "message": error.message(),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn worker_observation_ws_session(
+    proxy: BackendObservationProxy,
+    source: RuntimeObservationSourceConfig,
+    query: ClientWorkerEventsWsQuery,
+    mut socket: WebSocket,
+) {
+    let open = match proxy.open(
+        &source.runtime_id,
+        &source.worker_id,
+        query.cursor.as_deref(),
+    ) {
+        Ok(open) => open,
+        Err(error) => {
+            let _ = send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::diagnostic(error))
+                .await;
+            return;
+        }
+    };
+
+    let mut backend_cursor = open.backend_cursor;
+    for envelope in open.replay {
+        backend_cursor = crate::observation::BackendObservationCursor::decode(&envelope.cursor)
+            .unwrap_or(backend_cursor);
+        if !send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::event(envelope)).await {
+            return;
+        }
+    }
+
+    let mut upstream =
+        match RuntimeWsObservationClient::connect(&source, open.runtime_cursor.as_deref()).await {
+            Ok(client) => client,
+            Err(error) => {
+                let _ =
+                    send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::diagnostic(error))
+                        .await;
+                return;
+            }
+        };
+
+    loop {
+        tokio::select! {
+            inbound = socket.next() => {
+                match inbound {
+                    Some(Ok(WsMessage::Close(_))) | None => return,
+                    Some(Ok(WsMessage::Ping(payload))) => {
+                        if socket.send(WsMessage::Pong(payload)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Some(Ok(WsMessage::Pong(_))) => {}
+                    Some(Ok(_)) => {
+                        let _ = send_client_ws_frame(
+                            &mut socket,
+                            ClientWorkerEventWsFrame::diagnostic(ObservationProxyError::ObservationOnly),
+                        ).await;
+                        return;
+                    }
+                    Some(Err(error)) => {
+                        let _ = send_client_ws_frame(
+                            &mut socket,
+                            ClientWorkerEventWsFrame::diagnostic(
+                                ObservationProxyError::MalformedFrame(format!(
+                                    "client WebSocket receive error: {error}"
+                                )),
+                            ),
+                        ).await;
+                        return;
+                    }
+                }
+            }
+            upstream_event = upstream.next_event() => {
+                match upstream_event {
+                    Ok(event) => match proxy.store(event) {
+                        Ok(envelope) => {
+                            backend_cursor = crate::observation::BackendObservationCursor::decode(&envelope.cursor)
+                                .unwrap_or(backend_cursor);
+                            if !send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::event(envelope)).await {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::diagnostic(error)).await;
+                            return;
+                        }
+                    },
+                    Err(error) => {
+                        let _ = send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::diagnostic(error)).await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn send_client_ws_frame(socket: &mut WebSocket, frame: ClientWorkerEventWsFrame) -> bool {
+    match serde_json::to_string(&frame) {
+        Ok(text) => socket.send(WsMessage::Text(text.into())).await.is_ok(),
+        Err(error) => {
+            let fallback =
+                ClientWorkerEventWsFrame::diagnostic(ObservationProxyError::MalformedFrame(
+                    format!("failed to serialize backend observation frame: {error}"),
+                ));
+            let Ok(text) = serde_json::to_string(&fallback) else {
+                return false;
+            };
+            socket.send(WsMessage::Text(text.into())).await.is_ok()
+        }
+    }
 }
 
 async fn list_host_workers(
@@ -613,10 +980,21 @@ impl IntoResponse for ApiError {
             Error::InvalidRecordId(_)
             | Error::MissingFrontmatter(_)
             | Error::UnknownHost(_)
-            | Error::UnknownWorker(_)
+            | Error::UnknownRuntime(_)
+            | Error::UnknownWorker { .. }
             | Error::UnknownRepository(_) => StatusCode::NOT_FOUND,
             Error::Ticket(_) => StatusCode::NOT_FOUND,
             Error::RuntimeCapabilityUnsupported { .. } => StatusCode::NOT_IMPLEMENTED,
+            Error::RuntimeOperationFailed { code, .. } if code == "remote_runtime_auth_failed" => {
+                StatusCode::UNAUTHORIZED
+            }
+            Error::RuntimeOperationFailed { code, .. } if code == "remote_runtime_timeout" => {
+                StatusCode::GATEWAY_TIMEOUT
+            }
+            Error::RuntimeOperationFailed { code, .. } if code == "remote_runtime_unsupported" => {
+                StatusCode::NOT_IMPLEMENTED
+            }
+            Error::RuntimeOperationFailed { .. } => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (
@@ -637,9 +1015,13 @@ mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
-    use serde_json::Value;
+    use futures::{SinkExt, StreamExt};
+    use serde_json::{Value, json};
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::Message;
     use tower::ServiceExt;
 
+    use crate::observation::ClientWorkerEventWsDiagnostic;
     use crate::store::SqliteWorkspaceStore;
 
     const TEST_WORKSPACE_ID: &str = "0192f0e8-4d84-7d6e-a000-000000000001";
@@ -746,14 +1128,62 @@ mod tests {
         let runtimes = get_json(app.clone(), "/api/runtimes").await;
         assert_eq!(runtimes["source"], "worker_runtime_registry");
         assert_eq!(runtimes["items"][0]["runtime_id"], "local-worker-runtime");
+        assert_eq!(
+            runtimes["items"][0]["source"]["kind"],
+            "local_compatibility"
+        );
+        assert_eq!(
+            runtimes["items"][0]["source"]["identity_authority"],
+            "runtime_registry_projection"
+        );
+        assert!(!runtimes.to_string().contains("/workspace/demo"));
         assert_eq!(runtimes["items"][0]["host_ids"][0], host_id);
 
         let workers = get_json(app.clone(), "/api/workers").await;
-        assert!(workers["items"].as_array().unwrap().is_empty());
+        let worker_items = workers["items"].as_array().unwrap();
+        let companion_worker = worker_items
+            .iter()
+            .find(|worker| worker["role"] == "workspace_companion")
+            .expect("companion worker is visible through runtime worker API");
+        assert_eq!(companion_worker["runtime_id"], "embedded-worker-runtime");
+        assert_eq!(companion_worker["capabilities"]["can_stop"], false);
         assert_eq!(
             workers["diagnostics"][0]["code"],
             "local_pod_registry_unreadable"
         );
+
+        let companion_status = get_json(app.clone(), "/api/companion/status").await;
+        assert_eq!(companion_status["state"], "ready");
+        assert_eq!(companion_status["worker"]["role"], "workspace_companion");
+        assert_eq!(
+            companion_status["transport"]["kind"],
+            "providerless_backend_internal"
+        );
+        assert!(!companion_status.to_string().contains("/workspace/demo"));
+
+        let companion_message = post_json(
+            app.clone(),
+            "/api/companion/messages",
+            json!({ "content": "hello companion" }),
+        )
+        .await;
+        assert_eq!(companion_message["state"], "accepted");
+        assert_eq!(companion_message["transcript"]["items"][0]["role"], "user");
+        assert_eq!(
+            companion_message["transcript"]["items"][1]["role"],
+            "assistant"
+        );
+        assert!(
+            companion_message["transcript"]["items"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("provider-less")
+        );
+        assert!(!companion_message.to_string().contains("/workspace/demo"));
+
+        let companion_transcript = get_json(app.clone(), "/api/companion/transcript").await;
+        assert_eq!(companion_transcript["total_items"], 2);
+        assert_eq!(companion_transcript["items"][1]["role"], "assistant");
 
         let host_workers = get_json(app.clone(), &format!("/api/hosts/{host_id}/workers")).await;
         assert!(host_workers["items"].as_array().unwrap().is_empty());
@@ -836,9 +1266,415 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn embedded_runtime_api_routes_by_runtime_and_worker_ids_without_leaking_internals() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let mut config = ServerConfig::local_dev(dir.path(), test_identity());
+        config.local_runtime_data_dir = Some(dir.path().join("data"));
+        let api = WorkspaceApi::new(config, Arc::new(store)).await.unwrap();
+        let app = build_router(api);
+
+        let runtimes = get_json(app.clone(), "/api/runtimes").await;
+        let embedded_summary = runtimes["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|runtime| runtime["runtime_id"] == "embedded-worker-runtime")
+            .expect("embedded runtime summary");
+        assert_eq!(
+            embedded_summary["source"]["kind"],
+            "embedded_worker_runtime"
+        );
+        assert_eq!(embedded_summary["source"]["status"], "active");
+        assert_eq!(
+            embedded_summary["capabilities"]["workspace_scope"],
+            "backend_internal"
+        );
+        assert_eq!(embedded_summary["capabilities"]["has_workspace_fs"], false);
+
+        let spawned = post_json(
+            app.clone(),
+            "/api/runtimes/embedded-worker-runtime/workers",
+            json!({
+                "intent": {
+                    "kind": "ticket_role",
+                    "ticket_id": "00001KVZSGT0Q",
+                    "role": "coder"
+                },
+                "requested_worker_name": "api-friendly-name",
+                "acceptance": {
+                    "kind": "run_accepted",
+                    "expected_segments": 0
+                }
+            }),
+        )
+        .await;
+        assert_eq!(spawned["state"], "accepted");
+        let worker_id = spawned["worker"]["worker_id"].as_str().unwrap().to_string();
+        assert_eq!(spawned["worker"]["runtime_id"], "embedded-worker-runtime");
+        assert_eq!(
+            spawned["worker"]["workspace"]["visibility"],
+            "backend_internal"
+        );
+        assert_eq!(
+            spawned["worker"]["implementation"]["kind"],
+            "embedded_worker_runtime"
+        );
+
+        let worker = get_json(
+            app.clone(),
+            &format!("/api/runtimes/embedded-worker-runtime/workers/{worker_id}"),
+        )
+        .await;
+        assert_eq!(worker["worker_id"], worker_id);
+        assert_eq!(worker["runtime_id"], "embedded-worker-runtime");
+
+        let accepted = post_json(
+            app.clone(),
+            &format!("/api/runtimes/embedded-worker-runtime/workers/{worker_id}/input"),
+            json!({
+                "kind": "user",
+                "content": "hello from browser-facing api"
+            }),
+        )
+        .await;
+        assert_eq!(accepted["state"], "accepted");
+        assert_eq!(accepted["runtime_id"], "embedded-worker-runtime");
+        assert_eq!(accepted["worker_id"], worker_id);
+        assert_eq!(accepted["transcript_sequence"], 1);
+
+        let transcript = get_json(
+            app.clone(),
+            &format!("/api/runtimes/embedded-worker-runtime/workers/{worker_id}/transcript?start=0&limit=10"),
+        )
+        .await;
+        assert_eq!(transcript["state"], "accepted");
+        assert_eq!(transcript["items"][0]["role"], "user");
+        assert_eq!(
+            transcript["items"][0]["content"],
+            "hello from browser-facing api"
+        );
+
+        let wrong_runtime = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/runtimes/local-worker-runtime/workers/{worker_id}/input"
+                    ))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "kind": "user",
+                            "content": "wrong runtime"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_runtime.status(), StatusCode::NOT_FOUND);
+
+        let projected = format!(
+            "{}{}{}{}{}",
+            embedded_summary, spawned, worker, accepted, transcript
+        );
+        for forbidden in [
+            dir.path().to_string_lossy().as_ref(),
+            "metadata.json",
+            "socket",
+            "session",
+            "token",
+            "credential",
+            "provider",
+        ] {
+            assert!(
+                !projected.contains(forbidden),
+                "embedded api projection leaked forbidden term: {forbidden}: {projected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn proxies_worker_observation_ws_with_backend_cursors_and_diagnostics() {
+        let runtime = worker_runtime::Runtime::new_memory();
+        let worker = runtime
+            .create_worker(worker_runtime::catalog::CreateWorkerRequest::default())
+            .unwrap();
+        let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let runtime_addr = runtime_listener.local_addr().unwrap();
+        tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                worker_runtime::http_server::serve_runtime_http(runtime, runtime_listener, None)
+                    .await
+                    .unwrap()
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let mut config = ServerConfig::local_dev(dir.path(), test_identity());
+        config.local_runtime_data_dir = Some(dir.path().join("data"));
+        config
+            .runtime_event_sources
+            .push(RuntimeObservationSourceConfig {
+                runtime_id: "runtime-a".into(),
+                worker_id: "worker-a".into(),
+                endpoint: format!(
+                    "ws://{runtime_addr}/v1/workers/{}/events/ws",
+                    worker.worker_ref.worker_id
+                ),
+                bearer_token: None,
+            });
+        let api = WorkspaceApi::new(config, Arc::new(store)).await.unwrap();
+        let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app_addr = app_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(app_listener, build_router(api)).await.unwrap() });
+
+        let url = format!("ws://{app_addr}/api/runtimes/runtime-a/workers/worker-a/events/ws");
+        let (mut stream, _) = connect_async(&url).await.unwrap();
+        let snapshot = next_client_frame(&mut stream).await;
+        let ClientWorkerEventWsFrame::Event { envelope: snapshot } = snapshot else {
+            panic!("expected snapshot event");
+        };
+        assert_eq!(snapshot.runtime_id, "runtime-a");
+        assert_eq!(snapshot.worker_id, "worker-a");
+        assert!(matches!(snapshot.payload, protocol::Event::Snapshot { .. }));
+
+        runtime
+            .observe_worker_event(
+                &worker.worker_ref,
+                protocol::Event::TextDelta {
+                    text: "live".into(),
+                },
+            )
+            .unwrap();
+        let live = next_client_frame(&mut stream).await;
+        let ClientWorkerEventWsFrame::Event { envelope: live } = live else {
+            panic!("expected live event");
+        };
+        assert_eq!(live.runtime_id, "runtime-a");
+        assert_eq!(live.worker_id, "worker-a");
+        assert!(matches!(live.payload, protocol::Event::TextDelta { .. }));
+
+        let (mut resumed, _) = connect_async(format!("{url}?cursor={}", live.cursor))
+            .await
+            .unwrap();
+        let _snapshot = next_client_frame(&mut resumed).await;
+        runtime
+            .observe_worker_event(
+                &worker.worker_ref,
+                protocol::Event::TextDone {
+                    text: "done".into(),
+                },
+            )
+            .unwrap();
+        let resumed_event = next_client_frame(&mut resumed).await;
+        let ClientWorkerEventWsFrame::Event {
+            envelope: resumed_event,
+        } = resumed_event
+        else {
+            panic!("expected resumed live event");
+        };
+        assert_ne!(resumed_event.cursor, live.cursor);
+        assert!(matches!(
+            resumed_event.payload,
+            protocol::Event::TextDone { .. }
+        ));
+
+        let (mut malformed, _) = connect_async(format!("{url}?cursor=bad")).await.unwrap();
+        let diagnostic = next_client_frame(&mut malformed).await;
+        let ClientWorkerEventWsFrame::Diagnostic { diagnostic } = diagnostic else {
+            panic!("expected malformed cursor diagnostic");
+        };
+        assert_eq!(diagnostic.code, "backend.cursor_malformed");
+
+        stream.send(Message::Text("{}".into())).await.unwrap();
+        let mut saw_observation_only = false;
+        for _ in 0..3 {
+            if let ClientWorkerEventWsFrame::Diagnostic { diagnostic } =
+                next_client_frame(&mut stream).await
+            {
+                assert_eq!(diagnostic.code, "backend.observation_only");
+                saw_observation_only = true;
+                break;
+            }
+        }
+        assert!(saw_observation_only, "expected observation-only diagnostic");
+    }
+
+    #[tokio::test]
+    async fn proxy_reports_unknown_backend_cursor_before_upstream_connect() {
+        let source = RuntimeObservationSourceConfig {
+            runtime_id: "runtime-a".into(),
+            worker_id: "worker-a".into(),
+            endpoint: "ws://127.0.0.1:9/not-used".into(),
+            bearer_token: None,
+        };
+        let (url, _dir) = spawn_workspace_proxy(source).await;
+        let (mut stream, _) = connect_async(format!("{url}?cursor=bo_ffffffffffffffff"))
+            .await
+            .unwrap();
+        let diagnostic = next_client_diagnostic(&mut stream).await;
+        assert_eq!(diagnostic.code, "backend.cursor_unknown_or_expired");
+    }
+
+    #[tokio::test]
+    async fn proxy_maps_runtime_cursor_diagnostic_to_typed_backend_diagnostic() {
+        let (_runtime, _worker_ref, endpoint) = spawn_runtime_worker().await;
+        let source = RuntimeObservationSourceConfig {
+            runtime_id: "runtime-a".into(),
+            worker_id: "worker-a".into(),
+            endpoint: format!("{endpoint}?cursor=wo_ffffffffffffffff"),
+            bearer_token: None,
+        };
+        let (url, _dir) = spawn_workspace_proxy(source).await;
+        let (mut stream, _) = connect_async(&url).await.unwrap();
+        assert!(matches!(
+            next_client_frame(&mut stream).await,
+            ClientWorkerEventWsFrame::Event { envelope } if matches!(envelope.payload, protocol::Event::Snapshot { .. })
+        ));
+        let diagnostic = next_client_diagnostic(&mut stream).await;
+        assert_eq!(diagnostic.code, "backend.cursor_unknown_or_expired");
+    }
+
+    #[tokio::test]
+    async fn proxy_maps_runtime_worker_not_found_http_404_to_typed_backend_diagnostic() {
+        let (_runtime, _worker_ref, endpoint) = spawn_runtime_worker().await;
+        let endpoint = endpoint.replace("/events/ws", "/missing-worker/events/ws");
+        let source = RuntimeObservationSourceConfig {
+            runtime_id: "runtime-a".into(),
+            worker_id: "worker-a".into(),
+            endpoint,
+            bearer_token: None,
+        };
+        let (url, _dir) = spawn_workspace_proxy(source).await;
+        let (mut stream, _) = connect_async(&url).await.unwrap();
+        let diagnostic = next_client_diagnostic(&mut stream).await;
+        assert_eq!(diagnostic.code, "backend.worker_not_found");
+    }
+
+    #[tokio::test]
+    async fn proxy_reports_actual_upstream_disconnect_separately() {
+        let endpoint = spawn_closing_runtime_ws().await;
+        let source = RuntimeObservationSourceConfig {
+            runtime_id: "runtime-a".into(),
+            worker_id: "worker-a".into(),
+            endpoint,
+            bearer_token: None,
+        };
+        let (url, _dir) = spawn_workspace_proxy(source).await;
+        let (mut stream, _) = connect_async(&url).await.unwrap();
+        let diagnostic = next_client_diagnostic(&mut stream).await;
+        assert_eq!(diagnostic.code, "backend.upstream_disconnect");
+    }
+
+    async fn next_client_frame(
+        stream: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> ClientWorkerEventWsFrame {
+        let message = stream.next().await.unwrap().unwrap();
+        let Message::Text(text) = message else {
+            panic!("expected text frame");
+        };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    async fn next_client_diagnostic(
+        stream: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> ClientWorkerEventWsDiagnostic {
+        match next_client_frame(stream).await {
+            ClientWorkerEventWsFrame::Diagnostic { diagnostic } => diagnostic,
+            ClientWorkerEventWsFrame::Event { envelope } => {
+                panic!("expected diagnostic, got event: {envelope:?}")
+            }
+        }
+    }
+
+    async fn spawn_runtime_worker() -> (
+        worker_runtime::Runtime,
+        worker_runtime::identity::WorkerRef,
+        String,
+    ) {
+        let runtime = worker_runtime::Runtime::new_memory();
+        let worker = runtime
+            .create_worker(worker_runtime::catalog::CreateWorkerRequest::default())
+            .unwrap();
+        let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let runtime_addr = runtime_listener.local_addr().unwrap();
+        tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                worker_runtime::http_server::serve_runtime_http(runtime, runtime_listener, None)
+                    .await
+                    .unwrap()
+            }
+        });
+        let endpoint = format!(
+            "ws://{runtime_addr}/v1/workers/{}/events/ws",
+            worker.worker_ref.worker_id
+        );
+        (runtime, worker.worker_ref, endpoint)
+    }
+
+    async fn spawn_workspace_proxy(
+        source: RuntimeObservationSourceConfig,
+    ) -> (String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let mut config = ServerConfig::local_dev(dir.path(), test_identity());
+        config.local_runtime_data_dir = Some(dir.path().join("data"));
+        let runtime_id = source.runtime_id.clone();
+        let worker_id = source.worker_id.clone();
+        config.runtime_event_sources.push(source);
+        let api = WorkspaceApi::new(config, Arc::new(store)).await.unwrap();
+        let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let app_addr = app_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(app_listener, build_router(api)).await.unwrap() });
+        (
+            format!("ws://{app_addr}/api/runtimes/{runtime_id}/workers/{worker_id}/events/ws"),
+            dir,
+        )
+    }
+
+    async fn spawn_closing_runtime_ws() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = websocket.close(None).await;
+        });
+        format!("ws://{addr}/events/ws")
+    }
+
     async fn get_json(app: Router, uri: &str) -> Value {
         let response = app
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn post_json(app: Router, uri: &str, body: Value) -> Value {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{uri}");

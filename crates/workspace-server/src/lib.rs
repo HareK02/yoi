@@ -4,8 +4,10 @@
 //! it is not the product CLI facade. Existing `.yoi` Ticket and Objective files
 //! remain the canonical project records and are read through bounded bridge APIs.
 
+pub mod companion;
 pub mod hosts;
 pub mod identity;
+pub mod observation;
 pub mod records;
 pub mod repositories;
 pub mod server;
@@ -40,10 +42,21 @@ pub enum Error {
     MissingFrontmatter(String),
     #[error("unknown local host `{0}`")]
     UnknownHost(String),
-    #[error("unknown local worker `{0}`")]
-    UnknownWorker(String),
+    #[error("unknown runtime `{0}`")]
+    UnknownRuntime(String),
+    #[error("unknown worker `{worker_id}` in runtime `{runtime_id}`")]
+    UnknownWorker {
+        runtime_id: String,
+        worker_id: String,
+    },
     #[error("invalid runtime {kind} `{value}`")]
     InvalidRuntimeIdentifier { kind: String, value: String },
+    #[error("runtime `{runtime_id}` operation failed ({code}): {message}")]
+    RuntimeOperationFailed {
+        runtime_id: String,
+        code: String,
+        message: String,
+    },
     #[error("runtime `{runtime_id}` does not support `{capability}`")]
     RuntimeCapabilityUnsupported {
         runtime_id: String,
