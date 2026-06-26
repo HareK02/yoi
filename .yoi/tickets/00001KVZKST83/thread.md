@@ -316,3 +316,20 @@ Scope:
 - REST command server / Backend integration / legacy migration / SQLite store は Non-goals として未実装。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T03:09:01Z -->
+
+## Implementation report
+
+Cleanup report:
+
+- FS store Coder/Reviewer child Workers were no longer present in the spawned-child registry at cleanup time, so no StopPod action was available for them.
+- Child implementation worktree removed:
+  - `/home/hare/Projects/yoi/.worktree/00001KVZKST83-worker-runtime-fs-store`
+- Child implementation branch removed:
+  - `work/00001KVZKST83-worker-runtime-fs-store`
+
+Operational note:
+- User noted StopPod should be run one-by-one rather than through parallel multi-tool execution; future cleanup will follow that.
+
+---

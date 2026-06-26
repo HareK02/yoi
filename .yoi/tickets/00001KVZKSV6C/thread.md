@@ -375,3 +375,20 @@ Scope:
 - embedded runtime connection / remote HTTP / REST server / Web Console は Non-goals として未実装。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T03:09:01Z -->
+
+## Implementation report
+
+Cleanup report:
+
+- Registry Coder/Reviewer child Workers were no longer present in the spawned-child registry at cleanup time, so no StopPod action was available for them.
+- Child implementation worktree removed:
+  - `/home/hare/Projects/yoi/.worktree/00001KVZKSV6C-backend-runtime-registry`
+- Child implementation branch removed:
+  - `work/00001KVZKSV6C-backend-runtime-registry`
+
+Operational note:
+- User noted StopPod should be run one-by-one rather than through parallel multi-tool execution; future cleanup will follow that.
+
+---

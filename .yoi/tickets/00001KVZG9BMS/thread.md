@@ -785,3 +785,22 @@ Allowed remaining `pod` wording must be explicitly intentional legacy/internal c
 
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T03:09:01Z -->
+
+## Implementation report
+
+Late cleanup report:
+
+- Stale child Workers stopped one-by-one and scope reclaimed:
+  - `yoi-coder-00001KVZG9BMS-worker-rename`
+  - `yoi-reviewer-00001KVZG9BMS-worker-rename`
+- Child implementation worktree removed:
+  - `/home/hare/Projects/yoi/.worktree/00001KVZG9BMS-worker-crate-rename`
+- Child implementation branch removed:
+  - `work/00001KVZG9BMS-worker-crate-rename`
+
+Operational note:
+- User noted StopPod should be run one-by-one rather than through parallel multi-tool execution; future cleanup will follow that.
+
+---
