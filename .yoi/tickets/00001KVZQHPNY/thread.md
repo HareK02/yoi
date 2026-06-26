@@ -374,3 +374,56 @@ Review result: approve
 - `package.nix` の `cargoHash` 更新も反映済み。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T07:39:30Z -->
+
+## Implementation report
+
+Integration / validation report:
+
+Integration:
+- Implementation branch `work/00001KVZQHPNY-runtime-config-bundles` を orchestration branch に merge 済み。
+- Merge commit: `7e8a8cfa merge: 00001KVZQHPNY runtime config bundles`
+
+Included implementation commits:
+- `abab1af2 feat: add runtime config bundle sync`
+- `4867ab21 fix: harden runtime config bundle boundary`
+
+Validation in Orchestrator worktree:
+- `cargo fmt --all --check`: success
+- `cargo test -p worker-runtime`: success（13 tests passed）
+- `cargo test -p yoi-workspace-server`: success（35 tests passed）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Review:
+- Reviewer approve 済み。前回 blockers だった bundle content boundary、bundle id path safety、remote diagnostics raw path non-leak は解消済み。
+
+Outcome:
+- Acceptance criteria を満たしたため `done` へ進める。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-26T07:39:39Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Runtime Profile/config bundle sync の実装、review、merge、Orchestrator validation が完了した。
+
+Done evidence:
+- Merge commit: `7e8a8cfa merge: 00001KVZQHPNY runtime config bundles`
+- Reviewer approve 済み。
+- Orchestrator validation:
+  - `cargo fmt --all --check`: success
+  - `cargo test -p worker-runtime`: success（13 tests passed）
+  - `cargo test -p yoi-workspace-server`: success（35 tests passed）
+  - `cargo check -p yoi`: success
+  - `git diff --check`: success
+  - `nix build .#yoi --no-link`: success
+
+Scope:
+- Config bundle domain/sync/check、worker creation integration、embedded/remote Backend sync/check boundary を追加。
+- Secret value sync / full Plugin package manager/signature policy / Web Console completion は Non-goals として未実装。
+
+---
