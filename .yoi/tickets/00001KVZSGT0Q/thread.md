@@ -244,3 +244,53 @@ Review result: approve
 - read-only 指示に従い、ビルド/テスト再実行やファイル変更は行わず、対象 commit の差分・実装・テストを静的確認した。報告済み validation 結果と矛盾する点はない。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-26T05:47:01Z -->
+
+## Implementation report
+
+Integration / validation report:
+
+Integration:
+- Implementation branch `work/00001KVZSGT0Q-embedded-runtime-registry` を orchestration branch に merge 済み。
+- Merge commit: `e0cc7acf merge: 00001KVZSGT0Q embedded runtime registry`
+
+Included implementation commit:
+- `c8209285 feat: add embedded workspace runtime registry`
+
+Validation in Orchestrator worktree:
+- `cargo fmt --all --check`: success
+- `cargo test -p yoi-workspace-server`: success（29 tests passed）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Review:
+- Reviewer approve 済み。embedded Runtime registration/routing、internal path/credential non-leak、local compatibility source separation、runtime_id+worker_id authority に blocker なし。
+
+Outcome:
+- Acceptance criteria を満たしたため `done` へ進める。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-26T05:47:09Z from: inprogress to: done reason: merged_reviewed_validated field: state -->
+
+## State changed
+
+Backend RuntimeRegistry embedded worker-runtime connection の実装、review、merge、Orchestrator validation が完了した。
+
+Done evidence:
+- Merge commit: `e0cc7acf merge: 00001KVZSGT0Q embedded runtime registry`
+- Reviewer approve 済み。
+- Orchestrator validation:
+  - `cargo fmt --all --check`: success
+  - `cargo test -p yoi-workspace-server`: success（29 tests passed）
+  - `cargo check -p yoi`: success
+  - `git diff --check`: success
+  - `nix build .#yoi --no-link`: success
+
+Scope:
+- Backend RuntimeRegistry に embedded `worker_runtime::Runtime` source を接続。
+- Remote process / FS/REST/WS server implementation / Web Console / Profile config sync は Non-goals として未実装。
+
+---
