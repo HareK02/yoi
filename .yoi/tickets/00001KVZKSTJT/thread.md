@@ -401,3 +401,62 @@ Review result: request_changes
 上記を修正し、Runtime diagnostic / HTTP failure を Backend の typed diagnostic に適切にマップするテストを追加すれば、設計境界自体は approve に近い状態。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZKSTJT-ws-proxy at: 2026-06-26T05:10:58Z -->
+
+## Implementation report
+
+Follow-up implementation report after review request_changes:
+
+Fix commit:
+- `8cc9a594f78feef62aa7abd5bbf11b5cd40b4781 fix: preserve runtime websocket diagnostics`
+
+修正内容:
+
+### 1. Runtime WS diagnostic の型を Backend で保持 / 変換
+
+`crates/workspace-server/src/observation.rs`
+
+- `RuntimeWsObservationClient::next_event` が Runtime diagnostic を全部 `backend.upstream_disconnect` に潰していた問題を修正。
+- Runtime diagnostic code を Backend typed diagnostic に変換:
+  - `runtime.worker_not_found` → `backend.worker_not_found`
+  - `runtime.cursor_malformed` → `backend.cursor_malformed`
+  - `runtime.cursor_unknown_or_expired` / `runtime.cursor_expired` → `backend.cursor_unknown_or_expired`
+  - `runtime.upstream_closed` / `runtime.websocket_error` → `backend.upstream_disconnect`
+  - `runtime.unavailable` → `backend.runtime_unavailable`
+  - `runtime.serialize_failed` → `backend.malformed_frame`
+  - `runtime.observation_only` → `backend.observation_only`
+- Runtime WS connect 時の HTTP 404 を `backend.worker_not_found` として扱うように変更。
+- 実際の socket close / receive error は引き続き `backend.upstream_disconnect` として区別。
+
+### 2. WS proxy テスト追加
+
+`crates/workspace-server/src/server.rs`
+
+追加 coverage:
+- Backend unknown/expired cursor:
+  - well-formed だが未知の `bo_...` cursor が `backend.cursor_unknown_or_expired` になること。
+- Runtime upstream diagnostic mapping:
+  - Runtime の `runtime.cursor_unknown_or_expired` が client-facing `backend.cursor_unknown_or_expired` に変換されること。
+- Runtime worker-not-found / HTTP 404 mapping:
+  - Runtime WS upgrade が 404 を返すケースを `backend.worker_not_found` として返すこと。
+- Upstream disconnect:
+  - Runtime upstream が WS 接続後に閉じた場合、`backend.upstream_disconnect` として返すこと。
+
+既存の snapshot/live/resume/filter/malformed cursor/observation-only coverage は維持。
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo check -p worker-runtime`: success
+- `cargo test -p worker-runtime --features ws-server`: success（14 tests passed + bin/doc tests）
+- `cargo test -p yoi-workspace-server`: success（26 tests passed + bin/doc tests）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Residual risks / review focus:
+- Runtime diagnostic code の Backend 変換は現 Runtime diagnostic set に対する明示 mapping。未知 code は `backend.runtime_unavailable` に安全側で畳む。
+- HTTP 404 は worker-not-found として扱う。Runtime 側で route miss と worker miss の HTTP body までは分離していないため、client-facing には endpoint/path/token 等を出さず typed diagnostic のみ返す。
+- v0 cursor/backlog は引き続き in-memory bounded。再起動 / eviction 後は unknown/expired cursor diagnostic。
+
+---
