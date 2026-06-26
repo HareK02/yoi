@@ -220,3 +220,27 @@ Residual risks / review focus:
 - `deno task test` の UI contract tests は component runtime harness ではなく、現行 Deno/Svelte 構成に合わせた focused contract tests。将来 component test harness が入るなら置き換え候補。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KW2GCPYF-worker-console at: 2026-06-26T18:11:54Z status: request_changes -->
+
+## Review: request changes
+
+Review result: request_changes
+
+ブロッカー:
+
+- `web/workspace/src/routes/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte`
+  - lines 263-267 の `$effect` が `refreshConsole()` を呼び、
+  - `refreshConsole()` lines 128-130 が `reloadToken += 1` で `reloadToken` を読み書きしています。
+  - Svelte runes の `$effect` は effect 内で同期的に読んだ state（ネストした関数呼び出し含む）を依存として追跡するため、この effect は `reloadToken` に依存しつつ自分で更新し、再実行ループになります。
+  - 結果として Worker detail/transcript fetch が継続的に走り、line 269 の observation WS も `reloadToken` 依存で再接続を繰り返すリスクがあります。Console が安定して開けないため、Acceptance の「Worker list can open a Console」「observation WS/input/transcript を適切に使う」を満たせません。
+
+確認済みの良い点:
+- old `web/workspace/src/routes/console` は存在せず、`/api/companion` 参照も Console 実装には残っていません。
+- 新 route は `/runtimes/[runtimeId]/workers/[workerId]/console`。
+- Worker list/sidebar は `runtime_id + worker_id` を `encodeURIComponent` して Console href を生成。
+- protocol event projection、snapshot/in-flight、非 streaming Worker の degrade 表示、compact/collapsible diagnostics card は実装されています。
+
+検証は read-only 方針に従い、ソース確認・`find`/`rg`・git 状態確認のみ実施しました。ビルド/テスト再実行は artifact/cache 作成の可能性があるため未実施です。
+
+---
