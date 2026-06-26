@@ -6,15 +6,16 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::hosts::{
-    DiagnosticSeverity, HostSummary, LocalWorkerRuntime, RuntimeDiagnostic, RuntimeRegistry,
-    RuntimeSummary, WorkerSummary,
+    DiagnosticSeverity, EmbeddedWorkerRuntime, HostSummary, LocalWorkerRuntime, RuntimeDiagnostic,
+    RuntimeRegistry, RuntimeSummary, WorkerInputRequest, WorkerInputResult, WorkerSpawnRequest,
+    WorkerSpawnResult, WorkerSummary, WorkerTranscriptProjection,
 };
 use crate::identity::WorkspaceIdentity;
 use crate::observation::{
@@ -87,11 +88,14 @@ impl WorkspaceApi {
                 updated_at: config.workspace_created_at.clone(),
             })
             .await?;
-        let runtime = Arc::new(RuntimeRegistry::for_local_pods(LocalWorkerRuntime::new(
-            config.workspace_id.clone(),
-            config.workspace_root.clone(),
-            config.local_runtime_data_dir.clone(),
-        )));
+        let runtime = Arc::new(RuntimeRegistry::for_workspace(
+            LocalWorkerRuntime::new(
+                config.workspace_id.clone(),
+                config.workspace_root.clone(),
+                config.local_runtime_data_dir.clone(),
+            ),
+            EmbeddedWorkerRuntime::new_memory(config.workspace_id.clone()),
+        ));
         let observation_proxy = BackendObservationProxy::new(config.runtime_event_sources.clone());
         Ok(Self {
             records: LocalProjectRecordReader::new(config.workspace_root.clone()),
@@ -139,6 +143,22 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route("/api/hosts", get(list_hosts))
         .route("/api/runtimes", get(list_runtimes))
         .route("/api/workers", get(list_workers))
+        .route(
+            "/api/runtimes/{runtime_id}/workers",
+            post(create_runtime_worker),
+        )
+        .route(
+            "/api/runtimes/{runtime_id}/workers/{worker_id}",
+            get(get_runtime_worker),
+        )
+        .route(
+            "/api/runtimes/{runtime_id}/workers/{worker_id}/input",
+            post(send_runtime_worker_input),
+        )
+        .route(
+            "/api/runtimes/{runtime_id}/workers/{worker_id}/transcript",
+            get(get_runtime_worker_transcript),
+        )
         .route(
             "/api/runtimes/{runtime_id}/workers/{worker_id}/events/ws",
             get(worker_observation_ws),
@@ -249,6 +269,12 @@ struct LogQuery {
 
 #[derive(Debug, Deserialize)]
 struct TicketKanbanQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TranscriptQuery {
+    start: Option<usize>,
     limit: Option<usize>,
 }
 
@@ -436,6 +462,55 @@ async fn list_workers(
     State(api): State<WorkspaceApi>,
 ) -> ApiResult<Json<RuntimeListResponse<WorkerSummary>>> {
     workers_response(api).map(Json)
+}
+
+async fn get_runtime_worker(
+    State(api): State<WorkspaceApi>,
+    AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
+) -> ApiResult<Json<WorkerSummary>> {
+    let worker = api
+        .runtime
+        .worker(&runtime_id, &worker_id)
+        .map_err(|err| err.into_error())?;
+    Ok(Json(worker))
+}
+
+async fn create_runtime_worker(
+    State(api): State<WorkspaceApi>,
+    AxumPath(runtime_id): AxumPath<String>,
+    Json(request): Json<WorkerSpawnRequest>,
+) -> ApiResult<Json<WorkerSpawnResult>> {
+    let result = api
+        .runtime
+        .spawn_worker(&runtime_id, request)
+        .map_err(|err| err.into_error())?;
+    Ok(Json(result))
+}
+
+async fn send_runtime_worker_input(
+    State(api): State<WorkspaceApi>,
+    AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
+    Json(request): Json<WorkerInputRequest>,
+) -> ApiResult<Json<WorkerInputResult>> {
+    let result = api
+        .runtime
+        .send_input(&runtime_id, &worker_id, request)
+        .map_err(|err| err.into_error())?;
+    Ok(Json(result))
+}
+
+async fn get_runtime_worker_transcript(
+    State(api): State<WorkspaceApi>,
+    AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
+    Query(query): Query<TranscriptQuery>,
+) -> ApiResult<Json<WorkerTranscriptProjection>> {
+    let limit = query.limit.unwrap_or(api.config.max_records).min(200);
+    let start = query.start.unwrap_or(0);
+    let result = api
+        .runtime
+        .transcript(&runtime_id, &worker_id, start, limit)
+        .map_err(|err| err.into_error())?;
+    Ok(Json(result))
 }
 
 async fn worker_observation_ws(
@@ -790,7 +865,7 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use futures::{SinkExt, StreamExt};
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message;
     use tower::ServiceExt;
@@ -999,6 +1074,138 @@ mod tests {
                 .unwrap()
                 .contains("Yoi Workspace")
         );
+    }
+
+    #[tokio::test]
+    async fn embedded_runtime_api_routes_by_runtime_and_worker_ids_without_leaking_internals() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        let mut config = ServerConfig::local_dev(dir.path(), test_identity());
+        config.local_runtime_data_dir = Some(dir.path().join("data"));
+        let api = WorkspaceApi::new(config, Arc::new(store)).await.unwrap();
+        let app = build_router(api);
+
+        let runtimes = get_json(app.clone(), "/api/runtimes").await;
+        let embedded_summary = runtimes["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|runtime| runtime["runtime_id"] == "embedded-worker-runtime")
+            .expect("embedded runtime summary");
+        assert_eq!(
+            embedded_summary["source"]["kind"],
+            "embedded_worker_runtime"
+        );
+        assert_eq!(embedded_summary["source"]["status"], "active");
+        assert_eq!(
+            embedded_summary["capabilities"]["workspace_scope"],
+            "backend_internal"
+        );
+        assert_eq!(embedded_summary["capabilities"]["has_workspace_fs"], false);
+
+        let spawned = post_json(
+            app.clone(),
+            "/api/runtimes/embedded-worker-runtime/workers",
+            json!({
+                "intent": {
+                    "kind": "ticket_role",
+                    "ticket_id": "00001KVZSGT0Q",
+                    "role": "coder"
+                },
+                "requested_worker_name": "api-friendly-name",
+                "acceptance": {
+                    "kind": "run_accepted",
+                    "expected_segments": 0
+                }
+            }),
+        )
+        .await;
+        assert_eq!(spawned["state"], "accepted");
+        let worker_id = spawned["worker"]["worker_id"].as_str().unwrap().to_string();
+        assert_eq!(spawned["worker"]["runtime_id"], "embedded-worker-runtime");
+        assert_eq!(
+            spawned["worker"]["workspace"]["visibility"],
+            "backend_internal"
+        );
+        assert_eq!(
+            spawned["worker"]["implementation"]["kind"],
+            "embedded_worker_runtime"
+        );
+
+        let worker = get_json(
+            app.clone(),
+            &format!("/api/runtimes/embedded-worker-runtime/workers/{worker_id}"),
+        )
+        .await;
+        assert_eq!(worker["worker_id"], worker_id);
+        assert_eq!(worker["runtime_id"], "embedded-worker-runtime");
+
+        let accepted = post_json(
+            app.clone(),
+            &format!("/api/runtimes/embedded-worker-runtime/workers/{worker_id}/input"),
+            json!({
+                "kind": "user",
+                "content": "hello from browser-facing api"
+            }),
+        )
+        .await;
+        assert_eq!(accepted["state"], "accepted");
+        assert_eq!(accepted["runtime_id"], "embedded-worker-runtime");
+        assert_eq!(accepted["worker_id"], worker_id);
+        assert_eq!(accepted["transcript_sequence"], 1);
+
+        let transcript = get_json(
+            app.clone(),
+            &format!("/api/runtimes/embedded-worker-runtime/workers/{worker_id}/transcript?start=0&limit=10"),
+        )
+        .await;
+        assert_eq!(transcript["state"], "accepted");
+        assert_eq!(transcript["items"][0]["role"], "user");
+        assert_eq!(
+            transcript["items"][0]["content"],
+            "hello from browser-facing api"
+        );
+
+        let wrong_runtime = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/runtimes/local-worker-runtime/workers/{worker_id}/input"
+                    ))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "kind": "user",
+                            "content": "wrong runtime"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_runtime.status(), StatusCode::NOT_FOUND);
+
+        let projected = format!(
+            "{}{}{}{}{}",
+            embedded_summary, spawned, worker, accepted, transcript
+        );
+        for forbidden in [
+            dir.path().to_string_lossy().as_ref(),
+            "metadata.json",
+            "socket",
+            "session",
+            "token",
+            "credential",
+            "provider",
+        ] {
+            assert!(
+                !projected.contains(forbidden),
+                "embedded api projection leaked forbidden term: {forbidden}: {projected}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1261,6 +1468,23 @@ mod tests {
     async fn get_json(app: Router, uri: &str) -> Value {
         let response = app
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn post_json(app: Router, uri: &str, body: Value) -> Value {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{uri}");
