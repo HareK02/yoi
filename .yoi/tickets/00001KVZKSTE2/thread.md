@@ -155,3 +155,70 @@ Dependent queued Tickets:
 - `00001KVZKSTJT`, `00001KVZSGT14`, `00001KW04A8K6`, and `00001KVZ9JGK0` remain queued with blocker notes until their prerequisite chain is done.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KVZKSTE2-rest-server at: 2026-06-26T03:10:50Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装完了。マージ・Ticket 更新・cleanup はしていない。
+
+Commit:
+- `f43a6b84011024b68c03fd5b4211ab427614683b feat: add worker runtime REST server`
+
+変更ファイル:
+- `crates/worker-runtime/Cargo.toml`
+  - optional feature `http-server` を追加。
+  - `axum`, `tokio`, `tower`, `serde_json` を feature-gated dependency として追加。
+- `crates/worker-runtime/src/lib.rs`
+  - `#[cfg(feature = "http-server")] pub mod http_server;` を追加。
+  - core は HTTP 非依存で、REST adapter は optional である旨を module docs に追記。
+- `crates/worker-runtime/src/http_server.rs`
+  - Runtime REST process adapter を新規追加。
+- `Cargo.lock`
+  - `worker-runtime` optional dependency 反映。
+- `package.nix`
+  - cargo vendor hash 更新。
+
+追加 API / endpoints:
+- `worker_runtime::http_server` module（`http-server` feature 有効時）。
+- `RuntimeHttpServerConfig`: `bind_addr`, `runtime_id`, `display_name`, `limits`, `store`, `local_token`。
+- `RuntimeHttpStoreSelection`: `Memory`; `Fs { root }` は `fs-store` feature 併用時のみ。
+- `RuntimeHttpServer::bind(...)`, `RuntimeHttpServer::serve(...)`, `serve_configured_runtime_http(...)`, `serve_runtime_http(...)`, `runtime_http_router(...)`。
+- REST endpoints:
+  - `GET /v1/runtime`
+  - `GET /v1/workers`
+  - `GET /v1/workers/{worker_id}`
+  - `POST /v1/workers`
+  - `POST /v1/workers/{worker_id}/input`
+  - `POST /v1/workers/{worker_id}/stop`
+  - `POST /v1/workers/{worker_id}/cancel`
+  - `GET /v1/workers/{worker_id}/transcript`
+
+Boundary notes:
+- 各 handler は `Runtime` lib API に委譲し、Worker semantics は複製していない。
+- Worker authority は server 側 Runtime id + path の `worker_id` から `WorkerRef` を組み立てる形。
+- module docs / API comments に「Browser は Runtime process へ直接接続しない。Backend/proxy が intended client」という境界を明記。
+- SSE / WebSocket / Backend integration / dynamic registration / Web Console / full auth model は未実装。
+- `local_token` は backend-to-runtime 用の最小 bearer token placeholder のみ。
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo test -p worker-runtime --no-default-features`: success（8 passed）
+- `cargo test -p worker-runtime --features http-server`: success（11 passed）
+- `cargo test -p worker-runtime --features fs-store,http-server`: success（13 passed）
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Notes:
+- `nix build` は初回 `cargoHash` 不一致で失敗。hash 更新後に再実行して成功。
+
+Residual risks / review focus:
+- REST response shapes は v0 として明示型を追加したが、外部 API として固定する前に Backend 側の envelope naming / field naming は確認余地あり。
+- `stop` / `cancel` は空 body も許容し、body がある場合は `{ "reason": ... }` を受ける。Backend 側で厳密 JSON body 必須にしたい場合は調整可能。
+- `local_token` は placeholder であり、Browser-facing credential model ではない。この境界が崩れていないか review focus。
+- `tower` は router unit test helper 用にも使うが、`http-server` feature 配下の optional dependency。core / no-default build には入らない。
+
+---
