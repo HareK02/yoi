@@ -309,3 +309,22 @@ Residual risks / review focus:
 - `fs` store は `fs-store` feature 併用時のみ有効で、`http-server` 単独 build では明示エラー。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KVZKSTE2-rest-server at: 2026-06-26T03:23:55Z status: approve -->
+
+## Review: approve
+
+Review result: approve
+
+確認結果:
+- 以前の blocker（Runtime process wrapper / binary target 欠落）は解消済み。
+  - `crates/worker-runtime/Cargo.toml` に `[[bin]]` が追加され、`worker-runtime-rest-server` / `src/main.rs` / `required-features = ["http-server"]` になっている。
+- `http-server` feature 必須の binary target なので、no-default/core library 側に HTTP server binary/deps を強制しない形。
+- `src/main.rs` は `RuntimeHttpServer::bind(config)` → `server.serve().await` を呼ぶ薄い process wrapper で、REST semantics を再実装していない。
+- v0 config は bind addr / runtime id / display name / memory/fs store selection / local token/env token / transcript/event limits を扱っており、Ticket 範囲として妥当。
+- help・module comment・startup log で「Browser は Runtime process に直接接続せず trusted backend/proxy 経由」の境界が明記されている。
+- SSE / WebSocket / Backend integration / dynamic registration / full auth model の追加は見当たらない。
+
+実施した検証は read-only inspection と `cargo read-manifest` / `rg` / `git` による確認。報告済み cargo/nix validation は再実行していない。
+
+---
