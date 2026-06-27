@@ -255,3 +255,41 @@ request_changes
 - 作業ツリーは review 後も clean。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KW55B32Y-exec-backend at: 2026-06-27T19:46:45Z -->
+
+## Implementation report
+
+Change-response implementation report:
+
+Reviewer blocker を修正済み。マージ / close / cleanup は未実施。
+
+Fix commit:
+- `761b60c85750d03c119733a088fb5073f9b37e9a fix: initialize restored worker observations`
+
+修正内容:
+
+`RuntimeState::from_persisted` の fs-store restore path で、`ws-server` feature 有効時の observation bus 状態を初期化するようにした。
+
+追加初期化:
+- `next_observation_sequence: 1`
+- `observation_events: VecDeque::new()`
+- `observation_tx: broadcast::channel(256).0`
+
+また、`fs_store_restores_workers_events_and_transcripts` に `ws-server` 有効時の focused assertion を追加し、restore 後の Runtime でも `observe_worker_event` / `read_worker_observation_events` が動くことを確認した。
+
+Validation:
+- `CARGO_TARGET_DIR=/tmp/yoi-review-target-00001KW55B32Y cargo check -p worker-runtime --features "ws-server fs-store"`: success
+- `cargo fmt --all`: success
+- `cargo test -p worker-runtime --features ws-server`: success
+- `cargo test -p worker-runtime --features "ws-server fs-store"`: success
+- `cargo test -p yoi-workspace-server`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Residual risk / review focus:
+- observation events 自体は fs-store 永続化対象ではないため、restore 後の observation backlog は空から開始する。これは既存の observation bus/backlog の揮発的性質に沿った修正。
+- 今回は compile blocker の修正に限定し、backend adapter や永続 observation replay の設計拡張は行っていない。
+
+---
