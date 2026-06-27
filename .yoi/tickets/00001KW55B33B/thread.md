@@ -463,3 +463,25 @@ sanitized diagnostic 例:
 - Companion status は環境の profile/provider setup 可否により `ready` / `error` のどちらも取り得るため、既存テストはその環境差を許容する形に調整。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KW55B33B-worker-adapter at: 2026-06-27T21:42:24Z status: approve -->
+
+## Review: approve
+
+approve
+
+読取専用で再レビューした。前回 blocker は解消されている。
+
+確認した点:
+
+- `workspace-server` の embedded spawn 後に `detail.execution.last_result` を検査し、`Rejected / Errored / Unsupported / Busy` を browser-facing `WorkerSpawnResult.state = Rejected` として返すようになっている。
+- spawn execution failure の diagnostic は sanitized な固定文言・code で返され、内部 path / handle / credential / secret ref の露出は見当たらない。
+- `can_accept_input` は backend 接続・Worker `Running`・backend kind `Connected`・`run_state == Idle`・last_result failure でないことを要求しており、spawn failure 後の入力可能 projection は塞がれている。
+- `can_stop` も rejected / errored / unconnected failure state では false になる。
+- 先回指摘の embedded input API delegate、builtin profile double-prefix、protocol event -> runtime execution status projection も修正済み。
+- crate layering は `worker` 側 feature adapter -> `worker-runtime` boundary の向きで、`worker-runtime` が `worker` に依存する逆流は見当たらない。
+- fake/providerless fallback、public capability flag 復活、下流 Ticket `00001KW55B33H` scope creep は見当たらない。
+
+検証は指示通り read-only の静的確認のみで、テスト実行やファイル変更はしていない。
+
+---
