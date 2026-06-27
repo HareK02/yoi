@@ -293,3 +293,34 @@ Residual risk / review focus:
 - 今回は compile blocker の修正に限定し、backend adapter や永続 observation replay の設計拡張は行っていない。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KW55B32Y-exec-backend at: 2026-06-27T19:48:30Z status: approve -->
+
+## Review: approve
+
+approve
+
+確認結果:
+
+- 先回ブロッカーだった `ws-server + fs-store` の `RuntimeState::from_persisted` 初期化漏れは修正済み。
+  - `next_observation_sequence`
+  - `observation_events`
+  - `observation_tx`
+  が restore path で初期化されていることを確認。
+- 追加 test で restored Runtime の `observe_worker_event` / `read_worker_observation_events` が検証されていることを確認。
+- 手元検証:
+  - `CARGO_TARGET_DIR=/tmp/yoi-review-target-00001KW55B32Y cargo check -p worker-runtime --features "ws-server fs-store"`: pass
+  - `CARGO_TARGET_DIR=/tmp/yoi-review-target-00001KW55B32Y cargo test -p worker-runtime --features "ws-server fs-store"`: pass
+- original Ticket invariants について、前回確認済みの内容から regression は見当たらない。
+  - backend-unconnected input rejection / transcript 非追加
+  - fake/providerless assistant response なし
+  - fake backend dispatch boundary
+  - protocol event publish hook
+  - stop/cancel unsupported typed rejection
+  - `can_stream_events` / `can_read_bounded_transcript` public capability 復活なし
+  - Browser-facing projection で raw backend internals/path/credential leak なし
+  - concrete `worker` crate adapter / Companion real LLM execution への scope creep なし
+
+作業ツリーも clean のまま。
+
+---
