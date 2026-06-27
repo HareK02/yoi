@@ -199,3 +199,27 @@ Residual risks / review focus:
 - `WorkerSummary` / `WorkerDetail` の public JSON に `execution` が増えるが、handle/path/socket/credential/session/manifest など raw internals は含めていない。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-27T19:36:13Z -->
+
+## Implementation report
+
+Review kickoff:
+
+Reviewer Worker spawned for `00001KW55B32Y` implementation.
+
+- Reviewer Worker: `yoi-reviewer-00001KW55B32Y-exec-backend`
+- Review target commit: `2d5971738478f832ba9a135601ea11dda60c565d feat: add worker execution backend boundary`
+- Review mode: read-only implementation worktree review
+
+Review focus:
+- backend-unconnected input rejection and no transcript/event acceptance
+- connected fake backend input dispatch boundary
+- protocol event publish hook correctness
+- stop/cancel unsupported typed rejection
+- no fake/providerless assistant response
+- no `can_stream_events` / `can_read_bounded_transcript` public capability regression
+- no raw execution handle/path/socket/session/credential leakage
+- no scope creep into concrete `worker` crate adapter or Companion real LLM execution
+
+---
