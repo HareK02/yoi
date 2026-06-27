@@ -960,7 +960,7 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let detail: RuntimeHttpWorkerResponse = read_json(response).await;
-        assert_eq!(detail.worker.transcript_len, 2);
+        assert_eq!(detail.worker.transcript_len, 1);
 
         let response = empty_request(
             app.clone(),
@@ -999,7 +999,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let workers: RuntimeHttpWorkersResponse = read_json(response).await;
         assert_eq!(workers.workers.len(), 1);
-        assert_eq!(workers.workers[0].transcript_len, 2);
+        assert_eq!(workers.workers[0].transcript_len, 1);
 
         let response = empty_request(app, Method::GET, "/v1/runtime").await;
         assert_eq!(response.status(), StatusCode::OK);

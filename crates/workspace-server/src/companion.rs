@@ -1,19 +1,15 @@
 use std::sync::{Arc, Mutex};
 
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use worker_runtime::catalog::{CapabilityRequest, ProfileSelector};
 
 use crate::hosts::{
-    DiagnosticSeverity, RuntimeDiagnostic, RuntimeRegistry, WorkerInputKind, WorkerInputRequest,
-    WorkerOperationState, WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest,
-    WorkerSummary,
+    DiagnosticSeverity, RuntimeDiagnostic, RuntimeRegistry, WorkerOperationState,
+    WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest, WorkerSummary,
 };
 
 const COMPANION_RUNTIME_ID: &str = "embedded-worker-runtime";
 const MAX_MESSAGE_CHARS: usize = 8_000;
-const PROVIDERLESS_RESPONSE: &str =
-    include_str!("../../../resources/prompts/worker/web_companion_providerless.md");
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -103,7 +99,6 @@ struct CompanionWorkerState {
 }
 
 pub struct CompanionConsole {
-    runtime: Arc<RuntimeRegistry>,
     worker: Mutex<CompanionWorkerState>,
     transcript: Mutex<CompanionTranscript>,
 }
@@ -112,7 +107,6 @@ impl CompanionConsole {
     pub fn new(runtime: Arc<RuntimeRegistry>) -> Self {
         let initial = spawn_companion_worker(&runtime);
         Self {
-            runtime,
             worker: Mutex::new(initial),
             transcript: Mutex::new(CompanionTranscript::default()),
         }
@@ -125,7 +119,7 @@ impl CompanionConsole {
                 return CompanionStatusResponse {
                     state: CompanionState::Error,
                     worker: None,
-                    transport: providerless_transport(),
+                    transport: companion_transport(),
                     diagnostics: vec![diagnostic(
                         "companion_state_unavailable",
                         DiagnosticSeverity::Error,
@@ -137,7 +131,7 @@ impl CompanionConsole {
         CompanionStatusResponse {
             state: worker.state,
             worker: worker.worker.clone(),
-            transport: providerless_transport(),
+            transport: companion_transport(),
             diagnostics: worker.diagnostics.clone(),
         }
     }
@@ -181,125 +175,18 @@ impl CompanionConsole {
             ));
         }
 
-        let mut transcript = match self.transcript.try_lock() {
-            Ok(transcript) => transcript,
-            Err(std::sync::TryLockError::WouldBlock) => {
-                return self.busy_message_response();
-            }
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                return self.error_message_response(diagnostic(
-                    "companion_transcript_unavailable",
-                    DiagnosticSeverity::Error,
-                    "Companion transcript is unavailable",
-                ));
-            }
-        };
-
-        let (worker, mut diagnostics) = match self.current_worker() {
-            Ok((Some(worker), diagnostics)) => (worker, diagnostics),
-            Ok((None, diagnostics)) => {
-                return response_from_locked_transcript(
-                    &transcript,
-                    CompanionState::Error,
-                    None,
-                    None,
-                    None,
-                    0,
-                    200,
-                    diagnostics,
-                );
-            }
-            Err(diagnostic) => {
-                return response_from_locked_transcript(
-                    &transcript,
-                    CompanionState::Error,
-                    None,
-                    None,
-                    None,
-                    0,
-                    200,
-                    vec![diagnostic],
-                );
-            }
-        };
-
-        let user_item = transcript.push("user", content.clone(), "browser_request", "accepted");
-        match self.runtime.send_input(
-            &worker.runtime_id,
-            &worker.worker_id,
-            WorkerInputRequest {
-                kind: WorkerInputKind::User,
-                content,
-            },
-        ) {
-            Ok(result) if result.state == WorkerOperationState::Accepted => {
-                diagnostics.extend(result.diagnostics);
-            }
-            Ok(result) => {
-                diagnostics.extend(result.diagnostics);
-                diagnostics.push(diagnostic(
-                    "companion_runtime_input_rejected",
-                    DiagnosticSeverity::Error,
-                    "Embedded Companion Worker rejected the browser message",
-                ));
-                return response_from_locked_transcript(
-                    &transcript,
-                    CompanionState::Error,
-                    Some(worker),
-                    Some(user_item),
-                    None,
-                    0,
-                    200,
-                    diagnostics,
-                );
-            }
-            Err(error) => {
-                diagnostics.push(diagnostic(
-                    "companion_runtime_input_failed",
-                    DiagnosticSeverity::Error,
-                    format!("Embedded Companion Worker input failed: {error:?}"),
-                ));
-                return response_from_locked_transcript(
-                    &transcript,
-                    CompanionState::Error,
-                    Some(worker),
-                    Some(user_item),
-                    None,
-                    0,
-                    200,
-                    diagnostics,
-                );
-            }
-        }
-
-        diagnostics.push(diagnostic(
-            "companion_providerless_boundary",
-            DiagnosticSeverity::Info,
-            "Real LLM completion is not connected in this MVP; response is the backend provider-less boundary text",
-        ));
-        let assistant_item = transcript.push(
-            "assistant",
-            providerless_response_text(),
-            "backend_providerless_boundary",
-            "complete",
-        );
-        response_from_locked_transcript(
-            &transcript,
-            CompanionState::Accepted,
-            Some(worker),
-            Some(user_item),
-            Some(assistant_item),
-            0,
-            200,
-            diagnostics,
-        )
+        self.rejected_message_response(diagnostic(
+            "companion_llm_not_connected",
+            DiagnosticSeverity::Error,
+            "Workspace Companion input is disabled until it is connected to actual Worker/LLM execution",
+        ))
     }
 
     pub fn cancel(&self, _request: CompanionCancelRequest) -> CompanionMessageResponse {
         let diagnostics = vec![diagnostic(
             "companion_cancel_no_active_run",
             DiagnosticSeverity::Info,
-            "Provider-less Companion Console has no active generation to cancel",
+            "Workspace Companion has no active generation to cancel",
         )];
         match self.transcript.lock() {
             Ok(transcript) => response_from_locked_transcript(
@@ -335,19 +222,6 @@ impl CompanionConsole {
         }
     }
 
-    fn current_worker(
-        &self,
-    ) -> Result<(Option<WorkerSummary>, Vec<RuntimeDiagnostic>), RuntimeDiagnostic> {
-        let worker = self.worker.lock().map_err(|_| {
-            diagnostic(
-                "companion_state_unavailable",
-                DiagnosticSeverity::Error,
-                "Companion state is unavailable",
-            )
-        })?;
-        Ok((worker.worker.clone(), worker.diagnostics.clone()))
-    }
-
     fn rejected_message_response(&self, diagnostic: RuntimeDiagnostic) -> CompanionMessageResponse {
         match self.transcript.lock() {
             Ok(transcript) => response_from_locked_transcript(
@@ -377,83 +251,6 @@ impl CompanionConsole {
                 diagnostics: vec![diagnostic],
             },
         }
-    }
-
-    fn busy_message_response(&self) -> CompanionMessageResponse {
-        let diagnostic = diagnostic(
-            "companion_busy",
-            DiagnosticSeverity::Warning,
-            "Companion Console is already processing a message",
-        );
-        match self.transcript.lock() {
-            Ok(transcript) => response_from_locked_transcript(
-                &transcript,
-                CompanionState::Busy,
-                self.status().worker,
-                None,
-                None,
-                0,
-                200,
-                vec![diagnostic],
-            ),
-            Err(_) => CompanionMessageResponse {
-                state: CompanionState::Busy,
-                worker: self.status().worker,
-                user_item: None,
-                assistant_item: None,
-                transcript: CompanionTranscriptProjection {
-                    state: CompanionState::Busy,
-                    start: 0,
-                    limit: 200,
-                    total_items: 0,
-                    next_start: None,
-                    items: Vec::new(),
-                    diagnostics: vec![diagnostic.clone()],
-                },
-                diagnostics: vec![diagnostic],
-            },
-        }
-    }
-
-    fn error_message_response(&self, diagnostic: RuntimeDiagnostic) -> CompanionMessageResponse {
-        CompanionMessageResponse {
-            state: CompanionState::Error,
-            worker: self.status().worker,
-            user_item: None,
-            assistant_item: None,
-            transcript: CompanionTranscriptProjection {
-                state: CompanionState::Error,
-                start: 0,
-                limit: 200,
-                total_items: 0,
-                next_start: None,
-                items: Vec::new(),
-                diagnostics: vec![diagnostic.clone()],
-            },
-            diagnostics: vec![diagnostic],
-        }
-    }
-}
-
-impl CompanionTranscript {
-    fn push(
-        &mut self,
-        role: impl Into<String>,
-        content: impl Into<String>,
-        source: impl Into<String>,
-        status: impl Into<String>,
-    ) -> CompanionTranscriptItem {
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        let item = CompanionTranscriptItem {
-            sequence: self.next_sequence,
-            role: role.into(),
-            content: content.into(),
-            created_at: Utc::now().to_rfc3339(),
-            source: source.into(),
-            status: status.into(),
-        };
-        self.items.push(item.clone());
-        item
     }
 }
 
@@ -537,15 +334,11 @@ fn project_transcript(
     }
 }
 
-fn providerless_response_text() -> String {
-    PROVIDERLESS_RESPONSE.trim().to_string()
-}
-
-fn providerless_transport() -> CompanionTransportSummary {
+fn companion_transport() -> CompanionTransportSummary {
     CompanionTransportSummary {
-        kind: "providerless_backend_internal".to_string(),
-        completion: "synchronous_request_response".to_string(),
-        limitation: "No provider-backed LLM generation is wired in this MVP; browser messages are recorded by a backend-internal tools-less Companion Worker and receive a resource-defined boundary response.".to_string(),
+        kind: "embedded_worker_runtime".to_string(),
+        completion: "not_connected".to_string(),
+        limitation: "Workspace Companion is visible as an embedded Worker, but browser input is disabled until actual Worker/LLM execution is connected.".to_string(),
     }
 }
 
@@ -567,7 +360,7 @@ mod tests {
     use crate::hosts::{EmbeddedWorkerRuntime, RuntimeRegistry};
 
     #[test]
-    fn companion_spawns_visible_worker_and_records_providerless_turn() {
+    fn companion_spawns_visible_worker_without_fake_turn() {
         let registry =
             RuntimeRegistry::for_workspace(EmbeddedWorkerRuntime::new_memory("local:test"));
         let registry = Arc::new(registry);
@@ -591,22 +384,19 @@ mod tests {
         let response = companion.send_message(CompanionMessageRequest {
             content: "hello".to_string(),
         });
-        assert_eq!(response.state, CompanionState::Accepted);
-        assert_eq!(response.transcript.items.len(), 2);
-        assert_eq!(response.transcript.items[0].role, "user");
-        assert_eq!(response.transcript.items[1].role, "assistant");
+        assert_eq!(response.state, CompanionState::Rejected);
+        assert!(response.transcript.items.is_empty());
         assert!(
-            response.transcript.items[1]
-                .content
-                .contains("provider-less")
+            response
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "companion_llm_not_connected")
         );
 
         let runtime_transcript = registry
             .transcript(COMPANION_RUNTIME_ID, &worker.worker_id, 0, 10)
             .unwrap();
-        assert_eq!(runtime_transcript.items.len(), 2);
-        assert_eq!(runtime_transcript.items[0].role, "user");
-        assert_eq!(runtime_transcript.items[1].role, "assistant");
+        assert!(runtime_transcript.items.is_empty());
 
         let browser_payload = serde_json::to_string(&(status, response)).unwrap();
         for forbidden in [

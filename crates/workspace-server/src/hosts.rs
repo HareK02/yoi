@@ -957,7 +957,7 @@ impl EmbeddedWorkerRuntime {
                 display_hint: "backend-internal worker-runtime Worker".to_string(),
             },
             capabilities: WorkerCapabilitySummary {
-                can_accept_input: true,
+                can_accept_input: false,
                 can_stop: false,
                 can_spawn_followup: false,
             },
@@ -989,7 +989,7 @@ impl EmbeddedWorkerRuntime {
                 display_hint: "backend-internal worker-runtime Worker".to_string(),
             },
             capabilities: WorkerCapabilitySummary {
-                can_accept_input: true,
+                can_accept_input: false,
                 can_stop: false,
                 can_spawn_followup: false,
             },
@@ -1255,40 +1255,17 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         ))
     }
 
-    fn send_input(&self, worker_id: &str, request: WorkerInputRequest) -> WorkerInputResult {
-        let Some(worker_ref) = self.worker_ref(worker_id) else {
-            return embedded_input_rejected(
-                &self.runtime_id,
-                worker_id,
-                diagnostic(
-                    "embedded_worker_id_invalid",
-                    DiagnosticSeverity::Warning,
-                    "Worker id was empty and cannot be resolved".to_string(),
-                ),
-            );
-        };
-        let input = EmbeddedWorkerInput {
-            kind: match request.kind {
-                WorkerInputKind::User => EmbeddedWorkerInputKind::User,
-                WorkerInputKind::System => EmbeddedWorkerInputKind::System,
-            },
-            content: request.content,
-        };
-        match self.runtime.send_input(&worker_ref, input) {
-            Ok(ack) => WorkerInputResult {
-                state: WorkerOperationState::Accepted,
-                runtime_id: self.runtime_id.clone(),
-                worker_id: worker_id.to_string(),
-                transcript_sequence: Some(ack.transcript_sequence),
-                event_id: Some(ack.event_id),
-                diagnostics: Vec::new(),
-            },
-            Err(err) => embedded_input_rejected(
-                &self.runtime_id,
-                worker_id,
-                embedded_runtime_diagnostic(&err),
+    fn send_input(&self, worker_id: &str, _request: WorkerInputRequest) -> WorkerInputResult {
+        embedded_input_rejected(
+            &self.runtime_id,
+            worker_id,
+            diagnostic(
+                "embedded_worker_llm_not_connected",
+                DiagnosticSeverity::Error,
+                "Embedded Worker input is disabled until actual Worker/LLM execution is connected"
+                    .to_string(),
             ),
-        }
+        )
     }
 
     fn transcript(
@@ -1878,7 +1855,7 @@ fn embedded_runtime_capabilities(limit: usize, available: bool) -> RuntimeCapabi
         can_get_worker: available,
         can_spawn_worker: available,
         can_stop_worker: false,
-        can_accept_input: available,
+        can_accept_input: false,
         has_workspace_fs: false,
         has_shell: false,
         has_git: false,
@@ -2611,7 +2588,7 @@ mod tests {
         );
         assert_eq!(embedded_summary.source.status, RuntimeSourceStatus::Active);
         assert!(embedded_summary.capabilities.can_spawn_worker);
-        assert!(embedded_summary.capabilities.can_accept_input);
+        assert!(!embedded_summary.capabilities.can_accept_input);
 
         let spawned = registry
             .spawn_worker(
@@ -2644,7 +2621,7 @@ mod tests {
         assert_eq!(worker.workspace.identity, "runtime_registry_worker");
         assert_eq!(worker.implementation.kind, "embedded_worker_runtime");
         assert_eq!(worker.profile.as_deref(), Some("builtin:coder"));
-        assert!(worker.capabilities.can_accept_input);
+        assert!(!worker.capabilities.can_accept_input);
 
         let input = registry
             .send_input(
@@ -2656,24 +2633,21 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(input.state, WorkerOperationState::Accepted);
+        assert_eq!(input.state, WorkerOperationState::Rejected);
         assert_eq!(input.runtime_id, EMBEDDED_RUNTIME_ID);
         assert_eq!(input.worker_id, worker.worker_id);
-        assert_eq!(input.transcript_sequence, Some(1));
+        assert!(
+            input
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "embedded_worker_llm_not_connected")
+        );
 
         let transcript = registry
             .transcript(EMBEDDED_RUNTIME_ID, &worker.worker_id, 0, 10)
             .unwrap();
         assert_eq!(transcript.state, WorkerOperationState::Accepted);
-        assert_eq!(transcript.items.len(), 2);
-        assert_eq!(transcript.items[0].role, "user");
-        assert_eq!(transcript.items[0].content, "hello embedded runtime");
-        assert_eq!(transcript.items[1].role, "assistant");
-        assert!(
-            transcript.items[1]
-                .content
-                .contains("LLM execution is not connected")
-        );
+        assert!(transcript.items.is_empty());
 
         let json = serde_json::to_string(&(embedded_summary, worker, transcript)).unwrap();
         for forbidden in [

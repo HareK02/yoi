@@ -33,10 +33,6 @@ use tokio::sync::broadcast;
 
 static NEXT_RUNTIME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-fn providerless_embedded_response_text() -> &'static str {
-    "Embedded worker-runtime accepted the message. LLM execution is not connected for this worker yet."
-}
-
 /// Concrete embedded Runtime domain entity.
 ///
 /// The default implementation is memory-backed and tools/provider-less by
@@ -319,36 +315,10 @@ impl Runtime {
             };
             state.push_worker_observation_event(worker_ref.clone(), payload);
         }
-        let assistant_transcript_sequence = if matches!(role, TranscriptRole::User) {
-            let assistant_text = providerless_embedded_response_text().to_string();
-            let worker = state.worker_mut(worker_ref)?;
-            let assistant_sequence = worker.next_transcript_sequence;
-            worker.next_transcript_sequence += 1;
-            worker.transcript.push(TranscriptEntry {
-                sequence: assistant_sequence,
-                worker_ref: worker_ref.clone(),
-                role: TranscriptRole::Assistant,
-                content: assistant_text.clone(),
-                event_id,
-            });
-            #[cfg(feature = "ws-server")]
-            state.push_worker_observation_event(
-                worker_ref.clone(),
-                protocol::Event::TextDone {
-                    text: assistant_text,
-                },
-            );
-            Some(assistant_sequence)
-        } else {
-            None
-        };
         state.persist_runtime_snapshot()?;
         state.persist_worker(&worker_ref.worker_id)?;
         state.persist_event_by_id(event_id)?;
         state.persist_transcript_entry(&worker_ref.worker_id, transcript_sequence)?;
-        if let Some(sequence) = assistant_transcript_sequence {
-            state.persist_transcript_entry(&worker_ref.worker_id, sequence)?;
-        }
 
         Ok(WorkerInteractionAck {
             worker_ref: worker_ref.clone(),
@@ -1412,10 +1382,10 @@ mod tests {
         let projection = runtime
             .transcript_projection(&detail.worker_ref, TranscriptQuery::new(0, 2))
             .unwrap();
-        assert_eq!(projection.total_items, 5);
+        assert_eq!(projection.total_items, 3);
         assert_eq!(projection.items.len(), 2);
         assert_eq!(projection.items[0].content, "hello");
-        assert_eq!(projection.items[1].role, TranscriptRole::Assistant);
+        assert_eq!(projection.items[1].role, TranscriptRole::System);
         assert_eq!(projection.next_start, Some(2));
 
         let err = runtime

@@ -327,16 +327,16 @@ async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<Worksp
         extension_points: ExtensionPoints {
             store: "sqlite".to_string(),
             event_stream: ExtensionPointState {
-                status: "reserved".to_string(),
-                note: "No browser-to-Worker socket path is exposed in this bootstrap; any future stream must be a Workspace server proxy that resolves Worker identity and enforces method allow/block boundaries.".to_string(),
+                status: "backend_proxy".to_string(),
+                note: "Worker observation streams are exposed only through the Workspace server proxy keyed by runtime_id + worker_id; browser clients never receive raw Runtime endpoints or socket paths.".to_string(),
             },
             host_worker_bridge: ExtensionPointState {
-                status: "read_only_local".to_string(),
-                note: "Local Hosts and Workers are exposed as a read-only bridge over existing Worker metadata; no direct Worker socket, scheduling, or lifecycle control is implemented.".to_string(),
+                status: "runtime_registry".to_string(),
+                note: "Hosts and Workers are projected from the Workspace RuntimeRegistry; raw Runtime endpoints, sockets, and local metadata paths are not exposed.".to_string(),
             },
             companion_console: ExtensionPointState {
-                status: "providerless_mvp".to_string(),
-                note: "Backend-internal tools-less Companion Worker is available through Workspace API status/transcript/message endpoints; v0 records browser messages and returns a resource-defined provider-less response instead of direct LLM generation.".to_string(),
+                status: "not_connected".to_string(),
+                note: "Workspace Companion is visible as an embedded Worker, but browser input is disabled until actual Worker/LLM execution is connected.".to_string(),
             },
         },
     }))
@@ -1051,7 +1051,7 @@ mod tests {
         assert_eq!(workspace["record_authority"], "local_yoi_project_records");
         assert_eq!(
             workspace["extension_points"]["host_worker_bridge"]["status"],
-            "read_only_local"
+            "runtime_registry"
         );
 
         let tickets = get_json(app.clone(), "/api/tickets").await;
@@ -1141,7 +1141,7 @@ mod tests {
         assert_eq!(companion_status["worker"]["role"], "workspace_companion");
         assert_eq!(
             companion_status["transport"]["kind"],
-            "providerless_backend_internal"
+            "embedded_worker_runtime"
         );
         assert!(!companion_status.to_string().contains("/workspace/demo"));
 
@@ -1151,23 +1151,24 @@ mod tests {
             json!({ "content": "hello companion" }),
         )
         .await;
-        assert_eq!(companion_message["state"], "accepted");
-        assert_eq!(companion_message["transcript"]["items"][0]["role"], "user");
-        assert_eq!(
-            companion_message["transcript"]["items"][1]["role"],
-            "assistant"
+        assert_eq!(companion_message["state"], "rejected");
+        assert!(
+            companion_message["transcript"]["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
         );
         assert!(
-            companion_message["transcript"]["items"][1]["content"]
-                .as_str()
+            companion_message["diagnostics"]
+                .as_array()
                 .unwrap()
-                .contains("provider-less")
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "companion_llm_not_connected")
         );
         assert!(!companion_message.to_string().contains("/workspace/demo"));
 
         let companion_transcript = get_json(app.clone(), "/api/companion/transcript").await;
-        assert_eq!(companion_transcript["total_items"], 2);
-        assert_eq!(companion_transcript["items"][1]["role"], "assistant");
+        assert_eq!(companion_transcript["total_items"], 0);
 
         let host_workers = get_json(app.clone(), &format!("/api/hosts/{host_id}/workers")).await;
         assert!(
@@ -1328,10 +1329,16 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(accepted["state"], "accepted");
+        assert_eq!(accepted["state"], "rejected");
         assert_eq!(accepted["runtime_id"], "embedded-worker-runtime");
         assert_eq!(accepted["worker_id"], worker_id);
-        assert_eq!(accepted["transcript_sequence"], 1);
+        assert!(
+            accepted["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "embedded_worker_llm_not_connected")
+        );
 
         let transcript = get_json(
             app.clone(),
@@ -1339,11 +1346,7 @@ mod tests {
         )
         .await;
         assert_eq!(transcript["state"], "accepted");
-        assert_eq!(transcript["items"][0]["role"], "user");
-        assert_eq!(
-            transcript["items"][0]["content"],
-            "hello from browser-facing api"
-        );
+        assert!(transcript["items"].as_array().unwrap().is_empty());
 
         let wrong_runtime = app
             .clone()
