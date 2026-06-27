@@ -1,9 +1,11 @@
 ---
 title: 'embedded worker-runtimeをworker crate実行に接続する'
-state: 'ready'
+state: 'queued'
 created_at: '2026-06-27T18:26:46Z'
-updated_at: '2026-06-27T18:58:48Z'
+updated_at: '2026-06-27T19:06:30Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-06-27T19:06:30Z'
 ---
 
 ## 背景
