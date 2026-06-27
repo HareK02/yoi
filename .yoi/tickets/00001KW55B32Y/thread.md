@@ -418,3 +418,20 @@ Validation:
 Cleanup は child implementation worktree / branch と related role Pods のみを対象に実施する。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-27T20:09:45Z -->
+
+## Implementation report
+
+Cleanup report:
+
+- `StopPod` は並列呼び出しでハングし得る不具合があるとの指摘を受けたため、今後は必ず 1 回ずつ実行する運用にする。
+- 今回の role Pods は `StopPod` 実行時点で spawned child registry から既に見えず、`ListPods` でも spawned child は 0 件だったため、追加の concurrent stop retry は行っていない。
+- Child implementation worktree を削除済み:
+  - `/home/hare/Projects/yoi/.worktree/00001KW55B32Y-worker-runtime-execution-backend`
+- Child implementation branch を削除済み:
+  - `work/00001KW55B32Y-worker-runtime-execution-backend`
+
+Orchestration worktree は clean。
+
+---
