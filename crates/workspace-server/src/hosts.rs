@@ -962,15 +962,30 @@ impl EmbeddedWorkerRuntime {
     fn can_accept_embedded_input(
         &self,
         status: EmbeddedWorkerStatus,
-        run_state: WorkerExecutionRunState,
+        execution: &worker_runtime::execution::WorkerExecutionStatus,
     ) -> bool {
         self.execution_enabled
             && status == EmbeddedWorkerStatus::Running
-            && run_state != WorkerExecutionRunState::Busy
+            && execution.backend == worker_runtime::execution::WorkerExecutionBackendKind::Connected
+            && execution.run_state == WorkerExecutionRunState::Idle
+            && !execution_last_result_blocks_control(execution)
     }
 
-    fn can_stop_embedded_worker(&self, status: EmbeddedWorkerStatus) -> bool {
-        self.execution_enabled && status == EmbeddedWorkerStatus::Running
+    fn can_stop_embedded_worker(
+        &self,
+        status: EmbeddedWorkerStatus,
+        execution: &worker_runtime::execution::WorkerExecutionStatus,
+    ) -> bool {
+        self.execution_enabled
+            && status == EmbeddedWorkerStatus::Running
+            && execution.backend == worker_runtime::execution::WorkerExecutionBackendKind::Connected
+            && !matches!(
+                execution.run_state,
+                WorkerExecutionRunState::Rejected
+                    | WorkerExecutionRunState::Errored
+                    | WorkerExecutionRunState::Unconnected
+            )
+            && !execution_last_result_blocks_control(execution)
     }
 
     fn map_worker_summary(&self, summary: worker_runtime::catalog::WorkerSummary) -> WorkerSummary {
@@ -994,8 +1009,8 @@ impl EmbeddedWorkerRuntime {
                 display_hint: "backend-internal worker-runtime Worker".to_string(),
             },
             capabilities: WorkerCapabilitySummary {
-                can_accept_input: self.can_accept_embedded_input(summary.status, summary.execution.run_state),
-                can_stop: self.can_stop_embedded_worker(summary.status),
+                can_accept_input: self.can_accept_embedded_input(summary.status, &summary.execution),
+                can_stop: self.can_stop_embedded_worker(summary.status, &summary.execution),
                 can_spawn_followup: false,
             },
             diagnostics: vec![diagnostic(
@@ -1027,8 +1042,8 @@ impl EmbeddedWorkerRuntime {
                 display_hint: "backend-internal worker-runtime Worker".to_string(),
             },
             capabilities: WorkerCapabilitySummary {
-                can_accept_input: self.can_accept_embedded_input(detail.status, detail.execution.run_state),
-                can_stop: self.can_stop_embedded_worker(detail.status),
+                can_accept_input: self.can_accept_embedded_input(detail.status, &detail.execution),
+                can_stop: self.can_stop_embedded_worker(detail.status, &detail.execution),
                 can_spawn_followup: false,
             },
             diagnostics: vec![diagnostic(
@@ -1202,24 +1217,38 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             mount_refs: Vec::new(),
         };
         match self.runtime.create_worker(create_request) {
-            Ok(detail) => WorkerSpawnResult {
-                state: WorkerOperationState::Accepted,
-                worker: Some(self.map_worker_detail(detail)),
-                acceptance_evidence: vec![
-                    WorkerSpawnAcceptanceEvidence {
-                        kind: "embedded_runtime_worker_created".to_string(),
-                        detail:
-                            "worker-runtime catalog accepted a backend-internal tools-less Worker"
-                                .to_string(),
-                    },
-                    WorkerSpawnAcceptanceEvidence {
-                        kind: "embedded_runtime_backend_internal_projection".to_string(),
-                        detail: "only runtime_id plus worker_id backend projections were exposed"
-                            .to_string(),
-                    },
-                ],
-                diagnostics,
-            },
+            Ok(detail) => {
+                let execution_failure =
+                    embedded_spawn_execution_failure_diagnostic(&detail.execution);
+                if let Some(diagnostic) = execution_failure {
+                    diagnostics.push(diagnostic);
+                    WorkerSpawnResult {
+                        state: WorkerOperationState::Rejected,
+                        worker: Some(self.map_worker_detail(detail)),
+                        acceptance_evidence: Vec::new(),
+                        diagnostics,
+                    }
+                } else {
+                    WorkerSpawnResult {
+                        state: WorkerOperationState::Accepted,
+                        worker: Some(self.map_worker_detail(detail)),
+                        acceptance_evidence: vec![
+                            WorkerSpawnAcceptanceEvidence {
+                                kind: "embedded_runtime_worker_created".to_string(),
+                                detail: "worker-runtime catalog accepted a backend-internal tools-less Worker"
+                                    .to_string(),
+                            },
+                            WorkerSpawnAcceptanceEvidence {
+                                kind: "embedded_runtime_backend_internal_projection".to_string(),
+                                detail:
+                                    "only runtime_id plus worker_id backend projections were exposed"
+                                        .to_string(),
+                            },
+                        ],
+                        diagnostics,
+                    }
+                }
+            }
             Err(err) => {
                 diagnostics.push(embedded_runtime_diagnostic(&err));
                 WorkerSpawnResult {
@@ -2041,6 +2070,48 @@ fn embedded_runtime_status_label(status: RuntimeStatus) -> &'static str {
     }
 }
 
+fn embedded_spawn_execution_failure_diagnostic(
+    execution: &worker_runtime::execution::WorkerExecutionStatus,
+) -> Option<RuntimeDiagnostic> {
+    let result = execution.last_result.as_ref()?;
+    let severity = match result.outcome {
+        worker_runtime::execution::WorkerExecutionOutcome::Accepted => return None,
+        worker_runtime::execution::WorkerExecutionOutcome::Rejected
+        | worker_runtime::execution::WorkerExecutionOutcome::Busy
+        | worker_runtime::execution::WorkerExecutionOutcome::Unsupported => {
+            DiagnosticSeverity::Warning
+        }
+        worker_runtime::execution::WorkerExecutionOutcome::Errored => DiagnosticSeverity::Error,
+    };
+    let status = match result.outcome {
+        worker_runtime::execution::WorkerExecutionOutcome::Accepted => "accepted",
+        worker_runtime::execution::WorkerExecutionOutcome::Rejected => "rejected",
+        worker_runtime::execution::WorkerExecutionOutcome::Busy => "busy",
+        worker_runtime::execution::WorkerExecutionOutcome::Unsupported => "unsupported",
+        worker_runtime::execution::WorkerExecutionOutcome::Errored => "errored",
+    };
+    Some(diagnostic(
+        format!("embedded_worker_execution_spawn_{status}"),
+        severity,
+        format!(
+            "Embedded Worker execution spawn was {status} during setup; check runtime configuration"
+        ),
+    ))
+}
+
+fn execution_last_result_blocks_control(
+    execution: &worker_runtime::execution::WorkerExecutionStatus,
+) -> bool {
+    execution.last_result.as_ref().is_some_and(|result| {
+        matches!(
+            result.outcome,
+            worker_runtime::execution::WorkerExecutionOutcome::Rejected
+                | worker_runtime::execution::WorkerExecutionOutcome::Errored
+                | worker_runtime::execution::WorkerExecutionOutcome::Unsupported
+        )
+    })
+}
+
 fn embedded_worker_status_label(status: EmbeddedWorkerStatus) -> &'static str {
     match status {
         EmbeddedWorkerStatus::Running => "running",
@@ -2607,6 +2678,37 @@ mod tests {
         .with_computed_digest()
     }
 
+    struct FailingSpawnBackend;
+
+    impl worker_runtime::execution::WorkerExecutionBackend for FailingSpawnBackend {
+        fn backend_id(&self) -> &str {
+            "workspace-server-failing-spawn-backend"
+        }
+
+        fn spawn_worker(
+            &self,
+            _request: worker_runtime::execution::WorkerExecutionSpawnRequest,
+        ) -> worker_runtime::execution::WorkerExecutionSpawnResult {
+            worker_runtime::execution::WorkerExecutionSpawnResult::Errored(
+                worker_runtime::execution::WorkerExecutionResult::errored(
+                    worker_runtime::execution::WorkerExecutionOperation::Spawn,
+                    "provider setup failed at /tmp/secret-provider-config",
+                ),
+            )
+        }
+
+        fn dispatch_input(
+            &self,
+            _handle: &worker_runtime::execution::WorkerExecutionHandle,
+            _input: EmbeddedWorkerInput,
+        ) -> worker_runtime::execution::WorkerExecutionResult {
+            worker_runtime::execution::WorkerExecutionResult::rejected(
+                worker_runtime::execution::WorkerExecutionOperation::Input,
+                "spawn failed before input could be dispatched",
+            )
+        }
+    }
+
     #[derive(Default)]
     struct AcceptingExecutionBackend {
         contexts:
@@ -2848,14 +2950,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn embedded_runtime_with_execution_backend_routes_input_and_projects_transcript() {
-        let runtime = EmbeddedWorkerRuntime::new_memory_with_execution_backend(
-            "local:test",
-            Arc::new(AcceptingExecutionBackend::default()),
-        )
-        .expect("test backend should connect");
-        let spawned = runtime.spawn_worker(WorkerSpawnRequest {
+    fn embedded_spawn_request() -> WorkerSpawnRequest {
+        WorkerSpawnRequest {
             intent: WorkerSpawnIntent::TicketRole {
                 ticket_id: "00001KVZSGT0Q".to_string(),
                 role: TicketWorkerRole::Coder,
@@ -2867,7 +2963,37 @@ mod tests {
             profile: None,
             config_bundle: None,
             requested_capabilities: Vec::new(),
-        });
+        }
+    }
+
+    #[test]
+    fn embedded_runtime_spawn_execution_failure_is_rejected_and_not_input_capable() {
+        let runtime = EmbeddedWorkerRuntime::new_memory_with_execution_backend(
+            "local:test",
+            Arc::new(FailingSpawnBackend),
+        )
+        .expect("test backend should connect");
+        let spawned = runtime.spawn_worker(embedded_spawn_request());
+        assert_eq!(spawned.state, WorkerOperationState::Rejected);
+        assert!(spawned.acceptance_evidence.is_empty());
+        assert!(spawned.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "embedded_worker_execution_spawn_errored"
+                && !diagnostic.message.contains("/tmp/secret-provider-config")
+        }));
+        let worker = spawned.worker.expect("failed execution is still projected");
+        assert_eq!(worker.status, "errored");
+        assert!(!worker.capabilities.can_accept_input);
+        assert!(!worker.capabilities.can_stop);
+    }
+
+    #[test]
+    fn embedded_runtime_with_execution_backend_routes_input_and_projects_transcript() {
+        let runtime = EmbeddedWorkerRuntime::new_memory_with_execution_backend(
+            "local:test",
+            Arc::new(AcceptingExecutionBackend::default()),
+        )
+        .expect("test backend should connect");
+        let spawned = runtime.spawn_worker(embedded_spawn_request());
         assert_eq!(spawned.state, WorkerOperationState::Accepted);
         let worker = spawned.worker.expect("created embedded worker");
         assert!(worker.capabilities.can_accept_input);

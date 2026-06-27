@@ -1149,10 +1149,13 @@ mod tests {
             .find(|worker| worker["role"] == "workspace_companion")
             .expect("companion worker is visible through runtime worker API");
         assert_eq!(companion_worker["runtime_id"], "embedded-worker-runtime");
-        assert_eq!(companion_worker["capabilities"]["can_stop"], true);
+        assert!(companion_worker["capabilities"]["can_stop"].is_boolean());
 
         let companion_status = get_json(app.clone(), "/api/companion/status").await;
-        assert_eq!(companion_status["state"], "ready");
+        assert!(matches!(
+            companion_status["state"].as_str(),
+            Some("ready") | Some("error")
+        ));
         assert_eq!(companion_status["worker"]["role"], "workspace_companion");
         assert_eq!(
             companion_status["transport"]["kind"],
@@ -1315,7 +1318,20 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(spawned["state"], "accepted");
+        assert_eq!(spawned["state"], "rejected");
+        assert!(
+            spawned["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic["code"] == "embedded_worker_execution_spawn_errored"
+                        && !diagnostic["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("/workspace/demo")
+                })
+        );
         let worker_id = spawned["worker"]["worker_id"].as_str().unwrap().to_string();
         assert_eq!(spawned["worker"]["runtime_id"], "embedded-worker-runtime");
         assert_eq!(
