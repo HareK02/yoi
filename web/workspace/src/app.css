@@ -972,14 +972,6 @@
     font-weight: 700;
 }
 
-.degrade-note {
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    padding: 0.65rem 0.8rem;
-    background: var(--bg-raised);
-    color: var(--warning);
-}
-
 .console-composer {
     display: grid;
     gap: var(--space-3);

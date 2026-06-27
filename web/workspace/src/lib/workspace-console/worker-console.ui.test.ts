@@ -71,11 +71,6 @@ Deno.test("Worker Console page is routed by runtime_id and worker_id through bac
     "Console page must not use Companion-specific APIs",
   );
   assert(
-    consolePage.includes("streaming observation is not available") ||
-      consolePage.includes("Streaming observation is not available"),
-    "Console should show an explicit non-streaming degradation path",
-  );
-  assert(
     consolePage.includes("function advanceReloadToken()") &&
       consolePage.includes("nextReloadToken += 1") &&
       !consolePage.includes("reloadToken += 1"),

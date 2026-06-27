@@ -604,8 +604,9 @@ mod tests {
         let runtime_transcript = registry
             .transcript(COMPANION_RUNTIME_ID, &worker.worker_id, 0, 10)
             .unwrap();
-        assert_eq!(runtime_transcript.items.len(), 1);
+        assert_eq!(runtime_transcript.items.len(), 2);
         assert_eq!(runtime_transcript.items[0].role, "user");
+        assert_eq!(runtime_transcript.items[1].role, "assistant");
 
         let browser_payload = serde_json::to_string(&(status, response)).unwrap();
         for forbidden in [

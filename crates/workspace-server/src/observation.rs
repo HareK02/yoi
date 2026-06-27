@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use worker_runtime::identity::WorkerRef;
+use worker_runtime::observation::{WorkerObservationCursor, WorkerObservationEvent};
+
 use axum::http::StatusCode;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -29,6 +32,66 @@ impl std::fmt::Debug for RuntimeObservationSourceConfig {
                 &self.bearer_token.as_ref().map(|_| "<redacted>"),
             )
             .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct EmbeddedRuntimeObservationSource {
+    pub runtime_id: String,
+    pub worker_id: String,
+    pub runtime: worker_runtime::Runtime,
+    pub worker_ref: WorkerRef,
+}
+
+#[derive(Clone)]
+pub enum RuntimeObservationSource {
+    RemoteWs(RuntimeObservationSourceConfig),
+    Embedded(EmbeddedRuntimeObservationSource),
+}
+
+impl RuntimeObservationSource {
+    pub fn remote_ws(config: RuntimeObservationSourceConfig) -> Self {
+        Self::RemoteWs(config)
+    }
+
+    pub fn embedded(source: EmbeddedRuntimeObservationSource) -> Self {
+        Self::Embedded(source)
+    }
+
+    pub fn runtime_id(&self) -> &str {
+        match self {
+            Self::RemoteWs(config) => &config.runtime_id,
+            Self::Embedded(source) => &source.runtime_id,
+        }
+    }
+
+    pub fn worker_id(&self) -> &str {
+        match self {
+            Self::RemoteWs(config) => &config.worker_id,
+            Self::Embedded(source) => &source.worker_id,
+        }
+    }
+}
+
+impl std::fmt::Debug for RuntimeObservationSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RemoteWs(config) => formatter
+                .debug_struct("RemoteRuntimeObservationSource")
+                .field("runtime_id", &config.runtime_id)
+                .field("worker_id", &config.worker_id)
+                .field("endpoint", &"<backend-private>")
+                .field(
+                    "bearer_token",
+                    &config.bearer_token.as_ref().map(|_| "<redacted>"),
+                )
+                .finish(),
+            Self::Embedded(source) => formatter
+                .debug_struct("EmbeddedRuntimeObservationSource")
+                .field("runtime_id", &source.runtime_id)
+                .field("worker_id", &source.worker_id)
+                .finish(),
+        }
     }
 }
 
@@ -234,13 +297,14 @@ impl BackendObservationProxy {
         &self,
         runtime_id: &str,
         worker_id: &str,
-    ) -> Result<RuntimeObservationSourceConfig, ObservationProxyError> {
+    ) -> Result<RuntimeObservationSource, ObservationProxyError> {
         self.sources
             .get(&ObservationKey {
                 runtime_id: runtime_id.to_string(),
                 worker_id: worker_id.to_string(),
             })
             .cloned()
+            .map(RuntimeObservationSource::remote_ws)
             .ok_or_else(|| {
                 ObservationProxyError::WorkerNotFound(format!(
                     "worker {worker_id} is not registered for runtime {runtime_id}"
@@ -495,6 +559,173 @@ impl RuntimeWsObservationClient {
             worker_id: self.worker_id.clone(),
             runtime_cursor: envelope.cursor,
             payload: envelope.payload,
+        }
+    }
+}
+
+pub enum RuntimeObservationClient {
+    RemoteWs(RuntimeWsObservationClient),
+    Embedded(EmbeddedObservationClient),
+}
+
+impl RuntimeObservationClient {
+    pub async fn connect(
+        source: &RuntimeObservationSource,
+        runtime_cursor: Option<&str>,
+    ) -> Result<Self, ObservationProxyError> {
+        match source {
+            RuntimeObservationSource::RemoteWs(config) => {
+                RuntimeWsObservationClient::connect(config, runtime_cursor)
+                    .await
+                    .map(Self::RemoteWs)
+            }
+            RuntimeObservationSource::Embedded(source) => {
+                EmbeddedObservationClient::connect(source, runtime_cursor).map(Self::Embedded)
+            }
+        }
+    }
+
+    pub async fn next_event(
+        &mut self,
+    ) -> Result<RuntimeObservationUpstreamEvent, ObservationProxyError> {
+        match self {
+            Self::RemoteWs(client) => client.next_event().await,
+            Self::Embedded(client) => client.next_event().await,
+        }
+    }
+}
+
+pub struct EmbeddedObservationClient {
+    runtime_id: String,
+    worker_id: String,
+    worker_ref: WorkerRef,
+    cursor: WorkerObservationCursor,
+    receiver: tokio::sync::broadcast::Receiver<WorkerObservationEvent>,
+    queued: VecDeque<RuntimeObservationUpstreamEvent>,
+}
+
+impl EmbeddedObservationClient {
+    fn connect(
+        source: &EmbeddedRuntimeObservationSource,
+        runtime_cursor: Option<&str>,
+    ) -> Result<Self, ObservationProxyError> {
+        let cursor = match runtime_cursor {
+            Some(raw) => WorkerObservationCursor::decode(raw).ok_or_else(|| {
+                ObservationProxyError::CursorMalformed(
+                    "embedded runtime cursor is malformed".into(),
+                )
+            })?,
+            None => source
+                .runtime
+                .worker_observation_cursor_now(&source.worker_ref)
+                .map_err(|err| {
+                    ObservationProxyError::WorkerNotFound(format!(
+                        "embedded Worker '{}' is not observable: {err}",
+                        source.worker_id
+                    ))
+                })?,
+        };
+        let receiver = source
+            .runtime
+            .subscribe_worker_observation()
+            .map_err(|err| {
+                ObservationProxyError::WorkerNotFound(format!(
+                    "embedded Worker '{}' observation subscription is unavailable: {err}",
+                    source.worker_id
+                ))
+            })?;
+        let mut queued = VecDeque::new();
+        if runtime_cursor.is_none() {
+            let snapshot = source
+                .runtime
+                .worker_observation_snapshot(&source.worker_ref)
+                .map_err(|err| {
+                    ObservationProxyError::WorkerNotFound(format!(
+                        "embedded Worker '{}' snapshot is unavailable: {err}",
+                        source.worker_id
+                    ))
+                })?;
+            queued.push_back(RuntimeObservationUpstreamEvent {
+                runtime_id: source.runtime_id.clone(),
+                worker_id: source.worker_id.clone(),
+                runtime_cursor: cursor.encode(),
+                payload: snapshot,
+            });
+        }
+        for event in source
+            .runtime
+            .read_worker_observation_events(&source.worker_ref, cursor)
+            .map_err(|err| {
+                ObservationProxyError::CursorUnknownOrExpired(format!(
+                    "embedded Worker '{}' cursor is unavailable: {err}",
+                    source.worker_id
+                ))
+            })?
+        {
+            queued.push_back(Self::map_event(
+                &source.runtime_id,
+                &source.worker_id,
+                event,
+            ));
+        }
+        Ok(Self {
+            runtime_id: source.runtime_id.clone(),
+            worker_id: source.worker_id.clone(),
+            worker_ref: source.worker_ref.clone(),
+            cursor,
+            receiver,
+            queued,
+        })
+    }
+
+    async fn next_event(
+        &mut self,
+    ) -> Result<RuntimeObservationUpstreamEvent, ObservationProxyError> {
+        if let Some(event) = self.queued.pop_front() {
+            if let Some(cursor) = WorkerObservationCursor::decode(&event.runtime_cursor) {
+                self.cursor = cursor;
+            }
+            return Ok(event);
+        }
+        loop {
+            match self.receiver.recv().await {
+                Ok(event)
+                    if event.worker_ref == self.worker_ref
+                        && event.sequence > self.cursor.sequence =>
+                {
+                    self.cursor =
+                        WorkerObservationCursor::decode(&event.cursor).ok_or_else(|| {
+                            ObservationProxyError::CursorMalformed(
+                                "embedded runtime emitted a malformed cursor".into(),
+                            )
+                        })?;
+                    return Ok(Self::map_event(&self.runtime_id, &self.worker_id, event));
+                }
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    return Err(ObservationProxyError::CursorUnknownOrExpired(
+                        "embedded runtime observation backlog was exceeded".into(),
+                    ));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(ObservationProxyError::UpstreamDisconnect(
+                        "embedded runtime observation stream closed".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn map_event(
+        runtime_id: &str,
+        worker_id: &str,
+        event: WorkerObservationEvent,
+    ) -> RuntimeObservationUpstreamEvent {
+        RuntimeObservationUpstreamEvent {
+            runtime_id: runtime_id.to_string(),
+            worker_id: worker_id.to_string(),
+            runtime_cursor: event.cursor,
+            payload: event.payload,
         }
     }
 }

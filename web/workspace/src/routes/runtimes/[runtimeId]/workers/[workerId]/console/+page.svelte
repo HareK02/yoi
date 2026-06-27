@@ -36,7 +36,7 @@
   let draft = $state('');
   let sending = $state(false);
   let sendError = $state<string | null>(null);
-  let streamState = $state<'connecting' | 'open' | 'unsupported' | 'closed' | 'error'>('connecting');
+  let streamState = $state<'connecting' | 'open' | 'closed' | 'error'>('connecting');
   let streamDiagnostics = $state<Diagnostic[]>([]);
   let observedEvents = $state<Array<{ cursor: string; event: ClientWorkerEventWsFrame & { kind: 'event' } }>>([]);
   let nextReloadToken = 0;
@@ -60,11 +60,6 @@
     mergeDiagnostics(worker?.diagnostics ?? [], transcript?.diagnostics ?? [], streamDiagnostics)
   );
   const canSend = $derived(Boolean(worker?.capabilities.can_accept_input) && draft.trim().length > 0 && !sending);
-  const transcriptOnly = $derived(
-    worker && !worker.capabilities.can_stream_events
-      ? 'Streaming observation is not available for this Worker. Console is using bounded transcript plus manual refresh.'
-      : null
-  );
 
   async function getJson<T>(path: string): Promise<T> {
     const response = await fetch(path);
@@ -180,18 +175,6 @@
       streamState = 'closed';
       return;
     }
-    if (!targetWorker.capabilities.can_stream_events) {
-      streamState = 'unsupported';
-      streamDiagnostics = [
-        {
-          code: 'worker_streaming_unsupported',
-          severity: 'info',
-          message: 'This Worker does not expose backend-proxied observation streaming; transcript refresh remains available.'
-        }
-      ];
-      return;
-    }
-
     streamState = 'connecting';
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(
@@ -247,8 +230,8 @@
           ...streamDiagnostics,
           {
             code: 'worker_observation_ws_error',
-            severity: 'warning',
-            message: 'Backend observation WebSocket failed; transcript refresh remains available.'
+            severity: 'error',
+            message: 'Worker observation WebSocket failed.'
           }
         ];
       }
@@ -334,9 +317,6 @@
         {#if transcriptError}
           <p class="error">{transcriptError}</p>
         {/if}
-        {#if transcriptOnly}
-          <p class="section-note degrade-note">{transcriptOnly}</p>
-        {/if}
 
         {#if lines.length === 0}
           <p>No transcript items or observation events are available for this Worker yet.</p>
@@ -395,8 +375,6 @@
             <summary>Capabilities</summary>
             <ul>
               <li>input: {worker.capabilities.can_accept_input ? 'available' : 'unsupported'}</li>
-              <li>stream: {worker.capabilities.can_stream_events ? 'available' : 'unsupported'}</li>
-              <li>bounded transcript: {worker.capabilities.can_read_bounded_transcript ? 'available' : 'unsupported'}</li>
               <li>stop: {worker.capabilities.can_stop ? 'available' : 'unsupported'}</li>
               <li>follow-up spawn: {worker.capabilities.can_spawn_followup ? 'available' : 'unsupported'}</li>
             </ul>

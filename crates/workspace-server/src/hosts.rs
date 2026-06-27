@@ -140,8 +140,6 @@ pub struct RuntimeCapabilitySummary {
     pub can_spawn_worker: bool,
     pub can_stop_worker: bool,
     pub can_accept_input: bool,
-    pub can_stream_events: bool,
-    pub can_read_bounded_transcript: bool,
     pub has_workspace_fs: bool,
     pub has_shell: bool,
     pub has_git: bool,
@@ -195,10 +193,8 @@ pub struct WorkerImplementationSummary {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerCapabilitySummary {
     pub can_accept_input: bool,
-    pub can_stream_events: bool,
     pub can_stop: bool,
     pub can_spawn_followup: bool,
-    pub can_read_bounded_transcript: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -578,7 +574,7 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
     fn observation_source(
         &self,
         _worker_id: &str,
-    ) -> Option<crate::observation::RuntimeObservationSourceConfig> {
+    ) -> Option<crate::observation::RuntimeObservationSource> {
         None
     }
 
@@ -879,7 +875,7 @@ impl RuntimeRegistry {
         &self,
         runtime_id: &str,
         worker_id: &str,
-    ) -> Result<crate::observation::RuntimeObservationSourceConfig, RuntimeRegistryError> {
+    ) -> Result<crate::observation::RuntimeObservationSource, RuntimeRegistryError> {
         validate_backend_identifier("runtime_id", runtime_id)?;
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
@@ -962,10 +958,8 @@ impl EmbeddedWorkerRuntime {
             },
             capabilities: WorkerCapabilitySummary {
                 can_accept_input: true,
-                can_stream_events: false,
                 can_stop: false,
                 can_spawn_followup: false,
-                can_read_bounded_transcript: true,
             },
             diagnostics: vec![diagnostic(
                 "embedded_runtime_projection",
@@ -996,10 +990,8 @@ impl EmbeddedWorkerRuntime {
             },
             capabilities: WorkerCapabilitySummary {
                 can_accept_input: true,
-                can_stream_events: false,
                 can_stop: false,
                 can_spawn_followup: false,
-                can_read_bounded_transcript: true,
             },
             diagnostics: vec![diagnostic(
                 "embedded_runtime_projection",
@@ -1243,6 +1235,24 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 diagnostics: vec![embedded_runtime_diagnostic(&error)],
             },
         }
+    }
+
+    fn observation_source(
+        &self,
+        worker_id: &str,
+    ) -> Option<crate::observation::RuntimeObservationSource> {
+        let worker_ref = self.worker_ref(worker_id)?;
+        if self.runtime.worker_detail(&worker_ref).is_err() {
+            return None;
+        }
+        Some(crate::observation::RuntimeObservationSource::embedded(
+            crate::observation::EmbeddedRuntimeObservationSource {
+                runtime_id: self.runtime_id.clone(),
+                worker_id: worker_id.to_string(),
+                runtime: self.runtime.clone(),
+                worker_ref,
+            },
+        ))
     }
 
     fn send_input(&self, worker_id: &str, request: WorkerInputRequest) -> WorkerInputResult {
@@ -1512,10 +1522,8 @@ impl RemoteWorkerRuntime {
             },
             capabilities: WorkerCapabilitySummary {
                 can_accept_input: true,
-                can_stream_events: true,
                 can_stop: true,
                 can_spawn_followup: false,
-                can_read_bounded_transcript: true,
             },
             diagnostics: vec![diagnostic(
                 "remote_runtime_projection",
@@ -1546,10 +1554,8 @@ impl RemoteWorkerRuntime {
             },
             capabilities: WorkerCapabilitySummary {
                 can_accept_input: true,
-                can_stream_events: true,
                 can_stop: true,
                 can_spawn_followup: false,
-                can_read_bounded_transcript: true,
             },
             diagnostics: vec![diagnostic(
                 "remote_runtime_projection",
@@ -1811,13 +1817,15 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
     fn observation_source(
         &self,
         worker_id: &str,
-    ) -> Option<crate::observation::RuntimeObservationSourceConfig> {
-        Some(crate::observation::RuntimeObservationSourceConfig {
-            runtime_id: self.runtime_id.clone(),
-            worker_id: worker_id.to_string(),
-            endpoint: self.ws_endpoint(worker_id),
-            bearer_token: self.bearer_token.clone(),
-        })
+    ) -> Option<crate::observation::RuntimeObservationSource> {
+        Some(crate::observation::RuntimeObservationSource::remote_ws(
+            crate::observation::RuntimeObservationSourceConfig {
+                runtime_id: self.runtime_id.clone(),
+                worker_id: worker_id.to_string(),
+                endpoint: self.ws_endpoint(worker_id),
+                bearer_token: self.bearer_token.clone(),
+            },
+        ))
     }
 
     fn send_input(&self, worker_id: &str, request: WorkerInputRequest) -> WorkerInputResult {
@@ -1871,8 +1879,6 @@ fn embedded_runtime_capabilities(limit: usize, available: bool) -> RuntimeCapabi
         can_spawn_worker: available,
         can_stop_worker: false,
         can_accept_input: available,
-        can_stream_events: false,
-        can_read_bounded_transcript: available,
         has_workspace_fs: false,
         has_shell: false,
         has_git: false,
@@ -2048,6 +2054,7 @@ fn embedded_transcript_rejected(
 fn embedded_transcript_role_label(role: TranscriptRole) -> &'static str {
     match role {
         TranscriptRole::User => "user",
+        TranscriptRole::Assistant => "assistant",
         TranscriptRole::System => "system",
     }
 }
@@ -2139,8 +2146,6 @@ fn remote_runtime_capabilities(limit: usize, available: bool) -> RuntimeCapabili
         can_spawn_worker: available,
         can_stop_worker: available,
         can_accept_input: available,
-        can_stream_events: available,
-        can_read_bounded_transcript: available,
         has_workspace_fs: false,
         has_shell: false,
         has_git: false,
@@ -2357,10 +2362,8 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> WorkerSummary {
         },
         capabilities: WorkerCapabilitySummary {
             can_accept_input: false,
-            can_stream_events: false,
             can_stop: false,
             can_spawn_followup: false,
-            can_read_bounded_transcript: false,
         },
         diagnostics: vec![diagnostic(
             "runtime_capability_unsupported",
@@ -2450,10 +2453,8 @@ mod tests {
                     },
                     capabilities: WorkerCapabilitySummary {
                         can_accept_input: false,
-                        can_stream_events: false,
                         can_stop: false,
                         can_spawn_followup: false,
-                        can_read_bounded_transcript: false,
                     },
                     diagnostics: Vec::new(),
                 }],
@@ -2481,8 +2482,6 @@ mod tests {
                     can_spawn_worker: false,
                     can_stop_worker: false,
                     can_accept_input: false,
-                    can_stream_events: false,
-                    can_read_bounded_transcript: false,
                     has_workspace_fs: false,
                     has_shell: false,
                     has_git: false,
@@ -2613,7 +2612,6 @@ mod tests {
         assert_eq!(embedded_summary.source.status, RuntimeSourceStatus::Active);
         assert!(embedded_summary.capabilities.can_spawn_worker);
         assert!(embedded_summary.capabilities.can_accept_input);
-        assert!(embedded_summary.capabilities.can_read_bounded_transcript);
 
         let spawned = registry
             .spawn_worker(
@@ -2647,7 +2645,6 @@ mod tests {
         assert_eq!(worker.implementation.kind, "embedded_worker_runtime");
         assert_eq!(worker.profile.as_deref(), Some("builtin:coder"));
         assert!(worker.capabilities.can_accept_input);
-        assert!(worker.capabilities.can_read_bounded_transcript);
 
         let input = registry
             .send_input(
@@ -2668,9 +2665,15 @@ mod tests {
             .transcript(EMBEDDED_RUNTIME_ID, &worker.worker_id, 0, 10)
             .unwrap();
         assert_eq!(transcript.state, WorkerOperationState::Accepted);
-        assert_eq!(transcript.items.len(), 1);
+        assert_eq!(transcript.items.len(), 2);
         assert_eq!(transcript.items[0].role, "user");
         assert_eq!(transcript.items[0].content, "hello embedded runtime");
+        assert_eq!(transcript.items[1].role, "assistant");
+        assert!(
+            transcript.items[1]
+                .content
+                .contains("LLM execution is not connected")
+        );
 
         let json = serde_json::to_string(&(embedded_summary, worker, transcript)).unwrap();
         for forbidden in [
@@ -2810,6 +2813,10 @@ mod tests {
         let observation = registry
             .observation_source("remote:primary", "worker-remote-1")
             .expect("remote runtime exposes backend-owned WS observation source");
+        let crate::observation::RuntimeObservationSource::RemoteWs(observation) = observation
+        else {
+            panic!("remote runtime should expose a remote WS observation source");
+        };
         assert!(observation.endpoint.starts_with("ws://127.0.0.1:"));
         assert!(
             observation

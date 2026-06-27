@@ -26,7 +26,7 @@ use crate::hosts::{
 use crate::identity::WorkspaceIdentity;
 use crate::observation::{
     BackendObservationProxy, ClientWorkerEventWsFrame, ClientWorkerEventsWsQuery,
-    ObservationProxyError, RuntimeObservationSourceConfig, RuntimeWsObservationClient,
+    ObservationProxyError, RuntimeObservationClient, RuntimeObservationSourceConfig,
 };
 use crate::records::{
     LocalProjectRecordReader, ObjectiveDetail, ProjectRecordList, TicketDetail, TicketSummary,
@@ -676,13 +676,13 @@ async fn worker_observation_ws(
 
 async fn worker_observation_ws_session(
     proxy: BackendObservationProxy,
-    source: RuntimeObservationSourceConfig,
+    source: crate::observation::RuntimeObservationSource,
     query: ClientWorkerEventsWsQuery,
     mut socket: WebSocket,
 ) {
     let open = match proxy.open(
-        &source.runtime_id,
-        &source.worker_id,
+        source.runtime_id(),
+        source.worker_id(),
         query.cursor.as_deref(),
     ) {
         Ok(open) => open,
@@ -703,7 +703,7 @@ async fn worker_observation_ws_session(
     }
 
     let mut upstream =
-        match RuntimeWsObservationClient::connect(&source, open.runtime_cursor.as_deref()).await {
+        match RuntimeObservationClient::connect(&source, open.runtime_cursor.as_deref()).await {
             Ok(client) => client,
             Err(error) => {
                 let _ =
