@@ -256,3 +256,88 @@ request_changes
 - Ticket 更新・merge・cleanup・ファイル変更・テスト実行はしていない。Static review のみ。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KW55B33B-worker-adapter at: 2026-06-27T21:22:01Z -->
+
+## Implementation report
+
+Change-response implementation report:
+
+Reviewer blockers を修正済み。マージ / close / cleanup は未実施。
+
+Fix commit:
+- `9069b035e0a93f83c702e206d3d15b2b683a8c19 fix: connect embedded runtime input lifecycle`
+
+既存実装 commit:
+- `18526ee36264610048f48b07b5db50ce86852fd2 feat: connect runtime worker execution adapter`
+
+## 修正内容
+
+### 1. workspace-server embedded Worker input API を adapter に接続
+
+`EmbeddedWorkerRuntime::send_input` の固定 reject を撤去し、execution backend 接続済みの場合は `worker_runtime::Runtime::send_input` に委譲するようにした。
+
+あわせて:
+- `EmbeddedWorkerRuntime` に `execution_enabled` を追加。
+- `new_memory_with_execution_backend(...)` で backend 接続済み runtime として扱う。
+- Worker projection の capability を backend 接続状態に合わせて更新:
+  - `can_accept_input`
+  - `can_stop`
+- `stop_worker` / `cancel_worker` も embedded Runtime lifecycle API に委譲。
+- `workspace-server` 側の focused test を追加し、fake execution backend で embedded Runtime spawn / workspace-server host API 経由 input / backend dispatch / `protocol::Event` / transcript projection / capability/status projection を検証。
+
+### 2. builtin profile selector double-prefix bug 修正
+
+`worker/src/runtime_adapter.rs` の `ProfileSelector::Builtin` 変換を修正。
+
+- `Builtin("coder")` -> `builtin:coder`
+- `Builtin("builtin:coder")` -> `builtin:coder`
+
+`builtin:builtin:coder` にならないことを focused unit test で追加確認。
+
+### 3. run_state / status projection を real run lifecycle に合わせて修正
+
+`send_method` が常に `Idle` を返していた点を修正。
+
+- `Method::Run` accepted -> `WorkerExecutionRunState::Busy`
+- `Method::Shutdown` accepted -> `Stopped`
+- `Method::Cancel` accepted -> `Idle`
+
+さらに `worker-runtime` 側で bridged `protocol::Event` を execution status に投影するようにした。
+
+対応イベント:
+- `Status { Running }` -> `Busy`
+- `Status { Idle }` -> `Idle`
+- `Status { Paused }` -> `Busy`
+- `Snapshot { status }` -> status に応じて `Busy` / `Idle`
+- `RunEnd { Finished | RolledBack }` -> `Idle`
+- `RunEnd { Paused }` -> `Busy`
+- `RunEnd { LimitReached }` -> `Errored`
+- `Error` -> `Errored`
+
+これにより Backend/Web projection の `status` は execution run_state を反映する。
+
+## Validation
+
+実行済み・成功:
+- `cargo fmt --all`
+- `cargo fmt --all --check`
+- `cargo test -p worker --features runtime-adapter runtime_adapter`
+- `cargo test -p worker-runtime --features ws-server`
+- `cargo test -p worker-runtime --features "ws-server fs-store"`
+- `cargo test -p yoi-workspace-server`
+- `cargo check -p yoi`
+- `git diff --check`
+- `nix build .#yoi --no-link`
+
+補足:
+- `cargo test -p yoi-workspace-server` では既存 warning: `field next_sequence is never read`
+- 新規失敗や未解決の validation failure はない。
+
+## 残リスク / review focus
+
+- `workspace-server` の embedded Worker capability は backend 接続時に `can_accept_input` / `can_stop` が true になる。実 provider/profile 不足時は fake 応答ではなく typed rejection/error になるため、下流 Companion UX 側でその表示/導線を確認する必要がある。
+- Runtime execution status projection は主要 lifecycle event に対応したが、より細かい paused/cancelled 表示語彙を Browser projection で増やす場合は別 Ticket 範囲。
+- v0 policy は引き続き queue なし。Busy 中 input は typed busy rejection。
+
+---
