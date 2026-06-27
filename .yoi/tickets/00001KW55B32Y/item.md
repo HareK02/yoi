@@ -1,8 +1,8 @@
 ---
 title: 'worker-runtimeにWorker実行Backend境界を追加する'
-state: 'planning'
+state: 'ready'
 created_at: '2026-06-27T18:26:46Z'
-updated_at: '2026-06-27T18:40:00Z'
+updated_at: '2026-06-27T18:58:48Z'
 assignee: null
 ---
 

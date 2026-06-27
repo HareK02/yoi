@@ -1,8 +1,8 @@
 ---
 title: 'Workspace Companionを実LLM実行Workerとして起動する'
-state: 'planning'
+state: 'ready'
 created_at: '2026-06-27T18:26:47Z'
-updated_at: '2026-06-27T18:29:46Z'
+updated_at: '2026-06-27T18:58:48Z'
 assignee: null
 ---
 
