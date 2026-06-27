@@ -55,3 +55,43 @@ Next action:
 - `00001KW55B32Y` が reviewer approve / merge / validation / done になった後に再 routing する。
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-27T20:11:40Z -->
+
+## Decision
+
+Routing decision:
+
+Queue continuation was explicitly requested. The upstream boundary Ticket `00001KW55B32Y` is closed after merge and validation, so this Ticket is now unblocked and accepted for implementation.
+
+Plan:
+- Create child implementation worktree:
+  - `/home/hare/Projects/yoi/.worktree/00001KW55B33B-worker-runtime-worker-adapter`
+- Branch:
+  - `work/00001KW55B33B-worker-runtime-worker-adapter`
+- Route implementation to a sibling Coder Worker with focused write scope.
+- Route read-only review to a sibling Reviewer Worker after implementation.
+- Orchestrator retains merge, final validation, Ticket completion, child worktree/branch cleanup, and role Pod shutdown.
+
+Review/implementation focus:
+- choose adapter placement without introducing crate dependency cycles, and record the rationale
+- connect embedded `worker-runtime` execution backend to existing `worker` crate execution
+- preserve Profile/config bundle and authority resolution boundaries
+- dispatch input to real Worker run lifecycle, not providerless/fake responses
+- bridge `protocol::Event` to Runtime observation bus / Backend WS
+- return typed diagnostics/rejections for missing config/provider/busy/unsupported operations
+- do not expose raw handles, sockets, credentials, session paths, or manifest paths to Browser-facing APIs
+- leave `00001KW55B33H` queued until this adapter is merged/validated
+
+Operational note:
+- `StopPod` must be called serially during cleanup; do not use parallel StopPod calls.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-27T20:11:44Z from: queued to: inprogress reason: dependency_closed_and_queue_continues field: state -->
+
+## State changed
+
+Queue continuation requested by user. Upstream dependency `00001KW55B32Y` is closed with merge and validation complete, and this Ticket has no remaining blockers. Accepting implementation before child worktree / role Pod side effects.
+
+---
