@@ -31,3 +31,82 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-27T19:07:57Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- Dashboard Queue により routing 許可済み。
+- 本 Ticket は後続 adapter / Companion 実行 Ticket の前段となる execution backend boundary であり、具体的な `worker` crate adapter 実装は Non-goal として分離されている。
+- Outgoing blocking relation はなく、current `inprogress` は 0。orchestration worktree is clean。
+- Downstream queued Tickets (`00001KW55B33B`, `00001KW55B33H`) は本 Ticket 完了まで待機させる。
+
+Evidence checked:
+- Ticket body: execution backend boundary、input rejection/dispatch、protocol event publish hook、Worker model invariant、Browser-facing non-leak、Non-goals、acceptance criteria。
+- Relations: incoming/downstream dependency chain is present via queued Tickets; this Ticket itself has no unresolved outgoing blocker。
+- Orchestration plan: accepted plan `orch-plan-20260627-190733-1` recorded。
+- Code context: current `worker-runtime::Runtime` / `catalog` / `workspace-server::hosts` have Runtime/Worker model and projection foundation but no concrete execution backend boundary yet。
+- Workspace state: queued 3 / inprogress 0、orchestration clean。
+
+IntentPacket:
+
+Intent:
+- `worker-runtime` に Worker execution backend 境界を追加し、Runtime が input-capable Worker と backend-unconnected placeholder を混同しないようにする。
+
+Binding decisions / invariants:
+- Execution backend 未接続 Worker への user input は accepted にしない。
+- Runtime 自身が fake / providerless assistant response を生成しない。
+- Worker transcript / observation は正規 contract とし、`can_stream_events` / `can_read_bounded_transcript` を public capability として復活させない。
+- Execution backend handle / socket path / credential / session path / raw worker handle は Browser-facing API に出さない。
+- 既存 `worker` crate への具体 adapter 接続、Workspace Companion real LLM execution、Web Console UX redesign は実装しない。
+
+Requirements / acceptance criteria:
+- `worker-runtime` に execution backend trait / handle / enum / lifecycle contract がある。
+- backend connected Worker の input dispatch 境界と run state/busy/rejected/errored typed result がある。
+- stop/cancel unsupported は typed rejection。
+- protocol event を Runtime observation bus へ publish する hook がある。
+- Focused tests が backend 未接続 input rejection、connected backend input dispatch boundary、observation publish hook を確認する。
+- `cargo test -p worker-runtime --features ws-server`, `cargo test -p yoi-workspace-server`, `cargo check -p yoi`, `git diff --check`, `nix build .#yoi --no-link` が通る。
+
+Implementation latitude:
+- Backend boundary の具体型名、trait sync/asyncの形、test backend/fake backend の実装、Runtime state/projectionの最小変更は Coder が既存 `worker-runtime` design に合わせて選べる。
+- `workspace-server` projection に必要な最小 diagnostic/state 表現は追加してよい。
+- 既存 `worker` crate adapter に必要そうな shape は見越してよいが、実 adapter 実装はしない。
+
+Escalate if:
+- `worker` crate に大きく手を入れないと boundary 自体が定義できない。
+- Browser-facing API に raw execution handle/path/credential を出す必要が出る。
+- public capability として `can_stream_events` / `can_read_bounded_transcript` を戻さないと UI/API が成立しない。
+- fake/providerless response を再導入しないと tests/UX が通らない。
+
+Validation:
+- `cargo fmt --all`
+- `cargo test -p worker-runtime --features ws-server`
+- `cargo test -p yoi-workspace-server`
+- `cargo check -p yoi`
+- `git diff --check`
+- 可能なら `nix build .#yoi --no-link`
+
+Critical risks / reviewer focus:
+- backend 未接続 Worker が input accepted になる regression。
+- Runtime-generated fake/providerless assistant response の再導入。
+- Browser-facing projection に execution backend internals/path/credential/session が漏れること。
+- Worker transcript/observation を optional display capability として扱うこと。
+- 後続 adapter Ticket の scope を先取りしすぎること。
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-27T19:08:06Z from: queued to: inprogress reason: routing_accepted_execution_backend_boundary field: state -->
+
+## State changed
+
+Routing decision: implementation_ready。
+
+Ticket body / relation / workspace state / accepted plan を確認し、Worker execution backend boundary slice は unblocked と判断した。Downstream queued Tickets は本 Ticket の completion を待つ。accepted plan と IntentPacket は thread / orchestration plan に記録済み。
+
+これ以降、worktree creation / coder Worker routing などの implementation side effect に進める。
+
+---
