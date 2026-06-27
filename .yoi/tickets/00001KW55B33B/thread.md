@@ -341,3 +341,38 @@ Fix commit:
 - v0 policy は引き続き queue なし。Busy 中 input は typed busy rejection。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KW55B33B-worker-adapter at: 2026-06-27T21:27:37Z status: request_changes -->
+
+## Review: request changes
+
+request_changes
+
+静的レビューのみ実施。対象 worktree の HEAD は `9069b035041d17e7c52a454a7563cc5f0b7e1f61` として確認。先回報告の full SHA suffix には差異があるため、以後この full SHA を正とする。
+
+先回の blocker のうち、input delegate / builtin prefix normalization / protocol event -> execution status projection は概ね修正されている。
+
+ただし、元の invariant に対してまだ blocker がある。
+
+## Blocker
+
+**spawn 時の provider/profile/config/setup 失敗が Browser-facing spawn API では `Accepted` 扱いになり、typed rejection/diagnostic になっていない。**
+
+根拠:
+
+- 実 Worker 作成時の profile/provider/session setup 失敗は adapter で `WorkerExecutionSpawnResult::Errored` になる。
+  - `worker/src/runtime_adapter.rs:161-194`
+  - `worker/src/runtime_adapter.rs:365-371`
+- しかし `worker-runtime::Runtime::create_worker` は spawn `Rejected/Errored` を `Err` にせず、`Ok(WorkerDetail)` に execution status として記録するだけ。
+  - `worker-runtime/src/runtime.rs:278-280`
+  - `worker-runtime/src/runtime.rs:417-446`
+- workspace-server 側は `create_worker` が `Ok(detail)` なら常に `WorkerOperationState::Accepted` として返し、execution failure の diagnostic/rejection を browser-facing result に出していない。
+  - `workspace-server/src/hosts.rs:1204-1222`
+- さらに projection の `can_accept_input` は `run_state != Busy` だけを見るため、spawn `Errored/Rejected` でも status が `Running` のままなら input 可能に見える。
+  - `workspace-server/src/hosts.rs:962-970`
+
+このため、missing provider/config/secret/setup が「typed diagnostic/rejection」ではなく「spawn accepted だが内部 execution errored」という中途半端な projection になり、Ticket の受け入れ条件を満たしていない。
+
+spawn execution failure は、少なくとも browser-facing API で sanitized diagnostic/rejection として扱うか、capability を false にして明確な failure projection を返す必要がある。
+
+---
