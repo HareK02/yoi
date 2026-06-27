@@ -5932,6 +5932,7 @@ dependencies = [
  "uuid",
  "wasmtime",
  "wat",
+ "worker-runtime",
  "workflow",
  "yoi-plugin-pdk",
 ]
@@ -6054,6 +6055,7 @@ dependencies = [
  "tower",
  "tracing",
  "uuid",
+ "worker",
  "worker-runtime",
 ]
 

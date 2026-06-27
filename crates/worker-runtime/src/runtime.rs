@@ -11,7 +11,8 @@ use crate::error::RuntimeError;
 use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionBackendKind, WorkerExecutionBackendRef,
     WorkerExecutionHandle, WorkerExecutionOperation, WorkerExecutionResult,
-    WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult, WorkerExecutionStatus,
+    WorkerExecutionRunState, WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
+    WorkerExecutionStatus,
 };
 #[cfg(feature = "fs-store")]
 use crate::fs_store::{
@@ -722,7 +723,16 @@ impl Runtime {
     ) -> Result<WorkerObservationEvent, RuntimeError> {
         let mut state = self.lock()?;
         state.ensure_worker_ref(worker_ref)?;
+        let transcript_sequence = state.project_protocol_event_to_transcript(worker_ref, &payload);
+        let execution_state_changed =
+            state.project_protocol_event_to_execution(worker_ref, &payload);
         let event = state.push_worker_observation_event(worker_ref.clone(), payload);
+        if transcript_sequence.is_some() || execution_state_changed {
+            state.persist_worker(&worker_ref.worker_id)?;
+        }
+        if let Some(sequence) = transcript_sequence {
+            state.persist_transcript_entry(&worker_ref.worker_id, sequence)?;
+        }
         Ok(event)
     }
 
@@ -1257,6 +1267,111 @@ impl RuntimeState {
         }
         let _ = self.observation_tx.send(event.clone());
         event
+    }
+
+    #[cfg(feature = "ws-server")]
+    fn append_worker_transcript_entry(
+        &mut self,
+        worker_ref: &WorkerRef,
+        role: TranscriptRole,
+        content: impl Into<String>,
+    ) -> Option<u64> {
+        let content = content.into();
+        if content.trim().is_empty() {
+            return None;
+        }
+        let event_id = self.last_event_id();
+        let worker = self.workers.get_mut(&worker_ref.worker_id)?;
+        let sequence = worker.next_transcript_sequence;
+        worker.next_transcript_sequence += 1;
+        worker.transcript.push(TranscriptEntry {
+            sequence,
+            worker_ref: worker_ref.clone(),
+            role,
+            content,
+            event_id,
+        });
+        Some(sequence)
+    }
+
+    #[cfg(feature = "ws-server")]
+    fn project_protocol_event_to_transcript(
+        &mut self,
+        worker_ref: &WorkerRef,
+        event: &protocol::Event,
+    ) -> Option<u64> {
+        match event {
+            protocol::Event::TextDone { text, .. } => self.append_worker_transcript_entry(
+                worker_ref,
+                TranscriptRole::Assistant,
+                text.clone(),
+            ),
+            protocol::Event::Error { message, .. } => self.append_worker_transcript_entry(
+                worker_ref,
+                TranscriptRole::System,
+                format!("error: {message}"),
+            ),
+            protocol::Event::ToolResult {
+                id,
+                summary,
+                is_error,
+                ..
+            } => self.append_worker_transcript_entry(
+                worker_ref,
+                TranscriptRole::System,
+                format!(
+                    "tool result {id}: {}{}",
+                    if *is_error { "error: " } else { "" },
+                    summary
+                ),
+            ),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "ws-server")]
+    fn project_protocol_event_to_execution(
+        &mut self,
+        worker_ref: &WorkerRef,
+        event: &protocol::Event,
+    ) -> bool {
+        let Some(worker) = self.workers.get_mut(&worker_ref.worker_id) else {
+            return false;
+        };
+        let status = &mut worker.execution;
+        let next_run_state = match event {
+            protocol::Event::Status {
+                status: protocol::WorkerStatus::Running,
+            } => Some(WorkerExecutionRunState::Busy),
+            protocol::Event::Status {
+                status: protocol::WorkerStatus::Idle,
+            } => Some(WorkerExecutionRunState::Idle),
+            protocol::Event::Status {
+                status: protocol::WorkerStatus::Paused,
+            } => Some(WorkerExecutionRunState::Busy),
+            protocol::Event::Snapshot { status, .. } => match status {
+                protocol::WorkerStatus::Running => Some(WorkerExecutionRunState::Busy),
+                protocol::WorkerStatus::Idle => Some(WorkerExecutionRunState::Idle),
+                protocol::WorkerStatus::Paused => Some(WorkerExecutionRunState::Busy),
+            },
+            protocol::Event::RunEnd { result } => match result {
+                protocol::RunResult::Finished | protocol::RunResult::RolledBack => {
+                    Some(WorkerExecutionRunState::Idle)
+                }
+                protocol::RunResult::Paused => Some(WorkerExecutionRunState::Busy),
+                protocol::RunResult::LimitReached => Some(WorkerExecutionRunState::Errored),
+            },
+            protocol::Event::Error { .. } => Some(WorkerExecutionRunState::Errored),
+            _ => None,
+        };
+        let Some(next_run_state) = next_run_state else {
+            return false;
+        };
+        if status.run_state == next_run_state {
+            return false;
+        }
+        status.run_state = next_run_state;
+        true
     }
 
     fn push_diagnostic(
