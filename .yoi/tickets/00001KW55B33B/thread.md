@@ -190,3 +190,27 @@ Residual risks / review focus:
 - `workspace-server` が `worker` を feature 付きで依存するため、crate layering と public API leak が意図通りかを重点 review してほしい。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-27T20:51:43Z -->
+
+## Implementation report
+
+Review kickoff:
+
+Reviewer Worker spawned for `00001KW55B33B` implementation.
+
+- Reviewer Worker: `yoi-reviewer-00001KW55B33B-worker-adapter`
+- Review target commit: `18526ee36264610048f48b07b5db50ce86852fd2 feat: connect runtime worker execution adapter`
+- Review mode: read-only implementation worktree review
+
+Review focus:
+- crate layering / `runtime-adapter` feature dependency cycle risk
+- production Profile/config/authority resolution and typed failure mode
+- protocol event bridge into Runtime observation bus / Backend WS
+- transcript projection consistency for real Worker run output
+- no fake/providerless fallback
+- busy / stop / cancel lifecycle semantics
+- Browser-facing non-leak of worker handles, raw execution handles, sockets, session paths, credentials, secret refs, and raw manifest paths
+- no downstream Workspace Companion bootstrap/UX scope creep
+
+---
