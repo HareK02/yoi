@@ -123,6 +123,24 @@ impl ProfileRuntimeWorkerFactory {
         request.worker_ref.worker_id.to_string()
     }
 
+    fn runtime_profile_value(
+        profile: &worker_runtime::catalog::ProfileSelector,
+    ) -> Option<std::borrow::Cow<'_, str>> {
+        match profile {
+            worker_runtime::catalog::ProfileSelector::RuntimeDefault => None,
+            worker_runtime::catalog::ProfileSelector::Named(name) => {
+                Some(std::borrow::Cow::Borrowed(name.as_str()))
+            }
+            worker_runtime::catalog::ProfileSelector::Builtin(name) => {
+                if name.starts_with("builtin:") {
+                    Some(std::borrow::Cow::Borrowed(name.as_str()))
+                } else {
+                    Some(std::borrow::Cow::Owned(format!("builtin:{name}")))
+                }
+            }
+        }
+    }
+
     fn runtime_profile<'a>(
         &'a self,
         request: &'a WorkerExecutionSpawnRequest,
@@ -130,15 +148,7 @@ impl ProfileRuntimeWorkerFactory {
         if let Some(profile) = self.profile.as_deref() {
             return Some(std::borrow::Cow::Borrowed(profile));
         }
-        match &request.request.profile {
-            worker_runtime::catalog::ProfileSelector::RuntimeDefault => None,
-            worker_runtime::catalog::ProfileSelector::Named(name) => {
-                Some(std::borrow::Cow::Borrowed(name.as_str()))
-            }
-            worker_runtime::catalog::ProfileSelector::Builtin(name) => {
-                Some(std::borrow::Cow::Owned(format!("builtin:{name}")))
-            }
-        }
+        Self::runtime_profile_value(&request.request.profile)
     }
 }
 
@@ -302,6 +312,7 @@ where
         operation: WorkerExecutionOperation,
         worker: WorkerHandle,
         method: Method,
+        accepted_run_state: WorkerExecutionRunState,
     ) -> WorkerExecutionResult {
         self.run_on_adapter_runtime(async move {
             worker
@@ -309,7 +320,7 @@ where
                 .await
                 .map_err(|err| format!("failed to send Worker method: {err}"))
         })
-        .map(|_| WorkerExecutionResult::accepted(operation, WorkerExecutionRunState::Idle))
+        .map(|_| WorkerExecutionResult::accepted(operation, accepted_run_state))
         .unwrap_or_else(|message| WorkerExecutionResult::errored(operation, message))
     }
 }
@@ -448,6 +459,7 @@ where
             Method::Run {
                 input: vec![Segment::text(content)],
             },
+            WorkerExecutionRunState::Busy,
         );
         if result.outcome != worker_runtime::execution::WorkerExecutionOutcome::Accepted {
             busy.store(false, Ordering::SeqCst);
@@ -463,7 +475,12 @@ where
                 return result;
             }
         };
-        self.send_method(WorkerExecutionOperation::Stop, worker, Method::Shutdown)
+        self.send_method(
+            WorkerExecutionOperation::Stop,
+            worker,
+            Method::Shutdown,
+            WorkerExecutionRunState::Stopped,
+        )
     }
 
     fn cancel_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
@@ -474,7 +491,12 @@ where
                 return result;
             }
         };
-        self.send_method(WorkerExecutionOperation::Cancel, worker, Method::Cancel)
+        self.send_method(
+            WorkerExecutionOperation::Cancel,
+            worker,
+            Method::Cancel,
+            WorkerExecutionRunState::Idle,
+        )
     }
 }
 
@@ -609,6 +631,24 @@ mod tests {
             workspace_refs: Vec::new(),
             mount_refs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn builtin_profile_selector_is_not_double_prefixed() {
+        assert_eq!(
+            ProfileRuntimeWorkerFactory::runtime_profile_value(
+                &worker_runtime::catalog::ProfileSelector::Builtin("coder".to_string())
+            )
+            .as_deref(),
+            Some("builtin:coder")
+        );
+        assert_eq!(
+            ProfileRuntimeWorkerFactory::runtime_profile_value(
+                &worker_runtime::catalog::ProfileSelector::Builtin("builtin:coder".to_string())
+            )
+            .as_deref(),
+            Some("builtin:coder")
+        );
     }
 
     #[test]

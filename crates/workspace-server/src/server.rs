@@ -1149,7 +1149,7 @@ mod tests {
             .find(|worker| worker["role"] == "workspace_companion")
             .expect("companion worker is visible through runtime worker API");
         assert_eq!(companion_worker["runtime_id"], "embedded-worker-runtime");
-        assert_eq!(companion_worker["capabilities"]["can_stop"], false);
+        assert_eq!(companion_worker["capabilities"]["can_stop"], true);
 
         let companion_status = get_json(app.clone(), "/api/companion/status").await;
         assert_eq!(companion_status["state"], "ready");
