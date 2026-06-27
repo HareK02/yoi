@@ -214,3 +214,45 @@ Review focus:
 - no downstream Workspace Companion bootstrap/UX scope creep
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KW55B33B-worker-adapter at: 2026-06-27T20:58:06Z status: request_changes -->
+
+## Review: request changes
+
+request_changes
+
+読取専用で差分・主要実装を確認した。crate layering 自体は概ね意図通りで、`worker` crate 側の `runtime-adapter` feature に adapter を置き、`worker-runtime` が `worker` に依存しない形は保たれている。また fake/providerless の canned response は見当たらない。
+
+ただし、Ticket 受け入れ条件に対して以下が blocker。
+
+## Blockers
+
+1. **workspace-server の embedded Worker input API がまだ adapter に接続されていない**
+
+   - `workspace-server/src/server.rs:101-113` で adapter は embedded Runtime に install されている。
+   - しかし browser/backend registry 側の `EmbeddedWorkerRuntime::send_input` は `hosts.rs:1275-1285` で固定 reject のまま。
+   - projection も `hosts.rs:1008-1010` で `can_accept_input: false`, `can_stop: false` のまま。
+   - そのため Ticket 要件の「Backend Worker input API からの user input を `Method::Run` 相当に渡す」「Runtime / Backend / Web Console が正規経路を共有する」「embedded Worker への user input が実 Worker run に渡る」を満たしていない。
+
+2. **production profile resolution に builtin 二重 prefix の不整合がある**
+
+   - workspace-server の Ticket role mapping は `hosts.rs:1920-1924` で `ProfileSelector::Builtin("builtin:coder")` のように値へ `builtin:` を含めている。
+   - adapter 側は `worker/src/runtime_adapter.rs:133-140` で `Builtin(name)` を常に `format!("builtin:{name}")` しているため、内部的に `builtin:builtin:coder` になる。
+   - `manifest::ProfileSelector::parse_cli` は `builtin:builtin:coder` を source=`builtin`, name=`builtin:coder` と解釈するため、通常の builtin `coder` 解決に失敗する。Ticket role Worker の実 spawn path で破綻する可能性が高く、Profile/config resolution の受け入れ条件を満たさない。
+
+3. **run_state/status projection が実 run lifecycle と整合していない**
+
+   - `send_method` は input の `Method::Run` 送信成功時も `WorkerExecutionRunState::Idle` を返している（`worker/src/runtime_adapter.rs:300-313`, `445-455`）。
+   - Runtime 側はその `Idle` を input accepted 後の execution status として保存する（`worker-runtime/src/runtime.rs:369-373`）。
+   - bridge は `protocol::Event` を observation bus に流しているが、Worker の running/completed/errored/cancelled status を Runtime execution status に反映していない。
+   - Ticket 要件の「run started / completed / errored / cancelled を Runtime Worker status と transcript projection に反映」「busy/double-run lifecycle semantics」の観点で不足。
+
+## 確認済み
+
+- `worker-runtime` -> `worker` の依存逆流は見当たらず、adapter placement の方向性は良い。
+- `protocol::Event` bridge は `publish_protocol_event` を使って observation bus に流す実装になっている。
+- `can_stream_events` / `can_read_bounded_transcript` の public flag 復活は見当たらない。
+- downstream `00001KW55B33H` の Companion UX 完成まで踏み込む scope creep は見当たらない。
+- Ticket 更新・merge・cleanup・ファイル変更・テスト実行はしていない。Static review のみ。
+
+---
