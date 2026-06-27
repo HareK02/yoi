@@ -1,8 +1,8 @@
 ---
 title: 'worker-runtimeにWorker実行Backend境界を追加する'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-06-27T18:26:46Z'
-updated_at: '2026-06-27T19:48:30Z'
+updated_at: '2026-06-27T19:49:46Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-27T19:06:28Z'
