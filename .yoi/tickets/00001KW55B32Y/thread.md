@@ -131,3 +131,71 @@ Queued dependency notes:
 - `00001KW55B33H` remains queued behind `00001KW55B33B`.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KW55B32Y-exec-backend at: 2026-06-27T19:34:20Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装完了。マージ / close / cleanup は未実施。
+
+Commit:
+- `2d5971738478f832ba9a135601ea11dda60c565d feat: add worker execution backend boundary`
+
+変更概要:
+
+### `worker-runtime`
+
+追加/変更:
+- `crates/worker-runtime/src/execution.rs` を追加。
+  - `WorkerExecutionBackend` trait
+  - `WorkerExecutionHandle`
+  - `WorkerExecutionContext`
+  - `WorkerExecutionStatus`
+  - `WorkerExecutionRunState`
+  - `WorkerExecutionResult`
+  - `WorkerExecutionOperation`
+  - `WorkerExecutionOutcome`
+  - `WorkerExecutionSpawnRequest`
+  - `WorkerExecutionSpawnResult`
+- `Runtime::with_execution_backend(...)` を追加。
+- `Runtime::with_fs_store_and_execution_backend(...)` を追加。
+- `WorkerSummary` / `WorkerDetail` に `execution` status を追加。
+- `Runtime::create_worker(...)`
+  - backend 接続時は spawn/initialize 境界を呼ぶ。
+  - backend 未接続時は `execution.backend = unconnected`。
+- `Runtime::send_input(...)`
+  - backend 未接続 Worker への input を `WorkerExecutionUnavailable` で拒否。
+  - backend dispatch が `Busy` / `Rejected` / `Errored` / `Unsupported` を返した場合、typed `WorkerExecutionRejected` として拒否。
+  - dispatch accept 後のみ transcript / event / observation を通常 Worker contract として記録。
+- `Runtime::stop_worker(...)` / `cancel_worker(...)`
+  - active かつ connected handle ありの場合は backend lifecycle 境界を呼ぶ。
+  - default backend implementation は unsupported typed rejection。
+- backend から Runtime observation bus へ `protocol::Event` を publish できる hook を追加。
+- HTTP API error mapping に execution unavailable/rejected を追加。
+
+### `workspace-server`
+
+- Embedded Worker input unavailable diagnostic を LLM 固有表現から execution backend 境界表現へ変更。
+  - `embedded_worker_execution_unavailable`
+- RuntimeRegistry / Backend projection のテストで、Browser-facing JSON に以下が出ないことを確認。
+  - `can_stream_events`
+  - `can_read_bounded_transcript`
+  - raw URL/path/socket/session/credential/provider 系の既存禁止項目。
+
+Validation:
+- `cargo fmt --all`: success
+- `cargo test -p worker-runtime --features ws-server`: success
+- `cargo test -p yoi-workspace-server`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Residual risks / review focus:
+- concrete `worker` crate adapter は意図通り未実装。下流 Ticket `00001KW55B33B` 側で今回の `WorkerExecutionBackend` trait に接続する想定。
+- Embedded Runtime は現時点では backend-unconnected placeholder のままなので、workspace-server 側では input unavailable diagnostic を返す。
+- backend trait は sync 境界として実装。実 adapter 実装時に async/process lifecycle、busy state、cancel semantics のレビューが必要。
+- `WorkerSummary` / `WorkerDetail` の public JSON に `execution` が増えるが、handle/path/socket/credential/session/manifest など raw internals は含めていない。
+
+---
