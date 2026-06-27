@@ -18,8 +18,8 @@ use crate::companion::{
 };
 use crate::hosts::{
     ConfigBundleCheckResult, ConfigBundleSyncResult, DiagnosticSeverity, EmbeddedWorkerRuntime,
-    HostSummary, LocalWorkerRuntime, RemoteRuntimeConfig, RemoteWorkerRuntime, RuntimeDiagnostic,
-    RuntimeRegistry, RuntimeSummary, WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest,
+    HostSummary, RemoteRuntimeConfig, RemoteWorkerRuntime, RuntimeDiagnostic, RuntimeRegistry,
+    RuntimeSummary, WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest,
     WorkerLifecycleResult, WorkerSpawnRequest, WorkerSpawnResult, WorkerSummary,
     WorkerTranscriptProjection,
 };
@@ -53,7 +53,6 @@ pub struct ServerConfig {
     pub static_assets_dir: Option<PathBuf>,
     pub auth: AuthConfig,
     pub max_records: usize,
-    pub local_runtime_data_dir: Option<PathBuf>,
     pub runtime_event_sources: Vec<RuntimeObservationSourceConfig>,
     pub remote_runtime_sources: Vec<RemoteRuntimeConfig>,
 }
@@ -71,7 +70,6 @@ impl ServerConfig {
                 token_configured: false,
             },
             max_records: 200,
-            local_runtime_data_dir: manifest::paths::data_dir(),
             runtime_event_sources: Vec::new(),
             remote_runtime_sources: Vec::new(),
         }
@@ -99,14 +97,9 @@ impl WorkspaceApi {
                 updated_at: config.workspace_created_at.clone(),
             })
             .await?;
-        let mut runtime = RuntimeRegistry::for_workspace(
-            LocalWorkerRuntime::new(
-                config.workspace_id.clone(),
-                config.workspace_root.clone(),
-                config.local_runtime_data_dir.clone(),
-            ),
-            EmbeddedWorkerRuntime::new_memory(config.workspace_id.clone()),
-        );
+        let mut runtime = RuntimeRegistry::for_workspace(EmbeddedWorkerRuntime::new_memory(
+            config.workspace_id.clone(),
+        ));
         for remote_config in config.remote_runtime_sources.iter().cloned() {
             runtime
                 .register(RemoteWorkerRuntime::new(remote_config).map_err(|err| err.into_error())?);
@@ -1049,7 +1042,6 @@ mod tests {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
         let mut config = ServerConfig::local_dev(dir.path(), test_identity());
         config.static_assets_dir = Some(static_dir);
-        config.local_runtime_data_dir = Some(dir.path().join("data"));
         let api = WorkspaceApi::new(config, Arc::new(store)).await.unwrap();
         let app = build_router(api);
 
@@ -1109,28 +1101,24 @@ mod tests {
 
         let hosts = get_json(app.clone(), "/api/hosts").await;
         assert_eq!(hosts["source"], "worker_runtime_registry");
-        assert_eq!(hosts["items"][0]["runtime_id"], "local-worker-runtime");
+        assert_eq!(hosts["items"][0]["runtime_id"], "embedded-worker-runtime");
         let host_id = hosts["items"][0]["host_id"].as_str().unwrap().to_string();
-        assert!(host_id.starts_with("local-"));
-        assert!(host_id.len() <= 120);
-        assert_ne!(host_id, TEST_REPOSITORY_ID);
-        assert_eq!(hosts["items"][0]["kind"], "local-worker-host");
-        assert_eq!(
-            hosts["items"][0]["capabilities"]["local_pod_inspection"],
-            "available"
-        );
+        assert_eq!(hosts["items"][0]["kind"], "embedded-worker-runtime-host");
         assert_eq!(
             hosts["items"][0]["capabilities"]["workspace_scope"],
-            "current_workspace"
+            "backend_internal"
         );
         assert!(!hosts.to_string().contains("metadata.json"));
 
         let runtimes = get_json(app.clone(), "/api/runtimes").await;
         assert_eq!(runtimes["source"], "worker_runtime_registry");
-        assert_eq!(runtimes["items"][0]["runtime_id"], "local-worker-runtime");
+        assert_eq!(
+            runtimes["items"][0]["runtime_id"],
+            "embedded-worker-runtime"
+        );
         assert_eq!(
             runtimes["items"][0]["source"]["kind"],
-            "local_compatibility"
+            "embedded_worker_runtime"
         );
         assert_eq!(
             runtimes["items"][0]["source"]["identity_authority"],
@@ -1147,10 +1135,6 @@ mod tests {
             .expect("companion worker is visible through runtime worker API");
         assert_eq!(companion_worker["runtime_id"], "embedded-worker-runtime");
         assert_eq!(companion_worker["capabilities"]["can_stop"], false);
-        assert_eq!(
-            workers["diagnostics"][0]["code"],
-            "local_pod_registry_unreadable"
-        );
 
         let companion_status = get_json(app.clone(), "/api/companion/status").await;
         assert_eq!(companion_status["state"], "ready");
@@ -1186,7 +1170,13 @@ mod tests {
         assert_eq!(companion_transcript["items"][1]["role"], "assistant");
 
         let host_workers = get_json(app.clone(), &format!("/api/hosts/{host_id}/workers")).await;
-        assert!(host_workers["items"].as_array().unwrap().is_empty());
+        assert!(
+            host_workers["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|worker| worker["role"] == "workspace_companion")
+        );
 
         let runs_response = app
             .clone()
@@ -1270,8 +1260,7 @@ mod tests {
     async fn embedded_runtime_api_routes_by_runtime_and_worker_ids_without_leaking_internals() {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        let mut config = ServerConfig::local_dev(dir.path(), test_identity());
-        config.local_runtime_data_dir = Some(dir.path().join("data"));
+        let config = ServerConfig::local_dev(dir.path(), test_identity());
         let api = WorkspaceApi::new(config, Arc::new(store)).await.unwrap();
         let app = build_router(api);
 
@@ -1362,7 +1351,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri(format!(
-                        "/api/runtimes/local-worker-runtime/workers/{worker_id}/input"
+                        "/api/runtimes/unknown-runtime/workers/{worker_id}/input"
                     ))
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(
@@ -1418,7 +1407,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteWorkspaceStore::in_memory().unwrap();
         let mut config = ServerConfig::local_dev(dir.path(), test_identity());
-        config.local_runtime_data_dir = Some(dir.path().join("data"));
         config
             .runtime_event_sources
             .push(RuntimeObservationSourceConfig {
@@ -1630,7 +1618,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteWorkspaceStore::in_memory().unwrap();
         let mut config = ServerConfig::local_dev(dir.path(), test_identity());
-        config.local_runtime_data_dir = Some(dir.path().join("data"));
         let runtime_id = source.runtime_id.clone();
         let worker_id = source.worker_id.clone();
         config.runtime_event_sources.push(source);

@@ -6037,8 +6037,6 @@ dependencies = [
  "axum",
  "chrono",
  "futures",
- "manifest",
- "pod-store",
  "project-record",
  "protocol",
  "reqwest",

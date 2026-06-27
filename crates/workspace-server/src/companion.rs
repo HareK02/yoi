@@ -564,14 +564,12 @@ fn diagnostic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hosts::{EmbeddedWorkerRuntime, LocalWorkerRuntime, RuntimeRegistry};
+    use crate::hosts::{EmbeddedWorkerRuntime, RuntimeRegistry};
 
     #[test]
     fn companion_spawns_visible_worker_and_records_providerless_turn() {
-        let registry = RuntimeRegistry::for_workspace(
-            LocalWorkerRuntime::new("local:test", "/workspace/project", None),
-            EmbeddedWorkerRuntime::new_memory("local:test"),
-        );
+        let registry =
+            RuntimeRegistry::for_workspace(EmbeddedWorkerRuntime::new_memory("local:test"));
         let registry = Arc::new(registry);
         let companion = CompanionConsole::new(registry.clone());
 

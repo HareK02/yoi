@@ -3,7 +3,6 @@
   import { workerConsoleHref } from '$lib/workspace-console/model';
   import WorkspaceSidebar from '$lib/workspace-sidebar/WorkspaceSidebar.svelte';
   import type {
-    Diagnostic,
     Host,
     ListResponse,
     ObjectiveDetail,
@@ -27,17 +26,6 @@
     view = 'overview',
     objectiveId = null
   }: { view?: WorkspaceView; repositoryId?: string; objectiveId?: string | null } = $props();
-
-  const endpoints = [
-    { label: 'Workspace', path: '/api/workspace' },
-    { label: 'Tickets', path: '/api/tickets' },
-    { label: 'Objectives', path: '/api/objectives' },
-    { label: 'Repositories', path: '/api/repositories' },
-    { label: 'Repository tickets', path: '/api/repositories/local/tickets' },
-    { label: 'Runs', path: '/api/runs' },
-    { label: 'Hosts', path: '/api/hosts' },
-    { label: 'Workers', path: '/api/workers' }
-  ];
 
   let workspace = $state<WorkspaceResponse | null>(null);
   let hosts = $state<ListResponse<Host> | null>(null);
@@ -147,10 +135,6 @@
         objectiveDetailLoading = false;
       }
     }
-  }
-
-  function diagnosticsFor(...groups: Array<Diagnostic[] | undefined>): Diagnostic[] {
-    return groups.flatMap((group) => group ?? []);
   }
 
   function routeFromView(view: WorkspaceView, objectiveId: string | null): RouteState {
@@ -265,21 +249,6 @@
         {/if}
       </section>
 
-      {@const repositoryDiagnostics = diagnosticsFor(repository?.git.diagnostics, repositoryTickets?.diagnostics)}
-      {#if repositoryDiagnostics.length > 0}
-        <section class="card diagnostics">
-          <h2>Repository diagnostics</h2>
-          <ul>
-            {#each repositoryDiagnostics as diagnostic}
-              <li>
-                <strong>{diagnostic.severity}</strong>
-                <code>{diagnostic.code}</code>
-                <span>{diagnostic.message}</span>
-              </li>
-            {/each}
-          </ul>
-        </section>
-      {/if}
     {:else if route.page === 'objectives' || route.page === 'objective'}
       <section class="card">
         <h2>Objectives</h2>
@@ -391,26 +360,6 @@
         {/if}
       </section>
 
-      <section class="grid">
-        <div class="card">
-          <h2>Read API surface</h2>
-          <ul>
-            {#each endpoints as endpoint}
-              <li><code>{endpoint.path}</code> — {endpoint.label}</li>
-            {/each}
-          </ul>
-        </div>
-
-        <div class="card">
-          <h2>Reserved seams</h2>
-          <p>
-            Event streams remain represented as extension-point state in the backend
-            response. Hosts and Workers are read-only local observations; no
-            scheduler, lifecycle control, or hosted multi-tenant behavior is
-            implemented in this slice.
-          </p>
-        </div>
-      </section>
 
       <section class="grid runtime">
         <div class="card">
@@ -434,10 +383,6 @@
                       <div>
                         <dt>Kind</dt>
                         <dd>{host.kind}</dd>
-                      </div>
-                      <div>
-                        <dt>Local inspection</dt>
-                        <dd>{host.capabilities.local_pod_inspection}</dd>
                       </div>
                       <div>
                         <dt>Runtime</dt>
@@ -509,23 +454,6 @@
         </div>
       </section>
 
-      {#if hosts || workers}
-        {@const diagnostics = diagnosticsFor(hosts?.diagnostics, workers?.diagnostics)}
-        {#if diagnostics.length > 0}
-          <section class="card diagnostics">
-            <h2>Diagnostics</h2>
-            <ul>
-              {#each diagnostics as diagnostic}
-                <li>
-                  <strong>{diagnostic.severity}</strong>
-                  <code>{diagnostic.code}</code>
-                  <span>{diagnostic.message}</span>
-                </li>
-              {/each}
-            </ul>
-          </section>
-        {/if}
-      {/if}
     {/if}
   </main>
 </div>

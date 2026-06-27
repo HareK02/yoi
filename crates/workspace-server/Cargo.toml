@@ -9,9 +9,7 @@ publish = false
 async-trait.workspace = true
 axum = { workspace = true, features = ["ws"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-manifest = { workspace = true }
 futures.workspace = true
-pod-store = { workspace = true }
 protocol = { workspace = true }
 project-record.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "native-tls"] }

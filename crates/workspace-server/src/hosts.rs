@@ -1,20 +1,12 @@
 use crate::Error;
 use chrono::Utc;
-use pod_store::WorkerMetadata;
 use reqwest::StatusCode;
 use reqwest::blocking::{Client as BlockingHttpClient, RequestBuilder};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{
-    collections::BTreeSet,
-    fs,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 use worker_runtime::catalog::{
     CapabilityRequest, ConfigBundleRef, CreateWorkerRequest, ProfileSelector,
     WorkerDetail as EmbeddedWorkerDetail, WorkerIntent, WorkerStatus as EmbeddedWorkerStatus,
@@ -38,9 +30,7 @@ use worker_runtime::observation::{
     TranscriptProjection as EmbeddedTranscriptProjection, TranscriptQuery, TranscriptRole,
 };
 
-const LOCAL_RUNTIME_ID: &str = "local-worker-runtime";
 const EMBEDDED_RUNTIME_ID: &str = "embedded-worker-runtime";
-const LOCAL_HOST_KIND: &str = "local-worker-host";
 const EMBEDDED_HOST_KIND: &str = "embedded-worker-runtime-host";
 const REMOTE_HOST_KIND: &str = "remote-worker-runtime-host";
 const MAX_DIAGNOSTICS: usize = 16;
@@ -77,11 +67,7 @@ pub enum DiagnosticSeverity {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeSourceKind {
-    /// Compatibility projection over the existing local Pod metadata store.
-    LocalCompatibility,
-    /// Reserved boundary for the future in-process worker-runtime Runtime adapter.
     EmbeddedWorkerRuntime,
-    /// Reserved boundary for a future remote Workspace Runtime adapter.
     RemoteHttp,
 }
 
@@ -96,7 +82,7 @@ pub enum RuntimeSourceStatus {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeIdentityAuthority {
     /// Public Runtime/Host/Worker ids are registry projections, never raw
-    /// compatibility-store names, socket addresses, session ids, or paths.
+    /// socket addresses, session ids, credentials, or paths.
     RuntimeRegistryProjection,
 }
 
@@ -109,15 +95,6 @@ pub struct RuntimeSourceSummary {
 }
 
 impl RuntimeSourceSummary {
-    pub fn local_compatibility() -> Self {
-        Self {
-            kind: RuntimeSourceKind::LocalCompatibility,
-            status: RuntimeSourceStatus::Active,
-            identity_authority: RuntimeIdentityAuthority::RuntimeRegistryProjection,
-            note: "read-only compatibility projection over local Worker metadata; no socket, session, or path authority is exposed".to_string(),
-        }
-    }
-
     pub fn embedded_worker_runtime() -> Self {
         Self {
             kind: RuntimeSourceKind::EmbeddedWorkerRuntime,
@@ -170,7 +147,6 @@ pub struct RuntimeCapabilitySummary {
     pub has_git: bool,
     pub supports_worktrees: bool,
     pub supports_backend_internal_tools: bool,
-    pub local_pod_inspection: String,
     pub workspace_scope: String,
     pub max_workers: usize,
     pub os: String,
@@ -674,15 +650,8 @@ impl RuntimeRegistry {
         Self { runtimes }
     }
 
-    pub fn for_local_pods(runtime: LocalWorkerRuntime) -> Self {
-        Self::new(vec![Arc::new(runtime)])
-    }
-
-    pub fn for_workspace(
-        local_runtime: LocalWorkerRuntime,
-        embedded_runtime: EmbeddedWorkerRuntime,
-    ) -> Self {
-        Self::new(vec![Arc::new(local_runtime), Arc::new(embedded_runtime)])
+    pub fn for_workspace(embedded_runtime: EmbeddedWorkerRuntime) -> Self {
+        Self::new(vec![Arc::new(embedded_runtime)])
     }
 
     pub fn register<R>(&mut self, runtime: R)
@@ -1894,300 +1863,6 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
     }
 }
 
-#[derive(Clone)]
-pub struct LocalWorkerRuntime {
-    runtime_id: String,
-    host_id: String,
-    workspace_root: PathBuf,
-    data_dir: Option<PathBuf>,
-}
-
-pub type LocalRuntimeBridge = LocalWorkerRuntime;
-
-impl LocalWorkerRuntime {
-    pub fn new(
-        workspace_id: impl AsRef<str>,
-        workspace_root: impl Into<PathBuf>,
-        data_dir: Option<PathBuf>,
-    ) -> Self {
-        Self {
-            runtime_id: LOCAL_RUNTIME_ID.to_string(),
-            host_id: host_id_for_workspace(workspace_id.as_ref()),
-            workspace_root: workspace_root.into(),
-            data_dir,
-        }
-    }
-
-    fn pod_root(&self) -> Option<PathBuf> {
-        self.data_dir.as_ref().map(|dir| dir.join("pods"))
-    }
-
-    fn worker_names(&self, pod_root: &Path) -> Result<BTreeSet<String>, RuntimeDiagnostic> {
-        let entries = fs::read_dir(pod_root).map_err(|err| {
-            diagnostic(
-                "local_pod_registry_unreadable",
-                DiagnosticSeverity::Warning,
-                format!("local Worker registry could not be read: {err}"),
-            )
-        })?;
-
-        let mut worker_names = BTreeSet::new();
-        for entry in entries.flatten() {
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-            let Some(name) = entry.file_name().to_str().map(|name| name.to_string()) else {
-                continue;
-            };
-            worker_names.insert(name);
-        }
-        Ok(worker_names)
-    }
-
-    fn read_worker(&self, pod_root: &Path, worker_name: &str) -> WorkerReadOutcome {
-        let metadata_path = pod_root.join(worker_name).join("metadata.json");
-        let data = match fs::read_to_string(metadata_path) {
-            Ok(data) => data,
-            Err(err) => {
-                return WorkerReadOutcome::Diagnostic(diagnostic(
-                    "local_pod_metadata_unreadable",
-                    DiagnosticSeverity::Warning,
-                    format!("local Worker metadata could not be read: {err}"),
-                ));
-            }
-        };
-        let metadata: WorkerMetadata = match serde_json::from_str(&data) {
-            Ok(metadata) => metadata,
-            Err(err) => {
-                return WorkerReadOutcome::Diagnostic(diagnostic(
-                    "local_pod_metadata_invalid",
-                    DiagnosticSeverity::Warning,
-                    format!("local Worker metadata could not be parsed: {err}"),
-                ));
-            }
-        };
-
-        let Some(metadata_workspace_root) = metadata.workspace_root.as_ref() else {
-            return WorkerReadOutcome::Diagnostic(diagnostic(
-                "local_pod_workspace_root_missing",
-                DiagnosticSeverity::Warning,
-                "local Worker metadata did not include a workspace identity and was not included"
-                    .to_string(),
-            ));
-        };
-        if !same_workspace_root(metadata_workspace_root, &self.workspace_root) {
-            return WorkerReadOutcome::Diagnostic(diagnostic(
-                "local_pod_workspace_not_visible",
-                DiagnosticSeverity::Info,
-                "local Worker metadata belongs to another workspace and was not included"
-                    .to_string(),
-            ));
-        }
-
-        let label = safe_display_hint(&metadata.worker_name);
-        let role = manifest_hint_string(&metadata.resolved_manifest_snapshot, "role");
-        let profile =
-            manifest_hint_string(&metadata.resolved_manifest_snapshot, "profile_selector");
-        let worker_id = worker_id_for_pod(worker_name);
-        let status = match metadata
-            .active
-            .as_ref()
-            .and_then(|active| active.segment_id.as_ref())
-        {
-            Some(_) => "active:segment".to_string(),
-            None if metadata.active.is_some() => "active:pending_segment".to_string(),
-            None => "metadata_only".to_string(),
-        };
-        let state = if metadata.active.is_some() {
-            "active".to_string()
-        } else {
-            "metadata_only".to_string()
-        };
-        let last_seen_at = None;
-        WorkerReadOutcome::Worker(WorkerSummary {
-            runtime_id: self.runtime_id.clone(),
-            worker_id,
-            host_id: self.host_id.clone(),
-            label,
-            role,
-            profile,
-            workspace: WorkerWorkspaceSummary {
-                visibility: "current_workspace".to_string(),
-                identity: "runtime_workspace".to_string(),
-            },
-            state,
-            status,
-            last_seen_at,
-            implementation: WorkerImplementationSummary {
-                kind: "local_pod".to_string(),
-                display_hint: safe_display_hint(worker_name),
-            },
-            capabilities: WorkerCapabilitySummary {
-                can_accept_input: true,
-                can_stream_events: false,
-                can_stop: false,
-                can_spawn_followup: false,
-                can_read_bounded_transcript: false,
-            },
-            diagnostics: vec![diagnostic(
-                "worker_actions_not_implemented",
-                DiagnosticSeverity::Info,
-                "runtime overview is available; worker control and stream/proxy operations are not yet implemented"
-                    .to_string(),
-            )],
-        })
-    }
-}
-
-impl WorkspaceWorkerRuntime for LocalWorkerRuntime {
-    fn runtime_id(&self) -> &str {
-        &self.runtime_id
-    }
-
-    fn runtime_summary(&self, limit: usize) -> RuntimeSummary {
-        let host_list = self.list_hosts(1);
-        RuntimeSummary {
-            runtime_id: self.runtime_id.clone(),
-            label: "Local Worker runtime".to_string(),
-            kind: "local_pod".to_string(),
-            status: "available".to_string(),
-            source: RuntimeSourceSummary::local_compatibility(),
-            host_ids: host_list
-                .items
-                .iter()
-                .take(limit)
-                .map(|host| host.host_id.clone())
-                .collect(),
-            capabilities: local_runtime_capabilities(limit, self.pod_root().is_some()),
-            diagnostics: host_list.diagnostics,
-        }
-    }
-
-    fn list_hosts(&self, limit: usize) -> RuntimeList<HostSummary> {
-        if limit == 0 {
-            return RuntimeList::new(Vec::new(), Vec::new());
-        }
-
-        let mut diagnostics = Vec::new();
-        let inspection_available = self.pod_root().is_some();
-        if !inspection_available {
-            diagnostics.push(diagnostic(
-                "local_pod_registry_unavailable",
-                DiagnosticSeverity::Warning,
-                "local Worker data directory is not configured; worker discovery is unavailable"
-                    .to_string(),
-            ));
-        }
-
-        let item = HostSummary {
-            runtime_id: self.runtime_id.clone(),
-            host_id: self.host_id.clone(),
-            label: label_for_workspace(&self.workspace_root),
-            kind: LOCAL_HOST_KIND.to_string(),
-            status: if inspection_available {
-                "available"
-            } else {
-                "degraded"
-            }
-            .to_string(),
-            observed_at: Utc::now().to_rfc3339(),
-            last_seen_at: None,
-            capabilities: local_runtime_capabilities(limit, inspection_available),
-            diagnostics: diagnostics.clone(),
-        };
-        RuntimeList::new(vec![item], diagnostics)
-    }
-
-    fn list_workers(&self, limit: usize) -> RuntimeList<WorkerSummary> {
-        let Some(pod_root) = self.pod_root() else {
-            return RuntimeList::new(
-                Vec::new(),
-                vec![diagnostic(
-                    "local_pod_registry_unavailable",
-                    DiagnosticSeverity::Warning,
-                    "local Worker data directory is not configured; worker discovery is unavailable"
-                        .to_string(),
-                )],
-            );
-        };
-        if limit == 0 {
-            return RuntimeList::new(Vec::new(), Vec::new());
-        }
-
-        let mut workers = Vec::new();
-        let mut diagnostics = Vec::new();
-        let worker_names = match self.worker_names(&pod_root) {
-            Ok(worker_names) => worker_names,
-            Err(diag) => return RuntimeList::new(Vec::new(), vec![diag]),
-        };
-
-        for worker_name in worker_names {
-            if workers.len() >= limit {
-                break;
-            }
-            match self.read_worker(&pod_root, &worker_name) {
-                WorkerReadOutcome::Worker(worker) => workers.push(worker),
-                WorkerReadOutcome::Diagnostic(diag) => {
-                    if diagnostics.len() < MAX_DIAGNOSTICS {
-                        diagnostics.push(diag);
-                    }
-                }
-            }
-        }
-        RuntimeList::new(workers, diagnostics)
-    }
-
-    fn worker(&self, worker_id: &str) -> WorkerLookupResult {
-        let Some(pod_root) = self.pod_root() else {
-            return WorkerLookupResult {
-                worker: None,
-                diagnostics: vec![diagnostic(
-                    "local_pod_registry_unavailable",
-                    DiagnosticSeverity::Warning,
-                    "local Worker data directory is not configured; worker discovery is unavailable"
-                        .to_string(),
-                )],
-            };
-        };
-        let worker_names = match self.worker_names(&pod_root) {
-            Ok(worker_names) => worker_names,
-            Err(diag) => {
-                return WorkerLookupResult {
-                    worker: None,
-                    diagnostics: vec![diag],
-                };
-            }
-        };
-        for worker_name in worker_names {
-            if worker_id_for_pod(&worker_name) != worker_id {
-                continue;
-            }
-            return match self.read_worker(&pod_root, &worker_name) {
-                WorkerReadOutcome::Worker(worker) => WorkerLookupResult {
-                    worker: Some(worker),
-                    diagnostics: Vec::new(),
-                },
-                WorkerReadOutcome::Diagnostic(diag) => WorkerLookupResult {
-                    worker: None,
-                    diagnostics: vec![diag],
-                },
-            };
-        }
-        WorkerLookupResult {
-            worker: None,
-            diagnostics: Vec::new(),
-        }
-    }
-}
-
-enum WorkerReadOutcome {
-    Worker(WorkerSummary),
-    Diagnostic(RuntimeDiagnostic),
-}
-
 fn embedded_runtime_capabilities(limit: usize, available: bool) -> RuntimeCapabilitySummary {
     RuntimeCapabilitySummary {
         can_list_hosts: true,
@@ -2203,7 +1878,6 @@ fn embedded_runtime_capabilities(limit: usize, available: bool) -> RuntimeCapabi
         has_git: false,
         supports_worktrees: false,
         supports_backend_internal_tools: true,
-        local_pod_inspection: "not_applicable".to_string(),
         workspace_scope: "backend_internal".to_string(),
         max_workers: limit,
         os: std::env::consts::OS.to_string(),
@@ -2472,7 +2146,6 @@ fn remote_runtime_capabilities(limit: usize, available: bool) -> RuntimeCapabili
         has_git: false,
         supports_worktrees: false,
         supports_backend_internal_tools: false,
-        local_pod_inspection: "unavailable".to_string(),
         workspace_scope: "remote_runtime_backend_private".to_string(),
         max_workers: limit,
         os: "remote".to_string(),
@@ -2532,37 +2205,6 @@ fn remote_http_status_diagnostic(
     )
 }
 
-fn local_runtime_capabilities(
-    limit: usize,
-    inspection_available: bool,
-) -> RuntimeCapabilitySummary {
-    RuntimeCapabilitySummary {
-        can_list_hosts: true,
-        can_list_workers: inspection_available,
-        can_get_worker: inspection_available,
-        can_spawn_worker: false,
-        can_stop_worker: false,
-        can_accept_input: false,
-        can_stream_events: false,
-        can_read_bounded_transcript: false,
-        has_workspace_fs: false,
-        has_shell: false,
-        has_git: false,
-        supports_worktrees: false,
-        supports_backend_internal_tools: false,
-        local_pod_inspection: if inspection_available {
-            "available"
-        } else {
-            "unavailable"
-        }
-        .to_string(),
-        workspace_scope: "current_workspace".to_string(),
-        max_workers: limit,
-        os: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
-    }
-}
-
 fn diagnostic(
     code: impl Into<String>,
     severity: DiagnosticSeverity,
@@ -2592,14 +2234,6 @@ fn operation_failed_or_unknown_worker(
             runtime_id: runtime_id.to_string(),
             worker_id: worker_id.to_string(),
         })
-}
-
-fn host_id_for_workspace(workspace_id: &str) -> String {
-    bounded_backend_identifier("local-", workspace_id)
-}
-
-fn worker_id_for_pod(worker_name: &str) -> String {
-    bounded_backend_identifier("local-worker-", worker_name)
 }
 
 fn bounded_backend_identifier(prefix: &str, value: &str) -> String {
@@ -2680,27 +2314,6 @@ fn validate_backend_identifier(
     Ok(())
 }
 
-fn label_for_workspace(workspace_root: &Path) -> String {
-    workspace_root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("workspace")
-        .to_string()
-}
-
-fn same_workspace_root(left: &Path, right: &Path) -> bool {
-    lexical_path_string(left) == lexical_path_string(right)
-}
-
-fn lexical_path_string(path: &Path) -> String {
-    let mut value = path.to_string_lossy().replace('\\', "/");
-    while value.len() > 1 && value.ends_with('/') {
-        value.pop();
-    }
-    value
-}
-
 fn safe_display_hint(value: &str) -> String {
     value
         .chars()
@@ -2720,27 +2333,6 @@ fn worker_spawn_intent_label(intent: &WorkerSpawnIntent) -> &'static str {
             TicketWorkerRole::Reviewer => "ticket_reviewer",
         },
     }
-}
-
-fn manifest_hint_string(snapshot: &Option<Value>, key: &str) -> Option<String> {
-    let value = snapshot.as_ref()?;
-    let candidate = match key {
-        "role" => value
-            .get("role")
-            .or_else(|| value.get("role_claim").and_then(|role| role.get("role"))),
-        "profile_selector" => value
-            .get("profile_selector")
-            .or_else(|| value.get("profile")),
-        _ => value.get(key),
-    }?;
-    let text = candidate.as_str().map(ToOwned::to_owned).or_else(|| {
-        candidate
-            .get("name")
-            .and_then(|name| name.as_str())
-            .map(ToOwned::to_owned)
-    })?;
-    let safe = safe_display_hint(&text);
-    (!safe.is_empty()).then_some(safe)
 }
 
 pub fn placeholder_worker(host_id: impl Into<String>) -> WorkerSummary {
@@ -2795,32 +2387,10 @@ pub fn placeholder_spawn_response(host_id: impl Into<String>) -> WorkerSpawnResu
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::fs;
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::Arc;
     use std::thread;
-    use tempfile::TempDir;
-
-    fn write_metadata(dir: &Path, worker_name: &str, metadata: &WorkerMetadata) {
-        let pod_dir = dir.join("pods").join(worker_name);
-        fs::create_dir_all(&pod_dir).unwrap();
-        fs::write(
-            pod_dir.join("metadata.json"),
-            serde_json::to_vec(metadata).unwrap(),
-        )
-        .unwrap();
-    }
-
-    fn metadata(workspace_root: Option<&str>) -> WorkerMetadata {
-        let mut metadata = WorkerMetadata::new("coder", None);
-        metadata.workspace_root = workspace_root.map(PathBuf::from);
-        metadata.resolved_manifest_snapshot = Some(json!({
-            "role": "coder",
-            "profile_selector": "builtin:coder"
-        }));
-        metadata
-    }
 
     fn test_config_bundle() -> ConfigBundle {
         ConfigBundle {
@@ -2846,15 +2416,6 @@ mod tests {
             }],
         }
         .with_computed_digest()
-    }
-
-    fn assert_valid_generated_id(id: &str) {
-        assert!(id.len() <= MAX_IDENTIFIER_LEN, "id too long: {id}");
-        validate_backend_identifier("test_id", id).unwrap();
-    }
-
-    fn host_id() -> String {
-        host_id_for_workspace("local:test")
     }
 
     #[derive(Clone)]
@@ -2927,7 +2488,6 @@ mod tests {
                     has_git: false,
                     supports_worktrees: false,
                     supports_backend_internal_tools: false,
-                    local_pod_inspection: "none".to_string(),
                     workspace_scope: "none".to_string(),
                     max_workers: self.workers.len(),
                     os: "test".to_string(),
@@ -3036,139 +2596,9 @@ mod tests {
     }
 
     #[test]
-    fn local_runtime_reports_host_without_private_paths() {
-        let bridge = LocalWorkerRuntime::new("local:test", "/workspace/project", None);
-        let hosts = bridge.list_hosts(10);
-        assert_eq!(hosts.items.len(), 1);
-        let host = &hosts.items[0];
-        assert_eq!(host.runtime_id, LOCAL_RUNTIME_ID);
-        assert_eq!(host.host_id, host_id());
-        assert_valid_generated_id(&host.host_id);
-        assert_eq!(host.capabilities.local_pod_inspection, "unavailable");
-        assert_eq!(host.capabilities.workspace_scope, "current_workspace");
-        let json = serde_json::to_string(host).unwrap();
-        assert!(!json.contains("/workspace/project"));
-        assert!(!json.contains("metadata.json"));
-    }
-
-    #[test]
-    fn registry_lists_runtimes_hosts_and_workers() {
-        let temp = TempDir::new().unwrap();
-        write_metadata(temp.path(), "coder", &metadata(Some("/workspace/project")));
-        let registry = RuntimeRegistry::for_local_pods(LocalWorkerRuntime::new(
-            "local:test",
-            "/workspace/project",
-            Some(temp.path().to_path_buf()),
-        ));
-
-        let runtimes = registry.list_runtimes(10);
-        assert_eq!(runtimes.items[0].runtime_id, LOCAL_RUNTIME_ID);
-        assert_eq!(
-            runtimes.items[0].source.kind,
-            RuntimeSourceKind::LocalCompatibility
-        );
-        assert_eq!(
-            runtimes.items[0].source.identity_authority,
-            RuntimeIdentityAuthority::RuntimeRegistryProjection
-        );
-        assert_eq!(runtimes.items[0].host_ids, vec![host_id()]);
-
-        let hosts = registry.list_hosts(10);
-        assert_eq!(hosts.items[0].host_id, host_id());
-        assert_valid_generated_id(&hosts.items[0].host_id);
-
-        let workers = registry.list_workers(10);
-        assert_eq!(workers.items.len(), 1);
-        let worker = &workers.items[0];
-        assert_eq!(worker.runtime_id, LOCAL_RUNTIME_ID);
-        assert_eq!(worker.worker_id, worker_id_for_pod("coder"));
-        assert_valid_generated_id(&worker.worker_id);
-        assert_eq!(worker.host_id, host_id());
-        assert_eq!(worker.workspace.visibility, "current_workspace");
-        assert_eq!(worker.implementation.display_hint, "coder");
-        let json = serde_json::to_string(worker).unwrap();
-        assert!(!json.contains("/workspace/project"));
-        assert!(!json.contains("metadata.json"));
-    }
-
-    #[test]
-    fn registry_resolves_backend_validated_host_ids() {
-        let temp = TempDir::new().unwrap();
-        write_metadata(temp.path(), "coder", &metadata(Some("/workspace/project")));
-        let registry = RuntimeRegistry::for_local_pods(LocalWorkerRuntime::new(
-            "local:test",
-            "/workspace/project",
-            Some(temp.path().to_path_buf()),
-        ));
-
-        let workers = registry.list_workers_for_host(&host_id(), 10).unwrap();
-        assert_eq!(workers.items.len(), 1);
-        assert!(matches!(
-            registry.list_workers_for_host("../secret", 10),
-            Err(RuntimeRegistryError::InvalidIdentifier { .. })
-        ));
-        assert!(matches!(
-            registry.list_workers_for_host("local-missing", 10),
-            Err(RuntimeRegistryError::UnknownHost(_))
-        ));
-    }
-
-    #[test]
-    fn local_runtime_excludes_other_workspace_metadata() {
-        let temp = TempDir::new().unwrap();
-        write_metadata(temp.path(), "other", &metadata(Some("/workspace/other")));
-        write_metadata(temp.path(), "missing", &metadata(None));
-        let bridge = LocalWorkerRuntime::new(
-            "local:test",
-            "/workspace/project",
-            Some(temp.path().to_path_buf()),
-        );
-        let workers = bridge.list_workers(10);
-        assert!(workers.items.is_empty());
-        assert!(
-            workers
-                .diagnostics
-                .iter()
-                .any(|diag| diag.code == "local_pod_workspace_not_visible")
-        );
-        assert!(
-            workers
-                .diagnostics
-                .iter()
-                .any(|diag| diag.code == "local_pod_workspace_root_missing")
-        );
-    }
-
-    #[test]
-    fn local_runtime_worker_detail_is_safe_and_bounded() {
-        let temp = TempDir::new().unwrap();
-        write_metadata(temp.path(), "coder", &metadata(Some("/workspace/project")));
-        let bridge = LocalWorkerRuntime::new(
-            "local:test",
-            "/workspace/project",
-            Some(temp.path().to_path_buf()),
-        );
-        let worker_id = worker_id_for_pod("coder");
-        let worker = bridge.worker(&worker_id).worker.unwrap();
-        assert_eq!(worker.label, "coder");
-        assert_eq!(worker.workspace.identity, "runtime_workspace");
-        assert!(
-            bridge
-                .worker(&worker_id_for_pod("missing"))
-                .worker
-                .is_none()
-        );
-    }
-
-    #[test]
     fn embedded_runtime_registers_routes_input_and_transcript_without_internal_leaks() {
-        let temp = TempDir::new().unwrap();
-        let mut registry = RuntimeRegistry::for_local_pods(LocalWorkerRuntime::new(
-            "local:test",
-            "/workspace/project",
-            Some(temp.path().to_path_buf()),
-        ));
-        registry.register(EmbeddedWorkerRuntime::new_memory("local:test"));
+        let registry =
+            RuntimeRegistry::for_workspace(EmbeddedWorkerRuntime::new_memory("local:test"));
 
         let runtimes = registry.list_runtimes(10);
         let embedded_summary = runtimes
@@ -3241,19 +2671,6 @@ mod tests {
         assert_eq!(transcript.items.len(), 1);
         assert_eq!(transcript.items[0].role, "user");
         assert_eq!(transcript.items[0].content, "hello embedded runtime");
-
-        assert!(matches!(
-            registry.send_input(
-                LOCAL_RUNTIME_ID,
-                &worker.worker_id,
-                WorkerInputRequest {
-                    kind: WorkerInputKind::User,
-                    content: "wrong runtime".to_string(),
-                },
-            ),
-            Err(RuntimeRegistryError::UnknownWorker { runtime_id, worker_id })
-                if runtime_id == LOCAL_RUNTIME_ID && worker_id == worker.worker_id
-        ));
 
         let json = serde_json::to_string(&(embedded_summary, worker, transcript)).unwrap();
         for forbidden in [
@@ -3626,62 +3043,5 @@ mod tests {
             "transcript_len": 0,
             "last_event_id": 0
         })
-    }
-
-    #[test]
-    fn generated_worker_ids_are_opaque_bounded_unique_and_resolvable() {
-        let temp = TempDir::new().unwrap();
-        let long_a = format!("{}-A", "TicketWorkerWithVeryLongName".repeat(8));
-        let long_b = format!("{}-B", "TicketWorkerWithVeryLongName".repeat(8));
-        let worker_names = vec![
-            "00001KVWECEQG-Coder.Worker".to_string(),
-            "foo.bar".to_string(),
-            "foo-bar".to_string(),
-            "Ticket#Worker@Reviewer".to_string(),
-            long_a,
-            long_b,
-        ];
-        for worker_name in &worker_names {
-            write_metadata(
-                temp.path(),
-                worker_name,
-                &metadata(Some("/workspace/project")),
-            );
-        }
-        let bridge = LocalWorkerRuntime::new(
-            "local:test",
-            "/workspace/project",
-            Some(temp.path().to_path_buf()),
-        );
-        let registry = RuntimeRegistry::for_local_pods(bridge.clone());
-
-        let listed = registry.list_workers(100);
-        assert_eq!(listed.items.len(), worker_names.len());
-        let mut ids = BTreeSet::new();
-        for worker in listed.items {
-            assert_valid_generated_id(&worker.worker_id);
-            assert!(
-                ids.insert(worker.worker_id.clone()),
-                "duplicate id: {}",
-                worker.worker_id
-            );
-            assert!(!worker.worker_id.contains('.'));
-            assert!(!worker.worker_id.contains('@'));
-            assert!(!worker.worker_id.contains('#'));
-
-            let from_registry = registry
-                .worker(&worker.runtime_id, &worker.worker_id)
-                .unwrap();
-            assert_eq!(from_registry.worker_id, worker.worker_id);
-            let from_runtime = bridge.worker(&worker.worker_id).worker.unwrap();
-            assert_eq!(from_runtime.worker_id, worker.worker_id);
-        }
-
-        let dotted = worker_id_for_pod("foo.bar");
-        let dashed = worker_id_for_pod("foo-bar");
-        assert_ne!(dotted, dashed);
-        assert!(ids.contains(&dotted));
-        assert!(ids.contains(&dashed));
-        assert!(ids.iter().any(|id| id.len() == MAX_IDENTIFIER_LEN));
     }
 }

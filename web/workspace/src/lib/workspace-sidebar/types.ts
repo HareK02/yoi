@@ -42,7 +42,6 @@ export type RuntimeCapabilities = {
   has_git: boolean;
   supports_worktrees: boolean;
   supports_backend_internal_tools: boolean;
-  local_pod_inspection: string;
   workspace_scope: string;
   os: string;
   arch: string;
