@@ -95,3 +95,27 @@ Operational note:
 Queue continuation requested by user. Upstream dependency `00001KW55B32Y` is closed with merge and validation complete, and this Ticket has no remaining blockers. Accepting implementation before child worktree / role Pod side effects.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-27T20:12:31Z -->
+
+## Implementation report
+
+Implementation kickoff:
+
+- Worktree created: `/home/hare/Projects/yoi/.worktree/00001KW55B33B-worker-runtime-worker-adapter`
+- Branch: `work/00001KW55B33B-worker-runtime-worker-adapter`
+- Coder Worker spawned: `yoi-coder-00001KW55B33B-worker-adapter`
+
+Scope notes:
+- Coder write scope is limited to `crates/worker-runtime/**`, `crates/worker/**`, `crates/workspace-server/**`, root `Cargo.toml`, `Cargo.lock`, and `package.nix` if dependency/package changes are needed.
+- Coder is instructed not to modify Ticket records and not to operate in root/orchestration worktrees.
+
+Implementation focus:
+- adapter placement without crate dependency cycles, with rationale reported back
+- connect `worker-runtime` execution backend boundary to existing `worker` crate run lifecycle
+- bridge existing `protocol::Event` to Runtime observation bus / Backend WS
+- preserve typed diagnostics for missing config/provider/secret and busy/unsupported operations
+- avoid fake/providerless responses and Browser-facing raw handle/path/credential/session leaks
+- leave downstream Workspace Companion real execution Ticket `00001KW55B33H` queued until this adapter is merged/validated
+
+---
