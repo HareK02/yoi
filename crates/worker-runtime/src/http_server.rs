@@ -822,7 +822,9 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
         RuntimeError::WorkerNotFound { .. } | RuntimeError::ConfigBundleMissing { .. } => {
             StatusCode::NOT_FOUND
         }
-        RuntimeError::RuntimeStopped { .. } => StatusCode::CONFLICT,
+        RuntimeError::RuntimeStopped { .. }
+        | RuntimeError::WorkerExecutionUnavailable { .. }
+        | RuntimeError::WorkerExecutionRejected { .. } => StatusCode::CONFLICT,
         RuntimeError::LimitTooLarge { .. }
         | RuntimeError::InvalidRequest(_)
         | RuntimeError::ConfigBundleDigestMismatch { .. }
@@ -843,6 +845,8 @@ fn code_for_runtime_error(error: &RuntimeError) -> &'static str {
         RuntimeError::WrongRuntime { .. } => "wrong_runtime",
         RuntimeError::WrongRuntimeCursor { .. } => "wrong_runtime_cursor",
         RuntimeError::WorkerNotFound { .. } => "worker_not_found",
+        RuntimeError::WorkerExecutionUnavailable { .. } => "worker_execution_unavailable",
+        RuntimeError::WorkerExecutionRejected { .. } => "worker_execution_rejected",
         RuntimeError::LimitTooLarge { .. } => "limit_too_large",
         RuntimeError::InvalidRequest(_) => "invalid_request",
         RuntimeError::ConfigBundleMissing { .. } => "config_bundle_missing",
@@ -869,6 +873,12 @@ pub enum RuntimeHttpServerError {
 mod tests {
     use super::*;
     use crate::catalog::{CapabilityRequest, ProfileSelector, WorkerIntent};
+    use crate::execution::{
+        WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation,
+        WorkerExecutionResult, WorkerExecutionRunState, WorkerExecutionSpawnRequest,
+        WorkerExecutionSpawnResult,
+    };
+    use crate::management::RuntimeOptions;
     use axum::body::to_bytes;
     use axum::http::Method;
     use tower::ServiceExt;
@@ -883,6 +893,39 @@ mod tests {
             requested_capabilities: vec![CapabilityRequest::named("read")],
             workspace_refs: Vec::new(),
             mount_refs: Vec::new(),
+        }
+    }
+
+    struct AcceptingBackend;
+
+    impl WorkerExecutionBackend for AcceptingBackend {
+        fn backend_id(&self) -> &str {
+            "http-test"
+        }
+
+        fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
+            WorkerExecutionSpawnResult::Connected {
+                handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
+                run_state: WorkerExecutionRunState::Idle,
+            }
+        }
+
+        fn dispatch_input(
+            &self,
+            _handle: &WorkerExecutionHandle,
+            _input: WorkerInput,
+        ) -> WorkerExecutionResult {
+            WorkerExecutionResult::accepted(
+                WorkerExecutionOperation::Input,
+                WorkerExecutionRunState::Idle,
+            )
+        }
+
+        fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
+            WorkerExecutionResult::accepted(
+                WorkerExecutionOperation::Stop,
+                WorkerExecutionRunState::Stopped,
+            )
         }
     }
 
@@ -923,7 +966,9 @@ mod tests {
 
     #[tokio::test]
     async fn rest_command_api_delegates_to_runtime() {
-        let runtime = Runtime::new_memory();
+        let runtime =
+            Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(AcceptingBackend))
+                .unwrap();
         let app = runtime_http_router(runtime.clone(), None);
 
         let response = json_request(

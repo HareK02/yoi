@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod config_bundle;
 pub mod diagnostics;
 pub mod error;
+pub mod execution;
 #[cfg(feature = "fs-store")]
 pub mod fs_store;
 #[cfg(feature = "http-server")]
