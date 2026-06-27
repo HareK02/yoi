@@ -1,3 +1,4 @@
+use crate::execution::WorkerExecutionResult;
 use crate::identity::{RuntimeId, WorkerId};
 use std::path::PathBuf;
 
@@ -26,6 +27,21 @@ pub enum RuntimeError {
     WorkerNotFound {
         runtime_id: RuntimeId,
         worker_id: WorkerId,
+    },
+
+    #[error("worker {worker_id} has no execution backend: {message}")]
+    WorkerExecutionUnavailable {
+        worker_id: WorkerId,
+        message: String,
+    },
+
+    #[error("worker {worker_id} execution {operation:?} returned {outcome:?}: {message}")]
+    WorkerExecutionRejected {
+        worker_id: WorkerId,
+        operation: crate::execution::WorkerExecutionOperation,
+        outcome: crate::execution::WorkerExecutionOutcome,
+        message: String,
+        result: WorkerExecutionResult,
     },
 
     #[error("limit {requested} exceeds maximum {max}")]

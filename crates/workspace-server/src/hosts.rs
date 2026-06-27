@@ -1260,9 +1260,9 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             &self.runtime_id,
             worker_id,
             diagnostic(
-                "embedded_worker_llm_not_connected",
+                "embedded_worker_execution_unavailable",
                 DiagnosticSeverity::Error,
-                "Embedded Worker input is disabled until actual Worker/LLM execution is connected"
+                "Embedded Worker input is disabled until an execution backend is connected"
                     .to_string(),
             ),
         )
@@ -2054,6 +2054,16 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             DiagnosticSeverity::Warning,
             "Embedded Runtime worker was not found".to_string(),
         ),
+        EmbeddedRuntimeError::WorkerExecutionUnavailable { .. } => diagnostic(
+            "embedded_worker_execution_unavailable",
+            DiagnosticSeverity::Warning,
+            "Embedded Worker has no execution backend attached".to_string(),
+        ),
+        EmbeddedRuntimeError::WorkerExecutionRejected { .. } => diagnostic(
+            "embedded_worker_execution_rejected",
+            DiagnosticSeverity::Warning,
+            "Embedded Worker execution backend rejected the operation".to_string(),
+        ),
         EmbeddedRuntimeError::LimitTooLarge { requested, max } => diagnostic(
             "embedded_runtime_limit_too_large",
             DiagnosticSeverity::Warning,
@@ -2640,7 +2650,7 @@ mod tests {
             input
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == "embedded_worker_llm_not_connected")
+                .any(|diagnostic| diagnostic.code == "embedded_worker_execution_unavailable")
         );
 
         let transcript = registry
@@ -2658,6 +2668,8 @@ mod tests {
             "token",
             "credential",
             "provider",
+            "can_stream_events",
+            "can_read_bounded_transcript",
         ] {
             assert!(
                 !json.contains(forbidden),
@@ -3013,6 +3025,7 @@ mod tests {
             "runtime_id": runtime_id,
             "worker_id": worker_id,
             "status": "running",
+            "execution": { "backend": "connected", "run_state": "idle" },
             "intent": { "kind": "role", "role": "coder", "purpose": "remote test" },
             "profile": { "kind": "builtin", "value": "coder" },
             "config_bundle": null,

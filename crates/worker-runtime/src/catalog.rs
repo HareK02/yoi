@@ -1,3 +1,4 @@
+use crate::execution::WorkerExecutionStatus;
 use crate::identity::{RuntimeId, WorkerId, WorkerRef};
 use serde::{Deserialize, Serialize};
 
@@ -142,6 +143,7 @@ pub struct WorkerSummary {
     pub runtime_id: RuntimeId,
     pub worker_id: WorkerId,
     pub status: WorkerStatus,
+    pub execution: WorkerExecutionStatus,
     pub intent: WorkerIntent,
     pub profile: ProfileSelector,
     pub requested_capability_count: usize,
@@ -157,6 +159,7 @@ pub struct WorkerDetail {
     pub runtime_id: RuntimeId,
     pub worker_id: WorkerId,
     pub status: WorkerStatus,
+    pub execution: WorkerExecutionStatus,
     pub intent: WorkerIntent,
     pub profile: ProfileSelector,
     #[serde(default, skip_serializing_if = "Option::is_none")]

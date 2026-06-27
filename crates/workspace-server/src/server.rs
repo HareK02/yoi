@@ -1337,7 +1337,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|diagnostic| diagnostic["code"] == "embedded_worker_llm_not_connected")
+                .any(|diagnostic| diagnostic["code"] == "embedded_worker_execution_unavailable")
         );
 
         let transcript = get_json(
