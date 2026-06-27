@@ -223,3 +223,35 @@ Review focus:
 - no scope creep into concrete `worker` crate adapter or Companion real LLM execution
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KW55B32Y-exec-backend at: 2026-06-27T19:41:12Z status: request_changes -->
+
+## Review: request changes
+
+request_changes
+
+ブロッカー:
+
+- `worker-runtime` の既存 feature 組み合わせ `ws-server + fs-store` がコンパイル不能。今回追加された observation bus 用フィールドが `RuntimeState::from_persisted` で初期化されていない。
+  - 実行: `CARGO_TARGET_DIR=/tmp/yoi-review-target-00001KW55B32Y cargo check -p worker-runtime --features "ws-server fs-store"`
+  - 失敗: `crates/worker-runtime/src/runtime.rs:925`
+  - エラー: missing fields `next_observation_sequence`, `observation_events`, `observation_tx` in initializer of `RuntimeState`
+  - 既存の fs-store runtime path と ws observation path の組み合わせを壊す regression なので修正が必要。
+
+確認した範囲では、Ticket の主眼自体は概ね実装されている:
+
+- unconnected Worker input は typed `WorkerExecutionUnavailable` で拒否され、user transcript / observation event は追加されない。
+- connected fake backend による input dispatch test がある。
+- `protocol::Event` を observation bus に publish する hook と test がある。
+- stop/cancel unsupported は typed rejection になる。
+- fake/providerless/canned assistant response 生成は見当たらない。
+- `can_stream_events` / `can_read_bounded_transcript` の public capability 復活は見当たらない。
+- Browser-facing projection で raw backend handle/socket/session/credential/path を漏らす変更は見当たらない。
+- concrete `worker` crate adapter / Companion real LLM execution への scope creep は見当たらない。
+
+追加検証:
+
+- `git diff --check HEAD~1..HEAD`: pass
+- 作業ツリーは review 後も clean。
+
+---
