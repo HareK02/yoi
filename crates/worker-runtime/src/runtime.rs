@@ -937,6 +937,12 @@ impl RuntimeState {
             config_bundles: persisted.config_bundles,
             events: persisted.events,
             diagnostics: persisted.diagnostics,
+            #[cfg(feature = "ws-server")]
+            next_observation_sequence: 1,
+            #[cfg(feature = "ws-server")]
+            observation_events: VecDeque::new(),
+            #[cfg(feature = "ws-server")]
+            observation_tx: broadcast::channel(256).0,
         })
     }
 
@@ -2050,6 +2056,24 @@ mod tests {
             .read_transcript(&worker.worker_ref, TranscriptQuery::new(1, 1), 2)
             .unwrap();
         assert_eq!(direct_transcript.items[0].content, "second");
+
+        #[cfg(feature = "ws-server")]
+        {
+            let observation = restored
+                .observe_worker_event(
+                    &worker.worker_ref,
+                    protocol::Event::TextDelta {
+                        text: "restored observation bus".to_string(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(observation.sequence, 1);
+            let observations = restored
+                .read_worker_observation_events(&worker.worker_ref, WorkerObservationCursor::zero())
+                .unwrap();
+            assert_eq!(observations.len(), 1);
+            assert_eq!(observations[0].cursor, observation.cursor);
+        }
 
         let _ = std::fs::remove_dir_all(root);
     }
