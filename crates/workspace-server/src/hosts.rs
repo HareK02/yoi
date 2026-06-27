@@ -917,6 +917,23 @@ impl EmbeddedWorkerRuntime {
         Self::from_runtime(workspace_id, runtime)
     }
 
+    pub fn new_memory_with_execution_backend(
+        workspace_id: impl AsRef<str>,
+        backend: std::sync::Arc<dyn worker_runtime::execution::WorkerExecutionBackend>,
+    ) -> Result<Self, worker_runtime::error::RuntimeError> {
+        let runtime_id = EmbeddedRuntimeId::new(EMBEDDED_RUNTIME_ID)
+            .expect("embedded runtime id is a non-empty literal");
+        let runtime = worker_runtime::Runtime::with_execution_backend(
+            EmbeddedRuntimeOptions {
+                runtime_id: Some(runtime_id),
+                display_name: Some("Workspace backend embedded Runtime".to_string()),
+                ..EmbeddedRuntimeOptions::default()
+            },
+            backend,
+        )?;
+        Ok(Self::from_runtime(workspace_id, runtime))
+    }
+
     pub fn from_runtime(workspace_id: impl AsRef<str>, runtime: worker_runtime::Runtime) -> Self {
         let runtime_id = runtime
             .runtime_id()

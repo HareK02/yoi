@@ -722,7 +722,12 @@ impl Runtime {
     ) -> Result<WorkerObservationEvent, RuntimeError> {
         let mut state = self.lock()?;
         state.ensure_worker_ref(worker_ref)?;
+        let transcript_sequence = state.project_protocol_event_to_transcript(worker_ref, &payload);
         let event = state.push_worker_observation_event(worker_ref.clone(), payload);
+        if let Some(sequence) = transcript_sequence {
+            state.persist_worker(&worker_ref.worker_id)?;
+            state.persist_transcript_entry(&worker_ref.worker_id, sequence)?;
+        }
         Ok(event)
     }
 
@@ -1257,6 +1262,66 @@ impl RuntimeState {
         }
         let _ = self.observation_tx.send(event.clone());
         event
+    }
+
+    #[cfg(feature = "ws-server")]
+    fn append_worker_transcript_entry(
+        &mut self,
+        worker_ref: &WorkerRef,
+        role: TranscriptRole,
+        content: impl Into<String>,
+    ) -> Option<u64> {
+        let content = content.into();
+        if content.trim().is_empty() {
+            return None;
+        }
+        let event_id = self.last_event_id();
+        let worker = self.workers.get_mut(&worker_ref.worker_id)?;
+        let sequence = worker.next_transcript_sequence;
+        worker.next_transcript_sequence += 1;
+        worker.transcript.push(TranscriptEntry {
+            sequence,
+            worker_ref: worker_ref.clone(),
+            role,
+            content,
+            event_id,
+        });
+        Some(sequence)
+    }
+
+    #[cfg(feature = "ws-server")]
+    fn project_protocol_event_to_transcript(
+        &mut self,
+        worker_ref: &WorkerRef,
+        event: &protocol::Event,
+    ) -> Option<u64> {
+        match event {
+            protocol::Event::TextDone { text, .. } => self.append_worker_transcript_entry(
+                worker_ref,
+                TranscriptRole::Assistant,
+                text.clone(),
+            ),
+            protocol::Event::Error { message, .. } => self.append_worker_transcript_entry(
+                worker_ref,
+                TranscriptRole::System,
+                format!("error: {message}"),
+            ),
+            protocol::Event::ToolResult {
+                id,
+                summary,
+                is_error,
+                ..
+            } => self.append_worker_transcript_entry(
+                worker_ref,
+                TranscriptRole::System,
+                format!(
+                    "tool result {id}: {}{}",
+                    if *is_error { "error: " } else { "" },
+                    summary
+                ),
+            ),
+            _ => None,
+        }
     }
 
     fn push_diagnostic(

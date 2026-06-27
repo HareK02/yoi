@@ -11,6 +11,7 @@ use axum::{Json, Router};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+use worker::runtime_adapter::WorkerRuntimeExecutionBackend;
 
 use crate::companion::{
     CompanionCancelRequest, CompanionConsole, CompanionMessageRequest, CompanionMessageResponse,
@@ -97,9 +98,23 @@ impl WorkspaceApi {
                 updated_at: config.workspace_created_at.clone(),
             })
             .await?;
-        let mut runtime = RuntimeRegistry::for_workspace(EmbeddedWorkerRuntime::new_memory(
-            config.workspace_id.clone(),
-        ));
+        let execution_backend = WorkerRuntimeExecutionBackend::from_workspace(
+            config.workspace_root.clone(),
+        )
+        .map_err(|err| {
+            crate::Error::Store(format!(
+                "failed to initialize embedded Worker backend: {err}"
+            ))
+        })?;
+        let mut runtime = RuntimeRegistry::for_workspace(
+            EmbeddedWorkerRuntime::new_memory_with_execution_backend(
+                config.workspace_id.clone(),
+                Arc::new(execution_backend),
+            )
+            .map_err(|err| {
+                crate::Error::Store(format!("invalid embedded Worker backend: {err}"))
+            })?,
+        );
         for remote_config in config.remote_runtime_sources.iter().cloned() {
             runtime
                 .register(RemoteWorkerRuntime::new(remote_config).map_err(|err| err.into_error())?);
