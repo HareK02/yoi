@@ -376,3 +376,90 @@ request_changes
 spawn execution failure は、少なくとも browser-facing API で sanitized diagnostic/rejection として扱うか、capability を false にして明確な failure projection を返す必要がある。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KW55B33B-worker-adapter at: 2026-06-27T21:39:54Z -->
+
+## Implementation report
+
+Change-response implementation report:
+
+Reviewer blocker を修正済み。Ticket ファイル変更、merge、close、cleanup は未実施。
+
+Current HEAD:
+- `7e29ff5ec99dcc748fa5a511cda5bae31fec124b fix: reject embedded spawn execution failures`
+
+Prior fix commit:
+- `9069b035041d17e7c52a454a7563cc5f0b7e1f61 fix: connect embedded runtime input lifecycle`
+
+## 修正内容
+
+### Spawn-time execution failure を Browser-facing API で `Rejected` として返す
+
+`worker-runtime::Runtime::create_worker` は spawn backend の `Rejected/Errored` を `Ok(WorkerDetail)` 内の execution status として保持する設計のままなので、`workspace-server` 側で `detail.execution.last_result` を検査するようにした。
+
+対象:
+- `crates/workspace-server/src/hosts.rs`
+
+変更:
+- embedded Runtime spawn 後に execution spawn failure を検出。
+- `WorkerExecutionOutcome::{Rejected, Errored, Unsupported, Busy}` の場合:
+  - Browser-facing `WorkerSpawnResult.state = Rejected`
+  - `acceptance_evidence = []`
+  - sanitized diagnostic を返す
+  - worker projection は残すが、capability は失敗状態として false にする
+
+sanitized diagnostic 例:
+- code: `embedded_worker_execution_spawn_errored`
+- message: `Embedded Worker execution spawn was errored during setup; check runtime configuration`
+
+### Failed execution state で capability が true にならないよう修正
+
+`can_accept_input` / `can_stop` 判定を `run_state != Busy` からより厳密に変更。
+
+`can_accept_input` は以下すべてを満たす場合のみ true:
+- execution backend が接続済み
+- worker status が `Running`
+- execution backend kind が `Connected`
+- run_state が `Idle`
+- last_result が `Rejected/Errored/Unsupported` ではない
+
+`can_stop` も spawn rejected/errored/unconnected 系では false。
+
+### Focused tests
+
+`workspace-server` に spawn execution failure の focused test を追加。
+
+検証内容:
+- fake failing execution backend が spawn `Errored` を返す
+- Browser-facing spawn result が `Rejected`
+- diagnostic が sanitized され、fake 内部 path を漏らさない
+- projected worker status が `errored`
+- `can_accept_input == false`
+- `can_stop == false`
+
+既存 server API projection test も、real backend setup failure が Browser-facing projection で sanitized rejection として出る前提に調整。
+
+## Validation
+
+実行済み・成功:
+- `cargo fmt --all`
+- `cargo fmt --all --check`
+- `cargo test -p worker --features runtime-adapter runtime_adapter`
+- `cargo test -p worker-runtime --features ws-server`
+- `cargo test -p worker-runtime --features "ws-server fs-store"`
+- `cargo test -p yoi-workspace-server`
+- `cargo check -p yoi`
+- `git diff --check`
+- `nix build .#yoi --no-link`
+
+補足:
+- `cargo test -p yoi-workspace-server` では既存 warning: `field next_sequence is never read`
+- `nix build` は dirty tree warning を出したが build 自体は成功。
+
+## 残リスク / review focus
+
+- `worker-runtime::Runtime::create_worker` 自体は引き続き spawn execution failure を `Ok(WorkerDetail)` に記録する設計。今回の修正は Browser-facing `workspace-server` projection で typed rejection/diagnostic として露出する対応。
+- diagnostic は sanitized のため、具体的な provider/config/secret path 等は Browser-facing API には出さない。詳細原因の調査導線が必要なら、別途 backend/admin 向け diagnostics 設計が必要。
+- Companion status は環境の profile/provider setup 可否により `ready` / `error` のどちらも取り得るため、既存テストはその環境差を許容する形に調整。
+
+---
