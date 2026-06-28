@@ -295,3 +295,39 @@ Residual risks / review focus:
 - deterministic test backend による検証のため、外部 secret/provider には依存しない。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KW55B33H-companion at: 2026-06-28T07:05:54Z status: request_changes -->
+
+## Review: request changes
+
+request_changes
+
+今回の実装で prior functional routing issues は解消されているが、status / transport の blocker が 1 件残っている。
+
+## Blocker
+
+`/api/workspace` がまだ Companion Console を not connected / input disabled として advertise している。
+
+- `crates/workspace-server/src/server.rs:341-365` が `WorkspaceResponse.extension_points.companion_console` を組み立てている。
+- ここでまだ以下を返している。
+  - `status: "not_connected"`
+  - note: `"browser input remains disabled until actual Worker/LLM execution is connected"`
+
+これは現在求められる挙動と矛盾する。Companion status / transport は、input-capable なら `connected`、provider/config/profile/authority 不足などで input 不可なら `not_input_capable` + typed diagnostic を返すべきである。`/api/companion/status` が正しくても、この Browser-facing workspace status が stale な “not connected / disabled” state を露出しているため、client を誤誘導し得る。
+
+## 改善済み / apparently satisfied
+
+- `/api/companion/messages` は `CompanionConsole::send_message` / `RuntimeRegistry::send_input` 経由になり、旧固定 `companion_llm_not_connected` rejection ではなくなっている。
+- Companion bootstrap は `ProfileSelector::Builtin("companion")` と Companion config bundle label を使っている。
+- Companion transcript は runtime transcript projection 由来になっている。
+- main Worker Console path は `runtime_id + worker_id` を使い、`/api/runtimes/{runtime_id}/workers/{worker_id}/input` に post する。
+- existing Console rendering は protocol event / transcript paths を消費している。
+- `/api/workspace` は以前の `local_root: PathBuf` を公開しなくなっている。
+- negative test assertions 以外で public `can_stream_events` / `can_read_bounded_transcript` fields は見当たらない。
+- fake/canned Companion assistant response path は見当たらない。
+
+## Validation note
+
+報告された validation command は再実行していない。test/check/build success は plausibly true だが、残る stale `/api/workspace` Companion status は更新後の behavior assertion で cover されていないため、passing tests だけではこの acceptance point の evidence にならない。
+
+---
