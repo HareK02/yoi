@@ -149,3 +149,29 @@ Operational note:
 Dependencies are closed, no Ticket is currently inprogress, and the orchestration worktree is clean. Accepting implementation before child worktree / role Pod side effects.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-28T19:18:26Z -->
+
+## Implementation report
+
+Implementation kickoff:
+
+- Worktree created: `/home/hare/Projects/yoi/.worktree/00001KW7835H0-old-pod-crate-cleanup`
+- Branch: `work/00001KW7835H0-old-pod-crate-cleanup`
+- Coder Worker spawned: `yoi-coder-00001KW7835H0-pod-cleanup`
+
+Scope notes:
+- Coder write scope covers the old crate directories `crates/pod-registry`, `crates/pod-store`, affected active crates (`crates/worker`, `crates/tui`, `crates/yoi`, `crates/worker-runtime`, `crates/session-store`, `crates/manifest`), prompt/profile/web workspace paths, and root Cargo/package files.
+- `crates/pod` is already absent; Coder is instructed to verify absence and prevent reintroduction.
+- Coder is instructed not to modify Ticket records and not to operate in root/orchestration worktrees.
+
+Implementation focus:
+- remove `crates/pod-registry` and `crates/pod-store` from workspace
+- migrate/rename any remaining Worker metadata/session persistence to Worker/Runtime/session-store boundaries without active Pod authority naming
+- remove old pod-registry path APIs and old Pod metadata inventory/cleanup dependencies from worker/tui/yoi where active
+- ensure Runtime Worker identity / creation / persistence remains `worker-runtime` fs-store + execution backend mapping authority
+- do not use old Pod registry/store/socket/name as active authority
+- keep historical docs only if clearly historical
+- validate dependency graph and run targeted tests/checks
+
+---
