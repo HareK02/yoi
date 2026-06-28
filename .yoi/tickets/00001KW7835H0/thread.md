@@ -112,3 +112,40 @@ Next routing condition:
 - Re-evaluate this Ticket after `00001KW7726H9` is merged, validated, and closed, or after an explicit replan changes the dependency.
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-28T19:17:30Z -->
+
+## Decision
+
+Routing decision:
+
+The previously blocking dependency `00001KW7726H9` is now merged, validated, closed, and cleaned up. Related fs-store persistence Ticket `00001KW76E8EG` is also merged, validated, closed, and cleaned up. Current workspace state was inspected before implementation side effects.
+
+Findings:
+- Ticket state: `queued`
+- Blocking dependency: `00001KW7726H9` is closed.
+- Related persistence Ticket: `00001KW76E8EG` is closed.
+- Current `inprogress` Tickets: 0
+- Orchestration worktree: clean
+
+Decision:
+- Accept this Ticket for implementation and transition `queued -> inprogress` before child worktree / Pod side effects.
+
+Plan:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KW7835H0-old-pod-crate-cleanup`
+- Branch: `work/00001KW7835H0-old-pod-crate-cleanup`
+- Coder Worker will remove old `pod-registry` / `pod-store` crates and migrate any remaining authority/persistence responsibilities to Worker/Runtime/session-store boundaries.
+- Reviewer Worker will verify crate removal, dependency graph cleanup, Runtime authority invariants, stale compatibility avoidance, Browser/UI/CLI/prompt/test wording, and validation evidence.
+
+Operational note:
+- User instructed not to use `StopPod` for now after repeated stop/hang symptoms. Cleanup will skip role-Pod shutdown and remove only child worktree/branch unless explicitly reauthorized.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-28T19:17:36Z from: queued to: inprogress reason: dependencies_closed_and_queue_continues field: state -->
+
+## State changed
+
+Dependencies are closed, no Ticket is currently inprogress, and the orchestration worktree is clean. Accepting implementation before child worktree / role Pod side effects.
+
+---

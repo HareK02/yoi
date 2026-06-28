@@ -1,8 +1,8 @@
 ---
 title: '旧Pod関連クレートを削除しWorker/Runtime storeへ整理する'
-state: 'queued'
+state: 'inprogress'
 created_at: '2026-06-28T13:53:21Z'
-updated_at: '2026-06-28T16:51:22Z'
+updated_at: '2026-06-28T19:17:36Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-28T16:51:00Z'
