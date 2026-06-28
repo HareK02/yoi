@@ -175,3 +175,56 @@ Implementation focus:
 - validate dependency graph and run targeted tests/checks
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KW7835H0-pod-cleanup at: 2026-06-28T19:45:57Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装完了。Ticket ファイル編集、merge、close、cleanup は未実施。
+
+Commit:
+- `17a9488a4aa0a3dc83be2d3360b6ffd8ffcaeb5a refactor: remove old pod crates`
+
+実装内容:
+
+- `crates/pod-registry` / `crates/pod-store` を workspace から削除。
+  - `Cargo.toml` / `Cargo.lock` / 各 crate dependency / `package.nix` から旧 crate 参照を除去。
+  - `crates/pod` も引き続き存在しないことを確認。
+  - `pod-registry` / `pod-store` / `crates/pod` 系の active 参照が残っていないことを `rg` で確認。
+- `pod-store` の Worker metadata 永続化を `session-store` 境界へ移動。
+  - `session_store::worker_metadata` として `FsWorkerStore`, `WorkerMetadataStore`, `CombinedStore` 等を提供。
+  - active storage naming を Worker metadata に寄せ、metadata root も `data_dir/workers` 側へ変更。
+- `pod-registry` の active crate 依存を削除。
+  - Worker 内部の `runtime::worker_allocation` モジュールへ、scope allocation 用の実装として分類・移設。
+  - module comment で「Runtime Worker identity / creation / durable persistence の authority ではない」ことを明記。
+  - manifest path API は `worker_allocation_path` / `worker_socket_path` 名へ置換。
+- `tui` / `yoi` / `worker` の旧 crate 依存を置換。
+  - TUI の live worker inventory は旧 `pod-registry` crate に依存せず、renamed worker allocation table を read-only に読む形へ変更。
+  - 読み取り時は `fs4` の shared lock を使い、writer との競合で partial read しにくい形に修正。
+- `package.nix` の `cargoHash` を更新。
+
+依存監査サマリ:
+- `crates/pod`: absent
+- `crates/pod-registry`: deleted
+- `crates/pod-store`: deleted
+- workspace/package/lock/source 内の active `pod-registry` / `pod-store` / `crates/pod` 参照: なし
+- Runtime Worker identity/creation/persistence authority は `worker-runtime` fs-store + execution backend mapping のまま維持し、旧 registry/store/socket/name を authority として使わない構成に整理。
+
+Validation:
+- `cargo test -p worker-runtime --features ws-server`: success
+- `cargo test -p yoi-workspace-server`: success
+- `cargo test -p worker`: success
+- `cargo test -p session-store`: success
+- `cargo check -p yoi`: success
+- `cd web/workspace && deno task check`: success
+- `git diff --check`: success
+- `git diff --cached --check`: success
+- `nix build .#yoi`: success
+
+Risks / notes:
+- Worker metadata root を `data_dir/pods` 由来から `data_dir/workers` 側へ寄せたため、既存ローカル metadata の自動移行は入れていない。Ticket 方針どおり、旧 Pod authority naming 互換を増やさない実装。
+- Historical docs は今回の active dependency cleanup の対象外だが、active crate/path/dependency 参照は除去済み。
+
+---
