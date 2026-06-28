@@ -6,7 +6,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use worker_runtime::catalog::{
     ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerDetail as EmbeddedWorkerDetail,
     WorkerStatus as EmbeddedWorkerStatus,
@@ -16,7 +16,10 @@ use worker_runtime::config_bundle::{
     ConfigBundleSummary, ConfigProfileDescriptor,
 };
 use worker_runtime::error::RuntimeError as EmbeddedRuntimeError;
-use worker_runtime::execution::{WorkerExecutionRunState, WorkerExecutionStatus};
+use worker_runtime::execution::{
+    WorkerExecutionBackendKind, WorkerExecutionRunState, WorkerExecutionStatus,
+};
+use worker_runtime::fs_store::FsRuntimeStoreOptions;
 use worker_runtime::http_server::{
     RuntimeHttpConfigBundleAvailabilityResponse, RuntimeHttpConfigBundleSyncRequest,
     RuntimeHttpErrorResponse, RuntimeHttpSummaryResponse, RuntimeHttpTranscriptResponse,
@@ -909,15 +912,19 @@ pub struct EmbeddedWorkerRuntime {
     execution_enabled: bool,
 }
 
+fn embedded_runtime_options() -> EmbeddedRuntimeOptions {
+    let runtime_id = EmbeddedRuntimeId::new(EMBEDDED_RUNTIME_ID)
+        .expect("embedded runtime id is a non-empty literal");
+    EmbeddedRuntimeOptions {
+        runtime_id: Some(runtime_id),
+        display_name: Some("Workspace backend embedded Runtime".to_string()),
+        ..EmbeddedRuntimeOptions::default()
+    }
+}
+
 impl EmbeddedWorkerRuntime {
     pub fn new_memory(workspace_id: impl AsRef<str>) -> Self {
-        let runtime_id = EmbeddedRuntimeId::new(EMBEDDED_RUNTIME_ID)
-            .expect("embedded runtime id is a non-empty literal");
-        let runtime = worker_runtime::Runtime::with_options(EmbeddedRuntimeOptions {
-            runtime_id: Some(runtime_id),
-            display_name: Some("Workspace backend embedded Runtime".to_string()),
-            ..EmbeddedRuntimeOptions::default()
-        });
+        let runtime = worker_runtime::Runtime::with_options(embedded_runtime_options());
         Self::from_runtime(workspace_id, runtime)
     }
 
@@ -925,13 +932,26 @@ impl EmbeddedWorkerRuntime {
         workspace_id: impl AsRef<str>,
         backend: std::sync::Arc<dyn worker_runtime::execution::WorkerExecutionBackend>,
     ) -> Result<Self, worker_runtime::error::RuntimeError> {
+        let runtime =
+            worker_runtime::Runtime::with_execution_backend(embedded_runtime_options(), backend)?;
+        let mut embedded = Self::from_runtime(workspace_id, runtime);
+        embedded.execution_enabled = true;
+        Ok(embedded)
+    }
+
+    pub fn new_fs_store_with_execution_backend(
+        workspace_id: impl AsRef<str>,
+        store_root: impl Into<PathBuf>,
+        backend: std::sync::Arc<dyn worker_runtime::execution::WorkerExecutionBackend>,
+    ) -> Result<Self, worker_runtime::error::RuntimeError> {
         let runtime_id = EmbeddedRuntimeId::new(EMBEDDED_RUNTIME_ID)
             .expect("embedded runtime id is a non-empty literal");
-        let runtime = worker_runtime::Runtime::with_execution_backend(
-            EmbeddedRuntimeOptions {
+        let runtime = worker_runtime::Runtime::with_fs_store_and_execution_backend(
+            FsRuntimeStoreOptions {
+                root: store_root.into(),
                 runtime_id: Some(runtime_id),
                 display_name: Some("Workspace backend embedded Runtime".to_string()),
-                ..EmbeddedRuntimeOptions::default()
+                limits: EmbeddedRuntimeOptions::default().limits,
             },
             backend,
         )?;
@@ -998,15 +1018,12 @@ impl EmbeddedWorkerRuntime {
                 display_hint: "backend-internal worker-runtime Worker".to_string(),
             },
             capabilities: WorkerCapabilitySummary {
-                can_accept_input: self.can_accept_embedded_input(summary.status, &summary.execution),
+                can_accept_input: self
+                    .can_accept_embedded_input(summary.status, &summary.execution),
                 can_stop: self.can_stop_embedded_worker(summary.status, &summary.execution),
                 can_spawn_followup: false,
             },
-            diagnostics: vec![diagnostic(
-                "embedded_runtime_projection",
-                DiagnosticSeverity::Info,
-                "Worker identity is projected only as runtime_id plus worker_id; embedded runtime internals remain backend-private".to_string(),
-            )],
+            diagnostics: embedded_worker_projection_diagnostics(&summary.execution),
         }
     }
 
@@ -1035,11 +1052,7 @@ impl EmbeddedWorkerRuntime {
                 can_stop: self.can_stop_embedded_worker(detail.status, &detail.execution),
                 can_spawn_followup: false,
             },
-            diagnostics: vec![diagnostic(
-                "embedded_runtime_projection",
-                DiagnosticSeverity::Info,
-                "Worker identity is projected only as runtime_id plus worker_id; embedded runtime internals remain backend-private".to_string(),
-            )],
+            diagnostics: embedded_worker_projection_diagnostics(&detail.execution),
         }
     }
 }
@@ -2150,6 +2163,41 @@ fn embedded_worker_status_label(status: EmbeddedWorkerStatus) -> &'static str {
         EmbeddedWorkerStatus::Stopped => "stopped",
         EmbeddedWorkerStatus::Cancelled => "cancelled",
     }
+}
+
+fn embedded_worker_projection_diagnostics(
+    execution: &WorkerExecutionStatus,
+) -> Vec<RuntimeDiagnostic> {
+    let mut diagnostics = vec![diagnostic(
+        "embedded_runtime_projection",
+        DiagnosticSeverity::Info,
+        "Worker identity is projected only as runtime_id plus worker_id; embedded runtime internals remain backend-private".to_string(),
+    )];
+
+    if execution.backend == WorkerExecutionBackendKind::Stale {
+        diagnostics.push(diagnostic(
+            "embedded_worker_execution_stale",
+            DiagnosticSeverity::Warning,
+            "Worker execution handle is not connected in this server process; persisted execution binding was marked stale".to_string(),
+        ));
+    } else if execution.backend == WorkerExecutionBackendKind::Unconnected
+        || execution.run_state == WorkerExecutionRunState::Unconnected
+    {
+        diagnostics.push(diagnostic(
+            "embedded_worker_execution_unconnected",
+            DiagnosticSeverity::Warning,
+            "Worker execution handle is not connected in this server process".to_string(),
+        ));
+    } else if execution.run_state == WorkerExecutionRunState::Rejected {
+        diagnostics.push(diagnostic(
+            "embedded_worker_execution_spawn_rejected",
+            DiagnosticSeverity::Error,
+            "Worker execution spawn was rejected; backend-private details are not exposed"
+                .to_string(),
+        ));
+    }
+
+    diagnostics
 }
 
 fn embedded_worker_execution_status_label(
