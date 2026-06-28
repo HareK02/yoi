@@ -828,6 +828,7 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
         | RuntimeError::WorkerExecutionRejected { .. } => StatusCode::CONFLICT,
         RuntimeError::LimitTooLarge { .. }
         | RuntimeError::InvalidRequest(_)
+        | RuntimeError::InvalidInitialInputKind { .. }
         | RuntimeError::ConfigBundleDigestMismatch { .. }
         | RuntimeError::InvalidProfileSelector { .. }
         | RuntimeError::UnsupportedConfigDeclaration { .. }
@@ -851,6 +852,7 @@ fn code_for_runtime_error(error: &RuntimeError) -> &'static str {
         RuntimeError::WorkerExecutionRejected { .. } => "worker_execution_rejected",
         RuntimeError::LimitTooLarge { .. } => "limit_too_large",
         RuntimeError::InvalidRequest(_) => "invalid_request",
+        RuntimeError::InvalidInitialInputKind { .. } => "invalid_initial_input_kind",
         RuntimeError::ConfigBundleMissing { .. } => "config_bundle_missing",
         RuntimeError::ConfigBundleDigestMismatch { .. } => "config_bundle_digest_mismatch",
         RuntimeError::InvalidProfileSelector { .. } => "invalid_profile_selector",

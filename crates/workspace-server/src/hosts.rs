@@ -2356,6 +2356,11 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             DiagnosticSeverity::Warning,
             format!("Requested limit {requested} exceeds embedded Runtime maximum {max}"),
         ),
+        EmbeddedRuntimeError::InvalidInitialInputKind { .. } => diagnostic(
+            "embedded_worker_initial_input_kind_invalid",
+            DiagnosticSeverity::Warning,
+            error.to_string(),
+        ),
         EmbeddedRuntimeError::InvalidRequest(_)
         | EmbeddedRuntimeError::ConfigBundleMissing { .. }
         | EmbeddedRuntimeError::ConfigBundleDigestMismatch { .. }
@@ -2998,6 +3003,31 @@ mod tests {
                 && !diagnostic.message.contains("/tmp/secret-provider-config")
         }));
         assert!(spawned.worker.is_none());
+    }
+
+    #[test]
+    fn embedded_runtime_rejects_system_initial_input_without_worker_projection() {
+        let runtime = EmbeddedWorkerRuntime::new_memory_with_execution_backend(
+            "local:test",
+            Arc::new(AcceptingExecutionBackend::default()),
+        )
+        .expect("test backend should connect");
+        let mut request = embedded_spawn_request();
+        request.initial_input = Some(EmbeddedWorkerInput {
+            kind: EmbeddedWorkerInputKind::System,
+            content: "system/role instruction belongs in profile".to_string(),
+        });
+
+        let spawned = runtime.spawn_worker(request);
+        assert_eq!(spawned.state, WorkerOperationState::Rejected);
+        assert!(spawned.worker.is_none());
+        assert!(spawned.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "embedded_worker_initial_input_kind_invalid"
+                && diagnostic
+                    .message
+                    .contains("initial worker input must be user input")
+        }));
+        assert!(runtime.list_workers(10).items.is_empty());
     }
 
     #[test]

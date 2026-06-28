@@ -23,6 +23,9 @@ pub enum RuntimeError {
         actual_runtime_id: RuntimeId,
     },
 
+    #[error("initial worker input must be user input, got {kind}")]
+    InvalidInitialInputKind { kind: String },
+
     #[error("worker {worker_id} was not found in runtime {runtime_id}")]
     WorkerNotFound {
         runtime_id: RuntimeId,

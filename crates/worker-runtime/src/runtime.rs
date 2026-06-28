@@ -6,13 +6,15 @@ use crate::config_bundle::{
     ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary, validate_config_bundle,
     validate_config_bundle_ref,
 };
+#[cfg(feature = "fs-store")]
+use crate::diagnostics::DiagnosticSeverity;
 use crate::diagnostics::RuntimeDiagnostic;
 use crate::error::RuntimeError;
 use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionBackendKind, WorkerExecutionBackendRef,
-    WorkerExecutionHandle, WorkerExecutionOperation, WorkerExecutionResult,
-    WorkerExecutionRunState, WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
-    WorkerExecutionStatus,
+    WorkerExecutionBindingIdentity, WorkerExecutionHandle, WorkerExecutionOperation,
+    WorkerExecutionResult, WorkerExecutionRunState, WorkerExecutionSpawnRequest,
+    WorkerExecutionSpawnResult, WorkerExecutionStatus,
 };
 #[cfg(feature = "fs-store")]
 use crate::fs_store::{
@@ -259,14 +261,10 @@ impl Runtime {
             let mut transcript = Vec::new();
             let mut next_transcript_sequence = 1;
             if let Some(input) = request.initial_input.clone() {
-                let role = match input.kind {
-                    WorkerInputKind::User => TranscriptRole::User,
-                    WorkerInputKind::System => TranscriptRole::System,
-                };
                 transcript.push(TranscriptEntry {
                     sequence: next_transcript_sequence,
                     worker_ref: worker_ref.clone(),
-                    role,
+                    role: TranscriptRole::User,
                     content: input.content,
                     event_id,
                 });
@@ -389,7 +387,9 @@ impl Runtime {
                         "worker has no execution backend",
                     );
                     let worker = state.worker_mut(worker_ref)?;
-                    worker.execution = WorkerExecutionStatus::unconnected().with_result(result);
+                    let mut execution = WorkerExecutionStatus::unconnected().with_result(result);
+                    execution.binding = worker.execution.binding.clone();
+                    worker.execution = execution;
                     state.persist_worker(&worker_ref.worker_id)?;
                     return Err(RuntimeError::WorkerExecutionUnavailable {
                         worker_id: worker_ref.worker_id.clone(),
@@ -431,6 +431,7 @@ impl Runtime {
         worker.execution = WorkerExecutionStatus {
             backend: WorkerExecutionBackendKind::Connected,
             run_state: dispatch_result.run_state,
+            binding: worker.execution.binding.clone(),
             last_result: Some(dispatch_result),
         };
         worker.transcript.push(TranscriptEntry {
@@ -485,9 +486,12 @@ impl Runtime {
         let mut state = self.lock()?;
         let runtime_id = state.runtime_id.clone();
         let detail = {
+            let binding = WorkerExecutionBindingIdentity::from_handle(&handle);
             let worker = state.worker_mut(worker_ref)?;
             worker.execution_handle = Some(handle);
-            worker.execution = WorkerExecutionStatus::connected(run_state).with_result(result);
+            worker.execution = WorkerExecutionStatus::connected(run_state)
+                .with_binding(binding)
+                .with_result(result);
             worker.detail(&runtime_id)
         };
         state.persist_runtime_snapshot()?;
@@ -520,6 +524,7 @@ impl Runtime {
         worker.execution = WorkerExecutionStatus {
             backend: WorkerExecutionBackendKind::Connected,
             run_state: result.run_state,
+            binding: worker.execution.binding.clone(),
             last_result: Some(result),
         };
         state.persist_worker(&worker_ref.worker_id)?;
@@ -891,6 +896,8 @@ struct RuntimeState {
     execution_backend: Option<WorkerExecutionBackendRef>,
     next_worker_sequence: u64,
     next_event_id: u64,
+    #[cfg(feature = "fs-store")]
+    next_diagnostic_id: u64,
     workers: BTreeMap<WorkerId, WorkerRecord>,
     config_bundles: BTreeMap<String, ConfigBundle>,
     events: Vec<RuntimeEvent>,
@@ -915,6 +922,8 @@ impl RuntimeState {
             execution_backend: None,
             next_worker_sequence: 1,
             next_event_id: 1,
+            #[cfg(feature = "fs-store")]
+            next_diagnostic_id: 1,
             workers: BTreeMap::new(),
             config_bundles: BTreeMap::new(),
             events: Vec::new(),
@@ -945,6 +954,8 @@ impl RuntimeState {
             execution_backend: None,
             next_worker_sequence: 1,
             next_event_id: 1,
+            #[cfg(feature = "fs-store")]
+            next_diagnostic_id: 1,
             workers: BTreeMap::new(),
             config_bundles: BTreeMap::new(),
             events: Vec::new(),
@@ -976,7 +987,28 @@ impl RuntimeState {
         }
 
         let mut workers = BTreeMap::new();
+        let mut diagnostics = persisted.diagnostics;
+        let mut next_diagnostic_id = persisted.next_diagnostic_id;
         for (worker_id, worker) in persisted.workers {
+            let execution = if worker.execution.binding.is_some()
+                && worker.execution.backend == WorkerExecutionBackendKind::Connected
+            {
+                let stale = WorkerExecutionStatus::stale(worker.execution);
+                diagnostics.push(RuntimeDiagnostic {
+                    id: next_diagnostic_id,
+                    severity: DiagnosticSeverity::Warning,
+                    code: "worker_execution_mapping_stale".to_string(),
+                    message: format!(
+                        "worker {} has persisted execution binding identity but no live execution handle was restored",
+                        worker.worker_id
+                    ),
+                    worker_ref: Some(worker.worker_ref.clone()),
+                });
+                next_diagnostic_id += 1;
+                stale
+            } else {
+                worker.execution
+            };
             workers.insert(
                 worker_id,
                 WorkerRecord {
@@ -984,7 +1016,7 @@ impl RuntimeState {
                     worker_id: worker.worker_id,
                     status: worker.status,
                     request: worker.request,
-                    execution: WorkerExecutionStatus::unconnected(),
+                    execution,
                     execution_handle: None,
                     transcript: worker.transcript,
                     next_transcript_sequence: worker.next_transcript_sequence,
@@ -1003,11 +1035,11 @@ impl RuntimeState {
             execution_backend: None,
             next_worker_sequence: persisted.next_worker_sequence,
             next_event_id: persisted.next_event_id,
-            next_diagnostic_id: persisted.next_diagnostic_id,
+            next_diagnostic_id,
             workers,
             config_bundles: persisted.config_bundles,
             events: persisted.events,
-            diagnostics: persisted.diagnostics,
+            diagnostics,
             #[cfg(feature = "ws-server")]
             next_observation_sequence: 1,
             #[cfg(feature = "ws-server")]
@@ -1471,6 +1503,7 @@ impl WorkerRecord {
             worker_id: self.worker_id.clone(),
             status: self.status,
             request: self.request.clone(),
+            execution: self.execution.clone(),
             transcript: self.transcript.clone(),
             next_transcript_sequence: self.next_transcript_sequence,
             last_event_id: self.last_event_id,
@@ -1498,6 +1531,11 @@ fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), R
         ));
     }
     if let Some(input) = &request.initial_input {
+        if input.kind != WorkerInputKind::User {
+            return Err(RuntimeError::InvalidInitialInputKind {
+                kind: format!("{:?}", input.kind),
+            });
+        }
         if input.content.trim().is_empty() {
             return Err(RuntimeError::InvalidRequest(
                 "initial_input.content must not be empty".to_string(),
@@ -1766,6 +1804,29 @@ mod tests {
 
         let err = runtime_b.worker_detail(&detail.worker_ref).unwrap_err();
         assert!(matches!(err, RuntimeError::WrongRuntime { .. }));
+    }
+
+    #[test]
+    fn create_worker_rejects_system_initial_input_without_persisting_worker() {
+        let runtime = runtime_with_backend();
+        let mut request = task_request("system initial input");
+        request.initial_input = Some(WorkerInput::system("role/system belongs in config bundle"));
+
+        let error = runtime.create_worker(request).unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::InvalidInitialInputKind { .. }
+        ));
+        assert!(runtime.list_workers().unwrap().is_empty());
+        let events = runtime
+            .read_events(&runtime.event_cursor_from_start().unwrap(), 16)
+            .unwrap();
+        assert!(
+            events
+                .events
+                .iter()
+                .all(|event| event.kind != RuntimeEventKind::WorkerCreated)
+        );
     }
 
     #[test]
@@ -2117,6 +2178,7 @@ mod tests {
             runtime.summary().unwrap().backend,
             RuntimeBackendKind::FsStore
         );
+        runtime.store_config_bundle(test_bundle()).unwrap();
 
         let worker = runtime.create_worker(task_request("persist me")).unwrap();
         runtime
@@ -2140,6 +2202,28 @@ mod tests {
         .unwrap();
         let restored_worker = restored.worker_detail(&worker.worker_ref).unwrap();
         assert_eq!(restored_worker.status, WorkerStatus::Stopped);
+        assert_eq!(
+            restored_worker.execution.backend,
+            WorkerExecutionBackendKind::Stale
+        );
+        assert_eq!(
+            restored_worker
+                .execution
+                .binding
+                .as_ref()
+                .map(|binding| binding.backend_id.as_str()),
+            Some("test-execution-backend")
+        );
+        assert!(
+            restored
+                .diagnostics()
+                .unwrap()
+                .iter()
+                .any(
+                    |diagnostic| diagnostic.code == "worker_execution_mapping_stale"
+                        && diagnostic.worker_ref.as_ref() == Some(&worker.worker_ref)
+                )
+        );
         assert_eq!(restored_worker.transcript_len, 2);
 
         let projection = restored
@@ -2215,13 +2299,17 @@ mod tests {
 
         let missing_root = fs_store_root("missing");
         let missing_runtime_id = RuntimeId::new("runtime-missing").unwrap();
-        let missing_runtime = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
-            root: missing_root.clone(),
-            runtime_id: Some(missing_runtime_id.clone()),
-            display_name: None,
-            limits: RuntimeLimits::default(),
-        })
+        let missing_runtime = Runtime::with_fs_store_and_execution_backend(
+            crate::fs_store::FsRuntimeStoreOptions {
+                root: missing_root.clone(),
+                runtime_id: Some(missing_runtime_id.clone()),
+                display_name: None,
+                limits: RuntimeLimits::default(),
+            },
+            Arc::new(TestExecutionBackend::default()),
+        )
         .unwrap();
+        missing_runtime.store_config_bundle(test_bundle()).unwrap();
         missing_runtime
             .create_worker(task_request("missing worker snapshot"))
             .unwrap();
