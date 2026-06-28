@@ -569,3 +569,22 @@ Operational note:
 - User instructed not to use `StopPod` for now after repeated stop/hang symptoms. Cleanup will skip role-Pod shutdown and remove only child implementation worktree / branch.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-28T20:10:50Z -->
+
+## Implementation report
+
+Cleanup report:
+
+- User instructed not to use `StopPod` for now after repeated stop/hang symptoms. Role Pod shutdown was intentionally skipped.
+- Child implementation worktree was removed:
+  - `/home/hare/Projects/yoi/.worktree/00001KW7835H0-old-pod-crate-cleanup`
+- Child implementation branch was removed:
+  - `work/00001KW7835H0-old-pod-crate-cleanup`
+- No root/original workspace cleanup was performed.
+- Orchestration worktree is clean after worktree/branch cleanup.
+
+Queue note:
+- The Dashboard-queued chain related to Runtime Worker launch/fs-store/old Pod crate cleanup is now complete/closed.
+
+---
