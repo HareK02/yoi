@@ -2,7 +2,7 @@
 title: 'Workspace Backendのembedded Runtimeをfs-store永続化に切り替える'
 state: 'inprogress'
 created_at: '2026-06-28T13:34:29Z'
-updated_at: '2026-06-28T18:40:23Z'
+updated_at: '2026-06-28T18:40:58Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-28T17:12:16Z'

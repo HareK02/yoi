@@ -116,3 +116,30 @@ Operational note:
 Dependencies `00001KW55B33B` and `00001KW7726H9` are closed, no Ticket is currently inprogress, and the orchestration worktree is clean. Accepting implementation before child worktree / role Pod side effects.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-28T18:40:58Z -->
+
+## Implementation report
+
+Implementation kickoff:
+
+- Worktree created: `/home/hare/Projects/yoi/.worktree/00001KW76E8EG-embedded-runtime-fs-store`
+- Branch: `work/00001KW76E8EG-embedded-runtime-fs-store`
+- Coder Worker spawned: `yoi-coder-00001KW76E8EG-fs-store`
+
+Scope notes:
+- Coder write scope is limited to `crates/workspace-server/**`, `crates/worker-runtime/**`, `crates/worker/**`, root `Cargo.toml`, `Cargo.lock`, and `package.nix` if needed.
+- Coder is instructed not to modify Ticket records and not to operate in root/orchestration worktrees.
+
+Implementation focus:
+- enable `worker-runtime` `fs-store` feature in `workspace-server`
+- add `ServerConfig` embedded Runtime store root
+- default store root under user data / workspace id, not under project records or `.yoi/tickets`
+- add fs-store backed `EmbeddedWorkerRuntime` constructor using `Runtime::with_fs_store_and_execution_backend`
+- normal WorkspaceApi constructor uses fs-store, not `new_memory_with_execution_backend`
+- restart restores Runtime catalog / Worker snapshot / transcript / ConfigBundle store
+- live execution handle is not falsely connected after restart; stale/unconnected diagnostic/projection remains explicit
+- Browser-facing APIs do not expose store root / raw path / execution handle
+- tests cover fs-store restore, ConfigBundle/transcript restore, execution stale/unconnected restore, memory-backed production bypass absence, and store-root non-leak
+
+---
