@@ -562,3 +562,36 @@ Residual risks / review focus:
 - stale / unconnected は明示的に input-capable ではなくなるため、既存 UI が「remote worker は常に入力可」と仮定している場合は表示 / 操作導線の調整が必要になる可能性がある。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KW7726H9-launch-unify at: 2026-06-28T18:37:36Z status: approve -->
+
+## Review: approve
+
+approve
+
+読み取り専用で再レビューした。HEAD は `ba7f9d2ee83a946820cc234e847b6531b4a141f3 workspace: respect remote execution projection`。`git diff --check c29d10b..ba7f9d2` は追加出力なし。cargo / nix 系の reported validation は再実行していない。
+
+## 確認結果
+
+前回 blocker だった remote Runtime projection は解消されている。
+
+- `crates/workspace-server/src/hosts.rs:1670-1693`
+  - remote `map_worker_summary()` が Runtime HTTP response の `summary.execution` を参照し、`can_accept_input` / `can_stop` を計算するようになっている。
+- `crates/workspace-server/src/hosts.rs:1703-1726`
+  - remote `map_worker_detail()` も `detail.execution` を使っている。
+- `crates/workspace-server/src/hosts.rs:2106-2134`
+  - `runtime_worker_can_accept_input()` は `Running` + `Connected` + `Idle` + rejected / errored / unsupported last_result なしを要求。
+  - `runtime_worker_can_stop()` も `Running` + `Connected` を要求し、stopped / rejected / errored / unconnected run_state と blocking last_result を拒否。
+- `crates/workspace-server/src/hosts.rs:2155-2175`
+  - display status も `Stale` / `Unconnected` / `Rejected` / `Errored` を反映する。
+- `crates/workspace-server/src/hosts.rs:3384-3475`
+  - stale / unconnected / rejected / errored の remote projection が input-capable / stoppable にならない test が追加されている。
+- 既存 remote positive path でも connected idle worker が input / stop capable であることが確認されている。
+
+これにより、`stale` / execution backend 未接続 Worker が Workspace API 上で input-capable として見える問題は解消されている。
+
+## 総合判断
+
+前回までの blocker（execution binding projection persistence、stale diagnostic、System initial input rejection、remote stale projection）について、現在の差分で受け入れ条件を満たしていると判断する。現時点で concrete blocker はない。
+
+---
