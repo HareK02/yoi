@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KW7726H9",
+      "kind": "related",
+      "target": "00001KW55B32Y",
+      "note": "execution backend boundary is part of the canonical Worker creation contract",
+      "author": "yoi ticket",
+      "at": "2026-06-28T13:36:24Z"
+    },
+    {
+      "ticket_id": "00001KW7726H9",
+      "kind": "related",
+      "target": "00001KW55B33B",
+      "note": "embedded worker crate adapter must be entered through the canonical creation path",
+      "author": "yoi ticket",
+      "at": "2026-06-28T13:36:24Z"
+    },
+    {
+      "ticket_id": "00001KW7726H9",
+      "kind": "related",
+      "target": "00001KW55B33H",
+      "note": "Workspace Companion bootstrap must not bypass canonical Runtime Worker creation",
+      "author": "yoi ticket",
+      "at": "2026-06-28T13:36:24Z"
+    }
+  ]
+}
