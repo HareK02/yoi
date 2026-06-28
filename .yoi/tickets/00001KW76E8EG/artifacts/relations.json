@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KW76E8EG",
+      "kind": "depends_on",
+      "target": "00001KW55B33B",
+      "note": "fs-store persistence applies after embedded Runtime is connected to worker crate execution",
+      "author": "yoi ticket",
+      "at": "2026-06-28T13:25:27Z"
+    },
+    {
+      "ticket_id": "00001KW76E8EG",
+      "kind": "depends_on",
+      "target": "00001KW7726H9",
+      "note": "fs-store persistence should persist the canonical Runtime Worker creation model rather than an embedded-only bypass",
+      "author": "yoi ticket",
+      "at": "2026-06-28T13:36:24Z"
+    },
+    {
+      "ticket_id": "00001KW76E8EG",
+      "kind": "related",
+      "target": "00001KVZQHPNY",
+      "note": "Profile/config bundle sync state must persist in the Runtime store",
+      "author": "yoi ticket",
+      "at": "2026-06-28T13:25:27Z"
+    },
+    {
+      "ticket_id": "00001KW76E8EG",
+      "kind": "related",
+      "target": "00001KW55B33H",
+      "note": "Workspace Companion should reuse durable embedded Worker identity across backend restart",
+      "author": "yoi ticket",
+      "at": "2026-06-28T13:25:27Z"
+    }
+  ]
+}
