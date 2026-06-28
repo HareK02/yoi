@@ -143,3 +143,50 @@ Implementation focus:
 - tests cover fs-store restore, ConfigBundle/transcript restore, execution stale/unconnected restore, memory-backed production bypass absence, and store-root non-leak
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KW76E8EG-fs-store at: 2026-06-28T19:05:47Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装・検証・commit 完了。Ticket ファイル編集、merge、close、cleanup は未実施。
+
+Commit:
+- `736b05c6 feat: persist embedded workspace runtime in fs store`
+
+変更概要:
+- `workspace-server` で `worker-runtime` の `fs-store` feature を有効化。
+- `ServerConfig` に `embedded_runtime_store_root` を追加し、既定値を user data 配下の `workspace-server/<workspace_id>/embedded-runtime` に設定。
+- 通常の `WorkspaceApi` 生成経路を `EmbeddedWorkerRuntime::new_memory_with_execution_backend` から `new_fs_store_with_execution_backend` に切り替え。
+- `Runtime::with_fs_store_and_execution_backend` を使う fs-store backed constructor を追加。
+- 再起動後の Worker は live handle 接続済みと偽らず、`stale` / `unconnected` の診断を Browser API projection に残すようにした。
+- store root / raw path / handle が Browser API に出ないことをテスト。
+- `package.nix` の `cargoHash` を更新。
+
+追加・更新テスト:
+- fs-store restart restore:
+  - catalog / Worker snapshot
+  - ConfigBundle
+  - transcript
+  - stale execution projection / input rejection
+- store root isolation / non-leak
+- 既存 workspace-server tests は明示的 temp store root を使うよう調整。
+
+Validation:
+- `cargo fmt`: success
+- `cargo fmt -- --check`: success
+- `cargo test -p yoi-workspace-server`: success
+- `cargo test -p worker-runtime --features "ws-server fs-store"`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi`: success
+
+作業後状態:
+- branch: `work/00001KW76E8EG-embedded-runtime-fs-store`
+- `git status --short`: clean
+
+Residual risks:
+- 特記すべき未解決リスクなし。再起動後の実行 handle は復元せず stale/unconnected として扱う設計どおり。
+
+---
