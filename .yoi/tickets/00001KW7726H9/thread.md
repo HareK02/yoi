@@ -277,3 +277,72 @@ Implementation focus:
 - final request fields must be justified against source / scope-access / visibility / persistence-projection / retry / validation / existing type / failure.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KW7726H9-launch-unify at: 2026-06-28T17:46:07Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装・検証・commit 完了。merge / close / cleanup は未実施。
+
+Commit:
+- `14bb4934a6374eea64591035e5342088ab0ccd09 runtime: unify worker creation path`
+
+実装概要:
+
+- Runtime Worker 作成 API を canonical な `ConfigBundle + ExecutionBackend` 経路に統一。
+- `worker-runtime::catalog::CreateWorkerRequest` を Runtime 内部の作成契約として絞り込み。
+  - 採用フィールド:
+    - `profile: ProfileSelector`
+    - `config_bundle: ConfigBundleRef`（必須）
+    - `initial_input: Option<WorkerInput>`
+  - 除外フィールド:
+    - Browser / product intent
+    - requested capabilities
+    - workspace refs / mount refs
+    - cwd / workspace path / tool scope / config store / secret / socket / raw path 類
+- `CreateWorkerRequest::default()` / providerless / tools-less 作成経路を廃止し、input-capable Worker 作成には execution backend を必須化。
+- ConfigBundle 未同期 / digest mismatch / profile 未宣言 / execution backend 不在 / spawn-input dispatch rejection を typed diagnostics / errors として扱うように変更。
+- 作成は成功時のみ catalog / transcript / event を永続化し、spawn / initial input dispatch 失敗時は in-memory Worker と create event を rollback。
+- Workspace 側で Browser-facing launch semantics と Runtime create request を分離。
+  - Browser-facing `WorkerSpawnRequest` は intent / requested name / acceptance / profile / initial input の範囲に限定。
+  - Workspace host が backend-resolved ConfigBundle を同期し、その `ConfigBundleRef` で Runtime create を呼び出す。
+- Embedded / Companion / remote-facing creation が同じ Runtime create path を通るように調整。
+- providerless / fake response 前提のテストを更新し、execution backend を持つ経路または typed rejection を確認するテストに変更。
+
+API field rationale:
+
+- `profile`
+  - source: launch backend が決定する profile selector
+  - visibility: opaque selector であり raw config/body/path/secret を含まない
+  - validation: synced ConfigBundle が selector を宣言していることを Runtime 側で検証
+  - persistence: Worker projection に durable selector として保存可能
+- `config_bundle`
+  - source: Runtime create 前に backend が `store_config_bundle` / remote sync で確定する opaque ref
+  - visibility: `id + digest` のみで config store path や secret は露出しない
+  - validation: missing / digest mismatch / profile mismatch を typed error 化
+  - retry: 同じ bundle ref で再試行可能
+  - failure: missing ConfigBundle は create 前に fail closed
+- `initial_input`
+  - source: Browser/product launch intent から通常の Worker input として明示的に渡す
+  - visibility: ユーザー/システム input 本体のみ。scope/path/secret は含めない
+  - persistence: 作成成功時に transcript に同一 transaction として保存
+  - failure: initial dispatch が execution backend に rejected された場合は create rollback
+- 除外フィールド:
+  - `intent`, `requested_capabilities`, `workspace_refs`, `mount_refs`, raw cwd/path/config/secret は Runtime create API から除外
+  - 理由: Browser/product/backend policy 層の semantics であり、Runtime Worker の canonical durable create request に混ぜると visibility/persistence/retry/error 境界が崩れるため
+
+Validation:
+- `cargo fmt`: success
+- `cargo test -p worker-runtime --features ws-server`: success
+- `cargo test -p yoi-workspace-server`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi`: success
+
+Residual risks / review focus:
+- E2E の実プロセス spawn テストは既存方針どおり未整備なので、実 worker process 起動の完全統合は unit/integration レベルの backend mock と `nix build` での確認に留まる。
+- create 成功後の永続化失敗時に、すでに execution backend が外部 worker を spawn 済みであるケースの完全補償は今後さらに詰める余地がある。今回の実装では spawn / initial input rejection は rollback し、成功時だけ durable persistence する。
+
+---
