@@ -371,3 +371,59 @@ Review focus:
 - no fake/providerless assistant response bypass
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KW7726H9-launch-unify at: 2026-06-28T17:51:13Z status: request_changes -->
+
+## Review: request changes
+
+request_changes
+
+読み取り専用で Ticket `00001KW7726H9`、`artifacts/api-field-audit.md`、target commit `14bb4934a6374eea64591035e5342088ab0ccd09` の実装を確認した。重い検証コマンドは再実行していない。`git diff --check HEAD^..HEAD` は追加出力なし。
+
+## Blockers
+
+### 1. 永続化要件の `execution binding identity` と stale execution mapping 診断が未実装
+
+Ticket の保存・再起動要件では、Worker 作成時に `execution binding identity` を保存し、再起動後に live execution handle を復元できない場合は stale execution mapping として typed diagnostic にする必要がある。
+
+しかし実装では、永続化 record に execution binding 情報が保存されていない。
+
+- `crates/worker-runtime/src/runtime.rs:1467-1477`
+  - `PersistedWorkerRecord` へ `worker_ref`, `worker_id`, `status`, `request`, `transcript` などは保存されているが、`WorkerExecutionStatus` / binding id / execution handle identity が落ちている。
+- `crates/worker-runtime/src/runtime.rs:978-1010`
+  - restore 時に全 Worker が `WorkerExecutionStatus::unconnected()` / `execution_handle: None` にされる。
+  - その際、`diagnostics` は persisted diagnostics をそのまま引き継ぐだけで、stale execution mapping の diagnostic を追加していない。
+- `Runtime::diagnostics()` は `state.diagnostics.clone()` を返すのみで、restore された unconnected Worker を typed diagnostic として表面化しない。
+
+これにより、次の意図を満たしていない。
+
+- Worker 作成時に execution binding identity を保存する。
+- 保存 identity は権限値ではなく stale execution mapping / reconnect の参照として扱う。
+- 再起動後に live execution handle を復元できない場合は stale execution mapping として診断する。
+- missing config / execution binding / history を typed diagnostic にし、黙って別 Worker を作らない。
+
+現状は「黙って unconnected に戻す」挙動なので、Runtime worker creation の永続性・復元診断要件として blocker。
+
+### 2. 初期 input で `System` を受け入れて transcript に保存できる
+
+Ticket / API audit の方針では、Browser launch の initial input はユーザー投入分であり、launch/create 時に System message を作らない設計だった。System instruction / role prompt は ConfigBundle/Profile 側に寄せる意図である。
+
+しかし現在の実装では、CreateWorkerRequest の `initial_input` が `WorkerInput` のままなので `WorkerInputKind::System` を受け取れる。
+
+- `crates/worker-runtime/src/catalog.rs`
+  - `CreateWorkerRequest { config_bundle_ref, initial_input: Option<WorkerInput> }`
+- `crates/worker-runtime/src/runtime.rs:261-265`
+  - `WorkerInputKind::System => TranscriptRole::System` として initial transcript に保存される。
+- `crates/workspace-server/src/hosts.rs`
+  - Browser-facing `WorkerSpawnRequest.initial_input` も `EmbeddedWorkerInput` 経由で system/user を表現できる形になっている。
+
+これにより、Browser/API caller が Worker 作成時に system transcript を注入できるため、Ticket の「Browser launch semantics と Runtime CreateWorkerRequest を分離し、initial input はユーザー投入分に限定する」意図と矛盾する。少なくとも create / launch initial input では User-only 型にするか、Runtime boundary で `System` を typed rejection する必要がある。
+
+## 確認できた良い点
+
+- Runtime `CreateWorkerRequest` から workspace / cwd / tool scope / config store / secret / socket / path 由来の大きな launch fields は削られ、基本的に `config_bundle_ref` + `initial_input` に寄っている。
+- ConfigBundle missing / digest mismatch / profile mismatch は `RuntimeError` と diagnostic で扱う方向になっている。
+- execution backend 不在時は providerless / fake Worker を返さず、create が失敗する経路になっている。
+- embedded Workspace Server 側の spawn は ConfigBundle を Runtime に sync してから canonical Runtime create に寄せている。
+
+---
