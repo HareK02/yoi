@@ -430,3 +430,32 @@ Final state:
 - child worktree is clean.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KW7835H0-pod-cleanup at: 2026-06-28T20:04:44Z status: approve -->
+
+## Review: approve
+
+approve
+
+read-only で再レビューした。対象 HEAD は `fdd902d5 fix: align e2e worker metadata root`、worktree は clean。
+
+確認した点:
+
+- 前回 blocker の E2E Worker metadata root は解消済み。
+  - `tests/e2e/src/lib.rs` で `active_worker_metadata_root(&fixture.home)` を使い、helper write path と artifact path が同じ `$HOME/.yoi/workers` を参照している。
+  - `write_blocking_worker_metadata` も `active_worker_metadata_root(home)` 経由であり、`manifest::paths::data_dir()` の default HOME 解決と整合している。
+  - `fixture_worker_metadata_root` artifact も同じ helper 経由で記録されている。
+- 前回までの blocker 修正も維持されている。
+  - `yoi worker delete` refusal output は `worker:`。
+  - `worker_allocation` の user-facing error は Pod wording ではなく Worker/allocation wording。
+  - E2E artifact/helper 名は `tested_yoi_worker_allocation` / `fixture_worker_metadata_root` / `write_blocking_worker_metadata`。
+- 旧 crate / authority 参照の除去を再確認。
+  - `crates/pod`, `crates/pod-registry`, `crates/pod-store` は不在。
+  - workspace / active dependency / lock / package への `pod-registry` / `pod-store` 参照は見当たらない。
+  - `pod_registry_path`, `pod_registry::`, `pod_store::` など旧 API authority 参照も active source では見当たらない。
+- `git diff --check HEAD^ HEAD`: success。
+- 報告 validation（`cargo fmt`, `cargo check -p yoi-e2e`, `cargo test -p yoi-e2e`, `cargo check -p yoi`）は、今回の diff と import/path 整合性から plausible。read-only 指示のため cargo 系は再実行していない。
+
+ブロッカーはない。
+
+---
