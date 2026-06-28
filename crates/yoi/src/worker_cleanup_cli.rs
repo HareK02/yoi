@@ -239,7 +239,7 @@ async fn run_delete(
     let Some(metadata) = metadata else {
         return Ok(WorkerCleanupCliOutput {
             stdout: format!(
-                "yoi worker delete\nstatus: refused\npod: {}\nreason: worker metadata is missing\n",
+                "yoi worker delete\nstatus: refused\nworker: {}\nreason: worker metadata is missing\n",
                 options.name
             ),
             status: WorkerCleanupCliStatus::Failure,
@@ -250,7 +250,7 @@ async fn run_delete(
     if let Some(reason) = probe.refusal_reason() {
         return Ok(WorkerCleanupCliOutput {
             stdout: format!(
-                "yoi worker delete\nstatus: refused\npod: {}\nreason: {}\nsocket: {}\n",
+                "yoi worker delete\nstatus: refused\nworker: {}\nreason: {}\nsocket: {}\n",
                 options.name,
                 reason,
                 probe.socket_path.display()
