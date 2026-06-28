@@ -9,6 +9,7 @@ export type { PodProtocolEvent, PodProtocolMethod, PodProtocolSegment };
 export type ExtensionPoint = {
   status: string;
   note: string;
+  diagnostics: Diagnostic[];
 };
 
 export type WorkspaceResponse = {

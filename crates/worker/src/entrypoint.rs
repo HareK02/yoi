@@ -225,6 +225,21 @@ fn load_profile(
     Ok((resolved.manifest, PromptLoader::builtins_only()))
 }
 
+#[cfg(feature = "runtime-adapter")]
+pub(crate) fn resolve_runtime_profile_manifest(
+    profile: Option<&str>,
+    workspace_root: &Path,
+    worker_name: &str,
+) -> Result<(WorkerManifest, PromptLoader), String> {
+    let selector = profile
+        .map(ProfileSelector::parse_cli)
+        .unwrap_or(ProfileSelector::Default);
+    let (mut manifest, loader) = load_profile(&selector, workspace_root, worker_name)?;
+    apply_profile_launch_policy(&mut manifest, workspace_root, None)?;
+    apply_plugin_resolution_plan(&mut manifest, workspace_root);
+    Ok((manifest, loader))
+}
+
 fn load_single_manifest(
     path: &Path,
     explicit_worker_name: Option<&str>,

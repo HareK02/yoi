@@ -8,6 +8,12 @@ use crate::config_bundle::{
 };
 use crate::diagnostics::{DiagnosticSeverity, RuntimeDiagnostic};
 use crate::error::RuntimeError;
+use crate::execution::{
+    WorkerExecutionBackend, WorkerExecutionBackendKind, WorkerExecutionBackendRef,
+    WorkerExecutionHandle, WorkerExecutionOperation, WorkerExecutionResult,
+    WorkerExecutionRunState, WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
+    WorkerExecutionStatus,
+};
 #[cfg(feature = "fs-store")]
 use crate::fs_store::{
     FsRuntimeStore, FsRuntimeStoreOptions, PersistedRuntimeState, PersistedWorkerRecord,
@@ -63,6 +69,16 @@ impl Runtime {
         }
     }
 
+    /// Create a memory-backed Runtime with an attached execution backend.
+    pub fn with_execution_backend(
+        options: RuntimeOptions,
+        backend: Arc<dyn WorkerExecutionBackend>,
+    ) -> Result<Self, RuntimeError> {
+        let runtime = Self::with_options(options);
+        runtime.install_execution_backend(backend)?;
+        Ok(runtime)
+    }
+
     /// Create or restore a filesystem-backed Runtime.
     ///
     /// The store is scoped by typed Runtime identity under `options.root`; if the
@@ -71,11 +87,28 @@ impl Runtime {
     /// created before the Runtime is returned.
     #[cfg(feature = "fs-store")]
     pub fn with_fs_store(options: FsRuntimeStoreOptions) -> Result<Self, RuntimeError> {
+        Self::with_fs_store_inner(options, None)
+    }
+
+    /// Create or restore a filesystem-backed Runtime with an execution backend.
+    #[cfg(feature = "fs-store")]
+    pub fn with_fs_store_and_execution_backend(
+        options: FsRuntimeStoreOptions,
+        backend: Arc<dyn WorkerExecutionBackend>,
+    ) -> Result<Self, RuntimeError> {
+        Self::with_fs_store_inner(options, Some(WorkerExecutionBackendRef::new(backend)?))
+    }
+
+    #[cfg(feature = "fs-store")]
+    fn with_fs_store_inner(
+        options: FsRuntimeStoreOptions,
+        execution_backend: Option<WorkerExecutionBackendRef>,
+    ) -> Result<Self, RuntimeError> {
         let runtime_id = options.runtime_id.unwrap_or_else(|| {
             RuntimeId::generated(NEXT_RUNTIME_SEQUENCE.fetch_add(1, Ordering::Relaxed))
         });
         let opened = FsRuntimeStore::open_or_create(options.root, runtime_id.clone())?;
-        let state = if let Some(persisted) = opened.state {
+        let mut state = if let Some(persisted) = opened.state {
             RuntimeState::from_persisted(persisted, opened.store)?
         } else {
             let mut state = RuntimeState::new_fs_backed(
@@ -90,6 +123,7 @@ impl Runtime {
             state.persist_event_by_id(event_id)?;
             state
         };
+        state.execution_backend = execution_backend;
         Ok(Self {
             inner: Arc::new(Mutex::new(state)),
         })
@@ -210,6 +244,12 @@ impl Runtime {
         let worker_id = WorkerId::generated(state.next_worker_sequence);
         state.next_worker_sequence += 1;
         let worker_ref = WorkerRef::new(state.runtime_id.clone(), worker_id.clone());
+        let backend = state.execution_backend.clone();
+        let spawn_request = backend.as_ref().map(|_| WorkerExecutionSpawnRequest {
+            worker_ref: worker_ref.clone(),
+            request: request.clone(),
+            context: self.execution_context(worker_ref.clone()),
+        });
         let event_id = state.push_event(
             Some(worker_ref.clone()),
             RuntimeEventKind::WorkerCreated,
@@ -217,10 +257,12 @@ impl Runtime {
         );
 
         let record = WorkerRecord {
-            worker_ref,
+            worker_ref: worker_ref.clone(),
             worker_id: worker_id.clone(),
             status: WorkerStatus::Running,
             request,
+            execution: WorkerExecutionStatus::unconnected(),
+            execution_handle: None,
             transcript: Vec::new(),
             next_transcript_sequence: 1,
             last_event_id: event_id,
@@ -231,7 +273,14 @@ impl Runtime {
         state.persist_runtime_snapshot()?;
         state.persist_worker(&worker_id)?;
         state.persist_event_by_id(event_id)?;
-        Ok(detail)
+        drop(state);
+
+        if let (Some(backend), Some(spawn_request)) = (backend, spawn_request) {
+            let result = backend.spawn_worker(spawn_request);
+            self.apply_spawn_result(&worker_ref, result)
+        } else {
+            Ok(detail)
+        }
     }
 
     /// List Workers known to this Runtime.
@@ -257,11 +306,11 @@ impl Runtime {
         worker_ref: &WorkerRef,
         input: WorkerInput,
     ) -> Result<WorkerInteractionAck, RuntimeError> {
-        let mut state = self.lock()?;
-        state.ensure_running()?;
-        validate_worker_input(&input)?;
-        state.ensure_worker_ref(worker_ref)?;
-        {
+        let (backend, handle) = {
+            let mut state = self.lock()?;
+            state.ensure_running()?;
+            validate_worker_input(&input)?;
+            state.ensure_worker_ref(worker_ref)?;
             let worker = state.worker(worker_ref)?;
             if !worker.status.is_active() {
                 return Err(RuntimeError::InvalidRequest(format!(
@@ -269,8 +318,40 @@ impl Runtime {
                     worker_ref.worker_id
                 )));
             }
+            let backend = state.execution_backend.clone();
+            let handle = worker.execution_handle.clone();
+            match (backend, handle) {
+                (Some(backend), Some(handle)) => (backend, handle),
+                _ => {
+                    let result = WorkerExecutionResult::rejected(
+                        WorkerExecutionOperation::Input,
+                        "worker has no execution backend",
+                    );
+                    let worker = state.worker_mut(worker_ref)?;
+                    worker.execution = WorkerExecutionStatus::unconnected().with_result(result);
+                    state.persist_worker(&worker_ref.worker_id)?;
+                    return Err(RuntimeError::WorkerExecutionUnavailable {
+                        worker_id: worker_ref.worker_id.clone(),
+                        message: "worker has no execution backend".to_string(),
+                    });
+                }
+            }
+        };
+
+        let dispatch_result = backend.dispatch_input(&handle, input.clone());
+        if !dispatch_result.is_accepted() {
+            self.record_execution_result(worker_ref, dispatch_result.clone())?;
+            return Err(RuntimeError::WorkerExecutionRejected {
+                worker_id: worker_ref.worker_id.clone(),
+                operation: dispatch_result.operation,
+                outcome: dispatch_result.outcome,
+                message: dispatch_result.message_or_default(),
+                result: dispatch_result,
+            });
         }
 
+        let mut state = self.lock()?;
+        state.ensure_running()?;
         let event_id = state.push_event(
             Some(worker_ref.clone()),
             RuntimeEventKind::WorkerInputAccepted,
@@ -286,6 +367,11 @@ impl Runtime {
         let transcript_sequence = worker.next_transcript_sequence;
         worker.next_transcript_sequence += 1;
         worker.last_event_id = event_id;
+        worker.execution = WorkerExecutionStatus {
+            backend: WorkerExecutionBackendKind::Connected,
+            run_state: dispatch_result.run_state,
+            last_result: Some(dispatch_result),
+        };
         worker.transcript.push(TranscriptEntry {
             sequence: transcript_sequence,
             worker_ref: worker_ref.clone(),
@@ -328,12 +414,103 @@ impl Runtime {
         })
     }
 
+    fn apply_spawn_result(
+        &self,
+        worker_ref: &WorkerRef,
+        result: WorkerExecutionSpawnResult,
+    ) -> Result<WorkerDetail, RuntimeError> {
+        let mut state = self.lock()?;
+        let runtime_id = state.runtime_id.clone();
+        let detail = {
+            let worker = state.worker_mut(worker_ref)?;
+            match result {
+                WorkerExecutionSpawnResult::Connected { handle, run_state } => {
+                    worker.execution_handle = Some(handle);
+                    worker.execution = WorkerExecutionStatus::connected(run_state).with_result(
+                        WorkerExecutionResult::accepted(WorkerExecutionOperation::Spawn, run_state),
+                    );
+                }
+                WorkerExecutionSpawnResult::Rejected(result)
+                | WorkerExecutionSpawnResult::Errored(result) => {
+                    worker.execution_handle = None;
+                    worker.execution = WorkerExecutionStatus {
+                        backend: WorkerExecutionBackendKind::Connected,
+                        run_state: result.run_state,
+                        last_result: Some(result),
+                    };
+                }
+            }
+            worker.detail(&runtime_id)
+        };
+        state.persist_worker(&worker_ref.worker_id)?;
+        Ok(detail)
+    }
+
+    fn record_execution_result(
+        &self,
+        worker_ref: &WorkerRef,
+        result: WorkerExecutionResult,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.lock()?;
+        let worker = state.worker_mut(worker_ref)?;
+        worker.execution = WorkerExecutionStatus {
+            backend: WorkerExecutionBackendKind::Connected,
+            run_state: result.run_state,
+            last_result: Some(result),
+        };
+        state.persist_worker(&worker_ref.worker_id)?;
+        Ok(())
+    }
+
+    fn dispatch_lifecycle_to_backend(
+        &self,
+        worker_ref: &WorkerRef,
+        operation: WorkerExecutionOperation,
+    ) -> Result<(), RuntimeError> {
+        let Some((backend, handle)) = ({
+            let state = self.lock()?;
+            state.ensure_worker_ref(worker_ref)?;
+            let worker = state.worker(worker_ref)?;
+            if !worker.status.is_active() {
+                return Ok(());
+            }
+            match (
+                state.execution_backend.clone(),
+                worker.execution_handle.clone(),
+            ) {
+                (Some(backend), Some(handle)) => Some((backend, handle)),
+                _ => None,
+            }
+        }) else {
+            return Ok(());
+        };
+
+        let result = match operation {
+            WorkerExecutionOperation::Stop => backend.stop_worker(&handle),
+            WorkerExecutionOperation::Cancel => backend.cancel_worker(&handle),
+            WorkerExecutionOperation::Spawn | WorkerExecutionOperation::Input => return Ok(()),
+        };
+        if result.is_accepted() {
+            self.record_execution_result(worker_ref, result)?;
+            return Ok(());
+        }
+        self.record_execution_result(worker_ref, result.clone())?;
+        Err(RuntimeError::WorkerExecutionRejected {
+            worker_id: worker_ref.worker_id.clone(),
+            operation: result.operation,
+            outcome: result.outcome,
+            message: result.message_or_default(),
+            result,
+        })
+    }
+
     /// Stop a Worker.  Repeated stops are idempotent and return the last event id.
     pub fn stop_worker(
         &self,
         worker_ref: &WorkerRef,
         reason: Option<String>,
     ) -> Result<WorkerLifecycleAck, RuntimeError> {
+        self.dispatch_lifecycle_to_backend(worker_ref, WorkerExecutionOperation::Stop)?;
         self.transition_worker(
             worker_ref,
             WorkerStatus::Stopped,
@@ -348,6 +525,7 @@ impl Runtime {
         worker_ref: &WorkerRef,
         reason: Option<String>,
     ) -> Result<WorkerLifecycleAck, RuntimeError> {
+        self.dispatch_lifecycle_to_backend(worker_ref, WorkerExecutionOperation::Cancel)?;
         self.transition_worker(
             worker_ref,
             WorkerStatus::Cancelled,
@@ -545,7 +723,16 @@ impl Runtime {
     ) -> Result<WorkerObservationEvent, RuntimeError> {
         let mut state = self.lock()?;
         state.ensure_worker_ref(worker_ref)?;
+        let transcript_sequence = state.project_protocol_event_to_transcript(worker_ref, &payload);
+        let execution_state_changed =
+            state.project_protocol_event_to_execution(worker_ref, &payload);
         let event = state.push_worker_observation_event(worker_ref.clone(), payload);
+        if transcript_sequence.is_some() || execution_state_changed {
+            state.persist_worker(&worker_ref.worker_id)?;
+        }
+        if let Some(sequence) = transcript_sequence {
+            state.persist_transcript_entry(&worker_ref.worker_id, sequence)?;
+        }
         Ok(event)
     }
 
@@ -591,6 +778,30 @@ impl Runtime {
         })
     }
 
+    fn install_execution_backend(
+        &self,
+        backend: Arc<dyn WorkerExecutionBackend>,
+    ) -> Result<(), RuntimeError> {
+        let backend = WorkerExecutionBackendRef::new(backend)?;
+        let mut state = self.lock()?;
+        state.execution_backend = Some(backend);
+        Ok(())
+    }
+
+    #[cfg(feature = "ws-server")]
+    fn execution_context(&self, worker_ref: WorkerRef) -> crate::execution::WorkerExecutionContext {
+        let runtime = self.clone();
+        crate::execution::WorkerExecutionContext::new(
+            worker_ref,
+            Arc::new(move |worker_ref, payload| runtime.observe_worker_event(&worker_ref, payload)),
+        )
+    }
+
+    #[cfg(not(feature = "ws-server"))]
+    fn execution_context(&self, worker_ref: WorkerRef) -> crate::execution::WorkerExecutionContext {
+        crate::execution::WorkerExecutionContext::new(worker_ref)
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, RuntimeState>, RuntimeError> {
         self.inner.lock().map_err(|_| RuntimeError::StatePoisoned)
     }
@@ -613,6 +824,7 @@ struct RuntimeState {
     persistence: RuntimePersistence,
     status: RuntimeStatus,
     limits: RuntimeLimits,
+    execution_backend: Option<WorkerExecutionBackendRef>,
     next_worker_sequence: u64,
     next_event_id: u64,
     next_diagnostic_id: u64,
@@ -637,6 +849,7 @@ impl RuntimeState {
             persistence: RuntimePersistence::Memory,
             status: RuntimeStatus::Running,
             limits,
+            execution_backend: None,
             next_worker_sequence: 1,
             next_event_id: 1,
             next_diagnostic_id: 1,
@@ -667,6 +880,7 @@ impl RuntimeState {
             persistence: RuntimePersistence::Fs(store),
             status: RuntimeStatus::Running,
             limits,
+            execution_backend: None,
             next_worker_sequence: 1,
             next_event_id: 1,
             next_diagnostic_id: 1,
@@ -709,6 +923,8 @@ impl RuntimeState {
                     worker_id: worker.worker_id,
                     status: worker.status,
                     request: worker.request,
+                    execution: WorkerExecutionStatus::unconnected(),
+                    execution_handle: None,
                     transcript: worker.transcript,
                     next_transcript_sequence: worker.next_transcript_sequence,
                     last_event_id: worker.last_event_id,
@@ -723,6 +939,7 @@ impl RuntimeState {
             persistence: RuntimePersistence::Fs(store),
             status: persisted.status,
             limits: persisted.limits,
+            execution_backend: None,
             next_worker_sequence: persisted.next_worker_sequence,
             next_event_id: persisted.next_event_id,
             next_diagnostic_id: persisted.next_diagnostic_id,
@@ -730,6 +947,12 @@ impl RuntimeState {
             config_bundles: persisted.config_bundles,
             events: persisted.events,
             diagnostics: persisted.diagnostics,
+            #[cfg(feature = "ws-server")]
+            next_observation_sequence: 1,
+            #[cfg(feature = "ws-server")]
+            observation_events: VecDeque::new(),
+            #[cfg(feature = "ws-server")]
+            observation_tx: broadcast::channel(256).0,
         })
     }
 
@@ -1046,6 +1269,111 @@ impl RuntimeState {
         event
     }
 
+    #[cfg(feature = "ws-server")]
+    fn append_worker_transcript_entry(
+        &mut self,
+        worker_ref: &WorkerRef,
+        role: TranscriptRole,
+        content: impl Into<String>,
+    ) -> Option<u64> {
+        let content = content.into();
+        if content.trim().is_empty() {
+            return None;
+        }
+        let event_id = self.last_event_id();
+        let worker = self.workers.get_mut(&worker_ref.worker_id)?;
+        let sequence = worker.next_transcript_sequence;
+        worker.next_transcript_sequence += 1;
+        worker.transcript.push(TranscriptEntry {
+            sequence,
+            worker_ref: worker_ref.clone(),
+            role,
+            content,
+            event_id,
+        });
+        Some(sequence)
+    }
+
+    #[cfg(feature = "ws-server")]
+    fn project_protocol_event_to_transcript(
+        &mut self,
+        worker_ref: &WorkerRef,
+        event: &protocol::Event,
+    ) -> Option<u64> {
+        match event {
+            protocol::Event::TextDone { text, .. } => self.append_worker_transcript_entry(
+                worker_ref,
+                TranscriptRole::Assistant,
+                text.clone(),
+            ),
+            protocol::Event::Error { message, .. } => self.append_worker_transcript_entry(
+                worker_ref,
+                TranscriptRole::System,
+                format!("error: {message}"),
+            ),
+            protocol::Event::ToolResult {
+                id,
+                summary,
+                is_error,
+                ..
+            } => self.append_worker_transcript_entry(
+                worker_ref,
+                TranscriptRole::System,
+                format!(
+                    "tool result {id}: {}{}",
+                    if *is_error { "error: " } else { "" },
+                    summary
+                ),
+            ),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "ws-server")]
+    fn project_protocol_event_to_execution(
+        &mut self,
+        worker_ref: &WorkerRef,
+        event: &protocol::Event,
+    ) -> bool {
+        let Some(worker) = self.workers.get_mut(&worker_ref.worker_id) else {
+            return false;
+        };
+        let status = &mut worker.execution;
+        let next_run_state = match event {
+            protocol::Event::Status {
+                status: protocol::WorkerStatus::Running,
+            } => Some(WorkerExecutionRunState::Busy),
+            protocol::Event::Status {
+                status: protocol::WorkerStatus::Idle,
+            } => Some(WorkerExecutionRunState::Idle),
+            protocol::Event::Status {
+                status: protocol::WorkerStatus::Paused,
+            } => Some(WorkerExecutionRunState::Busy),
+            protocol::Event::Snapshot { status, .. } => match status {
+                protocol::WorkerStatus::Running => Some(WorkerExecutionRunState::Busy),
+                protocol::WorkerStatus::Idle => Some(WorkerExecutionRunState::Idle),
+                protocol::WorkerStatus::Paused => Some(WorkerExecutionRunState::Busy),
+            },
+            protocol::Event::RunEnd { result } => match result {
+                protocol::RunResult::Finished | protocol::RunResult::RolledBack => {
+                    Some(WorkerExecutionRunState::Idle)
+                }
+                protocol::RunResult::Paused => Some(WorkerExecutionRunState::Busy),
+                protocol::RunResult::LimitReached => Some(WorkerExecutionRunState::Errored),
+            },
+            protocol::Event::Error { .. } => Some(WorkerExecutionRunState::Errored),
+            _ => None,
+        };
+        let Some(next_run_state) = next_run_state else {
+            return false;
+        };
+        if status.run_state == next_run_state {
+            return false;
+        }
+        status.run_state = next_run_state;
+        true
+    }
+
     fn push_diagnostic(
         &mut self,
         severity: DiagnosticSeverity,
@@ -1090,6 +1418,8 @@ struct WorkerRecord {
     worker_id: WorkerId,
     status: WorkerStatus,
     request: CreateWorkerRequest,
+    execution: WorkerExecutionStatus,
+    execution_handle: Option<WorkerExecutionHandle>,
     transcript: Vec<TranscriptEntry>,
     next_transcript_sequence: u64,
     last_event_id: u64,
@@ -1102,6 +1432,7 @@ impl WorkerRecord {
             runtime_id: runtime_id.clone(),
             worker_id: self.worker_id.clone(),
             status: self.status,
+            execution: self.execution.clone(),
             intent: self.request.intent.clone(),
             profile: self.request.profile.clone(),
             requested_capability_count: self.request.requested_capabilities.len(),
@@ -1117,6 +1448,7 @@ impl WorkerRecord {
             runtime_id: runtime_id.clone(),
             worker_id: self.worker_id.clone(),
             status: self.status,
+            execution: self.execution.clone(),
             intent: self.request.intent.clone(),
             profile: self.request.profile.clone(),
             config_bundle: self.request.config_bundle.clone(),
@@ -1185,7 +1517,12 @@ mod tests {
         ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigDeclaration,
         ConfigDeclarationKind, ConfigProfileDescriptor,
     };
-    use crate::management::RuntimeLimits;
+    use crate::execution::{
+        WorkerExecutionBackend, WorkerExecutionContext, WorkerExecutionHandle,
+        WorkerExecutionRunState,
+    };
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
 
     fn task_request(objective: &str) -> CreateWorkerRequest {
         CreateWorkerRequest {
@@ -1198,6 +1535,92 @@ mod tests {
             workspace_refs: Vec::new(),
             mount_refs: Vec::new(),
         }
+    }
+
+    #[derive(Default)]
+    struct TestExecutionBackend {
+        dispatch_result: Mutex<Option<WorkerExecutionResult>>,
+        contexts: Mutex<BTreeMap<WorkerId, WorkerExecutionContext>>,
+    }
+
+    impl TestExecutionBackend {
+        fn set_dispatch_result(&self, result: WorkerExecutionResult) {
+            *self.dispatch_result.lock().unwrap() = Some(result);
+        }
+
+        #[cfg(feature = "ws-server")]
+        fn publish_text_delta(
+            &self,
+            worker_ref: &WorkerRef,
+            text: &str,
+        ) -> Result<crate::observation::WorkerObservationEvent, RuntimeError> {
+            let contexts = self.contexts.lock().unwrap();
+            let context = contexts.get(&worker_ref.worker_id).expect("context stored");
+            context.publish_protocol_event(protocol::Event::TextDelta { text: text.into() })
+        }
+    }
+
+    impl WorkerExecutionBackend for TestExecutionBackend {
+        fn backend_id(&self) -> &str {
+            "test-execution-backend"
+        }
+
+        fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
+            self.contexts
+                .lock()
+                .unwrap()
+                .insert(request.worker_ref.worker_id.clone(), request.context);
+            WorkerExecutionSpawnResult::Connected {
+                handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
+                run_state: WorkerExecutionRunState::Idle,
+            }
+        }
+
+        fn dispatch_input(
+            &self,
+            _handle: &WorkerExecutionHandle,
+            _input: WorkerInput,
+        ) -> WorkerExecutionResult {
+            self.dispatch_result
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| {
+                    WorkerExecutionResult::accepted(
+                        WorkerExecutionOperation::Input,
+                        WorkerExecutionRunState::Idle,
+                    )
+                })
+        }
+
+        fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
+            WorkerExecutionResult::accepted(
+                WorkerExecutionOperation::Stop,
+                WorkerExecutionRunState::Stopped,
+            )
+        }
+
+        fn cancel_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
+            WorkerExecutionResult::accepted(
+                WorkerExecutionOperation::Cancel,
+                WorkerExecutionRunState::Stopped,
+            )
+        }
+    }
+
+    fn runtime_with_backend() -> Runtime {
+        Runtime::with_execution_backend(
+            RuntimeOptions::default(),
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap()
+    }
+
+    fn runtime_and_backend() -> (Runtime, Arc<TestExecutionBackend>) {
+        let backend = Arc::new(TestExecutionBackend::default());
+        let runtime =
+            Runtime::with_execution_backend(RuntimeOptions::default(), backend.clone()).unwrap();
+        (runtime, backend)
     }
 
     fn test_bundle() -> ConfigBundle {
@@ -1358,14 +1781,141 @@ mod tests {
     }
 
     #[test]
+    fn backend_unconnected_worker_input_is_rejected_and_not_transcribed() {
+        let runtime = Runtime::new_memory();
+        let detail = runtime.create_worker(task_request("placeholder")).unwrap();
+        assert_eq!(
+            detail.execution.backend,
+            WorkerExecutionBackendKind::Unconnected
+        );
+
+        let err = runtime
+            .send_input(&detail.worker_ref, WorkerInput::user("must reject"))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeError::WorkerExecutionUnavailable { .. }
+        ));
+
+        let projection = runtime
+            .transcript_projection(&detail.worker_ref, TranscriptQuery::new(0, 1))
+            .unwrap();
+        assert_eq!(projection.total_items, 0);
+    }
+
+    #[test]
+    fn connected_backend_busy_dispatch_is_typed_and_not_transcribed() {
+        let (runtime, backend) = runtime_and_backend();
+        backend.set_dispatch_result(WorkerExecutionResult::busy(
+            WorkerExecutionOperation::Input,
+            "worker is already running",
+        ));
+        let detail = runtime.create_worker(task_request("busy")).unwrap();
+
+        let err = runtime
+            .send_input(&detail.worker_ref, WorkerInput::user("wait"))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeError::WorkerExecutionRejected {
+                outcome: crate::execution::WorkerExecutionOutcome::Busy,
+                ..
+            }
+        ));
+        let refreshed = runtime.worker_detail(&detail.worker_ref).unwrap();
+        assert_eq!(refreshed.execution.run_state, WorkerExecutionRunState::Busy);
+        assert_eq!(
+            runtime
+                .transcript_projection(&detail.worker_ref, TranscriptQuery::new(0, 1))
+                .unwrap()
+                .total_items,
+            0
+        );
+    }
+
+    #[cfg(feature = "ws-server")]
+    #[test]
+    fn backend_protocol_publish_hook_writes_observation_bus() {
+        let (runtime, backend) = runtime_and_backend();
+        let detail = runtime.create_worker(task_request("observe")).unwrap();
+
+        let observation = backend
+            .publish_text_delta(&detail.worker_ref, "from backend")
+            .unwrap();
+        assert_eq!(observation.worker_ref, detail.worker_ref);
+
+        let observations = runtime
+            .read_worker_observation_events(&detail.worker_ref, WorkerObservationCursor::zero())
+            .unwrap();
+        assert_eq!(observations.len(), 1);
+        assert!(matches!(
+            observations[0].payload,
+            protocol::Event::TextDelta { .. }
+        ));
+    }
+
+    struct InputOnlyBackend;
+
+    impl WorkerExecutionBackend for InputOnlyBackend {
+        fn backend_id(&self) -> &str {
+            "input-only"
+        }
+
+        fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
+            WorkerExecutionSpawnResult::Connected {
+                handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
+                run_state: WorkerExecutionRunState::Idle,
+            }
+        }
+
+        fn dispatch_input(
+            &self,
+            _handle: &WorkerExecutionHandle,
+            _input: WorkerInput,
+        ) -> WorkerExecutionResult {
+            WorkerExecutionResult::accepted(
+                WorkerExecutionOperation::Input,
+                WorkerExecutionRunState::Idle,
+            )
+        }
+    }
+
+    #[test]
+    fn connected_backend_stop_unsupported_is_typed_rejection() {
+        let runtime =
+            Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(InputOnlyBackend))
+                .unwrap();
+        let detail = runtime.create_worker(task_request("no stop")).unwrap();
+
+        let err = runtime
+            .stop_worker(&detail.worker_ref, Some("stop".to_string()))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeError::WorkerExecutionRejected {
+                outcome: crate::execution::WorkerExecutionOutcome::Unsupported,
+                ..
+            }
+        ));
+        assert_eq!(
+            runtime.worker_detail(&detail.worker_ref).unwrap().status,
+            WorkerStatus::Running
+        );
+    }
+
+    #[test]
     fn send_input_and_project_bounded_transcript() {
-        let runtime = Runtime::with_options(RuntimeOptions {
-            limits: RuntimeLimits {
-                max_transcript_projection_items: 2,
-                max_event_batch_items: 16,
+        let runtime = Runtime::with_execution_backend(
+            RuntimeOptions {
+                limits: RuntimeLimits {
+                    max_transcript_projection_items: 2,
+                    max_event_batch_items: 16,
+                },
+                ..RuntimeOptions::default()
             },
-            ..RuntimeOptions::default()
-        });
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
         let detail = runtime.create_worker(task_request("chat")).unwrap();
 
         let first = runtime
@@ -1509,7 +2059,7 @@ mod tests {
 
     #[test]
     fn event_cursor_and_poll_only_subscription_are_bounded_placeholders() {
-        let runtime = Runtime::new_memory();
+        let runtime = runtime_with_backend();
         let cursor = runtime.event_cursor_from_start().unwrap();
         let subscription = runtime.subscribe_events(cursor.clone()).unwrap();
         assert_eq!(subscription.mode, EventSubscriptionMode::PollOnly);
@@ -1559,15 +2109,18 @@ mod tests {
     fn fs_store_restores_workers_events_and_transcripts() {
         let root = fs_store_root("restore");
         let runtime_id = RuntimeId::new("runtime-fs-authority").unwrap();
-        let runtime = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
-            root: root.clone(),
-            runtime_id: Some(runtime_id.clone()),
-            display_name: Some("filesystem runtime".to_string()),
-            limits: RuntimeLimits {
-                max_transcript_projection_items: 2,
-                max_event_batch_items: 2,
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            crate::fs_store::FsRuntimeStoreOptions {
+                root: root.clone(),
+                runtime_id: Some(runtime_id.clone()),
+                display_name: Some("filesystem runtime".to_string()),
+                limits: RuntimeLimits {
+                    max_transcript_projection_items: 2,
+                    max_event_batch_items: 2,
+                },
             },
-        })
+            Arc::new(TestExecutionBackend::default()),
+        )
         .unwrap();
         assert_eq!(
             runtime.summary().unwrap().backend,
@@ -1618,6 +2171,24 @@ mod tests {
             .read_transcript(&worker.worker_ref, TranscriptQuery::new(1, 1), 2)
             .unwrap();
         assert_eq!(direct_transcript.items[0].content, "second");
+
+        #[cfg(feature = "ws-server")]
+        {
+            let observation = restored
+                .observe_worker_event(
+                    &worker.worker_ref,
+                    protocol::Event::TextDelta {
+                        text: "restored observation bus".to_string(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(observation.sequence, 1);
+            let observations = restored
+                .read_worker_observation_events(&worker.worker_ref, WorkerObservationCursor::zero())
+                .unwrap();
+            assert_eq!(observations.len(), 1);
+            assert_eq!(observations[0].cursor, observation.cursor);
+        }
 
         let _ = std::fs::remove_dir_all(root);
     }

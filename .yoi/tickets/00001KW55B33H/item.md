@@ -1,8 +1,8 @@
 ---
 title: 'Workspace Companionを実LLM実行Workerとして起動する'
-state: 'queued'
+state: 'closed'
 created_at: '2026-06-27T18:26:47Z'
-updated_at: '2026-06-27T19:06:32Z'
+updated_at: '2026-06-28T07:20:22Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-27T19:06:32Z'
