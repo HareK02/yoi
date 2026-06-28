@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KW7835H0",
+      "kind": "depends_on",
+      "target": "00001KW7726H9",
+      "note": "Pod registry/store removal should follow the canonical Runtime Worker creation authority decision",
+      "author": "yoi ticket",
+      "at": "2026-06-28T13:54:49Z"
+    },
+    {
+      "ticket_id": "00001KW7835H0",
+      "kind": "related",
+      "target": "00001KVZG9BMS",
+      "note": "Pod wording audit and crate removal share active Pod concept cleanup",
+      "author": "yoi ticket",
+      "at": "2026-06-28T13:54:49Z"
+    },
+    {
+      "ticket_id": "00001KW7835H0",
+      "kind": "related",
+      "target": "00001KW76E8EG",
+      "note": "Runtime fs-store persistence replaces old Pod metadata authority",
+      "author": "yoi ticket",
+      "at": "2026-06-28T13:54:49Z"
+    }
+  ]
+}
