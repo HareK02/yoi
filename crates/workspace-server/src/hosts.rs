@@ -2160,9 +2160,10 @@ fn embedded_profile_selector(intent: &WorkerSpawnIntent) -> ProfileSelector {
         WorkerSpawnIntent::TicketRole { role, .. } => {
             ProfileSelector::Builtin(format!("builtin:{}", ticket_role_profile_slug(role)))
         }
-        WorkerSpawnIntent::WorkspaceCompanion | WorkerSpawnIntent::WorkspaceOrchestrator => {
-            ProfileSelector::RuntimeDefault
+        WorkerSpawnIntent::WorkspaceCompanion => {
+            ProfileSelector::Builtin("builtin:companion".to_string())
         }
+        WorkerSpawnIntent::WorkspaceOrchestrator => ProfileSelector::RuntimeDefault,
     }
 }
 
