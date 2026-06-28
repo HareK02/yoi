@@ -427,3 +427,51 @@ Ticket / API audit の方針では、Browser launch の initial input はユー�
 - embedded Workspace Server 側の spawn は ConfigBundle を Runtime に sync してから canonical Runtime create に寄せている。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KW7726H9-launch-unify at: 2026-06-28T18:12:02Z -->
+
+## Implementation report
+
+Change-response implementation report:
+
+Reviewer blockers を修正し、追加 commit を作成済み。Ticket ファイル編集、merge、close、cleanup は未実施。
+
+Commit:
+- `c29d10b67bfff1f4a7a1b2742ec05fe63b80c054 runtime: persist execution binding projection`
+
+変更内容:
+
+- Execution binding identity の永続化
+  - `WorkerExecutionBindingIdentity { backend_id }` を追加。
+  - raw handle / secret / path / socket を含まない非権威 durable projection として保存。
+  - Worker persisted record に `WorkerExecutionStatus` を保存し、execution status / binding projection が restore 後に消えないようにした。
+
+- stale execution mapping diagnostic
+  - fs-store restore 時、persisted execution binding が存在するが live execution handle を復元できない場合に Worker execution status を `stale` として投影。
+  - typed diagnostic `worker_execution_mapping_stale` を追加。
+  - stale projection は input-capable と誤認されないよう `WorkerExecutionBackendKind::Stale` として扱う。
+
+- System initial input の拒否
+  - `CreateWorkerRequest.initial_input` に `WorkerInputKind::System` が来た場合、Runtime boundary で `RuntimeError::InvalidInitialInputKind` として拒否。
+  - System / role instructions は Profile / ConfigBundle に属し、launch/create initial input として transcript に保存されないようにした。
+  - Browser-facing embedded launch でも typed diagnostic `embedded_worker_initial_input_kind_invalid` として返す。
+
+- Tests
+  - System initial input が reject され、Worker / WorkerCreated event が persisted されないことを確認。
+  - fs-store restore 後に stale execution mapping diagnostic が出ること、binding identity が raw authority ではなく backend id projection として残ることを確認。
+  - embedded runtime launch の System initial input reject を確認。
+
+Validation:
+- `cargo fmt`: success
+- `cargo test -p worker-runtime --features ws-server`: success
+- `cargo test -p yoi-workspace-server`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `cargo test -p worker-runtime --features fs-store,ws-server`: success
+- `nix build .#yoi`: success
+
+Residual risks / review focus:
+- restore 後の execution binding は非権威 projection であり、live handle は復元しない。再接続 / reattach 実処理は別設計範囲。
+- stale Worker は binding identity と diagnostic を保持するが input-capable とは扱わないため、UI/API 側では stale diagnostic を見て明示的な再接続 / 再作成導線を出す必要がある。
+
+---
