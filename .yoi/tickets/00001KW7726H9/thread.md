@@ -213,3 +213,40 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-28T16:48:19Z -->
+
+## Decision
+
+Routing decision:
+
+Workspace Dashboard Queue authorized Orchestrator routing. Current state was inspected before implementation side effects.
+
+Findings:
+- Ticket state: `queued`
+- Blocker relations: none
+- Related Tickets `00001KW55B32Y`, `00001KW55B33B`, `00001KW55B33H` are prior execution-boundary / adapter / Companion work and are closed.
+- Current `inprogress` Tickets: 0
+- Orchestration worktree: clean
+
+Decision:
+- Accept this Ticket for implementation and transition `queued -> inprogress` before child worktree / Pod side effects.
+
+Plan:
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KW7726H9-runtime-worker-launch-unification`
+- Branch: `work/00001KW7726H9-runtime-worker-launch-unification`
+- Coder Worker will inspect `.yoi/tickets/00001KW7726H9/item.md` and `artifacts/api-field-audit.md`, then implement the canonical Worker launch/creation path using current code as authority.
+- Reviewer Worker will verify API boundary separation, ConfigBundle sync / Runtime creation separation, execution binding boundary, transaction/persistence/retry behavior, Browser-facing non-leak, no fake/providerless response, and focused tests.
+
+Operational note:
+- User instructed not to use `StopPod` for now after repeated stop/hang symptoms. Cleanup will skip role-Pod shutdown and remove only child worktree/branch unless explicitly reauthorized.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-28T16:48:25Z from: queued to: inprogress reason: authorized_unblocked_queue_acceptance field: state -->
+
+## State changed
+
+Workspace Dashboard Queue authorized routing. The Ticket has no blocker relations, related prerequisite Tickets are closed, no other Ticket is inprogress, and the orchestration worktree is clean. Accepting implementation before child worktree / role Pod side effects.
+
+---
