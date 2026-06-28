@@ -228,3 +228,27 @@ Risks / notes:
 - Historical docs は今回の active dependency cleanup の対象外だが、active crate/path/dependency 参照は除去済み。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-28T19:46:27Z -->
+
+## Implementation report
+
+Review kickoff:
+
+Reviewer Worker spawned for `00001KW7835H0` implementation.
+
+- Reviewer Worker: `yoi-reviewer-00001KW7835H0-pod-cleanup`
+- Review target commit: `17a9488a4aa0a3dc83be2d3360b6ffd8ffcaeb5a refactor: remove old pod crates`
+- Review mode: read-only implementation worktree review
+
+Review focus:
+- `crates/pod-registry` and `crates/pod-store` are removed from workspace / Cargo / package / lock / active source references
+- `crates/pod` remains absent and is not reintroduced
+- needed Worker metadata/session persistence moved to Worker/Runtime/session-store boundaries without active Pod authority naming
+- old pod-registry APIs are not active authority
+- Runtime Worker identity / creation / persistence remains `worker-runtime` fs-store + execution backend mapping
+- UI/CLI/TUI active wording and tests compile
+- no stale compatibility alias preserves old Pod store authority
+- validation evidence is plausible and sufficient
+
+---
