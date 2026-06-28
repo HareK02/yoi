@@ -14,17 +14,17 @@ use std::sync::{Arc, LazyLock, Mutex};
 use llm_engine::llm_client::types::{ContentPart, Item, Role};
 use llm_engine::tool::ToolOutput;
 use manifest::{Permission, Scope, ScopeRule, SharedScope};
-use pod_store::{CombinedStore, FsWorkerStore, WorkerMetadataStore};
 use protocol::stream::{JsonLineReader, JsonLineWriter};
 use protocol::{ErrorCode, Event, Greeting, Method};
 use serde_json::json;
 use session_store::FsStore;
+use session_store::{CombinedStore, FsWorkerStore, WorkerMetadataStore};
 use tempfile::TempDir;
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use worker::runtime::dir::{RuntimeDir, SpawnedWorkerRecord};
-use worker::runtime::pod_registry::{self, LockFileGuard};
+use worker::runtime::worker_allocation::{self, LockFileGuard};
 use worker::spawn::comm_tools::{read_worker_output_tool, send_to_worker_tool, stop_worker_tool};
 use worker::spawn::registry::SpawnedWorkerRegistry;
 
@@ -416,7 +416,7 @@ async fn stop_worker_sends_shutdown_and_releases_scope() {
             permission: Permission::Write,
             recursive: true,
         };
-        pod_registry::register_worker_with_deny(
+        worker_allocation::register_worker_with_deny(
             &mut g,
             "spawner".into(),
             std::process::id(),
@@ -426,7 +426,7 @@ async fn stop_worker_sends_shutdown_and_releases_scope() {
             session_store::new_segment_id(),
         )
         .unwrap();
-        pod_registry::register_worker(
+        worker_allocation::register_worker(
             &mut g,
             "child".into(),
             std::process::id(),
@@ -663,7 +663,7 @@ async fn load_from_worker_state_reclaims_missing_child_scope_and_records_history
 
     {
         let mut g = LockFileGuard::open(&runtime_tmp.path().join("workers.json")).unwrap();
-        pod_registry::register_worker_with_deny(
+        worker_allocation::register_worker_with_deny(
             &mut g,
             "spawner".into(),
             std::process::id(),

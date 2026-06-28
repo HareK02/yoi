@@ -18,19 +18,19 @@ use async_trait::async_trait;
 use client::WorkerRuntimeCommand;
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use manifest::{Permission, ScopeRule};
-use pod_store::{
-    WorkerActiveSegmentRef, WorkerMetadata, WorkerMetadataStore, validate_worker_name,
-};
 use protocol::stream::JsonLineReader;
 use protocol::{Event, Method, WorkerStatus};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use session_store::{SegmentId, SessionId};
+use session_store::{
+    WorkerActiveSegmentRef, WorkerMetadata, WorkerMetadataStore, validate_worker_name,
+};
 use tokio::net::UnixStream;
 use tokio::process::Command;
 
 use crate::runtime::dir::SpawnedWorkerRecord;
-use crate::runtime::pod_registry;
+use crate::runtime::worker_allocation;
 use crate::spawn::comm_tools::connect_and_send;
 use crate::spawn::registry::SpawnedWorkerRegistry;
 
@@ -705,9 +705,9 @@ pub enum WorkerDiscoveryError {
     #[error("session store error: {0}")]
     Store(#[from] session_store::StoreError),
     #[error("worker store error: {0}")]
-    WorkerStore(#[from] pod_store::WorkerStoreError),
+    WorkerStore(#[from] session_store::WorkerStoreError),
     #[error("scope lock error: {0}")]
-    ScopeLock(#[from] pod_registry::ScopeLockError),
+    ScopeLock(#[from] worker_allocation::ScopeLockError),
     #[error("failed to launch restore process: {0}")]
     RestoreSpawn(io::Error),
     #[error("failed to launch restore runtime command `{command}`: {source}")]
@@ -748,7 +748,7 @@ impl VisibilitySet {
     }
 }
 
-fn comm_info_from_spawned_child(child: &pod_store::WorkerSpawnedChild) -> CommRegistryInfo {
+fn comm_info_from_spawned_child(child: &session_store::WorkerSpawnedChild) -> CommRegistryInfo {
     let scope_delegated = child
         .scope_delegated
         .iter()
@@ -773,7 +773,7 @@ fn comm_info_from_spawned_child(child: &pod_store::WorkerSpawnedChild) -> CommRe
 }
 
 async fn summarize_spawned_children(
-    children: &[pod_store::WorkerSpawnedChild],
+    children: &[session_store::WorkerSpawnedChild],
 ) -> SpawnedChildrenSummary {
     let mut summary = SpawnedChildrenSummary {
         count: children.len(),
@@ -832,8 +832,8 @@ async fn probe_socket(socket_path: &Path) -> LiveInfo {
 
 fn lookup_segment_lock(
     segment_id: SegmentId,
-) -> Result<Option<pod_registry::SegmentLockInfo>, pod_registry::ScopeLockError> {
-    pod_registry::lookup_segment(segment_id)
+) -> Result<Option<worker_allocation::SegmentLockInfo>, worker_allocation::ScopeLockError> {
+    worker_allocation::lookup_segment(segment_id)
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1061,9 +1061,11 @@ mod tests {
     use std::sync::Mutex;
 
     use manifest::{Permission, ScopeRule};
-    use pod_store::{FsWorkerStore, WorkerSpawnedChild, WorkerSpawnedScopeRule, WorkerStoreError};
     use protocol::stream::JsonLineWriter;
     use protocol::{Alert, AlertLevel, AlertSource};
+    use session_store::{
+        FsWorkerStore, WorkerSpawnedChild, WorkerSpawnedScopeRule, WorkerStoreError,
+    };
     use session_store::{new_segment_id, new_session_id};
     use tempfile::TempDir;
     use tokio::net::UnixListener;
@@ -1143,7 +1145,7 @@ mod tests {
                 child("child-pending", &pending_socket),
             ],
             reclaimed_children: Vec::new(),
-            peers: vec![pod_store::WorkerPeer {
+            peers: vec![session_store::WorkerPeer {
                 worker_name: "peer".into(),
             }],
             resolved_manifest_snapshot: None,
@@ -1209,7 +1211,7 @@ mod tests {
                 workspace_root: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
-                peers: vec![pod_store::WorkerPeer {
+                peers: vec![session_store::WorkerPeer {
                     worker_name: "parent".into(),
                 }],
                 resolved_manifest_snapshot: None,
@@ -1317,7 +1319,7 @@ mod tests {
         assert!(matches!(restore_plan, RestorePlan::Restore { .. }));
 
         let lock_socket = runtime_base.join("lock-owner.sock");
-        let _guard = pod_registry::install_top_level(
+        let _guard = worker_allocation::install_top_level(
             "lock-owner".into(),
             std::process::id(),
             lock_socket.clone(),
@@ -1415,7 +1417,7 @@ mod tests {
                 workspace_root: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
-                peers: vec![pod_store::WorkerPeer {
+                peers: vec![session_store::WorkerPeer {
                     worker_name: "target".into(),
                 }],
                 resolved_manifest_snapshot: None,
@@ -1455,7 +1457,7 @@ mod tests {
                 workspace_root: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
-                peers: vec![pod_store::WorkerPeer {
+                peers: vec![session_store::WorkerPeer {
                     worker_name: "target".into(),
                 }],
                 resolved_manifest_snapshot: None,
@@ -1468,7 +1470,7 @@ mod tests {
                 workspace_root: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
-                peers: vec![pod_store::WorkerPeer {
+                peers: vec![session_store::WorkerPeer {
                     worker_name: "source".into(),
                 }],
                 resolved_manifest_snapshot: None,
@@ -1573,7 +1575,7 @@ mod tests {
                 workspace_root: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
-                peers: vec![pod_store::WorkerPeer {
+                peers: vec![session_store::WorkerPeer {
                     worker_name: "target".into(),
                 }],
                 resolved_manifest_snapshot: None,
@@ -1586,7 +1588,7 @@ mod tests {
                 workspace_root: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
-                peers: vec![pod_store::WorkerPeer {
+                peers: vec![session_store::WorkerPeer {
                     worker_name: "source".into(),
                 }],
                 resolved_manifest_snapshot: None,

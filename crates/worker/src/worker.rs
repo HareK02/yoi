@@ -10,12 +10,12 @@ use llm_engine::llm_client::client::LlmClient;
 use llm_engine::llm_client::types::Role;
 use llm_engine::state::Mutable;
 use llm_engine::{Engine, EngineError, EngineResult, ToolOutputLimits, UsageRecord};
-use pod_store::{
-    WorkerActiveSegmentRef, WorkerMetadata, WorkerMetadataStore, WorkerReclaimedChild,
-    WorkerSpawnedChild, WorkerSpawnedScopeRule, WorkerStoreError,
-};
 use session_store::{
     LogEntry, SegmentId, SessionId, Store, StoreError, SystemItem, segment_log, to_logged,
+};
+use session_store::{
+    WorkerActiveSegmentRef, WorkerMetadata, WorkerMetadataStore, WorkerReclaimedChild,
+    WorkerSpawnedChild, WorkerSpawnedScopeRule, WorkerStoreError,
 };
 use tracing::{info, warn};
 
@@ -44,7 +44,7 @@ use crate::prompt::catalog::{CatalogError, PromptCatalog};
 use crate::prompt::loader::PromptLoader;
 use crate::prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 use crate::runtime::dir;
-use crate::runtime::pod_registry::{self, ScopeAllocationGuard, ScopeLockError};
+use crate::runtime::worker_allocation::{self, ScopeAllocationGuard, ScopeLockError};
 use crate::workflow::WorkflowResolveError;
 #[cfg(test)]
 use async_trait::async_trait;
@@ -795,7 +795,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
 
     /// Strip `revoke` rules from the Worker's runtime scope by adding
     /// matching deny rules. A `Permission::Write` revoke caps effective
-    /// access at `Read` (mirroring the pod-registry `effective_write`
+    /// access at `Read` (mirroring the worker-allocation `effective_write`
     /// semantics — Write is the only permission tracked across Workers).
     /// A `Permission::Read` revoke removes access entirely.
     pub fn revoke_scope_rules(
@@ -2086,7 +2086,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         self.segment_state.set_entries_written(1);
         self.sink.reset_with_initial(entry);
         if self.scope_allocation.is_some() {
-            pod_registry::update_segment(&self.manifest.worker.name, fork_segment_id)?;
+            worker_allocation::update_segment(&self.manifest.worker.name, fork_segment_id)?;
         }
         self.write_worker_metadata_active(SegmentLocation {
             session_id: loc.session_id,
@@ -2795,7 +2795,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         // when no allocation is installed (e.g. compact under
         // `Worker::new` in tests).
         if self.scope_allocation.is_some() {
-            pod_registry::update_segment(&self.manifest.worker.name, new_segment_id)?;
+            worker_allocation::update_segment(&self.manifest.worker.name, new_segment_id)?;
         }
         self.write_worker_metadata_active(SegmentLocation {
             session_id: old_loc.session_id,
@@ -3847,19 +3847,19 @@ where
         // Segment creation is deferred to the first run (see
         // `ensure_segment_head`) so the SegmentStart entry can capture
         // the rendered system prompt, not the raw template source. The
-        // session_id + segment_id are allocated here so the pod-registry
+        // session_id + segment_id are allocated here so the worker-allocation
         // registration can record them from the start.
         let session_id = session_store::new_session_id();
         let segment_id = session_store::new_segment_id();
 
-        // Register this Worker in the machine-wide pod-registry
+        // Register this Worker in the machine-wide worker-allocation
         // before building anything else, so a spawn that conflicts on
         // scope fails fast.
         let socket_path = dir::default_base()
             .map_err(ScopeLockError::from)?
             .join(&manifest.worker.name)
             .join("sock");
-        let scope_allocation = pod_registry::install_top_level(
+        let scope_allocation = worker_allocation::install_top_level(
             manifest.worker.name.clone(),
             std::process::id(),
             socket_path,
@@ -3927,7 +3927,7 @@ where
     ///
     /// Behaves like [`Worker::from_manifest`] but claims the scope
     /// allocation that the spawner pre-registered via
-    /// [`pod_registry::delegate_scope`], rather than installing a new
+    /// [`worker_allocation::delegate_scope`], rather than installing a new
     /// top-level entry. `callback_socket` carries the spawner's
     /// Unix-socket path so the spawned Worker can send `Method::Notify`
     /// back to the spawner.
@@ -3971,7 +3971,7 @@ where
         // fresh Session rather than joining the spawner's.
         let session_id = session_store::new_session_id();
         let segment_id = session_store::new_segment_id();
-        let scope_allocation = pod_registry::adopt_allocation(
+        let scope_allocation = worker_allocation::adopt_allocation(
             manifest.worker.name.clone(),
             std::process::id(),
             segment_id,
@@ -4104,9 +4104,9 @@ where
     /// reuses the same `segment_id` so subsequent turns append to the
     /// source jsonl as a continuation of the same conversation.
     ///
-    /// Concurrent writers are prevented by the pod-registry:
+    /// Concurrent writers are prevented by the worker-allocation:
     /// the registration carries `segment_id`, and this constructor
-    /// refuses to start when `pod_registry::lookup_segment` already finds
+    /// refuses to start when `worker_allocation::lookup_segment` already finds
     /// a live Worker writing to `segment_id`. So there is no need to fork —
     /// resume is "the same session, a different process owning it".
     ///
@@ -4173,7 +4173,7 @@ where
             .map_err(ScopeLockError::from)?
             .join(&manifest.worker.name)
             .join("sock");
-        let scope_allocation = pod_registry::install_top_level_with_deny(
+        let scope_allocation = worker_allocation::install_top_level_with_deny(
             manifest.worker.name.clone(),
             std::process::id(),
             socket_path,
@@ -4291,10 +4291,10 @@ where
             let delegated_scope = spawned_child_scope_rules(&child);
             if !delegated_scope.is_empty() {
                 let lock_path =
-                    pod_registry::default_registry_path().map_err(ScopeLockError::from)?;
-                let mut guard =
-                    pod_registry::LockFileGuard::open(&lock_path).map_err(ScopeLockError::from)?;
-                pod_registry::reclaim_delegated_scope(
+                    worker_allocation::default_allocation_path().map_err(ScopeLockError::from)?;
+                let mut guard = worker_allocation::LockFileGuard::open(&lock_path)
+                    .map_err(ScopeLockError::from)?;
+                worker_allocation::reclaim_delegated_scope(
                     &mut guard,
                     &worker_name,
                     &child.worker_name,
@@ -5300,7 +5300,7 @@ mod worker_metadata_restore_manifest_tests {
     #[test]
     fn metadata_writer_persists_workspace_root_through_store_update() {
         let temp = tempfile::tempdir().unwrap();
-        let store = pod_store::FsWorkerStore::new(temp.path().join("pods")).unwrap();
+        let store = session_store::FsWorkerStore::new(temp.path().join("workers")).unwrap();
         let workspace_root = temp.path().join("workspace-root");
         std::fs::create_dir_all(&workspace_root).unwrap();
         let writer = worker_metadata_writer_for_store(&store);

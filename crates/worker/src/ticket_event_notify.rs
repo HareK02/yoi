@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 use crate::discovery::{WeakNotifyDelivery, WorkerDiscovery};
 use crate::hook::{Hook, HookPostToolAction, PostToolCall, ToolResultSummary};
 use crate::prompt::catalog::{PromptCatalog, WorkerPrompt};
-use pod_store::WorkerMetadataStore;
+use session_store::WorkerMetadataStore;
 
 const MAX_TITLE_CHARS: usize = 96;
 const MAX_SUMMARY_CHARS: usize = 160;
@@ -251,11 +251,11 @@ mod tests {
     use crate::runtime::dir::RuntimeDir;
     use crate::spawn::registry::SpawnedWorkerRegistry;
     use llm_engine::tool::ToolOutput;
-    use pod_store::FsWorkerStore;
-    use pod_store::WorkerMetadata;
     use protocol::stream::{JsonLineReader, JsonLineWriter};
     use protocol::{Event, Method};
     use serde_json::json;
+    use session_store::FsWorkerStore;
+    use session_store::WorkerMetadata;
     use std::sync::Arc;
     use tempfile::tempdir;
     use ticket::NewTicket;

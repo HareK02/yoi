@@ -19,7 +19,6 @@ use crossterm::event::{
     Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     poll, read,
 };
-use pod_store::FsWorkerStore;
 use protocol::stream::{JsonLineReader, JsonLineWriter};
 use protocol::{ErrorCode, Event, Method, Segment, WorkerStatus};
 use ratatui::Frame;
@@ -31,6 +30,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use serde::Serialize;
 use session_store::FsStore;
+use session_store::FsWorkerStore;
 use ticket::config::{GitBranchName, TicketConfig, TicketOrchestrationConfig};
 use ticket::{
     LocalTicketBackend, MarkdownText, TicketBackend, TicketIdOrSlug, TicketStateChange,
@@ -46,7 +46,7 @@ use crate::role_session_registry::{
 };
 use crate::worker_list::{
     StoredMetadataState, WorkerList, WorkerListEntry, WorkerVisibilitySource,
-    read_reachable_live_pod_infos, read_stored_worker_infos,
+    read_reachable_live_worker_infos, read_stored_worker_infos,
 };
 #[cfg(not(feature = "e2e-test"))]
 use crate::workspace_panel::build_workspace_panel;
@@ -522,9 +522,9 @@ fn default_store_dir() -> Result<PathBuf, DashboardError> {
     })
 }
 
-fn default_pod_store_dir() -> Result<PathBuf, DashboardError> {
+fn default_worker_metadata_dir() -> Result<PathBuf, DashboardError> {
     manifest::paths::data_dir()
-        .map(|dir| dir.join("pods"))
+        .map(|dir| dir.join("workers"))
         .ok_or_else(|| {
             DashboardError::Io(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -3423,9 +3423,10 @@ async fn load_worker_list(
 ) -> Result<WorkerList, DashboardError> {
     let store_dir = default_store_dir()?;
     let store = FsStore::new(&store_dir)?;
-    let pod_store = FsWorkerStore::new(default_pod_store_dir()?).map_err(io::Error::other)?;
-    let stored = read_stored_worker_infos(&store, &pod_store)?;
-    let live = read_reachable_live_pod_infos(&store)
+    let worker_metadata_store =
+        FsWorkerStore::new(default_worker_metadata_dir()?).map_err(io::Error::other)?;
+    let stored = read_stored_worker_infos(&store, &worker_metadata_store)?;
+    let live = read_reachable_live_worker_infos(&store)
         .await
         .unwrap_or_default();
     Ok(WorkerList::from_workspace_sources(

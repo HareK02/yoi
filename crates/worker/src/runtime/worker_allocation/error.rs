@@ -1,4 +1,4 @@
-//! Error type for mutating pod-registry operations.
+//! Error type for mutating pod-worker allocation operations.
 
 use std::io;
 use std::path::PathBuf;
@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use manifest::{ScopeError, ScopeRule};
 use session_store::SegmentId;
 
-/// Errors raised by the mutating pod-registry operations.
+/// Errors raised by the mutating pod-worker allocation operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ScopeLockError {
     #[error("I/O error on workers.json: {0}")]

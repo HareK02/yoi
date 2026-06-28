@@ -22,8 +22,7 @@ toml = { workspace = true }
 manifest = { workspace = true }
 secrets = { workspace = true }
 session-store = { workspace = true }
-pod-store = { workspace = true }
-pod-registry = { workspace = true }
+fs4 = { workspace = true }
 provider = { workspace = true }
 ticket = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

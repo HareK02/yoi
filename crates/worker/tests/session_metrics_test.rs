@@ -25,8 +25,8 @@ use llm_engine::Engine;
 use llm_engine::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent, UsageEvent};
 use llm_engine::llm_client::{ClientError, LlmClient, Request};
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
-use pod_store::{CombinedStore, FsWorkerStore};
 use session_metrics::{DOMAIN, Metric, metrics_from_extensions};
+use session_store::{CombinedStore, FsWorkerStore};
 use session_store::{FsStore, LogEntry, SegmentId, SessionId, Store, StoreError, TraceEntry};
 
 use worker::{Worker, WorkerManifest};

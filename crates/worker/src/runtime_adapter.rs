@@ -16,9 +16,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use manifest::paths;
-use pod_store::{CombinedStore, FsWorkerStore};
 use protocol::{Method, Segment, WorkerStatus};
 use session_store::FsStore;
+use session_store::{CombinedStore, FsWorkerStore};
 use tokio::runtime::Runtime;
 use tokio::sync::broadcast;
 use worker_runtime::execution::{
@@ -49,7 +49,7 @@ pub struct ProfileRuntimeWorkerFactory {
     workspace_root: PathBuf,
     cwd: PathBuf,
     store_dir: Option<PathBuf>,
-    pod_store_dir: Option<PathBuf>,
+    worker_metadata_dir: Option<PathBuf>,
     profile: Option<String>,
     runtime_base_dir: Option<PathBuf>,
 }
@@ -61,7 +61,7 @@ impl ProfileRuntimeWorkerFactory {
             cwd: workspace_root.clone(),
             workspace_root,
             store_dir: None,
-            pod_store_dir: None,
+            worker_metadata_dir: None,
             profile: None,
             runtime_base_dir: None,
         }
@@ -77,8 +77,8 @@ impl ProfileRuntimeWorkerFactory {
         self
     }
 
-    pub fn with_pod_store_dir(mut self, pod_store_dir: impl Into<PathBuf>) -> Self {
-        self.pod_store_dir = Some(pod_store_dir.into());
+    pub fn with_worker_metadata_dir(mut self, worker_metadata_dir: impl Into<PathBuf>) -> Self {
+        self.worker_metadata_dir = Some(worker_metadata_dir.into());
         self
     }
 
@@ -104,11 +104,11 @@ impl ProfileRuntimeWorkerFactory {
             })
     }
 
-    fn pod_store_dir(&self, store_dir: &std::path::Path) -> PathBuf {
-        self.pod_store_dir
+    fn worker_metadata_dir(&self, store_dir: &std::path::Path) -> PathBuf {
+        self.worker_metadata_dir
             .clone()
-            .or_else(|| paths::data_dir().map(|data_dir| data_dir.join("pods")))
-            .or_else(|| store_dir.parent().map(|parent| parent.join("pods")))
+            .or_else(|| paths::data_dir().map(|data_dir| data_dir.join("workers")))
+            .or_else(|| store_dir.parent().map(|parent| parent.join("workers")))
             .unwrap_or_else(|| PathBuf::from("workers"))
     }
 
@@ -174,14 +174,14 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 store_dir.display()
             )
         })?;
-        let pod_store_dir = self.pod_store_dir(&store_dir);
-        let pod_store = FsWorkerStore::new(&pod_store_dir).map_err(|err| {
+        let worker_metadata_dir = self.worker_metadata_dir(&store_dir);
+        let worker_metadata_store = FsWorkerStore::new(&worker_metadata_dir).map_err(|err| {
             format!(
                 "failed to initialize worker metadata store at {}: {err}",
-                pod_store_dir.display()
+                worker_metadata_dir.display()
             )
         })?;
-        let store = CombinedStore::new(session_store, pod_store);
+        let store = CombinedStore::new(session_store, worker_metadata_store);
 
         let worker = Worker::from_manifest_with_context(
             manifest,
@@ -558,7 +558,7 @@ mod tests {
         runtime_base: PathBuf,
         cwd: PathBuf,
         store_dir: PathBuf,
-        pod_store_dir: PathBuf,
+        worker_metadata_dir: PathBuf,
     }
 
     #[async_trait]
@@ -588,7 +588,7 @@ mod tests {
             .map_err(|err| err.to_string())?;
             let store = CombinedStore::new(
                 FsStore::new(&self.store_dir).map_err(|err| err.to_string())?,
-                FsWorkerStore::new(&self.pod_store_dir).map_err(|err| err.to_string())?,
+                FsWorkerStore::new(&self.worker_metadata_dir).map_err(|err| err.to_string())?,
             );
             let scope = Scope::writable(&self.cwd).map_err(|err| err.to_string())?;
             let worker = Worker::new(
@@ -662,7 +662,7 @@ mod tests {
             runtime_base: runtime_base.path().to_path_buf(),
             cwd: cwd.path().to_path_buf(),
             store_dir: store.path().join("sessions"),
-            pod_store_dir: store.path().join("pods"),
+            worker_metadata_dir: store.path().join("workers"),
         };
         let backend = WorkerRuntimeExecutionBackend::new(factory).unwrap();
         let runtime = EmbeddedRuntime::with_execution_backend(

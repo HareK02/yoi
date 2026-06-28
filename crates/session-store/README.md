@@ -15,8 +15,8 @@ Owns:
 
 Does not own:
 
-- current Worker-name metadata (`pod-store`)
-- live process/socket discovery (`pod-registry`, `client`)
+- current Worker-name metadata (`session-store` worker metadata)
+- live process/socket discovery (`worker-allocation`, `client`)
 - UI state (`tui`)
 - generated memory summaries (`memory`)
 

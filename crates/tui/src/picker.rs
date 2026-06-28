@@ -1,7 +1,7 @@
 //! Inline-viewport "pick a Worker to attach or restore" UX.
 //!
 //! Reads live Worker allocations from the runtime registry and stopped Worker state
-//! from the pod-store name-keyed metadata. Picking a live row attaches to
+//! from the session-store worker metadata name-keyed metadata. Picking a live row attaches to
 //! its socket; picking a stopped row restores via the Worker runtime command.
 
 use std::io;
@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
-use pod_store::FsWorkerStore;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
@@ -18,11 +17,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, TerminalOptions, Viewport};
 use session_store::FsStore;
+use session_store::FsWorkerStore;
 
 use crate::worker_list::{
     LiveWorkerInfo, StoredMetadataState, StoredWorkerInfo, WorkerList, WorkerListEntry,
-    WorkerVisibilitySource, live_socket_for_pod as worker_list_live_socket_for_pod,
-    read_reachable_live_pod_infos, read_stored_worker_infos,
+    WorkerVisibilitySource, live_socket_for_worker as worker_list_live_socket_for_worker,
+    read_reachable_live_worker_infos, read_stored_worker_infos,
 };
 
 const MAX_ROWS: usize = 10;
@@ -156,9 +156,10 @@ fn list_for_options(
 pub async fn run(options: PickerOptions) -> Result<PickerOutcome, PickerError> {
     let store_dir = default_store_dir()?;
     let store = FsStore::new(&store_dir)?;
-    let pod_store = FsWorkerStore::new(default_pod_store_dir()?).map_err(io::Error::other)?;
-    let stored_workers = read_stored_worker_infos(&store, &pod_store)?;
-    let live_workers = read_reachable_live_pod_infos(&store)
+    let worker_metadata_store =
+        FsWorkerStore::new(default_worker_metadata_dir()?).map_err(io::Error::other)?;
+    let stored_workers = read_stored_worker_infos(&store, &worker_metadata_store)?;
+    let live_workers = read_reachable_live_worker_infos(&store)
         .await
         .unwrap_or_default();
     let mut list = list_for_options(&options, stored_workers, live_workers);
@@ -223,9 +224,9 @@ fn default_store_dir() -> Result<PathBuf, PickerError> {
     })
 }
 
-fn default_pod_store_dir() -> Result<PathBuf, PickerError> {
+fn default_worker_metadata_dir() -> Result<PathBuf, PickerError> {
     manifest::paths::data_dir()
-        .map(|dir| dir.join("pods"))
+        .map(|dir| dir.join("workers"))
         .ok_or_else(|| {
             PickerError::Io(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -235,8 +236,8 @@ fn default_pod_store_dir() -> Result<PathBuf, PickerError> {
         })
 }
 
-pub(crate) fn live_socket_for_pod(worker_name: &str) -> Option<PathBuf> {
-    worker_list_live_socket_for_pod(worker_name)
+pub(crate) fn live_socket_for_worker(worker_name: &str) -> Option<PathBuf> {
+    worker_list_live_socket_for_worker(worker_name)
 }
 
 fn make_inline_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {

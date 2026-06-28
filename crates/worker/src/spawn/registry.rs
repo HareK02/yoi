@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use manifest::{Permission, ScopeRule, SharedScope};
-use pod_store::{
+use session_store::{
     WorkerMetadataStore, WorkerReclaimedChild, WorkerSpawnedChild, WorkerSpawnedScopeRule,
     WorkerStoreError,
 };
@@ -30,7 +30,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::runtime::dir::{RuntimeDir, SpawnedWorkerRecord};
-use crate::runtime::pod_registry;
+use crate::runtime::worker_allocation;
 
 type RegistryStateWriter = Arc<dyn Fn(&[SpawnedWorkerRecord]) -> io::Result<()> + Send + Sync>;
 type RegistryReclaimWriter = Arc<dyn Fn(&SpawnedWorkerRecord) -> io::Result<()> + Send + Sync>;
@@ -339,11 +339,11 @@ fn reclaim_record(
         .cloned()
         .collect::<Vec<_>>();
 
-    let lock_path = pod_registry::default_registry_path()
+    let lock_path = worker_allocation::default_allocation_path()
         .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-    let mut guard = pod_registry::LockFileGuard::open(&lock_path)
+    let mut guard = worker_allocation::LockFileGuard::open(&lock_path)
         .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-    pod_registry::reclaim_delegated_scope(
+    worker_allocation::reclaim_delegated_scope(
         &mut guard,
         parent_name,
         &record.worker_name,
@@ -361,12 +361,12 @@ fn reclaim_record(
 }
 
 fn release_child_allocation(worker_name: &str) -> io::Result<()> {
-    let lock_path = pod_registry::default_registry_path()
+    let lock_path = worker_allocation::default_allocation_path()
         .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-    let mut guard = pod_registry::LockFileGuard::open(&lock_path)
+    let mut guard = worker_allocation::LockFileGuard::open(&lock_path)
         .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-    match pod_registry::release_worker(&mut guard, worker_name) {
-        Ok(()) | Err(pod_registry::ScopeLockError::UnknownWorker(_)) => Ok(()),
+    match worker_allocation::release_worker(&mut guard, worker_name) {
+        Ok(()) | Err(worker_allocation::ScopeLockError::UnknownWorker(_)) => Ok(()),
         Err(err) => Err(io::Error::new(io::ErrorKind::Other, err)),
     }
 }

@@ -9,7 +9,7 @@ use llm_engine::llm_client::event::{ErrorEvent, Event as LlmEvent, ResponseStatu
 use llm_engine::llm_client::types::Item;
 use llm_engine::llm_client::{ClientError, LlmClient, Request};
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
-use pod_store::{CombinedStore, FsWorkerStore};
+use session_store::{CombinedStore, FsWorkerStore};
 use session_store::{FsStore, LogEntry};
 
 use worker::{Event, Method, Worker, WorkerController, WorkerHandle, WorkerManifest, WorkerStatus};

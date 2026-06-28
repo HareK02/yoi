@@ -14,13 +14,11 @@ async-trait = { workspace = true }
 clap = { version = "4.6.0", features = ["derive"] }
 llm-engine = { workspace = true }
 session-store = { workspace = true }
-pod-store = { workspace = true }
 manifest = { workspace = true }
 mcp = { workspace = true }
 protocol = { workspace = true }
 provider = { workspace = true }
 client = { workspace = true }
-pod-registry = { workspace = true }
 worker-runtime = { workspace = true, features = ["ws-server"], optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

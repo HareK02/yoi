@@ -10,7 +10,7 @@ Owns:
 
 - Worker lifecycle and socket protocol serving
 - Engine construction around a resolved Manifest
-- session-store and pod-store coordination
+- session-store and session-store worker metadata coordination
 - built-in tool registration under scope/policy
 - spawned-child orchestration hooks
 
@@ -19,7 +19,7 @@ Does not own:
 - provider-specific wire formats (`provider` / `llm-engine` clients)
 - product CLI parsing (`yoi`)
 - TUI display authority (`tui`)
-- current-state storage schema outside Worker metadata (`pod-store`)
+- current-state storage schema outside Worker metadata (`session-store` worker metadata)
 
 ## Design notes
 

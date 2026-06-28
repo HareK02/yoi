@@ -5,8 +5,8 @@
 //! cargo run -p worker --example worker_protocol
 //! ```
 
-use pod_store::{CombinedStore, FsWorkerStore};
 use session_store::FsStore;
+use session_store::{CombinedStore, FsWorkerStore};
 use worker::{Event, Method, WorkerController};
 
 fn manifest_toml(pwd: &std::path::Path) -> String {

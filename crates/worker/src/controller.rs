@@ -5,8 +5,8 @@ use std::sync::atomic::Ordering;
 use llm_engine::EngineError;
 use llm_engine::llm_client::client::LlmClient;
 use manifest::TicketFeatureAccessConfig;
-use pod_store::WorkerMetadataStore;
 use session_store::Store;
+use session_store::WorkerMetadataStore;
 use ticket::LocalTicketBackend;
 use ticket::config::TicketConfig;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -608,7 +608,7 @@ where
     let spawner_name = worker.manifest().worker.name.clone();
     let spawner_manifest = worker.manifest().clone();
     let prompts = worker.prompts().clone();
-    let pod_store = worker.store().clone();
+    let worker_metadata_store = worker.store().clone();
     let self_parent_socket = worker.callback_socket().cloned();
 
     // The Worker's SharedScope (already augmented with the bash-output
@@ -724,8 +724,13 @@ where
             worker.register_tool(send_to_worker_tool(spawned_registry.clone()));
             worker.register_tool(read_worker_output_tool(spawned_registry.clone()));
             worker.register_tool(stop_worker_tool(spawned_registry.clone()));
-            let discovery =
-                WorkerDiscovery::new(pod_store, spawner_name, runtime_base, cwd, spawned_registry);
+            let discovery = WorkerDiscovery::new(
+                worker_metadata_store,
+                spawner_name,
+                runtime_base,
+                cwd,
+                spawned_registry,
+            );
             worker.register_tool(list_workers_tool(discovery.clone()));
             worker.register_tool(restore_worker_tool(discovery.clone()));
             worker.register_tool(send_to_peer_worker_tool(discovery));
