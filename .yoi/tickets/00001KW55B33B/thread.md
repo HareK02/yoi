@@ -593,3 +593,19 @@ Known non-blocking warning:
 Cleanup は child implementation worktree / branch と related role Pods のみを対象に実施する。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-28T06:02:16Z -->
+
+## Implementation report
+
+Cleanup report:
+
+- User instructed to stop using `StopPod` for now after repeated stop/hang symptoms. Role Pod shutdown was therefore intentionally skipped.
+- Child implementation worktree was removed:
+  - `/home/hare/Projects/yoi/.worktree/00001KW55B33B-worker-runtime-worker-adapter`
+- Child implementation branch was removed:
+  - `work/00001KW55B33B-worker-runtime-worker-adapter`
+- No root/original workspace cleanup was performed.
+- Orchestration worktree is clean after worktree/branch cleanup.
+
+---
