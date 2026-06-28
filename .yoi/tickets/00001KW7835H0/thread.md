@@ -311,3 +311,40 @@ Requested fixes:
 - run focused validation and commit fixes
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KW7835H0-pod-fix at: 2026-06-28T19:55:08Z -->
+
+## Implementation report
+
+Change-response implementation report:
+
+Reviewer blockers を修正し、追加 commit を作成済み。Ticket ファイル編集、merge、close、cleanup は未実施。
+
+Commit:
+- `c46e880b fix: finish worker wording cleanup`
+
+変更内容:
+- `crates/yoi/src/worker_cleanup_cli.rs`
+  - `yoi worker delete` の refusal 出力を `pod:` から `worker:` に修正。
+- `crates/worker/src/runtime/worker_allocation/error.rs`
+  - active/user-facing error 文言を旧 Pod 表現から Worker/allocation 表現に修正。
+  - `pod name`, `conflicts with pod`, `pod ... not registered`, `held by pod` を置換。
+- `tests/e2e/src/lib.rs`
+  - E2E artifact 名と fixture metadata path を Worker/allocation/metadata 表現に更新。
+  - `tested_yoi_pod_registry` -> `tested_yoi_worker_allocation`
+  - `fixture_pod_metadata_root` -> `fixture_worker_metadata_root`
+  - fixture path `yoi/pods/...` -> `yoi/workers/...`
+  - helper 名を `write_blocking_worker_metadata` に更新。
+
+Validation:
+- `cargo fmt`: success
+- `cargo test -p worker`: success
+- `cargo check -p yoi`: success
+- `cargo check -p yoi-e2e`: success
+- `git diff --check`: success
+- 対象旧表現の `rg` 確認: success
+
+Final state:
+- child worktree is clean.
+
+---
