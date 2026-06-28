@@ -699,3 +699,22 @@ Operational note:
 - User instructed not to use `StopPod` for now after repeated stop/hang symptoms. Cleanup will skip role-Pod shutdown and remove only child implementation worktree / branch.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-28T18:39:24Z -->
+
+## Implementation report
+
+Cleanup report:
+
+- User instructed not to use `StopPod` for now after repeated stop/hang symptoms. Role Pod shutdown was intentionally skipped.
+- Child implementation worktree was removed:
+  - `/home/hare/Projects/yoi/.worktree/00001KW7726H9-runtime-worker-launch-unification`
+- Child implementation branch was removed:
+  - `work/00001KW7726H9-runtime-worker-launch-unification`
+- No root/original workspace cleanup was performed.
+- Orchestration worktree is clean after worktree/branch cleanup.
+
+Routing note:
+- Tickets that were queued behind `00001KW7726H9` can now be re-evaluated.
+
+---
