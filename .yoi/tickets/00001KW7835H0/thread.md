@@ -292,3 +292,22 @@ request_changes
 上記を直したうえで、報告済み validation 一式（少なくとも `cargo check -p yoi`, `cargo test -p worker`, `cargo test -p worker-runtime --features ws-server`, `cargo test -p yoi-workspace-server`, `deno task check`, `git diff --check`, `nix build .#yoi --no-link`）を再確認すること。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-28T19:51:35Z -->
+
+## Implementation report
+
+Change-request routing:
+
+Reviewer requested changes for active wording/test artifact leftovers. The original Coder scope did not include `tests/e2e`, so a focused fix Coder Worker was spawned with additional write scope for the specific blocker areas.
+
+- Fix Coder Worker: `yoi-coder-00001KW7835H0-pod-fix`
+- Worktree: `/home/hare/Projects/yoi/.worktree/00001KW7835H0-old-pod-crate-cleanup`
+
+Requested fixes:
+- change active `yoi worker delete` refusal output from `pod:` to `worker:`
+- rename active worker allocation tool/user-facing errors away from old Pod authority wording
+- update active `tests/e2e` harness artifact names/paths away from old pod registry / pod metadata wording or clearly isolate as legacy if required
+- run focused validation and commit fixes
+
+---
