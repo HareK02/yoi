@@ -521,3 +521,44 @@ remote projection でも Runtime response の `execution.backend`, `run_state`, 
 重い validation（cargo / nix）は再実行していない。reported validation は未再現。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KW7726H9-launch-unify at: 2026-06-28T18:35:12Z -->
+
+## Implementation report
+
+Change-response implementation report:
+
+Reviewer の remote Runtime projection blocker を修正し、追加 commit を作成済み。Ticket ファイル編集、merge、close、cleanup は未実施。
+
+Commit:
+- `ba7f9d2ee83a946820cc234e847b6531b4a141f3 workspace: respect remote execution projection`
+
+Note:
+- Coder output initially reported a different SHA prefix, but `git rev-parse HEAD` confirmed the actual commit above.
+
+変更内容:
+
+- `crates/workspace-server/src/hosts.rs` の remote Runtime projection で、Runtime HTTP の `WorkerSummary` / `WorkerDetail.execution` を反映するように修正。
+- remote projection の `can_accept_input` / `can_stop` は embedded projection と同様に以下を確認する。
+  - Worker status が `running`
+  - `execution.backend == connected`
+  - input は `execution.run_state == idle`
+  - `rejected` / `errored` / `unconnected` / `stopped` などの実行状態は操作不可
+  - `last_result` が `rejected` / `errored` / `unsupported` の場合は操作不可
+- remote Worker の表示 status も execution status を反映し、`stale` / `unconnected` / `rejected` / `errored` を投影する。
+- remote Runtime の stale / unconnected / rejected / errored projection が input-capable / stoppable にならないことを確認する tests を追加。
+- 既存 remote connected projection test に、connected idle の場合だけ input / stop capable になる確認を追加。
+
+Validation:
+- `cargo fmt`: success
+- `cargo test -p yoi-workspace-server`: success
+- `cargo test -p worker-runtime --features ws-server`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi`: success
+
+Residual risks / review focus:
+- remote Runtime の `execution` projection を信頼して UI/API capability を決めるため、remote 側が古い schema や不正な execution state を返す場合は deserialize / request failure として扱われる。
+- stale / unconnected は明示的に input-capable ではなくなるため、既存 UI が「remote worker は常に入力可」と仮定している場合は表示 / 操作導線の調整が必要になる可能性がある。
+
+---
