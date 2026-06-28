@@ -13,7 +13,6 @@ export type ConsoleLineKind =
   | "status"
   | "error"
   | "usage"
-  | "snapshot"
   | "in_flight"
   | "system";
 
@@ -24,7 +23,7 @@ export type ConsoleLine = {
   body: string;
   detail?: string;
   cursor?: string | null;
-  source: "transcript" | "event";
+  source: "initial" | "live";
   streaming?: boolean;
   error?: boolean;
 };
@@ -53,23 +52,22 @@ export function workerConsolePath(runtimeId: string, workerId: string): string {
   return workerConsoleHref({ runtime_id: runtimeId, worker_id: workerId });
 }
 
-export function transcriptLines(items: WorkerTranscriptItem[]): ConsoleLine[] {
+export function initialConsoleLines(items: WorkerTranscriptItem[]): ConsoleLine[] {
   return items.map((item) => ({
-    id: `transcript-${item.event_id}-${item.sequence}`,
-    kind: transcriptRoleKind(item.role),
-    title: `${item.role} · transcript #${item.sequence}`,
+    id: `initial-${item.event_id}-${item.sequence}`,
+    kind: initialRoleKind(item.role),
+    title: item.role,
     body: item.content,
-    detail: `event ${item.event_id}`,
-    source: "transcript",
+    source: "initial",
   }));
 }
 
 export function projectConsole(
-  transcript: WorkerTranscriptItem[],
+  initialItems: WorkerTranscriptItem[],
   events: Array<{ cursor: string; event: ProtocolEvent }> = [],
 ): ConsoleProjection {
   return events.reduce(applyProtocolEvent, {
-    lines: transcriptLines(transcript),
+    lines: initialConsoleLines(initialItems),
     status: null,
     usage: null,
     lastCursor: null,
@@ -208,15 +206,6 @@ export function applyProtocolEvent(
       break;
     case "snapshot":
       next.status = event.data.status;
-      next.lines.push(
-        line(
-          envelope.cursor,
-          "snapshot",
-          `snapshot · ${event.data.status}`,
-          `${event.data.entries.length} entries · ${event.data.greeting.provider} / ${event.data.greeting.model}`,
-          `${event.data.greeting.worker_name} · context ${event.data.greeting.context_tokens}/${event.data.greeting.context_window}`,
-        ),
-      );
       for (const block of event.data.in_flight?.blocks ?? []) {
         next.lines.push(inFlightLine(envelope.cursor, block));
       }
@@ -443,7 +432,7 @@ export function segmentsToText(segments: Segment[]): string {
     .join("\n");
 }
 
-function transcriptRoleKind(role: string): ConsoleLineKind {
+function initialRoleKind(role: string): ConsoleLineKind {
   if (role === "user" || role === "assistant" || role === "system") {
     return role;
   }
@@ -466,7 +455,7 @@ function line(
     body,
     detail,
     cursor,
-    source: "event",
+    source: "live",
     streaming,
     error,
   };

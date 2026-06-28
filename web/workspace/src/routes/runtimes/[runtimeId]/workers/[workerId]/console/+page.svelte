@@ -38,6 +38,7 @@
   let sendError = $state<string | null>(null);
   let streamState = $state<'connecting' | 'open' | 'closed' | 'error'>('connecting');
   let streamDiagnostics = $state<Diagnostic[]>([]);
+  let workerDetailsOpen = $state(false);
   let observedEvents = $state<Array<{ cursor: string; event: ClientWorkerEventWsFrame & { kind: 'event' } }>>([]);
   let nextReloadToken = 0;
   let reloadToken = $state(0);
@@ -136,11 +137,6 @@
     nextReloadToken += 1;
     reloadToken = nextReloadToken;
     return nextReloadToken;
-  }
-
-  async function refreshConsole() {
-    advanceReloadToken();
-    await loadConsoleData(consoleTarget);
   }
 
   async function sendMessage(event: SubmitEvent) {
@@ -283,33 +279,27 @@
   <main class="shell console-shell worker-console-shell">
     <section class="console-header card">
       <div>
-        <p class="eyebrow">Worker attach Console</p>
         <h2>{worker?.label ?? workerId}</h2>
-        <p class="section-note">
-          Target authority is <code>runtime_id</code> + <code>worker_id</code>. Browser traffic uses Workspace Backend Worker APIs only;
-          Runtime endpoints, credentials, socket paths, and session paths are not exposed.
-        </p>
       </div>
-      <div class="console-status-pill" class:warn={streamState !== 'open'}>
-        {worker?.state ?? 'unknown'} · {worker?.status ?? 'loading'} · stream {streamState}
+      <div class="console-header-actions">
+        <div class="console-status-pill" class:warn={streamState !== 'open'}>
+          {worker?.state ?? 'unknown'} · {worker?.status ?? 'loading'} · stream {streamState}
+        </div>
+        <button type="button" class="secondary-button" aria-expanded={workerDetailsOpen} onclick={() => workerDetailsOpen = !workerDetailsOpen}>
+          Details
+        </button>
       </div>
     </section>
 
-    <section class="console-grid">
-      <article class="card transcript-card worker-transcript-card">
-        <header class="transcript-toolbar">
-          <div>
-            <h3>Transcript and protocol events</h3>
-            {#if projection.status || projection.usage}
-              <p class="section-note">
-                {#if projection.status}status: {projection.status}{/if}
-                {#if projection.status && projection.usage} · {/if}
-                {#if projection.usage}usage: {projection.usage}{/if}
-              </p>
-            {/if}
-          </div>
-          <button type="button" class="secondary-button" onclick={refreshConsole}>Refresh</button>
-        </header>
+    <section class="console-body">
+      <article class="card console-card worker-console-card">
+        {#if projection.status || projection.usage}
+          <p class="section-note">
+            {#if projection.status}status: {projection.status}{/if}
+            {#if projection.status && projection.usage} · {/if}
+            {#if projection.usage}usage: {projection.usage}{/if}
+          </p>
+        {/if}
 
         {#if workerError}
           <p class="error">{workerError}</p>
@@ -319,21 +309,26 @@
         {/if}
 
         {#if lines.length === 0}
-          <p>No transcript items or observation events are available for this Worker yet.</p>
+          <p>No console output is available for this Worker yet.</p>
         {:else}
-          <ol class="transcript worker-transcript">
+          <ol class="console-log">
             {#each lines as item}
               <li class:assistant={lineClass(item) === 'assistant'} class:user={lineClass(item) === 'user'} class:system={lineClass(item) !== 'assistant' && lineClass(item) !== 'user'} class:error-line={item.error}>
-                <div class="message-heading">
-                  <span>{item.title}</span>
-                  <small>{item.source}{item.streaming ? ' · streaming' : ''}</small>
-                </div>
+                {#if lineClass(item) !== 'assistant' && lineClass(item) !== 'user'}
+                  <div class="message-heading">
+                    <span>{item.title}</span>
+                    {#if item.streaming}<small>streaming</small>{/if}
+                  </div>
+                {:else if item.streaming}
+                  <div class="message-heading streaming-heading">
+                    <small>streaming</small>
+                  </div>
+                {/if}
                 <pre>{item.body || '—'}</pre>
-                {#if item.detail || item.cursor}
+                {#if item.detail}
                   <details class="message-detail">
-                    <summary>metadata</summary>
-                    {#if item.detail}<p>{item.detail}</p>{/if}
-                    {#if item.cursor}<code>{item.cursor}</code>{/if}
+                    <summary>detail</summary>
+                    <p>{item.detail}</p>
                   </details>
                 {/if}
               </li>
@@ -342,8 +337,14 @@
         {/if}
       </article>
 
-      <aside class="console-side-card card">
-        <h3>Worker detail</h3>
+    </section>
+
+    {#if workerDetailsOpen}
+      <aside class="console-side-panel" aria-label="Worker detail">
+        <header class="side-panel-header">
+          <h3>Worker detail</h3>
+          <button type="button" class="secondary-button" onclick={() => workerDetailsOpen = false}>Close</button>
+        </header>
         {#if worker}
           <dl>
             <div>
@@ -398,14 +399,13 @@
           </details>
         {/if}
       </aside>
-    </section>
+    {/if}
 
     <form class="console-composer card" onsubmit={sendMessage}>
-      <label for="worker-console-message">Send user input</label>
       <textarea
         id="worker-console-message"
+        aria-label="Console input"
         bind:value={draft}
-        placeholder={worker?.capabilities.can_accept_input ? 'Message this Worker through the Backend input API…' : 'Input is unsupported for this Worker'}
         disabled={!worker?.capabilities.can_accept_input || sending}
       ></textarea>
       <div class="composer-actions">

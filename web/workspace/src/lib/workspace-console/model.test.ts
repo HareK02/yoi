@@ -45,7 +45,7 @@ Deno.test("segmentsToText preserves protocol segment semantics", () => {
   );
 });
 
-Deno.test("projectConsole keeps transcript and protocol-derived event rows distinct", () => {
+Deno.test("projectConsole projects initial console output and live protocol rows", () => {
   const projection = projectConsole(
     [
       {
@@ -101,15 +101,15 @@ Deno.test("projectConsole keeps transcript and protocol-derived event rows disti
 
   assert(
     projection.lines.some((line) =>
-      line.source === "transcript" && line.kind === "user"
+      line.source === "initial" && line.kind === "user"
     ),
-    "transcript user row expected",
+    "initial user row expected",
   );
   assert(
     projection.lines.some((line) =>
-      line.source === "event" && line.kind === "assistant"
+      line.source === "live" && line.kind === "assistant"
     ),
-    "assistant event row expected",
+    "assistant live row expected",
   );
   assert(
     projection.lines.some((line) => line.kind === "thinking"),
@@ -133,7 +133,7 @@ Deno.test("projectConsole keeps transcript and protocol-derived event rows disti
   );
 });
 
-Deno.test("projectConsole displays snapshot and in-flight state", () => {
+Deno.test("projectConsole uses snapshot for state without rendering it as console output", () => {
   const projection = projectConsole([], [
     {
       cursor: "20",
@@ -171,8 +171,8 @@ Deno.test("projectConsole displays snapshot and in-flight state", () => {
 
   assert(projection.status === "running", "snapshot should update status");
   assert(
-    projection.lines.some((line) => line.kind === "snapshot"),
-    "snapshot row expected",
+    !projection.lines.some((line) => line.title.includes("snapshot")),
+    "snapshot should not render as a console row",
   );
   assert(
     projection.lines.filter((line) => line.kind === "in_flight").length === 2,
