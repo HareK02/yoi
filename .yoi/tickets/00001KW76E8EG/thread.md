@@ -214,3 +214,48 @@ Review focus:
 - focused tests cover these behaviors
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KW76E8EG-fs-store at: 2026-06-28T19:15:12Z status: approve -->
+
+## Review: approve
+
+approve
+
+Ticket `00001KW76E8EG` の意図・受け入れ条件に対して、実装は妥当です。ブロッカーは見つかりませんでした。
+
+## 確認した主な根拠
+
+- `workspace-server` が `worker-runtime` の `fs-store` feature を有効化していることを確認。
+  - `crates/workspace-server/Cargo.toml`
+- `ServerConfig` に `embedded_runtime_store_root` が追加され、通常の `local_dev` 設定では project records / `.yoi/tickets` ではなく、ユーザーデータ配下の workspace id ベースの領域を既定 root にしていることを確認。
+  - `crates/workspace-server/src/server.rs`
+- 通常の `WorkspaceApi::new` / `new_with_execution_backend` 経路が `EmbeddedWorkerRuntime::new_fs_store_with_execution_backend(...)` を使い、memory store ではなく fs-store backed runtime を構築していることを確認。
+  - `crates/workspace-server/src/server.rs`
+  - `crates/workspace-server/src/hosts.rs`
+- `EmbeddedWorkerRuntime` 側で `EmbeddedRuntimeStore::fs_store(store_root)` + `WorkerRuntime::with_options(..., RuntimeOptions::ws_server())` を使う経路が追加されていることを確認。
+- restart 後の復元について、テストで以下が確認されていることを確認。
+  - catalog / worker snapshot が復元される
+  - `ConfigBundle` が復元される
+  - transcript が復元される
+  - restart 後の execution handle は接続済み扱いにならず、stale/unconnected diagnostic となる
+  - restart 後に input を送っても接続済み実行 handle として扱われない
+- Browser/API projection について、serialized response に store root/raw path/handle などが混入しないことを確認するテストが追加されていることを確認。
+- production 経路については、通常 `WorkspaceApi` の生成経路が fs-store を使っており、memory-backed runtime に戻る変更は見当たりませんでした。memory constructor は低レベル/テスト用途として残っていますが、通常 server path からは使われていません。
+
+## 実行した検証
+
+read-only 方針に合わせ、worktree 内のソース/Ticket は変更せず、`CARGO_TARGET_DIR` を `/run/user/.../target-review` に逃がして検証しました。
+
+- `git diff --check HEAD^ HEAD`: success
+- `cargo fmt --all -- --check`: success
+- `CARGO_TARGET_DIR=/run/user/1000/yoi/yoi-reviewer-00001KW76E8EG-fs-store/target-review cargo test -p yoi-workspace-server`: success
+- `CARGO_TARGET_DIR=/run/user/1000/yoi/yoi-reviewer-00001KW76E8EG-fs-store/target-review cargo test -p worker-runtime --features ws-server,fs-store`: success
+- `CARGO_TARGET_DIR=/run/user/1000/yoi/yoi-reviewer-00001KW76E8EG-fs-store/target-review cargo check -p yoi`: success
+
+検証後の `git status --short` も clean でした。
+
+## 残リスク
+
+- `nix build .#yoi` は reviewer 側では再実行していません。ただし `Cargo.lock` / `package.nix` の更新と Rust 側の check/test は整合しており、報告されているビルド系コマンドは十分 plausible と判断します。
+
+---
