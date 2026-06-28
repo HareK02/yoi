@@ -254,6 +254,7 @@ pub struct ExtensionPoints {
 pub struct ExtensionPointState {
     pub status: String,
     pub note: String,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -339,6 +340,8 @@ async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<Worksp
         .as_ref()
         .map(|record| record.display_name.clone())
         .unwrap_or_else(|| api.config.workspace_display_name.clone());
+    let companion_status = api.companion.status();
+    let companion_console = companion_console_extension_point(&companion_status);
     Ok(Json(WorkspaceResponse {
         workspace_id: api.config.workspace_id.clone(),
         display_name,
@@ -350,17 +353,46 @@ async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<Worksp
             event_stream: ExtensionPointState {
                 status: "backend_proxy".to_string(),
                 note: "Worker observation streams are exposed only through the Workspace server proxy keyed by runtime_id + worker_id; browser clients never receive raw Runtime endpoints or socket paths.".to_string(),
+                diagnostics: Vec::new(),
             },
             host_worker_bridge: ExtensionPointState {
                 status: "runtime_registry".to_string(),
                 note: "Hosts and Workers are projected from the Workspace RuntimeRegistry; raw Runtime endpoints, sockets, and local metadata paths are not exposed.".to_string(),
+                diagnostics: Vec::new(),
             },
-            companion_console: ExtensionPointState {
-                status: "not_connected".to_string(),
-                note: "Workspace Companion is visible as an embedded Worker, but browser input is disabled until actual Worker/LLM execution is connected.".to_string(),
-            },
+            companion_console,
         },
     }))
+}
+
+fn companion_console_extension_point(status: &CompanionStatusResponse) -> ExtensionPointState {
+    let completion = status.transport.completion.clone();
+    let note = match completion.as_str() {
+        "connected" => "Workspace Companion is input-capable and browser input is dispatched through the normal Worker runtime path.".to_string(),
+        "not_input_capable" => {
+            let diagnostic_codes = status
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if diagnostic_codes.is_empty() {
+                "Workspace Companion is not input-capable; check provider, config, profile, secret, and authority diagnostics.".to_string()
+            } else {
+                format!(
+                    "Workspace Companion is not input-capable; check typed diagnostics: {diagnostic_codes}."
+                )
+            }
+        }
+        other => format!(
+            "Workspace Companion transport reports {other}; browser input follows the Companion Worker runtime capability state."
+        ),
+    };
+    ExtensionPointState {
+        status: completion,
+        note,
+        diagnostics: status.diagnostics.clone(),
+    }
 }
 
 async fn list_tickets(
@@ -1132,6 +1164,24 @@ mod tests {
             workspace["extension_points"]["host_worker_bridge"]["status"],
             "runtime_registry"
         );
+        let workspace_companion = &workspace["extension_points"]["companion_console"];
+        assert_ne!(workspace_companion["status"], "not_connected");
+        assert!(
+            !workspace_companion["note"]
+                .as_str()
+                .unwrap()
+                .contains("browser input remains disabled"),
+            "stale Companion Console note returned: {workspace_companion}"
+        );
+        if workspace_companion["status"] == "not_input_capable" {
+            assert!(
+                !workspace_companion["diagnostics"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                "not_input_capable workspace companion_console lacks typed diagnostics: {workspace_companion}"
+            );
+        }
 
         let tickets = get_json(app.clone(), "/api/tickets").await;
         assert_eq!(tickets["items"][0]["id"], "00000000001J2");
@@ -1358,6 +1408,22 @@ mod tests {
         .await
         .unwrap();
         let app = build_router(api);
+
+        let workspace = get_json(app.clone(), "/api/workspace").await;
+        let workspace_companion = &workspace["extension_points"]["companion_console"];
+        assert_eq!(workspace_companion["status"], "connected");
+        assert!(
+            workspace_companion["diagnostics"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            workspace_companion["note"]
+                .as_str()
+                .unwrap()
+                .contains("normal Worker runtime path")
+        );
 
         let status = get_json(app.clone(), "/api/companion/status").await;
         assert_eq!(status["transport"]["completion"], "connected");
