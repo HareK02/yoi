@@ -459,3 +459,113 @@ read-only で再レビューした。対象 HEAD は `fdd902d5 fix: align e2e wo
 ブロッカーはない。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-28T20:10:03Z -->
+
+## Implementation report
+
+Merge / validation report:
+
+Implementation branch was integrated into the orchestration branch after reviewer approval.
+
+Integrated commits:
+- `17a9488a4aa0a3dc83be2d3360b6ffd8ffcaeb5a refactor: remove old pod crates`
+- `c46e880b fix: finish worker wording cleanup`
+- `fdd902d5 fix: align e2e worker metadata root`
+
+Merge commit:
+- `83d433bf merge: old pod crate cleanup`
+
+Validation in orchestration worktree:
+- `cargo fmt --all --check`: success
+- `cargo test -p worker-runtime --features ws-server`: success
+- `cargo test -p yoi-workspace-server`: success
+- `cargo test -p worker`: success
+- `cargo test -p session-store`: success
+- `cargo check -p yoi`: success
+- `cargo check -p yoi-e2e`: success
+- `cd web/workspace && deno task check`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Outcome:
+- `crates/pod-registry` and `crates/pod-store` were removed from workspace/package/lock/source.
+- `crates/pod` remains absent.
+- Worker metadata store responsibility moved to `session-store::worker_metadata` under Worker naming.
+- Runtime allocation implementation now lives under `worker::runtime::worker_allocation` and is documented as scope allocation, not Runtime Worker identity/creation/durable-persistence authority.
+- Active CLI/tool/test output was renamed away from old Pod authority wording.
+- E2E worker metadata fixture now uses the active `$HOME/.yoi/workers` data root resolution rather than `XDG_DATA_HOME/yoi/workers`.
+- Runtime Worker identity / creation / persistence remains `worker-runtime` fs-store + execution backend mapping authority.
+- No stale compatibility alias preserving old Pod store authority was introduced.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-28T20:10:12Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Reviewer approval後に implementation branch を orchestration branch へ merge し、要求された validation が成功したため done に遷移する。
+
+Validation:
+- `cargo fmt --all --check`: success
+- `cargo test -p worker-runtime --features ws-server`: success
+- `cargo test -p yoi-workspace-server`: success
+- `cargo test -p worker`: success
+- `cargo test -p session-store`: success
+- `cargo check -p yoi`: success
+- `cargo check -p yoi-e2e`: success
+- `cd web/workspace && deno task check`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-28T20:10:27Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-28T20:10:27Z status: closed -->
+
+## 完了
+
+旧 Pod 関連 crate を削除し、Worker/Runtime/session-store 境界へ整理した実装を reviewer approval 後に orchestration branch へ merge した。
+
+実装内容:
+- `crates/pod-registry` と `crates/pod-store` を workspace / package / lock / source から削除。
+- `crates/pod` は引き続き absent。
+- `pod-store` 相当の Worker metadata persistence を `session-store::worker_metadata` へ移管。
+- Worker metadata root を active Worker data root 側へ整理。
+- `pod-registry` 相当の scope allocation 実装を `worker::runtime::worker_allocation` へ移管し、Runtime Worker identity / creation / durable persistence authority ではないことを明記。
+- active CLI / tool / test artifact output を旧 Pod authority wording から Worker / allocation / metadata wording へ変更。
+- TUI / yoi / worker の active old crate dependency を削除。
+- E2E fixture の Worker metadata root を active `manifest::paths::data_dir()` default resolution と整合する `$HOME/.yoi/workers` に変更。
+- Runtime Worker identity / creation / persistence authority は `worker-runtime` fs-store + execution backend mapping のまま維持。
+- old Pod registry/store/socket/name を active authority として残す互換 alias は導入していない。
+
+Integrated commits:
+- `17a9488a4aa0a3dc83be2d3360b6ffd8ffcaeb5a refactor: remove old pod crates`
+- `c46e880b fix: finish worker wording cleanup`
+- `fdd902d5 fix: align e2e worker metadata root`
+- merge: `83d433bf merge: old pod crate cleanup`
+
+Validation:
+- `cargo fmt --all --check`: success
+- `cargo test -p worker-runtime --features ws-server`: success
+- `cargo test -p yoi-workspace-server`: success
+- `cargo test -p worker`: success
+- `cargo test -p session-store`: success
+- `cargo check -p yoi`: success
+- `cargo check -p yoi-e2e`: success
+- `cd web/workspace && deno task check`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Operational note:
+- User instructed not to use `StopPod` for now after repeated stop/hang symptoms. Cleanup will skip role-Pod shutdown and remove only child implementation worktree / branch.
+
+---
