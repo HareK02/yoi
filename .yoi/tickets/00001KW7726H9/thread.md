@@ -346,3 +346,28 @@ Residual risks / review focus:
 - create 成功後の永続化失敗時に、すでに execution backend が外部 worker を spawn 済みであるケースの完全補償は今後さらに詰める余地がある。今回の実装では spawn / initial input rejection は rollback し、成功時だけ durable persistence する。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-28T17:46:31Z -->
+
+## Implementation report
+
+Review kickoff:
+
+Reviewer Worker spawned for `00001KW7726H9` implementation.
+
+- Reviewer Worker: `yoi-reviewer-00001KW7726H9-launch-unify`
+- Review target commit: `14bb4934a6374eea64591035e5342088ab0ccd09 runtime: unify worker creation path`
+- Review mode: read-only implementation worktree review
+
+Review focus:
+- Runtime worker creation uses canonical ConfigBundle + ExecutionBackend path
+- Browser-facing launch semantics are separated from Runtime `CreateWorkerRequest`
+- create request fields are justified against source / scope-access / visibility / persistence-projection / retry / validation / existing type / failure
+- no raw workspace / cwd / tool scope / config store / secret / socket / path leaks
+- ConfigBundle missing / digest mismatch / profile mismatch / execution backend missing / provider-secret failure produce typed diagnostics
+- input-capable Workers require execution backend
+- create is persistent/transactional enough, with rollback on spawn / initial input rejection
+- embedded / Companion / remote-facing creation share the canonical path
+- no fake/providerless assistant response bypass
+
+---
