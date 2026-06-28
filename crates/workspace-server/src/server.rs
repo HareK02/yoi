@@ -1284,30 +1284,20 @@ mod tests {
             json!({ "content": "hello companion" }),
         )
         .await;
-        assert_eq!(companion_message["state"], "rejected");
-        assert!(
-            companion_message["transcript"]["items"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(companion_message["state"], "accepted");
+        assert_eq!(companion_message["user_item"]["role"], "user");
+        assert_eq!(companion_message["user_item"]["content"], "hello companion");
         assert!(
             !companion_message
                 .to_string()
                 .contains("companion_llm_not_connected"),
             "legacy non-execution diagnostic leaked: {companion_message}"
         );
-        assert!(
-            !companion_message["diagnostics"]
-                .as_array()
-                .unwrap()
-                .is_empty(),
-            "missing typed diagnostic for non-input-capable Companion: {companion_message}"
-        );
+        assert!(!companion_message.to_string().contains("providerless"));
         assert!(!companion_message.to_string().contains("/workspace/demo"));
 
         let companion_transcript = get_json(app.clone(), "/api/companion/transcript").await;
-        assert_eq!(companion_transcript["total_items"], 0);
+        assert!(companion_transcript["total_items"].as_u64().unwrap() >= 1);
 
         let host_workers = get_json(app.clone(), &format!("/api/hosts/{host_id}/workers")).await;
         assert!(
