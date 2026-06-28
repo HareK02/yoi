@@ -6038,6 +6038,7 @@ dependencies = [
  "axum",
  "chrono",
  "futures",
+ "manifest",
  "project-record",
  "protocol",
  "reqwest",
