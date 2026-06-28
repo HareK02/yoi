@@ -93,3 +93,31 @@ Operational note:
 Queue continuation requested by user. Dependency `00001KW55B33B` is closed with merge and validation complete, so this Ticket has no remaining blockers. Accepting implementation before child worktree / role Pod side effects.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-28T06:03:56Z -->
+
+## Implementation report
+
+Implementation kickoff:
+
+- Worktree created: `/home/hare/Projects/yoi/.worktree/00001KW55B33H-workspace-companion-llm-worker`
+- Branch: `work/00001KW55B33H-workspace-companion-llm-worker`
+- Coder Worker spawned: `yoi-coder-00001KW55B33H-companion-llm`
+
+Scope notes:
+- Coder write scope is limited to `crates/workspace-server/**`, `crates/worker/**`, `crates/worker-runtime/**`, `web/workspace/**`, `resources/profiles/**`, `resources/prompts/**`, root `Cargo.toml`, `Cargo.lock`, and `package.nix` if dependency/package changes are needed.
+- Coder is instructed not to modify Ticket records and not to operate in root/orchestration worktrees.
+
+Implementation focus:
+- bootstrap `workspace_companion` as an executable Worker using embedded Runtime + `worker/runtime-adapter`
+- normal Worker list / Worker Console attach path via `runtime_id + worker_id`
+- Send through Backend Worker input API to real Worker run lifecycle
+- no fake/providerless Companion response
+- provider/profile/model/secret/authority absence as typed diagnostic and not input-capable
+- `/api/companion/messages`, if retained, must not be a separate fake response path
+- preserve Browser-facing non-leak of raw handles, paths, credentials, secret refs, and raw manifest paths
+
+Operational note:
+- User instructed not to use `StopPod` for now. Later cleanup will skip role-Pod shutdown and remove only child implementation worktree/branch unless explicitly reauthorized.
+
+---
