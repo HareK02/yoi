@@ -400,3 +400,33 @@ E2E harness は `HOME` と `XDG_DATA_HOME` を分けて渡しており、`YOI_DA
 補足: `YOI_POD_RUNTIME_COMMAND` の残存は既存設計上の dev executable-path override として扱い、今回の blocker にはしていない。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KW7835H0-pod-fix at: 2026-06-28T20:02:28Z -->
+
+## Implementation report
+
+Change-response implementation report:
+
+Reviewer の E2E Worker metadata root blocker を修正し、追加 commit を作成済み。Ticket ファイル編集、merge、close、cleanup は未実施。
+
+Commit:
+- `fdd902d5 fix: align e2e worker metadata root`
+
+変更内容:
+- `tests/e2e/src/lib.rs`
+  - E2E fixture の Worker metadata helper を active code の `manifest::paths::data_dir()` の既定解決に合わせた。
+  - `XDG_DATA_HOME/yoi/workers` ではなく、fixture の `HOME` から解決される `$HOME/.yoi/workers` を使用。
+  - `fixture_worker_metadata_root` artifact も同じ `$HOME/.yoi/workers` を記録するよう修正。
+  - `active_worker_metadata_root(&home)` helper を追加し、書き込み先と artifact 記録を同一関数で揃えた。
+
+Validation:
+- `cargo fmt`: success
+- `cargo check -p yoi-e2e`: success
+- `git diff --check`: success
+- `cargo test -p yoi-e2e`: success
+- `cargo check -p yoi`: success
+
+Final state:
+- child worktree is clean.
+
+---
