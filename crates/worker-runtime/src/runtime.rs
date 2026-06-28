@@ -4,9 +4,9 @@ use crate::catalog::{
 };
 use crate::config_bundle::{
     ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary, validate_config_bundle,
-    validate_config_bundle_ref, validate_profile_selector,
+    validate_config_bundle_ref,
 };
-use crate::diagnostics::{DiagnosticSeverity, RuntimeDiagnostic};
+use crate::diagnostics::RuntimeDiagnostic;
 use crate::error::RuntimeError;
 use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionBackendKind, WorkerExecutionBackendRef,
@@ -231,55 +231,116 @@ impl Runtime {
         Ok(event_id)
     }
 
-    /// Create a Worker in the embedded catalog.
+    /// Create a Worker through the canonical ConfigBundle + execution backend path.
     pub fn create_worker(
         &self,
         request: CreateWorkerRequest,
     ) -> Result<WorkerDetail, RuntimeError> {
-        let mut state = self.lock()?;
-        state.ensure_running()?;
-        validate_create_worker_request(&request)?;
-        state.validate_worker_config_boundary(&request)?;
+        let (backend, worker_ref, spawn_request) = {
+            let mut state = self.lock()?;
+            state.ensure_running()?;
+            validate_create_worker_request(&request)?;
+            state.validate_worker_config_boundary(&request)?;
+            let backend = state.execution_backend.clone().ok_or_else(|| {
+                RuntimeError::ExecutionBackendUnavailable {
+                    message: "worker creation requires an execution backend".to_string(),
+                }
+            })?;
 
-        let worker_id = WorkerId::generated(state.next_worker_sequence);
-        state.next_worker_sequence += 1;
-        let worker_ref = WorkerRef::new(state.runtime_id.clone(), worker_id.clone());
-        let backend = state.execution_backend.clone();
-        let spawn_request = backend.as_ref().map(|_| WorkerExecutionSpawnRequest {
-            worker_ref: worker_ref.clone(),
-            request: request.clone(),
-            context: self.execution_context(worker_ref.clone()),
-        });
-        let event_id = state.push_event(
-            Some(worker_ref.clone()),
-            RuntimeEventKind::WorkerCreated,
-            format!("worker {worker_id} created"),
-        );
+            let worker_id = WorkerId::generated(state.next_worker_sequence);
+            state.next_worker_sequence += 1;
+            let worker_ref = WorkerRef::new(state.runtime_id.clone(), worker_id.clone());
+            let event_id = state.push_event(
+                Some(worker_ref.clone()),
+                RuntimeEventKind::WorkerCreated,
+                format!("worker {worker_id} created"),
+            );
 
-        let record = WorkerRecord {
-            worker_ref: worker_ref.clone(),
-            worker_id: worker_id.clone(),
-            status: WorkerStatus::Running,
-            request,
-            execution: WorkerExecutionStatus::unconnected(),
-            execution_handle: None,
-            transcript: Vec::new(),
-            next_transcript_sequence: 1,
-            last_event_id: event_id,
+            let mut transcript = Vec::new();
+            let mut next_transcript_sequence = 1;
+            if let Some(input) = request.initial_input.clone() {
+                let role = match input.kind {
+                    WorkerInputKind::User => TranscriptRole::User,
+                    WorkerInputKind::System => TranscriptRole::System,
+                };
+                transcript.push(TranscriptEntry {
+                    sequence: next_transcript_sequence,
+                    worker_ref: worker_ref.clone(),
+                    role,
+                    content: input.content,
+                    event_id,
+                });
+                next_transcript_sequence += 1;
+            }
+
+            let record = WorkerRecord {
+                worker_ref: worker_ref.clone(),
+                worker_id: worker_id.clone(),
+                status: WorkerStatus::Running,
+                request: request.clone(),
+                execution: WorkerExecutionStatus::unconnected(),
+                execution_handle: None,
+                transcript,
+                next_transcript_sequence,
+                last_event_id: event_id,
+            };
+            state.workers.insert(worker_id, record);
+            let spawn_request = WorkerExecutionSpawnRequest {
+                worker_ref: worker_ref.clone(),
+                request,
+                context: self.execution_context(worker_ref.clone()),
+            };
+            (backend, worker_ref, spawn_request)
         };
-        let detail = record.detail(&state.runtime_id);
-        state.emit_create_diagnostics(&detail);
-        state.workers.insert(worker_id.clone(), record);
-        state.persist_runtime_snapshot()?;
-        state.persist_worker(&worker_id)?;
-        state.persist_event_by_id(event_id)?;
-        drop(state);
 
-        if let (Some(backend), Some(spawn_request)) = (backend, spawn_request) {
-            let result = backend.spawn_worker(spawn_request);
-            self.apply_spawn_result(&worker_ref, result)
+        let spawn_result = backend.spawn_worker(spawn_request);
+        let (handle, run_state) = match spawn_result {
+            WorkerExecutionSpawnResult::Connected { handle, run_state } => (handle, run_state),
+            WorkerExecutionSpawnResult::Rejected(result)
+            | WorkerExecutionSpawnResult::Errored(result) => {
+                self.rollback_failed_create(&worker_ref)?;
+                return Err(RuntimeError::WorkerExecutionRejected {
+                    worker_id: worker_ref.worker_id.clone(),
+                    operation: result.operation,
+                    outcome: result.outcome,
+                    message: result.message_or_default(),
+                    result,
+                });
+            }
+        };
+
+        if let Some(initial_input) = {
+            let state = self.lock()?;
+            state.worker(&worker_ref)?.request.initial_input.clone()
+        } {
+            let dispatch_result = backend.dispatch_input(&handle, initial_input);
+            if !dispatch_result.is_accepted() {
+                let _ = backend.stop_worker(&handle);
+                self.rollback_failed_create(&worker_ref)?;
+                return Err(RuntimeError::WorkerExecutionRejected {
+                    worker_id: worker_ref.worker_id.clone(),
+                    operation: dispatch_result.operation,
+                    outcome: dispatch_result.outcome,
+                    message: dispatch_result.message_or_default(),
+                    result: dispatch_result,
+                });
+            }
+            self.commit_created_worker(
+                &worker_ref,
+                handle,
+                WorkerExecutionRunState::Busy,
+                WorkerExecutionResult::accepted(
+                    WorkerExecutionOperation::Input,
+                    WorkerExecutionRunState::Busy,
+                ),
+            )
         } else {
-            Ok(detail)
+            self.commit_created_worker(
+                &worker_ref,
+                handle,
+                run_state,
+                WorkerExecutionResult::accepted(WorkerExecutionOperation::Spawn, run_state),
+            )
         }
     }
 
@@ -414,36 +475,39 @@ impl Runtime {
         })
     }
 
-    fn apply_spawn_result(
+    fn commit_created_worker(
         &self,
         worker_ref: &WorkerRef,
-        result: WorkerExecutionSpawnResult,
+        handle: WorkerExecutionHandle,
+        run_state: WorkerExecutionRunState,
+        result: WorkerExecutionResult,
     ) -> Result<WorkerDetail, RuntimeError> {
         let mut state = self.lock()?;
         let runtime_id = state.runtime_id.clone();
         let detail = {
             let worker = state.worker_mut(worker_ref)?;
-            match result {
-                WorkerExecutionSpawnResult::Connected { handle, run_state } => {
-                    worker.execution_handle = Some(handle);
-                    worker.execution = WorkerExecutionStatus::connected(run_state).with_result(
-                        WorkerExecutionResult::accepted(WorkerExecutionOperation::Spawn, run_state),
-                    );
-                }
-                WorkerExecutionSpawnResult::Rejected(result)
-                | WorkerExecutionSpawnResult::Errored(result) => {
-                    worker.execution_handle = None;
-                    worker.execution = WorkerExecutionStatus {
-                        backend: WorkerExecutionBackendKind::Connected,
-                        run_state: result.run_state,
-                        last_result: Some(result),
-                    };
-                }
-            }
+            worker.execution_handle = Some(handle);
+            worker.execution = WorkerExecutionStatus::connected(run_state).with_result(result);
             worker.detail(&runtime_id)
         };
+        state.persist_runtime_snapshot()?;
         state.persist_worker(&worker_ref.worker_id)?;
+        let worker = state.worker(worker_ref)?;
+        for entry in &worker.transcript {
+            state.persist_transcript_entry(&worker_ref.worker_id, entry.sequence)?;
+        }
+        state.persist_event_by_id(detail.last_event_id)?;
         Ok(detail)
+    }
+
+    fn rollback_failed_create(&self, worker_ref: &WorkerRef) -> Result<(), RuntimeError> {
+        let mut state = self.lock()?;
+        if let Some(record) = state.workers.remove(&worker_ref.worker_id) {
+            state.events.retain(|event| {
+                event.id != record.last_event_id || event.worker_ref.as_ref() != Some(worker_ref)
+            });
+        }
+        Ok(())
     }
 
     fn record_execution_result(
@@ -827,7 +891,6 @@ struct RuntimeState {
     execution_backend: Option<WorkerExecutionBackendRef>,
     next_worker_sequence: u64,
     next_event_id: u64,
-    next_diagnostic_id: u64,
     workers: BTreeMap<WorkerId, WorkerRecord>,
     config_bundles: BTreeMap<String, ConfigBundle>,
     events: Vec<RuntimeEvent>,
@@ -852,7 +915,6 @@ impl RuntimeState {
             execution_backend: None,
             next_worker_sequence: 1,
             next_event_id: 1,
-            next_diagnostic_id: 1,
             workers: BTreeMap::new(),
             config_bundles: BTreeMap::new(),
             events: Vec::new(),
@@ -883,7 +945,6 @@ impl RuntimeState {
             execution_backend: None,
             next_worker_sequence: 1,
             next_event_id: 1,
-            next_diagnostic_id: 1,
             workers: BTreeMap::new(),
             config_bundles: BTreeMap::new(),
             events: Vec::new(),
@@ -1131,36 +1192,22 @@ impl RuntimeState {
         &self,
         request: &CreateWorkerRequest,
     ) -> Result<(), RuntimeError> {
-        match &request.config_bundle {
-            Some(reference) => {
-                let availability = self.check_config_bundle_ref(reference)?;
-                let bundle = self
-                    .config_bundles
-                    .get(&availability.reference.id)
-                    .ok_or_else(|| RuntimeError::ConfigBundleMissing {
-                        bundle_id: availability.reference.id.clone(),
-                    })?;
-                if !bundle.contains_profile(&request.profile) {
-                    return Err(RuntimeError::InvalidProfileSelector {
-                        profile: profile_label(&request.profile),
-                        bundle_id: Some(reference.id.clone()),
-                        message: "profile selector is not declared by synced config bundle"
-                            .to_string(),
-                    });
-                }
-                Ok(())
-            }
-            None => match &request.profile {
-                ProfileSelector::RuntimeDefault | ProfileSelector::Builtin(_) => {
-                    validate_profile_selector(request.profile.clone(), None)
-                }
-                ProfileSelector::Named(_) => Err(RuntimeError::InvalidProfileSelector {
-                    profile: profile_label(&request.profile),
-                    bundle_id: None,
-                    message: "named profiles require a synced config bundle reference".to_string(),
-                }),
-            },
+        let reference = &request.config_bundle;
+        let availability = self.check_config_bundle_ref(reference)?;
+        let bundle = self
+            .config_bundles
+            .get(&availability.reference.id)
+            .ok_or_else(|| RuntimeError::ConfigBundleMissing {
+                bundle_id: availability.reference.id.clone(),
+            })?;
+        if !bundle.contains_profile(&request.profile) {
+            return Err(RuntimeError::InvalidProfileSelector {
+                profile: profile_label(&request.profile),
+                bundle_id: Some(reference.id.clone()),
+                message: "profile selector is not declared by synced config bundle".to_string(),
+            });
         }
+        Ok(())
     }
 
     fn ensure_worker_ref(&self, worker_ref: &WorkerRef) -> Result<(), RuntimeError> {
@@ -1373,43 +1420,6 @@ impl RuntimeState {
         status.run_state = next_run_state;
         true
     }
-
-    fn push_diagnostic(
-        &mut self,
-        severity: DiagnosticSeverity,
-        code: impl Into<String>,
-        message: impl Into<String>,
-        worker_ref: Option<WorkerRef>,
-    ) {
-        let id = self.next_diagnostic_id;
-        self.next_diagnostic_id += 1;
-        self.diagnostics.push(RuntimeDiagnostic {
-            id,
-            severity,
-            code: code.into(),
-            message: message.into(),
-            worker_ref,
-        });
-    }
-
-    fn emit_create_diagnostics(&mut self, detail: &WorkerDetail) {
-        if detail.config_bundle.is_none() {
-            self.push_diagnostic(
-                DiagnosticSeverity::Info,
-                "runtime.local_default_resources",
-                "worker created without ConfigBundleRef; runtime-local defaults are assumed",
-                Some(detail.worker_ref.clone()),
-            );
-        }
-        if detail.requested_capabilities.is_empty() {
-            self.push_diagnostic(
-                DiagnosticSeverity::Info,
-                "worker.tools_less",
-                "worker created without requested tool capabilities",
-                Some(detail.worker_ref.clone()),
-            );
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -1433,10 +1443,8 @@ impl WorkerRecord {
             worker_id: self.worker_id.clone(),
             status: self.status,
             execution: self.execution.clone(),
-            intent: self.request.intent.clone(),
             profile: self.request.profile.clone(),
-            requested_capability_count: self.request.requested_capabilities.len(),
-            has_config_bundle: self.request.config_bundle.is_some(),
+            config_bundle: self.request.config_bundle.clone(),
             transcript_len: self.transcript.len(),
             last_event_id: self.last_event_id,
         }
@@ -1449,12 +1457,8 @@ impl WorkerRecord {
             worker_id: self.worker_id.clone(),
             status: self.status,
             execution: self.execution.clone(),
-            intent: self.request.intent.clone(),
             profile: self.request.profile.clone(),
             config_bundle: self.request.config_bundle.clone(),
-            requested_capabilities: self.request.requested_capabilities.clone(),
-            workspace_refs: self.request.workspace_refs.clone(),
-            mount_refs: self.request.mount_refs.clone(),
             transcript_len: self.transcript.len(),
             last_event_id: self.last_event_id,
         }
@@ -1483,17 +1487,20 @@ fn profile_label(selector: &ProfileSelector) -> String {
 }
 
 fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), RuntimeError> {
-    if let crate::catalog::WorkerIntent::Task { objective } = &request.intent {
-        if objective.trim().is_empty() {
-            return Err(RuntimeError::InvalidRequest(
-                "task objective must not be empty".to_string(),
-            ));
-        }
+    if request.config_bundle.id.trim().is_empty() {
+        return Err(RuntimeError::InvalidRequest(
+            "config_bundle.id must not be empty".to_string(),
+        ));
     }
-    for capability in &request.requested_capabilities {
-        if capability.name.trim().is_empty() {
+    if request.config_bundle.digest.trim().is_empty() {
+        return Err(RuntimeError::InvalidRequest(
+            "config_bundle.digest must not be empty".to_string(),
+        ));
+    }
+    if let Some(input) = &request.initial_input {
+        if input.content.trim().is_empty() {
             return Err(RuntimeError::InvalidRequest(
-                "capability name must not be empty".to_string(),
+                "initial_input.content must not be empty".to_string(),
             ));
         }
     }
@@ -1512,7 +1519,7 @@ fn validate_worker_input(input: &WorkerInput) -> Result<(), RuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{CapabilityRequest, ConfigBundleRef, ProfileSelector, WorkerIntent};
+    use crate::catalog::{ConfigBundleRef, ProfileSelector};
     use crate::config_bundle::{
         ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigDeclaration,
         ConfigDeclarationKind, ConfigProfileDescriptor,
@@ -1524,17 +1531,43 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
-    fn task_request(objective: &str) -> CreateWorkerRequest {
+    fn task_request(_objective: &str) -> CreateWorkerRequest {
+        let profile = ProfileSelector::Builtin("builtin:coder".to_string());
+        let bundle = test_bundle_for_profile(profile.clone());
         CreateWorkerRequest {
-            intent: WorkerIntent::Task {
-                objective: objective.to_string(),
+            profile,
+            config_bundle: ConfigBundleRef {
+                id: bundle.metadata.id,
+                digest: bundle.metadata.digest,
             },
-            profile: ProfileSelector::Builtin("builtin:coder".to_string()),
-            config_bundle: None,
-            requested_capabilities: vec![CapabilityRequest::named("read")],
-            workspace_refs: Vec::new(),
-            mount_refs: Vec::new(),
+            initial_input: None,
         }
+    }
+
+    fn test_bundle_for_profile(profile: ProfileSelector) -> ConfigBundle {
+        ConfigBundle {
+            metadata: ConfigBundleMetadata {
+                id: "bundle-1".to_string(),
+                digest: String::new(),
+                revision: "rev-1".to_string(),
+                workspace_id: "workspace-1".to_string(),
+                created_at: "2026-06-26T00:00:00Z".to_string(),
+                provenance: ConfigBundleProvenance {
+                    source: "workspace-backend".to_string(),
+                    detail: Some("profile-sync".to_string()),
+                },
+            },
+            profiles: vec![ConfigProfileDescriptor {
+                selector: profile,
+                label: Some("Coder".to_string()),
+            }],
+            declarations: vec![ConfigDeclaration {
+                kind: ConfigDeclarationKind::CapabilityGrant,
+                name: "read".to_string(),
+                reference: "capability:read".to_string(),
+            }],
+        }
+        .with_computed_digest()
     }
 
     #[derive(Default)]
@@ -1609,77 +1642,58 @@ mod tests {
     }
 
     fn runtime_with_backend() -> Runtime {
-        Runtime::with_execution_backend(
+        let runtime = Runtime::with_execution_backend(
             RuntimeOptions::default(),
             Arc::new(TestExecutionBackend::default()),
         )
-        .unwrap()
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        runtime
     }
 
     fn runtime_and_backend() -> (Runtime, Arc<TestExecutionBackend>) {
         let backend = Arc::new(TestExecutionBackend::default());
         let runtime =
             Runtime::with_execution_backend(RuntimeOptions::default(), backend.clone()).unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
         (runtime, backend)
     }
 
     fn test_bundle() -> ConfigBundle {
-        ConfigBundle {
-            metadata: ConfigBundleMetadata {
-                id: "bundle-1".to_string(),
-                digest: String::new(),
-                revision: "rev-1".to_string(),
-                workspace_id: "workspace-1".to_string(),
-                created_at: "2026-06-26T00:00:00Z".to_string(),
-                provenance: ConfigBundleProvenance {
-                    source: "workspace-backend".to_string(),
-                    detail: Some("profile-sync".to_string()),
-                },
-            },
-            profiles: vec![ConfigProfileDescriptor {
-                selector: ProfileSelector::Builtin("builtin:coder".to_string()),
-                label: Some("Coder".to_string()),
-            }],
-            declarations: vec![ConfigDeclaration {
-                kind: ConfigDeclarationKind::CapabilityGrant,
-                name: "read".to_string(),
-                reference: "capability:read".to_string(),
-            }],
-        }
-        .with_computed_digest()
+        test_bundle_for_profile(ProfileSelector::Builtin("builtin:coder".to_string()))
     }
 
     fn bundled_task_request(objective: &str, bundle: &ConfigBundle) -> CreateWorkerRequest {
         let mut request = task_request(objective);
-        request.config_bundle = Some(ConfigBundleRef {
+        request.config_bundle = ConfigBundleRef {
             id: bundle.metadata.id.clone(),
             digest: bundle.metadata.digest.clone(),
-        });
+        };
         request
     }
 
     #[test]
     fn create_list_and_detail_preserve_runtime_worker_authority() {
-        let runtime = Runtime::new_memory();
+        let runtime = runtime_with_backend();
         let detail = runtime.create_worker(task_request("implement v0")).unwrap();
 
         assert_eq!(detail.worker_ref.runtime_id, runtime.runtime_id().unwrap());
         assert_eq!(detail.status, WorkerStatus::Running);
-        assert!(detail.config_bundle.is_none());
+        assert_eq!(detail.config_bundle.id, "bundle-1");
 
         let list = runtime.list_workers().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].worker_ref, detail.worker_ref);
-        assert_eq!(list[0].requested_capability_count, 1);
+        assert_eq!(list[0].config_bundle, detail.config_bundle);
 
         let fetched = runtime.worker_detail(&detail.worker_ref).unwrap();
         assert_eq!(fetched.worker_id, detail.worker_id);
-        assert_eq!(fetched.intent, detail.intent);
+        assert_eq!(fetched.profile, detail.profile);
     }
 
     #[test]
     fn synced_config_bundle_is_stored_checked_and_used_for_worker_creation() {
-        let runtime = Runtime::new_memory();
+        let runtime = runtime_with_backend();
         let bundle = test_bundle();
         let availability = runtime.store_config_bundle(bundle.clone()).unwrap();
         assert_eq!(availability.reference.id, "bundle-1");
@@ -1697,7 +1711,7 @@ mod tests {
         let detail = runtime
             .create_worker(bundled_task_request("synced", &bundle))
             .unwrap();
-        assert_eq!(detail.config_bundle, Some(availability.reference));
+        assert_eq!(detail.config_bundle, availability.reference);
     }
 
     #[test]
@@ -1746,8 +1760,8 @@ mod tests {
 
     #[test]
     fn rejects_worker_refs_from_another_runtime() {
-        let runtime_a = Runtime::new_memory();
-        let runtime_b = Runtime::new_memory();
+        let runtime_a = runtime_with_backend();
+        let runtime_b = runtime_with_backend();
         let detail = runtime_a.create_worker(task_request("runtime a")).unwrap();
 
         let err = runtime_b.worker_detail(&detail.worker_ref).unwrap_err();
@@ -1755,52 +1769,27 @@ mod tests {
     }
 
     #[test]
-    fn tools_less_worker_without_config_bundle_uses_local_defaults_and_diagnostics() {
+    fn create_worker_without_execution_backend_is_rejected_and_not_persisted() {
         let runtime = Runtime::new_memory();
-        let detail = runtime
-            .create_worker(CreateWorkerRequest::tools_less(
-                WorkerIntent::default(),
-                ProfileSelector::RuntimeDefault,
-            ))
-            .unwrap();
-
-        assert!(detail.config_bundle.is_none());
-        assert!(detail.requested_capabilities.is_empty());
-        let diagnostics = runtime.diagnostics().unwrap();
-        assert_eq!(diagnostics.len(), 2);
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "runtime.local_default_resources")
-        );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "worker.tools_less")
-        );
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let error = runtime
+            .create_worker(task_request("no backend"))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::ExecutionBackendUnavailable { .. }
+        ));
+        assert!(runtime.list_workers().unwrap().is_empty());
     }
 
     #[test]
-    fn backend_unconnected_worker_input_is_rejected_and_not_transcribed() {
+    fn create_worker_missing_config_bundle_is_rejected_before_backend() {
         let runtime = Runtime::new_memory();
-        let detail = runtime.create_worker(task_request("placeholder")).unwrap();
-        assert_eq!(
-            detail.execution.backend,
-            WorkerExecutionBackendKind::Unconnected
-        );
-
-        let err = runtime
-            .send_input(&detail.worker_ref, WorkerInput::user("must reject"))
+        let error = runtime
+            .create_worker(task_request("missing bundle"))
             .unwrap_err();
-        assert!(matches!(
-            err,
-            RuntimeError::WorkerExecutionUnavailable { .. }
-        ));
-
-        let projection = runtime
-            .transcript_projection(&detail.worker_ref, TranscriptQuery::new(0, 1))
-            .unwrap();
-        assert_eq!(projection.total_items, 0);
+        assert!(matches!(error, RuntimeError::ConfigBundleMissing { .. }));
+        assert!(runtime.list_workers().unwrap().is_empty());
     }
 
     #[test]
@@ -1885,6 +1874,7 @@ mod tests {
         let runtime =
             Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(InputOnlyBackend))
                 .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
         let detail = runtime.create_worker(task_request("no stop")).unwrap();
 
         let err = runtime
@@ -1916,6 +1906,7 @@ mod tests {
             Arc::new(TestExecutionBackend::default()),
         )
         .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
         let detail = runtime.create_worker(task_request("chat")).unwrap();
 
         let first = runtime
@@ -1946,7 +1937,7 @@ mod tests {
 
     #[test]
     fn stop_and_cancel_workers_update_summary() {
-        let runtime = Runtime::new_memory();
+        let runtime = runtime_with_backend();
         let stopped = runtime.create_worker(task_request("stop me")).unwrap();
         let cancelled = runtime.create_worker(task_request("cancel me")).unwrap();
 
@@ -1969,7 +1960,7 @@ mod tests {
 
     #[test]
     fn stop_then_cancel_preserves_stopped_terminal_state() {
-        let runtime = Runtime::new_memory();
+        let runtime = runtime_with_backend();
         let cursor = runtime.event_cursor_from_start().unwrap();
         let worker = runtime
             .create_worker(task_request("stable stopped"))
@@ -2014,7 +2005,7 @@ mod tests {
 
     #[test]
     fn cancel_then_stop_preserves_cancelled_terminal_state() {
-        let runtime = Runtime::new_memory();
+        let runtime = runtime_with_backend();
         let cursor = runtime.event_cursor_from_start().unwrap();
         let worker = runtime
             .create_worker(task_request("stable cancelled"))

@@ -1063,6 +1063,7 @@ mod tests {
     use axum::http::Request;
     use futures::{SinkExt, StreamExt};
     use serde_json::{Value, json};
+    use std::sync::Arc;
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message;
     use tower::ServiceExt;
@@ -1140,6 +1141,51 @@ mod tests {
         }
     }
 
+    fn runtime_test_bundle() -> worker_runtime::config_bundle::ConfigBundle {
+        worker_runtime::config_bundle::ConfigBundle {
+            metadata: worker_runtime::config_bundle::ConfigBundleMetadata {
+                id: "server-test-bundle".to_string(),
+                digest: String::new(),
+                revision: "test".to_string(),
+                workspace_id: "test".to_string(),
+                created_at: "test".to_string(),
+                provenance: worker_runtime::config_bundle::ConfigBundleProvenance {
+                    source: "test".to_string(),
+                    detail: None,
+                },
+            },
+            profiles: vec![worker_runtime::config_bundle::ConfigProfileDescriptor {
+                selector: worker_runtime::catalog::ProfileSelector::RuntimeDefault,
+                label: Some("server-test".to_string()),
+            }],
+            declarations: Vec::new(),
+        }
+        .with_computed_digest()
+    }
+
+    fn runtime_create_request() -> worker_runtime::catalog::CreateWorkerRequest {
+        let bundle = runtime_test_bundle();
+        worker_runtime::catalog::CreateWorkerRequest {
+            profile: worker_runtime::catalog::ProfileSelector::RuntimeDefault,
+            config_bundle: worker_runtime::catalog::ConfigBundleRef {
+                id: bundle.metadata.id,
+                digest: bundle.metadata.digest,
+            },
+            initial_input: None,
+        }
+    }
+
+    fn runtime_with_worker() -> (worker_runtime::Runtime, worker_runtime::identity::WorkerRef) {
+        let runtime = worker_runtime::Runtime::with_execution_backend(
+            worker_runtime::RuntimeOptions::default(),
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .unwrap();
+        runtime.store_config_bundle(runtime_test_bundle()).unwrap();
+        let worker = runtime.create_worker(runtime_create_request()).unwrap();
+        (runtime, worker.worker_ref)
+    }
+
     #[tokio::test]
     async fn serves_bounded_read_apis_and_static_spa_separately() {
         let dir = tempfile::tempdir().unwrap();
@@ -1153,7 +1199,13 @@ mod tests {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
         let mut config = ServerConfig::local_dev(dir.path(), test_identity());
         config.static_assets_dir = Some(static_dir);
-        let api = WorkspaceApi::new(config, Arc::new(store)).await.unwrap();
+        let api = WorkspaceApi::new_with_execution_backend(
+            config,
+            Arc::new(store),
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .await
+        .unwrap();
         let app = build_router(api);
 
         let workspace = get_json(app.clone(), "/api/workspace").await;
@@ -1260,7 +1312,7 @@ mod tests {
         let worker_items = workers["items"].as_array().unwrap();
         let companion_worker = worker_items
             .iter()
-            .find(|worker| worker["role"] == "workspace_companion")
+            .find(|worker| worker["role"] == "builtin:companion")
             .expect("companion worker is visible through runtime worker API");
         assert_eq!(companion_worker["runtime_id"], "embedded-worker-runtime");
         assert!(companion_worker["capabilities"]["can_stop"].is_boolean());
@@ -1270,7 +1322,7 @@ mod tests {
             companion_status["state"].as_str(),
             Some("ready") | Some("error")
         ));
-        assert_eq!(companion_status["worker"]["role"], "workspace_companion");
+        assert_eq!(companion_status["worker"]["role"], "builtin:companion");
         assert_eq!(
             companion_status["transport"]["kind"],
             "embedded_worker_runtime"
@@ -1305,7 +1357,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|worker| worker["role"] == "workspace_companion")
+                .any(|worker| worker["role"] == "builtin:companion")
         );
 
         let runs_response = app
@@ -1477,7 +1529,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SqliteWorkspaceStore::in_memory().unwrap();
         let config = ServerConfig::local_dev(dir.path(), test_identity());
-        let api = WorkspaceApi::new(config, Arc::new(store)).await.unwrap();
+        let api = WorkspaceApi::new_with_execution_backend(
+            config,
+            Arc::new(store),
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .await
+        .unwrap();
         let app = build_router(api);
 
         let runtimes = get_json(app.clone(), "/api/runtimes").await;
@@ -1515,20 +1573,14 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(spawned["state"], "rejected");
-        assert!(
-            spawned["diagnostics"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|diagnostic| {
-                    diagnostic["code"] == "embedded_worker_execution_spawn_errored"
-                        && !diagnostic["message"]
-                            .as_str()
-                            .unwrap()
-                            .contains("/workspace/demo")
-                })
-        );
+        assert_eq!(spawned["state"], "accepted");
+        let diagnostics = spawned["diagnostics"].as_array().unwrap();
+        assert!(diagnostics.iter().all(|diagnostic| {
+            !diagnostic["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("/workspace/demo")
+        }));
         let worker_id = spawned["worker"]["worker_id"].as_str().unwrap().to_string();
         assert_eq!(spawned["worker"]["runtime_id"], "embedded-worker-runtime");
         assert_eq!(
@@ -1557,16 +1609,10 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(accepted["state"], "rejected");
+        assert_eq!(accepted["state"], "accepted");
         assert_eq!(accepted["runtime_id"], "embedded-worker-runtime");
         assert_eq!(accepted["worker_id"], worker_id);
-        assert!(
-            accepted["diagnostics"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|diagnostic| diagnostic["code"] == "embedded_worker_execution_unavailable")
-        );
+        assert!(accepted["diagnostics"].as_array().unwrap().is_empty());
 
         let transcript = get_json(
             app.clone(),
@@ -1574,7 +1620,9 @@ mod tests {
         )
         .await;
         assert_eq!(transcript["state"], "accepted");
-        assert!(transcript["items"].as_array().unwrap().is_empty());
+        assert!(transcript["items"].as_array().unwrap().iter().any(
+            |item| item["role"] == "user" && item["content"] == "hello from browser-facing api"
+        ));
 
         let wrong_runtime = app
             .clone()
@@ -1620,10 +1668,7 @@ mod tests {
 
     #[tokio::test]
     async fn proxies_worker_observation_ws_with_backend_cursors_and_diagnostics() {
-        let runtime = worker_runtime::Runtime::new_memory();
-        let worker = runtime
-            .create_worker(worker_runtime::catalog::CreateWorkerRequest::default())
-            .unwrap();
+        let (runtime, worker_ref) = runtime_with_worker();
         let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let runtime_addr = runtime_listener.local_addr().unwrap();
         tokio::spawn({
@@ -1645,11 +1690,17 @@ mod tests {
                 worker_id: "worker-a".into(),
                 endpoint: format!(
                     "ws://{runtime_addr}/v1/workers/{}/events/ws",
-                    worker.worker_ref.worker_id
+                    worker_ref.worker_id
                 ),
                 bearer_token: None,
             });
-        let api = WorkspaceApi::new(config, Arc::new(store)).await.unwrap();
+        let api = WorkspaceApi::new_with_execution_backend(
+            config,
+            Arc::new(store),
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .await
+        .unwrap();
         let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let app_addr = app_listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(app_listener, build_router(api)).await.unwrap() });
@@ -1666,7 +1717,7 @@ mod tests {
 
         runtime
             .observe_worker_event(
-                &worker.worker_ref,
+                &worker_ref,
                 protocol::Event::TextDelta {
                     text: "live".into(),
                 },
@@ -1686,7 +1737,7 @@ mod tests {
         let _snapshot = next_client_frame(&mut resumed).await;
         runtime
             .observe_worker_event(
-                &worker.worker_ref,
+                &worker_ref,
                 protocol::Event::TextDone {
                     text: "done".into(),
                 },
@@ -1822,10 +1873,7 @@ mod tests {
         worker_runtime::identity::WorkerRef,
         String,
     ) {
-        let runtime = worker_runtime::Runtime::new_memory();
-        let worker = runtime
-            .create_worker(worker_runtime::catalog::CreateWorkerRequest::default())
-            .unwrap();
+        let (runtime, worker_ref) = runtime_with_worker();
         let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let runtime_addr = runtime_listener.local_addr().unwrap();
         tokio::spawn({
@@ -1838,9 +1886,9 @@ mod tests {
         });
         let endpoint = format!(
             "ws://{runtime_addr}/v1/workers/{}/events/ws",
-            worker.worker_ref.worker_id
+            worker_ref.worker_id
         );
-        (runtime, worker.worker_ref, endpoint)
+        (runtime, worker_ref, endpoint)
     }
 
     async fn spawn_workspace_proxy(
@@ -1852,7 +1900,13 @@ mod tests {
         let runtime_id = source.runtime_id.clone();
         let worker_id = source.worker_id.clone();
         config.runtime_event_sources.push(source);
-        let api = WorkspaceApi::new(config, Arc::new(store)).await.unwrap();
+        let api = WorkspaceApi::new_with_execution_backend(
+            config,
+            Arc::new(store),
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .await
+        .unwrap();
         let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let app_addr = app_listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(app_listener, build_router(api)).await.unwrap() });

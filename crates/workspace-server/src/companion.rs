@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use worker_runtime::catalog::{CapabilityRequest, ConfigBundleRef, ProfileSelector};
+use worker_runtime::catalog::ProfileSelector;
 use worker_runtime::config_bundle::{
     ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigProfileDescriptor,
 };
@@ -367,10 +367,6 @@ fn spawn_companion_worker(runtime: &RuntimeRegistry) -> CompanionWorkerState {
     let selector = companion_profile_selector();
     let mut diagnostics = Vec::new();
     let config_bundle = companion_config_bundle();
-    let config_ref = ConfigBundleRef {
-        id: config_bundle.metadata.id.clone(),
-        digest: config_bundle.metadata.digest.clone(),
-    };
 
     match runtime.sync_config_bundle(COMPANION_RUNTIME_ID, config_bundle) {
         Ok(result) => diagnostics.extend(result.diagnostics),
@@ -390,8 +386,7 @@ fn spawn_companion_worker(runtime: &RuntimeRegistry) -> CompanionWorkerState {
                 expected_segments: 0,
             },
             profile: Some(selector),
-            config_bundle: Some(config_ref),
-            requested_capabilities: vec![CapabilityRequest::named("worker.input.user")],
+            initial_input: None,
         },
     );
 
@@ -611,36 +606,37 @@ mod tests {
     }
 
     #[test]
-    fn companion_spawns_worker_with_companion_profile_and_diagnostic_when_not_input_capable() {
-        let registry =
-            RuntimeRegistry::for_workspace(EmbeddedWorkerRuntime::new_memory("local:test"));
+    fn companion_spawns_worker_with_companion_profile_through_runtime_backend() {
+        let registry = RuntimeRegistry::for_workspace(
+            EmbeddedWorkerRuntime::new_memory_with_execution_backend(
+                "local:test",
+                Arc::new(DeterministicExecutionBackend::default()),
+            )
+            .unwrap(),
+        );
         let registry = Arc::new(registry);
         let companion = CompanionConsole::new(registry.clone());
 
         let status = companion.status();
         let worker = status.worker.clone().expect("companion worker");
         assert_eq!(worker.runtime_id, COMPANION_RUNTIME_ID);
-        assert_eq!(worker.role.as_deref(), Some("workspace_companion"));
-        assert!(!worker.capabilities.can_accept_input);
-        assert_eq!(status.transport.completion, "not_input_capable");
-        assert!(
-            status
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "companion_worker_not_input_capable")
-        );
+        assert_eq!(worker.role.as_deref(), Some(COMPANION_PROFILE_ID));
+        assert!(worker.capabilities.can_accept_input);
+        assert_eq!(status.transport.completion, "connected");
+        assert!(status.diagnostics.is_empty());
 
         let response = companion.send_message(CompanionMessageRequest {
             content: "hello".to_string(),
         });
-        assert_eq!(response.state, CompanionState::Rejected);
+        assert_eq!(response.state, CompanionState::Accepted);
+        assert!(response.diagnostics.is_empty());
         assert!(
-            !response
-                .diagnostics
+            response
+                .transcript
+                .items
                 .iter()
-                .any(|diagnostic| diagnostic.code == "companion_llm_not_connected")
+                .any(|entry| entry.role == "user" && entry.content == "hello")
         );
-        assert!(response.transcript.items.is_empty());
 
         let worker_detail = registry
             .worker(COMPANION_RUNTIME_ID, &worker.worker_id)

@@ -824,6 +824,7 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
         }
         RuntimeError::RuntimeStopped { .. }
         | RuntimeError::WorkerExecutionUnavailable { .. }
+        | RuntimeError::ExecutionBackendUnavailable { .. }
         | RuntimeError::WorkerExecutionRejected { .. } => StatusCode::CONFLICT,
         RuntimeError::LimitTooLarge { .. }
         | RuntimeError::InvalidRequest(_)
@@ -846,6 +847,7 @@ fn code_for_runtime_error(error: &RuntimeError) -> &'static str {
         RuntimeError::WrongRuntimeCursor { .. } => "wrong_runtime_cursor",
         RuntimeError::WorkerNotFound { .. } => "worker_not_found",
         RuntimeError::WorkerExecutionUnavailable { .. } => "worker_execution_unavailable",
+        RuntimeError::ExecutionBackendUnavailable { .. } => "execution_backend_unavailable",
         RuntimeError::WorkerExecutionRejected { .. } => "worker_execution_rejected",
         RuntimeError::LimitTooLarge { .. } => "limit_too_large",
         RuntimeError::InvalidRequest(_) => "invalid_request",
@@ -872,7 +874,10 @@ pub enum RuntimeHttpServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{CapabilityRequest, ProfileSelector, WorkerIntent};
+    use crate::catalog::{ConfigBundleRef, ProfileSelector};
+    use crate::config_bundle::{
+        ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigProfileDescriptor,
+    };
     use crate::execution::{
         WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation,
         WorkerExecutionResult, WorkerExecutionRunState, WorkerExecutionSpawnRequest,
@@ -883,16 +888,38 @@ mod tests {
     use axum::http::Method;
     use tower::ServiceExt;
 
-    fn task_request(objective: &str) -> CreateWorkerRequest {
-        CreateWorkerRequest {
-            intent: WorkerIntent::Task {
-                objective: objective.to_string(),
+    fn test_bundle(profile: ProfileSelector) -> ConfigBundle {
+        ConfigBundle {
+            metadata: ConfigBundleMetadata {
+                id: "http-test-bundle".to_string(),
+                digest: String::new(),
+                revision: "test".to_string(),
+                workspace_id: "test-workspace".to_string(),
+                created_at: "test".to_string(),
+                provenance: ConfigBundleProvenance {
+                    source: "test".to_string(),
+                    detail: None,
+                },
             },
-            profile: ProfileSelector::Builtin("builtin:coder".to_string()),
-            config_bundle: None,
-            requested_capabilities: vec![CapabilityRequest::named("read")],
-            workspace_refs: Vec::new(),
-            mount_refs: Vec::new(),
+            profiles: vec![ConfigProfileDescriptor {
+                selector: profile,
+                label: Some("test".to_string()),
+            }],
+            declarations: Vec::new(),
+        }
+        .with_computed_digest()
+    }
+
+    fn task_request(_objective: &str) -> CreateWorkerRequest {
+        let profile = ProfileSelector::Builtin("builtin:coder".to_string());
+        let bundle = test_bundle(profile.clone());
+        CreateWorkerRequest {
+            profile,
+            config_bundle: ConfigBundleRef {
+                id: bundle.metadata.id,
+                digest: bundle.metadata.digest,
+            },
+            initial_input: None,
         }
     }
 
@@ -969,6 +996,11 @@ mod tests {
         let runtime =
             Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(AcceptingBackend))
                 .unwrap();
+        runtime
+            .store_config_bundle(test_bundle(ProfileSelector::Builtin(
+                "builtin:coder".to_string(),
+            )))
+            .unwrap();
         let app = runtime_http_router(runtime.clone(), None);
 
         let response = json_request(
@@ -1091,15 +1123,89 @@ mod tests {
 #[cfg(all(test, feature = "ws-server"))]
 mod ws_tests {
     use super::*;
+    use crate::catalog::{ConfigBundleRef, ProfileSelector};
+    use crate::config_bundle::{
+        ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigProfileDescriptor,
+    };
+    use crate::execution::{
+        WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation,
+        WorkerExecutionResult, WorkerExecutionRunState, WorkerExecutionSpawnRequest,
+        WorkerExecutionSpawnResult,
+    };
+    use crate::interaction::WorkerInput;
     use futures::{SinkExt, StreamExt};
+    use std::sync::Arc;
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message;
 
+    struct WsBackend;
+
+    impl WorkerExecutionBackend for WsBackend {
+        fn backend_id(&self) -> &str {
+            "ws-test"
+        }
+
+        fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
+            WorkerExecutionSpawnResult::Connected {
+                handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
+                run_state: WorkerExecutionRunState::Idle,
+            }
+        }
+
+        fn dispatch_input(
+            &self,
+            _handle: &WorkerExecutionHandle,
+            _input: WorkerInput,
+        ) -> WorkerExecutionResult {
+            WorkerExecutionResult::accepted(
+                WorkerExecutionOperation::Input,
+                WorkerExecutionRunState::Idle,
+            )
+        }
+    }
+
+    fn ws_test_bundle(profile: ProfileSelector) -> ConfigBundle {
+        ConfigBundle {
+            metadata: ConfigBundleMetadata {
+                id: "ws-test-bundle".to_string(),
+                digest: String::new(),
+                revision: "test".to_string(),
+                workspace_id: "test".to_string(),
+                created_at: "test".to_string(),
+                provenance: ConfigBundleProvenance {
+                    source: "test".to_string(),
+                    detail: None,
+                },
+            },
+            profiles: vec![ConfigProfileDescriptor {
+                selector: profile,
+                label: Some("ws".to_string()),
+            }],
+            declarations: Vec::new(),
+        }
+        .with_computed_digest()
+    }
+
+    fn ws_create_request() -> CreateWorkerRequest {
+        let bundle = ws_test_bundle(ProfileSelector::RuntimeDefault);
+        CreateWorkerRequest {
+            profile: ProfileSelector::RuntimeDefault,
+            config_bundle: ConfigBundleRef {
+                id: bundle.metadata.id,
+                digest: bundle.metadata.digest,
+            },
+            initial_input: None,
+        }
+    }
+
     async fn spawn_runtime_server() -> (Runtime, WorkerRef, String) {
-        let runtime = Runtime::new_memory();
-        let worker = runtime
-            .create_worker(CreateWorkerRequest::default())
+        let runtime =
+            Runtime::with_execution_backend(RuntimeOptions::default(), Arc::new(WsBackend))
+                .unwrap();
+        runtime
+            .store_config_bundle(ws_test_bundle(ProfileSelector::RuntimeDefault))
             .unwrap();
+        let worker = runtime.create_worker(ws_create_request()).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn({
@@ -1169,9 +1275,7 @@ mod ws_tests {
     #[tokio::test]
     async fn runtime_ws_cursor_resume_is_duplicate_safe_and_filters_workers() {
         let (runtime, worker_ref, url) = spawn_runtime_server().await;
-        let other = runtime
-            .create_worker(CreateWorkerRequest::default())
-            .unwrap();
+        let other = runtime.create_worker(ws_create_request()).unwrap();
         let first = runtime
             .observe_worker_event(
                 &worker_ref,

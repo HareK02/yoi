@@ -8,10 +8,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{sync::Arc, time::Duration};
 use worker_runtime::catalog::{
-    CapabilityRequest, ConfigBundleRef, CreateWorkerRequest, ProfileSelector,
-    WorkerDetail as EmbeddedWorkerDetail, WorkerIntent, WorkerStatus as EmbeddedWorkerStatus,
+    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerDetail as EmbeddedWorkerDetail,
+    WorkerStatus as EmbeddedWorkerStatus,
 };
-use worker_runtime::config_bundle::{ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary};
+use worker_runtime::config_bundle::{
+    ConfigBundle, ConfigBundleAvailability, ConfigBundleMetadata, ConfigBundleProvenance,
+    ConfigBundleSummary, ConfigProfileDescriptor,
+};
 use worker_runtime::error::RuntimeError as EmbeddedRuntimeError;
 use worker_runtime::execution::WorkerExecutionRunState;
 use worker_runtime::http_server::{
@@ -236,11 +239,12 @@ pub struct WorkerLookupResult {
 
 /// Browser-safe worker spawn request shape.
 ///
-/// The request intentionally carries only workspace policy intents, stable
-/// worker identifiers, optional profile selectors, config bundle refs, and
-/// requested capability names. Raw workspace roots, child cwd, executable path,
-/// Runtime endpoints/credentials, raw bundle storage paths, and host-local
-/// resolved WorkerSpec content are resolved by the runtime service and never
+/// The request carries Browser-facing launch semantics only: workspace intent,
+/// optional display identity, acceptance policy, optional profile selector, and
+/// optional initial input. Runtime execution authority is resolved by the host
+/// into a synced ConfigBundle before the canonical Runtime create request is
+/// built. Raw workspace roots, child cwd, executable paths, tool scope,
+/// credentials, raw config stores, sockets, sessions, and storage paths are not
 /// accepted from Workspace API callers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerSpawnRequest {
@@ -251,9 +255,7 @@ pub struct WorkerSpawnRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ProfileSelector>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config_bundle: Option<ConfigBundleRef>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub requested_capabilities: Vec<CapabilityRequest>,
+    pub initial_input: Option<EmbeddedWorkerInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -994,7 +996,7 @@ impl EmbeddedWorkerRuntime {
             worker_id: summary.worker_ref.worker_id.as_str().to_string(),
             host_id: self.host_id.clone(),
             label: safe_display_hint(summary.worker_ref.worker_id.as_str()),
-            role: embedded_intent_label(&summary.intent),
+            role: embedded_profile_label(&summary.profile),
             profile: embedded_profile_label(&summary.profile),
             workspace: WorkerWorkspaceSummary {
                 visibility: "backend_internal".to_string(),
@@ -1027,7 +1029,7 @@ impl EmbeddedWorkerRuntime {
             worker_id: detail.worker_id.as_str().to_string(),
             host_id: self.host_id.clone(),
             label: safe_display_hint(detail.worker_id.as_str()),
-            role: embedded_intent_label(&detail.intent),
+            role: embedded_profile_label(&detail.profile),
             profile: embedded_profile_label(&detail.profile),
             workspace: WorkerWorkspaceSummary {
                 visibility: "backend_internal".to_string(),
@@ -1195,26 +1197,35 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         if matches!(request.acceptance, WorkerSpawnAcceptanceRequirement::RunAccepted { expected_segments } if expected_segments > 0)
         {
             diagnostics.push(diagnostic(
-                "embedded_runtime_tools_less",
+                "embedded_runtime_acceptance_projection",
                 DiagnosticSeverity::Info,
-                "Embedded Runtime v0 creates a tools-less catalog Worker and does not spawn provider segments".to_string(),
+                "Embedded Runtime accepts creation through a runtime execution backend; provider segment counts are observed after execution, not faked at create time".to_string(),
             ));
         }
 
+        let profile = request
+            .profile
+            .clone()
+            .unwrap_or_else(|| embedded_profile_selector(&request.intent));
+        let config_bundle = match self
+            .runtime
+            .store_config_bundle(default_embedded_config_bundle(&profile))
+        {
+            Ok(availability) => availability.reference,
+            Err(error) => {
+                diagnostics.push(embedded_runtime_diagnostic(&error));
+                return WorkerSpawnResult {
+                    state: WorkerOperationState::Rejected,
+                    worker: None,
+                    acceptance_evidence: Vec::new(),
+                    diagnostics,
+                };
+            }
+        };
         let create_request = CreateWorkerRequest {
-            intent: embedded_create_intent(&request.intent),
-            profile: request
-                .profile
-                .clone()
-                .unwrap_or_else(|| embedded_profile_selector(&request.intent)),
-            config_bundle: request.config_bundle.clone(),
-            requested_capabilities: if request.requested_capabilities.is_empty() {
-                vec![CapabilityRequest::named("read")]
-            } else {
-                request.requested_capabilities.clone()
-            },
-            workspace_refs: Vec::new(),
-            mount_refs: Vec::new(),
+            profile,
+            config_bundle,
+            initial_input: request.initial_input.clone(),
         };
         match self.runtime.create_worker(create_request) {
             Ok(detail) => {
@@ -1675,7 +1686,7 @@ impl RemoteWorkerRuntime {
             worker_id: summary.worker_ref.worker_id.as_str().to_string(),
             host_id: self.host_id.clone(),
             label: safe_display_hint(summary.worker_ref.worker_id.as_str()),
-            role: embedded_intent_label(&summary.intent),
+            role: None,
             profile: embedded_profile_label(&summary.profile),
             workspace: WorkerWorkspaceSummary {
                 visibility: "remote_runtime".to_string(),
@@ -1707,7 +1718,7 @@ impl RemoteWorkerRuntime {
             worker_id: detail.worker_id.as_str().to_string(),
             host_id: self.host_id.clone(),
             label: safe_display_hint(detail.worker_id.as_str()),
-            role: embedded_intent_label(&detail.intent),
+            role: None,
             profile: embedded_profile_label(&detail.profile),
             workspace: WorkerWorkspaceSummary {
                 visibility: "remote_runtime".to_string(),
@@ -1875,20 +1886,24 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 )],
             };
         }
+        let profile = request
+            .profile
+            .clone()
+            .unwrap_or_else(|| embedded_profile_selector(&request.intent));
+        let sync = self.sync_config_bundle(default_embedded_config_bundle(&profile));
+        let Some(config_bundle) = sync.availability.map(|availability| availability.reference)
+        else {
+            return WorkerSpawnResult {
+                state: WorkerOperationState::Rejected,
+                worker: None,
+                acceptance_evidence: Vec::new(),
+                diagnostics: sync.diagnostics,
+            };
+        };
         let create = CreateWorkerRequest {
-            intent: embedded_create_intent(&request.intent),
-            profile: request
-                .profile
-                .clone()
-                .unwrap_or_else(|| embedded_profile_selector(&request.intent)),
-            config_bundle: request.config_bundle.clone(),
-            requested_capabilities: if request.requested_capabilities.is_empty() {
-                vec![CapabilityRequest::named("read")]
-            } else {
-                request.requested_capabilities.clone()
-            },
-            workspace_refs: Vec::new(),
-            mount_refs: Vec::new(),
+            profile,
+            config_bundle,
+            initial_input: request.initial_input.clone(),
         };
         match self.post_json::<_, RuntimeHttpWorkerResponse>("/v1/workers", &create) {
             Ok(response) => WorkerSpawnResult {
@@ -2138,21 +2153,32 @@ fn embedded_worker_execution_status_label(
     }
 }
 
-fn embedded_create_intent(intent: &WorkerSpawnIntent) -> WorkerIntent {
-    match intent {
-        WorkerSpawnIntent::WorkspaceCompanion => WorkerIntent::Role {
-            role: "workspace_companion".to_string(),
-            purpose: Some("workspace backend internal companion".to_string()),
+fn default_embedded_config_bundle(profile: &ProfileSelector) -> ConfigBundle {
+    let id = format!(
+        "workspace-runtime-{}",
+        embedded_profile_label(profile)
+            .unwrap_or_else(|| "default".to_string())
+            .replace([':', '/', ' '], "-")
+    );
+    ConfigBundle {
+        metadata: ConfigBundleMetadata {
+            id,
+            digest: String::new(),
+            revision: "workspace-runtime-v0".to_string(),
+            workspace_id: "workspace-server".to_string(),
+            created_at: "runtime-generated".to_string(),
+            provenance: ConfigBundleProvenance {
+                source: "workspace-server".to_string(),
+                detail: Some("backend-resolved launch bundle".to_string()),
+            },
         },
-        WorkerSpawnIntent::WorkspaceOrchestrator => WorkerIntent::Role {
-            role: "workspace_orchestrator".to_string(),
-            purpose: Some("workspace backend internal orchestration".to_string()),
-        },
-        WorkerSpawnIntent::TicketRole { ticket_id, role } => WorkerIntent::Role {
-            role: ticket_role_profile_slug(role).to_string(),
-            purpose: Some(format!("ticket {ticket_id}")),
-        },
+        profiles: vec![ConfigProfileDescriptor {
+            selector: profile.clone(),
+            label: embedded_profile_label(profile),
+        }],
+        declarations: Vec::new(),
     }
+    .with_computed_digest()
 }
 
 fn embedded_profile_selector(intent: &WorkerSpawnIntent) -> ProfileSelector {
@@ -2173,16 +2199,6 @@ fn ticket_role_profile_slug(role: &TicketWorkerRole) -> &'static str {
         TicketWorkerRole::Orchestrator => "orchestrator",
         TicketWorkerRole::Coder => "coder",
         TicketWorkerRole::Reviewer => "reviewer",
-    }
-}
-
-fn embedded_intent_label(intent: &WorkerIntent) -> Option<String> {
-    match intent {
-        WorkerIntent::Assistant { purpose } => {
-            purpose.clone().or_else(|| Some("assistant".to_string()))
-        }
-        WorkerIntent::Task { objective } => Some(safe_display_hint(objective)),
-        WorkerIntent::Role { role, .. } => Some(safe_display_hint(role)),
     }
 }
 
@@ -2324,7 +2340,8 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             DiagnosticSeverity::Warning,
             "Embedded Runtime worker was not found".to_string(),
         ),
-        EmbeddedRuntimeError::WorkerExecutionUnavailable { .. } => diagnostic(
+        EmbeddedRuntimeError::WorkerExecutionUnavailable { .. }
+        | EmbeddedRuntimeError::ExecutionBackendUnavailable { .. } => diagnostic(
             "embedded_worker_execution_unavailable",
             DiagnosticSeverity::Warning,
             "Embedded Worker has no execution backend attached".to_string(),
@@ -2962,8 +2979,7 @@ mod tests {
                 expected_segments: 0,
             },
             profile: None,
-            config_bundle: None,
-            requested_capabilities: Vec::new(),
+            initial_input: None,
         }
     }
 
@@ -2978,13 +2994,10 @@ mod tests {
         assert_eq!(spawned.state, WorkerOperationState::Rejected);
         assert!(spawned.acceptance_evidence.is_empty());
         assert!(spawned.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "embedded_worker_execution_spawn_errored"
+            diagnostic.code == "embedded_worker_execution_rejected"
                 && !diagnostic.message.contains("/tmp/secret-provider-config")
         }));
-        let worker = spawned.worker.expect("failed execution is still projected");
-        assert_eq!(worker.status, "errored");
-        assert!(!worker.capabilities.can_accept_input);
-        assert!(!worker.capabilities.can_stop);
+        assert!(spawned.worker.is_none());
     }
 
     #[test]
@@ -3035,8 +3048,13 @@ mod tests {
 
     #[test]
     fn embedded_runtime_registers_routes_input_and_transcript_without_internal_leaks() {
-        let registry =
-            RuntimeRegistry::for_workspace(EmbeddedWorkerRuntime::new_memory("local:test"));
+        let registry = RuntimeRegistry::for_workspace(
+            EmbeddedWorkerRuntime::new_memory_with_execution_backend(
+                "local:test",
+                Arc::new(AcceptingExecutionBackend::default()),
+            )
+            .expect("test backend should connect"),
+        );
 
         let runtimes = registry.list_runtimes(10);
         let embedded_summary = runtimes
@@ -3050,7 +3068,7 @@ mod tests {
         );
         assert_eq!(embedded_summary.source.status, RuntimeSourceStatus::Active);
         assert!(embedded_summary.capabilities.can_spawn_worker);
-        assert!(!embedded_summary.capabilities.can_accept_input);
+        assert!(embedded_summary.capabilities.can_accept_input);
 
         let spawned = registry
             .spawn_worker(
@@ -3065,8 +3083,7 @@ mod tests {
                         expected_segments: 0,
                     },
                     profile: None,
-                    config_bundle: None,
-                    requested_capabilities: Vec::new(),
+                    initial_input: None,
                 },
             )
             .unwrap();
@@ -3083,7 +3100,7 @@ mod tests {
         assert_eq!(worker.workspace.identity, "runtime_registry_worker");
         assert_eq!(worker.implementation.kind, "embedded_worker_runtime");
         assert_eq!(worker.profile.as_deref(), Some("builtin:coder"));
-        assert!(!worker.capabilities.can_accept_input);
+        assert!(worker.capabilities.can_accept_input);
 
         let input = registry
             .send_input(
@@ -3095,21 +3112,20 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(input.state, WorkerOperationState::Rejected);
+        assert_eq!(input.state, WorkerOperationState::Accepted);
         assert_eq!(input.runtime_id, EMBEDDED_RUNTIME_ID);
         assert_eq!(input.worker_id, worker.worker_id);
-        assert!(
-            input
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "embedded_worker_execution_unavailable")
-        );
 
         let transcript = registry
             .transcript(EMBEDDED_RUNTIME_ID, &worker.worker_id, 0, 10)
             .unwrap();
         assert_eq!(transcript.state, WorkerOperationState::Accepted);
-        assert!(transcript.items.is_empty());
+        assert!(
+            transcript
+                .items
+                .iter()
+                .any(|entry| entry.role == "user" && entry.content == "hello embedded runtime")
+        );
 
         let json = serde_json::to_string(&(embedded_summary, worker, transcript)).unwrap();
         for forbidden in [
@@ -3132,9 +3148,13 @@ mod tests {
 
     #[test]
     fn embedded_backend_syncs_config_bundle_and_spawns_with_bundle_ref() {
-        let registry = RuntimeRegistry::new(vec![Arc::new(EmbeddedWorkerRuntime::new_memory(
-            "local:test",
-        ))]);
+        let registry = RuntimeRegistry::new(vec![Arc::new(
+            EmbeddedWorkerRuntime::new_memory_with_execution_backend(
+                "local:test",
+                Arc::new(AcceptingExecutionBackend::default()),
+            )
+            .unwrap(),
+        )]);
         let bundle = test_config_bundle();
         let sync = registry
             .sync_config_bundle(EMBEDDED_RUNTIME_ID, bundle.clone())
@@ -3162,8 +3182,7 @@ mod tests {
                         expected_segments: 0,
                     },
                     profile: Some(ProfileSelector::Builtin("builtin:coder".to_string())),
-                    config_bundle: Some(reference),
-                    requested_capabilities: vec![CapabilityRequest::named("read")],
+                    initial_input: None,
                 },
             )
             .unwrap();
@@ -3176,9 +3195,13 @@ mod tests {
 
     #[test]
     fn embedded_runtime_rejects_socket_ready_acceptance_without_socket_identity() {
-        let registry = RuntimeRegistry::new(vec![Arc::new(EmbeddedWorkerRuntime::new_memory(
-            "local:test",
-        ))]);
+        let registry = RuntimeRegistry::new(vec![Arc::new(
+            EmbeddedWorkerRuntime::new_memory_with_execution_backend(
+                "local:test",
+                Arc::new(AcceptingExecutionBackend::default()),
+            )
+            .unwrap(),
+        )]);
         let result = registry
             .spawn_worker(
                 EMBEDDED_RUNTIME_ID,
@@ -3187,8 +3210,7 @@ mod tests {
                     requested_worker_name: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::SocketReady,
                     profile: None,
-                    config_bundle: None,
-                    requested_capabilities: Vec::new(),
+                    initial_input: None,
                 },
             )
             .unwrap();
@@ -3480,12 +3502,7 @@ mod tests {
             "execution": { "backend": "connected", "run_state": "idle" },
             "intent": { "kind": "role", "role": "coder", "purpose": "remote test" },
             "profile": { "kind": "builtin", "value": "coder" },
-            "config_bundle": null,
-            "requested_capabilities": [],
-            "workspace_refs": [],
-            "mount_refs": [],
-            "requested_capability_count": 0,
-            "has_config_bundle": false,
+            "config_bundle": { "id": "remote-bundle", "digest": "remote-digest" },
             "transcript_len": 0,
             "last_event_id": 0
         })

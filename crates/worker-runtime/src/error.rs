@@ -35,6 +35,9 @@ pub enum RuntimeError {
         message: String,
     },
 
+    #[error("worker creation has no execution backend: {message}")]
+    ExecutionBackendUnavailable { message: String },
+
     #[error("worker {worker_id} execution {operation:?} returned {outcome:?}: {message}")]
     WorkerExecutionRejected {
         worker_id: WorkerId,

@@ -24,4 +24,5 @@ mod runtime;
 
 #[cfg(feature = "fs-store")]
 pub use fs_store::{FsRuntimeStore, FsRuntimeStoreOptions};
+pub use management::{RuntimeLimits, RuntimeOptions};
 pub use runtime::Runtime;
