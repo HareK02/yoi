@@ -252,3 +252,43 @@ Review focus:
 - validation evidence is plausible and sufficient
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KW7835H0-pod-cleanup at: 2026-06-28T19:51:02Z status: request_changes -->
+
+## Review: request changes
+
+request_changes
+
+対象 commit `17a9488a4aa0a3dc83be2d3360b6ffd8ffcaeb5a` を read-only で確認した。worktree は clean、`git diff --check HEAD^ HEAD` は成功。重い `cargo` / `deno` / `nix` は reviewer では再実行せず、報告済み validation は diff/code 上で plausibility を確認した。
+
+## 満たしている点
+
+- `crates/pod` / `crates/pod-registry` / `crates/pod-store` のディレクトリは存在しない。
+- `Cargo.toml` workspace members/default-members/dependencies、active crate `Cargo.toml`、`Cargo.lock`、`package.nix` から `pod-registry` / `pod-store` dependency は除去済み。
+- `manifest::paths::pod_registry_path` / `pod_registry::...` / `pod_store::...` 参照は active source から消えている。
+- `pod-store` 相当の `WorkerMetadataStore` / `FsWorkerStore` / `CombinedStore` は `session-store::worker_metadata` へ移され、`data_dir/workers` の Worker metadata と session log store に分離されている。
+- `worker-runtime` 側は `RuntimeId + WorkerId` を authority とする fs-store / execution backend mapping が残っており、旧 pod path/socket/session path を authority にしない設計コメント・境界も確認した。
+
+## Blockers
+
+1. **active CLI output に旧 `pod` 名が残っている。**
+
+   `crates/yoi/src/worker_cleanup_cli.rs:242` / `253` で `yoi worker delete` の refusal 出力が `pod: {}` になっている。これは Ticket の「TUI / yoi CLI / worker cleanup CLI から旧 Pod metadata inventory / cleanup 依存を削除」「Active UI / CLI / prompt / test output に旧 Pod concept が正規 concept として残らない」に反する。`worker:` に直す必要がある。
+
+2. **LLM/tool-visible な active Worker allocation error が旧 Pod authority wording のまま。**
+
+   `crates/worker/src/runtime/worker_allocation/error.rs:14,16,29,32` に以下が残っている:
+   - `pod name ... is already registered`
+   - `conflicts with pod ...`
+   - `pod ... is not registered`
+   - `session ... is already held by pod ...`
+
+   これらは `crates/worker/src/spawn/tool.rs:867-875` で `ToolError` に `e.to_string()` として流れるため、単なる内部コメントではなく active tool/user-facing error。旧 `pod-registry` crate は消えているが、移管先の active scope allocation path が旧 Pod 名で authority/error を表現しており、Ticket intent に対して未完了。
+
+3. **active e2e harness artifact に旧 pod registry / metadata path が残っている。**
+
+   `tests/e2e/src/lib.rs:1624-1625` が `tested_yoi_pod_registry: ... pods.json` と `fixture_pod_metadata_root: ... pods` を書き出している。`tests/e2e` は workspace member なので、historical docs/report ではなく active test source/output と見なされる。現 Runtime/Worker path へ更新するか、legacy/historical fixture として明確に分類・隔離する必要がある。
+
+上記を直したうえで、報告済み validation 一式（少なくとも `cargo check -p yoi`, `cargo test -p worker`, `cargo test -p worker-runtime --features ws-server`, `cargo test -p yoi-workspace-server`, `deno task check`, `git diff --check`, `nix build .#yoi --no-link`）を再確認すること。
+
+---
