@@ -348,3 +348,55 @@ Final state:
 - child worktree is clean.
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KW7835H0-pod-cleanup at: 2026-06-28T20:00:09Z status: request_changes -->
+
+## Review: request changes
+
+request_changes
+
+再レビューは read-only で実施した。`c46e880b` は確認済みで、worktree は clean、`git diff --check HEAD^ HEAD` は成功。重い `cargo` / `deno` / `nix` は read-only 指示のため再実行せず、報告 validation はコード上の整合性を確認した。
+
+前回指摘分のうち、以下は修正済み:
+
+- `crates/yoi/src/worker_cleanup_cli.rs` の active refusal output は `pod:` ではなく `worker:` になっている。
+- `crates/worker/src/runtime/worker_allocation/error.rs` の user-facing error は Pod wording から Worker/allocation wording に変更されている。
+- `tests/e2e/src/lib.rs` の artifact key / helper 名は `tested_yoi_worker_allocation` / `fixture_worker_metadata_root` / `write_blocking_worker_metadata` に変更されている。
+- `crates/pod` / `crates/pod-registry` / `crates/pod-store` の crate directory / workspace dependency / lock / package 参照は残っていない。
+
+## Blocker
+
+### E2E fixture の Worker metadata root が active store と一致していない
+
+`tests/e2e/src/lib.rs` は現在も Worker metadata を `XDG_DATA_HOME` 側へ書いている。
+
+- `tests/e2e/src/lib.rs:1353-1354`
+  - `write_blocking_worker_metadata(&fixture.xdg_data_home, "workspace")?;`
+  - `write_blocking_worker_metadata(&fixture.xdg_data_home, "workspace-orchestrator")?;`
+- `tests/e2e/src/lib.rs:1625`
+  - `"fixture_worker_metadata_root": self.xdg_data_home.join("yoi").join("workers")`
+- `tests/e2e/src/lib.rs:2000-2003`
+  - `data_home.join("yoi").join("workers").join(worker_name)`
+
+しかし active Worker metadata store は `manifest::paths::data_dir()` ベース:
+
+- `crates/manifest/src/paths.rs:41-46`
+  - `data_dir()` は `YOI_DATA_DIR` / `YOI_HOME` / `HOME` を見る。`XDG_DATA_HOME` は使わない。
+- `crates/worker/src/entrypoint.rs:487-494`
+  - worker metadata dir は `paths::data_dir().join("workers")`
+- `crates/yoi/src/worker_cleanup_cli.rs:209-237`
+  - cleanup CLI も `paths::data_dir().join("workers")`
+
+E2E harness は `HOME` と `XDG_DATA_HOME` を分けて渡しており、`YOI_DATA_DIR` は設定していない。そのため実際の active metadata root は fixture 上では概ね `$HOME/.yoi/workers` だが、現在の fixture/helper/artifact は `$XDG_DATA_HOME/yoi/workers` を指している。
+
+これは表面上の naming は直っているが、移行後の Worker/session-store 境界と一致していないため、E2E fixture が正しい Worker metadata store をブロック・記録できない。Ticket の「必要な Worker metadata/session persistence を Worker/Runtime/session-store boundaries へ移す」「tests が旧 Pod metadata inventory に依存しない」に対して未完了。
+
+修正案:
+
+- `write_blocking_worker_metadata` に `fixture.home` または解決済み `data_dir` を渡し、`$HOME/.yoi/workers` に書く。
+- または E2E subprocess に `YOI_DATA_DIR` を明示し、helper / artifact / subprocess env が同じ data root を使うように揃える。
+- `fixture_worker_metadata_root` も同じ resolved active path を記録する。
+
+補足: `YOI_POD_RUNTIME_COMMAND` の残存は既存設計上の dev executable-path override として扱い、今回の blocker にはしていない。
+
+---
