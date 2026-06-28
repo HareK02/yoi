@@ -132,7 +132,7 @@ fn resolve_socket(worker_name: &str, override_path: Option<PathBuf>) -> PathBuf 
     if let Some(p) = override_path {
         return p;
     }
-    manifest::paths::pod_socket_path(worker_name).unwrap_or_else(|| {
+    manifest::paths::worker_socket_path(worker_name).unwrap_or_else(|| {
         PathBuf::from("/tmp")
             .join("yoi")
             .join(worker_name)
@@ -317,7 +317,7 @@ async fn connect_live_pod(
     if !allow_registry_fallback {
         return None;
     }
-    let registry_socket = picker::live_socket_for_pod(worker_name)?;
+    let registry_socket = picker::live_socket_for_worker(worker_name)?;
     if registry_socket == preferred_socket {
         return None;
     }

@@ -15,7 +15,7 @@ use tempfile::TempDir;
 use tokio::net::UnixListener;
 use worker::ipc::event::{apply_event_side_effects, fire_and_forget, render_event};
 use worker::runtime::dir::{RuntimeDir, SpawnedWorkerRecord};
-use worker::runtime::pod_registry::{self, LockFileGuard};
+use worker::runtime::worker_allocation::{self, LockFileGuard};
 use worker::spawn::registry::SpawnedWorkerRegistry;
 
 /// Serialises tests that mutate `YOI_RUNTIME_DIR`.
@@ -62,7 +62,7 @@ impl Drop for EnvGuard {
     }
 }
 
-/// Point `YOI_RUNTIME_DIR` at `dir`. The pod-registry then lives at
+/// Point `YOI_RUNTIME_DIR` at `dir`. The worker-allocation then lives at
 /// `<dir>/workers.json` and Worker runtime sub-dirs at `<dir>/{worker_name}/`.
 fn set_runtime_dir(dir: &std::path::Path) {
     unsafe {
@@ -380,7 +380,7 @@ async fn shutdown_releases_scope_allocation_when_present() {
 
     // Install a top-level allocation for "kid" so ShutDown has
     // something to release.
-    let guard = pod_registry::install_top_level(
+    let guard = worker_allocation::install_top_level(
         "kid".into(),
         std::process::id(),
         "/tmp/kid.sock".into(),
@@ -412,7 +412,7 @@ async fn shutdown_releases_scope_allocation_when_present() {
     )
     .await;
 
-    // Allocation is gone from the pod-registry.
+    // Allocation is gone from the worker-allocation.
     let g = LockFileGuard::open(&lock_path).unwrap();
     assert!(
         g.data().find("kid").is_none(),

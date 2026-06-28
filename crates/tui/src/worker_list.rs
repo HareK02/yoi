@@ -1,13 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io;
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use client::WorkerClient;
-use pod_registry::{LockFileGuard, default_registry_path};
-use pod_store::{WorkerActiveSegmentRef, WorkerMetadata, WorkerMetadataStore};
+use manifest::paths;
 use protocol::{Event, WorkerStatus};
+use serde::Deserialize;
 use session_store::{FsStore, SegmentId, SessionId};
+use session_store::{WorkerActiveSegmentRef, WorkerMetadata, WorkerMetadataStore};
 
 #[derive(Debug, Clone)]
 pub(crate) struct WorkerList {
@@ -314,11 +316,14 @@ pub(crate) enum WorkerEntryDiagnosticKind {
 
 pub(crate) fn read_stored_worker_infos(
     store: &FsStore,
-    pod_store: &impl WorkerMetadataStore,
+    worker_metadata_store: &impl WorkerMetadataStore,
 ) -> Result<Vec<StoredWorkerInfo>, io::Error> {
     let mut records = Vec::new();
-    for worker_name in pod_store.list_names().map_err(io::Error::other)? {
-        let info = match pod_store.read_by_name(&worker_name) {
+    for worker_name in worker_metadata_store
+        .list_names()
+        .map_err(io::Error::other)?
+    {
+        let info = match worker_metadata_store.read_by_name(&worker_name) {
             Ok(Some(metadata)) => stored_info_from_metadata(store, worker_name, metadata),
             Ok(None) => corrupt_stored_info(
                 worker_name,
@@ -331,16 +336,24 @@ pub(crate) fn read_stored_worker_infos(
     Ok(records)
 }
 
-pub(crate) fn read_live_pod_infos() -> Result<Vec<LiveWorkerInfo>, io::Error> {
-    let path = default_registry_path()?;
-    let guard = LockFileGuard::open(&path)?;
-    Ok(guard
-        .data()
+pub(crate) fn read_live_worker_infos() -> Result<Vec<LiveWorkerInfo>, io::Error> {
+    let path = paths::worker_allocation_path().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "could not resolve worker allocation path",
+        )
+    })?;
+    let table = match read_worker_allocation_table(&path) {
+        Ok(table) => table,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    Ok(table
         .allocations
-        .iter()
+        .into_iter()
         .map(|allocation| LiveWorkerInfo {
-            worker_name: allocation.worker_name.clone(),
-            socket_path: allocation.socket.clone(),
+            worker_name: allocation.worker_name,
+            socket_path: allocation.socket,
             status: None,
             reachable: false,
             segment_id: allocation.segment_id,
@@ -349,20 +362,49 @@ pub(crate) fn read_live_pod_infos() -> Result<Vec<LiveWorkerInfo>, io::Error> {
         .collect())
 }
 
-pub(crate) async fn read_reachable_live_pod_infos(
-    store: &FsStore,
-) -> Result<Vec<LiveWorkerInfo>, io::Error> {
-    let records = read_live_pod_infos()?;
-    probe_reachable_live_pod_infos(store, records).await
+fn read_worker_allocation_table(path: &Path) -> Result<WorkerAllocationTable, io::Error> {
+    let mut file = File::open(path)?;
+    fs4::fs_std::FileExt::lock_shared(&file)?;
+    let mut contents = String::new();
+    let read_result = file.read_to_string(&mut contents);
+    let unlock_result = fs4::fs_std::FileExt::unlock(&file);
+    read_result?;
+    unlock_result?;
+
+    if contents.trim().is_empty() {
+        return Ok(WorkerAllocationTable::default());
+    }
+    serde_json::from_str(&contents).map_err(io::Error::other)
 }
 
-async fn probe_reachable_live_pod_infos(
+#[derive(Debug, Default, Deserialize)]
+struct WorkerAllocationTable {
+    #[serde(default)]
+    allocations: Vec<WorkerAllocationRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerAllocationRecord {
+    worker_name: String,
+    socket: PathBuf,
+    #[serde(default)]
+    segment_id: Option<SegmentId>,
+}
+
+pub(crate) async fn read_reachable_live_worker_infos(
+    store: &FsStore,
+) -> Result<Vec<LiveWorkerInfo>, io::Error> {
+    let records = read_live_worker_infos()?;
+    probe_reachable_live_worker_infos(store, records).await
+}
+
+async fn probe_reachable_live_worker_infos(
     _store: &FsStore,
     records: Vec<LiveWorkerInfo>,
 ) -> Result<Vec<LiveWorkerInfo>, io::Error> {
     let mut handles = Vec::with_capacity(records.len());
     for record in records {
-        handles.push(tokio::spawn(probe_live_pod_info(record)));
+        handles.push(tokio::spawn(probe_live_worker_info(record)));
     }
 
     let mut reachable = Vec::with_capacity(handles.len());
@@ -378,15 +420,15 @@ async fn probe_reachable_live_pod_infos(
     Ok(reachable)
 }
 
-async fn probe_live_pod_info(mut record: LiveWorkerInfo) -> Result<LiveWorkerInfo, io::Error> {
+async fn probe_live_worker_info(mut record: LiveWorkerInfo) -> Result<LiveWorkerInfo, io::Error> {
     let status = probe_live_status(&record.socket_path).await?;
     record.reachable = true;
     record.status = status;
     Ok(record)
 }
 
-pub(crate) fn live_socket_for_pod(worker_name: &str) -> Option<PathBuf> {
-    read_live_pod_infos()
+pub(crate) fn live_socket_for_worker(worker_name: &str) -> Option<PathBuf> {
+    read_live_worker_infos()
         .ok()?
         .into_iter()
         .find(|worker| worker.worker_name == worker_name)
@@ -560,10 +602,10 @@ mod tests {
     use std::sync::Arc;
 
     use llm_engine::llm_client::types::RequestConfig;
-    use pod_store::FsWorkerStore;
-    use pod_store::{WorkerActiveSegmentRef, WorkerMetadataStore};
     use protocol::stream::JsonLineWriter;
+    use session_store::FsWorkerStore;
     use session_store::{LogEntry, Store, new_segment_id, new_session_id};
+    use session_store::{WorkerActiveSegmentRef, WorkerMetadataStore};
     use tempfile::tempdir;
     use tokio::net::UnixListener;
     use tokio::sync::Barrier;
@@ -877,7 +919,7 @@ mod tests {
 
         let records = tokio::time::timeout(
             LIVE_STATUS_PROBE_TIMEOUT * 3,
-            probe_reachable_live_pod_infos(&store, records),
+            probe_reachable_live_worker_infos(&store, records),
         )
         .await
         .expect("status probes should complete")
@@ -907,7 +949,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        let records = probe_reachable_live_pod_infos(
+        let records = probe_reachable_live_worker_infos(
             &store,
             vec![live_probe_record("silent", socket_path.clone())],
         )
@@ -985,12 +1027,12 @@ mod tests {
     fn read_stored_worker_infos_reports_corrupt_metadata() {
         let dir = tempdir().unwrap();
         let store = FsStore::new(dir.path()).unwrap();
-        let pod_store = FsWorkerStore::new(dir.path().join("pods")).unwrap();
-        let pod_dir = dir.path().join("pods").join("broken");
-        std::fs::create_dir_all(&pod_dir).unwrap();
-        std::fs::write(pod_dir.join("metadata.json"), "{not-json").unwrap();
+        let worker_metadata_store = FsWorkerStore::new(dir.path().join("workers")).unwrap();
+        let worker_metadata_dir = dir.path().join("workers").join("broken");
+        std::fs::create_dir_all(&worker_metadata_dir).unwrap();
+        std::fs::write(worker_metadata_dir.join("metadata.json"), "{not-json").unwrap();
 
-        let records = read_stored_worker_infos(&store, &pod_store).unwrap();
+        let records = read_stored_worker_infos(&store, &worker_metadata_store).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].worker_name, "broken");
         assert!(matches!(
@@ -1003,10 +1045,10 @@ mod tests {
     fn read_stored_worker_infos_reads_metadata() {
         let dir = tempdir().unwrap();
         let store = FsStore::new(dir.path()).unwrap();
-        let pod_store = FsWorkerStore::new(dir.path().join("pods")).unwrap();
+        let worker_metadata_store = FsWorkerStore::new(dir.path().join("workers")).unwrap();
         let session_id = new_session_id();
         let segment_id = new_segment_id();
-        pod_store
+        worker_metadata_store
             .write(&WorkerMetadata::new(
                 "agent",
                 Some(WorkerActiveSegmentRef::active_segment(
@@ -1015,7 +1057,7 @@ mod tests {
             ))
             .unwrap();
 
-        let records = read_stored_worker_infos(&store, &pod_store).unwrap();
+        let records = read_stored_worker_infos(&store, &worker_metadata_store).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].worker_name, "agent");
         assert_eq!(records[0].metadata_state, StoredMetadataState::Present);

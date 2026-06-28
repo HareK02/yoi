@@ -12,8 +12,8 @@
 //! model remain session JSONL history. Socket and callback paths are last-known
 //! runtime hints, not proof of liveness.
 
+use crate::{SegmentId, SessionId};
 use serde::{Deserialize, Serialize};
-use session_store::{SegmentId, SessionId};
 use std::fs;
 use std::path::PathBuf;
 
@@ -26,8 +26,8 @@ pub enum WorkerStoreError {
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 
-    #[error("invalid pod name: {0}")]
-    InvalidPodName(String),
+    #[error("invalid worker name: {0}")]
+    InvalidWorkerName(String),
 }
 
 /// Active Session/Segment pointer for a Worker.
@@ -284,13 +284,13 @@ impl FsWorkerStore {
         Ok(Self { root })
     }
 
-    fn pod_dir(&self, worker_name: &str) -> Result<PathBuf, WorkerStoreError> {
+    fn worker_dir(&self, worker_name: &str) -> Result<PathBuf, WorkerStoreError> {
         validate_worker_name(worker_name)?;
         Ok(self.root.join(worker_name))
     }
 
     fn metadata_path(&self, worker_name: &str) -> Result<PathBuf, WorkerStoreError> {
-        Ok(self.pod_dir(worker_name)?.join("metadata.json"))
+        Ok(self.worker_dir(worker_name)?.join("metadata.json"))
     }
 }
 
@@ -364,7 +364,7 @@ pub fn validate_worker_name(worker_name: &str) -> Result<(), WorkerStoreError> {
         || worker_name.contains('/')
         || worker_name.contains('\0')
     {
-        return Err(WorkerStoreError::InvalidPodName(worker_name.to_string()));
+        return Err(WorkerStoreError::InvalidWorkerName(worker_name.to_string()));
     }
     Ok(())
 }
@@ -372,61 +372,58 @@ pub fn validate_worker_name(worker_name: &str) -> Result<(), WorkerStoreError> {
 /// Convenience composition for callers that want one handle carrying separate
 /// session-log and Worker-state roots.
 #[derive(Clone)]
-pub struct CombinedStore<S, P> {
+pub struct CombinedStore<S, W> {
     pub session_store: S,
-    pub pod_store: P,
+    pub worker_metadata_store: W,
 }
 
-impl<S, P> CombinedStore<S, P> {
-    pub fn new(session_store: S, pod_store: P) -> Self {
+impl<S, W> CombinedStore<S, W> {
+    pub fn new(session_store: S, worker_metadata_store: W) -> Self {
         Self {
             session_store,
-            pod_store,
+            worker_metadata_store,
         }
     }
 }
 
-impl<S, P> session_store::Store for CombinedStore<S, P>
+impl<S, W> crate::Store for CombinedStore<S, W>
 where
-    S: session_store::Store,
-    P: Send + Sync,
+    S: crate::Store,
+    W: Send + Sync,
 {
     fn append(
         &self,
         session_id: SessionId,
         segment_id: SegmentId,
-        entry: &session_store::LogEntry,
-    ) -> Result<(), session_store::StoreError> {
+        entry: &crate::LogEntry,
+    ) -> Result<(), crate::StoreError> {
         self.session_store.append(session_id, segment_id, entry)
     }
     fn read_all(
         &self,
         session_id: SessionId,
         segment_id: SegmentId,
-    ) -> Result<Vec<session_store::LogEntry>, session_store::StoreError> {
+    ) -> Result<Vec<crate::LogEntry>, crate::StoreError> {
         self.session_store.read_all(session_id, segment_id)
     }
-    fn list_sessions(&self) -> Result<Vec<SessionId>, session_store::StoreError> {
+    fn list_sessions(&self) -> Result<Vec<SessionId>, crate::StoreError> {
         self.session_store.list_sessions()
     }
-    fn list_segments(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Vec<SegmentId>, session_store::StoreError> {
+    fn list_segments(&self, session_id: SessionId) -> Result<Vec<SegmentId>, crate::StoreError> {
         self.session_store.list_segments(session_id)
     }
     fn lookup_session_of(
         &self,
         segment_id: SegmentId,
-    ) -> Result<Option<SessionId>, session_store::StoreError> {
+    ) -> Result<Option<SessionId>, crate::StoreError> {
         self.session_store.lookup_session_of(segment_id)
     }
     fn create_segment(
         &self,
         session_id: SessionId,
         segment_id: SegmentId,
-        entries: &[session_store::LogEntry],
-    ) -> Result<(), session_store::StoreError> {
+        entries: &[crate::LogEntry],
+    ) -> Result<(), crate::StoreError> {
         self.session_store
             .create_segment(session_id, segment_id, entries)
     }
@@ -434,7 +431,7 @@ where
         &self,
         session_id: SessionId,
         segment_id: SegmentId,
-    ) -> Result<bool, session_store::StoreError> {
+    ) -> Result<bool, crate::StoreError> {
         self.session_store.exists(session_id, segment_id)
     }
     fn truncate(
@@ -442,7 +439,7 @@ where
         session_id: SessionId,
         segment_id: SegmentId,
         entries_len: usize,
-    ) -> Result<(), session_store::StoreError> {
+    ) -> Result<(), crate::StoreError> {
         self.session_store
             .truncate(session_id, segment_id, entries_len)
     }
@@ -450,39 +447,39 @@ where
         &self,
         session_id: SessionId,
         segment_id: SegmentId,
-    ) -> Result<usize, session_store::StoreError> {
+    ) -> Result<usize, crate::StoreError> {
         self.session_store.read_entry_count(session_id, segment_id)
     }
     fn append_trace(
         &self,
         session_id: SessionId,
         segment_id: SegmentId,
-        entry: &session_store::TraceEntry,
-    ) -> Result<(), session_store::StoreError> {
+        entry: &crate::TraceEntry,
+    ) -> Result<(), crate::StoreError> {
         self.session_store
             .append_trace(session_id, segment_id, entry)
     }
 }
 
-impl<S, P> WorkerMetadataStore for CombinedStore<S, P>
+impl<S, W> WorkerMetadataStore for CombinedStore<S, W>
 where
     S: Send + Sync,
-    P: WorkerMetadataStore,
+    W: WorkerMetadataStore,
 {
     fn write(&self, metadata: &WorkerMetadata) -> Result<(), WorkerStoreError> {
-        self.pod_store.write(metadata)
+        self.worker_metadata_store.write(metadata)
     }
     fn read_by_name(&self, worker_name: &str) -> Result<Option<WorkerMetadata>, WorkerStoreError> {
-        self.pod_store.read_by_name(worker_name)
+        self.worker_metadata_store.read_by_name(worker_name)
     }
     fn list_names(&self) -> Result<Vec<String>, WorkerStoreError> {
-        self.pod_store.list_names()
+        self.worker_metadata_store.list_names()
     }
     fn root_dir(&self) -> Option<PathBuf> {
-        self.pod_store.root_dir()
+        self.worker_metadata_store.root_dir()
     }
     fn delete_by_name(&self, worker_name: &str) -> Result<(), WorkerStoreError> {
-        self.pod_store.delete_by_name(worker_name)
+        self.worker_metadata_store.delete_by_name(worker_name)
     }
 }
 
@@ -491,15 +488,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pod_metadata_manifest_snapshot_roundtrips() {
+    fn worker_metadata_manifest_snapshot_roundtrips() {
         let mut metadata = WorkerMetadata::new(
-            "profile-pod",
+            "profile-worker",
             Some(WorkerActiveSegmentRef::pending_segment(
-                session_store::new_session_id(),
+                crate::new_session_id(),
             )),
         );
         metadata.resolved_manifest_snapshot = Some(serde_json::json!({
-            "pod": { "name": "profile-pod" },
+            "worker": { "name": "profile-worker" },
             "profile": { "source": { "kind": "path", "path": "/profiles/coder.lua" } }
         }));
 
@@ -510,22 +507,22 @@ mod tests {
     }
 
     #[test]
-    fn fs_store_writes_under_pod_state_root_only() {
+    fn fs_store_writes_under_worker_state_root_only() {
         let tmp = tempfile::TempDir::new().unwrap();
         let session_root = tmp.path().join("sessions");
-        let pod_root = tmp.path().join("workers");
+        let worker_root = tmp.path().join("workers");
         fs::create_dir_all(&session_root).unwrap();
-        let store = FsWorkerStore::new(&pod_root).unwrap();
+        let store = FsWorkerStore::new(&worker_root).unwrap();
         store
             .write(&WorkerMetadata::new(
                 "agent",
                 Some(WorkerActiveSegmentRef::pending_segment(
-                    session_store::new_session_id(),
+                    crate::new_session_id(),
                 )),
             ))
             .unwrap();
 
-        assert!(pod_root.join("agent/metadata.json").exists());
+        assert!(worker_root.join("agent/metadata.json").exists());
         assert!(!session_root.join("workers/agent/metadata.json").exists());
     }
 
@@ -540,16 +537,16 @@ mod tests {
             scope_delegated: vec![],
             callback_address: std::path::Path::new("/tmp/parent.sock").into(),
         });
-        metadata.resolved_manifest_snapshot = Some(serde_json::json!({"pod":{"name":"agent"}}));
+        metadata.resolved_manifest_snapshot = Some(serde_json::json!({"worker":{"name":"agent"}}));
         store.write(&metadata).unwrap();
 
-        let snapshot = serde_json::json!({"pod":{"name":"updated"}});
+        let snapshot = serde_json::json!({"worker":{"name":"updated"}});
         store
             .set_active(
                 "agent",
                 Some(WorkerActiveSegmentRef::active_segment(
-                    session_store::new_session_id(),
-                    session_store::new_segment_id(),
+                    crate::new_session_id(),
+                    crate::new_segment_id(),
                 )),
                 Some(snapshot.clone()),
             )
@@ -564,10 +561,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = FsWorkerStore::new(tmp.path()).unwrap();
         let active = WorkerActiveSegmentRef::active_segment(
-            session_store::new_session_id(),
-            session_store::new_segment_id(),
+            crate::new_session_id(),
+            crate::new_segment_id(),
         );
-        let snapshot = serde_json::json!({"pod":{"name":"agent"}});
+        let snapshot = serde_json::json!({"worker":{"name":"agent"}});
         store
             .set_active("agent", Some(active.clone()), Some(snapshot.clone()))
             .unwrap();
@@ -592,10 +589,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = FsWorkerStore::new(tmp.path()).unwrap();
         let active = WorkerActiveSegmentRef::active_segment(
-            session_store::new_session_id(),
-            session_store::new_segment_id(),
+            crate::new_session_id(),
+            crate::new_segment_id(),
         );
-        let snapshot = serde_json::json!({"pod":{"name":"agent"}});
+        let snapshot = serde_json::json!({"worker":{"name":"agent"}});
         store
             .set_active("agent", Some(active.clone()), Some(snapshot.clone()))
             .unwrap();

@@ -1,5 +1,5 @@
 //! Mutating operations over the allocation table. All of these expect
-//! the caller to hold a [`LockFileGuard`] for the registry's lock file.
+//! the caller to hold a [`LockFileGuard`] for the worker allocation's lock file.
 
 use std::io;
 use std::path::PathBuf;
@@ -7,9 +7,9 @@ use std::path::PathBuf;
 use manifest::{DelegationScope, Permission, ScopeRule};
 use session_store::SegmentId;
 
-use crate::conflict::{find_conflict_owner, find_conflict_owners};
-use crate::error::ScopeLockError;
-use crate::table::{Allocation, LockFileGuard};
+use super::conflict::{find_conflict_owner, find_conflict_owners};
+use super::error::ScopeLockError;
+use super::table::{Allocation, LockFileGuard};
 
 /// Register a top-level Worker (started directly by a human, no
 /// delegation parent). Reclaims stale entries before checking
@@ -46,7 +46,7 @@ pub fn register_worker(
 /// competitor.rule), not relational — it does not verify that the
 /// competitor actually descends from this Worker's prior delegations.
 /// In practice this is safe because the canonical restore caller derives
-/// `scope_deny` from outstanding `pod-store` child delegations, so any
+/// `scope_deny` from outstanding child worker metadata delegations, so any
 /// covered competitor is expected to be a descendant of the original
 /// allocation. Direct callers must uphold the same invariant.
 pub fn register_worker_with_deny(
@@ -79,7 +79,7 @@ pub fn register_worker_with_deny(
                 scope_deny
                     .iter()
                     .filter(|r| r.permission == Permission::Write)
-                    .any(|deny| crate::conflict::covers_fully(deny, &owner.rule))
+                    .any(|deny| super::conflict::covers_fully(deny, &owner.rule))
             });
         if all_denied {
             continue;
@@ -286,9 +286,9 @@ fn pid_alive(pid: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::is_within_effective_write;
+    use super::super::test_util::*;
     use super::*;
-    use crate::is_within_effective_write;
-    use crate::test_util::*;
     use tempfile::TempDir;
 
     #[test]

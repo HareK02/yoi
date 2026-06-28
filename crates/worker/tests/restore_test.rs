@@ -2,12 +2,12 @@
 //! validation paths.
 //!
 //! These cases all return before `prepare_worker_common` runs, so they
-//! do not need a real LLM client or pod-registry environment — only the
+//! do not need a real LLM client or worker-allocation environment — only the
 //! session store needs to be present.
 
 use std::sync::{LazyLock, Mutex};
 
-use pod_store::{
+use session_store::{
     CombinedStore, FsWorkerStore, WorkerActiveSegmentRef, WorkerMetadata, WorkerMetadataStore,
 };
 use session_store::{FsStore, StoreError};

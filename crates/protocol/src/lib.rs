@@ -99,7 +99,7 @@ pub enum Method {
 ///
 /// Delivered as `Method::WorkerEvent` over the parent's Unix socket. The
 /// parent Controller always applies variant-specific side effects
-/// (registry / pod-registry updates). Agent-visible variants are also
+/// (registry / worker-allocation updates). Agent-visible variants are also
 /// queued into the notification buffer; control-plane-only variants are
 /// not injected into the parent's LLM context.
 ///

@@ -16,8 +16,8 @@ use llm_engine::Engine;
 use llm_engine::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
 use llm_engine::llm_client::types::Item;
 use llm_engine::llm_client::{ClientError, LlmClient, Request};
-use pod_store::{CombinedStore, FsWorkerStore, WorkerMetadataStore};
 use protocol::{Event, Method, RunResult};
+use session_store::{CombinedStore, FsWorkerStore, WorkerMetadataStore};
 use session_store::{FsStore, LogEntry, Store};
 use tokio::sync::broadcast;
 

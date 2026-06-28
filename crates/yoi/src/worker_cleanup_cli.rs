@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use manifest::paths;
-use pod_store::{FsWorkerStore, WorkerMetadata, WorkerMetadataStore, validate_worker_name};
+use session_store::{FsWorkerStore, WorkerMetadata, WorkerMetadataStore, validate_worker_name};
 
 const MAX_REPORT_ITEMS: usize = 50;
 
@@ -234,12 +234,12 @@ async fn run_delete(
     data_dir: PathBuf,
     runtime_dir: PathBuf,
 ) -> Result<WorkerCleanupCliOutput, WorkerCleanupCliError> {
-    let store = FsWorkerStore::new(data_dir.join("pods")).map_err(to_error)?;
+    let store = FsWorkerStore::new(data_dir.join("workers")).map_err(to_error)?;
     let metadata = store.read_by_name(&options.name).map_err(to_error)?;
     let Some(metadata) = metadata else {
         return Ok(WorkerCleanupCliOutput {
             stdout: format!(
-                "yoi worker delete\nstatus: refused\npod: {}\nreason: worker metadata is missing\n",
+                "yoi worker delete\nstatus: refused\nworker: {}\nreason: worker metadata is missing\n",
                 options.name
             ),
             status: WorkerCleanupCliStatus::Failure,
@@ -250,7 +250,7 @@ async fn run_delete(
     if let Some(reason) = probe.refusal_reason() {
         return Ok(WorkerCleanupCliOutput {
             stdout: format!(
-                "yoi worker delete\nstatus: refused\npod: {}\nreason: {}\nsocket: {}\n",
+                "yoi worker delete\nstatus: refused\nworker: {}\nreason: {}\nsocket: {}\n",
                 options.name,
                 reason,
                 probe.socket_path.display()
@@ -290,7 +290,7 @@ async fn run_prune(
     data_dir: PathBuf,
     runtime_dir: PathBuf,
 ) -> Result<WorkerCleanupCliOutput, WorkerCleanupCliError> {
-    let store = FsWorkerStore::new(data_dir.join("pods")).map_err(to_error)?;
+    let store = FsWorkerStore::new(data_dir.join("workers")).map_err(to_error)?;
     let names = store.list_names().map_err(to_error)?;
     let cutoff = SystemTime::now()
         .checked_sub(options.older_than)
@@ -498,7 +498,7 @@ fn prune_help_text() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pod_store::WorkerActiveSegmentRef;
+    use session_store::WorkerActiveSegmentRef;
     use session_store::{Store, new_segment_id, new_session_id};
 
     fn string_args(args: &[&str]) -> Vec<String> {
@@ -543,14 +543,14 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         let runtime_dir = tmp.path().join("run");
-        let pod_store = FsWorkerStore::new(data_dir.join("pods")).unwrap();
+        let worker_metadata_store = FsWorkerStore::new(data_dir.join("workers")).unwrap();
         let session_store = session_store::FsStore::new(data_dir.join("sessions")).unwrap();
         let session_id = new_session_id();
         let segment_id = new_segment_id();
         session_store
             .create_segment(session_id, segment_id, &[])
             .unwrap();
-        pod_store
+        worker_metadata_store
             .write(&WorkerMetadata::new(
                 "agent",
                 Some(WorkerActiveSegmentRef::active_segment(
@@ -573,7 +573,12 @@ mod tests {
 
         assert_eq!(output.status, WorkerCleanupCliStatus::Success);
         assert!(output.stdout.contains("deleted: worker metadata"));
-        assert!(pod_store.read_by_name("agent").unwrap().is_none());
+        assert!(
+            worker_metadata_store
+                .read_by_name("agent")
+                .unwrap()
+                .is_none()
+        );
         assert!(session_store.exists(session_id, segment_id).unwrap());
     }
 
@@ -582,8 +587,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         let runtime_dir = tmp.path().join("run");
-        let pod_store = FsWorkerStore::new(data_dir.join("pods")).unwrap();
-        pod_store
+        let worker_metadata_store = FsWorkerStore::new(data_dir.join("workers")).unwrap();
+        worker_metadata_store
             .write(&WorkerMetadata::new("agent", None))
             .unwrap();
 
@@ -601,7 +606,12 @@ mod tests {
 
         assert_eq!(output.status, WorkerCleanupCliStatus::Success);
         assert!(output.stdout.contains("mode: dry-run"));
-        assert!(pod_store.read_by_name("agent").unwrap().is_some());
+        assert!(
+            worker_metadata_store
+                .read_by_name("agent")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[cfg(unix)]
@@ -612,8 +622,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         let runtime_dir = tmp.path().join("run");
-        let pod_store = FsWorkerStore::new(data_dir.join("pods")).unwrap();
-        pod_store
+        let worker_metadata_store = FsWorkerStore::new(data_dir.join("workers")).unwrap();
+        worker_metadata_store
             .write(&WorkerMetadata::new("agent", None))
             .unwrap();
         std::fs::create_dir_all(runtime_dir.join("agent")).unwrap();
@@ -634,6 +644,11 @@ mod tests {
         drop(listener);
         assert_eq!(output.status, WorkerCleanupCliStatus::Failure);
         assert!(output.stdout.contains("status: refused"));
-        assert!(pod_store.read_by_name("agent").unwrap().is_some());
+        assert!(
+            worker_metadata_store
+                .read_by_name("agent")
+                .unwrap()
+                .is_some()
+        );
     }
 }

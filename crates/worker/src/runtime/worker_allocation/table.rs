@@ -49,7 +49,7 @@ pub struct Allocation {
     /// a top-level Worker started directly by a human.
     pub delegated_from: Option<String>,
     /// Segment ID this Worker is currently writing to. `None` means this
-    /// is a pre-reservation made by a spawner via [`crate::delegate_scope`]
+    /// is a pre-reservation made by a spawner via [`super::super::delegate_scope`]
     /// before the child has come up; the child fills it in at
     /// [`crate::adopt_allocation`] time.
     #[serde(default)]
@@ -79,11 +79,11 @@ impl LockFile {
 }
 
 /// Default on-disk path: `<runtime_dir>/workers.json` resolved via
-/// [`manifest::paths::pod_registry_path`]. Tests should point this
+/// [`manifest::paths::worker_allocation_path`]. Tests should point this
 /// elsewhere by setting `YOI_HOME` or `YOI_RUNTIME_DIR` to a
 /// tempdir.
-pub fn default_registry_path() -> io::Result<PathBuf> {
-    paths::pod_registry_path().ok_or_else(|| {
+pub fn default_allocation_path() -> io::Result<PathBuf> {
+    paths::worker_allocation_path().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "could not resolve workers.json path (no YOI_HOME / \
@@ -137,7 +137,7 @@ impl LockFileGuard {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             format!(
-                                "timed out waiting for pod registry lock `{}`",
+                                "timed out waiting for worker allocation lock `{}`",
                                 path.display()
                             ),
                         ));
@@ -149,7 +149,7 @@ impl LockFileGuard {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             format!(
-                                "timed out waiting for pod registry lock `{}`",
+                                "timed out waiting for worker allocation lock `{}`",
                                 path.display()
                             ),
                         ));
@@ -211,9 +211,9 @@ impl Drop for LockFileGuard {
 
 #[cfg(test)]
 mod tests {
+    use super::super::register_worker;
+    use super::super::test_util::*;
     use super::*;
-    use crate::register_pod;
-    use crate::test_util::*;
     use tempfile::TempDir;
 
     #[test]
@@ -277,7 +277,7 @@ mod tests {
             sid(),
         )
         .unwrap();
-        crate::delegate_scope(
+        super::super::delegate_scope(
             &mut g,
             "parent",
             "child".into(),

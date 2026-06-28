@@ -37,6 +37,7 @@ pub mod segment;
 pub mod segment_log;
 pub mod store;
 pub mod system_item;
+pub mod worker_metadata;
 
 pub use event_trace::{TraceEntry, TracePayload};
 pub use fs_store::FsStore;
@@ -52,6 +53,11 @@ pub use segment::{
 pub use segment_log::{LogEntry, RestoredState, SegmentOrigin, collect_state};
 pub use store::{Store, StoreError};
 pub use system_item::{SystemItem, SystemReminder, SystemReminderSource, render_worker_event};
+pub use worker_metadata::{
+    CombinedStore, FsWorkerStore, WorkerActiveSegmentRef, WorkerMetadata, WorkerMetadataStore,
+    WorkerPeer, WorkerReclaimedChild, WorkerSpawnedChild, WorkerSpawnedScopeRule, WorkerStoreError,
+    validate_worker_name,
+};
 
 /// Session identifier — the fork-tree root. UUID v7 (time-ordered).
 ///
