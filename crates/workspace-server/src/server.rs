@@ -89,6 +89,22 @@ pub struct WorkspaceApi {
 
 impl WorkspaceApi {
     pub async fn new(config: ServerConfig, store: Arc<dyn ControlPlaneStore>) -> Result<Self> {
+        let execution_backend = WorkerRuntimeExecutionBackend::from_workspace(
+            config.workspace_root.clone(),
+        )
+        .map_err(|err| {
+            crate::Error::Store(format!(
+                "failed to initialize embedded Worker backend: {err}"
+            ))
+        })?;
+        Self::new_with_execution_backend(config, store, Arc::new(execution_backend)).await
+    }
+
+    async fn new_with_execution_backend(
+        config: ServerConfig,
+        store: Arc<dyn ControlPlaneStore>,
+        execution_backend: Arc<dyn worker_runtime::execution::WorkerExecutionBackend>,
+    ) -> Result<Self> {
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: config.workspace_id.clone(),
@@ -98,18 +114,10 @@ impl WorkspaceApi {
                 updated_at: config.workspace_created_at.clone(),
             })
             .await?;
-        let execution_backend = WorkerRuntimeExecutionBackend::from_workspace(
-            config.workspace_root.clone(),
-        )
-        .map_err(|err| {
-            crate::Error::Store(format!(
-                "failed to initialize embedded Worker backend: {err}"
-            ))
-        })?;
         let mut runtime = RuntimeRegistry::for_workspace(
             EmbeddedWorkerRuntime::new_memory_with_execution_backend(
                 config.workspace_id.clone(),
-                Arc::new(execution_backend),
+                execution_backend,
             )
             .map_err(|err| {
                 crate::Error::Store(format!("invalid embedded Worker backend: {err}"))
@@ -228,7 +236,6 @@ pub async fn serve(
 pub struct WorkspaceResponse {
     pub workspace_id: String,
     pub display_name: String,
-    pub local_root: PathBuf,
     pub record_authority: String,
     pub schema_version: i64,
     pub auth: AuthConfig,
@@ -247,6 +254,7 @@ pub struct ExtensionPoints {
 pub struct ExtensionPointState {
     pub status: String,
     pub note: String,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -332,10 +340,11 @@ async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<Worksp
         .as_ref()
         .map(|record| record.display_name.clone())
         .unwrap_or_else(|| api.config.workspace_display_name.clone());
+    let companion_status = api.companion.status();
+    let companion_console = companion_console_extension_point(&companion_status);
     Ok(Json(WorkspaceResponse {
         workspace_id: api.config.workspace_id.clone(),
         display_name,
-        local_root: api.config.workspace_root.clone(),
         record_authority: "local_yoi_project_records".to_string(),
         schema_version,
         auth: api.config.auth.clone(),
@@ -344,17 +353,46 @@ async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<Worksp
             event_stream: ExtensionPointState {
                 status: "backend_proxy".to_string(),
                 note: "Worker observation streams are exposed only through the Workspace server proxy keyed by runtime_id + worker_id; browser clients never receive raw Runtime endpoints or socket paths.".to_string(),
+                diagnostics: Vec::new(),
             },
             host_worker_bridge: ExtensionPointState {
                 status: "runtime_registry".to_string(),
                 note: "Hosts and Workers are projected from the Workspace RuntimeRegistry; raw Runtime endpoints, sockets, and local metadata paths are not exposed.".to_string(),
+                diagnostics: Vec::new(),
             },
-            companion_console: ExtensionPointState {
-                status: "not_connected".to_string(),
-                note: "Workspace Companion is visible as an embedded Worker, but browser input is disabled until actual Worker/LLM execution is connected.".to_string(),
-            },
+            companion_console,
         },
     }))
+}
+
+fn companion_console_extension_point(status: &CompanionStatusResponse) -> ExtensionPointState {
+    let completion = status.transport.completion.clone();
+    let note = match completion.as_str() {
+        "connected" => "Workspace Companion is input-capable and browser input is dispatched through the normal Worker runtime path.".to_string(),
+        "not_input_capable" => {
+            let diagnostic_codes = status
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if diagnostic_codes.is_empty() {
+                "Workspace Companion is not input-capable; check provider, config, profile, secret, and authority diagnostics.".to_string()
+            } else {
+                format!(
+                    "Workspace Companion is not input-capable; check typed diagnostics: {diagnostic_codes}."
+                )
+            }
+        }
+        other => format!(
+            "Workspace Companion transport reports {other}; browser input follows the Companion Worker runtime capability state."
+        ),
+    };
+    ExtensionPointState {
+        status: completion,
+        note,
+        diagnostics: status.diagnostics.clone(),
+    }
 }
 
 async fn list_tickets(
@@ -1036,6 +1074,64 @@ mod tests {
     const TEST_REPOSITORY_ID: &str = "local-0192f0e8-4d84-7d6e-a000-000000000001";
     const TEST_CREATED_AT: &str = "2026-06-23T06:43:28Z";
 
+    #[derive(Default)]
+    struct DeterministicExecutionBackend {
+        contexts: std::sync::Mutex<
+            std::collections::HashMap<
+                worker_runtime::identity::WorkerRef,
+                worker_runtime::execution::WorkerExecutionContext,
+            >,
+        >,
+    }
+
+    impl worker_runtime::execution::WorkerExecutionBackend for DeterministicExecutionBackend {
+        fn backend_id(&self) -> &str {
+            "deterministic-workspace-server-test"
+        }
+
+        fn spawn_worker(
+            &self,
+            request: worker_runtime::execution::WorkerExecutionSpawnRequest,
+        ) -> worker_runtime::execution::WorkerExecutionSpawnResult {
+            self.contexts
+                .lock()
+                .unwrap()
+                .insert(request.worker_ref.clone(), request.context);
+            worker_runtime::execution::WorkerExecutionSpawnResult::Connected {
+                handle: worker_runtime::execution::WorkerExecutionHandle::new(
+                    request.worker_ref,
+                    self.backend_id(),
+                ),
+                run_state: worker_runtime::execution::WorkerExecutionRunState::Idle,
+            }
+        }
+
+        fn dispatch_input(
+            &self,
+            handle: &worker_runtime::execution::WorkerExecutionHandle,
+            input: worker_runtime::interaction::WorkerInput,
+        ) -> worker_runtime::execution::WorkerExecutionResult {
+            let context = self
+                .contexts
+                .lock()
+                .unwrap()
+                .get(handle.worker_ref())
+                .cloned()
+                .expect("execution context");
+            let content = input.content.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                let _ = context.publish_protocol_event(protocol::Event::TextDone {
+                    text: format!("server companion echoed: {content}"),
+                });
+            });
+            worker_runtime::execution::WorkerExecutionResult::accepted(
+                worker_runtime::execution::WorkerExecutionOperation::Input,
+                worker_runtime::execution::WorkerExecutionRunState::Idle,
+            )
+        }
+    }
+
     fn test_identity() -> WorkspaceIdentity {
         WorkspaceIdentity {
             workspace_id: TEST_WORKSPACE_ID.to_string(),
@@ -1068,6 +1164,24 @@ mod tests {
             workspace["extension_points"]["host_worker_bridge"]["status"],
             "runtime_registry"
         );
+        let workspace_companion = &workspace["extension_points"]["companion_console"];
+        assert_ne!(workspace_companion["status"], "not_connected");
+        assert!(
+            !workspace_companion["note"]
+                .as_str()
+                .unwrap()
+                .contains("browser input remains disabled"),
+            "stale Companion Console note returned: {workspace_companion}"
+        );
+        if workspace_companion["status"] == "not_input_capable" {
+            assert!(
+                !workspace_companion["diagnostics"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                "not_input_capable workspace companion_console lacks typed diagnostics: {workspace_companion}"
+            );
+        }
 
         let tickets = get_json(app.clone(), "/api/tickets").await;
         assert_eq!(tickets["items"][0]["id"], "00000000001J2");
@@ -1161,6 +1275,7 @@ mod tests {
             companion_status["transport"]["kind"],
             "embedded_worker_runtime"
         );
+        assert_ne!(companion_status["transport"]["completion"], "not_connected");
         assert!(!companion_status.to_string().contains("/workspace/demo"));
 
         let companion_message = post_json(
@@ -1177,11 +1292,17 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            companion_message["diagnostics"]
+            !companion_message
+                .to_string()
+                .contains("companion_llm_not_connected"),
+            "legacy non-execution diagnostic leaked: {companion_message}"
+        );
+        assert!(
+            !companion_message["diagnostics"]
                 .as_array()
                 .unwrap()
-                .iter()
-                .any(|diagnostic| diagnostic["code"] == "companion_llm_not_connected")
+                .is_empty(),
+            "missing typed diagnostic for non-input-capable Companion: {companion_message}"
         );
         assert!(!companion_message.to_string().contains("/workspace/demo"));
 
@@ -1272,6 +1393,92 @@ mod tests {
             !String::from_utf8(bytes.to_vec())
                 .unwrap()
                 .contains("Yoi Workspace")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_companion_messages_route_dispatches_through_worker_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = ServerConfig::local_dev(temp.path().join("workspace"), test_identity());
+        let api = WorkspaceApi::new_with_execution_backend(
+            config,
+            Arc::new(SqliteWorkspaceStore::in_memory().unwrap()),
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .await
+        .unwrap();
+        let app = build_router(api);
+
+        let workspace = get_json(app.clone(), "/api/workspace").await;
+        let workspace_companion = &workspace["extension_points"]["companion_console"];
+        assert_eq!(workspace_companion["status"], "connected");
+        assert!(
+            workspace_companion["diagnostics"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            workspace_companion["note"]
+                .as_str()
+                .unwrap()
+                .contains("normal Worker runtime path")
+        );
+
+        let status = get_json(app.clone(), "/api/companion/status").await;
+        assert_eq!(status["transport"]["completion"], "connected");
+        let worker_id = status["worker"]["worker_id"].as_str().unwrap().to_string();
+        assert_eq!(status["worker"]["profile"], "builtin:companion");
+
+        let response = post_json(
+            app.clone(),
+            "/api/companion/messages",
+            serde_json::json!({ "content": "from legacy route" }),
+        )
+        .await;
+        assert_eq!(response["state"], "accepted");
+        assert_eq!(response["user_item"]["content"], "from legacy route");
+        assert!(!response.to_string().contains("companion_llm_not_connected"));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let transcript = loop {
+            let transcript = get_json(app.clone(), "/api/companion/transcript").await;
+            let has_assistant = transcript["items"].as_array().unwrap().iter().any(|item| {
+                item["role"] == "assistant"
+                    && item["content"] == "server companion echoed: from legacy route"
+                    && item["source"] == "worker_runtime"
+            });
+            if has_assistant {
+                break transcript;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for server companion transcript: {transcript}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert!(
+            transcript["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["role"] == "user" && item["content"] == "from legacy route" })
+        );
+
+        let worker_transcript = get_json(
+            app,
+            &format!("/api/runtimes/embedded-worker-runtime/workers/{worker_id}/transcript"),
+        )
+        .await;
+        assert!(
+            worker_transcript["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| {
+                    item["role"] == "assistant"
+                        && item["content"] == "server companion echoed: from legacy route"
+                })
         );
     }
 
