@@ -2,6 +2,7 @@ use crate::catalog::{CreateWorkerRequest, WorkerStatus};
 use crate::config_bundle::ConfigBundle;
 use crate::diagnostics::RuntimeDiagnostic;
 use crate::error::RuntimeError;
+use crate::execution::WorkerExecutionStatus;
 use crate::identity::{RuntimeId, WorkerId, WorkerRef};
 use crate::management::{RuntimeBackendKind, RuntimeLimits, RuntimeStatus};
 use crate::observation::{
@@ -376,6 +377,7 @@ pub(crate) struct PersistedWorkerRecord {
     pub(crate) worker_id: WorkerId,
     pub(crate) status: WorkerStatus,
     pub(crate) request: CreateWorkerRequest,
+    pub(crate) execution: WorkerExecutionStatus,
     pub(crate) transcript: Vec<TranscriptEntry>,
     pub(crate) next_transcript_sequence: u64,
     pub(crate) last_event_id: u64,
@@ -473,6 +475,8 @@ struct WorkerSnapshot {
     worker_id: WorkerId,
     status: WorkerStatus,
     request: CreateWorkerRequest,
+    #[serde(default = "WorkerExecutionStatus::unconnected")]
+    execution: WorkerExecutionStatus,
     next_transcript_sequence: u64,
     last_event_id: u64,
 }
@@ -485,6 +489,7 @@ impl WorkerSnapshot {
             worker_id: worker.worker_id.clone(),
             status: worker.status,
             request: worker.request.clone(),
+            execution: worker.execution.clone(),
             next_transcript_sequence: worker.next_transcript_sequence,
             last_event_id: worker.last_event_id,
         }
@@ -530,6 +535,7 @@ impl WorkerSnapshot {
             worker_id: self.worker_id,
             status: self.status,
             request: self.request,
+            execution: self.execution,
             transcript,
             next_transcript_sequence: self.next_transcript_sequence,
             last_event_id: self.last_event_id,

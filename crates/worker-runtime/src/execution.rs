@@ -18,7 +18,27 @@ use std::sync::Arc;
 pub enum WorkerExecutionBackendKind {
     #[default]
     Unconnected,
+    /// A durable execution binding was restored, but no live handle was recovered.
+    Stale,
     Connected,
+}
+
+/// Durable, non-authority execution binding projection.
+///
+/// This records only enough identity to diagnose stale mappings after restore.
+/// It is not a live handle and must not contain sockets, paths, credentials, or
+/// provider-private authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerExecutionBindingIdentity {
+    pub backend_id: String,
+}
+
+impl WorkerExecutionBindingIdentity {
+    pub fn from_handle(handle: &WorkerExecutionHandle) -> Self {
+        Self {
+            backend_id: handle.backend_id.clone(),
+        }
+    }
 }
 
 /// Current execution-side run state for a Worker.
@@ -131,6 +151,8 @@ pub struct WorkerExecutionStatus {
     pub backend: WorkerExecutionBackendKind,
     pub run_state: WorkerExecutionRunState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<WorkerExecutionBindingIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_result: Option<WorkerExecutionResult>,
 }
 
@@ -143,8 +165,20 @@ impl WorkerExecutionStatus {
         Self {
             backend: WorkerExecutionBackendKind::Connected,
             run_state,
+            binding: None,
             last_result: None,
         }
+    }
+
+    pub fn stale(mut previous: Self) -> Self {
+        previous.backend = WorkerExecutionBackendKind::Stale;
+        previous.run_state = WorkerExecutionRunState::Unconnected;
+        previous
+    }
+
+    pub fn with_binding(mut self, binding: WorkerExecutionBindingIdentity) -> Self {
+        self.binding = Some(binding);
+        self
     }
 
     pub fn with_result(mut self, result: WorkerExecutionResult) -> Self {
