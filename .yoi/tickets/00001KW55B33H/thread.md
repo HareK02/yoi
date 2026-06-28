@@ -331,3 +331,46 @@ request_changes
 報告された validation command は再実行していない。test/check/build success は plausibly true だが、残る stale `/api/workspace` Companion status は更新後の behavior assertion で cover されていないため、passing tests だけではこの acceptance point の evidence にならない。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KW55B33H-companion-2 at: 2026-06-28T07:14:16Z -->
+
+## Implementation report
+
+Change-response implementation report:
+
+Remaining reviewer blocker を修正し、追加 commit を作成済み。Ticket ファイル編集、merge、close、cleanup は未実施。
+
+Commit:
+- `3be193223c7efc67636667d1ad526646da81fb63 fix: report companion console runtime status`
+
+Previous implementation commit:
+- `ee25cfbcfd90983a24091ef30c0128d653095003 fix: route workspace companion through worker runtime`
+
+変更概要:
+
+- `/api/workspace` の `extension_points.companion_console` を固定値から Companion の実際の status / transport projection に変更。
+  - input-capable なら `status: "connected"`
+  - input 不可なら `status: "not_input_capable"` と typed diagnostics を返す
+  - stale note `"browser input remains disabled until actual Worker/LLM execution is connected"` を削除
+- `ExtensionPointState` に `diagnostics` を追加し、Browser-facing projection でも Companion の typed diagnostic を確認できるようにした。
+- Workspace web 側の `ExtensionPoint` 型にも `diagnostics` を追加。
+- Focused test を追加・更新。
+  - `/api/workspace` の `companion_console` が `not_connected` を返さないこと
+  - input-capable deterministic backend では `connected` になること
+  - `not_input_capable` の場合は diagnostics が空でないこと
+
+Validation:
+- `cargo fmt --check`: success
+- `cargo test -p yoi-workspace-server`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `cd web/workspace && deno task test`: success
+- `cd web/workspace && deno task check`: success
+- `cd web/workspace && deno task build`: success
+- `nix build .#yoi`: success
+
+Residual risks / review focus:
+- `ExtensionPointState` の JSON に `diagnostics` が増えている。Workspace web 側の型は更新済み。
+- Companion が provider/config/profile/secret/authority 欠落で input-capable でない環境では、`/api/workspace` でも `not_input_capable` と診断情報が表示される。
+
+---
