@@ -190,3 +190,27 @@ Residual risks:
 - 特記すべき未解決リスクなし。再起動後の実行 handle は復元せず stale/unconnected として扱う設計どおり。
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-28T19:06:09Z -->
+
+## Implementation report
+
+Review kickoff:
+
+Reviewer Worker spawned for `00001KW76E8EG` implementation.
+
+- Reviewer Worker: `yoi-reviewer-00001KW76E8EG-fs-store`
+- Review target commit: `736b05c6 feat: persist embedded workspace runtime in fs store`
+- Review mode: read-only implementation worktree review
+
+Review focus:
+- `workspace-server` enables `worker-runtime` `fs-store` feature
+- `ServerConfig` has authoritative embedded Runtime store root defaulting under user data / workspace id, not project records
+- normal `WorkspaceApi` uses fs-store backed `EmbeddedWorkerRuntime`, not memory-backed runtime
+- restart restores catalog / Worker snapshot / ConfigBundle / transcript
+- execution handle after restart is stale/unconnected diagnostic, not falsely connected
+- Browser APIs do not leak store root / raw path / execution handle
+- production path cannot accidentally use memory-backed runtime
+- focused tests cover these behaviors
+
+---
