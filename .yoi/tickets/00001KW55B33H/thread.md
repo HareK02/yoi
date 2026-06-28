@@ -169,3 +169,27 @@ Orchestrator note:
 - Because no code commit was produced for this Ticket, a reviewer will be asked to explicitly verify whether upstream merged implementation fully satisfies `00001KW55B33H` or whether additional changes are required.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-28T06:21:01Z -->
+
+## Implementation report
+
+Review kickoff:
+
+Reviewer Worker spawned to verify the no-code implementation/verification outcome for `00001KW55B33H`.
+
+- Reviewer Worker: `yoi-reviewer-00001KW55B33H-companion`
+- Review mode: read-only review of current child worktree code state after upstream `00001KW55B33B` merge
+- Special focus: confirm whether no additional code changes are required for this Ticket, or identify concrete blockers
+
+Review focus:
+- `workspace_companion` bootstraps as an executable normal Worker via embedded Runtime + `worker/runtime-adapter`
+- Worker list / Worker Console attach path uses `runtime_id + worker_id`
+- Send uses Backend Worker input API -> embedded Runtime execution backend -> real Worker run lifecycle
+- protocol events / transcript use existing Console rendering path
+- missing provider/config/profile/secret/authority is typed diagnostic and not input-capable
+- `/api/companion/messages` does not return fake/providerless response
+- Browser-facing API does not leak raw handles, socket paths, session paths, credentials, secret refs, raw manifest paths, or broad authority internals
+- public `can_stream_events` / `can_read_bounded_transcript` flags are not revived
+
+---
