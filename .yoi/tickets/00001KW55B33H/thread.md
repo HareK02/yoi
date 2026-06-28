@@ -374,3 +374,39 @@ Residual risks / review focus:
 - Companion が provider/config/profile/secret/authority 欠落で input-capable でない環境では、`/api/workspace` でも `not_input_capable` と診断情報が表示される。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KW55B33H-companion at: 2026-06-28T07:18:37Z status: approve -->
+
+## Review: approve
+
+approve
+
+同じ worktree / branch を静的再レビューし、前回 blocker は解消され、Ticket scope の受け入れ条件を満たしていると判断した。
+
+Validation performed:
+- `.yoi/tickets/00001KW55B33H/item.md` を再読。
+- 現在の `crates/workspace-server/src/server.rs`, `companion.rs`, `hosts.rs`, worker runtime adapter paths, web workspace types を確認。
+- stale blocker strings / public flags を grep:
+  - `browser input remains disabled`
+  - `companion_llm_not_connected`
+  - `can_stream_events`
+  - `can_read_bounded_transcript`
+  - `local_root`
+  - fake/canned response markers
+- ファイル変更や Ticket record 更新はしていない。
+- full reported validation suite は再実行していない。
+
+Evidence:
+- `/api/workspace` の `extension_points.companion_console` は固定 stale value ではなく `api.companion.status()` 由来の status / diagnostics を使っている。
+- `ExtensionPointState` に `diagnostics` が追加され、workspace web types も更新されている。
+- Companion message send path は `RuntimeRegistry::send_input` / Worker runtime input path を使っており、fake response や固定 rejection ではない。
+- Companion status は input-capable なら `connected`、そうでなければ diagnostics 付き `not_input_capable` を返す。
+- Companion bootstrap は Companion profile / config-bundle path を使っている。
+- Transcript projection は runtime transcript 由来。
+- Worker Console route / input path は `runtime_id + worker_id` keyed のまま。
+- negative assertions 以外で public `can_stream_events` / `can_read_bounded_transcript` fields は見当たらない。
+- 以前の `/api/workspace` raw `local_root` exposure は消えている。
+
+Reported validations は、updated server tests が Companion Console workspace status と runtime dispatch behavior を cover していることも含め、変更内容に対して妥当と判断した。
+
+---
