@@ -88,3 +88,27 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-28T16:51:22Z -->
+
+## Decision
+
+Routing decision:
+
+Workspace Dashboard Queue authorized Orchestrator routing, so the Ticket and current workspace state were inspected.
+
+Findings:
+- Ticket state: `queued`
+- Outgoing dependency: `depends_on 00001KW7726H9`
+- Blocking Ticket `00001KW7726H9` is currently `inprogress`.
+- Current inprogress Tickets: `00001KW7726H9`
+- Orchestration worktree: clean
+
+Decision:
+- Leave `00001KW7835H0` queued and do not create a child worktree / role Pod yet.
+- Reason: `pod-registry` / `pod-store` removal must follow the canonical Runtime Worker creation authority decision and implementation in `00001KW7726H9`. Starting both in parallel would risk deleting/moving store/registry paths while the canonical Worker creation API is still being shaped.
+
+Next routing condition:
+- Re-evaluate this Ticket after `00001KW7726H9` is merged, validated, and closed, or after an explicit replan changes the dependency.
+
+---
