@@ -121,3 +121,18 @@ Operational note:
 - User instructed not to use `StopPod` for now. Later cleanup will skip role-Pod shutdown and remove only child implementation worktree/branch unless explicitly reauthorized.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-28T06:09:52Z -->
+
+## Implementation report
+
+Implementation routing diagnostic:
+
+Initial Coder Worker `yoi-coder-00001KW55B33H-companion-llm` failed before producing implementation output with provider error `context_length_exceeded`. This appears to be a prompt/context-size failure rather than an implementation result.
+
+Operational response:
+- Per current user instruction, `StopPod` will not be used.
+- A replacement Coder Worker will be spawned with a shorter bootstrap instruction and the same implementation worktree, if scope delegation is accepted.
+- The replacement Coder should read the Ticket and current code directly from the worktree rather than receiving the full requirement text in the initial prompt.
+
+---
