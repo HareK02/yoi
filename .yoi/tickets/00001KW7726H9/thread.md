@@ -250,3 +250,30 @@ Operational note:
 Workspace Dashboard Queue authorized routing. The Ticket has no blocker relations, related prerequisite Tickets are closed, no other Ticket is inprogress, and the orchestration worktree is clean. Accepting implementation before child worktree / role Pod side effects.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-28T16:49:08Z -->
+
+## Implementation report
+
+Implementation kickoff:
+
+- Worktree created: `/home/hare/Projects/yoi/.worktree/00001KW7726H9-runtime-worker-launch-unification`
+- Branch: `work/00001KW7726H9-runtime-worker-launch-unification`
+- Coder Worker spawned: `yoi-coder-00001KW7726H9-launch-unify`
+
+Scope notes:
+- Coder write scope is limited to `crates/worker-runtime/**`, `crates/worker/**`, `crates/workspace-server/**`, `web/workspace/**`, `resources/profiles/**`, `resources/prompts/**`, root `Cargo.toml`, `Cargo.lock`, and `package.nix` if needed.
+- Coder is instructed to read the Ticket and `artifacts/api-field-audit.md` from the worktree and not to modify Ticket records.
+- Coder is instructed not to operate in root/orchestration worktrees.
+
+Implementation focus:
+- Browser-facing launch semantics and Runtime worker creation request responsibilities must be separated.
+- ConfigBundle sync and worker creation payload must remain separate.
+- Runtime must not receive raw workspace path / cwd / tool scope / secret / Runtime endpoint / execution binding internals.
+- Runtime worker creation must be persistent/transactional and typed-fail on missing ConfigBundle / execution binding / provider / secret.
+- embedded / Companion / remote-facing creation must use the same canonical path.
+- input-capable Workers must have an execution backend.
+- no fake/providerless assistant response bypass.
+- final request fields must be justified against source / scope-access / visibility / persistence-projection / retry / validation / existing type / failure.
+
+---
