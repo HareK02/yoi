@@ -251,3 +251,47 @@ request_changes
 - 現状の `cargo test -p yoi-workspace-server` は古い rejected Companion behavior を assert して通っている可能性があり、この Ticket の acceptance evidence にはならない。
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KW55B33H-companion-2 at: 2026-06-28T06:56:50Z -->
+
+## Implementation report
+
+Change-response implementation report:
+
+Reviewer blockers を修正し、実装 commit を作成済み。Ticket ファイル編集、merge、close、cleanup は未実施。
+
+Commit:
+- `ee25cfbcfd90983a24091ef30c0128d653095003 fix: route workspace companion through worker runtime`
+
+変更概要:
+
+- `/api/companion/messages` の旧 `companion_llm_not_connected` 固定拒否経路を廃止し、通常の `RuntimeRegistry::send_input` / Worker runtime 入力経路へ接続。
+- Companion status / transport を更新。
+  - Worker が input-capable の場合は `completion: "connected"`。
+  - missing provider/config/profile/authority 等で input-capable でない場合は `completion: "not_input_capable"` と typed diagnostic。
+  - fake/providerless/canned assistant 応答は追加していない。
+- Companion bootstrap を `builtin:companion` profile + Companion 用 config bundle sync へ変更。
+- `WorkspaceCompanion` intent の embedded profile projection も `builtin:companion` に変更。
+- Companion transcript projection を runtime transcript 由来に変更し、旧独自 transcript / 旧非実行 semantics を置換。
+- `/api/workspace` の Browser-facing response から raw `local_root: PathBuf` を削除。
+- Tests を更新・追加。
+  - Companion bootstrap / input dispatch / assistant output / observation event / transcript projection を deterministic test execution backend で検証。
+  - legacy `/api/companion/messages` route が Worker runtime 経由で input dispatch することを server test で検証。
+  - 旧 `companion_llm_not_connected` 依存 assertion を削除。
+
+Validation:
+- `cargo fmt --check`: success
+- `cd web/workspace && deno task test`: success
+- `cd web/workspace && deno task check`: success
+- `cd web/workspace && deno task build`: success
+- `cargo test -p yoi-workspace-server`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi`: success
+
+Residual risks / review focus:
+- `/api/companion/*` は互換 route として残しつつ、内部動作は Worker runtime 経路へ寄せている。主 UI path は引き続き `runtime_id + worker_id` の Worker Console。
+- provider/profile/secret/authority 欠落時は input 不可 diagnostic になる。実 provider 設定がない環境では Companion は起動 projection されても入力不可。
+- deterministic test backend による検証のため、外部 secret/provider には依存しない。
+
+---
