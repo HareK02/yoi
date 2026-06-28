@@ -193,3 +193,61 @@ Review focus:
 - public `can_stream_events` / `can_read_bounded_transcript` flags are not revived
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KW55B33H-companion at: 2026-06-28T06:27:08Z status: request_changes -->
+
+## Review: request changes
+
+request_changes
+
+静的レビューの結果、upstream の `worker-runtime` adapter 実装は存在するが、Ticket `00001KW55B33H` 自体の受け入れ条件はまだ満たされていない。
+
+## Blockers
+
+1. **`/api/companion/messages` がまだ hard-coded な非実行 path のまま**
+
+   - `server.rs:533-537` は `/api/companion/messages` を直接 `api.companion.send_message(request)` に route している。
+   - `companion.rs:161-182` は non-empty input を常に `companion_llm_not_connected` で reject する。
+   - これは Backend Worker input API の thin wrapper ではなく、real Worker run lifecycle に到達しないため、Ticket の `/api/companion/messages` 要件を満たさない。
+
+2. **Companion status / transport が古い “not connected” limitation をまだ宣言している**
+
+   - `companion.rs:337-342` が `completion: "not_connected"` を返し、実 Worker/LLM execution 接続まで browser input は disabled と説明している。
+   - Ticket の目的は Workspace Companion を real LLM execution に接続して Web Console から使えるようにすることなので矛盾している。
+
+3. **Companion bootstrap が適切な Companion profile / config bundle を解決していない**
+
+   - `companion.rs:257-267` は `profile: Some(ProfileSelector::RuntimeDefault)` / `config_bundle: None` で spawn している。
+   - `hosts.rs:2188-2191` では `RuntimeDefault` が `runtime_default` と投影されるだけで、Companion profile として表示されない。
+   - Ticket は Companion Profile / config bundle を解決し、`workspace_companion` / 適切な companion Profile として表示することを求めている。
+
+4. **focused tests が古い rejected/no-output behavior をまだ assert している**
+
+   - `companion.rs:384-399` は `send_message("hello")` が `Rejected`、`companion_llm_not_connected`、runtime transcript empty であることを assert している。
+   - `server.rs:1166-1185` は `/api/companion/messages` が rejected で transcript empty であることを assert している。
+   - Ticket は bootstrap、input dispatch、assistant output、observation event、transcript projection が Worker execution path を通ることを proving する tests を求めている。
+
+5. **raw path leak 懸念**
+
+   - `server.rs:227-235` の `WorkspaceResponse` に `local_root: PathBuf` が含まれる。
+   - `server.rs:335-339` が `/api/workspace` に `api.config.workspace_root` を serialize している。
+   - “no raw handle/path/credential leaks” を Browser-facing workspace API 全体に適用するなら違反の可能性がある。Worker projection 自体はより注意深く redacted されているが、この public path field は残っているため要確認・必要なら修正が必要。
+
+## 確認済み / non-blocking observations
+
+- upstream embedded runtime adapter は存在する。
+  - `WorkspaceApi::new` が `WorkerRuntimeExecutionBackend::from_workspace(...)` を作り、`EmbeddedWorkerRuntime::new_memory_with_execution_backend(...)` に渡している。
+- Worker list / Console routing は `runtime_id + worker_id` を使っている。
+  - Console Send は `/api/runtimes/{runtime_id}/workers/{worker_id}/input`。
+  - Observation WS は `/api/runtimes/{runtime_id}/workers/{worker_id}/events/ws`。
+- public `can_stream_events` / `can_read_bounded_transcript` fields は見当たらない。
+- `/api/companion/messages` は fake/canned assistant response は返していないが、same execution path / normal Worker input path 要件も満たしていない。
+
+## Validation review
+
+- `.yoi/tickets/00001KW55B33H/item.md` と `thread.md` を読んだ。
+- `crates/workspace-server/src/{companion.rs,server.rs,hosts.rs}`、`crates/worker/src/runtime_adapter.rs`、Web Console Svelte/TS paths を静的レビューした。
+- test/build は実行していない。
+- 現状の `cargo test -p yoi-workspace-server` は古い rejected Companion behavior を assert して通っている可能性があり、この Ticket の acceptance evidence にはならない。
+
+---
