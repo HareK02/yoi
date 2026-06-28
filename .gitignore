@@ -1,6 +1,6 @@
 /target
 /result
 /.direnv
-/.worktree
+.worktree
 *.local*
 .env
