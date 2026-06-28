@@ -475,3 +475,49 @@ Residual risks / review focus:
 - stale Worker は binding identity と diagnostic を保持するが input-capable とは扱わないため、UI/API 側では stale diagnostic を見て明示的な再接続 / 再作成導線を出す必要がある。
 
 ---
+
+<!-- event: review author: yoi-reviewer-00001KW7726H9-launch-unify at: 2026-06-28T18:17:07Z status: request_changes -->
+
+## Review: request changes
+
+request_changes
+
+読み取り専用で再レビューした。前回指摘した Runtime 本体側の 2 点は概ね修正されているが、元の受け入れ条件に対する blocker が 1 件残っている。
+
+## Blocker
+
+### Remote Runtime projection が stale / unconnected Worker を input-capable として公開する
+
+Runtime fs-store restore 側では、persisted execution binding があるが live handle が戻らない場合に `WorkerExecutionBackendKind::Stale` と `worker_execution_mapping_stale` diagnostic を出す実装になっている。
+
+- `crates/worker-runtime/src/runtime.rs:993-1008`
+  - persisted binding + `Connected` を restore 時に `Stale` 化し、`worker_execution_mapping_stale` diagnostic を追加。
+- `crates/worker-runtime/src/execution.rs:18-23`, `148-156`, `173-181`
+  - `Stale` backend kind と durable binding projection が追加されている。
+
+しかし Workspace Server の remote Runtime projection では、Runtime HTTP から返る `WorkerSummary` / `WorkerDetail` の `execution` を無視して、常に `can_accept_input: true` にしている。
+
+- `crates/workspace-server/src/hosts.rs:1683-1704`
+  - remote `map_worker_summary()` が `summary.execution` を見ずに `can_accept_input: true`。
+- `crates/workspace-server/src/hosts.rs:1715-1736`
+  - remote `map_worker_detail()` も `detail.execution` を見ずに `can_accept_input: true`。
+- 対照的に embedded projection は `can_accept_embedded_input()` で `status == Running` かつ `execution.backend == Connected` などを確認している（`hosts.rs:981-990`, `993-1015`, `1026-1048`）。
+
+このため、remote-facing Worker creation / listing では、Runtime 側で stale と診断された Worker でも Workspace API 上は input-capable と見えてしまう。Ticket の以下の要件を満たしていない。
+
+- `input-capable Worker が execution backend 未接続になる経路がない`
+- `Stale is not input-capable`
+- `embedded Worker / Workspace Companion / remote-facing Worker creation が同じ作成手順を使う`
+
+remote projection でも Runtime response の `execution.backend`, `run_state`, `status`, `last_result` を使って embedded と同等に `can_accept_input` / `can_stop` を計算する必要がある。
+
+## 前回 blocker の確認状況
+
+- Execution binding identity persistence は Runtime record に `execution` が保存されるようになっており、`WorkerExecutionBindingIdentity { backend_id }` も raw handle / socket / path / secret を保持していない。
+- restore 時の stale diagnostic は追加されている。
+- `CreateWorkerRequest.initial_input` の `System` は Runtime で `InvalidInitialInputKind` として拒否され、transcript には user role のみで作成される経路になっている。
+- create は execution backend 未接続なら拒否し、fake/providerless response を返さない方向である。
+
+重い validation（cargo / nix）は再実行していない。reported validation は未再現。
+
+---

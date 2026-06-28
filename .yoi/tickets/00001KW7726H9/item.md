@@ -2,7 +2,7 @@
 title: 'Runtime Worker起動経路を正規のExecution/ConfigBundle経路に一本化する'
 state: 'inprogress'
 created_at: '2026-06-28T13:35:21Z'
-updated_at: '2026-06-28T18:12:02Z'
+updated_at: '2026-06-28T18:17:07Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-28T16:47:42Z'
