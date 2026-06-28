@@ -55,3 +55,27 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: yoi-orchestrator at: 2026-06-28T17:12:39Z -->
+
+## Decision
+
+Routing decision:
+
+Workspace Dashboard Queue authorized Orchestrator routing, so the Ticket and current workspace state were inspected.
+
+Findings:
+- Ticket state: `queued`
+- Outgoing dependency: `depends_on 00001KW7726H9`
+- Blocking Ticket `00001KW7726H9` is currently `inprogress`.
+- Current inprogress Tickets: `00001KW7726H9`
+- Orchestration worktree: clean
+
+Decision:
+- Leave `00001KW76E8EG` queued and do not create a child worktree / role Pod yet.
+- Reason: embedded Runtime fs-store persistence should persist the canonical Runtime Worker creation model, not an embedded-only bypass. That canonical creation path is currently being implemented in `00001KW7726H9`.
+
+Next routing condition:
+- Re-evaluate this Ticket after `00001KW7726H9` is merged, validated, and closed, or after an explicit replan changes the dependency.
+
+---
