@@ -10,7 +10,7 @@
 //!   parent's notification buffer. Control-plane-only variants may still have
 //!   a renderer for diagnostics, but receive-side classification keeps them
 //!   out of LLM history/context.
-//! - **Apply side effects** on the parent (registry / pod-registry
+//! - **Apply side effects** on the parent (registry / worker-allocation
 //!   updates) so that the receive path is idempotent and tolerant of
 //!   out-of-order delivery.
 //!

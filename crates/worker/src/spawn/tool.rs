@@ -1,9 +1,9 @@
 //! `SpawnWorker` tool — launch a new Worker process as a child of this one.
 //!
-//! Wires pod-registry delegation, child manifest-config construction, subprocess
+//! Wires worker-allocation delegation, child manifest-config construction, subprocess
 //! launch, and socket handoff into a single `Tool` implementation. When
 //! the LLM calls `SpawnWorker`, a fresh Worker runtime command is exec'd in its own
-//! process group, the pod-registry is updated atomically, and the child's
+//! process group, the worker-allocation is updated atomically, and the child's
 //! first turn is kicked off by handing its socket a `Method::Run`.
 
 use std::path::{Path, PathBuf};
@@ -29,7 +29,7 @@ use tokio::time::sleep;
 use crate::ipc::event;
 use crate::prompt::catalog::PromptCatalog;
 use crate::runtime::dir::SpawnedWorkerRecord;
-use crate::runtime::pod_registry::{self, LockFileGuard, ScopeLockError};
+use crate::runtime::worker_allocation::{self, LockFileGuard, ScopeLockError};
 use crate::spawn::comm_tools::{SendRunError, send_run_and_confirm};
 use crate::spawn::registry::SpawnedWorkerRegistry;
 use protocol::WorkerEvent;
@@ -216,7 +216,7 @@ fn parse_spawn_profile_selector(raw: Option<&str>) -> Result<SpawnProfileSelecto
 /// controller once per Worker lifetime.
 pub struct SpawnWorkerTool {
     /// Spawner's own worker name — becomes the spawned Worker's
-    /// `delegated_from` in the pod-registry.
+    /// `delegated_from` in the worker-allocation.
     spawner_name: String,
     /// Path to the spawner's Unix socket. Handed to the child via
     /// `--callback` so its `WorkerEvent` callbacks have somewhere to land.
@@ -254,7 +254,7 @@ pub struct SpawnWorkerTool {
     /// `Permission::Write` rules in the delegated scope are revoked
     /// from the spawner's in-memory view (a `deny(Write, target)` is
     /// pushed on top, downgrading the spawner's effective access on
-    /// those paths to `Read`). Mirrors the pod-registry's
+    /// those paths to `Read`). Mirrors the worker-allocation's
     /// `effective_write` semantics: Write is the only permission
     /// tracked across Workers, so revocation only touches Write.
     spawner_scope: SharedScope,
@@ -337,15 +337,15 @@ impl Tool for SpawnWorkerTool {
             .map_err(|e| ToolError::InvalidArgument(format!("{e}")))?;
 
         let predicted_socket = self.runtime_base.join(&input.name).join("sock");
-        let lock_path = pod_registry::default_registry_path()
-            .map_err(|e| ToolError::ExecutionFailed(format!("pod-registry path: {e}")))?;
+        let lock_path = worker_allocation::default_allocation_path()
+            .map_err(|e| ToolError::ExecutionFailed(format!("worker-allocation path: {e}")))?;
 
         // Reserve the allocation up front. Spawner's pid is a live
         // placeholder; the child will rewrite it via `adopt_allocation`.
         {
             let mut guard = LockFileGuard::open(&lock_path)
-                .map_err(|e| ToolError::ExecutionFailed(format!("pod-registry open: {e}")))?;
-            pod_registry::delegate_scope(
+                .map_err(|e| ToolError::ExecutionFailed(format!("worker-allocation open: {e}")))?;
+            worker_allocation::delegate_scope(
                 &mut guard,
                 &self.spawner_name,
                 input.name.clone(),
@@ -354,7 +354,7 @@ impl Tool for SpawnWorkerTool {
                 scope_allow.clone(),
                 &self.delegation_scope,
             )
-            .map_err(pod_registry_err_to_tool)?;
+            .map_err(worker_allocation_err_to_tool)?;
         }
 
         // `start_outcome` covers steps that happen before the child is
@@ -527,7 +527,7 @@ impl SpawnWorkerTool {
 
     fn release_reservation(&self, lock_path: &Path, worker_name: &str) {
         if let Ok(mut g) = LockFileGuard::open(lock_path) {
-            let _ = pod_registry::release_worker(&mut g, worker_name);
+            let _ = worker_allocation::release_worker(&mut g, worker_name);
         }
     }
 }
@@ -864,7 +864,7 @@ fn spawn_delivery_error(worker_name: &str, err: SendRunError) -> ToolError {
     }
 }
 
-fn pod_registry_err_to_tool(e: ScopeLockError) -> ToolError {
+fn worker_allocation_err_to_tool(e: ScopeLockError) -> ToolError {
     match e {
         ScopeLockError::NotSubset { .. }
         | ScopeLockError::WriteConflict { .. }

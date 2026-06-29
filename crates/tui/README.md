@@ -16,7 +16,7 @@ Owns:
 Does not own:
 
 - durable transcript authority (`session-store`)
-- Worker current state (`pod-store`)
+- Worker current state (`session-store` worker metadata)
 - Worker lifecycle policy (`worker`)
 - product CLI ownership (`yoi`)
 

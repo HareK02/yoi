@@ -12,10 +12,8 @@ members = [
     "crates/worker-runtime",
     "crates/plugin-pdk",
     "crates/yoi",
-    "crates/pod-store",
     "crates/protocol",
     "crates/provider",
-    "crates/pod-registry",
     "crates/session-metrics",
     "crates/session-analytics",
     "crates/lint-common",
@@ -40,10 +38,8 @@ default-members = [
     "crates/worker-runtime",
     "crates/plugin-pdk",
     "crates/yoi",
-    "crates/pod-store",
     "crates/protocol",
     "crates/provider",
-    "crates/pod-registry",
     "crates/session-metrics",
     "crates/session-analytics",
     "crates/lint-common",
@@ -75,8 +71,6 @@ worker = { path = "crates/worker" }
 worker-runtime = { path = "crates/worker-runtime" }
 yoi-plugin-pdk = { path = "crates/plugin-pdk" }
 yoi = { path = "crates/yoi" }
-pod-registry = { path = "crates/pod-registry" }
-pod-store = { path = "crates/pod-store" }
 protocol = { path = "crates/protocol" }
 provider = { path = "crates/provider" }
 session-metrics = { path = "crates/session-metrics" }

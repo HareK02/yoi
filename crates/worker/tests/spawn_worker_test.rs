@@ -1,6 +1,6 @@
 //! Integration tests for the `SpawnWorker` tool.
 //!
-//! These tests exercise the tool's pod-registry delegation, subprocess
+//! These tests exercise the tool's worker-allocation delegation, subprocess
 //! launch, socket handoff, and `spawned_workers.json` write through an injected
 //! typed runtime command. The mock command exits immediately while a
 //! test-owned Unix listener pre-binds the predicted socket path, so the tool
@@ -22,7 +22,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::net::UnixListener;
 use worker::runtime::dir::{RuntimeDir, SpawnedWorkerRecord};
-use worker::runtime::pod_registry::{self, LockFileGuard};
+use worker::runtime::worker_allocation::{self, LockFileGuard};
 use worker::spawn::registry::SpawnedWorkerRegistry;
 use worker::spawn::tool::spawn_worker_tool_with_runtime_command;
 
@@ -67,7 +67,7 @@ async fn setup_spawner(
         .unwrap();
     let spawner_socket = spawner_rd.socket_path();
 
-    let _guard = pod_registry::install_top_level(
+    let _guard = worker_allocation::install_top_level(
         spawner_name.into(),
         std::process::id(),
         spawner_socket.clone(),
@@ -450,8 +450,8 @@ async fn spawn_worker_delegates_scope_and_sends_run() {
         other => panic!("expected Run, got {other:?}"),
     }
 
-    // Verify pod_registry has the child allocation under `root`.
-    let lock_path = pod_registry::default_registry_path().unwrap();
+    // Verify worker_allocation has the child allocation under `root`.
+    let lock_path = worker_allocation::default_allocation_path().unwrap();
     let guard = LockFileGuard::open(&lock_path).unwrap();
     let child = guard
         .data()
@@ -651,7 +651,7 @@ async fn spawn_worker_rejects_scope_outside_spawner() {
     }
 
     // The spawner's allocation is unchanged; no "child" appeared.
-    let lock_path = pod_registry::default_registry_path().unwrap();
+    let lock_path = worker_allocation::default_allocation_path().unwrap();
     let guard = LockFileGuard::open(&lock_path).unwrap();
     assert!(guard.data().find("child").is_none());
 
@@ -724,7 +724,7 @@ async fn spawn_worker_rolls_back_reservation_when_socket_never_appears() {
     }
 
     // Rollback assertion: the reserved "ghost" allocation is gone.
-    let lock_path = pod_registry::default_registry_path().unwrap();
+    let lock_path = worker_allocation::default_allocation_path().unwrap();
     let guard = LockFileGuard::open(&lock_path).unwrap();
     assert!(
         guard.data().find("ghost").is_none(),

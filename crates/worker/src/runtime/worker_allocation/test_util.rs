@@ -1,6 +1,6 @@
-//! Shared test helpers for the pod-registry crate.
+//! Shared test helpers for the pod-worker allocation crate.
 //!
-//! Visible to all `#[cfg(test)]` modules under `crate::test_util::*`.
+//! Visible to all `#[cfg(test)]` modules under `super::test_util::*`.
 
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -8,7 +8,7 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 use manifest::{DelegationScope, Permission, ScopeConfig, ScopeRule};
 use session_store::SegmentId;
 
-use crate::table::LockFileGuard;
+use super::table::LockFileGuard;
 
 pub(crate) fn sid() -> SegmentId {
     session_store::new_segment_id()
@@ -17,7 +17,7 @@ pub(crate) fn sid() -> SegmentId {
 /// Serialises tests that mutate runtime-dir env vars. The test
 /// harness runs tests on multiple threads inside a single process,
 /// so env-var writes from one test would otherwise leak into a
-/// parallel test's `default_registry_path()` lookup.
+/// parallel test's `default_allocation_path()` lookup.
 pub(crate) static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Sandbox `YOI_RUNTIME_DIR` to a tempdir for the duration of

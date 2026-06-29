@@ -1350,8 +1350,9 @@ impl FixtureWorkspace {
         };
         fixture.write_fixture_metadata("created", None)?;
 
-        write_blocking_pod_metadata(&fixture.xdg_data_home, "workspace")?;
-        write_blocking_pod_metadata(&fixture.xdg_data_home, "workspace-orchestrator")?;
+        let worker_metadata_root = active_worker_metadata_root(&fixture.home);
+        write_blocking_worker_metadata(&worker_metadata_root, "workspace")?;
+        write_blocking_worker_metadata(&worker_metadata_root, "workspace-orchestrator")?;
         run_yoi(
             binary,
             &fixture.workspace,
@@ -1621,8 +1622,8 @@ impl FixtureWorkspace {
                     "host_runtime_inherited": false,
                     "host_xdg_runtime_dir_present": std::env::var_os("XDG_RUNTIME_DIR").is_some(),
                     "tested_yoi_runtime_source": "fixture XDG_RUNTIME_DIR",
-                    "tested_yoi_pod_registry": self.xdg_runtime_dir.join("yoi").join("pods.json"),
-                    "fixture_pod_metadata_root": self.xdg_data_home.join("yoi").join("pods")
+                    "tested_yoi_worker_allocation": self.xdg_runtime_dir.join("yoi").join("workers.json"),
+                    "fixture_worker_metadata_root": active_worker_metadata_root(&self.home)
                 },
                 "tested_yoi_env_policy": tested_yoi_env_policy_overview(),
                 "cleanup": cleanup,
@@ -1997,8 +1998,12 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_blocking_pod_metadata(data_home: &Path, worker_name: &str) -> Result<()> {
-    let dir = data_home.join("yoi").join("pods").join(worker_name);
+fn active_worker_metadata_root(home: &Path) -> PathBuf {
+    home.join(".yoi").join("workers")
+}
+
+fn write_blocking_worker_metadata(worker_metadata_root: &Path, worker_name: &str) -> Result<()> {
+    let dir = worker_metadata_root.join(worker_name);
     fs::create_dir_all(&dir)?;
     fs::write(dir.join("metadata.json"), b"not valid metadata for e2e\n")?;
     Ok(())

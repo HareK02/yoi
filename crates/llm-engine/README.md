@@ -19,7 +19,7 @@ Does not own:
 - Worker names, sockets, process lifecycle, or scope delegation (`worker`)
 - product CLI shape (`yoi`)
 - provider catalog and secret resolution (`provider`, `secrets`)
-- durable Worker current state (`pod-store`)
+- durable Worker current state (`session-store` worker metadata)
 
 ## Design notes
 

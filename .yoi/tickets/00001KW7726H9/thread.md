@@ -277,3 +277,444 @@ Implementation focus:
 - final request fields must be justified against source / scope-access / visibility / persistence-projection / retry / validation / existing type / failure.
 
 ---
+
+<!-- event: implementation_report author: yoi-coder-00001KW7726H9-launch-unify at: 2026-06-28T17:46:07Z -->
+
+## Implementation report
+
+Implementation report:
+
+実装・検証・commit 完了。merge / close / cleanup は未実施。
+
+Commit:
+- `14bb4934a6374eea64591035e5342088ab0ccd09 runtime: unify worker creation path`
+
+実装概要:
+
+- Runtime Worker 作成 API を canonical な `ConfigBundle + ExecutionBackend` 経路に統一。
+- `worker-runtime::catalog::CreateWorkerRequest` を Runtime 内部の作成契約として絞り込み。
+  - 採用フィールド:
+    - `profile: ProfileSelector`
+    - `config_bundle: ConfigBundleRef`（必須）
+    - `initial_input: Option<WorkerInput>`
+  - 除外フィールド:
+    - Browser / product intent
+    - requested capabilities
+    - workspace refs / mount refs
+    - cwd / workspace path / tool scope / config store / secret / socket / raw path 類
+- `CreateWorkerRequest::default()` / providerless / tools-less 作成経路を廃止し、input-capable Worker 作成には execution backend を必須化。
+- ConfigBundle 未同期 / digest mismatch / profile 未宣言 / execution backend 不在 / spawn-input dispatch rejection を typed diagnostics / errors として扱うように変更。
+- 作成は成功時のみ catalog / transcript / event を永続化し、spawn / initial input dispatch 失敗時は in-memory Worker と create event を rollback。
+- Workspace 側で Browser-facing launch semantics と Runtime create request を分離。
+  - Browser-facing `WorkerSpawnRequest` は intent / requested name / acceptance / profile / initial input の範囲に限定。
+  - Workspace host が backend-resolved ConfigBundle を同期し、その `ConfigBundleRef` で Runtime create を呼び出す。
+- Embedded / Companion / remote-facing creation が同じ Runtime create path を通るように調整。
+- providerless / fake response 前提のテストを更新し、execution backend を持つ経路または typed rejection を確認するテストに変更。
+
+API field rationale:
+
+- `profile`
+  - source: launch backend が決定する profile selector
+  - visibility: opaque selector であり raw config/body/path/secret を含まない
+  - validation: synced ConfigBundle が selector を宣言していることを Runtime 側で検証
+  - persistence: Worker projection に durable selector として保存可能
+- `config_bundle`
+  - source: Runtime create 前に backend が `store_config_bundle` / remote sync で確定する opaque ref
+  - visibility: `id + digest` のみで config store path や secret は露出しない
+  - validation: missing / digest mismatch / profile mismatch を typed error 化
+  - retry: 同じ bundle ref で再試行可能
+  - failure: missing ConfigBundle は create 前に fail closed
+- `initial_input`
+  - source: Browser/product launch intent から通常の Worker input として明示的に渡す
+  - visibility: ユーザー/システム input 本体のみ。scope/path/secret は含めない
+  - persistence: 作成成功時に transcript に同一 transaction として保存
+  - failure: initial dispatch が execution backend に rejected された場合は create rollback
+- 除外フィールド:
+  - `intent`, `requested_capabilities`, `workspace_refs`, `mount_refs`, raw cwd/path/config/secret は Runtime create API から除外
+  - 理由: Browser/product/backend policy 層の semantics であり、Runtime Worker の canonical durable create request に混ぜると visibility/persistence/retry/error 境界が崩れるため
+
+Validation:
+- `cargo fmt`: success
+- `cargo test -p worker-runtime --features ws-server`: success
+- `cargo test -p yoi-workspace-server`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi`: success
+
+Residual risks / review focus:
+- E2E の実プロセス spawn テストは既存方針どおり未整備なので、実 worker process 起動の完全統合は unit/integration レベルの backend mock と `nix build` での確認に留まる。
+- create 成功後の永続化失敗時に、すでに execution backend が外部 worker を spawn 済みであるケースの完全補償は今後さらに詰める余地がある。今回の実装では spawn / initial input rejection は rollback し、成功時だけ durable persistence する。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-28T17:46:31Z -->
+
+## Implementation report
+
+Review kickoff:
+
+Reviewer Worker spawned for `00001KW7726H9` implementation.
+
+- Reviewer Worker: `yoi-reviewer-00001KW7726H9-launch-unify`
+- Review target commit: `14bb4934a6374eea64591035e5342088ab0ccd09 runtime: unify worker creation path`
+- Review mode: read-only implementation worktree review
+
+Review focus:
+- Runtime worker creation uses canonical ConfigBundle + ExecutionBackend path
+- Browser-facing launch semantics are separated from Runtime `CreateWorkerRequest`
+- create request fields are justified against source / scope-access / visibility / persistence-projection / retry / validation / existing type / failure
+- no raw workspace / cwd / tool scope / config store / secret / socket / path leaks
+- ConfigBundle missing / digest mismatch / profile mismatch / execution backend missing / provider-secret failure produce typed diagnostics
+- input-capable Workers require execution backend
+- create is persistent/transactional enough, with rollback on spawn / initial input rejection
+- embedded / Companion / remote-facing creation share the canonical path
+- no fake/providerless assistant response bypass
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KW7726H9-launch-unify at: 2026-06-28T17:51:13Z status: request_changes -->
+
+## Review: request changes
+
+request_changes
+
+読み取り専用で Ticket `00001KW7726H9`、`artifacts/api-field-audit.md`、target commit `14bb4934a6374eea64591035e5342088ab0ccd09` の実装を確認した。重い検証コマンドは再実行していない。`git diff --check HEAD^..HEAD` は追加出力なし。
+
+## Blockers
+
+### 1. 永続化要件の `execution binding identity` と stale execution mapping 診断が未実装
+
+Ticket の保存・再起動要件では、Worker 作成時に `execution binding identity` を保存し、再起動後に live execution handle を復元できない場合は stale execution mapping として typed diagnostic にする必要がある。
+
+しかし実装では、永続化 record に execution binding 情報が保存されていない。
+
+- `crates/worker-runtime/src/runtime.rs:1467-1477`
+  - `PersistedWorkerRecord` へ `worker_ref`, `worker_id`, `status`, `request`, `transcript` などは保存されているが、`WorkerExecutionStatus` / binding id / execution handle identity が落ちている。
+- `crates/worker-runtime/src/runtime.rs:978-1010`
+  - restore 時に全 Worker が `WorkerExecutionStatus::unconnected()` / `execution_handle: None` にされる。
+  - その際、`diagnostics` は persisted diagnostics をそのまま引き継ぐだけで、stale execution mapping の diagnostic を追加していない。
+- `Runtime::diagnostics()` は `state.diagnostics.clone()` を返すのみで、restore された unconnected Worker を typed diagnostic として表面化しない。
+
+これにより、次の意図を満たしていない。
+
+- Worker 作成時に execution binding identity を保存する。
+- 保存 identity は権限値ではなく stale execution mapping / reconnect の参照として扱う。
+- 再起動後に live execution handle を復元できない場合は stale execution mapping として診断する。
+- missing config / execution binding / history を typed diagnostic にし、黙って別 Worker を作らない。
+
+現状は「黙って unconnected に戻す」挙動なので、Runtime worker creation の永続性・復元診断要件として blocker。
+
+### 2. 初期 input で `System` を受け入れて transcript に保存できる
+
+Ticket / API audit の方針では、Browser launch の initial input はユーザー投入分であり、launch/create 時に System message を作らない設計だった。System instruction / role prompt は ConfigBundle/Profile 側に寄せる意図である。
+
+しかし現在の実装では、CreateWorkerRequest の `initial_input` が `WorkerInput` のままなので `WorkerInputKind::System` を受け取れる。
+
+- `crates/worker-runtime/src/catalog.rs`
+  - `CreateWorkerRequest { config_bundle_ref, initial_input: Option<WorkerInput> }`
+- `crates/worker-runtime/src/runtime.rs:261-265`
+  - `WorkerInputKind::System => TranscriptRole::System` として initial transcript に保存される。
+- `crates/workspace-server/src/hosts.rs`
+  - Browser-facing `WorkerSpawnRequest.initial_input` も `EmbeddedWorkerInput` 経由で system/user を表現できる形になっている。
+
+これにより、Browser/API caller が Worker 作成時に system transcript を注入できるため、Ticket の「Browser launch semantics と Runtime CreateWorkerRequest を分離し、initial input はユーザー投入分に限定する」意図と矛盾する。少なくとも create / launch initial input では User-only 型にするか、Runtime boundary で `System` を typed rejection する必要がある。
+
+## 確認できた良い点
+
+- Runtime `CreateWorkerRequest` から workspace / cwd / tool scope / config store / secret / socket / path 由来の大きな launch fields は削られ、基本的に `config_bundle_ref` + `initial_input` に寄っている。
+- ConfigBundle missing / digest mismatch / profile mismatch は `RuntimeError` と diagnostic で扱う方向になっている。
+- execution backend 不在時は providerless / fake Worker を返さず、create が失敗する経路になっている。
+- embedded Workspace Server 側の spawn は ConfigBundle を Runtime に sync してから canonical Runtime create に寄せている。
+
+---
+
+<!-- event: implementation_report author: yoi-coder-00001KW7726H9-launch-unify at: 2026-06-28T18:12:02Z -->
+
+## Implementation report
+
+Change-response implementation report:
+
+Reviewer blockers を修正し、追加 commit を作成済み。Ticket ファイル編集、merge、close、cleanup は未実施。
+
+Commit:
+- `c29d10b67bfff1f4a7a1b2742ec05fe63b80c054 runtime: persist execution binding projection`
+
+変更内容:
+
+- Execution binding identity の永続化
+  - `WorkerExecutionBindingIdentity { backend_id }` を追加。
+  - raw handle / secret / path / socket を含まない非権威 durable projection として保存。
+  - Worker persisted record に `WorkerExecutionStatus` を保存し、execution status / binding projection が restore 後に消えないようにした。
+
+- stale execution mapping diagnostic
+  - fs-store restore 時、persisted execution binding が存在するが live execution handle を復元できない場合に Worker execution status を `stale` として投影。
+  - typed diagnostic `worker_execution_mapping_stale` を追加。
+  - stale projection は input-capable と誤認されないよう `WorkerExecutionBackendKind::Stale` として扱う。
+
+- System initial input の拒否
+  - `CreateWorkerRequest.initial_input` に `WorkerInputKind::System` が来た場合、Runtime boundary で `RuntimeError::InvalidInitialInputKind` として拒否。
+  - System / role instructions は Profile / ConfigBundle に属し、launch/create initial input として transcript に保存されないようにした。
+  - Browser-facing embedded launch でも typed diagnostic `embedded_worker_initial_input_kind_invalid` として返す。
+
+- Tests
+  - System initial input が reject され、Worker / WorkerCreated event が persisted されないことを確認。
+  - fs-store restore 後に stale execution mapping diagnostic が出ること、binding identity が raw authority ではなく backend id projection として残ることを確認。
+  - embedded runtime launch の System initial input reject を確認。
+
+Validation:
+- `cargo fmt`: success
+- `cargo test -p worker-runtime --features ws-server`: success
+- `cargo test -p yoi-workspace-server`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `cargo test -p worker-runtime --features fs-store,ws-server`: success
+- `nix build .#yoi`: success
+
+Residual risks / review focus:
+- restore 後の execution binding は非権威 projection であり、live handle は復元しない。再接続 / reattach 実処理は別設計範囲。
+- stale Worker は binding identity と diagnostic を保持するが input-capable とは扱わないため、UI/API 側では stale diagnostic を見て明示的な再接続 / 再作成導線を出す必要がある。
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KW7726H9-launch-unify at: 2026-06-28T18:17:07Z status: request_changes -->
+
+## Review: request changes
+
+request_changes
+
+読み取り専用で再レビューした。前回指摘した Runtime 本体側の 2 点は概ね修正されているが、元の受け入れ条件に対する blocker が 1 件残っている。
+
+## Blocker
+
+### Remote Runtime projection が stale / unconnected Worker を input-capable として公開する
+
+Runtime fs-store restore 側では、persisted execution binding があるが live handle が戻らない場合に `WorkerExecutionBackendKind::Stale` と `worker_execution_mapping_stale` diagnostic を出す実装になっている。
+
+- `crates/worker-runtime/src/runtime.rs:993-1008`
+  - persisted binding + `Connected` を restore 時に `Stale` 化し、`worker_execution_mapping_stale` diagnostic を追加。
+- `crates/worker-runtime/src/execution.rs:18-23`, `148-156`, `173-181`
+  - `Stale` backend kind と durable binding projection が追加されている。
+
+しかし Workspace Server の remote Runtime projection では、Runtime HTTP から返る `WorkerSummary` / `WorkerDetail` の `execution` を無視して、常に `can_accept_input: true` にしている。
+
+- `crates/workspace-server/src/hosts.rs:1683-1704`
+  - remote `map_worker_summary()` が `summary.execution` を見ずに `can_accept_input: true`。
+- `crates/workspace-server/src/hosts.rs:1715-1736`
+  - remote `map_worker_detail()` も `detail.execution` を見ずに `can_accept_input: true`。
+- 対照的に embedded projection は `can_accept_embedded_input()` で `status == Running` かつ `execution.backend == Connected` などを確認している（`hosts.rs:981-990`, `993-1015`, `1026-1048`）。
+
+このため、remote-facing Worker creation / listing では、Runtime 側で stale と診断された Worker でも Workspace API 上は input-capable と見えてしまう。Ticket の以下の要件を満たしていない。
+
+- `input-capable Worker が execution backend 未接続になる経路がない`
+- `Stale is not input-capable`
+- `embedded Worker / Workspace Companion / remote-facing Worker creation が同じ作成手順を使う`
+
+remote projection でも Runtime response の `execution.backend`, `run_state`, `status`, `last_result` を使って embedded と同等に `can_accept_input` / `can_stop` を計算する必要がある。
+
+## 前回 blocker の確認状況
+
+- Execution binding identity persistence は Runtime record に `execution` が保存されるようになっており、`WorkerExecutionBindingIdentity { backend_id }` も raw handle / socket / path / secret を保持していない。
+- restore 時の stale diagnostic は追加されている。
+- `CreateWorkerRequest.initial_input` の `System` は Runtime で `InvalidInitialInputKind` として拒否され、transcript には user role のみで作成される経路になっている。
+- create は execution backend 未接続なら拒否し、fake/providerless response を返さない方向である。
+
+重い validation（cargo / nix）は再実行していない。reported validation は未再現。
+
+---
+
+<!-- event: implementation_report author: yoi-coder-00001KW7726H9-launch-unify at: 2026-06-28T18:35:12Z -->
+
+## Implementation report
+
+Change-response implementation report:
+
+Reviewer の remote Runtime projection blocker を修正し、追加 commit を作成済み。Ticket ファイル編集、merge、close、cleanup は未実施。
+
+Commit:
+- `ba7f9d2ee83a946820cc234e847b6531b4a141f3 workspace: respect remote execution projection`
+
+Note:
+- Coder output initially reported a different SHA prefix, but `git rev-parse HEAD` confirmed the actual commit above.
+
+変更内容:
+
+- `crates/workspace-server/src/hosts.rs` の remote Runtime projection で、Runtime HTTP の `WorkerSummary` / `WorkerDetail.execution` を反映するように修正。
+- remote projection の `can_accept_input` / `can_stop` は embedded projection と同様に以下を確認する。
+  - Worker status が `running`
+  - `execution.backend == connected`
+  - input は `execution.run_state == idle`
+  - `rejected` / `errored` / `unconnected` / `stopped` などの実行状態は操作不可
+  - `last_result` が `rejected` / `errored` / `unsupported` の場合は操作不可
+- remote Worker の表示 status も execution status を反映し、`stale` / `unconnected` / `rejected` / `errored` を投影する。
+- remote Runtime の stale / unconnected / rejected / errored projection が input-capable / stoppable にならないことを確認する tests を追加。
+- 既存 remote connected projection test に、connected idle の場合だけ input / stop capable になる確認を追加。
+
+Validation:
+- `cargo fmt`: success
+- `cargo test -p yoi-workspace-server`: success
+- `cargo test -p worker-runtime --features ws-server`: success
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi`: success
+
+Residual risks / review focus:
+- remote Runtime の `execution` projection を信頼して UI/API capability を決めるため、remote 側が古い schema や不正な execution state を返す場合は deserialize / request failure として扱われる。
+- stale / unconnected は明示的に input-capable ではなくなるため、既存 UI が「remote worker は常に入力可」と仮定している場合は表示 / 操作導線の調整が必要になる可能性がある。
+
+---
+
+<!-- event: review author: yoi-reviewer-00001KW7726H9-launch-unify at: 2026-06-28T18:37:36Z status: approve -->
+
+## Review: approve
+
+approve
+
+読み取り専用で再レビューした。HEAD は `ba7f9d2ee83a946820cc234e847b6531b4a141f3 workspace: respect remote execution projection`。`git diff --check c29d10b..ba7f9d2` は追加出力なし。cargo / nix 系の reported validation は再実行していない。
+
+## 確認結果
+
+前回 blocker だった remote Runtime projection は解消されている。
+
+- `crates/workspace-server/src/hosts.rs:1670-1693`
+  - remote `map_worker_summary()` が Runtime HTTP response の `summary.execution` を参照し、`can_accept_input` / `can_stop` を計算するようになっている。
+- `crates/workspace-server/src/hosts.rs:1703-1726`
+  - remote `map_worker_detail()` も `detail.execution` を使っている。
+- `crates/workspace-server/src/hosts.rs:2106-2134`
+  - `runtime_worker_can_accept_input()` は `Running` + `Connected` + `Idle` + rejected / errored / unsupported last_result なしを要求。
+  - `runtime_worker_can_stop()` も `Running` + `Connected` を要求し、stopped / rejected / errored / unconnected run_state と blocking last_result を拒否。
+- `crates/workspace-server/src/hosts.rs:2155-2175`
+  - display status も `Stale` / `Unconnected` / `Rejected` / `Errored` を反映する。
+- `crates/workspace-server/src/hosts.rs:3384-3475`
+  - stale / unconnected / rejected / errored の remote projection が input-capable / stoppable にならない test が追加されている。
+- 既存 remote positive path でも connected idle worker が input / stop capable であることが確認されている。
+
+これにより、`stale` / execution backend 未接続 Worker が Workspace API 上で input-capable として見える問題は解消されている。
+
+## 総合判断
+
+前回までの blocker（execution binding projection persistence、stale diagnostic、System initial input rejection、remote stale projection）について、現在の差分で受け入れ条件を満たしていると判断する。現時点で concrete blocker はない。
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-28T18:38:41Z -->
+
+## Implementation report
+
+Merge / validation report:
+
+Implementation branch was integrated into the orchestration branch after reviewer approval.
+
+Integrated commits:
+- `14bb4934a6374eea64591035e5342088ab0ccd09 runtime: unify worker creation path`
+- `c29d10b67bfff1f4a7a1b2742ec05fe63b80c054 runtime: persist execution binding projection`
+- `ba7f9d2ee83a946820cc234e847b6531b4a141f3 workspace: respect remote execution projection`
+
+Merge commit:
+- `bdb339fa merge: runtime worker launch unification`
+
+Validation in orchestration worktree:
+- `cargo fmt --all --check`: success
+- `cargo test -p worker-runtime --features ws-server`: success
+- `cargo test -p worker-runtime --features "fs-store ws-server"`: success
+- `cargo test -p yoi-workspace-server`: success (`36 passed`)
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Outcome:
+- Runtime Worker creation is unified around canonical `ConfigBundleRef + ExecutionBackend` create semantics.
+- Browser-facing launch semantics are separated from Runtime `CreateWorkerRequest`.
+- Runtime create request no longer carries raw workspace/cwd/tool-scope/config-store/secret/socket/path semantics.
+- ConfigBundle missing/digest/profile mismatch and execution backend missing/provider failures are typed diagnostics/errors.
+- Input-capable Workers require execution backend connection.
+- Execution binding identity is persisted only as non-authority projection and restore without live handle surfaces stale execution mapping diagnostics.
+- System initial input is rejected at Runtime boundary and not persisted as launch-created system transcript.
+- Remote Runtime projection respects execution state so stale/unconnected/rejected/errored Workers are not input-capable.
+- fake/providerless response bypass was not introduced.
+
+---
+
+<!-- event: state_changed author: yoi-orchestrator at: 2026-06-28T18:38:48Z from: inprogress to: done reason: implementation_merged_and_validated field: state -->
+
+## State changed
+
+Reviewer approval後に implementation branch を orchestration branch へ merge し、要求された validation が成功したため done に遷移する。
+
+Validation:
+- `cargo fmt --all --check`: success
+- `cargo test -p worker-runtime --features ws-server`: success
+- `cargo test -p worker-runtime --features "fs-store ws-server"`: success
+- `cargo test -p yoi-workspace-server`: success (`36 passed`)
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+---
+
+<!-- event: state_changed author: hare at: 2026-06-28T18:39:03Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-06-28T18:39:03Z status: closed -->
+
+## 完了
+
+Runtime Worker 起動経路を canonical `ConfigBundleRef + ExecutionBackend` 経路へ一本化し、reviewer approval 後に orchestration branch へ merge した。
+
+実装内容:
+- Runtime `CreateWorkerRequest` を `config_bundle_ref` と user-only initial input 中心の内部作成契約へ整理。
+- Browser-facing launch semantics と Runtime worker creation request を分離。
+- raw workspace / cwd / tool scope / config store / secret / socket / path 類を Runtime create request に含めない境界にした。
+- ConfigBundle missing / digest mismatch / profile mismatch を typed error / diagnostic として扱う。
+- execution backend 未接続では Worker 作成を拒否し、input-capable Worker が backend 未接続になる経路を塞いだ。
+- create 成功時のみ catalog / transcript / event を永続化し、spawn / initial input dispatch rejection は rollback。
+- execution binding identity を raw handle / secret / path / socket を含まない non-authority projection として永続化。
+- restore 後に live handle がない persisted execution mapping は `stale` として diagnostic `worker_execution_mapping_stale` を出す。
+- System initial input を Runtime boundary で拒否し、launch/create が system transcript を注入できないようにした。
+- Workspace embedded / Companion / remote-facing creation を canonical Runtime create path に寄せた。
+- Remote Runtime projection でも execution status を見て `can_accept_input` / `can_stop` を計算し、stale / unconnected / rejected / errored Workers を input-capable として出さないようにした。
+- fake/providerless response bypass は導入していない。
+
+Integrated commits:
+- `14bb4934a6374eea64591035e5342088ab0ccd09 runtime: unify worker creation path`
+- `c29d10b67bfff1f4a7a1b2742ec05fe63b80c054 runtime: persist execution binding projection`
+- `ba7f9d2ee83a946820cc234e847b6531b4a141f3 workspace: respect remote execution projection`
+- merge: `bdb339fa merge: runtime worker launch unification`
+
+Validation:
+- `cargo fmt --all --check`: success
+- `cargo test -p worker-runtime --features ws-server`: success
+- `cargo test -p worker-runtime --features "fs-store ws-server"`: success
+- `cargo test -p yoi-workspace-server`: success (`36 passed`)
+- `cargo check -p yoi`: success
+- `git diff --check`: success
+- `nix build .#yoi --no-link`: success
+
+Operational note:
+- User instructed not to use `StopPod` for now after repeated stop/hang symptoms. Cleanup will skip role-Pod shutdown and remove only child implementation worktree / branch.
+
+---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-06-28T18:39:24Z -->
+
+## Implementation report
+
+Cleanup report:
+
+- User instructed not to use `StopPod` for now after repeated stop/hang symptoms. Role Pod shutdown was intentionally skipped.
+- Child implementation worktree was removed:
+  - `/home/hare/Projects/yoi/.worktree/00001KW7726H9-runtime-worker-launch-unification`
+- Child implementation branch was removed:
+  - `work/00001KW7726H9-runtime-worker-launch-unification`
+- No root/original workspace cleanup was performed.
+- Orchestration worktree is clean after worktree/branch cleanup.
+
+Routing note:
+- Tickets that were queued behind `00001KW7726H9` can now be re-evaluated.
+
+---

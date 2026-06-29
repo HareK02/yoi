@@ -1,2 +1,2 @@
 pub mod dir;
-pub use ::pod_registry;
+pub mod worker_allocation;

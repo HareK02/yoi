@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use manifest::paths;
-use pod_store::{FsWorkerStore, WorkerMetadataStore};
 use session_store::{FsStore, SessionId, Store};
+use session_store::{FsWorkerStore, WorkerMetadataStore};
 
 use crate::worker_cleanup_cli::parse_duration;
 
@@ -203,8 +203,8 @@ pub fn run_prune_with_roots(
         ));
     }
     let session_store = FsStore::new(data_dir.join("sessions")).map_err(to_error)?;
-    let pod_store = FsWorkerStore::new(data_dir.join("pods")).map_err(to_error)?;
-    let referenced_sessions = referenced_sessions(&pod_store)?;
+    let worker_metadata_store = FsWorkerStore::new(data_dir.join("workers")).map_err(to_error)?;
+    let referenced_sessions = referenced_sessions(&worker_metadata_store)?;
     let cutoff = options
         .older_than
         .map(|older_than| {
@@ -315,10 +315,12 @@ pub fn run_prune_with_roots(
     })
 }
 
-fn referenced_sessions(pod_store: &FsWorkerStore) -> Result<BTreeSet<SessionId>, SessionCliError> {
+fn referenced_sessions(
+    worker_metadata_store: &FsWorkerStore,
+) -> Result<BTreeSet<SessionId>, SessionCliError> {
     let mut sessions = BTreeSet::new();
-    for name in pod_store.list_names().map_err(to_error)? {
-        let metadata = pod_store
+    for name in worker_metadata_store.list_names().map_err(to_error)? {
+        let metadata = worker_metadata_store
             .read_by_name(&name)
             .map_err(to_error)?
             .ok_or_else(|| {
@@ -358,8 +360,8 @@ pub fn help_text() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pod_store::{WorkerActiveSegmentRef, WorkerMetadata};
     use session_store::{Store, new_segment_id, new_session_id};
+    use session_store::{WorkerActiveSegmentRef, WorkerMetadata};
     use std::io::Write;
 
     #[test]
@@ -441,7 +443,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         let session_store = FsStore::new(data_dir.join("sessions")).unwrap();
-        let pod_store = FsWorkerStore::new(data_dir.join("pods")).unwrap();
+        let worker_metadata_store = FsWorkerStore::new(data_dir.join("workers")).unwrap();
         let referenced_session = new_session_id();
         let referenced_segment = new_segment_id();
         let orphan_session = new_session_id();
@@ -452,7 +454,7 @@ mod tests {
         session_store
             .create_segment(orphan_session, orphan_segment, &[])
             .unwrap();
-        pod_store
+        worker_metadata_store
             .write(&WorkerMetadata::new(
                 "agent",
                 Some(WorkerActiveSegmentRef::active_segment(

@@ -6,14 +6,20 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use worker_runtime::catalog::{
-    CapabilityRequest, ConfigBundleRef, CreateWorkerRequest, ProfileSelector,
-    WorkerDetail as EmbeddedWorkerDetail, WorkerIntent, WorkerStatus as EmbeddedWorkerStatus,
+    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerDetail as EmbeddedWorkerDetail,
+    WorkerStatus as EmbeddedWorkerStatus,
 };
-use worker_runtime::config_bundle::{ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary};
+use worker_runtime::config_bundle::{
+    ConfigBundle, ConfigBundleAvailability, ConfigBundleMetadata, ConfigBundleProvenance,
+    ConfigBundleSummary, ConfigProfileDescriptor,
+};
 use worker_runtime::error::RuntimeError as EmbeddedRuntimeError;
-use worker_runtime::execution::WorkerExecutionRunState;
+use worker_runtime::execution::{
+    WorkerExecutionBackendKind, WorkerExecutionRunState, WorkerExecutionStatus,
+};
+use worker_runtime::fs_store::FsRuntimeStoreOptions;
 use worker_runtime::http_server::{
     RuntimeHttpConfigBundleAvailabilityResponse, RuntimeHttpConfigBundleSyncRequest,
     RuntimeHttpErrorResponse, RuntimeHttpSummaryResponse, RuntimeHttpTranscriptResponse,
@@ -236,11 +242,12 @@ pub struct WorkerLookupResult {
 
 /// Browser-safe worker spawn request shape.
 ///
-/// The request intentionally carries only workspace policy intents, stable
-/// worker identifiers, optional profile selectors, config bundle refs, and
-/// requested capability names. Raw workspace roots, child cwd, executable path,
-/// Runtime endpoints/credentials, raw bundle storage paths, and host-local
-/// resolved WorkerSpec content are resolved by the runtime service and never
+/// The request carries Browser-facing launch semantics only: workspace intent,
+/// optional display identity, acceptance policy, optional profile selector, and
+/// optional initial input. Runtime execution authority is resolved by the host
+/// into a synced ConfigBundle before the canonical Runtime create request is
+/// built. Raw workspace roots, child cwd, executable paths, tool scope,
+/// credentials, raw config stores, sockets, sessions, and storage paths are not
 /// accepted from Workspace API callers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerSpawnRequest {
@@ -251,9 +258,7 @@ pub struct WorkerSpawnRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<ProfileSelector>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config_bundle: Option<ConfigBundleRef>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub requested_capabilities: Vec<CapabilityRequest>,
+    pub initial_input: Option<EmbeddedWorkerInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -907,15 +912,19 @@ pub struct EmbeddedWorkerRuntime {
     execution_enabled: bool,
 }
 
+fn embedded_runtime_options() -> EmbeddedRuntimeOptions {
+    let runtime_id = EmbeddedRuntimeId::new(EMBEDDED_RUNTIME_ID)
+        .expect("embedded runtime id is a non-empty literal");
+    EmbeddedRuntimeOptions {
+        runtime_id: Some(runtime_id),
+        display_name: Some("Workspace backend embedded Runtime".to_string()),
+        ..EmbeddedRuntimeOptions::default()
+    }
+}
+
 impl EmbeddedWorkerRuntime {
     pub fn new_memory(workspace_id: impl AsRef<str>) -> Self {
-        let runtime_id = EmbeddedRuntimeId::new(EMBEDDED_RUNTIME_ID)
-            .expect("embedded runtime id is a non-empty literal");
-        let runtime = worker_runtime::Runtime::with_options(EmbeddedRuntimeOptions {
-            runtime_id: Some(runtime_id),
-            display_name: Some("Workspace backend embedded Runtime".to_string()),
-            ..EmbeddedRuntimeOptions::default()
-        });
+        let runtime = worker_runtime::Runtime::with_options(embedded_runtime_options());
         Self::from_runtime(workspace_id, runtime)
     }
 
@@ -923,13 +932,26 @@ impl EmbeddedWorkerRuntime {
         workspace_id: impl AsRef<str>,
         backend: std::sync::Arc<dyn worker_runtime::execution::WorkerExecutionBackend>,
     ) -> Result<Self, worker_runtime::error::RuntimeError> {
+        let runtime =
+            worker_runtime::Runtime::with_execution_backend(embedded_runtime_options(), backend)?;
+        let mut embedded = Self::from_runtime(workspace_id, runtime);
+        embedded.execution_enabled = true;
+        Ok(embedded)
+    }
+
+    pub fn new_fs_store_with_execution_backend(
+        workspace_id: impl AsRef<str>,
+        store_root: impl Into<PathBuf>,
+        backend: std::sync::Arc<dyn worker_runtime::execution::WorkerExecutionBackend>,
+    ) -> Result<Self, worker_runtime::error::RuntimeError> {
         let runtime_id = EmbeddedRuntimeId::new(EMBEDDED_RUNTIME_ID)
             .expect("embedded runtime id is a non-empty literal");
-        let runtime = worker_runtime::Runtime::with_execution_backend(
-            EmbeddedRuntimeOptions {
+        let runtime = worker_runtime::Runtime::with_fs_store_and_execution_backend(
+            FsRuntimeStoreOptions {
+                root: store_root.into(),
                 runtime_id: Some(runtime_id),
                 display_name: Some("Workspace backend embedded Runtime".to_string()),
-                ..EmbeddedRuntimeOptions::default()
+                limits: EmbeddedRuntimeOptions::default().limits,
             },
             backend,
         )?;
@@ -964,11 +986,7 @@ impl EmbeddedWorkerRuntime {
         status: EmbeddedWorkerStatus,
         execution: &worker_runtime::execution::WorkerExecutionStatus,
     ) -> bool {
-        self.execution_enabled
-            && status == EmbeddedWorkerStatus::Running
-            && execution.backend == worker_runtime::execution::WorkerExecutionBackendKind::Connected
-            && execution.run_state == WorkerExecutionRunState::Idle
-            && !execution_last_result_blocks_control(execution)
+        runtime_worker_can_accept_input(self.execution_enabled, status, execution)
     }
 
     fn can_stop_embedded_worker(
@@ -976,16 +994,7 @@ impl EmbeddedWorkerRuntime {
         status: EmbeddedWorkerStatus,
         execution: &worker_runtime::execution::WorkerExecutionStatus,
     ) -> bool {
-        self.execution_enabled
-            && status == EmbeddedWorkerStatus::Running
-            && execution.backend == worker_runtime::execution::WorkerExecutionBackendKind::Connected
-            && !matches!(
-                execution.run_state,
-                WorkerExecutionRunState::Rejected
-                    | WorkerExecutionRunState::Errored
-                    | WorkerExecutionRunState::Unconnected
-            )
-            && !execution_last_result_blocks_control(execution)
+        runtime_worker_can_stop(self.execution_enabled, status, execution)
     }
 
     fn map_worker_summary(&self, summary: worker_runtime::catalog::WorkerSummary) -> WorkerSummary {
@@ -994,14 +1003,14 @@ impl EmbeddedWorkerRuntime {
             worker_id: summary.worker_ref.worker_id.as_str().to_string(),
             host_id: self.host_id.clone(),
             label: safe_display_hint(summary.worker_ref.worker_id.as_str()),
-            role: embedded_intent_label(&summary.intent),
+            role: embedded_profile_label(&summary.profile),
             profile: embedded_profile_label(&summary.profile),
             workspace: WorkerWorkspaceSummary {
                 visibility: "backend_internal".to_string(),
                 identity: "runtime_registry_worker".to_string(),
             },
             state: embedded_worker_status_label(summary.status).to_string(),
-            status: embedded_worker_execution_status_label(summary.status, summary.execution.run_state)
+            status: embedded_worker_execution_status_label(summary.status, &summary.execution)
                 .to_string(),
             last_seen_at: None,
             implementation: WorkerImplementationSummary {
@@ -1009,15 +1018,12 @@ impl EmbeddedWorkerRuntime {
                 display_hint: "backend-internal worker-runtime Worker".to_string(),
             },
             capabilities: WorkerCapabilitySummary {
-                can_accept_input: self.can_accept_embedded_input(summary.status, &summary.execution),
+                can_accept_input: self
+                    .can_accept_embedded_input(summary.status, &summary.execution),
                 can_stop: self.can_stop_embedded_worker(summary.status, &summary.execution),
                 can_spawn_followup: false,
             },
-            diagnostics: vec![diagnostic(
-                "embedded_runtime_projection",
-                DiagnosticSeverity::Info,
-                "Worker identity is projected only as runtime_id plus worker_id; embedded runtime internals remain backend-private".to_string(),
-            )],
+            diagnostics: embedded_worker_projection_diagnostics(&summary.execution),
         }
     }
 
@@ -1027,14 +1033,14 @@ impl EmbeddedWorkerRuntime {
             worker_id: detail.worker_id.as_str().to_string(),
             host_id: self.host_id.clone(),
             label: safe_display_hint(detail.worker_id.as_str()),
-            role: embedded_intent_label(&detail.intent),
+            role: embedded_profile_label(&detail.profile),
             profile: embedded_profile_label(&detail.profile),
             workspace: WorkerWorkspaceSummary {
                 visibility: "backend_internal".to_string(),
                 identity: "runtime_registry_worker".to_string(),
             },
             state: embedded_worker_status_label(detail.status).to_string(),
-            status: embedded_worker_execution_status_label(detail.status, detail.execution.run_state)
+            status: embedded_worker_execution_status_label(detail.status, &detail.execution)
                 .to_string(),
             last_seen_at: None,
             implementation: WorkerImplementationSummary {
@@ -1046,11 +1052,7 @@ impl EmbeddedWorkerRuntime {
                 can_stop: self.can_stop_embedded_worker(detail.status, &detail.execution),
                 can_spawn_followup: false,
             },
-            diagnostics: vec![diagnostic(
-                "embedded_runtime_projection",
-                DiagnosticSeverity::Info,
-                "Worker identity is projected only as runtime_id plus worker_id; embedded runtime internals remain backend-private".to_string(),
-            )],
+            diagnostics: embedded_worker_projection_diagnostics(&detail.execution),
         }
     }
 }
@@ -1195,26 +1197,35 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         if matches!(request.acceptance, WorkerSpawnAcceptanceRequirement::RunAccepted { expected_segments } if expected_segments > 0)
         {
             diagnostics.push(diagnostic(
-                "embedded_runtime_tools_less",
+                "embedded_runtime_acceptance_projection",
                 DiagnosticSeverity::Info,
-                "Embedded Runtime v0 creates a tools-less catalog Worker and does not spawn provider segments".to_string(),
+                "Embedded Runtime accepts creation through a runtime execution backend; provider segment counts are observed after execution, not faked at create time".to_string(),
             ));
         }
 
+        let profile = request
+            .profile
+            .clone()
+            .unwrap_or_else(|| embedded_profile_selector(&request.intent));
+        let config_bundle = match self
+            .runtime
+            .store_config_bundle(default_embedded_config_bundle(&profile))
+        {
+            Ok(availability) => availability.reference,
+            Err(error) => {
+                diagnostics.push(embedded_runtime_diagnostic(&error));
+                return WorkerSpawnResult {
+                    state: WorkerOperationState::Rejected,
+                    worker: None,
+                    acceptance_evidence: Vec::new(),
+                    diagnostics,
+                };
+            }
+        };
         let create_request = CreateWorkerRequest {
-            intent: embedded_create_intent(&request.intent),
-            profile: request
-                .profile
-                .clone()
-                .unwrap_or_else(|| embedded_profile_selector(&request.intent)),
-            config_bundle: request.config_bundle.clone(),
-            requested_capabilities: if request.requested_capabilities.is_empty() {
-                vec![CapabilityRequest::named("read")]
-            } else {
-                request.requested_capabilities.clone()
-            },
-            workspace_refs: Vec::new(),
-            mount_refs: Vec::new(),
+            profile,
+            config_bundle,
+            initial_input: request.initial_input.clone(),
         };
         match self.runtime.create_worker(create_request) {
             Ok(detail) => {
@@ -1675,22 +1686,23 @@ impl RemoteWorkerRuntime {
             worker_id: summary.worker_ref.worker_id.as_str().to_string(),
             host_id: self.host_id.clone(),
             label: safe_display_hint(summary.worker_ref.worker_id.as_str()),
-            role: embedded_intent_label(&summary.intent),
+            role: None,
             profile: embedded_profile_label(&summary.profile),
             workspace: WorkerWorkspaceSummary {
                 visibility: "remote_runtime".to_string(),
                 identity: "runtime_registry_worker".to_string(),
             },
             state: embedded_worker_status_label(summary.status).to_string(),
-            status: embedded_worker_status_label(summary.status).to_string(),
+            status: embedded_worker_execution_status_label(summary.status, &summary.execution)
+                .to_string(),
             last_seen_at: None,
             implementation: WorkerImplementationSummary {
                 kind: "remote_worker_runtime".to_string(),
                 display_hint: "Backend-proxied remote worker-runtime Worker".to_string(),
             },
             capabilities: WorkerCapabilitySummary {
-                can_accept_input: true,
-                can_stop: true,
+                can_accept_input: runtime_worker_can_accept_input(true, summary.status, &summary.execution),
+                can_stop: runtime_worker_can_stop(true, summary.status, &summary.execution),
                 can_spawn_followup: false,
             },
             diagnostics: vec![diagnostic(
@@ -1707,22 +1719,23 @@ impl RemoteWorkerRuntime {
             worker_id: detail.worker_id.as_str().to_string(),
             host_id: self.host_id.clone(),
             label: safe_display_hint(detail.worker_id.as_str()),
-            role: embedded_intent_label(&detail.intent),
+            role: None,
             profile: embedded_profile_label(&detail.profile),
             workspace: WorkerWorkspaceSummary {
                 visibility: "remote_runtime".to_string(),
                 identity: "runtime_registry_worker".to_string(),
             },
             state: embedded_worker_status_label(detail.status).to_string(),
-            status: embedded_worker_status_label(detail.status).to_string(),
+            status: embedded_worker_execution_status_label(detail.status, &detail.execution)
+                .to_string(),
             last_seen_at: None,
             implementation: WorkerImplementationSummary {
                 kind: "remote_worker_runtime".to_string(),
                 display_hint: "Backend-proxied remote worker-runtime Worker".to_string(),
             },
             capabilities: WorkerCapabilitySummary {
-                can_accept_input: true,
-                can_stop: true,
+                can_accept_input: runtime_worker_can_accept_input(true, detail.status, &detail.execution),
+                can_stop: runtime_worker_can_stop(true, detail.status, &detail.execution),
                 can_spawn_followup: false,
             },
             diagnostics: vec![diagnostic(
@@ -1875,20 +1888,24 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 )],
             };
         }
+        let profile = request
+            .profile
+            .clone()
+            .unwrap_or_else(|| embedded_profile_selector(&request.intent));
+        let sync = self.sync_config_bundle(default_embedded_config_bundle(&profile));
+        let Some(config_bundle) = sync.availability.map(|availability| availability.reference)
+        else {
+            return WorkerSpawnResult {
+                state: WorkerOperationState::Rejected,
+                worker: None,
+                acceptance_evidence: Vec::new(),
+                diagnostics: sync.diagnostics,
+            };
+        };
         let create = CreateWorkerRequest {
-            intent: embedded_create_intent(&request.intent),
-            profile: request
-                .profile
-                .clone()
-                .unwrap_or_else(|| embedded_profile_selector(&request.intent)),
-            config_bundle: request.config_bundle.clone(),
-            requested_capabilities: if request.requested_capabilities.is_empty() {
-                vec![CapabilityRequest::named("read")]
-            } else {
-                request.requested_capabilities.clone()
-            },
-            workspace_refs: Vec::new(),
-            mount_refs: Vec::new(),
+            profile,
+            config_bundle,
+            initial_input: request.initial_input.clone(),
         };
         match self.post_json::<_, RuntimeHttpWorkerResponse>("/v1/workers", &create) {
             Ok(response) => WorkerSpawnResult {
@@ -2099,9 +2116,37 @@ fn embedded_spawn_execution_failure_diagnostic(
     ))
 }
 
-fn execution_last_result_blocks_control(
-    execution: &worker_runtime::execution::WorkerExecutionStatus,
+fn runtime_worker_can_accept_input(
+    execution_enabled: bool,
+    status: EmbeddedWorkerStatus,
+    execution: &WorkerExecutionStatus,
 ) -> bool {
+    execution_enabled
+        && status == EmbeddedWorkerStatus::Running
+        && execution.backend == worker_runtime::execution::WorkerExecutionBackendKind::Connected
+        && execution.run_state == WorkerExecutionRunState::Idle
+        && !execution_last_result_blocks_control(execution)
+}
+
+fn runtime_worker_can_stop(
+    execution_enabled: bool,
+    status: EmbeddedWorkerStatus,
+    execution: &WorkerExecutionStatus,
+) -> bool {
+    execution_enabled
+        && status == EmbeddedWorkerStatus::Running
+        && execution.backend == worker_runtime::execution::WorkerExecutionBackendKind::Connected
+        && !matches!(
+            execution.run_state,
+            WorkerExecutionRunState::Stopped
+                | WorkerExecutionRunState::Rejected
+                | WorkerExecutionRunState::Errored
+                | WorkerExecutionRunState::Unconnected
+        )
+        && !execution_last_result_blocks_control(execution)
+}
+
+fn execution_last_result_blocks_control(execution: &WorkerExecutionStatus) -> bool {
     execution.last_result.as_ref().is_some_and(|result| {
         matches!(
             result.outcome,
@@ -2120,39 +2165,90 @@ fn embedded_worker_status_label(status: EmbeddedWorkerStatus) -> &'static str {
     }
 }
 
+fn embedded_worker_projection_diagnostics(
+    execution: &WorkerExecutionStatus,
+) -> Vec<RuntimeDiagnostic> {
+    let mut diagnostics = vec![diagnostic(
+        "embedded_runtime_projection",
+        DiagnosticSeverity::Info,
+        "Worker identity is projected only as runtime_id plus worker_id; embedded runtime internals remain backend-private".to_string(),
+    )];
+
+    if execution.backend == WorkerExecutionBackendKind::Stale {
+        diagnostics.push(diagnostic(
+            "embedded_worker_execution_stale",
+            DiagnosticSeverity::Warning,
+            "Worker execution handle is not connected in this server process; persisted execution binding was marked stale".to_string(),
+        ));
+    } else if execution.backend == WorkerExecutionBackendKind::Unconnected
+        || execution.run_state == WorkerExecutionRunState::Unconnected
+    {
+        diagnostics.push(diagnostic(
+            "embedded_worker_execution_unconnected",
+            DiagnosticSeverity::Warning,
+            "Worker execution handle is not connected in this server process".to_string(),
+        ));
+    } else if execution.run_state == WorkerExecutionRunState::Rejected {
+        diagnostics.push(diagnostic(
+            "embedded_worker_execution_spawn_rejected",
+            DiagnosticSeverity::Error,
+            "Worker execution spawn was rejected; backend-private details are not exposed"
+                .to_string(),
+        ));
+    }
+
+    diagnostics
+}
+
 fn embedded_worker_execution_status_label(
     status: EmbeddedWorkerStatus,
-    run_state: WorkerExecutionRunState,
+    execution: &WorkerExecutionStatus,
 ) -> &'static str {
     match status {
         EmbeddedWorkerStatus::Stopped => "stopped",
         EmbeddedWorkerStatus::Cancelled => "cancelled",
-        EmbeddedWorkerStatus::Running => match run_state {
-            WorkerExecutionRunState::Idle => "idle",
-            WorkerExecutionRunState::Busy => "running",
-            WorkerExecutionRunState::Stopped => "stopped",
-            WorkerExecutionRunState::Rejected => "rejected",
-            WorkerExecutionRunState::Errored => "errored",
-            WorkerExecutionRunState::Unconnected => "unconnected",
-        },
+        EmbeddedWorkerStatus::Running => {
+            if execution.backend == worker_runtime::execution::WorkerExecutionBackendKind::Stale {
+                return "stale";
+            }
+            match execution.run_state {
+                WorkerExecutionRunState::Idle => "idle",
+                WorkerExecutionRunState::Busy => "running",
+                WorkerExecutionRunState::Stopped => "stopped",
+                WorkerExecutionRunState::Rejected => "rejected",
+                WorkerExecutionRunState::Errored => "errored",
+                WorkerExecutionRunState::Unconnected => "unconnected",
+            }
+        }
     }
 }
 
-fn embedded_create_intent(intent: &WorkerSpawnIntent) -> WorkerIntent {
-    match intent {
-        WorkerSpawnIntent::WorkspaceCompanion => WorkerIntent::Role {
-            role: "workspace_companion".to_string(),
-            purpose: Some("workspace backend internal companion".to_string()),
+fn default_embedded_config_bundle(profile: &ProfileSelector) -> ConfigBundle {
+    let id = format!(
+        "workspace-runtime-{}",
+        embedded_profile_label(profile)
+            .unwrap_or_else(|| "default".to_string())
+            .replace([':', '/', ' '], "-")
+    );
+    ConfigBundle {
+        metadata: ConfigBundleMetadata {
+            id,
+            digest: String::new(),
+            revision: "workspace-runtime-v0".to_string(),
+            workspace_id: "workspace-server".to_string(),
+            created_at: "runtime-generated".to_string(),
+            provenance: ConfigBundleProvenance {
+                source: "workspace-server".to_string(),
+                detail: Some("backend-resolved launch bundle".to_string()),
+            },
         },
-        WorkerSpawnIntent::WorkspaceOrchestrator => WorkerIntent::Role {
-            role: "workspace_orchestrator".to_string(),
-            purpose: Some("workspace backend internal orchestration".to_string()),
-        },
-        WorkerSpawnIntent::TicketRole { ticket_id, role } => WorkerIntent::Role {
-            role: ticket_role_profile_slug(role).to_string(),
-            purpose: Some(format!("ticket {ticket_id}")),
-        },
+        profiles: vec![ConfigProfileDescriptor {
+            selector: profile.clone(),
+            label: embedded_profile_label(profile),
+        }],
+        declarations: Vec::new(),
     }
+    .with_computed_digest()
 }
 
 fn embedded_profile_selector(intent: &WorkerSpawnIntent) -> ProfileSelector {
@@ -2173,16 +2269,6 @@ fn ticket_role_profile_slug(role: &TicketWorkerRole) -> &'static str {
         TicketWorkerRole::Orchestrator => "orchestrator",
         TicketWorkerRole::Coder => "coder",
         TicketWorkerRole::Reviewer => "reviewer",
-    }
-}
-
-fn embedded_intent_label(intent: &WorkerIntent) -> Option<String> {
-    match intent {
-        WorkerIntent::Assistant { purpose } => {
-            purpose.clone().or_else(|| Some("assistant".to_string()))
-        }
-        WorkerIntent::Task { objective } => Some(safe_display_hint(objective)),
-        WorkerIntent::Role { role, .. } => Some(safe_display_hint(role)),
     }
 }
 
@@ -2324,7 +2410,8 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             DiagnosticSeverity::Warning,
             "Embedded Runtime worker was not found".to_string(),
         ),
-        EmbeddedRuntimeError::WorkerExecutionUnavailable { .. } => diagnostic(
+        EmbeddedRuntimeError::WorkerExecutionUnavailable { .. }
+        | EmbeddedRuntimeError::ExecutionBackendUnavailable { .. } => diagnostic(
             "embedded_worker_execution_unavailable",
             DiagnosticSeverity::Warning,
             "Embedded Worker has no execution backend attached".to_string(),
@@ -2338,6 +2425,11 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             "embedded_runtime_limit_too_large",
             DiagnosticSeverity::Warning,
             format!("Requested limit {requested} exceeds embedded Runtime maximum {max}"),
+        ),
+        EmbeddedRuntimeError::InvalidInitialInputKind { .. } => diagnostic(
+            "embedded_worker_initial_input_kind_invalid",
+            DiagnosticSeverity::Warning,
+            error.to_string(),
         ),
         EmbeddedRuntimeError::InvalidRequest(_)
         | EmbeddedRuntimeError::ConfigBundleMissing { .. }
@@ -2962,8 +3054,7 @@ mod tests {
                 expected_segments: 0,
             },
             profile: None,
-            config_bundle: None,
-            requested_capabilities: Vec::new(),
+            initial_input: None,
         }
     }
 
@@ -2978,13 +3069,35 @@ mod tests {
         assert_eq!(spawned.state, WorkerOperationState::Rejected);
         assert!(spawned.acceptance_evidence.is_empty());
         assert!(spawned.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "embedded_worker_execution_spawn_errored"
+            diagnostic.code == "embedded_worker_execution_rejected"
                 && !diagnostic.message.contains("/tmp/secret-provider-config")
         }));
-        let worker = spawned.worker.expect("failed execution is still projected");
-        assert_eq!(worker.status, "errored");
-        assert!(!worker.capabilities.can_accept_input);
-        assert!(!worker.capabilities.can_stop);
+        assert!(spawned.worker.is_none());
+    }
+
+    #[test]
+    fn embedded_runtime_rejects_system_initial_input_without_worker_projection() {
+        let runtime = EmbeddedWorkerRuntime::new_memory_with_execution_backend(
+            "local:test",
+            Arc::new(AcceptingExecutionBackend::default()),
+        )
+        .expect("test backend should connect");
+        let mut request = embedded_spawn_request();
+        request.initial_input = Some(EmbeddedWorkerInput {
+            kind: EmbeddedWorkerInputKind::System,
+            content: "system/role instruction belongs in profile".to_string(),
+        });
+
+        let spawned = runtime.spawn_worker(request);
+        assert_eq!(spawned.state, WorkerOperationState::Rejected);
+        assert!(spawned.worker.is_none());
+        assert!(spawned.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "embedded_worker_initial_input_kind_invalid"
+                && diagnostic
+                    .message
+                    .contains("initial worker input must be user input")
+        }));
+        assert!(runtime.list_workers(10).items.is_empty());
     }
 
     #[test]
@@ -3035,8 +3148,13 @@ mod tests {
 
     #[test]
     fn embedded_runtime_registers_routes_input_and_transcript_without_internal_leaks() {
-        let registry =
-            RuntimeRegistry::for_workspace(EmbeddedWorkerRuntime::new_memory("local:test"));
+        let registry = RuntimeRegistry::for_workspace(
+            EmbeddedWorkerRuntime::new_memory_with_execution_backend(
+                "local:test",
+                Arc::new(AcceptingExecutionBackend::default()),
+            )
+            .expect("test backend should connect"),
+        );
 
         let runtimes = registry.list_runtimes(10);
         let embedded_summary = runtimes
@@ -3050,7 +3168,7 @@ mod tests {
         );
         assert_eq!(embedded_summary.source.status, RuntimeSourceStatus::Active);
         assert!(embedded_summary.capabilities.can_spawn_worker);
-        assert!(!embedded_summary.capabilities.can_accept_input);
+        assert!(embedded_summary.capabilities.can_accept_input);
 
         let spawned = registry
             .spawn_worker(
@@ -3065,8 +3183,7 @@ mod tests {
                         expected_segments: 0,
                     },
                     profile: None,
-                    config_bundle: None,
-                    requested_capabilities: Vec::new(),
+                    initial_input: None,
                 },
             )
             .unwrap();
@@ -3083,7 +3200,7 @@ mod tests {
         assert_eq!(worker.workspace.identity, "runtime_registry_worker");
         assert_eq!(worker.implementation.kind, "embedded_worker_runtime");
         assert_eq!(worker.profile.as_deref(), Some("builtin:coder"));
-        assert!(!worker.capabilities.can_accept_input);
+        assert!(worker.capabilities.can_accept_input);
 
         let input = registry
             .send_input(
@@ -3095,21 +3212,20 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(input.state, WorkerOperationState::Rejected);
+        assert_eq!(input.state, WorkerOperationState::Accepted);
         assert_eq!(input.runtime_id, EMBEDDED_RUNTIME_ID);
         assert_eq!(input.worker_id, worker.worker_id);
-        assert!(
-            input
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "embedded_worker_execution_unavailable")
-        );
 
         let transcript = registry
             .transcript(EMBEDDED_RUNTIME_ID, &worker.worker_id, 0, 10)
             .unwrap();
         assert_eq!(transcript.state, WorkerOperationState::Accepted);
-        assert!(transcript.items.is_empty());
+        assert!(
+            transcript
+                .items
+                .iter()
+                .any(|entry| entry.role == "user" && entry.content == "hello embedded runtime")
+        );
 
         let json = serde_json::to_string(&(embedded_summary, worker, transcript)).unwrap();
         for forbidden in [
@@ -3132,9 +3248,13 @@ mod tests {
 
     #[test]
     fn embedded_backend_syncs_config_bundle_and_spawns_with_bundle_ref() {
-        let registry = RuntimeRegistry::new(vec![Arc::new(EmbeddedWorkerRuntime::new_memory(
-            "local:test",
-        ))]);
+        let registry = RuntimeRegistry::new(vec![Arc::new(
+            EmbeddedWorkerRuntime::new_memory_with_execution_backend(
+                "local:test",
+                Arc::new(AcceptingExecutionBackend::default()),
+            )
+            .unwrap(),
+        )]);
         let bundle = test_config_bundle();
         let sync = registry
             .sync_config_bundle(EMBEDDED_RUNTIME_ID, bundle.clone())
@@ -3162,8 +3282,7 @@ mod tests {
                         expected_segments: 0,
                     },
                     profile: Some(ProfileSelector::Builtin("builtin:coder".to_string())),
-                    config_bundle: Some(reference),
-                    requested_capabilities: vec![CapabilityRequest::named("read")],
+                    initial_input: None,
                 },
             )
             .unwrap();
@@ -3176,9 +3295,13 @@ mod tests {
 
     #[test]
     fn embedded_runtime_rejects_socket_ready_acceptance_without_socket_identity() {
-        let registry = RuntimeRegistry::new(vec![Arc::new(EmbeddedWorkerRuntime::new_memory(
-            "local:test",
-        ))]);
+        let registry = RuntimeRegistry::new(vec![Arc::new(
+            EmbeddedWorkerRuntime::new_memory_with_execution_backend(
+                "local:test",
+                Arc::new(AcceptingExecutionBackend::default()),
+            )
+            .unwrap(),
+        )]);
         let result = registry
             .spawn_worker(
                 EMBEDDED_RUNTIME_ID,
@@ -3187,8 +3310,7 @@ mod tests {
                     requested_worker_name: None,
                     acceptance: WorkerSpawnAcceptanceRequirement::SocketReady,
                     profile: None,
-                    config_bundle: None,
-                    requested_capabilities: Vec::new(),
+                    initial_input: None,
                 },
             )
             .unwrap();
@@ -3275,6 +3397,8 @@ mod tests {
             workers.items[0].workspace.identity,
             "runtime_registry_worker"
         );
+        assert!(workers.items[0].capabilities.can_accept_input);
+        assert!(workers.items[0].capabilities.can_stop);
 
         let input = registry
             .send_input(
@@ -3302,6 +3426,101 @@ mod tests {
         );
         assert!(browser_payload.contains("runtime_id"));
         assert!(browser_payload.contains("worker_id"));
+    }
+
+    #[test]
+    fn remote_runtime_projection_blocks_stale_and_unconnected_execution_input() {
+        let (base_url, server) = serve_mock_http(vec![
+            mock_response(
+                "GET",
+                "/v1/workers",
+                true,
+                200,
+                json!({
+                    "workers": [
+                    worker_json_with_execution(
+                        "embedded-worker-runtime",
+                        "worker-stale",
+                        "stale",
+                        "unconnected",
+                        None,
+                    ),
+                    worker_json_with_execution(
+                        "embedded-worker-runtime",
+                        "worker-unconnected",
+                        "unconnected",
+                        "unconnected",
+                        None,
+                    ),
+                    worker_json_with_execution(
+                        "embedded-worker-runtime",
+                        "worker-rejected",
+                        "connected",
+                        "rejected",
+                        Some("rejected"),
+                    ),
+                    worker_json_with_execution(
+                        "embedded-worker-runtime",
+                        "worker-errored",
+                        "connected",
+                        "errored",
+                        Some("errored"),
+                    )
+                    ]
+                })
+                .to_string(),
+            ),
+            mock_response(
+                "GET",
+                "/v1/workers/worker-stale",
+                true,
+                200,
+                json!({
+                    "worker": worker_json_with_execution(
+                    "embedded-worker-runtime",
+                    "worker-stale",
+                    "stale",
+                    "unconnected",
+                    None,
+                )})
+                .to_string(),
+            ),
+        ]);
+        let registry = RuntimeRegistry::new(vec![Arc::new(
+            RemoteWorkerRuntime::new(RemoteRuntimeConfig::new(
+                "remote:primary",
+                "Remote Primary",
+                base_url,
+                Some("secret-token-do-not-leak".to_string()),
+            ))
+            .unwrap(),
+        )]);
+
+        let workers = registry.list_workers(10);
+        assert_eq!(workers.items.len(), 4);
+        for worker in &workers.items {
+            assert!(
+                !worker.capabilities.can_accept_input,
+                "{} should not be input-capable",
+                worker.worker_id
+            );
+            assert!(
+                !worker.capabilities.can_stop,
+                "{} should not be stoppable",
+                worker.worker_id
+            );
+        }
+        assert_eq!(workers.items[0].status, "stale");
+        assert_eq!(workers.items[1].status, "unconnected");
+        assert_eq!(workers.items[2].status, "rejected");
+        assert_eq!(workers.items[3].status, "errored");
+
+        let stale_detail = registry.worker("remote:primary", "worker-stale").unwrap();
+        assert!(!stale_detail.capabilities.can_accept_input);
+        assert!(!stale_detail.capabilities.can_stop);
+        assert_eq!(stale_detail.status, "stale");
+
+        server.join().expect("mock remote server finished");
     }
 
     #[test]
@@ -3472,20 +3691,33 @@ mod tests {
     }
 
     fn worker_json(runtime_id: &str, worker_id: &str) -> serde_json::Value {
+        worker_json_with_execution(runtime_id, worker_id, "connected", "idle", None)
+    }
+
+    fn worker_json_with_execution(
+        runtime_id: &str,
+        worker_id: &str,
+        backend: &str,
+        run_state: &str,
+        last_outcome: Option<&str>,
+    ) -> serde_json::Value {
+        let last_result = last_outcome.map(|outcome| {
+            json!({
+                "operation": "input",
+                "outcome": outcome,
+                "run_state": run_state,
+                "message": format!("{outcome} result")
+            })
+        });
         json!({
             "worker_ref": { "runtime_id": runtime_id, "worker_id": worker_id },
             "runtime_id": runtime_id,
             "worker_id": worker_id,
             "status": "running",
-            "execution": { "backend": "connected", "run_state": "idle" },
+            "execution": { "backend": backend, "run_state": run_state, "last_result": last_result },
             "intent": { "kind": "role", "role": "coder", "purpose": "remote test" },
             "profile": { "kind": "builtin", "value": "coder" },
-            "config_bundle": null,
-            "requested_capabilities": [],
-            "workspace_refs": [],
-            "mount_refs": [],
-            "requested_capability_count": 0,
-            "has_config_bundle": false,
+            "config_bundle": { "id": "remote-bundle", "digest": "remote-digest" },
             "transcript_len": 0,
             "last_event_id": 0
         })

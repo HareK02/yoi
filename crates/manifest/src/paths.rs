@@ -88,9 +88,9 @@ pub fn sessions_dir() -> Option<PathBuf> {
     sessions_dir_from_data_dir(data_dir())
 }
 
-/// `<runtime_dir>/workers.json` — machine-wide Worker allocation registry。
-pub fn pod_registry_path() -> Option<PathBuf> {
-    pod_registry_path_from_runtime_dir(runtime_dir())
+/// `<runtime_dir>/workers.json` — machine-wide Worker allocation table。
+pub fn worker_allocation_path() -> Option<PathBuf> {
+    worker_allocation_path_from_runtime_dir(runtime_dir())
 }
 
 /// `<runtime_dir>/<worker_name>/` — Worker ごとのランタイムディレクトリ。
@@ -104,8 +104,8 @@ pub fn worker_runtime_dir(worker_name: &str) -> Option<PathBuf> {
 /// `RuntimeDir::socket_path()` で、Worker 名が分かっている外部 (TUI の
 /// attach フロー等) からの**予測**はこの関数で行う。両者は同じパス
 /// を返すことが期待される。
-pub fn pod_socket_path(worker_name: &str) -> Option<PathBuf> {
-    pod_socket_path_from_runtime_dir(runtime_dir(), worker_name)
+pub fn worker_socket_path(worker_name: &str) -> Option<PathBuf> {
+    worker_socket_path_from_runtime_dir(runtime_dir(), worker_name)
 }
 
 // ---- internals --------------------------------------------------------------
@@ -183,7 +183,7 @@ fn sessions_dir_from_data_dir(data_dir: Option<PathBuf>) -> Option<PathBuf> {
     Some(data_dir?.join("sessions"))
 }
 
-fn pod_registry_path_from_runtime_dir(runtime_dir: Option<PathBuf>) -> Option<PathBuf> {
+fn worker_allocation_path_from_runtime_dir(runtime_dir: Option<PathBuf>) -> Option<PathBuf> {
     Some(runtime_dir?.join("workers.json"))
 }
 
@@ -194,7 +194,7 @@ fn worker_runtime_dir_from_runtime_dir(
     Some(runtime_dir?.join(worker_name))
 }
 
-fn pod_socket_path_from_runtime_dir(
+fn worker_socket_path_from_runtime_dir(
     runtime_dir: Option<PathBuf>,
     worker_name: &str,
 ) -> Option<PathBuf> {
@@ -396,7 +396,7 @@ mod tests {
             PathBuf::from("/sand/sessions")
         );
         assert_eq!(
-            pod_registry_path_from_runtime_dir(runtime_dir.clone()).unwrap(),
+            worker_allocation_path_from_runtime_dir(runtime_dir.clone()).unwrap(),
             PathBuf::from("/sand/run/workers.json")
         );
         assert_eq!(
@@ -404,7 +404,7 @@ mod tests {
             PathBuf::from("/sand/run/foo")
         );
         assert_eq!(
-            pod_socket_path_from_runtime_dir(runtime_dir, "foo").unwrap(),
+            worker_socket_path_from_runtime_dir(runtime_dir, "foo").unwrap(),
             PathBuf::from("/sand/run/foo/sock")
         );
     }

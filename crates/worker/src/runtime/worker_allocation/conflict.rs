@@ -6,7 +6,7 @@
 
 use manifest::{Permission, ScopeRule};
 
-use crate::table::{Allocation, LockFile};
+use super::table::{Allocation, LockFile};
 
 /// Whether `a` and `b` claim any overlapping concrete path.
 ///
@@ -156,9 +156,11 @@ fn find_conflict_in_subtree(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_util::*;
+    use super::super::{
+        ScopeLockError, delegate_scope, register_worker, register_worker_with_deny,
+    };
     use super::*;
-    use crate::test_util::*;
-    use crate::{ScopeLockError, delegate_scope, register_pod, register_worker_with_deny};
     use tempfile::TempDir;
 
     #[test]

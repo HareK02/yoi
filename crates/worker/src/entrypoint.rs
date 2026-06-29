@@ -9,7 +9,7 @@ use manifest::{
     WorkerManifest, WorkerManifestConfig, paths,
     plugin::{PluginDiscoveryOptions, resolve_plugin_config_for_startup},
 };
-use pod_store::{CombinedStore, FsWorkerStore, WorkerMetadataStore};
+use session_store::{CombinedStore, FsWorkerStore, WorkerMetadataStore};
 use session_store::{FsStore, SegmentId, Store};
 use ticket::config::TicketRole;
 
@@ -85,7 +85,7 @@ struct Cli {
 
     /// Restore a Worker from an existing session. The Worker re-uses the
     /// given session id and appends new turns to the same jsonl;
-    /// concurrent writers are prevented by the pod-registry.
+    /// concurrent writers are prevented by the worker-allocation.
     /// Mutually exclusive with `--adopt` (spawned children always start
     /// fresh).
     #[arg(long, value_name = "UUID", conflicts_with_all = ["adopt"])]
@@ -484,21 +484,21 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let pod_store_dir = match paths::data_dir() {
-        Some(data_dir) => data_dir.join("pods"),
+    let worker_metadata_dir = match paths::data_dir() {
+        Some(data_dir) => data_dir.join("workers"),
         None => store_dir
             .parent()
-            .map(|parent| parent.join("pods"))
+            .map(|parent| parent.join("workers"))
             .unwrap_or_else(|| PathBuf::from("workers")),
     };
-    let pod_store = match FsWorkerStore::new(&pod_store_dir) {
+    let worker_metadata_store = match FsWorkerStore::new(&worker_metadata_dir) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("error: failed to initialize worker store at {pod_store_dir:?}: {e}");
+            eprintln!("error: failed to initialize worker store at {worker_metadata_dir:?}: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let store = CombinedStore::new(session_store, pod_store);
+    let store = CombinedStore::new(session_store, worker_metadata_store);
 
     let mut worker = if cli.adopt {
         let callback = match cli.callback.clone() {

@@ -266,7 +266,7 @@ impl Scope {
 
     /// Allow rules with their targets resolved to absolute paths.
     ///
-    /// Used by the pod-registry, where every Worker's allocation
+    /// Used by the worker-allocation, where every Worker's allocation
     /// must be expressed in absolute terms so prefix comparisons are
     /// meaningful across processes.
     pub fn allow_rules(&self) -> Vec<ScopeRule> {

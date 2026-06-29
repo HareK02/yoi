@@ -1,5 +1,5 @@
 //! Owned-allocation guards and the high-level entry points that open
-//! the default registry path, mutate it, and return a guard that cleans
+//! the default worker allocation path, mutate it, and return a guard that cleans
 //! up on drop.
 
 use std::path::{Path, PathBuf};
@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use manifest::ScopeRule;
 use session_store::SegmentId;
 
-use crate::error::ScopeLockError;
-use crate::mutate::release_worker;
-use crate::table::{LockFileGuard, default_registry_path};
+use super::error::ScopeLockError;
+use super::mutate::release_worker;
+use super::table::{LockFileGuard, default_allocation_path};
 
 /// Owned allocation: on drop, opens the lock file and releases this
 /// Worker's entry. The guard keeps only the name + lock-file path; it
@@ -68,9 +68,9 @@ pub fn install_top_level_with_deny(
     scope_deny: Vec<ScopeRule>,
     segment_id: SegmentId,
 ) -> Result<ScopeAllocationGuard, ScopeLockError> {
-    let lock_path = default_registry_path()?;
+    let lock_path = default_allocation_path()?;
     let mut guard = LockFileGuard::open(&lock_path)?;
-    crate::mutate::register_worker_with_deny(
+    super::mutate::register_worker_with_deny(
         &mut guard,
         worker_name.clone(),
         pid,
@@ -99,7 +99,7 @@ pub fn adopt_allocation(
     new_pid: u32,
     segment_id: SegmentId,
 ) -> Result<ScopeAllocationGuard, ScopeLockError> {
-    let lock_path = default_registry_path()?;
+    let lock_path = default_allocation_path()?;
     let mut guard = LockFileGuard::open(&lock_path)?;
     let alloc = guard
         .data_mut()
@@ -134,7 +134,7 @@ pub fn adopt_allocation(
 /// guard, so the segment_id collision check is atomic with the
 /// rewrite.
 pub fn update_segment(worker_name: &str, new_segment_id: SegmentId) -> Result<(), ScopeLockError> {
-    let lock_path = default_registry_path()?;
+    let lock_path = default_allocation_path()?;
     let mut guard = LockFileGuard::open(&lock_path)?;
     if let Some(other) = guard.data().find_by_segment(new_segment_id) {
         if other.worker_name != worker_name {
@@ -169,9 +169,9 @@ pub struct SegmentLockInfo {
 /// Used by `Worker::restore_from_manifest` to refuse a resume that would
 /// race a live writer on the same source session.
 pub fn lookup_segment(segment_id: SegmentId) -> Result<Option<SegmentLockInfo>, ScopeLockError> {
-    let lock_path = default_registry_path()?;
+    let lock_path = default_allocation_path()?;
     let mut guard = LockFileGuard::open(&lock_path)?;
-    crate::mutate::reclaim_stale(&mut guard);
+    super::mutate::reclaim_stale(&mut guard);
     Ok(guard
         .data()
         .find_by_segment(segment_id)
@@ -184,9 +184,9 @@ pub fn lookup_segment(segment_id: SegmentId) -> Result<Option<SegmentLockInfo>, 
 
 #[cfg(test)]
 mod tests {
+    use super::super::table::Allocation;
+    use super::super::test_util::*;
     use super::*;
-    use crate::table::Allocation;
-    use crate::test_util::*;
     use tempfile::TempDir;
 
     /// Mimic what the spawner does before the child comes up: push an
