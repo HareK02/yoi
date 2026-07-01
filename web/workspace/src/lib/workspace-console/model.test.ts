@@ -11,6 +11,14 @@ function assert(condition: unknown, message: string): asserts condition {
   }
 }
 
+function assertEquals<T>(actual: T, expected: T): void {
+  const actualJson = JSON.stringify(actual);
+  const expectedJson = JSON.stringify(expected);
+  if (actualJson !== expectedJson) {
+    throw new Error(`Expected ${expectedJson}, got ${actualJson}`);
+  }
+}
+
 Deno.test("workerConsoleHref encodes runtime and worker target authority", () => {
   assert(
     workerConsoleHref({
@@ -45,7 +53,7 @@ Deno.test("segmentsToText preserves protocol segment semantics", () => {
   );
 });
 
-Deno.test("projectConsole projects initial console output and live protocol rows", () => {
+Deno.test("projectConsole projects initial console output and live visible protocol rows", () => {
   const projection = projectConsole(
     [
       {
@@ -120,8 +128,8 @@ Deno.test("projectConsole projects initial console output and live protocol rows
     "tool event row expected",
   );
   assert(
-    projection.lines.some((line) => line.kind === "usage"),
-    "usage event row expected",
+    !projection.lines.some((line) => line.kind === "usage"),
+    "usage should update the summary without rendering a console row",
   );
   assert(
     projection.lines.some((line) => line.kind === "error" && line.error),
@@ -131,6 +139,37 @@ Deno.test("projectConsole projects initial console output and live protocol rows
     projection.usage === "input 12 · output 5 · cache unknown",
     "usage summary should be retained",
   );
+});
+
+Deno.test("projectConsole keeps protocol lifecycle events out of the console surface", () => {
+  const projection = projectConsole([], [
+    {
+      cursor: "30",
+      event: { event: "status", data: { status: "running" } } satisfies Event,
+    },
+    {
+      cursor: "31",
+      event: { event: "llm_call_end", data: { llm_call: 0 } } satisfies Event,
+    },
+    {
+      cursor: "32",
+      event: { event: "turn_end", data: { turn: 0, result: "finished" } } satisfies Event,
+    },
+    {
+      cursor: "33",
+      event: { event: "run_end", data: { result: "finished" } } satisfies Event,
+    },
+    {
+      cursor: "34",
+      event: {
+        event: "system_item",
+        data: { item: { kind: "note", content: "internal" } },
+      } satisfies Event,
+    },
+  ]);
+
+  assertEquals(projection.lines, []);
+  assertEquals(projection.status, "running");
 });
 
 Deno.test("projectConsole uses snapshot for state without rendering it as console output", () => {

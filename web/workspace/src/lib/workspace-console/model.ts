@@ -98,14 +98,7 @@ export function applyProtocolEvent(
       );
       break;
     case "system_item":
-      next.lines.push(
-        line(
-          envelope.cursor,
-          "system",
-          "system item",
-          jsonPreview(event.data.item),
-        ),
-      );
+      // System items are protocol/internal context, not console output.
       break;
     case "text_delta":
       appendStreaming(
@@ -189,7 +182,6 @@ export function applyProtocolEvent(
       break;
     case "usage":
       next.usage = usageText(event.data);
-      next.lines.push(line(envelope.cursor, "usage", "usage", next.usage));
       break;
     case "error":
       next.lines.push(
@@ -212,179 +204,28 @@ export function applyProtocolEvent(
       break;
     case "status":
       next.status = event.data.status;
-      next.lines.push(
-        line(envelope.cursor, "status", "status", event.data.status),
-      );
       break;
     case "invoke_start":
-      next.lines.push(
-        line(envelope.cursor, "status", "invoke start", event.data.kind),
-      );
-      break;
     case "turn_start":
-      next.lines.push(
-        line(
-          envelope.cursor,
-          "status",
-          "turn start",
-          `turn ${event.data.turn}`,
-        ),
-      );
-      break;
     case "turn_end":
-      next.lines.push(
-        line(
-          envelope.cursor,
-          "status",
-          "turn end",
-          `turn ${event.data.turn} · ${event.data.result}`,
-        ),
-      );
-      break;
     case "llm_call_start":
-      next.lines.push(
-        line(
-          envelope.cursor,
-          "status",
-          "llm call start",
-          `call ${event.data.llm_call}`,
-        ),
-      );
-      break;
     case "llm_call_end":
-      next.lines.push(
-        line(
-          envelope.cursor,
-          "status",
-          "llm call end",
-          `call ${event.data.llm_call}`,
-        ),
-      );
-      break;
     case "llm_retry":
-      next.lines.push(
-        line(
-          envelope.cursor,
-          "status",
-          "llm retry",
-          `${event.data.error} · attempt ${event.data.failed_attempt}/${event.data.max_attempts}`,
-        ),
-      );
-      break;
     case "llm_continuation":
-      next.lines.push(
-        line(
-          envelope.cursor,
-          "status",
-          "llm continuation",
-          `${event.data.reason} · attempt ${event.data.attempt}/${event.data.max_attempts}`,
-        ),
-      );
-      break;
     case "run_end":
-      next.lines.push(
-        line(envelope.cursor, "status", "run end", event.data.result),
-      );
-      break;
     case "alert":
-      next.lines.push(
-        line(
-          envelope.cursor,
-          "status",
-          `alert · ${event.data.level}`,
-          event.data.message,
-        ),
-      );
-      break;
     case "memory_worker":
-      next.lines.push(
-        line(envelope.cursor, "status", "memory worker", event.data.message),
-      );
-      break;
     case "segment_rotated":
-      next.lines.push(
-        line(
-          envelope.cursor,
-          "status",
-          "segment rotated",
-          jsonPreview(event.data.entry),
-        ),
-      );
-      break;
     case "completions":
-      next.lines.push(
-        line(
-          envelope.cursor,
-          "status",
-          "completions",
-          `${event.data.kind} · ${event.data.entries.length} entries`,
-        ),
-      );
-      break;
     case "rewind_targets":
-      next.lines.push(
-        line(
-          envelope.cursor,
-          "status",
-          "rewind targets",
-          `${event.data.targets.length} targets · head ${event.data.head_entries}`,
-        ),
-      );
-      break;
     case "rewind_applied":
-      next.lines.push(
-        line(
-          envelope.cursor,
-          "status",
-          "rewind applied",
-          `${event.data.summary.discarded_entries} discarded · ${event.data.summary.truncated_to_entries} retained`,
-        ),
-      );
-      break;
     case "workers_listed":
-      next.lines.push(
-        line(
-          envelope.cursor,
-          "status",
-          "workers listed",
-          jsonPreview(event.data.workers),
-        ),
-      );
-      break;
     case "worker_restored":
-      next.lines.push(
-        line(
-          envelope.cursor,
-          "status",
-          "worker restored",
-          jsonPreview(event.data.result),
-        ),
-      );
-      break;
     case "peer_registered":
-      next.lines.push(
-        line(
-          envelope.cursor,
-          "status",
-          "peer registered",
-          jsonPreview(event.data.result),
-        ),
-      );
-      break;
     case "compact_start":
-      next.lines.push(
-        line(envelope.cursor, "status", "compact start", "compaction started"),
-      );
-      break;
     case "compact_done":
-      next.lines.push(
-        line(
-          envelope.cursor,
-          "status",
-          "compact done",
-          event.data.new_segment_id,
-        ),
-      );
+      // These are protocol/status/control events. TUI Console does not append
+      // them to the conversation surface; browser Console should not either.
       break;
     case "compact_failed":
       next.lines.push(
@@ -401,9 +242,6 @@ export function applyProtocolEvent(
       break;
     case "shutdown":
       next.status = "shutdown";
-      next.lines.push(
-        line(envelope.cursor, "status", "shutdown", "worker shut down"),
-      );
       break;
   }
 
