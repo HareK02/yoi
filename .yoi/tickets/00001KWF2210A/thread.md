@@ -130,3 +130,28 @@ Validation:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-01T16:38:31Z -->
+
+## Implementation report
+
+Moved the Workspace Backend default config template into runtime resources and wired init-time copying.
+
+Changes:
+- Added `resources/workspace-backend.default.toml` as the packaged template source.
+- Embedded the template with `include_str!` from `workspace-server::config`.
+- Added `.yoi/workspace-backend.default.toml` as the workspace-local copied template path.
+- `yoi-workspace-server serve` now ensures the default template exists after workspace identity initialization and before reading `.local` config.
+- Copying uses create-new semantics and does not overwrite an existing workspace-local default template.
+- Removed the previously untracked `.yoi/workspace-backend.default.toml` workspace copy from the repository root.
+
+Validation:
+- `cargo fmt --check`
+- `cargo test -p yoi-workspace-server`
+- `cargo check -p yoi`
+- TOML parse check with Deno
+- `git diff --check`
+- `nix build .#yoi --no-link`
+
+
+---

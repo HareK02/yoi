@@ -67,6 +67,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Error>> {
     let identity = WorkspaceIdentity::load_or_init(&options.workspace)?;
+    WorkspaceBackendConfigFile::ensure_default_template_for_workspace(&options.workspace)?;
     let config_file = WorkspaceBackendConfigFile::load_for_workspace(&options.workspace)?;
     let mut resolved = config_file.resolve(&options.workspace, identity)?;
     if let Some(db) = options.db {

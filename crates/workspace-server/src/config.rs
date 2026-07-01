@@ -10,6 +10,10 @@ use crate::server::{AuthConfig, ServerConfig};
 use crate::{Error, Result};
 
 pub const WORKSPACE_BACKEND_CONFIG_RELATIVE_PATH: &str = ".yoi/workspace-backend.local.toml";
+pub const WORKSPACE_BACKEND_DEFAULT_CONFIG_RELATIVE_PATH: &str =
+    ".yoi/workspace-backend.default.toml";
+pub const WORKSPACE_BACKEND_DEFAULT_CONFIG_TEMPLATE: &str =
+    include_str!("../../../resources/workspace-backend.default.toml");
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
 const DEFAULT_FRONTEND_URL: &str = "http://127.0.0.1:5173";
 const DEFAULT_MAX_RECORDS: usize = 200;
@@ -86,6 +90,33 @@ impl WorkspaceBackendConfigFile {
         workspace_root
             .as_ref()
             .join(WORKSPACE_BACKEND_CONFIG_RELATIVE_PATH)
+    }
+
+    pub fn default_template_path_for_workspace(workspace_root: impl AsRef<Path>) -> PathBuf {
+        workspace_root
+            .as_ref()
+            .join(WORKSPACE_BACKEND_DEFAULT_CONFIG_RELATIVE_PATH)
+    }
+
+    pub fn ensure_default_template_for_workspace(workspace_root: impl AsRef<Path>) -> Result<()> {
+        let path = Self::default_template_path_for_workspace(workspace_root);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                file.write_all(WORKSPACE_BACKEND_DEFAULT_CONFIG_TEMPLATE.as_bytes())?;
+                file.sync_all()?;
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(Error::Io(error)),
+        }
     }
 
     pub fn load_for_workspace(workspace_root: impl AsRef<Path>) -> Result<Self> {
@@ -333,6 +364,20 @@ root = ".local-data"
             resolved.server.embedded_runtime_store_root,
             dir.path().join(".local-data/embedded-runtime")
         );
+    }
+
+    #[test]
+    fn copies_default_template_without_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        WorkspaceBackendConfigFile::ensure_default_template_for_workspace(dir.path()).unwrap();
+        let path = WorkspaceBackendConfigFile::default_template_path_for_workspace(dir.path());
+        let raw = fs::read_to_string(&path).unwrap();
+        assert_eq!(raw, WORKSPACE_BACKEND_DEFAULT_CONFIG_TEMPLATE);
+        WorkspaceBackendConfigFile::parse_str(&raw, &path).unwrap();
+
+        fs::write(&path, "# custom template\n").unwrap();
+        WorkspaceBackendConfigFile::ensure_default_template_for_workspace(dir.path()).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# custom template\n");
     }
 
     #[test]
