@@ -1,8 +1,8 @@
 ---
 title: 'Workspace Backend設定ファイルのスキーマを定義する'
-state: 'done'
+state: 'closed'
 created_at: '2026-07-01T14:41:48Z'
-updated_at: '2026-07-01T15:48:17Z'
+updated_at: '2026-07-01T15:48:28Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-01T15:32:38Z'
