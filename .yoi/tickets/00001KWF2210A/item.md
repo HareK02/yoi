@@ -1,9 +1,11 @@
 ---
 title: 'Workspace Backend設定ファイルのスキーマを定義する'
-state: 'planning'
+state: 'done'
 created_at: '2026-07-01T14:41:48Z'
-updated_at: '2026-07-01T14:43:04Z'
+updated_at: '2026-07-01T15:48:17Z'
 assignee: null
+queued_by: 'yoi ticket'
+queued_at: '2026-07-01T15:32:38Z'
 ---
 
 ## 背景

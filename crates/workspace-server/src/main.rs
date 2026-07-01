@@ -4,14 +4,16 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
-use yoi_workspace_server::{ServerConfig, SqliteWorkspaceStore, WorkspaceIdentity, serve};
+use yoi_workspace_server::{
+    SqliteWorkspaceStore, WorkspaceBackendConfigFile, WorkspaceIdentity, serve,
+};
 
 #[derive(Debug)]
 struct ServeOptions {
     workspace: PathBuf,
     db: Option<PathBuf>,
     frontend: Option<PathBuf>,
-    listen: SocketAddr,
+    listen: Option<SocketAddr>,
 }
 
 #[derive(Debug)]
@@ -65,23 +67,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Error>> {
     let identity = WorkspaceIdentity::load_or_init(&options.workspace)?;
-    let db = options
-        .db
-        .unwrap_or_else(|| options.workspace.join(".yoi/workspace.db"));
-    if let Some(parent) = db.parent() {
+    let config_file = WorkspaceBackendConfigFile::load_for_workspace(&options.workspace)?;
+    let mut resolved = config_file.resolve(&options.workspace, identity)?;
+    if let Some(db) = options.db {
+        resolved = resolved.with_database_path(db);
+    }
+    if let Some(frontend) = options.frontend {
+        resolved = resolved.with_static_assets_dir(Some(frontend));
+    }
+    if let Some(listen) = options.listen {
+        resolved = resolved.with_listen(listen);
+    }
+
+    if let Some(parent) = resolved.database_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    let store = Arc::new(SqliteWorkspaceStore::open(&db)?);
-    let mut config = ServerConfig::local_dev(&options.workspace, identity);
-    config.static_assets_dir = options.frontend;
-    let listener = TcpListener::bind(options.listen).await?;
+    let store = Arc::new(SqliteWorkspaceStore::open(&resolved.database_path)?);
+    let listener = TcpListener::bind(resolved.listen).await?;
     eprintln!(
         "yoi-workspace-server: serving workspace `{}` on http://{}",
         options.workspace.display(),
         listener.local_addr()?
     );
-    serve(config, store, listener).await?;
+    serve(resolved.server, store, listener).await?;
     Ok(())
 }
 
@@ -90,7 +99,7 @@ fn parse_serve_options(args: &[String]) -> Result<ServeOptions, CliError> {
         .map_err(|error| CliError(format!("failed to resolve current directory: {error}")))?;
     let mut db = None;
     let mut frontend = None;
-    let mut listen = "127.0.0.1:8787".parse::<SocketAddr>().unwrap();
+    let mut listen = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -122,7 +131,7 @@ fn parse_serve_options(args: &[String]) -> Result<ServeOptions, CliError> {
                 let value = args
                     .get(index)
                     .ok_or_else(|| CliError("--listen requires a value".to_string()))?;
-                listen = parse_listen(value)?;
+                listen = Some(parse_listen(value)?);
             }
             _ if arg.starts_with("--workspace=") => {
                 workspace = PathBuf::from(value_after_equals(arg, "--workspace")?);
@@ -134,7 +143,7 @@ fn parse_serve_options(args: &[String]) -> Result<ServeOptions, CliError> {
                 frontend = Some(PathBuf::from(value_after_equals(arg, "--frontend")?));
             }
             _ if arg.starts_with("--listen=") => {
-                listen = parse_listen(value_after_equals(arg, "--listen")?)?;
+                listen = Some(parse_listen(value_after_equals(arg, "--listen")?)?);
             }
             _ if arg.starts_with('-') => {
                 return Err(CliError(format!("unknown serve option `{arg}`")));

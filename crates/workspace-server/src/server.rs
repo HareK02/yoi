@@ -51,6 +51,7 @@ pub struct ServerConfig {
     pub workspace_display_name: String,
     pub workspace_created_at: String,
     pub workspace_root: PathBuf,
+    pub frontend_url: String,
     pub embedded_runtime_store_root: PathBuf,
     pub static_assets_dir: Option<PathBuf>,
     pub auth: AuthConfig,
@@ -69,6 +70,7 @@ impl ServerConfig {
             workspace_display_name: identity.display_name,
             workspace_created_at: identity.created_at,
             workspace_root,
+            frontend_url: "http://127.0.0.1:5173".to_string(),
             embedded_runtime_store_root,
             static_assets_dir: None,
             auth: AuthConfig::LocalDevToken {
@@ -80,7 +82,7 @@ impl ServerConfig {
         }
     }
 
-    pub fn embedded_runtime_store_root_for_data_dir(
+    pub fn workspace_backend_data_root_for_data_dir(
         data_dir: impl Into<PathBuf>,
         workspace_id: impl AsRef<str>,
     ) -> PathBuf {
@@ -88,20 +90,30 @@ impl ServerConfig {
             .into()
             .join("workspace-server")
             .join(workspace_id.as_ref())
-            .join("embedded-runtime")
     }
 
-    pub fn default_embedded_runtime_store_root(workspace_id: impl AsRef<str>) -> PathBuf {
+    pub fn default_workspace_backend_data_root(workspace_id: impl AsRef<str>) -> PathBuf {
         match manifest::paths::data_dir() {
             Some(data_dir) => {
-                Self::embedded_runtime_store_root_for_data_dir(data_dir, workspace_id.as_ref())
+                Self::workspace_backend_data_root_for_data_dir(data_dir, workspace_id.as_ref())
             }
             None => std::env::temp_dir()
                 .join("yoi")
                 .join("workspace-server")
-                .join(workspace_id.as_ref())
-                .join("embedded-runtime"),
+                .join(workspace_id.as_ref()),
         }
+    }
+
+    pub fn embedded_runtime_store_root_for_data_dir(
+        data_dir: impl Into<PathBuf>,
+        workspace_id: impl AsRef<str>,
+    ) -> PathBuf {
+        Self::workspace_backend_data_root_for_data_dir(data_dir, workspace_id)
+            .join("embedded-runtime")
+    }
+
+    pub fn default_embedded_runtime_store_root(workspace_id: impl AsRef<str>) -> PathBuf {
+        Self::default_workspace_backend_data_root(workspace_id).join("embedded-runtime")
     }
 
     pub fn with_embedded_runtime_store_root(mut self, root: impl Into<PathBuf>) -> Self {

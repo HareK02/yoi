@@ -5,6 +5,7 @@
 //! remain the canonical project records and are read through bounded bridge APIs.
 
 pub mod companion;
+pub mod config;
 pub mod hosts;
 pub mod identity;
 pub mod observation;
@@ -13,6 +14,10 @@ pub mod repositories;
 pub mod server;
 pub mod store;
 
+pub use config::{
+    ResolvedWorkspaceBackendConfig, WORKSPACE_BACKEND_CONFIG_RELATIVE_PATH,
+    WorkspaceBackendConfigFile,
+};
 pub use identity::{WORKSPACE_IDENTITY_RELATIVE_PATH, WorkspaceIdentity};
 pub use records::{
     LocalProjectRecordReader, ObjectiveDetail, ObjectiveSummary, TicketDetail, TicketSummary,
@@ -38,6 +43,8 @@ pub enum Error {
     Yaml(#[from] serde_yaml::Error),
     #[error("invalid project record id `{0}`")]
     InvalidRecordId(String),
+    #[error("workspace backend config error: {0}")]
+    Config(String),
     #[error("record `{0}` is missing frontmatter")]
     MissingFrontmatter(String),
     #[error("unknown local host `{0}`")]
