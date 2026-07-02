@@ -266,6 +266,7 @@ pub struct WorkerSpawnRequest {
 pub enum WorkerSpawnIntent {
     WorkspaceCompanion,
     WorkspaceOrchestrator,
+    WorkspaceCoding,
     TicketRole {
         ticket_id: String,
         role: TicketWorkerRole,
@@ -2260,6 +2261,7 @@ fn embedded_profile_selector(intent: &WorkerSpawnIntent) -> ProfileSelector {
             ProfileSelector::Builtin("builtin:companion".to_string())
         }
         WorkerSpawnIntent::WorkspaceOrchestrator => ProfileSelector::RuntimeDefault,
+        WorkerSpawnIntent::WorkspaceCoding => ProfileSelector::Builtin("builtin:coder".to_string()),
     }
 }
 
@@ -2680,6 +2682,7 @@ fn worker_spawn_intent_label(intent: &WorkerSpawnIntent) -> &'static str {
     match intent {
         WorkerSpawnIntent::WorkspaceCompanion => "workspace_companion",
         WorkerSpawnIntent::WorkspaceOrchestrator => "workspace_orchestrator",
+        WorkerSpawnIntent::WorkspaceCoding => "workspace_coding",
         WorkerSpawnIntent::TicketRole { role, .. } => match role {
             TicketWorkerRole::Intake => "ticket_intake",
             TicketWorkerRole::Orchestrator => "ticket_orchestrator",

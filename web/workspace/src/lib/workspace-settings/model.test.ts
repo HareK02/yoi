@@ -3,6 +3,7 @@ import {
   SETTINGS_PERMISSION_NOTICE,
   SETTINGS_ROUTE,
   SETTINGS_SECTIONS,
+  diagnosticLabel,
   settingsSectionHref,
 } from "./model.ts";
 
@@ -43,7 +44,12 @@ Deno.test("settings shell advertises no fake browser admin model", () => {
   );
 });
 
-Deno.test("settings placeholders avoid mutation promises and raw authority leaks", () => {
+Deno.test("runtime connections are editable without advertising raw authority leaks", () => {
+  const runtimeSection = SETTINGS_SECTIONS.find((section) =>
+    section.id === "runtime-connections"
+  );
+  assert(runtimeSection?.status === "editable", "Runtime Connections should be editable");
+
   const allText = [
     SETTINGS_PERMISSION_NOTICE,
     ...SETTINGS_SECTIONS.flatMap((section) => [
@@ -55,14 +61,12 @@ Deno.test("settings placeholders avoid mutation promises and raw authority leaks
   ].join("\n");
 
   assert(
-    allText.includes(
-      "does not add, remove, test, or persist Runtime endpoints",
-    ),
-    "Runtime Connections should remain a placeholder",
+    allText.includes("restart_required=true") || allText.includes("Restart-required"),
+    "restart-required pattern should be visible",
   );
   assert(
-    allText.includes("Restart-required"),
-    "restart-required pattern should be visible",
+    allText.includes("not echoed back") || allText.includes("not echoed"),
+    "endpoint submission should not imply endpoint echoing",
   );
 
   for (
@@ -72,6 +76,7 @@ Deno.test("settings placeholders avoid mutation promises and raw authority leaks
       "token:",
       "secret:",
       "store root:",
+      "config file path:",
     ]
   ) {
     assert(
@@ -79,4 +84,16 @@ Deno.test("settings placeholders avoid mutation promises and raw authority leaks
       `settings copy should not expose ${forbidden}`,
     );
   }
+});
+
+Deno.test("diagnostic labels preserve severity and code", () => {
+  const diagnostic = {
+    severity: "warning",
+    code: "runtime_registry_restart_required",
+    message: "Restart required.",
+  } as const;
+  assert(
+    diagnosticLabel(diagnostic) === "warning: runtime_registry_restart_required",
+    "diagnostic label should be bounded and stable",
+  );
 });

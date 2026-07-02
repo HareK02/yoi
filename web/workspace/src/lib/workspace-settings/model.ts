@@ -1,3 +1,9 @@
+export type Diagnostic = {
+  severity: "info" | "warning" | "error";
+  code: string;
+  message: string;
+};
+
 export type SettingsSectionId =
   | "runtime-connections"
   | "backend-config"
@@ -6,7 +12,7 @@ export type SettingsSectionId =
 export type SettingsSection = {
   readonly id: SettingsSectionId;
   readonly label: string;
-  readonly status: "placeholder" | "read-only";
+  readonly status: "editable" | "placeholder" | "read-only";
   readonly summary: string;
   readonly bullets: readonly string[];
 };
@@ -16,22 +22,66 @@ export type SettingsPattern = {
   readonly body: string;
 };
 
+export type RuntimeConnectionSummary = {
+  runtime_id: string;
+  display_name: string;
+  kind: string;
+  built_in: boolean;
+  config_managed: boolean;
+  active: boolean;
+  can_spawn_worker: boolean;
+  restart_required: boolean;
+  status: string;
+  diagnostics: Diagnostic[];
+};
+
+export type RemoteRuntimeConnectionSummary = RuntimeConnectionSummary & {
+  endpoint_configured: boolean;
+  token_ref_configured: boolean;
+};
+
+export type RuntimeConnectionSettingsResponse = {
+  workspace_id: string;
+  embedded: RuntimeConnectionSummary;
+  remotes: RemoteRuntimeConnectionSummary[];
+  diagnostics: Diagnostic[];
+};
+
+export type RuntimeConnectionMutationResponse = {
+  workspace_id: string;
+  restart_required: boolean;
+  remotes: RemoteRuntimeConnectionSummary[];
+  diagnostics: Diagnostic[];
+};
+
+export type RemoteRuntimeTestResponse = {
+  workspace_id: string;
+  runtime_id: string;
+  checked_at: string;
+  state: string;
+  protocol_version?: string | null;
+  compatibility_basis: string;
+  capabilities: string[];
+  health_result: string;
+  diagnostics: Diagnostic[];
+};
+
 export const SETTINGS_ROUTE = "/settings";
 
 export const SETTINGS_PERMISSION_NOTICE =
-  "Yoi currently has no browser user, role, permission, or multi-user authorization model. This shell is intentionally local and descriptive; it does not create an admin role or grant mutation authority.";
+  "Yoi currently has no browser user, role, permission, or multi-user authorization model. This local settings surface uses typed Backend APIs only; it does not create an admin role or grant broad mutation authority.";
 
 export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   {
     id: "runtime-connections",
     label: "Runtime Connections",
-    status: "placeholder",
+    status: "editable",
     summary:
-      "Future Runtime connection management will live here. The current view does not add, remove, test, or persist Runtime endpoints.",
+      "Manage remote Runtime connection records stored in the workspace-local Backend config. The embedded Runtime is built in and shown separately.",
     bullets: [
-      "Shows where connection diagnostics will surface without exposing tokens, sockets, store roots, or raw endpoint secrets.",
-      "Connection changes require a later typed Backend API and are not performed by this shell.",
-      "Restart-required states should be shown as bounded diagnostics rather than live mutation controls.",
+      "Remote connection changes are persisted through typed read-modify-write config updates and require a Backend restart before the live registry changes.",
+      "The browser may submit a new endpoint, but Runtime endpoints, tokens, sockets, store roots, and config paths are not echoed back in API responses.",
+      "Test negotiation is an observation only; checked_at, health, compatibility, and capability results are not persisted to local config.",
     ],
   },
   {
@@ -39,11 +89,11 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
     label: "Backend Config",
     status: "placeholder",
     summary:
-      "Configuration inspection is planned, but editing Backend config or secrets is out of scope for this shell.",
+      "General Backend config editing remains out of scope; this page only exposes the Runtime Connections v0 typed surface.",
     bullets: [
       "Only sanitized summaries belong in the browser; raw config paths, secret refs, tokens, and store roots stay backend-side.",
       "Missing-provider or invalid-config states should be displayed as typed diagnostics.",
-      "No fake permission model is created to make config editing appear available.",
+      "No fake permission model is created to make unrelated config editing appear available.",
     ],
   },
   {
@@ -64,20 +114,24 @@ export const SETTINGS_PATTERNS: readonly SettingsPattern[] = [
   {
     title: "Sanitized diagnostics",
     body:
-      "Settings cards should show bounded codes and operator-facing messages, not raw socket paths, credentials, secret refs, token values, or Runtime store paths.",
+      "Settings cards show bounded codes and operator-facing messages, not raw socket paths, credentials, token values, Runtime endpoints, or Runtime store paths.",
   },
   {
     title: "Restart-required changes",
     body:
-      "When a future setting cannot apply live, the browser should say restart required and leave the mutation to a typed Backend workflow.",
+      "Remote Runtime config updates return restart_required=true because v0 does not unregister/register live Runtime handles.",
   },
   {
-    title: "Read-only until typed APIs exist",
+    title: "Typed Runtime surface only",
     body:
-      "Placeholder sections describe planned surfaces without pretending that user, role, permission, or Runtime mutation APIs already exist.",
+      "Runtime Connections v0 is intentionally narrow: embedded is built in, remote config is add/delete/test, and broader Backend admin controls stay unavailable.",
   },
 ];
 
 export function settingsSectionHref(id: SettingsSectionId): string {
   return `${SETTINGS_ROUTE}#${id}`;
+}
+
+export function diagnosticLabel(diagnostic: Diagnostic): string {
+  return `${diagnostic.severity}: ${diagnostic.code}`;
 }

@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::hosts::RemoteRuntimeConfig;
 use crate::identity::WorkspaceIdentity;
@@ -16,7 +16,7 @@ const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
 const DEFAULT_FRONTEND_URL: &str = "http://127.0.0.1:5173";
 const DEFAULT_MAX_RECORDS: usize = 200;
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceBackendConfigFile {
     #[serde(default)]
@@ -29,7 +29,7 @@ pub struct WorkspaceBackendConfigFile {
     pub runtimes: WorkspaceBackendRuntimesConfig,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceBackendServerConfig {
     #[serde(default)]
@@ -40,7 +40,7 @@ pub struct WorkspaceBackendServerConfig {
     pub static_assets_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceBackendDataConfig {
     #[serde(default)]
@@ -51,21 +51,21 @@ pub struct WorkspaceBackendDataConfig {
     pub embedded_runtime_store_root: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceBackendLimitsConfig {
     #[serde(default)]
     pub max_records: Option<usize>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceBackendRuntimesConfig {
     #[serde(default)]
     pub remote: Vec<RemoteRuntimeConfigFile>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteRuntimeConfigFile {
     pub id: String,
@@ -187,6 +187,20 @@ impl WorkspaceBackendConfigFile {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(error) => Err(Error::Io(error)),
         }
+    }
+
+    pub fn write_for_workspace(&self, workspace_root: impl AsRef<Path>) -> Result<()> {
+        let path = Self::path_for_workspace(workspace_root);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let raw = toml::to_string_pretty(self).map_err(|error| {
+            Error::Config(format!(
+                "failed to serialize workspace backend config: {error}"
+            ))
+        })?;
+        fs::write(path, raw)?;
+        Ok(())
     }
 
     pub fn parse_str(raw: &str, path: impl AsRef<Path>) -> Result<Self> {

@@ -93,6 +93,37 @@ export type Worker = {
 
 export type WorkerOperationState = 'accepted' | 'unsupported' | 'rejected';
 
+export type WorkerLaunchRuntimeOption = {
+  runtime_id: string;
+  display_name: string;
+  built_in: boolean;
+  can_spawn_worker: boolean;
+  status: string;
+  diagnostics: Diagnostic[];
+};
+
+export type WorkerLaunchProfileCandidate = {
+  id: string;
+  label: string;
+  description: string;
+};
+
+export type WorkerLaunchOptionsResponse = {
+  workspace_id: string;
+  runtimes: WorkerLaunchRuntimeOption[];
+  profiles: WorkerLaunchProfileCandidate[];
+  diagnostics: Diagnostic[];
+};
+
+export type BrowserCreateWorkerResponse = {
+  workspace_id: string;
+  runtime_id: string;
+  worker_id: string;
+  console_href: string;
+  worker: Worker;
+  diagnostics: Diagnostic[];
+};
+
 export type WorkerInputResult = {
   state: WorkerOperationState;
   runtime_id: string;
