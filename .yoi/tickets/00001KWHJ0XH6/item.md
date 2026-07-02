@@ -2,7 +2,7 @@
 title: 'Workspace BrowserにSettings/Admin画面のshellとnavigationを追加する'
 state: 'closed'
 created_at: '2026-07-02T13:59:17Z'
-updated_at: '2026-07-02T14:38:34Z'
+updated_at: '2026-07-02T14:39:02Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-07-02T14:24:54Z'
