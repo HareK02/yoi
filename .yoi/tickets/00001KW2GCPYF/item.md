@@ -1,8 +1,8 @@
 ---
 title: 'Workspace Worker Consoleを任意Worker attach前提で再設計する'
-state: 'done'
+state: 'closed'
 created_at: '2026-06-26T17:42:10Z'
-updated_at: '2026-06-26T18:22:51Z'
+updated_at: '2026-07-02T11:55:42Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-06-26T17:45:40Z'
