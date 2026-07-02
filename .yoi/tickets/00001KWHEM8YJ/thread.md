@@ -260,3 +260,33 @@ Review-fix implementation report:
 - Requesting follow-up external review against `f2fead7e..47ed0ff8` and full combined implementation.
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-02T18:20:10Z status: approve -->
+
+## Review: approve
+
+External follow-up review result: approve
+
+Read-only follow-up review completed for both Tickets and fix commit `47ed0ff8` on top of `f2fead7e`.
+
+Evidence reviewed:
+- Ticket records for `00001KWHHRTM9` and `00001KWHEM8YJ`.
+- Fix diff `f2fead7e..47ed0ff8`.
+- Relevant backend/web files including `crates/workspace-server/src/server.rs`, `config.rs`, `hosts.rs`, `worker-launch.ts`, `WorkersNavSection.svelte`, related tests/settings model files.
+- Orchestrator-reported validation pass for `git diff --check`, `cargo test -p yoi-workspace-server`, `cargo check -p yoi`, `cd web/workspace && deno task test`, and `cd web/workspace && deno task check`.
+
+Reviewer findings:
+- Previous blocker 1 resolved: runtime connection test now performs lightweight negotiation/probing for Browser-relevant operations and represents unsupported/not-observed operations with typed diagnostics and `unknown`/`unsupported` capability entries instead of blanket compatibility.
+- Previous blocker 2 resolved: Browser-facing remote-test diagnostics omit raw endpoints/config paths/socket/session/store paths and use typed/sanitized diagnostics; tests assert projected responses do not contain the endpoint/runtime address.
+- Previous blocker 3 resolved: `/api/workers` keeps product-level request shape and preserves runtime rejection diagnostics while adding typed `workspace_worker_create_not_accepted` diagnostic.
+- Previous blocker 4 resolved: focused backend tests cover runtime connection test sanitization/compatibility, worker creation payload rejection, diagnostic preservation; web tests cover launch payload shaping/error handling.
+- Persisted config, live registry summaries, and test observations remain separated.
+- Browser-facing settings responses expose safe summaries rather than raw authority-bearing backend fields.
+- New Worker UI consumes `/api/workers/options` candidates and submits only product-level `/api/workers` payload.
+
+Non-blocking follow-up:
+- UI could later render backend diagnostic codes/details more richly on Worker launch failure, but current behavior is sanitized and merge-ready.
+
+No merge-blocking issues found.
+
+---
