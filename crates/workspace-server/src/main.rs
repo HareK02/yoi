@@ -9,11 +9,23 @@ use yoi_workspace_server::{
 };
 
 #[derive(Debug)]
+enum Command {
+    Serve(ServeOptions),
+    Init(InitOptions),
+    Help,
+}
+
+#[derive(Debug)]
 struct ServeOptions {
     workspace: PathBuf,
     db: Option<PathBuf>,
     frontend: Option<PathBuf>,
     listen: Option<SocketAddr>,
+}
+
+#[derive(Debug)]
+struct InitOptions {
+    workspace: PathBuf,
 }
 
 #[derive(Debug)]
@@ -40,34 +52,57 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let Some((command, rest)) = args.split_first() else {
-        print_help();
-        return Ok(());
-    };
-
-    match command.as_str() {
-        "serve" => {
-            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
-                print_serve_help();
-                return Ok(());
-            }
-            let options = parse_serve_options(rest)?;
-            run_serve(options).await?;
-            Ok(())
-        }
-        "--help" | "-h" => {
-            print_help();
-            Ok(())
-        }
-        other => Err(Box::new(CliError(format!(
-            "unknown command `{other}`; expected `serve`"
-        )))),
+    match parse_command(&args)? {
+        Command::Serve(options) => run_serve(options).await,
+        Command::Init(options) => run_init(options),
+        Command::Help => Ok(()),
     }
 }
 
-async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Error>> {
+fn parse_command(args: &[String]) -> Result<Command, CliError> {
+    let Some((command, rest)) = args.split_first() else {
+        print_help();
+        return Ok(Command::Help);
+    };
+
+    match command.as_str() {
+        "init" => {
+            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
+                print_init_help();
+                return Ok(Command::Help);
+            }
+            Ok(Command::Init(parse_init_options(rest)?))
+        }
+        "serve" => {
+            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
+                print_serve_help();
+                return Ok(Command::Help);
+            }
+            Ok(Command::Serve(parse_serve_options(rest)?))
+        }
+        "--help" | "-h" => {
+            print_help();
+            Ok(Command::Help)
+        }
+        other => Err(CliError(format!(
+            "unknown command `{other}`; expected `init` or `serve`"
+        ))),
+    }
+}
+
+fn run_init(options: InitOptions) -> Result<(), Box<dyn std::error::Error>> {
     let identity = WorkspaceIdentity::load_or_init(&options.workspace)?;
     WorkspaceBackendConfigFile::ensure_default_template_for_workspace(&options.workspace)?;
+    eprintln!(
+        "yoi-workspace-server: initialized workspace `{}` ({})",
+        options.workspace.display(),
+        identity.workspace_id
+    );
+    Ok(())
+}
+
+async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Error>> {
+    let identity = WorkspaceIdentity::load_required(&options.workspace)?;
     let config_file = WorkspaceBackendConfigFile::load_for_workspace(&options.workspace)?;
     let mut resolved = config_file.resolve(&options.workspace, identity)?;
     if let Some(db) = options.db {
@@ -93,6 +128,31 @@ async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
     );
     serve(resolved.server, store, listener).await?;
     Ok(())
+}
+
+fn parse_init_options(args: &[String]) -> Result<InitOptions, CliError> {
+    let mut workspace = std::env::current_dir()
+        .map_err(|error| CliError(format!("failed to read current dir: {error}")))?;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--workspace" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| CliError("--workspace requires a path".to_string()))?;
+                workspace = PathBuf::from(value);
+            }
+            value if value.starts_with("--workspace=") => {
+                workspace = PathBuf::from(value_after_equals(arg, "--workspace")?);
+            }
+            other => return Err(CliError(format!("unknown init option `{other}`"))),
+        }
+    }
+
+    let workspace = workspace
+        .canonicalize()
+        .map_err(|error| CliError(format!("failed to canonicalize workspace: {error}")))?;
+    Ok(InitOptions { workspace })
 }
 
 fn parse_serve_options(args: &[String]) -> Result<ServeOptions, CliError> {
@@ -192,12 +252,58 @@ fn parse_listen(value: &str) -> Result<SocketAddr, CliError> {
 
 fn print_help() {
     println!(
-        "yoi-workspace-server\n\nUsage:\n  yoi-workspace-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
+        "yoi-workspace-server\n\nUsage:\n  yoi-workspace-server init [OPTIONS]\n  yoi-workspace-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
+    );
+}
+
+fn print_init_help() {
+    println!(
+        "yoi-workspace-server init\n\nUsage:\n  yoi-workspace-server init [OPTIONS]\n\nDescription:\n  Initializes a Workspace identity and copies the default Backend config template. Does not create Backend data stores.\n\nOptions:\n      --workspace <PATH>  Workspace root to initialize (defaults to cwd)\n  -h, --help              Print help"
     );
 }
 
 fn print_serve_help() {
     println!(
-        "yoi-workspace-server serve\n\nUsage:\n  yoi-workspace-server serve [OPTIONS]\n\nOptions:\n      --workspace <PATH>  Workspace root containing .yoi project records (defaults to cwd)\n      --db <PATH>         SQLite database path (defaults to <workspace>/.yoi/workspace.db)\n      --frontend <PATH>   Static SPA build directory to serve\n      --listen <ADDR>     Listen address (defaults to 127.0.0.1:8787)\n  -h, --help              Print help"
+        "yoi-workspace-server serve\n\nUsage:\n  yoi-workspace-server serve [OPTIONS]\n\nDescription:\n  Serves an already initialized Workspace. Run `yoi workspace init` first.\n\nOptions:\n      --workspace <PATH>  Workspace root containing .yoi project records (defaults to cwd)\n      --db <PATH>         SQLite database path (legacy dev override)\n      --frontend <PATH>   Static SPA build directory to serve (legacy dev override)\n      --listen <ADDR>     Listen address (legacy dev override; default 127.0.0.1:8787)\n  -h, --help              Print help"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yoi_workspace_server::{
+        WORKSPACE_BACKEND_DEFAULT_CONFIG_RELATIVE_PATH, WORKSPACE_IDENTITY_RELATIVE_PATH,
+    };
+
+    #[test]
+    fn parse_init_defaults_workspace_to_cwd_or_flag() {
+        let temp = tempfile::tempdir().unwrap();
+        let args = vec!["--workspace".to_string(), temp.path().display().to_string()];
+        let options = parse_init_options(&args).unwrap();
+        assert_eq!(options.workspace, temp.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn init_creates_identity_and_default_template_only() {
+        let temp = tempfile::tempdir().unwrap();
+        run_init(InitOptions {
+            workspace: temp.path().canonicalize().unwrap(),
+        })
+        .unwrap();
+
+        assert!(temp.path().join(WORKSPACE_IDENTITY_RELATIVE_PATH).exists());
+        assert!(
+            temp.path()
+                .join(WORKSPACE_BACKEND_DEFAULT_CONFIG_RELATIVE_PATH)
+                .exists()
+        );
+        assert!(
+            !temp
+                .path()
+                .join(".yoi/workspace-backend.local.toml")
+                .exists()
+        );
+        assert!(!temp.path().join(".yoi/workspace.db").exists());
+        assert!(!temp.path().join(".yoi/embedded-runtime").exists());
+    }
 }

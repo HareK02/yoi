@@ -1,9 +1,11 @@
 ---
 title: 'Workspace初期化をinitコマンドに切り出しserveの副作用をなくす'
-state: 'planning'
+state: 'closed'
 created_at: '2026-07-02T07:02:02Z'
-updated_at: '2026-07-02T08:31:22Z'
+updated_at: '2026-07-02T09:20:26Z'
 assignee: null
+queued_by: 'yoi ticket'
+queued_at: '2026-07-02T09:03:56Z'
 ---
 
 ## 背景

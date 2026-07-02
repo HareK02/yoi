@@ -29,7 +29,10 @@ enum Mode {
     WorkerCleanup(worker_cleanup_cli::WorkerCleanupCli),
     Ticket(ticket_cli::TicketCli),
     WorkspaceHelp,
-    WorkspaceServe(Vec<String>),
+    WorkspaceServer {
+        subcommand: String,
+        args: Vec<String>,
+    },
     WorkerRuntime(Vec<String>),
     Keys,
     SetupModel,
@@ -78,7 +81,7 @@ async fn main() -> ExitCode {
             print_workspace_help();
             ExitCode::SUCCESS
         }
-        Mode::WorkspaceServe(args) => run_workspace_server(args),
+        Mode::WorkspaceServer { subcommand, args } => run_workspace_server(&subcommand, args),
         Mode::MemoryLint(options) => match memory_lint::run(&options) {
             Ok(LintStatus::Clean) => ExitCode::SUCCESS,
             Ok(LintStatus::Failed) => ExitCode::FAILURE,
@@ -607,24 +610,36 @@ fn current_dir() -> Result<PathBuf, ParseError> {
 fn parse_workspace_args(args: &[String]) -> Result<Mode, ParseError> {
     let Some((subcommand, rest)) = args.split_first() else {
         return Err(ParseError(
-            "yoi workspace requires `serve` (try `yoi workspace --help`)".to_string(),
+            "yoi workspace requires `init` or `serve` (try `yoi workspace --help`)".to_string(),
         ));
     };
     match subcommand.as_str() {
+        "init" => {
+            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
+                return Ok(Mode::WorkspaceHelp);
+            }
+            Ok(Mode::WorkspaceServer {
+                subcommand: "init".to_string(),
+                args: rest.to_vec(),
+            })
+        }
         "serve" => {
             if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
                 return Ok(Mode::WorkspaceHelp);
             }
-            Ok(Mode::WorkspaceServe(rest.to_vec()))
+            Ok(Mode::WorkspaceServer {
+                subcommand: "serve".to_string(),
+                args: rest.to_vec(),
+            })
         }
         "--help" | "-h" => Ok(Mode::WorkspaceHelp),
         other => Err(ParseError(format!(
-            "unknown yoi workspace subcommand `{other}`"
+            "unknown yoi workspace subcommand `{other}`; expected `init` or `serve`"
         ))),
     }
 }
 
-fn run_workspace_server(args: Vec<String>) -> ExitCode {
+fn run_workspace_server(subcommand: &str, args: Vec<String>) -> ExitCode {
     let command = match resolve_workspace_server_command() {
         Ok(command) => command,
         Err(error) => {
@@ -634,7 +649,7 @@ fn run_workspace_server(args: Vec<String>) -> ExitCode {
     };
 
     let mut child = Command::new(&command);
-    child.arg("serve");
+    child.arg(subcommand);
     child.args(args);
     match child.status() {
         Ok(status) if status.success() => ExitCode::SUCCESS,
@@ -999,13 +1014,14 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
 
 fn print_help() {
     println!(
-        "yoi\n\nUsage:\n  yoi [OPTIONS]\n  yoi resume [--workspace <PATH>] [--all]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi worker [WORKER_OPTIONS]\n  yoi worker delete <NAME> [--force] [--dry-run]\n  yoi worker prune --older-than <DURATION> [--force] [--dry-run]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi session prune --unreferenced [--older-than <DURATION>] [--force] [--dry-run]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi workspace serve [OPTIONS]\n  yoi plugin new <rust-component-tool|rust-component-service> <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Worker chat/client surface (default, --worker, yoi resume, Backend Runtime target)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n      --workspace <PATH> Runtime workspace root for default Console/--worker (defaults to cwd)\n      --worker <NAME>       Open the Worker Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Worker Console to a specific socket with --worker\n      --session <UUID>   Resume a specific session segment in the Worker Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
+        "yoi\n\nUsage:\n  yoi [OPTIONS]\n  yoi resume [--workspace <PATH>] [--all]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi worker [WORKER_OPTIONS]\n  yoi worker delete <NAME> [--force] [--dry-run]\n  yoi worker prune --older-than <DURATION> [--force] [--dry-run]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi session prune --unreferenced [--older-than <DURATION>] [--force] [--dry-run]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi workspace init [OPTIONS]
+  yoi workspace serve [OPTIONS]\n  yoi plugin new <rust-component-tool|rust-component-service> <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Worker chat/client surface (default, --worker, yoi resume, Backend Runtime target)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n      --workspace <PATH> Runtime workspace root for default Console/--worker (defaults to cwd)\n      --worker <NAME>       Open the Worker Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Worker Console to a specific socket with --worker\n      --session <UUID>   Resume a specific session segment in the Worker Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
     );
 }
 
 fn print_workspace_help() {
     println!(
-        "yoi workspace\n\nUsage:\n  yoi workspace serve [OPTIONS]\n\nDescription:\n  Launches the separate yoi-workspace-server executable. The yoi binary does not link the workspace server crate.\n\nOptions forwarded to yoi-workspace-server serve:\n      --workspace <PATH>  Workspace root containing .yoi project records (defaults to cwd)\n      --db <PATH>         SQLite database path (defaults to <workspace>/.yoi/workspace.db)\n      --frontend <PATH>   Static SPA build directory to serve\n      --listen <ADDR>     Listen address (defaults to 127.0.0.1:8787)\n  -h, --help              Print help\n\nEnvironment:\n  YOI_WORKSPACE_SERVER_COMMAND  Path to yoi-workspace-server executable override\n"
+        "yoi workspace\n\nUsage:\n  yoi workspace init [OPTIONS]\n  yoi workspace serve [OPTIONS]\n\nDescription:\n  Launches the separate yoi-workspace-server executable. The yoi binary does not link the workspace server crate.\n\nSubcommands:\n  init   Initialize .yoi/workspace.toml and the default Backend config template\n  serve  Serve an already initialized Workspace\n\nOptions forwarded to init/serve:\n      --workspace <PATH>  Workspace root (defaults to cwd)\n\nLegacy dev options forwarded to serve:\n      --db <PATH>         SQLite database path override\n      --frontend <PATH>   Static SPA build directory to serve\n      --listen <ADDR>     Listen address override\n  -h, --help              Print help\n\nEnvironment:\n  YOI_WORKSPACE_SERVER_COMMAND  Path to yoi-workspace-server executable override\n"
     );
 }
 
@@ -1209,7 +1225,21 @@ mod tests {
     #[test]
     fn parse_workspace_serve_passthrough() {
         match parse_args_from(["workspace", "serve", "--listen", "127.0.0.1:0"]).unwrap() {
-            Mode::WorkspaceServe(args) => assert_eq!(args, vec!["--listen", "127.0.0.1:0"]),
+            Mode::WorkspaceServer { subcommand, args } => {
+                assert_eq!(subcommand, "serve");
+                assert_eq!(args, vec!["--listen", "127.0.0.1:0"]);
+            }
+            other => panic!("unexpected mode: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_workspace_init_passthrough() {
+        match parse_args_from(["workspace", "init", "--workspace", "/tmp/ws"]).unwrap() {
+            Mode::WorkspaceServer { subcommand, args } => {
+                assert_eq!(subcommand, "init");
+                assert_eq!(args, vec!["--workspace", "/tmp/ws"]);
+            }
             other => panic!("unexpected mode: {other:?}"),
         }
     }

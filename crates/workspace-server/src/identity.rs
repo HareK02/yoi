@@ -38,6 +38,21 @@ impl WorkspaceIdentity {
         })
     }
 
+    pub fn load_required(workspace_root: impl AsRef<Path>) -> Result<Self> {
+        let path = Self::path(workspace_root.as_ref());
+        match fs::read_to_string(&path) {
+            Ok(raw) => Self::parse_str(&raw, &path),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                Err(Error::WorkspaceIdentity(format!(
+                    "workspace is not initialized at {}; run `yoi workspace init --workspace {}` first",
+                    workspace_root.as_ref().display(),
+                    workspace_root.as_ref().display()
+                )))
+            }
+            Err(error) => Err(Error::Io(error)),
+        }
+    }
+
     pub fn path(workspace_root: impl AsRef<Path>) -> PathBuf {
         workspace_root
             .as_ref()
@@ -191,6 +206,21 @@ mod tests {
 
     const FIXED_WORKSPACE_ID: &str = "0192f0e8-4d84-7d6e-a000-000000000001";
     const FIXED_CREATED_AT: &str = "2026-06-23T06:43:28Z";
+
+    #[test]
+    fn load_required_rejects_uninitialized_workspace_without_creating_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("uninitialized-workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+
+        let error = WorkspaceIdentity::load_required(&workspace_root).unwrap_err();
+
+        assert!(
+            error.to_string().contains("workspace is not initialized"),
+            "unexpected error: {error}"
+        );
+        assert!(!WorkspaceIdentity::path(&workspace_root).exists());
+    }
 
     #[test]
     fn missing_identity_file_is_created_with_safe_fields() {

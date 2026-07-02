@@ -39,3 +39,109 @@ Workspace init Ticket に storage / 正本境界を追記した。
 
 
 ---
+
+<!-- event: intake_summary author: hare at: 2026-07-02T09:03:56Z -->
+
+## Intake summary
+
+Marked ready by `yoi ticket state`.
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-07-02T09:03:56Z from: planning to: ready reason: cli_state field: state -->
+
+## State changed
+
+Marked ready by `yoi ticket state`.
+
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-07-02T09:03:56Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `yoi ticket` が queued にしました。
+
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-07-02T09:03:56Z from: queued to: inprogress reason: cli_state field: state -->
+
+## State changed
+
+State changed to `inprogress`.
+
+
+---
+
+<!-- event: implementation_report author: hare at: 2026-07-02T09:20:10Z -->
+
+## Implementation report
+
+Implemented explicit Workspace init and removed serve-time initialization side effects.
+
+Changes:
+- Added `yoi workspace init [--workspace <PATH>]` passthrough to `yoi-workspace-server init`.
+- Added `yoi-workspace-server init [--workspace <PATH>]`.
+- `init` creates only `.yoi/workspace.toml` and `.yoi/workspace-backend.default.toml`.
+- `init` does not create `.local` config, SQLite DB, embedded Runtime store, logs, Worker data, or project record layout.
+- Added `WorkspaceIdentity::load_required(...)` for serve-time load-only behavior.
+- `serve` now requires an initialized workspace and no longer calls `load_or_init` or copies the default config template.
+- Uninitialized `serve` fails with a diagnostic telling the user to run `yoi workspace init --workspace <path>`.
+- Updated help text for `yoi workspace` and `yoi-workspace-server`.
+- Added focused tests for init parsing, init output files, load_required no-create behavior, and yoi CLI passthrough.
+
+Validation:
+- `cargo test -p yoi-workspace-server`
+- `cargo test -p yoi`
+- `cargo check -p yoi`
+- `git diff --check`
+- `nix build .#yoi --no-link`
+- manual smoke: uninitialized `yoi-workspace-server serve` fails without creating identity.
+- manual smoke: `yoi-workspace-server init` creates only workspace identity and default template.
+
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-07-02T09:20:10Z from: inprogress to: done reason: cli_state field: state -->
+
+## State changed
+
+State changed to `done`.
+
+
+---
+
+<!-- event: state_changed author: hare at: 2026-07-02T09:20:26Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-07-02T09:20:26Z status: closed -->
+
+## 完了
+
+Implemented explicit Workspace initialization command and removed implicit initialization from serve.
+
+Delivered:
+- `yoi workspace init [--workspace <PATH>]`.
+- `yoi-workspace-server init [--workspace <PATH>]`.
+- `init` creates `.yoi/workspace.toml` and `.yoi/workspace-backend.default.toml` only.
+- `serve` requires `.yoi/workspace.toml` to already exist and fails with an init diagnostic otherwise.
+- `serve` no longer creates workspace identity or default config template.
+- Help text and focused tests updated.
+
+Validation:
+- `cargo test -p yoi-workspace-server`
+- `cargo test -p yoi`
+- `cargo check -p yoi`
+- `git diff --check`
+- `nix build .#yoi --no-link`
+
+
+---
