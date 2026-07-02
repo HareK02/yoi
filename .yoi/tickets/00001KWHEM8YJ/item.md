@@ -1,9 +1,11 @@
 ---
 title: 'Workspace Browserから手動Coding Workerを作成する導線を追加する'
-state: 'ready'
+state: 'queued'
 created_at: '2026-07-02T12:59:57Z'
-updated_at: '2026-07-02T15:39:49Z'
+updated_at: '2026-07-02T16:13:24Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-07-02T16:13:24Z'
 ---
 
 ## 背景
