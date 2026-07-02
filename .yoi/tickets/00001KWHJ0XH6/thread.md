@@ -105,3 +105,24 @@ Operational note:
 Dashboard Queue authorized routing. The Ticket has no blocker relations, no other Ticket is inprogress, and the orchestration worktree is clean. Accepting implementation before child worktree / role Pod side effects.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-07-02T14:26:39Z -->
+
+## Implementation report
+
+Implementation routing diagnostic:
+
+Attempted to spawn Coder Worker `yoi-coder-00001KWHJ0XH6-settings`, but `SpawnPod` failed before child startup with:
+
+```text
+failed to spawn `/home/hare/.cargo/bin/yoi (deleted) pod`: No such file or directory (os error 2)
+```
+
+This appears to be a runtime executable availability issue in the current Orchestrator process, not a Ticket/code implementation result.
+
+Operational response:
+- The Ticket is already `inprogress` and the child worktree/branch exists.
+- Because role Pod spawning is temporarily unavailable and this Ticket is web-only / narrow-scope, Orchestrator will implement the small Settings/Admin shell directly in the child worktree, then route review if spawning becomes available; otherwise Orchestrator will perform focused validation and record the limitation.
+- `StopPod` remains unused per user instruction.
+
+---
