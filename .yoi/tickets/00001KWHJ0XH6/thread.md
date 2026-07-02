@@ -186,3 +186,37 @@ Because role Pod spawning is unavailable in the current process and the change i
 `StopPod` remains unused per user instruction.
 
 ---
+
+<!-- event: review author: yoi-orchestrator at: 2026-07-02T14:37:21Z status: approve -->
+
+## Review: approve
+
+approve
+
+Operational note:
+- Normal read-only Reviewer Worker could not be spawned because `SpawnPod` failed with current executable path `/home/hare/.cargo/bin/yoi (deleted) pod` missing. This review was therefore performed manually by Orchestrator as a narrow web-only fallback.
+
+Review target:
+- `c0c6880b1a00ec367910267a3d2a0595839b3d5b feat: add settings admin shell`
+
+確認した点:
+- `/settings` route が追加され、Settings / Admin shell が表示される。
+- Sidebar header gear と Sidebar の Settings section から `/settings` へ navigation できる。
+- Runtime Connections / Backend Config / Workspace Identity の sections がある。
+- Runtime Connections / Backend Config は placeholder として明示され、Runtime connection add/delete/test/persist、Backend config editor、secret UI、settings mutation API は実装されていない。
+- Workspace Identity は opaque `workspace_id` / display name / record authority context の read-only 表示であり、raw filesystem path を表示していない。
+- 「browser user / role / permission / multi-user authorization model は存在しない」「admin role を作らない」旨が明記されている。
+- sanitized diagnostics / restart-required / read-only until typed API exists の表示 pattern が追加されている。
+- 既存 Worker Console route と `runtime_id + worker_id` sidebar navigation は維持されている。
+- テストで Settings navigation、no fake admin permission model、placeholder boundaries、raw authority leak avoidance の最低限を確認している。
+
+Validation:
+- `git diff --check HEAD~1..HEAD`: success
+- `deno run -A npm:@sveltejs/kit@2.49.4 sync`: success
+- `cd web/workspace && deno task test`: success (`10 passed`)
+- `cd web/workspace && deno task check`: success
+- `cd web/workspace && deno task build`: success
+
+ブロッカーはない。
+
+---
