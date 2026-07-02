@@ -200,3 +200,23 @@ Implementation routing update:
 - Work order remains: this Ticket first, then `00001KWHEM8YJ`; external review will be requested after coder completion evidence is available.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-02T17:29:34Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Coder Pod completed the combined implementation and committed `f2fead7e feat: add workspace runtime and worker controls` on branch `work/00001KWHHRTM9-00001KWHEM8YJ`.
+- Worktree status was clean after commit.
+- Changed areas include `crates/workspace-server/src/config.rs`, `crates/workspace-server/src/hosts.rs`, `crates/workspace-server/src/server.rs`, Settings UI/model/tests, Worker sidebar UI/types, and workspace TS config/CSS.
+- Orchestrator reran validation:
+  - `git diff --check`: pass
+  - `cargo test -p yoi-workspace-server`: pass（51 lib tests + 2 main tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task test`: pass（11 tests）
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+- `nix build .#yoi --no-link` は dependency/resource packaging 変更ではないため未実行。
+- External review requested via sibling Reviewer Pod `yoi-reviewer-00001KWHHRTM9-00001KWHEM8YJ`.
+
+---

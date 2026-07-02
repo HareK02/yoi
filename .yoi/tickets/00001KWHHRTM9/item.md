@@ -2,7 +2,7 @@
 title: 'Workspace Backend Runtime接続の管理画面と永続configを追加する'
 state: 'inprogress'
 created_at: '2026-07-02T13:54:52Z'
-updated_at: '2026-07-02T17:03:28Z'
+updated_at: '2026-07-02T17:29:34Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-07-02T16:45:19Z'
