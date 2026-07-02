@@ -145,3 +145,28 @@ Validation:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-02T11:59:35Z -->
+
+## Implementation report
+
+Adjusted Workspace Backend config handling so no workspace-local `.default.toml` file is created.
+
+Decision:
+- `resources/workspace-backend.default.toml` remains the packaged template source.
+- `yoi workspace init` copies that template directly to `.yoi/workspace-backend.local.toml` with create-new semantics and never overwrites an existing local config.
+- `.yoi/workspace-backend.default.toml` is no longer created.
+- `yoi workspace config default` / `yoi-workspace-server config default` print the latest packaged template.
+- `yoi workspace config diff` / `yoi-workspace-server config diff` compare the workspace-local config with the packaged template.
+- Built-in code fallback remains separate from the generated local config file.
+
+Validation:
+- `cargo test -p yoi-workspace-server`
+- `cargo test -p yoi`
+- `cargo check -p yoi`
+- `git diff --check`
+- `nix build .#yoi --no-link`
+- Manual smoke: `yoi-workspace-server init` creates only `.yoi/workspace.toml` and `.yoi/workspace-backend.local.toml`; `config default` prints the packaged template; `config diff` reports a match for fresh init.
+
+
+---

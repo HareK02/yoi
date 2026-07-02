@@ -10,9 +10,7 @@ use crate::server::{AuthConfig, ServerConfig};
 use crate::{Error, Result};
 
 pub const WORKSPACE_BACKEND_CONFIG_RELATIVE_PATH: &str = ".yoi/workspace-backend.local.toml";
-pub const WORKSPACE_BACKEND_DEFAULT_CONFIG_RELATIVE_PATH: &str =
-    ".yoi/workspace-backend.default.toml";
-pub const WORKSPACE_BACKEND_DEFAULT_CONFIG_TEMPLATE: &str =
+pub const WORKSPACE_BACKEND_CONFIG_TEMPLATE: &str =
     include_str!("../../../resources/workspace-backend.default.toml");
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
 const DEFAULT_FRONTEND_URL: &str = "http://127.0.0.1:5173";
@@ -78,6 +76,61 @@ pub struct RemoteRuntimeConfigFile {
     pub token_ref: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigDiff {
+    pub differs: bool,
+    pub text: String,
+}
+
+impl ConfigDiff {
+    fn new(default: &str, local: &str) -> Self {
+        if default == local {
+            return Self {
+                differs: false,
+                text: "workspace backend local config matches the packaged default\n".to_string(),
+            };
+        }
+
+        let mut text = String::from("--- packaged default\n+++ workspace local\n");
+        let default_lines = default.lines().collect::<Vec<_>>();
+        let local_lines = local.lines().collect::<Vec<_>>();
+        let max = default_lines.len().max(local_lines.len());
+        for index in 0..max {
+            match (default_lines.get(index), local_lines.get(index)) {
+                (Some(left), Some(right)) if left == right => {
+                    text.push(' ');
+                    text.push_str(left);
+                    text.push('\n');
+                }
+                (Some(left), Some(right)) => {
+                    text.push('-');
+                    text.push_str(left);
+                    text.push('\n');
+                    text.push('+');
+                    text.push_str(right);
+                    text.push('\n');
+                }
+                (Some(left), None) => {
+                    text.push('-');
+                    text.push_str(left);
+                    text.push('\n');
+                }
+                (None, Some(right)) => {
+                    text.push('+');
+                    text.push_str(right);
+                    text.push('\n');
+                }
+                (None, None) => {}
+            }
+        }
+
+        Self {
+            differs: true,
+            text,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ResolvedWorkspaceBackendConfig {
     pub server: ServerConfig,
@@ -92,14 +145,8 @@ impl WorkspaceBackendConfigFile {
             .join(WORKSPACE_BACKEND_CONFIG_RELATIVE_PATH)
     }
 
-    pub fn default_template_path_for_workspace(workspace_root: impl AsRef<Path>) -> PathBuf {
-        workspace_root
-            .as_ref()
-            .join(WORKSPACE_BACKEND_DEFAULT_CONFIG_RELATIVE_PATH)
-    }
-
-    pub fn ensure_default_template_for_workspace(workspace_root: impl AsRef<Path>) -> Result<()> {
-        let path = Self::default_template_path_for_workspace(workspace_root);
+    pub fn ensure_local_config_for_workspace(workspace_root: impl AsRef<Path>) -> Result<()> {
+        let path = Self::path_for_workspace(workspace_root);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -110,11 +157,25 @@ impl WorkspaceBackendConfigFile {
         {
             Ok(mut file) => {
                 use std::io::Write;
-                file.write_all(WORKSPACE_BACKEND_DEFAULT_CONFIG_TEMPLATE.as_bytes())?;
+                file.write_all(WORKSPACE_BACKEND_CONFIG_TEMPLATE.as_bytes())?;
                 file.sync_all()?;
                 Ok(())
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(Error::Io(error)),
+        }
+    }
+
+    pub fn local_config_diff_for_workspace(workspace_root: impl AsRef<Path>) -> Result<ConfigDiff> {
+        let workspace_root = workspace_root.as_ref();
+        let path = Self::path_for_workspace(workspace_root);
+        match fs::read_to_string(&path) {
+            Ok(local) => Ok(ConfigDiff::new(WORKSPACE_BACKEND_CONFIG_TEMPLATE, &local)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Err(Error::Config(format!(
+                "workspace backend local config `{}` does not exist; run `yoi workspace init --workspace {}` first",
+                path.display(),
+                workspace_root.display()
+            ))),
             Err(error) => Err(Error::Io(error)),
         }
     }
@@ -367,17 +428,39 @@ root = ".local-data"
     }
 
     #[test]
-    fn copies_default_template_without_overwriting() {
+    fn copies_local_config_without_overwriting() {
         let dir = tempfile::tempdir().unwrap();
-        WorkspaceBackendConfigFile::ensure_default_template_for_workspace(dir.path()).unwrap();
-        let path = WorkspaceBackendConfigFile::default_template_path_for_workspace(dir.path());
+        WorkspaceBackendConfigFile::ensure_local_config_for_workspace(dir.path()).unwrap();
+        let path = WorkspaceBackendConfigFile::path_for_workspace(dir.path());
         let raw = fs::read_to_string(&path).unwrap();
-        assert_eq!(raw, WORKSPACE_BACKEND_DEFAULT_CONFIG_TEMPLATE);
+        assert_eq!(raw, WORKSPACE_BACKEND_CONFIG_TEMPLATE);
         WorkspaceBackendConfigFile::parse_str(&raw, &path).unwrap();
 
-        fs::write(&path, "# custom template\n").unwrap();
-        WorkspaceBackendConfigFile::ensure_default_template_for_workspace(dir.path()).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "# custom template\n");
+        fs::write(&path, "# custom local config\n").unwrap();
+        WorkspaceBackendConfigFile::ensure_local_config_for_workspace(dir.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "# custom local config\n"
+        );
+    }
+
+    #[test]
+    fn local_config_diff_reports_match_and_difference() {
+        let dir = tempfile::tempdir().unwrap();
+        WorkspaceBackendConfigFile::ensure_local_config_for_workspace(dir.path()).unwrap();
+        let matched =
+            WorkspaceBackendConfigFile::local_config_diff_for_workspace(dir.path()).unwrap();
+        assert!(!matched.differs);
+
+        fs::write(
+            WorkspaceBackendConfigFile::path_for_workspace(dir.path()),
+            "[server]\nlisten = \"127.0.0.1:9999\"\n",
+        )
+        .unwrap();
+        let diff = WorkspaceBackendConfigFile::local_config_diff_for_workspace(dir.path()).unwrap();
+        assert!(diff.differs);
+        assert!(diff.text.contains("+++ workspace local"));
+        assert!(diff.text.contains("127.0.0.1:9999"));
     }
 
     #[test]

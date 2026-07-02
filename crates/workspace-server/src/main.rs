@@ -5,13 +5,16 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 use yoi_workspace_server::{
-    SqliteWorkspaceStore, WorkspaceBackendConfigFile, WorkspaceIdentity, serve,
+    SqliteWorkspaceStore, WORKSPACE_BACKEND_CONFIG_TEMPLATE, WorkspaceBackendConfigFile,
+    WorkspaceIdentity, serve,
 };
 
 #[derive(Debug)]
 enum Command {
     Serve(ServeOptions),
     Init(InitOptions),
+    ConfigDefault,
+    ConfigDiff(WorkspacePathOptions),
     Help,
 }
 
@@ -25,6 +28,11 @@ struct ServeOptions {
 
 #[derive(Debug)]
 struct InitOptions {
+    workspace: PathBuf,
+}
+
+#[derive(Debug)]
+struct WorkspacePathOptions {
     workspace: PathBuf,
 }
 
@@ -55,6 +63,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match parse_command(&args)? {
         Command::Serve(options) => run_serve(options).await,
         Command::Init(options) => run_init(options),
+        Command::ConfigDefault => run_config_default(),
+        Command::ConfigDiff(options) => run_config_diff(options),
         Command::Help => Ok(()),
     }
 }
@@ -73,6 +83,7 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             }
             Ok(Command::Init(parse_init_options(rest)?))
         }
+        "config" => parse_config_command(rest),
         "serve" => {
             if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
                 print_serve_help();
@@ -85,19 +96,30 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             Ok(Command::Help)
         }
         other => Err(CliError(format!(
-            "unknown command `{other}`; expected `init` or `serve`"
+            "unknown command `{other}`; expected `init`, `config`, or `serve`"
         ))),
     }
 }
 
 fn run_init(options: InitOptions) -> Result<(), Box<dyn std::error::Error>> {
     let identity = WorkspaceIdentity::load_or_init(&options.workspace)?;
-    WorkspaceBackendConfigFile::ensure_default_template_for_workspace(&options.workspace)?;
+    WorkspaceBackendConfigFile::ensure_local_config_for_workspace(&options.workspace)?;
     eprintln!(
         "yoi-workspace-server: initialized workspace `{}` ({})",
         options.workspace.display(),
         identity.workspace_id
     );
+    Ok(())
+}
+
+fn run_config_default() -> Result<(), Box<dyn std::error::Error>> {
+    print!("{WORKSPACE_BACKEND_CONFIG_TEMPLATE}");
+    Ok(())
+}
+
+fn run_config_diff(options: WorkspacePathOptions) -> Result<(), Box<dyn std::error::Error>> {
+    let diff = WorkspaceBackendConfigFile::local_config_diff_for_workspace(&options.workspace)?;
+    print!("{}", diff.text);
     Ok(())
 }
 
@@ -128,6 +150,65 @@ async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Erro
     );
     serve(resolved.server, store, listener).await?;
     Ok(())
+}
+
+fn parse_config_command(args: &[String]) -> Result<Command, CliError> {
+    let Some((subcommand, rest)) = args.split_first() else {
+        print_config_help();
+        return Ok(Command::Help);
+    };
+    match subcommand.as_str() {
+        "default" => {
+            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
+                print_config_help();
+                return Ok(Command::Help);
+            }
+            if !rest.is_empty() {
+                return Err(CliError(
+                    "config default does not accept options".to_string(),
+                ));
+            }
+            Ok(Command::ConfigDefault)
+        }
+        "diff" => {
+            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
+                print_config_help();
+                return Ok(Command::Help);
+            }
+            Ok(Command::ConfigDiff(parse_workspace_path_options(rest)?))
+        }
+        "--help" | "-h" => {
+            print_config_help();
+            Ok(Command::Help)
+        }
+        other => Err(CliError(format!(
+            "unknown config subcommand `{other}`; expected `default` or `diff`"
+        ))),
+    }
+}
+
+fn parse_workspace_path_options(args: &[String]) -> Result<WorkspacePathOptions, CliError> {
+    let mut workspace = std::env::current_dir()
+        .map_err(|error| CliError(format!("failed to read current dir: {error}")))?;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--workspace" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| CliError("--workspace requires a path".to_string()))?;
+                workspace = PathBuf::from(value);
+            }
+            value if value.starts_with("--workspace=") => {
+                workspace = PathBuf::from(value_after_equals(arg, "--workspace")?);
+            }
+            other => return Err(CliError(format!("unknown workspace option `{other}`"))),
+        }
+    }
+    let workspace = workspace
+        .canonicalize()
+        .map_err(|error| CliError(format!("failed to canonicalize workspace: {error}")))?;
+    Ok(WorkspacePathOptions { workspace })
 }
 
 fn parse_init_options(args: &[String]) -> Result<InitOptions, CliError> {
@@ -252,13 +333,19 @@ fn parse_listen(value: &str) -> Result<SocketAddr, CliError> {
 
 fn print_help() {
     println!(
-        "yoi-workspace-server\n\nUsage:\n  yoi-workspace-server init [OPTIONS]\n  yoi-workspace-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
+        "yoi-workspace-server\n\nUsage:\n  yoi-workspace-server init [OPTIONS]\n  yoi-workspace-server config <COMMAND> [OPTIONS]\n  yoi-workspace-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
     );
 }
 
 fn print_init_help() {
     println!(
-        "yoi-workspace-server init\n\nUsage:\n  yoi-workspace-server init [OPTIONS]\n\nDescription:\n  Initializes a Workspace identity and copies the default Backend config template. Does not create Backend data stores.\n\nOptions:\n      --workspace <PATH>  Workspace root to initialize (defaults to cwd)\n  -h, --help              Print help"
+        "yoi-workspace-server init\n\nUsage:\n  yoi-workspace-server init [OPTIONS]\n\nDescription:\n  Initializes a Workspace identity and copies the packaged Backend config template to .yoi/workspace-backend.local.toml. Does not create Backend data stores.\n\nOptions:\n      --workspace <PATH>  Workspace root to initialize (defaults to cwd)\n  -h, --help              Print help"
+    );
+}
+
+fn print_config_help() {
+    println!(
+        "yoi-workspace-server config\n\nUsage:\n  yoi-workspace-server config default\n  yoi-workspace-server config diff [OPTIONS]\n\nDescription:\n  Prints the packaged Workspace Backend config template or compares it with the workspace-local config.\n\nOptions for diff:\n      --workspace <PATH>  Workspace root (defaults to cwd)\n  -h, --help              Print help"
     );
 }
 
@@ -272,7 +359,8 @@ fn print_serve_help() {
 mod tests {
     use super::*;
     use yoi_workspace_server::{
-        WORKSPACE_BACKEND_DEFAULT_CONFIG_RELATIVE_PATH, WORKSPACE_IDENTITY_RELATIVE_PATH,
+        WORKSPACE_BACKEND_CONFIG_RELATIVE_PATH, WORKSPACE_BACKEND_CONFIG_TEMPLATE,
+        WORKSPACE_IDENTITY_RELATIVE_PATH,
     };
 
     #[test]
@@ -284,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn init_creates_identity_and_default_template_only() {
+    fn init_creates_identity_and_local_config_only() {
         let temp = tempfile::tempdir().unwrap();
         run_init(InitOptions {
             workspace: temp.path().canonicalize().unwrap(),
@@ -292,15 +380,16 @@ mod tests {
         .unwrap();
 
         assert!(temp.path().join(WORKSPACE_IDENTITY_RELATIVE_PATH).exists());
-        assert!(
-            temp.path()
-                .join(WORKSPACE_BACKEND_DEFAULT_CONFIG_RELATIVE_PATH)
-                .exists()
+        let local_config_path = temp.path().join(WORKSPACE_BACKEND_CONFIG_RELATIVE_PATH);
+        assert!(local_config_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(local_config_path).unwrap(),
+            WORKSPACE_BACKEND_CONFIG_TEMPLATE
         );
         assert!(
             !temp
                 .path()
-                .join(".yoi/workspace-backend.local.toml")
+                .join(".yoi/workspace-backend.default.toml")
                 .exists()
         );
         assert!(!temp.path().join(".yoi/workspace.db").exists());

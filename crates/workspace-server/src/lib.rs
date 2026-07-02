@@ -15,8 +15,8 @@ pub mod server;
 pub mod store;
 
 pub use config::{
-    ResolvedWorkspaceBackendConfig, WORKSPACE_BACKEND_CONFIG_RELATIVE_PATH,
-    WORKSPACE_BACKEND_DEFAULT_CONFIG_RELATIVE_PATH, WorkspaceBackendConfigFile,
+    ConfigDiff, ResolvedWorkspaceBackendConfig, WORKSPACE_BACKEND_CONFIG_RELATIVE_PATH,
+    WORKSPACE_BACKEND_CONFIG_TEMPLATE, WorkspaceBackendConfigFile,
 };
 pub use identity::{WORKSPACE_IDENTITY_RELATIVE_PATH, WorkspaceIdentity};
 pub use records::{

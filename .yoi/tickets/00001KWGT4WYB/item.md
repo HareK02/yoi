@@ -2,7 +2,7 @@
 title: 'Workspace初期化をinitコマンドに切り出しserveの副作用をなくす'
 state: 'closed'
 created_at: '2026-07-02T07:02:02Z'
-updated_at: '2026-07-02T09:20:26Z'
+updated_at: '2026-07-02T11:59:35Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-02T09:03:56Z'
@@ -14,30 +14,32 @@ queued_at: '2026-07-02T09:03:56Z'
 
 - `WorkspaceIdentity::load_or_init(workspace_root)`
   - `.yoi/workspace.toml` が無ければ作る。
-- `WorkspaceBackendConfigFile::ensure_default_template_for_workspace(workspace_root)`
-  - `.yoi/workspace-backend.default.toml` が無ければ `resources/workspace-backend.default.toml` からコピーする。
+- `WorkspaceBackendConfigFile::ensure_local_config_for_workspace(workspace_root)`
+  - `.yoi/workspace-backend.local.toml` が無ければ `resources/workspace-backend.default.toml` からコピーする。
 
-1Workspace=1Backend の現状では、Backend の実行 directory / `--workspace` が workspace root になっている。この前提自体はよいが、`serve` が初期化副作用を持つと、間違った cwd で起動しただけで `.yoi/workspace.toml` や default config template が作られる。
+1Workspace=1Backend の現状では、Backend の実行 directory / `--workspace` が workspace root になっている。この前提自体はよいが、`serve` が初期化副作用を持つと、間違った cwd で起動しただけで `.yoi/workspace.toml` や local config が作られる。
 
 Workspace の一回だけ実行されるべき初期化は、明示的な `init` コマンドへ切り出し、`serve` は既に初期化済みの workspace を起動するだけにする。
 
 ## 目的
 
 - Workspace 初期化を明示コマンドに切り出す。
-- `serve` 起動時に workspace identity / default config template を作らない。
+- `serve` 起動時に workspace identity / local config を作らない。
 - `serve` は未初期化 workspace に対して typed diagnostic で失敗する。
 - 1Workspace=1Backend の前提を保ち、workspace root は Backend 起動対象として明示する。
-- 初期化で作る record / template と、serve/runtime が生成する data を分ける。
+- 初期化で作る record / local config と、serve/runtime が生成する data を分ける。
 - 現状の local filesystem 保存を採用しつつ、Workspace / Project record の将来的な provider 可換性を妨げない。
 
 ## コマンド設計
 
 ### Product CLI
 
-`yoi` 側に workspace init subcommand を追加する。
+`yoi` 側に workspace init と config subcommand を追加する。
 
 ```text
 yoi workspace init [--workspace <PATH>]
+yoi workspace config default
+yoi workspace config diff [--workspace <PATH>]
 yoi workspace serve [OPTIONS]
 ```
 
@@ -49,6 +51,8 @@ yoi workspace serve [OPTIONS]
 
 ```text
 yoi-workspace-server init [--workspace <PATH>]
+yoi-workspace-server config default
+yoi-workspace-server config diff [--workspace <PATH>]
 yoi-workspace-server serve [OPTIONS]
 ```
 
@@ -60,7 +64,7 @@ yoi-workspace-server serve [OPTIONS]
 
 ```text
 .yoi/workspace.toml
-.yoi/workspace-backend.default.toml
+.yoi/workspace-backend.local.toml
 ```
 
 ### `.yoi/workspace.toml`
@@ -70,17 +74,16 @@ yoi-workspace-server serve [OPTIONS]
 - 既存ファイルがある場合は parse/validate し、上書きしない。
 - 作成は `create_new` semantics を維持し、race 時は既存 record を読み直す。
 
-### `.yoi/workspace-backend.default.toml`
+### `.yoi/workspace-backend.local.toml`
 
-- `resources/workspace-backend.default.toml` からコピーする workspace-local template。
+- `resources/workspace-backend.default.toml` からコピーする workspace-local config。
 - 既存ファイルがある場合は上書きしない。
-- `.local` config ではないため、ユーザーが実設定として使う場合は `.yoi/workspace-backend.local.toml` にコピーして編集する。
+- packaged default の最新版は `yoi workspace config default` で参照し、local との差分は `yoi workspace config diff` で確認する。
 
 ## 初期化で作らないもの
 
 `init` は Backend / Runtime data を作らない。
 
-- `.yoi/workspace-backend.local.toml`
 - control-plane SQLite DB
 - embedded Runtime fs-store
 - logs / pid files
@@ -131,7 +134,7 @@ Ticket / Objective などの project record は、現状では `.yoi/tickets` / 
 
 1. workspace root を決める。
 2. `.yoi/workspace.toml` を load する。
-3. `.yoi/workspace-backend.default.toml` は作らない。
+3. `.yoi/workspace-backend.local.toml` は作らない。
 4. `.yoi/workspace-backend.local.toml` があれば読む。無ければ defaults。
 5. resolved `ServerConfig` で Backend を起動する。
 
@@ -143,7 +146,7 @@ Diagnostic 例:
 workspace is not initialized at <path>; run `yoi workspace init --workspace <path>` first
 ```
 
-`serve` は `.yoi/workspace-backend.default.toml` が無いだけでは失敗しない方針とする。これは template であり、runtime config の authority ではないため。ただし init 済み workspace で default template が欠けている場合に warning を出すかは実装時に判断する。
+`serve` は `.yoi/workspace-backend.local.toml` が無いだけでは失敗しない方針とする。config file が欠けている場合は code fallback を使う。ただし `init` は通常 `.local` config を作るため、欠落は診断対象にしてよい。
 
 ## 内部 API 整理
 
@@ -161,7 +164,7 @@ WorkspaceInitialization::load_required(workspace_root) -> WorkspaceIdentity
 ```rust
 WorkspaceIdentity::init_if_missing(...)
 WorkspaceIdentity::load_required(...)
-WorkspaceBackendConfigFile::ensure_default_template_for_workspace(...)
+WorkspaceBackendConfigFile::ensure_local_config_for_workspace(...)
 ```
 
 重要なのは、`serve` が `load_or_init` を呼ばないこと。
@@ -171,20 +174,23 @@ WorkspaceBackendConfigFile::ensure_default_template_for_workspace(...)
 この Ticket は Workspace Backend config schema の方針を維持し、新規 Backend 設定項目を CLI flag として増やさない。
 
 - `init` に必要なのは `--workspace` だけ。
+- `config diff` に必要なのも `--workspace` だけ。
 - `serve` の既存 legacy dev flags をこの Ticket で全面削除するかは別判断にする。
 - ただし `serve` の初期化副作用は必ずなくす。
 
 ## 実装要件
 
 - `yoi workspace init [--workspace <PATH>]` を追加する。
+- `yoi workspace config default` / `yoi workspace config diff [--workspace <PATH>]` を追加する。
+- `yoi-workspace-server config default` / `yoi-workspace-server config diff [--workspace <PATH>]` を追加する。
 - `yoi-workspace-server init [--workspace <PATH>]` を追加する。
 - workspace-server 側の help に init を追加する。
 - `WorkspaceIdentity` に load-only path を追加する。
   - 既存 `load_or_init` は init command 内部用に残してよいが、serve からは呼ばない。
 - `serve` から `WorkspaceIdentity::load_or_init(...)` を外す。
-- `serve` から `WorkspaceBackendConfigFile::ensure_default_template_for_workspace(...)` を外す。
+- `serve` から `WorkspaceBackendConfigFile::ensure_local_config_for_workspace(...)` を外す。
 - 未初期化 workspace の `serve` は typed diagnostic で失敗する。
-- `init` は existing workspace identity / default template を上書きしない。
+- `init` は existing workspace identity / local config を上書きしない。
 - `init` は data root / DB / embedded Runtime store を作らない。
 - `init` は Ticket / Objective など provider-specific project record layout を作らない。
 - `serve` / Browser-facing API / Runtime create path に workspace-local filesystem path を正本識別子として漏らさない。
@@ -192,19 +198,21 @@ WorkspaceBackendConfigFile::ensure_default_template_for_workspace(...)
 ## 受け入れ条件
 
 - `yoi workspace init [--workspace <PATH>]` が使える。
+- `yoi workspace config default` が packaged template を表示する。
+- `yoi workspace config diff [--workspace <PATH>]` が `.local` config と packaged template を比較する。
 - `yoi-workspace-server init [--workspace <PATH>]` が使える。
-- `init` が `.yoi/workspace.toml` と `.yoi/workspace-backend.default.toml` を作る。
-- `init` が既存 `.yoi/workspace.toml` / `.yoi/workspace-backend.default.toml` を上書きしない。
-- `init` が `.yoi/workspace-backend.local.toml`、DB、embedded Runtime fs-store、logs を作らない。
+- `init` が `.yoi/workspace.toml` と `.yoi/workspace-backend.local.toml` を作る。
+- `init` が既存 `.yoi/workspace.toml` / `.yoi/workspace-backend.local.toml` を上書きしない。
+- `init` が DB、embedded Runtime fs-store、logs を作らない.
 - `init` が Ticket / Objective body や provider-specific project record layout を作らない。
 - `serve` が `.yoi/workspace.toml` を新規作成しない。
-- `serve` が `.yoi/workspace-backend.default.toml` を新規作成しない。
+- `serve` が `.yoi/workspace-backend.local.toml` を新規作成しない。
 - 未初期化 workspace で `serve` すると、`workspace init` を促す diagnostic で失敗する。
-- 初期化済み workspace では config file が無くても defaults で `serve` が起動できる。
+- 初期化済み workspace では `.local` config が存在し、欠けた key は code fallback で解決される。
 - Browser-facing API / Runtime create path / Worker conversation context に `.yoi/workspace.toml`、`.yoi/tickets/...`、data root、DB path、Runtime store path が正本識別子として漏れない。
 - Project record provider 可換性を妨げないことが code/docs/tests 上で明確になっている。
-- Help text が `workspace init` と `workspace serve` の責務差を説明している。
-- Focused tests が init 作成、init idempotency、serve 未初期化拒否、serve 初期化済み起動、data 非作成を確認する。
+- Help text が `workspace init`、`workspace config`、`workspace serve` の責務差を説明している。
+- Focused tests が init 作成、init idempotency、serve 未初期化拒否、serve 初期化済み起動、config default/diff、data 非作成を確認する。
 - `cargo test -p yoi-workspace-server` が通る。
 - `cargo test -p yoi` が通る、または CLI parser tests が通る。
 - `cargo check -p yoi` が通る。
@@ -213,7 +221,7 @@ WorkspaceBackendConfigFile::ensure_default_template_for_workspace(...)
 
 ## 対象外
 
-- Backend config schema の追加変更。
+- Backend config schema の追加変更。ただし packaged template の参照・diff CLI はこの Ticket の correction として扱う。
 - frontend Vite config の管理。
 - remote Runtime supervisor。
 - secret store 実装。

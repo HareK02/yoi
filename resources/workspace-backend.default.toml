@@ -1,10 +1,16 @@
 # Workspace Backend local config template.
 #
-# Copied to `.yoi/workspace-backend.default.toml` during workspace init.
-# Copy that file to `.yoi/workspace-backend.local.toml` and edit it.
+# `yoi workspace init` copies this packaged template to
+# `.yoi/workspace-backend.local.toml` without overwriting an existing file.
 # The `.local` file is intentionally git-ignored.
 #
-# Omit a key to use the built-in default. TOML has no `null`, so optional
+# Print the latest packaged template with:
+#   yoi workspace config default
+#
+# Compare the local config with the latest packaged template with:
+#   yoi workspace config diff
+#
+# Omit a key to use the built-in fallback. TOML has no `null`, so optional
 # settings are represented by leaving the key commented out.
 
 [server]
@@ -19,17 +25,17 @@ frontend_url = "http://127.0.0.1:5173"
 # static_assets_dir = "web/workspace/dist"
 
 [data]
-# Backend data root override. Leave commented to use the user-data default:
+# Backend data root override. Leave commented to use the user-data fallback:
 #   <data_dir>/workspace-server/<workspace_id>/
 # Relative paths are resolved from the workspace root.
 # root = ".yoi/workspace-backend.data"
 
 # Explicit control-plane SQLite DB path override.
-# If omitted, this defaults to `<data.root>/workspace.db`.
+# If omitted, this falls back to `<data.root>/workspace.db`.
 # workspace_database_path = ".yoi/workspace-backend.data/workspace.db"
 
 # Explicit embedded Runtime fs-store root override.
-# If omitted, this defaults to `<data.root>/embedded-runtime`.
+# If omitted, this falls back to `<data.root>/embedded-runtime`.
 # embedded_runtime_store_root = ".yoi/workspace-backend.data/embedded-runtime"
 
 [limits]
