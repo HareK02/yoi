@@ -220,3 +220,42 @@ Implementation progress report:
 - External review requested via sibling Reviewer Pod `yoi-reviewer-00001KWHHRTM9-00001KWHEM8YJ`.
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-02T17:36:45Z status: request_changes -->
+
+## Review: request changes
+
+External review result: request_changes
+
+Checked evidence:
+- 両 Ticket record と最新 IntentPacket / orchestration-plan を確認。
+- `f2fead7e` の diff/stat/check evidence を確認（10 files changed、`git diff --check f2fead7e^ f2fead7e` clean）。
+- `config.rs`, `hosts.rs`, `server.rs`, settings UI/model/tests, sidebar worker form/types, CSS/tsconfig を focused static review。
+- Reviewer は read-only で、validation 再実行はせず Orchestrator reported validation pass を参照。
+
+Blockers:
+
+1. Runtime connection `test` が recorded lightweight negotiation / compatibility contract を満たしていない。
+   - Ticket は observed runtime capabilities の parse と Browser 必要 operation（list workers, observe detail, event websocket construction, spawn, input dispatch, config-bundle availability/sync）に対する compatibility check を要求している。
+   - 現状 `test_remote_runtime_config` は `/v1/runtime` を呼び、狭い `RuntimeHttpSummaryResponse` を parse した後、operation compatibility check なしで常に `state: "compatible"`, `capabilities: Vec::new()` を返す。
+   - acceptance criterion の sanitized compatibility/capabilities/diagnostics response を満たしていない。
+
+2. Browser-facing diagnostic sanitization が endpoint/path leak invariant に対して不十分。
+   - remote test failure path が `sanitize_backend_error(&error.to_string())` を Browser response に入れている。
+   - sanitizer は `/home/`, `/Users/`, `\\`, `:\\` を含む message だけ置換するため、reqwest error の requested URL や non-home config/temp path が漏れる可能性がある。
+   - Ticket は Runtime endpoint/config path/internal location を Browser-facing response に漏らさないことを要求しているため、raw backend error string ではなく fixed typed diagnostics にする必要がある。
+
+3. Manual Worker launch が rejected Runtime operation の typed unsupported diagnostics を落としている。
+   - `create_workspace_worker` が non-`Accepted` `WorkerOperationResult` を generic `workspace_worker_create_failed` に変換し、`result.diagnostics` を破棄している。
+   - unsupported remote/runtime cases は typed sanitized diagnostics を返す必要がある。
+
+4. key contracts の focused acceptance tests が不足。
+   - backend は helper-level validation/sanitizer tests に寄っており、runtime connection list/add/delete/test negotiation、config persistence、restart_required、`/api/workers` POST success/unsupported diagnostics の route-level tests が足りない。
+   - Web は settings model helper tests のみで、New Worker form rendering/submit-path test がない。
+
+Non-blocking follow-ups:
+- manual Worker launch の `display_name` は optional と記録されているが backend/UI は non-empty を要求している。空なら default label derivation を検討。
+- Browser-facing request structs に `deny_unknown_fields` を付けると “only these fields” boundary が fail closed になる。
+- `nix build .#yoi --no-link` は dependency/resource packaging 変更ではないため未実行だが、acceptance evidence としては未検証。
+
+---
