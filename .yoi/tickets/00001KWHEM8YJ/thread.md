@@ -156,3 +156,27 @@ Acceptance basis:
 - side effect はこの `queued -> inprogress` acceptance 後に開始する。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-02T17:02:43Z -->
+
+## Implementation report
+
+Implementation side-effect recovery note:
+
+- `queued -> inprogress` acceptance 後、implementation worktree `/home/hare/Projects/yoi/.worktree/00001KWHHRTM9-00001KWHEM8YJ` / branch `work/00001KWHHRTM9-00001KWHEM8YJ` は作成済み。
+- 最初の Coder Pod spawn は、child workspace root `/home/hare/Projects/yoi` を readable scope に含めていなかったため `workspace root is not readable under the configured scope` で失敗した。
+- Ticket は `inprogress` のまま、read scope に workspace root、write scope に implementation worktree だけを含める形で即時 retry する。raw runtime/socket/session details は implementation contract には含めない。
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-02T17:03:28Z -->
+
+## Implementation report
+
+Implementation routing update:
+
+- Recovery retry succeeded: sibling Coder Pod `yoi-coder-00001KWHHRTM9-00001KWHEM8YJ` was spawned for the combined branch/worktree.
+- Scope policy: workspace root is readable for runtime workspace metadata; write authority is restricted to implementation worktree `/home/hare/Projects/yoi/.worktree/00001KWHHRTM9-00001KWHEM8YJ`.
+- Work order remains: `00001KWHHRTM9` first, then this Ticket; external review will be requested after coder completion evidence is available.
+
+---
