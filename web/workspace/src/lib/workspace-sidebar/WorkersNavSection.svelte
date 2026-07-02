@@ -1,5 +1,6 @@
 <script lang="ts">
   import { workerConsoleHref } from '$lib/workspace-console/model';
+  import { buildBrowserCreateWorkerRequest, defaultWorkerLaunchForm } from './worker-launch';
   import type {
     BrowserCreateWorkerResponse,
     ListResponse,
@@ -77,16 +78,15 @@
       }
       const payload = (await response.json()) as WorkerLaunchOptionsResponse;
       options = payload;
-      const preferredRuntime = payload.runtimes.find((runtime) => runtime.can_spawn_worker && runtime.status === 'active')
-        ?? payload.runtimes.find((runtime) => runtime.can_spawn_worker)
-        ?? payload.runtimes[0];
-      if (preferredRuntime && !runtimeId) {
-        runtimeId = preferredRuntime.runtime_id;
-      }
-      const preferredProfile = payload.profiles.find((candidate) => candidate.id === 'builtin:coder') ?? payload.profiles[0];
-      if (preferredProfile && !payload.profiles.some((candidate) => candidate.id === profile)) {
-        profile = preferredProfile.id;
-      }
+      const form = defaultWorkerLaunchForm(payload, {
+        runtime_id: runtimeId,
+        display_name: displayName,
+        profile,
+        initial_text: initialText,
+      });
+      runtimeId = form.runtime_id;
+      displayName = form.display_name;
+      profile = form.profile;
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
         return;
@@ -102,12 +102,12 @@
       const response = await fetch('/api/workers', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
+        body: JSON.stringify(buildBrowserCreateWorkerRequest({
           runtime_id: runtimeId,
           display_name: displayName,
           profile,
           initial_text: initialText,
-        }),
+        })),
       });
       if (!response.ok) {
         throw new Error(await responseErrorMessage(response, 'worker create failed'));
