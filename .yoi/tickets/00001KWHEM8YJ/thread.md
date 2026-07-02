@@ -63,3 +63,96 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-07-02T17:00:32Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- Ticket は Manual Coding Worker launch の product-level API / Sidebar New form / sanitized payload / success Console navigation / unsupported runtime diagnostic を具体化しており、observable な acceptance criteria と validation がある。
+- typed relation blocker は 0 件、OrchestrationPlan は prior human-gate waiting note のみで、ユーザーから「2つとも消化して」と明示 follow-up があったため human gate は解除された。
+- `00001KWHHRTM9` の Runtime connection management と UI/API surface が近く、別 worktree 並列では衝突リスクが高いので、同一 implementation worktree/branch で `00001KWHHRTM9` を先に実装し、その Runtime candidate/projection を利用して本 Ticket を続けて実装する。
+
+Evidence checked:
+- Ticket body / thread / artifacts。
+- `TicketRelationQuery(00001KWHEM8YJ)` は 0 件。
+- `TicketOrchestrationPlanQuery(00001KWHEM8YJ)` は prior human-gate waiting note のみ。
+- queued Ticket 一覧では `00001KWHHRTM9` も queued、ready/inprogress は 0 件。
+- workspace/orchestration git state と worktree 一覧、visible Pods、TicketDoctor（0 errors / 既存 warning のみ）。
+- Bounded code map: `web/workspace/src/lib/workspace-sidebar/WorkersNavSection.svelte`、console route under `web/workspace/src/routes/runtimes/[runtimeId]/workers/[workerId]/console/`、existing `/api/workers` list projection、`/api/runtimes/{runtime_id}/workers` internal-ish Runtime spawn path、`crates/workspace-server` runtime/backend/config areas。
+
+IntentPacket:
+
+Intent:
+- Workspace Browser sidebar の WORKER heading 横に `New` button と作成 form を追加し、Browser-facing `/api/workers` product-level endpoint から coding Worker を作成し、成功後に Worker Console へ遷移する。
+
+Binding decisions / invariants:
+- Browser UI は existing Runtime create payload を直接露出しない。
+- Browser-facing request fields は `runtime_id` / `display_name` / `profile` / `initial_text` のみ。`kind` は endpoint/backend launch mode として扱い、form input や request field にしない。
+- Browser-facing payload/response/form に raw workspace path、cwd、tool scope、`ConfigBundleRef`、requested capabilities、secret/token、Runtime endpoint、socket/session/store path を含めない。
+- `profile` は Backend が公開する候補から選ばせ、自由入力にしない。
+- v0 は embedded/local Runtime を primary target とし、remote Runtime の workspace provisioning が未対応なら typed diagnostic で拒否してよい。
+- `/api/runtimes/{runtime_id}/workers` は残してよいが、New Worker UI は新しい product-level `/api/workers` POST を使う。
+
+Requirements / acceptance criteria:
+- Sidebar WORKER heading 横に `New` button がある。
+- `New` で display name / runtime / profile / initial text だけの form が開く。
+- Form submit は `/api/workers` product-level endpoint を使い、coding Worker を作成できる。
+- Backend は request の `profile` から Profile / ConfigBundle / execution backend を解決する。
+- 作成成功後、Worker list を refresh し、`/runtimes/{runtime_id}/workers/{worker_id}/console` へ遷移する。
+- 作成失敗時、入力値を保持して sanitized diagnostic を form に表示する。
+- focused backend/UI tests を追加し、指定 validation を可能な範囲で実行する。
+
+Implementation latitude:
+- Runtime candidate は `00001KWHHRTM9` の projection を利用する。v0 で embedded-only fallback が必要なら許容されるが、Browser 自由入力にはしない。
+- Product-level endpoint の internal mapping、response shape、Svelte form placement（inline/sidebar panel/modal）は既存 UX を壊さない範囲で選んでよい。
+- Profile candidate の v0 source は backend-provided static/builtin candidates でもよい。ただし自由入力化しない。
+
+Escalate if:
+- Browser-facing API に raw path/cwd/scope/secret/runtime internal location を含めないと実装できない場合。
+- Profile/ConfigBundle resolution の既存 boundary を変える必要が出た場合。
+- remote runtime provisioning を完成させないと acceptance を満たせない場合。
+
+Validation:
+- `cd web/workspace && deno task test`
+- `cd web/workspace && deno task check`
+- `cargo test -p yoi-workspace-server`
+- `cargo check -p yoi`
+- `git diff --check`
+- `nix build .#yoi --no-link` は時間/依存変更の重さを見て実行、未実行なら理由を report。
+
+Current code map:
+- Sidebar UI: `web/workspace/src/lib/workspace-sidebar/WorkersNavSection.svelte`, `WorkspaceSidebar.svelte`。
+- Worker console/navigation: `web/workspace/src/lib/workspace-console/model`, `web/workspace/src/routes/runtimes/[runtimeId]/workers/[workerId]/console/`。
+- Existing worker list and runtime spawn APIs: `crates/workspace-server` `/api/workers` and `/api/runtimes/{runtime_id}/workers` handlers, worker-runtime `CreateWorkerRequest` / config bundle resolution paths。
+- Runtime candidates/settings base: `00001KWHHRTM9` implementation in the same worktree.
+
+Critical risks / reviewer focus:
+- Product-level endpoint does not deserialize or expose the internal Runtime create request shape.
+- Browser-facing surfaces are sanitized and do not leak raw path/cwd/scope/ConfigBundleRef/requested capabilities/secret/runtime endpoint/socket/session/store path.
+- Profile/runtime selectors are bounded to backend-published choices.
+- Success navigation and worker list refresh are deterministic.
+- The combined implementation with `00001KWHHRTM9` keeps runtime connection management and manual worker launch contracts consistent.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-07-02T17:01:11Z from: queued to: inprogress reason: routing_acceptance_implementation_ready field: state -->
+
+## State changed
+
+Queued acceptance recorded after explicit user follow-up 「2つとも消化して」。
+
+Checked context:
+- Ticket body / thread / artifacts。
+- `TicketRelationQuery(00001KWHEM8YJ)`: blocking relation 0 件。
+- `TicketOrchestrationPlanQuery(00001KWHEM8YJ)`: prior human-gate waiting note を確認し、今回 accepted_plan / after ordering を記録済み。
+- workspace/worktree/visible Pod/TicketDoctor/code-map の bounded check。
+
+Acceptance basis:
+- concrete missing decision / information は残っていない。
+- `00001KWHHRTM9` と surface が重なるため、同一 implementation worktree で `00001KWHHRTM9` の後に実装する。
+- side effect はこの `queued -> inprogress` acceptance 後に開始する。
+
+---
