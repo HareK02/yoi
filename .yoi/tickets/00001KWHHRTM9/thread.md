@@ -259,3 +259,24 @@ Non-blocking follow-ups:
 - `nix build .#yoi --no-link` は dependency/resource packaging 変更ではないため未実行だが、acceptance evidence としては未検証。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-02T18:11:11Z -->
+
+## Implementation report
+
+Review-fix implementation report:
+
+- Coder Pod completed requested changes and committed follow-up `47ed0ff8 fix: harden runtime and worker launch controls` on branch `work/00001KWHHRTM9-00001KWHEM8YJ`.
+- Worktree status was clean after commit.
+- Fix changed `crates/workspace-server/src/server.rs`, `web/workspace/deno.json`, `WorkersNavSection.svelte`, and added `worker-launch.ts` / `worker-launch.test.ts`.
+- Reported fixes include lightweight runtime compatibility probes, fixed sanitized remote-test diagnostics without endpoint/path leakage, preservation of typed unsupported worker-create diagnostics, `deny_unknown_fields` on Browser-facing request structs, empty display-name default derivation, backend route/acceptance tests, and web worker-launch model tests.
+- Orchestrator reran validation:
+  - `git diff --check`: pass
+  - `cargo test -p yoi-workspace-server`: pass（55 lib tests + 2 main tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task test`: pass（13 tests）
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+- `nix build .#yoi --no-link` は dependency/resource packaging 変更ではないため未実行。
+- Requesting follow-up external review against `f2fead7e..47ed0ff8` and full combined implementation.
+
+---
