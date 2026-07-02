@@ -176,3 +176,137 @@ Acceptance basis:
 - side effect はこの `queued -> inprogress` acceptance 後に開始する。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-02T17:02:35Z -->
+
+## Implementation report
+
+Implementation side-effect recovery note:
+
+- `queued -> inprogress` acceptance 後、implementation worktree `/home/hare/Projects/yoi/.worktree/00001KWHHRTM9-00001KWHEM8YJ` / branch `work/00001KWHHRTM9-00001KWHEM8YJ` は作成済み。
+- 最初の Coder Pod spawn は、child workspace root `/home/hare/Projects/yoi` を readable scope に含めていなかったため `workspace root is not readable under the configured scope` で失敗した。
+- Ticket は `inprogress` のまま、read scope に workspace root、write scope に implementation worktree だけを含める形で即時 retry する。raw runtime/socket/session details は implementation contract には含めない。
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-02T17:03:28Z -->
+
+## Implementation report
+
+Implementation routing update:
+
+- Recovery retry succeeded: sibling Coder Pod `yoi-coder-00001KWHHRTM9-00001KWHEM8YJ` was spawned for the combined branch/worktree.
+- Scope policy: workspace root is readable for runtime workspace metadata; write authority is restricted to implementation worktree `/home/hare/Projects/yoi/.worktree/00001KWHHRTM9-00001KWHEM8YJ`.
+- Work order remains: this Ticket first, then `00001KWHEM8YJ`; external review will be requested after coder completion evidence is available.
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-02T17:29:34Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Coder Pod completed the combined implementation and committed `f2fead7e feat: add workspace runtime and worker controls` on branch `work/00001KWHHRTM9-00001KWHEM8YJ`.
+- Worktree status was clean after commit.
+- Changed areas include `crates/workspace-server/src/config.rs`, `crates/workspace-server/src/hosts.rs`, `crates/workspace-server/src/server.rs`, Settings UI/model/tests, Worker sidebar UI/types, and workspace TS config/CSS.
+- Orchestrator reran validation:
+  - `git diff --check`: pass
+  - `cargo test -p yoi-workspace-server`: pass（51 lib tests + 2 main tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task test`: pass（11 tests）
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+- `nix build .#yoi --no-link` は dependency/resource packaging 変更ではないため未実行。
+- External review requested via sibling Reviewer Pod `yoi-reviewer-00001KWHHRTM9-00001KWHEM8YJ`.
+
+---
+
+<!-- event: review author: reviewer at: 2026-07-02T17:36:45Z status: request_changes -->
+
+## Review: request changes
+
+External review result: request_changes
+
+Checked evidence:
+- 両 Ticket record と最新 IntentPacket / orchestration-plan を確認。
+- `f2fead7e` の diff/stat/check evidence を確認（10 files changed、`git diff --check f2fead7e^ f2fead7e` clean）。
+- `config.rs`, `hosts.rs`, `server.rs`, settings UI/model/tests, sidebar worker form/types, CSS/tsconfig を focused static review。
+- Reviewer は read-only で、validation 再実行はせず Orchestrator reported validation pass を参照。
+
+Blockers:
+
+1. Runtime connection `test` が recorded lightweight negotiation / compatibility contract を満たしていない。
+   - Ticket は observed runtime capabilities の parse と Browser 必要 operation（list workers, observe detail, event websocket construction, spawn, input dispatch, config-bundle availability/sync）に対する compatibility check を要求している。
+   - 現状 `test_remote_runtime_config` は `/v1/runtime` を呼び、狭い `RuntimeHttpSummaryResponse` を parse した後、operation compatibility check なしで常に `state: "compatible"`, `capabilities: Vec::new()` を返す。
+   - acceptance criterion の sanitized compatibility/capabilities/diagnostics response を満たしていない。
+
+2. Browser-facing diagnostic sanitization が endpoint/path leak invariant に対して不十分。
+   - remote test failure path が `sanitize_backend_error(&error.to_string())` を Browser response に入れている。
+   - sanitizer は `/home/`, `/Users/`, `\\`, `:\\` を含む message だけ置換するため、reqwest error の requested URL や non-home config/temp path が漏れる可能性がある。
+   - Ticket は Runtime endpoint/config path/internal location を Browser-facing response に漏らさないことを要求しているため、raw backend error string ではなく fixed typed diagnostics にする必要がある。
+
+3. Manual Worker launch が rejected Runtime operation の typed unsupported diagnostics を落としている。
+   - `create_workspace_worker` が non-`Accepted` `WorkerOperationResult` を generic `workspace_worker_create_failed` に変換し、`result.diagnostics` を破棄している。
+   - unsupported remote/runtime cases は typed sanitized diagnostics を返す必要がある。
+
+4. key contracts の focused acceptance tests が不足。
+   - backend は helper-level validation/sanitizer tests に寄っており、runtime connection list/add/delete/test negotiation、config persistence、restart_required、`/api/workers` POST success/unsupported diagnostics の route-level tests が足りない。
+   - Web は settings model helper tests のみで、New Worker form rendering/submit-path test がない。
+
+Non-blocking follow-ups:
+- manual Worker launch の `display_name` は optional と記録されているが backend/UI は non-empty を要求している。空なら default label derivation を検討。
+- Browser-facing request structs に `deny_unknown_fields` を付けると “only these fields” boundary が fail closed になる。
+- `nix build .#yoi --no-link` は dependency/resource packaging 変更ではないため未実行だが、acceptance evidence としては未検証。
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-02T18:11:11Z -->
+
+## Implementation report
+
+Review-fix implementation report:
+
+- Coder Pod completed requested changes and committed follow-up `47ed0ff8 fix: harden runtime and worker launch controls` on branch `work/00001KWHHRTM9-00001KWHEM8YJ`.
+- Worktree status was clean after commit.
+- Fix changed `crates/workspace-server/src/server.rs`, `web/workspace/deno.json`, `WorkersNavSection.svelte`, and added `worker-launch.ts` / `worker-launch.test.ts`.
+- Reported fixes include lightweight runtime compatibility probes, fixed sanitized remote-test diagnostics without endpoint/path leakage, preservation of typed unsupported worker-create diagnostics, `deny_unknown_fields` on Browser-facing request structs, empty display-name default derivation, backend route/acceptance tests, and web worker-launch model tests.
+- Orchestrator reran validation:
+  - `git diff --check`: pass
+  - `cargo test -p yoi-workspace-server`: pass（55 lib tests + 2 main tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task test`: pass（13 tests）
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+- `nix build .#yoi --no-link` は dependency/resource packaging 変更ではないため未実行。
+- Requesting follow-up external review against `f2fead7e..47ed0ff8` and full combined implementation.
+
+---
+
+<!-- event: review author: reviewer at: 2026-07-02T18:20:10Z status: approve -->
+
+## Review: approve
+
+External follow-up review result: approve
+
+Read-only follow-up review completed for both Tickets and fix commit `47ed0ff8` on top of `f2fead7e`.
+
+Evidence reviewed:
+- Ticket records for `00001KWHHRTM9` and `00001KWHEM8YJ`.
+- Fix diff `f2fead7e..47ed0ff8`.
+- Relevant backend/web files including `crates/workspace-server/src/server.rs`, `config.rs`, `hosts.rs`, `worker-launch.ts`, `WorkersNavSection.svelte`, related tests/settings model files.
+- Orchestrator-reported validation pass for `git diff --check`, `cargo test -p yoi-workspace-server`, `cargo check -p yoi`, `cd web/workspace && deno task test`, and `cd web/workspace && deno task check`.
+
+Reviewer findings:
+- Previous blocker 1 resolved: runtime connection test now performs lightweight negotiation/probing for Browser-relevant operations and represents unsupported/not-observed operations with typed diagnostics and `unknown`/`unsupported` capability entries instead of blanket compatibility.
+- Previous blocker 2 resolved: Browser-facing remote-test diagnostics omit raw endpoints/config paths/socket/session/store paths and use typed/sanitized diagnostics; tests assert projected responses do not contain the endpoint/runtime address.
+- Previous blocker 3 resolved: `/api/workers` keeps product-level request shape and preserves runtime rejection diagnostics while adding typed `workspace_worker_create_not_accepted` diagnostic.
+- Previous blocker 4 resolved: focused backend tests cover runtime connection test sanitization/compatibility, worker creation payload rejection, diagnostic preservation; web tests cover launch payload shaping/error handling.
+- Persisted config, live registry summaries, and test observations remain separated.
+- Browser-facing settings responses expose safe summaries rather than raw authority-bearing backend fields.
+- New Worker UI consumes `/api/workers/options` candidates and submits only product-level `/api/workers` payload.
+
+Non-blocking follow-up:
+- UI could later render backend diagnostic codes/details more richly on Worker launch failure, but current behavior is sanitized and merge-ready.
+
+No merge-blocking issues found.
+
+---
