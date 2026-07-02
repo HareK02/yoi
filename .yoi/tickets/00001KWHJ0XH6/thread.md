@@ -168,3 +168,21 @@ Note:
 - Running `deno task test` before SvelteKit sync failed due stale/generated tsconfig state; after `svelte-kit sync`, the repository task succeeded. `deno task check` also runs sync.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-07-02T14:36:39Z -->
+
+## Implementation report
+
+Review routing diagnostic:
+
+Attempted to spawn Reviewer Worker `yoi-reviewer-00001KWHJ0XH6-settings`, but `SpawnPod` failed before child startup with the same runtime executable availability issue:
+
+```text
+failed to spawn `/home/hare/.cargo/bin/yoi (deleted) pod`: No such file or directory (os error 2)
+```
+
+Because role Pod spawning is unavailable in the current process and the change is narrow web-only, Orchestrator will perform a focused manual review plus validation before merge. This is recorded as an operational deviation from the normal sibling Reviewer path.
+
+`StopPod` remains unused per user instruction.
+
+---
