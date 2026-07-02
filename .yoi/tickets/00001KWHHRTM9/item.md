@@ -1,8 +1,8 @@
 ---
 title: 'Workspace Backend Runtime接続の管理画面と永続configを追加する'
-state: 'planning'
+state: 'ready'
 created_at: '2026-07-02T13:54:52Z'
-updated_at: '2026-07-02T14:55:21Z'
+updated_at: '2026-07-02T16:25:43Z'
 assignee: null
 ---
 
