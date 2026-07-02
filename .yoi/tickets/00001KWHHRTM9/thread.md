@@ -36,3 +36,20 @@ Decision:
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-07-02T14:55:21Z -->
+
+## Decision
+
+Runtime connection management に negotiation / compatibility check を含める方針へ更新した。
+
+Decision:
+- 現状は明示的な negotiation / handshake は無く、`GET /v1/runtime` が事実上の疎通確認になっているだけ。
+- Runtime connection `test` は単なる ping ではなく lightweight negotiation / compatibility check として扱う。
+- v0 check は `GET /v1/runtime` の parse、observed runtime id/display/status/capabilities、worker list/detail、event websocket construction、spawn/input/config-bundle support などを確認する。
+- 現行 API に protocol version が無い場合は fake version を作らず、`v1 runtime endpoint responded` のような compatibility basis として表現する。
+- negotiation result / observed capabilities / health result / checked_at / diagnostics は persisted config に保存しない。必要になった場合は Backend DB の observation/cache として扱う。
+- persisted config、RuntimeRegistry live state、negotiation result を混同しない。
+
+
+---
