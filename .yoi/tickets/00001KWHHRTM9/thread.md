@@ -79,3 +79,100 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-07-02T16:59:57Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- Ticket は Runtime connection settings API / `.yoi/workspace-backend.local.toml` 永続化 / Settings UI / sanitized diagnostics / restart_required の v0 境界を具体化しており、observable な acceptance criteria と validation がある。
+- 先行 Settings shell Ticket `00001KWHJ0XH6` は closed を確認済み。
+- typed relation blocker は 0 件、OrchestrationPlan は human gate の waiting note のみで、ユーザーから「2つとも消化して」と明示 follow-up があったため human gate は解除された。
+- Manual Coding Worker Ticket `00001KWHEM8YJ` と UI/API surface が近く、並列別 worktree では衝突リスクが高いので、同一 implementation worktree/branch で Runtime connection 管理を先に実装し、続けて manual Worker 作成導線を実装する。
+
+Evidence checked:
+- Ticket body / thread / artifacts。
+- `TicketRelationQuery(00001KWHHRTM9)` は 0 件。
+- `TicketOrchestrationPlanQuery(00001KWHHRTM9)` は prior human-gate waiting note のみ。
+- `TicketShow(00001KWHJ0XH6)` は closed。
+- queued Ticket 一覧では `00001KWHEM8YJ` も queued、ready/inprogress は 0 件。
+- workspace/orchestration git state と worktree 一覧、visible Pods、TicketDoctor（0 errors / 既存 warning のみ）。
+- Bounded code map: `crates/workspace-server` の workspace backend / runtime registry / config file 周辺、`web/workspace/src/lib/workspace-settings/SettingsPage.svelte`、`web/workspace/src/routes/settings/+page.svelte`、既存 `/api/workers` / `/api/runtimes/{runtime_id}/workers` projection、`WorkersNavSection.svelte`。
+
+IntentPacket:
+
+Intent:
+- Workspace Browser の Settings / Runtime Connections で embedded Runtime 表示、remote Runtime connection の list/add/delete/test negotiation、`.yoi/workspace-backend.local.toml` 永続化、restart_required diagnostic を提供する。
+- `00001KWHEM8YJ` が使う Runtime candidate projection の基盤を作る。
+
+Binding decisions / invariants:
+- Runtime が Backend に接続するのではなく、Backend が configured Runtime source を `RuntimeRegistry` に登録する現行構造を前提にする。
+- embedded Runtime は built-in として表示し、config 管理対象や削除対象にしない。
+- remote Runtime connection は既存 `[[runtimes.remote]]` schema に保存する。
+- v0 は config persistence 優先で、config 更新後は `restart_required = true`。live register/unregister は対象外。
+- raw token 値、secret、socket/session/store path、Runtime event cursor、live handle、config file path は UI/API response に出さない。
+- negotiation/test result、observed capabilities、health result、checked_at は local config に保存しない。
+- protocol version が無ければ fake version を作らず、compatibility basis として表現する。
+
+Requirements / acceptance criteria:
+- Runtime Connections 管理画面が Settings shell 内にある。
+- embedded Runtime は built-in / delete不可として表示される。
+- remote connection を add/delete でき、config の `[[runtimes.remote]]` が read-modify-write される。
+- test negotiation は `GET /v1/runtime` parse と Browser 必要操作に対する compatibility/sanitized diagnostics を返す。
+- duplicate id / invalid endpoint / incompatible runtime / embedded delete attempt は typed diagnostic。
+- request/response/config に raw token 値や internal paths を含めない。
+- focused backend/UI tests を追加し、指定 validation を可能な範囲で実行する。
+
+Implementation latitude:
+- TOML comments/format preservation は v0 で typed serialize により失われてもよい。ただし implementation report/docs/test で明記する。
+- POST 保存前に test を必須にするか、保存は許して test diagnostic を別扱いにするかは、Ticket の v0 境界内で選んでよい。
+- API response shape / Svelte component分割 / test helper構成は既存 style に合わせて選んでよい。
+
+Escalate if:
+- secret store / raw token input / live RuntimeRegistry unregister / remote workspace provisioning / protocol version追加を必須にしないと満たせない場合。
+- existing config schema を壊す必要がある場合。
+- Browser-facing API に raw path/secret/runtime internal location を出す誘惑が出た場合。
+
+Validation:
+- `cd web/workspace && deno task test`
+- `cd web/workspace && deno task check`
+- `cargo test -p yoi-workspace-server`
+- `cargo check -p yoi`
+- `git diff --check`
+- `nix build .#yoi --no-link` は時間/依存変更の重さを見て実行、未実行なら理由を report。
+
+Current code map:
+- Settings UI: `web/workspace/src/lib/workspace-settings/SettingsPage.svelte`, `web/workspace/src/routes/settings/+page.svelte`。
+- Worker/sidebar UI: `web/workspace/src/lib/workspace-sidebar/WorkersNavSection.svelte`, console route under `web/workspace/src/routes/runtimes/[runtimeId]/workers/[workerId]/console/`。
+- Backend/runtime/config areas: `crates/workspace-server`, existing `/api/workers`, `/api/runtimes/{runtime_id}/workers`, `WorkspaceBackendConfigFile`, `ServerConfig.remote_runtime_sources`, `RuntimeRegistry`, `EmbeddedWorkerRuntime`。
+
+Critical risks / reviewer focus:
+- persisted config、live registry state、test/negotiation observation を混同していないか。
+- Browser-facing API に secrets/internal paths/runtime store/socket/session/config file path が漏れていないか。
+- embedded delete が fail closed か。
+- restart_required semantics が UI/API で明確か。
+- `00001KWHEM8YJ` と同一 worktreeで実装し、runtime candidates の shared contract が破綻していないか。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-07-02T17:01:01Z from: queued to: inprogress reason: routing_acceptance_implementation_ready field: state -->
+
+## State changed
+
+Queued acceptance recorded after explicit user follow-up 「2つとも消化して」。
+
+Checked context:
+- Ticket body / thread / artifacts。
+- `TicketRelationQuery(00001KWHHRTM9)`: blocking relation 0 件。
+- `TicketOrchestrationPlanQuery(00001KWHHRTM9)`: prior human-gate waiting note を確認し、今回 accepted_plan / before ordering を記録済み。
+- `00001KWHJ0XH6` は closed。
+- workspace/worktree/visible Pod/TicketDoctor/code-map の bounded check。
+
+Acceptance basis:
+- concrete missing decision / information は残っていない。
+- `00001KWHEM8YJ` と surface が重なるため、同一 implementation worktree でこの Ticket を先に実装する。
+- side effect はこの `queued -> inprogress` acceptance 後に開始する。
+
+---
