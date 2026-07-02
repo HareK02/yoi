@@ -126,3 +126,45 @@ Operational response:
 - `StopPod` remains unused per user instruction.
 
 ---
+
+<!-- event: implementation_report author: yoi-orchestrator at: 2026-07-02T14:36:11Z -->
+
+## Implementation report
+
+Implementation report:
+
+Due to `SpawnPod` failure caused by the current executable path being deleted, Orchestrator implemented the narrow web-only change directly in the child worktree.
+
+Implementation commit:
+- `c0c6880b1a00ec367910267a3d2a0595839b3d5b feat: add settings admin shell`
+
+Changed files:
+- `web/workspace/src/routes/settings/+page.svelte`
+- `web/workspace/src/lib/workspace-settings/SettingsPage.svelte`
+- `web/workspace/src/lib/workspace-settings/model.ts`
+- `web/workspace/src/lib/workspace-settings/model.test.ts`
+- `web/workspace/src/lib/workspace-sidebar/WorkspaceSidebar.svelte`
+- `web/workspace/src/app.css`
+- `web/workspace/deno.json`
+
+Implementation summary:
+- Added `/settings` route and Settings / Admin page shell.
+- Added sidebar/header Settings navigation entry while preserving Worker Console/sidebar routes.
+- Added section navigation for Runtime Connections, Backend Config, and Workspace Identity.
+- Runtime Connections and Backend Config are explicit placeholders; Workspace Identity is read-only.
+- Added visible authority notice: no browser user/role/permission/multi-user authorization model exists and this shell does not create an admin role.
+- Added sanitized diagnostic / restart-required / read-only-until-typed-APIs patterns.
+- The page reads `/api/workspace` for opaque workspace id/display name/record authority context only; it does not expose raw filesystem path, secret, token, socket, runtime store path, or mutation control.
+- No Runtime connection mutation, settings mutation API, backend config editor, secret UI, or permission UI was added.
+
+Validation:
+- `deno run -A npm:@sveltejs/kit@2.49.4 sync`: success
+- `cd web/workspace && deno task test`: success (`10 passed`)
+- `cd web/workspace && deno task check`: success
+- `cd web/workspace && deno task build`: success
+- `git diff --check`: success
+
+Note:
+- Running `deno task test` before SvelteKit sync failed due stale/generated tsconfig state; after `svelte-kit sync`, the repository task succeeded. `deno task check` also runs sync.
+
+---
