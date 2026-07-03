@@ -65,4 +65,6 @@ pub struct RuntimeSummary {
     pub cancelled_worker_count: usize,
     pub diagnostic_count: usize,
     pub limits: RuntimeLimits,
+    #[serde(default)]
+    pub worker_creation_available: bool,
 }

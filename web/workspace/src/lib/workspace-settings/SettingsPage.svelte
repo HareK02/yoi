@@ -184,6 +184,13 @@
     }
   }
 
+  function capabilityOperations(test: RemoteRuntimeTestResponse, state: "available" | "unknown" | "incompatible"): string[] {
+    const suffix = `:${state}`;
+    return test.capabilities
+      .filter((capability) => capability.endsWith(suffix))
+      .map((capability) => capability.slice(0, -suffix.length));
+  }
+
   function applyRuntimeMutation(data: RuntimeConnectionMutationResponse) {
     runtimeSettings = runtimeSettings
       ? { ...runtimeSettings, remotes: data.remotes, diagnostics: data.diagnostics }
@@ -335,10 +342,18 @@
                 </div>
                 {#if tests[remote.runtime_id]}
                   {@const test = tests[remote.runtime_id]}
+                  {@const available = capabilityOperations(test, "available")}
+                  {@const unchecked = capabilityOperations(test, "unknown")}
                   <div class="settings-test-result">
                     <strong>Test: {test.state}</strong>
                     <span>{test.health_result} · {test.checked_at}</span>
                     <p>{test.compatibility_basis}</p>
+                    {#if available.length > 0}
+                      <p class="settings-test-verified">Verified areas: {available.join(', ')}</p>
+                    {/if}
+                    {#if unchecked.length > 0}
+                      <p class="settings-test-verified">Unchecked warning areas: {unchecked.join(', ')}</p>
+                    {/if}
                     {@render DiagnosticsList({ diagnostics: test.diagnostics })}
                   </div>
                 {/if}

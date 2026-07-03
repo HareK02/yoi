@@ -1,11 +1,10 @@
 //! Embedded Runtime domain API for Worker management.
 //!
-//! `worker-runtime` keeps its core independent from HTTP/WebSocket servers,
-//! provider execution, and the existing Worker host.  Filesystem persistence is
-//! available only through the optional `fs-store` feature, and the minimal REST
-//! process adapter is available only through the optional `http-server` feature.
-//! The crate defines the in-process Runtime authority surface that higher layers
-//! can later adapt into registries or backend APIs.
+//! `worker-runtime` owns the Runtime authority surface and, for the standalone
+//! process, wires that Runtime to the real Worker host. Filesystem persistence is
+//! available only through the optional `fs-store` feature, and the REST/WebSocket
+//! server is available only through the optional `http-server` / `ws-server`
+//! features.
 
 pub mod catalog;
 pub mod config_bundle;
@@ -21,6 +20,7 @@ pub mod interaction;
 pub mod management;
 pub mod observation;
 mod runtime;
+pub mod worker_backend;
 
 #[cfg(feature = "fs-store")]
 pub use fs_store::{FsRuntimeStore, FsRuntimeStoreOptions};

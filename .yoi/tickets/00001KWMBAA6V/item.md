@@ -1,9 +1,11 @@
 ---
 title: 'Live-reload Runtime connection registry changes'
-state: 'planning'
+state: 'done'
 created_at: '2026-07-03T15:59:48Z'
-updated_at: '2026-07-03T15:59:48Z'
+updated_at: '2026-07-03T19:47:23Z'
 assignee: null
+queued_by: 'yoi ticket'
+queued_at: '2026-07-03T16:52:35Z'
 ---
 
 ## 背景

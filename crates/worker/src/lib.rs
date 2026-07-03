@@ -10,8 +10,6 @@ pub(crate) mod in_flight;
 pub mod ipc;
 pub mod prompt;
 pub mod runtime;
-#[cfg(feature = "runtime-adapter")]
-pub mod runtime_adapter;
 pub mod segment_log_sink;
 pub mod shared_state;
 mod shutdown_after_idle;

@@ -4,29 +4,37 @@ description = "Embedded memory-backed Runtime API for Worker management"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+autobins = false
 
 [[bin]]
 name = "worker-runtime-rest-server"
 path = "src/main.rs"
-required-features = ["http-server"]
+required-features = ["ws-server", "fs-store"]
 
 [features]
 default = []
 fs-store = ["dep:serde_json"]
-http-server = ["dep:axum", "dep:serde_json", "dep:tokio", "dep:tower"]
-ws-server = ["http-server", "axum/ws", "dep:futures", "dep:protocol", "tokio/sync"]
+http-server = ["dep:axum", "dep:serde_json", "dep:tower"]
+ws-server = ["http-server", "axum/ws", "dep:futures", "tokio/sync"]
 
 [dependencies]
+async-trait.workspace = true
 axum = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
-protocol = { workspace = true, optional = true }
+manifest.workspace = true
+protocol.workspace = true
 serde = { workspace = true, features = ["derive"] }
+session-store.workspace = true
 sha2.workspace = true
 serde_json = { workspace = true, optional = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["net", "rt"], optional = true }
+tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
 tower = { workspace = true, features = ["util"], optional = true }
+worker.workspace = true
 
 [dev-dependencies]
+futures.workspace = true
+llm-engine.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-tungstenite.workspace = true

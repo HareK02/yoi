@@ -12,11 +12,9 @@ use crate::catalog::{
 };
 use crate::config_bundle::{ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary};
 use crate::error::RuntimeError;
-#[cfg(feature = "fs-store")]
-use crate::fs_store::FsRuntimeStoreOptions;
 use crate::identity::{RuntimeId, WorkerId, WorkerRef};
 use crate::interaction::{WorkerInput, WorkerInteractionAck};
-use crate::management::{RuntimeLimits, RuntimeOptions, RuntimeSummary};
+use crate::management::{RuntimeLimits, RuntimeSummary};
 #[cfg(feature = "ws-server")]
 use crate::observation::WorkerObservationCursor;
 use crate::observation::{TranscriptProjection, TranscriptQuery};
@@ -39,6 +37,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+
+const DEFAULT_RUNTIME_HTTP_PORT: u16 = 38800;
+
+fn default_runtime_http_bind_addr() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], DEFAULT_RUNTIME_HTTP_PORT))
+}
 
 /// v0 Runtime REST server configuration.
 #[derive(Clone, PartialEq, Eq)]
@@ -63,7 +67,7 @@ pub struct RuntimeHttpServerConfig {
 impl Default for RuntimeHttpServerConfig {
     fn default() -> Self {
         Self {
-            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            bind_addr: default_runtime_http_bind_addr(),
             runtime_id: None,
             display_name: None,
             limits: RuntimeLimits::default(),
@@ -100,48 +104,6 @@ pub enum RuntimeHttpStoreSelection {
     Fs {
         root: PathBuf,
     },
-}
-
-/// Bound REST server instance.
-pub struct RuntimeHttpServer {
-    runtime: Runtime,
-    local_token: Option<String>,
-    listener: TcpListener,
-}
-
-impl RuntimeHttpServer {
-    /// Build a Runtime from config and bind the configured address.
-    pub async fn bind(config: RuntimeHttpServerConfig) -> Result<Self, RuntimeHttpServerError> {
-        let runtime = runtime_from_config(&config)?;
-        let listener = TcpListener::bind(config.bind_addr).await?;
-        Ok(Self {
-            runtime,
-            local_token: config.local_token,
-            listener,
-        })
-    }
-
-    /// Address actually bound by the server.
-    pub fn local_addr(&self) -> Result<SocketAddr, RuntimeHttpServerError> {
-        Ok(self.listener.local_addr()?)
-    }
-
-    /// Runtime owned by this server.
-    pub fn runtime(&self) -> Runtime {
-        self.runtime.clone()
-    }
-
-    /// Serve requests until the axum server is stopped or returns an error.
-    pub async fn serve(self) -> Result<(), RuntimeHttpServerError> {
-        serve_runtime_http(self.runtime, self.listener, self.local_token).await
-    }
-}
-
-/// Convenience entry point: bind and serve a configured Runtime REST process API.
-pub async fn serve_configured_runtime_http(
-    config: RuntimeHttpServerConfig,
-) -> Result<(), RuntimeHttpServerError> {
-    RuntimeHttpServer::bind(config).await?.serve().await
 }
 
 /// Serve an existing Runtime on a pre-bound listener.
@@ -192,27 +154,6 @@ pub fn runtime_http_router(runtime: Runtime, local_token: Option<String>) -> Rou
     router
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, require_local_token))
-}
-
-fn runtime_from_config(
-    config: &RuntimeHttpServerConfig,
-) -> Result<Runtime, RuntimeHttpServerError> {
-    match &config.store {
-        RuntimeHttpStoreSelection::Memory => Ok(Runtime::with_options(RuntimeOptions {
-            runtime_id: config.runtime_id.clone(),
-            display_name: config.display_name.clone(),
-            limits: config.limits.clone(),
-        })),
-        #[cfg(feature = "fs-store")]
-        RuntimeHttpStoreSelection::Fs { root } => {
-            Ok(Runtime::with_fs_store(FsRuntimeStoreOptions {
-                root: root.clone(),
-                runtime_id: config.runtime_id.clone(),
-                display_name: config.display_name.clone(),
-                limits: config.limits.clone(),
-            })?)
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -1134,7 +1075,7 @@ mod ws_tests {
         WorkerExecutionResult, WorkerExecutionRunState, WorkerExecutionSpawnRequest,
         WorkerExecutionSpawnResult,
     };
-    use crate::interaction::WorkerInput;
+    use crate::management::RuntimeOptions;
     use futures::{SinkExt, StreamExt};
     use std::sync::Arc;
     use tokio_tungstenite::connect_async;

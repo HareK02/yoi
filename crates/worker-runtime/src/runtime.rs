@@ -161,6 +161,7 @@ impl Runtime {
             cancelled_worker_count,
             diagnostic_count: state.diagnostics.len(),
             limits: state.limits.clone(),
+            worker_creation_available: state.execution_backend.is_some(),
         })
     }
 

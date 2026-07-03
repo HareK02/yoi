@@ -12,20 +12,20 @@ use chrono::{SecondsFormat, Utc};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use worker::runtime_adapter::WorkerRuntimeExecutionBackend;
+use worker_runtime::worker_backend::WorkerRuntimeExecutionBackend;
 
 use crate::companion::{
     CompanionCancelRequest, CompanionConsole, CompanionMessageRequest, CompanionMessageResponse,
     CompanionStatusResponse, CompanionTranscriptProjection,
 };
-use crate::config::{RemoteRuntimeConfigFile, WorkspaceBackendConfigFile};
+use crate::config::{RemoteRuntimeConfigFile, WorkspaceBackendConfigFile, resolve_remote_runtime};
 use crate::hosts::{
     ConfigBundleCheckResult, ConfigBundleSyncResult, DiagnosticSeverity, EmbeddedWorkerRuntime,
     HostSummary, RemoteRuntimeConfig, RemoteWorkerRuntime, RuntimeDiagnostic, RuntimeRegistry,
-    RuntimeSummary, WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest,
-    WorkerLifecycleResult, WorkerOperationState, WorkerSpawnAcceptanceRequirement,
-    WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult, WorkerSummary,
-    WorkerTranscriptProjection,
+    RuntimeRegistryUnregisterResult, RuntimeSummary, WorkerInputRequest, WorkerInputResult,
+    WorkerLifecycleRequest, WorkerLifecycleResult, WorkerOperationState,
+    WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult,
+    WorkerSummary, WorkerTranscriptProjection,
 };
 use crate::identity::WorkspaceIdentity;
 use crate::observation::{
@@ -171,7 +171,7 @@ impl WorkspaceApi {
                 updated_at: config.workspace_created_at.clone(),
             })
             .await?;
-        let mut runtime = RuntimeRegistry::for_workspace(
+        let runtime = RuntimeRegistry::for_workspace(
             EmbeddedWorkerRuntime::new_fs_store_with_execution_backend(
                 config.workspace_id.clone(),
                 config.embedded_runtime_store_root.clone(),
@@ -782,7 +782,7 @@ async fn add_remote_runtime_connection(
             "a remote Runtime connection with that id is already configured",
         ));
     }
-    local_config.runtimes.remote.push(RemoteRuntimeConfigFile {
+    let remote_config = RemoteRuntimeConfigFile {
         id,
         endpoint: request.endpoint.trim().to_string(),
         display_name: request
@@ -792,9 +792,30 @@ async fn add_remote_runtime_connection(
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned),
         token_ref: None,
-    });
+    };
+    let active_config = remote_runtime_config_from_file(&remote_config).map_err(|diagnostic| {
+        ApiError::with_diagnostics(
+            Error::RuntimeOperationFailed {
+                runtime_id: remote_config.id.clone(),
+                code: diagnostic.code.clone(),
+                message: diagnostic.message.clone(),
+            },
+            vec![diagnostic],
+        )
+    })?;
+    let active_runtime = RemoteWorkerRuntime::new(active_config).map_err(|err| err.into_error())?;
+    local_config.runtimes.remote.push(remote_config);
     write_workspace_backend_config_for_settings(&api, &local_config)?;
-    let mut response = runtime_connection_mutation_response(&api, &local_config);
+    api.runtime.register_or_replace(active_runtime);
+    let mut response = runtime_connection_mutation_response(
+        &api,
+        &local_config,
+        vec![settings_diagnostic(
+            "runtime_registry_applied",
+            DiagnosticSeverity::Info,
+            "Remote Runtime config was persisted and applied to the active Runtime registry without restarting the Workspace backend.",
+        )],
+    );
     response.diagnostics.push(settings_diagnostic(
         "workspace_backend_config_rewritten",
         DiagnosticSeverity::Info,
@@ -822,8 +843,44 @@ async fn delete_remote_runtime_connection(
     if before == local_config.runtimes.remote.len() {
         return Err(Error::UnknownRuntime(runtime_id).into());
     }
+    match api
+        .runtime
+        .unregister_if_idle(&runtime_id, api.config.max_records.min(200))
+        .map_err(|err| err.into_error())?
+    {
+        RuntimeRegistryUnregisterResult::Removed | RuntimeRegistryUnregisterResult::NotFound => {}
+        RuntimeRegistryUnregisterResult::BlockedByWorkers {
+            worker_count,
+            diagnostics,
+        } => {
+            let mut diagnostics = diagnostics;
+            diagnostics.push(settings_diagnostic(
+                "remote_runtime_delete_blocked",
+                DiagnosticSeverity::Error,
+                format!(
+                    "Remote Runtime '{runtime_id}' has {worker_count} active worker(s); stop or move them before deleting the connection."
+                ),
+            ));
+            return Err(ApiError::with_diagnostics(
+                Error::RuntimeOperationFailed {
+                    runtime_id,
+                    code: "remote_runtime_delete_blocked".to_string(),
+                    message: "Remote Runtime connection has active workers".to_string(),
+                },
+                diagnostics,
+            ));
+        }
+    }
     write_workspace_backend_config_for_settings(&api, &local_config)?;
-    let mut response = runtime_connection_mutation_response(&api, &local_config);
+    let mut response = runtime_connection_mutation_response(
+        &api,
+        &local_config,
+        vec![settings_diagnostic(
+            "runtime_registry_applied",
+            DiagnosticSeverity::Info,
+            "Remote Runtime config was removed from persisted config and the active Runtime registry without restarting the Workspace backend.",
+        )],
+    );
     response.diagnostics.push(settings_diagnostic(
         "workspace_backend_config_rewritten",
         DiagnosticSeverity::Info,
@@ -1277,16 +1334,13 @@ fn runtime_connection_settings_response(
 fn runtime_connection_mutation_response(
     api: &WorkspaceApi,
     local_config: &WorkspaceBackendConfigFile,
+    diagnostics: Vec<RuntimeDiagnostic>,
 ) -> RuntimeConnectionMutationResponse {
     RuntimeConnectionMutationResponse {
         workspace_id: api.config.workspace_id.clone(),
-        restart_required: true,
-        remotes: remote_runtime_connection_summaries(api, local_config, true),
-        diagnostics: vec![settings_diagnostic(
-            "runtime_registry_restart_required",
-            DiagnosticSeverity::Warning,
-            "Runtime connection config changed; restart the Workspace backend for the live Runtime registry to use the new config.",
-        )],
+        restart_required: false,
+        remotes: remote_runtime_connection_summaries(api, local_config, false),
+        diagnostics,
     }
 }
 
@@ -1443,6 +1497,18 @@ fn validate_public_runtime_id(runtime_id: &str) -> ApiResult<()> {
     Ok(())
 }
 
+fn remote_runtime_config_from_file(
+    remote: &RemoteRuntimeConfigFile,
+) -> std::result::Result<RemoteRuntimeConfig, RuntimeDiagnostic> {
+    resolve_remote_runtime(remote).map_err(|err| {
+        settings_diagnostic(
+            "remote_runtime_apply_failed",
+            DiagnosticSeverity::Error,
+            err.to_string(),
+        )
+    })
+}
+
 async fn test_remote_runtime_config(
     api: &WorkspaceApi,
     remote: &RemoteRuntimeConfigFile,
@@ -1529,7 +1595,10 @@ async fn test_remote_runtime_config(
             );
         }
     };
-    observation.available("runtime.summary", "Runtime summary was readable.");
+    observation.available(
+        "runtime.summary",
+        "Connected: /v1/runtime responded with a recognized worker-runtime summary.",
+    );
 
     let workers_url = match remote_probe_url(remote, "/v1/workers") {
         Ok(url) => url,
@@ -1544,7 +1613,10 @@ async fn test_remote_runtime_config(
         match probe_remote_json(&client, workers_url, "workers.list", "Worker list").await {
             Ok(payload) => match serde_json::from_value::<RuntimeHttpWorkersResponse>(payload) {
                 Ok(workers) => {
-                    observation.available("workers.list", "Worker list was readable.");
+                    observation.available(
+                        "workers.list",
+                        "Verified: /v1/workers responded with a recognized worker list.",
+                    );
                     Some(workers)
                 }
                 Err(_) => {
@@ -1574,7 +1646,10 @@ async fn test_remote_runtime_config(
         match remote_probe_url(remote, &path) {
             Ok(url) => match probe_remote_json(&client, url, "workers.detail", "Worker detail").await {
                 Ok(payload) => match serde_json::from_value::<RuntimeHttpWorkerResponse>(payload) {
-                    Ok(_) => observation.available("workers.detail", "Worker detail was readable."),
+                    Ok(_) => observation.available(
+                        "workers.detail",
+                        "Verified: worker detail responded for an existing worker reported by the remote Runtime.",
+                    ),
                     Err(_) => observation.incompatible(
                         "workers.detail",
                         settings_diagnostic(
@@ -1591,13 +1666,13 @@ async fn test_remote_runtime_config(
     } else {
         observation.unknown(
             "workers.detail",
-            "Worker detail compatibility could not be proven because the Runtime reported no workers during the lightweight probe.",
+            "No connection problem found. Worker detail was not checked because the remote Runtime reported no workers during the lightweight probe.",
         );
     }
 
     observation.available(
         "workers.events_ws.construct",
-        "Worker event websocket URL can be constructed from the configured HTTP(S) Runtime endpoint, but no websocket connection was opened during this lightweight test.",
+        "Verified: worker event websocket URL can be constructed from the configured HTTP(S) Runtime endpoint. The lightweight test does not open a websocket stream.",
     );
 
     let bundles_url = match remote_probe_url(remote, "/v1/config-bundles") {
@@ -1621,8 +1696,10 @@ async fn test_remote_runtime_config(
             Ok(payload) => {
                 match serde_json::from_value::<RuntimeHttpConfigBundlesResponse>(payload) {
                     Ok(bundles) => {
-                        observation
-                            .available("config_bundles.list", "Config-bundle list was readable.");
+                        observation.available(
+                            "config_bundles.list",
+                            "Verified: /v1/config-bundles responded with a recognized config-bundle list.",
+                        );
                         Some(bundles)
                     }
                     Err(_) => {
@@ -1665,7 +1742,7 @@ async fn test_remote_runtime_config(
                     {
                         Ok(_) => observation.available(
                             "config_bundles.availability",
-                            "Config-bundle availability was readable for an advertised bundle.",
+                            "Verified: config-bundle availability was confirmed for an advertised bundle.",
                         ),
                         Err(_) => observation.incompatible(
                             "config_bundles.availability",
@@ -1686,21 +1763,32 @@ async fn test_remote_runtime_config(
     } else {
         observation.unknown(
             "config_bundles.availability",
-            "Config-bundle availability compatibility could not be proven because the Runtime advertised no bundles during the lightweight probe.",
+            "No connection problem found. Config-bundle availability was not checked because the remote Runtime advertised no bundles during the lightweight probe.",
         );
     }
 
-    observation.unknown(
-        "workers.spawn",
-        "Worker spawn compatibility was not proven because the lightweight test does not create remote workers as a side effect.",
-    );
+    if summary.runtime.worker_creation_available {
+        observation.available(
+            "workers.spawn",
+            "Verified: /v1/runtime reports worker creation is enabled by a Runtime execution backend. The lightweight test does not create a worker.",
+        );
+    } else {
+        observation.incompatible(
+            "workers.spawn",
+            settings_diagnostic(
+                "remote_runtime_worker_creation_unavailable",
+                DiagnosticSeverity::Error,
+                "Connected to the Runtime, but worker creation is unavailable because this Runtime process has no execution backend attached.",
+            ),
+        );
+    }
     observation.unknown(
         "workers.input_dispatch",
-        "Worker input dispatch compatibility was not proven because the lightweight test does not send model-visible input as a side effect.",
+        "No connection problem found. Worker input dispatch was not checked because this lightweight test does not send model-visible input as a side effect.",
     );
     observation.unknown(
         "config_bundles.sync",
-        "Config-bundle sync compatibility was not proven because the lightweight test does not upload bundles as a side effect.",
+        "No connection problem found. Config-bundle sync was not checked because this lightweight test does not upload bundles as a side effect.",
     );
 
     RemoteRuntimeTestResponse {
@@ -1709,11 +1797,14 @@ async fn test_remote_runtime_config(
         checked_at,
         state: observation.state().to_string(),
         protocol_version,
-        compatibility_basis: "Observed worker-runtime HTTP endpoints for summary, worker listing/detail when available, event websocket URL construction, and config-bundle listing/availability when available; side-effecting spawn/input/sync operations are reported unknown unless the Runtime API proves them.".to_string(),
+        compatibility_basis: "Connected to /v1/runtime and verified non-side-effecting worker-runtime HTTP endpoints. No incompatible operation was found; warning items below are unproven optional or side-effecting checks, not connection failures.".to_string(),
         capabilities: observation.capabilities,
         health_result: format!(
-            "runtime_status={:?}; incompatible={}; unknown={}",
-            summary.runtime.status, observation.incompatible_count, observation.unknown_count
+            "connected=true; runtime_status={:?}; available={}; incompatible={}; warnings={}",
+            summary.runtime.status,
+            observation.available_count,
+            observation.incompatible_count,
+            observation.unknown_count
         ),
         diagnostics: observation.diagnostics,
     }
@@ -1747,13 +1838,20 @@ fn remote_runtime_test_failed(
 struct RuntimeCompatibilityObservation {
     capabilities: Vec<String>,
     diagnostics: Vec<RuntimeDiagnostic>,
+    available_count: usize,
     incompatible_count: usize,
     unknown_count: usize,
 }
 
 impl RuntimeCompatibilityObservation {
-    fn available(&mut self, operation: &str, _message: &str) {
+    fn available(&mut self, operation: &str, message: impl Into<String>) {
+        self.available_count += 1;
         self.capabilities.push(format!("{operation}:available"));
+        self.diagnostics.push(settings_diagnostic(
+            format!("{operation}.available"),
+            DiagnosticSeverity::Info,
+            message,
+        ));
     }
 
     fn unknown(&mut self, operation: &str, message: impl Into<String>) {
@@ -1775,8 +1873,6 @@ impl RuntimeCompatibilityObservation {
     fn state(&self) -> &'static str {
         if self.incompatible_count > 0 {
             "incompatible"
-        } else if self.unknown_count > 0 {
-            "unknown"
         } else {
             "compatible"
         }
@@ -2144,6 +2240,9 @@ impl IntoResponse for ApiError {
             Error::RuntimeOperationFailed { code, .. } if code == "remote_runtime_unsupported" => {
                 StatusCode::NOT_IMPLEMENTED
             }
+            Error::RuntimeOperationFailed { code, .. } if code.ends_with("_blocked") => {
+                StatusCode::CONFLICT
+            }
             Error::RuntimeOperationFailed { code, .. }
                 if code.starts_with("workspace_settings_")
                     || code.starts_with("invalid_")
@@ -2365,7 +2464,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_connection_settings_add_delete_persist_restart_required() {
+    async fn runtime_connection_settings_add_delete_apply_live_registry() {
         let dir = tempfile::tempdir().unwrap();
         let app = test_app(dir.path()).await;
 
@@ -2383,9 +2482,16 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(added["restart_required"], true);
+        assert_eq!(added["restart_required"], false);
         assert_eq!(added["remotes"][0]["runtime_id"], "team-runtime");
         assert_eq!(added["remotes"][0]["endpoint_configured"], true);
+        assert!(
+            added["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "runtime_registry_applied")
+        );
         let projected = serde_json::to_string(&added).unwrap();
         assert!(!projected.contains("runtime.example.invalid"));
 
@@ -2397,22 +2503,113 @@ mod tests {
             "https://runtime.example.invalid"
         );
 
+        let launch_options = get_json(app.clone(), "/api/workers/launch-options").await;
+        assert!(
+            launch_options["runtimes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|runtime| runtime["runtime_id"] == "team-runtime")
+        );
+
         let deleted = request_json(
-            app,
+            app.clone(),
             "DELETE",
             "/api/settings/runtime-connections/remotes/team-runtime",
             None,
             StatusCode::OK,
         )
         .await;
-        assert_eq!(deleted["restart_required"], true);
+        assert_eq!(deleted["restart_required"], false);
         assert_eq!(deleted["remotes"].as_array().unwrap().len(), 0);
+        let launch_options = get_json(app.clone(), "/api/workers/launch-options").await;
+        assert!(
+            !launch_options["runtimes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|runtime| runtime["runtime_id"] == "team-runtime")
+        );
         let persisted = WorkspaceBackendConfigFile::load_for_workspace(dir.path()).unwrap();
         assert!(persisted.runtimes.remote.is_empty());
     }
 
-    #[tokio::test]
-    async fn runtime_connection_test_reports_observed_and_unknown_capabilities_without_endpoint_leak()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_connection_delete_rejects_active_remote_workers() {
+        let (runtime, _worker_ref) = runtime_with_worker();
+        let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let runtime_addr = runtime_listener.local_addr().unwrap();
+        tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                worker_runtime::http_server::serve_runtime_http(runtime, runtime_listener, None)
+                    .await
+                    .unwrap()
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_app(dir.path()).await;
+        let added = post_json(
+            app.clone(),
+            "/api/settings/runtime-connections/remotes",
+            serde_json::json!({
+                "runtime_id": "busy-runtime",
+                "display_name": "Busy Runtime",
+                "endpoint": format!("http://{runtime_addr}")
+            }),
+        )
+        .await;
+        assert_eq!(added["restart_required"], false);
+        let created = post_json(
+            app.clone(),
+            "/api/workers",
+            serde_json::json!({
+                "runtime_id": "busy-runtime",
+                "display_name": "Remote Test Worker",
+                "profile": "runtime_default",
+                "initial_text": ""
+            }),
+        )
+        .await;
+        assert_eq!(created["runtime_id"], "busy-runtime");
+        let workers = get_json(app.clone(), "/api/workers").await;
+        assert!(
+            workers["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|worker| worker["runtime_id"] == "busy-runtime"),
+            "expected remote runtime to report at least one worker, got {workers}"
+        );
+
+        let response = request_json(
+            app,
+            "DELETE",
+            "/api/settings/runtime-connections/remotes/busy-runtime",
+            None,
+            StatusCode::CONFLICT,
+        )
+        .await;
+        assert!(
+            response["message"]
+                .as_str()
+                .unwrap()
+                .contains("remote_runtime_delete_blocked")
+        );
+        assert!(
+            response["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| { diagnostic["code"] == "remote_runtime_delete_blocked" })
+        );
+        let persisted = WorkspaceBackendConfigFile::load_for_workspace(dir.path()).unwrap();
+        assert_eq!(persisted.runtimes.remote.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_connection_test_reports_compatible_with_unknown_warnings_without_endpoint_leak()
      {
         let (runtime, _worker_ref) = runtime_with_worker();
         let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2449,7 +2646,7 @@ mod tests {
             serde_json::json!({}),
         )
         .await;
-        assert_eq!(response["state"], "unknown");
+        assert_eq!(response["state"], "compatible");
         let capabilities = response["capabilities"].as_array().unwrap();
         assert!(
             capabilities
@@ -2464,19 +2661,73 @@ mod tests {
         assert!(
             capabilities
                 .iter()
-                .any(|value| value == "workers.spawn:unknown")
+                .any(|value| value == "workers.spawn:available")
         );
         assert!(
             response["diagnostics"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|diagnostic| { diagnostic["code"] == "workers.spawn.unknown" })
+                .any(|diagnostic| { diagnostic["code"] == "workers.spawn.available" })
         );
         let projected = serde_json::to_string(&response).unwrap();
         assert!(!projected.contains(&endpoint));
         assert!(!projected.contains(&runtime_addr.to_string()));
         assert_eq!(response["protocol_version"], serde_json::Value::Null);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runtime_connection_test_marks_missing_execution_backend_incompatible() {
+        let runtime =
+            worker_runtime::Runtime::with_options(worker_runtime::RuntimeOptions::default());
+        let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let runtime_addr = runtime_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            worker_runtime::http_server::serve_runtime_http(runtime, runtime_listener, None)
+                .await
+                .unwrap()
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = format!("http://{runtime_addr}");
+        WorkspaceBackendConfigFile {
+            runtimes: crate::config::WorkspaceBackendRuntimesConfig {
+                remote: vec![RemoteRuntimeConfigFile {
+                    id: "control-only-runtime".to_string(),
+                    display_name: Some("Control-only Runtime".to_string()),
+                    endpoint,
+                    token_ref: None,
+                }],
+            },
+            ..WorkspaceBackendConfigFile::default()
+        }
+        .write_for_workspace(dir.path())
+        .unwrap();
+        let app = test_app(dir.path()).await;
+
+        let response = post_json(
+            app,
+            "/api/settings/runtime-connections/remotes/control-only-runtime/test",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(response["state"], "incompatible");
+        assert!(
+            response["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| { value == "workers.spawn:incompatible" })
+        );
+        assert!(
+            response["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic["code"] == "remote_runtime_worker_creation_unavailable"
+                })
+        );
     }
 
     #[tokio::test]

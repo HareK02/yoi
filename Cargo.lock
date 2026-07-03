@@ -5904,7 +5904,6 @@ dependencies = [
  "uuid",
  "wasmtime",
  "wat",
- "worker-runtime",
  "workflow",
  "yoi-plugin-pdk",
 ]
@@ -5913,16 +5912,22 @@ dependencies = [
 name = "worker-runtime"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "futures",
+ "llm-engine",
+ "manifest",
  "protocol",
  "serde",
  "serde_json",
+ "session-store",
  "sha2 0.11.0",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.29.0",
  "tower",
+ "worker",
 ]
 
 [[package]]

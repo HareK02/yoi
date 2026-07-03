@@ -6,7 +6,11 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 use worker_runtime::catalog::{
     ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerDetail as EmbeddedWorkerDetail,
     WorkerStatus as EmbeddedWorkerStatus,
@@ -44,6 +48,22 @@ const MAX_DIAGNOSTICS: usize = 16;
 const MAX_HOST_SCAN: usize = 256;
 const MAX_IDENTIFIER_LEN: usize = 120;
 const ID_DIGEST_HEX_LEN: usize = 16;
+
+fn run_blocking_http<T, F>(operation: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(operation)
+        }
+        Ok(_) => std::thread::spawn(operation)
+            .join()
+            .expect("blocking HTTP thread panicked"),
+        Err(_) => operation(),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeDiagnostic {
@@ -643,31 +663,95 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum RuntimeRegistryUnregisterResult {
+    Removed,
+    NotFound,
+    BlockedByWorkers {
+        worker_count: usize,
+        diagnostics: Vec<RuntimeDiagnostic>,
+    },
+}
+
 #[derive(Clone)]
 pub struct RuntimeRegistry {
-    runtimes: Vec<Arc<dyn WorkspaceWorkerRuntime>>,
+    runtimes: Arc<RwLock<Vec<Arc<dyn WorkspaceWorkerRuntime>>>>,
 }
 
 impl RuntimeRegistry {
     pub fn new(runtimes: Vec<Arc<dyn WorkspaceWorkerRuntime>>) -> Self {
-        Self { runtimes }
+        Self {
+            runtimes: Arc::new(RwLock::new(runtimes)),
+        }
     }
 
     pub fn for_workspace(embedded_runtime: EmbeddedWorkerRuntime) -> Self {
         Self::new(vec![Arc::new(embedded_runtime)])
     }
 
-    pub fn register<R>(&mut self, runtime: R)
+    pub fn register<R>(&self, runtime: R)
     where
         R: WorkspaceWorkerRuntime + 'static,
     {
-        self.runtimes.push(Arc::new(runtime));
+        self.runtimes
+            .write()
+            .expect("runtime registry lock poisoned")
+            .push(Arc::new(runtime));
+    }
+
+    pub fn register_or_replace<R>(&self, runtime: R)
+    where
+        R: WorkspaceWorkerRuntime + 'static,
+    {
+        let runtime = Arc::new(runtime);
+        let runtime_id = runtime.runtime_id().to_string();
+        let mut runtimes = self
+            .runtimes
+            .write()
+            .expect("runtime registry lock poisoned");
+        runtimes.retain(|existing| existing.runtime_id() != runtime_id);
+        runtimes.push(runtime);
+    }
+
+    pub fn unregister_if_idle(
+        &self,
+        runtime_id: &str,
+        worker_scan_limit: usize,
+    ) -> Result<RuntimeRegistryUnregisterResult, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        let runtime = self
+            .runtimes_snapshot()
+            .into_iter()
+            .find(|runtime| runtime.runtime_id() == runtime_id);
+        if let Some(runtime) = runtime {
+            let worker_list = runtime.list_workers(worker_scan_limit);
+            if !worker_list.items.is_empty() {
+                return Ok(RuntimeRegistryUnregisterResult::BlockedByWorkers {
+                    worker_count: worker_list.items.len(),
+                    diagnostics: worker_list.diagnostics,
+                });
+            }
+        } else {
+            return Ok(RuntimeRegistryUnregisterResult::NotFound);
+        }
+
+        let mut runtimes = self
+            .runtimes
+            .write()
+            .expect("runtime registry lock poisoned");
+        let before = runtimes.len();
+        runtimes.retain(|runtime| runtime.runtime_id() != runtime_id);
+        if runtimes.len() == before {
+            Ok(RuntimeRegistryUnregisterResult::NotFound)
+        } else {
+            Ok(RuntimeRegistryUnregisterResult::Removed)
+        }
     }
 
     pub fn list_runtimes(&self, limit: usize) -> RuntimeList<RuntimeSummary> {
         let mut diagnostics = Vec::new();
         let mut items = Vec::new();
-        for runtime in self.runtimes.iter().take(limit) {
+        for runtime in self.runtimes_snapshot().iter().take(limit) {
             let summary = runtime.runtime_summary(limit);
             diagnostics.extend(summary.diagnostics.iter().cloned());
             items.push(summary);
@@ -679,7 +763,7 @@ impl RuntimeRegistry {
     pub fn list_hosts(&self, limit: usize) -> RuntimeList<HostSummary> {
         let mut items = Vec::new();
         let mut diagnostics = Vec::new();
-        for runtime in &self.runtimes {
+        for runtime in self.runtimes_snapshot() {
             if items.len() >= limit {
                 break;
             }
@@ -694,7 +778,7 @@ impl RuntimeRegistry {
     pub fn list_workers(&self, limit: usize) -> RuntimeList<WorkerSummary> {
         let mut items = Vec::new();
         let mut diagnostics = Vec::new();
-        for runtime in &self.runtimes {
+        for runtime in self.runtimes_snapshot() {
             if items.len() >= limit {
                 break;
             }
@@ -716,7 +800,7 @@ impl RuntimeRegistry {
         let mut host_found = false;
         let mut diagnostics = Vec::new();
         let mut items = Vec::new();
-        for runtime in &self.runtimes {
+        for runtime in self.runtimes_snapshot() {
             let host_list = runtime.list_hosts(MAX_HOST_SCAN);
             diagnostics.extend(host_list.diagnostics);
             if !host_list.items.iter().any(|host| host.host_id == host_id) {
@@ -894,13 +978,23 @@ impl RuntimeRegistry {
             })
     }
 
+    fn runtimes_snapshot(&self) -> Vec<Arc<dyn WorkspaceWorkerRuntime>> {
+        self.runtimes
+            .read()
+            .expect("runtime registry lock poisoned")
+            .clone()
+    }
+
     fn runtime(
         &self,
         runtime_id: &str,
-    ) -> Result<&Arc<dyn WorkspaceWorkerRuntime>, RuntimeRegistryError> {
+    ) -> Result<Arc<dyn WorkspaceWorkerRuntime>, RuntimeRegistryError> {
         self.runtimes
+            .read()
+            .expect("runtime registry lock poisoned")
             .iter()
             .find(|runtime| runtime.runtime_id() == runtime_id)
+            .cloned()
             .ok_or_else(|| RuntimeRegistryError::UnknownRuntime(runtime_id.to_string()))
     }
 }
@@ -1548,7 +1642,7 @@ impl RemoteRuntimeConfig {
             display_name: display_name.into(),
             base_url: base_url.into(),
             bearer_token,
-            cached_capabilities: remote_runtime_capabilities(200, false),
+            cached_capabilities: remote_runtime_capabilities(200, false, false),
             cached_status: "configured".to_string(),
             timeout: Duration::from_secs(10),
         }
@@ -1586,14 +1680,14 @@ impl RemoteWorkerRuntime {
     pub fn new(config: RemoteRuntimeConfig) -> Result<Self, RuntimeRegistryError> {
         validate_backend_identifier("runtime_id", &config.runtime_id)?;
         let base_url = config.base_url.trim_end_matches('/').to_string();
-        let http = BlockingHttpClient::builder()
-            .timeout(config.timeout)
-            .build()
-            .map_err(|err| RuntimeRegistryError::RuntimeOperationFailed {
-                runtime_id: config.runtime_id.clone(),
-                code: "remote_runtime_client_build_failed".to_string(),
-                message: err.to_string(),
-            })?;
+        let timeout = config.timeout;
+        let http =
+            run_blocking_http(move || BlockingHttpClient::builder().timeout(timeout).build())
+                .map_err(|err| RuntimeRegistryError::RuntimeOperationFailed {
+                    runtime_id: config.runtime_id.clone(),
+                    code: "remote_runtime_client_build_failed".to_string(),
+                    message: err.to_string(),
+                })?;
         Ok(Self {
             host_id: host_id_for_remote_runtime(&config.runtime_id),
             runtime_id: config.runtime_id,
@@ -1628,18 +1722,9 @@ impl RemoteWorkerRuntime {
         format!("{base}/v1/workers/{worker_id}/events/ws")
     }
 
-    fn authorize(&self, request: RequestBuilder) -> RequestBuilder {
-        let request = request.header(CONTENT_TYPE, "application/json");
-        if let Some(token) = self.bearer_token.as_deref() {
-            request.header(AUTHORIZATION, format!("Bearer {token}"))
-        } else {
-            request
-        }
-    }
-
     fn get_json<T>(&self, path: &str) -> Result<T, RuntimeDiagnostic>
     where
-        T: DeserializeOwned,
+        T: DeserializeOwned + Send + 'static,
     {
         self.send_json(self.http.get(self.endpoint(path)))
     }
@@ -1647,38 +1732,43 @@ impl RemoteWorkerRuntime {
     fn post_json<B, T>(&self, path: &str, body: &B) -> Result<T, RuntimeDiagnostic>
     where
         B: Serialize + ?Sized,
-        T: DeserializeOwned,
+        T: DeserializeOwned + Send + 'static,
     {
         self.send_json(self.http.post(self.endpoint(path)).json(body))
     }
 
     fn send_json<T>(&self, request: RequestBuilder) -> Result<T, RuntimeDiagnostic>
     where
-        T: DeserializeOwned,
+        T: DeserializeOwned + Send + 'static,
     {
-        let response = self
-            .authorize(request)
-            .send()
-            .map_err(|err| remote_reqwest_diagnostic(&self.runtime_id, err))?;
-        let status = response.status();
-        if status.is_success() {
-            response.json::<T>().map_err(|err| {
-                diagnostic(
-                    "remote_runtime_malformed_response",
-                    DiagnosticSeverity::Error,
-                    format!(
-                        "Remote Runtime returned malformed JSON for '{}': {err}",
-                        self.runtime_id
-                    ),
-                )
-            })
-        } else {
-            Err(remote_http_status_diagnostic(
-                &self.runtime_id,
-                status,
-                response,
-            ))
-        }
+        let runtime_id = self.runtime_id.clone();
+        let bearer_token = self.bearer_token.clone();
+        run_blocking_http(move || {
+            let request = request.header(CONTENT_TYPE, "application/json");
+            let request = if let Some(token) = bearer_token.as_deref() {
+                request.header(AUTHORIZATION, format!("Bearer {token}"))
+            } else {
+                request
+            };
+            let response = request
+                .send()
+                .map_err(|err| remote_reqwest_diagnostic(&runtime_id, err))?;
+            let status = response.status();
+            if status.is_success() {
+                response.json::<T>().map_err(|err| {
+                    diagnostic(
+                        "remote_runtime_malformed_response",
+                        DiagnosticSeverity::Error,
+                        format!(
+                            "Remote Runtime returned malformed JSON for '{}': {err}",
+                            runtime_id
+                        ),
+                    )
+                })
+            } else {
+                Err(remote_http_status_diagnostic(&runtime_id, status, response))
+            }
+        })
     }
 
     fn map_worker_summary(&self, summary: worker_runtime::catalog::WorkerSummary) -> WorkerSummary {
@@ -1790,7 +1880,11 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 } else {
                     vec![self.host_id.clone()]
                 },
-                capabilities: remote_runtime_capabilities(limit, true),
+                capabilities: remote_runtime_capabilities(
+                    limit,
+                    true,
+                    response.runtime.worker_creation_available,
+                ),
                 diagnostics: vec![diagnostic(
                     "remote_runtime_backend_proxy",
                     DiagnosticSeverity::Info,
@@ -1827,7 +1921,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 status: "configured".to_string(),
                 observed_at: Utc::now().to_rfc3339(),
                 last_seen_at: None,
-                capabilities: remote_runtime_capabilities(limit, true),
+                capabilities: remote_runtime_capabilities(limit, true, false),
                 diagnostics: vec![diagnostic(
                     "remote_runtime_backend_proxy",
                     DiagnosticSeverity::Info,
@@ -2489,14 +2583,18 @@ fn percent_encode(input: &str, keep: impl Fn(u8) -> bool) -> String {
     encoded
 }
 
-fn remote_runtime_capabilities(limit: usize, available: bool) -> RuntimeCapabilitySummary {
+fn remote_runtime_capabilities(
+    limit: usize,
+    available: bool,
+    worker_creation_available: bool,
+) -> RuntimeCapabilitySummary {
     RuntimeCapabilitySummary {
         can_list_hosts: true,
         can_list_workers: available,
         can_get_worker: available,
-        can_spawn_worker: available,
+        can_spawn_worker: available && worker_creation_available,
         can_stop_worker: available,
-        can_accept_input: available,
+        can_accept_input: available && worker_creation_available,
         has_workspace_fs: false,
         has_shell: false,
         has_git: false,
@@ -3327,6 +3425,19 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn remote_runtime_client_can_initialize_inside_tokio_context() {
+        let runtime = RemoteWorkerRuntime::new(RemoteRuntimeConfig::new(
+            "remote:async-init",
+            "Remote Async Init",
+            "http://127.0.0.1:9",
+            None,
+        ))
+        .unwrap();
+
+        assert_eq!(runtime.runtime_id(), "remote:async-init");
+    }
+
     #[test]
     fn remote_runtime_registry_routes_commands_without_browser_secret_leaks() {
         let worker_json = worker_json("remote:primary", "worker-remote-1");
@@ -3362,7 +3473,7 @@ mod tests {
             ),
         ]);
         let secret = "secret-token-do-not-leak".to_string();
-        let mut registry = RuntimeRegistry::new(Vec::new());
+        let registry = RuntimeRegistry::new(Vec::new());
         registry.register(
             RemoteWorkerRuntime::new(RemoteRuntimeConfig::new(
                 "remote:primary",
@@ -3559,7 +3670,7 @@ mod tests {
                 .to_string(),
             ),
         ]);
-        let mut registry = RuntimeRegistry::new(Vec::new());
+        let registry = RuntimeRegistry::new(Vec::new());
         registry.register(
             RemoteWorkerRuntime::new(RemoteRuntimeConfig::new(
                 "remote:primary",
@@ -3605,7 +3716,7 @@ mod tests {
             401,
             json!({ "error": { "code": "unauthorized", "message": "bad token" } }).to_string(),
         )]);
-        let mut registry = RuntimeRegistry::new(Vec::new());
+        let registry = RuntimeRegistry::new(Vec::new());
         registry.register(
             RemoteWorkerRuntime::new(RemoteRuntimeConfig::new(
                 "remote:primary",

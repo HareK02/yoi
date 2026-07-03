@@ -225,8 +225,7 @@ fn load_profile(
     Ok((resolved.manifest, PromptLoader::builtins_only()))
 }
 
-#[cfg(feature = "runtime-adapter")]
-pub(crate) fn resolve_runtime_profile_manifest(
+pub fn resolve_runtime_profile_manifest(
     profile: Option<&str>,
     workspace_root: &Path,
     worker_name: &str,

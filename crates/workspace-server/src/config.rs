@@ -299,7 +299,9 @@ impl ResolvedWorkspaceBackendConfig {
     }
 }
 
-fn resolve_remote_runtime(config: &RemoteRuntimeConfigFile) -> Result<RemoteRuntimeConfig> {
+pub(crate) fn resolve_remote_runtime(
+    config: &RemoteRuntimeConfigFile,
+) -> Result<RemoteRuntimeConfig> {
     if let Some(token_ref) = config.token_ref.as_deref() {
         return Err(Error::Config(format!(
             "remote runtime `{}` uses token_ref `{token_ref}`, but secret ref resolution is not implemented for workspace backend config yet",

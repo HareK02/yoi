@@ -23,7 +23,7 @@ thiserror.workspace = true
 ticket.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "net", "rt-multi-thread", "sync"] }
 tokio-tungstenite.workspace = true
-worker = { workspace = true, features = ["runtime-adapter"] }
+worker.workspace = true
 worker-runtime = { workspace = true, features = ["ws-server", "fs-store"] }
 toml.workspace = true
 tracing.workspace = true

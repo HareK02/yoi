@@ -46,6 +46,6 @@ max_records = 200
 #
 # [[runtimes.remote]]
 # id = "example"
-# endpoint = "http://127.0.0.1:8790"
+# endpoint = "http://127.0.0.1:38800"
 # display_name = "Example Runtime"
 # token_ref = "local:example-runtime-token"

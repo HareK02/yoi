@@ -7,7 +7,6 @@ autobins = false
 
 [features]
 default = []
-runtime-adapter = ["dep:worker-runtime"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -19,7 +18,6 @@ mcp = { workspace = true }
 protocol = { workspace = true }
 provider = { workspace = true }
 client = { workspace = true }
-worker-runtime = { workspace = true, features = ["ws-server"], optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "native-tls"] }

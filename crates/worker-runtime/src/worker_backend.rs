@@ -14,6 +14,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
+use crate::execution::{
+    WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation, WorkerExecutionResult,
+    WorkerExecutionRunState, WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
+};
+use crate::interaction::{WorkerInput, WorkerInputKind};
 use async_trait::async_trait;
 use manifest::paths;
 use protocol::{Method, Segment, WorkerStatus};
@@ -21,13 +26,8 @@ use session_store::FsStore;
 use session_store::{CombinedStore, FsWorkerStore};
 use tokio::runtime::Runtime;
 use tokio::sync::broadcast;
-use worker_runtime::execution::{
-    WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation, WorkerExecutionResult,
-    WorkerExecutionRunState, WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
-};
-use worker_runtime::interaction::{WorkerInput, WorkerInputKind};
 
-use crate::{Worker, WorkerController, WorkerHandle};
+use worker::{Worker, WorkerController, WorkerHandle};
 
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
 const RUNTIME_TASK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -115,7 +115,7 @@ impl ProfileRuntimeWorkerFactory {
     fn runtime_base_dir(&self) -> Result<PathBuf, String> {
         self.runtime_base_dir
             .clone()
-            .or_else(|| crate::runtime::dir::default_base().ok())
+            .or_else(|| worker::runtime::dir::default_base().ok())
             .ok_or_else(|| "could not resolve worker runtime directory".to_string())
     }
 
@@ -124,14 +124,14 @@ impl ProfileRuntimeWorkerFactory {
     }
 
     fn runtime_profile_value(
-        profile: &worker_runtime::catalog::ProfileSelector,
+        profile: &crate::catalog::ProfileSelector,
     ) -> Option<std::borrow::Cow<'_, str>> {
         match profile {
-            worker_runtime::catalog::ProfileSelector::RuntimeDefault => None,
-            worker_runtime::catalog::ProfileSelector::Named(name) => {
+            crate::catalog::ProfileSelector::RuntimeDefault => None,
+            crate::catalog::ProfileSelector::Named(name) => {
                 Some(std::borrow::Cow::Borrowed(name.as_str()))
             }
-            worker_runtime::catalog::ProfileSelector::Builtin(name) => {
+            crate::catalog::ProfileSelector::Builtin(name) => {
                 if name.starts_with("builtin:") {
                     Some(std::borrow::Cow::Borrowed(name.as_str()))
                 } else {
@@ -160,7 +160,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
     ) -> Result<WorkerHandle, String> {
         let worker_name = Self::runtime_worker_name(&request);
         let profile = self.runtime_profile(&request);
-        let (mut manifest, loader) = crate::entrypoint::resolve_runtime_profile_manifest(
+        let (mut manifest, loader) = worker::entrypoint::resolve_runtime_profile_manifest(
             profile.as_deref(),
             &self.workspace_root,
             &worker_name,
@@ -211,7 +211,7 @@ pub struct WorkerRuntimeExecutionBackend<F = ProfileRuntimeWorkerFactory> {
     backend_id: String,
     factory: Arc<F>,
     runtime: Mutex<Option<Runtime>>,
-    workers: Mutex<HashMap<worker_runtime::identity::WorkerRef, RuntimeWorkerExecution>>,
+    workers: Mutex<HashMap<crate::identity::WorkerRef, RuntimeWorkerExecution>>,
 }
 
 impl WorkerRuntimeExecutionBackend<ProfileRuntimeWorkerFactory> {
@@ -461,7 +461,7 @@ where
             },
             WorkerExecutionRunState::Busy,
         );
-        if result.outcome != worker_runtime::execution::WorkerExecutionOutcome::Accepted {
+        if result.outcome != crate::execution::WorkerExecutionOutcome::Accepted {
             busy.store(false, Ordering::SeqCst);
         }
         result
@@ -506,17 +506,17 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::Runtime as EmbeddedRuntime;
+    use crate::catalog::{ConfigBundleRef, CreateWorkerRequest, ProfileSelector};
+    use crate::identity::RuntimeId;
+    use crate::management::RuntimeOptions;
+    use crate::observation::{TranscriptQuery, TranscriptRole};
     use async_trait::async_trait;
     use futures::Stream;
     use llm_engine::Engine;
     use llm_engine::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
     use llm_engine::llm_client::{ClientError, LlmClient, Request};
     use manifest::{Scope, WorkerManifest};
-    use worker_runtime::Runtime as EmbeddedRuntime;
-    use worker_runtime::catalog::{CreateWorkerRequest, ProfileSelector, WorkerIntent};
-    use worker_runtime::identity::RuntimeId;
-    use worker_runtime::management::RuntimeOptions;
-    use worker_runtime::observation::{TranscriptQuery, TranscriptRole};
 
     #[derive(Clone)]
     struct MockClient {
@@ -619,17 +619,37 @@ mod tests {
         ]
     }
 
-    fn create_request(name: &str) -> CreateWorkerRequest {
-        CreateWorkerRequest {
-            intent: WorkerIntent::Role {
-                role: name.to_string(),
-                purpose: None,
+    fn test_bundle() -> crate::config_bundle::ConfigBundle {
+        crate::config_bundle::ConfigBundle {
+            metadata: crate::config_bundle::ConfigBundleMetadata {
+                id: "adapter-test-bundle".to_string(),
+                digest: String::new(),
+                revision: "test".to_string(),
+                workspace_id: "adapter-test".to_string(),
+                created_at: "test".to_string(),
+                provenance: crate::config_bundle::ConfigBundleProvenance {
+                    source: "test".to_string(),
+                    detail: None,
+                },
             },
+            profiles: vec![crate::config_bundle::ConfigProfileDescriptor {
+                selector: ProfileSelector::RuntimeDefault,
+                label: Some("adapter-test".to_string()),
+            }],
+            declarations: Vec::new(),
+        }
+        .with_computed_digest()
+    }
+
+    fn create_request(_name: &str) -> CreateWorkerRequest {
+        let bundle = test_bundle();
+        CreateWorkerRequest {
             profile: ProfileSelector::RuntimeDefault,
-            config_bundle: None,
-            requested_capabilities: Vec::new(),
-            workspace_refs: Vec::new(),
-            mount_refs: Vec::new(),
+            config_bundle: ConfigBundleRef {
+                id: bundle.metadata.id,
+                digest: bundle.metadata.digest,
+            },
+            initial_input: None,
         }
     }
 
@@ -637,14 +657,14 @@ mod tests {
     fn builtin_profile_selector_is_not_double_prefixed() {
         assert_eq!(
             ProfileRuntimeWorkerFactory::runtime_profile_value(
-                &worker_runtime::catalog::ProfileSelector::Builtin("coder".to_string())
+                &crate::catalog::ProfileSelector::Builtin("coder".to_string())
             )
             .as_deref(),
             Some("builtin:coder")
         );
         assert_eq!(
             ProfileRuntimeWorkerFactory::runtime_profile_value(
-                &worker_runtime::catalog::ProfileSelector::Builtin("builtin:coder".to_string())
+                &crate::catalog::ProfileSelector::Builtin("builtin:coder".to_string())
             )
             .as_deref(),
             Some("builtin:coder")
@@ -673,6 +693,7 @@ mod tests {
             Arc::new(backend),
         )
         .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
         let detail = runtime.create_worker(create_request("chat")).unwrap();
 
         runtime
@@ -700,7 +721,7 @@ mod tests {
         let observations = runtime
             .read_worker_observation_events(
                 &detail.worker_ref,
-                worker_runtime::observation::WorkerObservationCursor::zero(),
+                crate::observation::WorkerObservationCursor::zero(),
             )
             .unwrap();
         assert!(
