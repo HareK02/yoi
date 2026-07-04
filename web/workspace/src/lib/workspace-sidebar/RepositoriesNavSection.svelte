@@ -17,9 +17,9 @@
 
   <ul class="nav-list" aria-label="Repositories">
     <li>
-      <a class="nav-item" class:active={currentPath.startsWith('/repositories')} href="/repositories/local">
-        <span class="item-title">{workspace?.display_name ?? 'local workspace'}</span>
-        <span class="item-meta">local repository · read-only</span>
+      <a class="nav-item" class:active={currentPath.startsWith('/repositories')} href="/repositories/main">
+        <span class="item-title">main</span>
+        <span class="item-meta">configured repository · read-only</span>
       </a>
     </li>
   </ul>

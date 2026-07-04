@@ -17,14 +17,15 @@
   type WorkspaceView = 'overview' | 'repository' | 'objectives' | 'objective';
 
   type RouteState =
-    | { page: 'overview'; objectiveId?: undefined }
-    | { page: 'repository'; objectiveId?: undefined }
-    | { page: 'objectives'; objectiveId?: undefined }
-    | { page: 'objective'; objectiveId: string };
+    | { page: 'overview'; objectiveId?: undefined; repositoryId?: undefined }
+    | { page: 'repository'; repositoryId: string; objectiveId?: undefined }
+    | { page: 'objectives'; objectiveId?: undefined; repositoryId?: undefined }
+    | { page: 'objective'; objectiveId: string; repositoryId?: undefined };
 
   let {
     view = 'overview',
-    objectiveId = null
+    objectiveId = null,
+    repositoryId = 'main'
   }: { view?: WorkspaceView; repositoryId?: string; objectiveId?: string | null } = $props();
 
   let workspace = $state<WorkspaceResponse | null>(null);
@@ -44,7 +45,7 @@
   let objectiveDetailError = $state<string | null>(null);
   let objectiveDetailLoading = $state(false);
   let objectiveDetailRequest = 0;
-  let route = $derived(routeFromView(view, objectiveId));
+  let route = $derived(routeFromView(view, objectiveId, repositoryId));
   let currentPath = $derived(pathFromRoute(route));
 
   async function getJson<T>(path: string): Promise<T> {
@@ -87,8 +88,11 @@
 
   async function loadRepository() {
     repositoryError = null;
+    const selectedRepositoryId = route.page === 'repository' ? route.repositoryId : repositoryId;
     try {
-      const detail = await getJson<RepositoryDetailResponse>('/api/repositories/local');
+      const detail = await getJson<RepositoryDetailResponse>(
+        `/api/repositories/${encodeURIComponent(selectedRepositoryId)}`
+      );
       repository = detail.item;
     } catch (error) {
       repositoryError = error instanceof Error ? error.message : String(error);
@@ -98,8 +102,11 @@
 
   async function loadRepositoryTickets() {
     repositoryTicketsError = null;
+    const selectedRepositoryId = route.page === 'repository' ? route.repositoryId : repositoryId;
     try {
-      repositoryTickets = await getJson<RepositoryTicketsResponse>('/api/repositories/local/tickets');
+      repositoryTickets = await getJson<RepositoryTicketsResponse>(
+        `/api/repositories/${encodeURIComponent(selectedRepositoryId)}/tickets`
+      );
     } catch (error) {
       repositoryTicketsError = error instanceof Error ? error.message : String(error);
       repositoryTickets = null;
@@ -137,9 +144,13 @@
     }
   }
 
-  function routeFromView(view: WorkspaceView, objectiveId: string | null): RouteState {
+  function routeFromView(
+    view: WorkspaceView,
+    objectiveId: string | null,
+    repositoryId: string
+  ): RouteState {
     if (view === 'repository') {
-      return { page: 'repository' };
+      return { page: 'repository', repositoryId };
     }
     if (view === 'objective' && objectiveId) {
       return { page: 'objective', objectiveId };
@@ -152,7 +163,7 @@
 
   function pathFromRoute(route: RouteState): string {
     if (route.page === 'repository') {
-      return '/repositories/local';
+      return `/repositories/${route.repositoryId}`;
     }
     if (route.page === 'objective') {
       return `/objectives/${route.objectiveId}`;
@@ -216,8 +227,12 @@
               <dd>{repository.kind}</dd>
             </div>
             <div>
-              <dt>Workspace root</dt>
-              <dd><code>{repository.workspace_root}</code></dd>
+              <dt>Provider</dt>
+              <dd>{repository.provider}</dd>
+            </div>
+            <div>
+              <dt>Default selector</dt>
+              <dd>{repository.default_selector ?? 'none configured'}</dd>
             </div>
             <div>
               <dt>Record authority</dt>
@@ -225,13 +240,25 @@
             </div>
             <div>
               <dt>Git</dt>
-              <dd>{repository.git.status}</dd>
+              <dd>{repository.git?.status ?? 'not available'}</dd>
             </div>
+            {#if repository.diagnostics && repository.diagnostics.length > 0}
+              <div>
+                <dt>Diagnostics</dt>
+                <dd>
+                  <ul>
+                    {#each repository.diagnostics as diagnostic}
+                      <li><code>{diagnostic.code}</code>: {diagnostic.message}</li>
+                    {/each}
+                  </ul>
+                </dd>
+              </div>
+            {/if}
           </dl>
         {:else if repositoryError}
           <p class="error">{repositoryError}</p>
         {:else}
-          <p>Waiting for <code>/api/repositories/local</code>…</p>
+          <p>Waiting for <code>/api/repositories/{route.repositoryId}</code>…</p>
         {/if}
       </section>
 
@@ -245,7 +272,7 @@
         {:else if repositoryTicketsError}
           <p class="error">{repositoryTicketsError}</p>
         {:else}
-          <p>Waiting for <code>/api/repositories/local/tickets</code>…</p>
+          <p>Waiting for <code>/api/repositories/{route.repositoryId}/tickets</code>…</p>
         {/if}
       </section>
 

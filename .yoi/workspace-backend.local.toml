@@ -1,0 +1,9 @@
+# Dogfood Workspace Backend configuration.
+# Repository URI values are resolved from this workspace config root.
+
+[[repositories]]
+id = "main"
+provider = "git"
+uri = "."
+display_name = "Yoi"
+default_selector = "HEAD"

@@ -23,8 +23,8 @@ pub use records::{
     LocalProjectRecordReader, ObjectiveDetail, ObjectiveSummary, TicketDetail, TicketSummary,
 };
 pub use repositories::{
-    GitCommitSummary, GitRemoteSummary, GitRepositorySummary, LocalRepositoryReader,
-    RepositoryLogRead, RepositorySummary,
+    ConfiguredRepository, GitCommitSummary, GitRemoteSummary, GitRepositorySummary,
+    RepositoryLogRead, RepositoryRegistryReader, RepositorySummary,
 };
 pub use server::{AuthConfig, ServerConfig, WorkspaceApi, build_router, serve};
 pub use store::{ControlPlaneStore, SqliteWorkspaceStore, WorkspaceRecord};

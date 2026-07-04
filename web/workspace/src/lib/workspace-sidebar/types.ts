@@ -181,34 +181,35 @@ export type RepositorySummary = {
   id: string;
   display_name: string;
   kind: string;
-  workspace_root: string;
+  provider: string;
+  default_selector?: string | null;
   record_authority: string;
-  git: GitRepositorySummary;
+  git?: GitRepositorySummary | null;
+  diagnostics?: Diagnostic[];
 };
 
 export type GitRepositorySummary = {
   status: string;
-  root?: string | null;
   branch?: string | null;
   head?: string | null;
-  dirty?: boolean | null;
-  dirty_scope: string;
-  remote?: GitRemoteSummary | null;
-  diagnostics: Diagnostic[];
+  dirty: boolean;
+  remotes: GitRemoteSummary[];
 };
 
 export type GitRemoteSummary = {
   name: string;
-  url: string;
-  redacted: boolean;
+  fetch_url: string;
 };
 
 export type GitCommitSummary = {
   hash: string;
-  subject: string;
+  short_hash: string;
+  summary: string;
   author_name: string;
   author_email: string;
-  timestamp: string;
+  author_date: string;
+  parents: string[];
+  refs: string[];
 };
 
 export type RepositoryDetailResponse = {
@@ -220,6 +221,7 @@ export type RepositoryDetailResponse = {
 export type RepositoryLogResponse = {
   workspace_id: string;
   repository_id: string;
+  default_selector?: string | null;
   limit: number;
   items: GitCommitSummary[];
   diagnostics: Diagnostic[];
