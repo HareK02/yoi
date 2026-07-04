@@ -1,8 +1,8 @@
 ---
 title: 'Config-driven Repository registry for Workspace Backend'
-state: 'planning'
+state: 'ready'
 created_at: '2026-07-04T10:50:45Z'
-updated_at: '2026-07-04T10:50:45Z'
+updated_at: '2026-07-04T10:59:11Z'
 assignee: null
 ---
 
