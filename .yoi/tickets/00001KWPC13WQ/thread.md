@@ -179,3 +179,34 @@ Implementation progress report:
 - External review will be requested via a read-only sibling Reviewer Pod. `StopPod` は使わない。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-04T20:02:57Z status: request_changes -->
+
+## Review: request changes
+
+External review result: request_changes
+
+Blockers:
+
+1. Web UI still exposes an implicit hardcoded `main` repository instead of deriving repository navigation from configured repositories.
+   - `web/workspace/src/lib/workspace-sidebar/RepositoriesNavSection.svelte:12-25` always renders count `1` and a `/repositories/main` link labeled “configured repository”。
+   - `WorkspacePage.svelte:25-29` still defaults `repositoryId = 'main'`, and `WorkspacePage.svelte:181-187` loads repository data/tickets even outside the repository route。
+   - This violates the acceptance criterion that the web UI behave safely with no configured repositories and display repository views only for explicit repositories. In an empty registry workspace, the sidebar still advertises `main`。
+
+2. Browser-facing repository summaries can leak local absolute host paths through Git remotes.
+   - `crates/workspace-server/src/repositories.rs:223-225` reads `git remote -v`。
+   - `parse_remotes` exposes `fetch_url` in `GitRemoteSummary` (`repositories.rs:42-46`, `274-291`)。
+   - `sanitize_remote_url` only redacts `scheme://credentials@host` userinfo (`repositories.rs:338-345`); local absolute remotes such as `/home/.../repo.git` or `file:///home/...` are returned unchanged。
+   - This conflicts with the Ticket invariant that browser-facing responses must not leak unnecessary absolute host paths/internal path details。
+
+Validation / evidence reviewed:
+- Ticket `item.md`, routing decision / IntentPacket, and orchestration plan。
+- Commit `2f0d1cee` diff/stat/name list and relevant backend/web files。
+- `git diff --check 2f0d1cee^ 2f0d1cee` had no whitespace errors。
+- Positive backend pieces exist: explicit dogfood `main` config, config-level `[[repositories]]`, `uri = "."` workspace-root resolution test, empty-registry `repository_config_empty` diagnostic, and unknown/unsupported repository log route tests。
+
+Non-blocking follow-ups:
+- Add web-side tests or component-model coverage for empty repository registry / non-`main` configured repository navigation so the hardcoded fallback cannot regress。
+- Consider a stricter public `GitRemoteSummary` shape that reports only sanitized display metadata, not raw fetch URLs。
+
+---
