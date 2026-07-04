@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, path::PathBuf, process::Command};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -336,13 +340,33 @@ fn parse_git_log(raw: &str) -> Vec<GitCommitSummary> {
 }
 
 fn sanitize_remote_url(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_string();
+    let trimmed = url.trim();
+    if is_local_path_like(trimmed) {
+        return "<redacted-local-path>".to_string();
+    }
+
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return trimmed.to_string();
     };
+    if scheme.eq_ignore_ascii_case("file") {
+        return "file://<redacted-local-path>".to_string();
+    }
     let Some((_credentials, host_path)) = rest.split_once('@') else {
-        return url.to_string();
+        return trimmed.to_string();
     };
     format!("{scheme}://<redacted>@{host_path}")
+}
+
+fn is_local_path_like(value: &str) -> bool {
+    Path::new(value).is_absolute() || is_windows_absolute_path_like(value)
+}
+
+fn is_windows_absolute_path_like(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
 }
 
 fn non_empty_string(value: &str) -> Option<String> {
@@ -358,7 +382,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sanitizes_remote_credentials() {
+    fn sanitizes_remote_credentials_and_local_paths() {
         assert_eq!(
             sanitize_remote_url("https://user:token@example.com/org/repo.git"),
             "https://<redacted>@example.com/org/repo.git"
@@ -366,6 +390,26 @@ mod tests {
         assert_eq!(
             sanitize_remote_url("git@example.com:org/repo.git"),
             "git@example.com:org/repo.git"
+        );
+        assert_eq!(
+            sanitize_remote_url("/home/alice/private/repo.git"),
+            "<redacted-local-path>"
+        );
+        assert_eq!(
+            sanitize_remote_url("/Users/alice/private/repo.git"),
+            "<redacted-local-path>"
+        );
+        assert_eq!(
+            sanitize_remote_url("C:\\Users\\alice\\private\\repo.git"),
+            "<redacted-local-path>"
+        );
+        assert_eq!(
+            sanitize_remote_url("file:///home/alice/private/repo.git"),
+            "file://<redacted-local-path>"
+        );
+        assert_eq!(
+            sanitize_remote_url("file://localhost/home/alice/private/repo.git"),
+            "file://<redacted-local-path>"
         );
     }
 

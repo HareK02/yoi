@@ -3,4 +3,4 @@
   import WorkspacePage from '$lib/workspace-pages/WorkspacePage.svelte';
 </script>
 
-<WorkspacePage view="repository" repositoryId={page.params.repositoryId ?? 'main'} />
+<WorkspacePage view="repository" repositoryId={page.params.repositoryId} />

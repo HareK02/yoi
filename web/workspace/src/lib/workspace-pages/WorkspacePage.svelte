@@ -8,6 +8,7 @@
     ObjectiveDetail,
     ObjectiveListResponse,
     RepositoryDetailResponse,
+    RepositoryListResponse,
     RepositorySummary,
     RepositoryTicketsResponse,
     Worker,
@@ -25,12 +26,13 @@
   let {
     view = 'overview',
     objectiveId = null,
-    repositoryId = 'main'
-  }: { view?: WorkspaceView; repositoryId?: string; objectiveId?: string | null } = $props();
+    repositoryId = null
+  }: { view?: WorkspaceView; repositoryId?: string | null; objectiveId?: string | null } = $props();
 
   let workspace = $state<WorkspaceResponse | null>(null);
   let hosts = $state<ListResponse<Host> | null>(null);
   let workers = $state<ListResponse<Worker> | null>(null);
+  let repositories = $state<RepositoryListResponse | null>(null);
   let repository = $state<RepositorySummary | null>(null);
   let repositoryTickets = $state<RepositoryTicketsResponse | null>(null);
   let objectives = $state<ObjectiveListResponse | null>(null);
@@ -39,6 +41,7 @@
   let workspaceError = $state<string | null>(null);
   let hostsError = $state<string | null>(null);
   let workersError = $state<string | null>(null);
+  let repositoriesError = $state<string | null>(null);
   let repositoryError = $state<string | null>(null);
   let repositoryTicketsError = $state<string | null>(null);
   let objectivesError = $state<string | null>(null);
@@ -86,12 +89,21 @@
     }
   }
 
-  async function loadRepository() {
+  async function loadRepositories() {
+    repositoriesError = null;
+    try {
+      repositories = await getJson<RepositoryListResponse>('/api/repositories');
+    } catch (error) {
+      repositoriesError = error instanceof Error ? error.message : String(error);
+      repositories = null;
+    }
+  }
+
+  async function loadRepository(id: string) {
     repositoryError = null;
-    const selectedRepositoryId = route.page === 'repository' ? route.repositoryId : repositoryId;
     try {
       const detail = await getJson<RepositoryDetailResponse>(
-        `/api/repositories/${encodeURIComponent(selectedRepositoryId)}`
+        `/api/repositories/${encodeURIComponent(id)}`
       );
       repository = detail.item;
     } catch (error) {
@@ -100,12 +112,11 @@
     }
   }
 
-  async function loadRepositoryTickets() {
+  async function loadRepositoryTickets(id: string) {
     repositoryTicketsError = null;
-    const selectedRepositoryId = route.page === 'repository' ? route.repositoryId : repositoryId;
     try {
       repositoryTickets = await getJson<RepositoryTicketsResponse>(
-        `/api/repositories/${encodeURIComponent(selectedRepositoryId)}/tickets`
+        `/api/repositories/${encodeURIComponent(id)}/tickets`
       );
     } catch (error) {
       repositoryTicketsError = error instanceof Error ? error.message : String(error);
@@ -147,9 +158,9 @@
   function routeFromView(
     view: WorkspaceView,
     objectiveId: string | null,
-    repositoryId: string
+    repositoryId: string | null
   ): RouteState {
-    if (view === 'repository') {
+    if (view === 'repository' && repositoryId) {
       return { page: 'repository', repositoryId };
     }
     if (view === 'objective' && objectiveId) {
@@ -182,9 +193,20 @@
     void loadWorkspace();
     void loadHosts();
     void loadWorkers();
-    void loadRepository();
-    void loadRepositoryTickets();
+    void loadRepositories();
     void loadObjectives();
+  });
+
+  $effect(() => {
+    if (route.page === 'repository') {
+      void loadRepository(route.repositoryId);
+      void loadRepositoryTickets(route.repositoryId);
+    } else {
+      repository = null;
+      repositoryTickets = null;
+      repositoryError = null;
+      repositoryTicketsError = null;
+    }
   });
 
   $effect(() => {
@@ -210,7 +232,7 @@
 </svelte:head>
 
 <div class="workspace-layout">
-  <WorkspaceSidebar {workspace} {workspaceError} {currentPath} />
+  <WorkspaceSidebar {workspace} {workspaceError} {repositories} {repositoriesError} {currentPath} />
 
   <main class="shell">
     {#if route.page === 'repository'}

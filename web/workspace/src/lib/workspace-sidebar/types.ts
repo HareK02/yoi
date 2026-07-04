@@ -212,6 +212,13 @@ export type GitCommitSummary = {
   refs: string[];
 };
 
+export type RepositoryListResponse = {
+  workspace_id: string;
+  items: RepositorySummary[];
+  source: string;
+  diagnostics: Diagnostic[];
+};
+
 export type RepositoryDetailResponse = {
   workspace_id: string;
   item: RepositorySummary;
