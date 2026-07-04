@@ -2,15 +2,23 @@
   import ObjectivesNavSection from './ObjectivesNavSection.svelte';
   import RepositoriesNavSection from './RepositoriesNavSection.svelte';
   import WorkersNavSection from './WorkersNavSection.svelte';
-  import type { WorkspaceResponse } from './types';
+  import type { RepositoryListResponse, WorkspaceResponse } from './types';
 
   type Props = {
     workspace: WorkspaceResponse | null;
     workspaceError?: string | null;
+    repositories?: RepositoryListResponse | null;
+    repositoriesError?: string | null;
     currentPath?: string;
   };
 
-  let { workspace, workspaceError = null, currentPath = '/' }: Props = $props();
+  let {
+    workspace,
+    workspaceError = null,
+    repositories = null,
+    repositoriesError = null,
+    currentPath = '/'
+  }: Props = $props();
   let settingsActive = $derived(currentPath.startsWith("/settings"));
 </script>
 
@@ -43,7 +51,7 @@
   </header>
 
   <nav class="sidebar-sections" aria-label="Workspace sections">
-    <RepositoriesNavSection {workspace} {currentPath} />
+    <RepositoriesNavSection {repositories} {repositoriesError} {currentPath} />
     <ObjectivesNavSection {currentPath} />
     <WorkersNavSection {currentPath} />
 

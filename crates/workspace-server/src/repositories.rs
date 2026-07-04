@@ -1,351 +1,379 @@
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use serde::{Deserialize, Serialize};
 
-use crate::hosts::{DiagnosticSeverity, RuntimeDiagnostic};
+pub type RepositoryId = String;
+pub type RepositorySelector = String;
 
-const LEGACY_LOCAL_REPOSITORY_ID: &str = "local";
-const LOCAL_REPOSITORY_PREFIX: &str = "local-";
-const MAX_COMMAND_OUTPUT: usize = 4096;
-const DEFAULT_LOG_LIMIT: usize = 10;
-const MAX_LOG_LIMIT: usize = 50;
-const MAX_FIELD_LEN: usize = 240;
-
-#[derive(Debug, Clone)]
-pub struct LocalRepositoryReader {
-    workspace_root: PathBuf,
-    workspace_id: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredRepository {
+    pub id: RepositoryId,
+    pub provider: String,
+    pub uri: String,
+    pub path: PathBuf,
+    pub display_name: Option<String>,
+    pub default_selector: Option<RepositorySelector>,
 }
 
-impl LocalRepositoryReader {
-    pub fn new(workspace_root: impl Into<PathBuf>, workspace_id: impl Into<String>) -> Self {
-        Self {
-            workspace_root: workspace_root.into(),
-            workspace_id: workspace_id.into(),
-        }
-    }
-
-    pub fn list(&self, workspace_display_name: &str) -> Vec<RepositorySummary> {
-        vec![self.summary(workspace_display_name)]
-    }
-
-    pub fn summary(&self, workspace_display_name: &str) -> RepositorySummary {
-        let git = inspect_git(&self.workspace_root);
-        RepositorySummary {
-            id: Self::repository_id_for_workspace(&self.workspace_id),
-            display_name: workspace_display_name.to_string(),
-            kind: "local".to_string(),
-            workspace_root: self.workspace_root.clone(),
-            record_authority: "local_workspace_root".to_string(),
-            git,
-        }
-    }
-
-    pub fn recent_log(&self, requested_limit: Option<usize>) -> RepositoryLogRead {
-        let limit = requested_limit
-            .unwrap_or(DEFAULT_LOG_LIMIT)
-            .clamp(1, MAX_LOG_LIMIT);
-        git_log(&self.workspace_root, limit)
-    }
-
-    pub fn repository_id_for_workspace(workspace_id: &str) -> String {
-        format!(
-            "{LOCAL_REPOSITORY_PREFIX}{}",
-            sanitize_identifier_fragment(workspace_id)
-        )
-    }
-
-    pub fn is_local_repository_id(id: &str, workspace_id: &str) -> bool {
-        id == LEGACY_LOCAL_REPOSITORY_ID || id == Self::repository_id_for_workspace(workspace_id)
-    }
-}
-
-fn sanitize_identifier_fragment(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    let mut previous_dash = false;
-    for ch in value.chars() {
-        let mapped = if ch.is_ascii_alphanumeric() {
-            ch.to_ascii_lowercase()
-        } else {
-            '-'
-        };
-        if mapped == '-' {
-            if !previous_dash {
-                output.push(mapped);
-            }
-            previous_dash = true;
-        } else {
-            output.push(mapped);
-            previous_dash = false;
-        }
-    }
-    let output = output.trim_matches('-').to_string();
-    if output.is_empty() {
-        "workspace".to_string()
-    } else {
-        output
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositorySummary {
-    pub id: String,
+    pub id: RepositoryId,
     pub display_name: String,
     pub kind: String,
-    pub workspace_root: PathBuf,
+    pub provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_selector: Option<RepositorySelector>,
     pub record_authority: String,
-    pub git: GitRepositorySummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitRepositorySummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<RepositoryDiagnostic>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitRepositorySummary {
     pub status: String,
-    pub root: Option<PathBuf>,
-    pub branch: Option<String>,
     pub head: Option<String>,
-    pub dirty: Option<bool>,
-    pub dirty_scope: String,
-    pub remote: Option<GitRemoteSummary>,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
+    pub branch: Option<String>,
+    pub dirty: bool,
+    pub remotes: Vec<GitRemoteSummary>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitRemoteSummary {
     pub name: String,
-    pub url: String,
-    pub redacted: bool,
+    pub fetch_url: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryDiagnostic {
+    pub severity: String,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryListProjection {
+    pub items: Vec<RepositorySummary>,
+    pub diagnostics: Vec<RepositoryDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryLogRead {
+    pub repository_id: RepositoryId,
+    pub default_selector: Option<RepositorySelector>,
+    pub limit: usize,
+    pub commits: Vec<GitCommitSummary>,
+    pub diagnostics: Vec<RepositoryDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitCommitSummary {
     pub hash: String,
-    pub subject: String,
+    pub short_hash: String,
+    pub summary: String,
     pub author_name: String,
     pub author_email: String,
-    pub timestamp: String,
+    pub author_date: String,
+    pub parents: Vec<String>,
+    pub refs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RepositoryLogRead {
-    pub limit: usize,
-    pub items: Vec<GitCommitSummary>,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositoryLookupError {
+    UnknownRepository { id: RepositoryId },
+    UnsupportedProvider { id: RepositoryId, provider: String },
 }
 
-fn inspect_git(workspace_root: &Path) -> GitRepositorySummary {
-    let mut diagnostics = Vec::new();
-    let root = match git_stdout(workspace_root, &["rev-parse", "--show-toplevel"]) {
-        Ok(root) => PathBuf::from(root.trim()),
-        Err(message) => {
-            diagnostics.push(diagnostic(
-                "git_unavailable",
-                "info",
-                format!("Workspace root is not available as a Git repository: {message}"),
-            ));
-            return GitRepositorySummary {
-                status: "unavailable".to_string(),
-                root: None,
-                branch: None,
-                head: None,
-                dirty: None,
-                dirty_scope: "tracked_changes_only".to_string(),
-                remote: None,
-                diagnostics,
+#[derive(Debug, Clone)]
+pub struct RepositoryRegistryReader {
+    repositories: Vec<ConfiguredRepository>,
+}
+
+impl RepositoryRegistryReader {
+    pub fn new(repositories: Vec<ConfiguredRepository>) -> Self {
+        Self { repositories }
+    }
+
+    pub fn list(&self) -> RepositoryListProjection {
+        if self.repositories.is_empty() {
+            return RepositoryListProjection {
+                items: Vec::new(),
+                diagnostics: vec![RepositoryDiagnostic {
+                    severity: "warning".to_string(),
+                    code: "repository_config_empty".to_string(),
+                    message: "No repositories are configured for this workspace backend."
+                        .to_string(),
+                }],
             };
         }
-    };
 
-    let branch = git_stdout(workspace_root, &["branch", "--show-current"])
-        .ok()
-        .map(|value| truncate_field(value.trim(), MAX_FIELD_LEN))
-        .filter(|value| !value.is_empty())
-        .or_else(|| Some("detached".to_string()));
-    let head = match git_stdout(workspace_root, &["rev-parse", "--verify", "HEAD"]) {
-        Ok(value) => Some(truncate_field(value.trim(), 40)),
-        Err(message) => {
-            diagnostics.push(diagnostic(
-                "git_head_unavailable",
-                "warn",
-                format!("Git HEAD summary is unavailable: {message}"),
-            ));
-            None
+        RepositoryListProjection {
+            items: self
+                .repositories
+                .iter()
+                .map(|repository| self.summary_for_config(repository))
+                .collect(),
+            diagnostics: Vec::new(),
         }
-    };
-    let dirty = match git_stdout(
-        workspace_root,
-        &["status", "--porcelain=v1", "--untracked-files=no"],
-    ) {
-        Ok(value) => Some(!value.trim().is_empty()),
-        Err(message) => {
-            diagnostics.push(diagnostic(
-                "git_status_unavailable",
-                "warn",
-                format!("Git dirty status is unavailable: {message}"),
-            ));
-            None
-        }
-    };
-    let remote = match git_stdout(workspace_root, &["remote", "get-url", "origin"]) {
-        Ok(value) => {
-            let (url, redacted) = sanitize_remote_url(value.trim());
-            Some(GitRemoteSummary {
-                name: "origin".to_string(),
-                url,
-                redacted,
-            })
-        }
-        Err(_) => {
-            diagnostics.push(diagnostic(
-                "git_origin_remote_missing",
-                "info",
-                "No origin remote is configured or visible through the bounded Git summary."
-                    .to_string(),
-            ));
-            None
-        }
-    };
-
-    GitRepositorySummary {
-        status: "available".to_string(),
-        root: Some(root),
-        branch,
-        head,
-        dirty,
-        dirty_scope: "tracked_changes_only".to_string(),
-        remote,
-        diagnostics,
-    }
-}
-
-fn git_log(workspace_root: &Path, limit: usize) -> RepositoryLogRead {
-    let mut diagnostics = Vec::new();
-    if let Err(message) = git_stdout(workspace_root, &["rev-parse", "--show-toplevel"]) {
-        diagnostics.push(diagnostic(
-            "git_unavailable",
-            "info",
-            format!("Recent Git log is unavailable for this local repository: {message}"),
-        ));
-        return RepositoryLogRead {
-            limit,
-            items: Vec::new(),
-            diagnostics,
-        };
     }
 
-    match git_stdout(
-        workspace_root,
-        &[
-            "log",
-            "--no-show-signature",
-            "--date=iso-strict",
-            "--format=%H%x1f%an%x1f%ae%x1f%aI%x1f%s%x1e",
-            "-n",
-            &limit.to_string(),
-        ],
-    ) {
-        Ok(output) => RepositoryLogRead {
-            limit,
-            items: parse_log(output.as_str()),
-            diagnostics,
-        },
-        Err(message) => {
-            diagnostics.push(diagnostic(
-                "git_log_unavailable",
-                "warn",
-                format!("Recent Git log is unavailable: {message}"),
-            ));
-            RepositoryLogRead {
-                limit,
-                items: Vec::new(),
-                diagnostics,
+    pub fn summary(&self, id: &str) -> Result<RepositorySummary, RepositoryLookupError> {
+        let repository = self
+            .find(id)
+            .ok_or_else(|| RepositoryLookupError::UnknownRepository { id: id.to_string() })?;
+        Ok(self.summary_for_config(repository))
+    }
+
+    pub fn recent_log(
+        &self,
+        id: &str,
+        limit: Option<usize>,
+    ) -> Result<RepositoryLogRead, RepositoryLookupError> {
+        let repository = self
+            .find(id)
+            .ok_or_else(|| RepositoryLookupError::UnknownRepository { id: id.to_string() })?;
+        if repository.provider != "git" {
+            return Err(RepositoryLookupError::UnsupportedProvider {
+                id: repository.id.clone(),
+                provider: repository.provider.clone(),
+            });
+        }
+
+        let limit = limit.unwrap_or(40).clamp(1, 200);
+        let mut diagnostics = Vec::new();
+        let commits = match self.git_log(repository, limit) {
+            Ok(commits) => commits,
+            Err(message) => {
+                diagnostics.push(RepositoryDiagnostic {
+                    severity: "warning".to_string(),
+                    code: "repository_git_log_unavailable".to_string(),
+                    message,
+                });
+                Vec::new()
             }
+        };
+
+        Ok(RepositoryLogRead {
+            repository_id: repository.id.clone(),
+            default_selector: repository.default_selector.clone(),
+            limit,
+            commits,
+            diagnostics,
+        })
+    }
+
+    fn find(&self, id: &str) -> Option<&ConfiguredRepository> {
+        self.repositories
+            .iter()
+            .find(|repository| repository.id == id)
+    }
+
+    fn summary_for_config(&self, repository: &ConfiguredRepository) -> RepositorySummary {
+        let display_name = repository
+            .display_name
+            .clone()
+            .unwrap_or_else(|| repository.id.clone());
+        let mut diagnostics = Vec::new();
+        let git = match repository.provider.as_str() {
+            "git" => match self.inspect_git(repository) {
+                Ok(git) => Some(git),
+                Err(message) => {
+                    diagnostics.push(RepositoryDiagnostic {
+                        severity: "warning".to_string(),
+                        code: "repository_git_unavailable".to_string(),
+                        message,
+                    });
+                    None
+                }
+            },
+            provider => {
+                diagnostics.push(RepositoryDiagnostic {
+                    severity: "warning".to_string(),
+                    code: "repository_provider_unsupported".to_string(),
+                    message: format!(
+                        "Repository provider `{provider}` is configured but is not supported by the workspace backend API."
+                    ),
+                });
+                None
+            }
+        };
+
+        RepositorySummary {
+            id: repository.id.clone(),
+            display_name,
+            kind: repository.provider.clone(),
+            provider: repository.provider.clone(),
+            default_selector: repository.default_selector.clone(),
+            record_authority: "workspace-backend-config".to_string(),
+            git,
+            diagnostics,
         }
+    }
+
+    fn inspect_git(
+        &self,
+        repository: &ConfiguredRepository,
+    ) -> Result<GitRepositorySummary, String> {
+        let head = git_stdout(&repository.path, ["rev-parse", "HEAD"])?;
+        let branch = git_stdout(&repository.path, ["branch", "--show-current"])
+            .ok()
+            .and_then(|value| non_empty_string(value.trim()));
+        let status = git_stdout(&repository.path, ["status", "--porcelain"])?;
+        let remotes = git_stdout(&repository.path, ["remote", "-v"])
+            .map(|raw| parse_remotes(&raw))
+            .unwrap_or_default();
+        Ok(GitRepositorySummary {
+            status: "available".to_string(),
+            head: non_empty_string(head.trim()),
+            branch,
+            dirty: !status.trim().is_empty(),
+            remotes,
+        })
+    }
+
+    fn git_log(
+        &self,
+        repository: &ConfiguredRepository,
+        limit: usize,
+    ) -> Result<Vec<GitCommitSummary>, String> {
+        let limit_arg = format!("-{limit}");
+        let output = git_stdout(
+            &repository.path,
+            [
+                "log",
+                "--date=iso-strict",
+                "--decorate=short",
+                "--pretty=format:%H%x1f%h%x1f%s%x1f%an%x1f%ae%x1f%aI%x1f%P%x1f%D%x1e",
+                limit_arg.as_str(),
+            ],
+        )?;
+        Ok(parse_git_log(&output))
     }
 }
 
-fn parse_log(output: &str) -> Vec<GitCommitSummary> {
-    output
-        .split('\u{1e}')
+fn git_stdout<'a, I>(repository_path: &PathBuf, args: I) -> Result<String, String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository_path)
+        .args(args)
+        .output()
+        .map_err(|_| {
+            "Git command could not be executed; backend-private path details were omitted."
+                .to_string()
+        })?;
+    if !output.status.success() {
+        return Err("Git command failed; backend-private path details were omitted.".to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn parse_remotes(raw: &str) -> Vec<GitRemoteSummary> {
+    let mut seen = BTreeSet::new();
+    let mut remotes = Vec::new();
+    for line in raw.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        let Some(url) = parts.next() else {
+            continue;
+        };
+        if !seen.insert((name.to_string(), url.to_string())) {
+            continue;
+        }
+        remotes.push(GitRemoteSummary {
+            name: name.to_string(),
+            fetch_url: sanitize_remote_url(url),
+        });
+    }
+    remotes
+}
+
+fn parse_git_log(raw: &str) -> Vec<GitCommitSummary> {
+    raw.split('\u{1e}')
         .filter_map(|record| {
-            let record = record.trim_matches('\n');
-            if record.is_empty() {
+            let trimmed = record.trim_matches('\n').trim_end();
+            if trimmed.is_empty() {
                 return None;
             }
-            let mut fields = record.split('\u{1f}');
+            let mut fields = trimmed.split('\u{1f}');
+            let hash = fields.next()?.to_string();
+            let short_hash = fields.next().unwrap_or_default().to_string();
+            let summary = fields.next().unwrap_or_default().to_string();
+            let author_name = fields.next().unwrap_or_default().to_string();
+            let author_email = fields.next().unwrap_or_default().to_string();
+            let author_date = fields.next().unwrap_or_default().to_string();
+            let parents = fields
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(ToString::to_string)
+                .collect();
+            let refs = fields
+                .next()
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|reference| !reference.is_empty())
+                .map(ToString::to_string)
+                .collect();
             Some(GitCommitSummary {
-                hash: truncate_field(fields.next()?, 40),
-                author_name: truncate_field(fields.next().unwrap_or_default(), MAX_FIELD_LEN),
-                author_email: truncate_field(fields.next().unwrap_or_default(), MAX_FIELD_LEN),
-                timestamp: truncate_field(fields.next().unwrap_or_default(), MAX_FIELD_LEN),
-                subject: truncate_field(fields.next().unwrap_or_default(), MAX_FIELD_LEN),
+                hash,
+                short_hash,
+                summary,
+                author_name,
+                author_email,
+                author_date,
+                parents,
+                refs,
             })
         })
         .collect()
 }
 
-fn git_stdout(workspace_root: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(workspace_root)
-        .args(args)
-        .output()
-        .map_err(|error| truncate_field(&error.to_string(), MAX_FIELD_LEN))?;
-    command_stdout(output)
+fn sanitize_remote_url(url: &str) -> String {
+    let trimmed = url.trim();
+    if is_local_path_like(trimmed) {
+        return "<redacted-local-path>".to_string();
+    }
+
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return trimmed.to_string();
+    };
+    if scheme.eq_ignore_ascii_case("file") {
+        return "file://<redacted-local-path>".to_string();
+    }
+    let Some((_credentials, host_path)) = rest.split_once('@') else {
+        return trimmed.to_string();
+    };
+    format!("{scheme}://<redacted>@{host_path}")
 }
 
-fn command_stdout(output: Output) -> Result<String, String> {
-    if output.status.success() {
-        return Ok(truncate_output(
-            String::from_utf8_lossy(&output.stdout).as_ref(),
-        ));
-    }
-    let stderr = truncate_output(String::from_utf8_lossy(&output.stderr).as_ref());
-    if stderr.trim().is_empty() {
-        Err(format!("git exited with status {}", output.status))
+fn is_local_path_like(value: &str) -> bool {
+    Path::new(value).is_absolute() || is_windows_absolute_path_like(value)
+}
+
+fn is_windows_absolute_path_like(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    if value.is_empty() {
+        None
     } else {
-        Err(stderr.trim().to_string())
-    }
-}
-
-fn sanitize_remote_url(raw: &str) -> (String, bool) {
-    let bounded = truncate_field(raw, MAX_FIELD_LEN);
-    let Some(separator) = bounded.find("://") else {
-        return (bounded, false);
-    };
-    let scheme_end = separator + 3;
-    let after_scheme = &bounded[scheme_end..];
-    let Some(at_index) = after_scheme.find('@') else {
-        return (bounded, false);
-    };
-    let host_and_path = &after_scheme[(at_index + 1)..];
-    (format!("{}{}", &bounded[..scheme_end], host_and_path), true)
-}
-
-fn truncate_output(value: &str) -> String {
-    truncate_field(value, MAX_COMMAND_OUTPUT)
-}
-
-fn truncate_field(value: &str, limit: usize) -> String {
-    if value.len() <= limit {
-        return value.to_string();
-    }
-    let mut end = limit;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value[..end].to_string()
-}
-
-fn diagnostic(code: &str, severity: &str, message: String) -> RuntimeDiagnostic {
-    RuntimeDiagnostic {
-        code: code.to_string(),
-        severity: match severity {
-            "error" => DiagnosticSeverity::Error,
-            "warning" => DiagnosticSeverity::Warning,
-            _ => DiagnosticSeverity::Info,
-        },
-        message,
+        Some(value.to_string())
     }
 }
 
@@ -354,24 +382,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sanitizes_userinfo_from_url_remotes() {
+    fn sanitizes_remote_credentials_and_local_paths() {
         assert_eq!(
-            sanitize_remote_url("https://token@example.com/org/repo.git"),
-            ("https://example.com/org/repo.git".to_string(), true)
+            sanitize_remote_url("https://user:token@example.com/org/repo.git"),
+            "https://<redacted>@example.com/org/repo.git"
         );
         assert_eq!(
             sanitize_remote_url("git@example.com:org/repo.git"),
-            ("git@example.com:org/repo.git".to_string(), false)
+            "git@example.com:org/repo.git"
+        );
+        assert_eq!(
+            sanitize_remote_url("/home/alice/private/repo.git"),
+            "<redacted-local-path>"
+        );
+        assert_eq!(
+            sanitize_remote_url("/Users/alice/private/repo.git"),
+            "<redacted-local-path>"
+        );
+        assert_eq!(
+            sanitize_remote_url("C:\\Users\\alice\\private\\repo.git"),
+            "<redacted-local-path>"
+        );
+        assert_eq!(
+            sanitize_remote_url("file:///home/alice/private/repo.git"),
+            "file://<redacted-local-path>"
+        );
+        assert_eq!(
+            sanitize_remote_url("file://localhost/home/alice/private/repo.git"),
+            "file://<redacted-local-path>"
         );
     }
 
     #[test]
-    fn parses_bounded_git_log_records() {
-        let parsed = parse_log(
-            "0123456789abcdef\u{1f}Alice\u{1f}a@example.test\u{1f}2026-01-01T00:00:00+00:00\u{1f}Subject\u{1e}\n",
+    fn empty_registry_reports_diagnostic_without_implicit_repository() {
+        let projection = RepositoryRegistryReader::new(Vec::new()).list();
+
+        assert!(projection.items.is_empty());
+        assert_eq!(projection.diagnostics.len(), 1);
+        assert_eq!(projection.diagnostics[0].code, "repository_config_empty");
+    }
+
+    #[test]
+    fn unknown_repository_is_not_resolved_from_fallback() {
+        let reader = RepositoryRegistryReader::new(Vec::new());
+
+        assert_eq!(
+            reader.summary("main").unwrap_err(),
+            RepositoryLookupError::UnknownRepository {
+                id: "main".to_string()
+            }
         );
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].hash, "0123456789abcdef");
-        assert_eq!(parsed[0].subject, "Subject");
     }
 }

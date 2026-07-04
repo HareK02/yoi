@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::hosts::RemoteRuntimeConfig;
 use crate::identity::WorkspaceIdentity;
+use crate::repositories::ConfiguredRepository;
 use crate::server::{AuthConfig, ServerConfig};
 use crate::{Error, Result};
 
@@ -25,6 +26,8 @@ pub struct WorkspaceBackendConfigFile {
     pub data: WorkspaceBackendDataConfig,
     #[serde(default)]
     pub limits: WorkspaceBackendLimitsConfig,
+    #[serde(default)]
+    pub repositories: Vec<WorkspaceRepositoryConfigFile>,
     #[serde(default)]
     pub runtimes: WorkspaceBackendRuntimesConfig,
 }
@@ -56,6 +59,18 @@ pub struct WorkspaceBackendDataConfig {
 pub struct WorkspaceBackendLimitsConfig {
     #[serde(default)]
     pub max_records: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceRepositoryConfigFile {
+    pub id: String,
+    pub provider: String,
+    pub uri: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub default_selector: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -264,6 +279,11 @@ impl WorkspaceBackendConfigFile {
             .map(|path| resolve_workspace_path(workspace_root, path));
         server.embedded_runtime_store_root = embedded_runtime_store_root;
         server.max_records = self.limits.max_records.unwrap_or(DEFAULT_MAX_RECORDS);
+        server.repositories = self
+            .repositories
+            .iter()
+            .map(|repository| resolve_repository(workspace_root, repository))
+            .collect::<Result<Vec<_>>>()?;
         server.remote_runtime_sources = self
             .runtimes
             .remote
@@ -297,6 +317,70 @@ impl ResolvedWorkspaceBackendConfig {
         self.listen = listen;
         self
     }
+}
+
+fn resolve_repository(
+    workspace_root: &Path,
+    config: &WorkspaceRepositoryConfigFile,
+) -> Result<ConfiguredRepository> {
+    let id = normalize_required_string("repository id", &config.id)?;
+    validate_repository_id(&id)?;
+    let provider =
+        normalize_required_string("repository provider", &config.provider)?.to_ascii_lowercase();
+    let uri = normalize_required_string("repository uri", &config.uri)?;
+    let path = resolve_repository_uri(workspace_root, &id, &uri)?;
+    let display_name = normalize_optional_string(config.display_name.as_deref());
+    let default_selector = normalize_optional_string(config.default_selector.as_deref());
+
+    Ok(ConfiguredRepository {
+        id,
+        provider,
+        uri,
+        path,
+        display_name,
+        default_selector,
+    })
+}
+
+fn normalize_required_string(field: &str, value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(Error::Config(format!("{field} must not be empty")));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn normalize_optional_string(value: Option<&str>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn validate_repository_id(id: &str) -> Result<()> {
+    if id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        Ok(())
+    } else {
+        Err(Error::Config(format!(
+            "repository id `{id}` must contain only ASCII letters, digits, `_`, `-`, or `.`"
+        )))
+    }
+}
+
+fn resolve_repository_uri(workspace_root: &Path, id: &str, uri: &str) -> Result<PathBuf> {
+    if uri.contains("://") {
+        return Err(Error::Config(format!(
+            "repository `{id}` uses a remote URI, but remote repository materialization is not implemented"
+        )));
+    }
+    Ok(resolve_workspace_path(workspace_root, Path::new(uri)))
 }
 
 pub(crate) fn resolve_remote_runtime(
@@ -477,6 +561,57 @@ root = ".local-data"
         assert!(diff.differs);
         assert!(diff.text.contains("+++ workspace local"));
         assert!(diff.text.contains("127.0.0.1:9999"));
+    }
+
+    #[test]
+    fn resolves_repository_uri_relative_to_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = WorkspaceBackendConfigFile::parse_str(
+            r#"
+[[repositories]]
+id = "main"
+provider = "git"
+uri = "."
+display_name = "Main"
+default_selector = "HEAD"
+"#,
+            "test",
+        )
+        .unwrap();
+        let resolved = config.resolve(dir.path(), identity()).unwrap();
+        let repository = resolved.server.repositories.first().unwrap();
+
+        assert_eq!(repository.id, "main");
+        assert_eq!(repository.provider, "git");
+        assert_eq!(repository.path, dir.path());
+        assert_eq!(repository.display_name.as_deref(), Some("Main"));
+        assert_eq!(repository.default_selector.as_deref(), Some("HEAD"));
+    }
+
+    #[test]
+    fn remote_repository_uri_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = WorkspaceBackendConfigFile::parse_str(
+            r#"
+[[repositories]]
+id = "main"
+provider = "git"
+uri = "https://example.com/org/repo.git"
+"#,
+            "test",
+        )
+        .unwrap();
+        let error = match config.resolve(dir.path(), identity()) {
+            Ok(_) => panic!("remote repository URI should fail closed"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("remote repository materialization is not implemented"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

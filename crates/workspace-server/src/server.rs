@@ -35,7 +35,10 @@ use crate::observation::{
 use crate::records::{
     LocalProjectRecordReader, ObjectiveDetail, ProjectRecordList, TicketDetail, TicketSummary,
 };
-use crate::repositories::{LocalRepositoryReader, RepositoryLogRead, RepositorySummary};
+use crate::repositories::{
+    ConfiguredRepository, RepositoryListProjection, RepositoryLogRead, RepositoryLookupError,
+    RepositoryRegistryReader, RepositorySummary,
+};
 use crate::store::{ControlPlaneStore, WorkspaceRecord};
 use crate::{Error, Result};
 use worker_runtime::catalog::{ConfigBundleRef, ProfileSelector};
@@ -68,6 +71,7 @@ pub struct ServerConfig {
     pub static_assets_dir: Option<PathBuf>,
     pub auth: AuthConfig,
     pub max_records: usize,
+    pub repositories: Vec<ConfiguredRepository>,
     pub runtime_event_sources: Vec<RuntimeObservationSourceConfig>,
     pub remote_runtime_sources: Vec<RemoteRuntimeConfig>,
 }
@@ -89,6 +93,7 @@ impl ServerConfig {
                 token_configured: false,
             },
             max_records: 200,
+            repositories: Vec::new(),
             runtime_event_sources: Vec::new(),
             remote_runtime_sources: Vec::new(),
         }
@@ -202,19 +207,8 @@ impl WorkspaceApi {
         self.config.workspace_id.as_str()
     }
 
-    fn local_repository_reader(&self) -> LocalRepositoryReader {
-        LocalRepositoryReader::new(
-            self.config.workspace_root.clone(),
-            self.config.workspace_id.clone(),
-        )
-    }
-
-    fn local_repository_id(&self) -> String {
-        LocalRepositoryReader::repository_id_for_workspace(self.workspace_id())
-    }
-
-    fn workspace_display_name(&self) -> &str {
-        self.config.workspace_display_name.as_str()
+    fn repository_reader(&self) -> RepositoryRegistryReader {
+        RepositoryRegistryReader::new(self.config.repositories.clone())
     }
 }
 
@@ -479,6 +473,8 @@ pub struct RepositoryDetailResponse {
 pub struct RepositoryLogResponse {
     pub workspace_id: String,
     pub repository_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_selector: Option<String>,
     pub limit: usize,
     pub items: Vec<crate::repositories::GitCommitSummary>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
@@ -633,13 +629,12 @@ async fn get_objective(
 async fn list_repositories(
     State(api): State<WorkspaceApi>,
 ) -> ApiResult<Json<RepositoryListResponse>> {
-    let reader = api.local_repository_reader();
-    let items = reader.list(api.workspace_display_name());
+    let RepositoryListProjection { items, diagnostics } = api.repository_reader().list();
     Ok(Json(RepositoryListResponse {
         workspace_id: api.config.workspace_id,
         items,
-        source: "local_workspace_root".to_string(),
-        diagnostics: Vec::new(),
+        source: "workspace_backend_config".to_string(),
+        diagnostics: repository_diagnostics(diagnostics),
     }))
 }
 
@@ -647,12 +642,11 @@ async fn repository_detail(
     State(api): State<WorkspaceApi>,
     AxumPath(repository_id): AxumPath<String>,
 ) -> ApiResult<Json<RepositoryDetailResponse>> {
-    let _canonical_repository_id = ensure_local_repository(&api, &repository_id)?;
-    let reader = api.local_repository_reader();
+    let item = repository_lookup(api.repository_reader().summary(&repository_id))?;
     Ok(Json(RepositoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
-        item: reader.summary(api.workspace_display_name()),
-        source: "local_workspace_root".to_string(),
+        item,
+        source: "workspace_backend_config".to_string(),
     }))
 }
 
@@ -661,18 +655,23 @@ async fn repository_log(
     AxumPath(repository_id): AxumPath<String>,
     Query(query): Query<LogQuery>,
 ) -> ApiResult<Json<RepositoryLogResponse>> {
-    let canonical_repository_id = ensure_local_repository(&api, &repository_id)?;
     let RepositoryLogRead {
+        repository_id,
+        default_selector,
         limit,
-        items,
+        commits,
         diagnostics,
-    } = api.local_repository_reader().recent_log(query.limit);
+    } = repository_lookup(
+        api.repository_reader()
+            .recent_log(&repository_id, query.limit),
+    )?;
     Ok(Json(RepositoryLogResponse {
         workspace_id: api.config.workspace_id,
-        repository_id: canonical_repository_id,
+        repository_id,
+        default_selector,
         limit,
-        items,
-        diagnostics,
+        items: commits,
+        diagnostics: repository_diagnostics(diagnostics),
     }))
 }
 
@@ -681,7 +680,8 @@ async fn repository_tickets(
     AxumPath(repository_id): AxumPath<String>,
     Query(query): Query<TicketKanbanQuery>,
 ) -> ApiResult<Json<RepositoryTicketsResponse>> {
-    let canonical_repository_id = ensure_local_repository(&api, &repository_id)?;
+    repository_lookup(api.repository_reader().summary(&repository_id))?;
+    let canonical_repository_id = repository_id;
     let limit = query.limit.unwrap_or(api.config.max_records).min(200);
     let ProjectRecordList {
         items,
@@ -2056,13 +2056,58 @@ fn sanitize_backend_error(_message: &str) -> String {
     "operation failed; backend-private details were omitted".to_string()
 }
 
-fn ensure_local_repository(api: &WorkspaceApi, repository_id: &str) -> Result<String> {
-    let canonical_repository_id = api.local_repository_id();
-    if LocalRepositoryReader::is_local_repository_id(repository_id, api.workspace_id()) {
-        Ok(canonical_repository_id)
-    } else {
-        Err(Error::UnknownRepository(repository_id.to_string()))
-    }
+fn repository_diagnostics(
+    diagnostics: Vec<crate::repositories::RepositoryDiagnostic>,
+) -> Vec<RuntimeDiagnostic> {
+    diagnostics
+        .into_iter()
+        .map(|diagnostic| RuntimeDiagnostic {
+            code: diagnostic.code,
+            severity: match diagnostic.severity.as_str() {
+                "error" => DiagnosticSeverity::Error,
+                "warning" => DiagnosticSeverity::Warning,
+                _ => DiagnosticSeverity::Info,
+            },
+            message: diagnostic.message,
+        })
+        .collect()
+}
+
+fn repository_lookup<T>(result: std::result::Result<T, RepositoryLookupError>) -> ApiResult<T> {
+    result.map_err(|error| match error {
+        RepositoryLookupError::UnknownRepository { id } => {
+            let message = format!("repository `{id}` is not configured for this workspace");
+            ApiError::with_diagnostics(
+                Error::RuntimeOperationFailed {
+                    runtime_id: "workspace-repository-registry".to_string(),
+                    code: "repository_not_configured".to_string(),
+                    message: message.clone(),
+                },
+                vec![RuntimeDiagnostic {
+                    code: "repository_not_configured".to_string(),
+                    severity: DiagnosticSeverity::Error,
+                    message,
+                }],
+            )
+        }
+        RepositoryLookupError::UnsupportedProvider { id, provider } => {
+            let message = format!(
+                "repository `{id}` uses unsupported provider `{provider}` for this operation"
+            );
+            ApiError::with_diagnostics(
+                Error::RuntimeOperationFailed {
+                    runtime_id: "workspace-repository-registry".to_string(),
+                    code: "repository_provider_unsupported".to_string(),
+                    message: message.clone(),
+                },
+                vec![RuntimeDiagnostic {
+                    code: "repository_provider_unsupported".to_string(),
+                    severity: DiagnosticSeverity::Error,
+                    message,
+                }],
+            )
+        }
+    })
 }
 
 fn ticket_kanban_columns(items: Vec<TicketSummary>) -> Vec<TicketKanbanColumn> {
@@ -2231,6 +2276,14 @@ impl IntoResponse for ApiError {
             | Error::UnknownRepository(_) => StatusCode::NOT_FOUND,
             Error::Ticket(_) => StatusCode::NOT_FOUND,
             Error::RuntimeCapabilityUnsupported { .. } => StatusCode::NOT_IMPLEMENTED,
+            Error::RuntimeOperationFailed { code, .. } if code == "repository_not_configured" => {
+                StatusCode::NOT_FOUND
+            }
+            Error::RuntimeOperationFailed { code, .. }
+                if code == "repository_provider_unsupported" =>
+            {
+                StatusCode::BAD_REQUEST
+            }
             Error::RuntimeOperationFailed { code, .. } if code == "remote_runtime_auth_failed" => {
                 StatusCode::UNAUTHORIZED
             }
@@ -2290,7 +2343,7 @@ mod tests {
     use crate::store::SqliteWorkspaceStore;
 
     const TEST_WORKSPACE_ID: &str = "0192f0e8-4d84-7d6e-a000-000000000001";
-    const TEST_REPOSITORY_ID: &str = "local-0192f0e8-4d84-7d6e-a000-000000000001";
+    const TEST_REPOSITORY_ID: &str = "main";
     const TEST_CREATED_AT: &str = "2026-06-23T06:43:28Z";
 
     #[test]
@@ -2402,8 +2455,17 @@ mod tests {
     fn test_server_config(workspace_root: impl Into<PathBuf>) -> ServerConfig {
         let workspace_root = workspace_root.into();
         let store_root = workspace_root.join(".test-embedded-runtime-store");
-        ServerConfig::local_dev(workspace_root, test_identity())
-            .with_embedded_runtime_store_root(store_root)
+        let mut config = ServerConfig::local_dev(workspace_root.clone(), test_identity())
+            .with_embedded_runtime_store_root(store_root);
+        config.repositories = vec![ConfiguredRepository {
+            id: TEST_REPOSITORY_ID.to_string(),
+            provider: "git".to_string(),
+            uri: ".".to_string(),
+            path: workspace_root,
+            display_name: Some("Test Repository".to_string()),
+            default_selector: Some("HEAD".to_string()),
+        }];
+        config
     }
 
     async fn test_app(workspace_root: impl Into<PathBuf>) -> Router {
@@ -2861,16 +2923,26 @@ mod tests {
 
         let repositories = get_json(app.clone(), "/api/repositories").await;
         assert_eq!(repositories["items"][0]["id"], TEST_REPOSITORY_ID);
-        assert_eq!(repositories["items"][0]["kind"], "local");
+        assert_eq!(repositories["items"][0]["kind"], "git");
+        assert_eq!(
+            repositories["items"][0]["record_authority"],
+            "workspace-backend-config"
+        );
+        assert!(
+            repositories
+                .to_string()
+                .contains("repository_git_unavailable")
+        );
 
-        let repository_detail = get_json(app.clone(), "/api/repositories/local").await;
+        let repository_detail = get_json(app.clone(), "/api/repositories/main").await;
         assert_eq!(repository_detail["item"]["id"], TEST_REPOSITORY_ID);
 
-        let repository_log = get_json(app.clone(), "/api/repositories/local/log?limit=3").await;
+        let repository_log = get_json(app.clone(), "/api/repositories/main/log?limit=3").await;
         assert_eq!(repository_log["repository_id"], TEST_REPOSITORY_ID);
+        assert_eq!(repository_log["default_selector"], "HEAD");
         assert_eq!(repository_log["limit"], 3);
 
-        let repository_tickets = get_json(app.clone(), "/api/repositories/local/tickets").await;
+        let repository_tickets = get_json(app.clone(), "/api/repositories/main/tickets").await;
         assert_eq!(repository_tickets["repository_id"], TEST_REPOSITORY_ID);
         let ready_column = repository_tickets["columns"]
             .as_array()
@@ -3322,6 +3394,77 @@ mod tests {
                 "{uri} leaked embedded runtime store root: {serialized}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn empty_repository_config_returns_empty_list_with_warning() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_server_config(root.path());
+        config.repositories.clear();
+        let api = WorkspaceApi::new_with_execution_backend(
+            config,
+            Arc::new(SqliteWorkspaceStore::in_memory().unwrap()),
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .await
+        .unwrap();
+        let app = build_router(api);
+
+        let repositories = get_json(app, "/api/repositories").await;
+
+        assert!(repositories["items"].as_array().unwrap().is_empty());
+        assert_eq!(
+            repositories["diagnostics"][0]["code"],
+            "repository_config_empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_log_rejects_unknown_or_unsupported_configured_repository() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = test_server_config(root.path());
+        config.repositories = vec![ConfiguredRepository {
+            id: "files".to_string(),
+            provider: "local_fs".to_string(),
+            uri: ".".to_string(),
+            path: root.path().to_path_buf(),
+            display_name: None,
+            default_selector: None,
+        }];
+        let api = WorkspaceApi::new_with_execution_backend(
+            config,
+            Arc::new(SqliteWorkspaceStore::in_memory().unwrap()),
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .await
+        .unwrap();
+        let app = build_router(api);
+
+        let unknown = request_json(
+            app.clone(),
+            "GET",
+            "/api/repositories/main/log",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_eq!(
+            unknown["diagnostics"][0]["code"],
+            "repository_not_configured"
+        );
+
+        let unsupported = request_json(
+            app,
+            "GET",
+            "/api/repositories/files/log",
+            None,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_eq!(
+            unsupported["diagnostics"][0]["code"],
+            "repository_provider_unsupported"
+        );
     }
 
     #[tokio::test]
