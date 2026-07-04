@@ -150,3 +150,32 @@ Implementation routing update:
 - 完了後は diff / validation evidence を Orchestrator が確認し、別 sibling Reviewer Pod に read-only review を依頼する。`StopPod` は既知の不具合があるため使用しない。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-04T19:58:53Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Coder Pod completed implementation and committed `2f0d1cee feat: add workspace repository registry` on branch `work/00001KWPC13WQ-repository-registry`.
+- Worktree status was clean after commit.
+- Changed files include:
+  - `.yoi/workspace-backend.local.toml`
+  - `resources/workspace-backend.default.toml`
+  - `crates/workspace-server/src/config.rs`
+  - `crates/workspace-server/src/lib.rs`
+  - `crates/workspace-server/src/repositories.rs`
+  - `crates/workspace-server/src/server.rs`
+  - web workspace repository/sidebar route files.
+- Implementation summary: explicit `[[repositories]]` registry, config-root-relative `uri`, no implicit cwd/workspace-root repository fallback, empty registry diagnostic, configured-id-only log route, typed sanitized unknown/unsupported diagnostics, dogfood `main` repository entry.
+- Orchestrator reran validation in the implementation worktree:
+  - `git diff --check`: pass
+  - `cargo test -p yoi-workspace-server`: pass（63 lib tests + 2 main tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（13 tests）
+  - `yoi ticket doctor`: ok
+- `nix build .#yoi --no-link` は Cargo.lock / dependency / resource packaging / Nix 変更ではないため未実行。
+- External review will be requested via a read-only sibling Reviewer Pod. `StopPod` は使わない。
+
+---

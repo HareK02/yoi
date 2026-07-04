@@ -2,7 +2,7 @@
 title: 'Config-driven Repository registry for Workspace Backend'
 state: 'inprogress'
 created_at: '2026-07-04T10:50:45Z'
-updated_at: '2026-07-04T19:36:56Z'
+updated_at: '2026-07-04T19:58:53Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-07-04T19:34:04Z'
