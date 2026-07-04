@@ -1,8 +1,8 @@
 ---
 title: 'Config-driven Repository registry for Workspace Backend'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-07-04T10:50:45Z'
-updated_at: '2026-07-04T20:17:56Z'
+updated_at: '2026-07-04T20:19:15Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-07-04T19:34:04Z'
