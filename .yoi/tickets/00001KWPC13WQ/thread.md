@@ -210,3 +210,29 @@ Non-blocking follow-ups:
 - Consider a stricter public `GitRemoteSummary` shape that reports only sanitized display metadata, not raw fetch URLs。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-04T20:11:32Z -->
+
+## Implementation report
+
+Review-fix implementation report:
+
+- Coder Pod completed requested changes and committed follow-up `14e63ca5 fix: derive repository UI from registry` on branch `work/00001KWPC13WQ-repository-registry`.
+- Worktree status was clean after commit.
+- Fix summary:
+  - Web UI no longer hardcodes implicit `main` repository navigation/default route behavior.
+  - Repository navigation is derived from configured repositories; empty registry does not invent `main` and can surface diagnostics such as `repository_config_empty`.
+  - Repository details/tickets load only for explicit repository routes.
+  - Browser-facing Git remote display values now redact local absolute remotes such as `/home/...`, `/Users/...`, Windows-style absolute paths, `file:///...`, and `file://localhost/...`, while preserving credential redaction.
+  - Added focused web tests for empty registry and non-`main` configured repository navigation.
+- Orchestrator reran validation in the implementation worktree:
+  - `git diff --check`: pass
+  - `cargo test -p yoi-workspace-server`: pass（63 lib tests + 2 main tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（15 tests）
+  - `yoi ticket doctor`: ok
+- `nix build .#yoi --no-link` は Cargo.lock / dependency / resource packaging / Nix 変更ではないため未実行。
+- Requesting follow-up external review against `2f0d1cee..14e63ca5` and full combined implementation。
+
+---
