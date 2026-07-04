@@ -236,3 +236,32 @@ Review-fix implementation report:
 - Requesting follow-up external review against `2f0d1cee..14e63ca5` and full combined implementation。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-04T20:17:56Z status: approve -->
+
+## Review: approve
+
+External follow-up review result: approve
+
+Blockers: none.
+
+Evidence reviewed in implementation worktree only:
+- Ticket `00001KWPC13WQ` item/thread and IntentPacket: explicit config-driven registry, no cwd/workspace-root fallback, `uri = "."` relative to workspace config root, browser-facing path/secret invariant.
+- `git show --stat --check 14e63ca5`, `git diff --stat 2f0d1cee..14e63ca5`, combined changed-file set, and relevant full files.
+
+Findings:
+- Prior blocker 1 fixed: `/api/repositories` is built from `config.repositories` only, empty registry returns empty items plus `repository_config_empty`, sidebar derives links via `projectRepositoryNav`, no hardcoded `/repositories/main` remains, `WorkspacePage` no longer defaults to `main`, repository fetches happen only for explicit route ids, and non-`main` ids are covered by tests。
+- Prior blocker 2 fixed: Browser-facing `RepositorySummary` does not serialize configured `uri` or resolved local `path`; Git command failure diagnostics are generic; remote URLs redact credentials and local absolute/file remotes including `/home/...`, `/Users/...`, Windows absolute paths, `file:///...`, and `file://localhost/...`, with tests。
+- `uri = "."` resolves against workspace/config root, not process cwd, with unit test。
+- Unknown repository ids map to typed `repository_not_configured` diagnostics and 404。
+- Unsupported providers for git log map to typed `repository_provider_unsupported` diagnostics and 400。
+- Dogfood `.yoi/workspace-backend.local.toml` contains explicit `main` git repository entry with `uri = "."` and no secret/local-only fields。
+- No implicit workspace-root/cwd repository fallback found in Browser/API output paths。
+
+Validation note:
+- Reviewer did not rerun the full test suite; reviewer relied on Orchestrator-reported passing validation and performed read-only diff/file inspection。
+- `git show --check` had no whitespace errors for the fix commit。
+
+No merge-blocking issues found.
+
+---
