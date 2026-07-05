@@ -41,6 +41,17 @@ frontend_url = "http://127.0.0.1:5173"
 [limits]
 max_records = 200
 
+# Repository registry. Browser/API repository projection reads only configured
+# entries and never falls back to the backend process cwd. Relative URI values
+# are resolved from this workspace config root. Git is the v0 supported provider.
+#
+# [[repositories]]
+# id = "main"
+# provider = "git"
+# uri = "."
+# display_name = "Main repository"
+# default_selector = "HEAD"
+
 # Remote Runtime sources. Token values must not be written here.
 # Use token_ref only after secret-ref resolution is implemented for this config.
 #
