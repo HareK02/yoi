@@ -1,5 +1,8 @@
-# Dogfood Workspace Backend configuration.
-# Repository URI values are resolved from this workspace config root.
+[server]
+
+[data]
+
+[limits]
 
 [[repositories]]
 id = "main"
@@ -7,3 +10,8 @@ provider = "git"
 uri = "."
 display_name = "Yoi"
 default_selector = "HEAD"
+
+[[runtimes.remote]]
+id = "arc"
+endpoint = "http://127.0.0.1:38800"
+display_name = "arc"

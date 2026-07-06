@@ -215,10 +215,31 @@ where
     }
 
     apply_store_selection(&mut config.http, store)?;
+    config.workspace_root = normalize_workspace_path(config.workspace_root)?;
     if config.cwd.as_os_str().is_empty() {
         config.cwd = config.workspace_root.clone();
+    } else {
+        config.cwd = normalize_child_path(&config.workspace_root, config.cwd);
     }
     Ok(Some(config))
+}
+
+fn normalize_workspace_path(path: PathBuf) -> Result<PathBuf, ProcessError> {
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        env::current_dir()?.join(path)
+    };
+    Ok(absolute.canonicalize().unwrap_or(absolute))
+}
+
+fn normalize_child_path(base: &std::path::Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path.canonicalize().unwrap_or(path)
+    } else {
+        let absolute = base.join(path);
+        absolute.canonicalize().unwrap_or(absolute)
+    }
 }
 
 fn split_flag_value(arg: String) -> Result<(String, Option<String>), ProcessError> {
@@ -393,6 +414,17 @@ mod tests {
             config.http.bind_addr,
             "127.0.0.1:38800".parse::<SocketAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn normalizes_relative_workspace_for_worker_spawn() {
+        let current_dir = env::current_dir().unwrap().canonicalize().unwrap();
+        let config = parse_args(["--workspace", ".", "--cwd", "."])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(config.workspace_root, current_dir);
+        assert_eq!(config.cwd, current_dir);
     }
 
     #[test]
