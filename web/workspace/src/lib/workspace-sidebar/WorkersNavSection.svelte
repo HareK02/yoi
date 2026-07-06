@@ -37,6 +37,13 @@
   let initialText = $state('');
 
   $effect(() => {
+    if (!workspaceId) {
+      loading = false;
+      workers = [];
+      options = null;
+      return;
+    }
+
     const controller = new AbortController();
     void loadWorkers(controller.signal);
     void loadLaunchOptions(controller.signal);
@@ -102,6 +109,11 @@
   }
 
   async function createWorker() {
+    if (!workspaceId) {
+      submitError = 'workspace id is unavailable';
+      return;
+    }
+
     submitError = null;
     submitting = true;
     try {

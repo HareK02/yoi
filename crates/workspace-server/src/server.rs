@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::header::CONTENT_TYPE;
+use axum::http::header::{CONTENT_TYPE, LOCATION};
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -2737,6 +2737,12 @@ async fn static_or_spa_fallback(State(api): State<WorkspaceApi>, uri: Uri) -> Re
         }
     }
 
+    if let Some(location) =
+        unscoped_workspace_ui_redirect(uri.path(), uri.query(), api.workspace_id())
+    {
+        return (StatusCode::TEMPORARY_REDIRECT, [(LOCATION, location)]).into_response();
+    }
+
     let Some(static_root) = api.config.static_assets_dir.as_ref() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -2751,6 +2757,30 @@ async fn static_or_spa_fallback(State(api): State<WorkspaceApi>, uri: Uri) -> Re
             StatusCode::NOT_FOUND.into_response()
         }
     }
+}
+
+fn unscoped_workspace_ui_redirect(
+    path: &str,
+    query: Option<&str>,
+    workspace_id: &str,
+) -> Option<String> {
+    let scoped_tail = if path == "/" {
+        ""
+    } else if ["/repositories", "/objectives", "/settings", "/runtimes"]
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+    {
+        path
+    } else {
+        return None;
+    };
+
+    let mut location = format!("/w/{}{}", encode_path_segment(workspace_id), scoped_tail);
+    if let Some(query) = query.filter(|query| !query.is_empty()) {
+        location.push('?');
+        location.push_str(query);
+    }
+    Some(location)
 }
 
 fn workspace_id_from_ui_path(path: &str) -> Option<&str> {
@@ -3596,6 +3626,26 @@ mod tests {
             !mismatched_workspace
                 .to_string()
                 .contains(dir.path().to_string_lossy().as_ref())
+        );
+
+        let unscoped_objectives = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/objectives?focus=active")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unscoped_objectives.status(), StatusCode::TEMPORARY_REDIRECT);
+        let expected_location = format!("/w/{TEST_WORKSPACE_ID}/objectives?focus=active");
+        assert_eq!(
+            unscoped_objectives
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_location.as_str())
         );
 
         let tickets = get_json(app.clone(), "/api/tickets").await;

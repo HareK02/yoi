@@ -11,7 +11,7 @@ function assert(condition: unknown, message: string): asserts condition {
 
 Deno.test("workspace Worker list and sidebar attach through Worker Console hrefs", async () => {
   const workspacePage = await Deno.readTextFile(
-    new URL("./../../routes/+page.svelte", import.meta.url),
+    new URL("./../../routes/w/[workspaceId]/+page.svelte", import.meta.url),
   );
   const workersNav = await Deno.readTextFile(
     new URL("../workspace-sidebar/WorkersNavSection.svelte", import.meta.url),

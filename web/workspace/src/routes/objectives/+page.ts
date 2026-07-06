@@ -1,17 +1,3 @@
-import { loadJson, workspaceApiPath } from "$lib/workspace-api/http";
-import type { ObjectiveListResponse } from "$lib/workspace-sidebar/types";
 import type { PageLoad } from "./$types";
 
-export const load: PageLoad = async ({ fetch, parent }) => {
-  const layout = await parent();
-  const workspaceId = layout.workspace?.workspace_id ?? "";
-  const objectives = await loadJson<ObjectiveListResponse>(
-    fetch,
-    workspaceApiPath(workspaceId, "/objectives"),
-  );
-  return {
-    workspaceId,
-    objectives: objectives.data,
-    objectivesError: objectives.error,
-  };
-};
+export const load: PageLoad = async () => ({});
