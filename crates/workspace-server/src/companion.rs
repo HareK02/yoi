@@ -388,6 +388,7 @@ fn spawn_companion_worker(runtime: &RuntimeRegistry) -> CompanionWorkerState {
             profile: Some(selector),
             initial_input: None,
             execution_workspace: None,
+            resolved_execution_workspace: None,
         },
     );
 

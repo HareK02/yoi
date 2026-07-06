@@ -25,8 +25,8 @@ use crate::hosts::{
     HostSummary, RemoteRuntimeConfig, RemoteWorkerRuntime, RuntimeDiagnostic, RuntimeRegistry,
     RuntimeRegistryUnregisterResult, RuntimeSummary, WorkerInputRequest, WorkerInputResult,
     WorkerLifecycleRequest, WorkerLifecycleResult, WorkerOperationState,
-    WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult,
-    WorkerSummary, WorkerTranscriptProjection,
+    WorkerSpawnAcceptanceRequirement, WorkerSpawnExecutionWorkspaceRequest, WorkerSpawnIntent,
+    WorkerSpawnRequest, WorkerSpawnResult, WorkerSummary, WorkerTranscriptProjection,
 };
 use crate::identity::WorkspaceIdentity;
 use crate::observation::{
@@ -917,6 +917,51 @@ async fn get_worker_launch_options(
     Ok(Json(worker_launch_options_response(&api)))
 }
 
+fn execution_workspace_request_from_repository(
+    repository: &ConfiguredRepository,
+    selector: Option<&str>,
+) -> ExecutionWorkspaceRequest {
+    ExecutionWorkspaceRequest {
+        repository: ExecutionWorkspaceRepository {
+            id: repository.id.clone(),
+            provider: repository.provider.clone(),
+            uri: repository.uri.clone(),
+            local_path: Some(repository.path.clone()),
+            selector: selector
+                .map(|selector| RuntimeRepositorySelector::from(selector.to_string()))
+                .or_else(|| {
+                    repository
+                        .default_selector
+                        .clone()
+                        .map(RuntimeRepositorySelector)
+                })
+                .or_else(|| Some(RuntimeRepositorySelector::from("HEAD"))),
+        },
+        materializer: MaterializerKind::LocalGitWorktree,
+        dirty_state_policy: DirtyStatePolicy::CleanPointOnly,
+    }
+}
+
+fn configured_execution_workspace_request(
+    config: &ServerConfig,
+    request: &WorkerSpawnExecutionWorkspaceRequest,
+) -> Result<ExecutionWorkspaceRequest> {
+    let repository = config
+        .repositories
+        .iter()
+        .find(|repository| repository.id == request.repository_id)
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "unknown repository id `{}` for Worker execution workspace",
+                request.repository_id
+            ))
+        })?;
+    Ok(execution_workspace_request_from_repository(
+        repository,
+        request.selector.as_deref(),
+    ))
+}
+
 fn default_execution_workspace_request(
     config: &ServerConfig,
     repository_id: Option<&str>,
@@ -941,21 +986,9 @@ fn default_execution_workspace_request(
         },
     };
 
-    Ok(Some(ExecutionWorkspaceRequest {
-        repository: ExecutionWorkspaceRepository {
-            id: repository.id.clone(),
-            provider: repository.provider.clone(),
-            uri: repository.uri.clone(),
-            local_path: Some(repository.path.clone()),
-            selector: repository
-                .default_selector
-                .clone()
-                .map(RuntimeRepositorySelector)
-                .or_else(|| Some(RuntimeRepositorySelector::from("HEAD"))),
-        },
-        materializer: MaterializerKind::LocalGitWorktree,
-        dirty_state_policy: DirtyStatePolicy::CleanPointOnly,
-    }))
+    Ok(Some(execution_workspace_request_from_repository(
+        repository, None,
+    )))
 }
 
 async fn create_workspace_worker(
@@ -997,7 +1030,8 @@ async fn create_workspace_worker(
                 },
                 profile: Some(profile_selector),
                 initial_input,
-                execution_workspace,
+                execution_workspace: None,
+                resolved_execution_workspace: execution_workspace,
             },
         )
         .map_err(|err| err.into_error())?;
@@ -1082,8 +1116,15 @@ struct RuntimeConfigBundleAvailabilityQuery {
 async fn create_runtime_worker(
     State(api): State<WorkspaceApi>,
     AxumPath(runtime_id): AxumPath<String>,
-    Json(request): Json<WorkerSpawnRequest>,
+    Json(mut request): Json<WorkerSpawnRequest>,
 ) -> ApiResult<Json<WorkerSpawnResult>> {
+    request.resolved_execution_workspace = request
+        .execution_workspace
+        .as_ref()
+        .map(|execution_workspace| {
+            configured_execution_workspace_request(&api.config, execution_workspace)
+        })
+        .transpose()?;
     let result = api
         .runtime
         .spawn_worker(&runtime_id, request)
@@ -2896,6 +2937,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_worker_spawn_rejects_raw_execution_workspace_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_app(dir.path()).await;
+        let response = request_json(
+            app,
+            "POST",
+            "/api/runtimes/embedded-worker-runtime/workers",
+            Some(serde_json::json!({
+                "intent": {
+                    "kind": "ticket_role",
+                    "ticket_id": "00001KVZSGT0Q",
+                    "role": "coder"
+                },
+                "acceptance": {
+                    "kind": "run_accepted",
+                    "expected_segments": 0
+                },
+                "execution_workspace": {
+                    "repository_id": TEST_REPOSITORY_ID,
+                    "local_path": dir.path().display().to_string()
+                }
+            })),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )
+        .await;
+        assert!(
+            response["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unknown field"),
+            "raw execution workspace field should be rejected: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_worker_spawn_accepts_safe_repository_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_app(dir.path()).await;
+        let response = request_json(
+            app,
+            "POST",
+            "/api/runtimes/embedded-worker-runtime/workers",
+            Some(serde_json::json!({
+                "intent": {
+                    "kind": "ticket_role",
+                    "ticket_id": "00001KVZSGT0Q",
+                    "role": "coder"
+                },
+                "acceptance": {
+                    "kind": "run_accepted",
+                    "expected_segments": 0
+                },
+                "execution_workspace": {
+                    "repository_id": TEST_REPOSITORY_ID,
+                    "selector": "HEAD"
+                }
+            })),
+            StatusCode::OK,
+        )
+        .await;
+        let projected = serde_json::to_string(&response).unwrap();
+        assert!(!projected.contains(dir.path().to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
     async fn browser_worker_create_rejects_extra_request_fields() {
         let dir = tempfile::tempdir().unwrap();
         let app = test_app(dir.path()).await;
@@ -3308,6 +3414,7 @@ mod tests {
                     profile: None,
                     initial_input: None,
                     execution_workspace: None,
+                    resolved_execution_workspace: None,
                 },
             )
             .expect("spawn worker");
