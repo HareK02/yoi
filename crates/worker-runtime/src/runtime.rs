@@ -1,6 +1,7 @@
 use crate::catalog::{
-    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerDetail, WorkerLifecycleAck,
-    WorkerStatus, WorkerSummary,
+    ConfigBundleRef, CreateWorkerRequest,
+    ExecutionWorkspaceStatus as CatalogExecutionWorkspaceStatus, ProfileSelector, WorkerDetail,
+    WorkerLifecycleAck, WorkerStatus, WorkerSummary,
 };
 use crate::config_bundle::{
     ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary, validate_config_bundle,
@@ -288,13 +289,18 @@ impl Runtime {
                 worker_ref: worker_ref.clone(),
                 request,
                 context: self.execution_context(worker_ref.clone()),
+                execution_workspace: None,
             };
             (backend, worker_ref, spawn_request)
         };
 
         let spawn_result = backend.spawn_worker(spawn_request);
-        let (handle, run_state) = match spawn_result {
-            WorkerExecutionSpawnResult::Connected { handle, run_state } => (handle, run_state),
+        let (handle, run_state, execution_workspace) = match spawn_result {
+            WorkerExecutionSpawnResult::Connected {
+                handle,
+                run_state,
+                execution_workspace,
+            } => (handle, run_state, execution_workspace),
             WorkerExecutionSpawnResult::Rejected(result)
             | WorkerExecutionSpawnResult::Errored(result) => {
                 self.rollback_failed_create(&worker_ref)?;
@@ -328,6 +334,7 @@ impl Runtime {
                 &worker_ref,
                 handle,
                 WorkerExecutionRunState::Busy,
+                execution_workspace,
                 WorkerExecutionResult::accepted(
                     WorkerExecutionOperation::Input,
                     WorkerExecutionRunState::Busy,
@@ -338,6 +345,7 @@ impl Runtime {
                 &worker_ref,
                 handle,
                 run_state,
+                execution_workspace,
                 WorkerExecutionResult::accepted(WorkerExecutionOperation::Spawn, run_state),
             )
         }
@@ -433,6 +441,7 @@ impl Runtime {
             backend: WorkerExecutionBackendKind::Connected,
             run_state: dispatch_result.run_state,
             binding: worker.execution.binding.clone(),
+            execution_workspace: worker.execution.execution_workspace.clone(),
             last_result: Some(dispatch_result),
         };
         worker.transcript.push(TranscriptEntry {
@@ -482,6 +491,7 @@ impl Runtime {
         worker_ref: &WorkerRef,
         handle: WorkerExecutionHandle,
         run_state: WorkerExecutionRunState,
+        execution_workspace: Option<CatalogExecutionWorkspaceStatus>,
         result: WorkerExecutionResult,
     ) -> Result<WorkerDetail, RuntimeError> {
         let mut state = self.lock()?;
@@ -490,9 +500,11 @@ impl Runtime {
             let binding = WorkerExecutionBindingIdentity::from_handle(&handle);
             let worker = state.worker_mut(worker_ref)?;
             worker.execution_handle = Some(handle);
-            worker.execution = WorkerExecutionStatus::connected(run_state)
-                .with_binding(binding)
-                .with_result(result);
+            let mut execution = WorkerExecutionStatus::connected(run_state).with_binding(binding);
+            if let Some(status) = execution_workspace {
+                execution = execution.with_execution_workspace(status);
+            }
+            worker.execution = execution.with_result(result);
             worker.detail(&runtime_id)
         };
         state.persist_runtime_snapshot()?;
@@ -526,6 +538,7 @@ impl Runtime {
             backend: WorkerExecutionBackendKind::Connected,
             run_state: result.run_state,
             binding: worker.execution.binding.clone(),
+            execution_workspace: worker.execution.execution_workspace.clone(),
             last_result: Some(result),
         };
         state.persist_worker(&worker_ref.worker_id)?;
@@ -1580,6 +1593,7 @@ mod tests {
                 digest: bundle.metadata.digest,
             },
             initial_input: None,
+            execution_workspace: None,
         }
     }
 
@@ -1645,6 +1659,10 @@ mod tests {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
                 run_state: WorkerExecutionRunState::Idle,
+                execution_workspace: request
+                    .execution_workspace
+                    .as_ref()
+                    .map(|binding| binding.status()),
             }
         }
 
@@ -1916,6 +1934,10 @@ mod tests {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
                 run_state: WorkerExecutionRunState::Idle,
+                execution_workspace: request
+                    .execution_workspace
+                    .as_ref()
+                    .map(|binding| binding.status()),
             }
         }
 
