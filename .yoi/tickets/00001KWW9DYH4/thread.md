@@ -189,3 +189,35 @@ Implementation progress report:
 - External review will be requested via a read-only sibling Reviewer Pod. `StopPod` は使わない。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-06T19:06:24Z status: request_changes -->
+
+## Review: request changes
+
+External review result: request_changes
+
+Blocker:
+- 実装が Browser/API-facing spawn boundary を広げ、API caller から full `ExecutionWorkspaceRequest`（`ExecutionWorkspaceRepository.local_path: Option<PathBuf>` を含む）を受け取れる形になっている。
+  - `crates/workspace-server/src/hosts.rs:263-283` は `WorkerSpawnRequest` を browser-safe として raw workspace roots/storage paths を受け取らない契約にしているが、現在は `execution_workspace: Option<ExecutionWorkspaceRequest>` を含む。
+  - `crates/worker-runtime/src/catalog.rs:58-66` の request は raw `local_path` を運べる。
+  - `/api/runtimes/{runtime_id}/workers` はこの request shape を受け取り、embedded/remote host spawn path が `CreateWorkerRequest` に pass-through している。
+- これは Ticket / routing invariant の「raw source/internal paths を含む public launch boundary 拡張を避ける。必要なら escalate」に反し、既存コード上の browser-safe contract とも衝突している。
+- safer `/api/workers` path は server-side repository config から `repository_id` により解決しているため、generic API も caller-supplied raw `local_path` authority を受け取らない形にするか、Execution Workspace materialization request の組み立てを host/runtime 内部境界に閉じる必要がある。
+
+Evidence supporting the rest of the implementation:
+- Runtime/backend materialization boundary は存在する。`Runtime::create_worker` が request を backend に渡し、`WorkerRuntimeExecutionBackend::spawn_worker` が spawn 前に materializer を呼ぶ。
+- local materializer は `execution-workspaces/<allocation-id>/root/<repository-id>` 配下に resolved commit の detached worktree を作成し、branch checkout はしない。
+- Worker `workspace_root` / `cwd` は `Worker::from_manifest_with_context` 前に materialized binding に差し替えられている。
+- dirty source は `clean_point_only` で拒否され、remote/non-Git は typed diagnostic code を返す。
+- allocation evidence/status/cleanup target/policy は記録・永続化され、worker stop cleanup は worktree removal / cleanup-pending 更新を行う。
+- tests は detached materialization、distinct paths、dirty rejection、unsupported diagnostics、cleanup、spawn cwd substitution を cover している。
+
+Validation reviewed:
+- Ticket / Objective と implementation diff/files を implementation worktree 内で read-only review。
+- Orchestrator reported validation pass（`git diff --check`, worker-runtime/workspace-server tests, `cargo check -p yoi`, web checks/tests, `yoi ticket doctor`）を確認。
+
+Non-blocking follow-ups:
+- `Runtime::stop_runtime` は currently workers を stopped に mark するだけなので、per-worker stop 以外の runtime-stop/orphan-sweeper cleanup を後続で検討するとよい。
+- external HTTP/API error body で materializer diagnostic code を message string だけでなく structured に保つ余地がある。
+
+---
