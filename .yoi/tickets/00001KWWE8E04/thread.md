@@ -184,3 +184,35 @@ Implementation progress report:
 - External review will be requested via a read-only sibling Reviewer Pod. `StopPod` は使わない。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-06T20:36:50Z status: request_changes -->
+
+## Review: request changes
+
+External review result: request_changes
+
+Blockers:
+
+1. Unscoped UI routes still perform unscoped frontend API calls。
+   - `web/workspace/src/routes/+layout.ts:11-18` falls back to `/api${path}` when `params.workspaceId` is absent。
+   - As a result `/`, `/objectives`, `/settings` などが workspace-scoped data を `/api/workspace` / `/api/repositories` から通常 load し続ける。
+   - これは Ticket / Intent の「Frontend own calls は workspace-scoped data に `/api/w/<workspace-id>/...` を使う」と衝突する。Compatibility aliases は redirect/bootstrap-only などにして、通常の unscoped data routes として残さない必要がある。
+
+2. scoped/unscoped browser routes が大きな duplicated pages として実装され、route logic drift を作っている。
+   - `web/workspace/src/routes/w/[workspaceId]/**` に full page copies が追加され、旧 route files も残っている。
+   - `settings/+page.svelte` と `w/[workspaceId]/settings/+page.svelte`、worker console page などが byte-identical。
+   - これは critical pages の substantial duplicated UI/control logic であり、thin compatibility shim ではなく co-canonical surface になっている。
+   - Unscoped routes を `/w/<workspace-id>/...` に redirect するか、shared route components/load helpers に factor して canonical scoped routes だけを maintained surface にする必要がある。
+
+Validated/inspected:
+- Ticket item/thread と routing IntentPacket。
+- implementation worktree 内で `f6ad9cfc` diff/stat/check を inspection。
+- Backend scoped route pattern と mismatch handling は方向性として妥当。`validate_workspace_scope` は fail closed し、`workspace_id_mismatch` diagnostics は raw path/internal store details を漏らしていない。
+- Runtime `/v1/...` API は inspected diff では変更されていない。
+- Orchestrator-reported validations は pass として確認。Reviewer は heavy checks を再実行していない。
+
+Non-blocking follow-ups:
+- 一部 UI placeholder/help text が旧 `/api/...` paths に触れているため、canonical route/API behavior 修正後に掃除するとよい。
+- redirect/shared-route refactor 後、scoped settings/workers/console endpoints の direct coverage を増やすとよい。
+
+---
