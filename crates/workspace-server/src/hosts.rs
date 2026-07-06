@@ -1885,11 +1885,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                     true,
                     response.runtime.worker_creation_available,
                 ),
-                diagnostics: vec![diagnostic(
-                    "remote_runtime_backend_proxy",
-                    DiagnosticSeverity::Info,
-                    "Remote Runtime is accessed only by backend-owned REST/WS clients".to_string(),
-                )],
+                diagnostics: Vec::new(),
             },
             Err(diagnostic) => RuntimeSummary {
                 runtime_id: self.runtime_id.clone(),
@@ -1922,11 +1918,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 observed_at: Utc::now().to_rfc3339(),
                 last_seen_at: None,
                 capabilities: remote_runtime_capabilities(limit, true, false),
-                diagnostics: vec![diagnostic(
-                    "remote_runtime_backend_proxy",
-                    DiagnosticSeverity::Info,
-                    "Remote host endpoint and credentials are backend-private".to_string(),
-                )],
+                diagnostics: Vec::new(),
             }],
             Vec::new(),
         )
@@ -2010,11 +2002,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                     kind: "remote_runtime_worker_created".to_string(),
                     detail: "worker-runtime REST create endpoint accepted the Worker".to_string(),
                 }],
-                diagnostics: vec![diagnostic(
-                    "remote_runtime_backend_proxy",
-                    DiagnosticSeverity::Info,
-                    "Remote create used a backend-owned REST client; browser-facing payload exposes only runtime_id plus worker_id".to_string(),
-                )],
+                diagnostics: Vec::new(),
             },
             Err(diagnostic) => WorkerSpawnResult {
                 state: WorkerOperationState::Rejected,

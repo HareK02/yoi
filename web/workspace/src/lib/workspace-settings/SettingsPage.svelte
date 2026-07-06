@@ -12,7 +12,6 @@
     type RemoteRuntimeTestResponse,
     type RuntimeConnectionMutationResponse,
     type RuntimeConnectionSettingsResponse,
-    type RuntimeConnectionSummary,
   } from "./model";
 
   type RemoteAddForm = {
@@ -33,6 +32,7 @@
   let deleting = $state<string | null>(null);
   let testing = $state<string | null>(null);
   let submitting = $state(false);
+  let showAddRuntimeForm = $state(false);
   let remoteForm = $state<RemoteAddForm>({
     runtime_id: "",
     display_name: "",
@@ -117,6 +117,7 @@
       const data = (await response.json()) as RuntimeConnectionMutationResponse;
       applyRuntimeMutation(data);
       remoteForm = { runtime_id: "", display_name: "", endpoint: "" };
+      showAddRuntimeForm = false;
     } catch (err) {
       mutationMessage = err instanceof Error ? err.message : "add remote Runtime failed";
     } finally {
@@ -289,76 +290,138 @@
       {:else if runtimeError}
         <p class="status-message error">Runtime connection settings unavailable: {runtimeError}</p>
       {:else if runtimeSettings}
-        {@render RuntimeConnectionCard({ connection: runtimeSettings.embedded })}
+        <div class="settings-action-row">
+          <button type="button" onclick={() => showAddRuntimeForm = !showAddRuntimeForm}>
+            {showAddRuntimeForm ? "Cancel adding Runtime" : "Add remote Runtime"}
+          </button>
+        </div>
 
-        <form class="settings-runtime-form" onsubmit={(event) => { event.preventDefault(); void submitRemoteRuntime(); }}>
-          <h3>Add remote Runtime</h3>
-          <p>Endpoint is submitted to the Backend but not echoed back in settings responses.</p>
-          <label>
-            <span>Runtime id</span>
-            <input bind:value={remoteForm.runtime_id} required maxlength="96" pattern="[A-Za-z0-9_.-]+" placeholder="team-runtime" />
-          </label>
-          <label>
-            <span>Display name</span>
-            <input bind:value={remoteForm.display_name} maxlength="80" placeholder="Team Runtime" />
-          </label>
-          <label>
-            <span>Endpoint</span>
-            <input bind:value={remoteForm.endpoint} required inputmode="url" placeholder="https://runtime.example" />
-          </label>
-          <button type="submit" disabled={submitting}>{submitting ? "Saving…" : "Add Runtime"}</button>
-        </form>
+        {#if showAddRuntimeForm}
+          <form class="settings-runtime-form" onsubmit={(event) => { event.preventDefault(); void submitRemoteRuntime(); }}>
+            <h3>Add remote Runtime</h3>
+            <p>Endpoint is submitted to the Backend but not echoed back in settings responses.</p>
+            <label>
+              <span>Runtime id</span>
+              <input bind:value={remoteForm.runtime_id} required maxlength="96" pattern="[A-Za-z0-9_.-]+" placeholder="team-runtime" />
+            </label>
+            <label>
+              <span>Display name</span>
+              <input bind:value={remoteForm.display_name} maxlength="80" placeholder="Team Runtime" />
+            </label>
+            <label>
+              <span>Endpoint</span>
+              <input bind:value={remoteForm.endpoint} required inputmode="url" placeholder="https://runtime.example" />
+            </label>
+            <button type="submit" disabled={submitting}>{submitting ? "Saving…" : "Add Runtime"}</button>
+          </form>
+        {/if}
 
         {#if mutationMessage}
           <p class="status-message" class:error={mutationMessage.includes("failed")}>{mutationMessage}</p>
         {/if}
         {@render DiagnosticsList({ diagnostics: mutationDiagnostics })}
 
-        <div class="settings-runtime-list" aria-label="Remote Runtime connections">
-          <h3>Remote Runtimes</h3>
+        <div class="settings-runtime-list" aria-label="Runtime connections">
+          <h3>Runtimes</h3>
+          <div class="settings-runtime-table-wrap">
+            <table class="settings-runtime-table">
+              <thead>
+                <tr>
+                  <th scope="col">Runtime</th>
+                  <th scope="col">Source</th>
+                  <th scope="col">Connection</th>
+                  <th scope="col">Status</th>
+                  <th scope="col">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr class:inactive={!runtimeSettings.embedded.active}>
+                  <td>
+                    <strong>{runtimeSettings.embedded.display_name}</strong>
+                    <code>{runtimeSettings.embedded.runtime_id}</code>
+                  </td>
+                  <td>
+                    <strong>embedded</strong>
+                    <span>Workspace backend process</span>
+                  </td>
+                  <td>Local Backend runtime</td>
+                  <td>
+                    <span class="badge" class:success={runtimeSettings.embedded.active} class:warning={!runtimeSettings.embedded.active}>{runtimeSettings.embedded.status}</span>
+                    {#if runtimeSettings.embedded.restart_required}
+                      <span class="badge warning">restart required</span>
+                    {/if}
+                  </td>
+                  <td><span class="settings-muted-action">Managed by backend</span></td>
+                </tr>
+                {#if runtimeSettings.embedded.diagnostics.length > 0}
+                  <tr class="settings-runtime-detail-row">
+                    <td colspan="5">{@render DiagnosticsList({ diagnostics: runtimeSettings.embedded.diagnostics })}</td>
+                  </tr>
+                {/if}
+                {#each runtimeSettings.remotes as remote (remote.runtime_id)}
+                  <tr class:inactive={!remote.active}>
+                    <td>
+                      <strong>{remote.display_name}</strong>
+                      <code>{remote.runtime_id}</code>
+                    </td>
+                    <td>
+                      <strong>remote</strong>
+                      <span>Configured Runtime endpoint</span>
+                    </td>
+                    <td>
+                      <span>Endpoint: {remote.endpoint_configured ? "configured" : "not configured"}</span>
+                      {#if remote.endpoint_configured}<small>hidden</small>{/if}
+                      <span>Token: {remote.token_ref_configured ? "configured" : "not configured"}</span>
+                    </td>
+                    <td>
+                      <span class="badge" class:success={remote.active} class:warning={!remote.active}>{remote.status}</span>
+                      {#if remote.restart_required}
+                        <span class="badge warning">restart required</span>
+                      {/if}
+                    </td>
+                    <td>
+                      <div class="settings-action-row">
+                        <button type="button" onclick={() => void testRemoteRuntime(remote.runtime_id)} disabled={testing === remote.runtime_id}>
+                          {testing === remote.runtime_id ? "Testing…" : "Test"}
+                        </button>
+                        <button type="button" class="danger" onclick={() => void deleteRemoteRuntime(remote.runtime_id)} disabled={deleting === remote.runtime_id}>
+                          {deleting === remote.runtime_id ? "Deleting…" : "Delete"}
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                  {#if remote.diagnostics.length > 0}
+                    <tr class="settings-runtime-detail-row">
+                      <td colspan="5">{@render DiagnosticsList({ diagnostics: remote.diagnostics })}</td>
+                    </tr>
+                  {/if}
+                  {#if tests[remote.runtime_id]}
+                    {@const test = tests[remote.runtime_id]}
+                    {@const available = capabilityOperations(test, "available")}
+                    {@const unchecked = capabilityOperations(test, "unknown")}
+                    <tr class="settings-runtime-detail-row">
+                      <td colspan="5">
+                        <div class="settings-test-result">
+                          <strong>Test: {test.state}</strong>
+                          <span>{test.health_result} · {test.checked_at}</span>
+                          <p>{test.compatibility_basis}</p>
+                          {#if available.length > 0}
+                            <p class="settings-test-verified">Verified areas: {available.join(', ')}</p>
+                          {/if}
+                          {#if unchecked.length > 0}
+                            <p class="settings-test-verified">Unchecked warning areas: {unchecked.join(', ')}</p>
+                          {/if}
+                          {@render DiagnosticsList({ diagnostics: test.diagnostics })}
+                        </div>
+                      </td>
+                    </tr>
+                  {/if}
+                {/each}
+              </tbody>
+            </table>
+          </div>
           {#if runtimeSettings.remotes.length === 0}
             <p class="status-message">No remote Runtime connections configured.</p>
-          {:else}
-            {#each runtimeSettings.remotes as remote (remote.runtime_id)}
-              <article class="settings-runtime-card">
-                {@render RuntimeConnectionCard({ connection: remote })}
-                <dl class="settings-identity-list compact">
-                  <div>
-                    <dt>Endpoint</dt>
-                    <dd>{remote.endpoint_configured ? "configured (hidden)" : "not configured"}</dd>
-                  </div>
-                  <div>
-                    <dt>Token ref</dt>
-                    <dd>{remote.token_ref_configured ? "configured (hidden)" : "not configured"}</dd>
-                  </div>
-                </dl>
-                <div class="settings-action-row">
-                  <button type="button" onclick={() => void testRemoteRuntime(remote.runtime_id)} disabled={testing === remote.runtime_id}>
-                    {testing === remote.runtime_id ? "Testing…" : "Test"}
-                  </button>
-                  <button type="button" class="danger" onclick={() => void deleteRemoteRuntime(remote.runtime_id)} disabled={deleting === remote.runtime_id}>
-                    {deleting === remote.runtime_id ? "Deleting…" : "Delete"}
-                  </button>
-                </div>
-                {#if tests[remote.runtime_id]}
-                  {@const test = tests[remote.runtime_id]}
-                  {@const available = capabilityOperations(test, "available")}
-                  {@const unchecked = capabilityOperations(test, "unknown")}
-                  <div class="settings-test-result">
-                    <strong>Test: {test.state}</strong>
-                    <span>{test.health_result} · {test.checked_at}</span>
-                    <p>{test.compatibility_basis}</p>
-                    {#if available.length > 0}
-                      <p class="settings-test-verified">Verified areas: {available.join(', ')}</p>
-                    {/if}
-                    {#if unchecked.length > 0}
-                      <p class="settings-test-verified">Unchecked warning areas: {unchecked.join(', ')}</p>
-                    {/if}
-                    {@render DiagnosticsList({ diagnostics: test.diagnostics })}
-                  </div>
-                {/if}
-              </article>
-            {/each}
           {/if}
         </div>
       {/if}
@@ -427,41 +490,6 @@
     {/if}
   </main>
 </div>
-
-{#snippet RuntimeConnectionCard({ connection }: { connection: RuntimeConnectionSummary | RemoteRuntimeConnectionSummary })}
-  <article class="settings-runtime-card embedded" class:inactive={!connection.active}>
-    <header>
-      <div>
-        <h3>{connection.display_name}</h3>
-        <p><code>{connection.runtime_id}</code></p>
-      </div>
-      <span class="badge" class:success={connection.active} class:warning={!connection.active}>{connection.status}</span>
-    </header>
-    <dl class="settings-identity-list compact">
-      <div>
-        <dt>Kind</dt>
-        <dd>{connection.kind}</dd>
-      </div>
-      <div>
-        <dt>Built in</dt>
-        <dd>{connection.built_in ? "yes" : "no"}</dd>
-      </div>
-      <div>
-        <dt>Config managed</dt>
-        <dd>{connection.config_managed ? "yes" : "no"}</dd>
-      </div>
-      <div>
-        <dt>Spawn</dt>
-        <dd>{connection.can_spawn_worker ? "available" : "unavailable"}</dd>
-      </div>
-      <div>
-        <dt>Restart required</dt>
-        <dd>{connection.restart_required ? "yes" : "no"}</dd>
-      </div>
-    </dl>
-    {@render DiagnosticsList({ diagnostics: connection.diagnostics })}
-  </article>
-{/snippet}
 
 {#snippet DiagnosticsList({ diagnostics }: { diagnostics: Diagnostic[] })}
   {#if diagnostics.length > 0}

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import RepositoryTicketKanban from '$lib/workspace-pages/RepositoryTicketKanban.svelte';
   import { workerConsoleHref } from '$lib/workspace-console/model';
   import WorkspaceSidebar from '$lib/workspace-sidebar/WorkspaceSidebar.svelte';
@@ -51,48 +52,48 @@
   let route = $derived(routeFromView(view, objectiveId, repositoryId));
   let currentPath = $derived(pathFromRoute(route));
 
-  async function getJson<T>(path: string): Promise<T> {
-    const response = await fetch(path);
+  async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+    const response = await fetch(path, { signal });
     if (!response.ok) {
       throw new Error(`GET ${path} failed: ${response.status}`);
     }
     return response.json() as Promise<T>;
   }
 
-  async function loadWorkspace() {
+  async function loadWorkspace(signal?: AbortSignal) {
     workspaceError = null;
     try {
-      workspace = await getJson<WorkspaceResponse>('/api/workspace');
+      workspace = await getJson<WorkspaceResponse>('/api/workspace', signal);
     } catch (error) {
       workspaceError = error instanceof Error ? error.message : String(error);
       workspace = null;
     }
   }
 
-  async function loadHosts() {
+  async function loadHosts(signal?: AbortSignal) {
     hostsError = null;
     try {
-      hosts = await getJson<ListResponse<Host>>('/api/hosts');
+      hosts = await getJson<ListResponse<Host>>('/api/hosts', signal);
     } catch (error) {
       hostsError = error instanceof Error ? error.message : String(error);
       hosts = null;
     }
   }
 
-  async function loadWorkers() {
+  async function loadWorkers(signal?: AbortSignal) {
     workersError = null;
     try {
-      workers = await getJson<ListResponse<Worker>>('/api/workers');
+      workers = await getJson<ListResponse<Worker>>('/api/workers', signal);
     } catch (error) {
       workersError = error instanceof Error ? error.message : String(error);
       workers = null;
     }
   }
 
-  async function loadRepositories() {
+  async function loadRepositories(signal?: AbortSignal) {
     repositoriesError = null;
     try {
-      repositories = await getJson<RepositoryListResponse>('/api/repositories');
+      repositories = await getJson<RepositoryListResponse>('/api/repositories', signal);
     } catch (error) {
       repositoriesError = error instanceof Error ? error.message : String(error);
       repositories = null;
@@ -124,10 +125,10 @@
     }
   }
 
-  async function loadObjectives() {
+  async function loadObjectives(signal?: AbortSignal) {
     objectivesError = null;
     try {
-      objectives = await getJson<ObjectiveListResponse>('/api/objectives');
+      objectives = await getJson<ObjectiveListResponse>('/api/objectives', signal);
     } catch (error) {
       objectivesError = error instanceof Error ? error.message : String(error);
       objectives = null;
@@ -189,12 +190,15 @@
     return value ?? 'not recorded';
   }
 
-  $effect(() => {
-    void loadWorkspace();
-    void loadHosts();
-    void loadWorkers();
-    void loadRepositories();
-    void loadObjectives();
+  onMount(() => {
+    const controller = new AbortController();
+    void loadWorkspace(controller.signal);
+    void loadHosts(controller.signal);
+    void loadWorkers(controller.signal);
+    void loadRepositories(controller.signal);
+    void loadObjectives(controller.signal);
+
+    return () => controller.abort();
   });
 
   $effect(() => {

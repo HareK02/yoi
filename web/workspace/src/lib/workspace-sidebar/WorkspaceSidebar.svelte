@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import ObjectivesNavSection from './ObjectivesNavSection.svelte';
   import RepositoriesNavSection from './RepositoriesNavSection.svelte';
   import WorkersNavSection from './WorkersNavSection.svelte';
@@ -15,11 +16,43 @@
   let {
     workspace,
     workspaceError = null,
-    repositories = null,
-    repositoriesError = null,
+    repositories,
+    repositoriesError,
     currentPath = '/'
   }: Props = $props();
-  let settingsActive = $derived(currentPath.startsWith("/settings"));
+
+  let fallbackRepositories = $state<RepositoryListResponse | null>(null);
+  let fallbackRepositoriesError = $state<string | null>(null);
+  let displayedRepositories = $derived(repositories === undefined ? fallbackRepositories : repositories);
+  let displayedRepositoriesError = $derived(
+    repositoriesError === undefined ? fallbackRepositoriesError : repositoriesError
+  );
+
+  onMount(() => {
+    if (repositories !== undefined) {
+      return;
+    }
+    const controller = new AbortController();
+    void loadFallbackRepositories(controller.signal);
+    return () => controller.abort();
+  });
+
+  async function loadFallbackRepositories(signal?: AbortSignal) {
+    fallbackRepositoriesError = null;
+    try {
+      const response = await fetch('/api/repositories', { signal });
+      if (!response.ok) {
+        throw new Error(`repositories request failed (${response.status})`);
+      }
+      fallbackRepositories = (await response.json()) as RepositoryListResponse;
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        return;
+      }
+      fallbackRepositoriesError = error instanceof Error ? error.message : 'repositories request failed';
+      fallbackRepositories = null;
+    }
+  }
 </script>
 
 <aside class="workspace-sidebar" aria-label="Workspace navigation">
@@ -40,33 +73,22 @@
 
     <a
       class="settings-button"
-      class:active={settingsActive}
       href="/settings"
       aria-label="Open Settings / Admin"
       title="Settings / Admin"
-      aria-current={settingsActive ? 'page' : undefined}
     >
       ⚙
     </a>
   </header>
 
   <nav class="sidebar-sections" aria-label="Workspace sections">
-    <RepositoriesNavSection {repositories} {repositoriesError} {currentPath} />
+    <RepositoriesNavSection
+      repositories={displayedRepositories}
+      repositoriesError={displayedRepositoriesError}
+      {currentPath}
+    />
     <ObjectivesNavSection {currentPath} />
     <WorkersNavSection {currentPath} />
 
-    <section class="nav-section" aria-labelledby="settings-heading">
-      <div class="section-heading-row">
-        <h2 id="settings-heading">settings</h2>
-      </div>
-      <ul class="nav-list" aria-label="Settings">
-        <li>
-          <a class="nav-item" class:active={settingsActive} href="/settings" aria-current={settingsActive ? 'page' : undefined}>
-            <span class="item-title">Settings / Admin</span>
-            <span class="item-meta">Backend shell and diagnostics</span>
-          </a>
-        </li>
-      </ul>
-    </section>
   </nav>
 </aside>

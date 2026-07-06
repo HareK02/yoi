@@ -1226,28 +1226,74 @@
   background: rgba(255, 255, 255, 0.03);
 }
 
-.settings-runtime-card {
-  display: grid;
-  gap: 0.75rem;
+.settings-runtime-table-wrap {
+  overflow-x: auto;
   border: 1px solid var(--line);
   border-radius: 1rem;
-  padding: 1rem;
   background: var(--bg-raised);
 }
 
-.settings-runtime-card header {
-  display: flex;
-  justify-content: space-between;
-  gap: 1rem;
-  align-items: flex-start;
+.settings-runtime-table {
+  width: 100%;
+  min-width: 48rem;
+  border-collapse: collapse;
 }
 
-.settings-runtime-card.inactive {
-  opacity: 0.86;
+.settings-runtime-table th,
+.settings-runtime-table td {
+  padding: 0.8rem 0.9rem;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
 }
 
-.settings-identity-list.compact {
-  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+.settings-runtime-table th {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.settings-runtime-table tr:last-child td {
+  border-bottom: 0;
+}
+
+.settings-runtime-table tr.inactive {
+  opacity: 0.78;
+}
+
+.settings-runtime-table td {
+  color: var(--text-muted);
+}
+
+.settings-runtime-table td > strong,
+.settings-runtime-table td > span,
+.settings-runtime-table td > code,
+.settings-runtime-table td > small {
+  display: block;
+}
+
+.settings-runtime-table strong {
+  color: var(--text-strong);
+}
+
+.settings-runtime-table code {
+  margin-top: 0.15rem;
+  overflow-wrap: anywhere;
+}
+
+.settings-runtime-table small {
+  color: var(--text-muted);
+}
+
+.settings-runtime-detail-row td {
+  padding-top: 0;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.settings-muted-action {
+  color: var(--text-muted);
+  font-size: 0.82rem;
 }
 
 .settings-action-row {
