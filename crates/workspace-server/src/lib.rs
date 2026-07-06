@@ -71,6 +71,8 @@ pub enum Error {
     },
     #[error("unknown local repository `{0}`")]
     UnknownRepository(String),
+    #[error("workspace id does not match this Workspace backend")]
+    WorkspaceIdMismatch,
     #[error("workspace identity error: {0}")]
     WorkspaceIdentity(String),
     #[error("store error: {0}")]

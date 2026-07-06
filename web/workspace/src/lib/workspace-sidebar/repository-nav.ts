@@ -1,3 +1,4 @@
+import { workspaceRoute } from "$lib/workspace-api/http";
 import type { Diagnostic, RepositoryListResponse } from "./types";
 
 export type RepositoryNavItem = {
@@ -16,14 +17,15 @@ export type RepositoryNavProjection = {
 
 export function projectRepositoryNav(
   repositories: RepositoryListResponse | null,
-  currentPath = "/",
+  currentPath: string,
+  workspaceId: string,
 ): RepositoryNavProjection {
   const summaries = repositories?.items ?? [];
   return {
     count: summaries.length,
     diagnostics: repositories?.diagnostics ?? [],
     items: summaries.map((repository) => {
-      const href = `/repositories/${encodeURIComponent(repository.id)}`;
+      const href = workspaceRoute(workspaceId, `/repositories/${encodeURIComponent(repository.id)}`);
       return {
         id: repository.id,
         title: repository.display_name || repository.id,

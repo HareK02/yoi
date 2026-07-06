@@ -4,6 +4,7 @@ import type {
   Segment,
 } from "$lib/generated/protocol";
 import type { WorkerTranscriptItem } from "$lib/workspace-sidebar/types";
+import { workspaceRoute } from "$lib/workspace-api/http";
 
 export type ConsoleLineKind =
   | "user"
@@ -40,16 +41,23 @@ export type WorkerTarget = {
   worker_id: string;
 };
 
-export function workerConsoleHref(target: WorkerTarget): string {
-  return `/runtimes/${encodeURIComponent(target.runtime_id)}/workers/${
-    encodeURIComponent(
-      target.worker_id,
-    )
-  }/console`;
+export function workerConsoleHref(target: WorkerTarget, workspaceId: string): string {
+  return workspaceRoute(
+    workspaceId,
+    `/runtimes/${encodeURIComponent(target.runtime_id)}/workers/${
+      encodeURIComponent(
+        target.worker_id,
+      )
+    }/console`,
+  );
 }
 
-export function workerConsolePath(runtimeId: string, workerId: string): string {
-  return workerConsoleHref({ runtime_id: runtimeId, worker_id: workerId });
+export function workerConsolePath(
+  workspaceId: string,
+  runtimeId: string,
+  workerId: string,
+): string {
+  return workerConsoleHref({ runtime_id: runtimeId, worker_id: workerId }, workspaceId);
 }
 
 export function initialConsoleLines(items: WorkerTranscriptItem[]): ConsoleLine[] {
