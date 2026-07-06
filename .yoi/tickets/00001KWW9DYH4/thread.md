@@ -154,3 +154,38 @@ Implementation routing update:
 - 完了後は diff / validation evidence を Orchestrator が確認し、別 sibling Reviewer Pod に read-only review を依頼する。`StopPod` は既知の不具合があるため使用しない。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-06T18:57:42Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Coder Pod completed implementation and committed `8b7a5da0 feat: materialize execution workspaces` on branch `work/00001KWW9DYH4-execution-workspace-materializer`.
+- Worktree status was clean after commit.
+- Changed files include:
+  - `crates/worker-runtime/src/execution_workspace.rs` (new)
+  - `crates/worker-runtime/src/{catalog.rs,execution.rs,http_server.rs,lib.rs,main.rs,runtime.rs,worker_backend.rs}`
+  - `crates/workspace-server/src/{companion.rs,hosts.rs,server.rs}`
+- Implementation summary:
+  - Runtime-side Execution Workspace request/status types and local Git worktree materializer。
+  - detached Git worktree creation under Runtime root: `execution-workspaces/<allocation-id>/root/<repository-id>`。
+  - clean HEAD/selector commit and tree evidence resolution。
+  - dirty source rejection under `clean_point_only`。
+  - typed diagnostics for remote URI / non-Git provider / unsupported policy。
+  - materialization/cleanup evidence persistence and best-effort worktree cleanup on Worker stop。
+  - Worker spawn cwd/scope uses materialized worktree path, not source repository root。
+  - workspace-server embedded runtime startup and Worker spawn pass configured repositories into materialization request。
+  - API-facing execution workspace status summaries remain sanitized/path-free。
+- Orchestrator reran validation in the implementation worktree:
+  - `git diff --check`: pass
+  - `cargo test -p worker-runtime --features ws-server,fs-store`: pass（34 lib tests + 5 main tests + doc tests）
+  - `cargo test -p yoi-workspace-server`: pass（63 lib tests + 2 main tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（15 tests）
+  - `yoi ticket doctor`: ok
+- `nix build .#yoi --no-link` は Cargo.lock / dependency / resource packaging / Nix 変更ではないため未実行。
+- External review will be requested via a read-only sibling Reviewer Pod. `StopPod` は使わない。
+
+---
