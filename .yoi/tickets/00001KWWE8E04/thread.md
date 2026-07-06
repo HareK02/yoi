@@ -154,3 +154,33 @@ Implementation routing update:
 - 完了後は diff / validation evidence を Orchestrator が確認し、別 sibling Reviewer Pod に read-only review を依頼する。`StopPod` は既知の不具合があるため使用しない。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-06T20:27:15Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Coder Pod completed implementation and committed `f6ad9cfc feat: scope workspace routes by id` on branch `work/00001KWWE8E04-workspace-id-routes`.
+- Worktree status was clean after commit.
+- Changed files include backend `crates/workspace-server/src/server.rs` / `lib.rs`, scoped route/API helpers/tests, sidebar/repository/objective/settings/worker console links, and new SvelteKit route files under `web/workspace/src/routes/w/[workspaceId]/...`.
+- Implementation summary:
+  - Added canonical Browser routes under `/w/<workspace-id>/...`。
+  - Added Browser-facing scoped API routes under `/api/w/<workspace-id>/...`。
+  - Added backend scoped workspace id validation against current immutable backend workspace id。
+  - mismatch returns typed sanitized `workspace_id_mismatch` diagnostic with 404。
+  - Runtime `/v1/...` APIs were not changed。
+  - Frontend links/API calls now use scoped route/API helpers for workspace Browser surfaces。
+  - Worker creation console hrefs point at scoped `/w/<workspace-id>/runtimes/.../console`。
+  - Focused backend and frontend tests cover scoped API/mismatch and route/API/link helpers。
+- Orchestrator reran validation in the implementation worktree:
+  - `git diff --check`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（16 tests）
+  - `cargo test -p yoi-workspace-server`: pass（65 lib tests + 2 main tests）
+  - `cargo check -p yoi`: pass
+  - `yoi ticket doctor`: ok
+- `nix build .#yoi --no-link` は Cargo.lock / dependency / resource packaging / Nix 変更ではないため未実行。
+- External review will be requested via a read-only sibling Reviewer Pod. `StopPod` は使わない。
+
+---

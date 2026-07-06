@@ -2,7 +2,7 @@
 title: 'Scope Workspace Browser routes and API by workspace id'
 state: 'inprogress'
 created_at: '2026-07-06T19:25:08Z'
-updated_at: '2026-07-06T19:55:26Z'
+updated_at: '2026-07-06T20:27:15Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-07-06T19:53:14Z'
