@@ -243,3 +243,29 @@ Review-fix implementation report:
 - Requesting follow-up external review against `f6ad9cfc..71340b89` and full combined implementation。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-06T20:52:40Z status: approve -->
+
+## Review: approve
+
+External follow-up review result: approve
+
+Blockers: none.
+
+Evidence reviewed in implementation worktree:
+- Ticket `00001KWWE8E04`, fix commit `71340b89`, and combined relevant implementation。
+
+Findings:
+- Prior blocker 1 resolved: unscoped browser routes now bootstrap only through `/api/workspace` and redirect to `/w/<workspace-id>/...`; when no workspace id is available, layout returns empty/null state instead of loading workspace datasets through unscoped `/api/...`。
+- Prior blocker 2 resolved: canonical maintained UI/control logic is under `web/workspace/src/routes/w/[workspaceId]/...`; unscoped route files are thin empty-load/component shims and no longer duplicate critical page logic。
+- Frontend scoped API construction uses `/api/w/<workspace-id>/...` via shared helpers; scoped routes and links use `/w/<workspace-id>/...`。
+- Backend has scoped `/api/w/{workspace_id}/...` routes with centralized workspace-id assertion. Mismatches return typed/sanitized 404 diagnostic (`workspace_id_mismatch`) without raw paths, store paths, or runtime internals。
+- Runtime `/v1/...` API surface was not touched。
+- Tests meaningfully cover scoped API behavior, mismatch diagnostics, static unscoped redirect behavior, frontend scoped API/link construction, and unscoped shim/source-shape expectations。
+
+Validation note:
+- Reviewer did not rerun the full validation; reviewer relied on Orchestrator-reported passing validation and performed read-only inspection。
+
+No merge-blocking issues found.
+
+---
