@@ -221,3 +221,31 @@ Non-blocking follow-ups:
 - external HTTP/API error body で materializer diagnostic code を message string だけでなく structured に保つ余地がある。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-06T19:17:17Z -->
+
+## Implementation report
+
+Review-fix implementation report:
+
+- Coder Pod completed requested changes and committed follow-up `c90ebf24 fix: keep execution workspace paths internal` on branch `work/00001KWW9DYH4-execution-workspace-materializer`.
+- Worktree status was clean after commit.
+- Fix summary:
+  - Browser/API-facing `WorkerSpawnRequest` no longer deserializes full `ExecutionWorkspaceRequest` or caller-supplied raw `local_path`.
+  - Added browser-safe execution workspace request shape with `repository_id` and optional `selector` only。
+  - Added `deny_unknown_fields` so raw fields such as `execution_workspace.local_path` and unexpected fields are rejected at the API boundary。
+  - Server-side host code resolves configured repository registry into internal `ExecutionWorkspaceRequest`; raw `local_path` construction stays behind trusted host/server boundary。
+  - Existing `/api/workers` repository-id safe behavior remains preserved。
+  - Added focused API tests for rejecting raw `execution_workspace.local_path` and accepting safe repository-id/selector materialization without exposing raw workspace path。
+- Orchestrator reran validation in the implementation worktree:
+  - `git diff --check`: pass
+  - `cargo test -p worker-runtime --features ws-server,fs-store`: pass（34 lib tests + 5 main tests + doc tests）
+  - `cargo test -p yoi-workspace-server`: pass（65 lib tests + 2 main tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（15 tests）
+  - `yoi ticket doctor`: ok
+- `nix build .#yoi --no-link` は Cargo.lock / dependency / resource packaging / Nix 変更ではないため未実行。
+- Requesting follow-up external review against `8b7a5da0..c90ebf24` and full combined implementation。
+
+---
