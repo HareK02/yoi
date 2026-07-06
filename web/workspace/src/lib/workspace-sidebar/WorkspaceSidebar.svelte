@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { workspaceRoute } from '$lib/workspace-api/http';
   import ObjectivesNavSection from './ObjectivesNavSection.svelte';
   import RepositoriesNavSection from './RepositoriesNavSection.svelte';
   import WorkersNavSection from './WorkersNavSection.svelte';
@@ -23,6 +24,10 @@
     collapsed = false,
     onToggleCollapsed
   }: Props = $props();
+
+  let workspaceId = $derived(workspace?.workspace_id ?? '');
+  let homeHref = $derived(workspaceId ? workspaceRoute(workspaceId) : '/');
+  let settingsHref = $derived(workspaceId ? workspaceRoute(workspaceId, '/settings') : '/settings');
 </script>
 
 <aside
@@ -70,7 +75,7 @@
     <div class="sidebar-actions-row">
       <a
         class="sidebar-icon-button"
-        href="/"
+        href={homeHref}
         aria-label="Open workspace overview"
         title="Workspace overview"
       >
@@ -83,7 +88,7 @@
       </a>
       <a
         class="sidebar-icon-button"
-        href="/settings"
+        href={settingsHref}
         aria-label="Open Settings / Admin"
         title="Settings / Admin"
       >
@@ -99,9 +104,9 @@
 
   {#if !collapsed}
     <nav class="sidebar-sections" aria-label="Workspace sections">
-      <RepositoriesNavSection {repositories} {repositoriesError} {currentPath} />
-      <ObjectivesNavSection {currentPath} />
-      <WorkersNavSection {currentPath} />
+      <RepositoriesNavSection {repositories} {repositoriesError} {currentPath} {workspaceId} />
+      <ObjectivesNavSection {currentPath} {workspaceId} />
+      <WorkersNavSection {currentPath} {workspaceId} />
     </nav>
   {/if}
 </aside>

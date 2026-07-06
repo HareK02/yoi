@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { workspaceApiPath } from '$lib/workspace-api/http';
   import { workerConsoleHref } from '$lib/workspace-console/model';
   import { buildBrowserCreateWorkerRequest, defaultWorkerLaunchForm } from './worker-launch';
   import type {
@@ -12,9 +13,14 @@
 
   type Props = {
     currentPath?: string;
+    workspaceId: string;
   };
 
-  let { currentPath = '/' }: Props = $props();
+  let { currentPath = '/', workspaceId }: Props = $props();
+
+  function workerApiPath(path: string): string {
+    return workspaceApiPath(workspaceId, path);
+  }
 
   let loading = $state(true);
   let error = $state<string | null>(null);
@@ -31,6 +37,13 @@
   let initialText = $state('');
 
   $effect(() => {
+    if (!workspaceId) {
+      loading = false;
+      workers = [];
+      options = null;
+      return;
+    }
+
     const controller = new AbortController();
     void loadWorkers(controller.signal);
     void loadLaunchOptions(controller.signal);
@@ -42,7 +55,7 @@
     error = null;
     placeholder = null;
     try {
-      const response = await fetch('/api/workers', { signal });
+      const response = await fetch(workerApiPath('/workers'), { signal });
       if (response.status === 404) {
         workers = [];
         placeholder = 'Worker API is not integrated in this build yet.';
@@ -72,7 +85,7 @@
   async function loadLaunchOptions(signal?: AbortSignal) {
     optionsError = null;
     try {
-      const response = await fetch('/api/workers/launch-options', { signal });
+      const response = await fetch(workerApiPath('/workers/launch-options'), { signal });
       if (!response.ok) {
         throw new Error(`worker launch options failed (${response.status})`);
       }
@@ -96,10 +109,15 @@
   }
 
   async function createWorker() {
+    if (!workspaceId) {
+      submitError = 'workspace id is unavailable';
+      return;
+    }
+
     submitError = null;
     submitting = true;
     try {
-      const response = await fetch('/api/workers', {
+      const response = await fetch(workerApiPath('/workers'), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(buildBrowserCreateWorkerRequest({
@@ -207,7 +225,7 @@
   {:else}
     <ul class="nav-list" aria-label="Workers">
       {#each workers as worker (`${worker.runtime_id}:${worker.worker_id}`)}
-        {@const href = workerConsoleHref(worker)}
+        {@const href = workerConsoleHref(worker, workspaceId)}
         <li>
           <a href={href} class="nav-item worker-nav-item" class:active={currentPath === href} aria-current={currentPath === href ? 'page' : undefined}>
             <span class="worker-title-row">
