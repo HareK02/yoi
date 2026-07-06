@@ -1,9 +1,11 @@
 ---
 title: 'Add local Git worktree Execution Workspace materializer'
-state: 'ready'
+state: 'queued'
 created_at: '2026-07-06T18:00:46Z'
-updated_at: '2026-07-06T18:26:52Z'
+updated_at: '2026-07-06T18:28:26Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-07-06T18:28:26Z'
 ---
 
 ## 背景
