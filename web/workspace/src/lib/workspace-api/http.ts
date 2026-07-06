@@ -3,6 +3,19 @@ export type ApiResult<T> = {
   error: string | null;
 };
 
+function normalizePath(path: string): string {
+  if (!path || path === '/') return '';
+  return path.startsWith('/') ? path : `/${path}`;
+}
+
+export function workspaceRoute(workspaceId: string, path = ''): string {
+  return `/w/${encodeURIComponent(workspaceId)}${normalizePath(path)}`;
+}
+
+export function workspaceApiPath(workspaceId: string, path = ''): string {
+  return `/api/w/${encodeURIComponent(workspaceId)}${normalizePath(path)}`;
+}
+
 export async function loadJson<T>(
   fetchFn: typeof fetch,
   path: string,

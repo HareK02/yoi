@@ -3,7 +3,7 @@
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
-  let workspaceId = $derived(data.workspace?.workspace_id ?? '');
+  let workspaceId = $derived(data.workspace?.workspace_id ?? data.workspaceId);
 </script>
 
 <svelte:head>

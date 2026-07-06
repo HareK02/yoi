@@ -221,84 +221,193 @@ impl WorkspaceApi {
 pub fn build_router(api: WorkspaceApi) -> Router {
     Router::new()
         .route("/api/workspace", get(get_workspace))
+        .route("/api/w/{workspace_id}/workspace", get(scoped_get_workspace))
         .route("/api/tickets", get(list_tickets))
+        .route("/api/w/{workspace_id}/tickets", get(scoped_list_tickets))
         .route("/api/tickets/{id}", get(get_ticket))
+        .route("/api/w/{workspace_id}/tickets/{id}", get(scoped_get_ticket))
         .route("/api/objectives", get(list_objectives))
+        .route(
+            "/api/w/{workspace_id}/objectives",
+            get(scoped_list_objectives),
+        )
         .route("/api/objectives/{id}", get(get_objective))
+        .route(
+            "/api/w/{workspace_id}/objectives/{id}",
+            get(scoped_get_objective),
+        )
         .route("/api/repositories", get(list_repositories))
+        .route(
+            "/api/w/{workspace_id}/repositories",
+            get(scoped_list_repositories),
+        )
         .route("/api/repositories/{repository_id}", get(repository_detail))
+        .route(
+            "/api/w/{workspace_id}/repositories/{repository_id}",
+            get(scoped_repository_detail),
+        )
         .route("/api/repositories/{repository_id}/log", get(repository_log))
+        .route(
+            "/api/w/{workspace_id}/repositories/{repository_id}/log",
+            get(scoped_repository_log),
+        )
         .route(
             "/api/repositories/{repository_id}/tickets",
             get(repository_tickets),
         )
+        .route(
+            "/api/w/{workspace_id}/repositories/{repository_id}/tickets",
+            get(scoped_repository_tickets),
+        )
         .route("/api/hosts", get(list_hosts))
+        .route("/api/w/{workspace_id}/hosts", get(scoped_list_hosts))
         .route("/api/runtimes", get(list_runtimes))
+        .route("/api/w/{workspace_id}/runtimes", get(scoped_list_runtimes))
         .route(
             "/api/workers",
             get(list_workers).post(create_workspace_worker),
+        )
+        .route(
+            "/api/w/{workspace_id}/workers",
+            get(scoped_list_workers).post(scoped_create_workspace_worker),
         )
         .route(
             "/api/workers/launch-options",
             get(get_worker_launch_options),
         )
         .route(
+            "/api/w/{workspace_id}/workers/launch-options",
+            get(scoped_get_worker_launch_options),
+        )
+        .route(
             "/api/settings/runtime-connections",
             get(get_runtime_connection_settings),
+        )
+        .route(
+            "/api/w/{workspace_id}/settings/runtime-connections",
+            get(scoped_get_runtime_connection_settings),
         )
         .route(
             "/api/settings/runtime-connections/remotes",
             post(add_remote_runtime_connection),
         )
         .route(
+            "/api/w/{workspace_id}/settings/runtime-connections/remotes",
+            post(scoped_add_remote_runtime_connection),
+        )
+        .route(
             "/api/settings/runtime-connections/remotes/{runtime_id}",
             delete(delete_remote_runtime_connection),
+        )
+        .route(
+            "/api/w/{workspace_id}/settings/runtime-connections/remotes/{runtime_id}",
+            delete(scoped_delete_remote_runtime_connection),
         )
         .route(
             "/api/settings/runtime-connections/remotes/{runtime_id}/test",
             post(test_remote_runtime_connection),
         )
+        .route(
+            "/api/w/{workspace_id}/settings/runtime-connections/remotes/{runtime_id}/test",
+            post(scoped_test_remote_runtime_connection),
+        )
         .route("/api/companion/status", get(get_companion_status))
+        .route(
+            "/api/w/{workspace_id}/companion/status",
+            get(scoped_get_companion_status),
+        )
         .route("/api/companion/transcript", get(get_companion_transcript))
+        .route(
+            "/api/w/{workspace_id}/companion/transcript",
+            get(scoped_get_companion_transcript),
+        )
         .route("/api/companion/messages", post(post_companion_message))
+        .route(
+            "/api/w/{workspace_id}/companion/messages",
+            post(scoped_post_companion_message),
+        )
         .route("/api/companion/cancel", post(post_companion_cancel))
+        .route(
+            "/api/w/{workspace_id}/companion/cancel",
+            post(scoped_post_companion_cancel),
+        )
         .route(
             "/api/runtimes/{runtime_id}/workers",
             post(create_runtime_worker),
+        )
+        .route(
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers",
+            post(scoped_create_runtime_worker),
         )
         .route(
             "/api/runtimes/{runtime_id}/config-bundles",
             post(sync_runtime_config_bundle),
         )
         .route(
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/config-bundles",
+            post(scoped_sync_runtime_config_bundle),
+        )
+        .route(
             "/api/runtimes/{runtime_id}/config-bundles/{bundle_id}/availability",
             get(check_runtime_config_bundle),
+        )
+        .route(
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/config-bundles/{bundle_id}/availability",
+            get(scoped_check_runtime_config_bundle),
         )
         .route(
             "/api/runtimes/{runtime_id}/workers/{worker_id}",
             get(get_runtime_worker),
         )
         .route(
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}",
+            get(scoped_get_runtime_worker),
+        )
+        .route(
             "/api/runtimes/{runtime_id}/workers/{worker_id}/input",
             post(send_runtime_worker_input),
+        )
+        .route(
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/input",
+            post(scoped_send_runtime_worker_input),
         )
         .route(
             "/api/runtimes/{runtime_id}/workers/{worker_id}/stop",
             post(stop_runtime_worker),
         )
         .route(
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/stop",
+            post(scoped_stop_runtime_worker),
+        )
+        .route(
             "/api/runtimes/{runtime_id}/workers/{worker_id}/cancel",
             post(cancel_runtime_worker),
+        )
+        .route(
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/cancel",
+            post(scoped_cancel_runtime_worker),
         )
         .route(
             "/api/runtimes/{runtime_id}/workers/{worker_id}/transcript",
             get(get_runtime_worker_transcript),
         )
         .route(
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/transcript",
+            get(scoped_get_runtime_worker_transcript),
+        )
+        .route(
             "/api/runtimes/{runtime_id}/workers/{worker_id}/events/ws",
             get(worker_observation_ws),
         )
+        .route(
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/events/ws",
+            get(scoped_worker_observation_ws),
+        )
         .route("/api/hosts/{host_id}/workers", get(list_host_workers))
+        .route(
+            "/api/w/{workspace_id}/hosts/{host_id}/workers",
+            get(scoped_list_host_workers),
+        )
         .fallback(get(static_or_spa_fallback))
         .with_state(api)
 }
@@ -520,6 +629,363 @@ struct TicketKanbanQuery {
 struct TranscriptQuery {
     start: Option<usize>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScopedWorkspacePath {
+    workspace_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScopedRecordPath {
+    workspace_id: String,
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScopedRepositoryPath {
+    workspace_id: String,
+    repository_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScopedHostPath {
+    workspace_id: String,
+    host_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScopedRuntimePath {
+    workspace_id: String,
+    runtime_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScopedConfigBundlePath {
+    workspace_id: String,
+    runtime_id: String,
+    bundle_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScopedRuntimeWorkerPath {
+    workspace_id: String,
+    runtime_id: String,
+    worker_id: String,
+}
+
+fn validate_workspace_scope(api: &WorkspaceApi, workspace_id: &str) -> ApiResult<()> {
+    if workspace_id == api.workspace_id() {
+        Ok(())
+    } else {
+        Err(workspace_id_mismatch_error())
+    }
+}
+
+async fn scoped_get_workspace(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<WorkspaceResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    get_workspace(State(api)).await
+}
+
+async fn scoped_list_tickets(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<ListResponse<crate::records::TicketSummary>>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    list_tickets(State(api)).await
+}
+
+async fn scoped_get_ticket(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRecordPath>,
+) -> ApiResult<Json<TicketDetail>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    get_ticket(State(api), AxumPath(path.id)).await
+}
+
+async fn scoped_list_objectives(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<ListResponse<crate::records::ObjectiveSummary>>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    list_objectives(State(api)).await
+}
+
+async fn scoped_get_objective(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRecordPath>,
+) -> ApiResult<Json<ObjectiveDetail>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    get_objective(State(api), AxumPath(path.id)).await
+}
+
+async fn scoped_list_repositories(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<RepositoryListResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    list_repositories(State(api)).await
+}
+
+async fn scoped_repository_detail(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRepositoryPath>,
+) -> ApiResult<Json<RepositoryDetailResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    repository_detail(State(api), AxumPath(path.repository_id)).await
+}
+
+async fn scoped_repository_log(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRepositoryPath>,
+    Query(query): Query<LogQuery>,
+) -> ApiResult<Json<RepositoryLogResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    repository_log(State(api), AxumPath(path.repository_id), Query(query)).await
+}
+
+async fn scoped_repository_tickets(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRepositoryPath>,
+    Query(query): Query<TicketKanbanQuery>,
+) -> ApiResult<Json<RepositoryTicketsResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    repository_tickets(State(api), AxumPath(path.repository_id), Query(query)).await
+}
+
+async fn scoped_list_hosts(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<RuntimeListResponse<HostSummary>>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    list_hosts(State(api)).await
+}
+
+async fn scoped_list_runtimes(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<RuntimeListResponse<RuntimeSummary>>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    list_runtimes(State(api)).await
+}
+
+async fn scoped_list_workers(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<RuntimeListResponse<WorkerSummary>>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    list_workers(State(api)).await
+}
+
+async fn scoped_create_workspace_worker(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Json(request): Json<BrowserCreateWorkerRequest>,
+) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    create_workspace_worker(State(api), Json(request)).await
+}
+
+async fn scoped_get_worker_launch_options(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<WorkerLaunchOptionsResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    get_worker_launch_options(State(api)).await
+}
+
+async fn scoped_get_runtime_connection_settings(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<RuntimeConnectionSettingsResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    get_runtime_connection_settings(State(api)).await
+}
+
+async fn scoped_add_remote_runtime_connection(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Json(request): Json<AddRemoteRuntimeConnectionRequest>,
+) -> ApiResult<Json<RuntimeConnectionMutationResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    add_remote_runtime_connection(State(api), Json(request)).await
+}
+
+async fn scoped_delete_remote_runtime_connection(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimePath>,
+) -> ApiResult<Json<RuntimeConnectionMutationResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    delete_remote_runtime_connection(State(api), AxumPath(path.runtime_id)).await
+}
+
+async fn scoped_test_remote_runtime_connection(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimePath>,
+) -> ApiResult<Json<RemoteRuntimeTestResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    test_remote_runtime_connection(State(api), AxumPath(path.runtime_id)).await
+}
+
+async fn scoped_get_companion_status(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<CompanionStatusResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    get_companion_status(State(api)).await
+}
+
+async fn scoped_get_companion_transcript(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Query(query): Query<TranscriptQuery>,
+) -> ApiResult<Json<CompanionTranscriptProjection>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    get_companion_transcript(State(api), Query(query)).await
+}
+
+async fn scoped_post_companion_message(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Json(request): Json<CompanionMessageRequest>,
+) -> ApiResult<Json<CompanionMessageResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    post_companion_message(State(api), Json(request)).await
+}
+
+async fn scoped_post_companion_cancel(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Json(request): Json<CompanionCancelRequest>,
+) -> ApiResult<Json<CompanionMessageResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    post_companion_cancel(State(api), Json(request)).await
+}
+
+async fn scoped_create_runtime_worker(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimePath>,
+    Json(request): Json<WorkerSpawnRequest>,
+) -> ApiResult<Json<WorkerSpawnResult>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    create_runtime_worker(State(api), AxumPath(path.runtime_id), Json(request)).await
+}
+
+async fn scoped_sync_runtime_config_bundle(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimePath>,
+    Json(request): Json<RuntimeConfigBundleSyncRequest>,
+) -> ApiResult<Json<ConfigBundleSyncResult>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    sync_runtime_config_bundle(State(api), AxumPath(path.runtime_id), Json(request)).await
+}
+
+async fn scoped_check_runtime_config_bundle(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedConfigBundlePath>,
+    Query(query): Query<RuntimeConfigBundleAvailabilityQuery>,
+) -> ApiResult<Json<ConfigBundleCheckResult>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    check_runtime_config_bundle(
+        State(api),
+        AxumPath((path.runtime_id, path.bundle_id)),
+        Query(query),
+    )
+    .await
+}
+
+async fn scoped_get_runtime_worker(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
+) -> ApiResult<Json<WorkerSummary>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    get_runtime_worker(State(api), AxumPath((path.runtime_id, path.worker_id))).await
+}
+
+async fn scoped_send_runtime_worker_input(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
+    Json(request): Json<WorkerInputRequest>,
+) -> ApiResult<Json<WorkerInputResult>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    send_runtime_worker_input(
+        State(api),
+        AxumPath((path.runtime_id, path.worker_id)),
+        Json(request),
+    )
+    .await
+}
+
+async fn scoped_stop_runtime_worker(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
+    Json(request): Json<WorkerLifecycleRequest>,
+) -> ApiResult<Json<WorkerLifecycleResult>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    stop_runtime_worker(
+        State(api),
+        AxumPath((path.runtime_id, path.worker_id)),
+        Json(request),
+    )
+    .await
+}
+
+async fn scoped_cancel_runtime_worker(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
+    Json(request): Json<WorkerLifecycleRequest>,
+) -> ApiResult<Json<WorkerLifecycleResult>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    cancel_runtime_worker(
+        State(api),
+        AxumPath((path.runtime_id, path.worker_id)),
+        Json(request),
+    )
+    .await
+}
+
+async fn scoped_get_runtime_worker_transcript(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
+    Query(query): Query<TranscriptQuery>,
+) -> ApiResult<Json<WorkerTranscriptProjection>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    get_runtime_worker_transcript(
+        State(api),
+        AxumPath((path.runtime_id, path.worker_id)),
+        Query(query),
+    )
+    .await
+}
+
+async fn scoped_worker_observation_ws(
+    ws: WebSocketUpgrade,
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
+    Query(query): Query<ClientWorkerEventsWsQuery>,
+) -> Response {
+    if let Err(err) = validate_workspace_scope(&api, &path.workspace_id) {
+        return err.into_response();
+    }
+    worker_observation_ws(
+        State(api),
+        AxumPath((path.runtime_id, path.worker_id)),
+        Query(query),
+        ws,
+    )
+    .await
+    .into_response()
+}
+
+async fn scoped_list_host_workers(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedHostPath>,
+) -> ApiResult<Json<RuntimeListResponse<WorkerSummary>>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    list_host_workers(State(api), AxumPath(path.host_id)).await
 }
 
 async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<WorkspaceResponse>> {
@@ -1048,13 +1514,15 @@ async fn create_workspace_worker(
     })?;
     let runtime_id = worker.runtime_id.clone();
     let worker_id = worker.worker_id.clone();
+    let workspace_id = api.workspace_id().to_string();
     let console_href = format!(
-        "/runtimes/{}/workers/{}/console",
+        "/w/{}/runtimes/{}/workers/{}/console",
+        encode_path_segment(&workspace_id),
         encode_path_segment(&runtime_id),
         encode_path_segment(&worker_id)
     );
     Ok(Json(BrowserCreateWorkerResponse {
-        workspace_id: api.config.workspace_id,
+        workspace_id,
         runtime_id,
         worker_id,
         console_href,
@@ -2263,6 +2731,12 @@ async fn static_or_spa_fallback(State(api): State<WorkspaceApi>, uri: Uri) -> Re
             .into_response();
     }
 
+    if let Some(workspace_id) = workspace_id_from_ui_path(uri.path()) {
+        if workspace_id != api.workspace_id() {
+            return workspace_id_mismatch_error().into_response();
+        }
+    }
+
     let Some(static_root) = api.config.static_assets_dir.as_ref() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -2276,6 +2750,16 @@ async fn static_or_spa_fallback(State(api): State<WorkspaceApi>, uri: Uri) -> Re
             tracing::debug!(%error, path = %uri.path(), "failed to serve static asset");
             StatusCode::NOT_FOUND.into_response()
         }
+    }
+}
+
+fn workspace_id_from_ui_path(path: &str) -> Option<&str> {
+    let tail = path.strip_prefix("/w/")?;
+    let workspace_id = tail.split('/').next().unwrap_or_default();
+    if workspace_id.is_empty() {
+        None
+    } else {
+        Some(workspace_id)
     }
 }
 
@@ -2337,6 +2821,18 @@ fn content_type_for(path: &Path) -> &'static str {
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
+fn workspace_id_mismatch_error() -> ApiError {
+    let message = "workspace id does not match this Workspace backend".to_string();
+    ApiError::with_diagnostics(
+        Error::WorkspaceIdMismatch,
+        vec![RuntimeDiagnostic {
+            code: "workspace_id_mismatch".to_string(),
+            severity: DiagnosticSeverity::Error,
+            message,
+        }],
+    )
+}
+
 struct ApiError {
     error: Error,
     diagnostics: Vec<RuntimeDiagnostic>,
@@ -2366,7 +2862,8 @@ impl IntoResponse for ApiError {
             | Error::UnknownHost(_)
             | Error::UnknownRuntime(_)
             | Error::UnknownWorker { .. }
-            | Error::UnknownRepository(_) => StatusCode::NOT_FOUND,
+            | Error::UnknownRepository(_)
+            | Error::WorkspaceIdMismatch => StatusCode::NOT_FOUND,
             Error::Ticket(_) => StatusCode::NOT_FOUND,
             Error::RuntimeCapabilityUnsupported { .. } => StatusCode::NOT_IMPLEMENTED,
             Error::RuntimeOperationFailed { code, .. } if code == "repository_not_configured" => {
@@ -3076,6 +3573,31 @@ mod tests {
             );
         }
 
+        let scoped_workspace = get_json(
+            app.clone(),
+            &format!("/api/w/{TEST_WORKSPACE_ID}/workspace"),
+        )
+        .await;
+        assert_eq!(scoped_workspace["workspace_id"], TEST_WORKSPACE_ID);
+
+        let mismatched_workspace = request_json(
+            app.clone(),
+            "GET",
+            "/api/w/not-this-workspace/workspace",
+            None,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_eq!(
+            mismatched_workspace["diagnostics"][0]["code"],
+            "workspace_id_mismatch"
+        );
+        assert!(
+            !mismatched_workspace
+                .to_string()
+                .contains(dir.path().to_string_lossy().as_ref())
+        );
+
         let tickets = get_json(app.clone(), "/api/tickets").await;
         assert_eq!(tickets["items"][0]["id"], "00000000001J2");
         assert_eq!(tickets["items"][0]["state"], "ready");
@@ -3083,6 +3605,18 @@ mod tests {
         let objectives = get_json(app.clone(), "/api/objectives").await;
         assert_eq!(objectives["items"][0]["id"], "00000000001J3");
         assert_eq!(objectives["items"][0]["summary"], "Objective body.");
+        let scoped_objectives = get_json(
+            app.clone(),
+            &format!("/api/w/{TEST_WORKSPACE_ID}/objectives"),
+        )
+        .await;
+        assert_eq!(scoped_objectives["items"][0]["id"], "00000000001J3");
+        let scoped_objective = get_json(
+            app.clone(),
+            &format!("/api/w/{TEST_WORKSPACE_ID}/objectives/00000000001J3"),
+        )
+        .await;
+        assert_eq!(scoped_objective["id"], "00000000001J3");
 
         let repositories = get_json(app.clone(), "/api/repositories").await;
         assert_eq!(repositories["items"][0]["id"], TEST_REPOSITORY_ID);
@@ -3099,6 +3633,12 @@ mod tests {
 
         let repository_detail = get_json(app.clone(), "/api/repositories/main").await;
         assert_eq!(repository_detail["item"]["id"], TEST_REPOSITORY_ID);
+        let scoped_repository_detail = get_json(
+            app.clone(),
+            &format!("/api/w/{TEST_WORKSPACE_ID}/repositories/main"),
+        )
+        .await;
+        assert_eq!(scoped_repository_detail["item"]["id"], TEST_REPOSITORY_ID);
 
         let repository_log = get_json(app.clone(), "/api/repositories/main/log?limit=3").await;
         assert_eq!(repository_log["repository_id"], TEST_REPOSITORY_ID);

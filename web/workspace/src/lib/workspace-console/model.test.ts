@@ -24,8 +24,8 @@ Deno.test("workerConsoleHref encodes runtime and worker target authority", () =>
     workerConsoleHref({
       runtime_id: "local runtime",
       worker_id: "worker/one",
-    }) ===
-      "/runtimes/local%20runtime/workers/worker%2Fone/console",
+    }, "workspace-1") ===
+      "/w/workspace-1/runtimes/local%20runtime/workers/worker%2Fone/console",
     "href should contain encoded runtime_id and worker_id segments",
   );
 });

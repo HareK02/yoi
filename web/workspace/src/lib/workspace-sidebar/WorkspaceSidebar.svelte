@@ -2,6 +2,7 @@
   import ObjectivesNavSection from './ObjectivesNavSection.svelte';
   import RepositoriesNavSection from './RepositoriesNavSection.svelte';
   import WorkersNavSection from './WorkersNavSection.svelte';
+  import { workspaceRoute } from '$lib/workspace-api/http';
   import type { RepositoryListResponse, WorkspaceResponse } from './types';
 
   type Props = {
@@ -19,6 +20,9 @@
     repositoriesError = null,
     currentPath = '/'
   }: Props = $props();
+
+  let workspaceId = $derived(workspace?.workspace_id ?? '');
+  let settingsHref = $derived(workspaceId ? workspaceRoute(workspaceId, '/settings') : '/settings');
 </script>
 
 <aside class="workspace-sidebar" aria-label="Workspace navigation">
@@ -39,7 +43,7 @@
 
     <a
       class="settings-button"
-      href="/settings"
+      href={settingsHref}
       aria-label="Open Settings / Admin"
       title="Settings / Admin"
     >
@@ -48,9 +52,9 @@
   </header>
 
   <nav class="sidebar-sections" aria-label="Workspace sections">
-    <RepositoriesNavSection {repositories} {repositoriesError} {currentPath} />
-    <ObjectivesNavSection {currentPath} />
-    <WorkersNavSection {currentPath} />
+    <RepositoriesNavSection {repositories} {repositoriesError} {currentPath} {workspaceId} />
+    <ObjectivesNavSection {currentPath} {workspaceId} />
+    <WorkersNavSection {currentPath} {workspaceId} />
 
   </nav>
 </aside>

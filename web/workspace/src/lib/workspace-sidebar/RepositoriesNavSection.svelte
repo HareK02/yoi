@@ -6,10 +6,11 @@
     repositories: RepositoryListResponse | null;
     repositoriesError?: string | null;
     currentPath?: string;
+    workspaceId: string;
   };
 
-  let { repositories, repositoriesError = null, currentPath = '/' }: Props = $props();
-  let navigation = $derived(projectRepositoryNav(repositories, currentPath));
+  let { repositories, repositoriesError = null, currentPath = '/', workspaceId }: Props = $props();
+  let navigation = $derived(projectRepositoryNav(repositories, currentPath, workspaceId));
 </script>
 
 <section class="nav-section" aria-labelledby="repositories-heading">

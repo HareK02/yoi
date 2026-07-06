@@ -21,12 +21,12 @@ Deno.test("workspace Worker list and sidebar attach through Worker Console hrefs
   );
 
   assert(
-    workspacePage.includes("workerConsoleHref(worker)") &&
+    workspacePage.includes("workerConsoleHref(worker, workspaceId)") &&
       workspacePage.includes("Open Console"),
     "top Worker list should expose an attach action per Worker",
   );
   assert(
-    workersNav.includes("workerConsoleHref(worker)") &&
+    workersNav.includes("workerConsoleHref(worker, workspaceId)") &&
       workersNav.includes("aria-current"),
     "Workers sidebar rows should link to the Worker target Console route",
   );
@@ -40,26 +40,28 @@ Deno.test("workspace Worker list and sidebar attach through Worker Console hrefs
 Deno.test("Worker Console page is routed by runtime_id and worker_id through backend APIs", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(
-      "./../../routes/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      "./../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
       import.meta.url,
     ),
   );
   const routeLoad = await Deno.readTextFile(
     new URL(
-      "./../../routes/runtimes/[runtimeId]/workers/[workerId]/console/+page.ts",
+      "./../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.ts",
       import.meta.url,
     ),
   );
 
   assert(
-    routeLoad.includes("runtimeId") && routeLoad.includes("workerId"),
-    "route load should expose both target ids",
+    routeLoad.includes("workspaceId") &&
+      routeLoad.includes("runtimeId") && routeLoad.includes("workerId"),
+    "route load should expose workspace and target ids",
   );
   assert(
-    consolePage.includes(
-      "/api/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(target.workerId)}",
-    ),
-    "Worker detail should use the backend Worker detail API",
+    consolePage.includes("workspaceApiPath(workspaceId, path)") &&
+      consolePage.includes(
+        "workerApiPath(`/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(target.workerId)}`)",
+      ),
+    "Worker detail should use the scoped backend Worker detail API",
   );
   assert(
     consolePage.includes("/transcript?limit=200") &&

@@ -36,7 +36,7 @@ Deno.test("repository nav does not invent main for an empty registry", () => {
         message: "No repositories configured",
       },
     ],
-  });
+  }, "/w/workspace-1", "workspace-1");
 
   assertEquals(projection.count, 0);
   assertEquals(projection.items, []);
@@ -56,14 +56,15 @@ Deno.test("repository nav links configured non-main repository ids", () => {
         diagnostics: [],
       },
     ]),
-    "/repositories/infra",
+    "/w/workspace-1/repositories/infra",
+    "workspace-1",
   );
 
   assertEquals(projection.count, 1);
   assertEquals(projection.items[0], {
     id: "infra",
     title: "Infrastructure",
-    href: "/repositories/infra",
+    href: "/w/workspace-1/repositories/infra",
     meta: "git repository · read-only",
     active: true,
   });
