@@ -12,8 +12,8 @@ use std::{
     time::Duration,
 };
 use worker_runtime::catalog::{
-    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerDetail as EmbeddedWorkerDetail,
-    WorkerStatus as EmbeddedWorkerStatus,
+    ConfigBundleRef, CreateWorkerRequest, ExecutionWorkspaceRequest, ProfileSelector,
+    WorkerDetail as EmbeddedWorkerDetail, WorkerStatus as EmbeddedWorkerStatus,
 };
 use worker_runtime::config_bundle::{
     ConfigBundle, ConfigBundleAvailability, ConfigBundleMetadata, ConfigBundleProvenance,
@@ -279,6 +279,8 @@ pub struct WorkerSpawnRequest {
     pub profile: Option<ProfileSelector>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_input: Option<EmbeddedWorkerInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_workspace: Option<ExecutionWorkspaceRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1321,6 +1323,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             profile,
             config_bundle,
             initial_input: request.initial_input.clone(),
+            execution_workspace: request.execution_workspace.clone(),
         };
         match self.runtime.create_worker(create_request) {
             Ok(detail) => {
@@ -1993,6 +1996,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             profile,
             config_bundle,
             initial_input: request.initial_input.clone(),
+            execution_workspace: request.execution_workspace.clone(),
         };
         match self.post_json::<_, RuntimeHttpWorkerResponse>("/v1/workers", &create) {
             Ok(response) => WorkerSpawnResult {
@@ -2916,6 +2920,10 @@ mod tests {
                     self.backend_id(),
                 ),
                 run_state: WorkerExecutionRunState::Idle,
+                execution_workspace: request
+                    .execution_workspace
+                    .as_ref()
+                    .map(|binding| binding.status()),
             }
         }
 
@@ -3144,6 +3152,7 @@ mod tests {
             },
             profile: None,
             initial_input: None,
+            execution_workspace: None,
         }
     }
 
@@ -3273,6 +3282,7 @@ mod tests {
                     },
                     profile: None,
                     initial_input: None,
+                    execution_workspace: None,
                 },
             )
             .unwrap();
@@ -3372,6 +3382,7 @@ mod tests {
                     },
                     profile: Some(ProfileSelector::Builtin("builtin:coder".to_string())),
                     initial_input: None,
+                    execution_workspace: None,
                 },
             )
             .unwrap();
@@ -3400,6 +3411,7 @@ mod tests {
                     acceptance: WorkerSpawnAcceptanceRequirement::SocketReady,
                     profile: None,
                     initial_input: None,
+                    execution_workspace: None,
                 },
             )
             .unwrap();

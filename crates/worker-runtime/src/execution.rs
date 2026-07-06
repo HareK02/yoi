@@ -1,5 +1,6 @@
-use crate::catalog::CreateWorkerRequest;
+use crate::catalog::{CreateWorkerRequest, ExecutionWorkspaceStatus};
 use crate::error::RuntimeError;
+use crate::execution_workspace::ExecutionWorkspaceBinding;
 use crate::identity::WorkerRef;
 use crate::interaction::WorkerInput;
 #[cfg(feature = "ws-server")]
@@ -153,6 +154,8 @@ pub struct WorkerExecutionStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<WorkerExecutionBindingIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_workspace: Option<ExecutionWorkspaceStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_result: Option<WorkerExecutionResult>,
 }
 
@@ -166,6 +169,7 @@ impl WorkerExecutionStatus {
             backend: WorkerExecutionBackendKind::Connected,
             run_state,
             binding: None,
+            execution_workspace: None,
             last_result: None,
         }
     }
@@ -178,6 +182,11 @@ impl WorkerExecutionStatus {
 
     pub fn with_binding(mut self, binding: WorkerExecutionBindingIdentity) -> Self {
         self.binding = Some(binding);
+        self
+    }
+
+    pub fn with_execution_workspace(mut self, status: ExecutionWorkspaceStatus) -> Self {
+        self.execution_workspace = Some(status);
         self
     }
 
@@ -277,6 +286,7 @@ pub struct WorkerExecutionSpawnRequest {
     pub worker_ref: WorkerRef,
     pub request: CreateWorkerRequest,
     pub context: WorkerExecutionContext,
+    pub execution_workspace: Option<ExecutionWorkspaceBinding>,
 }
 
 /// Result of backend Worker spawn/initialization.
@@ -285,6 +295,7 @@ pub enum WorkerExecutionSpawnResult {
     Connected {
         handle: WorkerExecutionHandle,
         run_state: WorkerExecutionRunState,
+        execution_workspace: Option<ExecutionWorkspaceStatus>,
     },
     Rejected(WorkerExecutionResult),
     Errored(WorkerExecutionResult),

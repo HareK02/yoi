@@ -863,6 +863,7 @@ mod tests {
                 digest: bundle.metadata.digest,
             },
             initial_input: None,
+            execution_workspace: None,
         }
     }
 
@@ -877,6 +878,10 @@ mod tests {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
                 run_state: WorkerExecutionRunState::Idle,
+                execution_workspace: request
+                    .execution_workspace
+                    .as_ref()
+                    .map(|binding| binding.status()),
             }
         }
 
@@ -1092,6 +1097,10 @@ mod ws_tests {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
                 run_state: WorkerExecutionRunState::Idle,
+                execution_workspace: request
+                    .execution_workspace
+                    .as_ref()
+                    .map(|binding| binding.status()),
             }
         }
 
@@ -1138,6 +1147,7 @@ mod ws_tests {
                 digest: bundle.metadata.digest,
             },
             initial_input: None,
+            execution_workspace: None,
         }
     }
 

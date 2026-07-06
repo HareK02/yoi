@@ -12,6 +12,7 @@ use chrono::{SecondsFormat, Utc};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+use worker_runtime::execution_workspace::LocalGitWorktreeMaterializer;
 use worker_runtime::worker_backend::WorkerRuntimeExecutionBackend;
 
 use crate::companion::{
@@ -41,7 +42,10 @@ use crate::repositories::{
 };
 use crate::store::{ControlPlaneStore, WorkspaceRecord};
 use crate::{Error, Result};
-use worker_runtime::catalog::{ConfigBundleRef, ProfileSelector};
+use worker_runtime::catalog::{
+    ConfigBundleRef, DirtyStatePolicy, ExecutionWorkspaceRepository, ExecutionWorkspaceRequest,
+    MaterializerKind, ProfileSelector, RepositorySelector as RuntimeRepositorySelector,
+};
 use worker_runtime::config_bundle::ConfigBundle;
 use worker_runtime::http_server::{
     RuntimeHttpConfigBundleAvailabilityResponse, RuntimeHttpConfigBundlesResponse,
@@ -151,14 +155,16 @@ pub struct WorkspaceApi {
 
 impl WorkspaceApi {
     pub async fn new(config: ServerConfig, store: Arc<dyn ControlPlaneStore>) -> Result<Self> {
-        let execution_backend = WorkerRuntimeExecutionBackend::from_workspace(
-            config.workspace_root.clone(),
-        )
-        .map_err(|err| {
-            crate::Error::Store(format!(
-                "failed to initialize embedded Worker backend: {err}"
-            ))
-        })?;
+        let execution_backend =
+            WorkerRuntimeExecutionBackend::from_workspace(config.workspace_root.clone())
+                .map_err(|err| {
+                    crate::Error::Store(format!(
+                        "failed to initialize embedded Worker backend: {err}"
+                    ))
+                })?
+                .with_execution_workspace_materializer(LocalGitWorktreeMaterializer::new(
+                    config.embedded_runtime_store_root.clone(),
+                ));
         Self::new_with_execution_backend(config, store, Arc::new(execution_backend)).await
     }
 
@@ -442,6 +448,8 @@ pub struct BrowserCreateWorkerRequest {
     pub display_name: String,
     pub profile: String,
     pub initial_text: String,
+    #[serde(default)]
+    pub repository_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -909,6 +917,47 @@ async fn get_worker_launch_options(
     Ok(Json(worker_launch_options_response(&api)))
 }
 
+fn default_execution_workspace_request(
+    config: &ServerConfig,
+    repository_id: Option<&str>,
+) -> Result<Option<ExecutionWorkspaceRequest>> {
+    let repository = match repository_id {
+        Some(id) => config
+            .repositories
+            .iter()
+            .find(|repository| repository.id == id)
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "unknown repository id `{id}` for Worker execution workspace"
+                ))
+            })?,
+        None => match config.repositories.as_slice() {
+            [] => return Ok(None),
+            [repository] => repository,
+            repositories => repositories
+                .iter()
+                .find(|repository| repository.id == "main")
+                .unwrap_or(&repositories[0]),
+        },
+    };
+
+    Ok(Some(ExecutionWorkspaceRequest {
+        repository: ExecutionWorkspaceRepository {
+            id: repository.id.clone(),
+            provider: repository.provider.clone(),
+            uri: repository.uri.clone(),
+            local_path: Some(repository.path.clone()),
+            selector: repository
+                .default_selector
+                .clone()
+                .map(RuntimeRepositorySelector)
+                .or_else(|| Some(RuntimeRepositorySelector::from("HEAD"))),
+        },
+        materializer: MaterializerKind::LocalGitWorktree,
+        dirty_state_policy: DirtyStatePolicy::CleanPointOnly,
+    }))
+}
+
 async fn create_workspace_worker(
     State(api): State<WorkspaceApi>,
     Json(request): Json<BrowserCreateWorkerRequest>,
@@ -934,6 +983,8 @@ async fn create_workspace_worker(
             content: initial_text,
         })
     };
+    let execution_workspace =
+        default_execution_workspace_request(&api.config, request.repository_id.as_deref())?;
     let result = api
         .runtime
         .spawn_worker(
@@ -946,6 +997,7 @@ async fn create_workspace_worker(
                 },
                 profile: Some(profile_selector),
                 initial_input,
+                execution_workspace,
             },
         )
         .map_err(|err| err.into_error())?;
@@ -2415,6 +2467,10 @@ mod tests {
                     self.backend_id(),
                 ),
                 run_state: worker_runtime::execution::WorkerExecutionRunState::Idle,
+                execution_workspace: request
+                    .execution_workspace
+                    .as_ref()
+                    .map(|binding| binding.status()),
             }
         }
 
@@ -2511,6 +2567,7 @@ mod tests {
                 digest: bundle.metadata.digest,
             },
             initial_input: None,
+            execution_workspace: None,
         }
     }
 
@@ -3250,6 +3307,7 @@ mod tests {
                     },
                     profile: None,
                     initial_input: None,
+                    execution_workspace: None,
                 },
             )
             .expect("spawn worker");
