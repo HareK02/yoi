@@ -12,8 +12,8 @@ use std::{
     time::Duration,
 };
 use worker_runtime::catalog::{
-    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerDetail as EmbeddedWorkerDetail,
-    WorkerStatus as EmbeddedWorkerStatus,
+    ConfigBundleRef, CreateWorkerRequest, ExecutionWorkspaceRequest, ProfileSelector,
+    WorkerDetail as EmbeddedWorkerDetail, WorkerStatus as EmbeddedWorkerStatus,
 };
 use worker_runtime::config_bundle::{
     ConfigBundle, ConfigBundleAvailability, ConfigBundleMetadata, ConfigBundleProvenance,
@@ -263,13 +263,26 @@ pub struct WorkerLookupResult {
 /// Browser-safe worker spawn request shape.
 ///
 /// The request carries Browser-facing launch semantics only: workspace intent,
-/// optional display identity, acceptance policy, optional profile selector, and
-/// optional initial input. Runtime execution authority is resolved by the host
+/// optional display identity, acceptance policy, optional profile selector,
+/// optional initial input, and optional configured Repository selector for
+/// execution-workspace materialization. Runtime execution authority is resolved by the host
 /// into a synced ConfigBundle before the canonical Runtime create request is
 /// built. Raw workspace roots, child cwd, executable paths, tool scope,
 /// credentials, raw config stores, sockets, sessions, and storage paths are not
 /// accepted from Workspace API callers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerSpawnExecutionWorkspaceRequest {
+    /// Safe configured Repository id. The host resolves this id to repository
+    /// authority from server-side config; browser callers cannot provide raw
+    /// source paths or runtime-internal storage paths.
+    pub repository_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerSpawnRequest {
     pub intent: WorkerSpawnIntent,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -279,6 +292,13 @@ pub struct WorkerSpawnRequest {
     pub profile: Option<ProfileSelector>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_input: Option<EmbeddedWorkerInput>,
+    /// Optional safe execution-workspace selector. The Workspace server resolves
+    /// this into a runtime-internal `ExecutionWorkspaceRequest` from configured
+    /// repositories before calling a host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_workspace: Option<WorkerSpawnExecutionWorkspaceRequest>,
+    #[serde(skip, default)]
+    pub resolved_execution_workspace: Option<ExecutionWorkspaceRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1321,6 +1341,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             profile,
             config_bundle,
             initial_input: request.initial_input.clone(),
+            execution_workspace: request.resolved_execution_workspace.clone(),
         };
         match self.runtime.create_worker(create_request) {
             Ok(detail) => {
@@ -1993,6 +2014,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             profile,
             config_bundle,
             initial_input: request.initial_input.clone(),
+            execution_workspace: request.resolved_execution_workspace.clone(),
         };
         match self.post_json::<_, RuntimeHttpWorkerResponse>("/v1/workers", &create) {
             Ok(response) => WorkerSpawnResult {
@@ -2916,6 +2938,10 @@ mod tests {
                     self.backend_id(),
                 ),
                 run_state: WorkerExecutionRunState::Idle,
+                execution_workspace: request
+                    .execution_workspace
+                    .as_ref()
+                    .map(|binding| binding.status()),
             }
         }
 
@@ -3144,6 +3170,8 @@ mod tests {
             },
             profile: None,
             initial_input: None,
+            execution_workspace: None,
+            resolved_execution_workspace: None,
         }
     }
 
@@ -3273,6 +3301,8 @@ mod tests {
                     },
                     profile: None,
                     initial_input: None,
+                    execution_workspace: None,
+                    resolved_execution_workspace: None,
                 },
             )
             .unwrap();
@@ -3372,6 +3402,8 @@ mod tests {
                     },
                     profile: Some(ProfileSelector::Builtin("builtin:coder".to_string())),
                     initial_input: None,
+                    execution_workspace: None,
+                    resolved_execution_workspace: None,
                 },
             )
             .unwrap();
@@ -3400,6 +3432,8 @@ mod tests {
                     acceptance: WorkerSpawnAcceptanceRequirement::SocketReady,
                     profile: None,
                     initial_input: None,
+                    execution_workspace: None,
+                    resolved_execution_workspace: None,
                 },
             )
             .unwrap();

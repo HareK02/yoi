@@ -18,6 +18,7 @@ use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation, WorkerExecutionResult,
     WorkerExecutionRunState, WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
 };
+use crate::execution_workspace::{ExecutionWorkspaceBinding, ExecutionWorkspaceMaterializer};
 use crate::interaction::{WorkerInput, WorkerInputKind};
 use async_trait::async_trait;
 use manifest::paths;
@@ -160,9 +161,19 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
     ) -> Result<WorkerHandle, String> {
         let worker_name = Self::runtime_worker_name(&request);
         let profile = self.runtime_profile(&request);
+        let workspace_root = request
+            .execution_workspace
+            .as_ref()
+            .map(|binding| binding.workspace_root().to_path_buf())
+            .unwrap_or_else(|| self.workspace_root.clone());
+        let cwd = request
+            .execution_workspace
+            .as_ref()
+            .map(|binding| binding.cwd().to_path_buf())
+            .unwrap_or_else(|| self.cwd.clone());
         let (mut manifest, loader) = worker::entrypoint::resolve_runtime_profile_manifest(
             profile.as_deref(),
-            &self.workspace_root,
+            &workspace_root,
             &worker_name,
         )?;
         manifest.worker.name = worker_name;
@@ -183,15 +194,10 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         })?;
         let store = CombinedStore::new(session_store, worker_metadata_store);
 
-        let worker = Worker::from_manifest_with_context(
-            manifest,
-            store,
-            loader,
-            self.workspace_root.clone(),
-            self.cwd.clone(),
-        )
-        .await
-        .map_err(|err| format!("failed to create Worker from profile: {err}"))?;
+        let worker =
+            Worker::from_manifest_with_context(manifest, store, loader, workspace_root, cwd)
+                .await
+                .map_err(|err| format!("failed to create Worker from profile: {err}"))?;
 
         let runtime_base = self.runtime_base_dir()?;
         let (handle, _shutdown_rx) = WorkerController::spawn(worker, &runtime_base)
@@ -204,12 +210,14 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
 struct RuntimeWorkerExecution {
     handle: WorkerHandle,
     busy: Arc<AtomicBool>,
+    execution_workspace: Option<ExecutionWorkspaceBinding>,
 }
 
 /// `worker-runtime` execution backend backed by real `worker` crate Workers.
 pub struct WorkerRuntimeExecutionBackend<F = ProfileRuntimeWorkerFactory> {
     backend_id: String,
     factory: Arc<F>,
+    execution_workspace_materializer: Option<Arc<dyn ExecutionWorkspaceMaterializer>>,
     runtime: Mutex<Option<Runtime>>,
     workers: Mutex<HashMap<crate::identity::WorkerRef, RuntimeWorkerExecution>>,
 }
@@ -233,6 +241,7 @@ where
         Ok(Self {
             backend_id: DEFAULT_BACKEND_ID.to_string(),
             factory: Arc::new(factory),
+            execution_workspace_materializer: None,
             runtime: Mutex::new(Some(runtime)),
             workers: Mutex::new(HashMap::new()),
         })
@@ -240,6 +249,14 @@ where
 
     pub fn with_backend_id(mut self, backend_id: impl Into<String>) -> Self {
         self.backend_id = backend_id.into();
+        self
+    }
+
+    pub fn with_execution_workspace_materializer(
+        mut self,
+        materializer: impl ExecutionWorkspaceMaterializer,
+    ) -> Self {
+        self.execution_workspace_materializer = Some(Arc::new(materializer));
         self
     }
 
@@ -356,6 +373,33 @@ where
             ));
         }
 
+        let mut request = request;
+        let execution_workspace = match request.request.execution_workspace.as_ref() {
+            Some(workspace_request) => {
+                let Some(materializer) = self.execution_workspace_materializer.as_ref() else {
+                    return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
+                        WorkerExecutionOperation::Spawn,
+                        "execution workspace materialization requested, but no materializer is configured for this runtime backend",
+                    ));
+                };
+                match materializer.materialize(&request.worker_ref, workspace_request) {
+                    Ok(binding) => {
+                        request.execution_workspace = Some(binding.clone());
+                        Some(binding)
+                    }
+                    Err(error) => {
+                        return WorkerExecutionSpawnResult::Rejected(
+                            WorkerExecutionResult::rejected(
+                                WorkerExecutionOperation::Spawn,
+                                error.to_string(),
+                            ),
+                        );
+                    }
+                }
+            }
+            None => None,
+        };
+
         let factory = self.factory.clone();
         let bridge_context = request.context.clone();
         let worker_ref = request.worker_ref.clone();
@@ -365,6 +409,12 @@ where
         let handle = match spawn_result {
             Ok(handle) => handle,
             Err(message) => {
+                if let (Some(materializer), Some(binding)) = (
+                    self.execution_workspace_materializer.as_ref(),
+                    execution_workspace.as_ref(),
+                ) {
+                    let _ = materializer.cleanup(binding);
+                }
                 return WorkerExecutionSpawnResult::Errored(WorkerExecutionResult::errored(
                     WorkerExecutionOperation::Spawn,
                     message,
@@ -405,11 +455,19 @@ where
                 ));
             }
         };
-        workers.insert(worker_ref.clone(), RuntimeWorkerExecution { handle, busy });
+        workers.insert(
+            worker_ref.clone(),
+            RuntimeWorkerExecution {
+                handle,
+                busy,
+                execution_workspace: execution_workspace.clone(),
+            },
+        );
 
         WorkerExecutionSpawnResult::Connected {
             handle: WorkerExecutionHandle::new(worker_ref, self.backend_id()),
             run_state: WorkerExecutionRunState::Idle,
+            execution_workspace: execution_workspace.map(|binding| binding.status()),
         }
     }
 
@@ -468,19 +526,44 @@ where
     }
 
     fn stop_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
-        let (worker, _busy) = match self.get_execution(handle) {
-            Ok(execution) => execution,
-            Err(mut result) => {
-                result.operation = WorkerExecutionOperation::Stop;
-                return result;
+        if handle.backend_id() != self.backend_id() {
+            return WorkerExecutionResult::rejected(
+                WorkerExecutionOperation::Stop,
+                format!(
+                    "execution handle belongs to backend {}, not {}",
+                    handle.backend_id(),
+                    self.backend_id()
+                ),
+            );
+        }
+        let execution = match self.workers.lock() {
+            Ok(mut workers) => workers.remove(handle.worker_ref()),
+            Err(_) => {
+                return WorkerExecutionResult::errored(
+                    WorkerExecutionOperation::Stop,
+                    "worker adapter registry lock is poisoned",
+                );
             }
         };
-        self.send_method(
+        let Some(execution) = execution else {
+            return WorkerExecutionResult::rejected(
+                WorkerExecutionOperation::Stop,
+                "execution handle does not reference a live Worker",
+            );
+        };
+        let result = self.send_method(
             WorkerExecutionOperation::Stop,
-            worker,
+            execution.handle,
             Method::Shutdown,
             WorkerExecutionRunState::Stopped,
-        )
+        );
+        if let (Some(materializer), Some(binding)) = (
+            self.execution_workspace_materializer.as_ref(),
+            execution.execution_workspace.as_ref(),
+        ) {
+            let _ = materializer.cleanup(binding);
+        }
+        result
     }
 
     fn cancel_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
@@ -503,11 +586,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::pin::Pin;
+    use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::Runtime as EmbeddedRuntime;
-    use crate::catalog::{ConfigBundleRef, CreateWorkerRequest, ProfileSelector};
+    use crate::catalog::{
+        ConfigBundleRef, CreateWorkerRequest, DirtyStatePolicy, ExecutionWorkspaceRepository,
+        ExecutionWorkspaceRequest, MaterializerKind, ProfileSelector, RepositorySelector,
+    };
+    use crate::execution_workspace::LocalGitWorktreeMaterializer;
     use crate::identity::RuntimeId;
     use crate::management::RuntimeOptions;
     use crate::observation::{TranscriptQuery, TranscriptRole};
@@ -559,13 +648,14 @@ mod tests {
         cwd: PathBuf,
         store_dir: PathBuf,
         worker_metadata_dir: PathBuf,
+        observed_cwds: Arc<Mutex<Vec<PathBuf>>>,
     }
 
     #[async_trait]
     impl RuntimeWorkerFactory for MockFactory {
         async fn spawn_controller(
             &self,
-            _request: WorkerExecutionSpawnRequest,
+            request: WorkerExecutionSpawnRequest,
         ) -> Result<WorkerHandle, String> {
             let manifest = WorkerManifest::from_toml(
                 r#"
@@ -590,12 +680,18 @@ mod tests {
                 FsStore::new(&self.store_dir).map_err(|err| err.to_string())?,
                 FsWorkerStore::new(&self.worker_metadata_dir).map_err(|err| err.to_string())?,
             );
-            let scope = Scope::writable(&self.cwd).map_err(|err| err.to_string())?;
+            let cwd = request
+                .execution_workspace
+                .as_ref()
+                .map(|binding| binding.cwd().to_path_buf())
+                .unwrap_or_else(|| self.cwd.clone());
+            self.observed_cwds.lock().unwrap().push(cwd.clone());
+            let scope = Scope::writable(&cwd).map_err(|err| err.to_string())?;
             let worker = Worker::new(
                 manifest,
                 Engine::new(self.client.clone()),
                 store,
-                self.cwd.clone(),
+                cwd,
                 scope,
             )
             .await
@@ -650,6 +746,45 @@ mod tests {
                 digest: bundle.metadata.digest,
             },
             initial_input: None,
+            execution_workspace: None,
+        }
+    }
+
+    fn git(path: &std::path::Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {:?} failed", args);
+    }
+
+    fn create_clean_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init"]);
+        git(
+            dir.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        git(dir.path(), &["config", "user.name", "Yoi Test"]);
+        fs::write(dir.path().join("README.md"), "clean\n").unwrap();
+        git(dir.path(), &["add", "README.md"]);
+        git(dir.path(), &["commit", "-m", "init"]);
+        dir
+    }
+
+    fn execution_workspace_request(repo: &std::path::Path) -> ExecutionWorkspaceRequest {
+        ExecutionWorkspaceRequest {
+            repository: ExecutionWorkspaceRepository {
+                id: "repo-main".to_string(),
+                provider: "git".to_string(),
+                uri: ".".to_string(),
+                local_path: Some(repo.to_path_buf()),
+                selector: Some(RepositorySelector::from("HEAD")),
+            },
+            materializer: MaterializerKind::LocalGitWorktree,
+            dirty_state_policy: DirtyStatePolicy::CleanPointOnly,
         }
     }
 
@@ -677,12 +812,14 @@ mod tests {
         let runtime_base = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
+        let observed_cwds = Arc::new(Mutex::new(Vec::new()));
         let factory = MockFactory {
             client: client.clone(),
             runtime_base: runtime_base.path().to_path_buf(),
             cwd: cwd.path().to_path_buf(),
             store_dir: store.path().join("sessions"),
             worker_metadata_dir: store.path().join("workers"),
+            observed_cwds,
         };
         let backend = WorkerRuntimeExecutionBackend::new(factory).unwrap();
         let runtime = EmbeddedRuntime::with_execution_backend(
@@ -729,5 +866,48 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.payload, protocol::Event::TextDone { .. }))
         );
+    }
+
+    #[test]
+    fn worker_spawn_receives_materialized_workspace_cwd_instead_of_source_repo() {
+        let client = MockClient::new(simple_text_events());
+        let runtime_base = tempfile::tempdir().unwrap();
+        let repo = create_clean_repo();
+        let store = tempfile::tempdir().unwrap();
+        let observed_cwds = Arc::new(Mutex::new(Vec::new()));
+        let factory = MockFactory {
+            client,
+            runtime_base: runtime_base.path().to_path_buf(),
+            cwd: repo.path().to_path_buf(),
+            store_dir: store.path().join("sessions"),
+            worker_metadata_dir: store.path().join("workers"),
+            observed_cwds: observed_cwds.clone(),
+        };
+        let backend = WorkerRuntimeExecutionBackend::new(factory)
+            .unwrap()
+            .with_execution_workspace_materializer(LocalGitWorktreeMaterializer::new(
+                runtime_base.path(),
+            ));
+        let runtime = EmbeddedRuntime::with_execution_backend(
+            RuntimeOptions {
+                runtime_id: RuntimeId::new("embedded-materialized"),
+                ..RuntimeOptions::default()
+            },
+            Arc::new(backend),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let mut request = create_request("chat");
+        request.execution_workspace = Some(execution_workspace_request(repo.path()));
+
+        let detail = runtime.create_worker(request).unwrap();
+
+        assert!(detail.execution.execution_workspace.is_some());
+        let cwds = observed_cwds.lock().unwrap();
+        assert_eq!(cwds.len(), 1);
+        let cwd = &cwds[0];
+        assert!(cwd.starts_with(runtime_base.path()));
+        assert!(!cwd.starts_with(repo.path()));
+        assert!(cwd.join("README.md").exists());
     }
 }

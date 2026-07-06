@@ -2,6 +2,7 @@ use crate::execution::WorkerExecutionStatus;
 use crate::identity::{RuntimeId, WorkerId, WorkerRef};
 use crate::interaction::WorkerInput;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Profile selector boundary. This is a selector, not a resolved config bundle.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,21 +26,124 @@ pub struct ConfigBundleRef {
     pub digest: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositorySelector(pub String);
+
+impl From<&str> for RepositorySelector {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<String> for RepositorySelector {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<str> for RepositorySelector {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for RepositorySelector {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionWorkspaceRepository {
+    pub id: String,
+    pub provider: String,
+    pub uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<RepositorySelector>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterializerKind {
+    #[default]
+    LocalGitWorktree,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirtyStatePolicy {
+    #[default]
+    CleanPointOnly,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionWorkspaceRequest {
+    pub repository: ExecutionWorkspaceRepository,
+    #[serde(default)]
+    pub materializer: MaterializerKind,
+    #[serde(default)]
+    pub dirty_state_policy: DirtyStatePolicy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionWorkspaceStatusKind {
+    Active,
+    Removed,
+    CleanupPending,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionWorkspaceCleanupTarget {
+    pub kind: String,
+    pub allocation_id: String,
+    pub repository_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionWorkspaceSummary {
+    pub allocation_id: String,
+    pub repository_id: String,
+    pub materializer_kind: MaterializerKind,
+    pub dirty_state_policy: DirtyStatePolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_tree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_target: Option<ExecutionWorkspaceCleanupTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_policy: Option<String>,
+    pub status: ExecutionWorkspaceStatusKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionWorkspaceStatus {
+    pub summary: ExecutionWorkspaceSummary,
+}
+
 /// Canonical Runtime Worker creation request.
 ///
 /// Browser/product launch semantics are resolved by a backend before this
 /// request is built. The request contains only durable Runtime identity inputs:
 /// a backend-decided profile selector, a previously synced ConfigBundle identity,
-/// and optional initial user input that is committed in the same transaction as
-/// Worker catalog/transcript persistence. It carries no cwd/workspace path, tool
-/// scope, credential, socket/session path, raw config body, or execution binding
-/// internals.
+/// optional initial user input that is committed in the same transaction as
+/// Worker catalog/transcript persistence, and an optional execution workspace
+/// request that preserves RepositoryPoint-style semantics for runtime-side
+/// materialization. Browser-facing status for materialized workspaces is
+/// summarized without exposing raw host paths.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateWorkerRequest {
     pub profile: ProfileSelector,
     pub config_bundle: ConfigBundleRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_input: Option<WorkerInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_workspace: Option<ExecutionWorkspaceRequest>,
 }
 
 /// Worker lifecycle status for the in-memory embedded runtime.
