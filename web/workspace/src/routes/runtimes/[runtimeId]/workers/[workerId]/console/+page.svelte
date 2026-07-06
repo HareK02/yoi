@@ -1,8 +1,6 @@
 <script lang="ts">
-  import WorkspaceSidebar from '$lib/workspace-sidebar/WorkspaceSidebar.svelte';
   import {
     projectConsole,
-    workerConsolePath,
     type ConsoleLine
   } from '$lib/workspace-console/model';
   import type {
@@ -10,8 +8,7 @@
     Diagnostic,
     Worker,
     WorkerInputResult,
-    WorkerTranscriptProjection,
-    WorkspaceResponse
+    WorkerTranscriptProjection
   } from '$lib/workspace-sidebar/types';
 
   type Props = {
@@ -25,10 +22,7 @@
 
   const runtimeId = $derived(data.runtimeId);
   const workerId = $derived(data.workerId);
-  const currentPath = $derived(workerConsolePath(runtimeId, workerId));
 
-  let workspace = $state<WorkspaceResponse | null>(null);
-  let workspaceError = $state<string | null>(null);
   let worker = $state<Worker | null>(null);
   let workerError = $state<string | null>(null);
   let transcript = $state<WorkerTranscriptProjection | null>(null);
@@ -92,16 +86,6 @@
       return response.json() as Promise<T>;
     } finally {
       window.clearTimeout(timeout);
-    }
-  }
-
-  async function loadWorkspace() {
-    workspaceError = null;
-    try {
-      workspace = await getJson<WorkspaceResponse>('/api/workspace');
-    } catch (error) {
-      workspaceError = error instanceof Error ? error.message : String(error);
-      workspace = null;
     }
   }
 
@@ -254,10 +238,6 @@
   }
 
   $effect(() => {
-    void loadWorkspace();
-  });
-
-  $effect(() => {
     const target = consoleTarget;
     observedEvents = [];
     streamDiagnostics = [];
@@ -273,10 +253,7 @@
   <meta name="description" content="Worker attach console through Workspace Backend APIs" />
 </svelte:head>
 
-<div class="workspace-layout">
-  <WorkspaceSidebar {workspace} {workspaceError} {currentPath} />
-
-  <main class="shell console-shell worker-console-shell">
+<div class="console-shell worker-console-shell">
     <section class="console-header card">
       <div>
         <h2>{worker?.label ?? workerId}</h2>
@@ -413,5 +390,4 @@
         {#if sendError}<p class="error">{sendError}</p>{/if}
       </div>
     </form>
-  </main>
 </div>

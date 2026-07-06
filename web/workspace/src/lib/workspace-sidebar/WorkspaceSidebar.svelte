@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
   import ObjectivesNavSection from './ObjectivesNavSection.svelte';
   import RepositoriesNavSection from './RepositoriesNavSection.svelte';
   import WorkersNavSection from './WorkersNavSection.svelte';
@@ -16,43 +15,10 @@
   let {
     workspace,
     workspaceError = null,
-    repositories,
-    repositoriesError,
+    repositories = null,
+    repositoriesError = null,
     currentPath = '/'
   }: Props = $props();
-
-  let fallbackRepositories = $state<RepositoryListResponse | null>(null);
-  let fallbackRepositoriesError = $state<string | null>(null);
-  let displayedRepositories = $derived(repositories === undefined ? fallbackRepositories : repositories);
-  let displayedRepositoriesError = $derived(
-    repositoriesError === undefined ? fallbackRepositoriesError : repositoriesError
-  );
-
-  onMount(() => {
-    if (repositories !== undefined) {
-      return;
-    }
-    const controller = new AbortController();
-    void loadFallbackRepositories(controller.signal);
-    return () => controller.abort();
-  });
-
-  async function loadFallbackRepositories(signal?: AbortSignal) {
-    fallbackRepositoriesError = null;
-    try {
-      const response = await fetch('/api/repositories', { signal });
-      if (!response.ok) {
-        throw new Error(`repositories request failed (${response.status})`);
-      }
-      fallbackRepositories = (await response.json()) as RepositoryListResponse;
-    } catch (error) {
-      if (error instanceof DOMException && error.name === 'AbortError') {
-        return;
-      }
-      fallbackRepositoriesError = error instanceof Error ? error.message : 'repositories request failed';
-      fallbackRepositories = null;
-    }
-  }
 </script>
 
 <aside class="workspace-sidebar" aria-label="Workspace navigation">
@@ -82,11 +48,7 @@
   </header>
 
   <nav class="sidebar-sections" aria-label="Workspace sections">
-    <RepositoriesNavSection
-      repositories={displayedRepositories}
-      repositoriesError={displayedRepositoriesError}
-      {currentPath}
-    />
+    <RepositoriesNavSection {repositories} {repositoriesError} {currentPath} />
     <ObjectivesNavSection {currentPath} />
     <WorkersNavSection {currentPath} />
 
