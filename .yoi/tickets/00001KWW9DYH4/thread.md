@@ -249,3 +249,42 @@ Review-fix implementation report:
 - Requesting follow-up external review against `8b7a5da0..c90ebf24` and full combined implementation。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-06T19:23:01Z status: approve -->
+
+## Review: approve
+
+External follow-up review result: approve
+
+Blockers: none.
+
+Evidence reviewed:
+- Ticket / Objective context, combined diff, fix diff, and relevant runtime/workspace-server files in the implementation worktree。
+- Fix commit `c90ebf24` and combined implementation after `8b7a5da0`。
+
+Findings:
+- Prior blocker is resolved. Browser/API `WorkerSpawnRequest` now exposes only `execution_workspace: { repository_id, selector? }` via `WorkerSpawnExecutionWorkspaceRequest` with `deny_unknown_fields`; internal `resolved_execution_workspace` is `#[serde(skip, default)]`。
+- `/api/runtimes/{runtime_id}/workers` resolves safe repository id/selector server-side from configured repositories into an internal `ExecutionWorkspaceRequest`。
+- `/api/workers` remains safe: `BrowserCreateWorkerRequest` only accepts optional `repository_id`; server-side code builds the internal request。
+- Fix tests explicitly reject caller-supplied `local_path` and accept safe `repository_id`/`selector`, with response path redaction asserted。
+- Response/status projections remain browser-safe: execution workspace summaries carry ids/commit/tree/cleanup metadata, not raw workspace/source paths。
+- Original materializer acceptance remains satisfied:
+  - local Git only, remote/non-Git/dirty source rejected with typed diagnostics。
+  - selector resolves to commit/tree。
+  - detached `git worktree add --detach` is created under Runtime root `execution-workspaces/<allocation-id>/root/<repository-id>`。
+  - worker factory uses materialized workspace root/cwd instead of source root。
+  - allocation evidence and cleanup target are recorded。
+  - cleanup hook removes worktree and updates record。
+  - tests cover detached worktree, distinct paths, dirty rejection, unsupported diagnostics, cleanup, and materialized cwd。
+
+Validation reviewed:
+- Reviewer inspected requested fix diff and combined implementation diff。
+- Reviewer ran read-only `git diff --check 50c80e77..HEAD` in the implementation worktree; no whitespace errors。
+- Reviewer accepted Orchestrator-reported full validation suite as passing。
+
+Non-blocking note:
+- Runtime HTTP `/v1/workers` remains an internal/trusted backend-to-runtime API carrying `CreateWorkerRequest`; this matches the current trusted-runtime boundary and is not browser-facing。
+
+No merge-blocking issues found.
+
+---
