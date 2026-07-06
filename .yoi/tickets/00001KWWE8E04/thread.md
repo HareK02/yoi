@@ -216,3 +216,30 @@ Non-blocking follow-ups:
 - redirect/shared-route refactor 後、scoped settings/workers/console endpoints の direct coverage を増やすとよい。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-06T20:45:34Z -->
+
+## Implementation report
+
+Review-fix implementation report:
+
+- Coder Pod completed requested changes and committed follow-up `71340b89 fix: redirect unscoped workspace routes` on branch `work/00001KWWE8E04-workspace-id-routes`.
+- Worktree status was clean after commit.
+- Fix summary:
+  - `+layout.ts` now uses `/api/workspace` only as bootstrap when route `workspaceId` is absent, then redirects to `/w/<workspace-id>...`。
+  - Silent `/api${path}` fallback for workspace-scoped data was removed。
+  - Unscoped root/objectives/repository/settings/worker-console routes are thin redirect/shim surfaces instead of duplicated full data/control pages。
+  - Backend SPA fallback redirects unscoped Browser routes such as `/objectives?...` to `/w/<workspace-id>/objectives?...`。
+  - Canonical maintained page/control logic remains under `/w/[workspaceId]/**`。
+  - Added/updated focused tests for bootstrap-then-redirect behavior, no unscoped workspace API fallback, thin settings shim, backend unscoped UI redirect, and canonical worker console scoped route references。
+- Orchestrator reran validation in the implementation worktree:
+  - `git diff --check`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（17 tests）
+  - `cargo test -p yoi-workspace-server`: pass（65 lib tests + 2 main tests）
+  - `cargo check -p yoi`: pass
+  - `yoi ticket doctor`: ok
+- `nix build .#yoi --no-link` は Cargo.lock / dependency / resource packaging / Nix 変更ではないため未実行。
+- Requesting follow-up external review against `f6ad9cfc..71340b89` and full combined implementation。
+
+---
