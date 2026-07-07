@@ -155,3 +155,37 @@ Implementation routing update:
 - 完了後は diff / validation evidence を Orchestrator が確認し、別 sibling Reviewer Pod に read-only review を依頼する。`StopPod` は既知の不具合があるため使用しない。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-07T14:23:27Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Coder Pod completed implementation and committed `684b19e8 feat: add browser execution workspaces` on branch `work/00001KWY8EHEJ-browser-execution-workspaces`.
+- Worktree status was clean after commit.
+- Changed files include:
+  - `crates/worker-runtime/src/{catalog.rs,execution_workspace.rs,http_server.rs,runtime.rs,worker_backend.rs}`
+  - `crates/workspace-server/src/{companion.rs,hosts.rs,server.rs}`
+  - `web/workspace/src/lib/workspace-sidebar/{WorkersNavSection.svelte,types.ts,worker-launch.ts,worker-launch.test.ts}`
+- Implementation summary:
+  - Runtime-side preallocated Execution Workspace create/list/detail/cleanup and allocation binding at Worker spawn。
+  - `relative_cwd` validation rejects absolute paths, `..`, missing paths, files, and symlink escapes。
+  - scoped Browser API: `POST/GET /api/w/<workspace-id>/execution-workspaces`, detail, and cleanup。
+  - Browser API uses configured `repository_id` + selector + policy, not raw paths/internal `ExecutionWorkspaceRequest`。
+  - Browser responses expose safe summaries only。
+  - Worker spawn uses selected allocation id plus optional safe `relative_cwd`。
+  - Worker list/detail projections include execution workspace safe summary。
+  - Workspace UI Worker launch flow can select existing allocations or create a new allocation before launch。
+- Orchestrator reran validation in the implementation worktree:
+  - `git diff --check`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（17 tests）
+  - `cargo test -p yoi-workspace-server`: pass（66 lib tests + 2 main tests）
+  - `cargo test -p worker-runtime --features ws-server,fs-store`: pass（36 lib tests + 5 main tests + doc tests）
+  - `cargo check -p yoi`: pass
+  - `yoi ticket doctor`: ok
+  - `nix build .#yoi --no-link`: pass
+- External review will be requested via a read-only sibling Reviewer Pod. `StopPod` は使わない。
+
+---

@@ -2,7 +2,7 @@
 title: 'Enable Browser-managed execution workspaces for Worker spawn'
 state: 'inprogress'
 created_at: '2026-07-07T12:22:06Z'
-updated_at: '2026-07-07T13:42:50Z'
+updated_at: '2026-07-07T14:23:27Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-07-07T13:40:23Z'
