@@ -48,7 +48,7 @@
   let runtimeId = $state('');
   let profile = $state('builtin:coder');
   let initialText = $state('');
-  let workingDirectoryAllocationId = $state('');
+  let workingDirectoryId = $state('');
   let workingDirectoryRepositoryId = $state('');
   let workingDirectorySelector = $state('HEAD');
   let relativeCwd = $state('');
@@ -114,7 +114,7 @@
         display_name: displayName,
         profile,
         initial_text: initialText,
-        working_directory_allocation_id: workingDirectoryAllocationId,
+        working_directory_id: workingDirectoryId,
         working_directory_repository_id: workingDirectoryRepositoryId,
         working_directory_selector: workingDirectorySelector,
         relative_cwd: relativeCwd,
@@ -122,7 +122,7 @@
       runtimeId = form.runtime_id;
       displayName = form.display_name;
       profile = form.profile;
-      workingDirectoryAllocationId = form.working_directory_allocation_id;
+      workingDirectoryId = form.working_directory_id;
       workingDirectoryRepositoryId = form.working_directory_repository_id;
       workingDirectorySelector = form.working_directory_selector;
       relativeCwd = form.relative_cwd;
@@ -158,9 +158,9 @@
       const payload = (await response.json()) as BrowserWorkingDirectoryCreateResponse;
       const items = options?.working_directories ?? [];
       options = options
-        ? { ...options, working_directories: [...items.filter((item) => item.allocation_id !== payload.item.allocation_id), payload.item] }
+        ? { ...options, working_directories: [...items.filter((item) => item.working_directory_id !== payload.item.working_directory_id), payload.item] }
         : options;
-      workingDirectoryAllocationId = payload.item.allocation_id;
+      workingDirectoryId = payload.item.working_directory_id;
     } catch (err) {
       submitError = exceptionDisplayError(err, 'working directory create failed');
     } finally {
@@ -185,7 +185,7 @@
           display_name: displayName,
           profile,
           initial_text: initialText,
-          working_directory_allocation_id: workingDirectoryAllocationId,
+          working_directory_id: workingDirectoryId,
           working_directory_repository_id: workingDirectoryRepositoryId,
           working_directory_selector: workingDirectorySelector,
           relative_cwd: relativeCwd,
@@ -279,18 +279,18 @@
       <fieldset class="worker-working-directory">
         <legend>Working directory</legend>
         <label>
-          <span>Allocation</span>
-          <select bind:value={workingDirectoryAllocationId}>
-            <option value="">No allocation selected</option>
+          <span>Working directory</span>
+          <select bind:value={workingDirectoryId}>
+            <option value="">No working directory selected</option>
             {#each options?.working_directories ?? [] as directory}
-              <option value={directory.allocation_id} disabled={directory.status !== 'active'}>
+              <option value={directory.working_directory_id} disabled={directory.status !== 'active'}>
                 {directory.repository_id} · {directory.requested_selector ?? 'HEAD'} · {directory.resolved_commit.slice(0, 12)} · {directory.status}
               </option>
             {/each}
           </select>
         </label>
         <label>
-          <span>Repository for new allocation</span>
+          <span>Repository</span>
           <select bind:value={workingDirectoryRepositoryId}>
             {#if options?.repositories.length}
               {#each options.repositories as repository}
@@ -306,11 +306,11 @@
           <input bind:value={workingDirectorySelector} autocomplete="off" placeholder="HEAD" />
         </label>
         <button type="button" disabled={creatingWorkingDirectory || !workingDirectoryRepositoryId} onclick={() => void createWorkingDirectory()}>
-          {creatingWorkingDirectory ? 'Allocating…' : 'Create working directory'}
+          {creatingWorkingDirectory ? 'Creating…' : 'Create working directory'}
         </button>
         <label>
           <span>Relative cwd</span>
-          <input bind:value={relativeCwd} autocomplete="off" placeholder="Optional path inside allocation" />
+          <input bind:value={relativeCwd} autocomplete="off" placeholder="Optional path inside working directory" />
         </label>
       </fieldset>
       <label>
@@ -335,7 +335,7 @@
           {/if}
         </div>
       {/if}
-      <button type="submit" disabled={submitting || !runtimeId || !profile || !workingDirectoryAllocationId}>
+      <button type="submit" disabled={submitting || !runtimeId || !profile || !workingDirectoryId}>
         {submitting ? 'Starting…' : 'Start Coding Worker'}
       </button>
     </form>

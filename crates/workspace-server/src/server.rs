@@ -46,7 +46,7 @@ use crate::store::{ControlPlaneStore, WorkspaceRecord};
 use crate::{Error, Result};
 use worker_runtime::catalog::{
     ConfigBundleRef, DirtyStatePolicy, MaterializerKind, ProfileSelector,
-    RepositorySelector as RuntimeRepositorySelector, WorkingDirectoryAllocationClaim,
+    RepositorySelector as RuntimeRepositorySelector, WorkingDirectoryClaim,
     WorkingDirectoryRepository, WorkingDirectoryRequest, WorkingDirectorySummary,
 };
 use worker_runtime::config_bundle::ConfigBundle;
@@ -275,7 +275,7 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             get(scoped_list_working_directories).post(scoped_create_working_directory),
         )
         .route(
-            "/api/w/{workspace_id}/working-directories/{allocation_id}",
+            "/api/w/{workspace_id}/working-directories/{working_directory_id}",
             get(scoped_working_directory_detail).delete(scoped_cleanup_working_directory),
         )
         .route("/api/runtimes", get(list_runtimes))
@@ -626,7 +626,7 @@ pub struct BrowserWorkingDirectoryDetailResponse {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserWorkerWorkingDirectorySelection {
-    pub allocation_id: String,
+    pub working_directory_id: String,
     #[serde(default)]
     pub relative_cwd: Option<String>,
 }
@@ -744,7 +744,7 @@ struct ScopedRuntimePath {
 #[derive(Debug, Deserialize)]
 struct ScopedWorkingDirectoryPath {
     workspace_id: String,
-    allocation_id: String,
+    working_directory_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -903,10 +903,10 @@ async fn scoped_create_working_directory(
     Json(request): Json<BrowserWorkingDirectoryCreateRequest>,
 ) -> ApiResult<Json<BrowserWorkingDirectoryDetailResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let workspace_request = working_directory_request_for_browser(&api, request)?;
+    let working_directory_request = working_directory_request_for_browser(&api, request)?;
     let binding = api
         .working_directory_materializer
-        .preallocate(&workspace_request)
+        .create(&working_directory_request)
         .map_err(|diagnostic| {
             ApiError::from(Error::RuntimeOperationFailed {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
@@ -928,7 +928,7 @@ async fn scoped_working_directory_detail(
     validate_workspace_scope(&api, &path.workspace_id)?;
     let status = api
         .working_directory_materializer
-        .allocation_status(&path.allocation_id)
+        .working_directory_status(&path.working_directory_id)
         .map_err(|diagnostic| {
             ApiError::from(Error::RuntimeOperationFailed {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
@@ -950,7 +950,7 @@ async fn scoped_cleanup_working_directory(
     validate_workspace_scope(&api, &path.workspace_id)?;
     let status = api
         .working_directory_materializer
-        .cleanup_allocation(&path.allocation_id)
+        .cleanup_working_directory(&path.working_directory_id)
         .map_err(|diagnostic| {
             ApiError::from(Error::RuntimeOperationFailed {
                 runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
@@ -1621,28 +1621,28 @@ async fn create_workspace_worker(
             content: initial_text,
         })
     };
-    let resolved_working_directory_allocation =
+    let resolved_working_directory =
         request
             .working_directory
-            .map(|selection| WorkingDirectoryAllocationClaim {
-                allocation_id: selection.allocation_id,
+            .map(|selection| WorkingDirectoryClaim {
+                working_directory_id: selection.working_directory_id,
                 relative_cwd: selection.relative_cwd,
             });
-    if resolved_working_directory_allocation.is_some()
-        && request.runtime_id != EMBEDDED_WORKER_RUNTIME_ID
-    {
+    if resolved_working_directory.is_some() && request.runtime_id != EMBEDDED_WORKER_RUNTIME_ID {
         return Err(Error::RuntimeOperationFailed {
             runtime_id: request.runtime_id.clone(),
             code: "working_directory_runtime_unsupported".to_string(),
-            message: "preallocated working directories are only supported by the embedded local runtime in v0".to_string(),
+            message:
+                "created working directories are only supported by the embedded local runtime in v0"
+                    .to_string(),
         }
         .into());
     }
-    if let Some(allocation) = resolved_working_directory_allocation.as_ref() {
+    if let Some(working_directory) = resolved_working_directory.as_ref() {
         api.working_directory_materializer
-            .bind_allocation(
-                &allocation.allocation_id,
-                allocation.relative_cwd.as_deref(),
+            .bind_working_directory(
+                &working_directory.working_directory_id,
+                working_directory.relative_cwd.as_deref(),
             )
             .map_err(|diagnostic| {
                 working_directory_api_error(request.runtime_id.clone(), diagnostic)
@@ -1660,9 +1660,9 @@ async fn create_workspace_worker(
                 },
                 profile: Some(profile_selector),
                 initial_input,
-                working_directory: None,
-                resolved_working_directory: None,
-                resolved_working_directory_allocation,
+                working_directory_request: None,
+                resolved_working_directory_request: None,
+                resolved_working_directory,
             },
         )
         .map_err(|err| err.into_error())?;
@@ -1751,8 +1751,8 @@ async fn create_runtime_worker(
     AxumPath(runtime_id): AxumPath<String>,
     Json(mut request): Json<WorkerSpawnRequest>,
 ) -> ApiResult<Json<WorkerSpawnResult>> {
-    request.resolved_working_directory = request
-        .working_directory
+    request.resolved_working_directory_request = request
+        .working_directory_request
         .as_ref()
         .map(|working_directory| {
             configured_working_directory_request(&api.config, working_directory)
@@ -2713,7 +2713,7 @@ fn working_directory_repository_options(
 
 fn working_directory_summaries(api: &WorkspaceApi) -> ApiResult<Vec<WorkingDirectorySummary>> {
     api.working_directory_materializer
-        .list_allocations()
+        .list_working_directories()
         .map(|items| items.into_iter().map(|status| status.summary).collect())
         .map_err(|diagnostic| {
             ApiError::from(Error::RuntimeOperationFailed {
@@ -3418,8 +3418,8 @@ mod tests {
                 digest: bundle.metadata.digest,
             },
             initial_input: None,
+            working_directory_request: None,
             working_directory: None,
-            working_directory_allocation: None,
         }
     }
 
@@ -3435,7 +3435,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_working_directory_preallocate_list_detail_and_cleanup_are_path_safe() {
+    async fn browser_working_directory_create_list_detail_and_cleanup_are_path_safe() {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let app = test_app(dir.path()).await;
@@ -3451,7 +3451,7 @@ mod tests {
             }),
         )
         .await;
-        let allocation_id = created["item"]["allocation_id"]
+        let working_directory_id = created["item"]["working_directory_id"]
             .as_str()
             .unwrap()
             .to_string();
@@ -3463,11 +3463,14 @@ mod tests {
 
         let list = get_json(app.clone(), &workspace_path).await;
         assert_eq!(list["items"].as_array().unwrap().len(), 1);
-        assert_eq!(list["items"][0]["allocation_id"], allocation_id);
+        assert_eq!(
+            list["items"][0]["working_directory_id"],
+            working_directory_id
+        );
 
-        let detail_path = format!("{workspace_path}/{allocation_id}");
+        let detail_path = format!("{workspace_path}/{working_directory_id}");
         let detail = get_json(app.clone(), &detail_path).await;
-        assert_eq!(detail["item"]["allocation_id"], allocation_id);
+        assert_eq!(detail["item"]["working_directory_id"], working_directory_id);
 
         let removed = request_json(app, "DELETE", &detail_path, None, StatusCode::OK).await;
         assert_eq!(removed["item"]["status"], "removed");
@@ -3489,7 +3492,7 @@ mod tests {
             }),
         )
         .await;
-        let allocation_id = created["item"]["allocation_id"].as_str().unwrap();
+        let working_directory_id = created["item"]["working_directory_id"].as_str().unwrap();
 
         let response = request_json(
             app,
@@ -3501,7 +3504,7 @@ mod tests {
                 "profile": "builtin:coder",
                 "initial_text": "",
                 "working_directory": {
-                    "allocation_id": allocation_id,
+                    "working_directory_id": working_directory_id,
                     "relative_cwd": "../escape"
                 }
             })),
@@ -3857,7 +3860,7 @@ mod tests {
                     "kind": "run_accepted",
                     "expected_segments": 0
                 },
-                "working_directory": {
+                "working_directory_request": {
                     "repository_id": TEST_REPOSITORY_ID,
                     "local_path": dir.path().display().to_string()
                 }
@@ -3892,7 +3895,7 @@ mod tests {
                     "kind": "run_accepted",
                     "expected_segments": 0
                 },
-                "working_directory": {
+                "working_directory_request": {
                     "repository_id": TEST_REPOSITORY_ID,
                     "selector": "HEAD"
                 }
@@ -4379,9 +4382,9 @@ mod tests {
                     },
                     profile: None,
                     initial_input: None,
-                    working_directory: None,
+                    working_directory_request: None,
+                    resolved_working_directory_request: None,
                     resolved_working_directory: None,
-                    resolved_working_directory_allocation: None,
                 },
             )
             .expect("spawn worker");

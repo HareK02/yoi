@@ -13,7 +13,7 @@ use std::{
 };
 use worker_runtime::catalog::{
     ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerDetail as EmbeddedWorkerDetail,
-    WorkerStatus as EmbeddedWorkerStatus, WorkingDirectoryAllocationClaim, WorkingDirectoryRequest,
+    WorkerStatus as EmbeddedWorkerStatus, WorkingDirectoryClaim, WorkingDirectoryRequest,
     WorkingDirectorySummary,
 };
 use worker_runtime::config_bundle::{
@@ -295,15 +295,15 @@ pub struct WorkerSpawnRequest {
     pub profile: Option<ProfileSelector>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_input: Option<EmbeddedWorkerInput>,
-    /// Optional safe working-directory selector. The Workspace server resolves
+    /// Optional safe working-directory creation request. The Workspace server resolves
     /// this into a runtime-internal `WorkingDirectoryRequest` from configured
     /// repositories before calling a host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_directory: Option<WorkerSpawnWorkingDirectoryRequest>,
+    pub working_directory_request: Option<WorkerSpawnWorkingDirectoryRequest>,
     #[serde(skip, default)]
-    pub resolved_working_directory: Option<WorkingDirectoryRequest>,
+    pub resolved_working_directory_request: Option<WorkingDirectoryRequest>,
     #[serde(skip, default)]
-    pub resolved_working_directory_allocation: Option<WorkingDirectoryAllocationClaim>,
+    pub resolved_working_directory: Option<WorkingDirectoryClaim>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1356,8 +1356,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             profile,
             config_bundle,
             initial_input: request.initial_input.clone(),
+            working_directory_request: request.resolved_working_directory_request.clone(),
             working_directory: request.resolved_working_directory.clone(),
-            working_directory_allocation: request.resolved_working_directory_allocation.clone(),
         };
         match self.runtime.create_worker(create_request) {
             Ok(detail) => {
@@ -2032,8 +2032,8 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             profile,
             config_bundle,
             initial_input: request.initial_input.clone(),
+            working_directory_request: request.resolved_working_directory_request.clone(),
             working_directory: request.resolved_working_directory.clone(),
-            working_directory_allocation: request.resolved_working_directory_allocation.clone(),
         };
         match self.post_json::<_, RuntimeHttpWorkerResponse>("/v1/workers", &create) {
             Ok(response) => WorkerSpawnResult {
@@ -3191,9 +3191,9 @@ mod tests {
             },
             profile: None,
             initial_input: None,
-            working_directory: None,
+            working_directory_request: None,
+            resolved_working_directory_request: None,
             resolved_working_directory: None,
-            resolved_working_directory_allocation: None,
         }
     }
 
@@ -3323,9 +3323,9 @@ mod tests {
                     },
                     profile: None,
                     initial_input: None,
-                    working_directory: None,
+                    working_directory_request: None,
+                    resolved_working_directory_request: None,
                     resolved_working_directory: None,
-                    resolved_working_directory_allocation: None,
                 },
             )
             .unwrap();
@@ -3425,9 +3425,9 @@ mod tests {
                     },
                     profile: Some(ProfileSelector::Builtin("builtin:coder".to_string())),
                     initial_input: None,
-                    working_directory: None,
+                    working_directory_request: None,
+                    resolved_working_directory_request: None,
                     resolved_working_directory: None,
-                    resolved_working_directory_allocation: None,
                 },
             )
             .unwrap();
@@ -3456,9 +3456,9 @@ mod tests {
                     acceptance: WorkerSpawnAcceptanceRequirement::SocketReady,
                     profile: None,
                     initial_input: None,
-                    working_directory: None,
+                    working_directory_request: None,
+                    resolved_working_directory_request: None,
                     resolved_working_directory: None,
-                    resolved_working_directory_allocation: None,
                 },
             )
             .unwrap();

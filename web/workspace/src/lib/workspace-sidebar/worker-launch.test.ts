@@ -45,7 +45,7 @@ const options: WorkerLaunchOptionsResponse = {
   ],
   working_directories: [
     {
-      allocation_id: "alloc-1-repo",
+      working_directory_id: "wd-1-repo",
       repository_id: "repo",
       requested_selector: "HEAD",
       materializer_kind: "local_git_worktree",
@@ -55,7 +55,7 @@ const options: WorkerLaunchOptionsResponse = {
       cleanup_policy: "manual_or_worker_stop",
       cleanup_target: {
         kind: "git_worktree",
-        allocation_id: "alloc-1-repo",
+        working_directory_id: "wd-1-repo",
         repository_id: "repo",
       },
     },
@@ -69,7 +69,7 @@ Deno.test("defaultWorkerLaunchForm chooses active runtime, coder profile, reposi
     display_name: "",
     profile: "",
     initial_text: "hello",
-    working_directory_allocation_id: "",
+    working_directory_id: "",
     working_directory_repository_id: "",
     working_directory_selector: "",
     relative_cwd: "",
@@ -79,18 +79,18 @@ Deno.test("defaultWorkerLaunchForm chooses active runtime, coder profile, reposi
   assertEquals(form.display_name, "Coding Worker");
   assertEquals(form.profile, "builtin:coder");
   assertEquals(form.initial_text, "hello");
-  assertEquals(form.working_directory_allocation_id, "alloc-1-repo");
+  assertEquals(form.working_directory_id, "wd-1-repo");
   assertEquals(form.working_directory_repository_id, "repo");
   assertEquals(form.working_directory_selector, "HEAD");
 });
 
-Deno.test("buildBrowserCreateWorkerRequest sends allocation id and relative cwd only", () => {
+Deno.test("buildBrowserCreateWorkerRequest sends working_directory id and relative cwd only", () => {
   const request = buildBrowserCreateWorkerRequest({
     runtime_id: "embedded",
     display_name: "Worker",
     profile: "builtin:coder",
     initial_text: "go",
-    working_directory_allocation_id: "alloc-1-repo",
+    working_directory_id: "wd-1-repo",
     working_directory_repository_id: "repo",
     working_directory_selector: "main",
     relative_cwd: "crates/yoi",
@@ -102,7 +102,7 @@ Deno.test("buildBrowserCreateWorkerRequest sends allocation id and relative cwd 
     profile: "builtin:coder",
     initial_text: "go",
     working_directory: {
-      allocation_id: "alloc-1-repo",
+      working_directory_id: "wd-1-repo",
       relative_cwd: "crates/yoi",
     },
   });

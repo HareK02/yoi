@@ -1592,8 +1592,8 @@ mod tests {
                 digest: bundle.metadata.digest,
             },
             initial_input: None,
+            working_directory_request: None,
             working_directory: None,
-            working_directory_allocation: None,
         }
     }
 

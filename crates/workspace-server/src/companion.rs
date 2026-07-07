@@ -387,9 +387,9 @@ fn spawn_companion_worker(runtime: &RuntimeRegistry) -> CompanionWorkerState {
             },
             profile: Some(selector),
             initial_input: None,
-            working_directory: None,
+            working_directory_request: None,
+            resolved_working_directory_request: None,
             resolved_working_directory: None,
-            resolved_working_directory_allocation: None,
         },
     );
 

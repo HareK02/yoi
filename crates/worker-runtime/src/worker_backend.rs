@@ -375,23 +375,23 @@ where
 
         let mut request = request;
         let working_directory = match (
+            request.request.working_directory_request.as_ref(),
             request.request.working_directory.as_ref(),
-            request.request.working_directory_allocation.as_ref(),
         ) {
             (Some(_), Some(_)) => {
                 return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
                     WorkerExecutionOperation::Spawn,
-                    "worker spawn cannot specify both working_directory and working_directory_allocation",
+                    "worker spawn cannot specify both working_directory_request and working_directory",
                 ));
             }
-            (Some(workspace_request), None) => {
+            (Some(working_directory_request), None) => {
                 let Some(materializer) = self.working_directory_materializer.as_ref() else {
                     return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
                         WorkerExecutionOperation::Spawn,
                         "working directory materialization requested, but no materializer is configured for this runtime backend",
                     ));
                 };
-                match materializer.materialize(&request.worker_ref, workspace_request) {
+                match materializer.materialize(&request.worker_ref, working_directory_request) {
                     Ok(binding) => {
                         request.working_directory = Some(binding.clone());
                         Some(binding)
@@ -406,16 +406,16 @@ where
                     }
                 }
             }
-            (None, Some(allocation)) => {
+            (None, Some(working_directory)) => {
                 let Some(materializer) = self.working_directory_materializer.as_ref() else {
                     return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
                         WorkerExecutionOperation::Spawn,
-                        "working directory allocation requested, but no materializer is configured for this runtime backend",
+                        "working directory working_directory requested, but no materializer is configured for this runtime backend",
                     ));
                 };
-                match materializer.bind_allocation(
-                    &allocation.allocation_id,
-                    allocation.relative_cwd.as_deref(),
+                match materializer.bind_working_directory(
+                    &working_directory.working_directory_id,
+                    working_directory.relative_cwd.as_deref(),
                 ) {
                     Ok(binding) => {
                         request.working_directory = Some(binding.clone());
@@ -780,8 +780,8 @@ mod tests {
                 digest: bundle.metadata.digest,
             },
             initial_input: None,
+            working_directory_request: None,
             working_directory: None,
-            working_directory_allocation: None,
         }
     }
 
@@ -933,7 +933,7 @@ mod tests {
         .unwrap();
         runtime.store_config_bundle(test_bundle()).unwrap();
         let mut request = create_request("chat");
-        request.working_directory = Some(working_directory_request(repo.path()));
+        request.working_directory_request = Some(working_directory_request(repo.path()));
 
         let detail = runtime.create_worker(request).unwrap();
 

@@ -90,8 +90,8 @@ pub struct WorkingDirectoryRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkingDirectoryAllocationClaim {
-    pub allocation_id: String,
+pub struct WorkingDirectoryClaim {
+    pub working_directory_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relative_cwd: Option<String>,
 }
@@ -107,13 +107,13 @@ pub enum WorkingDirectoryStatusKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkingDirectoryCleanupTarget {
     pub kind: String,
-    pub allocation_id: String,
+    pub working_directory_id: String,
     pub repository_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkingDirectorySummary {
-    pub allocation_id: String,
+    pub working_directory_id: String,
     pub repository_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_selector: Option<String>,
@@ -152,9 +152,9 @@ pub struct CreateWorkerRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_input: Option<WorkerInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_directory: Option<WorkingDirectoryRequest>,
+    pub working_directory_request: Option<WorkingDirectoryRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_directory_allocation: Option<WorkingDirectoryAllocationClaim>,
+    pub working_directory: Option<WorkingDirectoryClaim>,
 }
 
 /// Worker lifecycle status for the in-memory embedded runtime.

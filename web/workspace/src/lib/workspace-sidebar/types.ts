@@ -116,7 +116,7 @@ export type WorkingDirectoryRepositoryOption = {
 };
 
 export type WorkingDirectorySummary = {
-  allocation_id: string;
+  working_directory_id: string;
   repository_id: string;
   requested_selector?: string | null;
   materializer_kind: string;
@@ -127,7 +127,7 @@ export type WorkingDirectorySummary = {
   cleanup_policy: string;
   cleanup_target: {
     kind: string;
-    allocation_id: string;
+    working_directory_id: string;
     repository_id: string;
   };
 };
@@ -145,7 +145,7 @@ export type BrowserWorkingDirectoryListResponse = {
 };
 
 export type BrowserWorkerWorkingDirectorySelection = {
-  allocation_id: string;
+  working_directory_id: string;
   relative_cwd?: string | null;
 };
 

@@ -8,7 +8,7 @@ export type WorkerLaunchFormState = {
   display_name: string;
   profile: string;
   initial_text: string;
-  working_directory_allocation_id: string;
+  working_directory_id: string;
   working_directory_repository_id: string;
   working_directory_selector: string;
   relative_cwd: string;
@@ -54,12 +54,12 @@ export function defaultWorkerLaunchForm(
         ? current.profile
         : preferredProfile?.id || "",
     initial_text: current.initial_text,
-    working_directory_allocation_id: options?.working_directories.some(
+    working_directory_id: options?.working_directories.some(
         (directory) =>
-          directory.allocation_id === current.working_directory_allocation_id,
+          directory.working_directory_id === current.working_directory_id,
       )
-      ? current.working_directory_allocation_id
-      : preferredWorkingDirectory?.allocation_id || "",
+      ? current.working_directory_id
+      : preferredWorkingDirectory?.working_directory_id || "",
     working_directory_repository_id: current.working_directory_repository_id ||
       preferredRepository?.id || "",
     working_directory_selector: current.working_directory_selector ||
@@ -77,9 +77,9 @@ export function buildBrowserCreateWorkerRequest(
     profile: form.profile,
     initial_text: form.initial_text,
   };
-  if (form.working_directory_allocation_id) {
+  if (form.working_directory_id) {
     request.working_directory = {
-      allocation_id: form.working_directory_allocation_id,
+      working_directory_id: form.working_directory_id,
     };
     const relativeCwd = form.relative_cwd.trim();
     if (relativeCwd) {

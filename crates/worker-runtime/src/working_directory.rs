@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const WORKING_DIRECTORIES_DIR: &str = "working-directories";
 const MATERIALIZATION_RECORD: &str = "materialization.json";
-static NEXT_ALLOCATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static NEXT_WORKING_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkingDirectoryEvidence {
@@ -27,7 +27,7 @@ pub struct WorkingDirectoryEvidence {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkingDirectoryAllocation {
+pub struct WorkingDirectory {
     pub id: String,
     pub repository_id: String,
     pub materializer_kind: MaterializerKind,
@@ -38,10 +38,10 @@ pub struct WorkingDirectoryAllocation {
     pub status: WorkingDirectoryStatusKind,
 }
 
-impl WorkingDirectoryAllocation {
+impl WorkingDirectory {
     pub fn status_summary(&self) -> WorkingDirectorySummary {
         WorkingDirectorySummary {
-            allocation_id: self.id.clone(),
+            working_directory_id: self.id.clone(),
             repository_id: self.repository_id.clone(),
             requested_selector: self.evidence.requested_selector.clone(),
             materializer_kind: self.materializer_kind.clone(),
@@ -57,10 +57,10 @@ impl WorkingDirectoryAllocation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkingDirectoryBinding {
-    pub allocation: WorkingDirectoryAllocation,
+    pub working_directory: WorkingDirectory,
     pub workspace_root: PathBuf,
     pub cwd: PathBuf,
-    allocation_root: PathBuf,
+    working_directory_root: PathBuf,
     source_repository_path: PathBuf,
 }
 
@@ -73,8 +73,8 @@ impl WorkingDirectoryBinding {
         &self.cwd
     }
 
-    pub fn allocation_root(&self) -> &Path {
-        &self.allocation_root
+    pub fn working_directory_root(&self) -> &Path {
+        &self.working_directory_root
     }
 
     pub fn source_repository_path(&self) -> &Path {
@@ -83,7 +83,7 @@ impl WorkingDirectoryBinding {
 
     pub fn status(&self) -> WorkingDirectoryStatus {
         WorkingDirectoryStatus {
-            summary: self.allocation.status_summary(),
+            summary: self.working_directory.status_summary(),
         }
     }
 }
@@ -118,27 +118,29 @@ pub trait WorkingDirectoryMaterializer: Send + Sync + 'static {
         request: &WorkingDirectoryRequest,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic>;
 
-    fn preallocate(
+    fn create(
         &self,
         request: &WorkingDirectoryRequest,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic>;
 
-    fn bind_allocation(
+    fn bind_working_directory(
         &self,
-        allocation_id: &str,
+        working_directory_id: &str,
         relative_cwd: Option<&str>,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic>;
 
-    fn list_allocations(&self) -> Result<Vec<WorkingDirectoryStatus>, WorkingDirectoryDiagnostic>;
-
-    fn allocation_status(
+    fn list_working_directories(
         &self,
-        allocation_id: &str,
+    ) -> Result<Vec<WorkingDirectoryStatus>, WorkingDirectoryDiagnostic>;
+
+    fn working_directory_status(
+        &self,
+        working_directory_id: &str,
     ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic>;
 
-    fn cleanup_allocation(
+    fn cleanup_working_directory(
         &self,
-        allocation_id: &str,
+        working_directory_id: &str,
     ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic>;
 
     fn cleanup(&self, binding: &WorkingDirectoryBinding) -> Result<(), WorkingDirectoryDiagnostic>;
@@ -160,7 +162,7 @@ impl LocalGitWorktreeMaterializer {
         &self.runtime_root
     }
 
-    fn allocation_id(worker_ref: &WorkerRef, repository_id: &str) -> String {
+    fn working_directory_id(worker_ref: &WorkerRef, repository_id: &str) -> String {
         format!(
             "{}-{}-{}",
             sanitize_path_component(worker_ref.runtime_id.as_str()),
@@ -169,10 +171,10 @@ impl LocalGitWorktreeMaterializer {
         )
     }
 
-    fn allocation_root(&self, allocation_id: &str) -> PathBuf {
+    fn working_directory_root(&self, working_directory_id: &str) -> PathBuf {
         self.runtime_root
             .join(WORKING_DIRECTORIES_DIR)
-            .join(allocation_id)
+            .join(working_directory_id)
     }
 
     fn write_record(
@@ -180,11 +182,11 @@ impl LocalGitWorktreeMaterializer {
         binding: &WorkingDirectoryBinding,
     ) -> Result<(), WorkingDirectoryDiagnostic> {
         let record = WorkingDirectoryMaterializationRecord {
-            allocation: binding.allocation.clone(),
+            working_directory: binding.working_directory.clone(),
             workspace_root: binding.workspace_root.clone(),
             source_repository_path: binding.source_repository_path.clone(),
         };
-        let path = binding.allocation_root.join(MATERIALIZATION_RECORD);
+        let path = binding.working_directory_root.join(MATERIALIZATION_RECORD);
         let raw = serde_json::to_vec_pretty(&record).map_err(|error| {
             WorkingDirectoryDiagnostic::new(
                 "working_directory_record_serialize_failed",
@@ -201,38 +203,38 @@ impl LocalGitWorktreeMaterializer {
 
     fn read_binding(
         &self,
-        allocation_id: &str,
+        working_directory_id: &str,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
-        let allocation_root = self.allocation_root(allocation_id);
-        let path = allocation_root.join(MATERIALIZATION_RECORD);
+        let working_directory_root = self.working_directory_root(working_directory_id);
+        let path = working_directory_root.join(MATERIALIZATION_RECORD);
         let raw = fs::read(&path).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
-                "working_directory_allocation_not_found",
-                "working directory allocation was not found",
+                "working_directory_not_found",
+                "working directory working_directory was not found",
             )
         })?;
         let record: WorkingDirectoryMaterializationRecord = serde_json::from_slice(&raw).map_err(|_| {
             WorkingDirectoryDiagnostic::new(
                 "working_directory_record_invalid",
-                "working directory allocation record is invalid; backend-private path details were omitted",
+                "working directory working_directory record is invalid; backend-private path details were omitted",
             )
         })?;
         Ok(WorkingDirectoryBinding {
-            allocation: record.allocation,
+            working_directory: record.working_directory,
             workspace_root: record.workspace_root.clone(),
             cwd: record.workspace_root,
-            allocation_root,
+            working_directory_root,
             source_repository_path: record.source_repository_path,
         })
     }
 
-    fn materialize_with_allocation_id(
+    fn materialize_with_working_directory_id(
         &self,
-        allocation_id: String,
+        working_directory_id: String,
         request: &WorkingDirectoryRequest,
         cleanup_policy: &str,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
-        validate_allocation_id(&allocation_id)?;
+        validate_working_directory_id(&working_directory_id)?;
         if request.materializer != MaterializerKind::LocalGitWorktree {
             return Err(WorkingDirectoryDiagnostic::new(
                 "working_directory_materializer_unsupported",
@@ -299,26 +301,26 @@ impl LocalGitWorktreeMaterializer {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
 
-        let allocation_root = self.allocation_root(&allocation_id);
-        let workspace_root = allocation_root
+        let working_directory_root = self.working_directory_root(&working_directory_id);
+        let workspace_root = working_directory_root
             .join("root")
             .join(sanitize_path_component(&request.repository.id));
         if workspace_root.exists() {
             return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_allocation_exists",
-                "working directory allocation target already exists; cleanup or choose a new allocation",
+                "working_directory_exists",
+                "working directory working_directory target already exists; cleanup or choose a new working_directory",
             ));
         }
         fs::create_dir_all(workspace_root.parent().ok_or_else(|| {
             WorkingDirectoryDiagnostic::new(
                 "working_directory_invalid_target",
-                "working directory allocation target has no parent directory",
+                "working directory working_directory target has no parent directory",
             )
         })?)
         .map_err(|_| {
             WorkingDirectoryDiagnostic::new(
                 "working_directory_create_failed",
-                "failed to create working directory allocation directory; backend-private path details were omitted",
+                "failed to create working directory working_directory directory; backend-private path details were omitted",
             )
         })?;
 
@@ -334,8 +336,8 @@ impl LocalGitWorktreeMaterializer {
             ],
         )?;
 
-        let allocation = WorkingDirectoryAllocation {
-            id: allocation_id.clone(),
+        let working_directory = WorkingDirectory {
+            id: working_directory_id.clone(),
             repository_id: request.repository.id.clone(),
             materializer_kind: MaterializerKind::LocalGitWorktree,
             dirty_state_policy: DirtyStatePolicy::CleanPointOnly,
@@ -353,17 +355,17 @@ impl LocalGitWorktreeMaterializer {
             },
             cleanup_target: WorkingDirectoryCleanupTarget {
                 kind: "git_worktree".to_string(),
-                allocation_id,
+                working_directory_id,
                 repository_id: request.repository.id.clone(),
             },
             cleanup_policy: cleanup_policy.to_string(),
             status: WorkingDirectoryStatusKind::Active,
         };
         let binding = WorkingDirectoryBinding {
-            allocation,
+            working_directory,
             workspace_root: workspace_root.clone(),
             cwd: workspace_root,
-            allocation_root,
+            working_directory_root,
             source_repository_path: source_root,
         };
         self.write_record(&binding)?;
@@ -377,36 +379,46 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
         worker_ref: &WorkerRef,
         request: &WorkingDirectoryRequest,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
-        let allocation_id = Self::allocation_id(worker_ref, &request.repository.id);
-        self.materialize_with_allocation_id(allocation_id, request, "remove_on_worker_stop")
+        let working_directory_id = Self::working_directory_id(worker_ref, &request.repository.id);
+        self.materialize_with_working_directory_id(
+            working_directory_id,
+            request,
+            "remove_on_worker_stop",
+        )
     }
 
-    fn preallocate(
+    fn create(
         &self,
         request: &WorkingDirectoryRequest,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
-        let allocation_id = next_allocation_id(&request.repository.id);
-        self.materialize_with_allocation_id(allocation_id, request, "manual_or_worker_stop")
+        let working_directory_id = next_working_directory_id(&request.repository.id);
+        self.materialize_with_working_directory_id(
+            working_directory_id,
+            request,
+            "manual_or_worker_stop",
+        )
     }
 
-    fn bind_allocation(
+    fn bind_working_directory(
         &self,
-        allocation_id: &str,
+        working_directory_id: &str,
         relative_cwd: Option<&str>,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
-        validate_allocation_id(allocation_id)?;
-        let binding = self.read_binding(allocation_id)?;
-        if binding.allocation.status != WorkingDirectoryStatusKind::Active {
+        validate_working_directory_id(working_directory_id)?;
+        let binding = self.read_binding(working_directory_id)?;
+        if binding.working_directory.status != WorkingDirectoryStatusKind::Active {
             return Err(WorkingDirectoryDiagnostic::new(
                 "working_directory_not_active",
-                "working directory allocation is not active",
+                "working directory working_directory is not active",
             ));
         }
         let cwd = validate_relative_cwd(binding.workspace_root(), relative_cwd)?;
         Ok(WorkingDirectoryBinding { cwd, ..binding })
     }
 
-    fn list_allocations(&self) -> Result<Vec<WorkingDirectoryStatus>, WorkingDirectoryDiagnostic> {
+    fn list_working_directories(
+        &self,
+    ) -> Result<Vec<WorkingDirectoryStatus>, WorkingDirectoryDiagnostic> {
         let root = self.runtime_root.join(WORKING_DIRECTORIES_DIR);
         let entries = match fs::read_dir(&root) {
             Ok(entries) => entries,
@@ -414,7 +426,7 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
             Err(_) => {
                 return Err(WorkingDirectoryDiagnostic::new(
                     "working_directory_list_failed",
-                    "failed to list working directory allocations; backend-private path details were omitted",
+                    "failed to list working directory working_directories; backend-private path details were omitted",
                 ));
             }
         };
@@ -427,43 +439,46 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
             if !file_type.is_dir() {
                 continue;
             }
-            let allocation_id = entry.file_name().to_string_lossy().to_string();
-            if validate_allocation_id(&allocation_id).is_err() {
+            let working_directory_id = entry.file_name().to_string_lossy().to_string();
+            if validate_working_directory_id(&working_directory_id).is_err() {
                 continue;
             }
-            if let Ok(status) = self.allocation_status(&allocation_id) {
+            if let Ok(status) = self.working_directory_status(&working_directory_id) {
                 statuses.push(status);
             }
         }
-        statuses
-            .sort_by(|left, right| left.summary.allocation_id.cmp(&right.summary.allocation_id));
+        statuses.sort_by(|left, right| {
+            left.summary
+                .working_directory_id
+                .cmp(&right.summary.working_directory_id)
+        });
         Ok(statuses)
     }
 
-    fn allocation_status(
+    fn working_directory_status(
         &self,
-        allocation_id: &str,
+        working_directory_id: &str,
     ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
-        validate_allocation_id(allocation_id)?;
-        Ok(self.read_binding(allocation_id)?.status())
+        validate_working_directory_id(working_directory_id)?;
+        Ok(self.read_binding(working_directory_id)?.status())
     }
 
-    fn cleanup_allocation(
+    fn cleanup_working_directory(
         &self,
-        allocation_id: &str,
+        working_directory_id: &str,
     ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
-        validate_allocation_id(allocation_id)?;
-        let binding = self.read_binding(allocation_id)?;
+        validate_working_directory_id(working_directory_id)?;
+        let binding = self.read_binding(working_directory_id)?;
         self.cleanup(&binding)?;
-        self.allocation_status(allocation_id)
+        self.working_directory_status(working_directory_id)
     }
 
     fn cleanup(&self, binding: &WorkingDirectoryBinding) -> Result<(), WorkingDirectoryDiagnostic> {
-        let mut allocation = binding.allocation.clone();
-        let allocation_root = binding.allocation_root.canonicalize().map_err(|_| {
+        let mut working_directory = binding.working_directory.clone();
+        let working_directory_root = binding.working_directory_root.canonicalize().map_err(|_| {
             WorkingDirectoryDiagnostic::new(
                 "working_directory_cleanup_target_invalid",
-                "working directory allocation root is unavailable; backend-private path details were omitted",
+                "working directory working directory root is unavailable; backend-private path details were omitted",
             )
         })?;
         let workspace_root = binding.workspace_root.canonicalize().map_err(|_| {
@@ -472,10 +487,10 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
                 "working directory root is unavailable; backend-private path details were omitted",
             )
         })?;
-        if !workspace_root.starts_with(&allocation_root) {
+        if !workspace_root.starts_with(&working_directory_root) {
             return Err(WorkingDirectoryDiagnostic::new(
                 "working_directory_cleanup_escape_rejected",
-                "working directory cleanup target is outside the allocation root",
+                "working directory cleanup target is outside the working directory root",
             ));
         }
         let workspace_root_arg = path_str(&workspace_root)?;
@@ -495,16 +510,16 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
                 Ok(())
             }
         });
-        allocation.status = if remove_result.is_ok() {
+        working_directory.status = if remove_result.is_ok() {
             WorkingDirectoryStatusKind::Removed
         } else {
             WorkingDirectoryStatusKind::CleanupPending
         };
         let updated = WorkingDirectoryBinding {
-            allocation,
+            working_directory,
             workspace_root: binding.workspace_root.clone(),
             cwd: binding.cwd.clone(),
-            allocation_root: binding.allocation_root.clone(),
+            working_directory_root: binding.working_directory_root.clone(),
             source_repository_path: binding.source_repository_path.clone(),
         };
         let _ = self.write_record(&updated);
@@ -514,7 +529,7 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct WorkingDirectoryMaterializationRecord {
-    allocation: WorkingDirectoryAllocation,
+    working_directory: WorkingDirectory,
     workspace_root: PathBuf,
     source_repository_path: PathBuf,
 }
@@ -586,29 +601,31 @@ fn sanitize_path_component(value: &str) -> String {
     }
 }
 
-fn next_allocation_id(repository_id: &str) -> String {
+fn next_working_directory_id(repository_id: &str) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
-    let sequence = NEXT_ALLOCATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let sequence = NEXT_WORKING_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!(
         "alloc-{now}-{sequence}-{}",
         sanitize_path_component(repository_id)
     )
 }
 
-fn validate_allocation_id(allocation_id: &str) -> Result<(), WorkingDirectoryDiagnostic> {
-    let sanitized = sanitize_path_component(allocation_id);
-    if allocation_id.is_empty()
-        || allocation_id != sanitized
-        || allocation_id.contains(std::path::MAIN_SEPARATOR)
-        || allocation_id.contains('/')
-        || allocation_id.contains('\\')
+fn validate_working_directory_id(
+    working_directory_id: &str,
+) -> Result<(), WorkingDirectoryDiagnostic> {
+    let sanitized = sanitize_path_component(working_directory_id);
+    if working_directory_id.is_empty()
+        || working_directory_id != sanitized
+        || working_directory_id.contains(std::path::MAIN_SEPARATOR)
+        || working_directory_id.contains('/')
+        || working_directory_id.contains('\\')
     {
         return Err(WorkingDirectoryDiagnostic::new(
-            "working_directory_allocation_id_invalid",
-            "working directory allocation id is invalid",
+            "working_directory_id_invalid",
+            "working directory working_directory id is invalid",
         ));
     }
     Ok(())
@@ -639,7 +656,7 @@ fn validate_relative_cwd(
     {
         return Err(WorkingDirectoryDiagnostic::new(
             "working_directory_relative_cwd_invalid",
-            "working directory relative_cwd must be a relative path inside the allocation root",
+            "working directory relative_cwd must be a relative path inside the working directory root",
         ));
     }
     let target = workspace_root
@@ -654,7 +671,7 @@ fn validate_relative_cwd(
     if !target.starts_with(&workspace_root) || !target.is_dir() {
         return Err(WorkingDirectoryDiagnostic::new(
             "working_directory_relative_cwd_escape_rejected",
-            "working directory relative_cwd must resolve to a directory inside the allocation root",
+            "working directory relative_cwd must resolve to a directory inside the working directory root",
         ));
     }
     Ok(target)
@@ -728,16 +745,16 @@ mod tests {
             "worktree should be detached, got {branch}"
         );
         assert_eq!(
-            binding.allocation.materializer_kind,
+            binding.working_directory.materializer_kind,
             MaterializerKind::LocalGitWorktree
         );
         assert_eq!(
-            binding.allocation.dirty_state_policy,
+            binding.working_directory.dirty_state_policy,
             DirtyStatePolicy::CleanPointOnly
         );
         assert!(
             binding
-                .allocation_root()
+                .working_directory_root()
                 .join(MATERIALIZATION_RECORD)
                 .exists()
         );
@@ -805,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn preallocated_allocation_binds_safe_relative_cwd_and_lists_without_paths() {
+    fn working_directory_binds_safe_relative_cwd_and_lists_without_paths() {
         let repo = create_clean_repo();
         fs::create_dir_all(repo.path().join("crates/yoi")).unwrap();
         fs::write(repo.path().join("crates/yoi/lib.rs"), "// ok\n").unwrap();
@@ -813,15 +830,18 @@ mod tests {
         git(repo.path(), &["commit", "-m", "add crate"]);
         let runtime_root = tempfile::tempdir().unwrap();
         let materializer = LocalGitWorktreeMaterializer::new(runtime_root.path());
-        let allocation = materializer.preallocate(&request(repo.path())).unwrap();
+        let working_directory = materializer.create(&request(repo.path())).unwrap();
 
         let bound = materializer
-            .bind_allocation(&allocation.allocation.id, Some("crates/yoi"))
+            .bind_working_directory(&working_directory.working_directory.id, Some("crates/yoi"))
             .unwrap();
         assert_eq!(bound.cwd.file_name().unwrap(), "yoi");
-        let listed = materializer.list_allocations().unwrap();
+        let listed = materializer.list_working_directories().unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].summary.allocation_id, allocation.allocation.id);
+        assert_eq!(
+            listed[0].summary.working_directory_id,
+            working_directory.working_directory.id
+        );
         assert_eq!(
             listed[0].summary.requested_selector.as_deref(),
             Some("HEAD")
@@ -837,32 +857,35 @@ mod tests {
         git(repo.path(), &["commit", "-m", "add inside"]);
         let runtime_root = tempfile::tempdir().unwrap();
         let materializer = LocalGitWorktreeMaterializer::new(runtime_root.path());
-        let allocation = materializer.preallocate(&request(repo.path())).unwrap();
+        let working_directory = materializer.create(&request(repo.path())).unwrap();
 
         assert_eq!(
             materializer
-                .bind_allocation(&allocation.allocation.id, Some("/tmp"))
+                .bind_working_directory(&working_directory.working_directory.id, Some("/tmp"))
                 .unwrap_err()
                 .code,
             "working_directory_relative_cwd_invalid"
         );
         assert_eq!(
             materializer
-                .bind_allocation(&allocation.allocation.id, Some("../outside"))
+                .bind_working_directory(&working_directory.working_directory.id, Some("../outside"))
                 .unwrap_err()
                 .code,
             "working_directory_relative_cwd_invalid"
         );
         assert_eq!(
             materializer
-                .bind_allocation(&allocation.allocation.id, Some("missing"))
+                .bind_working_directory(&working_directory.working_directory.id, Some("missing"))
                 .unwrap_err()
                 .code,
             "working_directory_relative_cwd_unavailable"
         );
         assert_eq!(
             materializer
-                .bind_allocation(&allocation.allocation.id, Some("inside/file.txt"))
+                .bind_working_directory(
+                    &working_directory.working_directory.id,
+                    Some("inside/file.txt")
+                )
                 .unwrap_err()
                 .code,
             "working_directory_relative_cwd_escape_rejected"
@@ -870,10 +893,11 @@ mod tests {
 
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink("/tmp", allocation.workspace_root().join("escape")).unwrap();
+            std::os::unix::fs::symlink("/tmp", working_directory.workspace_root().join("escape"))
+                .unwrap();
             assert_eq!(
                 materializer
-                    .bind_allocation(&allocation.allocation.id, Some("escape"))
+                    .bind_working_directory(&working_directory.working_directory.id, Some("escape"))
                     .unwrap_err()
                     .code,
                 "working_directory_relative_cwd_escape_rejected"
@@ -894,8 +918,12 @@ mod tests {
         materializer.cleanup(&binding).unwrap();
 
         assert!(!workspace_root.exists());
-        let raw =
-            fs::read_to_string(binding.allocation_root().join(MATERIALIZATION_RECORD)).unwrap();
+        let raw = fs::read_to_string(
+            binding
+                .working_directory_root()
+                .join(MATERIALIZATION_RECORD),
+        )
+        .unwrap();
         assert!(raw.contains("removed"));
     }
 }
