@@ -43,7 +43,7 @@ queued_at: '2026-07-04T19:34:04Z'
 
 ## 非目標
 
-- Runtime materialization / Execution Workspace 作成をこのチケットで実装すること。
+- Runtime materialization / working directory 作成をこのチケットで実装すること。
 - multi-workspace Backend store を `~/.yoi/` に完全移行すること。
 - Repository credential / clone / fetch / write operation を実装すること。
 - Ticket target から RepositoryPoint を解決して Worker launch に渡すこと。

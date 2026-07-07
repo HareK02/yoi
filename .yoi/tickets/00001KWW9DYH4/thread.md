@@ -39,15 +39,15 @@ Ticket を `workspace-panel` が queued にしました。
 Routing decision: implementation_ready
 
 Reason:
-- Ticket は local Git worktree Execution Workspace materializer の v0 範囲、非目標、acceptance criteria が具体化されている。
-- Objective `00001KWW44EXK` の境界（Runtime root / Execution Workspace / RepositoryPoint / materialization strategy / cleanup registry / dirty state policy）と整合している。
+- Ticket は local Git worktree working directory materializer の v0 範囲、非目標、acceptance criteria が具体化されている。
+- Objective `00001KWW44EXK` の境界（Runtime root / working directory / RepositoryPoint / materialization strategy / cleanup registry / dirty state policy）と整合している。
 - `remote URI`, clone/fetch/cache, credential resolution, CoW/sandbox 強化、dirty snapshot/apply は非目標として明確。
 - typed relation blocker は 0 件、OrchestrationPlan record は 0 件。
 - queued notification は human authorized routing であり、今回の routing acceptance 後にのみ implementation side effect へ進める。
 
 Evidence checked:
 - Ticket body / thread / artifacts。
-- Objective `00001KWW44EXK` body（Runtime execution workspace materialization direction, Runtime root separation, detached worktree strategy, clean point policy, cleanup registry）。
+- Objective `00001KWW44EXK` body（Runtime working directory materialization direction, Runtime root separation, detached worktree strategy, clean point policy, cleanup registry）。
 - `TicketRelationQuery(00001KWW9DYH4)`: 0 件。
 - `TicketOrchestrationPlanQuery(00001KWW9DYH4)`: 0 件。
 - Orchestrator worktree git status: clean on `orchestration`。
@@ -59,11 +59,11 @@ Evidence checked:
 IntentPacket:
 
 Intent:
-- Runtime Worker spawn の直前に Execution Workspace materialization boundary を追加し、configured local Git repository から Worker ごとの detached worktree を Runtime root 配下に作る v0 materializer を実装する。
+- Runtime Worker spawn の直前に working directory materialization boundary を追加し、configured local Git repository から Worker ごとの detached worktree を Runtime root 配下に作る v0 materializer を実装する。
 - Worker の workspace scope / cwd を source repository root ではなく materialized worktree path にすることで、同じ local Git repository を対象に複数 Worker を spawn しても source root scope allocation conflict で失敗しないようにする。
 
 Binding decisions / invariants:
-- Execution Workspace は `.yoi` / Backend workspace store ではなく Runtime root 配下に作る。
+- working directory は `.yoi` / Backend workspace store ではなく Runtime root 配下に作る。
 - v0 は local Git repository URI のみ対応する。remote URI / non-Git provider / clone/fetch/cache / credentials は typed diagnostic で拒否または非対応扱い。
 - worktree は branch 名ではなく resolved commit に対する detached worktree として作る。v0 materialization では Worker 用 branch を作らない。
 - dirty local changes は暗黙に含めない。v0 は `clean_point_only` とし、dirty state は typed diagnostic / test evidence で明示する。
@@ -73,8 +73,8 @@ Binding decisions / invariants:
 - `RepositoryId` / `RepositorySelector` / `RepositoryPoint` の将来境界を壊さず、Git branch/tag/hash 固定の抽象にしない。
 
 Requirements / acceptance criteria:
-- `CreateWorkerRequest` または Runtime-side spawn path に Execution Workspace materialization request / allocation 境界が追加されている。
-- local Git repository `uri = "."` 相当から resolved commit を取得し、Runtime root 配下の `execution-workspaces/<allocation-id>/root/<repository-id>` に `git worktree add --detach` できる。
+- `CreateWorkerRequest` または Runtime-side spawn path に working directory materialization request / allocation 境界が追加されている。
+- local Git repository `uri = "."` 相当から resolved commit を取得し、Runtime root 配下の `working-directories/<allocation-id>/root/<repository-id>` に `git worktree add --detach` できる。
 - Worker spawn 時の scope/cwd は source repository root ではなく materialized worktree を指す。
 - 同じ local Git repository を対象に複数 Worker を spawn しても source root scope conflict で失敗しない。
 - unsupported non-local URI / non-Git provider は typed diagnostic。
@@ -124,7 +124,7 @@ Queued acceptance recorded after Workspace Dashboard Queue notification authoriz
 
 Checked context:
 - Ticket body / thread / artifacts。
-- Objective `00001KWW44EXK` の Execution Workspace materialization strategy / dirty policy / Runtime root separation / cleanup registry context。
+- Objective `00001KWW44EXK` の working directory materialization strategy / dirty policy / Runtime root separation / cleanup registry context。
 - `TicketRelationQuery(00001KWW9DYH4)`: blocking relation 0 件。
 - `TicketOrchestrationPlanQuery(00001KWW9DYH4)`: prior record 0 件。今回 accepted_plan を記録済み。
 - Orchestrator worktree git status: clean on `orchestration`。
@@ -161,22 +161,22 @@ Implementation routing update:
 
 Implementation progress report:
 
-- Coder Pod completed implementation and committed `8b7a5da0 feat: materialize execution workspaces` on branch `work/00001KWW9DYH4-execution-workspace-materializer`.
+- Coder Pod completed implementation and committed `8b7a5da0 feat: materialize working directories` on branch `work/00001KWW9DYH4-execution-workspace-materializer`.
 - Worktree status was clean after commit.
 - Changed files include:
-  - `crates/worker-runtime/src/execution_workspace.rs` (new)
+  - `crates/worker-runtime/src/working_directory.rs` (new)
   - `crates/worker-runtime/src/{catalog.rs,execution.rs,http_server.rs,lib.rs,main.rs,runtime.rs,worker_backend.rs}`
   - `crates/workspace-server/src/{companion.rs,hosts.rs,server.rs}`
 - Implementation summary:
-  - Runtime-side Execution Workspace request/status types and local Git worktree materializer。
-  - detached Git worktree creation under Runtime root: `execution-workspaces/<allocation-id>/root/<repository-id>`。
+  - Runtime-side working directory request/status types and local Git worktree materializer。
+  - detached Git worktree creation under Runtime root: `working-directories/<allocation-id>/root/<repository-id>`。
   - clean HEAD/selector commit and tree evidence resolution。
   - dirty source rejection under `clean_point_only`。
   - typed diagnostics for remote URI / non-Git provider / unsupported policy。
   - materialization/cleanup evidence persistence and best-effort worktree cleanup on Worker stop。
   - Worker spawn cwd/scope uses materialized worktree path, not source repository root。
   - workspace-server embedded runtime startup and Worker spawn pass configured repositories into materialization request。
-  - API-facing execution workspace status summaries remain sanitized/path-free。
+  - API-facing working directory status summaries remain sanitized/path-free。
 - Orchestrator reran validation in the implementation worktree:
   - `git diff --check`: pass
   - `cargo test -p worker-runtime --features ws-server,fs-store`: pass（34 lib tests + 5 main tests + doc tests）
@@ -197,16 +197,16 @@ Implementation progress report:
 External review result: request_changes
 
 Blocker:
-- 実装が Browser/API-facing spawn boundary を広げ、API caller から full `ExecutionWorkspaceRequest`（`ExecutionWorkspaceRepository.local_path: Option<PathBuf>` を含む）を受け取れる形になっている。
-  - `crates/workspace-server/src/hosts.rs:263-283` は `WorkerSpawnRequest` を browser-safe として raw workspace roots/storage paths を受け取らない契約にしているが、現在は `execution_workspace: Option<ExecutionWorkspaceRequest>` を含む。
+- 実装が Browser/API-facing spawn boundary を広げ、API caller から full `WorkingDirectoryRequest`（`WorkingDirectoryRepository.local_path: Option<PathBuf>` を含む）を受け取れる形になっている。
+  - `crates/workspace-server/src/hosts.rs:263-283` は `WorkerSpawnRequest` を browser-safe として raw workspace roots/storage paths を受け取らない契約にしているが、現在は `working_directory: Option<WorkingDirectoryRequest>` を含む。
   - `crates/worker-runtime/src/catalog.rs:58-66` の request は raw `local_path` を運べる。
   - `/api/runtimes/{runtime_id}/workers` はこの request shape を受け取り、embedded/remote host spawn path が `CreateWorkerRequest` に pass-through している。
 - これは Ticket / routing invariant の「raw source/internal paths を含む public launch boundary 拡張を避ける。必要なら escalate」に反し、既存コード上の browser-safe contract とも衝突している。
-- safer `/api/workers` path は server-side repository config から `repository_id` により解決しているため、generic API も caller-supplied raw `local_path` authority を受け取らない形にするか、Execution Workspace materialization request の組み立てを host/runtime 内部境界に閉じる必要がある。
+- safer `/api/workers` path は server-side repository config から `repository_id` により解決しているため、generic API も caller-supplied raw `local_path` authority を受け取らない形にするか、working directory materialization request の組み立てを host/runtime 内部境界に閉じる必要がある。
 
 Evidence supporting the rest of the implementation:
 - Runtime/backend materialization boundary は存在する。`Runtime::create_worker` が request を backend に渡し、`WorkerRuntimeExecutionBackend::spawn_worker` が spawn 前に materializer を呼ぶ。
-- local materializer は `execution-workspaces/<allocation-id>/root/<repository-id>` 配下に resolved commit の detached worktree を作成し、branch checkout はしない。
+- local materializer は `working-directories/<allocation-id>/root/<repository-id>` 配下に resolved commit の detached worktree を作成し、branch checkout はしない。
 - Worker `workspace_root` / `cwd` は `Worker::from_manifest_with_context` 前に materialized binding に差し替えられている。
 - dirty source は `clean_point_only` で拒否され、remote/non-Git は typed diagnostic code を返す。
 - allocation evidence/status/cleanup target/policy は記録・永続化され、worker stop cleanup は worktree removal / cleanup-pending 更新を行う。
@@ -228,15 +228,15 @@ Non-blocking follow-ups:
 
 Review-fix implementation report:
 
-- Coder Pod completed requested changes and committed follow-up `c90ebf24 fix: keep execution workspace paths internal` on branch `work/00001KWW9DYH4-execution-workspace-materializer`.
+- Coder Pod completed requested changes and committed follow-up `c90ebf24 fix: keep working directory paths internal` on branch `work/00001KWW9DYH4-execution-workspace-materializer`.
 - Worktree status was clean after commit.
 - Fix summary:
-  - Browser/API-facing `WorkerSpawnRequest` no longer deserializes full `ExecutionWorkspaceRequest` or caller-supplied raw `local_path`.
-  - Added browser-safe execution workspace request shape with `repository_id` and optional `selector` only。
-  - Added `deny_unknown_fields` so raw fields such as `execution_workspace.local_path` and unexpected fields are rejected at the API boundary。
-  - Server-side host code resolves configured repository registry into internal `ExecutionWorkspaceRequest`; raw `local_path` construction stays behind trusted host/server boundary。
+  - Browser/API-facing `WorkerSpawnRequest` no longer deserializes full `WorkingDirectoryRequest` or caller-supplied raw `local_path`.
+  - Added browser-safe working directory request shape with `repository_id` and optional `selector` only。
+  - Added `deny_unknown_fields` so raw fields such as `working_directory.local_path` and unexpected fields are rejected at the API boundary。
+  - Server-side host code resolves configured repository registry into internal `WorkingDirectoryRequest`; raw `local_path` construction stays behind trusted host/server boundary。
   - Existing `/api/workers` repository-id safe behavior remains preserved。
-  - Added focused API tests for rejecting raw `execution_workspace.local_path` and accepting safe repository-id/selector materialization without exposing raw workspace path。
+  - Added focused API tests for rejecting raw `working_directory.local_path` and accepting safe repository-id/selector materialization without exposing raw workspace path。
 - Orchestrator reran validation in the implementation worktree:
   - `git diff --check`: pass
   - `cargo test -p worker-runtime --features ws-server,fs-store`: pass（34 lib tests + 5 main tests + doc tests）
@@ -263,15 +263,15 @@ Evidence reviewed:
 - Fix commit `c90ebf24` and combined implementation after `8b7a5da0`。
 
 Findings:
-- Prior blocker is resolved. Browser/API `WorkerSpawnRequest` now exposes only `execution_workspace: { repository_id, selector? }` via `WorkerSpawnExecutionWorkspaceRequest` with `deny_unknown_fields`; internal `resolved_execution_workspace` is `#[serde(skip, default)]`。
-- `/api/runtimes/{runtime_id}/workers` resolves safe repository id/selector server-side from configured repositories into an internal `ExecutionWorkspaceRequest`。
+- Prior blocker is resolved. Browser/API `WorkerSpawnRequest` now exposes only `working_directory: { repository_id, selector? }` via `WorkerSpawnWorkingDirectoryRequest` with `deny_unknown_fields`; internal `resolved_working_directory` is `#[serde(skip, default)]`。
+- `/api/runtimes/{runtime_id}/workers` resolves safe repository id/selector server-side from configured repositories into an internal `WorkingDirectoryRequest`。
 - `/api/workers` remains safe: `BrowserCreateWorkerRequest` only accepts optional `repository_id`; server-side code builds the internal request。
 - Fix tests explicitly reject caller-supplied `local_path` and accept safe `repository_id`/`selector`, with response path redaction asserted。
-- Response/status projections remain browser-safe: execution workspace summaries carry ids/commit/tree/cleanup metadata, not raw workspace/source paths。
+- Response/status projections remain browser-safe: working directory summaries carry ids/commit/tree/cleanup metadata, not raw workspace/source paths。
 - Original materializer acceptance remains satisfied:
   - local Git only, remote/non-Git/dirty source rejected with typed diagnostics。
   - selector resolves to commit/tree。
-  - detached `git worktree add --detach` is created under Runtime root `execution-workspaces/<allocation-id>/root/<repository-id>`。
+  - detached `git worktree add --detach` is created under Runtime root `working-directories/<allocation-id>/root/<repository-id>`。
   - worker factory uses materialized workspace root/cwd instead of source root。
   - allocation evidence and cleanup target are recorded。
   - cleanup hook removes worktree and updates record。
@@ -296,7 +296,7 @@ No merge-blocking issues found.
 Merge/validation acceptance:
 
 - Follow-up external review approved the implementation after blocker fix。
-- Implementation branch `work/00001KWW9DYH4-execution-workspace-materializer` was merged into the orchestration branch with merge commit `c4cdf1c3 merge: execution workspace materializer`。
+- Implementation branch `work/00001KWW9DYH4-execution-workspace-materializer` was merged into the orchestration branch with merge commit `c4cdf1c3 merge: working directory materializer`。
 - Final validation in Orchestrator worktree passed:
   - `git diff --check`: pass
   - `cargo test -p worker-runtime --features ws-server,fs-store`: pass（34 lib tests + 5 main tests + doc tests）
@@ -308,8 +308,8 @@ Merge/validation acceptance:
 - `nix build .#yoi --no-link` は Cargo.lock / dependency / resource packaging / Nix 変更ではないため未実行。
 
 Implementation commits:
-- `8b7a5da0 feat: materialize execution workspaces`
-- `c90ebf24 fix: keep execution workspace paths internal`
+- `8b7a5da0 feat: materialize working directories`
+- `c90ebf24 fix: keep working directory paths internal`
 
 No merge-blocking issues remain.
 
@@ -331,19 +331,19 @@ Ticket を closed にしました。
 完了。
 
 実装内容:
-- Runtime-side Execution Workspace materialization boundary を追加した。
-- v0 local Git materializer として、configured repository から resolved commit / tree evidence を取り、Runtime root 配下 `execution-workspaces/<allocation-id>/root/<repository-id>` に detached Git worktree を作成するようにした。
+- Runtime-side working directory materialization boundary を追加した。
+- v0 local Git materializer として、configured repository から resolved commit / tree evidence を取り、Runtime root 配下 `working-directories/<allocation-id>/root/<repository-id>` に detached Git worktree を作成するようにした。
 - Worker spawn 時の workspace root / cwd / scope は source repository root ではなく materialized worktree path を使うようにした。
 - 同一 source repository に対する複数 Worker が distinct materialized paths を使えるようにした。
 - dirty source state は `clean_point_only` policy で拒否し、remote URI / non-Git provider / unsupported policy は typed diagnostics で fail closed するようにした。
 - allocation evidence / cleanup target / cleanup policy / status を記録し、Worker stop cleanup hook で worktree cleanup と record update を行うようにした。
-- Browser/API-facing spawn boundary は raw `ExecutionWorkspaceRequest` / `local_path` を受け取らないようにし、safe `repository_id` / optional `selector` から host/server 内部で materialization request を構築するようにした。
+- Browser/API-facing spawn boundary は raw `WorkingDirectoryRequest` / `local_path` を受け取らないようにし、safe `repository_id` / optional `selector` から host/server 内部で materialization request を構築するようにした。
 - Focused worker-runtime / workspace-server tests を追加した。
 
 主な commit / merge:
-- implementation: `8b7a5da0 feat: materialize execution workspaces`
-- review fix: `c90ebf24 fix: keep execution workspace paths internal`
-- merge into orchestration: `c4cdf1c3 merge: execution workspace materializer`
+- implementation: `8b7a5da0 feat: materialize working directories`
+- review fix: `c90ebf24 fix: keep working directory paths internal`
+- merge into orchestration: `c4cdf1c3 merge: working directory materializer`
 
 Review:
 - 初回 external review は request_changes。

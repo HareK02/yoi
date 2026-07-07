@@ -20,14 +20,14 @@ Yoi を、単一のローカル開発ディレクトリで動くエージェン�
 
 - Workspace: チームまたはプロジェクトの管理単位。Ticket、Objective、Memory、Knowledge、Artifact、Policy、Actor、Repository、Runtime state を持つ。Git Repository root ではない。
 - Control plane: Workspace の正本を持ち、Web UI / API / CLI から操作される管理システム。
-- Runtime: Worker 群を束ねる実行基盤。Worker lifecycle、sandbox、mount、cache、checkout/worktree/container filesystem などの Execution Workspace materialization、event/control plane を管理する。将来的には 1 つの Runtime が複数 Workspace / Repository の Worker を抱えられる。
-- Worker: Runtime が管理する 1 つの agent/session/process。Runtime が用意した Execution Workspace と authority の中で動く。
+- Runtime: Worker 群を束ねる実行基盤。Worker lifecycle、sandbox、mount、cache、checkout/worktree/container filesystem などの working directory materialization、event/control plane を管理する。将来的には 1 つの Runtime が複数 Workspace / Repository の Worker を抱えられる。
+- Worker: Runtime が管理する 1 つの agent/session/process。Runtime が用意した working directory と authority の中で動く。
 - Repository: Workspace に接続される source/storage。コード、ドキュメント、local directory、object storage、artifact store、dataset などを含む。Git Repository も Repository の一種であり、基本的には filesystem path ではなく URI / URL で識別する。
 - RepositoryId: Workspace 内でどの Repository を対象にするかを指す安定 identifier。Git hash、branch、path ではない。
 - Repository provider: Repository の種類ごとの実装。Git、local filesystem、object store、artifact store、将来の non-Git VCS など。
 - RepositorySelector: Repository provider に渡す未解決の地点指定。branch/tag/PR/revspec/bookmark/revset/path@revision/object version/latest など provider-specific な symbolic / mutable / query-like locator であり、それ自体は再現性の authority ではない。
 - RepositoryPoint: RepositorySelector をある時点で解決した具体地点。Git commit/tree、Mercurial changeset、SVN revision、object store version/manifest digest、file snapshot など provider ごとの immutable / reproducible point を表し、Artifact/evidence に残す。
-- Execution Workspace: Runtime が Worker のために作る作業環境。1 つ以上の RepositoryPoint から materialize される作業用ディレクトリ、container filesystem、sandbox mount の集合であり、Git worktree、clone、sparse checkout などはこれを作る手段である。
+- working directory: Runtime が Worker のために作る作業環境。1 つ以上の RepositoryPoint から materialize される作業用ディレクトリ、container filesystem、sandbox mount の集合であり、Git worktree、clone、sparse checkout などはこれを作る手段である。
 - Ticket: チームで扱う作業単位。目的、要件、判断、議論、完了条件、関係、証跡を持つ。
 - Objective: 複数の Ticket を束ねる長期目標や設計方針。
 - Artifact: Ticket や Worker 実行に紐づく成果物や証跡。diff、log、validation result、review result、report など。
@@ -46,7 +46,7 @@ Yoi を、単一のローカル開発ディレクトリで動くエージェン�
 - 管理システムと Runtime を分ける。
 - まず Web から Ticket、Objective、Memory、Knowledge、Artifact、Runtime / Worker state を見られるようにする。
 - 最初はローカル Runtime を使い、後でリモート Runtime、クラウド Runtime、runtime pool、resource allocation、quota、billing、sandboxing に拡張する。
-- Git ホスティング機能を取り込むのではなく、Git Repository / worktree / clone は Repository provider と Execution Workspace materialization の手段として扱う。
+- Git ホスティング機能を取り込むのではなく、Git Repository / worktree / clone は Repository provider と working directory materialization の手段として扱う。
 
 OSS として Control plane、Runtime、Web frontend、protocol を公開しつつ、managed service では hosted control plane、runtime fleet、リソース柔軟性、team auth、backup、audit、availability、multi-tenant operations で価値を出す。
 
@@ -68,7 +68,7 @@ Ticket と Objective は Repository 配下に置かず、Workspace 配下に平�
 
 RepositorySelector は Git branch/tag の抽象化ではない。Selector は provider-specific な未解決 locator であり、Git provider なら branch/tag/ref/revspec/PR/commit、Mercurial provider なら bookmark/revset/changeset、SVN provider なら path/revision、object store provider なら prefix/version/latest などを解釈する。実行時には Control plane または Repository provider が Selector を RepositoryPoint に解決し、Runtime はその RepositoryPoint を materialize する。
 
-Worker launch request は Ticket の target selector を concrete RepositoryPoint に解決し、その RepositoryPoint から Runtime が Execution Workspace を materialize する。Git worktree 相当の機能は、この Execution Workspace を作るための実装戦略として扱う。
+Worker launch request は Ticket の target selector を concrete RepositoryPoint に解決し、その RepositoryPoint から Runtime が working directory を materialize する。Git worktree 相当の機能は、この working directory を作るための実装戦略として扱う。
 
 Backend は cwd や `--workspace` を暗黙の Repository として扱わない。`--workspace` は当面 workspace config root / local descriptor root を指すだけであり、Repository registry は明示設定された Workspace config から構築する。短期的には `.yoi/workspace-backend.local.toml` の `[[repositories]]` を local descriptor として使い、`uri = "."` のような local repository も明示 entry として登録する。`./` を暗黙 Repository として自動採用しない。
 
@@ -86,7 +86,7 @@ Ticket target は intent/selector であり、実行再現性のための immuta
 Ticket
   -> target selectors: Repository + ref selector + path + intent
   -> resolved RepositoryPoint
-  -> Execution Workspace
+  -> working directory
   -> WorkerRef / Artifact / Evidence
   -> Review / Decision
   -> Audit / Notification
@@ -119,7 +119,7 @@ Ticket には次の概念が必要になる。
 - Actor identity: human / agent / system / service account.
 - Assignment / owner / reviewer / watcher.
 - Typed thread events: comment, decision, plan, review, implementation report, state transition.
-- Linked Objective / Artifact / WorkerRef / Repository / RepositoryPoint / Execution Workspace.
+- Linked Objective / Artifact / WorkerRef / Repository / RepositoryPoint / working directory.
 - Permission / visibility.
 - Audit trail.
 - Notification / mention.
@@ -170,17 +170,17 @@ Ticket / user intent
   -> RepositoryId + RepositorySelector + path scope + required authority
   -> resolved RepositoryPoint
   -> WorkerLaunchRequest / ConfigBundle / AuthorityBundle
-  -> Runtime ExecutionWorkspaceMaterializer
-  -> Execution Workspace allocation
+  -> Runtime WorkingDirectoryMaterializer
+  -> working directory allocation
   -> Worker process
   -> WorkerRef + Artifact/evidence
 ```
 
-Control plane は Workspace authority、Ticket target、Repository registry、Actor permission、設定 bundle の正本を持つ。Control plane または Repository provider は RepositorySelector を RepositoryPoint に解決し、どの地点を対象にしたかを evidence に残す。Runtime は RepositoryPoint、materialization policy、sandbox policy、mount/cache/secret policy、Worker config を受け取り、Runtime-local な Execution Workspace を確保して Worker を起動する。
+Control plane は Workspace authority、Ticket target、Repository registry、Actor permission、設定 bundle の正本を持つ。Control plane または Repository provider は RepositorySelector を RepositoryPoint に解決し、どの地点を対象にしたかを evidence に残す。Runtime は RepositoryPoint、materialization policy、sandbox policy、mount/cache/secret policy、Worker config を受け取り、Runtime-local な working directory を確保して Worker を起動する。
 
-この境界では、Worker は host filesystem path や Repository credential を自分で発見しない。Worker は Runtime が materialize した workspace root、mount、環境変数、tool authority、config bundle だけを見る。Runtime は Execution Workspace の lifecycle、cleanup、cache reuse、namespace、quota、sandbox boundary、event collection を管理する。Control plane / Browser-facing API は raw host path、secret、socket、internal runtime path を authority-bearing internals として扱い、必要な evidence だけを Artifact として公開する。
+この境界では、Worker は host filesystem path や Repository credential を自分で発見しない。Worker は Runtime が materialize した workspace root、mount、環境変数、tool authority、config bundle だけを見る。Runtime は working directory の lifecycle、cleanup、cache reuse、namespace、quota、sandbox boundary、event collection を管理する。Control plane / Browser-facing API は raw host path、secret、socket、internal runtime path を authority-bearing internals として扱い、必要な evidence だけを Artifact として公開する。
 
-v0 materializer は existing local root を明示的な Execution Workspace として返してよい。ただし型と呼び出し順序は、後で Git worktree、clone、sparse checkout、container filesystem、remote object snapshot、multi-repository mount に置き換えられる形にする。Runtime process 起動時の `--workspace` はこの v0 materializer の legacy bootstrap input であり、Runtime identity や long-term workspace binding ではない。
+v0 materializer は existing local root を明示的な working directory として返してよい。ただし型と呼び出し順序は、後で Git worktree、clone、sparse checkout、container filesystem、remote object snapshot、multi-repository mount に置き換えられる形にする。Runtime process 起動時の `--workspace` はこの v0 materializer の legacy bootstrap input であり、Runtime identity や long-term workspace binding ではない。
 
 その後で、remote Runtime、self-hosted Runtime、hosted cloud runtime fleet、runtime pool、resource allocation、quota、billing、sandbox、network policy、secret distribution を追加する。
 
@@ -204,7 +204,7 @@ Web UI は Ticket、Objective、Memory、Knowledge、Runtime、Worker、Artifact
 
 ### 7. 多重起動コストと runtime placement を見直す
 
-Cloud/remote execution を成立させるには、多数のエージェント実行を安く管理できる必要がある。logical Worker session と Runtime process/resource placement を分ける。Runtime は Git Repository root や Workspace path に固定されず、request ごとに必要な Execution Workspace を materialize できる実行基盤として扱う。
+Cloud/remote execution を成立させるには、多数のエージェント実行を安く管理できる必要がある。logical Worker session と Runtime process/resource placement を分ける。Runtime は Git Repository root や Workspace path に固定されず、request ごとに必要な working directory を materialize できる実行基盤として扱う。
 
 初期 Workspace DB では、Worker を canonical table として永続化しない。Runtime / Worker 一覧は backend-local runtime inspection や将来の Runtime protocol から逐次取得する live view とし、Ticket に関わった Worker は Ticket thread events と WorkerRef snapshot / TicketWorkerLink として記録する。
 
@@ -214,7 +214,7 @@ Worker の一元管理、データ永続化、アーカイブは将来的には�
 
 - Worker identity と Runtime process/resource placement の分離。
 - 1 Runtime が複数 Workspace / Repository の Worker を抱える場合の namespace、quota、cleanup、audit boundary。
-- Runtime-side Execution Workspace materialization、sandbox、mount、checkout/worktree/container filesystem の責務。
+- Runtime-side working directory materialization、sandbox、mount、checkout/worktree/container filesystem の責務。
 - Provider client、tool registry、resource cache の共有可能性。
 - Prompt/resource/profile/config bundle resolution cache。
 - Model call multiplexing and scheduling。
@@ -226,7 +226,7 @@ Worker の一元管理、データ永続化、アーカイブは将来的には�
 ## Initial phases / candidate tickets
 
 1. **Vocabulary / architecture record**
-   - Workspace / RepositoryId / RepositorySelector / RepositoryPoint / Execution Workspace / Runtime / Worker / Control Plane / Ticket / Memory / Knowledge の用語と境界を固める。
+   - Workspace / RepositoryId / RepositorySelector / RepositoryPoint / working directory / Runtime / Worker / Control Plane / Ticket / Memory / Knowledge の用語と境界を固める。
 2. **Team-space canonical data model**
    - Ticket / Objective / Target / Artifact / Actor / Permission / Audit / Memory / Knowledge の entity/event model を設計する。
 3. **Ticket evidence model**
@@ -238,8 +238,8 @@ Worker の一元管理、データ永続化、アーカイブは将来的には�
 6. **Web control plane MVP design**
    - read-only Ticket / Objective / Memory / Knowledge / Runtime / Worker state UI/API の範囲を決める。
 7. **Local Runtime protocol design**
-   - Web/control plane から local Runtime に安全な操作を送り、Runtime が Worker lifecycle と Execution Workspace materialization を担う protocol と authority boundary を設計する。
-8. **Repository and Execution Workspace materialization model**
+   - Web/control plane から local Runtime に安全な操作を送り、Runtime が Worker lifecycle と working directory materialization を担う protocol と authority boundary を設計する。
+8. **Repository and working directory materialization model**
    - Repository URI、Repository provider capability、RepositorySelector resolution、RepositoryPoint evidence、Git worktree / clone / sparse checkout / future source backend を Runtime-side materialization strategy として抽象化する。
 9. **Remote/hosted runtime foundation**
    - runtime registration, heartbeat, capability advertisement, job assignment, logs/events, secrets, sandbox/resource policy を設計する。
@@ -258,7 +258,7 @@ Worker の一元管理、データ永続化、アーカイブは将来的には�
 
 ## Success criteria / exit conditions
 
-- Workspace / RepositoryId / RepositorySelector / RepositoryPoint / Execution Workspace / Runtime / Worker / Control Plane / Ticket / Memory / Knowledge の境界が文書化されている。
+- Workspace / RepositoryId / RepositorySelector / RepositoryPoint / working directory / Runtime / Worker / Control Plane / Ticket / Memory / Knowledge の境界が文書化されている。
 - Ticket が team coordination record として、target selector / Artifact / Actor / Permission / Audit と分離された model を持つ。
 - `.yoi` local backend は compatibility/local backend として整理され、server-side canonical backend の設計を阻害しない。
 - Web UI/API が Ticket / Objective / Runtime / Worker state を中心とした read-only view を提供できる設計または MVP を持つ。Memory / Knowledge は既存 record の表示または将来 placeholder に留め、本格再設計をこの段階の必須条件にしない。
@@ -266,7 +266,7 @@ Worker の一元管理、データ永続化、アーカイブは将来的には�
 - Runtime は single Workspace / Git repository root 専用 process ではなく、sandbox/authority が成立すれば複数 Workspace / Repository の Worker を抱えられる execution substrate として設計されている。
 - Git Repository root に依存しない Workspace model があり、Git Repository は Repository provider の一種として扱われている。
 - Ticket と Objective は Workspace 配下に平たく存在し、Repository への所属ではなく RepositoryId / RepositorySelector / path scope / intent で対象を表現する。
-- Git worktree 相当は Execution Workspace materialization strategy として扱われ、Artifact/evidence が concrete RepositoryPoint を記録する。
+- Git worktree 相当は working directory materialization strategy として扱われ、Artifact/evidence が concrete RepositoryPoint を記録する。
 - Memory / Knowledge は Ticket / Artifact の authority を置き換えない record として platform contract だけを持つ。本格的な意味論・抽出・承認・検索・staleness 処理は、Memory の保存先を Workspace backend / control plane record に移すタイミングで回収する。
 - Hosted Runtime / resource allocation / SaaS offering に進むための後続 Ticket が切れる状態になっている。
 - 既存 local dogfooding runtime を壊さず、local use と remote-capable architecture が両立している。

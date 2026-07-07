@@ -4,7 +4,7 @@
   import { buildBrowserCreateWorkerRequest, defaultWorkerLaunchForm } from './worker-launch';
   import type {
     BrowserCreateWorkerResponse,
-    BrowserExecutionWorkspaceCreateResponse,
+    BrowserWorkingDirectoryCreateResponse,
     ListResponse,
     Worker,
     WorkerLaunchOptionsResponse,
@@ -36,11 +36,11 @@
   let runtimeId = $state('');
   let profile = $state('builtin:coder');
   let initialText = $state('');
-  let executionWorkspaceAllocationId = $state('');
-  let executionWorkspaceRepositoryId = $state('');
-  let executionWorkspaceSelector = $state('HEAD');
+  let workingDirectoryAllocationId = $state('');
+  let workingDirectoryRepositoryId = $state('');
+  let workingDirectorySelector = $state('HEAD');
   let relativeCwd = $state('');
-  let creatingWorkspace = $state(false);
+  let creatingWorkingDirectory = $state(false);
 
   $effect(() => {
     if (!workspaceId) {
@@ -102,17 +102,17 @@
         display_name: displayName,
         profile,
         initial_text: initialText,
-        execution_workspace_allocation_id: executionWorkspaceAllocationId,
-        execution_workspace_repository_id: executionWorkspaceRepositoryId,
-        execution_workspace_selector: executionWorkspaceSelector,
+        working_directory_allocation_id: workingDirectoryAllocationId,
+        working_directory_repository_id: workingDirectoryRepositoryId,
+        working_directory_selector: workingDirectorySelector,
         relative_cwd: relativeCwd,
       });
       runtimeId = form.runtime_id;
       displayName = form.display_name;
       profile = form.profile;
-      executionWorkspaceAllocationId = form.execution_workspace_allocation_id;
-      executionWorkspaceRepositoryId = form.execution_workspace_repository_id;
-      executionWorkspaceSelector = form.execution_workspace_selector;
+      workingDirectoryAllocationId = form.working_directory_allocation_id;
+      workingDirectoryRepositoryId = form.working_directory_repository_id;
+      workingDirectorySelector = form.working_directory_selector;
       relativeCwd = form.relative_cwd;
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
@@ -122,36 +122,36 @@
     }
   }
 
-  async function createExecutionWorkspace() {
-    if (!executionWorkspaceRepositoryId) {
-      submitError = 'select a repository before creating an execution workspace';
+  async function createWorkingDirectory() {
+    if (!workingDirectoryRepositoryId) {
+      submitError = 'select a repository before creating a working directory';
       return;
     }
-    creatingWorkspace = true;
+    creatingWorkingDirectory = true;
     submitError = null;
     try {
-      const response = await fetch(workerApiPath('/execution-workspaces'), {
+      const response = await fetch(workerApiPath('/working-directories'), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          repository_id: executionWorkspaceRepositoryId,
-          selector: executionWorkspaceSelector || null,
+          repository_id: workingDirectoryRepositoryId,
+          selector: workingDirectorySelector || null,
           policy: { dirty_state: 'clean_point_only', cleanup: 'manual_or_worker_stop' },
         }),
       });
       if (!response.ok) {
-        throw new Error(await responseErrorMessage(response, 'execution workspace create failed'));
+        throw new Error(await responseErrorMessage(response, 'working directory create failed'));
       }
-      const payload = (await response.json()) as BrowserExecutionWorkspaceCreateResponse;
-      const items = options?.execution_workspaces ?? [];
+      const payload = (await response.json()) as BrowserWorkingDirectoryCreateResponse;
+      const items = options?.working_directories ?? [];
       options = options
-        ? { ...options, execution_workspaces: [...items.filter((item) => item.allocation_id !== payload.item.allocation_id), payload.item] }
+        ? { ...options, working_directories: [...items.filter((item) => item.allocation_id !== payload.item.allocation_id), payload.item] }
         : options;
-      executionWorkspaceAllocationId = payload.item.allocation_id;
+      workingDirectoryAllocationId = payload.item.allocation_id;
     } catch (err) {
-      submitError = err instanceof Error ? err.message : 'execution workspace create failed';
+      submitError = err instanceof Error ? err.message : 'working directory create failed';
     } finally {
-      creatingWorkspace = false;
+      creatingWorkingDirectory = false;
     }
   }
 
@@ -172,9 +172,9 @@
           display_name: displayName,
           profile,
           initial_text: initialText,
-          execution_workspace_allocation_id: executionWorkspaceAllocationId,
-          execution_workspace_repository_id: executionWorkspaceRepositoryId,
-          execution_workspace_selector: executionWorkspaceSelector,
+          working_directory_allocation_id: workingDirectoryAllocationId,
+          working_directory_repository_id: workingDirectoryRepositoryId,
+          working_directory_selector: workingDirectorySelector,
           relative_cwd: relativeCwd,
         })),
       });
@@ -251,22 +251,22 @@
           {/if}
         </select>
       </label>
-      <fieldset class="worker-execution-workspace">
-        <legend>Execution workspace</legend>
+      <fieldset class="worker-working-directory">
+        <legend>Working directory</legend>
         <label>
           <span>Allocation</span>
-          <select bind:value={executionWorkspaceAllocationId}>
+          <select bind:value={workingDirectoryAllocationId}>
             <option value="">No allocation selected</option>
-            {#each options?.execution_workspaces ?? [] as workspace}
-              <option value={workspace.allocation_id} disabled={workspace.status !== 'active'}>
-                {workspace.repository_id} · {workspace.requested_selector ?? 'HEAD'} · {workspace.resolved_commit.slice(0, 12)} · {workspace.status}
+            {#each options?.working_directories ?? [] as directory}
+              <option value={directory.allocation_id} disabled={directory.status !== 'active'}>
+                {directory.repository_id} · {directory.requested_selector ?? 'HEAD'} · {directory.resolved_commit.slice(0, 12)} · {directory.status}
               </option>
             {/each}
           </select>
         </label>
         <label>
           <span>Repository for new allocation</span>
-          <select bind:value={executionWorkspaceRepositoryId}>
+          <select bind:value={workingDirectoryRepositoryId}>
             {#if options?.repositories.length}
               {#each options.repositories as repository}
                 <option value={repository.id}>{repository.display_name}</option>
@@ -278,10 +278,10 @@
         </label>
         <label>
           <span>Selector</span>
-          <input bind:value={executionWorkspaceSelector} autocomplete="off" placeholder="HEAD" />
+          <input bind:value={workingDirectorySelector} autocomplete="off" placeholder="HEAD" />
         </label>
-        <button type="button" disabled={creatingWorkspace || !executionWorkspaceRepositoryId} onclick={() => void createExecutionWorkspace()}>
-          {creatingWorkspace ? 'Allocating…' : 'Create execution workspace'}
+        <button type="button" disabled={creatingWorkingDirectory || !workingDirectoryRepositoryId} onclick={() => void createWorkingDirectory()}>
+          {creatingWorkingDirectory ? 'Allocating…' : 'Create working directory'}
         </button>
         <label>
           <span>Relative cwd</span>
@@ -298,7 +298,7 @@
       {#if submitError}
         <p class="section-state error">{submitError}</p>
       {/if}
-      <button type="submit" disabled={submitting || !runtimeId || !profile || !executionWorkspaceAllocationId}>
+      <button type="submit" disabled={submitting || !runtimeId || !profile || !workingDirectoryAllocationId}>
         {submitting ? 'Starting…' : 'Start Coding Worker'}
       </button>
     </form>
@@ -322,7 +322,7 @@
             </span>
             <span class="item-meta">
               {worker.role ? `${worker.role} · ` : ''}{worker.state} · {worker.status} · 🖥 {worker.host_id}
-              {worker.execution_workspace ? ` · ws:${worker.execution_workspace.repository_id}@${worker.execution_workspace.resolved_commit.slice(0, 8)}` : ''}
+              {worker.working_directory ? ` · wd:${worker.working_directory.repository_id}@${worker.working_directory.resolved_commit.slice(0, 8)}` : ''}
             </span>
           </a>
         </li>

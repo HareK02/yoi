@@ -863,8 +863,8 @@ mod tests {
                 digest: bundle.metadata.digest,
             },
             initial_input: None,
-            execution_workspace: None,
-            execution_workspace_allocation: None,
+            working_directory: None,
+            working_directory_allocation: None,
         }
     }
 
@@ -879,8 +879,8 @@ mod tests {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
                 run_state: WorkerExecutionRunState::Idle,
-                execution_workspace: request
-                    .execution_workspace
+                working_directory: request
+                    .working_directory
                     .as_ref()
                     .map(|binding| binding.status()),
             }
@@ -1098,8 +1098,8 @@ mod ws_tests {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
                 run_state: WorkerExecutionRunState::Idle,
-                execution_workspace: request
-                    .execution_workspace
+                working_directory: request
+                    .working_directory
                     .as_ref()
                     .map(|binding| binding.status()),
             }
@@ -1148,8 +1148,8 @@ mod ws_tests {
                 digest: bundle.metadata.digest,
             },
             initial_input: None,
-            execution_workspace: None,
-            execution_workspace_allocation: None,
+            working_directory: None,
+            working_directory_allocation: None,
         }
     }
 

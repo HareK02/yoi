@@ -56,7 +56,7 @@ impl std::ops::Deref for RepositorySelector {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecutionWorkspaceRepository {
+pub struct WorkingDirectoryRepository {
     pub id: String,
     pub provider: String,
     pub uri: String,
@@ -81,8 +81,8 @@ pub enum DirtyStatePolicy {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecutionWorkspaceRequest {
-    pub repository: ExecutionWorkspaceRepository,
+pub struct WorkingDirectoryRequest {
+    pub repository: WorkingDirectoryRepository,
     #[serde(default)]
     pub materializer: MaterializerKind,
     #[serde(default)]
@@ -90,7 +90,7 @@ pub struct ExecutionWorkspaceRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecutionWorkspaceAllocationClaim {
+pub struct WorkingDirectoryAllocationClaim {
     pub allocation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relative_cwd: Option<String>,
@@ -98,21 +98,21 @@ pub struct ExecutionWorkspaceAllocationClaim {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ExecutionWorkspaceStatusKind {
+pub enum WorkingDirectoryStatusKind {
     Active,
     Removed,
     CleanupPending,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecutionWorkspaceCleanupTarget {
+pub struct WorkingDirectoryCleanupTarget {
     pub kind: String,
     pub allocation_id: String,
     pub repository_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecutionWorkspaceSummary {
+pub struct WorkingDirectorySummary {
     pub allocation_id: String,
     pub repository_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,15 +124,15 @@ pub struct ExecutionWorkspaceSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_tree: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cleanup_target: Option<ExecutionWorkspaceCleanupTarget>,
+    pub cleanup_target: Option<WorkingDirectoryCleanupTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanup_policy: Option<String>,
-    pub status: ExecutionWorkspaceStatusKind,
+    pub status: WorkingDirectoryStatusKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecutionWorkspaceStatus {
-    pub summary: ExecutionWorkspaceSummary,
+pub struct WorkingDirectoryStatus {
+    pub summary: WorkingDirectorySummary,
 }
 
 /// Canonical Runtime Worker creation request.
@@ -141,9 +141,9 @@ pub struct ExecutionWorkspaceStatus {
 /// request is built. The request contains only durable Runtime identity inputs:
 /// a backend-decided profile selector, a previously synced ConfigBundle identity,
 /// optional initial user input that is committed in the same transaction as
-/// Worker catalog/transcript persistence, and an optional execution workspace
+/// Worker catalog/transcript persistence, and an optional working directory
 /// request that preserves RepositoryPoint-style semantics for runtime-side
-/// materialization. Browser-facing status for materialized workspaces is
+/// materialization. Browser-facing status for materialized working directories is
 /// summarized without exposing raw host paths.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateWorkerRequest {
@@ -152,9 +152,9 @@ pub struct CreateWorkerRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_input: Option<WorkerInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_workspace: Option<ExecutionWorkspaceRequest>,
+    pub working_directory: Option<WorkingDirectoryRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_workspace_allocation: Option<ExecutionWorkspaceAllocationClaim>,
+    pub working_directory_allocation: Option<WorkingDirectoryAllocationClaim>,
 }
 
 /// Worker lifecycle status for the in-memory embedded runtime.

@@ -1,19 +1,19 @@
 完了。
 
 実装内容:
-- Runtime-side Execution Workspace materialization boundary を追加した。
-- v0 local Git materializer として、configured repository から resolved commit / tree evidence を取り、Runtime root 配下 `execution-workspaces/<allocation-id>/root/<repository-id>` に detached Git worktree を作成するようにした。
+- Runtime-side working directory materialization boundary を追加した。
+- v0 local Git materializer として、configured repository から resolved commit / tree evidence を取り、Runtime root 配下 `working-directories/<allocation-id>/root/<repository-id>` に detached Git worktree を作成するようにした。
 - Worker spawn 時の workspace root / cwd / scope は source repository root ではなく materialized worktree path を使うようにした。
 - 同一 source repository に対する複数 Worker が distinct materialized paths を使えるようにした。
 - dirty source state は `clean_point_only` policy で拒否し、remote URI / non-Git provider / unsupported policy は typed diagnostics で fail closed するようにした。
 - allocation evidence / cleanup target / cleanup policy / status を記録し、Worker stop cleanup hook で worktree cleanup と record update を行うようにした。
-- Browser/API-facing spawn boundary は raw `ExecutionWorkspaceRequest` / `local_path` を受け取らないようにし、safe `repository_id` / optional `selector` から host/server 内部で materialization request を構築するようにした。
+- Browser/API-facing spawn boundary は raw `WorkingDirectoryRequest` / `local_path` を受け取らないようにし、safe `repository_id` / optional `selector` から host/server 内部で materialization request を構築するようにした。
 - Focused worker-runtime / workspace-server tests を追加した。
 
 主な commit / merge:
-- implementation: `8b7a5da0 feat: materialize execution workspaces`
-- review fix: `c90ebf24 fix: keep execution workspace paths internal`
-- merge into orchestration: `c4cdf1c3 merge: execution workspace materializer`
+- implementation: `8b7a5da0 feat: materialize working directories`
+- review fix: `c90ebf24 fix: keep working directory paths internal`
+- merge into orchestration: `c4cdf1c3 merge: working directory materializer`
 
 Review:
 - 初回 external review は request_changes。

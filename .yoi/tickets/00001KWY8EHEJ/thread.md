@@ -39,7 +39,7 @@ Ticket を `workspace-panel` が queued にしました。
 Routing decision: implementation_ready
 
 Reason:
-- Ticket は Browser-managed Execution Workspace の pre-allocate 方式、API/UI/spawn 接続、`relative_cwd` validation、path leak invariant、cleanup policy の v0 方針を具体化している。
+- Ticket は Browser-managed working directory の pre-allocate 方式、API/UI/spawn 接続、`relative_cwd` validation、path leak invariant、cleanup policy の v0 方針を具体化している。
 - 先行 Runtime-side materializer / Repository registry / workspace-id scoped API が orchestration branch に統合済みで、Browser-facing API を `/api/w/<workspace-id>/...` に追加する実装基盤がある。
 - raw host path / internal materialization request を Browser payload に露出しない binding invariant が明確で、Worker spawn は allocation id + safe `relative_cwd` で接続する要求になっている。
 - typed relation blocker は 0 件、OrchestrationPlan record は 0 件。
@@ -53,17 +53,17 @@ Evidence checked:
 - queued Ticket 一覧: この Ticket 1件のみ。inprogress は 0 件。
 - visible Pods: previous child Pods が idle で残っているが、`StopPod` 不使用方針のため停止せず、新規 unique Pod を使う。capacity blocker ではない。
 - `TicketDoctor`: 0 errors / 既存 diagnostics のみ。
-- Bounded code map: `crates/worker-runtime/src/{catalog.rs,execution_workspace.rs,runtime.rs,worker_backend.rs,http_server.rs}`, `crates/workspace-server/src/{server.rs,hosts.rs,repositories.rs,config.rs}`, `web/workspace/src/lib/workspace-sidebar/**`, scoped routes/API under `web/workspace/src/routes/w/[workspaceId]/**`。
+- Bounded code map: `crates/worker-runtime/src/{catalog.rs,working_directory.rs,runtime.rs,worker_backend.rs,http_server.rs}`, `crates/workspace-server/src/{server.rs,hosts.rs,repositories.rs,config.rs}`, `web/workspace/src/lib/workspace-sidebar/**`, scoped routes/API under `web/workspace/src/routes/w/[workspaceId]/**`。
 
 IntentPacket:
 
 Intent:
-- Browser-facing API から configured repository + selector + policy により Execution Workspace を事前作成し、Browser には allocation id と safe summary だけを返す。
-- Worker launch UI/API で作成済み Execution Workspace を選択し、Worker spawn 時に allocation id と safe `relative_cwd` を Runtime materializer / Worker spawn boundary に接続する。
-- Worker detail/list に execution workspace の safe summary を表示し、cleanup policy と手動 cleanup 操作の v0 方針を実装/明示する。
+- Browser-facing API から configured repository + selector + policy により working directory を事前作成し、Browser には allocation id と safe summary だけを返す。
+- Worker launch UI/API で作成済み working directory を選択し、Worker spawn 時に allocation id と safe `relative_cwd` を Runtime materializer / Worker spawn boundary に接続する。
+- Worker detail/list に working directory の safe summary を表示し、cleanup policy と手動 cleanup 操作の v0 方針を実装/明示する。
 
 Binding decisions / invariants:
-- Browser から raw host path、backend-private absolute path、raw `ExecutionWorkspaceRequest`、internal runtime path を送らせない/返さない。
+- Browser から raw host path、backend-private absolute path、raw `WorkingDirectoryRequest`、internal runtime path を送らせない/返さない。
 - pre-allocate 方式を優先する。単発 spawn request だけで暗黙 materialize する経路は後回し。
 - v0 materializer は existing local Git detached worktree 方針を使う。remote clone/cache、dirty source inclusion は扱わない。
 - Worker spawn は作成済み allocation id と任意の `relative_cwd` を選ぶ。
@@ -73,19 +73,19 @@ Binding decisions / invariants:
 - Workspace-scoped Browser API は `/api/w/<workspace-id>/...` を使い、Runtime `/v1/...` API を Browser contract として広げない。
 
 Requirements / acceptance criteria:
-- `POST /api/w/<workspace-id>/execution-workspaces` 相当で configured repository + selector から Execution Workspace を作成できる。
-- `GET /api/w/<workspace-id>/execution-workspaces` 相当で safe summary list を取得できる。
+- `POST /api/w/<workspace-id>/working-directories` 相当で configured repository + selector から working directory を作成できる。
+- `GET /api/w/<workspace-id>/working-directories` 相当で safe summary list を取得できる。
 - 必要なら detail / cleanup endpoint を scoped API に追加し、safe summary / typed diagnostic を返す。
-- Worker launch UI で Execution Workspace を選択でき、raw path ではなく safe id/selector 情報を送る。
+- Worker launch UI で working directory を選択でき、raw path ではなく safe id/selector 情報を送る。
 - Worker spawn 時に選択 allocation が Runtime の materialized workspace に接続され、Worker cwd/scope は materialized worktree 配下になる。
 - invalid repository / dirty unsupported / remote unsupported / invalid `relative_cwd` は typed diagnostic。
-- Worker detail/list に execution workspace safe summary を表示する。
+- Worker detail/list に working directory safe summary を表示する。
 - frontend check/test、workspace-server tests、`yoi ticket doctor`、`nix build .#yoi` を通す。
 
 Implementation latitude:
 - Allocation store の所在/形式、API endpoint 名、UI placement、cleanup status 名、test helper は既存 workspace-server / worker-runtime / web style に合わせてよい。
 - v0 では Runtime materializer の既存 allocation evidence を再利用し、Browser-managed allocation registry は必要最小限でよい。
-- Worker launch UI は既存 New Worker form に Execution Workspace select / create link / refresh を追加する形でよい。
+- Worker launch UI は既存 New Worker form に working directory select / create link / refresh を追加する形でよい。
 - `relative_cwd` は empty/`.` を workspace root と扱ってよい。
 
 Escalate if:
@@ -103,7 +103,7 @@ Validation:
 - `nix build .#yoi --no-link`（Ticket acceptance に含まれるため実行する。実行不能なら理由を implementation report に明記する）
 
 Current code map:
-- Runtime Execution Workspace: `crates/worker-runtime/src/catalog.rs`, `execution_workspace.rs`, `runtime.rs`, `worker_backend.rs`, `http_server.rs`。
+- Runtime working directory: `crates/worker-runtime/src/catalog.rs`, `working_directory.rs`, `runtime.rs`, `worker_backend.rs`, `http_server.rs`。
 - Workspace Backend host/API: `crates/workspace-server/src/server.rs`, `hosts.rs`, `repositories.rs`, `config.rs`。
 - Worker launch UI and API helpers: `web/workspace/src/lib/workspace-sidebar/WorkersNavSection.svelte`, worker launch model/tests, workspace API helper, scoped route layout。
 - Worker detail/console: scoped worker console route and runtime worker detail/list projections。
@@ -134,7 +134,7 @@ Checked context:
 
 Acceptance basis:
 - concrete missing decision / information は残っていない。
-- Ticket の scope は Browser-managed pre-allocated Execution Workspace と Worker spawn 接続に閉じており、remote clone/cache, dirty source inclusion, raw path Browser contract, implicit one-shot materialization は非目標/後回しとして明確。
+- Ticket の scope は Browser-managed pre-allocated working directory と Worker spawn 接続に閉じており、remote clone/cache, dirty source inclusion, raw path Browser contract, implicit one-shot materialization は非目標/後回しとして明確。
 - side effect はこの `queued -> inprogress` acceptance 後に、worktree-workflow に沿って implementation worktree を作成してから開始する。
 
 ---
@@ -146,8 +146,8 @@ Acceptance basis:
 Implementation routing update:
 
 - Worktree-workflow に従い implementation worktree を作成した。
-  - Worktree: `/home/hare/Projects/yoi/.worktree/00001KWY8EHEJ-browser-execution-workspaces`
-  - Branch: `work/00001KWY8EHEJ-browser-execution-workspaces`
+  - Worktree: `/home/hare/Projects/yoi/.worktree/00001KWY8EHEJ-browser-working-directories`
+  - Branch: `work/00001KWY8EHEJ-browser-working-directories`
 - Worktree には tracked `.yoi` project records が見えている。
 - `.yoi/memory` / `.yoi/runtime` / `.yoi/log` / `.yoi/logs` / `.yoi/local` / `.yoi/*.lock` / `.yoi/*secret*` は作成直後に存在しないことを確認した。
 - Sibling Coder Pod `yoi-coder-00001KWY8EHEJ-browser-execws` を起動した。
@@ -162,20 +162,20 @@ Implementation routing update:
 
 Implementation progress report:
 
-- Coder Pod completed implementation and committed `684b19e8 feat: add browser execution workspaces` on branch `work/00001KWY8EHEJ-browser-execution-workspaces`.
+- Coder Pod completed implementation and committed `684b19e8 feat: add browser working directories` on branch `work/00001KWY8EHEJ-browser-working-directories`.
 - Worktree status was clean after commit.
 - Changed files include:
-  - `crates/worker-runtime/src/{catalog.rs,execution_workspace.rs,http_server.rs,runtime.rs,worker_backend.rs}`
+  - `crates/worker-runtime/src/{catalog.rs,working_directory.rs,http_server.rs,runtime.rs,worker_backend.rs}`
   - `crates/workspace-server/src/{companion.rs,hosts.rs,server.rs}`
   - `web/workspace/src/lib/workspace-sidebar/{WorkersNavSection.svelte,types.ts,worker-launch.ts,worker-launch.test.ts}`
 - Implementation summary:
-  - Runtime-side preallocated Execution Workspace create/list/detail/cleanup and allocation binding at Worker spawn。
+  - Runtime-side preallocated working directory create/list/detail/cleanup and allocation binding at Worker spawn。
   - `relative_cwd` validation rejects absolute paths, `..`, missing paths, files, and symlink escapes。
-  - scoped Browser API: `POST/GET /api/w/<workspace-id>/execution-workspaces`, detail, and cleanup。
-  - Browser API uses configured `repository_id` + selector + policy, not raw paths/internal `ExecutionWorkspaceRequest`。
+  - scoped Browser API: `POST/GET /api/w/<workspace-id>/working-directories`, detail, and cleanup。
+  - Browser API uses configured `repository_id` + selector + policy, not raw paths/internal `WorkingDirectoryRequest`。
   - Browser responses expose safe summaries only。
   - Worker spawn uses selected allocation id plus optional safe `relative_cwd`。
-  - Worker list/detail projections include execution workspace safe summary。
+  - Worker list/detail projections include working directory safe summary。
   - Workspace UI Worker launch flow can select existing allocations or create a new allocation before launch。
 - Orchestrator reran validation in the implementation worktree:
   - `git diff --check`: pass
@@ -198,23 +198,23 @@ External review result: request_changes
 
 Blocker:
 
-1. Invalid `relative_cwd` is rejected internally, but the Browser-facing Worker spawn API does not return the required typed Execution Workspace diagnostic。
+1. Invalid `relative_cwd` is rejected internally, but the Browser-facing Worker spawn API does not return the required typed working directory diagnostic。
    - Ticket acceptance requires invalid `relative_cwd` to be rejected as a typed diagnostic。
    - Materializer has specific typed codes:
-     - `execution_workspace_relative_cwd_invalid`
-     - `execution_workspace_relative_cwd_unavailable`
-     - `execution_workspace_relative_cwd_escape_rejected`
-   - `crates/worker-runtime/src/worker_backend.rs` converts `ExecutionWorkspaceDiagnostic` to a plain string in `WorkerExecutionResult::rejected(...)`。
+     - `working_directory_relative_cwd_invalid`
+     - `working_directory_relative_cwd_unavailable`
+     - `working_directory_relative_cwd_escape_rejected`
+   - `crates/worker-runtime/src/worker_backend.rs` converts `WorkingDirectoryDiagnostic` to a plain string in `WorkerExecutionResult::rejected(...)`。
    - Workspace host/API then maps this to generic diagnostics/error codes, including generic embedded execution rejection and generic `workspace_worker_create_failed`。
-   - Result: Browser caller submitting invalid `relative_cwd` gets a generic worker-create/runtime rejection rather than a typed `execution_workspace_relative_cwd_*` diagnostic。
+   - Result: Browser caller submitting invalid `relative_cwd` gets a generic worker-create/runtime rejection rather than a typed `working_directory_relative_cwd_*` diagnostic。
    - Browser/scoped API-level tests cover materializer bind validation but not the API rejection shape。
 
 Required fix:
-- Preserve/propagate `ExecutionWorkspaceDiagnostic.code` through Worker spawn, or prevalidate allocation + `relative_cwd` in the Workspace API and return that typed diagnostic directly。
-- Add a scoped Browser API test for at least one invalid `relative_cwd` that asserts the typed `execution_workspace_relative_cwd_*` diagnostic is returned。
+- Preserve/propagate `WorkingDirectoryDiagnostic.code` through Worker spawn, or prevalidate allocation + `relative_cwd` in the Workspace API and return that typed diagnostic directly。
+- Add a scoped Browser API test for at least one invalid `relative_cwd` that asserts the typed `working_directory_relative_cwd_*` diagnostic is returned。
 
 Non-blocking follow-ups:
-- The implementation otherwise appears aligned with the pre-allocation design: scoped `/api/w/<workspace-id>/execution-workspaces` routes exist, Browser create payload uses configured `repository_id`/selector/policy rather than raw `ExecutionWorkspaceRequest`, summaries avoid raw paths, UI explicitly creates/selects allocations, and cleanup is bounded to the allocation root。
+- The implementation otherwise appears aligned with the pre-allocation design: scoped `/api/w/<workspace-id>/working-directories` routes exist, Browser create payload uses configured `repository_id`/selector/policy rather than raw `WorkingDirectoryRequest`, summaries avoid raw paths, UI explicitly creates/selects allocations, and cleanup is bounded to the allocation root。
 
 Validation reviewed:
 - Reviewer read Ticket item/thread, inspected `git show --stat --check 684b19e8` / `git show --name-only 684b19e8`, and reviewed Runtime, Workspace API/host, and frontend launch files。
@@ -228,13 +228,13 @@ Validation reviewed:
 
 Review-fix implementation report:
 
-- Coder Pod completed requested changes and committed follow-up `9adb0fae fix: preserve execution workspace cwd diagnostics` on branch `work/00001KWY8EHEJ-browser-execution-workspaces`.
+- Coder Pod completed requested changes and committed follow-up `9adb0fae fix: preserve working directory cwd diagnostics` on branch `work/00001KWY8EHEJ-browser-working-directories`.
 - Worktree status was clean after commit.
 - Fix summary:
-  - Browser Worker spawn now prevalidates selected execution workspace allocation + `relative_cwd` through the materializer before spawn。
-  - `ExecutionWorkspaceDiagnostic` is mapped directly into Browser API error diagnostics, preserving typed codes such as `execution_workspace_relative_cwd_invalid`, `execution_workspace_relative_cwd_unavailable`, and `execution_workspace_relative_cwd_escape_rejected`。
-  - Added a scoped Browser API regression test asserting invalid `relative_cwd: "../escape"` returns typed `execution_workspace_relative_cwd_invalid` diagnostic。
-  - Existing scoped execution workspace routes, safe summaries, explicit UI allocation flow, and bounded cleanup behavior remain unchanged。
+  - Browser Worker spawn now prevalidates selected working directory allocation + `relative_cwd` through the materializer before spawn。
+  - `WorkingDirectoryDiagnostic` is mapped directly into Browser API error diagnostics, preserving typed codes such as `working_directory_relative_cwd_invalid`, `working_directory_relative_cwd_unavailable`, and `working_directory_relative_cwd_escape_rejected`。
+  - Added a scoped Browser API regression test asserting invalid `relative_cwd: "../escape"` returns typed `working_directory_relative_cwd_invalid` diagnostic。
+  - Existing scoped working directory routes, safe summaries, explicit UI allocation flow, and bounded cleanup behavior remain unchanged。
 - Orchestrator reran validation in the implementation worktree:
   - `git diff --check`: pass
   - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
@@ -259,13 +259,13 @@ Blockers: none.
 Evidence reviewed in implementation worktree only:
 - Ticket records: `.yoi/tickets/00001KWY8EHEJ/item.md`, `thread.md`, and orchestration artifact。
 - Fix diff: `9adb0fae` stat/check and `684b19e8..9adb0fae` focused diff for `crates/workspace-server/src/server.rs`。
-- Relevant files: `workspace-server/src/server.rs`, `worker-runtime/src/execution_workspace.rs`, `worker_backend.rs`, scoped host/runtime API pieces, and worker launch UI/model/tests。
+- Relevant files: `workspace-server/src/server.rs`, `worker-runtime/src/working_directory.rs`, `worker_backend.rs`, scoped host/runtime API pieces, and worker launch UI/model/tests。
 
 Findings:
-- Prior blocker is resolved. Browser Worker spawn now pre-validates `execution_workspace.relative_cwd` through the execution workspace materializer before calling the runtime spawn path, and maps `ExecutionWorkspaceError` into API diagnostics via `execution_workspace_api_error`。
-- Invalid Browser spawn `relative_cwd` now returns typed diagnostics with the expected codes, covered by the added test asserting `execution_workspace_relative_cwd_invalid` appears both in diagnostics and message。
-- Browser-facing spawn payload remains allocation-based (`allocation_id` + optional `relative_cwd`) rather than exposing raw `ExecutionWorkspaceRequest` or host paths. UI request construction sends allocation id and relative cwd only。
-- Scoped create/list/detail/cleanup routes remain under `/api/w/:workspace_id/execution-workspaces`; worker creation uses the scoped workspace API path from the Browser UI。
+- Prior blocker is resolved. Browser Worker spawn now pre-validates `working_directory.relative_cwd` through the working directory materializer before calling the runtime spawn path, and maps `WorkingDirectoryError` into API diagnostics via `working_directory_api_error`。
+- Invalid Browser spawn `relative_cwd` now returns typed diagnostics with the expected codes, covered by the added test asserting `working_directory_relative_cwd_invalid` appears both in diagnostics and message。
+- Browser-facing spawn payload remains allocation-based (`allocation_id` + optional `relative_cwd`) rather than exposing raw `WorkingDirectoryRequest` or host paths. UI request construction sends allocation id and relative cwd only。
+- Scoped create/list/detail/cleanup routes remain under `/api/w/:workspace_id/working-directories`; worker creation uses the scoped workspace API path from the Browser UI。
 - Cleanup remains bounded to the allocation root: cleanup re-derives allocation root from the allocation id/root, canonicalizes workspace root, rejects escape, and removes only the recorded workspace root。
 - Runtime/internal trusted path still performs canonical materialization/bind at Worker launch, while Browser gets a safer scoped allocation API。
 - Reported validation was comprehensive and green; reviewer did not rerun tests as this was a read-only follow-up review。
@@ -283,7 +283,7 @@ No merge-blocking issues found.
 Merge/validation acceptance:
 
 - Follow-up external review approved the implementation after blocker fix。
-- Implementation branch `work/00001KWY8EHEJ-browser-execution-workspaces` was merged into the orchestration branch with merge commit `b52986e5 merge: browser execution workspaces`。
+- Implementation branch `work/00001KWY8EHEJ-browser-working-directories` was merged into the orchestration branch with merge commit `b52986e5 merge: browser working directories`。
 - Final validation in Orchestrator worktree passed:
   - `git diff --check`: pass
   - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
@@ -295,8 +295,8 @@ Merge/validation acceptance:
   - `nix build .#yoi --no-link`: pass
 
 Implementation commits:
-- `684b19e8 feat: add browser execution workspaces`
-- `9adb0fae fix: preserve execution workspace cwd diagnostics`
+- `684b19e8 feat: add browser working directories`
+- `9adb0fae fix: preserve working directory cwd diagnostics`
 
 No merge-blocking issues remain.
 
@@ -318,24 +318,24 @@ Ticket を closed にしました。
 完了。
 
 実装内容:
-- Browser-managed Execution Workspace API を scoped Workspace API に追加した。
-  - `POST /api/w/<workspace-id>/execution-workspaces`
-  - `GET /api/w/<workspace-id>/execution-workspaces`
+- Browser-managed working directory API を scoped Workspace API に追加した。
+  - `POST /api/w/<workspace-id>/working-directories`
+  - `GET /api/w/<workspace-id>/working-directories`
   - detail / cleanup endpoint
-- Browser create payload は configured `repository_id` / selector / policy を使い、raw host path / raw internal `ExecutionWorkspaceRequest` / internal runtime path を受け取らないようにした。
+- Browser create payload は configured `repository_id` / selector / policy を使い、raw host path / raw internal `WorkingDirectoryRequest` / internal runtime path を受け取らないようにした。
 - Browser response は allocation id、repository id、selector/commit evidence、status、cleanup policy など safe summary のみを返すようにした。
-- Worker launch UI で Execution Workspace を create/select できるようにした。
+- Worker launch UI で working directory を create/select できるようにした。
 - Worker spawn は selected allocation id + optional `relative_cwd` を使い、Runtime materialized workspace に接続するようにした。
 - `relative_cwd` は materialized root 相対として検証し、absolute path、`..` escape、symlink escape、nonexistent / non-directory を拒否するようにした。
-- invalid `relative_cwd` は Browser-facing API で typed `execution_workspace_relative_cwd_*` diagnostic として返るようにした。
-- Worker list/detail に execution workspace safe summary を含めた。
+- invalid `relative_cwd` は Browser-facing API で typed `working_directory_relative_cwd_*` diagnostic として返るようにした。
+- Worker list/detail に working directory safe summary を含めた。
 - cleanup は allocation root に bounded され、typed/sanitized diagnostic を返すようにした。
 - Focused backend/runtime/web tests を追加した。
 
 主な commit / merge:
-- implementation: `684b19e8 feat: add browser execution workspaces`
-- review fix: `9adb0fae fix: preserve execution workspace cwd diagnostics`
-- merge into orchestration: `b52986e5 merge: browser execution workspaces`
+- implementation: `684b19e8 feat: add browser working directories`
+- review fix: `9adb0fae fix: preserve working directory cwd diagnostics`
+- merge into orchestration: `b52986e5 merge: browser working directories`
 
 Review:
 - 初回 external review は request_changes。

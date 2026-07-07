@@ -12,10 +12,10 @@ use chrono::{SecondsFormat, Utc};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use worker_runtime::execution_workspace::{
-    ExecutionWorkspaceDiagnostic, ExecutionWorkspaceMaterializer, LocalGitWorktreeMaterializer,
-};
 use worker_runtime::worker_backend::WorkerRuntimeExecutionBackend;
+use worker_runtime::working_directory::{
+    LocalGitWorktreeMaterializer, WorkingDirectoryDiagnostic, WorkingDirectoryMaterializer,
+};
 
 use crate::companion::{
     CompanionCancelRequest, CompanionConsole, CompanionMessageRequest, CompanionMessageResponse,
@@ -27,8 +27,8 @@ use crate::hosts::{
     HostSummary, RemoteRuntimeConfig, RemoteWorkerRuntime, RuntimeDiagnostic, RuntimeRegistry,
     RuntimeRegistryUnregisterResult, RuntimeSummary, WorkerInputRequest, WorkerInputResult,
     WorkerLifecycleRequest, WorkerLifecycleResult, WorkerOperationState,
-    WorkerSpawnAcceptanceRequirement, WorkerSpawnExecutionWorkspaceRequest, WorkerSpawnIntent,
-    WorkerSpawnRequest, WorkerSpawnResult, WorkerSummary, WorkerTranscriptProjection,
+    WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult,
+    WorkerSpawnWorkingDirectoryRequest, WorkerSummary, WorkerTranscriptProjection,
 };
 use crate::identity::WorkspaceIdentity;
 use crate::observation::{
@@ -45,9 +45,9 @@ use crate::repositories::{
 use crate::store::{ControlPlaneStore, WorkspaceRecord};
 use crate::{Error, Result};
 use worker_runtime::catalog::{
-    ConfigBundleRef, DirtyStatePolicy, ExecutionWorkspaceAllocationClaim,
-    ExecutionWorkspaceRepository, ExecutionWorkspaceRequest, ExecutionWorkspaceSummary,
-    MaterializerKind, ProfileSelector, RepositorySelector as RuntimeRepositorySelector,
+    ConfigBundleRef, DirtyStatePolicy, MaterializerKind, ProfileSelector,
+    RepositorySelector as RuntimeRepositorySelector, WorkingDirectoryAllocationClaim,
+    WorkingDirectoryRepository, WorkingDirectoryRequest, WorkingDirectorySummary,
 };
 use worker_runtime::config_bundle::ConfigBundle;
 use worker_runtime::http_server::{
@@ -154,7 +154,7 @@ pub struct WorkspaceApi {
     runtime: Arc<RuntimeRegistry>,
     companion: Arc<CompanionConsole>,
     observation_proxy: BackendObservationProxy,
-    execution_workspace_materializer: Arc<LocalGitWorktreeMaterializer>,
+    working_directory_materializer: Arc<LocalGitWorktreeMaterializer>,
 }
 
 impl WorkspaceApi {
@@ -169,7 +169,7 @@ impl WorkspaceApi {
                         "failed to initialize embedded Worker backend: {err}"
                     ))
                 })?
-                .with_execution_workspace_materializer((*materializer).clone());
+                .with_working_directory_materializer((*materializer).clone());
         Self::new_with_execution_backend(config, store, Arc::new(execution_backend)).await
     }
 
@@ -204,7 +204,7 @@ impl WorkspaceApi {
         let runtime = Arc::new(runtime);
         let companion = Arc::new(CompanionConsole::new(runtime.clone()));
         let observation_proxy = BackendObservationProxy::new(config.runtime_event_sources.clone());
-        let execution_workspace_materializer = Arc::new(LocalGitWorktreeMaterializer::new(
+        let working_directory_materializer = Arc::new(LocalGitWorktreeMaterializer::new(
             config.embedded_runtime_store_root.clone(),
         ));
         Ok(Self {
@@ -214,7 +214,7 @@ impl WorkspaceApi {
             runtime,
             companion,
             observation_proxy,
-            execution_workspace_materializer,
+            working_directory_materializer,
         })
     }
 
@@ -271,12 +271,12 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route("/api/hosts", get(list_hosts))
         .route("/api/w/{workspace_id}/hosts", get(scoped_list_hosts))
         .route(
-            "/api/w/{workspace_id}/execution-workspaces",
-            get(scoped_list_execution_workspaces).post(scoped_create_execution_workspace),
+            "/api/w/{workspace_id}/working-directories",
+            get(scoped_list_working_directories).post(scoped_create_working_directory),
         )
         .route(
-            "/api/w/{workspace_id}/execution-workspaces/{allocation_id}",
-            get(scoped_execution_workspace_detail).delete(scoped_cleanup_execution_workspace),
+            "/api/w/{workspace_id}/working-directories/{allocation_id}",
+            get(scoped_working_directory_detail).delete(scoped_cleanup_working_directory),
         )
         .route("/api/runtimes", get(list_runtimes))
         .route("/api/w/{workspace_id}/runtimes", get(scoped_list_runtimes))
@@ -547,8 +547,8 @@ pub struct WorkerLaunchOptionsResponse {
     pub workspace_id: String,
     pub runtimes: Vec<WorkerLaunchRuntimeOption>,
     pub profiles: Vec<WorkerLaunchProfileCandidate>,
-    pub repositories: Vec<ExecutionWorkspaceRepositoryOption>,
-    pub execution_workspaces: Vec<ExecutionWorkspaceSummary>,
+    pub repositories: Vec<WorkingDirectoryRepositoryOption>,
+    pub working_directories: Vec<WorkingDirectorySummary>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -570,7 +570,7 @@ pub struct WorkerLaunchProfileCandidate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionWorkspaceRepositoryOption {
+pub struct WorkingDirectoryRepositoryOption {
     pub id: String,
     pub display_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -578,54 +578,54 @@ pub struct ExecutionWorkspaceRepositoryOption {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct BrowserExecutionWorkspaceCreatePolicy {
+pub struct BrowserWorkingDirectoryCreatePolicy {
     #[serde(default)]
-    pub dirty_state: BrowserExecutionWorkspaceDirtyStatePolicy,
+    pub dirty_state: BrowserWorkingDirectoryDirtyStatePolicy,
     #[serde(default)]
-    pub cleanup: BrowserExecutionWorkspaceCleanupPolicy,
+    pub cleanup: BrowserWorkingDirectoryCleanupPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum BrowserExecutionWorkspaceDirtyStatePolicy {
+pub enum BrowserWorkingDirectoryDirtyStatePolicy {
     #[default]
     CleanPointOnly,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum BrowserExecutionWorkspaceCleanupPolicy {
+pub enum BrowserWorkingDirectoryCleanupPolicy {
     #[default]
     ManualOrWorkerStop,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct BrowserExecutionWorkspaceCreateRequest {
+pub struct BrowserWorkingDirectoryCreateRequest {
     pub repository_id: String,
     #[serde(default)]
     pub selector: Option<String>,
     #[serde(default)]
-    pub policy: BrowserExecutionWorkspaceCreatePolicy,
+    pub policy: BrowserWorkingDirectoryCreatePolicy,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct BrowserExecutionWorkspaceListResponse {
+pub struct BrowserWorkingDirectoryListResponse {
     pub workspace_id: String,
-    pub items: Vec<ExecutionWorkspaceSummary>,
+    pub items: Vec<WorkingDirectorySummary>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct BrowserExecutionWorkspaceDetailResponse {
+pub struct BrowserWorkingDirectoryDetailResponse {
     pub workspace_id: String,
-    pub item: ExecutionWorkspaceSummary,
+    pub item: WorkingDirectorySummary,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct BrowserWorkerExecutionWorkspaceSelection {
+pub struct BrowserWorkerWorkingDirectorySelection {
     pub allocation_id: String,
     #[serde(default)]
     pub relative_cwd: Option<String>,
@@ -639,7 +639,7 @@ pub struct BrowserCreateWorkerRequest {
     pub profile: String,
     pub initial_text: String,
     #[serde(default)]
-    pub execution_workspace: Option<BrowserWorkerExecutionWorkspaceSelection>,
+    pub working_directory: Option<BrowserWorkerWorkingDirectorySelection>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -742,7 +742,7 @@ struct ScopedRuntimePath {
 }
 
 #[derive(Debug, Deserialize)]
-struct ScopedExecutionWorkspacePath {
+struct ScopedWorkingDirectoryPath {
     workspace_id: String,
     allocation_id: String,
 }
@@ -884,28 +884,28 @@ async fn scoped_get_worker_launch_options(
     get_worker_launch_options(State(api)).await
 }
 
-async fn scoped_list_execution_workspaces(
+async fn scoped_list_working_directories(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
-) -> ApiResult<Json<BrowserExecutionWorkspaceListResponse>> {
+) -> ApiResult<Json<BrowserWorkingDirectoryListResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let items = execution_workspace_summaries(&api)?;
-    Ok(Json(BrowserExecutionWorkspaceListResponse {
+    let items = working_directory_summaries(&api)?;
+    Ok(Json(BrowserWorkingDirectoryListResponse {
         workspace_id: api.config.workspace_id.clone(),
         items,
         diagnostics: Vec::new(),
     }))
 }
 
-async fn scoped_create_execution_workspace(
+async fn scoped_create_working_directory(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    Json(request): Json<BrowserExecutionWorkspaceCreateRequest>,
-) -> ApiResult<Json<BrowserExecutionWorkspaceDetailResponse>> {
+    Json(request): Json<BrowserWorkingDirectoryCreateRequest>,
+) -> ApiResult<Json<BrowserWorkingDirectoryDetailResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let workspace_request = execution_workspace_request_for_browser(&api, request)?;
+    let workspace_request = working_directory_request_for_browser(&api, request)?;
     let binding = api
-        .execution_workspace_materializer
+        .working_directory_materializer
         .preallocate(&workspace_request)
         .map_err(|diagnostic| {
             ApiError::from(Error::RuntimeOperationFailed {
@@ -914,20 +914,20 @@ async fn scoped_create_execution_workspace(
                 message: diagnostic.message,
             })
         })?;
-    Ok(Json(BrowserExecutionWorkspaceDetailResponse {
+    Ok(Json(BrowserWorkingDirectoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
         item: binding.status().summary,
         diagnostics: Vec::new(),
     }))
 }
 
-async fn scoped_execution_workspace_detail(
+async fn scoped_working_directory_detail(
     State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedExecutionWorkspacePath>,
-) -> ApiResult<Json<BrowserExecutionWorkspaceDetailResponse>> {
+    AxumPath(path): AxumPath<ScopedWorkingDirectoryPath>,
+) -> ApiResult<Json<BrowserWorkingDirectoryDetailResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let status = api
-        .execution_workspace_materializer
+        .working_directory_materializer
         .allocation_status(&path.allocation_id)
         .map_err(|diagnostic| {
             ApiError::from(Error::RuntimeOperationFailed {
@@ -936,20 +936,20 @@ async fn scoped_execution_workspace_detail(
                 message: diagnostic.message,
             })
         })?;
-    Ok(Json(BrowserExecutionWorkspaceDetailResponse {
+    Ok(Json(BrowserWorkingDirectoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
         item: status.summary,
         diagnostics: Vec::new(),
     }))
 }
 
-async fn scoped_cleanup_execution_workspace(
+async fn scoped_cleanup_working_directory(
     State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedExecutionWorkspacePath>,
-) -> ApiResult<Json<BrowserExecutionWorkspaceDetailResponse>> {
+    AxumPath(path): AxumPath<ScopedWorkingDirectoryPath>,
+) -> ApiResult<Json<BrowserWorkingDirectoryDetailResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     let status = api
-        .execution_workspace_materializer
+        .working_directory_materializer
         .cleanup_allocation(&path.allocation_id)
         .map_err(|diagnostic| {
             ApiError::from(Error::RuntimeOperationFailed {
@@ -958,7 +958,7 @@ async fn scoped_cleanup_execution_workspace(
                 message: diagnostic.message,
             })
         })?;
-    Ok(Json(BrowserExecutionWorkspaceDetailResponse {
+    Ok(Json(BrowserWorkingDirectoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
         item: status.summary,
         diagnostics: Vec::new(),
@@ -1551,12 +1551,12 @@ async fn get_worker_launch_options(
     Ok(Json(worker_launch_options_response(&api)))
 }
 
-fn execution_workspace_request_from_repository(
+fn working_directory_request_from_repository(
     repository: &ConfiguredRepository,
     selector: Option<&str>,
-) -> ExecutionWorkspaceRequest {
-    ExecutionWorkspaceRequest {
-        repository: ExecutionWorkspaceRepository {
+) -> WorkingDirectoryRequest {
+    WorkingDirectoryRequest {
+        repository: WorkingDirectoryRepository {
             id: repository.id.clone(),
             provider: repository.provider.clone(),
             uri: repository.uri.clone(),
@@ -1576,21 +1576,21 @@ fn execution_workspace_request_from_repository(
     }
 }
 
-fn configured_execution_workspace_request(
+fn configured_working_directory_request(
     config: &ServerConfig,
-    request: &WorkerSpawnExecutionWorkspaceRequest,
-) -> Result<ExecutionWorkspaceRequest> {
+    request: &WorkerSpawnWorkingDirectoryRequest,
+) -> Result<WorkingDirectoryRequest> {
     let repository = config
         .repositories
         .iter()
         .find(|repository| repository.id == request.repository_id)
         .ok_or_else(|| {
             Error::Config(format!(
-                "unknown repository id `{}` for Worker execution workspace",
+                "unknown repository id `{}` for Worker working directory",
                 request.repository_id
             ))
         })?;
-    Ok(execution_workspace_request_from_repository(
+    Ok(working_directory_request_from_repository(
         repository,
         request.selector.as_deref(),
     ))
@@ -1621,31 +1621,31 @@ async fn create_workspace_worker(
             content: initial_text,
         })
     };
-    let resolved_execution_workspace_allocation =
+    let resolved_working_directory_allocation =
         request
-            .execution_workspace
-            .map(|selection| ExecutionWorkspaceAllocationClaim {
+            .working_directory
+            .map(|selection| WorkingDirectoryAllocationClaim {
                 allocation_id: selection.allocation_id,
                 relative_cwd: selection.relative_cwd,
             });
-    if resolved_execution_workspace_allocation.is_some()
+    if resolved_working_directory_allocation.is_some()
         && request.runtime_id != EMBEDDED_WORKER_RUNTIME_ID
     {
         return Err(Error::RuntimeOperationFailed {
             runtime_id: request.runtime_id.clone(),
-            code: "execution_workspace_runtime_unsupported".to_string(),
-            message: "preallocated execution workspaces are only supported by the embedded local runtime in v0".to_string(),
+            code: "working_directory_runtime_unsupported".to_string(),
+            message: "preallocated working directories are only supported by the embedded local runtime in v0".to_string(),
         }
         .into());
     }
-    if let Some(allocation) = resolved_execution_workspace_allocation.as_ref() {
-        api.execution_workspace_materializer
+    if let Some(allocation) = resolved_working_directory_allocation.as_ref() {
+        api.working_directory_materializer
             .bind_allocation(
                 &allocation.allocation_id,
                 allocation.relative_cwd.as_deref(),
             )
             .map_err(|diagnostic| {
-                execution_workspace_api_error(request.runtime_id.clone(), diagnostic)
+                working_directory_api_error(request.runtime_id.clone(), diagnostic)
             })?;
     }
     let result = api
@@ -1660,9 +1660,9 @@ async fn create_workspace_worker(
                 },
                 profile: Some(profile_selector),
                 initial_input,
-                execution_workspace: None,
-                resolved_execution_workspace: None,
-                resolved_execution_workspace_allocation,
+                working_directory: None,
+                resolved_working_directory: None,
+                resolved_working_directory_allocation,
             },
         )
         .map_err(|err| err.into_error())?;
@@ -1751,11 +1751,11 @@ async fn create_runtime_worker(
     AxumPath(runtime_id): AxumPath<String>,
     Json(mut request): Json<WorkerSpawnRequest>,
 ) -> ApiResult<Json<WorkerSpawnResult>> {
-    request.resolved_execution_workspace = request
-        .execution_workspace
+    request.resolved_working_directory = request
+        .working_directory
         .as_ref()
-        .map(|execution_workspace| {
-            configured_execution_workspace_request(&api.config, execution_workspace)
+        .map(|working_directory| {
+            configured_working_directory_request(&api.config, working_directory)
         })
         .transpose()?;
     let result = api
@@ -2688,19 +2688,19 @@ fn worker_launch_options_response(api: &WorkspaceApi) -> WorkerLaunchOptionsResp
         workspace_id: api.config.workspace_id.clone(),
         runtimes,
         profiles: worker_profile_candidates(),
-        repositories: execution_workspace_repository_options(api),
-        execution_workspaces: execution_workspace_summaries(api).unwrap_or_default(),
+        repositories: working_directory_repository_options(api),
+        working_directories: working_directory_summaries(api).unwrap_or_default(),
         diagnostics: Vec::new(),
     }
 }
 
-fn execution_workspace_repository_options(
+fn working_directory_repository_options(
     api: &WorkspaceApi,
-) -> Vec<ExecutionWorkspaceRepositoryOption> {
+) -> Vec<WorkingDirectoryRepositoryOption> {
     api.config
         .repositories
         .iter()
-        .map(|repository| ExecutionWorkspaceRepositoryOption {
+        .map(|repository| WorkingDirectoryRepositoryOption {
             id: repository.id.clone(),
             display_name: repository
                 .display_name
@@ -2711,8 +2711,8 @@ fn execution_workspace_repository_options(
         .collect()
 }
 
-fn execution_workspace_summaries(api: &WorkspaceApi) -> ApiResult<Vec<ExecutionWorkspaceSummary>> {
-    api.execution_workspace_materializer
+fn working_directory_summaries(api: &WorkspaceApi) -> ApiResult<Vec<WorkingDirectorySummary>> {
+    api.working_directory_materializer
         .list_allocations()
         .map(|items| items.into_iter().map(|status| status.summary).collect())
         .map_err(|diagnostic| {
@@ -2724,10 +2724,10 @@ fn execution_workspace_summaries(api: &WorkspaceApi) -> ApiResult<Vec<ExecutionW
         })
 }
 
-fn execution_workspace_request_for_browser(
+fn working_directory_request_for_browser(
     api: &WorkspaceApi,
-    request: BrowserExecutionWorkspaceCreateRequest,
-) -> ApiResult<ExecutionWorkspaceRequest> {
+    request: BrowserWorkingDirectoryCreateRequest,
+) -> ApiResult<WorkingDirectoryRequest> {
     let repository = api
         .config
         .repositories
@@ -2739,13 +2739,13 @@ fn execution_workspace_request_for_browser(
         .or_else(|| repository.default_selector.clone())
         .filter(|selector| !selector.trim().is_empty());
     match request.policy.dirty_state {
-        BrowserExecutionWorkspaceDirtyStatePolicy::CleanPointOnly => {}
+        BrowserWorkingDirectoryDirtyStatePolicy::CleanPointOnly => {}
     }
     match request.policy.cleanup {
-        BrowserExecutionWorkspaceCleanupPolicy::ManualOrWorkerStop => {}
+        BrowserWorkingDirectoryCleanupPolicy::ManualOrWorkerStop => {}
     }
-    Ok(ExecutionWorkspaceRequest {
-        repository: ExecutionWorkspaceRepository {
+    Ok(WorkingDirectoryRequest {
+        repository: WorkingDirectoryRepository {
             id: repository.id.clone(),
             provider: "git".to_string(),
             uri: repository.path.to_string_lossy().to_string(),
@@ -2822,9 +2822,9 @@ fn worker_create_not_accepted_error(
     )
 }
 
-fn execution_workspace_api_error(
+fn working_directory_api_error(
     runtime_id: String,
-    diagnostic: ExecutionWorkspaceDiagnostic,
+    diagnostic: WorkingDirectoryDiagnostic,
 ) -> ApiError {
     ApiError::with_diagnostics(
         Error::RuntimeOperationFailed {
@@ -3168,7 +3168,7 @@ impl IntoResponse for ApiError {
                 if code.starts_with("workspace_settings_")
                     || code.starts_with("invalid_")
                     || code.starts_with("unsupported_worker_profile")
-                    || code.starts_with("execution_workspace_")
+                    || code.starts_with("working_directory_")
                     || code.ends_with("_already_exists")
                     || code.ends_with("_not_config_managed")
                     || code.ends_with("_unsupported") =>
@@ -3284,8 +3284,8 @@ mod tests {
                     self.backend_id(),
                 ),
                 run_state: worker_runtime::execution::WorkerExecutionRunState::Idle,
-                execution_workspace: request
-                    .execution_workspace
+                working_directory: request
+                    .working_directory
                     .as_ref()
                     .map(|binding| binding.status()),
             }
@@ -3418,8 +3418,8 @@ mod tests {
                 digest: bundle.metadata.digest,
             },
             initial_input: None,
-            execution_workspace: None,
-            execution_workspace_allocation: None,
+            working_directory: None,
+            working_directory_allocation: None,
         }
     }
 
@@ -3435,11 +3435,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_execution_workspace_preallocate_list_detail_and_cleanup_are_path_safe() {
+    async fn browser_working_directory_preallocate_list_detail_and_cleanup_are_path_safe() {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let app = test_app(dir.path()).await;
-        let workspace_path = format!("/api/w/{TEST_WORKSPACE_ID}/execution-workspaces");
+        let workspace_path = format!("/api/w/{TEST_WORKSPACE_ID}/working-directories");
 
         let created = post_json(
             app.clone(),
@@ -3478,10 +3478,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let app = test_app(dir.path()).await;
-        let workspaces_path = format!("/api/w/{TEST_WORKSPACE_ID}/execution-workspaces");
+        let working_directories_path = format!("/api/w/{TEST_WORKSPACE_ID}/working-directories");
         let created = post_json(
             app.clone(),
-            &workspaces_path,
+            &working_directories_path,
             serde_json::json!({
                 "repository_id": TEST_REPOSITORY_ID,
                 "selector": "HEAD",
@@ -3500,7 +3500,7 @@ mod tests {
                 "display_name": "Coding Worker",
                 "profile": "builtin:coder",
                 "initial_text": "",
-                "execution_workspace": {
+                "working_directory": {
                     "allocation_id": allocation_id,
                     "relative_cwd": "../escape"
                 }
@@ -3513,14 +3513,14 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|diagnostic| diagnostic["code"] == "execution_workspace_relative_cwd_invalid"),
+                .any(|diagnostic| diagnostic["code"] == "working_directory_relative_cwd_invalid"),
             "expected typed relative_cwd diagnostic, got {response}"
         );
         assert!(
             response["message"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("execution_workspace_relative_cwd_invalid")
+                .contains("working_directory_relative_cwd_invalid")
         );
         let projected = serde_json::to_string(&response).unwrap();
         assert!(!projected.contains(dir.path().to_string_lossy().as_ref()));
@@ -3840,7 +3840,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_worker_spawn_rejects_raw_execution_workspace_fields() {
+    async fn runtime_worker_spawn_rejects_raw_working_directory_fields() {
         let dir = tempfile::tempdir().unwrap();
         let app = test_app(dir.path()).await;
         let response = request_json(
@@ -3857,7 +3857,7 @@ mod tests {
                     "kind": "run_accepted",
                     "expected_segments": 0
                 },
-                "execution_workspace": {
+                "working_directory": {
                     "repository_id": TEST_REPOSITORY_ID,
                     "local_path": dir.path().display().to_string()
                 }
@@ -3870,7 +3870,7 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .contains("unknown field"),
-            "raw execution workspace field should be rejected: {response}"
+            "raw working directory field should be rejected: {response}"
         );
     }
 
@@ -3892,7 +3892,7 @@ mod tests {
                     "kind": "run_accepted",
                     "expected_segments": 0
                 },
-                "execution_workspace": {
+                "working_directory": {
                     "repository_id": TEST_REPOSITORY_ID,
                     "selector": "HEAD"
                 }
@@ -4379,9 +4379,9 @@ mod tests {
                     },
                     profile: None,
                     initial_input: None,
-                    execution_workspace: None,
-                    resolved_execution_workspace: None,
-                    resolved_execution_workspace_allocation: None,
+                    working_directory: None,
+                    resolved_working_directory: None,
+                    resolved_working_directory_allocation: None,
                 },
             )
             .expect("spawn worker");

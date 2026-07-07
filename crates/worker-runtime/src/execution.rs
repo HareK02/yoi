@@ -1,10 +1,10 @@
-use crate::catalog::{CreateWorkerRequest, ExecutionWorkspaceStatus};
+use crate::catalog::{CreateWorkerRequest, WorkingDirectoryStatus};
 use crate::error::RuntimeError;
-use crate::execution_workspace::ExecutionWorkspaceBinding;
 use crate::identity::WorkerRef;
 use crate::interaction::WorkerInput;
 #[cfg(feature = "ws-server")]
 use crate::observation::WorkerObservationEvent;
+use crate::working_directory::WorkingDirectoryBinding;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
@@ -154,7 +154,7 @@ pub struct WorkerExecutionStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<WorkerExecutionBindingIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_workspace: Option<ExecutionWorkspaceStatus>,
+    pub working_directory: Option<WorkingDirectoryStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_result: Option<WorkerExecutionResult>,
 }
@@ -169,7 +169,7 @@ impl WorkerExecutionStatus {
             backend: WorkerExecutionBackendKind::Connected,
             run_state,
             binding: None,
-            execution_workspace: None,
+            working_directory: None,
             last_result: None,
         }
     }
@@ -185,8 +185,8 @@ impl WorkerExecutionStatus {
         self
     }
 
-    pub fn with_execution_workspace(mut self, status: ExecutionWorkspaceStatus) -> Self {
-        self.execution_workspace = Some(status);
+    pub fn with_working_directory(mut self, status: WorkingDirectoryStatus) -> Self {
+        self.working_directory = Some(status);
         self
     }
 
@@ -286,7 +286,7 @@ pub struct WorkerExecutionSpawnRequest {
     pub worker_ref: WorkerRef,
     pub request: CreateWorkerRequest,
     pub context: WorkerExecutionContext,
-    pub execution_workspace: Option<ExecutionWorkspaceBinding>,
+    pub working_directory: Option<WorkingDirectoryBinding>,
 }
 
 /// Result of backend Worker spawn/initialization.
@@ -295,7 +295,7 @@ pub enum WorkerExecutionSpawnResult {
     Connected {
         handle: WorkerExecutionHandle,
         run_state: WorkerExecutionRunState,
-        execution_workspace: Option<ExecutionWorkspaceStatus>,
+        working_directory: Option<WorkingDirectoryStatus>,
     },
     Rejected(WorkerExecutionResult),
     Errored(WorkerExecutionResult),

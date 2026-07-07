@@ -14,13 +14,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use worker_runtime::error::RuntimeError;
-use worker_runtime::execution_workspace::LocalGitWorktreeMaterializer;
 use worker_runtime::fs_store::FsRuntimeStoreOptions;
 use worker_runtime::http_server::{
     RuntimeHttpServerConfig, RuntimeHttpServerError, RuntimeHttpStoreSelection,
 };
 use worker_runtime::identity::RuntimeId;
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
+use worker_runtime::working_directory::LocalGitWorktreeMaterializer;
 use worker_runtime::{Runtime, RuntimeOptions};
 
 fn main() -> ExitCode {
@@ -81,12 +81,12 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
     if let Some(profile) = config.profile.clone() {
         factory = factory.with_profile(profile);
     }
-    let execution_workspace_root = execution_workspace_runtime_root(config);
+    let working_directory_root = working_directory_runtime_root(config);
     let backend = Arc::new(
         WorkerRuntimeExecutionBackend::new(factory)
             .map_err(ProcessError::WorkerAdapter)?
-            .with_execution_workspace_materializer(LocalGitWorktreeMaterializer::new(
-                execution_workspace_root,
+            .with_working_directory_materializer(LocalGitWorktreeMaterializer::new(
+                working_directory_root,
             )),
     );
 
@@ -109,7 +109,7 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
     }
 }
 
-fn execution_workspace_runtime_root(config: &ProcessConfig) -> PathBuf {
+fn working_directory_runtime_root(config: &ProcessConfig) -> PathBuf {
     match &config.http.store {
         RuntimeHttpStoreSelection::Fs { root } => root.clone(),
         _ => config
