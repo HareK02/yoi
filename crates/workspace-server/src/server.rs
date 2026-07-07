@@ -13,7 +13,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use worker_runtime::execution_workspace::{
-    ExecutionWorkspaceMaterializer, LocalGitWorktreeMaterializer,
+    ExecutionWorkspaceDiagnostic, ExecutionWorkspaceMaterializer, LocalGitWorktreeMaterializer,
 };
 use worker_runtime::worker_backend::WorkerRuntimeExecutionBackend;
 
@@ -1638,6 +1638,16 @@ async fn create_workspace_worker(
         }
         .into());
     }
+    if let Some(allocation) = resolved_execution_workspace_allocation.as_ref() {
+        api.execution_workspace_materializer
+            .bind_allocation(
+                &allocation.allocation_id,
+                allocation.relative_cwd.as_deref(),
+            )
+            .map_err(|diagnostic| {
+                execution_workspace_api_error(request.runtime_id.clone(), diagnostic)
+            })?;
+    }
     let result = api
         .runtime
         .spawn_worker(
@@ -2812,6 +2822,24 @@ fn worker_create_not_accepted_error(
     )
 }
 
+fn execution_workspace_api_error(
+    runtime_id: String,
+    diagnostic: ExecutionWorkspaceDiagnostic,
+) -> ApiError {
+    ApiError::with_diagnostics(
+        Error::RuntimeOperationFailed {
+            runtime_id,
+            code: diagnostic.code.clone(),
+            message: diagnostic.message.clone(),
+        },
+        vec![RuntimeDiagnostic {
+            code: diagnostic.code,
+            severity: DiagnosticSeverity::Error,
+            message: diagnostic.message,
+        }],
+    )
+}
+
 fn settings_bad_request(code: &'static str, message: &'static str) -> ApiError {
     Error::RuntimeOperationFailed {
         runtime_id: "workspace-backend".to_string(),
@@ -3140,6 +3168,7 @@ impl IntoResponse for ApiError {
                 if code.starts_with("workspace_settings_")
                     || code.starts_with("invalid_")
                     || code.starts_with("unsupported_worker_profile")
+                    || code.starts_with("execution_workspace_")
                     || code.ends_with("_already_exists")
                     || code.ends_with("_not_config_managed")
                     || code.ends_with("_unsupported") =>
@@ -3442,6 +3471,59 @@ mod tests {
 
         let removed = request_json(app, "DELETE", &detail_path, None, StatusCode::OK).await;
         assert_eq!(removed["item"]["status"], "removed");
+    }
+
+    #[tokio::test]
+    async fn scoped_worker_create_invalid_relative_cwd_returns_typed_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let app = test_app(dir.path()).await;
+        let workspaces_path = format!("/api/w/{TEST_WORKSPACE_ID}/execution-workspaces");
+        let created = post_json(
+            app.clone(),
+            &workspaces_path,
+            serde_json::json!({
+                "repository_id": TEST_REPOSITORY_ID,
+                "selector": "HEAD",
+                "policy": { "dirty_state": "clean_point_only", "cleanup": "manual_or_worker_stop" }
+            }),
+        )
+        .await;
+        let allocation_id = created["item"]["allocation_id"].as_str().unwrap();
+
+        let response = request_json(
+            app,
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/workers"),
+            Some(serde_json::json!({
+                "runtime_id": EMBEDDED_WORKER_RUNTIME_ID,
+                "display_name": "Coding Worker",
+                "profile": "builtin:coder",
+                "initial_text": "",
+                "execution_workspace": {
+                    "allocation_id": allocation_id,
+                    "relative_cwd": "../escape"
+                }
+            })),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert!(
+            response["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "execution_workspace_relative_cwd_invalid"),
+            "expected typed relative_cwd diagnostic, got {response}"
+        );
+        assert!(
+            response["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("execution_workspace_relative_cwd_invalid")
+        );
+        let projected = serde_json::to_string(&response).unwrap();
+        assert!(!projected.contains(dir.path().to_string_lossy().as_ref()));
     }
 
     #[tokio::test]
