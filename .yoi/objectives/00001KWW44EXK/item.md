@@ -1,18 +1,18 @@
 ---
-title: "Runtime execution workspace materialization and sandboxed agent environments"
+title: "Runtime working directory materialization and sandboxed agent environments"
 state: "active"
 created_at: "2026-07-06T16:28:12Z"
-updated_at: "2026-07-06T16:28:12Z"
+updated_at: "2026-07-07T12:40:00Z"
 linked_tickets: ["00001KWPC13WQ", "00001KWMBAA6V"]
 ---
 
 ## Goal
 
-Runtime が Worker ごとに安全で安価な作業環境を用意できるようにする。Yoi の Runtime は、単に既存ディレクトリで Worker process を起動する launcher ではなく、RepositoryPoint から Execution Workspace を materialize し、sandbox / mount / cache / cleanup / evidence を管理する実行基盤になる。
+Runtime が Worker ごとに安全で安価な作業環境を用意できるようにする。Yoi の Runtime は、単に既存ディレクトリで Worker process を起動する launcher ではなく、RepositoryPoint から working directory を materialize し、sandbox / mount / cache / cleanup / evidence を管理する実行基盤になる。
 
-この Objective の中心は、Worktree ライクな作業ディレクトリ管理、Repository cache、Execution Workspace allocation、sandboxed agent environment の境界を設計し、将来的に 1 つの Runtime が複数 Workspace / Repository の Worker を抱えられるようにすることである。
+この Objective の中心は、Worker 用 working directory の materialization、Repository cache、working directory allocation、sandboxed agent environment の境界を設計し、将来的に 1 つの Runtime が複数 Workspace / Repository の Worker を抱えられるようにすることである。
 
-初期実装では Git/local repository を主対象にしてよい。ただし設計は Git worktree 固定にしない。Git worktree、bare object cache、sparse checkout、copy-on-write snapshot、reflink copy、APFS clonefile、btrfs snapshot、overlay filesystem、container filesystem、remote object snapshot は、すべて Execution Workspace materialization strategy の候補として扱う。
+初期実装では Git/local repository を主対象にしてよい。ただし設計は Git worktree 固定にしない。Git worktree、bare object cache、sparse checkout、copy-on-write snapshot、reflink copy、APFS clonefile、btrfs snapshot、overlay filesystem、container filesystem、remote object snapshot は、すべて working directory materialization strategy の候補として扱う。
 
 ## Motivation / background
 
@@ -24,7 +24,7 @@ Runtime が Worker ごとに安全で安価な作業環境を用意できるよ�
 - Worker ごとに full clone すると容量と時間のコストが大きすぎる。
 - `.yoi` / Backend fs-store / Workspace descriptor と、Worker 実行用 checkout / scratch / build output の lifecycle が混ざりやすい。
 
-Yoi は Workspace / Repository / Runtime を分ける方針になっている。Backend は Repository registry、RepositorySelector、RepositoryPoint、Ticket/Artifact evidence の authority を持つ。一方 Runtime は RepositoryPoint を受け取り、Worker が使う Execution Workspace を用意する責務を持つべきである。
+Yoi は Workspace / Repository / Runtime を分ける方針になっている。Backend は Repository registry、RepositorySelector、RepositoryPoint、Ticket/Artifact evidence の authority を持つ。一方 Runtime は RepositoryPoint を受け取り、Worker が使う working directory を用意する責務を持つべきである。
 
 したがって、Repository を持ってくる実体ディレクトリは Backend / Workspace store ではなく Runtime 管理領域に置く。`./.yoi` は local descriptor / compatibility / project record surface であり、Worker ごとの checkout、worktree、snapshot、sandbox root、build cache、dependency cache を置く場所ではない。
 
@@ -32,11 +32,11 @@ Yoi は Workspace / Repository / Runtime を分ける方針になっている。
 
 ## Glossary
 
-- Runtime root: Runtime が自身の store、cache、Worker metadata、Execution Workspace allocation を管理する root。長期的には `~/.yoi/runtimes/<runtime-id>/` 配下など、Workspace backend store とは別に置く。
+- Runtime root: Runtime が自身の store、cache、Worker metadata、working directory allocation を管理する root。長期的には `~/.yoi/runtimes/<runtime-id>/` 配下など、Workspace backend store とは別に置く。
 - Repository cache: Runtime-local の共有 source/cache。Git なら bare mirror / object cache / packfile cache など。重く、長寿命で、複数 Worker allocation から共有される。
-- Execution Workspace: Worker ごとの作業環境。短寿命で、Worker が読み書きする root / mounts / scratch / overlay を含む。
-- Materialization strategy: RepositoryPoint から Execution Workspace を作る実装戦略。Git detached worktree、sparse checkout、CoW snapshot、reflink copy、overlay、container filesystem など。
-- ExecutionWorkspaceAllocation: Runtime が払い出した作業環境の record。allocation id、worker id、workspace id、repository point、materializer kind、root、mounts、cleanup policy、status を持つ。
+- working directory: Worker ごとの作業環境。短寿命で、Worker が読み書きする root / mounts / scratch / overlay を含む。Browser-facing UI/API では `Workspace` と混同しないよう、この呼称に寄せる。`Volume` は storage backing の候補名であり、この作業領域そのものの呼称にはしない。
+- Materialization strategy: RepositoryPoint から working directory を作る実装戦略。Git detached worktree、sparse checkout、CoW snapshot、reflink copy、overlay、container filesystem など。
+- WorkingDirectoryAllocation: Runtime が払い出した作業環境の record。allocation id、worker id、workspace id、repository point、materializer kind、root、mounts、cleanup policy、status を持つ。
 - Sandbox policy: Worker が見られる filesystem、network、process、secret、tool authority の境界を表す policy。
 - Dirty state policy: local uncommitted changes を Worker environment に含めるかどうかの方針。clean point only、patch artifact apply、snapshot current worktree など。
 
@@ -64,7 +64,7 @@ Runtime root
   - config bundles
   - worker metadata / transcript references
   - repository-cache
-  - execution-workspaces
+  - working-directories
   - sandbox state
   - build/dependency cache
   - cleanup ledger
@@ -94,7 +94,7 @@ Runtime root
         git/
           <repository-cache-key>/
             bare.git
-      execution-workspaces/
+      working-directories/
         <allocation-id>/
           root/
           mounts/
@@ -106,14 +106,14 @@ Runtime root
 
 ### 2. clone ではなく materialize と呼ぶ
 
-Runtime は Repository を毎回 clone するのではない。Runtime は RepositoryPoint を Worker 用の Execution Workspace として materialize する。
+Runtime は Repository を毎回 clone するのではない。Runtime は RepositoryPoint を Worker 用の working directory として materialize する。
 
 ```text
 RepositoryId + RepositorySelector
   -> resolved RepositoryPoint
   -> Runtime repository-cache
-  -> ExecutionWorkspaceMaterializer
-  -> ExecutionWorkspaceAllocation
+  -> WorkingDirectoryMaterializer
+  -> WorkingDirectoryAllocation
   -> Worker process
 ```
 
@@ -128,15 +128,15 @@ Git の場合でも materialization strategy は複数あり得る。
 - overlay filesystem
 - external tool backed snapshot, e.g. Rift-like CoW workspace creation
 
-### 3. Repository cache と Worker workspace を分離する
+### 3. Repository cache と Worker working directory を分離する
 
-full clone を Worker ごとに作らない。重い source/object data は Runtime-local repository cache に集約し、Worker ごとの Execution Workspace は cheap allocation にする。
+full clone を Worker ごとに作らない。重い source/object data は Runtime-local repository cache に集約し、Worker ごとの working directory は cheap allocation にする。
 
 Git v0 の方向:
 
 ```text
 repository-cache/git/<repo-key>/bare.git
-execution-workspaces/<allocation-id>/root/<repository-id>/
+working-directories/<allocation-id>/root/<repository-id>/
 ```
 
 初回:
@@ -174,7 +174,7 @@ Dirty state を含める場合、Artifact/evidence には source RepositoryPoint
 
 ### 5. Sandbox を materialization と同じ境界で扱う
 
-Execution Workspace は単なる directory path ではなく、Worker が見てよい filesystem view である。Runtime は Execution Workspace allocation と同時に sandbox/mount/authority を構築する。
+working directory は単なる directory path ではなく、Worker が見てよい filesystem view である。Runtime は working directory allocation と同時に sandbox/mount/authority を構築する。
 
 Worker に渡すもの:
 
@@ -193,18 +193,18 @@ Worker が自分で発見してはいけないもの:
 - `.yoi` authority-bearing internals
 - raw credentials
 - Runtime socket/store/cache internals
-- sibling Worker workspaces
+- sibling Worker working directories
 
 Sandbox v0 は strong isolation でなくてもよい。ただし型と lifecycle は、後で container sandbox、namespace, mount filtering, network policy, secret boundary に拡張できる形にする。
 
-### 6. Execution Workspace registry を持つ
+### 6. working directory registry を持つ
 
 Runtime は materialized workspace を filesystem だけでなく registry でも管理する。
 
 必要な record:
 
 ```text
-ExecutionWorkspaceAllocation
+WorkingDirectoryAllocation
   id
   runtime_id
   worker_id
@@ -228,7 +228,7 @@ ExecutionWorkspaceAllocation
 
 ### 7. Heavy regenerable artifacts は policy で除外または cache 化する
 
-Worker workspace creation では、`node_modules`, `target`, `.venv`, framework cache, dist, build, coverage などを無条件に full copy しない。
+Worker working directory creation では、`node_modules`, `target`, `.venv`, framework cache, dist, build, coverage などを無条件に full copy しない。
 
 Materialization policy は以下を持てるようにする。
 
@@ -245,26 +245,26 @@ Rift の filtered CoW creation のように、重い artifacts を除外しな�
 
 ### Phase 1: Materialization boundary and legacy allocation record
 
-- `CreateWorkerRequest` に Execution Workspace request / target placeholder を追加する。
-- `ExecutionWorkspaceMaterializer` trait を `worker-runtime` に追加する。
+- `CreateWorkerRequest` に working directory request / target placeholder を追加する。
+- `WorkingDirectoryMaterializer` trait を `worker-runtime` に追加する。
 - `WorkerRuntimeExecutionBackend` が Worker spawn 前に materializer を呼ぶ順序にする。
 - v0 materializer は existing local root を explicit allocation として返してよいが、`direct_legacy_mount` として明示し、通常設計の final form と混同しない。
 - Allocation record / cleanup policy / diagnostics の型を先に作る。
 - Worker が source repository root を直接 scope として要求する経路を deprecated/legacy に閉じ込める。
 
-### Phase 2: Runtime root and execution workspace storage
+### Phase 2: Runtime root and working directory storage
 
-- `--runtime-root` を導入し、Runtime state / repository-cache / execution-workspaces / worker metadata / worker runtime dirs を Runtime root 配下へ寄せる。
+- `--runtime-root` を導入し、Runtime state / repository-cache / working-directories / worker metadata / worker runtime dirs を Runtime root 配下へ寄せる。
 - `--workspace` は legacy bootstrap input としてだけ扱い、Runtime identity / long-term workspace binding から外す。
 - Runtime root default は user data 配下にする。
-- Execution Workspace allocation registry を Runtime root に保存する。
+- working directory allocation registry を Runtime root に保存する。
 
 ### Phase 3: Git cached detached worktree materializer
 
 - Git repository cache を Runtime root に作る。
 - RepositorySelector を RepositoryPoint に解決する呼び出し境界を作る。
 - resolved commit/tree を evidence として残す。
-- Worker ごとに detached worktree を `execution-workspaces/<allocation-id>/root/<repository-id>` に作る。
+- Worker ごとに detached worktree を `working-directories/<allocation-id>/root/<repository-id>` に作る。
 - Worker stop / cleanup 時に `git worktree remove` と registry cleanup を行う。
 - dirty state は v0 では `clean_point_only` を default にし、dirty local workspace は明示 diagnostic で拒否する。
 
@@ -284,13 +284,13 @@ Rift の filtered CoW creation のように、重い artifacts を除外しな�
 
 - container filesystem / mount namespace / network policy / secret handle / tool authority を Runtime allocation と統合する。
 - Runtime が複数 Workspace / Repository の Worker を同時に抱える場合の namespace、quota、cleanup、audit boundary を固める。
-- remote/self-hosted/hosted Runtime fleet で repository cache と execution workspace storage をどう扱うかを設計する。
+- remote/self-hosted/hosted Runtime fleet で repository cache と working directory storage をどう扱うかを設計する。
 
 ## Non-goals
 
 - v0 で完全な container sandbox を実装すること。
 - Worker ごとに full clone すること。
-- `.yoi` や Backend workspace store に Worker execution workspace を置くこと。
+- `.yoi` や Backend workspace store に Worker working directory を置くこと。
 - Git worktree を唯一の materialization strategy として固定すること。
 - Dirty local changes を暗黙に Worker に渡すこと。
 - Browser-facing API に raw host path、secret、Runtime internal store path を公開すること。
@@ -298,10 +298,10 @@ Rift の filtered CoW creation のように、重い artifacts を除外しな�
 
 ## Success criteria / exit conditions
 
-- Runtime root、Repository cache、Execution Workspace、Backend/Workspace store の境界が文書化されている。
-- Runtime が Worker spawn 前に Execution Workspace materializer を呼ぶ型と順序を持つ。
-- Worker は source repository root ではなく materialized Execution Workspace を scope として起動する。
-- Execution Workspace allocation が Runtime registry に記録され、cleanup policy を持つ。
+- Runtime root、Repository cache、working directory、Backend/Workspace store の境界が文書化されている。
+- Runtime が Worker spawn 前に working directory materializer を呼ぶ型と順序を持つ。
+- Worker は source repository root ではなく materialized working directory を scope として起動する。
+- working directory allocation が Runtime registry に記録され、cleanup policy を持つ。
 - Git/local repository の v0 materializer が full clone 連発ではなく shared cache / detached worktree / cheap allocation の方向に進んでいる。
 - dirty state policy が明示され、clean point、patch artifact、snapshot のどれを使ったか evidence に残せる。
 - Runtime process 起動時の `--workspace` は legacy bootstrap input として隔離され、Runtime identity や single workspace binding とみなされない。
@@ -315,10 +315,10 @@ Rift の filtered CoW creation のように、重い artifacts を除外しな�
 ## Decision context
 
 - Runtime は Worker 群を束ねる実行基盤であり、Worker 用の作業環境を用意する責務を持つ。
-- Repository は clone されるものではなく、RepositoryPoint から Worker 用 Execution Workspace として materialize される。
-- Runtime execution storage は Backend/Workspace store と分離する。`.yoi` は Worker execution workspace 置き場ではない。
+- Repository は clone されるものではなく、RepositoryPoint から Worker 用 working directory として materialize される。
+- Runtime execution storage は Backend/Workspace store と分離する。`.yoi` は Worker working directory 置き場ではない。
 - full clone を Worker ごとに作らない。Runtime-local repository cache と Worker-local cheap workspace allocation を分ける。
 - Git detached worktree は v0 materialization strategy として有力だが、Git worktree 固定の設計にはしない。
 - CoW snapshot / reflink / btrfs snapshot / APFS clonefile / Rift-like workspace creation は、将来の materializer backend として検討する。
 - Dirty local state は暗黙に渡さず、policy と evidence を持って扱う。
-- Sandbox は後付けの別機能ではなく、Execution Workspace allocation と同じ境界で扱う。
+- Sandbox は後付けの別機能ではなく、working directory allocation と同じ境界で扱う。
