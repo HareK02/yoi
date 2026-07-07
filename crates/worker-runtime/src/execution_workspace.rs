@@ -6,16 +6,20 @@ use crate::catalog::{
 use crate::identity::WorkerRef;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const EXECUTION_WORKSPACES_DIR: &str = "execution-workspaces";
 const MATERIALIZATION_RECORD: &str = "materialization.json";
+static NEXT_ALLOCATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionWorkspaceEvidence {
     pub repository_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_selector: Option<String>,
     pub resolved_commit: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_tree: Option<String>,
@@ -40,6 +44,7 @@ impl ExecutionWorkspaceAllocation {
         ExecutionWorkspaceSummary {
             allocation_id: self.id.clone(),
             repository_id: self.repository_id.clone(),
+            requested_selector: self.evidence.requested_selector.clone(),
             materializer_kind: self.materializer_kind.clone(),
             dirty_state_policy: self.dirty_state_policy.clone(),
             resolved_commit: Some(self.evidence.resolved_commit.clone()),
@@ -114,6 +119,31 @@ pub trait ExecutionWorkspaceMaterializer: Send + Sync + 'static {
         request: &ExecutionWorkspaceRequest,
     ) -> Result<ExecutionWorkspaceBinding, ExecutionWorkspaceDiagnostic>;
 
+    fn preallocate(
+        &self,
+        request: &ExecutionWorkspaceRequest,
+    ) -> Result<ExecutionWorkspaceBinding, ExecutionWorkspaceDiagnostic>;
+
+    fn bind_allocation(
+        &self,
+        allocation_id: &str,
+        relative_cwd: Option<&str>,
+    ) -> Result<ExecutionWorkspaceBinding, ExecutionWorkspaceDiagnostic>;
+
+    fn list_allocations(
+        &self,
+    ) -> Result<Vec<ExecutionWorkspaceStatus>, ExecutionWorkspaceDiagnostic>;
+
+    fn allocation_status(
+        &self,
+        allocation_id: &str,
+    ) -> Result<ExecutionWorkspaceStatus, ExecutionWorkspaceDiagnostic>;
+
+    fn cleanup_allocation(
+        &self,
+        allocation_id: &str,
+    ) -> Result<ExecutionWorkspaceStatus, ExecutionWorkspaceDiagnostic>;
+
     fn cleanup(
         &self,
         binding: &ExecutionWorkspaceBinding,
@@ -174,14 +204,41 @@ impl LocalGitWorktreeMaterializer {
             )
         })
     }
-}
 
-impl ExecutionWorkspaceMaterializer for LocalGitWorktreeMaterializer {
-    fn materialize(
+    fn read_binding(
         &self,
-        worker_ref: &WorkerRef,
-        request: &ExecutionWorkspaceRequest,
+        allocation_id: &str,
     ) -> Result<ExecutionWorkspaceBinding, ExecutionWorkspaceDiagnostic> {
+        let allocation_root = self.allocation_root(allocation_id);
+        let path = allocation_root.join(MATERIALIZATION_RECORD);
+        let raw = fs::read(&path).map_err(|_| {
+            ExecutionWorkspaceDiagnostic::new(
+                "execution_workspace_allocation_not_found",
+                "execution workspace allocation was not found",
+            )
+        })?;
+        let record: ExecutionWorkspaceMaterializationRecord = serde_json::from_slice(&raw).map_err(|_| {
+            ExecutionWorkspaceDiagnostic::new(
+                "execution_workspace_record_invalid",
+                "execution workspace allocation record is invalid; backend-private path details were omitted",
+            )
+        })?;
+        Ok(ExecutionWorkspaceBinding {
+            allocation: record.allocation,
+            workspace_root: record.workspace_root.clone(),
+            cwd: record.workspace_root,
+            allocation_root,
+            source_repository_path: record.source_repository_path,
+        })
+    }
+
+    fn materialize_with_allocation_id(
+        &self,
+        allocation_id: String,
+        request: &ExecutionWorkspaceRequest,
+        cleanup_policy: &str,
+    ) -> Result<ExecutionWorkspaceBinding, ExecutionWorkspaceDiagnostic> {
+        validate_allocation_id(&allocation_id)?;
         if request.materializer != MaterializerKind::LocalGitWorktree {
             return Err(ExecutionWorkspaceDiagnostic::new(
                 "execution_workspace_materializer_unsupported",
@@ -248,7 +305,6 @@ impl ExecutionWorkspaceMaterializer for LocalGitWorktreeMaterializer {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
 
-        let allocation_id = Self::allocation_id(worker_ref, &request.repository.id);
         let allocation_root = self.allocation_root(&allocation_id);
         let workspace_root = allocation_root
             .join("root")
@@ -256,7 +312,7 @@ impl ExecutionWorkspaceMaterializer for LocalGitWorktreeMaterializer {
         if workspace_root.exists() {
             return Err(ExecutionWorkspaceDiagnostic::new(
                 "execution_workspace_allocation_exists",
-                "execution workspace allocation target already exists; cleanup or choose a new Worker allocation",
+                "execution workspace allocation target already exists; cleanup or choose a new allocation",
             ));
         }
         fs::create_dir_all(workspace_root.parent().ok_or_else(|| {
@@ -285,12 +341,17 @@ impl ExecutionWorkspaceMaterializer for LocalGitWorktreeMaterializer {
         )?;
 
         let allocation = ExecutionWorkspaceAllocation {
-            id: allocation_id,
+            id: allocation_id.clone(),
             repository_id: request.repository.id.clone(),
             materializer_kind: MaterializerKind::LocalGitWorktree,
             dirty_state_policy: DirtyStatePolicy::CleanPointOnly,
             evidence: ExecutionWorkspaceEvidence {
                 repository_id: request.repository.id.clone(),
+                requested_selector: request
+                    .repository
+                    .selector
+                    .as_ref()
+                    .map(|selector| selector.as_ref().to_string()),
                 resolved_commit,
                 resolved_tree,
                 materializer_kind: MaterializerKind::LocalGitWorktree,
@@ -298,10 +359,10 @@ impl ExecutionWorkspaceMaterializer for LocalGitWorktreeMaterializer {
             },
             cleanup_target: ExecutionWorkspaceCleanupTarget {
                 kind: "git_worktree".to_string(),
-                allocation_id: Self::allocation_id(worker_ref, &request.repository.id),
+                allocation_id,
                 repository_id: request.repository.id.clone(),
             },
-            cleanup_policy: "remove_on_worker_stop".to_string(),
+            cleanup_policy: cleanup_policy.to_string(),
             status: ExecutionWorkspaceStatusKind::Active,
         };
         let binding = ExecutionWorkspaceBinding {
@@ -314,20 +375,128 @@ impl ExecutionWorkspaceMaterializer for LocalGitWorktreeMaterializer {
         self.write_record(&binding)?;
         Ok(binding)
     }
+}
+
+impl ExecutionWorkspaceMaterializer for LocalGitWorktreeMaterializer {
+    fn materialize(
+        &self,
+        worker_ref: &WorkerRef,
+        request: &ExecutionWorkspaceRequest,
+    ) -> Result<ExecutionWorkspaceBinding, ExecutionWorkspaceDiagnostic> {
+        let allocation_id = Self::allocation_id(worker_ref, &request.repository.id);
+        self.materialize_with_allocation_id(allocation_id, request, "remove_on_worker_stop")
+    }
+
+    fn preallocate(
+        &self,
+        request: &ExecutionWorkspaceRequest,
+    ) -> Result<ExecutionWorkspaceBinding, ExecutionWorkspaceDiagnostic> {
+        let allocation_id = next_allocation_id(&request.repository.id);
+        self.materialize_with_allocation_id(allocation_id, request, "manual_or_worker_stop")
+    }
+
+    fn bind_allocation(
+        &self,
+        allocation_id: &str,
+        relative_cwd: Option<&str>,
+    ) -> Result<ExecutionWorkspaceBinding, ExecutionWorkspaceDiagnostic> {
+        validate_allocation_id(allocation_id)?;
+        let binding = self.read_binding(allocation_id)?;
+        if binding.allocation.status != ExecutionWorkspaceStatusKind::Active {
+            return Err(ExecutionWorkspaceDiagnostic::new(
+                "execution_workspace_not_active",
+                "execution workspace allocation is not active",
+            ));
+        }
+        let cwd = validate_relative_cwd(binding.workspace_root(), relative_cwd)?;
+        Ok(ExecutionWorkspaceBinding { cwd, ..binding })
+    }
+
+    fn list_allocations(
+        &self,
+    ) -> Result<Vec<ExecutionWorkspaceStatus>, ExecutionWorkspaceDiagnostic> {
+        let root = self.runtime_root.join(EXECUTION_WORKSPACES_DIR);
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(_) => {
+                return Err(ExecutionWorkspaceDiagnostic::new(
+                    "execution_workspace_list_failed",
+                    "failed to list execution workspace allocations; backend-private path details were omitted",
+                ));
+            }
+        };
+        let mut statuses = Vec::new();
+        for entry in entries.flatten() {
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let allocation_id = entry.file_name().to_string_lossy().to_string();
+            if validate_allocation_id(&allocation_id).is_err() {
+                continue;
+            }
+            if let Ok(status) = self.allocation_status(&allocation_id) {
+                statuses.push(status);
+            }
+        }
+        statuses
+            .sort_by(|left, right| left.summary.allocation_id.cmp(&right.summary.allocation_id));
+        Ok(statuses)
+    }
+
+    fn allocation_status(
+        &self,
+        allocation_id: &str,
+    ) -> Result<ExecutionWorkspaceStatus, ExecutionWorkspaceDiagnostic> {
+        validate_allocation_id(allocation_id)?;
+        Ok(self.read_binding(allocation_id)?.status())
+    }
+
+    fn cleanup_allocation(
+        &self,
+        allocation_id: &str,
+    ) -> Result<ExecutionWorkspaceStatus, ExecutionWorkspaceDiagnostic> {
+        validate_allocation_id(allocation_id)?;
+        let binding = self.read_binding(allocation_id)?;
+        self.cleanup(&binding)?;
+        self.allocation_status(allocation_id)
+    }
 
     fn cleanup(
         &self,
         binding: &ExecutionWorkspaceBinding,
     ) -> Result<(), ExecutionWorkspaceDiagnostic> {
         let mut allocation = binding.allocation.clone();
-        let workspace_root_arg = path_str(binding.workspace_root())?;
+        let allocation_root = binding.allocation_root.canonicalize().map_err(|_| {
+            ExecutionWorkspaceDiagnostic::new(
+                "execution_workspace_cleanup_target_invalid",
+                "execution workspace allocation root is unavailable; backend-private path details were omitted",
+            )
+        })?;
+        let workspace_root = binding.workspace_root.canonicalize().map_err(|_| {
+            ExecutionWorkspaceDiagnostic::new(
+                "execution_workspace_cleanup_target_invalid",
+                "execution workspace root is unavailable; backend-private path details were omitted",
+            )
+        })?;
+        if !workspace_root.starts_with(&allocation_root) {
+            return Err(ExecutionWorkspaceDiagnostic::new(
+                "execution_workspace_cleanup_escape_rejected",
+                "execution workspace cleanup target is outside the allocation root",
+            ));
+        }
+        let workspace_root_arg = path_str(&workspace_root)?;
         let remove_result = git_status(
             binding.source_repository_path(),
             ["worktree", "remove", "--force", workspace_root_arg.as_str()],
         )
         .or_else(|_| {
-            if binding.workspace_root.exists() {
-                fs::remove_dir_all(binding.workspace_root()).map_err(|_| {
+            if workspace_root.exists() {
+                fs::remove_dir_all(&workspace_root).map_err(|_| {
                     ExecutionWorkspaceDiagnostic::new(
                         "execution_workspace_cleanup_failed",
                         "failed to remove execution workspace; backend-private path details were omitted",
@@ -429,6 +598,80 @@ fn sanitize_path_component(value: &str) -> String {
     } else {
         trimmed
     }
+}
+
+fn next_allocation_id(repository_id: &str) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let sequence = NEXT_ALLOCATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "alloc-{now}-{sequence}-{}",
+        sanitize_path_component(repository_id)
+    )
+}
+
+fn validate_allocation_id(allocation_id: &str) -> Result<(), ExecutionWorkspaceDiagnostic> {
+    let sanitized = sanitize_path_component(allocation_id);
+    if allocation_id.is_empty()
+        || allocation_id != sanitized
+        || allocation_id.contains(std::path::MAIN_SEPARATOR)
+        || allocation_id.contains('/')
+        || allocation_id.contains('\\')
+    {
+        return Err(ExecutionWorkspaceDiagnostic::new(
+            "execution_workspace_allocation_id_invalid",
+            "execution workspace allocation id is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_relative_cwd(
+    workspace_root: &Path,
+    relative_cwd: Option<&str>,
+) -> Result<PathBuf, ExecutionWorkspaceDiagnostic> {
+    let workspace_root = workspace_root.canonicalize().map_err(|_| {
+        ExecutionWorkspaceDiagnostic::new(
+            "execution_workspace_root_unavailable",
+            "execution workspace root is unavailable; backend-private path details were omitted",
+        )
+    })?;
+    let relative = relative_cwd.unwrap_or(".").trim();
+    if relative.is_empty() || relative == "." {
+        return Ok(workspace_root);
+    }
+    let relative_path = Path::new(relative);
+    if relative_path.is_absolute()
+        || relative_path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ExecutionWorkspaceDiagnostic::new(
+            "execution_workspace_relative_cwd_invalid",
+            "execution workspace relative_cwd must be a relative path inside the allocation root",
+        ));
+    }
+    let target = workspace_root
+        .join(relative_path)
+        .canonicalize()
+        .map_err(|_| {
+            ExecutionWorkspaceDiagnostic::new(
+                "execution_workspace_relative_cwd_unavailable",
+                "execution workspace relative_cwd does not identify an existing directory",
+            )
+        })?;
+    if !target.starts_with(&workspace_root) || !target.is_dir() {
+        return Err(ExecutionWorkspaceDiagnostic::new(
+            "execution_workspace_relative_cwd_escape_rejected",
+            "execution workspace relative_cwd must resolve to a directory inside the allocation root",
+        ));
+    }
+    Ok(target)
 }
 
 #[cfg(test)]
@@ -573,6 +816,83 @@ mod tests {
             error.code,
             "execution_workspace_repository_provider_unsupported"
         );
+    }
+
+    #[test]
+    fn preallocated_allocation_binds_safe_relative_cwd_and_lists_without_paths() {
+        let repo = create_clean_repo();
+        fs::create_dir_all(repo.path().join("crates/yoi")).unwrap();
+        fs::write(repo.path().join("crates/yoi/lib.rs"), "// ok\n").unwrap();
+        git(repo.path(), &["add", "crates/yoi/lib.rs"]);
+        git(repo.path(), &["commit", "-m", "add crate"]);
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = LocalGitWorktreeMaterializer::new(runtime_root.path());
+        let allocation = materializer.preallocate(&request(repo.path())).unwrap();
+
+        let bound = materializer
+            .bind_allocation(&allocation.allocation.id, Some("crates/yoi"))
+            .unwrap();
+        assert_eq!(bound.cwd.file_name().unwrap(), "yoi");
+        let listed = materializer.list_allocations().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].summary.allocation_id, allocation.allocation.id);
+        assert_eq!(
+            listed[0].summary.requested_selector.as_deref(),
+            Some("HEAD")
+        );
+    }
+
+    #[test]
+    fn relative_cwd_rejects_absolute_parent_nonexistent_file_and_symlink_escape() {
+        let repo = create_clean_repo();
+        fs::create_dir_all(repo.path().join("inside")).unwrap();
+        fs::write(repo.path().join("inside/file.txt"), "file\n").unwrap();
+        git(repo.path(), &["add", "inside/file.txt"]);
+        git(repo.path(), &["commit", "-m", "add inside"]);
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = LocalGitWorktreeMaterializer::new(runtime_root.path());
+        let allocation = materializer.preallocate(&request(repo.path())).unwrap();
+
+        assert_eq!(
+            materializer
+                .bind_allocation(&allocation.allocation.id, Some("/tmp"))
+                .unwrap_err()
+                .code,
+            "execution_workspace_relative_cwd_invalid"
+        );
+        assert_eq!(
+            materializer
+                .bind_allocation(&allocation.allocation.id, Some("../outside"))
+                .unwrap_err()
+                .code,
+            "execution_workspace_relative_cwd_invalid"
+        );
+        assert_eq!(
+            materializer
+                .bind_allocation(&allocation.allocation.id, Some("missing"))
+                .unwrap_err()
+                .code,
+            "execution_workspace_relative_cwd_unavailable"
+        );
+        assert_eq!(
+            materializer
+                .bind_allocation(&allocation.allocation.id, Some("inside/file.txt"))
+                .unwrap_err()
+                .code,
+            "execution_workspace_relative_cwd_escape_rejected"
+        );
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/tmp", allocation.workspace_root().join("escape")).unwrap();
+            assert_eq!(
+                materializer
+                    .bind_allocation(&allocation.allocation.id, Some("escape"))
+                    .unwrap_err()
+                    .code,
+                "execution_workspace_relative_cwd_escape_rejected"
+            );
+        }
     }
 
     #[test]

@@ -374,8 +374,17 @@ where
         }
 
         let mut request = request;
-        let execution_workspace = match request.request.execution_workspace.as_ref() {
-            Some(workspace_request) => {
+        let execution_workspace = match (
+            request.request.execution_workspace.as_ref(),
+            request.request.execution_workspace_allocation.as_ref(),
+        ) {
+            (Some(_), Some(_)) => {
+                return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
+                    WorkerExecutionOperation::Spawn,
+                    "worker spawn cannot specify both execution_workspace and execution_workspace_allocation",
+                ));
+            }
+            (Some(workspace_request), None) => {
                 let Some(materializer) = self.execution_workspace_materializer.as_ref() else {
                     return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
                         WorkerExecutionOperation::Spawn,
@@ -397,7 +406,32 @@ where
                     }
                 }
             }
-            None => None,
+            (None, Some(allocation)) => {
+                let Some(materializer) = self.execution_workspace_materializer.as_ref() else {
+                    return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
+                        WorkerExecutionOperation::Spawn,
+                        "execution workspace allocation requested, but no materializer is configured for this runtime backend",
+                    ));
+                };
+                match materializer.bind_allocation(
+                    &allocation.allocation_id,
+                    allocation.relative_cwd.as_deref(),
+                ) {
+                    Ok(binding) => {
+                        request.execution_workspace = Some(binding.clone());
+                        Some(binding)
+                    }
+                    Err(error) => {
+                        return WorkerExecutionSpawnResult::Rejected(
+                            WorkerExecutionResult::rejected(
+                                WorkerExecutionOperation::Spawn,
+                                error.to_string(),
+                            ),
+                        );
+                    }
+                }
+            }
+            (None, None) => None,
         };
 
         let factory = self.factory.clone();
@@ -747,6 +781,7 @@ mod tests {
             },
             initial_input: None,
             execution_workspace: None,
+            execution_workspace_allocation: None,
         }
     }
 

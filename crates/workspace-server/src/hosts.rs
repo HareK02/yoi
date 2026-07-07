@@ -12,7 +12,8 @@ use std::{
     time::Duration,
 };
 use worker_runtime::catalog::{
-    ConfigBundleRef, CreateWorkerRequest, ExecutionWorkspaceRequest, ProfileSelector,
+    ConfigBundleRef, CreateWorkerRequest, ExecutionWorkspaceAllocationClaim,
+    ExecutionWorkspaceRequest, ExecutionWorkspaceSummary, ProfileSelector,
     WorkerDetail as EmbeddedWorkerDetail, WorkerStatus as EmbeddedWorkerStatus,
 };
 use worker_runtime::config_bundle::{
@@ -238,6 +239,8 @@ pub struct WorkerSummary {
     pub last_seen_at: Option<String>,
     pub implementation: WorkerImplementationSummary,
     pub capabilities: WorkerCapabilitySummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_workspace: Option<ExecutionWorkspaceSummary>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -299,6 +302,8 @@ pub struct WorkerSpawnRequest {
     pub execution_workspace: Option<WorkerSpawnExecutionWorkspaceRequest>,
     #[serde(skip, default)]
     pub resolved_execution_workspace: Option<ExecutionWorkspaceRequest>,
+    #[serde(skip, default)]
+    pub resolved_execution_workspace_allocation: Option<ExecutionWorkspaceAllocationClaim>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1138,6 +1143,11 @@ impl EmbeddedWorkerRuntime {
                 can_stop: self.can_stop_embedded_worker(summary.status, &summary.execution),
                 can_spawn_followup: false,
             },
+            execution_workspace: summary
+                .execution
+                .execution_workspace
+                .clone()
+                .map(|status| status.summary),
             diagnostics: embedded_worker_projection_diagnostics(&summary.execution),
         }
     }
@@ -1167,6 +1177,11 @@ impl EmbeddedWorkerRuntime {
                 can_stop: self.can_stop_embedded_worker(detail.status, &detail.execution),
                 can_spawn_followup: false,
             },
+            execution_workspace: detail
+                .execution
+                .execution_workspace
+                .clone()
+                .map(|status| status.summary),
             diagnostics: embedded_worker_projection_diagnostics(&detail.execution),
         }
     }
@@ -1342,6 +1357,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             config_bundle,
             initial_input: request.initial_input.clone(),
             execution_workspace: request.resolved_execution_workspace.clone(),
+            execution_workspace_allocation: request.resolved_execution_workspace_allocation.clone(),
         };
         match self.runtime.create_worker(create_request) {
             Ok(detail) => {
@@ -1817,6 +1833,7 @@ impl RemoteWorkerRuntime {
                 can_stop: runtime_worker_can_stop(true, summary.status, &summary.execution),
                 can_spawn_followup: false,
             },
+            execution_workspace: summary.execution.execution_workspace.clone().map(|status| status.summary),
             diagnostics: vec![diagnostic(
                 "remote_runtime_projection",
                 DiagnosticSeverity::Info,
@@ -1850,6 +1867,7 @@ impl RemoteWorkerRuntime {
                 can_stop: runtime_worker_can_stop(true, detail.status, &detail.execution),
                 can_spawn_followup: false,
             },
+            execution_workspace: detail.execution.execution_workspace.clone().map(|status| status.summary),
             diagnostics: vec![diagnostic(
                 "remote_runtime_projection",
                 DiagnosticSeverity::Info,
@@ -2015,6 +2033,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             config_bundle,
             initial_input: request.initial_input.clone(),
             execution_workspace: request.resolved_execution_workspace.clone(),
+            execution_workspace_allocation: request.resolved_execution_workspace_allocation.clone(),
         };
         match self.post_json::<_, RuntimeHttpWorkerResponse>("/v1/workers", &create) {
             Ok(response) => WorkerSpawnResult {
@@ -2825,6 +2844,7 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> WorkerSummary {
             can_stop: false,
             can_spawn_followup: false,
         },
+        execution_workspace: None,
         diagnostics: vec![diagnostic(
             "runtime_capability_unsupported",
             DiagnosticSeverity::Info,
@@ -3020,6 +3040,7 @@ mod tests {
                         can_stop: false,
                         can_spawn_followup: false,
                     },
+                    execution_workspace: None,
                     diagnostics: Vec::new(),
                 }],
             }
@@ -3172,6 +3193,7 @@ mod tests {
             initial_input: None,
             execution_workspace: None,
             resolved_execution_workspace: None,
+            resolved_execution_workspace_allocation: None,
         }
     }
 
@@ -3303,6 +3325,7 @@ mod tests {
                     initial_input: None,
                     execution_workspace: None,
                     resolved_execution_workspace: None,
+                    resolved_execution_workspace_allocation: None,
                 },
             )
             .unwrap();
@@ -3404,6 +3427,7 @@ mod tests {
                     initial_input: None,
                     execution_workspace: None,
                     resolved_execution_workspace: None,
+                    resolved_execution_workspace_allocation: None,
                 },
             )
             .unwrap();
@@ -3434,6 +3458,7 @@ mod tests {
                     initial_input: None,
                     execution_workspace: None,
                     resolved_execution_workspace: None,
+                    resolved_execution_workspace_allocation: None,
                 },
             )
             .unwrap();

@@ -12,7 +12,9 @@ use chrono::{SecondsFormat, Utc};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use worker_runtime::execution_workspace::LocalGitWorktreeMaterializer;
+use worker_runtime::execution_workspace::{
+    ExecutionWorkspaceDiagnostic, ExecutionWorkspaceMaterializer, LocalGitWorktreeMaterializer,
+};
 use worker_runtime::worker_backend::WorkerRuntimeExecutionBackend;
 
 use crate::companion::{
@@ -43,7 +45,8 @@ use crate::repositories::{
 use crate::store::{ControlPlaneStore, WorkspaceRecord};
 use crate::{Error, Result};
 use worker_runtime::catalog::{
-    ConfigBundleRef, DirtyStatePolicy, ExecutionWorkspaceRepository, ExecutionWorkspaceRequest,
+    ConfigBundleRef, DirtyStatePolicy, ExecutionWorkspaceAllocationClaim,
+    ExecutionWorkspaceRepository, ExecutionWorkspaceRequest, ExecutionWorkspaceSummary,
     MaterializerKind, ProfileSelector, RepositorySelector as RuntimeRepositorySelector,
 };
 use worker_runtime::config_bundle::ConfigBundle;
@@ -151,10 +154,14 @@ pub struct WorkspaceApi {
     runtime: Arc<RuntimeRegistry>,
     companion: Arc<CompanionConsole>,
     observation_proxy: BackendObservationProxy,
+    execution_workspace_materializer: Arc<LocalGitWorktreeMaterializer>,
 }
 
 impl WorkspaceApi {
     pub async fn new(config: ServerConfig, store: Arc<dyn ControlPlaneStore>) -> Result<Self> {
+        let materializer = Arc::new(LocalGitWorktreeMaterializer::new(
+            config.embedded_runtime_store_root.clone(),
+        ));
         let execution_backend =
             WorkerRuntimeExecutionBackend::from_workspace(config.workspace_root.clone())
                 .map_err(|err| {
@@ -162,9 +169,7 @@ impl WorkspaceApi {
                         "failed to initialize embedded Worker backend: {err}"
                     ))
                 })?
-                .with_execution_workspace_materializer(LocalGitWorktreeMaterializer::new(
-                    config.embedded_runtime_store_root.clone(),
-                ));
+                .with_execution_workspace_materializer((*materializer).clone());
         Self::new_with_execution_backend(config, store, Arc::new(execution_backend)).await
     }
 
@@ -199,6 +204,9 @@ impl WorkspaceApi {
         let runtime = Arc::new(runtime);
         let companion = Arc::new(CompanionConsole::new(runtime.clone()));
         let observation_proxy = BackendObservationProxy::new(config.runtime_event_sources.clone());
+        let execution_workspace_materializer = Arc::new(LocalGitWorktreeMaterializer::new(
+            config.embedded_runtime_store_root.clone(),
+        ));
         Ok(Self {
             records: LocalProjectRecordReader::new(config.workspace_root.clone()),
             config,
@@ -206,6 +214,7 @@ impl WorkspaceApi {
             runtime,
             companion,
             observation_proxy,
+            execution_workspace_materializer,
         })
     }
 
@@ -261,6 +270,14 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         )
         .route("/api/hosts", get(list_hosts))
         .route("/api/w/{workspace_id}/hosts", get(scoped_list_hosts))
+        .route(
+            "/api/w/{workspace_id}/execution-workspaces",
+            get(scoped_list_execution_workspaces).post(scoped_create_execution_workspace),
+        )
+        .route(
+            "/api/w/{workspace_id}/execution-workspaces/{allocation_id}",
+            get(scoped_execution_workspace_detail).delete(scoped_cleanup_execution_workspace),
+        )
         .route("/api/runtimes", get(list_runtimes))
         .route("/api/w/{workspace_id}/runtimes", get(scoped_list_runtimes))
         .route(
@@ -530,6 +547,8 @@ pub struct WorkerLaunchOptionsResponse {
     pub workspace_id: String,
     pub runtimes: Vec<WorkerLaunchRuntimeOption>,
     pub profiles: Vec<WorkerLaunchProfileCandidate>,
+    pub repositories: Vec<ExecutionWorkspaceRepositoryOption>,
+    pub execution_workspaces: Vec<ExecutionWorkspaceSummary>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -550,6 +569,68 @@ pub struct WorkerLaunchProfileCandidate {
     pub description: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionWorkspaceRepositoryOption {
+    pub id: String,
+    pub display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_selector: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BrowserExecutionWorkspaceCreatePolicy {
+    #[serde(default)]
+    pub dirty_state: BrowserExecutionWorkspaceDirtyStatePolicy,
+    #[serde(default)]
+    pub cleanup: BrowserExecutionWorkspaceCleanupPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserExecutionWorkspaceDirtyStatePolicy {
+    #[default]
+    CleanPointOnly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserExecutionWorkspaceCleanupPolicy {
+    #[default]
+    ManualOrWorkerStop,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserExecutionWorkspaceCreateRequest {
+    pub repository_id: String,
+    #[serde(default)]
+    pub selector: Option<String>,
+    #[serde(default)]
+    pub policy: BrowserExecutionWorkspaceCreatePolicy,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BrowserExecutionWorkspaceListResponse {
+    pub workspace_id: String,
+    pub items: Vec<ExecutionWorkspaceSummary>,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BrowserExecutionWorkspaceDetailResponse {
+    pub workspace_id: String,
+    pub item: ExecutionWorkspaceSummary,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserWorkerExecutionWorkspaceSelection {
+    pub allocation_id: String,
+    #[serde(default)]
+    pub relative_cwd: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserCreateWorkerRequest {
@@ -558,7 +639,7 @@ pub struct BrowserCreateWorkerRequest {
     pub profile: String,
     pub initial_text: String,
     #[serde(default)]
-    pub repository_id: Option<String>,
+    pub execution_workspace: Option<BrowserWorkerExecutionWorkspaceSelection>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -658,6 +739,12 @@ struct ScopedHostPath {
 struct ScopedRuntimePath {
     workspace_id: String,
     runtime_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScopedExecutionWorkspacePath {
+    workspace_id: String,
+    allocation_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -795,6 +882,87 @@ async fn scoped_get_worker_launch_options(
 ) -> ApiResult<Json<WorkerLaunchOptionsResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     get_worker_launch_options(State(api)).await
+}
+
+async fn scoped_list_execution_workspaces(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<BrowserExecutionWorkspaceListResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let items = execution_workspace_summaries(&api)?;
+    Ok(Json(BrowserExecutionWorkspaceListResponse {
+        workspace_id: api.config.workspace_id.clone(),
+        items,
+        diagnostics: Vec::new(),
+    }))
+}
+
+async fn scoped_create_execution_workspace(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Json(request): Json<BrowserExecutionWorkspaceCreateRequest>,
+) -> ApiResult<Json<BrowserExecutionWorkspaceDetailResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let workspace_request = execution_workspace_request_for_browser(&api, request)?;
+    let binding = api
+        .execution_workspace_materializer
+        .preallocate(&workspace_request)
+        .map_err(|diagnostic| {
+            ApiError::from(Error::RuntimeOperationFailed {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                code: diagnostic.code,
+                message: diagnostic.message,
+            })
+        })?;
+    Ok(Json(BrowserExecutionWorkspaceDetailResponse {
+        workspace_id: api.config.workspace_id.clone(),
+        item: binding.status().summary,
+        diagnostics: Vec::new(),
+    }))
+}
+
+async fn scoped_execution_workspace_detail(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedExecutionWorkspacePath>,
+) -> ApiResult<Json<BrowserExecutionWorkspaceDetailResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let status = api
+        .execution_workspace_materializer
+        .allocation_status(&path.allocation_id)
+        .map_err(|diagnostic| {
+            ApiError::from(Error::RuntimeOperationFailed {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                code: diagnostic.code,
+                message: diagnostic.message,
+            })
+        })?;
+    Ok(Json(BrowserExecutionWorkspaceDetailResponse {
+        workspace_id: api.config.workspace_id.clone(),
+        item: status.summary,
+        diagnostics: Vec::new(),
+    }))
+}
+
+async fn scoped_cleanup_execution_workspace(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedExecutionWorkspacePath>,
+) -> ApiResult<Json<BrowserExecutionWorkspaceDetailResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let status = api
+        .execution_workspace_materializer
+        .cleanup_allocation(&path.allocation_id)
+        .map_err(|diagnostic| {
+            ApiError::from(Error::RuntimeOperationFailed {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                code: diagnostic.code,
+                message: diagnostic.message,
+            })
+        })?;
+    Ok(Json(BrowserExecutionWorkspaceDetailResponse {
+        workspace_id: api.config.workspace_id.clone(),
+        item: status.summary,
+        diagnostics: Vec::new(),
+    }))
 }
 
 async fn scoped_get_runtime_connection_settings(
@@ -1428,35 +1596,6 @@ fn configured_execution_workspace_request(
     ))
 }
 
-fn default_execution_workspace_request(
-    config: &ServerConfig,
-    repository_id: Option<&str>,
-) -> Result<Option<ExecutionWorkspaceRequest>> {
-    let repository = match repository_id {
-        Some(id) => config
-            .repositories
-            .iter()
-            .find(|repository| repository.id == id)
-            .ok_or_else(|| {
-                Error::Config(format!(
-                    "unknown repository id `{id}` for Worker execution workspace"
-                ))
-            })?,
-        None => match config.repositories.as_slice() {
-            [] => return Ok(None),
-            [repository] => repository,
-            repositories => repositories
-                .iter()
-                .find(|repository| repository.id == "main")
-                .unwrap_or(&repositories[0]),
-        },
-    };
-
-    Ok(Some(execution_workspace_request_from_repository(
-        repository, None,
-    )))
-}
-
 async fn create_workspace_worker(
     State(api): State<WorkspaceApi>,
     Json(request): Json<BrowserCreateWorkerRequest>,
@@ -1482,8 +1621,33 @@ async fn create_workspace_worker(
             content: initial_text,
         })
     };
-    let execution_workspace =
-        default_execution_workspace_request(&api.config, request.repository_id.as_deref())?;
+    let resolved_execution_workspace_allocation =
+        request
+            .execution_workspace
+            .map(|selection| ExecutionWorkspaceAllocationClaim {
+                allocation_id: selection.allocation_id,
+                relative_cwd: selection.relative_cwd,
+            });
+    if resolved_execution_workspace_allocation.is_some()
+        && request.runtime_id != EMBEDDED_WORKER_RUNTIME_ID
+    {
+        return Err(Error::RuntimeOperationFailed {
+            runtime_id: request.runtime_id.clone(),
+            code: "execution_workspace_runtime_unsupported".to_string(),
+            message: "preallocated execution workspaces are only supported by the embedded local runtime in v0".to_string(),
+        }
+        .into());
+    }
+    if let Some(allocation) = resolved_execution_workspace_allocation.as_ref() {
+        api.execution_workspace_materializer
+            .bind_allocation(
+                &allocation.allocation_id,
+                allocation.relative_cwd.as_deref(),
+            )
+            .map_err(|diagnostic| {
+                execution_workspace_api_error(request.runtime_id.clone(), diagnostic)
+            })?;
+    }
     let result = api
         .runtime
         .spawn_worker(
@@ -1497,7 +1661,8 @@ async fn create_workspace_worker(
                 profile: Some(profile_selector),
                 initial_input,
                 execution_workspace: None,
-                resolved_execution_workspace: execution_workspace,
+                resolved_execution_workspace: None,
+                resolved_execution_workspace_allocation,
             },
         )
         .map_err(|err| err.into_error())?;
@@ -2523,8 +2688,73 @@ fn worker_launch_options_response(api: &WorkspaceApi) -> WorkerLaunchOptionsResp
         workspace_id: api.config.workspace_id.clone(),
         runtimes,
         profiles: worker_profile_candidates(),
+        repositories: execution_workspace_repository_options(api),
+        execution_workspaces: execution_workspace_summaries(api).unwrap_or_default(),
         diagnostics: Vec::new(),
     }
+}
+
+fn execution_workspace_repository_options(
+    api: &WorkspaceApi,
+) -> Vec<ExecutionWorkspaceRepositoryOption> {
+    api.config
+        .repositories
+        .iter()
+        .map(|repository| ExecutionWorkspaceRepositoryOption {
+            id: repository.id.clone(),
+            display_name: repository
+                .display_name
+                .clone()
+                .unwrap_or_else(|| repository.id.clone()),
+            default_selector: repository.default_selector.clone(),
+        })
+        .collect()
+}
+
+fn execution_workspace_summaries(api: &WorkspaceApi) -> ApiResult<Vec<ExecutionWorkspaceSummary>> {
+    api.execution_workspace_materializer
+        .list_allocations()
+        .map(|items| items.into_iter().map(|status| status.summary).collect())
+        .map_err(|diagnostic| {
+            ApiError::from(Error::RuntimeOperationFailed {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                code: diagnostic.code,
+                message: diagnostic.message,
+            })
+        })
+}
+
+fn execution_workspace_request_for_browser(
+    api: &WorkspaceApi,
+    request: BrowserExecutionWorkspaceCreateRequest,
+) -> ApiResult<ExecutionWorkspaceRequest> {
+    let repository = api
+        .config
+        .repositories
+        .iter()
+        .find(|repository| repository.id == request.repository_id)
+        .ok_or_else(|| Error::UnknownRepository(request.repository_id.clone()))?;
+    let selector = request
+        .selector
+        .or_else(|| repository.default_selector.clone())
+        .filter(|selector| !selector.trim().is_empty());
+    match request.policy.dirty_state {
+        BrowserExecutionWorkspaceDirtyStatePolicy::CleanPointOnly => {}
+    }
+    match request.policy.cleanup {
+        BrowserExecutionWorkspaceCleanupPolicy::ManualOrWorkerStop => {}
+    }
+    Ok(ExecutionWorkspaceRequest {
+        repository: ExecutionWorkspaceRepository {
+            id: repository.id.clone(),
+            provider: "git".to_string(),
+            uri: repository.path.to_string_lossy().to_string(),
+            local_path: Some(repository.path.clone()),
+            selector: selector.map(RuntimeRepositorySelector),
+        },
+        materializer: MaterializerKind::LocalGitWorktree,
+        dirty_state_policy: DirtyStatePolicy::CleanPointOnly,
+    })
 }
 
 fn worker_profile_candidates() -> Vec<WorkerLaunchProfileCandidate> {
@@ -2589,6 +2819,24 @@ fn worker_create_not_accepted_error(
             message: "Runtime did not accept worker creation".to_string(),
         },
         diagnostics,
+    )
+}
+
+fn execution_workspace_api_error(
+    runtime_id: String,
+    diagnostic: ExecutionWorkspaceDiagnostic,
+) -> ApiError {
+    ApiError::with_diagnostics(
+        Error::RuntimeOperationFailed {
+            runtime_id,
+            code: diagnostic.code.clone(),
+            message: diagnostic.message.clone(),
+        },
+        vec![RuntimeDiagnostic {
+            code: diagnostic.code,
+            severity: DiagnosticSeverity::Error,
+            message: diagnostic.message,
+        }],
     )
 }
 
@@ -2920,6 +3168,7 @@ impl IntoResponse for ApiError {
                 if code.starts_with("workspace_settings_")
                     || code.starts_with("invalid_")
                     || code.starts_with("unsupported_worker_profile")
+                    || code.starts_with("execution_workspace_")
                     || code.ends_with("_already_exists")
                     || code.ends_with("_not_config_managed")
                     || code.ends_with("_unsupported") =>
@@ -3092,6 +3341,40 @@ mod tests {
         config
     }
 
+    fn init_clean_git_workspace(path: &std::path::Path) {
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "Yoi Test"],
+        ] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        std::fs::write(path.join("README.md"), "clean\n").unwrap();
+        std::fs::write(
+            path.join(".gitignore"),
+            ".yoi/\n.test-embedded-runtime-store/\n",
+        )
+        .unwrap();
+        for args in [
+            vec!["add", "README.md", ".gitignore"],
+            vec!["commit", "-m", "init"],
+        ] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+    }
+
     async fn test_app(workspace_root: impl Into<PathBuf>) -> Router {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
         let api = WorkspaceApi::new_with_execution_backend(
@@ -3136,6 +3419,7 @@ mod tests {
             },
             initial_input: None,
             execution_workspace: None,
+            execution_workspace_allocation: None,
         }
     }
 
@@ -3148,6 +3432,98 @@ mod tests {
         runtime.store_config_bundle(runtime_test_bundle()).unwrap();
         let worker = runtime.create_worker(runtime_create_request()).unwrap();
         (runtime, worker.worker_ref)
+    }
+
+    #[tokio::test]
+    async fn browser_execution_workspace_preallocate_list_detail_and_cleanup_are_path_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let app = test_app(dir.path()).await;
+        let workspace_path = format!("/api/w/{TEST_WORKSPACE_ID}/execution-workspaces");
+
+        let created = post_json(
+            app.clone(),
+            &workspace_path,
+            serde_json::json!({
+                "repository_id": TEST_REPOSITORY_ID,
+                "selector": "HEAD",
+                "policy": { "dirty_state": "clean_point_only", "cleanup": "manual_or_worker_stop" }
+            }),
+        )
+        .await;
+        let allocation_id = created["item"]["allocation_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(created["item"]["repository_id"], TEST_REPOSITORY_ID);
+        assert_eq!(created["item"]["requested_selector"], "HEAD");
+        assert_eq!(created["item"]["status"], "active");
+        let projected = serde_json::to_string(&created).unwrap();
+        assert!(!projected.contains(dir.path().to_string_lossy().as_ref()));
+
+        let list = get_json(app.clone(), &workspace_path).await;
+        assert_eq!(list["items"].as_array().unwrap().len(), 1);
+        assert_eq!(list["items"][0]["allocation_id"], allocation_id);
+
+        let detail_path = format!("{workspace_path}/{allocation_id}");
+        let detail = get_json(app.clone(), &detail_path).await;
+        assert_eq!(detail["item"]["allocation_id"], allocation_id);
+
+        let removed = request_json(app, "DELETE", &detail_path, None, StatusCode::OK).await;
+        assert_eq!(removed["item"]["status"], "removed");
+    }
+
+    #[tokio::test]
+    async fn scoped_worker_create_invalid_relative_cwd_returns_typed_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(dir.path());
+        let app = test_app(dir.path()).await;
+        let workspaces_path = format!("/api/w/{TEST_WORKSPACE_ID}/execution-workspaces");
+        let created = post_json(
+            app.clone(),
+            &workspaces_path,
+            serde_json::json!({
+                "repository_id": TEST_REPOSITORY_ID,
+                "selector": "HEAD",
+                "policy": { "dirty_state": "clean_point_only", "cleanup": "manual_or_worker_stop" }
+            }),
+        )
+        .await;
+        let allocation_id = created["item"]["allocation_id"].as_str().unwrap();
+
+        let response = request_json(
+            app,
+            "POST",
+            &format!("/api/w/{TEST_WORKSPACE_ID}/workers"),
+            Some(serde_json::json!({
+                "runtime_id": EMBEDDED_WORKER_RUNTIME_ID,
+                "display_name": "Coding Worker",
+                "profile": "builtin:coder",
+                "initial_text": "",
+                "execution_workspace": {
+                    "allocation_id": allocation_id,
+                    "relative_cwd": "../escape"
+                }
+            })),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert!(
+            response["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "execution_workspace_relative_cwd_invalid"),
+            "expected typed relative_cwd diagnostic, got {response}"
+        );
+        assert!(
+            response["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("execution_workspace_relative_cwd_invalid")
+        );
+        let projected = serde_json::to_string(&response).unwrap();
+        assert!(!projected.contains(dir.path().to_string_lossy().as_ref()));
     }
 
     #[tokio::test]
@@ -4005,6 +4381,7 @@ mod tests {
                     initial_input: None,
                     execution_workspace: None,
                     resolved_execution_workspace: None,
+                    resolved_execution_workspace_allocation: None,
                 },
             )
             .expect("spawn worker");

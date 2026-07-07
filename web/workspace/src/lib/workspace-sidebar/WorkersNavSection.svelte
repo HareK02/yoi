@@ -4,6 +4,7 @@
   import { buildBrowserCreateWorkerRequest, defaultWorkerLaunchForm } from './worker-launch';
   import type {
     BrowserCreateWorkerResponse,
+    BrowserExecutionWorkspaceCreateResponse,
     ListResponse,
     Worker,
     WorkerLaunchOptionsResponse,
@@ -35,6 +36,11 @@
   let runtimeId = $state('');
   let profile = $state('builtin:coder');
   let initialText = $state('');
+  let executionWorkspaceAllocationId = $state('');
+  let executionWorkspaceRepositoryId = $state('');
+  let executionWorkspaceSelector = $state('HEAD');
+  let relativeCwd = $state('');
+  let creatingWorkspace = $state(false);
 
   $effect(() => {
     if (!workspaceId) {
@@ -96,15 +102,56 @@
         display_name: displayName,
         profile,
         initial_text: initialText,
+        execution_workspace_allocation_id: executionWorkspaceAllocationId,
+        execution_workspace_repository_id: executionWorkspaceRepositoryId,
+        execution_workspace_selector: executionWorkspaceSelector,
+        relative_cwd: relativeCwd,
       });
       runtimeId = form.runtime_id;
       displayName = form.display_name;
       profile = form.profile;
+      executionWorkspaceAllocationId = form.execution_workspace_allocation_id;
+      executionWorkspaceRepositoryId = form.execution_workspace_repository_id;
+      executionWorkspaceSelector = form.execution_workspace_selector;
+      relativeCwd = form.relative_cwd;
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
         return;
       }
       optionsError = err instanceof Error ? err.message : 'worker launch options failed';
+    }
+  }
+
+  async function createExecutionWorkspace() {
+    if (!executionWorkspaceRepositoryId) {
+      submitError = 'select a repository before creating an execution workspace';
+      return;
+    }
+    creatingWorkspace = true;
+    submitError = null;
+    try {
+      const response = await fetch(workerApiPath('/execution-workspaces'), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          repository_id: executionWorkspaceRepositoryId,
+          selector: executionWorkspaceSelector || null,
+          policy: { dirty_state: 'clean_point_only', cleanup: 'manual_or_worker_stop' },
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(await responseErrorMessage(response, 'execution workspace create failed'));
+      }
+      const payload = (await response.json()) as BrowserExecutionWorkspaceCreateResponse;
+      const items = options?.execution_workspaces ?? [];
+      options = options
+        ? { ...options, execution_workspaces: [...items.filter((item) => item.allocation_id !== payload.item.allocation_id), payload.item] }
+        : options;
+      executionWorkspaceAllocationId = payload.item.allocation_id;
+    } catch (err) {
+      submitError = err instanceof Error ? err.message : 'execution workspace create failed';
+    } finally {
+      creatingWorkspace = false;
     }
   }
 
@@ -125,6 +172,10 @@
           display_name: displayName,
           profile,
           initial_text: initialText,
+          execution_workspace_allocation_id: executionWorkspaceAllocationId,
+          execution_workspace_repository_id: executionWorkspaceRepositoryId,
+          execution_workspace_selector: executionWorkspaceSelector,
+          relative_cwd: relativeCwd,
         })),
       });
       if (!response.ok) {
@@ -200,6 +251,43 @@
           {/if}
         </select>
       </label>
+      <fieldset class="worker-execution-workspace">
+        <legend>Execution workspace</legend>
+        <label>
+          <span>Allocation</span>
+          <select bind:value={executionWorkspaceAllocationId}>
+            <option value="">No allocation selected</option>
+            {#each options?.execution_workspaces ?? [] as workspace}
+              <option value={workspace.allocation_id} disabled={workspace.status !== 'active'}>
+                {workspace.repository_id} · {workspace.requested_selector ?? 'HEAD'} · {workspace.resolved_commit.slice(0, 12)} · {workspace.status}
+              </option>
+            {/each}
+          </select>
+        </label>
+        <label>
+          <span>Repository for new allocation</span>
+          <select bind:value={executionWorkspaceRepositoryId}>
+            {#if options?.repositories.length}
+              {#each options.repositories as repository}
+                <option value={repository.id}>{repository.display_name}</option>
+              {/each}
+            {:else}
+              <option value="" disabled>No configured repositories</option>
+            {/if}
+          </select>
+        </label>
+        <label>
+          <span>Selector</span>
+          <input bind:value={executionWorkspaceSelector} autocomplete="off" placeholder="HEAD" />
+        </label>
+        <button type="button" disabled={creatingWorkspace || !executionWorkspaceRepositoryId} onclick={() => void createExecutionWorkspace()}>
+          {creatingWorkspace ? 'Allocating…' : 'Create execution workspace'}
+        </button>
+        <label>
+          <span>Relative cwd</span>
+          <input bind:value={relativeCwd} autocomplete="off" placeholder="Optional path inside allocation" />
+        </label>
+      </fieldset>
       <label>
         <span>Initial text</span>
         <textarea bind:value={initialText} rows="3" placeholder="Optional first instruction"></textarea>
@@ -210,7 +298,7 @@
       {#if submitError}
         <p class="section-state error">{submitError}</p>
       {/if}
-      <button type="submit" disabled={submitting || !runtimeId || !profile}>
+      <button type="submit" disabled={submitting || !runtimeId || !profile || !executionWorkspaceAllocationId}>
         {submitting ? 'Starting…' : 'Start Coding Worker'}
       </button>
     </form>
@@ -234,6 +322,7 @@
             </span>
             <span class="item-meta">
               {worker.role ? `${worker.role} · ` : ''}{worker.state} · {worker.status} · 🖥 {worker.host_id}
+              {worker.execution_workspace ? ` · ws:${worker.execution_workspace.repository_id}@${worker.execution_workspace.resolved_commit.slice(0, 8)}` : ''}
             </span>
           </a>
         </li>
