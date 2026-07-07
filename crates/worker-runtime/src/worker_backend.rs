@@ -18,8 +18,8 @@ use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation, WorkerExecutionResult,
     WorkerExecutionRunState, WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
 };
-use crate::execution_workspace::{ExecutionWorkspaceBinding, ExecutionWorkspaceMaterializer};
 use crate::interaction::{WorkerInput, WorkerInputKind};
+use crate::working_directory::{WorkingDirectoryBinding, WorkingDirectoryMaterializer};
 use async_trait::async_trait;
 use manifest::paths;
 use protocol::{Method, Segment, WorkerStatus};
@@ -162,12 +162,12 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         let worker_name = Self::runtime_worker_name(&request);
         let profile = self.runtime_profile(&request);
         let workspace_root = request
-            .execution_workspace
+            .working_directory
             .as_ref()
             .map(|binding| binding.workspace_root().to_path_buf())
             .unwrap_or_else(|| self.workspace_root.clone());
         let cwd = request
-            .execution_workspace
+            .working_directory
             .as_ref()
             .map(|binding| binding.cwd().to_path_buf())
             .unwrap_or_else(|| self.cwd.clone());
@@ -210,14 +210,14 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
 struct RuntimeWorkerExecution {
     handle: WorkerHandle,
     busy: Arc<AtomicBool>,
-    execution_workspace: Option<ExecutionWorkspaceBinding>,
+    working_directory: Option<WorkingDirectoryBinding>,
 }
 
 /// `worker-runtime` execution backend backed by real `worker` crate Workers.
 pub struct WorkerRuntimeExecutionBackend<F = ProfileRuntimeWorkerFactory> {
     backend_id: String,
     factory: Arc<F>,
-    execution_workspace_materializer: Option<Arc<dyn ExecutionWorkspaceMaterializer>>,
+    working_directory_materializer: Option<Arc<dyn WorkingDirectoryMaterializer>>,
     runtime: Mutex<Option<Runtime>>,
     workers: Mutex<HashMap<crate::identity::WorkerRef, RuntimeWorkerExecution>>,
 }
@@ -241,7 +241,7 @@ where
         Ok(Self {
             backend_id: DEFAULT_BACKEND_ID.to_string(),
             factory: Arc::new(factory),
-            execution_workspace_materializer: None,
+            working_directory_materializer: None,
             runtime: Mutex::new(Some(runtime)),
             workers: Mutex::new(HashMap::new()),
         })
@@ -252,11 +252,11 @@ where
         self
     }
 
-    pub fn with_execution_workspace_materializer(
+    pub fn with_working_directory_materializer(
         mut self,
-        materializer: impl ExecutionWorkspaceMaterializer,
+        materializer: impl WorkingDirectoryMaterializer,
     ) -> Self {
-        self.execution_workspace_materializer = Some(Arc::new(materializer));
+        self.working_directory_materializer = Some(Arc::new(materializer));
         self
     }
 
@@ -374,17 +374,26 @@ where
         }
 
         let mut request = request;
-        let execution_workspace = match request.request.execution_workspace.as_ref() {
-            Some(workspace_request) => {
-                let Some(materializer) = self.execution_workspace_materializer.as_ref() else {
+        let working_directory = match (
+            request.request.working_directory.as_ref(),
+            request.request.working_directory_allocation.as_ref(),
+        ) {
+            (Some(_), Some(_)) => {
+                return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
+                    WorkerExecutionOperation::Spawn,
+                    "worker spawn cannot specify both working_directory and working_directory_allocation",
+                ));
+            }
+            (Some(workspace_request), None) => {
+                let Some(materializer) = self.working_directory_materializer.as_ref() else {
                     return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
                         WorkerExecutionOperation::Spawn,
-                        "execution workspace materialization requested, but no materializer is configured for this runtime backend",
+                        "working directory materialization requested, but no materializer is configured for this runtime backend",
                     ));
                 };
                 match materializer.materialize(&request.worker_ref, workspace_request) {
                     Ok(binding) => {
-                        request.execution_workspace = Some(binding.clone());
+                        request.working_directory = Some(binding.clone());
                         Some(binding)
                     }
                     Err(error) => {
@@ -397,7 +406,32 @@ where
                     }
                 }
             }
-            None => None,
+            (None, Some(allocation)) => {
+                let Some(materializer) = self.working_directory_materializer.as_ref() else {
+                    return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
+                        WorkerExecutionOperation::Spawn,
+                        "working directory allocation requested, but no materializer is configured for this runtime backend",
+                    ));
+                };
+                match materializer.bind_allocation(
+                    &allocation.allocation_id,
+                    allocation.relative_cwd.as_deref(),
+                ) {
+                    Ok(binding) => {
+                        request.working_directory = Some(binding.clone());
+                        Some(binding)
+                    }
+                    Err(error) => {
+                        return WorkerExecutionSpawnResult::Rejected(
+                            WorkerExecutionResult::rejected(
+                                WorkerExecutionOperation::Spawn,
+                                error.to_string(),
+                            ),
+                        );
+                    }
+                }
+            }
+            (None, None) => None,
         };
 
         let factory = self.factory.clone();
@@ -410,8 +444,8 @@ where
             Ok(handle) => handle,
             Err(message) => {
                 if let (Some(materializer), Some(binding)) = (
-                    self.execution_workspace_materializer.as_ref(),
-                    execution_workspace.as_ref(),
+                    self.working_directory_materializer.as_ref(),
+                    working_directory.as_ref(),
                 ) {
                     let _ = materializer.cleanup(binding);
                 }
@@ -460,14 +494,14 @@ where
             RuntimeWorkerExecution {
                 handle,
                 busy,
-                execution_workspace: execution_workspace.clone(),
+                working_directory: working_directory.clone(),
             },
         );
 
         WorkerExecutionSpawnResult::Connected {
             handle: WorkerExecutionHandle::new(worker_ref, self.backend_id()),
             run_state: WorkerExecutionRunState::Idle,
-            execution_workspace: execution_workspace.map(|binding| binding.status()),
+            working_directory: working_directory.map(|binding| binding.status()),
         }
     }
 
@@ -558,8 +592,8 @@ where
             WorkerExecutionRunState::Stopped,
         );
         if let (Some(materializer), Some(binding)) = (
-            self.execution_workspace_materializer.as_ref(),
-            execution.execution_workspace.as_ref(),
+            self.working_directory_materializer.as_ref(),
+            execution.working_directory.as_ref(),
         ) {
             let _ = materializer.cleanup(binding);
         }
@@ -593,13 +627,13 @@ mod tests {
 
     use crate::Runtime as EmbeddedRuntime;
     use crate::catalog::{
-        ConfigBundleRef, CreateWorkerRequest, DirtyStatePolicy, ExecutionWorkspaceRepository,
-        ExecutionWorkspaceRequest, MaterializerKind, ProfileSelector, RepositorySelector,
+        ConfigBundleRef, CreateWorkerRequest, DirtyStatePolicy, MaterializerKind, ProfileSelector,
+        RepositorySelector, WorkingDirectoryRepository, WorkingDirectoryRequest,
     };
-    use crate::execution_workspace::LocalGitWorktreeMaterializer;
     use crate::identity::RuntimeId;
     use crate::management::RuntimeOptions;
     use crate::observation::{TranscriptQuery, TranscriptRole};
+    use crate::working_directory::LocalGitWorktreeMaterializer;
     use async_trait::async_trait;
     use futures::Stream;
     use llm_engine::Engine;
@@ -681,7 +715,7 @@ mod tests {
                 FsWorkerStore::new(&self.worker_metadata_dir).map_err(|err| err.to_string())?,
             );
             let cwd = request
-                .execution_workspace
+                .working_directory
                 .as_ref()
                 .map(|binding| binding.cwd().to_path_buf())
                 .unwrap_or_else(|| self.cwd.clone());
@@ -746,7 +780,8 @@ mod tests {
                 digest: bundle.metadata.digest,
             },
             initial_input: None,
-            execution_workspace: None,
+            working_directory: None,
+            working_directory_allocation: None,
         }
     }
 
@@ -774,9 +809,9 @@ mod tests {
         dir
     }
 
-    fn execution_workspace_request(repo: &std::path::Path) -> ExecutionWorkspaceRequest {
-        ExecutionWorkspaceRequest {
-            repository: ExecutionWorkspaceRepository {
+    fn working_directory_request(repo: &std::path::Path) -> WorkingDirectoryRequest {
+        WorkingDirectoryRequest {
+            repository: WorkingDirectoryRepository {
                 id: "repo-main".to_string(),
                 provider: "git".to_string(),
                 uri: ".".to_string(),
@@ -885,7 +920,7 @@ mod tests {
         };
         let backend = WorkerRuntimeExecutionBackend::new(factory)
             .unwrap()
-            .with_execution_workspace_materializer(LocalGitWorktreeMaterializer::new(
+            .with_working_directory_materializer(LocalGitWorktreeMaterializer::new(
                 runtime_base.path(),
             ));
         let runtime = EmbeddedRuntime::with_execution_backend(
@@ -898,11 +933,11 @@ mod tests {
         .unwrap();
         runtime.store_config_bundle(test_bundle()).unwrap();
         let mut request = create_request("chat");
-        request.execution_workspace = Some(execution_workspace_request(repo.path()));
+        request.working_directory = Some(working_directory_request(repo.path()));
 
         let detail = runtime.create_worker(request).unwrap();
 
-        assert!(detail.execution.execution_workspace.is_some());
+        assert!(detail.execution.working_directory.is_some());
         let cwds = observed_cwds.lock().unwrap();
         assert_eq!(cwds.len(), 1);
         let cwd = &cwds[0];

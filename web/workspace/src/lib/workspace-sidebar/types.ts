@@ -1,8 +1,8 @@
 import type {
   Event as PodProtocolEvent,
   Method as PodProtocolMethod,
-  Segment as PodProtocolSegment
-} from '$lib/generated/protocol';
+  Segment as PodProtocolSegment,
+} from "$lib/generated/protocol";
 
 export type { PodProtocolEvent, PodProtocolMethod, PodProtocolSegment };
 
@@ -88,10 +88,11 @@ export type Worker = {
   last_seen_at?: string | null;
   implementation: { kind: string; display_hint: string };
   capabilities: WorkerCapabilities;
+  working_directory?: WorkingDirectorySummary | null;
   diagnostics: Diagnostic[];
 };
 
-export type WorkerOperationState = 'accepted' | 'unsupported' | 'rejected';
+export type WorkerOperationState = "accepted" | "unsupported" | "rejected";
 
 export type WorkerLaunchRuntimeOption = {
   runtime_id: string;
@@ -108,10 +109,61 @@ export type WorkerLaunchProfileCandidate = {
   description: string;
 };
 
+export type WorkingDirectoryRepositoryOption = {
+  id: string;
+  display_name: string;
+  default_selector?: string | null;
+};
+
+export type WorkingDirectorySummary = {
+  allocation_id: string;
+  repository_id: string;
+  requested_selector?: string | null;
+  materializer_kind: string;
+  dirty_state_policy: string;
+  resolved_commit: string;
+  resolved_tree?: string | null;
+  status: string;
+  cleanup_policy: string;
+  cleanup_target: {
+    kind: string;
+    allocation_id: string;
+    repository_id: string;
+  };
+};
+
+export type BrowserWorkingDirectoryCreateResponse = {
+  workspace_id: string;
+  item: WorkingDirectorySummary;
+  diagnostics: Diagnostic[];
+};
+
+export type BrowserWorkingDirectoryListResponse = {
+  workspace_id: string;
+  items: WorkingDirectorySummary[];
+  diagnostics: Diagnostic[];
+};
+
+export type BrowserWorkerWorkingDirectorySelection = {
+  allocation_id: string;
+  relative_cwd?: string | null;
+};
+
+export type BrowserWorkingDirectoryCreateRequest = {
+  repository_id: string;
+  selector?: string | null;
+  policy?: {
+    dirty_state?: "clean_point_only";
+    cleanup?: "manual_or_worker_stop";
+  };
+};
+
 export type WorkerLaunchOptionsResponse = {
   workspace_id: string;
   runtimes: WorkerLaunchRuntimeOption[];
   profiles: WorkerLaunchProfileCandidate[];
+  repositories: WorkingDirectoryRepositoryOption[];
+  working_directories: WorkingDirectorySummary[];
   diagnostics: Diagnostic[];
 };
 
@@ -135,7 +187,7 @@ export type WorkerInputResult = {
 
 export type WorkerTranscriptItem = {
   sequence: number;
-  role: 'user' | 'assistant' | 'system' | string;
+  role: "user" | "assistant" | "system" | string;
   content: string;
   event_id: number;
 };
@@ -166,8 +218,8 @@ export type ClientWorkerEventWsDiagnostic = {
 };
 
 export type ClientWorkerEventWsFrame =
-  | { kind: 'event'; envelope: ClientWorkerEventWsEnvelope }
-  | { kind: 'diagnostic'; diagnostic: ClientWorkerEventWsDiagnostic };
+  | { kind: "event"; envelope: ClientWorkerEventWsEnvelope }
+  | { kind: "diagnostic"; diagnostic: ClientWorkerEventWsDiagnostic };
 
 export type ListResponse<T> = {
   workspace_id: string;
@@ -297,13 +349,13 @@ export type ObjectiveListResponse = {
 };
 
 export type CompanionState =
-  | 'ready'
-  | 'busy'
-  | 'error'
-  | 'timeout'
-  | 'cancelled'
-  | 'accepted'
-  | 'rejected';
+  | "ready"
+  | "busy"
+  | "error"
+  | "timeout"
+  | "cancelled"
+  | "accepted"
+  | "rejected";
 
 export type CompanionTransportSummary = {
   kind: string;
@@ -320,7 +372,7 @@ export type CompanionStatusResponse = {
 
 export type CompanionTranscriptItem = {
   sequence: number;
-  role: 'user' | 'assistant' | 'system' | string;
+  role: "user" | "assistant" | "system" | string;
   content: string;
   created_at: string;
   source: string;

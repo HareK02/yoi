@@ -85,7 +85,7 @@ Implementation latitude:
 - focused tests の構成は backend helper/route-level と web model/component-levelの現実的な範囲で選んでよい。
 
 Escalate if:
-- credential/clone/fetch/write operation、Runtime materialization、Execution Workspace 作成、multi-workspace store 移行、Ticket target からの RepositoryPoint 解決が必要になる場合。
+- credential/clone/fetch/write operation、Runtime materialization、working directory 作成、multi-workspace store 移行、Ticket target からの RepositoryPoint 解決が必要になる場合。
 - Browser-facing API に secret/auth ref/internal absolute paths を出さないと実装できない場合。
 - `RepositorySelector` / `RepositoryPoint` の概念境界を設計変更する必要が出た場合。
 

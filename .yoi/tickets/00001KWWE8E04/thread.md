@@ -51,7 +51,7 @@ Evidence checked:
 - `TicketOrchestrationPlanQuery(00001KWWE8E04)`: 0 件。
 - Orchestrator worktree git status: clean on `orchestration`。
 - queued Ticket 一覧: この Ticket 1件のみ。inprogress は 0 件。
-- visible Pods: previous execution-workspace child Pods が idle で残っているが、`StopPod` 不使用方針のため停止せず、新規 unique Pod を使う。capacity blocker ではない。
+- visible Pods: previous working-directory child Pods が idle で残っているが、`StopPod` 不使用方針のため停止せず、新規 unique Pod を使う。capacity blocker ではない。
 - `TicketDoctor`: 0 errors / 既存 diagnostics のみ。
 - Bounded code map: `crates/workspace-server/src/{identity.rs,server.rs,hosts.rs,config.rs,records.rs,repositories.rs}`, `web/workspace/src/routes/**`, `web/workspace/src/lib/workspace-sidebar/**`, workspace settings/sidebar/console helpers。
 

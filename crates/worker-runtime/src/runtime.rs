@@ -1,7 +1,6 @@
 use crate::catalog::{
-    ConfigBundleRef, CreateWorkerRequest,
-    ExecutionWorkspaceStatus as CatalogExecutionWorkspaceStatus, ProfileSelector, WorkerDetail,
-    WorkerLifecycleAck, WorkerStatus, WorkerSummary,
+    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerDetail, WorkerLifecycleAck,
+    WorkerStatus, WorkerSummary, WorkingDirectoryStatus as CatalogWorkingDirectoryStatus,
 };
 use crate::config_bundle::{
     ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary, validate_config_bundle,
@@ -289,18 +288,18 @@ impl Runtime {
                 worker_ref: worker_ref.clone(),
                 request,
                 context: self.execution_context(worker_ref.clone()),
-                execution_workspace: None,
+                working_directory: None,
             };
             (backend, worker_ref, spawn_request)
         };
 
         let spawn_result = backend.spawn_worker(spawn_request);
-        let (handle, run_state, execution_workspace) = match spawn_result {
+        let (handle, run_state, working_directory) = match spawn_result {
             WorkerExecutionSpawnResult::Connected {
                 handle,
                 run_state,
-                execution_workspace,
-            } => (handle, run_state, execution_workspace),
+                working_directory,
+            } => (handle, run_state, working_directory),
             WorkerExecutionSpawnResult::Rejected(result)
             | WorkerExecutionSpawnResult::Errored(result) => {
                 self.rollback_failed_create(&worker_ref)?;
@@ -334,7 +333,7 @@ impl Runtime {
                 &worker_ref,
                 handle,
                 WorkerExecutionRunState::Busy,
-                execution_workspace,
+                working_directory,
                 WorkerExecutionResult::accepted(
                     WorkerExecutionOperation::Input,
                     WorkerExecutionRunState::Busy,
@@ -345,7 +344,7 @@ impl Runtime {
                 &worker_ref,
                 handle,
                 run_state,
-                execution_workspace,
+                working_directory,
                 WorkerExecutionResult::accepted(WorkerExecutionOperation::Spawn, run_state),
             )
         }
@@ -441,7 +440,7 @@ impl Runtime {
             backend: WorkerExecutionBackendKind::Connected,
             run_state: dispatch_result.run_state,
             binding: worker.execution.binding.clone(),
-            execution_workspace: worker.execution.execution_workspace.clone(),
+            working_directory: worker.execution.working_directory.clone(),
             last_result: Some(dispatch_result),
         };
         worker.transcript.push(TranscriptEntry {
@@ -491,7 +490,7 @@ impl Runtime {
         worker_ref: &WorkerRef,
         handle: WorkerExecutionHandle,
         run_state: WorkerExecutionRunState,
-        execution_workspace: Option<CatalogExecutionWorkspaceStatus>,
+        working_directory: Option<CatalogWorkingDirectoryStatus>,
         result: WorkerExecutionResult,
     ) -> Result<WorkerDetail, RuntimeError> {
         let mut state = self.lock()?;
@@ -501,8 +500,8 @@ impl Runtime {
             let worker = state.worker_mut(worker_ref)?;
             worker.execution_handle = Some(handle);
             let mut execution = WorkerExecutionStatus::connected(run_state).with_binding(binding);
-            if let Some(status) = execution_workspace {
-                execution = execution.with_execution_workspace(status);
+            if let Some(status) = working_directory {
+                execution = execution.with_working_directory(status);
             }
             worker.execution = execution.with_result(result);
             worker.detail(&runtime_id)
@@ -538,7 +537,7 @@ impl Runtime {
             backend: WorkerExecutionBackendKind::Connected,
             run_state: result.run_state,
             binding: worker.execution.binding.clone(),
-            execution_workspace: worker.execution.execution_workspace.clone(),
+            working_directory: worker.execution.working_directory.clone(),
             last_result: Some(result),
         };
         state.persist_worker(&worker_ref.worker_id)?;
@@ -1593,7 +1592,8 @@ mod tests {
                 digest: bundle.metadata.digest,
             },
             initial_input: None,
-            execution_workspace: None,
+            working_directory: None,
+            working_directory_allocation: None,
         }
     }
 
@@ -1659,8 +1659,8 @@ mod tests {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
                 run_state: WorkerExecutionRunState::Idle,
-                execution_workspace: request
-                    .execution_workspace
+                working_directory: request
+                    .working_directory
                     .as_ref()
                     .map(|binding| binding.status()),
             }
@@ -1934,8 +1934,8 @@ mod tests {
             WorkerExecutionSpawnResult::Connected {
                 handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
                 run_state: WorkerExecutionRunState::Idle,
-                execution_workspace: request
-                    .execution_workspace
+                working_directory: request
+                    .working_directory
                     .as_ref()
                     .map(|binding| binding.status()),
             }

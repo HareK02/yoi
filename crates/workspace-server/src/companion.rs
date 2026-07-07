@@ -387,8 +387,9 @@ fn spawn_companion_worker(runtime: &RuntimeRegistry) -> CompanionWorkerState {
             },
             profile: Some(selector),
             initial_input: None,
-            execution_workspace: None,
-            resolved_execution_workspace: None,
+            working_directory: None,
+            resolved_working_directory: None,
+            resolved_working_directory_allocation: None,
         },
     );
 
@@ -577,8 +578,8 @@ mod tests {
                     "deterministic-companion-test",
                 ),
                 run_state: WorkerExecutionRunState::Idle,
-                execution_workspace: request
-                    .execution_workspace
+                working_directory: request
+                    .working_directory
                     .as_ref()
                     .map(|binding| binding.status()),
             }

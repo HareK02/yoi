@@ -12,8 +12,9 @@ use std::{
     time::Duration,
 };
 use worker_runtime::catalog::{
-    ConfigBundleRef, CreateWorkerRequest, ExecutionWorkspaceRequest, ProfileSelector,
-    WorkerDetail as EmbeddedWorkerDetail, WorkerStatus as EmbeddedWorkerStatus,
+    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerDetail as EmbeddedWorkerDetail,
+    WorkerStatus as EmbeddedWorkerStatus, WorkingDirectoryAllocationClaim, WorkingDirectoryRequest,
+    WorkingDirectorySummary,
 };
 use worker_runtime::config_bundle::{
     ConfigBundle, ConfigBundleAvailability, ConfigBundleMetadata, ConfigBundleProvenance,
@@ -238,6 +239,8 @@ pub struct WorkerSummary {
     pub last_seen_at: Option<String>,
     pub implementation: WorkerImplementationSummary,
     pub capabilities: WorkerCapabilitySummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<WorkingDirectorySummary>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -265,14 +268,14 @@ pub struct WorkerLookupResult {
 /// The request carries Browser-facing launch semantics only: workspace intent,
 /// optional display identity, acceptance policy, optional profile selector,
 /// optional initial input, and optional configured Repository selector for
-/// execution-workspace materialization. Runtime execution authority is resolved by the host
+/// working-directory materialization. Runtime execution authority is resolved by the host
 /// into a synced ConfigBundle before the canonical Runtime create request is
 /// built. Raw workspace roots, child cwd, executable paths, tool scope,
 /// credentials, raw config stores, sockets, sessions, and storage paths are not
 /// accepted from Workspace API callers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct WorkerSpawnExecutionWorkspaceRequest {
+pub struct WorkerSpawnWorkingDirectoryRequest {
     /// Safe configured Repository id. The host resolves this id to repository
     /// authority from server-side config; browser callers cannot provide raw
     /// source paths or runtime-internal storage paths.
@@ -292,13 +295,15 @@ pub struct WorkerSpawnRequest {
     pub profile: Option<ProfileSelector>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_input: Option<EmbeddedWorkerInput>,
-    /// Optional safe execution-workspace selector. The Workspace server resolves
-    /// this into a runtime-internal `ExecutionWorkspaceRequest` from configured
+    /// Optional safe working-directory selector. The Workspace server resolves
+    /// this into a runtime-internal `WorkingDirectoryRequest` from configured
     /// repositories before calling a host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_workspace: Option<WorkerSpawnExecutionWorkspaceRequest>,
+    pub working_directory: Option<WorkerSpawnWorkingDirectoryRequest>,
     #[serde(skip, default)]
-    pub resolved_execution_workspace: Option<ExecutionWorkspaceRequest>,
+    pub resolved_working_directory: Option<WorkingDirectoryRequest>,
+    #[serde(skip, default)]
+    pub resolved_working_directory_allocation: Option<WorkingDirectoryAllocationClaim>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1138,6 +1143,11 @@ impl EmbeddedWorkerRuntime {
                 can_stop: self.can_stop_embedded_worker(summary.status, &summary.execution),
                 can_spawn_followup: false,
             },
+            working_directory: summary
+                .execution
+                .working_directory
+                .clone()
+                .map(|status| status.summary),
             diagnostics: embedded_worker_projection_diagnostics(&summary.execution),
         }
     }
@@ -1167,6 +1177,11 @@ impl EmbeddedWorkerRuntime {
                 can_stop: self.can_stop_embedded_worker(detail.status, &detail.execution),
                 can_spawn_followup: false,
             },
+            working_directory: detail
+                .execution
+                .working_directory
+                .clone()
+                .map(|status| status.summary),
             diagnostics: embedded_worker_projection_diagnostics(&detail.execution),
         }
     }
@@ -1341,7 +1356,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             profile,
             config_bundle,
             initial_input: request.initial_input.clone(),
-            execution_workspace: request.resolved_execution_workspace.clone(),
+            working_directory: request.resolved_working_directory.clone(),
+            working_directory_allocation: request.resolved_working_directory_allocation.clone(),
         };
         match self.runtime.create_worker(create_request) {
             Ok(detail) => {
@@ -1817,6 +1833,7 @@ impl RemoteWorkerRuntime {
                 can_stop: runtime_worker_can_stop(true, summary.status, &summary.execution),
                 can_spawn_followup: false,
             },
+            working_directory: summary.execution.working_directory.clone().map(|status| status.summary),
             diagnostics: vec![diagnostic(
                 "remote_runtime_projection",
                 DiagnosticSeverity::Info,
@@ -1850,6 +1867,7 @@ impl RemoteWorkerRuntime {
                 can_stop: runtime_worker_can_stop(true, detail.status, &detail.execution),
                 can_spawn_followup: false,
             },
+            working_directory: detail.execution.working_directory.clone().map(|status| status.summary),
             diagnostics: vec![diagnostic(
                 "remote_runtime_projection",
                 DiagnosticSeverity::Info,
@@ -2014,7 +2032,8 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             profile,
             config_bundle,
             initial_input: request.initial_input.clone(),
-            execution_workspace: request.resolved_execution_workspace.clone(),
+            working_directory: request.resolved_working_directory.clone(),
+            working_directory_allocation: request.resolved_working_directory_allocation.clone(),
         };
         match self.post_json::<_, RuntimeHttpWorkerResponse>("/v1/workers", &create) {
             Ok(response) => WorkerSpawnResult {
@@ -2825,6 +2844,7 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> WorkerSummary {
             can_stop: false,
             can_spawn_followup: false,
         },
+        working_directory: None,
         diagnostics: vec![diagnostic(
             "runtime_capability_unsupported",
             DiagnosticSeverity::Info,
@@ -2938,8 +2958,8 @@ mod tests {
                     self.backend_id(),
                 ),
                 run_state: WorkerExecutionRunState::Idle,
-                execution_workspace: request
-                    .execution_workspace
+                working_directory: request
+                    .working_directory
                     .as_ref()
                     .map(|binding| binding.status()),
             }
@@ -3020,6 +3040,7 @@ mod tests {
                         can_stop: false,
                         can_spawn_followup: false,
                     },
+                    working_directory: None,
                     diagnostics: Vec::new(),
                 }],
             }
@@ -3170,8 +3191,9 @@ mod tests {
             },
             profile: None,
             initial_input: None,
-            execution_workspace: None,
-            resolved_execution_workspace: None,
+            working_directory: None,
+            resolved_working_directory: None,
+            resolved_working_directory_allocation: None,
         }
     }
 
@@ -3301,8 +3323,9 @@ mod tests {
                     },
                     profile: None,
                     initial_input: None,
-                    execution_workspace: None,
-                    resolved_execution_workspace: None,
+                    working_directory: None,
+                    resolved_working_directory: None,
+                    resolved_working_directory_allocation: None,
                 },
             )
             .unwrap();
@@ -3402,8 +3425,9 @@ mod tests {
                     },
                     profile: Some(ProfileSelector::Builtin("builtin:coder".to_string())),
                     initial_input: None,
-                    execution_workspace: None,
-                    resolved_execution_workspace: None,
+                    working_directory: None,
+                    resolved_working_directory: None,
+                    resolved_working_directory_allocation: None,
                 },
             )
             .unwrap();
@@ -3432,8 +3456,9 @@ mod tests {
                     acceptance: WorkerSpawnAcceptanceRequirement::SocketReady,
                     profile: None,
                     initial_input: None,
-                    execution_workspace: None,
-                    resolved_execution_workspace: None,
+                    working_directory: None,
+                    resolved_working_directory: None,
+                    resolved_working_directory_allocation: None,
                 },
             )
             .unwrap();

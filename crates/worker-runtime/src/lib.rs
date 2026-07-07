@@ -11,7 +11,6 @@ pub mod config_bundle;
 pub mod diagnostics;
 pub mod error;
 pub mod execution;
-pub mod execution_workspace;
 #[cfg(feature = "fs-store")]
 pub mod fs_store;
 #[cfg(feature = "http-server")]
@@ -22,6 +21,7 @@ pub mod management;
 pub mod observation;
 mod runtime;
 pub mod worker_backend;
+pub mod working_directory;
 
 #[cfg(feature = "fs-store")]
 pub use fs_store::{FsRuntimeStore, FsRuntimeStoreOptions};

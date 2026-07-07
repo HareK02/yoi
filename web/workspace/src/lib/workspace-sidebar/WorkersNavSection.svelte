@@ -4,6 +4,8 @@
   import { buildBrowserCreateWorkerRequest, defaultWorkerLaunchForm } from './worker-launch';
   import type {
     BrowserCreateWorkerResponse,
+    BrowserWorkingDirectoryCreateResponse,
+    Diagnostic,
     ListResponse,
     Worker,
     WorkerLaunchOptionsResponse,
@@ -14,6 +16,17 @@
   type Props = {
     currentPath?: string;
     workspaceId: string;
+  };
+
+  type DisplayError = {
+    message: string;
+    diagnostics: Diagnostic[];
+  };
+
+  type ErrorPayload = {
+    error?: { message?: string; code?: string } | string;
+    message?: string;
+    diagnostics?: Diagnostic[];
   };
 
   let { currentPath = '/', workspaceId }: Props = $props();
@@ -30,11 +43,16 @@
   let optionsError = $state<string | null>(null);
   let showNewWorker = $state(false);
   let submitting = $state(false);
-  let submitError = $state<string | null>(null);
+  let submitError = $state<DisplayError | null>(null);
   let displayName = $state('Coding Worker');
   let runtimeId = $state('');
   let profile = $state('builtin:coder');
   let initialText = $state('');
+  let workingDirectoryAllocationId = $state('');
+  let workingDirectoryRepositoryId = $state('');
+  let workingDirectorySelector = $state('HEAD');
+  let relativeCwd = $state('');
+  let creatingWorkingDirectory = $state(false);
 
   $effect(() => {
     if (!workspaceId) {
@@ -96,10 +114,18 @@
         display_name: displayName,
         profile,
         initial_text: initialText,
+        working_directory_allocation_id: workingDirectoryAllocationId,
+        working_directory_repository_id: workingDirectoryRepositoryId,
+        working_directory_selector: workingDirectorySelector,
+        relative_cwd: relativeCwd,
       });
       runtimeId = form.runtime_id;
       displayName = form.display_name;
       profile = form.profile;
+      workingDirectoryAllocationId = form.working_directory_allocation_id;
+      workingDirectoryRepositoryId = form.working_directory_repository_id;
+      workingDirectorySelector = form.working_directory_selector;
+      relativeCwd = form.relative_cwd;
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
         return;
@@ -108,9 +134,43 @@
     }
   }
 
+  async function createWorkingDirectory() {
+    if (!workingDirectoryRepositoryId) {
+      submitError = { message: 'select a repository before creating a working directory', diagnostics: [] };
+      return;
+    }
+    creatingWorkingDirectory = true;
+    submitError = null;
+    try {
+      const response = await fetch(workerApiPath('/working-directories'), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          repository_id: workingDirectoryRepositoryId,
+          selector: workingDirectorySelector || null,
+          policy: { dirty_state: 'clean_point_only', cleanup: 'manual_or_worker_stop' },
+        }),
+      });
+      if (!response.ok) {
+        submitError = await responseDisplayError(response, 'working directory create failed');
+        return;
+      }
+      const payload = (await response.json()) as BrowserWorkingDirectoryCreateResponse;
+      const items = options?.working_directories ?? [];
+      options = options
+        ? { ...options, working_directories: [...items.filter((item) => item.allocation_id !== payload.item.allocation_id), payload.item] }
+        : options;
+      workingDirectoryAllocationId = payload.item.allocation_id;
+    } catch (err) {
+      submitError = exceptionDisplayError(err, 'working directory create failed');
+    } finally {
+      creatingWorkingDirectory = false;
+    }
+  }
+
   async function createWorker() {
     if (!workspaceId) {
-      submitError = 'workspace id is unavailable';
+      submitError = { message: 'workspace id is unavailable', diagnostics: [] };
       return;
     }
 
@@ -125,35 +185,51 @@
           display_name: displayName,
           profile,
           initial_text: initialText,
+          working_directory_allocation_id: workingDirectoryAllocationId,
+          working_directory_repository_id: workingDirectoryRepositoryId,
+          working_directory_selector: workingDirectorySelector,
+          relative_cwd: relativeCwd,
         })),
       });
       if (!response.ok) {
-        throw new Error(await responseErrorMessage(response, 'worker create failed'));
+        submitError = await responseDisplayError(response, 'worker create failed');
+        return;
       }
       const payload = (await response.json()) as BrowserCreateWorkerResponse;
       await loadWorkers();
       window.location.href = payload.console_href;
     } catch (err) {
-      submitError = err instanceof Error ? err.message : 'worker create failed';
+      submitError = exceptionDisplayError(err, 'worker create failed');
     } finally {
       submitting = false;
     }
   }
 
-  async function responseErrorMessage(response: Response, fallback: string): Promise<string> {
+  async function responseDisplayError(response: Response, fallback: string): Promise<DisplayError> {
     try {
-      const payload = (await response.json()) as { error?: { message?: string; code?: string } | string; message?: string };
+      const payload = (await response.json()) as ErrorPayload;
+      const diagnostics = Array.isArray(payload.diagnostics) ? payload.diagnostics : [];
       if (typeof payload.error === 'object' && payload.error?.message) {
-        return `${payload.error.code ?? 'request_failed'}: ${payload.error.message}`;
+        return {
+          message: `${payload.error.code ?? 'request_failed'}: ${payload.error.message}`,
+          diagnostics,
+        };
       }
       if (payload.message) {
         const code = typeof payload.error === 'string' ? payload.error : 'request_failed';
-        return `${code}: ${payload.message}`;
+        return { message: `${code}: ${payload.message}`, diagnostics };
       }
     } catch {
       // fall through
     }
-    return `${fallback} (${response.status})`;
+    return { message: `${fallback} (${response.status})`, diagnostics: [] };
+  }
+
+  function exceptionDisplayError(err: unknown, fallback: string): DisplayError {
+    return {
+      message: err instanceof Error ? err.message : fallback,
+      diagnostics: [],
+    };
   }
 </script>
 
@@ -200,6 +276,43 @@
           {/if}
         </select>
       </label>
+      <fieldset class="worker-working-directory">
+        <legend>Working directory</legend>
+        <label>
+          <span>Allocation</span>
+          <select bind:value={workingDirectoryAllocationId}>
+            <option value="">No allocation selected</option>
+            {#each options?.working_directories ?? [] as directory}
+              <option value={directory.allocation_id} disabled={directory.status !== 'active'}>
+                {directory.repository_id} · {directory.requested_selector ?? 'HEAD'} · {directory.resolved_commit.slice(0, 12)} · {directory.status}
+              </option>
+            {/each}
+          </select>
+        </label>
+        <label>
+          <span>Repository for new allocation</span>
+          <select bind:value={workingDirectoryRepositoryId}>
+            {#if options?.repositories.length}
+              {#each options.repositories as repository}
+                <option value={repository.id}>{repository.display_name}</option>
+              {/each}
+            {:else}
+              <option value="" disabled>No configured repositories</option>
+            {/if}
+          </select>
+        </label>
+        <label>
+          <span>Selector</span>
+          <input bind:value={workingDirectorySelector} autocomplete="off" placeholder="HEAD" />
+        </label>
+        <button type="button" disabled={creatingWorkingDirectory || !workingDirectoryRepositoryId} onclick={() => void createWorkingDirectory()}>
+          {creatingWorkingDirectory ? 'Allocating…' : 'Create working directory'}
+        </button>
+        <label>
+          <span>Relative cwd</span>
+          <input bind:value={relativeCwd} autocomplete="off" placeholder="Optional path inside allocation" />
+        </label>
+      </fieldset>
       <label>
         <span>Initial text</span>
         <textarea bind:value={initialText} rows="3" placeholder="Optional first instruction"></textarea>
@@ -208,9 +321,21 @@
         <p class="section-state error">{optionsError}</p>
       {/if}
       {#if submitError}
-        <p class="section-state error">{submitError}</p>
+        <div class="section-state error worker-submit-error">
+          <p>{submitError.message}</p>
+          {#if submitError.diagnostics.length > 0}
+            <ul class="worker-error-diagnostics">
+              {#each submitError.diagnostics as diagnostic}
+                <li class={diagnostic.severity}>
+                  <strong>{diagnostic.code}</strong>
+                  <span>{diagnostic.message}</span>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
       {/if}
-      <button type="submit" disabled={submitting || !runtimeId || !profile}>
+      <button type="submit" disabled={submitting || !runtimeId || !profile || !workingDirectoryAllocationId}>
         {submitting ? 'Starting…' : 'Start Coding Worker'}
       </button>
     </form>
@@ -234,6 +359,7 @@
             </span>
             <span class="item-meta">
               {worker.role ? `${worker.role} · ` : ''}{worker.state} · {worker.status} · 🖥 {worker.host_id}
+              {worker.working_directory ? ` · wd:${worker.working_directory.repository_id}@${worker.working_directory.resolved_commit.slice(0, 8)}` : ''}
             </span>
           </a>
         </li>

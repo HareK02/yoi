@@ -1,83 +1,109 @@
 import {
   buildBrowserCreateWorkerRequest,
   defaultWorkerLaunchForm,
-  type WorkerLaunchFormState,
-} from './worker-launch.ts';
-
-import type { WorkerLaunchOptionsResponse } from './types.ts';
+} from "./worker-launch.ts";
+import type { WorkerLaunchOptionsResponse } from "./types.ts";
 
 declare const Deno: {
-  test(name: string, fn: () => void): void;
+  test(name: string, fn: () => Promise<void> | void): void;
 };
 
-function assert(condition: unknown, message: string): asserts condition {
-  if (!condition) {
-    throw new Error(message);
+function assertEquals<T>(actual: T, expected: T): void {
+  const actualJson = JSON.stringify(actual);
+  const expectedJson = JSON.stringify(expected);
+  if (actualJson !== expectedJson) {
+    throw new Error(`Expected ${expectedJson}, got ${actualJson}`);
   }
 }
 
 const options: WorkerLaunchOptionsResponse = {
-  workspace_id: 'workspace',
+  workspace_id: "workspace",
   runtimes: [
     {
-      runtime_id: 'remote-runtime',
-      display_name: 'Remote Runtime',
+      runtime_id: "remote",
+      display_name: "Remote",
+      status: "active",
+      can_spawn_worker: true,
       built_in: false,
-      can_spawn_worker: false,
-      status: 'active',
       diagnostics: [],
     },
     {
-      runtime_id: 'embedded-worker-runtime',
-      display_name: 'Embedded Runtime',
-      built_in: true,
+      runtime_id: "embedded",
+      display_name: "Embedded",
+      status: "active",
       can_spawn_worker: true,
-      status: 'active',
+      built_in: false,
       diagnostics: [],
     },
   ],
   profiles: [
+    { id: "builtin:companion", label: "Companion", description: "chat" },
+    { id: "builtin:coder", label: "Coder", description: "code" },
+  ],
+  repositories: [
+    { id: "repo", display_name: "Repo", default_selector: "HEAD" },
+  ],
+  working_directories: [
     {
-      id: 'runtime_default',
-      label: 'Runtime default',
-      description: 'Runtime default profile.',
-    },
-    {
-      id: 'builtin:coder',
-      label: 'Coding Worker',
-      description: 'Coding role.',
+      allocation_id: "alloc-1-repo",
+      repository_id: "repo",
+      requested_selector: "HEAD",
+      materializer_kind: "local_git_worktree",
+      dirty_state_policy: "clean_point_only",
+      resolved_commit: "0123456789abcdef",
+      status: "active",
+      cleanup_policy: "manual_or_worker_stop",
+      cleanup_target: {
+        kind: "git_worktree",
+        allocation_id: "alloc-1-repo",
+        repository_id: "repo",
+      },
     },
   ],
   diagnostics: [],
 };
 
-Deno.test('new worker form defaults to backend-published runtime and profile candidates', () => {
-  const current: WorkerLaunchFormState = {
-    runtime_id: '',
-    display_name: '',
-    profile: 'free-text-profile',
-    initial_text: 'start here',
-  };
-
-  const form = defaultWorkerLaunchForm(options, current);
-  assert(form.runtime_id === 'embedded-worker-runtime', 'should choose spawn-capable runtime');
-  assert(form.profile === 'builtin:coder', 'should choose backend-published coder profile');
-  assert(form.display_name === 'Coding Worker', 'should derive default display name');
-  assert(form.initial_text === 'start here', 'should preserve initial text');
-});
-
-Deno.test('new worker submit payload exposes only browser contract fields', () => {
-  const request = buildBrowserCreateWorkerRequest({
-    runtime_id: 'embedded-worker-runtime',
-    display_name: 'Coding Worker',
-    profile: 'builtin:coder',
-    initial_text: 'implement ticket',
+Deno.test("defaultWorkerLaunchForm chooses active runtime, coder profile, repository, and working directory", () => {
+  const form = defaultWorkerLaunchForm(options, {
+    runtime_id: "",
+    display_name: "",
+    profile: "",
+    initial_text: "hello",
+    working_directory_allocation_id: "",
+    working_directory_repository_id: "",
+    working_directory_selector: "",
+    relative_cwd: "",
   });
 
-  assert(
-    JSON.stringify(Object.keys(request).sort()) ===
-      JSON.stringify(['display_name', 'initial_text', 'profile', 'runtime_id'].sort()),
-    'submit payload should contain only Browser-facing worker create fields',
-  );
-  assert(!('kind' in request), 'kind must not be exposed as a Browser request field');
+  assertEquals(form.runtime_id, "remote");
+  assertEquals(form.display_name, "Coding Worker");
+  assertEquals(form.profile, "builtin:coder");
+  assertEquals(form.initial_text, "hello");
+  assertEquals(form.working_directory_allocation_id, "alloc-1-repo");
+  assertEquals(form.working_directory_repository_id, "repo");
+  assertEquals(form.working_directory_selector, "HEAD");
+});
+
+Deno.test("buildBrowserCreateWorkerRequest sends allocation id and relative cwd only", () => {
+  const request = buildBrowserCreateWorkerRequest({
+    runtime_id: "embedded",
+    display_name: "Worker",
+    profile: "builtin:coder",
+    initial_text: "go",
+    working_directory_allocation_id: "alloc-1-repo",
+    working_directory_repository_id: "repo",
+    working_directory_selector: "main",
+    relative_cwd: "crates/yoi",
+  });
+
+  assertEquals(request, {
+    runtime_id: "embedded",
+    display_name: "Worker",
+    profile: "builtin:coder",
+    initial_text: "go",
+    working_directory: {
+      allocation_id: "alloc-1-repo",
+      relative_cwd: "crates/yoi",
+    },
+  });
 });
