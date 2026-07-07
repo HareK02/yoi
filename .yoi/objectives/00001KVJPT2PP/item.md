@@ -2,7 +2,7 @@
 title: "Team workspace control plane and runtime architecture"
 state: "active"
 created_at: "2026-06-20T14:26:29Z"
-updated_at: "2026-07-03T18:05:00Z"
+updated_at: "2026-07-07T12:40:00Z"
 linked_tickets: ["00001KVMFFYVX", "00001KWMBAA6V"]
 ---
 
@@ -27,7 +27,7 @@ Yoi を、単一のローカル開発ディレクトリで動くエージェン�
 - Repository provider: Repository の種類ごとの実装。Git、local filesystem、object store、artifact store、将来の non-Git VCS など。
 - RepositorySelector: Repository provider に渡す未解決の地点指定。branch/tag/PR/revspec/bookmark/revset/path@revision/object version/latest など provider-specific な symbolic / mutable / query-like locator であり、それ自体は再現性の authority ではない。
 - RepositoryPoint: RepositorySelector をある時点で解決した具体地点。Git commit/tree、Mercurial changeset、SVN revision、object store version/manifest digest、file snapshot など provider ごとの immutable / reproducible point を表し、Artifact/evidence に残す。
-- working directory: Runtime が Worker のために作る作業環境。1 つ以上の RepositoryPoint から materialize される作業用ディレクトリ、container filesystem、sandbox mount の集合であり、Git worktree、clone、sparse checkout などはこれを作る手段である。
+- working directory: Runtime が Worker のために作る作業環境。1 つ以上の RepositoryPoint から materialize される作業用ディレクトリ、container filesystem、sandbox mount の集合であり、Git worktree、clone、sparse checkout などはこれを作る手段である。Browser-facing UI/API では product `Workspace` と混同しないよう、この呼称に寄せる。`Volume` は storage backing の候補名に留め、作業領域そのものの呼称にはしない。
 - Ticket: チームで扱う作業単位。目的、要件、判断、議論、完了条件、関係、証跡を持つ。
 - Objective: 複数の Ticket を束ねる長期目標や設計方針。
 - Artifact: Ticket や Worker 実行に紐づく成果物や証跡。diff、log、validation result、review result、report など。
@@ -178,7 +178,7 @@ Ticket / user intent
 
 Control plane は Workspace authority、Ticket target、Repository registry、Actor permission、設定 bundle の正本を持つ。Control plane または Repository provider は RepositorySelector を RepositoryPoint に解決し、どの地点を対象にしたかを evidence に残す。Runtime は RepositoryPoint、materialization policy、sandbox policy、mount/cache/secret policy、Worker config を受け取り、Runtime-local な working directory を確保して Worker を起動する。
 
-この境界では、Worker は host filesystem path や Repository credential を自分で発見しない。Worker は Runtime が materialize した workspace root、mount、環境変数、tool authority、config bundle だけを見る。Runtime は working directory の lifecycle、cleanup、cache reuse、namespace、quota、sandbox boundary、event collection を管理する。Control plane / Browser-facing API は raw host path、secret、socket、internal runtime path を authority-bearing internals として扱い、必要な evidence だけを Artifact として公開する。
+この境界では、Worker は host filesystem path や Repository credential を自分で発見しない。Worker は Runtime が materialize した working directory root、mount、環境変数、tool authority、config bundle だけを見る。Runtime は working directory の lifecycle、cleanup、cache reuse、namespace、quota、sandbox boundary、event collection を管理する。Control plane / Browser-facing API は raw host path、secret、socket、internal runtime path を authority-bearing internals として扱い、必要な evidence だけを Artifact として公開する。
 
 v0 materializer は existing local root を明示的な working directory として返してよい。ただし型と呼び出し順序は、後で Git worktree、clone、sparse checkout、container filesystem、remote object snapshot、multi-repository mount に置き換えられる形にする。Runtime process 起動時の `--workspace` はこの v0 materializer の legacy bootstrap input であり、Runtime identity や long-term workspace binding ではない。
 

@@ -2,7 +2,7 @@
 title: "Runtime working directory materialization and sandboxed agent environments"
 state: "active"
 created_at: "2026-07-06T16:28:12Z"
-updated_at: "2026-07-06T16:28:12Z"
+updated_at: "2026-07-07T12:40:00Z"
 linked_tickets: ["00001KWPC13WQ", "00001KWMBAA6V"]
 ---
 
@@ -10,7 +10,7 @@ linked_tickets: ["00001KWPC13WQ", "00001KWMBAA6V"]
 
 Runtime が Worker ごとに安全で安価な作業環境を用意できるようにする。Yoi の Runtime は、単に既存ディレクトリで Worker process を起動する launcher ではなく、RepositoryPoint から working directory を materialize し、sandbox / mount / cache / cleanup / evidence を管理する実行基盤になる。
 
-この Objective の中心は、Worktree ライクな作業ディレクトリ管理、Repository cache、working directory allocation、sandboxed agent environment の境界を設計し、将来的に 1 つの Runtime が複数 Workspace / Repository の Worker を抱えられるようにすることである。
+この Objective の中心は、Worker 用 working directory の materialization、Repository cache、working directory allocation、sandboxed agent environment の境界を設計し、将来的に 1 つの Runtime が複数 Workspace / Repository の Worker を抱えられるようにすることである。
 
 初期実装では Git/local repository を主対象にしてよい。ただし設計は Git worktree 固定にしない。Git worktree、bare object cache、sparse checkout、copy-on-write snapshot、reflink copy、APFS clonefile、btrfs snapshot、overlay filesystem、container filesystem、remote object snapshot は、すべて working directory materialization strategy の候補として扱う。
 
@@ -34,7 +34,7 @@ Yoi は Workspace / Repository / Runtime を分ける方針になっている。
 
 - Runtime root: Runtime が自身の store、cache、Worker metadata、working directory allocation を管理する root。長期的には `~/.yoi/runtimes/<runtime-id>/` 配下など、Workspace backend store とは別に置く。
 - Repository cache: Runtime-local の共有 source/cache。Git なら bare mirror / object cache / packfile cache など。重く、長寿命で、複数 Worker allocation から共有される。
-- working directory: Worker ごとの作業環境。短寿命で、Worker が読み書きする root / mounts / scratch / overlay を含む。
+- working directory: Worker ごとの作業環境。短寿命で、Worker が読み書きする root / mounts / scratch / overlay を含む。Browser-facing UI/API では `Workspace` と混同しないよう、この呼称に寄せる。`Volume` は storage backing の候補名であり、この作業領域そのものの呼称にはしない。
 - Materialization strategy: RepositoryPoint から working directory を作る実装戦略。Git detached worktree、sparse checkout、CoW snapshot、reflink copy、overlay、container filesystem など。
 - WorkingDirectoryAllocation: Runtime が払い出した作業環境の record。allocation id、worker id、workspace id、repository point、materializer kind、root、mounts、cleanup policy、status を持つ。
 - Sandbox policy: Worker が見られる filesystem、network、process、secret、tool authority の境界を表す policy。
@@ -128,7 +128,7 @@ Git の場合でも materialization strategy は複数あり得る。
 - overlay filesystem
 - external tool backed snapshot, e.g. Rift-like CoW workspace creation
 
-### 3. Repository cache と Worker workspace を分離する
+### 3. Repository cache と Worker working directory を分離する
 
 full clone を Worker ごとに作らない。重い source/object data は Runtime-local repository cache に集約し、Worker ごとの working directory は cheap allocation にする。
 
@@ -193,7 +193,7 @@ Worker が自分で発見してはいけないもの:
 - `.yoi` authority-bearing internals
 - raw credentials
 - Runtime socket/store/cache internals
-- sibling Worker workspaces
+- sibling Worker working directories
 
 Sandbox v0 は strong isolation でなくてもよい。ただし型と lifecycle は、後で container sandbox、namespace, mount filtering, network policy, secret boundary に拡張できる形にする。
 
@@ -228,7 +228,7 @@ WorkingDirectoryAllocation
 
 ### 7. Heavy regenerable artifacts は policy で除外または cache 化する
 
-Worker workspace creation では、`node_modules`, `target`, `.venv`, framework cache, dist, build, coverage などを無条件に full copy しない。
+Worker working directory creation では、`node_modules`, `target`, `.venv`, framework cache, dist, build, coverage などを無条件に full copy しない。
 
 Materialization policy は以下を持てるようにする。
 
