@@ -247,3 +247,31 @@ Review-fix implementation report:
 - Requesting follow-up external review against `684b19e8..9adb0fae` and full combined implementation。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-07T14:56:52Z status: approve -->
+
+## Review: approve
+
+External follow-up review result: approve
+
+Blockers: none.
+
+Evidence reviewed in implementation worktree only:
+- Ticket records: `.yoi/tickets/00001KWY8EHEJ/item.md`, `thread.md`, and orchestration artifact。
+- Fix diff: `9adb0fae` stat/check and `684b19e8..9adb0fae` focused diff for `crates/workspace-server/src/server.rs`。
+- Relevant files: `workspace-server/src/server.rs`, `worker-runtime/src/execution_workspace.rs`, `worker_backend.rs`, scoped host/runtime API pieces, and worker launch UI/model/tests。
+
+Findings:
+- Prior blocker is resolved. Browser Worker spawn now pre-validates `execution_workspace.relative_cwd` through the execution workspace materializer before calling the runtime spawn path, and maps `ExecutionWorkspaceError` into API diagnostics via `execution_workspace_api_error`。
+- Invalid Browser spawn `relative_cwd` now returns typed diagnostics with the expected codes, covered by the added test asserting `execution_workspace_relative_cwd_invalid` appears both in diagnostics and message。
+- Browser-facing spawn payload remains allocation-based (`allocation_id` + optional `relative_cwd`) rather than exposing raw `ExecutionWorkspaceRequest` or host paths. UI request construction sends allocation id and relative cwd only。
+- Scoped create/list/detail/cleanup routes remain under `/api/w/:workspace_id/execution-workspaces`; worker creation uses the scoped workspace API path from the Browser UI。
+- Cleanup remains bounded to the allocation root: cleanup re-derives allocation root from the allocation id/root, canonicalizes workspace root, rejects escape, and removes only the recorded workspace root。
+- Runtime/internal trusted path still performs canonical materialization/bind at Worker launch, while Browser gets a safer scoped allocation API。
+- Reported validation was comprehensive and green; reviewer did not rerun tests as this was a read-only follow-up review。
+
+Non-blocking follow-ups: none identified。
+
+No merge-blocking issues found.
+
+---
