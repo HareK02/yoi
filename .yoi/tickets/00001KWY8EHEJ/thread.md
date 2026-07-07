@@ -221,3 +221,29 @@ Validation reviewed:
 - Reviewer did not rerun full validation; Orchestrator-provided validation was used as passing evidence。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-07T14:51:28Z -->
+
+## Implementation report
+
+Review-fix implementation report:
+
+- Coder Pod completed requested changes and committed follow-up `9adb0fae fix: preserve execution workspace cwd diagnostics` on branch `work/00001KWY8EHEJ-browser-execution-workspaces`.
+- Worktree status was clean after commit.
+- Fix summary:
+  - Browser Worker spawn now prevalidates selected execution workspace allocation + `relative_cwd` through the materializer before spawn。
+  - `ExecutionWorkspaceDiagnostic` is mapped directly into Browser API error diagnostics, preserving typed codes such as `execution_workspace_relative_cwd_invalid`, `execution_workspace_relative_cwd_unavailable`, and `execution_workspace_relative_cwd_escape_rejected`。
+  - Added a scoped Browser API regression test asserting invalid `relative_cwd: "../escape"` returns typed `execution_workspace_relative_cwd_invalid` diagnostic。
+  - Existing scoped execution workspace routes, safe summaries, explicit UI allocation flow, and bounded cleanup behavior remain unchanged。
+- Orchestrator reran validation in the implementation worktree:
+  - `git diff --check`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（17 tests）
+  - `cargo test -p yoi-workspace-server`: pass（67 lib tests + 2 main tests）
+  - `cargo test -p worker-runtime --features ws-server,fs-store`: pass（36 lib tests + 5 main tests + doc tests）
+  - `cargo check -p yoi`: pass
+  - `yoi ticket doctor`: ok
+  - `nix build .#yoi --no-link`: pass
+- Requesting follow-up external review against `684b19e8..9adb0fae` and full combined implementation。
+
+---
