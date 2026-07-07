@@ -1594,6 +1594,7 @@ mod tests {
             },
             initial_input: None,
             execution_workspace: None,
+            execution_workspace_allocation: None,
         }
     }
 

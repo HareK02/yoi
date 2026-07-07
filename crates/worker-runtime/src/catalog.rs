@@ -90,6 +90,13 @@ pub struct ExecutionWorkspaceRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionWorkspaceAllocationClaim {
+    pub allocation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_cwd: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionWorkspaceStatusKind {
     Active,
@@ -108,6 +115,8 @@ pub struct ExecutionWorkspaceCleanupTarget {
 pub struct ExecutionWorkspaceSummary {
     pub allocation_id: String,
     pub repository_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_selector: Option<String>,
     pub materializer_kind: MaterializerKind,
     pub dirty_state_policy: DirtyStatePolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -144,6 +153,8 @@ pub struct CreateWorkerRequest {
     pub initial_input: Option<WorkerInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_workspace: Option<ExecutionWorkspaceRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_workspace_allocation: Option<ExecutionWorkspaceAllocationClaim>,
 }
 
 /// Worker lifecycle status for the in-memory embedded runtime.

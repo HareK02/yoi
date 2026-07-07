@@ -88,6 +88,7 @@ export type Worker = {
   last_seen_at?: string | null;
   implementation: { kind: string; display_hint: string };
   capabilities: WorkerCapabilities;
+  execution_workspace?: ExecutionWorkspaceSummary | null;
   diagnostics: Diagnostic[];
 };
 
@@ -108,10 +109,61 @@ export type WorkerLaunchProfileCandidate = {
   description: string;
 };
 
+export type ExecutionWorkspaceRepositoryOption = {
+  id: string;
+  display_name: string;
+  default_selector?: string | null;
+};
+
+export type ExecutionWorkspaceSummary = {
+  allocation_id: string;
+  repository_id: string;
+  requested_selector?: string | null;
+  materializer_kind: string;
+  dirty_state_policy: string;
+  resolved_commit: string;
+  resolved_tree?: string | null;
+  status: string;
+  cleanup_policy: string;
+  cleanup_target: {
+    kind: string;
+    allocation_id: string;
+    repository_id: string;
+  };
+};
+
+export type BrowserExecutionWorkspaceCreateResponse = {
+  workspace_id: string;
+  item: ExecutionWorkspaceSummary;
+  diagnostics: Diagnostic[];
+};
+
+export type BrowserExecutionWorkspaceListResponse = {
+  workspace_id: string;
+  items: ExecutionWorkspaceSummary[];
+  diagnostics: Diagnostic[];
+};
+
+export type BrowserWorkerExecutionWorkspaceSelection = {
+  allocation_id: string;
+  relative_cwd?: string | null;
+};
+
+export type BrowserExecutionWorkspaceCreateRequest = {
+  repository_id: string;
+  selector?: string | null;
+  policy?: {
+    dirty_state?: 'clean_point_only';
+    cleanup?: 'manual_or_worker_stop';
+  };
+};
+
 export type WorkerLaunchOptionsResponse = {
   workspace_id: string;
   runtimes: WorkerLaunchRuntimeOption[];
   profiles: WorkerLaunchProfileCandidate[];
+  repositories: ExecutionWorkspaceRepositoryOption[];
+  execution_workspaces: ExecutionWorkspaceSummary[];
   diagnostics: Diagnostic[];
 };
 

@@ -389,6 +389,7 @@ fn spawn_companion_worker(runtime: &RuntimeRegistry) -> CompanionWorkerState {
             initial_input: None,
             execution_workspace: None,
             resolved_execution_workspace: None,
+            resolved_execution_workspace_allocation: None,
         },
     );
 

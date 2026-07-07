@@ -864,6 +864,7 @@ mod tests {
             },
             initial_input: None,
             execution_workspace: None,
+            execution_workspace_allocation: None,
         }
     }
 
@@ -1148,6 +1149,7 @@ mod ws_tests {
             },
             initial_input: None,
             execution_workspace: None,
+            execution_workspace_allocation: None,
         }
     }
 
