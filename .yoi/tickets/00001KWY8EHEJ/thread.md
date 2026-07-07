@@ -189,3 +189,35 @@ Implementation progress report:
 - External review will be requested via a read-only sibling Reviewer Pod. `StopPod` は使わない。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-07T14:36:39Z status: request_changes -->
+
+## Review: request changes
+
+External review result: request_changes
+
+Blocker:
+
+1. Invalid `relative_cwd` is rejected internally, but the Browser-facing Worker spawn API does not return the required typed Execution Workspace diagnostic。
+   - Ticket acceptance requires invalid `relative_cwd` to be rejected as a typed diagnostic。
+   - Materializer has specific typed codes:
+     - `execution_workspace_relative_cwd_invalid`
+     - `execution_workspace_relative_cwd_unavailable`
+     - `execution_workspace_relative_cwd_escape_rejected`
+   - `crates/worker-runtime/src/worker_backend.rs` converts `ExecutionWorkspaceDiagnostic` to a plain string in `WorkerExecutionResult::rejected(...)`。
+   - Workspace host/API then maps this to generic diagnostics/error codes, including generic embedded execution rejection and generic `workspace_worker_create_failed`。
+   - Result: Browser caller submitting invalid `relative_cwd` gets a generic worker-create/runtime rejection rather than a typed `execution_workspace_relative_cwd_*` diagnostic。
+   - Browser/scoped API-level tests cover materializer bind validation but not the API rejection shape。
+
+Required fix:
+- Preserve/propagate `ExecutionWorkspaceDiagnostic.code` through Worker spawn, or prevalidate allocation + `relative_cwd` in the Workspace API and return that typed diagnostic directly。
+- Add a scoped Browser API test for at least one invalid `relative_cwd` that asserts the typed `execution_workspace_relative_cwd_*` diagnostic is returned。
+
+Non-blocking follow-ups:
+- The implementation otherwise appears aligned with the pre-allocation design: scoped `/api/w/<workspace-id>/execution-workspaces` routes exist, Browser create payload uses configured `repository_id`/selector/policy rather than raw `ExecutionWorkspaceRequest`, summaries avoid raw paths, UI explicitly creates/selects allocations, and cleanup is bounded to the allocation root。
+
+Validation reviewed:
+- Reviewer read Ticket item/thread, inspected `git show --stat --check 684b19e8` / `git show --name-only 684b19e8`, and reviewed Runtime, Workspace API/host, and frontend launch files。
+- Reviewer did not rerun full validation; Orchestrator-provided validation was used as passing evidence。
+
+---
