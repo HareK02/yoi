@@ -1,8 +1,8 @@
 ---
 title: 'Enable Browser-managed execution workspaces for Worker spawn'
-state: 'planning'
+state: 'ready'
 created_at: '2026-07-07T12:22:06Z'
-updated_at: '2026-07-07T12:22:06Z'
+updated_at: '2026-07-07T12:26:36Z'
 assignee: null
 ---
 
