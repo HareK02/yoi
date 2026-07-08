@@ -176,3 +176,38 @@ Implementation routing update:
 - 完了後は diff / validation evidence を Orchestrator が確認し、別 sibling Reviewer Pod に read-only review を依頼する。`StopPod` は既知の不具合があるため使用しない。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-08T11:20:23Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Coder Pod completed implementation and committed `57e96d3b feat: add backend resource fetch api` on branch `work/00001KX0G06VA-resource-fetch-api`.
+- Worktree status was clean after commit.
+- Changed files include:
+  - `crates/worker-runtime/src/resource.rs` (new)
+  - `crates/workspace-server/src/resource_broker.rs` (new)
+  - `crates/worker-runtime/src/{config_bundle.rs,http_server.rs,main.rs,profile_archive.rs,worker_backend.rs}`
+  - `crates/workspace-server/src/{hosts.rs,server.rs,companion.rs}`
+  - `Cargo.lock`, `package.nix`
+- Implementation summary:
+  - Added typed resource handle/request/response model and Runtime resource client/cache path。
+  - Added Backend resource broker for v0 `profile_source_archive` resources。
+  - Embedded direct path and remote Runtime HTTP path share the resource contract。
+  - Runtime verifies digest, max bytes/content type, expiry/binding, and cache reuse before using fetched profile archives。
+  - Config bundle/profile archive path can use resource handle without Runtime filesystem discovery。
+  - Browser-facing summaries redact internal resource handles/endpoints/raw paths/archive details。
+  - Added focused tests for handle issue/verify, runtime mismatch, digest mismatch, oversized response, direct/remote resource fetch, Browser redaction, and config-bundle/resource archive integration。
+- Orchestrator reran validation in the implementation worktree:
+  - `git diff --check`: pass
+  - `cargo test -p worker-runtime --features ws-server,fs-store`: pass（42 lib tests + 5 main tests + doc tests）
+  - `cargo test -p yoi-workspace-server`: pass（71 lib tests + 2 main tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（17 tests）
+  - `yoi ticket doctor`: ok
+  - `nix build .#yoi --no-link`: pass
+- External review will be requested via a read-only sibling Reviewer Pod. `StopPod` は使わない。
+
+---
