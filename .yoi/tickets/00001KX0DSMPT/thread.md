@@ -170,3 +170,15 @@ Implementation routing update:
 - 完了後は diff / validation evidence を Orchestrator が確認し、別 sibling Reviewer Pod に read-only review を依頼する。`StopPod` は既知の不具合があるため使用しない。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-08T12:03:23Z -->
+
+## Implementation report
+
+Implementation routing recovery note:
+
+- Initial Coder Pod `yoi-coder-00001KX0DSMPT-profile-settings` failed its first turn with provider `context_length_exceeded` before producing implementation output。
+- Ticket remains `inprogress`; worktree/branch already exist and are clean at creation baseline。
+- Recovery plan: avoid `StopPod` and retry with a fresh minimal Coder task that reads the Ticket records from the worktree instead of embedding the full IntentPacket in the prompt. If scope registry prevents a fresh Pod, fallback is to use the existing Pod with a much smaller instruction or ask for human cleanup/authority。
+
+---
