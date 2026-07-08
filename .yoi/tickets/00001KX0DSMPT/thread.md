@@ -280,3 +280,27 @@ Review-fix implementation report:
 - Requesting follow-up external review against `3eefd333..0c2ca1ea` and full combined implementation。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-08T13:18:55Z status: approve -->
+
+## Review: approve
+
+External follow-up review result: approve
+
+Blockers: none.
+
+Validation performed read-only in implementation worktree. Reviewer inspected Ticket records, `0c2ca1ea`, fix diff `3eefd333..0c2ca1ea`, and relevant server/profile/UI code. Reviewer did not rerun heavy validation and relied on Orchestrator-reported passing validation.
+
+Findings:
+- Prior blocker 1 resolved: profile mutation failures now return typed Browser diagnostics with populated diagnostics rather than generic empty diagnostics. Server-side handlers/tests cover invalid source mutations and missing-source registry mutations with non-empty diagnostic arrays and bad-request status。
+- Prior blocker 2 resolved: invalid/missing/Decodal-invalid project profile sources are surfaced on relevant profile summaries, invalid project profiles are excluded from Worker launch candidates, and candidate validation rejects invalid project profile ids with regression coverage。
+- Prior blocker 3 resolved: registry/default update paths validate selector/default existence, selector/source-id correspondence, missing source files, source path safety including symlink escape rejection, source size, Decodal/ProfileSourceArchive validity, and invalid registry schema before accepting mutations。
+- Browser-facing profile/settings summaries expose bounded ids, labels, relative display paths, revision/configured booleans, and diagnostics; no host absolute paths, socket/session paths, runtime-local store paths, runtime endpoints/tokens, backend-private paths, archive digests, raw resource handles, or secret values were found in inspected API/UI surfaces。
+- Profile detail exposes editable source content as intended settings-editor payload, not resolved archive/resource bundle。
+- Decodal/ProfileSourceArchive validation remains behind server-side checked source path/archive boundary; Runtime filesystem discovery was not reintroduced for profile validation or launch。
+- Single-page settings UI route structure is acceptable under implementation latitude and not a blocker。
+
+Non-blocking follow-up:
+- If merge target accumulated additional `.yoi/tickets/00001KX0DSMPT/thread.md` edits, resolve Ticket-record conflicts normally during merge; this does not affect product/code correctness.
+
+---
