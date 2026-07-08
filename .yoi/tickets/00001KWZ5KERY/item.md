@@ -1,8 +1,8 @@
 ---
 title: 'Migrate Profiles to Decodal ProfileSourceArchive for Runtime launch'
-state: 'planning'
+state: 'ready'
 created_at: '2026-07-07T20:51:35Z'
-updated_at: '2026-07-08T08:52:00Z'
+updated_at: '2026-07-08T09:03:55Z'
 assignee: null
 ---
 
