@@ -1,160 +1,181 @@
 ---
-title: 'Implement event-driven WorkerConfigBundle sync for Runtime worker creation'
+title: 'Migrate Profiles to Decodal ProfileSourceArchive for Runtime launch'
 state: 'planning'
 created_at: '2026-07-07T20:51:35Z'
-updated_at: '2026-07-07T21:18:00Z'
+updated_at: '2026-07-08T08:52:00Z'
 assignee: null
 ---
 
 ## 背景
 
-Backend -> Runtime の config 境界は既に `ConfigBundle` の sync/check/store の外枠を持っているが、現状の bundle は profile selector 宣言が中心であり、Worker 作成時の実際の Profile discovery / manifest resolution は Runtime 側の `ProfileRuntimeWorkerFactory` が host filesystem から再実行している。
+Runtime の Browser/Backend 経由 Worker creation は、Workspace filesystem を profile/config discovery source として読まない境界にする必要がある。現状の Lua Profile 経路は `ProfileRuntimeWorkerFactory` / `resolve_runtime_profile_manifest` が Runtime-local path を `workspace_root` / `profile_base_dir` として扱い、そこから `.yoi/profiles.toml`、Lua Profile file、local require module、`.yoi/override.local.toml` を探索・読み取りしている。
 
-これは正規経路ではない。Workspace は Browser/product の論理単位であり、Runtime は Workspace filesystem を profile/config discovery source として読まない。Backend が Workspace / project / builtin Profile を解決し、Runtime へ同期した Worker 起動用 bundle だけを Worker creation の config authority にする。
+Lua Profile は sandbox されているが、設定 DSL としては過剰であり、`require` / local module / FS discovery の境界が複雑になっている。Profile は Workspace/Profile source graph として Backend が正本を持ち、Runtime はその source graph を filesystem ではなく archive artifact として受け取り、決定的に評価できればよい。
 
-この Ticket では既存の一般名 `ConfigBundle` を Worker 起動用途に限定した `WorkerConfigBundle` として整理する。実装上の rename 範囲は code review で確定してよいが、外向きの意味は「Backend-resolved, content-addressed Worker launch config snapshot」で固定する。
+本 Ticket では Lua Profile の通常経路を Decodal Profile DSL に移行し、Backend が selected Profile revision の source graph を tar archive (`ProfileSourceArchive`) として構築する。Runtime は archive を prefetch / verify し、Decodal `SourceLoader` を archive 内 source に限定して Profile を resolve する。
 
-同期したい Workspace 情報は主に Profile と、その Profile から Worker 起動に必要になる non-secret launch config である。Ticket / Objective / repository contents / Worker catalog などの Workspace product state 全体を Runtime に同期するものではない。
+## 実装順序
+
+1. 本 Ticket `00001KWZ5KERY`: Decodal Profile DSL、`ProfileSourceArchive`、Runtime archive prefetch/verify、FSなし profile resolution を実装する。
+2. Ticket `00001KX0DSMPT`: Workspace settings API/pages を Decodal Profile source 編集向けに実装する。Profile source model / validation が本 Ticket で固まった後に進める。
+3. Runtime-local artifact sync は別 Ticket とする。Plugin package、MCP executable、sandbox image など、Runtime-local 実体が必要なものだけを対象にする。
 
 ## 実装目的
 
-- Backend が Profile discovery / resolution を行い、Runtime は通常 Worker creation 経路で Profile filesystem discovery を行わない。
-- `WorkerConfigBundle` は profile selector allowlist ではなく、Worker 作成に必要な resolved launch config snapshot を持つ。
-- Backend は設定変更時、Profile 変更時、Runtime 登録/再接続時、Backend 起動時 reconcile、または明示 resync 時に bundle を Runtime へ同期する。
-- Worker launch 時は既に Backend が生成済みの `WorkerConfigBundle` を参照し、通常経路で bundle generation / Profile discovery を行わない。
-- Runtime は同期済み `WorkerConfigBundleRef`、WorkingDirectory、initial input から Worker を作る。
-- Browser-facing API には `WorkerConfigBundleRef`、bundle digest、Runtime config store、raw path、Runtime endpoint を出さない。
-
-## 同期モデル
-
-主経路:
-
-```text
-Workspace/Profile/config change
-  -> Backend resolves profiles into WorkerConfigBundle
-  -> Backend computes content digest
-  -> Backend syncs bundle to registered/reachable Runtimes
-
-Worker launch
-  -> Backend selects an already-generated WorkerConfigBundleRef
-  -> Backend checks Runtime availability
-  -> Runtime creates Worker from stored bundle + WorkingDirectory + initial input
-```
-
-launch 時に許すのは availability check と missing repair sync だけである。launch 時に Profile discovery や bundle generation を行わない。missing repair sync は Backend が既に持っている bundle artifact を Runtime に再送するだけに限定する。repair できない場合は typed diagnostic で止める。
-
-同期トリガー:
-
-- Backend startup reconcile。
-- Workspace / Profile / config record change。
-- builtin Profile version change。
-- Runtime registration / reconnect。
-- manual resync。
-- Worker launch-time missing repair sync。
+- Lua Profile を Browser/Backend Worker launch の通常経路から外し、Decodal Profile DSL を使う。
+- Backend は Workspace/Profile source の正本として Profile source graph を読み、tar 化した `ProfileSourceArchive` を作る。
+- Runtime は Workspace filesystem / WorkingDirectory root から Profile discovery を行わず、prefetch 済み archive だけを読む。
+- Decodal import は Backend への都度 fetch ではなく、archive manifest が許可する source graph 内で解決する。
+- WorkingDirectory は Worker execution root/cwd としてのみ使う。
+- Memory / Ticket / Objective のような更新頻度が高い Workspace product state は Runtime に同期せず、Backend API / capability / tool 経由でアクセスする。
+- Plugin package、MCP executable、sandbox image など Runtime-local 実体が必要な artifact は Profile source archive と分離する。
 
 ## 実装内容
 
-### 1. `WorkerConfigBundle` payload を resolved launch config に拡張する
+### 1. Decodal Profile DSL を導入する
 
-既存 `ConfigBundle` を `WorkerConfigBundle` として整理し、Backend-resolved profile payload を追加する。新しい payload は selector 宣言だけではなく、Runtime が Worker manifest/config を構築するための typed data を持つ。
+Lua Profile の通常経路を置き換える Decodal profile schema を追加する。
 
-payload に含めるもの:
+実装すること:
 
+- Decodal dependency を追加する。
+- Worker manifest/config に必要な typed schema を Decodal materialization target として定義する。
+- builtin role Profiles を Decodal source へ移行する。
+- Profile selector / role metadata / model/provider refs / tool policy / memory/ticket/language policy / prompt/resource refs を Decodal から表現できるようにする。
+- secret values、host absolute path、Runtime endpoint、socket/session path、runtime-local mount actual path は schema validation で拒否する。
+- Lua Profile は compatibility-only path とし、Browser/Backend launch の通常経路では使わない。
+
+### 2. `ProfileSourceArchive` tar format を定義する
+
+Backend が Runtime に渡す profile source graph artifact を tar archive として定義する。
+
+archive の例:
+
+```text
+manifest.json
+sources/root.dcl
+sources/modules/foo.dcl
+sources/modules/bar.dcl
+```
+
+manifest に含める情報:
+
+- archive kind / version。
+- workspace id。
 - profile selector。
-- display label / role metadata。
-- `WorkerManifestConfig` 相当の resolved launch config。
-- prompt / resource / workflow を解決するための resource table または digest 付き resource entry。
-- non-secret provider/model config refs。
-- tool / hook / plugin declaration と policy declaration。
-- language / memory / ticket / runtime policy のうち Worker manifest 作成に必要な non-secret config。
+- profile revision。
+- root source key / root path。
+- source entries: key, relative archive path, digest, size, content type。
+- import map / import policy。
+- builtin profile version / source provenance。
+- archive digest。
 
-payload に含めないもの:
+禁止する情報:
 
 - secret values。
 - host absolute path。
 - Runtime endpoint / token / socket path / session path。
-- runtime-local mount actual path。
-- Browser request 由来の raw cwd / raw filesystem scope。
-- Ticket / Objective / repository contents / Worker catalog など、Worker 起動 config ではない Workspace product state。
+- WorkingDirectory root path。
+- raw Browser cwd / raw filesystem scope。
+- Ticket / Objective / Memory contents。
+- Plugin executable/package bytes。
 
-bundle digest は metadata だけではなく、この resolved payload を含む canonical content identity にする。
+### 3. Backend に archive builder を実装する
 
-### 2. Backend に `WorkerConfigBundle` builder と change-driven sync を実装する
-
-Workspace Backend に、Profile/config 変更から `WorkerConfigBundle` を構築・更新する経路を追加する。
-
-実装すること:
-
-- 既存の builtin / workspace / project Profile discovery を Backend 側で呼び出す。
-- selector ambiguity / missing profile / invalid profile を Backend diagnostic にする。
-- Profile を resolved launch config payload に変換する。
-- bundle digest を計算し、変更がある場合だけ Runtime sync 対象にする。
-- Backend startup reconcile と Runtime registration/reconnect 時に必要 bundle を sync/check する。
-- manual resync を可能にする。
-- launch options は Browser に profile/role candidates だけ返し、bundle identity は返さない。
-
-### 3. Runtime の bundle store / sync / check を resolved payload 対応にする
-
-Runtime 側の bundle store は resolved payload を保存・検証できるようにする。
+Workspace Backend が profile/role selector から `ProfileSourceArchive` を作る。
 
 実装すること:
 
-- `store_worker_config_bundle` / check API が payload digest を検証する。
-- unsupported declaration / unsupported host policy / missing secret ref を typed diagnostic にする。
-- embedded Runtime direct call と remote Runtime REST path が同じ bundle contract を使う。
-- retry / duplicate sync で同じ bundle content は同じ identity として扱える。
+- workspace/project/builtin Decodal Profile registry discovery を Backend 側で行う。
+- selected source と import closure を読み取る。
+- import specifier を Backend 側で解決し、許可された source graph に閉じる。
+- artifact size / file count / import depth / unsupported source / symlink escape / path escape を validation する。
+- source digest と archive digest を計算する。
+- archive manifest と tar bytes を作る。
+- Browser launch options は profile/role candidates だけ返し、archive content / digest / Runtime internal identity は返さない。
 
-### 4. Worker creation を `WorkerConfigBundle` payload から構築する
+### 4. Runtime に archive prefetch / verify / cache を実装する
+
+Runtime Worker creation は `ProfileSourceArchiveRef` を受け取り、archive が無ければ Backend から prefetch する。
+
+実装すること:
+
+- `CreateWorkerRequest` または Backend-facing wrapper に `ProfileSourceArchiveRef` を追加する。
+- Runtime は archive digest / manifest schema / source digests / total size / source paths を検証する。
+- archive path は relative のみ許可し、absolute path / `..` / symlink escape を拒否する。
+- same digest の archive は idempotent に cache / reuse できる。
+- missing archive は Backend から fetch して repair できる。
+- fetch failure / digest mismatch / manifest invalid / source missing / unsupported archive version は typed diagnostic にする。
+
+### 5. Decodal `SourceLoader` を archive 内 source に限定する
+
+Runtime は Decodal evaluator を持つが、SourceLoader は filesystem や Backend 都度 fetch を行わない。
+
+実装すること:
+
+- `ArchiveSourceLoader` を実装する。
+- `SourceLoader::load(current_key, specifier)` は archive manifest / import map だけを参照する。
+- import が manifest 許可外に出る場合は typed diagnostic にする。
+- Decodal evaluation に max imports / max total bytes / max depth / timeout を設定する。
+- resolved Worker manifest/config は既存 validation boundary を通す。
+
+### 6. Worker creation を archive-resolved config に接続する
 
 Runtime Worker creation は、通常経路で Runtime-local filesystem から Profile discovery しない。
 
 実装すること:
 
-- `CreateWorkerRequest` は Backend が ensure した `WorkerConfigBundleRef` を参照する。
-- Runtime は `WorkerConfigBundleRef` が保存済み bundle と一致することを検証する。
-- Runtime は bundle payload から Worker manifest/config を構築する。
-- WorkingDirectory は Worker execution root/cwd としてのみ使う。
-- WorkingDirectory を Profile discovery source として使わない。
-- bundle missing / digest mismatch / profile not in bundle / unsupported declaration は typed rejection にする。
+- Backend は Worker launch 時に selected Profile revision に対応する `ProfileSourceArchiveRef` を Runtime に渡す。
+- Runtime は archive を verify し、Decodal で resolved Worker manifest/config を構築する。
+- WorkingDirectory は execution root/cwd/scope の計算にのみ使う。
+- Runtime-local profile fallback は Browser/Backend launch の通常経路では使わない。
+- Worker metadata / audit に archive id / digest / source graph digest summary を残す。
 
-### 5. Browser WorkingDirectory launch を `WorkerConfigBundle` 経由に接続する
+### 7. Runtime-local artifact sync を別境界に分離する
 
-既存 Browser WorkingDirectory launch は、Backend-resolved `WorkerConfigBundle` を必ず経由して Worker を作る。
+Profile source archive と Runtime-local artifact sync を混ぜない。
 
-実装すること:
+Runtime-local sync/check 対象:
 
-- Browser request は profile/role selector、working_directory_id、relative cwd / initial input など product-level fields だけを送る。
-- Backend は request を `WorkerConfigBundleRef` + WorkingDirectory + initial input に落とし込む。
-- Worker launch 時は bundle availability check を行う。
-- missing の場合は Backend が持つ既存 bundle artifact の repair sync を試すか、typed diagnostic で止める。
-- Browser-facing response / error に `WorkerConfigBundleRef`、bundle digest、Runtime store path、Runtime endpoint、raw path を含めない。
-- diagnostic は Browser に必要な sanitized message/code だけを返す。
+- Plugin package / plugin binary。
+- MCP server executable / service package。
+- sandbox image / toolchain / runtime-local service。
+- large prompt/resource asset のうち Runtime local file として必要なもの。
 
-### 6. compatibility fallback を通常経路から外す
+Runtime-local sync/check 対象ではないもの:
 
-`worker_config_bundle = None` や runtime-local profile discovery fallback が残る場合は、direct worker-runtime CLI / tests / builtin debugging の compatibility path として明示的に隔離する。
+- Profile registry / Profile source archive 以外の Workspace product state。
+- Memory / Ticket / Objective / Workspace metadata。
+- Repository contents。
+
+Profile から plugin enablement / package refs が出る場合、Runtime は package availability を別途 check し、missing / unsupported / digest mismatch を typed diagnostic にする。
+
+### 8. compatibility fallback を通常経路から外す
+
+既存 CLI / tests / builtin debugging のために Lua/runtime-local profile discovery fallback が残る場合は、compatibility-only として隔離する。
 
 実装すること:
 
 - Browser / Workspace Backend launch では fallback を使わない。
-- fallback を使う code path には diagnostic または test name で compatibility-only であることを残す。
+- fallback path は test name / diagnostic / code comment で compatibility-only と明示する。
 - `profile_base_dir` / legacy `workspace_root` 呼称が残る場合、通常 launch 経路から参照されていないことを test で確認する。
 
 ## 受け入れ条件
 
-- `WorkerConfigBundle` に resolved launch config payload が実装されている。
-- bundle digest が resolved payload を含む canonical content identity になっている。
-- bundle validation が secret values、raw host paths、Runtime endpoint、socket/session paths、runtime-local mount actual paths を拒否する。
-- Backend が Workspace/Profile/config change を契機に `WorkerConfigBundle` を生成・更新できる。
-- Backend startup reconcile、Runtime registration/reconnect、manual resync、launch-time missing repair sync が実装されている。
-- Worker launch 時の通常経路で Profile discovery / bundle generation を行わない。
+- Decodal Profile DSL が Worker launch config を表現できる。
+- builtin role Profiles が Decodal source として利用できる。
+- `ProfileSourceArchive` tar format と manifest schema が実装されている。
+- Backend が profile/role selector から `ProfileSourceArchive` を構築できる。
+- Backend archive builder が import closure を解決し、archive path / symlink / size / depth / unsupported source を検証する。
+- Runtime が `ProfileSourceArchiveRef` から archive を prefetch / verify / cache できる。
+- Runtime `ArchiveSourceLoader` が archive manifest 内の source だけから Decodal import を解決する。
 - Runtime Worker creation は通常経路で Workspace filesystem / profile base / WorkingDirectory root から Profile discovery を行わない。
-- Runtime Worker creation は保存済み `WorkerConfigBundleRef` と bundle payload から Worker manifest/config を構築する。
-- Existing Browser WorkingDirectory launch が `WorkerConfigBundle` 経由で Worker を作れる。
-- Browser-facing API に `WorkerConfigBundleRef` / bundle digest / Runtime config store / raw path / Runtime endpoint が露出しない。
-- Embedded Runtime と remote Runtime の bundle check/sync/create behavior が同じ contract を使う。
-- Missing bundle、digest mismatch、profile missing、unsupported declaration、unsupported host policy、missing secret ref は typed diagnostic になる。
-- Focused tests が Backend bundle build、change-driven sync、Runtime bundle validation、Worker create without Runtime FS profile discovery、remote sync/check path、Browser payload redaction、WorkingDirectory launch success を確認する。
+- WorkingDirectory は Worker execution root/cwd としてのみ使われる。
+- Browser-facing API に archive content、archive digest、Runtime store path、raw path、Runtime endpoint が露出しない。
+- Memory / Ticket / Objective は sync 対象ではなく、Backend API / capability / tool 経由でアクセスする方針が code/docs/tests 上で崩れていない。
+- Plugin/MCP/sandbox など Runtime-local artifact availability は `ProfileSourceArchive` とは別の check/sync 境界として扱われる。
+- Missing profile、ambiguous selector、invalid Decodal source、missing import、import outside graph、artifact too large、archive digest mismatch、unsupported plugin package、missing runtime-local artifact は typed diagnostic になる。
+- Focused tests が Backend archive build、Runtime archive verify、ArchiveSourceLoader import resolution、Worker create without Runtime FS discovery、WorkingDirectory launch success、Browser payload redaction、compatibility fallback isolation を確認する。
 - `cargo test -p worker-runtime --features ws-server,fs-store` が通る。
 - `cargo test -p yoi-workspace-server` が通る。
 - `cargo check -p yoi` が通る。
@@ -165,9 +186,9 @@ Runtime Worker creation は、通常経路で Runtime-local filesystem から Pr
 ## 非目標
 
 - Secret value synchronization。
-- Ticket / Objective / repository contents / Worker catalog の Runtime 同期。
+- Ticket / Objective / Memory / repository contents / Worker catalog の Runtime 同期。
 - Plugin package manager / signature policy の完成。
 - Multi-tenant auth model の完成。
-- Browser-facing bundle editor UI。
+- Browser-facing Profile editor UI。これは `00001KX0DSMPT` で扱う。
 - Runtime が Workspace filesystem を profile/config discovery source として読む経路の延命。
 - WorkingDirectory materializer の新しい dirty snapshot / cache / remote clone policy。
