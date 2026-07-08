@@ -254,3 +254,29 @@ Non-blocking follow-ups:
 - UI implements profile list/editor on single `/settings` page with anchors/forms rather than separate `/settings/profiles/...` pages. This may be acceptable under implementation latitude, but confirm route granularity if it matters.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-08T13:07:39Z -->
+
+## Implementation report
+
+Review-fix implementation report:
+
+- Recovery Coder Pod completed requested changes and committed follow-up `0c2ca1ea fix: harden profile settings validation` on branch `work/00001KX0DSMPT-workspace-profile-settings`.
+- Worktree status was clean after commit。
+- Fix summary:
+  - Profile settings validation errors now map to typed Browser diagnostics with non-empty `diagnostics` arrays and appropriate HTTP statuses（revision conflict 409、invalid/duplicate/path/schema/source/profile errors 400、unknown source/selector 404）。
+  - Project profile discovery attaches source/Decodal validation failures to the relevant `WorkspaceProfileSummary`。
+  - Invalid project profiles are excluded from Worker launch candidates and rejected by candidate validation。
+  - Registry/default writes validate default selector existence, selector/source consistency, missing source files, path/symlink escape, source size, Decodal/ProfileSourceArchive validity, and invalid registry schema before commit。
+  - Added/strengthened tests for duplicate selector, invalid Decodal/schema, stale revision conflict, too-large source, symlink escape redaction, invalid launch candidate rejection, and missing/default reference rejection。
+- Orchestrator reran validation in the implementation worktree:
+  - `git diff --check`: pass
+  - `cargo test -p yoi-workspace-server`: pass（91 lib tests + 2 main tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（17 tests）
+  - `yoi ticket doctor`: ok
+  - `nix build .#yoi --no-link`: pass
+- Requesting follow-up external review against `3eefd333..0c2ca1ea` and full combined implementation。
+
+---
