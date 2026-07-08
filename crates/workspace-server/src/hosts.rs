@@ -307,6 +307,8 @@ pub struct WorkerSpawnRequest {
     pub resolved_working_directory_request: Option<WorkingDirectoryRequest>,
     #[serde(skip, default)]
     pub resolved_working_directory: Option<WorkingDirectoryClaim>,
+    #[serde(skip, default)]
+    pub resolved_config_bundle: Option<ConfigBundle>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1348,17 +1350,23 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             .clone()
             .unwrap_or_else(|| embedded_profile_selector(&request.intent));
         let runtime_id = EmbeddedRuntimeId::new(self.runtime_id.clone());
-        let config_bundle = match default_embedded_config_bundle(
-            &profile,
-            &self.host_id,
-            runtime_id.as_ref(),
-            &self.resource_broker,
-        )
-        .and_then(|bundle| {
-            self.runtime
-                .store_config_bundle(bundle)
-                .map_err(|err| err.to_string())
-        }) {
+        let config_bundle = match request
+            .resolved_config_bundle
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| {
+                default_embedded_config_bundle(
+                    &profile,
+                    &self.host_id,
+                    runtime_id.as_ref(),
+                    &self.resource_broker,
+                )
+            })
+            .and_then(|bundle| {
+                self.runtime
+                    .store_config_bundle(bundle)
+                    .map_err(|err| err.to_string())
+            }) {
             Ok(availability) => availability.reference,
             Err(error) => {
                 diagnostics.push(diagnostic(
@@ -2048,12 +2056,18 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             .clone()
             .unwrap_or_else(|| embedded_profile_selector(&request.intent));
         let runtime_id = EmbeddedRuntimeId::new(self.runtime_id.clone());
-        let sync = match default_embedded_config_bundle(
-            &profile,
-            &self.host_id,
-            runtime_id.as_ref(),
-            &self.resource_broker,
-        ) {
+        let sync = match request
+            .resolved_config_bundle
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| {
+                default_embedded_config_bundle(
+                    &profile,
+                    &self.host_id,
+                    runtime_id.as_ref(),
+                    &self.resource_broker,
+                )
+            }) {
             Ok(bundle) => self.sync_config_bundle(bundle),
             Err(error) => ConfigBundleSyncResult {
                 state: WorkerOperationState::Rejected,
@@ -3398,6 +3412,7 @@ mod tests {
             working_directory_request: None,
             resolved_working_directory_request: None,
             resolved_working_directory: None,
+            resolved_config_bundle: None,
         }
     }
 
@@ -3530,6 +3545,7 @@ mod tests {
                     working_directory_request: None,
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
+                    resolved_config_bundle: None,
                 },
             )
             .unwrap();
@@ -3632,6 +3648,7 @@ mod tests {
                     working_directory_request: None,
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
+                    resolved_config_bundle: None,
                 },
             )
             .unwrap();
@@ -3663,6 +3680,7 @@ mod tests {
                     working_directory_request: None,
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
+                    resolved_config_bundle: None,
                 },
             )
             .unwrap();
