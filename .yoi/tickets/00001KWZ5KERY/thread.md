@@ -195,3 +195,47 @@ Implementation progress report:
 - External review will be requested via a read-only sibling Reviewer Pod. `StopPod` は使わない。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-08T10:07:07Z status: request_changes -->
+
+## Review: request changes
+
+External review result: request_changes
+
+Blockers:
+
+1. Builtin Decodal profiles が現在の schema で実際には解決できず、normal Browser/Backend launch が archive path で失敗する。
+   - Evidence:
+     - builtin Decodal files に `tool_enabled` が含まれる（例: `resources/profiles/default.dcdl`, `coder.dcdl`, `reviewer.dcdl`）。
+     - archive resolution は Decodal を JSON に materialize してすぐ `ProfileConfig` に deserialize する。
+     - `ProfileConfig` は `#[serde(deny_unknown_fields)]` で、`feature`, `permissions` などはあるが `tool_enabled` field がない。
+   - Impact:
+     - acceptance criterion「builtin role Profiles が Decodal source として利用できる」を満たしていない。
+     - Backend-built archives が normal workspace/Companion launch に使われるなら、unknown-field error で Worker creation 前に失敗する。
+   - Required fix:
+     - Decodal profile schema で既存 typed fields を使って tool policy を表現するか、`tool_enabled` 相当を typed mapping/field として受け入れて Worker manifest/config に変換する。
+     - embedded builtin `.dcdl` それぞれを real `ProfileSourceArchive` + Decodal + `ProfileConfig` path で resolve する focused test を追加する。
+
+2. Missing/unknown profile selectors が typed diagnostic にならず、silent default fallback する。
+   - Evidence:
+     - Runtime archive resolution が requested selector 欠落時に `"default"` へ fallback している。
+     - Backend archive construction が selected label を `embedded_profile_path(profile)` に入れ、unknown `Builtin` / `Named` profile を `profiles/default.dcdl` に map している。
+   - Impact:
+     - missing profile / ambiguous selector が typed diagnostic になるという acceptance criterion に違反。
+     - invalid/custom profile request が default profile Worker として成功し得るため、Browser/Backend launch の correctness / authority boundary 問題。
+   - Required fix:
+     - unknown profile selector は archive construction 前または archive resolution 中に typed diagnostic で拒否する。
+     - explicit RuntimeDefault/default 以外の default fallback を削除する。
+     - unknown `Named` / unknown `Builtin` selector の tests を追加する。
+
+Validation / inspection performed:
+- Ticket records と IntentPacket / acceptance criteria を確認。
+- implementation worktree 内で implementation commit/diff targets を read-only inspection。
+- archive format/verification, config bundle storage, Runtime launch, Backend archive construction, Browser-facing summaries, builtin Decodal profiles を確認。
+- broad build/test matrix は Orchestrator-reported validation pass を参照し、Reviewer は変更を行っていない。
+
+Non-blocking follow-ups:
+- blockers 修正後、embedded Decodal profiles を使う actual Browser/Backend default launch bundle path の integration-style unit test を追加するとよい。
+- supported profile registry boundary をより明確にするとよい。現状 Backend archive construction は embedded builtins hardcode で、Ticket は workspace/project/builtin profile registry discovery を記述している。
+
+---
