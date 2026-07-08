@@ -1,8 +1,8 @@
 ---
-title: 'Add Runtime-to-Backend resource fetch channel'
-state: 'planning'
+title: 'Add Runtime-to-Backend resource fetch REST API'
+state: 'ready'
 created_at: '2026-07-08T09:12:33Z'
-updated_at: '2026-07-08T09:12:33Z'
+updated_at: '2026-07-08T09:27:52Z'
 assignee: null
 ---
 
@@ -18,20 +18,20 @@ Runtime は Worker execution host であり、Workspace filesystem を直接読�
 - Workspace metadata / repository metadata の bounded lookup。
 - 将来の Backend-owned resource / prompt / policy artifact lookup。
 
-これらを Runtime-local filesystem discovery や ad hoc HTTP endpoint で増やすと、Workspace authority、credential、redaction、audit、capability の境界が崩れる。本 Ticket は Runtime -> Backend の情報取得を、typed resource fetch / capability request channel として定義・実装する。
+これらを Runtime-local filesystem discovery や ad hoc endpoint で増やすと、Workspace authority、credential、redaction、audit、capability の境界が崩れる。本 Ticket は Runtime -> Backend の情報取得を、Runtime-internal REST API と Backend-issued resource handle として実装する。
 
 ## 実装順序
 
-1. 本 Ticket `00001KX0G06VA`: Runtime -> Backend の resource fetch channel を実装する。
-2. Ticket `00001KWZ5KERY`: Decodal `ProfileSourceArchive` prefetch/verify は、本 Ticket の channel を使って Backend から archive を取得する。
+1. 本 Ticket `00001KX0G06VA`: Runtime -> Backend の resource fetch REST API を実装する。
+2. Ticket `00001KWZ5KERY`: Decodal `ProfileSourceArchive` prefetch/verify は、本 Ticket の REST API を使って Backend から archive を取得する。
 3. Ticket `00001KX0DSMPT`: Workspace/Profile settings UI/API は Decodal source model に合わせて実装する。
-4. Memory / Ticket / Objective tool backend の Runtime -> Backend 接続は後続 Ticket で、この channel 上の resource/capability として実装する。
+4. Memory / Ticket / Objective tool backend の Runtime -> Backend 接続は後続 Ticket で、この REST API 上の resource/capability として実装する。
 
 ## 実装目的
 
 - Runtime が Workspace filesystem を読まずに、Backend-owned resource を取得できる。
 - Backend が Workspace information の authority として access control / redaction / audit を持つ。
-- Runtime は Backend-issued capability / resource handle なしに任意 Workspace information を取得できない。
+- Runtime は Backend-issued resource handle なしに任意 Workspace information を取得できない。
 - Browser-facing API に Runtime -> Backend resource handle、Backend internal endpoint、credential、raw path を露出しない。
 - `ProfileSourceArchive` prefetch のような Worker creation-time fetch と、Memory/Ticket/Objective のような Worker runtime-time lookup の両方に拡張できる。
 
@@ -59,21 +59,26 @@ handle に含めないもの:
 - secret value。
 - Browser request 由来の raw filesystem scope。
 
-### 2. Runtime -> Backend fetch protocol を実装する
+### 2. Runtime-internal Backend REST API を実装する
 
-Runtime が Backend-owned resource を取得する protocol を追加する。
+Runtime が Backend-owned resource を取得する REST API を追加する。v0 は request/response fetch でよく、WebSocket や persistent bidirectional channel は使わない。
+
+想定 endpoint:
+
+```text
+POST /internal/runtime/resources/fetch
+```
 
 実装すること:
 
 - embedded Runtime direct call path。
 - remote Runtime HTTP path。
 - request/response typed schema。
-- bounded bytes / streaming or chunking policy。
+- runtime credential / connection authority validation。
+- bounded bytes / optional streaming or chunking policy。
 - timeout / cancellation / retry policy。
 - missing / expired / unauthorized / unsupported resource diagnostics。
 - response digest validation。
-
-v0 は request/response fetch でよい。WebSocket や persistent bidirectional channel は非目標とする。
 
 ### 3. Backend resource broker を実装する
 
@@ -99,13 +104,13 @@ v0 resource kind:
 - `objective_read` / `objective_update`。
 - `workspace_metadata_read`。
 
-### 4. Runtime-side client / cache を追加する
+### 4. Runtime-side REST client / cache を追加する
 
-Runtime は Backend resource handle を受け取り、必要な resource を fetch / verify / cache できる。
+Runtime は Backend resource handle を受け取り、必要な resource を REST fetch / verify / cache できる。
 
 実装すること:
 
-- resource fetch client。
+- resource fetch REST client。
 - digest / revision / content type validation。
 - bounded cache for immutable/digest-addressed artifacts。
 - mutable resource は cache しないか、short TTL / revision validation を使う。
@@ -125,9 +130,9 @@ Runtime -> Backend fetch が Workspace filesystem bypass や raw endpoint leak �
 
 ## 受け入れ条件
 
-- Runtime -> Backend resource fetch protocol が typed schema として実装されている。
+- Runtime -> Backend resource fetch REST API が typed request/response schema として実装されている。
 - Backend が resource handle を発行・検証し、v0 resource kind `profile_source_archive` を返せる。
-- Runtime が resource handle から `ProfileSourceArchive` を fetch / verify / cache できる。
+- Runtime が resource handle から `ProfileSourceArchive` を REST fetch / verify / cache できる。
 - embedded Runtime direct call path と remote Runtime HTTP path が同じ resource contract を使う。
 - Runtime は Workspace filesystem を読まず、Backend resource handle なしに Workspace-derived resource を取得できない。
 - expired handle、unauthorized handle、workspace/runtime/worker mismatch、missing resource、digest mismatch、oversized response は typed diagnostic になる。
