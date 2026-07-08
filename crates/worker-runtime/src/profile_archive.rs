@@ -472,7 +472,7 @@ fn validate_archive_path(path: &str) -> Result<(), ProfileArchiveError> {
     Ok(())
 }
 
-fn sha256_hex(data: &[u8]) -> String {
+pub fn sha256_hex(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
     let mut out = String::from("sha256:");
     for byte in digest.as_slice() {

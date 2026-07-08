@@ -78,6 +78,14 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
     if let Some(runtime_base_dir) = config.worker_runtime_base_dir.clone() {
         factory = factory.with_runtime_base_dir(runtime_base_dir);
     }
+    if let Some(endpoint) = config.backend_resource_endpoint.clone() {
+        factory = factory.with_resource_client(Arc::new(
+            worker_runtime::resource::HttpBackendResourceClient::new(
+                endpoint,
+                config.backend_resource_token.clone(),
+            ),
+        ));
+    }
     if let Some(profile) = config.profile.clone() {
         factory = factory.with_profile(profile);
     }
@@ -172,6 +180,13 @@ where
             "--worker-runtime-base-dir" => {
                 config.worker_runtime_base_dir =
                     Some(PathBuf::from(take_value(&flag, inline_value, &mut args)?));
+            }
+            "--backend-resource-endpoint" => {
+                config.backend_resource_endpoint =
+                    Some(take_value(&flag, inline_value, &mut args)?);
+            }
+            "--backend-resource-token" => {
+                config.backend_resource_token = Some(take_value(&flag, inline_value, &mut args)?);
             }
             "--profile" => {
                 config.profile = Some(take_value(&flag, inline_value, &mut args)?);
@@ -317,6 +332,8 @@ struct ProcessConfig {
     worker_store_dir: Option<PathBuf>,
     worker_metadata_dir: Option<PathBuf>,
     worker_runtime_base_dir: Option<PathBuf>,
+    backend_resource_endpoint: Option<String>,
+    backend_resource_token: Option<String>,
     profile: Option<String>,
 }
 
@@ -330,6 +347,8 @@ impl ProcessConfig {
             worker_store_dir: None,
             worker_metadata_dir: None,
             worker_runtime_base_dir: None,
+            backend_resource_endpoint: None,
+            backend_resource_token: None,
             profile: None,
         })
     }
@@ -405,6 +424,8 @@ Options:\n\
   --worker-store-dir <PATH>             Worker session store directory\n\
   --worker-metadata-dir <PATH>          Worker metadata directory\n\
   --worker-runtime-base-dir <PATH>      Worker controller runtime directory\n\
+  --backend-resource-endpoint <URL>     Internal Backend resource fetch endpoint for resource handles\n\
+  --backend-resource-token <TOKEN>      Optional bearer token for the Backend resource fetch endpoint\n\
   --store <memory|fs>                   Runtime catalog store selection (default: memory)\n\
   --fs-root <PATH>                      Runtime catalog filesystem store root\n\
   --local-token <TOKEN>                 Minimal local bearer token placeholder\n\

@@ -12,7 +12,8 @@ use chrono::{SecondsFormat, Utc};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use worker_runtime::worker_backend::WorkerRuntimeExecutionBackend;
+use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
+use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
 use worker_runtime::working_directory::{
     LocalGitWorktreeMaterializer, WorkingDirectoryDiagnostic, WorkingDirectoryMaterializer,
 };
@@ -42,6 +43,7 @@ use crate::repositories::{
     ConfiguredRepository, RepositoryListProjection, RepositoryLogRead, RepositoryLookupError,
     RepositoryRegistryReader, RepositorySummary,
 };
+use crate::resource_broker::BackendResourceBroker;
 use crate::store::{ControlPlaneStore, WorkspaceRecord};
 use crate::{Error, Result};
 use worker_runtime::catalog::{
@@ -154,6 +156,7 @@ pub struct WorkspaceApi {
     runtime: Arc<RuntimeRegistry>,
     companion: Arc<CompanionConsole>,
     observation_proxy: BackendObservationProxy,
+    resource_broker: BackendResourceBroker,
     working_directory_materializer: Arc<LocalGitWorktreeMaterializer>,
 }
 
@@ -162,21 +165,46 @@ impl WorkspaceApi {
         let materializer = Arc::new(LocalGitWorktreeMaterializer::new(
             config.embedded_runtime_store_root.clone(),
         ));
-        let execution_backend =
-            WorkerRuntimeExecutionBackend::from_workspace(config.workspace_root.clone())
-                .map_err(|err| {
-                    crate::Error::Store(format!(
-                        "failed to initialize embedded Worker backend: {err}"
-                    ))
-                })?
-                .with_working_directory_materializer((*materializer).clone());
-        Self::new_with_execution_backend(config, store, Arc::new(execution_backend)).await
+        let resource_broker = BackendResourceBroker::default();
+        let execution_backend = WorkerRuntimeExecutionBackend::new(
+            ProfileRuntimeWorkerFactory::new(config.workspace_root.clone())
+                .with_resource_client(Arc::new(resource_broker.clone())),
+        )
+        .map_err(|err| {
+            crate::Error::Store(format!(
+                "failed to initialize embedded Worker backend: {err}"
+            ))
+        })?
+        .with_working_directory_materializer((*materializer).clone());
+        Self::new_with_execution_backend_and_broker(
+            config,
+            store,
+            Arc::new(execution_backend),
+            resource_broker,
+        )
+        .await
     }
 
+    #[cfg(test)]
     async fn new_with_execution_backend(
         config: ServerConfig,
         store: Arc<dyn ControlPlaneStore>,
         execution_backend: Arc<dyn worker_runtime::execution::WorkerExecutionBackend>,
+    ) -> Result<Self> {
+        Self::new_with_execution_backend_and_broker(
+            config,
+            store,
+            execution_backend,
+            BackendResourceBroker::default(),
+        )
+        .await
+    }
+
+    async fn new_with_execution_backend_and_broker(
+        config: ServerConfig,
+        store: Arc<dyn ControlPlaneStore>,
+        execution_backend: Arc<dyn worker_runtime::execution::WorkerExecutionBackend>,
+        resource_broker: BackendResourceBroker,
     ) -> Result<Self> {
         store
             .upsert_workspace(&WorkspaceRecord {
@@ -193,13 +221,17 @@ impl WorkspaceApi {
                 config.embedded_runtime_store_root.clone(),
                 execution_backend,
             )
+            .map(|runtime| runtime.with_resource_broker(resource_broker.clone()))
             .map_err(|err| {
                 crate::Error::Store(format!("invalid embedded Worker backend: {err}"))
             })?,
         );
         for remote_config in config.remote_runtime_sources.iter().cloned() {
-            runtime
-                .register(RemoteWorkerRuntime::new(remote_config).map_err(|err| err.into_error())?);
+            runtime.register(
+                RemoteWorkerRuntime::new(remote_config)
+                    .map(|host| host.with_resource_broker(resource_broker.clone()))
+                    .map_err(|err| err.into_error())?,
+            );
         }
         let runtime = Arc::new(runtime);
         let companion = Arc::new(CompanionConsole::new(runtime.clone()));
@@ -214,6 +246,7 @@ impl WorkspaceApi {
             runtime,
             companion,
             observation_proxy,
+            resource_broker,
             working_directory_materializer,
         })
     }
@@ -327,6 +360,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/settings/runtime-connections/remotes/{runtime_id}/test",
             post(scoped_test_remote_runtime_connection),
+        )
+        .route(
+            "/internal/runtime/resources/fetch",
+            post(post_internal_runtime_resource_fetch),
         )
         .route("/api/companion/status", get(get_companion_status))
         .route(
@@ -1445,7 +1482,9 @@ async fn add_remote_runtime_connection(
             vec![diagnostic],
         )
     })?;
-    let active_runtime = RemoteWorkerRuntime::new(active_config).map_err(|err| err.into_error())?;
+    let active_runtime = RemoteWorkerRuntime::new(active_config)
+        .map(|host| host.with_resource_broker(api.resource_broker.clone()))
+        .map_err(|err| err.into_error())?;
     local_config.runtimes.remote.push(remote_config);
     write_workspace_backend_config_for_settings(&api, &local_config)?;
     api.runtime.register_or_replace(active_runtime);
@@ -1694,6 +1733,33 @@ async fn create_workspace_worker(
         worker,
         diagnostics: result.diagnostics,
     }))
+}
+
+async fn post_internal_runtime_resource_fetch(
+    State(api): State<WorkspaceApi>,
+    Json(request): Json<BackendResourceFetchRequest>,
+) -> std::result::Result<
+    Json<worker_runtime::resource::BackendResourceFetchResponse>,
+    (StatusCode, Json<BackendResourceError>),
+> {
+    api.resource_broker
+        .fetch_profile_source_archive(request)
+        .map(Json)
+        .map_err(|error| (backend_resource_error_status(&error), Json(error)))
+}
+
+fn backend_resource_error_status(error: &BackendResourceError) -> StatusCode {
+    match error {
+        BackendResourceError::Expired => StatusCode::GONE,
+        BackendResourceError::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
+        BackendResourceError::MissingResource => StatusCode::NOT_FOUND,
+        BackendResourceError::UnsupportedKind
+        | BackendResourceError::DigestMismatch { .. }
+        | BackendResourceError::Oversized { .. }
+        | BackendResourceError::ContentTypeMismatch { .. }
+        | BackendResourceError::InvalidResponse { .. } => StatusCode::BAD_REQUEST,
+        BackendResourceError::Transport { .. } => StatusCode::BAD_GATEWAY,
+    }
 }
 
 async fn get_companion_status(
@@ -3203,6 +3269,7 @@ mod tests {
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message;
     use tower::ServiceExt;
+    use worker_runtime::resource::BackendResourceClient;
 
     use crate::hosts::{
         TicketWorkerRole, WorkerInputKind, WorkerOperationState, WorkerSpawnAcceptanceRequirement,
@@ -3375,16 +3442,161 @@ mod tests {
         }
     }
 
-    async fn test_app(workspace_root: impl Into<PathBuf>) -> Router {
+    async fn test_api(workspace_root: impl Into<PathBuf>) -> WorkspaceApi {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        let api = WorkspaceApi::new_with_execution_backend(
+        WorkspaceApi::new_with_execution_backend(
             test_server_config(workspace_root),
             Arc::new(store),
             Arc::new(DeterministicExecutionBackend::default()),
         )
         .await
-        .unwrap();
-        build_router(api)
+        .unwrap()
+    }
+
+    async fn test_app(workspace_root: impl Into<PathBuf>) -> Router {
+        build_router(test_api(workspace_root).await)
+    }
+
+    fn test_profile_archive() -> worker_runtime::profile_archive::ProfileSourceArchive {
+        use worker_runtime::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveInput};
+        ProfileSourceArchive::build(ProfileSourceArchiveInput {
+            id: "profile-source-archive:server-test".to_string(),
+            entrypoints: std::collections::BTreeMap::from([(
+                "default".to_string(),
+                "profiles/default.dcdl".to_string(),
+            )]),
+            imports: std::collections::BTreeMap::new(),
+            sources: std::collections::BTreeMap::from([(
+                "profiles/default.dcdl".to_string(),
+                r#"{
+                    slug = "default";
+                    description = "Default";
+                    scope = "workspace_read";
+                }"#
+                .to_string(),
+            )]),
+        })
+        .unwrap()
+    }
+
+    fn missing_resource_handle() -> worker_runtime::resource::BackendResourceHandle {
+        worker_runtime::resource::BackendResourceHandle {
+            kind: worker_runtime::resource::BackendResourceKind::ProfileSourceArchive,
+            workspace_id: "workspace-test".to_string(),
+            scope_id: Some("workspace-profile-source".to_string()),
+            runtime_id: Some("runtime-test".to_string()),
+            worker_id: None,
+            resource_id: "profile-source-archive:missing".to_string(),
+            digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+            operation: worker_runtime::resource::BackendResourceOperation::FetchArchive,
+            expires_at_unix_seconds: 4_102_444_800,
+            nonce: "missing-nonce".to_string(),
+            revision: "missing-revision".to_string(),
+            generation: None,
+            max_bytes: worker_runtime::resource::DEFAULT_PROFILE_SOURCE_ARCHIVE_MAX_BYTES,
+            content_type: worker_runtime::resource::PROFILE_SOURCE_ARCHIVE_CONTENT_TYPE.to_string(),
+            redaction: worker_runtime::resource::ResourceRedactionPolicy::RuntimeInternalOnly,
+            audit_correlation_id: "audit-missing".to_string(),
+            profile_source_graph: Some(
+                worker_runtime::profile_archive::ProfileSourceGraphSummary {
+                    entrypoints: std::collections::BTreeMap::from([(
+                        "default".to_string(),
+                        "profiles/default.dcdl".to_string(),
+                    )]),
+                    source_count: 1,
+                    import_count: 0,
+                    total_source_bytes: 0,
+                },
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_resource_fetch_rest_returns_typed_missing_resource() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let app = test_app(workspace.path()).await;
+        let handle = missing_resource_handle();
+        let response = app
+            .oneshot(
+                Request::post("/internal/runtime/resources/fetch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(
+                            &worker_runtime::resource::BackendResourceFetchRequest {
+                                audit_correlation_id: handle.audit_correlation_id.clone(),
+                                runtime_id: "runtime-test".to_string(),
+                                worker_id: None,
+                                handle,
+                            },
+                        )
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: worker_runtime::resource::BackendResourceError =
+            serde_json::from_slice(&bytes).unwrap();
+        assert!(matches!(
+            error,
+            worker_runtime::resource::BackendResourceError::MissingResource
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_http_resource_fetch_uses_backend_resource_contract() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let broker = api.resource_broker.clone();
+        let archive = test_profile_archive();
+        let runtime_id = worker_runtime::identity::RuntimeId::new("runtime-test").unwrap();
+        let handle = broker.issue_profile_source_archive_handle(
+            "workspace-test",
+            Some(&runtime_id),
+            None,
+            archive,
+        );
+        let app = build_router(api);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = worker_runtime::resource::HttpBackendResourceClient::new(
+            format!("http://{addr}/internal/runtime/resources/fetch"),
+            None,
+        );
+
+        let response = client
+            .fetch_resource(worker_runtime::resource::BackendResourceFetchRequest {
+                audit_correlation_id: handle.audit_correlation_id.clone(),
+                runtime_id: runtime_id.as_str().to_string(),
+                worker_id: None,
+                handle: handle.clone(),
+            })
+            .await
+            .expect("remote HTTP resource fetch succeeds");
+        assert_eq!(response.digest, handle.digest);
+
+        let mut tampered = handle;
+        tampered.scope_id = Some("tampered".to_string());
+        let error = client
+            .fetch_resource(worker_runtime::resource::BackendResourceFetchRequest {
+                audit_correlation_id: tampered.audit_correlation_id.clone(),
+                runtime_id: runtime_id.as_str().to_string(),
+                worker_id: None,
+                handle: tampered,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            worker_runtime::resource::BackendResourceError::Unauthorized { .. }
+        ));
+        server.abort();
     }
 
     fn runtime_test_bundle() -> worker_runtime::config_bundle::ConfigBundle {
@@ -3406,6 +3618,7 @@ mod tests {
             }],
             declarations: Vec::new(),
             profile_source_archive: None,
+            profile_source_archive_handle: None,
         }
         .with_computed_digest()
     }

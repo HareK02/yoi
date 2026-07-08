@@ -5936,6 +5936,7 @@ dependencies = [
  "llm-engine",
  "manifest",
  "protocol",
+ "reqwest",
  "serde",
  "serde_json",
  "session-store",

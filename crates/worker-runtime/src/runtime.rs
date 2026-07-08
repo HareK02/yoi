@@ -1628,6 +1628,7 @@ mod tests {
                 reference: "capability:read".to_string(),
             }],
             profile_source_archive: None,
+            profile_source_archive_handle: None,
         }
         .with_computed_digest()
     }

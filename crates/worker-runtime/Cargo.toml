@@ -14,7 +14,7 @@ required-features = ["ws-server", "fs-store"]
 [features]
 default = []
 fs-store = []
-http-server = ["dep:axum", "dep:tower"]
+http-server = ["dep:axum", "dep:tower", "dep:reqwest"]
 ws-server = ["http-server", "axum/ws", "dep:futures", "tokio/sync"]
 
 [dependencies]
@@ -28,6 +28,7 @@ serde = { workspace = true, features = ["derive"] }
 session-store.workspace = true
 sha2.workspace = true
 serde_json.workspace = true
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["json", "rustls"] }
 tar.workspace = true
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }

@@ -455,6 +455,7 @@ fn companion_config_bundle() -> ConfigBundle {
         }],
         declarations: Vec::new(),
         profile_source_archive: Some(companion_profile_archive()),
+        profile_source_archive_handle: None,
     }
     .with_computed_digest()
 }
