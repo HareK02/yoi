@@ -1,8 +1,8 @@
 ---
 title: 'Add Workspace settings API and pages for Workspace/Profile editing'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-07-08T08:34:01Z'
-updated_at: '2026-07-08T13:18:55Z'
+updated_at: '2026-07-08T13:20:27Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-07-08T10:44:13Z'

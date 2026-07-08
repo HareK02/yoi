@@ -304,3 +304,78 @@ Non-blocking follow-up:
 - If merge target accumulated additional `.yoi/tickets/00001KX0DSMPT/thread.md` edits, resolve Ticket-record conflicts normally during merge; this does not affect product/code correctness.
 
 ---
+
+<!-- event: state_changed author: orchestrator at: 2026-07-08T13:20:09Z from: inprogress to: done reason: merged_validated_review_approved field: state -->
+
+## State changed
+
+Merge/validation acceptance:
+
+- Follow-up external review approved the implementation after blocker fixes。
+- Implementation branch `work/00001KX0DSMPT-workspace-profile-settings` was merged into the orchestration branch with merge commit `0bf3638c merge: workspace profile settings`。
+- Ticket-record conflicts during merge were resolved by preserving Orchestrator-side Ticket item/thread records; product/code changes were merged。
+- Final validation in Orchestrator worktree passed:
+  - `git diff --check`: pass
+  - `cargo test -p yoi-workspace-server`: pass（91 lib tests + 2 main tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（17 tests）
+  - `yoi ticket doctor`: ok
+  - `nix build .#yoi --no-link`: pass
+
+Implementation commits:
+- `3eefd333 feat: add workspace profile settings`
+- `0c2ca1ea fix: harden profile settings validation`
+
+No merge-blocking issues remain.
+
+---
+
+<!-- event: state_changed author: hare at: 2026-07-08T13:20:27Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-07-08T13:20:27Z status: closed -->
+
+## 完了
+
+完了。
+
+実装内容:
+- Workspace/Profile settings scoped API を追加した。
+- Workspace metadata read/update と safe identity/source summaries を扱う Settings API を追加した。
+- Profile registry/source read/update API を追加し、create/update/delete と revision/etag-style optimistic checks を実装した。
+- Backend profile settings model に safe source ids/display paths、Decodal/ProfileSourceArchive validation、selector uniqueness、path/symlink escape protection、source size checks、typed diagnostics を追加した。
+- Profile updates 後に Backend profile discovery / validation / launch options を再構築し、Worker launch profile candidates と Settings profile list が同じ discovery result を使うようにした。
+- invalid project profile は relevant profile summary に diagnostics を付与し、Worker launch candidates から除外し、candidate validation でも reject するようにした。
+- Browser-facing responses/UI から host absolute paths、secret values、Runtime endpoints/tokens、socket/session paths、runtime-local store paths、archive content/digest、raw resource handles、backend-private paths を出さないようにした。
+- Settings UI に Workspace overview と Profile list/source editor surface を追加した。
+- Focused backend/web tests を追加/強化した。
+
+主な commit / merge:
+- implementation: `3eefd333 feat: add workspace profile settings`
+- review fix: `0c2ca1ea fix: harden profile settings validation`
+- merge into orchestration: `0bf3638c merge: workspace profile settings`
+
+Review:
+- 初回 external review は request_changes。
+- follow-up external review は approve。merge-blocking issue なし。
+
+Final validation in Orchestrator worktree:
+- `git diff --check`: pass
+- `cargo test -p yoi-workspace-server`: pass（91 lib tests + 2 main tests）
+- `cargo check -p yoi`: pass
+- `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+- `cd web/workspace && deno task test`: pass（17 tests）
+- `yoi ticket doctor`: ok
+- `nix build .#yoi --no-link`: pass
+
+補足:
+- implementation branch merge 時に Ticket record conflict が発生したため、Orchestrator 側の Ticket item/thread を保持して解決した。product/code changes は merge 済み。
+
+---
