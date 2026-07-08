@@ -211,3 +211,46 @@ Implementation progress report:
 - External review will be requested via a read-only sibling Reviewer Pod. `StopPod` は使わない。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-08T11:27:23Z status: request_changes -->
+
+## Review: request changes
+
+External review result: request_changes
+
+Blockers:
+
+1. Backend handle verification が Runtime から送られた mutable handle fields を信頼している。
+   - `crates/workspace-server/src/resource_broker.rs` の fetch validation は expiry / max-bytes を `request.handle` から確認しており、broker-stored issued handle の authority fields と照合していない。
+   - 有効な nonce/resource/digest を持つ Runtime が以下を改変できる可能性がある。
+     - `expires_at_unix_seconds` を延長して expiry を bypass。
+     - `max_bytes` を増やして oversized rejection を bypass。
+     - redaction/scope/generation など他 policy fields も stored issued handle に bind されていない。
+   - Backend-issued handle を Backend が検証し、expired/oversized handles が fail closed typed diagnostics になるという Ticket requirement に反する。
+
+2. Runtime cache が Backend authorization / expiry / binding を bypass している。
+   - `ProfileRuntimeWorkerFactory::resolve_profile_source_archive` は fetch 前に digest keyed `profile_archive_cache` を見る。
+   - 一度 archive が cache されると、同一 digest の後続 config bundle は Backend verification なしで reuse でき、expired handle / runtime-worker-workspace mismatch でも成功し得る。
+   - 「Runtime cannot fetch/use Workspace-derived resources without Backend-issued handle」「Runtime verifies expiry/binding」「expired/unauthorized/mismatch cases produce diagnostics」に反する。
+
+3. security contract の acceptance-level tests が不足している。
+   - happy-path broker issue/fetch、runtime mismatch、browser projection redaction はあるが、以下の meaningful coverage が不足している。
+     - tampered expired handle / expiry extension。
+     - worker mismatch。
+     - REST 経由 missing resource。
+     - Runtime response verification の digest mismatch。
+     - tampered `max_bytes` による oversized response。
+     - remote HTTP resource-fetch path が同じ contract を使うこと。
+   - 上記 defect が存在しているため、単なる coverage gap ではなく core Ticket intent の boundary regression を許している。
+
+Validation / inspection performed:
+- implementation worktree `/home/hare/Projects/yoi/.worktree/00001KX0G06VA-resource-fetch-api` のみを使用。
+- Ticket item/thread/orchestration plan を確認。
+- `git show --stat --check 57e96d3b`, `git show --name-only 57e96d3b`, relevant implementation files を inspection。
+- Orchestrator-reported validation pass を参照し、Reviewer は heavy tests を再実行していない。
+
+Non-blocking follow-ups:
+- New `reqwest` dependency and `package.nix` cargo hash update は HTTP Runtime resource client と `nix build` pass により妥当。
+- broader resource kind 追加前に、stored issued handle policy fields の完全比較、または signed/opaque handle representation を検討するとよい。
+
+---
