@@ -282,3 +282,38 @@ Review-fix implementation report:
 - Requesting follow-up external review against `57e96d3b..e716ae44` and full combined implementation。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-08T11:53:02Z status: approve -->
+
+## Review: approve
+
+External follow-up review result: approve
+
+Blockers: none.
+
+Validation performed:
+- Read-only review in implementation worktree `/home/hare/Projects/yoi/.worktree/00001KX0G06VA-resource-fetch-api`。
+- Ticket item/thread, branch/log/status, `57e96d3b..e716ae44` fix diff, and relevant implementation files を確認。
+- Reviewer は validation suite を再実行せず、Orchestrator-reported passing validation を evidence として確認。
+
+Findings:
+- Prior blocker 1 fixed: Backend は mutable request handle policy fields を信頼しない。`BackendResourceBroker` は issued `BackendResourceHandle` を resource と共に保存し、stored expiry/max_bytes を検証してから request handle と stored issued handle を比較する。tampering は `Expired` / `Oversized` / `Unauthorized` diagnostics で fail closed。expiry extension、policy tampering、worker/runtime mismatch、max_bytes tampering tests あり。
+- Prior blocker 2 fixed: Runtime cache は Backend authorization を bypass しない。`resolve_profile_source_archive` は先に Backend fetch を行い、handle に対して response verify してから digest cache を reuse/insert する。cache test は second-use backend `Expired` rejection と backend call count を確認している。
+- Prior blocker 3 fixed: security contract tests が meaningful に追加されている。
+  - `resource_broker.rs`: expired/expiry extension、worker mismatch、runtime mismatch、policy tampering、stored max_bytes oversized。
+  - `resource.rs`: Runtime digest mismatch と oversized response verification。
+  - `server.rs`: REST missing-resource diagnostic と remote HTTP contract/tampering path。
+  - `worker_backend.rs`: cache authorization。
+  - Browser redaction: `ConfigBundleSummary` redaction test。
+- Typed/direct/remote contract: `BackendResourceFetchRequest/Response/Error` は shared typed structs。embedded direct path は `BackendResourceBroker` を `BackendResourceClient` として使い、remote HTTP は同じ request shape を `/internal/runtime/resources/fetch` に POST する。
+- Browser-facing redaction remains strong: browser-safe summaries は profile source graph summary のみを出し、handle nonce/resource id/archive digest/runtime-worker binding/token/internal endpoint/raw path を出さない。
+- ProfileSourceArchive integration は normal Backend/Browser launch で Backend-owned resource boundary を使う。generated bundles は resource handle を持ち inline archive を持たず、Runtime は fetched archive bytes から resolve する。filesystem profile discovery は explicit no-config-bundle compatibility/debug fallback のみ。
+
+Non-blocking follow-ups:
+- stored `audit_correlation_id` の echo と Runtime-side response `resource_id` check を追加すると diagnostic integrity がさらに強くなる。
+- remote HTTP resource fetch が trusted Backend/Runtime links を越えて露出する場合は、JSON body materialization 前の explicit client-side timeout/response-size limiting を検討する。
+
+Effect on queued `00001KX0DSMPT`:
+- blocking concern なし。profile/archive details は redacted summaries behind boundary に留まっており、future settings UI/API が profile metadata を consume しても handles を露出しない設計と互換。
+
+---
