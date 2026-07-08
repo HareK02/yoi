@@ -266,3 +266,37 @@ Review-fix implementation report:
 - Requesting follow-up external review against `a823d414..a2833dad` and full combined implementation。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-08T10:33:16Z status: approve -->
+
+## Review: approve
+
+External follow-up review result: approve
+
+Result: approve
+
+Review evidence:
+- Prior blocker 1 is fixed:
+  - Builtin Decodal profiles now resolve through `default_embedded_config_bundle(...) -> ProfileSourceArchive -> verify() -> resolve_profile(...) -> ProfileConfig` rather than bypassing archive resolution。
+  - `resources/profiles/*.dcdl` no longer use unsupported `tool_enabled`; they use supported `feature = { ... }` fields and are covered by the added embedded-profile resolution test。
+- Prior blocker 2 is fixed:
+  - `VerifiedProfileSourceArchive::resolve_profile` no longer falls back to `default` for missing selectors。
+  - Unknown `Builtin` and `Named` selectors are rejected before bundle construction in `embedded_profile_path(...)`, with typed runtime diagnostics from embedded/remote launch paths。
+  - Explicit runtime default remains valid via default/builtin-default archive entrypoints。
+- Browser/Backend launch path:
+  - Browser only selects Backend-published profile candidates。
+  - Workspace Backend builds/syncs a config bundle containing the archive before `CreateWorkerRequest`。
+  - Runtime `create_worker` passes the stored config bundle into the execution backend; `ProfileRuntimeWorkerFactory` only uses the Lua/filesystem fallback when no config bundle is present, so ordinary Browser/Backend launch does not read Runtime-local profile discovery。
+- Archive invariants:
+  - Archive build/verify enforces relative safe tar paths, source counts/sizes/total bytes, source digests, archive digest, supported source kind, and declared import-map lookup。
+  - Undeclared imports are rejected by `ArchiveSourceLoader`。
+- Browser-facing exposure:
+  - Web launch types expose only profile candidates。
+  - Config bundle summaries expose source graph summary rather than archive content or archive digest; worker summaries retain only profile selector/config-bundle ref metadata and do not expose runtime store paths/endpoints/secrets。
+- Compatibility:
+  - Lua/filesystem fallback remains isolated to direct/debug paths without a config bundle。
+  - Dependency/package changes look sound, and the provided validation set includes Rust tests/checks, Deno checks/tests, ticket doctor, and `nix build .#yoi --no-link`。
+
+No merge blockers found.
+
+---
