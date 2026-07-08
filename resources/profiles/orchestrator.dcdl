@@ -2,12 +2,11 @@ slug = "orchestrator";
 description = "Ticket orchestrator profile.";
 scope = "workspace_write";
 
-tool_enabled = {
-    bash = true;
-    read = true;
-    write = true;
-    edit = true;
-    grep = true;
-    glob = true;
-    memory = true;
+feature = {
+    task = { enabled = true; };
+    memory = { enabled = true; };
+    web = { enabled = true; };
+    workers = { enabled = true; };
+    ticket = { enabled = true; access = "lifecycle"; };
+    ticket_orchestration = { enabled = true; };
 };

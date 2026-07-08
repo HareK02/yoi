@@ -323,7 +323,6 @@ impl VerifiedProfileSourceArchive {
             .manifest
             .entrypoints
             .get(selector)
-            .or_else(|| self.manifest.entrypoints.get("default"))
             .ok_or_else(|| ProfileArchiveError::MissingEntrypoint(selector.to_string()))?;
         let mut engine = Engine::new(ArchiveSourceLoader { archive: self });
         let source = self
@@ -532,6 +531,17 @@ mod tests {
             .resolve_profile("default", root.path(), "archive-worker")
             .unwrap();
         assert_eq!(manifest.worker.name, "archive-worker");
+    }
+
+    #[test]
+    fn unknown_selector_does_not_fallback_to_default() {
+        let archive = sample_archive();
+        let verified = archive.verify().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            verified.resolve_profile("missing", root.path(), "archive-worker"),
+            Err(ProfileArchiveError::MissingEntrypoint(selector)) if selector == "missing"
+        ));
     }
 
     #[test]

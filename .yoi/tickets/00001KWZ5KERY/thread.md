@@ -167,3 +167,27 @@ Validation performed:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-08T10:21:42Z -->
+
+## Implementation report
+
+Follow-up review fixes for Decodal ProfileSourceArchive launch:
+
+- Replaced unsupported `tool_enabled` fields in embedded Decodal profiles with existing typed ProfileConfig fields (`feature`, plus the existing model/session/engine/memory/web fields where applicable) so archive resolution can materialize through Decodal and deserialize under `deny_unknown_fields`.
+- Removed archive selector fallback to `default`; missing selectors now return `ProfileArchiveError::MissingEntrypoint`.
+- Changed Workspace Backend embedded archive construction to reject unknown `Builtin` and `Named` selectors instead of mapping them to the default profile.
+- Added tests that resolve every embedded builtin `.dcdl` via the real Backend-built ProfileSourceArchive + Decodal + ProfileConfig path.
+- Added tests for unknown Builtin/Named selector rejection and no-default-fallback archive resolution.
+
+Validation performed:
+- git diff --check
+- cargo test -p worker-runtime --features ws-server,fs-store
+- cargo test -p yoi-workspace-server
+- cargo check -p yoi
+- cd web/workspace && deno task check && deno task test
+- yoi ticket doctor
+- nix build .#yoi --no-link
+
+
+---
