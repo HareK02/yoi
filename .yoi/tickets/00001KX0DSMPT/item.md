@@ -2,7 +2,7 @@
 title: 'Add Workspace settings API and pages for Workspace/Profile editing'
 state: 'planning'
 created_at: '2026-07-08T08:34:01Z'
-updated_at: '2026-07-08T09:01:17Z'
+updated_at: '2026-07-08T09:25:00Z'
 assignee: null
 ---
 
@@ -88,7 +88,7 @@ UI 要件:
 - Workspace display name を編集できる。
 - Profile list を source kind / selector / label / diagnostics 付きで見られる。
 - Profile registry を編集できる。
-- Decodal Profile source を textarea/editor で編集できる。
+- Decodal Profile source は v0 では formatter / syntax highlighter なしの plain text textarea/editor で編集できる。
 - 保存前後の validation diagnostics を表示する。
 - raw absolute path、Runtime endpoint、secret value を表示しない。
 - Browser WorkingDirectory / Worker launch の profile candidates と同じ Backend discovery 結果を見られる。
