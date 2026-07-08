@@ -19,7 +19,6 @@ pub struct BackendResourceBroker {
 
 #[derive(Clone)]
 struct StoredResource {
-    workspace_id: String,
     runtime_id: Option<String>,
     worker_id: Option<String>,
     handle: BackendResourceHandle,
@@ -58,7 +57,6 @@ impl BackendResourceBroker {
             profile_source_graph: Some(archive.reference.source_graph.clone()),
         };
         let stored = StoredResource {
-            workspace_id,
             runtime_id: runtime_id.map(|id| id.as_str().to_string()),
             worker_id: worker_id.map(|id| id.as_str().to_string()),
             handle: handle.clone(),
@@ -75,9 +73,6 @@ impl BackendResourceBroker {
         request: BackendResourceFetchRequest,
     ) -> Result<BackendResourceFetchResponse, BackendResourceError> {
         verify_handle_shape(&request.handle)?;
-        if request.handle.expires_at_unix_seconds < Utc::now().timestamp() {
-            return Err(BackendResourceError::Expired);
-        }
         let stored = self
             .resources
             .lock()
@@ -87,15 +82,20 @@ impl BackendResourceBroker {
             .get(&request.handle.nonce)
             .cloned()
             .ok_or(BackendResourceError::MissingResource)?;
-        if stored.workspace_id != request.handle.workspace_id
-            || stored.runtime_id != request.handle.runtime_id
-            || stored.worker_id != request.handle.worker_id
-            || stored.handle.resource_id != request.handle.resource_id
-            || stored.handle.digest != request.handle.digest
-            || stored.handle.revision != request.handle.revision
-        {
+        verify_handle_shape(&stored.handle)?;
+        if stored.handle.expires_at_unix_seconds < Utc::now().timestamp() {
+            return Err(BackendResourceError::Expired);
+        }
+        let actual_bytes = stored.archive.content.len() as u64;
+        if actual_bytes > stored.handle.max_bytes {
+            return Err(BackendResourceError::Oversized {
+                max_bytes: stored.handle.max_bytes,
+                actual_bytes,
+            });
+        }
+        if request.handle != stored.handle {
             return Err(BackendResourceError::Unauthorized {
-                message: "resource handle metadata does not match broker record".to_string(),
+                message: "resource handle does not match broker-issued handle".to_string(),
             });
         }
         if let Some(expected_runtime_id) = stored.runtime_id.as_deref() {
@@ -111,13 +111,6 @@ impl BackendResourceBroker {
                     message: "worker id does not match resource handle".to_string(),
                 });
             }
-        }
-        let actual_bytes = stored.archive.content.len() as u64;
-        if actual_bytes > request.handle.max_bytes {
-            return Err(BackendResourceError::Oversized {
-                max_bytes: request.handle.max_bytes,
-                actual_bytes,
-            });
         }
         Ok(BackendResourceFetchResponse {
             kind: BackendResourceKind::ProfileSourceArchive,
@@ -162,7 +155,7 @@ fn verify_handle_shape(handle: &BackendResourceHandle) -> Result<(), BackendReso
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use worker_runtime::identity::RuntimeId;
+    use worker_runtime::identity::{RuntimeId, WorkerId};
     use worker_runtime::profile_archive::{
         ProfileSourceArchive, ProfileSourceArchiveRef, ProfileSourceGraphSummary, sha256_hex,
     };
@@ -184,6 +177,39 @@ mod tests {
                 },
             },
             content,
+        }
+    }
+
+    fn archive_with_len(len: usize) -> ProfileSourceArchive {
+        let content = vec![b'x'; len];
+        let mut entrypoints = BTreeMap::new();
+        entrypoints.insert("default".to_string(), "profiles/default.dcdl".to_string());
+        ProfileSourceArchive {
+            reference: ProfileSourceArchiveRef {
+                id: format!("profile-source-archive:test-{len}"),
+                digest: sha256_hex(&content),
+                size_bytes: content.len() as u64,
+                source_graph: ProfileSourceGraphSummary {
+                    entrypoints,
+                    source_count: 1,
+                    import_count: 0,
+                    total_source_bytes: content.len() as u64,
+                },
+            },
+            content,
+        }
+    }
+
+    fn request(
+        handle: BackendResourceHandle,
+        runtime_id: &RuntimeId,
+        worker_id: Option<&WorkerId>,
+    ) -> BackendResourceFetchRequest {
+        BackendResourceFetchRequest {
+            audit_correlation_id: handle.audit_correlation_id.clone(),
+            handle,
+            runtime_id: runtime_id.as_str().to_string(),
+            worker_id: worker_id.map(|id| id.as_str().to_string()),
         }
     }
 
@@ -212,20 +238,99 @@ mod tests {
     #[test]
     fn broker_rejects_runtime_mismatch() {
         let broker = BackendResourceBroker::default();
+        let runtime_a = RuntimeId::new("runtime-a").unwrap();
         let handle = broker.issue_profile_source_archive_handle(
             "workspace-test",
-            Some(&RuntimeId::new("runtime-a").unwrap()),
+            Some(&runtime_a),
             None,
             archive(),
         );
         let err = broker
-            .fetch_profile_source_archive(BackendResourceFetchRequest {
-                handle: handle.clone(),
-                runtime_id: RuntimeId::new("runtime-b").unwrap().as_str().to_string(),
-                worker_id: None,
-                audit_correlation_id: handle.audit_correlation_id.clone(),
-            })
+            .fetch_profile_source_archive(request(
+                handle,
+                &RuntimeId::new("runtime-b").unwrap(),
+                None,
+            ))
             .unwrap_err();
         assert!(matches!(err, BackendResourceError::Unauthorized { .. }));
+    }
+
+    #[test]
+    fn broker_rejects_worker_mismatch() {
+        let broker = BackendResourceBroker::default();
+        let runtime_id = RuntimeId::new("runtime-test").unwrap();
+        let worker_a = WorkerId::new("worker-a").unwrap();
+        let worker_b = WorkerId::new("worker-b").unwrap();
+        let handle = broker.issue_profile_source_archive_handle(
+            "workspace-test",
+            Some(&runtime_id),
+            Some(&worker_a),
+            archive(),
+        );
+        let err = broker
+            .fetch_profile_source_archive(request(handle, &runtime_id, Some(&worker_b)))
+            .unwrap_err();
+        assert!(matches!(err, BackendResourceError::Unauthorized { .. }));
+    }
+
+    #[test]
+    fn broker_rejects_expiry_extension_from_request_handle() {
+        let broker = BackendResourceBroker::default();
+        let runtime_id = RuntimeId::new("runtime-test").unwrap();
+        let handle = broker.issue_profile_source_archive_handle(
+            "workspace-test",
+            Some(&runtime_id),
+            None,
+            archive(),
+        );
+        broker
+            .resources
+            .lock()
+            .unwrap()
+            .get_mut(&handle.nonce)
+            .unwrap()
+            .handle
+            .expires_at_unix_seconds = 1;
+        let mut extended = handle;
+        extended.expires_at_unix_seconds = 4_102_444_800;
+        let err = broker
+            .fetch_profile_source_archive(request(extended, &runtime_id, None))
+            .unwrap_err();
+        assert!(matches!(err, BackendResourceError::Expired));
+    }
+
+    #[test]
+    fn broker_rejects_policy_tampered_request_handle() {
+        let broker = BackendResourceBroker::default();
+        let runtime_id = RuntimeId::new("runtime-test").unwrap();
+        let mut handle = broker.issue_profile_source_archive_handle(
+            "workspace-test",
+            Some(&runtime_id),
+            None,
+            archive(),
+        );
+        handle.scope_id = Some("tampered-scope".to_string());
+        let err = broker
+            .fetch_profile_source_archive(request(handle, &runtime_id, None))
+            .unwrap_err();
+        assert!(matches!(err, BackendResourceError::Unauthorized { .. }));
+    }
+
+    #[test]
+    fn broker_uses_stored_max_bytes_when_request_handle_is_tampered() {
+        let broker = BackendResourceBroker::default();
+        let runtime_id = RuntimeId::new("runtime-test").unwrap();
+        let archive = archive_with_len((DEFAULT_PROFILE_SOURCE_ARCHIVE_MAX_BYTES + 1) as usize);
+        let mut handle = broker.issue_profile_source_archive_handle(
+            "workspace-test",
+            Some(&runtime_id),
+            None,
+            archive,
+        );
+        handle.max_bytes = DEFAULT_PROFILE_SOURCE_ARCHIVE_MAX_BYTES + 1024;
+        let err = broker
+            .fetch_profile_source_archive(request(handle, &runtime_id, None))
+            .unwrap_err();
+        assert!(matches!(err, BackendResourceError::Oversized { .. }));
     }
 }

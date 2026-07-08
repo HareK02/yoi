@@ -254,3 +254,83 @@ pub fn validate_resource_handle_text(label: &str, value: &str) -> Result<(), Str
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile_archive::ProfileSourceGraphSummary;
+    use std::collections::BTreeMap;
+
+    fn graph() -> ProfileSourceGraphSummary {
+        ProfileSourceGraphSummary {
+            source_count: 1,
+            total_source_bytes: 4,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                "profiles/default.dcdl".to_string(),
+            )]),
+            import_count: 0,
+        }
+    }
+
+    fn handle_for(bytes: &[u8]) -> BackendResourceHandle {
+        BackendResourceHandle {
+            kind: BackendResourceKind::ProfileSourceArchive,
+            workspace_id: "workspace-test".to_string(),
+            scope_id: Some("workspace-profile-source".to_string()),
+            runtime_id: Some("runtime-test".to_string()),
+            worker_id: Some("worker-test".to_string()),
+            resource_id: "profile-source-archive:test".to_string(),
+            digest: sha256_hex(bytes),
+            operation: BackendResourceOperation::FetchArchive,
+            expires_at_unix_seconds: 4_102_444_800,
+            nonce: "nonce-test".to_string(),
+            revision: sha256_hex(bytes),
+            generation: Some(1),
+            max_bytes: 1024,
+            content_type: PROFILE_SOURCE_ARCHIVE_CONTENT_TYPE.to_string(),
+            redaction: ResourceRedactionPolicy::RuntimeInternalOnly,
+            audit_correlation_id: "audit-test".to_string(),
+            profile_source_graph: Some(graph()),
+        }
+    }
+
+    #[test]
+    fn response_verification_detects_digest_mismatch() {
+        let bytes = b"archive-bytes";
+        let handle = handle_for(bytes);
+        let error = profile_source_archive_from_response(
+            &handle,
+            BackendResourceFetchResponse {
+                kind: BackendResourceKind::ProfileSourceArchive,
+                resource_id: handle.resource_id.clone(),
+                digest: handle.digest.clone(),
+                content_type: PROFILE_SOURCE_ARCHIVE_CONTENT_TYPE.to_string(),
+                bytes: b"tampered-bytes".to_vec(),
+                audit_correlation_id: handle.audit_correlation_id.clone(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, BackendResourceError::DigestMismatch { .. }));
+    }
+
+    #[test]
+    fn response_verification_rejects_oversized_bytes() {
+        let bytes = b"archive-bytes";
+        let mut handle = handle_for(bytes);
+        handle.max_bytes = 2;
+        let error = profile_source_archive_from_response(
+            &handle,
+            BackendResourceFetchResponse {
+                kind: BackendResourceKind::ProfileSourceArchive,
+                resource_id: handle.resource_id.clone(),
+                digest: handle.digest.clone(),
+                content_type: PROFILE_SOURCE_ARCHIVE_CONTENT_TYPE.to_string(),
+                bytes: bytes.to_vec(),
+                audit_correlation_id: handle.audit_correlation_id.clone(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, BackendResourceError::Oversized { .. }));
+    }
+}
