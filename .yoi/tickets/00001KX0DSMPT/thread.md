@@ -182,3 +182,36 @@ Implementation routing recovery note:
 - Recovery plan: avoid `StopPod` and retry with a fresh minimal Coder task that reads the Ticket records from the worktree instead of embedding the full IntentPacket in the prompt. If scope registry prevents a fresh Pod, fallback is to use the existing Pod with a much smaller instruction or ask for human cleanup/authority。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-08T12:40:07Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Recovery Coder Pod `yoi-coder2-00001KX0DSMPT-profile-settings` completed implementation and committed `3eefd333 feat: add workspace profile settings` on branch `work/00001KX0DSMPT-workspace-profile-settings`.
+- Worktree status was clean after commit。
+- Changed files include:
+  - `crates/workspace-server/src/profile_settings.rs` (new)
+  - `crates/workspace-server/src/{server.rs,hosts.rs,companion.rs,lib.rs}`
+  - `web/workspace/src/lib/workspace-settings/{profile-api.ts,profile-types.ts,model.ts}`
+  - `web/workspace/src/lib/workspace-api/http.ts`
+  - `web/workspace/src/routes/w/[workspaceId]/settings/+page.svelte`
+  - child implementation also committed `.yoi/tickets/00001KX0DSMPT/{item.md,thread.md}` changes; Orchestrator will preserve authoritative Ticket thread/item records during integration if conflicts occur。
+- Implementation summary:
+  - Added scoped Workspace/Profile settings API for workspace metadata and profile registry/source read/write。
+  - Added Backend profile settings model with safe source ids/display paths, revision checks, Decodal validation, selector uniqueness checks, path/symlink escape protection, and typed diagnostics。
+  - Profile updates rebuild Backend profile discovery/launch options so Worker launch profile candidates and settings profile list use the same discovery result。
+  - Extended settings UI with Workspace overview and Profiles list/editor surface using scoped APIs and safe summaries。
+  - Browser-facing responses avoid raw host paths, runtime internals, archive digests/content, and resource handles。
+- Orchestrator reran validation in the implementation worktree:
+  - `git diff --check`: pass
+  - `cargo test -p yoi-workspace-server`: pass（80 lib tests + 2 main tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（17 tests）
+  - `yoi ticket doctor`: ok
+  - `nix build .#yoi --no-link`: pass
+- External review will be requested via a read-only sibling Reviewer Pod. `StopPod` は使わない。
+
+---
