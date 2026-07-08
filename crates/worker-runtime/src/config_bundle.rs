@@ -4,6 +4,7 @@ use crate::profile_archive::{
     ProfileArchiveError, ProfileSourceArchive, ProfileSourceArchiveRef,
     VerifiedProfileSourceArchive,
 };
+use crate::resource::{BackendResourceHandle, validate_resource_handle_text};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -24,6 +25,8 @@ pub struct ConfigBundle {
     pub declarations: Vec<ConfigDeclaration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_source_archive: Option<ProfileSourceArchive>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_source_archive_handle: Option<BackendResourceHandle>,
 }
 
 impl ConfigBundle {
@@ -75,6 +78,27 @@ impl ConfigBundle {
                 lines.push(format!("profile_archive_entrypoint\0{selector}\0{path}"));
             }
         }
+        if let Some(handle) = &self.profile_source_archive_handle {
+            lines.push(format!(
+                "profile_archive_handle\0{}\0{}\0{}\0{}\0{}",
+                handle.workspace_id,
+                handle.resource_id,
+                handle.digest,
+                handle.revision,
+                handle.max_bytes
+            ));
+            for (selector, path) in handle
+                .profile_source_graph
+                .as_ref()
+                .map(|graph| &graph.entrypoints)
+                .into_iter()
+                .flatten()
+            {
+                lines.push(format!(
+                    "profile_archive_handle_entrypoint\0{selector}\0{path}"
+                ));
+            }
+        }
 
         lines.sort();
         let mut hasher = Sha256::new();
@@ -105,7 +129,12 @@ impl ConfigBundle {
             profile_source_archive: self
                 .profile_source_archive
                 .as_ref()
-                .map(|archive| archive.reference.source_graph.clone()),
+                .map(|archive| archive.reference.source_graph.clone())
+                .or_else(|| {
+                    self.profile_source_archive_handle
+                        .as_ref()
+                        .and_then(|handle| handle.profile_source_graph.clone())
+                }),
         }
     }
 
@@ -252,6 +281,33 @@ pub(crate) fn validate_config_bundle(bundle: &ConfigBundle) -> Result<(), Runtim
         archive.verify().map_err(|err| {
             RuntimeError::InvalidRequest(format!("invalid profile source archive: {err}"))
         })?;
+    }
+    if let Some(handle) = &bundle.profile_source_archive_handle {
+        for (label, value) in [
+            ("resource handle workspace id", handle.workspace_id.as_str()),
+            ("resource handle resource id", handle.resource_id.as_str()),
+            ("resource handle digest", handle.digest.as_str()),
+            ("resource handle nonce", handle.nonce.as_str()),
+            ("resource handle revision", handle.revision.as_str()),
+            ("resource handle content type", handle.content_type.as_str()),
+            (
+                "resource handle audit correlation id",
+                handle.audit_correlation_id.as_str(),
+            ),
+        ] {
+            validate_resource_handle_text(label, value).map_err(RuntimeError::InvalidRequest)?;
+        }
+        if !handle.digest.starts_with("sha256:") {
+            return Err(RuntimeError::InvalidRequest(
+                "resource handle digest must use sha256:<hex>".to_string(),
+            ));
+        }
+        if handle.profile_source_graph.is_none() {
+            return Err(RuntimeError::InvalidRequest(
+                "profile source archive resource handle must include source graph summary"
+                    .to_string(),
+            ));
+        }
     }
 
     Ok(())
@@ -529,6 +585,7 @@ mod tests {
                 reference: reference.to_string(),
             }],
             profile_source_archive: None,
+            profile_source_archive_handle: None,
         }
         .with_computed_digest()
     }
@@ -558,6 +615,53 @@ mod tests {
     fn accepts_typed_secret_refs() {
         validate_config_bundle(&bundle_with_declaration("secret:github-token")).unwrap();
         validate_config_bundle(&bundle_with_declaration("vault:team.api-key")).unwrap();
+    }
+
+    #[test]
+    fn bundle_summary_redacts_runtime_internal_resource_handle() {
+        let mut bundle = bundle_with_declaration("secret:github-token");
+        let source_graph = crate::profile_archive::ProfileSourceGraphSummary {
+            entrypoints: std::collections::BTreeMap::from([(
+                "default".to_string(),
+                "profiles/default.dcdl".to_string(),
+            )]),
+            source_count: 1,
+            import_count: 0,
+            total_source_bytes: 16,
+        };
+        bundle.profile_source_archive_handle = Some(crate::resource::BackendResourceHandle {
+            kind: crate::resource::BackendResourceKind::ProfileSourceArchive,
+            workspace_id: "workspace-1".to_string(),
+            scope_id: Some("scope-1".to_string()),
+            runtime_id: Some("runtime-1".to_string()),
+            worker_id: Some("worker-1".to_string()),
+            resource_id: "profile-source-archive:test".to_string(),
+            digest: "sha256:0123456789abcdef".to_string(),
+            operation: crate::resource::BackendResourceOperation::FetchArchive,
+            expires_at_unix_seconds: 4_102_444_800,
+            nonce: "nonce-not-for-browser".to_string(),
+            revision: "rev-1".to_string(),
+            generation: Some(1),
+            max_bytes: 128,
+            content_type: crate::resource::PROFILE_SOURCE_ARCHIVE_CONTENT_TYPE.to_string(),
+            redaction: crate::resource::ResourceRedactionPolicy::RuntimeInternalOnly,
+            audit_correlation_id: "audit-1".to_string(),
+            profile_source_graph: Some(source_graph),
+        });
+        let rendered = serde_json::to_string(&bundle.summary()).unwrap();
+        assert!(rendered.contains("profile_source_archive"));
+        for forbidden in [
+            "nonce-not-for-browser",
+            "profile-source-archive:test",
+            "sha256:0123456789abcdef",
+            "runtime-1",
+            "worker-1",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "leaked {forbidden}: {rendered}"
+            );
+        }
     }
 
     #[test]

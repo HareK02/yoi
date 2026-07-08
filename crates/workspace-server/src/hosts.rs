@@ -1,4 +1,5 @@
 use crate::Error;
+use crate::resource_broker::BackendResourceBroker;
 use chrono::Utc;
 use reqwest::StatusCode;
 use reqwest::blocking::{Client as BlockingHttpClient, RequestBuilder};
@@ -306,6 +307,8 @@ pub struct WorkerSpawnRequest {
     pub resolved_working_directory_request: Option<WorkingDirectoryRequest>,
     #[serde(skip, default)]
     pub resolved_working_directory: Option<WorkingDirectoryClaim>,
+    #[serde(skip, default)]
+    pub resolved_config_bundle: Option<ConfigBundle>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1032,6 +1035,7 @@ pub struct EmbeddedWorkerRuntime {
     host_id: String,
     runtime: worker_runtime::Runtime,
     execution_enabled: bool,
+    resource_broker: BackendResourceBroker,
 }
 
 fn embedded_runtime_options() -> EmbeddedRuntimeOptions {
@@ -1082,6 +1086,11 @@ impl EmbeddedWorkerRuntime {
         Ok(embedded)
     }
 
+    pub fn with_resource_broker(mut self, resource_broker: BackendResourceBroker) -> Self {
+        self.resource_broker = resource_broker;
+        self
+    }
+
     pub fn from_runtime(workspace_id: impl AsRef<str>, runtime: worker_runtime::Runtime) -> Self {
         let runtime_id = runtime
             .runtime_id()
@@ -1093,6 +1102,7 @@ impl EmbeddedWorkerRuntime {
             host_id: host_id_for_embedded_workspace(workspace_id.as_ref()),
             runtime,
             execution_enabled: false,
+            resource_broker: BackendResourceBroker::default(),
         }
     }
 
@@ -1339,11 +1349,24 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             .profile
             .clone()
             .unwrap_or_else(|| embedded_profile_selector(&request.intent));
-        let config_bundle = match default_embedded_config_bundle(&profile).and_then(|bundle| {
-            self.runtime
-                .store_config_bundle(bundle)
-                .map_err(|err| err.to_string())
-        }) {
+        let runtime_id = EmbeddedRuntimeId::new(self.runtime_id.clone());
+        let config_bundle = match request
+            .resolved_config_bundle
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| {
+                default_embedded_config_bundle(
+                    &profile,
+                    &self.host_id,
+                    runtime_id.as_ref(),
+                    &self.resource_broker,
+                )
+            })
+            .and_then(|bundle| {
+                self.runtime
+                    .store_config_bundle(bundle)
+                    .map_err(|err| err.to_string())
+            }) {
             Ok(availability) => availability.reference,
             Err(error) => {
                 diagnostics.push(diagnostic(
@@ -1717,6 +1740,7 @@ pub struct RemoteWorkerRuntime {
     cached_capabilities: RuntimeCapabilitySummary,
     cached_status: String,
     host_id: String,
+    resource_broker: BackendResourceBroker,
     http: BlockingHttpClient,
 }
 
@@ -1740,8 +1764,14 @@ impl RemoteWorkerRuntime {
             bearer_token: config.bearer_token,
             cached_capabilities: config.cached_capabilities,
             cached_status: config.cached_status,
+            resource_broker: BackendResourceBroker::default(),
             http,
         })
+    }
+
+    pub fn with_resource_broker(mut self, resource_broker: BackendResourceBroker) -> Self {
+        self.resource_broker = resource_broker;
+        self
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -2025,7 +2055,19 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             .profile
             .clone()
             .unwrap_or_else(|| embedded_profile_selector(&request.intent));
-        let sync = match default_embedded_config_bundle(&profile) {
+        let runtime_id = EmbeddedRuntimeId::new(self.runtime_id.clone());
+        let sync = match request
+            .resolved_config_bundle
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| {
+                default_embedded_config_bundle(
+                    &profile,
+                    &self.host_id,
+                    runtime_id.as_ref(),
+                    &self.resource_broker,
+                )
+            }) {
             Ok(bundle) => self.sync_config_bundle(bundle),
             Err(error) => ConfigBundleSyncResult {
                 state: WorkerOperationState::Rejected,
@@ -2365,19 +2407,31 @@ fn embedded_worker_execution_status_label(
     }
 }
 
-fn default_embedded_config_bundle(profile: &ProfileSelector) -> Result<ConfigBundle, String> {
+fn default_embedded_config_bundle(
+    profile: &ProfileSelector,
+    workspace_id: &str,
+    runtime_id: Option<&EmbeddedRuntimeId>,
+    resource_broker: &BackendResourceBroker,
+) -> Result<ConfigBundle, String> {
     let id = format!(
         "workspace-runtime-{}",
         embedded_profile_label(profile)
             .unwrap_or_else(|| "default".to_string())
             .replace([':', '/', ' '], "-")
     );
+    let archive = default_profile_source_archive(profile)?;
+    let handle = resource_broker.issue_profile_source_archive_handle(
+        workspace_id.to_string(),
+        runtime_id,
+        None,
+        archive,
+    );
     Ok(ConfigBundle {
         metadata: ConfigBundleMetadata {
             id,
             digest: String::new(),
             revision: "workspace-runtime-v0".to_string(),
-            workspace_id: "workspace-server".to_string(),
+            workspace_id: workspace_id.to_string(),
             created_at: "runtime-generated".to_string(),
             provenance: ConfigBundleProvenance {
                 source: "workspace-server".to_string(),
@@ -2389,7 +2443,8 @@ fn default_embedded_config_bundle(profile: &ProfileSelector) -> Result<ConfigBun
             label: embedded_profile_label(profile),
         }],
         declarations: Vec::new(),
-        profile_source_archive: Some(default_profile_source_archive(profile)?),
+        profile_source_archive: None,
+        profile_source_archive_handle: Some(handle),
     }
     .with_computed_digest())
 }
@@ -2967,6 +3022,8 @@ mod tests {
     #[test]
     fn embedded_builtin_decodal_profiles_resolve_through_archive() {
         let root = tempfile::tempdir().unwrap();
+        let broker = BackendResourceBroker::default();
+        let runtime_id = EmbeddedRuntimeId::new("runtime-test".to_string()).unwrap();
         for selector in [
             ProfileSelector::RuntimeDefault,
             ProfileSelector::Builtin("builtin:companion".to_string()),
@@ -2975,13 +3032,30 @@ mod tests {
             ProfileSelector::Builtin("builtin:coder".to_string()),
             ProfileSelector::Builtin("builtin:reviewer".to_string()),
         ] {
-            let bundle = default_embedded_config_bundle(&selector).unwrap();
-            let archive = bundle
-                .profile_source_archive
-                .as_ref()
-                .unwrap()
-                .verify()
+            let bundle = default_embedded_config_bundle(
+                &selector,
+                "workspace-test",
+                Some(&runtime_id),
+                &broker,
+            )
+            .unwrap();
+            let handle = bundle.profile_source_archive_handle.as_ref().unwrap();
+            assert!(bundle.profile_source_archive.is_none());
+            let response = broker
+                .fetch_profile_source_archive(
+                    worker_runtime::resource::BackendResourceFetchRequest {
+                        handle: handle.clone(),
+                        runtime_id: runtime_id.as_str().to_string(),
+                        worker_id: None,
+                        audit_correlation_id: handle.audit_correlation_id.clone(),
+                    },
+                )
                 .unwrap();
+            let archive =
+                worker_runtime::resource::profile_source_archive_from_response(handle, response)
+                    .unwrap()
+                    .verify()
+                    .unwrap();
             let selector_key = match &selector {
                 ProfileSelector::RuntimeDefault => "default".to_string(),
                 ProfileSelector::Builtin(name) => name.clone(),
@@ -2996,14 +3070,25 @@ mod tests {
 
     #[test]
     fn embedded_archive_rejects_unknown_selectors() {
+        let broker = BackendResourceBroker::default();
+        let runtime_id = EmbeddedRuntimeId::new("runtime-test".to_string()).unwrap();
         assert!(
-            default_embedded_config_bundle(&ProfileSelector::Builtin(
-                "builtin:missing".to_string()
-            ))
+            default_embedded_config_bundle(
+                &ProfileSelector::Builtin("builtin:missing".to_string()),
+                "workspace-test",
+                Some(&runtime_id),
+                &broker,
+            )
             .is_err()
         );
         assert!(
-            default_embedded_config_bundle(&ProfileSelector::Named("custom".to_string())).is_err()
+            default_embedded_config_bundle(
+                &ProfileSelector::Named("custom".to_string()),
+                "workspace-test",
+                Some(&runtime_id),
+                &broker,
+            )
+            .is_err()
         );
     }
 
@@ -3030,6 +3115,7 @@ mod tests {
                 reference: "capability:read".to_string(),
             }],
             profile_source_archive: None,
+            profile_source_archive_handle: None,
         }
         .with_computed_digest()
     }
@@ -3326,6 +3412,7 @@ mod tests {
             working_directory_request: None,
             resolved_working_directory_request: None,
             resolved_working_directory: None,
+            resolved_config_bundle: None,
         }
     }
 
@@ -3458,6 +3545,7 @@ mod tests {
                     working_directory_request: None,
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
+                    resolved_config_bundle: None,
                 },
             )
             .unwrap();
@@ -3560,6 +3648,7 @@ mod tests {
                     working_directory_request: None,
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
+                    resolved_config_bundle: None,
                 },
             )
             .unwrap();
@@ -3591,6 +3680,7 @@ mod tests {
                     working_directory_request: None,
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
+                    resolved_config_bundle: None,
                 },
             )
             .unwrap();

@@ -6,6 +6,7 @@ export type Diagnostic = {
 
 export type SettingsSectionId =
   | "runtime-connections"
+  | "profile-sources"
   | "backend-config"
   | "workspace-identity";
 
@@ -82,6 +83,18 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
       "Remote connection changes are persisted through typed read-modify-write config updates and require a Backend restart before the live registry changes.",
       "The browser may submit a new endpoint, but Runtime endpoints, tokens, sockets, store roots, and config paths are not echoed back in API responses.",
       "Test negotiation is an observation only; checked_at, health, compatibility, and capability results are not persisted to local config.",
+    ],
+  },
+  {
+    id: "profile-sources",
+    label: "Profile Sources",
+    status: "editable",
+    summary:
+      "Manage the workspace-scoped Decodal Profile registry and source files used by Backend-published launch profile discovery.",
+    bullets: [
+      "Selectors are source-qualified (builtin:* or project:*); raw profile source paths, archive content, archive digests, resource handles, and runtime tokens are not exposed.",
+      "Profile source edits are validated through the Backend ProfileSourceArchive/Decodal boundary before they are persisted.",
+      "Launch profile candidates refresh from the same Backend projection after registry or source updates.",
     ],
   },
   {

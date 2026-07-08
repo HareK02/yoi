@@ -392,6 +392,7 @@ fn spawn_companion_worker(runtime: &RuntimeRegistry) -> CompanionWorkerState {
             working_directory_request: None,
             resolved_working_directory_request: None,
             resolved_working_directory: None,
+            resolved_config_bundle: None,
         },
     );
 
@@ -455,6 +456,7 @@ fn companion_config_bundle() -> ConfigBundle {
         }],
         declarations: Vec::new(),
         profile_source_archive: Some(companion_profile_archive()),
+        profile_source_archive_handle: None,
     }
     .with_computed_digest()
 }
