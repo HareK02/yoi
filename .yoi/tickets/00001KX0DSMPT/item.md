@@ -1,8 +1,8 @@
 ---
 title: 'Add Workspace settings API and pages for Workspace/Profile editing'
-state: 'planning'
+state: 'ready'
 created_at: '2026-07-08T08:34:01Z'
-updated_at: '2026-07-08T09:25:00Z'
+updated_at: '2026-07-08T10:40:06Z'
 assignee: null
 ---
 
