@@ -13,20 +13,22 @@ required-features = ["ws-server", "fs-store"]
 
 [features]
 default = []
-fs-store = ["dep:serde_json"]
-http-server = ["dep:axum", "dep:serde_json", "dep:tower"]
+fs-store = []
+http-server = ["dep:axum", "dep:tower"]
 ws-server = ["http-server", "axum/ws", "dep:futures", "tokio/sync"]
 
 [dependencies]
 async-trait.workspace = true
 axum = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
+decodal.workspace = true
 manifest.workspace = true
 protocol.workspace = true
 serde = { workspace = true, features = ["derive"] }
 session-store.workspace = true
 sha2.workspace = true
-serde_json = { workspace = true, optional = true }
+serde_json.workspace = true
+tar.workspace = true
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
 tower = { workspace = true, features = ["util"], optional = true }

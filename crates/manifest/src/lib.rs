@@ -19,7 +19,7 @@ pub use profile::{
     ProfileDiscovery, ProfileError, ProfileManifestSnapshot, ProfileMetadata, ProfileRegistry,
     ProfileRegistryEntry, ProfileRegistrySource, ProfileResolveOptions, ProfileResolver,
     ProfileSelector, ProfileSource, ResolvedProfile, WorkspaceOverrideSnapshot,
-    resolve_profile_artifact,
+    resolve_profile_artifact, resolve_profile_artifact_value,
 };
 pub use protocol::{Permission, ScopeRule};
 pub use scope::{DelegationScope, Scope, ScopeError, SharedScope};

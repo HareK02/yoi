@@ -19,6 +19,7 @@ pub mod identity;
 pub mod interaction;
 pub mod management;
 pub mod observation;
+pub mod profile_archive;
 mod runtime;
 pub mod worker_backend;
 pub mod working_directory;

@@ -1,0 +1,13 @@
+slug = "coder";
+description = "Ticket implementation coder profile.";
+scope = "workspace_write";
+
+tool_enabled = {
+    bash = true;
+    read = true;
+    write = true;
+    edit = true;
+    grep = true;
+    glob = true;
+    memory = true;
+};

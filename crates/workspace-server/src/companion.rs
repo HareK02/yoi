@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
@@ -6,6 +7,7 @@ use worker_runtime::catalog::ProfileSelector;
 use worker_runtime::config_bundle::{
     ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigProfileDescriptor,
 };
+use worker_runtime::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveInput};
 
 use crate::hosts::{
     DiagnosticSeverity, RuntimeDiagnostic, RuntimeRegistry, WorkerInputKind, WorkerInputRequest,
@@ -452,8 +454,30 @@ fn companion_config_bundle() -> ConfigBundle {
             label: Some("Workspace Companion".to_string()),
         }],
         declarations: Vec::new(),
+        profile_source_archive: Some(companion_profile_archive()),
     }
     .with_computed_digest()
+}
+
+fn companion_profile_archive() -> ProfileSourceArchive {
+    let mut entrypoints = BTreeMap::new();
+    entrypoints.insert("default".to_string(), "profiles/companion.dcdl".to_string());
+    entrypoints.insert(
+        COMPANION_PROFILE_ID.to_string(),
+        "profiles/companion.dcdl".to_string(),
+    );
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "profiles/companion.dcdl".to_string(),
+        include_str!("../../../resources/profiles/companion.dcdl").to_string(),
+    );
+    ProfileSourceArchive::build(ProfileSourceArchiveInput {
+        id: "workspace-companion-profile-archive-v1".to_string(),
+        entrypoints,
+        imports: BTreeMap::new(),
+        sources,
+    })
+    .expect("builtin Companion Decodal profile source archive is valid")
 }
 
 fn companion_state_for_worker(worker: &WorkerSummary) -> CompanionState {

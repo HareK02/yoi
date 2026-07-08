@@ -3405,6 +3405,7 @@ mod tests {
                 label: Some("server-test".to_string()),
             }],
             declarations: Vec::new(),
+            profile_source_archive: None,
         }
         .with_computed_digest()
     }

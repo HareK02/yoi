@@ -1,0 +1,15 @@
+slug = "companion";
+description = "Workspace companion profile.";
+scope = "workspace_write";
+
+tool_enabled = {
+    bash = true;
+    read = true;
+    write = true;
+    edit = true;
+    grep = true;
+    glob = true;
+    web_search = true;
+    web_fetch = true;
+    memory = true;
+};

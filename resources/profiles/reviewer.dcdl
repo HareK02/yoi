@@ -1,0 +1,11 @@
+slug = "reviewer";
+description = "Ticket review profile.";
+scope = "workspace_read";
+
+tool_enabled = {
+    bash = true;
+    read = true;
+    grep = true;
+    glob = true;
+    memory = true;
+};

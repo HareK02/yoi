@@ -7,6 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, RwLock},
     time::Duration,
@@ -41,6 +42,7 @@ use worker_runtime::management::{RuntimeOptions as EmbeddedRuntimeOptions, Runti
 use worker_runtime::observation::{
     TranscriptProjection as EmbeddedTranscriptProjection, TranscriptQuery, TranscriptRole,
 };
+use worker_runtime::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveInput};
 
 const EMBEDDED_RUNTIME_ID: &str = "embedded-worker-runtime";
 const EMBEDDED_HOST_KIND: &str = "embedded-worker-runtime-host";
@@ -2371,8 +2373,73 @@ fn default_embedded_config_bundle(profile: &ProfileSelector) -> ConfigBundle {
             label: embedded_profile_label(profile),
         }],
         declarations: Vec::new(),
+        profile_source_archive: Some(default_profile_source_archive(profile)),
     }
     .with_computed_digest()
+}
+
+fn default_profile_source_archive(profile: &ProfileSelector) -> ProfileSourceArchive {
+    let selected = embedded_profile_label(profile).unwrap_or_else(|| "default".to_string());
+    let mut entrypoints = BTreeMap::new();
+    entrypoints.insert("default".to_string(), "profiles/default.dcdl".to_string());
+    entrypoints.insert(
+        "builtin:default".to_string(),
+        "profiles/default.dcdl".to_string(),
+    );
+    for slug in ["companion", "intake", "orchestrator", "coder", "reviewer"] {
+        entrypoints.insert(format!("builtin:{slug}"), format!("profiles/{slug}.dcdl"));
+    }
+    entrypoints.insert(selected, embedded_profile_path(profile));
+
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "profiles/default.dcdl".to_string(),
+        include_str!("../../../resources/profiles/default.dcdl").to_string(),
+    );
+    sources.insert(
+        "profiles/companion.dcdl".to_string(),
+        include_str!("../../../resources/profiles/companion.dcdl").to_string(),
+    );
+    sources.insert(
+        "profiles/intake.dcdl".to_string(),
+        include_str!("../../../resources/profiles/intake.dcdl").to_string(),
+    );
+    sources.insert(
+        "profiles/orchestrator.dcdl".to_string(),
+        include_str!("../../../resources/profiles/orchestrator.dcdl").to_string(),
+    );
+    sources.insert(
+        "profiles/coder.dcdl".to_string(),
+        include_str!("../../../resources/profiles/coder.dcdl").to_string(),
+    );
+    sources.insert(
+        "profiles/reviewer.dcdl".to_string(),
+        include_str!("../../../resources/profiles/reviewer.dcdl").to_string(),
+    );
+
+    ProfileSourceArchive::build(ProfileSourceArchiveInput {
+        id: "builtin-decodal-profiles-v1".to_string(),
+        entrypoints,
+        imports: BTreeMap::new(),
+        sources,
+    })
+    .expect("builtin Decodal profile source archive is valid")
+}
+
+fn embedded_profile_path(profile: &ProfileSelector) -> String {
+    match profile {
+        ProfileSelector::RuntimeDefault => "profiles/default.dcdl".to_string(),
+        ProfileSelector::Builtin(name) | ProfileSelector::Named(name) => {
+            match name.strip_prefix("builtin:").unwrap_or(name) {
+                "companion" => "profiles/companion.dcdl".to_string(),
+                "intake" => "profiles/intake.dcdl".to_string(),
+                "orchestrator" => "profiles/orchestrator.dcdl".to_string(),
+                "coder" => "profiles/coder.dcdl".to_string(),
+                "reviewer" => "profiles/reviewer.dcdl".to_string(),
+                _ => "profiles/default.dcdl".to_string(),
+            }
+        }
+    }
 }
 
 fn embedded_profile_selector(intent: &WorkerSpawnIntent) -> ProfileSelector {
@@ -2900,6 +2967,7 @@ mod tests {
                 name: "read".to_string(),
                 reference: "capability:read".to_string(),
             }],
+            profile_source_archive: None,
         }
         .with_computed_digest()
     }

@@ -244,6 +244,13 @@ impl Runtime {
             state.ensure_running()?;
             validate_create_worker_request(&request)?;
             state.validate_worker_config_boundary(&request)?;
+            let config_bundle = state
+                .config_bundles
+                .get(&request.config_bundle.id)
+                .cloned()
+                .ok_or_else(|| RuntimeError::ConfigBundleMissing {
+                    bundle_id: request.config_bundle.id.clone(),
+                })?;
             let backend = state.execution_backend.clone().ok_or_else(|| {
                 RuntimeError::ExecutionBackendUnavailable {
                     message: "worker creation requires an execution backend".to_string(),
@@ -289,6 +296,7 @@ impl Runtime {
                 request,
                 context: self.execution_context(worker_ref.clone()),
                 working_directory: None,
+                config_bundle: Some(config_bundle),
             };
             (backend, worker_ref, spawn_request)
         };
@@ -1619,6 +1627,7 @@ mod tests {
                 name: "read".to_string(),
                 reference: "capability:read".to_string(),
             }],
+            profile_source_archive: None,
         }
         .with_computed_digest()
     }

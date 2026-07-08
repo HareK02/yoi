@@ -1,0 +1,21 @@
+slug = "default";
+description = "General Yoi companion profile.";
+scope = "workspace_write";
+
+model = {
+    scheme = "codex";
+    model_id = "gpt-5";
+    auth = { kind = "codex_oauth"; };
+};
+
+tool_enabled = {
+    bash = true;
+    read = true;
+    write = true;
+    edit = true;
+    grep = true;
+    glob = true;
+    web_search = true;
+    web_fetch = true;
+    memory = true;
+};

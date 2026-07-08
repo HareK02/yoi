@@ -141,3 +141,29 @@ Acceptance basis:
 - side effect はこの `queued -> inprogress` acceptance 後に、worktree-workflow に沿って implementation worktree を作成してから開始する。
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-08T09:57:38Z -->
+
+## Implementation report
+
+Implemented Decodal ProfileSourceArchive launch path for Browser/Workspace Backend Worker creation.
+
+Changes:
+- Added worker-runtime ProfileSourceArchive tar manifest/content model with digest verification, source limits, path confinement, import-map-only ArchiveSourceLoader, and Decodal-to-profile resolution.
+- Added builtin Decodal profile sources and Backend-built archives for normal workspace and Companion launches.
+- Runtime config bundle validation now verifies/caches the profile source archive and Worker spawn passes the verified bundle to execution.
+- ProfileRuntimeWorkerFactory now resolves normal Runtime launches from archive-contained Decodal sources and keeps Runtime-local Lua/filesystem discovery as compatibility/debug fallback only.
+- Browser/runtime summaries expose only source graph summary, not archive content/digest/store paths.
+- Added tests for archive build/verify, digest mismatch, archive-only resolution, and import-map rejection.
+
+Validation performed:
+- git diff --check HEAD
+- cargo test -p worker-runtime --features ws-server,fs-store
+- cargo test -p yoi-workspace-server
+- cargo check -p yoi
+- cd web/workspace && deno task check && deno task test
+- yoi ticket doctor
+- nix build .#yoi --no-link
+
+
+---
