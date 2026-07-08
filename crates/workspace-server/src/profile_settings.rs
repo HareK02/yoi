@@ -230,7 +230,10 @@ pub fn workspace_metadata_settings(
             diagnostics.push(diagnostic(
                 "workspace_identity_read_failed",
                 DiagnosticSeverity::Error,
-                format!("Workspace identity could not be read: {}", sanitize_error(&err.to_string())),
+                format!(
+                    "Workspace identity could not be read: {}",
+                    sanitize_error(&err.to_string())
+                ),
             ));
             (
                 fallback_workspace_id.to_string(),
@@ -311,6 +314,17 @@ pub fn load_profile_settings(workspace_id: &str, workspace_root: &Path) -> Profi
         }
         let source_summary = summarize_source(workspace_root, &source_id, &entry.relative_path);
         entry_diagnostics.extend(source_summary.diagnostics.clone());
+        entry_diagnostics.extend(validate_project_profile_entry(workspace_root, &entry));
+        if BUILTIN_PROFILE_SLUGS.contains(&entry.name.as_str()) {
+            entry_diagnostics.push(diagnostic(
+                "profile_selector_duplicate",
+                DiagnosticSeverity::Error,
+                format!(
+                    "Project profile '{}' conflicts with a builtin selector.",
+                    entry.name
+                ),
+            ));
+        }
         profiles.push(WorkspaceProfileSummary {
             profile_id: selector.clone(),
             selector,
@@ -324,7 +338,17 @@ pub fn load_profile_settings(workspace_id: &str, workspace_root: &Path) -> Profi
         });
         sources.push(source_summary);
     }
-    diagnostics.extend(validate_project_profiles(workspace_root, &registry));
+    let mut default_diagnostics = validate_registry_default(&registry)
+        .err()
+        .map(|err| vec![diagnostic_from_error(&err)])
+        .unwrap_or_default();
+    diagnostics.extend(
+        profiles
+            .iter()
+            .filter(|profile| profile.source_kind == "project")
+            .flat_map(|profile| profile.diagnostics.clone()),
+    );
+    diagnostics.append(&mut default_diagnostics);
     ProfileSettingsResponse {
         workspace_id: workspace_id.to_string(),
         registry_revision,
@@ -340,7 +364,7 @@ pub fn read_profile_source(
     workspace_root: &Path,
     source_id: &str,
 ) -> Result<WorkspaceProfileSourceDetailResponse> {
-    let registry = read_registry(workspace_root).map_err(Error::Config)?;
+    let registry = read_registry(workspace_root).map_err(profile_registry_error)?;
     let (name, entry) = entry_for_source_id(&registry, source_id)?;
     let full = checked_source_path(workspace_root, &entry.relative_path)?;
     let metadata = source_metadata(&full)?;
@@ -380,8 +404,12 @@ pub fn create_profile_source(
     request: CreateWorkspaceProfileSourceRequest,
 ) -> Result<ProfileSettingsMutationResponse> {
     let registry_path = registry_path(workspace_root);
-    ensure_revision(&registry_path, &request.registry_revision, "profile_registry_revision_conflict")?;
-    let mut registry = read_registry(workspace_root).map_err(Error::Config)?;
+    ensure_revision(
+        &registry_path,
+        &request.registry_revision,
+        "profile_registry_revision_conflict",
+    )?;
+    let mut registry = read_registry(workspace_root).map_err(profile_registry_error)?;
     let name = validate_profile_name(&request.name)?;
     if registry.profile.contains_key(&name) || BUILTIN_PROFILE_SLUGS.contains(&name.as_str()) {
         return Err(Error::RuntimeOperationFailed {
@@ -390,7 +418,9 @@ pub fn create_profile_source(
             message: "Profile selector already exists".to_string(),
         });
     }
-    let relative_path = PathBuf::from(".yoi").join("profiles").join(format!("{name}.dcdl"));
+    let relative_path = PathBuf::from(".yoi")
+        .join("profiles")
+        .join(format!("{name}.dcdl"));
     validate_source_content(workspace_root, &name, &relative_path, &request.content)?;
     let full = checked_source_path(workspace_root, &relative_path)?;
     if let Some(parent) = full.parent() {
@@ -401,9 +431,13 @@ pub fn create_profile_source(
         name.clone(),
         ProfileEntryFile::Table(ProfileEntryTable {
             path: format!("profiles/{name}.dcdl"),
-            description: request.description.and_then(|value| optional_trim(value.as_str())),
+            description: request
+                .description
+                .and_then(|value| optional_trim(value.as_str())),
         }),
     );
+    validate_registry_default(&registry)?;
+    validate_all_project_profiles(workspace_root, &registry)?;
     write_registry(workspace_root, &registry)?;
     Ok(ProfileSettingsMutationResponse {
         workspace_id: workspace_id.to_string(),
@@ -422,8 +456,11 @@ pub fn update_profile_registry(
     request: UpdateWorkspaceProfileRegistryRequest,
 ) -> Result<ProfileSettingsMutationResponse> {
     let path = registry_path(workspace_root);
-    ensure_revision(&path, &request.registry_revision, "profile_registry_revision_conflict")?;
-    validate_default_profile(request.default_profile.as_deref())?;
+    ensure_revision(
+        &path,
+        &request.registry_revision,
+        "profile_registry_revision_conflict",
+    )?;
     let mut profile = BTreeMap::new();
     let mut seen = BTreeSet::new();
     for update in request.profiles {
@@ -452,7 +489,9 @@ pub fn update_profile_registry(
             name.clone(),
             ProfileEntryFile::Table(ProfileEntryTable {
                 path: format!("profiles/{name}.dcdl"),
-                description: update.description.and_then(|value| optional_trim(value.as_str())),
+                description: update
+                    .description
+                    .and_then(|value| optional_trim(value.as_str())),
             }),
         );
     }
@@ -460,13 +499,8 @@ pub fn update_profile_registry(
         default: request.default_profile,
         profile,
     };
-    for entry in project_entries(&registry, &mut Vec::new()) {
-        let full = checked_source_path(workspace_root, &entry.relative_path)?;
-        if full.exists() {
-            let content = fs::read_to_string(&full)?;
-            validate_source_content(workspace_root, &entry.name, &entry.relative_path, &content)?;
-        }
-    }
+    validate_registry_default(&registry)?;
+    validate_all_project_profiles(workspace_root, &registry)?;
     write_registry(workspace_root, &registry)?;
     Ok(ProfileSettingsMutationResponse {
         workspace_id: workspace_id.to_string(),
@@ -485,11 +519,16 @@ pub fn update_profile_source(
     source_id: &str,
     request: UpdateWorkspaceProfileSourceRequest,
 ) -> Result<ProfileSettingsMutationResponse> {
-    let registry = read_registry(workspace_root).map_err(Error::Config)?;
+    let registry = read_registry(workspace_root).map_err(profile_registry_error)?;
     let (name, entry) = entry_for_source_id(&registry, source_id)?;
     let full = checked_source_path(workspace_root, &entry.relative_path)?;
     ensure_revision(&full, &request.revision, "profile_source_revision_conflict")?;
-    validate_source_content(workspace_root, &name, &entry.relative_path, &request.content)?;
+    validate_source_content(
+        workspace_root,
+        &name,
+        &entry.relative_path,
+        &request.content,
+    )?;
     fs::write(&full, request.content)?;
     Ok(ProfileSettingsMutationResponse {
         workspace_id: workspace_id.to_string(),
@@ -509,11 +548,19 @@ pub fn delete_profile_source(
     request: DeleteWorkspaceProfileSourceRequest,
 ) -> Result<ProfileSettingsMutationResponse> {
     let registry_path = registry_path(workspace_root);
-    ensure_revision(&registry_path, &request.registry_revision, "profile_registry_revision_conflict")?;
-    let mut registry = read_registry(workspace_root).map_err(Error::Config)?;
+    ensure_revision(
+        &registry_path,
+        &request.registry_revision,
+        "profile_registry_revision_conflict",
+    )?;
+    let mut registry = read_registry(workspace_root).map_err(profile_registry_error)?;
     let (name, entry) = entry_for_source_id(&registry, source_id)?;
     let full = checked_source_path(workspace_root, &entry.relative_path)?;
-    ensure_revision(&full, &request.source_revision, "profile_source_revision_conflict")?;
+    ensure_revision(
+        &full,
+        &request.source_revision,
+        "profile_source_revision_conflict",
+    )?;
     registry.profile.remove(&name);
     if registry.default.as_deref() == Some(project_selector(&name).as_str()) {
         registry.default = None;
@@ -540,7 +587,7 @@ pub fn build_workspace_profile_archive(
     if !selector.starts_with("project:") {
         return Ok(None);
     }
-    let registry = read_registry(workspace_root).map_err(Error::Config)?;
+    let registry = read_registry(workspace_root).map_err(profile_registry_error)?;
     let mut entrypoints = BTreeMap::new();
     let mut sources = BTreeMap::new();
     for entry in project_entries(&registry, &mut Vec::new()) {
@@ -554,10 +601,15 @@ pub fn build_workspace_profile_archive(
         return Err(Error::RuntimeOperationFailed {
             runtime_id: "workspace-backend".to_string(),
             code: "unknown_profile_selector".to_string(),
-            message: "Selected project profile is not present in the workspace profile registry".to_string(),
+            message: "Selected project profile is not present in the workspace profile registry"
+                .to_string(),
         });
     }
-    if let Some(default) = registry.default.as_deref().filter(|value| value.starts_with("project:")) {
+    if let Some(default) = registry
+        .default
+        .as_deref()
+        .filter(|value| value.starts_with("project:"))
+    {
         if let Some(path) = entrypoints.get(default).cloned() {
             entrypoints.insert("default".to_string(), path);
         }
@@ -573,15 +625,18 @@ pub fn build_workspace_profile_archive(
         code: "profile_source_archive_invalid".to_string(),
         message: err.to_string(),
     })?;
-    archive.verify().and_then(|verified| {
-        verified
-            .resolve_profile(selector, workspace_root, "workspace-settings-validation")
-            .map(|_| ())
-    }).map_err(|err| Error::RuntimeOperationFailed {
-        runtime_id: "workspace-backend".to_string(),
-        code: "profile_source_invalid".to_string(),
-        message: err.to_string(),
-    })?;
+    archive
+        .verify()
+        .and_then(|verified| {
+            verified
+                .resolve_profile(selector, workspace_root, "workspace-settings-validation")
+                .map(|_| ())
+        })
+        .map_err(|err| Error::RuntimeOperationFailed {
+            runtime_id: "workspace-backend".to_string(),
+            code: "profile_source_invalid".to_string(),
+            message: err.to_string(),
+        })?;
     Ok(Some(archive))
 }
 
@@ -622,7 +677,7 @@ pub fn project_profile_candidates(workspace_root: &Path) -> Vec<WorkspaceProfile
     load_profile_settings("workspace", workspace_root)
         .profiles
         .into_iter()
-        .filter(|profile| profile.source_kind == "project")
+        .filter(|profile| profile.source_kind == "project" && !has_error(&profile.diagnostics))
         .collect()
 }
 
@@ -637,11 +692,23 @@ pub fn is_profile_candidate(workspace_root: &Path, profile_id: &str) -> bool {
 fn builtin_profile_summaries(default_profile: Option<&str>) -> Vec<WorkspaceProfileSummary> {
     let labels = [
         ("builtin:default", "Default", "Bundled default Yoi profile"),
-        ("builtin:companion", "Companion", "Bundled Companion role profile"),
+        (
+            "builtin:companion",
+            "Companion",
+            "Bundled Companion role profile",
+        ),
         ("builtin:intake", "Intake", "Bundled Intake role profile"),
-        ("builtin:orchestrator", "Orchestrator", "Bundled Orchestrator role profile"),
+        (
+            "builtin:orchestrator",
+            "Orchestrator",
+            "Bundled Orchestrator role profile",
+        ),
         ("builtin:coder", "Coder", "Bundled Coder role profile"),
-        ("builtin:reviewer", "Reviewer", "Bundled Reviewer role profile"),
+        (
+            "builtin:reviewer",
+            "Reviewer",
+            "Bundled Reviewer role profile",
+        ),
     ];
     labels
         .into_iter()
@@ -659,52 +726,123 @@ fn builtin_profile_summaries(default_profile: Option<&str>) -> Vec<WorkspaceProf
         .collect()
 }
 
-fn validate_project_profiles(workspace_root: &Path, registry: &ProfileRegistryDocument) -> Vec<RuntimeDiagnostic> {
-    let mut diagnostics = Vec::new();
-    for entry in project_entries(registry, &mut diagnostics) {
-        let full = match checked_source_path(workspace_root, &entry.relative_path) {
-            Ok(path) => path,
-            Err(err) => {
-                diagnostics.push(diagnostic(
-                    "profile_source_path_escape",
-                    DiagnosticSeverity::Error,
-                    err.to_string(),
-                ));
-                continue;
-            }
-        };
-        match fs::read_to_string(&full) {
-            Ok(content) => {
-                if let Err(err) = validate_source_content(workspace_root, &entry.name, &entry.relative_path, &content) {
-                    diagnostics.push(diagnostic(
-                        "profile_source_invalid",
-                        DiagnosticSeverity::Error,
-                        sanitize_error(&err.to_string()),
-                    ));
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => diagnostics.push(diagnostic(
-                "profile_source_missing",
-                DiagnosticSeverity::Error,
-                format!("Profile source '{}' is missing.", entry.name),
-            )),
-            Err(err) => diagnostics.push(diagnostic(
-                "profile_source_read_failed",
-                DiagnosticSeverity::Error,
-                sanitize_error(&err.to_string()),
-            )),
+fn validate_project_profile_entry(
+    workspace_root: &Path,
+    entry: &ProjectProfileEntry,
+) -> Vec<RuntimeDiagnostic> {
+    let full = match checked_source_path(workspace_root, &entry.relative_path) {
+        Ok(path) => path,
+        Err(err) => return vec![diagnostic_from_error(&err)],
+    };
+    match fs::read_to_string(&full) {
+        Ok(content) => {
+            validate_source_content(workspace_root, &entry.name, &entry.relative_path, &content)
+                .err()
+                .map(|err| vec![diagnostic_from_error(&err)])
+                .unwrap_or_default()
         }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => vec![diagnostic(
+            "profile_source_missing",
+            DiagnosticSeverity::Error,
+            format!("Profile source '{}' is missing.", entry.name),
+        )],
+        Err(err) => vec![diagnostic(
+            "profile_source_read_failed",
+            DiagnosticSeverity::Error,
+            sanitize_error(&err.to_string()),
+        )],
     }
-    if let Some(default) = registry.default.as_deref() {
-        if let Err(err) = validate_default_profile(Some(default)) {
-            diagnostics.push(diagnostic(
-                "profile_default_invalid",
-                DiagnosticSeverity::Error,
-                sanitize_error(&err.to_string()),
+}
+
+fn diagnostic_from_error(err: &Error) -> RuntimeDiagnostic {
+    match err {
+        Error::RuntimeOperationFailed { code, message, .. } => diagnostic(
+            code.clone(),
+            DiagnosticSeverity::Error,
+            sanitize_error(message),
+        ),
+        other => diagnostic(
+            "profile_settings_failed",
+            DiagnosticSeverity::Error,
+            sanitize_error(&other.to_string()),
+        ),
+    }
+}
+
+fn has_error(diagnostics: &[RuntimeDiagnostic]) -> bool {
+    diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+}
+
+fn validate_all_project_profiles(
+    workspace_root: &Path,
+    registry: &ProfileRegistryDocument,
+) -> Result<()> {
+    let mut diagnostics = Vec::new();
+    let entries = project_entries(registry, &mut diagnostics);
+    if let Some(diagnostic) = diagnostics
+        .into_iter()
+        .find(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+    {
+        return Err(profile_validation_error(
+            diagnostic.code,
+            diagnostic.message,
+        ));
+    }
+    for entry in entries {
+        if BUILTIN_PROFILE_SLUGS.contains(&entry.name.as_str()) {
+            return Err(profile_validation_error(
+                "profile_selector_duplicate",
+                "Project profile conflicts with a builtin selector",
+            ));
+        }
+        if let Some(diagnostic) = validate_project_profile_entry(workspace_root, &entry)
+            .into_iter()
+            .find(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+        {
+            return Err(profile_validation_error(
+                diagnostic.code,
+                diagnostic.message,
             ));
         }
     }
-    diagnostics
+    Ok(())
+}
+
+fn profile_validation_error(code: impl Into<String>, message: impl Into<String>) -> Error {
+    Error::RuntimeOperationFailed {
+        runtime_id: "workspace-backend".to_string(),
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
+fn profile_registry_error(message: String) -> Error {
+    profile_validation_error("profile_registry_schema_invalid", sanitize_error(&message))
+}
+
+fn validate_registry_default(registry: &ProfileRegistryDocument) -> Result<()> {
+    let Some(value) = registry.default.as_deref() else {
+        return Ok(());
+    };
+    if BUILTIN_PROFILE_IDS.contains(&value) {
+        return Ok(());
+    }
+    if let Some(name) = value.strip_prefix("project:") {
+        let name = validate_profile_name(name)?;
+        if registry.profile.contains_key(&name) {
+            return Ok(());
+        }
+        return Err(profile_validation_error(
+            "profile_default_unknown",
+            "Default project profile selector is not present in the workspace profile registry",
+        ));
+    }
+    Err(profile_validation_error(
+        "profile_default_invalid",
+        "Default profile must be a Backend-published builtin or project selector",
+    ))
 }
 
 fn validate_source_content(
@@ -738,11 +876,13 @@ fn validate_source_content(
         code: "profile_source_archive_invalid".to_string(),
         message: err.to_string(),
     })?;
-    let verified = archive.verify().map_err(|err| Error::RuntimeOperationFailed {
-        runtime_id: "workspace-backend".to_string(),
-        code: "profile_source_archive_invalid".to_string(),
-        message: err.to_string(),
-    })?;
+    let verified = archive
+        .verify()
+        .map_err(|err| Error::RuntimeOperationFailed {
+            runtime_id: "workspace-backend".to_string(),
+            code: "profile_source_archive_invalid".to_string(),
+            message: err.to_string(),
+        })?;
     checked_source_path(workspace_root, relative_path)?;
     verified
         .resolve_profile(&selector, workspace_root, "workspace-settings-validation")
@@ -797,7 +937,9 @@ fn summarize_source(
         profile_source_id: source_id.to_string(),
         display_path,
         kind: "decodal".to_string(),
-        editable: diagnostics.iter().all(|d| d.severity != DiagnosticSeverity::Error),
+        editable: diagnostics
+            .iter()
+            .all(|d| d.severity != DiagnosticSeverity::Error),
         revision,
         size_bytes,
         diagnostics,
@@ -807,9 +949,16 @@ fn summarize_source(
 fn read_registry(workspace_root: &Path) -> std::result::Result<ProfileRegistryDocument, String> {
     let path = registry_path(workspace_root);
     match fs::read_to_string(&path) {
-        Ok(raw) => toml::from_str(&raw).map_err(|err| format!("invalid profile registry schema: {err}")),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(ProfileRegistryDocument::default()),
-        Err(err) => Err(format!("failed to read profile registry: {}", sanitize_error(&err.to_string()))),
+        Ok(raw) => {
+            toml::from_str(&raw).map_err(|err| format!("invalid profile registry schema: {err}"))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ProfileRegistryDocument::default())
+        }
+        Err(err) => Err(format!(
+            "failed to read profile registry: {}",
+            sanitize_error(&err.to_string())
+        )),
     }
 }
 
@@ -824,7 +973,10 @@ fn write_registry(workspace_root: &Path, registry: &ProfileRegistryDocument) -> 
     Ok(())
 }
 
-fn project_entries(registry: &ProfileRegistryDocument, diagnostics: &mut Vec<RuntimeDiagnostic>) -> Vec<ProjectProfileEntry> {
+fn project_entries(
+    registry: &ProfileRegistryDocument,
+    diagnostics: &mut Vec<RuntimeDiagnostic>,
+) -> Vec<ProjectProfileEntry> {
     registry
         .profile
         .iter()
@@ -839,7 +991,9 @@ fn project_entries(registry: &ProfileRegistryDocument, diagnostics: &mut Vec<Run
                 }
                 let (path, description) = match entry {
                     ProfileEntryFile::Path(path) => (path.clone(), None),
-                    ProfileEntryFile::Table(table) => (table.path.clone(), table.description.clone()),
+                    ProfileEntryFile::Table(table) => {
+                        (table.path.clone(), table.description.clone())
+                    }
                 };
                 match registry_relative_source_path(&path) {
                     Ok(relative_path) => Some(ProjectProfileEntry {
@@ -869,7 +1023,10 @@ fn project_entries(registry: &ProfileRegistryDocument, diagnostics: &mut Vec<Run
         .collect()
 }
 
-fn entry_for_source_id(registry: &ProfileRegistryDocument, source_id: &str) -> Result<(String, ProjectProfileEntry)> {
+fn entry_for_source_id(
+    registry: &ProfileRegistryDocument,
+    source_id: &str,
+) -> Result<(String, ProjectProfileEntry)> {
     let (name, _) = parse_project_source_id(source_id)?;
     let mut diagnostics = Vec::new();
     let entry = project_entries(registry, &mut diagnostics)
@@ -899,11 +1056,16 @@ fn registry_relative_source_path(raw: &str) -> std::result::Result<PathBuf, Stri
 
 fn validate_relative_source_path(path: &Path) -> std::result::Result<(), String> {
     if !path.starts_with(PROFILE_SOURCE_ROOT_RELATIVE_PATH) {
-        return Err("Profile source path must be under the workspace profile source root.".to_string());
+        return Err(
+            "Profile source path must be under the workspace profile source root.".to_string(),
+        );
     }
     for component in path.components() {
         if !matches!(component, Component::Normal(_)) {
-            return Err("Profile source path must not contain absolute, parent, or prefix components.".to_string());
+            return Err(
+                "Profile source path must not contain absolute, parent, or prefix components."
+                    .to_string(),
+            );
         }
     }
     if path.extension().and_then(|value| value.to_str()) != Some("dcdl") {
@@ -913,10 +1075,12 @@ fn validate_relative_source_path(path: &Path) -> std::result::Result<(), String>
 }
 
 fn checked_source_path(workspace_root: &Path, relative_path: &Path) -> Result<PathBuf> {
-    validate_relative_source_path(relative_path).map_err(|message| Error::RuntimeOperationFailed {
-        runtime_id: "workspace-backend".to_string(),
-        code: "profile_source_path_escape".to_string(),
-        message,
+    validate_relative_source_path(relative_path).map_err(|message| {
+        Error::RuntimeOperationFailed {
+            runtime_id: "workspace-backend".to_string(),
+            code: "profile_source_path_escape".to_string(),
+            message,
+        }
     })?;
     let source_root = workspace_root.join(PROFILE_SOURCE_ROOT_RELATIVE_PATH);
     fs::create_dir_all(&source_root)?;
@@ -927,7 +1091,8 @@ fn checked_source_path(workspace_root: &Path, relative_path: &Path) -> Result<Pa
             return Err(Error::RuntimeOperationFailed {
                 runtime_id: "workspace-backend".to_string(),
                 code: "profile_source_symlink_escape".to_string(),
-                message: "Profile source resolves outside the workspace profile source root".to_string(),
+                message: "Profile source resolves outside the workspace profile source root"
+                    .to_string(),
             });
         }
     } else if let Some(parent) = full.parent() {
@@ -936,25 +1101,12 @@ fn checked_source_path(workspace_root: &Path, relative_path: &Path) -> Result<Pa
             return Err(Error::RuntimeOperationFailed {
                 runtime_id: "workspace-backend".to_string(),
                 code: "profile_source_path_escape".to_string(),
-                message: "Profile source parent resolves outside the workspace profile source root".to_string(),
+                message: "Profile source parent resolves outside the workspace profile source root"
+                    .to_string(),
             });
         }
     }
     Ok(full)
-}
-
-fn validate_default_profile(value: Option<&str>) -> Result<()> {
-    if let Some(value) = value {
-        if BUILTIN_PROFILE_IDS.contains(&value) || value.starts_with("project:") {
-            return Ok(());
-        }
-        return Err(Error::RuntimeOperationFailed {
-            runtime_id: "workspace-backend".to_string(),
-            code: "profile_default_invalid".to_string(),
-            message: "Default profile must be a Backend-published builtin or project selector".to_string(),
-        });
-    }
-    Ok(())
 }
 
 fn validate_profile_name(value: &str) -> Result<String> {
@@ -968,7 +1120,8 @@ fn validate_profile_name(value: &str) -> Result<String> {
         return Err(Error::RuntimeOperationFailed {
             runtime_id: "workspace-backend".to_string(),
             code: "profile_selector_invalid".to_string(),
-            message: "Profile selector must contain only ASCII letters, digits, '-' or '_'".to_string(),
+            message: "Profile selector must contain only ASCII letters, digits, '-' or '_'"
+                .to_string(),
         });
     }
     Ok(trimmed.to_string())
@@ -1006,16 +1159,22 @@ pub fn project_source_id(name: &str) -> String {
     format!("project:{name}")
 }
 
-pub fn selector_for_builtin_candidate(id: &str) -> Option<worker_runtime::catalog::ProfileSelector> {
+pub fn selector_for_builtin_candidate(
+    id: &str,
+) -> Option<worker_runtime::catalog::ProfileSelector> {
     match id {
         "runtime_default" => Some(worker_runtime::catalog::ProfileSelector::RuntimeDefault),
-        "builtin:default" | "builtin:companion" | "builtin:intake" | "builtin:orchestrator"
-        | "builtin:coder" | "builtin:reviewer" => {
-            Some(worker_runtime::catalog::ProfileSelector::Builtin(id.to_string()))
-        }
-        value if value.starts_with("project:") => {
-            Some(worker_runtime::catalog::ProfileSelector::Named(value.to_string()))
-        }
+        "builtin:default"
+        | "builtin:companion"
+        | "builtin:intake"
+        | "builtin:orchestrator"
+        | "builtin:coder"
+        | "builtin:reviewer" => Some(worker_runtime::catalog::ProfileSelector::Builtin(
+            id.to_string(),
+        )),
+        value if value.starts_with("project:") => Some(
+            worker_runtime::catalog::ProfileSelector::Named(value.to_string()),
+        ),
         _ => None,
     }
 }
@@ -1090,7 +1249,8 @@ fn sanitize_error(value: &str) -> String {
     value
         .split_whitespace()
         .map(|token| {
-            if token.starts_with('/') || token.contains("/.yoi/") || token.contains(".yoi/sessions") {
+            if token.starts_with('/') || token.contains("/.yoi/") || token.contains(".yoi/sessions")
+            {
                 "<redacted-path>"
             } else {
                 token
@@ -1131,14 +1291,18 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(created
-            .settings
-            .profiles
-            .iter()
-            .any(|profile| profile.profile_id == "project:alpha"));
-        assert!(build_workspace_profile_archive(dir.path(), "project:alpha")
-            .unwrap()
-            .is_some());
+        assert!(
+            created
+                .settings
+                .profiles
+                .iter()
+                .any(|profile| profile.profile_id == "project:alpha")
+        );
+        assert!(
+            build_workspace_profile_archive(dir.path(), "project:alpha")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -1151,10 +1315,12 @@ mod tests {
         )
         .unwrap();
         let settings = load_profile_settings("workspace-test", dir.path());
-        assert!(settings
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "profile_source_path_escape"));
+        assert!(
+            settings
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "profile_source_path_escape")
+        );
 
         let err = update_profile_registry(
             "workspace-test",
@@ -1166,7 +1332,10 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(err.to_string().contains("profile_registry_revision_conflict"));
+        assert!(
+            err.to_string()
+                .contains("profile_registry_revision_conflict")
+        );
     }
 
     #[test]
@@ -1186,6 +1355,124 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(err.to_string().contains("profile_source_syntax_invalid") || err.to_string().contains("profile_source_archive_invalid"));
+        assert!(
+            err.to_string().contains("profile_source_syntax_invalid")
+                || err.to_string().contains("profile_source_archive_invalid")
+        );
+    }
+
+    #[test]
+    fn invalid_project_profile_is_not_a_launch_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".yoi/profiles")).unwrap();
+        fs::write(
+            dir.path().join(".yoi/profiles.toml"),
+            "[profile.bad]\npath = \"profiles/bad.dcdl\"\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join(".yoi/profiles/bad.dcdl"), "not decodal").unwrap();
+
+        let settings = load_profile_settings("workspace-test", dir.path());
+        let bad = settings
+            .profiles
+            .iter()
+            .find(|profile| profile.profile_id == "project:bad")
+            .expect("bad profile summary is still visible for repair");
+        assert!(
+            bad.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code.starts_with("profile_source_"))
+        );
+        assert!(project_profile_candidates(dir.path()).is_empty());
+        assert!(!is_profile_candidate(dir.path(), "project:bad"));
+    }
+
+    #[test]
+    fn registry_update_rejects_missing_source_and_unknown_default() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".yoi")).unwrap();
+        fs::write(dir.path().join(".yoi/profiles.toml"), "").unwrap();
+        let revision = file_revision(&dir.path().join(".yoi/profiles.toml"));
+
+        let err = update_profile_registry(
+            "workspace-test",
+            dir.path(),
+            UpdateWorkspaceProfileRegistryRequest {
+                registry_revision: revision.clone(),
+                default_profile: Some("project:missing".to_string()),
+                profiles: Vec::new(),
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("profile_default_unknown"));
+
+        let err = update_profile_registry(
+            "workspace-test",
+            dir.path(),
+            UpdateWorkspaceProfileRegistryRequest {
+                registry_revision: revision,
+                default_profile: None,
+                profiles: vec![WorkspaceProfileRegistryEntryUpdate {
+                    name: "missing".to_string(),
+                    description: None,
+                    profile_source_id: None,
+                }],
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("profile_source_missing"));
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".yoi/profiles.toml")).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn profile_source_rejects_too_large_content() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".yoi")).unwrap();
+        fs::write(dir.path().join(".yoi/profiles.toml"), "").unwrap();
+        let revision = file_revision(&dir.path().join(".yoi/profiles.toml"));
+        let err = create_profile_source(
+            "workspace-test",
+            dir.path(),
+            CreateWorkspaceProfileSourceRequest {
+                name: "large".to_string(),
+                description: None,
+                content: "x".repeat((MAX_PROFILE_SOURCE_BYTES + 1) as usize),
+                registry_revision: revision,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("profile_source_too_large"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_update_rejects_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".yoi/profiles")).unwrap();
+        fs::write(dir.path().join(".yoi/profiles.toml"), "").unwrap();
+        let outside = dir.path().join("outside.dcdl");
+        fs::write(&outside, valid_decodal("escape")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.path().join(".yoi/profiles/escape.dcdl")).unwrap();
+        let revision = file_revision(&dir.path().join(".yoi/profiles.toml"));
+        let err = update_profile_registry(
+            "workspace-test",
+            dir.path(),
+            UpdateWorkspaceProfileRegistryRequest {
+                registry_revision: revision,
+                default_profile: None,
+                profiles: vec![WorkspaceProfileRegistryEntryUpdate {
+                    name: "escape".to_string(),
+                    description: None,
+                    profile_source_id: None,
+                }],
+            },
+        )
+        .unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("profile_source_symlink_escape"));
+        assert!(!rendered.contains(dir.path().to_string_lossy().as_ref()));
     }
 }

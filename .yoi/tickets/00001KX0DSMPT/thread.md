@@ -176,3 +176,26 @@ Validation:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-08T13:02:16Z -->
+
+## Implementation report
+
+Follow-up fixes for external review blockers.
+
+Summary:
+- Profile settings RuntimeOperationFailed responses now include typed Browser diagnostics and map profile validation/conflict/not-found codes to bad-request/conflict/not-found HTTP statuses; response messages are redacted while preserving diagnostic codes.
+- Project profile discovery now attaches source/Decodal validation failures to each project profile summary, excludes invalid project profiles from launch candidates, and rejects invalid project selectors during Worker launch candidate validation.
+- Registry/default mutations now validate default selector existence, selector/source consistency, missing source files, symlink/path escape, source size, Decodal/ProfileSourceArchive validity, and invalid registry schema before committing registry changes.
+- Added API/unit coverage for duplicate selector, invalid Decodal/source schema, stale revision conflicts, too-large source content, symlink escape redaction, invalid candidate exclusion/rejection, and missing/default reference rejection.
+
+Validation:
+- git diff --check
+- cargo test -p yoi-workspace-server
+- cargo check -p yoi
+- cd web/workspace && deno task check && deno task test
+- yoi ticket doctor
+- nix build .#yoi --no-link
+
+
+---

@@ -1362,11 +1362,11 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                     &self.resource_broker,
                 )
             })
-        .and_then(|bundle| {
-            self.runtime
-                .store_config_bundle(bundle)
-                .map_err(|err| err.to_string())
-        }) {
+            .and_then(|bundle| {
+                self.runtime
+                    .store_config_bundle(bundle)
+                    .map_err(|err| err.to_string())
+            }) {
             Ok(availability) => availability.reference,
             Err(error) => {
                 diagnostics.push(diagnostic(
@@ -3545,7 +3545,7 @@ mod tests {
                     working_directory_request: None,
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
-            resolved_config_bundle: None,
+                    resolved_config_bundle: None,
                 },
             )
             .unwrap();
@@ -3648,7 +3648,7 @@ mod tests {
                     working_directory_request: None,
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
-            resolved_config_bundle: None,
+                    resolved_config_bundle: None,
                 },
             )
             .unwrap();
@@ -3680,7 +3680,7 @@ mod tests {
                     working_directory_request: None,
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
-            resolved_config_bundle: None,
+                    resolved_config_bundle: None,
                 },
             )
             .unwrap();
