@@ -38,6 +38,31 @@ export async function loadJson<T>(
   }
 }
 
+async function requireJson<T>(response: Response, path: string): Promise<T> {
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || `${path} request failed (${response.status})`);
+  }
+  return (await response.json()) as T;
+}
+
+export async function workspaceApiJson<T>(path: string): Promise<T> {
+  return requireJson<T>(await fetch(path), path);
+}
+
+export async function workspaceApiJsonWithBody<T>(path: string, init: RequestInit): Promise<T> {
+  return requireJson<T>(
+    await fetch(path, {
+      headers: {
+        "content-type": "application/json",
+        ...(init.headers ?? {}),
+      },
+      ...init,
+    }),
+    path,
+  );
+}
+
 export function formatDate(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) {

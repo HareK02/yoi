@@ -13,6 +13,21 @@
     type RuntimeConnectionMutationResponse,
     type RuntimeConnectionSettingsResponse,
   } from "$lib/workspace-settings/model";
+  import type {
+    ProfileSettingsResponse,
+    WorkspaceMetadataSettingsResponse,
+    WorkspaceProfileSourceDetailResponse,
+  } from "$lib/workspace-settings/profile-types";
+  import {
+    createProfileSource,
+    deleteProfileSource,
+    fetchProfileSettings,
+    fetchProfileSource,
+    fetchWorkspaceMetadataSettings,
+    updateProfileRegistry,
+    updateProfileSource,
+    updateWorkspaceMetadataSettings,
+  } from "$lib/workspace-settings/profile-api";
 
   type RemoteAddForm = {
     runtime_id: string;
@@ -44,6 +59,19 @@
     display_name: "",
     endpoint: "",
   });
+  let workspaceMetadata = $state<WorkspaceMetadataSettingsResponse | null>(null);
+  let profileSettings = $state<ProfileSettingsResponse | null>(null);
+  let selectedProfileSource = $state<WorkspaceProfileSourceDetailResponse | null>(null);
+  let profileSourceContent = $state("");
+  let newProfileName = $state("");
+  let newProfileDescription = $state("");
+  let newProfileContent = $state("{\n  slug = \"workspace-profile\";\n  description = \"Workspace profile\";\n  scope = \"workspace_read\";\n}\n");
+  let profileLoading = $state(true);
+  let profileMessage = $state<string | null>(null);
+  let profileDiagnostics = $state<Diagnostic[]>([]);
+  let profileSubmitting = $state(false);
+  let workspaceNameDraft = $state("");
+  let defaultProfileDraft = $state("");
 
   $effect(() => {
     if (!workspaceId) {
@@ -82,6 +110,179 @@
       cancelled = true;
     };
   });
+
+  $effect(() => {
+    if (!workspaceId) {
+      profileLoading = false;
+      return;
+    }
+    let cancelled = false;
+    async function loadProfileAndWorkspaceSettings() {
+      profileLoading = true;
+      profileMessage = null;
+      profileDiagnostics = [];
+      try {
+        const [workspace, profiles] = await Promise.all([
+          fetchWorkspaceMetadataSettings(workspaceId),
+          fetchProfileSettings(workspaceId),
+        ]);
+        if (!cancelled) {
+          workspaceMetadata = workspace;
+          workspaceNameDraft = workspace.display_name;
+          profileSettings = profiles;
+          defaultProfileDraft = profiles.default_profile ?? "";
+          profileDiagnostics = [...workspace.diagnostics, ...profiles.diagnostics];
+        }
+      } catch (err) {
+        if (!cancelled) {
+          profileMessage = err instanceof Error ? err.message : "profile settings request failed";
+        }
+      } finally {
+        if (!cancelled) {
+          profileLoading = false;
+        }
+      }
+    }
+    loadProfileAndWorkspaceSettings();
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  async function refreshProfileSettings() {
+    profileSettings = await fetchProfileSettings(workspaceId);
+    profileDiagnostics = profileSettings.diagnostics;
+  }
+
+  async function submitWorkspaceName() {
+    if (!workspaceMetadata) return;
+    profileSubmitting = true;
+    profileMessage = null;
+    try {
+      const response = await updateWorkspaceMetadataSettings(workspaceId, {
+        display_name: workspaceNameDraft,
+        revision: workspaceMetadata.revision,
+      });
+      workspaceMetadata = response.workspace;
+      workspaceNameDraft = response.workspace.display_name;
+      profileDiagnostics = response.diagnostics.concat(response.workspace.diagnostics);
+      profileMessage = "Workspace display name updated.";
+    } catch (err) {
+      profileMessage = err instanceof Error ? err.message : "workspace update failed";
+    } finally {
+      profileSubmitting = false;
+    }
+  }
+
+  async function submitProfileRegistry() {
+    if (!profileSettings) return;
+    profileSubmitting = true;
+    profileMessage = null;
+    try {
+      const response = await updateProfileRegistry(workspaceId, {
+        registry_revision: profileSettings.registry_revision,
+        default_profile: defaultProfileDraft || null,
+        profiles: profileSettings.profiles
+          .filter((profile) => profile.source_kind === "project")
+          .map((profile) => ({
+            name: profile.selector.replace(/^project:/, ""),
+            description: profile.description ?? null,
+            profile_source_id: profile.profile_source_id ?? null,
+          })),
+      });
+      profileSettings = response.settings;
+      defaultProfileDraft = response.settings.default_profile ?? "";
+      profileDiagnostics = response.diagnostics.concat(response.settings.diagnostics);
+      profileMessage = "Profile registry updated.";
+    } catch (err) {
+      profileMessage = err instanceof Error ? err.message : "profile registry update failed";
+    } finally {
+      profileSubmitting = false;
+    }
+  }
+
+  async function submitNewProfileSource() {
+    if (!profileSettings) return;
+    profileSubmitting = true;
+    profileMessage = null;
+    try {
+      const response = await createProfileSource(workspaceId, {
+        name: newProfileName,
+        description: newProfileDescription || undefined,
+        content: newProfileContent,
+        registry_revision: profileSettings.registry_revision,
+      });
+      profileSettings = response.settings;
+      defaultProfileDraft = response.settings.default_profile ?? "";
+      profileDiagnostics = response.diagnostics.concat(response.settings.diagnostics);
+      newProfileName = "";
+      newProfileDescription = "";
+      profileMessage = "Profile source created.";
+    } catch (err) {
+      profileMessage = err instanceof Error ? err.message : "profile source create failed";
+    } finally {
+      profileSubmitting = false;
+    }
+  }
+
+  async function selectProfileSource(sourceId: string) {
+    profileSubmitting = true;
+    profileMessage = null;
+    try {
+      selectedProfileSource = await fetchProfileSource(workspaceId, sourceId);
+      profileSourceContent = selectedProfileSource.content;
+      profileDiagnostics = selectedProfileSource.diagnostics.concat(
+        selectedProfileSource.source.diagnostics,
+        selectedProfileSource.profile.diagnostics,
+      );
+    } catch (err) {
+      profileMessage = err instanceof Error ? err.message : "profile source load failed";
+    } finally {
+      profileSubmitting = false;
+    }
+  }
+
+  async function submitProfileSourceUpdate() {
+    if (!selectedProfileSource) return;
+    profileSubmitting = true;
+    profileMessage = null;
+    try {
+      const response = await updateProfileSource(workspaceId, selectedProfileSource.source.profile_source_id, {
+        content: profileSourceContent,
+        revision: selectedProfileSource.source.revision,
+      });
+      profileSettings = response.settings;
+      defaultProfileDraft = response.settings.default_profile ?? "";
+      profileDiagnostics = response.diagnostics.concat(response.settings.diagnostics);
+      await selectProfileSource(selectedProfileSource.source.profile_source_id);
+      profileMessage = "Profile source updated.";
+    } catch (err) {
+      profileMessage = err instanceof Error ? err.message : "profile source update failed";
+    } finally {
+      profileSubmitting = false;
+    }
+  }
+
+  async function submitProfileSourceDelete() {
+    if (!profileSettings || !selectedProfileSource) return;
+    profileSubmitting = true;
+    profileMessage = null;
+    try {
+      const response = await deleteProfileSource(workspaceId, selectedProfileSource.source.profile_source_id, {
+        registry_revision: profileSettings.registry_revision,
+        source_revision: selectedProfileSource.source.revision,
+      });
+      profileSettings = response.settings;
+      selectedProfileSource = null;
+      profileSourceContent = "";
+      profileDiagnostics = response.diagnostics.concat(response.settings.diagnostics);
+      profileMessage = "Profile source deleted.";
+    } catch (err) {
+      profileMessage = err instanceof Error ? err.message : "profile source delete failed";
+    } finally {
+      profileSubmitting = false;
+    }
+  }
 
   async function submitRemoteRuntime() {
     submitting = true;
@@ -410,8 +611,109 @@
       {/if}
     </section>
 
+    <section class="card profile-settings" id="profile-sources" aria-labelledby="profile-settings-title">
+      <header class="settings-section-header">
+        <div>
+          <p class="eyebrow">editable</p>
+          <h2 id="profile-settings-title">Profile Sources</h2>
+        </div>
+        <span class="badge success">Backend scoped</span>
+      </header>
+      <p>
+        Workspace profile settings are surfaced as source-qualified selectors and Decodal source summaries. The browser never receives raw host paths, runtime endpoints, tokens, resource handles, archive content, or archive digests.
+      </p>
+
+      {#if profileLoading}
+        <p class="status-message">Loading profile settings…</p>
+      {:else}
+        <div class="grid settings-grid">
+          <form class="settings-form" onsubmit={(event) => { event.preventDefault(); submitWorkspaceName(); }}>
+            <h3>Workspace display name</h3>
+            <label>
+              <span>Display name</span>
+              <input bind:value={workspaceNameDraft} autocomplete="off" />
+            </label>
+            <p class="settings-note">Workspace id: <code>{workspaceMetadata?.workspace_id ?? workspaceId}</code></p>
+            <button type="submit" disabled={profileSubmitting || !workspaceMetadata}>Save workspace name</button>
+          </form>
+
+          <form class="settings-form" onsubmit={(event) => { event.preventDefault(); submitProfileRegistry(); }}>
+            <h3>Default launch profile</h3>
+            <label>
+              <span>Default selector</span>
+              <select bind:value={defaultProfileDraft} disabled={!profileSettings}>
+                <option value="">Runtime default</option>
+                {#each profileSettings?.profiles ?? [] as profile}
+                  <option value={profile.selector}>{profile.label} ({profile.selector})</option>
+                {/each}
+              </select>
+            </label>
+            <button type="submit" disabled={profileSubmitting || !profileSettings}>Save profile registry</button>
+          </form>
+        </div>
+
+        <div class="settings-table-wrapper">
+          <h3>Discovered profiles</h3>
+          <table class="settings-table">
+            <thead>
+              <tr><th>Selector</th><th>Label</th><th>Source</th><th>Status</th><th>Action</th></tr>
+            </thead>
+            <tbody>
+              {#each profileSettings?.profiles ?? [] as profile}
+                <tr>
+                  <td><code>{profile.selector}</code></td>
+                  <td>{profile.label}</td>
+                  <td>{profile.source_kind}</td>
+                  <td>{profile.diagnostics.length === 0 ? "ok" : `${profile.diagnostics.length} diagnostics`}</td>
+                  <td>
+                    {#if profile.profile_source_id}
+                      <button type="button" onclick={() => selectProfileSource(profile.profile_source_id!)} disabled={profileSubmitting}>Open source</button>
+                    {:else}
+                      <span class="settings-note">builtin</span>
+                    {/if}
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+
+        <div class="grid settings-grid">
+          <form class="settings-form" onsubmit={(event) => { event.preventDefault(); submitNewProfileSource(); }}>
+            <h3>Create project profile source</h3>
+            <label><span>Name</span><input bind:value={newProfileName} placeholder="team-coder" autocomplete="off" /></label>
+            <label><span>Description</span><input bind:value={newProfileDescription} placeholder="Optional summary" autocomplete="off" /></label>
+            <label><span>Decodal source</span><textarea bind:value={newProfileContent} rows="8"></textarea></label>
+            <button type="submit" disabled={profileSubmitting || !profileSettings}>Create source</button>
+          </form>
+
+          {#if selectedProfileSource}
+            <form class="settings-form" onsubmit={(event) => { event.preventDefault(); submitProfileSourceUpdate(); }}>
+              <h3>Edit {selectedProfileSource.profile.label}</h3>
+              <p class="settings-note">Source id: <code>{selectedProfileSource.source.profile_source_id}</code>; display path: {selectedProfileSource.source.display_path}</p>
+              <label><span>Decodal source</span><textarea bind:value={profileSourceContent} rows="14"></textarea></label>
+              <div class="settings-actions">
+                <button type="submit" disabled={profileSubmitting}>Validate & save source</button>
+                <button type="button" class="danger" onclick={submitProfileSourceDelete} disabled={profileSubmitting}>Delete source</button>
+              </div>
+            </form>
+          {:else}
+            <div class="settings-empty-state">
+              <h3>No profile source selected</h3>
+              <p>Open a project source from the discovered profile table to edit it.</p>
+            </div>
+          {/if}
+        </div>
+
+        {#if profileMessage}
+          <p class="status-message">{profileMessage}</p>
+        {/if}
+        {@render DiagnosticsList({ diagnostics: profileDiagnostics })}
+      {/if}
+    </section>
+
     <div class="grid settings-grid">
-      {#each SETTINGS_SECTIONS.filter((section) => section.id !== "runtime-connections") as section}
+      {#each SETTINGS_SECTIONS.filter((section) => section.id !== "runtime-connections" && section.id !== "profile-sources") as section}
         <section class="card settings-section" id={section.id} aria-labelledby={`${section.id}-title`}>
           <header class="settings-section-header">
             <div>

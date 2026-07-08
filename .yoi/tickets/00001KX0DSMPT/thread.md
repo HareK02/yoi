@@ -153,3 +153,26 @@ Acceptance basis:
 - side effect はこの `queued -> inprogress` acceptance 後に、worktree-workflow に沿って implementation worktree を作成してから開始する。
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-08T12:37:56Z -->
+
+## Implementation report
+
+Implemented workspace-scoped Workspace/Profile settings in the delegated worktree.
+
+Summary:
+- Added scoped Workspace settings API to read/update display metadata through the workspace identity record with revision checks.
+- Added scoped Profile settings API for workspace Decodal Profile registry/source discovery, create/update/delete, default selector updates, typed diagnostics, revision conflict checks, safe source-root/path validation, and Decodal/ProfileSourceArchive validation.
+- Added Backend launch-options integration so project profile candidates refresh from the same settings projection; project-profile spawns carry the resolved ConfigBundle through the Runtime resource-fetch/config boundary.
+- Added Settings page UI for workspace display name, profile registry/default selector, profile source creation/edit/delete, and safe diagnostics without exposing raw host paths, secrets, runtime endpoints/tokens, socket/session/store paths, archive content/digest, resource handles, or runtime internals.
+
+Validation:
+- git diff --check
+- cargo test -p yoi-workspace-server
+- cargo check -p yoi
+- cd web/workspace && deno task check && deno task test
+- yoi ticket doctor
+- nix build .#yoi --no-link
+
+
+---

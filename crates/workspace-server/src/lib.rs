@@ -8,6 +8,7 @@ pub mod companion;
 pub mod config;
 pub mod hosts;
 pub mod identity;
+pub mod profile_settings;
 pub mod observation;
 pub mod records;
 pub mod repositories;

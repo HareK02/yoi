@@ -6,7 +6,7 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::header::{CONTENT_TYPE, LOCATION};
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::{SecondsFormat, Utc};
 use futures::StreamExt;
@@ -35,6 +35,11 @@ use crate::identity::WorkspaceIdentity;
 use crate::observation::{
     BackendObservationProxy, ClientWorkerEventWsFrame, ClientWorkerEventsWsQuery,
     ObservationProxyError, RuntimeObservationClient, RuntimeObservationSourceConfig,
+};
+use crate::profile_settings::{
+    CreateWorkspaceProfileSourceRequest, DeleteWorkspaceProfileSourceRequest,
+    UpdateWorkspaceMetadataRequest, UpdateWorkspaceProfileRegistryRequest,
+    UpdateWorkspaceProfileSourceRequest,
 };
 use crate::records::{
     LocalProjectRecordReader, ObjectiveDetail, ProjectRecordList, TicketDetail, TicketSummary,
@@ -264,6 +269,24 @@ pub fn build_router(api: WorkspaceApi) -> Router {
     Router::new()
         .route("/api/workspace", get(get_workspace))
         .route("/api/w/{workspace_id}/workspace", get(scoped_get_workspace))
+        .route(
+            "/api/w/{workspace_id}/settings/workspace",
+            get(scoped_get_workspace_settings).put(scoped_update_workspace_settings),
+        )
+        .route(
+            "/api/w/{workspace_id}/settings/profiles",
+            get(scoped_get_profile_settings).post(scoped_create_profile_source),
+        )
+        .route(
+            "/api/w/{workspace_id}/settings/profiles/registry",
+            put(scoped_update_profile_registry),
+        )
+        .route(
+            "/api/w/{workspace_id}/settings/profiles/{profile_source_id}",
+            get(scoped_get_profile_source)
+                .put(scoped_update_profile_source)
+                .delete(scoped_delete_profile_source),
+        )
         .route("/api/tickets", get(list_tickets))
         .route("/api/w/{workspace_id}/tickets", get(scoped_list_tickets))
         .route("/api/tickets/{id}", get(get_ticket))
@@ -812,6 +835,113 @@ async fn scoped_get_workspace(
 ) -> ApiResult<Json<WorkspaceResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     get_workspace(State(api)).await
+}
+
+async fn scoped_get_workspace_settings(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<crate::profile_settings::WorkspaceMetadataSettingsResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    Ok(Json(crate::profile_settings::workspace_metadata_settings(
+        &api.config.workspace_root,
+        &api.config.workspace_id,
+        &api.config.workspace_created_at,
+        &api.config.workspace_display_name,
+    )))
+}
+
+async fn scoped_update_workspace_settings(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Json(request): Json<UpdateWorkspaceMetadataRequest>,
+) -> ApiResult<Json<crate::profile_settings::WorkspaceMetadataMutationResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let workspace = crate::profile_settings::update_workspace_metadata(&api.config.workspace_root, request)?;
+    Ok(Json(crate::profile_settings::WorkspaceMetadataMutationResponse {
+        workspace,
+        diagnostics: vec![RuntimeDiagnostic {
+            code: "workspace_metadata_updated".to_string(),
+            severity: DiagnosticSeverity::Info,
+            message: "Workspace display metadata was updated.".to_string(),
+        }],
+    }))
+}
+
+async fn scoped_get_profile_settings(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<crate::profile_settings::ProfileSettingsResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    Ok(Json(crate::profile_settings::load_profile_settings(
+        &api.config.workspace_id,
+        &api.config.workspace_root,
+    )))
+}
+
+async fn scoped_create_profile_source(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Json(request): Json<CreateWorkspaceProfileSourceRequest>,
+) -> ApiResult<Json<crate::profile_settings::ProfileSettingsMutationResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    Ok(Json(crate::profile_settings::create_profile_source(
+        &api.config.workspace_id,
+        &api.config.workspace_root,
+        request,
+    )?))
+}
+
+async fn scoped_update_profile_registry(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Json(request): Json<UpdateWorkspaceProfileRegistryRequest>,
+) -> ApiResult<Json<crate::profile_settings::ProfileSettingsMutationResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    Ok(Json(crate::profile_settings::update_profile_registry(
+        &api.config.workspace_id,
+        &api.config.workspace_root,
+        request,
+    )?))
+}
+
+async fn scoped_get_profile_source(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, profile_source_id)): AxumPath<(String, String)>,
+) -> ApiResult<Json<crate::profile_settings::WorkspaceProfileSourceDetailResponse>> {
+    validate_workspace_scope(&api, &workspace_id)?;
+    Ok(Json(crate::profile_settings::read_profile_source(
+        &api.config.workspace_id,
+        &api.config.workspace_root,
+        &profile_source_id,
+    )?))
+}
+
+async fn scoped_update_profile_source(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, profile_source_id)): AxumPath<(String, String)>,
+    Json(request): Json<UpdateWorkspaceProfileSourceRequest>,
+) -> ApiResult<Json<crate::profile_settings::ProfileSettingsMutationResponse>> {
+    validate_workspace_scope(&api, &workspace_id)?;
+    Ok(Json(crate::profile_settings::update_profile_source(
+        &api.config.workspace_id,
+        &api.config.workspace_root,
+        &profile_source_id,
+        request,
+    )?))
+}
+
+async fn scoped_delete_profile_source(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, profile_source_id)): AxumPath<(String, String)>,
+    Json(request): Json<DeleteWorkspaceProfileSourceRequest>,
+) -> ApiResult<Json<crate::profile_settings::ProfileSettingsMutationResponse>> {
+    validate_workspace_scope(&api, &workspace_id)?;
+    Ok(Json(crate::profile_settings::delete_profile_source(
+        &api.config.workspace_id,
+        &api.config.workspace_root,
+        &profile_source_id,
+        request,
+    )?))
 }
 
 async fn scoped_list_tickets(
@@ -1639,12 +1769,22 @@ async fn create_workspace_worker(
     State(api): State<WorkspaceApi>,
     Json(request): Json<BrowserCreateWorkerRequest>,
 ) -> ApiResult<Json<BrowserCreateWorkerResponse>> {
-    let profile_selector = profile_selector_for_candidate(&request.profile).ok_or_else(|| {
+    let profile_selector = profile_selector_for_candidate_with_root(&api.config.workspace_root, &request.profile).ok_or_else(|| {
         settings_bad_request(
             "unsupported_worker_profile",
             "profile must be selected from Backend-published worker profile candidates",
         )
     })?;
+    let resolved_config_bundle = if request.profile.starts_with("project:") {
+        crate::profile_settings::build_workspace_profile_config_bundle(
+            &api.config.workspace_root,
+            &api.config.workspace_id,
+            &api.config.workspace_created_at,
+            &request.profile,
+        )?
+    } else {
+        None
+    };
     let display_name = sanitize_worker_display_name(&request.display_name).ok_or_else(|| {
         settings_bad_request(
             "invalid_worker_display_name",
@@ -1702,6 +1842,7 @@ async fn create_workspace_worker(
                 working_directory_request: None,
                 resolved_working_directory_request: None,
                 resolved_working_directory,
+                resolved_config_bundle,
             },
         )
         .map_err(|err| err.into_error())?;
@@ -2753,7 +2894,7 @@ fn worker_launch_options_response(api: &WorkspaceApi) -> WorkerLaunchOptionsResp
     WorkerLaunchOptionsResponse {
         workspace_id: api.config.workspace_id.clone(),
         runtimes,
-        profiles: worker_profile_candidates(),
+        profiles: worker_profile_candidates_for_root(&api.config.workspace_root),
         repositories: working_directory_repository_options(api),
         working_directories: working_directory_summaries(api).unwrap_or_default(),
         diagnostics: Vec::new(),
@@ -2823,8 +2964,16 @@ fn working_directory_request_for_browser(
     })
 }
 
+#[cfg(test)]
 fn worker_profile_candidates() -> Vec<WorkerLaunchProfileCandidate> {
-    vec![
+    worker_profile_candidates_for_root(Path::new("."))
+        .into_iter()
+        .filter(|candidate| candidate.id == "builtin:coder" || candidate.id == "runtime_default")
+        .collect()
+}
+
+fn worker_profile_candidates_for_root(workspace_root: &Path) -> Vec<WorkerLaunchProfileCandidate> {
+    let mut candidates = vec![
         WorkerLaunchProfileCandidate {
             id: "builtin:coder".to_string(),
             label: "Coding Worker".to_string(),
@@ -2835,14 +2984,35 @@ fn worker_profile_candidates() -> Vec<WorkerLaunchProfileCandidate> {
             label: "Runtime default".to_string(),
             description: "Use the selected Runtime's default profile.".to_string(),
         },
-    ]
+    ];
+    candidates.extend(
+        crate::profile_settings::project_profile_candidates(workspace_root)
+            .into_iter()
+            .filter(|profile| profile.diagnostics.is_empty())
+            .map(|profile| WorkerLaunchProfileCandidate {
+                id: profile.profile_id,
+                label: profile.label,
+                description: profile
+                    .description
+                    .unwrap_or_else(|| "Workspace Decodal profile source.".to_string()),
+            }),
+    );
+    candidates
 }
 
 fn profile_selector_for_candidate(profile: &str) -> Option<ProfileSelector> {
-    match profile {
-        "builtin:coder" => Some(ProfileSelector::Builtin("builtin:coder".to_string())),
-        "runtime_default" => Some(ProfileSelector::RuntimeDefault),
-        _ => None,
+    crate::profile_settings::selector_for_builtin_candidate(profile).filter(|_| {
+        matches!(profile, "builtin:coder" | "runtime_default")
+    })
+}
+
+fn profile_selector_for_candidate_with_root(workspace_root: &Path, profile: &str) -> Option<ProfileSelector> {
+    if profile_selector_for_candidate(profile).is_some() {
+        profile_selector_for_candidate(profile)
+    } else if crate::profile_settings::is_profile_candidate(workspace_root, profile) {
+        crate::profile_settings::selector_for_builtin_candidate(profile)
+    } else {
+        None
     }
 }
 
@@ -4599,6 +4769,7 @@ mod tests {
                     working_directory_request: None,
                     resolved_working_directory_request: None,
                     resolved_working_directory: None,
+                    resolved_config_bundle: None,
                 },
             )
             .expect("spawn worker");

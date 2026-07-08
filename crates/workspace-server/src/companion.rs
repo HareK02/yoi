@@ -392,6 +392,7 @@ fn spawn_companion_worker(runtime: &RuntimeRegistry) -> CompanionWorkerState {
             working_directory_request: None,
             resolved_working_directory_request: None,
             resolved_working_directory: None,
+            resolved_config_bundle: None,
         },
     );
 
