@@ -142,7 +142,16 @@ export const SETTINGS_PATTERNS: readonly SettingsPattern[] = [
 ];
 
 export function settingsSectionHref(id: SettingsSectionId): string {
-  return `${SETTINGS_ROUTE}#${id}`;
+  switch (id) {
+    case "runtime-connections":
+      return `${SETTINGS_ROUTE}/runtime-connections`;
+    case "profile-sources":
+      return `${SETTINGS_ROUTE}/profiles`;
+    case "workspace-identity":
+      return `${SETTINGS_ROUTE}/workspace`;
+    case "backend-config":
+      return `${SETTINGS_ROUTE}/backend`;
+  }
 }
 
 export function diagnosticLabel(diagnostic: Diagnostic): string {

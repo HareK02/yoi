@@ -1,9 +1,9 @@
 import {
+  diagnosticLabel,
   SETTINGS_PATTERNS,
   SETTINGS_PERMISSION_NOTICE,
   SETTINGS_ROUTE,
   SETTINGS_SECTIONS,
-  diagnosticLabel,
   settingsSectionHref,
 } from "./model.ts";
 
@@ -23,12 +23,12 @@ Deno.test("settings section navigation stays under the settings route", () => {
   for (const section of SETTINGS_SECTIONS) {
     const href = settingsSectionHref(section.id);
     assert(
-      href.startsWith("/settings#"),
+      href.startsWith("/settings"),
       `${section.id} should link under settings`,
     );
     assert(
-      href.endsWith(section.id),
-      `${section.id} href should preserve section id`,
+      !href.includes("#"),
+      `${section.id} href should use a dedicated route instead of a page anchor`,
     );
   }
 });
@@ -48,7 +48,10 @@ Deno.test("runtime connections are editable without advertising raw authority le
   const runtimeSection = SETTINGS_SECTIONS.find((section) =>
     section.id === "runtime-connections"
   );
-  assert(runtimeSection?.status === "editable", "Runtime Connections should be editable");
+  assert(
+    runtimeSection?.status === "editable",
+    "Runtime Connections should be editable",
+  );
 
   const allText = [
     SETTINGS_PERMISSION_NOTICE,
@@ -61,7 +64,8 @@ Deno.test("runtime connections are editable without advertising raw authority le
   ].join("\n");
 
   assert(
-    allText.includes("restart_required=true") || allText.includes("Restart-required"),
+    allText.includes("restart_required=true") ||
+      allText.includes("Restart-required"),
     "restart-required pattern should be visible",
   );
   assert(
@@ -93,7 +97,8 @@ Deno.test("diagnostic labels preserve severity and code", () => {
     message: "Restart required.",
   } as const;
   assert(
-    diagnosticLabel(diagnostic) === "warning: runtime_registry_restart_required",
+    diagnosticLabel(diagnostic) ===
+      "warning: runtime_registry_restart_required",
     "diagnostic label should be bounded and stable",
   );
 });

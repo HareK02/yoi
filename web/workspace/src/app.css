@@ -1446,3 +1446,212 @@
         display: block;
     }
 }
+
+@layer components {
+  .settings-page {
+    display: grid;
+    gap: var(--space-5);
+  }
+
+  .settings-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+  }
+
+  .settings-nav a,
+  .settings-section-card,
+  .button-link {
+    color: inherit;
+    text-decoration: none;
+  }
+
+  .settings-nav a,
+  .settings-section-card {
+    display: grid;
+    gap: var(--space-1);
+    min-width: min(16rem, 100%);
+    padding: var(--space-3) var(--space-4);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-panel);
+    background: var(--bg-raised);
+  }
+
+  .settings-nav a:hover,
+  .settings-nav a:focus-visible,
+  .settings-nav a.active,
+  .settings-section-card:hover,
+  .settings-section-card:focus-visible {
+    background: var(--interactive-hover);
+  }
+
+  .settings-nav span,
+  .settings-section-card h3 {
+    color: var(--text-strong);
+    font-weight: 800;
+  }
+
+  .settings-section-grid,
+  .settings-profile-grid,
+  .settings-pattern-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(20rem, 100%), 1fr));
+    gap: var(--space-4);
+  }
+
+  .settings-card {
+    display: grid;
+    gap: var(--space-4);
+  }
+
+  .settings-card-header,
+  .settings-section-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-4);
+  }
+
+  .settings-form,
+  .settings-registry-editor {
+    display: grid;
+    gap: var(--space-3);
+  }
+
+  .settings-form label,
+  .settings-registry-editor label {
+    display: grid;
+    gap: var(--space-1);
+    color: var(--text-muted);
+    font-size: 0.82rem;
+  }
+
+  .settings-form input,
+  .settings-form select,
+  .settings-form textarea,
+  .settings-registry-editor input,
+  .settings-registry-editor select,
+  .settings-runtime-form input {
+    width: 100%;
+    border: 1px solid var(--line);
+    border-radius: 0.55rem;
+    background: var(--bg-raised);
+    color: var(--text-strong);
+    padding: 0.45rem 0.55rem;
+    font: inherit;
+  }
+
+  .settings-form textarea {
+    min-height: 18rem;
+    resize: vertical;
+    font-family: var(--font-mono);
+  }
+
+  .settings-form button,
+  .button-link {
+    width: fit-content;
+    border: 0;
+    border-radius: 0.6rem;
+    background: var(--accent);
+    color: var(--bg);
+    font-weight: 700;
+    padding: 0.5rem 0.75rem;
+    cursor: pointer;
+  }
+
+  .settings-form button:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
+  .settings-form button.danger {
+    background: var(--danger);
+  }
+
+  .settings-note {
+    margin: 0;
+    color: var(--text-muted);
+  }
+
+  .settings-profile-list {
+    display: grid;
+    gap: var(--space-3);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .settings-profile-list li,
+  .settings-registry-editor fieldset,
+  .settings-pattern-grid article {
+    display: grid;
+    gap: var(--space-2);
+    padding: var(--space-3);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-panel);
+    background: var(--bg-raised);
+  }
+
+  .settings-profile-list strong,
+  .settings-profile-list span,
+  .settings-profile-list small {
+    display: block;
+  }
+
+  .settings-profile-list strong {
+    color: var(--text-strong);
+  }
+
+  .settings-profile-list span,
+  .settings-profile-list small,
+  .settings-profile-list p {
+    margin: 0;
+    color: var(--text-muted);
+  }
+
+  .settings-registry-editor fieldset {
+    margin: 0;
+  }
+
+  .settings-registry-editor legend {
+    color: var(--text-strong);
+    font-weight: 750;
+  }
+
+  .settings-identity-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(14rem, 100%), 1fr));
+    gap: var(--space-3);
+    margin: 0;
+  }
+
+  .settings-identity-list div {
+    display: grid;
+    gap: var(--space-1);
+  }
+
+  .settings-identity-list dt {
+    color: var(--text-muted);
+    font-size: 0.78rem;
+  }
+
+  .settings-identity-list dd {
+    margin: 0;
+    color: var(--text-strong);
+  }
+
+  .section-status-pill {
+    width: fit-content;
+    border-radius: 999px;
+    padding: 0.25rem 0.55rem;
+    background: var(--bg-subtle);
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    font-weight: 800;
+    text-transform: uppercase;
+  }
+
+  .status-message.error {
+    color: var(--danger);
+  }
+}
