@@ -239,6 +239,19 @@ pub fn resolve_runtime_profile_manifest(
     Ok((manifest, loader))
 }
 
+pub fn resolve_runtime_profile_manifest_from_manifest(
+    mut manifest: WorkerManifest,
+    workspace_root: &Path,
+    worker_name: &str,
+) -> Result<(WorkerManifest, PromptLoader), String> {
+    if manifest.worker.name.is_empty() {
+        manifest.worker.name = worker_name.to_string();
+    }
+    apply_profile_launch_policy(&mut manifest, workspace_root, None)?;
+    apply_plugin_resolution_plan(&mut manifest, workspace_root);
+    Ok((manifest, PromptLoader::builtins_only()))
+}
+
 fn load_single_manifest(
     path: &Path,
     explicit_worker_name: Option<&str>,

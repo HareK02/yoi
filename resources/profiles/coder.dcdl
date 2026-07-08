@@ -1,0 +1,12 @@
+slug = "coder";
+description = "Ticket implementation coder profile.";
+scope = "workspace_write";
+
+feature = {
+    task = { enabled = true; };
+    memory = { enabled = true; };
+    web = { enabled = true; };
+    workers = { enabled = false; };
+    ticket = { enabled = false; access = "lifecycle"; };
+    ticket_orchestration = { enabled = false; };
+};

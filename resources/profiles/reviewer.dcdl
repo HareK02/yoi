@@ -1,0 +1,12 @@
+slug = "reviewer";
+description = "Ticket review profile.";
+scope = "workspace_read";
+
+feature = {
+    task = { enabled = true; };
+    memory = { enabled = true; };
+    web = { enabled = true; };
+    workers = { enabled = false; };
+    ticket = { enabled = false; access = "lifecycle"; };
+    ticket_orchestration = { enabled = false; };
+};

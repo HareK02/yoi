@@ -195,3 +195,187 @@ Implementation progress report:
 - External review will be requested via a read-only sibling Reviewer Pod. `StopPod` は使わない。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-08T10:07:07Z status: request_changes -->
+
+## Review: request changes
+
+External review result: request_changes
+
+Blockers:
+
+1. Builtin Decodal profiles が現在の schema で実際には解決できず、normal Browser/Backend launch が archive path で失敗する。
+   - Evidence:
+     - builtin Decodal files に `tool_enabled` が含まれる（例: `resources/profiles/default.dcdl`, `coder.dcdl`, `reviewer.dcdl`）。
+     - archive resolution は Decodal を JSON に materialize してすぐ `ProfileConfig` に deserialize する。
+     - `ProfileConfig` は `#[serde(deny_unknown_fields)]` で、`feature`, `permissions` などはあるが `tool_enabled` field がない。
+   - Impact:
+     - acceptance criterion「builtin role Profiles が Decodal source として利用できる」を満たしていない。
+     - Backend-built archives が normal workspace/Companion launch に使われるなら、unknown-field error で Worker creation 前に失敗する。
+   - Required fix:
+     - Decodal profile schema で既存 typed fields を使って tool policy を表現するか、`tool_enabled` 相当を typed mapping/field として受け入れて Worker manifest/config に変換する。
+     - embedded builtin `.dcdl` それぞれを real `ProfileSourceArchive` + Decodal + `ProfileConfig` path で resolve する focused test を追加する。
+
+2. Missing/unknown profile selectors が typed diagnostic にならず、silent default fallback する。
+   - Evidence:
+     - Runtime archive resolution が requested selector 欠落時に `"default"` へ fallback している。
+     - Backend archive construction が selected label を `embedded_profile_path(profile)` に入れ、unknown `Builtin` / `Named` profile を `profiles/default.dcdl` に map している。
+   - Impact:
+     - missing profile / ambiguous selector が typed diagnostic になるという acceptance criterion に違反。
+     - invalid/custom profile request が default profile Worker として成功し得るため、Browser/Backend launch の correctness / authority boundary 問題。
+   - Required fix:
+     - unknown profile selector は archive construction 前または archive resolution 中に typed diagnostic で拒否する。
+     - explicit RuntimeDefault/default 以外の default fallback を削除する。
+     - unknown `Named` / unknown `Builtin` selector の tests を追加する。
+
+Validation / inspection performed:
+- Ticket records と IntentPacket / acceptance criteria を確認。
+- implementation worktree 内で implementation commit/diff targets を read-only inspection。
+- archive format/verification, config bundle storage, Runtime launch, Backend archive construction, Browser-facing summaries, builtin Decodal profiles を確認。
+- broad build/test matrix は Orchestrator-reported validation pass を参照し、Reviewer は変更を行っていない。
+
+Non-blocking follow-ups:
+- blockers 修正後、embedded Decodal profiles を使う actual Browser/Backend default launch bundle path の integration-style unit test を追加するとよい。
+- supported profile registry boundary をより明確にするとよい。現状 Backend archive construction は embedded builtins hardcode で、Ticket は workspace/project/builtin profile registry discovery を記述している。
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-08T10:23:11Z -->
+
+## Implementation report
+
+Review-fix implementation report:
+
+- Coder Pod completed requested changes and committed follow-up `a2833dad fix: reject unknown profile archive selectors` on branch `work/00001KWZ5KERY-decodal-profile-archive`.
+- Worktree status was clean after commit.
+- Fix summary:
+  - Embedded Decodal profiles no longer use unsupported `tool_enabled`; they now use existing typed `ProfileConfig` fields such as `feature` plus existing model/session/engine/memory/web fields as applicable。
+  - Archive selector fallback to `default` was removed; missing selector now returns `ProfileArchiveError::MissingEntrypoint`。
+  - Backend embedded archive construction rejects unknown `Builtin` and unknown `Named` selectors instead of mapping them to default。
+  - Added focused tests proving every embedded builtin `.dcdl` resolves through real Backend-built `ProfileSourceArchive` + Decodal + `ProfileConfig` path。
+  - Added tests for unknown Builtin/Named selector rejection and no default fallback for missing selectors。
+- Orchestrator reran validation in the implementation worktree:
+  - `git diff --check`: pass
+  - `cargo test -p worker-runtime --features ws-server,fs-store`: pass（41 lib tests + 5 main tests + doc tests）
+  - `cargo test -p yoi-workspace-server`: pass（69 lib tests + 2 main tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（17 tests）
+  - `yoi ticket doctor`: ok
+  - `nix build .#yoi --no-link`: pass
+- Requesting follow-up external review against `a823d414..a2833dad` and full combined implementation。
+
+---
+
+<!-- event: review author: reviewer at: 2026-07-08T10:33:16Z status: approve -->
+
+## Review: approve
+
+External follow-up review result: approve
+
+Result: approve
+
+Review evidence:
+- Prior blocker 1 is fixed:
+  - Builtin Decodal profiles now resolve through `default_embedded_config_bundle(...) -> ProfileSourceArchive -> verify() -> resolve_profile(...) -> ProfileConfig` rather than bypassing archive resolution。
+  - `resources/profiles/*.dcdl` no longer use unsupported `tool_enabled`; they use supported `feature = { ... }` fields and are covered by the added embedded-profile resolution test。
+- Prior blocker 2 is fixed:
+  - `VerifiedProfileSourceArchive::resolve_profile` no longer falls back to `default` for missing selectors。
+  - Unknown `Builtin` and `Named` selectors are rejected before bundle construction in `embedded_profile_path(...)`, with typed runtime diagnostics from embedded/remote launch paths。
+  - Explicit runtime default remains valid via default/builtin-default archive entrypoints。
+- Browser/Backend launch path:
+  - Browser only selects Backend-published profile candidates。
+  - Workspace Backend builds/syncs a config bundle containing the archive before `CreateWorkerRequest`。
+  - Runtime `create_worker` passes the stored config bundle into the execution backend; `ProfileRuntimeWorkerFactory` only uses the Lua/filesystem fallback when no config bundle is present, so ordinary Browser/Backend launch does not read Runtime-local profile discovery。
+- Archive invariants:
+  - Archive build/verify enforces relative safe tar paths, source counts/sizes/total bytes, source digests, archive digest, supported source kind, and declared import-map lookup。
+  - Undeclared imports are rejected by `ArchiveSourceLoader`。
+- Browser-facing exposure:
+  - Web launch types expose only profile candidates。
+  - Config bundle summaries expose source graph summary rather than archive content or archive digest; worker summaries retain only profile selector/config-bundle ref metadata and do not expose runtime store paths/endpoints/secrets。
+- Compatibility:
+  - Lua/filesystem fallback remains isolated to direct/debug paths without a config bundle。
+  - Dependency/package changes look sound, and the provided validation set includes Rust tests/checks, Deno checks/tests, ticket doctor, and `nix build .#yoi --no-link`。
+
+No merge blockers found.
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-07-08T10:35:19Z from: inprogress to: done reason: merged_validated_review_approved field: state -->
+
+## State changed
+
+Merge/validation acceptance:
+
+- Follow-up external review approved the implementation after blocker fix。
+- Implementation branch `work/00001KWZ5KERY-decodal-profile-archive` was merged into the orchestration branch with merge commit `0334c572 merge: decodal profile archives`。
+- Ticket-record conflicts during merge were resolved by preserving Orchestrator-side Ticket thread/item records; product/code/archive changes were merged。
+- Final validation in Orchestrator worktree passed:
+  - `git diff --check`: pass
+  - `cargo test -p worker-runtime --features ws-server,fs-store`: pass（41 lib tests + 5 main tests + doc tests）
+  - `cargo test -p yoi-workspace-server`: pass（69 lib tests + 2 main tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（17 tests）
+  - `yoi ticket doctor`: ok
+  - `nix build .#yoi --no-link`: pass
+
+Implementation commits:
+- `a823d414 feat: add decodal profile archives`
+- `a2833dad fix: reject unknown profile archive selectors`
+
+No merge-blocking issues remain.
+
+---
+
+<!-- event: state_changed author: hare at: 2026-07-08T10:35:38Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-07-08T10:35:38Z status: closed -->
+
+## 完了
+
+完了。
+
+実装内容:
+- Decodal dependency/schema を導入し、builtin role Profiles を Decodal sources として追加した。
+- `ProfileSourceArchive` tar format と `manifest.json` schema を実装した。
+- Backend が profile/role selector から archive を構築し、import closure / source digest / archive digest / size/count/depth/path safety を検証するようにした。
+- Runtime が `ProfileSourceArchiveRef` / config bundle から archive を prefetch / verify / cache / reuse できるようにした。
+- Runtime `ArchiveSourceLoader` は archive-contained Decodal sources のみを解決し、undeclared import / filesystem fallback を拒否するようにした。
+- Worker creation の通常 Browser/Backend path は archive-resolved Decodal config を使い、Runtime-local filesystem profile discovery を使わないようにした。
+- Worker metadata/config bundle summary に archive id / source graph summary を残し、Browser-facing response には archive content / digest / store path / raw path を出さないようにした。
+- Lua filesystem Profile path は compatibility/debug fallback として隔離した。
+- Unknown Builtin / Named selectors と missing entrypoint は default fallback せず typed diagnostics で reject するようにした。
+- Builtin `.dcdl` は real Backend-built `ProfileSourceArchive` + Decodal + `ProfileConfig` path で resolve できるように修正した。
+- Focused worker-runtime / workspace-server tests を追加した。
+
+主な commit / merge:
+- implementation: `a823d414 feat: add decodal profile archives`
+- review fix: `a2833dad fix: reject unknown profile archive selectors`
+- merge into orchestration: `0334c572 merge: decodal profile archives`
+
+Review:
+- 初回 external review は request_changes。
+- follow-up external review は approve。merge-blocking issue なし。
+
+Final validation in Orchestrator worktree:
+- `git diff --check`: pass
+- `cargo test -p worker-runtime --features ws-server,fs-store`: pass（41 lib tests + 5 main tests + doc tests）
+- `cargo test -p yoi-workspace-server`: pass（69 lib tests + 2 main tests）
+- `cargo check -p yoi`: pass
+- `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+- `cd web/workspace && deno task test`: pass（17 tests）
+- `yoi ticket doctor`: ok
+- `nix build .#yoi --no-link`: pass
+
+補足:
+- implementation branch merge 時に Ticket record conflict が発生したため、Orchestrator 側の Ticket item/thread を保持して解決した。product/code/archive changes は merge 済み。
+
+---

@@ -1,0 +1,12 @@
+slug = "intake";
+description = "Ticket intake profile.";
+scope = "workspace_write";
+
+feature = {
+    task = { enabled = false; };
+    memory = { enabled = true; };
+    web = { enabled = true; };
+    workers = { enabled = false; };
+    ticket = { enabled = true; access = "lifecycle"; };
+    ticket_orchestration = { enabled = false; };
+};

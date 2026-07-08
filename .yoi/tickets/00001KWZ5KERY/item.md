@@ -1,8 +1,8 @@
 ---
 title: 'Migrate Profiles to Decodal ProfileSourceArchive for Runtime launch'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-07-07T20:51:35Z'
-updated_at: '2026-07-08T09:59:31Z'
+updated_at: '2026-07-08T10:35:38Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-07-08T09:11:22Z'

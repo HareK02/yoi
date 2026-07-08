@@ -189,6 +189,10 @@ pub enum ProfileSource {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provenance: Option<String>,
     },
+    Archive {
+        archive_id: String,
+        source: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1405,6 +1409,10 @@ fn source_name(source: &ProfileSource) -> Option<String> {
             .and_then(|s| s.to_str())
             .map(str::to_string),
         ProfileSource::Registry { name, .. } => Some(name.clone()),
+        ProfileSource::Archive { source, .. } => Path::new(source)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string),
     }
 }
 fn canonicalize_existing_dir(path: &Path) -> Result<PathBuf, ProfileError> {
@@ -1439,11 +1447,20 @@ pub fn resolve_profile_artifact(
     base_dir: &Path,
     raw_artifact: serde_json::Value,
 ) -> Result<ResolvedProfile, ProfileError> {
+    resolve_profile_artifact_value(raw_artifact, source, base_dir, "artifact-worker")
+}
+
+pub fn resolve_profile_artifact_value(
+    raw_artifact: serde_json::Value,
+    source: ProfileSource,
+    base_dir: &Path,
+    worker_name: &str,
+) -> Result<ResolvedProfile, ProfileError> {
     resolve_lua_profile_value(
         source,
         base_dir,
         base_dir,
-        ProfileResolveOptions::with_worker_name("artifact-worker"),
+        ProfileResolveOptions::with_worker_name(worker_name),
         raw_artifact.clone(),
         raw_artifact,
         None,

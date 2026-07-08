@@ -1,5 +1,9 @@
 use crate::catalog::{ConfigBundleRef, ProfileSelector};
 use crate::error::RuntimeError;
+use crate::profile_archive::{
+    ProfileArchiveError, ProfileSourceArchive, ProfileSourceArchiveRef,
+    VerifiedProfileSourceArchive,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -18,6 +22,8 @@ pub struct ConfigBundle {
     pub profiles: Vec<ConfigProfileDescriptor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declarations: Vec<ConfigDeclaration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_source_archive: Option<ProfileSourceArchive>,
 }
 
 impl ConfigBundle {
@@ -60,6 +66,16 @@ impl ConfigBundle {
             ));
         }
 
+        if let Some(archive) = &self.profile_source_archive {
+            lines.push(format!(
+                "profile_archive\0{}\0{}\0{}",
+                archive.reference.id, archive.reference.digest, archive.reference.size_bytes
+            ));
+            for (selector, path) in &archive.reference.source_graph.entrypoints {
+                lines.push(format!("profile_archive_entrypoint\0{selector}\0{path}"));
+            }
+        }
+
         lines.sort();
         let mut hasher = Sha256::new();
         for line in lines {
@@ -86,6 +102,10 @@ impl ConfigBundle {
             provenance: self.metadata.provenance.clone(),
             profile_count: self.profiles.len(),
             declaration_count: self.declarations.len(),
+            profile_source_archive: self
+                .profile_source_archive
+                .as_ref()
+                .map(|archive| archive.reference.source_graph.clone()),
         }
     }
 
@@ -164,6 +184,8 @@ pub struct ConfigBundleSummary {
     pub provenance: ConfigBundleProvenance,
     pub profile_count: usize,
     pub declaration_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_source_archive: Option<crate::profile_archive::ProfileSourceGraphSummary>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +244,16 @@ pub(crate) fn validate_config_bundle(bundle: &ConfigBundle) -> Result<(), Runtim
         }
         validate_declaration_reference(&bundle.metadata.id, declaration)?;
     }
+
+    if let Some(archive) = &bundle.profile_source_archive {
+        validate_profile_source_archive_ref(&archive.reference).map_err(|err| {
+            RuntimeError::InvalidRequest(format!("invalid profile source archive: {err}"))
+        })?;
+        archive.verify().map_err(|err| {
+            RuntimeError::InvalidRequest(format!("invalid profile source archive: {err}"))
+        })?;
+    }
+
     Ok(())
 }
 
@@ -229,6 +261,34 @@ pub(crate) fn validate_config_bundle_ref(reference: &ConfigBundleRef) -> Result<
     validate_config_bundle_id(&reference.id)?;
     validate_non_empty("config bundle reference digest", &reference.digest)?;
     validate_digest("config bundle reference digest", &reference.digest)?;
+    Ok(())
+}
+
+pub fn verified_profile_source_archive(
+    bundle: &ConfigBundle,
+) -> Result<Option<VerifiedProfileSourceArchive>, ProfileArchiveError> {
+    bundle
+        .profile_source_archive
+        .as_ref()
+        .map(ProfileSourceArchive::verify)
+        .transpose()
+}
+
+fn validate_profile_source_archive_ref(
+    reference: &ProfileSourceArchiveRef,
+) -> Result<(), ProfileArchiveError> {
+    if reference.id.trim().is_empty() {
+        return Err(ProfileArchiveError::MissingEntrypoint(
+            "archive id".to_string(),
+        ));
+    }
+    if !reference.digest.starts_with("sha256:") {
+        return Err(ProfileArchiveError::ArchiveDigestMismatch {
+            id: reference.id.clone(),
+            expected: "sha256:<hex>".to_string(),
+            actual: reference.digest.clone(),
+        });
+    }
     Ok(())
 }
 
@@ -468,6 +528,7 @@ mod tests {
                 name: "credential".to_string(),
                 reference: reference.to_string(),
             }],
+            profile_source_archive: None,
         }
         .with_computed_digest()
     }
