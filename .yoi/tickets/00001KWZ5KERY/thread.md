@@ -158,3 +158,40 @@ Implementation routing update:
 - 完了後は diff / validation evidence を Orchestrator が確認し、別 sibling Reviewer Pod に read-only review を依頼する。`StopPod` は既知の不具合があるため使用しない。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-08T09:59:31Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Coder Pod completed implementation and committed `a823d414 feat: add decodal profile archives` on branch `work/00001KWZ5KERY-decodal-profile-archive`.
+- Worktree status was clean after commit.
+- Changed files include:
+  - `Cargo.toml`, `Cargo.lock`, `package.nix`
+  - `crates/manifest/src/profile.rs`
+  - `crates/worker-runtime/src/{profile_archive.rs,config_bundle.rs,worker_backend.rs,runtime.rs,catalog.rs,http_server.rs,main.rs}`
+  - `crates/worker/src/entrypoint.rs`
+  - `crates/workspace-server/src/{hosts.rs,companion.rs,server.rs}`
+  - builtin Decodal sources `resources/profiles/*.dcdl`
+- Implementation summary:
+  - Added Decodal-backed `ProfileSourceArchive` tar format with `manifest.json`, source graph summary, digest verification, path confinement, limits, unsupported source/symlink/path escape rejection。
+  - Added archive-only Decodal `ArchiveSourceLoader` using manifest import map only。
+  - Added builtin Decodal role Profiles。
+  - Backend builds profile source archives for normal Workspace/Browser and Companion launches。
+  - Runtime config bundle validation verifies/stores archive content and passes verified bundle into Worker execution。
+  - `ProfileRuntimeWorkerFactory` uses archive-resolved Decodal config for normal Runtime launch; Runtime-local Lua/filesystem profile discovery remains compatibility/debug fallback when no archive is supplied。
+  - Browser/runtime summaries expose bounded source graph summary only, not archive content/digest/store paths。
+  - Nix `cargoHash` updated for new Rust dependencies。
+- Orchestrator reran validation in the implementation worktree:
+  - `git diff --check`: pass
+  - `cargo test -p worker-runtime --features ws-server,fs-store`: pass（40 lib tests + 5 main tests + doc tests）
+  - `cargo test -p yoi-workspace-server`: pass（67 lib tests + 2 main tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（17 tests）
+  - `yoi ticket doctor`: ok
+  - `nix build .#yoi --no-link`: pass
+- External review will be requested via a read-only sibling Reviewer Pod. `StopPod` は使わない。
+
+---
