@@ -159,3 +159,20 @@ Acceptance basis:
 - side effect はこの `queued -> inprogress` acceptance 後に、worktree-workflow に沿って implementation worktree を作成してから開始する。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-08T10:40:25Z -->
+
+## Implementation report
+
+Implementation routing update:
+
+- Worktree-workflow に従い implementation worktree を作成した。
+  - Worktree: `/home/hare/Projects/yoi/.worktree/00001KX0G06VA-resource-fetch-api`
+  - Branch: `work/00001KX0G06VA-resource-fetch-api`
+- Worktree には tracked `.yoi` project records が見えている。
+- `.yoi/memory` / `.yoi/runtime` / `.yoi/log` / `.yoi/logs` / `.yoi/local` / `.yoi/*.lock` / `.yoi/*secret*` は作成直後に存在しないことを確認した。
+- Sibling Coder Pod `yoi-coder-00001KX0G06VA-resource-fetch` を起動した。
+- Scope policy: runtime workspace root は read-only、implementation worktree は write 可。Coder task では root/original workspace での read/write/validation/git operation を禁止し、この implementation worktree だけを作業対象に指定した。
+- 完了後は diff / validation evidence を Orchestrator が確認し、別 sibling Reviewer Pod に read-only review を依頼する。`StopPod` は既知の不具合があるため使用しない。
+
+---
