@@ -2541,10 +2541,12 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             DiagnosticSeverity::Warning,
             "Embedded Worker has no execution backend attached".to_string(),
         ),
-        EmbeddedRuntimeError::WorkerExecutionRejected { .. } => diagnostic(
+        EmbeddedRuntimeError::WorkerExecutionRejected {
+            operation, outcome, ..
+        } => diagnostic(
             "embedded_worker_execution_rejected",
             DiagnosticSeverity::Warning,
-            "Embedded Worker execution backend rejected the operation".to_string(),
+            format!("Embedded Worker execution backend rejected {operation:?} with {outcome:?}"),
         ),
         EmbeddedRuntimeError::LimitTooLarge { requested, max } => diagnostic(
             "embedded_runtime_limit_too_large",

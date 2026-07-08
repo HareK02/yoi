@@ -47,7 +47,7 @@ pub trait RuntimeWorkerFactory: Send + Sync + 'static {
 /// `WorkerController`.
 #[derive(Debug, Clone)]
 pub struct ProfileRuntimeWorkerFactory {
-    workspace_root: PathBuf,
+    profile_base_dir: PathBuf,
     cwd: PathBuf,
     store_dir: Option<PathBuf>,
     worker_metadata_dir: Option<PathBuf>,
@@ -56,11 +56,11 @@ pub struct ProfileRuntimeWorkerFactory {
 }
 
 impl ProfileRuntimeWorkerFactory {
-    pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
-        let workspace_root = workspace_root.into();
+    pub fn new(profile_base_dir: impl Into<PathBuf>) -> Self {
+        let profile_base_dir = profile_base_dir.into();
         Self {
-            cwd: workspace_root.clone(),
-            workspace_root,
+            cwd: profile_base_dir.clone(),
+            profile_base_dir,
             store_dir: None,
             worker_metadata_dir: None,
             profile: None,
@@ -161,19 +161,22 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
     ) -> Result<WorkerHandle, String> {
         let worker_name = Self::runtime_worker_name(&request);
         let profile = self.runtime_profile(&request);
-        let workspace_root = request
+        let worker_root = request
             .working_directory
             .as_ref()
-            .map(|binding| binding.workspace_root().to_path_buf())
-            .unwrap_or_else(|| self.workspace_root.clone());
+            .map(|binding| binding.root().to_path_buf())
+            .unwrap_or_else(|| self.profile_base_dir.clone());
         let cwd = request
             .working_directory
             .as_ref()
             .map(|binding| binding.cwd().to_path_buf())
             .unwrap_or_else(|| self.cwd.clone());
+        // Profile discovery uses the runtime profile base, not the Worker working directory.
+        // The working directory may be an arbitrary repository checkout that intentionally
+        // does not carry Yoi profile files.
         let (mut manifest, loader) = worker::entrypoint::resolve_runtime_profile_manifest(
             profile.as_deref(),
-            &workspace_root,
+            &self.profile_base_dir,
             &worker_name,
         )?;
         manifest.worker.name = worker_name;
@@ -194,10 +197,9 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         })?;
         let store = CombinedStore::new(session_store, worker_metadata_store);
 
-        let worker =
-            Worker::from_manifest_with_context(manifest, store, loader, workspace_root, cwd)
-                .await
-                .map_err(|err| format!("failed to create Worker from profile: {err}"))?;
+        let worker = Worker::from_manifest_with_context(manifest, store, loader, worker_root, cwd)
+            .await
+            .map_err(|err| format!("failed to create Worker from profile: {err}"))?;
 
         let runtime_base = self.runtime_base_dir()?;
         let (handle, _shutdown_rx) = WorkerController::spawn(worker, &runtime_base)

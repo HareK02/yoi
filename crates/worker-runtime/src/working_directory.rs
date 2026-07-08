@@ -58,15 +58,15 @@ impl WorkingDirectory {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkingDirectoryBinding {
     pub working_directory: WorkingDirectory,
-    pub workspace_root: PathBuf,
+    pub root: PathBuf,
     pub cwd: PathBuf,
     working_directory_root: PathBuf,
     source_repository_path: PathBuf,
 }
 
 impl WorkingDirectoryBinding {
-    pub fn workspace_root(&self) -> &Path {
-        &self.workspace_root
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     pub fn cwd(&self) -> &Path {
@@ -183,7 +183,7 @@ impl LocalGitWorktreeMaterializer {
     ) -> Result<(), WorkingDirectoryDiagnostic> {
         let record = WorkingDirectoryMaterializationRecord {
             working_directory: binding.working_directory.clone(),
-            workspace_root: binding.workspace_root.clone(),
+            root: binding.root.clone(),
             source_repository_path: binding.source_repository_path.clone(),
         };
         let path = binding.working_directory_root.join(MATERIALIZATION_RECORD);
@@ -221,8 +221,8 @@ impl LocalGitWorktreeMaterializer {
         })?;
         Ok(WorkingDirectoryBinding {
             working_directory: record.working_directory,
-            workspace_root: record.workspace_root.clone(),
-            cwd: record.workspace_root,
+            root: record.root.clone(),
+            cwd: record.root,
             working_directory_root,
             source_repository_path: record.source_repository_path,
         })
@@ -302,16 +302,16 @@ impl LocalGitWorktreeMaterializer {
             .filter(|value| !value.is_empty());
 
         let working_directory_root = self.working_directory_root(&working_directory_id);
-        let workspace_root = working_directory_root
+        let worktree_root = working_directory_root
             .join("root")
             .join(sanitize_path_component(&request.repository.id));
-        if workspace_root.exists() {
+        if worktree_root.exists() {
             return Err(WorkingDirectoryDiagnostic::new(
                 "working_directory_exists",
                 "working directory working_directory target already exists; cleanup or choose a new working_directory",
             ));
         }
-        fs::create_dir_all(workspace_root.parent().ok_or_else(|| {
+        fs::create_dir_all(worktree_root.parent().ok_or_else(|| {
             WorkingDirectoryDiagnostic::new(
                 "working_directory_invalid_target",
                 "working directory working_directory target has no parent directory",
@@ -324,14 +324,14 @@ impl LocalGitWorktreeMaterializer {
             )
         })?;
 
-        let workspace_root_arg = path_str(&workspace_root)?;
+        let workspace_worktree_root_arg = path_str(&worktree_root)?;
         git_status(
             &source_root,
             [
                 "worktree",
                 "add",
                 "--detach",
-                workspace_root_arg.as_str(),
+                workspace_worktree_root_arg.as_str(),
                 resolved_commit.as_str(),
             ],
         )?;
@@ -363,8 +363,8 @@ impl LocalGitWorktreeMaterializer {
         };
         let binding = WorkingDirectoryBinding {
             working_directory,
-            workspace_root: workspace_root.clone(),
-            cwd: workspace_root,
+            root: worktree_root.clone(),
+            cwd: worktree_root,
             working_directory_root,
             source_repository_path: source_root,
         };
@@ -412,7 +412,7 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
                 "working directory working_directory is not active",
             ));
         }
-        let cwd = validate_relative_cwd(binding.workspace_root(), relative_cwd)?;
+        let cwd = validate_relative_cwd(binding.root(), relative_cwd)?;
         Ok(WorkingDirectoryBinding { cwd, ..binding })
     }
 
@@ -481,26 +481,26 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
                 "working directory working directory root is unavailable; backend-private path details were omitted",
             )
         })?;
-        let workspace_root = binding.workspace_root.canonicalize().map_err(|_| {
+        let root = binding.root.canonicalize().map_err(|_| {
             WorkingDirectoryDiagnostic::new(
                 "working_directory_cleanup_target_invalid",
                 "working directory root is unavailable; backend-private path details were omitted",
             )
         })?;
-        if !workspace_root.starts_with(&working_directory_root) {
+        if !root.starts_with(&working_directory_root) {
             return Err(WorkingDirectoryDiagnostic::new(
                 "working_directory_cleanup_escape_rejected",
                 "working directory cleanup target is outside the working directory root",
             ));
         }
-        let workspace_root_arg = path_str(&workspace_root)?;
+        let workspace_worktree_root_arg = path_str(&root)?;
         let remove_result = git_status(
             binding.source_repository_path(),
-            ["worktree", "remove", "--force", workspace_root_arg.as_str()],
+            ["worktree", "remove", "--force", workspace_worktree_root_arg.as_str()],
         )
         .or_else(|_| {
-            if workspace_root.exists() {
-                fs::remove_dir_all(&workspace_root).map_err(|_| {
+            if root.exists() {
+                fs::remove_dir_all(&root).map_err(|_| {
                     WorkingDirectoryDiagnostic::new(
                         "working_directory_cleanup_failed",
                         "failed to remove working directory; backend-private path details were omitted",
@@ -517,7 +517,7 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
         };
         let updated = WorkingDirectoryBinding {
             working_directory,
-            workspace_root: binding.workspace_root.clone(),
+            root: binding.root.clone(),
             cwd: binding.cwd.clone(),
             working_directory_root: binding.working_directory_root.clone(),
             source_repository_path: binding.source_repository_path.clone(),
@@ -530,7 +530,7 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct WorkingDirectoryMaterializationRecord {
     working_directory: WorkingDirectory,
-    workspace_root: PathBuf,
+    root: PathBuf,
     source_repository_path: PathBuf,
 }
 
@@ -632,10 +632,10 @@ fn validate_working_directory_id(
 }
 
 fn validate_relative_cwd(
-    workspace_root: &Path,
+    root: &Path,
     relative_cwd: Option<&str>,
 ) -> Result<PathBuf, WorkingDirectoryDiagnostic> {
-    let workspace_root = workspace_root.canonicalize().map_err(|_| {
+    let root = root.canonicalize().map_err(|_| {
         WorkingDirectoryDiagnostic::new(
             "working_directory_root_unavailable",
             "working directory root is unavailable; backend-private path details were omitted",
@@ -643,7 +643,7 @@ fn validate_relative_cwd(
     })?;
     let relative = relative_cwd.unwrap_or(".").trim();
     if relative.is_empty() || relative == "." {
-        return Ok(workspace_root);
+        return Ok(root);
     }
     let relative_path = Path::new(relative);
     if relative_path.is_absolute()
@@ -659,16 +659,13 @@ fn validate_relative_cwd(
             "working directory relative_cwd must be a relative path inside the working directory root",
         ));
     }
-    let target = workspace_root
-        .join(relative_path)
-        .canonicalize()
-        .map_err(|_| {
-            WorkingDirectoryDiagnostic::new(
-                "working_directory_relative_cwd_unavailable",
-                "working directory relative_cwd does not identify an existing directory",
-            )
-        })?;
-    if !target.starts_with(&workspace_root) || !target.is_dir() {
+    let target = root.join(relative_path).canonicalize().map_err(|_| {
+        WorkingDirectoryDiagnostic::new(
+            "working_directory_relative_cwd_unavailable",
+            "working directory relative_cwd does not identify an existing directory",
+        )
+    })?;
+    if !target.starts_with(&root) || !target.is_dir() {
         return Err(WorkingDirectoryDiagnostic::new(
             "working_directory_relative_cwd_escape_rejected",
             "working directory relative_cwd must resolve to a directory inside the working directory root",
@@ -737,9 +734,9 @@ mod tests {
             .materialize(&worker_ref(1), &request(repo.path()))
             .unwrap();
 
-        assert!(binding.workspace_root.starts_with(runtime_root.path()));
-        assert!(binding.workspace_root.join("README.md").exists());
-        let branch = git_stdout(binding.workspace_root(), ["branch", "--show-current"]).unwrap();
+        assert!(binding.root.starts_with(runtime_root.path()));
+        assert!(binding.root.join("README.md").exists());
+        let branch = git_stdout(binding.root(), ["branch", "--show-current"]).unwrap();
         assert!(
             branch.is_empty(),
             "worktree should be detached, got {branch}"
@@ -772,11 +769,11 @@ mod tests {
             .materialize(&worker_ref(2), &request(repo.path()))
             .unwrap();
 
-        assert_ne!(first.workspace_root, second.workspace_root);
-        assert!(first.workspace_root.starts_with(runtime_root.path()));
-        assert!(second.workspace_root.starts_with(runtime_root.path()));
-        assert!(!first.workspace_root.starts_with(repo.path()));
-        assert!(!second.workspace_root.starts_with(repo.path()));
+        assert_ne!(first.root, second.root);
+        assert!(first.root.starts_with(runtime_root.path()));
+        assert!(second.root.starts_with(runtime_root.path()));
+        assert!(!first.root.starts_with(repo.path()));
+        assert!(!second.root.starts_with(repo.path()));
     }
 
     #[test]
@@ -893,8 +890,7 @@ mod tests {
 
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink("/tmp", working_directory.workspace_root().join("escape"))
-                .unwrap();
+            std::os::unix::fs::symlink("/tmp", working_directory.root().join("escape")).unwrap();
             assert_eq!(
                 materializer
                     .bind_working_directory(&working_directory.working_directory.id, Some("escape"))
@@ -913,11 +909,11 @@ mod tests {
         let binding = materializer
             .materialize(&worker_ref(1), &request(repo.path()))
             .unwrap();
-        let workspace_root = binding.workspace_root.clone();
+        let root = binding.root.clone();
 
         materializer.cleanup(&binding).unwrap();
 
-        assert!(!workspace_root.exists());
+        assert!(!root.exists());
         let raw = fs::read_to_string(
             binding
                 .working_directory_root()
