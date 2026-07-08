@@ -1,9 +1,11 @@
 ---
 title: 'Add Runtime-to-Backend resource fetch REST API'
-state: 'ready'
+state: 'queued'
 created_at: '2026-07-08T09:12:33Z'
-updated_at: '2026-07-08T09:27:52Z'
+updated_at: '2026-07-08T10:04:10Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-07-08T10:04:10Z'
 ---
 
 ## 背景
