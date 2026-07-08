@@ -254,3 +254,31 @@ Non-blocking follow-ups:
 - broader resource kind 追加前に、stored issued handle policy fields の完全比較、または signed/opaque handle representation を検討するとよい。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-08T11:45:42Z -->
+
+## Implementation report
+
+Review-fix implementation report:
+
+- Coder Pod completed requested changes and committed follow-up `e716ae44 fix: harden backend resource handles` on branch `work/00001KX0G06VA-resource-fetch-api`.
+- Worktree status was clean after commit.
+- Fix summary:
+  - Backend broker now treats broker-stored issued handle as authority。
+  - Request handle must match stored issued handle; expiry and `max_bytes` validation use stored policy fields, not mutable Runtime-provided fields。
+  - Tampered scope/policy fields fail closed。
+  - Runtime archive cache no longer bypasses Backend authorization: Runtime calls `BackendResourceClient` and verifies response before reusing digest-cached archive。
+  - Expired/unauthorized handles now block cached reuse。
+  - Added focused security-contract tests for expiry extension/expired handle rejection, worker mismatch, policy tampering, REST missing-resource diagnostic, Runtime digest mismatch, oversized response despite `max_bytes` tampering, and remote HTTP path using the same Backend contract as direct broker path。
+- Orchestrator reran validation in the implementation worktree:
+  - `git diff --check`: pass
+  - `cargo test -p worker-runtime --features ws-server,fs-store`: pass（45 lib tests + 5 main tests + doc tests）
+  - `cargo test -p yoi-workspace-server`: pass（77 lib tests + 2 main tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（17 tests）
+  - `yoi ticket doctor`: ok
+  - `nix build .#yoi --no-link`: pass
+- Requesting follow-up external review against `57e96d3b..e716ae44` and full combined implementation。
+
+---
