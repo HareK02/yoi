@@ -2,7 +2,7 @@
 title: 'Add Workspace settings API and pages for Workspace/Profile editing'
 state: 'queued'
 created_at: '2026-07-08T08:34:01Z'
-updated_at: '2026-07-08T10:44:13Z'
+updated_at: '2026-07-08T10:45:48Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-07-08T10:44:13Z'
