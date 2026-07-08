@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
+use crate::config_bundle::verified_profile_source_archive;
 use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation, WorkerExecutionResult,
     WorkerExecutionRunState, WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
@@ -171,14 +172,34 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             .as_ref()
             .map(|binding| binding.cwd().to_path_buf())
             .unwrap_or_else(|| self.cwd.clone());
-        // Profile discovery uses the runtime profile base, not the Worker working directory.
-        // The working directory may be an arbitrary repository checkout that intentionally
-        // does not carry Yoi profile files.
-        let (mut manifest, loader) = worker::entrypoint::resolve_runtime_profile_manifest(
-            profile.as_deref(),
-            &self.profile_base_dir,
-            &worker_name,
-        )?;
+        let (mut manifest, loader) = if let Some(bundle) = request.config_bundle.as_ref() {
+            let selector = profile.as_deref().unwrap_or("builtin:default");
+            let archive = verified_profile_source_archive(bundle)
+                .map_err(|err| format!("failed to verify profile source archive: {err}"))?
+                .ok_or_else(|| {
+                    format!(
+                        "config bundle {} does not contain a ProfileSourceArchive",
+                        bundle.metadata.id
+                    )
+                })?;
+            let manifest = archive
+                .resolve_profile(selector, &worker_root, &worker_name)
+                .map_err(|err| format!("failed to resolve profile source archive: {err}"))?;
+            worker::entrypoint::resolve_runtime_profile_manifest_from_manifest(
+                manifest,
+                &worker_root,
+                &worker_name,
+            )?
+        } else {
+            // Compatibility/debug fallback for direct CLI tests. Normal Browser/Backend launch
+            // supplies a ProfileSourceArchive inside the Runtime config bundle and must not use
+            // Runtime-local filesystem profile discovery.
+            worker::entrypoint::resolve_runtime_profile_manifest(
+                profile.as_deref(),
+                &self.profile_base_dir,
+                &worker_name,
+            )?
+        };
         manifest.worker.name = worker_name;
 
         let store_dir = self.store_dir()?;
@@ -769,6 +790,7 @@ mod tests {
                 label: Some("adapter-test".to_string()),
             }],
             declarations: Vec::new(),
+            profile_source_archive: None,
         }
         .with_computed_digest()
     }

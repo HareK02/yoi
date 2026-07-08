@@ -1,4 +1,5 @@
 use crate::catalog::{CreateWorkerRequest, WorkingDirectoryStatus};
+use crate::config_bundle::ConfigBundle;
 use crate::error::RuntimeError;
 use crate::identity::WorkerRef;
 use crate::interaction::WorkerInput;
@@ -287,6 +288,7 @@ pub struct WorkerExecutionSpawnRequest {
     pub request: CreateWorkerRequest,
     pub context: WorkerExecutionContext,
     pub working_directory: Option<WorkingDirectoryBinding>,
+    pub config_bundle: Option<ConfigBundle>,
 }
 
 /// Result of backend Worker spawn/initialization.

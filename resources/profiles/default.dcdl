@@ -1,0 +1,38 @@
+slug = "default";
+description = "Default Yoi coding profile.";
+scope = "workspace_write";
+
+model = {
+    ref = "codex-oauth/gpt-5.5";
+};
+
+session = {
+    record_event_trace = true;
+};
+
+engine = {
+    reasoning = "high";
+};
+
+feature = {
+    task = { enabled = true; };
+    memory = { enabled = true; };
+    web = { enabled = true; };
+    workers = { enabled = true; };
+    ticket = { enabled = false; access = "lifecycle"; };
+    ticket_orchestration = { enabled = false; };
+};
+
+memory = {
+    extract_threshold = 50000;
+    consolidation_threshold_files = 5;
+    consolidation_threshold_bytes = 50000;
+};
+
+web = {
+    enabled = true;
+    search = {
+        provider = "brave";
+        api_key_secret = "web/brave/default";
+    };
+};

@@ -86,6 +86,7 @@ yoi-workspace-server = { path = "crates/workspace-server" }
 # need `default-features = false`, which workspace inheritance cannot override.
 async-trait = "0.1"
 axum = "0.8"
+decodal = "0.1.1"
 fs4 = "0.13"
 futures = "0.3"
 libc = "0.2"
@@ -93,6 +94,7 @@ schemars = "1.2"
 serde = "1.0"
 serde_json = "1.0"
 serde_yaml = "0.9.34"
+tar = "0.4"
 rusqlite = { version = "0.37", features = ["bundled"] }
 sha2 = "0.11"
 tempfile = "3.27"

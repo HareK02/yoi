@@ -849,6 +849,7 @@ mod tests {
                 label: Some("test".to_string()),
             }],
             declarations: Vec::new(),
+            profile_source_archive: None,
         }
         .with_computed_digest()
     }
@@ -1135,6 +1136,7 @@ mod ws_tests {
                 label: Some("ws".to_string()),
             }],
             declarations: Vec::new(),
+            profile_source_archive: None,
         }
         .with_computed_digest()
     }

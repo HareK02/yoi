@@ -7,6 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, RwLock},
     time::Duration,
@@ -41,6 +42,7 @@ use worker_runtime::management::{RuntimeOptions as EmbeddedRuntimeOptions, Runti
 use worker_runtime::observation::{
     TranscriptProjection as EmbeddedTranscriptProjection, TranscriptQuery, TranscriptRole,
 };
+use worker_runtime::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveInput};
 
 const EMBEDDED_RUNTIME_ID: &str = "embedded-worker-runtime";
 const EMBEDDED_HOST_KIND: &str = "embedded-worker-runtime-host";
@@ -1337,13 +1339,18 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             .profile
             .clone()
             .unwrap_or_else(|| embedded_profile_selector(&request.intent));
-        let config_bundle = match self
-            .runtime
-            .store_config_bundle(default_embedded_config_bundle(&profile))
-        {
+        let config_bundle = match default_embedded_config_bundle(&profile).and_then(|bundle| {
+            self.runtime
+                .store_config_bundle(bundle)
+                .map_err(|err| err.to_string())
+        }) {
             Ok(availability) => availability.reference,
             Err(error) => {
-                diagnostics.push(embedded_runtime_diagnostic(&error));
+                diagnostics.push(diagnostic(
+                    "embedded_profile_source_archive_invalid",
+                    DiagnosticSeverity::Error,
+                    error,
+                ));
                 return WorkerSpawnResult {
                     state: WorkerOperationState::Rejected,
                     worker: None,
@@ -2018,7 +2025,18 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             .profile
             .clone()
             .unwrap_or_else(|| embedded_profile_selector(&request.intent));
-        let sync = self.sync_config_bundle(default_embedded_config_bundle(&profile));
+        let sync = match default_embedded_config_bundle(&profile) {
+            Ok(bundle) => self.sync_config_bundle(bundle),
+            Err(error) => ConfigBundleSyncResult {
+                state: WorkerOperationState::Rejected,
+                availability: None,
+                diagnostics: vec![diagnostic(
+                    "remote_profile_source_archive_invalid",
+                    DiagnosticSeverity::Error,
+                    error,
+                )],
+            },
+        };
         let Some(config_bundle) = sync.availability.map(|availability| availability.reference)
         else {
             return WorkerSpawnResult {
@@ -2347,14 +2365,14 @@ fn embedded_worker_execution_status_label(
     }
 }
 
-fn default_embedded_config_bundle(profile: &ProfileSelector) -> ConfigBundle {
+fn default_embedded_config_bundle(profile: &ProfileSelector) -> Result<ConfigBundle, String> {
     let id = format!(
         "workspace-runtime-{}",
         embedded_profile_label(profile)
             .unwrap_or_else(|| "default".to_string())
             .replace([':', '/', ' '], "-")
     );
-    ConfigBundle {
+    Ok(ConfigBundle {
         metadata: ConfigBundleMetadata {
             id,
             digest: String::new(),
@@ -2371,8 +2389,76 @@ fn default_embedded_config_bundle(profile: &ProfileSelector) -> ConfigBundle {
             label: embedded_profile_label(profile),
         }],
         declarations: Vec::new(),
+        profile_source_archive: Some(default_profile_source_archive(profile)?),
     }
-    .with_computed_digest()
+    .with_computed_digest())
+}
+
+fn default_profile_source_archive(
+    profile: &ProfileSelector,
+) -> Result<ProfileSourceArchive, String> {
+    let selected = embedded_profile_label(profile).unwrap_or_else(|| "default".to_string());
+    let selected_path = embedded_profile_path(profile)?;
+    let mut entrypoints = BTreeMap::new();
+    entrypoints.insert("default".to_string(), "profiles/default.dcdl".to_string());
+    entrypoints.insert(
+        "builtin:default".to_string(),
+        "profiles/default.dcdl".to_string(),
+    );
+    for slug in ["companion", "intake", "orchestrator", "coder", "reviewer"] {
+        entrypoints.insert(format!("builtin:{slug}"), format!("profiles/{slug}.dcdl"));
+    }
+    entrypoints.insert(selected, selected_path);
+
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "profiles/default.dcdl".to_string(),
+        include_str!("../../../resources/profiles/default.dcdl").to_string(),
+    );
+    sources.insert(
+        "profiles/companion.dcdl".to_string(),
+        include_str!("../../../resources/profiles/companion.dcdl").to_string(),
+    );
+    sources.insert(
+        "profiles/intake.dcdl".to_string(),
+        include_str!("../../../resources/profiles/intake.dcdl").to_string(),
+    );
+    sources.insert(
+        "profiles/orchestrator.dcdl".to_string(),
+        include_str!("../../../resources/profiles/orchestrator.dcdl").to_string(),
+    );
+    sources.insert(
+        "profiles/coder.dcdl".to_string(),
+        include_str!("../../../resources/profiles/coder.dcdl").to_string(),
+    );
+    sources.insert(
+        "profiles/reviewer.dcdl".to_string(),
+        include_str!("../../../resources/profiles/reviewer.dcdl").to_string(),
+    );
+
+    ProfileSourceArchive::build(ProfileSourceArchiveInput {
+        id: "builtin-decodal-profiles-v1".to_string(),
+        entrypoints,
+        imports: BTreeMap::new(),
+        sources,
+    })
+    .map_err(|err| err.to_string())
+}
+
+fn embedded_profile_path(profile: &ProfileSelector) -> Result<String, String> {
+    match profile {
+        ProfileSelector::RuntimeDefault => Ok("profiles/default.dcdl".to_string()),
+        ProfileSelector::Builtin(name) => match name.strip_prefix("builtin:").unwrap_or(name) {
+            "default" => Ok("profiles/default.dcdl".to_string()),
+            "companion" => Ok("profiles/companion.dcdl".to_string()),
+            "intake" => Ok("profiles/intake.dcdl".to_string()),
+            "orchestrator" => Ok("profiles/orchestrator.dcdl".to_string()),
+            "coder" => Ok("profiles/coder.dcdl".to_string()),
+            "reviewer" => Ok("profiles/reviewer.dcdl".to_string()),
+            other => Err(format!("unknown builtin profile selector: builtin:{other}")),
+        },
+        ProfileSelector::Named(name) => Err(format!("unknown named profile selector: {name}")),
+    }
 }
 
 fn embedded_profile_selector(intent: &WorkerSpawnIntent) -> ProfileSelector {
@@ -2878,6 +2964,49 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
+    #[test]
+    fn embedded_builtin_decodal_profiles_resolve_through_archive() {
+        let root = tempfile::tempdir().unwrap();
+        for selector in [
+            ProfileSelector::RuntimeDefault,
+            ProfileSelector::Builtin("builtin:companion".to_string()),
+            ProfileSelector::Builtin("builtin:intake".to_string()),
+            ProfileSelector::Builtin("builtin:orchestrator".to_string()),
+            ProfileSelector::Builtin("builtin:coder".to_string()),
+            ProfileSelector::Builtin("builtin:reviewer".to_string()),
+        ] {
+            let bundle = default_embedded_config_bundle(&selector).unwrap();
+            let archive = bundle
+                .profile_source_archive
+                .as_ref()
+                .unwrap()
+                .verify()
+                .unwrap();
+            let selector_key = match &selector {
+                ProfileSelector::RuntimeDefault => "default".to_string(),
+                ProfileSelector::Builtin(name) => name.clone(),
+                ProfileSelector::Named(name) => name.clone(),
+            };
+            let manifest = archive
+                .resolve_profile(&selector_key, root.path(), "embedded-test-worker")
+                .unwrap();
+            assert_eq!(manifest.worker.name, "embedded-test-worker");
+        }
+    }
+
+    #[test]
+    fn embedded_archive_rejects_unknown_selectors() {
+        assert!(
+            default_embedded_config_bundle(&ProfileSelector::Builtin(
+                "builtin:missing".to_string()
+            ))
+            .is_err()
+        );
+        assert!(
+            default_embedded_config_bundle(&ProfileSelector::Named("custom".to_string())).is_err()
+        );
+    }
+
     fn test_config_bundle() -> ConfigBundle {
         ConfigBundle {
             metadata: worker_runtime::config_bundle::ConfigBundleMetadata {
@@ -2900,6 +3029,7 @@ mod tests {
                 name: "read".to_string(),
                 reference: "capability:read".to_string(),
             }],
+            profile_source_archive: None,
         }
         .with_computed_digest()
     }
