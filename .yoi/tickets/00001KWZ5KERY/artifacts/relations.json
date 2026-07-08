@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KWZ5KERY",
+      "kind": "depends_on",
+      "target": "00001KX0G06VA",
+      "note": "ProfileSourceArchive prefetch should use the Runtime-to-Backend resource fetch channel rather than ad hoc Backend fetch.",
+      "author": "yoi ticket",
+      "at": "2026-07-08T09:13:34Z"
+    }
+  ]
+}
