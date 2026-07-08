@@ -11,6 +11,7 @@ pub mod identity;
 pub mod observation;
 pub mod records;
 pub mod repositories;
+pub mod resource_broker;
 pub mod server;
 pub mod store;
 

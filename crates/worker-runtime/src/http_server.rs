@@ -850,6 +850,7 @@ mod tests {
             }],
             declarations: Vec::new(),
             profile_source_archive: None,
+            profile_source_archive_handle: None,
         }
         .with_computed_digest()
     }
@@ -1137,6 +1138,7 @@ mod ws_tests {
             }],
             declarations: Vec::new(),
             profile_source_archive: None,
+            profile_source_archive_handle: None,
         }
         .with_computed_digest()
     }

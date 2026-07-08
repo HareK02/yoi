@@ -20,6 +20,10 @@ use crate::execution::{
     WorkerExecutionRunState, WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
 };
 use crate::interaction::{WorkerInput, WorkerInputKind};
+use crate::resource::{
+    BackendResourceClient, BackendResourceError, ProfileSourceArchiveCache,
+    build_profile_source_archive_fetch_request, profile_source_archive_from_response,
+};
 use crate::working_directory::{WorkingDirectoryBinding, WorkingDirectoryMaterializer};
 use async_trait::async_trait;
 use manifest::paths;
@@ -46,7 +50,7 @@ pub trait RuntimeWorkerFactory: Send + Sync + 'static {
 
 /// Production factory that resolves a normal Worker profile and spawns it under
 /// `WorkerController`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProfileRuntimeWorkerFactory {
     profile_base_dir: PathBuf,
     cwd: PathBuf,
@@ -54,6 +58,8 @@ pub struct ProfileRuntimeWorkerFactory {
     worker_metadata_dir: Option<PathBuf>,
     profile: Option<String>,
     runtime_base_dir: Option<PathBuf>,
+    resource_client: Option<Arc<dyn BackendResourceClient>>,
+    profile_archive_cache: Arc<ProfileSourceArchiveCache>,
 }
 
 impl ProfileRuntimeWorkerFactory {
@@ -66,6 +72,8 @@ impl ProfileRuntimeWorkerFactory {
             worker_metadata_dir: None,
             profile: None,
             runtime_base_dir: None,
+            resource_client: None,
+            profile_archive_cache: Arc::new(ProfileSourceArchiveCache::default()),
         }
     }
 
@@ -93,6 +101,11 @@ impl ProfileRuntimeWorkerFactory {
 
     pub fn with_runtime_base_dir(mut self, runtime_base_dir: impl Into<PathBuf>) -> Self {
         self.runtime_base_dir = Some(runtime_base_dir.into());
+        self
+    }
+
+    pub fn with_resource_client(mut self, resource_client: Arc<dyn BackendResourceClient>) -> Self {
+        self.resource_client = Some(resource_client);
         self
     }
 
@@ -152,6 +165,56 @@ impl ProfileRuntimeWorkerFactory {
         }
         Self::runtime_profile_value(&request.request.profile)
     }
+    async fn resolve_profile_source_archive(
+        &self,
+        bundle: &crate::config_bundle::ConfigBundle,
+        request: &WorkerExecutionSpawnRequest,
+    ) -> Result<crate::profile_archive::VerifiedProfileSourceArchive, String> {
+        if let Some(archive) = verified_profile_source_archive(bundle)
+            .map_err(|err| format!("failed to verify profile source archive: {err}"))?
+        {
+            return Ok(archive);
+        }
+        let handle = bundle
+            .profile_source_archive_handle
+            .clone()
+            .ok_or_else(|| {
+                format!(
+                    "config bundle {} does not contain a ProfileSourceArchive resource handle",
+                    bundle.metadata.id
+                )
+            })?;
+        if let Some(cached) = self.profile_archive_cache.get(&handle.digest) {
+            return cached
+                .verify()
+                .map_err(|err| format!("failed to verify cached profile source archive: {err}"));
+        }
+        let client = self.resource_client.as_ref().ok_or_else(|| {
+            format!(
+                "config bundle {} requires a Backend resource client for profile source archive fetch",
+                bundle.metadata.id
+            )
+        })?;
+        let fetch_request = build_profile_source_archive_fetch_request(
+            handle.clone(),
+            &request.worker_ref.runtime_id,
+            Some(&request.worker_ref.worker_id),
+        );
+        let response = client
+            .fetch_resource(fetch_request)
+            .await
+            .map_err(format_backend_resource_error)?;
+        let archive = profile_source_archive_from_response(&handle, response)
+            .map_err(format_backend_resource_error)?;
+        self.profile_archive_cache.insert(archive.clone());
+        archive
+            .verify()
+            .map_err(|err| format!("failed to verify fetched profile source archive: {err}"))
+    }
+}
+
+fn format_backend_resource_error(error: BackendResourceError) -> String {
+    format!("backend resource fetch failed: {error}")
 }
 
 #[async_trait]
@@ -174,14 +237,9 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             .unwrap_or_else(|| self.cwd.clone());
         let (mut manifest, loader) = if let Some(bundle) = request.config_bundle.as_ref() {
             let selector = profile.as_deref().unwrap_or("builtin:default");
-            let archive = verified_profile_source_archive(bundle)
-                .map_err(|err| format!("failed to verify profile source archive: {err}"))?
-                .ok_or_else(|| {
-                    format!(
-                        "config bundle {} does not contain a ProfileSourceArchive",
-                        bundle.metadata.id
-                    )
-                })?;
+            let archive = self
+                .resolve_profile_source_archive(bundle, &request)
+                .await?;
             let manifest = archive
                 .resolve_profile(selector, &worker_root, &worker_name)
                 .map_err(|err| format!("failed to resolve profile source archive: {err}"))?;
@@ -791,6 +849,7 @@ mod tests {
             }],
             declarations: Vec::new(),
             profile_source_archive: None,
+            profile_source_archive_handle: None,
         }
         .with_computed_digest()
     }

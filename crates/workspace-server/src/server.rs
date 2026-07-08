@@ -12,7 +12,8 @@ use chrono::{SecondsFormat, Utc};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use worker_runtime::worker_backend::WorkerRuntimeExecutionBackend;
+use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
+use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
 use worker_runtime::working_directory::{
     LocalGitWorktreeMaterializer, WorkingDirectoryDiagnostic, WorkingDirectoryMaterializer,
 };
@@ -42,6 +43,7 @@ use crate::repositories::{
     ConfiguredRepository, RepositoryListProjection, RepositoryLogRead, RepositoryLookupError,
     RepositoryRegistryReader, RepositorySummary,
 };
+use crate::resource_broker::BackendResourceBroker;
 use crate::store::{ControlPlaneStore, WorkspaceRecord};
 use crate::{Error, Result};
 use worker_runtime::catalog::{
@@ -154,6 +156,7 @@ pub struct WorkspaceApi {
     runtime: Arc<RuntimeRegistry>,
     companion: Arc<CompanionConsole>,
     observation_proxy: BackendObservationProxy,
+    resource_broker: BackendResourceBroker,
     working_directory_materializer: Arc<LocalGitWorktreeMaterializer>,
 }
 
@@ -162,21 +165,46 @@ impl WorkspaceApi {
         let materializer = Arc::new(LocalGitWorktreeMaterializer::new(
             config.embedded_runtime_store_root.clone(),
         ));
-        let execution_backend =
-            WorkerRuntimeExecutionBackend::from_workspace(config.workspace_root.clone())
-                .map_err(|err| {
-                    crate::Error::Store(format!(
-                        "failed to initialize embedded Worker backend: {err}"
-                    ))
-                })?
-                .with_working_directory_materializer((*materializer).clone());
-        Self::new_with_execution_backend(config, store, Arc::new(execution_backend)).await
+        let resource_broker = BackendResourceBroker::default();
+        let execution_backend = WorkerRuntimeExecutionBackend::new(
+            ProfileRuntimeWorkerFactory::new(config.workspace_root.clone())
+                .with_resource_client(Arc::new(resource_broker.clone())),
+        )
+        .map_err(|err| {
+            crate::Error::Store(format!(
+                "failed to initialize embedded Worker backend: {err}"
+            ))
+        })?
+        .with_working_directory_materializer((*materializer).clone());
+        Self::new_with_execution_backend_and_broker(
+            config,
+            store,
+            Arc::new(execution_backend),
+            resource_broker,
+        )
+        .await
     }
 
+    #[cfg(test)]
     async fn new_with_execution_backend(
         config: ServerConfig,
         store: Arc<dyn ControlPlaneStore>,
         execution_backend: Arc<dyn worker_runtime::execution::WorkerExecutionBackend>,
+    ) -> Result<Self> {
+        Self::new_with_execution_backend_and_broker(
+            config,
+            store,
+            execution_backend,
+            BackendResourceBroker::default(),
+        )
+        .await
+    }
+
+    async fn new_with_execution_backend_and_broker(
+        config: ServerConfig,
+        store: Arc<dyn ControlPlaneStore>,
+        execution_backend: Arc<dyn worker_runtime::execution::WorkerExecutionBackend>,
+        resource_broker: BackendResourceBroker,
     ) -> Result<Self> {
         store
             .upsert_workspace(&WorkspaceRecord {
@@ -193,13 +221,17 @@ impl WorkspaceApi {
                 config.embedded_runtime_store_root.clone(),
                 execution_backend,
             )
+            .map(|runtime| runtime.with_resource_broker(resource_broker.clone()))
             .map_err(|err| {
                 crate::Error::Store(format!("invalid embedded Worker backend: {err}"))
             })?,
         );
         for remote_config in config.remote_runtime_sources.iter().cloned() {
-            runtime
-                .register(RemoteWorkerRuntime::new(remote_config).map_err(|err| err.into_error())?);
+            runtime.register(
+                RemoteWorkerRuntime::new(remote_config)
+                    .map(|host| host.with_resource_broker(resource_broker.clone()))
+                    .map_err(|err| err.into_error())?,
+            );
         }
         let runtime = Arc::new(runtime);
         let companion = Arc::new(CompanionConsole::new(runtime.clone()));
@@ -214,6 +246,7 @@ impl WorkspaceApi {
             runtime,
             companion,
             observation_proxy,
+            resource_broker,
             working_directory_materializer,
         })
     }
@@ -327,6 +360,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/settings/runtime-connections/remotes/{runtime_id}/test",
             post(scoped_test_remote_runtime_connection),
+        )
+        .route(
+            "/internal/runtime/resources/fetch",
+            post(post_internal_runtime_resource_fetch),
         )
         .route("/api/companion/status", get(get_companion_status))
         .route(
@@ -1445,7 +1482,9 @@ async fn add_remote_runtime_connection(
             vec![diagnostic],
         )
     })?;
-    let active_runtime = RemoteWorkerRuntime::new(active_config).map_err(|err| err.into_error())?;
+    let active_runtime = RemoteWorkerRuntime::new(active_config)
+        .map(|host| host.with_resource_broker(api.resource_broker.clone()))
+        .map_err(|err| err.into_error())?;
     local_config.runtimes.remote.push(remote_config);
     write_workspace_backend_config_for_settings(&api, &local_config)?;
     api.runtime.register_or_replace(active_runtime);
@@ -1694,6 +1733,33 @@ async fn create_workspace_worker(
         worker,
         diagnostics: result.diagnostics,
     }))
+}
+
+async fn post_internal_runtime_resource_fetch(
+    State(api): State<WorkspaceApi>,
+    Json(request): Json<BackendResourceFetchRequest>,
+) -> std::result::Result<
+    Json<worker_runtime::resource::BackendResourceFetchResponse>,
+    (StatusCode, Json<BackendResourceError>),
+> {
+    api.resource_broker
+        .fetch_profile_source_archive(request)
+        .map(Json)
+        .map_err(|error| (backend_resource_error_status(&error), Json(error)))
+}
+
+fn backend_resource_error_status(error: &BackendResourceError) -> StatusCode {
+    match error {
+        BackendResourceError::Expired => StatusCode::GONE,
+        BackendResourceError::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
+        BackendResourceError::MissingResource => StatusCode::NOT_FOUND,
+        BackendResourceError::UnsupportedKind
+        | BackendResourceError::DigestMismatch { .. }
+        | BackendResourceError::Oversized { .. }
+        | BackendResourceError::ContentTypeMismatch { .. }
+        | BackendResourceError::InvalidResponse { .. } => StatusCode::BAD_REQUEST,
+        BackendResourceError::Transport { .. } => StatusCode::BAD_GATEWAY,
+    }
 }
 
 async fn get_companion_status(
@@ -3406,6 +3472,7 @@ mod tests {
             }],
             declarations: Vec::new(),
             profile_source_archive: None,
+            profile_source_archive_handle: None,
         }
         .with_computed_digest()
     }
