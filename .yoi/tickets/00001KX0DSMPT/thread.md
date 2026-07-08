@@ -215,3 +215,42 @@ Implementation progress report:
 - External review will be requested via a read-only sibling Reviewer Pod. `StopPod` は使わない。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-08T12:49:09Z status: request_changes -->
+
+## Review: request changes
+
+External review result: request_changes
+
+Blockers:
+
+1. Profile mutation validation failures are not returned as typed diagnostics。
+   - scoped settings handlers call `profile_settings::*` with `?` directly (`server.rs:881-945`).
+   - `ApiError::from(Error)` initializes `diagnostics: Vec::new()` (`server.rs:3355-3360`).
+   - profile errors such as `profile_selector_duplicate`, `profile_source_syntax_invalid`, `profile_source_path_escape`, `profile_registry_revision_conflict` fall through to `BAD_GATEWAY` (`server.rs:3403-3414`) with an empty diagnostics array (`server.rs:3420-3423`).
+   - Recorded requirement says duplicate selector, invalid registry/schema/Decodal, path/symlink escape, artifact too large, and concurrency conflicts must return typed diagnostics.
+
+2. Worker launch profile candidates can include invalid project profiles。
+   - `load_profile_settings` attaches Decodal/source validation errors from `validate_project_profiles` only to top-level `diagnostics` (`profile_settings.rs:327`, `663-707`).
+   - each project `WorkspaceProfileSummary` only gets `source_summary` diagnostics (`profile_settings.rs:304-323`).
+   - `worker_profile_candidates_for_root` includes project profiles when `profile.diagnostics.is_empty()` (`server.rs:2989-2992`).
+   - `is_profile_candidate` accepts any discovered project profile id (`profile_settings.rs:629-635`).
+   - Result: registry entry with invalid Decodal source can still appear in launch options and be accepted as a candidate until spawn-time archive resolution fails.
+   - This violates the intent that profile updates re-run Backend discovery/validation and Worker launch candidates share the same effective validated discovery result.
+
+3. Registry/default updates can commit references that are not actually Backend-published/valid。
+   - `validate_default_profile` accepts any string beginning with `project:` without checking that the project selector exists in submitted registry or discovery result (`profile_settings.rs:946-955`).
+   - `update_profile_registry` only validates source content if the expected source file already exists (`profile_settings.rs:463-468`) before writing the registry (`profile_settings.rs:470`).
+   - This permits API writes that persist nonexistent project defaults or missing project source references, contrary to the invariant that writes validate schema/selector/source references before commit and defaults/candidates are Backend-published.
+
+Validation performed:
+- Read Ticket `00001KX0DSMPT` item/thread, IntentPacket, binding invariants, acceptance criteria, implementation report, and reviewer focus。
+- Read-only inspection in implementation worktree `/home/hare/Projects/yoi/.worktree/00001KX0DSMPT-workspace-profile-settings`。
+- Inspected implementation commit scope and relevant backend/frontend files。
+- Relied on Orchestrator-provided validation results; did not modify files or run root/original workspace operations。
+
+Non-blocking follow-ups:
+- Negative-test coverage is thinner than reviewer focus: duplicate selector, invalid registry schema, symlink escape, artifact size, redaction, concurrent update API response shape, and launch-candidate invalidation need stronger coverage.
+- UI implements profile list/editor on single `/settings` page with anchors/forms rather than separate `/settings/profiles/...` pages. This may be acceptable under implementation latitude, but confirm route granularity if it matters.
+
+---
