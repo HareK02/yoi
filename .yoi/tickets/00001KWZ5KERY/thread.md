@@ -239,3 +239,30 @@ Non-blocking follow-ups:
 - supported profile registry boundary をより明確にするとよい。現状 Backend archive construction は embedded builtins hardcode で、Ticket は workspace/project/builtin profile registry discovery を記述している。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-08T10:23:11Z -->
+
+## Implementation report
+
+Review-fix implementation report:
+
+- Coder Pod completed requested changes and committed follow-up `a2833dad fix: reject unknown profile archive selectors` on branch `work/00001KWZ5KERY-decodal-profile-archive`.
+- Worktree status was clean after commit.
+- Fix summary:
+  - Embedded Decodal profiles no longer use unsupported `tool_enabled`; they now use existing typed `ProfileConfig` fields such as `feature` plus existing model/session/engine/memory/web fields as applicable。
+  - Archive selector fallback to `default` was removed; missing selector now returns `ProfileArchiveError::MissingEntrypoint`。
+  - Backend embedded archive construction rejects unknown `Builtin` and unknown `Named` selectors instead of mapping them to default。
+  - Added focused tests proving every embedded builtin `.dcdl` resolves through real Backend-built `ProfileSourceArchive` + Decodal + `ProfileConfig` path。
+  - Added tests for unknown Builtin/Named selector rejection and no default fallback for missing selectors。
+- Orchestrator reran validation in the implementation worktree:
+  - `git diff --check`: pass
+  - `cargo test -p worker-runtime --features ws-server,fs-store`: pass（41 lib tests + 5 main tests + doc tests）
+  - `cargo test -p yoi-workspace-server`: pass（69 lib tests + 2 main tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（17 tests）
+  - `yoi ticket doctor`: ok
+  - `nix build .#yoi --no-link`: pass
+- Requesting follow-up external review against `a823d414..a2833dad` and full combined implementation。
+
+---
