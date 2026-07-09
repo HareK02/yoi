@@ -1,8 +1,8 @@
 ---
 title: 'Add ProfileSourceTree virtual filesystem and Decodal profile editor'
-state: 'planning'
+state: 'ready'
 created_at: '2026-07-08T19:18:25Z'
-updated_at: '2026-07-08T19:27:00Z'
+updated_at: '2026-07-09T07:18:33Z'
 assignee: null
 ---
 
