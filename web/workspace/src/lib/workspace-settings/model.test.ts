@@ -6,6 +6,7 @@ import {
   SETTINGS_SECTIONS,
   settingsSectionHref,
 } from "./model.ts";
+import { profileSourceTreeSettingsHref, virtualProfilePathForCreate } from "./profile-routes.ts";
 
 declare const Deno: {
   test(name: string, fn: () => void): void;
@@ -101,4 +102,20 @@ Deno.test("diagnostic labels preserve severity and code", () => {
       "warning: runtime_registry_restart_required",
     "diagnostic label should be bounded and stable",
   );
+});
+
+
+Deno.test("profile source tree routes use encoded scoped ids", () => {
+  const href = profileSourceTreeSettingsHref("workspace a", "project/tree");
+  assert(
+    href === "/w/workspace%20a/settings/profiles/trees/project%2Ftree",
+    `unexpected href ${href}`,
+  );
+  assert(!href.includes("/home/"), "route must not contain host paths");
+});
+
+Deno.test("profile source create paths are normalized to virtual profile paths", () => {
+  assert(virtualProfilePathForCreate("alpha.dcdl") === "profiles/alpha.dcdl", "bare file names are scoped");
+  assert(virtualProfilePathForCreate("profiles/alpha.dcdl") === "profiles/alpha.dcdl", "virtual paths are preserved");
+  assert(virtualProfilePathForCreate("project:profiles/alpha.dcdl") === "project:profiles/alpha.dcdl", "safe virtual namespaces are preserved");
 });
