@@ -249,3 +249,36 @@ Review-fix implementation report:
 - Requesting follow-up external review against `81abfa63..941b9126` and full combined implementation。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-09T08:57:15Z status: request_changes -->
+
+## Review: request changes
+
+External follow-up review result: request_changes
+
+Blockers:
+
+1. Tree writes still allow a source-root symlink escape before/at filesystem mutation。
+   - Fix rejects symlinked intermediate directories under `.yoi/profiles`, but not `.yoi/profiles` itself being a symlink。
+   - `prepare_source_path_for_write()` creates/canonicalizes `source_root` without checking `symlink_metadata(source_root)` or verifying canonical source root remains under canonical workspace root。
+   - If `.yoi/profiles` is a symlink to an outside directory, `canonical_root` becomes outside target; `parent_relative` strips against textual symlink path and missing children can be created outside workspace。
+   - `checked_source_path()` repeats the escaped-root comparison and can accept files under escaped root。
+   - `list_profile_tree_files()` starts `read_dir` at `workspace_root/.yoi/profiles`, so symlinked source root can expose outside `.dcdl` files as virtual tree files。
+   - Required fix: reject symlinked source root and ensure canonical source root is confined under canonical workspace root before list/read/write/delete/archive operations。
+
+2. Regression coverage for the remaining symlink escape is missing。
+   - Existing test covers symlinked child directory only。
+   - Add focused regression for `.yoi/profiles -> outside_dir` asserting tree write is rejected before side effects, outside target is not created/modified, and preferably list/read/archive construction also fail closed or do not traverse escaped root。
+
+Evidence / resolved items:
+- `decodal-codemirror@0.1.2` is present and `DecodalSourceEditor.svelte` imports/uses `decodal()` in CM6 extensions。
+- Required tree route exists at `web/workspace/src/routes/w/[workspaceId]/settings/profiles/trees/[sourceTreeId]/...`; create/save/delete call Backend APIs。
+- Selected-root archive construction now collects only import closure; tests assert unrelated sources are excluded。
+- Browser-facing typed summaries include virtual path/root, content type/digest, and typed provenance without host paths。
+- Runtime `ArchiveSourceLoader` remains manifest/import-map backed with no filesystem fallback。
+
+Non-blocking follow-ups:
+- Current web tests cover route helper/path normalization but not actual Svelte create/save/delete interaction behavior。
+- Editor extension wiring is compile/static-source covered rather than directly unit-tested; acceptable for now, but smoke coverage would help future dependency regressions。
+
+---
