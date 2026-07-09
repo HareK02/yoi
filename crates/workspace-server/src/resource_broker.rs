@@ -68,6 +68,18 @@ impl BackendResourceBroker {
         handle
     }
 
+    pub fn profile_source_archive(
+        &self,
+        digest: &str,
+    ) -> Option<worker_runtime::profile_archive::ProfileSourceArchive> {
+        self.resources
+            .lock()
+            .ok()?
+            .values()
+            .find(|resource| resource.handle.digest == digest)
+            .map(|resource| resource.archive.clone())
+    }
+
     pub fn fetch_profile_source_archive(
         &self,
         request: BackendResourceFetchRequest,

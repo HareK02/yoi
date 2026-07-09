@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::header::{CONTENT_TYPE, LOCATION};
-use axum::http::{StatusCode, Uri};
+use axum::http::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -91,6 +91,7 @@ pub struct ServerConfig {
     pub repositories: Vec<ConfiguredRepository>,
     pub runtime_event_sources: Vec<RuntimeObservationSourceConfig>,
     pub remote_runtime_sources: Vec<RemoteRuntimeConfig>,
+    pub backend_base_url: Option<String>,
 }
 
 impl ServerConfig {
@@ -113,6 +114,7 @@ impl ServerConfig {
             repositories: Vec::new(),
             runtime_event_sources: Vec::new(),
             remote_runtime_sources: Vec::new(),
+            backend_base_url: None,
         }
     }
 
@@ -234,9 +236,15 @@ impl WorkspaceApi {
         );
         for remote_config in config.remote_runtime_sources.iter().cloned() {
             runtime.register(
-                RemoteWorkerRuntime::new(remote_config)
-                    .map(|host| host.with_resource_broker(resource_broker.clone()))
-                    .map_err(|err| err.into_error())?,
+                RemoteWorkerRuntime::new(
+                    remote_config,
+                    config
+                        .backend_base_url
+                        .clone()
+                        .unwrap_or_else(|| "http://127.0.0.1:8787".to_string()),
+                )
+                .map(|host| host.with_resource_broker(resource_broker.clone()))
+                .map_err(|err| err.into_error())?,
             );
         }
         let runtime = Arc::new(runtime);
@@ -333,6 +341,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         )
         .route("/api/hosts", get(list_hosts))
         .route("/api/w/{workspace_id}/hosts", get(scoped_list_hosts))
+        .route(
+            "/api/w/{workspace_id}/profile-source-archives/{digest}",
+            get(scoped_get_profile_source_archive),
+        )
         .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/working-directories",
             get(scoped_list_runtime_working_directories).post(scoped_create_runtime_working_directory),
@@ -807,6 +819,12 @@ struct ScopedRepositoryPath {
 }
 
 #[derive(Debug, Deserialize)]
+struct ScopedProfileArchivePath {
+    workspace_id: String,
+    digest: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ScopedHostPath {
     workspace_id: String,
     host_id: String,
@@ -1097,6 +1115,32 @@ async fn scoped_list_hosts(
 ) -> ApiResult<Json<RuntimeListResponse<HostSummary>>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     list_hosts(State(api)).await
+}
+
+async fn scoped_get_profile_source_archive(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedProfileArchivePath>,
+    headers: HeaderMap,
+) -> ApiResult<(StatusCode, HeaderMap, Vec<u8>)> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let archive = api
+        .resource_broker
+        .profile_source_archive(&path.digest)
+        .ok_or_else(|| Error::Store("profile source archive not found".to_string()))?;
+    let etag = format!("\"profile-source:{}\"", archive.reference.digest);
+    if headers
+        .get(IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|candidate| candidate.trim() == etag))
+    {
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert(ETAG, etag.parse().unwrap());
+        return Ok((StatusCode::NOT_MODIFIED, response_headers, Vec::new()));
+    }
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(ETAG, etag.parse().unwrap());
+    response_headers.insert(CONTENT_TYPE, "application/x-tar".parse().unwrap());
+    Ok((StatusCode::OK, response_headers, archive.content))
 }
 
 async fn scoped_list_runtimes(
@@ -1783,9 +1827,15 @@ async fn add_remote_runtime_connection(
             vec![diagnostic],
         )
     })?;
-    let active_runtime = RemoteWorkerRuntime::new(active_config)
-        .map(|host| host.with_resource_broker(api.resource_broker.clone()))
-        .map_err(|err| err.into_error())?;
+    let active_runtime = RemoteWorkerRuntime::new(
+        active_config,
+        api.config
+            .backend_base_url
+            .clone()
+            .unwrap_or_else(|| "http://127.0.0.1:8787".to_string()),
+    )
+    .map(|host| host.with_resource_broker(api.resource_broker.clone()))
+    .map_err(|err| err.into_error())?;
     local_config.runtimes.remote.push(remote_config);
     write_workspace_backend_config_for_settings(&api, &local_config)?;
     api.runtime.register_or_replace(active_runtime);
@@ -4278,10 +4328,27 @@ mod tests {
         let bundle = runtime_test_bundle();
         worker_runtime::catalog::CreateWorkerRequest {
             profile: worker_runtime::catalog::ProfileSelector::RuntimeDefault,
-            config_bundle: worker_runtime::catalog::ConfigBundleRef {
+            profile_source: worker_runtime::catalog::ProfileSourceArchiveSource::Http {
+                location: worker_runtime::catalog::ProfileSourceArchiveHttpRef {
+                    url: "http://127.0.0.1/profile-source.tar".to_string(),
+                    etag: None,
+                    archive: worker_runtime::profile_archive::ProfileSourceArchiveRef {
+                        id: "test-profile-source".to_string(),
+                        digest: "test-digest".to_string(),
+                        size_bytes: 0,
+                        source_graph: worker_runtime::profile_archive::ProfileSourceGraphSummary {
+                            source_count: 0,
+                            total_source_bytes: 0,
+                            entrypoints: std::collections::BTreeMap::new(),
+                            import_count: 0,
+                        },
+                    },
+                },
+            },
+            config_bundle: Some(worker_runtime::catalog::ConfigBundleRef {
                 id: bundle.metadata.id,
                 digest: bundle.metadata.digest,
-            },
+            }),
             initial_input: None,
             working_directory_request: None,
             working_directory: None,

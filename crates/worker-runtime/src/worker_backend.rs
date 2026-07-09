@@ -14,17 +14,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use crate::catalog::{WorkingDirectoryRequest, WorkingDirectoryStatus};
-use crate::config_bundle::verified_profile_source_archive;
+use crate::catalog::{
+    ProfileSourceArchiveHttpRef, ProfileSourceArchiveSource, WorkingDirectoryRequest,
+    WorkingDirectoryStatus,
+};
 use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation, WorkerExecutionResult,
     WorkerExecutionRunState, WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
 };
 use crate::interaction::{WorkerInput, WorkerInputKind};
-use crate::resource::{
-    BackendResourceClient, BackendResourceError, ProfileSourceArchiveCache,
-    build_profile_source_archive_fetch_request, profile_source_archive_from_response,
-};
+use crate::resource::{BackendResourceClient, ProfileSourceArchiveCache};
 use crate::working_directory::{
     WorkingDirectoryBinding, WorkingDirectoryDiagnostic, WorkingDirectoryMaterializer,
 };
@@ -170,54 +169,103 @@ impl ProfileRuntimeWorkerFactory {
     }
     async fn resolve_profile_source_archive(
         &self,
-        bundle: &crate::config_bundle::ConfigBundle,
-        request: &WorkerExecutionSpawnRequest,
+        source: &ProfileSourceArchiveSource,
     ) -> Result<crate::profile_archive::VerifiedProfileSourceArchive, String> {
-        if let Some(archive) = verified_profile_source_archive(bundle)
-            .map_err(|err| format!("failed to verify profile source archive: {err}"))?
-        {
-            return Ok(archive);
-        }
-        let handle = bundle
-            .profile_source_archive_handle
-            .clone()
-            .ok_or_else(|| {
-                format!(
-                    "config bundle {} does not contain a ProfileSourceArchive resource handle",
-                    bundle.metadata.id
-                )
-            })?;
-        let client = self.resource_client.as_ref().ok_or_else(|| {
-            format!(
-                "config bundle {} requires a Backend resource client for profile source archive fetch",
-                bundle.metadata.id
-            )
-        })?;
-        let fetch_request = build_profile_source_archive_fetch_request(
-            handle.clone(),
-            &request.worker_ref.runtime_id,
-            Some(&request.worker_ref.worker_id),
-        );
-        let response = client
-            .fetch_resource(fetch_request)
-            .await
-            .map_err(format_backend_resource_error)?;
-        let fetched_archive = profile_source_archive_from_response(&handle, response)
-            .map_err(format_backend_resource_error)?;
-        if let Some(cached) = self.profile_archive_cache.get(&handle.digest) {
-            return cached
+        match source {
+            ProfileSourceArchiveSource::Embedded { archive } => archive
                 .verify()
-                .map_err(|err| format!("failed to verify cached profile source archive: {err}"));
+                .map_err(|err| format!("failed to verify embedded profile source archive: {err}")),
+            ProfileSourceArchiveSource::Http { location } => {
+                self.fetch_profile_source_archive(location).await
+            }
         }
-        self.profile_archive_cache.insert(fetched_archive.clone());
-        fetched_archive
-            .verify()
-            .map_err(|err| format!("failed to verify fetched profile source archive: {err}"))
+    }
+
+    async fn fetch_profile_source_archive(
+        &self,
+        location: &ProfileSourceArchiveHttpRef,
+    ) -> Result<crate::profile_archive::VerifiedProfileSourceArchive, String> {
+        if let Some(cached) = self.profile_archive_cache.get(&location.archive.digest) {
+            let response =
+                fetch_profile_source_archive_http(location, Some(&location.archive.digest)).await?;
+            if let Some(fetched) = response {
+                self.profile_archive_cache.insert(fetched.clone());
+                fetched.verify().map_err(|err| {
+                    format!("failed to verify fetched profile source archive: {err}")
+                })
+            } else {
+                cached
+                    .verify()
+                    .map_err(|err| format!("failed to verify cached profile source archive: {err}"))
+            }
+        } else {
+            let archive = fetch_profile_source_archive_http(location, None)
+                .await?
+                .ok_or_else(|| {
+                    "profile source archive HTTP revalidation returned 304 without a cached archive"
+                        .to_string()
+                })?;
+            self.profile_archive_cache.insert(archive.clone());
+            archive
+                .verify()
+                .map_err(|err| format!("failed to verify fetched profile source archive: {err}"))
+        }
     }
 }
 
-fn format_backend_resource_error(error: BackendResourceError) -> String {
-    format!("backend resource fetch failed: {error}")
+#[cfg(feature = "http-server")]
+async fn fetch_profile_source_archive_http(
+    location: &ProfileSourceArchiveHttpRef,
+    cached_digest: Option<&str>,
+) -> Result<Option<crate::profile_archive::ProfileSourceArchive>, String> {
+    let client = reqwest::Client::new();
+    let mut request = client.get(&location.url);
+    if cached_digest == Some(location.archive.digest.as_str()) {
+        if let Some(etag) = location.etag.as_deref() {
+            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|err| format!("failed to fetch profile source archive: {err}"))?;
+    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        let status = response.status();
+        return Err(format!(
+            "profile source archive fetch failed with HTTP {status}"
+        ));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|err| format!("failed to read profile source archive response: {err}"))?
+        .to_vec();
+    let archive = crate::profile_archive::ProfileSourceArchive {
+        reference: location.archive.clone(),
+        content: bytes,
+    };
+    if archive.content.len() as u64 != archive.reference.size_bytes {
+        return Err(format!(
+            "profile source archive size mismatch: expected {}, got {}",
+            archive.reference.size_bytes,
+            archive.content.len()
+        ));
+    }
+    Ok(Some(archive))
+}
+
+#[cfg(not(feature = "http-server"))]
+async fn fetch_profile_source_archive_http(
+    _location: &ProfileSourceArchiveHttpRef,
+    _cached_digest: Option<&str>,
+) -> Result<Option<crate::profile_archive::ProfileSourceArchive>, String> {
+    Err(
+        "HTTP profile source archive fetch requires the worker-runtime http-server feature"
+            .to_string(),
+    )
 }
 
 #[async_trait]
@@ -238,26 +286,17 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             .as_ref()
             .map(|binding| binding.cwd().to_path_buf())
             .unwrap_or_else(|| self.cwd.clone());
-        let (mut manifest, loader) = if let Some(bundle) = request.config_bundle.as_ref() {
-            let selector = profile.as_deref().unwrap_or("builtin:default");
-            let archive = self
-                .resolve_profile_source_archive(bundle, &request)
-                .await?;
+        let selector = profile.as_deref().unwrap_or("builtin:default");
+        let archive = self
+            .resolve_profile_source_archive(&request.request.profile_source)
+            .await?;
+        let (mut manifest, loader) = {
             let manifest = archive
                 .resolve_profile(selector, &worker_root, &worker_name)
                 .map_err(|err| format!("failed to resolve profile source archive: {err}"))?;
             worker::entrypoint::resolve_runtime_profile_manifest_from_manifest(
                 manifest,
                 &worker_root,
-                &worker_name,
-            )?
-        } else {
-            // Compatibility/debug fallback for direct CLI tests. Normal Browser/Backend launch
-            // supplies a ProfileSourceArchive inside the Runtime config bundle and must not use
-            // Runtime-local filesystem profile discovery.
-            worker::entrypoint::resolve_runtime_profile_manifest(
-                profile.as_deref(),
-                &self.profile_base_dir,
                 &worker_name,
             )?
         };
@@ -899,7 +938,7 @@ mod tests {
                 label: Some("adapter-test".to_string()),
             }],
             declarations: Vec::new(),
-            profile_source_archive: None,
+            profile_source_archive: Some(sample_profile_archive()),
             profile_source_archive_handle: None,
         }
         .with_computed_digest()
@@ -1010,10 +1049,13 @@ mod tests {
             worker_ref: worker_ref.clone(),
             request: CreateWorkerRequest {
                 profile: ProfileSelector::RuntimeDefault,
-                config_bundle: ConfigBundleRef {
+                profile_source: crate::catalog::ProfileSourceArchiveSource::Embedded {
+                    archive: bundle.profile_source_archive.clone().unwrap(),
+                },
+                config_bundle: Some(ConfigBundleRef {
                     id: bundle.metadata.id.clone(),
                     digest: bundle.metadata.digest.clone(),
-                },
+                }),
                 initial_input: None,
                 working_directory_request: None,
                 working_directory: None,
@@ -1028,10 +1070,13 @@ mod tests {
         let bundle = test_bundle();
         CreateWorkerRequest {
             profile: ProfileSelector::RuntimeDefault,
-            config_bundle: ConfigBundleRef {
+            profile_source: crate::catalog::ProfileSourceArchiveSource::Embedded {
+                archive: bundle.profile_source_archive.clone().unwrap(),
+            },
+            config_bundle: Some(ConfigBundleRef {
                 id: bundle.metadata.id,
                 digest: bundle.metadata.digest,
-            },
+            }),
             initial_input: None,
             working_directory_request: None,
             working_directory: None,
@@ -1077,34 +1122,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_profile_archive_still_requires_backend_authorization() {
-        let archive = sample_profile_archive();
-        let handle = handle_for_archive(&archive);
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let client = SequencedResourceClient {
-            responses: Arc::new(Mutex::new(VecDeque::from([
-                Ok(response_for_archive(&handle, &archive)),
-                Err(crate::resource::BackendResourceError::Expired),
-            ]))),
-            call_count: call_count.clone(),
+    async fn embedded_profile_source_archive_does_not_require_backend_resource_fetch() {
+        let factory = ProfileRuntimeWorkerFactory::new(tempfile::tempdir().unwrap().path());
+        let bundle = test_bundle();
+        let source = crate::catalog::ProfileSourceArchiveSource::Embedded {
+            archive: bundle.profile_source_archive.clone().unwrap(),
         };
-        let factory = ProfileRuntimeWorkerFactory::new(tempfile::tempdir().unwrap().path())
-            .with_resource_client(Arc::new(client));
-        let mut bundle = test_bundle();
-        bundle.profile_source_archive_handle = Some(handle);
-        bundle = bundle.with_computed_digest();
-
         factory
-            .resolve_profile_source_archive(&bundle, &spawn_request_with_bundle(bundle.clone()))
+            .resolve_profile_source_archive(&source)
             .await
-            .expect("first fetch should authorize and cache archive");
-        let err = factory
-            .resolve_profile_source_archive(&bundle, &spawn_request_with_bundle(bundle.clone()))
-            .await
-            .unwrap_err();
-
-        assert!(err.contains("expired"), "unexpected error: {err}");
-        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+            .expect("embedded archive should resolve without Backend resource client");
     }
 
     #[test]

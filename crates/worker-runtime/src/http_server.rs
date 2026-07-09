@@ -933,10 +933,27 @@ mod tests {
         let bundle = test_bundle(profile.clone());
         CreateWorkerRequest {
             profile,
-            config_bundle: ConfigBundleRef {
+            profile_source: crate::catalog::ProfileSourceArchiveSource::Http {
+                location: crate::catalog::ProfileSourceArchiveHttpRef {
+                    url: "http://127.0.0.1/profile-source.tar".to_string(),
+                    etag: None,
+                    archive: crate::profile_archive::ProfileSourceArchiveRef {
+                        id: "test-profile-source".to_string(),
+                        digest: "test-digest".to_string(),
+                        size_bytes: 0,
+                        source_graph: crate::profile_archive::ProfileSourceGraphSummary {
+                            source_count: 0,
+                            total_source_bytes: 0,
+                            entrypoints: std::collections::BTreeMap::new(),
+                            import_count: 0,
+                        },
+                    },
+                },
+            },
+            config_bundle: Some(ConfigBundleRef {
                 id: bundle.metadata.id,
                 digest: bundle.metadata.digest,
-            },
+            }),
             initial_input: None,
             working_directory_request: None,
             working_directory: None,
@@ -1220,10 +1237,27 @@ mod ws_tests {
         let bundle = ws_test_bundle(ProfileSelector::RuntimeDefault);
         CreateWorkerRequest {
             profile: ProfileSelector::RuntimeDefault,
-            config_bundle: ConfigBundleRef {
+            profile_source: crate::catalog::ProfileSourceArchiveSource::Http {
+                location: crate::catalog::ProfileSourceArchiveHttpRef {
+                    url: "http://127.0.0.1/profile-source.tar".to_string(),
+                    etag: None,
+                    archive: crate::profile_archive::ProfileSourceArchiveRef {
+                        id: "test-profile-source".to_string(),
+                        digest: "test-digest".to_string(),
+                        size_bytes: 0,
+                        source_graph: crate::profile_archive::ProfileSourceGraphSummary {
+                            source_count: 0,
+                            total_source_bytes: 0,
+                            entrypoints: std::collections::BTreeMap::new(),
+                            import_count: 0,
+                        },
+                    },
+                },
+            },
+            config_bundle: Some(ConfigBundleRef {
                 id: bundle.metadata.id,
                 digest: bundle.metadata.digest,
-            },
+            }),
             initial_input: None,
             working_directory_request: None,
             working_directory: None,

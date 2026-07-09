@@ -1,6 +1,6 @@
 use crate::catalog::{
-    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerDetail, WorkerLifecycleAck,
-    WorkerStatus, WorkerSummary, WorkingDirectoryRequest,
+    ConfigBundleRef, CreateWorkerRequest, WorkerDetail, WorkerLifecycleAck, WorkerStatus,
+    WorkerSummary, WorkingDirectoryRequest,
     WorkingDirectoryStatus as CatalogWorkingDirectoryStatus,
 };
 use crate::config_bundle::{
@@ -308,7 +308,7 @@ impl Runtime {
             .map_err(|diagnostic| RuntimeError::InvalidRequest(diagnostic.to_string()))
     }
 
-    /// Create a Worker through the canonical ConfigBundle + execution backend path.
+    /// Create a Worker through the canonical profile-source + execution backend path.
     pub fn create_worker(
         &self,
         request: CreateWorkerRequest,
@@ -318,13 +318,6 @@ impl Runtime {
             state.ensure_running()?;
             validate_create_worker_request(&request)?;
             state.validate_worker_config_boundary(&request)?;
-            let config_bundle = state
-                .config_bundles
-                .get(&request.config_bundle.id)
-                .cloned()
-                .ok_or_else(|| RuntimeError::ConfigBundleMissing {
-                    bundle_id: request.config_bundle.id.clone(),
-                })?;
             let backend = state.execution_backend.clone().ok_or_else(|| {
                 RuntimeError::ExecutionBackendUnavailable {
                     message: "worker creation requires an execution backend".to_string(),
@@ -370,7 +363,7 @@ impl Runtime {
                 request,
                 context: self.execution_context(worker_ref.clone()),
                 working_directory: None,
-                config_bundle: Some(config_bundle),
+                config_bundle: None,
             };
             (backend, worker_ref, spawn_request)
         };
@@ -1317,23 +1310,8 @@ impl RuntimeState {
 
     fn validate_worker_config_boundary(
         &self,
-        request: &CreateWorkerRequest,
+        _request: &CreateWorkerRequest,
     ) -> Result<(), RuntimeError> {
-        let reference = &request.config_bundle;
-        let availability = self.check_config_bundle_ref(reference)?;
-        let bundle = self
-            .config_bundles
-            .get(&availability.reference.id)
-            .ok_or_else(|| RuntimeError::ConfigBundleMissing {
-                bundle_id: availability.reference.id.clone(),
-            })?;
-        if !bundle.contains_profile(&request.profile) {
-            return Err(RuntimeError::InvalidProfileSelector {
-                profile: profile_label(&request.profile),
-                bundle_id: Some(reference.id.clone()),
-                message: "profile selector is not declared by synced config bundle".to_string(),
-            });
-        }
         Ok(())
     }
 
@@ -1571,6 +1549,7 @@ impl WorkerRecord {
             status: self.status,
             execution: self.execution.clone(),
             profile: self.request.profile.clone(),
+            profile_source: self.request.profile_source.reference(),
             config_bundle: self.request.config_bundle.clone(),
             transcript_len: self.transcript.len(),
             last_event_id: self.last_event_id,
@@ -1585,6 +1564,7 @@ impl WorkerRecord {
             status: self.status,
             execution: self.execution.clone(),
             profile: self.request.profile.clone(),
+            profile_source: self.request.profile_source.reference(),
             config_bundle: self.request.config_bundle.clone(),
             transcript_len: self.transcript.len(),
             last_event_id: self.last_event_id,
@@ -1606,24 +1586,25 @@ impl WorkerRecord {
     }
 }
 
-fn profile_label(selector: &ProfileSelector) -> String {
-    match selector {
-        ProfileSelector::RuntimeDefault => "runtime_default".to_string(),
-        ProfileSelector::Builtin(value) => value.clone(),
-        ProfileSelector::Named(value) => value.clone(),
-    }
-}
-
 fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), RuntimeError> {
-    if request.config_bundle.id.trim().is_empty() {
-        return Err(RuntimeError::InvalidRequest(
-            "config_bundle.id must not be empty".to_string(),
-        ));
-    }
-    if request.config_bundle.digest.trim().is_empty() {
-        return Err(RuntimeError::InvalidRequest(
-            "config_bundle.digest must not be empty".to_string(),
-        ));
+    match &request.profile_source {
+        crate::catalog::ProfileSourceArchiveSource::Embedded { archive } => {
+            archive.verify().map_err(|err| {
+                RuntimeError::InvalidRequest(format!("profile_source archive is invalid: {err}"))
+            })?;
+        }
+        crate::catalog::ProfileSourceArchiveSource::Http { location } => {
+            if location.url.trim().is_empty() {
+                return Err(RuntimeError::InvalidRequest(
+                    "profile_source.location.url must not be empty".to_string(),
+                ));
+            }
+            if location.archive.digest.trim().is_empty() {
+                return Err(RuntimeError::InvalidRequest(
+                    "profile_source.location.archive.digest must not be empty".to_string(),
+                ));
+            }
+        }
     }
     if let Some(input) = &request.initial_input {
         if input.kind != WorkerInputKind::User {
@@ -1669,10 +1650,27 @@ mod tests {
         let bundle = test_bundle_for_profile(profile.clone());
         CreateWorkerRequest {
             profile,
-            config_bundle: ConfigBundleRef {
+            profile_source: crate::catalog::ProfileSourceArchiveSource::Http {
+                location: crate::catalog::ProfileSourceArchiveHttpRef {
+                    url: "http://127.0.0.1/profile-source.tar".to_string(),
+                    etag: None,
+                    archive: crate::profile_archive::ProfileSourceArchiveRef {
+                        id: "test-profile-source".to_string(),
+                        digest: "test-digest".to_string(),
+                        size_bytes: 0,
+                        source_graph: crate::profile_archive::ProfileSourceGraphSummary {
+                            source_count: 0,
+                            total_source_bytes: 0,
+                            entrypoints: BTreeMap::new(),
+                            import_count: 0,
+                        },
+                    },
+                },
+            },
+            config_bundle: Some(ConfigBundleRef {
                 id: bundle.metadata.id,
                 digest: bundle.metadata.digest,
-            },
+            }),
             initial_input: None,
             working_directory_request: None,
             working_directory: None,
@@ -1806,10 +1804,10 @@ mod tests {
 
     fn bundled_task_request(objective: &str, bundle: &ConfigBundle) -> CreateWorkerRequest {
         let mut request = task_request(objective);
-        request.config_bundle = ConfigBundleRef {
+        request.config_bundle = Some(ConfigBundleRef {
             id: bundle.metadata.id.clone(),
             digest: bundle.metadata.digest.clone(),
-        };
+        });
         request
     }
 
@@ -1820,7 +1818,7 @@ mod tests {
 
         assert_eq!(detail.worker_ref.runtime_id, runtime.runtime_id().unwrap());
         assert_eq!(detail.status, WorkerStatus::Running);
-        assert_eq!(detail.config_bundle.id, "bundle-1");
+        assert_eq!(detail.config_bundle.as_ref().unwrap().id, "bundle-1");
 
         let list = runtime.list_workers().unwrap();
         assert_eq!(list.len(), 1);
@@ -1852,18 +1850,13 @@ mod tests {
         let detail = runtime
             .create_worker(bundled_task_request("synced", &bundle))
             .unwrap();
-        assert_eq!(detail.config_bundle, availability.reference);
+        assert_eq!(detail.config_bundle, Some(availability.reference));
     }
 
     #[test]
     fn config_bundle_errors_are_typed() {
         let runtime = Runtime::new_memory();
         let bundle = test_bundle();
-
-        let missing = runtime
-            .create_worker(bundled_task_request("missing", &bundle))
-            .unwrap_err();
-        assert!(matches!(missing, RuntimeError::ConfigBundleMissing { .. }));
 
         runtime.store_config_bundle(bundle.clone()).unwrap();
         let mismatch = runtime
@@ -1875,14 +1868,6 @@ mod tests {
         assert!(matches!(
             mismatch,
             RuntimeError::ConfigBundleDigestMismatch { .. }
-        ));
-
-        let mut bad_profile = bundled_task_request("bad profile", &bundle);
-        bad_profile.profile = ProfileSelector::Builtin("builtin:reviewer".to_string());
-        let invalid_profile = runtime.create_worker(bad_profile).unwrap_err();
-        assert!(matches!(
-            invalid_profile,
-            RuntimeError::InvalidProfileSelector { .. }
         ));
 
         let mut unsupported = test_bundle();
@@ -1947,12 +1932,15 @@ mod tests {
     }
 
     #[test]
-    fn create_worker_missing_config_bundle_is_rejected_before_backend() {
+    fn create_worker_without_execution_backend_is_rejected_before_persisting_worker() {
         let runtime = Runtime::new_memory();
         let error = runtime
-            .create_worker(task_request("missing bundle"))
+            .create_worker(task_request("missing backend"))
             .unwrap_err();
-        assert!(matches!(error, RuntimeError::ConfigBundleMissing { .. }));
+        assert!(matches!(
+            error,
+            RuntimeError::ExecutionBackendUnavailable { .. }
+        ));
         assert!(runtime.list_workers().unwrap().is_empty());
     }
 

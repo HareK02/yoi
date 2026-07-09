@@ -14,7 +14,8 @@ use std::{
     time::Duration,
 };
 use worker_runtime::catalog::{
-    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerDetail as EmbeddedWorkerDetail,
+    ConfigBundleRef, CreateWorkerRequest, ProfileSelector, ProfileSourceArchiveHttpRef,
+    ProfileSourceArchiveSource, WorkerDetail as EmbeddedWorkerDetail,
     WorkerStatus as EmbeddedWorkerStatus, WorkingDirectoryClaim, WorkingDirectoryRequest,
     WorkingDirectoryStatus, WorkingDirectorySummary,
 };
@@ -1507,25 +1508,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             .profile
             .clone()
             .unwrap_or_else(|| embedded_profile_selector(&request.intent));
-        let runtime_id = EmbeddedRuntimeId::new(self.runtime_id.clone());
-        let config_bundle = match request
-            .resolved_config_bundle
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(|| {
-                default_embedded_config_bundle(
-                    &profile,
-                    &self.host_id,
-                    runtime_id.as_ref(),
-                    &self.resource_broker,
-                )
-            })
-            .and_then(|bundle| {
-                self.runtime
-                    .store_config_bundle(bundle)
-                    .map_err(|err| err.to_string())
-            }) {
-            Ok(availability) => availability.reference,
+        let profile_source = match default_profile_source_archive_source(&profile) {
+            Ok(source) => source,
             Err(error) => {
                 diagnostics.push(diagnostic(
                     "embedded_profile_source_archive_invalid",
@@ -1542,7 +1526,8 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         };
         let create_request = CreateWorkerRequest {
             profile,
-            config_bundle,
+            config_bundle: None,
+            profile_source,
             initial_input: request.initial_input.clone(),
             working_directory_request: request.resolved_working_directory_request.clone(),
             working_directory: request.resolved_working_directory.clone(),
@@ -1894,6 +1879,7 @@ pub struct RemoteWorkerRuntime {
     runtime_id: String,
     display_name: String,
     base_url: String,
+    backend_base_url: String,
     bearer_token: Option<String>,
     cached_capabilities: RuntimeCapabilitySummary,
     cached_status: String,
@@ -1903,7 +1889,10 @@ pub struct RemoteWorkerRuntime {
 }
 
 impl RemoteWorkerRuntime {
-    pub fn new(config: RemoteRuntimeConfig) -> Result<Self, RuntimeRegistryError> {
+    pub fn new(
+        config: RemoteRuntimeConfig,
+        backend_base_url: String,
+    ) -> Result<Self, RuntimeRegistryError> {
         validate_backend_identifier("runtime_id", &config.runtime_id)?;
         let base_url = config.base_url.trim_end_matches('/').to_string();
         let timeout = config.timeout;
@@ -1919,6 +1908,7 @@ impl RemoteWorkerRuntime {
             runtime_id: config.runtime_id,
             display_name: config.display_name,
             base_url,
+            backend_base_url: backend_base_url.trim_end_matches('/').to_string(),
             bearer_token: config.bearer_token,
             cached_capabilities: config.cached_capabilities,
             cached_status: config.cached_status,
@@ -2286,41 +2276,31 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             .clone()
             .unwrap_or_else(|| embedded_profile_selector(&request.intent));
         let runtime_id = EmbeddedRuntimeId::new(self.runtime_id.clone());
-        let sync = match request
-            .resolved_config_bundle
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(|| {
-                default_embedded_config_bundle(
-                    &profile,
-                    &self.host_id,
-                    runtime_id.as_ref(),
-                    &self.resource_broker,
-                )
-            }) {
-            Ok(bundle) => self.sync_config_bundle(bundle),
-            Err(error) => ConfigBundleSyncResult {
-                state: WorkerOperationState::Rejected,
-                availability: None,
-                diagnostics: vec![diagnostic(
-                    "remote_profile_source_archive_invalid",
-                    DiagnosticSeverity::Error,
-                    error,
-                )],
-            },
-        };
-        let Some(config_bundle) = sync.availability.map(|availability| availability.reference)
-        else {
-            return WorkerSpawnResult {
-                state: WorkerOperationState::Rejected,
-                worker: None,
-                acceptance_evidence: Vec::new(),
-                diagnostics: sync.diagnostics,
-            };
+        let profile_source = match default_profile_source_archive_http_source(
+            &profile,
+            &self.host_id,
+            runtime_id.as_ref(),
+            &self.resource_broker,
+            &self.backend_base_url,
+        ) {
+            Ok(source) => source,
+            Err(error) => {
+                return WorkerSpawnResult {
+                    state: WorkerOperationState::Rejected,
+                    worker: None,
+                    acceptance_evidence: Vec::new(),
+                    diagnostics: vec![diagnostic(
+                        "remote_profile_source_archive_invalid",
+                        DiagnosticSeverity::Error,
+                        error,
+                    )],
+                };
+            }
         };
         let create = CreateWorkerRequest {
             profile,
-            config_bundle,
+            config_bundle: None,
+            profile_source,
             initial_input: request.initial_input.clone(),
             working_directory_request: request.resolved_working_directory_request.clone(),
             working_directory: request.resolved_working_directory.clone(),
@@ -2637,11 +2617,56 @@ fn embedded_worker_execution_status_label(
     }
 }
 
+fn default_profile_source_archive_source(
+    profile: &ProfileSelector,
+) -> Result<ProfileSourceArchiveSource, String> {
+    Ok(ProfileSourceArchiveSource::Embedded {
+        archive: default_profile_source_archive(profile)?,
+    })
+}
+
+fn default_profile_source_archive_http_source(
+    profile: &ProfileSelector,
+    workspace_id: &str,
+    runtime_id: Option<&EmbeddedRuntimeId>,
+    resource_broker: &BackendResourceBroker,
+    backend_base_url: &str,
+) -> Result<ProfileSourceArchiveSource, String> {
+    let archive = default_profile_source_archive(profile)?;
+    let _handle = resource_broker.issue_profile_source_archive_handle(
+        workspace_id.to_string(),
+        runtime_id,
+        None,
+        archive.clone(),
+    );
+    let etag = format!("\"profile-source:{}\"", archive.reference.digest);
+    let url = format!(
+        "{}/api/w/{}/profile-source-archives/{}",
+        backend_base_url.trim_end_matches('/'),
+        workspace_id,
+        archive.reference.digest
+    );
+    Ok(ProfileSourceArchiveSource::Http {
+        location: ProfileSourceArchiveHttpRef {
+            url,
+            etag: Some(etag),
+            archive: archive.reference.clone(),
+        },
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProfileSourceArchiveTransport {
+    Inline,
+    BackendResourceHandle,
+}
+
 fn default_embedded_config_bundle(
     profile: &ProfileSelector,
     workspace_id: &str,
     runtime_id: Option<&EmbeddedRuntimeId>,
     resource_broker: &BackendResourceBroker,
+    archive_transport: ProfileSourceArchiveTransport,
 ) -> Result<ConfigBundle, String> {
     let id = format!(
         "workspace-runtime-{}",
@@ -2650,12 +2675,18 @@ fn default_embedded_config_bundle(
             .replace([':', '/', ' '], "-")
     );
     let archive = default_profile_source_archive(profile)?;
-    let handle = resource_broker.issue_profile_source_archive_handle(
-        workspace_id.to_string(),
-        runtime_id,
-        None,
-        archive,
-    );
+    let (profile_source_archive, profile_source_archive_handle) = match archive_transport {
+        ProfileSourceArchiveTransport::Inline => (Some(archive), None),
+        ProfileSourceArchiveTransport::BackendResourceHandle => {
+            let handle = resource_broker.issue_profile_source_archive_handle(
+                workspace_id.to_string(),
+                runtime_id,
+                None,
+                archive,
+            );
+            (None, Some(handle))
+        }
+    };
     Ok(ConfigBundle {
         metadata: ConfigBundleMetadata {
             id,
@@ -2673,8 +2704,8 @@ fn default_embedded_config_bundle(
             label: embedded_profile_label(profile),
         }],
         declarations: Vec::new(),
-        profile_source_archive: None,
-        profile_source_archive_handle: Some(handle),
+        profile_source_archive,
+        profile_source_archive_handle,
     }
     .with_computed_digest())
 }
@@ -3277,6 +3308,7 @@ mod tests {
                 "workspace-test",
                 Some(&runtime_id),
                 &broker,
+                ProfileSourceArchiveTransport::BackendResourceHandle,
             )
             .unwrap();
             let handle = bundle.profile_source_archive_handle.as_ref().unwrap();
@@ -3309,6 +3341,32 @@ mod tests {
     }
 
     #[test]
+    fn remote_default_bundle_inlines_profile_archive_for_standalone_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let broker = BackendResourceBroker::default();
+        let runtime_id = EmbeddedRuntimeId::new("remote:test".to_string()).unwrap();
+        let bundle = default_embedded_config_bundle(
+            &ProfileSelector::Builtin("builtin:coder".to_string()),
+            "workspace-test",
+            Some(&runtime_id),
+            &broker,
+            ProfileSourceArchiveTransport::Inline,
+        )
+        .unwrap();
+        assert!(bundle.profile_source_archive_handle.is_none());
+        let archive = bundle
+            .profile_source_archive
+            .as_ref()
+            .expect("remote default bundle carries inline profile archive")
+            .verify()
+            .unwrap();
+        let manifest = archive
+            .resolve_profile("builtin:coder", root.path(), "remote-test-worker")
+            .unwrap();
+        assert_eq!(manifest.worker.name, "remote-test-worker");
+    }
+
+    #[test]
     fn embedded_archive_rejects_unknown_selectors() {
         let broker = BackendResourceBroker::default();
         let runtime_id = EmbeddedRuntimeId::new("runtime-test".to_string()).unwrap();
@@ -3318,6 +3376,7 @@ mod tests {
                 "workspace-test",
                 Some(&runtime_id),
                 &broker,
+                ProfileSourceArchiveTransport::BackendResourceHandle,
             )
             .is_err()
         );
@@ -3327,6 +3386,7 @@ mod tests {
                 "workspace-test",
                 Some(&runtime_id),
                 &broker,
+                ProfileSourceArchiveTransport::BackendResourceHandle,
             )
             .is_err()
         );
@@ -3936,12 +3996,15 @@ mod tests {
 
     #[tokio::test]
     async fn remote_runtime_client_can_initialize_inside_tokio_context() {
-        let runtime = RemoteWorkerRuntime::new(RemoteRuntimeConfig::new(
-            "remote:async-init",
-            "Remote Async Init",
-            "http://127.0.0.1:9",
-            None,
-        ))
+        let runtime = RemoteWorkerRuntime::new(
+            RemoteRuntimeConfig::new(
+                "remote:async-init",
+                "Remote Async Init",
+                "http://127.0.0.1:9",
+                None,
+            ),
+            "http://127.0.0.1:8787".to_string(),
+        )
         .unwrap();
 
         assert_eq!(runtime.runtime_id(), "remote:async-init");
@@ -3984,12 +4047,15 @@ mod tests {
         let secret = "secret-token-do-not-leak".to_string();
         let registry = RuntimeRegistry::new(Vec::new());
         registry.register(
-            RemoteWorkerRuntime::new(RemoteRuntimeConfig::new(
-                "remote:primary",
-                "Remote Primary",
-                base_url.clone(),
-                Some(secret.clone()),
-            ))
+            RemoteWorkerRuntime::new(
+                RemoteRuntimeConfig::new(
+                    "remote:primary",
+                    "Remote Primary",
+                    base_url.clone(),
+                    Some(secret.clone()),
+                ),
+                "http://127.0.0.1:8787".to_string(),
+            )
             .unwrap(),
         );
 
@@ -4062,28 +4128,28 @@ mod tests {
                 json!({
                     "workers": [
                     worker_json_with_execution(
-                        "embedded-worker-runtime",
+                        "remote:primary",
                         "worker-stale",
                         "stale",
                         "unconnected",
                         None,
                     ),
                     worker_json_with_execution(
-                        "embedded-worker-runtime",
+                        "remote:primary",
                         "worker-unconnected",
                         "unconnected",
                         "unconnected",
                         None,
                     ),
                     worker_json_with_execution(
-                        "embedded-worker-runtime",
+                        "remote:primary",
                         "worker-rejected",
                         "connected",
                         "rejected",
                         Some("rejected"),
                     ),
                     worker_json_with_execution(
-                        "embedded-worker-runtime",
+                        "remote:primary",
                         "worker-errored",
                         "connected",
                         "errored",
@@ -4100,7 +4166,7 @@ mod tests {
                 200,
                 json!({
                     "worker": worker_json_with_execution(
-                    "embedded-worker-runtime",
+                    "remote:primary",
                     "worker-stale",
                     "stale",
                     "unconnected",
@@ -4110,12 +4176,15 @@ mod tests {
             ),
         ]);
         let registry = RuntimeRegistry::new(vec![Arc::new(
-            RemoteWorkerRuntime::new(RemoteRuntimeConfig::new(
-                "remote:primary",
-                "Remote Primary",
-                base_url,
-                Some("secret-token-do-not-leak".to_string()),
-            ))
+            RemoteWorkerRuntime::new(
+                RemoteRuntimeConfig::new(
+                    "remote:primary",
+                    "Remote Primary",
+                    base_url,
+                    Some("secret-token-do-not-leak".to_string()),
+                ),
+                "http://127.0.0.1:8787".to_string(),
+            )
             .unwrap(),
         )]);
 
@@ -4181,12 +4250,15 @@ mod tests {
         ]);
         let registry = RuntimeRegistry::new(Vec::new());
         registry.register(
-            RemoteWorkerRuntime::new(RemoteRuntimeConfig::new(
-                "remote:primary",
-                "Remote Primary",
-                base_url,
-                Some("secret-token".to_string()),
-            ))
+            RemoteWorkerRuntime::new(
+                RemoteRuntimeConfig::new(
+                    "remote:primary",
+                    "Remote Primary",
+                    base_url,
+                    Some("secret-token".to_string()),
+                ),
+                "http://127.0.0.1:8787".to_string(),
+            )
             .unwrap(),
         );
 
@@ -4227,12 +4299,15 @@ mod tests {
         )]);
         let registry = RuntimeRegistry::new(Vec::new());
         registry.register(
-            RemoteWorkerRuntime::new(RemoteRuntimeConfig::new(
-                "remote:primary",
-                "Remote Primary",
-                base_url,
-                Some("secret-token".to_string()),
-            ))
+            RemoteWorkerRuntime::new(
+                RemoteRuntimeConfig::new(
+                    "remote:primary",
+                    "Remote Primary",
+                    base_url,
+                    Some("secret-token".to_string()),
+                ),
+                "http://127.0.0.1:8787".to_string(),
+            )
             .unwrap(),
         );
 
@@ -4340,6 +4415,12 @@ mod tests {
             "execution": { "backend": backend, "run_state": run_state, "last_result": last_result },
             "intent": { "kind": "role", "role": "coder", "purpose": "remote test" },
             "profile": { "kind": "builtin", "value": "coder" },
+            "profile_source": {
+                "id": "remote-profile-source",
+                "digest": "remote-profile-digest",
+                "size_bytes": 0,
+                "source_graph": { "source_count": 0, "total_source_bytes": 0, "entrypoints": {}, "import_count": 0 }
+            },
             "config_bundle": { "id": "remote-bundle", "digest": "remote-digest" },
             "transcript_len": 0,
             "last_event_id": 0

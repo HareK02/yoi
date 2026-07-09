@@ -1,10 +1,11 @@
 use crate::execution::WorkerExecutionStatus;
 use crate::identity::{RuntimeId, WorkerId, WorkerRef};
 use crate::interaction::WorkerInput;
+use crate::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveRef};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Profile selector boundary. This is a selector, not a resolved config bundle.
+/// Profile selector boundary. This is a selector, not a resolved runtime config.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ProfileSelector {
@@ -19,7 +20,36 @@ impl Default for ProfileSelector {
     }
 }
 
-/// Backend-synced config bundle reference used during Worker creation.
+/// Runtime fetch/caching metadata for a Backend-authored Decodal profile source archive.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileSourceArchiveHttpRef {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    pub archive: ProfileSourceArchiveRef,
+}
+
+/// Profile source material available to a Runtime during Worker creation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProfileSourceArchiveSource {
+    /// Backend-internal embedded runtimes may receive already-built archive bytes.
+    Embedded { archive: ProfileSourceArchive },
+    /// Standalone runtimes fetch/cache the tar archive over HTTP.
+    Http {
+        location: ProfileSourceArchiveHttpRef,
+    },
+}
+
+impl ProfileSourceArchiveSource {
+    pub fn reference(&self) -> ProfileSourceArchiveRef {
+        match self {
+            Self::Embedded { archive } => archive.reference.clone(),
+            Self::Http { location } => location.archive.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigBundleRef {
     pub id: String,
@@ -139,16 +169,17 @@ pub struct WorkingDirectoryStatus {
 ///
 /// Browser/product launch semantics are resolved by a backend before this
 /// request is built. The request contains only durable Runtime identity inputs:
-/// a backend-decided profile selector, a previously synced ConfigBundle identity,
-/// optional initial user input that is committed in the same transaction as
-/// Worker catalog/transcript persistence, and an optional working directory
-/// request that preserves RepositoryPoint-style semantics for runtime-side
-/// materialization. Browser-facing status for materialized working directories is
-/// summarized without exposing raw host paths.
+/// a backend-decided profile selector, the Decodal profile source archive source
+/// used to resolve that selector, optional initial user input committed with the
+/// Worker catalog/transcript persistence, and an optional Runtime-owned working
+/// directory binding. Browser-facing status for materialized working directories
+/// is summarized without exposing raw host paths.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateWorkerRequest {
     pub profile: ProfileSelector,
-    pub config_bundle: ConfigBundleRef,
+    pub profile_source: ProfileSourceArchiveSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_bundle: Option<ConfigBundleRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_input: Option<WorkerInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -181,7 +212,9 @@ pub struct WorkerSummary {
     pub status: WorkerStatus,
     pub execution: WorkerExecutionStatus,
     pub profile: ProfileSelector,
-    pub config_bundle: ConfigBundleRef,
+    pub profile_source: ProfileSourceArchiveRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_bundle: Option<ConfigBundleRef>,
     pub transcript_len: usize,
     pub last_event_id: u64,
 }
@@ -195,7 +228,9 @@ pub struct WorkerDetail {
     pub status: WorkerStatus,
     pub execution: WorkerExecutionStatus,
     pub profile: ProfileSelector,
-    pub config_bundle: ConfigBundleRef,
+    pub profile_source: ProfileSourceArchiveRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_bundle: Option<ConfigBundleRef>,
     pub transcript_len: usize,
     pub last_event_id: u64,
 }
