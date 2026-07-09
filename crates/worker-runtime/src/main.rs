@@ -123,8 +123,14 @@ fn working_directory_runtime_root(config: &ProcessConfig) -> PathBuf {
         _ => config
             .worker_runtime_base_dir
             .clone()
-            .unwrap_or_else(|| env::temp_dir().join("yoi-worker-runtime")),
+            .unwrap_or_else(default_working_directory_runtime_root),
     }
+}
+
+fn default_working_directory_runtime_root() -> PathBuf {
+    manifest::paths::data_dir()
+        .map(|data_dir| data_dir.join("worker-runtime"))
+        .unwrap_or_else(|| env::temp_dir().join("yoi-worker-runtime"))
 }
 
 fn runtime_options_from_http(config: &RuntimeHttpServerConfig) -> RuntimeOptions {
