@@ -4,6 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use worker_runtime::config_bundle::{
     ConfigBundle, ConfigBundleMetadata, ConfigBundleProvenance, ConfigProfileDescriptor,
 };
@@ -14,6 +15,8 @@ use crate::{Error, Result};
 
 const PROFILE_REGISTRY_RELATIVE_PATH: &str = ".yoi/profiles.toml";
 const PROFILE_SOURCE_ROOT_RELATIVE_PATH: &str = ".yoi/profiles";
+const PROFILE_SOURCE_TREE_ID: &str = "project";
+const PROFILE_SOURCE_TREE_DISPLAY_ROOT: &str = "profiles";
 const MAX_PROFILE_SOURCE_BYTES: u64 = 256 * 1024;
 const BUILTIN_PROFILE_IDS: &[&str] = &[
     "builtin:default",
@@ -63,6 +66,8 @@ pub struct ProfileSettingsResponse {
     pub default_profile: Option<String>,
     pub profiles: Vec<WorkspaceProfileSummary>,
     pub sources: Vec<WorkspaceProfileSourceSummary>,
+    #[serde(default)]
+    pub source_trees: Vec<WorkspaceProfileSourceTreeSummary>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -86,9 +91,63 @@ pub struct WorkspaceProfileSourceSummary {
     pub profile_source_id: String,
     pub display_path: String,
     pub kind: String,
+    pub content_type: String,
+    pub content_digest: String,
+    pub provenance: WorkspaceProfileSourceProvenance,
     pub editable: bool,
     pub revision: String,
     pub size_bytes: u64,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceProfileSourceProvenance {
+    ProjectProfileSourceTree,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceProfileSourceTreeSummary {
+    pub source_tree_id: String,
+    pub label: String,
+    pub root_path: String,
+    pub kind: String,
+    pub content_type: String,
+    pub content_digest: String,
+    pub provenance: WorkspaceProfileSourceProvenance,
+    pub editable: bool,
+    pub revision: String,
+    pub file_count: usize,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceProfileSourceTreeFileSummary {
+    pub path: String,
+    pub kind: String,
+    pub content_type: String,
+    pub content_digest: String,
+    pub provenance: WorkspaceProfileSourceProvenance,
+    pub editable: bool,
+    pub revision: String,
+    pub size_bytes: u64,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceProfileSourceTreeResponse {
+    pub workspace_id: String,
+    pub tree: WorkspaceProfileSourceTreeSummary,
+    pub files: Vec<WorkspaceProfileSourceTreeFileSummary>,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceProfileSourceTreeFileResponse {
+    pub workspace_id: String,
+    pub source_tree_id: String,
+    pub file: WorkspaceProfileSourceTreeFileSummary,
+    pub content: String,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -135,6 +194,28 @@ pub struct WorkspaceProfileRegistryEntryUpdate {
 pub struct UpdateWorkspaceProfileSourceRequest {
     pub content: String,
     pub revision: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriteWorkspaceProfileTreeFileRequest {
+    pub path: String,
+    pub content: String,
+    #[serde(default)]
+    pub revision: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteWorkspaceProfileTreeFileRequest {
+    pub path: String,
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadWorkspaceProfileTreeFileQuery {
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -355,6 +436,7 @@ pub fn load_profile_settings(workspace_id: &str, workspace_root: &Path) -> Profi
         default_profile: registry.default,
         profiles,
         sources,
+        source_trees: vec![profile_source_tree_summary(workspace_root)],
         diagnostics,
     }
 }
@@ -422,10 +504,7 @@ pub fn create_profile_source(
         .join("profiles")
         .join(format!("{name}.dcdl"));
     validate_source_content(workspace_root, &name, &relative_path, &request.content)?;
-    let full = checked_source_path(workspace_root, &relative_path)?;
-    if let Some(parent) = full.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let full = prepare_source_path_for_write(workspace_root, &relative_path)?;
     fs::write(&full, request.content)?;
     registry.profile.insert(
         name.clone(),
@@ -580,6 +659,111 @@ pub fn delete_profile_source(
     })
 }
 
+pub fn read_profile_source_tree(
+    workspace_id: &str,
+    workspace_root: &Path,
+    source_tree_id: &str,
+) -> Result<WorkspaceProfileSourceTreeResponse> {
+    ensure_profile_source_tree_id(source_tree_id)?;
+    let files = list_profile_tree_files(workspace_root)?;
+    Ok(WorkspaceProfileSourceTreeResponse {
+        workspace_id: workspace_id.to_string(),
+        tree: profile_source_tree_summary_with_count(workspace_root, files.len()),
+        files,
+        diagnostics: Vec::new(),
+    })
+}
+
+pub fn read_profile_tree_file(
+    workspace_id: &str,
+    workspace_root: &Path,
+    source_tree_id: &str,
+    query: ReadWorkspaceProfileTreeFileQuery,
+) -> Result<WorkspaceProfileSourceTreeFileResponse> {
+    ensure_profile_source_tree_id(source_tree_id)?;
+    let relative_path = relative_source_path_for_virtual_path(&query.path)?;
+    let full = checked_source_path(workspace_root, &relative_path)?;
+    let metadata = source_metadata(&full)?;
+    if metadata.len() > MAX_PROFILE_SOURCE_BYTES {
+        return Err(profile_validation_error(
+            "profile_source_too_large",
+            "Profile source is too large for browser editing",
+        ));
+    }
+    let content = fs::read_to_string(&full)?;
+    Ok(WorkspaceProfileSourceTreeFileResponse {
+        workspace_id: workspace_id.to_string(),
+        source_tree_id: source_tree_id.to_string(),
+        file: summarize_tree_file(&full, display_source_path(&relative_path)),
+        content,
+        diagnostics: Vec::new(),
+    })
+}
+
+pub fn write_profile_tree_file(
+    workspace_id: &str,
+    workspace_root: &Path,
+    source_tree_id: &str,
+    request: WriteWorkspaceProfileTreeFileRequest,
+) -> Result<WorkspaceProfileSourceTreeFileResponse> {
+    ensure_profile_source_tree_id(source_tree_id)?;
+    if request.content.as_bytes().len() as u64 > MAX_PROFILE_SOURCE_BYTES {
+        return Err(profile_validation_error(
+            "profile_source_too_large",
+            "Profile source exceeds the browser editing size limit",
+        ));
+    }
+    let relative_path = relative_source_path_for_virtual_path(&request.path)?;
+    let full = prepare_source_path_for_write(workspace_root, &relative_path)?;
+    if let Some(expected) = request.revision.as_deref() {
+        ensure_revision(&full, expected, "profile_source_revision_conflict")?;
+    } else if full.exists() {
+        return Err(profile_validation_error(
+            "profile_source_revision_required",
+            "Existing profile source edits require a revision token",
+        ));
+    }
+    validate_tree_content(workspace_root, &relative_path, &request.content)?;
+    fs::write(&full, &request.content)?;
+    Ok(WorkspaceProfileSourceTreeFileResponse {
+        workspace_id: workspace_id.to_string(),
+        source_tree_id: source_tree_id.to_string(),
+        file: summarize_tree_file(&full, display_source_path(&relative_path)),
+        content: request.content,
+        diagnostics: vec![diagnostic(
+            "profile_source_file_written",
+            DiagnosticSeverity::Info,
+            "Profile source file was written through the source tree API.",
+        )],
+    })
+}
+
+pub fn delete_profile_tree_file(
+    workspace_id: &str,
+    workspace_root: &Path,
+    source_tree_id: &str,
+    request: DeleteWorkspaceProfileTreeFileRequest,
+) -> Result<WorkspaceProfileSourceTreeResponse> {
+    ensure_profile_source_tree_id(source_tree_id)?;
+    let relative_path = relative_source_path_for_virtual_path(&request.path)?;
+    let full = checked_source_path(workspace_root, &relative_path)?;
+    ensure_revision(&full, &request.revision, "profile_source_revision_conflict")?;
+    let registry = read_registry(workspace_root).map_err(profile_registry_error)?;
+    if project_entries(&registry, &mut Vec::new())
+        .iter()
+        .any(|entry| entry.relative_path == relative_path)
+    {
+        return Err(profile_validation_error(
+            "profile_source_registered",
+            "Registered profile entry sources must be deleted through the profile registry API",
+        ));
+    }
+    if full.exists() {
+        fs::remove_file(full)?;
+    }
+    read_profile_source_tree(workspace_id, workspace_root, source_tree_id)
+}
+
 pub fn build_workspace_profile_archive(
     workspace_root: &Path,
     selector: &str,
@@ -588,43 +772,8 @@ pub fn build_workspace_profile_archive(
         return Ok(None);
     }
     let registry = read_registry(workspace_root).map_err(profile_registry_error)?;
-    let mut entrypoints = BTreeMap::new();
-    let mut sources = BTreeMap::new();
-    for entry in project_entries(&registry, &mut Vec::new()) {
-        let path = archive_path_for_entry(&entry.name);
-        let full = checked_source_path(workspace_root, &entry.relative_path)?;
-        let content = fs::read_to_string(&full)?;
-        sources.insert(path.clone(), content);
-        entrypoints.insert(project_selector(&entry.name), path);
-    }
-    if !entrypoints.contains_key(selector) {
-        return Err(Error::RuntimeOperationFailed {
-            runtime_id: "workspace-backend".to_string(),
-            code: "unknown_profile_selector".to_string(),
-            message: "Selected project profile is not present in the workspace profile registry"
-                .to_string(),
-        });
-    }
-    if let Some(default) = registry
-        .default
-        .as_deref()
-        .filter(|value| value.starts_with("project:"))
-    {
-        if let Some(path) = entrypoints.get(default).cloned() {
-            entrypoints.insert("default".to_string(), path);
-        }
-    }
-    let archive = ProfileSourceArchive::build(ProfileSourceArchiveInput {
-        id: "workspace-project-decodal-profiles-v1".to_string(),
-        entrypoints,
-        imports: BTreeMap::new(),
-        sources,
-    })
-    .map_err(|err| Error::RuntimeOperationFailed {
-        runtime_id: "workspace-backend".to_string(),
-        code: "profile_source_archive_invalid".to_string(),
-        message: err.to_string(),
-    })?;
+    let sources = read_profile_source_tree_contents(workspace_root)?;
+    let archive = build_profile_archive_for_selector(&registry, sources, selector)?;
     archive
         .verify()
         .and_then(|verified| {
@@ -845,6 +994,410 @@ fn validate_registry_default(registry: &ProfileRegistryDocument) -> Result<()> {
     ))
 }
 
+fn profile_source_tree_summary(workspace_root: &Path) -> WorkspaceProfileSourceTreeSummary {
+    let file_count = list_profile_tree_files(workspace_root)
+        .map(|files| files.len())
+        .unwrap_or(0);
+    profile_source_tree_summary_with_count(workspace_root, file_count)
+}
+
+fn profile_source_tree_summary_with_count(
+    workspace_root: &Path,
+    file_count: usize,
+) -> WorkspaceProfileSourceTreeSummary {
+    WorkspaceProfileSourceTreeSummary {
+        source_tree_id: PROFILE_SOURCE_TREE_ID.to_string(),
+        label: "Project profile sources".to_string(),
+        root_path: PROFILE_SOURCE_TREE_DISPLAY_ROOT.to_string(),
+        kind: "decodal_source_tree".to_string(),
+        content_type: "application/vnd.yoi.profile-source-tree+json".to_string(),
+        content_digest: profile_source_tree_digest(workspace_root)
+            .unwrap_or_else(|_| "sha256:unavailable".to_string()),
+        provenance: WorkspaceProfileSourceProvenance::ProjectProfileSourceTree,
+        editable: true,
+        revision: file_revision(&workspace_root.join(PROFILE_SOURCE_ROOT_RELATIVE_PATH)),
+        file_count,
+        diagnostics: Vec::new(),
+    }
+}
+
+fn ensure_profile_source_tree_id(source_tree_id: &str) -> Result<()> {
+    if source_tree_id == PROFILE_SOURCE_TREE_ID {
+        Ok(())
+    } else {
+        Err(Error::RuntimeOperationFailed {
+            runtime_id: "workspace-backend".to_string(),
+            code: "unknown_profile_source_tree".to_string(),
+            message: "Unknown profile source tree".to_string(),
+        })
+    }
+}
+
+fn list_profile_tree_files(
+    workspace_root: &Path,
+) -> Result<Vec<WorkspaceProfileSourceTreeFileSummary>> {
+    let Some(source_root) = existing_profile_source_root(workspace_root)? else {
+        return Ok(Vec::new());
+    };
+    let mut files = Vec::new();
+    collect_profile_tree_files(workspace_root, &source_root, &source_root.path, &mut files)?;
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+fn collect_profile_tree_files(
+    workspace_root: &Path,
+    source_root: &ProfileSourceRoot,
+    dir: &Path,
+    files: &mut Vec<WorkspaceProfileSourceTreeFileSummary>,
+) -> Result<()> {
+    let canonical_dir = fs::canonicalize(dir)?;
+    if !canonical_dir.starts_with(&source_root.canonical_path) {
+        return Err(profile_source_symlink_escape(
+            "Profile source directory resolves outside the workspace profile source root",
+        ));
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(profile_source_symlink_escape(
+                "Profile source tree entries must not be symlinks",
+            ));
+        }
+        if file_type.is_dir() {
+            collect_profile_tree_files(workspace_root, source_root, &path, files)?;
+        } else if file_type.is_file()
+            && path.extension().and_then(|value| value.to_str()) == Some("dcdl")
+        {
+            let canonical_file = fs::canonicalize(&path)?;
+            if !canonical_file.starts_with(&source_root.canonical_path)
+                || !canonical_file.starts_with(&source_root.canonical_workspace)
+            {
+                return Err(profile_source_symlink_escape(
+                    "Profile source file resolves outside the workspace profile source root",
+                ));
+            }
+            let relative = path
+                .strip_prefix(workspace_root)
+                .map_err(|_| {
+                    profile_validation_error(
+                        "profile_source_path_invalid",
+                        "Profile source is outside workspace",
+                    )
+                })?
+                .to_path_buf();
+            files.push(summarize_tree_file(&path, display_source_path(&relative)));
+        }
+    }
+    Ok(())
+}
+
+fn summarize_tree_file(path: &Path, virtual_path: String) -> WorkspaceProfileSourceTreeFileSummary {
+    WorkspaceProfileSourceTreeFileSummary {
+        path: virtual_path,
+        kind: "decodal".to_string(),
+        content_type: "text/x-decodal".to_string(),
+        content_digest: file_content_digest(path),
+        provenance: WorkspaceProfileSourceProvenance::ProjectProfileSourceTree,
+        editable: true,
+        revision: file_revision(path),
+        size_bytes: source_metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0),
+        diagnostics: Vec::new(),
+    }
+}
+
+fn relative_source_path_for_virtual_path(virtual_path: &str) -> Result<PathBuf> {
+    let normalized = normalize_virtual_profile_source_path(virtual_path)?;
+    let Some(rest) = normalized.strip_prefix("profiles/") else {
+        return Err(profile_validation_error(
+            "profile_source_path_invalid",
+            "Profile source paths must be under profiles/",
+        ));
+    };
+    if rest.is_empty() || !rest.ends_with(".dcdl") {
+        return Err(profile_validation_error(
+            "profile_source_path_invalid",
+            "Profile source files must use the .dcdl extension",
+        ));
+    }
+    Ok(Path::new(PROFILE_SOURCE_ROOT_RELATIVE_PATH).join(rest))
+}
+
+fn display_source_path(relative_path: &Path) -> String {
+    let profile_root = Path::new(PROFILE_SOURCE_ROOT_RELATIVE_PATH);
+    let relative = relative_path
+        .strip_prefix(profile_root)
+        .unwrap_or(relative_path);
+    let rest = relative.to_string_lossy().replace('\\', "/");
+    format!("{PROFILE_SOURCE_TREE_DISPLAY_ROOT}/{rest}")
+}
+
+fn normalize_virtual_profile_source_path(path: &str) -> Result<String> {
+    let path = path
+        .strip_prefix("project:")
+        .or_else(|| path.strip_prefix("workspace:"))
+        .unwrap_or(path);
+    if path.is_empty() || path.contains("://") || Path::new(path).is_absolute() {
+        return Err(profile_validation_error(
+            "profile_source_path_invalid",
+            "Profile source path must be a virtual relative path",
+        ));
+    }
+    let mut normalized = PathBuf::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => normalized.push(value),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(profile_validation_error(
+                    "profile_source_path_invalid",
+                    "Profile source path must not escape the virtual source tree",
+                ));
+            }
+        }
+    }
+    let normalized = normalized.to_string_lossy().replace('\\', "/");
+    if normalized.is_empty() {
+        return Err(profile_validation_error(
+            "profile_source_path_invalid",
+            "Profile source path must not be empty",
+        ));
+    }
+    Ok(normalized)
+}
+
+fn read_profile_source_tree_contents(workspace_root: &Path) -> Result<BTreeMap<String, String>> {
+    let mut sources = BTreeMap::new();
+    for file in list_profile_tree_files(workspace_root)? {
+        let relative = relative_source_path_for_virtual_path(&file.path)?;
+        let full = checked_source_path(workspace_root, &relative)?;
+        sources.insert(file.path, fs::read_to_string(full)?);
+    }
+    Ok(sources)
+}
+
+fn build_profile_archive_from_tree_sources(
+    registry: &ProfileRegistryDocument,
+    sources: BTreeMap<String, String>,
+) -> Result<(ProfileSourceArchive, BTreeMap<String, String>)> {
+    let mut entrypoints = BTreeMap::new();
+    for entry in project_entries(registry, &mut Vec::new()) {
+        let path = display_source_path(&entry.relative_path);
+        if sources.contains_key(&path) {
+            entrypoints.insert(project_selector(&entry.name), path);
+        }
+    }
+    if let Some(default) = registry
+        .default
+        .as_deref()
+        .filter(|value| value.starts_with("project:"))
+    {
+        if let Some(path) = entrypoints.get(default).cloned() {
+            entrypoints.insert("default".to_string(), path);
+        }
+    }
+    build_profile_archive_from_source_set(entrypoints, sources)
+}
+
+fn build_profile_archive_for_selector(
+    registry: &ProfileRegistryDocument,
+    sources: BTreeMap<String, String>,
+    selector: &str,
+) -> Result<ProfileSourceArchive> {
+    let Some(name) = selector.strip_prefix("project:") else {
+        return Err(profile_validation_error(
+            "profile_selector_invalid",
+            "Project profile archive selector must use project:*",
+        ));
+    };
+    let entry = project_entries(registry, &mut Vec::new())
+        .into_iter()
+        .find(|entry| entry.name == name)
+        .ok_or_else(|| {
+            profile_validation_error(
+                "unknown_profile_selector",
+                "Selected project profile is not present in the workspace profile registry",
+            )
+        })?;
+    let root_path = display_source_path(&entry.relative_path);
+    if !sources.contains_key(&root_path) {
+        return Err(profile_validation_error(
+            "profile_source_missing",
+            "Selected project profile source is missing from the source tree",
+        ));
+    }
+    let mut closure_sources = BTreeMap::new();
+    let mut imports = BTreeMap::new();
+    collect_profile_import_closure(&root_path, &sources, &mut closure_sources, &mut imports)?;
+    let mut entrypoints = BTreeMap::new();
+    entrypoints.insert(selector.to_string(), root_path);
+    build_profile_archive_from_source_set_with_imports(entrypoints, closure_sources, imports)
+}
+
+fn collect_profile_import_closure(
+    current_path: &str,
+    all_sources: &BTreeMap<String, String>,
+    closure_sources: &mut BTreeMap<String, String>,
+    imports: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    if closure_sources.contains_key(current_path) {
+        return Ok(());
+    }
+    let content = all_sources.get(current_path).ok_or_else(|| {
+        profile_validation_error(
+            "profile_source_import_missing",
+            &format!("Profile source import closure is missing {current_path}"),
+        )
+    })?;
+    closure_sources.insert(current_path.to_string(), content.clone());
+    for specifier in collect_decodal_import_specifiers(content) {
+        let target = resolve_profile_source_import(current_path, &specifier)?;
+        if !all_sources.contains_key(&target) {
+            return Err(profile_validation_error(
+                "profile_source_import_missing",
+                &format!(
+                    "Profile source import {specifier:?} from {current_path} resolves to missing {target}"
+                ),
+            ));
+        }
+        imports.insert(format!("{current_path}\0{specifier}"), target.clone());
+        collect_profile_import_closure(&target, all_sources, closure_sources, imports)?;
+    }
+    Ok(())
+}
+
+fn build_profile_archive_from_source_set(
+    entrypoints: BTreeMap<String, String>,
+    sources: BTreeMap<String, String>,
+) -> Result<(ProfileSourceArchive, BTreeMap<String, String>)> {
+    let mut imports = BTreeMap::new();
+    let source_snapshot = sources.clone();
+    for (current_path, content) in &source_snapshot {
+        for specifier in collect_decodal_import_specifiers(content) {
+            let target = resolve_profile_source_import(current_path, &specifier)?;
+            if source_snapshot.contains_key(&target) {
+                imports.insert(format!("{current_path}\0{specifier}"), target);
+            } else {
+                return Err(profile_validation_error(
+                    "profile_source_import_missing",
+                    &format!(
+                        "Profile source import {specifier:?} from {current_path} resolves to missing {target}"
+                    ),
+                ));
+            }
+        }
+    }
+    build_profile_archive_from_source_set_with_imports(entrypoints, sources, imports.clone())
+        .map(|archive| (archive, imports))
+}
+
+fn build_profile_archive_from_source_set_with_imports(
+    entrypoints: BTreeMap<String, String>,
+    mut sources: BTreeMap<String, String>,
+    imports: BTreeMap<String, String>,
+) -> Result<ProfileSourceArchive> {
+    if sources.is_empty() {
+        sources.insert("profiles/.empty.dcdl".to_string(), "{}".to_string());
+    }
+    ProfileSourceArchive::build(ProfileSourceArchiveInput {
+        id: "workspace-project-decodal-profiles-v1".to_string(),
+        entrypoints,
+        imports,
+        sources,
+    })
+    .map_err(|err| Error::RuntimeOperationFailed {
+        runtime_id: "workspace-backend".to_string(),
+        code: "profile_source_archive_invalid".to_string(),
+        message: err.to_string(),
+    })
+}
+
+fn resolve_profile_source_import(current_path: &str, specifier: &str) -> Result<String> {
+    if specifier.is_empty() || specifier.contains("://") || Path::new(specifier).is_absolute() {
+        return Err(profile_validation_error(
+            "profile_source_import_invalid",
+            "Profile source import must be a virtual relative path",
+        ));
+    }
+    let raw = specifier
+        .strip_prefix("project:")
+        .or_else(|| specifier.strip_prefix("workspace:"))
+        .unwrap_or(specifier);
+    if specifier.contains(':') && raw == specifier {
+        return Err(profile_validation_error(
+            "profile_source_import_invalid",
+            "Unsupported profile source import namespace",
+        ));
+    }
+    let base = if raw.starts_with("profiles/") || raw.starts_with("./profiles/") {
+        PathBuf::from(raw)
+    } else {
+        Path::new(current_path)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default()
+            .join(raw)
+    };
+    let normalized = normalize_virtual_profile_source_path(&base.to_string_lossy())?;
+    if !normalized.starts_with("profiles/") {
+        return Err(profile_validation_error(
+            "profile_source_import_invalid",
+            "Profile source import must resolve inside the profiles/ tree",
+        ));
+    }
+    Ok(normalized)
+}
+
+fn collect_decodal_import_specifiers(content: &str) -> Vec<String> {
+    let mut specifiers = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(index) = trimmed.find("import") else {
+            continue;
+        };
+        let after = trimmed[index + "import".len()..].trim_start();
+        let Some(first) = after.chars().next() else {
+            continue;
+        };
+        if first == '"' || first == '\'' {
+            if let Some(end) = after[1..].find(first) {
+                specifiers.push(after[1..1 + end].to_string());
+            }
+        } else {
+            let ident: String = after
+                .chars()
+                .take_while(|ch| !ch.is_whitespace() && *ch != ';' && *ch != ',' && *ch != '{')
+                .collect();
+            if !ident.is_empty() {
+                specifiers.push(ident);
+            }
+        }
+    }
+    specifiers
+}
+
+fn validate_tree_content(workspace_root: &Path, relative_path: &Path, content: &str) -> Result<()> {
+    let mut sources = read_profile_source_tree_contents(workspace_root)?;
+    sources.insert(display_source_path(relative_path), content.to_string());
+    let registry = read_registry(workspace_root).map_err(profile_registry_error)?;
+    let (archive, _) = build_profile_archive_from_tree_sources(&registry, sources)?;
+    archive
+        .verify()
+        .map_err(|err| Error::RuntimeOperationFailed {
+            runtime_id: "workspace-backend".to_string(),
+            code: "profile_source_invalid".to_string(),
+            message: err.to_string(),
+        })?;
+    Ok(())
+}
+
 fn validate_source_content(
     workspace_root: &Path,
     name: &str,
@@ -858,24 +1411,18 @@ fn validate_source_content(
             message: "Profile source exceeds the browser editing size limit".to_string(),
         });
     }
-    let archive_path = archive_path_for_entry(name);
+    validate_source_candidate_path(workspace_root, relative_path)?;
+    let mut sources = read_profile_source_tree_contents(workspace_root)?;
+    sources.insert(display_source_path(relative_path), content.to_string());
+    let mut registry = read_registry(workspace_root).map_err(profile_registry_error)?;
+    registry.profile.entry(name.to_string()).or_insert_with(|| {
+        ProfileEntryFile::Table(ProfileEntryTable {
+            path: display_source_path(relative_path),
+            description: None,
+        })
+    });
     let selector = project_selector(name);
-    let mut entrypoints = BTreeMap::new();
-    entrypoints.insert(selector.clone(), archive_path.clone());
-    entrypoints.insert("default".to_string(), archive_path.clone());
-    let mut sources = BTreeMap::new();
-    sources.insert(archive_path, content.to_string());
-    let archive = ProfileSourceArchive::build(ProfileSourceArchiveInput {
-        id: format!("workspace-profile-validation-{name}"),
-        entrypoints,
-        imports: BTreeMap::new(),
-        sources,
-    })
-    .map_err(|err| Error::RuntimeOperationFailed {
-        runtime_id: "workspace-backend".to_string(),
-        code: "profile_source_archive_invalid".to_string(),
-        message: err.to_string(),
-    })?;
+    let (archive, _) = build_profile_archive_from_tree_sources(&registry, sources)?;
     let verified = archive
         .verify()
         .map_err(|err| Error::RuntimeOperationFailed {
@@ -883,7 +1430,6 @@ fn validate_source_content(
             code: "profile_source_archive_invalid".to_string(),
             message: err.to_string(),
         })?;
-    checked_source_path(workspace_root, relative_path)?;
     verified
         .resolve_profile(&selector, workspace_root, "workspace-settings-validation")
         .map_err(|err| Error::RuntimeOperationFailed {
@@ -937,6 +1483,11 @@ fn summarize_source(
         profile_source_id: source_id.to_string(),
         display_path,
         kind: "decodal".to_string(),
+        content_type: "text/x-decodal".to_string(),
+        content_digest: checked_source_path(workspace_root, relative_path)
+            .map(|path| file_content_digest(&path))
+            .unwrap_or_else(|_| "sha256:unavailable".to_string()),
+        provenance: WorkspaceProfileSourceProvenance::ProjectProfileSourceTree,
         editable: diagnostics
             .iter()
             .all(|d| d.severity != DiagnosticSeverity::Error),
@@ -1074,6 +1625,208 @@ fn validate_relative_source_path(path: &Path) -> std::result::Result<(), String>
     Ok(())
 }
 
+fn profile_source_tree_digest(workspace_root: &Path) -> Result<String> {
+    let mut bytes = Vec::new();
+    for file in list_profile_tree_files(workspace_root)? {
+        bytes.extend_from_slice(file.path.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(file.content_digest.as_bytes());
+        bytes.push(0);
+    }
+    Ok(sha256_hex(&bytes))
+}
+
+fn file_content_digest(path: &Path) -> String {
+    fs::read(path)
+        .map(|bytes| sha256_hex(&bytes))
+        .unwrap_or_else(|_| "sha256:unavailable".to_string())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::from("sha256:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+#[derive(Debug, Clone)]
+struct ProfileSourceRoot {
+    path: PathBuf,
+    canonical_path: PathBuf,
+    canonical_workspace: PathBuf,
+}
+
+fn profile_source_symlink_escape(message: impl Into<String>) -> Error {
+    Error::RuntimeOperationFailed {
+        runtime_id: "workspace-backend".to_string(),
+        code: "profile_source_symlink_escape".to_string(),
+        message: message.into(),
+    }
+}
+
+fn existing_profile_source_root(workspace_root: &Path) -> Result<Option<ProfileSourceRoot>> {
+    let source_root = workspace_root.join(PROFILE_SOURCE_ROOT_RELATIVE_PATH);
+    let metadata = match fs::symlink_metadata(&source_root) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    validate_profile_source_root_metadata(workspace_root, source_root, metadata).map(Some)
+}
+
+fn prepare_profile_source_root_for_write(workspace_root: &Path) -> Result<ProfileSourceRoot> {
+    let canonical_workspace = fs::canonicalize(workspace_root)?;
+    let yoi_dir = workspace_root.join(".yoi");
+    match fs::symlink_metadata(&yoi_dir) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(profile_source_symlink_escape(
+                    "Workspace .yoi directory must not be a symlink",
+                ));
+            }
+            if !metadata.is_dir() {
+                return Err(profile_validation_error(
+                    "profile_source_path_invalid",
+                    "Workspace .yoi path is not a directory",
+                ));
+            }
+            let canonical_yoi = fs::canonicalize(&yoi_dir)?;
+            if !canonical_yoi.starts_with(&canonical_workspace) {
+                return Err(profile_source_symlink_escape(
+                    "Workspace .yoi directory resolves outside the workspace root",
+                ));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&yoi_dir)?,
+        Err(err) => return Err(err.into()),
+    }
+
+    let source_root = workspace_root.join(PROFILE_SOURCE_ROOT_RELATIVE_PATH);
+    match fs::symlink_metadata(&source_root) {
+        Ok(metadata) => {
+            validate_profile_source_root_metadata(workspace_root, source_root, metadata)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&source_root)?;
+            let metadata = fs::symlink_metadata(&source_root)?;
+            validate_profile_source_root_metadata(workspace_root, source_root, metadata)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn validate_profile_source_root_metadata(
+    workspace_root: &Path,
+    source_root: PathBuf,
+    metadata: std::fs::Metadata,
+) -> Result<ProfileSourceRoot> {
+    if metadata.file_type().is_symlink() {
+        return Err(profile_source_symlink_escape(
+            "Workspace profile source root must not be a symlink",
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(profile_validation_error(
+            "profile_source_path_invalid",
+            "Workspace profile source root is not a directory",
+        ));
+    }
+    let canonical_workspace = fs::canonicalize(workspace_root)?;
+    let canonical_path = fs::canonicalize(&source_root)?;
+    if !canonical_path.starts_with(&canonical_workspace) {
+        return Err(profile_source_symlink_escape(
+            "Workspace profile source root resolves outside the workspace root",
+        ));
+    }
+    Ok(ProfileSourceRoot {
+        path: source_root,
+        canonical_path,
+        canonical_workspace,
+    })
+}
+
+fn validate_source_candidate_path(workspace_root: &Path, relative_path: &Path) -> Result<()> {
+    validate_relative_source_path(relative_path).map_err(|message| {
+        Error::RuntimeOperationFailed {
+            runtime_id: "workspace-backend".to_string(),
+            code: "profile_source_path_escape".to_string(),
+            message,
+        }
+    })?;
+    let Some(_) = existing_profile_source_root(workspace_root)? else {
+        return Ok(());
+    };
+    let full = workspace_root.join(relative_path);
+    if full.exists() || full.parent().is_some_and(Path::exists) {
+        checked_source_path(workspace_root, relative_path)?;
+    }
+    Ok(())
+}
+
+fn prepare_source_path_for_write(workspace_root: &Path, relative_path: &Path) -> Result<PathBuf> {
+    validate_relative_source_path(relative_path).map_err(|message| {
+        Error::RuntimeOperationFailed {
+            runtime_id: "workspace-backend".to_string(),
+            code: "profile_source_path_escape".to_string(),
+            message,
+        }
+    })?;
+    let source_root = prepare_profile_source_root_for_write(workspace_root)?;
+    let full = workspace_root.join(relative_path);
+    let parent = full.parent().ok_or_else(|| {
+        profile_validation_error(
+            "profile_source_path_invalid",
+            "Profile source path has no parent directory",
+        )
+    })?;
+    let parent_relative = parent.strip_prefix(&source_root.path).map_err(|_| {
+        profile_validation_error(
+            "profile_source_path_escape",
+            "Profile source parent must remain inside the source tree",
+        )
+    })?;
+    let mut current = source_root.path.clone();
+    for component in parent_relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(profile_validation_error(
+                "profile_source_path_escape",
+                "Profile source parent must be a normalized relative path",
+            ));
+        };
+        let next = current.join(name);
+        match fs::symlink_metadata(&next) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(profile_source_symlink_escape(
+                        "Profile source parent contains a symlink",
+                    ));
+                }
+                if !metadata.is_dir() {
+                    return Err(profile_validation_error(
+                        "profile_source_path_invalid",
+                        "Profile source parent component is not a directory",
+                    ));
+                }
+                let canonical_next = fs::canonicalize(&next)?;
+                if !canonical_next.starts_with(&source_root.canonical_path)
+                    || !canonical_next.starts_with(&source_root.canonical_workspace)
+                {
+                    return Err(profile_source_symlink_escape(
+                        "Profile source parent resolves outside the workspace profile source root",
+                    ));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&next)?,
+            Err(err) => return Err(err.into()),
+        }
+        current = next;
+    }
+    checked_source_path(workspace_root, relative_path)
+}
+
 fn checked_source_path(workspace_root: &Path, relative_path: &Path) -> Result<PathBuf> {
     validate_relative_source_path(relative_path).map_err(|message| {
         Error::RuntimeOperationFailed {
@@ -1082,22 +1835,26 @@ fn checked_source_path(workspace_root: &Path, relative_path: &Path) -> Result<Pa
             message,
         }
     })?;
-    let source_root = workspace_root.join(PROFILE_SOURCE_ROOT_RELATIVE_PATH);
-    fs::create_dir_all(&source_root)?;
-    let canonical_root = fs::canonicalize(&source_root)?;
+    let source_root = existing_profile_source_root(workspace_root)?.ok_or_else(|| {
+        profile_validation_error(
+            "profile_source_missing",
+            "Workspace profile source root does not exist",
+        )
+    })?;
     let full = workspace_root.join(relative_path);
     if let Ok(canonical_full) = fs::canonicalize(&full) {
-        if !canonical_full.starts_with(&canonical_root) {
-            return Err(Error::RuntimeOperationFailed {
-                runtime_id: "workspace-backend".to_string(),
-                code: "profile_source_symlink_escape".to_string(),
-                message: "Profile source resolves outside the workspace profile source root"
-                    .to_string(),
-            });
+        if !canonical_full.starts_with(&source_root.canonical_path)
+            || !canonical_full.starts_with(&source_root.canonical_workspace)
+        {
+            return Err(profile_source_symlink_escape(
+                "Profile source resolves outside the workspace profile source root",
+            ));
         }
     } else if let Some(parent) = full.parent() {
         let canonical_parent = fs::canonicalize(parent)?;
-        if !canonical_parent.starts_with(&canonical_root) {
+        if !canonical_parent.starts_with(&source_root.canonical_path)
+            || !canonical_parent.starts_with(&source_root.canonical_workspace)
+        {
             return Err(Error::RuntimeOperationFailed {
                 runtime_id: "workspace-backend".to_string(),
                 code: "profile_source_path_escape".to_string(),
@@ -1177,18 +1934,6 @@ pub fn selector_for_builtin_candidate(
         ),
         _ => None,
     }
-}
-
-fn archive_path_for_entry(name: &str) -> String {
-    format!("profiles/{name}.dcdl")
-}
-
-fn display_source_path(relative_path: &Path) -> String {
-    relative_path
-        .strip_prefix(".yoi")
-        .unwrap_or(relative_path)
-        .to_string_lossy()
-        .replace('\\', "/")
 }
 
 fn registry_path(workspace_root: &Path) -> PathBuf {
@@ -1474,5 +2219,109 @@ mod tests {
         let rendered = err.to_string();
         assert!(rendered.contains("profile_source_symlink_escape"));
         assert!(!rendered.contains(dir.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn selected_profile_archive_contains_only_import_closure() {
+        let mut registry = ProfileRegistryDocument::default();
+        registry.profile.insert(
+            "alpha".to_string(),
+            ProfileEntryFile::Table(ProfileEntryTable {
+                path: "profiles/alpha.dcdl".to_string(),
+                description: None,
+            }),
+        );
+        registry.profile.insert(
+            "beta".to_string(),
+            ProfileEntryFile::Table(ProfileEntryTable {
+                path: "profiles/beta.dcdl".to_string(),
+                description: None,
+            }),
+        );
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "profiles/alpha.dcdl".to_string(),
+            r#"{ extra = import "./shared.dcdl"; }"#.to_string(),
+        );
+        sources.insert("profiles/shared.dcdl".to_string(), "{}".to_string());
+        sources.insert("profiles/beta.dcdl".to_string(), "{}".to_string());
+        sources.insert("profiles/unregistered.dcdl".to_string(), "{}".to_string());
+
+        let archive =
+            build_profile_archive_for_selector(&registry, sources, "project:alpha").unwrap();
+        let verified = archive.verify().unwrap();
+        let manifest = verified.manifest();
+        let source_paths: Vec<_> = manifest
+            .sources
+            .iter()
+            .map(|source| source.path.as_str())
+            .collect();
+        assert_eq!(manifest.entrypoints.len(), 1);
+        assert_eq!(
+            manifest
+                .entrypoints
+                .get("project:alpha")
+                .map(String::as_str),
+            Some("profiles/alpha.dcdl")
+        );
+        assert!(source_paths.contains(&"profiles/alpha.dcdl"));
+        assert!(source_paths.contains(&"profiles/shared.dcdl"));
+        assert!(!source_paths.contains(&"profiles/beta.dcdl"));
+        assert!(!source_paths.contains(&"profiles/unregistered.dcdl"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_write_rejects_symlink_parent_before_outside_side_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".yoi/profiles")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join(".yoi/profiles/link")).unwrap();
+
+        let err = write_profile_tree_file(
+            "workspace-test",
+            dir.path(),
+            PROFILE_SOURCE_TREE_ID,
+            WriteWorkspaceProfileTreeFileRequest {
+                path: "profiles/link/nested/new.dcdl".to_string(),
+                content: valid_decodal("new"),
+                revision: None,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("profile_source_symlink_escape"));
+        assert!(!outside.path().join("nested").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_root_symlink_is_rejected_before_tree_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".yoi")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join(".yoi/profiles")).unwrap();
+
+        let err = write_profile_tree_file(
+            "workspace-test",
+            dir.path(),
+            PROFILE_SOURCE_TREE_ID,
+            WriteWorkspaceProfileTreeFileRequest {
+                path: "profiles/nested/new.dcdl".to_string(),
+                content: valid_decodal("new"),
+                revision: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("profile_source_symlink_escape"));
+        assert!(!outside.path().join("nested").exists());
+        assert!(!outside.path().join("new.dcdl").exists());
+
+        let err = read_profile_source_tree("workspace-test", dir.path(), PROFILE_SOURCE_TREE_ID)
+            .unwrap_err();
+        assert!(err.to_string().contains("profile_source_symlink_escape"));
+
+        let err = build_workspace_profile_archive(dir.path(), "project:any").unwrap_err();
+        assert!(err.to_string().contains("profile_source_symlink_escape"));
     }
 }
