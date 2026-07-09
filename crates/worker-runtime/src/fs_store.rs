@@ -1,6 +1,6 @@
 use crate::catalog::{CreateWorkerRequest, WorkerStatus};
 use crate::config_bundle::ConfigBundle;
-use crate::diagnostics::RuntimeDiagnostic;
+use crate::diagnostics::{DiagnosticSeverity, RuntimeDiagnostic};
 use crate::error::RuntimeError;
 use crate::execution::WorkerExecutionStatus;
 use crate::identity::{RuntimeId, WorkerId, WorkerRef};
@@ -244,7 +244,7 @@ impl FsRuntimeStore {
 
     pub(crate) fn load_runtime_state(&self) -> Result<PersistedRuntimeState, RuntimeError> {
         let runtime_path = self.runtime_path();
-        let snapshot: RuntimeSnapshot = read_json(&runtime_path, "read runtime snapshot")?;
+        let mut snapshot: RuntimeSnapshot = read_json(&runtime_path, "read runtime snapshot")?;
         snapshot.validate(&self.runtime_id, &runtime_path)?;
 
         let events = read_json_lines::<RuntimeEvent>(&self.events_path(), "read events")?;
@@ -281,38 +281,75 @@ impl FsRuntimeStore {
         for entry in worker_dirs {
             let path = entry.path();
             if !path.is_dir() {
-                return Err(RuntimeError::StoreCorrupt {
-                    operation: "read worker",
-                    path,
-                    message: "worker path exists but is not a directory".to_string(),
-                });
+                record_worker_load_diagnostic(
+                    &mut snapshot,
+                    None,
+                    "ignored invalid worker store entry while loading runtime store",
+                );
+                continue;
             }
             let worker_snapshot_path = path.join(WORKER_FILE);
             let worker_snapshot: WorkerSnapshot =
-                read_json(&worker_snapshot_path, "read worker snapshot")?;
-            worker_snapshot.validate(&self.runtime_id, &worker_snapshot_path)?;
-            let transcript =
-                read_json_lines::<TranscriptEntry>(&path.join(TRANSCRIPT_FILE), "read transcript")?;
-            for entry in &transcript {
-                self.ensure_worker_ref(&entry.worker_ref)?;
-                if entry.worker_ref.worker_id != worker_snapshot.worker_id {
-                    return Err(RuntimeError::StoreCorrupt {
-                        operation: "read transcript",
-                        path: path.join(TRANSCRIPT_FILE),
-                        message: format!(
-                            "transcript entry belongs to worker {}, expected {}",
-                            entry.worker_ref.worker_id, worker_snapshot.worker_id
-                        ),
-                    });
+                match read_json(&worker_snapshot_path, "read worker snapshot") {
+                    Ok(snapshot) => snapshot,
+                    Err(_error) => {
+                        record_worker_load_diagnostic(
+                            &mut snapshot,
+                            None,
+                            "ignored corrupt worker snapshot while loading runtime store",
+                        );
+                        continue;
+                    }
+                };
+            if worker_snapshot
+                .validate(&self.runtime_id, &worker_snapshot_path)
+                .is_err()
+            {
+                record_worker_load_diagnostic(
+                    &mut snapshot,
+                    Some(worker_snapshot.worker_ref.clone()),
+                    "ignored invalid worker snapshot while loading runtime store",
+                );
+                continue;
+            }
+            let transcript = match read_json_lines::<TranscriptEntry>(
+                &path.join(TRANSCRIPT_FILE),
+                "read transcript",
+            ) {
+                Ok(transcript) => transcript,
+                Err(_error) => {
+                    record_worker_load_diagnostic(
+                        &mut snapshot,
+                        Some(worker_snapshot.worker_ref.clone()),
+                        "ignored worker with unreadable transcript while loading runtime store",
+                    );
+                    continue;
                 }
+            };
+            let mut transcript_valid = true;
+            for entry in &transcript {
+                if self.ensure_worker_ref(&entry.worker_ref).is_err()
+                    || entry.worker_ref.worker_id != worker_snapshot.worker_id
+                {
+                    transcript_valid = false;
+                    break;
+                }
+            }
+            if !transcript_valid {
+                record_worker_load_diagnostic(
+                    &mut snapshot,
+                    Some(worker_snapshot.worker_ref.clone()),
+                    "ignored worker with invalid transcript while loading runtime store",
+                );
+                continue;
             }
             let worker = worker_snapshot.into_persisted(transcript);
             if workers.insert(worker.worker_id.clone(), worker).is_some() {
-                return Err(RuntimeError::StoreCorrupt {
-                    operation: "read workers",
-                    path: workers_dir.clone(),
-                    message: "duplicate worker id in store".to_string(),
-                });
+                record_worker_load_diagnostic(
+                    &mut snapshot,
+                    None,
+                    "ignored duplicate worker snapshot while loading runtime store",
+                );
             }
         }
 
@@ -397,6 +434,22 @@ struct RuntimeSnapshot {
     #[serde(default)]
     config_bundles: BTreeMap<String, ConfigBundle>,
     diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+fn record_worker_load_diagnostic(
+    snapshot: &mut RuntimeSnapshot,
+    worker_ref: Option<WorkerRef>,
+    message: impl Into<String>,
+) {
+    let id = snapshot.next_diagnostic_id;
+    snapshot.next_diagnostic_id = snapshot.next_diagnostic_id.saturating_add(1);
+    snapshot.diagnostics.push(RuntimeDiagnostic {
+        id,
+        worker_ref,
+        severity: DiagnosticSeverity::Warning,
+        code: "worker_snapshot_ignored".to_string(),
+        message: message.into(),
+    });
 }
 
 impl RuntimeSnapshot {

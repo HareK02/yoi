@@ -2416,14 +2416,21 @@ mod tests {
         worker_dirs.sort_by_key(|entry| entry.path());
         std::fs::remove_file(worker_dirs[0].path().join("worker.json")).unwrap();
         drop(missing_runtime);
-        let err = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
+        let loaded = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
             root: missing_root.clone(),
             runtime_id: Some(missing_runtime_id),
             display_name: None,
             limits: RuntimeLimits::default(),
         })
-        .unwrap_err();
-        assert!(matches!(err, RuntimeError::StoreMissing { .. }));
+        .expect("invalid worker snapshot should not make runtime store unreadable");
+        assert!(loaded.list_workers().unwrap().is_empty());
+        assert!(
+            loaded
+                .diagnostics()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic.code == "worker_snapshot_ignored")
+        );
         let _ = std::fs::remove_dir_all(missing_root);
     }
 }

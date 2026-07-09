@@ -789,7 +789,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::BTreeMap;
     use std::fs;
     use std::pin::Pin;
     use std::process::Command;
@@ -800,7 +800,6 @@ mod tests {
         ConfigBundleRef, CreateWorkerRequest, DirtyStatePolicy, MaterializerKind, ProfileSelector,
         RepositorySelector, WorkingDirectoryRepository, WorkingDirectoryRequest,
     };
-    use crate::execution::WorkerExecutionContext;
     use crate::identity::RuntimeId;
     use crate::management::RuntimeOptions;
     use crate::observation::{TranscriptQuery, TranscriptRole};
@@ -965,105 +964,6 @@ mod tests {
             },
         )
         .unwrap()
-    }
-
-    fn handle_for_archive(
-        archive: &crate::profile_archive::ProfileSourceArchive,
-    ) -> crate::resource::BackendResourceHandle {
-        crate::resource::BackendResourceHandle {
-            kind: crate::resource::BackendResourceKind::ProfileSourceArchive,
-            workspace_id: "workspace-test".to_string(),
-            scope_id: Some("workspace-profile-source".to_string()),
-            runtime_id: Some("runtime-test".to_string()),
-            worker_id: Some("worker-test".to_string()),
-            resource_id: archive.reference.id.clone(),
-            digest: archive.reference.digest.clone(),
-            operation: crate::resource::BackendResourceOperation::FetchArchive,
-            expires_at_unix_seconds: 4_102_444_800,
-            nonce: "nonce-test".to_string(),
-            revision: archive.reference.digest.clone(),
-            generation: Some(1),
-            max_bytes: crate::resource::DEFAULT_PROFILE_SOURCE_ARCHIVE_MAX_BYTES,
-            content_type: crate::resource::PROFILE_SOURCE_ARCHIVE_CONTENT_TYPE.to_string(),
-            redaction: crate::resource::ResourceRedactionPolicy::RuntimeInternalOnly,
-            audit_correlation_id: "audit-test".to_string(),
-            profile_source_graph: Some(archive.reference.source_graph.clone()),
-        }
-    }
-
-    fn response_for_archive(
-        handle: &crate::resource::BackendResourceHandle,
-        archive: &crate::profile_archive::ProfileSourceArchive,
-    ) -> crate::resource::BackendResourceFetchResponse {
-        crate::resource::BackendResourceFetchResponse {
-            kind: crate::resource::BackendResourceKind::ProfileSourceArchive,
-            resource_id: handle.resource_id.clone(),
-            digest: handle.digest.clone(),
-            content_type: crate::resource::PROFILE_SOURCE_ARCHIVE_CONTENT_TYPE.to_string(),
-            bytes: archive.content.clone(),
-            audit_correlation_id: handle.audit_correlation_id.clone(),
-        }
-    }
-
-    #[derive(Clone)]
-    struct SequencedResourceClient {
-        responses: Arc<
-            Mutex<
-                VecDeque<
-                    Result<
-                        crate::resource::BackendResourceFetchResponse,
-                        crate::resource::BackendResourceError,
-                    >,
-                >,
-            >,
-        >,
-        call_count: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl crate::resource::BackendResourceClient for SequencedResourceClient {
-        async fn fetch_resource(
-            &self,
-            _request: crate::resource::BackendResourceFetchRequest,
-        ) -> Result<
-            crate::resource::BackendResourceFetchResponse,
-            crate::resource::BackendResourceError,
-        > {
-            self.call_count.fetch_add(1, Ordering::SeqCst);
-            self.responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("missing sequenced resource response")
-        }
-    }
-
-    fn spawn_request_with_bundle(
-        bundle: crate::config_bundle::ConfigBundle,
-    ) -> WorkerExecutionSpawnRequest {
-        let worker_ref = crate::identity::WorkerRef::new(
-            RuntimeId::new("runtime-test").unwrap(),
-            crate::identity::WorkerId::new("worker-test").unwrap(),
-        );
-        WorkerExecutionSpawnRequest {
-            worker_ref: worker_ref.clone(),
-            request: CreateWorkerRequest {
-                profile: ProfileSelector::RuntimeDefault,
-                profile_source: crate::catalog::ProfileSourceArchiveSource::Embedded {
-                    archive: bundle.profile_source_archive.clone().unwrap(),
-                },
-                config_bundle: Some(ConfigBundleRef {
-                    id: bundle.metadata.id.clone(),
-                    digest: bundle.metadata.digest.clone(),
-                }),
-                initial_input: None,
-                working_directory_request: None,
-                working_directory: None,
-            },
-            context: WorkerExecutionContext::new(worker_ref, Arc::new(|_, _| panic!("unused"))),
-            working_directory: None,
-            config_bundle: Some(bundle),
-        }
     }
 
     fn create_request(_name: &str) -> CreateWorkerRequest {
