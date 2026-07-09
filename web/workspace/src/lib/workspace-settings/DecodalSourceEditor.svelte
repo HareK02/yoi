@@ -1,6 +1,7 @@
 <script lang="ts">
   import { EditorState } from '@codemirror/state';
   import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection } from '@codemirror/view';
+  import { decodal } from 'decodal-codemirror';
 
   let {
     value = '',
@@ -42,6 +43,7 @@
           lineNumbers(),
           drawSelection(),
           highlightActiveLine(),
+          decodal(),
           keymap.of([]),
           EditorState.readOnly.of(readonly),
           EditorView.editable.of(!readonly),

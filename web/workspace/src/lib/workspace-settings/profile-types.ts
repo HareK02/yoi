@@ -30,6 +30,9 @@ export type WorkspaceProfileSourceSummary = {
   profile_source_id: string;
   display_path: string;
   kind: "decodal" | string;
+  content_type: string;
+  content_digest: string;
+  provenance: "project_profile_source_tree" | string;
   editable: boolean;
   revision: string;
   size_bytes: number;
@@ -65,6 +68,9 @@ export type WorkspaceProfileSourceTreeSummary = {
   label: string;
   root_path: string;
   kind: "decodal_source_tree" | string;
+  content_type: string;
+  content_digest: string;
+  provenance: "project_profile_source_tree" | string;
   editable: boolean;
   revision: string;
   file_count: number;
@@ -74,6 +80,9 @@ export type WorkspaceProfileSourceTreeSummary = {
 export type WorkspaceProfileSourceTreeFileSummary = {
   path: string;
   kind: "decodal" | string;
+  content_type: string;
+  content_digest: string;
+  provenance: "project_profile_source_tree" | string;
   editable: boolean;
   revision: string;
   size_bytes: number;

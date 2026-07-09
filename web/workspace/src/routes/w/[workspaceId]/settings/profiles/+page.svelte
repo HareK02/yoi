@@ -4,10 +4,12 @@
   import {
     fetchProfileSettings,
     fetchProfileSourceTree,
+    deleteProfileTreeFile,
     fetchProfileTreeFile,
     writeProfileTreeFile,
   } from '$lib/workspace-settings/profile-api';
   import type { Diagnostic } from '$lib/workspace-settings/model';
+  import { profileSourceTreeSettingsHref, virtualProfilePathForCreate } from '$lib/workspace-settings/profile-routes';
   import type {
     ProfileSettingsResponse,
     WorkspaceProfileSourceTreeFileResponse,
@@ -24,6 +26,9 @@
   let draftContent = $state('');
   let loading = $state(true);
   let saving = $state(false);
+  let creating = $state(false);
+  let deleting = $state(false);
+  let newFilePath = $state('new-profile.dcdl');
   let message = $state<string | null>(null);
   let diagnostics = $state<Diagnostic[]>([]);
 
@@ -52,6 +57,46 @@
     selectedFile = await fetchProfileTreeFile(workspaceId, sourceTreeId, path);
     draftContent = selectedFile.content;
     diagnostics = selectedFile.diagnostics;
+  }
+
+  async function createTreeFile(sourceTreeId: string) {
+    creating = true;
+    message = null;
+    try {
+      const path = virtualProfilePathForCreate(newFilePath);
+      selectedFile = await writeProfileTreeFile(workspaceId, sourceTreeId, {
+        path,
+        content: '{\n  slug = "new-profile";\n  description = "New profile";\n  scope = "workspace_read";\n}',
+      });
+      draftContent = selectedFile.content;
+      sourceTree = await fetchProfileSourceTree(workspaceId, sourceTreeId);
+      diagnostics = selectedFile.diagnostics;
+      message = 'Created Decodal profile source.';
+    } catch (err) {
+      message = err instanceof Error ? err.message : 'profile source create failed';
+    } finally {
+      creating = false;
+    }
+  }
+
+  async function deleteSelectedFile() {
+    if (!selectedFile) return;
+    deleting = true;
+    message = null;
+    try {
+      sourceTree = await deleteProfileTreeFile(workspaceId, selectedFile.source_tree_id, {
+        path: selectedFile.file.path,
+        revision: selectedFile.file.revision,
+      });
+      selectedFile = null;
+      draftContent = '';
+      diagnostics = sourceTree.diagnostics;
+      message = 'Deleted Decodal profile source.';
+    } catch (err) {
+      message = err instanceof Error ? err.message : 'profile source delete failed';
+    } finally {
+      deleting = false;
+    }
   }
 
   async function saveSelectedFile() {
@@ -128,14 +173,21 @@
         <h3>Profile source tree</h3>
         <p class="settings-note">Virtual Decodal paths exposed by the Backend-owned source tree.</p>
         {#if sourceTree}
-          <small>{sourceTree.tree.root_path} · {sourceTree.tree.file_count} files · rev {sourceTree.tree.revision}</small>
+          <small>{sourceTree.tree.root_path} · {sourceTree.tree.file_count} files · {sourceTree.tree.content_type} · rev {sourceTree.tree.revision}</small>
+          <p><a href={profileSourceTreeSettingsHref(workspaceId, sourceTree.tree.source_tree_id)}>Open tree route</a></p>
+          <div class="settings-inline-form">
+            <input bind:value={newFilePath} aria-label="New profile source virtual path" placeholder="profiles/new-profile.dcdl" />
+            <button type="button" disabled={creating} onclick={() => createTreeFile(sourceTree!.tree.source_tree_id)}>
+              {creating ? 'Creating…' : 'Create source'}
+            </button>
+          </div>
           <ul class="settings-profile-list">
             {#each sourceTree.files as file (file.path)}
               <li>
                 <button class="link-button" type="button" onclick={() => selectTreeFile(sourceTree!.tree.source_tree_id, file.path)}>
                   <strong>{file.path}</strong>
                 </button>
-                <span>{file.kind} · {file.size_bytes} bytes</span>
+                <span>{file.kind} · {file.content_type} · {file.size_bytes} bytes</span>
                 <small>{file.editable ? 'editable' : 'read-only'} · rev {file.revision}</small>
                 <DiagnosticsList diagnostics={file.diagnostics} />
               </li>
@@ -154,9 +206,14 @@
             <p class="eyebrow">{selectedFile.source_tree_id}</p>
             <h3>{selectedFile.file.path}</h3>
           </div>
-          <button type="button" disabled={saving || draftContent === selectedFile.content} onclick={saveSelectedFile}>
-            {saving ? 'Saving…' : 'Save'}
-          </button>
+          <div class="settings-editor-actions">
+            <button type="button" disabled={saving || draftContent === selectedFile.content} onclick={saveSelectedFile}>
+              {saving ? 'Saving…' : 'Save'}
+            </button>
+            <button type="button" disabled={deleting} onclick={deleteSelectedFile}>
+              {deleting ? 'Deleting…' : 'Delete'}
+            </button>
+          </div>
         </header>
         <DecodalSourceEditor value={draftContent} onChange={(value) => (draftContent = value)} ariaLabel={`Decodal source ${selectedFile.file.path}`} />
       </article>

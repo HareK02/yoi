@@ -17,6 +17,7 @@
     "@sveltejs/vite-plugin-svelte": "npm:@sveltejs/vite-plugin-svelte@6.2.1",
     "@codemirror/state": "npm:@codemirror/state@6.5.2",
     "@codemirror/view": "npm:@codemirror/view@6.38.8",
+    "decodal-codemirror": "npm:decodal-codemirror@0.1.2",
     "clsx": "npm:clsx@2.1.1",
     "cookie": "npm:cookie@0.6.0",
     "devalue": "npm:devalue@5.6.4",

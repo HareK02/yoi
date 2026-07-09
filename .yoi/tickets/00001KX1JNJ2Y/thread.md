@@ -149,3 +149,29 @@ Validation:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-09T08:46:58Z -->
+
+## Implementation report
+
+Follow-up fixes for external review blockers.
+
+Summary:
+- Added required `decodal-codemirror@0.1.2` dependency and wired the `decodal()` CodeMirror 6 extension into the Decodal source editor.
+- Added a profile source tree settings route plus create/save/delete editor operations using Backend virtual-path APIs.
+- Changed project profile archive generation to build a selected-root/import-closure-only archive for the requested selector instead of snapshotting the whole tree.
+- Added safe source/tree summary metadata for content type, content digest, and typed provenance without host paths.
+- Hardened tree writes so symlinked intermediate directories fail before any outside filesystem mutation.
+- Added focused Rust regression tests for closure-only archive content and symlink write rejection; added web route/path model smoke tests.
+
+Validation:
+- `git diff --check`
+- `cargo test -p yoi-workspace-server`
+- `cargo test -p worker-runtime --features ws-server,fs-store`
+- `cargo check -p yoi`
+- `cd web/workspace && deno task check && deno task test`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+
+---

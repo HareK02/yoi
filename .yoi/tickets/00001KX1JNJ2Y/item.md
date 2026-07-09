@@ -2,7 +2,7 @@
 title: 'Add ProfileSourceTree virtual filesystem and Decodal profile editor'
 state: 'inprogress'
 created_at: '2026-07-08T19:18:25Z'
-updated_at: '2026-07-09T08:22:18Z'
+updated_at: '2026-07-09T08:46:58Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-07-09T07:56:07Z'
