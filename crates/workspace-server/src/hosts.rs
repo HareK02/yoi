@@ -3348,10 +3348,7 @@ mod tests {
                 .resolve_profile(&selector_key, root.path(), "embedded-test-worker")
                 .unwrap();
             assert_eq!(manifest.worker.name, "embedded-test-worker");
-            assert_eq!(
-                manifest.model.ref_.as_deref(),
-                Some("codex-oauth/gpt-5.5")
-            );
+            assert_eq!(manifest.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
         }
     }
 

@@ -137,7 +137,11 @@ impl ProfileRuntimeWorkerFactory {
     }
 
     fn runtime_worker_name(request: &WorkerExecutionSpawnRequest) -> String {
-        request.worker_ref.worker_id.to_string()
+        format!(
+            "runtime-{}-{}",
+            sanitize_worker_name_component(request.worker_ref.runtime_id.as_str()),
+            request.worker_ref.worker_id
+        )
     }
 
     fn runtime_profile_value(
@@ -211,6 +215,19 @@ impl ProfileRuntimeWorkerFactory {
                 .map_err(|err| format!("failed to verify fetched profile source archive: {err}"))
         }
     }
+}
+
+fn sanitize_worker_name_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 #[cfg(feature = "http-server")]
@@ -800,6 +817,7 @@ mod tests {
         ConfigBundleRef, CreateWorkerRequest, DirtyStatePolicy, MaterializerKind, ProfileSelector,
         RepositorySelector, WorkingDirectoryRepository, WorkingDirectoryRequest,
     };
+    use crate::execution::WorkerExecutionContext;
     use crate::identity::RuntimeId;
     use crate::management::RuntimeOptions;
     use crate::observation::{TranscriptQuery, TranscriptRole};
@@ -1019,6 +1037,31 @@ mod tests {
             materializer: MaterializerKind::LocalGitWorktree,
             dirty_state_policy: DirtyStatePolicy::CleanPointOnly,
         }
+    }
+
+    #[test]
+    fn runtime_worker_name_is_namespaced_by_runtime_id() {
+        let runtime_id = RuntimeId::new("arc:remote".to_string()).unwrap();
+        let worker_ref = crate::identity::WorkerRef::new(
+            runtime_id,
+            crate::identity::WorkerId::new("worker-00000001".to_string()).unwrap(),
+        );
+        let request = WorkerExecutionSpawnRequest {
+            worker_ref: worker_ref.clone(),
+            request: create_request("worker-00000001"),
+            context: WorkerExecutionContext::new(worker_ref, Arc::new(|_, _| panic!("unused"))),
+            working_directory: None,
+            config_bundle: None,
+        };
+
+        assert_eq!(
+            ProfileRuntimeWorkerFactory::runtime_worker_name(&request),
+            "runtime-arc-remote-worker-00000001"
+        );
+        assert_ne!(
+            ProfileRuntimeWorkerFactory::runtime_worker_name(&request),
+            "worker-00000001"
+        );
     }
 
     #[tokio::test]
