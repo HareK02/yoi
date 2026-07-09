@@ -1880,6 +1880,7 @@ pub struct RemoteWorkerRuntime {
     display_name: String,
     base_url: String,
     backend_base_url: String,
+    workspace_id: String,
     bearer_token: Option<String>,
     cached_capabilities: RuntimeCapabilitySummary,
     cached_status: String,
@@ -1891,6 +1892,7 @@ pub struct RemoteWorkerRuntime {
 impl RemoteWorkerRuntime {
     pub fn new(
         config: RemoteRuntimeConfig,
+        workspace_id: String,
         backend_base_url: String,
     ) -> Result<Self, RuntimeRegistryError> {
         validate_backend_identifier("runtime_id", &config.runtime_id)?;
@@ -1909,6 +1911,7 @@ impl RemoteWorkerRuntime {
             display_name: config.display_name,
             base_url,
             backend_base_url: backend_base_url.trim_end_matches('/').to_string(),
+            workspace_id,
             bearer_token: config.bearer_token,
             cached_capabilities: config.cached_capabilities,
             cached_status: config.cached_status,
@@ -2278,7 +2281,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         let runtime_id = EmbeddedRuntimeId::new(self.runtime_id.clone());
         let profile_source = match default_profile_source_archive_http_source(
             &profile,
-            &self.host_id,
+            &self.workspace_id,
             runtime_id.as_ref(),
             &self.resource_broker,
             &self.backend_base_url,
@@ -3367,6 +3370,31 @@ mod tests {
     }
 
     #[test]
+    fn remote_profile_source_archive_url_uses_workspace_id_not_host_id() {
+        let broker = BackendResourceBroker::default();
+        let runtime_id = EmbeddedRuntimeId::new("remote:test".to_string()).unwrap();
+        let source = default_profile_source_archive_http_source(
+            &ProfileSelector::Builtin("builtin:coder".to_string()),
+            "workspace-actual",
+            Some(&runtime_id),
+            &broker,
+            "http://127.0.0.1:8787/",
+        )
+        .unwrap();
+        let ProfileSourceArchiveSource::Http { location } = source else {
+            panic!("remote profile source should be HTTP fetched");
+        };
+        assert!(
+            location.url.starts_with(
+                "http://127.0.0.1:8787/api/w/workspace-actual/profile-source-archives/"
+            ),
+            "{}",
+            location.url
+        );
+        assert!(!location.url.contains("remote-runtime"), "{}", location.url);
+    }
+
+    #[test]
     fn embedded_archive_rejects_unknown_selectors() {
         let broker = BackendResourceBroker::default();
         let runtime_id = EmbeddedRuntimeId::new("runtime-test".to_string()).unwrap();
@@ -4003,6 +4031,7 @@ mod tests {
                 "http://127.0.0.1:9",
                 None,
             ),
+            "workspace-test".to_string(),
             "http://127.0.0.1:8787".to_string(),
         )
         .unwrap();
@@ -4054,6 +4083,7 @@ mod tests {
                     base_url.clone(),
                     Some(secret.clone()),
                 ),
+                "workspace-test".to_string(),
                 "http://127.0.0.1:8787".to_string(),
             )
             .unwrap(),
@@ -4183,6 +4213,7 @@ mod tests {
                     base_url,
                     Some("secret-token-do-not-leak".to_string()),
                 ),
+                "workspace-test".to_string(),
                 "http://127.0.0.1:8787".to_string(),
             )
             .unwrap(),
@@ -4257,6 +4288,7 @@ mod tests {
                     base_url,
                     Some("secret-token".to_string()),
                 ),
+                "workspace-test".to_string(),
                 "http://127.0.0.1:8787".to_string(),
             )
             .unwrap(),
@@ -4306,6 +4338,7 @@ mod tests {
                     base_url,
                     Some("secret-token".to_string()),
                 ),
+                "workspace-test".to_string(),
                 "http://127.0.0.1:8787".to_string(),
             )
             .unwrap(),

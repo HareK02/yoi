@@ -238,6 +238,7 @@ impl WorkspaceApi {
             runtime.register(
                 RemoteWorkerRuntime::new(
                     remote_config,
+                    config.workspace_id.clone(),
                     config
                         .backend_base_url
                         .clone()
@@ -1829,6 +1830,7 @@ async fn add_remote_runtime_connection(
     })?;
     let active_runtime = RemoteWorkerRuntime::new(
         active_config,
+        api.config.workspace_id.clone(),
         api.config
             .backend_base_url
             .clone()
