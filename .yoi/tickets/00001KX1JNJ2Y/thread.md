@@ -282,3 +282,31 @@ Non-blocking follow-ups:
 - Editor extension wiring is compile/static-source covered rather than directly unit-tested; acceptable for now, but smoke coverage would help future dependency regressions。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-09T09:10:00Z -->
+
+## Implementation report
+
+Second review-fix implementation report:
+
+- Coder Pod completed remaining requested changes and committed follow-up `13c6548b fix: reject profile source root symlinks` on branch `work/00001KX1JNJ2Y-profile-source-tree`。
+- Worktree status was clean after commit。
+- Fix summary:
+  - Added shared `ProfileSourceRoot` guard。
+  - Rejects `.yoi/profiles` when it is a symlink。
+  - Verifies canonical `.yoi/profiles` remains under the canonical workspace root。
+  - Applied the guard consistently to source tree listing, file read/delete checks, write preparation, source summaries, and archive construction through tree scan/read paths。
+  - Hardened writes so `.yoi` and `.yoi/profiles` are created one component at a time only after symlink/canonical containment checks。
+  - Added regression coverage for `.yoi/profiles -> outside_dir`: write rejects before outside side effects, outside target is not created/modified, source tree read/list fails closed, and archive construction fails closed。
+- Orchestrator reran validation in the implementation worktree:
+  - `git diff --check`: pass
+  - `cargo test -p yoi-workspace-server`: pass（94 lib tests + 2 main tests）
+  - `cargo test -p worker-runtime --features ws-server,fs-store`: pass（47 lib tests + 5 main tests + doc tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（19 tests）
+  - `yoi ticket doctor`: ok
+  - `nix build .#yoi --no-link`: pass
+- Requesting second follow-up external review against `941b9126..13c6548b` and full combined implementation。
+
+---
