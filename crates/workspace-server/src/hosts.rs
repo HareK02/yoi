@@ -2755,10 +2755,18 @@ fn default_profile_source_archive(
         include_str!("../../../resources/profiles/reviewer.dcdl").to_string(),
     );
 
+    let mut imports = BTreeMap::new();
+    for slug in ["companion", "intake", "orchestrator", "coder", "reviewer"] {
+        imports.insert(
+            format!("profiles/{slug}.dcdl\0./default.dcdl"),
+            "profiles/default.dcdl".to_string(),
+        );
+    }
+
     ProfileSourceArchive::build(ProfileSourceArchiveInput {
         id: "builtin-decodal-profiles-v1".to_string(),
         entrypoints,
-        imports: BTreeMap::new(),
+        imports,
         sources,
     })
     .map_err(|err| err.to_string())
@@ -3340,6 +3348,10 @@ mod tests {
                 .resolve_profile(&selector_key, root.path(), "embedded-test-worker")
                 .unwrap();
             assert_eq!(manifest.worker.name, "embedded-test-worker");
+            assert_eq!(
+                manifest.model.ref_.as_deref(),
+                Some("codex-oauth/gpt-5.5")
+            );
         }
     }
 

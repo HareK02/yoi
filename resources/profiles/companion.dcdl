@@ -1,12 +1,14 @@
-slug = "companion";
-description = "Workspace companion profile.";
-scope = "workspace_write";
+import "./default.dcdl" // {
+    slug = "companion";
+    description = "Workspace companion profile.";
+    scope = "workspace_write";
 
-feature = {
-    task = { enabled = true; };
-    memory = { enabled = true; };
-    web = { enabled = true; };
-    workers = { enabled = true; };
-    ticket = { enabled = false; access = "lifecycle"; };
-    ticket_orchestration = { enabled = false; };
-};
+    feature = {
+        task = { enabled = true; };
+        memory = { enabled = true; };
+        web = { enabled = true; };
+        workers = { enabled = true; };
+        ticket = { enabled = false; access = "lifecycle"; };
+        ticket_orchestration = { enabled = false; };
+    };
+}
