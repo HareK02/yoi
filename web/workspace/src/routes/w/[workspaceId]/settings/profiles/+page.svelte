@@ -1,40 +1,88 @@
 <script lang="ts">
   import DiagnosticsList from '$lib/workspace-settings/DiagnosticsList.svelte';
-  import { fetchProfileSettings } from '$lib/workspace-settings/profile-api';
+  import DecodalSourceEditor from '$lib/workspace-settings/DecodalSourceEditor.svelte';
+  import {
+    fetchProfileSettings,
+    fetchProfileSourceTree,
+    fetchProfileTreeFile,
+    writeProfileTreeFile,
+  } from '$lib/workspace-settings/profile-api';
   import type { Diagnostic } from '$lib/workspace-settings/model';
-  import type { ProfileSettingsResponse } from '$lib/workspace-settings/profile-types';
+  import type {
+    ProfileSettingsResponse,
+    WorkspaceProfileSourceTreeFileResponse,
+    WorkspaceProfileSourceTreeResponse,
+  } from '$lib/workspace-settings/profile-types';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
   let workspaceId = $derived(data.workspace?.workspace_id ?? '');
 
   let profileSettings = $state<ProfileSettingsResponse | null>(null);
+  let sourceTree = $state<WorkspaceProfileSourceTreeResponse | null>(null);
+  let selectedFile = $state<WorkspaceProfileSourceTreeFileResponse | null>(null);
+  let draftContent = $state('');
   let loading = $state(true);
+  let saving = $state(false);
   let message = $state<string | null>(null);
   let diagnostics = $state<Diagnostic[]>([]);
 
-  $effect(() => {
-    if (!workspaceId) {
+  async function loadSettings() {
+    if (!workspaceId) return;
+    loading = true;
+    message = null;
+    try {
+      const response = await fetchProfileSettings(workspaceId);
+      profileSettings = response;
+      diagnostics = response.diagnostics;
+      const treeId = response.source_trees[0]?.source_tree_id;
+      if (treeId) {
+        sourceTree = await fetchProfileSourceTree(workspaceId, treeId);
+        const firstPath = sourceTree.files[0]?.path;
+        if (firstPath) await selectTreeFile(treeId, firstPath);
+      }
+    } catch (err) {
+      message = err instanceof Error ? err.message : 'profile settings request failed';
+    } finally {
       loading = false;
-      return;
     }
+  }
+
+  async function selectTreeFile(sourceTreeId: string, path: string) {
+    selectedFile = await fetchProfileTreeFile(workspaceId, sourceTreeId, path);
+    draftContent = selectedFile.content;
+    diagnostics = selectedFile.diagnostics;
+  }
+
+  async function saveSelectedFile() {
+    if (!selectedFile) return;
+    saving = true;
+    message = null;
+    try {
+      selectedFile = await writeProfileTreeFile(workspaceId, selectedFile.source_tree_id, {
+        path: selectedFile.file.path,
+        revision: selectedFile.file.revision,
+        content: draftContent,
+      });
+      draftContent = selectedFile.content;
+      sourceTree = await fetchProfileSourceTree(workspaceId, selectedFile.source_tree_id);
+      diagnostics = selectedFile.diagnostics;
+      message = 'Saved Decodal profile source.';
+    } catch (err) {
+      message = err instanceof Error ? err.message : 'profile source save failed';
+    } finally {
+      saving = false;
+    }
+  }
+
+  $effect(() => {
     let cancelled = false;
     async function load() {
-      loading = true;
-      message = null;
-      try {
-        const response = await fetchProfileSettings(workspaceId);
-        if (!cancelled) {
-          profileSettings = response;
-          diagnostics = response.diagnostics;
-        }
-      } catch (err) {
-        if (!cancelled) message = err instanceof Error ? err.message : 'profile settings request failed';
-      } finally {
-        if (!cancelled) loading = false;
-      }
+      await loadSettings();
+      if (cancelled) return;
     }
-    load();
+    if (workspaceId) load();
+    else loading = false;
     return () => {
       cancelled = true;
     };
@@ -48,13 +96,13 @@
 <section class="card settings-section" aria-labelledby="profile-sources-title">
   <header class="settings-section-header">
     <div>
-      <p class="eyebrow">read-only</p>
+      <p class="eyebrow">Backend-owned source tree</p>
       <h2 id="profile-sources-title">Profiles</h2>
     </div>
-    <span class="badge warning">editing pending</span>
+    <span class="badge">Decodal editor</span>
   </header>
   <p>
-    Review the effective launch profiles and their source files. Editing is intentionally deferred until the Decodal profile source model is settled.
+    Review effective launch profiles and edit Decodal source files through virtual profile-tree paths. The browser receives only safe relative paths and revision tokens.
   </p>
 
   {#if loading}
@@ -77,24 +125,46 @@
         </ul>
       </article>
       <article>
-        <h3>Profile source files</h3>
-        <p class="settings-note">Decodal source files that define or contribute to launch profiles.</p>
-        <ul class="settings-profile-list">
-          {#each profileSettings.sources as source (source.profile_source_id)}
-            <li>
-              <strong>{source.display_path}</strong>
-              <span>{source.kind} · {source.size_bytes} bytes</span>
-              <small>{source.editable ? 'editable later' : 'read-only'} · rev {source.revision}</small>
-              <DiagnosticsList diagnostics={source.diagnostics} />
-            </li>
-          {/each}
-        </ul>
+        <h3>Profile source tree</h3>
+        <p class="settings-note">Virtual Decodal paths exposed by the Backend-owned source tree.</p>
+        {#if sourceTree}
+          <small>{sourceTree.tree.root_path} · {sourceTree.tree.file_count} files · rev {sourceTree.tree.revision}</small>
+          <ul class="settings-profile-list">
+            {#each sourceTree.files as file (file.path)}
+              <li>
+                <button class="link-button" type="button" onclick={() => selectTreeFile(sourceTree!.tree.source_tree_id, file.path)}>
+                  <strong>{file.path}</strong>
+                </button>
+                <span>{file.kind} · {file.size_bytes} bytes</span>
+                <small>{file.editable ? 'editable' : 'read-only'} · rev {file.revision}</small>
+                <DiagnosticsList diagnostics={file.diagnostics} />
+              </li>
+            {/each}
+          </ul>
+        {:else}
+          <p class="settings-note">No project profile source tree is available.</p>
+        {/if}
       </article>
     </div>
+
+    {#if selectedFile}
+      <article class="settings-editor-panel">
+        <header class="settings-section-header">
+          <div>
+            <p class="eyebrow">{selectedFile.source_tree_id}</p>
+            <h3>{selectedFile.file.path}</h3>
+          </div>
+          <button type="button" disabled={saving || draftContent === selectedFile.content} onclick={saveSelectedFile}>
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+        </header>
+        <DecodalSourceEditor value={draftContent} onChange={(value) => (draftContent = value)} ariaLabel={`Decodal source ${selectedFile.file.path}`} />
+      </article>
+    {/if}
   {/if}
 
   {#if message}
-    <p class="status-message" class:error={message.includes('failed')}>{message}</p>
+    <p class="status-message" class:error={message.includes('failed') || message.includes('error')}>{message}</p>
   {/if}
   <DiagnosticsList {diagnostics} />
 </section>

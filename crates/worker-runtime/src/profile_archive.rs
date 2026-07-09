@@ -2,7 +2,7 @@ use decodal::{Engine, LoadedSource, SourceLoader};
 use manifest::{ProfileSource, WorkerManifest, resolve_profile_artifact_value};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use tar::{Archive, Builder, Header};
@@ -27,6 +27,10 @@ pub enum ProfileArchiveError {
     MissingManifest,
     #[error("profile source archive missing source {0}")]
     MissingSource(String),
+    #[error("profile source archive contains duplicate source {0}")]
+    DuplicateSource(String),
+    #[error("profile source archive contains source not declared in manifest {0}")]
+    UndeclaredSource(String),
     #[error(
         "profile source archive source digest mismatch for {path}: expected {expected}, got {actual}"
     )]
@@ -47,6 +51,14 @@ pub enum ProfileArchiveError {
     MissingEntrypoint(String),
     #[error("profile source archive import is not declared in manifest import map: {0}")]
     ImportNotDeclared(String),
+    #[error(
+        "profile source archive import map mismatch for {specifier}: expected {expected}, got {actual}"
+    )]
+    ImportMapMismatch {
+        specifier: String,
+        expected: String,
+        actual: String,
+    },
     #[error("failed to read profile source archive: {0}")]
     Io(String),
     #[error("failed to parse profile source archive manifest: {0}")]
@@ -94,7 +106,11 @@ pub struct ProfileSourceArchiveManifest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProfileSourceArchiveSource {
     pub path: String,
+    #[serde(default)]
+    pub source_key: String,
     pub kind: String,
+    #[serde(default = "default_decodal_content_type")]
+    pub content_type: String,
     pub digest: String,
     pub size_bytes: u64,
 }
@@ -128,7 +144,9 @@ impl ProfileSourceArchive {
             }
             source_meta.push(ProfileSourceArchiveSource {
                 path: path.clone(),
+                source_key: path.clone(),
                 kind: "decodal".to_string(),
+                content_type: default_decodal_content_type(),
                 digest: sha256_hex(source.as_bytes()),
                 size_bytes: size,
             });
@@ -238,7 +256,9 @@ impl VerifiedProfileSourceArchive {
             } else {
                 let source = String::from_utf8(data)
                     .map_err(|err| ProfileArchiveError::Io(err.to_string()))?;
-                entries.insert(path, source);
+                if entries.insert(path.clone(), source).is_some() {
+                    return Err(ProfileArchiveError::DuplicateSource(path));
+                }
             }
             if entries.len() > MAX_SOURCES {
                 return Err(ProfileArchiveError::LimitExceeded("source count"));
@@ -258,8 +278,25 @@ impl VerifiedProfileSourceArchive {
             });
         }
         let mut total = 0u64;
+        let mut manifest_paths = BTreeSet::new();
         for source in &manifest.sources {
             validate_archive_path(&source.path)?;
+            if !source.source_key.is_empty() && source.source_key != source.path {
+                return Err(ProfileArchiveError::ImportMapMismatch {
+                    specifier: source.path.clone(),
+                    expected: source.path.clone(),
+                    actual: source.source_key.clone(),
+                });
+            }
+            if source.content_type != default_decodal_content_type() {
+                return Err(ProfileArchiveError::UnsupportedSource {
+                    path: source.path.clone(),
+                    kind: source.content_type.clone(),
+                });
+            }
+            if !manifest_paths.insert(source.path.clone()) {
+                return Err(ProfileArchiveError::DuplicateSource(source.path.clone()));
+            }
             if source.kind != "decodal" {
                 return Err(ProfileArchiveError::UnsupportedSource {
                     path: source.path.clone(),
@@ -285,6 +322,11 @@ impl VerifiedProfileSourceArchive {
             }
             total += size;
         }
+        for entry_path in entries.keys() {
+            if !manifest_paths.contains(entry_path) {
+                return Err(ProfileArchiveError::UndeclaredSource(entry_path.clone()));
+            }
+        }
         if total != reference.source_graph.total_source_bytes
             || manifest.sources.len() != reference.source_graph.source_count
         {
@@ -298,9 +340,12 @@ impl VerifiedProfileSourceArchive {
             .chain(manifest.imports.values())
         {
             validate_archive_path(path)?;
-            if !entries.contains_key(path) {
+            if !manifest_paths.contains(path) || !entries.contains_key(path) {
                 return Err(ProfileArchiveError::MissingSource(path.clone()));
             }
+        }
+        for (key, path) in &manifest.imports {
+            validate_archive_import_map_entry(key, path, &manifest_paths)?;
         }
         Ok(Self {
             reference,
@@ -311,6 +356,10 @@ impl VerifiedProfileSourceArchive {
 
     pub fn reference(&self) -> &ProfileSourceArchiveRef {
         &self.reference
+    }
+
+    pub fn manifest(&self) -> &ProfileSourceArchiveManifest {
+        &self.manifest
     }
 
     pub fn resolve_profile(
@@ -378,22 +427,26 @@ impl<'a> ArchiveSourceLoader<'a> {
 impl SourceLoader for ArchiveSourceLoader<'_> {
     fn load(
         &mut self,
-        _current_key: Option<&str>,
+        current_key: Option<&str>,
         specifier: &str,
     ) -> decodal::Result<LoadedSource> {
-        let path = self
-            .archive
-            .manifest
-            .imports
-            .get(specifier)
-            .ok_or_else(|| {
-                decodal::Diagnostic::new(
-                    decodal::DiagnosticKind::Import,
-                    decodal::Span::default(),
-                    format!("archive import not declared: {specifier}"),
-                )
-            })?;
-        let source = self.archive.sources.get(path).ok_or_else(|| {
+        let path =
+            archive_import_map_lookup(&self.archive.manifest.imports, current_key, specifier)
+                .map_err(import_diagnostic)?;
+        if let Some(current_key) = current_key {
+            match resolve_archive_import_path(current_key, specifier) {
+                Ok(expected) if expected == path => {}
+                Ok(expected) => {
+                    return Err(import_diagnostic(ProfileArchiveError::ImportMapMismatch {
+                        specifier: format!("{current_key}\0{specifier}"),
+                        expected,
+                        actual: path.clone(),
+                    }));
+                }
+                Err(err) => return Err(import_diagnostic(err)),
+            }
+        }
+        let source = self.archive.sources.get(&path).ok_or_else(|| {
             decodal::Diagnostic::new(
                 decodal::DiagnosticKind::Import,
                 decodal::Span::default(),
@@ -406,6 +459,123 @@ impl SourceLoader for ArchiveSourceLoader<'_> {
             source: source.clone(),
         })
     }
+}
+
+fn default_decodal_content_type() -> String {
+    "text/x-decodal".to_string()
+}
+
+fn import_diagnostic(err: ProfileArchiveError) -> decodal::Diagnostic {
+    decodal::Diagnostic::new(
+        decodal::DiagnosticKind::Import,
+        decodal::Span::default(),
+        err.to_string(),
+    )
+}
+
+fn archive_import_map_lookup(
+    imports: &BTreeMap<String, String>,
+    current_key: Option<&str>,
+    specifier: &str,
+) -> Result<String, ProfileArchiveError> {
+    if let Some(current_key) = current_key {
+        let scoped = format!("{current_key}\0{specifier}");
+        if let Some(path) = imports.get(&scoped) {
+            return Ok(path.clone());
+        }
+    }
+    imports
+        .get(specifier)
+        .cloned()
+        .ok_or_else(|| ProfileArchiveError::ImportNotDeclared(specifier.to_string()))
+}
+
+fn validate_archive_import_map_entry(
+    key: &str,
+    path: &str,
+    manifest_paths: &BTreeSet<String>,
+) -> Result<(), ProfileArchiveError> {
+    if !manifest_paths.contains(path) {
+        return Err(ProfileArchiveError::MissingSource(path.to_string()));
+    }
+    if let Some((current_key, specifier)) = key.split_once('\0') {
+        validate_archive_path(current_key)?;
+        let expected = resolve_archive_import_path(current_key, specifier)?;
+        if expected != path {
+            return Err(ProfileArchiveError::ImportMapMismatch {
+                specifier: key.to_string(),
+                expected,
+                actual: path.to_string(),
+            });
+        }
+    } else {
+        validate_archive_import_specifier(key)?;
+    }
+    Ok(())
+}
+
+fn resolve_archive_import_path(
+    current_key: &str,
+    specifier: &str,
+) -> Result<String, ProfileArchiveError> {
+    validate_archive_path(current_key)?;
+    validate_archive_import_specifier(specifier)?;
+    let raw = if let Some(rest) = specifier.strip_prefix("project:") {
+        rest
+    } else if let Some(rest) = specifier.strip_prefix("workspace:") {
+        rest
+    } else {
+        specifier
+    };
+    let base = if raw.starts_with("./") || raw.starts_with("../") {
+        Path::new(current_key)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default()
+            .join(raw)
+    } else {
+        PathBuf::from(raw)
+    };
+    normalize_archive_virtual_path(&base.to_string_lossy())
+}
+
+fn validate_archive_import_specifier(specifier: &str) -> Result<(), ProfileArchiveError> {
+    if specifier.is_empty()
+        || specifier.contains("://")
+        || specifier.starts_with('/')
+        || Path::new(specifier).is_absolute()
+    {
+        return Err(ProfileArchiveError::UnsafePath(specifier.to_string()));
+    }
+    if let Some((namespace, rest)) = specifier.split_once(':') {
+        if namespace != "project" && namespace != "workspace" {
+            return Err(ProfileArchiveError::UnsafePath(specifier.to_string()));
+        }
+        if rest.is_empty() || rest.starts_with('/') || rest.contains("://") {
+            return Err(ProfileArchiveError::UnsafePath(specifier.to_string()));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_archive_virtual_path(path: &str) -> Result<String, ProfileArchiveError> {
+    let path_ref = Path::new(path);
+    if path_ref.is_absolute() {
+        return Err(ProfileArchiveError::UnsafePath(path.to_string()));
+    }
+    let mut out = PathBuf::new();
+    for component in path_ref.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => out.push(value),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(ProfileArchiveError::UnsafePath(path.to_string()));
+            }
+        }
+    }
+    let normalized = out.to_string_lossy().replace('\\', "/");
+    validate_archive_path(&normalized)?;
+    Ok(normalized)
 }
 
 fn decodal_data_to_json(data: &decodal::Data) -> serde_json::Value {
@@ -550,5 +720,57 @@ mod tests {
         let verified = archive.verify().unwrap();
         let mut loader = ArchiveSourceLoader::new(&verified);
         assert!(loader.load(None, "missing").is_err());
+    }
+
+    #[test]
+    fn archive_loader_resolves_scoped_virtual_imports() {
+        let mut entrypoints = BTreeMap::new();
+        entrypoints.insert("default".to_string(), "profiles/main.dcdl".to_string());
+        let mut imports = BTreeMap::new();
+        imports.insert(
+            "profiles/main.dcdl\0./shared.dcdl".to_string(),
+            "profiles/shared.dcdl".to_string(),
+        );
+        let mut sources = BTreeMap::new();
+        sources.insert("profiles/main.dcdl".to_string(), "{}".to_string());
+        sources.insert("profiles/shared.dcdl".to_string(), "{}".to_string());
+        let archive = ProfileSourceArchive::build(ProfileSourceArchiveInput {
+            id: "project".to_string(),
+            entrypoints,
+            imports,
+            sources,
+        })
+        .unwrap();
+        let verified = archive.verify().unwrap();
+        let mut loader = ArchiveSourceLoader::new(&verified);
+        let loaded = loader
+            .load(Some("profiles/main.dcdl"), "./shared.dcdl")
+            .unwrap();
+        assert_eq!(loaded.key, "profiles/shared.dcdl");
+    }
+
+    #[test]
+    fn archive_verify_rejects_import_map_that_bypasses_virtual_resolver() {
+        let mut entrypoints = BTreeMap::new();
+        entrypoints.insert("default".to_string(), "profiles/main.dcdl".to_string());
+        let mut imports = BTreeMap::new();
+        imports.insert(
+            "profiles/main.dcdl\0./shared.dcdl".to_string(),
+            "profiles/other.dcdl".to_string(),
+        );
+        let mut sources = BTreeMap::new();
+        sources.insert("profiles/main.dcdl".to_string(), "{}".to_string());
+        sources.insert("profiles/other.dcdl".to_string(), "{}".to_string());
+        let archive = ProfileSourceArchive::build(ProfileSourceArchiveInput {
+            id: "project".to_string(),
+            entrypoints,
+            imports,
+            sources,
+        })
+        .unwrap();
+        assert!(matches!(
+            archive.verify(),
+            Err(ProfileArchiveError::ImportMapMismatch { .. })
+        ));
     }
 }

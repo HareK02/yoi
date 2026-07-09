@@ -8,6 +8,8 @@ import type {
   WorkspaceMetadataMutationResponse,
   WorkspaceMetadataSettingsResponse,
   WorkspaceProfileSourceDetailResponse,
+  WorkspaceProfileSourceTreeFileResponse,
+  WorkspaceProfileSourceTreeResponse,
 } from "./profile-types";
 
 export function fetchWorkspaceMetadataSettings(
@@ -113,6 +115,47 @@ export function deleteProfileSource(
     `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/${
       encodeURIComponent(sourceId)
     }`,
+    { method: "DELETE", body: JSON.stringify(request) },
+  );
+}
+
+export function fetchProfileSourceTree(
+  workspaceId: string,
+  sourceTreeId: string,
+): Promise<WorkspaceProfileSourceTreeResponse> {
+  return workspaceApiJson(
+    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/trees/${encodeURIComponent(sourceTreeId)}`,
+  );
+}
+
+export function fetchProfileTreeFile(
+  workspaceId: string,
+  sourceTreeId: string,
+  path: string,
+): Promise<WorkspaceProfileSourceTreeFileResponse> {
+  return workspaceApiJson(
+    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/trees/${encodeURIComponent(sourceTreeId)}/file?path=${encodeURIComponent(path)}`,
+  );
+}
+
+export function writeProfileTreeFile(
+  workspaceId: string,
+  sourceTreeId: string,
+  request: { path: string; content: string; revision?: string | null },
+): Promise<WorkspaceProfileSourceTreeFileResponse> {
+  return workspaceApiJsonWithBody(
+    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/trees/${encodeURIComponent(sourceTreeId)}/file`,
+    { method: "PUT", body: JSON.stringify(request) },
+  );
+}
+
+export function deleteProfileTreeFile(
+  workspaceId: string,
+  sourceTreeId: string,
+  request: { path: string; revision: string },
+): Promise<WorkspaceProfileSourceTreeResponse> {
+  return workspaceApiJsonWithBody(
+    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/trees/${encodeURIComponent(sourceTreeId)}/file`,
     { method: "DELETE", body: JSON.stringify(request) },
   );
 }

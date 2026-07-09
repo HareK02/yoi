@@ -38,8 +38,9 @@ use crate::observation::{
 };
 use crate::profile_settings::{
     CreateWorkspaceProfileSourceRequest, DeleteWorkspaceProfileSourceRequest,
+    DeleteWorkspaceProfileTreeFileRequest, ReadWorkspaceProfileTreeFileQuery,
     UpdateWorkspaceMetadataRequest, UpdateWorkspaceProfileRegistryRequest,
-    UpdateWorkspaceProfileSourceRequest,
+    UpdateWorkspaceProfileSourceRequest, WriteWorkspaceProfileTreeFileRequest,
 };
 use crate::records::{
     LocalProjectRecordReader, ObjectiveDetail, ProjectRecordList, TicketDetail, TicketSummary,
@@ -280,6 +281,16 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/settings/profiles/registry",
             put(scoped_update_profile_registry),
+        )
+        .route(
+            "/api/w/{workspace_id}/settings/profiles/trees/{source_tree_id}",
+            get(scoped_get_profile_source_tree),
+        )
+        .route(
+            "/api/w/{workspace_id}/settings/profiles/trees/{source_tree_id}/file",
+            get(scoped_get_profile_tree_file)
+                .put(scoped_write_profile_tree_file)
+                .delete(scoped_delete_profile_tree_file),
         )
         .route(
             "/api/w/{workspace_id}/settings/profiles/{profile_source_id}",
@@ -903,6 +914,60 @@ async fn scoped_update_profile_registry(
     Ok(Json(crate::profile_settings::update_profile_registry(
         &api.config.workspace_id,
         &api.config.workspace_root,
+        request,
+    )?))
+}
+
+async fn scoped_get_profile_source_tree(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, source_tree_id)): AxumPath<(String, String)>,
+) -> ApiResult<Json<crate::profile_settings::WorkspaceProfileSourceTreeResponse>> {
+    validate_workspace_scope(&api, &workspace_id)?;
+    Ok(Json(crate::profile_settings::read_profile_source_tree(
+        &workspace_id,
+        &api.config.workspace_root,
+        &source_tree_id,
+    )?))
+}
+
+async fn scoped_get_profile_tree_file(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, source_tree_id)): AxumPath<(String, String)>,
+    Query(query): Query<ReadWorkspaceProfileTreeFileQuery>,
+) -> ApiResult<Json<crate::profile_settings::WorkspaceProfileSourceTreeFileResponse>> {
+    validate_workspace_scope(&api, &workspace_id)?;
+    Ok(Json(crate::profile_settings::read_profile_tree_file(
+        &workspace_id,
+        &api.config.workspace_root,
+        &source_tree_id,
+        query,
+    )?))
+}
+
+async fn scoped_write_profile_tree_file(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, source_tree_id)): AxumPath<(String, String)>,
+    Json(request): Json<WriteWorkspaceProfileTreeFileRequest>,
+) -> ApiResult<Json<crate::profile_settings::WorkspaceProfileSourceTreeFileResponse>> {
+    validate_workspace_scope(&api, &workspace_id)?;
+    Ok(Json(crate::profile_settings::write_profile_tree_file(
+        &workspace_id,
+        &api.config.workspace_root,
+        &source_tree_id,
+        request,
+    )?))
+}
+
+async fn scoped_delete_profile_tree_file(
+    State(api): State<WorkspaceApi>,
+    AxumPath((workspace_id, source_tree_id)): AxumPath<(String, String)>,
+    Json(request): Json<DeleteWorkspaceProfileTreeFileRequest>,
+) -> ApiResult<Json<crate::profile_settings::WorkspaceProfileSourceTreeResponse>> {
+    validate_workspace_scope(&api, &workspace_id)?;
+    Ok(Json(crate::profile_settings::delete_profile_tree_file(
+        &workspace_id,
+        &api.config.workspace_root,
+        &source_tree_id,
         request,
     )?))
 }

@@ -124,3 +124,28 @@ Acceptance basis:
 - side effect はこの `queued -> inprogress` acceptance 後に、worktree-workflow に沿って implementation worktree を作成してから開始する。
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-09T08:22:18Z -->
+
+## Implementation report
+
+Implemented ProfileSourceTree virtual source-tree support for project Decodal profiles.
+
+Summary:
+- Added Runtime archive manifest validation for virtual source metadata, duplicate/undeclared tar entries, scoped import-map keys, namespace/path safety, and current-source relative import resolution without filesystem reads.
+- Added Backend-owned project `ProfileSourceTree` API over virtual `profiles/...` paths, revision-aware read/write/delete file operations, path validation, tree scanning, import closure/archive building from tree contents, and project-profile config bundle generation from archives.
+- Extended workspace server routes and browser API/types for scoped profile source tree access without exposing host absolute paths or resource/archive internals.
+- Added a Profiles settings Decodal CodeMirror editor backed by virtual paths/revision tokens only.
+- Added worker-runtime tests for scoped virtual imports and import-map mismatch rejection.
+
+Validation:
+- `git diff --check`
+- `cargo test -p yoi-workspace-server`
+- `cargo test -p worker-runtime --features ws-server,fs-store`
+- `cargo check -p yoi`
+- `cd web/workspace && deno task check && deno task test`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+
+---
