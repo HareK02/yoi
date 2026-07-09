@@ -310,3 +310,39 @@ Second review-fix implementation report:
 - Requesting second follow-up external review against `941b9126..13c6548b` and full combined implementation。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-09T09:16:20Z status: approve -->
+
+## Review: approve
+
+External second follow-up review result: approve
+
+Blockers verified:
+- Source-root symlink rejection is now in the shared source-root path validation:
+  - `existing_profile_source_root` rejects `.yoi/profiles` when the final component is a symlink。
+  - `prepare_profile_source_root_for_write` rejects both `.yoi` symlink parents and `.yoi/profiles` symlink roots before create/write operations。
+  - `checked_source_path`, tree listing, file read/write/delete, and archive construction all flow through these guards before touching tree contents。
+- Regression coverage for `.yoi/profiles -> outside_dir` exists:
+  - `source_root_symlink_is_rejected_before_tree_side_effects` covers write rejection before outside side effects, `read_profile_source_tree` fail-closed behavior, and `build_workspace_profile_archive` fail-closed behavior。
+  - Existing symlink-parent / entry symlink tests remain in place for nested escape cases。
+
+Still-good items checked and intact:
+- Decodal editor wiring remains present via the Svelte editor component using `decodal()` / CodeMirror integration。
+- Profile tree API routes remain wired for tree read and file create/save/delete:
+  - `/settings/profiles/trees/{source_tree_id}`
+  - `/settings/profiles/trees/{source_tree_id}/file`
+- Virtual source tree summaries still expose virtual metadata/provenance/digest-type fields without host path disclosure。
+- Selected-root archive construction still uses the selected profile entrypoint plus import closure rather than blindly archiving every source。
+- `Runtime ArchiveSourceLoader` behavior remains bounded to archive manifest/import-map package files plus archive-backed imports; no host filesystem fallback was introduced。
+
+Validation performed:
+- Read Ticket records in `.yoi/tickets/00001KX1JNJ2Y/`, including latest implementation/review context。
+- Inspected latest fix `13c6548b`, diff from `941b9126..13c6548b`, and relevant source files in the implementation worktree only。
+- Reviewed the orchestrator-provided successful validation list; Reviewer did not rerun tests or modify files。
+
+Non-blocking follow-up:
+- A direct assertion for `read_profile_tree_file` against a root-symlinked `.yoi/profiles` would make the regression matrix even more explicit, but the implementation path already uses the same guarded `checked_source_path`, so this is not a merge blocker。
+
+No merge-blocking issues found.
+
+---
