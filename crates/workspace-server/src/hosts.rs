@@ -16,7 +16,7 @@ use std::{
 use worker_runtime::catalog::{
     ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerDetail as EmbeddedWorkerDetail,
     WorkerStatus as EmbeddedWorkerStatus, WorkingDirectoryClaim, WorkingDirectoryRequest,
-    WorkingDirectorySummary,
+    WorkingDirectoryStatus, WorkingDirectorySummary,
 };
 use worker_runtime::config_bundle::{
     ConfigBundle, ConfigBundleAvailability, ConfigBundleMetadata, ConfigBundleProvenance,
@@ -32,6 +32,7 @@ use worker_runtime::http_server::{
     RuntimeHttpErrorResponse, RuntimeHttpSummaryResponse, RuntimeHttpTranscriptResponse,
     RuntimeHttpWorkerInputResponse, RuntimeHttpWorkerLifecycleRequest,
     RuntimeHttpWorkerLifecycleResponse, RuntimeHttpWorkerResponse, RuntimeHttpWorkersResponse,
+    RuntimeHttpWorkingDirectoriesResponse, RuntimeHttpWorkingDirectoryResponse,
 };
 use worker_runtime::identity::{
     RuntimeId as EmbeddedRuntimeId, WorkerId as EmbeddedWorkerId, WorkerRef as EmbeddedWorkerRef,
@@ -263,6 +264,14 @@ impl<T> RuntimeList<T> {
 pub struct WorkerLookupResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker: Option<WorkerSummary>,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeWorkingDirectoryResult {
+    pub state: WorkerOperationState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<WorkingDirectoryStatus>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -536,6 +545,56 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
     fn list_workers(&self, limit: usize) -> RuntimeList<WorkerSummary>;
 
     fn worker(&self, worker_id: &str) -> WorkerLookupResult;
+
+    fn create_working_directory(
+        &self,
+        _request: WorkingDirectoryRequest,
+    ) -> RuntimeWorkingDirectoryResult {
+        RuntimeWorkingDirectoryResult {
+            state: WorkerOperationState::Unsupported,
+            working_directory: None,
+            diagnostics: vec![diagnostic(
+                "runtime_working_directory_create_unsupported",
+                DiagnosticSeverity::Info,
+                "runtime does not implement working directory creation".to_string(),
+            )],
+        }
+    }
+
+    fn list_working_directories(&self) -> RuntimeList<WorkingDirectoryStatus> {
+        RuntimeList::new(Vec::new(), Vec::new())
+    }
+
+    fn working_directory(&self, working_directory_id: &str) -> RuntimeWorkingDirectoryResult {
+        RuntimeWorkingDirectoryResult {
+            state: WorkerOperationState::Unsupported,
+            working_directory: None,
+            diagnostics: vec![diagnostic(
+                "runtime_working_directory_lookup_unsupported",
+                DiagnosticSeverity::Info,
+                format!(
+                    "runtime does not implement working directory lookup for `{working_directory_id}`"
+                ),
+            )],
+        }
+    }
+
+    fn cleanup_working_directory(
+        &self,
+        working_directory_id: &str,
+    ) -> RuntimeWorkingDirectoryResult {
+        RuntimeWorkingDirectoryResult {
+            state: WorkerOperationState::Unsupported,
+            working_directory: None,
+            diagnostics: vec![diagnostic(
+                "runtime_working_directory_cleanup_unsupported",
+                DiagnosticSeverity::Info,
+                format!(
+                    "runtime does not implement working directory cleanup for `{working_directory_id}`"
+                ),
+            )],
+        }
+    }
 
     fn spawn_worker(&self, request: WorkerSpawnRequest) -> WorkerSpawnResult {
         WorkerSpawnResult {
@@ -880,6 +939,47 @@ impl RuntimeRegistry {
         validate_backend_identifier("runtime_id", runtime_id)?;
         let runtime = self.runtime(runtime_id)?;
         Ok(runtime.spawn_worker(request))
+    }
+
+    pub fn create_working_directory(
+        &self,
+        runtime_id: &str,
+        request: WorkingDirectoryRequest,
+    ) -> Result<RuntimeWorkingDirectoryResult, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        Ok(runtime.create_working_directory(request))
+    }
+
+    pub fn list_working_directories(
+        &self,
+        runtime_id: &str,
+    ) -> Result<RuntimeList<WorkingDirectoryStatus>, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        Ok(runtime.list_working_directories())
+    }
+
+    pub fn working_directory(
+        &self,
+        runtime_id: &str,
+        working_directory_id: &str,
+    ) -> Result<RuntimeWorkingDirectoryResult, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        validate_backend_identifier("working_directory_id", working_directory_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        Ok(runtime.working_directory(working_directory_id))
+    }
+
+    pub fn cleanup_working_directory(
+        &self,
+        runtime_id: &str,
+        working_directory_id: &str,
+    ) -> Result<RuntimeWorkingDirectoryResult, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        validate_backend_identifier("working_directory_id", working_directory_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        Ok(runtime.cleanup_working_directory(working_directory_id))
     }
 
     pub fn sync_config_bundle(
@@ -1306,6 +1406,64 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             },
             Err(err) => WorkerLookupResult {
                 worker: None,
+                diagnostics: vec![embedded_runtime_diagnostic(&err)],
+            },
+        }
+    }
+
+    fn create_working_directory(
+        &self,
+        request: WorkingDirectoryRequest,
+    ) -> RuntimeWorkingDirectoryResult {
+        match self.runtime.create_working_directory(request) {
+            Ok(working_directory) => RuntimeWorkingDirectoryResult {
+                state: WorkerOperationState::Accepted,
+                working_directory: Some(working_directory),
+                diagnostics: Vec::new(),
+            },
+            Err(err) => RuntimeWorkingDirectoryResult {
+                state: WorkerOperationState::Rejected,
+                working_directory: None,
+                diagnostics: vec![embedded_runtime_diagnostic(&err)],
+            },
+        }
+    }
+
+    fn list_working_directories(&self) -> RuntimeList<WorkingDirectoryStatus> {
+        match self.runtime.list_working_directories() {
+            Ok(items) => RuntimeList::new(items, Vec::new()),
+            Err(err) => RuntimeList::new(Vec::new(), vec![embedded_runtime_diagnostic(&err)]),
+        }
+    }
+
+    fn working_directory(&self, working_directory_id: &str) -> RuntimeWorkingDirectoryResult {
+        match self.runtime.working_directory(working_directory_id) {
+            Ok(working_directory) => RuntimeWorkingDirectoryResult {
+                state: WorkerOperationState::Accepted,
+                working_directory: Some(working_directory),
+                diagnostics: Vec::new(),
+            },
+            Err(err) => RuntimeWorkingDirectoryResult {
+                state: WorkerOperationState::Rejected,
+                working_directory: None,
+                diagnostics: vec![embedded_runtime_diagnostic(&err)],
+            },
+        }
+    }
+
+    fn cleanup_working_directory(
+        &self,
+        working_directory_id: &str,
+    ) -> RuntimeWorkingDirectoryResult {
+        match self.runtime.cleanup_working_directory(working_directory_id) {
+            Ok(working_directory) => RuntimeWorkingDirectoryResult {
+                state: WorkerOperationState::Accepted,
+                working_directory: Some(working_directory),
+                diagnostics: Vec::new(),
+            },
+            Err(err) => RuntimeWorkingDirectoryResult {
+                state: WorkerOperationState::Rejected,
+                working_directory: None,
                 diagnostics: vec![embedded_runtime_diagnostic(&err)],
             },
         }
@@ -1811,6 +1969,13 @@ impl RemoteWorkerRuntime {
         self.send_json(self.http.post(self.endpoint(path)).json(body))
     }
 
+    fn delete_json<T>(&self, path: &str) -> Result<T, RuntimeDiagnostic>
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        self.send_json(self.http.delete(self.endpoint(path)))
+    }
+
     fn send_json<T>(&self, request: RequestBuilder) -> Result<T, RuntimeDiagnostic>
     where
         T: DeserializeOwned + Send + 'static,
@@ -2030,6 +2195,71 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             },
             Err(diagnostic) => WorkerLookupResult {
                 worker: None,
+                diagnostics: vec![diagnostic],
+            },
+        }
+    }
+
+    fn create_working_directory(
+        &self,
+        request: WorkingDirectoryRequest,
+    ) -> RuntimeWorkingDirectoryResult {
+        match self.post_json::<_, RuntimeHttpWorkingDirectoryResponse>(
+            "/v1/working-directories",
+            &request,
+        ) {
+            Ok(response) => RuntimeWorkingDirectoryResult {
+                state: WorkerOperationState::Accepted,
+                working_directory: Some(response.working_directory),
+                diagnostics: Vec::new(),
+            },
+            Err(diagnostic) => RuntimeWorkingDirectoryResult {
+                state: WorkerOperationState::Rejected,
+                working_directory: None,
+                diagnostics: vec![diagnostic],
+            },
+        }
+    }
+
+    fn list_working_directories(&self) -> RuntimeList<WorkingDirectoryStatus> {
+        match self.get_json::<RuntimeHttpWorkingDirectoriesResponse>("/v1/working-directories") {
+            Ok(response) => RuntimeList::new(response.working_directories, Vec::new()),
+            Err(diagnostic) => RuntimeList::new(Vec::new(), vec![diagnostic]),
+        }
+    }
+
+    fn working_directory(&self, working_directory_id: &str) -> RuntimeWorkingDirectoryResult {
+        match self.get_json::<RuntimeHttpWorkingDirectoryResponse>(&format!(
+            "/v1/working-directories/{working_directory_id}"
+        )) {
+            Ok(response) => RuntimeWorkingDirectoryResult {
+                state: WorkerOperationState::Accepted,
+                working_directory: Some(response.working_directory),
+                diagnostics: Vec::new(),
+            },
+            Err(diagnostic) => RuntimeWorkingDirectoryResult {
+                state: WorkerOperationState::Rejected,
+                working_directory: None,
+                diagnostics: vec![diagnostic],
+            },
+        }
+    }
+
+    fn cleanup_working_directory(
+        &self,
+        working_directory_id: &str,
+    ) -> RuntimeWorkingDirectoryResult {
+        match self.delete_json::<RuntimeHttpWorkingDirectoryResponse>(&format!(
+            "/v1/working-directories/{working_directory_id}"
+        )) {
+            Ok(response) => RuntimeWorkingDirectoryResult {
+                state: WorkerOperationState::Accepted,
+                working_directory: Some(response.working_directory),
+                diagnostics: Vec::new(),
+            },
+            Err(diagnostic) => RuntimeWorkingDirectoryResult {
+                state: WorkerOperationState::Rejected,
+                working_directory: None,
                 diagnostics: vec![diagnostic],
             },
         }
@@ -2801,6 +3031,14 @@ fn remote_reqwest_diagnostic(runtime_id: &str, err: reqwest::Error) -> RuntimeDi
     }
 }
 
+fn sanitize_remote_runtime_message(code: &str, message: &str) -> String {
+    if message.contains('/') || message.contains('\\') {
+        format!("remote Runtime returned {code}; backend-private details were omitted")
+    } else {
+        message.to_string()
+    }
+}
+
 fn remote_http_status_diagnostic(
     runtime_id: &str,
     status: StatusCode,
@@ -2811,6 +3049,10 @@ fn remote_http_status_diagnostic(
         .as_ref()
         .map(|error| error.error.code.as_str())
         .unwrap_or("remote_http_error");
+    let remote_message = error
+        .as_ref()
+        .map(|error| sanitize_remote_runtime_message(remote_code, &error.error.message))
+        .unwrap_or_else(|| "remote Runtime did not return a typed error body".to_string());
     let (code, severity) = match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
             ("remote_runtime_auth_failed", DiagnosticSeverity::Error)
@@ -2820,14 +3062,12 @@ fn remote_http_status_diagnostic(
             ("remote_runtime_unsupported", DiagnosticSeverity::Warning)
         }
         _ if status.is_server_error() => ("remote_runtime_http_error", DiagnosticSeverity::Error),
-        _ => ("remote_runtime_http_rejected", DiagnosticSeverity::Warning),
+        _ => (remote_code, DiagnosticSeverity::Warning),
     };
     diagnostic(
         code,
         severity,
-        format!(
-            "Remote Runtime '{runtime_id}' rejected request ({remote_code}, HTTP {status}); internal details were sanitized"
-        ),
+        format!("Remote Runtime '{runtime_id}' rejected request (HTTP {status}): {remote_message}"),
     )
 }
 

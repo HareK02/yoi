@@ -142,10 +142,12 @@
     creatingWorkingDirectory = true;
     submitError = null;
     try {
-      const response = await fetch(workerApiPath('/working-directories'), {
+      const response = await fetch(
+        workerApiPath(`/runtimes/${encodeURIComponent(runtimeId)}/working-directories`), {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
+          runtime_id: runtimeId,
           repository_id: workingDirectoryRepositoryId,
           selector: workingDirectorySelector || null,
           policy: { dirty_state: 'clean_point_only', cleanup: 'manual_or_worker_stop' },

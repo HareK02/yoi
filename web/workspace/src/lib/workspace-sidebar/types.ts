@@ -150,6 +150,7 @@ export type BrowserWorkerWorkingDirectorySelection = {
 };
 
 export type BrowserWorkingDirectoryCreateRequest = {
+  runtime_id: string;
   repository_id: string;
   selector?: string | null;
   policy?: {

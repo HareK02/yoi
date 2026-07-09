@@ -95,6 +95,10 @@ pub struct WorkingDirectoryDiagnostic {
 }
 
 impl WorkingDirectoryDiagnostic {
+    pub fn rejected(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(code, message)
+    }
+
     fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),

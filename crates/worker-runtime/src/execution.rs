@@ -1,11 +1,11 @@
-use crate::catalog::{CreateWorkerRequest, WorkingDirectoryStatus};
+use crate::catalog::{CreateWorkerRequest, WorkingDirectoryRequest, WorkingDirectoryStatus};
 use crate::config_bundle::ConfigBundle;
 use crate::error::RuntimeError;
 use crate::identity::WorkerRef;
 use crate::interaction::WorkerInput;
 #[cfg(feature = "ws-server")]
 use crate::observation::WorkerObservationEvent;
-use crate::working_directory::WorkingDirectoryBinding;
+use crate::working_directory::{WorkingDirectoryBinding, WorkingDirectoryDiagnostic};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
@@ -313,6 +313,42 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
 
     fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult;
 
+    fn create_working_directory(
+        &self,
+        _request: &WorkingDirectoryRequest,
+    ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
+        Err(WorkingDirectoryDiagnostic::rejected(
+            "working_directory_unsupported",
+            "Worker execution backend does not support working directory materialization",
+        ))
+    }
+
+    fn list_working_directories(&self) -> Vec<WorkingDirectoryStatus> {
+        Vec::new()
+    }
+
+    fn working_directory(
+        &self,
+        working_directory_id: &str,
+    ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
+        Err(WorkingDirectoryDiagnostic::rejected(
+            "working_directory_unknown",
+            format!("working directory `{working_directory_id}` is not known to this Runtime"),
+        ))
+    }
+
+    fn cleanup_working_directory(
+        &self,
+        working_directory_id: &str,
+    ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
+        Err(WorkingDirectoryDiagnostic::rejected(
+            "working_directory_cleanup_unsupported",
+            format!(
+                "working directory `{working_directory_id}` cannot be cleaned up by this backend"
+            ),
+        ))
+    }
+
     fn dispatch_input(
         &self,
         handle: &WorkerExecutionHandle,
@@ -356,6 +392,31 @@ impl WorkerExecutionBackendRef {
         request: WorkerExecutionSpawnRequest,
     ) -> WorkerExecutionSpawnResult {
         self.backend.spawn_worker(request)
+    }
+
+    pub(crate) fn create_working_directory(
+        &self,
+        request: &WorkingDirectoryRequest,
+    ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
+        self.backend.create_working_directory(request)
+    }
+
+    pub(crate) fn list_working_directories(&self) -> Vec<WorkingDirectoryStatus> {
+        self.backend.list_working_directories()
+    }
+
+    pub(crate) fn working_directory(
+        &self,
+        working_directory_id: &str,
+    ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
+        self.backend.working_directory(working_directory_id)
+    }
+
+    pub(crate) fn cleanup_working_directory(
+        &self,
+        working_directory_id: &str,
+    ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
+        self.backend.cleanup_working_directory(working_directory_id)
     }
 
     pub(crate) fn dispatch_input(

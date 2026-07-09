@@ -1,6 +1,7 @@
 use crate::catalog::{
     ConfigBundleRef, CreateWorkerRequest, ProfileSelector, WorkerDetail, WorkerLifecycleAck,
-    WorkerStatus, WorkerSummary, WorkingDirectoryStatus as CatalogWorkingDirectoryStatus,
+    WorkerStatus, WorkerSummary, WorkingDirectoryRequest,
+    WorkingDirectoryStatus as CatalogWorkingDirectoryStatus,
 };
 use crate::config_bundle::{
     ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary, validate_config_bundle,
@@ -232,6 +233,79 @@ impl Runtime {
         state.persist_workers()?;
         state.persist_event_by_id(event_id)?;
         Ok(event_id)
+    }
+
+    /// Create a Runtime-owned working directory through the attached execution backend.
+    pub fn create_working_directory(
+        &self,
+        request: WorkingDirectoryRequest,
+    ) -> Result<CatalogWorkingDirectoryStatus, RuntimeError> {
+        let backend = {
+            let state = self.lock()?;
+            state.ensure_running()?;
+            state.execution_backend.clone().ok_or_else(|| {
+                RuntimeError::ExecutionBackendUnavailable {
+                    message: "working directory creation requires an execution backend".to_string(),
+                }
+            })?
+        };
+        backend
+            .create_working_directory(&request)
+            .map_err(|diagnostic| RuntimeError::InvalidRequest(diagnostic.to_string()))
+    }
+
+    /// List Runtime-owned working directories through the attached execution backend.
+    pub fn list_working_directories(
+        &self,
+    ) -> Result<Vec<CatalogWorkingDirectoryStatus>, RuntimeError> {
+        let backend = {
+            let state = self.lock()?;
+            state.ensure_running()?;
+            state.execution_backend.clone().ok_or_else(|| {
+                RuntimeError::ExecutionBackendUnavailable {
+                    message: "working directory listing requires an execution backend".to_string(),
+                }
+            })?
+        };
+        Ok(backend.list_working_directories())
+    }
+
+    /// Get a Runtime-owned working directory status.
+    pub fn working_directory(
+        &self,
+        working_directory_id: &str,
+    ) -> Result<CatalogWorkingDirectoryStatus, RuntimeError> {
+        let backend = {
+            let state = self.lock()?;
+            state.ensure_running()?;
+            state.execution_backend.clone().ok_or_else(|| {
+                RuntimeError::ExecutionBackendUnavailable {
+                    message: "working directory lookup requires an execution backend".to_string(),
+                }
+            })?
+        };
+        backend
+            .working_directory(working_directory_id)
+            .map_err(|diagnostic| RuntimeError::InvalidRequest(diagnostic.to_string()))
+    }
+
+    /// Cleanup a Runtime-owned working directory.
+    pub fn cleanup_working_directory(
+        &self,
+        working_directory_id: &str,
+    ) -> Result<CatalogWorkingDirectoryStatus, RuntimeError> {
+        let backend = {
+            let state = self.lock()?;
+            state.ensure_running()?;
+            state.execution_backend.clone().ok_or_else(|| {
+                RuntimeError::ExecutionBackendUnavailable {
+                    message: "working directory cleanup requires an execution backend".to_string(),
+                }
+            })?
+        };
+        backend
+            .cleanup_working_directory(working_directory_id)
+            .map_err(|diagnostic| RuntimeError::InvalidRequest(diagnostic.to_string()))
     }
 
     /// Create a Worker through the canonical ConfigBundle + execution backend path.

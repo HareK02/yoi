@@ -9,6 +9,7 @@
 use crate::Runtime;
 use crate::catalog::{
     ConfigBundleRef, CreateWorkerRequest, WorkerDetail, WorkerLifecycleAck, WorkerSummary,
+    WorkingDirectoryRequest, WorkingDirectoryStatus,
 };
 use crate::config_bundle::{ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary};
 use crate::error::RuntimeError;
@@ -138,6 +139,14 @@ pub fn runtime_http_router(runtime: Runtime, local_token: Option<String>) -> Rou
             "/v1/config-bundles/{bundle_id}/availability",
             get(check_config_bundle),
         )
+        .route(
+            "/v1/working-directories",
+            get(list_working_directories).post(create_working_directory),
+        )
+        .route(
+            "/v1/working-directories/{working_directory_id}",
+            get(get_working_directory).delete(cleanup_working_directory),
+        )
         .route("/v1/workers", get(list_workers).post(create_worker))
         .route("/v1/workers/{worker_id}", get(get_worker))
         .route("/v1/workers/{worker_id}/input", post(send_worker_input))
@@ -195,6 +204,18 @@ struct RuntimeHttpConfigBundleAvailabilityQuery {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeHttpWorkersResponse {
     pub workers: Vec<WorkerSummary>,
+}
+
+/// `GET /v1/working-directories` response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeHttpWorkingDirectoriesResponse {
+    pub working_directories: Vec<WorkingDirectoryStatus>,
+}
+
+/// Working directory response used by create/detail/delete endpoints.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeHttpWorkingDirectoryResponse {
+    pub working_directory: WorkingDirectoryStatus,
 }
 
 /// Worker detail response used by create/detail endpoints.
@@ -397,6 +418,58 @@ async fn list_workers(
         .list_workers()
         .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkersResponse { workers }))
+}
+
+async fn list_working_directories(
+    State(state): State<RuntimeHttpState>,
+) -> RestResult<RuntimeHttpWorkingDirectoriesResponse> {
+    let working_directories = state
+        .runtime
+        .list_working_directories()
+        .map_err(RuntimeHttpRestError::runtime)?;
+    Ok(Json(RuntimeHttpWorkingDirectoriesResponse {
+        working_directories,
+    }))
+}
+
+async fn create_working_directory(
+    State(state): State<RuntimeHttpState>,
+    body: Result<Json<WorkingDirectoryRequest>, JsonRejection>,
+) -> RestResult<RuntimeHttpWorkingDirectoryResponse> {
+    let Json(request) = body.map_err(RuntimeHttpRestError::json_rejection)?;
+    let working_directory = state
+        .runtime
+        .create_working_directory(request)
+        .map_err(RuntimeHttpRestError::runtime)?;
+    Ok(Json(RuntimeHttpWorkingDirectoryResponse {
+        working_directory,
+    }))
+}
+
+async fn get_working_directory(
+    State(state): State<RuntimeHttpState>,
+    Path(working_directory_id): Path<String>,
+) -> RestResult<RuntimeHttpWorkingDirectoryResponse> {
+    let working_directory = state
+        .runtime
+        .working_directory(&working_directory_id)
+        .map_err(RuntimeHttpRestError::runtime)?;
+    Ok(Json(RuntimeHttpWorkingDirectoryResponse {
+        working_directory,
+    }))
+}
+
+async fn cleanup_working_directory(
+    State(state): State<RuntimeHttpState>,
+    Path(working_directory_id): Path<String>,
+) -> RestResult<RuntimeHttpWorkingDirectoryResponse> {
+    let working_directory = state
+        .runtime
+        .cleanup_working_directory(&working_directory_id)
+        .map_err(RuntimeHttpRestError::runtime)?;
+    Ok(Json(RuntimeHttpWorkingDirectoryResponse {
+        working_directory,
+    }))
 }
 
 async fn get_worker(

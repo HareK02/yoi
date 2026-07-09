@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
+use crate::catalog::{WorkingDirectoryRequest, WorkingDirectoryStatus};
 use crate::config_bundle::verified_profile_source_archive;
 use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation, WorkerExecutionResult,
@@ -24,7 +25,9 @@ use crate::resource::{
     BackendResourceClient, BackendResourceError, ProfileSourceArchiveCache,
     build_profile_source_archive_fetch_request, profile_source_archive_from_response,
 };
-use crate::working_directory::{WorkingDirectoryBinding, WorkingDirectoryMaterializer};
+use crate::working_directory::{
+    WorkingDirectoryBinding, WorkingDirectoryDiagnostic, WorkingDirectoryMaterializer,
+};
 use async_trait::async_trait;
 use manifest::paths;
 use protocol::{Method, Segment, WorkerStatus};
@@ -439,6 +442,52 @@ where
 {
     fn backend_id(&self) -> &str {
         &self.backend_id
+    }
+
+    fn create_working_directory(
+        &self,
+        request: &WorkingDirectoryRequest,
+    ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
+        let Some(materializer) = self.working_directory_materializer.as_ref() else {
+            return Err(WorkingDirectoryDiagnostic::rejected(
+                "working_directory_materializer_unavailable",
+                "working directory materialization requested, but no materializer is configured for this runtime backend",
+            ));
+        };
+        Ok(materializer.create(request)?.status())
+    }
+
+    fn list_working_directories(&self) -> Vec<WorkingDirectoryStatus> {
+        self.working_directory_materializer
+            .as_ref()
+            .and_then(|materializer| materializer.list_working_directories().ok())
+            .unwrap_or_default()
+    }
+
+    fn working_directory(
+        &self,
+        working_directory_id: &str,
+    ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
+        let Some(materializer) = self.working_directory_materializer.as_ref() else {
+            return Err(WorkingDirectoryDiagnostic::rejected(
+                "working_directory_materializer_unavailable",
+                "working directory lookup requested, but no materializer is configured for this runtime backend",
+            ));
+        };
+        materializer.working_directory_status(working_directory_id)
+    }
+
+    fn cleanup_working_directory(
+        &self,
+        working_directory_id: &str,
+    ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
+        let Some(materializer) = self.working_directory_materializer.as_ref() else {
+            return Err(WorkingDirectoryDiagnostic::rejected(
+                "working_directory_materializer_unavailable",
+                "working directory cleanup requested, but no materializer is configured for this runtime backend",
+            ));
+        };
+        materializer.cleanup_working_directory(working_directory_id)
     }
 
     fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
