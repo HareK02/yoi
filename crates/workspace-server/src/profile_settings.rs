@@ -504,10 +504,7 @@ pub fn create_profile_source(
         .join("profiles")
         .join(format!("{name}.dcdl"));
     validate_source_content(workspace_root, &name, &relative_path, &request.content)?;
-    let full = checked_source_path(workspace_root, &relative_path)?;
-    if let Some(parent) = full.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let full = prepare_source_path_for_write(workspace_root, &relative_path)?;
     fs::write(&full, request.content)?;
     registry.profile.insert(
         name.clone(),
@@ -1039,33 +1036,49 @@ fn ensure_profile_source_tree_id(source_tree_id: &str) -> Result<()> {
 fn list_profile_tree_files(
     workspace_root: &Path,
 ) -> Result<Vec<WorkspaceProfileSourceTreeFileSummary>> {
+    let Some(source_root) = existing_profile_source_root(workspace_root)? else {
+        return Ok(Vec::new());
+    };
     let mut files = Vec::new();
-    collect_profile_tree_files(
-        workspace_root,
-        &workspace_root.join(PROFILE_SOURCE_ROOT_RELATIVE_PATH),
-        &mut files,
-    )?;
+    collect_profile_tree_files(workspace_root, &source_root, &source_root.path, &mut files)?;
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
 }
 
 fn collect_profile_tree_files(
     workspace_root: &Path,
+    source_root: &ProfileSourceRoot,
     dir: &Path,
     files: &mut Vec<WorkspaceProfileSourceTreeFileSummary>,
 ) -> Result<()> {
-    if !dir.exists() {
-        return Ok(());
+    let canonical_dir = fs::canonicalize(dir)?;
+    if !canonical_dir.starts_with(&source_root.canonical_path) {
+        return Err(profile_source_symlink_escape(
+            "Profile source directory resolves outside the workspace profile source root",
+        ));
     }
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(profile_source_symlink_escape(
+                "Profile source tree entries must not be symlinks",
+            ));
+        }
         if file_type.is_dir() {
-            collect_profile_tree_files(workspace_root, &path, files)?;
+            collect_profile_tree_files(workspace_root, source_root, &path, files)?;
         } else if file_type.is_file()
             && path.extension().and_then(|value| value.to_str()) == Some("dcdl")
         {
+            let canonical_file = fs::canonicalize(&path)?;
+            if !canonical_file.starts_with(&source_root.canonical_path)
+                || !canonical_file.starts_with(&source_root.canonical_workspace)
+            {
+                return Err(profile_source_symlink_escape(
+                    "Profile source file resolves outside the workspace profile source root",
+                ));
+            }
             let relative = path
                 .strip_prefix(workspace_root)
                 .map_err(|_| {
@@ -1398,7 +1411,7 @@ fn validate_source_content(
             message: "Profile source exceeds the browser editing size limit".to_string(),
         });
     }
-    checked_source_path(workspace_root, relative_path)?;
+    validate_source_candidate_path(workspace_root, relative_path)?;
     let mut sources = read_profile_source_tree_contents(workspace_root)?;
     sources.insert(display_source_path(relative_path), content.to_string());
     let mut registry = read_registry(workspace_root).map_err(profile_registry_error)?;
@@ -1639,6 +1652,120 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
+#[derive(Debug, Clone)]
+struct ProfileSourceRoot {
+    path: PathBuf,
+    canonical_path: PathBuf,
+    canonical_workspace: PathBuf,
+}
+
+fn profile_source_symlink_escape(message: impl Into<String>) -> Error {
+    Error::RuntimeOperationFailed {
+        runtime_id: "workspace-backend".to_string(),
+        code: "profile_source_symlink_escape".to_string(),
+        message: message.into(),
+    }
+}
+
+fn existing_profile_source_root(workspace_root: &Path) -> Result<Option<ProfileSourceRoot>> {
+    let source_root = workspace_root.join(PROFILE_SOURCE_ROOT_RELATIVE_PATH);
+    let metadata = match fs::symlink_metadata(&source_root) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    validate_profile_source_root_metadata(workspace_root, source_root, metadata).map(Some)
+}
+
+fn prepare_profile_source_root_for_write(workspace_root: &Path) -> Result<ProfileSourceRoot> {
+    let canonical_workspace = fs::canonicalize(workspace_root)?;
+    let yoi_dir = workspace_root.join(".yoi");
+    match fs::symlink_metadata(&yoi_dir) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(profile_source_symlink_escape(
+                    "Workspace .yoi directory must not be a symlink",
+                ));
+            }
+            if !metadata.is_dir() {
+                return Err(profile_validation_error(
+                    "profile_source_path_invalid",
+                    "Workspace .yoi path is not a directory",
+                ));
+            }
+            let canonical_yoi = fs::canonicalize(&yoi_dir)?;
+            if !canonical_yoi.starts_with(&canonical_workspace) {
+                return Err(profile_source_symlink_escape(
+                    "Workspace .yoi directory resolves outside the workspace root",
+                ));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&yoi_dir)?,
+        Err(err) => return Err(err.into()),
+    }
+
+    let source_root = workspace_root.join(PROFILE_SOURCE_ROOT_RELATIVE_PATH);
+    match fs::symlink_metadata(&source_root) {
+        Ok(metadata) => {
+            validate_profile_source_root_metadata(workspace_root, source_root, metadata)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&source_root)?;
+            let metadata = fs::symlink_metadata(&source_root)?;
+            validate_profile_source_root_metadata(workspace_root, source_root, metadata)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn validate_profile_source_root_metadata(
+    workspace_root: &Path,
+    source_root: PathBuf,
+    metadata: std::fs::Metadata,
+) -> Result<ProfileSourceRoot> {
+    if metadata.file_type().is_symlink() {
+        return Err(profile_source_symlink_escape(
+            "Workspace profile source root must not be a symlink",
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(profile_validation_error(
+            "profile_source_path_invalid",
+            "Workspace profile source root is not a directory",
+        ));
+    }
+    let canonical_workspace = fs::canonicalize(workspace_root)?;
+    let canonical_path = fs::canonicalize(&source_root)?;
+    if !canonical_path.starts_with(&canonical_workspace) {
+        return Err(profile_source_symlink_escape(
+            "Workspace profile source root resolves outside the workspace root",
+        ));
+    }
+    Ok(ProfileSourceRoot {
+        path: source_root,
+        canonical_path,
+        canonical_workspace,
+    })
+}
+
+fn validate_source_candidate_path(workspace_root: &Path, relative_path: &Path) -> Result<()> {
+    validate_relative_source_path(relative_path).map_err(|message| {
+        Error::RuntimeOperationFailed {
+            runtime_id: "workspace-backend".to_string(),
+            code: "profile_source_path_escape".to_string(),
+            message,
+        }
+    })?;
+    let Some(_) = existing_profile_source_root(workspace_root)? else {
+        return Ok(());
+    };
+    let full = workspace_root.join(relative_path);
+    if full.exists() || full.parent().is_some_and(Path::exists) {
+        checked_source_path(workspace_root, relative_path)?;
+    }
+    Ok(())
+}
+
 fn prepare_source_path_for_write(workspace_root: &Path, relative_path: &Path) -> Result<PathBuf> {
     validate_relative_source_path(relative_path).map_err(|message| {
         Error::RuntimeOperationFailed {
@@ -1647,9 +1774,7 @@ fn prepare_source_path_for_write(workspace_root: &Path, relative_path: &Path) ->
             message,
         }
     })?;
-    let source_root = workspace_root.join(PROFILE_SOURCE_ROOT_RELATIVE_PATH);
-    fs::create_dir_all(&source_root)?;
-    let canonical_root = fs::canonicalize(&source_root)?;
+    let source_root = prepare_profile_source_root_for_write(workspace_root)?;
     let full = workspace_root.join(relative_path);
     let parent = full.parent().ok_or_else(|| {
         profile_validation_error(
@@ -1657,13 +1782,13 @@ fn prepare_source_path_for_write(workspace_root: &Path, relative_path: &Path) ->
             "Profile source path has no parent directory",
         )
     })?;
-    let parent_relative = parent.strip_prefix(&source_root).map_err(|_| {
+    let parent_relative = parent.strip_prefix(&source_root.path).map_err(|_| {
         profile_validation_error(
             "profile_source_path_escape",
             "Profile source parent must remain inside the source tree",
         )
     })?;
-    let mut current = source_root.clone();
+    let mut current = source_root.path.clone();
     for component in parent_relative.components() {
         let Component::Normal(name) = component else {
             return Err(profile_validation_error(
@@ -1675,11 +1800,9 @@ fn prepare_source_path_for_write(workspace_root: &Path, relative_path: &Path) ->
         match fs::symlink_metadata(&next) {
             Ok(metadata) => {
                 if metadata.file_type().is_symlink() {
-                    return Err(Error::RuntimeOperationFailed {
-                        runtime_id: "workspace-backend".to_string(),
-                        code: "profile_source_symlink_escape".to_string(),
-                        message: "Profile source parent contains a symlink".to_string(),
-                    });
+                    return Err(profile_source_symlink_escape(
+                        "Profile source parent contains a symlink",
+                    ));
                 }
                 if !metadata.is_dir() {
                     return Err(profile_validation_error(
@@ -1688,12 +1811,12 @@ fn prepare_source_path_for_write(workspace_root: &Path, relative_path: &Path) ->
                     ));
                 }
                 let canonical_next = fs::canonicalize(&next)?;
-                if !canonical_next.starts_with(&canonical_root) {
-                    return Err(Error::RuntimeOperationFailed {
-                        runtime_id: "workspace-backend".to_string(),
-                        code: "profile_source_symlink_escape".to_string(),
-                        message: "Profile source parent resolves outside the workspace profile source root".to_string(),
-                    });
+                if !canonical_next.starts_with(&source_root.canonical_path)
+                    || !canonical_next.starts_with(&source_root.canonical_workspace)
+                {
+                    return Err(profile_source_symlink_escape(
+                        "Profile source parent resolves outside the workspace profile source root",
+                    ));
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&next)?,
@@ -1712,22 +1835,26 @@ fn checked_source_path(workspace_root: &Path, relative_path: &Path) -> Result<Pa
             message,
         }
     })?;
-    let source_root = workspace_root.join(PROFILE_SOURCE_ROOT_RELATIVE_PATH);
-    fs::create_dir_all(&source_root)?;
-    let canonical_root = fs::canonicalize(&source_root)?;
+    let source_root = existing_profile_source_root(workspace_root)?.ok_or_else(|| {
+        profile_validation_error(
+            "profile_source_missing",
+            "Workspace profile source root does not exist",
+        )
+    })?;
     let full = workspace_root.join(relative_path);
     if let Ok(canonical_full) = fs::canonicalize(&full) {
-        if !canonical_full.starts_with(&canonical_root) {
-            return Err(Error::RuntimeOperationFailed {
-                runtime_id: "workspace-backend".to_string(),
-                code: "profile_source_symlink_escape".to_string(),
-                message: "Profile source resolves outside the workspace profile source root"
-                    .to_string(),
-            });
+        if !canonical_full.starts_with(&source_root.canonical_path)
+            || !canonical_full.starts_with(&source_root.canonical_workspace)
+        {
+            return Err(profile_source_symlink_escape(
+                "Profile source resolves outside the workspace profile source root",
+            ));
         }
     } else if let Some(parent) = full.parent() {
         let canonical_parent = fs::canonicalize(parent)?;
-        if !canonical_parent.starts_with(&canonical_root) {
+        if !canonical_parent.starts_with(&source_root.canonical_path)
+            || !canonical_parent.starts_with(&source_root.canonical_workspace)
+        {
             return Err(Error::RuntimeOperationFailed {
                 runtime_id: "workspace-backend".to_string(),
                 code: "profile_source_path_escape".to_string(),
@@ -2165,5 +2292,36 @@ mod tests {
 
         assert!(err.to_string().contains("profile_source_symlink_escape"));
         assert!(!outside.path().join("nested").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_root_symlink_is_rejected_before_tree_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".yoi")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join(".yoi/profiles")).unwrap();
+
+        let err = write_profile_tree_file(
+            "workspace-test",
+            dir.path(),
+            PROFILE_SOURCE_TREE_ID,
+            WriteWorkspaceProfileTreeFileRequest {
+                path: "profiles/nested/new.dcdl".to_string(),
+                content: valid_decodal("new"),
+                revision: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("profile_source_symlink_escape"));
+        assert!(!outside.path().join("nested").exists());
+        assert!(!outside.path().join("new.dcdl").exists());
+
+        let err = read_profile_source_tree("workspace-test", dir.path(), PROFILE_SOURCE_TREE_ID)
+            .unwrap_err();
+        assert!(err.to_string().contains("profile_source_symlink_escape"));
+
+        let err = build_workspace_profile_archive(dir.path(), "project:any").unwrap_err();
+        assert!(err.to_string().contains("profile_source_symlink_escape"));
     }
 }

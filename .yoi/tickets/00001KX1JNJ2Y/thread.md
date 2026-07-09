@@ -175,3 +175,27 @@ Validation:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-09T09:08:18Z -->
+
+## Implementation report
+
+Follow-up fix for source-root symlink review blocker.
+
+Summary:
+- Added a shared ProfileSourceRoot guard that rejects `.yoi/profiles` when it is a symlink and verifies the canonical profile source root remains under the canonical workspace root.
+- Applied the guard to source tree listing, tree file read/delete checks, write preparation, source summaries, and archive construction through the existing tree scan/read path.
+- Hardened writes so `.yoi` and `.yoi/profiles` are created one component at a time only after symlink/canonical containment checks, preventing outside mutations through a symlinked source root.
+- Added regression coverage for `.yoi/profiles -> outside_dir` to assert writes fail before outside side effects and list/archive paths fail closed.
+
+Validation:
+- `git diff --check`
+- `cargo test -p yoi-workspace-server`
+- `cargo test -p worker-runtime --features ws-server,fs-store`
+- `cargo check -p yoi`
+- `cd web/workspace && deno task check && deno task test`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+
+---
