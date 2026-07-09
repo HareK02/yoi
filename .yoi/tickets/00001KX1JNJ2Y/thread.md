@@ -178,3 +178,45 @@ Implementation progress report:
 - External review will be requested via a read-only sibling Reviewer Pod. `StopPod` は使わない。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-09T08:32:35Z status: request_changes -->
+
+## Review: request changes
+
+External review result: request_changes
+
+Blockers:
+
+1. Decodal CodeMirror integration is missing。
+   - Ticket requires `decodal-codemirror@0.1.2` and the `decodal()` CodeMirror 6 extension。
+   - Implementation only adds `@codemirror/state` / `@codemirror/view` (`web/workspace/deno.json`) and `deno.lock` has no `decodal-codemirror` specifier。
+   - `DecodalSourceEditor.svelte` builds a plain CodeMirror editor with line numbers/selection/theme only, so there is no Decodal highlighting/indent/folding extension。
+
+2. Settings UI does not implement the required tree route or create/delete editor operations。
+   - Ticket requires `/w/<workspace-id>/settings/profiles/trees/<source-tree-id>` plus save/create/delete via Backend APIs。
+   - Route tree only contains `web/workspace/src/routes/w/[workspaceId]/settings/profiles/+page.svelte`; no `trees/[sourceTreeId]` route。
+   - Page imports/uses only `writeProfileTreeFile` and renders only Save; no create/delete UI is wired despite `deleteProfileTreeFile` existing in API wrapper。
+
+3. Archive construction is not a selected-root import-closure snapshot。
+   - `build_workspace_profile_archive(workspace_root, selector)` reads whole tree and calls `build_profile_archive_from_tree_sources`; selector is used only for post-build validation。
+   - Builder adds entrypoints for every project registry entry, scans every source for imports, and passes entire `sources` map into `ProfileSourceArchive::build`。
+   - This violates requirement that archive is generated from `ProfileSourceTree revision + selected root + import closure`, with closure-only contents。
+
+4. `ProfileSourceTree` typed model is incomplete against Ticket contract。
+   - Browser/backend structs expose tree id/root/revision/file count and file path/kind/revision/size, but no content digest, content type, or provenance field/typed provenance enum。
+   - These are explicit Ticket requirements for the typed model。
+
+5. Symlink/path-escape write safety has a side-effect before containment validation。
+   - `write_profile_tree_file` calls `fs::create_dir_all(parent)` on unresolved workspace path before `checked_source_path` canonical root containment checks。
+   - With a symlinked intermediate directory under `.yoi/profiles`, this can create directories outside source root before later rejection。
+   - Path/symlink escape should fail closed without outside filesystem mutation。
+
+Validation performed:
+- Read Ticket item, routing IntentPacket, and implementation report。
+- Inspected implementation commit metadata and relevant backend/runtime/frontend files in the implementation worktree only。
+- Did not rerun reported cargo/deno/nix validations; Orchestrator-reported validation was passing, but blockers are functional/design acceptance gaps。
+
+Non-blocking follow-ups:
+- After blockers are fixed, add focused regression coverage for selected-root closure behavior, tree route smoke, Decodal editor extension wiring, UI create/delete flows, and symlinked-directory tree-write rejection-before-side-effect。
+
+---
