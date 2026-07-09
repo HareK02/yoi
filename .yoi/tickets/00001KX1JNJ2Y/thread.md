@@ -142,3 +142,39 @@ Implementation routing update:
 - 完了後は diff / validation evidence を Orchestrator が確認し、別 sibling Reviewer Pod に read-only review を依頼する。`StopPod` は既知の不具合があるため使用しない。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-09T08:28:11Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Coder Pod completed implementation and committed `81abfa63 feat: add profile source tree editor` on branch `work/00001KX1JNJ2Y-profile-source-tree`.
+- Worktree status was clean after commit。
+- Changed files include:
+  - `crates/worker-runtime/src/profile_archive.rs`
+  - `crates/workspace-server/src/profile_settings.rs`
+  - `crates/workspace-server/src/server.rs`
+  - `web/workspace/deno.json`, `web/workspace/deno.lock`
+  - `web/workspace/src/lib/workspace-settings/DecodalSourceEditor.svelte`
+  - `web/workspace/src/lib/workspace-settings/{profile-api.ts,profile-types.ts}`
+  - `web/workspace/src/routes/w/[workspaceId]/settings/profiles/+page.svelte`
+  - child implementation also committed `.yoi/tickets/00001KX1JNJ2Y/{item.md,thread.md}` changes; Orchestrator will preserve authoritative Ticket records during merge if conflicts occur。
+- Implementation summary:
+  - Added Runtime archive validation for virtual source metadata, duplicate/undeclared entries, scoped import maps, namespace/path safety, and relative virtual import resolution。
+  - Added Backend-owned project `ProfileSourceTree` support with virtual `profiles/...` paths, tree scanning, revision-aware file read/write/delete API, and tree-based archive/config-bundle generation。
+  - Added workspace server routes and Browser API/types for scoped source-tree access without host paths or backend-private/archive internals。
+  - Added Profiles settings Decodal CodeMirror editor using virtual paths and revision tokens。
+  - Added worker-runtime tests for scoped virtual import resolution and import-map mismatch rejection。
+- Orchestrator reran validation in the implementation worktree:
+  - `git diff --check`: pass
+  - `cargo test -p yoi-workspace-server`: pass（91 lib tests + 2 main tests）
+  - `cargo test -p worker-runtime --features ws-server,fs-store`: pass（47 lib tests + 5 main tests + doc tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（17 tests）
+  - `yoi ticket doctor`: ok
+  - `nix build .#yoi --no-link`: pass
+- External review will be requested via a read-only sibling Reviewer Pod. `StopPod` は使わない。
+
+---
