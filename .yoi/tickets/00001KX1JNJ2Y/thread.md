@@ -220,3 +220,32 @@ Non-blocking follow-ups:
 - After blockers are fixed, add focused regression coverage for selected-root closure behavior, tree route smoke, Decodal editor extension wiring, UI create/delete flows, and symlinked-directory tree-write rejection-before-side-effect。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-09T08:52:14Z -->
+
+## Implementation report
+
+Review-fix implementation report:
+
+- Coder Pod completed requested changes and committed follow-up `941b9126 fix: complete profile source tree review fixes` on branch `work/00001KX1JNJ2Y-profile-source-tree`.
+- Worktree status was clean after commit。
+- Fix summary:
+  - Added `decodal-codemirror@0.1.2` and wired `decodal()` into the CodeMirror 6 editor。
+  - Added source tree settings route `/w/<workspace-id>/settings/profiles/trees/<source-tree-id>`。
+  - Wired UI create/save/delete operations through Backend virtual-path source tree APIs。
+  - Changed archive construction to selected selector/root + import closure only, avoiding unrelated project tree sources。
+  - Added safe typed source/tree metadata including content type, content digest, and typed provenance。
+  - Hardened tree writes against symlinked intermediate directories before any outside filesystem mutation。
+  - Added focused regression coverage for selected-root closure-only archive contents, symlink write rejection before side effects, and web model smoke tests for tree routes / virtual create paths。
+- Orchestrator reran validation in the implementation worktree:
+  - `git diff --check`: pass
+  - `cargo test -p yoi-workspace-server`: pass（93 lib tests + 2 main tests）
+  - `cargo test -p worker-runtime --features ws-server,fs-store`: pass（47 lib tests + 5 main tests + doc tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（19 tests）
+  - `yoi ticket doctor`: ok
+  - `nix build .#yoi --no-link`: pass
+- Requesting follow-up external review against `81abfa63..941b9126` and full combined implementation。
+
+---
