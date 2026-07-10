@@ -342,3 +342,29 @@ Next action:
 - Request focused re-review on remaining unmanaged-list blocker and full acceptance status before merge/close decisions。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-10T17:35:29Z status: approve -->
+
+## Review: approve
+
+Focused re-review result: approve
+
+Evidence:
+- Follow-up `239f93b084fdcc2201e17fcdbc23eb0140531f16` is present on the requested branch/worktree; worktree was clean during inspection。
+- Remaining blocker is fixed:
+  - Workspace-scoped Browser launch options still use `working_directory_summaries()`, and that now lists only `backend_managed` rows after Runtime observation sync (`server.rs:3279-3308`)。
+  - Store filtering is explicit in `list_managed_workdir_registry()` with `management_kind = 'backend_managed'` (`store.rs:376-392`)。
+  - Runtime-scoped Workdir projection still lists registry rows for the Runtime and preserves explicit `management_kind`, so `runtime_unmanaged` remains diagnosable (`server.rs:3310-3317`, `workdir_summary_from_record`)。
+- Previous blockers sanity-checked:
+  - Worker list syncs Runtime observations then projects from Backend `worker_registry` / link authority (`server.rs:2564-2583`, `merge_worker_registry_projection`)。
+  - Runtime Worker create prepares pending Workdir rows, syncs Worker observations, and links Workdirs (`server.rs:2295-2352`)。
+  - Stop path preserves canonical records and updates Worker/linked Workdir statuses without deleting registry rows (`server.rs:2399-2443`)。
+  - Pinned retention is protected from normal Runtime sync by store upsert `CASE` logic (`store.rs:220-243`)。
+  - New Backend registry structs/schema store ids/status/metadata only; inspected Browser summaries do not expose raw Runtime materialized paths。
+- Focused validation run:
+  - `cargo test -p yoi-workspace-server --lib workdir -- --nocapture` passed 3/3 relevant tests, including managed-list exclusion, unmanaged runtime projection, and pinned/registry roundtrip coverage。
+
+Non-blocking note:
+- Some runtime detail/create response paths still return direct Runtime summaries with `management_kind: None`; list/options surfaces required by this Ticket are now safe, but projecting details through Backend records would make diagnostics more uniformly typed later。
+
+---
