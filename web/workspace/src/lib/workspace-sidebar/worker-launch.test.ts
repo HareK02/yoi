@@ -25,6 +25,7 @@ const options: WorkerLaunchOptionsResponse = {
       status: "active",
       can_spawn_worker: true,
       built_in: false,
+      working_directory_required: true,
       diagnostics: [],
     },
     {
@@ -32,7 +33,8 @@ const options: WorkerLaunchOptionsResponse = {
       display_name: "Embedded",
       status: "active",
       can_spawn_worker: true,
-      built_in: false,
+      built_in: true,
+      working_directory_required: false,
       diagnostics: [],
     },
   ],
@@ -105,5 +107,25 @@ Deno.test("buildBrowserCreateWorkerRequest sends working_directory id and relati
       working_directory_id: "wd-1-repo",
       relative_cwd: "crates/yoi",
     },
+  });
+});
+
+Deno.test("buildBrowserCreateWorkerRequest omits working_directory for embedded no-workdir launches", () => {
+  const request = buildBrowserCreateWorkerRequest({
+    runtime_id: "embedded",
+    display_name: "Worker",
+    profile: "builtin:companion",
+    initial_text: "chat",
+    working_directory_id: "",
+    working_directory_repository_id: "",
+    working_directory_selector: "",
+    relative_cwd: "",
+  });
+
+  assertEquals(request, {
+    runtime_id: "embedded",
+    display_name: "Worker",
+    profile: "builtin:companion",
+    initial_text: "chat",
   });
 });

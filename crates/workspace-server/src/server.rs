@@ -753,6 +753,7 @@ pub struct WorkerLaunchRuntimeOption {
     pub display_name: String,
     pub built_in: bool,
     pub can_spawn_worker: bool,
+    pub working_directory_required: bool,
     pub status: String,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
@@ -2642,6 +2643,9 @@ async fn create_workspace_worker(
                 relative_cwd: selection.relative_cwd,
             });
     validate_working_directory_claim_for_browser(resolved_working_directory.as_ref())?;
+    if resolved_working_directory.is_none() {
+        reject_no_workdir_for_non_embedded_runtime(&request.runtime_id)?;
+    }
     let result = api
         .runtime
         .spawn_worker(
@@ -2811,11 +2815,36 @@ struct RuntimeConfigBundleAvailabilityQuery {
     digest: String,
 }
 
+fn reject_no_workdir_for_non_embedded_runtime(
+    runtime_id: &str,
+) -> std::result::Result<(), ApiError> {
+    if runtime_id == EMBEDDED_WORKER_RUNTIME_ID {
+        return Ok(());
+    }
+    Err(ApiError::with_diagnostics(
+        Error::RuntimeOperationFailed {
+            runtime_id: runtime_id.to_string(),
+            code: "workspace_worker_workdir_required".to_string(),
+            message: "Only the embedded Runtime can launch a Worker without a working directory"
+                .to_string(),
+        },
+        vec![RuntimeDiagnostic {
+            code: "workspace_worker_workdir_required".to_string(),
+            severity: DiagnosticSeverity::Error,
+            message: "Select a working directory for this Runtime, or choose the embedded Runtime for a conversation-only Worker."
+                .to_string(),
+        }],
+    ))
+}
+
 async fn create_runtime_worker(
     State(api): State<WorkspaceApi>,
     AxumPath(runtime_id): AxumPath<String>,
     Json(mut request): Json<WorkerSpawnRequest>,
 ) -> ApiResult<Json<WorkerSpawnResult>> {
+    if request.working_directory_request.is_none() && request.resolved_working_directory.is_none() {
+        reject_no_workdir_for_non_embedded_runtime(&runtime_id)?;
+    }
     request.resolved_working_directory_request = request
         .working_directory_request
         .as_ref()
@@ -3803,6 +3832,7 @@ fn worker_launch_options_response(api: &WorkspaceApi) -> WorkerLaunchOptionsResp
                 display_name: runtime.label,
                 built_in,
                 can_spawn_worker: runtime.capabilities.can_spawn_worker,
+                working_directory_required: !built_in,
                 status: runtime.status,
                 diagnostics: runtime.diagnostics,
             }
@@ -4735,6 +4765,7 @@ impl IntoResponse for ApiError {
                     || code.starts_with("unsupported_worker_profile")
                     || code.starts_with("working_directory_")
                     || code.starts_with("workspace_cleanup_")
+                    || code == "workspace_worker_workdir_required"
                     || code.ends_with("_already_exists")
                     || code.ends_with("_not_config_managed")
                     || code.ends_with("_unsupported") =>
@@ -6080,13 +6111,17 @@ mod tests {
         );
 
         let launch_options = get_json(app.clone(), "/api/workers/launch-options").await;
-        assert!(
-            launch_options["runtimes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|runtime| runtime["runtime_id"] == "team-runtime")
-        );
+        let runtimes = launch_options["runtimes"].as_array().unwrap();
+        let embedded_runtime = runtimes
+            .iter()
+            .find(|runtime| runtime["runtime_id"] == EMBEDDED_WORKER_RUNTIME_ID)
+            .expect("embedded runtime launch option");
+        assert_eq!(embedded_runtime["working_directory_required"], false);
+        let team_runtime = runtimes
+            .iter()
+            .find(|runtime| runtime["runtime_id"] == "team-runtime")
+            .expect("team runtime launch option");
+        assert_eq!(team_runtime["working_directory_required"], true);
 
         let deleted = request_json(
             app.clone(),
@@ -6137,18 +6172,6 @@ mod tests {
         )
         .await;
         assert_eq!(added["restart_required"], false);
-        let created = post_json(
-            app.clone(),
-            "/api/workers",
-            serde_json::json!({
-                "runtime_id": "busy-runtime",
-                "display_name": "Remote Test Worker",
-                "profile": "runtime_default",
-                "initial_text": ""
-            }),
-        )
-        .await;
-        assert_eq!(created["runtime_id"], "busy-runtime");
         let workers = get_json(app.clone(), "/api/workers").await;
         assert!(
             workers["items"]
@@ -6350,6 +6373,38 @@ mod tests {
         );
         let projected = serde_json::to_string(&response).unwrap();
         assert!(!projected.contains("http://"));
+    }
+
+    #[tokio::test]
+    async fn browser_worker_create_rejects_non_embedded_no_workdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_app(dir.path()).await;
+        let response = request_json(
+            app,
+            "POST",
+            "/api/workers",
+            Some(serde_json::json!({
+                "runtime_id": "remote-runtime",
+                "display_name": "Remote Worker",
+                "profile": "runtime_default",
+                "initial_text": ""
+            })),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert!(
+            response["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("workspace_worker_workdir_required")
+        );
+        assert!(
+            response["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| { diagnostic["code"] == "workspace_worker_workdir_required" })
+        );
     }
 
     #[tokio::test]
