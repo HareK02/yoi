@@ -64,3 +64,40 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-07-10T21:51:29Z -->
+
+## Decision
+
+Routing decision: accept for implementation
+
+Evidence checked:
+- Ticket `00001KX6Y2A9Q` is `queued` and has a concrete implementation scope。
+- `TicketRelationQuery(00001KX6Y2A9Q)` shows incoming dependents (`00001KX6WVNPD`, `00001KX6Y6ZEA`) but no outgoing unresolved blockers for this Ticket。
+- `TicketOrchestrationPlanQuery(00001KX6Y2A9Q)` had no prior plan; accepted plan was recorded in this routing pass。
+- `TicketList(inprogress)` shows 0 inprogress Tickets。
+- Orchestrator worktree `/home/hare/Projects/yoi/.worktree/orchestration` is clean。
+
+Accepted plan:
+- Create dedicated implementation worktree `/home/hare/Projects/yoi/.worktree/00001KX6Y2A9Q-worker-filesystem-authority` from current orchestration branch。
+- Use branch `work/00001KX6Y2A9Q-worker-filesystem-authority`。
+- Route implementation to sibling Coder Pod, then external review to sibling Reviewer Pod。
+- Orchestrator retains merge, final validation, Ticket close, and child worktree/branch cleanup authority。
+
+Implementation focus:
+- Add explicit `WorkerFilesystemAuthority` with no-workdir `None` and local `Local(LocalWorkingDirectory)` representation。
+- Remove Worker-level `cwd: PathBuf` field and `worker.cwd()` accessor。
+- Gate core filesystem tools and Bash on `WorkerFilesystemAuthority::Local`; no-workdir Workers must not register those tools。
+- Update constructor / restore / embedded / child-spawn paths to pass filesystem authority explicitly。
+- Separate workspace context from filesystem authority; do not use workspace root / process cwd / runtime cwd fallback as no-workdir authority。
+- Add tests for no-workdir model-visible tool surface and execution construction behavior, plus grep/equivalent assurance that `worker.cwd()` usages are gone。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-07-10T21:51:33Z from: queued to: inprogress reason: accepted_for_implementation field: state -->
+
+## State changed
+
+Dashboard queue authorization was inspected, no blockers were found, and an accepted plan was recorded. Moving queued Ticket to inprogress before creating implementation worktree or spawning Pods.
+
+---
