@@ -1,8 +1,8 @@
 ---
 title: 'Add manual delete and cleanup operations for Workers and workdirs'
-state: 'planning'
+state: 'ready'
 created_at: '2026-07-10T16:11:33Z'
-updated_at: '2026-07-10T16:43:34Z'
+updated_at: '2026-07-10T16:44:17Z'
 assignee: null
 ---
 
