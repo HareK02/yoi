@@ -310,3 +310,35 @@ Non-blocking notes:
 - Consider ensuring detail/cleanup/create responses also project through `workdir_summary_from_record`; several paths still return Runtime summaries with `management_kind: None`, even after storing a typed Backend record。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-10T17:32:02Z -->
+
+## Implementation report
+
+Second follow-up implementation progress report:
+
+- Coder Pod `yoi-coder-00001KX6BPY7M-worker-workdir` completed the focused unmanaged-workdir fix and committed `239f93b084fdcc2201e17fcdbc23eb0140531f16 fix: keep unmanaged workdirs out of managed lists` on branch `work/00001KX6BPY7M-worker-workdir-registry`。
+- Implementation worktree status was clean at Orchestrator inspection。
+- Orchestrator inspected branch log / commit stats / `git diff --check 86f652a7..HEAD` in the implementation worktree。
+
+Coder-reported fix summary:
+- Workspace-scoped Browser Workdir summaries / launch options now include only `backend_managed` Workdir registry rows。
+- Runtime-direct/unmanaged Workdirs remain visible through runtime-scoped projection with explicit `management_kind: runtime_unmanaged`。
+- Tests prove:
+  - `runtime_unmanaged` rows are excluded from managed Browser Workdir summaries / launch options。
+  - unmanaged rows remain distinguishable in runtime projection。
+  - store-level managed listing excludes unmanaged rows while all-row listing still includes them。
+
+Coder-reported validation passed:
+- `git diff --check`
+- `cargo test -p yoi-workspace-server --lib`
+- `cargo test -p worker-runtime --features ws-server,fs-store`
+- `cargo check -p yoi`
+- `cd web/workspace && deno task check && deno task test`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Next action:
+- Request focused re-review on remaining unmanaged-list blocker and full acceptance status before merge/close decisions。
+
+---
