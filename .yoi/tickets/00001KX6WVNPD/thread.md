@@ -64,3 +64,27 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-07-10T22:00:33Z -->
+
+## Decision
+
+Routing decision: blocked_by_dependency
+
+Reason:
+- Dashboard queue authorization was inspected, but this Ticket has an explicit typed `depends_on` relation to `00001KX6Y2A9Q`。
+- `00001KX6Y2A9Q` is currently `inprogress` and is implementing the Worker filesystem-authority / no-workdir / cwd-removal boundary this Ticket depends on。
+- Starting this Ticket before that boundary is reviewed/merged would duplicate or conflict with constructor/restore/spawn/tool-registration changes。
+- Therefore this routing pass leaves the Ticket `queued` and does not record `queued -> inprogress`, create a worktree, or spawn role Pods。
+
+Evidence checked:
+- Ticket body / recent thread / artifacts。
+- `TicketRelationQuery(00001KX6WVNPD)`: includes dependency on `00001KX6Y2A9Q`。
+- `TicketList(inprogress)`: `00001KX6Y2A9Q` is the active inprogress Ticket。
+- Orchestrator worktree status: clean。
+
+Next action:
+- Re-route this Ticket after `00001KX6Y2A9Q` is approved, merged, validated, and closed。
+- Escalate only if a human explicitly requests combined implementation in the same branch/worktree。
+
+---
