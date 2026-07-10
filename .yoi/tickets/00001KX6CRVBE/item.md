@@ -2,7 +2,7 @@
 title: 'Add manual prune plan and cleanup operations for Workers and workdirs'
 state: 'planning'
 created_at: '2026-07-10T16:11:33Z'
-updated_at: '2026-07-10T16:12:30Z'
+updated_at: '2026-07-10T16:31:05Z'
 assignee: null
 ---
 
@@ -17,7 +17,7 @@ Ticket `00001KX6BPY7M` で Backend SQLite に Worker / Workdir registry と Work
 - 削除は plan-first にする。
 - 自動削除はこの Ticket の範囲外。期限切れや容量制限による automatic prune は後続判断とする。
 - Worker は保存単位であり、Worker を archive/prune することは内包する Session / transcript retention と連動する。
-- `pinned` Worker は削除候補にしてはならない。
+- `pinned` Worker は削除候補にしてはならない。この Ticket で pinned flag の永続化と pin/unpin mutation API も明示的に実装する。
 - Workdir 実ファイルは clean かつ stopped/archived Worker だけに紐づく場合、manual cleanup 候補にできる。
 - Dirty Workdir は活動中/要判断状態として扱い、manual cleanup でも explicit discard confirmation が必要。
 - Dirty orphan は recovery Worker 起動または explicit discard の判断対象であり、通常 prune とは区別する。
@@ -26,6 +26,8 @@ Ticket `00001KX6BPY7M` で Backend SQLite に Worker / Workdir registry と Work
 
 ## 要件
 
+- Backend registry の Worker record に pinned flag または equivalent retention field を追加し、永続化する。
+- Backend API に Worker pin / unpin mutation を追加する。mutation は Backend Worker registry を更新し、Runtime process には不要な副作用を起こさない。
 - Backend registry を基準に Worker / Workdir / link の prune plan を生成する。
 - Runtime observation を merge して、workdir files の状態を `present` / `removed` / `missing` / `unknown` 相当で表示する。
 - Plan は対象ごとに、削除可能性、blocking reason、削除種別、推定 reclaim bytes を返す。
@@ -44,6 +46,8 @@ Ticket `00001KX6BPY7M` で Backend SQLite に Worker / Workdir registry と Work
 ## 受け入れ条件
 
 - `00001KX6BPY7M` の Backend Worker/Workdir registry と link model を前提として実装されている。
+- Backend API で Worker を pin / unpin でき、状態が SQLite に永続化される。
+- Worker list/detail は pinned state を返す。
 - Backend API で Runtime ごとの manual prune plan を取得できる。
 - Plan に Worker candidates と Workdir candidates が分かれて表示される。
 - Candidate には削除種別、理由、blocking reason、linked Worker/Workdir ids、retention state、pinned state が含まれる。

@@ -21,3 +21,18 @@ Follow-up to 00001KX6BPY7M. Deletion/cleanup policy is intentionally manual-firs
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-07-10T16:31:05Z -->
+
+## Decision
+
+Clarification: because 00001KX6BPY7M is already in progress, this follow-up ticket explicitly owns implementation of Worker pinned state beyond merely consuming it in prune logic.
+
+Scope added here:
+- Persist pinned flag or equivalent Worker retention field in Backend registry.
+- Add Backend Worker pin/unpin mutation API.
+- Include pinned state in Worker list/detail and prune plan.
+- Ensure manual cleanup execution rejects pinned Worker history and protected linked records.
+
+
+---
