@@ -3,7 +3,7 @@ title: 'Replace Worker workspace_root path with WorkspaceBackend'
 state: 'planning'
 priority: 'P1'
 created_at: '2026-07-10T21:16:22Z'
-updated_at: '2026-07-10T21:32:47Z'
+updated_at: '2026-07-10T22:00:16Z'
 assignee: null
 ---
 
@@ -15,14 +15,14 @@ workspace は local path ではなく Backend/API 側の identity として扱�
 
 ## 要件
 
-- Worker の workspace identity/context を `workspace_root: PathBuf` から `workspace_id: Option<WorkspaceId>` へ移行する設計を導入する。
+- Worker の workspace identity/context を `workspace_root: PathBuf` から `workspace_id: Option<WorkspaceId>` へ移行する。
+- Worker struct から `workspace_root: PathBuf` field を削除し、Worker の workspace identity として local path を保持しない。
 - `WorkspaceBackendRef` は Worker ではなく Runtime/host 側が保持し、backend endpoint / auth / adapter selection / capability discovery を解決する。
 - Runtime は `WorkspaceBackendRef` から scoped `WorkspaceClient` / handle を materialize し、Worker に注入する。
 - Worker は `WorkspaceBackendRef` や secret を自分で解決せず、注入された narrow client/handle を通じて workspace-aware API に request する。
 - `workspace_id` と `filesystem` を分離し、workspace id/client が存在しても local filesystem authority があるとは扱わない。
-- workspace-aware 機能（Ticket / memory / workflow / project records / workspace metadata）は Backend API 経由で取得する方向に寄せる。
-- local path は Worker の workspace identity として保持せず、必要な場合も backend 実装の内側に閉じ込める。
-- 移行中は既存 `workspace_root` 利用箇所を一括削除しなくてよいが、新規 filesystem authority の根拠として使わない境界を明確にする。
+- workspace-aware 機能（Ticket / memory / workflow / project records / workspace metadata）は Backend API 経由で取得する。
+- local path が必要な処理は Runtime/host の backend adapter、または `WorkerFilesystemAuthority::Local` の内側に閉じ込め、Worker workspace identity として露出しない。
 
 ## capability の扱い
 
@@ -69,11 +69,15 @@ trait WorkspaceClient {
 ## 受け入れ条件
 
 - Worker context に workspace identity を path ではない `Option<WorkspaceId>` として保持できる。
+- Worker struct に `workspace_root: PathBuf` field が存在しない。
+- Worker の workspace identity accessor が local path を返さない。
 - Runtime/host が `WorkspaceBackendRef` を保持・解決し、Worker に scoped `WorkspaceClient` / handle を注入できる。
 - `workspace_id = None` と `filesystem = None` の会話専用 Worker を表現できる。
 - `workspace_id = Some(...)` かつ `filesystem = None` の、workspace API は使えるが local filesystem は使えない Worker を表現できる。
-- workspace-aware tools は注入された `WorkspaceClient` / handle を通して backend/API にアクセスし、local workspace path を authority として要求しない方向へ移行できる。
+- workspace-aware tools は注入された `WorkspaceClient` / handle を通して backend/API にアクセスし、local workspace path を authority として要求しない。
 - Worker が `WorkspaceBackendRef` / REST endpoint / SecretRef を直接解決しない境界が明確である。
+- Ticket / memory / workflow / project records / workspace metadata の Worker 側参照が `workspace_id` + `WorkspaceClient` 経由に移行している。
+- local path backend が必要な場合でも、path は Runtime/host backend adapter 内または `WorkerFilesystemAuthority::Local` 内に閉じている。
 - capability を導入する場合は backend-enforced authority ではなく tool registration / UX / discovery hint として扱われる。
 - `WorkerFilesystemAuthority` チケットとの境界が明確で、filesystem authority と workspace identity/client が混同されない。
 - `cargo test` と `nix build .#yoi` が通る。
