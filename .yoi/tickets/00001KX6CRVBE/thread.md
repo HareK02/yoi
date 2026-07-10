@@ -146,3 +146,34 @@ Design constraints for implementation:
 Prerequisite registry/link model is now closed and merged. Accepting queued manual cleanup Ticket for implementation before creating worktree or spawning role Pods.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-10T18:13:40Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Coder Pod `yoi-coder-00001KX6CRVBE-manual-cleanup` completed implementation in `/home/hare/Projects/yoi/.worktree/00001KX6CRVBE-manual-cleanup` on branch `work/00001KX6CRVBE-manual-cleanup`。
+- Implementation commit: `ba44391acfdb8076c06ced9324b74d6cc63910ab feat: add manual worker workdir cleanup`。
+- Orchestrator inspected the worktree status, branch log, commit stats, and `git diff --check 5f762a6c..HEAD`; worktree was clean and diff check passed。
+
+Coder-reported implementation summary:
+- Added Backend Worker retention APIs for pin/unpin registry rows; Worker list/detail carries `pinned` / `retention_state`; pin/unpin mutates Backend registry only and does not affect Runtime processes。
+- Added manual Runtime cleanup plan API with separate Worker delete and Workdir cleanup/delete candidates, action kind, reason/blocking reason, linked ids, pinned state, cleanliness/file status, running-link state, and safe reclaim-byte placeholder。
+- Added manual cleanup execution API requiring expected plan revision/digest; rejects stale plans, pinned Worker/history delete, running-linked Workdir cleanup, and dirty cleanup without explicit discard confirmation; allows safe removed/missing Workdir registry deletion。
+- Added Browser UI for manual cleanup preview/execution on Runtime Workdirs page and Backend-only pin/unpin controls on Worker page。
+- Added focused tests for plan generation, stale rejection, pinned protection, running-linked Workdir blocking, dirty confirmation, removed/missing record delete, and raw path redaction。
+
+Coder-reported validation passed:
+- `git diff --check`
+- `cargo test -p yoi-workspace-server --lib`
+- `cargo test -p worker-runtime --features ws-server,fs-store`
+- `cargo check -p yoi`
+- `cd web/workspace && deno task check && deno task test`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Next action:
+- Route to external Reviewer Pod before merge/close decisions。
+
+---
