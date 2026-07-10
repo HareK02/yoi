@@ -141,3 +141,28 @@ Next action:
 - Route to external Reviewer Pod before merge/close decisions。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-10T22:40:35Z status: approve -->
+
+## Review: approve
+
+External review result: approve
+
+Evidence:
+- `WorkerFilesystemAuthority::{None, Local(LocalWorkingDirectory)}` and separate `root`/`cwd` are present in `crates/worker/src/worker.rs`; `Worker` now stores `filesystem_authority` plus separate `workspace_root`, with no `cwd: PathBuf` Worker field。
+- Core filesystem/Bash registration is gated on `worker.local_working_directory()` in `crates/worker/src/controller.rs:619-636`; no-local Workers return `(None, None)` and do not construct/register `Read`/`Write`/`Edit`/`Glob`/`Grep`/`Bash`。
+- Ticket and worker-spawn surfaces require local authority rather than falling back to `workspace_root` (`controller.rs:647-667`, `719-733`)。
+- Embedded runtime creates `WorkerFilesystemAuthority::Local(binding.root, binding.cwd)` only when a working directory binding exists, otherwise `WorkerFilesystemAuthority::None` (`crates/worker-runtime/src/worker_backend.rs:297-310`)。
+- Tests cover no-workdir omission and no cwd fallback via empty observed materialized cwds plus forbidden core tool names (`worker_backend.rs:1133-1201`), and materialized local Workers exposing core tools with materialized cwd (`worker_backend.rs:1203-1260`)。
+- Grep check found no `worker.cwd()` / Worker `fn cwd`; the only remaining `pub fn cwd` hit is `WorkingDirectory` binding API, not `Worker`。
+
+Blockers: none。
+
+Validation performed by reviewer:
+- Read-only ticket/diff/source/test inspection and grep checks。
+- Reviewer did not rerun cargo/nix tests; coder-reported validation covers the requested test/build set。
+
+Non-blocking note:
+- Workspace-context surfaces such as memory/MCP/resident prompt loading can still be backed by `workspace_root` when enabled; this was treated as outside this Ticket’s focused core filesystem/Bash authority gate, but may need follow-up if the intended invariant becomes “no local file reads of any kind” for no-workdir Workers。
+
+---
