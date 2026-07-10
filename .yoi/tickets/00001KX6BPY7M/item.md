@@ -1,8 +1,8 @@
 ---
 title: 'Add Backend Worker/Workdir registry and link model'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-07-10T15:53:02Z'
-updated_at: '2026-07-10T17:35:29Z'
+updated_at: '2026-07-10T17:38:20Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-07-10T16:10:57Z'
