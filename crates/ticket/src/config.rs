@@ -526,7 +526,9 @@ impl ProfileSelectorRef {
         if value.starts_with("path:")
             || value.starts_with('.')
             || value.contains('/')
-            || value.ends_with(".lua")
+            || value.ends_with(".dcdl")
+            || value.ends_with(".json")
+            || value.ends_with(".toml")
             || value.ends_with(".nix")
         {
             return Err("profile selector must be `inherit`, `default`, a source-qualified registry selector, or an unqualified registry selector; path selectors are not supported".to_string());
@@ -1347,7 +1349,7 @@ profile = "legacy.nix"
             temp.path(),
             r#"
 [roles.coder]
-profile = "./coder.lua"
+profile = "./coder.toml"
 "#,
         );
 

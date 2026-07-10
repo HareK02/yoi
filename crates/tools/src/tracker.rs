@@ -34,7 +34,7 @@
 //! let fs = ScopedFs::new(scope, PathBuf::from("/workspace")); // worker lifetime
 //! let tracker = Tracker::new();    // session lifetime
 //! let bash_outputs = PathBuf::from("/run/yoi/bash-output");
-//! let defs = core_builtin_tools(fs, tracker, bash_outputs, None);
+//! let defs = core_builtin_tools(fs, tracker, bash_outputs);
 //! ```
 
 use std::collections::{HashMap, VecDeque};

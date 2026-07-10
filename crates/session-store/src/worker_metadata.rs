@@ -497,7 +497,7 @@ mod tests {
         );
         metadata.resolved_manifest_snapshot = Some(serde_json::json!({
             "worker": { "name": "profile-worker" },
-            "profile": { "source": { "kind": "path", "path": "/profiles/coder.lua" } }
+            "profile": { "source": { "kind": "path", "path": "/profiles/coder.toml" } }
         }));
 
         let json = serde_json::to_string(&metadata).unwrap();

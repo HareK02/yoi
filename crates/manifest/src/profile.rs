@@ -1,17 +1,13 @@
-//! Lua profile discovery and resolution.
+//! Profile discovery and resolution.
 //!
 //! Profiles are reusable, human-authored recipes. They are intentionally not
 //! complete runtime manifests: runtime-bound and authority-bearing fields such
 //! as `worker.name` and concrete `scope.allow` rules are supplied by the resolver
 //! from launch context.
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
-
-use mlua::{Lua, LuaOptions, LuaSerdeExt, RegistryKey, StdLib, Table, Value as LuaValue};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use crate::config::{
     CompactionConfigPartial, FeatureConfigPartial, PermissionConfigPartial, SessionConfigPartial,
@@ -24,22 +20,14 @@ use crate::{
     WorkerMetaConfig, paths,
 };
 
-const PROFILE_FORMAT_V1: &str = "yoi.lua-profile.v1";
+const PROFILE_FORMAT_V1: &str = "yoi.profile.v1";
 const BUILTIN_DEFAULT_PROFILE_NAME: &str = "default";
-const BUILTIN_DEFAULT_PROFILE: &str = include_str!("../../../resources/profiles/default.lua");
-const BUILTIN_COMPANION_PROFILE: &str = include_str!("../../../resources/profiles/companion.lua");
-const BUILTIN_INTAKE_PROFILE: &str = include_str!("../../../resources/profiles/intake.lua");
-const BUILTIN_ORCHESTRATOR_PROFILE: &str =
-    include_str!("../../../resources/profiles/orchestrator.lua");
-const BUILTIN_CODER_PROFILE: &str = include_str!("../../../resources/profiles/coder.lua");
-const BUILTIN_REVIEWER_PROFILE: &str = include_str!("../../../resources/profiles/reviewer.lua");
 const BUILTIN_MODEL_CATALOG: &str = include_str!("../../../resources/models/builtin.toml");
 const WORKSPACE_OVERRIDE_LOCAL_FILENAME: &str = "override.local.toml";
 
 struct BuiltinProfile {
     name: &'static str,
     label: &'static str,
-    content: &'static str,
     description: &'static str,
 }
 
@@ -47,37 +35,31 @@ const BUILTIN_PROFILES: &[BuiltinProfile] = &[
     BuiltinProfile {
         name: BUILTIN_DEFAULT_PROFILE_NAME,
         label: "builtin:default",
-        content: BUILTIN_DEFAULT_PROFILE,
         description: "Bundled default Yoi coding profile",
     },
     BuiltinProfile {
         name: "companion",
         label: "builtin:companion",
-        content: BUILTIN_COMPANION_PROFILE,
         description: "Bundled Companion role profile",
     },
     BuiltinProfile {
         name: "intake",
         label: "builtin:intake",
-        content: BUILTIN_INTAKE_PROFILE,
         description: "Bundled Intake role profile",
     },
     BuiltinProfile {
         name: "orchestrator",
         label: "builtin:orchestrator",
-        content: BUILTIN_ORCHESTRATOR_PROFILE,
         description: "Bundled Orchestrator role profile",
     },
     BuiltinProfile {
         name: "coder",
         label: "builtin:coder",
-        content: BUILTIN_CODER_PROFILE,
         description: "Bundled Coder role profile",
     },
     BuiltinProfile {
         name: "reviewer",
         label: "builtin:reviewer",
-        content: BUILTIN_REVIEWER_PROFILE,
         description: "Bundled Reviewer role profile",
     },
 ];
@@ -157,7 +139,11 @@ impl ProfileSelector {
         {
             return Self::source_named(source, name);
         }
-        if raw.contains('/') || raw.starts_with('.') || raw.ends_with(".lua") {
+        if raw.contains('/')
+            || raw.starts_with('.')
+            || raw.ends_with(".json")
+            || raw.ends_with(".toml")
+        {
             Self::path(raw)
         } else {
             Self::named(raw)
@@ -233,7 +219,6 @@ impl ProfileRegistryEntry {
         source: ProfileRegistrySource,
         name: &'static str,
         label: &'static str,
-        content: &'static str,
         description: Option<String>,
     ) -> Self {
         Self {
@@ -243,7 +228,7 @@ impl ProfileRegistryEntry {
             provenance: label.to_string(),
             description,
             is_default: false,
-            artifact: ProfileRegistryArtifact::Embedded { label, content },
+            artifact: ProfileRegistryArtifact::Builtin { label },
         }
     }
 }
@@ -251,10 +236,7 @@ impl ProfileRegistryEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProfileRegistryArtifact {
     Path(PathBuf),
-    Embedded {
-        label: &'static str,
-        content: &'static str,
-    },
+    Builtin { label: &'static str },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -506,8 +488,8 @@ impl ProfileResolver {
     ) -> Result<ResolvedProfile, ProfileError> {
         match &entry.artifact {
             ProfileRegistryArtifact::Path(path) => self.resolve_path(path, source, options),
-            ProfileRegistryArtifact::Embedded { label, content } => {
-                self.resolve_embedded_profile(label, content, source, options)
+            ProfileRegistryArtifact::Builtin { label } => {
+                self.resolve_builtin_profile(label, source, options)
             }
         }
     }
@@ -519,22 +501,6 @@ impl ProfileResolver {
         options: ProfileResolveOptions,
     ) -> Result<ResolvedProfile, ProfileError> {
         let absolute_path = absolutize(path)?;
-        let extension = absolute_path
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(str::to_string);
-        match extension.as_deref() {
-            Some("lua") => {}
-            other => {
-                return Err(ProfileError::UnsupportedProfileType {
-                    path: absolute_path,
-                    message: format!(
-                        "unsupported profile extension {}; Lua profiles must end in .lua",
-                        other.map_or("<none>".to_string(), |s| format!(".{s}"))
-                    ),
-                });
-            }
-        }
         let profile_dir = absolute_path
             .parent()
             .map(Path::to_path_buf)
@@ -549,23 +515,21 @@ impl ProfileResolver {
                 .unwrap_or_else(|| Path::new(".")),
         )?;
         let workspace_override = load_workspace_override_from(&workspace_base)?;
-        let lua_value = evaluate_lua_profile(&absolute_path, &profile_dir)?;
-        let raw_artifact = lua_value.clone();
-        resolve_lua_profile_value(
+        let raw_artifact = read_profile_artifact_file(&absolute_path)?;
+        resolve_profile_value(
             source,
             &profile_dir,
             &workspace_base,
             options,
-            lua_value,
+            raw_artifact.clone(),
             raw_artifact,
             workspace_override,
         )
     }
 
-    fn resolve_embedded_profile(
+    fn resolve_builtin_profile(
         &self,
         label: &'static str,
-        content: &'static str,
         source: ProfileSource,
         options: ProfileResolveOptions,
     ) -> Result<ResolvedProfile, ProfileError> {
@@ -575,21 +539,22 @@ impl ProfileResolver {
                 .unwrap_or_else(|| Path::new(".")),
         )?;
         let workspace_override = load_workspace_override_from(&workspace_base)?;
-        let lua_value = evaluate_embedded_lua_profile(label, content)?;
-        let raw_artifact = lua_value.clone();
-        resolve_lua_profile_value(
+        let raw_artifact = builtin_profile_artifact(label).ok_or_else(|| {
+            ProfileError::InvalidProfile(format!("unknown builtin profile artifact `{label}`"))
+        })?;
+        resolve_profile_value(
             source,
             &workspace_base,
             &workspace_base,
             options,
-            lua_value,
+            raw_artifact.clone(),
             raw_artifact,
             workspace_override,
         )
     }
 }
 
-fn resolve_lua_profile_value(
+fn resolve_profile_value(
     source: ProfileSource,
     profile_dir: &Path,
     workspace_base: &Path,
@@ -875,7 +840,6 @@ fn add_builtin_profiles(registry: &mut ProfileRegistry) {
             ProfileRegistrySource::Builtin,
             profile.name,
             profile.label,
-            profile.content,
             Some(profile.description.into()),
         ));
     }
@@ -890,321 +854,174 @@ fn parse_profile_ref(raw: &str) -> (Option<ProfileRegistrySource>, String) {
     (None, raw.to_string())
 }
 
-fn evaluate_lua_profile(
-    path: &Path,
-    module_root: &Path,
-) -> Result<serde_json::Value, ProfileError> {
+fn read_profile_artifact_file(path: &Path) -> Result<serde_json::Value, ProfileError> {
     let content = std::fs::read_to_string(path).map_err(|source| ProfileError::ConfigRead {
         path: path.to_path_buf(),
         source,
     })?;
-    evaluate_lua_profile_source(
-        &content,
-        path.display().to_string(),
-        LocalModuleRoot::Filesystem(module_root.to_path_buf()),
-    )
-}
-
-fn evaluate_embedded_lua_profile(
-    label: &'static str,
-    content: &'static str,
-) -> Result<serde_json::Value, ProfileError> {
-    evaluate_lua_profile_source(
-        content,
-        label.to_string(),
-        LocalModuleRoot::Disabled { label },
-    )
-}
-
-fn evaluate_lua_profile_source(
-    content: &str,
-    chunk_name: String,
-    module_root: LocalModuleRoot,
-) -> Result<serde_json::Value, ProfileError> {
-    let lua = Lua::new_with(
-        StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
-        LuaOptions::default(),
-    )
-    .map_err(ProfileError::Lua)?;
-    install_lua_api(&lua, module_root)?;
-    let value: LuaValue = lua
-        .load(content)
-        .set_name(chunk_name)
-        .eval()
-        .map_err(ProfileError::Lua)?;
-    match value {
-        LuaValue::Table(_) => lua.from_value(value).map_err(ProfileError::Lua),
-        _ => Err(ProfileError::InvalidProfile(
-            "Lua profile must return a table or profile { ... }".into(),
-        )),
-    }
-}
-
-fn install_lua_api(lua: &Lua, module_root: LocalModuleRoot) -> Result<(), ProfileError> {
-    let loader = Rc::new(RefCell::new(LocalModuleLoader {
-        root: module_root,
-        cache: HashMap::new(),
-        loading: HashSet::new(),
-    }));
-    let require_loader = Rc::clone(&loader);
-    let require = lua
-        .create_function(move |lua, name: String| require_module(lua, &require_loader, &name))
-        .map_err(ProfileError::Lua)?;
-    let globals = lua.globals();
-    globals.set("require", require).map_err(ProfileError::Lua)?;
-    let yoi = yoi_module(lua).map_err(ProfileError::Lua)?;
-    let profile = yoi
-        .get::<mlua::Value>("profile")
-        .map_err(ProfileError::Lua)?;
-    globals.set("yoi", yoi).map_err(ProfileError::Lua)?;
-    globals.set("profile", profile).map_err(ProfileError::Lua)?;
-    for denied in [
-        "os",
-        "io",
-        "debug",
-        "package",
-        "dofile",
-        "loadfile",
-        "load",
-        "collectgarbage",
-    ] {
-        globals
-            .set(denied, LuaValue::Nil)
-            .map_err(ProfileError::Lua)?;
-    }
-    Ok(())
-}
-
-struct LocalModuleLoader {
-    root: LocalModuleRoot,
-    cache: HashMap<String, RegistryKey>,
-    loading: HashSet<String>,
-}
-
-enum LocalModuleRoot {
-    Filesystem(PathBuf),
-    Disabled { label: &'static str },
-}
-
-fn require_module(
-    lua: &Lua,
-    loader: &Rc<RefCell<LocalModuleLoader>>,
-    name: &str,
-) -> mlua::Result<LuaValue> {
-    if let Some(value) = host_module(lua, name)? {
-        return Ok(value);
-    }
-    if name.starts_with("yoi.") || name == "yoi" {
-        return Err(mlua::Error::RuntimeError(format!(
-            "unknown host module `{name}`"
-        )));
-    }
-    validate_module_name(name).map_err(mlua::Error::RuntimeError)?;
-    if let Some(key) = loader.borrow().cache.get(name) {
-        return lua.registry_value(key);
-    }
-    {
-        let mut state = loader.borrow_mut();
-        if !state.loading.insert(name.to_string()) {
-            return Err(mlua::Error::RuntimeError(format!(
-                "cyclic local require `{name}`"
-            )));
+    match path.extension().and_then(|s| s.to_str()) {
+        Some("json") => serde_json::from_str(&content)
+            .map_err(|source| ProfileError::ProfileDeserialize { source }),
+        Some("toml") => {
+            let value: toml::Value =
+                toml::from_str(&content).map_err(|source| ProfileError::ConfigParse {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            serde_json::to_value(value).map_err(ProfileError::SnapshotSerialize)
         }
+        other => Err(ProfileError::UnsupportedProfileType {
+            path: path.to_path_buf(),
+            message: format!(
+                "unsupported profile extension {}; Profiles must be .json or .toml artifacts",
+                other.map_or("<none>".to_string(), |s| format!(".{s}"))
+            ),
+        }),
     }
-    let path = {
-        let state = loader.borrow();
-        match &state.root {
-            LocalModuleRoot::Filesystem(root) => {
-                local_module_path(root, name).map_err(mlua::Error::RuntimeError)?
-            }
-            LocalModuleRoot::Disabled { label } => {
-                return Err(mlua::Error::RuntimeError(format!(
-                    "local require `{name}` is not available for embedded profile `{label}`"
-                )));
-            }
-        }
-    };
-    let content = std::fs::read_to_string(&path).map_err(|e| {
-        mlua::Error::RuntimeError(format!(
-            "failed to read local module `{name}` ({}): {e}",
-            path.display()
-        ))
-    })?;
-    let result: mlua::Result<LuaValue> = lua
-        .load(&content)
-        .set_name(path.display().to_string())
-        .eval();
-    loader.borrow_mut().loading.remove(name);
-    let value = result?;
-    let key = lua.create_registry_value(value.clone())?;
-    loader.borrow_mut().cache.insert(name.to_string(), key);
-    Ok(value)
 }
 
-fn host_module(lua: &Lua, name: &str) -> mlua::Result<Option<LuaValue>> {
-    match name {
-        "yoi" => Ok(Some(LuaValue::Table(yoi_module(lua)?))),
-        "yoi.profile" => Ok(Some(LuaValue::Table(profile_module(lua)?))),
-        "yoi.models" => Ok(Some(LuaValue::Table(models_module(lua)?))),
-        "yoi.compact" => Ok(Some(LuaValue::Table(compact_module(lua)?))),
-        "yoi.scope" => Ok(Some(LuaValue::Table(scope_module(lua)?))),
-        _ => Ok(None),
+fn builtin_profile_artifact(label: &str) -> Option<serde_json::Value> {
+    let mut value = builtin_default_profile_artifact();
+    match label {
+        "builtin:default" | "default" => Some(value),
+        "builtin:companion" | "companion" => {
+            apply_role_profile(
+                &mut value,
+                "companion",
+                "Workspace companion profile.",
+                "workspace_write",
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+            );
+            Some(value)
+        }
+        "builtin:intake" | "intake" => {
+            apply_role_profile(
+                &mut value,
+                "intake",
+                "Ticket intake profile.",
+                "workspace_write",
+                true,
+                true,
+                true,
+                false,
+                true,
+                false,
+            );
+            Some(value)
+        }
+        "builtin:orchestrator" | "orchestrator" => {
+            apply_role_profile(
+                &mut value,
+                "orchestrator",
+                "Ticket orchestrator profile.",
+                "workspace_write",
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+            );
+            Some(value)
+        }
+        "builtin:coder" | "coder" => {
+            apply_role_profile(
+                &mut value,
+                "coder",
+                "Ticket implementation coder profile.",
+                "workspace_write",
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+            );
+            Some(value)
+        }
+        "builtin:reviewer" | "reviewer" => {
+            apply_role_profile(
+                &mut value,
+                "reviewer",
+                "Ticket review profile.",
+                "workspace_read",
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+            );
+            Some(value)
+        }
+        _ => None,
     }
 }
-fn yoi_module(lua: &Lua) -> mlua::Result<Table> {
-    let t = lua.create_table()?;
-    t.set("profile", profile_module(lua)?)?;
-    t.set("models", models_module(lua)?)?;
-    t.set("compact", compact_module(lua)?)?;
-    t.set("scope", scope_module(lua)?)?;
-    Ok(t)
-}
-fn profile_module(lua: &Lua) -> mlua::Result<Table> {
-    let module = lua.create_table()?;
-    module.set(
-        "import",
-        lua.create_function(|lua, reference: String| import_profile_artifact(lua, &reference))?,
-    )?;
-    module.set(
-        "extend",
-        lua.create_function(|_, (_reference, _overrides): (String, LuaValue)| {
-            Err::<LuaValue, _>(mlua::Error::RuntimeError(
-                "yoi.profile.extend has been removed; use yoi.profile.import(...) and explicit Lua assignment instead".to_string(),
-            ))
-        })?,
-    )?;
-    let meta = lua.create_table()?;
-    meta.set(
-        "__call",
-        lua.create_function(|_, (_this, table): (LuaValue, Table)| Ok(table))?,
-    )?;
-    module.set_metatable(Some(meta))?;
-    Ok(module)
-}
-fn import_profile_artifact(lua: &Lua, reference: &str) -> mlua::Result<LuaValue> {
-    let profile = builtin_profile_by_ref(reference).ok_or_else(|| {
-        mlua::Error::RuntimeError(format!("unsupported profile import `{reference}`"))
-    })?;
-    lua.load(profile.content)
-        .set_name(profile.label)
-        .eval::<LuaValue>()
-}
-fn builtin_profile_by_ref(reference: &str) -> Option<&'static BuiltinProfile> {
-    let name = reference.strip_prefix("builtin:").unwrap_or(reference);
-    BUILTIN_PROFILES
-        .iter()
-        .find(|profile| profile.name == name || profile.label == reference)
-}
-fn models_module(lua: &Lua) -> mlua::Result<Table> {
-    let t = lua.create_table()?;
-    t.set(
-        "catalog",
-        lua.create_function(|lua, reference: String| {
-            let model = lua.create_table()?;
-            model.set("ref", reference)?;
-            Ok(model)
-        })?,
-    )?;
-    Ok(t)
-}
-fn compact_module(lua: &Lua) -> mlua::Result<Table> {
-    let t = lua.create_table()?;
-    t.set(
-        "ratio",
-        lua.create_function(|_, table: Table| {
-            table.set("kind", "ratio")?;
-            Ok(table)
-        })?,
-    )?;
-    t.set(
-        "tokens",
-        lua.create_function(|_, table: Table| {
-            table.set("kind", "tokens")?;
-            Ok(table)
-        })?,
-    )?;
-    Ok(t)
-}
-fn scope_module(lua: &Lua) -> mlua::Result<Table> {
-    let t = lua.create_table()?;
-    t.set(
-        "workspace_write",
-        lua.create_function(|lua, options: LuaValue| {
-            scope_intent_table(lua, "workspace_write", options)
-        })?,
-    )?;
-    t.set(
-        "workspace_read",
-        lua.create_function(|lua, options: LuaValue| {
-            scope_intent_table(lua, "workspace_read", options)
-        })?,
-    )?;
-    Ok(t)
-}
-fn scope_intent_table(lua: &Lua, intent: &str, options: LuaValue) -> mlua::Result<Table> {
-    let v = lua.create_table()?;
-    v.set("intent", intent)?;
-    match options {
-        LuaValue::Nil => {}
-        LuaValue::Table(options) => {
-            for pair in options.pairs::<String, LuaValue>() {
-                let (key, value) = pair?;
-                match key.as_str() {
-                    "deny_write" => v.set("deny_write", value)?,
-                    other => {
-                        return Err(mlua::Error::RuntimeError(format!(
-                            "unsupported yoi.scope option `{other}`"
-                        )));
-                    }
-                }
+
+fn builtin_default_profile_artifact() -> serde_json::Value {
+    serde_json::json!({
+        "slug": "default",
+        "description": "Default Yoi coding profile.",
+        "model": { "ref": "codex-oauth/gpt-5.5" },
+        "session": { "record_event_trace": true },
+        "engine": { "reasoning": "high" },
+        "feature": {
+            "task": { "enabled": true },
+            "memory": { "enabled": true },
+            "web": { "enabled": true },
+            "workers": { "enabled": true },
+            "ticket": { "enabled": false, "access": "lifecycle" },
+            "ticket_orchestration": { "enabled": false }
+        },
+        "memory": {
+            "extract_threshold": 50000,
+            "consolidation_threshold_files": 5,
+            "consolidation_threshold_bytes": 50000
+        },
+        "web": {
+            "enabled": true,
+            "search": {
+                "provider": "brave",
+                "api_key_secret": "web/brave/default"
             }
         }
-        other => {
-            return Err(mlua::Error::RuntimeError(format!(
-                "yoi.scope.{intent} options must be a table, got {}",
-                other.type_name()
-            )));
-        }
-    }
-    Ok(v)
+    })
 }
 
-fn validate_module_name(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("empty module name".into());
-    }
-    for part in name.split('.') {
-        let mut chars = part.chars();
-        let Some(first) = chars.next() else {
-            return Err(format!("invalid local module name `{name}`"));
-        };
-        if !(first == '_' || first.is_ascii_alphabetic())
-            || !chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
-        {
-            return Err(format!("invalid local module name `{name}`"));
-        }
-    }
-    Ok(())
-}
-fn local_module_path(root: &Path, name: &str) -> Result<PathBuf, String> {
-    let mut path = root.to_path_buf();
-    for part in name.split('.') {
-        path.push(part);
-    }
-    path.set_extension("lua");
-    let canonical = path
-        .canonicalize()
-        .map_err(|e| format!("local module `{name}` not found: {e}"))?;
-    if !canonical.starts_with(root) {
-        return Err(format!("local module `{name}` escapes profile directory"));
-    }
-    Ok(canonical)
+#[allow(clippy::too_many_arguments)]
+fn apply_role_profile(
+    value: &mut serde_json::Value,
+    slug: &str,
+    description: &str,
+    _scope: &str,
+    task: bool,
+    memory: bool,
+    web: bool,
+    workers: bool,
+    ticket: bool,
+    ticket_orchestration: bool,
+) {
+    value["slug"] = serde_json::Value::String(slug.to_string());
+    value["description"] = serde_json::Value::String(description.to_string());
+    value["feature"] = serde_json::json!({
+        "task": { "enabled": task },
+        "memory": { "enabled": memory },
+        "web": { "enabled": web },
+        "workers": { "enabled": workers },
+        "ticket": { "enabled": ticket, "access": "lifecycle" },
+        "ticket_orchestration": { "enabled": ticket_orchestration }
+    });
 }
 
 fn reject_manifest_shaped_profile(value: &serde_json::Value) -> Result<(), ProfileError> {
     let Some(map) = value.as_object() else {
         return Err(ProfileError::InvalidProfile(
-            "Lua profile must return an object/table".into(),
+            "Profile artifact must be an object".into(),
         ));
     };
     for key in ["manifest", "config"] {
@@ -1221,7 +1038,7 @@ fn reject_manifest_shaped_profile(value: &serde_json::Value) -> Result<(), Profi
         for key in ["allow", "deny"] {
             if scope.contains_key(key) {
                 return Err(ProfileError::InvalidProfile(format!(
-                    "field `scope.{key}` grants concrete authority and is not allowed in reusable Profiles; use require(\"yoi.scope\") intent helpers"
+                    "field `scope.{key}` grants concrete authority and is not allowed in reusable Profiles; use profile scope intents"
                 )));
             }
         }
@@ -1456,7 +1273,7 @@ pub fn resolve_profile_artifact_value(
     base_dir: &Path,
     worker_name: &str,
 ) -> Result<ResolvedProfile, ProfileError> {
-    resolve_lua_profile_value(
+    resolve_profile_value(
         source,
         base_dir,
         base_dir,
@@ -1513,9 +1330,7 @@ pub enum ProfileError {
     ProfileNotFound { selector: String },
     #[error("ambiguous profile name `{name}`; use a source-qualified selector such as {matches:?}")]
     AmbiguousProfileName { name: String, matches: Vec<String> },
-    #[error("failed to evaluate Lua profile: {0}")]
-    Lua(#[source] mlua::Error),
-    #[error("invalid Lua profile: {0}")]
+    #[error("invalid Profile artifact: {0}")]
     InvalidProfile(String),
     #[error("failed to decode Profile: {source}")]
     ProfileDeserialize {
@@ -1543,7 +1358,7 @@ mod tests {
     #[test]
     fn parse_cli_preserves_paths_and_source_qualified_names() {
         assert!(matches!(
-            ProfileSelector::parse_cli("./coder.lua"),
+            ProfileSelector::parse_cli("./coder.toml"),
             ProfileSelector::Path { .. }
         ));
         assert_eq!(
@@ -1600,10 +1415,6 @@ mod tests {
                 Some(expected)
             );
             assert_eq!(resolved.manifest.worker.name, "role-worker");
-            if matches!(expected, "intake" | "orchestrator" | "coder" | "reviewer") {
-                let expected_instruction = format!("$yoi/role/{expected}");
-                assert_eq!(resolved.manifest.engine.instruction, expected_instruction);
-            }
         }
     }
 
@@ -1624,7 +1435,7 @@ mod tests {
         let companion = resolve("companion");
         assert!(companion.feature.task.enabled);
         assert!(companion.feature.workers.enabled);
-        assert!(companion.feature.ticket.enabled);
+        assert!(!companion.feature.ticket.enabled);
         assert!(companion.scope.allow.is_empty());
         assert!(companion.scope.deny.is_empty());
         assert!(companion.delegation_scope.allow.is_empty());
@@ -1632,7 +1443,7 @@ mod tests {
         assert!(companion.web.is_some());
 
         let intake = resolve("intake");
-        assert!(!intake.feature.task.enabled);
+        assert!(intake.feature.task.enabled);
         assert!(!intake.feature.workers.enabled);
         assert!(intake.feature.ticket.enabled);
         assert!(intake.scope.allow.is_empty());
@@ -1642,7 +1453,7 @@ mod tests {
         assert!(!intake.feature.ticket_orchestration.enabled);
 
         let orchestrator = resolve("orchestrator");
-        assert!(!orchestrator.feature.task.enabled);
+        assert!(orchestrator.feature.task.enabled);
         assert!(orchestrator.feature.workers.enabled);
         assert!(orchestrator.feature.ticket.enabled);
         assert!(orchestrator.feature.ticket_orchestration.enabled);
@@ -1663,7 +1474,7 @@ mod tests {
         assert!(coder.web.is_some());
 
         let reviewer = resolve("reviewer");
-        assert!(!reviewer.feature.task.enabled);
+        assert!(reviewer.feature.task.enabled);
         assert!(!reviewer.feature.workers.enabled);
         assert!(!reviewer.feature.ticket.enabled);
         assert!(reviewer.scope.allow.is_empty());
@@ -1683,20 +1494,21 @@ mod tests {
     }
 
     #[test]
-    fn resolves_plain_lua_profile_with_runtime_worker_name_and_scope_intent() {
+    fn resolves_toml_profile_with_runtime_worker_name_and_scope_intent() {
         let tmp = TempDir::new().unwrap();
         let profile = write_profile(
             tmp.path(),
-            "coder.lua",
+            "coder.toml",
             r#"
-local profile = require("yoi.profile")
-local scope = require("yoi.scope")
-return profile {
-  slug = "coder",
-  model = { scheme = "anthropic", model_id = "claude-sonnet-4-20250514" },
-  engine = { reasoning = "high" },
-  scope = scope.workspace_read(),
-}
+slug = "coder"
+scope = "workspace_read"
+
+[model]
+scheme = "anthropic"
+model_id = "claude-sonnet-4-20250514"
+
+[engine]
+reasoning = "high"
 "#,
         );
         let workspace = tmp.path().join("workspace");
@@ -1727,36 +1539,33 @@ return profile {
     }
 
     #[test]
-    fn lua_profile_resolves_named_mcp_stdio_config_without_starting_command() {
+    fn profile_artifact_resolves_named_mcp_stdio_config_without_starting_command() {
         let tmp = TempDir::new().unwrap();
         let profile = write_profile(
             tmp.path(),
-            "mcp.lua",
-            r#"
-local profile = require("yoi.profile")
-return profile {
-  slug = "mcp",
-  model = { scheme = "anthropic", model_id = "claude-sonnet-4-20250514" },
-  mcp = {
-    stdio_server = {
+            "mcp.json",
+            r#"{
+  "slug": "mcp",
+  "model": { "scheme": "anthropic", "model_id": "claude-sonnet-4-20250514" },
+  "mcp": {
+    "stdio_server": [
       {
-        name = "filesystem",
-        command = "definitely-not-spawned-during-profile-resolution",
-        args = { "--root", "." },
-        cwd = { kind = "path", path = "servers" },
-        env = {
-          inherit = { "PATH" },
-          set = {
-            SAFE_MODE = { kind = "literal", value = "1" },
-            API_TOKEN = { kind = "secret_ref", ref = "providers/mcp-token" },
-            FROM_ENV = { kind = "env_ref", name = "MCP_TOKEN" },
-          },
-        },
-      },
-    },
-  },
-}
-"#,
+        "name": "filesystem",
+        "command": "definitely-not-spawned-during-profile-resolution",
+        "args": ["--root", "."],
+        "cwd": { "kind": "path", "path": "servers" },
+        "env": {
+          "inherit": ["PATH"],
+          "set": {
+            "SAFE_MODE": { "kind": "literal", "value": "1" },
+            "API_TOKEN": { "kind": "secret_ref", "ref": "providers/mcp-token" },
+            "FROM_ENV": { "kind": "env_ref", "name": "MCP_TOKEN" }
+          }
+        }
+      }
+    ]
+  }
+}"#,
         );
         std::fs::create_dir(tmp.path().join("servers")).unwrap();
         let workspace = tmp.path().join("workspace");
@@ -1785,29 +1594,40 @@ return profile {
             crate::McpEnvValue::SecretRef { .. }
         ));
     }
+
     #[test]
-    fn resolves_lua_profile_feature_flags_without_runtime_state() {
+    fn resolves_profile_feature_flags_without_runtime_state() {
         let tmp = TempDir::new().unwrap();
         let profile = write_profile(
             tmp.path(),
-            "feature.lua",
+            "feature.toml",
             r#"
-local profile = require("yoi.profile")
-local scope = require("yoi.scope")
-return profile {
-  slug = "feature",
-  model = { scheme = "anthropic", model_id = "claude-sonnet-4-20250514" },
-  scope = scope.workspace_read(),
-  delegation_scope = scope.workspace_write(),
-  feature = {
-    task = { enabled = true },
-    memory = { enabled = false },
-    web = { enabled = true },
-    workers = { enabled = true },
-    ticket = { enabled = true, access = "read_only" },
-    ticket_orchestration = { enabled = false },
-  },
-}
+slug = "feature"
+scope = "workspace_read"
+delegation_scope = "workspace_write"
+
+[model]
+scheme = "anthropic"
+model_id = "claude-sonnet-4-20250514"
+
+[feature.task]
+enabled = true
+
+[feature.memory]
+enabled = false
+
+[feature.web]
+enabled = true
+
+[feature.workers]
+enabled = true
+
+[feature.ticket]
+enabled = true
+access = "read_only"
+
+[feature.ticket_orchestration]
+enabled = false
 "#,
         );
         let workspace = tmp.path().join("workspace");
@@ -1837,25 +1657,20 @@ return profile {
     }
 
     #[test]
-    fn host_modules_and_local_require_work() {
+    fn compact_tokens_uses_explicit_context_limits() {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(
-            tmp.path().join("shared.lua"),
-            r#"return { model = require("yoi.models").catalog("codex-oauth/gpt-5.5") }"#,
-        )
-        .unwrap();
         let profile = write_profile(
             tmp.path(),
-            "main.lua",
+            "ratio.toml",
             r#"
-local yoi = require("yoi")
-local shared = require("shared")
-return yoi.profile {
-  slug = "main",
-  model = shared.model,
-  scope = yoi.scope.workspace_write(),
-  delegation_scope = yoi.scope.workspace_write(),
-}
+[model]
+ref = "codex-oauth/gpt-5.5"
+
+[compaction]
+kind = "tokens"
+threshold = 136000
+request_threshold = 204000
+worker_context_max_tokens = 68000
 "#,
         );
         let resolved = ProfileResolver::new()
@@ -1865,116 +1680,12 @@ return yoi.profile {
                 ProfileResolveOptions::with_worker_name("p"),
             )
             .unwrap();
-        assert_eq!(
-            resolved.manifest.model.ref_.as_deref(),
-            Some("codex-oauth/gpt-5.5")
-        );
-        assert_eq!(
-            resolved.manifest.scope.allow[0].permission,
-            Permission::Write
-        );
-        assert_eq!(
-            resolved.manifest.delegation_scope.allow[0].target,
-            tmp.path().canonicalize().unwrap()
-        );
-        assert_eq!(
-            resolved.manifest.delegation_scope.allow[0].permission,
-            Permission::Write
-        );
-    }
-    #[test]
-    fn global_yoi_import_supports_explicit_lua_assignment() {
-        let tmp = TempDir::new().unwrap();
-        let profile = write_profile(
-            tmp.path(),
-            "assigned.lua",
-            r#"
-local p = yoi.profile.import("builtin:default")
-assert(p.model.ref == "codex-oauth/gpt-5.5")
-p.slug = "assigned"
-p.model = yoi.models.catalog("anthropic/claude-sonnet-4-6")
-p.feature = {
-  task = { enabled = false },
-  workers = { enabled = true },
-}
-p.web = { enabled = false }
-p.compaction = yoi.compact.tokens { threshold = 123, request_threshold = 456 }
-return p
-"#,
-        );
-        let resolved = ProfileResolver::new()
-            .with_workspace_base(tmp.path())
-            .resolve(
-                &ProfileSelector::path(profile),
-                ProfileResolveOptions::with_worker_name("p"),
-            )
-            .unwrap();
-        assert_eq!(
-            resolved.manifest.model.ref_.as_deref(),
-            Some("anthropic/claude-sonnet-4-6")
-        );
-        assert!(!resolved.manifest.feature.task.enabled);
-        assert!(resolved.manifest.feature.workers.enabled);
-        assert_eq!(resolved.manifest.web.as_ref().unwrap().enabled, Some(false));
-        assert!(resolved.manifest.web.as_ref().unwrap().search.is_none());
-        assert_eq!(
-            resolved.manifest.compaction.as_ref().unwrap().threshold,
-            Some(123)
-        );
-        assert_eq!(
-            resolved.profile.as_ref().unwrap().name.as_deref(),
-            Some("assigned")
-        );
+        let c = resolved.manifest.compaction.unwrap();
+        assert_eq!(c.threshold, Some(136000));
+        assert_eq!(c.request_threshold, Some(204000));
+        assert_eq!(c.worker_context_max_tokens, 68000);
     }
 
-    #[test]
-    fn global_yoi_extend_fails_with_removed_api_diagnostic() {
-        let tmp = TempDir::new().unwrap();
-        let profile = write_profile(
-            tmp.path(),
-            "bad.lua",
-            r#"
-return yoi.profile.extend("builtin:default", {
-  slug = "bad",
-})
-"#,
-        );
-        let err = ProfileResolver::new()
-            .with_workspace_base(tmp.path())
-            .resolve(
-                &ProfileSelector::path(profile),
-                ProfileResolveOptions::with_worker_name("p"),
-            )
-            .unwrap_err();
-        let message = err.to_string();
-        assert!(message.contains("yoi.profile.extend"), "{message}");
-        assert!(message.contains("removed"), "{message}");
-        assert!(message.contains("yoi.profile.import"), "{message}");
-    }
-
-    #[test]
-    fn sandbox_denies_unsafe_libraries() {
-        let tmp = TempDir::new().unwrap();
-        for (name, body) in [
-            ("os.lua", "return os.getenv('HOME')"),
-            ("io.lua", "return io.open('x')"),
-            ("debug.lua", "return debug.getinfo(1)"),
-            ("package.lua", "return package.path"),
-        ] {
-            let path = write_profile(tmp.path(), name, body);
-            let err = ProfileResolver::new()
-                .with_workspace_base(tmp.path())
-                .resolve(
-                    &ProfileSelector::path(path),
-                    ProfileResolveOptions::with_worker_name("p"),
-                )
-                .unwrap_err();
-            assert!(matches!(
-                err,
-                ProfileError::Lua(_) | ProfileError::InvalidProfile(_)
-            ));
-        }
-    }
     #[test]
     fn rejects_manifest_shaped_runtime_and_authority_fields() {
         for (value, needle) in [
@@ -1992,7 +1703,7 @@ return yoi.profile.extend("builtin:default", {
         ] {
             let err = resolve_profile_artifact(
                 ProfileSource::Path {
-                    path: PathBuf::from("/profiles/bad.lua"),
+                    path: PathBuf::from("/profiles/bad.json"),
                 },
                 Path::new("/workspace"),
                 value,
@@ -2003,36 +1714,8 @@ return yoi.profile.extend("builtin:default", {
     }
     #[test]
     fn rejects_absolute_profile_paths() {
-        let err = resolve_profile_artifact(ProfileSource::Path { path: PathBuf::from("/profiles/bad.lua") }, Path::new("/workspace"), serde_json::json!({"model": { "scheme": "anthropic", "model_id": "m", "auth": {"kind":"api_key", "file":"/secret/key"} }, "scope": "workspace_write"})).unwrap_err();
+        let err = resolve_profile_artifact(ProfileSource::Path { path: PathBuf::from("/profiles/bad.json") }, Path::new("/workspace"), serde_json::json!({"model": { "scheme": "anthropic", "model_id": "m", "auth": {"kind":"api_key", "file":"/secret/key"} }, "scope": "workspace_write"})).unwrap_err();
         assert!(err.to_string().contains("model.auth.file"));
-    }
-    #[test]
-    fn compact_ratio_uses_known_model_context() {
-        let tmp = TempDir::new().unwrap();
-        let profile = write_profile(
-            tmp.path(),
-            "ratio.lua",
-            r#"
-local profile = require("yoi.profile")
-local models = require("yoi.models")
-local compact = require("yoi.compact")
-return profile {
-  model = models.catalog("codex-oauth/gpt-5.5"),
-  compaction = compact.ratio { threshold = 0.5, request = 0.75, worker = 0.25 },
-}
-"#,
-        );
-        let resolved = ProfileResolver::new()
-            .with_workspace_base(tmp.path())
-            .resolve(
-                &ProfileSelector::path(profile),
-                ProfileResolveOptions::with_worker_name("p"),
-            )
-            .unwrap();
-        let c = resolved.manifest.compaction.unwrap();
-        assert_eq!(c.threshold, Some(136000));
-        assert_eq!(c.request_threshold, Some(204000));
-        assert_eq!(c.worker_context_max_tokens, 68000);
     }
     #[test]
     fn builtin_default_resolves_without_external_evaluator() {
@@ -2206,7 +1889,10 @@ language = "nested"
             )
             .unwrap_err();
         assert!(matches!(err, ProfileError::UnsupportedProfileType { .. }));
-        assert!(err.to_string().contains("Lua profiles must end in .lua"));
+        assert!(
+            err.to_string()
+                .contains("Profiles must be .json or .toml artifacts")
+        );
     }
     #[test]
     fn discovery_reads_user_and_project_registry_and_project_default_wins() {
@@ -2217,10 +1903,10 @@ language = "nested"
         let project_config = project_dir.join("profiles.toml");
         std::fs::write(
             &user_config,
-            "default = \"coder\"\n[profile]\ncoder = \"profiles/user-coder.lua\"\n",
+            "default = \"coder\"\n[profile]\ncoder = \"profiles/user-coder.toml\"\n",
         )
         .unwrap();
-        std::fs::write(&project_config, "default = \"project:coder\"\n[profile.coder]\npath = \"profiles/project-coder.lua\"\ndescription = \"Project coder\"\n").unwrap();
+        std::fs::write(&project_config, "default = \"project:coder\"\n[profile.coder]\npath = \"profiles/project-coder.toml\"\ndescription = \"Project coder\"\n").unwrap();
         let registry = ProfileDiscovery::with_sources(Some(user_config), Some(project_config))
             .discover()
             .unwrap();
@@ -2232,7 +1918,7 @@ language = "nested"
                 .path
                 .as_ref()
                 .unwrap()
-                .ends_with("profiles/project-coder.lua")
+                .ends_with("profiles/project-coder.toml")
         );
     }
     #[test]
@@ -2243,7 +1929,7 @@ language = "nested"
         let project_config = project_dir.join("profiles.toml");
         std::fs::write(
             &project_config,
-            "default = \"coder\"\n[profile]\ncoder = \"profiles/coder.lua\"\n",
+            "default = \"coder\"\n[profile]\ncoder = \"profiles/coder.toml\"\n",
         )
         .unwrap();
         let registry = ProfileDiscovery::with_sources(None, Some(project_config))
@@ -2268,13 +1954,13 @@ language = "nested"
         registry.push_entry(ProfileRegistryEntry::path(
             ProfileRegistrySource::User,
             "coder".to_string(),
-            PathBuf::from("/user/coder.lua"),
+            PathBuf::from("/user/coder.toml"),
             None,
         ));
         registry.push_entry(ProfileRegistryEntry::path(
             ProfileRegistrySource::Project,
             "coder".to_string(),
-            PathBuf::from("/project/coder.lua"),
+            PathBuf::from("/project/coder.toml"),
             None,
         ));
         let err = registry
@@ -2289,7 +1975,7 @@ language = "nested"
             .unwrap();
         assert_eq!(
             selected.path.as_deref(),
-            Some(Path::new("/project/coder.lua"))
+            Some(Path::new("/project/coder.toml"))
         );
     }
 }

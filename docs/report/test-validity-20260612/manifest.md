@@ -34,12 +34,12 @@
   - canonicalization/relative-path normalization;
   - delegation subset checks;
   - shared-scope add/remove/clear operations。
-- `profile.rs` は、Lua profile behavior について特に広いカバレッジを持つ:
-  - 意図された `yoi.profile` API 経由の profile registration;
-  - legacy/global APIs の明示的な rejection;
+- `profile.rs` は、profile artifact behavior について特に広いカバレッジを持つ:
+  - typed profile artifact registration;
+  - manifest-shaped/runtime authority fields の明示的な rejection;
   - builtin role profile defaults と tool-policy boundaries;
   - workspace/profile override precedence;
-  - `extend`、helper APIs、TOML loading、model catalog access、Lua module loading;
+  - TOML/JSON artifact loading、model catalog access;
   - multiple-profile discovery、selector handling、ambiguity、exact/unique match behavior。
 - `paths.rs` のテストは、pure resolver functions によって XDG/Yoi directory precedence rules をカバーしており、global environment races を避けている。
 - いくつかのテストは、単なる実装機構ではなく、重要な product decisions を regression checks として符号化している。manifest/profile semantics は durable contract なので、この crate ではそれが適切である。

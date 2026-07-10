@@ -243,7 +243,7 @@ impl ProtocolProviderContribution {
 #[serde(rename_all = "snake_case")]
 pub enum FeatureRuntimeKind {
     Builtin,
-    LuaProfile,
+    Profile,
     ExternalPlugin,
     ProtocolProvider,
 }

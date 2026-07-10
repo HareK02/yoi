@@ -1076,34 +1076,37 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
-        let profile = write_profile(tmp.path(), "mcp.lua", body);
+        let profile = write_profile(tmp.path(), "mcp.toml", body);
         (tmp, workspace, profile)
     }
 
     fn mcp_profile() -> String {
         r#"
-local profile = require("yoi.profile")
-return profile {
-  slug = "mcp-test",
-  model = { scheme = "anthropic", model_id = "claude-sonnet-4-20250514" },
-  mcp = {
-    stdio_server = {
-      {
-        name = "filesystem",
-        command = "definitely-not-spawned-during-cli-inspection",
-        args = { "--root", ".", "--token", "ARG_SECRET_DO_NOT_PRINT" },
-        env = {
-          inherit = { "PATH" },
-          set = {
-            SAFE_MODE = { kind = "literal", value = "SUPER_SECRET_LITERAL_DO_NOT_PRINT" },
-            API_TOKEN = { kind = "secret_ref", ref = "providers/mcp-token" },
-            FROM_ENV = { kind = "env_ref", name = "SECRET_ENV_NAME_DO_NOT_PRINT" },
-          },
-        },
-      },
-    },
-  },
-}
+slug = "mcp-test"
+
+[model]
+scheme = "anthropic"
+model_id = "claude-sonnet-4-20250514"
+
+[[mcp.stdio_server]]
+name = "filesystem"
+command = "definitely-not-spawned-during-cli-inspection"
+args = ["--root", ".", "--token", "ARG_SECRET_DO_NOT_PRINT"]
+
+[mcp.stdio_server.env]
+inherit = ["PATH"]
+
+[mcp.stdio_server.env.set.SAFE_MODE]
+kind = "literal"
+value = "SUPER_SECRET_LITERAL_DO_NOT_PRINT"
+
+[mcp.stdio_server.env.set.API_TOKEN]
+kind = "secret_ref"
+ref = "providers/mcp-token"
+
+[mcp.stdio_server.env.set.FROM_ENV]
+kind = "env_ref"
+name = "SECRET_ENV_NAME_DO_NOT_PRINT"
 "#
         .to_string()
     }
@@ -1194,17 +1197,19 @@ return profile {
     #[test]
     fn invalid_config_is_reported_as_invalid_not_silently_empty() {
         let body = r#"
-local profile = require("yoi.profile")
-return profile {
-  slug = "bad-mcp",
-  model = { scheme = "anthropic", model_id = "claude-sonnet-4-20250514" },
-  mcp = {
-    stdio_server = {
-      { name = "dup", command = "one" },
-      { name = "dup", command = "two" },
-    },
-  },
-}
+slug = "bad-mcp"
+
+[model]
+scheme = "anthropic"
+model_id = "claude-sonnet-4-20250514"
+
+[[mcp.stdio_server]]
+name = "dup"
+command = "one"
+
+[[mcp.stdio_server]]
+name = "dup"
+command = "two"
 "#;
         let (_tmp, workspace, profile) = workspace_and_profile(body);
         let output = render_list(&args(&workspace, &profile, true)).unwrap();
@@ -1218,11 +1223,11 @@ return profile {
     #[test]
     fn human_output_distinguishes_empty_and_unavailable() {
         let body = r#"
-local profile = require("yoi.profile")
-return profile {
-  slug = "empty-mcp",
-  model = { scheme = "anthropic", model_id = "claude-sonnet-4-20250514" },
-}
+slug = "empty-mcp"
+
+[model]
+scheme = "anthropic"
+model_id = "claude-sonnet-4-20250514"
 "#;
         let (_tmp, workspace, profile) = workspace_and_profile(body);
         let output = render_list(&args(&workspace, &profile, false)).unwrap();

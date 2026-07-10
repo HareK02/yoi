@@ -1227,7 +1227,7 @@ workflow = "ticket-review-workflow"
             temp.path(),
             r#"
 [roles.coder]
-profile = "./coder.lua"
+profile = "./coder.toml"
 "#,
         );
         let context = TicketRoleLaunchContext::new(temp.path(), TicketRole::Coder);

@@ -183,7 +183,9 @@ fn parse_spawn_profile_selector(raw: Option<&str>) -> Result<SpawnProfileSelecto
         || raw.starts_with("./")
         || raw.starts_with("../")
         || raw.contains('/')
-        || raw.ends_with(".lua")
+        || raw.ends_with(".dcdl")
+        || raw.ends_with(".json")
+        || raw.ends_with(".toml")
         || raw.ends_with(".nix")
     {
         return Err(format!(
@@ -1181,25 +1183,31 @@ mod tests {
     }
 
     const CODER_PROFILE: &str = r#"
-local profile = require("yoi.profile")
-local scope = require("yoi.scope")
-return profile {
-  slug = "coder",
-  model = { scheme = "anthropic", model_id = "coder-model" },
-  engine = { instruction = "$yoi/coder", language = "Coderish", max_tokens = 2222 },
-  scope = scope.workspace_write(),
-}
+slug = "coder"
+scope = "workspace_write"
+
+[model]
+scheme = "anthropic"
+model_id = "coder-model"
+
+[engine]
+instruction = "$yoi/coder"
+language = "Coderish"
+max_tokens = 2222
 "#;
 
     const REVIEWER_PROFILE: &str = r#"
-local profile = require("yoi.profile")
-local scope = require("yoi.scope")
-return profile {
-  slug = "reviewer",
-  model = { scheme = "anthropic", model_id = "reviewer-model" },
-  engine = { instruction = "$yoi/reviewer", language = "Reviewerish", max_tokens = 3333 },
-  scope = scope.workspace_write(),
-}
+slug = "reviewer"
+scope = "workspace_write"
+
+[model]
+scheme = "anthropic"
+model_id = "reviewer-model"
+
+[engine]
+instruction = "$yoi/reviewer"
+language = "Reviewerish"
+max_tokens = 3333
 "#;
 
     #[test]
@@ -1297,8 +1305,8 @@ return profile {
             &project,
             Some("reviewer"),
             &[
-                ("coder", "coder.lua", CODER_PROFILE),
-                ("reviewer", "reviewer.lua", REVIEWER_PROFILE),
+                ("coder", "coder.toml", CODER_PROFILE),
+                ("reviewer", "reviewer.toml", REVIEWER_PROFILE),
             ],
         );
         let parent = parent_manifest(&project, None);
@@ -1333,8 +1341,8 @@ return profile {
             &project,
             Some("coder"),
             &[
-                ("coder", "coder.lua", CODER_PROFILE),
-                ("reviewer", "reviewer.lua", REVIEWER_PROFILE),
+                ("coder", "coder.toml", CODER_PROFILE),
+                ("reviewer", "reviewer.toml", REVIEWER_PROFILE),
             ],
         );
         let parent = parent_manifest(&project, None);
@@ -1414,7 +1422,7 @@ return profile {
         let available = write_project_profile_registry(
             &project,
             Some("reviewer"),
-            &[("reviewer", "reviewer.lua", REVIEWER_PROFILE)],
+            &[("reviewer", "reviewer.toml", REVIEWER_PROFILE)],
         );
         let parent = parent_manifest(&project, None);
         let scope = vec![abs_rule(&delegated, Permission::Write)];
@@ -1451,7 +1459,7 @@ return profile {
         let available = write_project_profile_registry(
             &project,
             Some("reviewer"),
-            &[("reviewer", "reviewer.lua", REVIEWER_PROFILE)],
+            &[("reviewer", "reviewer.toml", REVIEWER_PROFILE)],
         );
         let parent = parent_manifest(&parent_root, Some(&parent_root.join("deny")));
         let scope = vec![abs_rule(&delegated, Permission::Read)];
@@ -1497,12 +1505,12 @@ return profile {
         let available = write_project_profile_registry(
             &project,
             None,
-            &[("coder", "coder.lua", CODER_PROFILE)],
+            &[("coder", "coder.toml", CODER_PROFILE)],
         );
         let parent = parent_manifest(&project, None);
         let scope = vec![abs_rule(&project, Permission::Read)];
 
-        let invalid = parse_spawn_profile_selector(Some("./reviewer.lua"))
+        let invalid = parse_spawn_profile_selector(Some("./reviewer.toml"))
             .map_err(|msg| format!("{msg}{}", available.error_suffix()))
             .unwrap_err();
         assert!(invalid.contains("Use `default`, `inherit`"));
@@ -1521,7 +1529,7 @@ return profile {
         assert!(default_config.contains("\"name\":\"child\""));
 
         let user_config = tmp.path().join("user-profiles.toml");
-        std::fs::write(&user_config, "[profile]\ncoder = \"user-coder.lua\"\n").unwrap();
+        std::fs::write(&user_config, "[profile]\ncoder = \"user-coder.toml\"\n").unwrap();
         let project_config = project.join(".yoi/profiles.toml");
         let ambiguous = AvailableProfiles {
             registry: Some(
@@ -1550,9 +1558,9 @@ return profile {
     #[test]
     fn spawn_profile_selector_rejects_path_like_values() {
         for raw in [
-            "./reviewer.lua",
-            "path:./reviewer.lua",
-            "/tmp/reviewer.lua",
+            "./reviewer.toml",
+            "path:./reviewer.toml",
+            "/tmp/reviewer.toml",
             "legacy.nix",
         ] {
             let err = parse_spawn_profile_selector(Some(raw)).unwrap_err();

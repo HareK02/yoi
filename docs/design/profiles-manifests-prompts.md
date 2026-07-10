@@ -17,7 +17,7 @@ A Profile should not contain runtime-bound fields:
 
 Those fields depend on one run, one parent, or one machine. Putting them in a reusable Profile makes reuse unsafe.
 
-Yoi is Lua Profile first. Lua gives project/user authors a controlled recipe layer through host-provided `require("yoi")` modules without treating Nix as runtime authoring. Nix remains useful for packaging and development records.
+Yoi Profiles are data artifacts resolved from builtin profile definitions, `profiles.toml`, Decodal source archives, or explicit JSON/TOML artifacts. Decodal is the authoring syntax used by the Workspace profile editor and Backend Runtime archive path; JSON/TOML artifacts are the low-level resolver interchange format. Runtime launch should not depend on executable profile scripts.
 
 ## Manifests
 
@@ -33,27 +33,32 @@ For normal Profile/default startup, a workspace may add `.yoi/override.local.tom
 
 Profiles and manifest layers may declare named local stdio MCP servers under `mcp.stdio_server`. This is a typed configuration surface only. Declaring a server does not start a subprocess, discover packages, negotiate MCP capabilities, or register tools/resources/prompts.
 
-Example Lua Profile fragment:
+Example TOML artifact fragment:
 
-```lua
-mcp = {
-  stdio_server = {
-    {
-      name = "filesystem",
-      command = "node",
-      args = { "server.js", "--root", "." },
-      cwd = { kind = "path", path = "./mcp" },
-      env = {
-        inherit = { "PATH" },
-        set = {
-          SAFE_MODE = { kind = "literal", value = "1" },
-          API_TOKEN = { kind = "secret_ref", ref = "providers/mcp-token" },
-          UPSTREAM_TOKEN = { kind = "env_ref", name = "MCP_UPSTREAM_TOKEN" },
-        },
-      },
-    },
-  },
-}
+```toml
+[[mcp.stdio_server]]
+name = "filesystem"
+command = "node"
+args = ["server.js", "--root", "."]
+
+[mcp.stdio_server.cwd]
+kind = "path"
+path = "./mcp"
+
+[mcp.stdio_server.env]
+inherit = ["PATH"]
+
+[mcp.stdio_server.env.set.SAFE_MODE]
+kind = "literal"
+value = "1"
+
+[mcp.stdio_server.env.set.API_TOKEN]
+kind = "secret_ref"
+ref = "providers/mcp-token"
+
+[mcp.stdio_server.env.set.UPSTREAM_TOKEN]
+kind = "env_ref"
+name = "MCP_UPSTREAM_TOKEN"
 ```
 
 `command` is a direct executable name/path, not a shell string. `args` are passed as argv entries by future lifecycle code. `cwd.kind = "path"` is resolved relative to the Profile or manifest layer; omit `cwd` or use `{ kind = "inherit" }` when the lifecycle caller should choose. Environment handling is explicit: future spawn code should inherit only names listed in `env.inherit` and set only variables in `env.set`. `literal` values are for non-secret data; credentials should use `secret_ref` or explicit `env_ref`. Diagnostics and Debug output must redact env literal values and must not print secret plaintext.

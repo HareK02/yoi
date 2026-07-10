@@ -1528,7 +1528,7 @@ mod tests {
             (
                 vec![
                     "--profile".to_string(),
-                    "p.lua".to_string(),
+                    "p.toml".to_string(),
                     "--session".to_string(),
                     segment_id,
                 ],
@@ -1537,7 +1537,7 @@ mod tests {
             (
                 vec![
                     "--profile".to_string(),
-                    "p.lua".to_string(),
+                    "p.toml".to_string(),
                     "--socket".to_string(),
                     "/tmp/yoi/sock".to_string(),
                 ],

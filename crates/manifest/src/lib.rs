@@ -1193,9 +1193,9 @@ model_id = "claude-sonnet-4-20250514"
         let toml = MINIMAL_REQUIRED.replace(
             "[engine]\n",
             "[engine]\n\
-             [worker.tool_output]\n\
+             [engine.tool_output]\n\
              default_max_bytes = 8192\n\n\
-             [worker.tool_output.per_tool]\n\
+             [engine.tool_output.per_tool]\n\
              Read = 32768\n\
              Grep = 4096\n\n\
              [engine.file_upload]\n\
@@ -1215,7 +1215,7 @@ model_id = "claude-sonnet-4-20250514"
         let toml = MINIMAL_REQUIRED.replace(
             "[engine]\n",
             "[engine]\n\
-             [worker.tool_output]\n",
+             [engine.tool_output]\n",
         );
         let manifest = WorkerManifest::from_toml(&toml).unwrap();
         let limits = &manifest.engine.tool_output;

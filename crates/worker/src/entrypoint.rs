@@ -845,15 +845,15 @@ recursive = true
                 external.display()
             ),
         );
-        let profile = tmp.path().join("profile.lua");
+        let profile = tmp.path().join("profile.toml");
         write(
             &profile,
             r#"
-local yoi = require("yoi")
-return yoi.profile {
-  slug = "override-scope",
-  model = { scheme = "anthropic", model_id = "test-model" },
-}
+slug = "override-scope"
+
+[model]
+scheme = "anthropic"
+model_id = "test-model"
 "#,
         );
         let cli = Cli::try_parse_from([
@@ -889,7 +889,7 @@ return yoi.profile {
     #[test]
     fn profile_uses_selected_profile() {
         let tmp = TempDir::new().unwrap();
-        let profile = tmp.path().join("profile.lua");
+        let profile = tmp.path().join("profile.toml");
         let cli = Cli::try_parse_from([
             "yoi worker",
             "--profile",
@@ -1223,8 +1223,14 @@ permission = "write"
     fn profile_conflicts_with_manifest_and_restore_modes() {
         let segment_id = session_store::new_segment_id().to_string();
         for args in [
-            vec!["yoi worker", "--profile", "p.lua", "--manifest", "m.toml"],
-            vec!["yoi worker", "--profile", "p.lua", "--session", &segment_id],
+            vec!["yoi worker", "--profile", "p.toml", "--manifest", "m.toml"],
+            vec![
+                "yoi worker",
+                "--profile",
+                "p.toml",
+                "--session",
+                &segment_id,
+            ],
         ] {
             let err = Cli::try_parse_from(args).unwrap_err();
             assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
@@ -1233,9 +1239,9 @@ permission = "write"
 
     #[test]
     fn profile_and_worker_are_independent_startup_inputs() {
-        let cli =
-            Cli::try_parse_from(["yoi worker", "--profile", "p.lua", "--worker", "agent"]).unwrap();
-        assert_eq!(cli.profile.as_deref(), Some("p.lua"));
+        let cli = Cli::try_parse_from(["yoi worker", "--profile", "p.toml", "--worker", "agent"])
+            .unwrap();
+        assert_eq!(cli.profile.as_deref(), Some("p.toml"));
         assert_eq!(cli.worker.as_deref(), Some("agent"));
     }
 
