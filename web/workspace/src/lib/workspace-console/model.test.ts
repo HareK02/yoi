@@ -304,6 +304,49 @@ Deno.test("projectConsole aggregates Read calls without showing file content", (
   );
 });
 
+Deno.test("projectConsole renders Edit calls with structured diff lines", () => {
+  const projection = projectConsole([
+    {
+      cursor: "60",
+      event: {
+        event: "tool_call_done",
+        data: {
+          id: "edit-1",
+          name: "Edit",
+          arguments: JSON.stringify({
+            file_path: "/tmp/a.md",
+            old_string: "one\ntwo\nthree",
+            new_string: "one\nTWO\nthree\nfour",
+          }),
+        },
+      } satisfies Event,
+    },
+    {
+      cursor: "61",
+      event: {
+        event: "tool_result",
+        data: {
+          id: "edit-1",
+          summary: "edited",
+          output: "ok",
+          is_error: false,
+        },
+      } satisfies Event,
+    },
+  ]);
+
+  const [line] = projection.lines.filter((line) => line.kind === "tool");
+  assertEquals(line.title, "Call · Edit");
+  assert(line.body.includes("diff: -1 +2"), "diff summary should be shown");
+  assertEquals(line.diff?.map((row) => row.kind), [
+    "context",
+    "remove",
+    "add",
+    "context",
+    "add",
+  ]);
+});
+
 Deno.test("projectConsole preserves in-progress assistant protocol stream", () => {
   const projection = projectConsole([
     {

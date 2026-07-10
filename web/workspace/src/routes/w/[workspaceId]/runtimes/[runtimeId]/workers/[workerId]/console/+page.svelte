@@ -1,5 +1,6 @@
 <script lang="ts">
   import { tick } from 'svelte';
+  import RichMarkdown from '$lib/workspace-console/RichMarkdown.svelte';
   import {
     projectConsole,
     type ConsoleLine
@@ -243,6 +244,12 @@
     return line.error ? 'error' : line.kind;
   }
 
+  function toolClass(line: ConsoleLine): string {
+    const name = line.toolCall?.name?.toLowerCase() ?? '';
+    const state = line.toolCall?.state ?? (line.streaming ? 'streaming' : 'done');
+    return [name ? `tool-${name}` : '', `tool-state-${state}`].filter(Boolean).join(' ');
+  }
+
   function isNearConsoleBottom(element: HTMLElement): boolean {
     return element.scrollHeight - element.scrollTop - element.clientHeight <= CONSOLE_BOTTOM_THRESHOLD_PX;
   }
@@ -326,7 +333,7 @@
         {:else}
           <ol class="console-log">
             {#each lines as item}
-              <li class:assistant={lineClass(item) === 'assistant'} class:user={lineClass(item) === 'user'} class:system={lineClass(item) !== 'assistant' && lineClass(item) !== 'user'} class:error-line={item.error}>
+              <li class={`console-line ${lineClass(item)} ${toolClass(item)}`} class:error-line={item.error}>
                 {#if lineClass(item) !== 'assistant' && lineClass(item) !== 'user'}
                   <div class="message-heading">
                     <span>{item.title}</span>
@@ -337,7 +344,11 @@
                     <small>streaming</small>
                   </div>
                 {/if}
-                <pre>{item.body || '—'}</pre>
+                <RichMarkdown text={item.body || '—'} />
+                {#if item.diff}
+                  <pre class="console-diff" aria-label="Edit diff">{#each item.diff as diffLine}
+<span class={`diff-line ${diffLine.kind}`}><span class="diff-gutter">{diffLine.oldNumber ?? ''}</span><span class="diff-gutter">{diffLine.newNumber ?? ''}</span><span class="diff-marker">{diffLine.kind === 'add' ? '+' : diffLine.kind === 'remove' ? '-' : ' '}</span><span class="diff-content">{diffLine.content}</span></span>{/each}</pre>
+                {/if}
                 {#if item.detail}
                   <details class="message-detail">
                     <summary>detail</summary>

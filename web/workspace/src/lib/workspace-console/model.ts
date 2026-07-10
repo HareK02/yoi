@@ -35,12 +35,20 @@ type ToolCallView = {
   isError?: boolean;
 };
 
+export type ConsoleDiffLine = {
+  kind: "context" | "add" | "remove";
+  oldNumber?: number;
+  newNumber?: number;
+  content: string;
+};
+
 export type ConsoleLine = {
   id: string;
   kind: ConsoleLineKind;
   title: string;
   body: string;
   detail?: string;
+  diff?: ConsoleDiffLine[];
   cursor?: string | null;
   source: "event";
   streaming?: boolean;
@@ -455,6 +463,7 @@ function refreshToolLine(item: ConsoleLine): void {
     : `Call · ${toolCall.name}`;
   item.body = renderToolCall(toolCall);
   item.detail = toolCallDetail(toolCall);
+  item.diff = toolCall.name === "Edit" ? editDiff(toolCall) : undefined;
   item.streaming = !["done", "error"].includes(toolCall.state);
   item.error = toolCall.state === "error";
 }
@@ -563,19 +572,93 @@ function renderWriteTool(toolCall: ToolCallView): string {
 function renderEditTool(toolCall: ToolCallView): string {
   const args = parsedArgs(toolCall);
   const path = stringField(args, "file_path") ?? "?";
-  const oldString = stringField(args, "old_string");
-  const newString = stringField(args, "new_string");
-  const change = oldString || newString
-    ? compactLines([
-      oldString ? `- ${firstLine(oldString)}` : undefined,
-      newString ? `+ ${firstLine(newString)}` : undefined,
-    ])
-    : undefined;
+  const diff = editDiff(toolCall) ?? [];
+  const removes = diff.filter((line) => line.kind === "remove").length;
+  const adds = diff.filter((line) => line.kind === "add").length;
   return compactLines([
     `Edit — ${path} (${stateSuffix(toolCall.state)})`,
-    change,
+    diff.length > 0 ? `diff: -${removes} +${adds}` : undefined,
     resultText(toolCall),
   ]);
+}
+
+function editDiff(toolCall: ToolCallView): ConsoleDiffLine[] | undefined {
+  const args = parsedArgs(toolCall);
+  const oldString = stringField(args, "old_string");
+  const newString = stringField(args, "new_string");
+  if (oldString === undefined && newString === undefined) {
+    return undefined;
+  }
+  return diffLines(oldString ?? "", newString ?? "");
+}
+
+function diffLines(oldText: string, newText: string): ConsoleDiffLine[] {
+  const oldLines = oldText.split(/\r?\n/);
+  const newLines = newText.split(/\r?\n/);
+  const table = lcsTable(oldLines, newLines);
+  const rows: ConsoleDiffLine[] = [];
+  let oldIndex = 0;
+  let newIndex = 0;
+  while (oldIndex < oldLines.length && newIndex < newLines.length) {
+    if (oldLines[oldIndex] === newLines[newIndex]) {
+      rows.push({
+        kind: "context",
+        oldNumber: oldIndex + 1,
+        newNumber: newIndex + 1,
+        content: oldLines[oldIndex],
+      });
+      oldIndex += 1;
+      newIndex += 1;
+    } else if (
+      table[oldIndex + 1]?.[newIndex] >= table[oldIndex]?.[newIndex + 1]
+    ) {
+      rows.push({
+        kind: "remove",
+        oldNumber: oldIndex + 1,
+        content: oldLines[oldIndex],
+      });
+      oldIndex += 1;
+    } else {
+      rows.push({
+        kind: "add",
+        newNumber: newIndex + 1,
+        content: newLines[newIndex],
+      });
+      newIndex += 1;
+    }
+  }
+  while (oldIndex < oldLines.length) {
+    rows.push({
+      kind: "remove",
+      oldNumber: oldIndex + 1,
+      content: oldLines[oldIndex],
+    });
+    oldIndex += 1;
+  }
+  while (newIndex < newLines.length) {
+    rows.push({
+      kind: "add",
+      newNumber: newIndex + 1,
+      content: newLines[newIndex],
+    });
+    newIndex += 1;
+  }
+  return rows;
+}
+
+function lcsTable(oldLines: string[], newLines: string[]): number[][] {
+  const rows = Array.from(
+    { length: oldLines.length + 1 },
+    () => Array(newLines.length + 1).fill(0),
+  );
+  for (let oldIndex = oldLines.length - 1; oldIndex >= 0; oldIndex -= 1) {
+    for (let newIndex = newLines.length - 1; newIndex >= 0; newIndex -= 1) {
+      rows[oldIndex][newIndex] = oldLines[oldIndex] === newLines[newIndex]
+        ? rows[oldIndex + 1][newIndex + 1] + 1
+        : Math.max(rows[oldIndex + 1][newIndex], rows[oldIndex][newIndex + 1]);
+    }
+  }
+  return rows;
 }
 
 function renderSearchTool(toolCall: ToolCallView): string {

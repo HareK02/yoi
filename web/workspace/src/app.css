@@ -42,6 +42,14 @@
         --success: oklch(48% 0.11 145);
         --warning: oklch(62% 0.12 85);
         --danger: oklch(54% 0.14 25);
+        --tui-green: #76946a;
+        --tui-red: #c34043;
+        --tui-yellow: #c0a36e;
+        --tui-blue: #7e9cd8;
+        --tui-cyan: #6a9589;
+        --tui-magenta: #957fb8;
+        --tui-gray: #727169;
+        --tui-dark-gray: #54546d;
 
         --space-1: 4px;
         --space-2: 8px;
@@ -1033,13 +1041,157 @@
 .console-log li {
     display: grid;
     gap: var(--space-1);
-    padding: 0.2rem 0;
+    padding: 0.45rem 0 0.45rem 0.75rem;
+    border-left: 3px solid var(--line);
     background: transparent;
 }
 
+.console-log li.console-line.assistant {
+    border-left-color: var(--tui-blue);
+}
 
+.console-log li.console-line.user {
+    border-left-color: var(--tui-green);
+}
 
+.console-log li.console-line.thinking {
+    border-left-color: var(--tui-magenta);
+}
 
+.console-log li.console-line.tool {
+    border-left-color: var(--tui-cyan);
+}
+
+.console-log li.console-line.tool-read {
+    border-left-color: var(--tui-blue);
+}
+
+.console-log li.console-line.tool-write,
+.console-log li.console-line.tool-edit {
+    border-left-color: var(--tui-yellow);
+}
+
+.console-log li.console-line.tool-bash {
+    border-left-color: var(--tui-magenta);
+}
+
+.console-log li.console-line.tool-state-running,
+.console-log li.console-line.tool-state-streaming_args,
+.console-log li.console-line.tool-state-pending {
+    border-left-color: var(--tui-yellow);
+}
+
+.console-log li.console-line.tool-state-done {
+    border-left-color: var(--tui-green);
+}
+
+.console-log li.console-line.tool-state-error,
+.console-log li.console-line.error-line {
+    border-left-color: var(--tui-red);
+}
+
+.rich-markdown {
+    color: inherit;
+    line-height: 1.55;
+}
+
+.rich-markdown > :first-child {
+    margin-top: 0;
+}
+
+.rich-markdown > :last-child {
+    margin-bottom: 0;
+}
+
+.rich-markdown p,
+.rich-markdown ul,
+.rich-markdown blockquote,
+.rich-markdown pre {
+    margin: 0.45rem 0;
+}
+
+.rich-markdown ul {
+    padding-left: 1.2rem;
+}
+
+.rich-markdown h1,
+.rich-markdown h2,
+.rich-markdown h3,
+.rich-markdown h4 {
+    margin: 0.7rem 0 0.35rem;
+    color: var(--text-strong);
+    font-size: 1rem;
+}
+
+.rich-markdown blockquote {
+    border-left: 2px solid var(--tui-dark-gray);
+    color: var(--text-muted);
+    padding-left: 0.8rem;
+}
+
+.rich-markdown :not(pre) > code {
+    background: color-mix(in oklch, var(--bg-raised) 80%, var(--tui-blue));
+    border: 1px solid var(--line);
+    border-radius: 0.35rem;
+    color: var(--tui-blue);
+    padding: 0.05rem 0.28rem;
+}
+
+.rich-markdown a {
+    color: var(--tui-cyan);
+}
+
+.rich-markdown .shiki {
+    border: 1px solid var(--line);
+    border-radius: 0.65rem;
+    overflow: auto;
+    padding: 0.75rem;
+}
+
+.console-diff {
+    background: color-mix(in oklch, var(--bg-raised) 85%, black);
+    border: 1px solid var(--line);
+    border-radius: 0.65rem;
+    color: var(--text);
+    font-size: 0.78rem;
+    line-height: 1.45;
+    margin: 0.6rem 0 0;
+    overflow-x: auto;
+    padding: 0.45rem 0;
+}
+
+.diff-line {
+    display: grid;
+    grid-template-columns: 3.2rem 3.2rem 1.4rem minmax(0, 1fr);
+    min-width: max-content;
+}
+
+.diff-line.add {
+    background: color-mix(in oklch, var(--tui-green) 18%, transparent);
+    color: color-mix(in oklch, var(--tui-green) 75%, white);
+}
+
+.diff-line.remove {
+    background: color-mix(in oklch, var(--tui-red) 18%, transparent);
+    color: color-mix(in oklch, var(--tui-red) 72%, white);
+}
+
+.diff-line.context {
+    color: var(--text-muted);
+}
+
+.diff-gutter,
+.diff-marker {
+    color: var(--tui-gray);
+    padding: 0 0.5rem;
+    text-align: right;
+    user-select: none;
+}
+
+.diff-content {
+    padding-right: 0.75rem;
+    white-space: pre;
+}
 
 .console-log li.error-line {
     color: var(--danger);
