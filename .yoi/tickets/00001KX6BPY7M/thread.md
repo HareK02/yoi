@@ -247,3 +247,37 @@ Validation performed:
 - acceptance blockers が inspection で明確だったため、full test/build matrix は再実行していない。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-10T17:14:02Z -->
+
+## Implementation report
+
+Follow-up implementation progress report after request_changes:
+
+- Coder Pod `yoi-coder-00001KX6BPY7M-worker-workdir` completed the focused fix pass and committed follow-up commit `8695089fba346b8f10d55016b8328337e1c37445 fix: sync backend worker registry projections` on branch `work/00001KX6BPY7M-worker-workdir-registry`。
+- Implementation worktree status was clean at Orchestrator inspection。
+- Orchestrator inspected branch log / commit stats / `git diff --check 86f652a7..HEAD` in the implementation worktree。
+
+Coder-reported fix summary:
+- Browser Worker list now projects from Backend `worker_registry` rows after Runtime observation sync, preserving Backend-only stopped/archive rows。
+- Worker-Workdir relationships are projected from `worker_workdir_links` as authority。
+- Runtime-scoped Worker spawn now writes pending Backend-managed Workdir rows, Worker registry rows, and Worker-Workdir links。
+- Worker stop now updates Backend Worker lifecycle and syncs linked Workdir status to present/removed/missing without deleting canonical rows。
+- Runtime Workdir observation/listing now syncs Runtime observations into Backend registry and projects safe `management_kind` (`backend_managed` / `runtime_unmanaged`)。
+- Existing `pinned` Worker retention is protected from ordinary Runtime sync/upsert clobbering。
+- Tests were added/strengthened for archive/link projection, unmanaged Workdir projection, raw path redaction, removed Workdir preservation, and pinned retention preservation。
+- Frontend type exposure for Workdir `management_kind` was added。
+
+Coder-reported validation passed:
+- `git diff --check`
+- `cargo test -p yoi-workspace-server --lib`
+- `cargo test -p worker-runtime --features ws-server,fs-store`
+- `cargo check -p yoi`
+- `cd web/workspace && deno task check && deno task test`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Next action:
+- Request focused external re-review against commits `3e5546ea..8695089f` and the whole Ticket acceptance criteria before merge/close decisions。
+
+---
