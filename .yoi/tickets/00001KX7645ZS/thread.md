@@ -69,3 +69,21 @@ State changed to `done`.
 
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-07-10T23:50:55Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-07-10T23:50:55Z status: closed -->
+
+## 完了
+
+Removed backend-local worker observation replay. Worker Console attach now receives Runtime Snapshot as bootstrap and then live upstream events only; workspace-server no longer stores/replays previous user_message/tool_result/text_delta frames.
+
+
+---

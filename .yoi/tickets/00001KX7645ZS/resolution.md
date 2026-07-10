@@ -1,0 +1,1 @@
+Removed backend-local worker observation replay. Worker Console attach now receives Runtime Snapshot as bootstrap and then live upstream events only; workspace-server no longer stores/replays previous user_message/tool_result/text_delta frames.
