@@ -1,8 +1,9 @@
 ---
 title: 'Replace Worker workspace_root path with WorkspaceBackend'
 state: 'planning'
+priority: 'P1'
 created_at: '2026-07-10T21:16:22Z'
-updated_at: '2026-07-10T21:23:27Z'
+updated_at: '2026-07-10T21:32:47Z'
 assignee: null
 ---
 

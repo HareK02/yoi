@@ -3,6 +3,14 @@
   "relations": [
     {
       "ticket_id": "00001KX6Y6ZEA",
+      "kind": "depends_on",
+      "target": "00001KX6Y2A9Q",
+      "note": "Workspace identity/backend refactor should build on the explicit filesystem-authority boundary.",
+      "author": "yoi ticket",
+      "at": "2026-07-10T21:24:10Z"
+    },
+    {
+      "ticket_id": "00001KX6Y6ZEA",
       "kind": "related",
       "target": "00001KX6WVNPD",
       "note": "Embedded no-workdir Workers need workspace API access without local filesystem authority.",

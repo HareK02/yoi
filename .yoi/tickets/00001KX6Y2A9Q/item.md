@@ -1,8 +1,9 @@
 ---
 title: 'Implement WorkerFilesystemAuthority for no-workdir Workers'
 state: 'planning'
+priority: 'P1'
 created_at: '2026-07-10T21:13:49Z'
-updated_at: '2026-07-10T21:14:19Z'
+updated_at: '2026-07-10T21:32:47Z'
 assignee: null
 ---
 
