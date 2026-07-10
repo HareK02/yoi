@@ -47,3 +47,20 @@ Clarification: this ticket should remove Worker-level `workspace_root: PathBuf`,
 
 
 ---
+
+<!-- event: intake_summary author: hare at: 2026-07-10T22:01:46Z -->
+
+## Intake summary
+
+Marked ready by `yoi ticket state`.
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-07-10T22:01:46Z from: planning to: ready reason: cli_state field: state -->
+
+## State changed
+
+Marked ready by `yoi ticket state`.
+
+
+---
