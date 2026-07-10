@@ -1,9 +1,9 @@
 ---
 title: 'Embedded no-workdir Worker authority policy'
-state: 'planning'
+state: 'ready'
 priority: 'P1'
 created_at: '2026-07-10T20:52:43Z'
-updated_at: '2026-07-10T21:54:14Z'
+updated_at: '2026-07-10T21:59:20Z'
 assignee: null
 ---
 
