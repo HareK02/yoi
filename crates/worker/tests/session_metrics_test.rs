@@ -190,9 +190,16 @@ async fn make_worker(
     let mut worker = Engine::new(client);
     worker.register_tool(big_content_tool_definition(tool_name));
 
-    let worker = Worker::new(manifest, worker, store, pwd, scope)
-        .await
-        .unwrap();
+    let worker = Worker::new(
+        manifest,
+        worker,
+        store,
+        pwd.clone(),
+        worker::WorkerFilesystemAuthority::local(pwd.clone(), pwd.clone()),
+        scope,
+    )
+    .await
+    .unwrap();
     (worker, store_tmp, pwd_tmp)
 }
 
@@ -453,9 +460,16 @@ async fn metric_write_failure_emits_warn_alert_and_does_not_abort_run() {
     // the failure path: at least one metric attempts to write.
     let client = MockClient::new(vec![text_response_with_cache("hi", 0, 0)]);
     let worker = Engine::new(client);
-    let mut worker = Worker::new(manifest, worker, store.clone(), pwd, scope)
-        .await
-        .unwrap();
+    let mut worker = Worker::new(
+        manifest,
+        worker,
+        store.clone(),
+        pwd.clone(),
+        worker::WorkerFilesystemAuthority::local(pwd.clone(), pwd.clone()),
+        scope,
+    )
+    .await
+    .unwrap();
 
     let (tx, mut rx) = broadcast::channel::<Event>(64);
     let alerter = worker::Alerter::new(tx);
@@ -522,9 +536,16 @@ permission = "write"
     let pwd = pwd_tmp.path().to_path_buf();
     let scope = worker::Scope::writable(&pwd).unwrap();
     let worker = Engine::new(client);
-    let mut worker = Worker::new(manifest, worker, store.clone(), pwd, scope)
-        .await
-        .unwrap();
+    let mut worker = Worker::new(
+        manifest,
+        worker,
+        store.clone(),
+        pwd.clone(),
+        worker::WorkerFilesystemAuthority::local(pwd.clone(), pwd.clone()),
+        scope,
+    )
+    .await
+    .unwrap();
     let session_id = worker.session_id();
     let segment_id = worker.segment_id();
     worker.run_text("hello").await.unwrap();

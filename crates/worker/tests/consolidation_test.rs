@@ -170,9 +170,16 @@ async fn make_worker_with(
 
     let scope = worker::Scope::writable(&pwd).unwrap();
     let worker = Engine::new(client);
-    Worker::new(manifest, worker, store, pwd, scope)
-        .await
-        .unwrap()
+    Worker::new(
+        manifest,
+        worker,
+        store,
+        pwd.clone(),
+        worker::WorkerFilesystemAuthority::local(pwd.clone(), pwd.clone()),
+        scope,
+    )
+    .await
+    .unwrap()
 }
 
 fn write_n_staging(layout: &WorkspaceLayout, n: usize) -> Vec<uuid::Uuid> {

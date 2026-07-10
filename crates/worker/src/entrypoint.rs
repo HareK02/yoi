@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use crate::{PromptLoader, Worker, WorkerController};
+use crate::{PromptLoader, Worker, WorkerController, WorkerFilesystemAuthority};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use manifest::{
     Permission, ProfileResolveOptions, ProfileResolver, ProfileSelector, ScopeConfig, ScopeRule,
@@ -511,6 +511,8 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
         }
     };
     let store = CombinedStore::new(session_store, worker_metadata_store);
+    let filesystem_authority =
+        WorkerFilesystemAuthority::local(workspace_root.clone(), cwd.clone());
 
     let mut worker = if cli.adopt {
         let callback = match cli.callback.clone() {
@@ -526,7 +528,7 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
             loader,
             callback,
             workspace_root.clone(),
-            cwd.clone(),
+            filesystem_authority.clone(),
         )
         .await
         {
@@ -557,7 +559,7 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
             store,
             loader,
             workspace_root.clone(),
-            cwd.clone(),
+            filesystem_authority.clone(),
         )
         .await
         {
@@ -577,7 +579,7 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
                     store,
                     loader,
                     workspace_root.clone(),
-                    cwd.clone(),
+                    filesystem_authority.clone(),
                 )
                 .await
                 {
@@ -598,7 +600,7 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
                     store,
                     loader,
                     workspace_root.clone(),
-                    cwd.clone(),
+                    filesystem_authority.clone(),
                 )
                 .await
                 {
@@ -620,7 +622,7 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
             store,
             loader,
             workspace_root.clone(),
-            cwd.clone(),
+            filesystem_authority.clone(),
         )
         .await
         {

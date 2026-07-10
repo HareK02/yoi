@@ -414,7 +414,7 @@ mod tests {
                 store,
                 "orchestrator".into(),
                 runtime_base.clone(),
-                root.path().to_path_buf(),
+                Some(root.path().to_path_buf()),
                 SpawnedWorkerRegistry::new(runtime_dir),
             ),
             "companion",
