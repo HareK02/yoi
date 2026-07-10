@@ -395,7 +395,10 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
         &self,
         request: &WorkingDirectoryRequest,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
-        let working_directory_id = next_working_directory_id(&request.repository.id);
+        let working_directory_id = request
+            .backend_workdir_id
+            .clone()
+            .unwrap_or_else(|| next_working_directory_id(&request.repository.id));
         self.materialize_with_working_directory_id(
             working_directory_id,
             request,
@@ -719,6 +722,7 @@ mod tests {
             },
             materializer: MaterializerKind::LocalGitWorktree,
             dirty_state_policy: DirtyStatePolicy::CleanPointOnly,
+            backend_workdir_id: None,
         }
     }
 

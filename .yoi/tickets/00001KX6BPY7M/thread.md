@@ -144,3 +144,29 @@ Acceptance basis:
 - side effect はこの `queued -> inprogress` acceptance 後に、worktree-workflow に沿って implementation worktree を作成してから開始する。
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-10T16:38:10Z -->
+
+## Implementation report
+
+Implemented Backend SQLite Worker/Workdir registries and Worker-Workdir link authority.
+
+Summary:
+- Added schema v3 tables for worker_registry, workdir_registry, and worker_workdir_links with explicit retention_state including pinned.
+- Added store records/APIs plus round-trip tests for pinned Worker retention, removed Workdir preservation, and links.
+- Added Backend-managed Workdir id assignment and pending registry write before Runtime materialization.
+- Updated Workspace API to serve Browser Workdir lists from backend-managed registry rows, preserve canonical Workdir records after cleanup/removal, and distinguish runtime_unmanaged records when Runtime-direct Workdirs are encountered.
+- Registered created/listed Workers and linked Workers to selected Workdirs without storing raw Runtime materialized paths.
+- Extended worker-runtime WorkingDirectoryRequest with an optional backend_workdir_id used by local worktree materialization.
+
+Validation run:
+- git diff --check
+- cargo test -p yoi-workspace-server --lib
+- cargo test -p worker-runtime --features ws-server,fs-store
+- cargo check -p yoi
+- cd web/workspace && deno task check && deno task test
+- yoi ticket doctor
+- nix build .#yoi --no-link
+
+
+---

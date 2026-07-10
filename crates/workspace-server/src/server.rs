@@ -48,12 +48,16 @@ use crate::repositories::{
     RepositoryRegistryReader, RepositorySummary,
 };
 use crate::resource_broker::BackendResourceBroker;
-use crate::store::{ControlPlaneStore, WorkspaceRecord};
+use crate::store::{
+    ControlPlaneStore, WorkdirRegistryRecord, WorkerRegistryRecord, WorkerWorkdirLinkRecord,
+    WorkspaceRecord,
+};
 use crate::{Error, Result};
 use worker_runtime::catalog::{
     ConfigBundleRef, DirtyStatePolicy, MaterializerKind, ProfileSelector,
     RepositorySelector as RuntimeRepositorySelector, WorkingDirectoryClaim,
-    WorkingDirectoryRepository, WorkingDirectoryRequest, WorkingDirectorySummary,
+    WorkingDirectoryRepository, WorkingDirectoryRequest, WorkingDirectoryStatusKind,
+    WorkingDirectorySummary,
 };
 use worker_runtime::config_bundle::ConfigBundle;
 use worker_runtime::http_server::{
@@ -1274,12 +1278,36 @@ fn create_working_directory_for_runtime(
     request: BrowserWorkingDirectoryCreateRequest,
 ) -> ApiResult<Json<BrowserWorkingDirectoryDetailResponse>> {
     let runtime_id = request.runtime_id.clone();
-    let working_directory_request = working_directory_request_for_browser(&api, request)?;
+    let mut working_directory_request = working_directory_request_for_browser(&api, request)?;
+    let workdir_id = next_backend_workdir_id(&working_directory_request.repository.id);
+    working_directory_request.backend_workdir_id = Some(workdir_id.clone());
+    let pending = WorkdirRegistryRecord {
+        workspace_id: api.config.workspace_id.clone(),
+        workdir_id: workdir_id.clone(),
+        runtime_id: runtime_id.clone(),
+        repository_id: working_directory_request.repository.id.clone(),
+        selector: working_directory_request
+            .repository
+            .selector
+            .as_ref()
+            .map(|selector| selector.as_ref().to_string()),
+        resolved_commit: None,
+        materialization_status: "pending".to_string(),
+        cleanliness: "clean".to_string(),
+        management_kind: "backend_managed".to_string(),
+        created_at: now_registry_timestamp(),
+        updated_at: now_registry_timestamp(),
+    };
+    api.store.upsert_workdir_registry(&pending)?;
     let result = api
         .runtime
         .create_working_directory(&runtime_id, working_directory_request)
         .map_err(|err| err.into_error())?;
     let Some(working_directory) = result.working_directory else {
+        let mut failed = pending;
+        failed.materialization_status = "failed".to_string();
+        failed.updated_at = now_registry_timestamp();
+        api.store.upsert_workdir_registry(&failed)?;
         return Err(ApiError::with_diagnostics(
             Error::RuntimeOperationFailed {
                 runtime_id,
@@ -1289,6 +1317,13 @@ fn create_working_directory_for_runtime(
             result.diagnostics,
         ));
     };
+    let record = workdir_record_from_summary(
+        &api,
+        &runtime_id,
+        &working_directory.summary,
+        "backend_managed",
+    );
+    api.store.upsert_workdir_registry(&record)?;
     Ok(Json(BrowserWorkingDirectoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
         item: working_directory.summary,
@@ -1305,21 +1340,43 @@ fn working_directory_detail_for_runtime(
         .runtime
         .working_directory(runtime_id, working_directory_id)
         .map_err(|err| err.into_error())?;
-    let Some(working_directory) = result.working_directory else {
-        return Err(ApiError::with_diagnostics(
-            Error::RuntimeOperationFailed {
-                runtime_id: runtime_id.to_string(),
-                code: "workspace_working_directory_lookup_failed".to_string(),
-                message: "Runtime did not return working directory".to_string(),
-            },
-            result.diagnostics,
-        ));
-    };
-    Ok(Json(BrowserWorkingDirectoryDetailResponse {
-        workspace_id: api.config.workspace_id.clone(),
-        item: working_directory.summary,
-        diagnostics: result.diagnostics,
-    }))
+    if let Some(working_directory) = result.working_directory {
+        let management_kind = api
+            .store
+            .get_workdir_registry(&api.config.workspace_id, working_directory_id)?
+            .map(|record| record.management_kind)
+            .unwrap_or_else(|| "runtime_unmanaged".to_string());
+        let record = workdir_record_from_summary(
+            &api,
+            runtime_id,
+            &working_directory.summary,
+            management_kind.as_str(),
+        );
+        api.store.upsert_workdir_registry(&record)?;
+        return Ok(Json(BrowserWorkingDirectoryDetailResponse {
+            workspace_id: api.config.workspace_id.clone(),
+            item: working_directory.summary,
+            diagnostics: result.diagnostics,
+        }));
+    }
+    if let Some(record) = api
+        .store
+        .get_workdir_registry(&api.config.workspace_id, working_directory_id)?
+    {
+        return Ok(Json(BrowserWorkingDirectoryDetailResponse {
+            workspace_id: api.config.workspace_id.clone(),
+            item: workdir_summary_from_record(&record),
+            diagnostics: result.diagnostics,
+        }));
+    }
+    Err(ApiError::with_diagnostics(
+        Error::RuntimeOperationFailed {
+            runtime_id: runtime_id.to_string(),
+            code: "workspace_working_directory_lookup_failed".to_string(),
+            message: "Runtime did not return working directory".to_string(),
+        },
+        result.diagnostics,
+    ))
 }
 
 fn cleanup_working_directory_for_runtime(
@@ -1341,6 +1398,18 @@ fn cleanup_working_directory_for_runtime(
             result.diagnostics,
         ));
     };
+    let management_kind = api
+        .store
+        .get_workdir_registry(&api.config.workspace_id, working_directory_id)?
+        .map(|record| record.management_kind)
+        .unwrap_or_else(|| "runtime_unmanaged".to_string());
+    let record = workdir_record_from_summary(
+        &api,
+        runtime_id,
+        &working_directory.summary,
+        management_kind.as_str(),
+    );
+    api.store.upsert_workdir_registry(&record)?;
     Ok(Json(BrowserWorkingDirectoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
         item: working_directory.summary,
@@ -1966,6 +2035,7 @@ fn working_directory_request_from_repository(
         },
         materializer: MaterializerKind::LocalGitWorktree,
         dirty_state_policy: DirtyStatePolicy::CleanPointOnly,
+        backend_workdir_id: None,
     }
 }
 
@@ -2026,6 +2096,10 @@ async fn create_workspace_worker(
             content: initial_text,
         })
     };
+    let selected_working_directory_id = request
+        .working_directory
+        .as_ref()
+        .map(|selection| selection.working_directory_id.clone());
     let resolved_working_directory =
         request
             .working_directory
@@ -2039,7 +2113,7 @@ async fn create_workspace_worker(
         .spawn_worker(
             &request.runtime_id,
             WorkerSpawnRequest {
-                requested_worker_name: Some(display_name),
+                requested_worker_name: Some(display_name.clone()),
                 intent: WorkerSpawnIntent::WorkspaceCoding,
                 acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                     expected_segments: if initial_input.is_some() { 1 } else { 0 },
@@ -2064,6 +2138,38 @@ async fn create_workspace_worker(
         code: "workspace_worker_create_missing_summary".to_string(),
         message: "Runtime completed worker creation without returning a Worker summary".to_string(),
     })?;
+    let worker_record =
+        record_worker_summary(&api, &worker, &display_name, Some(request.profile.clone()))?;
+    if let Some(workdir_id) = selected_working_directory_id.as_deref() {
+        if api
+            .store
+            .get_workdir_registry(&api.config.workspace_id, workdir_id)?
+            .is_none()
+        {
+            if let Ok(result) = api
+                .runtime
+                .working_directory(worker.runtime_id.as_str(), workdir_id)
+                .map_err(|err| err.into_error())
+            {
+                if let Some(status) = result.working_directory {
+                    let record = workdir_record_from_summary(
+                        &api,
+                        worker.runtime_id.as_str(),
+                        &status.summary,
+                        "runtime_unmanaged",
+                    );
+                    api.store.upsert_workdir_registry(&record)?;
+                }
+            }
+        }
+        if api
+            .store
+            .get_workdir_registry(&api.config.workspace_id, workdir_id)?
+            .is_some()
+        {
+            link_worker_to_workdir(&api, &worker_record, workdir_id)?;
+        }
+    }
     let runtime_id = worker.runtime_id.clone();
     let worker_id = worker.worker_id.clone();
     let workspace_id = api.workspace_id().to_string();
@@ -2423,11 +2529,19 @@ async fn list_host_workers(
 fn workers_response(api: WorkspaceApi) -> ApiResult<RuntimeListResponse<WorkerSummary>> {
     let limit = api.config.max_records.min(200);
     let runtime_workers = api.runtime.list_workers(limit);
+    for worker in &runtime_workers.items {
+        let _ = record_worker_summary(
+            &api,
+            worker,
+            worker.worker_id.as_str(),
+            worker.profile.clone(),
+        );
+    }
     Ok(RuntimeListResponse {
         workspace_id: api.config.workspace_id,
         limit,
         items: runtime_workers.items,
-        source: "worker_runtime_registry".to_string(),
+        source: "backend_worker_registry_synced".to_string(),
         diagnostics: runtime_workers.diagnostics,
     })
 }
@@ -3126,25 +3240,152 @@ fn working_directory_repository_options(
 }
 
 fn working_directory_summaries(api: &WorkspaceApi) -> ApiResult<Vec<WorkingDirectorySummary>> {
-    let list = api
-        .runtime
-        .list_working_directories(EMBEDDED_WORKER_RUNTIME_ID)
-        .map_err(|err| err.into_error())?;
-    if !list.diagnostics.is_empty() {
-        return Err(ApiError::with_diagnostics(
-            Error::RuntimeOperationFailed {
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-                code: "workspace_working_directory_list_failed".to_string(),
-                message: "Runtime did not list working directories".to_string(),
-            },
-            list.diagnostics,
-        ));
+    let records = api
+        .store
+        .list_managed_workdir_registry(&api.config.workspace_id, 200)?;
+    Ok(records
+        .iter()
+        .map(workdir_summary_from_record)
+        .collect::<Vec<_>>())
+}
+
+fn backend_worker_id(runtime_id: &str, runtime_worker_id: &str) -> String {
+    format!("{runtime_id}/{runtime_worker_id}")
+}
+
+fn now_registry_timestamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+fn registry_safe_id_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    sanitized.trim_matches('-').chars().take(48).collect()
+}
+
+fn next_backend_workdir_id(repository_id: &str) -> String {
+    let repository = registry_safe_id_component(repository_id);
+    format!(
+        "backend-{}-{}",
+        now_registry_timestamp(),
+        if repository.is_empty() {
+            "workdir"
+        } else {
+            &repository
+        }
+    )
+}
+
+fn record_worker_summary(
+    api: &WorkspaceApi,
+    worker: &WorkerSummary,
+    display_name: &str,
+    profile: Option<String>,
+) -> ApiResult<WorkerRegistryRecord> {
+    let timestamp = now_registry_timestamp();
+    let worker_id = backend_worker_id(worker.runtime_id.as_str(), worker.worker_id.as_str());
+    let record = WorkerRegistryRecord {
+        workspace_id: api.config.workspace_id.clone(),
+        worker_id,
+        runtime_id: worker.runtime_id.as_str().to_string(),
+        runtime_worker_id: worker.worker_id.as_str().to_string(),
+        display_name: display_name.to_string(),
+        profile,
+        lifecycle_state: worker.status.clone(),
+        retention_state: "normal".to_string(),
+        transcript_ref: Some(format!(
+            "runtime://{}/workers/{}/transcript",
+            worker.runtime_id.as_str(),
+            worker.worker_id.as_str()
+        )),
+        session_ref: None,
+        summary_ref: None,
+        diagnostics_ref: None,
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+    };
+    api.store.upsert_worker_registry(&record)?;
+    Ok(record)
+}
+
+fn workdir_record_from_summary(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    summary: &WorkingDirectorySummary,
+    management_kind: &str,
+) -> WorkdirRegistryRecord {
+    let timestamp = now_registry_timestamp();
+    WorkdirRegistryRecord {
+        workspace_id: api.config.workspace_id.clone(),
+        workdir_id: summary.working_directory_id.clone(),
+        runtime_id: runtime_id.to_string(),
+        repository_id: summary.repository_id.clone(),
+        selector: summary.requested_selector.clone(),
+        resolved_commit: summary.resolved_commit.clone(),
+        materialization_status: match summary.status {
+            WorkingDirectoryStatusKind::Active => "present",
+            WorkingDirectoryStatusKind::Removed => "removed",
+            WorkingDirectoryStatusKind::CleanupPending => "pending",
+        }
+        .to_string(),
+        cleanliness: "clean".to_string(),
+        management_kind: management_kind.to_string(),
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
     }
-    Ok(list
-        .items
-        .into_iter()
-        .map(|status| status.summary)
-        .collect())
+}
+
+fn workdir_summary_from_record(record: &WorkdirRegistryRecord) -> WorkingDirectorySummary {
+    let status = match record.materialization_status.as_str() {
+        "present" => WorkingDirectoryStatusKind::Active,
+        "pending" => WorkingDirectoryStatusKind::CleanupPending,
+        _ => WorkingDirectoryStatusKind::Removed,
+    };
+    WorkingDirectorySummary {
+        working_directory_id: record.workdir_id.clone(),
+        repository_id: record.repository_id.clone(),
+        requested_selector: record.selector.clone(),
+        materializer_kind: MaterializerKind::LocalGitWorktree,
+        dirty_state_policy: DirtyStatePolicy::CleanPointOnly,
+        resolved_commit: record.resolved_commit.clone(),
+        resolved_tree: None,
+        cleanup_target: Some(worker_runtime::catalog::WorkingDirectoryCleanupTarget {
+            kind: "local_git_worktree".to_string(),
+            working_directory_id: record.workdir_id.clone(),
+            repository_id: record.repository_id.clone(),
+        }),
+        cleanup_policy: Some("manual_or_worker_stop".to_string()),
+        status,
+    }
+}
+
+fn link_worker_to_workdir(
+    api: &WorkspaceApi,
+    worker_record: &WorkerRegistryRecord,
+    workdir_id: &str,
+) -> ApiResult<()> {
+    let timestamp = now_registry_timestamp();
+    api.store
+        .upsert_worker_workdir_link(&WorkerWorkdirLinkRecord {
+            workspace_id: api.config.workspace_id.clone(),
+            worker_id: worker_record.worker_id.clone(),
+            workdir_id: workdir_id.to_string(),
+            role: "primary_cwd".to_string(),
+            linked_at: timestamp,
+            unlinked_at: None,
+        })?;
+    Ok(())
 }
 
 fn validate_working_directory_claim_for_browser(
@@ -3207,6 +3448,7 @@ fn working_directory_request_for_browser(
         },
         materializer: MaterializerKind::LocalGitWorktree,
         dirty_state_policy: DirtyStatePolicy::CleanPointOnly,
+        backend_workdir_id: None,
     })
 }
 
