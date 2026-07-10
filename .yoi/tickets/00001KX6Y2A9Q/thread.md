@@ -29,3 +29,12 @@ Hard dependencies は WorkerFilesystemAuthority を共通前提に限定する�
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-07-10T21:46:21Z -->
+
+## Decision
+
+Clarification: `process_cwd` is not part of this design. The Worker-level `cwd: PathBuf` property and `worker.cwd()` accessor should be removed rather than kept as a legacy authority surface. Working directory exists only under `WorkerFilesystemAuthority::Local`; no-workdir uses `WorkerFilesystemAuthority::None`. Tool registration must be derived from that authority, not manifest override or cwd fallback.
+
+
+---
