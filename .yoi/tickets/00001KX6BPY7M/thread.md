@@ -196,3 +196,26 @@ Validation run:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-10T17:31:13Z -->
+
+## Implementation report
+
+Follow-up fix for focused re-review blocker.
+
+Fix summary:
+- Workspace-scoped Browser Workdir summaries / launch options now use only Backend-managed registry rows.
+- Runtime-direct/unmanaged Workdirs remain synchronized into the Backend registry and visible through runtime-scoped projection with explicit `management_kind: runtime_unmanaged`.
+- Added tests proving unmanaged rows are excluded from managed Browser summaries while remaining typed/diagnosable in runtime projection, and store-level managed listing excludes unmanaged rows.
+
+Validation run:
+- git diff --check
+- cargo test -p yoi-workspace-server --lib
+- cargo test -p worker-runtime --features ws-server,fs-store
+- cargo check -p yoi
+- cd web/workspace && deno task check && deno task test
+- yoi ticket doctor
+- nix build .#yoi --no-link
+
+
+---

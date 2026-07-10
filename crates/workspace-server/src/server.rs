@@ -3301,7 +3301,7 @@ fn working_directory_summaries(api: &WorkspaceApi) -> ApiResult<Vec<WorkingDirec
     let _ = sync_all_runtime_workdir_observations(api);
     let records = api
         .store
-        .list_workdir_registry(&api.config.workspace_id, 200)?;
+        .list_managed_workdir_registry(&api.config.workspace_id, 200)?;
     Ok(records
         .iter()
         .map(workdir_summary_from_record)
@@ -4297,6 +4297,59 @@ mod tests {
         assert!(!serialized.contains("materialized_path"));
     }
 
+    #[tokio::test]
+    async fn workspace_managed_workdir_summaries_exclude_runtime_unmanaged_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let api = test_api(dir.path()).await;
+        api.store
+            .upsert_workdir_registry(&WorkdirRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                workdir_id: "managed".to_string(),
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                repository_id: "repo".to_string(),
+                selector: None,
+                resolved_commit: None,
+                materialization_status: "present".to_string(),
+                cleanliness: "clean".to_string(),
+                management_kind: "backend_managed".to_string(),
+                created_at: "1".to_string(),
+                updated_at: "1".to_string(),
+            })
+            .unwrap();
+        api.store
+            .upsert_workdir_registry(&WorkdirRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                workdir_id: "runtime-direct".to_string(),
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                repository_id: "repo".to_string(),
+                selector: None,
+                resolved_commit: None,
+                materialization_status: "present".to_string(),
+                cleanliness: "unknown".to_string(),
+                management_kind: "runtime_unmanaged".to_string(),
+                created_at: "1".to_string(),
+                updated_at: "2".to_string(),
+            })
+            .unwrap();
+
+        let managed = working_directory_summaries(&api)
+            .unwrap_or_else(|err| panic!("working_directory_summaries failed: {}", err.error));
+        assert_eq!(managed.len(), 1);
+        assert_eq!(managed[0].working_directory_id, "managed");
+        assert_eq!(
+            managed[0].management_kind.as_deref(),
+            Some("backend_managed")
+        );
+
+        let (runtime_projection, _) =
+            runtime_working_directory_summaries(&api, EMBEDDED_WORKER_RUNTIME_ID).unwrap_or_else(
+                |err| panic!("runtime_working_directory_summaries failed: {}", err.error),
+            );
+        assert!(runtime_projection.iter().any(|summary| {
+            summary.working_directory_id == "runtime-direct"
+                && summary.management_kind.as_deref() == Some("runtime_unmanaged")
+        }));
+    }
     #[test]
     fn unmanaged_runtime_workdir_projection_is_typed_and_diagnostic_safe() {
         let workdir = WorkdirRegistryRecord {

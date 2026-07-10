@@ -1272,6 +1272,20 @@ mod tests {
             updated_at: "3".to_string(),
         };
         store.upsert_workdir_registry(&workdir).unwrap();
+        let unmanaged_workdir = WorkdirRegistryRecord {
+            workspace_id: "local-dev".to_string(),
+            workdir_id: "runtime-direct".to_string(),
+            runtime_id: "embedded".to_string(),
+            repository_id: "repo".to_string(),
+            selector: Some("feature".to_string()),
+            resolved_commit: Some("123456".to_string()),
+            materialization_status: "present".to_string(),
+            cleanliness: "unknown".to_string(),
+            management_kind: "runtime_unmanaged".to_string(),
+            created_at: "3".to_string(),
+            updated_at: "4".to_string(),
+        };
+        store.upsert_workdir_registry(&unmanaged_workdir).unwrap();
 
         let link = WorkerWorkdirLinkRecord {
             workspace_id: "local-dev".to_string(),
@@ -1294,6 +1308,10 @@ mod tests {
                 .get_workdir_registry("local-dev", "backend-2-repo")
                 .unwrap(),
             Some(workdir.clone())
+        );
+        assert_eq!(
+            store.list_workdir_registry("local-dev", 10).unwrap(),
+            vec![unmanaged_workdir.clone(), workdir.clone()]
         );
         assert_eq!(
             store
