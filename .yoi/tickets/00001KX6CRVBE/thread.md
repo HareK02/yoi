@@ -243,3 +243,32 @@ Next action:
 - Request focused re-review on the dirty/unknown Workdir blocker and overall acceptance status before merge/close decisions。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-10T18:36:11Z status: approve -->
+
+## Review: approve
+
+Focused re-review result: approve
+
+Evidence:
+- Dirty/unknown blocker is fixed。
+- Runtime/materialized Workdirs now sync as `cleanliness: "unknown"` (`crates/workspace-server/src/server.rs:4208`; pending create also around `1400`)。
+- Cleanup planning downgrades any live-observed non-dirty row to unknown before action selection (`server.rs:1689-1701`)。
+- Unknown/dirty present Workdirs become `WorkdirDirtyDiscard` with explicit-confirmation reasons (`server.rs:1721-1725`)。
+- Direct Workdir DELETE rejects that path before calling Runtime cleanup (`server.rs:1491-1509`)。
+- Execution still checks expected revision + digest for staleness (`server.rs:1780-1788`), blocks pinned/running-linked Workdirs (`server.rs:1703-1707`, `1834-1839`), and requires `confirm_dirty_discard_target_ids` before forced Runtime cleanup for dirty/unknown targets (`server.rs:1842-1850`)。
+- Normal clean cleanup is only reachable for `clean` candidates (`server.rs:1698-1699`, `1860-1861`)。
+
+No observed regressions in reviewed acceptance points:
+- Pinned Worker deletion remains blocked (`server.rs:1811-1816`)。
+- Workdir record delete remains separate for removed/missing (`server.rs:1696-1697`, `1869-1879`)。
+- Plan responses expose ids/status/reasons/links/retention but not raw paths (`server.rs:620-633`)。
+- UI labels dirty/unknown discard distinctly from verified-clean cleanup with a separate confirm checkbox (`web/workspace/.../workdirs/+page.svelte`)。
+- `estimated_reclaim_bytes: None` is acceptable here because no safe size source is implemented/exposed; the optional field is present and avoids raw-path traversal/leakage。
+
+Validation performed by reviewer:
+- `cargo test -p yoi-workspace-server cleanup --lib` passed。
+- Targeted regression tests `observed_workdir_without_verified_clean_evidence_requires_discard_confirmation` and `stale_clean_registry_row_is_downgraded_by_real_observation_before_cleanup` passed。
+- `git diff --check HEAD^..HEAD` passed。
+
+---
