@@ -1,10 +1,12 @@
 ---
 title: 'Embedded no-workdir Worker authority policy'
-state: 'ready'
+state: 'queued'
 priority: 'P1'
 created_at: '2026-07-10T20:52:43Z'
-updated_at: '2026-07-10T21:59:20Z'
+updated_at: '2026-07-10T22:00:07Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-07-10T22:00:07Z'
 ---
 
 ## 背景
