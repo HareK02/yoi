@@ -1,9 +1,30 @@
 <script lang="ts">
+  import { workspaceApiPath } from '$lib/workspace-api/http';
   import { workerConsoleHref } from '$lib/workspace-console/model';
   import type { Worker } from '$lib/workspace-sidebar/types';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
+  let retentionStatus = $state<string | null>(null);
+
+  async function setPinned(worker: Worker, pinned: boolean): Promise<void> {
+    retentionStatus = null;
+    const response = await fetch(
+      workspaceApiPath(
+        data.workspaceId,
+        `/runtimes/${encodeURIComponent(worker.runtime_id)}/workers/${encodeURIComponent(worker.worker_id)}/pin`,
+      ),
+      { method: pinned ? 'PUT' : 'DELETE' },
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      retentionStatus = payload?.message ?? payload?.error ?? response.statusText;
+      return;
+    }
+    worker.pinned = Boolean(payload?.pinned);
+    worker.retention_state = payload?.retention_state ?? (worker.pinned ? 'pinned' : 'normal');
+    retentionStatus = `${worker.label} ${worker.pinned ? 'pinned' : 'unpinned'}.`;
+  }
 
   function workerStatus(worker: Worker): string {
     return `${worker.state} · ${worker.status}`;
@@ -31,7 +52,8 @@
   <header class="workers-page-header">
     <div>
       <h1 id="workers-heading">Workers</h1>
-      <p>Workers running or persisted for this workspace.</p>
+      <p>Workers running or persisted for this workspace. Pinning only updates Backend retention.</p>
+      {#if retentionStatus}<p>{retentionStatus}</p>{/if}
     </div>
     <a class="section-action" href={`/w/${data.workspaceId}/workers/new`}>New Worker</a>
   </header>
@@ -51,6 +73,7 @@
             <th>Runtime</th>
             <th>Profile</th>
             <th>Status</th>
+            <th>Retention</th>
             <th>Workdir</th>
             <th>Action</th>
           </tr>
@@ -65,9 +88,13 @@
               <td><code>{worker.runtime_id}</code></td>
               <td>{workerProfile(worker)}</td>
               <td>{workerStatus(worker)}</td>
+              <td><span class="pill {worker.pinned ? 'success' : 'muted'}">{worker.retention_state ?? 'normal'}</span></td>
               <td>{workerDirectory(worker)}</td>
               <td>
                 <a class="inline-link" href={workerConsoleHref(worker, data.workspaceId)}>Open Console</a>
+                <button type="button" onclick={() => setPinned(worker, !worker.pinned)}>
+                  {worker.pinned ? 'Unpin' : 'Pin'}
+                </button>
               </td>
             </tr>
           {/each}
