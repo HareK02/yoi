@@ -1,9 +1,9 @@
 ---
 title: 'Implement WorkerFilesystemAuthority for no-workdir Workers'
-state: 'inprogress'
+state: 'closed'
 priority: 'P1'
 created_at: '2026-07-10T21:13:49Z'
-updated_at: '2026-07-10T22:40:35Z'
+updated_at: '2026-07-10T22:45:01Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-07-10T21:51:00Z'
