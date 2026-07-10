@@ -1,0 +1,1 @@
+Added rich Workspace Console rendering: safe markdown HTML output, Shiki-highlighted fenced code blocks, TUI-inspired coloring for message/tool state, and structured Edit diff rows. Read aggregation continues to avoid displaying file content. Validation passed with frontend check/test, diff check, and Nix build.

@@ -1,8 +1,8 @@
 ---
 title: 'Add rich markdown tool rendering to workspace console'
-state: 'done'
+state: 'closed'
 created_at: '2026-07-10T22:31:21Z'
-updated_at: '2026-07-10T22:45:55Z'
+updated_at: '2026-07-10T22:46:12Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-10T22:31:41Z'
