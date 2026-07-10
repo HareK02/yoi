@@ -51,7 +51,7 @@
             <th>Runtime</th>
             <th>Profile</th>
             <th>Status</th>
-            <th>Working directory</th>
+            <th>Workdir</th>
             <th>Action</th>
           </tr>
         </thead>

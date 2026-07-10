@@ -99,11 +99,11 @@
 
   async function createWorkingDirectory() {
     if (!runtimeId) {
-      submitError = { message: 'select a runtime before creating a working directory', diagnostics: [] };
+      submitError = { message: 'select a runtime before creating a workdir', diagnostics: [] };
       return;
     }
     if (!workingDirectoryRepositoryId) {
-      submitError = { message: 'select a repository before creating a working directory', diagnostics: [] };
+      submitError = { message: 'select a repository before creating a workdir', diagnostics: [] };
       return;
     }
     creatingWorkingDirectory = true;
@@ -122,7 +122,7 @@
         },
       );
       if (!response.ok) {
-        submitError = await responseDisplayError(response, 'working directory create failed');
+        submitError = await responseDisplayError(response, 'workdir create failed');
         return;
       }
       const payload = (await response.json()) as BrowserWorkingDirectoryCreateResponse;
@@ -138,7 +138,7 @@
         : options;
       workingDirectoryId = payload.item.working_directory_id;
     } catch (err) {
-      submitError = exceptionDisplayError(err, 'working directory create failed');
+      submitError = exceptionDisplayError(err, 'workdir create failed');
     } finally {
       creatingWorkingDirectory = false;
     }
@@ -150,7 +150,7 @@
       return;
     }
     if (isNewWorkingDirectorySelected || !workingDirectoryId) {
-      submitError = { message: 'select or create a working directory before starting a Worker', diagnostics: [] };
+      submitError = { message: 'select or create a workdir before starting a Worker', diagnostics: [] };
       return;
     }
 
@@ -220,7 +220,7 @@
   <header class="worker-new-page-header">
     <div>
       <h1 id="new-worker-heading">New Worker</h1>
-      <p>Create a Worker on a selected Runtime and working directory.</p>
+      <p>Create a Worker on a selected Runtime and workdir.</p>
     </div>
     <a class="secondary-link" href={`/w/${workspaceId}`}>Back to workspace</a>
   </header>
@@ -236,14 +236,14 @@
 
         <div class="worker-launch-sentence">
           <span>Run at</span>
-          <select class="worker-inline-select wd-select" bind:value={workingDirectoryId} aria-label="Working directory">
-            <option value="">Select working directory</option>
+          <select class="worker-inline-select wd-select" bind:value={workingDirectoryId} aria-label="Workdir">
+            <option value="">Select workdir</option>
             {#each options?.working_directories ?? [] as directory}
               <option value={directory.working_directory_id} disabled={directory.status !== 'active'}>
                 {directory.repository_id} · {directory.requested_selector ?? 'HEAD'}
               </option>
             {/each}
-            <option value={NEW_WORKING_DIRECTORY_VALUE}>New working directory…</option>
+            <option value={NEW_WORKING_DIRECTORY_VALUE}>New workdir…</option>
           </select>
           <span>in</span>
           <select class="worker-inline-select runtime-select" bind:value={runtimeId} required aria-label="Runtime">
@@ -261,7 +261,7 @@
 
         {#if isNewWorkingDirectorySelected}
           <div class="new-working-directory-panel">
-            <h3>New working directory</h3>
+            <h3>New workdir</h3>
             <div class="new-working-directory-fields">
               <label>
                 <span>Repository</span>
@@ -281,14 +281,14 @@
               </label>
             </div>
             <button type="button" disabled={creatingWorkingDirectory || !runtimeId || !workingDirectoryRepositoryId} onclick={() => void createWorkingDirectory()}>
-              {creatingWorkingDirectory ? 'Creating…' : 'Create working directory'}
+              {creatingWorkingDirectory ? 'Creating…' : 'Create workdir'}
             </button>
           </div>
         {/if}
 
         <label class="relative-cwd-field">
-          <span>Relative cwd inside WD</span>
-          <input bind:value={relativeCwd} autocomplete="off" placeholder="Optional path inside working directory" />
+          <span>Relative cwd inside workdir</span>
+          <input bind:value={relativeCwd} autocomplete="off" placeholder="Optional path inside workdir" />
         </label>
       </section>
 

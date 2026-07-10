@@ -24,6 +24,11 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
   );
 
   assert(
+    workspacePage.includes('href={`/w/${workspaceId}/runtimes`}') &&
+      workspacePage.includes('href={`/w/${workspaceId}/workers`}'),
+    "top workspace page should link to Runtimes and Workers pages",
+  );
+  assert(
     !workspacePage.includes("workerConsoleHref") &&
       !workspacePage.includes("Open Console"),
     "top workspace page should not own the Worker list",
@@ -44,6 +49,43 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
     !sidebar.includes("CompanionNavSection") &&
       sidebar.includes("WorkersNavSection"),
     "standalone Companion/Console navigation should not remain canonical",
+  );
+});
+
+Deno.test("workspace Runtime management pages expose Runtimes and Runtime-owned workdirs", async () => {
+  const sidebar = await Deno.readTextFile(
+    new URL("../workspace-sidebar/WorkspaceSidebar.svelte", import.meta.url),
+  );
+  const runtimesNav = await Deno.readTextFile(
+    new URL("../workspace-sidebar/RuntimesNavSection.svelte", import.meta.url),
+  );
+  const runtimesPage = await Deno.readTextFile(
+    new URL("./../../routes/w/[workspaceId]/runtimes/+page.svelte", import.meta.url),
+  );
+  const workdirsPage = await Deno.readTextFile(
+    new URL("./../../routes/w/[workspaceId]/runtimes/[runtimeId]/workdirs/+page.svelte", import.meta.url),
+  );
+  const workdirsLoad = await Deno.readTextFile(
+    new URL("./../../routes/w/[workspaceId]/runtimes/[runtimeId]/workdirs/+page.ts", import.meta.url),
+  );
+
+  assert(
+    sidebar.includes("RuntimesNavSection") &&
+      runtimesNav.includes('href={runtimesHref}') &&
+      runtimesNav.includes("/runtimes"),
+    "sidebar should expose Runtime management navigation",
+  );
+  assert(
+    runtimesPage.includes("Open workdirs") &&
+      runtimesPage.includes("runtimes-table") &&
+      runtimesPage.includes("/workdirs"),
+    "Runtimes page should table Runtimes and link to each Runtime's workdirs",
+  );
+  assert(
+    workdirsPage.includes("Workdirs") &&
+      workdirsPage.includes("workdirs-table") &&
+      workdirsLoad.includes("/working-directories"),
+    "Workdirs page should read Runtime-owned working-directory API while using workdir UI language",
   );
 });
 

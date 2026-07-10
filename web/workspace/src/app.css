@@ -463,6 +463,47 @@
         padding: 0;
     }
 
+    .workspace-actions {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: var(--space-3);
+    }
+
+    .workspace-action-card {
+        display: grid;
+        gap: var(--space-1);
+        padding: var(--space-4);
+        border: 1px solid var(--line);
+        border-radius: var(--radius-card);
+        background: var(--bg-raised);
+        color: inherit;
+        text-decoration: none;
+    }
+
+    .workspace-action-card:hover,
+    .workspace-action-card:focus-visible {
+        border-color: var(--accent);
+    }
+
+    .workspace-action-card span,
+    .workspace-action-card small {
+        color: var(--text-muted);
+    }
+
+    .workspace-action-card span {
+        font-size: 0.78rem;
+    }
+
+    .workspace-action-card strong {
+        color: var(--text-strong);
+    }
+
+    @media (max-width: 720px) {
+        .workspace-actions {
+            grid-template-columns: 1fr;
+        }
+    }
+
     .runtime-card {
         padding: 0;
     }
@@ -646,11 +687,7 @@
         text-transform: uppercase;
     }
 
-    .workers-page {
-        display: grid;
-        gap: var(--space-4);
-    }
-
+    .page-header-row,
     .workers-page-header {
         display: flex;
         justify-content: space-between;
@@ -658,20 +695,41 @@
         gap: var(--space-4);
     }
 
+    .page-header-row h1,
+    .page-header-row p,
     .workers-page-header h1,
     .workers-page-header p {
         margin: 0;
     }
 
+    .page-header-row h1,
     .workers-page-header h1 {
         color: var(--text-strong);
         font-size: clamp(1.6rem, 4vw, 2.4rem);
         line-height: 1.05;
     }
 
+    .page-header-row p:not(.breadcrumb),
     .workers-page-header p {
         margin-top: var(--space-2);
         color: var(--text-muted);
+    }
+
+    .breadcrumb {
+        margin-bottom: var(--space-2);
+        color: var(--text-muted);
+        font-size: 0.85rem;
+    }
+
+    .breadcrumb a {
+        color: inherit;
+    }
+
+    .runtimes-page,
+    .workdirs-page,
+    .workers-page {
+        display: grid;
+        gap: var(--space-4);
     }
 
     .workers-table-wrap {
