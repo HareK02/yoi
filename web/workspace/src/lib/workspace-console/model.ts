@@ -1,6 +1,7 @@
 import type {
   Event as ProtocolEvent,
   InFlightBlock,
+  InFlightToolCallState,
   Segment,
 } from "$lib/generated/protocol";
 import { workspaceRoute } from "$lib/workspace-api/http";
@@ -16,6 +17,24 @@ export type ConsoleLineKind =
   | "in_flight"
   | "system";
 
+type ToolCallState =
+  | "pending"
+  | "streaming_args"
+  | "running"
+  | "done"
+  | "error";
+
+type ToolCallView = {
+  id: string;
+  name: string;
+  argsStream: string;
+  arguments?: string;
+  state: ToolCallState;
+  summary?: string;
+  output?: string | null;
+  isError?: boolean;
+};
+
 export type ConsoleLine = {
   id: string;
   kind: ConsoleLineKind;
@@ -26,6 +45,7 @@ export type ConsoleLine = {
   source: "event";
   streaming?: boolean;
   error?: boolean;
+  toolCall?: ToolCallView;
 };
 
 export type ConsoleProjection = {
@@ -40,7 +60,10 @@ export type WorkerTarget = {
   worker_id: string;
 };
 
-export function workerConsoleHref(target: WorkerTarget, workspaceId: string): string {
+export function workerConsoleHref(
+  target: WorkerTarget,
+  workspaceId: string,
+): string {
   return workspaceRoute(
     workspaceId,
     `/runtimes/${encodeURIComponent(target.runtime_id)}/workers/${
@@ -56,12 +79,17 @@ export function workerConsolePath(
   runtimeId: string,
   workerId: string,
 ): string {
-  return workerConsoleHref({ runtime_id: runtimeId, worker_id: workerId }, workspaceId);
+  return workerConsoleHref(
+    { runtime_id: runtimeId, worker_id: workerId },
+    workspaceId,
+  );
 }
 
 export type ConsoleEventInput = { cursor: string; event: ProtocolEvent };
 
-export function projectConsole(events: ConsoleEventInput[] = []): ConsoleProjection {
+export function projectConsole(
+  events: ConsoleEventInput[] = [],
+): ConsoleProjection {
   return events.reduce(applyProtocolEvent, {
     lines: [],
     status: null,
@@ -138,43 +166,28 @@ export function applyProtocolEvent(
       );
       break;
     case "tool_call_start":
-      next.lines.push(
-        line(
-          envelope.cursor,
-          "tool",
-          `tool call · ${event.data.name}`,
-          `id: ${event.data.id}`,
-          undefined,
-          true,
-        ),
-      );
+      upsertToolCall(next, envelope.cursor, event.data.id, {
+        name: event.data.name,
+        state: "pending",
+      });
       break;
     case "tool_call_args_delta":
       appendToolArgs(next, envelope.cursor, event.data.id, event.data.json);
       break;
     case "tool_call_done":
-      next.lines.push(
-        line(
-          envelope.cursor,
-          "tool",
-          `tool call done · ${event.data.name}`,
-          event.data.arguments,
-          `id: ${event.data.id}`,
-        ),
-      );
+      upsertToolCall(next, envelope.cursor, event.data.id, {
+        name: event.data.name,
+        arguments: event.data.arguments,
+        argsStream: event.data.arguments,
+        state: "running",
+      });
       break;
     case "tool_result":
-      next.lines.push(
-        line(
-          envelope.cursor,
-          "tool",
-          event.data.is_error ? "tool result error" : "tool result",
-          event.data.output ?? event.data.summary,
-          `id: ${event.data.id} · ${event.data.summary}`,
-          false,
-          event.data.is_error,
-        ),
-      );
+      attachToolResult(next, envelope.cursor, event.data.id, {
+        summary: event.data.summary,
+        output: event.data.output,
+        isError: event.data.is_error,
+      });
       break;
     case "usage":
       next.usage = usageText(event.data);
@@ -326,32 +339,263 @@ function finalizeStreaming(
   projection.lines.push(line(cursor, kind, title, body));
 }
 
+function upsertToolCall(
+  projection: ConsoleProjection,
+  cursor: string,
+  id: string,
+  update: Partial<Omit<ToolCallView, "id">>,
+): ConsoleLine {
+  let existing = findToolCallLine(projection, id);
+  if (!existing) {
+    existing = toolLine(cursor, {
+      id,
+      name: update.name ?? "Tool",
+      argsStream: update.argsStream ?? "",
+      arguments: update.arguments,
+      state: update.state ?? "pending",
+      summary: update.summary,
+      output: update.output,
+      isError: update.isError,
+    });
+    projection.lines.push(existing);
+  } else {
+    existing.cursor = cursor;
+    existing.toolCall = {
+      ...existing.toolCall!,
+      ...update,
+      id,
+      name: update.name ?? existing.toolCall!.name,
+    };
+  }
+  refreshToolLine(existing);
+  return existing;
+}
+
 function appendToolArgs(
   projection: ConsoleProjection,
   cursor: string,
   id: string,
   delta: string,
 ): void {
-  const existing = [...projection.lines]
-    .reverse()
-    .find((item) =>
-      item.kind === "tool" && item.streaming && item.body.includes(`id: ${id}`)
-    );
-  if (existing) {
-    existing.body += delta;
-    existing.cursor = cursor;
+  const existing = upsertToolCall(projection, cursor, id, {
+    state: "streaming_args",
+  });
+  existing.toolCall!.argsStream += delta;
+  refreshToolLine(existing);
+}
+
+function attachToolResult(
+  projection: ConsoleProjection,
+  cursor: string,
+  id: string,
+  result: Pick<ToolCallView, "summary" | "output" | "isError">,
+): void {
+  const existing = findToolCallLine(projection, id);
+  if (!existing) {
+    const fallback = toolLine(cursor, {
+      id,
+      name: "Tool",
+      argsStream: "",
+      state: result.isError ? "error" : "done",
+      ...result,
+    });
+    fallback.title = result.isError
+      ? "Call · Tool result error"
+      : "Call · Tool result";
+    refreshToolLine(fallback);
+    projection.lines.push(fallback);
     return;
   }
-  projection.lines.push(
-    line(
-      cursor,
-      "tool",
-      "tool call args",
-      `id: ${id}\n${delta}`,
-      undefined,
-      true,
-    ),
+  existing.cursor = cursor;
+  existing.toolCall = {
+    ...existing.toolCall!,
+    ...result,
+    state: result.isError ? "error" : "done",
+  };
+  refreshToolLine(existing);
+}
+
+function findToolCallLine(
+  projection: ConsoleProjection,
+  id: string,
+): ConsoleLine | undefined {
+  return [...projection.lines].reverse().find((item) =>
+    item.toolCall?.id === id
   );
+}
+
+function toolLine(cursor: string, toolCall: ToolCallView): ConsoleLine {
+  const item: ConsoleLine = {
+    id: `tool-call-${toolCall.id}`,
+    kind: "tool",
+    title: `Call · ${toolCall.name}`,
+    body: "",
+    detail: undefined,
+    cursor,
+    source: "event",
+    streaming: true,
+    error: false,
+    toolCall,
+  };
+  refreshToolLine(item);
+  return item;
+}
+
+function refreshToolLine(item: ConsoleLine): void {
+  const toolCall = item.toolCall;
+  if (!toolCall) {
+    return;
+  }
+  item.title = item.title.startsWith("Call · Tool result")
+    ? item.title
+    : `Call · ${toolCall.name}`;
+  item.body = renderToolCall(toolCall);
+  item.detail = toolCallDetail(toolCall);
+  item.streaming = !["done", "error"].includes(toolCall.state);
+  item.error = toolCall.state === "error";
+}
+
+function renderToolCall(toolCall: ToolCallView): string {
+  switch (toolCall.name) {
+    case "Read":
+      return renderReadTool(toolCall);
+    case "Write":
+      return renderWriteTool(toolCall);
+    case "Edit":
+      return renderEditTool(toolCall);
+    case "Glob":
+    case "Grep":
+      return renderSearchTool(toolCall);
+    case "Bash":
+      return renderBashTool(toolCall);
+    default:
+      return renderDefaultTool(toolCall);
+  }
+}
+
+function renderReadTool(toolCall: ToolCallView): string {
+  const args = parsedArgs(toolCall);
+  const path = stringField(args, "file_path") ?? "?";
+  return compactLines([
+    `Read — ${path} (${stateSuffix(toolCall.state)})`,
+    resultText(toolCall),
+  ]);
+}
+
+function renderWriteTool(toolCall: ToolCallView): string {
+  const args = parsedArgs(toolCall);
+  const path = stringField(args, "file_path") ?? "?";
+  const content = stringField(args, "content");
+  return compactLines([
+    `Write — ${path} (${stateSuffix(toolCall.state)})`,
+    cappedSection(content, 5),
+    resultText(toolCall),
+  ]);
+}
+
+function renderEditTool(toolCall: ToolCallView): string {
+  const args = parsedArgs(toolCall);
+  const path = stringField(args, "file_path") ?? "?";
+  const oldString = stringField(args, "old_string");
+  const newString = stringField(args, "new_string");
+  const change = oldString || newString
+    ? compactLines([
+      oldString ? `- ${firstLine(oldString)}` : undefined,
+      newString ? `+ ${firstLine(newString)}` : undefined,
+    ])
+    : undefined;
+  return compactLines([
+    `Edit — ${path} (${stateSuffix(toolCall.state)})`,
+    change,
+    resultText(toolCall),
+  ]);
+}
+
+function renderSearchTool(toolCall: ToolCallView): string {
+  const summary = toolCall.summary?.trim();
+  return compactLines([
+    `${toolCall.name} — ${
+      summary ? firstLine(summary) : stateSuffix(toolCall.state)
+    }`,
+    resultText(toolCall),
+  ]);
+}
+
+function renderBashTool(toolCall: ToolCallView): string {
+  const args = parsedArgs(toolCall);
+  const command = stringField(args, "command");
+  return compactLines([
+    `Bash — ${stateSuffix(toolCall.state)}`,
+    command ? `$ ${command}` : argsText(toolCall),
+    resultText(toolCall),
+  ]);
+}
+
+function renderDefaultTool(toolCall: ToolCallView): string {
+  return compactLines([
+    `${toolCall.name} — ${stateSuffix(toolCall.state)}`,
+    argsText(toolCall),
+    resultText(toolCall),
+  ]);
+}
+
+function toolCallDetail(toolCall: ToolCallView): string {
+  return compactLines([
+    `id: ${toolCall.id}`,
+    `state: ${stateSuffix(toolCall.state)}`,
+    toolCall.summary ? `summary: ${toolCall.summary}` : undefined,
+    argsText(toolCall) ? `arguments:\n${argsText(toolCall)}` : undefined,
+  ]);
+}
+
+function resultText(toolCall: ToolCallView): string | undefined {
+  if (toolCall.output) {
+    return toolCall.output;
+  }
+  return toolCall.summary;
+}
+
+function argsText(toolCall: ToolCallView): string {
+  const raw = toolCall.arguments ?? toolCall.argsStream;
+  if (!raw.trim()) {
+    return "";
+  }
+  const parsed = parseJson(raw);
+  return parsed === undefined ? raw : jsonPreview(parsed);
+}
+
+function parsedArgs(
+  toolCall: ToolCallView,
+): Record<string, unknown> | undefined {
+  const parsed = parseJson(toolCall.arguments ?? toolCall.argsStream);
+  return isRecord(parsed) ? parsed : undefined;
+}
+
+function stringField(
+  value: Record<string, unknown> | undefined,
+  key: string,
+): string | undefined {
+  const field = value?.[key];
+  return typeof field === "string" ? field : undefined;
+}
+
+function compactLines(lines: Array<string | undefined | null | false>): string {
+  return lines.filter((line): line is string => Boolean(line)).join("\n");
+}
+
+function cappedSection(
+  value: string | undefined,
+  cap: number,
+): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const lines = value.split(/\r?\n/);
+  const shown = lines.slice(0, cap);
+  if (lines.length > cap) {
+    shown.push(`… +${lines.length - cap} more lines`);
+  }
+  return shown.join("\n");
 }
 
 function usageText(
@@ -387,15 +631,47 @@ function inFlightLine(cursor: string, block: InFlightBlock): ConsoleLine {
         !block.finished,
       );
     case "tool_call":
-      return line(
-        cursor,
-        "in_flight",
-        `in-flight tool · ${block.name}`,
-        block.args,
-        `${block.id} · ${block.state ?? "pending"}`,
-        block.state !== "done",
-      );
+      return toolLine(cursor, {
+        id: block.id,
+        name: block.name,
+        argsStream: block.args,
+        arguments: block.state === "done" ? block.args : undefined,
+        state: inFlightToolState(block.state),
+      });
   }
+}
+
+function inFlightToolState(
+  state: InFlightToolCallState | undefined,
+): ToolCallState {
+  switch (state) {
+    case "streaming_args":
+      return "streaming_args";
+    case "done":
+      return "running";
+    case "pending":
+    default:
+      return "pending";
+  }
+}
+
+function stateSuffix(state: ToolCallState): string {
+  switch (state) {
+    case "pending":
+      return "pending";
+    case "streaming_args":
+      return "streaming args";
+    case "running":
+      return "running";
+    case "done":
+      return "done";
+    case "error":
+      return "error";
+  }
+}
+
+function firstLine(value: string): string {
+  return value.split(/\r?\n/, 1)[0] ?? "";
 }
 
 function slugify(value: string): string {
@@ -405,10 +681,22 @@ function slugify(value: string): string {
   ) || "event";
 }
 
+function parseJson(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+}
+
 function jsonPreview(value: unknown): string {
   try {
     return JSON.stringify(value, null, 2) ?? "null";
   } catch {
     return String(value);
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

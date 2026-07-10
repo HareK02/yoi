@@ -105,11 +105,15 @@ Deno.test("projectConsole projects visible protocol rows", () => {
   ]);
 
   assert(
-    projection.lines.some((line) => line.source === "event" && line.kind === "user"),
+    projection.lines.some((line) =>
+      line.source === "event" && line.kind === "user"
+    ),
     "user protocol row expected",
   );
   assert(
-    projection.lines.some((line) => line.source === "event" && line.kind === "assistant"),
+    projection.lines.some((line) =>
+      line.source === "event" && line.kind === "assistant"
+    ),
     "assistant protocol row expected",
   );
   assert(
@@ -131,6 +135,100 @@ Deno.test("projectConsole projects visible protocol rows", () => {
   assert(
     projection.usage === "input 12 · output 5 · cache unknown",
     "usage summary should be retained",
+  );
+});
+
+Deno.test("projectConsole groups tool call lifecycle into one Call block", () => {
+  const projection = projectConsole([
+    {
+      cursor: "40",
+      event: {
+        event: "tool_call_start",
+        data: { id: "call-1", name: "Bash" },
+      } satisfies Event,
+    },
+    {
+      cursor: "41",
+      event: {
+        event: "tool_call_args_delta",
+        data: { id: "call-1", json: '{"command":"pw' },
+      } satisfies Event,
+    },
+    {
+      cursor: "42",
+      event: {
+        event: "tool_call_args_delta",
+        data: { id: "call-1", json: 'd"}' },
+      } satisfies Event,
+    },
+    {
+      cursor: "43",
+      event: {
+        event: "tool_call_done",
+        data: { id: "call-1", name: "Bash", arguments: '{"command":"pwd"}' },
+      } satisfies Event,
+    },
+    {
+      cursor: "44",
+      event: {
+        event: "tool_result",
+        data: {
+          id: "call-1",
+          summary: "command completed",
+          output: "/repo\n",
+          is_error: false,
+        },
+      } satisfies Event,
+    },
+  ]);
+
+  const toolLines = projection.lines.filter((line) => line.kind === "tool");
+  assertEquals(toolLines.length, 1);
+  assertEquals(toolLines[0].title, "Call · Bash");
+  assert(
+    !toolLines[0].streaming,
+    "completed tool call should not remain streaming",
+  );
+  assert(
+    toolLines[0].body.includes("$ pwd"),
+    "Bash command should be summarized",
+  );
+  assert(
+    toolLines[0].body.includes("/repo"),
+    "tool result should be folded into the Call block",
+  );
+  assert(
+    toolLines[0].detail?.includes("id: call-1"),
+    "call id should remain in detail",
+  );
+});
+
+Deno.test("projectConsole keeps streaming tool call updates in the same Call block", () => {
+  const projection = projectConsole([
+    {
+      cursor: "45",
+      event: {
+        event: "tool_call_start",
+        data: { id: "call-2", name: "Read" },
+      } satisfies Event,
+    },
+    {
+      cursor: "46",
+      event: {
+        event: "tool_call_args_delta",
+        data: { id: "call-2", json: '{"file_path":"/tmp/a.md"}' },
+      } satisfies Event,
+    },
+  ]);
+
+  const toolLines = projection.lines.filter((line) => line.kind === "tool");
+  assertEquals(toolLines.length, 1);
+  assertEquals(toolLines[0].title, "Call · Read");
+  assert(toolLines[0].streaming, "streaming tool call should remain streaming");
+  assert(
+    toolLines[0].body.includes("/tmp/a.md") &&
+      toolLines[0].body.includes("streaming args"),
+    "Read call should render the current argument stream and state",
   );
 });
 
@@ -163,7 +261,10 @@ Deno.test("projectConsole keeps protocol lifecycle events out of the console sur
     },
     {
       cursor: "32",
-      event: { event: "turn_end", data: { turn: 0, result: "finished" } } satisfies Event,
+      event: {
+        event: "turn_end",
+        data: { turn: 0, result: "finished" },
+      } satisfies Event,
     },
     {
       cursor: "33",
@@ -213,7 +314,9 @@ Deno.test("projectConsole uses snapshot for state without rendering it as consol
 
   assertEquals(projection.status, "running");
   assertEquals(
-    projection.lines.map((line) => `${line.kind}:${line.body}:${line.streaming}`),
+    projection.lines.map((line) =>
+      `${line.kind}:${line.body}:${line.streaming}`
+    ),
     ["in_flight:partial:true"],
   );
 });
