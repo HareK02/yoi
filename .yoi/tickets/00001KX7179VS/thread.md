@@ -70,3 +70,21 @@ State changed to `done`.
 
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-07-10T22:17:10Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-07-10T22:17:10Z status: closed -->
+
+## 完了
+
+Implemented frontend Workspace Console tool call grouping. Tool call start/arg/done/result events now project into a single `Call · <tool>` block keyed by call id, with streaming state updates and folded result output. Added generic and TUI-aligned specialized summaries for core tools, including Bash command/output rendering. Validated with frontend check/test, diff check, and Nix package build.
+
+
+---
