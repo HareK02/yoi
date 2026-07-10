@@ -204,3 +204,42 @@ Non-blocking note:
 - `estimated_reclaim_bytes` is present but always `None`; confirm whether “when safe” requires actual byte estimation before approval。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-10T18:30:52Z -->
+
+## Implementation report
+
+Follow-up implementation progress report after request_changes:
+
+- Coder Pod `yoi-coder-00001KX6CRVBE-manual-cleanup` completed the dirty/unknown Workdir safety fix and committed `361569a69efcba929b59b9c48113add5499d5068 fix: require discard confirmation for unknown workdirs`。
+- Orchestrator inspected the implementation worktree status, branch log, commit stats, and `git diff --check 5f762a6c..HEAD`; worktree was clean and diff check passed。
+
+Coder-reported fix summary:
+- Runtime-observed/materialized Workdirs are no longer marked `clean` without trusted clean evidence。
+- Observed Workdirs now sync as `cleanliness: "unknown"`。
+- Cleanup plan downgrades stale `clean` registry rows to `unknown` when real Runtime observation exists。
+- Present Workdirs with `cleanliness: "unknown"` or `dirty` are classified as discard-confirmation targets, not normal clean cleanup。
+- Direct Workdir cleanup rejects unknown/dirty Workdirs and requires the cleanup execution API with explicit discard confirmation。
+- Browser UI labels distinguish verified-clean cleanup from dirty/unknown-state discard。
+- `estimated_reclaim_bytes` remains intentionally `None` unless a safe estimate is available。
+
+Regression tests added/updated:
+- Real observed Workdir without verified clean evidence is classified as `unknown` and `WorkdirDirtyDiscard`。
+- Normal/direct cleanup is rejected for unknown Workdir state。
+- Dirty/unknown discard requires explicit confirmation。
+- Stale `clean` registry state is downgraded when Runtime observation exists。
+- Existing path-safe cleanup test uses explicit cleanup execution confirmation。
+
+Coder-reported validation passed:
+- `git diff --check`
+- `cargo test -p yoi-workspace-server --lib`
+- `cargo test -p worker-runtime --features ws-server,fs-store`
+- `cargo check -p yoi`
+- `cd web/workspace && deno task check && deno task test`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Next action:
+- Request focused re-review on the dirty/unknown Workdir blocker and overall acceptance status before merge/close decisions。
+
+---
