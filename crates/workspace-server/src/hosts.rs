@@ -261,6 +261,11 @@ impl<T> RuntimeList<T> {
     }
 }
 
+fn is_retired_companion_worker(worker: &WorkerSummary) -> bool {
+    worker.role.as_deref() == Some("builtin:companion")
+        || worker.profile.as_deref() == Some("builtin:companion")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerLookupResult {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -874,7 +879,12 @@ impl RuntimeRegistry {
             }
             let mut list = runtime.list_workers(limit.saturating_sub(items.len()));
             diagnostics.append(&mut list.diagnostics);
-            items.append(&mut list.items);
+            items.extend(
+                list.items
+                    .into_iter()
+                    .filter(|worker| !is_retired_companion_worker(worker))
+                    .take(limit.saturating_sub(items.len())),
+            );
         }
         diagnostics.truncate(MAX_DIAGNOSTICS);
         RuntimeList::new(items, diagnostics)
@@ -904,6 +914,7 @@ impl RuntimeRegistry {
                     .items
                     .into_iter()
                     .filter(|worker| worker.host_id == host_id)
+                    .filter(|worker| !is_retired_companion_worker(worker))
                     .take(limit.saturating_sub(items.len())),
             );
             if items.len() >= limit {
@@ -927,9 +938,16 @@ impl RuntimeRegistry {
         validate_backend_identifier("worker_id", worker_id)?;
         let runtime = self.runtime(runtime_id)?;
         let lookup = runtime.worker(worker_id);
-        lookup.worker.ok_or_else(|| {
+        let worker = lookup.worker.ok_or_else(|| {
             operation_failed_or_unknown_worker(runtime_id, worker_id, lookup.diagnostics)
-        })
+        })?;
+        if is_retired_companion_worker(&worker) {
+            return Err(RuntimeRegistryError::UnknownWorker {
+                runtime_id: runtime_id.to_string(),
+                worker_id: worker_id.to_string(),
+            });
+        }
+        Ok(worker)
     }
 
     pub fn spawn_worker(

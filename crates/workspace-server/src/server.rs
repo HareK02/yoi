@@ -249,7 +249,7 @@ impl WorkspaceApi {
             );
         }
         let runtime = Arc::new(runtime);
-        let companion = Arc::new(CompanionConsole::new(runtime.clone()));
+        let companion = Arc::new(CompanionConsole::disabled());
         let observation_proxy = BackendObservationProxy::new(config.runtime_event_sources.clone());
         Ok(Self {
             records: LocalProjectRecordReader::new(config.workspace_root.clone()),
@@ -1590,6 +1590,7 @@ fn companion_console_extension_point(status: &CompanionStatusResponse) -> Extens
                 )
             }
         }
+        "disabled" => "Workspace Companion auto-start has been removed; create an explicit Worker instead.".to_string(),
         other => format!(
             "Workspace Companion transport reports {other}; browser input follows the Companion Worker runtime capability state."
         ),
@@ -5064,24 +5065,18 @@ mod tests {
 
         let workers = get_json(app.clone(), "/api/workers").await;
         let worker_items = workers["items"].as_array().unwrap();
-        let companion_worker = worker_items
-            .iter()
-            .find(|worker| worker["role"] == "builtin:companion")
-            .expect("companion worker is visible through runtime worker API");
-        assert_eq!(companion_worker["runtime_id"], "embedded-worker-runtime");
-        assert!(companion_worker["capabilities"]["can_stop"].is_boolean());
+        assert!(
+            worker_items
+                .iter()
+                .all(|worker| worker["role"] != "builtin:companion"),
+            "companion auto-start should not create runtime workers: {workers}"
+        );
 
         let companion_status = get_json(app.clone(), "/api/companion/status").await;
-        assert!(matches!(
-            companion_status["state"].as_str(),
-            Some("ready") | Some("error")
-        ));
-        assert_eq!(companion_status["worker"]["role"], "builtin:companion");
-        assert_eq!(
-            companion_status["transport"]["kind"],
-            "embedded_worker_runtime"
-        );
-        assert_ne!(companion_status["transport"]["completion"], "not_connected");
+        assert_eq!(companion_status["state"], "disabled");
+        assert!(companion_status["worker"].is_null());
+        assert_eq!(companion_status["transport"]["kind"], "none");
+        assert_eq!(companion_status["transport"]["completion"], "disabled");
         assert!(!companion_status.to_string().contains("/workspace/demo"));
 
         let companion_message = post_json(
@@ -5090,20 +5085,17 @@ mod tests {
             json!({ "content": "hello companion" }),
         )
         .await;
-        assert_eq!(companion_message["state"], "accepted");
-        assert_eq!(companion_message["user_item"]["role"], "user");
-        assert_eq!(companion_message["user_item"]["content"], "hello companion");
-        assert!(
-            !companion_message
-                .to_string()
-                .contains("companion_llm_not_connected"),
-            "legacy non-execution diagnostic leaked: {companion_message}"
+        assert_eq!(companion_message["state"], "rejected");
+        assert_eq!(
+            companion_message["diagnostics"][0]["code"],
+            "companion_disabled"
         );
-        assert!(!companion_message.to_string().contains("providerless"));
+        assert!(companion_message["user_item"].is_null());
+        assert!(companion_message["assistant_item"].is_null());
         assert!(!companion_message.to_string().contains("/workspace/demo"));
 
         let companion_transcript = get_json(app.clone(), "/api/companion/transcript").await;
-        assert!(companion_transcript["total_items"].as_u64().unwrap() >= 1);
+        assert_eq!(companion_transcript["total_items"], 0);
 
         let host_workers = get_json(app.clone(), &format!("/api/hosts/{host_id}/workers")).await;
         assert!(
@@ -5111,7 +5103,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|worker| worker["role"] == "builtin:companion")
+                .all(|worker| worker["role"] != "builtin:companion")
         );
 
         let runs_response = app
@@ -5193,7 +5185,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_companion_messages_route_dispatches_through_worker_runtime() {
+    async fn companion_routes_report_disabled_without_spawning_worker() {
         let temp = tempfile::tempdir().unwrap();
         let config = test_server_config(temp.path().join("workspace"));
         let api = WorkspaceApi::new_with_execution_backend(
@@ -5207,24 +5199,22 @@ mod tests {
 
         let workspace = get_json(app.clone(), "/api/workspace").await;
         let workspace_companion = &workspace["extension_points"]["companion_console"];
-        assert_eq!(workspace_companion["status"], "connected");
-        assert!(
-            workspace_companion["diagnostics"]
-                .as_array()
-                .unwrap()
-                .is_empty()
+        assert_eq!(workspace_companion["status"], "disabled");
+        assert_eq!(
+            workspace_companion["diagnostics"][0]["code"],
+            "companion_disabled"
         );
         assert!(
             workspace_companion["note"]
                 .as_str()
                 .unwrap()
-                .contains("normal Worker runtime path")
+                .contains("auto-start has been removed")
         );
 
         let status = get_json(app.clone(), "/api/companion/status").await;
-        assert_eq!(status["transport"]["completion"], "connected");
-        let worker_id = status["worker"]["worker_id"].as_str().unwrap().to_string();
-        assert_eq!(status["worker"]["profile"], "builtin:companion");
+        assert_eq!(status["state"], "disabled");
+        assert_eq!(status["transport"]["completion"], "disabled");
+        assert!(status["worker"].is_null());
 
         let response = post_json(
             app.clone(),
@@ -5232,49 +5222,23 @@ mod tests {
             serde_json::json!({ "content": "from legacy route" }),
         )
         .await;
-        assert_eq!(response["state"], "accepted");
-        assert_eq!(response["user_item"]["content"], "from legacy route");
-        assert!(!response.to_string().contains("companion_llm_not_connected"));
+        assert_eq!(response["state"], "rejected");
+        assert_eq!(response["diagnostics"][0]["code"], "companion_disabled");
+        assert!(response["user_item"].is_null());
+        assert!(response["assistant_item"].is_null());
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let transcript = loop {
-            let transcript = get_json(app.clone(), "/api/companion/transcript").await;
-            let has_assistant = transcript["items"].as_array().unwrap().iter().any(|item| {
-                item["role"] == "assistant"
-                    && item["content"] == "server companion echoed: from legacy route"
-                    && item["source"] == "worker_runtime"
-            });
-            if has_assistant {
-                break transcript;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for server companion transcript: {transcript}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        };
+        let transcript = get_json(app.clone(), "/api/companion/transcript").await;
+        assert_eq!(transcript["state"], "disabled");
+        assert_eq!(transcript["total_items"], 0);
+
+        let workers = get_json(app, "/api/workers").await;
         assert!(
-            transcript["items"]
+            workers["items"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|item| { item["role"] == "user" && item["content"] == "from legacy route" })
-        );
-
-        let worker_transcript = get_json(
-            app,
-            &format!("/api/runtimes/embedded-worker-runtime/workers/{worker_id}/transcript"),
-        )
-        .await;
-        assert!(
-            worker_transcript["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|item| {
-                    item["role"] == "assistant"
-                        && item["content"] == "server companion echoed: from legacy route"
-                })
+                .all(|worker| worker["role"] != "builtin:companion"),
+            "disabled companion route should not spawn workers: {workers}"
         );
     }
 

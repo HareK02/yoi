@@ -9,9 +9,12 @@ function assert(condition: unknown, message: string): asserts condition {
   }
 }
 
-Deno.test("workspace Worker list and sidebar attach through Worker Console hrefs", async () => {
+Deno.test("workspace Worker list lives on the dedicated Workers page", async () => {
   const workspacePage = await Deno.readTextFile(
     new URL("./../../routes/w/[workspaceId]/+page.svelte", import.meta.url),
+  );
+  const workersPage = await Deno.readTextFile(
+    new URL("./../../routes/w/[workspaceId]/workers/+page.svelte", import.meta.url),
   );
   const workersNav = await Deno.readTextFile(
     new URL("../workspace-sidebar/WorkersNavSection.svelte", import.meta.url),
@@ -21,14 +24,21 @@ Deno.test("workspace Worker list and sidebar attach through Worker Console hrefs
   );
 
   assert(
-    workspacePage.includes("workerConsoleHref(worker, workspaceId)") &&
-      workspacePage.includes("Open Console"),
-    "top Worker list should expose an attach action per Worker",
+    !workspacePage.includes("workerConsoleHref") &&
+      !workspacePage.includes("Open Console"),
+    "top workspace page should not own the Worker list",
   );
   assert(
-    workersNav.includes("workerConsoleHref(worker, workspaceId)") &&
+    workersPage.includes("workerConsoleHref(worker, data.workspaceId)") &&
+      workersPage.includes("<table class=\"workers-table\">") &&
+      workersPage.includes("Open Console"),
+    "dedicated Workers page should expose a table and attach action per Worker",
+  );
+  assert(
+    workersNav.includes('href={`/w/${workspaceId}/workers`}') &&
+      workersNav.includes("workerConsoleHref(worker, workspaceId)") &&
       workersNav.includes("aria-current"),
-    "Workers sidebar rows should link to the Worker target Console route",
+    "Workers sidebar should link to the Worker list page and target Console routes",
   );
   assert(
     !sidebar.includes("CompanionNavSection") &&

@@ -68,7 +68,14 @@
 
 <section class="nav-section" aria-labelledby="workers-heading">
   <div class="section-heading-row">
-    <h2 id="workers-heading">workers</h2>
+    <h2 id="workers-heading">
+      <a
+        class="section-heading-link"
+        class:active={currentPath === `/w/${workspaceId}/workers`}
+        href={`/w/${workspaceId}/workers`}
+        aria-current={currentPath === `/w/${workspaceId}/workers` ? 'page' : undefined}
+      >workers</a>
+    </h2>
     <a
       class="section-action"
       class:active={currentPath === `/w/${workspaceId}/workers/new`}
