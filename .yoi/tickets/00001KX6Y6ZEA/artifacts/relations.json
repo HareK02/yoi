@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KX6Y6ZEA",
+      "kind": "related",
+      "target": "00001KX6WVNPD",
+      "note": "Embedded no-workdir Workers need workspace API access without local filesystem authority.",
+      "author": "yoi ticket",
+      "at": "2026-07-10T21:16:50Z"
+    },
+    {
+      "ticket_id": "00001KX6Y6ZEA",
+      "kind": "related",
+      "target": "00001KX6Y2A9Q",
+      "note": "WorkspaceBackend separates workspace identity/API access from WorkerFilesystemAuthority local filesystem authority.",
+      "author": "yoi ticket",
+      "at": "2026-07-10T21:16:50Z"
+    }
+  ]
+}
