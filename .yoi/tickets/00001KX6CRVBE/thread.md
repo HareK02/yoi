@@ -177,3 +177,30 @@ Next action:
 - Route to external Reviewer Pod before merge/close decisions。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-10T18:19:11Z status: request_changes -->
+
+## Review: request changes
+
+External review result: request_changes
+
+Blocker:
+- Dirty Workdir safety is not implemented against real Runtime/filesystem state。
+- Cleanup plan decides `WorkdirDirtyDiscard` solely from `WorkdirRegistryRecord.cleanliness` (`crates/workspace-server/src/server.rs:1689-1695`)。
+- Runtime observation sync always writes `cleanliness: "clean"` for observed Workdirs (`server.rs:4179-4199`) and there is no code outside tests that records `"dirty"` (`rg "cleanliness.*dirty|dirty.*cleanliness"` only finds plan/test use)。
+- Execution then treats such targets as `WorkdirCleanCleanup` and calls Runtime cleanup without dirty confirmation (`server.rs:1851-1852`)。
+- Runtime cleanup uses forced removal (`crates/worker-runtime/src/working_directory.rs:505-508`)。
+- This violates acceptance items requiring safe dirty/clean status representation and explicit confirmation before dirty discard。
+
+Test gap:
+- The dirty confirmation test seeds a synthetic registry row with `cleanliness = "dirty"` (`server.rs:5436-5449`, `5551-5580`), so it does not catch the real path where Runtime/workdir sync overwrites or fails to detect dirty files。
+
+Positive evidence:
+- pin/unpin API/routes and retention projection exist (`server.rs:1544-1584`, `2032-2072`, `4008-4022`)。
+- plan/execution endpoints include digest/revision stale checks and pinned/running-link blocking (`server.rs:1766-1840`)。
+- UI preview/execution and pin controls are present without raw path fields。
+
+Non-blocking note:
+- `estimated_reclaim_bytes` is present but always `None`; confirm whether “when safe” requires actual byte estimation before approval。
+
+---
