@@ -162,3 +162,38 @@ Implementation routing update:
 - 完了後は diff / validation evidence を Orchestrator が確認し、別 sibling Reviewer Pod に read-only review を依頼する。`StopPod` は既知の不具合があるため使用しない。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-10T16:40:17Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Coder Pod completed implementation and committed `3e5546ea feat: add backend worker workdir registry` on branch `work/00001KX6BPY7M-worker-workdir-registry`。
+- Worktree status was clean after commit。
+- Changed files include:
+  - `crates/workspace-server/src/store.rs`
+  - `crates/workspace-server/src/server.rs`
+  - `crates/worker-runtime/src/{catalog.rs,worker_backend.rs,working_directory.rs}`
+  - child implementation also committed `.yoi/tickets/00001KX6BPY7M/{item.md,thread.md}` changes; Orchestrator will preserve authoritative Ticket records during merge if conflicts occur。
+- Implementation summary:
+  - Added Backend SQLite schema v3 tables: `worker_registry`, `workdir_registry`, `worker_workdir_links`。
+  - Added typed store records/APIs for Worker archival registry, Workdir registry, Worker-Workdir link authority, and explicit `pinned` retention representation。
+  - Backend-managed Workdir IDs and pending registry writes are created before Runtime materialization。
+  - Browser Workdir lists are based on Backend-managed registry rows。
+  - Runtime-direct Workdirs are distinguished as `runtime_unmanaged`。
+  - Canonical Workdir records are preserved after cleanup/removal。
+  - Worker creation/listing records Backend Worker registry entries and links selected Workdirs without storing raw Runtime materialized paths。
+  - Extended worker-runtime `WorkingDirectoryRequest` with optional `backend_workdir_id`。
+- Orchestrator reran validation in the implementation worktree:
+  - `git diff --check`: pass
+  - `cargo test -p yoi-workspace-server --lib`: pass（95 tests）
+  - `cargo test -p worker-runtime --features ws-server,fs-store`: pass（48 lib tests + 5 main tests + doc tests）
+  - `cargo check -p yoi`: pass
+  - `cd web/workspace && deno task check`: pass（0 errors / 0 warnings）
+  - `cd web/workspace && deno task test`: pass（23 tests）
+  - `yoi ticket doctor`: ok
+  - `nix build .#yoi --no-link`: pass
+- External review will be requested via a read-only sibling Reviewer Pod. `StopPod` は使わない。
+
+---
