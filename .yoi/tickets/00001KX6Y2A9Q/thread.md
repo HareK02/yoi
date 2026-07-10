@@ -38,3 +38,20 @@ Clarification: `process_cwd` is not part of this design. The Worker-level `cwd: 
 
 
 ---
+
+<!-- event: intake_summary author: hare at: 2026-07-10T21:49:37Z -->
+
+## Intake summary
+
+Marked ready by `yoi ticket state`.
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-07-10T21:49:37Z from: planning to: ready reason: cli_state field: state -->
+
+## State changed
+
+Marked ready by `yoi ticket state`.
+
+
+---
