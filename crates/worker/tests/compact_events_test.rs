@@ -164,9 +164,16 @@ async fn make_worker_with_manifest(
     std::mem::forget(pwd_tmp);
 
     let worker = Engine::new(client);
-    let mut worker = Worker::new(manifest, worker, store, pwd, scope)
-        .await
-        .unwrap();
+    let mut worker = Worker::new(
+        manifest,
+        worker,
+        store,
+        pwd.clone(),
+        worker::WorkerFilesystemAuthority::local(pwd.clone(), pwd.clone()),
+        scope,
+    )
+    .await
+    .unwrap();
     worker.enable_worker_metadata_write_through().unwrap();
     worker
 }

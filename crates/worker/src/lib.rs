@@ -38,4 +38,7 @@ pub use provider::{ProviderError, build_client};
 pub use runtime::dir::RuntimeDir;
 pub use segment_log_sink::SegmentLogSink;
 pub use shared_state::WorkerSharedState;
-pub use worker::{Worker, WorkerError, WorkerRunResult, apply_worker_manifest};
+pub use worker::{
+    LocalWorkingDirectory, Worker, WorkerError, WorkerFilesystemAuthority, WorkerRunResult,
+    apply_worker_manifest,
+};

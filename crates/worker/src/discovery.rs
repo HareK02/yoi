@@ -42,7 +42,7 @@ pub struct WorkerDiscovery<St> {
     store: St,
     self_worker_name: String,
     runtime_base: PathBuf,
-    cwd: PathBuf,
+    cwd: Option<PathBuf>,
     store_dir: Option<PathBuf>,
     spawned_registry: Arc<SpawnedWorkerRegistry>,
 }
@@ -55,7 +55,7 @@ where
         store: St,
         self_worker_name: String,
         runtime_base: PathBuf,
-        cwd: PathBuf,
+        cwd: Option<PathBuf>,
         spawned_registry: Arc<SpawnedWorkerRegistry>,
     ) -> Self {
         let store_dir = store.root_dir();
@@ -432,13 +432,19 @@ where
     ) -> Result<(), WorkerDiscoveryError> {
         let runtime_command =
             WorkerRuntimeCommand::resolve().map_err(WorkerDiscoveryError::RestoreSpawn)?;
+        let Some(cwd) = &self.cwd else {
+            return Err(WorkerDiscoveryError::NotRestorable {
+                worker_name: worker_name.to_string(),
+                reason: "restore requires local Worker filesystem authority".into(),
+            });
+        };
         let mut command = Command::new(runtime_command.program());
         command
             .args(runtime_command.prefix_args())
             .arg("--worker")
             .arg(worker_name)
             .arg("--require-worker-state")
-            .current_dir(&self.cwd)
+            .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1228,7 +1234,7 @@ mod tests {
             store.clone(),
             "parent".into(),
             runtime_base.clone(),
-            root.path().to_path_buf(),
+            Some(root.path().to_path_buf()),
             registry,
         );
 
@@ -1355,7 +1361,7 @@ mod tests {
             store.clone(),
             "source".into(),
             runtime_base.clone(),
-            root.path().to_path_buf(),
+            Some(root.path().to_path_buf()),
             SpawnedWorkerRegistry::new(runtime_dir),
         );
         let result = discovery.register_peer("target").unwrap();
@@ -1390,7 +1396,7 @@ mod tests {
             store,
             "source".into(),
             runtime_base,
-            root.path().to_path_buf(),
+            Some(root.path().to_path_buf()),
             SpawnedWorkerRegistry::new(runtime_dir),
         );
 
@@ -1430,7 +1436,7 @@ mod tests {
             store.clone(),
             "source".into(),
             runtime_base,
-            root.path().to_path_buf(),
+            Some(root.path().to_path_buf()),
             SpawnedWorkerRegistry::new(runtime_dir),
         );
 
@@ -1481,7 +1487,7 @@ mod tests {
             store,
             "source".into(),
             runtime_base.clone(),
-            root.path().to_path_buf(),
+            Some(root.path().to_path_buf()),
             SpawnedWorkerRegistry::new(runtime_dir),
         );
 
@@ -1599,7 +1605,7 @@ mod tests {
             store,
             "source".into(),
             runtime_base.clone(),
-            root.path().to_path_buf(),
+            Some(root.path().to_path_buf()),
             SpawnedWorkerRegistry::new(runtime_dir),
         );
 
@@ -1701,7 +1707,7 @@ mod tests {
             store,
             "source".into(),
             runtime_base,
-            root.path().to_path_buf(),
+            Some(root.path().to_path_buf()),
             SpawnedWorkerRegistry::new(runtime_dir),
         );
 

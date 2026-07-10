@@ -35,7 +35,7 @@ use session_store::{CombinedStore, FsWorkerStore};
 use tokio::runtime::Runtime;
 use tokio::sync::broadcast;
 
-use worker::{Worker, WorkerController, WorkerHandle};
+use worker::{Worker, WorkerController, WorkerFilesystemAuthority, WorkerHandle};
 
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
 const RUNTIME_TASK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -298,11 +298,16 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             .as_ref()
             .map(|binding| binding.root().to_path_buf())
             .unwrap_or_else(|| self.profile_base_dir.clone());
-        let cwd = request
+        let filesystem_authority = request
             .working_directory
             .as_ref()
-            .map(|binding| binding.cwd().to_path_buf())
-            .unwrap_or_else(|| self.cwd.clone());
+            .map(|binding| {
+                WorkerFilesystemAuthority::local(
+                    binding.root().to_path_buf(),
+                    binding.cwd().to_path_buf(),
+                )
+            })
+            .unwrap_or(WorkerFilesystemAuthority::None);
         let selector = profile.as_deref().unwrap_or("builtin:default");
         let archive = self
             .resolve_profile_source_archive(&request.request.profile_source)
@@ -335,9 +340,15 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         })?;
         let store = CombinedStore::new(session_store, worker_metadata_store);
 
-        let worker = Worker::from_manifest_with_context(manifest, store, loader, worker_root, cwd)
-            .await
-            .map_err(|err| format!("failed to create Worker from profile: {err}"))?;
+        let worker = Worker::from_manifest_with_context(
+            manifest,
+            store,
+            loader,
+            worker_root,
+            filesystem_authority,
+        )
+        .await
+        .map_err(|err| format!("failed to create Worker from profile: {err}"))?;
 
         let runtime_base = self.runtime_base_dir()?;
         let (handle, _shutdown_rx) = WorkerController::spawn(worker, &runtime_base)
@@ -806,7 +817,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::pin::Pin;
     use std::process::Command;
@@ -902,18 +913,27 @@ mod tests {
                 FsStore::new(&self.store_dir).map_err(|err| err.to_string())?,
                 FsWorkerStore::new(&self.worker_metadata_dir).map_err(|err| err.to_string())?,
             );
-            let cwd = request
+            let filesystem_authority = request
                 .working_directory
                 .as_ref()
-                .map(|binding| binding.cwd().to_path_buf())
+                .map(|binding| {
+                    let cwd = binding.cwd().to_path_buf();
+                    self.observed_cwds.lock().unwrap().push(cwd.clone());
+                    WorkerFilesystemAuthority::local(binding.root().to_path_buf(), cwd)
+                })
+                .unwrap_or(WorkerFilesystemAuthority::None);
+            let scope_root = request
+                .working_directory
+                .as_ref()
+                .map(|binding| binding.root().to_path_buf())
                 .unwrap_or_else(|| self.cwd.clone());
-            self.observed_cwds.lock().unwrap().push(cwd.clone());
-            let scope = Scope::writable(&cwd).map_err(|err| err.to_string())?;
+            let scope = Scope::writable(&scope_root).map_err(|err| err.to_string())?;
             let worker = Worker::new(
                 manifest,
                 Engine::new(self.client.clone()),
                 store,
-                cwd,
+                self.cwd.clone(),
+                filesystem_authority,
                 scope,
             )
             .await
@@ -923,6 +943,20 @@ mod tests {
                 .map_err(|err| err.to_string())?;
             Ok(handle)
         }
+    }
+
+    fn core_filesystem_tool_names() -> BTreeSet<&'static str> {
+        ["Read", "Write", "Edit", "Glob", "Grep", "Bash"]
+            .into_iter()
+            .collect()
+    }
+
+    fn captured_tool_names(client: &MockClient, index: usize) -> BTreeSet<String> {
+        client.captured.lock().unwrap()[index]
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect()
     }
 
     fn simple_text_events() -> Vec<LlmEvent> {
@@ -1109,7 +1143,7 @@ mod tests {
             cwd: cwd.path().to_path_buf(),
             store_dir: store.path().join("sessions"),
             worker_metadata_dir: store.path().join("workers"),
-            observed_cwds,
+            observed_cwds: observed_cwds.clone(),
         };
         let backend = WorkerRuntimeExecutionBackend::new(factory).unwrap();
         let runtime = EmbeddedRuntime::with_execution_backend(
@@ -1148,6 +1182,14 @@ mod tests {
         }
 
         assert_eq!(client.captured.lock().unwrap().len(), 1);
+        assert!(observed_cwds.lock().unwrap().is_empty());
+        let names = captured_tool_names(&client, 0);
+        for forbidden in core_filesystem_tool_names() {
+            assert!(
+                !names.contains(forbidden),
+                "no-workdir Worker unexpectedly exposed {forbidden}; tools={names:?}"
+            );
+        }
         let observations = runtime
             .read_worker_observation_events(&detail.worker_ref, WorkerObservationCursor::zero())
             .unwrap();
@@ -1166,7 +1208,7 @@ mod tests {
         let store = tempfile::tempdir().unwrap();
         let observed_cwds = Arc::new(Mutex::new(Vec::new()));
         let factory = MockFactory {
-            client,
+            client: client.clone(),
             runtime_base: runtime_base.path().to_path_buf(),
             cwd: repo.path().to_path_buf(),
             store_dir: store.path().join("sessions"),
@@ -1191,6 +1233,24 @@ mod tests {
         request.working_directory_request = Some(working_directory_request(repo.path()));
 
         let detail = runtime.create_worker(request).unwrap();
+        runtime
+            .send_input(&detail.worker_ref, WorkerInput::user("inspect tools"))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while client.captured.lock().unwrap().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for materialized-worker request"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let names = captured_tool_names(&client, 0);
+        for expected in core_filesystem_tool_names() {
+            assert!(
+                names.contains(expected),
+                "local Worker did not expose {expected}; tools={names:?}"
+            );
+        }
 
         assert!(detail.execution.working_directory.is_some());
         let cwds = observed_cwds.lock().unwrap();

@@ -13,7 +13,9 @@
 //! `set_system_prompt`. Subsequent turns and compactions reuse that
 //! materialised string verbatim.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::path::Path;
 use std::sync::Arc;
 
@@ -146,7 +148,7 @@ impl std::fmt::Debug for SystemPromptTemplate {
 /// templates cannot drop them on the floor.
 pub struct SystemPromptContext<'a> {
     pub now: DateTime<Utc>,
-    pub cwd: &'a Path,
+    pub cwd: Cow<'a, str>,
     /// Language policy exposed to instruction templates as `{{ language }}`.
     pub language: &'a str,
     pub scope: &'a Scope,
@@ -189,7 +191,7 @@ impl<'a> SystemPromptContext<'a> {
             "datetime".into(),
             Value::from(self.now.to_rfc3339_opts(SecondsFormat::Secs, true)),
         );
-        root.insert("cwd".into(), Value::from(self.cwd.display().to_string()));
+        root.insert("cwd".into(), Value::from(self.cwd.as_ref()));
         root.insert("language".into(), Value::from(self.language));
         root.insert(
             "tools".into(),
@@ -442,7 +444,7 @@ mod tests {
     ) -> SystemPromptContext<'a> {
         SystemPromptContext {
             now: fixed_now(),
-            cwd,
+            cwd: cwd.display().to_string().into(),
             language: manifest::defaults::WORKER_LANGUAGE,
             scope,
             tool_names: tools,
@@ -461,7 +463,7 @@ mod tests {
     ) -> SystemPromptContext<'a> {
         SystemPromptContext {
             now: fixed_now(),
-            cwd,
+            cwd: cwd.display().to_string().into(),
             language: manifest::defaults::WORKER_LANGUAGE,
             scope,
             tool_names: Vec::new(),
@@ -480,7 +482,7 @@ mod tests {
     ) -> SystemPromptContext<'a> {
         SystemPromptContext {
             now: fixed_now(),
-            cwd,
+            cwd: cwd.display().to_string().into(),
             language: manifest::defaults::WORKER_LANGUAGE,
             scope,
             tool_names: Vec::new(),
@@ -499,7 +501,7 @@ mod tests {
     ) -> SystemPromptContext<'a> {
         SystemPromptContext {
             now: fixed_now(),
-            cwd,
+            cwd: cwd.display().to_string().into(),
             language: manifest::defaults::WORKER_LANGUAGE,
             scope,
             tool_names: Vec::new(),
