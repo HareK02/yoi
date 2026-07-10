@@ -27,6 +27,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "align legacy workspace bootstrap with schema v0",
         apply: align_legacy_bootstrap_schema,
     },
+    Migration {
+        version: 3,
+        name: "backend worker workdir registry schema",
+        apply: create_worker_workdir_registry_tables,
+    },
 ];
 
 struct Migration {
@@ -44,11 +49,99 @@ pub struct WorkspaceRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerRegistryRecord {
+    pub workspace_id: String,
+    /// Backend-owned archival Worker id. In v0 it is derived from runtime_id + runtime_worker_id.
+    pub worker_id: String,
+    pub runtime_id: String,
+    pub runtime_worker_id: String,
+    pub display_name: String,
+    pub profile: Option<String>,
+    pub lifecycle_state: String,
+    /// Retention state is explicit so `pinned` can be represented before prune exists.
+    pub retention_state: String,
+    pub transcript_ref: Option<String>,
+    pub session_ref: Option<String>,
+    pub summary_ref: Option<String>,
+    pub diagnostics_ref: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkdirRegistryRecord {
+    pub workspace_id: String,
+    pub workdir_id: String,
+    pub runtime_id: String,
+    pub repository_id: String,
+    pub selector: Option<String>,
+    pub resolved_commit: Option<String>,
+    pub materialization_status: String,
+    pub cleanliness: String,
+    /// `backend_managed` rows are authored by this Backend; `runtime_unmanaged` is for diagnostics only.
+    pub management_kind: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerWorkdirLinkRecord {
+    pub workspace_id: String,
+    pub worker_id: String,
+    pub workdir_id: String,
+    pub role: String,
+    pub linked_at: String,
+    pub unlinked_at: Option<String>,
+}
+
 #[async_trait]
 pub trait ControlPlaneStore: Send + Sync {
     async fn schema_version(&self) -> Result<i64>;
     async fn upsert_workspace(&self, record: &WorkspaceRecord) -> Result<()>;
     async fn get_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceRecord>>;
+
+    fn upsert_worker_registry(&self, record: &WorkerRegistryRecord) -> Result<()>;
+    fn get_worker_registry(
+        &self,
+        workspace_id: &str,
+        worker_id: &str,
+    ) -> Result<Option<WorkerRegistryRecord>>;
+    fn get_worker_registry_by_runtime(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        runtime_worker_id: &str,
+    ) -> Result<Option<WorkerRegistryRecord>>;
+    fn list_worker_registry(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkerRegistryRecord>>;
+
+    fn upsert_workdir_registry(&self, record: &WorkdirRegistryRecord) -> Result<()>;
+    fn get_workdir_registry(
+        &self,
+        workspace_id: &str,
+        workdir_id: &str,
+    ) -> Result<Option<WorkdirRegistryRecord>>;
+    fn list_workdir_registry(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkdirRegistryRecord>>;
+    fn list_managed_workdir_registry(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkdirRegistryRecord>>;
+
+    fn upsert_worker_workdir_link(&self, record: &WorkerWorkdirLinkRecord) -> Result<()>;
+    fn list_worker_workdir_links(
+        &self,
+        workspace_id: &str,
+        worker_id: &str,
+    ) -> Result<Vec<WorkerWorkdirLinkRecord>>;
 }
 
 #[derive(Clone)]
@@ -131,6 +224,355 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             .map_err(Error::from)
         })
     }
+
+    fn upsert_worker_registry(&self, record: &WorkerRegistryRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO worker_registry (
+                    workspace_id, worker_id, runtime_id, runtime_worker_id, display_name, profile,
+                    lifecycle_state, retention_state, transcript_ref, session_ref, summary_ref,
+                    diagnostics_ref, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                ON CONFLICT(workspace_id, worker_id) DO UPDATE SET
+                    runtime_id = excluded.runtime_id,
+                    runtime_worker_id = excluded.runtime_worker_id,
+                    display_name = excluded.display_name,
+                    profile = excluded.profile,
+                    lifecycle_state = excluded.lifecycle_state,
+                    retention_state = CASE
+                        WHEN worker_registry.retention_state = 'pinned' AND excluded.retention_state = 'normal'
+                        THEN worker_registry.retention_state
+                        ELSE excluded.retention_state
+                    END,
+                    transcript_ref = excluded.transcript_ref,
+                    session_ref = excluded.session_ref,
+                    summary_ref = excluded.summary_ref,
+                    diagnostics_ref = excluded.diagnostics_ref,
+                    updated_at = excluded.updated_at"#,
+                params![
+                    record.workspace_id,
+                    record.worker_id,
+                    record.runtime_id,
+                    record.runtime_worker_id,
+                    record.display_name,
+                    record.profile,
+                    record.lifecycle_state,
+                    record.retention_state,
+                    record.transcript_ref,
+                    record.session_ref,
+                    record.summary_ref,
+                    record.diagnostics_ref,
+                    record.created_at,
+                    record.updated_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn get_worker_registry(
+        &self,
+        workspace_id: &str,
+        worker_id: &str,
+    ) -> Result<Option<WorkerRegistryRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                worker_registry_select_sql("WHERE workspace_id = ?1 AND worker_id = ?2").as_str(),
+                params![workspace_id, worker_id],
+                read_worker_registry_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn get_worker_registry_by_runtime(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        runtime_worker_id: &str,
+    ) -> Result<Option<WorkerRegistryRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                worker_registry_select_sql(
+                    "WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3",
+                )
+                .as_str(),
+                params![workspace_id, runtime_id, runtime_worker_id],
+                read_worker_registry_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn list_worker_registry(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkerRegistryRecord>> {
+        self.with_conn(|conn| {
+            let sql = worker_registry_select_sql(
+                "WHERE workspace_id = ?1 ORDER BY updated_at DESC LIMIT ?2",
+            );
+            let mut stmt = conn.prepare(sql.as_str())?;
+            let rows = stmt.query_map(
+                params![workspace_id, limit as i64],
+                read_worker_registry_record,
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        })
+    }
+
+    fn upsert_workdir_registry(&self, record: &WorkdirRegistryRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO workdir_registry (
+                    workspace_id, workdir_id, runtime_id, repository_id, selector, resolved_commit,
+                    materialization_status, cleanliness, management_kind, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ON CONFLICT(workspace_id, workdir_id) DO UPDATE SET
+                    runtime_id = excluded.runtime_id,
+                    repository_id = excluded.repository_id,
+                    selector = excluded.selector,
+                    resolved_commit = excluded.resolved_commit,
+                    materialization_status = excluded.materialization_status,
+                    cleanliness = excluded.cleanliness,
+                    management_kind = excluded.management_kind,
+                    updated_at = excluded.updated_at"#,
+                params![
+                    record.workspace_id,
+                    record.workdir_id,
+                    record.runtime_id,
+                    record.repository_id,
+                    record.selector,
+                    record.resolved_commit,
+                    record.materialization_status,
+                    record.cleanliness,
+                    record.management_kind,
+                    record.created_at,
+                    record.updated_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn get_workdir_registry(
+        &self,
+        workspace_id: &str,
+        workdir_id: &str,
+    ) -> Result<Option<WorkdirRegistryRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                workdir_registry_select_sql("WHERE workspace_id = ?1 AND workdir_id = ?2").as_str(),
+                params![workspace_id, workdir_id],
+                read_workdir_registry_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn list_workdir_registry(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkdirRegistryRecord>> {
+        self.with_conn(|conn| {
+            let sql = workdir_registry_select_sql(
+                "WHERE workspace_id = ?1 ORDER BY updated_at DESC LIMIT ?2",
+            );
+            let mut stmt = conn.prepare(sql.as_str())?;
+            let rows = stmt.query_map(
+                params![workspace_id, limit as i64],
+                read_workdir_registry_record,
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        })
+    }
+
+    fn list_managed_workdir_registry(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkdirRegistryRecord>> {
+        self.with_conn(|conn| {
+            let sql = workdir_registry_select_sql(
+                "WHERE workspace_id = ?1 AND management_kind = 'backend_managed' ORDER BY updated_at DESC LIMIT ?2",
+            );
+            let mut stmt = conn.prepare(sql.as_str())?;
+            let rows = stmt.query_map(params![workspace_id, limit as i64], read_workdir_registry_record)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        })
+    }
+
+    fn upsert_worker_workdir_link(&self, record: &WorkerWorkdirLinkRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO worker_workdir_links (
+                    workspace_id, worker_id, workdir_id, role, linked_at, unlinked_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(workspace_id, worker_id, workdir_id, role) DO UPDATE SET
+                    linked_at = excluded.linked_at,
+                    unlinked_at = excluded.unlinked_at"#,
+                params![
+                    record.workspace_id,
+                    record.worker_id,
+                    record.workdir_id,
+                    record.role,
+                    record.linked_at,
+                    record.unlinked_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn list_worker_workdir_links(
+        &self,
+        workspace_id: &str,
+        worker_id: &str,
+    ) -> Result<Vec<WorkerWorkdirLinkRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"SELECT workspace_id, worker_id, workdir_id, role, linked_at, unlinked_at
+                   FROM worker_workdir_links
+                   WHERE workspace_id = ?1 AND worker_id = ?2 AND unlinked_at IS NULL
+                   ORDER BY linked_at DESC"#,
+            )?;
+            let rows = stmt.query_map(params![workspace_id, worker_id], |row| {
+                Ok(WorkerWorkdirLinkRecord {
+                    workspace_id: row.get(0)?,
+                    worker_id: row.get(1)?,
+                    workdir_id: row.get(2)?,
+                    role: row.get(3)?,
+                    linked_at: row.get(4)?,
+                    unlinked_at: row.get(5)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        })
+    }
+}
+
+fn worker_registry_select_sql(where_clause: &str) -> String {
+    format!(
+        "SELECT workspace_id, worker_id, runtime_id, runtime_worker_id, display_name, profile, \
+         lifecycle_state, retention_state, transcript_ref, session_ref, summary_ref, diagnostics_ref, \
+         created_at, updated_at FROM worker_registry {where_clause}"
+    )
+}
+
+fn read_worker_registry_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerRegistryRecord> {
+    Ok(WorkerRegistryRecord {
+        workspace_id: row.get(0)?,
+        worker_id: row.get(1)?,
+        runtime_id: row.get(2)?,
+        runtime_worker_id: row.get(3)?,
+        display_name: row.get(4)?,
+        profile: row.get(5)?,
+        lifecycle_state: row.get(6)?,
+        retention_state: row.get(7)?,
+        transcript_ref: row.get(8)?,
+        session_ref: row.get(9)?,
+        summary_ref: row.get(10)?,
+        diagnostics_ref: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+    })
+}
+
+fn workdir_registry_select_sql(where_clause: &str) -> String {
+    format!(
+        "SELECT workspace_id, workdir_id, runtime_id, repository_id, selector, resolved_commit, \
+         materialization_status, cleanliness, management_kind, created_at, updated_at \
+         FROM workdir_registry {where_clause}"
+    )
+}
+
+fn read_workdir_registry_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WorkdirRegistryRecord> {
+    Ok(WorkdirRegistryRecord {
+        workspace_id: row.get(0)?,
+        workdir_id: row.get(1)?,
+        runtime_id: row.get(2)?,
+        repository_id: row.get(3)?,
+        selector: row.get(4)?,
+        resolved_commit: row.get(5)?,
+        materialization_status: row.get(6)?,
+        cleanliness: row.get(7)?,
+        management_kind: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+fn create_worker_workdir_registry_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS worker_registry (
+    workspace_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    runtime_worker_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    profile TEXT,
+    lifecycle_state TEXT NOT NULL,
+    retention_state TEXT NOT NULL CHECK (retention_state IN ('normal', 'pinned')),
+    transcript_ref TEXT,
+    session_ref TEXT,
+    summary_ref TEXT,
+    diagnostics_ref TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, worker_id),
+    UNIQUE (workspace_id, runtime_id, runtime_worker_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS workdir_registry (
+    workspace_id TEXT NOT NULL,
+    workdir_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    repository_id TEXT NOT NULL,
+    selector TEXT,
+    resolved_commit TEXT,
+    materialization_status TEXT NOT NULL CHECK (materialization_status IN ('pending', 'present', 'missing', 'removed', 'failed')),
+    cleanliness TEXT NOT NULL CHECK (cleanliness IN ('clean', 'dirty', 'unknown')),
+    management_kind TEXT NOT NULL CHECK (management_kind IN ('backend_managed', 'runtime_unmanaged')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, workdir_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS worker_workdir_links (
+    workspace_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    workdir_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    linked_at TEXT NOT NULL,
+    unlinked_at TEXT,
+    PRIMARY KEY (workspace_id, worker_id, workdir_id, role),
+    FOREIGN KEY (workspace_id, worker_id) REFERENCES worker_registry(workspace_id, worker_id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, workdir_id) REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_worker_registry_workspace_updated
+    ON worker_registry(workspace_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_workdir_registry_workspace_updated
+    ON workdir_registry(workspace_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_worker_workdir_links_worker
+    ON worker_workdir_links(workspace_id, worker_id, linked_at DESC);
+"#,
+    )?;
+    Ok(())
 }
 
 fn configure_sqlite(conn: &Connection) -> Result<()> {
@@ -488,7 +930,7 @@ mod tests {
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 2);
+        assert_eq!(store.schema_version().await.unwrap(), 3);
 
         let record = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
@@ -500,7 +942,7 @@ mod tests {
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 2);
+        assert_eq!(reopened.schema_version().await.unwrap(), 3);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -527,6 +969,9 @@ mod tests {
             "ticket_worker_links",
             "artifacts",
             "audit_events",
+            "worker_registry",
+            "workdir_registry",
+            "worker_workdir_links",
         ] {
             assert!(
                 tables.contains(expected),
@@ -688,7 +1133,7 @@ mod tests {
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 2);
+        assert_eq!(store.schema_version().await.unwrap(), 3);
 
         store
             .with_conn(|conn| {
@@ -770,6 +1215,115 @@ mod tests {
         assert_eq!(
             store.get_workspace("new-workspace").await.unwrap(),
             Some(new_record)
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_workdir_registry_round_trips_and_preserves_pinned_retention() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("workspace.db");
+        let store = SqliteWorkspaceStore::open(&db).unwrap();
+        let workspace = WorkspaceRecord {
+            workspace_id: "local-dev".to_string(),
+            display_name: "Local Dev".to_string(),
+            state: "active".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        store.upsert_workspace(&workspace).await.unwrap();
+
+        let worker = WorkerRegistryRecord {
+            workspace_id: "local-dev".to_string(),
+            worker_id: "embedded/browser-1".to_string(),
+            runtime_id: "embedded".to_string(),
+            runtime_worker_id: "browser-1".to_string(),
+            display_name: "Browser 1".to_string(),
+            profile: Some("builtin:companion".to_string()),
+            lifecycle_state: "idle".to_string(),
+            retention_state: "pinned".to_string(),
+            transcript_ref: Some("runtime://embedded/workers/browser-1/transcript".to_string()),
+            session_ref: None,
+            summary_ref: None,
+            diagnostics_ref: None,
+            created_at: "2".to_string(),
+            updated_at: "2".to_string(),
+        };
+        store.upsert_worker_registry(&worker).unwrap();
+        let mut runtime_sync_worker = worker.clone();
+        runtime_sync_worker.lifecycle_state = "running".to_string();
+        runtime_sync_worker.retention_state = "normal".to_string();
+        runtime_sync_worker.updated_at = "5".to_string();
+        store.upsert_worker_registry(&runtime_sync_worker).unwrap();
+        let mut expected_worker = worker.clone();
+        expected_worker.lifecycle_state = "running".to_string();
+        expected_worker.updated_at = "5".to_string();
+
+        let workdir = WorkdirRegistryRecord {
+            workspace_id: "local-dev".to_string(),
+            workdir_id: "backend-2-repo".to_string(),
+            runtime_id: "embedded".to_string(),
+            repository_id: "repo".to_string(),
+            selector: Some("develop".to_string()),
+            resolved_commit: Some("abcdef".to_string()),
+            materialization_status: "removed".to_string(),
+            cleanliness: "clean".to_string(),
+            management_kind: "backend_managed".to_string(),
+            created_at: "2".to_string(),
+            updated_at: "3".to_string(),
+        };
+        store.upsert_workdir_registry(&workdir).unwrap();
+        let unmanaged_workdir = WorkdirRegistryRecord {
+            workspace_id: "local-dev".to_string(),
+            workdir_id: "runtime-direct".to_string(),
+            runtime_id: "embedded".to_string(),
+            repository_id: "repo".to_string(),
+            selector: Some("feature".to_string()),
+            resolved_commit: Some("123456".to_string()),
+            materialization_status: "present".to_string(),
+            cleanliness: "unknown".to_string(),
+            management_kind: "runtime_unmanaged".to_string(),
+            created_at: "3".to_string(),
+            updated_at: "4".to_string(),
+        };
+        store.upsert_workdir_registry(&unmanaged_workdir).unwrap();
+
+        let link = WorkerWorkdirLinkRecord {
+            workspace_id: "local-dev".to_string(),
+            worker_id: worker.worker_id.clone(),
+            workdir_id: workdir.workdir_id.clone(),
+            role: "primary_cwd".to_string(),
+            linked_at: "4".to_string(),
+            unlinked_at: None,
+        };
+        store.upsert_worker_workdir_link(&link).unwrap();
+
+        assert_eq!(
+            store
+                .get_worker_registry_by_runtime("local-dev", "embedded", "browser-1")
+                .unwrap(),
+            Some(expected_worker.clone())
+        );
+        assert_eq!(
+            store
+                .get_workdir_registry("local-dev", "backend-2-repo")
+                .unwrap(),
+            Some(workdir.clone())
+        );
+        assert_eq!(
+            store.list_workdir_registry("local-dev", 10).unwrap(),
+            vec![unmanaged_workdir.clone(), workdir.clone()]
+        );
+        assert_eq!(
+            store
+                .list_managed_workdir_registry("local-dev", 10)
+                .unwrap(),
+            vec![workdir]
+        );
+        assert_eq!(
+            store
+                .list_worker_workdir_links("local-dev", "embedded/browser-1")
+                .unwrap(),
+            vec![link]
         );
     }
 
