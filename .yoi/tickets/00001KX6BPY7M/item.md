@@ -1,8 +1,8 @@
 ---
 title: 'Add Backend Worker/Workdir registry and link model'
-state: 'planning'
+state: 'ready'
 created_at: '2026-07-10T15:53:02Z'
-updated_at: '2026-07-10T15:54:24Z'
+updated_at: '2026-07-10T16:06:07Z'
 assignee: null
 ---
 
