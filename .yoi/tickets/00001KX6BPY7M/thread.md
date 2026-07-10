@@ -197,3 +197,53 @@ Implementation progress report:
 - External review will be requested via a read-only sibling Reviewer Pod. `StopPod` は使わない。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-10T16:52:25Z status: request_changes -->
+
+## Review: request changes
+
+External review result: request_changes
+
+Blockers:
+
+1. Browser Worker list が Backend registry based になっていない。
+   - Ticket は Worker/Workdir lists を Backend-managed registry + Runtime observation merge に基づかせることを要求している。
+   - `workers_response` はまだ `api.runtime.list_workers(limit)` を呼び、live Runtime items を opportunistic に記録したうえで `items: runtime_workers.items` を返している（`crates/workspace-server/src/server.rs:2529-2546`）。
+   - `worker_registry` / `worker_workdir_links` を read していないため、Backend-only / stopped / archive rows を list できず、relation authority が Browser Worker list に使われていない。
+
+2. Runtime Worker creation path が Worker registry / Workdir registry / links を書いていない。
+   - `create_runtime_worker` は `working_directory_request` を解決して `api.runtime.spawn_worker` に forward し、Runtime result を返すだけ（`server.rs:2269-2285`）。
+   - Runtime materialization 前の pending Backend Workdir row、`record_worker_summary`、Worker-Workdir link がない。
+   - Browser `/api/workers` path のみ existing Workdir を record/link-select している（`server.rs:2141-2170`）。
+   - Backend-created/internal Runtime Workers with materialized workdirs が untracked になり、「Backend worker creation writes/updates Worker registry and Worker-Workdir link」 acceptance に違反する。
+
+3. Stopped Worker -> removed/missing Workdir relationship が Backend registry から安定して答えられない。
+   - `stop_runtime_worker` は Runtime stop を forward して返すだけ（`server.rs:2330-2339`）。
+   - Runtime cleanup 後に Worker lifecycle、Workdir materialization status、link state を Backend SQLite に更新しない。
+   - `working_directory_summaries` は `list_managed_workdir_registry` だけを読む（`server.rs:3242-3249`）ため、Runtime stop が bound workdir を remove しても Backend record は stale `present` のままになり得る。
+
+4. Runtime Workdir observation / unmanaged distinction が partial。
+   - runtime-scoped workdir list は raw Runtime summaries を直接返す（`server.rs:1184-1200`）。
+   - workspace-scoped list は Backend-managed rows のみ返す。
+   - `runtime_unmanaged` rows は detail / worker-create paths で opportunistic に作られるだけで、list 時に sync/typed されない。
+   - Browser summaries も management kind を露出していないため、unmanaged/external Runtime Workdirs を Backend-managed Workdirs と区別して visible/diagnosable にする requirement を満たしていない。
+
+5. pinned retention が sync で clobber され得る。
+   - schema は `pinned` を保存できるが、`record_worker_summary` は常に `retention_state: "normal"` を書く（`server.rs:3290-3318`）。
+   - `upsert_worker_registry` は conflict 時に `retention_state = excluded.retention_state` で上書きする（`store.rs:223-242`）。
+   - pinned Worker への後続 Runtime observation / list sync が pinned を normal に downgrade できるため、`pinned` が durable retention metadata として保護されていない。
+
+Non-blocking follow-ups:
+- schema 方向性自体は妥当。`worker_registry`, `workdir_registry`, `worker_workdir_links` は typed checks / FK relations 付きで存在する（`store.rs:488-545`）。
+- Backend workdir creation が Runtime materialization 前に pending Backend row を作る点は良い（`server.rs:1276-1327`）。
+- inspected paths では raw materialized Runtime paths が新 Backend registry records に保存されている箇所は見当たらなかった。
+- tests は schema roundtrip / pinned storage / removed Workdir / link basics を cover しているが、上記 blocker paths（runtime worker spawn with workdir, stop cleanup syncing, Backend-registry Worker list projection, unmanaged list diagnostics, pinned preservation under sync）は不足。
+
+Validation performed:
+- Ticket item/thread including routing decision, IntentPacket, implementation report を確認。
+- implementation commit `3e5546ea` の `git show --name-only` / `git show --check` を確認。
+- implementation worktree 内だけで branch/status を確認。
+- `store.rs`, `server.rs`, `catalog.rs`, `worker_backend.rs`, `working_directory.rs` を review。
+- acceptance blockers が inspection で明確だったため、full test/build matrix は再実行していない。
+
+---
