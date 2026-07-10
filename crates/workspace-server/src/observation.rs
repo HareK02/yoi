@@ -225,15 +225,11 @@ impl BackendObservationCursor {
 #[derive(Debug, Default)]
 struct BackendObservationState {
     next_sequence: u64,
-    history: BTreeMap<ObservationKey, VecDeque<StoredBackendEvent>>,
 }
 
 impl BackendObservationState {
     fn new() -> Self {
-        Self {
-            next_sequence: 1,
-            history: BTreeMap::new(),
-        }
+        Self { next_sequence: 1 }
     }
 }
 
@@ -241,20 +237,6 @@ impl BackendObservationState {
 struct ObservationKey {
     runtime_id: String,
     worker_id: String,
-}
-
-#[derive(Clone, Debug)]
-struct StoredBackendEvent {
-    sequence: u64,
-    runtime_cursor: String,
-    envelope: ClientWorkerEventWsEnvelope,
-}
-
-#[derive(Clone, Debug)]
-pub struct BackendObservationOpen {
-    pub replay: Vec<ClientWorkerEventWsEnvelope>,
-    pub runtime_cursor: Option<String>,
-    pub backend_cursor: BackendObservationCursor,
 }
 
 /// Backend-owned in-memory v0 observation proxy state.
@@ -314,62 +296,18 @@ impl BackendObservationProxy {
 
     pub fn open(
         &self,
-        runtime_id: &str,
-        worker_id: &str,
+        _runtime_id: &str,
+        _worker_id: &str,
         cursor: Option<&str>,
-    ) -> Result<BackendObservationOpen, ObservationProxyError> {
-        let key = ObservationKey {
-            runtime_id: runtime_id.to_string(),
-            worker_id: worker_id.to_string(),
-        };
-        let cursor = match cursor {
-            Some(raw) => BackendObservationCursor::decode(raw).ok_or_else(|| {
+    ) -> Result<(), ObservationProxyError> {
+        if let Some(raw) = cursor {
+            BackendObservationCursor::decode(raw).ok_or_else(|| {
                 ObservationProxyError::CursorMalformed(format!(
                     "malformed backend observation cursor: {raw}"
                 ))
-            })?,
-            None => BackendObservationCursor::zero(),
-        };
-        let state = self.state.lock().map_err(|_| {
-            ObservationProxyError::RuntimeUnavailable(
-                "backend observation state lock poisoned".into(),
-            )
-        })?;
-        let history = state.history.get(&key);
-        let replay: Vec<_> = history
-            .into_iter()
-            .flat_map(|events| events.iter())
-            .filter(|event| event.sequence > cursor.sequence)
-            .cloned()
-            .collect();
-        if cursor.sequence != 0 {
-            let found = history
-                .into_iter()
-                .flat_map(|events| events.iter())
-                .any(|event| event.sequence == cursor.sequence);
-            if !found {
-                return Err(ObservationProxyError::CursorUnknownOrExpired(format!(
-                    "backend observation cursor {} is unknown or expired for runtime {runtime_id} worker {worker_id}",
-                    cursor.encode()
-                )));
-            }
+            })?;
         }
-        let runtime_cursor = replay
-            .last()
-            .map(|event| event.runtime_cursor.clone())
-            .or_else(|| {
-                history.and_then(|events| {
-                    events
-                        .iter()
-                        .find(|event| event.sequence == cursor.sequence)
-                        .map(|event| event.runtime_cursor.clone())
-                })
-            });
-        Ok(BackendObservationOpen {
-            replay: replay.into_iter().map(|event| event.envelope).collect(),
-            runtime_cursor,
-            backend_cursor: cursor,
-        })
+        Ok(())
     }
 
     pub fn store(
@@ -384,27 +322,13 @@ impl BackendObservationProxy {
         let sequence = state.next_sequence;
         state.next_sequence += 1;
         let cursor = BackendObservationCursor::new(sequence).encode();
-        let envelope = ClientWorkerEventWsEnvelope {
+        Ok(ClientWorkerEventWsEnvelope {
             cursor: cursor.clone(),
             event_id: cursor,
-            runtime_id: event.runtime_id.clone(),
-            worker_id: event.worker_id.clone(),
-            payload: event.payload,
-        };
-        let key = ObservationKey {
             runtime_id: event.runtime_id,
             worker_id: event.worker_id,
-        };
-        let history = state.history.entry(key).or_default();
-        history.push_back(StoredBackendEvent {
-            sequence,
-            runtime_cursor: event.runtime_cursor,
-            envelope: envelope.clone(),
-        });
-        while history.len() > 1024 {
-            history.pop_front();
-        }
-        Ok(envelope)
+            payload: event.payload,
+        })
     }
 }
 

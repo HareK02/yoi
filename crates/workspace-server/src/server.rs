@@ -2981,38 +2981,24 @@ async fn worker_observation_ws_session(
     query: ClientWorkerEventsWsQuery,
     mut socket: WebSocket,
 ) {
-    let open = match proxy.open(
+    if let Err(error) = proxy.open(
         source.runtime_id(),
         source.worker_id(),
         query.cursor.as_deref(),
     ) {
-        Ok(open) => open,
+        let _ =
+            send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::diagnostic(error)).await;
+        return;
+    }
+
+    let mut upstream = match RuntimeObservationClient::connect(&source, None).await {
+        Ok(client) => client,
         Err(error) => {
             let _ = send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::diagnostic(error))
                 .await;
             return;
         }
     };
-
-    let mut backend_cursor = open.backend_cursor;
-    for envelope in open.replay {
-        backend_cursor = crate::observation::BackendObservationCursor::decode(&envelope.cursor)
-            .unwrap_or(backend_cursor);
-        if !send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::event(envelope)).await {
-            return;
-        }
-    }
-
-    let mut upstream =
-        match RuntimeObservationClient::connect(&source, open.runtime_cursor.as_deref()).await {
-            Ok(client) => client,
-            Err(error) => {
-                let _ =
-                    send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::diagnostic(error))
-                        .await;
-                return;
-            }
-        };
 
     loop {
         tokio::select! {
@@ -3049,8 +3035,6 @@ async fn worker_observation_ws_session(
                 match upstream_event {
                     Ok(event) => match proxy.store(event) {
                         Ok(envelope) => {
-                            backend_cursor = crate::observation::BackendObservationCursor::decode(&envelope.cursor)
-                                .unwrap_or(backend_cursor);
                             if !send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::event(envelope)).await {
                                 return;
                             }
@@ -7262,6 +7246,26 @@ mod tests {
         assert_eq!(live.worker_id, "worker-a");
         assert!(matches!(live.payload, protocol::Event::TextDelta { .. }));
 
+        let (mut fresh, _) = connect_async(&url).await.unwrap();
+        let fresh_snapshot = next_client_frame(&mut fresh).await;
+        assert!(matches!(
+            fresh_snapshot,
+            ClientWorkerEventWsFrame::Event { envelope } if matches!(envelope.payload, protocol::Event::Snapshot { .. })
+        ));
+        runtime
+            .observe_worker_event(
+                &worker_ref,
+                protocol::Event::TextDone {
+                    text: "fresh".into(),
+                },
+            )
+            .unwrap();
+        let fresh_event = next_client_frame(&mut fresh).await;
+        assert!(matches!(
+            fresh_event,
+            ClientWorkerEventWsFrame::Event { envelope } if matches!(envelope.payload, protocol::Event::TextDone { .. })
+        ));
+
         let (mut resumed, _) = connect_async(format!("{url}?cursor={}", live.cursor))
             .await
             .unwrap();
@@ -7309,7 +7313,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_reports_unknown_backend_cursor_before_upstream_connect() {
+    async fn proxy_does_not_validate_backend_cursor_against_replay_history() {
         let source = RuntimeObservationSourceConfig {
             runtime_id: "runtime-a".into(),
             worker_id: "worker-a".into(),
@@ -7321,7 +7325,7 @@ mod tests {
             .await
             .unwrap();
         let diagnostic = next_client_diagnostic(&mut stream).await;
-        assert_eq!(diagnostic.code, "backend.cursor_unknown_or_expired");
+        assert_eq!(diagnostic.code, "backend.runtime_unavailable");
     }
 
     #[tokio::test]
