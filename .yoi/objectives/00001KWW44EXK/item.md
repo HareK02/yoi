@@ -2,8 +2,8 @@
 title: "Runtime working directory materialization and sandboxed agent environments"
 state: "active"
 created_at: "2026-07-06T16:28:12Z"
-updated_at: "2026-07-10T00:00:00Z"
-linked_tickets: ["00001KWPC13WQ", "00001KWMBAA6V"]
+updated_at: "2026-07-10T16:50:00Z"
+linked_tickets: ["00001KWPC13WQ", "00001KWMBAA6V", "00001KX6BPY7M", "00001KX6CRVBE"]
 ---
 
 ## Goal
@@ -35,7 +35,7 @@ Yoi は Workspace / Repository / Runtime を分ける方針になっている。
 - Runtime root: Runtime が自身の store、cache、Worker metadata、working directory allocation を管理する root。長期的には `~/.yoi/runtimes/<runtime-id>/` 配下など、Workspace backend store とは別に置く。
 - Repository cache: Runtime-local の共有 source/cache。Git なら bare mirror / object cache / packfile cache など。重く、長寿命で、複数 Worker allocation から共有される。
 - working directory: Worker ごとの作業環境。短寿命で、Worker が読み書きする root / mounts / scratch / overlay を含む。Browser-facing UI では `workspace` と混同しないよう `workdir` と表示してよい。`Volume` は storage backing の候補名であり、この作業領域そのものの呼称にはしない。
-- Worker archive: 作業単位として保存する Worker record。profile、Runtime、RepositoryPoint / workdir evidence、session/transcript refs、status、diagnostics、summary、retention policy を束ねる。Session 単体ではなく Worker archive を保存単位にする。
+- Worker record: 作業単位として保存する record。profile、Runtime、RepositoryPoint / workdir evidence、session/transcript refs、status、diagnostics、summary、pinned flag を束ねる。Session 単体ではなく Worker を保存・削除の単位にする。
 - Materialization strategy: RepositoryPoint から working directory を作る実装戦略。Git detached worktree、sparse checkout、CoW snapshot、reflink copy、overlay、container filesystem など。
 - WorkingDirectoryAllocation: Runtime が払い出した作業環境の record。allocation id、worker id、workspace id、repository point、materializer kind、root、mounts、cleanup policy、status を持つ。
 - Sandbox policy: Worker が見られる filesystem、network、process、secret、tool authority の境界を表す policy。
@@ -287,15 +287,19 @@ Rift の filtered CoW creation のように、重い artifacts を除外しな�
 - Runtime が複数 Workspace / Repository の Worker を同時に抱える場合の namespace、quota、cleanup、audit boundary を固める。
 - remote/self-hosted/hosted Runtime fleet で repository cache と working directory storage をどう扱うかを設計する。
 
-### 7. Worker / Session / workdir retention policy
+### 7. Worker / Session / workdir retention and cleanup policy
 
-- Worker を保存単位にする。Session / transcript は Worker archive に内包または参照される履歴として扱い、Session 単体を長期保存 authority にしない。
-- Worker archive には retention policy を持たせる。少なくとも `active` / `archived` / `pinned` / `prunable` 相当の状態を表現できること。`pinned` は必要であり、明示的に残す作業記録を cleanup / prune から守る。
-- Session / transcript は削除可能にする。Worker が retained/pinned なら full history を残せるが、Worker prune 時には session files を削除、または summary だけ残して full transcript を捨てられるようにする。
-- Workdir 実ファイルは durable history ではなく再現可能 cache として扱う。RepositoryPoint / resolved commit から再現でき、dirty/uncommitted state が無いなら、停止済み Worker に紐づく workdir files は cleanup eligible とする。
-- Workdir record は Runtime-owned materialization evidence として扱う。実ファイルが削除済みなら `removed`、実ファイルが外部要因で欠落しているなら stale/missing materialization として診断可能にする。
-- Workdir と Worker の関係は、Worker archive 側に workdir binding summary / RepositoryPoint / resolved commit を保存する。Workdir list で linked Workers を見せる場合は、まず Worker records から derived view を作る。
-- Prune は plan-first にする。削除前に対象、理由、削除される bytes、残る archive/summary、blocking conditions（running Worker、pinned Worker、dirty state、unreachable commit など）を提示する。
+- Worker を保存・削除単位にする。Session / transcript は Worker に内包または参照される履歴として扱い、Session 単体を長期保存 authority にしない。
+- Worker lifecycle は `running -> stopped -> delete` を基本にする。`archived` を lifecycle state として導入しない。
+- Worker には `pinned` flag を持たせる。Pinned Worker は manual delete / cleanup / future automatic prune から守られる。
+- Worker delete は Worker record と内包する Session / transcript history の削除を意味する。Workdir files は自動削除しない。
+- Session / transcript は削除可能にする。圧縮 archive storage や高度な summarized retention は必要になった時点で別の storage policy として設計する。
+- Workdir 実ファイルは durable history ではなく再現可能 cache として扱う。RepositoryPoint / resolved commit から再現でき、dirty/uncommitted state が無いなら、running Worker に紐づかない workdir files は manual cleanup eligible とする。
+- Dirty Workdir は活動中または要判断状態として扱う。削除は可能だが、changes ごと消す explicit confirmation を要求する。Dirty orphan は recovery Worker 起動または explicit discard の判断対象であり、通常の clean cleanup と区別する。
+- Workdir record は materialization evidence として扱う。実ファイルが削除済みなら `removed`、外部要因で欠落しているなら stale/missing materialization として診断可能にする。
+- Worker と Workdir の関係は Backend registry の link table を authority にする。Worker record は最後に活動した RepositoryPoint / resolved commit / workdir binding summary を保持し、Stopped Worker + Removed Workdir でも必要に応じて再 materialize できるようにする。
+- Cleanup/delete は当面 manual-first にする。削除前に対象、理由、削除される bytes、blocking conditions（running Worker、pinned Worker、dirty state、unreachable commit など）を plan として提示する。
+- 将来的には容量/期限ベースの automatic prune を設定可能にする予定。ただし automatic prune は user-configured policy と pinned protection を前提にし、初期の manual cleanup/delete とは別段階で扱う。
 - UI 表示は `workdir` に寄せる。内部型/API の互換名 `working_directory` は移行中に残ってよいが、Browser-facing navigation では Runtime 管理配下の `Workdirs` として扱う。
 
 ## Non-goals
@@ -319,8 +323,9 @@ Rift の filtered CoW creation のように、重い artifacts を除外しな�
 - Runtime process 起動時の `--workspace` は legacy bootstrap input として隔離され、Runtime identity や single workspace binding とみなされない。
 - Worker ごとの scope allocation conflict が、同一 source root を直接渡す設計ではなく materialized workspace allocation によって解消される。
 - Sandbox / mount / cache / secret boundary を後続実装で強化できる model になっている。
-- Worker archive が Session / transcript refs と retention policy を束ね、`pinned` Worker を prune から守れる。
-- Workdir 実ファイルは再現可能 cache として cleanup/prune でき、削除前に plan-first で linked Worker、session retention、commit reachability、dirty/missing 状態を確認できる。
+- Worker record が Session / transcript refs と pinned flag を束ね、`pinned` Worker を cleanup/delete/future automatic prune から守れる。
+- Workdir 実ファイルは再現可能 cache として manual cleanup/delete でき、削除前に plan-first で linked Worker、session retention、commit reachability、dirty/missing 状態を確認できる。
+- 将来的に容量/期限ベースの automatic prune を user-configured policy として追加できる設計余地がある。
 
 ## References
 
