@@ -101,3 +101,43 @@ Implementation focus:
 Dashboard queue authorization was inspected, no blockers were found, and an accepted plan was recorded. Moving queued Ticket to inprogress before creating implementation worktree or spawning Pods.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-10T22:31:16Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Coder Pod `yoi-coder-00001KX6Y2A9Q-worker-fs-authority` completed implementation in `/home/hare/Projects/yoi/.worktree/00001KX6Y2A9Q-worker-filesystem-authority` on branch `work/00001KX6Y2A9Q-worker-filesystem-authority`。
+- Implementation commit: `b50b94612a1185dc5bdc935d83d63f9d6ace826b feat: add explicit worker filesystem authority`。
+- Orchestrator inspected the worktree status, branch log, commit stats, `git diff --check db3a7165..HEAD`, and grep checks for `worker.cwd()` / Worker `fn cwd`; worktree was clean, diff check passed, and no matches were found。
+
+Coder-reported implementation summary:
+- Added explicit `WorkerFilesystemAuthority::{None, Local(LocalWorkingDirectory)}` boundary。
+- Removed Worker-level `cwd: PathBuf` and `worker.cwd()` accessor。
+- Local Workers carry authority `root` and `cwd` separately。
+- No-workdir embedded Worker spawn passes `WorkerFilesystemAuthority::None` explicitly instead of falling back to runtime/process cwd。
+- Controller tool registration branches on local filesystem authority:
+  - Local Workers register `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash` and get fs view/completions。
+  - No-workdir Workers do not construct/register filesystem or Bash tools。
+- Ticket / worker-spawn / peer-discovery cwd-dependent paths now require local filesystem authority instead of using workspace root as fallback。
+- Tests added/updated for no-workdir tool omission, no cwd fallback, and local/materialized Worker filesystem/Bash behavior。
+
+Coder-reported validation passed:
+- `cargo test -p worker --lib --tests`
+- `cargo test -p worker-runtime --features ws-server,fs-store`
+- `cargo test -p yoi-workspace-server --lib`
+- `cargo check -p yoi`
+- `git diff --check`
+- `cargo run -p yoi -- ticket doctor`
+- `nix build .#yoi --no-link`
+- `rg "worker\\.cwd\\(" crates || true`: no matches。
+- `rg "pub fn cwd\\(" crates/worker/src/worker.rs || true`: no Worker cwd accessor remains。
+
+Not run by Coder:
+- `cd web/workspace && deno task check && deno task test` because web/API/types were not touched。
+
+Next action:
+- Route to external Reviewer Pod before merge/close decisions。
+
+---
