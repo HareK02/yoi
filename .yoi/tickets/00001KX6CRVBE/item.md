@@ -1,8 +1,8 @@
 ---
 title: 'Add manual delete and cleanup operations for Workers and workdirs'
-state: 'queued'
+state: 'inprogress'
 created_at: '2026-07-10T16:11:33Z'
-updated_at: '2026-07-10T16:46:04Z'
+updated_at: '2026-07-10T17:39:03Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-07-10T16:45:14Z'

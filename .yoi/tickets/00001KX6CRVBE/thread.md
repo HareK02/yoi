@@ -108,3 +108,41 @@ Escalate if:
 - 人間が `00001KX6BPY7M` とこの Ticket を同一 combined worktree で統合実装する方針に切り替えたい場合。
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-07-10T17:39:00Z -->
+
+## Decision
+
+Routing decision: accept for implementation
+
+Reason:
+- Previously recorded prerequisite `00001KX6BPY7M` has now been reviewed, merged into orchestration branch, final-validated, closed, and its child implementation worktree/branch cleaned up。
+- `TicketRelationQuery(00001KX6CRVBE)` shows no typed blockers。
+- Queue contains this Ticket and there are no other `inprogress` Tickets。
+- Ticket is concrete and well scoped: manual Worker delete / Workdir cleanup plan and execution on top of Backend Worker/Workdir registry/link authority。
+
+Accepted plan:
+- Create dedicated implementation worktree `/home/hare/Projects/yoi/.worktree/00001KX6CRVBE-manual-cleanup` on branch `work/00001KX6CRVBE-manual-cleanup` from current orchestration branch。
+- Route implementation to sibling Coder Pod。
+- Route external review to sibling Reviewer Pod after Coder commit/validation。
+- Orchestrator retains merge, final validation, Ticket close, and cleanup authority。
+
+Design constraints for implementation:
+- Cleanup/delete is manual-first only; no automatic prune policy。
+- Worker lifecycle remains `running -> stopped -> delete`; do not introduce `archived` lifecycle state。
+- `pinned` Worker/history is protected in plan generation and execution。
+- Workdir file cleanup blocks when linked to running Workers。
+- Dirty Workdir discard is explicit and separate from ordinary clean cleanup。
+- Execution must reject stale plan revision/digest。
+- Browser-facing responses/UI must not expose raw Runtime paths。
+- Workdir/Worker canonical records should remain Backend/registry based and safe after execution。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-07-10T17:39:03Z from: queued to: inprogress reason: accepted_for_implementation field: state -->
+
+## State changed
+
+Prerequisite registry/link model is now closed and merged. Accepting queued manual cleanup Ticket for implementation before creating worktree or spawning role Pods.
+
+---
