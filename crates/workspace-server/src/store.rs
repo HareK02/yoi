@@ -118,6 +118,14 @@ pub trait ControlPlaneStore: Send + Sync {
         workspace_id: &str,
         limit: usize,
     ) -> Result<Vec<WorkerRegistryRecord>>;
+    fn update_worker_retention(
+        &self,
+        workspace_id: &str,
+        worker_id: &str,
+        retention_state: &str,
+        updated_at: &str,
+    ) -> Result<bool>;
+    fn delete_worker_registry(&self, workspace_id: &str, worker_id: &str) -> Result<bool>;
 
     fn upsert_workdir_registry(&self, record: &WorkdirRegistryRecord) -> Result<()>;
     fn get_workdir_registry(
@@ -135,12 +143,18 @@ pub trait ControlPlaneStore: Send + Sync {
         workspace_id: &str,
         limit: usize,
     ) -> Result<Vec<WorkdirRegistryRecord>>;
+    fn delete_workdir_registry(&self, workspace_id: &str, workdir_id: &str) -> Result<bool>;
 
     fn upsert_worker_workdir_link(&self, record: &WorkerWorkdirLinkRecord) -> Result<()>;
     fn list_worker_workdir_links(
         &self,
         workspace_id: &str,
         worker_id: &str,
+    ) -> Result<Vec<WorkerWorkdirLinkRecord>>;
+    fn list_workdir_worker_links(
+        &self,
+        workspace_id: &str,
+        workdir_id: &str,
     ) -> Result<Vec<WorkerWorkdirLinkRecord>>;
 }
 
@@ -325,6 +339,34 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn update_worker_retention(
+        &self,
+        workspace_id: &str,
+        worker_id: &str,
+        retention_state: &str,
+        updated_at: &str,
+    ) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                r#"UPDATE worker_registry
+                   SET retention_state = ?3, updated_at = ?4
+                   WHERE workspace_id = ?1 AND worker_id = ?2"#,
+                params![workspace_id, worker_id, retention_state, updated_at],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    fn delete_worker_registry(&self, workspace_id: &str, worker_id: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "DELETE FROM worker_registry WHERE workspace_id = ?1 AND worker_id = ?2",
+                params![workspace_id, worker_id],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
     fn upsert_workdir_registry(&self, record: &WorkdirRegistryRecord) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
@@ -410,6 +452,16 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn delete_workdir_registry(&self, workspace_id: &str, workdir_id: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "DELETE FROM workdir_registry WHERE workspace_id = ?1 AND workdir_id = ?2",
+                params![workspace_id, workdir_id],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
     fn upsert_worker_workdir_link(&self, record: &WorkerWorkdirLinkRecord) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
@@ -444,20 +496,48 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                    WHERE workspace_id = ?1 AND worker_id = ?2 AND unlinked_at IS NULL
                    ORDER BY linked_at DESC"#,
             )?;
-            let rows = stmt.query_map(params![workspace_id, worker_id], |row| {
-                Ok(WorkerWorkdirLinkRecord {
-                    workspace_id: row.get(0)?,
-                    worker_id: row.get(1)?,
-                    workdir_id: row.get(2)?,
-                    role: row.get(3)?,
-                    linked_at: row.get(4)?,
-                    unlinked_at: row.get(5)?,
-                })
-            })?;
+            let rows = stmt.query_map(
+                params![workspace_id, worker_id],
+                read_worker_workdir_link_record,
+            )?;
             rows.collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(Error::from)
         })
     }
+
+    fn list_workdir_worker_links(
+        &self,
+        workspace_id: &str,
+        workdir_id: &str,
+    ) -> Result<Vec<WorkerWorkdirLinkRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"SELECT workspace_id, worker_id, workdir_id, role, linked_at, unlinked_at
+                   FROM worker_workdir_links
+                   WHERE workspace_id = ?1 AND workdir_id = ?2 AND unlinked_at IS NULL
+                   ORDER BY linked_at DESC"#,
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id, workdir_id],
+                read_worker_workdir_link_record,
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        })
+    }
+}
+
+fn read_worker_workdir_link_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WorkerWorkdirLinkRecord> {
+    Ok(WorkerWorkdirLinkRecord {
+        workspace_id: row.get(0)?,
+        worker_id: row.get(1)?,
+        workdir_id: row.get(2)?,
+        role: row.get(3)?,
+        linked_at: row.get(4)?,
+        unlinked_at: row.get(5)?,
+    })
 }
 
 fn worker_registry_select_sql(where_clause: &str) -> String {

@@ -11,6 +11,8 @@ use axum::{Json, Router};
 use chrono::{SecondsFormat, Utc};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use tokio::net::TcpListener;
 use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
@@ -474,6 +476,18 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             get(scoped_get_runtime_worker),
         )
         .route(
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/pin",
+            put(scoped_pin_runtime_worker).delete(scoped_unpin_runtime_worker),
+        )
+        .route(
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/cleanup-plan",
+            get(scoped_runtime_cleanup_plan),
+        )
+        .route(
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/cleanup-executions",
+            post(scoped_execute_runtime_cleanup),
+        )
+        .route(
             "/api/runtimes/{runtime_id}/workers/{worker_id}/input",
             post(send_runtime_worker_input),
         )
@@ -573,6 +587,102 @@ pub struct RuntimeListResponse<T> {
     pub items: Vec<T>,
     pub source: String,
     pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupTargetKind {
+    WorkerDelete,
+    WorkdirCleanCleanup,
+    WorkdirDirtyDiscard,
+    WorkdirRecordDelete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CleanupWorkerCandidate {
+    pub target_id: String,
+    pub action: CleanupTargetKind,
+    pub worker_id: String,
+    pub runtime_worker_id: String,
+    pub runtime_id: String,
+    pub reason: String,
+    pub blocking_reason: Option<String>,
+    pub pinned: bool,
+    pub retention_state: String,
+    pub lifecycle_state: String,
+    pub linked_workdir_ids: Vec<String>,
+    pub running_linked: bool,
+    pub estimated_reclaim_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CleanupWorkdirCandidate {
+    pub target_id: String,
+    pub action: CleanupTargetKind,
+    pub workdir_id: String,
+    pub runtime_id: String,
+    pub repository_id: String,
+    pub reason: String,
+    pub blocking_reason: Option<String>,
+    pub linked_worker_ids: Vec<String>,
+    pub linked_running_worker_ids: Vec<String>,
+    pub running_linked: bool,
+    pub pinned_linked: bool,
+    pub file_status: String,
+    pub cleanliness: String,
+    pub estimated_reclaim_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeCleanupPlanResponse {
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub generated_at: String,
+    pub revision: String,
+    pub digest: String,
+    pub workers: Vec<CleanupWorkerCandidate>,
+    pub workdirs: Vec<CleanupWorkdirCandidate>,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecuteRuntimeCleanupRequest {
+    pub expected_plan_revision: String,
+    pub expected_plan_digest: String,
+    #[serde(default)]
+    pub worker_target_ids: Vec<String>,
+    #[serde(default)]
+    pub workdir_target_ids: Vec<String>,
+    #[serde(default)]
+    pub confirm_dirty_discard_target_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeCleanupExecutionResult {
+    pub target_id: String,
+    pub action: CleanupTargetKind,
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeCleanupExecutionResponse {
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub executed_at: String,
+    pub results: Vec<RuntimeCleanupExecutionResult>,
+    pub plan_after: RuntimeCleanupPlanResponse,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerRetentionResponse {
+    pub workspace_id: String,
+    pub runtime_id: String,
+    pub worker_id: String,
+    pub pinned: bool,
+    pub retention_state: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1378,6 +1488,26 @@ fn cleanup_working_directory_for_runtime(
     runtime_id: &str,
     working_directory_id: &str,
 ) -> ApiResult<Json<BrowserWorkingDirectoryDetailResponse>> {
+    if let Some(candidate) = build_runtime_cleanup_plan(&api, runtime_id)?
+        .workdirs
+        .into_iter()
+        .find(|candidate| candidate.workdir_id == working_directory_id)
+    {
+        if let Some(reason) = candidate.blocking_reason {
+            return Err(cleanup_api_error(
+                runtime_id,
+                "workspace_cleanup_workdir_blocked",
+                &reason,
+            ));
+        }
+        if candidate.action == CleanupTargetKind::WorkdirDirtyDiscard {
+            return Err(cleanup_api_error(
+                runtime_id,
+                "workspace_cleanup_dirty_confirmation_required",
+                "dirty Workdir discard requires the cleanup execution API with explicit confirmation",
+            ));
+        }
+    }
     let result = api
         .runtime
         .cleanup_working_directory(runtime_id, working_directory_id)
@@ -1409,6 +1539,394 @@ fn cleanup_working_directory_for_runtime(
         item: working_directory.summary,
         diagnostics: result.diagnostics,
     }))
+}
+
+async fn set_worker_retention(
+    api: WorkspaceApi,
+    runtime_id: String,
+    runtime_worker_id: String,
+    pinned: bool,
+) -> ApiResult<Json<WorkerRetentionResponse>> {
+    let worker_id = backend_worker_id(runtime_id.as_str(), runtime_worker_id.as_str());
+    if api
+        .store
+        .get_worker_registry(&api.config.workspace_id, worker_id.as_str())?
+        .is_none()
+    {
+        if let Ok(worker) = api
+            .runtime
+            .worker(runtime_id.as_str(), runtime_worker_id.as_str())
+        {
+            let _ = sync_worker_observation(&api, &worker);
+        }
+    }
+    let retention_state = if pinned { "pinned" } else { "normal" };
+    let changed = api.store.update_worker_retention(
+        &api.config.workspace_id,
+        worker_id.as_str(),
+        retention_state,
+        now_registry_timestamp().as_str(),
+    )?;
+    if !changed {
+        return Err(cleanup_api_error(
+            runtime_id.as_str(),
+            "workspace_worker_retention_unknown_worker",
+            "Worker is not known to the Backend registry",
+        ));
+    }
+    Ok(Json(WorkerRetentionResponse {
+        workspace_id: api.config.workspace_id,
+        runtime_id,
+        worker_id: runtime_worker_id,
+        pinned,
+        retention_state: retention_state.to_string(),
+    }))
+}
+
+fn build_runtime_cleanup_plan(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+) -> ApiResult<RuntimeCleanupPlanResponse> {
+    let _ = workers_response(api.clone());
+    let (workdir_summaries, mut diagnostics) =
+        match runtime_working_directory_summaries(api, runtime_id) {
+            Ok(result) => result,
+            Err(error) => {
+                let mut diagnostics = error.diagnostics;
+                if diagnostics.is_empty() {
+                    diagnostics.push(RuntimeDiagnostic {
+                        code: "workspace_cleanup_runtime_observation_unavailable".to_string(),
+                        severity: DiagnosticSeverity::Warning,
+                        message: sanitize_backend_error(&error.error.to_string()),
+                    });
+                }
+                (Vec::new(), diagnostics)
+            }
+        };
+    let workdir_records = api
+        .store
+        .list_workdir_registry(&api.config.workspace_id, 500)?;
+    let worker_records = api
+        .store
+        .list_worker_registry(&api.config.workspace_id, 500)?;
+    let worker_by_id: HashMap<_, _> = worker_records
+        .iter()
+        .map(|record| (record.worker_id.clone(), record.clone()))
+        .collect();
+    let observed_workdirs: HashMap<_, _> = workdir_summaries
+        .into_iter()
+        .map(|summary| (summary.working_directory_id.clone(), summary))
+        .collect();
+
+    let mut worker_candidates = Vec::new();
+    for record in worker_records
+        .iter()
+        .filter(|record| record.runtime_id == runtime_id)
+    {
+        let links = api
+            .store
+            .list_worker_workdir_links(&api.config.workspace_id, record.worker_id.as_str())?;
+        let is_running = record.lifecycle_state == "running";
+        let pinned = record.retention_state == "pinned";
+        let blocking_reason = if pinned {
+            Some("worker is pinned".to_string())
+        } else if is_running {
+            Some("worker is running".to_string())
+        } else {
+            None
+        };
+        worker_candidates.push(CleanupWorkerCandidate {
+            target_id: format!("worker:{}", record.worker_id),
+            action: CleanupTargetKind::WorkerDelete,
+            worker_id: record.worker_id.clone(),
+            runtime_worker_id: record.runtime_worker_id.clone(),
+            runtime_id: record.runtime_id.clone(),
+            reason: if blocking_reason.is_some() {
+                "Worker registry row cannot be deleted until blocking conditions are cleared"
+                    .to_string()
+            } else {
+                "Stopped or unobserved Worker registry row can be manually deleted".to_string()
+            },
+            blocking_reason,
+            pinned,
+            retention_state: record.retention_state.clone(),
+            lifecycle_state: record.lifecycle_state.clone(),
+            linked_workdir_ids: links.iter().map(|link| link.workdir_id.clone()).collect(),
+            running_linked: is_running,
+            estimated_reclaim_bytes: None,
+        });
+    }
+
+    let mut workdir_candidates = Vec::new();
+    for record in workdir_records
+        .iter()
+        .filter(|record| record.runtime_id == runtime_id)
+    {
+        let links = api
+            .store
+            .list_workdir_worker_links(&api.config.workspace_id, record.workdir_id.as_str())?;
+        let linked_workers = links
+            .iter()
+            .filter_map(|link| worker_by_id.get(link.worker_id.as_str()))
+            .collect::<Vec<_>>();
+        let linked_worker_ids = links
+            .iter()
+            .map(|link| link.worker_id.clone())
+            .collect::<Vec<_>>();
+        let linked_running_worker_ids = linked_workers
+            .iter()
+            .filter(|worker| worker.lifecycle_state == "running")
+            .map(|worker| worker.worker_id.clone())
+            .collect::<Vec<_>>();
+        let pinned_linked = linked_workers
+            .iter()
+            .any(|worker| worker.retention_state == "pinned");
+        let running_linked = !linked_running_worker_ids.is_empty();
+        let observed_status = observed_workdirs
+            .get(record.workdir_id.as_str())
+            .map(|summary| format!("{:?}", summary.status).to_lowercase());
+        let file_status = observed_status.unwrap_or_else(|| record.materialization_status.clone());
+        let cleanliness = record.cleanliness.clone();
+        let action = if matches!(file_status.as_str(), "removed" | "missing") {
+            CleanupTargetKind::WorkdirRecordDelete
+        } else if cleanliness == "dirty" {
+            CleanupTargetKind::WorkdirDirtyDiscard
+        } else {
+            CleanupTargetKind::WorkdirCleanCleanup
+        };
+        let blocking_reason = if running_linked {
+            Some("workdir is linked to a running Worker".to_string())
+        } else if pinned_linked {
+            Some("workdir is linked to a pinned Worker/history".to_string())
+        } else {
+            None
+        };
+        workdir_candidates.push(CleanupWorkdirCandidate {
+            target_id: format!("workdir:{}", record.workdir_id),
+            action,
+            workdir_id: record.workdir_id.clone(),
+            runtime_id: record.runtime_id.clone(),
+            repository_id: record.repository_id.clone(),
+            reason: if blocking_reason.is_some() {
+                "Workdir cleanup is blocked until linked Worker state is safe".to_string()
+            } else if matches!(file_status.as_str(), "removed" | "missing") {
+                "Removed or missing Workdir record can be deleted from the Backend registry"
+                    .to_string()
+            } else if cleanliness == "dirty" {
+                "Dirty Workdir requires explicit discard confirmation before cleanup".to_string()
+            } else {
+                "Clean Workdir can be manually cleaned up".to_string()
+            },
+            blocking_reason,
+            linked_worker_ids,
+            linked_running_worker_ids,
+            running_linked,
+            pinned_linked,
+            file_status,
+            cleanliness,
+            estimated_reclaim_bytes: None,
+        });
+    }
+    diagnostics.truncate(16);
+    let generated_at = now_registry_timestamp();
+    let digest = cleanup_plan_digest(&worker_candidates, &workdir_candidates)?;
+    Ok(RuntimeCleanupPlanResponse {
+        workspace_id: api.config.workspace_id.clone(),
+        runtime_id: runtime_id.to_string(),
+        generated_at,
+        revision: digest.clone(),
+        digest,
+        workers: worker_candidates,
+        workdirs: workdir_candidates,
+        diagnostics,
+    })
+}
+
+fn cleanup_plan_digest(
+    workers: &[CleanupWorkerCandidate],
+    workdirs: &[CleanupWorkdirCandidate],
+) -> ApiResult<String> {
+    let bytes = serde_json::to_vec(&(workers, workdirs)).map_err(|error| {
+        cleanup_api_error(
+            "backend",
+            "workspace_cleanup_plan_digest_failed",
+            &format!("failed to serialize cleanup plan: {error}"),
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let bytes = hasher.finalize();
+    let digest = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("sha256:{digest}"))
+}
+
+fn execute_runtime_cleanup(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    request: ExecuteRuntimeCleanupRequest,
+) -> ApiResult<RuntimeCleanupExecutionResponse> {
+    let plan = build_runtime_cleanup_plan(api, runtime_id)?;
+    if request.expected_plan_revision != plan.revision
+        || request.expected_plan_digest != plan.digest
+    {
+        return Err(cleanup_api_error(
+            runtime_id,
+            "workspace_cleanup_plan_stale",
+            "cleanup plan revision/digest is stale; refresh the preview before executing",
+        ));
+    }
+    let worker_targets: HashSet<_> = request.worker_target_ids.iter().cloned().collect();
+    let workdir_targets: HashSet<_> = request.workdir_target_ids.iter().cloned().collect();
+    let dirty_confirmations: HashSet<_> = request
+        .confirm_dirty_discard_target_ids
+        .iter()
+        .cloned()
+        .collect();
+    let mut results = Vec::new();
+
+    for candidate in plan
+        .workers
+        .iter()
+        .filter(|candidate| worker_targets.contains(candidate.target_id.as_str()))
+    {
+        if let Some(reason) = &candidate.blocking_reason {
+            return Err(cleanup_api_error(
+                runtime_id,
+                "workspace_cleanup_worker_blocked",
+                reason,
+            ));
+        }
+        if candidate.pinned {
+            return Err(cleanup_api_error(
+                runtime_id,
+                "workspace_cleanup_worker_pinned",
+                "pinned Worker/history cannot be deleted",
+            ));
+        }
+        api.store
+            .delete_worker_registry(&api.config.workspace_id, candidate.worker_id.as_str())?;
+        results.push(RuntimeCleanupExecutionResult {
+            target_id: candidate.target_id.clone(),
+            action: candidate.action.clone(),
+            status: "deleted".to_string(),
+            message: "Worker registry row deleted; Runtime process state was not touched"
+                .to_string(),
+        });
+    }
+
+    for candidate in plan
+        .workdirs
+        .iter()
+        .filter(|candidate| workdir_targets.contains(candidate.target_id.as_str()))
+    {
+        if let Some(reason) = &candidate.blocking_reason {
+            return Err(cleanup_api_error(
+                runtime_id,
+                "workspace_cleanup_workdir_blocked",
+                reason,
+            ));
+        }
+        match candidate.action {
+            CleanupTargetKind::WorkdirDirtyDiscard => {
+                if !dirty_confirmations.contains(candidate.target_id.as_str()) {
+                    return Err(cleanup_api_error(
+                        runtime_id,
+                        "workspace_cleanup_dirty_confirmation_required",
+                        "dirty Workdir discard requires explicit confirmation",
+                    ));
+                }
+                cleanup_runtime_workdir_for_execution(api, runtime_id, candidate)?;
+                results.push(RuntimeCleanupExecutionResult {
+                    target_id: candidate.target_id.clone(),
+                    action: candidate.action.clone(),
+                    status: "discarded".to_string(),
+                    message:
+                        "Dirty Workdir cleanup/discard was executed after explicit confirmation"
+                            .to_string(),
+                });
+            }
+            CleanupTargetKind::WorkdirCleanCleanup => {
+                cleanup_runtime_workdir_for_execution(api, runtime_id, candidate)?;
+                results.push(RuntimeCleanupExecutionResult {
+                    target_id: candidate.target_id.clone(),
+                    action: candidate.action.clone(),
+                    status: "cleaned".to_string(),
+                    message: "Clean Workdir cleanup was executed".to_string(),
+                });
+            }
+            CleanupTargetKind::WorkdirRecordDelete => {
+                api.store.delete_workdir_registry(
+                    &api.config.workspace_id,
+                    candidate.workdir_id.as_str(),
+                )?;
+                results.push(RuntimeCleanupExecutionResult {
+                    target_id: candidate.target_id.clone(),
+                    action: candidate.action.clone(),
+                    status: "deleted".to_string(),
+                    message: "Removed/missing Workdir registry row deleted".to_string(),
+                });
+            }
+            CleanupTargetKind::WorkerDelete => {
+                return Err(cleanup_api_error(
+                    runtime_id,
+                    "workspace_cleanup_invalid_target_kind",
+                    "worker delete action cannot be executed as a Workdir target",
+                ));
+            }
+        }
+    }
+
+    let plan_after = build_runtime_cleanup_plan(api, runtime_id)?;
+    let executed_at = now_registry_timestamp();
+    Ok(RuntimeCleanupExecutionResponse {
+        workspace_id: api.config.workspace_id.clone(),
+        runtime_id: runtime_id.to_string(),
+        executed_at,
+        results,
+        diagnostics: plan_after.diagnostics.clone(),
+        plan_after,
+    })
+}
+
+fn cleanup_runtime_workdir_for_execution(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    candidate: &CleanupWorkdirCandidate,
+) -> ApiResult<()> {
+    let result = api
+        .runtime
+        .cleanup_working_directory(runtime_id, candidate.workdir_id.as_str())
+        .map_err(|err| err.into_error())?;
+    let Some(working_directory) = result.working_directory else {
+        return Err(ApiError::with_diagnostics(
+            Error::RuntimeOperationFailed {
+                runtime_id: runtime_id.to_string(),
+                code: "workspace_cleanup_workdir_runtime_failed".to_string(),
+                message: "Runtime did not cleanup selected Workdir".to_string(),
+            },
+            result.diagnostics,
+        ));
+    };
+    let record = workdir_record_from_summary(
+        api,
+        runtime_id,
+        &working_directory.summary,
+        "backend_managed",
+    );
+    api.store.upsert_workdir_registry(&record)?;
+    Ok(())
+}
+
+fn cleanup_api_error(runtime_id: &str, code: &str, message: &str) -> ApiError {
+    Error::RuntimeOperationFailed {
+        runtime_id: runtime_id.to_string(),
+        code: code.to_string(),
+        message: message.to_string(),
+    }
+    .into()
 }
 
 async fn scoped_get_runtime_connection_settings(
@@ -1517,6 +2035,41 @@ async fn scoped_get_runtime_worker(
 ) -> ApiResult<Json<WorkerSummary>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     get_runtime_worker(State(api), AxumPath((path.runtime_id, path.worker_id))).await
+}
+
+async fn scoped_pin_runtime_worker(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
+) -> ApiResult<Json<WorkerRetentionResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    set_worker_retention(api, path.runtime_id, path.worker_id, true).await
+}
+
+async fn scoped_unpin_runtime_worker(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
+) -> ApiResult<Json<WorkerRetentionResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    set_worker_retention(api, path.runtime_id, path.worker_id, false).await
+}
+
+async fn scoped_runtime_cleanup_plan(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimePath>,
+) -> ApiResult<Json<RuntimeCleanupPlanResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let plan = build_runtime_cleanup_plan(&api, path.runtime_id.as_str())?;
+    Ok(Json(plan))
+}
+
+async fn scoped_execute_runtime_cleanup(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimePath>,
+    Json(request): Json<ExecuteRuntimeCleanupRequest>,
+) -> ApiResult<Json<RuntimeCleanupExecutionResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let response = execute_runtime_cleanup(&api, path.runtime_id.as_str(), request)?;
+    Ok(Json(response))
 }
 
 async fn scoped_send_runtime_worker_input(
@@ -2246,7 +2799,19 @@ async fn get_runtime_worker(
         .runtime
         .worker(&runtime_id, &worker_id)
         .map_err(|err| err.into_error())?;
-    Ok(Json(worker))
+    let record = sync_worker_observation(&api, &worker)?;
+    let links = api
+        .store
+        .list_worker_workdir_links(&api.config.workspace_id, record.worker_id.as_str())?;
+    let workdirs = api
+        .store
+        .list_workdir_registry(&api.config.workspace_id, 500)?;
+    Ok(Json(merge_worker_registry_projection(
+        Some(&worker),
+        &record,
+        links,
+        &workdirs,
+    )))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3370,6 +3935,9 @@ fn record_worker_summary(
 ) -> ApiResult<WorkerRegistryRecord> {
     let timestamp = now_registry_timestamp();
     let worker_id = backend_worker_id(worker.runtime_id.as_str(), worker.worker_id.as_str());
+    let existing = api
+        .store
+        .get_worker_registry(&api.config.workspace_id, worker_id.as_str())?;
     let record = WorkerRegistryRecord {
         workspace_id: api.config.workspace_id.clone(),
         worker_id: worker_id.clone(),
@@ -3378,7 +3946,10 @@ fn record_worker_summary(
         display_name: display_name.to_string(),
         profile,
         lifecycle_state: worker.status.clone(),
-        retention_state: "normal".to_string(),
+        retention_state: existing
+            .as_ref()
+            .map(|record| record.retention_state.clone())
+            .unwrap_or_else(|| "normal".to_string()),
         transcript_ref: Some(format!(
             "runtime://{}/workers/{}/transcript",
             worker.runtime_id.as_str(),
@@ -3407,6 +3978,8 @@ fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> WorkerSummary 
         status: record.lifecycle_state.clone(),
         state: record.lifecycle_state.clone(),
         last_seen_at: Some(record.updated_at.clone()),
+        pinned: record.retention_state == "pinned",
+        retention_state: record.retention_state.clone(),
         capabilities: WorkerCapabilitySummary {
             can_accept_input: false,
             can_stop: false,
@@ -3445,6 +4018,8 @@ fn merge_worker_registry_projection(
     summary.status = record.lifecycle_state.clone();
     summary.state = record.lifecycle_state.clone();
     summary.profile = record.profile.clone();
+    summary.pinned = record.retention_state == "pinned";
+    summary.retention_state = record.retention_state.clone();
     summary.working_directory = links.iter().find_map(|link| {
         workdirs
             .iter()
@@ -4160,7 +4735,11 @@ impl IntoResponse for ApiError {
             Error::RuntimeOperationFailed { code, .. }
                 if code == "profile_registry_revision_conflict"
                     || code == "profile_source_revision_conflict"
-                    || code == "workspace_metadata_revision_conflict" =>
+                    || code == "workspace_metadata_revision_conflict"
+                    || code == "workspace_cleanup_plan_stale"
+                    || code == "workspace_cleanup_worker_blocked"
+                    || code == "workspace_cleanup_workdir_blocked"
+                    || code == "workspace_cleanup_worker_pinned" =>
             {
                 StatusCode::CONFLICT
             }
@@ -4182,6 +4761,7 @@ impl IntoResponse for ApiError {
                     || code.starts_with("invalid_")
                     || code.starts_with("unsupported_worker_profile")
                     || code.starts_with("working_directory_")
+                    || code.starts_with("workspace_cleanup_")
                     || code.ends_with("_already_exists")
                     || code.ends_with("_not_config_managed")
                     || code.ends_with("_unsupported") =>
@@ -4822,6 +5402,198 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    fn seed_cleanup_worker(
+        api: &WorkspaceApi,
+        runtime_worker_id: &str,
+        lifecycle_state: &str,
+        retention_state: &str,
+    ) -> String {
+        let worker_id = backend_worker_id("runtime-test", runtime_worker_id);
+        let now = now_registry_timestamp();
+        api.store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: api.config.workspace_id.clone(),
+                worker_id: worker_id.clone(),
+                runtime_id: "runtime-test".to_string(),
+                runtime_worker_id: runtime_worker_id.to_string(),
+                display_name: runtime_worker_id.to_string(),
+                profile: None,
+                lifecycle_state: lifecycle_state.to_string(),
+                retention_state: retention_state.to_string(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .unwrap();
+        worker_id
+    }
+
+    fn seed_cleanup_workdir(api: &WorkspaceApi, workdir_id: &str, status: &str, cleanliness: &str) {
+        let now = now_registry_timestamp();
+        api.store
+            .upsert_workdir_registry(&WorkdirRegistryRecord {
+                workspace_id: api.config.workspace_id.clone(),
+                workdir_id: workdir_id.to_string(),
+                runtime_id: "runtime-test".to_string(),
+                repository_id: "repo-test".to_string(),
+                management_kind: "backend_managed".to_string(),
+                selector: Some("HEAD".to_string()),
+                resolved_commit: None,
+                materialization_status: status.to_string(),
+                cleanliness: cleanliness.to_string(),
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .unwrap();
+    }
+
+    fn seed_cleanup_link(api: &WorkspaceApi, worker_id: &str, workdir_id: &str) {
+        api.store
+            .upsert_worker_workdir_link(&WorkerWorkdirLinkRecord {
+                workspace_id: api.config.workspace_id.clone(),
+                worker_id: worker_id.to_string(),
+                workdir_id: workdir_id.to_string(),
+                role: "primary".to_string(),
+                linked_at: now_registry_timestamp(),
+                unlinked_at: None,
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_plan_reports_pinned_running_dirty_removed_and_redacts_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let pinned = seed_cleanup_worker(&api, "worker-pinned", "stopped", "pinned");
+        let running = seed_cleanup_worker(&api, "worker-running", "running", "normal");
+        seed_cleanup_workdir(&api, "workdir-dirty", "present", "dirty");
+        seed_cleanup_workdir(&api, "workdir-removed", "removed", "clean");
+        seed_cleanup_link(&api, pinned.as_str(), "workdir-dirty");
+        seed_cleanup_link(&api, running.as_str(), "workdir-removed");
+
+        let plan = build_runtime_cleanup_plan(&api, "runtime-test")
+            .unwrap_or_else(|err| panic!("cleanup plan: {}", err.error));
+        let pinned_worker = plan
+            .workers
+            .iter()
+            .find(|candidate| candidate.worker_id == pinned)
+            .unwrap();
+        assert!(pinned_worker.pinned);
+        assert_eq!(
+            pinned_worker.blocking_reason.as_deref(),
+            Some("worker is pinned")
+        );
+        let running_linked_workdir = plan
+            .workdirs
+            .iter()
+            .find(|candidate| candidate.workdir_id == "workdir-removed")
+            .unwrap();
+        assert_eq!(
+            running_linked_workdir.action,
+            CleanupTargetKind::WorkdirRecordDelete
+        );
+        assert!(running_linked_workdir.running_linked);
+        assert_eq!(
+            running_linked_workdir.blocking_reason.as_deref(),
+            Some("workdir is linked to a running Worker")
+        );
+        let dirty_workdir = plan
+            .workdirs
+            .iter()
+            .find(|candidate| candidate.workdir_id == "workdir-dirty")
+            .unwrap();
+        assert_eq!(dirty_workdir.action, CleanupTargetKind::WorkdirDirtyDiscard);
+        assert!(dirty_workdir.pinned_linked);
+        let serialized = serde_json::to_string(&plan).unwrap();
+        assert!(!serialized.contains("/tmp/secret-runtime-path"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_execution_rejects_stale_plan_and_pinned_worker_delete() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let worker = seed_cleanup_worker(&api, "worker-pinned", "stopped", "pinned");
+        let plan = build_runtime_cleanup_plan(&api, "runtime-test")
+            .unwrap_or_else(|err| panic!("cleanup plan: {}", err.error));
+        let target = plan
+            .workers
+            .iter()
+            .find(|candidate| candidate.worker_id == worker)
+            .unwrap()
+            .target_id
+            .clone();
+        let stale = ExecuteRuntimeCleanupRequest {
+            expected_plan_revision: "stale".to_string(),
+            expected_plan_digest: plan.digest.clone(),
+            worker_target_ids: vec![target.clone()],
+            workdir_target_ids: Vec::new(),
+            confirm_dirty_discard_target_ids: Vec::new(),
+        };
+        assert!(execute_runtime_cleanup(&api, "runtime-test", stale).is_err());
+        let pinned = ExecuteRuntimeCleanupRequest {
+            expected_plan_revision: plan.revision,
+            expected_plan_digest: plan.digest,
+            worker_target_ids: vec![target],
+            workdir_target_ids: Vec::new(),
+            confirm_dirty_discard_target_ids: Vec::new(),
+        };
+        assert!(execute_runtime_cleanup(&api, "runtime-test", pinned).is_err());
+    }
+
+    #[tokio::test]
+    async fn cleanup_execution_requires_dirty_confirmation_and_deletes_removed_record() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        seed_cleanup_workdir(&api, "workdir-dirty", "present", "dirty");
+        seed_cleanup_workdir(&api, "workdir-removed", "removed", "clean");
+        let plan = build_runtime_cleanup_plan(&api, "runtime-test")
+            .unwrap_or_else(|err| panic!("cleanup plan: {}", err.error));
+        let dirty_target = plan
+            .workdirs
+            .iter()
+            .find(|candidate| candidate.workdir_id == "workdir-dirty")
+            .unwrap()
+            .target_id
+            .clone();
+        let removed_target = plan
+            .workdirs
+            .iter()
+            .find(|candidate| candidate.workdir_id == "workdir-removed")
+            .unwrap()
+            .target_id
+            .clone();
+        let missing_confirmation = ExecuteRuntimeCleanupRequest {
+            expected_plan_revision: plan.revision.clone(),
+            expected_plan_digest: plan.digest.clone(),
+            worker_target_ids: Vec::new(),
+            workdir_target_ids: vec![dirty_target],
+            confirm_dirty_discard_target_ids: Vec::new(),
+        };
+        assert!(execute_runtime_cleanup(&api, "runtime-test", missing_confirmation).is_err());
+        let delete_removed = ExecuteRuntimeCleanupRequest {
+            expected_plan_revision: plan.revision,
+            expected_plan_digest: plan.digest,
+            worker_target_ids: Vec::new(),
+            workdir_target_ids: vec![removed_target],
+            confirm_dirty_discard_target_ids: Vec::new(),
+        };
+        let response = execute_runtime_cleanup(&api, "runtime-test", delete_removed)
+            .unwrap_or_else(|err| panic!("cleanup execution: {}", err.error));
+        assert_eq!(response.results[0].status, "deleted");
+        assert!(
+            api.store
+                .get_workdir_registry(&api.config.workspace_id, "workdir-removed")
+                .unwrap()
+                .is_none()
+        );
     }
 
     async fn test_app(workspace_root: impl Into<PathBuf>) -> Router {

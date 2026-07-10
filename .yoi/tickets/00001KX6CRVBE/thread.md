@@ -146,3 +146,27 @@ Design constraints for implementation:
 Prerequisite registry/link model is now closed and merged. Accepting queued manual cleanup Ticket for implementation before creating worktree or spawning role Pods.
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-10T18:12:28Z -->
+
+## Implementation report
+
+Implemented manual Worker/Workdir cleanup and retention for Ticket 00001KX6CRVBE.
+
+Summary:
+- Added Backend Worker retention pin/unpin store APIs and scoped Browser API endpoints.
+- Added manual Runtime cleanup plan and execution APIs with plan digest/revision checks, pinned/running/dirty safeguards, removed/missing record deletion, and Browser-safe DTOs that do not expose raw materialized paths.
+- Added Browser Workdirs cleanup preview/execution UI and Worker retention controls.
+- Added focused workspace-server tests covering plan generation, stale rejection, pinned protection, running-link block, dirty confirmation, removed record deletion, and raw path redaction.
+
+Validation:
+- git diff --check
+- cargo test -p yoi-workspace-server --lib
+- cargo test -p worker-runtime --features ws-server,fs-store
+- cargo check -p yoi
+- cd web/workspace && deno task check && deno task test
+- yoi ticket doctor
+- nix build .#yoi --no-link
+
+
+---

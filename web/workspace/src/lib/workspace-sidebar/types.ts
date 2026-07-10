@@ -85,6 +85,8 @@ export type Worker = {
   workspace: { visibility: string; identity: string };
   state: string;
   status: string;
+  pinned?: boolean;
+  retention_state?: string;
   last_seen_at?: string | null;
   implementation: { kind: string; display_hint: string };
   capabilities: WorkerCapabilities;
@@ -142,6 +144,70 @@ export type BrowserWorkingDirectoryCreateResponse = {
 export type BrowserWorkingDirectoryListResponse = {
   workspace_id: string;
   items: WorkingDirectorySummary[];
+  diagnostics: Diagnostic[];
+};
+
+export type CleanupTargetKind =
+  | "worker_delete"
+  | "workdir_clean_cleanup"
+  | "workdir_dirty_discard"
+  | "workdir_record_delete";
+
+export type CleanupWorkerCandidate = {
+  target_id: string;
+  action: CleanupTargetKind;
+  worker_id: string;
+  runtime_worker_id: string;
+  runtime_id: string;
+  reason: string;
+  blocking_reason?: string | null;
+  pinned: boolean;
+  retention_state: string;
+  lifecycle_state: string;
+  linked_workdir_ids: string[];
+  running_linked: boolean;
+  estimated_reclaim_bytes?: number | null;
+};
+
+export type CleanupWorkdirCandidate = {
+  target_id: string;
+  action: CleanupTargetKind;
+  workdir_id: string;
+  runtime_id: string;
+  repository_id: string;
+  reason: string;
+  blocking_reason?: string | null;
+  linked_worker_ids: string[];
+  linked_running_worker_ids: string[];
+  running_linked: boolean;
+  pinned_linked: boolean;
+  file_status: string;
+  cleanliness: string;
+  estimated_reclaim_bytes?: number | null;
+};
+
+export type RuntimeCleanupPlanResponse = {
+  workspace_id: string;
+  runtime_id: string;
+  generated_at: string;
+  revision: string;
+  digest: string;
+  workers: CleanupWorkerCandidate[];
+  workdirs: CleanupWorkdirCandidate[];
+  diagnostics: Diagnostic[];
+};
+
+export type RuntimeCleanupExecutionResponse = {
+  workspace_id: string;
+  runtime_id: string;
+  executed_at: string;
+  results: {
+    target_id: string;
+    action: CleanupTargetKind;
+    status: string;
+    message: string;
+  }[];
+  plan_after: RuntimeCleanupPlanResponse;
   diagnostics: Diagnostic[];
 };
 
