@@ -125,6 +125,11 @@ pub trait ControlPlaneStore: Send + Sync {
         workspace_id: &str,
         workdir_id: &str,
     ) -> Result<Option<WorkdirRegistryRecord>>;
+    fn list_workdir_registry(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkdirRegistryRecord>>;
     fn list_managed_workdir_registry(
         &self,
         workspace_id: &str,
@@ -234,7 +239,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     display_name = excluded.display_name,
                     profile = excluded.profile,
                     lifecycle_state = excluded.lifecycle_state,
-                    retention_state = excluded.retention_state,
+                    retention_state = CASE
+                        WHEN worker_registry.retention_state = 'pinned' AND excluded.retention_state = 'normal'
+                        THEN worker_registry.retention_state
+                        ELSE excluded.retention_state
+                    END,
                     transcript_ref = excluded.transcript_ref,
                     session_ref = excluded.session_ref,
                     summary_ref = excluded.summary_ref,
@@ -363,6 +372,25 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )
             .optional()
             .map_err(Error::from)
+        })
+    }
+
+    fn list_workdir_registry(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkdirRegistryRecord>> {
+        self.with_conn(|conn| {
+            let sql = workdir_registry_select_sql(
+                "WHERE workspace_id = ?1 ORDER BY updated_at DESC LIMIT ?2",
+            );
+            let mut stmt = conn.prepare(sql.as_str())?;
+            let rows = stmt.query_map(
+                params![workspace_id, limit as i64],
+                read_workdir_registry_record,
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
         })
     }
 
@@ -1221,6 +1249,14 @@ mod tests {
             updated_at: "2".to_string(),
         };
         store.upsert_worker_registry(&worker).unwrap();
+        let mut runtime_sync_worker = worker.clone();
+        runtime_sync_worker.lifecycle_state = "running".to_string();
+        runtime_sync_worker.retention_state = "normal".to_string();
+        runtime_sync_worker.updated_at = "5".to_string();
+        store.upsert_worker_registry(&runtime_sync_worker).unwrap();
+        let mut expected_worker = worker.clone();
+        expected_worker.lifecycle_state = "running".to_string();
+        expected_worker.updated_at = "5".to_string();
 
         let workdir = WorkdirRegistryRecord {
             workspace_id: "local-dev".to_string(),
@@ -1251,7 +1287,7 @@ mod tests {
             store
                 .get_worker_registry_by_runtime("local-dev", "embedded", "browser-1")
                 .unwrap(),
-            Some(worker.clone())
+            Some(expected_worker.clone())
         );
         assert_eq!(
             store

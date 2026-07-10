@@ -162,6 +162,10 @@ pub struct WorkingDirectorySummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanup_policy: Option<String>,
     pub status: WorkingDirectoryStatusKind,
+    /// Backend projection metadata. Runtimes leave this absent; Workspace Browser
+    /// APIs fill it with `backend_managed` or `runtime_unmanaged`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub management_kind: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

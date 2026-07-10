@@ -51,6 +51,7 @@ impl WorkingDirectory {
             cleanup_target: Some(self.cleanup_target.clone()),
             cleanup_policy: Some(self.cleanup_policy.clone()),
             status: self.status.clone(),
+            management_kind: None,
         }
     }
 }

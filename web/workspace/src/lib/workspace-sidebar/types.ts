@@ -124,6 +124,7 @@ export type WorkingDirectorySummary = {
   resolved_commit: string;
   resolved_tree?: string | null;
   status: string;
+  management_kind?: "backend_managed" | "runtime_unmanaged" | string | null;
   cleanup_policy: string;
   cleanup_target: {
     kind: string;

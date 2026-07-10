@@ -170,3 +170,29 @@ Validation run:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-10T17:12:46Z -->
+
+## Implementation report
+
+Follow-up fix for external review blockers.
+
+Fix summary:
+- Browser Worker list now projects from Backend worker_registry rows after Runtime observation sync, preserving Backend-only stopped/archive rows and using worker_workdir_links as Workdir relationship authority.
+- Runtime-scoped Worker spawn now writes pending Backend-managed Workdir registry rows, records spawned Workers, and links Workers to materialized or selected Workdirs.
+- Worker stop now updates Backend Worker lifecycle and syncs linked Workdir records to present/removed/missing without deleting canonical rows.
+- Runtime Workdir listing now syncs Runtime observations into Backend registry and projects typed management_kind (`backend_managed` / `runtime_unmanaged`) instead of returning raw Runtime summaries directly.
+- Existing `pinned` Worker retention is preserved when Runtime observation/upsert sync supplies ordinary `normal` retention.
+- Strengthened tests for archive/link projection, unmanaged Workdir projection, raw path redaction, removed Workdir preservation, and pinned retention preservation.
+
+Validation run:
+- git diff --check
+- cargo test -p yoi-workspace-server --lib
+- cargo test -p worker-runtime --features ws-server,fs-store
+- cargo check -p yoi
+- cd web/workspace && deno task check && deno task test
+- yoi ticket doctor
+- nix build .#yoi --no-link
+
+
+---
