@@ -1144,7 +1144,7 @@ fn embedded_runtime_options() -> EmbeddedRuntimeOptions {
         .expect("embedded runtime id is a non-empty literal");
     EmbeddedRuntimeOptions {
         runtime_id: Some(runtime_id),
-        display_name: Some("Workspace backend embedded Runtime".to_string()),
+        display_name: Some("embedded".to_string()),
         ..EmbeddedRuntimeOptions::default()
     }
 }
@@ -1177,7 +1177,7 @@ impl EmbeddedWorkerRuntime {
             FsRuntimeStoreOptions {
                 root: store_root.into(),
                 runtime_id: Some(runtime_id),
-                display_name: Some("Workspace backend embedded Runtime".to_string()),
+                display_name: Some("embedded".to_string()),
                 limits: EmbeddedRuntimeOptions::default().limits,
             },
             backend,
@@ -1351,7 +1351,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             vec![HostSummary {
                 runtime_id: self.runtime_id.clone(),
                 host_id: self.host_id.clone(),
-                label: "Workspace backend embedded Runtime".to_string(),
+                label: "embedded".to_string(),
                 kind: EMBEDDED_HOST_KIND.to_string(),
                 status: "available".to_string(),
                 observed_at: Utc::now().to_rfc3339(),

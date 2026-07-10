@@ -37,6 +37,28 @@ Deno.test("workspace Worker list and sidebar attach through Worker Console hrefs
   );
 });
 
+Deno.test("workspace Worker sidebar links New to the dedicated create page", async () => {
+  const workersNav = await Deno.readTextFile(
+    new URL("../workspace-sidebar/WorkersNavSection.svelte", import.meta.url),
+  );
+  const newWorkerPage = await Deno.readTextFile(
+    new URL("./../../routes/w/[workspaceId]/workers/new/+page.svelte", import.meta.url),
+  );
+
+  assert(
+    workersNav.includes('href={`/w/${workspaceId}/workers/new`}') &&
+      !workersNav.includes('worker-launch-form') &&
+      !workersNav.includes('createWorker()'),
+    "Workers sidebar should link to the dedicated New Worker page instead of owning the form",
+  );
+  assert(
+    newWorkerPage.includes('worker-launch-form') &&
+      newWorkerPage.includes('buildBrowserCreateWorkerRequest') &&
+      newWorkerPage.includes("/workers/launch-options"),
+    "New Worker page should own launch options and creation form behavior",
+  );
+});
+
 Deno.test("Worker Console page is routed by runtime_id and worker_id through backend APIs", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(

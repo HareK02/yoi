@@ -141,6 +141,83 @@ Deno.test("projectConsole projects initial console output and live visible proto
   );
 });
 
+Deno.test("projectConsole suppresses replayed live conversation rows already present in initial transcript", () => {
+  const projection = projectConsole(
+    [
+      {
+        sequence: 1,
+        role: "user",
+        content: "hello",
+        event_id: 10,
+      },
+      {
+        sequence: 2,
+        role: "assistant",
+        content: "world",
+        event_id: 11,
+      },
+    ],
+    [
+      {
+        cursor: "12",
+        event: {
+          event: "user_message",
+          data: { segments: [{ kind: "text", content: "hello" }] },
+        } satisfies Event,
+      },
+      {
+        cursor: "13",
+        event: { event: "text_delta", data: { text: "wo" } } satisfies Event,
+      },
+      {
+        cursor: "14",
+        event: { event: "text_delta", data: { text: "rld" } } satisfies Event,
+      },
+      {
+        cursor: "15",
+        event: { event: "text_done", data: { text: "world" } } satisfies Event,
+      },
+      {
+        cursor: "16",
+        event: { event: "status", data: { status: "idle" } } satisfies Event,
+      },
+    ],
+  );
+
+  assertEquals(
+    projection.lines.map((line) => `${line.source}:${line.kind}:${line.body}`),
+    ["initial:user:hello", "initial:assistant:world"],
+  );
+  assertEquals(projection.status, "idle");
+});
+
+Deno.test("projectConsole preserves live assistant stream not yet present in initial transcript", () => {
+  const projection = projectConsole(
+    [
+      {
+        sequence: 1,
+        role: "user",
+        content: "hello",
+        event_id: 10,
+      },
+    ],
+    [
+      {
+        cursor: "13",
+        event: { event: "text_delta", data: { text: "new" } } satisfies Event,
+      },
+    ],
+  );
+
+  assert(
+    projection.lines.some((line) =>
+      line.source === "live" && line.kind === "assistant" &&
+      line.body === "new" && line.streaming
+    ),
+    "live in-progress assistant stream should remain visible",
+  );
+});
+
 Deno.test("projectConsole keeps protocol lifecycle events out of the console surface", () => {
   const projection = projectConsole([], [
     {
