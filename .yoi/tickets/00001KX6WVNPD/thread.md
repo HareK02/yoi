@@ -29,3 +29,12 @@ Hard dependencies は WorkerFilesystemAuthority を共通前提に限定する�
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-07-10T21:54:14Z -->
+
+## Decision
+
+前提チケット `00001KX6Y2A9Q` で Worker 直下の作業ディレクトリ property は削除されるため、このチケットはその存在を前提にしない。embedded workdir ありは `WorkerFilesystemAuthority::Local`、workdir なしは `WorkerFilesystemAuthority::None` として扱い、tool registration もその authority から導出する。
+
+
+---
