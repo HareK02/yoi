@@ -281,3 +281,32 @@ Next action:
 - Request focused external re-review against commits `3e5546ea..8695089f` and the whole Ticket acceptance criteria before merge/close decisions。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-10T17:22:14Z status: request_changes -->
+
+## Review: request changes
+
+Focused re-review result: request_changes
+
+Evidence reviewed:
+- Implementation worktree is on `work/00001KX6BPY7M-worker-workdir-registry` at `8695089fba346b8f10d55016b8328337e1c37445`, clean。
+- Follow-up fixes most prior blockers:
+  - Worker list now syncs Runtime observations, then projects from `worker_registry` / `worker_workdir_links` (`workers_response`, `merge_worker_registry_projection`)。
+  - Runtime Worker create now writes pending Backend Workdir rows, records Worker rows, and links selected/materialized Workdirs。
+  - Stop path now updates Worker lifecycle and attempts linked Workdir status sync。
+  - Store upsert preserves existing `pinned` when a Runtime sync supplies `normal`。
+  - New registry records still do not store raw materialized Runtime paths。
+
+Blocker:
+- Unmanaged Runtime Workdirs are now mixed into normal Backend-managed Browser lists / launch options。
+  - Ticket requires Runtime-direct/unmanaged Workdirs to be distinguishable and “not mixed into managed lists” (`item.md:61`)。
+  - Follow-up syncs unknown Runtime Workdirs as `runtime_unmanaged`, but `working_directory_summaries()` returns all `workdir_registry` rows via `list_workdir_registry()` (`server.rs:3300-3308`)。
+  - This feeds Browser launch options (`server.rs:3278`) and the workspace-scoped Workdirs list。
+  - The worker-new UI select iterates `options.working_directories` without filtering or labeling `management_kind`, so a `runtime_unmanaged` Workdir can appear/select like a normal managed Workdir。
+  - This is not a safe typed UI distinction and does not satisfy the Backend-managed vs unmanaged boundary。
+
+Non-blocking notes:
+- Runtime-scoped Workdir lists being typed from registry is a good direction。
+- Consider ensuring detail/cleanup/create responses also project through `workdir_summary_from_record`; several paths still return Runtime summaries with `management_kind: None`, even after storing a typed Backend record。
+
+---
