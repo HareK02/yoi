@@ -1,10 +1,12 @@
 ---
 title: 'Replace Worker workspace_root path with WorkspaceBackend'
-state: 'ready'
+state: 'queued'
 priority: 'P1'
 created_at: '2026-07-10T21:16:22Z'
-updated_at: '2026-07-10T22:01:46Z'
+updated_at: '2026-07-10T22:03:27Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-07-10T22:03:27Z'
 ---
 
 ## 背景
