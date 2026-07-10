@@ -36,3 +36,20 @@ Scope added here:
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-07-10T16:43:34Z -->
+
+## Decision
+
+Lifecycle clarification:
+
+- Worker lifecycle should stay simple: running -> stopped -> delete.
+- Do not introduce archived as a Worker lifecycle state in this ticket.
+- Worker is the storage unit for Session/transcript history; deleting a Worker deletes or removes access to that history.
+- Pinned remains necessary and blocks Worker deletion.
+- Workdir files are cache and should be manually deletable.
+- Dirty workdir deletion is allowed only with explicit confirmation that changes will be discarded.
+- Compression/archive storage for Session history is out of scope and should be a separate storage policy if needed later.
+
+
+---
