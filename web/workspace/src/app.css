@@ -1041,53 +1041,8 @@
 .console-log li {
     display: grid;
     gap: var(--space-1);
-    padding: 0.45rem 0 0.45rem 0.75rem;
-    border-left: 3px solid var(--line);
+    padding: 0.2rem 0;
     background: transparent;
-}
-
-.console-log li.console-line.assistant {
-    border-left-color: var(--tui-blue);
-}
-
-.console-log li.console-line.user {
-    border-left-color: var(--tui-green);
-}
-
-.console-log li.console-line.thinking {
-    border-left-color: var(--tui-magenta);
-}
-
-.console-log li.console-line.tool {
-    border-left-color: var(--tui-cyan);
-}
-
-.console-log li.console-line.tool-read {
-    border-left-color: var(--tui-blue);
-}
-
-.console-log li.console-line.tool-write,
-.console-log li.console-line.tool-edit {
-    border-left-color: var(--tui-yellow);
-}
-
-.console-log li.console-line.tool-bash {
-    border-left-color: var(--tui-magenta);
-}
-
-.console-log li.console-line.tool-state-running,
-.console-log li.console-line.tool-state-streaming_args,
-.console-log li.console-line.tool-state-pending {
-    border-left-color: var(--tui-yellow);
-}
-
-.console-log li.console-line.tool-state-done {
-    border-left-color: var(--tui-green);
-}
-
-.console-log li.console-line.tool-state-error,
-.console-log li.console-line.error-line {
-    border-left-color: var(--tui-red);
 }
 
 .rich-markdown {
@@ -1205,6 +1160,50 @@
     color: var(--text-muted);
     font-size: 0.78rem;
     font-weight: 750;
+}
+
+.console-log li.console-line.assistant .message-heading {
+    color: var(--tui-blue);
+}
+
+.console-log li.console-line.user .message-heading {
+    color: var(--tui-green);
+}
+
+.console-log li.console-line.thinking .message-heading {
+    color: var(--tui-magenta);
+}
+
+.console-log li.console-line.tool .message-heading {
+    color: var(--tui-cyan);
+}
+
+.console-log li.console-line.tool-read .message-heading {
+    color: var(--tui-blue);
+}
+
+.console-log li.console-line.tool-write .message-heading,
+.console-log li.console-line.tool-edit .message-heading {
+    color: var(--tui-yellow);
+}
+
+.console-log li.console-line.tool-bash .message-heading {
+    color: var(--tui-magenta);
+}
+
+.console-log li.console-line.tool-state-running .message-heading,
+.console-log li.console-line.tool-state-streaming_args .message-heading,
+.console-log li.console-line.tool-state-pending .message-heading {
+    color: var(--tui-yellow);
+}
+
+.console-log li.console-line.tool-state-done .message-heading {
+    color: var(--tui-green);
+}
+
+.console-log li.console-line.tool-state-error .message-heading,
+.console-log li.console-line.error-line .message-heading {
+    color: var(--tui-red);
 }
 
 .message-heading.streaming-heading {
