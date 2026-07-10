@@ -79,3 +79,32 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-07-10T16:46:04Z -->
+
+## Decision
+
+Routing decision: blocked_by_dependency_or_missing_authority
+
+Reason:
+- Ticket is a manual delete / cleanup follow-up that depends on the Backend Worker/Workdir registry and link authority from `00001KX6BPY7M`。
+- `00001KX6BPY7M` is currently `inprogress` on branch `work/00001KX6BPY7M-worker-workdir-registry` and under external review。
+- This Ticket touches the same store schema, server APIs, Worker/Workdir projections, retention/managed-unmanaged semantics, and cleanup safety rules。
+- Starting this Ticket now would create a high-conflict parallel branch and could implement delete/cleanup behavior against an unreviewed registry model。
+- Therefore this routing pass leaves the Ticket queued and does not record `queued -> inprogress`, create a worktree, or spawn role Pods。
+
+Evidence checked:
+- Ticket body / thread / artifacts。
+- `TicketRelationQuery(00001KX6CRVBE)`: 0 typed relations, but Ticket body/order context makes `00001KX6BPY7M` a practical implementation prerequisite。
+- `TicketOrchestrationPlanQuery(00001KX6CRVBE)`: prior record 0 件だったため、今回 `after 00001KX6BPY7M` と waiting-capacity note を記録。
+- `TicketList`: queued はこの Ticket 1件、inprogress は `00001KX6BPY7M` 1件。
+- Orchestrator worktree git status: clean on `orchestration`。
+
+Next action:
+- `00001KX6BPY7M` の implementation/review/merge outcome を待つ。
+- registry/link model が merge されたら、この Ticket を再 routing し、updated orchestration branch から start する。
+
+Escalate if:
+- 人間が `00001KX6BPY7M` とこの Ticket を同一 combined worktree で統合実装する方針に切り替えたい場合。
+
+---
