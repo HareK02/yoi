@@ -98,3 +98,29 @@ Next action:
 - Escalate only if a human explicitly requests combined implementation in the same branch/worktree。
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-07-10T23:38:54Z -->
+
+## Decision
+
+Routing decision: hold_queued_due_migration_boundary_conflict
+
+Reason:
+- 前提 `00001KX6Y2A9Q` は closed になったため dependency 自体は解消済み。
+- ただし、この routing pass では `00001KX6WVNPD` を先に受理した。
+- `00001KX6WVNPD` は embedded no-workdir policy MVP であり、WorkspaceBackend migration を必要としない小さい境界変更である。
+- この Ticket は Worker `workspace_root` path を `WorkspaceBackend` に置き換える refactor で、Worker struct/context/constructor/runtime spawn/UI API 周辺に触れる。
+- `00001KX6WVNPD` も同じ Worker create / embedded runtime / no-workdir authority surface に触るため、並行 branch で進めると conflict と review boundary 混濁の可能性が高い。
+- よって、この Ticket は `queued` のまま保持し、`00001KX6WVNPD` が reviewed/merged/closed になってから再 routing する。
+
+Evidence checked:
+- Ticket body / thread / relations / orchestration plan。
+- `TicketRelationQuery(00001KX6Y6ZEA)`: prerequisite `00001KX6Y2A9Q` は closed。
+- `TicketList(inprogress)`: routing pass 中に `00001KX6WVNPD` を accepted for implementation。
+- Orchestrator worktree status: clean。
+
+Next action:
+- `00001KX6WVNPD` の implementation/review/merge/close を完了後、この Ticket を再 routing する。
+- 人間が combined branch を明示希望する場合のみ、この待機判断を再検討する。
+
+---
