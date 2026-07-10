@@ -1,8 +1,8 @@
 ---
 title: 'Remove backend worker observation replay'
-state: 'inprogress'
+state: 'done'
 created_at: '2026-07-10T23:34:39Z'
-updated_at: '2026-07-10T23:35:04Z'
+updated_at: '2026-07-10T23:50:50Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-10T23:35:04Z'
