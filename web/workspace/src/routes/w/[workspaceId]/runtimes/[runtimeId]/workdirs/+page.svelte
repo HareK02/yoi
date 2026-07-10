@@ -24,9 +24,11 @@
   }
 
   function cleanupLabel(candidate: CleanupWorkdirCandidate): string {
-    if (candidate.action === 'workdir_dirty_discard') return 'Discard dirty workdir';
+    if (candidate.action === 'workdir_dirty_discard') {
+      return candidate.cleanliness === 'dirty' ? 'Discard dirty workdir' : 'Discard unknown-state workdir';
+    }
     if (candidate.action === 'workdir_record_delete') return 'Delete missing/removed record';
-    return 'Clean up workdir';
+    return 'Clean up verified-clean workdir';
   }
 
   function toggleSelected(targetId: string): void {
@@ -152,7 +154,7 @@
                       checked={confirmedDirtyTargets.has(candidate.target_id)}
                       onchange={() => toggleDirtyConfirmation(candidate.target_id)}
                     />
-                    Confirm dirty discard
+                    Confirm discard
                   </label>
                 {/if}
               </span>

@@ -1397,7 +1397,7 @@ fn create_working_directory_for_runtime(
             .map(|selector| selector.as_ref().to_string()),
         resolved_commit: None,
         materialization_status: "pending".to_string(),
-        cleanliness: "clean".to_string(),
+        cleanliness: "unknown".to_string(),
         management_kind: "backend_managed".to_string(),
         created_at: now_registry_timestamp(),
         updated_at: now_registry_timestamp(),
@@ -1686,13 +1686,19 @@ fn build_runtime_cleanup_plan(
             .get(record.workdir_id.as_str())
             .map(|summary| format!("{:?}", summary.status).to_lowercase());
         let file_status = observed_status.unwrap_or_else(|| record.materialization_status.clone());
-        let cleanliness = record.cleanliness.clone();
+        let observed_without_clean_evidence =
+            observed_workdirs.contains_key(record.workdir_id.as_str());
+        let cleanliness = if observed_without_clean_evidence && record.cleanliness != "dirty" {
+            "unknown".to_string()
+        } else {
+            record.cleanliness.clone()
+        };
         let action = if matches!(file_status.as_str(), "removed" | "missing") {
             CleanupTargetKind::WorkdirRecordDelete
-        } else if cleanliness == "dirty" {
-            CleanupTargetKind::WorkdirDirtyDiscard
-        } else {
+        } else if cleanliness == "clean" {
             CleanupTargetKind::WorkdirCleanCleanup
+        } else {
+            CleanupTargetKind::WorkdirDirtyDiscard
         };
         let blocking_reason = if running_linked {
             Some("workdir is linked to a running Worker".to_string())
@@ -1714,6 +1720,9 @@ fn build_runtime_cleanup_plan(
                     .to_string()
             } else if cleanliness == "dirty" {
                 "Dirty Workdir requires explicit discard confirmation before cleanup".to_string()
+            } else if cleanliness == "unknown" {
+                "Workdir clean state is unknown; explicit discard confirmation is required"
+                    .to_string()
             } else {
                 "Clean Workdir can be manually cleaned up".to_string()
             },
@@ -1844,7 +1853,7 @@ fn execute_runtime_cleanup(
                     action: candidate.action.clone(),
                     status: "discarded".to_string(),
                     message:
-                        "Dirty Workdir cleanup/discard was executed after explicit confirmation"
+                        "Dirty/unknown Workdir cleanup/discard was executed after explicit confirmation"
                             .to_string(),
                 });
             }
@@ -4078,7 +4087,7 @@ fn upsert_pending_backend_workdir(
             .map(|selector| selector.as_ref().to_string()),
         resolved_commit: None,
         materialization_status: "pending".to_string(),
-        cleanliness: "clean".to_string(),
+        cleanliness: "unknown".to_string(),
         management_kind: "backend_managed".to_string(),
         created_at: timestamp.clone(),
         updated_at: timestamp,
@@ -4196,7 +4205,7 @@ fn workdir_record_from_summary(
             WorkingDirectoryStatusKind::CleanupPending => "pending",
         }
         .to_string(),
-        cleanliness: "clean".to_string(),
+        cleanliness: "unknown".to_string(),
         management_kind: management_kind.to_string(),
         created_at: timestamp.clone(),
         updated_at: timestamp,
@@ -5465,6 +5474,127 @@ mod tests {
             .unwrap();
     }
 
+    fn create_observed_workdir(api: &WorkspaceApi) -> String {
+        let Json(response) = create_working_directory_for_runtime(
+            api.clone(),
+            BrowserWorkingDirectoryCreateRequest {
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                repository_id: TEST_REPOSITORY_ID.to_string(),
+                selector: Some("HEAD".to_string()),
+                policy: BrowserWorkingDirectoryCreatePolicy::default(),
+            },
+        )
+        .unwrap_or_else(|err| panic!("create observed workdir: {}", err.error));
+        response.item.working_directory_id
+    }
+
+    #[tokio::test]
+    async fn observed_workdir_without_verified_clean_evidence_requires_discard_confirmation() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let workdir_id = create_observed_workdir(&api);
+        sync_runtime_workdir_observations(&api, EMBEDDED_WORKER_RUNTIME_ID)
+            .unwrap_or_else(|err| panic!("sync runtime workdir observations: {}", err.error));
+
+        let stored = api
+            .store
+            .get_workdir_registry(&api.config.workspace_id, workdir_id.as_str())
+            .unwrap()
+            .expect("workdir registry row");
+        assert_eq!(stored.materialization_status, "present");
+        assert_eq!(stored.cleanliness, "unknown");
+
+        let plan = build_runtime_cleanup_plan(&api, EMBEDDED_WORKER_RUNTIME_ID)
+            .unwrap_or_else(|err| panic!("cleanup plan: {}", err.error));
+        let candidate = plan
+            .workdirs
+            .iter()
+            .find(|candidate| candidate.workdir_id == workdir_id)
+            .expect("cleanup candidate");
+        assert_eq!(candidate.cleanliness, "unknown");
+        assert_eq!(candidate.action, CleanupTargetKind::WorkdirDirtyDiscard);
+        assert!(candidate.reason.contains("unknown"));
+
+        let direct_cleanup = cleanup_working_directory_for_runtime(
+            api.clone(),
+            EMBEDDED_WORKER_RUNTIME_ID,
+            workdir_id.as_str(),
+        );
+        assert!(direct_cleanup.is_err());
+
+        let target_id = candidate.target_id.clone();
+        let missing_confirmation = ExecuteRuntimeCleanupRequest {
+            expected_plan_revision: plan.revision.clone(),
+            expected_plan_digest: plan.digest.clone(),
+            worker_target_ids: Vec::new(),
+            workdir_target_ids: vec![target_id.clone()],
+            confirm_dirty_discard_target_ids: Vec::new(),
+        };
+        assert!(
+            execute_runtime_cleanup(&api, EMBEDDED_WORKER_RUNTIME_ID, missing_confirmation)
+                .is_err()
+        );
+
+        let confirmed = ExecuteRuntimeCleanupRequest {
+            expected_plan_revision: plan.revision,
+            expected_plan_digest: plan.digest,
+            worker_target_ids: Vec::new(),
+            workdir_target_ids: vec![target_id.clone()],
+            confirm_dirty_discard_target_ids: vec![target_id],
+        };
+        let response = execute_runtime_cleanup(&api, EMBEDDED_WORKER_RUNTIME_ID, confirmed)
+            .unwrap_or_else(|err| panic!("cleanup execution: {}", err.error));
+        assert_eq!(
+            response.results[0].action,
+            CleanupTargetKind::WorkdirDirtyDiscard
+        );
+        assert_eq!(response.results[0].status, "discarded");
+    }
+
+    #[tokio::test]
+    async fn stale_clean_registry_row_is_downgraded_by_real_observation_before_cleanup() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        let workdir_id = create_observed_workdir(&api);
+        let mut stale_clean = api
+            .store
+            .get_workdir_registry(&api.config.workspace_id, workdir_id.as_str())
+            .unwrap()
+            .expect("workdir registry row");
+        stale_clean.cleanliness = "clean".to_string();
+        api.store.upsert_workdir_registry(&stale_clean).unwrap();
+
+        let plan = build_runtime_cleanup_plan(&api, EMBEDDED_WORKER_RUNTIME_ID)
+            .unwrap_or_else(|err| panic!("cleanup plan: {}", err.error));
+        let candidate = plan
+            .workdirs
+            .iter()
+            .find(|candidate| candidate.workdir_id == workdir_id)
+            .expect("cleanup candidate");
+        assert_eq!(candidate.cleanliness, "unknown");
+        assert_ne!(candidate.action, CleanupTargetKind::WorkdirCleanCleanup);
+    }
+
+    #[tokio::test]
+    async fn synthetic_verified_clean_workdir_can_still_use_clean_cleanup_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        init_clean_git_workspace(workspace.path());
+        let api = test_api(workspace.path()).await;
+        seed_cleanup_workdir(&api, "verified-clean", "present", "clean");
+
+        let plan = build_runtime_cleanup_plan(&api, "runtime-test")
+            .unwrap_or_else(|err| panic!("cleanup plan: {}", err.error));
+        let candidate = plan
+            .workdirs
+            .iter()
+            .find(|candidate| candidate.workdir_id == "verified-clean")
+            .expect("cleanup candidate");
+        assert_eq!(candidate.cleanliness, "clean");
+        assert_eq!(candidate.action, CleanupTargetKind::WorkdirCleanCleanup);
+    }
+
     #[tokio::test]
     async fn cleanup_plan_reports_pinned_running_dirty_removed_and_redacts_paths() {
         let workspace = tempfile::tempdir().unwrap();
@@ -5846,8 +5976,50 @@ mod tests {
         let detail = get_json(app.clone(), &detail_path).await;
         assert_eq!(detail["item"]["working_directory_id"], working_directory_id);
 
-        let removed = request_json(app, "DELETE", &detail_path, None, StatusCode::OK).await;
-        assert_eq!(removed["item"]["status"], "removed");
+        let direct_cleanup = request_json(
+            app.clone(),
+            "DELETE",
+            &detail_path,
+            None,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert!(
+            direct_cleanup["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("workspace_cleanup_dirty_confirmation_required")
+        );
+
+        let cleanup_plan_path = format!(
+            "/api/w/{TEST_WORKSPACE_ID}/runtimes/{EMBEDDED_WORKER_RUNTIME_ID}/cleanup-plan"
+        );
+        let plan = get_json(app.clone(), &cleanup_plan_path).await;
+        let target_id = plan["workdirs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["workdir_id"] == working_directory_id)
+            .and_then(|candidate| candidate["target_id"].as_str())
+            .unwrap()
+            .to_string();
+        let removed = request_json(
+            app,
+            "POST",
+            &format!(
+                "/api/w/{TEST_WORKSPACE_ID}/runtimes/{EMBEDDED_WORKER_RUNTIME_ID}/cleanup-executions"
+            ),
+            Some(serde_json::json!({
+                "expected_plan_revision": plan["revision"],
+                "expected_plan_digest": plan["digest"],
+                "worker_target_ids": [],
+                "workdir_target_ids": [target_id],
+                "confirm_dirty_discard_target_ids": [target_id]
+            })),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(removed["results"][0]["status"], "discarded");
     }
 
     #[tokio::test]

@@ -170,3 +170,28 @@ Validation:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-10T18:29:56Z -->
+
+## Implementation report
+
+Follow-up fix for external review blocker.
+
+Summary:
+- Treat Runtime-observed/materialized Workdirs without trusted clean evidence as `unknown`, not `clean`.
+- Cleanup plan now downgrades stale clean registry rows to `unknown` when real Runtime observation exists, and classifies unknown/dirty present Workdirs as discard-confirmation targets rather than normal clean cleanup.
+- Direct Workdir cleanup endpoint now rejects unknown/dirty cleanup and requires the cleanup execution API with explicit discard confirmation.
+- Browser labels distinguish verified-clean cleanup from unknown-state discard.
+- `estimated_reclaim_bytes` remains `None` unless a safe estimate is available.
+
+Validation:
+- git diff --check
+- cargo test -p yoi-workspace-server --lib
+- cargo test -p worker-runtime --features ws-server,fs-store
+- cargo check -p yoi
+- cd web/workspace && deno task check && deno task test
+- yoi ticket doctor
+- nix build .#yoi --no-link
+
+
+---
