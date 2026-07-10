@@ -1152,6 +1152,68 @@
     color: var(--danger);
 }
 
+.console-log li.user .rich-markdown {
+    color: var(--tui-green);
+}
+
+.console-log li.assistant .rich-markdown {
+    color: var(--text-strong);
+}
+
+.console-log li.thinking .message-heading {
+    color: var(--tui-magenta);
+    font-style: italic;
+}
+
+.console-log li.thinking .rich-markdown {
+    color: var(--tui-dark-gray);
+    font-style: italic;
+}
+
+.tool-summary {
+    display: flex;
+    align-items: baseline;
+    gap: 0;
+    color: var(--text-muted);
+    font-size: 0.88rem;
+    font-weight: 750;
+}
+
+.tool-summary small {
+    margin-left: var(--space-2);
+    color: var(--text-muted);
+    font-size: 0.74rem;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+.tool-label {
+    color: var(--tui-cyan);
+}
+
+.tool-separator,
+.tool-suffix {
+    color: var(--tui-dark-gray);
+}
+
+.tool-state-error .tool-suffix {
+    color: var(--tui-red);
+}
+
+.tool-state-running .tool-suffix,
+.tool-state-streaming_args .tool-suffix,
+.tool-state-pending .tool-suffix {
+    color: var(--tui-yellow);
+}
+
+.tool-state-done .tool-suffix {
+    color: var(--tui-dark-gray);
+}
+
+.console-line.tool .rich-markdown {
+    color: var(--tui-gray);
+}
+
 .message-heading {
     display: flex;
     align-items: center;
@@ -1160,50 +1222,6 @@
     color: var(--text-muted);
     font-size: 0.78rem;
     font-weight: 750;
-}
-
-.console-log li.console-line.assistant .message-heading {
-    color: var(--tui-blue);
-}
-
-.console-log li.console-line.user .message-heading {
-    color: var(--tui-green);
-}
-
-.console-log li.console-line.thinking .message-heading {
-    color: var(--tui-magenta);
-}
-
-.console-log li.console-line.tool .message-heading {
-    color: var(--tui-cyan);
-}
-
-.console-log li.console-line.tool-read .message-heading {
-    color: var(--tui-blue);
-}
-
-.console-log li.console-line.tool-write .message-heading,
-.console-log li.console-line.tool-edit .message-heading {
-    color: var(--tui-yellow);
-}
-
-.console-log li.console-line.tool-bash .message-heading {
-    color: var(--tui-magenta);
-}
-
-.console-log li.console-line.tool-state-running .message-heading,
-.console-log li.console-line.tool-state-streaming_args .message-heading,
-.console-log li.console-line.tool-state-pending .message-heading {
-    color: var(--tui-yellow);
-}
-
-.console-log li.console-line.tool-state-done .message-heading {
-    color: var(--tui-green);
-}
-
-.console-log li.console-line.tool-state-error .message-heading,
-.console-log li.console-line.error-line .message-heading {
-    color: var(--tui-red);
 }
 
 .message-heading.streaming-heading {

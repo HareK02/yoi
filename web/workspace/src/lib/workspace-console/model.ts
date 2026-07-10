@@ -128,7 +128,7 @@ export function applyProtocolEvent(
         line(
           envelope.cursor,
           "user",
-          "user message",
+          "User",
           segmentsToText(event.data.segments),
         ),
       );
@@ -156,7 +156,7 @@ export function applyProtocolEvent(
       break;
     case "thinking_start":
       next.lines.push(
-        line(envelope.cursor, "thinking", "thinking", "", undefined, true),
+        line(envelope.cursor, "thinking", "Thinking...", "", undefined, true),
       );
       break;
     case "thinking_delta":
@@ -164,7 +164,7 @@ export function applyProtocolEvent(
         next,
         envelope.cursor,
         "thinking",
-        "thinking",
+        "Thinking...",
         event.data.text,
       );
       break;
@@ -173,7 +173,7 @@ export function applyProtocolEvent(
         next,
         "thinking",
         envelope.cursor,
-        "thinking",
+        "Thought",
         event.data.text,
       );
       break;
