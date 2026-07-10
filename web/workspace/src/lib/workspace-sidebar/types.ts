@@ -181,27 +181,7 @@ export type WorkerInputResult = {
   state: WorkerOperationState;
   runtime_id: string;
   worker_id: string;
-  transcript_sequence?: number | null;
   event_id?: number | null;
-  diagnostics: Diagnostic[];
-};
-
-export type WorkerTranscriptItem = {
-  sequence: number;
-  role: "user" | "assistant" | "system" | string;
-  content: string;
-  event_id: number;
-};
-
-export type WorkerTranscriptProjection = {
-  state: WorkerOperationState;
-  runtime_id: string;
-  worker_id: string;
-  start: number;
-  limit: number;
-  total_items: number;
-  next_start?: number | null;
-  items: WorkerTranscriptItem[];
   diagnostics: Diagnostic[];
 };
 

@@ -28,7 +28,7 @@ use crate::management::{
 };
 use crate::observation::{
     EventCursor, EventSubscription, EventSubscriptionMode, RuntimeEvent, RuntimeEventBatch,
-    RuntimeEventKind, TranscriptEntry, TranscriptProjection, TranscriptQuery, TranscriptRole,
+    RuntimeEventKind,
 };
 #[cfg(feature = "ws-server")]
 use crate::observation::{WorkerObservationCursor, WorkerObservationEvent};
@@ -333,19 +333,6 @@ impl Runtime {
                 format!("worker {worker_id} created"),
             );
 
-            let mut transcript = Vec::new();
-            let mut next_transcript_sequence = 1;
-            if let Some(input) = request.initial_input.clone() {
-                transcript.push(TranscriptEntry {
-                    sequence: next_transcript_sequence,
-                    worker_ref: worker_ref.clone(),
-                    role: TranscriptRole::User,
-                    content: input.content,
-                    event_id,
-                });
-                next_transcript_sequence += 1;
-            }
-
             let record = WorkerRecord {
                 worker_ref: worker_ref.clone(),
                 worker_id: worker_id.clone(),
@@ -353,8 +340,6 @@ impl Runtime {
                 request: request.clone(),
                 execution: WorkerExecutionStatus::unconnected(),
                 execution_handle: None,
-                transcript,
-                next_transcript_sequence,
                 last_event_id: event_id,
             };
             state.workers.insert(worker_id, record);
@@ -392,7 +377,7 @@ impl Runtime {
             let state = self.lock()?;
             state.worker(&worker_ref)?.request.initial_input.clone()
         } {
-            let dispatch_result = backend.dispatch_input(&handle, initial_input);
+            let dispatch_result = backend.dispatch_input(&handle, initial_input.clone());
             if !dispatch_result.is_accepted() {
                 let _ = backend.stop_worker(&handle);
                 self.rollback_failed_create(&worker_ref)?;
@@ -404,7 +389,7 @@ impl Runtime {
                     result: dispatch_result,
                 });
             }
-            self.commit_created_worker(
+            let detail = self.commit_created_worker(
                 &worker_ref,
                 handle,
                 WorkerExecutionRunState::Busy,
@@ -413,7 +398,9 @@ impl Runtime {
                     WorkerExecutionOperation::Input,
                     WorkerExecutionRunState::Busy,
                 ),
-            )
+            )?;
+            self.record_input_observation(&worker_ref, initial_input)?;
+            Ok(detail)
         } else {
             self.commit_created_worker(
                 &worker_ref,
@@ -442,7 +429,7 @@ impl Runtime {
         Ok(worker.detail(&state.runtime_id))
     }
 
-    /// Accept input into a Worker transcript.
+    /// Accept input into a Worker.
     pub fn send_input(
         &self,
         worker_ref: &WorkerRef,
@@ -502,14 +489,6 @@ impl Runtime {
             "worker input accepted",
         );
         let worker = state.worker_mut(worker_ref)?;
-
-        let input_content = input.content;
-        let role = match input.kind {
-            WorkerInputKind::User => TranscriptRole::User,
-            WorkerInputKind::System => TranscriptRole::System,
-        };
-        let transcript_sequence = worker.next_transcript_sequence;
-        worker.next_transcript_sequence += 1;
         worker.last_event_id = event_id;
         worker.execution = WorkerExecutionStatus {
             backend: WorkerExecutionBackendKind::Connected,
@@ -518,44 +497,24 @@ impl Runtime {
             working_directory: worker.execution.working_directory.clone(),
             last_result: Some(dispatch_result),
         };
-        worker.transcript.push(TranscriptEntry {
-            sequence: transcript_sequence,
-            worker_ref: worker_ref.clone(),
-            role,
-            content: input_content.clone(),
-            event_id,
-        });
 
         let status = worker.status;
         #[cfg(feature = "ws-server")]
-        {
-            let payload = match role {
-                TranscriptRole::User => protocol::Event::UserMessage {
-                    segments: vec![protocol::Segment::Text {
-                        content: input_content.clone(),
-                    }],
-                },
-                TranscriptRole::Assistant => protocol::Event::TextDone {
-                    text: input_content.clone(),
-                },
-                TranscriptRole::System => protocol::Event::SystemItem {
-                    item: serde_json::json!({
-                        "kind": "embedded_worker_system_input",
-                        "content": input_content.clone(),
-                    }),
-                },
-            };
-            state.push_worker_observation_event(worker_ref.clone(), payload);
-        }
+        let observation = {
+            let payload = input_protocol_event(&input);
+            Some(state.push_worker_observation_event(worker_ref.clone(), payload))
+        };
         state.persist_runtime_snapshot()?;
         state.persist_worker(&worker_ref.worker_id)?;
         state.persist_event_by_id(event_id)?;
-        state.persist_transcript_entry(&worker_ref.worker_id, transcript_sequence)?;
+        #[cfg(feature = "ws-server")]
+        if let Some(observation) = observation.as_ref() {
+            state.persist_worker_observation_event(observation)?;
+        }
 
         Ok(WorkerInteractionAck {
             worker_ref: worker_ref.clone(),
             status,
-            transcript_sequence,
             event_id,
         })
     }
@@ -583,10 +542,6 @@ impl Runtime {
         };
         state.persist_runtime_snapshot()?;
         state.persist_worker(&worker_ref.worker_id)?;
-        let worker = state.worker(worker_ref)?;
-        for entry in &worker.transcript {
-            state.persist_transcript_entry(&worker_ref.worker_id, entry.sequence)?;
-        }
         state.persist_event_by_id(detail.last_event_id)?;
         Ok(detail)
     }
@@ -689,38 +644,6 @@ impl Runtime {
             RuntimeEventKind::WorkerCancelled,
             reason.unwrap_or_else(|| "worker cancelled".to_string()),
         )
-    }
-
-    /// Bounded transcript projection for a Worker.
-    pub fn transcript_projection(
-        &self,
-        worker_ref: &WorkerRef,
-        query: TranscriptQuery,
-    ) -> Result<TranscriptProjection, RuntimeError> {
-        let state = self.lock()?;
-        if query.limit > state.limits.max_transcript_projection_items {
-            return Err(RuntimeError::LimitTooLarge {
-                requested: query.limit,
-                max: state.limits.max_transcript_projection_items,
-            });
-        }
-        let worker = state.worker(worker_ref)?;
-        let total_items = worker.transcript.len();
-        let end = query.start.saturating_add(query.limit).min(total_items);
-        let items = if query.start >= total_items {
-            Vec::new()
-        } else {
-            worker.transcript[query.start..end].to_vec()
-        };
-        let next_start = (end < total_items).then_some(end);
-        Ok(TranscriptProjection {
-            worker_ref: worker_ref.clone(),
-            start: query.start,
-            limit: query.limit,
-            total_items,
-            items,
-            next_start,
-        })
     }
 
     /// Cursor pointing to the beginning of Runtime events.
@@ -880,22 +803,42 @@ impl Runtime {
     ) -> Result<WorkerObservationEvent, RuntimeError> {
         let mut state = self.lock()?;
         state.ensure_worker_ref(worker_ref)?;
-        let transcript_sequence = state.project_protocol_event_to_transcript(worker_ref, &payload);
         let execution_state_changed =
             state.project_protocol_event_to_execution(worker_ref, &payload);
         let event = state.push_worker_observation_event(worker_ref.clone(), payload);
-        if transcript_sequence.is_some() || execution_state_changed {
+        if execution_state_changed {
             state.persist_worker(&worker_ref.worker_id)?;
         }
-        if let Some(sequence) = transcript_sequence {
-            state.persist_transcript_entry(&worker_ref.worker_id, sequence)?;
-        }
+        state.persist_worker_observation_event(&event)?;
         Ok(event)
     }
 
     /// Snapshot current diagnostics.
     pub fn diagnostics(&self) -> Result<Vec<RuntimeDiagnostic>, RuntimeError> {
         Ok(self.lock()?.diagnostics.clone())
+    }
+
+    #[cfg(feature = "ws-server")]
+    fn record_input_observation(
+        &self,
+        worker_ref: &WorkerRef,
+        input: WorkerInput,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.lock()?;
+        state.ensure_worker_ref(worker_ref)?;
+        let event =
+            state.push_worker_observation_event(worker_ref.clone(), input_protocol_event(&input));
+        state.persist_worker_observation_event(&event)?;
+        Ok(())
+    }
+
+    #[cfg(not(feature = "ws-server"))]
+    fn record_input_observation(
+        &self,
+        _worker_ref: &WorkerRef,
+        _input: WorkerInput,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
     }
 
     fn transition_worker(
@@ -1106,12 +1049,21 @@ impl RuntimeState {
                     request: worker.request,
                     execution,
                     execution_handle: None,
-                    transcript: worker.transcript,
-                    next_transcript_sequence: worker.next_transcript_sequence,
                     last_event_id: worker.last_event_id,
                 },
             );
         }
+
+        #[cfg(feature = "ws-server")]
+        let next_observation_sequence = persisted
+            .observation_events
+            .iter()
+            .map(|event| event.sequence)
+            .max()
+            .map(|sequence| sequence.saturating_add(1))
+            .unwrap_or(1);
+        #[cfg(feature = "ws-server")]
+        let observation_events = persisted.observation_events.into_iter().collect();
 
         Ok(Self {
             runtime_id: persisted.runtime_id,
@@ -1129,9 +1081,9 @@ impl RuntimeState {
             events: persisted.events,
             diagnostics,
             #[cfg(feature = "ws-server")]
-            next_observation_sequence: 1,
+            next_observation_sequence,
             #[cfg(feature = "ws-server")]
-            observation_events: VecDeque::new(),
+            observation_events,
             #[cfg(feature = "ws-server")]
             observation_tx: broadcast::channel(256).0,
         })
@@ -1154,6 +1106,8 @@ impl RuntimeState {
                 .collect(),
             config_bundles: self.config_bundles.clone(),
             events: self.events.clone(),
+            #[cfg(feature = "ws-server")]
+            observation_events: Vec::new(),
             diagnostics: self.diagnostics.clone(),
         }
     }
@@ -1206,33 +1160,22 @@ impl RuntimeState {
         Ok(())
     }
 
-    #[cfg(feature = "fs-store")]
-    fn persist_transcript_entry(
+    #[cfg(all(feature = "fs-store", feature = "ws-server"))]
+    fn persist_worker_observation_event(
         &self,
-        worker_id: &WorkerId,
-        sequence: u64,
+        event: &WorkerObservationEvent,
     ) -> Result<(), RuntimeError> {
         if let Some(store) = self.fs_store() {
-            let worker =
-                self.workers
-                    .get(worker_id)
-                    .ok_or_else(|| RuntimeError::WorkerNotFound {
-                        runtime_id: self.runtime_id.clone(),
-                        worker_id: worker_id.clone(),
-                    })?;
-            let entry = worker
-                .transcript
-                .iter()
-                .find(|entry| entry.sequence == sequence)
-                .ok_or_else(|| RuntimeError::StoreCorrupt {
-                    operation: "persist transcript",
-                    path: store.runtime_dir().to_path_buf(),
-                    message: format!(
-                        "transcript sequence {sequence} is missing from worker {worker_id}"
-                    ),
-                })?;
-            store.append_transcript_entry(entry)?;
+            store.append_worker_observation_event(event)?;
         }
+        Ok(())
+    }
+
+    #[cfg(all(not(feature = "fs-store"), feature = "ws-server"))]
+    fn persist_worker_observation_event(
+        &self,
+        _event: &WorkerObservationEvent,
+    ) -> Result<(), RuntimeError> {
         Ok(())
     }
 
@@ -1258,15 +1201,6 @@ impl RuntimeState {
 
     #[cfg(not(feature = "fs-store"))]
     fn persist_event_by_id(&self, _event_id: u64) -> Result<(), RuntimeError> {
-        Ok(())
-    }
-
-    #[cfg(not(feature = "fs-store"))]
-    fn persist_transcript_entry(
-        &self,
-        _worker_id: &WorkerId,
-        _sequence: u64,
-    ) -> Result<(), RuntimeError> {
         Ok(())
     }
 
@@ -1422,66 +1356,6 @@ impl RuntimeState {
     }
 
     #[cfg(feature = "ws-server")]
-    fn append_worker_transcript_entry(
-        &mut self,
-        worker_ref: &WorkerRef,
-        role: TranscriptRole,
-        content: impl Into<String>,
-    ) -> Option<u64> {
-        let content = content.into();
-        if content.trim().is_empty() {
-            return None;
-        }
-        let event_id = self.last_event_id();
-        let worker = self.workers.get_mut(&worker_ref.worker_id)?;
-        let sequence = worker.next_transcript_sequence;
-        worker.next_transcript_sequence += 1;
-        worker.transcript.push(TranscriptEntry {
-            sequence,
-            worker_ref: worker_ref.clone(),
-            role,
-            content,
-            event_id,
-        });
-        Some(sequence)
-    }
-
-    #[cfg(feature = "ws-server")]
-    fn project_protocol_event_to_transcript(
-        &mut self,
-        worker_ref: &WorkerRef,
-        event: &protocol::Event,
-    ) -> Option<u64> {
-        match event {
-            protocol::Event::TextDone { text, .. } => self.append_worker_transcript_entry(
-                worker_ref,
-                TranscriptRole::Assistant,
-                text.clone(),
-            ),
-            protocol::Event::Error { message, .. } => self.append_worker_transcript_entry(
-                worker_ref,
-                TranscriptRole::System,
-                format!("error: {message}"),
-            ),
-            protocol::Event::ToolResult {
-                id,
-                summary,
-                is_error,
-                ..
-            } => self.append_worker_transcript_entry(
-                worker_ref,
-                TranscriptRole::System,
-                format!(
-                    "tool result {id}: {}{}",
-                    if *is_error { "error: " } else { "" },
-                    summary
-                ),
-            ),
-            _ => None,
-        }
-    }
-
-    #[cfg(feature = "ws-server")]
     fn project_protocol_event_to_execution(
         &mut self,
         worker_ref: &WorkerRef,
@@ -1535,8 +1409,6 @@ struct WorkerRecord {
     request: CreateWorkerRequest,
     execution: WorkerExecutionStatus,
     execution_handle: Option<WorkerExecutionHandle>,
-    transcript: Vec<TranscriptEntry>,
-    next_transcript_sequence: u64,
     last_event_id: u64,
 }
 
@@ -1551,7 +1423,6 @@ impl WorkerRecord {
             profile: self.request.profile.clone(),
             profile_source: self.request.profile_source.reference(),
             config_bundle: self.request.config_bundle.clone(),
-            transcript_len: self.transcript.len(),
             last_event_id: self.last_event_id,
         }
     }
@@ -1566,7 +1437,6 @@ impl WorkerRecord {
             profile: self.request.profile.clone(),
             profile_source: self.request.profile_source.reference(),
             config_bundle: self.request.config_bundle.clone(),
-            transcript_len: self.transcript.len(),
             last_event_id: self.last_event_id,
         }
     }
@@ -1579,8 +1449,6 @@ impl WorkerRecord {
             status: self.status,
             request: self.request.clone(),
             execution: self.execution.clone(),
-            transcript: self.transcript.clone(),
-            next_transcript_sequence: self.next_transcript_sequence,
             last_event_id: self.last_event_id,
         }
     }
@@ -1628,6 +1496,23 @@ fn validate_worker_input(input: &WorkerInput) -> Result<(), RuntimeError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(feature = "ws-server")]
+fn input_protocol_event(input: &WorkerInput) -> protocol::Event {
+    match input.kind {
+        WorkerInputKind::User => protocol::Event::UserMessage {
+            segments: vec![protocol::Segment::Text {
+                content: input.content.clone(),
+            }],
+        },
+        WorkerInputKind::System => protocol::Event::SystemItem {
+            item: serde_json::json!({
+                "kind": "embedded_worker_system_input",
+                "content": input.content.clone(),
+            }),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1965,12 +1850,12 @@ mod tests {
         ));
         let refreshed = runtime.worker_detail(&detail.worker_ref).unwrap();
         assert_eq!(refreshed.execution.run_state, WorkerExecutionRunState::Busy);
-        assert_eq!(
+        #[cfg(feature = "ws-server")]
+        assert!(
             runtime
-                .transcript_projection(&detail.worker_ref, TranscriptQuery::new(0, 1))
+                .read_worker_observation_events(&detail.worker_ref, WorkerObservationCursor::zero())
                 .unwrap()
-                .total_items,
-            0
+                .is_empty()
         );
     }
 
@@ -2049,12 +1934,12 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ws-server")]
     #[test]
-    fn send_input_and_project_bounded_transcript() {
+    fn send_input_records_protocol_observations() {
         let runtime = Runtime::with_execution_backend(
             RuntimeOptions {
                 limits: RuntimeLimits {
-                    max_transcript_projection_items: 2,
                     max_event_batch_items: 16,
                 },
                 ..RuntimeOptions::default()
@@ -2068,27 +1953,23 @@ mod tests {
         let first = runtime
             .send_input(&detail.worker_ref, WorkerInput::user("hello"))
             .unwrap();
-        assert_eq!(first.transcript_sequence, 1);
         runtime
             .send_input(&detail.worker_ref, WorkerInput::system("note"))
             .unwrap();
-        runtime
-            .send_input(&detail.worker_ref, WorkerInput::user("again"))
-            .unwrap();
 
-        let projection = runtime
-            .transcript_projection(&detail.worker_ref, TranscriptQuery::new(0, 2))
+        let observations = runtime
+            .read_worker_observation_events(&detail.worker_ref, WorkerObservationCursor::zero())
             .unwrap();
-        assert_eq!(projection.total_items, 3);
-        assert_eq!(projection.items.len(), 2);
-        assert_eq!(projection.items[0].content, "hello");
-        assert_eq!(projection.items[1].role, TranscriptRole::System);
-        assert_eq!(projection.next_start, Some(2));
-
-        let err = runtime
-            .transcript_projection(&detail.worker_ref, TranscriptQuery::new(0, 3))
-            .unwrap_err();
-        assert!(matches!(err, RuntimeError::LimitTooLarge { .. }));
+        assert_eq!(first.event_id, 3);
+        assert_eq!(observations.len(), 2);
+        assert!(matches!(
+            observations[0].payload,
+            protocol::Event::UserMessage { .. }
+        ));
+        assert!(matches!(
+            observations[1].payload,
+            protocol::Event::SystemItem { .. }
+        ));
     }
 
     #[test]
@@ -2253,7 +2134,7 @@ mod tests {
 
     #[cfg(feature = "fs-store")]
     #[test]
-    fn fs_store_restores_workers_events_and_transcripts() {
+    fn fs_store_restores_workers_events_and_protocol_observations() {
         let root = fs_store_root("restore");
         let runtime_id = RuntimeId::new("runtime-fs-authority").unwrap();
         let runtime = Runtime::with_fs_store_and_execution_backend(
@@ -2262,7 +2143,6 @@ mod tests {
                 runtime_id: Some(runtime_id.clone()),
                 display_name: Some("filesystem runtime".to_string()),
                 limits: RuntimeLimits {
-                    max_transcript_projection_items: 2,
                     max_event_batch_items: 2,
                 },
             },
@@ -2319,14 +2199,21 @@ mod tests {
                         && diagnostic.worker_ref.as_ref() == Some(&worker.worker_ref)
                 )
         );
-        assert_eq!(restored_worker.transcript_len, 2);
-
-        let projection = restored
-            .transcript_projection(&worker.worker_ref, TranscriptQuery::new(0, 1))
-            .unwrap();
-        assert_eq!(projection.total_items, 2);
-        assert_eq!(projection.items[0].content, "first");
-        assert_eq!(projection.next_start, Some(1));
+        #[cfg(feature = "ws-server")]
+        {
+            let observations = restored
+                .read_worker_observation_events(&worker.worker_ref, WorkerObservationCursor::zero())
+                .unwrap();
+            assert_eq!(observations.len(), 2);
+            assert!(matches!(
+                observations[0].payload,
+                protocol::Event::UserMessage { .. }
+            ));
+            assert!(matches!(
+                observations[1].payload,
+                protocol::Event::SystemItem { .. }
+            ));
+        }
 
         let cursor = restored.event_cursor_from_start().unwrap();
         let batch = restored.read_events(&cursor, 2).unwrap();
@@ -2337,11 +2224,6 @@ mod tests {
 
         let direct_events = store.read_events(&cursor, 2, 2).unwrap();
         assert_eq!(direct_events.events, batch.events);
-        let direct_transcript = store
-            .read_transcript(&worker.worker_ref, TranscriptQuery::new(1, 1), 2)
-            .unwrap();
-        assert_eq!(direct_transcript.items[0].content, "second");
-
         #[cfg(feature = "ws-server")]
         {
             let observation = restored
@@ -2352,12 +2234,12 @@ mod tests {
                     },
                 )
                 .unwrap();
-            assert_eq!(observation.sequence, 1);
+            assert_eq!(observation.sequence, 3);
             let observations = restored
                 .read_worker_observation_events(&worker.worker_ref, WorkerObservationCursor::zero())
                 .unwrap();
-            assert_eq!(observations.len(), 1);
-            assert_eq!(observations[0].cursor, observation.cursor);
+            assert_eq!(observations.len(), 3);
+            assert_eq!(observations[2].cursor, observation.cursor);
         }
 
         let _ = std::fs::remove_dir_all(root);

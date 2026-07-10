@@ -5,10 +5,9 @@ use crate::error::RuntimeError;
 use crate::execution::WorkerExecutionStatus;
 use crate::identity::{RuntimeId, WorkerId, WorkerRef};
 use crate::management::{RuntimeBackendKind, RuntimeLimits, RuntimeStatus};
-use crate::observation::{
-    EventCursor, RuntimeEvent, RuntimeEventBatch, TranscriptEntry, TranscriptProjection,
-    TranscriptQuery,
-};
+#[cfg(feature = "ws-server")]
+use crate::observation::WorkerObservationEvent;
+use crate::observation::{EventCursor, RuntimeEvent, RuntimeEventBatch};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -22,7 +21,8 @@ const RUNTIME_FILE: &str = "runtime.json";
 const EVENTS_FILE: &str = "events.jsonl";
 const WORKERS_DIR: &str = "workers";
 const WORKER_FILE: &str = "worker.json";
-const TRANSCRIPT_FILE: &str = "transcript.jsonl";
+#[cfg(feature = "ws-server")]
+const OBSERVATIONS_FILE: &str = "observations.jsonl";
 
 static NEXT_TMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -119,42 +119,6 @@ impl FsRuntimeStore {
         })
     }
 
-    /// Read a persisted Worker transcript directly from its Worker-scoped log.
-    pub fn read_transcript(
-        &self,
-        worker_ref: &WorkerRef,
-        query: TranscriptQuery,
-        max_limit: usize,
-    ) -> Result<TranscriptProjection, RuntimeError> {
-        self.ensure_worker_ref(worker_ref)?;
-        if query.limit > max_limit {
-            return Err(RuntimeError::LimitTooLarge {
-                requested: query.limit,
-                max: max_limit,
-            });
-        }
-
-        let path = self.transcript_path(&worker_ref.worker_id);
-        let entries = read_json_lines::<TranscriptEntry>(&path, "read transcript")?;
-        let total_items = entries.len();
-        let end = query.start.saturating_add(query.limit).min(total_items);
-        let items = if query.start >= total_items {
-            Vec::new()
-        } else {
-            entries[query.start..end].to_vec()
-        };
-        let next_start = (end < total_items).then_some(end);
-
-        Ok(TranscriptProjection {
-            worker_ref: worker_ref.clone(),
-            start: query.start,
-            limit: query.limit,
-            total_items,
-            items,
-            next_start,
-        })
-    }
-
     pub(crate) fn open_or_create(
         root: PathBuf,
         runtime_id: RuntimeId,
@@ -220,7 +184,12 @@ impl FsRuntimeStore {
             &WorkerSnapshot::from_persisted(worker),
             "write worker snapshot",
         )?;
-        ensure_file_exists(&worker_dir.join(TRANSCRIPT_FILE), "create transcript log")
+        #[cfg(feature = "ws-server")]
+        ensure_file_exists(
+            &worker_dir.join(OBSERVATIONS_FILE),
+            "create observations log",
+        )?;
+        Ok(())
     }
 
     pub(crate) fn append_event(&self, event: &RuntimeEvent) -> Result<(), RuntimeError> {
@@ -230,15 +199,16 @@ impl FsRuntimeStore {
         append_json_line(&self.events_path(), event, "append event")
     }
 
-    pub(crate) fn append_transcript_entry(
+    #[cfg(feature = "ws-server")]
+    pub(crate) fn append_worker_observation_event(
         &self,
-        entry: &TranscriptEntry,
+        event: &WorkerObservationEvent,
     ) -> Result<(), RuntimeError> {
-        self.ensure_worker_ref(&entry.worker_ref)?;
+        self.ensure_worker_ref(&event.worker_ref)?;
         append_json_line(
-            &self.transcript_path(&entry.worker_ref.worker_id),
-            entry,
-            "append transcript",
+            &self.observations_path(&event.worker_ref.worker_id),
+            event,
+            "append worker observation",
         )
     }
 
@@ -278,6 +248,9 @@ impl FsRuntimeStore {
             })?;
         worker_dirs.sort_by_key(|entry| entry.path());
 
+        #[cfg(feature = "ws-server")]
+        let mut observation_events = Vec::new();
+
         for entry in worker_dirs {
             let path = entry.path();
             if !path.is_dir() {
@@ -312,38 +285,44 @@ impl FsRuntimeStore {
                 );
                 continue;
             }
-            let transcript = match read_json_lines::<TranscriptEntry>(
-                &path.join(TRANSCRIPT_FILE),
-                "read transcript",
+            #[cfg(feature = "ws-server")]
+            let worker_observations = match read_json_lines::<WorkerObservationEvent>(
+                &path.join(OBSERVATIONS_FILE),
+                "read worker observations",
             ) {
-                Ok(transcript) => transcript,
+                Ok(events) => events,
                 Err(_error) => {
                     record_worker_load_diagnostic(
                         &mut snapshot,
                         Some(worker_snapshot.worker_ref.clone()),
-                        "ignored worker with unreadable transcript while loading runtime store",
+                        "ignored worker with unreadable observations while loading runtime store",
                     );
                     continue;
                 }
             };
-            let mut transcript_valid = true;
-            for entry in &transcript {
-                if self.ensure_worker_ref(&entry.worker_ref).is_err()
-                    || entry.worker_ref.worker_id != worker_snapshot.worker_id
+            #[cfg(feature = "ws-server")]
+            let mut observations_valid = true;
+            #[cfg(feature = "ws-server")]
+            for event in &worker_observations {
+                if self.ensure_worker_ref(&event.worker_ref).is_err()
+                    || event.worker_ref.worker_id != worker_snapshot.worker_id
                 {
-                    transcript_valid = false;
+                    observations_valid = false;
                     break;
                 }
             }
-            if !transcript_valid {
+            #[cfg(feature = "ws-server")]
+            if !observations_valid {
                 record_worker_load_diagnostic(
                     &mut snapshot,
                     Some(worker_snapshot.worker_ref.clone()),
-                    "ignored worker with invalid transcript while loading runtime store",
+                    "ignored worker with invalid observations while loading runtime store",
                 );
                 continue;
             }
-            let worker = worker_snapshot.into_persisted(transcript);
+            #[cfg(feature = "ws-server")]
+            observation_events.extend(worker_observations);
+            let worker = worker_snapshot.into_persisted();
             if workers.insert(worker.worker_id.clone(), worker).is_some() {
                 record_worker_load_diagnostic(
                     &mut snapshot,
@@ -353,7 +332,15 @@ impl FsRuntimeStore {
             }
         }
 
-        Ok(snapshot.into_persisted(events, workers))
+        #[cfg(feature = "ws-server")]
+        observation_events.sort_by_key(|event| event.sequence);
+
+        Ok(snapshot.into_persisted(
+            events,
+            workers,
+            #[cfg(feature = "ws-server")]
+            observation_events,
+        ))
     }
 
     fn ensure_worker_ref(&self, worker_ref: &WorkerRef) -> Result<(), RuntimeError> {
@@ -382,8 +369,9 @@ impl FsRuntimeStore {
             .join(encoded_component(worker_id.as_str()))
     }
 
-    fn transcript_path(&self, worker_id: &WorkerId) -> PathBuf {
-        self.worker_dir(worker_id).join(TRANSCRIPT_FILE)
+    #[cfg(feature = "ws-server")]
+    fn observations_path(&self, worker_id: &WorkerId) -> PathBuf {
+        self.worker_dir(worker_id).join(OBSERVATIONS_FILE)
     }
 }
 
@@ -405,6 +393,8 @@ pub(crate) struct PersistedRuntimeState {
     pub(crate) workers: BTreeMap<WorkerId, PersistedWorkerRecord>,
     pub(crate) config_bundles: BTreeMap<String, ConfigBundle>,
     pub(crate) events: Vec<RuntimeEvent>,
+    #[cfg(feature = "ws-server")]
+    pub(crate) observation_events: Vec<WorkerObservationEvent>,
     pub(crate) diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -415,8 +405,6 @@ pub(crate) struct PersistedWorkerRecord {
     pub(crate) status: WorkerStatus,
     pub(crate) request: CreateWorkerRequest,
     pub(crate) execution: WorkerExecutionStatus,
-    pub(crate) transcript: Vec<TranscriptEntry>,
-    pub(crate) next_transcript_sequence: u64,
     pub(crate) last_event_id: u64,
 }
 
@@ -504,6 +492,7 @@ impl RuntimeSnapshot {
         self,
         events: Vec<RuntimeEvent>,
         workers: BTreeMap<WorkerId, PersistedWorkerRecord>,
+        #[cfg(feature = "ws-server")] observation_events: Vec<WorkerObservationEvent>,
     ) -> PersistedRuntimeState {
         PersistedRuntimeState {
             runtime_id: self.runtime_id,
@@ -516,6 +505,8 @@ impl RuntimeSnapshot {
             workers,
             config_bundles: self.config_bundles,
             events,
+            #[cfg(feature = "ws-server")]
+            observation_events,
             diagnostics: self.diagnostics,
         }
     }
@@ -530,7 +521,6 @@ struct WorkerSnapshot {
     request: CreateWorkerRequest,
     #[serde(default = "WorkerExecutionStatus::unconnected")]
     execution: WorkerExecutionStatus,
-    next_transcript_sequence: u64,
     last_event_id: u64,
 }
 
@@ -543,7 +533,6 @@ impl WorkerSnapshot {
             status: worker.status,
             request: worker.request.clone(),
             execution: worker.execution.clone(),
-            next_transcript_sequence: worker.next_transcript_sequence,
             last_event_id: worker.last_event_id,
         }
     }
@@ -582,15 +571,13 @@ impl WorkerSnapshot {
         Ok(())
     }
 
-    fn into_persisted(self, transcript: Vec<TranscriptEntry>) -> PersistedWorkerRecord {
+    fn into_persisted(self) -> PersistedWorkerRecord {
         PersistedWorkerRecord {
             worker_ref: self.worker_ref,
             worker_id: self.worker_id,
             status: self.status,
             request: self.request,
             execution: self.execution,
-            transcript,
-            next_transcript_sequence: self.next_transcript_sequence,
             last_event_id: self.last_event_id,
         }
     }

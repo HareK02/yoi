@@ -170,10 +170,10 @@ pub struct WorkingDirectoryStatus {
 /// Browser/product launch semantics are resolved by a backend before this
 /// request is built. The request contains only durable Runtime identity inputs:
 /// a backend-decided profile selector, the Decodal profile source archive source
-/// used to resolve that selector, optional initial user input committed with the
-/// Worker catalog/transcript persistence, and an optional Runtime-owned working
-/// directory binding. Browser-facing status for materialized working directories
-/// is summarized without exposing raw host paths.
+/// used to resolve that selector, optional initial user input committed as a
+/// protocol observation event, and an optional Runtime-owned working directory
+/// binding. Browser-facing status for materialized working directories is
+/// summarized without exposing raw host paths.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateWorkerRequest {
     pub profile: ProfileSelector,
@@ -215,7 +215,6 @@ pub struct WorkerSummary {
     pub profile_source: ProfileSourceArchiveRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_bundle: Option<ConfigBundleRef>,
-    pub transcript_len: usize,
     pub last_event_id: u64,
 }
 
@@ -231,7 +230,6 @@ pub struct WorkerDetail {
     pub profile_source: ProfileSourceArchiveRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_bundle: Option<ConfigBundleRef>,
-    pub transcript_len: usize,
     pub last_event_id: u64,
 }
 

@@ -53,71 +53,64 @@ Deno.test("segmentsToText preserves protocol segment semantics", () => {
   );
 });
 
-Deno.test("projectConsole projects initial console output and live visible protocol rows", () => {
-  const projection = projectConsole(
-    [
-      {
-        sequence: 1,
-        role: "user",
-        content: "transcript input",
-        event_id: 10,
-      },
-    ],
-    [
-      {
-        cursor: "11",
-        event: {
-          event: "text_delta",
-          data: { text: "stream" },
-        } satisfies Event,
-      },
-      {
-        cursor: "12",
-        event: {
-          event: "thinking_done",
-          data: { text: "reasoning" },
-        } satisfies Event,
-      },
-      {
-        cursor: "13",
-        event: {
-          event: "tool_result",
-          data: {
-            id: "tool-1",
-            summary: "read file",
-            output: "content",
-            is_error: false,
-          },
-        } satisfies Event,
-      },
-      {
-        cursor: "14",
-        event: {
-          event: "usage",
-          data: { input_tokens: 12, output_tokens: 5 },
-        } satisfies Event,
-      },
-      {
-        cursor: "15",
-        event: {
-          event: "error",
-          data: { code: "invalid_request", message: "bad frame" },
-        } satisfies Event,
-      },
-    ],
-  );
+Deno.test("projectConsole projects visible protocol rows", () => {
+  const projection = projectConsole([
+    {
+      cursor: "10",
+      event: {
+        event: "user_message",
+        data: { segments: [{ kind: "text", content: "input" }] },
+      } satisfies Event,
+    },
+    {
+      cursor: "11",
+      event: {
+        event: "text_delta",
+        data: { text: "stream" },
+      } satisfies Event,
+    },
+    {
+      cursor: "12",
+      event: {
+        event: "thinking_done",
+        data: { text: "reasoning" },
+      } satisfies Event,
+    },
+    {
+      cursor: "13",
+      event: {
+        event: "tool_result",
+        data: {
+          id: "tool-1",
+          summary: "read file",
+          output: "content",
+          is_error: false,
+        },
+      } satisfies Event,
+    },
+    {
+      cursor: "14",
+      event: {
+        event: "usage",
+        data: { input_tokens: 12, output_tokens: 5 },
+      } satisfies Event,
+    },
+    {
+      cursor: "15",
+      event: {
+        event: "error",
+        data: { code: "invalid_request", message: "bad frame" },
+      } satisfies Event,
+    },
+  ]);
 
   assert(
-    projection.lines.some((line) =>
-      line.source === "initial" && line.kind === "user"
-    ),
-    "initial user row expected",
+    projection.lines.some((line) => line.source === "event" && line.kind === "user"),
+    "user protocol row expected",
   );
   assert(
-    projection.lines.some((line) =>
-      line.source === "live" && line.kind === "assistant"
-    ),
-    "assistant live row expected",
+    projection.lines.some((line) => line.source === "event" && line.kind === "assistant"),
+    "assistant protocol row expected",
   );
   assert(
     projection.lines.some((line) => line.kind === "thinking"),
@@ -141,85 +134,25 @@ Deno.test("projectConsole projects initial console output and live visible proto
   );
 });
 
-Deno.test("projectConsole suppresses replayed live conversation rows already present in initial transcript", () => {
-  const projection = projectConsole(
-    [
-      {
-        sequence: 1,
-        role: "user",
-        content: "hello",
-        event_id: 10,
-      },
-      {
-        sequence: 2,
-        role: "assistant",
-        content: "world",
-        event_id: 11,
-      },
-    ],
-    [
-      {
-        cursor: "12",
-        event: {
-          event: "user_message",
-          data: { segments: [{ kind: "text", content: "hello" }] },
-        } satisfies Event,
-      },
-      {
-        cursor: "13",
-        event: { event: "text_delta", data: { text: "wo" } } satisfies Event,
-      },
-      {
-        cursor: "14",
-        event: { event: "text_delta", data: { text: "rld" } } satisfies Event,
-      },
-      {
-        cursor: "15",
-        event: { event: "text_done", data: { text: "world" } } satisfies Event,
-      },
-      {
-        cursor: "16",
-        event: { event: "status", data: { status: "idle" } } satisfies Event,
-      },
-    ],
-  );
-
-  assertEquals(
-    projection.lines.map((line) => `${line.source}:${line.kind}:${line.body}`),
-    ["initial:user:hello", "initial:assistant:world"],
-  );
-  assertEquals(projection.status, "idle");
-});
-
-Deno.test("projectConsole preserves live assistant stream not yet present in initial transcript", () => {
-  const projection = projectConsole(
-    [
-      {
-        sequence: 1,
-        role: "user",
-        content: "hello",
-        event_id: 10,
-      },
-    ],
-    [
-      {
-        cursor: "13",
-        event: { event: "text_delta", data: { text: "new" } } satisfies Event,
-      },
-    ],
-  );
+Deno.test("projectConsole preserves in-progress assistant protocol stream", () => {
+  const projection = projectConsole([
+    {
+      cursor: "13",
+      event: { event: "text_delta", data: { text: "new" } } satisfies Event,
+    },
+  ]);
 
   assert(
     projection.lines.some((line) =>
-      line.source === "live" && line.kind === "assistant" &&
+      line.source === "event" && line.kind === "assistant" &&
       line.body === "new" && line.streaming
     ),
-    "live in-progress assistant stream should remain visible",
+    "in-progress assistant stream should remain visible",
   );
 });
 
 Deno.test("projectConsole keeps protocol lifecycle events out of the console surface", () => {
-  const projection = projectConsole([], [
+  const projection = projectConsole([
     {
       cursor: "30",
       event: { event: "status", data: { status: "running" } } satisfies Event,
@@ -250,7 +183,7 @@ Deno.test("projectConsole keeps protocol lifecycle events out of the console sur
 });
 
 Deno.test("projectConsole uses snapshot for state without rendering it as console output", () => {
-  const projection = projectConsole([], [
+  const projection = projectConsole([
     {
       cursor: "20",
       event: {
@@ -270,14 +203,7 @@ Deno.test("projectConsole uses snapshot for state without rendering it as consol
           status: "running",
           in_flight: {
             blocks: [
-              { kind: "text", text: "unfinished answer", finished: false },
-              {
-                kind: "tool_call",
-                id: "call-1",
-                name: "Read",
-                args: "{}",
-                state: "streaming_args",
-              },
+              { kind: "text", text: "partial" },
             ],
           },
         },
@@ -285,13 +211,9 @@ Deno.test("projectConsole uses snapshot for state without rendering it as consol
     },
   ]);
 
-  assert(projection.status === "running", "snapshot should update status");
-  assert(
-    !projection.lines.some((line) => line.title.includes("snapshot")),
-    "snapshot should not render as a console row",
-  );
-  assert(
-    projection.lines.filter((line) => line.kind === "in_flight").length === 2,
-    "in-flight rows expected",
+  assertEquals(projection.status, "running");
+  assertEquals(
+    projection.lines.map((line) => `${line.kind}:${line.body}:${line.streaming}`),
+    ["in_flight:partial:true"],
   );
 });

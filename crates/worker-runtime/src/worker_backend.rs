@@ -820,7 +820,7 @@ mod tests {
     use crate::execution::WorkerExecutionContext;
     use crate::identity::RuntimeId;
     use crate::management::RuntimeOptions;
-    use crate::observation::{TranscriptQuery, TranscriptRole};
+    use crate::observation::WorkerObservationCursor;
     use crate::working_directory::LocalGitWorktreeMaterializer;
     use async_trait::async_trait;
     use futures::Stream;
@@ -1128,27 +1128,27 @@ mod tests {
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let projection = runtime
-                .transcript_projection(&detail.worker_ref, TranscriptQuery::new(0, 10))
+            let observations = runtime
+                .read_worker_observation_events(&detail.worker_ref, WorkerObservationCursor::zero())
                 .unwrap();
-            if projection.items.iter().any(|item| {
-                item.role == TranscriptRole::Assistant && item.content == "hello from worker"
+            if observations.iter().any(|event| {
+                matches!(
+                    &event.payload,
+                    protocol::Event::TextDone { text } if text == "hello from worker"
+                )
             }) {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "timed out waiting for assistant transcript projection"
+                "timed out waiting for assistant protocol observation"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
 
         assert_eq!(client.captured.lock().unwrap().len(), 1);
         let observations = runtime
-            .read_worker_observation_events(
-                &detail.worker_ref,
-                crate::observation::WorkerObservationCursor::zero(),
-            )
+            .read_worker_observation_events(&detail.worker_ref, WorkerObservationCursor::zero())
             .unwrap();
         assert!(
             observations

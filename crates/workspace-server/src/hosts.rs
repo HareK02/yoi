@@ -19,9 +19,10 @@ use worker_runtime::catalog::{
     WorkerStatus as EmbeddedWorkerStatus, WorkingDirectoryClaim, WorkingDirectoryRequest,
     WorkingDirectoryStatus, WorkingDirectorySummary,
 };
+use worker_runtime::config_bundle::{ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary};
+#[cfg(test)]
 use worker_runtime::config_bundle::{
-    ConfigBundle, ConfigBundleAvailability, ConfigBundleMetadata, ConfigBundleProvenance,
-    ConfigBundleSummary, ConfigProfileDescriptor,
+    ConfigBundleMetadata, ConfigBundleProvenance, ConfigProfileDescriptor,
 };
 use worker_runtime::error::RuntimeError as EmbeddedRuntimeError;
 use worker_runtime::execution::{
@@ -30,10 +31,10 @@ use worker_runtime::execution::{
 use worker_runtime::fs_store::FsRuntimeStoreOptions;
 use worker_runtime::http_server::{
     RuntimeHttpConfigBundleAvailabilityResponse, RuntimeHttpConfigBundleSyncRequest,
-    RuntimeHttpErrorResponse, RuntimeHttpSummaryResponse, RuntimeHttpTranscriptResponse,
-    RuntimeHttpWorkerInputResponse, RuntimeHttpWorkerLifecycleRequest,
-    RuntimeHttpWorkerLifecycleResponse, RuntimeHttpWorkerResponse, RuntimeHttpWorkersResponse,
-    RuntimeHttpWorkingDirectoriesResponse, RuntimeHttpWorkingDirectoryResponse,
+    RuntimeHttpErrorResponse, RuntimeHttpSummaryResponse, RuntimeHttpWorkerInputResponse,
+    RuntimeHttpWorkerLifecycleRequest, RuntimeHttpWorkerLifecycleResponse,
+    RuntimeHttpWorkerResponse, RuntimeHttpWorkersResponse, RuntimeHttpWorkingDirectoriesResponse,
+    RuntimeHttpWorkingDirectoryResponse,
 };
 use worker_runtime::identity::{
     RuntimeId as EmbeddedRuntimeId, WorkerId as EmbeddedWorkerId, WorkerRef as EmbeddedWorkerRef,
@@ -42,9 +43,6 @@ use worker_runtime::interaction::{
     WorkerInput as EmbeddedWorkerInput, WorkerInputKind as EmbeddedWorkerInputKind,
 };
 use worker_runtime::management::{RuntimeOptions as EmbeddedRuntimeOptions, RuntimeStatus};
-use worker_runtime::observation::{
-    TranscriptProjection as EmbeddedTranscriptProjection, TranscriptQuery, TranscriptRole,
-};
 use worker_runtime::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveInput};
 
 const EMBEDDED_RUNTIME_ID: &str = "embedded-worker-runtime";
@@ -454,31 +452,7 @@ pub struct WorkerInputResult {
     pub runtime_id: String,
     pub worker_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub transcript_sequence: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub event_id: Option<u64>,
-    pub diagnostics: Vec<RuntimeDiagnostic>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkerTranscriptItem {
-    pub sequence: u64,
-    pub role: String,
-    pub content: String,
-    pub event_id: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkerTranscriptProjection {
-    pub state: WorkerOperationState,
-    pub runtime_id: String,
-    pub worker_id: String,
-    pub start: usize,
-    pub limit: usize,
-    pub total_items: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_start: Option<usize>,
-    pub items: Vec<WorkerTranscriptItem>,
     pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
@@ -705,38 +679,12 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
             state: WorkerOperationState::Unsupported,
             runtime_id: self.runtime_id().to_string(),
             worker_id: worker_id.to_string(),
-            transcript_sequence: None,
             event_id: None,
             diagnostics: vec![diagnostic(
                 "worker_input_pending",
                 DiagnosticSeverity::Info,
                 format!(
                     "worker input for '{worker_id}' is reserved for the runtime service boundary and is not implemented by this registry source"
-                ),
-            )],
-        }
-    }
-
-    fn transcript(
-        &self,
-        worker_id: &str,
-        start: usize,
-        limit: usize,
-    ) -> WorkerTranscriptProjection {
-        WorkerTranscriptProjection {
-            state: WorkerOperationState::Unsupported,
-            runtime_id: self.runtime_id().to_string(),
-            worker_id: worker_id.to_string(),
-            start,
-            limit,
-            total_items: 0,
-            next_start: None,
-            items: Vec::new(),
-            diagnostics: vec![diagnostic(
-                "worker_transcript_pending",
-                DiagnosticSeverity::Info,
-                format!(
-                    "bounded transcript for '{worker_id}' is not implemented by this registry source"
                 ),
             )],
         }
@@ -1048,27 +996,6 @@ impl RuntimeRegistry {
             ));
         }
         Ok(runtime.send_input(worker_id, request))
-    }
-
-    pub fn transcript(
-        &self,
-        runtime_id: &str,
-        worker_id: &str,
-        start: usize,
-        limit: usize,
-    ) -> Result<WorkerTranscriptProjection, RuntimeRegistryError> {
-        validate_backend_identifier("runtime_id", runtime_id)?;
-        validate_backend_identifier("worker_id", worker_id)?;
-        let runtime = self.runtime(runtime_id)?;
-        let lookup = runtime.worker(worker_id);
-        if lookup.worker.is_none() {
-            return Err(operation_failed_or_unknown_worker(
-                runtime_id,
-                worker_id,
-                lookup.diagnostics,
-            ));
-        }
-        Ok(runtime.transcript(worker_id, start, limit))
     }
 
     pub fn stop_worker(
@@ -1781,7 +1708,6 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 state: WorkerOperationState::Accepted,
                 runtime_id: self.runtime_id.clone(),
                 worker_id: worker_id.to_string(),
-                transcript_sequence: Some(ack.transcript_sequence),
                 event_id: Some(ack.event_id),
                 diagnostics: Vec::new(),
             },
@@ -1789,42 +1715,6 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 &self.runtime_id,
                 worker_id,
                 embedded_runtime_diagnostic(&error),
-            ),
-        }
-    }
-
-    fn transcript(
-        &self,
-        worker_id: &str,
-        start: usize,
-        limit: usize,
-    ) -> WorkerTranscriptProjection {
-        let Some(worker_ref) = self.worker_ref(worker_id) else {
-            return embedded_transcript_rejected(
-                &self.runtime_id,
-                worker_id,
-                start,
-                limit,
-                diagnostic(
-                    "embedded_worker_id_invalid",
-                    DiagnosticSeverity::Warning,
-                    "Worker id was empty and cannot be resolved".to_string(),
-                ),
-            );
-        };
-        match self
-            .runtime
-            .transcript_projection(&worker_ref, TranscriptQuery::new(start, limit))
-        {
-            Ok(projection) => {
-                embedded_transcript_projection(&self.runtime_id, worker_id, projection)
-            }
-            Err(err) => embedded_transcript_rejected(
-                &self.runtime_id,
-                worker_id,
-                start,
-                limit,
-                embedded_runtime_diagnostic(&err),
             ),
         }
     }
@@ -2444,29 +2334,10 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 state: WorkerOperationState::Accepted,
                 runtime_id: self.runtime_id.clone(),
                 worker_id: worker_id.to_string(),
-                transcript_sequence: Some(response.ack.transcript_sequence),
                 event_id: Some(response.ack.event_id),
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => remote_input_rejected(&self.runtime_id, worker_id, diagnostic),
-        }
-    }
-
-    fn transcript(
-        &self,
-        worker_id: &str,
-        start: usize,
-        limit: usize,
-    ) -> WorkerTranscriptProjection {
-        match self.get_json::<RuntimeHttpTranscriptResponse>(&format!(
-            "/v1/workers/{worker_id}/transcript?start={start}&limit={limit}"
-        )) {
-            Ok(response) => {
-                embedded_transcript_projection(&self.runtime_id, worker_id, response.transcript)
-            }
-            Err(diagnostic) => {
-                embedded_transcript_rejected(&self.runtime_id, worker_id, start, limit, diagnostic)
-            }
         }
     }
 }
@@ -2676,12 +2547,14 @@ fn default_profile_source_archive_http_source(
     })
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProfileSourceArchiveTransport {
     Inline,
     BackendResourceHandle,
 }
 
+#[cfg(test)]
 fn default_embedded_config_bundle(
     profile: &ProfileSelector,
     workspace_id: &str,
@@ -2844,7 +2717,6 @@ fn embedded_input_rejected(
         state: WorkerOperationState::Rejected,
         runtime_id: runtime_id.to_string(),
         worker_id: worker_id.to_string(),
-        transcript_sequence: None,
         event_id: None,
         diagnostics: vec![diagnostic],
     }
@@ -2859,7 +2731,6 @@ fn remote_input_rejected(
         state: WorkerOperationState::Rejected,
         runtime_id: runtime_id.to_string(),
         worker_id: worker_id.to_string(),
-        transcript_sequence: None,
         event_id: None,
         diagnostics: vec![diagnostic],
     }
@@ -2890,61 +2761,6 @@ fn remote_lifecycle_rejected(
         worker_id: worker_id.to_string(),
         event_id: None,
         diagnostics: vec![diagnostic],
-    }
-}
-
-fn embedded_transcript_projection(
-    runtime_id: &str,
-    worker_id: &str,
-    projection: EmbeddedTranscriptProjection,
-) -> WorkerTranscriptProjection {
-    WorkerTranscriptProjection {
-        state: WorkerOperationState::Accepted,
-        runtime_id: runtime_id.to_string(),
-        worker_id: worker_id.to_string(),
-        start: projection.start,
-        limit: projection.limit,
-        total_items: projection.total_items,
-        next_start: projection.next_start,
-        items: projection
-            .items
-            .into_iter()
-            .map(|item| WorkerTranscriptItem {
-                sequence: item.sequence,
-                role: embedded_transcript_role_label(item.role).to_string(),
-                content: item.content,
-                event_id: item.event_id,
-            })
-            .collect(),
-        diagnostics: Vec::new(),
-    }
-}
-
-fn embedded_transcript_rejected(
-    runtime_id: &str,
-    worker_id: &str,
-    start: usize,
-    limit: usize,
-    diagnostic: RuntimeDiagnostic,
-) -> WorkerTranscriptProjection {
-    WorkerTranscriptProjection {
-        state: WorkerOperationState::Rejected,
-        runtime_id: runtime_id.to_string(),
-        worker_id: worker_id.to_string(),
-        start,
-        limit,
-        total_items: 0,
-        next_start: None,
-        items: Vec::new(),
-        diagnostics: vec![diagnostic],
-    }
-}
-
-fn embedded_transcript_role_label(role: TranscriptRole) -> &'static str {
-    match role {
-        TranscriptRole::User => "user",
-        TranscriptRole::Assistant => "assistant",
-        TranscriptRole::System => "system",
     }
 }
 
@@ -3814,7 +3630,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_runtime_with_execution_backend_routes_input_and_projects_transcript() {
+    fn embedded_runtime_with_execution_backend_routes_input_and_updates_status() {
         let runtime = EmbeddedWorkerRuntime::new_memory_with_execution_backend(
             "local:test",
             Arc::new(AcceptingExecutionBackend::default()),
@@ -3841,13 +3657,7 @@ mod tests {
                 .worker(&worker.worker_id)
                 .worker
                 .expect("worker detail");
-            let transcript = runtime.transcript(&worker.worker_id, 0, 10);
-            if detail.status == "idle"
-                && transcript
-                    .items
-                    .iter()
-                    .any(|entry| entry.role == "assistant" && entry.content == "echo: hello")
-            {
+            if detail.status == "idle" {
                 assert!(detail.capabilities.can_accept_input);
                 break;
             }
@@ -3860,7 +3670,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_runtime_registers_routes_input_and_transcript_without_internal_leaks() {
+    fn embedded_runtime_registers_routes_input_without_internal_leaks() {
         let registry = RuntimeRegistry::for_workspace(
             EmbeddedWorkerRuntime::new_memory_with_execution_backend(
                 "local:test",
@@ -3933,18 +3743,11 @@ mod tests {
         assert_eq!(input.runtime_id, EMBEDDED_RUNTIME_ID);
         assert_eq!(input.worker_id, worker.worker_id);
 
-        let transcript = registry
-            .transcript(EMBEDDED_RUNTIME_ID, &worker.worker_id, 0, 10)
+        let detail = registry
+            .worker(EMBEDDED_RUNTIME_ID, &worker.worker_id)
             .unwrap();
-        assert_eq!(transcript.state, WorkerOperationState::Accepted);
-        assert!(
-            transcript
-                .items
-                .iter()
-                .any(|entry| entry.role == "user" && entry.content == "hello embedded runtime")
-        );
 
-        let json = serde_json::to_string(&(embedded_summary, worker, transcript)).unwrap();
+        let json = serde_json::to_string(&(embedded_summary, worker, input, detail)).unwrap();
         for forbidden in [
             "/workspace/project",
             "metadata.json",
@@ -3953,6 +3756,7 @@ mod tests {
             "token",
             "credential",
             "provider",
+            "transcript",
             "can_stream_events",
             "can_read_bounded_transcript",
         ] {
@@ -4093,7 +3897,6 @@ mod tests {
                     "ack": {
                         "worker_ref": { "runtime_id": "remote:primary", "worker_id": "worker-remote-1" },
                         "status": "running",
-                        "transcript_sequence": 7,
                         "event_id": 8
                     }
                 })
@@ -4157,7 +3960,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(input.state, WorkerOperationState::Accepted);
-        assert_eq!(input.transcript_sequence, Some(7));
         assert_eq!(input.event_id, Some(8));
 
         server.join().expect("mock remote server finished");
@@ -4482,7 +4284,6 @@ mod tests {
                 "source_graph": { "source_count": 0, "total_source_bytes": 0, "entrypoints": {}, "import_count": 0 }
             },
             "config_bundle": { "id": "remote-bundle", "digest": "remote-digest" },
-            "transcript_len": 0,
             "last_event_id": 0
         })
     }

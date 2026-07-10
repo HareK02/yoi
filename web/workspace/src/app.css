@@ -967,13 +967,18 @@
 }
 
 .worker-console-shell {
-    min-height: 100dvh;
-    padding-bottom: 0;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    height: calc(100dvh - (var(--space-6) * 2));
+    overflow: hidden;
 }
 
 .worker-console-shell > .console-body {
     flex: 1 1 auto;
     min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
 }
 
 .console-header-actions {
@@ -1018,12 +1023,10 @@
 .console-log {
     display: grid;
     align-content: start;
-    gap: var(--space-2);
-    max-height: none;
+    gap: var(--space-3);
     min-height: 0;
     margin: 0;
     padding: 0;
-    overflow-y: auto;
     list-style: none;
 }
 
@@ -1134,6 +1137,7 @@
     position: sticky;
     bottom: 0;
     z-index: 2;
+    flex: 0 0 auto;
     display: grid;
     gap: var(--space-3);
     margin-inline: calc(-1 * var(--space-6));

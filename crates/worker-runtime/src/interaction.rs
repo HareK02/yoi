@@ -10,8 +10,7 @@ pub enum WorkerInputKind {
     System,
 }
 
-/// Worker input request.  v0 stores the input in an in-memory transcript and
-/// does not execute providers/tools.
+/// Worker input request accepted by a Runtime Worker.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerInput {
     pub kind: WorkerInputKind,
@@ -34,11 +33,10 @@ impl WorkerInput {
     }
 }
 
-/// Acknowledgement returned after input is accepted into the in-memory Worker.
+/// Acknowledgement returned after input is accepted into the Worker.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerInteractionAck {
     pub worker_ref: WorkerRef,
     pub status: WorkerStatus,
-    pub transcript_sequence: u64,
     pub event_id: u64,
 }

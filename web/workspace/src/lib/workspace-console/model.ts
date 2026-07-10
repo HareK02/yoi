@@ -3,7 +3,6 @@ import type {
   InFlightBlock,
   Segment,
 } from "$lib/generated/protocol";
-import type { WorkerTranscriptItem } from "$lib/workspace-sidebar/types";
 import { workspaceRoute } from "$lib/workspace-api/http";
 
 export type ConsoleLineKind =
@@ -24,7 +23,7 @@ export type ConsoleLine = {
   body: string;
   detail?: string;
   cursor?: string | null;
-  source: "initial" | "live";
+  source: "event";
   streaming?: boolean;
   error?: boolean;
 };
@@ -60,101 +59,15 @@ export function workerConsolePath(
   return workerConsoleHref({ runtime_id: runtimeId, worker_id: workerId }, workspaceId);
 }
 
-export function initialConsoleLines(items: WorkerTranscriptItem[]): ConsoleLine[] {
-  return items.map((item) => ({
-    id: `initial-${item.event_id}-${item.sequence}`,
-    kind: initialRoleKind(item.role),
-    title: item.role,
-    body: item.content,
-    source: "initial",
-  }));
-}
+export type ConsoleEventInput = { cursor: string; event: ProtocolEvent };
 
-export function projectConsole(
-  initialItems: WorkerTranscriptItem[],
-  events: Array<{ cursor: string; event: ProtocolEvent }> = [],
-): ConsoleProjection {
-  const visibleEvents = dedupeInitialTranscriptReplay(initialItems, events);
-  return visibleEvents.reduce(applyProtocolEvent, {
-    lines: initialConsoleLines(initialItems),
+export function projectConsole(events: ConsoleEventInput[] = []): ConsoleProjection {
+  return events.reduce(applyProtocolEvent, {
+    lines: [],
     status: null,
     usage: null,
     lastCursor: null,
   });
-}
-
-type EventEnvelope = { cursor: string; event: ProtocolEvent };
-
-function dedupeInitialTranscriptReplay(
-  initialItems: WorkerTranscriptItem[],
-  events: EventEnvelope[],
-): EventEnvelope[] {
-  const remainingInitial = new Map<string, number>();
-  for (const item of initialItems) {
-    if (item.role !== "user" && item.role !== "assistant") continue;
-    const key = transcriptKey(item.role, item.content);
-    remainingInitial.set(key, (remainingInitial.get(key) ?? 0) + 1);
-  }
-
-  const output: EventEnvelope[] = [];
-  let pendingAssistant: EventEnvelope[] = [];
-  let pendingAssistantText = "";
-
-  const flushPendingAssistant = () => {
-    if (pendingAssistant.length === 0) return;
-    output.push(...pendingAssistant);
-    pendingAssistant = [];
-    pendingAssistantText = "";
-  };
-
-  for (const envelope of events) {
-    const event = envelope.event;
-    if (event.event === "user_message") {
-      flushPendingAssistant();
-      const body = segmentsToText(event.data.segments);
-      if (consumeTranscriptKey(remainingInitial, "user", body)) continue;
-      output.push(envelope);
-      continue;
-    }
-    if (event.event === "text_delta") {
-      pendingAssistant.push(envelope);
-      pendingAssistantText += event.data.text;
-      continue;
-    }
-    if (event.event === "text_done") {
-      const body = event.data.text || pendingAssistantText;
-      if (!consumeTranscriptKey(remainingInitial, "assistant", body)) {
-        output.push(...pendingAssistant, envelope);
-      }
-      pendingAssistant = [];
-      pendingAssistantText = "";
-      continue;
-    }
-    flushPendingAssistant();
-    output.push(envelope);
-  }
-  flushPendingAssistant();
-  return output;
-}
-
-function consumeTranscriptKey(
-  remainingInitial: Map<string, number>,
-  role: "user" | "assistant",
-  body: string,
-): boolean {
-  const key = transcriptKey(role, body);
-  const remaining = remainingInitial.get(key) ?? 0;
-  if (remaining <= 0) return false;
-  if (remaining === 1) {
-    remainingInitial.delete(key);
-  } else {
-    remainingInitial.set(key, remaining - 1);
-  }
-  return true;
-}
-
-function transcriptKey(role: "user" | "assistant", body: string): string {
-  return `${role}\0${body}`;
 }
 
 export function applyProtocolEvent(
@@ -353,13 +266,6 @@ export function segmentsToText(segments: Segment[]): string {
     .join("\n");
 }
 
-function initialRoleKind(role: string): ConsoleLineKind {
-  if (role === "user" || role === "assistant" || role === "system") {
-    return role;
-  }
-  return "system";
-}
-
 function line(
   cursor: string,
   kind: ConsoleLineKind,
@@ -376,7 +282,7 @@ function line(
     body,
     detail,
     cursor,
-    source: "live",
+    source: "event",
     streaming,
     error,
   };

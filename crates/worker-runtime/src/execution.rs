@@ -305,7 +305,7 @@ pub enum WorkerExecutionSpawnResult {
 
 /// Backend boundary for Worker execution.
 ///
-/// Runtime owns Worker catalog, transcript, observation, and lifecycle state. A
+/// Runtime owns Worker catalog, protocol observation, and lifecycle state. A
 /// backend owns concrete execution. The default Runtime has no backend, so input
 /// to those Workers is rejected instead of producing providerless responses.
 pub trait WorkerExecutionBackend: Send + Sync + 'static {

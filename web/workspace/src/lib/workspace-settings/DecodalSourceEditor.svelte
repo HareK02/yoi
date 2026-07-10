@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import { EditorState } from '@codemirror/state';
   import { EditorView, keymap, lineNumbers, highlightActiveLine, drawSelection } from '@codemirror/view';
   import { decodal } from 'decodal-codemirror';
@@ -16,7 +17,7 @@
   } = $props();
 
   let host = $state<HTMLDivElement | null>(null);
-  let view = $state<EditorView | null>(null);
+  let view: EditorView | null = null;
 
   const theme = EditorView.theme({
     '&': {
@@ -35,20 +36,23 @@
 
   $effect(() => {
     if (!host || view) return;
+    const initialValue = untrack(() => value);
+    const initialReadonly = untrack(() => readonly);
+    const handleChange = untrack(() => onChange);
     const editor = new EditorView({
       parent: host,
       state: EditorState.create({
-        doc: value,
+        doc: initialValue,
         extensions: [
           lineNumbers(),
           drawSelection(),
           highlightActiveLine(),
           decodal(),
           keymap.of([]),
-          EditorState.readOnly.of(readonly),
-          EditorView.editable.of(!readonly),
+          EditorState.readOnly.of(initialReadonly),
+          EditorView.editable.of(!initialReadonly),
           EditorView.updateListener.of((update) => {
-            if (update.docChanged) onChange(update.state.doc.toString());
+            if (update.docChanged) handleChange(update.state.doc.toString());
           }),
           theme,
         ],

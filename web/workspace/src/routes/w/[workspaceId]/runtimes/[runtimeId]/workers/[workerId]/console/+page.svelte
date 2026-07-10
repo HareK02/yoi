@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import {
     projectConsole,
     type ConsoleLine
@@ -8,8 +9,7 @@
     ClientWorkerEventWsFrame,
     Diagnostic,
     Worker,
-    WorkerInputResult,
-    WorkerTranscriptProjection
+    WorkerInputResult
   } from '$lib/workspace-sidebar/types';
 
   type Props = {
@@ -32,15 +32,17 @@
 
   let worker = $state<Worker | null>(null);
   let workerError = $state<string | null>(null);
-  let transcript = $state<WorkerTranscriptProjection | null>(null);
-  let transcriptError = $state<string | null>(null);
   let draft = $state('');
   let sending = $state(false);
   let sendError = $state<string | null>(null);
   let streamState = $state<'connecting' | 'open' | 'closed' | 'error'>('connecting');
   let streamDiagnostics = $state<Diagnostic[]>([]);
   let workerDetailsOpen = $state(false);
+  let consoleBodyElement: HTMLElement | null = null;
+  let autoFollowConsole = $state(true);
+  const CONSOLE_BOTTOM_THRESHOLD_PX = 48;
   let observedEvents = $state<Array<{ cursor: string; event: ClientWorkerEventWsFrame & { kind: 'event' } }>>([]);
+  let seenObservationEventIds = new Set<string>();
   let nextReloadToken = 0;
   let reloadToken = $state(0);
 
@@ -52,15 +54,10 @@
   const consoleTarget = $derived({ runtimeId, workerId });
 
   const projection = $derived(
-    projectConsole(
-      transcript?.items ?? [],
-      observedEvents.map((item) => ({ cursor: item.cursor, event: item.event.envelope.payload }))
-    )
+    projectConsole(observedEvents.map((item) => ({ cursor: item.cursor, event: item.event.envelope.payload })))
   );
   const lines = $derived(projection.lines);
-  const diagnostics = $derived(
-    mergeDiagnostics(worker?.diagnostics ?? [], transcript?.diagnostics ?? [], streamDiagnostics)
-  );
+  const diagnostics = $derived(mergeDiagnostics(worker?.diagnostics ?? [], streamDiagnostics));
   const canSend = $derived(Boolean(worker?.capabilities.can_accept_input) && draft.trim().length > 0 && !sending);
 
   async function getJson<T>(path: string): Promise<T> {
@@ -108,26 +105,27 @@
     }
   }
 
-  async function loadTranscript(target: ConsoleTarget) {
-    transcriptError = null;
-    try {
-      transcript = await getJson<WorkerTranscriptProjection>(
-        workerApiPath(`/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(target.workerId)}/transcript?limit=200`)
-      );
-    } catch (error) {
-      transcriptError = error instanceof Error ? error.message : String(error);
-      transcript = null;
-    }
-  }
-
   async function loadConsoleData(target: ConsoleTarget) {
-    await Promise.all([loadWorker(target), loadTranscript(target)]);
+    await loadWorker(target);
   }
 
   function advanceReloadToken(): number {
     nextReloadToken += 1;
     reloadToken = nextReloadToken;
     return nextReloadToken;
+  }
+
+  function resetObservedEvents() {
+    observedEvents = [];
+    seenObservationEventIds = new Set();
+  }
+
+  function rememberObservationEvent(eventId: string): boolean {
+    if (seenObservationEventIds.has(eventId)) {
+      return false;
+    }
+    seenObservationEventIds.add(eventId);
+    return true;
   }
 
   async function sendMessage(event: SubmitEvent) {
@@ -149,7 +147,6 @@
       } else {
         sendError = diagnosticsToText(result.diagnostics) || `Input was ${result.state}.`;
       }
-      await loadTranscript(consoleTarget);
     } catch (error) {
       sendError = error instanceof Error ? error.message : String(error);
     } finally {
@@ -181,6 +178,9 @@
       try {
         const frame = JSON.parse(String(message.data)) as ClientWorkerEventWsFrame;
         if (frame.kind === 'event') {
+          if (!rememberObservationEvent(frame.envelope.event_id)) {
+            return;
+          }
           observedEvents = [
             ...observedEvents,
             {
@@ -243,9 +243,42 @@
     return line.error ? 'error' : line.kind;
   }
 
+  function isNearConsoleBottom(element: HTMLElement): boolean {
+    return element.scrollHeight - element.scrollTop - element.clientHeight <= CONSOLE_BOTTOM_THRESHOLD_PX;
+  }
+
+  function handleConsoleScroll() {
+    if (!consoleBodyElement) {
+      return;
+    }
+    autoFollowConsole = isNearConsoleBottom(consoleBodyElement);
+  }
+
+  async function scrollConsoleToBottom() {
+    await tick();
+    if (!consoleBodyElement) {
+      return;
+    }
+    consoleBodyElement.scrollTop = consoleBodyElement.scrollHeight;
+    autoFollowConsole = true;
+  }
+
+  const scrollFollowKey = $derived(
+    lines
+      .map((line) => `${line.source}:${line.kind}:${line.body.length}:${line.streaming ? 'streaming' : 'done'}`)
+      .join('|')
+  );
+
+  $effect(() => {
+    scrollFollowKey;
+    if (autoFollowConsole) {
+      void scrollConsoleToBottom();
+    }
+  });
+
   $effect(() => {
     const target = consoleTarget;
-    observedEvents = [];
+    resetObservedEvents();
     streamDiagnostics = [];
     advanceReloadToken();
     void loadConsoleData(target);
@@ -274,7 +307,7 @@
       </div>
     </section>
 
-    <section class="console-body">
+    <section class="console-body" bind:this={consoleBodyElement} onscroll={handleConsoleScroll}>
       <article class="card console-card worker-console-card">
         {#if projection.status || projection.usage}
           <p class="section-note">
@@ -286,9 +319,6 @@
 
         {#if workerError}
           <p class="error">{workerError}</p>
-        {/if}
-        {#if transcriptError}
-          <p class="error">{transcriptError}</p>
         {/if}
 
         {#if lines.length === 0}

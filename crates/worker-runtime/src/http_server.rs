@@ -18,7 +18,6 @@ use crate::interaction::{WorkerInput, WorkerInteractionAck};
 use crate::management::{RuntimeLimits, RuntimeSummary};
 #[cfg(feature = "ws-server")]
 use crate::observation::WorkerObservationCursor;
-use crate::observation::{TranscriptProjection, TranscriptQuery};
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 #[cfg(feature = "ws-server")]
@@ -151,11 +150,7 @@ pub fn runtime_http_router(runtime: Runtime, local_token: Option<String>) -> Rou
         .route("/v1/workers/{worker_id}", get(get_worker))
         .route("/v1/workers/{worker_id}/input", post(send_worker_input))
         .route("/v1/workers/{worker_id}/stop", post(stop_worker))
-        .route("/v1/workers/{worker_id}/cancel", post(cancel_worker))
-        .route(
-            "/v1/workers/{worker_id}/transcript",
-            get(get_worker_transcript),
-        );
+        .route("/v1/workers/{worker_id}/cancel", post(cancel_worker));
 
     #[cfg(feature = "ws-server")]
     let router = router.route("/v1/workers/{worker_id}/events/ws", get(worker_events_ws));
@@ -243,12 +238,6 @@ pub struct RuntimeHttpWorkerLifecycleResponse {
     pub ack: WorkerLifecycleAck,
 }
 
-/// `GET /v1/workers/{worker_id}/transcript` response.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeHttpTranscriptResponse {
-    pub transcript: TranscriptProjection,
-}
-
 /// Typed REST error response.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeHttpErrorResponse {
@@ -297,18 +286,6 @@ pub struct RuntimeWorkerEventWsDiagnostic {
 #[derive(Clone, Debug, Default, Deserialize)]
 struct RuntimeWorkerEventsWsQuery {
     cursor: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct RuntimeHttpTranscriptQuery {
-    #[serde(default)]
-    start: usize,
-    #[serde(default = "default_transcript_limit")]
-    limit: usize,
-}
-
-fn default_transcript_limit() -> usize {
-    256
 }
 
 #[cfg(feature = "ws-server")]
@@ -714,20 +691,6 @@ async fn cancel_worker(
     Ok(Json(RuntimeHttpWorkerLifecycleResponse { ack }))
 }
 
-async fn get_worker_transcript(
-    State(state): State<RuntimeHttpState>,
-    Path(worker_id): Path<String>,
-    query: Result<Query<RuntimeHttpTranscriptQuery>, QueryRejection>,
-) -> RestResult<RuntimeHttpTranscriptResponse> {
-    let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
-    let Query(query) = query.map_err(RuntimeHttpRestError::query_rejection)?;
-    let transcript = state
-        .runtime
-        .transcript_projection(&worker_ref, TranscriptQuery::new(query.start, query.limit))
-        .map_err(RuntimeHttpRestError::runtime)?;
-    Ok(Json(RuntimeHttpTranscriptResponse { transcript }))
-}
-
 fn worker_ref_for(runtime: &Runtime, worker_id: String) -> Result<WorkerRef, RuntimeHttpRestError> {
     let worker_id = WorkerId::new(worker_id).ok_or_else(|| {
         RuntimeHttpRestError::new(
@@ -1067,8 +1030,7 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        let input_ack: RuntimeHttpWorkerInputResponse = read_json(response).await;
-        assert_eq!(input_ack.ack.transcript_sequence, 1);
+        let _input_ack: RuntimeHttpWorkerInputResponse = read_json(response).await;
 
         let response = empty_request(
             app.clone(),
@@ -1077,21 +1039,15 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        let detail: RuntimeHttpWorkerResponse = read_json(response).await;
-        assert_eq!(detail.worker.transcript_len, 1);
+        let _detail: RuntimeHttpWorkerResponse = read_json(response).await;
 
         let response = empty_request(
             app.clone(),
             Method::GET,
-            &format!(
-                "/v1/workers/{}/transcript?start=0&limit=1",
-                created.worker.worker_id
-            ),
+            &format!("/v1/workers/{}/transcript", created.worker.worker_id),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let transcript: RuntimeHttpTranscriptResponse = read_json(response).await;
-        assert_eq!(transcript.transcript.items[0].content, "hello from backend");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         let response = empty_request(
             app.clone(),
@@ -1117,7 +1073,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let workers: RuntimeHttpWorkersResponse = read_json(response).await;
         assert_eq!(workers.workers.len(), 1);
-        assert_eq!(workers.workers[0].transcript_len, 1);
 
         let response = empty_request(app, Method::GET, "/v1/runtime").await;
         assert_eq!(response.status(), StatusCode::OK);

@@ -3,13 +3,12 @@ use std::fmt;
 use std::time::Duration;
 
 use futures::StreamExt;
-use protocol::{ErrorCode, Event, Greeting, InFlightSnapshot, Method, Segment, WorkerStatus};
+use protocol::{ErrorCode, Event, Method, Segment};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
-const TRANSCRIPT_SNAPSHOT_LIMIT: usize = 512;
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 const MAX_RECONNECT_ATTEMPTS: usize = 3;
 
@@ -80,31 +79,10 @@ impl BackendRuntimeClient {
         let http = reqwest::Client::new();
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let suppress_initial_snapshot = match load_initial_transcript(&http, &target).await {
-            Ok(events) => {
-                for event in events {
-                    let _ = tx.send(event);
-                }
-                true
-            }
-            Err(error) => {
-                let _ = tx.send(diagnostic_event(format!(
-                    "Backend initial transcript unavailable for {}: {error}",
-                    target.display_label()
-                )));
-                false
-            }
-        };
-
         let observation_target = target.clone();
         let observation_tx = tx.clone();
         let observation_task = tokio::spawn(async move {
-            observe_worker_events(
-                observation_target,
-                observation_tx,
-                suppress_initial_snapshot,
-            )
-            .await;
+            observe_worker_events(observation_target, observation_tx).await;
         });
 
         Ok(Self {
@@ -291,80 +269,7 @@ fn backend_command_from_method(method: &Method) -> BackendCommand {
     }
 }
 
-async fn load_initial_transcript(
-    http: &reqwest::Client,
-    target: &BackendRuntimeTarget,
-) -> Result<Vec<Event>, BackendRuntimeClientError> {
-    let path = format!(
-        "/api/runtimes/{}/workers/{}/transcript?start=0&limit={TRANSCRIPT_SNAPSHOT_LIMIT}",
-        path_segment_encode(&target.runtime_id),
-        path_segment_encode(&target.worker_id)
-    );
-    let response = http
-        .get(join_base_and_path(&target.base_url, &path))
-        .send()
-        .await?
-        .error_for_status()?;
-    let transcript: WorkerTranscriptProjection = response.json().await?;
-    Ok(transcript_projection_to_events(target, transcript))
-}
-
-fn transcript_projection_to_events(
-    target: &BackendRuntimeTarget,
-    transcript: WorkerTranscriptProjection,
-) -> Vec<Event> {
-    let mut events = vec![Event::Snapshot {
-        entries: Vec::new(),
-        greeting: Greeting {
-            worker_name: target.worker_id.clone(),
-            cwd: String::new(),
-            provider: "backend-runtime-api".to_string(),
-            model: target.runtime_id.clone(),
-            scope_summary: "Backend Runtime API worker observation".to_string(),
-            tools: Vec::new(),
-            context_window: 0,
-            context_tokens: 0,
-        },
-        status: WorkerStatus::Idle,
-        in_flight: InFlightSnapshot { blocks: Vec::new() },
-    }];
-
-    for item in transcript.items {
-        match item.role.as_str() {
-            "user" => events.push(Event::UserMessage {
-                segments: vec![Segment::text(item.content)],
-            }),
-            "assistant" => {
-                events.push(Event::TextDelta {
-                    text: item.content.clone(),
-                });
-                events.push(Event::TextDone { text: item.content });
-            }
-            role => events.push(Event::Alert(protocol::Alert {
-                level: protocol::AlertLevel::Warn,
-                source: protocol::AlertSource::Worker,
-                message: format!(
-                    "Backend transcript item with role `{role}` is not rendered as chat content"
-                ),
-                timestamp_ms: 0,
-            })),
-        }
-    }
-
-    for diagnostic in transcript.diagnostics {
-        events.push(diagnostic_event(format!(
-            "Backend transcript diagnostic [{}]: {}",
-            diagnostic.code, diagnostic.message
-        )));
-    }
-    events
-}
-
-async fn observe_worker_events(
-    target: BackendRuntimeTarget,
-    tx: mpsc::UnboundedSender<Event>,
-    mut suppress_next_snapshot: bool,
-) {
+async fn observe_worker_events(target: BackendRuntimeTarget, tx: mpsc::UnboundedSender<Event>) {
     let mut cursor: Option<String> = None;
     let mut last_sequence = 0_u64;
     let mut attempts = 0_usize;
@@ -403,12 +308,6 @@ async fn observe_worker_events(
                                         )));
                                     }
                                     cursor = Some(envelope.cursor.clone());
-                                    if suppress_next_snapshot
-                                        && matches!(envelope.payload, Event::Snapshot { .. })
-                                    {
-                                        suppress_next_snapshot = false;
-                                        continue;
-                                    }
                                     let _ = tx.send(envelope.payload);
                                 }
                                 Ok(ClientWorkerEventWsFrame::Diagnostic { diagnostic }) => {
@@ -596,20 +495,6 @@ struct BackendDiagnostic {
 }
 
 #[derive(Debug, Deserialize)]
-struct WorkerTranscriptProjection {
-    #[serde(default)]
-    items: Vec<WorkerTranscriptItem>,
-    #[serde(default)]
-    diagnostics: Vec<BackendDiagnostic>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WorkerTranscriptItem {
-    role: String,
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ClientWorkerEventWsFrame {
     Event {
@@ -665,30 +550,5 @@ mod tests {
             observation_ws_url(&target, Some("bo_0000000000000001")),
             "ws://127.0.0.1:8787/api/runtimes/runtime%2Fone/workers/worker%20one/events/ws?cursor=bo_0000000000000001"
         );
-    }
-
-    #[test]
-    fn transcript_projection_seeds_snapshot_and_chat_events() {
-        let target = BackendRuntimeTarget::new("http://backend", "runtime-a", "worker-b");
-        let events = transcript_projection_to_events(
-            &target,
-            WorkerTranscriptProjection {
-                items: vec![
-                    WorkerTranscriptItem {
-                        role: "user".to_string(),
-                        content: "hi".to_string(),
-                    },
-                    WorkerTranscriptItem {
-                        role: "assistant".to_string(),
-                        content: "hello".to_string(),
-                    },
-                ],
-                diagnostics: Vec::new(),
-            },
-        );
-        assert!(matches!(events[0], Event::Snapshot { .. }));
-        assert!(matches!(events[1], Event::UserMessage { .. }));
-        assert!(matches!(events[2], Event::TextDelta { .. }));
-        assert!(matches!(events[3], Event::TextDone { .. }));
     }
 }

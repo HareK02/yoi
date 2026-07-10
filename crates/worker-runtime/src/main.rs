@@ -238,10 +238,6 @@ where
                 }
                 config.http.local_token = Some(value);
             }
-            "--max-transcript-projection-items" => {
-                config.http.limits.max_transcript_projection_items =
-                    parse_usize_flag(&flag, take_value(&flag, inline_value, &mut args)?)?;
-            }
             "--max-event-batch-items" => {
                 config.http.limits.max_event_batch_items =
                     parse_usize_flag(&flag, take_value(&flag, inline_value, &mut args)?)?;
@@ -436,7 +432,6 @@ Options:\n\
   --fs-root <PATH>                      Runtime catalog filesystem store root\n\
   --local-token <TOKEN>                 Minimal local bearer token placeholder\n\
   --local-token-env <ENV>               Read local bearer token placeholder from env\n\
-  --max-transcript-projection-items <N> Override transcript projection limit\n\
   --max-event-batch-items <N>           Override event batch limit\n\
   -h, --help                            Show this help"
 }

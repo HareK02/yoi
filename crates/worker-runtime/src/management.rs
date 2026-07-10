@@ -18,17 +18,15 @@ pub enum RuntimeStatus {
     Stopped,
 }
 
-/// Guardrails for bounded observation/projection APIs.
+/// Guardrails for bounded Runtime APIs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeLimits {
-    pub max_transcript_projection_items: usize,
     pub max_event_batch_items: usize,
 }
 
 impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
-            max_transcript_projection_items: 256,
             max_event_batch_items: 256,
         }
     }

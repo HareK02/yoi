@@ -52,6 +52,35 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
   );
 });
 
+Deno.test("Worker Console uses protocol observation events without transcript fetch", async () => {
+  const consolePage = await Deno.readTextFile(
+    new URL("./../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte", import.meta.url),
+  );
+
+  assert(
+    consolePage.includes("seenObservationEventIds") &&
+      consolePage.includes("rememberObservationEvent(frame.envelope.event_id)") &&
+      consolePage.includes("projectConsole(observedEvents.map") &&
+      !consolePage.includes("/transcript") &&
+      !consolePage.includes("WorkerTranscriptProjection"),
+    "Console should render protocol observation replay/live events directly and dedupe repeated frames by event id",
+  );
+});
+
+Deno.test("Decodal source editor keeps imperative EditorView out of reactive state", async () => {
+  const editor = await Deno.readTextFile(
+    new URL("../workspace-settings/DecodalSourceEditor.svelte", import.meta.url),
+  );
+
+  assert(
+    editor.includes("let view: EditorView | null = null") &&
+      !editor.includes("$state<EditorView") &&
+      editor.includes("untrack(() => value)") &&
+      editor.includes("untrack(() => onChange)"),
+    "CodeMirror EditorView must not be reactive state; otherwise mount cleanup can loop forever",
+  );
+});
+
 Deno.test("workspace Runtime management pages expose Runtimes and Runtime-owned workdirs", async () => {
   const sidebar = await Deno.readTextFile(
     new URL("../workspace-sidebar/WorkspaceSidebar.svelte", import.meta.url),
@@ -138,9 +167,9 @@ Deno.test("Worker Console page is routed by runtime_id and worker_id through bac
     "Worker detail should use the scoped backend Worker detail API",
   );
   assert(
-    consolePage.includes("/transcript?limit=200") &&
+    !consolePage.includes("/transcript") &&
       consolePage.includes("/events/ws") && consolePage.includes("/input"),
-    "Console should use bounded transcript, observation WS, and input APIs",
+    "Console should use protocol observation WS and input APIs without a transcript API",
   );
   assert(
     !consolePage.includes("/api/companion"),

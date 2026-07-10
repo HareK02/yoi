@@ -27,7 +27,7 @@ use crate::hosts::{
     RuntimeRegistryUnregisterResult, RuntimeSummary, WorkerInputRequest, WorkerInputResult,
     WorkerLifecycleRequest, WorkerLifecycleResult, WorkerOperationState,
     WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult,
-    WorkerSpawnWorkingDirectoryRequest, WorkerSummary, WorkerTranscriptProjection,
+    WorkerSpawnWorkingDirectoryRequest, WorkerSummary,
 };
 use crate::identity::WorkspaceIdentity;
 use crate::observation::{
@@ -491,14 +491,6 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/cancel",
             post(scoped_cancel_runtime_worker),
-        )
-        .route(
-            "/api/runtimes/{runtime_id}/workers/{worker_id}/transcript",
-            get(get_runtime_worker_transcript),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/transcript",
-            get(scoped_get_runtime_worker_transcript),
         )
         .route(
             "/api/runtimes/{runtime_id}/workers/{worker_id}/events/ws",
@@ -1498,20 +1490,6 @@ async fn scoped_cancel_runtime_worker(
     .await
 }
 
-async fn scoped_get_runtime_worker_transcript(
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
-    Query(query): Query<TranscriptQuery>,
-) -> ApiResult<Json<WorkerTranscriptProjection>> {
-    validate_workspace_scope(&api, &path.workspace_id)?;
-    get_runtime_worker_transcript(
-        State(api),
-        AxumPath((path.runtime_id, path.worker_id)),
-        Query(query),
-    )
-    .await
-}
-
 async fn scoped_worker_observation_ws(
     ws: WebSocketUpgrade,
     State(api): State<WorkspaceApi>,
@@ -2241,20 +2219,6 @@ async fn cancel_runtime_worker(
     let result = api
         .runtime
         .cancel_worker(&runtime_id, &worker_id, request)
-        .map_err(|err| err.into_error())?;
-    Ok(Json(result))
-}
-
-async fn get_runtime_worker_transcript(
-    State(api): State<WorkspaceApi>,
-    AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
-    Query(query): Query<TranscriptQuery>,
-) -> ApiResult<Json<WorkerTranscriptProjection>> {
-    let limit = query.limit.unwrap_or(api.config.max_records).min(200);
-    let start = query.start.unwrap_or(0);
-    let result = api
-        .runtime
-        .transcript(&runtime_id, &worker_id, start, limit)
         .map_err(|err| err.into_error())?;
     Ok(Json(result))
 }
@@ -5243,8 +5207,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn embedded_runtime_fs_store_restores_catalog_config_bundle_transcript_and_stale_execution()
-     {
+    async fn embedded_runtime_fs_store_restores_catalog_config_bundle_and_stale_execution() {
         let dir = tempfile::tempdir().unwrap();
         let config = test_server_config(dir.path().join("workspace"));
         let store_root = config.embedded_runtime_store_root.clone();
@@ -5304,24 +5267,16 @@ mod tests {
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let transcript = api
+            let detail = api
                 .runtime
-                .transcript("embedded-worker-runtime", &worker_id, 0, 10)
-                .expect("transcript");
-            if transcript.items.iter().any(|item| {
-                item.role == "assistant" && item.content == "server companion echoed: persist me"
-            }) {
-                assert!(
-                    transcript
-                        .items
-                        .iter()
-                        .any(|item| item.role == "user" && item.content == "persist me")
-                );
+                .worker("embedded-worker-runtime", &worker_id)
+                .expect("worker detail");
+            if detail.status == "idle" {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "timed out waiting for deterministic transcript"
+                "timed out waiting for deterministic worker completion"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -5358,20 +5313,6 @@ mod tests {
                 .iter()
                 .any(|summary| summary.id == bundle_id)
         );
-
-        let restored_transcript = restored
-            .runtime
-            .transcript("embedded-worker-runtime", &worker_id, 0, 10)
-            .expect("restored transcript");
-        assert!(
-            restored_transcript
-                .items
-                .iter()
-                .any(|item| item.role == "user" && item.content == "persist me")
-        );
-        assert!(restored_transcript.items.iter().any(|item| {
-            item.role == "assistant" && item.content == "server companion echoed: persist me"
-        }));
 
         let rejected_input = restored
             .runtime
@@ -5591,15 +5532,20 @@ mod tests {
         assert_eq!(accepted["worker_id"], worker_id);
         assert!(accepted["diagnostics"].as_array().unwrap().is_empty());
 
-        let transcript = get_json(
-            app.clone(),
-            &format!("/api/runtimes/embedded-worker-runtime/workers/{worker_id}/transcript?start=0&limit=10"),
-        )
-        .await;
-        assert_eq!(transcript["state"], "accepted");
-        assert!(transcript["items"].as_array().unwrap().iter().any(
-            |item| item["role"] == "user" && item["content"] == "hello from browser-facing api"
-        ));
+        let transcript_route = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/api/runtimes/embedded-worker-runtime/workers/{worker_id}/transcript?start=0&limit=10"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(transcript_route.status(), StatusCode::NOT_FOUND);
 
         let wrong_runtime = app
             .clone()
@@ -5623,10 +5569,7 @@ mod tests {
             .unwrap();
         assert_eq!(wrong_runtime.status(), StatusCode::NOT_FOUND);
 
-        let projected = format!(
-            "{}{}{}{}{}",
-            embedded_summary, spawned, worker, accepted, transcript
-        );
+        let projected = format!("{}{}{}{}", embedded_summary, spawned, worker, accepted);
         for forbidden in [
             dir.path().to_string_lossy().as_ref(),
             "metadata.json",
