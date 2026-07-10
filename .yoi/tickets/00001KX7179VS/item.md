@@ -2,7 +2,7 @@
 title: 'Improve workspace console tool call rendering'
 state: 'closed'
 created_at: '2026-07-10T22:08:58Z'
-updated_at: '2026-07-10T22:17:10Z'
+updated_at: '2026-07-10T22:28:24Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-10T22:09:21Z'

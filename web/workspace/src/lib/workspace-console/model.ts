@@ -90,12 +90,16 @@ export type ConsoleEventInput = { cursor: string; event: ProtocolEvent };
 export function projectConsole(
   events: ConsoleEventInput[] = [],
 ): ConsoleProjection {
-  return events.reduce(applyProtocolEvent, {
+  const projection = events.reduce(applyProtocolEvent, {
     lines: [],
     status: null,
     usage: null,
     lastCursor: null,
   });
+  return {
+    ...projection,
+    lines: aggregateReadToolLines(projection.lines),
+  };
 }
 
 export function applyProtocolEvent(
@@ -473,13 +477,76 @@ function renderToolCall(toolCall: ToolCallView): string {
   }
 }
 
+function aggregateReadToolLines(lines: ConsoleLine[]): ConsoleLine[] {
+  const result: ConsoleLine[] = [];
+  let index = 0;
+  while (index < lines.length) {
+    const item = lines[index];
+    if (item.toolCall?.name !== "Read") {
+      result.push(item);
+      index += 1;
+      continue;
+    }
+
+    const group: ConsoleLine[] = [];
+    while (index < lines.length && lines[index].toolCall?.name === "Read") {
+      group.push(lines[index]);
+      index += 1;
+    }
+    result.push(readAggregateLine(group));
+  }
+  return result;
+}
+
+function readAggregateLine(group: ConsoleLine[]): ConsoleLine {
+  const calls = group.map((line) => line.toolCall!).filter(Boolean);
+  const count = calls.length;
+  const inProgress = calls.some((call) =>
+    !["done", "error"].includes(call.state)
+  );
+  const hasError = calls.some((call) => call.state === "error");
+  const paths = calls.map(readPath);
+  const visiblePaths = inProgress ? paths.slice(-3) : paths;
+  const body = compactLines([
+    inProgress
+      ? `Read — reading (${count} file${plural(count)}…)`
+      : `Read — ${count} file${plural(count)} read`,
+    visiblePaths.map((path) => `  ${path}`).join("\n"),
+    inProgress && paths.length > visiblePaths.length
+      ? `  … (${paths.length - visiblePaths.length} earlier)`
+      : undefined,
+  ]);
+  return {
+    id: `tool-read-aggregate-${calls.map((call) => call.id).join("-")}`,
+    kind: "tool",
+    title: "Call · Read",
+    body,
+    detail: calls.map(readDetail).join("\n\n"),
+    cursor: group.at(-1)?.cursor,
+    source: "event",
+    streaming: inProgress,
+    error: hasError,
+  };
+}
+
+function readPath(toolCall: ToolCallView): string {
+  const args = parsedArgs(toolCall);
+  return stringField(args, "file_path") ?? "?";
+}
+
+function readDetail(toolCall: ToolCallView): string {
+  return compactLines([
+    `id: ${toolCall.id}`,
+    `state: ${stateSuffix(toolCall.state)}`,
+    `path: ${readPath(toolCall)}`,
+    toolCall.summary ? `summary: ${toolCall.summary}` : undefined,
+  ]);
+}
+
 function renderReadTool(toolCall: ToolCallView): string {
   const args = parsedArgs(toolCall);
   const path = stringField(args, "file_path") ?? "?";
-  return compactLines([
-    `Read — ${path} (${stateSuffix(toolCall.state)})`,
-    resultText(toolCall),
-  ]);
+  return `Read — ${path} (${stateSuffix(toolCall.state)})`;
 }
 
 function renderWriteTool(toolCall: ToolCallView): string {
@@ -653,6 +720,10 @@ function inFlightToolState(
     default:
       return "pending";
   }
+}
+
+function plural(count: number): string {
+  return count === 1 ? "" : "s";
 }
 
 function stateSuffix(state: ToolCallState): string {

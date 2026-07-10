@@ -227,8 +227,80 @@ Deno.test("projectConsole keeps streaming tool call updates in the same Call blo
   assert(toolLines[0].streaming, "streaming tool call should remain streaming");
   assert(
     toolLines[0].body.includes("/tmp/a.md") &&
-      toolLines[0].body.includes("streaming args"),
-    "Read call should render the current argument stream and state",
+      toolLines[0].body.includes("Read — reading"),
+    "Read call should render aggregate progress and path without content",
+  );
+});
+
+Deno.test("projectConsole aggregates Read calls without showing file content", () => {
+  const projection = projectConsole([
+    {
+      cursor: "50",
+      event: {
+        event: "tool_call_done",
+        data: {
+          id: "read-1",
+          name: "Read",
+          arguments: '{"file_path":"/tmp/a.md"}',
+        },
+      } satisfies Event,
+    },
+    {
+      cursor: "51",
+      event: {
+        event: "tool_result",
+        data: {
+          id: "read-1",
+          summary: "Read 2 lines",
+          output: "secret file content\nsecond line\n",
+          is_error: false,
+        },
+      } satisfies Event,
+    },
+    {
+      cursor: "52",
+      event: {
+        event: "tool_call_done",
+        data: {
+          id: "read-2",
+          name: "Read",
+          arguments: '{"file_path":"/tmp/b.md"}',
+        },
+      } satisfies Event,
+    },
+    {
+      cursor: "53",
+      event: {
+        event: "tool_result",
+        data: {
+          id: "read-2",
+          summary: "Read 1 line",
+          output: "another content\n",
+          is_error: false,
+        },
+      } satisfies Event,
+    },
+  ]);
+
+  const toolLines = projection.lines.filter((line) => line.kind === "tool");
+  assertEquals(toolLines.length, 1);
+  assertEquals(toolLines[0].title, "Call · Read");
+  assert(
+    toolLines[0].body.includes("Read — 2 files read"),
+    "aggregate count should be shown",
+  );
+  assert(
+    toolLines[0].body.includes("/tmp/a.md"),
+    "first path should be listed",
+  );
+  assert(
+    toolLines[0].body.includes("/tmp/b.md"),
+    "second path should be listed",
+  );
+  assert(
+    !toolLines[0].body.includes("secret file content") &&
+      !toolLines[0].body.includes("another content"),
+    "Read aggregate should not display file contents",
   );
 });
 

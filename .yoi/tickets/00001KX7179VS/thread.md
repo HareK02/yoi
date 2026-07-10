@@ -88,3 +88,18 @@ Implemented frontend Workspace Console tool call grouping. Tool call start/arg/d
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-10T22:28:24Z -->
+
+## Implementation report
+
+Follow-up correction: Read rendering now matches the TUI special case more closely. Consecutive Read calls are aggregated into a single `Call · Read` block, and file contents / tool output are not rendered in the console body. The aggregate lists paths and state only, preserving summaries in detail.
+
+Validation:
+- cd web/workspace && deno task check
+- cd web/workspace && deno task test
+- git diff --check
+- nix build .#yoi --no-link
+
+
+---
