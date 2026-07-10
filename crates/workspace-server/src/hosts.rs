@@ -240,6 +240,10 @@ pub struct WorkerSummary {
     pub state: String,
     pub status: String,
     pub last_seen_at: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub retention_state: String,
     pub implementation: WorkerImplementationSummary,
     pub capabilities: WorkerCapabilitySummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1191,6 +1195,8 @@ impl EmbeddedWorkerRuntime {
             status: embedded_worker_execution_status_label(summary.status, &summary.execution)
                 .to_string(),
             last_seen_at: None,
+            pinned: false,
+            retention_state: "transient".to_string(),
             implementation: WorkerImplementationSummary {
                 kind: "embedded_worker_runtime".to_string(),
                 display_hint: "backend-internal worker-runtime Worker".to_string(),
@@ -1226,6 +1232,8 @@ impl EmbeddedWorkerRuntime {
             status: embedded_worker_execution_status_label(detail.status, &detail.execution)
                 .to_string(),
             last_seen_at: None,
+            pinned: false,
+            retention_state: "transient".to_string(),
             implementation: WorkerImplementationSummary {
                 kind: "embedded_worker_runtime".to_string(),
                 display_hint: "backend-internal worker-runtime Worker".to_string(),
@@ -1927,6 +1935,8 @@ impl RemoteWorkerRuntime {
             status: embedded_worker_execution_status_label(summary.status, &summary.execution)
                 .to_string(),
             last_seen_at: None,
+            pinned: false,
+            retention_state: "transient".to_string(),
             implementation: WorkerImplementationSummary {
                 kind: "remote_worker_runtime".to_string(),
                 display_hint: "Backend-proxied remote worker-runtime Worker".to_string(),
@@ -1961,6 +1971,8 @@ impl RemoteWorkerRuntime {
             status: embedded_worker_execution_status_label(detail.status, &detail.execution)
                 .to_string(),
             last_seen_at: None,
+            pinned: false,
+            retention_state: "transient".to_string(),
             implementation: WorkerImplementationSummary {
                 kind: "remote_worker_runtime".to_string(),
                 display_hint: "Backend-proxied remote worker-runtime Worker".to_string(),
@@ -3094,6 +3106,8 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> WorkerSummary {
         state: "unsupported".to_string(),
         status: "Worker runtime control is not wired yet".to_string(),
         last_seen_at: None,
+        pinned: false,
+        retention_state: "transient".to_string(),
         implementation: WorkerImplementationSummary {
             kind: "placeholder".to_string(),
             display_hint: "unsupported".to_string(),
@@ -3420,6 +3434,8 @@ mod tests {
                     state: "running".to_string(),
                     status: "available".to_string(),
                     last_seen_at: None,
+                    pinned: false,
+                    retention_state: "transient".to_string(),
                     implementation: WorkerImplementationSummary {
                         kind: "fixture".to_string(),
                         display_hint: "test fixture".to_string(),

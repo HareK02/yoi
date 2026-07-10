@@ -1036,6 +1036,7 @@ mod tests {
             },
             materializer: MaterializerKind::LocalGitWorktree,
             dirty_state_policy: DirtyStatePolicy::CleanPointOnly,
+            backend_workdir_id: None,
         }
     }
 
