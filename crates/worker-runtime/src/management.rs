@@ -50,6 +50,10 @@ impl Default for RuntimeOptions {
     }
 }
 
+fn unknown_platform_component() -> String {
+    "unknown".to_string()
+}
+
 /// Management-plane summary for a Runtime.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeSummary {
@@ -63,6 +67,10 @@ pub struct RuntimeSummary {
     pub cancelled_worker_count: usize,
     pub diagnostic_count: usize,
     pub limits: RuntimeLimits,
+    #[serde(default = "unknown_platform_component")]
+    pub os: String,
+    #[serde(default = "unknown_platform_component")]
+    pub arch: String,
     #[serde(default)]
     pub worker_creation_available: bool,
 }

@@ -4,10 +4,6 @@
 
   let { data }: PageProps = $props();
 
-  function runtimeScope(runtime: Runtime): string {
-    return runtime.capabilities.workspace_scope;
-  }
-
   function runtimePlatform(runtime: Runtime): string {
     return `${runtime.capabilities.os} / ${runtime.capabilities.arch}`;
   }
@@ -40,7 +36,6 @@
             <th>Runtime</th>
             <th>Kind</th>
             <th>Status</th>
-            <th>Scope</th>
             <th>Platform</th>
             <th>Capacity</th>
             <th>Workdirs</th>
@@ -55,7 +50,6 @@
               </td>
               <td>{runtime.kind}</td>
               <td>{runtime.status}</td>
-              <td>{runtimeScope(runtime)}</td>
               <td>{runtimePlatform(runtime)}</td>
               <td>{runtime.capabilities.max_workers} workers</td>
               <td>

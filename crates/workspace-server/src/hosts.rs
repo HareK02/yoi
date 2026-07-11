@@ -1765,7 +1765,9 @@ impl RemoteRuntimeConfig {
             display_name: display_name.into(),
             base_url: base_url.into(),
             bearer_token,
-            cached_capabilities: remote_runtime_capabilities(200, false, false),
+            cached_capabilities: remote_runtime_capabilities(
+                200, false, false, "unknown", "unknown",
+            ),
             cached_status: "configured".to_string(),
             timeout: Duration::from_secs(10),
         }
@@ -2033,6 +2035,8 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                     limit,
                     true,
                     response.runtime.worker_creation_available,
+                    response.runtime.os,
+                    response.runtime.arch,
                 ),
                 diagnostics: Vec::new(),
             },
@@ -2066,7 +2070,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 status: "configured".to_string(),
                 observed_at: Utc::now().to_rfc3339(),
                 last_seen_at: None,
-                capabilities: remote_runtime_capabilities(limit, true, false),
+                capabilities: remote_runtime_capabilities(limit, true, false, "unknown", "unknown"),
                 diagnostics: Vec::new(),
             }],
             Vec::new(),
@@ -2872,6 +2876,8 @@ fn remote_runtime_capabilities(
     limit: usize,
     available: bool,
     worker_creation_available: bool,
+    os: impl Into<String>,
+    arch: impl Into<String>,
 ) -> RuntimeCapabilitySummary {
     RuntimeCapabilitySummary {
         can_list_hosts: true,
@@ -2887,8 +2893,8 @@ fn remote_runtime_capabilities(
         supports_backend_internal_tools: false,
         workspace_scope: "remote_runtime_backend_private".to_string(),
         max_workers: limit,
-        os: "remote".to_string(),
-        arch: "remote".to_string(),
+        os: os.into(),
+        arch: arch.into(),
     }
 }
 

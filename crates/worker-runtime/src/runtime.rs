@@ -162,6 +162,8 @@ impl Runtime {
             cancelled_worker_count,
             diagnostic_count: state.diagnostics.len(),
             limits: state.limits.clone(),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
             worker_creation_available: state.execution_backend.is_some(),
         })
     }

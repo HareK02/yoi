@@ -2,14 +2,20 @@
   import { workspaceApiPath } from '$lib/workspace-api/http';
   import { workerConsoleHref } from '$lib/workspace-console/model';
   import { canOpenWorkerConsole } from '$lib/workspace-sidebar/workers';
-  import type { Worker } from '$lib/workspace-sidebar/types';
+  import type { CleanupWorkerCandidate, RuntimeCleanupExecutionResponse, RuntimeCleanupPlanResponse, Worker } from '$lib/workspace-sidebar/types';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
-  let retentionStatus = $state<string | null>(null);
+  let statusMessage = $state<string | null>(null);
+  let cleanupPlans = $state<Record<string, RuntimeCleanupPlanResponse>>({});
+  let busyCleanupTarget = $state<string | null>(null);
+
+  $effect(() => {
+    cleanupPlans = data.cleanupPlans;
+  });
 
   async function setPinned(worker: Worker, pinned: boolean): Promise<void> {
-    retentionStatus = null;
+    statusMessage = null;
     const response = await fetch(
       workspaceApiPath(
         data.workspaceId,
@@ -19,12 +25,56 @@
     );
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
-      retentionStatus = payload?.message ?? payload?.error ?? response.statusText;
+      statusMessage = payload?.message ?? payload?.error ?? response.statusText;
       return;
     }
     worker.pinned = Boolean(payload?.pinned);
     worker.retention_state = payload?.retention_state ?? (worker.pinned ? 'pinned' : 'normal');
-    retentionStatus = `${worker.label} ${worker.pinned ? 'pinned' : 'unpinned'}.`;
+    statusMessage = `${worker.label} ${worker.pinned ? 'pinned' : 'unpinned'}.`;
+  }
+
+  function cleanupCandidate(worker: Worker): CleanupWorkerCandidate | undefined {
+    return cleanupPlans?.[worker.runtime_id]?.workers.find(
+      (candidate) => candidate.runtime_id === worker.runtime_id && candidate.runtime_worker_id === worker.worker_id,
+    );
+  }
+
+  async function deleteWorkerRegistryRow(worker: Worker, candidate: CleanupWorkerCandidate): Promise<void> {
+    if (!cleanupPlans?.[worker.runtime_id]) return;
+    statusMessage = null;
+    busyCleanupTarget = candidate.target_id;
+    try {
+      const plan = cleanupPlans[worker.runtime_id];
+      const response = await fetch(
+        workspaceApiPath(data.workspaceId, `/runtimes/${encodeURIComponent(worker.runtime_id)}/cleanup-executions`),
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            expected_plan_revision: plan.revision,
+            expected_plan_digest: plan.digest,
+            worker_target_ids: [candidate.target_id],
+            workdir_target_ids: [],
+            confirm_dirty_discard_target_ids: [],
+          }),
+        },
+      );
+      const payload = (await response.json().catch(() => null)) as RuntimeCleanupExecutionResponse | { message?: string; error?: string } | null;
+      if (!response.ok) throw new Error(payload && 'message' in payload ? (payload.message ?? payload.error) : response.statusText);
+      if (payload && 'plan_after' in payload) {
+        cleanupPlans = { ...cleanupPlans, [worker.runtime_id]: payload.plan_after };
+      }
+      if (data.workers) {
+        data.workers.items = data.workers.items.filter(
+          (item) => !(item.runtime_id === worker.runtime_id && item.worker_id === worker.worker_id),
+        );
+      }
+      statusMessage = `Deleted Worker registry row for ${worker.label}.`;
+    } catch (error) {
+      statusMessage = error instanceof Error ? error.message : 'Worker cleanup failed';
+    } finally {
+      busyCleanupTarget = null;
+    }
   }
 
   function workerStatus(worker: Worker): string {
@@ -54,7 +104,7 @@
     <div>
       <h1 id="workers-heading">Workers</h1>
       <p>Workers running or persisted for this workspace. Pinning only updates Backend retention.</p>
-      {#if retentionStatus}<p>{retentionStatus}</p>{/if}
+      {#if statusMessage}<p>{statusMessage}</p>{/if}
     </div>
     <a class="section-action" href={`/w/${data.workspaceId}/workers/new`}>New Worker</a>
   </header>
@@ -81,6 +131,7 @@
         </thead>
         <tbody>
           {#each data.workers.items as worker}
+            {@const cleanup = cleanupCandidate(worker)}
             <tr>
               <td>
                 <strong>{worker.label}</strong>
@@ -100,6 +151,16 @@
                 <button type="button" onclick={() => setPinned(worker, !worker.pinned)}>
                   {worker.pinned ? 'Unpin' : 'Pin'}
                 </button>
+                {#if cleanup}
+                  <button
+                    type="button"
+                    disabled={!!cleanup.blocking_reason || busyCleanupTarget === cleanup.target_id}
+                    title={cleanup.blocking_reason ?? cleanup.reason}
+                    onclick={() => deleteWorkerRegistryRow(worker, cleanup)}
+                  >
+                    {busyCleanupTarget === cleanup.target_id ? 'Deleting…' : 'Delete row'}
+                  </button>
+                {/if}
               </td>
             </tr>
           {/each}

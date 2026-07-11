@@ -78,10 +78,6 @@
                 <dd><code>{host.runtime_id}</code></dd>
               </div>
               <div>
-                <dt>Scope</dt>
-                <dd>{host.capabilities.workspace_scope}</dd>
-              </div>
-              <div>
                 <dt>Platform</dt>
                 <dd>{host.capabilities.os} / {host.capabilities.arch}</dd>
               </div>
