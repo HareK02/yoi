@@ -1,0 +1,1 @@
+Worker display names are now preserved separately from Runtime worker ids. New Worker creation records the requested/sanitized display name, and later live Runtime sync does not overwrite it with the worker id label.

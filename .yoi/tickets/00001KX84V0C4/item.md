@@ -1,8 +1,8 @@
 ---
 title: 'Preserve requested Worker display names'
-state: 'done'
+state: 'closed'
 created_at: '2026-07-11T08:31:24Z'
-updated_at: '2026-07-11T08:44:11Z'
+updated_at: '2026-07-11T08:44:32Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-11T08:31:54Z'

@@ -71,3 +71,21 @@ State changed to `done`.
 
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-07-11T08:44:32Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-07-11T08:44:32Z status: closed -->
+
+## 完了
+
+Worker display names are now preserved separately from Runtime worker ids. New Worker creation records the requested/sanitized display name, and later live Runtime sync does not overwrite it with the worker id label.
+
+
+---
