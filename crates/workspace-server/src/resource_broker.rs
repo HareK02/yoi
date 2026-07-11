@@ -42,7 +42,7 @@ impl BackendResourceBroker {
             workspace_id: workspace_id.clone(),
             scope_id: Some("workspace-profile-source".to_string()),
             runtime_id: runtime_id.map(|id| id.as_str().to_string()),
-            worker_id: worker_id.map(|id| id.as_str().to_string()),
+            worker_id: worker_id.map(|id| id.to_string()),
             resource_id: archive.reference.id.clone(),
             digest: archive.reference.digest.clone(),
             operation: BackendResourceOperation::FetchArchive,
@@ -58,7 +58,7 @@ impl BackendResourceBroker {
         };
         let stored = StoredResource {
             runtime_id: runtime_id.map(|id| id.as_str().to_string()),
-            worker_id: worker_id.map(|id| id.as_str().to_string()),
+            worker_id: worker_id.map(|id| id.to_string()),
             handle: handle.clone(),
             archive,
         };
@@ -221,7 +221,7 @@ mod tests {
             audit_correlation_id: handle.audit_correlation_id.clone(),
             handle,
             runtime_id: runtime_id.as_str().to_string(),
-            worker_id: worker_id.map(|id| id.as_str().to_string()),
+            worker_id: worker_id.map(|id| id.to_string()),
         }
     }
 
@@ -271,8 +271,8 @@ mod tests {
     fn broker_rejects_worker_mismatch() {
         let broker = BackendResourceBroker::default();
         let runtime_id = RuntimeId::new("runtime-test").unwrap();
-        let worker_a = WorkerId::new("worker-a").unwrap();
-        let worker_b = WorkerId::new("worker-b").unwrap();
+        let worker_a = WorkerId::new(1);
+        let worker_b = WorkerId::new(2);
         let handle = broker.issue_profile_source_archive_handle(
             "workspace-test",
             Some(&runtime_id),

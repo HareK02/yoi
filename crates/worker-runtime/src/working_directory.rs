@@ -167,13 +167,8 @@ impl LocalGitWorktreeMaterializer {
         &self.runtime_root
     }
 
-    fn working_directory_id(worker_ref: &WorkerRef, repository_id: &str) -> String {
-        format!(
-            "{}-{}-{}",
-            sanitize_path_component(worker_ref.runtime_id.as_str()),
-            sanitize_path_component(worker_ref.worker_id.as_str()),
-            sanitize_path_component(repository_id)
-        )
+    fn working_directory_id(_worker_ref: &WorkerRef, repository_id: &str) -> String {
+        next_working_directory_id(repository_id)
     }
 
     fn working_directory_root(&self, working_directory_id: &str) -> PathBuf {
@@ -609,16 +604,13 @@ fn sanitize_path_component(value: &str) -> String {
     }
 }
 
-fn next_working_directory_id(repository_id: &str) -> String {
+fn next_working_directory_id(_repository_id: &str) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
+        .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default();
-    let sequence = NEXT_WORKING_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!(
-        "alloc-{now}-{sequence}-{}",
-        sanitize_path_component(repository_id)
-    )
+    let sequence = NEXT_WORKING_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed) & 0x00ff_ffff;
+    format!("{now:013x}{sequence:06x}")
 }
 
 fn validate_working_directory_id(

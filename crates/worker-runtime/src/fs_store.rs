@@ -366,7 +366,7 @@ impl FsRuntimeStore {
     fn worker_dir(&self, worker_id: &WorkerId) -> PathBuf {
         self.runtime_dir
             .join(WORKERS_DIR)
-            .join(encoded_component(worker_id.as_str()))
+            .join(encoded_component(&worker_id.to_string()))
     }
 
     #[cfg(feature = "ws-server")]

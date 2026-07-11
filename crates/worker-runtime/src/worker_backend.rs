@@ -1122,13 +1122,11 @@ mod tests {
     #[test]
     fn runtime_worker_name_is_namespaced_by_runtime_id() {
         let runtime_id = RuntimeId::new("arc:remote".to_string()).unwrap();
-        let worker_ref = crate::identity::WorkerRef::new(
-            runtime_id,
-            crate::identity::WorkerId::new("worker-00000001".to_string()).unwrap(),
-        );
+        let worker_ref =
+            crate::identity::WorkerRef::new(runtime_id, crate::identity::WorkerId::new(1));
         let request = WorkerExecutionSpawnRequest {
             worker_ref: worker_ref.clone(),
-            request: create_request("worker-00000001"),
+            request: create_request("1"),
             context: WorkerExecutionContext::new(worker_ref, Arc::new(|_, _| panic!("unused"))),
             working_directory: None,
             config_bundle: None,
@@ -1136,11 +1134,11 @@ mod tests {
 
         assert_eq!(
             ProfileRuntimeWorkerFactory::runtime_worker_name(&request),
-            "runtime-arc-remote-worker-00000001"
+            "runtime-arc-remote-1"
         );
         assert_ne!(
             ProfileRuntimeWorkerFactory::runtime_worker_name(&request),
-            "worker-00000001"
+            "00000001"
         );
     }
 

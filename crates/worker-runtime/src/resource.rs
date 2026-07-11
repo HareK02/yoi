@@ -186,7 +186,7 @@ pub fn build_profile_source_archive_fetch_request(
     BackendResourceFetchRequest {
         handle,
         runtime_id: runtime_id.as_str().to_string(),
-        worker_id: worker_id.map(|id| id.as_str().to_string()),
+        worker_id: worker_id.map(|id| id.to_string()),
         audit_correlation_id,
     }
 }

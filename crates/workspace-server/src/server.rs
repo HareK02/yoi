@@ -1,5 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
@@ -1539,10 +1540,14 @@ async fn set_worker_retention(
     runtime_worker_id: String,
     pinned: bool,
 ) -> ApiResult<Json<WorkerRetentionResponse>> {
-    let worker_id = backend_worker_id(runtime_id.as_str(), runtime_worker_id.as_str());
+    let runtime_worker_registry_id = parse_runtime_worker_id_for_registry(&runtime_worker_id)?;
     if api
         .store
-        .get_worker_registry(&api.config.workspace_id, worker_id.as_str())?
+        .get_worker_registry(
+            &api.config.workspace_id,
+            runtime_id.as_str(),
+            runtime_worker_registry_id,
+        )?
         .is_none()
     {
         if let Ok(worker) = api
@@ -1555,7 +1560,8 @@ async fn set_worker_retention(
     let retention_state = if pinned { "pinned" } else { "normal" };
     let changed = api.store.update_worker_retention(
         &api.config.workspace_id,
-        worker_id.as_str(),
+        runtime_id.as_str(),
+        runtime_worker_registry_id,
         retention_state,
         now_registry_timestamp().as_str(),
     )?;
@@ -1580,11 +1586,15 @@ fn build_runtime_cleanup_plan(
     runtime_id: &str,
 ) -> ApiResult<RuntimeCleanupPlanResponse> {
     let workers = workers_response(api.clone())?;
-    let live_running_worker_ids: HashSet<String> = workers
+    let live_running_worker_ids: HashSet<(String, u64)> = workers
         .items
         .iter()
         .filter(|worker| worker.state == "running")
-        .map(|worker| backend_worker_id(worker.runtime_id.as_str(), worker.worker_id.as_str()))
+        .filter_map(|worker| {
+            parse_runtime_worker_id_for_registry(worker.worker_id.as_str())
+                .ok()
+                .map(|worker_id| (worker.runtime_id.clone(), worker_id))
+        })
         .collect();
     let (workdir_summaries, mut diagnostics) =
         match runtime_working_directory_summaries(api, runtime_id) {
@@ -1609,7 +1619,12 @@ fn build_runtime_cleanup_plan(
         .list_worker_registry(&api.config.workspace_id, 500)?;
     let worker_by_id: HashMap<_, _> = worker_records
         .iter()
-        .map(|record| (record.worker_id.clone(), record.clone()))
+        .map(|record| {
+            (
+                (record.runtime_id.clone(), record.runtime_worker_id.clone()),
+                record.clone(),
+            )
+        })
         .collect();
     let observed_workdirs: HashMap<_, _> = workdir_summaries
         .into_iter()
@@ -1621,10 +1636,13 @@ fn build_runtime_cleanup_plan(
         .iter()
         .filter(|record| record.runtime_id == runtime_id)
     {
-        let links = api
-            .store
-            .list_worker_workdir_links(&api.config.workspace_id, record.worker_id.as_str())?;
-        let is_running = live_running_worker_ids.contains(&record.worker_id);
+        let links = api.store.list_worker_workdir_links(
+            &api.config.workspace_id,
+            record.runtime_id.as_str(),
+            record.runtime_worker_id,
+        )?;
+        let is_running = live_running_worker_ids
+            .contains(&(record.runtime_id.clone(), record.runtime_worker_id.clone()));
         let pinned = record.retention_state == "pinned";
         let blocking_reason = if pinned {
             Some("worker is pinned".to_string())
@@ -1634,10 +1652,14 @@ fn build_runtime_cleanup_plan(
             None
         };
         worker_candidates.push(CleanupWorkerCandidate {
-            target_id: format!("worker:{}", record.worker_id),
+            target_id: format!(
+                "worker:{}:{}",
+                encode_path_segment(record.runtime_id.as_str()),
+                encode_path_segment(&record.runtime_worker_id.to_string())
+            ),
             action: CleanupTargetKind::WorkerDelete,
-            worker_id: record.worker_id.clone(),
-            runtime_worker_id: record.runtime_worker_id.clone(),
+            worker_id: record.runtime_worker_id.to_string(),
+            runtime_worker_id: record.runtime_worker_id.to_string(),
             runtime_id: record.runtime_id.clone(),
             reason: if blocking_reason.is_some() {
                 "Worker registry row cannot be deleted until blocking conditions are cleared"
@@ -1664,16 +1686,21 @@ fn build_runtime_cleanup_plan(
             .list_workdir_worker_links(&api.config.workspace_id, record.workdir_id.as_str())?;
         let linked_workers = links
             .iter()
-            .filter_map(|link| worker_by_id.get(link.worker_id.as_str()))
+            .filter_map(|link| {
+                worker_by_id.get(&(link.runtime_id.clone(), link.runtime_worker_id.clone()))
+            })
             .collect::<Vec<_>>();
         let linked_worker_ids = links
             .iter()
-            .map(|link| link.worker_id.clone())
+            .map(|link| link.runtime_worker_id.to_string())
             .collect::<Vec<_>>();
         let linked_running_worker_ids = linked_workers
             .iter()
-            .filter(|worker| live_running_worker_ids.contains(&worker.worker_id))
-            .map(|worker| worker.worker_id.clone())
+            .filter(|worker| {
+                live_running_worker_ids
+                    .contains(&(worker.runtime_id.clone(), worker.runtime_worker_id.clone()))
+            })
+            .map(|worker| worker.runtime_worker_id.to_string())
             .collect::<Vec<_>>();
         let pinned_linked = linked_workers
             .iter()
@@ -1812,8 +1839,12 @@ fn execute_runtime_cleanup(
                 "pinned Worker/history cannot be deleted",
             ));
         }
-        api.store
-            .delete_worker_registry(&api.config.workspace_id, candidate.worker_id.as_str())?;
+        let runtime_worker_id = parse_runtime_worker_id_for_registry(&candidate.runtime_worker_id)?;
+        api.store.delete_worker_registry(
+            &api.config.workspace_id,
+            candidate.runtime_id.as_str(),
+            runtime_worker_id,
+        )?;
         results.push(RuntimeCleanupExecutionResult {
             target_id: candidate.target_id.clone(),
             action: candidate.action.clone(),
@@ -2697,7 +2728,11 @@ async fn create_workspace_worker(
             management_kind.as_str(),
         );
         api.store.upsert_workdir_registry(&workdir_record)?;
-        link_worker_to_workdir(&api, &worker_record, &working_directory.working_directory_id)?;
+        link_worker_to_workdir(
+            &api,
+            &worker_record,
+            &working_directory.working_directory_id,
+        )?;
     }
     if let Some(workdir_id) = selected_working_directory_id.as_deref() {
         if api
@@ -2813,9 +2848,11 @@ async fn get_runtime_worker(
         .worker(&runtime_id, &worker_id)
         .map_err(|err| err.into_error())?;
     let record = sync_worker_observation(&api, &worker)?;
-    let links = api
-        .store
-        .list_worker_workdir_links(&api.config.workspace_id, record.worker_id.as_str())?;
+    let links = api.store.list_worker_workdir_links(
+        &api.config.workspace_id,
+        record.runtime_id.as_str(),
+        record.runtime_worker_id,
+    )?;
     let workdirs = api
         .store
         .list_workdir_registry(&api.config.workspace_id, 500)?;
@@ -2981,10 +3018,10 @@ async fn stop_runtime_worker(
         .runtime
         .stop_worker(&runtime_id, &worker_id, request)
         .map_err(|err| err.into_error())?;
-    let backend_id = backend_worker_id(&runtime_id, &worker_id);
-    if let Some(record) = api
-        .store
-        .get_worker_registry(&api.config.workspace_id, backend_id.as_str())?
+    let runtime_worker_id = parse_runtime_worker_id_for_registry(&worker_id)?;
+    if let Some(record) =
+        api.store
+            .get_worker_registry(&api.config.workspace_id, &runtime_id, runtime_worker_id)?
     {
         sync_linked_workdir_after_worker_stop(&api, &runtime_id, &record)?;
     }
@@ -3137,10 +3174,14 @@ fn workers_response(api: WorkspaceApi) -> ApiResult<RuntimeListResponse<WorkerSu
     let mut observed = std::collections::BTreeMap::new();
     for worker in &runtime_workers.items {
         let _ = sync_worker_observation(&api, worker);
-        observed.insert(
-            backend_worker_id(worker.runtime_id.as_str(), worker.worker_id.as_str()),
-            worker.clone(),
-        );
+        if let Ok(runtime_worker_id) =
+            parse_runtime_worker_id_for_registry(worker.worker_id.as_str())
+        {
+            observed.insert(
+                (worker.runtime_id.clone(), runtime_worker_id),
+                worker.clone(),
+            );
+        }
     }
     let worker_records = api
         .store
@@ -3150,11 +3191,13 @@ fn workers_response(api: WorkspaceApi) -> ApiResult<RuntimeListResponse<WorkerSu
         .list_workdir_registry(&api.config.workspace_id, 500)?;
     let mut items = Vec::new();
     for record in worker_records {
-        let links = api
-            .store
-            .list_worker_workdir_links(&api.config.workspace_id, record.worker_id.as_str())?;
+        let links = api.store.list_worker_workdir_links(
+            &api.config.workspace_id,
+            record.runtime_id.as_str(),
+            record.runtime_worker_id,
+        )?;
         items.push(merge_worker_registry_projection(
-            observed.get(record.worker_id.as_str()),
+            observed.get(&(record.runtime_id.clone(), record.runtime_worker_id.clone())),
             &record,
             links,
             &workdir_records,
@@ -3518,7 +3561,7 @@ async fn test_remote_runtime_config(
     if let Some(worker) = workers.as_ref().and_then(|workers| workers.workers.first()) {
         let path = format!(
             "/v1/workers/{}",
-            encode_path_segment(worker.worker_id.as_str())
+            encode_path_segment(&worker.worker_id.to_string())
         );
         match remote_probe_url(remote, &path) {
             Ok(url) => match probe_remote_json(&client, url, "workers.detail", "Worker detail").await {
@@ -3890,9 +3933,7 @@ fn runtime_working_directory_summaries(
     Ok((items, diagnostics))
 }
 
-fn backend_worker_id(runtime_id: &str, runtime_worker_id: &str) -> String {
-    format!("{runtime_id}/{runtime_worker_id}")
-}
+static BACKEND_WORKDIR_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn now_registry_timestamp() -> String {
     std::time::SystemTime::now()
@@ -3901,31 +3942,13 @@ fn now_registry_timestamp() -> String {
         .unwrap_or_else(|_| "0".to_string())
 }
 
-fn registry_safe_id_component(value: &str) -> String {
-    let sanitized: String = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    sanitized.trim_matches('-').chars().take(48).collect()
-}
-
-fn next_backend_workdir_id(repository_id: &str) -> String {
-    let repository = registry_safe_id_component(repository_id);
-    format!(
-        "backend-{}-{}",
-        now_registry_timestamp(),
-        if repository.is_empty() {
-            "workdir"
-        } else {
-            &repository
-        }
-    )
+fn next_backend_workdir_id(_repository_id: &str) -> String {
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let sequence = BACKEND_WORKDIR_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed) & 0x00ff_ffff;
+    format!("{timestamp_ms:013x}{sequence:06x}")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3942,10 +3965,12 @@ fn record_worker_summary(
     display_name_policy: WorkerRegistryDisplayNamePolicy,
 ) -> ApiResult<WorkerRegistryRecord> {
     let timestamp = now_registry_timestamp();
-    let worker_id = backend_worker_id(worker.runtime_id.as_str(), worker.worker_id.as_str());
-    let existing = api
-        .store
-        .get_worker_registry(&api.config.workspace_id, worker_id.as_str())?;
+    let runtime_worker_id = parse_runtime_worker_id_for_registry(worker.worker_id.as_str())?;
+    let existing = api.store.get_worker_registry(
+        &api.config.workspace_id,
+        worker.runtime_id.as_str(),
+        runtime_worker_id,
+    )?;
     let display_name = match (display_name_policy, existing.as_ref()) {
         (WorkerRegistryDisplayNamePolicy::PreserveExisting, Some(record)) => {
             record.display_name.clone()
@@ -3954,9 +3979,8 @@ fn record_worker_summary(
     };
     let record = WorkerRegistryRecord {
         workspace_id: api.config.workspace_id.clone(),
-        worker_id: worker_id.clone(),
         runtime_id: worker.runtime_id.as_str().to_string(),
-        runtime_worker_id: worker.worker_id.as_str().to_string(),
+        runtime_worker_id,
         display_name,
         profile,
         retention_state: existing
@@ -3977,13 +4001,17 @@ fn record_worker_summary(
     api.store.upsert_worker_registry(&record)?;
     Ok(api
         .store
-        .get_worker_registry(&api.config.workspace_id, worker_id.as_str())?
+        .get_worker_registry(
+            &api.config.workspace_id,
+            worker.runtime_id.as_str(),
+            runtime_worker_id,
+        )?
         .unwrap_or(record))
 }
 
 fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> WorkerSummary {
     WorkerSummary {
-        worker_id: record.runtime_worker_id.clone(),
+        worker_id: record.runtime_worker_id.to_string(),
         runtime_id: record.runtime_id.clone(),
         host_id: "backend-registry".to_string(),
         role: None,
@@ -4159,9 +4187,11 @@ fn sync_linked_workdir_after_worker_stop(
     runtime_id: &str,
     worker_record: &WorkerRegistryRecord,
 ) -> ApiResult<()> {
-    let links = api
-        .store
-        .list_worker_workdir_links(&api.config.workspace_id, worker_record.worker_id.as_str())?;
+    let links = api.store.list_worker_workdir_links(
+        &api.config.workspace_id,
+        worker_record.runtime_id.as_str(),
+        worker_record.runtime_worker_id,
+    )?;
     for link in links {
         let result = api
             .runtime
@@ -4253,7 +4283,8 @@ fn link_worker_to_workdir(
     api.store
         .upsert_worker_workdir_link(&WorkerWorkdirLinkRecord {
             workspace_id: api.config.workspace_id.clone(),
-            worker_id: worker_record.worker_id.clone(),
+            runtime_id: worker_record.runtime_id.clone(),
+            runtime_worker_id: worker_record.runtime_worker_id.clone(),
             workdir_id: workdir_id.to_string(),
             role: "primary_cwd".to_string(),
             linked_at: timestamp,
@@ -4378,6 +4409,15 @@ fn profile_selector_for_candidate_with_root(
     } else {
         None
     }
+}
+
+fn parse_runtime_worker_id_for_registry(worker_id: &str) -> ApiResult<u64> {
+    worker_id.parse::<u64>().map_err(|_| {
+        settings_bad_request(
+            "workspace_worker_id_invalid",
+            "Runtime Worker id must be an unsigned integer",
+        )
+    })
 }
 
 fn sanitize_worker_display_name(value: &str) -> Option<String> {
@@ -4837,9 +4877,8 @@ mod tests {
     fn backend_worker_projection_preserves_archive_rows_links_and_redacts_paths() {
         let worker = WorkerRegistryRecord {
             workspace_id: "workspace-1".to_string(),
-            worker_id: "embedded/worker-1".to_string(),
             runtime_id: "embedded".to_string(),
-            runtime_worker_id: "worker-1".to_string(),
+            runtime_worker_id: 1,
             display_name: "Archived Worker".to_string(),
             profile: Some("builtin:coder".to_string()),
             retention_state: "pinned".to_string(),
@@ -4852,7 +4891,7 @@ mod tests {
         };
         let workdir = WorkdirRegistryRecord {
             workspace_id: "workspace-1".to_string(),
-            workdir_id: "backend-1-repo".to_string(),
+            workdir_id: "0000019a00000000000".to_string(),
             runtime_id: "embedded".to_string(),
             repository_id: "repo".to_string(),
             selector: Some("develop".to_string()),
@@ -4865,7 +4904,8 @@ mod tests {
         };
         let link = WorkerWorkdirLinkRecord {
             workspace_id: "workspace-1".to_string(),
-            worker_id: worker.worker_id.clone(),
+            runtime_id: worker.runtime_id.clone(),
+            runtime_worker_id: worker.runtime_worker_id.clone(),
             workdir_id: workdir.workdir_id.clone(),
             role: "primary_cwd".to_string(),
             linked_at: "4".to_string(),
@@ -5423,17 +5463,15 @@ mod tests {
 
     fn seed_cleanup_worker(
         api: &WorkspaceApi,
-        runtime_worker_id: &str,
+        runtime_worker_id: u64,
         retention_state: &str,
     ) -> String {
-        let worker_id = backend_worker_id("runtime-test", runtime_worker_id);
         let now = now_registry_timestamp();
         api.store
             .upsert_worker_registry(&WorkerRegistryRecord {
                 workspace_id: api.config.workspace_id.clone(),
-                worker_id: worker_id.clone(),
                 runtime_id: "runtime-test".to_string(),
-                runtime_worker_id: runtime_worker_id.to_string(),
+                runtime_worker_id,
                 display_name: runtime_worker_id.to_string(),
                 profile: None,
                 retention_state: retention_state.to_string(),
@@ -5445,7 +5483,7 @@ mod tests {
                 updated_at: now,
             })
             .unwrap();
-        worker_id
+        runtime_worker_id.to_string()
     }
 
     fn seed_cleanup_workdir(api: &WorkspaceApi, workdir_id: &str, status: &str, cleanliness: &str) {
@@ -5467,11 +5505,13 @@ mod tests {
             .unwrap();
     }
 
-    fn seed_cleanup_link(api: &WorkspaceApi, worker_id: &str, workdir_id: &str) {
+    fn seed_cleanup_link(api: &WorkspaceApi, runtime_worker_id: &str, workdir_id: &str) {
+        let runtime_worker_id = runtime_worker_id.parse::<u64>().unwrap();
         api.store
             .upsert_worker_workdir_link(&WorkerWorkdirLinkRecord {
                 workspace_id: api.config.workspace_id.clone(),
-                worker_id: worker_id.to_string(),
+                runtime_id: "runtime-test".to_string(),
+                runtime_worker_id,
                 workdir_id: workdir_id.to_string(),
                 role: "primary".to_string(),
                 linked_at: now_registry_timestamp(),
@@ -5606,8 +5646,8 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
-        let pinned = seed_cleanup_worker(&api, "worker-pinned", "pinned");
-        let unobserved = seed_cleanup_worker(&api, "worker-unobserved", "normal");
+        let pinned = seed_cleanup_worker(&api, 1, "pinned");
+        let unobserved = seed_cleanup_worker(&api, 2, "normal");
         seed_cleanup_workdir(&api, "workdir-dirty", "present", "dirty");
         seed_cleanup_workdir(&api, "workdir-removed", "removed", "clean");
         seed_cleanup_link(&api, pinned.as_str(), "workdir-dirty");
@@ -5652,7 +5692,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
-        let worker = seed_cleanup_worker(&api, "worker-pinned", "pinned");
+        let worker = seed_cleanup_worker(&api, 1, "pinned");
         let plan = build_runtime_cleanup_plan(&api, "runtime-test")
             .unwrap_or_else(|err| panic!("cleanup plan: {}", err.error));
         let target = plan

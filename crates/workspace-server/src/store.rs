@@ -37,6 +37,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "remove durable worker lifecycle state",
         apply: remove_worker_registry_legacy_live_state_column,
     },
+    Migration {
+        version: 5,
+        name: "use composite worker registry keys",
+        apply: use_composite_worker_registry_keys,
+    },
 ];
 
 struct Migration {
@@ -57,10 +62,8 @@ pub struct WorkspaceRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerRegistryRecord {
     pub workspace_id: String,
-    /// Backend-owned archival Worker id. In v0 it is derived from runtime_id + runtime_worker_id.
-    pub worker_id: String,
     pub runtime_id: String,
-    pub runtime_worker_id: String,
+    pub runtime_worker_id: u64,
     pub display_name: String,
     pub profile: Option<String>,
     /// Retention state is explicit so `pinned` can be represented before prune exists.
@@ -92,7 +95,8 @@ pub struct WorkdirRegistryRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerWorkdirLinkRecord {
     pub workspace_id: String,
-    pub worker_id: String,
+    pub runtime_id: String,
+    pub runtime_worker_id: u64,
     pub workdir_id: String,
     pub role: String,
     pub linked_at: String,
@@ -109,13 +113,8 @@ pub trait ControlPlaneStore: Send + Sync {
     fn get_worker_registry(
         &self,
         workspace_id: &str,
-        worker_id: &str,
-    ) -> Result<Option<WorkerRegistryRecord>>;
-    fn get_worker_registry_by_runtime(
-        &self,
-        workspace_id: &str,
         runtime_id: &str,
-        runtime_worker_id: &str,
+        runtime_worker_id: u64,
     ) -> Result<Option<WorkerRegistryRecord>>;
     fn list_worker_registry(
         &self,
@@ -125,11 +124,17 @@ pub trait ControlPlaneStore: Send + Sync {
     fn update_worker_retention(
         &self,
         workspace_id: &str,
-        worker_id: &str,
+        runtime_id: &str,
+        runtime_worker_id: u64,
         retention_state: &str,
         updated_at: &str,
     ) -> Result<bool>;
-    fn delete_worker_registry(&self, workspace_id: &str, worker_id: &str) -> Result<bool>;
+    fn delete_worker_registry(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        runtime_worker_id: u64,
+    ) -> Result<bool>;
 
     fn upsert_workdir_registry(&self, record: &WorkdirRegistryRecord) -> Result<()>;
     fn get_workdir_registry(
@@ -153,7 +158,8 @@ pub trait ControlPlaneStore: Send + Sync {
     fn list_worker_workdir_links(
         &self,
         workspace_id: &str,
-        worker_id: &str,
+        runtime_id: &str,
+        runtime_worker_id: u64,
     ) -> Result<Vec<WorkerWorkdirLinkRecord>>;
     fn list_workdir_worker_links(
         &self,
@@ -247,13 +253,11 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(|conn| {
             conn.execute(
                 r#"INSERT INTO worker_registry (
-                    workspace_id, worker_id, runtime_id, runtime_worker_id, display_name, profile,
+                    workspace_id, runtime_id, runtime_worker_id, display_name, profile,
                     retention_state, transcript_ref, session_ref, summary_ref,
                     diagnostics_ref, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-                ON CONFLICT(workspace_id, worker_id) DO UPDATE SET
-                    runtime_id = excluded.runtime_id,
-                    runtime_worker_id = excluded.runtime_worker_id,
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                ON CONFLICT(workspace_id, runtime_id, runtime_worker_id) DO UPDATE SET
                     display_name = excluded.display_name,
                     profile = excluded.profile,
                     retention_state = CASE
@@ -268,7 +272,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     updated_at = excluded.updated_at"#,
                 params![
                     record.workspace_id,
-                    record.worker_id,
                     record.runtime_id,
                     record.runtime_worker_id,
                     record.display_name,
@@ -289,24 +292,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     fn get_worker_registry(
         &self,
         workspace_id: &str,
-        worker_id: &str,
-    ) -> Result<Option<WorkerRegistryRecord>> {
-        self.with_conn(|conn| {
-            conn.query_row(
-                worker_registry_select_sql("WHERE workspace_id = ?1 AND worker_id = ?2").as_str(),
-                params![workspace_id, worker_id],
-                read_worker_registry_record,
-            )
-            .optional()
-            .map_err(Error::from)
-        })
-    }
-
-    fn get_worker_registry_by_runtime(
-        &self,
-        workspace_id: &str,
         runtime_id: &str,
-        runtime_worker_id: &str,
+        runtime_worker_id: u64,
     ) -> Result<Option<WorkerRegistryRecord>> {
         self.with_conn(|conn| {
             conn.query_row(
@@ -344,26 +331,38 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     fn update_worker_retention(
         &self,
         workspace_id: &str,
-        worker_id: &str,
+        runtime_id: &str,
+        runtime_worker_id: u64,
         retention_state: &str,
         updated_at: &str,
     ) -> Result<bool> {
         self.with_conn(|conn| {
             let changed = conn.execute(
                 r#"UPDATE worker_registry
-                   SET retention_state = ?3, updated_at = ?4
-                   WHERE workspace_id = ?1 AND worker_id = ?2"#,
-                params![workspace_id, worker_id, retention_state, updated_at],
+                   SET retention_state = ?4, updated_at = ?5
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3"#,
+                params![
+                    workspace_id,
+                    runtime_id,
+                    runtime_worker_id,
+                    retention_state,
+                    updated_at
+                ],
             )?;
             Ok(changed > 0)
         })
     }
 
-    fn delete_worker_registry(&self, workspace_id: &str, worker_id: &str) -> Result<bool> {
+    fn delete_worker_registry(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        runtime_worker_id: u64,
+    ) -> Result<bool> {
         self.with_conn(|conn| {
             let changed = conn.execute(
-                "DELETE FROM worker_registry WHERE workspace_id = ?1 AND worker_id = ?2",
-                params![workspace_id, worker_id],
+                "DELETE FROM worker_registry WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3",
+                params![workspace_id, runtime_id, runtime_worker_id],
             )?;
             Ok(changed > 0)
         })
@@ -468,14 +467,15 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(|conn| {
             conn.execute(
                 r#"INSERT INTO worker_workdir_links (
-                    workspace_id, worker_id, workdir_id, role, linked_at, unlinked_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                ON CONFLICT(workspace_id, worker_id, workdir_id, role) DO UPDATE SET
+                    workspace_id, runtime_id, runtime_worker_id, workdir_id, role, linked_at, unlinked_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(workspace_id, runtime_id, runtime_worker_id, workdir_id, role) DO UPDATE SET
                     linked_at = excluded.linked_at,
                     unlinked_at = excluded.unlinked_at"#,
                 params![
                     record.workspace_id,
-                    record.worker_id,
+                    record.runtime_id,
+                    record.runtime_worker_id,
                     record.workdir_id,
                     record.role,
                     record.linked_at,
@@ -489,17 +489,18 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     fn list_worker_workdir_links(
         &self,
         workspace_id: &str,
-        worker_id: &str,
+        runtime_id: &str,
+        runtime_worker_id: u64,
     ) -> Result<Vec<WorkerWorkdirLinkRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                r#"SELECT workspace_id, worker_id, workdir_id, role, linked_at, unlinked_at
+                r#"SELECT workspace_id, runtime_id, runtime_worker_id, workdir_id, role, linked_at, unlinked_at
                    FROM worker_workdir_links
-                   WHERE workspace_id = ?1 AND worker_id = ?2 AND unlinked_at IS NULL
+                   WHERE workspace_id = ?1 AND runtime_id = ?2 AND runtime_worker_id = ?3 AND unlinked_at IS NULL
                    ORDER BY linked_at DESC"#,
             )?;
             let rows = stmt.query_map(
-                params![workspace_id, worker_id],
+                params![workspace_id, runtime_id, runtime_worker_id],
                 read_worker_workdir_link_record,
             )?;
             rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -514,7 +515,7 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     ) -> Result<Vec<WorkerWorkdirLinkRecord>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                r#"SELECT workspace_id, worker_id, workdir_id, role, linked_at, unlinked_at
+                r#"SELECT workspace_id, runtime_id, runtime_worker_id, workdir_id, role, linked_at, unlinked_at
                    FROM worker_workdir_links
                    WHERE workspace_id = ?1 AND workdir_id = ?2 AND unlinked_at IS NULL
                    ORDER BY linked_at DESC"#,
@@ -534,17 +535,18 @@ fn read_worker_workdir_link_record(
 ) -> rusqlite::Result<WorkerWorkdirLinkRecord> {
     Ok(WorkerWorkdirLinkRecord {
         workspace_id: row.get(0)?,
-        worker_id: row.get(1)?,
-        workdir_id: row.get(2)?,
-        role: row.get(3)?,
-        linked_at: row.get(4)?,
-        unlinked_at: row.get(5)?,
+        runtime_id: row.get(1)?,
+        runtime_worker_id: row.get(2)?,
+        workdir_id: row.get(3)?,
+        role: row.get(4)?,
+        linked_at: row.get(5)?,
+        unlinked_at: row.get(6)?,
     })
 }
 
 fn worker_registry_select_sql(where_clause: &str) -> String {
     format!(
-        "SELECT workspace_id, worker_id, runtime_id, runtime_worker_id, display_name, profile, \
+        "SELECT workspace_id, runtime_id, runtime_worker_id, display_name, profile, \
          retention_state, transcript_ref, session_ref, summary_ref, diagnostics_ref, \
          created_at, updated_at FROM worker_registry {where_clause}"
     )
@@ -553,18 +555,17 @@ fn worker_registry_select_sql(where_clause: &str) -> String {
 fn read_worker_registry_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerRegistryRecord> {
     Ok(WorkerRegistryRecord {
         workspace_id: row.get(0)?,
-        worker_id: row.get(1)?,
-        runtime_id: row.get(2)?,
-        runtime_worker_id: row.get(3)?,
-        display_name: row.get(4)?,
-        profile: row.get(5)?,
-        retention_state: row.get(6)?,
-        transcript_ref: row.get(7)?,
-        session_ref: row.get(8)?,
-        summary_ref: row.get(9)?,
-        diagnostics_ref: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        runtime_id: row.get(1)?,
+        runtime_worker_id: row.get(2)?,
+        display_name: row.get(3)?,
+        profile: row.get(4)?,
+        retention_state: row.get(5)?,
+        transcript_ref: row.get(6)?,
+        session_ref: row.get(7)?,
+        summary_ref: row.get(8)?,
+        diagnostics_ref: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
 
@@ -599,9 +600,8 @@ fn create_worker_workdir_registry_tables(conn: &Connection) -> Result<()> {
         r#"
 CREATE TABLE IF NOT EXISTS worker_registry (
     workspace_id TEXT NOT NULL,
-    worker_id TEXT NOT NULL,
     runtime_id TEXT NOT NULL,
-    runtime_worker_id TEXT NOT NULL,
+    runtime_worker_id INTEGER NOT NULL,
     display_name TEXT NOT NULL,
     profile TEXT,
     retention_state TEXT NOT NULL CHECK (retention_state IN ('normal', 'pinned')),
@@ -611,8 +611,7 @@ CREATE TABLE IF NOT EXISTS worker_registry (
     diagnostics_ref TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, worker_id),
-    UNIQUE (workspace_id, runtime_id, runtime_worker_id),
+    PRIMARY KEY (workspace_id, runtime_id, runtime_worker_id),
     FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
 );
 
@@ -634,13 +633,14 @@ CREATE TABLE IF NOT EXISTS workdir_registry (
 
 CREATE TABLE IF NOT EXISTS worker_workdir_links (
     workspace_id TEXT NOT NULL,
-    worker_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    runtime_worker_id INTEGER NOT NULL,
     workdir_id TEXT NOT NULL,
     role TEXT NOT NULL,
     linked_at TEXT NOT NULL,
     unlinked_at TEXT,
-    PRIMARY KEY (workspace_id, worker_id, workdir_id, role),
-    FOREIGN KEY (workspace_id, worker_id) REFERENCES worker_registry(workspace_id, worker_id) ON DELETE CASCADE,
+    PRIMARY KEY (workspace_id, runtime_id, runtime_worker_id, workdir_id, role),
+    FOREIGN KEY (workspace_id, runtime_id, runtime_worker_id) REFERENCES worker_registry(workspace_id, runtime_id, runtime_worker_id) ON DELETE CASCADE,
     FOREIGN KEY (workspace_id, workdir_id) REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
 );
 
@@ -649,7 +649,7 @@ CREATE INDEX IF NOT EXISTS idx_worker_registry_workspace_updated
 CREATE INDEX IF NOT EXISTS idx_workdir_registry_workspace_updated
     ON workdir_registry(workspace_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_worker_workdir_links_worker
-    ON worker_workdir_links(workspace_id, worker_id, linked_at DESC);
+    ON worker_workdir_links(workspace_id, runtime_id, runtime_worker_id, linked_at DESC);
 "#,
     )?;
     Ok(())
@@ -802,7 +802,7 @@ fn remove_worker_registry_legacy_live_state_column(conn: &Connection) -> Result<
             workspace_id TEXT NOT NULL,
             worker_id TEXT NOT NULL,
             runtime_id TEXT NOT NULL,
-            runtime_worker_id TEXT NOT NULL,
+            runtime_worker_id INTEGER NOT NULL,
             display_name TEXT NOT NULL,
             profile TEXT,
             retention_state TEXT NOT NULL CHECK (retention_state IN ('normal', 'pinned')),
@@ -830,6 +830,98 @@ fn remove_worker_registry_legacy_live_state_column(conn: &Connection) -> Result<
         ALTER TABLE worker_registry_v4 RENAME TO worker_registry;
         CREATE INDEX IF NOT EXISTS idx_worker_registry_workspace_updated
             ON worker_registry(workspace_id, updated_at DESC);
+        "#,
+    )?;
+    Ok(())
+}
+
+fn use_composite_worker_registry_keys(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "worker_registry")?
+        || !table_columns(conn, "worker_registry")?
+            .iter()
+            .any(|column| column == "worker_id")
+    {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        r#"
+        CREATE TABLE worker_registry_v5 (
+            workspace_id TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            runtime_worker_id INTEGER NOT NULL,
+            display_name TEXT NOT NULL,
+            profile TEXT,
+            retention_state TEXT NOT NULL CHECK (retention_state IN ('normal', 'pinned')),
+            transcript_ref TEXT,
+            session_ref TEXT,
+            summary_ref TEXT,
+            diagnostics_ref TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, runtime_id, runtime_worker_id),
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+        INSERT OR REPLACE INTO worker_registry_v5 (
+            workspace_id, runtime_id, runtime_worker_id, display_name, profile,
+            retention_state, transcript_ref, session_ref, summary_ref, diagnostics_ref,
+            created_at, updated_at
+        )
+        SELECT
+            workspace_id,
+            runtime_id,
+            CASE
+                WHEN typeof(runtime_worker_id) = 'integer' THEN runtime_worker_id
+                WHEN runtime_worker_id GLOB 'worker-[0-9]*' THEN CAST(substr(runtime_worker_id, 8) AS INTEGER)
+                WHEN runtime_worker_id GLOB '[0-9]*' THEN CAST(runtime_worker_id AS INTEGER)
+                ELSE rowid
+            END,
+            display_name, profile,
+            retention_state, transcript_ref, session_ref, summary_ref, diagnostics_ref,
+            created_at, updated_at
+        FROM worker_registry;
+
+        CREATE TABLE worker_workdir_links_v5 (
+            workspace_id TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            runtime_worker_id INTEGER NOT NULL,
+            workdir_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            linked_at TEXT NOT NULL,
+            unlinked_at TEXT,
+            PRIMARY KEY (workspace_id, runtime_id, runtime_worker_id, workdir_id, role),
+            FOREIGN KEY (workspace_id, runtime_id, runtime_worker_id) REFERENCES worker_registry_v5(workspace_id, runtime_id, runtime_worker_id) ON DELETE CASCADE,
+            FOREIGN KEY (workspace_id, workdir_id) REFERENCES workdir_registry(workspace_id, workdir_id) ON DELETE CASCADE
+        );
+        INSERT OR REPLACE INTO worker_workdir_links_v5 (
+            workspace_id, runtime_id, runtime_worker_id, workdir_id, role, linked_at, unlinked_at
+        )
+        SELECT
+            links.workspace_id,
+            registry.runtime_id,
+            CASE
+                WHEN typeof(registry.runtime_worker_id) = 'integer' THEN registry.runtime_worker_id
+                WHEN registry.runtime_worker_id GLOB 'worker-[0-9]*' THEN CAST(substr(registry.runtime_worker_id, 8) AS INTEGER)
+                WHEN registry.runtime_worker_id GLOB '[0-9]*' THEN CAST(registry.runtime_worker_id AS INTEGER)
+                ELSE registry.rowid
+            END,
+            links.workdir_id,
+            links.role,
+            links.linked_at,
+            links.unlinked_at
+        FROM worker_workdir_links AS links
+        JOIN worker_registry AS registry
+          ON registry.workspace_id = links.workspace_id
+         AND registry.worker_id = links.worker_id;
+
+        DROP TABLE worker_workdir_links;
+        DROP TABLE worker_registry;
+        ALTER TABLE worker_registry_v5 RENAME TO worker_registry;
+        ALTER TABLE worker_workdir_links_v5 RENAME TO worker_workdir_links;
+        CREATE INDEX IF NOT EXISTS idx_worker_registry_workspace_updated
+            ON worker_registry(workspace_id, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_worker_workdir_links_worker
+            ON worker_workdir_links(workspace_id, runtime_id, runtime_worker_id, linked_at DESC);
         "#,
     )?;
     Ok(())
@@ -1058,7 +1150,7 @@ mod tests {
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 4);
+        assert_eq!(store.schema_version().await.unwrap(), 5);
 
         let record = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
@@ -1070,7 +1162,7 @@ mod tests {
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 4);
+        assert_eq!(reopened.schema_version().await.unwrap(), 5);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -1190,7 +1282,6 @@ mod tests {
             "worker_registry",
             [
                 "workspace_id",
-                "worker_id",
                 "runtime_id",
                 "runtime_worker_id",
                 "display_name",
@@ -1280,7 +1371,7 @@ mod tests {
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 4);
+        assert_eq!(store.schema_version().await.unwrap(), 5);
 
         store
             .with_conn(|conn| {
@@ -1381,13 +1472,12 @@ mod tests {
 
         let worker = WorkerRegistryRecord {
             workspace_id: "local-dev".to_string(),
-            worker_id: "embedded/browser-1".to_string(),
             runtime_id: "embedded".to_string(),
-            runtime_worker_id: "browser-1".to_string(),
+            runtime_worker_id: 1,
             display_name: "Browser 1".to_string(),
             profile: Some("builtin:companion".to_string()),
             retention_state: "pinned".to_string(),
-            transcript_ref: Some("runtime://embedded/workers/browser-1/transcript".to_string()),
+            transcript_ref: Some("runtime://embedded/workers/00000001/transcript".to_string()),
             session_ref: None,
             summary_ref: None,
             diagnostics_ref: None,
@@ -1404,7 +1494,7 @@ mod tests {
 
         let workdir = WorkdirRegistryRecord {
             workspace_id: "local-dev".to_string(),
-            workdir_id: "backend-2-repo".to_string(),
+            workdir_id: "0000019a00000000001".to_string(),
             runtime_id: "embedded".to_string(),
             repository_id: "repo".to_string(),
             selector: Some("develop".to_string()),
@@ -1433,7 +1523,8 @@ mod tests {
 
         let link = WorkerWorkdirLinkRecord {
             workspace_id: "local-dev".to_string(),
-            worker_id: worker.worker_id.clone(),
+            runtime_id: worker.runtime_id.clone(),
+            runtime_worker_id: worker.runtime_worker_id.clone(),
             workdir_id: workdir.workdir_id.clone(),
             role: "primary_cwd".to_string(),
             linked_at: "4".to_string(),
@@ -1443,13 +1534,13 @@ mod tests {
 
         assert_eq!(
             store
-                .get_worker_registry_by_runtime("local-dev", "embedded", "browser-1")
+                .get_worker_registry("local-dev", "embedded", 1)
                 .unwrap(),
             Some(expected_worker.clone())
         );
         assert_eq!(
             store
-                .get_workdir_registry("local-dev", "backend-2-repo")
+                .get_workdir_registry("local-dev", "0000019a00000000001")
                 .unwrap(),
             Some(workdir.clone())
         );
@@ -1465,7 +1556,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .list_worker_workdir_links("local-dev", "embedded/browser-1")
+                .list_worker_workdir_links("local-dev", "embedded", 1)
                 .unwrap(),
             vec![link]
         );

@@ -692,11 +692,11 @@ async fn cancel_worker(
 }
 
 fn worker_ref_for(runtime: &Runtime, worker_id: String) -> Result<WorkerRef, RuntimeHttpRestError> {
-    let worker_id = WorkerId::new(worker_id).ok_or_else(|| {
+    let worker_id = WorkerId::parse(&worker_id).ok_or_else(|| {
         RuntimeHttpRestError::new(
             StatusCode::BAD_REQUEST,
             "invalid_worker_id",
-            "worker_id must not be empty",
+            "worker_id must be an unsigned integer",
         )
     })?;
     let runtime_id = runtime
@@ -1107,12 +1107,12 @@ mod tests {
     #[tokio::test]
     async fn runtime_errors_use_typed_rest_error_shape() {
         let app = runtime_http_router(Runtime::new_memory(), None);
-        let response = empty_request(app, Method::GET, "/v1/workers/worker-missing").await;
+        let response = empty_request(app, Method::GET, "/v1/workers/999").await;
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let error: RuntimeHttpErrorResponse = read_json(response).await;
         assert_eq!(error.error.code, "worker_not_found");
-        assert!(error.error.message.contains("worker-missing"));
+        assert!(error.error.message.contains("999"));
     }
 }
 

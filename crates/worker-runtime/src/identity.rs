@@ -36,26 +36,25 @@ impl fmt::Display for RuntimeId {
 }
 
 /// Runtime-local Worker identity.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct WorkerId(String);
+pub struct WorkerId(u64);
 
 impl WorkerId {
-    pub fn new(value: impl Into<String>) -> Option<Self> {
-        let value = value.into();
-        if value.trim().is_empty() {
-            None
-        } else {
-            Some(Self(value))
-        }
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        value.parse::<u64>().ok().map(Self)
     }
 
     pub(crate) fn generated(sequence: u64) -> Self {
-        Self(format!("worker-{sequence:08x}"))
+        Self(sequence)
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub fn as_u64(&self) -> u64 {
+        self.0
     }
 }
 

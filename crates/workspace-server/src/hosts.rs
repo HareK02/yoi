@@ -1158,7 +1158,7 @@ impl EmbeddedWorkerRuntime {
     fn worker_ref(&self, worker_id: &str) -> Option<EmbeddedWorkerRef> {
         Some(EmbeddedWorkerRef::new(
             EmbeddedRuntimeId::new(self.runtime_id.clone())?,
-            EmbeddedWorkerId::new(worker_id.to_string())?,
+            EmbeddedWorkerId::parse(worker_id)?,
         ))
     }
 
@@ -1181,9 +1181,9 @@ impl EmbeddedWorkerRuntime {
     fn map_worker_summary(&self, summary: worker_runtime::catalog::WorkerSummary) -> WorkerSummary {
         WorkerSummary {
             runtime_id: self.runtime_id.clone(),
-            worker_id: summary.worker_ref.worker_id.as_str().to_string(),
+            worker_id: summary.worker_ref.worker_id.to_string(),
             host_id: self.host_id.clone(),
-            label: safe_display_hint(summary.worker_ref.worker_id.as_str()),
+            label: safe_display_hint(&summary.worker_ref.worker_id.to_string()),
             role: embedded_profile_label(&summary.profile),
             profile: embedded_profile_label(&summary.profile),
             workspace: WorkerWorkspaceSummary {
@@ -1217,9 +1217,9 @@ impl EmbeddedWorkerRuntime {
     fn map_worker_detail(&self, detail: EmbeddedWorkerDetail) -> WorkerSummary {
         WorkerSummary {
             runtime_id: self.runtime_id.clone(),
-            worker_id: detail.worker_id.as_str().to_string(),
+            worker_id: detail.worker_id.to_string(),
             host_id: self.host_id.clone(),
-            label: safe_display_hint(detail.worker_id.as_str()),
+            label: safe_display_hint(&detail.worker_id.to_string()),
             role: embedded_profile_label(&detail.profile),
             profile: embedded_profile_label(&detail.profile),
             workspace: WorkerWorkspaceSummary {
@@ -1919,9 +1919,9 @@ impl RemoteWorkerRuntime {
     fn map_worker_summary(&self, summary: worker_runtime::catalog::WorkerSummary) -> WorkerSummary {
         WorkerSummary {
             runtime_id: self.runtime_id.clone(),
-            worker_id: summary.worker_ref.worker_id.as_str().to_string(),
+            worker_id: summary.worker_ref.worker_id.to_string(),
             host_id: self.host_id.clone(),
-            label: safe_display_hint(summary.worker_ref.worker_id.as_str()),
+            label: safe_display_hint(&summary.worker_ref.worker_id.to_string()),
             role: None,
             profile: embedded_profile_label(&summary.profile),
             workspace: WorkerWorkspaceSummary {
@@ -1954,9 +1954,9 @@ impl RemoteWorkerRuntime {
     fn map_worker_detail(&self, detail: EmbeddedWorkerDetail) -> WorkerSummary {
         WorkerSummary {
             runtime_id: self.runtime_id.clone(),
-            worker_id: detail.worker_id.as_str().to_string(),
+            worker_id: detail.worker_id.to_string(),
             host_id: self.host_id.clone(),
-            label: safe_display_hint(detail.worker_id.as_str()),
+            label: safe_display_hint(&detail.worker_id.to_string()),
             role: None,
             profile: embedded_profile_label(&detail.profile),
             workspace: WorkerWorkspaceSummary {
@@ -3562,18 +3562,18 @@ mod tests {
             Error::UnknownRuntime(runtime_id) if runtime_id == "runtime-missing"
         ));
 
-        let unknown_worker = registry.worker("runtime-a", "worker-missing").unwrap_err();
+        let unknown_worker = registry.worker("runtime-a", "999").unwrap_err();
         assert_eq!(
             unknown_worker,
             RuntimeRegistryError::UnknownWorker {
                 runtime_id: "runtime-a".to_string(),
-                worker_id: "worker-missing".to_string(),
+                worker_id: "999".to_string(),
             }
         );
         assert!(matches!(
             unknown_worker.into_error(),
             Error::UnknownWorker { runtime_id, worker_id }
-                if runtime_id == "runtime-a" && worker_id == "worker-missing"
+                if runtime_id == "runtime-a" && worker_id == "999"
         ));
     }
 
@@ -3881,7 +3881,7 @@ mod tests {
 
     #[test]
     fn remote_runtime_registry_routes_commands_without_browser_secret_leaks() {
-        let worker_json = worker_json("remote:primary", "worker-remote-1");
+        let worker_json = worker_json("remote:primary", "1");
         let (base_url, server) = serve_mock_http(vec![
             mock_response(
                 "GET",
@@ -3892,19 +3892,19 @@ mod tests {
             ),
             mock_response(
                 "GET",
-                "/v1/workers/worker-remote-1",
+                "/v1/workers/1",
                 true,
                 200,
                 json!({ "worker": worker_json.clone() }).to_string(),
             ),
             mock_response(
                 "POST",
-                "/v1/workers/worker-remote-1/input",
+                "/v1/workers/1/input",
                 true,
                 200,
                 json!({
                     "ack": {
-                        "worker_ref": { "runtime_id": "remote:primary", "worker_id": "worker-remote-1" },
+                        "worker_ref": { "runtime_id": "remote:primary", "worker_id": 1 },
                         "status": "running",
                         "event_id": 8
                     }
@@ -3929,24 +3929,20 @@ mod tests {
         );
 
         let observation = registry
-            .observation_source("remote:primary", "worker-remote-1")
+            .observation_source("remote:primary", "1")
             .expect("remote runtime exposes backend-owned WS observation source");
         let crate::observation::RuntimeObservationSource::RemoteWs(observation) = observation
         else {
             panic!("remote runtime should expose a remote WS observation source");
         };
         assert!(observation.endpoint.starts_with("ws://127.0.0.1:"));
-        assert!(
-            observation
-                .endpoint
-                .ends_with("/v1/workers/worker-remote-1/events/ws")
-        );
+        assert!(observation.endpoint.ends_with("/v1/workers/1/events/ws"));
         assert_eq!(observation.bearer_token.as_deref(), Some(secret.as_str()));
 
         let workers = registry.list_workers(10);
         assert_eq!(workers.items.len(), 1);
         assert_eq!(workers.items[0].runtime_id, "remote:primary");
-        assert_eq!(workers.items[0].worker_id, "worker-remote-1");
+        assert_eq!(workers.items[0].worker_id, "1");
         assert_eq!(
             workers.items[0].implementation.kind,
             "remote_worker_runtime"
@@ -3961,7 +3957,7 @@ mod tests {
         let input = registry
             .send_input(
                 "remote:primary",
-                "worker-remote-1",
+                "1",
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
                     content: "hello remote".to_string(),
@@ -3997,28 +3993,28 @@ mod tests {
                     "workers": [
                     worker_json_with_execution(
                         "remote:primary",
-                        "worker-stale",
+                        "1",
                         "stale",
                         "unconnected",
                         None,
                     ),
                     worker_json_with_execution(
                         "remote:primary",
-                        "worker-unconnected",
+                        "2",
                         "unconnected",
                         "unconnected",
                         None,
                     ),
                     worker_json_with_execution(
                         "remote:primary",
-                        "worker-rejected",
+                        "3",
                         "connected",
                         "rejected",
                         Some("rejected"),
                     ),
                     worker_json_with_execution(
                         "remote:primary",
-                        "worker-errored",
+                        "4",
                         "connected",
                         "errored",
                         Some("errored"),
@@ -4029,13 +4025,13 @@ mod tests {
             ),
             mock_response(
                 "GET",
-                "/v1/workers/worker-stale",
+                "/v1/workers/1",
                 true,
                 200,
                 json!({
                     "worker": worker_json_with_execution(
                     "remote:primary",
-                    "worker-stale",
+                    "1",
                     "stale",
                     "unconnected",
                     None,
@@ -4076,7 +4072,7 @@ mod tests {
         assert_eq!(workers.items[2].state, "rejected");
         assert_eq!(workers.items[3].state, "errored");
 
-        let stale_detail = registry.worker("remote:primary", "worker-stale").unwrap();
+        let stale_detail = registry.worker("remote:primary", "1").unwrap();
         assert!(!stale_detail.capabilities.can_accept_input);
         assert!(!stale_detail.capabilities.can_stop);
         assert_eq!(stale_detail.state, "stale");
@@ -4162,7 +4158,7 @@ mod tests {
     fn remote_runtime_auth_errors_map_to_typed_backend_error() {
         let (base_url, server) = serve_mock_http(vec![mock_response(
             "GET",
-            "/v1/workers/worker-missing",
+            "/v1/workers/999",
             true,
             401,
             json!({ "error": { "code": "unauthorized", "message": "bad token" } }).to_string(),
@@ -4183,7 +4179,7 @@ mod tests {
         );
 
         let error = registry
-            .worker("remote:primary", "worker-missing")
+            .worker("remote:primary", "999")
             .expect_err("auth failure is a backend operation error");
         assert!(matches!(
             error,
@@ -4278,6 +4274,7 @@ mod tests {
                 "message": format!("{outcome} result")
             })
         });
+        let worker_id = worker_id.parse::<u64>().unwrap();
         json!({
             "worker_ref": { "runtime_id": runtime_id, "worker_id": worker_id },
             "runtime_id": runtime_id,
