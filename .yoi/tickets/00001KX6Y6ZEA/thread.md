@@ -273,3 +273,33 @@ Next action:
 - Route to external Reviewer Pod before merge/close decisions。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-11T01:07:06Z status: approve -->
+
+## Review: approve
+
+External review result: approve
+
+Evidence:
+- Worker identity is path-free: `WorkerWorkspaceContext` carries `Option<WorkspaceId>` plus narrow `WorkspaceClient`/unavailable state, while `Worker` stores `workspace_context` and `filesystem_authority` instead of a `workspace_root: PathBuf` (`crates/worker/src/worker.rs:61-109`, `384-405`)。
+- No `worker.workspace_root()` / local path-returning workspace accessor remains; local paths are exposed only through `WorkerFilesystemAuthority::Local` helpers such as `local_working_directory()` (`worker.rs:741-840`)。
+- Runtime/host boundary now resolves local workspace backend context before constructing Workers (`crates/worker-runtime/src/worker_backend.rs:321-390`), and Worker construction accepts injected workspace context + filesystem authority (`worker.rs:4219-4260`)。
+- Workspace/client without filesystem and no-workspace/no-filesystem Workers are represented and covered by tests (`worker.rs:5441-5530`; worker-runtime tests around `901+`)。
+- Workspace-aware local features fail closed when no local filesystem authority is available; Ticket/memory/workflow/spawn-dependent surfaces require `filesystem_authority.local()` and otherwise return unavailable errors rather than cwd/root fallback (`crates/worker/src/controller.rs:630-672`, `709-779`)。
+- Legacy `workspace_root` metadata is written only as a compatibility/local hint from local filesystem authority, not as Worker identity (`worker.rs:4604-4621`; `session-store/src/worker_metadata.rs`)。
+
+Validation performed:
+- `git diff --check 142b60e1^ 142b60e1`
+- Focused grep for forbidden `workspace_root()` accessor: no matches。
+- Focused tests:
+  - `cargo test -p worker spawned_context_tests --lib`
+  - `cargo test -p worker-runtime worker_spawn_receives_materialized_workspace_cwd_instead_of_source_repo --features ws-server,fs-store`
+  - `cargo test -p worker-runtime adapter_dispatches_user_input_through_worker_run_lifecycle --features ws-server,fs-store`
+
+Blockers: none。
+
+Non-blocking notes:
+- Remaining `workspace_root` hits are local runtime/entrypoint/spawn-tool adapter, legacy metadata, or test contexts; reviewer did not find Worker identity/accessor use。
+- `set_active_with_workspace_context` preserves existing metadata fields when passed `None`; acceptable for this Ticket as compatibility metadata, but future no-workspace reuse of an existing Pod name may want explicit clearing semantics to avoid stale UI hints。
+
+---
