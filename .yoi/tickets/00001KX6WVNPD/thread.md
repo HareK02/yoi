@@ -202,3 +202,28 @@ Next action:
 - Route to external Reviewer Pod before merge/close decisions。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-11T00:12:24Z status: approve -->
+
+## Review: approve
+
+External review result: approve
+
+Evidence:
+- UI/API optionality is correctly bounded: launch options expose `working_directory_required` and set it false only for embedded runtime (`crates/workspace-server/src/server.rs:749`, `:3823`), while browser request construction omits `working_directory` for embedded no-workdir mode and tests cover that (`web/workspace/src/lib/workspace-sidebar/worker-launch.test.ts:80`)。
+- Non-embedded no-workdir is rejected in workspace/API launch paths (`server.rs:2639`, `:2839`) with tests covering the 400 behavior (`server.rs:6383`, `:6554`)。
+- Authority boundary is preserved: absent materialized workdir reaches runtime as no working directory (`server.rs:2652`) and worker-runtime maps that to `WorkerFilesystemAuthority::None`; workdir-present maps to `Local(root, cwd)` (`crates/worker-runtime/src/worker_backend.rs:301`)。
+- Tool surface/no fallback is covered by existing runtime tests asserting no cwd observation and omission of `Read`/`Write`/`Edit`/`Glob`/`Grep`/`Bash` for no-workdir workers (`worker_backend.rs:1151`, `:1216`)。
+- Workdir-present behavior remains covered by materialized binding assertions (`worker_backend.rs:1151`) and server worker creation still links/summarizes workdir-present workers。
+- Browser labeling is explicit: embedded mode offers “No working directory — guidance-only Worker; filesystem tools are disabled” and non-embedded paths require selection (`+page.svelte:153`, `:289`)。
+
+Validation performed by reviewer:
+- `cargo test -p yoi-workspace-server no_workdir -- --nocapture`
+- `cargo test -p worker-runtime --features ws-server --lib -- --nocapture`
+- `cd web/workspace && deno task test`
+- Final `git status --short` was clean。
+
+Blockers: none。
+Non-blocking notes: none。
+
+---
