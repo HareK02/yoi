@@ -270,12 +270,10 @@ fn backend_command_from_method(method: &Method) -> BackendCommand {
 }
 
 async fn observe_worker_events(target: BackendRuntimeTarget, tx: mpsc::UnboundedSender<Event>) {
-    let mut cursor: Option<String> = None;
-    let mut last_sequence = 0_u64;
     let mut attempts = 0_usize;
 
     loop {
-        let url = observation_ws_url(&target, cursor.as_deref());
+        let url = observation_ws_url(&target);
         match connect_async(&url).await {
             Ok((mut ws, _)) => {
                 attempts = 0;
@@ -295,19 +293,6 @@ async fn observe_worker_events(target: BackendRuntimeTarget, tx: mpsc::Unbounded
                                         )));
                                         continue;
                                     }
-                                    if let Some(sequence) = decode_backend_cursor(&envelope.cursor)
-                                    {
-                                        if sequence <= last_sequence {
-                                            continue;
-                                        }
-                                        last_sequence = sequence;
-                                    } else {
-                                        let _ = tx.send(diagnostic_event(format!(
-                                            "Backend observation cursor was malformed: {}",
-                                            envelope.cursor
-                                        )));
-                                    }
-                                    cursor = Some(envelope.cursor.clone());
                                     let _ = tx.send(envelope.payload);
                                 }
                                 Ok(ClientWorkerEventWsFrame::Diagnostic { diagnostic }) => {
@@ -316,11 +301,6 @@ async fn observe_worker_events(target: BackendRuntimeTarget, tx: mpsc::Unbounded
                                         diagnostic.code, diagnostic.message
                                     );
                                     let _ = tx.send(diagnostic_event(message));
-                                    if diagnostic.code == "backend.cursor_unknown_or_expired" {
-                                        cursor = None;
-                                        last_sequence = 0;
-                                        break;
-                                    }
                                 }
                                 Err(error) => {
                                     let _ = tx.send(diagnostic_event(format!(
@@ -395,18 +375,13 @@ fn validate_target(target: &BackendRuntimeTarget) -> Result<(), BackendRuntimeCl
     Ok(())
 }
 
-fn observation_ws_url(target: &BackendRuntimeTarget, cursor: Option<&str>) -> String {
+fn observation_ws_url(target: &BackendRuntimeTarget) -> String {
     let path = format!(
         "/api/runtimes/{}/workers/{}/events/ws",
         path_segment_encode(&target.runtime_id),
         path_segment_encode(&target.worker_id)
     );
-    let mut url = join_base_and_path(&http_base_to_ws(&target.base_url), &path);
-    if let Some(cursor) = cursor {
-        url.push_str("?cursor=");
-        url.push_str(&query_value_encode(cursor));
-    }
-    url
+    join_base_and_path(&http_base_to_ws(&target.base_url), &path)
 }
 
 fn http_base_to_ws(base: &str) -> String {
@@ -423,21 +398,7 @@ fn join_base_and_path(base: &str, path: &str) -> String {
     format!("{}{}", base.trim_end_matches('/'), path)
 }
 
-fn decode_backend_cursor(cursor: &str) -> Option<u64> {
-    let encoded = cursor.strip_prefix("bo_")?;
-    if encoded.len() != 16 {
-        return None;
-    }
-    u64::from_str_radix(encoded, 16).ok()
-}
-
 fn path_segment_encode(input: &str) -> String {
-    percent_encode(input, |byte| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
-    })
-}
-
-fn query_value_encode(input: &str) -> String {
     percent_encode(input, |byte| {
         byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
     })
@@ -507,7 +468,6 @@ enum ClientWorkerEventWsFrame {
 
 #[derive(Debug, Deserialize)]
 struct ClientWorkerEventWsEnvelope {
-    cursor: String,
     runtime_id: String,
     worker_id: String,
     payload: Event,
@@ -547,8 +507,8 @@ mod tests {
         let target =
             BackendRuntimeTarget::new("http://127.0.0.1:8787/", "runtime/one", "worker one");
         assert_eq!(
-            observation_ws_url(&target, Some("bo_0000000000000001")),
-            "ws://127.0.0.1:8787/api/runtimes/runtime%2Fone/workers/worker%20one/events/ws?cursor=bo_0000000000000001"
+            observation_ws_url(&target),
+            "ws://127.0.0.1:8787/api/runtimes/runtime%2Fone/workers/worker%20one/events/ws"
         );
     }
 }

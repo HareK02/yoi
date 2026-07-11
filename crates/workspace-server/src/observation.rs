@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use worker_runtime::identity::WorkerRef;
 use worker_runtime::observation::{WorkerObservationCursor, WorkerObservationEvent};
@@ -100,7 +100,7 @@ impl std::fmt::Debug for RuntimeObservationSource {
 pub struct RuntimeObservationUpstreamEvent {
     pub runtime_id: String,
     pub worker_id: String,
-    pub runtime_cursor: String,
+    pub runtime_event_id: String,
     pub payload: protocol::Event,
 }
 
@@ -116,11 +116,10 @@ pub enum ClientWorkerEventWsFrame {
     },
 }
 
-/// Backend-owned opaque event envelope. It intentionally omits Runtime endpoints,
+/// Backend-owned event envelope. It intentionally omits Runtime endpoints,
 /// credentials, sockets and session paths.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClientWorkerEventWsEnvelope {
-    pub cursor: String,
     pub event_id: String,
     pub runtime_id: String,
     pub worker_id: String,
@@ -134,17 +133,10 @@ pub struct ClientWorkerEventWsDiagnostic {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
-pub struct ClientWorkerEventsWsQuery {
-    pub cursor: Option<String>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ObservationProxyError {
     RuntimeUnavailable(String),
     WorkerNotFound(String),
-    CursorMalformed(String),
-    CursorUnknownOrExpired(String),
     UpstreamDisconnect(String),
     MalformedFrame(String),
     ObservationOnly,
@@ -155,8 +147,6 @@ impl ObservationProxyError {
         match self {
             ObservationProxyError::RuntimeUnavailable(_) => "backend.runtime_unavailable",
             ObservationProxyError::WorkerNotFound(_) => "backend.worker_not_found",
-            ObservationProxyError::CursorMalformed(_) => "backend.cursor_malformed",
-            ObservationProxyError::CursorUnknownOrExpired(_) => "backend.cursor_unknown_or_expired",
             ObservationProxyError::UpstreamDisconnect(_) => "backend.upstream_disconnect",
             ObservationProxyError::MalformedFrame(_) => "backend.malformed_frame",
             ObservationProxyError::ObservationOnly => "backend.observation_only",
@@ -167,8 +157,6 @@ impl ObservationProxyError {
         match self {
             ObservationProxyError::RuntimeUnavailable(message)
             | ObservationProxyError::WorkerNotFound(message)
-            | ObservationProxyError::CursorMalformed(message)
-            | ObservationProxyError::CursorUnknownOrExpired(message)
             | ObservationProxyError::UpstreamDisconnect(message)
             | ObservationProxyError::MalformedFrame(message) => message,
             ObservationProxyError::ObservationOnly => {
@@ -193,46 +181,6 @@ impl ClientWorkerEventWsFrame {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct BackendObservationCursor {
-    pub sequence: u64,
-}
-
-impl BackendObservationCursor {
-    pub fn new(sequence: u64) -> Self {
-        Self { sequence }
-    }
-
-    pub fn zero() -> Self {
-        Self { sequence: 0 }
-    }
-
-    pub fn encode(self) -> String {
-        format!("bo_{:016x}", self.sequence)
-    }
-
-    pub fn decode(value: &str) -> Option<Self> {
-        let encoded = value.strip_prefix("bo_")?;
-        if encoded.len() != 16 {
-            return None;
-        }
-        u64::from_str_radix(encoded, 16)
-            .ok()
-            .map(|sequence| Self { sequence })
-    }
-}
-
-#[derive(Debug, Default)]
-struct BackendObservationState {
-    next_sequence: u64,
-}
-
-impl BackendObservationState {
-    fn new() -> Self {
-        Self { next_sequence: 1 }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct ObservationKey {
     runtime_id: String,
@@ -243,14 +191,12 @@ struct ObservationKey {
 #[derive(Clone)]
 pub struct BackendObservationProxy {
     sources: Arc<BTreeMap<ObservationKey, RuntimeObservationSourceConfig>>,
-    state: Arc<Mutex<BackendObservationState>>,
 }
 
 impl std::fmt::Debug for BackendObservationProxy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BackendObservationProxy")
             .field("source_count", &self.sources.len())
-            .field("state", &"<omitted>")
             .finish()
     }
 }
@@ -271,7 +217,6 @@ impl BackendObservationProxy {
             .collect();
         Self {
             sources: Arc::new(sources),
-            state: Arc::new(Mutex::new(BackendObservationState::new())),
         }
     }
 
@@ -294,41 +239,13 @@ impl BackendObservationProxy {
             })
     }
 
-    pub fn open(
-        &self,
-        _runtime_id: &str,
-        _worker_id: &str,
-        cursor: Option<&str>,
-    ) -> Result<(), ObservationProxyError> {
-        if let Some(raw) = cursor {
-            BackendObservationCursor::decode(raw).ok_or_else(|| {
-                ObservationProxyError::CursorMalformed(format!(
-                    "malformed backend observation cursor: {raw}"
-                ))
-            })?;
-        }
-        Ok(())
-    }
-
-    pub fn store(
-        &self,
-        event: RuntimeObservationUpstreamEvent,
-    ) -> Result<ClientWorkerEventWsEnvelope, ObservationProxyError> {
-        let mut state = self.state.lock().map_err(|_| {
-            ObservationProxyError::RuntimeUnavailable(
-                "backend observation state lock poisoned".into(),
-            )
-        })?;
-        let sequence = state.next_sequence;
-        state.next_sequence += 1;
-        let cursor = BackendObservationCursor::new(sequence).encode();
-        Ok(ClientWorkerEventWsEnvelope {
-            cursor: cursor.clone(),
-            event_id: cursor,
+    pub fn map_event(&self, event: RuntimeObservationUpstreamEvent) -> ClientWorkerEventWsEnvelope {
+        ClientWorkerEventWsEnvelope {
+            event_id: event.runtime_event_id,
             runtime_id: event.runtime_id,
             worker_id: event.worker_id,
             payload: event.payload,
-        })
+        }
     }
 }
 
@@ -337,11 +254,6 @@ fn map_runtime_connect_error(error: TungsteniteError) -> ObservationProxyError {
         TungsteniteError::Http(response) if response.status() == StatusCode::NOT_FOUND => {
             ObservationProxyError::WorkerNotFound(
                 "runtime worker observation endpoint returned 404 not found".into(),
-            )
-        }
-        TungsteniteError::Http(response) if response.status() == StatusCode::BAD_REQUEST => {
-            ObservationProxyError::CursorMalformed(
-                "runtime worker observation endpoint rejected the request as malformed".into(),
             )
         }
         TungsteniteError::Http(response) => ObservationProxyError::RuntimeUnavailable(format!(
@@ -357,10 +269,9 @@ fn map_runtime_connect_error(error: TungsteniteError) -> ObservationProxyError {
 fn map_runtime_diagnostic(code: String, message: String) -> ObservationProxyError {
     match code.as_str() {
         "runtime.worker_not_found" => ObservationProxyError::WorkerNotFound(message),
-        "runtime.cursor_malformed" => ObservationProxyError::CursorMalformed(message),
-        "runtime.cursor_unknown_or_expired" | "runtime.cursor_expired" => {
-            ObservationProxyError::CursorUnknownOrExpired(message)
-        }
+        "runtime.cursor_malformed"
+        | "runtime.cursor_unknown_or_expired"
+        | "runtime.cursor_expired" => ObservationProxyError::RuntimeUnavailable(message),
         "runtime.unavailable" => ObservationProxyError::RuntimeUnavailable(message),
         "runtime.upstream_closed" | "runtime.websocket_error" => {
             ObservationProxyError::UpstreamDisconnect(message)
@@ -384,15 +295,8 @@ pub struct RuntimeWsObservationClient {
 impl RuntimeWsObservationClient {
     pub async fn connect(
         source: &RuntimeObservationSourceConfig,
-        runtime_cursor: Option<&str>,
     ) -> Result<Self, ObservationProxyError> {
-        let mut endpoint = source.endpoint.clone();
-        if let Some(cursor) = runtime_cursor {
-            let separator = if endpoint.contains('?') { '&' } else { '?' };
-            endpoint.push(separator);
-            endpoint.push_str("cursor=");
-            endpoint.push_str(cursor);
-        }
+        let endpoint = source.endpoint.clone();
         let mut request = endpoint.into_client_request().map_err(|error| {
             ObservationProxyError::RuntimeUnavailable(format!(
                 "failed to build runtime WebSocket request: {error}"
@@ -481,7 +385,7 @@ impl RuntimeWsObservationClient {
         RuntimeObservationUpstreamEvent {
             runtime_id: self.runtime_id.clone(),
             worker_id: self.worker_id.clone(),
-            runtime_cursor: envelope.cursor,
+            runtime_event_id: envelope.event_id,
             payload: envelope.payload,
         }
     }
@@ -493,18 +397,15 @@ pub enum RuntimeObservationClient {
 }
 
 impl RuntimeObservationClient {
-    pub async fn connect(
-        source: &RuntimeObservationSource,
-        runtime_cursor: Option<&str>,
-    ) -> Result<Self, ObservationProxyError> {
+    pub async fn connect(source: &RuntimeObservationSource) -> Result<Self, ObservationProxyError> {
         match source {
             RuntimeObservationSource::RemoteWs(config) => {
-                RuntimeWsObservationClient::connect(config, runtime_cursor)
+                RuntimeWsObservationClient::connect(config)
                     .await
                     .map(Self::RemoteWs)
             }
             RuntimeObservationSource::Embedded(source) => {
-                EmbeddedObservationClient::connect(source, runtime_cursor).map(Self::Embedded)
+                EmbeddedObservationClient::connect(source).map(Self::Embedded)
             }
         }
     }
@@ -529,26 +430,16 @@ pub struct EmbeddedObservationClient {
 }
 
 impl EmbeddedObservationClient {
-    fn connect(
-        source: &EmbeddedRuntimeObservationSource,
-        runtime_cursor: Option<&str>,
-    ) -> Result<Self, ObservationProxyError> {
-        let cursor = match runtime_cursor {
-            Some(raw) => WorkerObservationCursor::decode(raw).ok_or_else(|| {
-                ObservationProxyError::CursorMalformed(
-                    "embedded runtime cursor is malformed".into(),
-                )
-            })?,
-            None => source
-                .runtime
-                .worker_observation_cursor_now(&source.worker_ref)
-                .map_err(|err| {
-                    ObservationProxyError::WorkerNotFound(format!(
-                        "embedded Worker '{}' is not observable: {err}",
-                        source.worker_id
-                    ))
-                })?,
-        };
+    fn connect(source: &EmbeddedRuntimeObservationSource) -> Result<Self, ObservationProxyError> {
+        let cursor = source
+            .runtime
+            .worker_observation_cursor_now(&source.worker_ref)
+            .map_err(|err| {
+                ObservationProxyError::WorkerNotFound(format!(
+                    "embedded Worker '{}' is not observable: {err}",
+                    source.worker_id
+                ))
+            })?;
         let receiver = source
             .runtime
             .subscribe_worker_observation()
@@ -559,29 +450,27 @@ impl EmbeddedObservationClient {
                 ))
             })?;
         let mut queued = VecDeque::new();
-        if runtime_cursor.is_none() {
-            let snapshot = source
-                .runtime
-                .worker_observation_snapshot(&source.worker_ref)
-                .map_err(|err| {
-                    ObservationProxyError::WorkerNotFound(format!(
-                        "embedded Worker '{}' snapshot is unavailable: {err}",
-                        source.worker_id
-                    ))
-                })?;
-            queued.push_back(RuntimeObservationUpstreamEvent {
-                runtime_id: source.runtime_id.clone(),
-                worker_id: source.worker_id.clone(),
-                runtime_cursor: cursor.encode(),
-                payload: snapshot,
-            });
-        }
+        let snapshot = source
+            .runtime
+            .worker_observation_snapshot(&source.worker_ref)
+            .map_err(|err| {
+                ObservationProxyError::WorkerNotFound(format!(
+                    "embedded Worker '{}' snapshot is unavailable: {err}",
+                    source.worker_id
+                ))
+            })?;
+        queued.push_back(RuntimeObservationUpstreamEvent {
+            runtime_id: source.runtime_id.clone(),
+            worker_id: source.worker_id.clone(),
+            runtime_event_id: "snapshot".to_string(),
+            payload: snapshot,
+        });
         for event in source
             .runtime
             .read_worker_observation_events(&source.worker_ref, cursor)
             .map_err(|err| {
-                ObservationProxyError::CursorUnknownOrExpired(format!(
-                    "embedded Worker '{}' cursor is unavailable: {err}",
+                ObservationProxyError::RuntimeUnavailable(format!(
+                    "embedded Worker '{}' observation cursor is unavailable: {err}",
                     source.worker_id
                 ))
             })?
@@ -606,9 +495,6 @@ impl EmbeddedObservationClient {
         &mut self,
     ) -> Result<RuntimeObservationUpstreamEvent, ObservationProxyError> {
         if let Some(event) = self.queued.pop_front() {
-            if let Some(cursor) = WorkerObservationCursor::decode(&event.runtime_cursor) {
-                self.cursor = cursor;
-            }
             return Ok(event);
         }
         loop {
@@ -619,7 +505,7 @@ impl EmbeddedObservationClient {
                 {
                     self.cursor =
                         WorkerObservationCursor::decode(&event.cursor).ok_or_else(|| {
-                            ObservationProxyError::CursorMalformed(
+                            ObservationProxyError::RuntimeUnavailable(
                                 "embedded runtime emitted a malformed cursor".into(),
                             )
                         })?;
@@ -627,7 +513,7 @@ impl EmbeddedObservationClient {
                 }
                 Ok(_) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    return Err(ObservationProxyError::CursorUnknownOrExpired(
+                    return Err(ObservationProxyError::RuntimeUnavailable(
                         "embedded runtime observation backlog was exceeded".into(),
                     ));
                 }
@@ -648,7 +534,7 @@ impl EmbeddedObservationClient {
         RuntimeObservationUpstreamEvent {
             runtime_id: runtime_id.to_string(),
             worker_id: worker_id.to_string(),
-            runtime_cursor: event.cursor,
+            runtime_event_id: event.cursor.clone(),
             payload: event.payload,
         }
     }

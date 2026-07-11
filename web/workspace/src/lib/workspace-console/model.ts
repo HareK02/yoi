@@ -49,7 +49,7 @@ export type ConsoleLine = {
   body: string;
   detail?: string;
   diff?: ConsoleDiffLine[];
-  cursor?: string | null;
+  eventId?: string | null;
   source: "event";
   streaming?: boolean;
   error?: boolean;
@@ -60,7 +60,7 @@ export type ConsoleProjection = {
   lines: ConsoleLine[];
   status: string | null;
   usage: string | null;
-  lastCursor: string | null;
+  lastEventId: string | null;
 };
 
 export type WorkerTarget = {
@@ -93,7 +93,7 @@ export function workerConsolePath(
   );
 }
 
-export type ConsoleEventInput = { cursor: string; event: ProtocolEvent };
+export type ConsoleEventInput = { eventId: string; event: ProtocolEvent };
 
 export function projectConsole(
   events: ConsoleEventInput[] = [],
@@ -102,7 +102,7 @@ export function projectConsole(
     lines: [],
     status: null,
     usage: null,
-    lastCursor: null,
+    lastEventId: null,
   });
   return {
     ...projection,
@@ -112,13 +112,13 @@ export function projectConsole(
 
 export function applyProtocolEvent(
   projection: ConsoleProjection,
-  envelope: { cursor: string; event: ProtocolEvent },
+  envelope: { eventId: string; event: ProtocolEvent },
 ): ConsoleProjection {
   const next: ConsoleProjection = {
     lines: [...projection.lines],
     status: projection.status,
     usage: projection.usage,
-    lastCursor: envelope.cursor,
+    lastEventId: envelope.eventId,
   };
   const event = envelope.event;
 
@@ -126,7 +126,7 @@ export function applyProtocolEvent(
     case "user_message":
       next.lines.push(
         line(
-          envelope.cursor,
+          envelope.eventId,
           "user",
           "User",
           segmentsToText(event.data.segments),
@@ -139,7 +139,7 @@ export function applyProtocolEvent(
     case "text_delta":
       appendStreaming(
         next,
-        envelope.cursor,
+        envelope.eventId,
         "assistant",
         "assistant streaming",
         event.data.text,
@@ -149,20 +149,20 @@ export function applyProtocolEvent(
       finalizeStreaming(
         next,
         "assistant",
-        envelope.cursor,
+        envelope.eventId,
         "assistant",
         event.data.text,
       );
       break;
     case "thinking_start":
       next.lines.push(
-        line(envelope.cursor, "thinking", "Thinking...", "", undefined, true),
+        line(envelope.eventId, "thinking", "Thinking...", "", undefined, true),
       );
       break;
     case "thinking_delta":
       appendStreaming(
         next,
-        envelope.cursor,
+        envelope.eventId,
         "thinking",
         "Thinking...",
         event.data.text,
@@ -172,22 +172,22 @@ export function applyProtocolEvent(
       finalizeStreaming(
         next,
         "thinking",
-        envelope.cursor,
+        envelope.eventId,
         "Thought",
         event.data.text,
       );
       break;
     case "tool_call_start":
-      upsertToolCall(next, envelope.cursor, event.data.id, {
+      upsertToolCall(next, envelope.eventId, event.data.id, {
         name: event.data.name,
         state: "pending",
       });
       break;
     case "tool_call_args_delta":
-      appendToolArgs(next, envelope.cursor, event.data.id, event.data.json);
+      appendToolArgs(next, envelope.eventId, event.data.id, event.data.json);
       break;
     case "tool_call_done":
-      upsertToolCall(next, envelope.cursor, event.data.id, {
+      upsertToolCall(next, envelope.eventId, event.data.id, {
         name: event.data.name,
         arguments: event.data.arguments,
         argsStream: event.data.arguments,
@@ -195,7 +195,7 @@ export function applyProtocolEvent(
       });
       break;
     case "tool_result":
-      attachToolResult(next, envelope.cursor, event.data.id, {
+      attachToolResult(next, envelope.eventId, event.data.id, {
         summary: event.data.summary,
         output: event.data.output,
         isError: event.data.is_error,
@@ -207,7 +207,7 @@ export function applyProtocolEvent(
     case "error":
       next.lines.push(
         line(
-          envelope.cursor,
+          envelope.eventId,
           "error",
           `error · ${event.data.code}`,
           event.data.message,
@@ -220,7 +220,7 @@ export function applyProtocolEvent(
     case "snapshot":
       next.status = event.data.status;
       for (const block of event.data.in_flight?.blocks ?? []) {
-        next.lines.push(inFlightLine(envelope.cursor, block));
+        next.lines.push(inFlightLine(envelope.eventId, block));
       }
       break;
     case "status":
@@ -251,7 +251,7 @@ export function applyProtocolEvent(
     case "compact_failed":
       next.lines.push(
         line(
-          envelope.cursor,
+          envelope.eventId,
           "error",
           "compact failed",
           event.data.error,
@@ -292,7 +292,7 @@ export function segmentsToText(segments: Segment[]): string {
 }
 
 function line(
-  cursor: string,
+  eventId: string,
   kind: ConsoleLineKind,
   title: string,
   body: string,
@@ -301,12 +301,12 @@ function line(
   error = false,
 ): ConsoleLine {
   return {
-    id: `event-${cursor}-${kind}-${slugify(title)}-${body.length}`,
+    id: `event-${eventId}-${kind}-${slugify(title)}-${body.length}`,
     kind,
     title,
     body,
     detail,
-    cursor,
+    eventId,
     source: "event",
     streaming,
     error,
@@ -315,7 +315,7 @@ function line(
 
 function appendStreaming(
   projection: ConsoleProjection,
-  cursor: string,
+  eventId: string,
   kind: "assistant" | "thinking",
   title: string,
   delta: string,
@@ -325,16 +325,16 @@ function appendStreaming(
   );
   if (existing) {
     existing.body += delta;
-    existing.cursor = cursor;
+    existing.eventId = eventId;
     return;
   }
-  projection.lines.push(line(cursor, kind, title, delta, undefined, true));
+  projection.lines.push(line(eventId, kind, title, delta, undefined, true));
 }
 
 function finalizeStreaming(
   projection: ConsoleProjection,
   kind: "assistant" | "thinking",
-  cursor: string,
+  eventId: string,
   title: string,
   body: string,
 ): void {
@@ -345,21 +345,21 @@ function finalizeStreaming(
     existing.body = body || existing.body;
     existing.streaming = false;
     existing.title = title;
-    existing.cursor = cursor;
+    existing.eventId = eventId;
     return;
   }
-  projection.lines.push(line(cursor, kind, title, body));
+  projection.lines.push(line(eventId, kind, title, body));
 }
 
 function upsertToolCall(
   projection: ConsoleProjection,
-  cursor: string,
+  eventId: string,
   id: string,
   update: Partial<Omit<ToolCallView, "id">>,
 ): ConsoleLine {
   let existing = findToolCallLine(projection, id);
   if (!existing) {
-    existing = toolLine(cursor, {
+    existing = toolLine(eventId, {
       id,
       name: update.name ?? "Tool",
       argsStream: update.argsStream ?? "",
@@ -371,7 +371,7 @@ function upsertToolCall(
     });
     projection.lines.push(existing);
   } else {
-    existing.cursor = cursor;
+    existing.eventId = eventId;
     existing.toolCall = {
       ...existing.toolCall!,
       ...update,
@@ -385,11 +385,11 @@ function upsertToolCall(
 
 function appendToolArgs(
   projection: ConsoleProjection,
-  cursor: string,
+  eventId: string,
   id: string,
   delta: string,
 ): void {
-  const existing = upsertToolCall(projection, cursor, id, {
+  const existing = upsertToolCall(projection, eventId, id, {
     state: "streaming_args",
   });
   existing.toolCall!.argsStream += delta;
@@ -398,13 +398,13 @@ function appendToolArgs(
 
 function attachToolResult(
   projection: ConsoleProjection,
-  cursor: string,
+  eventId: string,
   id: string,
   result: Pick<ToolCallView, "summary" | "output" | "isError">,
 ): void {
   const existing = findToolCallLine(projection, id);
   if (!existing) {
-    const fallback = toolLine(cursor, {
+    const fallback = toolLine(eventId, {
       id,
       name: "Tool",
       argsStream: "",
@@ -418,7 +418,7 @@ function attachToolResult(
     projection.lines.push(fallback);
     return;
   }
-  existing.cursor = cursor;
+  existing.eventId = eventId;
   existing.toolCall = {
     ...existing.toolCall!,
     ...result,
@@ -436,14 +436,14 @@ function findToolCallLine(
   );
 }
 
-function toolLine(cursor: string, toolCall: ToolCallView): ConsoleLine {
+function toolLine(eventId: string, toolCall: ToolCallView): ConsoleLine {
   const item: ConsoleLine = {
     id: `tool-call-${toolCall.id}`,
     kind: "tool",
     title: `Call · ${toolCall.name}`,
     body: "",
     detail: undefined,
-    cursor,
+    eventId,
     source: "event",
     streaming: true,
     error: false,
@@ -531,7 +531,7 @@ function readAggregateLine(group: ConsoleLine[]): ConsoleLine {
     title: "Call · Read",
     body,
     detail: calls.map(readDetail).join("\n\n"),
-    cursor: group.at(-1)?.cursor,
+    eventId: group.at(-1)?.eventId,
     source: "event",
     streaming: inProgress,
     error: hasError,
@@ -760,11 +760,11 @@ function usageText(
   } · cache ${data.cache_read_input_tokens ?? "unknown"}`;
 }
 
-function inFlightLine(cursor: string, block: InFlightBlock): ConsoleLine {
+function inFlightLine(eventId: string, block: InFlightBlock): ConsoleLine {
   switch (block.kind) {
     case "text":
       return line(
-        cursor,
+        eventId,
         "in_flight",
         "in-flight assistant text",
         block.text,
@@ -773,7 +773,7 @@ function inFlightLine(cursor: string, block: InFlightBlock): ConsoleLine {
       );
     case "thinking":
       return line(
-        cursor,
+        eventId,
         "in_flight",
         "in-flight thinking",
         block.text,
@@ -781,7 +781,7 @@ function inFlightLine(cursor: string, block: InFlightBlock): ConsoleLine {
         !block.finished,
       );
     case "tool_call":
-      return toolLine(cursor, {
+      return toolLine(eventId, {
         id: block.id,
         name: block.name,
         argsStream: block.args,

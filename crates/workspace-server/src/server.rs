@@ -34,8 +34,8 @@ use crate::hosts::{
 };
 use crate::identity::WorkspaceIdentity;
 use crate::observation::{
-    BackendObservationProxy, ClientWorkerEventWsFrame, ClientWorkerEventsWsQuery,
-    ObservationProxyError, RuntimeObservationClient, RuntimeObservationSourceConfig,
+    BackendObservationProxy, ClientWorkerEventWsFrame, ObservationProxyError,
+    RuntimeObservationClient, RuntimeObservationSourceConfig,
 };
 use crate::profile_settings::{
     CreateWorkspaceProfileSourceRequest, DeleteWorkspaceProfileSourceRequest,
@@ -2119,19 +2119,13 @@ async fn scoped_worker_observation_ws(
     ws: WebSocketUpgrade,
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
-    Query(query): Query<ClientWorkerEventsWsQuery>,
 ) -> Response {
     if let Err(err) = validate_workspace_scope(&api, &path.workspace_id) {
         return err.into_response();
     }
-    worker_observation_ws(
-        State(api),
-        AxumPath((path.runtime_id, path.worker_id)),
-        Query(query),
-        ws,
-    )
-    .await
-    .into_response()
+    worker_observation_ws(State(api), AxumPath((path.runtime_id, path.worker_id)), ws)
+        .await
+        .into_response()
 }
 
 async fn scoped_list_host_workers(
@@ -2946,17 +2940,16 @@ async fn cancel_runtime_worker(
 async fn worker_observation_ws(
     State(api): State<WorkspaceApi>,
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
-    Query(query): Query<ClientWorkerEventsWsQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     match api.observation_proxy.source(&runtime_id, &worker_id) {
         Ok(source) => ws.on_upgrade(move |socket| {
-            worker_observation_ws_session(api.observation_proxy, source, query, socket)
+            worker_observation_ws_session(api.observation_proxy, source, socket)
         }),
         Err(ObservationProxyError::WorkerNotFound(_)) => {
             match api.runtime.observation_source(&runtime_id, &worker_id) {
                 Ok(source) => ws.on_upgrade(move |socket| {
-                    worker_observation_ws_session(api.observation_proxy, source, query, socket)
+                    worker_observation_ws_session(api.observation_proxy, source, socket)
                 }),
                 Err(error) => ApiError::from(error.into_error()).into_response(),
             }
@@ -2978,20 +2971,9 @@ async fn worker_observation_ws(
 async fn worker_observation_ws_session(
     proxy: BackendObservationProxy,
     source: crate::observation::RuntimeObservationSource,
-    query: ClientWorkerEventsWsQuery,
     mut socket: WebSocket,
 ) {
-    if let Err(error) = proxy.open(
-        source.runtime_id(),
-        source.worker_id(),
-        query.cursor.as_deref(),
-    ) {
-        let _ =
-            send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::diagnostic(error)).await;
-        return;
-    }
-
-    let mut upstream = match RuntimeObservationClient::connect(&source, None).await {
+    let mut upstream = match RuntimeObservationClient::connect(&source).await {
         Ok(client) => client,
         Err(error) => {
             let _ = send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::diagnostic(error))
@@ -3033,14 +3015,9 @@ async fn worker_observation_ws_session(
             }
             upstream_event = upstream.next_event() => {
                 match upstream_event {
-                    Ok(event) => match proxy.store(event) {
-                        Ok(envelope) => {
-                            if !send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::event(envelope)).await {
-                                return;
-                            }
-                        }
-                        Err(error) => {
-                            let _ = send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::diagnostic(error)).await;
+                    Ok(event) => {
+                        let envelope = proxy.map_event(event);
+                        if !send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::event(envelope)).await {
                             return;
                         }
                     },
@@ -7266,37 +7243,12 @@ mod tests {
             ClientWorkerEventWsFrame::Event { envelope } if matches!(envelope.payload, protocol::Event::TextDone { .. })
         ));
 
-        let (mut resumed, _) = connect_async(format!("{url}?cursor={}", live.cursor))
-            .await
-            .unwrap();
-        let _snapshot = next_client_frame(&mut resumed).await;
-        runtime
-            .observe_worker_event(
-                &worker_ref,
-                protocol::Event::TextDone {
-                    text: "done".into(),
-                },
-            )
-            .unwrap();
-        let resumed_event = next_client_frame(&mut resumed).await;
-        let ClientWorkerEventWsFrame::Event {
-            envelope: resumed_event,
-        } = resumed_event
-        else {
-            panic!("expected resumed live event");
-        };
-        assert_ne!(resumed_event.cursor, live.cursor);
+        let (mut query_stream, _) = connect_async(format!("{url}?cursor=bad")).await.unwrap();
+        let query_snapshot = next_client_frame(&mut query_stream).await;
         assert!(matches!(
-            resumed_event.payload,
-            protocol::Event::TextDone { .. }
+            query_snapshot,
+            ClientWorkerEventWsFrame::Event { envelope } if matches!(envelope.payload, protocol::Event::Snapshot { .. })
         ));
-
-        let (mut malformed, _) = connect_async(format!("{url}?cursor=bad")).await.unwrap();
-        let diagnostic = next_client_frame(&mut malformed).await;
-        let ClientWorkerEventWsFrame::Diagnostic { diagnostic } = diagnostic else {
-            panic!("expected malformed cursor diagnostic");
-        };
-        assert_eq!(diagnostic.code, "backend.cursor_malformed");
 
         stream.send(Message::Text("{}".into())).await.unwrap();
         let mut saw_observation_only = false;
@@ -7310,41 +7262,6 @@ mod tests {
             }
         }
         assert!(saw_observation_only, "expected observation-only diagnostic");
-    }
-
-    #[tokio::test]
-    async fn proxy_does_not_validate_backend_cursor_against_replay_history() {
-        let source = RuntimeObservationSourceConfig {
-            runtime_id: "runtime-a".into(),
-            worker_id: "worker-a".into(),
-            endpoint: "ws://127.0.0.1:9/not-used".into(),
-            bearer_token: None,
-        };
-        let (url, _dir) = spawn_workspace_proxy(source).await;
-        let (mut stream, _) = connect_async(format!("{url}?cursor=bo_ffffffffffffffff"))
-            .await
-            .unwrap();
-        let diagnostic = next_client_diagnostic(&mut stream).await;
-        assert_eq!(diagnostic.code, "backend.runtime_unavailable");
-    }
-
-    #[tokio::test]
-    async fn proxy_maps_runtime_cursor_diagnostic_to_typed_backend_diagnostic() {
-        let (_runtime, _worker_ref, endpoint) = spawn_runtime_worker().await;
-        let source = RuntimeObservationSourceConfig {
-            runtime_id: "runtime-a".into(),
-            worker_id: "worker-a".into(),
-            endpoint: format!("{endpoint}?cursor=wo_ffffffffffffffff"),
-            bearer_token: None,
-        };
-        let (url, _dir) = spawn_workspace_proxy(source).await;
-        let (mut stream, _) = connect_async(&url).await.unwrap();
-        assert!(matches!(
-            next_client_frame(&mut stream).await,
-            ClientWorkerEventWsFrame::Event { envelope } if matches!(envelope.payload, protocol::Event::Snapshot { .. })
-        ));
-        let diagnostic = next_client_diagnostic(&mut stream).await;
-        assert_eq!(diagnostic.code, "backend.cursor_unknown_or_expired");
     }
 
     #[tokio::test]

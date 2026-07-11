@@ -42,7 +42,7 @@
   let consoleBodyElement: HTMLElement | null = null;
   let autoFollowConsole = $state(true);
   const CONSOLE_BOTTOM_THRESHOLD_PX = 48;
-  let observedEvents = $state<Array<{ cursor: string; event: ClientWorkerEventWsFrame & { kind: 'event' } }>>([]);
+  let observedEvents = $state<Array<{ eventId: string; event: ClientWorkerEventWsFrame & { kind: 'event' } }>>([]);
   let seenObservationEventIds = new Set<string>();
   let nextReloadToken = 0;
   let reloadToken = $state(0);
@@ -55,7 +55,7 @@
   const consoleTarget = $derived({ runtimeId, workerId });
 
   const projection = $derived(
-    projectConsole(observedEvents.map((item) => ({ cursor: item.cursor, event: item.event.envelope.payload })))
+    projectConsole(observedEvents.map((item) => ({ eventId: item.eventId, event: item.event.envelope.payload })))
   );
   const lines = $derived(projection.lines);
   const diagnostics = $derived(mergeDiagnostics(worker?.diagnostics ?? [], streamDiagnostics));
@@ -185,7 +185,7 @@
           observedEvents = [
             ...observedEvents,
             {
-              cursor: frame.envelope.cursor,
+              eventId: frame.envelope.event_id,
               event: frame
             }
           ].slice(-500);

@@ -56,28 +56,28 @@ Deno.test("segmentsToText preserves protocol segment semantics", () => {
 Deno.test("projectConsole projects visible protocol rows", () => {
   const projection = projectConsole([
     {
-      cursor: "10",
+      eventId: "10",
       event: {
         event: "user_message",
         data: { segments: [{ kind: "text", content: "input" }] },
       } satisfies Event,
     },
     {
-      cursor: "11",
+      eventId: "11",
       event: {
         event: "text_delta",
         data: { text: "stream" },
       } satisfies Event,
     },
     {
-      cursor: "12",
+      eventId: "12",
       event: {
         event: "thinking_done",
         data: { text: "reasoning" },
       } satisfies Event,
     },
     {
-      cursor: "13",
+      eventId: "13",
       event: {
         event: "tool_result",
         data: {
@@ -89,14 +89,14 @@ Deno.test("projectConsole projects visible protocol rows", () => {
       } satisfies Event,
     },
     {
-      cursor: "14",
+      eventId: "14",
       event: {
         event: "usage",
         data: { input_tokens: 12, output_tokens: 5 },
       } satisfies Event,
     },
     {
-      cursor: "15",
+      eventId: "15",
       event: {
         event: "error",
         data: { code: "invalid_request", message: "bad frame" },
@@ -141,35 +141,35 @@ Deno.test("projectConsole projects visible protocol rows", () => {
 Deno.test("projectConsole groups tool call lifecycle into one Call block", () => {
   const projection = projectConsole([
     {
-      cursor: "40",
+      eventId: "40",
       event: {
         event: "tool_call_start",
         data: { id: "call-1", name: "Bash" },
       } satisfies Event,
     },
     {
-      cursor: "41",
+      eventId: "41",
       event: {
         event: "tool_call_args_delta",
         data: { id: "call-1", json: '{"command":"pw' },
       } satisfies Event,
     },
     {
-      cursor: "42",
+      eventId: "42",
       event: {
         event: "tool_call_args_delta",
         data: { id: "call-1", json: 'd"}' },
       } satisfies Event,
     },
     {
-      cursor: "43",
+      eventId: "43",
       event: {
         event: "tool_call_done",
         data: { id: "call-1", name: "Bash", arguments: '{"command":"pwd"}' },
       } satisfies Event,
     },
     {
-      cursor: "44",
+      eventId: "44",
       event: {
         event: "tool_result",
         data: {
@@ -206,14 +206,14 @@ Deno.test("projectConsole groups tool call lifecycle into one Call block", () =>
 Deno.test("projectConsole keeps streaming tool call updates in the same Call block", () => {
   const projection = projectConsole([
     {
-      cursor: "45",
+      eventId: "45",
       event: {
         event: "tool_call_start",
         data: { id: "call-2", name: "Read" },
       } satisfies Event,
     },
     {
-      cursor: "46",
+      eventId: "46",
       event: {
         event: "tool_call_args_delta",
         data: { id: "call-2", json: '{"file_path":"/tmp/a.md"}' },
@@ -235,7 +235,7 @@ Deno.test("projectConsole keeps streaming tool call updates in the same Call blo
 Deno.test("projectConsole aggregates Read calls without showing file content", () => {
   const projection = projectConsole([
     {
-      cursor: "50",
+      eventId: "50",
       event: {
         event: "tool_call_done",
         data: {
@@ -246,7 +246,7 @@ Deno.test("projectConsole aggregates Read calls without showing file content", (
       } satisfies Event,
     },
     {
-      cursor: "51",
+      eventId: "51",
       event: {
         event: "tool_result",
         data: {
@@ -258,7 +258,7 @@ Deno.test("projectConsole aggregates Read calls without showing file content", (
       } satisfies Event,
     },
     {
-      cursor: "52",
+      eventId: "52",
       event: {
         event: "tool_call_done",
         data: {
@@ -269,7 +269,7 @@ Deno.test("projectConsole aggregates Read calls without showing file content", (
       } satisfies Event,
     },
     {
-      cursor: "53",
+      eventId: "53",
       event: {
         event: "tool_result",
         data: {
@@ -307,7 +307,7 @@ Deno.test("projectConsole aggregates Read calls without showing file content", (
 Deno.test("projectConsole renders Edit calls with structured diff lines", () => {
   const projection = projectConsole([
     {
-      cursor: "60",
+      eventId: "60",
       event: {
         event: "tool_call_done",
         data: {
@@ -322,7 +322,7 @@ Deno.test("projectConsole renders Edit calls with structured diff lines", () => 
       } satisfies Event,
     },
     {
-      cursor: "61",
+      eventId: "61",
       event: {
         event: "tool_result",
         data: {
@@ -350,7 +350,7 @@ Deno.test("projectConsole renders Edit calls with structured diff lines", () => 
 Deno.test("projectConsole preserves in-progress assistant protocol stream", () => {
   const projection = projectConsole([
     {
-      cursor: "13",
+      eventId: "13",
       event: { event: "text_delta", data: { text: "new" } } satisfies Event,
     },
   ]);
@@ -367,26 +367,26 @@ Deno.test("projectConsole preserves in-progress assistant protocol stream", () =
 Deno.test("projectConsole keeps protocol lifecycle events out of the console surface", () => {
   const projection = projectConsole([
     {
-      cursor: "30",
+      eventId: "30",
       event: { event: "status", data: { status: "running" } } satisfies Event,
     },
     {
-      cursor: "31",
+      eventId: "31",
       event: { event: "llm_call_end", data: { llm_call: 0 } } satisfies Event,
     },
     {
-      cursor: "32",
+      eventId: "32",
       event: {
         event: "turn_end",
         data: { turn: 0, result: "finished" },
       } satisfies Event,
     },
     {
-      cursor: "33",
+      eventId: "33",
       event: { event: "run_end", data: { result: "finished" } } satisfies Event,
     },
     {
-      cursor: "34",
+      eventId: "34",
       event: {
         event: "system_item",
         data: { item: { kind: "note", content: "internal" } },
@@ -401,7 +401,7 @@ Deno.test("projectConsole keeps protocol lifecycle events out of the console sur
 Deno.test("projectConsole uses snapshot for state without rendering it as console output", () => {
   const projection = projectConsole([
     {
-      cursor: "20",
+      eventId: "20",
       event: {
         event: "snapshot",
         data: {

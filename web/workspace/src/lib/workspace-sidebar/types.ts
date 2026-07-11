@@ -253,7 +253,6 @@ export type WorkerInputResult = {
 };
 
 export type ClientWorkerEventWsEnvelope = {
-  cursor: string;
   event_id: string;
   runtime_id: string;
   worker_id: string;
