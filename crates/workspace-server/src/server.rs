@@ -2674,7 +2674,31 @@ async fn create_workspace_worker(
         code: "workspace_worker_create_missing_summary".to_string(),
         message: "Runtime completed worker creation without returning a Worker summary".to_string(),
     })?;
-    let worker_record = sync_worker_observation(&api, &worker)?;
+    let worker_record = record_worker_summary(
+        &api,
+        &worker,
+        display_name.as_str(),
+        worker.profile.clone(),
+        WorkerRegistryDisplayNamePolicy::UseProvided,
+    )?;
+    if let Some(working_directory) = worker.working_directory.as_ref() {
+        let management_kind = api
+            .store
+            .get_workdir_registry(
+                &api.config.workspace_id,
+                &working_directory.working_directory_id,
+            )?
+            .map(|existing| existing.management_kind)
+            .unwrap_or_else(|| "runtime_unmanaged".to_string());
+        let workdir_record = workdir_record_from_summary(
+            &api,
+            worker.runtime_id.as_str(),
+            working_directory,
+            management_kind.as_str(),
+        );
+        api.store.upsert_workdir_registry(&workdir_record)?;
+        link_worker_to_workdir(&api, &worker_record, &working_directory.working_directory_id)?;
+    }
     if let Some(workdir_id) = selected_working_directory_id.as_deref() {
         if api
             .store
@@ -2864,12 +2888,24 @@ async fn create_runtime_worker(
             .as_ref()
             .map(|claim| claim.working_directory_id.clone())
     };
+    let requested_worker_name = request.requested_worker_name.clone();
     let result = api
         .runtime
         .spawn_worker(&runtime_id, request)
         .map_err(|err| err.into_error())?;
     if let Some(worker) = result.worker.as_ref() {
-        let record = sync_worker_observation(&api, worker)?;
+        let display_name = requested_worker_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(worker.label.as_str())
+            .to_string();
+        let record = record_worker_summary(
+            &api,
+            worker,
+            display_name.as_str(),
+            worker.profile.clone(),
+            WorkerRegistryDisplayNamePolicy::UseProvided,
+        )?;
         if worker.working_directory.is_none() {
             if let Some(workdir_id) = prepared_workdir_id.as_deref() {
                 if api
@@ -3892,23 +3928,36 @@ fn next_backend_workdir_id(repository_id: &str) -> String {
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerRegistryDisplayNamePolicy {
+    PreserveExisting,
+    UseProvided,
+}
+
 fn record_worker_summary(
     api: &WorkspaceApi,
     worker: &WorkerSummary,
     display_name: &str,
     profile: Option<String>,
+    display_name_policy: WorkerRegistryDisplayNamePolicy,
 ) -> ApiResult<WorkerRegistryRecord> {
     let timestamp = now_registry_timestamp();
     let worker_id = backend_worker_id(worker.runtime_id.as_str(), worker.worker_id.as_str());
     let existing = api
         .store
         .get_worker_registry(&api.config.workspace_id, worker_id.as_str())?;
+    let display_name = match (display_name_policy, existing.as_ref()) {
+        (WorkerRegistryDisplayNamePolicy::PreserveExisting, Some(record)) => {
+            record.display_name.clone()
+        }
+        _ => display_name.to_string(),
+    };
     let record = WorkerRegistryRecord {
         workspace_id: api.config.workspace_id.clone(),
         worker_id: worker_id.clone(),
         runtime_id: worker.runtime_id.as_str().to_string(),
         runtime_worker_id: worker.worker_id.as_str().to_string(),
-        display_name: display_name.to_string(),
+        display_name,
         profile,
         retention_state: existing
             .as_ref()
@@ -3994,7 +4043,13 @@ fn sync_worker_observation(
     api: &WorkspaceApi,
     worker: &WorkerSummary,
 ) -> ApiResult<WorkerRegistryRecord> {
-    let record = record_worker_summary(api, worker, worker.label.as_str(), worker.profile.clone())?;
+    let record = record_worker_summary(
+        api,
+        worker,
+        worker.label.as_str(),
+        worker.profile.clone(),
+        WorkerRegistryDisplayNamePolicy::PreserveExisting,
+    )?;
     if let Some(working_directory) = worker.working_directory.as_ref() {
         let management_kind = api
             .store
@@ -6298,6 +6353,23 @@ mod tests {
         )
         .await;
         assert_eq!(created["runtime_id"], "embedded-worker-runtime");
+        let workers = get_json(app.clone(), "/api/workers").await;
+        let worker = workers["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|worker| worker["worker_id"] == created["worker_id"])
+            .expect("created Worker should be listed");
+        assert_eq!(worker["label"], "Coding Worker");
+        assert_eq!(worker["worker_id"], created["worker_id"]);
+        let detail_path = format!(
+            "/api/runtimes/{}/workers/{}",
+            created["runtime_id"].as_str().unwrap(),
+            created["worker_id"].as_str().unwrap()
+        );
+        let detail = get_json(app.clone(), detail_path.as_str()).await;
+        assert_eq!(detail["label"], "Coding Worker");
+        assert_eq!(detail["worker_id"], created["worker_id"]);
         assert!(
             created["console_href"]
                 .as_str()
