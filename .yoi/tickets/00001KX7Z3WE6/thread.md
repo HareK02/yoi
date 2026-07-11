@@ -69,3 +69,21 @@ State changed to `done`.
 
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-07-11T07:01:41Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-07-11T07:01:41Z status: closed -->
+
+## 完了
+
+Archived registry-only Workers no longer appear as Console-accessible. Sidebar renders them as disabled rows, and the Workers page shows `Archived` instead of `Open Console`; live Workers keep Console links.
+
+
+---

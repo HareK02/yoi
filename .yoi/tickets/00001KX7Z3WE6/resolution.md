@@ -1,0 +1,1 @@
+Archived registry-only Workers no longer appear as Console-accessible. Sidebar renders them as disabled rows, and the Workers page shows `Archived` instead of `Open Console`; live Workers keep Console links.

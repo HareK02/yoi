@@ -1,8 +1,8 @@
 ---
 title: 'Disable Console links for archived Workers'
-state: 'done'
+state: 'closed'
 created_at: '2026-07-11T06:51:23Z'
-updated_at: '2026-07-11T07:01:17Z'
+updated_at: '2026-07-11T07:01:41Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-11T06:52:17Z'
