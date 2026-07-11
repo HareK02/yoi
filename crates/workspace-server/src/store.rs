@@ -32,6 +32,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "backend worker workdir registry schema",
         apply: create_worker_workdir_registry_tables,
     },
+    Migration {
+        version: 4,
+        name: "remove durable worker lifecycle state",
+        apply: remove_worker_registry_legacy_live_state_column,
+    },
 ];
 
 struct Migration {
@@ -58,7 +63,6 @@ pub struct WorkerRegistryRecord {
     pub runtime_worker_id: String,
     pub display_name: String,
     pub profile: Option<String>,
-    pub lifecycle_state: String,
     /// Retention state is explicit so `pinned` can be represented before prune exists.
     pub retention_state: String,
     pub transcript_ref: Option<String>,
@@ -244,15 +248,14 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             conn.execute(
                 r#"INSERT INTO worker_registry (
                     workspace_id, worker_id, runtime_id, runtime_worker_id, display_name, profile,
-                    lifecycle_state, retention_state, transcript_ref, session_ref, summary_ref,
+                    retention_state, transcript_ref, session_ref, summary_ref,
                     diagnostics_ref, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                 ON CONFLICT(workspace_id, worker_id) DO UPDATE SET
                     runtime_id = excluded.runtime_id,
                     runtime_worker_id = excluded.runtime_worker_id,
                     display_name = excluded.display_name,
                     profile = excluded.profile,
-                    lifecycle_state = excluded.lifecycle_state,
                     retention_state = CASE
                         WHEN worker_registry.retention_state = 'pinned' AND excluded.retention_state = 'normal'
                         THEN worker_registry.retention_state
@@ -270,7 +273,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.runtime_worker_id,
                     record.display_name,
                     record.profile,
-                    record.lifecycle_state,
                     record.retention_state,
                     record.transcript_ref,
                     record.session_ref,
@@ -543,7 +545,7 @@ fn read_worker_workdir_link_record(
 fn worker_registry_select_sql(where_clause: &str) -> String {
     format!(
         "SELECT workspace_id, worker_id, runtime_id, runtime_worker_id, display_name, profile, \
-         lifecycle_state, retention_state, transcript_ref, session_ref, summary_ref, diagnostics_ref, \
+         retention_state, transcript_ref, session_ref, summary_ref, diagnostics_ref, \
          created_at, updated_at FROM worker_registry {where_clause}"
     )
 }
@@ -556,14 +558,13 @@ fn read_worker_registry_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Work
         runtime_worker_id: row.get(3)?,
         display_name: row.get(4)?,
         profile: row.get(5)?,
-        lifecycle_state: row.get(6)?,
-        retention_state: row.get(7)?,
-        transcript_ref: row.get(8)?,
-        session_ref: row.get(9)?,
-        summary_ref: row.get(10)?,
-        diagnostics_ref: row.get(11)?,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
+        retention_state: row.get(6)?,
+        transcript_ref: row.get(7)?,
+        session_ref: row.get(8)?,
+        summary_ref: row.get(9)?,
+        diagnostics_ref: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
     })
 }
 
@@ -603,7 +604,6 @@ CREATE TABLE IF NOT EXISTS worker_registry (
     runtime_worker_id TEXT NOT NULL,
     display_name TEXT NOT NULL,
     profile TEXT,
-    lifecycle_state TEXT NOT NULL,
     retention_state TEXT NOT NULL CHECK (retention_state IN ('normal', 'pinned')),
     transcript_ref TEXT,
     session_ref TEXT,
@@ -784,6 +784,54 @@ fn rename_legacy_table(conn: &Connection, table_name: &str, legacy_name: &str) -
     conn.execute_batch(&format!(
         "ALTER TABLE {table_name} RENAME TO {legacy_name};"
     ))?;
+    Ok(())
+}
+
+fn remove_worker_registry_legacy_live_state_column(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "worker_registry")?
+        || !table_columns(conn, "worker_registry")?
+            .iter()
+            .any(|column| column == "lifecycle_state")
+    {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        r#"
+        CREATE TABLE worker_registry_v4 (
+            workspace_id TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            runtime_worker_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            profile TEXT,
+            retention_state TEXT NOT NULL CHECK (retention_state IN ('normal', 'pinned')),
+            transcript_ref TEXT,
+            session_ref TEXT,
+            summary_ref TEXT,
+            diagnostics_ref TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, worker_id),
+            UNIQUE (workspace_id, runtime_id, runtime_worker_id),
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+        INSERT INTO worker_registry_v4 (
+            workspace_id, worker_id, runtime_id, runtime_worker_id, display_name, profile,
+            retention_state, transcript_ref, session_ref, summary_ref, diagnostics_ref,
+            created_at, updated_at
+        )
+        SELECT
+            workspace_id, worker_id, runtime_id, runtime_worker_id, display_name, profile,
+            retention_state, transcript_ref, session_ref, summary_ref, diagnostics_ref,
+            created_at, updated_at
+        FROM worker_registry;
+        DROP TABLE worker_registry;
+        ALTER TABLE worker_registry_v4 RENAME TO worker_registry;
+        CREATE INDEX IF NOT EXISTS idx_worker_registry_workspace_updated
+            ON worker_registry(workspace_id, updated_at DESC);
+        "#,
+    )?;
     Ok(())
 }
 
@@ -1010,7 +1058,7 @@ mod tests {
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 3);
+        assert_eq!(store.schema_version().await.unwrap(), 4);
 
         let record = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
@@ -1022,7 +1070,7 @@ mod tests {
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 3);
+        assert_eq!(reopened.schema_version().await.unwrap(), 4);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -1139,6 +1187,25 @@ mod tests {
         );
         assert_columns(
             &conn,
+            "worker_registry",
+            [
+                "workspace_id",
+                "worker_id",
+                "runtime_id",
+                "runtime_worker_id",
+                "display_name",
+                "profile",
+                "retention_state",
+                "transcript_ref",
+                "session_ref",
+                "summary_ref",
+                "diagnostics_ref",
+                "created_at",
+                "updated_at",
+            ],
+        );
+        assert_columns(
+            &conn,
             "artifacts",
             [
                 "workspace_id",
@@ -1213,7 +1280,7 @@ mod tests {
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 3);
+        assert_eq!(store.schema_version().await.unwrap(), 4);
 
         store
             .with_conn(|conn| {
@@ -1319,7 +1386,6 @@ mod tests {
             runtime_worker_id: "browser-1".to_string(),
             display_name: "Browser 1".to_string(),
             profile: Some("builtin:companion".to_string()),
-            lifecycle_state: "idle".to_string(),
             retention_state: "pinned".to_string(),
             transcript_ref: Some("runtime://embedded/workers/browser-1/transcript".to_string()),
             session_ref: None,
@@ -1330,12 +1396,10 @@ mod tests {
         };
         store.upsert_worker_registry(&worker).unwrap();
         let mut runtime_sync_worker = worker.clone();
-        runtime_sync_worker.lifecycle_state = "running".to_string();
         runtime_sync_worker.retention_state = "normal".to_string();
         runtime_sync_worker.updated_at = "5".to_string();
         store.upsert_worker_registry(&runtime_sync_worker).unwrap();
         let mut expected_worker = worker.clone();
-        expected_worker.lifecycle_state = "running".to_string();
         expected_worker.updated_at = "5".to_string();
 
         let workdir = WorkdirRegistryRecord {

@@ -40,3 +40,37 @@ State changed to `inprogress`.
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-11T04:33:35Z -->
+
+## Implementation report
+
+Removed durable worker lifecycle state from the Backend worker registry.
+
+- `WorkerRegistryRecord` no longer has `lifecycle_state`.
+- Active worker_registry CREATE/INSERT/SELECT/read paths no longer include lifecycle state.
+- Added schema migration v4 to rebuild legacy worker_registry tables without the old lifecycle column.
+- Registry-only Worker projection now reports `archived` instead of stale `idle`/`running`/`stopped` values.
+- Live Worker merge no longer lets registry data overwrite Runtime status/state.
+- Cleanup planning uses live Runtime workers for running-linked detection; registry records only provide retention/link metadata.
+- Removed lifecycle_state from frontend cleanup candidate types/display.
+
+Validation:
+- cargo test -q -p yoi-workspace-server
+- cd web/workspace && deno task check
+- cd web/workspace && deno task test
+- cargo test -q
+- git diff --check
+- nix build .#yoi --no-link
+
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-07-11T04:33:35Z from: inprogress to: done reason: cli_state field: state -->
+
+## State changed
+
+State changed to `done`.
+
+
+---

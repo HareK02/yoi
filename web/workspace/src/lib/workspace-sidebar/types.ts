@@ -163,7 +163,6 @@ export type CleanupWorkerCandidate = {
   blocking_reason?: string | null;
   pinned: boolean;
   retention_state: string;
-  lifecycle_state: string;
   linked_workdir_ids: string[];
   running_linked: boolean;
   estimated_reclaim_bytes?: number | null;

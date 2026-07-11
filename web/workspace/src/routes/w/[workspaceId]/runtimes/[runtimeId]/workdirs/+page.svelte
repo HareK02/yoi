@@ -127,7 +127,7 @@
               />
               <span>
                 <strong>Delete Worker registry row:</strong> <code>{candidate.runtime_worker_id}</code>
-                <small>{candidate.lifecycle_state}; {candidate.retention_state}; linked Workdirs {candidate.linked_workdir_ids.length}</small>
+                <small>{candidate.retention_state}; linked Workdirs {candidate.linked_workdir_ids.length}</small>
                 {#if candidate.blocking_reason}<small class="error">Blocked: {candidate.blocking_reason}</small>{/if}
               </span>
             </label>

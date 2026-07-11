@@ -601,7 +601,6 @@ pub struct CleanupWorkerCandidate {
     pub blocking_reason: Option<String>,
     pub pinned: bool,
     pub retention_state: String,
-    pub lifecycle_state: String,
     pub linked_workdir_ids: Vec<String>,
     pub running_linked: bool,
     pub estimated_reclaim_bytes: Option<u64>,
@@ -1579,7 +1578,13 @@ fn build_runtime_cleanup_plan(
     api: &WorkspaceApi,
     runtime_id: &str,
 ) -> ApiResult<RuntimeCleanupPlanResponse> {
-    let _ = workers_response(api.clone());
+    let workers = workers_response(api.clone())?;
+    let live_running_worker_ids: HashSet<String> = workers
+        .items
+        .iter()
+        .filter(|worker| worker.status == "running" || worker.state == "running")
+        .map(|worker| backend_worker_id(worker.runtime_id.as_str(), worker.worker_id.as_str()))
+        .collect();
     let (workdir_summaries, mut diagnostics) =
         match runtime_working_directory_summaries(api, runtime_id) {
             Ok(result) => result,
@@ -1618,7 +1623,7 @@ fn build_runtime_cleanup_plan(
         let links = api
             .store
             .list_worker_workdir_links(&api.config.workspace_id, record.worker_id.as_str())?;
-        let is_running = record.lifecycle_state == "running";
+        let is_running = live_running_worker_ids.contains(&record.worker_id);
         let pinned = record.retention_state == "pinned";
         let blocking_reason = if pinned {
             Some("worker is pinned".to_string())
@@ -1642,7 +1647,6 @@ fn build_runtime_cleanup_plan(
             blocking_reason,
             pinned,
             retention_state: record.retention_state.clone(),
-            lifecycle_state: record.lifecycle_state.clone(),
             linked_workdir_ids: links.iter().map(|link| link.workdir_id.clone()).collect(),
             running_linked: is_running,
             estimated_reclaim_bytes: None,
@@ -1667,7 +1671,7 @@ fn build_runtime_cleanup_plan(
             .collect::<Vec<_>>();
         let linked_running_worker_ids = linked_workers
             .iter()
-            .filter(|worker| worker.lifecycle_state == "running")
+            .filter(|worker| live_running_worker_ids.contains(&worker.worker_id))
             .map(|worker| worker.worker_id.clone())
             .collect::<Vec<_>>();
         let pinned_linked = linked_workers
@@ -2913,13 +2917,10 @@ async fn stop_runtime_worker(
         .stop_worker(&runtime_id, &worker_id, request)
         .map_err(|err| err.into_error())?;
     let backend_id = backend_worker_id(&runtime_id, &worker_id);
-    if let Some(mut record) = api
+    if let Some(record) = api
         .store
         .get_worker_registry(&api.config.workspace_id, backend_id.as_str())?
     {
-        record.lifecycle_state = "stopped".to_string();
-        record.updated_at = now_registry_timestamp();
-        api.store.upsert_worker_registry(&record)?;
         sync_linked_workdir_after_worker_stop(&api, &runtime_id, &record)?;
     }
     Ok(Json(result))
@@ -3879,7 +3880,6 @@ fn record_worker_summary(
         runtime_worker_id: worker.worker_id.as_str().to_string(),
         display_name: display_name.to_string(),
         profile,
-        lifecycle_state: worker.status.clone(),
         retention_state: existing
             .as_ref()
             .map(|record| record.retention_state.clone())
@@ -3909,8 +3909,8 @@ fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> WorkerSummary 
         host_id: "backend-registry".to_string(),
         role: None,
         label: record.display_name.clone(),
-        status: record.lifecycle_state.clone(),
-        state: record.lifecycle_state.clone(),
+        status: "archived".to_string(),
+        state: "archived".to_string(),
         last_seen_at: Some(record.updated_at.clone()),
         pinned: record.retention_state == "pinned",
         retention_state: record.retention_state.clone(),
@@ -3949,8 +3949,6 @@ fn merge_worker_registry_projection(
         .cloned()
         .unwrap_or_else(|| worker_summary_from_registry(record));
     summary.label = record.display_name.clone();
-    summary.status = record.lifecycle_state.clone();
-    summary.state = record.lifecycle_state.clone();
     summary.profile = record.profile.clone();
     summary.pinned = record.retention_state == "pinned";
     summary.retention_state = record.retention_state.clone();
@@ -4759,7 +4757,6 @@ mod tests {
             runtime_worker_id: "worker-1".to_string(),
             display_name: "Archived Worker".to_string(),
             profile: Some("builtin:coder".to_string()),
-            lifecycle_state: "stopped".to_string(),
             retention_state: "pinned".to_string(),
             transcript_ref: Some("runtime://embedded/workers/worker-1/transcript".to_string()),
             session_ref: None,
@@ -4792,7 +4789,8 @@ mod tests {
 
         let projected = merge_worker_registry_projection(None, &worker, vec![link], &[workdir]);
 
-        assert_eq!(projected.status, "stopped");
+        assert_eq!(projected.status, "archived");
+        assert_eq!(projected.state, "archived");
         assert_eq!(
             projected.working_directory.as_ref().unwrap().status,
             WorkingDirectoryStatusKind::Removed
@@ -5341,7 +5339,6 @@ mod tests {
     fn seed_cleanup_worker(
         api: &WorkspaceApi,
         runtime_worker_id: &str,
-        lifecycle_state: &str,
         retention_state: &str,
     ) -> String {
         let worker_id = backend_worker_id("runtime-test", runtime_worker_id);
@@ -5354,7 +5351,6 @@ mod tests {
                 runtime_worker_id: runtime_worker_id.to_string(),
                 display_name: runtime_worker_id.to_string(),
                 profile: None,
-                lifecycle_state: lifecycle_state.to_string(),
                 retention_state: retention_state.to_string(),
                 transcript_ref: None,
                 session_ref: None,
@@ -5525,12 +5521,12 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
-        let pinned = seed_cleanup_worker(&api, "worker-pinned", "stopped", "pinned");
-        let running = seed_cleanup_worker(&api, "worker-running", "running", "normal");
+        let pinned = seed_cleanup_worker(&api, "worker-pinned", "pinned");
+        let unobserved = seed_cleanup_worker(&api, "worker-unobserved", "normal");
         seed_cleanup_workdir(&api, "workdir-dirty", "present", "dirty");
         seed_cleanup_workdir(&api, "workdir-removed", "removed", "clean");
         seed_cleanup_link(&api, pinned.as_str(), "workdir-dirty");
-        seed_cleanup_link(&api, running.as_str(), "workdir-removed");
+        seed_cleanup_link(&api, unobserved.as_str(), "workdir-removed");
 
         let plan = build_runtime_cleanup_plan(&api, "runtime-test")
             .unwrap_or_else(|err| panic!("cleanup plan: {}", err.error));
@@ -5553,11 +5549,8 @@ mod tests {
             running_linked_workdir.action,
             CleanupTargetKind::WorkdirRecordDelete
         );
-        assert!(running_linked_workdir.running_linked);
-        assert_eq!(
-            running_linked_workdir.blocking_reason.as_deref(),
-            Some("workdir is linked to a running Worker")
-        );
+        assert!(!running_linked_workdir.running_linked);
+        assert_eq!(running_linked_workdir.blocking_reason.as_deref(), None);
         let dirty_workdir = plan
             .workdirs
             .iter()
@@ -5574,7 +5567,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
-        let worker = seed_cleanup_worker(&api, "worker-pinned", "stopped", "pinned");
+        let worker = seed_cleanup_worker(&api, "worker-pinned", "pinned");
         let plan = build_runtime_cleanup_plan(&api, "runtime-test")
             .unwrap_or_else(|err| panic!("cleanup plan: {}", err.error));
         let target = plan
