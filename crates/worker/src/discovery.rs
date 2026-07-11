@@ -1145,6 +1145,7 @@ mod tests {
             worker_name: "parent".into(),
             active: None,
             workspace_root: None,
+            workspace_id: None,
             spawned_children: vec![
                 child("child-live", &live_socket),
                 child("child-stale", &stale_socket),
@@ -1165,6 +1166,7 @@ mod tests {
                     active_child_segment,
                 )),
                 workspace_root: None,
+                workspace_id: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: Vec::new(),
@@ -1179,6 +1181,7 @@ mod tests {
                     active_child_segment,
                 )),
                 workspace_root: None,
+                workspace_id: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: Vec::new(),
@@ -1190,6 +1193,7 @@ mod tests {
                 worker_name: "child-pending".into(),
                 active: Some(WorkerActiveSegmentRef::pending_segment(pending_session_id)),
                 workspace_root: None,
+                workspace_id: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: Vec::new(),
@@ -1204,6 +1208,7 @@ mod tests {
                     new_segment_id(),
                 )),
                 workspace_root: None,
+                workspace_id: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: Vec::new(),
@@ -1215,6 +1220,7 @@ mod tests {
                 worker_name: "peer".into(),
                 active: None,
                 workspace_root: None,
+                workspace_id: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: vec![session_store::WorkerPeer {
@@ -1421,6 +1427,7 @@ mod tests {
                 worker_name: "source".into(),
                 active: None,
                 workspace_root: None,
+                workspace_id: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: vec![session_store::WorkerPeer {
@@ -1461,6 +1468,7 @@ mod tests {
                 worker_name: "source".into(),
                 active: None,
                 workspace_root: None,
+                workspace_id: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: vec![session_store::WorkerPeer {
@@ -1474,6 +1482,7 @@ mod tests {
                 worker_name: "target".into(),
                 active: None,
                 workspace_root: None,
+                workspace_id: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: vec![session_store::WorkerPeer {
@@ -1579,6 +1588,7 @@ mod tests {
                 worker_name: "source".into(),
                 active: None,
                 workspace_root: None,
+                workspace_id: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: vec![session_store::WorkerPeer {
@@ -1592,6 +1602,7 @@ mod tests {
                 worker_name: "target".into(),
                 active: None,
                 workspace_root: None,
+                workspace_id: None,
                 spawned_children: Vec::new(),
                 reclaimed_children: Vec::new(),
                 peers: vec![session_store::WorkerPeer {
@@ -1695,6 +1706,7 @@ mod tests {
                 worker_name: "source".into(),
                 active: None,
                 workspace_root: None,
+                workspace_id: None,
                 spawned_children: vec![child("target", &socket)],
                 reclaimed_children: Vec::new(),
                 peers: Vec::new(),

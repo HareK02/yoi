@@ -14,7 +14,7 @@ use session_store::{FsStore, LogEntry};
 
 use worker::{
     Event, Method, Worker, WorkerController, WorkerFilesystemAuthority, WorkerHandle,
-    WorkerManifest, WorkerStatus,
+    WorkerManifest, WorkerStatus, WorkerWorkspaceContext,
 };
 
 type TestStore = CombinedStore<FsStore, FsWorkerStore>;
@@ -190,9 +190,16 @@ async fn make_worker_with_pwd_and_manifest(
 
     let worker = Engine::new(client);
     let authority = WorkerFilesystemAuthority::local(pwd.clone(), pwd.clone());
-    let worker = Worker::new(manifest, worker, store, pwd.clone(), authority, scope)
-        .await
-        .unwrap();
+    let worker = Worker::new(
+        manifest,
+        worker,
+        store,
+        WorkerWorkspaceContext::local_filesystem(None),
+        authority,
+        scope,
+    )
+    .await
+    .unwrap();
     (worker, pwd)
 }
 

@@ -40,5 +40,5 @@ pub use segment_log_sink::SegmentLogSink;
 pub use shared_state::WorkerSharedState;
 pub use worker::{
     LocalWorkingDirectory, Worker, WorkerError, WorkerFilesystemAuthority, WorkerRunResult,
-    apply_worker_manifest,
+    WorkerWorkspaceContext, WorkspaceClient, WorkspaceId, WorkspaceIdError, apply_worker_manifest,
 };

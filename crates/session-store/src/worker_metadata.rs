@@ -100,8 +100,13 @@ pub struct WorkerMetadata {
     pub worker_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<WorkerActiveSegmentRef>,
+    /// Legacy local path hint retained for host/runtime compatibility. It is not
+    /// Worker workspace identity or authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<PathBuf>,
+    /// Path-free workspace identity supplied by the host/runtime boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spawned_children: Vec<WorkerSpawnedChild>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -119,6 +124,7 @@ impl WorkerMetadata {
             worker_name: worker_name.into(),
             active,
             workspace_root: None,
+            workspace_id: None,
             spawned_children: Vec::new(),
             reclaimed_children: Vec::new(),
             peers: Vec::new(),
@@ -128,6 +134,11 @@ impl WorkerMetadata {
 
     pub fn with_workspace_root(mut self, workspace_root: PathBuf) -> Self {
         self.workspace_root = Some(workspace_root);
+        self
+    }
+
+    pub fn with_workspace_id(mut self, workspace_id: impl Into<String>) -> Self {
+        self.workspace_id = Some(workspace_id.into());
         self
     }
 }
@@ -180,6 +191,44 @@ pub trait WorkerMetadataStore: Send + Sync {
     }
 
     /// Set the active pointer and workspace ownership while preserving unrelated fields.
+    fn set_active_with_workspace_context(
+        &self,
+        worker_name: &str,
+        active: Option<WorkerActiveSegmentRef>,
+        resolved_manifest_snapshot: Option<serde_json::Value>,
+        workspace_id: Option<String>,
+        workspace_root: Option<PathBuf>,
+    ) -> Result<WorkerMetadata, WorkerStoreError> {
+        self.update_by_name(worker_name, |metadata| {
+            metadata.active = active;
+            metadata.resolved_manifest_snapshot = resolved_manifest_snapshot;
+            if let Some(workspace_id) = workspace_id {
+                metadata.workspace_id = Some(workspace_id);
+            }
+            if let Some(workspace_root) = workspace_root {
+                metadata.workspace_root = Some(workspace_root);
+            }
+        })
+    }
+
+    /// Set the active pointer and path-free workspace identity while preserving unrelated fields.
+    fn set_active_with_workspace_id(
+        &self,
+        worker_name: &str,
+        active: Option<WorkerActiveSegmentRef>,
+        resolved_manifest_snapshot: Option<serde_json::Value>,
+        workspace_id: Option<String>,
+    ) -> Result<WorkerMetadata, WorkerStoreError> {
+        self.update_by_name(worker_name, |metadata| {
+            metadata.active = active;
+            metadata.resolved_manifest_snapshot = resolved_manifest_snapshot;
+            if let Some(workspace_id) = workspace_id {
+                metadata.workspace_id = Some(workspace_id);
+            }
+        })
+    }
+
+    /// Set the active pointer and legacy local workspace-root hint while preserving unrelated fields.
     fn set_active_with_workspace_root(
         &self,
         worker_name: &str,
