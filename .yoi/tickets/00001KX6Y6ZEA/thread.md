@@ -221,3 +221,55 @@ Critical risks / reviewer focus:
 Prerequisite and prior conflict/migration-boundary Ticket are now closed. This Ticket is accepted for implementation before creating a worktree or spawning role Pods.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-11T00:59:55Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Coder Pod `yoi-coder-00001KX6Y6ZEA-workspace-backend` completed implementation in `/home/hare/Projects/yoi/.worktree/00001KX6Y6ZEA-workspace-backend` on branch `work/00001KX6Y6ZEA-workspace-backend`。
+- Implementation commit: `142b60e1b3ca refactor: separate worker workspace identity`。
+- Orchestrator inspected worktree status, branch log, commit stats, `git diff --check 74b07bd7..HEAD`, and workspace-root accessor grep. Worktree was clean and diff check passed。
+
+Implementation summary:
+- Replaced Worker-held `workspace_root: PathBuf` identity with path-free `WorkerWorkspaceContext`, `WorkspaceId`, and `WorkspaceClient`。
+- Kept local filesystem authority under `WorkerFilesystemAuthority::{None, Local(LocalWorkingDirectory)}`。
+- Updated Worker constructors / restore / spawn paths to receive workspace context separately from filesystem authority。
+- Added runtime-side `RuntimeWorkspaceBackendRef` as host-owned local backend binding that injects narrow Worker workspace context。
+- No-filesystem Workers keep memory/workflow local layouts unavailable/fail-closed rather than falling back to workspace paths。
+- Preserved legacy metadata `workspace_root` only as a local filesystem hint derived from `WorkerFilesystemAuthority::Local`, not as Worker identity。
+- Updated tests for path-free workspace identity/client separation from local tool cwd/root, workspace client without filesystem authority, no local path-returning Worker workspace accessor, and constructor usage。
+
+Files touched:
+- `crates/worker/src/worker.rs`
+- `crates/worker/src/controller.rs`
+- `crates/worker/src/entrypoint.rs`
+- `crates/worker/src/lib.rs`
+- `crates/worker/src/discovery.rs`
+- `crates/worker/src/ticket_event_notify.rs`
+- `crates/worker/tests/*`
+- `crates/worker-runtime/src/worker_backend.rs`
+- `crates/worker-runtime/Cargo.toml`
+- `crates/session-store/src/worker_metadata.rs`
+- `Cargo.lock`
+- `package.nix`
+
+Coder-reported validation passed:
+- `rg -n "workspace_root" crates/worker crates/worker-runtime crates/client crates/workspace-server` with remaining hits as legacy metadata/local filesystem adapter or host/runtime local backend boundaries plus tests。
+- `rg -n "worker\\.workspace_root|pub fn workspace_root|fn workspace_root" crates/worker crates/worker-runtime crates/client crates/workspace-server || true`; no Worker `workspace_root()` accessor hits. Orchestrator grep observed an unrelated `crates/workspace-server/src/records.rs` project-record accessor hit outside Worker identity。
+- `git diff --check`
+- `cargo test -p worker --lib --tests`
+- `cargo test -p worker-runtime --features ws-server,fs-store`
+- `cargo test -p yoi-workspace-server --lib`
+- `cargo check -p yoi`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Not run by Coder:
+- `cd web/workspace && deno task check && deno task test` because web/API/types were not touched。
+
+Next action:
+- Route to external Reviewer Pod before merge/close decisions。
+
+---
