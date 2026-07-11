@@ -1,4 +1,6 @@
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -57,6 +59,148 @@ use tokio::task::JoinHandle;
 
 const RESTORE_RECONCILIATION_REACHABILITY_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Explicit filesystem authority held by a Worker.
+///
+/// `None` means the Worker has no local filesystem authority: no cwd, no
+/// filesystem view, and no filesystem/Bash tool surface. Workspace context may
+/// still exist separately for memory, workflows, and project records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerFilesystemAuthority {
+    None,
+    Local(LocalWorkingDirectory),
+}
+
+impl WorkerFilesystemAuthority {
+    pub fn local(root: PathBuf, cwd: PathBuf) -> Self {
+        Self::Local(LocalWorkingDirectory { root, cwd })
+    }
+
+    pub fn as_local(&self) -> Option<&LocalWorkingDirectory> {
+        match self {
+            Self::None => None,
+            Self::Local(local) => Some(local),
+        }
+    }
+}
+
+/// Local filesystem authority for a Worker.
+///
+/// `root` is the authority root retained for control-plane semantics;
+/// `cwd` is the default working directory used by filesystem tools, Bash,
+/// file references, and local worktree-scoped features.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalWorkingDirectory {
+    pub root: PathBuf,
+    pub cwd: PathBuf,
+}
+
+/// Path-free workspace identity carried by a Worker.
+///
+/// The value is intentionally opaque to Worker code: Runtime/host layers own
+/// backend lookup, endpoint/auth/secret materialisation, and any mapping from a
+/// local checkout path to an id. Worker code may only compare/log the id and pass
+/// it through to narrow workspace-aware handles.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkspaceId(String);
+
+impl WorkspaceId {
+    pub fn new(id: impl Into<String>) -> Result<Self, WorkspaceIdError> {
+        let id = id.into();
+        if id.trim().is_empty() {
+            return Err(WorkspaceIdError::Empty);
+        }
+        Ok(Self(id))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum WorkspaceIdError {
+    #[error("workspace id must not be empty")]
+    Empty,
+}
+
+/// Narrow path-free workspace API handle injected by Runtime/host code.
+///
+/// This is deliberately not a filesystem authority surface. A Worker may have a
+/// workspace client without local filesystem authority, or neither. Local
+/// path-backed implementations are represented only as a capability marker here;
+/// the actual paths remain under [`WorkerFilesystemAuthority::Local`] or in host
+/// adapter code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceClient {
+    /// Runtime/host supplied a workspace API handle. The string is an opaque
+    /// diagnostic/backend kind, not an endpoint, path, or secret-bearing value.
+    Available { kind: String },
+    /// Workspace-aware operations must fail closed or stay disabled.
+    Unavailable { reason: String },
+}
+
+impl WorkspaceClient {
+    pub fn available(kind: impl Into<String>) -> Self {
+        Self::Available { kind: kind.into() }
+    }
+
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn local_filesystem() -> Self {
+        Self::available("local-filesystem")
+    }
+
+    pub fn is_available(&self) -> bool {
+        matches!(self, Self::Available { .. })
+    }
+}
+
+/// Workspace context supplied to a Worker separately from filesystem authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerWorkspaceContext {
+    workspace_id: Option<WorkspaceId>,
+    client: WorkspaceClient,
+}
+
+impl WorkerWorkspaceContext {
+    pub fn no_workspace() -> Self {
+        Self {
+            workspace_id: None,
+            client: WorkspaceClient::unavailable("no workspace configured"),
+        }
+    }
+
+    pub fn unavailable(workspace_id: Option<WorkspaceId>, reason: impl Into<String>) -> Self {
+        Self {
+            workspace_id,
+            client: WorkspaceClient::unavailable(reason),
+        }
+    }
+
+    pub fn with_client(workspace_id: Option<WorkspaceId>, client: WorkspaceClient) -> Self {
+        Self {
+            workspace_id,
+            client,
+        }
+    }
+
+    pub fn local_filesystem(workspace_id: Option<WorkspaceId>) -> Self {
+        Self::with_client(workspace_id, WorkspaceClient::local_filesystem())
+    }
+
+    pub fn workspace_id(&self) -> Option<&WorkspaceId> {
+        self.workspace_id.as_ref()
+    }
+
+    pub fn client(&self) -> &WorkspaceClient {
+        &self.client
+    }
+}
+
 /// `(SessionId, SegmentId)` pair the Worker is currently writing to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentLocation {
@@ -74,10 +218,11 @@ where
     let store = store.clone();
     Arc::new(move |metadata| {
         store
-            .set_active_with_workspace_root(
+            .set_active_with_workspace_context(
                 &metadata.worker_name,
                 metadata.active,
                 metadata.resolved_manifest_snapshot,
+                metadata.workspace_id,
                 metadata.workspace_root,
             )
             .map(|_| ())
@@ -249,11 +394,12 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// `segment_id` and append tally. `self.segment_id()` is a thin
     /// wrapper over `segment_state.segment_id()`.
     segment_state: Arc<SegmentState>,
-    /// Absolute tool/process working directory of the Worker.
-    cwd: PathBuf,
-    /// Absolute runtime workspace root used for project records, workflow,
-    /// memory, Ticket config, Profile context, and spawned-child inheritance.
-    workspace_root: PathBuf,
+    /// Explicit local filesystem authority, or `None` for Workers with no
+    /// local cwd and no filesystem/Bash tool surface.
+    filesystem_authority: WorkerFilesystemAuthority,
+    /// Path-free workspace identity/client context injected by Runtime/host.
+    /// This never grants local filesystem authority.
+    workspace_context: WorkerWorkspaceContext,
     /// Shared, atomically-swappable view of the Worker's resolved scope.
     /// Cloned out to `ScopedFs` instances (builtin tools, fs_view,
     /// compact worker) so scope updates propagate to every consumer
@@ -446,8 +592,8 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
             store: self.store.clone(),
             worker_metadata_writer: None,
             segment_state: self.segment_state.clone(),
-            cwd: self.cwd.clone(),
-            workspace_root: self.workspace_root.clone(),
+            filesystem_authority: self.filesystem_authority.clone(),
+            workspace_context: self.workspace_context.clone(),
             scope: self.scope.clone(),
             delegation_scope: self.delegation_scope.clone(),
             hook_builder: HookRegistryBuilder::new(),
@@ -607,9 +753,10 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
 impl<C: LlmClient, St: Store> Worker<C, St> {
     /// Create a new Worker from a pre-built Engine and store.
     ///
-    /// Callers must pre-resolve `cwd` (absolute) and build a [`Scope`]
-    /// — typically via [`Scope::from_config`] when coming from a
-    /// manifest, or [`Scope::writable`] in tests.
+    /// Callers must pass path-free workspace context separately from explicit
+    /// filesystem authority and build a [`Scope`] — typically via
+    /// [`Scope::from_config`] when coming from a manifest, or [`Scope::writable`]
+    /// in tests. Use [`WorkerFilesystemAuthority::None`] for no-workdir Workers.
     ///
     /// Note: this constructor does **not** parse `manifest.worker.system_prompt`
     /// as a template. `Worker::from_manifest` is the production path for
@@ -619,7 +766,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         manifest: WorkerManifest,
         worker: Engine<C>,
         store: St,
-        cwd: PathBuf,
+        workspace_context: WorkerWorkspaceContext,
+        filesystem_authority: WorkerFilesystemAuthority,
         scope: Scope,
     ) -> Result<Self, WorkerError> {
         // Segment creation is deferred to `ensure_segment_head` at first
@@ -636,8 +784,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             store,
             worker_metadata_writer: None,
             segment_state: SegmentState::new(session_id, segment_id, 0),
-            workspace_root: cwd.clone(),
-            cwd,
+            filesystem_authority,
+            workspace_context,
             scope: SharedScope::new(scope),
             delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
@@ -749,15 +897,26 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         self.runtime_ticket_role = role;
     }
 
-    /// The Worker's tool/process working directory.
-    pub fn cwd(&self) -> &Path {
-        &self.cwd
+    /// Explicit filesystem authority held by this Worker.
+    pub fn filesystem_authority(&self) -> &WorkerFilesystemAuthority {
+        &self.filesystem_authority
     }
 
-    /// The Worker's runtime workspace root. This stays separate from `cwd` for
-    /// spawned children whose SpawnWorker `cwd` only changes tool defaults.
-    pub fn workspace_root(&self) -> &Path {
-        &self.workspace_root
+    /// Local working directory when this Worker has local filesystem authority.
+    pub fn local_working_directory(&self) -> Option<&LocalWorkingDirectory> {
+        self.filesystem_authority.as_local()
+    }
+
+    /// Path-free workspace identity, if Runtime/host associated this Worker
+    /// with a workspace.
+    pub fn workspace_id(&self) -> Option<&WorkspaceId> {
+        self.workspace_context.workspace_id()
+    }
+
+    /// Narrow workspace client/availability handle injected by Runtime/host.
+    /// This never grants local filesystem authority.
+    pub fn workspace_client(&self) -> &WorkspaceClient {
+        self.workspace_context.client()
     }
 
     pub(crate) fn worker_metadata_store(&self) -> St
@@ -945,7 +1104,14 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     }
 
     fn worker_metadata(&self, active: Option<WorkerActiveSegmentRef>) -> WorkerMetadata {
-        worker_metadata_for_manifest(&self.manifest, &self.workspace_root, active)
+        worker_metadata_for_manifest(
+            &self.manifest,
+            self.workspace_id(),
+            self.filesystem_authority
+                .as_local()
+                .map(|local| local.root.as_path()),
+            active,
+        )
     }
 
     fn write_worker_metadata_pending(&self) -> Result<(), WorkerError> {
@@ -1320,10 +1486,15 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 .map(|d| d.name)
                 .collect()
         };
-        let agents_md_read = read_agents_md(&self.workspace_root);
-        for warning in agents_md_read.warnings {
-            if let Some(n) = alerter.as_ref() {
-                n.alert(AlertLevel::Warn, AlertSource::AgentsMd, warning);
+        let agents_md_read = self
+            .filesystem_authority
+            .as_local()
+            .map(|local| read_agents_md(&local.root));
+        if let Some(read) = agents_md_read.as_ref() {
+            for warning in &read.warnings {
+                if let Some(n) = alerter.as_ref() {
+                    n.alert(AlertLevel::Warn, AlertSource::AgentsMd, warning.clone());
+                }
             }
         }
         // Resident-injection collection. Each resident section has its own
@@ -1376,13 +1547,17 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             self.resident_exposure_snapshots(&resident, &resident_workflows);
         let worker_language = worker_language(&self.manifest.engine);
         let scope_snapshot = self.scope.snapshot();
+        let cwd_for_prompt = self
+            .local_working_directory()
+            .map(|local| local.cwd.display().to_string())
+            .unwrap_or_else(|| "no local working directory".to_string());
         let ctx = SystemPromptContext {
             now: chrono::Utc::now(),
-            cwd: &self.cwd,
+            cwd: cwd_for_prompt.into(),
             language: worker_language,
             scope: &scope_snapshot,
             tool_names,
-            agents_md: agents_md_read.body,
+            agents_md: agents_md_read.and_then(|read| read.body),
             resident_summary: resident_summary.as_deref(),
             resident_knowledge: resident_slice,
             resident_workflows: resident_workflow_slice,
@@ -1622,9 +1797,21 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// unresolved placeholder stays in the flattened user message so the LLM
     /// still sees the intent.
     fn resolve_file_refs(&self, segments: &[Segment]) -> Vec<SystemItem> {
+        let Some(local) = self.local_working_directory() else {
+            for seg in segments {
+                if let Segment::FileRef { path } = seg {
+                    self.alert(
+                        AlertLevel::Warn,
+                        AlertSource::Worker,
+                        format!("file ref @{path} could not be resolved: Worker has no local filesystem authority"),
+                    );
+                }
+            }
+            return Vec::new();
+        };
         let view = crate::fs_view::WorkerFsView::new(tools::ScopedFs::with_shared_scope(
             self.scope.clone(),
-            self.cwd.clone(),
+            local.cwd.clone(),
         ));
         let mut out = Vec::new();
         for seg in segments {
@@ -2549,11 +2736,13 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             auto_read_budget,
         )));
 
-        // Build an independent compact worker. Scope and cwd are shared
-        // with the main Worker (reads go through the same policy) but the
-        // Tracker is fresh — compact-time reads must not pollute the
-        // main session's recency list, which feeds `default_refs` above.
-        let scoped_fs = tools::ScopedFs::with_shared_scope(self.scope.clone(), self.cwd.clone());
+        // Build an independent compact worker. When the main Worker has local
+        // filesystem authority, compact-time reads go through the same scope
+        // and cwd policy. No-workdir Workers deliberately omit compact-time
+        // filesystem tools as well.
+        let scoped_fs = self
+            .local_working_directory()
+            .map(|local| tools::ScopedFs::with_shared_scope(self.scope.clone(), local.cwd.clone()));
         let summary_tracker = tools::Tracker::new();
         let summary_client: Box<dyn LlmClient> = self.build_compactor_client()?;
         let summary_system_prompt = self
@@ -2591,10 +2780,12 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         // Tools: read_file (shared scope, fresh tracker), bounded session
         // history exploration, and compact-specific tools that populate `ctx`.
         let compact_target_items = Arc::new(items_to_summarise.clone());
-        summary_worker.register_tool(tools::read_tool(scoped_fs.clone(), summary_tracker));
+        if let Some(scoped_fs) = scoped_fs.clone() {
+            summary_worker.register_tool(tools::read_tool(scoped_fs.clone(), summary_tracker));
+            summary_worker.register_tool(mark_read_required_tool(scoped_fs, ctx.clone()));
+        }
         summary_worker.register_tool(search_session_log_tool(compact_target_items.clone()));
         summary_worker.register_tool(read_session_items_tool(compact_target_items));
-        summary_worker.register_tool(mark_read_required_tool(scoped_fs.clone(), ctx.clone()));
         summary_worker.register_tool(add_reference_tool(ctx.clone()));
         summary_worker.register_tool(write_summary_tool(ctx.clone()));
 
@@ -2671,8 +2862,12 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         // logged and skipped inside `render_auto_read` rather than
         // aborting compaction — a missing / moved file should not fail
         // the whole compact.
-        let auto_read_messages =
-            WorkerFsView::new(scoped_fs.clone()).render_auto_read(&final_ctx.read_required);
+        let auto_read_messages = scoped_fs
+            .clone()
+            .map(|scoped_fs| {
+                WorkerFsView::new(scoped_fs).render_auto_read(&final_ctx.read_required)
+            })
+            .unwrap_or_default();
 
         // Reference list as a single system message; omitted when empty.
         let reference_message = (!final_ctx.references.is_empty()).then(|| {
@@ -2896,6 +3091,15 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         total_now.saturating_sub(total_at_pointer)
     }
 
+    fn local_memory_layout(
+        &self,
+        memory_cfg: &manifest::MemoryConfig,
+    ) -> Option<memory::WorkspaceLayout> {
+        self.filesystem_authority
+            .as_local()
+            .map(|local| memory::WorkspaceLayout::resolve(memory_cfg, &local.root))
+    }
+
     /// extract (memory.extract) post-run trigger.
     ///
     /// Called by the Controller before spawning the background memory task so
@@ -2912,10 +3116,13 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let Some(memory_cfg) = self.manifest.memory.clone() else {
             return Ok(());
         };
+        let Some(layout) = self.local_memory_layout(&memory_cfg) else {
+            tracing::debug!("workspace memory extract unavailable: no local filesystem authority");
+            return Ok(());
+        };
         // `Some(0)` means disabled, same as `None`. Otherwise the
         // `tokens_since >= 0` comparison would fire on every post-run.
         let Some(threshold) = memory_cfg.extract_threshold.filter(|n| *n > 0) else {
-            let layout = memory::WorkspaceLayout::resolve(&memory_cfg, &self.workspace_root);
             let model = memory_cfg
                 .extract_model
                 .as_ref()
@@ -2945,7 +3152,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
-                let layout = memory::WorkspaceLayout::resolve(&memory_cfg, &self.workspace_root);
                 let model = memory_cfg
                     .extract_model
                     .as_ref()
@@ -3001,7 +3207,10 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     ) -> Result<ExtractDecision, WorkerError> {
         use memory::extract;
 
-        let layout = memory::WorkspaceLayout::resolve(memory_cfg, &self.workspace_root);
+        let Some(layout) = self.local_memory_layout(memory_cfg) else {
+            tracing::debug!("workspace memory extract unavailable: no local filesystem authority");
+            return Ok(ExtractDecision::Skipped);
+        };
         let model = memory_cfg
             .extract_model
             .as_ref()
@@ -3316,6 +3525,12 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let Some(memory_cfg) = self.manifest.memory.clone() else {
             return Ok(());
         };
+        let Some(layout) = self.local_memory_layout(&memory_cfg) else {
+            tracing::debug!(
+                "workspace memory consolidation unavailable: no local filesystem authority"
+            );
+            return Ok(());
+        };
         // `Some(0)` collapses to `None` — staging count / bytes always
         // satisfies `>= 0`, which would fire consolidation on every post-run.
         // Treating zero as disabled lines up with `extract_threshold` and
@@ -3324,7 +3539,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let files_threshold = memory_cfg.consolidation_threshold_files.filter(|n| *n > 0);
         let bytes_threshold = memory_cfg.consolidation_threshold_bytes.filter(|n| *n > 0);
         if files_threshold.is_none() && bytes_threshold.is_none() {
-            let layout = memory::WorkspaceLayout::resolve(&memory_cfg, &self.workspace_root);
             let model = memory_cfg
                 .consolidation_model
                 .as_ref()
@@ -3352,7 +3566,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
-                let layout = memory::WorkspaceLayout::resolve(&memory_cfg, &self.workspace_root);
                 let model = memory_cfg
                     .consolidation_model
                     .as_ref()
@@ -3405,7 +3618,12 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     ) -> Result<ConsolidateDecision, WorkerError> {
         use memory::consolidate;
 
-        let layout = memory::WorkspaceLayout::resolve(memory_cfg, &self.workspace_root);
+        let Some(layout) = self.local_memory_layout(memory_cfg) else {
+            tracing::debug!(
+                "workspace memory consolidation unavailable: no local filesystem authority"
+            );
+            return Ok(ConsolidateDecision::Skipped);
+        };
         let model = memory_cfg
             .consolidation_model
             .as_ref()
@@ -3824,22 +4042,25 @@ where
         loader: PromptLoader,
     ) -> Result<Self, WorkerError> {
         let cwd = current_cwd()?;
-        Self::from_manifest_with_context(manifest, store, loader, cwd.clone(), cwd).await
+        let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
+        let workspace_context = WorkerWorkspaceContext::local_filesystem(None);
+        Self::from_manifest_with_context(manifest, store, loader, workspace_context, authority)
+            .await
     }
 
     pub async fn from_manifest_with_context(
         manifest: WorkerManifest,
         store: St,
         loader: PromptLoader,
-        workspace_root: PathBuf,
-        cwd: PathBuf,
+        workspace_context: WorkerWorkspaceContext,
+        filesystem_authority: WorkerFilesystemAuthority,
     ) -> Result<Self, WorkerError> {
         let mut common = prepare_worker_common_with_context(
             &manifest,
             &loader,
             /* parse_template */ true,
-            workspace_root,
-            cwd,
+            workspace_context,
+            filesystem_authority,
             manifest.scope.clone(),
         )?;
         let skill_shadows = std::mem::take(&mut common.skill_shadows);
@@ -3878,8 +4099,8 @@ where
             store,
             worker_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, 0),
-            cwd: common.cwd,
-            workspace_root: common.workspace_root,
+            filesystem_authority: common.filesystem_authority,
+            workspace_context: common.workspace_context,
             scope: SharedScope::new(common.scope),
             delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
@@ -3938,13 +4159,15 @@ where
         callback_socket: PathBuf,
     ) -> Result<Self, WorkerError> {
         let cwd = current_cwd()?;
+        let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
+        let workspace_context = WorkerWorkspaceContext::local_filesystem(None);
         Self::from_manifest_spawned_with_context(
             manifest,
             store,
             loader,
             callback_socket,
-            cwd.clone(),
-            cwd,
+            workspace_context,
+            authority,
         )
         .await
     }
@@ -3954,15 +4177,15 @@ where
         store: St,
         loader: PromptLoader,
         callback_socket: PathBuf,
-        workspace_root: PathBuf,
-        cwd: PathBuf,
+        workspace_context: WorkerWorkspaceContext,
+        filesystem_authority: WorkerFilesystemAuthority,
     ) -> Result<Self, WorkerError> {
         let mut common = prepare_worker_common_with_context(
             &manifest,
             &loader,
             /* parse_template */ true,
-            workspace_root,
-            cwd,
+            workspace_context,
+            filesystem_authority,
             manifest.scope.clone(),
         )?;
         let skill_shadows = std::mem::take(&mut common.skill_shadows);
@@ -3988,8 +4211,8 @@ where
             store,
             worker_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, 0),
-            cwd: common.cwd,
-            workspace_root: common.workspace_root,
+            filesystem_authority: common.filesystem_authority,
+            workspace_context: common.workspace_context,
             scope: SharedScope::new(common.scope),
             delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
@@ -4044,13 +4267,15 @@ where
         loader: PromptLoader,
     ) -> Result<Self, WorkerError> {
         let cwd = current_cwd()?;
+        let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
+        let workspace_context = WorkerWorkspaceContext::local_filesystem(None);
         Self::restore_from_worker_metadata_with_context(
             worker_name,
             manifest,
             store,
             loader,
-            cwd.clone(),
-            cwd,
+            workspace_context,
+            authority,
         )
         .await
     }
@@ -4060,8 +4285,8 @@ where
         manifest: WorkerManifest,
         store: St,
         loader: PromptLoader,
-        workspace_root: PathBuf,
-        cwd: PathBuf,
+        workspace_context: WorkerWorkspaceContext,
+        filesystem_authority: WorkerFilesystemAuthority,
     ) -> Result<Self, WorkerError> {
         let metadata =
             store
@@ -4091,8 +4316,8 @@ where
             manifest,
             store,
             loader,
-            workspace_root,
-            cwd,
+            workspace_context,
+            filesystem_authority,
         )
         .await
     }
@@ -4122,14 +4347,16 @@ where
         loader: PromptLoader,
     ) -> Result<Self, WorkerError> {
         let cwd = current_cwd()?;
+        let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
+        let workspace_context = WorkerWorkspaceContext::local_filesystem(None);
         Self::restore_from_manifest_with_context(
             session_id,
             segment_id,
             manifest,
             store,
             loader,
-            cwd.clone(),
-            cwd,
+            workspace_context,
+            authority,
         )
         .await
     }
@@ -4140,8 +4367,8 @@ where
         manifest: WorkerManifest,
         store: St,
         loader: PromptLoader,
-        workspace_root: PathBuf,
-        cwd: PathBuf,
+        workspace_context: WorkerWorkspaceContext,
+        filesystem_authority: WorkerFilesystemAuthority,
     ) -> Result<Self, WorkerError> {
         // Read raw entries once so we can both reconstruct state and
         // seed the broadcast sink's mirror with the same prefix that
@@ -4158,8 +4385,8 @@ where
             &manifest,
             &loader,
             /* parse_template */ false,
-            workspace_root,
-            cwd,
+            workspace_context,
+            filesystem_authority,
             scope_config,
         )?;
         let skill_shadows = std::mem::take(&mut common.skill_shadows);
@@ -4223,8 +4450,8 @@ where
             store,
             worker_metadata_writer,
             segment_state: SegmentState::new(session_id, segment_id, state.entries_count),
-            cwd: common.cwd,
-            workspace_root: common.workspace_root,
+            filesystem_authority: common.filesystem_authority,
+            workspace_context: common.workspace_context,
             scope: SharedScope::new(common.scope),
             delegation_scope: common.delegation_scope,
             hook_builder: HookRegistryBuilder::new(),
@@ -4376,11 +4603,17 @@ fn request_config_from_engine_manifest(wm: &manifest::EngineManifest) -> Request
 
 fn worker_metadata_for_manifest(
     manifest: &WorkerManifest,
-    workspace_root: &Path,
+    workspace_id: Option<&WorkspaceId>,
+    local_workspace_root: Option<&std::path::Path>,
     active: Option<WorkerActiveSegmentRef>,
 ) -> WorkerMetadata {
-    let mut metadata = WorkerMetadata::new(manifest.worker.name.clone(), active)
-        .with_workspace_root(workspace_root.to_path_buf());
+    let mut metadata = WorkerMetadata::new(manifest.worker.name.clone(), active);
+    if let Some(workspace_id) = workspace_id {
+        metadata = metadata.with_workspace_id(workspace_id.as_str().to_owned());
+    }
+    if let Some(local_workspace_root) = local_workspace_root {
+        metadata = metadata.with_workspace_root(local_workspace_root.to_path_buf());
+    }
     if should_persist_resolved_manifest_snapshot(manifest) {
         metadata.resolved_manifest_snapshot = serde_json::to_value(manifest).ok();
     }
@@ -4810,15 +5043,15 @@ pub enum WorkerError {
     #[error(transparent)]
     Scope(ScopeError),
 
-    #[error("workspace root is not readable under the configured scope: {}", .workspace_root.display())]
-    WorkspaceRootOutsideScope { workspace_root: PathBuf },
+    #[error("local filesystem authority root is not readable under the configured scope: {}", .root.display())]
+    LocalFilesystemRootOutsideScope { root: PathBuf },
 
     #[error("cwd is not readable under the configured scope: {}", .cwd.display())]
     CwdOutsideScope { cwd: PathBuf },
 
-    #[error("failed to resolve workspace root {}: {source}", .workspace_root.display())]
-    InvalidWorkspaceRoot {
-        workspace_root: PathBuf,
+    #[error("failed to resolve local filesystem authority root {}: {source}", .root.display())]
+    InvalidLocalFilesystemRoot {
+        root: PathBuf,
         #[source]
         source: std::io::Error,
     },
@@ -4909,13 +5142,13 @@ pub enum WorkerError {
 }
 
 /// Bundle of resources that every high-level Worker constructor needs:
-/// cwd, runtime workspace root, scope, an LLM client, the prompt catalog,
+/// filesystem authority, path-free workspace context, scope, an LLM client, the prompt catalog,
 /// and (optionally) a parsed system-prompt template. Built once by
 /// [`prepare_worker_common_with_context`] from the resolved manifest and then split into Worker
 /// fields.
 struct WorkerCommon {
-    cwd: PathBuf,
-    workspace_root: PathBuf,
+    filesystem_authority: WorkerFilesystemAuthority,
+    workspace_context: WorkerWorkspaceContext,
     scope: Scope,
     delegation_scope: DelegationScope,
     client: Box<dyn LlmClient>,
@@ -5002,23 +5235,30 @@ fn prepare_worker_common_with_context(
     manifest: &WorkerManifest,
     loader: &PromptLoader,
     parse_template: bool,
-    workspace_root: PathBuf,
-    cwd: PathBuf,
+    workspace_context: WorkerWorkspaceContext,
+    filesystem_authority: WorkerFilesystemAuthority,
     scope_config: ScopeConfig,
 ) -> Result<WorkerCommon, WorkerError> {
-    let workspace_root = std::fs::canonicalize(&workspace_root).map_err(|source| {
-        WorkerError::InvalidWorkspaceRoot {
-            workspace_root: workspace_root.clone(),
-            source,
+    let filesystem_authority = match filesystem_authority {
+        WorkerFilesystemAuthority::None => WorkerFilesystemAuthority::None,
+        WorkerFilesystemAuthority::Local(local) => {
+            let root = std::fs::canonicalize(&local.root).map_err(|source| {
+                WorkerError::InvalidLocalFilesystemRoot {
+                    root: local.root.clone(),
+                    source,
+                }
+            })?;
+            let cwd =
+                std::fs::canonicalize(&local.cwd).map_err(|source| WorkerError::InvalidCwd {
+                    cwd: local.cwd.clone(),
+                    source,
+                })?;
+            WorkerFilesystemAuthority::Local(LocalWorkingDirectory { root, cwd })
         }
-    })?;
-    let cwd = std::fs::canonicalize(&cwd).map_err(|source| WorkerError::InvalidCwd {
-        cwd: cwd.clone(),
-        source,
-    })?;
+    };
     let mut scope_config = scope_config;
-    if let Some(mem) = manifest.memory.as_ref() {
-        let layout = memory::WorkspaceLayout::resolve(mem, &workspace_root);
+    if let (Some(mem), Some(local)) = (manifest.memory.as_ref(), filesystem_authority.as_local()) {
+        let layout = memory::WorkspaceLayout::resolve(mem, &local.root);
         scope_config.deny.extend(memory::deny_write_rules(&layout));
         scope_config
             .deny
@@ -5026,32 +5266,46 @@ fn prepare_worker_common_with_context(
     }
     scope_config.allow.extend(skill_dir_read_rules(manifest));
     let scope = Scope::from_config(&scope_config).map_err(WorkerError::Scope)?;
-    prepare_worker_common_from_scope(manifest, loader, parse_template, workspace_root, cwd, scope)
+    prepare_worker_common_from_scope(
+        manifest,
+        loader,
+        parse_template,
+        workspace_context,
+        filesystem_authority,
+        scope,
+    )
 }
 
 fn prepare_worker_common_from_scope(
     manifest: &WorkerManifest,
     loader: &PromptLoader,
     parse_template: bool,
-    workspace_root: PathBuf,
-    cwd: PathBuf,
+    workspace_context: WorkerWorkspaceContext,
+    filesystem_authority: WorkerFilesystemAuthority,
     scope: Scope,
 ) -> Result<WorkerCommon, WorkerError> {
-    if !scope.is_readable(&workspace_root) {
-        return Err(WorkerError::WorkspaceRootOutsideScope { workspace_root });
-    }
-    if !scope.is_readable(&cwd) {
-        return Err(WorkerError::CwdOutsideScope { cwd });
+    if let Some(local) = filesystem_authority.as_local() {
+        if !scope.is_readable(&local.root) {
+            return Err(WorkerError::LocalFilesystemRootOutsideScope {
+                root: local.root.clone(),
+            });
+        }
+        if !scope.is_readable(&local.cwd) {
+            return Err(WorkerError::CwdOutsideScope {
+                cwd: local.cwd.clone(),
+            });
+        }
     }
     let delegation_scope =
         DelegationScope::from_config(&manifest.delegation_scope).map_err(WorkerError::Scope)?;
 
     let client = provider::build_client(&manifest.model)?;
     let prompts = PromptCatalog::load(loader, manifest.worker.prompt_pack.as_deref())?;
-    let memory_layout = manifest
-        .memory
-        .as_ref()
-        .map(|mem| memory::WorkspaceLayout::resolve(mem, &workspace_root));
+    let memory_layout = manifest.memory.as_ref().and_then(|mem| {
+        filesystem_authority
+            .as_local()
+            .map(|local| memory::WorkspaceLayout::resolve(mem, &local.root))
+    });
     let mut workflow_registry = match memory_layout.as_ref() {
         Some(layout) => {
             workflow_crate::load_workflows(layout).map_err(WorkerError::WorkflowLoad)?
@@ -5070,8 +5324,8 @@ fn prepare_worker_common_from_scope(
     };
 
     Ok(WorkerCommon {
-        cwd,
-        workspace_root,
+        filesystem_authority,
+        workspace_context,
         scope,
         delegation_scope,
         client,
@@ -5160,7 +5414,7 @@ mod spawned_context_tests {
     use super::*;
 
     #[test]
-    fn spawn_worker_context_keeps_workspace_root_separate_from_tool_pwd() {
+    fn spawn_worker_context_separates_workspace_identity_from_tool_pwd() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_root = tmp.path().join("workspace-root");
         let cwd = tmp.path().join("child-worktree");
@@ -5173,17 +5427,27 @@ mod spawned_context_tests {
             &manifest,
             &PromptLoader::builtins_only(),
             false,
-            workspace_root.clone(),
-            cwd.clone(),
+            WorkerWorkspaceContext::local_filesystem(Some(WorkspaceId::new("ws-test").unwrap())),
+            WorkerFilesystemAuthority::local(workspace_root.clone(), cwd.clone()),
             manifest.scope.clone(),
         )
         .unwrap();
 
         assert_eq!(
-            common.workspace_root,
+            common
+                .workspace_context
+                .workspace_id()
+                .map(WorkspaceId::as_str),
+            Some("ws-test")
+        );
+        assert_eq!(
+            common.filesystem_authority.as_local().unwrap().root,
             workspace_root.canonicalize().unwrap()
         );
-        assert_eq!(common.cwd, cwd.canonicalize().unwrap());
+        assert_eq!(
+            common.filesystem_authority.as_local().unwrap().cwd,
+            cwd.canonicalize().unwrap()
+        );
         assert_eq!(
             common.memory_layout.as_ref().unwrap().root(),
             workspace_root.canonicalize().unwrap()
@@ -5191,7 +5455,42 @@ mod spawned_context_tests {
     }
 
     #[test]
-    fn prepare_context_reports_workspace_root_when_workspace_root_is_unreadable() {
+    fn workspace_identity_and_client_do_not_grant_filesystem_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path().join("workspace-root");
+        let cwd = workspace_root.join("nested");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut manifest = minimal_manifest_for_context_test(&workspace_root, &cwd);
+        manifest.memory = Some(manifest::MemoryConfig::default());
+        let loader = PromptLoader::new(None, Some(workspace_root.clone()));
+        let workspace_id = WorkspaceId::new("ws-api-only").unwrap();
+        let common = prepare_worker_common_with_context(
+            &manifest,
+            &loader,
+            false,
+            WorkerWorkspaceContext::with_client(
+                Some(workspace_id.clone()),
+                WorkspaceClient::available("test-api"),
+            ),
+            WorkerFilesystemAuthority::None,
+            manifest.scope.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(common.filesystem_authority, WorkerFilesystemAuthority::None);
+        assert_eq!(
+            common
+                .workspace_context
+                .workspace_id()
+                .map(WorkspaceId::as_str),
+            Some(workspace_id.as_str())
+        );
+        assert!(common.workspace_context.client().is_available());
+        assert!(common.memory_layout.is_none());
+    }
+
+    #[test]
+    fn prepare_context_reports_local_filesystem_root_when_unreadable() {
         let tmp = tempfile::tempdir().unwrap();
         let workspace_root = tmp.path().join("workspace-root");
         let cwd = tmp.path().join("child-worktree");
@@ -5203,8 +5502,8 @@ mod spawned_context_tests {
             &manifest,
             &PromptLoader::builtins_only(),
             false,
-            workspace_root.clone(),
-            cwd.clone(),
+            WorkerWorkspaceContext::local_filesystem(Some(WorkspaceId::new("ws-test").unwrap())),
+            WorkerFilesystemAuthority::local(workspace_root.clone(), cwd.clone()),
             ScopeConfig {
                 allow: vec![ScopeRule {
                     target: cwd.clone(),
@@ -5214,17 +5513,15 @@ mod spawned_context_tests {
                 deny: Vec::new(),
             },
         ) {
-            Ok(_) => panic!("expected workspace-root scope error"),
+            Ok(_) => panic!("expected local filesystem root scope error"),
             Err(err) => err,
         };
 
         match err {
-            WorkerError::WorkspaceRootOutsideScope {
-                workspace_root: got,
-            } => {
+            WorkerError::LocalFilesystemRootOutsideScope { root: got } => {
                 assert_eq!(got, workspace_root.canonicalize().unwrap());
             }
-            other => panic!("expected workspace-root scope error, got {other:?}"),
+            other => panic!("expected local filesystem root scope error, got {other:?}"),
         }
     }
 
@@ -5241,8 +5538,8 @@ mod spawned_context_tests {
             &manifest,
             &PromptLoader::builtins_only(),
             false,
-            workspace_root.clone(),
-            cwd.clone(),
+            WorkerWorkspaceContext::local_filesystem(Some(WorkspaceId::new("ws-test").unwrap())),
+            WorkerFilesystemAuthority::local(workspace_root.clone(), cwd.clone()),
             ScopeConfig {
                 allow: vec![ScopeRule {
                     target: workspace_root.clone(),
@@ -5298,23 +5595,15 @@ mod worker_metadata_restore_manifest_tests {
     use super::*;
 
     #[test]
-    fn metadata_writer_persists_workspace_root_through_store_update() {
+    fn metadata_writer_persists_workspace_id_through_store_update() {
         let temp = tempfile::tempdir().unwrap();
         let store = session_store::FsWorkerStore::new(temp.path().join("workers")).unwrap();
-        let workspace_root = temp.path().join("workspace-root");
-        std::fs::create_dir_all(&workspace_root).unwrap();
         let writer = worker_metadata_writer_for_store(&store);
 
-        writer(
-            WorkerMetadata::new("runtime-worker", None).with_workspace_root(workspace_root.clone()),
-        )
-        .unwrap();
+        writer(WorkerMetadata::new("runtime-worker", None).with_workspace_id("ws-test")).unwrap();
 
         let stored = store.read_by_name("runtime-worker").unwrap().unwrap();
-        assert_eq!(
-            stored.workspace_root.as_deref(),
-            Some(workspace_root.as_path())
-        );
+        assert_eq!(stored.workspace_id.as_deref(), Some("ws-test"));
     }
 
     #[test]
@@ -5411,7 +5700,7 @@ permission = "read"
         .unwrap();
         assert!(manifest.profile.is_none());
         assert!(
-            worker_metadata_for_manifest(&manifest, Path::new("/snapshot/workspace"), None)
+            worker_metadata_for_manifest(&manifest, None, None, None)
                 .resolved_manifest_snapshot
                 .is_none()
         );
@@ -5448,8 +5737,7 @@ permission = "read"
             config: None,
         }];
 
-        let metadata =
-            worker_metadata_for_manifest(&manifest, Path::new("/snapshot/workspace"), None);
+        let metadata = worker_metadata_for_manifest(&manifest, None, None, None);
         let snapshot = metadata
             .resolved_manifest_snapshot
             .expect("plugin-resolved manifest should be snapshotted");
@@ -5703,9 +5991,17 @@ mod build_summary_prompt_tests {
         let cwd = dir.path().join("workspace");
         std::fs::create_dir_all(&cwd).unwrap();
         let scope = Scope::writable(&cwd).unwrap();
-        let mut worker = Worker::new(manifest, Engine::new(NoopClient), store, cwd, scope)
-            .await
-            .unwrap();
+        let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
+        let mut worker = Worker::new(
+            manifest,
+            Engine::new(NoopClient),
+            store,
+            WorkerWorkspaceContext::local_filesystem(None),
+            authority,
+            scope,
+        )
+        .await
+        .unwrap();
         worker.ensure_segment_head().unwrap();
         (dir, worker)
     }
@@ -5851,9 +6147,17 @@ mod build_summary_prompt_tests {
         let cwd = dir.path().join("workspace");
         std::fs::create_dir_all(&cwd).unwrap();
         let scope = Scope::writable(&cwd).unwrap();
-        let mut worker = Worker::new(manifest, Engine::new(NoopClient), store, cwd, scope)
-            .await
-            .unwrap();
+        let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
+        let mut worker = Worker::new(
+            manifest,
+            Engine::new(NoopClient),
+            store,
+            WorkerWorkspaceContext::local_filesystem(None),
+            authority,
+            scope,
+        )
+        .await
+        .unwrap();
 
         worker.ensure_segment_head().unwrap();
         worker.wire_history_persistence();
@@ -5978,9 +6282,17 @@ mod build_summary_prompt_tests {
         let mut manifest = minimal_manifest_with_skills(vec![]);
         manifest.memory = memory_config;
         let scope = Scope::writable(&cwd).unwrap();
-        let mut worker = Worker::new(manifest, Engine::new(NoopClient), store, cwd.clone(), scope)
-            .await
-            .unwrap();
+        let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
+        let mut worker = Worker::new(
+            manifest,
+            Engine::new(NoopClient),
+            store,
+            WorkerWorkspaceContext::local_filesystem(None),
+            authority,
+            scope,
+        )
+        .await
+        .unwrap();
         worker.memory_layout = worker
             .manifest
             .memory

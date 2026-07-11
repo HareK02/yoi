@@ -123,7 +123,15 @@ async fn make_worker_with_body(
     std::mem::forget(user_prompts_tmp);
 
     let worker = Engine::new(client);
-    let mut worker = Worker::new(manifest, worker, store, pwd.clone(), scope).await?;
+    let mut worker = Worker::new(
+        manifest,
+        worker,
+        store,
+        worker::WorkerWorkspaceContext::local_filesystem(None),
+        worker::WorkerFilesystemAuthority::local(pwd.clone(), pwd.clone()),
+        scope,
+    )
+    .await?;
 
     let template = SystemPromptTemplate::parse("$user/test", loader)
         .map_err(|source| WorkerError::InvalidSystemPromptTemplate { source })?;

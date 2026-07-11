@@ -101,6 +101,7 @@ export type WorkerLaunchRuntimeOption = {
   display_name: string;
   built_in: boolean;
   can_spawn_worker: boolean;
+  working_directory_required: boolean;
   status: string;
   diagnostics: Diagnostic[];
 };

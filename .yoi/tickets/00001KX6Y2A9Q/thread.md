@@ -101,3 +101,158 @@ Implementation focus:
 Dashboard queue authorization was inspected, no blockers were found, and an accepted plan was recorded. Moving queued Ticket to inprogress before creating implementation worktree or spawning Pods.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-10T22:31:16Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Coder Pod `yoi-coder-00001KX6Y2A9Q-worker-fs-authority` completed implementation in `/home/hare/Projects/yoi/.worktree/00001KX6Y2A9Q-worker-filesystem-authority` on branch `work/00001KX6Y2A9Q-worker-filesystem-authority`。
+- Implementation commit: `b50b94612a1185dc5bdc935d83d63f9d6ace826b feat: add explicit worker filesystem authority`。
+- Orchestrator inspected the worktree status, branch log, commit stats, `git diff --check db3a7165..HEAD`, and grep checks for `worker.cwd()` / Worker `fn cwd`; worktree was clean, diff check passed, and no matches were found。
+
+Coder-reported implementation summary:
+- Added explicit `WorkerFilesystemAuthority::{None, Local(LocalWorkingDirectory)}` boundary。
+- Removed Worker-level `cwd: PathBuf` and `worker.cwd()` accessor。
+- Local Workers carry authority `root` and `cwd` separately。
+- No-workdir embedded Worker spawn passes `WorkerFilesystemAuthority::None` explicitly instead of falling back to runtime/process cwd。
+- Controller tool registration branches on local filesystem authority:
+  - Local Workers register `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash` and get fs view/completions。
+  - No-workdir Workers do not construct/register filesystem or Bash tools。
+- Ticket / worker-spawn / peer-discovery cwd-dependent paths now require local filesystem authority instead of using workspace root as fallback。
+- Tests added/updated for no-workdir tool omission, no cwd fallback, and local/materialized Worker filesystem/Bash behavior。
+
+Coder-reported validation passed:
+- `cargo test -p worker --lib --tests`
+- `cargo test -p worker-runtime --features ws-server,fs-store`
+- `cargo test -p yoi-workspace-server --lib`
+- `cargo check -p yoi`
+- `git diff --check`
+- `cargo run -p yoi -- ticket doctor`
+- `nix build .#yoi --no-link`
+- `rg "worker\\.cwd\\(" crates || true`: no matches。
+- `rg "pub fn cwd\\(" crates/worker/src/worker.rs || true`: no Worker cwd accessor remains。
+
+Not run by Coder:
+- `cd web/workspace && deno task check && deno task test` because web/API/types were not touched。
+
+Next action:
+- Route to external Reviewer Pod before merge/close decisions。
+
+---
+
+<!-- event: review author: reviewer at: 2026-07-10T22:40:35Z status: approve -->
+
+## Review: approve
+
+External review result: approve
+
+Evidence:
+- `WorkerFilesystemAuthority::{None, Local(LocalWorkingDirectory)}` and separate `root`/`cwd` are present in `crates/worker/src/worker.rs`; `Worker` now stores `filesystem_authority` plus separate `workspace_root`, with no `cwd: PathBuf` Worker field。
+- Core filesystem/Bash registration is gated on `worker.local_working_directory()` in `crates/worker/src/controller.rs:619-636`; no-local Workers return `(None, None)` and do not construct/register `Read`/`Write`/`Edit`/`Glob`/`Grep`/`Bash`。
+- Ticket and worker-spawn surfaces require local authority rather than falling back to `workspace_root` (`controller.rs:647-667`, `719-733`)。
+- Embedded runtime creates `WorkerFilesystemAuthority::Local(binding.root, binding.cwd)` only when a working directory binding exists, otherwise `WorkerFilesystemAuthority::None` (`crates/worker-runtime/src/worker_backend.rs:297-310`)。
+- Tests cover no-workdir omission and no cwd fallback via empty observed materialized cwds plus forbidden core tool names (`worker_backend.rs:1133-1201`), and materialized local Workers exposing core tools with materialized cwd (`worker_backend.rs:1203-1260`)。
+- Grep check found no `worker.cwd()` / Worker `fn cwd`; the only remaining `pub fn cwd` hit is `WorkingDirectory` binding API, not `Worker`。
+
+Blockers: none。
+
+Validation performed by reviewer:
+- Read-only ticket/diff/source/test inspection and grep checks。
+- Reviewer did not rerun cargo/nix tests; coder-reported validation covers the requested test/build set。
+
+Non-blocking note:
+- Workspace-context surfaces such as memory/MCP/resident prompt loading can still be backed by `workspace_root` when enabled; this was treated as outside this Ticket’s focused core filesystem/Bash authority gate, but may need follow-up if the intended invariant becomes “no local file reads of any kind” for no-workdir Workers。
+
+---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-10T22:44:39Z -->
+
+## Implementation report
+
+Merge / final validation report:
+
+- Reviewer approved the implementation with no blockers。
+- Merged branch `work/00001KX6Y2A9Q-worker-filesystem-authority` into orchestration branch with merge commit `c29e9135 merge: worker filesystem authority`。
+- Final validation was rerun in `/home/hare/Projects/yoi/.worktree/orchestration` after merge。
+
+Validation passed:
+- `rg "worker\\.cwd\\(" crates || true`: no matches。
+- `rg "pub fn cwd\\(" crates/worker/src/worker.rs || true`: no Worker cwd accessor matches。
+- `git diff --check`
+- `cargo test -p worker --lib --tests`
+- `cargo test -p worker-runtime --features ws-server,fs-store`
+- `cargo test -p yoi-workspace-server --lib`
+- `cargo check -p yoi`
+- `cd web/workspace && deno task check`
+- `cd web/workspace && deno task test`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Validation log:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/worker-fs-authority-final-validation-1783723253.txt`
+
+Reviewed/merged implementation commit:
+- `b50b9461 feat: add explicit worker filesystem authority`
+
+Non-blocking reviewer note:
+- Workspace-context surfaces such as memory/MCP/resident prompt loading can still be backed by `workspace_root` when enabled; this was treated as outside this Ticket’s focused core filesystem/Bash authority gate, but may be follow-up material if the intended invariant becomes “no local file reads of any kind” for no-workdir Workers。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-07-10T22:44:45Z from: inprogress to: done reason: implementation_validated field: state -->
+
+## State changed
+
+Implementation was reviewed, merged into orchestration branch, and final validation passed. Moving to done before closure.
+
+---
+
+<!-- event: state_changed author: hare at: 2026-07-10T22:45:01Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-07-10T22:45:01Z status: closed -->
+
+## 完了
+
+Worker filesystem authority の明示境界を実装・レビュー・merge・検証した。
+
+実装内容:
+- `WorkerFilesystemAuthority::{None, Local(LocalWorkingDirectory)}` を追加。
+- `LocalWorkingDirectory` は filesystem authority `root` と default `cwd` を分離して保持する。
+- Worker-level `cwd: PathBuf` field と `worker.cwd()` accessor を削除。
+- core filesystem/Bash tool registration は local filesystem authority がある場合だけ行うようにした。
+- No-workdir Worker では `Read` / `Write` / `Edit` / `Glob` / `Grep` / `Bash` を construct/register/model-visible にしない。
+- Embedded no-workdir Worker spawn は Runtime/process cwd fallback ではなく `WorkerFilesystemAuthority::None` を明示的に渡す。
+- Ticket / worker-spawn / peer-discovery など cwd 依存箇所は local filesystem authority 必須に整理し、workspace root fallback を authority として使わないようにした。
+- tests で no-workdir tool omission、no cwd fallback、local/materialized Worker の filesystem/Bash behavior を確認。
+
+Review:
+- Reviewer approved with no blockers。
+- Evidence included explicit authority type, no Worker cwd field/accessor, filesystem/Bash registration gate, embedded Runtime authority construction, and tests。
+- Non-blocking note: workspace-context surfaces such as memory/MCP/resident prompt loading can still be backed by `workspace_root` when enabled; this is outside the focused core filesystem/Bash authority gate and may become follow-up if the invariant expands to “no local file reads of any kind”。
+
+Merge / validation:
+- Merge commit: `c29e9135 merge: worker filesystem authority`。
+- Final validation passed:
+  - `rg "worker\\.cwd\\(" crates || true`
+  - `rg "pub fn cwd\\(" crates/worker/src/worker.rs || true`
+  - `git diff --check`
+  - `cargo test -p worker --lib --tests`
+  - `cargo test -p worker-runtime --features ws-server,fs-store`
+  - `cargo test -p yoi-workspace-server --lib`
+  - `cargo check -p yoi`
+  - `cd web/workspace && deno task check`
+  - `cd web/workspace && deno task test`
+  - `yoi ticket doctor`
+  - `nix build .#yoi --no-link`
+- Validation log: `/run/user/1000/yoi/yoi-orchestrator/bash-output/worker-fs-authority-final-validation-1783723253.txt`
+
+---

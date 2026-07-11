@@ -2,7 +2,10 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use crate::{PromptLoader, Worker, WorkerController};
+use crate::{
+    PromptLoader, Worker, WorkerController, WorkerFilesystemAuthority, WorkerWorkspaceContext,
+    WorkspaceId,
+};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use manifest::{
     Permission, ProfileResolveOptions, ProfileResolver, ProfileSelector, ScopeConfig, ScopeRule,
@@ -100,6 +103,24 @@ fn runtime_workspace_root(cli: &Cli) -> Result<PathBuf, String> {
         std::env::current_dir()
             .map_err(|e| format!("failed to resolve current directory for workspace: {e}"))
             .map(|cwd| cwd.join(raw))
+    }
+}
+
+fn runtime_workspace_context(workspace_root: &Path) -> WorkerWorkspaceContext {
+    WorkerWorkspaceContext::local_filesystem(read_workspace_id_hint(workspace_root))
+}
+
+fn read_workspace_id_hint(workspace_root: &Path) -> Option<WorkspaceId> {
+    let path = workspace_root.join(".yoi/workspace.toml");
+    let contents = std::fs::read_to_string(path).ok()?;
+    let value = toml::from_str::<toml::Value>(&contents).ok()?;
+    let id = value.get("id")?.as_str()?.to_string();
+    match WorkspaceId::new(id) {
+        Ok(id) => Some(id),
+        Err(err) => {
+            tracing::warn!("ignoring invalid workspace id in .yoi/workspace.toml: {err}");
+            None
+        }
     }
 }
 
@@ -511,6 +532,9 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
         }
     };
     let store = CombinedStore::new(session_store, worker_metadata_store);
+    let filesystem_authority =
+        WorkerFilesystemAuthority::local(workspace_root.clone(), cwd.clone());
+    let workspace_context = runtime_workspace_context(&workspace_root);
 
     let mut worker = if cli.adopt {
         let callback = match cli.callback.clone() {
@@ -525,8 +549,8 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
             store,
             loader,
             callback,
-            workspace_root.clone(),
-            cwd.clone(),
+            workspace_context.clone(),
+            filesystem_authority.clone(),
         )
         .await
         {
@@ -556,8 +580,8 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
             manifest,
             store,
             loader,
-            workspace_root.clone(),
-            cwd.clone(),
+            workspace_context.clone(),
+            filesystem_authority.clone(),
         )
         .await
         {
@@ -576,8 +600,8 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
                     manifest,
                     store,
                     loader,
-                    workspace_root.clone(),
-                    cwd.clone(),
+                    workspace_context.clone(),
+                    filesystem_authority.clone(),
                 )
                 .await
                 {
@@ -597,8 +621,8 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
                     manifest,
                     store,
                     loader,
-                    workspace_root.clone(),
-                    cwd.clone(),
+                    workspace_context.clone(),
+                    filesystem_authority.clone(),
                 )
                 .await
                 {
@@ -619,8 +643,8 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
             manifest,
             store,
             loader,
-            workspace_root.clone(),
-            cwd.clone(),
+            workspace_context.clone(),
+            filesystem_authority.clone(),
         )
         .await
         {

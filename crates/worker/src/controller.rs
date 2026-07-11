@@ -274,7 +274,9 @@ impl WorkerController {
             manifest_toml.clone(),
             greeting,
         ));
-        shared_state.set_fs_view(crate::fs_view::WorkerFsView::new(fs_for_view));
+        if let Some(fs_for_view) = fs_for_view {
+            shared_state.set_fs_view(crate::fs_view::WorkerFsView::new(fs_for_view));
+        }
         shared_state.set_workflows(
             worker
                 .workflow_completions()
@@ -520,15 +522,17 @@ fn install_ticket_event_companion_notify_hook<C, St>(
         return;
     }
 
-    let Some(companion_worker_name) = companion_worker_name_for_workspace(worker.workspace_root())
-    else {
+    let Some(local) = worker.local_working_directory() else {
+        return;
+    };
+    let Some(companion_worker_name) = companion_worker_name_for_workspace(&local.root) else {
         return;
     };
     if companion_worker_name == worker.manifest().worker.name {
         return;
     }
 
-    let Ok(ticket_config) = TicketConfig::load_workspace(worker.cwd()) else {
+    let Ok(ticket_config) = TicketConfig::load_workspace(&local.cwd) else {
         return;
     };
     let backend_root = ticket_config.backend_root().to_path_buf();
@@ -540,7 +544,7 @@ fn install_ticket_event_companion_notify_hook<C, St>(
         worker.worker_metadata_store(),
         worker.manifest().worker.name.clone(),
         runtime_base,
-        worker.cwd().to_path_buf(),
+        Some(local.cwd.clone()),
         spawned_registry,
     );
     match discovery.ensure_existing_peer(&companion_worker_name) {
@@ -589,7 +593,7 @@ async fn register_worker_tools<C, St>(
     spawner_socket: PathBuf,
     runtime_base: PathBuf,
     spawned_registry: Arc<SpawnedWorkerRegistry>,
-) -> std::io::Result<tools::ScopedFs>
+) -> std::io::Result<Option<tools::ScopedFs>>
 where
     C: LlmClient + Clone + 'static,
     St: Store + WorkerMetadataStore + Clone + 'static,
@@ -597,8 +601,8 @@ where
     // Worker-immutable snapshots taken before the mutable worker borrow
     // below so the worker borrow doesn't conflict with reads on `worker`.
     let scope_handle = worker.scope().clone();
-    let cwd = worker.cwd().to_path_buf();
-    let workspace_root = worker.workspace_root().to_path_buf();
+    let local_filesystem = worker.local_working_directory().cloned();
+    let local_workspace_root = local_filesystem.as_ref().map(|local| local.root.clone());
     let task_feature = worker.task_feature();
     let session_id_for_usage = worker.segment_id().to_string();
     let memory_config = worker.manifest().memory.clone();
@@ -611,24 +615,24 @@ where
     let worker_metadata_store = worker.store().clone();
     let self_parent_socket = worker.callback_socket().cloned();
 
-    // The Worker's SharedScope (already augmented with the bash-output
-    // Read rule by the caller) is the single source of truth — every
-    // ScopedFs (builtin tools, fs_view, compact worker) reads from it,
-    // and any future scope mutation (SpawnWorker-style revoke, future
-    // GrantScope) propagates through it.
-    let fs = tools::ScopedFs::with_shared_scope(scope_handle.clone(), cwd.clone());
-    let tracker = tools::Tracker::new();
-    // Same ScopedFs also powers the IPC `ListCompletions` query — keep
-    // a clone for the FS view we attach below, since the tools consume
-    // `fs` itself.
-    let fs_for_view = fs.clone();
-    worker
-        .engine_mut()
-        .register_tools(tools::core_builtin_tools(
-            fs,
-            tracker.clone(),
-            bash_output_dir,
-        ));
+    // The Worker's SharedScope is the single source of truth for every
+    // ScopedFs when local filesystem authority exists. No-workdir Workers
+    // deliberately skip constructing/registering filesystem and Bash tools.
+    let (fs_for_view, tracker) = if let Some(local) = local_filesystem.as_ref() {
+        let fs = tools::ScopedFs::with_shared_scope(scope_handle.clone(), local.cwd.clone());
+        let tracker = tools::Tracker::new();
+        let fs_for_view = fs.clone();
+        worker
+            .engine_mut()
+            .register_tools(tools::core_builtin_tools(
+                fs,
+                tracker.clone(),
+                bash_output_dir,
+            ));
+        (Some(fs_for_view), Some(tracker))
+    } else {
+        (None, None)
+    };
     if feature_config.web.enabled {
         worker
             .engine_mut()
@@ -649,11 +653,20 @@ where
             }
         };
         // Ticket tools are typed operations over the currently checked-out work
-        // tree. Use the Worker cwd rather than the runtime workspace root so a
-        // dedicated Orchestrator worktree gets its own `.yoi/tickets` backend.
+        // tree. They require explicit local filesystem authority and must not
+        // use workspace identity as a cwd fallback.
+        let ticket_cwd = local_filesystem
+            .as_ref()
+            .map(|local| &local.cwd)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ticket tools require local Worker filesystem authority",
+                )
+            })?;
         feature_registry.add_module(
             crate::feature::builtin::ticket::ticket_tools_feature_with_options(
-                &cwd,
+                ticket_cwd,
                 feature_config.ticket.enabled.then_some(ticket_access),
                 feature_config.ticket_orchestration.enabled,
             ),
@@ -665,10 +678,12 @@ where
     ) {
         feature_registry = feature_registry.with_module(module);
     }
-    if let Some(module) =
-        crate::feature::mcp::discover_stdio_tool_feature(&mcp_config, &workspace_root).await
-    {
-        feature_registry = feature_registry.with_module(module);
+    if let Some(workspace_root) = local_workspace_root.as_ref() {
+        if let Some(module) =
+            crate::feature::mcp::discover_stdio_tool_feature(&mcp_config, workspace_root).await
+        {
+            feature_registry = feature_registry.with_module(module);
+        }
     }
 
     {
@@ -684,7 +699,13 @@ where
                     "[feature.memory].enabled = true requires a [memory] configuration section",
                 )
             })?;
-            let layout = memory::WorkspaceLayout::resolve(mem, &workspace_root);
+            let workspace_root = local_workspace_root.as_ref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "memory tools require local Worker filesystem authority",
+                )
+            })?;
+            let layout = memory::WorkspaceLayout::resolve(mem, workspace_root);
             let query_cfg = memory::tool::QueryConfig::from(mem);
             worker.register_tool(memory::tool::read_tool_with_usage(
                 layout.clone(),
@@ -709,12 +730,27 @@ where
                     "[feature.workers].enabled = true requires non-empty [[delegation_scope.allow]]",
                 ));
             }
+            let spawner_cwd = local_filesystem
+                .as_ref()
+                .map(|local| local.cwd.clone())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "worker spawn tools require local Worker filesystem authority",
+                    )
+                })?;
+            let spawner_workspace_root = local_workspace_root.clone().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "worker spawn tools require local Worker filesystem authority",
+                )
+            })?;
             worker.register_tool(spawn_worker_tool(
                 spawner_name.clone(),
                 spawner_socket,
                 runtime_base.clone(),
-                workspace_root.clone(),
-                cwd.clone(),
+                spawner_workspace_root,
+                spawner_cwd.clone(),
                 spawned_registry.clone(),
                 self_parent_socket,
                 spawner_manifest,
@@ -728,7 +764,7 @@ where
                 worker_metadata_store,
                 spawner_name,
                 runtime_base,
-                cwd,
+                Some(spawner_cwd),
                 spawned_registry,
             );
             worker.register_tool(list_workers_tool(discovery.clone()));
@@ -737,7 +773,9 @@ where
         }
     }
     let _feature_install_report = worker.install_features(feature_registry);
-    worker.attach_tracker(tracker);
+    if let Some(tracker) = tracker {
+        worker.attach_tracker(tracker);
+    }
     Ok(fs_for_view)
 }
 
@@ -774,11 +812,14 @@ async fn controller_loop<C, St>(
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| runtime_dir.path().to_path_buf());
+    let discovery_cwd = worker
+        .local_working_directory()
+        .map(|local| local.cwd.clone());
     let discovery = WorkerDiscovery::new(
         worker.store().clone(),
         spawner_name.clone(),
         discovery_runtime_base,
-        worker.cwd().to_path_buf(),
+        discovery_cwd,
         spawned_registry.clone(),
     );
     let mut pending: Option<PendingRun> = None;
@@ -1445,7 +1486,10 @@ where
         .collect();
     protocol::Greeting {
         worker_name: manifest.worker.name.clone(),
-        cwd: worker.cwd().display().to_string(),
+        cwd: worker
+            .local_working_directory()
+            .map(|local| local.cwd.display().to_string())
+            .unwrap_or_default(),
         provider: provider_name,
         model: model_id,
         scope_summary: worker.scope_snapshot().summary(),

@@ -12,7 +12,10 @@ use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use session_store::{CombinedStore, FsWorkerStore};
 use session_store::{FsStore, LogEntry};
 
-use worker::{Event, Method, Worker, WorkerController, WorkerHandle, WorkerManifest, WorkerStatus};
+use worker::{
+    Event, Method, Worker, WorkerController, WorkerFilesystemAuthority, WorkerHandle,
+    WorkerManifest, WorkerStatus, WorkerWorkspaceContext,
+};
 
 type TestStore = CombinedStore<FsStore, FsWorkerStore>;
 
@@ -186,9 +189,17 @@ async fn make_worker_with_pwd_and_manifest(
     std::mem::forget(pwd_tmp);
 
     let worker = Engine::new(client);
-    let worker = Worker::new(manifest, worker, store, pwd.clone(), scope)
-        .await
-        .unwrap();
+    let authority = WorkerFilesystemAuthority::local(pwd.clone(), pwd.clone());
+    let worker = Worker::new(
+        manifest,
+        worker,
+        store,
+        WorkerWorkspaceContext::local_filesystem(None),
+        authority,
+        scope,
+    )
+    .await
+    .unwrap();
     (worker, pwd)
 }
 
