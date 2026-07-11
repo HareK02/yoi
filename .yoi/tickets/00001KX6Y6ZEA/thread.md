@@ -124,3 +124,100 @@ Next action:
 - 人間が combined branch を明示希望する場合のみ、この待機判断を再検討する。
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-07-11T00:15:05Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- 前提 `00001KX6Y2A9Q` は closed 済みで、`WorkerFilesystemAuthority::{None, Local}` と cwd 除去境界が merge 済み。
+- 関連 `00001KX6WVNPD` も closed 済みで、embedded no-workdir Worker policy / UI/API optionality が merge 済み。
+- この Ticket の typed `depends_on 00001KX6Y2A9Q` は解消済み。`00001KX6WVNPD` は `related` であり blocker ではなく、直前の conflict/migration-boundary waiting note もその Ticket の merge/close により解消済み。
+- `TicketList(inprogress)` は 0 件で、Orchestrator worktree は clean。
+- Ticket body/thread に Worker-level local path identity をなくし、Runtime/host-owned backend/client 境界へ移す binding decision が記録されている。
+
+Evidence checked:
+- Ticket body / thread / relations / orchestration plan。
+- Closed prerequisite `00001KX6Y2A9Q` and closed related policy Ticket `00001KX6WVNPD`。
+- `TicketRelationQuery(00001KX6Y6ZEA)`: outgoing `depends_on 00001KX6Y2A9Q` is closed; other relations are `related` only。
+- `TicketOrchestrationPlanQuery(00001KX6Y6ZEA)`: prior waiting notes were dependency/conflict notes now resolved by prerequisite and related Ticket closure。
+- `TicketList(inprogress)`: 0 件。
+- Orchestrator worktree status: clean。
+
+IntentPacket:
+
+Intent:
+- Worker の workspace identity/context を local path (`workspace_root: PathBuf`) から path-free identity (`Option<WorkspaceId>`) と Runtime/host injected workspace client/handle 境界へ移行する。
+- Filesystem authority は `WorkerFilesystemAuthority` に閉じ込め、workspace identity/client が local filesystem authority を意味しないようにする。
+
+Binding decisions / invariants:
+- Worker struct は durable/context identity として local workspace path を保持しない。
+- Worker-level `workspace_root: PathBuf` field と local path-returning workspace identity accessor を削除する。
+- Worker が `WorkspaceBackendRef` / endpoint / auth / SecretRef / adapter を直接解決しない。
+- Runtime/host 側が backend binding source を保持・解決し、Worker には narrow `WorkspaceClient` / handle を注入する。
+- `workspace_id = Some(...)` かつ `filesystem = None` を表現できること。
+- `workspace_id = None` かつ `filesystem = None` の会話専用 Worker も表現できること。
+- local path が必要な処理は Runtime/host backend adapter または `WorkerFilesystemAuthority::Local` の内側に閉じ込める。
+- capability を導入する場合でも authority source にせず、tool registration / UX / discovery hint として扱い、enforcement は backend 側に置く。
+- `WorkerFilesystemAuthority` / embedded no-workdir policy を崩さない。workspace root fallback や process cwd fallback を filesystem authority として復活させない。
+
+Requirements / acceptance criteria:
+- Worker context に `workspace_id: Option<WorkspaceId>` equivalent と injected workspace client/handle equivalent を持てる。
+- Worker struct に `workspace_root: PathBuf` が存在しない。
+- workspace-aware features（Ticket / memory / workflow / project records / workspace metadata）は local workspace path authority ではなく injected workspace client/handle 経由へ移行する、または移行が必要な箇所を fail-closed / unavailable diagnostic にする。
+- Runtime/host が `WorkspaceBackendRef` equivalent を保持・解決し、Worker launch/restore/embedded/spawn path へ安全に materialize できる。
+- No-workdir Worker は workspace API access と local filesystem authority の有無を独立に表現できる。
+- Existing local/workdir Workers still work with `WorkerFilesystemAuthority::Local` and local-path-only operations confined there。
+- Tests cover no local workspace path identity on Worker, workspace_id/client injection shape, no filesystem authority mixing, and representative workspace-aware API/tool behavior。
+
+Implementation latitude:
+- `WorkspaceId`, `WorkspaceBackendRef`, `WorkspaceClient` / handle の exact placement/name/API surface は existing crate boundaries に合わせてよい。
+- Minimal client/handle can support only currently needed workspace-aware operations if broad API migration would exceed Ticket scope, but it must not leave Worker-local path authority as the active path。
+- If a currently path-backed feature cannot be migrated safely in this Ticket, prefer explicit unavailable/fail-closed diagnostic with follow-up note rather than hidden path fallback。
+- Capability discovery is optional unless needed for safe tool registration/UX。
+
+Escalate if:
+- Removing `workspace_root` from Worker requires changing product semantics for memory/Ticket/workflow availability beyond local refactor。
+- A workspace-aware feature cannot be migrated without introducing a broad external backend/protocol design not captured by this Ticket。
+- You need to reintroduce Worker-held local workspace path as identity/authority。
+- You need to weaken no-workdir fs/Bash tool omission or `WorkerFilesystemAuthority` invariants。
+- Public API/serialization migration requires incompatible durable-state handling beyond existing restore/test coverage。
+
+Validation:
+- `rg "workspace_root" crates/worker crates/worker-runtime crates/yoi-pod-client crates/yoi-workspace-server` with expected remaining hits only outside Worker identity/authority or documented adapter boundaries。
+- `rg "worker\.workspace_root|workspace_root\(\)" crates` or equivalent showing Worker local path accessor removed。
+- `git diff --check`
+- `cargo test -p worker --lib --tests`
+- `cargo test -p worker-runtime --features ws-server,fs-store`
+- `cargo test -p yoi-workspace-server --lib`
+- `cargo check -p yoi`
+- `cd web/workspace && deno task check && deno task test` if API/types/UI are touched。
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Current code map / likely touch points:
+- `crates/worker/src/worker.rs` for Worker context fields and accessors。
+- `crates/worker/src/controller.rs` for workspace-aware tool/resource setup currently tied to workspace path。
+- `crates/worker-runtime/src/worker_backend.rs` for Runtime/embedded/restore construction and backend binding materialization。
+- workspace-server/client crates if backend/client DTOs or Worker launch summaries expose workspace identity。
+- tests around no-workdir Workers, restore, child spawn, Ticket/memory/workflow availability。
+
+Critical risks / reviewer focus:
+- Hidden local path authority retained in Worker under a renamed field/accessor。
+- Workspace identity/client being treated as filesystem authority。
+- WorkspaceBackendRef/endpoint/secret leaking into Worker-owned state。
+- Breaking local/workdir Workers or child spawn/restore while removing path identity。
+- Regressing embedded no-workdir policy or filesystem/Bash tool omission。
+- Over-broad migration that invents a large remote-workspace protocol instead of the minimal safe boundary needed here。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-07-11T00:15:11Z from: queued to: inprogress reason: accepted_for_implementation field: state -->
+
+## State changed
+
+Prerequisite and prior conflict/migration-boundary Ticket are now closed. This Ticket is accepted for implementation before creating a worktree or spawning role Pods.
+
+---
