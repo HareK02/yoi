@@ -27,7 +27,7 @@
   }
 
   function workerStatus(worker: Worker): string {
-    return `${worker.state} · ${worker.status}`;
+    return worker.state;
   }
 
   function workerProfile(worker: Worker): string {

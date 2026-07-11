@@ -1583,7 +1583,7 @@ fn build_runtime_cleanup_plan(
     let live_running_worker_ids: HashSet<String> = workers
         .items
         .iter()
-        .filter(|worker| worker.status == "running" || worker.state == "running")
+        .filter(|worker| worker.state == "running")
         .map(|worker| backend_worker_id(worker.runtime_id.as_str(), worker.worker_id.as_str()))
         .collect();
     let (workdir_summaries, mut diagnostics) =
@@ -3939,7 +3939,6 @@ fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> WorkerSummary 
         host_id: "backend-registry".to_string(),
         role: None,
         label: record.display_name.clone(),
-        status: "archived".to_string(),
         state: "archived".to_string(),
         last_seen_at: Some(record.updated_at.clone()),
         pinned: record.retention_state == "pinned",
@@ -4820,7 +4819,7 @@ mod tests {
 
         let projected = merge_worker_registry_projection(None, &worker, vec![link], &[workdir]);
 
-        assert_eq!(projected.status, "archived");
+        assert_eq!(projected.state, "archived");
         assert_eq!(projected.state, "archived");
         assert_eq!(
             projected.working_directory.as_ref().unwrap().status,
@@ -6891,7 +6890,7 @@ mod tests {
                 .runtime
                 .worker("embedded-worker-runtime", &worker_id)
                 .expect("worker detail");
-            if detail.status == "idle" {
+            if detail.state == "idle" {
                 break;
             }
             assert!(
@@ -6913,7 +6912,7 @@ mod tests {
             .runtime
             .worker("embedded-worker-runtime", &worker_id)
             .expect("restored worker");
-        assert_eq!(restored_worker.status, "stale");
+        assert_eq!(restored_worker.state, "stale");
         assert!(!restored_worker.capabilities.can_accept_input);
         assert!(!restored_worker.capabilities.can_stop);
         assert!(

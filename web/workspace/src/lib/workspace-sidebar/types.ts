@@ -84,7 +84,6 @@ export type Worker = {
   profile?: string | null;
   workspace: { visibility: string; identity: string };
   state: string;
-  status: string;
   pinned?: boolean;
   retention_state?: string;
   last_seen_at?: string | null;

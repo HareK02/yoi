@@ -324,7 +324,7 @@
       </div>
       <div class="console-header-actions">
         <div class="console-status-pill" class:warn={streamState !== 'open'}>
-          {worker?.state ?? 'unknown'} · {worker?.status ?? 'loading'} · stream {streamState}
+          {worker?.state ?? 'loading'} · stream {streamState}
         </div>
         <button type="button" class="secondary-button" aria-expanded={workerDetailsOpen} onclick={() => workerDetailsOpen = !workerDetailsOpen}>
           Details

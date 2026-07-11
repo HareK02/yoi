@@ -238,7 +238,6 @@ pub struct WorkerSummary {
     pub profile: Option<String>,
     pub workspace: WorkerWorkspaceSummary,
     pub state: String,
-    pub status: String,
     pub last_seen_at: Option<String>,
     #[serde(default)]
     pub pinned: bool,
@@ -1191,8 +1190,7 @@ impl EmbeddedWorkerRuntime {
                 visibility: "backend_internal".to_string(),
                 identity: "runtime_registry_worker".to_string(),
             },
-            state: embedded_worker_status_label(summary.status).to_string(),
-            status: embedded_worker_execution_status_label(summary.status, &summary.execution)
+            state: embedded_worker_execution_status_label(summary.status, &summary.execution)
                 .to_string(),
             last_seen_at: None,
             pinned: false,
@@ -1228,8 +1226,7 @@ impl EmbeddedWorkerRuntime {
                 visibility: "backend_internal".to_string(),
                 identity: "runtime_registry_worker".to_string(),
             },
-            state: embedded_worker_status_label(detail.status).to_string(),
-            status: embedded_worker_execution_status_label(detail.status, &detail.execution)
+            state: embedded_worker_execution_status_label(detail.status, &detail.execution)
                 .to_string(),
             last_seen_at: None,
             pinned: false,
@@ -1931,8 +1928,7 @@ impl RemoteWorkerRuntime {
                 visibility: "remote_runtime".to_string(),
                 identity: "runtime_registry_worker".to_string(),
             },
-            state: embedded_worker_status_label(summary.status).to_string(),
-            status: embedded_worker_execution_status_label(summary.status, &summary.execution)
+            state: embedded_worker_execution_status_label(summary.status, &summary.execution)
                 .to_string(),
             last_seen_at: None,
             pinned: false,
@@ -1967,8 +1963,7 @@ impl RemoteWorkerRuntime {
                 visibility: "remote_runtime".to_string(),
                 identity: "runtime_registry_worker".to_string(),
             },
-            state: embedded_worker_status_label(detail.status).to_string(),
-            status: embedded_worker_execution_status_label(detail.status, &detail.execution)
+            state: embedded_worker_execution_status_label(detail.status, &detail.execution)
                 .to_string(),
             last_seen_at: None,
             pinned: false,
@@ -3104,7 +3099,6 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> WorkerSummary {
             identity: "unsupported".to_string(),
         },
         state: "unsupported".to_string(),
-        status: "Worker runtime control is not wired yet".to_string(),
         last_seen_at: None,
         pinned: false,
         retention_state: "transient".to_string(),
@@ -3431,8 +3425,7 @@ mod tests {
                         visibility: "opaque".to_string(),
                         identity: host_id.to_string(),
                     },
-                    state: "running".to_string(),
-                    status: "available".to_string(),
+                    state: "available".to_string(),
                     last_seen_at: None,
                     pinned: false,
                     retention_state: "transient".to_string(),
@@ -3673,7 +3666,7 @@ mod tests {
                 .worker(&worker.worker_id)
                 .worker
                 .expect("worker detail");
-            if detail.status == "idle" {
+            if detail.state == "idle" {
                 assert!(detail.capabilities.can_accept_input);
                 break;
             }
@@ -4078,15 +4071,15 @@ mod tests {
                 worker.worker_id
             );
         }
-        assert_eq!(workers.items[0].status, "stale");
-        assert_eq!(workers.items[1].status, "unconnected");
-        assert_eq!(workers.items[2].status, "rejected");
-        assert_eq!(workers.items[3].status, "errored");
+        assert_eq!(workers.items[0].state, "stale");
+        assert_eq!(workers.items[1].state, "unconnected");
+        assert_eq!(workers.items[2].state, "rejected");
+        assert_eq!(workers.items[3].state, "errored");
 
         let stale_detail = registry.worker("remote:primary", "worker-stale").unwrap();
         assert!(!stale_detail.capabilities.can_accept_input);
         assert!(!stale_detail.capabilities.can_stop);
-        assert_eq!(stale_detail.status, "stale");
+        assert_eq!(stale_detail.state, "stale");
 
         server.join().expect("mock remote server finished");
     }
