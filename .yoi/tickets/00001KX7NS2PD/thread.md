@@ -74,3 +74,21 @@ State changed to `done`.
 
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-07-11T04:34:08Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-07-11T04:34:08Z status: closed -->
+
+## 完了
+
+Removed durable `lifecycle_state` from Backend worker registry. Runtime remains the authority for live status/state; registry-only Workers project as archived, and cleanup planning uses live Runtime worker observation for running-linked checks. Existing DBs are migrated by schema v4 to remove the legacy column.
+
+
+---

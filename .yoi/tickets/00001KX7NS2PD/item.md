@@ -1,8 +1,8 @@
 ---
 title: 'Remove durable worker lifecycle_state'
-state: 'done'
+state: 'closed'
 created_at: '2026-07-11T04:08:12Z'
-updated_at: '2026-07-11T04:33:35Z'
+updated_at: '2026-07-11T04:34:08Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-11T04:09:06Z'
