@@ -41,7 +41,14 @@
   let relativeCwd = $state('');
   let creatingWorkingDirectory = $state(false);
   let isNewWorkingDirectorySelected = $derived(workingDirectoryId === NEW_WORKING_DIRECTORY_VALUE);
-  let canStartWorker = $derived(Boolean(runtimeId && profile && workingDirectoryId && !isNewWorkingDirectorySelected));
+  let selectedRuntime = $derived(options?.runtimes.find((runtime) => runtime.runtime_id === runtimeId));
+  let selectedRuntimeAllowsNoWorkdir = $derived(selectedRuntime?.working_directory_required === false);
+  let hasSelectedExistingWorkdir = $derived(Boolean(workingDirectoryId && !isNewWorkingDirectorySelected));
+  let canStartWorker = $derived(Boolean(
+    runtimeId &&
+      profile &&
+      (hasSelectedExistingWorkdir || (selectedRuntimeAllowsNoWorkdir && !isNewWorkingDirectorySelected)),
+  ));
 
   function workerApiPath(path: string): string {
     return workspaceApiPath(workspaceId, path);
@@ -81,7 +88,7 @@
       runtimeId = form.runtime_id;
       displayName = form.display_name;
       profile = form.profile;
-      workingDirectoryId = form.working_directory_id || NEW_WORKING_DIRECTORY_VALUE;
+      workingDirectoryId = form.working_directory_id;
       workingDirectoryRepositoryId = form.working_directory_repository_id;
       workingDirectorySelector = form.working_directory_selector;
       relativeCwd = form.relative_cwd;
@@ -149,8 +156,8 @@
       submitError = { message: 'workspace id is unavailable', diagnostics: [] };
       return;
     }
-    if (isNewWorkingDirectorySelected || !workingDirectoryId) {
-      submitError = { message: 'select or create a workdir before starting a Worker', diagnostics: [] };
+    if (isNewWorkingDirectorySelected || (!workingDirectoryId && !selectedRuntimeAllowsNoWorkdir)) {
+      submitError = { message: 'select or create a workdir before starting a Worker; only embedded Runtime can start without one', diagnostics: [] };
       return;
     }
 
@@ -220,7 +227,7 @@
   <header class="worker-new-page-header">
     <div>
       <h1 id="new-worker-heading">New Worker</h1>
-      <p>Create a Worker on a selected Runtime and workdir.</p>
+      <p>Create a Worker on a selected Runtime. Workdir-less conversation Workers are only available on embedded Runtime.</p>
     </div>
     <a class="secondary-link" href={`/w/${workspaceId}`}>Back to workspace</a>
   </header>
@@ -237,7 +244,11 @@
         <div class="worker-launch-sentence">
           <span>Run at</span>
           <select class="worker-inline-select wd-select" bind:value={workingDirectoryId} aria-label="Workdir">
-            <option value="">Select workdir</option>
+            {#if selectedRuntimeAllowsNoWorkdir}
+              <option value="">No workdir · embedded conversation only</option>
+            {:else}
+              <option value="" disabled>Select workdir</option>
+            {/if}
             {#each options?.working_directories ?? [] as directory}
               <option value={directory.working_directory_id} disabled={directory.status !== 'active'}>
                 {directory.repository_id} · {directory.requested_selector ?? 'HEAD'}
@@ -258,6 +269,12 @@
             {/if}
           </select>
         </div>
+
+        {#if !selectedRuntimeAllowsNoWorkdir && !workingDirectoryId && !isNewWorkingDirectorySelected}
+          <p class="worker-workdir-note">This Runtime requires a selected workdir before starting a Worker.</p>
+        {:else if selectedRuntimeAllowsNoWorkdir && !workingDirectoryId}
+          <p class="worker-workdir-note">No filesystem tools or Bash will be available without a workdir.</p>
+        {/if}
 
         {#if isNewWorkingDirectorySelected}
           <div class="new-working-directory-panel">
@@ -286,10 +303,12 @@
           </div>
         {/if}
 
-        <label class="relative-cwd-field">
-          <span>Relative cwd inside workdir</span>
-          <input bind:value={relativeCwd} autocomplete="off" placeholder="Optional path inside workdir" />
-        </label>
+        {#if hasSelectedExistingWorkdir || isNewWorkingDirectorySelected}
+          <label class="relative-cwd-field">
+            <span>Relative cwd inside workdir</span>
+            <input bind:value={relativeCwd} autocomplete="off" placeholder="Optional path inside workdir" />
+          </label>
+        {/if}
       </section>
 
       <section class="worker-form-section" aria-labelledby="worker-details-heading">
