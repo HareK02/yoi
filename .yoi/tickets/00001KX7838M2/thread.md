@@ -73,3 +73,21 @@ State changed to `done`.
 
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-07-11T00:31:57Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-07-11T00:31:57Z status: closed -->
+
+## 完了
+
+Removed browser-facing worker observation cursor support. Workspace Console and Backend Runtime clients now attach to Snapshot + live events without backend cursor query or backend-local cursor state. Event envelopes expose runtime event id for dedupe only.
+
+
+---

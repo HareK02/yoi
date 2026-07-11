@@ -1,0 +1,1 @@
+Removed browser-facing worker observation cursor support. Workspace Console and Backend Runtime clients now attach to Snapshot + live events without backend cursor query or backend-local cursor state. Event envelopes expose runtime event id for dedupe only.

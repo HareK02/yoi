@@ -1,8 +1,8 @@
 ---
 title: 'Remove worker observation WebSocket cursor surface'
-state: 'done'
+state: 'closed'
 created_at: '2026-07-11T00:09:06Z'
-updated_at: '2026-07-11T00:31:41Z'
+updated_at: '2026-07-11T00:31:57Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-11T00:09:32Z'
