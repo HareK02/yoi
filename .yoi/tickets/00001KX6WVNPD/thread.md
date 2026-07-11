@@ -174,3 +174,31 @@ Critical risks / reviewer focus:
 Prerequisite `00001KX6Y2A9Q` is now closed and merged. This Ticket is accepted for implementation before creating a worktree or spawning role Pods.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-11T00:00:55Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Coder Pod `yoi-coder-00001KX6WVNPD-no-workdir-policy` completed an implementation pass in `/home/hare/Projects/yoi/.worktree/00001KX6WVNPD-embedded-no-workdir-policy` on branch `work/00001KX6WVNPD-embedded-no-workdir-policy`。
+- Implementation commit: `10267869ae0dfe02e186dc69fec14151926f5009 feat: enforce embedded no-workdir worker policy`。
+- Files touched:
+  - `crates/workspace-server/src/server.rs`
+  - `web/workspace/src/lib/workspace-sidebar/types.ts`
+  - `web/workspace/src/lib/workspace-sidebar/worker-launch.test.ts`
+  - `web/workspace/src/routes/w/[workspaceId]/workers/new/+page.svelte`
+- Orchestrator inspected worktree status, branch log, commit stats, `git diff --check 83c9d884..HEAD`, and `rg 'worker\\.cwd\\(\\)' .`; worktree was clean, diff check passed, and no `worker.cwd()` matches were found。
+
+Implementation summary:
+- Added Browser/API launch metadata for whether a runtime requires working directory selection。
+- Embedded Runtime can be marked as workdir-optional; non-embedded Runtime remains workdir-required。
+- Server-side creation path rejects no-workdir Worker creation unless the target runtime is embedded, using a typed diagnostic。
+- Browser Worker creation UI offers “no workdir / embedded conversation only” only when the selected runtime allows it。
+- Relative cwd input is hidden for no-workdir launch and UI text explains no filesystem tools or Bash are available without workdir。
+- Tests were added/updated for launch metadata, non-embedded no-workdir rejection, and web request construction for embedded no-workdir launch。
+
+Next action:
+- Route to external Reviewer Pod before merge/close decisions。
+
+---

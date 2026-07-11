@@ -3,7 +3,7 @@ title: 'Embedded no-workdir Worker authority policy'
 state: 'inprogress'
 priority: 'P1'
 created_at: '2026-07-10T20:52:43Z'
-updated_at: '2026-07-10T23:38:34Z'
+updated_at: '2026-07-11T00:00:55Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-07-10T22:00:07Z'
