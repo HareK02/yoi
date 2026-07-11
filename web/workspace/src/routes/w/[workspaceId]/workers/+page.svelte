@@ -1,6 +1,7 @@
 <script lang="ts">
   import { workspaceApiPath } from '$lib/workspace-api/http';
   import { workerConsoleHref } from '$lib/workspace-console/model';
+  import { canOpenWorkerConsole } from '$lib/workspace-sidebar/workers';
   import type { Worker } from '$lib/workspace-sidebar/types';
   import type { PageProps } from './$types';
 
@@ -91,7 +92,11 @@
               <td><span class="pill {worker.pinned ? 'success' : 'muted'}">{worker.retention_state ?? 'normal'}</span></td>
               <td>{workerDirectory(worker)}</td>
               <td>
-                <a class="inline-link" href={workerConsoleHref(worker, data.workspaceId)}>Open Console</a>
+                {#if canOpenWorkerConsole(worker)}
+                  <a class="inline-link" href={workerConsoleHref(worker, data.workspaceId)}>Open Console</a>
+                {:else}
+                  <span class="muted" aria-disabled="true">Archived</span>
+                {/if}
                 <button type="button" onclick={() => setPinned(worker, !worker.pinned)}>
                   {worker.pinned ? 'Unpin' : 'Pin'}
                 </button>

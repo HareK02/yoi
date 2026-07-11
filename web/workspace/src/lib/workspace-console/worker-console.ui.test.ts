@@ -14,7 +14,10 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
     new URL("./../../routes/w/[workspaceId]/+page.svelte", import.meta.url),
   );
   const workersPage = await Deno.readTextFile(
-    new URL("./../../routes/w/[workspaceId]/workers/+page.svelte", import.meta.url),
+    new URL(
+      "./../../routes/w/[workspaceId]/workers/+page.svelte",
+      import.meta.url,
+    ),
   );
   const workersNav = await Deno.readTextFile(
     new URL("../workspace-sidebar/WorkersNavSection.svelte", import.meta.url),
@@ -24,8 +27,8 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
   );
 
   assert(
-    workspacePage.includes('href={`/w/${workspaceId}/runtimes`}') &&
-      workspacePage.includes('href={`/w/${workspaceId}/workers`}'),
+    workspacePage.includes("href={`/w/${workspaceId}/runtimes`}") &&
+      workspacePage.includes("href={`/w/${workspaceId}/workers`}"),
     "top workspace page should link to Runtimes and Workers pages",
   );
   assert(
@@ -35,15 +38,15 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
   );
   assert(
     workersPage.includes("workerConsoleHref(worker, data.workspaceId)") &&
-      workersPage.includes("<table class=\"workers-table\">") &&
+      workersPage.includes('<table class="workers-table">') &&
       workersPage.includes("Open Console"),
     "dedicated Workers page should expose a table and attach action per Worker",
   );
   assert(
-    workersNav.includes('href={`/w/${workspaceId}/workers`}') &&
-      workersNav.includes("workerConsoleHref(worker, workspaceId)") &&
-      workersNav.includes("aria-current"),
-    "Workers sidebar should link to the Worker list page and target Console routes",
+    workersNav.includes("href={`/w/${workspaceId}/workers`}") &&
+      workersNav.includes("canOpenWorkerConsole(worker)") &&
+      workersNav.includes('aria-disabled="true"'),
+    "Workers sidebar should link to the Worker list page and render archived Workers as disabled rows",
   );
   assert(
     !sidebar.includes("CompanionNavSection") &&
@@ -54,12 +57,17 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
 
 Deno.test("Worker Console uses protocol observation events without transcript fetch", async () => {
   const consolePage = await Deno.readTextFile(
-    new URL("./../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte", import.meta.url),
+    new URL(
+      "./../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      import.meta.url,
+    ),
   );
 
   assert(
     consolePage.includes("seenObservationEventIds") &&
-      consolePage.includes("rememberObservationEvent(frame.envelope.event_id)") &&
+      consolePage.includes(
+        "rememberObservationEvent(frame.envelope.event_id)",
+      ) &&
       consolePage.includes("projectConsole(observedEvents.map") &&
       !consolePage.includes("/transcript") &&
       !consolePage.includes("WorkerTranscriptProjection"),
@@ -69,7 +77,10 @@ Deno.test("Worker Console uses protocol observation events without transcript fe
 
 Deno.test("Decodal source editor keeps imperative EditorView out of reactive state", async () => {
   const editor = await Deno.readTextFile(
-    new URL("../workspace-settings/DecodalSourceEditor.svelte", import.meta.url),
+    new URL(
+      "../workspace-settings/DecodalSourceEditor.svelte",
+      import.meta.url,
+    ),
   );
 
   assert(
@@ -89,18 +100,27 @@ Deno.test("workspace Runtime management pages expose Runtimes and Runtime-owned 
     new URL("../workspace-sidebar/RuntimesNavSection.svelte", import.meta.url),
   );
   const runtimesPage = await Deno.readTextFile(
-    new URL("./../../routes/w/[workspaceId]/runtimes/+page.svelte", import.meta.url),
+    new URL(
+      "./../../routes/w/[workspaceId]/runtimes/+page.svelte",
+      import.meta.url,
+    ),
   );
   const workdirsPage = await Deno.readTextFile(
-    new URL("./../../routes/w/[workspaceId]/runtimes/[runtimeId]/workdirs/+page.svelte", import.meta.url),
+    new URL(
+      "./../../routes/w/[workspaceId]/runtimes/[runtimeId]/workdirs/+page.svelte",
+      import.meta.url,
+    ),
   );
   const workdirsLoad = await Deno.readTextFile(
-    new URL("./../../routes/w/[workspaceId]/runtimes/[runtimeId]/workdirs/+page.ts", import.meta.url),
+    new URL(
+      "./../../routes/w/[workspaceId]/runtimes/[runtimeId]/workdirs/+page.ts",
+      import.meta.url,
+    ),
   );
 
   assert(
     sidebar.includes("RuntimesNavSection") &&
-      runtimesNav.includes('href={runtimesHref}') &&
+      runtimesNav.includes("href={runtimesHref}") &&
       runtimesNav.includes("/runtimes"),
     "sidebar should expose Runtime management navigation",
   );
@@ -123,18 +143,21 @@ Deno.test("workspace Worker sidebar links New to the dedicated create page", asy
     new URL("../workspace-sidebar/WorkersNavSection.svelte", import.meta.url),
   );
   const newWorkerPage = await Deno.readTextFile(
-    new URL("./../../routes/w/[workspaceId]/workers/new/+page.svelte", import.meta.url),
+    new URL(
+      "./../../routes/w/[workspaceId]/workers/new/+page.svelte",
+      import.meta.url,
+    ),
   );
 
   assert(
-    workersNav.includes('href={`/w/${workspaceId}/workers/new`}') &&
-      !workersNav.includes('worker-launch-form') &&
-      !workersNav.includes('createWorker()'),
+    workersNav.includes("href={`/w/${workspaceId}/workers/new`}") &&
+      !workersNav.includes("worker-launch-form") &&
+      !workersNav.includes("createWorker()"),
     "Workers sidebar should link to the dedicated New Worker page instead of owning the form",
   );
   assert(
-    newWorkerPage.includes('worker-launch-form') &&
-      newWorkerPage.includes('buildBrowserCreateWorkerRequest') &&
+    newWorkerPage.includes("worker-launch-form") &&
+      newWorkerPage.includes("buildBrowserCreateWorkerRequest") &&
       newWorkerPage.includes("/workers/launch-options"),
     "New Worker page should own launch options and creation form behavior",
   );

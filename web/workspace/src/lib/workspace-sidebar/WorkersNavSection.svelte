@@ -1,6 +1,7 @@
 <script lang="ts">
   import { workspaceApiPath } from '$lib/workspace-api/http';
   import { workerConsoleHref } from '$lib/workspace-console/model';
+  import { canOpenWorkerConsole } from './workers';
   import type { ListResponse, Worker } from './types';
 
   const MAX_VISIBLE_WORKERS = 6;
@@ -99,17 +100,31 @@
     <ul class="nav-list" aria-label="Workers">
       {#each workers as worker (`${worker.runtime_id}:${worker.worker_id}`)}
         {@const href = workerConsoleHref(worker, workspaceId)}
+        {@const consoleAvailable = canOpenWorkerConsole(worker)}
         <li>
-          <a href={href} class="nav-item worker-nav-item" class:active={currentPath === href} aria-current={currentPath === href ? 'page' : undefined}>
-            <span class="worker-title-row">
-              <span class="item-title">{worker.label}</span>
-              <span class="worker-task-title">-</span>
-            </span>
-            <span class="item-meta">
-              {worker.role ? `${worker.role} · ` : ''}{worker.state} · 🖥 {worker.host_id}
-              {worker.working_directory ? ` · wd:${worker.working_directory.repository_id}@${worker.working_directory.resolved_commit.slice(0, 8)}` : ''}
-            </span>
-          </a>
+          {#if consoleAvailable}
+            <a href={href} class="nav-item worker-nav-item" class:active={currentPath === href} aria-current={currentPath === href ? 'page' : undefined}>
+              <span class="worker-title-row">
+                <span class="item-title">{worker.label}</span>
+                <span class="worker-task-title">-</span>
+              </span>
+              <span class="item-meta">
+                {worker.role ? `${worker.role} · ` : ''}{worker.state} · 🖥 {worker.host_id}
+                {worker.working_directory ? ` · wd:${worker.working_directory.repository_id}@${worker.working_directory.resolved_commit.slice(0, 8)}` : ''}
+              </span>
+            </a>
+          {:else}
+            <div class="nav-item worker-nav-item disabled" aria-disabled="true">
+              <span class="worker-title-row">
+                <span class="item-title">{worker.label}</span>
+                <span class="worker-task-title">archived</span>
+              </span>
+              <span class="item-meta">
+                {worker.role ? `${worker.role} · ` : ''}{worker.state} · 🖥 {worker.host_id}
+                {worker.working_directory ? ` · wd:${worker.working_directory.repository_id}@${worker.working_directory.resolved_commit.slice(0, 8)}` : ''}
+              </span>
+            </div>
+          {/if}
         </li>
       {/each}
     </ul>
