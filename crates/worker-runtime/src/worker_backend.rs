@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -35,7 +35,10 @@ use session_store::{CombinedStore, FsWorkerStore};
 use tokio::runtime::Runtime;
 use tokio::sync::broadcast;
 
-use worker::{Worker, WorkerController, WorkerFilesystemAuthority, WorkerHandle};
+use worker::{
+    Worker, WorkerController, WorkerFilesystemAuthority, WorkerHandle, WorkerWorkspaceContext,
+    WorkspaceId,
+};
 
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
 const RUNTIME_TASK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -230,6 +233,41 @@ fn sanitize_worker_name_component(value: &str) -> String {
         .collect()
 }
 
+#[derive(Debug, Clone)]
+enum RuntimeWorkspaceBackendRef {
+    None,
+    LocalFilesystem { root: PathBuf },
+}
+
+impl RuntimeWorkspaceBackendRef {
+    fn from_working_directory(binding: Option<&WorkingDirectoryBinding>) -> Self {
+        match binding {
+            Some(binding) => Self::LocalFilesystem {
+                root: binding.root().to_path_buf(),
+            },
+            None => Self::None,
+        }
+    }
+
+    fn worker_context(&self) -> WorkerWorkspaceContext {
+        match self {
+            Self::None => WorkerWorkspaceContext::no_workspace(),
+            Self::LocalFilesystem { root } => local_workspace_context(root),
+        }
+    }
+}
+
+fn local_workspace_context(root: &Path) -> WorkerWorkspaceContext {
+    WorkerWorkspaceContext::local_filesystem(read_workspace_id_hint(root))
+}
+
+fn read_workspace_id_hint(root: &Path) -> Option<WorkspaceId> {
+    let contents = std::fs::read_to_string(root.join(".yoi/workspace.toml")).ok()?;
+    let value = toml::from_str::<toml::Value>(&contents).ok()?;
+    let id = value.get("id")?.as_str()?.to_string();
+    WorkspaceId::new(id).ok()
+}
+
 #[cfg(feature = "http-server")]
 async fn fetch_profile_source_archive_http(
     location: &ProfileSourceArchiveHttpRef,
@@ -308,6 +346,9 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 )
             })
             .unwrap_or(WorkerFilesystemAuthority::None);
+        let workspace_backend_ref =
+            RuntimeWorkspaceBackendRef::from_working_directory(request.working_directory.as_ref());
+        let workspace_context = workspace_backend_ref.worker_context();
         let selector = profile.as_deref().unwrap_or("builtin:default");
         let archive = self
             .resolve_profile_source_archive(&request.request.profile_source)
@@ -344,7 +385,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             manifest,
             store,
             loader,
-            worker_root,
+            workspace_context,
             filesystem_authority,
         )
         .await
@@ -927,12 +968,16 @@ mod tests {
                 .as_ref()
                 .map(|binding| binding.root().to_path_buf())
                 .unwrap_or_else(|| self.cwd.clone());
+            let workspace_backend_ref = RuntimeWorkspaceBackendRef::from_working_directory(
+                request.working_directory.as_ref(),
+            );
+            let workspace_context = workspace_backend_ref.worker_context();
             let scope = Scope::writable(&scope_root).map_err(|err| err.to_string())?;
             let worker = Worker::new(
                 manifest,
                 Engine::new(self.client.clone()),
                 store,
-                self.cwd.clone(),
+                workspace_context,
                 filesystem_authority,
                 scope,
             )

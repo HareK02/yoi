@@ -194,7 +194,7 @@ async fn make_worker(
         manifest,
         worker,
         store,
-        pwd.clone(),
+        worker::WorkerWorkspaceContext::local_filesystem(None),
         worker::WorkerFilesystemAuthority::local(pwd.clone(), pwd.clone()),
         scope,
     )
@@ -464,7 +464,7 @@ async fn metric_write_failure_emits_warn_alert_and_does_not_abort_run() {
         manifest,
         worker,
         store.clone(),
-        pwd.clone(),
+        worker::WorkerWorkspaceContext::local_filesystem(None),
         worker::WorkerFilesystemAuthority::local(pwd.clone(), pwd.clone()),
         scope,
     )
@@ -540,7 +540,7 @@ permission = "write"
         manifest,
         worker,
         store.clone(),
-        pwd.clone(),
+        worker::WorkerWorkspaceContext::local_filesystem(None),
         worker::WorkerFilesystemAuthority::local(pwd.clone(), pwd.clone()),
         scope,
     )

@@ -522,17 +522,16 @@ fn install_ticket_event_companion_notify_hook<C, St>(
         return;
     }
 
-    let Some(companion_worker_name) = companion_worker_name_for_workspace(worker.workspace_root())
-    else {
+    let Some(local) = worker.local_working_directory() else {
+        return;
+    };
+    let Some(companion_worker_name) = companion_worker_name_for_workspace(&local.root) else {
         return;
     };
     if companion_worker_name == worker.manifest().worker.name {
         return;
     }
 
-    let Some(local) = worker.local_working_directory() else {
-        return;
-    };
     let Ok(ticket_config) = TicketConfig::load_workspace(&local.cwd) else {
         return;
     };
@@ -603,7 +602,7 @@ where
     // below so the worker borrow doesn't conflict with reads on `worker`.
     let scope_handle = worker.scope().clone();
     let local_filesystem = worker.local_working_directory().cloned();
-    let workspace_root = worker.workspace_root().to_path_buf();
+    let local_workspace_root = local_filesystem.as_ref().map(|local| local.root.clone());
     let task_feature = worker.task_feature();
     let session_id_for_usage = worker.segment_id().to_string();
     let memory_config = worker.manifest().memory.clone();
@@ -654,8 +653,8 @@ where
             }
         };
         // Ticket tools are typed operations over the currently checked-out work
-        // tree. They require explicit local filesystem authority; workspace_root
-        // is context only and must not be used as a cwd fallback.
+        // tree. They require explicit local filesystem authority and must not
+        // use workspace identity as a cwd fallback.
         let ticket_cwd = local_filesystem
             .as_ref()
             .map(|local| &local.cwd)
@@ -679,10 +678,12 @@ where
     ) {
         feature_registry = feature_registry.with_module(module);
     }
-    if let Some(module) =
-        crate::feature::mcp::discover_stdio_tool_feature(&mcp_config, &workspace_root).await
-    {
-        feature_registry = feature_registry.with_module(module);
+    if let Some(workspace_root) = local_workspace_root.as_ref() {
+        if let Some(module) =
+            crate::feature::mcp::discover_stdio_tool_feature(&mcp_config, workspace_root).await
+        {
+            feature_registry = feature_registry.with_module(module);
+        }
     }
 
     {
@@ -698,7 +699,13 @@ where
                     "[feature.memory].enabled = true requires a [memory] configuration section",
                 )
             })?;
-            let layout = memory::WorkspaceLayout::resolve(mem, &workspace_root);
+            let workspace_root = local_workspace_root.as_ref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "memory tools require local Worker filesystem authority",
+                )
+            })?;
+            let layout = memory::WorkspaceLayout::resolve(mem, workspace_root);
             let query_cfg = memory::tool::QueryConfig::from(mem);
             worker.register_tool(memory::tool::read_tool_with_usage(
                 layout.clone(),
@@ -732,11 +739,17 @@ where
                         "worker spawn tools require local Worker filesystem authority",
                     )
                 })?;
+            let spawner_workspace_root = local_workspace_root.clone().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "worker spawn tools require local Worker filesystem authority",
+                )
+            })?;
             worker.register_tool(spawn_worker_tool(
                 spawner_name.clone(),
                 spawner_socket,
                 runtime_base.clone(),
-                workspace_root.clone(),
+                spawner_workspace_root,
                 spawner_cwd.clone(),
                 spawned_registry.clone(),
                 self_parent_socket,

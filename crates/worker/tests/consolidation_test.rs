@@ -174,7 +174,7 @@ async fn make_worker_with(
         manifest,
         worker,
         store,
-        pwd.clone(),
+        worker::WorkerWorkspaceContext::local_filesystem(None),
         worker::WorkerFilesystemAuthority::local(pwd.clone(), pwd.clone()),
         scope,
     )
