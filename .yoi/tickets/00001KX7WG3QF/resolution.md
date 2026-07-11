@@ -1,0 +1,1 @@
+Removed duplicate browser-facing Worker `status` field. Workspace Worker summaries now use `state` only; Frontend Worker list/sidebar/Console no longer reference `worker.status`. Runtime, Host, Workdir, and protocol statuses remain where they are distinct concepts.

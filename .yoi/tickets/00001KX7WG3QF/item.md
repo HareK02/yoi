@@ -1,8 +1,8 @@
 ---
 title: 'Remove duplicate Worker status field'
-state: 'done'
+state: 'closed'
 created_at: '2026-07-11T06:05:38Z'
-updated_at: '2026-07-11T06:22:05Z'
+updated_at: '2026-07-11T06:22:34Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-11T06:06:13Z'

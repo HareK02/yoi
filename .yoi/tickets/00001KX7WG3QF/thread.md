@@ -71,3 +71,21 @@ State changed to `done`.
 
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-07-11T06:22:34Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-07-11T06:22:34Z status: closed -->
+
+## 完了
+
+Removed duplicate browser-facing Worker `status` field. Workspace Worker summaries now use `state` only; Frontend Worker list/sidebar/Console no longer reference `worker.status`. Runtime, Host, Workdir, and protocol statuses remain where they are distinct concepts.
+
+
+---
