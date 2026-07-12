@@ -15,12 +15,13 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use crate::catalog::{
-    ProfileSourceArchiveHttpRef, ProfileSourceArchiveSource, WorkingDirectoryRequest,
-    WorkingDirectoryStatus,
+    CreateWorkerRequest, ProfileSourceArchiveHttpRef, ProfileSourceArchiveSource,
+    WorkingDirectoryRequest, WorkingDirectoryStatus,
 };
 use crate::execution::{
-    WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation, WorkerExecutionResult,
-    WorkerExecutionRunState, WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
+    WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation,
+    WorkerExecutionRestoreRequest, WorkerExecutionResult, WorkerExecutionRunState,
+    WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
 };
 use crate::interaction::{WorkerInput, WorkerInputKind};
 use crate::resource::{BackendResourceClient, ProfileSourceArchiveCache};
@@ -33,11 +34,12 @@ use protocol::{Method, Segment, WorkerStatus};
 use session_store::FsStore;
 use session_store::{CombinedStore, FsWorkerStore};
 use tokio::runtime::Runtime;
+#[cfg(feature = "ws-server")]
 use tokio::sync::broadcast;
 
 use worker::{
-    Worker, WorkerController, WorkerFilesystemAuthority, WorkerHandle, WorkerWorkspaceContext,
-    WorkspaceId,
+    Worker, WorkerController, WorkerError, WorkerFilesystemAuthority, WorkerHandle,
+    WorkerWorkspaceContext, WorkspaceId,
 };
 
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
@@ -50,6 +52,11 @@ pub trait RuntimeWorkerFactory: Send + Sync + 'static {
     async fn spawn_controller(
         &self,
         request: WorkerExecutionSpawnRequest,
+    ) -> Result<WorkerHandle, String>;
+
+    async fn restore_controller(
+        &self,
+        request: WorkerExecutionRestoreRequest,
     ) -> Result<WorkerHandle, String>;
 }
 
@@ -139,12 +146,16 @@ impl ProfileRuntimeWorkerFactory {
             .ok_or_else(|| "could not resolve worker runtime directory".to_string())
     }
 
-    fn runtime_worker_name(request: &WorkerExecutionSpawnRequest) -> String {
+    fn runtime_worker_name_for_ref(worker_ref: &crate::identity::WorkerRef) -> String {
         format!(
             "runtime-{}-{}",
-            sanitize_worker_name_component(request.worker_ref.runtime_id.as_str()),
-            request.worker_ref.worker_id
+            sanitize_worker_name_component(worker_ref.runtime_id.as_str()),
+            worker_ref.worker_id
         )
+    }
+
+    fn runtime_worker_name(request: &WorkerExecutionSpawnRequest) -> String {
+        Self::runtime_worker_name_for_ref(&request.worker_ref)
     }
 
     fn runtime_profile_value(
@@ -165,14 +176,21 @@ impl ProfileRuntimeWorkerFactory {
         }
     }
 
-    fn runtime_profile<'a>(
+    fn runtime_profile_for_request<'a>(
         &'a self,
-        request: &'a WorkerExecutionSpawnRequest,
+        request: &'a CreateWorkerRequest,
     ) -> Option<std::borrow::Cow<'a, str>> {
         if let Some(profile) = self.profile.as_deref() {
             return Some(std::borrow::Cow::Borrowed(profile));
         }
-        Self::runtime_profile_value(&request.request.profile)
+        Self::runtime_profile_value(&request.profile)
+    }
+
+    fn runtime_profile<'a>(
+        &'a self,
+        request: &'a WorkerExecutionSpawnRequest,
+    ) -> Option<std::borrow::Cow<'a, str>> {
+        self.runtime_profile_for_request(&request.request)
     }
     async fn resolve_profile_source_archive(
         &self,
@@ -397,6 +415,110 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             .map_err(|err| format!("failed to spawn Worker controller: {err}"))?;
         Ok(handle)
     }
+
+    async fn restore_controller(
+        &self,
+        request: WorkerExecutionRestoreRequest,
+    ) -> Result<WorkerHandle, String> {
+        let worker_name = Self::runtime_worker_name_for_ref(&request.worker_ref);
+        let profile = self.runtime_profile_for_request(&request.request);
+        let worker_root = request
+            .working_directory
+            .as_ref()
+            .map(|binding| binding.root().to_path_buf())
+            .unwrap_or_else(|| self.profile_base_dir.clone());
+        let filesystem_authority = request
+            .working_directory
+            .as_ref()
+            .map(|binding| {
+                WorkerFilesystemAuthority::local(
+                    binding.root().to_path_buf(),
+                    binding.cwd().to_path_buf(),
+                )
+            })
+            .unwrap_or(WorkerFilesystemAuthority::None);
+        let workspace_backend_ref =
+            RuntimeWorkspaceBackendRef::from_working_directory(request.working_directory.as_ref());
+        let workspace_context = workspace_backend_ref.worker_context();
+        let selector = profile.as_deref().unwrap_or("builtin:default");
+        let archive = self
+            .resolve_profile_source_archive(&request.request.profile_source)
+            .await?;
+        let (mut manifest, loader) = {
+            let manifest = archive
+                .resolve_profile(selector, &worker_root, &worker_name)
+                .map_err(|err| format!("failed to resolve profile source archive: {err}"))?;
+            worker::entrypoint::resolve_runtime_profile_manifest_from_manifest(
+                manifest,
+                &worker_root,
+                &worker_name,
+            )?
+        };
+        manifest.worker.name = worker_name.clone();
+
+        let store_dir = self.store_dir()?;
+        let session_store = FsStore::new(&store_dir).map_err(|err| {
+            format!(
+                "failed to initialize session store at {}: {err}",
+                store_dir.display()
+            )
+        })?;
+        let worker_metadata_dir = self.worker_metadata_dir(&store_dir);
+        let worker_metadata_store = FsWorkerStore::new(&worker_metadata_dir).map_err(|err| {
+            format!(
+                "failed to initialize worker metadata store at {}: {err}",
+                worker_metadata_dir.display()
+            )
+        })?;
+        let store = CombinedStore::new(session_store, worker_metadata_store);
+
+        let worker = match Worker::restore_from_worker_metadata_with_context(
+            &worker_name,
+            manifest.clone(),
+            store,
+            loader.clone(),
+            workspace_context.clone(),
+            filesystem_authority.clone(),
+        )
+        .await
+        {
+            Ok(worker) => worker,
+            Err(WorkerError::WorkerMetadataPending { .. })
+                if request.request.initial_input.is_none() =>
+            {
+                let session_store = FsStore::new(&store_dir).map_err(|err| {
+                    format!(
+                        "failed to initialize session store at {}: {err}",
+                        store_dir.display()
+                    )
+                })?;
+                let worker_metadata_store =
+                    FsWorkerStore::new(&worker_metadata_dir).map_err(|err| {
+                        format!(
+                            "failed to initialize worker metadata store at {}: {err}",
+                            worker_metadata_dir.display()
+                        )
+                    })?;
+                let store = CombinedStore::new(session_store, worker_metadata_store);
+                Worker::from_manifest_with_context(
+                    manifest,
+                    store,
+                    loader,
+                    workspace_context,
+                    filesystem_authority,
+                )
+                .await
+                .map_err(|err| format!("failed to recreate pending Worker from profile: {err}"))?
+            }
+            Err(err) => return Err(format!("failed to restore Worker from metadata: {err}")),
+        };
+
+        let runtime_base = self.runtime_base_dir()?;
+        let (handle, _shutdown_rx) = WorkerController::spawn(worker, &runtime_base)
+            .await
+            .map_err(|err| format!("failed to spawn restored Worker controller: {err}"))?;
+        Ok(handle)
+    }
 }
 
 struct RuntimeWorkerExecution {
@@ -531,6 +653,69 @@ where
         })
         .map(|_| WorkerExecutionResult::accepted(operation, accepted_run_state))
         .unwrap_or_else(|message| WorkerExecutionResult::errored(operation, message))
+    }
+
+    fn connect_handle(
+        &self,
+        operation: WorkerExecutionOperation,
+        worker_ref: crate::identity::WorkerRef,
+        bridge_context: crate::execution::WorkerExecutionContext,
+        handle: WorkerHandle,
+        working_directory: Option<WorkingDirectoryBinding>,
+    ) -> WorkerExecutionSpawnResult {
+        let busy = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "ws-server")]
+        {
+            let mut events = handle.subscribe();
+            let bridge_handle = handle.clone();
+            let bridge_busy = busy.clone();
+            if let Err(message) = self.spawn_on_adapter_runtime(async move {
+                loop {
+                    match events.recv().await {
+                        Ok(event) => {
+                            let _ = bridge_context.publish_protocol_event(event);
+                            if bridge_handle.shared_state.get_status() == WorkerStatus::Idle {
+                                bridge_busy.store(false, Ordering::SeqCst);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }) {
+                return WorkerExecutionSpawnResult::Errored(WorkerExecutionResult::errored(
+                    operation, message,
+                ));
+            }
+        }
+        #[cfg(not(feature = "ws-server"))]
+        {
+            let _ = bridge_context;
+        }
+
+        let mut workers = match self.workers.lock() {
+            Ok(workers) => workers,
+            Err(_) => {
+                return WorkerExecutionSpawnResult::Errored(WorkerExecutionResult::errored(
+                    operation,
+                    "worker adapter registry lock is poisoned",
+                ));
+            }
+        };
+        workers.insert(
+            worker_ref.clone(),
+            RuntimeWorkerExecution {
+                handle,
+                busy,
+                working_directory: working_directory.clone(),
+            },
+        );
+
+        WorkerExecutionSpawnResult::Connected {
+            handle: WorkerExecutionHandle::new(worker_ref, self.backend_id()),
+            run_state: WorkerExecutionRunState::Idle,
+            working_directory: working_directory.map(|binding| binding.status()),
+        }
     }
 }
 
@@ -694,53 +879,108 @@ where
             }
         };
 
-        let mut events = handle.subscribe();
-        let bridge_handle = handle.clone();
-        let busy = Arc::new(AtomicBool::new(false));
-        let bridge_busy = busy.clone();
-        if let Err(message) = self.spawn_on_adapter_runtime(async move {
-            loop {
-                match events.recv().await {
-                    Ok(event) => {
-                        let _ = bridge_context.publish_protocol_event(event);
-                        if bridge_handle.shared_state.get_status() == WorkerStatus::Idle {
-                            bridge_busy.store(false, Ordering::SeqCst);
-                        }
+        self.connect_handle(
+            WorkerExecutionOperation::Spawn,
+            worker_ref,
+            bridge_context,
+            handle,
+            working_directory,
+        )
+    }
+
+    fn restore_worker(
+        &self,
+        mut request: WorkerExecutionRestoreRequest,
+    ) -> WorkerExecutionSpawnResult {
+        let working_directory = match request.previous_execution.working_directory.clone() {
+            Some(status) => {
+                let Some(materializer) = self.working_directory_materializer.as_ref() else {
+                    return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
+                        WorkerExecutionOperation::Restore,
+                        "persisted worker has a working directory binding, but no materializer is configured for this runtime backend",
+                    ));
+                };
+                let relative_cwd = request
+                    .request
+                    .working_directory
+                    .as_ref()
+                    .and_then(|working_directory| working_directory.relative_cwd.as_deref());
+                match materializer
+                    .bind_working_directory(&status.summary.working_directory_id, relative_cwd)
+                {
+                    Ok(binding) => {
+                        request.working_directory = Some(binding.clone());
+                        Some(binding)
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(error) => {
+                        return WorkerExecutionSpawnResult::Rejected(
+                            WorkerExecutionResult::rejected(
+                                WorkerExecutionOperation::Restore,
+                                error.to_string(),
+                            ),
+                        );
+                    }
                 }
             }
-        }) {
-            return WorkerExecutionSpawnResult::Errored(WorkerExecutionResult::errored(
-                WorkerExecutionOperation::Spawn,
-                message,
-            ));
-        }
+            None if request.request.working_directory_request.is_some() => {
+                return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
+                    WorkerExecutionOperation::Restore,
+                    "persisted worker requested a working directory, but no persisted working directory binding is available to restore",
+                ));
+            }
+            None if request.request.working_directory.is_some() => {
+                let Some(materializer) = self.working_directory_materializer.as_ref() else {
+                    return WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::rejected(
+                        WorkerExecutionOperation::Restore,
+                        "persisted worker has a working directory claim, but no materializer is configured for this runtime backend",
+                    ));
+                };
+                let working_directory =
+                    request.request.working_directory.as_ref().expect("checked");
+                match materializer.bind_working_directory(
+                    &working_directory.working_directory_id,
+                    working_directory.relative_cwd.as_deref(),
+                ) {
+                    Ok(binding) => {
+                        request.working_directory = Some(binding.clone());
+                        Some(binding)
+                    }
+                    Err(error) => {
+                        return WorkerExecutionSpawnResult::Rejected(
+                            WorkerExecutionResult::rejected(
+                                WorkerExecutionOperation::Restore,
+                                error.to_string(),
+                            ),
+                        );
+                    }
+                }
+            }
+            None => None,
+        };
 
-        let mut workers = match self.workers.lock() {
-            Ok(workers) => workers,
-            Err(_) => {
+        let factory = self.factory.clone();
+        let bridge_context = request.context.clone();
+        let worker_ref = request.worker_ref.clone();
+        let restore_result =
+            self.run_on_adapter_runtime(async move { factory.restore_controller(request).await });
+
+        let handle = match restore_result {
+            Ok(handle) => handle,
+            Err(message) => {
                 return WorkerExecutionSpawnResult::Errored(WorkerExecutionResult::errored(
-                    WorkerExecutionOperation::Spawn,
-                    "worker adapter registry lock is poisoned",
+                    WorkerExecutionOperation::Restore,
+                    message,
                 ));
             }
         };
-        workers.insert(
-            worker_ref.clone(),
-            RuntimeWorkerExecution {
-                handle,
-                busy,
-                working_directory: working_directory.clone(),
-            },
-        );
 
-        WorkerExecutionSpawnResult::Connected {
-            handle: WorkerExecutionHandle::new(worker_ref, self.backend_id()),
-            run_state: WorkerExecutionRunState::Idle,
-            working_directory: working_directory.map(|binding| binding.status()),
-        }
+        self.connect_handle(
+            WorkerExecutionOperation::Restore,
+            worker_ref,
+            bridge_context,
+            handle,
+            working_directory,
+        )
     }
 
     fn dispatch_input(
@@ -987,6 +1227,19 @@ mod tests {
                 .await
                 .map_err(|err| err.to_string())?;
             Ok(handle)
+        }
+        async fn restore_controller(
+            &self,
+            request: WorkerExecutionRestoreRequest,
+        ) -> Result<WorkerHandle, String> {
+            let request = WorkerExecutionSpawnRequest {
+                worker_ref: request.worker_ref,
+                request: request.request,
+                context: request.context,
+                working_directory: request.working_directory,
+                config_bundle: request.config_bundle,
+            };
+            self.spawn_controller(request).await
         }
     }
 

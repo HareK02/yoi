@@ -39,6 +39,7 @@ pub enum RuntimeEventKind {
     RuntimeStarted,
     RuntimeStopped,
     WorkerCreated,
+    WorkerExecutionRestored,
     WorkerInputAccepted,
     WorkerStopped,
     WorkerCancelled,

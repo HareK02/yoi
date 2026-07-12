@@ -11,6 +11,8 @@ use crate::config_bundle::{
 use crate::diagnostics::DiagnosticSeverity;
 use crate::diagnostics::RuntimeDiagnostic;
 use crate::error::RuntimeError;
+#[cfg(feature = "fs-store")]
+use crate::execution::WorkerExecutionRestoreRequest;
 use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionBackendKind, WorkerExecutionBackendRef,
     WorkerExecutionBindingIdentity, WorkerExecutionHandle, WorkerExecutionOperation,
@@ -128,9 +130,11 @@ impl Runtime {
             state
         };
         state.execution_backend = execution_backend;
-        Ok(Self {
+        let runtime = Self {
             inner: Arc::new(Mutex::new(state)),
-        })
+        };
+        runtime.restore_persisted_worker_executions()?;
+        Ok(runtime)
     }
 
     /// Runtime id half of public Worker authority.
@@ -639,7 +643,9 @@ impl Runtime {
         let result = match operation {
             WorkerExecutionOperation::Stop => backend.stop_worker(&handle),
             WorkerExecutionOperation::Cancel => backend.cancel_worker(&handle),
-            WorkerExecutionOperation::Spawn | WorkerExecutionOperation::Input => return Ok(()),
+            WorkerExecutionOperation::Spawn
+            | WorkerExecutionOperation::Restore
+            | WorkerExecutionOperation::Input => return Ok(()),
         };
         if result.is_accepted() {
             self.record_execution_result(worker_ref, result)?;
@@ -979,6 +985,136 @@ impl Runtime {
     #[cfg(not(feature = "ws-server"))]
     fn execution_context(&self, worker_ref: WorkerRef) -> crate::execution::WorkerExecutionContext {
         crate::execution::WorkerExecutionContext::new(worker_ref)
+    }
+
+    #[cfg(feature = "fs-store")]
+    fn restore_persisted_worker_executions(&self) -> Result<(), RuntimeError> {
+        #[derive(Clone)]
+        struct RestoreCandidate {
+            worker_ref: WorkerRef,
+            request: CreateWorkerRequest,
+            previous_execution: WorkerExecutionStatus,
+        }
+
+        let candidates = {
+            let mut state = self.lock()?;
+            let Some(backend) = state.execution_backend.clone() else {
+                return Ok(());
+            };
+            let backend_id = backend.backend_id().to_string();
+            let mut candidates = Vec::new();
+            let worker_ids: Vec<_> = state.workers.keys().cloned().collect();
+            for worker_id in worker_ids {
+                let Some(worker) = state.workers.get(&worker_id) else {
+                    continue;
+                };
+                if !worker.status.is_active()
+                    || worker.execution_handle.is_some()
+                    || worker.execution.backend != WorkerExecutionBackendKind::Stale
+                    || worker
+                        .execution
+                        .binding
+                        .as_ref()
+                        .is_none_or(|binding| binding.backend_id != backend_id)
+                {
+                    continue;
+                }
+                if let Some(working_directory) = worker.execution.working_directory.as_ref() {
+                    if let Some(owner) = state.active_primary_worker_id_for_workdir_excluding(
+                        &working_directory.summary.working_directory_id,
+                        &worker.worker_id,
+                    ) {
+                        let worker_ref = worker.worker_ref.clone();
+                        let message = format!(
+                            "worker {} cannot restore working directory {} because active worker {} is already the primary assignment",
+                            worker.worker_id, working_directory.summary.working_directory_id, owner
+                        );
+                        state.record_restore_failure(
+                            &worker_ref,
+                            WorkerExecutionResult::rejected(
+                                WorkerExecutionOperation::Restore,
+                                message,
+                            ),
+                        )?;
+                        continue;
+                    }
+                }
+                candidates.push(RestoreCandidate {
+                    worker_ref: worker.worker_ref.clone(),
+                    request: worker.request.clone(),
+                    previous_execution: worker.execution.clone(),
+                });
+            }
+            candidates
+        };
+
+        for candidate in candidates {
+            let backend = {
+                let state = self.lock()?;
+                state.execution_backend.clone()
+            };
+            let Some(backend) = backend else {
+                return Ok(());
+            };
+            let request = WorkerExecutionRestoreRequest {
+                worker_ref: candidate.worker_ref.clone(),
+                request: candidate.request,
+                context: self.execution_context(candidate.worker_ref.clone()),
+                previous_execution: candidate.previous_execution,
+                working_directory: None,
+                config_bundle: None,
+            };
+            match backend.restore_worker(request) {
+                WorkerExecutionSpawnResult::Connected {
+                    handle,
+                    run_state,
+                    working_directory,
+                } => self.commit_restored_worker_execution(
+                    &candidate.worker_ref,
+                    handle,
+                    run_state,
+                    working_directory,
+                )?,
+                WorkerExecutionSpawnResult::Rejected(result)
+                | WorkerExecutionSpawnResult::Errored(result) => {
+                    let mut state = self.lock()?;
+                    state.record_restore_failure(&candidate.worker_ref, result)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "fs-store")]
+    fn commit_restored_worker_execution(
+        &self,
+        worker_ref: &WorkerRef,
+        handle: WorkerExecutionHandle,
+        run_state: WorkerExecutionRunState,
+        working_directory: Option<CatalogWorkingDirectoryStatus>,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.lock()?;
+        state.ensure_worker_ref(worker_ref)?;
+        let event_id = state.push_event(
+            Some(worker_ref.clone()),
+            RuntimeEventKind::WorkerExecutionRestored,
+            format!("worker {} execution restored", worker_ref.worker_id),
+        );
+        {
+            let worker = state.worker_mut(worker_ref)?;
+            worker.execution_handle = Some(handle.clone());
+            let mut execution = WorkerExecutionStatus::connected(run_state)
+                .with_binding(WorkerExecutionBindingIdentity::from_handle(&handle));
+            if let Some(status) = working_directory {
+                execution = execution.with_working_directory(status);
+            }
+            worker.execution = execution;
+            worker.last_event_id = event_id;
+        }
+        state.persist_runtime_snapshot()?;
+        state.persist_worker(&worker_ref.worker_id)?;
+        state.persist_event_by_id(event_id)?;
+        Ok(())
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, RuntimeState>, RuntimeError> {
@@ -1394,6 +1530,62 @@ impl RuntimeState {
         })
     }
 
+    #[cfg(feature = "fs-store")]
+    fn active_primary_worker_id_for_workdir_excluding(
+        &self,
+        working_directory_id: &str,
+        excluded_worker_id: &WorkerId,
+    ) -> Option<WorkerId> {
+        self.workers.values().find_map(|worker| {
+            if worker.worker_id == *excluded_worker_id || !worker.status.is_active() {
+                return None;
+            }
+            if worker
+                .execution
+                .working_directory
+                .as_ref()
+                .is_some_and(|binding| binding.summary.working_directory_id == working_directory_id)
+                || requested_primary_workdir_id(&worker.request) == Some(working_directory_id)
+            {
+                Some(worker.worker_id)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[cfg(feature = "fs-store")]
+    fn record_restore_failure(
+        &mut self,
+        worker_ref: &WorkerRef,
+        result: WorkerExecutionResult,
+    ) -> Result<(), RuntimeError> {
+        let message = result
+            .message
+            .clone()
+            .unwrap_or_else(|| "worker execution restore failed".to_string());
+        let diagnostic_id = self.next_diagnostic_id;
+        self.next_diagnostic_id += 1;
+        self.diagnostics.push(RuntimeDiagnostic {
+            id: diagnostic_id,
+            severity: DiagnosticSeverity::Warning,
+            code: "worker_execution_restore_failed".to_string(),
+            message: format!(
+                "worker {} execution restore failed: {message}",
+                worker_ref.worker_id
+            ),
+            worker_ref: Some(worker_ref.clone()),
+        });
+        let worker = self.worker_mut(worker_ref)?;
+        worker.execution_handle = None;
+        let mut execution = WorkerExecutionStatus::stale(worker.execution.clone());
+        execution.last_result = Some(result);
+        worker.execution = execution;
+        self.persist_runtime_snapshot()?;
+        self.persist_worker(&worker_ref.worker_id)?;
+        Ok(())
+    }
+
     fn push_event(
         &mut self,
         worker_ref: Option<WorkerRef>,
@@ -1646,7 +1838,7 @@ mod tests {
     };
     use crate::execution::{
         WorkerExecutionBackend, WorkerExecutionContext, WorkerExecutionHandle,
-        WorkerExecutionRunState,
+        WorkerExecutionRestoreRequest, WorkerExecutionRunState,
     };
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
@@ -1714,6 +1906,8 @@ mod tests {
     #[derive(Default)]
     struct TestExecutionBackend {
         dispatch_result: Mutex<Option<WorkerExecutionResult>>,
+        restore_result: Mutex<Option<WorkerExecutionSpawnResult>>,
+        restore_count: Mutex<u64>,
         contexts: Mutex<BTreeMap<WorkerId, WorkerExecutionContext>>,
     }
 
@@ -1740,6 +1934,28 @@ mod tests {
         }
 
         fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult {
+            self.contexts
+                .lock()
+                .unwrap()
+                .insert(request.worker_ref.worker_id.clone(), request.context);
+            WorkerExecutionSpawnResult::Connected {
+                handle: WorkerExecutionHandle::new(request.worker_ref, self.backend_id()),
+                run_state: WorkerExecutionRunState::Idle,
+                working_directory: request
+                    .working_directory
+                    .as_ref()
+                    .map(|binding| binding.status()),
+            }
+        }
+
+        fn restore_worker(
+            &self,
+            request: WorkerExecutionRestoreRequest,
+        ) -> WorkerExecutionSpawnResult {
+            *self.restore_count.lock().unwrap() += 1;
+            if let Some(result) = self.restore_result.lock().unwrap().clone() {
+                return result;
+            }
             self.contexts
                 .lock()
                 .unwrap()
@@ -2382,6 +2598,134 @@ mod tests {
             assert_eq!(observations.len(), 3);
             assert_eq!(observations[2].cursor, observation.cursor);
         }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn fs_store_restores_active_worker_execution_handles() {
+        let root = fs_store_root("execution-restore");
+        let runtime_id = RuntimeId::new("runtime-execution-restore").unwrap();
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            crate::fs_store::FsRuntimeStoreOptions {
+                root: root.clone(),
+                runtime_id: Some(runtime_id.clone()),
+                display_name: None,
+                limits: RuntimeLimits::default(),
+            },
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("restore active worker"))
+            .unwrap();
+        drop(runtime);
+
+        let restoring_backend = Arc::new(TestExecutionBackend::default());
+        let restored = Runtime::with_fs_store_and_execution_backend(
+            crate::fs_store::FsRuntimeStoreOptions {
+                root: root.clone(),
+                runtime_id: Some(runtime_id),
+                display_name: None,
+                limits: RuntimeLimits::default(),
+            },
+            restoring_backend.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(*restoring_backend.restore_count.lock().unwrap(), 1);
+        let restored_worker = restored.worker_detail(&worker.worker_ref).unwrap();
+        assert_eq!(restored_worker.status, WorkerStatus::Running);
+        assert_eq!(
+            restored_worker.execution.backend,
+            WorkerExecutionBackendKind::Connected
+        );
+        assert!(restored_worker.execution.binding.is_some());
+        restored
+            .send_input(&worker.worker_ref, WorkerInput::user("after restart"))
+            .unwrap();
+        let cursor = restored.event_cursor_from_start().unwrap();
+        assert!(
+            restored
+                .read_events(&cursor, 16)
+                .unwrap()
+                .events
+                .iter()
+                .any(
+                    |event| event.kind == RuntimeEventKind::WorkerExecutionRestored
+                        && event.worker_ref.as_ref() == Some(&worker.worker_ref)
+                )
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn fs_store_keeps_worker_stale_when_execution_restore_fails() {
+        let root = fs_store_root("execution-restore-failed");
+        let runtime_id = RuntimeId::new("runtime-execution-restore-failed").unwrap();
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            crate::fs_store::FsRuntimeStoreOptions {
+                root: root.clone(),
+                runtime_id: Some(runtime_id.clone()),
+                display_name: None,
+                limits: RuntimeLimits::default(),
+            },
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("restore failure"))
+            .unwrap();
+        drop(runtime);
+
+        let restoring_backend = Arc::new(TestExecutionBackend::default());
+        *restoring_backend.restore_result.lock().unwrap() =
+            Some(WorkerExecutionSpawnResult::Errored(
+                WorkerExecutionResult::errored(WorkerExecutionOperation::Restore, "restore boom"),
+            ));
+        let restored = Runtime::with_fs_store_and_execution_backend(
+            crate::fs_store::FsRuntimeStoreOptions {
+                root: root.clone(),
+                runtime_id: Some(runtime_id),
+                display_name: None,
+                limits: RuntimeLimits::default(),
+            },
+            restoring_backend.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(*restoring_backend.restore_count.lock().unwrap(), 1);
+        let restored_worker = restored.worker_detail(&worker.worker_ref).unwrap();
+        assert_eq!(restored_worker.status, WorkerStatus::Running);
+        assert_eq!(
+            restored_worker.execution.backend,
+            WorkerExecutionBackendKind::Stale
+        );
+        assert!(
+            restored
+                .diagnostics()
+                .unwrap()
+                .iter()
+                .any(
+                    |diagnostic| diagnostic.code == "worker_execution_restore_failed"
+                        && diagnostic.worker_ref.as_ref() == Some(&worker.worker_ref)
+                )
+        );
+        let err = restored
+            .send_input(
+                &worker.worker_ref,
+                WorkerInput::user("after failed restore"),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeError::WorkerExecutionUnavailable { .. }
+        ));
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -61,6 +61,7 @@ pub enum WorkerExecutionRunState {
 #[serde(rename_all = "snake_case")]
 pub enum WorkerExecutionOperation {
     Spawn,
+    Restore,
     Input,
     Stop,
     Cancel,
@@ -291,6 +292,20 @@ pub struct WorkerExecutionSpawnRequest {
     pub config_bundle: Option<ConfigBundle>,
 }
 
+/// Restore request passed to an execution backend for a persisted Runtime Worker.
+///
+/// The persisted execution status is a restore hint, not a live handle. Backends
+/// must create a fresh controller/handle before returning `Connected`.
+#[derive(Clone, Debug)]
+pub struct WorkerExecutionRestoreRequest {
+    pub worker_ref: WorkerRef,
+    pub request: CreateWorkerRequest,
+    pub context: WorkerExecutionContext,
+    pub previous_execution: WorkerExecutionStatus,
+    pub working_directory: Option<WorkingDirectoryBinding>,
+    pub config_bundle: Option<ConfigBundle>,
+}
+
 /// Result of backend Worker spawn/initialization.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkerExecutionSpawnResult {
@@ -312,6 +327,16 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
     fn backend_id(&self) -> &str;
 
     fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult;
+
+    fn restore_worker(
+        &self,
+        _request: WorkerExecutionRestoreRequest,
+    ) -> WorkerExecutionSpawnResult {
+        WorkerExecutionSpawnResult::Rejected(WorkerExecutionResult::unsupported(
+            WorkerExecutionOperation::Restore,
+            "execution backend does not support restoring workers",
+        ))
+    }
 
     fn create_working_directory(
         &self,
@@ -392,6 +417,19 @@ impl WorkerExecutionBackendRef {
         request: WorkerExecutionSpawnRequest,
     ) -> WorkerExecutionSpawnResult {
         self.backend.spawn_worker(request)
+    }
+
+    #[cfg(feature = "fs-store")]
+    pub(crate) fn backend_id(&self) -> &str {
+        &self.id
+    }
+
+    #[cfg(feature = "fs-store")]
+    pub(crate) fn restore_worker(
+        &self,
+        request: WorkerExecutionRestoreRequest,
+    ) -> WorkerExecutionSpawnResult {
+        self.backend.restore_worker(request)
     }
 
     pub(crate) fn create_working_directory(

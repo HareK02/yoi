@@ -1,8 +1,8 @@
 ---
 title: 'Runtime restart-crossing Worker restore path'
-state: 'inprogress'
+state: 'done'
 created_at: '2026-07-12T13:21:38Z'
-updated_at: '2026-07-12T14:16:14Z'
+updated_at: '2026-07-12T14:38:56Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-12T14:16:14Z'
