@@ -1,6 +1,9 @@
 import type { Worker } from "./types";
 
+export function canShowWorkerInSidebar(worker: Worker): boolean {
+  return worker.implementation.kind !== "backend_worker_registry";
+}
+
 export function canOpenWorkerConsole(worker: Worker): boolean {
-  return worker.state !== "archived" &&
-    worker.implementation.kind !== "backend_worker_registry";
+  return canShowWorkerInSidebar(worker);
 }

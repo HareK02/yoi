@@ -31,10 +31,10 @@ use worker_runtime::execution::{
 use worker_runtime::fs_store::FsRuntimeStoreOptions;
 use worker_runtime::http_server::{
     RuntimeHttpConfigBundleAvailabilityResponse, RuntimeHttpConfigBundleSyncRequest,
-    RuntimeHttpErrorResponse, RuntimeHttpSummaryResponse, RuntimeHttpWorkerInputResponse,
-    RuntimeHttpWorkerLifecycleRequest, RuntimeHttpWorkerLifecycleResponse,
-    RuntimeHttpWorkerResponse, RuntimeHttpWorkersResponse, RuntimeHttpWorkingDirectoriesResponse,
-    RuntimeHttpWorkingDirectoryResponse,
+    RuntimeHttpErrorResponse, RuntimeHttpSummaryResponse, RuntimeHttpWorkerDeleteResponse,
+    RuntimeHttpWorkerInputResponse, RuntimeHttpWorkerLifecycleRequest,
+    RuntimeHttpWorkerLifecycleResponse, RuntimeHttpWorkerResponse, RuntimeHttpWorkersResponse,
+    RuntimeHttpWorkingDirectoriesResponse, RuntimeHttpWorkingDirectoryResponse,
 };
 use worker_runtime::identity::{
     RuntimeId as EmbeddedRuntimeId, WorkerId as EmbeddedWorkerId, WorkerRef as EmbeddedWorkerRef,
@@ -443,6 +443,15 @@ pub enum WorkerInputKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerDeleteResult {
+    pub state: WorkerOperationState,
+    pub runtime_id: String,
+    pub worker_id: String,
+    pub deleted: bool,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerInputRequest {
     #[serde(default = "default_worker_input_kind")]
     pub kind: WorkerInputKind,
@@ -666,6 +675,20 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
                 format!(
                     "worker cancel for '{worker_id}' is reserved for the runtime service boundary and is not implemented by this registry surface"
                 ),
+            )],
+        }
+    }
+
+    fn delete_worker(&self, worker_id: &str) -> WorkerDeleteResult {
+        WorkerDeleteResult {
+            state: WorkerOperationState::Unsupported,
+            runtime_id: self.runtime_id().to_string(),
+            worker_id: worker_id.to_string(),
+            deleted: false,
+            diagnostics: vec![diagnostic(
+                "worker_delete_unsupported",
+                DiagnosticSeverity::Info,
+                format!("runtime does not implement worker deletion for '{worker_id}'"),
             )],
         }
     }
@@ -1039,6 +1062,25 @@ impl RuntimeRegistry {
             ));
         }
         Ok(runtime.cancel_worker(worker_id, request))
+    }
+
+    pub fn delete_worker(
+        &self,
+        runtime_id: &str,
+        worker_id: &str,
+    ) -> Result<WorkerDeleteResult, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        validate_backend_identifier("worker_id", worker_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        let lookup = runtime.worker(worker_id);
+        if lookup.worker.is_none() {
+            return Err(operation_failed_or_unknown_worker(
+                runtime_id,
+                worker_id,
+                lookup.diagnostics,
+            ));
+        }
+        Ok(runtime.delete_worker(worker_id))
     }
 
     pub fn observation_source(
@@ -1655,6 +1697,38 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 worker_id,
                 embedded_runtime_diagnostic(&error),
             ),
+        }
+    }
+
+    fn delete_worker(&self, worker_id: &str) -> WorkerDeleteResult {
+        let Some(worker_ref) = self.worker_ref(worker_id) else {
+            return WorkerDeleteResult {
+                state: WorkerOperationState::Rejected,
+                runtime_id: self.runtime_id.clone(),
+                worker_id: worker_id.to_string(),
+                deleted: false,
+                diagnostics: vec![diagnostic(
+                    "embedded_worker_id_invalid",
+                    DiagnosticSeverity::Warning,
+                    "Worker id was empty and cannot be resolved".to_string(),
+                )],
+            };
+        };
+        match self.runtime.delete_worker(&worker_ref) {
+            Ok(result) => WorkerDeleteResult {
+                state: WorkerOperationState::Accepted,
+                runtime_id: result.runtime_id.to_string(),
+                worker_id: result.worker_id.to_string(),
+                deleted: result.deleted,
+                diagnostics: Vec::new(),
+            },
+            Err(error) => WorkerDeleteResult {
+                state: WorkerOperationState::Rejected,
+                runtime_id: self.runtime_id.clone(),
+                worker_id: worker_id.to_string(),
+                deleted: false,
+                diagnostics: vec![embedded_runtime_diagnostic(&error)],
+            },
         }
     }
 
@@ -2312,6 +2386,27 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         ) {
             Ok(response) => self.lifecycle_result_from_response(worker_id, response),
             Err(diagnostic) => remote_lifecycle_rejected(&self.runtime_id, worker_id, diagnostic),
+        }
+    }
+
+    fn delete_worker(&self, worker_id: &str) -> WorkerDeleteResult {
+        match self
+            .delete_json::<RuntimeHttpWorkerDeleteResponse>(&format!("/v1/workers/{worker_id}"))
+        {
+            Ok(response) => WorkerDeleteResult {
+                state: WorkerOperationState::Accepted,
+                runtime_id: response.worker.runtime_id.to_string(),
+                worker_id: response.worker.worker_id.to_string(),
+                deleted: response.worker.deleted,
+                diagnostics: Vec::new(),
+            },
+            Err(diagnostic) => WorkerDeleteResult {
+                state: WorkerOperationState::Rejected,
+                runtime_id: self.runtime_id.clone(),
+                worker_id: worker_id.to_string(),
+                deleted: false,
+                diagnostics: vec![diagnostic],
+            },
         }
     }
 

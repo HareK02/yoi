@@ -42,6 +42,7 @@ pub enum RuntimeEventKind {
     WorkerInputAccepted,
     WorkerStopped,
     WorkerCancelled,
+    WorkerDeleted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

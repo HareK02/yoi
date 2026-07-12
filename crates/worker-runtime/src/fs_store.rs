@@ -192,6 +192,18 @@ impl FsRuntimeStore {
         Ok(())
     }
 
+    pub(crate) fn delete_worker_snapshot(&self, worker_id: &WorkerId) -> Result<(), RuntimeError> {
+        let worker_dir = self.worker_dir(worker_id);
+        if !worker_dir.exists() {
+            return Ok(());
+        }
+        fs::remove_dir_all(&worker_dir).map_err(|source| RuntimeError::StoreIo {
+            operation: "delete worker store",
+            path: worker_dir,
+            source,
+        })
+    }
+
     pub(crate) fn append_event(&self, event: &RuntimeEvent) -> Result<(), RuntimeError> {
         if let Some(worker_ref) = &event.worker_ref {
             self.ensure_worker_ref(worker_ref)?;

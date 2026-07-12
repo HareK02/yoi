@@ -1,4 +1,4 @@
-use crate::identity::RuntimeId;
+use crate::identity::{RuntimeId, WorkerId};
 use serde::{Deserialize, Serialize};
 
 /// Runtime backend kind.
@@ -52,6 +52,13 @@ impl Default for RuntimeOptions {
 
 fn unknown_platform_component() -> String {
     "unknown".to_string()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerDeleteResult {
+    pub runtime_id: RuntimeId,
+    pub worker_id: WorkerId,
+    pub deleted: bool,
 }
 
 /// Management-plane summary for a Runtime.

@@ -15,7 +15,7 @@ use crate::config_bundle::{ConfigBundle, ConfigBundleAvailability, ConfigBundleS
 use crate::error::RuntimeError;
 use crate::identity::{RuntimeId, WorkerId, WorkerRef};
 use crate::interaction::{WorkerInput, WorkerInteractionAck};
-use crate::management::{RuntimeLimits, RuntimeSummary};
+use crate::management::{RuntimeLimits, RuntimeSummary, WorkerDeleteResult};
 #[cfg(feature = "ws-server")]
 use crate::observation::WorkerObservationCursor;
 use axum::body::{Body, Bytes};
@@ -147,7 +147,10 @@ pub fn runtime_http_router(runtime: Runtime, local_token: Option<String>) -> Rou
             get(get_working_directory).delete(cleanup_working_directory),
         )
         .route("/v1/workers", get(list_workers).post(create_worker))
-        .route("/v1/workers/{worker_id}", get(get_worker))
+        .route(
+            "/v1/workers/{worker_id}",
+            get(get_worker).delete(delete_worker),
+        )
         .route("/v1/workers/{worker_id}/input", post(send_worker_input))
         .route("/v1/workers/{worker_id}/stop", post(stop_worker))
         .route("/v1/workers/{worker_id}/cancel", post(cancel_worker));
@@ -217,6 +220,12 @@ pub struct RuntimeHttpWorkingDirectoryResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeHttpWorkerResponse {
     pub worker: WorkerDetail,
+}
+
+/// Worker delete response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeHttpWorkerDeleteResponse {
+    pub worker: WorkerDeleteResult,
 }
 
 /// Worker input acknowledgement response.
@@ -459,6 +468,18 @@ async fn get_worker(
         .worker_detail(&worker_ref)
         .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkerResponse { worker }))
+}
+
+async fn delete_worker(
+    State(state): State<RuntimeHttpState>,
+    Path(worker_id): Path<String>,
+) -> RestResult<RuntimeHttpWorkerDeleteResponse> {
+    let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
+    let worker = state
+        .runtime
+        .delete_worker(&worker_ref)
+        .map_err(RuntimeHttpRestError::runtime)?;
+    Ok(Json(RuntimeHttpWorkerDeleteResponse { worker }))
 }
 
 async fn create_worker(

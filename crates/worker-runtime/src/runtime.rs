@@ -25,6 +25,7 @@ use crate::identity::{RuntimeId, WorkerId, WorkerRef};
 use crate::interaction::{WorkerInput, WorkerInputKind, WorkerInteractionAck};
 use crate::management::{
     RuntimeBackendKind, RuntimeLimits, RuntimeOptions, RuntimeStatus, RuntimeSummary,
+    WorkerDeleteResult,
 };
 use crate::observation::{
     EventCursor, EventSubscription, EventSubscriptionMode, RuntimeEvent, RuntimeEventBatch,
@@ -648,6 +649,46 @@ impl Runtime {
         )
     }
 
+    /// Delete a non-running Worker from Runtime state and persisted Worker storage.
+    pub fn delete_worker(
+        &self,
+        worker_ref: &WorkerRef,
+    ) -> Result<WorkerDeleteResult, RuntimeError> {
+        let mut state = self.lock()?;
+        state.ensure_running()?;
+        state.ensure_worker_ref(worker_ref)?;
+        let worker = state.worker(worker_ref)?;
+        if worker.status.is_active() {
+            return Err(RuntimeError::InvalidRequest(format!(
+                "worker {} is running and must be stopped before deletion",
+                worker_ref.worker_id
+            )));
+        }
+        let removed = state.workers.remove(&worker_ref.worker_id).ok_or_else(|| {
+            RuntimeError::WorkerNotFound {
+                runtime_id: state.runtime_id.clone(),
+                worker_id: worker_ref.worker_id,
+            }
+        })?;
+        #[cfg(feature = "ws-server")]
+        state
+            .observation_events
+            .retain(|event| event.worker_ref != *worker_ref);
+        let event_id = state.push_event(
+            Some(worker_ref.clone()),
+            RuntimeEventKind::WorkerDeleted,
+            "worker deleted",
+        );
+        state.persist_runtime_snapshot()?;
+        state.delete_worker_snapshot(&worker_ref.worker_id)?;
+        state.persist_event_by_id(event_id)?;
+        Ok(WorkerDeleteResult {
+            runtime_id: removed.worker_ref.runtime_id,
+            worker_id: removed.worker_id,
+            deleted: true,
+        })
+    }
+
     /// Cursor pointing to the beginning of Runtime events.
     pub fn event_cursor_from_start(&self) -> Result<EventCursor, RuntimeError> {
         let state = self.lock()?;
@@ -1146,6 +1187,14 @@ impl RuntimeState {
     }
 
     #[cfg(feature = "fs-store")]
+    fn delete_worker_snapshot(&self, worker_id: &WorkerId) -> Result<(), RuntimeError> {
+        if let Some(store) = self.fs_store() {
+            store.delete_worker_snapshot(worker_id)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "fs-store")]
     fn persist_event_by_id(&self, event_id: u64) -> Result<(), RuntimeError> {
         if let Some(store) = self.fs_store() {
             let event = self
@@ -1198,6 +1247,11 @@ impl RuntimeState {
 
     #[cfg(not(feature = "fs-store"))]
     fn persist_worker(&self, _worker_id: &WorkerId) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    #[cfg(not(feature = "fs-store"))]
+    fn delete_worker_snapshot(&self, _worker_id: &WorkerId) -> Result<(), RuntimeError> {
         Ok(())
     }
 
@@ -1995,6 +2049,26 @@ mod tests {
         assert_eq!(summary.active_worker_count, 0);
         assert_eq!(summary.stopped_worker_count, 1);
         assert_eq!(summary.cancelled_worker_count, 1);
+    }
+
+    #[test]
+    fn delete_worker_removes_stopped_worker_from_runtime() {
+        let runtime = runtime_with_backend();
+        let worker = runtime.create_worker(task_request("delete me")).unwrap();
+        assert!(runtime.delete_worker(&worker.worker_ref).is_err());
+        runtime
+            .stop_worker(&worker.worker_ref, Some("done".to_string()))
+            .unwrap();
+
+        let result = runtime.delete_worker(&worker.worker_ref).unwrap();
+        assert!(result.deleted);
+        assert_eq!(result.worker_id, worker.worker_id);
+        assert!(matches!(
+            runtime.worker_detail(&worker.worker_ref),
+            Err(RuntimeError::WorkerNotFound { .. })
+        ));
+        let summary = runtime.summary().unwrap();
+        assert_eq!(summary.worker_count, 0);
     }
 
     #[test]

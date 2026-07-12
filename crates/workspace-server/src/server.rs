@@ -27,7 +27,7 @@ use crate::config::{RemoteRuntimeConfigFile, WorkspaceBackendConfigFile, resolve
 use crate::hosts::{
     ConfigBundleCheckResult, ConfigBundleSyncResult, DiagnosticSeverity, EmbeddedWorkerRuntime,
     HostSummary, RemoteRuntimeConfig, RemoteWorkerRuntime, RuntimeDiagnostic, RuntimeRegistry,
-    RuntimeRegistryUnregisterResult, RuntimeSummary, WorkerCapabilitySummary,
+    RuntimeRegistryError, RuntimeRegistryUnregisterResult, RuntimeSummary, WorkerCapabilitySummary,
     WorkerImplementationSummary, WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest,
     WorkerLifecycleResult, WorkerOperationState, WorkerSpawnAcceptanceRequirement,
     WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest,
@@ -1662,10 +1662,9 @@ fn build_runtime_cleanup_plan(
             runtime_worker_id: record.runtime_worker_id.to_string(),
             runtime_id: record.runtime_id.clone(),
             reason: if blocking_reason.is_some() {
-                "Worker registry row cannot be deleted until blocking conditions are cleared"
-                    .to_string()
+                "Worker cannot be deleted until blocking conditions are cleared".to_string()
             } else {
-                "Stopped or unobserved Worker registry row can be manually deleted".to_string()
+                "Stopped or missing Worker can be manually deleted".to_string()
             },
             blocking_reason,
             pinned,
@@ -1840,6 +1839,7 @@ fn execute_runtime_cleanup(
             ));
         }
         let runtime_worker_id = parse_runtime_worker_id_for_registry(&candidate.runtime_worker_id)?;
+        cleanup_runtime_worker_for_execution(api, runtime_id, candidate)?;
         api.store.delete_worker_registry(
             &api.config.workspace_id,
             candidate.runtime_id.as_str(),
@@ -1849,8 +1849,7 @@ fn execute_runtime_cleanup(
             target_id: candidate.target_id.clone(),
             action: candidate.action.clone(),
             status: "deleted".to_string(),
-            message: "Worker registry row deleted; Runtime process state was not touched"
-                .to_string(),
+            message: "Worker deleted from Runtime and Backend registry".to_string(),
         });
     }
 
@@ -1926,6 +1925,29 @@ fn execute_runtime_cleanup(
         diagnostics: plan_after.diagnostics.clone(),
         plan_after,
     })
+}
+
+fn cleanup_runtime_worker_for_execution(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    candidate: &CleanupWorkerCandidate,
+) -> ApiResult<()> {
+    match api
+        .runtime
+        .delete_worker(runtime_id, candidate.runtime_worker_id.as_str())
+    {
+        Ok(result) if result.deleted && result.state == WorkerOperationState::Accepted => Ok(()),
+        Ok(result) => Err(ApiError::with_diagnostics(
+            Error::RuntimeOperationFailed {
+                runtime_id: runtime_id.to_string(),
+                code: "workspace_cleanup_worker_runtime_delete_rejected".to_string(),
+                message: "Runtime did not delete selected Worker".to_string(),
+            },
+            result.diagnostics,
+        )),
+        Err(RuntimeRegistryError::UnknownWorker { .. }) => Ok(()),
+        Err(error) => Err(error.into_error().into()),
+    }
 }
 
 fn cleanup_runtime_workdir_for_execution(
@@ -3183,6 +3205,7 @@ fn workers_response(api: WorkspaceApi) -> ApiResult<RuntimeListResponse<WorkerSu
             );
         }
     }
+    let mut diagnostics = runtime_workers.diagnostics;
     let worker_records = api
         .store
         .list_worker_registry(&api.config.workspace_id, limit)?;
@@ -3191,13 +3214,38 @@ fn workers_response(api: WorkspaceApi) -> ApiResult<RuntimeListResponse<WorkerSu
         .list_workdir_registry(&api.config.workspace_id, 500)?;
     let mut items = Vec::new();
     for record in worker_records {
+        if !observed.contains_key(&(record.runtime_id.clone(), record.runtime_worker_id)) {
+            match api.runtime.worker(
+                record.runtime_id.as_str(),
+                &record.runtime_worker_id.to_string(),
+            ) {
+                Ok(worker) => {
+                    let _ = sync_worker_observation(&api, &worker);
+                    observed.insert(
+                        (worker.runtime_id.clone(), record.runtime_worker_id),
+                        worker,
+                    );
+                }
+                Err(RuntimeRegistryError::UnknownWorker { .. }) => {}
+                Err(error) => diagnostics.push(RuntimeDiagnostic {
+                    code: "worker_detail_probe_failed".to_string(),
+                    severity: DiagnosticSeverity::Info,
+                    message: format!(
+                        "Could not verify Worker {} on Runtime {}: {}",
+                        record.runtime_worker_id,
+                        record.runtime_id,
+                        sanitize_backend_error(&error.into_error().to_string())
+                    ),
+                }),
+            }
+        }
         let links = api.store.list_worker_workdir_links(
             &api.config.workspace_id,
             record.runtime_id.as_str(),
             record.runtime_worker_id,
         )?;
         items.push(merge_worker_registry_projection(
-            observed.get(&(record.runtime_id.clone(), record.runtime_worker_id.clone())),
+            observed.get(&(record.runtime_id.clone(), record.runtime_worker_id)),
             &record,
             links,
             &workdir_records,
@@ -3208,7 +3256,7 @@ fn workers_response(api: WorkspaceApi) -> ApiResult<RuntimeListResponse<WorkerSu
         limit,
         items,
         source: "backend_worker_registry".to_string(),
-        diagnostics: runtime_workers.diagnostics,
+        diagnostics,
     })
 }
 
@@ -4016,7 +4064,7 @@ fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> WorkerSummary 
         host_id: "backend-registry".to_string(),
         role: None,
         label: record.display_name.clone(),
-        state: "archived".to_string(),
+        state: "missing".to_string(),
         last_seen_at: Some(record.updated_at.clone()),
         pinned: record.retention_state == "pinned",
         retention_state: record.retention_state.clone(),
@@ -4032,14 +4080,14 @@ fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> WorkerSummary 
         profile: record.profile.clone(),
         implementation: WorkerImplementationSummary {
             kind: "backend_worker_registry".to_string(),
-            display_hint: "Archived Worker".to_string(),
+            display_hint: "Missing Worker".to_string(),
         },
         working_directory: None,
         diagnostics: vec![RuntimeDiagnostic {
-            code: "backend_worker_registry_only".to_string(),
+            code: "backend_worker_missing".to_string(),
             severity: DiagnosticSeverity::Info,
             message:
-                "Worker is preserved in the Backend registry without a live Runtime observation"
+                "Worker is preserved in the Backend registry but the Runtime did not find it by id"
                     .to_string(),
         }],
     }
@@ -4874,12 +4922,12 @@ mod tests {
     const TEST_CREATED_AT: &str = "2026-06-23T06:43:28Z";
 
     #[test]
-    fn backend_worker_projection_preserves_archive_rows_links_and_redacts_paths() {
+    fn backend_worker_projection_preserves_missing_rows_links_and_redacts_paths() {
         let worker = WorkerRegistryRecord {
             workspace_id: "workspace-1".to_string(),
             runtime_id: "embedded".to_string(),
             runtime_worker_id: 1,
-            display_name: "Archived Worker".to_string(),
+            display_name: "Missing Worker".to_string(),
             profile: Some("builtin:coder".to_string()),
             retention_state: "pinned".to_string(),
             transcript_ref: Some("runtime://embedded/workers/worker-1/transcript".to_string()),
@@ -4914,8 +4962,7 @@ mod tests {
 
         let projected = merge_worker_registry_projection(None, &worker, vec![link], &[workdir]);
 
-        assert_eq!(projected.state, "archived");
-        assert_eq!(projected.state, "archived");
+        assert_eq!(projected.state, "missing");
         assert_eq!(
             projected.working_directory.as_ref().unwrap().status,
             WorkingDirectoryStatusKind::Removed
