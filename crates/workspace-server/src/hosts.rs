@@ -170,7 +170,6 @@ pub struct RuntimeCapabilitySummary {
     pub can_get_worker: bool,
     pub can_spawn_worker: bool,
     pub can_stop_worker: bool,
-    pub can_accept_input: bool,
     pub has_workspace_fs: bool,
     pub has_shell: bool,
     pub has_git: bool,
@@ -223,7 +222,6 @@ pub struct WorkerImplementationSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerCapabilitySummary {
-    pub can_accept_input: bool,
     pub can_stop: bool,
     pub can_spawn_followup: bool,
 }
@@ -1204,14 +1202,6 @@ impl EmbeddedWorkerRuntime {
         ))
     }
 
-    fn can_accept_embedded_input(
-        &self,
-        status: EmbeddedWorkerStatus,
-        execution: &worker_runtime::execution::WorkerExecutionStatus,
-    ) -> bool {
-        runtime_worker_can_accept_input(self.execution_enabled, status, execution)
-    }
-
     fn can_stop_embedded_worker(
         &self,
         status: EmbeddedWorkerStatus,
@@ -1242,8 +1232,6 @@ impl EmbeddedWorkerRuntime {
                 display_hint: "backend-internal worker-runtime Worker".to_string(),
             },
             capabilities: WorkerCapabilitySummary {
-                can_accept_input: self
-                    .can_accept_embedded_input(summary.status, &summary.execution),
                 can_stop: self.can_stop_embedded_worker(summary.status, &summary.execution),
                 can_spawn_followup: false,
             },
@@ -1278,7 +1266,6 @@ impl EmbeddedWorkerRuntime {
                 display_hint: "backend-internal worker-runtime Worker".to_string(),
             },
             capabilities: WorkerCapabilitySummary {
-                can_accept_input: self.can_accept_embedded_input(detail.status, &detail.execution),
                 can_stop: self.can_stop_embedded_worker(detail.status, &detail.execution),
                 can_spawn_followup: false,
             },
@@ -2014,7 +2001,6 @@ impl RemoteWorkerRuntime {
                 display_hint: "Backend-proxied remote worker-runtime Worker".to_string(),
             },
             capabilities: WorkerCapabilitySummary {
-                can_accept_input: runtime_worker_can_accept_input(true, summary.status, &summary.execution),
                 can_stop: runtime_worker_can_stop(true, summary.status, &summary.execution),
                 can_spawn_followup: false,
             },
@@ -2049,7 +2035,6 @@ impl RemoteWorkerRuntime {
                 display_hint: "Backend-proxied remote worker-runtime Worker".to_string(),
             },
             capabilities: WorkerCapabilitySummary {
-                can_accept_input: runtime_worker_can_accept_input(true, detail.status, &detail.execution),
                 can_stop: runtime_worker_can_stop(true, detail.status, &detail.execution),
                 can_spawn_followup: false,
             },
@@ -2459,7 +2444,6 @@ fn embedded_runtime_capabilities(
         can_get_worker: available,
         can_spawn_worker: available,
         can_stop_worker: available && execution_enabled,
-        can_accept_input: available && execution_enabled,
         has_workspace_fs: false,
         has_shell: false,
         has_git: false,
@@ -2506,18 +2490,6 @@ fn embedded_spawn_execution_failure_diagnostic(
             "Embedded Worker execution spawn was {status} during setup; check runtime configuration"
         ),
     ))
-}
-
-fn runtime_worker_can_accept_input(
-    execution_enabled: bool,
-    status: EmbeddedWorkerStatus,
-    execution: &WorkerExecutionStatus,
-) -> bool {
-    execution_enabled
-        && status == EmbeddedWorkerStatus::Running
-        && execution.backend == worker_runtime::execution::WorkerExecutionBackendKind::Connected
-        && execution.run_state == WorkerExecutionRunState::Idle
-        && !execution_last_result_blocks_control(execution)
 }
 
 fn runtime_worker_can_stop(
@@ -2980,7 +2952,6 @@ fn remote_runtime_capabilities(
         can_get_worker: available,
         can_spawn_worker: available && worker_creation_available,
         can_stop_worker: available,
-        can_accept_input: available && worker_creation_available,
         has_workspace_fs: false,
         has_shell: false,
         has_git: false,
@@ -3208,7 +3179,6 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> WorkerSummary {
             display_hint: "unsupported".to_string(),
         },
         capabilities: WorkerCapabilitySummary {
-            can_accept_input: false,
             can_stop: false,
             can_spawn_followup: false,
         },
@@ -3535,7 +3505,6 @@ mod tests {
                         display_hint: "test fixture".to_string(),
                     },
                     capabilities: WorkerCapabilitySummary {
-                        can_accept_input: false,
                         can_stop: false,
                         can_spawn_followup: false,
                     },
@@ -3565,7 +3534,6 @@ mod tests {
                     can_get_worker: true,
                     can_spawn_worker: false,
                     can_stop_worker: false,
-                    can_accept_input: false,
                     has_workspace_fs: false,
                     has_shell: false,
                     has_git: false,
@@ -3749,7 +3717,6 @@ mod tests {
         let spawned = runtime.spawn_worker(embedded_spawn_request());
         assert_eq!(spawned.state, WorkerOperationState::Accepted);
         let worker = spawned.worker.expect("created embedded worker");
-        assert!(worker.capabilities.can_accept_input);
         assert!(worker.capabilities.can_stop);
 
         let input = runtime.send_input(
@@ -3768,7 +3735,6 @@ mod tests {
                 .worker
                 .expect("worker detail");
             if detail.state == "idle" {
-                assert!(detail.capabilities.can_accept_input);
                 break;
             }
             assert!(
@@ -3801,7 +3767,6 @@ mod tests {
         );
         assert_eq!(embedded_summary.source.status, RuntimeSourceStatus::Active);
         assert!(embedded_summary.capabilities.can_spawn_worker);
-        assert!(embedded_summary.capabilities.can_accept_input);
 
         let spawned = registry
             .spawn_worker(
@@ -3837,8 +3802,6 @@ mod tests {
         assert_eq!(worker.workspace.identity, "runtime_registry_worker");
         assert_eq!(worker.implementation.kind, "embedded_worker_runtime");
         assert_eq!(worker.profile.as_deref(), Some("builtin:coder"));
-        assert!(worker.capabilities.can_accept_input);
-
         let input = registry
             .send_input(
                 EMBEDDED_RUNTIME_ID,
@@ -4052,7 +4015,6 @@ mod tests {
             workers.items[0].workspace.identity,
             "runtime_registry_worker"
         );
-        assert!(workers.items[0].capabilities.can_accept_input);
         assert!(workers.items[0].capabilities.can_stop);
 
         let input = registry
@@ -4158,11 +4120,6 @@ mod tests {
         assert_eq!(workers.items.len(), 4);
         for worker in &workers.items {
             assert!(
-                !worker.capabilities.can_accept_input,
-                "{} should not be input-capable",
-                worker.worker_id
-            );
-            assert!(
                 !worker.capabilities.can_stop,
                 "{} should not be stoppable",
                 worker.worker_id
@@ -4174,7 +4131,6 @@ mod tests {
         assert_eq!(workers.items[3].state, "errored");
 
         let stale_detail = registry.worker("remote:primary", "1").unwrap();
-        assert!(!stale_detail.capabilities.can_accept_input);
         assert!(!stale_detail.capabilities.can_stop);
         assert_eq!(stale_detail.state, "stale");
 

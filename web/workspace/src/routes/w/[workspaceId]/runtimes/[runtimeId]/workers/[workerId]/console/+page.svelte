@@ -10,7 +10,8 @@
     ClientWorkerEventWsFrame,
     Diagnostic,
     Worker,
-    WorkerInputResult
+    WorkerInputResult,
+    PodProtocolEvent
   } from '$lib/workspace-sidebar/types';
 
   type Props = {
@@ -32,6 +33,7 @@
   }
 
   let worker = $state<Worker | null>(null);
+  let liveWorkerState = $state<string | null>(null);
   let workerError = $state<string | null>(null);
   let draft = $state('');
   let sending = $state(false);
@@ -59,7 +61,9 @@
   );
   const lines = $derived(projection.lines);
   const diagnostics = $derived(mergeDiagnostics(worker?.diagnostics ?? [], streamDiagnostics));
-  const canSend = $derived(Boolean(worker?.capabilities.can_accept_input) && draft.trim().length > 0 && !sending);
+  const workerState = $derived(liveWorkerState ?? worker?.state ?? 'loading');
+  const inputReady = $derived(workerState === 'idle');
+  const canSend = $derived(inputReady && draft.trim().length > 0 && !sending);
 
   async function getJson<T>(path: string): Promise<T> {
     const response = await fetch(path);
@@ -97,12 +101,15 @@
   async function loadWorker(target: ConsoleTarget) {
     workerError = null;
     try {
-      worker = await getJson<Worker>(
+      const payload = await getJson<Worker>(
         workerApiPath(`/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(target.workerId)}`)
       );
+      worker = payload;
+      liveWorkerState = payload.state;
     } catch (error) {
       workerError = error instanceof Error ? error.message : String(error);
       worker = null;
+      liveWorkerState = null;
     }
   }
 
@@ -132,7 +139,7 @@
   async function sendMessage(event: SubmitEvent) {
     event.preventDefault();
     const content = draft.trim();
-    if (!content || sending || !worker?.capabilities.can_accept_input) {
+    if (!content || sending || !inputReady) {
       return;
     }
 
@@ -145,6 +152,7 @@
       );
       if (result.state === 'accepted') {
         draft = '';
+        liveWorkerState = 'running';
       } else {
         sendError = diagnosticsToText(result.diagnostics) || `Input was ${result.state}.`;
       }
@@ -152,6 +160,18 @@
       sendError = error instanceof Error ? error.message : String(error);
     } finally {
       sending = false;
+    }
+  }
+
+  function workerStateFromProtocolEvent(event: PodProtocolEvent): string | null {
+    switch (event.event) {
+      case 'snapshot':
+      case 'status':
+        return event.data.status;
+      case 'shutdown':
+        return 'shutdown';
+      default:
+        return null;
     }
   }
 
@@ -181,6 +201,10 @@
         if (frame.kind === 'event') {
           if (!rememberObservationEvent(frame.envelope.event_id)) {
             return;
+          }
+          const observedState = workerStateFromProtocolEvent(frame.envelope.payload);
+          if (observedState) {
+            liveWorkerState = observedState;
           }
           observedEvents = [
             ...observedEvents,
@@ -304,6 +328,7 @@
   $effect(() => {
     const target = consoleTarget;
     resetObservedEvents();
+    liveWorkerState = null;
     streamDiagnostics = [];
     advanceReloadToken();
     void loadConsoleData(target);
@@ -324,7 +349,7 @@
       </div>
       <div class="console-header-actions">
         <div class="console-status-pill" class:warn={streamState !== 'open'}>
-          {worker?.state ?? 'loading'} · stream {streamState}
+          {workerState} · stream {streamState}
         </div>
         <button type="button" class="secondary-button" aria-expanded={workerDetailsOpen} onclick={() => workerDetailsOpen = !workerDetailsOpen}>
           Details
@@ -430,7 +455,6 @@
           <details class="metadata-details">
             <summary>Capabilities</summary>
             <ul>
-              <li>input: {worker.capabilities.can_accept_input ? 'available' : 'unsupported'}</li>
               <li>stop: {worker.capabilities.can_stop ? 'available' : 'unsupported'}</li>
               <li>follow-up spawn: {worker.capabilities.can_spawn_followup ? 'available' : 'unsupported'}</li>
             </ul>
@@ -461,7 +485,7 @@
         id="worker-console-message"
         aria-label="Console input"
         bind:value={draft}
-        disabled={!worker?.capabilities.can_accept_input || sending}
+        disabled={!inputReady || sending}
       ></textarea>
       <div class="composer-actions">
         <button type="submit" disabled={!canSend}>{sending ? 'Sending…' : 'Send'}</button>

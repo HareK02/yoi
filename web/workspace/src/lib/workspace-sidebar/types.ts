@@ -35,7 +35,6 @@ export type RuntimeCapabilities = {
   can_get_worker: boolean;
   can_spawn_worker: boolean;
   can_stop_worker: boolean;
-  can_accept_input: boolean;
   has_workspace_fs: boolean;
   has_shell: boolean;
   has_git: boolean;
@@ -70,7 +69,6 @@ export type Host = {
 };
 
 export type WorkerCapabilities = {
-  can_accept_input: boolean;
   can_stop: boolean;
   can_spawn_followup: boolean;
 };

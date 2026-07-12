@@ -29,7 +29,6 @@ function worker(overrides: Partial<Worker>): Worker {
       display_hint: "Runtime Worker",
     },
     capabilities: {
-      can_accept_input: true,
       can_stop: true,
       can_spawn_followup: false,
     },
@@ -47,7 +46,6 @@ Deno.test("registry-only workers are not sidebar targets or console targets", ()
       display_hint: "Missing Worker",
     },
     capabilities: {
-      can_accept_input: false,
       can_stop: false,
       can_spawn_followup: false,
     },

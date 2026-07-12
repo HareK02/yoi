@@ -4098,7 +4098,6 @@ fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> WorkerSummary 
         pinned: record.retention_state == "pinned",
         retention_state: record.retention_state.clone(),
         capabilities: WorkerCapabilitySummary {
-            can_accept_input: false,
             can_stop: false,
             can_spawn_followup: false,
         },
@@ -7142,7 +7141,6 @@ mod tests {
             .worker("embedded-worker-runtime", &worker_id)
             .expect("restored worker");
         assert_eq!(restored_worker.state, "stale");
-        assert!(!restored_worker.capabilities.can_accept_input);
         assert!(!restored_worker.capabilities.can_stop);
         assert!(
             restored_worker
