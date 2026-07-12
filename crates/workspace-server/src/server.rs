@@ -1686,9 +1686,9 @@ fn build_runtime_cleanup_plan(
             .map(|summary| format!("{:?}", summary.status).to_lowercase());
         let file_status = observed_status.unwrap_or_else(|| record.materialization_status.clone());
         let cleanliness = record.cleanliness.clone();
-        let action = if matches!(file_status.as_str(), "removed" | "missing" | "not_found") {
+        let action = if matches!(file_status.as_str(), "missing" | "not_found") {
             CleanupTargetKind::WorkdirRecordDelete
-        } else if cleanliness == "clean" {
+        } else if file_status == "corrupted" || cleanliness == "clean" {
             CleanupTargetKind::WorkdirCleanCleanup
         } else {
             CleanupTargetKind::WorkdirDirtyDiscard
@@ -1708,8 +1708,11 @@ fn build_runtime_cleanup_plan(
             repository_id: record.repository_id.clone(),
             reason: if blocking_reason.is_some() {
                 "Workdir cleanup is blocked until linked Worker state is safe".to_string()
-            } else if matches!(file_status.as_str(), "removed" | "missing" | "not_found") {
-                "Removed or not-found Workdir record can be deleted from the Backend registry"
+            } else if matches!(file_status.as_str(), "missing" | "not_found") {
+                "Not-found Workdir record can be deleted from the Backend registry"
+                    .to_string()
+            } else if file_status == "corrupted" {
+                "Corrupted Workdir can be deleted from Runtime storage and Backend registry"
                     .to_string()
             } else if cleanliness == "dirty" {
                 "Dirty Workdir requires explicit discard confirmation before cleanup".to_string()
@@ -1845,34 +1848,61 @@ fn execute_runtime_cleanup(
                     ));
                 }
                 cleanup_runtime_workdir_for_execution(api, runtime_id, candidate)?;
+                let deleted = api
+                    .store
+                    .delete_workdir_registry(&api.config.workspace_id, candidate.workdir_id.as_str())?;
+                if !deleted {
+                    return Err(cleanup_api_error(
+                        runtime_id,
+                        "workspace_cleanup_workdir_registry_not_found",
+                        "Backend Workdir registry row was not found after Runtime cleanup",
+                    ));
+                }
                 results.push(RuntimeCleanupExecutionResult {
                     target_id: candidate.target_id.clone(),
                     action: candidate.action.clone(),
-                    status: "discarded".to_string(),
+                    status: "deleted".to_string(),
                     message:
-                        "Dirty/unknown Workdir cleanup/discard was executed after explicit confirmation"
+                        "Dirty/unknown Workdir was deleted from Runtime storage and Backend registry after explicit confirmation"
                             .to_string(),
                 });
             }
             CleanupTargetKind::WorkdirCleanCleanup => {
                 cleanup_runtime_workdir_for_execution(api, runtime_id, candidate)?;
-                results.push(RuntimeCleanupExecutionResult {
-                    target_id: candidate.target_id.clone(),
-                    action: candidate.action.clone(),
-                    status: "cleaned".to_string(),
-                    message: "Clean Workdir cleanup was executed".to_string(),
-                });
-            }
-            CleanupTargetKind::WorkdirRecordDelete => {
-                api.store.delete_workdir_registry(
-                    &api.config.workspace_id,
-                    candidate.workdir_id.as_str(),
-                )?;
+                let deleted = api
+                    .store
+                    .delete_workdir_registry(&api.config.workspace_id, candidate.workdir_id.as_str())?;
+                if !deleted {
+                    return Err(cleanup_api_error(
+                        runtime_id,
+                        "workspace_cleanup_workdir_registry_not_found",
+                        "Backend Workdir registry row was not found after Runtime cleanup",
+                    ));
+                }
                 results.push(RuntimeCleanupExecutionResult {
                     target_id: candidate.target_id.clone(),
                     action: candidate.action.clone(),
                     status: "deleted".to_string(),
-                    message: "Removed/missing Workdir registry row deleted".to_string(),
+                    message: "Workdir deleted from Runtime storage and Backend registry".to_string(),
+                });
+            }
+            CleanupTargetKind::WorkdirRecordDelete => {
+                let deleted = api.store.delete_workdir_registry(
+                    &api.config.workspace_id,
+                    candidate.workdir_id.as_str(),
+                )?;
+                if !deleted {
+                    return Err(cleanup_api_error(
+                        runtime_id,
+                        "workspace_cleanup_workdir_registry_not_found",
+                        "Backend Workdir registry row was not found",
+                    ));
+                }
+                results.push(RuntimeCleanupExecutionResult {
+                    target_id: candidate.target_id.clone(),
+                    action: candidate.action.clone(),
+                    status: "deleted".to_string(),
+                    message: "Not-found Workdir registry row deleted".to_string(),
                 });
             }
             CleanupTargetKind::WorkerDelete => {
@@ -1883,6 +1913,15 @@ fn execute_runtime_cleanup(
                 ));
             }
         }
+    }
+
+    let requested_target_count = worker_targets.len() + workdir_targets.len();
+    if requested_target_count > 0 && results.len() != requested_target_count {
+        return Err(cleanup_api_error(
+            runtime_id,
+            "workspace_cleanup_target_not_executed",
+            "one or more selected cleanup targets were not present in the current cleanup plan",
+        ));
     }
 
     let plan_after = build_runtime_cleanup_plan(api, runtime_id)?;
@@ -1929,7 +1968,7 @@ fn cleanup_runtime_workdir_for_execution(
         .runtime
         .cleanup_working_directory(runtime_id, candidate.workdir_id.as_str())
         .map_err(|err| err.into_error())?;
-    let Some(working_directory) = result.working_directory else {
+    if result.working_directory.is_none() {
         return Err(ApiError::with_diagnostics(
             Error::RuntimeOperationFailed {
                 runtime_id: runtime_id.to_string(),
@@ -1939,13 +1978,6 @@ fn cleanup_runtime_workdir_for_execution(
             result.diagnostics,
         ));
     };
-    let record = workdir_record_from_summary(
-        api,
-        runtime_id,
-        &working_directory.summary,
-        "backend_managed",
-    );
-    api.store.upsert_workdir_registry(&record)?;
     Ok(())
 }
 
@@ -4158,6 +4190,13 @@ fn sync_runtime_workdir_observations(
     let mut observed = std::collections::BTreeSet::new();
     for status in &response.items {
         observed.insert(status.summary.working_directory_id.clone());
+        if status.summary.status == WorkingDirectoryStatusKind::NotFound {
+            api.store.delete_workdir_registry(
+                &api.config.workspace_id,
+                &status.summary.working_directory_id,
+            )?;
+            continue;
+        }
         let existing = api.store.get_workdir_registry(
             &api.config.workspace_id,
             &status.summary.working_directory_id,
@@ -4183,15 +4222,22 @@ fn sync_runtime_workdir_observations(
         {
             Ok(result) => {
                 if let Some(status) = result.working_directory {
-                    let management_kind = record.management_kind.clone();
-                    let mut updated = workdir_record_from_summary(
-                        api,
-                        runtime_id,
-                        &status.summary,
-                        management_kind.as_str(),
-                    );
-                    preserve_workdir_identity_for_corrupted_summary(&mut updated, Some(&record));
-                    api.store.upsert_workdir_registry(&updated)?;
+                    if status.summary.status == WorkingDirectoryStatusKind::NotFound {
+                        api.store.delete_workdir_registry(
+                            &api.config.workspace_id,
+                            record.workdir_id.as_str(),
+                        )?;
+                    } else {
+                        let management_kind = record.management_kind.clone();
+                        let mut updated = workdir_record_from_summary(
+                            api,
+                            runtime_id,
+                            &status.summary,
+                            management_kind.as_str(),
+                        );
+                        preserve_workdir_identity_for_corrupted_summary(&mut updated, Some(&record));
+                        api.store.upsert_workdir_registry(&updated)?;
+                    }
                 } else {
                     record.materialization_status =
                         workdir_status_from_runtime_miss(result.diagnostics.as_slice()).to_string();
@@ -4294,7 +4340,6 @@ fn workdir_record_from_summary(
         resolved_commit: summary.resolved_commit.clone(),
         materialization_status: match summary.status {
             WorkingDirectoryStatusKind::Active => "present",
-            WorkingDirectoryStatusKind::Removed => "removed",
             WorkingDirectoryStatusKind::CleanupPending => "pending",
             WorkingDirectoryStatusKind::Corrupted => "corrupted",
             WorkingDirectoryStatusKind::NotFound => "not_found",
@@ -4339,7 +4384,7 @@ fn workdir_summary_from_record(record: &WorkdirRegistryRecord) -> WorkingDirecto
         "corrupted" => WorkingDirectoryStatusKind::Corrupted,
         "not_found" | "missing" => WorkingDirectoryStatusKind::NotFound,
         "unknown" => WorkingDirectoryStatusKind::Unknown,
-        _ => WorkingDirectoryStatusKind::Removed,
+        _ => WorkingDirectoryStatusKind::Unknown,
     };
     WorkingDirectorySummary {
         working_directory_id: record.workdir_id.clone(),
@@ -5652,7 +5697,7 @@ mod tests {
             response.results[0].action,
             CleanupTargetKind::WorkdirCleanCleanup
         );
-        assert_eq!(response.results[0].status, "cleaned");
+        assert_eq!(response.results[0].status, "deleted");
     }
 
     #[tokio::test]
@@ -5699,16 +5744,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_plan_reports_pinned_running_dirty_removed_and_redacts_paths() {
+    async fn cleanup_plan_reports_pinned_running_dirty_not_found_and_redacts_paths() {
         let workspace = tempfile::tempdir().unwrap();
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
         let pinned = seed_cleanup_worker(&api, 1, "pinned");
         let unobserved = seed_cleanup_worker(&api, 2, "normal");
         seed_cleanup_workdir(&api, "workdir-dirty", "present", "dirty");
-        seed_cleanup_workdir(&api, "workdir-removed", "removed", "clean");
+        seed_cleanup_workdir(&api, "workdir-not-found", "not_found", "clean");
         seed_cleanup_link(&api, pinned.as_str(), "workdir-dirty");
-        seed_cleanup_link(&api, unobserved.as_str(), "workdir-removed");
+        seed_cleanup_link(&api, unobserved.as_str(), "workdir-not-found");
 
         let plan = build_runtime_cleanup_plan(&api, "runtime-test")
             .unwrap_or_else(|err| panic!("cleanup plan: {}", err.error));
@@ -5725,7 +5770,7 @@ mod tests {
         let running_linked_workdir = plan
             .workdirs
             .iter()
-            .find(|candidate| candidate.workdir_id == "workdir-removed")
+            .find(|candidate| candidate.workdir_id == "workdir-not-found")
             .unwrap();
         assert_eq!(
             running_linked_workdir.action,
@@ -5783,7 +5828,7 @@ mod tests {
         init_clean_git_workspace(workspace.path());
         let api = test_api(workspace.path()).await;
         seed_cleanup_workdir(&api, "workdir-dirty", "present", "dirty");
-        seed_cleanup_workdir(&api, "workdir-removed", "removed", "clean");
+        seed_cleanup_workdir(&api, "workdir-not-found", "not_found", "clean");
         let plan = build_runtime_cleanup_plan(&api, "runtime-test")
             .unwrap_or_else(|err| panic!("cleanup plan: {}", err.error));
         let dirty_target = plan
@@ -5796,7 +5841,7 @@ mod tests {
         let removed_target = plan
             .workdirs
             .iter()
-            .find(|candidate| candidate.workdir_id == "workdir-removed")
+            .find(|candidate| candidate.workdir_id == "workdir-not-found")
             .unwrap()
             .target_id
             .clone();
@@ -5820,7 +5865,7 @@ mod tests {
         assert_eq!(response.results[0].status, "deleted");
         assert!(
             api.store
-                .get_workdir_registry(&api.config.workspace_id, "workdir-removed")
+                .get_workdir_registry(&api.config.workspace_id, "workdir-not-found")
                 .unwrap()
                 .is_none()
         );
@@ -6103,7 +6148,7 @@ mod tests {
             StatusCode::OK,
         )
         .await;
-        assert_eq!(removed["results"][0]["status"], "cleaned");
+        assert_eq!(removed["results"][0]["status"], "deleted");
     }
 
     #[tokio::test]

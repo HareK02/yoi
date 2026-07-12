@@ -627,7 +627,7 @@ CREATE TABLE IF NOT EXISTS workdir_registry (
     repository_id TEXT NOT NULL,
     selector TEXT,
     resolved_commit TEXT,
-    materialization_status TEXT NOT NULL CHECK (materialization_status IN ('pending', 'present', 'not_found', 'corrupted', 'unknown', 'removed', 'failed')),
+    materialization_status TEXT NOT NULL CHECK (materialization_status IN ('pending', 'present', 'not_found', 'corrupted', 'unknown', 'failed')),
     cleanliness TEXT NOT NULL CHECK (cleanliness IN ('clean', 'dirty', 'unknown')),
     management_kind TEXT NOT NULL CHECK (management_kind IN ('backend_managed', 'runtime_unmanaged')),
     created_at TEXT NOT NULL,
@@ -946,7 +946,7 @@ fn add_workdir_runtime_observation_states(conn: &Connection) -> Result<()> {
             repository_id TEXT NOT NULL,
             selector TEXT,
             resolved_commit TEXT,
-            materialization_status TEXT NOT NULL CHECK (materialization_status IN ('pending', 'present', 'not_found', 'corrupted', 'unknown', 'removed', 'failed')),
+            materialization_status TEXT NOT NULL CHECK (materialization_status IN ('pending', 'present', 'not_found', 'corrupted', 'unknown', 'failed')),
             cleanliness TEXT NOT NULL CHECK (cleanliness IN ('clean', 'dirty', 'unknown')),
             management_kind TEXT NOT NULL CHECK (management_kind IN ('backend_managed', 'runtime_unmanaged')),
             created_at TEXT NOT NULL,
@@ -962,6 +962,7 @@ fn add_workdir_runtime_observation_states(conn: &Connection) -> Result<()> {
             workspace_id, workdir_id, runtime_id, repository_id, selector, resolved_commit,
             CASE materialization_status
                 WHEN 'missing' THEN 'not_found'
+                WHEN 'removed' THEN 'not_found'
                 ELSE materialization_status
             END,
             cleanliness, management_kind, created_at, updated_at
@@ -1547,7 +1548,7 @@ mod tests {
             repository_id: "repo".to_string(),
             selector: Some("develop".to_string()),
             resolved_commit: Some("abcdef".to_string()),
-            materialization_status: "removed".to_string(),
+            materialization_status: "not_found".to_string(),
             cleanliness: "clean".to_string(),
             management_kind: "backend_managed".to_string(),
             created_at: "2".to_string(),

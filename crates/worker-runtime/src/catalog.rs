@@ -125,7 +125,6 @@ pub struct WorkingDirectoryClaim {
 #[serde(rename_all = "snake_case")]
 pub enum WorkingDirectoryStatusKind {
     Active,
-    Removed,
     CleanupPending,
     Corrupted,
     NotFound,

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { pushWorkspaceAlert } from '$lib/workspace-alerts/store';
   import { workspaceApiPath } from '$lib/workspace-api/http';
   import type {
     CleanupWorkdirCandidate,
@@ -9,9 +10,9 @@
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
-  let cleanupStatus = $state<string | null>(null);
   let cleanupBusyTarget = $state<string | null>(null);
   let cleanupPlan = $state<RuntimeCleanupPlanResponse | null>(null);
+  let workdirs = $state<WorkingDirectorySummary[]>([]);
   let runtimeLabel = $derived(
     data.runtimes?.items.find((runtime) => runtime.runtime_id === data.runtimeId)?.label ?? data.runtimeId,
   );
@@ -19,6 +20,7 @@
 
   $effect(() => {
     cleanupPlan = data.cleanupPlan ?? null;
+    workdirs = data.workdirs?.items ?? [];
   });
 
   function commitLabel(workdir: WorkingDirectorySummary): string {
@@ -29,26 +31,35 @@
     return workdir.requested_selector ?? 'HEAD';
   }
 
-  function cleanupLabel(candidate: CleanupWorkdirCandidate): string {
-    if (candidate.action === 'workdir_dirty_discard') {
-      return candidate.cleanliness === 'dirty' ? 'Discard' : 'Discard unknown';
-    }
-    if (candidate.action === 'workdir_record_delete') return 'Delete record';
-    return 'Clean up';
-  }
-
   function cleanupCandidate(workdir: WorkingDirectorySummary): CleanupWorkdirCandidate | undefined {
     return cleanupCandidates.find((candidate) => candidate.workdir_id === workdir.working_directory_id);
   }
 
-  async function executeWorkdirCleanup(candidate: CleanupWorkdirCandidate): Promise<void> {
-    if (!cleanupPlan) return;
-    if (candidate.action === 'workdir_dirty_discard') {
-      const confirmed = window.confirm(`${cleanupLabel(candidate)} ${candidate.workdir_id}? This explicitly discards the Workdir contents.`);
-      if (!confirmed) return;
+  function isDeleteDisabled(candidate: CleanupWorkdirCandidate): boolean {
+    return Boolean(candidate.blocking_reason) || candidate.action === 'workdir_dirty_discard' || cleanupBusyTarget !== null;
+  }
+
+  function errorMessage(payload: unknown, fallback: string): string {
+    if (payload && typeof payload === 'object') {
+      if ('message' in payload && typeof payload.message === 'string') return payload.message;
+      if ('error' in payload) {
+        const error = payload.error;
+        if (typeof error === 'string') return error;
+        if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string') return error.message;
+      }
+      if ('diagnostics' in payload && Array.isArray(payload.diagnostics)) {
+        const diagnostic = payload.diagnostics.find(
+          (entry): entry is { message: string } => Boolean(entry) && typeof entry === 'object' && 'message' in entry && typeof entry.message === 'string',
+        );
+        if (diagnostic) return diagnostic.message;
+      }
     }
+    return fallback;
+  }
+
+  async function deleteWorkdir(workdir: WorkingDirectorySummary, candidate: CleanupWorkdirCandidate): Promise<void> {
+    if (!cleanupPlan || isDeleteDisabled(candidate)) return;
     cleanupBusyTarget = candidate.target_id;
-    cleanupStatus = null;
     try {
       const response = await fetch(
         workspaceApiPath(data.workspaceId, `/runtimes/${encodeURIComponent(data.runtimeId)}/cleanup-executions`),
@@ -60,16 +71,26 @@
             expected_plan_digest: cleanupPlan.digest,
             worker_target_ids: [],
             workdir_target_ids: [candidate.target_id],
-            confirm_dirty_discard_target_ids: candidate.action === 'workdir_dirty_discard' ? [candidate.target_id] : [],
+            confirm_dirty_discard_target_ids: [],
           }),
         },
       );
-      const payload = (await response.json().catch(() => null)) as RuntimeCleanupExecutionResponse | { message?: string; error?: string } | null;
-      if (!response.ok) throw new Error(payload && 'message' in payload ? (payload.message ?? payload.error) : response.statusText);
-      if (payload && 'plan_after' in payload) cleanupPlan = payload.plan_after;
-      cleanupStatus = `Executed cleanup for ${candidate.workdir_id}. Refresh to see the latest Workdir list.`;
+      const payload = (await response.json().catch(() => null)) as RuntimeCleanupExecutionResponse | unknown;
+      if (!response.ok) throw new Error(errorMessage(payload, response.statusText));
+      if (payload && typeof payload === 'object' && 'plan_after' in payload) {
+        cleanupPlan = (payload as RuntimeCleanupExecutionResponse).plan_after;
+      }
+      const result = payload && typeof payload === 'object' && 'results' in payload
+        ? (payload as RuntimeCleanupExecutionResponse).results.find((entry) => entry.target_id === candidate.target_id)
+        : undefined;
+      if (!result || result.status !== 'deleted') {
+        throw new Error(result?.message ?? 'Runtime did not delete the selected Workdir');
+      }
+      workdirs = workdirs.filter((item) => item.working_directory_id !== workdir.working_directory_id);
     } catch (error) {
-      cleanupStatus = error instanceof Error ? error.message : 'Workdir cleanup failed';
+      pushWorkspaceAlert('error', error instanceof Error ? error.message : 'Workdir deletion failed', {
+        title: 'Workdir deletion failed',
+      });
     } finally {
       cleanupBusyTarget = null;
     }
@@ -88,7 +109,6 @@
       <h1 id="workdirs-heading">Workdirs</h1>
       <p>Workdirs owned by <code>{data.runtimeId}</code>.</p>
       {#if data.cleanupPlanError}<p class="section-state error">{data.cleanupPlanError}</p>{/if}
-      {#if cleanupStatus}<p>{cleanupStatus}</p>{/if}
     </div>
   </header>
 
@@ -96,7 +116,7 @@
     <p class="section-state error">{data.workdirsError}</p>
   {:else if !data.workdirs}
     <p class="section-state">Loading workdirs…</p>
-  {:else if data.workdirs.items.length === 0}
+  {:else if workdirs.length === 0}
     <p class="section-state">No workdirs are visible for this Runtime.</p>
   {:else}
     <div class="table-wrap">
@@ -113,7 +133,7 @@
           </tr>
         </thead>
         <tbody>
-          {#each data.workdirs.items as workdir}
+          {#each workdirs as workdir}
             {@const cleanup = cleanupCandidate(workdir)}
             <tr>
               <td><code>{workdir.working_directory_id}</code></td>
@@ -125,14 +145,19 @@
               <td>
                 {#if cleanup}
                   <button
+                    class="icon-action danger"
                     type="button"
-                    disabled={!!cleanup.blocking_reason || cleanupBusyTarget === cleanup.target_id}
-                    title={cleanup.blocking_reason ?? cleanup.reason}
-                    onclick={() => executeWorkdirCleanup(cleanup)}
+                    disabled={isDeleteDisabled(cleanup)}
+                    aria-label={`Delete ${workdir.working_directory_id}`}
+                    title={cleanup.action === 'workdir_dirty_discard' ? 'Dirty Workdirs must be cleaned before deletion' : (cleanup.blocking_reason ?? cleanup.reason)}
+                    onclick={() => deleteWorkdir(workdir, cleanup)}
                   >
-                    {cleanupBusyTarget === cleanup.target_id ? 'Executing…' : cleanupLabel(cleanup)}
+                    {#if cleanupBusyTarget === cleanup.target_id}
+                      <span class="spinner" aria-hidden="true"></span>
+                    {:else}
+                      <svg class="action-icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" /><path d="M3 6h18" /><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></svg>
+                    {/if}
                   </button>
-                  {#if cleanup.blocking_reason}<small class="error">{cleanup.blocking_reason}</small>{/if}
                 {:else}
                   <span class="muted">—</span>
                 {/if}
@@ -144,3 +169,55 @@
     </div>
   {/if}
 </section>
+
+<style>
+  .icon-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2rem;
+    height: 2rem;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    background: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+  }
+
+  .icon-action.danger:hover:not(:disabled),
+  .icon-action.danger:focus-visible:not(:disabled) {
+    border-color: var(--danger, oklch(60% 0.18 30));
+    color: var(--danger, oklch(60% 0.18 30));
+  }
+
+  .icon-action:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
+
+  .action-icon {
+    width: 1rem;
+    height: 1rem;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .spinner {
+    width: 1rem;
+    height: 1rem;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 999px;
+    animation: workdir-action-spin 0.8s linear infinite;
+  }
+
+  @keyframes workdir-action-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+</style>

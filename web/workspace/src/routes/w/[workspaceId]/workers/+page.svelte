@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { pushWorkspaceAlert } from '$lib/workspace-alerts/store';
   import { workspaceApiPath } from '$lib/workspace-api/http';
   import { workerConsoleHref } from '$lib/workspace-console/model';
   import { canOpenWorkerConsole } from '$lib/workspace-sidebar/workers';
@@ -8,12 +9,13 @@
   type WorkerActionKind = 'pin' | 'delete';
 
   let { data }: PageProps = $props();
-  let statusMessage = $state<string | null>(null);
   let cleanupPlans = $state<Record<string, RuntimeCleanupPlanResponse>>({});
+  let workers = $state<Worker[]>([]);
   let busyAction = $state<{ workerKey: string; kind: WorkerActionKind } | null>(null);
 
   $effect(() => {
     cleanupPlans = data.cleanupPlans;
+    workers = data.workers?.items ?? [];
   });
 
   function workerKey(worker: Worker): string {
@@ -28,6 +30,24 @@
     return busyAction !== null;
   }
 
+  function errorMessage(payload: unknown, fallback: string): string {
+    if (payload && typeof payload === 'object') {
+      if ('message' in payload && typeof payload.message === 'string') return payload.message;
+      if ('error' in payload) {
+        const error = payload.error;
+        if (typeof error === 'string') return error;
+        if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string') return error.message;
+      }
+      if ('diagnostics' in payload && Array.isArray(payload.diagnostics)) {
+        const diagnostic = payload.diagnostics.find(
+          (entry): entry is { message: string } => Boolean(entry) && typeof entry === 'object' && 'message' in entry && typeof entry.message === 'string',
+        );
+        if (diagnostic) return diagnostic.message;
+      }
+    }
+    return fallback;
+  }
+
   async function refreshCleanupPlan(runtimeId: string): Promise<void> {
     const response = await fetch(
       workspaceApiPath(data.workspaceId, `/runtimes/${encodeURIComponent(runtimeId)}/cleanup-plan`),
@@ -40,7 +60,6 @@
   async function setPinned(worker: Worker, pinned: boolean): Promise<void> {
     if (busyAction) return;
     busyAction = { workerKey: workerKey(worker), kind: 'pin' };
-    statusMessage = null;
     try {
       const response = await fetch(
         workspaceApiPath(
@@ -51,13 +70,16 @@
       );
       const payload = await response.json().catch(() => null);
       if (!response.ok) {
-        statusMessage = payload?.message ?? payload?.error ?? response.statusText;
+        pushWorkspaceAlert('error', errorMessage(payload, response.statusText), { title: 'Worker pin failed' });
         return;
       }
       worker.pinned = Boolean(payload?.pinned);
       worker.retention_state = payload?.retention_state ?? (worker.pinned ? 'pinned' : 'normal');
       await refreshCleanupPlan(worker.runtime_id);
-      statusMessage = `${worker.label} ${worker.pinned ? 'pinned' : 'unpinned'}.`;
+    } catch (error) {
+      pushWorkspaceAlert('error', error instanceof Error ? error.message : 'Worker pin failed', {
+        title: 'Worker pin failed',
+      });
     } finally {
       busyAction = null;
     }
@@ -71,7 +93,6 @@
 
   async function deleteWorker(worker: Worker, candidate: CleanupWorkerCandidate): Promise<void> {
     if (!cleanupPlans?.[worker.runtime_id] || busyAction) return;
-    statusMessage = null;
     busyAction = { workerKey: workerKey(worker), kind: 'delete' };
     try {
       const plan = cleanupPlans[worker.runtime_id];
@@ -89,19 +110,25 @@
           }),
         },
       );
-      const payload = (await response.json().catch(() => null)) as RuntimeCleanupExecutionResponse | { message?: string; error?: string } | null;
-      if (!response.ok) throw new Error(payload && 'message' in payload ? (payload.message ?? payload.error) : response.statusText);
-      if (payload && 'plan_after' in payload) {
-        cleanupPlans = { ...cleanupPlans, [worker.runtime_id]: payload.plan_after };
+      const payload = (await response.json().catch(() => null)) as RuntimeCleanupExecutionResponse | unknown;
+      if (!response.ok) throw new Error(errorMessage(payload, response.statusText));
+      if (payload && typeof payload === 'object' && 'plan_after' in payload) {
+        const execution = payload as RuntimeCleanupExecutionResponse;
+        cleanupPlans = { ...cleanupPlans, [worker.runtime_id]: execution.plan_after };
       }
-      if (data.workers) {
-        data.workers.items = data.workers.items.filter(
-          (item) => !(item.runtime_id === worker.runtime_id && item.worker_id === worker.worker_id),
-        );
+      const result = payload && typeof payload === 'object' && 'results' in payload
+        ? (payload as RuntimeCleanupExecutionResponse).results.find((entry) => entry.target_id === candidate.target_id)
+        : undefined;
+      if (!result || result.status !== 'deleted') {
+        throw new Error(result?.message ?? 'Runtime did not delete the selected Worker');
       }
-      statusMessage = `Deleted Worker ${worker.label}.`;
+      workers = workers.filter(
+        (item) => !(item.runtime_id === worker.runtime_id && item.worker_id === worker.worker_id),
+      );
     } catch (error) {
-      statusMessage = error instanceof Error ? error.message : 'Worker cleanup failed';
+      pushWorkspaceAlert('error', error instanceof Error ? error.message : 'Worker deletion failed', {
+        title: 'Worker deletion failed',
+      });
     } finally {
       busyAction = null;
     }
@@ -134,7 +161,6 @@
     <div>
       <h1 id="workers-heading">Workers</h1>
       <p>Workers running or persisted for this workspace. Pinning updates Backend retention.</p>
-      {#if statusMessage}<p>{statusMessage}</p>{/if}
     </div>
     <a class="section-action" href={`/w/${data.workspaceId}/workers/new`}>New Worker</a>
   </header>
@@ -143,7 +169,7 @@
     <p class="section-state error">{data.workersError}</p>
   {:else if !data.workers}
     <p class="section-state">Loading Workers…</p>
-  {:else if data.workers.items.length === 0}
+  {:else if workers.length === 0}
     <p class="section-state">No Workers are visible.</p>
   {:else}
     <div class="table-wrap workers-table-wrap">
@@ -160,7 +186,7 @@
           </tr>
         </thead>
         <tbody>
-          {#each data.workers.items as worker}
+          {#each workers as worker}
             {@const cleanup = cleanupCandidate(worker)}
             {@const canDelete = cleanup && !cleanup.blocking_reason}
             {@const anyActionDisabled = actionsDisabled()}

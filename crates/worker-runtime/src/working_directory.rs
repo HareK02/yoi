@@ -524,12 +524,23 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
                 })?;
             }
             let mut summary = status.summary;
-            summary.status = WorkingDirectoryStatusKind::Removed;
+            summary.status = WorkingDirectoryStatusKind::NotFound;
             return Ok(WorkingDirectoryStatus { summary });
         }
         let binding = self.read_binding(working_directory_id)?;
         self.cleanup(&binding)?;
-        self.working_directory_status(working_directory_id)
+        let mut summary = binding.working_directory.status_summary();
+        summary.status = WorkingDirectoryStatusKind::NotFound;
+        summary.cleanliness = Some("unknown".to_string());
+        if binding.working_directory_root.exists() {
+            fs::remove_dir_all(&binding.working_directory_root).map_err(|_| {
+                WorkingDirectoryDiagnostic::new(
+                    "working_directory_record_cleanup_failed",
+                    "failed to remove working directory record; backend-private path details were omitted",
+                )
+            })?;
+        }
+        Ok(WorkingDirectoryStatus { summary })
     }
 
     fn cleanup(&self, binding: &WorkingDirectoryBinding) -> Result<(), WorkingDirectoryDiagnostic> {
@@ -569,19 +580,17 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
                 Ok(())
             }
         });
-        working_directory.status = if remove_result.is_ok() {
-            WorkingDirectoryStatusKind::Removed
-        } else {
-            WorkingDirectoryStatusKind::CleanupPending
-        };
-        let updated = WorkingDirectoryBinding {
-            working_directory,
-            root: binding.root.clone(),
-            cwd: binding.cwd.clone(),
-            working_directory_root: binding.working_directory_root.clone(),
-            source_repository_path: binding.source_repository_path.clone(),
-        };
-        let _ = self.write_record(&updated);
+        if remove_result.is_err() {
+            working_directory.status = WorkingDirectoryStatusKind::CleanupPending;
+            let updated = WorkingDirectoryBinding {
+                working_directory,
+                root: binding.root.clone(),
+                cwd: binding.cwd.clone(),
+                working_directory_root: binding.working_directory_root.clone(),
+                source_repository_path: binding.source_repository_path.clone(),
+            };
+            let _ = self.write_record(&updated);
+        }
         remove_result
     }
 }
@@ -954,7 +963,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_removes_worktree_and_updates_record() {
+    fn cleanup_working_directory_removes_worktree_and_record() {
         let repo = create_clean_repo();
         let runtime_root = tempfile::tempdir().unwrap();
         let materializer = LocalGitWorktreeMaterializer::new(runtime_root.path());
@@ -962,16 +971,14 @@ mod tests {
             .materialize(&worker_ref(1), &request(repo.path()))
             .unwrap();
         let root = binding.root.clone();
+        let record_root = binding.working_directory_root().to_path_buf();
 
-        materializer.cleanup(&binding).unwrap();
+        let status = materializer
+            .cleanup_working_directory(&binding.working_directory.id)
+            .unwrap();
 
+        assert_eq!(status.summary.status, WorkingDirectoryStatusKind::NotFound);
         assert!(!root.exists());
-        let raw = fs::read_to_string(
-            binding
-                .working_directory_root()
-                .join(MATERIALIZATION_RECORD),
-        )
-        .unwrap();
-        assert!(raw.contains("removed"));
+        assert!(!record_root.exists());
     }
 }
