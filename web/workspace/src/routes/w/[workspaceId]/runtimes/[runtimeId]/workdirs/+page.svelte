@@ -108,7 +108,7 @@
             <th>Selector</th>
             <th>Commit</th>
             <th>Status</th>
-            <th>Policy</th>
+            <th>Cleanliness</th>
             <th>Action</th>
           </tr>
         </thead>
@@ -121,10 +121,7 @@
               <td>{selectorLabel(workdir)}</td>
               <td><code>{commitLabel(workdir)}</code></td>
               <td>{workdir.status}</td>
-              <td>
-                <span>{workdir.dirty_state_policy}</span>
-                <small>{workdir.cleanup_policy}</small>
-              </td>
+              <td>{workdir.cleanliness ?? 'unknown'}</td>
               <td>
                 {#if cleanup}
                   <button

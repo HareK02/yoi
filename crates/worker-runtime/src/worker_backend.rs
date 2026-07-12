@@ -866,8 +866,8 @@ mod tests {
 
     use crate::Runtime as EmbeddedRuntime;
     use crate::catalog::{
-        ConfigBundleRef, CreateWorkerRequest, DirtyStatePolicy, MaterializerKind, ProfileSelector,
-        RepositorySelector, WorkingDirectoryRepository, WorkingDirectoryRequest,
+        ConfigBundleRef, CreateWorkerRequest, MaterializerKind, ProfileSelector, RepositorySelector,
+        WorkingDirectoryRepository, WorkingDirectoryRequest,
     };
     use crate::execution::WorkerExecutionContext;
     use crate::identity::RuntimeId;
@@ -1114,7 +1114,6 @@ mod tests {
                 selector: Some(RepositorySelector::from("HEAD")),
             },
             materializer: MaterializerKind::LocalGitWorktree,
-            dirty_state_policy: DirtyStatePolicy::CleanPointOnly,
             backend_workdir_id: None,
         }
     }

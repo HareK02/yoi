@@ -1,6 +1,6 @@
 use crate::catalog::{
-    DirtyStatePolicy, MaterializerKind, WorkingDirectoryCleanupTarget, WorkingDirectoryRequest,
-    WorkingDirectoryStatus, WorkingDirectoryStatusKind, WorkingDirectorySummary,
+    MaterializerKind, WorkingDirectoryCleanupTarget, WorkingDirectoryRequest, WorkingDirectoryStatus,
+    WorkingDirectoryStatusKind, WorkingDirectorySummary,
 };
 use crate::identity::WorkerRef;
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,6 @@ pub struct WorkingDirectoryEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_tree: Option<String>,
     pub materializer_kind: MaterializerKind,
-    pub dirty_state_policy: DirtyStatePolicy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,10 +30,8 @@ pub struct WorkingDirectory {
     pub id: String,
     pub repository_id: String,
     pub materializer_kind: MaterializerKind,
-    pub dirty_state_policy: DirtyStatePolicy,
     pub evidence: WorkingDirectoryEvidence,
     pub cleanup_target: WorkingDirectoryCleanupTarget,
-    pub cleanup_policy: String,
     pub status: WorkingDirectoryStatusKind,
 }
 
@@ -45,12 +42,11 @@ impl WorkingDirectory {
             repository_id: self.repository_id.clone(),
             requested_selector: self.evidence.requested_selector.clone(),
             materializer_kind: self.materializer_kind.clone(),
-            dirty_state_policy: self.dirty_state_policy.clone(),
             resolved_commit: Some(self.evidence.resolved_commit.clone()),
             resolved_tree: self.evidence.resolved_tree.clone(),
             cleanup_target: Some(self.cleanup_target.clone()),
-            cleanup_policy: Some(self.cleanup_policy.clone()),
             status: self.status.clone(),
+            cleanliness: None,
             management_kind: None,
         }
     }
@@ -83,9 +79,19 @@ impl WorkingDirectoryBinding {
     }
 
     pub fn status(&self) -> WorkingDirectoryStatus {
-        WorkingDirectoryStatus {
-            summary: self.working_directory.status_summary(),
+        let mut working_directory = self.working_directory.clone();
+        if working_directory.status == WorkingDirectoryStatusKind::Active
+            && !binding_paths_are_available(self)
+        {
+            working_directory.status = WorkingDirectoryStatusKind::Corrupted;
         }
+        let mut summary = working_directory.status_summary();
+        summary.cleanliness = if summary.status == WorkingDirectoryStatusKind::Active {
+            Some(binding_cleanliness(self))
+        } else {
+            Some("unknown".to_string())
+        };
+        WorkingDirectoryStatus { summary }
     }
 }
 
@@ -151,6 +157,27 @@ pub trait WorkingDirectoryMaterializer: Send + Sync + 'static {
     fn cleanup(&self, binding: &WorkingDirectoryBinding) -> Result<(), WorkingDirectoryDiagnostic>;
 }
 
+fn binding_paths_are_available(binding: &WorkingDirectoryBinding) -> bool {
+    let Ok(root) = binding.root.canonicalize() else {
+        return false;
+    };
+    if !root.is_dir() {
+        return false;
+    }
+    let Ok(source_repository_path) = binding.source_repository_path.canonicalize() else {
+        return false;
+    };
+    source_repository_path.is_dir()
+}
+
+fn binding_cleanliness(binding: &WorkingDirectoryBinding) -> String {
+    match git_stdout(binding.root(), ["status", "--porcelain"]) {
+        Ok(output) if output.is_empty() => "clean".to_string(),
+        Ok(_) => "dirty".to_string(),
+        Err(_) => "unknown".to_string(),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LocalGitWorktreeMaterializer {
     runtime_root: PathBuf,
@@ -175,6 +202,27 @@ impl LocalGitWorktreeMaterializer {
         self.runtime_root
             .join(WORKING_DIRECTORIES_DIR)
             .join(working_directory_id)
+    }
+
+    fn corrupted_status(&self, working_directory_id: &str) -> WorkingDirectoryStatus {
+        WorkingDirectoryStatus {
+            summary: WorkingDirectorySummary {
+                working_directory_id: working_directory_id.to_string(),
+                repository_id: "unknown".to_string(),
+                requested_selector: None,
+                materializer_kind: MaterializerKind::LocalGitWorktree,
+                resolved_commit: None,
+                resolved_tree: None,
+                cleanup_target: Some(WorkingDirectoryCleanupTarget {
+                    kind: "local_git_worktree".to_string(),
+                    working_directory_id: working_directory_id.to_string(),
+                    repository_id: "unknown".to_string(),
+                }),
+                status: WorkingDirectoryStatusKind::Corrupted,
+                cleanliness: Some("unknown".to_string()),
+                management_kind: None,
+            },
+        }
     }
 
     fn write_record(
@@ -232,7 +280,6 @@ impl LocalGitWorktreeMaterializer {
         &self,
         working_directory_id: String,
         request: &WorkingDirectoryRequest,
-        cleanup_policy: &str,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
         validate_working_directory_id(&working_directory_id)?;
         if request.materializer != MaterializerKind::LocalGitWorktree {
@@ -248,12 +295,6 @@ impl LocalGitWorktreeMaterializer {
                     "repository provider `{}` is not supported by the v0 working directory materializer",
                     request.repository.provider
                 ),
-            ));
-        }
-        if request.dirty_state_policy != DirtyStatePolicy::CleanPointOnly {
-            return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_dirty_policy_unsupported",
-                "only clean_point_only dirty-state policy is supported in v0",
             ));
         }
         if is_remote_uri(&request.repository.uri) {
@@ -281,7 +322,7 @@ impl LocalGitWorktreeMaterializer {
         if !status.trim().is_empty() {
             return Err(WorkingDirectoryDiagnostic::new(
                 "working_directory_dirty_source_rejected",
-                "clean_point_only working directory materialization rejects dirty source repository state",
+                "working directory materialization rejects dirty source repository state",
             ));
         }
 
@@ -340,7 +381,6 @@ impl LocalGitWorktreeMaterializer {
             id: working_directory_id.clone(),
             repository_id: request.repository.id.clone(),
             materializer_kind: MaterializerKind::LocalGitWorktree,
-            dirty_state_policy: DirtyStatePolicy::CleanPointOnly,
             evidence: WorkingDirectoryEvidence {
                 repository_id: request.repository.id.clone(),
                 requested_selector: request
@@ -351,14 +391,12 @@ impl LocalGitWorktreeMaterializer {
                 resolved_commit,
                 resolved_tree,
                 materializer_kind: MaterializerKind::LocalGitWorktree,
-                dirty_state_policy: DirtyStatePolicy::CleanPointOnly,
             },
             cleanup_target: WorkingDirectoryCleanupTarget {
                 kind: "git_worktree".to_string(),
                 working_directory_id,
                 repository_id: request.repository.id.clone(),
             },
-            cleanup_policy: cleanup_policy.to_string(),
             status: WorkingDirectoryStatusKind::Active,
         };
         let binding = WorkingDirectoryBinding {
@@ -380,11 +418,7 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
         request: &WorkingDirectoryRequest,
     ) -> Result<WorkingDirectoryBinding, WorkingDirectoryDiagnostic> {
         let working_directory_id = Self::working_directory_id(worker_ref, &request.repository.id);
-        self.materialize_with_working_directory_id(
-            working_directory_id,
-            request,
-            "remove_on_worker_stop",
-        )
+        self.materialize_with_working_directory_id(working_directory_id, request)
     }
 
     fn create(
@@ -395,11 +429,7 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
             .backend_workdir_id
             .clone()
             .unwrap_or_else(|| next_working_directory_id(&request.repository.id));
-        self.materialize_with_working_directory_id(
-            working_directory_id,
-            request,
-            "manual_or_worker_stop",
-        )
+        self.materialize_with_working_directory_id(working_directory_id, request)
     }
 
     fn bind_working_directory(
@@ -446,8 +476,9 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
             if validate_working_directory_id(&working_directory_id).is_err() {
                 continue;
             }
-            if let Ok(status) = self.working_directory_status(&working_directory_id) {
-                statuses.push(status);
+            match self.read_binding(&working_directory_id) {
+                Ok(binding) => statuses.push(binding.status()),
+                Err(_) => statuses.push(self.corrupted_status(&working_directory_id)),
             }
         }
         statuses.sort_by(|left, right| {
@@ -463,7 +494,17 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
         working_directory_id: &str,
     ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
         validate_working_directory_id(working_directory_id)?;
-        Ok(self.read_binding(working_directory_id)?.status())
+        let working_directory_root = self.working_directory_root(working_directory_id);
+        if !working_directory_root.exists() {
+            return Err(WorkingDirectoryDiagnostic::new(
+                "working_directory_not_found",
+                "working directory working_directory was not found",
+            ));
+        }
+        match self.read_binding(working_directory_id) {
+            Ok(binding) => Ok(binding.status()),
+            Err(_) => Ok(self.corrupted_status(working_directory_id)),
+        }
     }
 
     fn cleanup_working_directory(
@@ -471,6 +512,21 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
         working_directory_id: &str,
     ) -> Result<WorkingDirectoryStatus, WorkingDirectoryDiagnostic> {
         validate_working_directory_id(working_directory_id)?;
+        let status = self.working_directory_status(working_directory_id)?;
+        if status.summary.status == WorkingDirectoryStatusKind::Corrupted {
+            let working_directory_root = self.working_directory_root(working_directory_id);
+            if working_directory_root.exists() {
+                fs::remove_dir_all(&working_directory_root).map_err(|_| {
+                    WorkingDirectoryDiagnostic::new(
+                        "working_directory_corrupted_cleanup_failed",
+                        "failed to remove corrupted working directory; backend-private path details were omitted",
+                    )
+                })?;
+            }
+            let mut summary = status.summary;
+            summary.status = WorkingDirectoryStatusKind::Removed;
+            return Ok(WorkingDirectoryStatus { summary });
+        }
         let binding = self.read_binding(working_directory_id)?;
         self.cleanup(&binding)?;
         self.working_directory_status(working_directory_id)
@@ -714,7 +770,6 @@ mod tests {
                 selector: Some(RepositorySelector::from("HEAD")),
             },
             materializer: MaterializerKind::LocalGitWorktree,
-            dirty_state_policy: DirtyStatePolicy::CleanPointOnly,
             backend_workdir_id: None,
         }
     }
@@ -746,10 +801,6 @@ mod tests {
             binding.working_directory.materializer_kind,
             MaterializerKind::LocalGitWorktree
         );
-        assert_eq!(
-            binding.working_directory.dirty_state_policy,
-            DirtyStatePolicy::CleanPointOnly
-        );
         assert!(
             binding
                 .working_directory_root()
@@ -778,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_source_is_rejected_by_clean_point_only_policy() {
+    fn dirty_source_is_rejected_by_materialization() {
         let repo = create_clean_repo();
         fs::write(repo.path().join("dirty.txt"), "dirty\n").unwrap();
         let runtime_root = tempfile::tempdir().unwrap();
@@ -789,7 +840,7 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, "working_directory_dirty_source_rejected");
-        assert!(error.message.contains("clean_point_only"));
+        assert!(error.message.contains("dirty source"));
     }
 
     #[test]

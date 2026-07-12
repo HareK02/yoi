@@ -42,6 +42,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "use composite worker registry keys",
         apply: use_composite_worker_registry_keys,
     },
+    Migration {
+        version: 6,
+        name: "add workdir runtime observation states",
+        apply: add_workdir_runtime_observation_states,
+    },
 ];
 
 struct Migration {
@@ -622,7 +627,7 @@ CREATE TABLE IF NOT EXISTS workdir_registry (
     repository_id TEXT NOT NULL,
     selector TEXT,
     resolved_commit TEXT,
-    materialization_status TEXT NOT NULL CHECK (materialization_status IN ('pending', 'present', 'missing', 'removed', 'failed')),
+    materialization_status TEXT NOT NULL CHECK (materialization_status IN ('pending', 'present', 'not_found', 'corrupted', 'unknown', 'removed', 'failed')),
     cleanliness TEXT NOT NULL CHECK (cleanliness IN ('clean', 'dirty', 'unknown')),
     management_kind TEXT NOT NULL CHECK (management_kind IN ('backend_managed', 'runtime_unmanaged')),
     created_at TEXT NOT NULL,
@@ -927,6 +932,49 @@ fn use_composite_worker_registry_keys(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn add_workdir_runtime_observation_states(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "workdir_registry")? {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        r#"
+        CREATE TABLE workdir_registry_v6 (
+            workspace_id TEXT NOT NULL,
+            workdir_id TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            repository_id TEXT NOT NULL,
+            selector TEXT,
+            resolved_commit TEXT,
+            materialization_status TEXT NOT NULL CHECK (materialization_status IN ('pending', 'present', 'not_found', 'corrupted', 'unknown', 'removed', 'failed')),
+            cleanliness TEXT NOT NULL CHECK (cleanliness IN ('clean', 'dirty', 'unknown')),
+            management_kind TEXT NOT NULL CHECK (management_kind IN ('backend_managed', 'runtime_unmanaged')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, workdir_id),
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+        INSERT OR REPLACE INTO workdir_registry_v6 (
+            workspace_id, workdir_id, runtime_id, repository_id, selector, resolved_commit,
+            materialization_status, cleanliness, management_kind, created_at, updated_at
+        )
+        SELECT
+            workspace_id, workdir_id, runtime_id, repository_id, selector, resolved_commit,
+            CASE materialization_status
+                WHEN 'missing' THEN 'not_found'
+                ELSE materialization_status
+            END,
+            cleanliness, management_kind, created_at, updated_at
+        FROM workdir_registry;
+        DROP TABLE workdir_registry;
+        ALTER TABLE workdir_registry_v6 RENAME TO workdir_registry;
+        CREATE INDEX IF NOT EXISTS idx_workdir_registry_workspace_updated
+            ON workdir_registry(workspace_id, updated_at DESC);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn create_schema_v0_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -1150,7 +1198,7 @@ mod tests {
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 5);
+        assert_eq!(store.schema_version().await.unwrap(), 6);
 
         let record = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
@@ -1162,7 +1210,7 @@ mod tests {
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 5);
+        assert_eq!(reopened.schema_version().await.unwrap(), 6);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -1371,7 +1419,7 @@ mod tests {
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 5);
+        assert_eq!(store.schema_version().await.unwrap(), 6);
 
         store
             .with_conn(|conn| {

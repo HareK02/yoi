@@ -103,20 +103,11 @@ pub enum MaterializerKind {
     LocalGitWorktree,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DirtyStatePolicy {
-    #[default]
-    CleanPointOnly,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkingDirectoryRequest {
     pub repository: WorkingDirectoryRepository,
     #[serde(default)]
     pub materializer: MaterializerKind,
-    #[serde(default)]
-    pub dirty_state_policy: DirtyStatePolicy,
     /// Backend-assigned stable Workdir id. Runtimes use this when present so the
     /// Backend can create canonical registry rows before materialization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -136,6 +127,9 @@ pub enum WorkingDirectoryStatusKind {
     Active,
     Removed,
     CleanupPending,
+    Corrupted,
+    NotFound,
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,16 +146,15 @@ pub struct WorkingDirectorySummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_selector: Option<String>,
     pub materializer_kind: MaterializerKind,
-    pub dirty_state_policy: DirtyStatePolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_commit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_tree: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanup_target: Option<WorkingDirectoryCleanupTarget>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cleanup_policy: Option<String>,
     pub status: WorkingDirectoryStatusKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanliness: Option<String>,
     /// Backend projection metadata. Runtimes leave this absent; Workspace Browser
     /// APIs fill it with `backend_managed` or `runtime_unmanaged`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

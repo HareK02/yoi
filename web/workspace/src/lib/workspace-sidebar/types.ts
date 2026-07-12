@@ -122,12 +122,11 @@ export type WorkingDirectorySummary = {
   repository_id: string;
   requested_selector?: string | null;
   materializer_kind: string;
-  dirty_state_policy: string;
   resolved_commit: string;
   resolved_tree?: string | null;
   status: string;
+  cleanliness?: string | null;
   management_kind?: "backend_managed" | "runtime_unmanaged" | string | null;
-  cleanup_policy: string;
   cleanup_target: {
     kind: string;
     working_directory_id: string;
@@ -219,10 +218,6 @@ export type BrowserWorkingDirectoryCreateRequest = {
   runtime_id: string;
   repository_id: string;
   selector?: string | null;
-  policy?: {
-    dirty_state?: "clean_point_only";
-    cleanup?: "manual_or_worker_stop";
-  };
 };
 
 export type WorkerLaunchOptionsResponse = {
