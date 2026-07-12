@@ -1,6 +1,6 @@
 use crate::catalog::{
-    MaterializerKind, WorkingDirectoryCleanupTarget, WorkingDirectoryRequest, WorkingDirectoryStatus,
-    WorkingDirectoryStatusKind, WorkingDirectorySummary,
+    MaterializerKind, WorkingDirectoryCleanupTarget, WorkingDirectoryRequest,
+    WorkingDirectoryStatus, WorkingDirectoryStatusKind, WorkingDirectorySummary,
 };
 use crate::identity::WorkerRef;
 use serde::{Deserialize, Serialize};
@@ -47,6 +47,7 @@ impl WorkingDirectory {
             cleanup_target: Some(self.cleanup_target.clone()),
             status: self.status.clone(),
             cleanliness: None,
+            primary_worker_id: None,
             management_kind: None,
         }
     }
@@ -220,6 +221,7 @@ impl LocalGitWorktreeMaterializer {
                 }),
                 status: WorkingDirectoryStatusKind::Corrupted,
                 cleanliness: Some("unknown".to_string()),
+                primary_worker_id: None,
                 management_kind: None,
             },
         }

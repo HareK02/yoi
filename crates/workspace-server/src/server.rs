@@ -1709,8 +1709,7 @@ fn build_runtime_cleanup_plan(
             reason: if blocking_reason.is_some() {
                 "Workdir cleanup is blocked until linked Worker state is safe".to_string()
             } else if matches!(file_status.as_str(), "missing" | "not_found") {
-                "Not-found Workdir record can be deleted from the Backend registry"
-                    .to_string()
+                "Not-found Workdir record can be deleted from the Backend registry".to_string()
             } else if file_status == "corrupted" {
                 "Corrupted Workdir can be deleted from Runtime storage and Backend registry"
                     .to_string()
@@ -1848,9 +1847,10 @@ fn execute_runtime_cleanup(
                     ));
                 }
                 cleanup_runtime_workdir_for_execution(api, runtime_id, candidate)?;
-                let deleted = api
-                    .store
-                    .delete_workdir_registry(&api.config.workspace_id, candidate.workdir_id.as_str())?;
+                let deleted = api.store.delete_workdir_registry(
+                    &api.config.workspace_id,
+                    candidate.workdir_id.as_str(),
+                )?;
                 if !deleted {
                     return Err(cleanup_api_error(
                         runtime_id,
@@ -1869,9 +1869,10 @@ fn execute_runtime_cleanup(
             }
             CleanupTargetKind::WorkdirCleanCleanup => {
                 cleanup_runtime_workdir_for_execution(api, runtime_id, candidate)?;
-                let deleted = api
-                    .store
-                    .delete_workdir_registry(&api.config.workspace_id, candidate.workdir_id.as_str())?;
+                let deleted = api.store.delete_workdir_registry(
+                    &api.config.workspace_id,
+                    candidate.workdir_id.as_str(),
+                )?;
                 if !deleted {
                     return Err(cleanup_api_error(
                         runtime_id,
@@ -1883,7 +1884,8 @@ fn execute_runtime_cleanup(
                     target_id: candidate.target_id.clone(),
                     action: candidate.action.clone(),
                     status: "deleted".to_string(),
-                    message: "Workdir deleted from Runtime storage and Backend registry".to_string(),
+                    message: "Workdir deleted from Runtime storage and Backend registry"
+                        .to_string(),
                 });
             }
             CleanupTargetKind::WorkdirRecordDelete => {
@@ -3933,7 +3935,7 @@ fn worker_launch_options_response(api: &WorkspaceApi) -> WorkerLaunchOptionsResp
         runtimes,
         profiles: worker_profile_candidates_for_root(&api.config.workspace_root),
         repositories: working_directory_repository_options(api),
-        working_directories: working_directory_summaries(api).unwrap_or_default(),
+        working_directories: available_working_directory_summaries(api).unwrap_or_default(),
         diagnostics: Vec::new(),
     }
 }
@@ -3964,6 +3966,32 @@ fn working_directory_summaries(api: &WorkspaceApi) -> ApiResult<Vec<WorkingDirec
         .iter()
         .map(workdir_summary_from_record)
         .collect::<Vec<_>>())
+}
+
+fn available_working_directory_summaries(
+    api: &WorkspaceApi,
+) -> ApiResult<Vec<WorkingDirectorySummary>> {
+    let limit = api.config.max_records.min(200);
+    for worker in api.runtime.list_workers(limit).items {
+        let _ = sync_worker_observation(api, &worker);
+    }
+    let records = working_directory_summaries(api)?;
+    let mut available = Vec::new();
+    for summary in records {
+        if summary.status != WorkingDirectoryStatusKind::Active
+            || summary.cleanliness.as_deref() != Some("clean")
+        {
+            continue;
+        }
+        let links = api.store.list_workdir_worker_links(
+            &api.config.workspace_id,
+            summary.working_directory_id.as_str(),
+        )?;
+        if links.is_empty() && summary.primary_worker_id.is_none() {
+            available.push(summary);
+        }
+    }
+    Ok(available)
 }
 
 fn runtime_working_directory_summaries(
@@ -4235,7 +4263,10 @@ fn sync_runtime_workdir_observations(
                             &status.summary,
                             management_kind.as_str(),
                         );
-                        preserve_workdir_identity_for_corrupted_summary(&mut updated, Some(&record));
+                        preserve_workdir_identity_for_corrupted_summary(
+                            &mut updated,
+                            Some(&record),
+                        );
                         api.store.upsert_workdir_registry(&updated)?;
                     }
                 } else {
@@ -4400,6 +4431,7 @@ fn workdir_summary_from_record(record: &WorkdirRegistryRecord) -> WorkingDirecto
         }),
         status,
         cleanliness: Some(record.cleanliness.clone()),
+        primary_worker_id: None,
         management_kind: Some(record.management_kind.clone()),
     }
 }

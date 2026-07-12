@@ -270,7 +270,8 @@ impl Runtime {
                 }
             })?
         };
-        Ok(backend.list_working_directories())
+        let statuses = backend.list_working_directories();
+        self.annotate_working_directory_statuses(statuses)
     }
 
     /// Get a Runtime-owned working directory status.
@@ -287,9 +288,10 @@ impl Runtime {
                 }
             })?
         };
-        backend
+        let status = backend
             .working_directory(working_directory_id)
-            .map_err(|diagnostic| RuntimeError::InvalidRequest(diagnostic.to_string()))
+            .map_err(|diagnostic| RuntimeError::InvalidRequest(diagnostic.to_string()))?;
+        self.annotate_working_directory_status(status)
     }
 
     /// Cleanup a Runtime-owned working directory.
@@ -300,6 +302,11 @@ impl Runtime {
         let backend = {
             let state = self.lock()?;
             state.ensure_running()?;
+            if let Some(worker_id) = state.primary_worker_id_for_workdir(working_directory_id) {
+                return Err(RuntimeError::InvalidRequest(format!(
+                    "working directory {working_directory_id} is assigned to worker {worker_id}"
+                )));
+            }
             state.execution_backend.clone().ok_or_else(|| {
                 RuntimeError::ExecutionBackendUnavailable {
                     message: "working directory cleanup requires an execution backend".to_string(),
@@ -309,6 +316,26 @@ impl Runtime {
         backend
             .cleanup_working_directory(working_directory_id)
             .map_err(|diagnostic| RuntimeError::InvalidRequest(diagnostic.to_string()))
+    }
+
+    fn annotate_working_directory_statuses(
+        &self,
+        statuses: Vec<CatalogWorkingDirectoryStatus>,
+    ) -> Result<Vec<CatalogWorkingDirectoryStatus>, RuntimeError> {
+        statuses
+            .into_iter()
+            .map(|status| self.annotate_working_directory_status(status))
+            .collect()
+    }
+
+    fn annotate_working_directory_status(
+        &self,
+        mut status: CatalogWorkingDirectoryStatus,
+    ) -> Result<CatalogWorkingDirectoryStatus, RuntimeError> {
+        let state = self.lock()?;
+        status.summary.primary_worker_id =
+            state.primary_worker_id_for_workdir(status.summary.working_directory_id.as_str());
+        Ok(status)
     }
 
     /// Create a Worker through the canonical profile-source + execution backend path.
@@ -321,6 +348,15 @@ impl Runtime {
             state.ensure_running()?;
             validate_create_worker_request(&request)?;
             state.validate_worker_config_boundary(&request)?;
+            if let Some(working_directory_id) = requested_primary_workdir_id(&request) {
+                if let Some(owner_worker_id) =
+                    state.primary_worker_id_for_workdir(working_directory_id)
+                {
+                    return Err(RuntimeError::InvalidRequest(format!(
+                        "working directory {working_directory_id} is already assigned to worker {owner_worker_id}"
+                    )));
+                }
+            }
             let backend = state.execution_backend.clone().ok_or_else(|| {
                 RuntimeError::ExecutionBackendUnavailable {
                     message: "worker creation requires an execution backend".to_string(),
@@ -1342,6 +1378,22 @@ impl RuntimeState {
             })
     }
 
+    fn primary_worker_id_for_workdir(&self, working_directory_id: &str) -> Option<WorkerId> {
+        self.workers.values().find_map(|worker| {
+            if worker
+                .execution
+                .working_directory
+                .as_ref()
+                .is_some_and(|binding| binding.summary.working_directory_id == working_directory_id)
+                || requested_primary_workdir_id(&worker.request) == Some(working_directory_id)
+            {
+                Some(worker.worker_id)
+            } else {
+                None
+            }
+        })
+    }
+
     fn push_event(
         &mut self,
         worker_ref: Option<WorkerRef>,
@@ -1508,6 +1560,19 @@ impl WorkerRecord {
             last_event_id: self.last_event_id,
         }
     }
+}
+
+fn requested_primary_workdir_id(request: &CreateWorkerRequest) -> Option<&str> {
+    request
+        .working_directory
+        .as_ref()
+        .map(|claim| claim.working_directory_id.as_str())
+        .or_else(|| {
+            request
+                .working_directory_request
+                .as_ref()
+                .and_then(|request| request.backend_workdir_id.as_deref())
+        })
 }
 
 fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), RuntimeError> {

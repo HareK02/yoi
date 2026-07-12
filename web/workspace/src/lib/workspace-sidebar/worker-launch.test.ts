@@ -53,6 +53,8 @@ const options: WorkerLaunchOptionsResponse = {
       materializer_kind: "local_git_worktree",
       resolved_commit: "0123456789abcdef",
       status: "active",
+      cleanliness: "clean",
+      primary_worker_id: null,
       cleanup_target: {
         kind: "git_worktree",
         working_directory_id: "wd-1-repo",

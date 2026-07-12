@@ -866,8 +866,8 @@ mod tests {
 
     use crate::Runtime as EmbeddedRuntime;
     use crate::catalog::{
-        ConfigBundleRef, CreateWorkerRequest, MaterializerKind, ProfileSelector, RepositorySelector,
-        WorkingDirectoryRepository, WorkingDirectoryRequest,
+        ConfigBundleRef, CreateWorkerRequest, MaterializerKind, ProfileSelector,
+        RepositorySelector, WorkingDirectoryRepository, WorkingDirectoryRequest,
     };
     use crate::execution::WorkerExecutionContext;
     use crate::identity::RuntimeId;

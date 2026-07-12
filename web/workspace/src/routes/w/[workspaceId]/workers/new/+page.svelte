@@ -43,7 +43,16 @@
   let isNewWorkingDirectorySelected = $derived(workingDirectoryId === NEW_WORKING_DIRECTORY_VALUE);
   let selectedRuntime = $derived(options?.runtimes.find((runtime) => runtime.runtime_id === runtimeId));
   let selectedRuntimeAllowsNoWorkdir = $derived(selectedRuntime?.working_directory_required === false);
-  let hasSelectedExistingWorkdir = $derived(Boolean(workingDirectoryId && !isNewWorkingDirectorySelected));
+  let hasSelectedExistingWorkdir = $derived(Boolean(
+    workingDirectoryId && !isNewWorkingDirectorySelected && !selectedRuntimeAllowsNoWorkdir,
+  ));
+  let availableWorkingDirectories = $derived(
+    selectedRuntimeAllowsNoWorkdir
+      ? []
+      : (options?.working_directories ?? []).filter((directory) =>
+        directory.status === 'active' && directory.cleanliness === 'clean' && directory.primary_worker_id == null
+      ),
+  );
   let canStartWorker = $derived(Boolean(
     runtimeId &&
       profile &&
@@ -63,6 +72,13 @@
     const controller = new AbortController();
     void loadLaunchOptions(controller.signal);
     return () => controller.abort();
+  });
+
+  $effect(() => {
+    if (selectedRuntimeAllowsNoWorkdir && workingDirectoryId) {
+      workingDirectoryId = '';
+      relativeCwd = '';
+    }
   });
 
   async function loadLaunchOptions(signal?: AbortSignal) {
@@ -109,6 +125,10 @@
       submitError = { message: 'select a runtime before creating a workdir', diagnostics: [] };
       return;
     }
+    if (selectedRuntimeAllowsNoWorkdir) {
+      submitError = { message: 'embedded Runtime does not create workdirs', diagnostics: [] };
+      return;
+    }
     if (!workingDirectoryRepositoryId) {
       submitError = { message: 'select a repository before creating a workdir', diagnostics: [] };
       return;
@@ -124,7 +144,6 @@
             runtime_id: runtimeId,
             repository_id: workingDirectoryRepositoryId,
             selector: workingDirectorySelector || null,
-            policy: { dirty_state: 'clean_point_only', cleanup: 'manual_or_worker_stop' },
           }),
         },
       );
@@ -245,16 +264,16 @@
           <span>Run at</span>
           <select class="worker-inline-select wd-select" bind:value={workingDirectoryId} aria-label="Workdir">
             {#if selectedRuntimeAllowsNoWorkdir}
-              <option value="">No workdir · embedded conversation only</option>
+              <option value="">No workdir</option>
             {:else}
               <option value="" disabled>Select workdir</option>
+              {#each availableWorkingDirectories as directory}
+                <option value={directory.working_directory_id}>
+                  {directory.repository_id} · {directory.requested_selector ?? 'HEAD'}
+                </option>
+              {/each}
+              <option value={NEW_WORKING_DIRECTORY_VALUE}>New workdir…</option>
             {/if}
-            {#each options?.working_directories ?? [] as directory}
-              <option value={directory.working_directory_id} disabled={directory.status !== 'active'}>
-                {directory.repository_id} · {directory.requested_selector ?? 'HEAD'}
-              </option>
-            {/each}
-            <option value={NEW_WORKING_DIRECTORY_VALUE}>New workdir…</option>
           </select>
           <span>in</span>
           <select class="worker-inline-select runtime-select" bind:value={runtimeId} required aria-label="Runtime">
