@@ -1,9 +1,11 @@
 ---
 title: 'Allow not-found Workdir cleanup action'
-state: 'planning'
+state: 'inprogress'
 created_at: '2026-07-13T11:43:33Z'
-updated_at: '2026-07-13T11:44:00Z'
+updated_at: '2026-07-13T11:44:18Z'
 assignee: null
+queued_by: 'yoi ticket'
+queued_at: '2026-07-13T11:44:18Z'
 ---
 
 ## 背景
