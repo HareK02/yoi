@@ -1,9 +1,11 @@
 ---
 title: 'Restore Worker without backend profile fetch'
-state: 'planning'
+state: 'inprogress'
 created_at: '2026-07-13T14:44:12Z'
-updated_at: '2026-07-13T14:44:40Z'
+updated_at: '2026-07-13T14:45:04Z'
 assignee: null
+queued_by: 'yoi ticket'
+queued_at: '2026-07-13T14:45:04Z'
 ---
 
 ## 背景
