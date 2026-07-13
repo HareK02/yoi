@@ -1,5 +1,6 @@
 use crate::execution::WorkerExecutionResult;
 use crate::identity::WorkerId;
+use crate::working_directory::WorkingDirectoryDiagnostic;
 use std::path::PathBuf;
 
 /// Errors returned by the embedded Runtime API.
@@ -37,6 +38,9 @@ pub enum RuntimeError {
 
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+
+    #[error(transparent)]
+    WorkingDirectory(#[from] WorkingDirectoryDiagnostic),
 
     #[error("config bundle `{bundle_id}` was not found")]
     ConfigBundleMissing { bundle_id: String },

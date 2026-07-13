@@ -4290,7 +4290,7 @@ fn sync_runtime_workdir_observations(
 fn workdir_status_from_runtime_miss(diagnostics: &[RuntimeDiagnostic]) -> &'static str {
     if diagnostics
         .iter()
-        .any(|diagnostic| diagnostic.code.contains("not_found"))
+        .any(|diagnostic| diagnostic.code == "working_directory_not_found")
     {
         "not_found"
     } else {
@@ -5208,6 +5208,26 @@ mod tests {
         assert_eq!(
             sanitized,
             "failed to open /home/example/.yoi/workspace-backend.local.toml"
+        );
+    }
+
+    #[test]
+    fn workdir_runtime_miss_uses_exact_typed_code() {
+        assert_eq!(
+            workdir_status_from_runtime_miss(&[RuntimeDiagnostic {
+                code: "working_directory_not_found".to_string(),
+                severity: DiagnosticSeverity::Warning,
+                message: "missing".to_string(),
+            }]),
+            "not_found"
+        );
+        assert_eq!(
+            workdir_status_from_runtime_miss(&[RuntimeDiagnostic {
+                code: "some_other_not_found".to_string(),
+                severity: DiagnosticSeverity::Warning,
+                message: "not a typed workdir miss".to_string(),
+            }]),
+            "unknown"
         );
     }
 

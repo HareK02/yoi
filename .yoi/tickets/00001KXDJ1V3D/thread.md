@@ -40,3 +40,36 @@ State changed to `inprogress`.
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-13T11:16:48Z -->
+
+## Implementation report
+
+Removed text/substring-based Workdir not-found handling.
+
+- Added `RuntimeError::WorkingDirectory(WorkingDirectoryDiagnostic)` so worker-runtime preserves typed Workdir diagnostic codes instead of flattening them into `invalid_request`.
+- Worker Runtime REST errors now return Workdir diagnostic codes such as `working_directory_not_found` as `error.code` and map that code to HTTP 404.
+- Remote Runtime HTTP error mapping now preserves typed error codes from Runtime error bodies instead of remapping all HTTP 404 responses to a generic worker-not-found code.
+- Embedded Runtime diagnostics also preserve typed Workdir diagnostic codes.
+- `workdir_status_from_runtime_miss` now uses exact `diagnostic.code == "working_directory_not_found"` rather than substring matching.
+- Added tests for preserving Workdir REST error codes and for exact Workdir miss classification.
+
+Validation:
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check -q`
+- `cargo test -q -p worker-runtime --features fs-store,ws-server`
+- `cargo test -q -p yoi-workspace-server`
+- `nix build .#yoi --no-link`
+
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-07-13T11:16:48Z from: inprogress to: done reason: cli_state field: state -->
+
+## State changed
+
+State changed to `done`.
+
+
+---

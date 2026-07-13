@@ -761,15 +761,15 @@ async fn require_local_token(
 #[derive(Debug)]
 struct RuntimeHttpRestError {
     status: StatusCode,
-    code: &'static str,
+    code: String,
     message: String,
 }
 
 impl RuntimeHttpRestError {
-    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+    fn new(status: StatusCode, code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             status,
-            code,
+            code: code.into(),
             message: message.into(),
         }
     }
@@ -801,7 +801,7 @@ impl IntoResponse for RuntimeHttpRestError {
     fn into_response(self) -> Response {
         let body = RuntimeHttpErrorResponse {
             error: RuntimeHttpErrorDetail {
-                code: self.code.to_string(),
+                code: self.code,
                 message: self.message,
             },
         };
@@ -814,6 +814,11 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
         RuntimeError::WorkerNotFound { .. } | RuntimeError::ConfigBundleMissing { .. } => {
             StatusCode::NOT_FOUND
         }
+        RuntimeError::WorkingDirectory(diagnostic)
+            if diagnostic.code == "working_directory_not_found" =>
+        {
+            StatusCode::NOT_FOUND
+        }
         RuntimeError::RuntimeStopped
         | RuntimeError::WorkerExecutionUnavailable { .. }
         | RuntimeError::ExecutionBackendUnavailable { .. }
@@ -823,7 +828,8 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
         | RuntimeError::InvalidInitialInputKind { .. }
         | RuntimeError::ConfigBundleDigestMismatch { .. }
         | RuntimeError::InvalidProfileSelector { .. }
-        | RuntimeError::UnsupportedConfigDeclaration { .. } => StatusCode::BAD_REQUEST,
+        | RuntimeError::UnsupportedConfigDeclaration { .. }
+        | RuntimeError::WorkingDirectory(_) => StatusCode::BAD_REQUEST,
         RuntimeError::StoreIo { .. }
         | RuntimeError::StoreMissing { .. }
         | RuntimeError::StoreCorrupt { .. }
@@ -831,24 +837,33 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
     }
 }
 
-fn code_for_runtime_error(error: &RuntimeError) -> &'static str {
+fn code_for_runtime_error(error: &RuntimeError) -> String {
     match error {
-        RuntimeError::RuntimeStopped => "runtime_stopped",
-        RuntimeError::WorkerNotFound { .. } => "worker_not_found",
-        RuntimeError::WorkerExecutionUnavailable { .. } => "worker_execution_unavailable",
-        RuntimeError::ExecutionBackendUnavailable { .. } => "execution_backend_unavailable",
-        RuntimeError::WorkerExecutionRejected { .. } => "worker_execution_rejected",
-        RuntimeError::LimitTooLarge { .. } => "limit_too_large",
-        RuntimeError::InvalidRequest(_) => "invalid_request",
-        RuntimeError::InvalidInitialInputKind { .. } => "invalid_initial_input_kind",
-        RuntimeError::ConfigBundleMissing { .. } => "config_bundle_missing",
-        RuntimeError::ConfigBundleDigestMismatch { .. } => "config_bundle_digest_mismatch",
-        RuntimeError::InvalidProfileSelector { .. } => "invalid_profile_selector",
-        RuntimeError::UnsupportedConfigDeclaration { .. } => "unsupported_config_declaration",
-        RuntimeError::StoreIo { .. } => "store_io",
-        RuntimeError::StoreMissing { .. } => "store_missing",
-        RuntimeError::StoreCorrupt { .. } => "store_corrupt",
-        RuntimeError::StatePoisoned => "state_poisoned",
+        RuntimeError::RuntimeStopped => "runtime_stopped".to_string(),
+        RuntimeError::WorkerNotFound { .. } => "worker_not_found".to_string(),
+        RuntimeError::WorkerExecutionUnavailable { .. } => {
+            "worker_execution_unavailable".to_string()
+        }
+        RuntimeError::ExecutionBackendUnavailable { .. } => {
+            "execution_backend_unavailable".to_string()
+        }
+        RuntimeError::WorkerExecutionRejected { .. } => "worker_execution_rejected".to_string(),
+        RuntimeError::LimitTooLarge { .. } => "limit_too_large".to_string(),
+        RuntimeError::InvalidRequest(_) => "invalid_request".to_string(),
+        RuntimeError::WorkingDirectory(diagnostic) => diagnostic.code.clone(),
+        RuntimeError::InvalidInitialInputKind { .. } => "invalid_initial_input_kind".to_string(),
+        RuntimeError::ConfigBundleMissing { .. } => "config_bundle_missing".to_string(),
+        RuntimeError::ConfigBundleDigestMismatch { .. } => {
+            "config_bundle_digest_mismatch".to_string()
+        }
+        RuntimeError::InvalidProfileSelector { .. } => "invalid_profile_selector".to_string(),
+        RuntimeError::UnsupportedConfigDeclaration { .. } => {
+            "unsupported_config_declaration".to_string()
+        }
+        RuntimeError::StoreIo { .. } => "store_io".to_string(),
+        RuntimeError::StoreMissing { .. } => "store_missing".to_string(),
+        RuntimeError::StoreCorrupt { .. } => "store_corrupt".to_string(),
+        RuntimeError::StatePoisoned => "state_poisoned".to_string(),
     }
 }
 
@@ -1124,6 +1139,21 @@ mod tests {
         let error: RuntimeHttpErrorResponse = read_json(response).await;
         assert_eq!(error.error.code, "worker_not_found");
         assert!(error.error.message.contains("999"));
+    }
+
+    #[test]
+    fn workdir_runtime_errors_preserve_diagnostic_code() {
+        let error =
+            RuntimeError::WorkingDirectory(crate::working_directory::WorkingDirectoryDiagnostic {
+                code: "working_directory_not_found".to_string(),
+                message: "working directory missing-workdir was not found".to_string(),
+            });
+
+        assert_eq!(status_for_runtime_error(&error), StatusCode::NOT_FOUND);
+        assert_eq!(
+            code_for_runtime_error(&error),
+            "working_directory_not_found"
+        );
     }
 }
 

@@ -233,7 +233,7 @@ impl Runtime {
         };
         backend
             .create_working_directory(&request)
-            .map_err(|diagnostic| RuntimeError::InvalidRequest(diagnostic.to_string()))
+            .map_err(RuntimeError::from)
     }
 
     /// List Runtime-owned working directories through the attached execution backend.
@@ -269,7 +269,7 @@ impl Runtime {
         };
         let status = backend
             .working_directory(working_directory_id)
-            .map_err(|diagnostic| RuntimeError::InvalidRequest(diagnostic.to_string()))?;
+            .map_err(RuntimeError::from)?;
         self.annotate_working_directory_status(status)
     }
 
@@ -294,7 +294,7 @@ impl Runtime {
         };
         backend
             .cleanup_working_directory(working_directory_id)
-            .map_err(|diagnostic| RuntimeError::InvalidRequest(diagnostic.to_string()))
+            .map_err(RuntimeError::from)
     }
 
     fn annotate_working_directory_statuses(

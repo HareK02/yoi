@@ -2144,7 +2144,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 worker: Some(self.map_worker_detail(response.worker)),
                 diagnostics: Vec::new(),
             },
-            Err(diagnostic) if diagnostic.code == "remote_worker_not_found" => WorkerLookupResult {
+            Err(diagnostic) if diagnostic.code == "worker_not_found" => WorkerLookupResult {
                 worker: None,
                 diagnostics: Vec::new(),
             },
@@ -2860,6 +2860,11 @@ fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnosti
             DiagnosticSeverity::Warning,
             error.to_string(),
         ),
+        EmbeddedRuntimeError::WorkingDirectory(workdir_diagnostic) => diagnostic(
+            workdir_diagnostic.code.clone(),
+            DiagnosticSeverity::Warning,
+            workdir_diagnostic.message.clone(),
+        ),
         EmbeddedRuntimeError::InvalidRequest(_)
         | EmbeddedRuntimeError::ConfigBundleMissing { .. }
         | EmbeddedRuntimeError::ConfigBundleDigestMismatch { .. }
@@ -2989,7 +2994,8 @@ fn remote_http_status_diagnostic(
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
             ("remote_runtime_auth_failed", DiagnosticSeverity::Error)
         }
-        StatusCode::NOT_FOUND => ("remote_worker_not_found", DiagnosticSeverity::Warning),
+        _ if error.is_some() => (remote_code, DiagnosticSeverity::Warning),
+        StatusCode::NOT_FOUND => ("remote_runtime_not_found", DiagnosticSeverity::Warning),
         StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED => {
             ("remote_runtime_unsupported", DiagnosticSeverity::Warning)
         }
