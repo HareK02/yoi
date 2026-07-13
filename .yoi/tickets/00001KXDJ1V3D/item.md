@@ -1,9 +1,11 @@
 ---
 title: 'Preserve typed Workdir not-found errors'
-state: 'planning'
+state: 'inprogress'
 created_at: '2026-07-13T10:58:32Z'
-updated_at: '2026-07-13T10:59:00Z'
+updated_at: '2026-07-13T10:59:02Z'
 assignee: null
+queued_by: 'yoi ticket'
+queued_at: '2026-07-13T10:59:02Z'
 ---
 
 ## 背景
