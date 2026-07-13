@@ -1810,6 +1810,8 @@ fn build_runtime_cleanup_plan(
             estimated_reclaim_bytes: None,
         });
     }
+    worker_candidates.sort_by(|left, right| left.target_id.cmp(&right.target_id));
+    workdir_candidates.sort_by(|left, right| left.target_id.cmp(&right.target_id));
     diagnostics.truncate(16);
     let generated_at = now_registry_timestamp();
     let digest = cleanup_plan_digest(&worker_candidates, &workdir_candidates)?;
