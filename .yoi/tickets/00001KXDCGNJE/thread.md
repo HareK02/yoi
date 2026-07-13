@@ -40,3 +40,39 @@ State changed to `inprogress`.
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-13T09:31:37Z -->
+
+## Implementation report
+
+Removed `worker-runtime-rest-server` `--workspace` and `--cwd` options.
+
+- Removed process config fields and CLI parsing for workspace/cwd.
+- Runtime Worker factory now uses a Runtime-local `worker-root` under the Runtime root instead of a workspace root for workdirless Workers.
+- Workdir bindings still provide their materialized root/cwd when a Worker has a Workdir.
+- Help no longer lists `--workspace` / `--cwd`; specifying either now fails as an unknown argument.
+
+Validation:
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check -q`
+- `cargo check -q -p worker-runtime --features fs-store,ws-server`
+- `cargo test -q -p worker-runtime --features fs-store,ws-server`
+- `cargo test -q -p yoi-workspace-server`
+- `cargo run -q -p worker-runtime --features ws-server,fs-store --bin worker-runtime-rest-server -- --help`
+- `cargo run -q -p worker-runtime --features ws-server,fs-store --bin worker-runtime-rest-server -- --workspace /tmp` rejects the removed option
+- `cargo run -q -p worker-runtime --features ws-server,fs-store --bin worker-runtime-rest-server -- --cwd /tmp` rejects the removed option
+- Started `worker-runtime-rest-server` with only `--bind` and `--fs-root` and verified `/v1/runtime` responds with `backend: fs_store`
+- `nix build .#yoi --no-link`
+
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-07-13T09:31:37Z from: inprogress to: done reason: cli_state field: state -->
+
+## State changed
+
+State changed to `done`.
+
+
+---

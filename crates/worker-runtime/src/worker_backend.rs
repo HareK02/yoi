@@ -65,7 +65,6 @@ pub trait RuntimeWorkerFactory: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct ProfileRuntimeWorkerFactory {
     profile_base_dir: PathBuf,
-    cwd: PathBuf,
     store_dir: Option<PathBuf>,
     worker_metadata_dir: Option<PathBuf>,
     profile: Option<String>,
@@ -78,7 +77,6 @@ impl ProfileRuntimeWorkerFactory {
     pub fn new(profile_base_dir: impl Into<PathBuf>) -> Self {
         let profile_base_dir = profile_base_dir.into();
         Self {
-            cwd: profile_base_dir.clone(),
             profile_base_dir,
             store_dir: None,
             worker_metadata_dir: None,
@@ -87,11 +85,6 @@ impl ProfileRuntimeWorkerFactory {
             resource_client: None,
             profile_archive_cache: Arc::new(ProfileSourceArchiveCache::default()),
         }
-    }
-
-    pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
-        self.cwd = cwd.into();
-        self
     }
 
     pub fn with_store_dir(mut self, store_dir: impl Into<PathBuf>) -> Self {

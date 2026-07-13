@@ -1,8 +1,8 @@
 ---
 title: 'Remove workspace and cwd from worker runtime server'
-state: 'inprogress'
+state: 'done'
 created_at: '2026-07-13T09:21:46Z'
-updated_at: '2026-07-13T09:22:30Z'
+updated_at: '2026-07-13T09:31:37Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-13T09:22:30Z'

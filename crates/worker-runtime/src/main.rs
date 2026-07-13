@@ -66,8 +66,8 @@ fn run() -> Result<(), ProcessError> {
 }
 
 fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
-    let mut factory = ProfileRuntimeWorkerFactory::new(config.workspace_root.clone())
-        .with_cwd(config.cwd.clone());
+    let runtime_root = working_directory_runtime_root(config);
+    let mut factory = ProfileRuntimeWorkerFactory::new(runtime_root.join("worker-root"));
     if let Some(store_dir) = config.worker_store_dir.clone() {
         factory = factory.with_store_dir(store_dir);
     }
@@ -168,12 +168,6 @@ where
             "--display-name" => {
                 config.http.display_name = Some(take_value(&flag, inline_value, &mut args)?);
             }
-            "--workspace" => {
-                config.workspace_root = PathBuf::from(take_value(&flag, inline_value, &mut args)?);
-            }
-            "--cwd" => {
-                config.cwd = PathBuf::from(take_value(&flag, inline_value, &mut args)?);
-            }
             "--worker-store-dir" => {
                 config.worker_store_dir =
                     Some(PathBuf::from(take_value(&flag, inline_value, &mut args)?));
@@ -250,31 +244,7 @@ where
     }
 
     apply_store_selection(&mut config.http, store)?;
-    config.workspace_root = normalize_workspace_path(config.workspace_root)?;
-    if config.cwd.as_os_str().is_empty() {
-        config.cwd = config.workspace_root.clone();
-    } else {
-        config.cwd = normalize_child_path(&config.workspace_root, config.cwd);
-    }
     Ok(Some(config))
-}
-
-fn normalize_workspace_path(path: PathBuf) -> Result<PathBuf, ProcessError> {
-    let absolute = if path.is_absolute() {
-        path
-    } else {
-        env::current_dir()?.join(path)
-    };
-    Ok(absolute.canonicalize().unwrap_or(absolute))
-}
-
-fn normalize_child_path(base: &std::path::Path, path: PathBuf) -> PathBuf {
-    if path.is_absolute() {
-        path.canonicalize().unwrap_or(path)
-    } else {
-        let absolute = base.join(path);
-        absolute.canonicalize().unwrap_or(absolute)
-    }
 }
 
 fn split_flag_value(arg: String) -> Result<(String, Option<String>), ProcessError> {
@@ -328,8 +298,6 @@ fn apply_store_selection(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProcessConfig {
     http: RuntimeHttpServerConfig,
-    workspace_root: PathBuf,
-    cwd: PathBuf,
     worker_store_dir: Option<PathBuf>,
     worker_metadata_dir: Option<PathBuf>,
     worker_runtime_base_dir: Option<PathBuf>,
@@ -340,11 +308,8 @@ struct ProcessConfig {
 
 impl ProcessConfig {
     fn default() -> Result<Self, ProcessError> {
-        let workspace_root = env::current_dir()?;
         Ok(Self {
             http: RuntimeHttpServerConfig::default(),
-            cwd: workspace_root.clone(),
-            workspace_root,
             worker_store_dir: None,
             worker_metadata_dir: None,
             worker_runtime_base_dir: None,
@@ -418,8 +383,6 @@ Browsers must not connect to this Runtime process directly.\n\n\
 Options:\n\
   --bind <ADDR>                         Bind socket address (default: 127.0.0.1:38800)\n\
   --display-name <NAME>                 Runtime display name\n\
-  --workspace <PATH>                    Workspace root used for spawned Workers (default: cwd)\n\
-  --cwd <PATH>                          Process cwd used for spawned Workers (default: workspace)\n\
   --profile <SELECTOR>                  Force spawned Workers to use a Profile selector\n\
   --worker-store-dir <PATH>             Worker session store directory\n\
   --worker-metadata-dir <PATH>          Worker metadata directory\n\
@@ -454,14 +417,9 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_relative_workspace_for_worker_spawn() {
-        let current_dir = env::current_dir().unwrap().canonicalize().unwrap();
-        let config = parse_args(["--workspace", ".", "--cwd", "."])
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(config.workspace_root, current_dir);
-        assert_eq!(config.cwd, current_dir);
+    fn rejects_removed_workspace_and_cwd_options() {
+        assert!(parse_args(["--workspace", "/tmp/workspace"]).is_err());
+        assert!(parse_args(["--cwd", "/tmp/workspace"]).is_err());
     }
 
     #[test]
@@ -471,10 +429,6 @@ mod tests {
             "127.0.0.1:0",
             "--display-name",
             "Runtime Alpha",
-            "--workspace",
-            "/tmp/workspace",
-            "--cwd",
-            "/tmp/workspace/subdir",
             "--profile",
             "builtin:coder",
             "--local-token-env",
@@ -490,10 +444,6 @@ mod tests {
             "127.0.0.1:0",
             "--display-name",
             "Runtime Alpha",
-            "--workspace",
-            "/tmp/workspace",
-            "--cwd",
-            "/tmp/workspace/subdir",
             "--profile",
             "builtin:coder",
             "--local-token-env",
@@ -507,8 +457,6 @@ mod tests {
 
         assert_eq!(config.http.bind_addr, "127.0.0.1:0".parse().unwrap());
         assert_eq!(config.http.display_name.as_deref(), Some("Runtime Alpha"));
-        assert_eq!(config.workspace_root, PathBuf::from("/tmp/workspace"));
-        assert_eq!(config.cwd, PathBuf::from("/tmp/workspace/subdir"));
         assert_eq!(config.profile.as_deref(), Some("builtin:coder"));
         assert_eq!(config.http.local_token.as_deref(), Some("secret-token"));
     }
