@@ -1,8 +1,8 @@
 ---
 title: 'Stop Worker before cleanup deletion'
-state: 'inprogress'
+state: 'done'
 created_at: '2026-07-13T13:58:15Z'
-updated_at: '2026-07-13T13:58:54Z'
+updated_at: '2026-07-13T14:05:35Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-13T13:58:54Z'

@@ -2024,6 +2024,28 @@ fn cleanup_runtime_worker_for_execution(
     runtime_id: &str,
     candidate: &CleanupWorkerCandidate,
 ) -> ApiResult<()> {
+    match api.runtime.stop_worker(
+        runtime_id,
+        candidate.runtime_worker_id.as_str(),
+        WorkerLifecycleRequest {
+            reason: Some("cleanup worker before deletion".to_string()),
+        },
+    ) {
+        Ok(result) if result.state == WorkerOperationState::Accepted => {}
+        Ok(result) => {
+            return Err(ApiError::with_diagnostics(
+                Error::RuntimeOperationFailed {
+                    runtime_id: runtime_id.to_string(),
+                    code: "workspace_cleanup_worker_runtime_stop_rejected".to_string(),
+                    message: "Runtime did not stop selected Worker before deletion".to_string(),
+                },
+                result.diagnostics,
+            ));
+        }
+        Err(RuntimeRegistryError::UnknownWorker { .. }) => return Ok(()),
+        Err(error) => return Err(error.into_error().into()),
+    }
+
     match api
         .runtime
         .delete_worker(runtime_id, candidate.runtime_worker_id.as_str())
@@ -2033,7 +2055,7 @@ fn cleanup_runtime_worker_for_execution(
             Error::RuntimeOperationFailed {
                 runtime_id: runtime_id.to_string(),
                 code: "workspace_cleanup_worker_runtime_delete_rejected".to_string(),
-                message: "Runtime did not delete selected Worker".to_string(),
+                message: "Runtime did not delete selected Worker after stopping it".to_string(),
             },
             result.diagnostics,
         )),
