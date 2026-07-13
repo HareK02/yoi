@@ -1,9 +1,11 @@
 ---
 title: 'Use live Worker snapshot for runtime observation'
-state: 'planning'
+state: 'inprogress'
 created_at: '2026-07-13T17:48:09Z'
-updated_at: '2026-07-13T17:48:30Z'
+updated_at: '2026-07-13T17:48:47Z'
 assignee: null
+queued_by: 'yoi ticket'
+queued_at: '2026-07-13T17:48:47Z'
 ---
 
 ## 背景
