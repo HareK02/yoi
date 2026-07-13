@@ -20,9 +20,8 @@ impl Scheme for OpenAIResponsesScheme {
     type State = OpenAIResponsesState;
 
     fn default_base_url(&self) -> &'static str {
-        // `/v1` は base_url 側に寄せる。ChatGPT OAuth 経由のときは
-        // `https://chatgpt.com/backend-api/codex` を base にすれば同じ
-        // `/responses` path で両系統を吸収できる（Codex CLI 準拠）。
+        // `/v1` は base_url 側に寄せる。互換 backend を使う場合も、
+        // base URL を差し替えるだけで同じ `/responses` path を使える。
         "https://api.openai.com/v1"
     }
 
@@ -59,16 +58,18 @@ impl Scheme for OpenAIResponsesScheme {
 
     fn validate_config(&self, config: &RequestConfig) -> Vec<ConfigWarning> {
         let mut warnings = Vec::new();
-        // ChatGPT backend (codex-oauth) は `max_output_tokens` を 400 で弾く。
-        // scheme 構築時に `send_max_output_tokens=false` で組まれていれば
-        // body 投影は止まっているので、ユーザの意図が落ちることだけを通知する。
+        // Some compatible backends reject `max_output_tokens` with HTTP 400.
+        // If the scheme was built with `send_max_output_tokens=false`, body
+        // projection is already disabled; only notify that the user's intent
+        // was dropped.
         if !self.send_max_output_tokens && config.max_tokens.is_some() {
             warnings.push(ConfigWarning::unsupported(
                 "max_tokens",
                 "OpenAI Responses (ChatGPT backend)",
             ));
         }
-        // 同上、`temperature` / `top_p` も ChatGPT backend では 400 で弾かれる。
+        // Same for `temperature` / `top_p` on compatible backends that
+        // reject unsupported sampling parameters.
         if !self.send_sampling_params {
             if config.temperature.is_some() {
                 warnings.push(ConfigWarning::unsupported(

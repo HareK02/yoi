@@ -28,11 +28,11 @@ use super::types::{Request, RequestConfig};
 pub const DEFAULT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 pub const DEFAULT_FIRST_STREAM_EVENT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// `AuthRef` を解決したランタイム表現。`crates/provider` が構築する。
+/// 認証設定をリクエスト時に使える形へ解決したランタイム表現。
 ///
 /// - `None`: 認証ヘッダを送らない（Ollama 等の opt-out）
 /// - `ApiKey`: 静的な API key 文字列
-/// - `Custom`: リクエスト毎に動的にヘッダを組み立てる（Codex OAuth 等）
+/// - `Custom`: リクエスト毎に動的にヘッダを組み立てる
 #[derive(Debug, Clone)]
 pub enum ResolvedAuth {
     None,
@@ -226,9 +226,8 @@ impl<S: Scheme> HttpTransport<S> {
             let value = HeaderValue::from_str(cache_key).map_err(|e| {
                 ClientError::Config(format!("invalid Codex conversation header: {e}"))
             })?;
-            // Codex CLI sends hyphenated session/thread headers to the
-            // ChatGPT Codex backend. Keep the legacy underscore header for
-            // existing traces/backends while exposing the current Codex shape.
+            // Send both current hyphenated conversation headers and the
+            // legacy underscore form for compatibility with existing backends.
             headers.insert(HeaderName::from_static("session-id"), value.clone());
             headers.insert(HeaderName::from_static("thread-id"), value.clone());
             headers.insert(HeaderName::from_static("session_id"), value.clone());

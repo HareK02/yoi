@@ -20,7 +20,7 @@ Does not own:
 
 ## Design notes
 
-Macros reduce boilerplate, but they must not imply capability. A generated tool definition is still subject to manifest permissions, Worker scope, and runtime policy.
+Macros reduce boilerplate, but they must not imply capability. A generated tool definition is still subject to host permissions, application scope, and runtime policy.
 
 ## See also
 

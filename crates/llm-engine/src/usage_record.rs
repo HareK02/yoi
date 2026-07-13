@@ -2,9 +2,8 @@
 //!
 //! 1 リクエストの送信時点での「ある history prefix 長で計測した占有量」を
 //! 1 件分にまとめたもの。`UsageEvent` (provider stream イベント) を
-//! 受けて呼び出し側 (typically Worker) が組み立て、永続化層
-//! (session-store) に流したり、token accounting (`token_counter`) で
-//! 履歴として参照したりする。
+//! 受けて呼び出し側が組み立て、永続化層に流したり、token accounting
+//! (`token_counter`) で履歴として参照したりする。
 
 /// LLM リクエスト送信時点での占有量スナップショット。
 #[derive(Debug, Clone, PartialEq, Eq)]

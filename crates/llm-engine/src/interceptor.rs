@@ -1,9 +1,8 @@
 //! Interceptor - control flow delegation for the Engine execution loop
 //!
-//! Defines the [`Interceptor`] trait that upper layers (e.g. Worker) implement
-//! to inject orchestration decisions (approval, skip, pause, abort)
-//! into the Engine's turn loop without the Engine knowing about
-//! higher-level concepts.
+//! Defines the [`Interceptor`] trait that callers implement to inject
+//! orchestration decisions (approval, skip, pause, abort) into the Engine's
+//! turn loop without the Engine knowing about host-application concepts.
 
 use std::sync::Arc;
 
@@ -132,8 +131,8 @@ pub struct ToolResultInfo {
 /// Intercepts the Engine execution loop at key decision points.
 ///
 /// All methods have default implementations that let the Engine
-/// proceed without intervention. Upper layers (e.g. Worker) provide
-/// richer implementations for approval flows, permission checks, etc.
+/// proceed without intervention. Callers provide richer implementations for
+/// approval flows, permission checks, etc.
 #[async_trait]
 pub trait Interceptor: Send + Sync {
     /// Called after receiving user input, before adding to history.
@@ -149,7 +148,7 @@ pub trait Interceptor: Send + Sync {
     ///
     /// Use this for inputs that arrive from outside the LLM and need
     /// to be reflected in the on-disk history — notifications,
-    /// cross-Worker events, system reminders. Do **not** use
+    /// external events, system reminders. Do **not** use
     /// [`Self::pre_llm_request`] for that purpose: it mutates a
     /// per-request clone, so any committed assistant response that
     /// reacts to the injection would have no visible trigger on the
