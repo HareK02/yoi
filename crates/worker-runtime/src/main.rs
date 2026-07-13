@@ -66,17 +66,11 @@ fn run() -> Result<(), ProcessError> {
 }
 
 fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
-    let runtime_root = working_directory_runtime_root(config);
-    let mut factory = ProfileRuntimeWorkerFactory::new(runtime_root.join("worker-root"));
-    if let Some(store_dir) = config.worker_store_dir.clone() {
-        factory = factory.with_store_dir(store_dir);
-    }
-    if let Some(metadata_dir) = config.worker_metadata_dir.clone() {
-        factory = factory.with_worker_metadata_dir(metadata_dir);
-    }
-    if let Some(runtime_base_dir) = config.worker_runtime_base_dir.clone() {
-        factory = factory.with_runtime_base_dir(runtime_base_dir);
-    }
+    let fs_paths = config.resolved_fs_paths();
+    let mut factory = ProfileRuntimeWorkerFactory::new(fs_paths.worker_dir.join("worker-root"))
+        .with_store_dir(fs_paths.worker_dir.join("sessions"))
+        .with_worker_metadata_dir(fs_paths.worker_dir.join("metadata"))
+        .with_runtime_base_dir(fs_paths.worker_dir.join("runtime"));
     if let Some(endpoint) = config.backend_resource_endpoint.clone() {
         factory = factory.with_resource_client(Arc::new(
             worker_runtime::resource::HttpBackendResourceClient::new(
@@ -88,12 +82,11 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
     if let Some(profile) = config.profile.clone() {
         factory = factory.with_profile(profile);
     }
-    let working_directory_root = working_directory_runtime_root(config);
     let backend = Arc::new(
         WorkerRuntimeExecutionBackend::new(factory)
             .map_err(ProcessError::WorkerAdapter)?
             .with_working_directory_materializer(LocalGitWorktreeMaterializer::new(
-                working_directory_root,
+                fs_paths.workdir_target.clone(),
             )),
     );
 
@@ -115,22 +108,6 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
     }
 }
 
-fn working_directory_runtime_root(config: &ProcessConfig) -> PathBuf {
-    match &config.http.store {
-        RuntimeHttpStoreSelection::Fs { root } => root.clone(),
-        _ => config
-            .worker_runtime_base_dir
-            .clone()
-            .unwrap_or_else(default_working_directory_runtime_root),
-    }
-}
-
-fn default_working_directory_runtime_root() -> PathBuf {
-    manifest::paths::data_dir()
-        .map(|data_dir| data_dir.join("worker-runtime"))
-        .unwrap_or_else(|| env::temp_dir().join("yoi-worker-runtime"))
-}
-
 fn runtime_options_from_http(config: &RuntimeHttpServerConfig) -> RuntimeOptions {
     RuntimeOptions {
         display_name: config.display_name.clone(),
@@ -138,10 +115,8 @@ fn runtime_options_from_http(config: &RuntimeHttpServerConfig) -> RuntimeOptions
     }
 }
 
-fn default_fs_root() -> Option<PathBuf> {
-    manifest::paths::data_dir()
-        .map(|data_dir| data_dir.join("worker-runtime-rest"))
-        .or_else(|| Some(env::temp_dir().join("yoi-worker-runtime-rest")))
+fn default_fs_root() -> PathBuf {
+    manifest::paths::data_dir().unwrap_or_else(|| env::temp_dir().join("yoi"))
 }
 
 fn parse_args<I, S>(args: I) -> Result<Option<ProcessConfig>, ProcessError>
@@ -150,9 +125,6 @@ where
     S: Into<String>,
 {
     let mut config = ProcessConfig::default()?;
-    let mut store = StoreArg::Fs {
-        root: default_fs_root(),
-    };
     let mut args = args.into_iter().map(Into::into).collect::<VecDeque<_>>();
 
     while let Some(arg) = args.pop_front() {
@@ -168,16 +140,16 @@ where
             "--display-name" => {
                 config.http.display_name = Some(take_value(&flag, inline_value, &mut args)?);
             }
-            "--worker-store-dir" => {
-                config.worker_store_dir =
+            "--fs-worker-dir" => {
+                config.fs_worker_dir =
                     Some(PathBuf::from(take_value(&flag, inline_value, &mut args)?));
             }
-            "--worker-metadata-dir" => {
-                config.worker_metadata_dir =
+            "--fs-runtime-dir" => {
+                config.fs_runtime_dir =
                     Some(PathBuf::from(take_value(&flag, inline_value, &mut args)?));
             }
-            "--worker-runtime-base-dir" => {
-                config.worker_runtime_base_dir =
+            "--workdir-target" => {
+                config.workdir_target =
                     Some(PathBuf::from(take_value(&flag, inline_value, &mut args)?));
             }
             "--backend-resource-endpoint" => {
@@ -192,23 +164,19 @@ where
             }
             "--store" => {
                 let value = take_value(&flag, inline_value, &mut args)?;
-                store = match value.as_str() {
-                    "memory" => StoreArg::Memory,
-                    "fs" | "fs-store" => StoreArg::Fs {
-                        root: default_fs_root(),
-                    },
-                    _ => {
-                        return Err(ProcessError::usage(format!(
-                            "unsupported --store `{value}`; expected `memory` or `fs`"
-                        )));
-                    }
-                };
+                if !matches!(value.as_str(), "fs" | "fs-store") {
+                    return Err(ProcessError::usage(format!(
+                        "unsupported --store `{value}`; only `fs` is accepted (use --no-store for ephemeral mode)"
+                    )));
+                }
+            }
+            "--no-store" => {
+                ensure_no_inline_value(&flag, inline_value.as_deref())?;
+                config.no_store = true;
             }
             "--fs-root" => {
                 let value = take_value(&flag, inline_value, &mut args)?;
-                store = StoreArg::Fs {
-                    root: Some(PathBuf::from(value)),
-                };
+                config.fs_root = Some(PathBuf::from(value));
             }
             "--local-token" => {
                 let value = take_value(&flag, inline_value, &mut args)?;
@@ -243,7 +211,7 @@ where
         }
     }
 
-    apply_store_selection(&mut config.http, store)?;
+    apply_store_selection(&mut config);
     Ok(Some(config))
 }
 
@@ -272,58 +240,84 @@ fn take_value(
         .ok_or_else(|| ProcessError::usage(format!("{flag} requires a value")))
 }
 
+fn ensure_no_inline_value(flag: &str, inline_value: Option<&str>) -> Result<(), ProcessError> {
+    if inline_value.is_some() {
+        return Err(ProcessError::usage(format!(
+            "{flag} does not accept a value"
+        )));
+    }
+    Ok(())
+}
+
 fn parse_usize_flag(flag: &str, value: String) -> Result<usize, ProcessError> {
     value
         .parse::<usize>()
         .map_err(|error| ProcessError::usage(format!("invalid {flag} value `{value}`: {error}")))
 }
 
-fn apply_store_selection(
-    config: &mut RuntimeHttpServerConfig,
-    store: StoreArg,
-) -> Result<(), ProcessError> {
-    match store {
-        StoreArg::Memory => {
-            config.store = RuntimeHttpStoreSelection::Memory;
-            Ok(())
-        }
-        StoreArg::Fs { root } => {
-            let root = root.unwrap_or_else(|| env::temp_dir().join("yoi-worker-runtime-rest"));
-            config.store = RuntimeHttpStoreSelection::Fs { root };
-            Ok(())
-        }
+fn apply_store_selection(config: &mut ProcessConfig) {
+    if config.no_store {
+        config.http.store = RuntimeHttpStoreSelection::Memory;
+    } else {
+        let runtime_dir = config.resolved_fs_paths().runtime_dir;
+        config.http.store = RuntimeHttpStoreSelection::Fs { root: runtime_dir };
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProcessConfig {
     http: RuntimeHttpServerConfig,
-    worker_store_dir: Option<PathBuf>,
-    worker_metadata_dir: Option<PathBuf>,
-    worker_runtime_base_dir: Option<PathBuf>,
+    fs_root: Option<PathBuf>,
+    fs_worker_dir: Option<PathBuf>,
+    fs_runtime_dir: Option<PathBuf>,
+    workdir_target: Option<PathBuf>,
+    no_store: bool,
     backend_resource_endpoint: Option<String>,
     backend_resource_token: Option<String>,
     profile: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FsPathConfig {
+    root: PathBuf,
+    worker_dir: PathBuf,
+    runtime_dir: PathBuf,
+    workdir_target: PathBuf,
 }
 
 impl ProcessConfig {
     fn default() -> Result<Self, ProcessError> {
         Ok(Self {
             http: RuntimeHttpServerConfig::default(),
-            worker_store_dir: None,
-            worker_metadata_dir: None,
-            worker_runtime_base_dir: None,
+            fs_root: None,
+            fs_worker_dir: None,
+            fs_runtime_dir: None,
+            workdir_target: None,
+            no_store: false,
             backend_resource_endpoint: None,
             backend_resource_token: None,
             profile: None,
         })
     }
-}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum StoreArg {
-    Memory,
-    Fs { root: Option<PathBuf> },
+    fn resolved_fs_paths(&self) -> FsPathConfig {
+        let root = self.fs_root.clone().unwrap_or_else(default_fs_root);
+        FsPathConfig {
+            worker_dir: self
+                .fs_worker_dir
+                .clone()
+                .unwrap_or_else(|| root.join("worker")),
+            runtime_dir: self
+                .fs_runtime_dir
+                .clone()
+                .unwrap_or_else(|| root.join("runtime")),
+            workdir_target: self
+                .workdir_target
+                .clone()
+                .unwrap_or_else(|| root.join("workdirs")),
+            root,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -377,24 +371,27 @@ impl From<std::io::Error> for ProcessError {
 }
 
 fn usage() -> &'static str {
-    "Usage: worker-runtime-rest-server [OPTIONS]\n\n\
-Starts a worker-backed Runtime REST command API for a trusted backend/proxy.\n\
-Browsers must not connect to this Runtime process directly.\n\n\
-Options:\n\
-  --bind <ADDR>                         Bind socket address (default: 127.0.0.1:38800)\n\
-  --display-name <NAME>                 Runtime display name\n\
-  --profile <SELECTOR>                  Force spawned Workers to use a Profile selector\n\
-  --worker-store-dir <PATH>             Worker session store directory\n\
-  --worker-metadata-dir <PATH>          Worker metadata directory\n\
-  --worker-runtime-base-dir <PATH>      Worker controller runtime directory\n\
-  --backend-resource-endpoint <URL>     Internal Backend resource fetch endpoint for resource handles\n\
-  --backend-resource-token <TOKEN>      Optional bearer token for the Backend resource fetch endpoint\n\
-  --store <memory|fs>                   Runtime catalog store selection (default: fs)\n\
-  --fs-root <PATH>                      Runtime catalog filesystem store root (default: user data dir)\n\
-  --local-token <TOKEN>                 Minimal local bearer token placeholder\n\
-  --local-token-env <ENV>               Read local bearer token placeholder from env\n\
-  --max-event-batch-items <N>           Override event batch limit\n\
-  -h, --help                            Show this help"
+    r#"Usage: worker-runtime-rest-server [OPTIONS]
+
+Starts a worker-backed Runtime REST command API for a trusted backend/proxy.
+Browsers must not connect to this Runtime process directly.
+
+Options:
+  --bind <ADDR>                         Bind socket address (default: 127.0.0.1:38800)
+  --display-name <NAME>                 Runtime display name
+  --profile <SELECTOR>                  Force spawned Workers to use a Profile selector
+  --fs-root <PATH>                      Filesystem-backed storage root (default: user data dir)
+  --fs-worker-dir <PATH>                Worker storage directory (default: <fs-root>/worker)
+  --fs-runtime-dir <PATH>               Runtime catalog directory (default: <fs-root>/runtime)
+  --workdir-target <PATH>               Workdir materialization target (default: <fs-root>/workdirs)
+  --backend-resource-endpoint <URL>     Internal Backend resource fetch endpoint for resource handles
+  --backend-resource-token <TOKEN>      Optional bearer token for the Backend resource fetch endpoint
+  --store <fs>                          Runtime catalog store kind (default: fs)
+  --no-store                            Disable Runtime catalog persistence for ephemeral runs
+  --local-token <TOKEN>                 Minimal local bearer token placeholder
+  --local-token-env <ENV>               Read local bearer token placeholder from env
+  --max-event-batch-items <N>           Override event batch limit
+  -h, --help                            Show this help"#
 }
 
 #[cfg(test)]
@@ -417,13 +414,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_removed_workspace_and_cwd_options() {
+    fn rejects_removed_workspace_cwd_and_worker_path_options() {
         assert!(parse_args(["--workspace", "/tmp/workspace"]).is_err());
         assert!(parse_args(["--cwd", "/tmp/workspace"]).is_err());
+        assert!(parse_args(["--worker-store-dir", "/tmp/sessions"]).is_err());
+        assert!(parse_args(["--worker-metadata-dir", "/tmp/metadata"]).is_err());
+        assert!(parse_args(["--worker-runtime-base-dir", "/tmp/runtime"]).is_err());
     }
 
     #[test]
-    fn parses_memory_runtime_process_config() {
+    fn rejects_store_memory_in_favor_of_no_store() {
+        assert!(parse_args(["--store", "memory"]).is_err());
+    }
+
+    #[test]
+    fn parses_runtime_process_config() {
         let config = parse_args([
             "--bind",
             "127.0.0.1:0",
@@ -463,12 +468,35 @@ mod tests {
 
     #[test]
     fn parses_fs_store_runtime_process_config() {
-        let config = parse_args(["--store", "fs", "--fs-root", "/tmp/runtime-store"])
-            .unwrap()
-            .unwrap();
+        let config = parse_args([
+            "--store",
+            "fs",
+            "--fs-root",
+            "/tmp/yoi",
+            "--fs-worker-dir",
+            "/tmp/yoi-worker",
+            "--fs-runtime-dir",
+            "/tmp/yoi-runtime",
+            "--workdir-target",
+            "/tmp/yoi-workdirs",
+        ])
+        .unwrap()
+        .unwrap();
         assert!(matches!(
             config.http.store,
-            RuntimeHttpStoreSelection::Fs { ref root } if root == &PathBuf::from("/tmp/runtime-store")
+            RuntimeHttpStoreSelection::Fs { ref root } if root == &PathBuf::from("/tmp/yoi-runtime")
+        ));
+        let paths = config.resolved_fs_paths();
+        assert_eq!(paths.worker_dir, PathBuf::from("/tmp/yoi-worker"));
+        assert_eq!(paths.workdir_target, PathBuf::from("/tmp/yoi-workdirs"));
+    }
+
+    #[test]
+    fn no_store_disables_runtime_catalog_persistence() {
+        let config = parse_args(["--no-store"]).unwrap().unwrap();
+        assert!(matches!(
+            config.http.store,
+            RuntimeHttpStoreSelection::Memory
         ));
     }
 }
