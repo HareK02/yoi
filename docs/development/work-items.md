@@ -427,7 +427,6 @@ Implementation Tickets usually also need focused tests and broader checks, for e
 cargo fmt --check
 cargo check --workspace --all-targets
 cargo test -p <crate> <filter>
-nix build .#yoi --no-link
 ```
 
 Record validation commands and results in the implementation report or resolution.

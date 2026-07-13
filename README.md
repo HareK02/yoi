@@ -80,12 +80,6 @@ cargo check --workspace --all-targets
 cargo test --workspace
 ```
 
-Optional Nix validation:
-
-```sh
-nix build .#yoi --no-link
-```
-
 E2E testing with real spawned processes is not yet designed. Keep changes scoped, preserve durable authority boundaries, and prefer clear type-safe structure over short-term compatibility layers.
 
 License: MIT. See [`LICENSE`](LICENSE).

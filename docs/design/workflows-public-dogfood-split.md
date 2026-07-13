@@ -87,7 +87,7 @@ These remain in this repository under `.yoi/workflow/` as overrides or dogfood-o
   - `.yoi/memory`, local/runtime/log/lock/secret-like paths excluded;
   - branch/worktree cleanup policy.
 - A dogfood extension for multi-agent/merge-completion, if the generic builtin `multi-agent-workflow` is cleaned:
-  - concrete `cargo fmt`, `cargo test`, `target/debug/yoi ticket doctor`, `nix build .#yoi` validation policy;
+  - concrete `cargo fmt`, `cargo test`, `target/debug/yoi ticket doctor`, validation policy;
   - merge authority boundaries for this repository;
   - docs/report conventions.
 
