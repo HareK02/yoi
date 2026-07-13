@@ -1,8 +1,8 @@
 ---
 title: 'Restore Worker without backend profile fetch'
-state: 'inprogress'
+state: 'done'
 created_at: '2026-07-13T14:44:12Z'
-updated_at: '2026-07-13T14:45:04Z'
+updated_at: '2026-07-13T14:55:17Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-13T14:45:04Z'

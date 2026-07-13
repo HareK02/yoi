@@ -38,7 +38,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::broadcast;
 
 use worker::{
-    Worker, WorkerController, WorkerError, WorkerFilesystemAuthority, WorkerHandle,
+    PromptLoader, Worker, WorkerController, WorkerError, WorkerFilesystemAuthority, WorkerHandle,
     WorkerWorkspaceContext, WorkspaceId,
 };
 
@@ -180,6 +180,16 @@ impl ProfileRuntimeWorkerFactory {
         request: &'a WorkerExecutionSpawnRequest,
     ) -> Option<std::borrow::Cow<'a, str>> {
         self.runtime_profile_for_request(&request.request)
+    }
+
+    fn restore_fallback_manifest(
+        worker_name: &str,
+    ) -> Result<(manifest::WorkerManifest, PromptLoader), String> {
+        let mut config = manifest::WorkerManifestConfig::builtin_defaults();
+        config.worker.name = Some(worker_name.to_string());
+        let manifest = manifest::WorkerManifest::try_from(config)
+            .map_err(|err| format!("failed to build restore fallback manifest: {err}"))?;
+        Ok((manifest, PromptLoader::builtins_only()))
     }
     async fn resolve_profile_source_archive(
         &self,
@@ -397,7 +407,6 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         request: WorkerExecutionRestoreRequest,
     ) -> Result<WorkerHandle, String> {
         let worker_name = Self::runtime_worker_name_for_ref(&request.worker_ref);
-        let profile = self.runtime_profile_for_request(&request.request);
         let worker_root = request
             .working_directory
             .as_ref()
@@ -416,21 +425,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         let workspace_backend_ref =
             RuntimeWorkspaceBackendRef::from_working_directory(request.working_directory.as_ref());
         let workspace_context = workspace_backend_ref.worker_context();
-        let selector = profile.as_deref().unwrap_or("builtin:default");
-        let archive = self
-            .resolve_profile_source_archive(&request.request.profile_source)
-            .await?;
-        let (mut manifest, loader) = {
-            let manifest = archive
-                .resolve_profile(selector, &worker_root, &worker_name)
-                .map_err(|err| format!("failed to resolve profile source archive: {err}"))?;
-            worker::entrypoint::resolve_runtime_profile_manifest_from_manifest(
-                manifest,
-                &worker_root,
-                &worker_name,
-            )?
-        };
-        manifest.worker.name = worker_name.clone();
+        let (manifest, loader) = Self::restore_fallback_manifest(&worker_name)?;
 
         let store_dir = self.store_dir()?;
         let session_store = FsStore::new(&store_dir).map_err(|err| {
@@ -462,6 +457,24 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             Err(WorkerError::WorkerMetadataPending { .. })
                 if request.request.initial_input.is_none() =>
             {
+                let profile = self.runtime_profile_for_request(&request.request);
+                let selector = profile.as_deref().unwrap_or("builtin:default");
+                let archive = self
+                    .resolve_profile_source_archive(&request.request.profile_source)
+                    .await?;
+                let (mut pending_manifest, pending_loader) = {
+                    let manifest = archive
+                        .resolve_profile(selector, &worker_root, &worker_name)
+                        .map_err(|err| {
+                            format!("failed to resolve profile source archive: {err}")
+                        })?;
+                    worker::entrypoint::resolve_runtime_profile_manifest_from_manifest(
+                        manifest,
+                        &worker_root,
+                        &worker_name,
+                    )?
+                };
+                pending_manifest.worker.name = worker_name.clone();
                 let session_store = FsStore::new(&store_dir).map_err(|err| {
                     format!(
                         "failed to initialize session store at {}: {err}",
@@ -477,9 +490,9 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                     })?;
                 let store = CombinedStore::new(session_store, worker_metadata_store);
                 Worker::from_manifest_with_context(
-                    manifest,
+                    pending_manifest,
                     store,
-                    loader,
+                    pending_loader,
                     workspace_context,
                     filesystem_authority,
                 )
