@@ -38,6 +38,9 @@ use crate::hook::{
     PreToolCall,
 };
 use crate::in_flight::InFlightEvents;
+
+const COMPACTION_EXTENSION_DOMAIN: &str = "yoi.compaction";
+const COMPACTION_BLOCK_ID: &str = "compact";
 use crate::ipc::alerter::Alerter;
 use crate::ipc::interceptor::WorkerInterceptor;
 use crate::ipc::notify_buffer::NotifyBuffer;
@@ -2309,6 +2312,55 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             .map_err(WorkerError::Engine)
     }
 
+    fn persist_compaction_block(
+        &mut self,
+        state: &str,
+        message: &str,
+        error: Option<&str>,
+        new_segment_id: Option<SegmentId>,
+    ) -> Result<(), WorkerError> {
+        let payload = serde_json::json!({
+            "kind": "compaction_block",
+            "schema_version": 1,
+            "block_id": COMPACTION_BLOCK_ID,
+            "state": state,
+            "message": message,
+            "error": error,
+            "new_segment_id": new_segment_id.map(|id| id.to_string()),
+        });
+        Ok(self.commit_entry(LogEntry::Extension {
+            ts: segment_log::now_millis(),
+            domain: COMPACTION_EXTENSION_DOMAIN.into(),
+            payload,
+        })?)
+    }
+
+    fn persist_and_send_compact_start(&mut self) -> Result<(), WorkerError> {
+        self.persist_compaction_block("running", "Compacting…", None, None)?;
+        self.send_event(Event::CompactStart);
+        Ok(())
+    }
+
+    fn persist_and_send_compact_done(
+        &mut self,
+        new_segment_id: SegmentId,
+    ) -> Result<(), WorkerError> {
+        self.persist_compaction_block("done", "Compacted.", None, Some(new_segment_id))?;
+        self.send_event(Event::CompactDone { new_segment_id });
+        Ok(())
+    }
+
+    fn persist_and_send_compact_failed(&mut self, error: String) -> Result<(), WorkerError> {
+        self.persist_compaction_block(
+            "failed",
+            &format!("Compact failed: {error}"),
+            Some(error.as_str()),
+            None,
+        )?;
+        self.send_event(Event::CompactFailed { error });
+        Ok(())
+    }
+
     /// Perform compaction after a `compact_needed` abort and resume execution.
     ///
     /// Uses `Box::pin` for the recursive `resume()` call to break the
@@ -2334,14 +2386,14 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 .map(|s| s.retained_tokens())
                 .unwrap_or(manifest::defaults::COMPACT_RETAINED_TOKENS);
 
-            self.send_event(Event::CompactStart);
+            self.persist_and_send_compact_start()?;
             match self.compact(retained).await {
                 Ok(new_segment_id) => {
                     info!(
                         new_segment_id = %new_segment_id,
                         "Compaction succeeded, resuming execution"
                     );
-                    self.send_event(Event::CompactDone { new_segment_id });
+                    self.persist_and_send_compact_done(new_segment_id)?;
                     if let Some(ref state) = self.compact_state {
                         state.record_compact_success();
                     }
@@ -2349,9 +2401,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 }
                 Err(e) => {
                     warn!(error = %e, "Compaction failed during run");
-                    self.send_event(Event::CompactFailed {
-                        error: e.to_string(),
-                    });
+                    self.persist_and_send_compact_failed(e.to_string())?;
                     self.alert(
                         AlertLevel::Error,
                         AlertSource::Compactor,
@@ -2384,21 +2434,45 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         }
 
         let retained = state.retained_tokens();
-        self.send_event(Event::CompactStart);
+        if let Err(err) = self.persist_and_send_compact_start() {
+            warn!(error = %err, "failed to persist proactive compact start");
+            self.alert(
+                AlertLevel::Warn,
+                AlertSource::Compactor,
+                format!("pre-run compaction not started: failed to persist status block: {err}"),
+            );
+            return;
+        }
         match self.compact(retained).await {
             Ok(new_segment_id) => {
                 info!(
                     new_segment_id = %new_segment_id,
                     "Proactive pre-run compaction succeeded"
                 );
-                self.send_event(Event::CompactDone { new_segment_id });
+                if let Err(err) = self.persist_and_send_compact_done(new_segment_id) {
+                    warn!(error = %err, "failed to persist proactive compact completion");
+                    self.alert(
+                        AlertLevel::Warn,
+                        AlertSource::Compactor,
+                        format!(
+                            "pre-run compaction completed but status block was not persisted: {err}"
+                        ),
+                    );
+                }
                 state.record_compact_success();
             }
             Err(e) => {
                 warn!(error = %e, "Proactive pre-run compaction failed");
-                self.send_event(Event::CompactFailed {
-                    error: e.to_string(),
-                });
+                if let Err(err) = self.persist_and_send_compact_failed(e.to_string()) {
+                    warn!(error = %err, "failed to persist proactive compact failure");
+                    self.alert(
+                        AlertLevel::Warn,
+                        AlertSource::Compactor,
+                        format!(
+                            "pre-run compaction failed and status block was not persisted: {err}"
+                        ),
+                    );
+                }
                 self.alert(
                     AlertLevel::Warn,
                     AlertSource::Compactor,
@@ -2456,11 +2530,11 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         }
 
         self.join_memory_task().await;
-        self.send_event(Event::CompactStart);
+        self.persist_and_send_compact_start()?;
         match self.compact(retained).await {
             Ok(new_segment_id) => {
                 info!(new_segment_id = %new_segment_id, "Manual compaction succeeded");
-                self.send_event(Event::CompactDone { new_segment_id });
+                self.persist_and_send_compact_done(new_segment_id)?;
                 if let Some(ref state) = state {
                     state.record_compact_success();
                 }
@@ -2468,9 +2542,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             }
             Err(e) => {
                 warn!(error = %e, "Manual compaction failed");
-                self.send_event(Event::CompactFailed {
-                    error: e.to_string(),
-                });
+                self.persist_and_send_compact_failed(e.to_string())?;
                 self.alert(
                     AlertLevel::Error,
                     AlertSource::Compactor,

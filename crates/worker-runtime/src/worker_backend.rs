@@ -996,31 +996,38 @@ where
             );
         }
 
-        let WorkerInputKind::User = input.kind else {
-            busy.store(false, Ordering::SeqCst);
-            return WorkerExecutionResult::unsupported(
-                WorkerExecutionOperation::Input,
-                "runtime adapter currently dispatches user input only",
-            );
+        let method = match input.kind {
+            WorkerInputKind::User => Method::Run {
+                input: input
+                    .segments
+                    .unwrap_or_else(|| vec![Segment::text(input.content.trim().to_string())]),
+            },
+            WorkerInputKind::System => Method::Notify {
+                message: input.content,
+                auto_run: true,
+            },
+            WorkerInputKind::Compact => Method::Compact,
+            WorkerInputKind::ListRewindTargets => Method::ListRewindTargets,
+            WorkerInputKind::RegisterPeer => Method::RegisterPeer {
+                name: input.content.trim().to_string(),
+            },
         };
-        let content = input.content.trim().to_string();
-        if content.is_empty() {
-            busy.store(false, Ordering::SeqCst);
-            return WorkerExecutionResult::rejected(
-                WorkerExecutionOperation::Input,
-                "runtime adapter rejects empty user input",
-            );
-        }
+        let accepted_run_state = match method {
+            Method::Run { .. } | Method::Notify { .. } | Method::Compact => {
+                WorkerExecutionRunState::Busy
+            }
+            _ => WorkerExecutionRunState::Idle,
+        };
+        let accepted_is_idle = accepted_run_state == WorkerExecutionRunState::Idle;
 
         let result = self.send_method(
             WorkerExecutionOperation::Input,
             worker,
-            Method::Run {
-                input: vec![Segment::text(content)],
-            },
-            WorkerExecutionRunState::Busy,
+            method,
+            accepted_run_state,
         );
-        if result.outcome != crate::execution::WorkerExecutionOutcome::Accepted {
+        if accepted_is_idle || result.outcome != crate::execution::WorkerExecutionOutcome::Accepted
+        {
             busy.store(false, Ordering::SeqCst);
         }
         result
@@ -1092,6 +1099,24 @@ where
         workers
             .get(handle.worker_ref())
             .map(|execution| execution.handle.snapshot_event())
+    }
+
+    fn worker_completions(
+        &self,
+        handle: &WorkerExecutionHandle,
+        kind: protocol::CompletionKind,
+        prefix: &str,
+    ) -> Vec<protocol::CompletionEntry> {
+        if handle.backend_id() != self.backend_id() {
+            return Vec::new();
+        }
+        let Ok(workers) = self.workers.lock() else {
+            return Vec::new();
+        };
+        workers
+            .get(handle.worker_ref())
+            .map(|execution| execution.handle.completion_entries(kind, prefix))
+            .unwrap_or_default()
     }
 }
 

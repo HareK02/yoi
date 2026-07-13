@@ -2,6 +2,14 @@
   import { tick } from 'svelte';
   import ConsoleLineItem from '$lib/workspace-console/ConsoleLineItem.svelte';
   import { chatSubmit } from '$lib/workspace-console/chat-submit';
+  import { buildComposerRequest } from '$lib/workspace-console/composer-command';
+  import {
+    applyCompletion,
+    completionTokenAt,
+    localCommandCompletions,
+    type ComposerCompletionEntry,
+    type ComposerCompletionToken
+  } from '$lib/workspace-console/composer-completion';
   import { fitTextarea } from '$lib/workspace-console/textarea-fit';
   import {
     createConsoleProjector,
@@ -35,12 +43,24 @@
     return workspaceApiPath(workspaceId, path);
   }
 
+  type WorkerCompletionsResult = {
+    kind: 'file' | 'knowledge' | 'workflow';
+    prefix: string;
+    entries: ComposerCompletionEntry[];
+    diagnostics: Diagnostic[];
+  };
+
   let worker = $state<Worker | null>(null);
   let liveWorkerState = $state<string | null>(null);
   let workerError = $state<string | null>(null);
   let draft = $state('');
+  let completionEntries = $state<ComposerCompletionEntry[]>([]);
+  let completionToken = $state<ComposerCompletionToken | null>(null);
+  let completionBusy = $state(false);
+  let completionError = $state<string | null>(null);
   let sending = $state(false);
   let sendError = $state<string | null>(null);
+  let composerNotice = $state<string | null>(null);
   let streamState = $state<'connecting' | 'open' | 'closed' | 'error'>('connecting');
   let streamDiagnostics = $state<Diagnostic[]>([]);
   let workerDetailsOpen = $state(false);
@@ -200,9 +220,80 @@
     return true;
   }
 
+  async function applyComposerCompletion(event: KeyboardEvent) {
+    const target = event.currentTarget;
+    if (!(target instanceof HTMLTextAreaElement)) {
+      return;
+    }
+    const token = completionTokenAt(draft, target.selectionStart ?? draft.length);
+    completionToken = token;
+    completionError = null;
+    if (!token) {
+      completionEntries = [];
+      return;
+    }
+
+    completionBusy = true;
+    try {
+      const entries = await resolveCompletionEntries(token);
+      completionEntries = entries;
+      if (entries.length === 0) {
+        completionError = `No completions for ${token.sigil}${token.prefix}`;
+        return;
+      }
+      const applied = applyCompletion(draft, token, entries[0]);
+      draft = applied.value;
+      await tick();
+      target.setSelectionRange(applied.cursor, applied.cursor);
+      composerNotice = entries.length > 1
+        ? `Completed ${token.sigil}${entries[0].value}; ${entries.length - 1} more candidate(s)`
+        : null;
+    } catch (error) {
+      completionError = error instanceof Error ? error.message : String(error);
+    } finally {
+      completionBusy = false;
+    }
+  }
+
+  async function resolveCompletionEntries(
+    token: ComposerCompletionToken
+  ): Promise<ComposerCompletionEntry[]> {
+    if (token.kind === 'command') {
+      return localCommandCompletions(token.prefix);
+    }
+    const result = await postJson<WorkerCompletionsResult>(
+      workerApiPath(
+        `/runtimes/${encodeURIComponent(runtimeId)}/workers/${encodeURIComponent(workerId)}/completions`
+      ),
+      { kind: token.kind, prefix: token.prefix }
+    );
+    if (result.diagnostics.length > 0 && result.entries.length === 0) {
+      throw new Error(diagnosticsToText(result.diagnostics));
+    }
+    return result.entries;
+  }
+
+  function handleComposerKeydown(event: KeyboardEvent) {
+    if (event.key !== 'Tab') {
+      return;
+    }
+    event.preventDefault();
+    void applyComposerCompletion(event);
+  }
+
   async function submitDraft(value = draft) {
-    const content = value.trim();
-    if (!content || sending || !inputReady) {
+    const command = buildComposerRequest(value);
+    if (!command.ok) {
+      composerNotice = null;
+      sendError = command.message;
+      return;
+    }
+    composerNotice = command.notice ?? null;
+    if (!command.request) {
+      draft = '';
+      return;
+    }
+    if (sending || !inputReady) {
       return;
     }
 
@@ -211,7 +302,7 @@
     try {
       const result = await postJson<WorkerInputResult>(
         workerApiPath(`/runtimes/${encodeURIComponent(runtimeId)}/workers/${encodeURIComponent(workerId)}/input`),
-        { kind: 'user', content }
+        command.request
       );
       if (result.state === 'accepted') {
         draft = '';
@@ -470,18 +561,34 @@
       <textarea
         id="worker-console-message"
         aria-label="Console input"
-        aria-keyshortcuts="Meta+Enter"
+        aria-keyshortcuts="Meta+Enter Control+Enter"
         bind:value={draft}
         use:chatSubmit={{
           enabled: inputReady && !sending,
           onSubmit: (value) => void submitDraft(value)
         }}
         use:fitTextarea={{ value: draft, maxRows: 10 }}
+        onkeydown={handleComposerKeydown}
         disabled={!inputReady || sending}
       ></textarea>
+      {#if completionBusy || completionError || completionEntries.length > 0}
+        <div class="composer-completions" aria-live="polite">
+          {#if completionBusy}
+            <span>completing…</span>
+          {:else if completionError}
+            <span class="error">{completionError}</span>
+          {:else}
+            <span>Tab: {completionToken?.sigil}{completionEntries[0]?.value}</span>
+            {#if completionEntries.length > 1}
+              <span>{completionEntries.length - 1} more</span>
+            {/if}
+          {/if}
+        </div>
+      {/if}
       <div class="composer-actions">
         <button type="submit" disabled={!canSend}>{sending ? 'Sending…' : 'Send'}</button>
-        {#if sendError}<p class="error">{sendError}</p>{/if}
+        {#if composerNotice}<p class="section-note">{composerNotice}</p>{/if}
+      {#if sendError}<p class="error">{sendError}</p>{/if}
       </div>
     </form>
 </div>

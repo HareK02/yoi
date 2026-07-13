@@ -537,6 +537,28 @@ impl Runtime {
         })
     }
 
+    /// Return live completion entries for the Worker composer.
+    pub fn worker_completions(
+        &self,
+        worker_ref: &WorkerRef,
+        kind: protocol::CompletionKind,
+        prefix: &str,
+    ) -> Result<Vec<protocol::CompletionEntry>, RuntimeError> {
+        let (backend, handle) = {
+            let state = self.lock()?;
+            state.ensure_worker_ref(worker_ref)?;
+            let worker = state.worker(worker_ref)?;
+            (
+                state.execution_backend.clone(),
+                worker.execution_handle.clone(),
+            )
+        };
+        let Some((backend, handle)) = backend.zip(handle) else {
+            return Ok(Vec::new());
+        };
+        Ok(backend.worker_completions(&handle, kind, prefix))
+    }
+
     fn commit_created_worker(
         &self,
         worker_ref: &WorkerRef,
@@ -1730,9 +1752,18 @@ fn validate_create_worker_request(request: &CreateWorkerRequest) -> Result<(), R
 }
 
 fn validate_worker_input(input: &WorkerInput) -> Result<(), RuntimeError> {
-    if input.content.trim().is_empty() {
+    if !input.kind.is_empty_content_allowed() && input.content.trim().is_empty() {
         return Err(RuntimeError::InvalidRequest(
             "worker input content must not be empty".to_string(),
+        ));
+    }
+    if input
+        .segments
+        .as_ref()
+        .is_some_and(|segments| segments.is_empty())
+    {
+        return Err(RuntimeError::InvalidRequest(
+            "worker input segments must not be empty".to_string(),
         ));
     }
     Ok(())
@@ -1742,13 +1773,24 @@ fn validate_worker_input(input: &WorkerInput) -> Result<(), RuntimeError> {
 fn input_protocol_event(input: &WorkerInput) -> protocol::Event {
     match input.kind {
         WorkerInputKind::User => protocol::Event::UserMessage {
-            segments: vec![protocol::Segment::Text {
-                content: input.content.clone(),
-            }],
+            segments: input.segments.clone().unwrap_or_else(|| {
+                vec![protocol::Segment::Text {
+                    content: input.content.clone(),
+                }]
+            }),
         },
         WorkerInputKind::System => protocol::Event::SystemItem {
             item: serde_json::json!({
                 "kind": "embedded_worker_system_input",
+                "content": input.content.clone(),
+            }),
+        },
+        WorkerInputKind::Compact
+        | WorkerInputKind::ListRewindTargets
+        | WorkerInputKind::RegisterPeer => protocol::Event::SystemItem {
+            item: serde_json::json!({
+                "kind": "embedded_worker_command_input",
+                "command": input.kind,
                 "content": input.content.clone(),
             }),
         },

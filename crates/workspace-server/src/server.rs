@@ -28,10 +28,10 @@ use crate::hosts::{
     ConfigBundleCheckResult, ConfigBundleSyncResult, DiagnosticSeverity, EmbeddedWorkerRuntime,
     HostSummary, RemoteRuntimeConfig, RemoteWorkerRuntime, RuntimeDiagnostic, RuntimeRegistry,
     RuntimeRegistryError, RuntimeRegistryUnregisterResult, RuntimeSummary, WorkerCapabilitySummary,
-    WorkerImplementationSummary, WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest,
-    WorkerLifecycleResult, WorkerOperationState, WorkerSpawnAcceptanceRequirement,
-    WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest,
-    WorkerSummary, WorkerWorkspaceSummary,
+    WorkerCompletionsRequest, WorkerCompletionsResult, WorkerImplementationSummary,
+    WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest, WorkerLifecycleResult,
+    WorkerOperationState, WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest,
+    WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest, WorkerSummary, WorkerWorkspaceSummary,
 };
 use crate::identity::WorkspaceIdentity;
 use crate::observation::{
@@ -495,6 +495,14 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/input",
             post(scoped_send_runtime_worker_input),
+        )
+        .route(
+            "/api/runtimes/{runtime_id}/workers/{worker_id}/completions",
+            post(runtime_worker_completions),
+        )
+        .route(
+            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/completions",
+            post(scoped_runtime_worker_completions),
         )
         .route(
             "/api/runtimes/{runtime_id}/workers/{worker_id}/stop",
@@ -2252,6 +2260,20 @@ async fn scoped_send_runtime_worker_input(
     .await
 }
 
+async fn scoped_runtime_worker_completions(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
+    Json(request): Json<WorkerCompletionsRequest>,
+) -> ApiResult<Json<WorkerCompletionsResult>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    runtime_worker_completions(
+        State(api),
+        AxumPath((path.runtime_id, path.worker_id)),
+        Json(request),
+    )
+    .await
+}
+
 async fn scoped_stop_runtime_worker(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
@@ -2786,6 +2808,7 @@ async fn create_workspace_worker(
         Some(EmbeddedWorkerInput {
             kind: EmbeddedWorkerInputKind::User,
             content: initial_text,
+            segments: None,
         })
     };
     let selected_working_directory_id = request
@@ -3133,6 +3156,18 @@ async fn send_runtime_worker_input(
     let result = api
         .runtime
         .send_input(&runtime_id, &worker_id, request)
+        .map_err(|err| err.into_error())?;
+    Ok(Json(result))
+}
+
+async fn runtime_worker_completions(
+    State(api): State<WorkspaceApi>,
+    AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
+    Json(request): Json<WorkerCompletionsRequest>,
+) -> ApiResult<Json<WorkerCompletionsResult>> {
+    let result = api
+        .runtime
+        .worker_completions(&runtime_id, &worker_id, request)
         .map_err(|err| err.into_error())?;
     Ok(Json(result))
 }
@@ -7237,6 +7272,7 @@ mod tests {
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
                     content: "persist me".to_string(),
+                    segments: None,
                 },
             )
             .expect("send input");
@@ -7298,6 +7334,7 @@ mod tests {
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
                     content: "should not be routed to stale handle".to_string(),
+                    segments: None,
                 },
             )
             .expect("stale worker input is projected as an operation result");

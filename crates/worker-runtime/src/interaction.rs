@@ -1,5 +1,6 @@
 use crate::catalog::WorkerStatus;
 use crate::identity::WorkerRef;
+use protocol::Segment;
 use serde::{Deserialize, Serialize};
 
 /// Input kind accepted by the embedded interaction API.
@@ -8,6 +9,15 @@ use serde::{Deserialize, Serialize};
 pub enum WorkerInputKind {
     User,
     System,
+    Compact,
+    ListRewindTargets,
+    RegisterPeer,
+}
+
+impl WorkerInputKind {
+    pub fn is_empty_content_allowed(&self) -> bool {
+        matches!(self, Self::Compact | Self::ListRewindTargets)
+    }
 }
 
 /// Worker input request accepted by a Runtime Worker.
@@ -15,6 +25,8 @@ pub enum WorkerInputKind {
 pub struct WorkerInput {
     pub kind: WorkerInputKind,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segments: Option<Vec<Segment>>,
 }
 
 impl WorkerInput {
@@ -22,6 +34,7 @@ impl WorkerInput {
         Self {
             kind: WorkerInputKind::User,
             content: content.into(),
+            segments: None,
         }
     }
 
@@ -29,6 +42,7 @@ impl WorkerInput {
         Self {
             kind: WorkerInputKind::System,
             content: content.into(),
+            segments: None,
         }
     }
 }

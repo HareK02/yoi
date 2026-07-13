@@ -2082,6 +2082,11 @@ impl App {
                 let value = serde_json::to_value(&item).expect("SystemItem is Serialize");
                 self.apply_system_item(&value);
             }
+            session_store::LogEntry::Extension {
+                domain, payload, ..
+            } if domain == "yoi.compaction" => {
+                self.apply_compaction_extension(&payload);
+            }
             // Non-history-bearing variants don't affect the block view.
             _ => {}
         }
@@ -2092,6 +2097,58 @@ impl App {
     /// Kind-based routing replaces the old free-text `[Notification]` /
     /// `[File: …]` parsing path: each kind maps directly to a typed
     /// block (`Block::Notify`, `Block::WorkerEvent`, …).
+    fn apply_compaction_extension(&mut self, payload: &serde_json::Value) {
+        if payload.get("kind").and_then(|value| value.as_str()) != Some("compaction_block") {
+            return;
+        }
+        match payload.get("state").and_then(|value| value.as_str()) {
+            Some("running") => {
+                if self.last_streaming_compact_mut().is_none() {
+                    self.blocks.push(Block::Compact(CompactEvent::Streaming {
+                        started_at: Instant::now(),
+                    }));
+                }
+            }
+            Some("done") => {
+                let new_segment_id = payload
+                    .get("new_segment_id")
+                    .and_then(|value| value.as_str())
+                    .and_then(|value| value.parse::<uuid::Uuid>().ok())
+                    .unwrap_or_else(uuid::Uuid::nil);
+                if let Some(evt) = self.last_streaming_compact_mut() {
+                    *evt = CompactEvent::Done {
+                        new_segment_id,
+                        elapsed_secs: None,
+                    };
+                } else {
+                    self.blocks.push(Block::Compact(CompactEvent::Done {
+                        new_segment_id,
+                        elapsed_secs: None,
+                    }));
+                }
+            }
+            Some("failed") => {
+                let error = payload
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("compact failed")
+                    .to_string();
+                if let Some(evt) = self.last_streaming_compact_mut() {
+                    *evt = CompactEvent::Failed {
+                        error,
+                        elapsed_secs: None,
+                    };
+                } else {
+                    self.blocks.push(Block::Compact(CompactEvent::Failed {
+                        error,
+                        elapsed_secs: None,
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn apply_system_item(&mut self, value: &serde_json::Value) {
         let Ok(item) = serde_json::from_value::<session_store::SystemItem>(value.clone()) else {
             // Unknown / forward-compat shape: fall back to rendering the

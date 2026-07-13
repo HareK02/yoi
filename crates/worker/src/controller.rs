@@ -91,6 +91,44 @@ impl WorkerHandle {
         (event, entry_rx)
     }
 
+    pub fn completion_entries(
+        &self,
+        kind: protocol::CompletionKind,
+        prefix: &str,
+    ) -> Vec<protocol::CompletionEntry> {
+        match kind {
+            protocol::CompletionKind::File => self
+                .shared_state
+                .fs_view()
+                .map(|view| view.list_file_completions(prefix))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| protocol::CompletionEntry {
+                    value: c.path,
+                    is_dir: c.is_dir,
+                })
+                .collect(),
+            protocol::CompletionKind::Knowledge => self
+                .shared_state
+                .list_knowledge_completions(prefix)
+                .into_iter()
+                .map(|c| protocol::CompletionEntry {
+                    value: c.slug,
+                    is_dir: false,
+                })
+                .collect(),
+            protocol::CompletionKind::Workflow => self
+                .shared_state
+                .list_workflow_completions(prefix)
+                .into_iter()
+                .map(|c| protocol::CompletionEntry {
+                    value: c.slug,
+                    is_dir: false,
+                })
+                .collect(),
+        }
+    }
+
     /// Broadcast an event to all listeners (including socket clients).
     pub fn send_event(&self, event: Event) -> Result<usize, broadcast::error::SendError<Event>> {
         self.event_tx.send(event)

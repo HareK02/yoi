@@ -14,6 +14,13 @@ engine = {
     reasoning = "high";
 };
 
+compaction = {
+    kind = "tokens";
+    threshold = 240000;
+    request_threshold = 270000;
+    worker_context_max_tokens = 100000;
+};
+
 feature = {
     task = { enabled = true; };
     memory = { enabled = true; };

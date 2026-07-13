@@ -31,7 +31,8 @@ use worker_runtime::execution::{
 use worker_runtime::fs_store::FsRuntimeStoreOptions;
 use worker_runtime::http_server::{
     RuntimeHttpConfigBundleAvailabilityResponse, RuntimeHttpConfigBundleSyncRequest,
-    RuntimeHttpErrorResponse, RuntimeHttpSummaryResponse, RuntimeHttpWorkerDeleteResponse,
+    RuntimeHttpErrorResponse, RuntimeHttpSummaryResponse, RuntimeHttpWorkerCompletionsRequest,
+    RuntimeHttpWorkerCompletionsResponse, RuntimeHttpWorkerDeleteResponse,
     RuntimeHttpWorkerInputResponse, RuntimeHttpWorkerLifecycleRequest,
     RuntimeHttpWorkerLifecycleResponse, RuntimeHttpWorkerResponse, RuntimeHttpWorkersResponse,
     RuntimeHttpWorkingDirectoriesResponse, RuntimeHttpWorkingDirectoryResponse,
@@ -436,6 +437,9 @@ pub struct WorkerLifecycleResult {
 pub enum WorkerInputKind {
     User,
     System,
+    Compact,
+    ListRewindTargets,
+    RegisterPeer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -452,6 +456,25 @@ pub struct WorkerInputRequest {
     #[serde(default = "default_worker_input_kind")]
     pub kind: WorkerInputKind,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segments: Option<Vec<protocol::Segment>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerCompletionsRequest {
+    pub kind: protocol::CompletionKind,
+    #[serde(default)]
+    pub prefix: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerCompletionsResult {
+    pub runtime_id: String,
+    pub worker_id: String,
+    pub kind: protocol::CompletionKind,
+    pub prefix: String,
+    pub entries: Vec<protocol::CompletionEntry>,
+    pub diagnostics: Vec<RuntimeDiagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -708,6 +731,25 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
                 format!(
                     "worker input for '{worker_id}' is reserved for the runtime service boundary and is not implemented by this registry source"
                 ),
+            )],
+        }
+    }
+
+    fn worker_completions(
+        &self,
+        worker_id: &str,
+        request: WorkerCompletionsRequest,
+    ) -> WorkerCompletionsResult {
+        WorkerCompletionsResult {
+            runtime_id: self.runtime_id().to_string(),
+            worker_id: worker_id.to_string(),
+            kind: request.kind,
+            prefix: request.prefix,
+            entries: Vec::new(),
+            diagnostics: vec![diagnostic(
+                "worker_completions_unsupported",
+                DiagnosticSeverity::Info,
+                format!("runtime does not implement completions for worker '{worker_id}'"),
             )],
         }
     }
@@ -1018,6 +1060,26 @@ impl RuntimeRegistry {
             ));
         }
         Ok(runtime.send_input(worker_id, request))
+    }
+
+    pub fn worker_completions(
+        &self,
+        runtime_id: &str,
+        worker_id: &str,
+        request: WorkerCompletionsRequest,
+    ) -> Result<WorkerCompletionsResult, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        validate_backend_identifier("worker_id", worker_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        let lookup = runtime.worker(worker_id);
+        if lookup.worker.is_none() {
+            return Err(operation_failed_or_unknown_worker(
+                runtime_id,
+                worker_id,
+                lookup.diagnostics,
+            ));
+        }
+        Ok(runtime.worker_completions(worker_id, request))
     }
 
     pub fn stop_worker(
@@ -1750,8 +1812,12 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             kind: match request.kind {
                 WorkerInputKind::User => EmbeddedWorkerInputKind::User,
                 WorkerInputKind::System => EmbeddedWorkerInputKind::System,
+                WorkerInputKind::Compact => EmbeddedWorkerInputKind::Compact,
+                WorkerInputKind::ListRewindTargets => EmbeddedWorkerInputKind::ListRewindTargets,
+                WorkerInputKind::RegisterPeer => EmbeddedWorkerInputKind::RegisterPeer,
             },
             content: request.content,
+            segments: request.segments,
         };
         match self.runtime.send_input(&worker_ref, input) {
             Ok(ack) => WorkerInputResult {
@@ -1766,6 +1832,64 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 worker_id,
                 embedded_runtime_diagnostic(&error),
             ),
+        }
+    }
+
+    fn worker_completions(
+        &self,
+        worker_id: &str,
+        request: WorkerCompletionsRequest,
+    ) -> WorkerCompletionsResult {
+        if !self.execution_enabled {
+            return WorkerCompletionsResult {
+                runtime_id: self.runtime_id.clone(),
+                worker_id: worker_id.to_string(),
+                kind: request.kind,
+                prefix: request.prefix,
+                entries: Vec::new(),
+                diagnostics: vec![diagnostic(
+                    "embedded_worker_execution_unavailable",
+                    DiagnosticSeverity::Info,
+                    format!(
+                        "worker completions for '{worker_id}' require an embedded execution backend"
+                    ),
+                )],
+            };
+        }
+        let Some(worker_ref) = self.worker_ref(worker_id) else {
+            return WorkerCompletionsResult {
+                runtime_id: self.runtime_id.clone(),
+                worker_id: worker_id.to_string(),
+                kind: request.kind,
+                prefix: request.prefix,
+                entries: Vec::new(),
+                diagnostics: vec![diagnostic(
+                    "embedded_worker_id_invalid",
+                    DiagnosticSeverity::Warning,
+                    "Worker id was empty and cannot be resolved".to_string(),
+                )],
+            };
+        };
+        match self
+            .runtime
+            .worker_completions(&worker_ref, request.kind, &request.prefix)
+        {
+            Ok(entries) => WorkerCompletionsResult {
+                runtime_id: self.runtime_id.clone(),
+                worker_id: worker_id.to_string(),
+                kind: request.kind,
+                prefix: request.prefix,
+                entries,
+                diagnostics: Vec::new(),
+            },
+            Err(error) => WorkerCompletionsResult {
+                runtime_id: self.runtime_id.clone(),
+                worker_id: worker_id.to_string(),
+                kind: request.kind,
+                prefix: request.prefix,
+                entries: Vec::new(),
+                diagnostics: vec![embedded_runtime_diagnostic(&error)],
+            },
         }
     }
 }
@@ -2397,8 +2521,12 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             kind: match request.kind {
                 WorkerInputKind::User => EmbeddedWorkerInputKind::User,
                 WorkerInputKind::System => EmbeddedWorkerInputKind::System,
+                WorkerInputKind::Compact => EmbeddedWorkerInputKind::Compact,
+                WorkerInputKind::ListRewindTargets => EmbeddedWorkerInputKind::ListRewindTargets,
+                WorkerInputKind::RegisterPeer => EmbeddedWorkerInputKind::RegisterPeer,
             },
             content: request.content,
+            segments: request.segments,
         };
         match self.post_json::<_, RuntimeHttpWorkerInputResponse>(
             &format!("/v1/workers/{worker_id}/input"),
@@ -2412,6 +2540,38 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 diagnostics: Vec::new(),
             },
             Err(diagnostic) => remote_input_rejected(&self.runtime_id, worker_id, diagnostic),
+        }
+    }
+
+    fn worker_completions(
+        &self,
+        worker_id: &str,
+        request: WorkerCompletionsRequest,
+    ) -> WorkerCompletionsResult {
+        let request = RuntimeHttpWorkerCompletionsRequest {
+            kind: request.kind,
+            prefix: request.prefix,
+        };
+        match self.post_json::<_, RuntimeHttpWorkerCompletionsResponse>(
+            &format!("/v1/workers/{worker_id}/completions"),
+            &request,
+        ) {
+            Ok(response) => WorkerCompletionsResult {
+                runtime_id: self.runtime_id.clone(),
+                worker_id: worker_id.to_string(),
+                kind: response.kind,
+                prefix: response.prefix,
+                entries: response.entries,
+                diagnostics: Vec::new(),
+            },
+            Err(diagnostic) => WorkerCompletionsResult {
+                runtime_id: self.runtime_id.clone(),
+                worker_id: worker_id.to_string(),
+                kind: request.kind,
+                prefix: request.prefix,
+                entries: Vec::new(),
+                diagnostics: vec![diagnostic],
+            },
         }
     }
 }
@@ -3676,6 +3836,7 @@ mod tests {
         request.initial_input = Some(EmbeddedWorkerInput {
             kind: EmbeddedWorkerInputKind::System,
             content: "system/role instruction belongs in profile".to_string(),
+            segments: None,
         });
 
         let spawned = runtime.spawn_worker(request);
@@ -3707,6 +3868,7 @@ mod tests {
             WorkerInputRequest {
                 kind: WorkerInputKind::User,
                 content: "hello".to_string(),
+                segments: None,
             },
         );
         assert_eq!(input.state, WorkerOperationState::Accepted);
@@ -3792,6 +3954,7 @@ mod tests {
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
                     content: "hello embedded runtime".to_string(),
+                    segments: None,
                 },
             )
             .unwrap();
@@ -4007,6 +4170,7 @@ mod tests {
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
                     content: "hello remote".to_string(),
+                    segments: None,
                 },
             )
             .unwrap();

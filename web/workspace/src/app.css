@@ -1383,6 +1383,15 @@
     color: var(--text-muted);
 }
 
+.composer-completions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    align-items: center;
+    color: var(--text-muted);
+    font-size: 0.86rem;
+}
+
 @media (max-width: 960px) {
     .console-header {
         flex-direction: column;

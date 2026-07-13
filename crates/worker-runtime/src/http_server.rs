@@ -146,6 +146,10 @@ pub fn runtime_http_router(runtime: Runtime, local_token: Option<String>) -> Rou
             get(get_worker).delete(delete_worker),
         )
         .route("/v1/workers/{worker_id}/input", post(send_worker_input))
+        .route(
+            "/v1/workers/{worker_id}/completions",
+            post(worker_completions),
+        )
         .route("/v1/workers/{worker_id}/stop", post(stop_worker))
         .route("/v1/workers/{worker_id}/cancel", post(cancel_worker));
 
@@ -226,6 +230,20 @@ pub struct RuntimeHttpWorkerDeleteResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeHttpWorkerInputResponse {
     pub ack: WorkerInteractionAck,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeHttpWorkerCompletionsRequest {
+    pub kind: protocol::CompletionKind,
+    #[serde(default)]
+    pub prefix: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeHttpWorkerCompletionsResponse {
+    pub kind: protocol::CompletionKind,
+    pub prefix: String,
+    pub entries: Vec<protocol::CompletionEntry>,
 }
 
 /// Worker lifecycle request body used by stop/cancel endpoints.
@@ -676,6 +694,24 @@ async fn send_worker_input(
         .send_input(&worker_ref, input)
         .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkerInputResponse { ack }))
+}
+
+async fn worker_completions(
+    State(state): State<RuntimeHttpState>,
+    Path(worker_id): Path<String>,
+    body: Result<Json<RuntimeHttpWorkerCompletionsRequest>, JsonRejection>,
+) -> RestResult<RuntimeHttpWorkerCompletionsResponse> {
+    let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
+    let Json(request) = body.map_err(RuntimeHttpRestError::json_rejection)?;
+    let entries = state
+        .runtime
+        .worker_completions(&worker_ref, request.kind, &request.prefix)
+        .map_err(RuntimeHttpRestError::runtime)?;
+    Ok(Json(RuntimeHttpWorkerCompletionsResponse {
+        kind: request.kind,
+        prefix: request.prefix,
+        entries,
+    }))
 }
 
 async fn stop_worker(

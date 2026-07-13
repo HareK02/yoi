@@ -349,6 +349,118 @@ Deno.test("projectConsole keeps Grep error detail in the body", () => {
   );
 });
 
+Deno.test("projectConsole renders alert events", () => {
+  const projection = projectConsole([
+    {
+      eventId: "alert-1",
+      event: {
+        event: "alert",
+        data: {
+          level: "warn",
+          source: "compactor",
+          message: "manual compaction skipped",
+          timestamp_ms: 1,
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "alert-2",
+      event: {
+        event: "alert",
+        data: {
+          level: "error",
+          source: "engine",
+          message: "provider failed",
+          timestamp_ms: 2,
+        },
+      } satisfies Event,
+    },
+  ]);
+
+  assertEquals(projection.lines.length, 2);
+  assertEquals(projection.lines[0].kind, "status");
+  assertEquals(projection.lines[0].title, "Alert · compactor");
+  assertEquals(projection.lines[0].body, "manual compaction skipped");
+  assertEquals(projection.lines[0].error, false);
+  assertEquals(projection.lines[1].kind, "error");
+  assertEquals(projection.lines[1].title, "Alert · engine");
+  assertEquals(projection.lines[1].body, "provider failed");
+  assertEquals(projection.lines[1].error, true);
+});
+
+Deno.test("projectConsole shows compact progress as a status block", () => {
+  const projection = projectConsole([
+    {
+      eventId: "compact-1",
+      event: { event: "compact_start" } satisfies Event,
+    },
+  ]);
+
+  assertEquals(projection.lines.length, 1);
+  assertEquals(projection.lines[0].id, "status-compact");
+  assertEquals(projection.lines[0].kind, "status");
+  assertEquals(projection.lines[0].body, "Compacting…");
+  assertEquals(projection.lines[0].streaming, true);
+
+  const completed = projectConsole([
+    {
+      eventId: "compact-1",
+      event: { event: "compact_start" } satisfies Event,
+    },
+    {
+      eventId: "compact-2",
+      event: {
+        event: "compact_done",
+        data: { new_segment_id: "00000000-0000-0000-0000-000000000001" },
+      } satisfies Event,
+    },
+  ]);
+
+  assertEquals(completed.lines.length, 1);
+  assertEquals(completed.lines[0].id, "status-compact");
+  assertEquals(completed.lines[0].body, "Compacted.");
+  assertEquals(completed.lines[0].streaming, false);
+});
+
+Deno.test("createConsoleProjector updates only compact status block", () => {
+  const projector = createConsoleProjector();
+  let projection = projector.append([
+    {
+      eventId: "compact-identity-1",
+      event: {
+        event: "user_message",
+        data: { segments: [{ kind: "text", content: "hello" }] },
+      } satisfies Event,
+    },
+    {
+      eventId: "compact-identity-2",
+      event: { event: "compact_start" } satisfies Event,
+    },
+  ]);
+  const userLine = projection.lines[0];
+  const compactLine = projection.lines[1];
+
+  projection = projector.append([
+    {
+      eventId: "compact-identity-3",
+      event: {
+        event: "compact_done",
+        data: { new_segment_id: "00000000-0000-0000-0000-000000000001" },
+      } satisfies Event,
+    },
+  ]);
+
+  assert(
+    projection.lines[0] === userLine,
+    "unrelated message line should keep object identity",
+  );
+  assert(
+    projection.lines[1] !== compactLine,
+    "compact status line should update object identity",
+  );
+  assertEquals(projection.lines[1].body, "Compacted.");
+});
+
 Deno.test("projectConsole keeps streaming tool call updates in the same Call block", () => {
   const projection = projectConsole([
     {
@@ -680,6 +792,18 @@ Deno.test("projectConsole renders snapshot entries and in-flight output", () => 
                 is_error: false,
               },
             },
+            {
+              kind: "extension",
+              ts: 6,
+              domain: "yoi.compaction",
+              payload: {
+                kind: "compaction_block",
+                schema_version: 1,
+                block_id: "compact",
+                state: "running",
+                message: "Compacting…",
+              },
+            },
           ],
           greeting: {
             worker_name: "Worker",
@@ -710,6 +834,7 @@ Deno.test("projectConsole renders snapshot entries and in-flight output", () => 
       "user:new user:false",
       "assistant:assistant reply:false",
       "tool:Read — 1 file read\n  /tmp/a.md:false",
+      "status:Compacting…:true",
       "in_flight:partial:true",
     ],
   );

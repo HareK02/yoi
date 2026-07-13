@@ -26,7 +26,7 @@ export type ChatSubmitKeyEventLike = {
 function normalizeOptions(options: ChatSubmitOptions): NormalizedChatSubmitOptions {
   return {
     mode: "mod-enter",
-    modKey: "meta",
+    modKey: "auto",
     allowEmptySubmit: false,
     stopPropagation: false,
     enabled: true,

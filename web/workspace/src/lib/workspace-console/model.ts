@@ -1,5 +1,6 @@
 import type {
   Event as ProtocolEvent,
+  Alert,
   InFlightBlock,
   InFlightToolCallState,
   Segment,
@@ -262,7 +263,10 @@ export function applyProtocolEvent(
     case "llm_retry":
     case "llm_continuation":
     case "run_end":
+      break;
     case "alert":
+      appendAlertLine(next, envelope.eventId, event.data);
+      break;
     case "memory_worker":
     case "segment_rotated":
     case "completions":
@@ -271,22 +275,23 @@ export function applyProtocolEvent(
     case "workers_listed":
     case "worker_restored":
     case "peer_registered":
-    case "compact_start":
-    case "compact_done":
       // These are protocol/status/control events. TUI Console does not append
       // them to the conversation surface; browser Console should not either.
       break;
+    case "compact_start":
+      upsertStatusLine(next, "compact", envelope.eventId, "Compacting…", true);
+      break;
+    case "compact_done":
+      upsertStatusLine(next, "compact", envelope.eventId, "Compacted.", false);
+      break;
     case "compact_failed":
-      next.lines.push(
-        line(
-          envelope.eventId,
-          "error",
-          "compact failed",
-          event.data.error,
-          undefined,
-          false,
-          true,
-        ),
+      upsertStatusLine(
+        next,
+        "compact",
+        envelope.eventId,
+        `Compact failed: ${event.data.error}`,
+        false,
+        true,
       );
       break;
     case "shutdown":
@@ -339,6 +344,52 @@ function line(
     streaming,
     error,
   };
+}
+
+function upsertStatusLine(
+  projection: ConsoleProjection,
+  id: string,
+  eventId: string,
+  body: string,
+  streaming: boolean,
+  error = false,
+): void {
+  const lineId = `status-${id}`;
+  const index = projection.lines.findIndex((item) => item.id === lineId);
+  const item: ConsoleLine = {
+    id: lineId,
+    kind: error ? "error" : "status",
+    title: error ? "Status error" : "Status",
+    body,
+    eventId,
+    source: "event",
+    streaming,
+    error,
+  };
+  if (index >= 0) {
+    projection.lines[index] = item;
+  } else {
+    projection.lines.push(item);
+  }
+}
+
+function appendAlertLine(
+  projection: ConsoleProjection,
+  eventId: string,
+  alert: Alert,
+): void {
+  const isError = alert.level === "error";
+  projection.lines.push(
+    line(
+      eventId,
+      isError ? "error" : "status",
+      `Alert · ${alert.source}`,
+      alert.message,
+      undefined,
+      false,
+      isError,
+    ),
+  );
 }
 
 function findLastLineIndex(
@@ -943,8 +994,52 @@ function applyLogEntry(
     case "tool_result":
       applyLoggedItem(projection, eventId, entry["item"]);
       break;
+    case "extension":
+      applyExtensionEntry(projection, eventId, entry);
+      break;
     default:
       break;
+  }
+}
+
+function applyExtensionEntry(
+  projection: ConsoleProjection,
+  eventId: string,
+  entry: Record<string, unknown>,
+) {
+  if (entry["domain"] !== "yoi.compaction") {
+    return;
+  }
+  const payload = entry["payload"];
+  if (!isRecord(payload) || payload["kind"] !== "compaction_block") {
+    return;
+  }
+  const blockId = stringField(payload, "block_id") || "compact";
+  const state = stringField(payload, "state") || "running";
+  const message = stringField(payload, "message") || compactMessageForState(state, payload);
+  upsertStatusLine(
+    projection,
+    blockId,
+    eventId,
+    message,
+    state === "running",
+    state === "failed",
+  );
+}
+
+function compactMessageForState(
+  state: string,
+  payload: Record<string, unknown>,
+): string {
+  switch (state) {
+    case "done":
+      return "Compacted.";
+    case "failed": {
+      const error = stringField(payload, "error");
+      return error ? `Compact failed: ${error}` : "Compact failed.";
+    }
+    default:
+      return "Compacting…";
   }
 }
 

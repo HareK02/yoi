@@ -165,37 +165,7 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: WorkerHandle)
             method = reader.next::<Method>() => {
                 match method {
                     Ok(Some(Method::ListCompletions { kind, prefix })) => {
-                        let entries = match kind {
-                            protocol::CompletionKind::File => handle
-                                .shared_state
-                                .fs_view()
-                                .map(|view| view.list_file_completions(&prefix))
-                                .unwrap_or_default()
-                                .into_iter()
-                                .map(|c| protocol::CompletionEntry {
-                                    value: c.path,
-                                    is_dir: c.is_dir,
-                                })
-                                .collect(),
-                            protocol::CompletionKind::Knowledge => handle
-                                .shared_state
-                                .list_knowledge_completions(&prefix)
-                                .into_iter()
-                                .map(|c| protocol::CompletionEntry {
-                                    value: c.slug,
-                                    is_dir: false,
-                                })
-                                .collect(),
-                            protocol::CompletionKind::Workflow => handle
-                                .shared_state
-                                .list_workflow_completions(&prefix)
-                                .into_iter()
-                                .map(|c| protocol::CompletionEntry {
-                                    value: c.slug,
-                                    is_dir: false,
-                                })
-                                .collect(),
-                        };
+                        let entries = handle.completion_entries(kind, &prefix);
                         if writer
                             .write(&Event::Completions { kind, entries })
                             .await

@@ -398,6 +398,15 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
     fn worker_snapshot(&self, _handle: &WorkerExecutionHandle) -> Option<protocol::Event> {
         None
     }
+
+    fn worker_completions(
+        &self,
+        _handle: &WorkerExecutionHandle,
+        _kind: protocol::CompletionKind,
+        _prefix: &str,
+    ) -> Vec<protocol::CompletionEntry> {
+        Vec::new()
+    }
 }
 
 #[derive(Clone)]
@@ -484,6 +493,15 @@ impl WorkerExecutionBackendRef {
         handle: &WorkerExecutionHandle,
     ) -> Option<protocol::Event> {
         self.backend.worker_snapshot(handle)
+    }
+
+    pub(crate) fn worker_completions(
+        &self,
+        handle: &WorkerExecutionHandle,
+        kind: protocol::CompletionKind,
+        prefix: &str,
+    ) -> Vec<protocol::CompletionEntry> {
+        self.backend.worker_completions(handle, kind, prefix)
     }
 }
 

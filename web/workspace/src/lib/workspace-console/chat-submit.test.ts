@@ -18,20 +18,30 @@ function assertEquals<T>(actual: T, expected: T): void {
   }
 }
 
-Deno.test("shouldSubmitChatKey defaults to Cmd+Enter submit behavior", () => {
+Deno.test("shouldSubmitChatKey supports platform-auto submit modifier", () => {
+  assert(
+    shouldSubmitChatKey(
+      { key: "Enter", ctrlKey: true },
+      { mode: "mod-enter", modKey: "auto", enabled: true },
+    ),
+    "Ctrl+Enter should submit on non-Apple platforms",
+  );
+  assertEquals(
+    shouldSubmitChatKey(
+      { key: "Enter" },
+      { mode: "mod-enter", modKey: "auto", enabled: true },
+    ),
+    false,
+  );
+});
+
+Deno.test("shouldSubmitChatKey still supports explicit Cmd+Enter behavior", () => {
   assert(
     shouldSubmitChatKey(
       { key: "Enter", metaKey: true },
       { mode: "mod-enter", modKey: "meta", enabled: true },
     ),
-    "Cmd+Enter should submit by default",
-  );
-  assertEquals(
-    shouldSubmitChatKey(
-      { key: "Enter" },
-      { mode: "mod-enter", modKey: "meta", enabled: true },
-    ),
-    false,
+    "Cmd+Enter should submit when meta is selected",
   );
   assertEquals(
     shouldSubmitChatKey(

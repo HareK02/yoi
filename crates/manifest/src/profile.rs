@@ -970,6 +970,12 @@ fn builtin_default_profile_artifact() -> serde_json::Value {
         "model": { "ref": "codex-oauth/gpt-5.5" },
         "session": { "record_event_trace": true },
         "engine": { "reasoning": "high" },
+        "compaction": {
+            "kind": "tokens",
+            "threshold": 240000,
+            "request_threshold": 270000,
+            "worker_context_max_tokens": 100000
+        },
         "feature": {
             "task": { "enabled": true },
             "memory": { "enabled": true },
@@ -1441,6 +1447,22 @@ mod tests {
         assert!(companion.delegation_scope.allow.is_empty());
         assert_eq!(companion.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
         assert!(companion.web.is_some());
+        assert_eq!(
+            companion.compaction.as_ref().unwrap().threshold,
+            Some(240000)
+        );
+        assert_eq!(
+            companion.compaction.as_ref().unwrap().request_threshold,
+            Some(270000)
+        );
+        assert_eq!(
+            companion
+                .compaction
+                .as_ref()
+                .unwrap()
+                .worker_context_max_tokens,
+            100000
+        );
 
         let intake = resolve("intake");
         assert!(intake.feature.task.enabled);
@@ -1450,6 +1472,7 @@ mod tests {
         assert!(intake.delegation_scope.allow.is_empty());
         assert_eq!(intake.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
         assert!(intake.web.is_some());
+        assert!(intake.compaction.is_some());
         assert!(!intake.feature.ticket_orchestration.enabled);
 
         let orchestrator = resolve("orchestrator");
@@ -1464,6 +1487,7 @@ mod tests {
             Some("codex-oauth/gpt-5.5")
         );
         assert!(orchestrator.web.is_some());
+        assert!(orchestrator.compaction.is_some());
 
         let coder = resolve("coder");
         assert!(coder.feature.task.enabled);
@@ -1472,6 +1496,7 @@ mod tests {
         assert!(coder.delegation_scope.allow.is_empty());
         assert_eq!(coder.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
         assert!(coder.web.is_some());
+        assert!(coder.compaction.is_some());
 
         let reviewer = resolve("reviewer");
         assert!(reviewer.feature.task.enabled);
@@ -1481,6 +1506,7 @@ mod tests {
         assert!(reviewer.delegation_scope.allow.is_empty());
         assert_eq!(reviewer.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
         assert!(reviewer.web.is_some());
+        assert!(reviewer.compaction.is_some());
     }
 
     #[test]
