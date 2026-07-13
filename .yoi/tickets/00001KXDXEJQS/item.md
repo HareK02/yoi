@@ -1,9 +1,11 @@
 ---
 title: 'Render console snapshot entries'
-state: 'planning'
+state: 'inprogress'
 created_at: '2026-07-13T14:17:43Z'
-updated_at: '2026-07-13T14:18:00Z'
+updated_at: '2026-07-13T14:18:30Z'
 assignee: null
+queued_by: 'yoi ticket'
+queued_at: '2026-07-13T14:18:30Z'
 ---
 
 ## 背景
