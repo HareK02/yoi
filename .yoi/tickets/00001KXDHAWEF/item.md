@@ -1,8 +1,8 @@
 ---
 title: 'Show backend operation error details'
-state: 'inprogress'
+state: 'done'
 created_at: '2026-07-13T10:45:59Z'
-updated_at: '2026-07-13T10:46:30Z'
+updated_at: '2026-07-13T10:51:20Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-13T10:46:30Z'

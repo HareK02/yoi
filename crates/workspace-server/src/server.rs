@@ -4637,8 +4637,8 @@ fn settings_diagnostic(
     }
 }
 
-fn sanitize_backend_error(_message: &str) -> String {
-    "operation failed; backend-private details were omitted".to_string()
+fn sanitize_backend_error(message: &str) -> String {
+    message.to_string()
 }
 
 fn repository_diagnostics(
@@ -5201,11 +5201,14 @@ mod tests {
     }
 
     #[test]
-    fn sanitized_errors_omit_backend_private_paths() {
+    fn backend_errors_preserve_operation_details() {
         let sanitized = sanitize_backend_error(
             "failed to open /home/example/.yoi/workspace-backend.local.toml",
         );
-        assert!(!sanitized.contains("/home/example"));
+        assert_eq!(
+            sanitized,
+            "failed to open /home/example/.yoi/workspace-backend.local.toml"
+        );
     }
 
     #[tokio::test]
