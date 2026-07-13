@@ -73,3 +73,23 @@ State changed to `done`.
 
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-07-13T12:05:01Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-07-13T12:05:01Z status: closed -->
+
+## 完了
+
+Ticket `00001KXDJ1V3D` (`Preserve typed Workdir not-found errors`) はすでに `state: done` に到達していたため、workspace Dashboard から close しました。
+
+この Close action によって、実装作業、state 変更、Orchestrator/Companion launch、worker invocation は開始されていません。
+
+
+---

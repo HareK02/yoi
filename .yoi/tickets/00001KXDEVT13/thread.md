@@ -80,3 +80,23 @@ State changed to `done`.
 
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-07-13T12:05:03Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-07-13T12:05:03Z status: closed -->
+
+## 完了
+
+Ticket `00001KXDEVT13` (`Normalize worker runtime filesystem options`) はすでに `state: done` に到達していたため、workspace Dashboard から close しました。
+
+この Close action によって、実装作業、state 変更、Orchestrator/Companion launch、worker invocation は開始されていません。
+
+
+---

@@ -1,8 +1,8 @@
 ---
 title: 'Preserve typed Workdir not-found errors'
-state: 'done'
+state: 'closed'
 created_at: '2026-07-13T10:58:32Z'
-updated_at: '2026-07-13T11:16:48Z'
+updated_at: '2026-07-13T12:05:01Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-13T10:59:02Z'

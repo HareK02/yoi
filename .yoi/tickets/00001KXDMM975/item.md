@@ -1,8 +1,8 @@
 ---
 title: 'Allow not-found Workdir cleanup action'
-state: 'done'
+state: 'closed'
 created_at: '2026-07-13T11:43:33Z'
-updated_at: '2026-07-13T11:51:11Z'
+updated_at: '2026-07-13T12:04:57Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-13T11:44:18Z'

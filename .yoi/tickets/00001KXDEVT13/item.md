@@ -1,8 +1,8 @@
 ---
 title: 'Normalize worker runtime filesystem options'
-state: 'done'
+state: 'closed'
 created_at: '2026-07-13T10:02:48Z'
-updated_at: '2026-07-13T10:04:09Z'
+updated_at: '2026-07-13T12:05:03Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-13T10:04:08Z'
