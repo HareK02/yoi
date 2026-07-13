@@ -1683,7 +1683,7 @@ fn build_runtime_cleanup_plan(
         let running_linked = !linked_running_worker_ids.is_empty();
         let observed_status = observed_workdirs
             .get(record.workdir_id.as_str())
-            .map(|summary| format!("{:?}", summary.status).to_lowercase());
+            .map(|summary| workdir_status_kind_label(&summary.status).to_string());
         let file_status = observed_status.unwrap_or_else(|| record.materialization_status.clone());
         let cleanliness = record.cleanliness.clone();
         let action = if matches!(file_status.as_str(), "missing" | "not_found") {
@@ -4285,6 +4285,16 @@ fn sync_runtime_workdir_observations(
         }
     }
     Ok(response.diagnostics)
+}
+
+fn workdir_status_kind_label(status: &WorkingDirectoryStatusKind) -> &'static str {
+    match status {
+        WorkingDirectoryStatusKind::Active => "active",
+        WorkingDirectoryStatusKind::CleanupPending => "cleanup_pending",
+        WorkingDirectoryStatusKind::Corrupted => "corrupted",
+        WorkingDirectoryStatusKind::NotFound => "not_found",
+        WorkingDirectoryStatusKind::Unknown => "unknown",
+    }
 }
 
 fn workdir_status_from_runtime_miss(diagnostics: &[RuntimeDiagnostic]) -> &'static str {

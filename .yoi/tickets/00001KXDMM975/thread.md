@@ -40,3 +40,37 @@ State changed to `inprogress`.
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-13T11:51:11Z -->
+
+## Implementation report
+
+Fixed not-found Workdir cleanup plan classification.
+
+Root cause:
+- Cleanup plan converted `WorkingDirectoryStatusKind::NotFound` with `format!("{:?}").to_lowercase()`, producing `notfound` instead of the canonical API/status label `not_found`.
+- The action classifier only recognized `missing` / `not_found`, so the candidate fell through to `workdir_dirty_discard`, which the frontend disables by design.
+
+Changes:
+- Added explicit `workdir_status_kind_label` mapping for `WorkingDirectoryStatusKind`.
+- `NotFound` now maps to `not_found`, so cleanup plan candidates become `workdir_record_delete`.
+
+Validation:
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check -q`
+- `cargo test -q -p yoi-workspace-server`
+- targeted cleanup plan test
+- `nix build .#yoi --no-link`
+
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-07-13T11:51:11Z from: inprogress to: done reason: cli_state field: state -->
+
+## State changed
+
+State changed to `done`.
+
+
+---
