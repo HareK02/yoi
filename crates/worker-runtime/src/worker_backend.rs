@@ -1082,6 +1082,17 @@ where
             WorkerExecutionRunState::Idle,
         )
     }
+
+    #[cfg(feature = "ws-server")]
+    fn worker_snapshot(&self, handle: &WorkerExecutionHandle) -> Option<protocol::Event> {
+        if handle.backend_id() != self.backend_id() {
+            return None;
+        }
+        let workers = self.workers.lock().ok()?;
+        workers
+            .get(handle.worker_ref())
+            .map(|execution| execution.handle.snapshot_event())
+    }
 }
 
 #[cfg(test)]

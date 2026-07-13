@@ -7,7 +7,6 @@ use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
 
 use crate::controller::WorkerHandle;
-use crate::in_flight::snapshot_from_guard;
 use protocol::{Event, Method};
 
 /// Unix socket server for Worker Protocol.
@@ -111,16 +110,10 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: WorkerHandle)
     // committed entry or as the still-present in-flight block. This lock
     // order matches `append_entry` (in-flight clear before sink publish) and
     // keeps the snapshot/live boundary gap-free.
-    let (entries_snapshot, mut entry_rx, alert_snapshot, mut rx, in_flight) = {
-        let in_flight_guard = handle.in_flight.snapshot_guard();
-        let (entries_snapshot, entry_rx) = handle.sink.subscribe_with_snapshot();
-
-        // Atomically subscribe and snapshot buffered alerts so that warnings
-        // emitted before this client connected are replayed exactly once.
-        let (alert_snapshot, rx) = handle.alerter.subscribe_with_snapshot();
-        let in_flight = snapshot_from_guard(&in_flight_guard);
-        (entries_snapshot, entry_rx, alert_snapshot, rx, in_flight)
-    };
+    let (snapshot_event, mut entry_rx) = handle.snapshot_event_with_entry_subscription();
+    // Atomically subscribe and snapshot buffered alerts so that warnings
+    // emitted before this client connected are replayed exactly once.
+    let (alert_snapshot, mut rx) = handle.alerter.subscribe_with_snapshot();
     for alert in alert_snapshot {
         if writer.write(&Event::Alert(alert)).await.is_err() {
             return;
@@ -129,15 +122,6 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: WorkerHandle)
 
     // Send the typed snapshot up front so late attachers can
     // reconstruct view state without an extra round trip.
-    let snapshot_event = Event::Snapshot {
-        entries: entries_snapshot
-            .into_iter()
-            .map(|e| serde_json::to_value(&e).expect("LogEntry is Serialize"))
-            .collect(),
-        greeting: handle.shared_state.greeting.clone(),
-        status: handle.shared_state.get_status(),
-        in_flight,
-    };
     if writer.write(&snapshot_event).await.is_err() {
         return;
     }

@@ -5,8 +5,8 @@ use std::sync::atomic::Ordering;
 use llm_engine::EngineError;
 use llm_engine::llm_client::client::LlmClient;
 use manifest::TicketFeatureAccessConfig;
-use session_store::Store;
 use session_store::WorkerMetadataStore;
+use session_store::{LogEntry, Store};
 use ticket::LocalTicketBackend;
 use ticket::config::TicketConfig;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -16,7 +16,7 @@ use crate::discovery::{
     WorkerDiscovery, list_workers_tool, restore_worker_tool, send_to_peer_worker_tool,
 };
 use crate::feature::FeatureRegistryBuilder;
-use crate::in_flight::InFlightEvents;
+use crate::in_flight::{InFlightEvents, snapshot_from_guard};
 use crate::ipc::alerter::Alerter;
 use crate::ipc::notify_buffer::NotifyBuffer;
 use crate::ipc::server::SocketServer;
@@ -64,6 +64,31 @@ impl WorkerHandle {
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.event_tx.subscribe()
+    }
+
+    pub fn snapshot_event(&self) -> Event {
+        self.snapshot_event_with_entry_subscription().0
+    }
+
+    pub(crate) fn snapshot_event_with_entry_subscription(
+        &self,
+    ) -> (Event, broadcast::Receiver<LogEntry>) {
+        let (entries, entry_rx, in_flight) = {
+            let in_flight_guard = self.in_flight.snapshot_guard();
+            let (entries, entry_rx) = self.sink.subscribe_with_snapshot();
+            let in_flight = snapshot_from_guard(&in_flight_guard);
+            (entries, entry_rx, in_flight)
+        };
+        let event = Event::Snapshot {
+            entries: entries
+                .into_iter()
+                .map(|entry| serde_json::to_value(entry).expect("log entry serializes"))
+                .collect(),
+            greeting: self.shared_state.greeting.clone(),
+            status: self.shared_state.get_status(),
+            in_flight,
+        };
+        (event, entry_rx)
     }
 
     /// Broadcast an event to all listeners (including socket clients).

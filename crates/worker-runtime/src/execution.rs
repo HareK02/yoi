@@ -393,6 +393,11 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
             "execution backend does not support cancelling workers",
         )
     }
+
+    #[cfg(feature = "ws-server")]
+    fn worker_snapshot(&self, _handle: &WorkerExecutionHandle) -> Option<protocol::Event> {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -471,6 +476,14 @@ impl WorkerExecutionBackendRef {
 
     pub(crate) fn cancel_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
         self.backend.cancel_worker(handle)
+    }
+
+    #[cfg(feature = "ws-server")]
+    pub(crate) fn worker_snapshot(
+        &self,
+        handle: &WorkerExecutionHandle,
+    ) -> Option<protocol::Event> {
+        self.backend.worker_snapshot(handle)
     }
 }
 

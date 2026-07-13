@@ -783,8 +783,19 @@ impl Runtime {
         &self,
         worker_ref: &WorkerRef,
     ) -> Result<protocol::Event, RuntimeError> {
-        let state = self.lock()?;
-        let _worker = state.worker(worker_ref)?;
+        let (backend, handle) = {
+            let state = self.lock()?;
+            let worker = state.worker(worker_ref)?;
+            (
+                state.execution_backend.clone(),
+                worker.execution_handle.clone(),
+            )
+        };
+        if let (Some(backend), Some(handle)) = (backend, handle) {
+            if let Some(snapshot) = backend.worker_snapshot(&handle) {
+                return Ok(snapshot);
+            }
+        }
         Ok(protocol::Event::Snapshot {
             entries: Vec::new(),
             greeting: protocol::Greeting {
@@ -1826,11 +1837,21 @@ mod tests {
         restore_result: Mutex<Option<WorkerExecutionSpawnResult>>,
         restore_count: Mutex<u64>,
         contexts: Mutex<BTreeMap<WorkerId, WorkerExecutionContext>>,
+        #[cfg(feature = "ws-server")]
+        snapshots: Mutex<BTreeMap<WorkerId, protocol::Event>>,
     }
 
     impl TestExecutionBackend {
         fn set_dispatch_result(&self, result: WorkerExecutionResult) {
             *self.dispatch_result.lock().unwrap() = Some(result);
+        }
+
+        #[cfg(feature = "ws-server")]
+        fn set_worker_snapshot(&self, worker_ref: &WorkerRef, snapshot: protocol::Event) {
+            self.snapshots
+                .lock()
+                .unwrap()
+                .insert(worker_ref.worker_id.clone(), snapshot);
         }
 
         #[cfg(feature = "ws-server")]
@@ -1916,6 +1937,15 @@ mod tests {
                 WorkerExecutionOperation::Cancel,
                 WorkerExecutionRunState::Stopped,
             )
+        }
+
+        #[cfg(feature = "ws-server")]
+        fn worker_snapshot(&self, handle: &WorkerExecutionHandle) -> Option<protocol::Event> {
+            self.snapshots
+                .lock()
+                .unwrap()
+                .get(&handle.worker_ref().worker_id)
+                .cloned()
         }
     }
 
@@ -2121,6 +2151,51 @@ mod tests {
             observations[0].payload,
             protocol::Event::TextDelta { .. }
         ));
+    }
+
+    #[cfg(feature = "ws-server")]
+    #[test]
+    fn observation_snapshot_prefers_live_backend_snapshot() {
+        let (runtime, backend) = runtime_and_backend();
+        let detail = runtime
+            .create_worker(task_request("observe snapshot"))
+            .unwrap();
+        let expected_entry = serde_json::json!({"kind": "restored-log-entry"});
+        backend.set_worker_snapshot(
+            &detail.worker_ref,
+            protocol::Event::Snapshot {
+                entries: vec![expected_entry.clone()],
+                greeting: protocol::Greeting {
+                    worker_name: "live-worker".to_string(),
+                    cwd: "/tmp/live".to_string(),
+                    provider: "test-provider".to_string(),
+                    model: "test-model".to_string(),
+                    scope_summary: "live snapshot".to_string(),
+                    tools: Vec::new(),
+                    context_window: 128,
+                    context_tokens: 64,
+                },
+                status: protocol::WorkerStatus::Running,
+                in_flight: protocol::InFlightSnapshot { blocks: Vec::new() },
+            },
+        );
+
+        let snapshot = runtime
+            .worker_observation_snapshot(&detail.worker_ref)
+            .unwrap();
+        match snapshot {
+            protocol::Event::Snapshot {
+                entries,
+                greeting,
+                status,
+                ..
+            } => {
+                assert_eq!(entries, vec![expected_entry]);
+                assert_eq!(greeting.worker_name, "live-worker");
+                assert_eq!(status, protocol::WorkerStatus::Running);
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
     }
 
     struct InputOnlyBackend;
