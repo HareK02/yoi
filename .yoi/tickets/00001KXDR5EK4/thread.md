@@ -40,3 +40,37 @@ State changed to `inprogress`.
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-13T12:56:55Z -->
+
+## Implementation report
+
+Typed Workdir cleanup plan status and cleanliness.
+
+- Added `CleanupWorkdirFileStatus` and `CleanupWorkdirCleanliness` typed enums with snake_case JSON serialization.
+- `CleanupWorkdirCandidate.file_status` and `.cleanliness` now use those enums instead of `String`.
+- Runtime-observed `WorkingDirectoryStatusKind` is converted directly into cleanup status without string formatting.
+- Registry string fields are parsed only at the DB/API boundary; unknown values become `Unknown`.
+- Cleanup action policy now uses enum matches/predicates rather than string matching.
+- `NotFound` remains represented as `not_found` over JSON and maps to `workdir_record_delete` internally.
+
+Validation:
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo check -q`
+- `cargo test -q -p yoi-workspace-server`
+- `cargo test -q -p worker-runtime --features fs-store,ws-server`
+- `cd web/workspace && deno task check && deno task test`
+- `nix build .#yoi --no-link`
+
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-07-13T12:56:55Z from: inprogress to: done reason: cli_state field: state -->
+
+## State changed
+
+State changed to `done`.
+
+
+---

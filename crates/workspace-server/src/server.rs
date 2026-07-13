@@ -591,6 +591,80 @@ pub enum CleanupTargetKind {
     WorkdirRecordDelete,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupWorkdirFileStatus {
+    Pending,
+    Present,
+    Active,
+    CleanupPending,
+    NotFound,
+    Corrupted,
+    Failed,
+    Unknown,
+}
+
+impl CleanupWorkdirFileStatus {
+    fn from_registry(value: &str) -> Self {
+        match value {
+            "pending" => Self::Pending,
+            "present" => Self::Present,
+            "active" => Self::Active,
+            "cleanup_pending" => Self::CleanupPending,
+            "not_found" => Self::NotFound,
+            "corrupted" => Self::Corrupted,
+            "failed" => Self::Failed,
+            "unknown" => Self::Unknown,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn from_runtime(value: &WorkingDirectoryStatusKind) -> Self {
+        match value {
+            WorkingDirectoryStatusKind::Active => Self::Active,
+            WorkingDirectoryStatusKind::CleanupPending => Self::CleanupPending,
+            WorkingDirectoryStatusKind::Corrupted => Self::Corrupted,
+            WorkingDirectoryStatusKind::NotFound => Self::NotFound,
+            WorkingDirectoryStatusKind::Unknown => Self::Unknown,
+        }
+    }
+
+    fn is_record_only(self) -> bool {
+        matches!(self, Self::NotFound)
+    }
+
+    fn is_corrupted(self) -> bool {
+        matches!(self, Self::Corrupted)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupWorkdirCleanliness {
+    Clean,
+    Dirty,
+    Unknown,
+}
+
+impl CleanupWorkdirCleanliness {
+    fn from_registry(value: &str) -> Self {
+        match value {
+            "clean" => Self::Clean,
+            "dirty" => Self::Dirty,
+            "unknown" => Self::Unknown,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn from_runtime(value: Option<&str>) -> Self {
+        value.map(Self::from_registry).unwrap_or(Self::Unknown)
+    }
+
+    fn is_clean(self) -> bool {
+        matches!(self, Self::Clean)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CleanupWorkerCandidate {
     pub target_id: String,
@@ -620,8 +694,8 @@ pub struct CleanupWorkdirCandidate {
     pub linked_running_worker_ids: Vec<String>,
     pub running_linked: bool,
     pub pinned_linked: bool,
-    pub file_status: String,
-    pub cleanliness: String,
+    pub file_status: CleanupWorkdirFileStatus,
+    pub cleanliness: CleanupWorkdirCleanliness,
     pub estimated_reclaim_bytes: Option<u64>,
 }
 
@@ -1683,12 +1757,17 @@ fn build_runtime_cleanup_plan(
         let running_linked = !linked_running_worker_ids.is_empty();
         let observed_status = observed_workdirs
             .get(record.workdir_id.as_str())
-            .map(|summary| workdir_status_kind_label(&summary.status).to_string());
-        let file_status = observed_status.unwrap_or_else(|| record.materialization_status.clone());
-        let cleanliness = record.cleanliness.clone();
-        let action = if matches!(file_status.as_str(), "missing" | "not_found") {
+            .map(|summary| CleanupWorkdirFileStatus::from_runtime(&summary.status));
+        let file_status = observed_status.unwrap_or_else(|| {
+            CleanupWorkdirFileStatus::from_registry(&record.materialization_status)
+        });
+        let cleanliness = observed_workdirs
+            .get(record.workdir_id.as_str())
+            .map(|summary| CleanupWorkdirCleanliness::from_runtime(summary.cleanliness.as_deref()))
+            .unwrap_or_else(|| CleanupWorkdirCleanliness::from_registry(&record.cleanliness));
+        let action = if file_status.is_record_only() {
             CleanupTargetKind::WorkdirRecordDelete
-        } else if file_status == "corrupted" || cleanliness == "clean" {
+        } else if file_status.is_corrupted() || cleanliness.is_clean() {
             CleanupTargetKind::WorkdirCleanCleanup
         } else {
             CleanupTargetKind::WorkdirDirtyDiscard
@@ -1708,14 +1787,14 @@ fn build_runtime_cleanup_plan(
             repository_id: record.repository_id.clone(),
             reason: if blocking_reason.is_some() {
                 "Workdir cleanup is blocked until linked Worker state is safe".to_string()
-            } else if matches!(file_status.as_str(), "missing" | "not_found") {
+            } else if file_status.is_record_only() {
                 "Not-found Workdir record can be deleted from the Backend registry".to_string()
-            } else if file_status == "corrupted" {
+            } else if file_status.is_corrupted() {
                 "Corrupted Workdir can be deleted from Runtime storage and Backend registry"
                     .to_string()
-            } else if cleanliness == "dirty" {
+            } else if matches!(cleanliness, CleanupWorkdirCleanliness::Dirty) {
                 "Dirty Workdir requires explicit discard confirmation before cleanup".to_string()
-            } else if cleanliness == "unknown" {
+            } else if matches!(cleanliness, CleanupWorkdirCleanliness::Unknown) {
                 "Workdir clean state is unknown; explicit discard confirmation is required"
                     .to_string()
             } else {
@@ -4287,16 +4366,6 @@ fn sync_runtime_workdir_observations(
     Ok(response.diagnostics)
 }
 
-fn workdir_status_kind_label(status: &WorkingDirectoryStatusKind) -> &'static str {
-    match status {
-        WorkingDirectoryStatusKind::Active => "active",
-        WorkingDirectoryStatusKind::CleanupPending => "cleanup_pending",
-        WorkingDirectoryStatusKind::Corrupted => "corrupted",
-        WorkingDirectoryStatusKind::NotFound => "not_found",
-        WorkingDirectoryStatusKind::Unknown => "unknown",
-    }
-}
-
 fn workdir_status_from_runtime_miss(diagnostics: &[RuntimeDiagnostic]) -> &'static str {
     if diagnostics
         .iter()
@@ -5743,7 +5812,7 @@ mod tests {
             .iter()
             .find(|candidate| candidate.workdir_id == workdir_id)
             .expect("cleanup candidate");
-        assert_eq!(candidate.cleanliness, "clean");
+        assert_eq!(candidate.cleanliness, CleanupWorkdirCleanliness::Clean);
         assert_eq!(candidate.action, CleanupTargetKind::WorkdirCleanCleanup);
         assert!(candidate.reason.contains("clean"));
 
@@ -5785,7 +5854,7 @@ mod tests {
             .iter()
             .find(|candidate| candidate.workdir_id == workdir_id)
             .expect("cleanup candidate");
-        assert_eq!(candidate.cleanliness, "clean");
+        assert_eq!(candidate.cleanliness, CleanupWorkdirCleanliness::Clean);
         assert_eq!(candidate.action, CleanupTargetKind::WorkdirCleanCleanup);
     }
 
@@ -5803,7 +5872,7 @@ mod tests {
             .iter()
             .find(|candidate| candidate.workdir_id == "verified-clean")
             .expect("cleanup candidate");
-        assert_eq!(candidate.cleanliness, "clean");
+        assert_eq!(candidate.cleanliness, CleanupWorkdirCleanliness::Clean);
         assert_eq!(candidate.action, CleanupTargetKind::WorkdirCleanCleanup);
     }
 
@@ -5836,6 +5905,10 @@ mod tests {
             .iter()
             .find(|candidate| candidate.workdir_id == "workdir-not-found")
             .unwrap();
+        assert_eq!(
+            running_linked_workdir.file_status,
+            CleanupWorkdirFileStatus::NotFound
+        );
         assert_eq!(
             running_linked_workdir.action,
             CleanupTargetKind::WorkdirRecordDelete
