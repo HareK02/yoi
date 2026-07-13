@@ -1,9 +1,11 @@
 ---
 title: 'Type Workdir cleanup plan status'
-state: 'planning'
+state: 'inprogress'
 created_at: '2026-07-13T12:45:21Z'
-updated_at: '2026-07-13T12:45:40Z'
+updated_at: '2026-07-13T12:46:05Z'
 assignee: null
+queued_by: 'yoi ticket'
+queued_at: '2026-07-13T12:46:05Z'
 ---
 
 ## 背景
