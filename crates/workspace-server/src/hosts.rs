@@ -36,9 +36,7 @@ use worker_runtime::http_server::{
     RuntimeHttpWorkerLifecycleResponse, RuntimeHttpWorkerResponse, RuntimeHttpWorkersResponse,
     RuntimeHttpWorkingDirectoriesResponse, RuntimeHttpWorkingDirectoryResponse,
 };
-use worker_runtime::identity::{
-    RuntimeId as EmbeddedRuntimeId, WorkerId as EmbeddedWorkerId, WorkerRef as EmbeddedWorkerRef,
-};
+use worker_runtime::identity::{WorkerId as EmbeddedWorkerId, WorkerRef as EmbeddedWorkerRef};
 use worker_runtime::interaction::{
     WorkerInput as EmbeddedWorkerInput, WorkerInputKind as EmbeddedWorkerInputKind,
 };
@@ -1128,10 +1126,7 @@ pub struct EmbeddedWorkerRuntime {
 }
 
 fn embedded_runtime_options() -> EmbeddedRuntimeOptions {
-    let runtime_id = EmbeddedRuntimeId::new(EMBEDDED_RUNTIME_ID)
-        .expect("embedded runtime id is a non-empty literal");
     EmbeddedRuntimeOptions {
-        runtime_id: Some(runtime_id),
         display_name: Some("embedded".to_string()),
         ..EmbeddedRuntimeOptions::default()
     }
@@ -1159,12 +1154,9 @@ impl EmbeddedWorkerRuntime {
         store_root: impl Into<PathBuf>,
         backend: std::sync::Arc<dyn worker_runtime::execution::WorkerExecutionBackend>,
     ) -> Result<Self, worker_runtime::error::RuntimeError> {
-        let runtime_id = EmbeddedRuntimeId::new(EMBEDDED_RUNTIME_ID)
-            .expect("embedded runtime id is a non-empty literal");
         let runtime = worker_runtime::Runtime::with_fs_store_and_execution_backend(
             FsRuntimeStoreOptions {
                 root: store_root.into(),
-                runtime_id: Some(runtime_id),
                 display_name: Some("embedded".to_string()),
                 limits: EmbeddedRuntimeOptions::default().limits,
             },
@@ -1181,13 +1173,8 @@ impl EmbeddedWorkerRuntime {
     }
 
     pub fn from_runtime(workspace_id: impl AsRef<str>, runtime: worker_runtime::Runtime) -> Self {
-        let runtime_id = runtime
-            .runtime_id()
-            .ok()
-            .map(|id| id.as_str().to_string())
-            .unwrap_or_else(|| EMBEDDED_RUNTIME_ID.to_string());
         Self {
-            runtime_id,
+            runtime_id: EMBEDDED_RUNTIME_ID.to_string(),
             host_id: host_id_for_embedded_workspace(workspace_id.as_ref()),
             runtime,
             execution_enabled: false,
@@ -1196,10 +1183,7 @@ impl EmbeddedWorkerRuntime {
     }
 
     fn worker_ref(&self, worker_id: &str) -> Option<EmbeddedWorkerRef> {
-        Some(EmbeddedWorkerRef::new(
-            EmbeddedRuntimeId::new(self.runtime_id.clone())?,
-            EmbeddedWorkerId::parse(worker_id)?,
-        ))
+        Some(EmbeddedWorkerRef::new(EmbeddedWorkerId::parse(worker_id)?))
     }
 
     fn can_stop_embedded_worker(
@@ -1704,7 +1688,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         match self.runtime.delete_worker(&worker_ref) {
             Ok(result) => WorkerDeleteResult {
                 state: WorkerOperationState::Accepted,
-                runtime_id: result.runtime_id.to_string(),
+                runtime_id: self.runtime_id.clone(),
                 worker_id: result.worker_id.to_string(),
                 deleted: result.deleted,
                 diagnostics: Vec::new(),
@@ -2256,11 +2240,10 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             .profile
             .clone()
             .unwrap_or_else(|| embedded_profile_selector(&request.intent));
-        let runtime_id = EmbeddedRuntimeId::new(self.runtime_id.clone());
         let profile_source = match default_profile_source_archive_http_source(
             &profile,
             &self.workspace_id,
-            runtime_id.as_ref(),
+            Some(self.runtime_id.as_str()),
             &self.resource_broker,
             &self.backend_base_url,
         ) {
@@ -2380,7 +2363,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         {
             Ok(response) => WorkerDeleteResult {
                 state: WorkerOperationState::Accepted,
-                runtime_id: response.worker.runtime_id.to_string(),
+                runtime_id: self.runtime_id.clone(),
                 worker_id: response.worker.worker_id.to_string(),
                 deleted: response.worker.deleted,
                 diagnostics: Vec::new(),
@@ -2598,7 +2581,7 @@ fn default_profile_source_archive_source(
 fn default_profile_source_archive_http_source(
     profile: &ProfileSelector,
     workspace_id: &str,
-    runtime_id: Option<&EmbeddedRuntimeId>,
+    runtime_id: Option<&str>,
     resource_broker: &BackendResourceBroker,
     backend_base_url: &str,
 ) -> Result<ProfileSourceArchiveSource, String> {
@@ -2636,7 +2619,7 @@ enum ProfileSourceArchiveTransport {
 fn default_embedded_config_bundle(
     profile: &ProfileSelector,
     workspace_id: &str,
-    runtime_id: Option<&EmbeddedRuntimeId>,
+    runtime_id: Option<&str>,
     resource_broker: &BackendResourceBroker,
     archive_transport: ProfileSourceArchiveTransport,
 ) -> Result<ConfigBundle, String> {
@@ -2844,16 +2827,10 @@ fn remote_lifecycle_rejected(
 
 fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnostic {
     match error {
-        EmbeddedRuntimeError::RuntimeStopped { .. } => diagnostic(
+        EmbeddedRuntimeError::RuntimeStopped => diagnostic(
             "embedded_runtime_stopped",
             DiagnosticSeverity::Warning,
             "Embedded Runtime is stopped".to_string(),
-        ),
-        EmbeddedRuntimeError::WrongRuntime { .. }
-        | EmbeddedRuntimeError::WrongRuntimeCursor { .. } => diagnostic(
-            "embedded_runtime_wrong_identity",
-            DiagnosticSeverity::Warning,
-            "Embedded Runtime rejected a worker/runtime identity mismatch".to_string(),
         ),
         EmbeddedRuntimeError::WorkerNotFound { .. } => diagnostic(
             "embedded_worker_not_found",
@@ -3218,7 +3195,7 @@ mod tests {
     fn embedded_builtin_decodal_profiles_resolve_through_archive() {
         let root = tempfile::tempdir().unwrap();
         let broker = BackendResourceBroker::default();
-        let runtime_id = EmbeddedRuntimeId::new("runtime-test".to_string()).unwrap();
+        let runtime_id = "runtime-test";
         for selector in [
             ProfileSelector::RuntimeDefault,
             ProfileSelector::Builtin("builtin:companion".to_string()),
@@ -3230,7 +3207,7 @@ mod tests {
             let bundle = default_embedded_config_bundle(
                 &selector,
                 "workspace-test",
-                Some(&runtime_id),
+                Some(runtime_id),
                 &broker,
                 ProfileSourceArchiveTransport::BackendResourceHandle,
             )
@@ -3241,7 +3218,7 @@ mod tests {
                 .fetch_profile_source_archive(
                     worker_runtime::resource::BackendResourceFetchRequest {
                         handle: handle.clone(),
-                        runtime_id: runtime_id.as_str().to_string(),
+                        runtime_id: runtime_id.to_string(),
                         worker_id: None,
                         audit_correlation_id: handle.audit_correlation_id.clone(),
                     },
@@ -3269,11 +3246,11 @@ mod tests {
     fn remote_default_bundle_inlines_profile_archive_for_standalone_runtime() {
         let root = tempfile::tempdir().unwrap();
         let broker = BackendResourceBroker::default();
-        let runtime_id = EmbeddedRuntimeId::new("remote:test".to_string()).unwrap();
+        let runtime_id = "remote:test";
         let bundle = default_embedded_config_bundle(
             &ProfileSelector::Builtin("builtin:coder".to_string()),
             "workspace-test",
-            Some(&runtime_id),
+            Some(runtime_id),
             &broker,
             ProfileSourceArchiveTransport::Inline,
         )
@@ -3294,11 +3271,11 @@ mod tests {
     #[test]
     fn remote_profile_source_archive_url_uses_workspace_id_not_host_id() {
         let broker = BackendResourceBroker::default();
-        let runtime_id = EmbeddedRuntimeId::new("remote:test".to_string()).unwrap();
+        let runtime_id = "remote:test";
         let source = default_profile_source_archive_http_source(
             &ProfileSelector::Builtin("builtin:coder".to_string()),
             "workspace-actual",
-            Some(&runtime_id),
+            Some(runtime_id),
             &broker,
             "http://127.0.0.1:8787/",
         )
@@ -3319,12 +3296,12 @@ mod tests {
     #[test]
     fn embedded_archive_rejects_unknown_selectors() {
         let broker = BackendResourceBroker::default();
-        let runtime_id = EmbeddedRuntimeId::new("runtime-test".to_string()).unwrap();
+        let runtime_id = "runtime-test";
         assert!(
             default_embedded_config_bundle(
                 &ProfileSelector::Builtin("builtin:missing".to_string()),
                 "workspace-test",
-                Some(&runtime_id),
+                Some(runtime_id),
                 &broker,
                 ProfileSourceArchiveTransport::BackendResourceHandle,
             )
@@ -3334,7 +3311,7 @@ mod tests {
             default_embedded_config_bundle(
                 &ProfileSelector::Named("custom".to_string()),
                 "workspace-test",
-                Some(&runtime_id),
+                Some(runtime_id),
                 &broker,
                 ProfileSourceArchiveTransport::BackendResourceHandle,
             )

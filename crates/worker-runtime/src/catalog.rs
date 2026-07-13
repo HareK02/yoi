@@ -1,5 +1,5 @@
 use crate::execution::WorkerExecutionStatus;
-use crate::identity::{RuntimeId, WorkerId, WorkerRef};
+use crate::identity::{WorkerId, WorkerRef};
 use crate::interaction::WorkerInput;
 use crate::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveRef};
 use serde::{Deserialize, Serialize};
@@ -209,7 +209,6 @@ impl WorkerStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSummary {
     pub worker_ref: WorkerRef,
-    pub runtime_id: RuntimeId,
     pub worker_id: WorkerId,
     pub status: WorkerStatus,
     pub execution: WorkerExecutionStatus,
@@ -224,7 +223,6 @@ pub struct WorkerSummary {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerDetail {
     pub worker_ref: WorkerRef,
-    pub runtime_id: RuntimeId,
     pub worker_id: WorkerId,
     pub status: WorkerStatus,
     pub execution: WorkerExecutionStatus,

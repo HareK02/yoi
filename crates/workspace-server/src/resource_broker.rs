@@ -3,7 +3,7 @@ use chrono::{Duration, Utc};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
-use worker_runtime::identity::{RuntimeId, WorkerId};
+use worker_runtime::identity::WorkerId;
 use worker_runtime::profile_archive::ProfileSourceArchive;
 use worker_runtime::resource::{
     BackendResourceClient, BackendResourceError, BackendResourceFetchRequest,
@@ -29,7 +29,7 @@ impl BackendResourceBroker {
     pub fn issue_profile_source_archive_handle(
         &self,
         workspace_id: impl Into<String>,
-        runtime_id: Option<&RuntimeId>,
+        runtime_id: Option<&str>,
         worker_id: Option<&WorkerId>,
         archive: ProfileSourceArchive,
     ) -> BackendResourceHandle {
@@ -41,7 +41,7 @@ impl BackendResourceBroker {
             kind: BackendResourceKind::ProfileSourceArchive,
             workspace_id: workspace_id.clone(),
             scope_id: Some("workspace-profile-source".to_string()),
-            runtime_id: runtime_id.map(|id| id.as_str().to_string()),
+            runtime_id: runtime_id.map(|id| id.to_string()),
             worker_id: worker_id.map(|id| id.to_string()),
             resource_id: archive.reference.id.clone(),
             digest: archive.reference.digest.clone(),
@@ -57,7 +57,7 @@ impl BackendResourceBroker {
             profile_source_graph: Some(archive.reference.source_graph.clone()),
         };
         let stored = StoredResource {
-            runtime_id: runtime_id.map(|id| id.as_str().to_string()),
+            runtime_id: runtime_id.map(|id| id.to_string()),
             worker_id: worker_id.map(|id| id.to_string()),
             handle: handle.clone(),
             archive,
@@ -167,7 +167,7 @@ fn verify_handle_shape(handle: &BackendResourceHandle) -> Result<(), BackendReso
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use worker_runtime::identity::{RuntimeId, WorkerId};
+    use worker_runtime::identity::WorkerId;
     use worker_runtime::profile_archive::{
         ProfileSourceArchive, ProfileSourceArchiveRef, ProfileSourceGraphSummary, sha256_hex,
     };
@@ -214,13 +214,13 @@ mod tests {
 
     fn request(
         handle: BackendResourceHandle,
-        runtime_id: &RuntimeId,
+        runtime_id: &str,
         worker_id: Option<&WorkerId>,
     ) -> BackendResourceFetchRequest {
         BackendResourceFetchRequest {
             audit_correlation_id: handle.audit_correlation_id.clone(),
             handle,
-            runtime_id: runtime_id.as_str().to_string(),
+            runtime_id: runtime_id.to_string(),
             worker_id: worker_id.map(|id| id.to_string()),
         }
     }
@@ -228,17 +228,17 @@ mod tests {
     #[test]
     fn broker_issues_and_verifies_profile_source_archive_handles() {
         let broker = BackendResourceBroker::default();
-        let runtime_id = RuntimeId::new("runtime-test").unwrap();
+        let runtime_id = "runtime-test";
         let handle = broker.issue_profile_source_archive_handle(
             "workspace-test",
-            Some(&runtime_id),
+            Some(runtime_id),
             None,
             archive(),
         );
         let response = broker
             .fetch_profile_source_archive(BackendResourceFetchRequest {
                 handle: handle.clone(),
-                runtime_id: runtime_id.as_str().to_string(),
+                runtime_id: runtime_id.to_string(),
                 worker_id: None,
                 audit_correlation_id: handle.audit_correlation_id.clone(),
             })
@@ -250,19 +250,15 @@ mod tests {
     #[test]
     fn broker_rejects_runtime_mismatch() {
         let broker = BackendResourceBroker::default();
-        let runtime_a = RuntimeId::new("runtime-a").unwrap();
+        let runtime_a = "runtime-a";
         let handle = broker.issue_profile_source_archive_handle(
             "workspace-test",
-            Some(&runtime_a),
+            Some(runtime_a),
             None,
             archive(),
         );
         let err = broker
-            .fetch_profile_source_archive(request(
-                handle,
-                &RuntimeId::new("runtime-b").unwrap(),
-                None,
-            ))
+            .fetch_profile_source_archive(request(handle, "runtime-b", None))
             .unwrap_err();
         assert!(matches!(err, BackendResourceError::Unauthorized { .. }));
     }
@@ -270,12 +266,12 @@ mod tests {
     #[test]
     fn broker_rejects_worker_mismatch() {
         let broker = BackendResourceBroker::default();
-        let runtime_id = RuntimeId::new("runtime-test").unwrap();
+        let runtime_id = "runtime-test";
         let worker_a = WorkerId::new(1);
         let worker_b = WorkerId::new(2);
         let handle = broker.issue_profile_source_archive_handle(
             "workspace-test",
-            Some(&runtime_id),
+            Some(runtime_id),
             Some(&worker_a),
             archive(),
         );
@@ -288,10 +284,10 @@ mod tests {
     #[test]
     fn broker_rejects_expiry_extension_from_request_handle() {
         let broker = BackendResourceBroker::default();
-        let runtime_id = RuntimeId::new("runtime-test").unwrap();
+        let runtime_id = "runtime-test";
         let handle = broker.issue_profile_source_archive_handle(
             "workspace-test",
-            Some(&runtime_id),
+            Some(runtime_id),
             None,
             archive(),
         );
@@ -314,10 +310,10 @@ mod tests {
     #[test]
     fn broker_rejects_policy_tampered_request_handle() {
         let broker = BackendResourceBroker::default();
-        let runtime_id = RuntimeId::new("runtime-test").unwrap();
+        let runtime_id = "runtime-test";
         let mut handle = broker.issue_profile_source_archive_handle(
             "workspace-test",
-            Some(&runtime_id),
+            Some(runtime_id),
             None,
             archive(),
         );
@@ -331,11 +327,11 @@ mod tests {
     #[test]
     fn broker_uses_stored_max_bytes_when_request_handle_is_tampered() {
         let broker = BackendResourceBroker::default();
-        let runtime_id = RuntimeId::new("runtime-test").unwrap();
+        let runtime_id = "runtime-test";
         let archive = archive_with_len((DEFAULT_PROFILE_SOURCE_ARCHIVE_MAX_BYTES + 1) as usize);
         let mut handle = broker.issue_profile_source_archive_handle(
             "workspace-test",
-            Some(&runtime_id),
+            Some(runtime_id),
             None,
             archive,
         );

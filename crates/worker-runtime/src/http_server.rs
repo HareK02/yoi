@@ -13,7 +13,7 @@ use crate::catalog::{
 };
 use crate::config_bundle::{ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary};
 use crate::error::RuntimeError;
-use crate::identity::{RuntimeId, WorkerId, WorkerRef};
+use crate::identity::{WorkerId, WorkerRef};
 use crate::interaction::{WorkerInput, WorkerInteractionAck};
 use crate::management::{RuntimeLimits, RuntimeSummary, WorkerDeleteResult};
 #[cfg(feature = "ws-server")]
@@ -50,9 +50,6 @@ pub struct RuntimeHttpServerConfig {
     /// Address for the Runtime process to bind. Use a loopback address unless a
     /// trusted backend proxy explicitly owns network exposure.
     pub bind_addr: SocketAddr,
-    /// Optional explicit Runtime authority id. If omitted, the Runtime library
-    /// generates one.
-    pub runtime_id: Option<RuntimeId>,
     /// Optional display label surfaced by `GET /v1/runtime`.
     pub display_name: Option<String>,
     /// Bounded Runtime API limits.
@@ -68,7 +65,6 @@ impl Default for RuntimeHttpServerConfig {
     fn default() -> Self {
         Self {
             bind_addr: default_runtime_http_bind_addr(),
-            runtime_id: None,
             display_name: None,
             limits: RuntimeLimits::default(),
             store: RuntimeHttpStoreSelection::Memory,
@@ -81,7 +77,6 @@ impl fmt::Debug for RuntimeHttpServerConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RuntimeHttpServerConfig")
             .field("bind_addr", &self.bind_addr)
-            .field("runtime_id", &self.runtime_id)
             .field("display_name", &self.display_name)
             .field("limits", &self.limits)
             .field("store", &self.store)
@@ -118,10 +113,9 @@ pub async fn serve_runtime_http(
 
 /// Build the REST router for an existing Runtime.
 ///
-/// Handlers delegate to [`Runtime`] methods and keep Worker authority as
-/// `(runtime_id, worker_id)`. The path contains only a Runtime-local
-/// `worker_id`; the server supplies its own Runtime id instead of accepting a
-/// legacy pod/socket/session path as authority.
+/// Handlers delegate to [`Runtime`] methods and keep Worker authority Runtime-local.
+/// The path contains only a Runtime-local `worker_id`; backend aliases are not
+/// accepted or forwarded as Runtime authority.
 pub fn runtime_http_router(runtime: Runtime, local_token: Option<String>) -> Router {
     let state = RuntimeHttpState {
         runtime,
@@ -712,7 +706,10 @@ async fn cancel_worker(
     Ok(Json(RuntimeHttpWorkerLifecycleResponse { ack }))
 }
 
-fn worker_ref_for(runtime: &Runtime, worker_id: String) -> Result<WorkerRef, RuntimeHttpRestError> {
+fn worker_ref_for(
+    _runtime: &Runtime,
+    worker_id: String,
+) -> Result<WorkerRef, RuntimeHttpRestError> {
     let worker_id = WorkerId::parse(&worker_id).ok_or_else(|| {
         RuntimeHttpRestError::new(
             StatusCode::BAD_REQUEST,
@@ -720,10 +717,7 @@ fn worker_ref_for(runtime: &Runtime, worker_id: String) -> Result<WorkerRef, Run
             "worker_id must be an unsigned integer",
         )
     })?;
-    let runtime_id = runtime
-        .runtime_id()
-        .map_err(RuntimeHttpRestError::runtime)?;
-    Ok(WorkerRef::new(runtime_id, worker_id))
+    Ok(WorkerRef::new(worker_id))
 }
 
 fn parse_optional_lifecycle_request(
@@ -820,7 +814,7 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
         RuntimeError::WorkerNotFound { .. } | RuntimeError::ConfigBundleMissing { .. } => {
             StatusCode::NOT_FOUND
         }
-        RuntimeError::RuntimeStopped { .. }
+        RuntimeError::RuntimeStopped
         | RuntimeError::WorkerExecutionUnavailable { .. }
         | RuntimeError::ExecutionBackendUnavailable { .. }
         | RuntimeError::WorkerExecutionRejected { .. } => StatusCode::CONFLICT,
@@ -829,9 +823,7 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
         | RuntimeError::InvalidInitialInputKind { .. }
         | RuntimeError::ConfigBundleDigestMismatch { .. }
         | RuntimeError::InvalidProfileSelector { .. }
-        | RuntimeError::UnsupportedConfigDeclaration { .. }
-        | RuntimeError::WrongRuntime { .. }
-        | RuntimeError::WrongRuntimeCursor { .. } => StatusCode::BAD_REQUEST,
+        | RuntimeError::UnsupportedConfigDeclaration { .. } => StatusCode::BAD_REQUEST,
         RuntimeError::StoreIo { .. }
         | RuntimeError::StoreMissing { .. }
         | RuntimeError::StoreCorrupt { .. }
@@ -841,9 +833,7 @@ fn status_for_runtime_error(error: &RuntimeError) -> StatusCode {
 
 fn code_for_runtime_error(error: &RuntimeError) -> &'static str {
     match error {
-        RuntimeError::RuntimeStopped { .. } => "runtime_stopped",
-        RuntimeError::WrongRuntime { .. } => "wrong_runtime",
-        RuntimeError::WrongRuntimeCursor { .. } => "wrong_runtime_cursor",
+        RuntimeError::RuntimeStopped => "runtime_stopped",
         RuntimeError::WorkerNotFound { .. } => "worker_not_found",
         RuntimeError::WorkerExecutionUnavailable { .. } => "worker_execution_unavailable",
         RuntimeError::ExecutionBackendUnavailable { .. } => "execution_backend_unavailable",
@@ -1038,8 +1028,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let created: RuntimeHttpWorkerResponse = read_json(response).await;
         assert_eq!(
-            created.worker.worker_ref.runtime_id,
-            runtime.runtime_id().unwrap()
+            created.worker.worker_ref.worker_id,
+            created.worker.worker_id
         );
 
         let input = WorkerInput::user("hello from backend");

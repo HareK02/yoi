@@ -147,11 +147,7 @@ impl ProfileRuntimeWorkerFactory {
     }
 
     fn runtime_worker_name_for_ref(worker_ref: &crate::identity::WorkerRef) -> String {
-        format!(
-            "runtime-{}-{}",
-            sanitize_worker_name_component(worker_ref.runtime_id.as_str()),
-            worker_ref.worker_id
-        )
+        format!("worker-runtime-{}", worker_ref.worker_id)
     }
 
     fn runtime_worker_name(request: &WorkerExecutionSpawnRequest) -> String {
@@ -236,19 +232,6 @@ impl ProfileRuntimeWorkerFactory {
                 .map_err(|err| format!("failed to verify fetched profile source archive: {err}"))
         }
     }
-}
-
-fn sanitize_worker_name_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -1110,7 +1093,6 @@ mod tests {
         RepositorySelector, WorkingDirectoryRepository, WorkingDirectoryRequest,
     };
     use crate::execution::WorkerExecutionContext;
-    use crate::identity::RuntimeId;
     use crate::management::RuntimeOptions;
     use crate::observation::WorkerObservationCursor;
     use crate::working_directory::LocalGitWorktreeMaterializer;
@@ -1372,10 +1354,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_worker_name_is_namespaced_by_runtime_id() {
-        let runtime_id = RuntimeId::new("arc:remote".to_string()).unwrap();
-        let worker_ref =
-            crate::identity::WorkerRef::new(runtime_id, crate::identity::WorkerId::new(1));
+    fn runtime_worker_name_is_runtime_local() {
+        let worker_ref = crate::identity::WorkerRef::new(crate::identity::WorkerId::new(1));
         let request = WorkerExecutionSpawnRequest {
             worker_ref: worker_ref.clone(),
             request: create_request("1"),
@@ -1386,7 +1366,7 @@ mod tests {
 
         assert_eq!(
             ProfileRuntimeWorkerFactory::runtime_worker_name(&request),
-            "runtime-arc-remote-1"
+            "worker-runtime-1"
         );
         assert_ne!(
             ProfileRuntimeWorkerFactory::runtime_worker_name(&request),
@@ -1441,14 +1421,9 @@ mod tests {
             observed_cwds: observed_cwds.clone(),
         };
         let backend = WorkerRuntimeExecutionBackend::new(factory).unwrap();
-        let runtime = EmbeddedRuntime::with_execution_backend(
-            RuntimeOptions {
-                runtime_id: RuntimeId::new("embedded"),
-                ..RuntimeOptions::default()
-            },
-            Arc::new(backend),
-        )
-        .unwrap();
+        let runtime =
+            EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), Arc::new(backend))
+                .unwrap();
         runtime.store_config_bundle(test_bundle()).unwrap();
         let detail = runtime.create_worker(create_request("chat")).unwrap();
 
@@ -1515,14 +1490,9 @@ mod tests {
             .with_working_directory_materializer(LocalGitWorktreeMaterializer::new(
                 runtime_base.path(),
             ));
-        let runtime = EmbeddedRuntime::with_execution_backend(
-            RuntimeOptions {
-                runtime_id: RuntimeId::new("embedded-materialized"),
-                ..RuntimeOptions::default()
-            },
-            Arc::new(backend),
-        )
-        .unwrap();
+        let runtime =
+            EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), Arc::new(backend))
+                .unwrap();
         runtime.store_config_bundle(test_bundle()).unwrap();
         let mut request = create_request("chat");
         request.working_directory_request = Some(working_directory_request(repo.path()));

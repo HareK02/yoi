@@ -745,7 +745,7 @@ fn validate_relative_cwd(
 mod tests {
     use super::*;
     use crate::catalog::{RepositorySelector, WorkingDirectoryRepository};
-    use crate::identity::{RuntimeId, WorkerId};
+    use crate::identity::{WorkerId, WorkerRef};
 
     fn git(path: &Path, args: &[&str]) {
         let status = Command::new("git")
@@ -786,10 +786,7 @@ mod tests {
     }
 
     fn worker_ref(sequence: u64) -> WorkerRef {
-        WorkerRef::new(
-            RuntimeId::new("runtime-test").unwrap(),
-            WorkerId::generated(sequence),
-        )
+        WorkerRef::new(WorkerId::generated(sequence))
     }
 
     #[test]

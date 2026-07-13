@@ -23,7 +23,7 @@ use crate::execution::{
 use crate::fs_store::{
     FsRuntimeStore, FsRuntimeStoreOptions, PersistedRuntimeState, PersistedWorkerRecord,
 };
-use crate::identity::{RuntimeId, WorkerId, WorkerRef};
+use crate::identity::{WorkerId, WorkerRef};
 use crate::interaction::{WorkerInput, WorkerInputKind, WorkerInteractionAck};
 use crate::management::{
     RuntimeBackendKind, RuntimeLimits, RuntimeOptions, RuntimeStatus, RuntimeSummary,
@@ -38,12 +38,9 @@ use crate::observation::{WorkerObservationCursor, WorkerObservationEvent};
 use std::collections::BTreeMap;
 #[cfg(feature = "ws-server")]
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 #[cfg(feature = "ws-server")]
 use tokio::sync::broadcast;
-
-static NEXT_RUNTIME_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Concrete embedded Runtime domain entity.
 ///
@@ -65,10 +62,7 @@ impl Runtime {
 
     /// Create a memory-backed Runtime with explicit options.
     pub fn with_options(options: RuntimeOptions) -> Self {
-        let runtime_id = options.runtime_id.unwrap_or_else(|| {
-            RuntimeId::generated(NEXT_RUNTIME_SEQUENCE.fetch_add(1, Ordering::Relaxed))
-        });
-        let mut state = RuntimeState::new(runtime_id, options.display_name, options.limits);
+        let mut state = RuntimeState::new(options.display_name, options.limits);
         state.push_event(None, RuntimeEventKind::RuntimeStarted, "runtime started");
         Self {
             inner: Arc::new(Mutex::new(state)),
@@ -87,10 +81,9 @@ impl Runtime {
 
     /// Create or restore a filesystem-backed Runtime.
     ///
-    /// The store is scoped by typed Runtime identity under `options.root`; if the
-    /// Runtime directory already exists, persisted state is loaded and validated.
-    /// If it does not exist, a fresh Runtime is initialized and durable files are
-    /// created before the Runtime is returned.
+    /// The store is scoped by `options.root`; if the directory already exists,
+    /// persisted state is loaded and validated. If it does not exist, a fresh
+    /// Runtime is initialized and durable files are created before return.
     #[cfg(feature = "fs-store")]
     pub fn with_fs_store(options: FsRuntimeStoreOptions) -> Result<Self, RuntimeError> {
         Self::with_fs_store_inner(options, None)
@@ -110,19 +103,12 @@ impl Runtime {
         options: FsRuntimeStoreOptions,
         execution_backend: Option<WorkerExecutionBackendRef>,
     ) -> Result<Self, RuntimeError> {
-        let runtime_id = options.runtime_id.unwrap_or_else(|| {
-            RuntimeId::generated(NEXT_RUNTIME_SEQUENCE.fetch_add(1, Ordering::Relaxed))
-        });
-        let opened = FsRuntimeStore::open_or_create(options.root, runtime_id.clone())?;
+        let opened = FsRuntimeStore::open_or_create(options.root)?;
         let mut state = if let Some(persisted) = opened.state {
             RuntimeState::from_persisted(persisted, opened.store)?
         } else {
-            let mut state = RuntimeState::new_fs_backed(
-                runtime_id,
-                options.display_name,
-                options.limits,
-                opened.store,
-            );
+            let mut state =
+                RuntimeState::new_fs_backed(options.display_name, options.limits, opened.store);
             let event_id =
                 state.push_event(None, RuntimeEventKind::RuntimeStarted, "runtime started");
             state.persist_runtime_snapshot()?;
@@ -135,11 +121,6 @@ impl Runtime {
         };
         runtime.restore_persisted_worker_executions()?;
         Ok(runtime)
-    }
-
-    /// Runtime id half of public Worker authority.
-    pub fn runtime_id(&self) -> Result<RuntimeId, RuntimeError> {
-        Ok(self.lock()?.runtime_id.clone())
     }
 
     /// Management-plane summary.
@@ -157,7 +138,6 @@ impl Runtime {
         }
 
         Ok(RuntimeSummary {
-            runtime_id: state.runtime_id.clone(),
             display_name: state.display_name.clone(),
             backend: state.backend,
             status: state.status,
@@ -225,17 +205,12 @@ impl Runtime {
             return Ok(state.last_event_id());
         }
         state.status = RuntimeStatus::Stopped;
-        let runtime_id = state.runtime_id.clone();
         for worker in state.workers.values_mut() {
             if worker.status.is_active() {
                 worker.status = WorkerStatus::Stopped;
             }
         }
-        let event_id = state.push_event(
-            None,
-            RuntimeEventKind::RuntimeStopped,
-            format!("runtime {runtime_id} stopped"),
-        );
+        let event_id = state.push_event(None, RuntimeEventKind::RuntimeStopped, "runtime stopped");
         state.persist_runtime_snapshot()?;
         state.persist_workers()?;
         state.persist_event_by_id(event_id)?;
@@ -369,7 +344,7 @@ impl Runtime {
 
             let worker_id = WorkerId::generated(state.next_worker_sequence);
             state.next_worker_sequence += 1;
-            let worker_ref = WorkerRef::new(state.runtime_id.clone(), worker_id.clone());
+            let worker_ref = WorkerRef::new(worker_id.clone());
             let event_id = state.push_event(
                 Some(worker_ref.clone()),
                 RuntimeEventKind::WorkerCreated,
@@ -461,7 +436,7 @@ impl Runtime {
         Ok(state
             .workers
             .values()
-            .map(|worker| worker.summary(&state.runtime_id))
+            .map(|worker| worker.summary())
             .collect())
     }
 
@@ -469,7 +444,7 @@ impl Runtime {
     pub fn worker_detail(&self, worker_ref: &WorkerRef) -> Result<WorkerDetail, RuntimeError> {
         let state = self.lock()?;
         let worker = state.worker(worker_ref)?;
-        Ok(worker.detail(&state.runtime_id))
+        Ok(worker.detail())
     }
 
     /// Accept input into a Worker.
@@ -571,7 +546,6 @@ impl Runtime {
         result: WorkerExecutionResult,
     ) -> Result<WorkerDetail, RuntimeError> {
         let mut state = self.lock()?;
-        let runtime_id = state.runtime_id.clone();
         let detail = {
             let binding = WorkerExecutionBindingIdentity::from_handle(&handle);
             let worker = state.worker_mut(worker_ref)?;
@@ -581,7 +555,7 @@ impl Runtime {
                 execution = execution.with_working_directory(status);
             }
             worker.execution = execution.with_result(result);
-            worker.detail(&runtime_id)
+            worker.detail()
         };
         state.persist_runtime_snapshot()?;
         state.persist_worker(&worker_ref.worker_id)?;
@@ -708,7 +682,6 @@ impl Runtime {
         }
         let removed = state.workers.remove(&worker_ref.worker_id).ok_or_else(|| {
             RuntimeError::WorkerNotFound {
-                runtime_id: state.runtime_id.clone(),
                 worker_id: worker_ref.worker_id,
             }
         })?;
@@ -725,7 +698,6 @@ impl Runtime {
         state.delete_worker_snapshot(&worker_ref.worker_id)?;
         state.persist_event_by_id(event_id)?;
         Ok(WorkerDeleteResult {
-            runtime_id: removed.worker_ref.runtime_id,
             worker_id: removed.worker_id,
             deleted: true,
         })
@@ -733,18 +705,13 @@ impl Runtime {
 
     /// Cursor pointing to the beginning of Runtime events.
     pub fn event_cursor_from_start(&self) -> Result<EventCursor, RuntimeError> {
-        let state = self.lock()?;
-        Ok(EventCursor {
-            runtime_id: state.runtime_id.clone(),
-            next_event_id: 1,
-        })
+        Ok(EventCursor { next_event_id: 1 })
     }
 
     /// Cursor pointing after the current last event.
     pub fn event_cursor_now(&self) -> Result<EventCursor, RuntimeError> {
         let state = self.lock()?;
         Ok(EventCursor {
-            runtime_id: state.runtime_id.clone(),
             next_event_id: state.last_event_id() + 1,
         })
     }
@@ -756,12 +723,6 @@ impl Runtime {
         limit: usize,
     ) -> Result<RuntimeEventBatch, RuntimeError> {
         let state = self.lock()?;
-        if cursor.runtime_id != state.runtime_id {
-            return Err(RuntimeError::WrongRuntimeCursor {
-                expected_runtime_id: state.runtime_id.clone(),
-                actual_runtime_id: cursor.runtime_id.clone(),
-            });
-        }
         if limit > state.limits.max_event_batch_items {
             return Err(RuntimeError::LimitTooLarge {
                 requested: limit,
@@ -784,11 +745,7 @@ impl Runtime {
             .unwrap_or(cursor.next_event_id);
         let has_more = state.events.iter().any(|event| event.id >= next_event_id);
         Ok(RuntimeEventBatch {
-            runtime_id: state.runtime_id.clone(),
-            cursor: EventCursor {
-                runtime_id: state.runtime_id.clone(),
-                next_event_id,
-            },
+            cursor: EventCursor { next_event_id },
             events,
             has_more,
         })
@@ -796,15 +753,7 @@ impl Runtime {
 
     /// Create a poll-only placeholder subscription boundary for future streaming.
     pub fn subscribe_events(&self, cursor: EventCursor) -> Result<EventSubscription, RuntimeError> {
-        let state = self.lock()?;
-        if cursor.runtime_id != state.runtime_id {
-            return Err(RuntimeError::WrongRuntimeCursor {
-                expected_runtime_id: state.runtime_id.clone(),
-                actual_runtime_id: cursor.runtime_id,
-            });
-        }
         Ok(EventSubscription {
-            runtime_id: state.runtime_id.clone(),
             cursor,
             mode: EventSubscriptionMode::PollOnly,
         })
@@ -1132,7 +1081,6 @@ enum RuntimePersistence {
 
 #[derive(Debug)]
 struct RuntimeState {
-    runtime_id: RuntimeId,
     display_name: Option<String>,
     backend: RuntimeBackendKind,
     #[cfg_attr(not(feature = "fs-store"), allow(dead_code))]
@@ -1157,9 +1105,8 @@ struct RuntimeState {
 }
 
 impl RuntimeState {
-    fn new(runtime_id: RuntimeId, display_name: Option<String>, limits: RuntimeLimits) -> Self {
+    fn new(display_name: Option<String>, limits: RuntimeLimits) -> Self {
         Self {
-            runtime_id,
             display_name,
             backend: RuntimeBackendKind::Memory,
             persistence: RuntimePersistence::Memory,
@@ -1185,13 +1132,11 @@ impl RuntimeState {
 
     #[cfg(feature = "fs-store")]
     fn new_fs_backed(
-        runtime_id: RuntimeId,
         display_name: Option<String>,
         limits: RuntimeLimits,
         store: FsRuntimeStore,
     ) -> Self {
         Self {
-            runtime_id,
             display_name,
             backend: RuntimeBackendKind::FsStore,
             persistence: RuntimePersistence::Fs(store),
@@ -1220,18 +1165,6 @@ impl RuntimeState {
         persisted: PersistedRuntimeState,
         store: FsRuntimeStore,
     ) -> Result<Self, RuntimeError> {
-        if persisted.runtime_id != *store.runtime_id() {
-            return Err(RuntimeError::StoreCorrupt {
-                operation: "restore runtime state",
-                path: store.runtime_dir().to_path_buf(),
-                message: format!(
-                    "persisted runtime id {} does not match store runtime {}",
-                    persisted.runtime_id,
-                    store.runtime_id()
-                ),
-            });
-        }
-
         let mut workers = BTreeMap::new();
         let mut diagnostics = persisted.diagnostics;
         let mut next_diagnostic_id = persisted.next_diagnostic_id;
@@ -1281,7 +1214,6 @@ impl RuntimeState {
         let observation_events = persisted.observation_events.into_iter().collect();
 
         Ok(Self {
-            runtime_id: persisted.runtime_id,
             display_name: persisted.display_name,
             backend: RuntimeBackendKind::FsStore,
             persistence: RuntimePersistence::Fs(store),
@@ -1307,7 +1239,6 @@ impl RuntimeState {
     #[cfg(feature = "fs-store")]
     fn persisted_state(&self) -> PersistedRuntimeState {
         PersistedRuntimeState {
-            runtime_id: self.runtime_id.clone(),
             display_name: self.display_name.clone(),
             status: self.status,
             limits: self.limits.clone(),
@@ -1350,8 +1281,7 @@ impl RuntimeState {
                 self.workers
                     .get(worker_id)
                     .ok_or_else(|| RuntimeError::WorkerNotFound {
-                        runtime_id: self.runtime_id.clone(),
-                        worker_id: worker_id.clone(),
+                        worker_id: *worker_id,
                     })?;
             store.write_worker_snapshot(&worker.persisted_record())?;
         }
@@ -1439,9 +1369,7 @@ impl RuntimeState {
 
     fn ensure_running(&self) -> Result<(), RuntimeError> {
         if self.status == RuntimeStatus::Stopped {
-            Err(RuntimeError::RuntimeStopped {
-                runtime_id: self.runtime_id.clone(),
-            })
+            Err(RuntimeError::RuntimeStopped)
         } else {
             Ok(())
         }
@@ -1478,17 +1406,9 @@ impl RuntimeState {
     }
 
     fn ensure_worker_ref(&self, worker_ref: &WorkerRef) -> Result<(), RuntimeError> {
-        if worker_ref.runtime_id != self.runtime_id {
-            return Err(RuntimeError::WrongRuntime {
-                expected_runtime_id: self.runtime_id.clone(),
-                actual_runtime_id: worker_ref.runtime_id.clone(),
-                worker_id: worker_ref.worker_id.clone(),
-            });
-        }
         if !self.workers.contains_key(&worker_ref.worker_id) {
             return Err(RuntimeError::WorkerNotFound {
-                runtime_id: self.runtime_id.clone(),
-                worker_id: worker_ref.worker_id.clone(),
+                worker_id: worker_ref.worker_id,
             });
         }
         Ok(())
@@ -1499,8 +1419,7 @@ impl RuntimeState {
         self.workers
             .get(&worker_ref.worker_id)
             .ok_or_else(|| RuntimeError::WorkerNotFound {
-                runtime_id: self.runtime_id.clone(),
-                worker_id: worker_ref.worker_id.clone(),
+                worker_id: worker_ref.worker_id,
             })
     }
 
@@ -1509,8 +1428,7 @@ impl RuntimeState {
         self.workers
             .get_mut(&worker_ref.worker_id)
             .ok_or_else(|| RuntimeError::WorkerNotFound {
-                runtime_id: self.runtime_id.clone(),
-                worker_id: worker_ref.worker_id.clone(),
+                worker_id: worker_ref.worker_id,
             })
     }
 
@@ -1713,11 +1631,10 @@ struct WorkerRecord {
 }
 
 impl WorkerRecord {
-    fn summary(&self, runtime_id: &RuntimeId) -> WorkerSummary {
+    fn summary(&self) -> WorkerSummary {
         WorkerSummary {
             worker_ref: self.worker_ref.clone(),
-            runtime_id: runtime_id.clone(),
-            worker_id: self.worker_id.clone(),
+            worker_id: self.worker_id,
             status: self.status,
             execution: self.execution.clone(),
             profile: self.request.profile.clone(),
@@ -1727,11 +1644,10 @@ impl WorkerRecord {
         }
     }
 
-    fn detail(&self, runtime_id: &RuntimeId) -> WorkerDetail {
+    fn detail(&self) -> WorkerDetail {
         WorkerDetail {
             worker_ref: self.worker_ref.clone(),
-            runtime_id: runtime_id.clone(),
-            worker_id: self.worker_id.clone(),
+            worker_id: self.worker_id,
             status: self.status,
             execution: self.execution.clone(),
             profile: self.request.profile.clone(),
@@ -1841,6 +1757,7 @@ mod tests {
         WorkerExecutionRestoreRequest, WorkerExecutionRunState,
     };
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     fn task_request(_objective: &str) -> CreateWorkerRequest {
@@ -2034,11 +1951,10 @@ mod tests {
     }
 
     #[test]
-    fn create_list_and_detail_preserve_runtime_worker_authority() {
+    fn create_list_and_detail_preserve_runtime_local_worker_authority() {
         let runtime = runtime_with_backend();
         let detail = runtime.create_worker(task_request("implement v0")).unwrap();
 
-        assert_eq!(detail.worker_ref.runtime_id, runtime.runtime_id().unwrap());
         assert_eq!(detail.status, WorkerStatus::Running);
         assert_eq!(detail.config_bundle.as_ref().unwrap().id, "bundle-1");
 
@@ -2104,16 +2020,6 @@ mod tests {
             unsupported_err,
             RuntimeError::UnsupportedConfigDeclaration { .. }
         ));
-    }
-
-    #[test]
-    fn rejects_worker_refs_from_another_runtime() {
-        let runtime_a = runtime_with_backend();
-        let runtime_b = runtime_with_backend();
-        let detail = runtime_a.create_worker(task_request("runtime a")).unwrap();
-
-        let err = runtime_b.worker_detail(&detail.worker_ref).unwrap_err();
-        assert!(matches!(err, RuntimeError::WrongRuntime { .. }));
     }
 
     #[test]
@@ -2493,11 +2399,9 @@ mod tests {
     #[test]
     fn fs_store_restores_workers_events_and_protocol_observations() {
         let root = fs_store_root("restore");
-        let runtime_id = RuntimeId::new("runtime-fs-authority").unwrap();
         let runtime = Runtime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
                 root: root.clone(),
-                runtime_id: Some(runtime_id.clone()),
                 display_name: Some("filesystem runtime".to_string()),
                 limits: RuntimeLimits {
                     max_event_batch_items: 2,
@@ -2527,7 +2431,6 @@ mod tests {
 
         let restored = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
             root: root.clone(),
-            runtime_id: Some(runtime_id.clone()),
             display_name: None,
             limits: RuntimeLimits::default(),
         })
@@ -2606,11 +2509,9 @@ mod tests {
     #[test]
     fn fs_store_restores_active_worker_execution_handles() {
         let root = fs_store_root("execution-restore");
-        let runtime_id = RuntimeId::new("runtime-execution-restore").unwrap();
         let runtime = Runtime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
                 root: root.clone(),
-                runtime_id: Some(runtime_id.clone()),
                 display_name: None,
                 limits: RuntimeLimits::default(),
             },
@@ -2627,7 +2528,6 @@ mod tests {
         let restored = Runtime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
                 root: root.clone(),
-                runtime_id: Some(runtime_id),
                 display_name: None,
                 limits: RuntimeLimits::default(),
             },
@@ -2666,11 +2566,9 @@ mod tests {
     #[test]
     fn fs_store_keeps_worker_stale_when_execution_restore_fails() {
         let root = fs_store_root("execution-restore-failed");
-        let runtime_id = RuntimeId::new("runtime-execution-restore-failed").unwrap();
         let runtime = Runtime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
                 root: root.clone(),
-                runtime_id: Some(runtime_id.clone()),
                 display_name: None,
                 limits: RuntimeLimits::default(),
             },
@@ -2691,7 +2589,6 @@ mod tests {
         let restored = Runtime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
                 root: root.clone(),
-                runtime_id: Some(runtime_id),
                 display_name: None,
                 limits: RuntimeLimits::default(),
             },
@@ -2734,10 +2631,8 @@ mod tests {
     #[test]
     fn fs_store_reports_corrupt_and_missing_data() {
         let corrupt_root = fs_store_root("corrupt");
-        let corrupt_runtime_id = RuntimeId::new("runtime-corrupt").unwrap();
         let corrupt_runtime = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
             root: corrupt_root.clone(),
-            runtime_id: Some(corrupt_runtime_id.clone()),
             display_name: None,
             limits: RuntimeLimits::default(),
         })
@@ -2751,7 +2646,6 @@ mod tests {
         drop(corrupt_runtime);
         let err = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
             root: corrupt_root.clone(),
-            runtime_id: Some(corrupt_runtime_id),
             display_name: None,
             limits: RuntimeLimits::default(),
         })
@@ -2760,11 +2654,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(corrupt_root);
 
         let missing_root = fs_store_root("missing");
-        let missing_runtime_id = RuntimeId::new("runtime-missing").unwrap();
         let missing_runtime = Runtime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
                 root: missing_root.clone(),
-                runtime_id: Some(missing_runtime_id.clone()),
                 display_name: None,
                 limits: RuntimeLimits::default(),
             },
@@ -2785,7 +2677,6 @@ mod tests {
         drop(missing_runtime);
         let loaded = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
             root: missing_root.clone(),
-            runtime_id: Some(missing_runtime_id),
             display_name: None,
             limits: RuntimeLimits::default(),
         })

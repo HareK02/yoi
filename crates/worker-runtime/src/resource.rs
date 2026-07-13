@@ -1,4 +1,4 @@
-use crate::identity::{RuntimeId, WorkerId};
+use crate::identity::WorkerId;
 use crate::profile_archive::{ProfileSourceArchive, ProfileSourceArchiveRef, sha256_hex};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -179,13 +179,13 @@ impl ProfileSourceArchiveCache {
 
 pub fn build_profile_source_archive_fetch_request(
     handle: BackendResourceHandle,
-    runtime_id: &RuntimeId,
+    runtime_id: &str,
     worker_id: Option<&WorkerId>,
 ) -> BackendResourceFetchRequest {
     let audit_correlation_id = handle.audit_correlation_id.clone();
     BackendResourceFetchRequest {
         handle,
-        runtime_id: runtime_id.as_str().to_string(),
+        runtime_id: runtime_id.to_string(),
         worker_id: worker_id.map(|id| id.to_string()),
         audit_correlation_id,
     }

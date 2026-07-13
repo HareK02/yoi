@@ -18,7 +18,6 @@ use worker_runtime::fs_store::FsRuntimeStoreOptions;
 use worker_runtime::http_server::{
     RuntimeHttpServerConfig, RuntimeHttpServerError, RuntimeHttpStoreSelection,
 };
-use worker_runtime::identity::RuntimeId;
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
 use worker_runtime::working_directory::LocalGitWorktreeMaterializer;
 use worker_runtime::{Runtime, RuntimeOptions};
@@ -105,7 +104,6 @@ fn build_runtime(config: &ProcessConfig) -> Result<Runtime, ProcessError> {
         }
         RuntimeHttpStoreSelection::Fs { root } => {
             let mut options = FsRuntimeStoreOptions::new(root.clone());
-            options.runtime_id = config.http.runtime_id.clone();
             options.display_name = config.http.display_name.clone();
             options.limits = config.http.limits.clone();
             Runtime::with_fs_store_and_execution_backend(options, backend)
@@ -135,10 +133,15 @@ fn default_working_directory_runtime_root() -> PathBuf {
 
 fn runtime_options_from_http(config: &RuntimeHttpServerConfig) -> RuntimeOptions {
     RuntimeOptions {
-        runtime_id: config.runtime_id.clone(),
         display_name: config.display_name.clone(),
         limits: config.limits.clone(),
     }
+}
+
+fn default_fs_root() -> Option<PathBuf> {
+    manifest::paths::data_dir()
+        .map(|data_dir| data_dir.join("worker-runtime-rest"))
+        .or_else(|| Some(env::temp_dir().join("yoi-worker-runtime-rest")))
 }
 
 fn parse_args<I, S>(args: I) -> Result<Option<ProcessConfig>, ProcessError>
@@ -147,7 +150,9 @@ where
     S: Into<String>,
 {
     let mut config = ProcessConfig::default()?;
-    let mut store = StoreArg::Memory;
+    let mut store = StoreArg::Fs {
+        root: default_fs_root(),
+    };
     let mut args = args.into_iter().map(Into::into).collect::<VecDeque<_>>();
 
     while let Some(arg) = args.pop_front() {
@@ -159,12 +164,6 @@ where
                 config.http.bind_addr = value.parse::<SocketAddr>().map_err(|error| {
                     ProcessError::usage(format!("invalid --bind socket address `{value}`: {error}"))
                 })?;
-            }
-            "--runtime-id" => {
-                let value = take_value(&flag, inline_value, &mut args)?;
-                config.http.runtime_id = Some(RuntimeId::new(value).ok_or_else(|| {
-                    ProcessError::usage("--runtime-id must not be empty".to_string())
-                })?);
             }
             "--display-name" => {
                 config.http.display_name = Some(take_value(&flag, inline_value, &mut args)?);
@@ -201,7 +200,9 @@ where
                 let value = take_value(&flag, inline_value, &mut args)?;
                 store = match value.as_str() {
                     "memory" => StoreArg::Memory,
-                    "fs" | "fs-store" => StoreArg::Fs { root: None },
+                    "fs" | "fs-store" => StoreArg::Fs {
+                        root: default_fs_root(),
+                    },
                     _ => {
                         return Err(ProcessError::usage(format!(
                             "unsupported --store `{value}`; expected `memory` or `fs`"
@@ -317,9 +318,7 @@ fn apply_store_selection(
             Ok(())
         }
         StoreArg::Fs { root } => {
-            let root = root.ok_or_else(|| {
-                ProcessError::usage("--store fs requires --fs-root <PATH>".to_string())
-            })?;
+            let root = root.unwrap_or_else(|| env::temp_dir().join("yoi-worker-runtime-rest"));
             config.store = RuntimeHttpStoreSelection::Fs { root };
             Ok(())
         }
@@ -418,7 +417,6 @@ Starts a worker-backed Runtime REST command API for a trusted backend/proxy.\n\
 Browsers must not connect to this Runtime process directly.\n\n\
 Options:\n\
   --bind <ADDR>                         Bind socket address (default: 127.0.0.1:38800)\n\
-  --runtime-id <ID>                     Runtime authority id (default: generated)\n\
   --display-name <NAME>                 Runtime display name\n\
   --workspace <PATH>                    Workspace root used for spawned Workers (default: cwd)\n\
   --cwd <PATH>                          Process cwd used for spawned Workers (default: workspace)\n\
@@ -428,8 +426,8 @@ Options:\n\
   --worker-runtime-base-dir <PATH>      Worker controller runtime directory\n\
   --backend-resource-endpoint <URL>     Internal Backend resource fetch endpoint for resource handles\n\
   --backend-resource-token <TOKEN>      Optional bearer token for the Backend resource fetch endpoint\n\
-  --store <memory|fs>                   Runtime catalog store selection (default: memory)\n\
-  --fs-root <PATH>                      Runtime catalog filesystem store root\n\
+  --store <memory|fs>                   Runtime catalog store selection (default: fs)\n\
+  --fs-root <PATH>                      Runtime catalog filesystem store root (default: user data dir)\n\
   --local-token <TOKEN>                 Minimal local bearer token placeholder\n\
   --local-token-env <ENV>               Read local bearer token placeholder from env\n\
   --max-event-batch-items <N>           Override event batch limit\n\
@@ -471,7 +469,6 @@ mod tests {
         let config = parse_args([
             "--bind",
             "127.0.0.1:0",
-            "--runtime-id=runtime-alpha",
             "--display-name",
             "Runtime Alpha",
             "--workspace",
@@ -491,7 +488,6 @@ mod tests {
         let config = parse_args([
             "--bind",
             "127.0.0.1:0",
-            "--runtime-id=runtime-alpha",
             "--display-name",
             "Runtime Alpha",
             "--workspace",
@@ -510,10 +506,6 @@ mod tests {
         }
 
         assert_eq!(config.http.bind_addr, "127.0.0.1:0".parse().unwrap());
-        assert_eq!(
-            config.http.runtime_id.as_ref().map(ToString::to_string),
-            Some("runtime-alpha".to_string())
-        );
         assert_eq!(config.http.display_name.as_deref(), Some("Runtime Alpha"));
         assert_eq!(config.workspace_root, PathBuf::from("/tmp/workspace"));
         assert_eq!(config.cwd, PathBuf::from("/tmp/workspace/subdir"));

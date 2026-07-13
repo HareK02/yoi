@@ -3,7 +3,7 @@ use crate::config_bundle::ConfigBundle;
 use crate::diagnostics::{DiagnosticSeverity, RuntimeDiagnostic};
 use crate::error::RuntimeError;
 use crate::execution::WorkerExecutionStatus;
-use crate::identity::{RuntimeId, WorkerId, WorkerRef};
+use crate::identity::{WorkerId, WorkerRef};
 use crate::management::{RuntimeBackendKind, RuntimeLimits, RuntimeStatus};
 #[cfg(feature = "ws-server")]
 use crate::observation::WorkerObservationEvent;
@@ -16,10 +16,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const SCHEMA_VERSION: u32 = 1;
-const RUNTIMES_DIR: &str = "runtimes";
 const RUNTIME_FILE: &str = "runtime.json";
 const EVENTS_FILE: &str = "events.jsonl";
 const WORKERS_DIR: &str = "workers";
+const LEGACY_RUNTIMES_DIR: &str = "runtimes";
 const WORKER_FILE: &str = "worker.json";
 #[cfg(feature = "ws-server")]
 const OBSERVATIONS_FILE: &str = "observations.jsonl";
@@ -29,9 +29,8 @@ static NEXT_TMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 /// Options for constructing a filesystem-backed Runtime store.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FsRuntimeStoreOptions {
-    /// Root directory containing all Runtime-scoped store data.
+    /// Root directory containing this Runtime's store data.
     pub root: PathBuf,
-    pub runtime_id: Option<RuntimeId>,
     pub display_name: Option<String>,
     pub limits: RuntimeLimits,
 }
@@ -40,23 +39,19 @@ impl FsRuntimeStoreOptions {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            runtime_id: None,
             display_name: None,
             limits: RuntimeLimits::default(),
         }
     }
 }
 
-/// Filesystem persistence boundary for Worker Runtime state.
+/// Filesystem persistence boundary for one Worker Runtime state.
 ///
-/// Authority is the typed `runtime_id + worker_id` pair.  Those ids are encoded
-/// into path components only after validation; legacy pod paths, socket paths,
-/// and session paths are deliberately not part of the layout or lookup API.
+/// Authority is Runtime-local typed Worker identity. Legacy pod paths, socket
+/// paths, and session paths are deliberately not part of the layout or lookup API.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FsRuntimeStore {
     root: PathBuf,
-    runtime_id: RuntimeId,
-    runtime_dir: PathBuf,
 }
 
 impl FsRuntimeStore {
@@ -64,12 +59,8 @@ impl FsRuntimeStore {
         &self.root
     }
 
-    pub fn runtime_id(&self) -> &RuntimeId {
-        &self.runtime_id
-    }
-
     pub fn runtime_dir(&self) -> &Path {
-        &self.runtime_dir
+        &self.root
     }
 
     /// Read persisted Runtime events directly from the event log with the same
@@ -80,12 +71,6 @@ impl FsRuntimeStore {
         limit: usize,
         max_limit: usize,
     ) -> Result<RuntimeEventBatch, RuntimeError> {
-        if cursor.runtime_id != self.runtime_id {
-            return Err(RuntimeError::WrongRuntimeCursor {
-                expected_runtime_id: self.runtime_id.clone(),
-                actual_runtime_id: cursor.runtime_id.clone(),
-            });
-        }
         if limit > max_limit {
             return Err(RuntimeError::LimitTooLarge {
                 requested: limit,
@@ -109,49 +94,33 @@ impl FsRuntimeStore {
         let has_more = events.iter().any(|event| event.id >= next_event_id);
 
         Ok(RuntimeEventBatch {
-            runtime_id: self.runtime_id.clone(),
-            cursor: EventCursor {
-                runtime_id: self.runtime_id.clone(),
-                next_event_id,
-            },
+            cursor: EventCursor { next_event_id },
             events: selected,
             has_more,
         })
     }
 
-    pub(crate) fn open_or_create(
-        root: PathBuf,
-        runtime_id: RuntimeId,
-    ) -> Result<OpenedFsRuntimeStore, RuntimeError> {
-        fs::create_dir_all(root.join(RUNTIMES_DIR)).map_err(|source| RuntimeError::StoreIo {
-            operation: "create store root",
-            path: root.join(RUNTIMES_DIR),
-            source,
-        })?;
-
-        let runtime_dir = runtime_dir(&root, &runtime_id);
-        let existed = runtime_dir.exists();
-        if existed && !runtime_dir.is_dir() {
+    pub(crate) fn open_or_create(root: PathBuf) -> Result<OpenedFsRuntimeStore, RuntimeError> {
+        let existed = root.exists();
+        if existed && !root.is_dir() {
             return Err(RuntimeError::StoreCorrupt {
                 operation: "open runtime store",
-                path: runtime_dir,
+                path: root,
                 message: "runtime path exists but is not a directory".to_string(),
             });
         }
 
-        fs::create_dir_all(runtime_dir.join(WORKERS_DIR)).map_err(|source| {
-            RuntimeError::StoreIo {
-                operation: "create runtime store",
-                path: runtime_dir.join(WORKERS_DIR),
-                source,
-            }
+        if existed {
+            migrate_legacy_single_runtime_layout(&root)?;
+        }
+
+        fs::create_dir_all(root.join(WORKERS_DIR)).map_err(|source| RuntimeError::StoreIo {
+            operation: "create runtime store",
+            path: root.join(WORKERS_DIR),
+            source,
         })?;
 
-        let store = Self {
-            root,
-            runtime_id,
-            runtime_dir,
-        };
+        let store = Self { root };
         let state = if existed {
             Some(store.load_runtime_state()?)
         } else {
@@ -227,10 +196,10 @@ impl FsRuntimeStore {
     pub(crate) fn load_runtime_state(&self) -> Result<PersistedRuntimeState, RuntimeError> {
         let runtime_path = self.runtime_path();
         let mut snapshot: RuntimeSnapshot = read_json(&runtime_path, "read runtime snapshot")?;
-        snapshot.validate(&self.runtime_id, &runtime_path)?;
+        snapshot.validate(&runtime_path)?;
 
         let events = read_json_lines::<RuntimeEvent>(&self.events_path(), "read events")?;
-        let workers_dir = self.runtime_dir.join(WORKERS_DIR);
+        let workers_dir = self.root.join(WORKERS_DIR);
         if !workers_dir.exists() {
             return Err(RuntimeError::StoreMissing {
                 operation: "read workers",
@@ -286,10 +255,7 @@ impl FsRuntimeStore {
                         continue;
                     }
                 };
-            if worker_snapshot
-                .validate(&self.runtime_id, &worker_snapshot_path)
-                .is_err()
-            {
+            if worker_snapshot.validate(&worker_snapshot_path).is_err() {
                 record_worker_load_diagnostic(
                     &mut snapshot,
                     Some(worker_snapshot.worker_ref.clone()),
@@ -355,30 +321,20 @@ impl FsRuntimeStore {
         ))
     }
 
-    fn ensure_worker_ref(&self, worker_ref: &WorkerRef) -> Result<(), RuntimeError> {
-        if worker_ref.runtime_id == self.runtime_id {
-            Ok(())
-        } else {
-            Err(RuntimeError::WrongRuntime {
-                expected_runtime_id: self.runtime_id.clone(),
-                actual_runtime_id: worker_ref.runtime_id.clone(),
-                worker_id: worker_ref.worker_id.clone(),
-            })
-        }
+    fn ensure_worker_ref(&self, _worker_ref: &WorkerRef) -> Result<(), RuntimeError> {
+        Ok(())
     }
 
     fn runtime_path(&self) -> PathBuf {
-        self.runtime_dir.join(RUNTIME_FILE)
+        self.root.join(RUNTIME_FILE)
     }
 
     fn events_path(&self) -> PathBuf {
-        self.runtime_dir.join(EVENTS_FILE)
+        self.root.join(EVENTS_FILE)
     }
 
     fn worker_dir(&self, worker_id: &WorkerId) -> PathBuf {
-        self.runtime_dir
-            .join(WORKERS_DIR)
-            .join(encoded_component(&worker_id.to_string()))
+        self.root.join(WORKERS_DIR).join(worker_id.to_string())
     }
 
     #[cfg(feature = "ws-server")]
@@ -395,7 +351,6 @@ pub(crate) struct OpenedFsRuntimeStore {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PersistedRuntimeState {
-    pub(crate) runtime_id: RuntimeId,
     pub(crate) display_name: Option<String>,
     pub(crate) status: RuntimeStatus,
     pub(crate) limits: RuntimeLimits,
@@ -423,7 +378,6 @@ pub(crate) struct PersistedWorkerRecord {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RuntimeSnapshot {
     schema_version: u32,
-    runtime_id: RuntimeId,
     display_name: Option<String>,
     backend: RuntimeBackendKind,
     status: RuntimeStatus,
@@ -456,7 +410,6 @@ impl RuntimeSnapshot {
     fn from_persisted(state: &PersistedRuntimeState) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
-            runtime_id: state.runtime_id.clone(),
             display_name: state.display_name.clone(),
             backend: RuntimeBackendKind::FsStore,
             status: state.status,
@@ -469,7 +422,7 @@ impl RuntimeSnapshot {
         }
     }
 
-    fn validate(&self, expected_runtime_id: &RuntimeId, path: &Path) -> Result<(), RuntimeError> {
+    fn validate(&self, path: &Path) -> Result<(), RuntimeError> {
         if self.schema_version != SCHEMA_VERSION {
             return Err(RuntimeError::StoreCorrupt {
                 operation: "read runtime snapshot",
@@ -477,16 +430,6 @@ impl RuntimeSnapshot {
                 message: format!(
                     "unsupported schema version {}, expected {}",
                     self.schema_version, SCHEMA_VERSION
-                ),
-            });
-        }
-        if &self.runtime_id != expected_runtime_id {
-            return Err(RuntimeError::StoreCorrupt {
-                operation: "read runtime snapshot",
-                path: path.to_path_buf(),
-                message: format!(
-                    "runtime snapshot id {} does not match requested runtime {}",
-                    self.runtime_id, expected_runtime_id
                 ),
             });
         }
@@ -507,7 +450,6 @@ impl RuntimeSnapshot {
         #[cfg(feature = "ws-server")] observation_events: Vec<WorkerObservationEvent>,
     ) -> PersistedRuntimeState {
         PersistedRuntimeState {
-            runtime_id: self.runtime_id,
             display_name: self.display_name,
             status: self.status,
             limits: self.limits,
@@ -549,7 +491,7 @@ impl WorkerSnapshot {
         }
     }
 
-    fn validate(&self, expected_runtime_id: &RuntimeId, path: &Path) -> Result<(), RuntimeError> {
+    fn validate(&self, path: &Path) -> Result<(), RuntimeError> {
         if self.schema_version != SCHEMA_VERSION {
             return Err(RuntimeError::StoreCorrupt {
                 operation: "read worker snapshot",
@@ -557,16 +499,6 @@ impl WorkerSnapshot {
                 message: format!(
                     "unsupported schema version {}, expected {}",
                     self.schema_version, SCHEMA_VERSION
-                ),
-            });
-        }
-        if self.worker_ref.runtime_id != *expected_runtime_id {
-            return Err(RuntimeError::StoreCorrupt {
-                operation: "read worker snapshot",
-                path: path.to_path_buf(),
-                message: format!(
-                    "worker belongs to runtime {}, expected {}",
-                    self.worker_ref.runtime_id, expected_runtime_id
                 ),
             });
         }
@@ -595,27 +527,81 @@ impl WorkerSnapshot {
     }
 }
 
-fn runtime_dir(root: &Path, runtime_id: &RuntimeId) -> PathBuf {
-    root.join(RUNTIMES_DIR)
-        .join(encoded_component(runtime_id.as_str()))
+fn migrate_legacy_single_runtime_layout(root: &Path) -> Result<(), RuntimeError> {
+    if root.join(RUNTIME_FILE).exists() {
+        return Ok(());
+    }
+    let legacy_root = root.join(LEGACY_RUNTIMES_DIR);
+    if !legacy_root.is_dir() {
+        return Ok(());
+    }
+
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(&legacy_root).map_err(|source| RuntimeError::StoreIo {
+        operation: "read legacy runtime store root",
+        path: legacy_root.clone(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| RuntimeError::StoreIo {
+            operation: "read legacy runtime store entry",
+            path: legacy_root.clone(),
+            source,
+        })?;
+        let path = entry.path();
+        if path.join(RUNTIME_FILE).is_file() {
+            candidates.push(path);
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    if candidates.len() > 1 {
+        return Err(RuntimeError::StoreCorrupt {
+            operation: "migrate legacy runtime store",
+            path: legacy_root,
+            message: "multiple legacy runtime directories exist; choose a concrete fs root"
+                .to_string(),
+        });
+    }
+
+    let legacy_dir = candidates.remove(0);
+    rename_if_exists(
+        &legacy_dir.join(RUNTIME_FILE),
+        &root.join(RUNTIME_FILE),
+        "migrate legacy runtime snapshot",
+    )?;
+    rename_if_exists(
+        &legacy_dir.join(EVENTS_FILE),
+        &root.join(EVENTS_FILE),
+        "migrate legacy runtime events",
+    )?;
+    rename_if_exists(
+        &legacy_dir.join(WORKERS_DIR),
+        &root.join(WORKERS_DIR),
+        "migrate legacy runtime workers",
+    )?;
+    Ok(())
 }
 
-fn encoded_component(value: &str) -> String {
-    let mut encoded = String::with_capacity(3 + value.len() * 2);
-    encoded.push_str("id-");
-    for byte in value.as_bytes() {
-        encoded.push(hex_digit(byte >> 4));
-        encoded.push(hex_digit(byte & 0x0f));
+fn rename_if_exists(src: &Path, dst: &Path, operation: &'static str) -> Result<(), RuntimeError> {
+    if !src.exists() {
+        return Ok(());
     }
-    encoded
-}
-
-fn hex_digit(value: u8) -> char {
-    match value {
-        0..=9 => (b'0' + value) as char,
-        10..=15 => (b'a' + (value - 10)) as char,
-        _ => unreachable!("hex digit nybble is always <= 15"),
+    if dst.exists() {
+        return Err(RuntimeError::StoreCorrupt {
+            operation,
+            path: dst.to_path_buf(),
+            message: format!(
+                "cannot migrate {} because destination already exists",
+                src.display()
+            ),
+        });
     }
+    fs::rename(src, dst).map_err(|source| RuntimeError::StoreIo {
+        operation,
+        path: dst.to_path_buf(),
+        source,
+    })
 }
 
 fn read_json<T>(path: &Path, operation: &'static str) -> Result<T, RuntimeError>

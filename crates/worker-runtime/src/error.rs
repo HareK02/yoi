@@ -1,36 +1,18 @@
 use crate::execution::WorkerExecutionResult;
-use crate::identity::{RuntimeId, WorkerId};
+use crate::identity::WorkerId;
 use std::path::PathBuf;
 
 /// Errors returned by the embedded Runtime API.
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
-    #[error("runtime {runtime_id} is stopped")]
-    RuntimeStopped { runtime_id: RuntimeId },
-
-    #[error(
-        "worker {worker_id} belongs to runtime {actual_runtime_id}, not runtime {expected_runtime_id}"
-    )]
-    WrongRuntime {
-        expected_runtime_id: RuntimeId,
-        actual_runtime_id: RuntimeId,
-        worker_id: WorkerId,
-    },
-
-    #[error("cursor belongs to runtime {actual_runtime_id}, not runtime {expected_runtime_id}")]
-    WrongRuntimeCursor {
-        expected_runtime_id: RuntimeId,
-        actual_runtime_id: RuntimeId,
-    },
+    #[error("runtime is stopped")]
+    RuntimeStopped,
 
     #[error("initial worker input must be user input, got {kind}")]
     InvalidInitialInputKind { kind: String },
 
-    #[error("worker {worker_id} was not found in runtime {runtime_id}")]
-    WorkerNotFound {
-        runtime_id: RuntimeId,
-        worker_id: WorkerId,
-    },
+    #[error("worker {worker_id} was not found")]
+    WorkerNotFound { worker_id: WorkerId },
 
     #[error("worker {worker_id} has no execution backend: {message}")]
     WorkerExecutionUnavailable {

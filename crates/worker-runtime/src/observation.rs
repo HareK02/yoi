@@ -1,11 +1,10 @@
-use crate::identity::{RuntimeId, WorkerRef};
+use crate::identity::WorkerRef;
 use serde::{Deserialize, Serialize};
 
 /// Event cursor.  `next_event_id` is the first event id that should be returned
 /// by the next poll.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventCursor {
-    pub runtime_id: RuntimeId,
     pub next_event_id: u64,
 }
 
@@ -13,7 +12,6 @@ pub struct EventCursor {
 /// poll-only so HTTP/WS/SSE dependencies are not pulled into this crate.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventSubscription {
-    pub runtime_id: RuntimeId,
     pub cursor: EventCursor,
     pub mode: EventSubscriptionMode,
 }
@@ -48,7 +46,6 @@ pub enum RuntimeEventKind {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeEventBatch {
-    pub runtime_id: RuntimeId,
     pub cursor: EventCursor,
     pub events: Vec<RuntimeEvent>,
     pub has_more: bool,

@@ -1,4 +1,4 @@
-use crate::identity::{RuntimeId, WorkerId};
+use crate::identity::WorkerId;
 use serde::{Deserialize, Serialize};
 
 /// Runtime backend kind.
@@ -35,7 +35,6 @@ impl Default for RuntimeLimits {
 /// Options used to construct an embedded memory Runtime.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeOptions {
-    pub runtime_id: Option<RuntimeId>,
     pub display_name: Option<String>,
     pub limits: RuntimeLimits,
 }
@@ -43,7 +42,6 @@ pub struct RuntimeOptions {
 impl Default for RuntimeOptions {
     fn default() -> Self {
         Self {
-            runtime_id: None,
             display_name: None,
             limits: RuntimeLimits::default(),
         }
@@ -56,7 +54,6 @@ fn unknown_platform_component() -> String {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerDeleteResult {
-    pub runtime_id: RuntimeId,
     pub worker_id: WorkerId,
     pub deleted: bool,
 }
@@ -64,7 +61,6 @@ pub struct WorkerDeleteResult {
 /// Management-plane summary for a Runtime.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeSummary {
-    pub runtime_id: RuntimeId,
     pub display_name: Option<String>,
     pub backend: RuntimeBackendKind,
     pub status: RuntimeStatus,

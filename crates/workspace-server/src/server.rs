@@ -6003,10 +6003,10 @@ mod tests {
         let api = test_api(workspace.path()).await;
         let broker = api.resource_broker.clone();
         let archive = test_profile_archive();
-        let runtime_id = worker_runtime::identity::RuntimeId::new("runtime-test").unwrap();
+        let runtime_id = "runtime-test";
         let handle = broker.issue_profile_source_archive_handle(
             "workspace-test",
-            Some(&runtime_id),
+            Some(runtime_id),
             None,
             archive,
         );
@@ -6022,7 +6022,7 @@ mod tests {
         let response = client
             .fetch_resource(worker_runtime::resource::BackendResourceFetchRequest {
                 audit_correlation_id: handle.audit_correlation_id.clone(),
-                runtime_id: runtime_id.as_str().to_string(),
+                runtime_id: runtime_id.to_string(),
                 worker_id: None,
                 handle: handle.clone(),
             })
@@ -6035,7 +6035,7 @@ mod tests {
         let error = client
             .fetch_resource(worker_runtime::resource::BackendResourceFetchRequest {
                 audit_correlation_id: tampered.audit_correlation_id.clone(),
-                runtime_id: runtime_id.as_str().to_string(),
+                runtime_id: runtime_id.to_string(),
                 worker_id: None,
                 handle: tampered,
             })
