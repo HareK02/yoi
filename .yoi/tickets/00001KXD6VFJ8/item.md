@@ -1,9 +1,11 @@
 ---
 title: 'Remove Runtime-owned runtime_id'
-state: 'planning'
+state: 'inprogress'
 created_at: '2026-07-13T07:42:49Z'
-updated_at: '2026-07-13T07:43:20Z'
+updated_at: '2026-07-13T07:43:36Z'
 assignee: null
+queued_by: 'yoi ticket'
+queued_at: '2026-07-13T07:43:36Z'
 ---
 
 ## 背景
