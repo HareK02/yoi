@@ -1,9 +1,11 @@
 ---
 title: 'Show backend operation error details'
-state: 'planning'
+state: 'inprogress'
 created_at: '2026-07-13T10:45:59Z'
-updated_at: '2026-07-13T10:46:20Z'
+updated_at: '2026-07-13T10:46:30Z'
 assignee: null
+queued_by: 'yoi ticket'
+queued_at: '2026-07-13T10:46:30Z'
 ---
 
 ## 背景
