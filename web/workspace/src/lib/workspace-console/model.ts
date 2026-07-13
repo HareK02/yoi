@@ -219,6 +219,7 @@ export function applyProtocolEvent(
       break;
     case "snapshot":
       next.status = event.data.status;
+      next.lines = snapshotLinesFromEntries(envelope.eventId, event.data.entries);
       for (const block of event.data.in_flight?.blocks ?? []) {
         next.lines.push(inFlightLine(envelope.eventId, block));
       }
@@ -729,6 +730,11 @@ function stringField(
   return typeof field === "string" ? field : undefined;
 }
 
+function arrayField(value: Record<string, unknown>, key: string): unknown[] {
+  const field = value[key];
+  return Array.isArray(field) ? field : [];
+}
+
 function compactLines(lines: Array<string | undefined | null | false>): string {
   return lines.filter((line): line is string => Boolean(line)).join("\n");
 }
@@ -758,6 +764,113 @@ function usageText(
   return `input ${data.input_tokens ?? "unknown"} · output ${
     data.output_tokens ?? "unknown"
   } · cache ${data.cache_read_input_tokens ?? "unknown"}`;
+}
+
+function snapshotLinesFromEntries(eventId: string, entries: unknown[]): ConsoleLine[] {
+  const projection: ConsoleProjection = {
+    lines: [],
+    status: null,
+    usage: null,
+    lastEventId: eventId,
+  };
+  entries.forEach((entry, index) => applyLogEntry(projection, `${eventId}-snapshot-${index}`, entry));
+  return projection.lines;
+}
+
+function applyLogEntry(
+  projection: ConsoleProjection,
+  eventId: string,
+  entry: unknown,
+): void {
+  if (!isRecord(entry)) return;
+  switch (stringField(entry, "kind")) {
+    case "segment_start":
+      arrayField(entry, "history").forEach((item, index) =>
+        applyLoggedItem(projection, `${eventId}-history-${index}`, item)
+      );
+      break;
+    case "user_input":
+      projection.lines.push(
+        line(
+          eventId,
+          "user",
+          "User",
+          segmentsToText(arrayField(entry, "segments") as Segment[]),
+        ),
+      );
+      break;
+    case "assistant_item":
+    case "tool_result":
+      applyLoggedItem(projection, eventId, entry["item"]);
+      break;
+    default:
+      break;
+  }
+}
+
+function applyLoggedItem(
+  projection: ConsoleProjection,
+  eventId: string,
+  item: unknown,
+): void {
+  if (!isRecord(item)) return;
+  switch (stringField(item, "kind")) {
+    case "message": {
+      const body = loggedContentText(arrayField(item, "content"));
+      switch (stringField(item, "role")) {
+        case "user":
+          projection.lines.push(line(eventId, "user", "User", body));
+          break;
+        case "assistant":
+          projection.lines.push(line(eventId, "assistant", "assistant", body));
+          break;
+        default:
+          break;
+      }
+      break;
+    }
+    case "reasoning": {
+      const text = stringField(item, "text") ?? arrayField(item, "summary").filter((value) => typeof value === "string").join("\n");
+      if (text) {
+        projection.lines.push(line(eventId, "thinking", "Thought", text));
+      }
+      break;
+    }
+    case "tool_call":
+      upsertToolCall(projection, eventId, stringField(item, "call_id") ?? eventId, {
+        name: stringField(item, "name") ?? "Tool",
+        arguments: stringField(item, "arguments") ?? "",
+        argsStream: stringField(item, "arguments") ?? "",
+        state: "running",
+      });
+      break;
+    case "tool_result":
+      attachToolResult(projection, eventId, stringField(item, "call_id") ?? eventId, {
+        summary: stringField(item, "summary") ?? "",
+        output: stringField(item, "content"),
+        isError: item["is_error"] === true,
+      });
+      break;
+    default:
+      break;
+  }
+}
+
+function loggedContentText(parts: unknown[]): string {
+  return parts
+    .map((part) => {
+      if (!isRecord(part)) return "";
+      switch (stringField(part, "kind")) {
+        case "text":
+          return stringField(part, "text") ?? "";
+        case "refusal":
+          return stringField(part, "refusal") ?? "";
+        default:
+          return "";
+      }
+    })
+    .filter(Boolean)
+    .join("\n");
 }
 
 function inFlightLine(eventId: string, block: InFlightBlock): ConsoleLine {

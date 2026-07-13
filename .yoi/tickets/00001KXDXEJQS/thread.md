@@ -40,3 +40,38 @@ State changed to `inprogress`.
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-13T14:30:37Z -->
+
+## Implementation report
+
+Implemented console rendering for WebSocket snapshot entries.
+
+Root cause:
+- Browser Console consumed `snapshot.status` and `snapshot.in_flight`, but ignored `snapshot.entries`.
+- After reconnect/restore the WebSocket snapshot arrived, but committed conversation history was not projected into console rows, so the console appeared empty without an error.
+
+Changes:
+- `projectConsole` now rebuilds committed console rows from `snapshot.data.entries`.
+- `SegmentStart.history` is replayed so seed history from restored/compacted sessions is visible.
+- Snapshot log entries for user input, assistant messages, reasoning, tool calls, and tool results are projected into existing ConsoleLine shapes.
+- Existing in-flight snapshot rendering is preserved.
+- Unknown snapshot entries are ignored rather than surfaced as errors.
+
+Validation:
+- `cd web/workspace && deno task check`
+- `cd web/workspace && deno task test`
+- `git diff --check`
+- `nix build .#yoi --no-link`
+
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-07-13T14:30:38Z from: inprogress to: done reason: cli_state field: state -->
+
+## State changed
+
+State changed to `done`.
+
+
+---

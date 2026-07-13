@@ -398,14 +398,64 @@ Deno.test("projectConsole keeps protocol lifecycle events out of the console sur
   assertEquals(projection.status, "running");
 });
 
-Deno.test("projectConsole uses snapshot for state without rendering it as console output", () => {
+Deno.test("projectConsole renders snapshot entries and in-flight output", () => {
   const projection = projectConsole([
     {
       eventId: "20",
       event: {
         event: "snapshot",
         data: {
-          entries: [{ role: "user" }],
+          entries: [
+            {
+              kind: "segment_start",
+              ts: 1,
+              session_id: "00000000-0000-0000-0000-000000000001",
+              system_prompt: null,
+              config: {},
+              history: [
+                {
+                  kind: "message",
+                  role: "user",
+                  content: [{ kind: "text", text: "seed user" }],
+                },
+              ],
+            },
+            {
+              kind: "user_input",
+              ts: 2,
+              segments: [{ kind: "text", content: "new user" }],
+            },
+            {
+              kind: "assistant_item",
+              ts: 3,
+              item: {
+                kind: "message",
+                role: "assistant",
+                content: [{ kind: "text", text: "assistant reply" }],
+              },
+            },
+            {
+              kind: "assistant_item",
+              ts: 4,
+              item: {
+                kind: "tool_call",
+                call_id: "read-1",
+                name: "Read",
+                arguments: JSON.stringify({ file_path: "/tmp/a.md" }),
+              },
+            },
+            {
+              kind: "tool_result",
+              ts: 5,
+              item: {
+                kind: "tool_result",
+                call_id: "read-1",
+                summary: "read 3 lines",
+                content: "hidden file contents",
+                is_error: false,
+              },
+            },
+          ],
           greeting: {
             worker_name: "Worker",
             cwd: "/repo",
@@ -429,9 +479,13 @@ Deno.test("projectConsole uses snapshot for state without rendering it as consol
 
   assertEquals(projection.status, "running");
   assertEquals(
-    projection.lines.map((line) =>
-      `${line.kind}:${line.body}:${line.streaming}`
-    ),
-    ["in_flight:partial:true"],
+    projection.lines.map((line) => `${line.kind}:${line.body}:${line.streaming}`),
+    [
+      "user:seed user:false",
+      "user:new user:false",
+      "assistant:assistant reply:false",
+      "tool:Read — 1 file read\n  /tmp/a.md:false",
+      "in_flight:partial:true",
+    ],
   );
 });
