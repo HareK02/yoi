@@ -1,9 +1,12 @@
 <script lang="ts">
   import { tick } from 'svelte';
-  import RichMarkdown from '$lib/workspace-console/RichMarkdown.svelte';
+  import ConsoleLineItem from '$lib/workspace-console/ConsoleLineItem.svelte';
+  import { chatSubmit } from '$lib/workspace-console/chat-submit';
+  import { fitTextarea } from '$lib/workspace-console/textarea-fit';
   import {
-    projectConsole,
-    type ConsoleLine
+    createConsoleProjector,
+    type ConsoleEventInput,
+    type ConsoleProjection
   } from '$lib/workspace-console/model';
   import { workspaceApiPath } from '$lib/workspace-api/http';
   import type {
@@ -44,8 +47,13 @@
   let consoleBodyElement: HTMLElement | null = null;
   let autoFollowConsole = $state(true);
   const CONSOLE_BOTTOM_THRESHOLD_PX = 48;
-  let observedEvents = $state<Array<{ eventId: string; event: ClientWorkerEventWsFrame & { kind: 'event' } }>>([]);
+  const consoleProjector = createConsoleProjector();
+  let consoleProjection = $state.raw<ConsoleProjection>(consoleProjector.snapshot());
   let seenObservationEventIds = new Set<string>();
+  let pendingObservationEvents: ConsoleEventInput[] = [];
+  let pendingObservedStates: Array<string | null> = [];
+  let pendingStreamDiagnostics: Diagnostic[] = [];
+  let observationFlushHandle: number | null = null;
   let nextReloadToken = 0;
   let reloadToken = $state(0);
 
@@ -56,10 +64,7 @@
 
   const consoleTarget = $derived({ runtimeId, workerId });
 
-  const projection = $derived(
-    projectConsole(observedEvents.map((item) => ({ eventId: item.eventId, event: item.event.envelope.payload })))
-  );
-  const lines = $derived(projection.lines);
+  const lines = $derived(consoleProjection.lines);
   const diagnostics = $derived(mergeDiagnostics(worker?.diagnostics ?? [], streamDiagnostics));
   const workerState = $derived(liveWorkerState ?? worker?.state ?? 'loading');
   const inputReady = $derived(workerState === 'idle');
@@ -124,8 +129,67 @@
   }
 
   function resetObservedEvents() {
-    observedEvents = [];
+    cancelObservationFlush();
+    consoleProjection = consoleProjector.reset();
     seenObservationEventIds = new Set();
+  }
+
+  function cancelObservationFlush() {
+    if (observationFlushHandle !== null) {
+      window.cancelAnimationFrame(observationFlushHandle);
+      observationFlushHandle = null;
+    }
+    pendingObservationEvents = [];
+    pendingObservedStates = [];
+    pendingStreamDiagnostics = [];
+  }
+
+  function scheduleObservationFlush() {
+    if (observationFlushHandle !== null) {
+      return;
+    }
+    observationFlushHandle = window.requestAnimationFrame(() => {
+      flushObservationBatch();
+    });
+  }
+
+  function flushObservationBatch() {
+    observationFlushHandle = null;
+    const eventBatch = pendingObservationEvents;
+    const stateBatch = pendingObservedStates;
+    const diagnosticBatch = pendingStreamDiagnostics;
+    pendingObservationEvents = [];
+    pendingObservedStates = [];
+    pendingStreamDiagnostics = [];
+
+    if (eventBatch.length > 0) {
+      const latestState = stateBatch.findLast((state) => state !== null);
+      if (latestState) {
+        liveWorkerState = latestState;
+      }
+      consoleProjection = consoleProjector.append(eventBatch);
+    }
+
+    if (diagnosticBatch.length > 0) {
+      streamDiagnostics = [...streamDiagnostics, ...diagnosticBatch];
+    }
+  }
+
+  function queueObservationEvent(frame: ClientWorkerEventWsFrame & { kind: 'event' }) {
+    if (!rememberObservationEvent(frame.envelope.event_id)) {
+      return;
+    }
+    pendingObservationEvents.push({
+      eventId: frame.envelope.event_id,
+      event: frame.envelope.payload
+    });
+    pendingObservedStates.push(workerStateFromProtocolEvent(frame.envelope.payload));
+    scheduleObservationFlush();
+  }
+
+  function queueObservationDiagnostic(diagnostic: Diagnostic) {
+    pendingStreamDiagnostics.push(diagnostic);
+    scheduleObservationFlush();
   }
 
   function rememberObservationEvent(eventId: string): boolean {
@@ -136,9 +200,8 @@
     return true;
   }
 
-  async function sendMessage(event: SubmitEvent) {
-    event.preventDefault();
-    const content = draft.trim();
+  async function submitDraft(value = draft) {
+    const content = value.trim();
     if (!content || sending || !inputReady) {
       return;
     }
@@ -161,6 +224,11 @@
     } finally {
       sending = false;
     }
+  }
+
+  async function sendMessage(event: SubmitEvent) {
+    event.preventDefault();
+    await submitDraft();
   }
 
   function workerStateFromProtocolEvent(event: PodProtocolEvent): string | null {
@@ -199,39 +267,20 @@
       try {
         const frame = JSON.parse(String(message.data)) as ClientWorkerEventWsFrame;
         if (frame.kind === 'event') {
-          if (!rememberObservationEvent(frame.envelope.event_id)) {
-            return;
-          }
-          const observedState = workerStateFromProtocolEvent(frame.envelope.payload);
-          if (observedState) {
-            liveWorkerState = observedState;
-          }
-          observedEvents = [
-            ...observedEvents,
-            {
-              eventId: frame.envelope.event_id,
-              event: frame
-            }
-          ].slice(-500);
+          queueObservationEvent(frame);
         } else {
-          streamDiagnostics = [
-            ...streamDiagnostics,
-            {
-              code: frame.diagnostic.code,
-              severity: 'warning',
-              message: frame.diagnostic.message
-            }
-          ];
+          queueObservationDiagnostic({
+            code: frame.diagnostic.code,
+            severity: 'warning',
+            message: frame.diagnostic.message
+          });
         }
       } catch (error) {
-        streamDiagnostics = [
-          ...streamDiagnostics,
-          {
-            code: 'worker_observation_frame_invalid',
-            severity: 'warning',
-            message: error instanceof Error ? error.message : String(error)
-          }
-        ];
+        queueObservationDiagnostic({
+          code: 'worker_observation_frame_invalid',
+          severity: 'warning',
+          message: error instanceof Error ? error.message : String(error)
+        });
       }
     };
     ws.onerror = () => {
@@ -262,34 +311,6 @@
 
   function diagnosticsToText(items: Diagnostic[]): string {
     return items.map((item) => `${item.severity}: ${item.message}`).join('\n');
-  }
-
-  function lineClass(line: ConsoleLine): string {
-    return line.error ? 'error' : line.kind;
-  }
-
-  function toolClass(line: ConsoleLine): string {
-    const name = line.toolCall?.name?.toLowerCase() ?? '';
-    const state = line.toolCall?.state ?? (line.streaming ? 'streaming' : 'done');
-    return [name ? `tool-${name}` : '', `tool-state-${state}`].filter(Boolean).join(' ');
-  }
-
-  function shouldRenderHeading(line: ConsoleLine): boolean {
-    return line.kind !== 'assistant' && line.kind !== 'user' && line.kind !== 'tool';
-  }
-
-  function toolSummary(line: ConsoleLine): { label: string; suffix: string; rest: string } {
-    const [firstLine = '', ...rest] = line.body.split('\n');
-    const [label, suffix = ''] = firstLine.split(' — ', 2);
-    return {
-      label,
-      suffix,
-      rest: rest.join('\n')
-    };
-  }
-
-  function bodyTextAfterToolSummary(line: ConsoleLine): string {
-    return toolSummary(line).rest;
   }
 
   function isNearConsoleBottom(element: HTMLElement): boolean {
@@ -359,11 +380,11 @@
 
     <section class="console-body" bind:this={consoleBodyElement} onscroll={handleConsoleScroll}>
       <article class="card console-card worker-console-card">
-        {#if projection.status || projection.usage}
+        {#if consoleProjection.status || consoleProjection.usage}
           <p class="section-note">
-            {#if projection.status}status: {projection.status}{/if}
-            {#if projection.status && projection.usage} · {/if}
-            {#if projection.usage}usage: {projection.usage}{/if}
+            {#if consoleProjection.status}status: {consoleProjection.status}{/if}
+            {#if consoleProjection.status && consoleProjection.usage} · {/if}
+            {#if consoleProjection.usage}usage: {consoleProjection.usage}{/if}
           </p>
         {/if}
 
@@ -375,43 +396,8 @@
           <p>No console output is available for this Worker yet.</p>
         {:else}
           <ol class="console-log">
-            {#each lines as item}
-              <li class={`console-line ${lineClass(item)} ${toolClass(item)}`} class:error-line={item.error}>
-                {#if shouldRenderHeading(item)}
-                  <div class="message-heading">
-                    <span>{item.title}</span>
-                    {#if item.streaming}<small>streaming</small>{/if}
-                  </div>
-                {:else if item.kind === 'tool'}
-                  <div class="tool-summary">
-                    <span class="tool-label">{toolSummary(item).label}</span>
-                    <span class="tool-separator"> — </span>
-                    <span class={`tool-suffix ${item.toolCall?.state ?? ''}`}>{toolSummary(item).suffix}</span>
-                    {#if item.streaming}<small>streaming</small>{/if}
-                  </div>
-                {:else if item.streaming}
-                  <div class="message-heading streaming-heading">
-                    <small>streaming</small>
-                  </div>
-                {/if}
-                {#if item.kind === 'tool'}
-                  {#if bodyTextAfterToolSummary(item)}
-                    <RichMarkdown text={bodyTextAfterToolSummary(item)} />
-                  {/if}
-                {:else}
-                  <RichMarkdown text={item.body || '—'} />
-                {/if}
-                {#if item.diff}
-                  <pre class="console-diff" aria-label="Edit diff">{#each item.diff as diffLine}
-<span class={`diff-line ${diffLine.kind}`}><span class="diff-gutter">{diffLine.oldNumber ?? ''}</span><span class="diff-gutter">{diffLine.newNumber ?? ''}</span><span class="diff-marker">{diffLine.kind === 'add' ? '+' : diffLine.kind === 'remove' ? '-' : ' '}</span><span class="diff-content">{diffLine.content}</span></span>{/each}</pre>
-                {/if}
-                {#if item.detail}
-                  <details class="message-detail">
-                    <summary>detail</summary>
-                    <p>{item.detail}</p>
-                  </details>
-                {/if}
-              </li>
+            {#each lines as item (item.id)}
+              <ConsoleLineItem {item} />
             {/each}
           </ol>
         {/if}
@@ -484,7 +470,13 @@
       <textarea
         id="worker-console-message"
         aria-label="Console input"
+        aria-keyshortcuts="Meta+Enter"
         bind:value={draft}
+        use:chatSubmit={{
+          enabled: inputReady && !sending,
+          onSubmit: (value) => void submitDraft(value)
+        }}
+        use:fitTextarea={{ value: draft, maxRows: 10 }}
         disabled={!inputReady || sending}
       ></textarea>
       <div class="composer-actions">

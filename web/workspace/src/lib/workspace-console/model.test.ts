@@ -1,5 +1,10 @@
 import type { Event } from "$lib/generated/protocol";
-import { projectConsole, segmentsToText, workerConsoleHref } from "./model.ts";
+import {
+  createConsoleProjector,
+  projectConsole,
+  segmentsToText,
+  workerConsoleHref,
+} from "./model.ts";
 
 declare const Deno: {
   test(name: string, fn: () => void): void;
@@ -175,7 +180,7 @@ Deno.test("projectConsole groups tool call lifecycle into one Call block", () =>
         data: {
           id: "call-1",
           summary: "command completed",
-          output: "/repo\n",
+          output: "/repo\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline12",
           is_error: false,
         },
       } satisfies Event,
@@ -198,8 +203,149 @@ Deno.test("projectConsole groups tool call lifecycle into one Call block", () =>
     "tool result should be folded into the Call block",
   );
   assert(
+    toolLines[0].body.includes("line9"),
+    "Bash result preview should include the ninth output line",
+  );
+  assert(
+    !toolLines[0].body.includes("line10") &&
+      !toolLines[0].body.includes("line12"),
+    "Bash result preview should be capped at ten display lines",
+  );
+  assert(
+    toolLines[0].body.includes("… +3 more lines"),
+    "Bash result preview should show omitted output count",
+  );
+  assert(
     toolLines[0].detail?.includes("id: call-1"),
     "call id should remain in detail",
+  );
+});
+
+Deno.test("projectConsole caps default tool request and result previews", () => {
+  const projection = projectConsole([
+    {
+      eventId: "70",
+      event: {
+        event: "tool_call_done",
+        data: {
+          id: "custom-1",
+          name: "CustomTool",
+          arguments: JSON.stringify({
+            first: "one",
+            second: "two",
+            third: "three",
+            fourth: "four",
+          }),
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "71",
+      event: {
+        event: "tool_result",
+        data: {
+          id: "custom-1",
+          summary: "custom completed",
+          output: "out1\nout2\nout3\nout4\nout5",
+          is_error: false,
+        },
+      } satisfies Event,
+    },
+  ]);
+
+  const [line] = projection.lines.filter((line) => line.kind === "tool");
+  assertEquals(line.title, "Call · CustomTool");
+  assertEquals(line.body.split("\n").length, 7);
+  assert(line.body.includes("CustomTool — done"), "tool state should be shown");
+  assert(line.body.includes('"first": "one"'), "request preview should be shown");
+  assert(line.body.includes("out1"), "result preview should be shown");
+  assert(!line.body.includes("third"), "request preview should be capped");
+  assert(!line.body.includes("out3"), "result preview should be capped");
+  assert(line.body.includes("… +"), "overflow marker should be shown");
+});
+
+Deno.test("projectConsole shows Grep query and caps result preview to five entries", () => {
+  const projection = projectConsole([
+    {
+      eventId: "72",
+      event: {
+        event: "tool_call_done",
+        data: {
+          id: "grep-1",
+          name: "Grep",
+          arguments: JSON.stringify({ pattern: "needle", path: "/repo" }),
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "73",
+      event: {
+        event: "tool_result",
+        data: {
+          id: "grep-1",
+          summary: "6 matches",
+          output: "hit1\nhit2\nhit3\nhit4\nhit5\nhit6",
+          is_error: false,
+        },
+      } satisfies Event,
+    },
+  ]);
+
+  const [line] = projection.lines.filter((line) => line.kind === "tool");
+  assertEquals(line.title, "Call · Grep");
+  assert(line.body.includes("Grep — 6 matches"), "Grep summary should be shown");
+  assert(line.body.includes("query: needle"), "Grep query should be shown");
+  assert(line.body.includes("hit1"), "first result should be shown");
+  assert(line.body.includes("hit5"), "fifth result should be shown");
+  assert(!line.body.includes("hit6"), "sixth result should be capped");
+  assert(
+    line.body.includes("… +1 more results"),
+    "overflow marker should be shown",
+  );
+});
+
+Deno.test("projectConsole keeps Grep error detail in the body", () => {
+  const message =
+    "Tool execution failed: Invalid argument: path is outside allowed scope: /home/hare/.yoi/workdirs/working-directories/0019f5bce74f1000000/root/main/ghq.local/github/openai/codex";
+  const projection = projectConsole([
+    {
+      eventId: "74",
+      event: {
+        event: "tool_call_done",
+        data: {
+          id: "grep-error-1",
+          name: "Grep",
+          arguments: JSON.stringify({ pattern: "needle", path: "/outside" }),
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "75",
+      event: {
+        event: "tool_result",
+        data: {
+          id: "grep-error-1",
+          summary: message,
+          output: message,
+          is_error: true,
+        },
+      } satisfies Event,
+    },
+  ]);
+
+  const [line] = projection.lines.filter((line) => line.kind === "tool");
+  assertEquals(line.title, "Call · Grep");
+  assert(
+    line.body.includes("Grep — Failed"),
+    "error suffix should stay short",
+  );
+  assert(
+    line.body.includes(message),
+    "error detail should remain visible in the body",
+  );
+  assert(
+    !line.body.includes(`Grep — ${message}`),
+    "error detail should not be repeated in the suffix",
   );
 });
 
@@ -229,6 +375,85 @@ Deno.test("projectConsole keeps streaming tool call updates in the same Call blo
     toolLines[0].body.includes("/tmp/a.md") &&
       toolLines[0].body.includes("Read — reading"),
     "Read call should render aggregate progress and path without content",
+  );
+});
+
+Deno.test("createConsoleProjector replaces only the updated protocol block", () => {
+  const projector = createConsoleProjector();
+  let projection = projector.append([
+    {
+      eventId: "identity-1",
+      event: {
+        event: "user_message",
+        data: { segments: [{ kind: "text", content: "hello" }] },
+      } satisfies Event,
+    },
+    {
+      eventId: "identity-2",
+      event: {
+        event: "tool_call_start",
+        data: { id: "grep-a", name: "Grep" },
+      } satisfies Event,
+    },
+    {
+      eventId: "identity-3",
+      event: {
+        event: "tool_call_start",
+        data: { id: "grep-b", name: "Grep" },
+      } satisfies Event,
+    },
+  ]);
+
+  const userLine = projection.lines[0];
+  const grepA = projection.lines[1];
+  const grepB = projection.lines[2];
+
+  projection = projector.append([
+    {
+      eventId: "identity-4",
+      event: {
+        event: "tool_call_args_delta",
+        data: { id: "grep-a", json: '{"pattern":"needle"}' },
+      } satisfies Event,
+    },
+  ]);
+
+  assert(
+    projection.lines[0] === userLine,
+    "unrelated message line should keep object identity",
+  );
+  assert(
+    projection.lines[1] !== grepA,
+    "updated tool line should get a new object identity",
+  );
+  assert(
+    projection.lines[2] === grepB,
+    "parallel unrelated tool line should keep object identity",
+  );
+
+  const updatedGrepA = projection.lines[1];
+  projection = projector.append([
+    {
+      eventId: "identity-5",
+      event: {
+        event: "tool_result",
+        data: {
+          id: "grep-b",
+          summary: "done",
+          output: "hit",
+          is_error: false,
+        },
+      } satisfies Event,
+    },
+  ]);
+
+  assert(
+    projection.lines[1] === updatedGrepA,
+    "previously updated but now unrelated tool line should keep identity",
+  );
+  assert(
+    projection.lines[2] !== grepB,
+    "completed parallel tool line should get a new object identity",
   );
 });
 

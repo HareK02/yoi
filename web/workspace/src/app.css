@@ -96,6 +96,10 @@
 }
 
 @layer base {
+    html {
+        font-size: 14px;
+    }
+
     body {
         background: var(--bg);
         color: var(--text);
@@ -1048,8 +1052,7 @@
 }
 
 .console-log li {
-    display: grid;
-    gap: var(--space-1);
+    min-width: 0;
     padding: 0.2rem 0;
     background: transparent;
 }
@@ -1057,6 +1060,22 @@
 .rich-markdown {
     color: inherit;
     line-height: 1.55;
+}
+
+.console-plain-text {
+    margin: 0.45rem 0;
+    color: inherit;
+    line-height: 1.55;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+}
+
+.console-plain-text:first-child {
+    margin-top: 0;
+}
+
+.console-plain-text:last-child {
+    margin-bottom: 0;
 }
 
 .rich-markdown > :first-child {
@@ -1174,7 +1193,7 @@
     font-style: italic;
 }
 
-.console-log li.thinking .rich-markdown {
+.console-log li.thinking .console-plain-text {
     color: var(--tui-dark-gray);
     font-style: italic;
 }
@@ -1197,7 +1216,20 @@
 }
 
 .tool-label {
+    flex: 0 0 auto;
     color: var(--tui-cyan);
+    white-space: nowrap;
+}
+
+.tool-separator {
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+
+.tool-suffix {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-wrap: anywhere;
 }
 
 .tool-separator,
@@ -1219,7 +1251,16 @@
     color: var(--tui-dark-gray);
 }
 
-.console-line.tool .rich-markdown {
+.console-line.tool-bash .console-plain-text {
+    display: block;
+    max-width: 100%;
+    min-width: 0;
+    font-family: var(--font-mono);
+    overflow-x: auto;
+    white-space: pre;
+}
+
+.console-line.tool .console-plain-text {
     color: var(--tui-gray);
 }
 
@@ -1324,13 +1365,16 @@
 }
 
 .console-composer textarea {
+    box-sizing: border-box;
     width: 100%;
-    min-height: 7rem;
-    resize: vertical;
+    min-height: 0;
+    resize: none;
+    overflow-y: hidden;
     border: 1px solid var(--line);
     border-radius: 14px;
     padding: 0.85rem 1rem;
     font: inherit;
+    line-height: 1.45;
     color: var(--text-strong);
 }
 

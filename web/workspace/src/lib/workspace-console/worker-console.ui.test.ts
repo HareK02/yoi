@@ -69,10 +69,46 @@ Deno.test("Worker Console uses protocol observation events without transcript fe
       consolePage.includes(
         "rememberObservationEvent(frame.envelope.event_id)",
       ) &&
-      consolePage.includes("projectConsole(observedEvents.map") &&
+      consolePage.includes("createConsoleProjector") &&
+      consolePage.includes("consoleProjector.append(eventBatch)") &&
+      consolePage.includes("{#each lines as item (item.id)}") &&
+      !consolePage.includes("projectConsole(observedEvents.map") &&
       !consolePage.includes("/transcript") &&
       !consolePage.includes("WorkerTranscriptProjection"),
     "Console should render protocol observation replay/live events directly and dedupe repeated frames by event id",
+  );
+});
+
+Deno.test("Worker Console renders markdown only for message rows", async () => {
+  const consoleLine = await Deno.readTextFile(
+    new URL("./ConsoleLineItem.svelte", import.meta.url),
+  );
+
+  assert(
+    consoleLine.includes("function shouldRenderMarkdown") &&
+      consoleLine.includes("item.kind === 'tool'") &&
+      consoleLine.includes('<p class="console-plain-text">{bodyTextAfterToolSummary(item)}</p>') &&
+      consoleLine.includes("{:else if shouldRenderMarkdown(item)}") &&
+      consoleLine.includes("<RichMarkdown text={item.body || '—'} />"),
+    "Console should keep markdown rendering to user/assistant/system message bodies and render tool text literally",
+  );
+});
+
+Deno.test("Worker Console composer fits to content without manual resize", async () => {
+  const consolePage = await Deno.readTextFile(
+    new URL(
+      "./../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      import.meta.url,
+    ),
+  );
+  const css = await Deno.readTextFile(new URL("../../app.css", import.meta.url));
+
+  assert(
+    consolePage.includes("use:fitTextarea={{ value: draft, maxRows: 10 }}") &&
+      css.includes(".console-composer textarea") &&
+      css.includes("resize: none") &&
+      css.includes("overflow-y: hidden"),
+    "Console composer should autosize to content, cap at ten rows, and disable manual resize",
   );
 });
 

@@ -95,15 +95,42 @@ export function workerConsolePath(
 
 export type ConsoleEventInput = { eventId: string; event: ProtocolEvent };
 
-export function projectConsole(
-  events: ConsoleEventInput[] = [],
-): ConsoleProjection {
-  const projection = events.reduce(applyProtocolEvent, {
+export function emptyConsoleProjection(): ConsoleProjection {
+  return {
     lines: [],
     status: null,
     usage: null,
     lastEventId: null,
-  });
+  };
+}
+
+export function projectConsole(
+  events: ConsoleEventInput[] = [],
+): ConsoleProjection {
+  const projection = events.reduce(applyProtocolEvent, emptyConsoleProjection());
+  return projectVisibleConsole(projection);
+}
+
+export function createConsoleProjector() {
+  let projection = emptyConsoleProjection();
+  return {
+    reset(): ConsoleProjection {
+      projection = emptyConsoleProjection();
+      return projectVisibleConsole(projection);
+    },
+    append(events: ConsoleEventInput[]): ConsoleProjection {
+      for (const event of events) {
+        projection = applyProtocolEvent(projection, event);
+      }
+      return projectVisibleConsole(projection);
+    },
+    snapshot(): ConsoleProjection {
+      return projectVisibleConsole(projection);
+    },
+  };
+}
+
+function projectVisibleConsole(projection: ConsoleProjection): ConsoleProjection {
   return {
     ...projection,
     lines: aggregateReadToolLines(projection.lines),
@@ -314,6 +341,18 @@ function line(
   };
 }
 
+function findLastLineIndex(
+  lines: ConsoleLine[],
+  predicate: (line: ConsoleLine) => boolean,
+): number {
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (predicate(lines[index])) {
+      return index;
+    }
+  }
+  return -1;
+}
+
 function appendStreaming(
   projection: ConsoleProjection,
   eventId: string,
@@ -321,12 +360,17 @@ function appendStreaming(
   title: string,
   delta: string,
 ): void {
-  const existing = [...projection.lines].reverse().find((item) =>
-    item.kind === kind && item.streaming
+  const index = findLastLineIndex(
+    projection.lines,
+    (item) => item.kind === kind && item.streaming === true,
   );
-  if (existing) {
-    existing.body += delta;
-    existing.eventId = eventId;
+  if (index >= 0) {
+    const existing = projection.lines[index];
+    projection.lines[index] = {
+      ...existing,
+      body: `${existing.body}${delta}`,
+      eventId,
+    };
     return;
   }
   projection.lines.push(line(eventId, kind, title, delta, undefined, true));
@@ -339,14 +383,19 @@ function finalizeStreaming(
   title: string,
   body: string,
 ): void {
-  const existing = [...projection.lines].reverse().find((item) =>
-    item.kind === kind && item.streaming
+  const index = findLastLineIndex(
+    projection.lines,
+    (item) => item.kind === kind && item.streaming === true,
   );
-  if (existing) {
-    existing.body = body || existing.body;
-    existing.streaming = false;
-    existing.title = title;
-    existing.eventId = eventId;
+  if (index >= 0) {
+    const existing = projection.lines[index];
+    projection.lines[index] = {
+      ...existing,
+      body: body || existing.body,
+      streaming: false,
+      title,
+      eventId,
+    };
     return;
   }
   projection.lines.push(line(eventId, kind, title, body));
@@ -358,9 +407,9 @@ function upsertToolCall(
   id: string,
   update: Partial<Omit<ToolCallView, "id">>,
 ): ConsoleLine {
-  let existing = findToolCallLine(projection, id);
-  if (!existing) {
-    existing = toolLine(eventId, {
+  const index = findToolCallLineIndex(projection, id);
+  if (index < 0) {
+    const created = toolLine(eventId, {
       id,
       name: update.name ?? "Tool",
       argsStream: update.argsStream ?? "",
@@ -370,18 +419,23 @@ function upsertToolCall(
       output: update.output,
       isError: update.isError,
     });
-    projection.lines.push(existing);
-  } else {
-    existing.eventId = eventId;
-    existing.toolCall = {
+    projection.lines.push(created);
+    return created;
+  }
+
+  const existing = projection.lines[index];
+  const updated = refreshedToolLine({
+    ...existing,
+    eventId,
+    toolCall: {
       ...existing.toolCall!,
       ...update,
       id,
       name: update.name ?? existing.toolCall!.name,
-    };
-  }
-  refreshToolLine(existing);
-  return existing;
+    },
+  });
+  projection.lines[index] = updated;
+  return updated;
 }
 
 function appendToolArgs(
@@ -390,11 +444,27 @@ function appendToolArgs(
   id: string,
   delta: string,
 ): void {
-  const existing = upsertToolCall(projection, eventId, id, {
-    state: "streaming_args",
+  const index = findToolCallLineIndex(projection, id);
+  if (index < 0) {
+    projection.lines.push(toolLine(eventId, {
+      id,
+      name: "Tool",
+      argsStream: delta,
+      state: "streaming_args",
+    }));
+    return;
+  }
+  const existing = projection.lines[index];
+  const toolCall = existing.toolCall!;
+  projection.lines[index] = refreshedToolLine({
+    ...existing,
+    eventId,
+    toolCall: {
+      ...toolCall,
+      argsStream: `${toolCall.argsStream}${delta}`,
+      state: "streaming_args",
+    },
   });
-  existing.toolCall!.argsStream += delta;
-  refreshToolLine(existing);
 }
 
 function attachToolResult(
@@ -403,42 +473,47 @@ function attachToolResult(
   id: string,
   result: Pick<ToolCallView, "summary" | "output" | "isError">,
 ): void {
-  const existing = findToolCallLine(projection, id);
-  if (!existing) {
-    const fallback = toolLine(eventId, {
-      id,
-      name: "Tool",
-      argsStream: "",
-      state: result.isError ? "error" : "done",
-      ...result,
+  const index = findToolCallLineIndex(projection, id);
+  if (index < 0) {
+    const fallback = refreshedToolLine({
+      ...toolLine(eventId, {
+        id,
+        name: "Tool",
+        argsStream: "",
+        state: result.isError ? "error" : "done",
+        ...result,
+      }),
+      title: result.isError ? "Call · Tool result error" : "Call · Tool result",
     });
-    fallback.title = result.isError
-      ? "Call · Tool result error"
-      : "Call · Tool result";
-    refreshToolLine(fallback);
     projection.lines.push(fallback);
     return;
   }
-  existing.eventId = eventId;
-  existing.toolCall = {
-    ...existing.toolCall!,
-    ...result,
-    state: result.isError ? "error" : "done",
-  };
-  refreshToolLine(existing);
+  const existing = projection.lines[index];
+  projection.lines[index] = refreshedToolLine({
+    ...existing,
+    eventId,
+    toolCall: {
+      ...existing.toolCall!,
+      ...result,
+      state: result.isError ? "error" : "done",
+    },
+  });
 }
 
-function findToolCallLine(
+function findToolCallLineIndex(
   projection: ConsoleProjection,
   id: string,
-): ConsoleLine | undefined {
-  return [...projection.lines].reverse().find((item) =>
-    item.toolCall?.id === id
-  );
+): number {
+  for (let index = projection.lines.length - 1; index >= 0; index -= 1) {
+    if (projection.lines[index].toolCall?.id === id) {
+      return index;
+    }
+  }
+  return -1;
 }
 
 function toolLine(eventId: string, toolCall: ToolCallView): ConsoleLine {
-  const item: ConsoleLine = {
+  return refreshedToolLine({
     id: `tool-call-${toolCall.id}`,
     kind: "tool",
     title: `Call · ${toolCall.name}`,
@@ -449,24 +524,25 @@ function toolLine(eventId: string, toolCall: ToolCallView): ConsoleLine {
     streaming: true,
     error: false,
     toolCall,
-  };
-  refreshToolLine(item);
-  return item;
+  });
 }
 
-function refreshToolLine(item: ConsoleLine): void {
+function refreshedToolLine(item: ConsoleLine): ConsoleLine {
   const toolCall = item.toolCall;
   if (!toolCall) {
-    return;
+    return item;
   }
-  item.title = item.title.startsWith("Call · Tool result")
-    ? item.title
-    : `Call · ${toolCall.name}`;
-  item.body = renderToolCall(toolCall);
-  item.detail = toolCallDetail(toolCall);
-  item.diff = toolCall.name === "Edit" ? editDiff(toolCall) : undefined;
-  item.streaming = !["done", "error"].includes(toolCall.state);
-  item.error = toolCall.state === "error";
+  return {
+    ...item,
+    title: item.title.startsWith("Call · Tool result")
+      ? item.title
+      : `Call · ${toolCall.name}`,
+    body: renderToolCall(toolCall),
+    detail: toolCallDetail(toolCall),
+    diff: toolCall.name === "Edit" ? editDiff(toolCall) : undefined,
+    streaming: !["done", "error"].includes(toolCall.state),
+    error: toolCall.state === "error",
+  };
 }
 
 function renderToolCall(toolCall: ToolCallView): string {
@@ -478,8 +554,9 @@ function renderToolCall(toolCall: ToolCallView): string {
     case "Edit":
       return renderEditTool(toolCall);
     case "Glob":
-    case "Grep":
       return renderSearchTool(toolCall);
+    case "Grep":
+      return renderGrepTool(toolCall);
     case "Bash":
       return renderBashTool(toolCall);
     default:
@@ -665,11 +742,38 @@ function lcsTable(oldLines: string[], newLines: string[]): number[][] {
 function renderSearchTool(toolCall: ToolCallView): string {
   const summary = toolCall.summary?.trim();
   return compactLines([
-    `${toolCall.name} — ${
-      summary ? firstLine(summary) : stateSuffix(toolCall.state)
-    }`,
+    `${toolCall.name} — ${toolHeaderSuffix(toolCall, summary)}`,
     resultText(toolCall),
   ]);
+}
+
+function renderGrepTool(toolCall: ToolCallView): string {
+  const summary = toolCall.summary?.trim();
+  return compactLines([
+    `Grep — ${toolHeaderSuffix(toolCall, summary)}`,
+    grepQueryText(toolCall),
+    cappedResultSection(resultText(toolCall), 5),
+  ]);
+}
+
+function toolHeaderSuffix(
+  toolCall: ToolCallView,
+  summary?: string,
+): string {
+  if (toolCall.state === "error") {
+    return "Failed";
+  }
+  return summary ? firstLine(summary) : stateSuffix(toolCall.state);
+}
+
+function grepQueryText(toolCall: ToolCallView): string | undefined {
+  const args = parsedArgs(toolCall);
+  const pattern = stringField(args, "pattern");
+  if (pattern) {
+    return `query: ${pattern}`;
+  }
+  const renderedArgs = argsText(toolCall);
+  return renderedArgs ? `query:\n${renderedArgs}` : undefined;
 }
 
 function renderBashTool(toolCall: ToolCallView): string {
@@ -678,15 +782,15 @@ function renderBashTool(toolCall: ToolCallView): string {
   return compactLines([
     `Bash — ${stateSuffix(toolCall.state)}`,
     command ? `$ ${command}` : argsText(toolCall),
-    resultText(toolCall),
+    cappedDisplaySection(resultText(toolCall), 10),
   ]);
 }
 
 function renderDefaultTool(toolCall: ToolCallView): string {
   return compactLines([
     `${toolCall.name} — ${stateSuffix(toolCall.state)}`,
-    argsText(toolCall),
-    resultText(toolCall),
+    cappedDisplaySection(argsText(toolCall), 3),
+    cappedDisplaySection(resultText(toolCall), 3),
   ]);
 }
 
@@ -752,6 +856,42 @@ function cappedSection(
     shown.push(`… +${lines.length - cap} more lines`);
   }
   return shown.join("\n");
+}
+
+function cappedDisplaySection(
+  value: string | undefined,
+  maxLines: number,
+): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const lines = value.split(/\r?\n/);
+  if (lines.length <= maxLines) {
+    return value;
+  }
+  if (maxLines <= 0) {
+    return undefined;
+  }
+  const shown = lines.slice(0, maxLines);
+  shown[maxLines - 1] = `… +${lines.length - maxLines + 1} more lines`;
+  return shown.join("\n");
+}
+
+function cappedResultSection(
+  value: string | undefined,
+  maxResults: number,
+): string | undefined {
+  if (!value || maxResults <= 0) {
+    return undefined;
+  }
+  const lines = value.split(/\r?\n/).filter((line) => line.length > 0);
+  if (lines.length <= maxResults) {
+    return lines.join("\n");
+  }
+  return [
+    ...lines.slice(0, maxResults),
+    `… +${lines.length - maxResults} more results`,
+  ].join("\n");
 }
 
 function usageText(
