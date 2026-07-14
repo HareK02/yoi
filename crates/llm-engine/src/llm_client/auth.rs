@@ -40,12 +40,4 @@ pub enum AuthRequirement {
 pub trait AuthProvider: Send + Sync + std::fmt::Debug {
     /// 1 リクエスト分の認証ヘッダを返す。refresh が必要なら内部で行う。
     async fn headers(&self) -> Result<Vec<(HeaderName, HeaderValue)>, ClientError>;
-
-    /// Conversation header / request compression が必要な backend profile かどうか。
-    ///
-    /// transport は呼び出し側の具象型を知らないため、この hook だけで
-    /// 追加の wire behavior を切り替える。
-    fn is_codex_backend(&self) -> bool {
-        false
-    }
 }

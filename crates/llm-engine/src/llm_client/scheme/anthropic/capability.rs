@@ -1,7 +1,7 @@
 //! Anthropic scheme の wire-level 既定 capability。
 //!
-//! モデル ID 固有のテーブル(`claude-*` など)は高レベル構築層
-//! (`provider::capability`)の責務。ここでは未知モデルでも「この wire で
+//! モデル ID 固有のテーブル(`claude-*` など)は client construction layer
+//! の責務。ここでは未知モデルでも「この wire で
 //! 安全に送れる最小共通項」を返すだけに留める。
 
 use crate::llm_client::capability::{

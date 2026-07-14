@@ -4,11 +4,11 @@
 //!
 //! 設計:
 //!
-//! - llm-engine は [`AuthProvider`] trait しか知らず、実体である
-//!   [`CodexAuthProvider`] はこのクレートに置く（feedback_llm_engine_scope）
+//! - HTTP transport は [`AuthProvider`] trait だけを見て、実体である
+//!   [`CodexAuthProvider`] はこの optional module に置く
 //! - access_token JWT の `exp` を読み、`now` 以下で proactive refresh
 //!   （Codex CLI と同じバッファなし）
-//! - 並行する Codex CLI / 別 yoi の refresh と取り違えないよう、
+//! - 並行する Codex CLI / 別プロセスの refresh と取り違えないよう、
 //!   refresh 直前に再 load して account_id 一致を確認（guarded reload）
 //! - ファイルロックは取らず、書込前に再 load + diff merge で吸収
 //! - Codex の Keyring storage は対象外。auth.json 不在ならエラーで案内
@@ -21,9 +21,9 @@ mod refresh;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::llm_client::{ClientError, auth::AuthProvider};
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use llm_engine::llm_client::{ClientError, auth::AuthProvider};
 use reqwest::header::{HeaderName, HeaderValue};
 use tokio::sync::Mutex;
 
@@ -152,7 +152,7 @@ impl CodexAuthProvider {
             .map_err(|e| CodexAuthError::InvalidHeader(format!("ChatGPT-Account-Id: {e}")))?;
         out.push((HeaderName::from_static("chatgpt-account-id"), acc_val));
 
-        // Cloudflare WAF は ChatGPT backend アクセス元を `originator` /
+        // Cloudflare WAF は互換 backend アクセス元を `originator` /
         // `User-Agent` で識別する。Codex CLI が送る固定値を流用しないと
         // HTML challenge (403) を返されて SSE に到達できない。
         out.push((
@@ -187,10 +187,6 @@ impl AuthProvider for CodexAuthProvider {
             .await
             .map_err(CodexAuthError::to_client_error)?;
         Self::build_headers(&snap).map_err(CodexAuthError::to_client_error)
-    }
-
-    fn is_codex_backend(&self) -> bool {
-        true
     }
 }
 

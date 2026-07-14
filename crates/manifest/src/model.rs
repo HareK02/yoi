@@ -5,7 +5,7 @@
 //! 直書き）の両方を受け入れるため、すべてのフィールドを `Option` として
 //! 持つ 1 つの型 [`ModelManifest`] に統合している。実解決（ref をプロバイダ
 //! カタログ / モデルカタログから引いて `scheme` や `model_id` を埋める）
-//! は `crates/provider` の責務で、本モジュールはデータ表現のみを提供する。
+//! は [`crate::model_catalog`] の責務で、本モジュールはデータ表現のみを提供する。
 //!
 //! 同じ型を partial（カスケード層）と完成形（最終マニフェスト）の両方で
 //! 使うことで、merge と最終変換の重複を避ける。
@@ -24,7 +24,7 @@ pub use llm_engine::llm_client::capability::{ModelCapability, ReasoningControl, 
 /// - ref + 一部 override: ref で基底を引き、`auth` 等だけ書き換え
 /// - 完全 inline: `ref` を省略して `scheme` / `model_id` / `auth` を直書き
 ///
-/// どの形が有効かの判定は `provider::resolve_model_manifest` が担う。
+/// どの形が有効かの判定は [`crate::model_catalog::resolve_model_manifest`] が担う。
 /// 本クレートは「どこから取るか」を表現するだけで、未設定かどうかを
 /// 理由にした hard error は出さない。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -98,7 +98,7 @@ pub enum SchemeKind {
 /// 認証の参照。
 ///
 /// 実際のトークン値の解決（local secret store / file 読取、OAuth refresh 等）は
-/// `crates/provider` で行う。ここはあくまで「どこから取るか」の宣言。
+/// worker-side factory で行う。ここはあくまで「どこから取るか」の宣言。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuthRef {
@@ -113,7 +113,7 @@ pub enum AuthRef {
         #[serde(default)]
         file: Option<PathBuf>,
     },
-    /// ChatGPT OAuth（`~/.codex/auth.json`）。実装は `llm-auth-codex-oauth` チケット
+    /// ChatGPT OAuth（`~/.codex/auth.json`）。
     #[serde(rename = "codex_oauth")]
     CodexOAuth,
     /// Typed local secret-store reference. The profile resolver preserves this

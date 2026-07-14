@@ -65,7 +65,7 @@ impl Scheme for OpenAIResponsesScheme {
         if !self.send_max_output_tokens && config.max_tokens.is_some() {
             warnings.push(ConfigWarning::unsupported(
                 "max_tokens",
-                "OpenAI Responses (ChatGPT backend)",
+                "OpenAI Responses compatible backend",
             ));
         }
         // Same for `temperature` / `top_p` on compatible backends that
@@ -74,13 +74,13 @@ impl Scheme for OpenAIResponsesScheme {
             if config.temperature.is_some() {
                 warnings.push(ConfigWarning::unsupported(
                     "temperature",
-                    "OpenAI Responses (ChatGPT backend)",
+                    "OpenAI Responses compatible backend",
                 ));
             }
             if config.top_p.is_some() {
                 warnings.push(ConfigWarning::unsupported(
                     "top_p",
-                    "OpenAI Responses (ChatGPT backend)",
+                    "OpenAI Responses compatible backend",
                 ));
             }
         }

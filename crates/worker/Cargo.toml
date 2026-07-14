@@ -11,12 +11,12 @@ default = []
 [dependencies]
 async-trait = { workspace = true }
 clap = { version = "4.6.0", features = ["derive"] }
-llm-engine = { workspace = true }
+llm-engine = { workspace = true, features = ["codex"] }
 session-store = { workspace = true }
+secrets = { workspace = true }
 manifest = { workspace = true }
 mcp = { workspace = true }
 protocol = { workspace = true }
-provider = { workspace = true }
 client = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -46,6 +46,7 @@ futures-util = { version = "0.3", features = ["sink"] }
 [dev-dependencies]
 dotenv = "0.15.0"
 futures = { workspace = true }
+serial_test = "3.4.0"
 tempfile = { workspace = true }
 wat = "1.241.2"
 yoi-plugin-pdk = { workspace = true }

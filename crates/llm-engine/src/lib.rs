@@ -45,6 +45,7 @@ pub(crate) mod callback;
 pub mod event;
 pub mod interceptor;
 pub mod llm_client;
+pub mod providers;
 pub mod prune;
 pub mod state;
 pub mod timeline;
