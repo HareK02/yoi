@@ -41,7 +41,11 @@
   }
 </script>
 
-<li class={`console-line ${lineClass(item)} ${toolClass(item)}`} class:error-line={item.error}>
+<li
+  class={`console-line ${lineClass(item)} ${toolClass(item)}`}
+  class:error-line={item.error}
+  data-console-line-id={item.id}
+>
   {#if shouldRenderHeading(item)}
     <div class="message-heading">
       <span>{item.title}</span>
@@ -79,3 +83,200 @@
     </details>
   {/if}
 </li>
+
+<style>
+  .console-line {
+    min-width: 0;
+    padding: 0.2rem 0;
+    background: transparent;
+  }
+
+  .console-line.error-line {
+    color: var(--danger);
+  }
+
+  .console-line.user {
+    color: var(--tui-green);
+  }
+
+  .console-line.assistant {
+    color: var(--text-strong);
+  }
+
+  .console-line.thinking .message-heading {
+    color: var(--tui-magenta);
+    font-style: italic;
+  }
+
+  .console-line.thinking .console-plain-text {
+    color: var(--tui-dark-gray);
+    font-style: italic;
+  }
+
+  .console-plain-text {
+    margin: 0.45rem 0;
+    color: inherit;
+    line-height: 1.55;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+  }
+
+  .console-plain-text:first-child {
+    margin-top: 0;
+  }
+
+  .console-plain-text:last-child {
+    margin-bottom: 0;
+  }
+
+  .console-line.tool-bash .console-plain-text {
+    display: block;
+    max-width: 100%;
+    min-width: 0;
+    font-family: var(--font-mono);
+    overflow-x: auto;
+    white-space: pre;
+  }
+
+  .console-line.tool .console-plain-text {
+    color: var(--tui-gray);
+  }
+
+  .tool-summary {
+    display: flex;
+    align-items: baseline;
+    gap: 0;
+    color: var(--text-muted);
+    font-size: 0.88rem;
+    font-weight: 750;
+  }
+
+  .tool-summary small {
+    margin-left: var(--space-2);
+    color: var(--text-muted);
+    font-size: 0.74rem;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+
+  .tool-label {
+    flex: 0 0 auto;
+    color: var(--tui-cyan);
+    white-space: nowrap;
+  }
+
+  .tool-separator {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
+  .tool-suffix {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .tool-separator,
+  .tool-suffix {
+    color: var(--tui-dark-gray);
+  }
+
+  .tool-state-error .tool-suffix {
+    color: var(--tui-red);
+  }
+
+  .tool-state-running .tool-suffix,
+  .tool-state-streaming_args .tool-suffix,
+  .tool-state-pending .tool-suffix {
+    color: var(--tui-yellow);
+  }
+
+  .tool-state-done .tool-suffix {
+    color: var(--tui-dark-gray);
+  }
+
+  .message-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    color: var(--text-muted);
+    font-size: 0.78rem;
+    font-weight: 750;
+  }
+
+  .message-heading.streaming-heading {
+    justify-content: flex-start;
+  }
+
+  .message-heading small {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 0.74rem;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+
+  .console-diff {
+    background: color-mix(in oklch, var(--bg-raised) 85%, black);
+    border: 1px solid var(--line);
+    border-radius: 0.65rem;
+    color: var(--text);
+    font-size: 0.78rem;
+    line-height: 1.45;
+    margin: 0.6rem 0 0;
+    overflow-x: auto;
+    padding: 0.45rem 0;
+  }
+
+  .diff-line {
+    display: grid;
+    grid-template-columns: 3.2rem 3.2rem 1.4rem minmax(0, 1fr);
+    min-width: max-content;
+  }
+
+  .diff-line.add {
+    background: color-mix(in oklch, var(--tui-green) 18%, transparent);
+    color: color-mix(in oklch, var(--tui-green) 75%, white);
+  }
+
+  .diff-line.remove {
+    background: color-mix(in oklch, var(--tui-red) 18%, transparent);
+    color: color-mix(in oklch, var(--tui-red) 72%, white);
+  }
+
+  .diff-line.context {
+    color: var(--text-muted);
+  }
+
+  .diff-gutter,
+  .diff-marker {
+    color: var(--tui-gray);
+    padding: 0 0.5rem;
+    text-align: right;
+    user-select: none;
+  }
+
+  .diff-content {
+    padding-right: 0.75rem;
+    white-space: pre;
+  }
+
+  :global(.console-line pre) {
+    max-width: 100%;
+    margin: 0;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    color: var(--code);
+  }
+
+  .message-detail {
+    color: var(--text-muted);
+    font-size: 0.84rem;
+  }
+
+  .message-detail summary {
+    cursor: pointer;
+    font-weight: 800;
+  }
+</style>

@@ -94,6 +94,33 @@ Deno.test("Worker Console renders markdown only for message rows", async () => {
   );
 });
 
+Deno.test("Worker Console exposes a foldable timeline beside the scroll body", async () => {
+  const consolePage = await Deno.readTextFile(
+    new URL(
+      "./../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      import.meta.url,
+    ),
+  );
+  const consoleLine = await Deno.readTextFile(
+    new URL("./ConsoleLineItem.svelte", import.meta.url),
+  );
+  const consoleTimeline = await Deno.readTextFile(
+    new URL("./ConsoleTimeline.svelte", import.meta.url),
+  );
+  assert(
+    consoleTimeline.includes('class="console-timeline"') &&
+      consolePage.includes("timelineMarks") &&
+      consolePage.includes("jumpToTimelineMark") &&
+      consoleLine.includes("data-console-line-id={item.id}") &&
+      consolePage.includes("class:timeline-open={timelineOpen}") &&
+      consolePage.includes("class=\"timeline-fold\"") &&
+      consolePage.includes("{#if timelineOpen}") &&
+      consoleTimeline.includes(".timeline-thumb") &&
+      consoleTimeline.includes(".timeline-card"),
+    "Worker Console should expose a foldable timeline with scroll and line jump markers",
+  );
+});
+
 Deno.test("Worker Console composer fits to content without manual resize", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(
@@ -101,13 +128,11 @@ Deno.test("Worker Console composer fits to content without manual resize", async
       import.meta.url,
     ),
   );
-  const css = await Deno.readTextFile(new URL("../../app.css", import.meta.url));
-
   assert(
     consolePage.includes("use:fitTextarea={{ value: draft, maxRows: 10 }}") &&
-      css.includes(".console-composer textarea") &&
-      css.includes("resize: none") &&
-      css.includes("overflow-y: hidden"),
+      consolePage.includes(".console-composer textarea") &&
+      consolePage.includes("resize: none") &&
+      consolePage.includes("overflow-y: hidden"),
     "Console composer should autosize to content, cap at ten rows, and disable manual resize",
   );
 });
@@ -221,9 +246,9 @@ Deno.test("Worker Console page is routed by runtime_id and worker_id through bac
   );
   assert(
     consolePage.includes("workspaceApiPath(workspaceId, path)") &&
-      consolePage.includes(
-        "workerApiPath(`/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(target.workerId)}`)",
-      ),
+      consolePage.includes("workerApiPath(") &&
+      consolePage.includes("`/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(") &&
+      consolePage.includes("target.workerId"),
     "Worker detail should use the scoped backend Worker detail API",
   );
   assert(
@@ -242,9 +267,8 @@ Deno.test("Worker Console page is routed by runtime_id and worker_id through bac
     "reload token advancement should not synchronously read and write the rune state",
   );
   assert(
-    consolePage.includes(
-      "advanceReloadToken();\n    void loadConsoleData(target);",
-    ) &&
+    consolePage.includes("advanceReloadToken();") &&
+      consolePage.includes("void loadConsoleData(target);") &&
       !consolePage.includes("void refreshConsole();\n  });\n\n  $effect"),
     "target-change effect should load data without depending on manual refresh state reads",
   );

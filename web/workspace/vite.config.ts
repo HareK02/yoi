@@ -1,10 +1,14 @@
+import tailwindcss from '@tailwindcss/vite';
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
 
 export default defineConfig({
-	plugins: [sveltekit()],
+	plugins: [tailwindcss(), sveltekit()],
+
 	server: {
 		allowedHosts: ['develop.hareworks.net'],
+		watch: { ignored: ['**/.tmp*', '**/.tmp*/**'] },
+
 		proxy: {
 			'/api': {
 				target: 'http://127.0.0.1:8787',

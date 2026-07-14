@@ -94,7 +94,11 @@ export function workerConsolePath(
   );
 }
 
-export type ConsoleEventInput = { eventId: string; event: ProtocolEvent };
+export type ConsoleEventInput = {
+  eventId: string;
+  event: ProtocolEvent;
+  observedAtMs?: number;
+};
 
 export function emptyConsoleProjection(): ConsoleProjection {
   return {
