@@ -833,7 +833,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     ///
     /// Default `true`: normal Workers may expose each resident section according
     /// to its own gate and manifest settings. Internal disposable workers set
-    /// this to `false` so summary, Knowledge, and Workflow residency are all
+    /// this to `false` so summary and Knowledge residency are both
     /// suppressed while explicit tools remain available.
     pub fn set_resident_injection(&mut self, enabled: bool) {
         self.inject_resident_summary = enabled;

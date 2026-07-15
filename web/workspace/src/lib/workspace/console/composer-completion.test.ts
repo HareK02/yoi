@@ -32,7 +32,7 @@ Deno.test("completionTokenAt detects TUI-style sigils before the cursor", () => 
   });
   assertEquals(completionTokenAt(":comp", 5)?.kind, "command");
   assertEquals(completionTokenAt("ask #mem", 8)?.kind, "knowledge");
-  assertEquals(completionTokenAt("run /work", 9)?.kind, "workflow");
+  assertEquals(completionTokenAt("run /work", 9), null);
 });
 
 Deno.test("applyCompletion replaces the active token and advances the cursor", () => {
@@ -50,5 +50,7 @@ Deno.test("applyCompletion replaces the active token and advances the cursor", (
 });
 
 Deno.test("localCommandCompletions filters colon commands", () => {
-  assertEquals(localCommandCompletions("com").map((entry) => entry.value), ["compact"]);
+  assertEquals(localCommandCompletions("com").map((entry) => entry.value), [
+    "compact",
+  ]);
 });

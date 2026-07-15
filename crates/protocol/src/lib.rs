@@ -70,9 +70,7 @@ pub enum Method {
     ///
     /// Reply is sent on the same socket as `Event::Completions` (not
     /// broadcast). The IPC server handles this directly and writes
-    /// the response straight back to the requesting socket. Empty
-    /// results for resolvers that are not yet wired up
-    /// (Knowledge / Workflow).
+    /// the response straight back to the requesting socket.
     ListCompletions {
         kind: CompletionKind,
         prefix: String,
@@ -601,11 +599,7 @@ pub enum AlertSource {
 
 /// Kind of completion requested by `Method::ListCompletions`.
 ///
-/// Mirrors the TUI prefix sigils: `@` → `File`, `#` → `Knowledge`,
-/// `/` → `Workflow`. Knowledge and Workflow resolvers are currently
-/// stubs (always reply with empty `entries`); the wire shape is
-/// nailed down here so the TUI side can ship without waiting for
-/// the memory / workflow tickets.
+/// Mirrors the completion prefix sigils: `@` → `File`, `#` → `Knowledge`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -616,7 +610,7 @@ pub enum CompletionKind {
 
 /// One candidate returned in `Event::Completions::entries`.
 ///
-/// `value` is a path (file kind) or a slug (knowledge / workflow).
+/// `value` is a path (file kind) or a Knowledge slug.
 /// `is_dir` is meaningful only for the file kind — it lets the TUI
 /// keep a trailing `/` after a directory selection so the user can
 /// drill in without re-typing the prefix.

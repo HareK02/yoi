@@ -607,8 +607,7 @@ impl App {
     /// suggestion" — partial typing like `@README.` followed by
     /// Enter should chip when the popup is on `README.md`.
     ///
-    /// Files (and Knowledge / Workflow entries, which have no dir
-    /// concept) chipify here. Directory file entries return `false`
+    /// Files and Knowledge entries chipify here. Directory file entries return `false`
     /// so the caller can fall through to `apply_completion_text`
     /// for drill-in — chip-ifying a directory on Enter would strand
     /// the user with no way to inspect children.

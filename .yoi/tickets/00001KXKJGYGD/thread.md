@@ -183,3 +183,30 @@ Validation:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-15T21:22:40Z -->
+
+## Implementation report
+
+Follow-up fix for focused re-review blocker.
+
+Summary:
+- Removed `/` as a web console completion sigil; composer completions now only recognize commands, file refs, and Knowledge refs.
+- Removed `workflow` from the web console completion result type and route-side completion response typing.
+- Updated web completion tests so slash text remains plain text/no completion token.
+- Removed stale Workflow completion/resolver wording from protocol and nearby comments.
+- Did not add hidden Workflow compatibility or broad Skills replacement.
+
+Validation:
+- rg "ActiveWorkflow|active_workflow|Active workflow" -> no matches (exit 1)
+- focused completion-surface rg for workflow_invoke / workflow completion kind / slash Workflow resolver wording / resources/workflows / .yoi/workflow / Resident workflows -> no matches (exit 1)
+- focused web/protocol rg "kind.*workflow" -> no matches (exit 1); remaining project-wide "kind: workflow" mentions are only legacy persisted SystemItem ignore tests from the bounded compatibility path.
+- git diff --check -> exit 0
+- cd web/workspace && deno task check && deno task test -> exit 0
+- cargo test -p yoi --tests -> exit 0
+- cargo check -p yoi -> exit 0
+- yoi ticket doctor -> exit 0
+- nix build .#yoi --no-link -> exit 0
+
+
+---

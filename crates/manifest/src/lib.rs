@@ -83,8 +83,8 @@ pub struct WorkerManifest {
     /// `[feature.web].enabled = true`.
     #[serde(default)]
     pub web: Option<WebConfig>,
-    /// External Agent Skills (`SKILL.md`) directories to ingest as
-    /// Workflows. Each entry is a path to a skills *root* (i.e. a
+    /// External Agent Skills (`SKILL.md`) candidate directories. Each entry
+    /// is a path to a skills *root* (i.e. a
     /// directory whose children are individual `<name>/SKILL.md` skill
     /// bundles). Paths are resolved against the manifest's base
     /// directory like other path fields. Absent ⇒ no skills loaded;
