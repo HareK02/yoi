@@ -1,9 +1,11 @@
 ---
 title: 'Remove Knowledge support'
-state: 'ready'
+state: 'queued'
 created_at: '2026-07-15T20:04:08Z'
-updated_at: '2026-07-15T20:04:47Z'
+updated_at: '2026-07-15T20:27:02Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-07-15T20:27:02Z'
 ---
 
 ## 背景
