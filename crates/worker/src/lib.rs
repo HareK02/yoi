@@ -13,6 +13,7 @@ pub mod runtime;
 pub mod segment_log_sink;
 pub mod shared_state;
 mod shutdown_after_idle;
+pub mod skill;
 pub mod spawn;
 
 mod interrupt_prep;

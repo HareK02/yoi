@@ -56,6 +56,7 @@ use crate::repositories::{
     RepositoryRegistryReader, RepositorySummary,
 };
 use crate::resource_broker::BackendResourceBroker;
+use crate::skills;
 use crate::store::{
     ControlPlaneStore, WorkdirRegistryRecord, WorkerRegistryRecord, WorkerWorkdirLinkRecord,
     WorkspaceRecord,
@@ -330,6 +331,13 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             post(scoped_ticket_backend_operation),
         )
         .route("/api/tickets/{id}", get(get_ticket))
+        .route("/api/w/{workspace_id}/skills", get(scoped_list_skills))
+        .route("/api/w/{workspace_id}/skills/lint", get(scoped_lint_skills))
+        .route("/api/w/{workspace_id}/skills/{name}", get(scoped_get_skill))
+        .route(
+            "/api/w/{workspace_id}/skills/{name}/activate",
+            get(scoped_activate_skill),
+        )
         .route("/api/w/{workspace_id}/tickets/{id}", get(scoped_get_ticket))
         .route("/api/objectives", get(list_objectives))
         .route(
@@ -996,6 +1004,12 @@ struct ScopedRecordPath {
 }
 
 #[derive(Debug, Deserialize)]
+struct ScopedSkillPath {
+    workspace_id: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ScopedRepositoryPath {
     workspace_id: String,
     repository_id: String,
@@ -1259,6 +1273,60 @@ async fn scoped_ticket_backend_operation(
         },
     };
     Ok(Json(response))
+}
+
+async fn scoped_list_skills(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<worker::skill::SkillCatalogResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    Ok(Json(skills::catalog(&api.config.workspace_root)))
+}
+
+async fn scoped_lint_skills(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<worker::skill::SkillCatalogResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    Ok(Json(skills::lint(&api.config.workspace_root)))
+}
+
+async fn scoped_get_skill(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedSkillPath>,
+) -> ApiResult<Json<worker::skill::SkillDetailResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    skills::detail(&api.config.workspace_root, &path.name)
+        .map(Json)
+        .map_err(skill_api_error)
+}
+
+async fn scoped_activate_skill(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedSkillPath>,
+) -> ApiResult<Json<worker::skill::SkillActivationResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    skills::activation(&api.config.workspace_root, &path.name)
+        .map(Json)
+        .map_err(skill_api_error)
+}
+
+fn skill_api_error(error: skills::SkillError) -> ApiError {
+    match error {
+        skills::SkillError::NotFound(name) => ApiError::with_diagnostics(
+            Error::RuntimeOperationFailed {
+                runtime_id: "workspace".to_string(),
+                code: "skill_not_found".to_string(),
+                message: format!("unknown Skill `{name}`"),
+            },
+            vec![RuntimeDiagnostic {
+                code: "skill_not_found".to_string(),
+                severity: DiagnosticSeverity::Error,
+                message: format!("unknown Skill `{name}`"),
+            }],
+        ),
+        skills::SkillError::Io(error) => ApiError::from(Error::Io(error)),
+    }
 }
 
 async fn scoped_list_objectives(
@@ -5096,7 +5164,9 @@ impl IntoResponse for ApiError {
             | Error::UnknownWorker { .. }
             | Error::UnknownRepository(_)
             | Error::WorkspaceIdMismatch => StatusCode::NOT_FOUND,
-            Error::Ticket(_) => StatusCode::NOT_FOUND,
+            Error::RuntimeOperationFailed { code, .. } if code == "skill_not_found" => {
+                StatusCode::NOT_FOUND
+            }
             Error::RuntimeCapabilityUnsupported { .. } => StatusCode::NOT_IMPLEMENTED,
             Error::RuntimeOperationFailed { code, .. } if code == "repository_not_configured" => {
                 StatusCode::NOT_FOUND
@@ -5844,6 +5914,51 @@ mod tests {
                 .join("item.md")
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn skills_endpoints_use_workspace_backend_catalog_and_progressive_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".yoi/skills/triage-errors");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: triage-errors\ndescription: Use when triaging backend errors and choosing safe diagnostics.\n---\n\n# Triage Errors\n\nInspect logs before changing code.",
+        )
+        .unwrap();
+        let api = test_api(dir.path()).await;
+
+        let Json(catalog) = scoped_list_skills(
+            State(api.clone()),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("skill catalog failed: {}", error.error));
+        let entry = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.name == "triage-errors")
+            .expect("workspace Skill catalog entry");
+        assert_eq!(entry.provenance.id, "workspace:triage-errors");
+        assert!(
+            !serde_json::to_string(&catalog)
+                .unwrap()
+                .contains("# Triage Errors")
+        );
+
+        let Json(detail) = scoped_get_skill(
+            State(api),
+            AxumPath(ScopedSkillPath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                name: "triage-errors".to_string(),
+            }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("skill detail failed: {}", error.error));
+        assert!(detail.body.contains("# Triage Errors"));
+        assert_eq!(detail.provenance.id, "workspace:triage-errors");
     }
 
     async fn test_api(workspace_root: impl Into<PathBuf>) -> WorkspaceApi {

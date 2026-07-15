@@ -49,6 +49,7 @@ use crate::prompt::loader::PromptLoader;
 use crate::prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 use crate::runtime::dir;
 use crate::runtime::worker_allocation::{self, ScopeAllocationGuard, ScopeLockError};
+use crate::skill::{SkillActivationResponse, SkillClientError};
 #[cfg(test)]
 use async_trait::async_trait;
 use protocol::{
@@ -894,6 +895,31 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// This never grants local filesystem authority.
     pub fn workspace_client(&self) -> &WorkspaceClient {
         self.workspace_context.client()
+    }
+
+    /// Activate an Agent Skill through the Workspace backend/client and commit
+    /// the returned SKILL.md body to history before it can influence an LLM run.
+    ///
+    /// This deliberately does not scan `.yoi/skills` locally: when a Workspace
+    /// HTTP client is available, catalog/detail/activation authority belongs to
+    /// the Workspace backend API.
+    pub fn activate_skill(&mut self, name: &str) -> Result<SkillActivationResponse, WorkerError> {
+        let activation = self.workspace_client().activate_skill(name)?;
+        self.ensure_segment_head()?;
+        let body = format!(
+            "Agent Skill `{}` activated from {}.\n\n{}",
+            activation.name, activation.provenance.id, activation.body
+        );
+        self.commit_entry(LogEntry::SystemItem {
+            ts: segment_log::now_millis(),
+            item: SystemItem::SkillActivation {
+                name: activation.name.clone(),
+                body: body.clone(),
+            },
+        })?;
+        self.engine_mut()
+            .append_history(std::iter::once(llm_engine::Item::system_message(body)));
+        Ok(activation)
     }
 
     pub(crate) fn worker_metadata_store(&self) -> St
@@ -4788,6 +4814,9 @@ pub enum WorkerError {
 
     #[error(transparent)]
     PromptCatalog(#[from] CatalogError),
+
+    #[error(transparent)]
+    Skill(#[from] SkillClientError),
 
     #[error("memory extract staging write failed: {0}")]
     ExtractStaging(#[source] memory::extract::StagingError),
