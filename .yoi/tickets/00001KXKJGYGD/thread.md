@@ -302,3 +302,28 @@ Next action:
 - Request focused re-review of the remaining workflow completion blocker and overall acceptance before merge/close decisions。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-15T21:25:42Z status: request_changes -->
+
+## Review: request changes
+
+Focused re-review result: request_changes
+
+Evidence:
+- Slash workflow completion blocker appears fixed。
+- Focused greps for `workflow_invoke`, workflow completion/resolver wording, `kind.*workflow`, `resources/workflows`, `.yoi/workflow`, `workflow invocation`, and `Resident workflows` in protocol/web/resources/docs were clean。
+- Web console completion no longer exposes workflow invocation。
+- ActiveWorkflow/resource greps remain clean。
+- Reviewer did not see broad new Skills support beyond existing manifest/config docs。
+
+Remaining blocker:
+- A stale TUI unit test still uses a legacy `"kind": "workflow"` SystemItem as an active task-store snapshot carrier and now fails because workflow SystemItems are ignored。
+- Location: `crates/tui/src/app.rs:3568-3600`, including comment at `3587-3588`, JSON kind at `3591`。
+- Failing command: `cargo test -p tui --lib live_system_snapshot_replaces_task_store -- --nocapture`。
+- Failure at `crates/tui/src/app.rs:3599` (`left: 1`, `right: 4`)。
+- This leaves relevant tests failing and contradicts bounded legacy workflow behavior / test cleanup expectation。
+
+Required fix:
+- Update the test fixture to use a non-legacy active SystemItem kind or otherwise align it with workflow ignore semantics。
+
+---
