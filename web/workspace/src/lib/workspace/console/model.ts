@@ -319,8 +319,6 @@ export function segmentsToText(segments: Segment[]): string {
           return `@file ${segment.path}`;
         case "knowledge_ref":
           return `@knowledge ${segment.slug}`;
-        case "workflow_invoke":
-          return `/${segment.slug}`;
         case "unknown":
           return "[unknown segment]";
       }

@@ -152,3 +152,34 @@ Validation:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-15T21:04:19Z -->
+
+## Implementation report
+
+Follow-up fixes for external review blockers.
+
+Summary:
+- Removed stale web `workflow_invoke` protocol/model/composer/test behavior; slash-prefixed text now remains plain text in the web console composer.
+- Updated the generated TypeScript protocol surface to match the Rust protocol without WorkflowInvoke.
+- Removed remaining role workflow scaffold test expectation.
+- Replaced the stale TUI live workflow SystemItem rendering test with a legacy workflow SystemItem ignore-path test.
+- Removed stale docs/config wording that advertised loading Skills as Workflows.
+- Stabilized the Worker discovery restore-planning test by sharing the runtime-dir sandbox used by allocation tests, so the required full worker test command is not affected by global runtime-dir test races.
+
+Validation:
+- rg "ActiveWorkflow|active_workflow|Active workflow" -> no matches (exit 1)
+- rg "resources/workflows|\\.yoi/workflow|workflow invocation|Resident workflows|workflow_invoke" -> no matches (exit 1)
+- git diff --check -> exit 0
+- cargo test -p ticket --lib scaffold_config_includes_backend_and_all_fixed_roles -- --nocapture -> exit 0
+- cargo test -p tui --lib live_legacy_workflow_system_item_is_ignored -- --nocapture -> exit 0
+- cargo test -p session-store --lib --tests -> exit 0
+- cargo test -p worker --lib --tests -> exit 0
+- cargo test -p yoi --tests -> exit 0
+- cd web/workspace && deno task check && deno task test -> exit 0
+- cargo check -p yoi -> exit 0
+- yoi ticket doctor -> exit 0
+- nix build .#yoi --no-link -> exit 0
+
+
+---

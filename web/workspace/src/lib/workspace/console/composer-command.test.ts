@@ -24,8 +24,7 @@ Deno.test("parseSigilSegments converts TUI-style references", () => {
     { kind: "file_ref", path: "src/main.rs" },
     { kind: "text", content: " then " },
     { kind: "knowledge_ref", slug: "memory" },
-    { kind: "text", content: " and " },
-    { kind: "workflow_invoke", slug: "workflow" },
+    { kind: "text", content: " and /workflow" },
   ]);
 });
 

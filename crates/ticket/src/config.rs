@@ -1115,7 +1115,7 @@ launch_prompt = "$workspace/ticket/reviewer/launch"
         for role in TicketRole::ALL {
             assert!(scaffold.contains(&format!("[ticket.roles.{role}]")));
             assert!(scaffold.contains(&format!(
-                "[ticket.roles.{role}]\nprofile = \"{}\"\nworkflow = \"{}\"",
+                "[ticket.roles.{role}]\nprofile = \"{}\"",
                 role.default_profile()
             )));
         }

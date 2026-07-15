@@ -281,8 +281,8 @@ permission = "write"
 
 
 # ===== [skills] =============================================================
-# 外部 Agent Skills (`SKILL.md`) を Workflow として読み込むディレクトリ群。
-# セクション省略 = 何もロードしない (implicit な `$config_dir/skills/` 検索や
+# 外部 Agent Skills (`SKILL.md`) の候補ディレクトリ群。
+# セクション省略 = 何も使用しない (implicit な `$config_dir/skills/` 検索や
 # builtin probe は存在しない)。
 # [skills]
 #

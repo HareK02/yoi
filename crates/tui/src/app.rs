@@ -3324,7 +3324,7 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn live_system_item_workflow_appends_system_message_block() {
+    fn live_legacy_workflow_system_item_is_ignored() {
         let mut app = App::new("test".into());
         let item = serde_json::json!({
             "kind": "workflow",
@@ -3333,10 +3333,7 @@ mod completion_flow_tests {
         });
         app.handle_worker_event(Event::SystemItem { item });
 
-        assert!(matches!(
-            app.blocks.as_slice(),
-            [Block::SystemMessage { text }] if text == "[Workflow /build]\nRun the build"
-        ));
+        assert!(app.blocks.is_empty());
     }
 
     #[test]

@@ -1064,8 +1064,6 @@ fn discovery_error_to_tool_error(error: WorkerDiscoveryError) -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
     use manifest::{Permission, ScopeRule};
     use protocol::stream::JsonLineWriter;
     use protocol::{Alert, AlertLevel, AlertSource};
@@ -1077,6 +1075,7 @@ mod tests {
     use tokio::net::UnixListener;
 
     use crate::runtime::dir::RuntimeDir;
+    use crate::runtime::worker_allocation::test_util::RuntimeDirSandbox;
 
     #[derive(Clone)]
     struct FailTargetPeerStore {
@@ -1118,18 +1117,13 @@ mod tests {
         }
     }
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     #[tokio::test(flavor = "current_thread")]
     async fn state_backed_visibility_and_restore_planning() {
-        let _env = ENV_LOCK.lock().unwrap();
         let root = TempDir::new().unwrap();
         let store_dir = root.path().join("store");
         let runtime_base = root.path().join("runtime");
         std::fs::create_dir_all(&runtime_base).unwrap();
-        unsafe {
-            std::env::set_var("YOI_RUNTIME_DIR", &runtime_base);
-        }
+        let _runtime_sandbox = RuntimeDirSandbox::new(&runtime_base);
 
         let store = FsWorkerStore::new(&store_dir).unwrap();
         let session_id = new_session_id();
