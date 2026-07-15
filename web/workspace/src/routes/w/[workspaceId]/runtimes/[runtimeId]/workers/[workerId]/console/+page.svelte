@@ -46,7 +46,7 @@
     }
 
     type WorkerCompletionsResult = {
-        kind: "file" | "knowledge";
+        kind: "file";
         prefix: string;
         entries: ComposerCompletionEntry[];
         diagnostics: Diagnostic[];

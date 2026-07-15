@@ -7,7 +7,7 @@
 //! collection back to the LLM as `ToolError::InvalidArgument`.
 //!
 //! Reference-integrity checks (`replaced_by` / `requires` existence,
-//! cycle detection) walk the whole `memory/` and `knowledge/` trees
+//! cycle detection) walk the whole `memory/` tree
 //! each call. No caching; the trees are expected to be small.
 
 mod existing;
@@ -23,8 +23,7 @@ use serde::de::DeserializeOwned;
 
 use crate::error::{LintError, LintWarning};
 use crate::schema::{
-    DecisionFrontmatter, KnowledgeFrontmatter, RequestFrontmatter, SummaryFrontmatter,
-    split_frontmatter,
+    DecisionFrontmatter, RequestFrontmatter, SummaryFrontmatter, split_frontmatter,
 };
 use crate::workspace::{ClassifiedPath, RecordKind, WorkspaceLayout};
 
@@ -134,9 +133,6 @@ impl Linter {
             RecordKind::Request => {
                 self.check_request(content, &classified, &mut report);
             }
-            RecordKind::Knowledge => {
-                self.check_knowledge(content, &classified, &mut report);
-            }
             RecordKind::Summary => {
                 self.check_kind::<SummaryFrontmatter>(content, &classified, &mut report);
             }
@@ -206,30 +202,6 @@ impl Linter {
         }
 
         warnings::check_warnings_with_sources(parsed.body, fm.sources.len(), report);
-    }
-
-    fn check_knowledge(&self, content: &str, cp: &ClassifiedPath, report: &mut LintReport) {
-        let parsed = match parse_frontmatter::<KnowledgeFrontmatter>(content) {
-            Ok(p) => p,
-            Err(e) => {
-                report.push_error(e);
-                return;
-            }
-        };
-        let fm = parsed.frontmatter;
-        size::check_body::<KnowledgeFrontmatter>(parsed.body, report);
-
-        if fm.model_invokation
-            && fm.description.chars().count() > crate::schema::KNOWLEDGE_DESCRIPTION_HARD_CAP
-        {
-            report.push_error(LintError::DescriptionTooLong {
-                actual: fm.description.chars().count(),
-                limit: crate::schema::KNOWLEDGE_DESCRIPTION_HARD_CAP,
-            });
-        }
-
-        warnings::check_warnings_with_sources(parsed.body, fm.last_sources.len(), report);
-        let _ = cp;
     }
 }
 
@@ -355,37 +327,6 @@ mod tests {
             LintError::MissingField(_)
                 | LintError::Record(RecordLintError::MalformedFrontmatter(_))
         )));
-    }
-
-    #[test]
-    fn knowledge_long_description_with_model_invokation_errors() {
-        let (dir, linter) = workspace();
-        let path = dir.path().join(".yoi/knowledge/foo.md");
-        let big_desc = "x".repeat(2000);
-        let content = format!(
-            "---\ncreated_at: {now}\nupdated_at: {now}\nkind: rule\ndescription: {big_desc}\nmodel_invokation: true\nuser_invocable: true\nlast_sources: []\n---\nbody\n",
-            now = iso_now()
-        );
-        let report = linter.lint(&path, &content, WriteMode::Create);
-        assert!(
-            report
-                .errors
-                .iter()
-                .any(|e| matches!(e, LintError::DescriptionTooLong { .. }))
-        );
-    }
-
-    #[test]
-    fn knowledge_long_description_without_model_invokation_ok() {
-        let (dir, linter) = workspace();
-        let path = dir.path().join(".yoi/knowledge/foo.md");
-        let big_desc = "x".repeat(2000);
-        let content = format!(
-            "---\ncreated_at: {now}\nupdated_at: {now}\nkind: rule\ndescription: {big_desc}\nmodel_invokation: false\nuser_invocable: true\nlast_sources: []\n---\nbody\n",
-            now = iso_now()
-        );
-        let report = linter.lint(&path, &content, WriteMode::Create);
-        assert!(!report.has_errors(), "got errors: {:?}", report.errors);
     }
 
     #[test]

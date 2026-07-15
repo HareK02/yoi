@@ -22,7 +22,7 @@ use crate::Slug;
 use crate::workspace::{RecordKind, WorkspaceLayout};
 
 pub use edit::edit_tool;
-pub use query::{QueryConfig, knowledge_query_tool, memory_query_tool};
+pub use query::{QueryConfig, memory_query_tool};
 pub use read::{read_tool, read_tool_with_usage};
 pub use write::write_tool;
 
@@ -34,7 +34,6 @@ pub enum MemoryToolKind {
     Summary,
     Decision,
     Request,
-    Knowledge,
 }
 
 impl std::fmt::Display for MemoryToolKind {
@@ -43,7 +42,6 @@ impl std::fmt::Display for MemoryToolKind {
             Self::Summary => "summary",
             Self::Decision => "decision",
             Self::Request => "request",
-            Self::Knowledge => "knowledge",
         })
     }
 }
@@ -54,7 +52,6 @@ impl MemoryToolKind {
             Self::Summary => "summary",
             Self::Decision => "decision",
             Self::Request => "request",
-            Self::Knowledge => "knowledge",
         }
     }
 
@@ -63,7 +60,6 @@ impl MemoryToolKind {
             Self::Summary => RecordKind::Summary,
             Self::Decision => RecordKind::Decision,
             Self::Request => RecordKind::Request,
-            Self::Knowledge => RecordKind::Knowledge,
         }
     }
 
@@ -92,7 +88,6 @@ impl MemoryToolKind {
                 Ok(match other {
                     Self::Decision => layout.decision_path(&parsed),
                     Self::Request => layout.request_path(&parsed),
-                    Self::Knowledge => layout.knowledge_path(&parsed),
                     Self::Summary => unreachable!(),
                 })
             }

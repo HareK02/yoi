@@ -13,14 +13,9 @@ use manifest::{Permission, ScopeRule};
 
 use crate::workspace::WorkspaceLayout;
 
-/// Build deny rules that strip Write permission from `<workspace>/memory/`
-/// and `<workspace>/knowledge/`. Recursive — every descendant is capped at
-/// Read for the generic tools.
+/// Build a deny rule that strips Write permission from `<workspace>/.yoi/memory/`.
 pub fn deny_write_rules(layout: &WorkspaceLayout) -> Vec<ScopeRule> {
-    vec![
-        deny_write(layout.memory_dir().as_path()),
-        deny_write(layout.knowledge_dir().as_path()),
-    ]
+    vec![deny_write(layout.memory_dir().as_path())]
 }
 
 fn deny_write(target: &Path) -> ScopeRule {
@@ -37,13 +32,12 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn deny_targets_memory_and_knowledge() {
+    fn deny_targets_memory() {
         let layout = WorkspaceLayout::new(PathBuf::from("/ws"));
         let rules = deny_write_rules(&layout);
-        assert_eq!(rules.len(), 2);
+        assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].target, PathBuf::from("/ws/.yoi/memory"));
         assert_eq!(rules[0].permission, Permission::Write);
         assert!(rules[0].recursive);
-        assert_eq!(rules[1].target, PathBuf::from("/ws/.yoi/knowledge"));
     }
 }

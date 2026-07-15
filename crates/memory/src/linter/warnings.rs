@@ -26,7 +26,7 @@ pub fn check_warnings_kindless(_cp: &ClassifiedPath, body: &str, _report: &mut L
     // size:importance heuristic doesn't apply to a single rolling file.
 }
 
-/// For kinds with `sources` (Decisions / Requests / Knowledge), consult
+/// For kinds with `sources`, consult
 /// both the body length and the sources count.
 pub fn check_warnings_with_sources(body: &str, source_count: usize, report: &mut LintReport) {
     let chars = body.chars().count();

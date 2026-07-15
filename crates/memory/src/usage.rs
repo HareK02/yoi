@@ -1,9 +1,9 @@
-//! Workspace-local usage event log for memory / knowledge records.
+//! Workspace-local usage event log for memory records.
 //!
 //! The log is append-only JSONL under the workspace's `.yoi/` tree. It is
 //! intentionally evidence-only: aggregation reports explicit context reads and
 //! resident exposure cost telemetry, but it does not classify records as
-//! Knowledge candidates or tidy-protected records.
+//! tidy-protected records.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
@@ -25,7 +25,6 @@ pub enum UsageEventKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum UsageSource {
     MemoryRead,
-    KnowledgeRef,
     ResidentInjection,
 }
 
@@ -33,7 +32,6 @@ impl UsageSource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::MemoryRead => "MemoryRead",
-            Self::KnowledgeRef => "KnowledgeRef",
             Self::ResidentInjection => "ResidentInjection",
         }
     }
@@ -214,10 +212,6 @@ fn record_path(
             let slug = crate::Slug::parse(slug.to_string()).map_err(invalid_slug_error)?;
             Ok(layout.request_path(&slug))
         }
-        RecordKind::Knowledge => {
-            let slug = crate::Slug::parse(slug.to_string()).map_err(invalid_slug_error)?;
-            Ok(layout.knowledge_path(&slug))
-        }
     }
 }
 
@@ -313,7 +307,7 @@ mod tests {
     fn aggregates_use_and_resident_exposure_separately() {
         let (_dir, layout) = setup();
         let decision = snapshot_record_from_bytes(RecordKind::Decision, "alpha", b"abcd");
-        let knowledge = snapshot_record_from_bytes(RecordKind::Knowledge, "policy", b"abcdefgh");
+        let request = snapshot_record_from_bytes(RecordKind::Request, "policy", b"abcdefgh");
 
         append_use_event(
             &layout,
@@ -325,18 +319,18 @@ mod tests {
         append_use_event(
             &layout,
             "session-a",
-            UsageSource::KnowledgeRef,
-            vec![knowledge.clone()],
+            UsageSource::MemoryRead,
+            vec![request.clone()],
         )
         .unwrap();
         append_use_event(
             &layout,
             "session-b",
-            UsageSource::KnowledgeRef,
-            vec![knowledge.clone()],
+            UsageSource::MemoryRead,
+            vec![request.clone()],
         )
         .unwrap();
-        append_resident_exposure_event(&layout, "session-b", vec![knowledge]).unwrap();
+        append_resident_exposure_event(&layout, "session-b", vec![request]).unwrap();
 
         let report = build_usage_report(&layout).unwrap();
         let decision = report
@@ -349,22 +343,22 @@ mod tests {
         assert_eq!(decision.resident_exposure_count, 0);
         assert!(decision.last_used_at.is_some());
 
-        let knowledge = report
+        let request = report
             .records
             .iter()
-            .find(|r| r.kind == "knowledge" && r.slug == "policy")
+            .find(|r| r.kind == "request" && r.slug == "policy")
             .unwrap();
-        assert_eq!(knowledge.use_count, 2);
-        assert_eq!(knowledge.source_breakdown["KnowledgeRef"], 2);
-        assert_eq!(knowledge.resident_exposure_count, 1);
-        assert_eq!(knowledge.estimated_tokens_per_injection, 2);
-        assert_eq!(knowledge.estimated_total_resident_exposure_tokens, 2);
+        assert_eq!(request.use_count, 2);
+        assert_eq!(request.source_breakdown["MemoryRead"], 2);
+        assert_eq!(request.resident_exposure_count, 1);
+        assert_eq!(request.estimated_tokens_per_injection, 2);
+        assert_eq!(request.estimated_total_resident_exposure_tokens, 2);
     }
 
     #[test]
     fn resident_only_record_does_not_increment_use_count() {
         let (_dir, layout) = setup();
-        let snapshot = snapshot_record_from_bytes(RecordKind::Knowledge, "policy", b"abcdefgh");
+        let snapshot = snapshot_record_from_bytes(RecordKind::Decision, "policy", b"abcdefgh");
         append_resident_exposure_event(&layout, "session", vec![snapshot]).unwrap();
 
         let report = build_usage_report(&layout).unwrap();

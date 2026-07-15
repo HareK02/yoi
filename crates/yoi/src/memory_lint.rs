@@ -217,7 +217,6 @@ fn collect_record_paths(layout: &WorkspaceLayout) -> Result<Vec<PathBuf>, LintCl
 
     collect_md_files(&layout.decisions_dir(), &mut paths)?;
     collect_md_files(&layout.requests_dir(), &mut paths)?;
-    collect_md_files(&layout.knowledge_dir(), &mut paths)?;
 
     Ok(paths)
 }
@@ -413,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn lints_only_workspace_memory_and_knowledge_records() {
+    fn lints_only_workspace_memory_records() {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
         write(&root.join(".yoi/memory/summary.md"), valid_summary());

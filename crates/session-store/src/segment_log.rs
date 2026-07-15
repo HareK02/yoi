@@ -74,7 +74,7 @@ pub enum LogEntry {
 
     /// User input accepted at submit time. Carries the original typed
     /// `Vec<Segment>` so clients can re-render typed atoms (paste chips,
-    /// file/knowledge refs) on segment restore.
+    /// file refs) on segment restore.
     /// Replay flattens these into a `Item::user_message` for the worker
     /// history; the worker layer never sees segments directly.
     UserInput { ts: u64, segments: Vec<Segment> },
@@ -88,8 +88,8 @@ pub enum LogEntry {
     ToolResult { ts: u64, item: LoggedItem },
 
     /// One typed agent-injected system item: notification, child-Worker
-    /// lifecycle event, `@<path>` / `#<slug>` / `/<slug>` resolution
-    /// payload. Each `SystemItem` carries kind metadata that the LLM
+    /// lifecycle event, `@<path>` / `/<slug>` resolution payload. Each
+    /// `SystemItem` carries kind metadata that the LLM
     /// itself never sees (the LLM gets `Item::system_message` with the
     /// item's denormalised `body`), but live clients and replay paths
     /// dispatch on `kind` for typed rendering.

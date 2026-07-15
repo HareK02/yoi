@@ -1,6 +1,6 @@
 //! `MemoryWrite` tool.
 //!
-//! Creates or overwrites a memory or knowledge record by `(kind, slug)`.
+//! Creates or overwrites a memory record by `(kind, slug)`.
 //! Pre-write Linter validates frontmatter, slug uniqueness (Create only),
 //! reference integrity, size limits. On any
 //! Linter error the tool returns `ToolError::InvalidArgument` with all
@@ -19,14 +19,14 @@ use crate::linter::{LintReport, Linter, WriteMode};
 use crate::tool::MemoryToolKind;
 use crate::workspace::WorkspaceLayout;
 
-const DESCRIPTION: &str = "Create or overwrite a memory or knowledge record by \
-`kind` + `slug`. `kind`: summary | decision | request | knowledge. For `summary` \
+const DESCRIPTION: &str = "Create or overwrite a memory record by \
+`kind` + `slug`. `kind`: summary | decision | request. For `summary` \
 omit `slug`. Frontmatter is validated before write; on validation failure no \
 write occurs and every violation is returned in the error message.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct WriteParams {
-    /// Record kind: `summary` | `decision` | `request` | `knowledge`.
+    /// Record kind: `summary` | `decision` | `request`.
     kind: MemoryToolKind,
     /// Slug. Required for everything except `summary`; forbidden for `summary`.
     #[serde(default)]

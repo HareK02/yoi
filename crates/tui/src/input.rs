@@ -46,24 +46,11 @@ impl FileRefAtom {
     }
 }
 
-/// `#<slug>` chip — confirmed completion of a Knowledge reference.
-#[derive(Debug, Clone)]
-pub struct KnowledgeRefAtom {
-    pub slug: String,
-}
-
-impl KnowledgeRefAtom {
-    pub fn label(&self) -> String {
-        format!("#{}", self.slug)
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum Atom {
     Char(char),
     Paste(PasteRef),
     FileRef(FileRefAtom),
-    KnowledgeRef(KnowledgeRefAtom),
 }
 
 impl Atom {
@@ -74,7 +61,6 @@ impl Atom {
             Atom::Char(_) => None,
             Atom::Paste(p) => Some((Style::default().fg(Color::Magenta), p.label())),
             Atom::FileRef(r) => Some((Style::default().fg(Color::Cyan), r.label())),
-            Atom::KnowledgeRef(r) => Some((Style::default().fg(Color::Green), r.label())),
         }
     }
 }
@@ -83,7 +69,7 @@ impl Atom {
 enum AtomClass {
     Word(WordKind),
     Sep,
-    /// Indivisible chip — paste / file ref / knowledge ref. Word motion treats one chip as one unit; deletion
+    /// Indivisible chip — paste / file ref. Word motion treats one chip as one unit; deletion
     /// removes the whole atom.
     Chip,
 }
@@ -103,7 +89,7 @@ enum WordKind {
 fn atom_class(atom: &Atom) -> AtomClass {
     match atom {
         Atom::Char(c) => char_class(*c),
-        Atom::Paste(_) | Atom::FileRef(_) | Atom::KnowledgeRef(_) => AtomClass::Chip,
+        Atom::Paste(_) | Atom::FileRef(_) => AtomClass::Chip,
     }
 }
 
@@ -195,10 +181,6 @@ impl InputBuffer {
                     self.atoms
                         .push(Atom::FileRef(FileRefAtom { path: path.clone() }));
                 }
-                protocol::Segment::KnowledgeRef { slug } => {
-                    self.atoms
-                        .push(Atom::KnowledgeRef(KnowledgeRefAtom { slug: slug.clone() }));
-                }
                 protocol::Segment::Unknown => {
                     self.atoms
                         .extend("[unknown input segment]".chars().map(Atom::Char));
@@ -226,7 +208,6 @@ impl InputBuffer {
                 Atom::Char(c) => text.push(*c),
                 Atom::Paste(paste) => text.push_str(&paste.content),
                 Atom::FileRef(file) => text.push_str(&file.path),
-                Atom::KnowledgeRef(knowledge) => text.push_str(&knowledge.slug),
             }
         }
         text
@@ -254,20 +235,13 @@ impl InputBuffer {
     }
 
     /// Replace `atoms[start..self.cursor]` (the in-flight `@<typed>` /
-    /// `#<typed>` token) with the corresponding chip atom
+    /// active `@<typed>` file token) with the corresponding chip atom
     /// and place the cursor right after the chip. Used by the completion
     /// confirm path.
     pub fn replace_with_file_ref(&mut self, start: usize, path: String) {
         self.atoms.drain(start..self.cursor);
         self.atoms
             .insert(start, Atom::FileRef(FileRefAtom { path }));
-        self.cursor = start + 1;
-    }
-
-    pub fn replace_with_knowledge_ref(&mut self, start: usize, slug: String) {
-        self.atoms.drain(start..self.cursor);
-        self.atoms
-            .insert(start, Atom::KnowledgeRef(KnowledgeRefAtom { slug }));
         self.cursor = start + 1;
     }
 
@@ -286,7 +260,7 @@ impl InputBuffer {
         self.cursor = idx;
     }
 
-    /// If the cursor is currently inside a `@<typed>` / `#<typed>` /
+    /// If the cursor is currently inside a `@<typed>` /
     /// `/<typed>` token that satisfies the trigger rules, return the
     /// kind, the index of the leading sigil atom, and the typed text
     /// after the sigil (sigil itself excluded).
@@ -311,7 +285,7 @@ impl InputBuffer {
                     }
                     let kind = match c {
                         '@' => Some(protocol::CompletionKind::File),
-                        '#' => Some(protocol::CompletionKind::Knowledge),
+
                         _ => None,
                     };
                     if let Some(k) = kind {
@@ -480,7 +454,7 @@ impl InputBuffer {
 
     /// Build the typed `Vec<Segment>` sent over the protocol. Adjacent
     /// `Atom::Char`s are concatenated into a single `Segment::Text`; each
-    /// chip atom (`Paste` / `FileRef` / `KnowledgeRef` )
+    /// chip atom (`Paste` / `FileRef`)
     /// becomes a standalone `Segment` so that clients re-rendering an
     /// `Event::UserMessage` see the same indivisible chip rather than a
     /// flattened string.
@@ -508,12 +482,6 @@ impl InputBuffer {
                     flush_text(&mut buf, &mut out);
                     out.push(protocol::Segment::FileRef {
                         path: r.path.clone(),
-                    });
-                }
-                Atom::KnowledgeRef(r) => {
-                    flush_text(&mut buf, &mut out);
-                    out.push(protocol::Segment::KnowledgeRef {
-                        slug: r.slug.clone(),
                     });
                 }
             }
@@ -1029,14 +997,6 @@ mod completion_prefix_tests {
     }
 
     #[test]
-    fn hash_sigil_triggers_knowledge_completion() {
-        let buf = buf_from("#abc");
-        let (kind, _, prefix) = buf.pending_completion_prefix().unwrap();
-        assert_eq!(kind, CompletionKind::Knowledge);
-        assert_eq!(prefix, "abc");
-    }
-
-    #[test]
     fn newline_before_cursor_invalidates_trigger() {
         let buf = buf_from("@a\nbc");
         assert!(buf.pending_completion_prefix().is_none());
@@ -1234,7 +1194,7 @@ mod word_motion_tests {
         for a in &buf.atoms {
             match a {
                 Atom::Char(c) => out.push(*c),
-                Atom::Paste(_) | Atom::FileRef(_) | Atom::KnowledgeRef(_) => out.push_str("<P>"),
+                Atom::Paste(_) | Atom::FileRef(_) => out.push_str("<P>"),
             }
         }
         out

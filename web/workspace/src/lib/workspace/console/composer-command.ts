@@ -161,7 +161,7 @@ function invalidUsage(name: string): ComposerCommandResult {
 
 export function parseSigilSegments(input: string): Segment[] {
   const segments: Segment[] = [];
-  const pattern = /(^|\s)([@#])([^\s]+)/g;
+  const pattern = /(^|\s)([@])([^\s]+)/g;
   let cursor = 0;
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(input)) !== null) {
@@ -185,8 +185,6 @@ function sigilSegment(sigil: string, value: string): Segment {
   switch (sigil) {
     case "@":
       return { kind: "file_ref", path: value };
-    case "#":
-      return { kind: "knowledge_ref", slug: value };
     default:
       return { kind: "text", content: `${sigil}${value}` };
   }

@@ -502,16 +502,15 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// [`Self::from_manifest`], or defaults to the builtin pack when a
     /// Worker is constructed through lower-level paths that have no loader.
     prompts: Arc<PromptCatalog>,
-    /// Memory workspace layout used for Memory/Knowledge record operations.
+    /// Memory workspace layout used for Memory record operations.
     memory_layout: Option<memory::WorkspaceLayout>,
     /// When true (default), the system-prompt assembler may append the
     /// workspace memory summary (`memory/summary.md`). Internal disposable
     /// workers disable this so resident memory exposure is opt-in per Worker.
     inject_resident_summary: bool,
     /// When true (default), the system-prompt assembler may append resident
-    /// Knowledge descriptions. This is intentionally independent from
+    /// resident context. This is intentionally independent from
     /// summary residency: each section has its own gate.
-    inject_resident_knowledge: bool,
     /// extract (memory.extract) reentry guard. `true` while an extract
     /// worker is running; subsequent triggers are skipped per spec
     /// (`docs/plan/memory.md` §Extract 並走防止). `Arc<AtomicBool>` so
@@ -617,7 +616,6 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
             runtime_ticket_role: None,
             prompts: self.prompts.clone(),
             inject_resident_summary: self.inject_resident_summary,
-            inject_resident_knowledge: self.inject_resident_knowledge,
             extract_in_flight: self.extract_in_flight.clone(),
             consolidation_in_flight: self.consolidation_in_flight.clone(),
             extract_pointer: self.extract_pointer.clone(),
@@ -806,7 +804,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             prompts,
             memory_layout: None,
             inject_resident_summary: true,
-            inject_resident_knowledge: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Arc::new(Mutex::new(None)),
@@ -833,11 +830,9 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     ///
     /// Default `true`: normal Workers may expose each resident section according
     /// to its own gate and manifest settings. Internal disposable workers set
-    /// this to `false` so summary and Knowledge residency are both
     /// suppressed while explicit tools remain available.
-    pub fn set_resident_injection(&mut self, enabled: bool) {
+    pub fn set_resident_memory_injection(&mut self, enabled: bool) {
         self.inject_resident_summary = enabled;
-        self.inject_resident_knowledge = enabled;
     }
 
     /// Toggle `memory/summary.md` resident injection in the system prompt.
@@ -845,14 +840,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         self.inject_resident_summary = enabled;
     }
 
-    /// Toggle resident Knowledge injection in the system prompt.
-    pub fn set_resident_knowledge_injection(&mut self, enabled: bool) {
-        self.inject_resident_knowledge = enabled;
-    }
-
-    /// Shared handle to the prompt catalog. Cheap to clone (`Arc`).
-    pub fn prompts(&self) -> &Arc<PromptCatalog> {
-        &self.prompts
+    pub fn prompts(&self) -> Arc<PromptCatalog> {
+        Arc::clone(&self.prompts)
     }
 
     /// The current segment ID. Read lock-free from the shared session
@@ -1450,9 +1439,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let alerter = self.alerter.clone();
         let tool_names: Vec<String> = {
             let worker = self.engine.as_mut().expect("worker present");
-            // Materialise any pending tool factories so the template sees the
-            // full list of tool names. Redundant with the flush inside
-            // `Engine::lock()`; safe because `flush_pending` is idempotent.
             worker.tool_server_handle().flush_pending();
             worker
                 .tool_server_handle()
@@ -1472,11 +1458,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 }
             }
         }
-        // Resident-injection collection. Each resident section has its own
-        // gate so summary and Knowledge residency remain conceptually independent.
-        // Internal workers can still opt out of both resident sections.
-        // Owned values live for the duration of `render` below; the
-        // context borrows from them.
         let memory_layout = self.memory_layout.as_ref();
         let inject_summary = self.inject_resident_summary
             && memory_layout.is_some()
@@ -1491,21 +1472,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         } else {
             None
         };
-        let inject_resident_knowledge = self.inject_resident_knowledge && memory_layout.is_some();
-        let resident: Vec<memory::ResidentKnowledgeEntry> = if inject_resident_knowledge {
-            memory_layout
-                .map(memory::collect_resident_knowledge)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let resident_slice: Option<&[memory::ResidentKnowledgeEntry]> = if inject_resident_knowledge
-        {
-            Some(&resident)
-        } else {
-            None
-        };
-        let resident_exposure_snapshots = self.resident_exposure_snapshots(&resident);
         let worker_language = worker_language(&self.manifest.engine);
         let scope_snapshot = self.scope.snapshot();
         let cwd_for_prompt = self
@@ -1520,7 +1486,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             tool_names,
             agents_md: agents_md_read.and_then(|read| read.body),
             resident_summary: resident_summary.as_deref(),
-            resident_knowledge: resident_slice,
             prompts: &self.prompts,
         };
         let rendered = template
@@ -1530,7 +1495,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             .as_mut()
             .expect("worker present")
             .set_system_prompt(rendered);
-        self.append_resident_exposure_event(resident_exposure_snapshots);
         Ok(())
     }
 
@@ -1700,11 +1664,10 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         })?;
         self.user_segments.push(input.clone());
 
-        // Resolve `@<path>` file refs and `#<slug>` Knowledge refs to system
-        // messages stashed for the WorkerInterceptor to attach right after the
-        // user message. Resolution failures are non-fatal alerts.
-        let mut attachments = self.resolve_file_refs(&input);
-        attachments.extend(self.resolve_knowledge_refs(&input));
+        // Resolve `@<path>` file refs to system messages stashed for the
+        // WorkerInterceptor to attach right after the user message. Resolution
+        // failures are non-fatal alerts.
+        let attachments = self.resolve_file_refs(&input);
         let flattened = self.flatten_segments(&input);
         if !attachments.is_empty() {
             *self
@@ -1783,113 +1746,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         out
     }
 
-    fn resolve_knowledge_refs(&self, segments: &[Segment]) -> Vec<SystemItem> {
-        let Some(layout) = self.memory_layout.as_ref() else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        for seg in segments {
-            let Segment::KnowledgeRef { slug } = seg else {
-                continue;
-            };
-            let parsed = match memory::Slug::parse(slug.clone()) {
-                Ok(slug) => slug,
-                Err(e) => {
-                    self.alert(
-                        AlertLevel::Warn,
-                        AlertSource::Worker,
-                        format!("knowledge ref #{slug} has invalid slug: {e}"),
-                    );
-                    continue;
-                }
-            };
-            let path = layout.knowledge_path(&parsed);
-            let bytes = match std::fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    self.alert(
-                        AlertLevel::Warn,
-                        AlertSource::Worker,
-                        format!("knowledge ref #{slug} could not be read: {e}"),
-                    );
-                    continue;
-                }
-            };
-            let raw = String::from_utf8_lossy(&bytes).into_owned();
-            let body_text = match memory::schema::split_frontmatter(&raw) {
-                Ok((_yaml, body)) => body,
-                Err(e) => {
-                    self.alert(
-                        AlertLevel::Warn,
-                        AlertSource::Worker,
-                        format!("knowledge ref #{slug} has invalid frontmatter: {e}"),
-                    );
-                    continue;
-                }
-            };
-            let snapshot = memory::snapshot_record_from_bytes(
-                memory::workspace::RecordKind::Knowledge,
-                slug.clone(),
-                &bytes,
-            );
-            self.append_memory_use_event(memory::UsageSource::KnowledgeRef, vec![snapshot]);
-            let body = format!("[Knowledge #{}]\n{}", slug, body_text.trim_end());
-            out.push(SystemItem::Knowledge {
-                slug: slug.clone(),
-                body,
-            });
-        }
-        out
-    }
-
-    fn resident_exposure_snapshots(
-        &self,
-        knowledge: &[memory::ResidentKnowledgeEntry],
-    ) -> Vec<memory::UsageRecordSnapshot> {
-        let Some(layout) = self.memory_layout.as_ref() else {
-            return Vec::new();
-        };
-        let mut snapshots = Vec::new();
-        for entry in knowledge {
-            match memory::snapshot_record_from_layout(
-                layout,
-                memory::workspace::RecordKind::Knowledge,
-                &entry.slug,
-            ) {
-                Ok(snapshot) => snapshots.push(snapshot),
-                Err(err) => {
-                    warn!(knowledge = %entry.slug, error = %err, "failed to snapshot resident knowledge exposure")
-                }
-            }
-        }
-        snapshots
-    }
-
-    fn append_memory_use_event(
-        &self,
-        source: memory::UsageSource,
-        records: Vec<memory::UsageRecordSnapshot>,
-    ) {
-        let Some(layout) = self.memory_layout.as_ref() else {
-            return;
-        };
-        if let Err(err) =
-            memory::append_use_event(layout, self.segment_id().to_string(), source, records)
-        {
-            warn!(error = %err, "failed to append memory usage event");
-        }
-    }
-
-    fn append_resident_exposure_event(&self, records: Vec<memory::UsageRecordSnapshot>) {
-        let Some(layout) = self.memory_layout.as_ref() else {
-            return;
-        };
-        if let Err(err) =
-            memory::append_resident_exposure_event(layout, self.segment_id().to_string(), records)
-        {
-            warn!(error = %err, "failed to append resident exposure event");
-        }
-    }
     /// Stage the post-interruption cleanup at the front of worker
     /// history: close every unanswered `Item::ToolCall` with a synthetic
     /// `Item::ToolResult` (Anthropic wire-validity), then append a
@@ -1947,16 +1803,9 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         Ok(())
     }
 
-    pub fn knowledge_completions(&self) -> Vec<String> {
-        self.memory_layout
-            .as_ref()
-            .map(memory::list_knowledge_slugs)
-            .unwrap_or_default()
-    }
-
     /// Flatten a typed segment list into the single string the Engine
     /// receives as the user message, and emit user-facing alerts for
-    /// segments that fall through to placeholder (Knowledge refs without a resolver, or unknown variants from a newer client).
+    /// segments that fall through to placeholder (unknown variants from a newer client).
     /// `FileRef` is handled separately by `resolve_file_refs`. The text
     /// reconstruction itself comes from `Segment::flatten_to_text`,
     /// shared with replay paths that should not re-alert.
@@ -1964,18 +1813,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         for seg in segments {
             match seg {
                 Segment::Text { .. } | Segment::Paste { .. } | Segment::FileRef { .. } => {}
-                Segment::KnowledgeRef { slug } => {
-                    if self.memory_layout.is_none() {
-                        self.alert(
-                            AlertLevel::Warn,
-                            AlertSource::Worker,
-                            format!(
-                                "knowledge ref #{slug} cannot be resolved \
-                                 because memory is disabled; passed to LLM as placeholder"
-                            ),
-                        );
-                    }
-                }
                 Segment::Unknown => {
                     self.alert(
                         AlertLevel::Warn,
@@ -3678,8 +3515,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         // directly under the workspace via WorkspaceLayout. Resident section
         // injection is a Worker-level concern; this disposable Engine is built
         // without it by construction, in keeping with `docs/plan/memory.md`
-        // §Consolidation のKnowledgeアクセス (agent pulls knowledge through
-        // the search tool instead of via system-prompt residency).
         let query_cfg = memory::tool::QueryConfig::from(memory_cfg);
         worker.register_tool(memory::tool::read_tool_with_usage(
             layout.clone(),
@@ -3689,10 +3524,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         worker.register_tool(memory::tool::edit_tool(layout.clone()));
         worker.register_tool(memory::tool::delete_tool(layout.clone()));
         worker.register_tool(memory::tool::memory_query_tool(layout.clone(), query_cfg));
-        worker.register_tool(memory::tool::knowledge_query_tool(
-            layout.clone(),
-            query_cfg,
-        ));
 
         let tidy = consolidate::collect_tidy_hints(&layout);
         let usage_report = match memory::build_usage_report(&layout) {
@@ -4020,7 +3851,6 @@ where
             prompts: common.prompts,
             memory_layout: common.memory_layout,
             inject_resident_summary: true,
-            inject_resident_knowledge: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Arc::new(Mutex::new(None)),
@@ -4127,7 +3957,6 @@ where
             prompts: common.prompts,
             memory_layout: common.memory_layout,
             inject_resident_summary: true,
-            inject_resident_knowledge: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Arc::new(Mutex::new(None)),
@@ -4360,7 +4189,6 @@ where
             prompts: common.prompts,
             memory_layout: common.memory_layout,
             inject_resident_summary: true,
-            inject_resident_knowledge: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Arc::new(Mutex::new(extract_pointer)),
@@ -4875,10 +4703,6 @@ fn preview_segments(segments: &[Segment]) -> String {
             Segment::FileRef { path } => {
                 preview.push('@');
                 preview.push_str(path);
-            }
-            Segment::KnowledgeRef { slug } => {
-                preview.push('#');
-                preview.push_str(slug);
             }
             Segment::Unknown => preview.push_str("[unknown input segment]"),
         }
@@ -5972,15 +5796,11 @@ mod build_summary_prompt_tests {
     #[derive(Clone, Copy)]
     struct ResidentInjectionGates {
         summary: bool,
-        knowledge: bool,
     }
 
     impl ResidentInjectionGates {
         fn all(enabled: bool) -> Self {
-            Self {
-                summary: enabled,
-                knowledge: enabled,
-            }
+            Self { summary: enabled }
         }
     }
 
@@ -6002,7 +5822,7 @@ mod build_summary_prompt_tests {
         summary_doc: Option<&str>,
         memory_config: Option<manifest::MemoryConfig>,
         gates: ResidentInjectionGates,
-        include_knowledge: bool,
+        _unused: bool,
     ) -> String {
         let dir = tempfile::tempdir().unwrap();
         let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
@@ -6011,14 +5831,6 @@ mod build_summary_prompt_tests {
         if let Some(doc) = summary_doc {
             std::fs::create_dir_all(cwd.join(".yoi/memory")).unwrap();
             std::fs::write(cwd.join(".yoi/memory/summary.md"), doc).unwrap();
-        }
-        if include_knowledge {
-            std::fs::create_dir_all(cwd.join(".yoi/knowledge")).unwrap();
-            std::fs::write(
-                cwd.join(".yoi/knowledge/resident-policy.md"),
-                knowledge_doc("knowledge resident desc"),
-            )
-            .unwrap();
         }
         let mut manifest = minimal_manifest();
         manifest.memory = memory_config;
@@ -6039,12 +5851,7 @@ mod build_summary_prompt_tests {
             .memory
             .as_ref()
             .map(|mem| memory::WorkspaceLayout::resolve(mem, &cwd));
-        if gates.summary == gates.knowledge {
-            worker.set_resident_injection(gates.summary);
-        } else {
-            worker.set_resident_summary_injection(gates.summary);
-            worker.set_resident_knowledge_injection(gates.knowledge);
-        }
+        worker.set_resident_memory_injection(gates.summary);
         let template = SystemPromptTemplate::parse(
             "$yoi/default",
             crate::prompt::loader::PromptLoader::builtins_only(),
@@ -6057,12 +5864,6 @@ mod build_summary_prompt_tests {
 
     fn summary_doc(body: &str) -> String {
         format!("---\nupdated_at: 2026-01-01T00:00:00Z\n---\n{body}")
-    }
-
-    fn knowledge_doc(description: &str) -> String {
-        format!(
-            "---\ncreated_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\nkind: policy\ndescription: \"{description}\"\nmodel_invokation: true\nuser_invocable: true\nlast_sources: []\n---\nbody\n",
-        )
     }
 
     #[tokio::test]
@@ -6129,53 +5930,13 @@ mod build_summary_prompt_tests {
         let prompt = render_system_prompt_with_resident_sections(
             Some(&summary_doc("resident summary marker")),
             Some(manifest::MemoryConfig::default()),
-            ResidentInjectionGates {
-                summary: false,
-                knowledge: true,
-            },
+            ResidentInjectionGates { summary: false },
             true,
         )
         .await;
 
         assert!(!prompt.contains("Resident memory summary"));
         assert!(!prompt.contains("resident summary marker"));
-        assert!(prompt.contains("Resident knowledge"));
-        assert!(prompt.contains("knowledge resident desc"));
-    }
-
-    #[tokio::test]
-    async fn knowledge_gate_false_keeps_resident_summary() {
-        let prompt = render_system_prompt_with_resident_sections(
-            Some(&summary_doc("resident summary marker")),
-            Some(manifest::MemoryConfig::default()),
-            ResidentInjectionGates {
-                summary: true,
-                knowledge: false,
-            },
-            true,
-        )
-        .await;
-
-        assert!(prompt.contains("Resident memory summary"));
-        assert!(prompt.contains("resident summary marker"));
-        assert!(!prompt.contains("Resident knowledge"));
-        assert!(!prompt.contains("knowledge resident desc"));
-    }
-
-    #[tokio::test]
-    async fn resident_injection_opt_out_omits_all_resident_sections() {
-        let prompt = render_system_prompt_with_resident_sections(
-            Some(&summary_doc("resident summary marker")),
-            Some(manifest::MemoryConfig::default()),
-            ResidentInjectionGates::all(false),
-            true,
-        )
-        .await;
-
-        assert!(!prompt.contains("Resident memory summary"));
-        assert!(!prompt.contains("resident summary marker"));
-        assert!(!prompt.contains("Resident knowledge"));
-        assert!(!prompt.contains("knowledge resident desc"));
     }
 
     fn minimal_manifest() -> WorkerManifest {

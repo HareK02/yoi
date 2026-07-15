@@ -379,7 +379,7 @@ pub struct MemoryConfig {
     #[serde(default)]
     pub workspace_root: Option<PathBuf>,
     /// Maximum number of records returned by `MemoryQuery` /
-    /// `KnowledgeQuery` per call. `None` ⇒ tool default (20).
+    /// `MemoryQuery` per call. `None` ⇒ tool default (20).
     #[serde(default)]
     pub query_result_limit: Option<usize>,
     /// Lines of context before and after each match in query excerpts.
@@ -391,7 +391,7 @@ pub struct MemoryConfig {
     #[serde(default)]
     pub inject_summary: Option<bool>,
     /// Language used by memory extraction / consolidation workers for durable
-    /// memory and knowledge text. Free-form so workspaces can use names like
+    /// memory text. Free-form so workspaces can use names like
     /// `English`, `Japanese`, or locale tags. `None` ⇒
     /// [`defaults::MEMORY_LANGUAGE`].
     #[serde(default)]

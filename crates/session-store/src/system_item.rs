@@ -2,7 +2,7 @@
 //!
 //! Items in worker history with `role:system` are never produced by the
 //! LLM — they are always inserted by the Worker itself (notifications,
-//! file/knowledge ref resolutions, child-worker lifecycle events,
+//! file ref resolutions, child-worker lifecycle events,
 //! future `<system-reminder>` tags, …). [`SystemItem`] carries the
 //! typed shape of each such injection so clients can dispatch on
 //! `kind` instead of parsing text prefixes like `[Notification] …` or
@@ -106,7 +106,7 @@ fn render_system_reminder(body: &str) -> String {
 ///
 /// Each variant carries the kind-specific raw data clients use for
 /// typed rendering (`Notification.message`, `WorkerEvent.event`, file
-/// path / knowledge slug / etc.), plus a pre-rendered
+/// path / identifier / etc.), plus a pre-rendered
 /// `body` (where applicable) that is the exact `role:system` text the
 /// LLM actually saw at commit time. `body` is denormalised so that
 /// segment log replay reconstructs worker history byte-identical to
@@ -139,10 +139,11 @@ pub enum SystemItem {
     /// byte-identical to what was sent.
     FileAttachment { path: String, body: String },
 
-    /// `#<slug>` Knowledge reference resolution. `body` is the
-    /// rendered text the LLM saw (Worker composes the `[Knowledge: …]`
-    /// header + body).
-    Knowledge { slug: String, body: String },
+    /// Historical persisted Knowledge reference resolution. Knowledge is no
+    /// longer active, so restored sessions ignore this item instead of replaying
+    /// archived record text into model context.
+    #[serde(rename = "knowledge")]
+    LegacyKnowledgeIgnored { slug: String, body: String },
 
     /// Compatibility sink for pre-removal persisted `kind: "workflow"`
     /// system items. These entries are intentionally not replayed as
@@ -173,7 +174,7 @@ impl SystemItem {
             SystemItem::Notification { body, .. } => body.clone(),
             SystemItem::WorkerEvent { body, .. } => body.clone(),
             SystemItem::FileAttachment { body, .. } => body.clone(),
-            SystemItem::Knowledge { body, .. } => body.clone(),
+            SystemItem::LegacyKnowledgeIgnored { .. } => String::new(),
             SystemItem::LegacyIgnored { slug } => {
                 format!("Ignored legacy procedure item: /{slug}")
             }
@@ -195,7 +196,7 @@ impl SystemItem {
             SystemItem::Notification { .. } => "notification",
             SystemItem::WorkerEvent { .. } => "worker_event",
             SystemItem::FileAttachment { .. } => "file_attachment",
-            SystemItem::Knowledge { .. } => "knowledge",
+            SystemItem::LegacyKnowledgeIgnored { .. } => "legacy_knowledge_ignored",
             SystemItem::LegacyIgnored { .. } => "legacy_ignored",
             SystemItem::TaskReminder { .. } => "task_reminder",
             SystemItem::Interrupt { .. } => "interrupt",
