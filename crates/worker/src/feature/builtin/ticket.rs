@@ -61,6 +61,9 @@ pub enum TicketFeatureBackend {
     Local {
         root: PathBuf,
     },
+    LocalWorkspace {
+        workspace_root: PathBuf,
+    },
     WorkspaceHttp {
         workspace_id: String,
         base_url: String,
@@ -125,6 +128,13 @@ impl TicketFeature {
         access: Option<TicketFeatureAccess>,
         include_orchestration_tools: bool,
     ) -> Self {
+        if let TicketFeatureBackend::LocalWorkspace { workspace_root } = backend {
+            return Self::for_workspace_with_options(
+                workspace_root,
+                access,
+                include_orchestration_tools,
+            );
+        }
         Self {
             backend,
             record_language: None,
@@ -180,6 +190,7 @@ impl TicketFeature {
     pub fn backend_root(&self) -> Option<&Path> {
         match &self.backend {
             TicketFeatureBackend::Local { root } => Some(root),
+            TicketFeatureBackend::LocalWorkspace { workspace_root } => Some(workspace_root),
             TicketFeatureBackend::WorkspaceHttp { .. } => None,
         }
     }
@@ -219,7 +230,8 @@ impl TicketFeature {
     }
     fn tool_backend(&self, context: &mut FeatureInstallContext<'_>) -> Option<TicketToolBackend> {
         match &self.backend {
-            TicketFeatureBackend::Local { root: _ } => {
+            TicketFeatureBackend::Local { root: _ }
+            | TicketFeatureBackend::LocalWorkspace { workspace_root: _ } => {
                 let usable_root = match self.usable_backend_root() {
                     Ok(root) => root,
                     Err(reason) => {
@@ -606,7 +618,7 @@ mod tests {
     fn write_ticket_config(workspace: &Path, content: &str) {
         let yoi_dir = workspace.join(".yoi");
         std::fs::create_dir_all(&yoi_dir).unwrap();
-        std::fs::write(yoi_dir.join("ticket.config.toml"), content).unwrap();
+        std::fs::write(yoi_dir.join("workspace.toml"), content).unwrap();
     }
 
     fn pending_tool_description(
@@ -853,11 +865,11 @@ language = "Japanese"
         write_ticket_config(
             temp.path(),
             r#"
-[backend]
+[ticket.backend]
 provider = "builtin:yoi_local"
 root = "tickets"
 
-[roles.coder]
+[ticket.roles.coder]
 profile = "project:coder"
 "#,
         );
@@ -886,7 +898,7 @@ profile = "project:coder"
         write_ticket_config(
             temp.path(),
             r#"
-[roles.operator]
+[ticket.roles.operator]
 profile = "inherit"
 "#,
         );
@@ -911,7 +923,7 @@ profile = "inherit"
         write_ticket_config(
             temp.path(),
             r#"
-[backend]
+[ticket.backend]
 provider = "github"
 "#,
         );

@@ -6,8 +6,8 @@ use std::time::Instant;
 
 use protocol::WorkerStatus;
 use ticket::config::{
-    DEFAULT_TICKET_BACKEND_RELATIVE_PATH, TICKET_CONFIG_RELATIVE_PATH, TicketConfig,
-    TicketOrchestrationConfig,
+    TICKET_CONFIG_RELATIVE_PATH, TicketConfig, TicketOrchestrationConfig,
+    WORKSPACE_SETTINGS_RELATIVE_PATH,
 };
 use ticket::{
     LocalTicketBackend, TicketBackend, TicketError, TicketEvent, TicketFilter, TicketIdOrSlug,
@@ -567,8 +567,41 @@ pub(crate) fn decide_orchestrator_lifecycle(
 }
 
 pub(crate) fn ticket_config_availability(workspace_root: &Path) -> TicketConfigAvailability {
-    let config_path = workspace_root.join(TICKET_CONFIG_RELATIVE_PATH);
-    match config_path.symlink_metadata() {
+    let settings_path = workspace_root.join(WORKSPACE_SETTINGS_RELATIVE_PATH);
+    match settings_path.symlink_metadata() {
+        Ok(metadata) if !metadata.is_file() => TicketConfigAvailability::Unusable(format!(
+            "{} exists but is not a regular file",
+            WORKSPACE_SETTINGS_RELATIVE_PATH
+        )),
+        Ok(_) => match std::fs::read_to_string(&settings_path) {
+            Ok(content) => {
+                match TicketConfig::workspace_settings_has_ticket_config(&settings_path, &content) {
+                    Ok(true) => match TicketConfig::load_workspace(workspace_root) {
+                        Ok(_) => TicketConfigAvailability::Usable,
+                        Err(error) => TicketConfigAvailability::Unusable(error.to_string()),
+                    },
+                    Ok(false) => legacy_ticket_config_availability(workspace_root),
+                    Err(error) => TicketConfigAvailability::Unusable(error.to_string()),
+                }
+            }
+            Err(error) => TicketConfigAvailability::Unusable(format!(
+                "could not read {}: {error}",
+                WORKSPACE_SETTINGS_RELATIVE_PATH
+            )),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            legacy_ticket_config_availability(workspace_root)
+        }
+        Err(error) => TicketConfigAvailability::Unusable(format!(
+            "could not inspect {}: {error}",
+            WORKSPACE_SETTINGS_RELATIVE_PATH
+        )),
+    }
+}
+
+fn legacy_ticket_config_availability(workspace_root: &Path) -> TicketConfigAvailability {
+    let legacy_path = workspace_root.join(TICKET_CONFIG_RELATIVE_PATH);
+    match legacy_path.symlink_metadata() {
         Ok(metadata) if !metadata.is_file() => TicketConfigAvailability::Unusable(format!(
             "{} exists but is not a regular file",
             TICKET_CONFIG_RELATIVE_PATH
@@ -608,13 +641,14 @@ fn load_orchestration_ticket_overlay(
     }
     match validate_orchestration_overlay_source(workspace_root, &layout) {
         Ok(()) => {
-            load_orchestration_ticket_overlay_states(&layout.path, config.ticket_record_language())
-                .unwrap_or_else(|message| OrchestrationTicketOverlay {
+            load_orchestration_ticket_overlay_states(&layout.path).unwrap_or_else(|message| {
+                OrchestrationTicketOverlay {
                     states: BTreeMap::new(),
                     diagnostics: vec![bounded_panel_diagnostic(format!(
                         "Orchestration Ticket overlay unavailable: {message}"
                     ))],
-                })
+                }
+            })
         }
         Err(message) => OrchestrationTicketOverlay {
             states: BTreeMap::new(),
@@ -639,19 +673,25 @@ fn orchestration_worktree_layout(
 
 fn load_orchestration_ticket_overlay_states(
     worktree_root: &Path,
-    record_language: Option<&str>,
 ) -> Result<OrchestrationTicketOverlay, String> {
-    let ticket_root = worktree_root.join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH);
+    let overlay_config = TicketConfig::load_workspace(worktree_root).map_err(|error| {
+        format!(
+            "orchestration worktree {} has unusable Ticket settings: {error}",
+            worktree_root.display()
+        )
+    })?;
+    let ticket_root = overlay_config.backend_root();
     if !ticket_root.is_dir() {
         return Ok(OrchestrationTicketOverlay {
             states: BTreeMap::new(),
             diagnostics: vec![bounded_panel_diagnostic(format!(
-                "Orchestration worktree has no {} directory",
-                DEFAULT_TICKET_BACKEND_RELATIVE_PATH
+                "Orchestration worktree configured Ticket backend root {} is not a directory",
+                ticket_root.display()
             ))],
         });
     }
-    let backend = LocalTicketBackend::new(ticket_root).with_record_language(record_language);
+    let backend = LocalTicketBackend::new(ticket_root.to_path_buf())
+        .with_record_language(overlay_config.ticket_record_language());
     let partial = backend
         .list_partial(TicketFilter::all())
         .map_err(|error| error.to_string())?;
@@ -1763,11 +1803,17 @@ mod tests {
     }
 
     fn write_ticket_config(workspace_root: &Path) {
+        write_ticket_config_with_root(workspace_root, ".yoi/tickets");
+    }
+
+    fn write_ticket_config_with_root(workspace_root: &Path, root: &str) {
         let config_dir = workspace_root.join(".yoi");
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
-            config_dir.join("ticket.config.toml"),
-            "[backend]\nprovider = \"builtin:yoi_local\"\nroot = \".yoi/tickets\"\n",
+            config_dir.join("workspace.toml"),
+            format!(
+                "[ticket]\n\n[ticket.backend]\nprovider = \"builtin:yoi_local\"\nroot = \"{root}\"\n"
+            ),
         )
         .unwrap();
     }
@@ -1815,8 +1861,12 @@ mod tests {
     }
 
     fn copy_ticket_to_overlay(workspace_root: &Path, orchestration_root: &Path, id: &str) {
+        copy_ticket_to_overlay_root(workspace_root, &orchestration_root.join(".yoi/tickets"), id);
+    }
+
+    fn copy_ticket_to_overlay_root(workspace_root: &Path, overlay_root: &Path, id: &str) {
         let local_ticket_dir = workspace_root.join(".yoi/tickets").join(id);
-        let overlay_ticket_dir = orchestration_root.join(".yoi/tickets").join(id);
+        let overlay_ticket_dir = overlay_root.join(id);
         fs::create_dir_all(overlay_ticket_dir.parent().unwrap()).unwrap();
         fs::create_dir_all(&overlay_ticket_dir).unwrap();
         fs::copy(
@@ -1985,6 +2035,40 @@ mod tests {
         );
         assert_eq!(ticket_row_by_title(&model, "Local Only").status, "queued");
         assert!(model.rows.iter().all(|row| row.title != "Overlay Only"));
+    }
+
+    #[test]
+    fn workspace_panel_orchestration_overlay_uses_configured_backend_root() {
+        let temp = TempDir::new().unwrap();
+        init_git_repo(temp.path());
+        write_ticket_config(temp.path());
+        let orchestration_root = add_orchestration_worktree(temp.path(), "orchestration");
+        write_ticket_config_with_root(&orchestration_root, "configured-overlay-tickets");
+        let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
+        let id = create_ticket_with_id(&backend, "Overlay Custom Root", |input| {
+            input.workflow_state = Some(TicketWorkflowState::Queued);
+        });
+        let configured_overlay_root = orchestration_root.join("configured-overlay-tickets");
+        copy_ticket_to_overlay_root(temp.path(), &configured_overlay_root, &id);
+        let overlay_backend = LocalTicketBackend::new(&configured_overlay_root);
+        set_ticket_state(&overlay_backend, &id, TicketWorkflowState::InProgress);
+
+        let model = build_workspace_panel(temp.path(), &empty_pods());
+
+        assert!(model.header.diagnostics.is_empty());
+        let row = ticket_row_by_title(&model, "Overlay Custom Root");
+        assert_eq!(row.status, "q→prog");
+        assert_eq!(
+            row.ticket
+                .as_ref()
+                .unwrap()
+                .orchestration_overlay
+                .as_ref()
+                .unwrap()
+                .workflow_state,
+            TicketWorkflowState::InProgress
+        );
+        assert!(!orchestration_root.join(".yoi/tickets").exists());
     }
 
     #[test]
@@ -2233,8 +2317,8 @@ mod tests {
         let config_dir = temp.path().join(".yoi");
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
-            config_dir.join("ticket.config.toml"),
-            "[backend]\nprovider = \"unknown:provider\"\nroot = \".yoi/tickets\"\n",
+            config_dir.join("workspace.toml"),
+            "[ticket]\n\n[ticket.backend]\nprovider = \"unknown:provider\"\nroot = \".yoi/tickets\"\n",
         )
         .unwrap();
 
@@ -2678,11 +2762,11 @@ mod tests {
     }
 
     #[test]
-    fn existing_non_file_ticket_config_is_unusable_not_absent() {
+    fn existing_non_file_workspace_settings_is_unusable_not_absent() {
         let temp = TempDir::new().unwrap();
         let config_parent = temp.path().join(".yoi");
         fs::create_dir_all(&config_parent).unwrap();
-        fs::create_dir(config_parent.join("ticket.config.toml")).unwrap();
+        fs::create_dir(config_parent.join("workspace.toml")).unwrap();
 
         assert!(matches!(
             ticket_config_availability(temp.path()),

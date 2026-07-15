@@ -1,11 +1,13 @@
 use std::fmt;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use chrono::{SecondsFormat, Utc};
 use ticket::config::{
     DEFAULT_TICKET_BACKEND_RELATIVE_PATH, TICKET_CONFIG_RELATIVE_PATH, TicketConfig,
-    ticket_config_scaffold,
+    WORKSPACE_SETTINGS_RELATIVE_PATH, ticket_config_scaffold,
 };
 use ticket::{
     LocalTicketBackend, MarkdownText, NewTicket, NewTicketEvent, NewTicketRelation, TicketBackend,
@@ -252,11 +254,12 @@ fn run_command(
 }
 
 fn init(workspace: &Path) -> Result<TicketCliOutput, TicketCliError> {
-    let config_path = workspace.join(TICKET_CONFIG_RELATIVE_PATH);
-    if config_path.exists() {
+    let legacy_config_path = workspace.join(TICKET_CONFIG_RELATIVE_PATH);
+    if legacy_config_path.exists() {
         return Err(TicketCliError::new(format!(
-            "ticket config already exists at {}; refusing to overwrite. Edit it manually or remove it before running `yoi ticket init`.",
-            config_path.display()
+            "legacy ticket config exists at {}; `.yoi/ticket.config.toml` is obsolete and read-only. Move its policy into {} before running `yoi ticket init`.",
+            legacy_config_path.display(),
+            WORKSPACE_SETTINGS_RELATIVE_PATH
         )));
     }
 
@@ -266,26 +269,94 @@ fn init(workspace: &Path) -> Result<TicketCliOutput, TicketCliError> {
     fs::create_dir_all(&tickets_dir)?;
     fs::write(tickets_dir.join(".gitkeep"), b"")?;
 
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&config_path)
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                TicketCliError::new(format!(
-                    "ticket config already exists at {}; refusing to overwrite. Edit it manually or remove it before running `yoi ticket init`.",
-                    config_path.display()
-                ))
-            } else {
-                TicketCliError::from(error)
-            }
-        })?;
-    file.write_all(ticket_config_scaffold().as_bytes())?;
+    let settings_path = workspace.join(WORKSPACE_SETTINGS_RELATIVE_PATH);
+    let scaffold = ticket_config_scaffold();
+    let created_settings = if settings_path.exists() {
+        let content = fs::read_to_string(&settings_path)?;
+        if TicketConfig::workspace_settings_has_ticket_config(&settings_path, &content)? {
+            return Err(TicketCliError::new(format!(
+                "workspace Ticket settings already exist at {}; refusing to overwrite. Edit the [ticket] table manually before running `yoi ticket init`.",
+                settings_path.display()
+            )));
+        }
+        let mut file = fs::OpenOptions::new().append(true).open(&settings_path)?;
+        if !content.ends_with('\n') {
+            file.write_all(b"\n")?;
+        }
+        file.write_all(b"\n")?;
+        file.write_all(scaffold.as_bytes())?;
+        false
+    } else {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&settings_path)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    TicketCliError::new(format!(
+                        "workspace settings already exists at {}; retry `yoi ticket init` to append Ticket settings safely.",
+                        settings_path.display()
+                    ))
+                } else {
+                    TicketCliError::from(error)
+                }
+            })?;
+        let identity = workspace_settings_identity_header(workspace)?;
+        file.write_all(identity.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.write_all(scaffold.as_bytes())?;
+        true
+    };
 
+    let verb = if created_settings {
+        "created"
+    } else {
+        "updated"
+    };
     Ok(success(format!(
-        "created\t{}\nensured\t{}\n",
-        TICKET_CONFIG_RELATIVE_PATH, DEFAULT_TICKET_BACKEND_RELATIVE_PATH
+        "{verb}\t{}\nensured\t{}\n",
+        WORKSPACE_SETTINGS_RELATIVE_PATH, DEFAULT_TICKET_BACKEND_RELATIVE_PATH
     )))
+}
+
+fn workspace_settings_identity_header(workspace: &Path) -> Result<String, TicketCliError> {
+    let display_name = workspace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("workspace");
+    if display_name.contains('\0') || display_name.chars().any(|ch| ch.is_control()) {
+        return Err(TicketCliError::new(
+            "workspace display name derived from path must not contain control characters",
+        ));
+    }
+    Ok(format!(
+        "workspace_id = \"{}\"\ncreated_at = \"{}\"\ndisplay_name = \"{}\"\n",
+        workspace_settings_uuid_v7(workspace),
+        Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        display_name.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+
+fn workspace_settings_uuid_v7(workspace: &Path) -> String {
+    let now = Utc::now();
+    let timestamp_ms = (now.timestamp_millis().max(0) as u64) & 0xffff_ffff_ffff;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    workspace.hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    now.timestamp_nanos_opt()
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    let random = hasher.finish();
+
+    let time_low = (timestamp_ms >> 16) as u32;
+    let time_mid = (timestamp_ms & 0xffff) as u16;
+    let version_and_rand = 0x7000 | (((random >> 52) as u16) & 0x0fff);
+    let variant_and_rand = 0x8000 | (((random >> 38) as u16) & 0x3fff);
+    let node = random & 0xffff_ffff_ffff;
+    format!(
+        "{time_low:08x}-{time_mid:04x}-{version_and_rand:04x}-{variant_and_rand:04x}-{node:012x}"
+    )
 }
 
 fn backend_for_workspace(workspace: &Path) -> Result<LocalTicketBackend, TicketCliError> {
@@ -1077,7 +1148,7 @@ fn default_author() -> String {
 }
 
 fn help_text() -> &'static str {
-    "yoi ticket\n\nUsage:\n  yoi ticket init\n  yoi ticket create --title <title>\n  yoi ticket list [--state planning|ready|queued|inprogress|done|closed|all] [--limit <n>]\n  yoi ticket show <id>\n  yoi ticket comment <id> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket review <id> (--approve|--request-changes) (--file <path>|--message <text>)\n  yoi ticket state <id> <planning|ready|queued|inprogress|done|closed>\n  yoi ticket close <id> (--resolution <text>|--file <path>)\n  yoi ticket relation add --ticket <id> --kind <depends_on|blocks|related|supersedes|duplicate_of> --target <id> [--note <text>]\n  yoi ticket relation list [--ticket <id>] [--kind <kind>]\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  `yoi ticket init` writes .yoi/ticket.config.toml with explicit fixed role profiles and an optional commented [ticket].language setting.\n  Uses the workspace Ticket config at .yoi/ticket.config.toml when present.\n  Supported provider: builtin:yoi_local.\n  Without config, the local backend root is <cwd>/.yoi/tickets.\n"
+    "yoi ticket\n\nUsage:\n  yoi ticket init\n  yoi ticket create --title <title>\n  yoi ticket list [--state planning|ready|queued|inprogress|done|closed|all] [--limit <n>]\n  yoi ticket show <id>\n  yoi ticket comment <id> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket review <id> (--approve|--request-changes) (--file <path>|--message <text>)\n  yoi ticket state <id> <planning|ready|queued|inprogress|done|closed>\n  yoi ticket close <id> (--resolution <text>|--file <path>)\n  yoi ticket relation add --ticket <id> --kind <depends_on|blocks|related|supersedes|duplicate_of> --target <id> [--note <text>]\n  yoi ticket relation list [--ticket <id>] [--kind <kind>]\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  `yoi ticket init` writes explicit fixed role profiles and optional [ticket].language into .yoi/workspace.toml.\n  Uses workspace Ticket settings from .yoi/workspace.toml [ticket] when present; .yoi/ticket.config.toml is a read-only migration fallback only.\n  Supported provider: builtin:yoi_local.\n  Without configured Ticket settings, the local backend root is <cwd>/.yoi/tickets.\n"
 }
 
 #[cfg(test)]
@@ -1106,33 +1177,31 @@ mod tests {
     }
 
     #[test]
-    fn ticket_cli_init_writes_explicit_ticket_config_scaffold() {
+    fn ticket_cli_init_writes_explicit_workspace_ticket_settings() {
         let temp = TempDir::new().unwrap();
 
         let initialized = run(&temp, &["init"]);
         assert_eq!(initialized.status, TicketCliStatus::Success);
-        assert!(
-            initialized
-                .stdout
-                .contains("created\t.yoi/ticket.config.toml")
-        );
+        assert!(initialized.stdout.contains("created\t.yoi/workspace.toml"));
         assert!(initialized.stdout.contains("ensured\t.yoi/tickets"));
         assert!(temp.path().join(".yoi/tickets").exists());
         assert!(temp.path().join(".yoi/tickets/.gitkeep").exists());
 
-        let config = fs::read_to_string(temp.path().join(".yoi/ticket.config.toml")).unwrap();
-        assert!(config.contains("[backend]\n"));
+        let config = fs::read_to_string(temp.path().join(".yoi/workspace.toml")).unwrap();
+        assert!(config.contains("workspace_id = \""));
+        assert!(config.contains("[ticket]\n"));
+        assert!(config.contains("[ticket.backend]\n"));
         assert!(config.contains("provider = \"builtin:yoi_local\""));
         assert!(config.contains("root = \".yoi/tickets\""));
-        assert!(config.contains("# [ticket]\n# language = \"Japanese\""));
+        assert!(config.contains("# language = \"Japanese\""));
         for role in TicketRole::ALL {
             assert!(config.contains(&format!(
-                "[roles.{role}]\nprofile = \"{}\"\nworkflow = \"{}\"",
+                "[ticket.roles.{role}]\nprofile = \"{}\"\nworkflow = \"{}\"",
                 role.default_profile(),
                 role.default_workflow()
             )));
         }
-        assert!(!config.contains("[roles.investigator]"));
+        assert!(!config.contains("[ticket.roles.investigator]"));
     }
 
     #[test]
@@ -1148,9 +1217,9 @@ mod tests {
 
         let cli = parse_ticket_args(&args(&["init"])).unwrap();
         let err = run_in_workspace(cli, temp.path()).unwrap_err();
-        assert!(err.to_string().contains("already exists"));
-        assert!(err.to_string().contains("refusing to overwrite"));
-        assert!(err.to_string().contains("yoi ticket init"));
+        assert!(err.to_string().contains("legacy ticket config exists"));
+        assert!(err.to_string().contains("obsolete and read-only"));
+        assert!(err.to_string().contains(WORKSPACE_SETTINGS_RELATIVE_PATH));
         assert_eq!(
             fs::read_to_string(config_path).unwrap(),
             "[backend]\nprovider = \"builtin:yoi_local\"\n"
@@ -1414,8 +1483,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         fs::create_dir_all(temp.path().join(".yoi")).unwrap();
         fs::write(
-            temp.path().join(".yoi/ticket.config.toml"),
-            "[backend]\nprovider = \"builtin:yoi_local\"\nroot = \"custom-tickets\"\n",
+            temp.path().join(".yoi/workspace.toml"),
+            "[ticket]\nlanguage = \"Japanese\"\n\n[ticket.backend]\nprovider = \"builtin:yoi_local\"\nroot = \"custom-tickets\"\n",
         )
         .unwrap();
 
