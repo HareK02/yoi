@@ -292,3 +292,33 @@ Validation performed:
 - Static read-only review only; no tests rerun because the blocker is visible in source。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-15T22:50:56Z -->
+
+## Implementation report
+
+Second follow-up implementation progress report after request_changes:
+
+- Coder Pod `yoi-coder-00001KXKP2A71-knowledge-removal` completed the remaining web console `#` completion fix。
+- Follow-up commit: `20654f9c fix: disable hash console completions`。
+- Orchestrator inspected worktree status, branch log, commit stats, and `git diff --check f2106407..HEAD`; worktree was clean and diff check passed。
+
+Fix summary:
+- Removed `"#"` from `ComposerCompletionToken.sigil`。
+- Changed web console completion token regex from `[:@#]` to `[:@]`。
+- Removed fallback/default remapping that turned unknown sigils, including `#`, into file completion。
+- Added focused test asserting `ask #plain` is not a completion token。
+- No Knowledge/Skill compatibility or remapping was added。
+
+Coder-reported validation passed:
+- Focused grep over web console/route completion files for `"#"`, `[:@#]`, `case "#"`, `#<typed>`, `#<slug>`, `knowledge`: no hits。
+- `cd web/workspace && deno task check && deno task test`
+- `git diff --check`
+- `cargo check -p yoi`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Next action:
+- Request focused re-review of the remaining hash completion blocker and overall acceptance before merge/close decisions。
+
+---
