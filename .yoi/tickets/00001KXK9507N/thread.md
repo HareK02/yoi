@@ -317,3 +317,101 @@ Validation performed by reviewer:
 Blockers: none。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-15T17:51:09Z -->
+
+## Implementation report
+
+Merge / final validation report:
+
+- Reviewer approved the implementation after the Panel overlay configured-root fix。
+- Merged branch `work/00001KXK9507N-ticket-workspace-settings` into orchestration branch with merge commit `45783b74 merge: workspace ticket settings`。
+- Final validation was rerun in `/home/hare/Projects/yoi/.worktree/orchestration` after merge。
+
+Validation passed:
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo test -p ticket`
+- `cargo test -p yoi --tests`
+- `cargo test -p client --lib --tests`
+- `cargo test -p worker --lib --tests`
+- `cargo test -p yoi-workspace-server --lib`
+- `cargo test -p tui --lib --tests`
+- `cargo check -p yoi`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Validation log:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/workspace-ticket-settings-final-validation-1784137566.txt`
+
+Reviewed/merged implementation commits:
+- `b1e3a2ad ticket: move ticket settings into workspace config`
+- `40f21145 tui: use configured ticket root for overlay`
+
+Notes:
+- `.yoi/ticket.config.toml` was removed from tracked active project config。
+- `.yoi/workspace.toml [ticket]` is now the durable Ticket settings authority; legacy config remains only as narrow fallback when workspace `[ticket]` is absent。
+- Per user instruction, no `StopPod` cleanup was performed。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-07-15T17:51:15Z from: inprogress to: done reason: implementation_validated field: state -->
+
+## State changed
+
+Implementation was reviewed, merged into orchestration branch, and final validation passed. Moving to done before closure.
+
+---
+
+<!-- event: state_changed author: hare at: 2026-07-15T17:51:30Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-07-15T17:51:30Z status: closed -->
+
+## 完了
+
+Ticket configuration の Workspace settings 統合を実装・レビュー・merge・検証した。
+
+実装内容:
+- durable Ticket policy authority を `.yoi/workspace.toml [ticket]` に移動。
+- tracked `.yoi/ticket.config.toml` を削除。
+- Workspace `[ticket]` がない場合のみ legacy `.yoi/ticket.config.toml` を narrow read-only migration fallback として読むようにした。
+- Workspace `[ticket]` が存在する場合は legacy config を無視し、二重 active authority を避ける precedence にした。
+- default behavior は維持し、設定なしでは `provider = builtin:yoi_local`, `root = .yoi/tickets` を使う。
+- Ticket backend provider/root、record language、orchestration defaults、fixed role launch config を Workspace settings authority に移した。
+- Direct Ticket CLI / Objective config consumers / Worker Ticket feature setup / workspace-server Ticket backend endpoint / project record reader / Panel role launch availability / role launch tests を新 authority 解決へ更新。
+- Panel orchestration overlay も orchestration worktree の `TicketConfig::load_workspace(worktree_root)` を使い、configured backend root と record language を尊重するよう修正。
+- docs で `.yoi/ticket.config.toml` obsolete と新 `[ticket]` workspace settings shape を記録。
+
+Review:
+- 初回 review は Panel orchestration overlay が `.yoi/tickets` を hard-code している blocker で `request_changes`。
+- `40f21145 tui: use configured ticket root for overlay` で overlay read path を configured Ticket root に移行し、non-default root regression test を追加。
+- focused re-review は `approve`。
+
+Merge / validation:
+- Merge commit: `45783b74 merge: workspace ticket settings`。
+- Final validation passed:
+  - `cargo fmt --check`
+  - `git diff --check`
+  - `cargo test -p ticket`
+  - `cargo test -p yoi --tests`
+  - `cargo test -p client --lib --tests`
+  - `cargo test -p worker --lib --tests`
+  - `cargo test -p yoi-workspace-server --lib`
+  - `cargo test -p tui --lib --tests`
+  - `cargo check -p yoi`
+  - `yoi ticket doctor`
+  - `nix build .#yoi --no-link`
+- Validation log: `/run/user/1000/yoi/yoi-orchestrator/bash-output/workspace-ticket-settings-final-validation-1784137566.txt`
+
+Cleanup:
+- Implementation worktree/branch cleanup will be performed after close commit。
+- Per user instruction, `StopPod` is not used。
+
+---

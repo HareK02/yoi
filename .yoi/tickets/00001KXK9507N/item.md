@@ -1,8 +1,8 @@
 ---
 title: 'Consolidate Ticket configuration into Workspace settings'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-07-15T16:18:25Z'
-updated_at: '2026-07-15T17:45:34Z'
+updated_at: '2026-07-15T17:51:30Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-07-15T16:19:31Z'
