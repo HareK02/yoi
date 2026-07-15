@@ -262,3 +262,34 @@ Non-blocking note:
 - non-default-root Panel orchestration-overlay test を追加すると、この経路の regression を防げる。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-15T17:43:06Z -->
+
+## Implementation report
+
+Follow-up implementation progress report after request_changes:
+
+- Coder Pod `yoi-coder-00001KXK9507N-ticket-settings` completed the Panel overlay configured-root fix in `/home/hare/Projects/yoi/.worktree/00001KXK9507N-ticket-workspace-settings`。
+- Follow-up commit: `40f21145415106dabf0905d301dd04b73fabd424 tui: use configured ticket root for overlay`。
+- Orchestrator inspected worktree status, branch log, commit stats, and `git diff --check c68ed1fd..HEAD`; worktree was clean and diff check passed。
+
+Fix summary:
+- Panel orchestration overlay loading now uses `TicketConfig::load_workspace(worktree_root)`。
+- Overlay reads use the orchestration worktree’s configured `[ticket.backend].root` and Ticket record language。
+- Hard-coded `.yoi/tickets` overlay read path was removed except through config defaults。
+- Missing/unusable configured overlay backend root diagnostics are preserved。
+- Regression test added: `workspace_panel_orchestration_overlay_uses_configured_backend_root`。
+- Test verifies non-default orchestration overlay Ticket root is used and `.yoi/tickets` is not required。
+
+Coder-reported validation passed:
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo test -p tui --lib --tests` (`383 passed`)
+- `cargo check -p yoi`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Next action:
+- Request focused re-review of the previous Panel overlay blocker and overall acceptance before merge/close decisions。
+
+---
