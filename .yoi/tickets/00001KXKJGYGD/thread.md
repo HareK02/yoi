@@ -327,3 +327,32 @@ Required fix:
 - Update the test fixture to use a non-legacy active SystemItem kind or otherwise align it with workflow ignore semantics。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-15T21:32:50Z -->
+
+## Implementation report
+
+Third follow-up implementation progress report after request_changes:
+
+- Coder Pod `yoi-coder-00001KXKJGYGD-workflow-removal` completed the remaining TUI test blocker fix。
+- Follow-up commit: `bc48094dde08f5a1b20a060623b7a4c786d81ee2` (`fix: update workflow-free tui tests`)。
+- Orchestrator inspected worktree status, branch log, commit stats, and `git diff --check 83ad7506..HEAD`; worktree was clean and diff check passed。
+
+Fix summary:
+- Updated `live_system_snapshot_replaces_task_store` so the task-store snapshot fixture is carried by active `task_reminder` `SystemItem` text instead of legacy `kind: "workflow"`。
+- Legacy workflow `SystemItem`s remain ignored/drop-diagnostic only; no workflow active behavior was re-enabled。
+- Updated stale dashboard routing-message test assertions to match workflow-free queue guidance while running full TUI tests。
+
+Coder-reported validation passed:
+- `cargo test -p tui --lib live_system_snapshot_replaces_task_store -- --nocapture`
+- `cargo test -p tui --lib live_legacy_workflow_system_item_is_ignored -- --nocapture`
+- `git diff --check`
+- `cargo test -p tui --lib --tests`
+- `cargo check -p yoi`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Next action:
+- Request focused re-review of the remaining TUI test blocker and overall acceptance before merge/close decisions。
+
+---
