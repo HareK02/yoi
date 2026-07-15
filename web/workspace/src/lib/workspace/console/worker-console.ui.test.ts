@@ -11,19 +11,19 @@ function assert(condition: unknown, message: string): asserts condition {
 
 Deno.test("workspace Worker list lives on the dedicated Workers page", async () => {
   const workspacePage = await Deno.readTextFile(
-    new URL("./../../routes/w/[workspaceId]/+page.svelte", import.meta.url),
+    new URL("./../../../routes/w/[workspaceId]/+page.svelte", import.meta.url),
   );
   const workersPage = await Deno.readTextFile(
     new URL(
-      "./../../routes/w/[workspaceId]/workers/+page.svelte",
+      "./../../../routes/w/[workspaceId]/workers/+page.svelte",
       import.meta.url,
     ),
   );
   const workersNav = await Deno.readTextFile(
-    new URL("../workspace-sidebar/WorkersNavSection.svelte", import.meta.url),
+    new URL("../sidebar/WorkersNavSection.svelte", import.meta.url),
   );
   const sidebar = await Deno.readTextFile(
-    new URL("../workspace-sidebar/WorkspaceSidebar.svelte", import.meta.url),
+    new URL("../sidebar/WorkspaceSidebar.svelte", import.meta.url),
   );
 
   assert(
@@ -59,7 +59,7 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
 Deno.test("Worker Console uses protocol observation events without transcript fetch", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(
-      "./../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
       import.meta.url,
     ),
   );
@@ -94,10 +94,24 @@ Deno.test("Worker Console renders markdown only for message rows", async () => {
   );
 });
 
+Deno.test("Worker Console renders Edit diffs without preformatted template gaps", async () => {
+  const consoleLine = await Deno.readTextFile(
+    new URL("./ConsoleLineItem.svelte", import.meta.url),
+  );
+
+  assert(
+    consoleLine.includes('<div class="console-diff" role="group" aria-label="Edit diff">') &&
+      consoleLine.includes("{#each item.diff as diffLine}") &&
+      consoleLine.includes("class={`diff-line ${diffLine.kind}`}") &&
+      !consoleLine.includes('<pre class="console-diff"'),
+    "Edit diff rows should not be wrapped in a pre element that preserves template whitespace as blank lines",
+  );
+});
+
 Deno.test("Worker Console exposes a foldable timeline beside the scroll body", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(
-      "./../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
       import.meta.url,
     ),
   );
@@ -114,7 +128,15 @@ Deno.test("Worker Console exposes a foldable timeline beside the scroll body", a
       consoleLine.includes("data-console-line-id={item.id}") &&
       consolePage.includes("class:timeline-open={timelineOpen}") &&
       consolePage.includes("class=\"timeline-fold\"") &&
-      consolePage.includes("{#if timelineOpen}") &&
+      consolePage.includes("expanded={timelineOpen}") &&
+      !consolePage.includes("{#if timelineOpen}") &&
+      consolePage.includes("handleTimelineRailPointerDown") &&
+      consolePage.includes("projectTimelineAxisPosition") &&
+      consolePage.includes("scrollbar-width: none") &&
+      consoleTimeline.includes("onpointerdown={onRailPointerDown}") &&
+      consoleTimeline.includes("expanded ? 'expanded' : 'folded'") &&
+      consoleTimeline.includes(".timeline-mark.expanded .timeline-card") &&
+      !consoleTimeline.includes("{#if expanded}") &&
       consoleTimeline.includes(".timeline-thumb") &&
       consoleTimeline.includes(".timeline-card"),
     "Worker Console should expose a foldable timeline with scroll and line jump markers",
@@ -124,23 +146,33 @@ Deno.test("Worker Console exposes a foldable timeline beside the scroll body", a
 Deno.test("Worker Console composer fits to content without manual resize", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(
-      "./../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
       import.meta.url,
     ),
   );
   assert(
     consolePage.includes("use:fitTextarea={{ value: draft, maxRows: 10 }}") &&
+      consolePage.includes("class=\"composer-input-shell\" onclick={handleComposerShellClick}") &&
+      consolePage.includes("bind:this={composerTextareaElement}") &&
+      consolePage.includes("composerTextareaElement?.focus()") &&
+      consolePage.includes('event.key === "PageUp" || event.key === "PageDown"') &&
+      consolePage.includes("scrollConsoleByPage") &&
+      consolePage.includes("class=\"composer-input-footer\"") &&
+      consolePage.includes("class=\"composer-footer-slot\"") &&
+      consolePage.includes("class=\"composer-send-button\"") &&
+      consolePage.includes("class=\"composer-send-icon\"") &&
+      consolePage.includes('d="M8 6L12 2L16 6"') &&
       consolePage.includes(".console-composer textarea") &&
       consolePage.includes("resize: none") &&
       consolePage.includes("overflow-y: hidden"),
-    "Console composer should autosize to content, cap at ten rows, and disable manual resize",
+    "Console composer should autosize to content, cap at ten rows, wrap input and icon send button, and disable manual resize",
   );
 });
 
 Deno.test("Decodal source editor keeps imperative EditorView out of reactive state", async () => {
   const editor = await Deno.readTextFile(
     new URL(
-      "../workspace-settings/DecodalSourceEditor.svelte",
+      "../settings/DecodalSourceEditor.svelte",
       import.meta.url,
     ),
   );
@@ -156,26 +188,26 @@ Deno.test("Decodal source editor keeps imperative EditorView out of reactive sta
 
 Deno.test("workspace Runtime management pages expose Runtimes and Runtime-owned workdirs", async () => {
   const sidebar = await Deno.readTextFile(
-    new URL("../workspace-sidebar/WorkspaceSidebar.svelte", import.meta.url),
+    new URL("../sidebar/WorkspaceSidebar.svelte", import.meta.url),
   );
   const runtimesNav = await Deno.readTextFile(
-    new URL("../workspace-sidebar/RuntimesNavSection.svelte", import.meta.url),
+    new URL("../sidebar/RuntimesNavSection.svelte", import.meta.url),
   );
   const runtimesPage = await Deno.readTextFile(
     new URL(
-      "./../../routes/w/[workspaceId]/runtimes/+page.svelte",
+      "./../../../routes/w/[workspaceId]/runtimes/+page.svelte",
       import.meta.url,
     ),
   );
   const workdirsPage = await Deno.readTextFile(
     new URL(
-      "./../../routes/w/[workspaceId]/runtimes/[runtimeId]/workdirs/+page.svelte",
+      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workdirs/+page.svelte",
       import.meta.url,
     ),
   );
   const workdirsLoad = await Deno.readTextFile(
     new URL(
-      "./../../routes/w/[workspaceId]/runtimes/[runtimeId]/workdirs/+page.ts",
+      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workdirs/+page.ts",
       import.meta.url,
     ),
   );
@@ -202,11 +234,11 @@ Deno.test("workspace Runtime management pages expose Runtimes and Runtime-owned 
 
 Deno.test("workspace Worker sidebar links New to the dedicated create page", async () => {
   const workersNav = await Deno.readTextFile(
-    new URL("../workspace-sidebar/WorkersNavSection.svelte", import.meta.url),
+    new URL("../sidebar/WorkersNavSection.svelte", import.meta.url),
   );
   const newWorkerPage = await Deno.readTextFile(
     new URL(
-      "./../../routes/w/[workspaceId]/workers/new/+page.svelte",
+      "./../../../routes/w/[workspaceId]/workers/new/+page.svelte",
       import.meta.url,
     ),
   );
@@ -228,13 +260,13 @@ Deno.test("workspace Worker sidebar links New to the dedicated create page", asy
 Deno.test("Worker Console page is routed by runtime_id and worker_id through backend APIs", async () => {
   const consolePage = await Deno.readTextFile(
     new URL(
-      "./../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
+      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.svelte",
       import.meta.url,
     ),
   );
   const routeLoad = await Deno.readTextFile(
     new URL(
-      "./../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.ts",
+      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workers/[workerId]/console/+page.ts",
       import.meta.url,
     ),
   );

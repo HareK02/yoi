@@ -1,13 +1,13 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
-  import { workspaceApiPath } from '$lib/workspace-api/http';
-  import { buildBrowserCreateWorkerRequest, defaultWorkerLaunchForm } from '$lib/workspace-sidebar/worker-launch';
+  import { workspaceApiPath } from '$lib/workspace/api/http';
+  import { buildBrowserCreateWorkerRequest, defaultWorkerLaunchForm } from '$lib/workspace/sidebar/worker-launch';
   import type {
     BrowserCreateWorkerResponse,
     BrowserWorkingDirectoryCreateResponse,
     Diagnostic,
     WorkerLaunchOptionsResponse,
-  } from '$lib/workspace-sidebar/types';
+  } from '$lib/workspace/sidebar/types';
   import type { PageProps } from './$types';
 
   type DisplayError = {

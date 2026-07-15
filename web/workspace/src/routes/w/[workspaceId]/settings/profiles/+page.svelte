@@ -1,20 +1,20 @@
 <script lang="ts">
-  import DiagnosticsList from '$lib/workspace-settings/DiagnosticsList.svelte';
-  import DecodalSourceEditor from '$lib/workspace-settings/DecodalSourceEditor.svelte';
+  import DiagnosticsList from '$lib/workspace/settings/DiagnosticsList.svelte';
+  import DecodalSourceEditor from '$lib/workspace/settings/DecodalSourceEditor.svelte';
   import {
     fetchProfileSettings,
     fetchProfileSourceTree,
     deleteProfileTreeFile,
     fetchProfileTreeFile,
     writeProfileTreeFile,
-  } from '$lib/workspace-settings/profile-api';
-  import type { Diagnostic } from '$lib/workspace-settings/model';
-  import { profileSourceTreeSettingsHref, virtualProfilePathForCreate } from '$lib/workspace-settings/profile-routes';
+  } from '$lib/workspace/settings/profile-api';
+  import type { Diagnostic } from '$lib/workspace/settings/model';
+  import { profileSourceTreeSettingsHref, virtualProfilePathForCreate } from '$lib/workspace/settings/profile-routes';
   import type {
     ProfileSettingsResponse,
     WorkspaceProfileSourceTreeFileResponse,
     WorkspaceProfileSourceTreeResponse,
-  } from '$lib/workspace-settings/profile-types';
+  } from '$lib/workspace/settings/profile-types';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

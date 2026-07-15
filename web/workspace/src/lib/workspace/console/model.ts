@@ -5,7 +5,7 @@ import type {
   InFlightToolCallState,
   Segment,
 } from "$lib/generated/protocol";
-import { workspaceRoute } from "$lib/workspace-api/http";
+import { workspaceRoute } from "$lib/workspace/api/http";
 
 export type ConsoleLineKind =
   | "user"

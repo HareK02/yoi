@@ -1,9 +1,9 @@
-import { loadJson, workspaceApiPath } from "$lib/workspace-api/http";
+import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
 import type {
   RepositoryDetailResponse,
   RepositoryLogResponse,
   RepositoryTicketsResponse,
-} from "$lib/workspace-sidebar/types";
+} from "$lib/workspace/sidebar/types";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params }) => {

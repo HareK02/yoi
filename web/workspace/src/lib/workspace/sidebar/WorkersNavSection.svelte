@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { workspaceApiPath } from '$lib/workspace-api/http';
-  import { workerConsoleHref } from '$lib/workspace-console/model';
+  import { workspaceApiPath } from '$lib/workspace/api/http';
+  import { workerConsoleHref } from '$lib/workspace/console/model';
   import { canShowWorkerInSidebar } from './workers';
   import type { ListResponse, Worker } from './types';
 

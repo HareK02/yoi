@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { RepositoryTicketsResponse, TicketSummary } from '$lib/workspace-sidebar/types';
+  import type { RepositoryTicketsResponse, TicketSummary } from '$lib/workspace/sidebar/types';
 
   const INITIAL_VISIBLE_ROWS = 30;
   const VISIBLE_ROW_INCREMENT = 30;

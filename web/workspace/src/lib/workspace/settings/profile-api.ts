@@ -1,7 +1,7 @@
 import {
   workspaceApiJson,
   workspaceApiJsonWithBody,
-} from "../workspace-api/http";
+} from "../api/http";
 import type {
   ProfileSettingsMutationResponse,
   ProfileSettingsResponse,

@@ -1,6 +1,6 @@
 import { redirect } from "@sveltejs/kit";
-import { loadJson, workspaceApiPath, workspaceRoute } from "$lib/workspace-api/http";
-import type { RepositoryListResponse, WorkspaceResponse } from "$lib/workspace-sidebar/types";
+import { loadJson, workspaceApiPath, workspaceRoute } from "$lib/workspace/api/http";
+import type { RepositoryListResponse, WorkspaceResponse } from "$lib/workspace/sidebar/types";
 import type { LayoutLoad } from "./$types";
 
 export const ssr = false;

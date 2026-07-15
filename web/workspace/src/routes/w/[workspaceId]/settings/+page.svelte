@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { workspaceRoute } from '$lib/workspace-api/http';
-  import { SETTINGS_SECTIONS, settingsSectionHref } from '$lib/workspace-settings/model';
+  import { workspaceRoute } from '$lib/workspace/api/http';
+  import { SETTINGS_SECTIONS, settingsSectionHref } from '$lib/workspace/settings/model';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

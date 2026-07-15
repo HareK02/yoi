@@ -16,11 +16,19 @@
     marks: TimelineMark[];
     thumbStyle: string;
     axisStyle: string;
-    onRailClick: (event: MouseEvent) => void;
+    expanded: boolean;
+    onRailPointerDown: (event: PointerEvent) => void;
     onMarkClick: (mark: TimelineMark) => void;
   };
 
-  let { marks, thumbStyle, axisStyle, onRailClick, onMarkClick }: Props = $props();
+  let {
+    marks,
+    thumbStyle,
+    axisStyle,
+    expanded,
+    onRailPointerDown,
+    onMarkClick,
+  }: Props = $props();
 </script>
 
 <aside class="console-timeline" aria-label="Console timeline">
@@ -28,8 +36,8 @@
     <button
       type="button"
       class="timeline-rail"
-      aria-label="Jump within console scrollback"
-      onclick={onRailClick}
+      aria-label="Scroll console"
+      onpointerdown={onRailPointerDown}
     >
       <span class="timeline-thumb" style={thumbStyle}></span>
     </button>
@@ -37,7 +45,7 @@
       {#each marks as mark (mark.id)}
         <button
           type="button"
-          class={`timeline-mark ${mark.kind}`}
+          class={`timeline-mark ${mark.kind} ${expanded ? 'expanded' : 'folded'}`}
           style={`top: ${mark.position}px`}
           aria-label={mark.detail ? `${mark.label}: ${mark.detail}` : mark.label}
           onclick={() => onMarkClick(mark)}
@@ -81,12 +89,14 @@
   }
 
   .timeline-rail {
-    width: 0.35rem;
+    width: 0.65rem;
     border: 0;
     border-radius: 999px;
     background: color-mix(in srgb, var(--line) 70%, transparent);
-    cursor: pointer;
+    cursor: ns-resize;
     padding: 0;
+    touch-action: none;
+    user-select: none;
   }
 
   .timeline-thumb {
@@ -97,6 +107,7 @@
     border-radius: inherit;
     background: var(--tui-cyan);
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--tui-cyan) 30%, transparent);
+    pointer-events: none;
   }
 
   .timeline-marks {
@@ -139,7 +150,7 @@
   }
 
   .timeline-card {
-    display: grid;
+    display: none;
     width: 10rem;
     min-width: 0;
     grid-template-columns: minmax(0, 1fr);
@@ -152,6 +163,10 @@
     opacity: 1;
     padding: 0.25rem 0.45rem;
     transform: none;
+  }
+
+  .timeline-mark.expanded .timeline-card {
+    display: grid;
   }
 
   .timeline-card span {

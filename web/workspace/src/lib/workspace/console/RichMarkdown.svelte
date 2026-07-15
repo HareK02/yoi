@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { markdownToHtml } from "$lib/workspace-console/markdown";
+  import { markdownToHtml } from "$lib/workspace/console/markdown";
 
   type Props = {
     text: string;

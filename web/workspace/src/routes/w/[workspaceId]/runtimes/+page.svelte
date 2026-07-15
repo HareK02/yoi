@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Runtime } from '$lib/workspace-sidebar/types';
+  import type { Runtime } from '$lib/workspace/sidebar/types';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

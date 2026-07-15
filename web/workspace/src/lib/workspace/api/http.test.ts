@@ -29,7 +29,7 @@ Deno.test("workspace route helpers scope browser routes and API by immutable wor
 });
 
 Deno.test("unscoped layout bootstraps then redirects instead of loading unscoped workspace data", async () => {
-  const layout = await Deno.readTextFile(new URL("../../routes/+layout.ts", import.meta.url));
+  const layout = await Deno.readTextFile(new URL("./../../../routes/+layout.ts", import.meta.url));
   assert(
     layout.includes('loadJson<WorkspaceResponse>(fetch, "/api/workspace")'),
     "unscoped layout may use only the workspace-id bootstrap endpoint",
@@ -44,7 +44,7 @@ Deno.test("unscoped layout bootstraps then redirects instead of loading unscoped
   );
 
   const unscopedSettings = await Deno.readTextFile(
-    new URL("../../routes/settings/+page.svelte", import.meta.url),
+    new URL("./../../../routes/settings/+page.svelte", import.meta.url),
   );
   assert(
     unscopedSettings.includes("Redirecting to scoped settings") &&

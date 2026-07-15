@@ -1,6 +1,6 @@
 <script lang="ts">
-  import RichMarkdown from '$lib/workspace-console/RichMarkdown.svelte';
-  import type { ConsoleLine } from '$lib/workspace-console/model';
+  import RichMarkdown from '$lib/workspace/console/RichMarkdown.svelte';
+  import type { ConsoleLine } from '$lib/workspace/console/model';
 
   type Props = {
     item: ConsoleLine;
@@ -73,8 +73,11 @@
     <p class="console-plain-text">{item.body || '—'}</p>
   {/if}
   {#if item.diff}
-    <pre class="console-diff" aria-label="Edit diff">{#each item.diff as diffLine}
-<span class={`diff-line ${diffLine.kind}`}><span class="diff-gutter">{diffLine.oldNumber ?? ''}</span><span class="diff-gutter">{diffLine.newNumber ?? ''}</span><span class="diff-marker">{diffLine.kind === 'add' ? '+' : diffLine.kind === 'remove' ? '-' : ' '}</span><span class="diff-content">{diffLine.content}</span></span>{/each}</pre>
+    <div class="console-diff" role="group" aria-label="Edit diff">
+      {#each item.diff as diffLine}
+        <span class={`diff-line ${diffLine.kind}`}><span class="diff-gutter">{diffLine.oldNumber ?? ''}</span><span class="diff-gutter">{diffLine.newNumber ?? ''}</span><span class="diff-marker">{diffLine.kind === 'add' ? '+' : diffLine.kind === 'remove' ? '-' : ' '}</span><span class="diff-content">{diffLine.content}</span></span>
+      {/each}
+    </div>
   {/if}
   {#if item.detail}
     <details class="message-detail">
@@ -222,6 +225,7 @@
     border: 1px solid var(--line);
     border-radius: 0.65rem;
     color: var(--text);
+    font-family: var(--font-mono);
     font-size: 0.78rem;
     line-height: 1.45;
     margin: 0.6rem 0 0;

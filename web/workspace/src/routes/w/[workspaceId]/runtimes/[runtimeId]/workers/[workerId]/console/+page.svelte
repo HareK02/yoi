@@ -1,31 +1,31 @@
 <script lang="ts">
     import { tick } from "svelte";
-    import ConsoleLineItem from "$lib/workspace-console/ConsoleLineItem.svelte";
-    import ConsoleTimeline from "$lib/workspace-console/ConsoleTimeline.svelte";
-    import { chatSubmit } from "$lib/workspace-console/chat-submit";
-    import { buildComposerRequest } from "$lib/workspace-console/composer-command";
+    import ConsoleLineItem from "$lib/workspace/console/ConsoleLineItem.svelte";
+    import ConsoleTimeline from "$lib/workspace/console/ConsoleTimeline.svelte";
+    import { chatSubmit } from "$lib/workspace/console/chat-submit";
+    import { buildComposerRequest } from "$lib/workspace/console/composer-command";
     import {
         applyCompletion,
         completionTokenAt,
         localCommandCompletions,
         type ComposerCompletionEntry,
         type ComposerCompletionToken,
-    } from "$lib/workspace-console/composer-completion";
-    import { fitTextarea } from "$lib/workspace-console/textarea-fit";
+    } from "$lib/workspace/console/composer-completion";
+    import { fitTextarea } from "$lib/workspace/console/textarea-fit";
     import {
         createConsoleProjector,
         type ConsoleEventInput,
         type ConsoleLine,
         type ConsoleProjection,
-    } from "$lib/workspace-console/model";
-    import { workspaceApiPath } from "$lib/workspace-api/http";
+    } from "$lib/workspace/console/model";
+    import { workspaceApiPath } from "$lib/workspace/api/http";
     import type {
         ClientWorkerEventWsFrame,
         Diagnostic,
         Worker,
         WorkerInputResult,
         PodProtocolEvent,
-    } from "$lib/workspace-sidebar/types";
+    } from "$lib/workspace/sidebar/types";
 
     type Props = {
         data: {
@@ -106,6 +106,8 @@
     let workerDetailsOpen = $state(false);
     let timelineOpen = $state(false);
     let consoleBodyElement: HTMLElement | null = null;
+    let composerTextareaElement: HTMLTextAreaElement | null = null;
+    let timelineRailDragCleanup: (() => void) | null = null;
     let autoFollowConsole = $state(true);
     let consoleScroll = $state<ScrollMetrics>({ top: 0, height: 1, client: 1 });
     const eventObservedAtById = new Map<string, number>();
@@ -365,11 +367,38 @@
     }
 
     function handleComposerKeydown(event: KeyboardEvent) {
+        if (event.key === "PageUp" || event.key === "PageDown") {
+            event.preventDefault();
+            scrollConsoleByPage(event.key === "PageDown" ? 1 : -1);
+            return;
+        }
         if (event.key !== "Tab") {
             return;
         }
         event.preventDefault();
         void applyComposerCompletion(event);
+    }
+
+    function scrollConsoleByPage(direction: 1 | -1) {
+        if (!consoleBodyElement) {
+            return;
+        }
+        consoleBodyElement.scrollBy({
+            top: direction * Math.max(consoleBodyElement.clientHeight * 0.86, 1),
+            behavior: "auto",
+        });
+        window.requestAnimationFrame(updateConsoleScrollMetrics);
+    }
+
+    function handleComposerShellClick(event: MouseEvent) {
+        const target = event.target;
+        if (
+            target instanceof Element &&
+            target.closest("button, textarea, a")
+        ) {
+            return;
+        }
+        composerTextareaElement?.focus();
     }
 
     async function submitDraft(value = draft) {
@@ -534,7 +563,7 @@
         return {
             scale,
             axisSize,
-            marks: positioned,
+            marks: projectTimelineMarks(positioned, axisSize, trackHeight),
         };
     }
 
@@ -574,6 +603,28 @@
             };
         });
         return positioned;
+    }
+
+    function projectTimelineMarks(
+        marks: TimelineMark[],
+        axisSize: number,
+        trackHeight: number,
+    ): TimelineMark[] {
+        return marks.map((mark) => ({
+            ...mark,
+            position: projectTimelineAxisPosition(mark.position, axisSize, trackHeight),
+        }));
+    }
+
+    function projectTimelineAxisPosition(
+        axisPosition: number,
+        axisSize: number,
+        trackHeight: number,
+    ): number {
+        if (axisSize <= 0) {
+            return 0;
+        }
+        return (axisPosition / axisSize) * trackHeight;
     }
 
     function timelineAxisSize(
@@ -748,6 +799,7 @@
         metrics: ScrollMetrics,
         layout: TimelineLayout,
     ): string {
+        const trackHeight = timelineTrackHeight(metrics);
         const contentHeight = Math.max(metrics.height, 1);
         const viewportHeight = Math.max(metrics.client, 1);
         const scrollable = Math.max(contentHeight - viewportHeight, 1);
@@ -757,9 +809,19 @@
         const sourceBottom = Math.min(100, sourceTop + viewportRatio * 100);
         const targetTop = mapTimelinePosition(layout.scale, sourceTop);
         const targetBottom = mapTimelinePosition(layout.scale, sourceBottom);
-        const height = Math.max(targetBottom - targetTop, 18);
-        const top = Math.min(targetTop, Math.max(0, layout.axisSize - height));
-        return `top: ${Math.max(0, top)}px; height: ${Math.min(height, layout.axisSize)}px;`;
+        const projectedTop = projectTimelineAxisPosition(
+            targetTop,
+            layout.axisSize,
+            trackHeight,
+        );
+        const projectedBottom = projectTimelineAxisPosition(
+            targetBottom,
+            layout.axisSize,
+            trackHeight,
+        );
+        const height = Math.max(projectedBottom - projectedTop, 18);
+        const top = Math.min(projectedTop, Math.max(0, trackHeight - height));
+        return `top: ${Math.max(0, top)}px; height: ${Math.min(height, trackHeight)}px;`;
     }
 
     function timelineTrackHeight(metrics: ScrollMetrics): number {
@@ -767,16 +829,12 @@
     }
 
     function timelineAxisStyleFor(
-        layout: TimelineLayout,
+        _layout: TimelineLayout,
         metrics: ScrollMetrics,
     ): string {
-        const trackHeight = timelineTrackHeight(metrics);
-        const scrollable = Math.max(metrics.height - metrics.client, 1);
-        const scrollRatio = Math.max(0, Math.min(1, metrics.top / scrollable));
-        const offset = Math.max(0, layout.axisSize - trackHeight) * scrollRatio;
         return [
-            `height: ${layout.axisSize}px`,
-            `top: ${TIMELINE_AXIS_PADDING_PX - offset}px`,
+            `height: ${timelineTrackHeight(metrics)}px`,
+            `top: ${TIMELINE_AXIS_PADDING_PX}px`,
         ].join("; ");
     }
 
@@ -789,21 +847,21 @@
         }
     }
 
-    function jumpTimelineRatio(event: MouseEvent) {
-        if (
-            !consoleBodyElement ||
-            !(event.currentTarget instanceof HTMLElement)
-        ) {
+    function scrollConsoleToTimelineRailPosition(
+        rail: HTMLElement,
+        clientY: number,
+        behavior: ScrollBehavior,
+    ) {
+        if (!consoleBodyElement) {
             return;
         }
-        const rect = event.currentTarget.getBoundingClientRect();
-        const targetPx = Math.max(
-            0,
-            Math.min(rect.height, event.clientY - rect.top),
-        );
+        const rect = rail.getBoundingClientRect();
+        const trackHeight = Math.max(rect.height, 1);
+        const targetPx = Math.max(0, Math.min(trackHeight, clientY - rect.top));
+        const axisPosition = (targetPx / trackHeight) * timelineLayout.axisSize;
         const sourcePercent = unmapTimelinePosition(
             timelineLayout.scale,
-            targetPx,
+            axisPosition,
         );
         consoleBodyElement.scrollTo({
             top:
@@ -813,8 +871,48 @@
                         consoleBodyElement.clientHeight,
                     0,
                 ),
-            behavior: "smooth",
+            behavior,
         });
+    }
+
+    function handleTimelineRailPointerDown(event: PointerEvent) {
+        if (!(event.currentTarget instanceof HTMLElement)) {
+            return;
+        }
+        event.preventDefault();
+        const rail = event.currentTarget;
+        const pointerId = event.pointerId;
+        scrollConsoleToTimelineRailPosition(rail, event.clientY, "auto");
+
+        const handleMove = (moveEvent: PointerEvent) => {
+            if (moveEvent.pointerId !== pointerId) {
+                return;
+            }
+            moveEvent.preventDefault();
+            scrollConsoleToTimelineRailPosition(rail, moveEvent.clientY, "auto");
+        };
+        const stopDrag = (finishEvent: PointerEvent) => {
+            if (finishEvent.pointerId !== pointerId) {
+                return;
+            }
+            timelineRailDragCleanup?.();
+        };
+
+        timelineRailDragCleanup?.();
+        timelineRailDragCleanup = () => {
+            window.removeEventListener("pointermove", handleMove);
+            window.removeEventListener("pointerup", stopDrag);
+            window.removeEventListener("pointercancel", stopDrag);
+            timelineRailDragCleanup = null;
+        };
+        window.addEventListener("pointermove", handleMove);
+        window.addEventListener("pointerup", stopDrag);
+        window.addEventListener("pointercancel", stopDrag);
+        try {
+            rail.setPointerCapture(pointerId);
+        } catch {
+            // Pointer capture can fail if the pointer is already released.
+        }
     }
 
     function cssEscape(value: string): string {
@@ -875,6 +973,10 @@
         } else {
             tick().then(updateConsoleScrollMetrics);
         }
+    });
+
+    $effect(() => {
+        return () => timelineRailDragCleanup?.();
     });
 
     $effect(() => {
@@ -955,15 +1057,14 @@
             </article>
         </div>
 
-        {#if timelineOpen}
-            <ConsoleTimeline
-                marks={timelineMarks}
-                thumbStyle={timelineThumb}
-                axisStyle={timelineAxisStyle}
-                onRailClick={jumpTimelineRatio}
-                onMarkClick={jumpToTimelineMark}
-            />
-        {/if}
+        <ConsoleTimeline
+            marks={timelineMarks}
+            thumbStyle={timelineThumb}
+            axisStyle={timelineAxisStyle}
+            expanded={timelineOpen}
+            onRailPointerDown={handleTimelineRailPointerDown}
+            onMarkClick={jumpToTimelineMark}
+        />
     </section>
 
     {#if workerDetailsOpen}
@@ -1053,39 +1154,58 @@
     {/if}
 
     <form class="console-composer card" onsubmit={sendMessage}>
-        <textarea
-            id="worker-console-message"
-            aria-label="Console input"
-            aria-keyshortcuts="Meta+Enter Control+Enter"
-            bind:value={draft}
-            use:chatSubmit={{
-                enabled: inputReady && !sending,
-                onSubmit: (value) => void submitDraft(value),
-            }}
-            use:fitTextarea={{ value: draft, maxRows: 10 }}
-            onkeydown={handleComposerKeydown}
-            disabled={!inputReady || sending}></textarea>
-        {#if completionBusy || completionError || completionEntries.length > 0}
-            <div class="composer-completions" aria-live="polite">
-                {#if completionBusy}
-                    <span>completing…</span>
-                {:else if completionError}
-                    <span class="error">{completionError}</span>
-                {:else}
-                    <span
-                        >Tab: {completionToken?.sigil}{completionEntries[0]
-                            ?.value}</span
-                    >
-                    {#if completionEntries.length > 1}
-                        <span>{completionEntries.length - 1} more</span>
+        <div class="composer-input-shell" onclick={handleComposerShellClick}>
+            <textarea
+                id="worker-console-message"
+                aria-label="Console input"
+                aria-keyshortcuts="Meta+Enter Control+Enter"
+                bind:this={composerTextareaElement}
+                bind:value={draft}
+                use:chatSubmit={{
+                    enabled: inputReady && !sending,
+                    onSubmit: (value) => void submitDraft(value),
+                }}
+                use:fitTextarea={{ value: draft, maxRows: 10 }}
+                onkeydown={handleComposerKeydown}
+                disabled={!inputReady || sending}></textarea>
+            <div class="composer-input-footer">
+                <div class="composer-footer-slot">
+                    {#if completionBusy || completionError || completionEntries.length > 0}
+                        <div class="composer-completions" aria-live="polite">
+                            {#if completionBusy}
+                                <span>completing…</span>
+                            {:else if completionError}
+                                <span class="error">{completionError}</span>
+                            {:else}
+                                <span
+                                    >Tab: {completionToken?.sigil}{completionEntries[0]
+                                        ?.value}</span
+                                >
+                                {#if completionEntries.length > 1}
+                                    <span>{completionEntries.length - 1} more</span>
+                                {/if}
+                            {/if}
+                        </div>
                     {/if}
-                {/if}
+                </div>
+                <button
+                    class="composer-send-button"
+                    type="submit"
+                    aria-label={sending ? "Sending message" : "Send message"}
+                    disabled={!canSend}
+                >
+                    <svg
+                        class="composer-send-icon"
+                        aria-hidden="true"
+                        viewBox="0 0 24 24"
+                    >
+                        <path d="M8 6L12 2L16 6" />
+                        <path d="M12 2V22" />
+                    </svg>
+                </button>
             </div>
-        {/if}
+        </div>
         <div class="composer-actions">
-            <button type="submit" disabled={!canSend}>
-                {sending ? "Sending…" : "Send"}
-            </button>
             {#if composerNotice}
                 <span class="composer-notice">{composerNotice}</span>
             {/if}
@@ -1203,32 +1323,13 @@
         min-width: 0;
         min-height: 0;
         overflow-y: auto;
-        padding-right: var(--space-2);
-        scrollbar-color: color-mix(in srgb, var(--tui-cyan) 60%, var(--line))
-            color-mix(in srgb, var(--bg-raised) 70%, transparent);
-        scrollbar-gutter: stable;
-        scrollbar-width: thin;
+        padding-right: 0;
+        scrollbar-gutter: auto;
+        scrollbar-width: none;
     }
 
     .console-scroll::-webkit-scrollbar {
-        width: 0.65rem;
-    }
-
-    .console-scroll::-webkit-scrollbar-track {
-        border-radius: 999px;
-        background: color-mix(in srgb, var(--bg-raised) 70%, transparent);
-    }
-
-    .console-scroll::-webkit-scrollbar-thumb {
-        border: 2px solid transparent;
-        border-radius: 999px;
-        background: color-mix(in srgb, var(--tui-cyan) 60%, var(--line));
-        background-clip: padding-box;
-    }
-
-    .console-scroll::-webkit-scrollbar-thumb:hover {
-        background: var(--tui-cyan);
-        background-clip: padding-box;
+        display: none;
     }
 
     .console-log {
@@ -1309,23 +1410,80 @@
         background: var(--bg);
     }
 
+    .composer-input-shell {
+        display: grid;
+        gap: var(--space-2);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: var(--bg-raised);
+        cursor: text;
+        padding: 0.35rem;
+    }
+
+    .composer-input-shell:focus-within {
+        border-color: color-mix(in srgb, var(--tui-cyan) 60%, var(--line));
+        box-shadow: 0 0 0 1px color-mix(in srgb, var(--tui-cyan) 18%, transparent);
+    }
+
+    .composer-input-footer {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: var(--space-2);
+        align-items: end;
+        min-height: 2.35rem;
+        padding-left: 0.65rem;
+    }
+
+    .composer-footer-slot {
+        min-width: 0;
+    }
+
     .console-composer textarea {
         box-sizing: border-box;
         width: 100%;
         min-height: 0;
         resize: none;
         overflow-y: hidden;
-        border: 1px solid var(--line);
+        border: 0;
         border-radius: 14px;
-        padding: 0.85rem 1rem;
+        background: transparent;
+        padding: 0.55rem 0.65rem;
         font: inherit;
         line-height: 1.45;
         color: var(--text-strong);
+        outline: none;
     }
 
     .console-composer textarea:disabled {
-        background: var(--bg-raised);
         color: var(--text-muted);
+    }
+
+    .composer-send-button {
+        display: inline-grid;
+        width: 2.35rem;
+        height: 2.35rem;
+        place-items: center;
+        border: 0;
+        border-radius: 999px;
+        background: var(--accent);
+        color: var(--bg);
+        cursor: pointer;
+        padding: 0;
+    }
+
+    .composer-send-button:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+    }
+
+    .composer-send-icon {
+        width: 1.2rem;
+        height: 1.2rem;
+        fill: none;
+        stroke: currentColor;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        stroke-width: 2;
     }
 
     .composer-completions {
@@ -1352,21 +1510,6 @@
 
     .composer-actions .composer-notice {
         margin-right: auto;
-    }
-
-    .composer-actions button {
-        border: 0;
-        border-radius: 999px;
-        padding: 0.65rem 1rem;
-        background: var(--accent);
-        color: var(--bg);
-        font-weight: 800;
-        cursor: pointer;
-    }
-
-    .composer-actions button:disabled {
-        cursor: not-allowed;
-        opacity: 0.55;
     }
 
     @media (max-width: 960px) {

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { workspaceRoute } from '$lib/workspace-api/http';
+  import { workspaceRoute } from '$lib/workspace/api/http';
   import ObjectivesNavSection from './ObjectivesNavSection.svelte';
   import RepositoriesNavSection from './RepositoriesNavSection.svelte';
   import RuntimesNavSection from './RuntimesNavSection.svelte';

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { formatDate, workspaceRoute } from '$lib/workspace-api/http';
+  import { formatDate, workspaceRoute } from '$lib/workspace/api/http';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

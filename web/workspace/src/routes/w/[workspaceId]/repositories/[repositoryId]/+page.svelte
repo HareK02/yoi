@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { formatDate } from '$lib/workspace-api/http';
-  import RepositoryTicketKanban from '$lib/workspace-pages/RepositoryTicketKanban.svelte';
+  import { formatDate } from '$lib/workspace/api/http';
+  import RepositoryTicketKanban from '$lib/workspace/pages/RepositoryTicketKanban.svelte';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

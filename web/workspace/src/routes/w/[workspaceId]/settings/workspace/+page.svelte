@@ -1,11 +1,11 @@
 <script lang="ts">
-  import DiagnosticsList from '$lib/workspace-settings/DiagnosticsList.svelte';
+  import DiagnosticsList from '$lib/workspace/settings/DiagnosticsList.svelte';
   import {
     fetchWorkspaceMetadataSettings,
     updateWorkspaceMetadataSettings
-  } from '$lib/workspace-settings/profile-api';
-  import type { Diagnostic } from '$lib/workspace-settings/model';
-  import type { WorkspaceMetadataSettingsResponse } from '$lib/workspace-settings/profile-types';
+  } from '$lib/workspace/settings/profile-api';
+  import type { Diagnostic } from '$lib/workspace/settings/model';
+  import type { WorkspaceMetadataSettingsResponse } from '$lib/workspace/settings/profile-types';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

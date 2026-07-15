@@ -1,12 +1,12 @@
 <script lang="ts">
-  import { pushWorkspaceAlert } from '$lib/workspace-alerts/store';
-  import { workspaceApiPath } from '$lib/workspace-api/http';
+  import { pushWorkspaceAlert } from '$lib/workspace/alerts/store';
+  import { workspaceApiPath } from '$lib/workspace/api/http';
   import type {
     CleanupWorkdirCandidate,
     RuntimeCleanupExecutionResponse,
     RuntimeCleanupPlanResponse,
     WorkingDirectorySummary,
-  } from '$lib/workspace-sidebar/types';
+  } from '$lib/workspace/sidebar/types';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

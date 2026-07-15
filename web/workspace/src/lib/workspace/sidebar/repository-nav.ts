@@ -1,4 +1,4 @@
-import { workspaceRoute } from "$lib/workspace-api/http";
+import { workspaceRoute } from "$lib/workspace/api/http";
 import type { Diagnostic, RepositoryListResponse } from "./types";
 
 export type RepositoryNavItem = {

@@ -1,5 +1,5 @@
-import { loadJson, workspaceApiPath } from "$lib/workspace-api/http";
-import type { ObjectiveListResponse } from "$lib/workspace-sidebar/types";
+import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
+import type { ObjectiveListResponse } from "$lib/workspace/sidebar/types";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params }) => {

@@ -1,12 +1,12 @@
 <script lang="ts">
-  import { workspaceApiPath } from '$lib/workspace-api/http';
-  import DiagnosticsList from '$lib/workspace-settings/DiagnosticsList.svelte';
+  import { workspaceApiPath } from '$lib/workspace/api/http';
+  import DiagnosticsList from '$lib/workspace/settings/DiagnosticsList.svelte';
   import type {
     Diagnostic,
     RemoteRuntimeTestResponse,
     RuntimeConnectionMutationResponse,
     RuntimeConnectionSettingsResponse
-  } from '$lib/workspace-settings/model';
+  } from '$lib/workspace/settings/model';
   import type { PageProps } from './$types';
 
   type RemoteAddForm = {
