@@ -369,3 +369,24 @@ Coder-reported validation passed:
 No behavior tests were re-run for this follow-up because changes were docs/report wording only。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-15T22:56:59Z status: approve -->
+
+## Review: approve
+
+Focused re-review result: approve
+
+Evidence:
+- Report wording blockers are fixed: `docs/report/test-validity-20260612/yoi.md` now says memory record path; `docs/report/test-validity-20260612/memory.md` now says Request 作成。
+- Greps/read inspection found no `KnowledgeQuery`, no `kind=knowledge` Memory tools, no resident Knowledge injection, no active Web/TUI/protocol `#` Knowledge completion path。
+- `composer-completion.ts` only accepts `:`/`@` and test covers `ask #plain` as not a completion token。
+- No stale Memory/Knowledge tool guidance remains。
+- `.yoi/knowledge` appears only in the explicit legacy/manual archive note。
+- Legacy Knowledge SystemItems are ignored/drop to empty history text。
+- Memory summary/decision/request paths remain present。
+- No Skills implementation/diff was found。
+- `git diff --check f2106407..HEAD` passed。
+
+Blockers: none。
+
+---
