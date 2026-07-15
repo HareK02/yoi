@@ -235,7 +235,7 @@ impl InputBuffer {
     }
 
     /// Replace `atoms[start..self.cursor]` (the in-flight `@<typed>` /
-    /// `#<typed>` token) with the corresponding chip atom
+    /// active `@<typed>` file token) with the corresponding chip atom
     /// and place the cursor right after the chip. Used by the completion
     /// confirm path.
     pub fn replace_with_file_ref(&mut self, start: usize, path: String) {

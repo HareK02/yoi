@@ -154,7 +154,7 @@ fn base_tool_description(name: &str) -> &'static str {
 /// Build the model-visible Ticket tool description for a configured Ticket backend.
 ///
 /// `record_language` is the durable Ticket record/tool-body language, distinct from
-/// worker response language and Memory/Knowledge language. Keeping this on the tool
+/// worker response language and Memory language. Keeping this on the tool
 /// surface ensures every Ticket-capable Worker sees the policy without hidden context
 /// injection or role-launch-only prose.
 pub fn ticket_tool_description(name: &str, record_language: Option<&str>) -> String {
@@ -162,7 +162,7 @@ pub fn ticket_tool_description(name: &str, record_language: Option<&str>) -> Str
     if let Some(language) = record_language.filter(|language| !language.trim().is_empty()) {
         description.push_str("\n\nTicket record language: ");
         description.push_str(language.trim());
-        description.push_str(". Use this language for durable Ticket record and Ticket tool body text, including Ticket item bodies, thread comments/plans/decisions/implementation reports, reviews, resolutions, intake summaries, and orchestration plan notes. This policy is distinct from worker.language for normal prose and memory.language for Memory/Knowledge. Preserve protocol literals, file paths, commands, logs, identifiers, and quoted external text when translation would reduce fidelity.");
+        description.push_str(". Use this language for durable Ticket record and Ticket tool body text, including Ticket item bodies, thread comments/plans/decisions/implementation reports, reviews, resolutions, intake summaries, and orchestration plan notes. This policy is distinct from worker.language for normal prose and memory.language for Memory. Preserve protocol literals, file paths, commands, logs, identifiers, and quoted external text when translation would reduce fidelity.");
     }
     description
 }
