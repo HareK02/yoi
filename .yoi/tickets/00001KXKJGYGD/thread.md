@@ -201,3 +201,43 @@ Non-blocking note:
 - Core Rust ActiveWorkflow/resource deletions appear largely in place, and broad new Skills support was not introduced in the inspected diff。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-15T21:07:01Z -->
+
+## Implementation report
+
+Follow-up implementation progress report after request_changes:
+
+- Coder Pod `yoi-coder-00001KXKJGYGD-workflow-removal` completed the focused review-blocker fix in `/home/hare/Projects/yoi/.worktree/00001KXKJGYGD-remove-workflow-tracking`。
+- Follow-up commit: `d30dca2d99812f457324b91fd3549f4f126b6d7c` (`fix: remove remaining workflow invoke surfaces`)。
+- Orchestrator inspected worktree status, branch log, commit stats, `git diff --check 83ad7506..HEAD`, and grep checks. Worktree was clean and diff check passed。
+
+Fix summary:
+- Removed stale web `workflow_invoke` surfaces:
+  - `web/workspace/src/lib/generated/protocol.ts`
+  - `web/workspace/src/lib/workspace/console/composer-command.ts`
+  - `web/workspace/src/lib/workspace/console/model.ts`
+  - `web/workspace/src/lib/workspace/console/composer-command.test.ts`
+- Updated generated TypeScript protocol to match Rust protocol without `WorkflowInvoke`。
+- Removed stale Ticket role scaffold test expectation for `workflow = ...`。
+- Replaced stale TUI workflow SystemItem rendering test with legacy workflow SystemItem ignore-path test。
+- Removed docs/config wording that advertised loading Skills as Workflows。
+- Stabilized Worker discovery restore-planning test by sharing the runtime-dir sandbox used by allocation tests。
+
+Coder-reported validation passed:
+- `rg "ActiveWorkflow|active_workflow|Active workflow"`: no matches。
+- `rg "resources/workflows|\\.yoi/workflow|workflow invocation|Resident workflows|workflow_invoke"`: no matches。
+- `git diff --check`
+- `cargo test -p ticket --lib scaffold_config_includes_backend_and_all_fixed_roles -- --nocapture`
+- `cargo test -p tui --lib live_legacy_workflow_system_item_is_ignored -- --nocapture`
+- `cargo test -p session-store --lib --tests`
+- `cargo test -p worker --lib --tests`
+- `cargo test -p yoi --tests`
+- `cd web/workspace && deno task check && deno task test`
+- `cargo check -p yoi`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Knowledge removal Ticket `00001KXKP2A71` remains queued and will be re-routed after this Workflow removal Ticket is merged/closed, per human preference to proceed after completion rather than combined branch。
+
+---
