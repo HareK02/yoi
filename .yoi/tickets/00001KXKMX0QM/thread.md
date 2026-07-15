@@ -317,3 +317,33 @@ Next action:
 - Route to external Reviewer Pod before merge/close decisions。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-15T23:53:00Z status: request_changes -->
+
+## Review: request changes
+
+External review result: request_changes
+
+Blockers:
+
+1. Workflow/unsupported Skill frontmatter is silently accepted instead of linted/diagnosed。
+   - A `.yoi/skills/*/SKILL.md` containing `model_invokation`, `user_invocable`, graph/invocation fields, etc. will deserialize successfully and can be returned/activated as body。
+   - `SkillFrontmatter` only lists known fields and uses default serde unknown-field ignoring at `crates/workspace-server/src/skills.rs:40-50`, with parsing around `:290-300`。
+   - This violates the acceptance that workflow projection fields are not accepted as active Skill semantics。
+
+2. Required Worker activation/history behavior lacks coverage。
+   - `Worker::activate_skill` commits/appends at `crates/worker/src/worker.rs:906-922`。
+   - Worker Skill tests only exercise HTTP catalog fetch at `crates/worker/src/skill.rs:194-237`。
+   - Missing the stated acceptance test that activation appends/commits Skill body into Worker history before LLM context use。
+
+Evidence / validation performed:
+- Inspected Ticket and touched files。
+- Checked route/API/provenance behavior。
+- Ran `cargo test -p yoi-workspace-server skills --lib`。
+- Ran `cargo test -p worker skill --lib`。
+- Confirmed implementation worktree remained clean。
+
+Non-blocking note:
+- Catalog/detail progressive disclosure and path-free provenance generally look aligned。
+
+---
