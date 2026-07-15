@@ -241,3 +241,29 @@ Coder-reported validation passed:
 Knowledge removal Ticket `00001KXKP2A71` remains queued and will be re-routed after this Workflow removal Ticket is merged/closed, per human preference to proceed after completion rather than combined branch。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-15T21:10:11Z status: request_changes -->
+
+## Review: request changes
+
+Focused re-review result: request_changes
+
+Evidence:
+- Prior Rust/TUI test blockers are fixed:
+  - `cargo test -p ticket --lib scaffold_config_includes_backend_and_all_fixed_roles` passes。
+  - `cargo test -p tui --lib live_legacy_workflow_system_item_is_ignored` passes。
+- `ActiveWorkflow` / workflow resource greps over `crates web resources docs` are clean。
+- `workflow_invoke` is removed from generated protocol/composer/model。
+- Legacy workflow SystemItems are ignored in TUI。
+- `docs/manifest.toml` no longer says Skills load “as Workflows”。
+
+Remaining blocker:
+- Slash workflow completion path remains active, violating acceptance item for removing workflow resource/invocation/completion surfaces。
+- `web/workspace/src/lib/workspace/console/composer-completion.ts:1,4,38,82-83` still treats `/` as workflow completion。
+- `web/workspace/src/lib/workspace/console/composer-completion.test.ts:35` still asserts `completionTokenAt("run /work")?.kind === "workflow"`。
+- `web/workspace/src/routes/w/[workspaceId]/+page.svelte:354-361` still posts `token.kind` to the completions endpoint, and result type still allows `"workflow"` at `+page.svelte:48-49`。
+- `crates/protocol/src/lib.rs:604-608,619` comments still advertise `/ -> Workflow` and workflow resolvers。
+
+Blocker: remove the remaining slash workflow completion surface and stale protocol comments/types, without introducing hidden Workflow compatibility。
+
+---
