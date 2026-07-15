@@ -161,3 +161,48 @@ Critical risks / reviewer focus:
 Workflow removal dependency/conflict is now closed and no blockers remain. Accepting queued Knowledge removal Ticket for implementation before creating worktree or spawning role Pods.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-15T22:31:18Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Coder Pod `yoi-coder-00001KXKP2A71-knowledge-removal` completed implementation in `/home/hare/Projects/yoi/.worktree/00001KXKP2A71-remove-knowledge-support` on branch `work/00001KXKP2A71-remove-knowledge-support`。
+- Implementation commit: `f786e019 feat: remove active knowledge support`。
+- Orchestrator inspected worktree status, branch log, commit stats, and `git diff --check f2106407..HEAD`; worktree was clean and diff check passed。
+
+Implementation summary:
+- Removed active `KnowledgeQuery` registration/schema exposure。
+- Removed `kind = knowledge` from Memory tool kind support and tool descriptions。
+- Removed active Knowledge frontmatter/schema/lint/query/resident-context handling from the Memory crate。
+- Removed Worker resident Knowledge injection and Knowledge completion state。
+- Removed protocol/TUI/web active `#<slug>` / Knowledge reference and completion paths。
+- Kept bounded persisted-session compatibility: old session `SystemItem` entries serialized as `knowledge` deserialize into `LegacyKnowledgeIgnored` and do not replay archived Knowledge text into model context。
+- Updated prompts/docs to describe Memory summary/decision/request behavior and note old `.yoi/knowledge/` as ignored/manual archive material。
+- Did not implement Agent Skills support。
+
+Old `.yoi/knowledge` handling:
+- `.yoi/knowledge/` is no longer classified, linted, queried, consolidated, extracted, resident-injected, or treated as workspace record authority。
+- Docs say older `.yoi/knowledge/` files are ignored by current memory tooling and can be manually archived/inspected if needed。
+- Persisted session Knowledge system items are ignored on restore rather than injected into model context。
+
+Coder-reported validation passed:
+- `rg "KnowledgeQuery|kind = knowledge|kind: knowledge|ResidentKnowledge|model_invokation|\\.yoi/knowledge|#<slug>" --glob '!target' --glob '!Cargo.lock'`: only remaining hit is historical ignored `.yoi/knowledge/` note in `docs/design/memory-knowledge.md`。
+- `rg "knowledge" crates resources docs README.md web --glob '!target' --glob '!Cargo.lock'`: remaining intended hits are historical/ignored `.yoi/knowledge/` docs, compatibility-only `LegacyKnowledgeIgnored`, doc filenames containing `memory-knowledge`, and unrelated `acknowledge` substrings。
+- `git diff --check`
+- `cargo test -p memory --lib --tests`
+- `cargo test -p worker --lib --tests`
+- `cargo test -p session-store --lib --tests`
+- `cargo test -p tui --lib --tests`
+- `cargo test -p yoi --tests`
+- `cd web/workspace && deno task check` (passed with pre-existing/accessibility warnings only)
+- `cd web/workspace && deno task test` (`52 passed`)
+- `cargo check -p yoi`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Next action:
+- Route to external Reviewer Pod before merge/close decisions。
+
+---
