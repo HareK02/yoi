@@ -7,7 +7,7 @@ use std::time::Instant;
 use protocol::WorkerStatus;
 use ticket::config::{
     DEFAULT_TICKET_BACKEND_RELATIVE_PATH, TICKET_CONFIG_RELATIVE_PATH, TicketConfig,
-    TicketOrchestrationConfig,
+    TicketOrchestrationConfig, WORKSPACE_SETTINGS_RELATIVE_PATH,
 };
 use ticket::{
     LocalTicketBackend, TicketBackend, TicketError, TicketEvent, TicketFilter, TicketIdOrSlug,
@@ -567,8 +567,41 @@ pub(crate) fn decide_orchestrator_lifecycle(
 }
 
 pub(crate) fn ticket_config_availability(workspace_root: &Path) -> TicketConfigAvailability {
-    let config_path = workspace_root.join(TICKET_CONFIG_RELATIVE_PATH);
-    match config_path.symlink_metadata() {
+    let settings_path = workspace_root.join(WORKSPACE_SETTINGS_RELATIVE_PATH);
+    match settings_path.symlink_metadata() {
+        Ok(metadata) if !metadata.is_file() => TicketConfigAvailability::Unusable(format!(
+            "{} exists but is not a regular file",
+            WORKSPACE_SETTINGS_RELATIVE_PATH
+        )),
+        Ok(_) => match std::fs::read_to_string(&settings_path) {
+            Ok(content) => {
+                match TicketConfig::workspace_settings_has_ticket_config(&settings_path, &content) {
+                    Ok(true) => match TicketConfig::load_workspace(workspace_root) {
+                        Ok(_) => TicketConfigAvailability::Usable,
+                        Err(error) => TicketConfigAvailability::Unusable(error.to_string()),
+                    },
+                    Ok(false) => legacy_ticket_config_availability(workspace_root),
+                    Err(error) => TicketConfigAvailability::Unusable(error.to_string()),
+                }
+            }
+            Err(error) => TicketConfigAvailability::Unusable(format!(
+                "could not read {}: {error}",
+                WORKSPACE_SETTINGS_RELATIVE_PATH
+            )),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            legacy_ticket_config_availability(workspace_root)
+        }
+        Err(error) => TicketConfigAvailability::Unusable(format!(
+            "could not inspect {}: {error}",
+            WORKSPACE_SETTINGS_RELATIVE_PATH
+        )),
+    }
+}
+
+fn legacy_ticket_config_availability(workspace_root: &Path) -> TicketConfigAvailability {
+    let legacy_path = workspace_root.join(TICKET_CONFIG_RELATIVE_PATH);
+    match legacy_path.symlink_metadata() {
         Ok(metadata) if !metadata.is_file() => TicketConfigAvailability::Unusable(format!(
             "{} exists but is not a regular file",
             TICKET_CONFIG_RELATIVE_PATH
@@ -1766,8 +1799,8 @@ mod tests {
         let config_dir = workspace_root.join(".yoi");
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
-            config_dir.join("ticket.config.toml"),
-            "[backend]\nprovider = \"builtin:yoi_local\"\nroot = \".yoi/tickets\"\n",
+            config_dir.join("workspace.toml"),
+            "[ticket]\n\n[ticket.backend]\nprovider = \"builtin:yoi_local\"\nroot = \".yoi/tickets\"\n",
         )
         .unwrap();
     }
@@ -2233,8 +2266,8 @@ mod tests {
         let config_dir = temp.path().join(".yoi");
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
-            config_dir.join("ticket.config.toml"),
-            "[backend]\nprovider = \"unknown:provider\"\nroot = \".yoi/tickets\"\n",
+            config_dir.join("workspace.toml"),
+            "[ticket]\n\n[ticket.backend]\nprovider = \"unknown:provider\"\nroot = \".yoi/tickets\"\n",
         )
         .unwrap();
 
@@ -2678,11 +2711,11 @@ mod tests {
     }
 
     #[test]
-    fn existing_non_file_ticket_config_is_unusable_not_absent() {
+    fn existing_non_file_workspace_settings_is_unusable_not_absent() {
         let temp = TempDir::new().unwrap();
         let config_parent = temp.path().join(".yoi");
         fs::create_dir_all(&config_parent).unwrap();
-        fs::create_dir(config_parent.join("ticket.config.toml")).unwrap();
+        fs::create_dir(config_parent.join("workspace.toml")).unwrap();
 
         assert!(matches!(
             ticket_config_availability(temp.path()),

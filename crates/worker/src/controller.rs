@@ -736,8 +736,8 @@ where
                             "ticket tools require local Worker filesystem authority",
                         )
                     })?;
-                crate::feature::builtin::ticket::TicketFeatureBackend::Local {
-                    root: ticket_cwd.clone(),
+                crate::feature::builtin::ticket::TicketFeatureBackend::LocalWorkspace {
+                    workspace_root: ticket_cwd.clone(),
                 }
             }
         };

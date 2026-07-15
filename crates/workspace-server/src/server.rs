@@ -272,7 +272,7 @@ impl WorkspaceApi {
         let companion = Arc::new(CompanionConsole::disabled());
         let observation_proxy = BackendObservationProxy::new(config.runtime_event_sources.clone());
         Ok(Self {
-            records: LocalProjectRecordReader::new(config.workspace_root.clone()),
+            records: LocalProjectRecordReader::new(config.workspace_root.clone())?,
             config,
             store,
             runtime,
@@ -1248,11 +1248,10 @@ async fn scoped_ticket_backend_operation(
     Json(operation): Json<TicketBackendOperation>,
 ) -> ApiResult<Json<TicketBackendHttpResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let backend = LocalTicketBackend::new(
-        api.config
-            .workspace_root
-            .join(ticket::config::DEFAULT_TICKET_BACKEND_RELATIVE_PATH),
-    );
+    let config = ticket::config::TicketConfig::load_workspace(&api.config.workspace_root)
+        .map_err(|error| Error::Config(format!("load Ticket workspace settings: {error}")))?;
+    let backend = LocalTicketBackend::new(config.backend_root().to_path_buf())
+        .with_record_language(config.ticket_record_language());
     let response = match execute_ticket_backend_operation(&backend, operation) {
         Ok(result) => TicketBackendHttpResponse::Ok { result },
         Err(error) => TicketBackendHttpResponse::Error {
@@ -5798,6 +5797,53 @@ mod tests {
                 .unwrap();
             assert!(status.success());
         }
+    }
+
+    #[tokio::test]
+    async fn ticket_backend_endpoint_uses_workspace_settings_backend_root() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".yoi")).unwrap();
+        fs::write(
+            dir.path().join(".yoi/workspace.toml"),
+            format!(
+                "workspace_id = \"{TEST_WORKSPACE_ID}\"\ncreated_at = \"{TEST_CREATED_AT}\"\ndisplay_name = \"Endpoint Test\"\n\n[ticket]\nlanguage = \"Japanese\"\n\n[ticket.backend]\nprovider = \"builtin:yoi_local\"\nroot = \"server-tickets\"\n"
+            ),
+        )
+        .unwrap();
+        let api = test_api(dir.path()).await;
+
+        let Json(response) = scoped_ticket_backend_operation(
+            State(api),
+            AxumPath(ScopedWorkspacePath {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+            }),
+            Json(TicketBackendOperation::Create {
+                input: ticket::NewTicket::new("Endpoint configured root"),
+            }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("ticket backend operation failed: {}", error.error));
+
+        let ticket_ref = match response {
+            TicketBackendHttpResponse::Ok {
+                result: ticket::TicketBackendOperationResult::TicketRef(ticket_ref),
+            } => ticket_ref,
+            other => panic!("unexpected ticket backend response: {other:?}"),
+        };
+        assert!(
+            dir.path()
+                .join("server-tickets")
+                .join(&ticket_ref.id)
+                .join("item.md")
+                .is_file()
+        );
+        assert!(
+            !dir.path()
+                .join(".yoi/tickets")
+                .join(&ticket_ref.id)
+                .join("item.md")
+                .exists()
+        );
     }
 
     async fn test_api(workspace_root: impl Into<PathBuf>) -> WorkspaceApi {

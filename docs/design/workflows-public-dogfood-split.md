@@ -30,7 +30,7 @@ This document records the design/audit decision for Ticket `00001KTRKZ14C`. It d
 | `multi-agent-workflow` | Partly. The sibling coder/reviewer loop, intent packet, branch-local review, and merge-ready dossier are useful product concepts. | Heavy Yoi dogfood specifics: Git worktrees, commits, cargo/nix validation, branch cleanup, docs/report conventions, and parent/child policy. | Split into builtin `multi-agent-workflow` for role loop + dossier, and workspace dogfood extension for Git worktree/cargo/nix mechanics. |
 | `worktree-workflow` | Not resident public core. | Almost entirely this repository's Git worktree mechanics and `.yoi` path exclusions. | Keep workspace-local dogfood workflow. Optionally create a non-resident builtin `git-worktree-isolation` later, disabled unless explicitly selected. |
 
-## Slug and `.yoi/ticket.config.toml` migration decision
+## Slug and workspace Ticket settings migration decision
 
 Use explicit dogfood slugs for workflows whose semantics differ from the public builtin workflow. Same-slug workspace overrides are allowed for local wording/policy tweaks of the same public contract, but they should not be used to hide Yoi repository Git/worktree/cargo/nix/merge semantics behind a public slug. This avoids accidental shadowing when a user expects `multi-agent-workflow` to mean the generic builtin role loop.
 
@@ -38,10 +38,10 @@ Planned selector mapping for this repository after builtin workflow loading exis
 
 | Role/config surface | Workflow selector | Source intent | Rationale |
 | --- | --- | --- | --- |
-| `[roles.intake].workflow` | `ticket-intake-workflow` | builtin core by default; workspace same-slug override only if this repo needs a true local refinement of the same intake contract | Intake is mostly product-generic; dogfood Git/worktree policy does not belong here. |
-| `[roles.orchestrator].workflow` | `ticket-orchestrator-routing` | builtin core by default; dogfood merge/worktree instructions come from explicit launch context or a separate dogfood workflow, not a hidden same-slug override | Routing semantics should stay public/generic; repo-specific implementation mechanics should be opt-in and visible. |
-| `[roles.coder].workflow` | `yoi-dogfood-multi-agent-workflow` | workspace-local dogfood workflow | Coder work in this repository is tied to the repo worktree/branch/validation contract and must not shadow generic builtin `multi-agent-workflow`. |
-| `[roles.reviewer].workflow` | `yoi-dogfood-multi-agent-workflow` | workspace-local dogfood workflow | Reviewer evidence in this repository includes branch/worktree/cargo/nix/Ticket-doctor conventions; use an explicit dogfood slug. |
+| `[ticket.roles.intake].workflow` | `ticket-intake-workflow` | builtin core by default; workspace same-slug override only if this repo needs a true local refinement of the same intake contract | Intake is mostly product-generic; dogfood Git/worktree policy does not belong here. |
+| `[ticket.roles.orchestrator].workflow` | `ticket-orchestrator-routing` | builtin core by default; dogfood merge/worktree instructions come from explicit launch context or a separate dogfood workflow, not a hidden same-slug override | Routing semantics should stay public/generic; repo-specific implementation mechanics should be opt-in and visible. |
+| `[ticket.roles.coder].workflow` | `yoi-dogfood-multi-agent-workflow` | workspace-local dogfood workflow | Coder work in this repository is tied to the repo worktree/branch/validation contract and must not shadow generic builtin `multi-agent-workflow`. |
+| `[ticket.roles.reviewer].workflow` | `yoi-dogfood-multi-agent-workflow` | workspace-local dogfood workflow | Reviewer evidence in this repository includes branch/worktree/cargo/nix/Ticket-doctor conventions; use an explicit dogfood slug. |
 | compatibility references | `ticket-preflight-workflow` | builtin compatibility alias or workspace compatibility file, non-resident | Do not keep it as a role default. It should point to planning/requirements sync language only. |
 | dogfood worktree helper | `yoi-dogfood-worktree-workflow` | workspace-local helper, not a role default by itself | Referenced from `yoi-dogfood-multi-agent-workflow`; keeps Git worktree mechanics out of generic builtin workflows. |
 
@@ -115,7 +115,7 @@ Builtin workflows and active workspace workflows should remove or replace the fo
 
 3. **Dogfood workflow retention**
    - Keep or rename workspace-local dogfood workflows for this repository's implementation mechanics.
-   - Ensure `.yoi/ticket.config.toml` role workflow selectors intentionally point to builtin generic workflows or workspace dogfood overrides, with no accidental slug shadowing.
+   - Ensure `.yoi/workspace.toml` `[ticket.roles.*].workflow` selectors intentionally point to builtin generic workflows or workspace dogfood overrides, with no accidental slug shadowing.
 
 4. **Vocabulary migration**
    - Sweep active workflow text, prompts, docs, and Ticket UI wording for `Action required`, `Attention required`, and old preflight lane language.

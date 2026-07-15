@@ -253,7 +253,7 @@ pub enum TicketRoleLaunchError {
     #[error(transparent)]
     LaunchConfig(#[from] TicketRoleLaunchConfigError),
     #[error(
-        "Ticket role `{role}` profile selector `{selector}` is not resolvable before launch: {message}. Configure `[roles.{role}].profile` with an executable concrete profile selector such as `builtin:default` or a project/user profile"
+        "Ticket role `{role}` profile selector `{selector}` is not resolvable before launch: {message}. Configure `[ticket.roles.{role}].profile` with an executable concrete profile selector such as `builtin:default` or a project/user profile"
     )]
     ProfileResolution {
         role: TicketRole,
@@ -287,7 +287,7 @@ pub enum TicketRoleLaunchError {
     RunAcceptanceTimeout,
 }
 
-/// Load `.yoi/ticket.config.toml` from the workspace and construct a launch plan.
+/// Load Ticket policy from `.yoi/workspace.toml` and construct a launch plan.
 pub fn plan_ticket_role_launch(
     context: TicketRoleLaunchContext,
 ) -> Result<TicketRoleLaunchPlan, TicketRoleLaunchError> {
@@ -700,14 +700,14 @@ mod tests {
     fn write_config(workspace: &std::path::Path, content: &str) {
         let dir = workspace.join(".yoi");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("ticket.config.toml"), content).unwrap();
+        std::fs::write(dir.join("workspace.toml"), content).unwrap();
     }
 
     fn write_builtin_role_config(workspace: &std::path::Path, roles: &[TicketRole]) {
-        let mut config = String::new();
+        let mut config = String::from("[ticket]\n");
         for role in roles {
             config.push_str(&format!(
-                "\n[roles.{role}]\nprofile = \"builtin:default\"\n"
+                "\n[ticket.roles.{role}]\nprofile = \"builtin:default\"\n"
             ));
         }
         write_config(workspace, &config);
@@ -883,7 +883,7 @@ mod tests {
             err.to_string()
                 .contains("Ticket role `coder` is not launch-configured")
         );
-        assert!(err.to_string().contains("[roles.coder]"));
+        assert!(err.to_string().contains("[ticket.roles.coder]"));
     }
 
     #[test]
@@ -913,7 +913,7 @@ root = ".yoi/tickets"
         write_config(
             temp.path(),
             r#"
-[roles.intake]
+[ticket.roles.intake]
 profile = "inherit"
 "#,
         );
@@ -931,7 +931,7 @@ profile = "inherit"
         write_config(
             temp.path(),
             r#"
-[roles.intake]
+[ticket.roles.intake]
 profile = "project:no-such-ticket-role-profile"
 "#,
         );
@@ -944,7 +944,7 @@ profile = "project:no-such-ticket-role-profile"
                 "profile selector `project:no-such-ticket-role-profile` is not resolvable"
             )
         );
-        assert!(err.to_string().contains("[roles.intake].profile"));
+        assert!(err.to_string().contains("[ticket.roles.intake].profile"));
     }
 
     #[test]
@@ -968,7 +968,7 @@ profile = "project:no-such-ticket-role-profile"
 [ticket]
 language = "Japanese"
 
-[roles.intake]
+[ticket.roles.intake]
 profile = "builtin:default"
 "#,
         );
@@ -1035,7 +1035,7 @@ profile = "builtin:default"
         write_config(
             temp.path(),
             r#"
-[roles.reviewer]
+[ticket.roles.reviewer]
 profile = "builtin:default"
 launch_prompt = "$workspace/ticket/reviewer/launch"
 workflow = "ticket-review-workflow"
@@ -1226,7 +1226,7 @@ workflow = "ticket-review-workflow"
         write_config(
             temp.path(),
             r#"
-[roles.coder]
+[ticket.roles.coder]
 profile = "./coder.toml"
 "#,
         );
@@ -1243,7 +1243,7 @@ profile = "./coder.toml"
         write_config(
             temp.path(),
             r#"
-[roles.coder]
+[ticket.roles.coder]
 profile = "inherit"
 system_instruction = "$workspace/not-supported"
 "#,
