@@ -425,7 +425,6 @@ mod tests {
             &root.join(".yoi/memory/_logs/ignored.md"),
             "not frontmatter",
         );
-        write(&root.join(".yoi/workflow/ignored.md"), "not frontmatter");
 
         let report = lint_workspace(root).unwrap();
         assert_eq!(

@@ -141,7 +141,7 @@ fn read_kind_records(layout: &WorkspaceLayout, kind: RecordKind) -> BTreeMap<Str
         RecordKind::Decision => layout.decisions_dir(),
         RecordKind::Request => layout.requests_dir(),
         RecordKind::Knowledge => layout.knowledge_dir(),
-        RecordKind::Summary | RecordKind::Workflow => return BTreeMap::new(),
+        RecordKind::Summary => return BTreeMap::new(),
     };
     let mut out: BTreeMap<String, String> = BTreeMap::new();
     let entries = match std::fs::read_dir(&dir) {

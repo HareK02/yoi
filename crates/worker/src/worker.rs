@@ -28,7 +28,6 @@ use manifest::{
     SharedScope, WorkerManifest, WorkerManifestConfig,
 };
 
-use crate::active_workflow::{self, ActiveWorkflowStore};
 use crate::compact::state::CompactState;
 use crate::compact::usage_tracker::UsageTracker;
 use crate::feature::builtin::TaskFeature;
@@ -50,7 +49,6 @@ use crate::prompt::loader::PromptLoader;
 use crate::prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 use crate::runtime::dir;
 use crate::runtime::worker_allocation::{self, ScopeAllocationGuard, ScopeLockError};
-use crate::workflow::WorkflowResolveError;
 #[cfg(test)]
 use async_trait::async_trait;
 use protocol::{
@@ -309,7 +307,6 @@ struct EmptyTurnRollbackSnapshot {
     usage_history_len: usize,
     ai_activity_count: usize,
     last_run_interrupted: bool,
-    active_workflows: active_workflow::ActiveWorkflowSnapshot,
 }
 
 fn is_ai_materialized_item(item: &Item) -> bool {
@@ -453,10 +450,6 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// the narrow snapshot/restore surface Worker needs for compaction and rewind.
     /// Store/reminder ownership stays inside the Task feature module.
     task_feature: TaskFeature,
-    /// Durable state for workflow invocations that are active for the current task.
-    /// The store is persisted as typed session-log extensions and rehydrated into
-    /// prompt context during compaction.
-    active_workflows: ActiveWorkflowStore,
     /// Parsed system-prompt template awaiting first-turn materialisation.
     /// `Some` until `ensure_system_prompt_materialized` renders it once,
     /// then `None` forever — including after compaction.
@@ -509,11 +502,7 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// [`Self::from_manifest`], or defaults to the builtin pack when a
     /// Worker is constructed through lower-level paths that have no loader.
     prompts: Arc<PromptCatalog>,
-    /// Registry loaded from `<workspace>/.yoi/workflow/*.md` when
-    /// memory is enabled. Missing memory config keeps this empty.
-    workflow_registry: workflow_crate::WorkflowRegistry,
-    /// Memory workspace layout used by the workflow resolver to load required
-    /// Knowledge records by exact slug.
+    /// Memory workspace layout used for Memory/Knowledge record operations.
     memory_layout: Option<memory::WorkspaceLayout>,
     /// When true (default), the system-prompt assembler may append the
     /// workspace memory summary (`memory/summary.md`). Internal disposable
@@ -521,12 +510,8 @@ pub struct Worker<C: LlmClient, St: Store> {
     inject_resident_summary: bool,
     /// When true (default), the system-prompt assembler may append resident
     /// Knowledge descriptions. This is intentionally independent from
-    /// summary and workflow residency: each section has its own gate.
+    /// summary residency: each section has its own gate.
     inject_resident_knowledge: bool,
-    /// When true (default), the system-prompt assembler may append resident
-    /// Workflow descriptions. This is intentionally independent from
-    /// summary and Knowledge residency: each section has its own gate.
-    inject_resident_workflows: bool,
     /// extract (memory.extract) reentry guard. `true` while an extract
     /// worker is running; subsequent triggers are skipped per spec
     /// (`docs/plan/memory.md` §Extract 並走防止). `Arc<AtomicBool>` so
@@ -619,7 +604,7 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
             usage_history: self.usage_history.clone(),
             tracker: None,
             task_feature: self.task_feature.clone(),
-            active_workflows: self.active_workflows.clone(),
+            memory_layout: self.memory_layout.clone(),
             system_prompt_template: None,
             alerter: self.alerter.clone(),
             event_tx: self.event_tx.clone(),
@@ -631,11 +616,8 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
             callback_socket: None,
             runtime_ticket_role: None,
             prompts: self.prompts.clone(),
-            workflow_registry: self.workflow_registry.clone(),
-            memory_layout: self.memory_layout.clone(),
             inject_resident_summary: self.inject_resident_summary,
             inject_resident_knowledge: self.inject_resident_knowledge,
-            inject_resident_workflows: self.inject_resident_workflows,
             extract_in_flight: self.extract_in_flight.clone(),
             consolidation_in_flight: self.consolidation_in_flight.clone(),
             extract_pointer: self.extract_pointer.clone(),
@@ -811,7 +793,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             usage_history: Arc::new(Mutex::new(Vec::<UsageRecord>::new())),
             tracker: None,
             task_feature: TaskFeature::new(),
-            active_workflows: ActiveWorkflowStore::new(),
             system_prompt_template: None,
             alerter: None,
             event_tx: None,
@@ -823,11 +804,9 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             callback_socket: None,
             runtime_ticket_role: None,
             prompts,
-            workflow_registry: workflow_crate::WorkflowRegistry::empty(),
             memory_layout: None,
             inject_resident_summary: true,
             inject_resident_knowledge: true,
-            inject_resident_workflows: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Arc::new(Mutex::new(None)),
@@ -854,12 +833,11 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     ///
     /// Default `true`: normal Workers may expose each resident section according
     /// to its own gate and manifest settings. Internal disposable workers set
-    /// this to `false` so summary, Knowledge, and Workflow residency are all
+    /// this to `false` so summary and Knowledge residency are both
     /// suppressed while explicit tools remain available.
     pub fn set_resident_injection(&mut self, enabled: bool) {
         self.inject_resident_summary = enabled;
         self.inject_resident_knowledge = enabled;
-        self.inject_resident_workflows = enabled;
     }
 
     /// Toggle `memory/summary.md` resident injection in the system prompt.
@@ -870,11 +848,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// Toggle resident Knowledge injection in the system prompt.
     pub fn set_resident_knowledge_injection(&mut self, enabled: bool) {
         self.inject_resident_knowledge = enabled;
-    }
-
-    /// Toggle resident Workflow injection in the system prompt.
-    pub fn set_resident_workflow_injection(&mut self, enabled: bool) {
-        self.inject_resident_workflows = enabled;
     }
 
     /// Shared handle to the prompt catalog. Cheap to clone (`Arc`).
@@ -1019,16 +992,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         registry: FeatureRegistryBuilder,
     ) -> FeatureRegistryInstallReport {
         let worker = self.engine.as_mut().expect("worker taken during run");
-        let active_workflow_committer = self.log_writer.clone().map(|writer| {
-            Arc::new(move |entry| writer.commit_log_entry(entry))
-                as active_workflow::LogEntryCommitter
-        });
-        worker.register_tools(active_workflow::active_workflow_tools(
-            self.active_workflows.clone(),
-            active_workflow_committer,
-        ));
-        let report = registry.install_into_engine(worker, &mut self.hook_builder);
-        report
+        registry.install_into_engine(worker, &mut self.hook_builder)
     }
 
     /// Reference to the store.
@@ -1091,10 +1055,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         self.sink.truncate_silent(truncate_entries);
 
         self.task_feature.restore_from_history(&state.history);
-        self.active_workflows
-            .restore_from_history_and_extensions(&state.history, &state.extensions);
-        let mut history = state.history;
-        active_workflow::strip_rehydration_messages(&mut history);
+        let history = state.history;
         self.engine_mut().set_history(history);
         self.engine_mut().set_request_config(state.config);
         self.engine_mut().set_turn_count(state.turn_count);
@@ -1468,7 +1429,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 self.pending_attachments.clone(),
                 self.prompts.clone(),
                 self.log_writer.clone(),
-                self.active_workflows.clone(),
             )
             .with_usage_tracker(self.usage_tracker.clone());
             self.engine_mut().set_interceptor(interceptor);
@@ -1513,9 +1473,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             }
         }
         // Resident-injection collection. Each resident section has its own
-        // gate so summary, Knowledge, and Workflow residency remain
-        // conceptually independent. Internal workers can still opt out of all
-        // resident sections by flipping all three gates.
+        // gate so summary and Knowledge residency remain conceptually independent.
+        // Internal workers can still opt out of both resident sections.
         // Owned values live for the duration of `render` below; the
         // context borrows from them.
         let memory_layout = self.memory_layout.as_ref();
@@ -1546,20 +1505,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         } else {
             None
         };
-        let resident_workflows: Vec<workflow_crate::ResidentWorkflowEntry> =
-            if self.inject_resident_workflows {
-                self.workflow_registry.resident_entries()
-            } else {
-                Vec::new()
-            };
-        let resident_workflow_slice: Option<&[workflow_crate::ResidentWorkflowEntry]> =
-            if self.inject_resident_workflows {
-                Some(&resident_workflows)
-            } else {
-                None
-            };
-        let resident_exposure_snapshots =
-            self.resident_exposure_snapshots(&resident, &resident_workflows);
+        let resident_exposure_snapshots = self.resident_exposure_snapshots(&resident);
         let worker_language = worker_language(&self.manifest.engine);
         let scope_snapshot = self.scope.snapshot();
         let cwd_for_prompt = self
@@ -1575,7 +1521,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             agents_md: agents_md_read.and_then(|read| read.body),
             resident_summary: resident_summary.as_deref(),
             resident_knowledge: resident_slice,
-            resident_workflows: resident_workflow_slice,
             prompts: &self.prompts,
         };
         let rendered = template
@@ -1664,7 +1609,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             usage_history_len,
             ai_activity_count: self.ai_activity_counter.load(Ordering::SeqCst),
             last_run_interrupted: self.engine().last_run_interrupted(),
-            active_workflows: self.active_workflows.snapshot(),
         }
     }
 
@@ -1702,9 +1646,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             .truncate(snapshot.usage_history_len);
         let _ = self.usage_tracker.drain();
         let _ = self.metrics_tracker.drain();
-        self.active_workflows
-            .replace_with(snapshot.active_workflows);
-
         let loc = self.segment_state.location();
         self.store
             .truncate(loc.session_id, loc.segment_id, snapshot.entries_written)?;
@@ -1726,13 +1667,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// the Engine is aborted, history is compacted, and execution resumes
     /// automatically.
     pub async fn run(&mut self, input: Vec<Segment>) -> Result<WorkerRunResult, WorkerError> {
-        // Validate workflow invocations up front so an invalid slug
-        // never commits a UserInput entry, never triggers pre-run
-        // compaction, and never half-applies interrupt prep when the
-        // previous turn was interrupted. Read-only against
-        // `workflow_registry`.
-        self.validate_workflow_invocations(&input)?;
-
         // Paused→Run transition: if the previous turn was cut short,
         // any `Item::ToolCall` whose tool never produced a matching
         // `ToolResult` is closed with a synthetic one, and a short
@@ -1766,22 +1700,12 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         })?;
         self.user_segments.push(input.clone());
 
-        // Resolve `@<path>` refs, `#<slug>` Knowledge refs, and `/<slug>`
-        // workflow invocations to system messages stashed for the
-        // WorkerInterceptor to attach right after the user message. File and
-        // Knowledge failures are non-fatal alerts; explicit workflow invocation
-        // failures abort before the Engine sees the turn.
+        // Resolve `@<path>` file refs and `#<slug>` Knowledge refs to system
+        // messages stashed for the WorkerInterceptor to attach right after the
+        // user message. Resolution failures are non-fatal alerts.
         let mut attachments = self.resolve_file_refs(&input);
         attachments.extend(self.resolve_knowledge_refs(&input));
-        attachments.extend(self.resolve_workflow_invocations(&input)?);
         let flattened = self.flatten_segments(&input);
-        if self.active_workflows.activate_from_system_items(
-            &attachments,
-            flattened.clone(),
-            segment_log::now_millis(),
-        ) {
-            self.commit_entry(self.active_workflows.extension_entry())?;
-        }
         if !attachments.is_empty() {
             *self
                 .pending_attachments
@@ -1921,7 +1845,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     fn resident_exposure_snapshots(
         &self,
         knowledge: &[memory::ResidentKnowledgeEntry],
-        workflows: &[workflow_crate::ResidentWorkflowEntry],
     ) -> Vec<memory::UsageRecordSnapshot> {
         let Some(layout) = self.memory_layout.as_ref() else {
             return Vec::new();
@@ -1936,18 +1859,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 Ok(snapshot) => snapshots.push(snapshot),
                 Err(err) => {
                     warn!(knowledge = %entry.slug, error = %err, "failed to snapshot resident knowledge exposure")
-                }
-            }
-        }
-        for entry in workflows {
-            match memory::snapshot_record_from_layout(
-                layout,
-                memory::workspace::RecordKind::Workflow,
-                &entry.slug,
-            ) {
-                Ok(snapshot) => snapshots.push(snapshot),
-                Err(err) => {
-                    warn!(workflow = %entry.slug, error = %err, "failed to snapshot resident workflow exposure")
                 }
             }
         }
@@ -1979,60 +1890,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             warn!(error = %err, "failed to append resident exposure event");
         }
     }
-
-    fn resolve_workflow_invocations(
-        &self,
-        segments: &[Segment],
-    ) -> Result<Vec<SystemItem>, WorkflowResolveError> {
-        let Some(layout) = self.memory_layout.as_ref() else {
-            if let Some(slug) = segments.iter().find_map(|seg| match seg {
-                Segment::WorkflowInvoke { slug } => Some(slug.clone()),
-                _ => None,
-            }) {
-                return Err(WorkflowResolveError::NotFound { slug });
-            }
-            return Ok(Vec::new());
-        };
-        let mut out = Vec::new();
-        for seg in segments {
-            let Segment::WorkflowInvoke { slug } = seg else {
-                continue;
-            };
-            let items = crate::workflow::resolve_workflow_invocation(
-                &self.workflow_registry,
-                layout,
-                slug,
-            )?;
-            match memory::snapshot_record_from_layout(
-                layout,
-                memory::workspace::RecordKind::Workflow,
-                slug,
-            ) {
-                Ok(snapshot) => {
-                    self.append_memory_use_event(
-                        memory::UsageSource::WorkflowInvoke,
-                        vec![snapshot],
-                    );
-                }
-                Err(err) => {
-                    warn!(workflow = %slug, error = %err, "failed to snapshot workflow usage");
-                }
-            }
-            // `resolve_workflow_invocation` returns Item::system_message
-            // entries (potentially multiple — body + dependency knowledge
-            // bodies). Persist each as a SystemItem::Workflow keyed on
-            // the invocation slug.
-            for item in items {
-                let body = item.as_text().unwrap_or_default().to_string();
-                out.push(SystemItem::Workflow {
-                    slug: slug.clone(),
-                    body,
-                });
-            }
-        }
-        Ok(out)
-    }
-
     /// Stage the post-interruption cleanup at the front of worker
     /// history: close every unanswered `Item::ToolCall` with a synthetic
     /// `Item::ToolResult` (Anthropic wire-validity), then append a
@@ -2090,36 +1947,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         Ok(())
     }
 
-    /// Validate explicit workflow invocations without reading dependency
-    /// bodies. Called from `Worker::run` entry so an invalid slug aborts
-    /// the turn before any session-log commit or interrupt-prep side
-    /// effects; `pub` so completion / preview paths can also dry-check
-    /// inputs.
-    pub fn validate_workflow_invocations(
-        &self,
-        segments: &[Segment],
-    ) -> Result<(), WorkflowResolveError> {
-        for seg in segments {
-            let Segment::WorkflowInvoke { slug } = seg else {
-                continue;
-            };
-            let parsed = workflow_crate::Slug::parse(slug.clone())
-                .map_err(|source| WorkflowResolveError::InvalidSlug(source.into()))?;
-            let record = self
-                .workflow_registry
-                .get(&parsed)
-                .ok_or_else(|| WorkflowResolveError::NotFound { slug: slug.clone() })?;
-            if !record.user_invocable {
-                return Err(WorkflowResolveError::NotUserInvocable { slug: slug.clone() });
-            }
-        }
-        Ok(())
-    }
-
-    pub fn workflow_completions(&self) -> Vec<String> {
-        self.workflow_registry.list_user_invocable("")
-    }
-
     pub fn knowledge_completions(&self) -> Vec<String> {
         self.memory_layout
             .as_ref()
@@ -2129,8 +1956,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
 
     /// Flatten a typed segment list into the single string the Engine
     /// receives as the user message, and emit user-facing alerts for
-    /// segments that fall through to placeholder (knowledge / workflow
-    /// refs without a resolver, or unknown variants from a newer client).
+    /// segments that fall through to placeholder (Knowledge refs without a resolver, or unknown variants from a newer client).
     /// `FileRef` is handled separately by `resolve_file_refs`. The text
     /// reconstruction itself comes from `Segment::flatten_to_text`,
     /// shared with replay paths that should not re-alert.
@@ -2150,7 +1976,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                         );
                     }
                 }
-                Segment::WorkflowInvoke { .. } => {}
                 Segment::Unknown => {
                     self.alert(
                         AlertLevel::Warn,
@@ -2716,11 +2541,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let worker = self.engine.as_ref().expect("worker taken during run");
         let history = worker.history();
         let retain_from = cut.index.min(history.len());
-        let mut retained_items = history[retain_from..].to_vec();
-        let mut items_to_summarise = history[..retain_from].to_vec();
-        active_workflow::strip_rehydration_messages(&mut retained_items);
-        active_workflow::strip_rehydration_messages(&mut items_to_summarise);
-
+        let retained_items = history[retain_from..].to_vec();
+        let items_to_summarise = history[..retain_from].to_vec();
         // Compaction-related knobs. Fall through to manifest defaults when
         // `[compaction]` is omitted entirely.
         let (
@@ -2778,15 +2600,12 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             .unwrap_or_default();
 
         // Input text fed to the compact worker. Includes the default
-        // references, current TaskStore snapshot, active workflow invocation
-        // state, and the (pruned) conversation text.
+        // references, current TaskStore snapshot, current TaskStore snapshot, and the (pruned) conversation text.
         let task_snapshot_text = self.task_feature.snapshot_text();
-        let active_workflow_snapshot_text = self.active_workflows.snapshot_text();
         let summary_input = build_summary_input(
             &items_to_summarise,
             &default_refs,
             Some(task_snapshot_text.as_str()),
-            active_workflow_snapshot_text.as_deref(),
             SummaryInputOptions {
                 overview_target_tokens,
                 overview_warning_tokens,
@@ -2976,10 +2795,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             .count();
 
         // Build new history: [summary, ...auto-read, references, ...retained, task snapshot, TaskList synthetic call/result].
-        // Active workflow guidance is intentionally not persisted as an ordinary
-        // compacted-history system message. It is regenerated request-locally
-        // from typed `worker.active_workflows` extension state so completed,
-        // cancelled, corrupt, or missing state cannot leak stale obligations.
         // The TaskStore snapshot trails the retained items so that, on resume,
         // `replay_history` walks any pre-compact Task* calls preserved verbatim
         // in retained_items first and the trailing snapshot's `replace_with`
@@ -3050,8 +2865,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 at_turn_index: source_turn_count,
             }),
         };
-        let active_workflow_extension = self.active_workflows.extension_entry();
-        let initial_entries = vec![entry.clone(), active_workflow_extension.clone()];
+        let initial_entries = vec![entry.clone()];
         self.store
             .create_segment(old_loc.session_id, new_segment_id, &initial_entries)?;
         self.segment_state.set_location(SegmentLocation {
@@ -3065,8 +2879,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         // resets the mirror to the replacement segment prefix so any subscriber
         // querying after this point sees the post-compaction prefix, including
         // durable extension state.
-        self.sink
-            .reset_with_initial_entries(vec![session_start, active_workflow_extension]);
+        self.sink.reset_with_initial_entries(vec![session_start]);
         // Keep workers.json pointing at the live segment_id. Without this
         // a concurrent `restore_from_manifest(new_segment_id)` would
         // see no live writer and grab the session this Worker just moved
@@ -4139,7 +3952,7 @@ where
         workspace_context: WorkerWorkspaceContext,
         filesystem_authority: WorkerFilesystemAuthority,
     ) -> Result<Self, WorkerError> {
-        let mut common = prepare_worker_common_with_context(
+        let common = prepare_worker_common_with_context(
             &manifest,
             &loader,
             /* parse_template */ true,
@@ -4147,7 +3960,6 @@ where
             filesystem_authority,
             manifest.scope.clone(),
         )?;
-        let skill_shadows = std::mem::take(&mut common.skill_shadows);
 
         // Segment creation is deferred to the first run (see
         // `ensure_segment_head`) so the SegmentStart entry can capture
@@ -4195,7 +4007,6 @@ where
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
             task_feature: TaskFeature::new(),
-            active_workflows: ActiveWorkflowStore::new(),
             system_prompt_template: common.system_prompt_template,
             alerter: None,
             event_tx: None,
@@ -4207,11 +4018,9 @@ where
             callback_socket: None,
             runtime_ticket_role: None,
             prompts: common.prompts,
-            workflow_registry: common.workflow_registry,
             memory_layout: common.memory_layout,
             inject_resident_summary: true,
             inject_resident_knowledge: true,
-            inject_resident_workflows: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Arc::new(Mutex::new(None)),
@@ -4224,7 +4033,6 @@ where
         worker.apply_permissions_from_manifest();
         worker.apply_prune_from_manifest();
         worker.write_worker_metadata_pending()?;
-        drain_skill_shadows(&worker, skill_shadows);
         Ok(worker)
     }
 
@@ -4264,7 +4072,7 @@ where
         workspace_context: WorkerWorkspaceContext,
         filesystem_authority: WorkerFilesystemAuthority,
     ) -> Result<Self, WorkerError> {
-        let mut common = prepare_worker_common_with_context(
+        let common = prepare_worker_common_with_context(
             &manifest,
             &loader,
             /* parse_template */ true,
@@ -4272,7 +4080,6 @@ where
             filesystem_authority,
             manifest.scope.clone(),
         )?;
-        let skill_shadows = std::mem::take(&mut common.skill_shadows);
 
         // A spawned child starts its own conversation, so it mints a
         // fresh Session rather than joining the spawner's.
@@ -4307,7 +4114,6 @@ where
             usage_history: Arc::new(Mutex::new(Vec::new())),
             tracker: None,
             task_feature: TaskFeature::new(),
-            active_workflows: ActiveWorkflowStore::new(),
             system_prompt_template: common.system_prompt_template,
             alerter: None,
             event_tx: None,
@@ -4319,11 +4125,9 @@ where
             callback_socket: Some(callback_socket),
             runtime_ticket_role: None,
             prompts: common.prompts,
-            workflow_registry: common.workflow_registry,
             memory_layout: common.memory_layout,
             inject_resident_summary: true,
             inject_resident_knowledge: true,
-            inject_resident_workflows: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Arc::new(Mutex::new(None)),
@@ -4336,7 +4140,6 @@ where
         worker.apply_permissions_from_manifest();
         worker.apply_prune_from_manifest();
         worker.write_worker_metadata_pending()?;
-        drain_skill_shadows(&worker, skill_shadows);
         Ok(worker)
     }
 
@@ -4465,7 +4268,7 @@ where
         let mirror_entries: Vec<LogEntry> = raw_entries.clone();
         let scope_config = effective_restore_scope_config(&store, &manifest)?;
 
-        let mut common = prepare_worker_common_with_context(
+        let common = prepare_worker_common_with_context(
             &manifest,
             &loader,
             /* parse_template */ false,
@@ -4473,7 +4276,6 @@ where
             filesystem_authority,
             scope_config,
         )?;
-        let skill_shadows = std::mem::take(&mut common.skill_shadows);
 
         // Atomic: register_worker inside install_top_level rejects when
         // another live allocation already holds `segment_id`. Wrapping
@@ -4512,8 +4314,7 @@ where
                 ..
             })
         );
-        let mut restored_history = state.history.clone();
-        active_workflow::strip_rehydration_messages(&mut restored_history);
+        let restored_history = state.history.clone();
         worker.set_history(restored_history);
         worker.set_request_config(state.config.clone());
         worker.set_turn_count(state.turn_count);
@@ -4524,8 +4325,6 @@ where
 
         let extract_pointer = memory::extract::fold_pointer(&state.extensions);
         let task_feature = TaskFeature::from_history(&state.history);
-        let active_workflows = ActiveWorkflowStore::new();
-        active_workflows.restore_from_history_and_extensions(&state.history, &state.extensions);
         let worker_metadata_writer = Some(worker_metadata_writer_for_store(&store));
 
         let mut worker = Self {
@@ -4546,7 +4345,6 @@ where
             usage_history: Arc::new(Mutex::new(state.usage_history)),
             tracker: None,
             task_feature,
-            active_workflows,
             // Restore replays the saved system_prompt verbatim — no
             // template re-render on resume.
             system_prompt_template: None,
@@ -4560,11 +4358,9 @@ where
             callback_socket: None,
             runtime_ticket_role: None,
             prompts: common.prompts,
-            workflow_registry: common.workflow_registry,
             memory_layout: common.memory_layout,
             inject_resident_summary: true,
             inject_resident_knowledge: true,
-            inject_resident_workflows: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
             extract_pointer: Arc::new(Mutex::new(extract_pointer)),
@@ -4584,7 +4380,6 @@ where
             segment_id,
         })?;
         worker.reconcile_restored_delegations().await?;
-        drain_skill_shadows(&worker, skill_shadows);
         Ok(worker)
     }
 
@@ -4776,13 +4571,12 @@ struct SummaryInputBuild {
 }
 
 /// Build the compact worker's input: default-reference instructions,
-/// the list of recently-touched files, task snapshot, active workflow snapshot,
+/// the list of recently-touched files, task snapshot,
 /// and a bounded overview rather than a prefix-wide transcript.
 fn build_summary_input(
     items: &[Item],
     default_refs: &[PathBuf],
     task_snapshot: Option<&str>,
-    active_workflow_snapshot: Option<&str>,
     options: SummaryInputOptions,
 ) -> SummaryInputBuild {
     let overview = build_summary_overview(
@@ -4832,17 +4626,6 @@ fn build_summary_input(
              from the compact worker.\n",
         );
         out.push_str(task_snapshot);
-        out.push_str("\n\n");
-    }
-    if let Some(active_workflow_snapshot) = active_workflow_snapshot {
-        out.push_str(
-            "## Active Workflow Invocation State\n\
-             This is durable typed workflow state for workflow-governed tasks. Preserve active \
-             slugs, invocation scope, status, obligations/checkpoints, and the snapshotted \
-             workflow guidance in the summary; do not substitute advertised/latest workflow \
-             resources for this invocation state.\n",
-        );
-        out.push_str(active_workflow_snapshot);
         out.push_str("\n\n");
     }
     out.push_str("## Conversation overview/index\n");
@@ -5097,10 +4880,6 @@ fn preview_segments(segments: &[Segment]) -> String {
                 preview.push('#');
                 preview.push_str(slug);
             }
-            Segment::WorkflowInvoke { slug } => {
-                preview.push('/');
-                preview.push_str(slug);
-            }
             Segment::Unknown => preview.push_str("[unknown input segment]"),
         }
     }
@@ -5192,12 +4971,6 @@ pub enum WorkerError {
     #[error("memory consolidation lock acquisition failed: {0}")]
     ConsolidationLock(#[source] memory::consolidate::LockError),
 
-    #[error("workflow load failed: {0}")]
-    WorkflowLoad(#[source] workflow_crate::WorkflowLoadError),
-
-    #[error("workflow invocation failed: {0}")]
-    WorkflowResolve(#[from] WorkflowResolveError),
-
     #[error("session {segment_id} has no entries to restore")]
     SegmentEmpty { segment_id: SegmentId },
 
@@ -5237,14 +5010,8 @@ struct WorkerCommon {
     delegation_scope: DelegationScope,
     client: Box<dyn LlmClient>,
     prompts: Arc<PromptCatalog>,
-    workflow_registry: workflow_crate::WorkflowRegistry,
     memory_layout: Option<memory::WorkspaceLayout>,
     system_prompt_template: Option<SystemPromptTemplate>,
-    /// SKILL.md shadow events surfaced during workflow-registry build.
-    /// The Worker constructor drains these into the notify buffer right
-    /// after the Worker is materialised so the first LLM request observes
-    /// any skill ↔ workflow collisions.
-    skill_shadows: Vec<workflow_crate::ShadowedSkill>,
 }
 
 async fn restored_child_reachable(child: &WorkerSpawnedChild) -> bool {
@@ -5344,11 +5111,7 @@ fn prepare_worker_common_with_context(
     if let (Some(mem), Some(local)) = (manifest.memory.as_ref(), filesystem_authority.as_local()) {
         let layout = memory::WorkspaceLayout::resolve(mem, &local.root);
         scope_config.deny.extend(memory::deny_write_rules(&layout));
-        scope_config
-            .deny
-            .extend(workflow_crate::deny_write_rules(&layout));
     }
-    scope_config.allow.extend(skill_dir_read_rules(manifest));
     let scope = Scope::from_config(&scope_config).map_err(WorkerError::Scope)?;
     prepare_worker_common_from_scope(
         manifest,
@@ -5390,14 +5153,6 @@ fn prepare_worker_common_from_scope(
             .as_local()
             .map(|local| memory::WorkspaceLayout::resolve(mem, &local.root))
     });
-    let mut workflow_registry = match memory_layout.as_ref() {
-        Some(layout) => {
-            workflow_crate::load_workflows(layout).map_err(WorkerError::WorkflowLoad)?
-        }
-        None => workflow_crate::WorkflowRegistry::empty(),
-    };
-    let skill_shadows = ingest_skills(&mut workflow_registry, manifest);
-
     let system_prompt_template = if parse_template {
         Some(
             SystemPromptTemplate::parse(&manifest.engine.instruction, loader.clone())
@@ -5414,70 +5169,9 @@ fn prepare_worker_common_from_scope(
         delegation_scope,
         client,
         prompts,
-        workflow_registry,
         memory_layout,
         system_prompt_template,
-        skill_shadows,
     })
-}
-
-/// Ingest external SKILL.md sources into the workflow registry.
-///
-/// Skills come exclusively from the manifest's `[skills] directories`
-/// list (resolved against the manifest base directory). Internal
-/// Workflows already loaded via [`workflow_crate::load_workflows`] take priority
-/// over skills sharing the same slug; collisions are surfaced as
-/// [`workflow_crate::ShadowedSkill`] events that the caller pushes onto the
-/// Worker's notification buffer.
-fn ingest_skills(
-    registry: &mut workflow_crate::WorkflowRegistry,
-    manifest: &WorkerManifest,
-) -> Vec<workflow_crate::ShadowedSkill> {
-    let mut shadows = Vec::new();
-    let Some(skills_cfg) = manifest.skills.as_ref() else {
-        return shadows;
-    };
-    for dir in &skills_cfg.directories {
-        for skill in workflow_crate::load_skills_from_dir(dir) {
-            let source = workflow_crate::WorkflowSource::Skill { dir: dir.clone() };
-            let record = skill.into_workflow_record(source);
-            if let Some(shadow) = registry.merge_skill(record) {
-                shadows.push(shadow);
-            }
-        }
-    }
-    shadows
-}
-
-/// Drain skill-ingest shadow events into the Worker's notify buffer so the
-/// first LLM request renders them as system-message attachments.
-fn drain_skill_shadows<C, S>(worker: &Worker<C, S>, shadows: Vec<workflow_crate::ShadowedSkill>)
-where
-    C: LlmClient,
-    S: Store,
-{
-    for shadow in shadows {
-        worker.push_notify(format!("[Skill shadowed] {}", shadow.message()));
-    }
-}
-
-/// Allow-rules granting `Read` access to every skill directory the Worker
-/// will ingest from the manifest's `[skills] directories`. Returned
-/// rules are recursive so the entire skill bundle (`SKILL.md` +
-/// `scripts/` + `references/` + `assets/`) is readable.
-fn skill_dir_read_rules(manifest: &WorkerManifest) -> Vec<ScopeRule> {
-    let Some(skills_cfg) = manifest.skills.as_ref() else {
-        return Vec::new();
-    };
-    skills_cfg
-        .directories
-        .iter()
-        .map(|dir| ScopeRule {
-            target: dir.clone(),
-            permission: Permission::Read,
-            recursive: true,
-        })
-        .collect()
 }
 
 /// Snapshot the process's current working directory as the Worker's cwd,
@@ -5885,7 +5579,6 @@ mod build_summary_prompt_tests {
             items,
             &[],
             None,
-            None,
             SummaryInputOptions {
                 overview_target_tokens: 512,
                 overview_warning_tokens: 1024,
@@ -5935,33 +5628,11 @@ mod build_summary_prompt_tests {
     }
 
     #[test]
-    fn includes_active_workflow_snapshot_section() {
-        let prompt = build_summary_input(
-            &[Item::user_message("continue after review")],
-            &[],
-            None,
-            Some("ActiveWorkflowStore: 1 active workflow\n- review before merge\n- close ticket"),
-            SummaryInputOptions {
-                overview_target_tokens: 512,
-                overview_warning_tokens: 1024,
-                overview_deadline_tokens: 2048,
-                summary_target_tokens: 256,
-            },
-        )
-        .text;
-
-        assert!(prompt.contains("## Active Workflow Invocation State"));
-        assert!(prompt.contains("review before merge"));
-        assert!(prompt.contains("close ticket"));
-    }
-
-    #[test]
     fn overview_warning_does_not_drop_input() {
         let items = vec![Item::user_message("x".repeat(4_000))];
         let built = build_summary_input(
             &items,
             &[],
-            None,
             None,
             SummaryInputOptions {
                 overview_target_tokens: 10,
@@ -5981,7 +5652,6 @@ mod build_summary_prompt_tests {
         let built = build_summary_input(
             &items,
             &[],
-            None,
             None,
             SummaryInputOptions {
                 overview_target_tokens: 10,
@@ -6070,7 +5740,7 @@ mod build_summary_prompt_tests {
         Worker<NoopClient, session_store::FsStore>,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let manifest = minimal_manifest_with_skills(vec![]);
+        let manifest = minimal_manifest();
         let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
         let cwd = dir.path().join("workspace");
         std::fs::create_dir_all(&cwd).unwrap();
@@ -6226,7 +5896,7 @@ mod build_summary_prompt_tests {
     #[tokio::test]
     async fn apply_interrupt_prep_appends_via_callback_and_logs_independent_entries() {
         let dir = tempfile::tempdir().unwrap();
-        let manifest = minimal_manifest_with_skills(vec![]);
+        let manifest = minimal_manifest();
         let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
         let cwd = dir.path().join("workspace");
         std::fs::create_dir_all(&cwd).unwrap();
@@ -6303,7 +5973,6 @@ mod build_summary_prompt_tests {
     struct ResidentInjectionGates {
         summary: bool,
         knowledge: bool,
-        workflows: bool,
     }
 
     impl ResidentInjectionGates {
@@ -6311,7 +5980,6 @@ mod build_summary_prompt_tests {
             Self {
                 summary: enabled,
                 knowledge: enabled,
-                workflows: enabled,
             }
         }
     }
@@ -6326,7 +5994,6 @@ mod build_summary_prompt_tests {
             memory_config,
             ResidentInjectionGates::all(resident_injection),
             false,
-            false,
         )
         .await
     }
@@ -6336,7 +6003,6 @@ mod build_summary_prompt_tests {
         memory_config: Option<manifest::MemoryConfig>,
         gates: ResidentInjectionGates,
         include_knowledge: bool,
-        include_workflow: bool,
     ) -> String {
         let dir = tempfile::tempdir().unwrap();
         let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
@@ -6354,16 +6020,7 @@ mod build_summary_prompt_tests {
             )
             .unwrap();
         }
-        if include_workflow {
-            std::fs::create_dir_all(cwd.join(".yoi/workflow")).unwrap();
-            std::fs::write(
-                cwd.join(".yoi/workflow/resident-flow.md"),
-                workflow_doc("workflow resident desc"),
-            )
-            .unwrap();
-        }
-
-        let mut manifest = minimal_manifest_with_skills(vec![]);
+        let mut manifest = minimal_manifest();
         manifest.memory = memory_config;
         let scope = Scope::writable(&cwd).unwrap();
         let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
@@ -6382,15 +6039,11 @@ mod build_summary_prompt_tests {
             .memory
             .as_ref()
             .map(|mem| memory::WorkspaceLayout::resolve(mem, &cwd));
-        if let Some(layout) = worker.memory_layout.as_ref() {
-            worker.workflow_registry = workflow_crate::load_workflows(layout).unwrap();
-        }
-        if gates.summary == gates.knowledge && gates.summary == gates.workflows {
+        if gates.summary == gates.knowledge {
             worker.set_resident_injection(gates.summary);
         } else {
             worker.set_resident_summary_injection(gates.summary);
             worker.set_resident_knowledge_injection(gates.knowledge);
-            worker.set_resident_workflow_injection(gates.workflows);
         }
         let template = SystemPromptTemplate::parse(
             "$yoi/default",
@@ -6410,10 +6063,6 @@ mod build_summary_prompt_tests {
         format!(
             "---\ncreated_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\nkind: policy\ndescription: \"{description}\"\nmodel_invokation: true\nuser_invocable: true\nlast_sources: []\n---\nbody\n",
         )
-    }
-
-    fn workflow_doc(description: &str) -> String {
-        format!("---\ndescription: {description}\nmodel_invokation: true\n---\nbody\n")
     }
 
     #[tokio::test]
@@ -6483,9 +6132,7 @@ mod build_summary_prompt_tests {
             ResidentInjectionGates {
                 summary: false,
                 knowledge: true,
-                workflows: true,
             },
-            true,
             true,
         )
         .await;
@@ -6494,21 +6141,17 @@ mod build_summary_prompt_tests {
         assert!(!prompt.contains("resident summary marker"));
         assert!(prompt.contains("Resident knowledge"));
         assert!(prompt.contains("knowledge resident desc"));
-        assert!(prompt.contains("Resident workflows"));
-        assert!(prompt.contains("workflow resident desc"));
     }
 
     #[tokio::test]
-    async fn knowledge_and_workflow_gates_false_keep_resident_summary() {
+    async fn knowledge_gate_false_keeps_resident_summary() {
         let prompt = render_system_prompt_with_resident_sections(
             Some(&summary_doc("resident summary marker")),
             Some(manifest::MemoryConfig::default()),
             ResidentInjectionGates {
                 summary: true,
                 knowledge: false,
-                workflows: false,
             },
-            true,
             true,
         )
         .await;
@@ -6517,8 +6160,6 @@ mod build_summary_prompt_tests {
         assert!(prompt.contains("resident summary marker"));
         assert!(!prompt.contains("Resident knowledge"));
         assert!(!prompt.contains("knowledge resident desc"));
-        assert!(!prompt.contains("Resident workflows"));
-        assert!(!prompt.contains("workflow resident desc"));
     }
 
     #[tokio::test]
@@ -6528,7 +6169,6 @@ mod build_summary_prompt_tests {
             Some(manifest::MemoryConfig::default()),
             ResidentInjectionGates::all(false),
             true,
-            true,
         )
         .await;
 
@@ -6536,13 +6176,9 @@ mod build_summary_prompt_tests {
         assert!(!prompt.contains("resident summary marker"));
         assert!(!prompt.contains("Resident knowledge"));
         assert!(!prompt.contains("knowledge resident desc"));
-        assert!(!prompt.contains("Resident workflows"));
-        assert!(!prompt.contains("workflow resident desc"));
     }
 
-    fn minimal_manifest_with_skills(dirs: Vec<PathBuf>) -> WorkerManifest {
-        // Construct the smallest possible WorkerManifest that resolves; only
-        // the `skills` field matters for `skill_dir_read_rules`.
+    fn minimal_manifest() -> WorkerManifest {
         let toml_str = r#"
 [worker]
 name = "x"
@@ -6557,72 +6193,6 @@ model_id = "claude-sonnet-4-20250514"
 target = "/abs/scope"
 permission = "write"
 "#;
-        let mut manifest = WorkerManifest::from_toml(toml_str).unwrap();
-        if !dirs.is_empty() {
-            manifest.skills = Some(manifest::SkillsConfig { directories: dirs });
-        }
-        manifest
-    }
-
-    #[test]
-    fn skill_dir_read_rules_lists_workspace_skill_directories() {
-        let manifest = minimal_manifest_with_skills(vec![
-            PathBuf::from("/abs/skills-a"),
-            PathBuf::from("/abs/skills-b"),
-        ]);
-        let rules = skill_dir_read_rules(&manifest);
-        let workspace_rules: Vec<_> = rules
-            .iter()
-            .filter(|r| {
-                r.target == PathBuf::from("/abs/skills-a")
-                    || r.target == PathBuf::from("/abs/skills-b")
-            })
-            .collect();
-        assert_eq!(workspace_rules.len(), 2);
-        for rule in &workspace_rules {
-            assert_eq!(rule.permission, Permission::Read);
-            assert!(rule.recursive);
-        }
-    }
-
-    #[test]
-    fn skill_dir_read_rules_empty_when_skills_section_missing() {
-        let manifest = minimal_manifest_with_skills(vec![]);
-        let rules = skill_dir_read_rules(&manifest);
-        assert!(rules.is_empty());
-    }
-
-    #[test]
-    fn ingest_skills_returns_empty_when_skills_section_missing() {
-        let manifest = minimal_manifest_with_skills(vec![]);
-        let mut registry = workflow_crate::WorkflowRegistry::empty();
-        let shadows = ingest_skills(&mut registry, &manifest);
-        assert!(shadows.is_empty());
-        assert!(registry.is_empty());
-    }
-
-    #[test]
-    fn ingest_skills_loads_from_workspace_directories() {
-        let dir = tempfile::tempdir().unwrap();
-        let skills_root = dir.path().join("skills");
-        std::fs::create_dir_all(skills_root.join("alpha")).unwrap();
-        std::fs::write(
-            skills_root.join("alpha").join("SKILL.md"),
-            "---\nname: alpha\ndescription: Alpha skill\n---\nbody\n",
-        )
-        .unwrap();
-
-        let manifest = minimal_manifest_with_skills(vec![skills_root.clone()]);
-        let mut registry = workflow_crate::WorkflowRegistry::empty();
-        let shadows = ingest_skills(&mut registry, &manifest);
-
-        // workspace skill `alpha` should be registered (no collision).
-        assert!(
-            registry
-                .get(&workflow_crate::Slug::parse("alpha").unwrap())
-                .is_some()
-        );
-        // No workflow exists to shadow `alpha`, so no shadow event for it.
-        assert!(shadows.iter().all(|s| s.slug.as_str() != "alpha"));
+        WorkerManifest::from_toml(toml_str).unwrap()
     }
 }

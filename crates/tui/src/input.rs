@@ -58,25 +58,12 @@ impl KnowledgeRefAtom {
     }
 }
 
-/// `/<slug>` chip — confirmed completion of a Workflow invocation.
-#[derive(Debug, Clone)]
-pub struct WorkflowInvokeAtom {
-    pub slug: String,
-}
-
-impl WorkflowInvokeAtom {
-    pub fn label(&self) -> String {
-        format!("/{}", self.slug)
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum Atom {
     Char(char),
     Paste(PasteRef),
     FileRef(FileRefAtom),
     KnowledgeRef(KnowledgeRefAtom),
-    WorkflowInvoke(WorkflowInvokeAtom),
 }
 
 impl Atom {
@@ -88,7 +75,6 @@ impl Atom {
             Atom::Paste(p) => Some((Style::default().fg(Color::Magenta), p.label())),
             Atom::FileRef(r) => Some((Style::default().fg(Color::Cyan), r.label())),
             Atom::KnowledgeRef(r) => Some((Style::default().fg(Color::Green), r.label())),
-            Atom::WorkflowInvoke(r) => Some((Style::default().fg(Color::Yellow), r.label())),
         }
     }
 }
@@ -97,8 +83,7 @@ impl Atom {
 enum AtomClass {
     Word(WordKind),
     Sep,
-    /// Indivisible chip — paste / file ref / knowledge ref / workflow
-    /// invocation. Word motion treats one chip as one unit; deletion
+    /// Indivisible chip — paste / file ref / knowledge ref. Word motion treats one chip as one unit; deletion
     /// removes the whole atom.
     Chip,
 }
@@ -118,9 +103,7 @@ enum WordKind {
 fn atom_class(atom: &Atom) -> AtomClass {
     match atom {
         Atom::Char(c) => char_class(*c),
-        Atom::Paste(_) | Atom::FileRef(_) | Atom::KnowledgeRef(_) | Atom::WorkflowInvoke(_) => {
-            AtomClass::Chip
-        }
+        Atom::Paste(_) | Atom::FileRef(_) | Atom::KnowledgeRef(_) => AtomClass::Chip,
     }
 }
 
@@ -216,11 +199,6 @@ impl InputBuffer {
                     self.atoms
                         .push(Atom::KnowledgeRef(KnowledgeRefAtom { slug: slug.clone() }));
                 }
-                protocol::Segment::WorkflowInvoke { slug } => {
-                    self.atoms.push(Atom::WorkflowInvoke(WorkflowInvokeAtom {
-                        slug: slug.clone(),
-                    }));
-                }
                 protocol::Segment::Unknown => {
                     self.atoms
                         .extend("[unknown input segment]".chars().map(Atom::Char));
@@ -249,7 +227,6 @@ impl InputBuffer {
                 Atom::Paste(paste) => text.push_str(&paste.content),
                 Atom::FileRef(file) => text.push_str(&file.path),
                 Atom::KnowledgeRef(knowledge) => text.push_str(&knowledge.slug),
-                Atom::WorkflowInvoke(workflow) => text.push_str(&workflow.slug),
             }
         }
         text
@@ -277,7 +254,7 @@ impl InputBuffer {
     }
 
     /// Replace `atoms[start..self.cursor]` (the in-flight `@<typed>` /
-    /// `#<typed>` / `/<typed>` token) with the corresponding chip atom
+    /// `#<typed>` token) with the corresponding chip atom
     /// and place the cursor right after the chip. Used by the completion
     /// confirm path.
     pub fn replace_with_file_ref(&mut self, start: usize, path: String) {
@@ -291,13 +268,6 @@ impl InputBuffer {
         self.atoms.drain(start..self.cursor);
         self.atoms
             .insert(start, Atom::KnowledgeRef(KnowledgeRefAtom { slug }));
-        self.cursor = start + 1;
-    }
-
-    pub fn replace_with_workflow_invoke(&mut self, start: usize, slug: String) {
-        self.atoms.drain(start..self.cursor);
-        self.atoms
-            .insert(start, Atom::WorkflowInvoke(WorkflowInvokeAtom { slug }));
         self.cursor = start + 1;
     }
 
@@ -322,9 +292,9 @@ impl InputBuffer {
     /// after the sigil (sigil itself excluded).
     ///
     /// Trigger rules:
-    /// - The sigil (`@` / `#` / `/`) must be preceded by start-of-input,
+    /// - The sigil (`@` / `#`) must be preceded by start-of-input,
     ///   whitespace, or another chip atom — otherwise this is normal
-    ///   text (e.g. the `/` in `src/main.rs` is not a workflow trigger).
+    ///   text (e.g. the `/` in `src/main.rs` is not a completion trigger).
     /// - Whitespace, newlines and chip atoms invalidate an in-flight
     ///   token — `@foo /` closes the `@foo` candidate as soon as the
     ///   space lands.
@@ -342,7 +312,6 @@ impl InputBuffer {
                     let kind = match c {
                         '@' => Some(protocol::CompletionKind::File),
                         '#' => Some(protocol::CompletionKind::Knowledge),
-                        '/' => Some(protocol::CompletionKind::Workflow),
                         _ => None,
                     };
                     if let Some(k) = kind {
@@ -511,7 +480,7 @@ impl InputBuffer {
 
     /// Build the typed `Vec<Segment>` sent over the protocol. Adjacent
     /// `Atom::Char`s are concatenated into a single `Segment::Text`; each
-    /// chip atom (`Paste` / `FileRef` / `KnowledgeRef` / `WorkflowInvoke`)
+    /// chip atom (`Paste` / `FileRef` / `KnowledgeRef` )
     /// becomes a standalone `Segment` so that clients re-rendering an
     /// `Event::UserMessage` see the same indivisible chip rather than a
     /// flattened string.
@@ -544,12 +513,6 @@ impl InputBuffer {
                 Atom::KnowledgeRef(r) => {
                     flush_text(&mut buf, &mut out);
                     out.push(protocol::Segment::KnowledgeRef {
-                        slug: r.slug.clone(),
-                    });
-                }
-                Atom::WorkflowInvoke(r) => {
-                    flush_text(&mut buf, &mut out);
-                    out.push(protocol::Segment::WorkflowInvoke {
                         slug: r.slug.clone(),
                     });
                 }
@@ -993,34 +956,6 @@ mod submit_segments_tests {
         assert!(matches!(&segs[0], Segment::Text { content } if content == "see "));
         assert!(matches!(&segs[1], Segment::FileRef { path } if path == "src/main.rs"));
     }
-
-    #[test]
-    fn knowledge_and_workflow_chips_emit_typed_segments() {
-        let mut buf = InputBuffer::new();
-        for c in "#r".chars() {
-            buf.insert_char(c);
-        }
-        buf.replace_with_knowledge_ref(0, "rust-style".into());
-        buf.insert_char(' ');
-        for c in "/p".chars() {
-            buf.insert_char(c);
-        }
-        buf.replace_with_workflow_invoke(2, "plan".into());
-        let segs = buf.submit_segments();
-        assert_eq!(segs.len(), 3);
-        match &segs[0] {
-            Segment::KnowledgeRef { slug } => assert_eq!(slug, "rust-style"),
-            other => panic!("expected KnowledgeRef, got {other:?}"),
-        }
-        match &segs[1] {
-            Segment::Text { content } => assert_eq!(content, " "),
-            other => panic!("expected Text, got {other:?}"),
-        }
-        match &segs[2] {
-            Segment::WorkflowInvoke { slug } => assert_eq!(slug, "plan"),
-            other => panic!("expected WorkflowInvoke, got {other:?}"),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1055,7 +990,7 @@ mod completion_prefix_tests {
     }
 
     #[test]
-    fn slash_inside_path_is_not_a_workflow_trigger() {
+    fn slash_inside_path_is_not_a_completion_trigger() {
         // After `@src/m`, the only valid trigger is `@`, not the `/`.
         let buf = buf_from("@src/m");
         let (kind, start, prefix) = buf.pending_completion_prefix().unwrap();
@@ -1099,14 +1034,6 @@ mod completion_prefix_tests {
         let (kind, _, prefix) = buf.pending_completion_prefix().unwrap();
         assert_eq!(kind, CompletionKind::Knowledge);
         assert_eq!(prefix, "abc");
-    }
-
-    #[test]
-    fn slash_at_start_triggers_workflow_completion() {
-        let buf = buf_from("/cl");
-        let (kind, _, prefix) = buf.pending_completion_prefix().unwrap();
-        assert_eq!(kind, CompletionKind::Workflow);
-        assert_eq!(prefix, "cl");
     }
 
     #[test]
@@ -1307,10 +1234,7 @@ mod word_motion_tests {
         for a in &buf.atoms {
             match a {
                 Atom::Char(c) => out.push(*c),
-                Atom::Paste(_)
-                | Atom::FileRef(_)
-                | Atom::KnowledgeRef(_)
-                | Atom::WorkflowInvoke(_) => out.push_str("<P>"),
+                Atom::Paste(_) | Atom::FileRef(_) | Atom::KnowledgeRef(_) => out.push_str("<P>"),
             }
         }
         out

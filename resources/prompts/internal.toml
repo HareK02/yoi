@@ -57,15 +57,6 @@ The following knowledge records are advertised resident.{% if knowledge_query_av
 {{ entries }}\
 """
 
-resident_workflows_section = """\
----
-## Resident workflows
-
-The following workflows are advertised resident. When a user request matches one, follow its procedure as authoritative instead of improvising. User-invocable workflows can additionally be triggered by the user typing /<slug>; you cannot invoke any of them yourself.
-
-{{ entries }}\
-"""
-
 worker_orchestration_guidance_section = "{% include \"$yoi/common/worker-orchestration\" %}"
 
 ticket_event_companion_notice = "{% include \"$yoi/worker/ticket_event_companion_notice\" %}"

@@ -39,7 +39,6 @@ impl ExistingRecords {
             RecordKind::Decision => self.decisions.contains_key(slug),
             RecordKind::Request => self.requests.contains(slug),
             RecordKind::Knowledge => self.knowledge.contains(slug),
-            RecordKind::Workflow => false,
             RecordKind::Summary => false,
         }
     }
@@ -53,7 +52,6 @@ impl ExistingRecords {
             RecordKind::Decision => self.decisions.keys().collect(),
             RecordKind::Request => self.requests.iter().collect(),
             RecordKind::Knowledge => self.knowledge.iter().collect(),
-            RecordKind::Workflow => Vec::new(),
             RecordKind::Summary => Vec::new(),
         }
     }

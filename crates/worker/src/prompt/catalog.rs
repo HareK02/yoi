@@ -88,10 +88,6 @@ pub enum WorkerPrompt {
     /// injection is enabled, and at least one `knowledge/*` record advertises
     /// `model_invokation: true`.
     ResidentKnowledgeSection,
-    /// Trailing `## Resident workflows` section, appended after resident
-    /// knowledge when Workflow resident injection is enabled and at least one
-    /// workflow advertises `model_invokation: true`.
-    ResidentWorkflowsSection,
     /// Trailing Worker orchestration guidance, appended when registered tools
     /// include Worker-management capabilities.
     WorkerOrchestrationGuidanceSection,
@@ -115,7 +111,6 @@ impl WorkerPrompt {
             Self::AgentsMdSection => "agents_md_section",
             Self::ResidentMemorySummarySection => "resident_memory_summary_section",
             Self::ResidentKnowledgeSection => "resident_knowledge_section",
-            Self::ResidentWorkflowsSection => "resident_workflows_section",
             Self::WorkerOrchestrationGuidanceSection => "worker_orchestration_guidance_section",
             Self::TicketEventCompanionNotice => "ticket_event_companion_notice",
             Self::SpawnWorkerToolDescription => "spawn_worker_tool_description",
@@ -136,7 +131,6 @@ impl WorkerPrompt {
         WorkerPrompt::AgentsMdSection,
         WorkerPrompt::ResidentMemorySummarySection,
         WorkerPrompt::ResidentKnowledgeSection,
-        WorkerPrompt::ResidentWorkflowsSection,
         WorkerPrompt::WorkerOrchestrationGuidanceSection,
         WorkerPrompt::TicketEventCompanionNotice,
         WorkerPrompt::SpawnWorkerToolDescription,
@@ -153,7 +147,6 @@ impl WorkerPrompt {
         "agents_md_section",
         "resident_memory_summary_section",
         "resident_knowledge_section",
-        "resident_workflows_section",
         "worker_orchestration_guidance_section",
         "ticket_event_companion_notice",
         "spawn_worker_tool_description",
@@ -408,15 +401,6 @@ impl PromptCatalog {
         );
         m.insert("memory_read_available", Value::from(memory_read_available));
         self.render(WorkerPrompt::ResidentKnowledgeSection, Value::from(m))
-    }
-
-    /// Render `WorkerPrompt::ResidentWorkflowsSection` with `{{ entries }}`
-    /// (a pre-formatted list block authored by the caller).
-    pub fn resident_workflows_section(&self, entries: &str) -> Result<String, CatalogError> {
-        self.render(
-            WorkerPrompt::ResidentWorkflowsSection,
-            single("entries", entries),
-        )
     }
 
     /// Render `WorkerPrompt::WorkerOrchestrationGuidanceSection` (no inputs).
@@ -750,7 +734,7 @@ compact_system = "PREFIX\n{% include \"$yoi/internal/compact_system\" %}"
         assert!(rendered.contains("Do not use `sleep` or polling loops"));
         assert!(rendered.contains("worktree state, diff, and test results"));
         assert!(rendered.contains("not scheduler or auto-maintain authorization"));
-        assert!(rendered.contains("bypass user/workflow authorization"));
+        assert!(rendered.contains("bypass user/Ticket authorization"));
     }
 
     #[test]

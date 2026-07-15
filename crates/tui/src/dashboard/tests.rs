@@ -825,18 +825,10 @@ fn ticket_queue_notification_message_carries_routing_contract() {
     assert!(message.contains("transition state queued -> inprogress"));
     assert!(message.contains("before any worktree/SpawnWorker implementation side effects"));
     assert!(message.contains("After inprogress acceptance"));
-    assert!(message.contains("worktree-workflow"));
-    assert!(message.contains("`.worktree/<task-name>`"));
+    assert!(message.contains("implementation worktree"));
     assert!(message.contains("tracked `.yoi` project records visible"));
-    assert!(
-        message.contains(
-            "`.yoi/memory` plus local/runtime/log/lock/secret-like `.yoi` paths excluded"
-        )
-    );
-    assert!(message.contains("multi-agent-workflow"));
+    assert!(message.contains("generated/local/runtime/log/lock/secret-like `.yoi` paths excluded"));
     assert!(message.contains("sibling coder/reviewer Workers"));
-    assert!(message.contains("coder narrow child-worktree write scope"));
-    assert!(message.contains("reviewer read-only by default"));
     assert!(message.contains(
         "integrate the implementation branch into the orchestration branch automatically"
     ));
@@ -2791,7 +2783,6 @@ fn dashboard_ticket_intake_finish_success_clears_composer_and_reports_pod() {
                 role: TicketRole::Intake,
                 worker_name: "intake-worker".to_string(),
                 profile: "builtin:default".to_string(),
-                workflow: "ticket-intake-workflow".to_string(),
                 launch_prompt_ref: None,
                 run_segments: vec![],
             },

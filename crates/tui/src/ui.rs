@@ -1098,9 +1098,6 @@ fn chip_span_for(seg: &Segment, fallback: Style) -> (Style, String) {
         ),
         Segment::FileRef { path } => (Style::default().fg(Color::Cyan), format!("@{path}")),
         Segment::KnowledgeRef { slug } => (Style::default().fg(Color::Green), format!("#{slug}")),
-        Segment::WorkflowInvoke { slug } => {
-            (Style::default().fg(Color::Yellow), format!("/{slug}"))
-        }
         Segment::Unknown => (fallback, "[unknown segment]".to_owned()),
     }
 }
@@ -1116,7 +1113,6 @@ fn segment_display_text(seg: &Segment) -> String {
         } => format!("[Clipboard #{id} | {chars} chars, {lines} lines]"),
         Segment::FileRef { path } => format!("@{path}"),
         Segment::KnowledgeRef { slug } => format!("#{slug}"),
-        Segment::WorkflowInvoke { slug } => format!("/{slug}"),
         Segment::Unknown => "[unknown segment]".to_owned(),
     }
 }

@@ -12,7 +12,7 @@ mod mutate;
 mod table;
 
 #[cfg(test)]
-mod test_util;
+pub(crate) mod test_util;
 
 pub use conflict::{
     ConflictOwner, find_conflict_owner, find_conflict_owners, is_within_effective_write,

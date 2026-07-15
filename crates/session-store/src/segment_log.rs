@@ -74,7 +74,7 @@ pub enum LogEntry {
 
     /// User input accepted at submit time. Carries the original typed
     /// `Vec<Segment>` so clients can re-render typed atoms (paste chips,
-    /// file/knowledge refs, workflow invocations) on segment restore.
+    /// file/knowledge refs) on segment restore.
     /// Replay flattens these into a `Item::user_message` for the worker
     /// history; the worker layer never sees segments directly.
     UserInput { ts: u64, segments: Vec<Segment> },

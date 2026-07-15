@@ -25,7 +25,6 @@ use memory::ResidentKnowledgeEntry;
 use minijinja::value::Value;
 use minijinja::{Environment, ErrorKind, UndefinedBehavior};
 use thiserror::Error;
-use workflow_crate::ResidentWorkflowEntry;
 
 use crate::prompt::catalog::{CatalogError, PromptCatalog};
 use crate::prompt::loader::{LoaderError, PromptLoader, PromptRef};
@@ -127,7 +126,6 @@ impl SystemPromptTemplate {
             ctx.agents_md.as_deref(),
             ctx.resident_summary,
             ctx.resident_knowledge,
-            ctx.resident_workflows,
             ToolCapabilities::from_tool_names(&ctx.tool_names),
         )
     }
@@ -166,10 +164,6 @@ pub struct SystemPromptContext<'a> {
     /// section entirely (memory disabled, or a consolidation worker that opts
     /// out); `Some(&[])` also yields no section.
     pub resident_knowledge: Option<&'a [ResidentKnowledgeEntry]>,
-    /// Resident workflow descriptions from `<workspace>/.yoi/workflow/*`
-    /// whose frontmatter has `model_invokation: true`. `None` disables the
-    /// section; consolidation workers opt out together with resident Knowledge.
-    pub resident_workflows: Option<&'a [ResidentWorkflowEntry]>,
     /// Catalog used to render the fixed trailing section headers.
     /// Passed by reference so callers do not give up ownership across
     /// the short-lived render borrow.
@@ -304,7 +298,6 @@ fn append_trailing_section(
     agents_md: Option<&str>,
     resident_summary: Option<&str>,
     resident_knowledge: Option<&[ResidentKnowledgeEntry]>,
-    resident_workflows: Option<&[ResidentWorkflowEntry]>,
     tool_capabilities: ToolCapabilities,
 ) -> Result<String, SystemPromptError> {
     let mut out = String::with_capacity(body.len() + 256);
@@ -345,15 +338,6 @@ fn append_trailing_section(
             out.push('\n');
         }
     }
-    if let Some(entries) = resident_workflows {
-        if !entries.is_empty() {
-            out.push('\n');
-            let formatted = format_resident_workflow_entries(entries);
-            let section = prompts.resident_workflows_section(&formatted)?;
-            out.push_str(section.trim_end_matches(&['\n', ' '][..]));
-            out.push('\n');
-        }
-    }
     if tool_capabilities.worker_management() {
         out.push('\n');
         let section = prompts.worker_orchestration_guidance_section()?;
@@ -371,14 +355,6 @@ fn append_trailing_section(
 /// `- <slug>: <description>` per line. Description newlines are folded
 /// to spaces so a single entry stays on one row in the rendered prompt.
 fn format_resident_knowledge_entries(entries: &[ResidentKnowledgeEntry]) -> String {
-    format_resident_entries(
-        entries
-            .iter()
-            .map(|e| (e.slug.as_str(), e.description.as_str())),
-    )
-}
-
-fn format_resident_workflow_entries(entries: &[ResidentWorkflowEntry]) -> String {
     format_resident_entries(
         entries
             .iter()
@@ -451,7 +427,6 @@ mod tests {
             agents_md,
             resident_summary: None,
             resident_knowledge: None,
-            resident_workflows: None,
             prompts: test_prompts(),
         }
     }
@@ -470,7 +445,6 @@ mod tests {
             agents_md: None,
             resident_summary: summary,
             resident_knowledge: None,
-            resident_workflows: None,
             prompts: test_prompts(),
         }
     }
@@ -489,26 +463,6 @@ mod tests {
             agents_md: None,
             resident_summary: None,
             resident_knowledge: Some(resident),
-            resident_workflows: None,
-            prompts: test_prompts(),
-        }
-    }
-
-    fn ctx_with_resident_workflows<'a>(
-        cwd: &'a Path,
-        scope: &'a Scope,
-        resident: &'a [ResidentWorkflowEntry],
-    ) -> SystemPromptContext<'a> {
-        SystemPromptContext {
-            now: fixed_now(),
-            cwd: cwd.display().to_string().into(),
-            language: manifest::defaults::WORKER_LANGUAGE,
-            scope,
-            tool_names: Vec::new(),
-            agents_md: None,
-            resident_summary: None,
-            resident_knowledge: None,
-            resident_workflows: Some(resident),
             prompts: test_prompts(),
         }
     }
@@ -652,7 +606,7 @@ mod tests {
         assert!(rendered.contains("Do not use `sleep` or polling loops"));
         assert!(rendered.contains("worktree state, diff, and test results"));
         assert!(rendered.contains("not scheduler or auto-maintain authorization"));
-        assert!(rendered.contains("bypass user/workflow authorization"));
+        assert!(rendered.contains("bypass user/Ticket authorization"));
     }
 
     #[test]
@@ -954,40 +908,5 @@ mod tests {
 
         assert!(rendered.contains("## Resident knowledge"));
         assert!(rendered.contains("KnowledgeQuery / MemoryRead"));
-    }
-
-    #[test]
-    fn trailing_section_renders_resident_workflows() {
-        let (_tmp, loader) = user_loader_with("body.md", "BODY");
-        let tmpl = SystemPromptTemplate::parse("$user/body", loader).unwrap();
-        let dir = TempDir::new().unwrap();
-        let scope = build_scope(dir.path());
-        let workflows = [ResidentWorkflowEntry {
-            slug: "resident-flow".to_string(),
-            description: "workflow resident desc\nwith newline".to_string(),
-        }];
-        let rendered = tmpl
-            .render(&ctx_with_resident_workflows(dir.path(), &scope, &workflows))
-            .unwrap();
-
-        assert!(rendered.contains("## Resident workflows"));
-        assert!(rendered.contains("- resident-flow: workflow resident desc with newline"));
-        let pos_boundaries = rendered.find("## Working boundaries").unwrap();
-        let pos_resident = rendered.find("## Resident workflows").unwrap();
-        assert!(pos_resident > pos_boundaries);
-    }
-
-    #[test]
-    fn trailing_section_omits_empty_resident_workflows() {
-        let (_tmp, loader) = user_loader_with("body.md", "BODY");
-        let tmpl = SystemPromptTemplate::parse("$user/body", loader).unwrap();
-        let dir = TempDir::new().unwrap();
-        let scope = build_scope(dir.path());
-        let workflows: [ResidentWorkflowEntry; 0] = [];
-        let rendered = tmpl
-            .render(&ctx_with_resident_workflows(dir.path(), &scope, &workflows))
-            .unwrap();
-
-        assert!(!rendered.contains("Resident workflows"));
     }
 }

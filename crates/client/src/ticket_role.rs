@@ -165,7 +165,6 @@ pub struct TicketRoleLaunchPlan {
     pub role: TicketRole,
     pub worker_name: String,
     pub profile: String,
-    pub workflow: String,
     pub launch_prompt_ref: Option<String>,
     pub run_segments: Vec<Segment>,
 }
@@ -305,7 +304,6 @@ pub fn plan_ticket_role_launch_with_config(
     }
     let role_config = config.role_launch_config(context.role)?;
     let profile = role_config.profile.as_str().to_string();
-    let workflow = role_config.workflow.as_str().to_string();
     let launch_prompt_ref = role_config
         .launch_prompt
         .as_ref()
@@ -336,14 +334,10 @@ pub fn plan_ticket_role_launch_with_config(
         role: context.role,
         worker_name,
         profile,
-        workflow: workflow.clone(),
         launch_prompt_ref,
-        run_segments: vec![
-            Segment::WorkflowInvoke { slug: workflow },
-            Segment::Text {
-                content: format!("\n\n{prompt}"),
-            },
-        ],
+        run_segments: vec![Segment::Text {
+            content: format!("\n\n{prompt}"),
+        }],
     })
 }
 
@@ -759,7 +753,6 @@ mod tests {
             role: TicketRole::Intake,
             worker_name: "ticket-intake".to_string(),
             profile: "project:intake".to_string(),
-            workflow: "ticket-intake-workflow".to_string(),
             launch_prompt_ref: None,
             run_segments: vec![Segment::Text {
                 content: "intake request".to_string(),
@@ -994,7 +987,6 @@ profile = "builtin:default"
         .unwrap();
         assert_eq!(intake.role, TicketRole::Intake);
         assert_eq!(intake.profile, TicketRole::Intake.default_profile());
-        assert_eq!(intake.workflow, TicketRole::Intake.default_workflow());
 
         let orchestrator = plan_ticket_role_launch(TicketRoleLaunchContext::new(
             temp.path(),
@@ -1005,10 +997,6 @@ profile = "builtin:default"
         assert_eq!(
             orchestrator.profile,
             TicketRole::Orchestrator.default_profile()
-        );
-        assert_eq!(
-            orchestrator.workflow,
-            TicketRole::Orchestrator.default_workflow()
         );
     }
 
@@ -1038,7 +1026,6 @@ profile = "builtin:default"
 [ticket.roles.reviewer]
 profile = "builtin:default"
 launch_prompt = "$workspace/ticket/reviewer/launch"
-workflow = "ticket-review-workflow"
 "#,
         );
         let mut context = TicketRoleLaunchContext::new(temp.path(), TicketRole::Reviewer);
@@ -1051,18 +1038,13 @@ workflow = "ticket-review-workflow"
 
         assert_eq!(plan.worker_name, "reviewer-fixed");
         assert_eq!(plan.profile, "builtin:default");
-        assert_eq!(plan.workflow, "ticket-review-workflow");
         assert_eq!(
             plan.launch_prompt_ref.as_deref(),
             Some("$workspace/ticket/reviewer/launch")
         );
-        assert!(matches!(
-            &plan.run_segments[0],
-            Segment::WorkflowInvoke { slug } if slug == "ticket-review-workflow"
-        ));
+        assert!(matches!(&plan.run_segments[0], Segment::Text { .. }));
         assert!(!text.contains("Configured launch_prompt"));
         assert!(!text.contains("$workspace/ticket/reviewer/launch"));
-        assert!(!text.contains("Workflow: ticket-review-workflow"));
         assert!(!text.contains("Profile selector: builtin:default"));
         assert!(!text.contains("Role: reviewer"));
         assert!(!text.contains("system_instruction"));
@@ -1133,8 +1115,6 @@ workflow = "ticket-review-workflow"
         assert!(orchestrator_text.contains("Route to implementation after planning sync."));
         assert!(orchestrator_text.contains("cargo check --workspace --all-targets"));
         assert!(!orchestrator_text.contains("state = inprogress"));
-        assert!(!orchestrator_text.contains("worktree-workflow"));
-        assert!(!orchestrator_text.contains("multi-agent-workflow"));
         assert!(!orchestrator_text.contains("root/original workspace reads"));
         assert!(!orchestrator_text.contains("role_workspace_root"));
         assert!(!orchestrator_text.contains("role_cwd"));

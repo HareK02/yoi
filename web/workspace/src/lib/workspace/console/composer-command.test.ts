@@ -1,4 +1,7 @@
-import { buildComposerRequest, parseSigilSegments } from "./composer-command.ts";
+import {
+  buildComposerRequest,
+  parseSigilSegments,
+} from "./composer-command.ts";
 
 declare const Deno: {
   test(name: string, fn: () => void): void;
@@ -19,14 +22,16 @@ function assertEquals<T>(actual: T, expected: T): void {
 }
 
 Deno.test("parseSigilSegments converts TUI-style references", () => {
-  assertEquals(parseSigilSegments("read @src/main.rs then #memory and /workflow"), [
-    { kind: "text", content: "read " },
-    { kind: "file_ref", path: "src/main.rs" },
-    { kind: "text", content: " then " },
-    { kind: "knowledge_ref", slug: "memory" },
-    { kind: "text", content: " and " },
-    { kind: "workflow_invoke", slug: "workflow" },
-  ]);
+  assertEquals(
+    parseSigilSegments("read @src/main.rs then #memory and /literal"),
+    [
+      { kind: "text", content: "read " },
+      { kind: "file_ref", path: "src/main.rs" },
+      { kind: "text", content: " then " },
+      { kind: "knowledge_ref", slug: "memory" },
+      { kind: "text", content: " and /literal" },
+    ],
+  );
 });
 
 Deno.test("buildComposerRequest sends user segments when sigils are present", () => {
@@ -52,7 +57,10 @@ Deno.test("buildComposerRequest parses colon commands", () => {
   const help = buildComposerRequest(":help compact");
   assert(help.ok, "help should be accepted");
   assertEquals(help.request, undefined);
-  assert(help.notice?.includes(":compact"), "help should return a local notice");
+  assert(
+    help.notice?.includes(":compact"),
+    "help should return a local notice",
+  );
 });
 
 Deno.test("buildComposerRequest rejects invalid colon commands", () => {
