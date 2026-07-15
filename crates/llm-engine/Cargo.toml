@@ -5,6 +5,10 @@ version = "0.2.1"
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+codex = ["dep:base64", "dep:chrono"]
+
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -12,11 +16,13 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
 reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "native-tls", "http2"] }
 eventsource-stream = "0.2"
 zstd = "0.13"
+base64 = { version = "0.22.1", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock"], optional = true }
 llm-engine-macros = { workspace = true }
 
 [dev-dependencies]

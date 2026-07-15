@@ -1,6 +1,7 @@
 mod config;
 pub mod defaults;
 mod model;
+pub mod model_catalog;
 pub mod paths;
 pub mod plugin;
 mod profile;

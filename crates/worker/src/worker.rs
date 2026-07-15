@@ -3132,7 +3132,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     fn build_compactor_client(&self) -> Result<Box<dyn LlmClient>, WorkerError> {
         if let Some(ref compaction) = self.manifest.compaction {
             if let Some(ref model_config) = compaction.model {
-                let client = provider::build_client(model_config)?;
+                let client = crate::model_client::build_client(model_config)?;
                 return Ok(client);
             }
         }
@@ -3149,7 +3149,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         memory_cfg: &manifest::MemoryConfig,
     ) -> Result<Box<dyn LlmClient>, WorkerError> {
         if let Some(ref m) = memory_cfg.extract_model {
-            let client = provider::build_client(m)?;
+            let client = crate::model_client::build_client(m)?;
             return Ok(client);
         }
         let worker = self.engine.as_ref().expect("worker taken during run");
@@ -3586,7 +3586,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         memory_cfg: &manifest::MemoryConfig,
     ) -> Result<Box<dyn LlmClient>, WorkerError> {
         if let Some(ref m) = memory_cfg.consolidation_model {
-            let client = provider::build_client(m)?;
+            let client = crate::model_client::build_client(m)?;
             return Ok(client);
         }
         let worker = self.engine.as_ref().expect("worker taken during run");
@@ -5154,7 +5154,7 @@ pub enum WorkerError {
     ManifestResolve(#[source] ResolveError),
 
     #[error(transparent)]
-    Provider(#[from] provider::ProviderError),
+    Provider(#[from] crate::model_client::ProviderError),
 
     #[error("compaction thrash: context still exceeds threshold immediately after compact")]
     CompactThrash,
@@ -5383,7 +5383,7 @@ fn prepare_worker_common_from_scope(
     let delegation_scope =
         DelegationScope::from_config(&manifest.delegation_scope).map_err(WorkerError::Scope)?;
 
-    let client = provider::build_client(&manifest.model)?;
+    let client = crate::model_client::build_client(&manifest.model)?;
     let prompts = PromptCatalog::load(loader, manifest.worker.prompt_pack.as_deref())?;
     let memory_layout = manifest.memory.as_ref().and_then(|mem| {
         filesystem_authority

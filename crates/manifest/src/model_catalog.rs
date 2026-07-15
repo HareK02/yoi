@@ -4,19 +4,19 @@
 //! - builtin モデル:    `resources/models/builtin.toml`
 //! - user override:     `<config_dir>/{providers,models}.toml`
 //!
-//! `<config_dir>` の解決は [`manifest::paths::config_dir`] を参照。
+//! `<config_dir>` の解決は [`crate::paths::config_dir`] を参照。
 //! どちらの override も「あれば builtin を置換、無ければ builtin」と
 //! いう一方向の差し替え（マージしない）。providers / models は独立に
 //! 読み、片方だけ user override も可。
 //!
-//! [`resolve_model_manifest`] が `manifest::ModelManifest`（ref / inline
+//! [`resolve_model_manifest`] が [`crate::ModelManifest`]（ref / inline
 //! 両形）を最終的な [`ModelConfig`] に解決する単一の入口で、wire 層
 //! に渡す前のバリデーションもここで行う。
 
 use std::path::{Path, PathBuf};
 
+use crate::{AuthRef, ModelManifest, SchemeKind};
 use llm_engine::llm_client::capability::ModelCapability;
-use manifest::{AuthRef, ModelManifest, SchemeKind};
 use serde::{Deserialize, Serialize};
 
 const BUILTIN_PROVIDERS: &str = include_str!("../../../resources/providers/builtin.toml");
@@ -178,7 +178,7 @@ fn auth_hint_to_ref(hint: &AuthHint) -> AuthRef {
 /// ユーザーが書いた設定が silent に無視されて builtin に戻る挙動は
 /// 気付きにくいため）。
 pub fn load_providers() -> Result<Vec<ProviderEntry>, CatalogError> {
-    if let Some(path) = manifest::paths::user_catalog_override("providers.toml")
+    if let Some(path) = crate::paths::user_catalog_override("providers.toml")
         && path.is_file()
     {
         return load_providers_from(&path);
@@ -211,7 +211,7 @@ pub fn load_providers_from(path: &Path) -> Result<Vec<ProviderEntry>, CatalogErr
 
 /// builtin + user override を解決してモデルカタログを返す。
 pub fn load_models() -> Result<Vec<ModelEntry>, CatalogError> {
-    if let Some(path) = manifest::paths::user_catalog_override("models.toml")
+    if let Some(path) = crate::paths::user_catalog_override("models.toml")
         && path.is_file()
     {
         return load_models_from(&path);

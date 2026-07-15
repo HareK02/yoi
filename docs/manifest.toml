@@ -43,7 +43,7 @@ name = "example-agent"
 #   (b) `ref` + 一部 override     — auth など個別差し替え
 #   (c) `scheme` + `model_id` 直書き — カタログを使わない inline 指定
 # (b) / (c) では `ref` 未指定なら `scheme` / `model_id` / `auth` が必須。
-# (実際の必須判定は `crates/provider` の resolve 側で行う)
+# (実際の必須判定は manifest::model_catalog の resolve 側で行う)
 [model]
 
 # 任意。形式: "<provider_id>/<model_id_in_ref>"。

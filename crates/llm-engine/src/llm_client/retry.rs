@@ -1,15 +1,15 @@
 //! LLM response stream を開く前の transient error 向けリトライポリシー。
 //!
-//! Engine が `LlmClient::stream` の open error に対して `is_retryable` を見て
-//! retry / backoff / TUI event / cancellation をまとめて管理する。
+//! `LlmClient::stream` の open error に対して `is_retryable` を見て
+//! retry / backoff / cancellation をまとめて管理する。
 //! SSE 読み出し開始後の失敗は対象外。
 
 use std::time::Duration;
 
 /// 指数バックオフ + ジッター + 累積タイムアウトを表すポリシー。
 ///
-/// `Default` は llm-engine 全体の固定値を返す。manifest 経由の上書きが
-/// 必要になったら拡張する（現状は不要 → `tickets/llm-engine-transient-retry.md`）。
+/// `Default` は llm-engine 全体の固定値を返す。呼び出し側からの上書きが
+/// 必要になったら拡張する。
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
     /// 指数の基準値。`base * 2^attempt` を `cap` で頭打ちにした上限から

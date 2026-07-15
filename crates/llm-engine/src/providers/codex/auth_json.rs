@@ -1,7 +1,7 @@
 //! `~/.codex/auth.json` の読み書き。
 //!
-//! Codex CLI と schema を共有するが、yoi は知らないフィールドを
-//! 失わないようファイル全体を `serde_json::Value` で保持し、必要箇所
+//! Codex CLI と schema を共有するが、知らないフィールドを失わないよう
+//! ファイル全体を `serde_json::Value` で保持し、必要箇所
 //! のみアクセスする。書込は `mode 0o600` を再設定（Codex CLI 同様）、
 //! ファイルロックは取らない（manager 側で guarded reload）。
 
@@ -106,7 +106,7 @@ pub async fn load(path: &Path) -> Result<AuthSnapshot, CodexAuthError> {
 /// 既存ファイルを再読込し、`tokens.{id_token,access_token,refresh_token}` と
 /// `last_refresh` を更新して書き戻す。Codex CLI の `persist_tokens` 相当。
 ///
-/// 並行する Codex CLI / 別 yoi プロセスが先に refresh していた場合の
+/// 並行する Codex CLI / 別プロセスが先に refresh していた場合の
 /// fields を保護するため、書込前に再 load して merge する。
 pub async fn persist_refreshed(
     path: &Path,

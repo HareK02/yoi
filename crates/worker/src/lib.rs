@@ -8,6 +8,7 @@ pub mod fs_view;
 pub mod hook;
 pub(crate) mod in_flight;
 pub mod ipc;
+pub mod model_client;
 pub mod prompt;
 pub mod runtime;
 pub mod segment_log_sink;
@@ -30,11 +31,11 @@ pub use manifest::{
     AuthRef, ModelManifest, SchemeKind, Scope, WorkerManifest, WorkerManifestConfig,
     WorkerMetaConfig,
 };
+pub use model_client::{ProviderError, build_client};
 pub use prompt::catalog::{CatalogError, PromptCatalog, WorkerPrompt};
 pub use prompt::loader::PromptLoader;
 pub use prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 pub use protocol::{ErrorCode, Event, Method, TurnResult, WorkerStatus};
-pub use provider::{ProviderError, build_client};
 pub use runtime::dir::RuntimeDir;
 pub use segment_log_sink::SegmentLogSink;
 pub use shared_state::WorkerSharedState;

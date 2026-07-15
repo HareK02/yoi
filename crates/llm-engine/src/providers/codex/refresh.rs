@@ -80,7 +80,7 @@ async fn response_with_timeout(
         .await
         .map_err(|_| {
             CodexAuthError::RefreshTransient(format!(
-                "codex_oauth_refresh timed out after {}s",
+                "oauth_token_refresh timed out after {}s",
                 timeout.as_secs()
             ))
         })?

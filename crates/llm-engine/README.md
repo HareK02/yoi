@@ -16,10 +16,10 @@ Owns:
 
 Does not own:
 
-- Worker names, sockets, process lifecycle, or scope delegation (`worker`)
-- product CLI shape (`yoi`)
-- provider catalog and secret resolution (`provider`, `secrets`)
-- durable Worker current state (`session-store` worker metadata)
+- Host application names, sockets, process lifecycle, or scope delegation
+- Product CLI shape
+- Provider catalog and secret resolution
+- Durable application state outside engine history
 
 ## Design notes
 

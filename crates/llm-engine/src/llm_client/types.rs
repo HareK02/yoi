@@ -1,6 +1,6 @@
 //! LLM Client Common Types
 //!
-//! Core conversation types for yoi's LLM interaction model.
+//! Core conversation types for LLM interaction.
 //! The core abstraction is `Item` which represents different types of conversation elements:
 //! - Message items (user/assistant messages with content parts)
 //! - ToolCall items (tool invocations)
@@ -521,9 +521,8 @@ pub struct Request {
     /// Providers without prompt caching ignore the field.
     pub cache_anchor: Option<usize>,
     /// 会話単位の安定キー。`prompt_cache_key` として送られる
-    /// (OpenAI Responses)。ChatGPT backend (codex-oauth) は明示キーが
-    /// 無いと org/project ハッシュ衝突でプロンプトキャッシュが
-    /// ほぼヒットしないため、worker 側で `SegmentId` を渡す運用を想定。
+    /// (OpenAI Responses)。明示キーを必要とする backend では、
+    /// 呼び出し側が安定した conversation identifier を渡す。
     /// `cache_anchor` と違い名前空間キーであり、`prefix anchor` とは
     /// 別の概念。`cache_anchor` を読まない provider と同じく、
     /// `prompt_cache_key` を持たない provider は無視する。

@@ -1,7 +1,7 @@
 //! Gemini scheme の wire-level 既定 capability。
 //!
 //! モデル ID 固有のテーブル(`gemini-*` バージョン別の reasoning 有無)は
-//! 高レベル構築層(`provider::capability`)の責務。ここでは wire の
+//! client construction layer の責務。ここでは wire の
 //! 保守的 default のみ。
 
 use crate::llm_client::capability::{

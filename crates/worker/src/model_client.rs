@@ -1,5 +1,4 @@
-//! Worker マニフェストの [`ModelManifest`] を [`Box<dyn LlmClient>`]
-//! に落とすファクトリ。
+//! [`ModelManifest`] を [`Box<dyn LlmClient>`] に落とす worker-side factory。
 //!
 //! 段階:
 //! 1. `ModelManifest` を [`catalog::resolve_model_manifest`] で
@@ -11,11 +10,7 @@
 //!    `catalog::resolve_model_manifest` が [`ModelConfig`] に詰め込む）
 //!
 //! llm-engine は低レベル基盤に留める方針なので、高レベル側で必要に
-//! なる認証ストア解決（Codex OAuth の `~/.codex/auth.json` 読取等）は
-//! このクレートに追加する。
-
-pub mod catalog;
-pub mod codex_oauth;
+//! なる認証ストア解決と secret store 解決は worker 側で行う。
 
 use std::sync::Arc;
 
@@ -26,13 +21,14 @@ use llm_engine::llm_client::{
         Scheme, anthropic::AnthropicScheme, gemini::GeminiScheme, openai_chat::OpenAIScheme,
         openai_responses::OpenAIResponsesScheme,
     },
-    transport::{HttpTransport, ResolvedAuth},
+    transport::{HttpTransport, ResolvedAuth, TransportPolicy},
 };
+use llm_engine::providers::codex::CodexAuthProvider;
 
-use manifest::{AuthRef, ModelManifest, SchemeKind};
+use manifest::{AuthRef, ModelManifest, SchemeKind, model_catalog as catalog};
 use secrets::{SecretStore, SecretValue};
 
-pub use catalog::{ModelConfig, ResolveError as CatalogResolveError};
+pub use manifest::model_catalog::{ModelConfig, ResolveError as CatalogResolveError};
 
 /// プロバイダ構築時のエラー。
 #[derive(Debug, thiserror::Error)]
@@ -111,7 +107,7 @@ fn resolve_auth_with_resolver(
             Err(ProviderError::ApiKeyMissing { scheme })
         }
         AuthRef::CodexOAuth => {
-            let provider = codex_oauth::CodexAuthProvider::from_default_home()
+            let provider = CodexAuthProvider::from_default_home()
                 .map_err(|e| ProviderError::Config(e.to_string()))?;
             Ok(ResolvedAuth::Custom(Arc::new(provider)))
         }
@@ -144,6 +140,7 @@ fn build_transport<S: Scheme>(
     scheme: S,
     config: &ModelConfig,
     resolved: ResolvedAuth,
+    policy: TransportPolicy,
 ) -> Result<Box<dyn LlmClient>, ProviderError> {
     if !resolved.matches(scheme.required_auth()) {
         return Err(ProviderError::AuthMismatch {
@@ -160,21 +157,39 @@ fn build_transport<S: Scheme>(
         .clone()
         .unwrap_or_else(|| scheme.default_capability());
     let base_url = effective_base_url(&scheme, config);
-    Ok(Box::new(HttpTransport::new(
-        scheme,
-        config.model_id.clone(),
-        base_url,
-        resolved,
-        capability,
-    )))
+    Ok(Box::new(
+        HttpTransport::new(
+            scheme,
+            config.model_id.clone(),
+            base_url,
+            resolved,
+            capability,
+        )
+        .with_transport_policy(policy),
+    ))
 }
 
 fn build_from_config(config: &ModelConfig) -> Result<Box<dyn LlmClient>, ProviderError> {
     let resolved = resolve_auth(config.scheme, &config.auth)?;
     match config.scheme {
-        SchemeKind::Anthropic => build_transport(AnthropicScheme::new(), config, resolved),
-        SchemeKind::OpenaiChat => build_transport(OpenAIScheme::new(), config, resolved),
-        SchemeKind::Gemini => build_transport(GeminiScheme::new(), config, resolved),
+        SchemeKind::Anthropic => build_transport(
+            AnthropicScheme::new(),
+            config,
+            resolved,
+            TransportPolicy::standard(),
+        ),
+        SchemeKind::OpenaiChat => build_transport(
+            OpenAIScheme::new(),
+            config,
+            resolved,
+            TransportPolicy::standard(),
+        ),
+        SchemeKind::Gemini => build_transport(
+            GeminiScheme::new(),
+            config,
+            resolved,
+            TransportPolicy::standard(),
+        ),
         SchemeKind::OpenaiResponses => {
             // ChatGPT backend (codex-oauth) は `max_output_tokens` /
             // `temperature` / `top_p` を 400 で弾くため、その経路では
@@ -183,7 +198,12 @@ fn build_from_config(config: &ModelConfig) -> Result<Box<dyn LlmClient>, Provide
             let scheme = OpenAIResponsesScheme::new()
                 .with_send_max_output_tokens(send_to_official)
                 .with_send_sampling_params(send_to_official);
-            build_transport(scheme, config, resolved)
+            let policy = if matches!(config.auth, AuthRef::CodexOAuth) {
+                TransportPolicy::openai_compatible_zstd()
+            } else {
+                TransportPolicy::standard()
+            };
+            build_transport(scheme, config, resolved, policy)
         }
     }
 }
@@ -208,9 +228,33 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::io::Write;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     struct TestSecrets(std::collections::BTreeMap<String, String>);
+
+    struct ConfigDirGuard {
+        prev: Option<String>,
+    }
+
+    impl ConfigDirGuard {
+        fn new(path: &Path) -> Self {
+            let prev = std::env::var("YOI_CONFIG_DIR").ok();
+            // SAFETY: tests using this guard are marked `#[serial]`.
+            unsafe { std::env::set_var("YOI_CONFIG_DIR", path) };
+            Self { prev }
+        }
+    }
+
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("YOI_CONFIG_DIR", v),
+                    None => std::env::remove_var("YOI_CONFIG_DIR"),
+                }
+            }
+        }
+    }
 
     impl SecretResolver for TestSecrets {
         fn get_secret(&self, id: &str) -> Result<SecretValue, secrets::Error> {
@@ -311,7 +355,11 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn ref_manifest_builds_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::new(dir.path());
+
         // Ollama は AuthRef::None で構築できる end-to-end path。
         let manifest = ModelManifest {
             ref_: Some("ollama-local/llama3.1".into()),
@@ -326,7 +374,11 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn inline_manifest_builds_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::new(dir.path());
+
         // Form C: 完全直書き。Ollama 相当を AuthRef::None で構築。
         let manifest = ModelManifest {
             scheme: Some(SchemeKind::Anthropic),

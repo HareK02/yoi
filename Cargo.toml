@@ -13,7 +13,6 @@ members = [
     "crates/plugin-pdk",
     "crates/yoi",
     "crates/protocol",
-    "crates/provider",
     "crates/session-metrics",
     "crates/session-analytics",
     "crates/lint-common",
@@ -39,7 +38,6 @@ default-members = [
     "crates/plugin-pdk",
     "crates/yoi",
     "crates/protocol",
-    "crates/provider",
     "crates/session-metrics",
     "crates/session-analytics",
     "crates/lint-common",
@@ -72,7 +70,6 @@ worker-runtime = { path = "crates/worker-runtime" }
 yoi-plugin-pdk = { path = "crates/plugin-pdk" }
 yoi = { path = "crates/yoi" }
 protocol = { path = "crates/protocol" }
-provider = { path = "crates/provider" }
 session-metrics = { path = "crates/session-metrics" }
 session-analytics = { path = "crates/session-analytics" }
 session-store = { path = "crates/session-store" }

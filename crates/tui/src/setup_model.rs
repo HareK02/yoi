@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use provider::catalog::{self, AuthHint, ModelEntry, ProviderEntry};
+use manifest::model_catalog::{self as catalog, AuthHint, ModelEntry, ProviderEntry};
 use toml::Value;
 use toml::map::Map;
 

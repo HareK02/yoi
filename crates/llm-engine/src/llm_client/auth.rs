@@ -1,15 +1,11 @@
 //! `Scheme` 実装と通信層が要求する認証要件、および動的認証プロバイダ。
 //!
-//! マニフェスト側の型（`ModelConfig` / `SchemeKind` / `AuthRef`）は
-//! `crates/manifest` に置き、llm-engine はそれを知らずに済む。
 //! `AuthRequirement` は scheme が宣言する「この scheme はどんな認証を
-//! 期待するか」のランタイム記述で、manifest 側の `AuthRef` との
-//! 照合（`AuthRef → ResolvedAuth` 変換の適否）は `crates/provider`
-//! で行う。
+//! 期待するか」のランタイム記述で、設定ファイルや環境変数などから
+//! [`super::transport::ResolvedAuth`] を組み立てる責務は呼び出し側にある。
 //!
-//! Codex OAuth のようにリクエスト毎にトークンが変わり得る認証は
-//! [`AuthProvider`] trait を `crates/provider` 側で実装し、
-//! [`super::transport::ResolvedAuth::Custom`] 経由で transport に渡す。
+//! リクエスト毎にトークンが変わり得る認証は [`AuthProvider`] trait を
+//! 実装し、[`super::transport::ResolvedAuth::Custom`] 経由で transport に渡す。
 
 use async_trait::async_trait;
 use reqwest::header::{HeaderName, HeaderValue};
@@ -27,16 +23,15 @@ pub enum AuthRequirement {
     XApiKey,
     /// クエリパラメータ `?<name>=<token>`（Gemini 形式）
     QueryParam { name: &'static str },
-    /// 複合ヘッダ（Codex OAuth 等、`crates/provider` 側で解決）
+    /// 複合ヘッダ（呼び出し側が [`AuthProvider`] で解決）
     Custom,
 }
 
 /// リクエスト毎に認証ヘッダを動的に組み立てるプロバイダ。
 ///
-/// Codex OAuth のように access_token が refresh で更新されたり、
-/// `ChatGPT-Account-Id` / `X-OpenAI-Fedramp` のような複数ヘッダを
-/// 同時に注入する必要があるケースで使う。実体は `crates/provider`
-/// 側に置き、llm-engine は trait を知るだけ。
+/// access token が refresh で更新されたり、複数ヘッダを同時に注入する
+/// 必要があるケースで使う。実体は呼び出し側に置き、llm-engine は
+/// trait を知るだけ。
 ///
 /// 返したヘッダはそのまま `HeaderMap` に挿入される。`Authorization`
 /// 含む scheme 既定の認証ヘッダは送出されないので、必要なら
@@ -45,13 +40,4 @@ pub enum AuthRequirement {
 pub trait AuthProvider: Send + Sync + std::fmt::Debug {
     /// 1 リクエスト分の認証ヘッダを返す。refresh が必要なら内部で行う。
     async fn headers(&self) -> Result<Vec<(HeaderName, HeaderValue)>, ClientError>;
-
-    /// ChatGPT Codex backend 向けの複合認証かどうか。
-    ///
-    /// transport は provider crate の具象型を知らないため、この hook だけで
-    /// Codex CLI 互換の wire behavior（conversation header / request compression 等）
-    /// を切り替える。
-    fn is_codex_backend(&self) -> bool {
-        false
-    }
 }

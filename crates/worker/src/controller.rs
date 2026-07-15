@@ -1526,11 +1526,11 @@ where
     let manifest = worker.manifest();
     // `build_client` がここに到達する前に同じマニフェストで成功している
     // ため、カタログ解決も必ず通る。念のため失敗時は "unknown" に落とす。
-    let resolved = provider::catalog::resolve_model_manifest(&manifest.model).ok();
+    let resolved = manifest::model_catalog::resolve_model_manifest(&manifest.model).ok();
     let context_window = resolved
         .as_ref()
         .map(|cfg| cfg.context_window)
-        .unwrap_or(provider::catalog::DEFAULT_CONTEXT_WINDOW);
+        .unwrap_or(manifest::model_catalog::DEFAULT_CONTEXT_WINDOW);
     let (provider_name, model_id) = match resolved {
         Some(cfg) => {
             let name = match cfg.scheme {

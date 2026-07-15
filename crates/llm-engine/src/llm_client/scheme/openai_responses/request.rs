@@ -38,21 +38,21 @@ pub(crate) struct ResponsesRequest {
     /// `["reasoning.encrypted_content"]` 等。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<&'static str>,
-    /// 公式 OpenAI Responses API では受理されるが、ChatGPT backend
-    /// (codex-oauth) は 400 で弾く。scheme の `send_max_output_tokens`
-    /// が `false` のときは `None` のまま送る (skip_serializing_if で除外)。
+    /// 公式 OpenAI Responses API では受理されるが、互換 backend によっては
+    /// 400 で弾く。scheme の `send_max_output_tokens` が `false` のときは
+    /// `None` のまま送る (skip_serializing_if で除外)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
-    /// 公式 OpenAI Responses API では受理されるが、ChatGPT backend
-    /// (codex-oauth) は `temperature` / `top_p` を 400 で弾く。scheme の
+    /// 公式 OpenAI Responses API では受理されるが、互換 backend によっては
+    /// `temperature` / `top_p` を 400 で弾く。scheme の
     /// `send_sampling_params` が `false` のときは `None` のまま送る。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
-    /// 会話単位の安定キー。ChatGPT backend (codex-oauth) は明示キーが
-    /// 無いとプロンプトキャッシュがほぼ効かない。worker 側は `SegmentId`
-    /// を渡す。`Request::cache_key` が `None` のときはキー自体を送らない。
+    /// 会話単位の安定キー。明示キーを必要とする backend では、
+    /// 呼び出し側が安定した conversation identifier を渡す。
+    /// `Request::cache_key` が `None` のときはキー自体を送らない。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
 }
@@ -74,10 +74,9 @@ pub(crate) struct ReasoningConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum InputItem {
     /// 会話メッセージ。user / assistant / developer のいずれか。
-    /// `Role::System` items は `developer` として投影する（ChatGPT
-    /// backend が `role: "system"` を拒否するため。Codex CLI も
-    /// system 相当の挿入には DeveloperInstructions = `role: "developer"`
-    /// を使う）。
+    /// `Role::System` items は `developer` として投影する。OpenAI
+    /// Responses 互換 backend の一部は `role: "system"` を拒否するため、
+    /// system 相当の挿入には `role: "developer"` を使う。
     Message {
         role: &'static str,
         content: Vec<InputContent>,
@@ -403,10 +402,9 @@ mod tests {
 
     #[test]
     fn system_role_item_is_projected_as_developer() {
-        // ChatGPT backend (codex-oauth) は input[] の `role: "system"` を
-        // "System messages are not allowed" で 400 拒否する。in-conversation
-        // な system note (notify / fs_view auto-read / compaction summary) は
-        // `role: "developer"` として投影し、両 backend で受理されるようにする。
+        // Some compatible backends reject `role: "system"` in input[].
+        // Project in-conversation system notes as `role: "developer"` so
+        // both official and compatible backends can accept them.
         let scheme = OpenAIResponsesScheme::new();
         let req = Request::new()
             .user("hi")
@@ -523,11 +521,9 @@ mod tests {
     fn reasoning_summary_field_is_always_serialized() {
         // Responses API は reasoning item に `summary` を必須で要求する。
         // summary が空でも wire 上に `summary: []` として残らないと、
-        // ChatGPT backend (codex-oauth) が
-        //   400 invalid_request_error: Missing required parameter:
-        //   'input[N].summary'.
-        // で弾く。GPT-5 + reasoning effort 未指定のターンでは summary text
-        // が付かないことがあるため、空のままでも skip しないこと。
+        // backend によっては missing required parameter として拒否される。
+        // reasoning effort 未指定のターンでは summary text が付かないことが
+        // あるため、空のままでも skip しないこと。
         let scheme = OpenAIResponsesScheme::new();
         let item = Item::reasoning("").with_encrypted_content("ENC");
         let req = Request::new().user("hi").item(item);

@@ -723,7 +723,7 @@ fn resolve_auth_file(auth: &mut Option<AuthRef>, base: &Path) {
 
 /// モデル宣言に含まれる `auth.file` が絶対パスであることを検証する。
 /// ref / scheme / model_id 等の論理的な有効性（ref があるか、inline が
-/// 揃っているか）の検証はカタログを知る `crates/provider` 側で行う。
+/// 揃っているか）の検証は [`crate::model_catalog`] で行う。
 fn validate_model_paths(model: &ModelManifest, field: &'static str) -> Result<(), ResolveError> {
     if let Some(AuthRef::ApiKey { file: Some(p), .. }) = &model.auth {
         ensure_absolute(field, p)?;

@@ -75,10 +75,9 @@ impl ToolServerHandle {
     /// Execute all pending factories and register the resulting tools.
     ///
     /// Called implicitly by `Engine::lock()` before the first turn.
-    /// Exposed as `pub` so higher layers (e.g. Worker) can force-materialise
-    /// tools earlier — for example when building a system-prompt template
-    /// context that needs the list of registered tool names. Redundant
-    /// calls are no-ops.
+    /// Exposed as `pub` so callers can force-materialise tools earlier —
+    /// for example when building a system-prompt template context that needs
+    /// the list of registered tool names. Redundant calls are no-ops.
     ///
     /// # Panics
     ///

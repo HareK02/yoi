@@ -1,8 +1,8 @@
 //! `HttpTransport<S: Scheme>`: すべての LLM wire scheme を共通の 1 本の
 //! HTTP クライアントで扱う。
 //!
-//! 旧 `providers/{anthropic,openai,gemini,ollama}.rs` を置き換える。
-//! scheme 固有の差分は [`Scheme`] trait 実装に委譲する。
+//! scheme 固有の差分は [`Scheme`] trait 実装に委譲し、backend 固有の
+//! HTTP policy は [`TransportPolicy`] で明示的に差し込む。
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -28,11 +28,11 @@ use super::types::{Request, RequestConfig};
 pub const DEFAULT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 pub const DEFAULT_FIRST_STREAM_EVENT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// `AuthRef` を解決したランタイム表現。`crates/provider` が構築する。
+/// 認証設定をリクエスト時に使える形へ解決したランタイム表現。
 ///
 /// - `None`: 認証ヘッダを送らない（Ollama 等の opt-out）
 /// - `ApiKey`: 静的な API key 文字列
-/// - `Custom`: リクエスト毎に動的にヘッダを組み立てる（Codex OAuth 等）
+/// - `Custom`: リクエスト毎に動的にヘッダを組み立てる
 #[derive(Debug, Clone)]
 pub enum ResolvedAuth {
     None,
@@ -63,6 +63,71 @@ impl ResolvedAuth {
     }
 }
 
+/// Request body encoding policy used by [`HttpTransport`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestBodyEncoding {
+    /// Send the request body as plain JSON.
+    Json,
+    /// Send the request body as zstd-compressed JSON with `Content-Encoding: zstd`.
+    ZstdJson,
+}
+
+impl Default for RequestBodyEncoding {
+    fn default() -> Self {
+        Self::Json
+    }
+}
+
+/// Conversation header policy used by [`HttpTransport`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConversationHeaderPolicy {
+    /// Do not derive any transport headers from [`Request::cache_key`].
+    None,
+    /// Send OpenAI-compatible conversation headers from [`Request::cache_key`].
+    OpenAiCompatible {
+        /// Send the legacy `session_id` header in addition to `session-id`.
+        include_legacy_session_id: bool,
+        /// Send `thread-id` with the same value as `session-id`.
+        include_thread_id: bool,
+        /// Send `x-client-request-id` with the same value as `session-id`.
+        include_client_request_id: bool,
+    },
+}
+
+impl Default for ConversationHeaderPolicy {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+/// Backend-specific HTTP transport policy.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TransportPolicy {
+    /// How to serialize and encode the HTTP request body.
+    pub request_body_encoding: RequestBodyEncoding,
+    /// Optional backend-specific conversation headers derived from request metadata.
+    pub conversation_headers: ConversationHeaderPolicy,
+}
+
+impl TransportPolicy {
+    /// Plain JSON requests with no derived conversation headers.
+    pub fn standard() -> Self {
+        Self::default()
+    }
+
+    /// OpenAI-compatible backend profile that uses zstd JSON bodies and
+    /// conversation headers derived from [`Request::cache_key`].
+    pub fn openai_compatible_zstd() -> Self {
+        Self {
+            request_body_encoding: RequestBodyEncoding::ZstdJson,
+            conversation_headers: ConversationHeaderPolicy::OpenAiCompatible {
+                include_legacy_session_id: true,
+                include_thread_id: true,
+                include_client_request_id: true,
+            },
+        }
+    }
+}
 fn header_value_for_diagnostics(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
@@ -120,6 +185,7 @@ pub struct HttpTransport<S: Scheme> {
     base_url: String,
     auth: ResolvedAuth,
     capability: ModelCapability,
+    policy: TransportPolicy,
 }
 
 impl<S: Scheme> HttpTransport<S> {
@@ -141,7 +207,14 @@ impl<S: Scheme> HttpTransport<S> {
             base_url,
             auth,
             capability,
+            policy: TransportPolicy::default(),
         }
+    }
+
+    /// Set a backend-specific HTTP transport policy.
+    pub fn with_transport_policy(mut self, policy: TransportPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     /// カスタム HTTP クライアントを差し込む（テスト等）。
@@ -206,13 +279,6 @@ impl<S: Scheme> HttpTransport<S> {
         Ok(headers)
     }
 
-    fn is_codex_backend(&self) -> bool {
-        match &self.auth {
-            ResolvedAuth::Custom(provider) => provider.is_codex_backend(),
-            _ => false,
-        }
-    }
-
     fn apply_stream_headers(
         &self,
         headers: &mut HeaderMap,
@@ -220,19 +286,26 @@ impl<S: Scheme> HttpTransport<S> {
     ) -> Result<(), ClientError> {
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
 
-        if self.is_codex_backend()
+        if let ConversationHeaderPolicy::OpenAiCompatible {
+            include_legacy_session_id,
+            include_thread_id,
+            include_client_request_id,
+        } = self.policy.conversation_headers
             && let Some(cache_key) = request.cache_key.as_deref()
         {
             let value = HeaderValue::from_str(cache_key).map_err(|e| {
-                ClientError::Config(format!("invalid Codex conversation header: {e}"))
+                ClientError::Config(format!("invalid conversation header value: {e}"))
             })?;
-            // Codex CLI sends hyphenated session/thread headers to the
-            // ChatGPT Codex backend. Keep the legacy underscore header for
-            // existing traces/backends while exposing the current Codex shape.
             headers.insert(HeaderName::from_static("session-id"), value.clone());
-            headers.insert(HeaderName::from_static("thread-id"), value.clone());
-            headers.insert(HeaderName::from_static("session_id"), value.clone());
-            headers.insert(HeaderName::from_static("x-client-request-id"), value);
+            if include_thread_id {
+                headers.insert(HeaderName::from_static("thread-id"), value.clone());
+            }
+            if include_legacy_session_id {
+                headers.insert(HeaderName::from_static("session_id"), value.clone());
+            }
+            if include_client_request_id {
+                headers.insert(HeaderName::from_static("x-client-request-id"), value);
+            }
         }
 
         Ok(())
@@ -243,19 +316,22 @@ impl<S: Scheme> HttpTransport<S> {
         body: &serde_json::Value,
         headers: &mut HeaderMap,
     ) -> Result<RequestBody, ClientError> {
-        if !self.is_codex_backend() {
-            return Ok(RequestBody::Json(body.clone()));
+        match self.policy.request_body_encoding {
+            RequestBodyEncoding::Json => Ok(RequestBody::Json(body.clone())),
+            RequestBodyEncoding::ZstdJson => {
+                let raw = serde_json::to_vec(body)?;
+                let raw_json_bytes = raw.len();
+                let compressed =
+                    zstd::stream::encode_all(std::io::Cursor::new(raw), 3).map_err(|e| {
+                        ClientError::Config(format!("failed to zstd-compress request: {e}"))
+                    })?;
+                headers.insert(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
+                Ok(RequestBody::CompressedJson {
+                    bytes: compressed,
+                    raw_json_bytes,
+                })
+            }
         }
-
-        let raw = serde_json::to_vec(body)?;
-        let raw_json_bytes = raw.len();
-        let compressed = zstd::stream::encode_all(std::io::Cursor::new(raw), 3)
-            .map_err(|e| ClientError::Config(format!("failed to zstd-compress request: {e}")))?;
-        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("zstd"));
-        Ok(RequestBody::CompressedJson {
-            bytes: compressed,
-            raw_json_bytes,
-        })
     }
 }
 
@@ -384,6 +460,7 @@ impl<S: Scheme + Clone> Clone for HttpTransport<S> {
             base_url: self.base_url.clone(),
             auth: self.auth.clone(),
             capability: self.capability.clone(),
+            policy: self.policy.clone(),
         }
     }
 }
@@ -447,7 +524,8 @@ impl<S: Scheme + Clone + 'static> LlmClient for HttpTransport<S> {
                 "path": path,
                 "auth_kind": auth_kind(&self.auth),
                 "required_auth": format!("{:?}", self.scheme.required_auth()),
-                "codex_backend": self.is_codex_backend(),
+                "request_body_encoding": format!("{:?}", self.policy.request_body_encoding),
+                "conversation_headers": format!("{:?}", self.policy.conversation_headers),
                 "cache_key_present": request.cache_key.is_some(),
                 "stream_open_timeout_ms": DEFAULT_STREAM_OPEN_TIMEOUT.as_millis() as u64,
             }),
@@ -678,9 +756,7 @@ mod tests {
     use serde_json::json;
 
     #[derive(Debug)]
-    struct TestAuthProvider {
-        codex: bool,
-    }
+    struct TestAuthProvider;
 
     #[async_trait]
     impl AuthProvider for TestAuthProvider {
@@ -695,10 +771,6 @@ mod tests {
                     HeaderValue::from_static("account-1"),
                 ),
             ])
-        }
-
-        fn is_codex_backend(&self) -> bool {
-            self.codex
         }
     }
 
@@ -828,10 +900,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_backend_adds_conversation_headers_and_zstd_body() {
-        let transport = transport(ResolvedAuth::Custom(Arc::new(TestAuthProvider {
-            codex: true,
-        })));
+    async fn transport_policy_adds_conversation_headers_and_zstd_body() {
+        let transport = transport(ResolvedAuth::Custom(Arc::new(TestAuthProvider)))
+            .with_transport_policy(TransportPolicy::openai_compatible_zstd());
         let request = Request::new().user("hello").cache_key("segment-123");
         let mut headers = transport.build_headers().await.unwrap();
         transport
@@ -870,7 +941,7 @@ mod tests {
             raw_json_bytes,
         } = encoded
         else {
-            panic!("Codex backend request body must be zstd-compressed");
+            panic!("transport policy should zstd-compress request body");
         };
         assert!(raw_json_bytes > 0);
         let decoded = zstd::stream::decode_all(std::io::Cursor::new(compressed)).unwrap();
@@ -879,7 +950,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_codex_request_does_not_get_codex_only_headers_or_compression() {
+    async fn standard_policy_does_not_get_conversation_headers_or_compression() {
         let transport = transport(ResolvedAuth::ApiKey("api-key".to_string()));
         let request = Request::new().user("hello").cache_key("segment-123");
         let mut headers = transport.build_headers().await.unwrap();
@@ -901,7 +972,7 @@ mod tests {
         assert!(headers.get(CONTENT_ENCODING).is_none());
 
         let RequestBody::Json(decoded) = encoded else {
-            panic!("non-Codex request body must remain normal JSON");
+            panic!("standard transport policy should keep request body as JSON");
         };
         assert_eq!(decoded["prompt_cache_key"], "segment-123");
     }

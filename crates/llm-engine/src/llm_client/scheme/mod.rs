@@ -45,8 +45,8 @@ pub trait Scheme: Clone + Send + Sync + 'static {
     /// プロバイダもあるため、モデル ID を受け取る。
     fn path(&self, model_id: &str) -> String;
 
-    /// この scheme が要求する認証形式。`build_client` 時に
-    /// `manifest::AuthRef` と照合する。
+    /// この scheme が要求する認証形式。呼び出し側は client 構築時に
+    /// 設定された認証情報と照合する。
     fn required_auth(&self) -> AuthRequirement;
 
     /// `Content-Type` 以外の追加ヘッダ。`anthropic-version` / `anthropic-beta` 等。
@@ -78,8 +78,7 @@ pub trait Scheme: Clone + Send + Sync + 'static {
 
     /// scheme 既定の capability。モデル ID に関係なく、この wire で
     /// 安全に送れる最小共通項を返す。既知モデル ID の能力テーブルは
-    /// `provider::capability::lookup` 側(高レベル構築層)の責務で、
-    /// scheme はここには関与しない。
+    /// 高レベルの client 構築層の責務で、scheme はここには関与しない。
     fn default_capability(&self) -> ModelCapability;
 
     /// scheme 側でサポートしていない `RequestConfig` フィールドを

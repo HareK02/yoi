@@ -1,7 +1,7 @@
 //! OpenAI Responses scheme の wire-level 既定 capability。
 //!
-//! モデル ID 固有のテーブル(`gpt-5` / `codex-` 系など)は高レベル構築層
-//! (`provider::capability`)の責務。ここでは wire の保守的 default のみ。
+//! モデル ID 固有の能力テーブルは高レベルの client 構築層の責務。
+//! ここでは wire の保守的 default のみ。
 
 use crate::llm_client::capability::{
     CacheStrategy, ModelCapability, StructuredOutput, ToolCallingSupport,
