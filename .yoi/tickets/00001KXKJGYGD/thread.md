@@ -356,3 +356,23 @@ Next action:
 - Request focused re-review of the remaining TUI test blocker and overall acceptance before merge/close decisions。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-15T21:35:26Z status: approve -->
+
+## Review: approve
+
+Focused re-review result: approve
+
+Evidence:
+- Verified follow-up `bc48094d` with clean implementation worktree。
+- Focused greps for `ActiveWorkflow|active_workflow|Active workflow`, `workflow_invoke`, `resources/workflows`, `.yoi/workflow`, `workflow invocation`, `Resident workflows`, and workflow completion/resolver surfaces are clean。
+- `/` is no longer a web completion sigil and protocol completion docs now only cover file/Knowledge。
+- `live_system_snapshot_replaces_task_store` now uses active `task_reminder` and passes。
+- `live_legacy_workflow_system_item_is_ignored` also passes。
+- `git diff --check` and `cargo check -p yoi` pass。
+- Legacy persisted `kind: "workflow"` remains bounded to `LegacyIgnored` / diagnostic-or-drop behavior and TUI ignores it。
+- No broad first-class Skills implementation observed; remaining workflow text is ticket lifecycle naming, legacy ignore/rejection tests/docs, or historical/non-active comments, not active Workflow invocation/resource authority。
+
+Blockers: none。
+
+---
