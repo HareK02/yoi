@@ -596,7 +596,6 @@ impl App {
         match kind {
             CompletionKind::File => self.input.replace_with_file_ref(start, value),
             CompletionKind::Knowledge => self.input.replace_with_knowledge_ref(start, value),
-            CompletionKind::Workflow => self.input.replace_with_workflow_invoke(start, value),
         }
         self.completion = None;
         true
@@ -631,7 +630,6 @@ impl App {
         match kind {
             CompletionKind::File => self.input.replace_with_file_ref(start, value),
             CompletionKind::Knowledge => self.input.replace_with_knowledge_ref(start, value),
-            CompletionKind::Workflow => self.input.replace_with_workflow_invoke(start, value),
         }
         self.completion = None;
         true
@@ -2170,12 +2168,12 @@ impl App {
             }
             session_store::SystemItem::FileAttachment { body, .. }
             | session_store::SystemItem::Knowledge { body, .. }
-            | session_store::SystemItem::Workflow { body, .. }
             | session_store::SystemItem::TaskReminder { body, .. }
             | session_store::SystemItem::Interrupt { body } => {
                 self.task_store.apply_system_message_text(&body);
                 self.blocks.push(Block::SystemMessage { text: body });
             }
+            session_store::SystemItem::LegacyIgnored { .. } => {}
         }
     }
 
@@ -2981,7 +2979,7 @@ mod completion_flow_tests {
         let _ = app.refresh_completion();
         // Reply for a different kind shouldn't overwrite state.
         app.handle_worker_event(Event::Completions {
-            kind: CompletionKind::Workflow,
+            kind: CompletionKind::Knowledge,
             entries: vec![CompletionEntry {
                 value: "stale".into(),
                 is_dir: false,
@@ -3706,12 +3704,6 @@ mod completion_flow_tests {
             },
             Segment::KnowledgeRef {
                 slug: "design-note".into(),
-            },
-            Segment::Text {
-                content: " then ".into(),
-            },
-            Segment::WorkflowInvoke {
-                slug: "review".into(),
             },
             Segment::Paste {
                 id: 1,

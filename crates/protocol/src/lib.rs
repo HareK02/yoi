@@ -173,7 +173,7 @@ impl WorkerEvent {
 /// `Method::Run` and `Event::UserMessage` carry `Vec<Segment>`. Dumb
 /// clients (CLI piping, scripts) only need to produce a single
 /// `Segment::Text`; richer clients (TUI / GUI) construct typed atoms
-/// (paste chips, file refs, knowledge refs, workflow invocations) and
+/// (paste chips, file refs, knowledge refs, knowledge refs) and
 /// send them through directly so the Worker side never has to re-parse a
 /// flattened string.
 ///
@@ -205,8 +205,6 @@ pub enum Segment {
     FileRef { path: String },
     /// `#<slug>` Knowledge reference (see `docs/plan/memory.md`).
     KnowledgeRef { slug: String },
-    /// `/<slug>` Workflow invocation (see `docs/plan/workflow.md`).
-    WorkflowInvoke { slug: String },
     /// Unknown variant from a newer client. Worker treats this as an
     /// unresolved input — surfaces an alert and inserts a placeholder.
     /// Round-trip is lossy: re-serializing yields `{"kind":"unknown"}`.
@@ -225,9 +223,9 @@ impl Segment {
     /// to surface user-visible alerts for unresolved refs should do so
     /// alongside this call (Worker does so at submit time).
     ///
-    /// Sigil-prefixed variants (`FileRef` / `KnowledgeRef` / `WorkflowInvoke`)
+    /// Sigil-prefixed variants (`FileRef` / `KnowledgeRef`)
     /// flatten back to their literal sigil form (`@<path>`, `#<slug>`,
-    /// `/<slug>`) — matching what the user originally typed. Resolved
+    /// ) — matching what the user originally typed. Resolved
     /// content (e.g. file body or shallow directory listing for `FileRef`) is
     /// delivered as separate `Item::system_message`s adjacent to the user
     /// message; the resolution itself is the caller's job. `Unknown` falls back to
@@ -244,10 +242,6 @@ impl Segment {
                 }
                 Segment::KnowledgeRef { slug } => {
                     out.push('#');
-                    out.push_str(slug);
-                }
-                Segment::WorkflowInvoke { slug } => {
-                    out.push('/');
                     out.push_str(slug);
                 }
                 Segment::Unknown => {
@@ -295,7 +289,7 @@ pub enum Event {
     ///
     /// Carries the JSON form of `session_store::SystemItem`. Covers
     /// `Method::Notify` echoes, child-Worker lifecycle events from
-    /// `Method::WorkerEvent`, `@<path>` / `#<slug>` / `/<slug>`
+    /// `Method::WorkerEvent`, `@<path>` / `#<slug>` /
     /// resolution payloads, and any future agent-side injection kind.
     /// Clients dispatch on the `kind` tag for typed rendering instead
     /// of parsing free-text prefixes like `[Notification] …` or
@@ -618,7 +612,6 @@ pub enum AlertSource {
 pub enum CompletionKind {
     File,
     Knowledge,
-    Workflow,
 }
 
 /// One candidate returned in `Event::Completions::entries`.
@@ -1190,7 +1183,7 @@ mod tests {
     #[test]
     fn event_completions_format_and_default_is_dir() {
         let event = Event::Completions {
-            kind: CompletionKind::Workflow,
+            kind: CompletionKind::Knowledge,
             entries: vec![CompletionEntry {
                 value: "clear".into(),
                 is_dir: false,
@@ -1199,7 +1192,7 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "completions");
-        assert_eq!(parsed["data"]["kind"], "workflow");
+        assert_eq!(parsed["data"]["kind"], "knowledge");
         assert_eq!(parsed["data"]["entries"][0]["value"], "clear");
 
         // is_dir defaults to false on inbound payloads that omit it.

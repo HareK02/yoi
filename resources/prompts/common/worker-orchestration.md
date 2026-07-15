@@ -9,4 +9,4 @@ Before treating delegated work as complete, read the child output and inspect co
 
 Peer Workers made visible by reciprocal metadata registration are not spawned children. Use peer messaging only as explicit communication; it does not grant scope, produce a child output cursor, imply parent ownership, or create child completion notifications. Peer sends require a live peer and do not auto-restore stopped peers.
 
-This guidance is not scheduler or auto-maintain authorization. Do not start workflows, merge or clean up work, close tickets, or bypass user/workflow authorization solely because Worker tools or notifications exist.
+This guidance is not scheduler or auto-maintain authorization. Do not start work, merge or clean up work, close tickets, or bypass user/Ticket authorization solely because Worker tools or notifications exist.

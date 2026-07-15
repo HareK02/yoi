@@ -2,7 +2,7 @@
 //!
 //! Items in worker history with `role:system` are never produced by the
 //! LLM — they are always inserted by the Worker itself (notifications,
-//! file/knowledge/workflow ref resolutions, child-worker lifecycle events,
+//! file/knowledge ref resolutions, child-worker lifecycle events,
 //! future `<system-reminder>` tags, …). [`SystemItem`] carries the
 //! typed shape of each such injection so clients can dispatch on
 //! `kind` instead of parsing text prefixes like `[Notification] …` or
@@ -106,7 +106,7 @@ fn render_system_reminder(body: &str) -> String {
 ///
 /// Each variant carries the kind-specific raw data clients use for
 /// typed rendering (`Notification.message`, `WorkerEvent.event`, file
-/// path / knowledge slug / workflow slug / etc.), plus a pre-rendered
+/// path / knowledge slug / etc.), plus a pre-rendered
 /// `body` (where applicable) that is the exact `role:system` text the
 /// LLM actually saw at commit time. `body` is denormalised so that
 /// segment log replay reconstructs worker history byte-identical to
@@ -144,9 +144,11 @@ pub enum SystemItem {
     /// header + body).
     Knowledge { slug: String, body: String },
 
-    /// `/<slug>` Workflow invocation. `body` is the workflow's
-    /// prompt body materialized into the LLM context.
-    Workflow { slug: String, body: String },
+    /// Compatibility sink for pre-removal persisted `kind: "workflow"`
+    /// system items. These entries are intentionally not replayed as
+    /// authority-bearing context.
+    #[serde(rename = "workflow")]
+    LegacyIgnored { slug: String },
 
     /// Task-management inactivity reminder inserted before an LLM request.
     /// `source` is the policy that produced this durable reminder; `body` is
@@ -172,7 +174,9 @@ impl SystemItem {
             SystemItem::WorkerEvent { body, .. } => body.clone(),
             SystemItem::FileAttachment { body, .. } => body.clone(),
             SystemItem::Knowledge { body, .. } => body.clone(),
-            SystemItem::Workflow { body, .. } => body.clone(),
+            SystemItem::LegacyIgnored { slug } => {
+                format!("Ignored legacy procedure item: /{slug}")
+            }
             SystemItem::TaskReminder { body, .. } => body.clone(),
             SystemItem::Interrupt { body } => body.clone(),
         }
@@ -192,7 +196,7 @@ impl SystemItem {
             SystemItem::WorkerEvent { .. } => "worker_event",
             SystemItem::FileAttachment { .. } => "file_attachment",
             SystemItem::Knowledge { .. } => "knowledge",
-            SystemItem::Workflow { .. } => "workflow",
+            SystemItem::LegacyIgnored { .. } => "legacy_ignored",
             SystemItem::TaskReminder { .. } => "task_reminder",
             SystemItem::Interrupt { .. } => "interrupt",
         }
@@ -304,6 +308,17 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn legacy_procedure_system_item_is_ignored_on_replay() {
+        let parsed: SystemItem =
+            serde_json::from_str(r#"{"kind":"workflow","slug":"old-flow","body":"legacy body"}"#)
+                .unwrap();
+        assert_eq!(
+            parsed.history_text(),
+            "Ignored legacy procedure item: /old-flow"
+        );
     }
 
     #[test]

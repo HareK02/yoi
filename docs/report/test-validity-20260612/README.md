@@ -28,5 +28,4 @@
 - [ticket](ticket.md) — # テスト妥当性レビュー: ticket - 評価: 概ね良い
 - [tools](tools.md) — # テスト妥当性レビュー: tools - 評価: 混在
 - [tui](tui.md) — # テスト妥当性レビュー: tui - 評価: 混在
-- [workflow](workflow.md) — # テスト妥当性レビュー: workflow 
 - [yoi](yoi.md) — # テスト妥当性レビュー: yoi - 評価: 混在

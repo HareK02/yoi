@@ -3,9 +3,8 @@
 //! `WorkspaceLayout` carries the root used by the memory subsystem.
 //! All yoi-managed memory content lives under the conventional
 //! `<root>/.yoi/` subdirectory — alongside workspace project records
-//! such as workflow and generated durable memory. The trees inside it:
+//! generated durable memory. The trees inside it:
 //!
-//! - `<root>/.yoi/workflow/<slug>.md`
 //! - `<root>/.yoi/knowledge/<slug>.md`
 //! - `<root>/.yoi/memory/summary.md`
 //! - `<root>/.yoi/memory/decisions/<slug>.md`
@@ -14,9 +13,6 @@
 //! - `<root>/.yoi/memory/_logs/current.log` (append-only audit log)
 //!
 //! `memory/` is reserved for session-derived / generated state;
-//! Workflows are human-managed and live one level up under
-//! `.yoi/workflow/`.
-//!
 //! `memory.workspace_root` pins this root explicitly. Without an explicit
 //! root, resolution searches upward from the Worker pwd for a `.yoi/memory`
 //! marker; `.yoi` project records alone are not a memory marker.
@@ -31,7 +27,6 @@ use lint_common::RecordLintError;
 const YOI_DIR: &str = ".yoi";
 const MEMORY_DIR: &str = "memory";
 const KNOWLEDGE_DIR: &str = "knowledge";
-const WORKFLOW_DIR: &str = "workflow";
 const SUMMARY_FILE: &str = "summary.md";
 const DECISIONS_DIR: &str = "decisions";
 const REQUESTS_DIR: &str = "requests";
@@ -47,7 +42,6 @@ pub enum RecordKind {
     Summary,
     Decision,
     Request,
-    Workflow,
     Knowledge,
 }
 
@@ -57,7 +51,6 @@ impl RecordKind {
             Self::Summary => "summary",
             Self::Decision => "decision",
             Self::Request => "request",
-            Self::Workflow => "workflow",
             Self::Knowledge => "knowledge",
         }
     }
@@ -86,7 +79,7 @@ impl WorkspaceLayout {
     /// An explicit `memory.workspace_root` is honored exactly. Without an
     /// explicit root, resolution searches `default_root` and its ancestors for
     /// the nearest `.yoi/memory` directory. This keeps child worktrees that
-    /// contain `.yoi` project records such as tickets or workflows from
+    /// contain `.yoi` project records such as tickets from
     /// becoming independent memory roots merely because they contain `.yoi`.
     ///
     /// If no memory marker exists, this falls back to `default_root` because
@@ -133,11 +126,6 @@ impl WorkspaceLayout {
         self.memory_dir().join(REQUESTS_DIR)
     }
 
-    /// Workflow directory: `<root>/.yoi/workflow/`.
-    pub fn workflow_dir(&self) -> PathBuf {
-        self.yoi_dir().join(WORKFLOW_DIR)
-    }
-
     pub fn staging_dir(&self) -> PathBuf {
         self.memory_dir().join(STAGING_DIR)
     }
@@ -168,10 +156,6 @@ impl WorkspaceLayout {
 
     pub fn request_path(&self, slug: &Slug) -> PathBuf {
         self.requests_dir().join(format!("{slug}.md"))
-    }
-
-    pub fn workflow_path(&self, slug: &Slug) -> PathBuf {
-        self.workflow_dir().join(format!("{slug}.md"))
     }
 
     pub fn knowledge_path(&self, slug: &Slug) -> PathBuf {
@@ -308,14 +292,6 @@ mod tests {
     }
 
     #[test]
-    fn workflow_under_memory_is_invalid_path() {
-        let err = layout()
-            .classify(&PathBuf::from("/ws/.yoi/memory/workflow/wf.md"))
-            .unwrap_err();
-        assert!(matches!(err, LintError::InvalidPath(_)));
-    }
-
-    #[test]
     fn staging_returns_none() {
         assert!(
             layout()
@@ -414,7 +390,6 @@ mod tests {
         let child = workspace.join(".worktree/child");
         std::fs::create_dir_all(workspace.join(".yoi/memory")).unwrap();
         std::fs::create_dir_all(child.join(".yoi/tickets")).unwrap();
-        std::fs::create_dir_all(child.join(".yoi/workflow")).unwrap();
 
         let cfg = manifest::MemoryConfig::default();
         let layout = WorkspaceLayout::resolve(&cfg, &child);
@@ -427,7 +402,6 @@ mod tests {
         let workspace = tmp.path().join("workspace");
         let child = workspace.join("child");
         std::fs::create_dir_all(workspace.join(".yoi/tickets")).unwrap();
-        std::fs::create_dir_all(workspace.join(".yoi/workflow")).unwrap();
         std::fs::create_dir_all(&child).unwrap();
 
         assert_eq!(find_memory_marker_root(&child), None);

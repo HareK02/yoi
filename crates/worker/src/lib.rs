@@ -1,4 +1,3 @@
-pub mod active_workflow;
 pub mod compact;
 pub mod controller;
 pub mod discovery;
@@ -15,7 +14,6 @@ pub mod segment_log_sink;
 pub mod shared_state;
 mod shutdown_after_idle;
 pub mod spawn;
-pub mod workflow;
 
 mod interrupt_prep;
 mod permission;

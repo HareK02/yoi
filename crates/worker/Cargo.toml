@@ -34,7 +34,6 @@ libc = { workspace = true }
 schemars = { workspace = true }
 ticket = { workspace = true }
 memory = { workspace = true }
-workflow-crate = { package = "workflow", path = "../workflow" }
 uuid = { workspace = true, features = ["v7"] }
 session-metrics = { workspace = true }
 arc-swap = "1.9.1"

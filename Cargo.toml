@@ -21,7 +21,6 @@ members = [
     "crates/memory",
     "crates/ticket",
     "crates/project-record",
-    "crates/workflow",
     "crates/workspace-server",
     "tests/e2e",
 ]
@@ -46,7 +45,6 @@ default-members = [
     "crates/memory",
     "crates/ticket",
     "crates/project-record",
-    "crates/workflow",
     "crates/workspace-server",
 ]
 

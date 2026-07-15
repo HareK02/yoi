@@ -140,9 +140,6 @@ impl Linter {
             RecordKind::Summary => {
                 self.check_kind::<SummaryFrontmatter>(content, &classified, &mut report);
             }
-            RecordKind::Workflow => {
-                unreachable!("workflow paths are not classified by memory linter")
-            }
         }
 
         report

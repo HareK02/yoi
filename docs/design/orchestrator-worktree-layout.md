@@ -25,7 +25,6 @@ When these roots differ, implementation worktrees must be created under `impleme
 - Ticket role launch prompts now emit a `Workspace routing context` section for Orchestrator launches, and for any launch that explicitly provides original/target roots.
 - `TicketRoleLaunchPlan` carries `original_workspace_root`, `implementation_worktree_root`, and `target_workspace_root` as explicit plan fields for callers/tests.
 - Orchestrator role prompt resources now say to create implementation worktrees under the original workspace root and to run merge-completion against the recorded target workspace.
-- `worktree-workflow` now describes `<original-workspace-root>/.worktree/<task-name>` and `git -C <original-workspace-root> ...` instead of assuming the Orchestrator cwd is the repository root.
 
 ## Follow-up boundaries
 

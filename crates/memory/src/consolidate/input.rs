@@ -100,7 +100,7 @@ fn push_kind_records(out: &mut String, layout: &WorkspaceLayout, kind: RecordKin
     let dir = match kind {
         RecordKind::Decision => layout.decisions_dir(),
         RecordKind::Request => layout.requests_dir(),
-        RecordKind::Knowledge | RecordKind::Summary | RecordKind::Workflow => return,
+        RecordKind::Knowledge | RecordKind::Summary => return,
     };
     let entries = match std::fs::read_dir(&dir) {
         Ok(it) => it,

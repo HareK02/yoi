@@ -1,4 +1,4 @@
-//! Workspace-local usage event log for memory / knowledge / workflow records.
+//! Workspace-local usage event log for memory / knowledge records.
 //!
 //! The log is append-only JSONL under the workspace's `.yoi/` tree. It is
 //! intentionally evidence-only: aggregation reports explicit context reads and
@@ -26,7 +26,6 @@ pub enum UsageEventKind {
 pub enum UsageSource {
     MemoryRead,
     KnowledgeRef,
-    WorkflowInvoke,
     ResidentInjection,
 }
 
@@ -35,7 +34,6 @@ impl UsageSource {
         match self {
             Self::MemoryRead => "MemoryRead",
             Self::KnowledgeRef => "KnowledgeRef",
-            Self::WorkflowInvoke => "WorkflowInvoke",
             Self::ResidentInjection => "ResidentInjection",
         }
     }
@@ -215,10 +213,6 @@ fn record_path(
         RecordKind::Request => {
             let slug = crate::Slug::parse(slug.to_string()).map_err(invalid_slug_error)?;
             Ok(layout.request_path(&slug))
-        }
-        RecordKind::Workflow => {
-            let slug = crate::Slug::parse(slug.to_string()).map_err(invalid_slug_error)?;
-            Ok(layout.workflow_path(&slug))
         }
         RecordKind::Knowledge => {
             let slug = crate::Slug::parse(slug.to_string()).map_err(invalid_slug_error)?;

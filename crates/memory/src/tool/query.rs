@@ -7,7 +7,7 @@
 //! enumerate what records exist without knowing what's inside them.
 //!
 //! - `MemoryQuery` walks `.yoi/memory/{summary.md,decisions/,
-//!   requests/}`. `.yoi/workflow/`, `.yoi/memory/_staging/`,
+//!   requests/}`. `.yoi/memory/_staging/`,
 //!   `.yoi/memory/_usage/`, and `.yoi/memory/_logs/` are excluded
 //!   by construction.
 //! - `KnowledgeQuery` walks `.yoi/knowledge/*.md` and supports a
@@ -524,7 +524,6 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".yoi/memory/decisions")).unwrap();
         std::fs::create_dir_all(dir.path().join(".yoi/memory/requests")).unwrap();
         std::fs::create_dir_all(dir.path().join(".yoi/memory/_staging")).unwrap();
-        std::fs::create_dir_all(dir.path().join(".yoi/workflow")).unwrap();
         std::fs::create_dir_all(dir.path().join(".yoi/knowledge")).unwrap();
         (dir, layout)
     }
@@ -635,24 +634,6 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].slug, "summary");
         assert_eq!(records[0].kind, "summary");
-    }
-
-    #[tokio::test]
-    async fn memory_query_excludes_workflow_and_staging() {
-        let (dir, layout) = setup();
-        let wf = dir.path().join(".yoi/workflow/wf.md");
-        std::fs::write(&wf, "needle in workflow\n").unwrap();
-        let stg = dir.path().join(".yoi/memory/_staging/abc.json");
-        std::fs::write(&stg, "needle in staging\n").unwrap();
-
-        let (_, tool) = memory_query_tool(layout, QueryConfig::default())();
-        let inp = serde_json::json!({ "query": "needle" });
-        let out = tool
-            .execute(&inp.to_string(), Default::default())
-            .await
-            .unwrap();
-        let records: Vec<OwnedMemoryRecord> = parse_records(&out);
-        assert!(records.is_empty(), "got records: {:?}", out.content);
     }
 
     #[tokio::test]

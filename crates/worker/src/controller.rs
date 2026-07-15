@@ -117,15 +117,6 @@ impl WorkerHandle {
                     is_dir: false,
                 })
                 .collect(),
-            protocol::CompletionKind::Workflow => self
-                .shared_state
-                .list_workflow_completions(prefix)
-                .into_iter()
-                .map(|c| protocol::CompletionEntry {
-                    value: c.slug,
-                    is_dir: false,
-                })
-                .collect(),
         }
     }
 
@@ -340,13 +331,6 @@ impl WorkerController {
         if let Some(fs_for_view) = fs_for_view {
             shared_state.set_fs_view(crate::fs_view::WorkerFsView::new(fs_for_view));
         }
-        shared_state.set_workflows(
-            worker
-                .workflow_completions()
-                .into_iter()
-                .map(|slug| crate::shared_state::WorkflowCandidate { slug })
-                .collect(),
-        );
         shared_state.set_knowledge(
             worker
                 .knowledge_completions()
@@ -1584,7 +1568,6 @@ fn worker_error_code(e: &WorkerError) -> ErrorCode {
             _ => ErrorCode::Internal,
         },
         WorkerError::Provider(_) => ErrorCode::ProviderError,
-        WorkerError::WorkflowResolve(_) => ErrorCode::InvalidRequest,
         _ => ErrorCode::Internal,
     }
 }

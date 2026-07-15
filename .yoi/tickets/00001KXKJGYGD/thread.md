@@ -123,3 +123,32 @@ Next action:
 Dashboard queue authorization was inspected, no blockers were found, and an accepted plan was recorded. Moving queued Ticket to inprogress before creating worktree or spawning role Pods.
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-15T20:45:12Z -->
+
+## Implementation report
+
+Implemented Workflow removal.
+
+Summary:
+- Removed model-visible ActiveWorkflow tools and the Worker active-workflow store/extension/compaction/rehydration paths.
+- Removed Workflow resource loading/invocation/completions and deleted the workflow crate plus tracked resources/workflows files.
+- Simplified protocol/TUI/web segment handling by removing WorkflowInvoke and slash workflow completion behavior.
+- Removed .yoi/workflow memory/workspace authority and workflow usage source handling.
+- Removed Workflow/resident-workflow prompt/resource wording and updated Ticket role launch/config code to use typed role launch prompts without workflow slugs.
+- Preserved bounded legacy session behavior by deserializing old kind:"workflow" SystemItem entries into a non-authority LegacyIgnored item that replays only an ignore diagnostic.
+- Did not implement first-class Skills support.
+
+Validation:
+- rg "ActiveWorkflow|active_workflow|Active workflow" -> no matches (exit 1)
+- rg "resources/workflows|\\.yoi/workflow|workflow invocation|Resident workflows" -> no matches (exit 1)
+- git diff --check -> exit 0
+- cargo test -p session-store --lib --tests -> exit 0
+- cargo test -p worker --lib --tests -> exit 0
+- cargo test -p yoi --tests -> exit 0
+- cargo check -p yoi -> exit 0
+- yoi ticket doctor -> exit 0
+- nix build .#yoi --no-link -> exit 0
+
+
+---

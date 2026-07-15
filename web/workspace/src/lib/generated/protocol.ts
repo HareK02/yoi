@@ -6,7 +6,7 @@ export type AlertLevel = "warn" | "error";
 
 export type AlertSource = "worker" | "engine" | "compactor" | "agents_md";
 
-export type CompletionKind = "file" | "knowledge" | "workflow";
+export type CompletionKind = "file" | "knowledge";
 
 export type WorkerStatus = "idle" | "running" | "paused";
 

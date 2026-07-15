@@ -4,7 +4,7 @@ The conversation input is a bounded overview/index, not the full transcript. Tre
 
 ## Workflow
 
-1. Read the provided overview/index, current TaskStore snapshot, and any Active Workflow Invocation State section.
+1. Read the provided overview/index and current TaskStore snapshot.
 2. If the overview does not contain enough detail, use `search_session_log` to find relevant compact-target history items, then `read_session_items` to inspect only the needed range.
 3. Use `read_file` to inspect referenced files before deciding what the next session needs. Prefer skimming over blind inclusion.
 4. For files whose current contents are load-bearing for the active work, call `mark_read_required` to inject them into the next session. These count against the auto-read token budget — spend it deliberately.
@@ -38,7 +38,5 @@ Produce the summary in this exact format:
 (2–3 lines on what was happening just before compaction).
 
 ## Constraints
-
-- Preserve active workflow invocation state when present: active slug, invocation scope/source/time, status, open obligations/checkpoints, and snapshotted workflow guidance. Do not replace a snapshotted invocation with merely advertised/latest workflow resources.
 - Keep code snippets and raw tool output OUT of the summary — that is what auto-read and references are for.
 - Follow the summary target stated in the run input; if asked to shrink, call `write_summary` again with a shorter version.
