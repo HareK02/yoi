@@ -237,3 +237,31 @@ Non-blocking cleanup:
 - `crates/tui/src/input.rs:237-269` has stale comments mentioning `#<typed>`, though code only triggers `@` file completion。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-15T22:41:26Z -->
+
+## Implementation report
+
+Follow-up implementation progress report after request_changes:
+
+- Coder Pod `yoi-coder-00001KXKP2A71-knowledge-removal` completed the stale Knowledge guidance fix。
+- Follow-up commit: `ad666503 fix: remove stale knowledge guidance`。
+- Orchestrator inspected worktree status, branch log, commit stats, and `git diff --check f2106407..HEAD`; worktree was clean and diff check passed。
+
+Fix summary:
+- Updated model-visible Ticket tool description in `crates/ticket/src/tool.rs`: replaced `Memory/Knowledge` language guidance with `Memory`。
+- Updated active design overview in `docs/design/overview.md`: `memory` crate now owns generated Memory summary/decision/request records, not Knowledge records。
+- Updated stale TUI comment in `crates/tui/src/input.rs`: removed `#<typed>` from file-completion chip comment。
+- Removed stale “Knowledge records” wording from historical test-validity report text in `docs/report/test-validity-20260612/yoi.md`。
+
+Coder-reported validation passed:
+- Focused active guidance grep for `Memory/Knowledge|Knowledge records|#<typed>` in relevant active files: no hits。
+- Required Knowledge-removal grep for `KnowledgeQuery|kind = knowledge|kind: knowledge|ResidentKnowledge|model_invokation|\\.yoi/knowledge|#<slug>`: only remaining hit is `docs/design/memory-knowledge.md:13`, an explicit historical/legacy note saying old `.yoi/knowledge/` is no longer active and current tooling ignores it。
+- `git diff --check`
+- `cargo check -p yoi`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+No focused behavior tests were re-run for this follow-up because changes were docs/comments/model-visible text only。
+
+---
