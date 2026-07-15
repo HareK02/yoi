@@ -343,3 +343,29 @@ Validation performed:
 - Static read-only review only; no tests rerun because static docs acceptance blocker remains。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-15T22:55:19Z -->
+
+## Implementation report
+
+Third follow-up implementation progress report after request_changes:
+
+- Coder Pod `yoi-coder-00001KXKP2A71-knowledge-removal` completed the remaining docs/report wording fix。
+- Follow-up commit: `9f527f5e fix: remove stale report knowledge wording`。
+- Orchestrator inspected worktree status, branch log, commit stats, and `git diff --check f2106407..HEAD`; worktree was clean and diff check passed。
+
+Fix summary:
+- Updated `docs/report/test-validity-20260612/yoi.md`: `memory/Knowledge record path` -> `memory record path`。
+- Updated `docs/report/test-validity-20260612/memory.md`: `MemoryWrite` “Knowledge/Request 作成” -> “Request 作成”。
+- Searched nearby `docs/report` files and removed remaining active Knowledge wording there。
+
+Coder-reported validation passed:
+- Focused grep for `Knowledge records|Knowledge/Request|memory/Knowledge|MemoryWrite.*Knowledge|KnowledgeQuery|kind = knowledge|#<slug>|#<typed>|\\.yoi/knowledge`: only remaining hit is the explicit legacy/manual note for old `.yoi/knowledge` in `docs/design/memory-knowledge.md`; no active docs/report guidance remains。
+- `git diff --check`
+- `cargo check -p yoi`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+No behavior tests were re-run for this follow-up because changes were docs/report wording only。
+
+---
