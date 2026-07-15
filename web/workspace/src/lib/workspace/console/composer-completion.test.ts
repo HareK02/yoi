@@ -22,7 +22,7 @@ function assertEquals<T>(actual: T, expected: T): void {
   }
 }
 
-Deno.test("completionTokenAt detects TUI-style sigils before the cursor", () => {
+Deno.test("completionTokenAt detects command and file sigils before the cursor", () => {
   assertEquals(completionTokenAt("open @src/ma", "open @src/ma".length), {
     sigil: "@",
     kind: "file",
@@ -32,6 +32,7 @@ Deno.test("completionTokenAt detects TUI-style sigils before the cursor", () => 
   });
   assertEquals(completionTokenAt(":comp", 5)?.kind, "command");
   assertEquals(completionTokenAt("run /work", 9), null);
+  assertEquals(completionTokenAt("ask #plain", "ask #plain".length), null);
 });
 
 Deno.test("applyCompletion replaces the active token and advances the cursor", () => {

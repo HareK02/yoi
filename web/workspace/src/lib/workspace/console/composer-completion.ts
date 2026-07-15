@@ -1,7 +1,7 @@
 export type ComposerCompletionKind = "command" | "file";
 
 export type ComposerCompletionToken = {
-  sigil: ":" | "@" | "#";
+  sigil: ":" | "@";
   kind: ComposerCompletionKind;
   start: number;
   end: number;
@@ -35,7 +35,7 @@ export function completionTokenAt(
 ): ComposerCompletionToken | null {
   const boundedCursor = Math.max(0, Math.min(cursor, value.length));
   const before = value.slice(0, boundedCursor);
-  const match = /(^|\s)([:@#])([^\s]*)$/.exec(before);
+  const match = /(^|\s)([:@])([^\s]*)$/.exec(before);
   if (!match) {
     return null;
   }
@@ -83,8 +83,6 @@ function completionKindForSigil(
   switch (sigil) {
     case ":":
       return "command";
-    default:
-      return "file";
     case "@":
       return "file";
   }
