@@ -65,3 +65,99 @@ Escalate if:
 - Human explicitly wants Knowledge removal and Workflow removal combined in one branch/worktree, or accepts parallel conflict/review-boundary risk。
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-07-15T21:40:21Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- Previously recorded conflict reason (`00001KXKJGYGD` inprogress Workflow removal) is now resolved: Workflow removal was approved, merged, validated, closed, and its implementation worktree/branch cleaned。
+- `TicketRelationQuery(00001KXKP2A71)` shows only an incoming dependency from Skills support Ticket `00001KXKMX0QM`; this Ticket has no outgoing blockers。
+- `TicketOrchestrationPlanQuery(00001KXKP2A71)` contains prior `after 00001KXKJGYGD` / waiting notes, now satisfied, plus the accepted plan recorded in this pass。
+- `TicketList(inprogress)` is 0 件。
+- Orchestrator worktree is clean and no existing `00001KXKP2A71` implementation worktree/branch was found。
+
+Evidence checked:
+- Ticket body / thread / relations / orchestration plan。
+- Closed `00001KXKJGYGD` outcome and current repository/worktree state。
+- `TicketList(inprogress)` and orchestration worktree status。
+
+IntentPacket:
+
+Intent:
+- Knowledge を active supported feature / workspace record authority から削除する。
+- Memory は durable summary / decisions / requests として残し、Knowledge は separate record kind として廃止する。
+- Future Skills support の前に、Knowledge 固有の context/reference/tool surface を削除して概念境界を単純化する。
+
+Binding decisions / invariants:
+- `.yoi/knowledge` を active workspace record authority として扱わない。
+- `KnowledgeQuery` を model-visible tool schema から削除する。
+- `MemoryRead` / `MemoryWrite` / `MemoryEdit` / `MemoryDelete` の `kind = knowledge` を削除する。
+- resident Knowledge injection / `ResidentKnowledgeEntry` / `model_invokation` field usage を削除する。
+- TUI / protocol の `#<slug>` Knowledge reference / completion / chips / styling / system-item path を削除または unsupported にする。
+- memory lint / consolidation / extraction は Knowledge record を作成・更新・検査しない。
+- Current docs/prompts は Knowledge を active supported feature として説明しない。
+- Historical reports may remain if explicitly historical, but current design docs/prompts must not advertise active Knowledge support。
+- Skills are not a Knowledge clone; Skills support remains separate dependent work after Knowledge removal。
+
+Requirements / acceptance criteria:
+- `KnowledgeQuery` and `kind = knowledge` disappear from active model-visible tool schemas。
+- Worker prompt / resident context / compaction / rehydration have no Knowledge section。
+- Protocol/TUI/web no longer expose active `#<slug>` Knowledge references or completions。
+- Memory lint/consolidation no longer handles Knowledge records as active output/target。
+- Docs/prompts are updated to Memory / Ticket / Skill / repository-file boundaries without active Knowledge guidance。
+- Existing `.yoi/knowledge` data handling is explicit: ignore / diagnostic / manual archive, without large migration code。
+- Affected tests/build pass and dependent Skills support remains queued until this Ticket closes。
+
+Implementation latitude:
+- Removal can be direct deletion or fail-closed unsupported diagnostic where compatibility is necessary。
+- Exact treatment of old `.yoi/knowledge` directory can be ignore/diagnostic/manual archive note; do not add a broad migration subsystem。
+- If a crate/type still needs `knowledge` in historical tests/fixtures, keep only clearly non-active compatibility evidence and document it in test names/comments。
+- Web/TUI UX for `#` can become no completion / plain text / reserved unsupported; choose the smallest coherent behavior。
+
+Escalate if:
+- Removing Knowledge tools breaks Memory tools in a way that requires rethinking Memory API shape。
+- A persisted-session compatibility issue requires more than bounded ignore/drop/diagnostic behavior。
+- Skills support must be implemented now to replace a required active Knowledge path。
+- A current document appears to require Knowledge as a product feature rather than historical reference。
+
+Validation:
+- `rg "KnowledgeQuery|knowledge"` with remaining hits explained/limited to non-active historical/compatibility contexts。
+- `rg "#<slug>|ResidentKnowledge|model_invokation|kind = knowledge|\.yoi/knowledge"` with active hits removed or explained。
+- `git diff --check`
+- `cargo test -p worker --lib --tests`
+- `cargo test -p memory --lib --tests` or equivalent affected memory crate tests if present。
+- `cargo test -p session-store --lib --tests` if system/reference/session state touched。
+- `cargo test -p tui --lib --tests` if TUI references/completions touched。
+- `cargo test -p yoi --tests` if CLI/memory commands touched。
+- `cd web/workspace && deno task check && deno task test` if web generated/protocol/completion types touched。
+- `cargo check -p yoi`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Current code map / likely touch points:
+- Worker memory/knowledge tools and prompt/resident context paths。
+- Memory store/lint/consolidation/extraction code。
+- Protocol/TUI/web reference/completion/chip surfaces for `#<slug>`。
+- Session/system item/reference types if Knowledge references are persisted。
+- Docs/prompts mentioning Knowledge as active support。
+
+Critical risks / reviewer focus:
+- `KnowledgeQuery` or `kind = knowledge` surviving in model-visible tool schema。
+- Resident Knowledge still injected through prompt/compaction/rehydration。
+- `#<slug>` still parsed as active Knowledge reference/completion。
+- Consolidation prompt still asking to create/update Knowledge。
+- Docs/prompts continuing to teach Knowledge as supported active feature。
+- Accidentally removing Memory summary/decision/request functionality while deleting Knowledge。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-07-15T21:40:26Z from: queued to: inprogress reason: accepted_for_implementation field: state -->
+
+## State changed
+
+Workflow removal dependency/conflict is now closed and no blockers remain. Accepting queued Knowledge removal Ticket for implementation before creating worktree or spawning role Pods.
+
+---
