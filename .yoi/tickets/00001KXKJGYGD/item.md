@@ -1,9 +1,11 @@
 ---
 title: 'Remove workflow tracking and workflow resources'
-state: 'ready'
+state: 'queued'
 created_at: '2026-07-15T19:02:13Z'
-updated_at: '2026-07-15T19:43:46Z'
+updated_at: '2026-07-15T19:54:36Z'
 assignee: null
+queued_by: 'workspace-panel'
+queued_at: '2026-07-15T19:54:36Z'
 ---
 
 ## 背景
