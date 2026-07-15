@@ -166,3 +166,89 @@ Escalate if:
 - Human explicitly requests a combined branch across Workflow removal / Knowledge removal / Skills support and accepts the larger review-boundary risk。
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-07-15T23:01:21Z -->
+
+## Decision
+
+Routing decision: implementation_ready
+
+Reason:
+- Explicit dependencies are now satisfied: `00001KXKJGYGD` Workflow removal and `00001KXKP2A71` Knowledge removal are both approved, merged, final-validated, closed, and their implementation worktrees/branches cleaned。
+- `TicketRelationQuery(00001KXKMX0QM)` still records the outgoing `depends_on` edges, but the derived blocker view is empty because both targets are closed。
+- `TicketOrchestrationPlanQuery(00001KXKMX0QM)` contained earlier waiting notes for those blockers; this pass records an accepted implementation plan。
+- `TicketList(inprogress)` is 0 件。
+- Orchestrator worktree is clean and no existing `00001KXKMX0QM` implementation worktree/branch was found。
+
+Evidence checked:
+- Ticket body / thread / relations / orchestration plan。
+- Closed prerequisite Tickets `00001KXKJGYGD` and `00001KXKP2A71`。
+- Orchestrator worktree state / worktree list / branch list。
+
+IntentPacket:
+
+Intent:
+- Implement first-class Agent Skills support using Workspace backend authority。
+- `.yoi/skills/<skill-name>/SKILL.md` becomes tracked workspace Skill data, but Worker-local filesystem scan must not be the primary authority when Workspace backend/client is available。
+- Provide shared Skill catalog/lint/read/activation APIs for Worker / Runtime / Web / CLI and progressive disclosure of Skill metadata vs body/resources。
+
+Binding decisions / invariants:
+- Skill is LLM-facing procedural guidance/resource, not external state authority, scheduler, script runner, queue runner, or worktree manager。
+- Ticket / Worker / workdir / repository / network external state changes remain in typed feature/tool surfaces。
+- Workflow projection semantics must not return: no `WorkflowRecord`, `model_invokation`, `user_invocable`, graph/invocation assumptions, or `/workflow-slug` compatibility path。
+- Knowledge has been removed as active support; do not rebuild Knowledge under Skill terminology。
+- Workspace backend is authority for Skill discovery/lint/catalog/activation。
+- Worker with `WorkspaceClient::Http` must receive Skill metadata/body via Workspace API, not local path scan。
+- Full `SKILL.md` body is loaded into Worker history/context only on activation/select, not always with the catalog。
+- `allowed-tools` is experimental; if implemented, it must not become independent authority without explicit integration with feature/tool permissions。
+
+Requirements / acceptance criteria:
+- `.yoi/skills/<skill-name>/SKILL.md` is parsed/linted per Agent Skills required frontmatter and naming rules。
+- Workspace backend exposes Skill catalog/list, detail/read, lint/diagnostics, activation body, and resource access or backend-resolved resource authority as appropriate。
+- Builtin/workspace loading, override priority, provenance, invalid diagnostics, and non-default/workspace skill cases are covered by tests。
+- Worker / Web / CLI use the same Workspace backend Skill catalog view。
+- Activation appends/commits Skill body into Worker history before LLM context use。
+- Progressive disclosure is tested: catalog metadata is lightweight, full body/resources load only when requested/activated。
+- Role prompts/internal prompts/docs are updated to Skill terminology and no Workflow/Knowledge active guidance remains。
+- Initial implementation clearly marks unsupported decision points such as `allowed-tools`/scripts/resource execution if not implemented。
+
+Implementation latitude:
+- Exact crate/module placement and API DTO shapes may follow current workspace-server / Worker WorkspaceClient patterns。
+- Builtin Skill resource layout can be chosen based on existing resource conventions, but must be tested and documented。
+- Workspace override policy may choose complete override or conflict diagnostic if documented and tested; prefer a simple deterministic rule。
+- Web UI editing can be deferred if backend/API/CLI tests cover catalog/lint/read/activation and Ticket does not require full editor implementation。
+
+Escalate if:
+- Skill activation syntax (`/skill-name` vs explicit tool/API/UI activation) requires product decision beyond existing Ticket text。
+- Supporting `scripts/` execution would require new authority/sandbox model; prefer unsupported/diagnostic unless explicitly scoped。
+- Implementing resource access needs broad backend protocol design beyond bounded read/detail endpoints。
+- Any path requires reintroducing Workflow or Knowledge active surfaces。
+
+Validation:
+- `git diff --check`
+- Skill loader/lint/catalog tests in affected crate(s)。
+- `cargo test -p yoi-workspace-server --lib` if Workspace API is touched。
+- `cargo test -p worker --lib --tests` if Worker prompt/history/WorkspaceClient activation is touched。
+- `cargo test -p yoi --tests` if CLI/input activation is touched。
+- `cd web/workspace && deno task check && deno task test` if web/API types are touched。
+- `cargo check -p yoi`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Critical risks / reviewer focus:
+- Worker-local scan becoming divergent authority。
+- Full Skill body being resident by default rather than activated/progressive。
+- Workflow/Knowledge surfaces returning under new names。
+- `allowed-tools` or scripts accidentally becoming authority bypass。
+- Skill resources leaking raw paths or bypassing Workspace backend authority。
+- External state control moving into Skill text instead of typed tools/features。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-07-15T23:01:28Z from: queued to: inprogress reason: accepted_for_implementation field: state -->
+
+## State changed
+
+Dependencies Workflow removal and Knowledge removal are closed, no blockers remain, accepted plan recorded. Moving queued Ticket to inprogress before creating worktree or spawning role Pods.
+
+---
