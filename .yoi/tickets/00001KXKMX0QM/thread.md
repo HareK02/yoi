@@ -135,3 +135,34 @@ Ticket を `workspace-panel` が queued にしました。
 
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-07-15T21:26:58Z -->
+
+## Decision
+
+Routing decision: blocked_by_dependency
+
+Reason:
+- Dashboard queue authorization was inspected, but this Ticket has explicit `depends_on` blockers。
+- `00001KXKJGYGD` (`Remove workflow tracking and workflow resources`) is currently `inprogress` and still in reviewer/coder fix loop。
+- `00001KXKP2A71` (`Remove Knowledge support`) is still `queued` and was intentionally held until Workflow removal completes。
+- This Ticket’s body depends on both: Workflow projection must be gone, and obsolete Knowledge support should be removed before first-class Agent Skills support introduces new Skill/Knowledge boundaries and Workspace Skill APIs。
+- Therefore this routing pass leaves the Ticket `queued` and does not record `queued -> inprogress`, create a worktree, or spawn role Pods。
+
+Evidence checked:
+- Ticket body / thread / relations。
+- `TicketRelationQuery(00001KXKMX0QM)`: `depends_on 00001KXKJGYGD` and `depends_on 00001KXKP2A71`。
+- Ticket derived blocker view: `00001KXKJGYGD` is `inprogress`, `00001KXKP2A71` is `queued`。
+- `TicketOrchestrationPlanQuery(00001KXKMX0QM)`: no prior records; this pass recorded `after` entries and waiting note。
+- `TicketList(inprogress)`: `00001KXKJGYGD` active。
+- Orchestrator worktree status: clean。
+
+Next action:
+- Finish `00001KXKJGYGD` first。
+- Re-route and complete `00001KXKP2A71` second。
+- Re-route this Skills Ticket after both blockers are approved, merged, validated, and closed。
+
+Escalate if:
+- Human explicitly requests a combined branch across Workflow removal / Knowledge removal / Skills support and accepts the larger review-boundary risk。
+
+---
