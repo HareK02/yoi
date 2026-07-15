@@ -1,8 +1,8 @@
 ---
 title: 'Stabilize cleanup plan ordering'
-state: 'done'
+state: 'closed'
 created_at: '2026-07-13T13:29:51Z'
-updated_at: '2026-07-13T13:38:25Z'
+updated_at: '2026-07-15T16:19:29Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-13T13:30:39Z'

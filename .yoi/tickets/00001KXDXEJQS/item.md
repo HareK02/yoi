@@ -1,8 +1,8 @@
 ---
 title: 'Render console snapshot entries'
-state: 'done'
+state: 'closed'
 created_at: '2026-07-13T14:17:43Z'
-updated_at: '2026-07-13T14:30:38Z'
+updated_at: '2026-07-15T16:19:27Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-13T14:18:30Z'
