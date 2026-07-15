@@ -826,17 +826,9 @@ fn ticket_queue_notification_message_carries_routing_contract() {
     assert!(message.contains("before any worktree/SpawnWorker implementation side effects"));
     assert!(message.contains("After inprogress acceptance"));
     assert!(message.contains("implementation worktree"));
-    assert!(message.contains("`.worktree/<task-name>`"));
     assert!(message.contains("tracked `.yoi` project records visible"));
-    assert!(
-        message.contains(
-            "`.yoi/memory` plus local/runtime/log/lock/secret-like `.yoi` paths excluded"
-        )
-    );
+    assert!(message.contains("generated/local/runtime/log/lock/secret-like `.yoi` paths excluded"));
     assert!(message.contains("sibling coder/reviewer Workers"));
-    assert!(message.contains("sibling coder/reviewer Workers"));
-    assert!(message.contains("coder narrow child-worktree write scope"));
-    assert!(message.contains("reviewer read-only by default"));
     assert!(message.contains(
         "integrate the implementation branch into the orchestration branch automatically"
     ));

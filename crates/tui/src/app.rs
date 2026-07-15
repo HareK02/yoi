@@ -3584,12 +3584,11 @@ mod completion_flow_tests {
             ```json\n{\n  \"tasks\": [\n    {\n      \"taskid\": 4,\n      \
             \"status\": \"inprogress\",\n      \"subject\": \"from snapshot\",\n      \
             \"description\": \"d\"\n    }\n  ]\n}\n```\n";
-        // Snapshot text injected as a workflow body (kind doesn't matter
-        // for task-store parsing, only the text contents do).
+        // Snapshot text injected through an active system item kind; legacy
+        // workflow items are intentionally ignored and must not carry active state.
         app.handle_worker_event(Event::SystemItem {
             item: serde_json::json!({
-                "kind": "workflow",
-                "slug": "task-snapshot",
+                "kind": "task_reminder",
                 "body": snapshot,
             }),
         });

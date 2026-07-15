@@ -210,3 +210,26 @@ Validation:
 
 
 ---
+
+<!-- event: implementation_report author: hare at: 2026-07-15T21:32:07Z -->
+
+## Implementation report
+
+Follow-up fix for focused TUI re-review blocker.
+
+Summary:
+- Updated `live_system_snapshot_replaces_task_store` so the task-store snapshot fixture is carried by active `task_reminder` SystemItem text instead of a legacy `kind: "workflow"` item.
+- Legacy workflow SystemItems remain ignored/drop-diagnostic only; no workflow active behavior was re-enabled.
+- While running the requested full TUI suite, updated stale dashboard routing-message test assertions to match the already workflow-free queue guidance.
+
+Validation:
+- cargo test -p tui --lib live_system_snapshot_replaces_task_store -- --nocapture -> exit 0
+- cargo test -p tui --lib live_legacy_workflow_system_item_is_ignored -- --nocapture -> exit 0
+- git diff --check -> exit 0
+- cargo test -p tui --lib --tests -> exit 0
+- cargo check -p yoi -> exit 0
+- yoi ticket doctor -> exit 0
+- nix build .#yoi --no-link -> exit 0
+
+
+---
