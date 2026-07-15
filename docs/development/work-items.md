@@ -107,31 +107,34 @@ The first version intentionally does not implement roadmap scheduling, milestone
 
 ## Ticket configuration
 
-Workspace Ticket orchestration is configured by `.yoi/ticket.config.toml` when present.
+Workspace Ticket policy is configured by the tracked workspace settings file `.yoi/workspace.toml` under the `[ticket]` table. The old `.yoi/ticket.config.toml` file is obsolete: current code only reads it as a narrow read-only migration fallback when `.yoi/workspace.toml` has no `[ticket]` table. Workspace settings take precedence as soon as `[ticket]` exists.
 
 MVP shape:
 
 ```toml
-[backend]
+[ticket]
+language = "Japanese"
+
+[ticket.backend]
 provider = "builtin:yoi_local"
 root = ".yoi/tickets"
 
-[roles.intake]
+[ticket.roles.intake]
 profile = "project:intake"
 launch_prompt = "$workspace/ticket/intake/launch"
 workflow = "ticket-intake-workflow"
 
-[roles.orchestrator]
+[ticket.roles.orchestrator]
 profile = "project:orchestrator"
 launch_prompt = "$workspace/ticket/orchestrator/launch"
 workflow = "ticket-orchestrator-routing"
 
-[roles.coder]
+[ticket.roles.coder]
 profile = "project:coder"
 launch_prompt = "$workspace/ticket/coder/launch"
 workflow = "multi-agent-workflow"
 
-[roles.reviewer]
+[ticket.roles.reviewer]
 profile = "project:reviewer"
 launch_prompt = "$workspace/ticket/reviewer/launch"
 workflow = "multi-agent-workflow"
@@ -145,10 +148,10 @@ Fixed roles are:
 - `reviewer`
 
 This is not an arbitrary role registry. The fixed roles are the roles required by Ticket orchestration.
-Stale `[roles.investigator]` config is rejected as an unsupported fixed role; remove it and,
+Stale `[ticket.roles.investigator]` config is rejected as an unsupported fixed role; remove it and,
 when a spike is useful, let the Orchestrator create an ordinary task-specific read-only helper Worker.
 
-`profile` selects the Worker runtime Profile for that role. The selected Profile owns durable role/system behavior. `ticket.config.toml` does not have a role-level `system_instruction` field.
+`profile` selects the Worker runtime Profile for that role. The selected Profile owns durable role/system behavior. Workspace Ticket settings do not have a role-level `system_instruction` field.
 
 `launch_prompt` is a per-action first-run prompt reference for future prompt resolution. Current launcher behavior exposes the ref but does not treat it as system instruction.
 
@@ -156,7 +159,7 @@ when a spike is useful, let the Orchestrator create an ordinary task-specific re
 
 `provider = "builtin:yoi_local"` selects Yoi's built-in local Ticket backend. `root = ".yoi/tickets"` is the canonical local storage root for this repository. Legacy `kind = "local"` is accepted only as a short transitional alias; new configs should use `provider`.
 
-If `.yoi/ticket.config.toml` is missing, defaults are:
+If `.yoi/workspace.toml` has no `[ticket]` table and no legacy fallback file exists, defaults are:
 
 - backend provider: `builtin:yoi_local`
 - backend root: `<workspace>/.yoi/tickets`
@@ -168,7 +171,7 @@ If `.yoi/ticket.config.toml` is missing, defaults are:
   - coder: `multi-agent-workflow`
   - reviewer: `multi-agent-workflow`
 
-Important: top-level Ticket role launches cannot execute `profile = "inherit"` because top-level launch has no parent Profile to inherit from. Configure concrete role profiles in `.yoi/ticket.config.toml` before using `yoi panel` role-launch actions.
+Important: top-level Ticket role launches cannot execute `profile = "inherit"` because top-level launch has no parent Profile to inherit from. Configure concrete role profiles in `.yoi/workspace.toml` under `[ticket.roles.*]` before using `yoi panel` role-launch actions.
 
 ## Workflow lifecycle
 
@@ -272,7 +275,7 @@ Close with a resolution that summarizes what changed, key commits, validation, r
 
 `yoi panel` is the active Ticket/Intake/Orchestrator Dashboard. It owns fixed Ticket role-launch actions and uses the shared client Ticket role launcher. The single-Worker Console no longer supports `:ticket ...` commands; typing them in command mode is treated like any other unknown command.
 
-Role actions map to the same fixed roles configured in `.yoi/ticket.config.toml`:
+Role actions map to the same fixed roles configured in `.yoi/workspace.toml` under `[ticket.roles]`:
 
 - intake launches the intake role without an existing Ticket and requires freeform context.
 - route launches the orchestrator role for an existing Ticket.
@@ -288,7 +291,7 @@ The role-launch path is:
 ```text
 User triggers a Ticket action in yoi panel
   -> Dashboard builds a TicketRoleLaunchContext
-  -> client Ticket role launcher reads .yoi/ticket.config.toml
+  -> client Ticket role launcher reads .yoi/workspace.toml [ticket] settings
   -> launcher selects the role Profile and workflow
   -> launcher spawns the role Worker
   -> launcher sends Method::Run with WorkflowInvoke + Text segments
@@ -301,37 +304,37 @@ The launched Worker receives dynamic Ticket/action context as its first committe
 The first run input contains:
 
 - the selected fixed role;
-- the workflow canonical id from `.yoi/ticket.config.toml`;
+- the workflow canonical id from workspace `[ticket.roles.<role>]` settings;
 - Ticket id when the action targets an existing Ticket;
 - freeform user instruction/context from the action;
 - configured `launch_prompt` reference if present, as an unresolved reference for future prompt resolution.
 
-The selected Profile supplies durable system/role behavior. `ticket.config.toml` does not override system instruction.
+The selected Profile supplies durable system/role behavior. Workspace Ticket settings do not override system instruction.
 
 ### Dashboard setup
 
 Because top-level role launches cannot inherit a parent Profile, configure concrete role profiles before using Dashboard role actions:
 
 ```toml
-# .yoi/ticket.config.toml
+# .yoi/workspace.toml
 
-[backend]
+[ticket.backend]
 provider = "builtin:yoi_local"
 root = ".yoi/tickets"
 
-[roles.intake]
+[ticket.roles.intake]
 profile = "project:intake"
 workflow = "ticket-intake-workflow"
 
-[roles.orchestrator]
+[ticket.roles.orchestrator]
 profile = "project:orchestrator"
 workflow = "ticket-orchestrator-routing"
 
-[roles.coder]
+[ticket.roles.coder]
 profile = "project:coder"
 workflow = "multi-agent-workflow"
 
-[roles.reviewer]
+[ticket.roles.reviewer]
 profile = "project:reviewer"
 workflow = "multi-agent-workflow"
 ```
@@ -340,8 +343,8 @@ If a role still uses `profile = "inherit"`, the Dashboard fails closed with a di
 
 ### Dashboard troubleshooting
 
-- `profile = "inherit"`: configure a concrete role Profile in `.yoi/ticket.config.toml`.
-- malformed `.yoi/ticket.config.toml`: fix the config and retry.
+- `profile = "inherit"`: configure a concrete role Profile in `.yoi/workspace.toml` under `[ticket.roles.<role>]`.
+- malformed workspace Ticket settings: fix the `[ticket]` table in `.yoi/workspace.toml` and retry.
 - missing Ticket id for route, implement, or review actions: provide the target Ticket.
 - launch success but no visible completion: attach to or inspect the launched Worker; completion notifications are hints, not authority.
 

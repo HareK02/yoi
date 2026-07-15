@@ -94,13 +94,13 @@ fn ensure_and_restore_use_configured_orchestration_layout() {
     write_test_ticket_config(
         &root,
         r#"
-[orchestration]
+[ticket.orchestration]
 branch = "orchestration/custom-panel"
 worktree_dir = "custom-worktrees"
 worktree_name = "panel"
 "#,
     );
-    run_test_git(&root, &["add", ".yoi/ticket.config.toml"]).unwrap();
+    run_test_git(&root, &["add", ".yoi/workspace.toml"]).unwrap();
     run_test_git(&root, &["commit", "-m", "ticket config"]).unwrap();
 
     let resolved = resolved_orchestration_worktree_layout(&root).unwrap();
@@ -126,7 +126,7 @@ fn invalid_configured_orchestration_branch_is_rejected_before_git_worktree_opera
     write_test_ticket_config(
         &root,
         r#"
-[orchestration]
+[ticket.orchestration]
 branch = "orchestration/bad:branch"
 "#,
     );
@@ -145,11 +145,11 @@ fn restore_rejects_mismatched_configured_orchestration_branch_without_checkout()
     write_test_ticket_config(
         &root,
         r#"
-[orchestration]
+[ticket.orchestration]
 branch = "orchestration/custom-panel"
 "#,
     );
-    run_test_git(&root, &["add", ".yoi/ticket.config.toml"]).unwrap();
+    run_test_git(&root, &["add", ".yoi/workspace.toml"]).unwrap();
     run_test_git(&root, &["commit", "-m", "ticket config"]).unwrap();
     let layout = resolved_orchestration_worktree_layout(&root).unwrap();
     run_test_git(
@@ -259,7 +259,7 @@ fn existing_unrelated_repo_with_expected_branch_is_rejected_without_cleanup() {
 fn write_test_ticket_config(root: &Path, content: &str) {
     let config_dir = root.join(".yoi");
     std::fs::create_dir_all(&config_dir).unwrap();
-    std::fs::write(config_dir.join("ticket.config.toml"), content).unwrap();
+    std::fs::write(config_dir.join("workspace.toml"), content).unwrap();
 }
 
 fn init_test_repo(root: &Path) {
@@ -337,8 +337,8 @@ fn ticket_workspace(
     )
     .unwrap();
     fs::write(
-        temp.path().join(".yoi/ticket.config.toml"),
-        "[backend]\nprovider = \"builtin:yoi_local\"\nroot = \".yoi/tickets\"\n",
+        temp.path().join(".yoi/workspace.toml"),
+        "[ticket]\n\n[ticket.backend]\nprovider = \"builtin:yoi_local\"\nroot = \".yoi/tickets\"\n",
     )
     .unwrap();
     let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
@@ -712,7 +712,7 @@ async fn ticket_close_action_blocks_non_done_ticket_without_mutation() {
 #[tokio::test]
 async fn ticket_action_rejects_stale_absent_config_without_mutation() {
     let (temp, ticket_id, backend) = ready_ticket_workspace("panel-no-config");
-    fs::remove_file(temp.path().join(".yoi/ticket.config.toml")).unwrap();
+    fs::remove_file(temp.path().join(".yoi/workspace.toml")).unwrap();
 
     let error =
         dispatch_ticket_action(request_for(&temp, ticket_id.clone(), NextUserAction::Queue))
@@ -1059,8 +1059,8 @@ fn dashboard_ticket_action_rows_precede_pods_and_pod_actions_still_work() {
     let temp = TempDir::new().unwrap();
     fs::create_dir_all(temp.path().join(".yoi")).unwrap();
     fs::write(
-        temp.path().join(".yoi/ticket.config.toml"),
-        "[backend]\nprovider = \"builtin:yoi_local\"\nroot = \".yoi/tickets\"\n",
+        temp.path().join(".yoi/workspace.toml"),
+        "[ticket]\n\n[ticket.backend]\nprovider = \"builtin:yoi_local\"\nroot = \".yoi/tickets\"\n",
     )
     .unwrap();
     let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));

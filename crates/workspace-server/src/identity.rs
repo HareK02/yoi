@@ -12,10 +12,10 @@ pub const WORKSPACE_IDENTITY_RELATIVE_PATH: &str = ".yoi/workspace.toml";
 
 /// Stable local Workspace identity persisted as a tracked, safe project record.
 ///
-/// The v0 TOML schema intentionally contains identity metadata only:
-/// `workspace_id`, `created_at`, and `display_name`. Unknown fields are rejected
-/// instead of preserved because this loader cannot safely round-trip future local
-/// runtime settings without risking accidental path or secret persistence.
+/// The v0 TOML schema contains identity metadata plus optional tracked project
+/// policy tables such as `[ticket]`. Runtime/local-only settings remain rejected
+/// here because this loader cannot safely round-trip future local runtime settings
+/// without risking accidental path or secret persistence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceIdentity {
     pub workspace_id: String,
@@ -29,6 +29,8 @@ struct WorkspaceIdentityFile {
     workspace_id: String,
     created_at: String,
     display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ticket: Option<toml::Value>,
 }
 
 impl WorkspaceIdentity {
@@ -112,6 +114,7 @@ impl WorkspaceIdentity {
             workspace_id: self.workspace_id.clone(),
             created_at: self.created_at.clone(),
             display_name: self.display_name.clone(),
+            ticket: None,
         })
         .map_err(|error| {
             workspace_identity_error(path, format!("failed to encode TOML: {error}"))

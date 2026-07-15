@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use project_record::validate_record_id;
 use serde::{Deserialize, Serialize};
+use ticket::config::TicketConfig;
 use ticket::{LocalTicketBackend, TicketFilter, TicketIdOrSlug};
 
 use crate::{Error, Result};
@@ -17,13 +18,16 @@ pub struct LocalProjectRecordReader {
 }
 
 impl LocalProjectRecordReader {
-    pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+    pub fn new(workspace_root: impl Into<PathBuf>) -> Result<Self> {
         let workspace_root = workspace_root.into();
-        let ticket_root = workspace_root.join(".yoi/tickets");
-        Self {
+        let ticket_config = TicketConfig::load_workspace(&workspace_root)
+            .map_err(|error| Error::Config(format!("load Ticket workspace settings: {error}")))?;
+        let ticket_backend = LocalTicketBackend::new(ticket_config.backend_root().to_path_buf())
+            .with_record_language(ticket_config.ticket_record_language());
+        Ok(Self {
             workspace_root,
-            ticket_backend: LocalTicketBackend::new(ticket_root),
-        }
+            ticket_backend,
+        })
     }
 
     pub fn workspace_root(&self) -> &Path {
@@ -297,7 +301,7 @@ mod tests {
         write_ticket(dir.path(), "00000000001J2", "Read bridge", "ready");
         write_objective(dir.path(), "00000000001J3", "Control plane", "active");
 
-        let reader = LocalProjectRecordReader::new(dir.path());
+        let reader = LocalProjectRecordReader::new(dir.path()).unwrap();
         let tickets = reader.list_tickets(20).unwrap();
         assert_eq!(tickets.record_authority, "local_yoi_project_records");
         assert_eq!(tickets.items[0].id, "00000000001J2");
@@ -313,9 +317,41 @@ mod tests {
         let objective = reader.objective("00000000001J3").unwrap();
         assert!(objective.body.contains("Objective body"));
     }
+    #[test]
+    fn reads_tickets_from_workspace_settings_backend_root() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".yoi")).unwrap();
+        fs::write(
+            dir.path().join(".yoi/workspace.toml"),
+            r#"
+[ticket]
+language = "Japanese"
 
+[ticket.backend]
+provider = "builtin:yoi_local"
+root = "project-records/tickets"
+"#,
+        )
+        .unwrap();
+        write_ticket_at(
+            &dir.path().join("project-records/tickets"),
+            "00000000001J4",
+            "Configured root",
+            "ready",
+        );
+        write_ticket(dir.path(), "00000000001J5", "Default root", "ready");
+
+        let reader = LocalProjectRecordReader::new(dir.path()).unwrap();
+        let tickets = reader.list_tickets(20).unwrap();
+        assert_eq!(tickets.items.len(), 1);
+        assert_eq!(tickets.items[0].id, "00000000001J4");
+    }
     fn write_ticket(root: &Path, id: &str, title: &str, state: &str) {
-        let ticket_dir = root.join(".yoi/tickets").join(id);
+        write_ticket_at(&root.join(".yoi/tickets"), id, title, state);
+    }
+
+    fn write_ticket_at(ticket_root: &Path, id: &str, title: &str, state: &str) {
+        let ticket_dir = ticket_root.join(id);
         fs::create_dir_all(&ticket_dir).unwrap();
         fs::write(
             ticket_dir.join("item.md"),

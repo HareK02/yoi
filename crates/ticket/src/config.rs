@@ -1,9 +1,12 @@
 //! Workspace-local Ticket orchestration configuration.
 //!
-//! The config file lives at `.yoi/ticket.config.toml` under a workspace root.
-//! It intentionally stores lightweight string references for Profile selectors,
-//! launch prompts, and workflows so this crate remains independent from `worker`
-//! and `manifest` runtime resolution.
+//! Durable Ticket policy lives under the `[ticket]` table in tracked
+//! `.yoi/workspace.toml` workspace settings. The legacy
+//! `.yoi/ticket.config.toml` file is only a read-only migration fallback when
+//! workspace settings do not contain any Ticket policy. The config intentionally
+//! stores lightweight string references for Profile selectors, launch prompts,
+//! and workflows so this crate remains independent from `worker` and `manifest`
+//! runtime resolution.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -13,6 +16,8 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub const WORKSPACE_SETTINGS_RELATIVE_PATH: &str = ".yoi/workspace.toml";
+/// Legacy Ticket config path. This is kept as a narrow read-only migration fallback only.
 pub const TICKET_CONFIG_RELATIVE_PATH: &str = ".yoi/ticket.config.toml";
 /// Workspace-relative default root for the built-in local Ticket backend.
 pub const DEFAULT_TICKET_BACKEND_RELATIVE_PATH: &str = ".yoi/tickets";
@@ -20,13 +25,17 @@ const DEFAULT_ORCHESTRATION_BRANCH: &str = "orchestration";
 const DEFAULT_ORCHESTRATION_WORKTREE_DIR: &str = ".worktree";
 const DEFAULT_ORCHESTRATION_WORKTREE_NAME: &str = "orchestration";
 
-/// Return the explicit workspace Ticket config scaffold written by `yoi ticket init`.
+/// Return the explicit Workspace settings Ticket policy scaffold written by `yoi ticket init`.
 ///
-/// The scaffold intentionally configures every fixed Ticket role with a concrete
-/// profile so strict role launch planning can validate the config without runtime
+/// The scaffold is a valid `.yoi/workspace.toml` fragment rooted at `[ticket]`.
+/// It intentionally configures every fixed Ticket role with a concrete profile
+/// so strict role launch planning can validate the config without runtime
 /// fallback.
 pub fn ticket_config_scaffold() -> String {
-    let mut out = String::from("[backend]\n");
+    let mut out = String::from(
+        "[ticket]\n# Optional durable Ticket record language. When unset, generated Ticket text keeps current defaults.\n# language = \"Japanese\"\n",
+    );
+    out.push_str("\n[ticket.backend]\n");
     out.push_str(&format!(
         "provider = \"{}\"\n",
         TicketBackendProvider::BuiltinYoiLocal.as_str()
@@ -36,14 +45,11 @@ pub fn ticket_config_scaffold() -> String {
         DEFAULT_TICKET_BACKEND_RELATIVE_PATH
     ));
     out.push_str(
-        "\n# Optional durable Ticket record language. When unset, generated Ticket text keeps current defaults.\n# [ticket]\n# language = \"Japanese\"\n",
-    );
-    out.push_str(
-        "\n# Optional Panel Orchestrator worktree settings. When unset, Panel uses branch `orchestration` at `.worktree/orchestration`.\n# [orchestration]\n# branch = \"orchestration\"\n# worktree_dir = \".worktree\"\n# worktree_name = \"orchestration\"\n",
+        "\n# Optional Panel Orchestrator worktree settings. When unset, Panel uses branch `orchestration` at `.worktree/orchestration`.\n# [ticket.orchestration]\n# branch = \"orchestration\"\n# worktree_dir = \".worktree\"\n# worktree_name = \"orchestration\"\n",
     );
     for role in TicketRole::ALL {
         out.push_str(&format!(
-            "\n[roles.{role}]\nprofile = \"{}\"\nworkflow = \"{}\"\n",
+            "\n[ticket.roles.{role}]\nprofile = \"{}\"\nworkflow = \"{}\"\n",
             role.default_profile(),
             role.default_workflow()
         ));
@@ -222,15 +228,81 @@ impl TicketConfig {
 
     pub fn load_workspace(workspace_root: impl AsRef<Path>) -> Result<Self, TicketConfigError> {
         let workspace_root = workspace_root.as_ref();
-        let path = workspace_root.join(TICKET_CONFIG_RELATIVE_PATH);
-        let content = match fs::read_to_string(&path) {
+        let workspace_settings_path = workspace_root.join(WORKSPACE_SETTINGS_RELATIVE_PATH);
+        match fs::read_to_string(&workspace_settings_path) {
+            Ok(content) => {
+                if let Some(config) = Self::from_workspace_settings_toml(
+                    workspace_root,
+                    &workspace_settings_path,
+                    &content,
+                )? {
+                    return Ok(config);
+                }
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(TicketConfigError::Read {
+                    path: workspace_settings_path,
+                    source,
+                });
+            }
+        }
+
+        // Narrow read-only migration fallback for pre-workspace-settings projects.
+        // As soon as `.yoi/workspace.toml` contains any `[ticket]` table, the
+        // workspace settings authority wins and this legacy file is ignored.
+        let legacy_path = workspace_root.join(TICKET_CONFIG_RELATIVE_PATH);
+        let legacy_content = match fs::read_to_string(&legacy_path) {
             Ok(content) => content,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self::default_for_workspace(workspace_root));
             }
-            Err(source) => return Err(TicketConfigError::Read { path, source }),
+            Err(source) => {
+                return Err(TicketConfigError::Read {
+                    path: legacy_path,
+                    source,
+                });
+            }
         };
-        Self::from_toml(workspace_root, &path, &content)
+        Self::from_toml(workspace_root, &legacy_path, &legacy_content)
+    }
+
+    pub fn from_workspace_settings_toml(
+        workspace_root: impl AsRef<Path>,
+        path: impl AsRef<Path>,
+        content: &str,
+    ) -> Result<Option<Self>, TicketConfigError> {
+        let workspace_root = workspace_root.as_ref();
+        let path = path.as_ref();
+        let value: toml::Value =
+            toml::from_str(content).map_err(|source| TicketConfigError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let Some(ticket_value) = value.get("ticket").cloned() else {
+            return Ok(None);
+        };
+        let raw: RawWorkspaceTicketConfig =
+            ticket_value
+                .try_into()
+                .map_err(|source| TicketConfigError::Parse {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        raw.resolve(workspace_root, path).map(Some)
+    }
+
+    pub fn workspace_settings_has_ticket_config(
+        path: impl AsRef<Path>,
+        content: &str,
+    ) -> Result<bool, TicketConfigError> {
+        let path = path.as_ref();
+        let value: toml::Value =
+            toml::from_str(content).map_err(|source| TicketConfigError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        Ok(value.get("ticket").is_some())
     }
 
     pub fn from_toml(
@@ -487,11 +559,11 @@ impl Default for TicketRoleProfiles {
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TicketRoleLaunchConfigError {
     #[error(
-        "Ticket role `{role}` is not launch-configured; add `[roles.{role}]` with the role builtin profile or another executable concrete profile selector"
+        "Ticket role `{role}` is not launch-configured; add `[ticket.roles.{role}]` with the role builtin profile or another executable concrete profile selector"
     )]
     MissingRoleTable { role: TicketRole },
     #[error(
-        "Ticket role `{role}` has no launch profile; set `[roles.{role}].profile` to the role builtin profile or another executable concrete profile selector"
+        "Ticket role `{role}` has no launch profile; set `[ticket.roles.{role}].profile` to the role builtin profile or another executable concrete profile selector"
     )]
     MissingProfile { role: TicketRole },
     #[error(
@@ -677,6 +749,19 @@ struct RawTicketConfig {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawWorkspaceTicketConfig {
+    #[serde(default)]
+    backend: RawBackendConfig,
+    #[serde(default)]
+    language: Option<TicketRecordLanguage>,
+    #[serde(default)]
+    orchestration: RawTicketOrchestrationConfig,
+    #[serde(default)]
+    roles: BTreeMap<String, RawTicketRoleConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawTicketOrchestrationConfig {
     #[serde(default)]
     branch: Option<GitBranchName>,
@@ -723,39 +808,76 @@ impl RawTicketConfig {
         workspace_root: &Path,
         path: &Path,
     ) -> Result<TicketConfig, TicketConfigError> {
-        let mut roles = TicketRoleProfiles::default();
-        for (name, raw_role) in self.roles {
-            let role = TicketRole::parse(&name).ok_or_else(|| TicketConfigError::Invalid {
-                path: path.to_path_buf(),
-                message: format!(
-                    "unsupported Ticket role `{name}`; supported fixed roles: {}",
-                    TicketRole::supported_names().join(", ")
-                ),
-            })?;
-            let profile_configured = raw_role.profile.is_some();
-            roles.inner.insert(role, raw_role.resolve(role));
-            roles.configured_roles.insert(role);
-            if profile_configured {
-                roles.profile_configured_roles.insert(role);
-            }
-        }
-        Ok(TicketConfig {
-            backend: self.backend.resolve(workspace_root).map_err(|message| {
-                TicketConfigError::Invalid {
-                    path: path.to_path_buf(),
-                    message,
-                }
-            })?,
-            ticket: self.ticket.resolve(),
-            orchestration: self.orchestration.resolve().map_err(|message| {
-                TicketConfigError::Invalid {
-                    path: path.to_path_buf(),
-                    message,
-                }
-            })?,
-            roles,
-        })
+        resolve_ticket_config_parts(
+            self.backend,
+            self.ticket.resolve(),
+            self.orchestration,
+            self.roles,
+            workspace_root,
+            path,
+        )
     }
+}
+
+impl RawWorkspaceTicketConfig {
+    fn resolve(
+        self,
+        workspace_root: &Path,
+        path: &Path,
+    ) -> Result<TicketConfig, TicketConfigError> {
+        resolve_ticket_config_parts(
+            self.backend,
+            TicketRecordConfig {
+                language: self.language,
+            },
+            self.orchestration,
+            self.roles,
+            workspace_root,
+            path,
+        )
+    }
+}
+
+fn resolve_ticket_config_parts(
+    backend: RawBackendConfig,
+    ticket: TicketRecordConfig,
+    orchestration: RawTicketOrchestrationConfig,
+    raw_roles: BTreeMap<String, RawTicketRoleConfig>,
+    workspace_root: &Path,
+    path: &Path,
+) -> Result<TicketConfig, TicketConfigError> {
+    let mut roles = TicketRoleProfiles::default();
+    for (name, raw_role) in raw_roles {
+        let role = TicketRole::parse(&name).ok_or_else(|| TicketConfigError::Invalid {
+            path: path.to_path_buf(),
+            message: format!(
+                "unsupported Ticket role `{name}`; supported fixed roles: {}",
+                TicketRole::supported_names().join(", ")
+            ),
+        })?;
+        let profile_configured = raw_role.profile.is_some();
+        roles.inner.insert(role, raw_role.resolve(role));
+        roles.configured_roles.insert(role);
+        if profile_configured {
+            roles.profile_configured_roles.insert(role);
+        }
+    }
+    Ok(TicketConfig {
+        backend: backend
+            .resolve(workspace_root)
+            .map_err(|message| TicketConfigError::Invalid {
+                path: path.to_path_buf(),
+                message,
+            })?,
+        ticket,
+        orchestration: orchestration
+            .resolve()
+            .map_err(|message| TicketConfigError::Invalid {
+                path: path.to_path_buf(),
+                message,
+            })?,
+        roles,
+    })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -843,6 +965,12 @@ mod tests {
         std::fs::write(dir.join("ticket.config.toml"), content).unwrap();
     }
 
+    fn write_workspace_settings(workspace: &Path, content: &str) {
+        let dir = workspace.join(".yoi");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("workspace.toml"), content).unwrap();
+    }
+
     #[test]
     fn missing_config_returns_documented_defaults() {
         let temp = TempDir::new().unwrap();
@@ -876,39 +1004,123 @@ mod tests {
     }
 
     #[test]
-    fn full_config_parses_fixed_role_refs() {
+    fn workspace_settings_take_precedence_over_legacy_ticket_config() {
         let temp = TempDir::new().unwrap();
+        write_workspace_settings(
+            temp.path(),
+            r#"
+[ticket]
+language = "Japanese"
+
+[ticket.backend]
+provider = "builtin:yoi_local"
+root = "workspace-tickets"
+"#,
+        );
         write_config(
             temp.path(),
             r#"
 [backend]
 provider = "builtin:yoi_local"
-root = "custom-tickets"
+root = "legacy-tickets"
+
+[ticket]
+language = "English"
+"#,
+        );
+
+        let config = TicketConfig::load_workspace(temp.path()).unwrap();
+        assert_eq!(config.backend.root, temp.path().join("workspace-tickets"));
+        assert_eq!(config.ticket_record_language(), Some("Japanese"));
+    }
+
+    #[test]
+    fn legacy_ticket_config_is_read_only_migration_fallback() {
+        let temp = TempDir::new().unwrap();
+        write_workspace_settings(
+            temp.path(),
+            r#"
+workspace_id = "00000000-0000-7000-8000-000000000000"
+display_name = "legacy-fallback"
+"#,
+        );
+        write_config(
+            temp.path(),
+            r#"
+[backend]
+provider = "builtin:yoi_local"
+root = "legacy-tickets"
 
 [ticket]
 language = "Japanese"
+"#,
+        );
 
-[orchestration]
+        let config = TicketConfig::load_workspace(temp.path()).unwrap();
+        assert_eq!(config.backend.root, temp.path().join("legacy-tickets"));
+        assert_eq!(config.ticket_record_language(), Some("Japanese"));
+    }
+
+    #[test]
+    fn empty_workspace_ticket_table_uses_workspace_defaults_and_ignores_legacy() {
+        let temp = TempDir::new().unwrap();
+        write_workspace_settings(
+            temp.path(),
+            r#"
+[ticket]
+"#,
+        );
+        write_config(
+            temp.path(),
+            r#"
+[backend]
+provider = "builtin:yoi_local"
+root = "legacy-tickets"
+
+[ticket]
+language = "Japanese"
+"#,
+        );
+
+        let config = TicketConfig::load_workspace(temp.path()).unwrap();
+        assert_eq!(config.backend.root, temp.path().join(".yoi/tickets"));
+        assert_eq!(config.ticket_record_language(), None);
+    }
+
+    #[test]
+    fn full_config_parses_fixed_role_refs() {
+        let temp = TempDir::new().unwrap();
+        write_workspace_settings(
+            temp.path(),
+            r#"
+[ticket]
+language = "Japanese"
+
+[ticket.backend]
+provider = "builtin:yoi_local"
+root = "custom-tickets"
+
+[ticket.orchestration]
 branch = "orchestration/custom-panel"
 worktree_dir = "custom-worktrees"
 worktree_name = "custom-orchestrator"
 
-[roles.intake]
+[ticket.roles.intake]
 profile = "project:intake"
 launch_prompt = "$workspace/ticket/intake/launch"
 workflow = "ticket-intake-workflow"
 
-[roles.orchestrator]
+[ticket.roles.orchestrator]
 profile = "project:orchestrator"
 launch_prompt = "$workspace/ticket/orchestrator/launch"
 workflow = "ticket-orchestrator-routing"
 
-[roles.coder]
+[ticket.roles.coder]
 profile = "inherit"
 launch_prompt = "$workspace/ticket/coder/launch"
 workflow = "multi-agent-workflow"
 
-[roles.reviewer]
+[ticket.roles.reviewer]
 profile = "project:reviewer"
 launch_prompt = "$workspace/ticket/reviewer/launch"
 workflow = "multi-agent-workflow"
@@ -960,28 +1172,30 @@ workflow = "multi-agent-workflow"
         let temp = TempDir::new().unwrap();
         let scaffold = ticket_config_scaffold();
 
-        assert!(scaffold.contains("[backend]\n"));
+        assert!(scaffold.contains("[ticket]\n"));
+        assert!(scaffold.contains("[ticket.backend]\n"));
         assert!(scaffold.contains("provider = \"builtin:yoi_local\""));
         assert!(scaffold.contains("root = \".yoi/tickets\""));
-        assert!(scaffold.contains("# [ticket]\n# language = \"Japanese\""));
+        assert!(scaffold.contains("# language = \"Japanese\""));
         assert!(scaffold.contains(
-            "# [orchestration]\n# branch = \"orchestration\"\n# worktree_dir = \".worktree\"\n# worktree_name = \"orchestration\""
+            "# [ticket.orchestration]\n# branch = \"orchestration\"\n# worktree_dir = \".worktree\"\n# worktree_name = \"orchestration\""
         ));
         for role in TicketRole::ALL {
-            assert!(scaffold.contains(&format!("[roles.{role}]")));
+            assert!(scaffold.contains(&format!("[ticket.roles.{role}]")));
             assert!(scaffold.contains(&format!(
-                "[roles.{role}]\nprofile = \"{}\"\nworkflow = \"{}\"",
+                "[ticket.roles.{role}]\nprofile = \"{}\"\nworkflow = \"{}\"",
                 role.default_profile(),
                 role.default_workflow()
             )));
         }
-        assert!(!scaffold.contains("[roles.investigator]"));
+        assert!(!scaffold.contains("[ticket.roles.investigator]"));
 
-        let config = TicketConfig::from_toml(
+        let config = TicketConfig::from_workspace_settings_toml(
             temp.path(),
-            temp.path().join(TICKET_CONFIG_RELATIVE_PATH),
+            temp.path().join(WORKSPACE_SETTINGS_RELATIVE_PATH),
             &scaffold,
         )
+        .unwrap()
         .unwrap();
         assert_eq!(config.backend_root(), temp.path().join(".yoi/tickets"));
         assert_eq!(config.orchestration.branch_name(), None);

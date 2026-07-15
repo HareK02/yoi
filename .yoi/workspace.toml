@@ -1,3 +1,26 @@
 workspace_id = "0197a949-4b6b-7f2a-9d9a-1f87e3a4c5b6"
 created_at = "2026-06-23T00:00:00Z"
 display_name = "yoi"
+
+[ticket]
+language = "Japanese"
+
+[ticket.backend]
+provider = "builtin:yoi_local"
+root = ".yoi/tickets"
+
+[ticket.roles.intake]
+profile = "builtin:intake"
+workflow = "ticket-intake-workflow"
+
+[ticket.roles.orchestrator]
+profile = "builtin:orchestrator"
+workflow = "ticket-orchestrator-routing"
+
+[ticket.roles.coder]
+profile = "builtin:coder"
+workflow = "multi-agent-workflow"
+
+[ticket.roles.reviewer]
+profile = "builtin:reviewer"
+workflow = "multi-agent-workflow"
