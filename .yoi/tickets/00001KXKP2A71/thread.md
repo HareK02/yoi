@@ -322,3 +322,24 @@ Next action:
 - Request focused re-review of the remaining hash completion blocker and overall acceptance before merge/close decisions。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-15T22:53:20Z status: request_changes -->
+
+## Review: request changes
+
+Focused re-review result: request_changes
+
+Fixed:
+- Web `#` completion blocker is fixed: `web/workspace/src/lib/workspace/console/composer-completion.ts:4,38,80-88` now only accepts `:`/`@`, has no fallback remapping to file, and `composer-completion.test.ts:35` asserts `ask #plain` is not a token。
+- Prior code blockers remain fixed: no `KnowledgeQuery`, `MemoryToolKind` is summary/decision/request only, resident injection is summary-only, protocol `CompletionKind` is file-only, `.yoi/knowledge` appears only in the explicit legacy/manual archive note, legacy Knowledge SystemItems return empty history text, and no Skills files/diff were found。
+
+Remaining acceptance blocker:
+- Stale active docs/report guidance still advertises Knowledge as active record/tool behavior。
+- `docs/report/test-validity-20260612/yoi.md:41` says `memory/Knowledge record path` is linted。
+- `docs/report/test-validity-20260612/memory.md:46` refers to `MemoryWrite` “Knowledge/Request 作成”。
+- These are not framed as historical/ignored compatibility and violate the docs/prompts cleanup acceptance。
+
+Validation performed:
+- Static read-only review only; no tests rerun because static docs acceptance blocker remains。
+
+---
