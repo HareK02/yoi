@@ -1,0 +1,22 @@
+[backend]
+provider = "builtin:yoi_local"
+root = ".yoi/tickets"
+
+[ticket]
+language = "Japanese"
+
+[roles.intake]
+profile = "builtin:intake"
+workflow = "ticket-intake-workflow"
+
+[roles.orchestrator]
+profile = "builtin:orchestrator"
+workflow = "ticket-orchestrator-routing"
+
+[roles.coder]
+profile = "builtin:coder"
+workflow = "multi-agent-workflow"
+
+[roles.reviewer]
+profile = "builtin:reviewer"
+workflow = "multi-agent-workflow"
