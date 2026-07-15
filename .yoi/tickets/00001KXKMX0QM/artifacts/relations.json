@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KXKMX0QM",
+      "kind": "depends_on",
+      "target": "00001KXKJGYGD",
+      "note": "Skills support follows removal of legacy workflow tracking/resource paths.",
+      "author": "yoi ticket",
+      "at": "2026-07-15T19:45:40Z"
+    }
+  ]
+}
