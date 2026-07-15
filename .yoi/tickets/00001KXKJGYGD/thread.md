@@ -123,3 +123,49 @@ Next action:
 Dashboard queue authorization was inspected, no blockers were found, and an accepted plan was recorded. Moving queued Ticket to inprogress before creating worktree or spawning role Pods.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-15T20:46:17Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Coder Pod `yoi-coder-00001KXKJGYGD-workflow-removal` completed implementation in `/home/hare/Projects/yoi/.worktree/00001KXKJGYGD-remove-workflow-tracking` on branch `work/00001KXKJGYGD-remove-workflow-tracking`。
+- Implementation commit: `d801b2698bb1b3d07e0d49af71b2e4777efd3f6e` (`refactor: remove workflow machinery`)。
+- Orchestrator inspected worktree status, branch log, commit stats, `git diff --check 83ad7506..HEAD`, and grep checks for ActiveWorkflow / Workflow resource references. Worktree was clean and diff check passed。
+
+Implementation summary:
+- Removed model-visible `ActiveWorkflowList`, `ActiveWorkflowComplete`, and `ActiveWorkflowCancel` tools。
+- Removed Worker active-workflow durable state, extension snapshotting, compaction/rehydration handling, and prompt re-injection paths。
+- Removed Workflow registry/resource loading and `/workflow-slug` invocation behavior。
+- Deleted `crates/workflow` crate and tracked `resources/workflows` resources。
+- Removed `WorkflowInvoke` from protocol/TUI/web generated protocol surfaces and slash workflow completion behavior。
+- Removed `.yoi/workflow` memory/workspace authority and workflow usage-source handling。
+- Updated prompts/docs/config/role launch code to remove resident workflow and workflow invocation wording。
+- Updated Ticket role launch/config handling to use typed role launch prompts without workflow slugs。
+- Added bounded old-session handling: old persisted `kind: "workflow"` `SystemItem`s deserialize as `LegacyIgnored` and replay only a non-authority ignore diagnostic。
+- Confirmed broad first-class Skills support was not implemented in this Ticket。
+
+Files/resources touched include:
+- `crates/worker/src/active_workflow.rs` removed。
+- `crates/worker/src/workflow/mod.rs` removed。
+- `crates/workflow/*` removed。
+- `resources/workflows/*` removed。
+- Protocol/TUI/web generated protocol surfaces updated。
+- Prompt/docs/config references updated。
+
+Coder-reported validation passed:
+- `rg "ActiveWorkflow|active_workflow|Active workflow"`: no matches。
+- `rg "resources/workflows|\\.yoi/workflow|workflow invocation|Resident workflows"`: no matches。
+- `git diff --check`
+- `cargo test -p session-store --lib --tests`
+- `cargo test -p worker --lib --tests`
+- `cargo test -p yoi --tests`
+- `cargo check -p yoi`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Next action:
+- Route to external Reviewer Pod before merge/close decisions。
+
+---
