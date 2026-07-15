@@ -98,3 +98,14 @@ Workspace backend を Skill discovery / lint / catalog / activation の authorit
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-07-15T21:02:33Z -->
+
+## Decision
+
+Skill support should mirror the Ticket backend direction: Workspace backend owns the shared authority and exposes typed APIs for Worker / Runtime process / Web / CLI access.
+
+Required API surface includes catalog/list, detail/read, lint/diagnostics, activation body retrieval, and resource access or backend-resolved authority for references/assets. Worker-local filesystem scanning must not become the primary authority when `WorkspaceClient::Http` is available.
+
+
+---

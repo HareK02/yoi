@@ -2,7 +2,7 @@
 title: 'Implement Agent Skills support'
 state: 'planning'
 created_at: '2026-07-15T19:43:46Z'
-updated_at: '2026-07-15T20:43:42Z'
+updated_at: '2026-07-15T21:02:33Z'
 assignee: null
 ---
 
@@ -60,6 +60,13 @@ Agent Skills 標準に従い、workspace-local Skills は `.yoi/skills/` 配下�
 - Skill discovery / lint / catalog / activation の authority は Workspace backend とする。
   - `.yoi/skills/` は tracked workspace data の保存場所であり、Worker が各自で filesystem scan する source of truth ではない。
   - Web Workspace UI、Runtime Worker、embedded Worker、CLI は Workspace backend API 経由で同じ Skill view を得る。
+- Ticket backend API と同様に、Worker / Runtime process が Workspace backend 経由で Skill を扱える typed API を整備する。
+  - Skill catalog/list endpoint。
+  - Skill detail/read endpoint。
+  - Skill lint/diagnostics endpoint。
+  - Skill activation body endpoint。
+  - references / assets の resource read endpoint、または backend-resolved authority を返す endpoint。
+  - 必要なら Worker-facing Skill operation endpoint を用意し、Worker-local filesystem scan に依存しない。
 - Workspace backend は Skill catalog API を提供する。
   - `name` / `description` / source / provenance / override status / diagnostics を返す。
   - invalid Skill は catalog diagnostics として報告し、Worker ごとにばらばらな parse behavior を持たせない。
@@ -102,6 +109,11 @@ Agent Skills 標準に従い、workspace-local Skills は `.yoi/skills/` 配下�
   - override priority。
   - provenance reporting。
   - invalid Skill diagnostics。
+- Workspace Skill API tests を追加する。
+  - catalog/list が Workspace settings と `.yoi/skills` を authority として使うこと。
+  - detail/read/activation body が同じ Skill resolution を使うこと。
+  - lint diagnostics が Worker / Web / CLI で共有できる response schema になること。
+  - Worker-facing API 経由で Skill activation でき、Worker-local scan と結果が分岐しないこと。
 
 ## 要決定事項
 
@@ -132,6 +144,7 @@ Agent Skills 標準に従い、workspace-local Skills は `.yoi/skills/` 配下�
 
 - `.yoi/skills/<skill-name>/SKILL.md` が Agent Skills 標準の required frontmatter と naming rules で Workspace backend によって lint される。
 - builtin/workspace Skill の loading、override priority、provenance、lint が Workspace backend API tests で確認されている。
+- Ticket backend API と同様に、Worker / Runtime process / Web / CLI が共有できる Skill catalog/read/lint/activation API が整備され、tests で確認されている。
 - Worker / Web / CLI が同じ Workspace backend Skill catalog を参照し、Worker-local filesystem scan が primary authority になっていないことを tests で確認している。
 - Full `SKILL.md` body は activation 時にのみ Workspace backend から取得されて LLM context に入り、metadata catalog と progressive disclosure の分離が tests で確認されている。
 - Workflow projection 由来の標準外 Skill fields / semantics が Skill schema から除去され、Agent Skills 標準 field と明示的な Yoi 拡張だけが受理されることを tests で確認している。
