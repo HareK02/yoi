@@ -177,3 +177,61 @@ Next action:
 Explicit follow-up authorized implementation start. Ticket/relation/plan/worktree state was rechecked and no blockers were found. Moving to inprogress before worktree creation or role Pod spawn.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-15T17:20:06Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Coder Pod `yoi-coder-00001KXK9507N-ticket-settings` completed implementation in `/home/hare/Projects/yoi/.worktree/00001KXK9507N-ticket-workspace-settings` on branch `work/00001KXK9507N-ticket-workspace-settings`。
+- Implementation commit: `b1e3a2ad338a551f6e875087c93ecf709a03c1c8 ticket: move ticket settings into workspace config`。
+- Orchestrator inspected worktree status, branch log, commit stats, `git diff --check c68ed1fd..HEAD`, and changed files. Worktree was clean and diff check passed。
+
+Implementation summary:
+- Durable Ticket policy authority を `.yoi/workspace.toml` の `[ticket]` に移動。
+- tracked `.yoi/ticket.config.toml` を削除。
+- Workspace settings に `[ticket]` がない場合のみ、legacy `.yoi/ticket.config.toml` を narrow read-only migration fallback として読む。
+- Ticket settings がない場合の default behavior は `provider = builtin:yoi_local`, `root = .yoi/tickets` として維持。
+- `[ticket]` が存在する場合は legacy `.yoi/ticket.config.toml` を無視する precedence にした。
+- Direct CLI / Objective config consumers / Worker Ticket feature setup / workspace-server Ticket backend endpoint / project record reader / Panel role launch availability / role launch tests を新 authority 解決へ更新。
+- local-only runtime/backend operational settings は tracked workspace Ticket policy と分離。
+- docs で `.yoi/ticket.config.toml` obsolete と新 `[ticket]` workspace settings shape を記録。
+
+Files touched:
+- `.yoi/ticket.config.toml` removed。
+- `.yoi/workspace.toml` updated。
+- `crates/client/src/ticket_role.rs`
+- `crates/ticket/src/config.rs`
+- `crates/tui/src/dashboard/tests.rs`
+- `crates/tui/src/workspace_panel.rs`
+- `crates/worker/src/controller.rs`
+- `crates/worker/src/feature/builtin/ticket.rs`
+- `crates/workspace-server/src/identity.rs`
+- `crates/workspace-server/src/records.rs`
+- `crates/workspace-server/src/server.rs`
+- `crates/yoi/src/ticket_cli.rs`
+- `docs/design/workflows-public-dogfood-split.md`
+- `docs/development/work-items.md`
+
+Coder-reported validation passed:
+- `cargo fmt --check`
+- `git diff --check`
+- `cargo test -p ticket`
+- `cargo test -p yoi --tests`
+- `cargo test -p client --lib --tests`
+- `cargo test -p worker --lib --tests`
+- `cargo test -p yoi-workspace-server --lib`
+- `cargo test -p tui --lib --tests`
+- `cargo check -p yoi`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Not run:
+- `cargo test -p yoi --lib --tests`: `yoi` has no library target。
+- web checks: web/API types were not touched。
+
+Next action:
+- Route to external Reviewer Pod before merge/close decisions。
+
+---
