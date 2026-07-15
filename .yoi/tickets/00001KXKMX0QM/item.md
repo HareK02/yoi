@@ -2,7 +2,7 @@
 title: 'Implement Agent Skills support'
 state: 'planning'
 created_at: '2026-07-15T19:43:46Z'
-updated_at: '2026-07-15T21:02:33Z'
+updated_at: '2026-07-15T21:05:00Z'
 assignee: null
 ---
 
@@ -114,6 +114,16 @@ Agent Skills 標準に従い、workspace-local Skills は `.yoi/skills/` 配下�
   - detail/read/activation body が同じ Skill resolution を使うこと。
   - lint diagnostics が Worker / Web / CLI で共有できる response schema になること。
   - Worker-facing API 経由で Skill activation でき、Worker-local scan と結果が分岐しないこと。
+
+## 参照
+
+実装中に Agent Skills 標準や harness 側裁量を確認する必要が出た場合は、以下を参照する。
+
+- Agent Skills home: https://agentskills.io/home
+- Agent Skills specification: https://agentskills.io/specification
+- Client implementation guide: https://agentskills.io/client-implementation/adding-skills-support
+- Skill creation best practices: https://agentskills.io/skill-creation/best-practices
+- Reference implementation / validator: https://github.com/agentskills/agentskills/tree/main/skills-ref
 
 ## 要決定事項
 
