@@ -265,3 +265,30 @@ Coder-reported validation passed:
 No focused behavior tests were re-run for this follow-up because changes were docs/comments/model-visible text only。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-15T22:44:47Z status: request_changes -->
+
+## Review: request changes
+
+Focused re-review result: request_changes
+
+Fixed from prior review:
+- `crates/ticket/src/tool.rs:165` now says Memory only。
+- `docs/design/overview.md:18` now says summary/decision/request, not Knowledge records。
+- Focused grep/read review found no `KnowledgeQuery`, no `kind=knowledge` Memory tools, no resident Knowledge collection。
+- `.yoi/knowledge` remains only as historical/manual note in `docs/design/memory-knowledge.md:13`。
+- Legacy Knowledge system items are ignored in `crates/session-store/src/system_item.rs:142-177`。
+- No Agent Skills implementation was observed in the reviewed diff。
+
+Remaining blocker:
+- Web Console still treats `#` as an active completion sigil rather than unsupported/plain text。
+- `web/workspace/src/lib/workspace/console/composer-completion.ts:4` includes `"#"`。
+- `composer-completion.ts:38` matches `[:@#]`。
+- `composer-completion.ts:86-87` maps `#` to `"file"`。
+- `web/workspace/src/routes/w/[workspaceId]/+page.svelte:316-335,357-362` resolves/applies those completions through the worker completion endpoint。
+- This leaves an active `#<typed>` completion path after Knowledge removal, contrary to acceptance item requiring active `#<slug>` Knowledge references/completions to be removed or unsupported/plain text。
+
+Validation performed:
+- Static read-only review only; no tests rerun because the blocker is visible in source。
+
+---
