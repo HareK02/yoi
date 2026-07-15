@@ -109,3 +109,20 @@ Required API surface includes catalog/list, detail/read, lint/diagnostics, activ
 
 
 ---
+
+<!-- event: intake_summary author: hare at: 2026-07-15T21:17:01Z -->
+
+## Intake summary
+
+Marked ready by `yoi ticket state`.
+
+---
+
+<!-- event: state_changed author: "yoi ticket" at: 2026-07-15T21:17:01Z from: planning to: ready reason: cli_state field: state -->
+
+## State changed
+
+Marked ready by `yoi ticket state`.
+
+
+---
