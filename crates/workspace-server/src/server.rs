@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +14,10 @@ use chrono::{SecondsFormat, Utc};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use ticket::{
+    LocalTicketBackend, TicketBackendHttpResponse, TicketBackendOperation,
+    execute_ticket_backend_operation,
+};
 use tokio::net::TcpListener;
 use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
@@ -238,6 +242,14 @@ impl WorkspaceApi {
                 execution_backend,
             )
             .map(|runtime| runtime.with_resource_broker(resource_broker.clone()))
+            .map(|runtime| {
+                runtime.with_backend_base_url(
+                    config
+                        .backend_base_url
+                        .clone()
+                        .unwrap_or_else(|| "http://127.0.0.1:8787".to_string()),
+                )
+            })
             .map_err(|err| {
                 crate::Error::Store(format!("invalid embedded Worker backend: {err}"))
             })?,
@@ -313,6 +325,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         )
         .route("/api/tickets", get(list_tickets))
         .route("/api/w/{workspace_id}/tickets", get(scoped_list_tickets))
+        .route(
+            "/api/w/{workspace_id}/tickets/backend",
+            post(scoped_ticket_backend_operation),
+        )
         .route("/api/tickets/{id}", get(get_ticket))
         .route("/api/w/{workspace_id}/tickets/{id}", get(scoped_get_ticket))
         .route("/api/objectives", get(list_objectives))
@@ -1224,6 +1240,26 @@ async fn scoped_get_ticket(
 ) -> ApiResult<Json<TicketDetail>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     get_ticket(State(api), AxumPath(path.id)).await
+}
+
+async fn scoped_ticket_backend_operation(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Json(operation): Json<TicketBackendOperation>,
+) -> ApiResult<Json<TicketBackendHttpResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let backend = LocalTicketBackend::new(
+        api.config
+            .workspace_root
+            .join(ticket::config::DEFAULT_TICKET_BACKEND_RELATIVE_PATH),
+    );
+    let response = match execute_ticket_backend_operation(&backend, operation) {
+        Ok(result) => TicketBackendHttpResponse::Ok { result },
+        Err(error) => TicketBackendHttpResponse::Error {
+            message: error.to_string(),
+        },
+    };
+    Ok(Json(response))
 }
 
 async fn scoped_list_objectives(
@@ -6265,6 +6301,7 @@ mod tests {
             initial_input: None,
             working_directory_request: None,
             working_directory: None,
+            workspace_api: None,
         }
     }
 

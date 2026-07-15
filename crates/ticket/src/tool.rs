@@ -13,10 +13,11 @@ use serde_json::{Value, json};
 
 use crate::{
     AcceptedOrchestrationPlan, LocalTicketBackend, MarkdownText, NewOrchestrationPlanRecord,
-    NewTicket, NewTicketEvent, NewTicketRelation, OrchestrationPlanKind, Ticket, TicketBackend,
-    TicketDoctorDiagnostic, TicketDoctorReport, TicketDoctorSeverity, TicketError, TicketEventKind,
-    TicketIdOrSlug, TicketIntakeSummary, TicketRelationKind, TicketReview, TicketReviewResult,
-    TicketStateChange, TicketSummary, TicketWorkflowState,
+    NewTicket, NewTicketEvent, NewTicketRelation, OrchestrationPlanKind, OrchestrationPlanRecord,
+    Result as TicketResult, Ticket, TicketBackend, TicketDoctorDiagnostic, TicketDoctorReport,
+    TicketDoctorSeverity, TicketError, TicketEventKind, TicketIdOrSlug, TicketIntakeSummary,
+    TicketRef, TicketRelation, TicketRelationKind, TicketRelationView, TicketReview,
+    TicketReviewResult, TicketStateChange, TicketSummary, TicketWorkflowState,
 };
 
 const DEFAULT_LIST_LIMIT: usize = 50;
@@ -164,6 +165,160 @@ pub fn ticket_tool_description(name: &str, record_language: Option<&str>) -> Str
         description.push_str(". Use this language for durable Ticket record and Ticket tool body text, including Ticket item bodies, thread comments/plans/decisions/implementation reports, reviews, resolutions, intake summaries, and orchestration plan notes. This policy is distinct from worker.language for normal prose and memory.language for Memory/Knowledge. Preserve protocol literals, file paths, commands, logs, identifiers, and quoted external text when translation would reduce fidelity.");
     }
     description
+}
+
+/// Backend object used by the LLM-facing Ticket tools.
+///
+/// Tool execution is intentionally parameterized by this wrapper rather than by
+/// `LocalTicketBackend` so Worker hosts can supply an API-backed implementation
+/// without changing the model-visible tool surface.
+#[derive(Clone)]
+pub struct TicketToolBackend {
+    backend: Arc<dyn TicketBackend + Send + Sync>,
+    record_language: Option<String>,
+}
+
+impl TicketToolBackend {
+    pub fn new<B>(backend: B) -> Self
+    where
+        B: TicketBackend + Send + Sync + 'static,
+    {
+        Self {
+            backend: Arc::new(backend),
+            record_language: None,
+        }
+    }
+
+    pub fn with_record_language(mut self, language: Option<&str>) -> Self {
+        self.record_language = language
+            .map(str::trim)
+            .filter(|language| !language.is_empty())
+            .map(str::to_string);
+        self
+    }
+
+    pub fn record_language(&self) -> Option<&str> {
+        self.record_language.as_deref()
+    }
+}
+
+impl From<LocalTicketBackend> for TicketToolBackend {
+    fn from(backend: LocalTicketBackend) -> Self {
+        let record_language = backend.record_language().map(str::to_string);
+        Self::new(backend).with_record_language(record_language.as_deref())
+    }
+}
+
+impl TicketBackend for TicketToolBackend {
+    fn default_intake_ready_state_change_body(&self, from: &str) -> String {
+        self.backend.default_intake_ready_state_change_body(from)
+    }
+
+    fn list(&self, filter: crate::TicketFilter) -> TicketResult<Vec<TicketSummary>> {
+        self.backend.list(filter)
+    }
+
+    fn show(&self, id: TicketIdOrSlug) -> TicketResult<Ticket> {
+        self.backend.show(id)
+    }
+
+    fn create(&self, input: NewTicket) -> TicketResult<TicketRef> {
+        self.backend.create(input)
+    }
+
+    fn add_event(&self, id: TicketIdOrSlug, event: NewTicketEvent) -> TicketResult<()> {
+        self.backend.add_event(id, event)
+    }
+
+    fn add_state_changed(&self, id: TicketIdOrSlug, change: TicketStateChange) -> TicketResult<()> {
+        self.backend.add_state_changed(id, change)
+    }
+
+    fn add_intake_summary(
+        &self,
+        id: TicketIdOrSlug,
+        summary: TicketIntakeSummary,
+    ) -> TicketResult<()> {
+        self.backend.add_intake_summary(id, summary)
+    }
+
+    fn set_state_field(
+        &self,
+        id: TicketIdOrSlug,
+        field: &str,
+        change: TicketStateChange,
+    ) -> TicketResult<()> {
+        self.backend.set_state_field(id, field, change)
+    }
+
+    fn set_workflow_state(
+        &self,
+        id: TicketIdOrSlug,
+        change: TicketStateChange,
+    ) -> TicketResult<()> {
+        self.backend.set_workflow_state(id, change)
+    }
+
+    fn mark_intake_ready(
+        &self,
+        id: TicketIdOrSlug,
+        summary: TicketIntakeSummary,
+        change: TicketStateChange,
+    ) -> TicketResult<()> {
+        self.backend.mark_intake_ready(id, summary, change)
+    }
+
+    fn queue_ready(&self, id: TicketIdOrSlug, queued_by: &str) -> TicketResult<()> {
+        self.backend.queue_ready(id, queued_by)
+    }
+
+    fn review(&self, id: TicketIdOrSlug, review: TicketReview) -> TicketResult<()> {
+        self.backend.review(id, review)
+    }
+
+    fn close(&self, id: TicketIdOrSlug, resolution: MarkdownText) -> TicketResult<()> {
+        self.backend.close(id, resolution)
+    }
+
+    fn add_ticket_relation(
+        &self,
+        id: TicketIdOrSlug,
+        relation: NewTicketRelation,
+    ) -> TicketResult<TicketRelation> {
+        self.backend.add_ticket_relation(id, relation)
+    }
+
+    fn query_ticket_relations(
+        &self,
+        ticket: Option<TicketIdOrSlug>,
+        kind: Option<TicketRelationKind>,
+    ) -> TicketResult<Vec<TicketRelation>> {
+        self.backend.query_ticket_relations(ticket, kind)
+    }
+
+    fn relation_view(&self, id: TicketIdOrSlug) -> TicketResult<TicketRelationView> {
+        self.backend.relation_view(id)
+    }
+
+    fn add_orchestration_plan_record(
+        &self,
+        id: TicketIdOrSlug,
+        record: NewOrchestrationPlanRecord,
+    ) -> TicketResult<OrchestrationPlanRecord> {
+        self.backend.add_orchestration_plan_record(id, record)
+    }
+
+    fn query_orchestration_plan_records(
+        &self,
+        ticket: Option<TicketIdOrSlug>,
+        kind: Option<OrchestrationPlanKind>,
+    ) -> TicketResult<Vec<OrchestrationPlanRecord>> {
+        self.backend.query_orchestration_plan_records(ticket, kind)
+    }
+
+    fn doctor(&self) -> TicketResult<TicketDoctorReport> {
+        self.backend.doctor()
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -565,67 +720,67 @@ struct TicketDoctorOutput {
 
 #[derive(Clone)]
 struct TicketCreateTool {
-    backend: LocalTicketBackend,
+    backend: TicketToolBackend,
 }
 
 #[derive(Clone)]
 struct TicketListTool {
-    backend: LocalTicketBackend,
+    backend: TicketToolBackend,
 }
 
 #[derive(Clone)]
 struct TicketShowTool {
-    backend: LocalTicketBackend,
+    backend: TicketToolBackend,
 }
 
 #[derive(Clone)]
 struct TicketCommentTool {
-    backend: LocalTicketBackend,
+    backend: TicketToolBackend,
 }
 
 #[derive(Clone)]
 struct TicketReviewTool {
-    backend: LocalTicketBackend,
+    backend: TicketToolBackend,
 }
 
 #[derive(Clone)]
 struct TicketIntakeReadyTool {
-    backend: LocalTicketBackend,
+    backend: TicketToolBackend,
 }
 
 #[derive(Clone)]
 struct TicketWorkflowStateTool {
-    backend: LocalTicketBackend,
+    backend: TicketToolBackend,
 }
 
 #[derive(Clone)]
 struct TicketCloseTool {
-    backend: LocalTicketBackend,
+    backend: TicketToolBackend,
 }
 
 #[derive(Clone)]
 struct TicketRelationRecordTool {
-    backend: LocalTicketBackend,
+    backend: TicketToolBackend,
 }
 
 #[derive(Clone)]
 struct TicketRelationQueryTool {
-    backend: LocalTicketBackend,
+    backend: TicketToolBackend,
 }
 
 #[derive(Clone)]
 struct TicketOrchestrationPlanRecordTool {
-    backend: LocalTicketBackend,
+    backend: TicketToolBackend,
 }
 
 #[derive(Clone)]
 struct TicketOrchestrationPlanQueryTool {
-    backend: LocalTicketBackend,
+    backend: TicketToolBackend,
 }
 
 #[derive(Clone)]
 struct TicketDoctorTool {
-    backend: LocalTicketBackend,
+    backend: TicketToolBackend,
 }
 
 #[async_trait]
@@ -1308,9 +1463,9 @@ fn json_output(summary: String, value: impl Serialize) -> ToolOutput {
     }
 }
 
-fn tool_definition<T>(name: &'static str, backend: LocalTicketBackend) -> ToolDefinition
+fn tool_definition<T>(name: &'static str, backend: TicketToolBackend) -> ToolDefinition
 where
-    T: Tool + From<LocalTicketBackend> + 'static,
+    T: Tool + From<TicketToolBackend> + 'static,
 {
     let description = ticket_tool_description(name, backend.record_language());
     Arc::new(move || {
@@ -1355,8 +1510,8 @@ fn input_schema(name: &str) -> Value {
 
 macro_rules! impl_from_backend {
     ($tool:ident) => {
-        impl From<LocalTicketBackend> for $tool {
-            fn from(backend: LocalTicketBackend) -> Self {
+        impl From<TicketToolBackend> for $tool {
+            fn from(backend: TicketToolBackend) -> Self {
                 Self { backend }
             }
         }
@@ -1377,8 +1532,9 @@ impl_from_backend!(TicketOrchestrationPlanRecordTool);
 impl_from_backend!(TicketOrchestrationPlanQueryTool);
 impl_from_backend!(TicketDoctorTool);
 
-/// Build all MVP Ticket tool definitions over one local backend root.
-pub fn ticket_tools(backend: LocalTicketBackend) -> Vec<ToolDefinition> {
+/// Build all MVP Ticket tool definitions over the supplied backend.
+pub fn ticket_tools(backend: impl Into<TicketToolBackend>) -> Vec<ToolDefinition> {
+    let backend = backend.into();
     vec![
         tool_definition::<TicketCreateTool>("TicketCreate", backend.clone()),
         tool_definition::<TicketListTool>("TicketList", backend.clone()),
@@ -1416,7 +1572,7 @@ mod tests {
         tool
     }
 
-    fn tool_by_name(backend: LocalTicketBackend, name: &str) -> Arc<dyn Tool> {
+    fn tool_by_name(backend: impl Into<TicketToolBackend>, name: &str) -> Arc<dyn Tool> {
         ticket_tools(backend)
             .into_iter()
             .find_map(|definition| {
@@ -1426,7 +1582,7 @@ mod tests {
             .expect("tool exists")
     }
 
-    fn tool_description_by_name(backend: LocalTicketBackend, name: &str) -> String {
+    fn tool_description_by_name(backend: impl Into<TicketToolBackend>, name: &str) -> String {
         ticket_tools(backend)
             .into_iter()
             .find_map(|definition| {
@@ -2303,7 +2459,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let create = tool(tool_definition::<TicketCreateTool>(
             "TicketCreate",
-            backend(&temp),
+            backend(&temp).into(),
         ));
         let _ = create;
     }

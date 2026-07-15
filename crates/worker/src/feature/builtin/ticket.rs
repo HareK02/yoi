@@ -7,12 +7,18 @@
 use std::path::{Path, PathBuf};
 
 use ticket::{
-    LocalTicketBackend,
+    LocalTicketBackend, MarkdownText, NewOrchestrationPlanRecord, NewTicket, NewTicketEvent,
+    NewTicketRelation, OrchestrationPlanKind, OrchestrationPlanRecord, Result as TicketResult,
+    Ticket, TicketBackend, TicketBackendHttpResponse, TicketBackendOperation,
+    TicketBackendOperationResult, TicketDoctorReport, TicketError, TicketFilter, TicketIdOrSlug,
+    TicketIntakeSummary, TicketRef, TicketRelation, TicketRelationKind, TicketRelationView,
+    TicketReview, TicketStateChange, TicketSummary,
     config::{DEFAULT_TICKET_BACKEND_RELATIVE_PATH, TicketConfig},
     tool::{
         TICKET_BASE_READ_ONLY_TOOL_NAMES, TICKET_BASE_TOOL_NAMES,
         TICKET_ORCHESTRATION_READ_ONLY_TOOL_NAMES, TICKET_ORCHESTRATION_TOOL_NAMES,
-        TICKET_READ_ONLY_TOOL_NAMES, TICKET_TOOL_NAMES, ticket_tool_description, ticket_tools,
+        TICKET_READ_ONLY_TOOL_NAMES, TICKET_TOOL_NAMES, TicketToolBackend, ticket_tool_description,
+        ticket_tools,
     },
 };
 
@@ -51,8 +57,39 @@ impl TicketFeatureAccess {
 }
 
 #[derive(Clone, Debug)]
+pub enum TicketFeatureBackend {
+    Local {
+        root: PathBuf,
+    },
+    WorkspaceHttp {
+        workspace_id: String,
+        base_url: String,
+    },
+}
+
+impl From<PathBuf> for TicketFeatureBackend {
+    fn from(root: PathBuf) -> Self {
+        Self::Local { root }
+    }
+}
+
+impl From<&Path> for TicketFeatureBackend {
+    fn from(root: &Path) -> Self {
+        Self::Local {
+            root: root.to_path_buf(),
+        }
+    }
+}
+
+impl From<&PathBuf> for TicketFeatureBackend {
+    fn from(root: &PathBuf) -> Self {
+        Self::Local { root: root.clone() }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct TicketFeature {
-    backend_root: PathBuf,
+    backend: TicketFeatureBackend,
     record_language: Option<String>,
     config_error: Option<String>,
     access: TicketFeatureAccess,
@@ -74,8 +111,22 @@ impl TicketFeature {
         access: Option<TicketFeatureAccess>,
         include_orchestration_tools: bool,
     ) -> Self {
+        Self::with_backend(
+            TicketFeatureBackend::Local {
+                root: backend_root.into(),
+            },
+            access,
+            include_orchestration_tools,
+        )
+    }
+
+    pub fn with_backend(
+        backend: TicketFeatureBackend,
+        access: Option<TicketFeatureAccess>,
+        include_orchestration_tools: bool,
+    ) -> Self {
         Self {
-            backend_root: backend_root.into(),
+            backend,
             record_language: None,
             config_error: None,
             access: access.unwrap_or(TicketFeatureAccess::Lifecycle),
@@ -113,7 +164,9 @@ impl TicketFeature {
             Err(error) => {
                 let access_value = access.unwrap_or(TicketFeatureAccess::Lifecycle);
                 Self {
-                    backend_root: workspace.join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH),
+                    backend: TicketFeatureBackend::Local {
+                        root: workspace.join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH),
+                    },
                     record_language: None,
                     config_error: Some(error.to_string()),
                     access: access_value,
@@ -124,8 +177,11 @@ impl TicketFeature {
         }
     }
 
-    pub fn backend_root(&self) -> &Path {
-        &self.backend_root
+    pub fn backend_root(&self) -> Option<&Path> {
+        match &self.backend {
+            TicketFeatureBackend::Local { root } => Some(root),
+            TicketFeatureBackend::WorkspaceHttp { .. } => None,
+        }
     }
 
     pub fn access(&self) -> TicketFeatureAccess {
@@ -150,14 +206,51 @@ impl TicketFeature {
     }
 
     fn usable_backend_root(&self) -> Result<PathBuf, String> {
-        let root = self
-            .backend_root
+        let Some(root) = self.backend_root() else {
+            return Err("ticket backend is not local filesystem backed".to_string());
+        };
+        let root = root
             .canonicalize()
             .map_err(|error| format!("ticket backend root is not usable: {error}"))?;
         if !root.is_dir() {
             return Err("ticket backend root is not a directory".to_string());
         }
         Ok(root)
+    }
+    fn tool_backend(&self, context: &mut FeatureInstallContext<'_>) -> Option<TicketToolBackend> {
+        match &self.backend {
+            TicketFeatureBackend::Local { root: _ } => {
+                let usable_root = match self.usable_backend_root() {
+                    Ok(root) => root,
+                    Err(reason) => {
+                        context
+                            .diagnostics()
+                            .push(FeatureDiagnostic::warning(format!(
+                                "Ticket tools not registered: {reason}; root={} ",
+                                self.backend_root()
+                                    .map(|root| root.display().to_string())
+                                    .unwrap_or_else(|| "<non-local>".to_string())
+                            )));
+                        return None;
+                    }
+                };
+                Some(
+                    LocalTicketBackend::new(usable_root)
+                        .with_record_language(self.record_language.as_deref())
+                        .into(),
+                )
+            }
+            TicketFeatureBackend::WorkspaceHttp {
+                workspace_id,
+                base_url,
+            } => Some(
+                TicketToolBackend::new(WorkspaceHttpTicketBackend::new(
+                    workspace_id.clone(),
+                    base_url.clone(),
+                ))
+                .with_record_language(self.record_language.as_deref()),
+            ),
+        }
     }
 }
 
@@ -184,20 +277,9 @@ impl FeatureModule for TicketFeature {
                 )));
             return Ok(());
         }
-        let usable_root = match self.usable_backend_root() {
-            Ok(root) => root,
-            Err(reason) => {
-                context
-                    .diagnostics()
-                    .push(FeatureDiagnostic::warning(format!(
-                        "Ticket tools not registered: {reason}; root={} ",
-                        self.backend_root.display()
-                    )));
-                return Ok(());
-            }
+        let Some(backend) = self.tool_backend(context) else {
+            return Ok(());
         };
-        let backend = LocalTicketBackend::new(usable_root)
-            .with_record_language(self.record_language.as_deref());
         let allowed_tool_names = self.enabled_tool_names();
         let mut tools = context.tools();
         for definition in ticket_tools(backend) {
@@ -215,6 +297,275 @@ impl FeatureModule for TicketFeature {
     }
 }
 
+#[derive(Clone, Debug)]
+struct WorkspaceHttpTicketBackend {
+    workspace_id: String,
+    base_url: String,
+    client: reqwest::blocking::Client,
+}
+
+impl WorkspaceHttpTicketBackend {
+    fn new(workspace_id: String, base_url: String) -> Self {
+        Self {
+            workspace_id,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            client: reqwest::blocking::Client::new(),
+        }
+    }
+
+    fn endpoint(&self) -> String {
+        format!(
+            "{}/api/w/{}/tickets/backend",
+            self.base_url, self.workspace_id
+        )
+    }
+
+    fn invoke(
+        &self,
+        operation: TicketBackendOperation,
+    ) -> TicketResult<TicketBackendOperationResult> {
+        let body = serde_json::to_string(&operation).map_err(|error| {
+            TicketError::Conflict(format!("serialize ticket operation: {error}"))
+        })?;
+        let response = self
+            .client
+            .post(self.endpoint())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .map_err(|error| {
+                TicketError::Conflict(format!("ticket backend request failed: {error}"))
+            })?;
+        let status = response.status();
+        let text = response.text().map_err(|error| {
+            TicketError::Conflict(format!("ticket backend response failed: {error}"))
+        })?;
+        if !status.is_success() {
+            return Err(TicketError::Conflict(format!(
+                "ticket backend returned HTTP {status}: {text}"
+            )));
+        }
+        match serde_json::from_str::<TicketBackendHttpResponse>(&text).map_err(|error| {
+            TicketError::Conflict(format!("decode ticket backend response: {error}"))
+        })? {
+            TicketBackendHttpResponse::Ok { result } => Ok(result),
+            TicketBackendHttpResponse::Error { message } => Err(TicketError::Conflict(message)),
+        }
+    }
+}
+
+macro_rules! expect_ticket_result {
+    ($expr:expr, $variant:path) => {
+        match $expr? {
+            $variant(value) => Ok(value),
+            other => Err(TicketError::Conflict(format!(
+                "unexpected ticket backend response: {other:?}"
+            ))),
+        }
+    };
+}
+
+impl TicketBackend for WorkspaceHttpTicketBackend {
+    fn default_intake_ready_state_change_body(&self, from: &str) -> String {
+        match self.invoke(TicketBackendOperation::DefaultIntakeReadyStateChangeBody {
+            from: from.to_string(),
+        }) {
+            Ok(TicketBackendOperationResult::Text(value)) => value,
+            Ok(other) => format!("unexpected ticket backend response: {other:?}"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    fn list(&self, filter: TicketFilter) -> TicketResult<Vec<TicketSummary>> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::List { filter }),
+            TicketBackendOperationResult::Tickets
+        )
+    }
+
+    fn show(&self, id: TicketIdOrSlug) -> TicketResult<Ticket> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::Show { id }),
+            TicketBackendOperationResult::Ticket
+        )
+    }
+
+    fn create(&self, input: NewTicket) -> TicketResult<TicketRef> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::Create { input }),
+            TicketBackendOperationResult::TicketRef
+        )
+    }
+
+    fn add_event(&self, id: TicketIdOrSlug, event: NewTicketEvent) -> TicketResult<()> {
+        match self.invoke(TicketBackendOperation::AddEvent { id, event })? {
+            TicketBackendOperationResult::Unit => Ok(()),
+            other => Err(TicketError::Conflict(format!(
+                "unexpected ticket backend response: {other:?}"
+            ))),
+        }
+    }
+
+    fn add_state_changed(&self, id: TicketIdOrSlug, change: TicketStateChange) -> TicketResult<()> {
+        match self.invoke(TicketBackendOperation::AddStateChanged { id, change })? {
+            TicketBackendOperationResult::Unit => Ok(()),
+            other => Err(TicketError::Conflict(format!(
+                "unexpected ticket backend response: {other:?}"
+            ))),
+        }
+    }
+
+    fn add_intake_summary(
+        &self,
+        id: TicketIdOrSlug,
+        summary: TicketIntakeSummary,
+    ) -> TicketResult<()> {
+        match self.invoke(TicketBackendOperation::AddIntakeSummary { id, summary })? {
+            TicketBackendOperationResult::Unit => Ok(()),
+            other => Err(TicketError::Conflict(format!(
+                "unexpected ticket backend response: {other:?}"
+            ))),
+        }
+    }
+
+    fn set_state_field(
+        &self,
+        id: TicketIdOrSlug,
+        field: &str,
+        change: TicketStateChange,
+    ) -> TicketResult<()> {
+        match self.invoke(TicketBackendOperation::SetStateField {
+            id,
+            field: field.to_string(),
+            change,
+        })? {
+            TicketBackendOperationResult::Unit => Ok(()),
+            other => Err(TicketError::Conflict(format!(
+                "unexpected ticket backend response: {other:?}"
+            ))),
+        }
+    }
+
+    fn set_workflow_state(
+        &self,
+        id: TicketIdOrSlug,
+        change: TicketStateChange,
+    ) -> TicketResult<()> {
+        match self.invoke(TicketBackendOperation::SetWorkflowState { id, change })? {
+            TicketBackendOperationResult::Unit => Ok(()),
+            other => Err(TicketError::Conflict(format!(
+                "unexpected ticket backend response: {other:?}"
+            ))),
+        }
+    }
+
+    fn mark_intake_ready(
+        &self,
+        id: TicketIdOrSlug,
+        summary: TicketIntakeSummary,
+        change: TicketStateChange,
+    ) -> TicketResult<()> {
+        match self.invoke(TicketBackendOperation::MarkIntakeReady {
+            id,
+            summary,
+            change,
+        })? {
+            TicketBackendOperationResult::Unit => Ok(()),
+            other => Err(TicketError::Conflict(format!(
+                "unexpected ticket backend response: {other:?}"
+            ))),
+        }
+    }
+
+    fn queue_ready(&self, id: TicketIdOrSlug, queued_by: &str) -> TicketResult<()> {
+        match self.invoke(TicketBackendOperation::QueueReady {
+            id,
+            queued_by: queued_by.to_string(),
+        })? {
+            TicketBackendOperationResult::Unit => Ok(()),
+            other => Err(TicketError::Conflict(format!(
+                "unexpected ticket backend response: {other:?}"
+            ))),
+        }
+    }
+
+    fn review(&self, id: TicketIdOrSlug, review: TicketReview) -> TicketResult<()> {
+        match self.invoke(TicketBackendOperation::Review { id, review })? {
+            TicketBackendOperationResult::Unit => Ok(()),
+            other => Err(TicketError::Conflict(format!(
+                "unexpected ticket backend response: {other:?}"
+            ))),
+        }
+    }
+
+    fn close(&self, id: TicketIdOrSlug, resolution: MarkdownText) -> TicketResult<()> {
+        match self.invoke(TicketBackendOperation::Close { id, resolution })? {
+            TicketBackendOperationResult::Unit => Ok(()),
+            other => Err(TicketError::Conflict(format!(
+                "unexpected ticket backend response: {other:?}"
+            ))),
+        }
+    }
+
+    fn add_ticket_relation(
+        &self,
+        id: TicketIdOrSlug,
+        relation: NewTicketRelation,
+    ) -> TicketResult<TicketRelation> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::AddTicketRelation { id, relation }),
+            TicketBackendOperationResult::Relation
+        )
+    }
+
+    fn query_ticket_relations(
+        &self,
+        ticket: Option<TicketIdOrSlug>,
+        kind: Option<TicketRelationKind>,
+    ) -> TicketResult<Vec<TicketRelation>> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::QueryTicketRelations { ticket, kind }),
+            TicketBackendOperationResult::Relations
+        )
+    }
+
+    fn relation_view(&self, id: TicketIdOrSlug) -> TicketResult<TicketRelationView> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::RelationView { id }),
+            TicketBackendOperationResult::RelationView
+        )
+    }
+
+    fn add_orchestration_plan_record(
+        &self,
+        id: TicketIdOrSlug,
+        record: NewOrchestrationPlanRecord,
+    ) -> TicketResult<OrchestrationPlanRecord> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::AddOrchestrationPlanRecord { id, record }),
+            TicketBackendOperationResult::OrchestrationPlanRecord
+        )
+    }
+
+    fn query_orchestration_plan_records(
+        &self,
+        ticket: Option<TicketIdOrSlug>,
+        kind: Option<OrchestrationPlanKind>,
+    ) -> TicketResult<Vec<OrchestrationPlanRecord>> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::QueryOrchestrationPlanRecords { ticket, kind }),
+            TicketBackendOperationResult::OrchestrationPlanRecords
+        )
+    }
+
+    fn doctor(&self) -> TicketResult<TicketDoctorReport> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::Doctor),
+            TicketBackendOperationResult::DoctorReport
+        )
+    }
+}
+
 pub fn ticket_tools_feature(workspace: impl AsRef<Path>) -> TicketFeature {
     TicketFeature::for_workspace(workspace)
 }
@@ -227,11 +578,11 @@ pub fn ticket_tools_feature_with_access(
 }
 
 pub fn ticket_tools_feature_with_options(
-    workspace: impl AsRef<Path>,
+    backend: impl Into<TicketFeatureBackend>,
     access: Option<TicketFeatureAccess>,
     include_orchestration_tools: bool,
 ) -> TicketFeature {
-    TicketFeature::for_workspace_with_options(workspace, access, include_orchestration_tools)
+    TicketFeature::with_backend(backend.into(), access, include_orchestration_tools)
 }
 
 #[cfg(test)]
@@ -239,6 +590,9 @@ mod tests {
     use super::*;
     use crate::feature::{FeatureRegistryBuilder, FeatureRuntimeKind};
     use crate::hook::HookRegistryBuilder;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
     use tempfile::TempDir;
     use ticket::tool::{
         TICKET_BASE_TOOL_NAMES, TICKET_ORCHESTRATION_TOOL_NAMES, TICKET_READ_ONLY_TOOL_NAMES,
@@ -510,7 +864,10 @@ profile = "project:coder"
         make_ticket_root(&temp.path().join("tickets"));
 
         let feature = ticket_tools_feature(temp.path());
-        assert_eq!(feature.backend_root(), temp.path().join("tickets"));
+        assert_eq!(
+            feature.backend_root(),
+            Some(temp.path().join("tickets").as_path())
+        );
 
         let mut pending_tools = Vec::new();
         let mut hooks = HookRegistryBuilder::default();
@@ -610,5 +967,42 @@ provider = "github"
         assert!(!root.join("open").exists());
         assert!(!root.join("pending").exists());
         assert!(!root.join("closed").exists());
+    }
+
+    #[test]
+    fn workspace_http_backend_executes_ticket_create_operation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 8192];
+            let len = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..len]);
+            assert!(request.starts_with("POST /api/w/workspace-a/tickets/backend HTTP/1.1"));
+            assert!(request.contains("\"operation\":\"create\""));
+            assert!(request.contains("\"title\":\"HTTP ticket\""));
+            let response_body = serde_json::to_string(&TicketBackendHttpResponse::Ok {
+                result: TicketBackendOperationResult::TicketRef(TicketRef {
+                    id: "01TEST".to_string(),
+                    slug: "http-ticket".to_string(),
+                    status: ticket::TicketStatus::Open,
+                }),
+            })
+            .unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .unwrap();
+        });
+
+        let backend = WorkspaceHttpTicketBackend::new("workspace-a".to_string(), base_url);
+        let created = backend.create(NewTicket::new("HTTP ticket")).unwrap();
+
+        server.join().unwrap();
+        assert_eq!(created.id, "01TEST");
+        assert_eq!(created.slug, "http-ticket");
     }
 }

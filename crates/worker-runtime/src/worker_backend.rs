@@ -39,7 +39,7 @@ use tokio::sync::broadcast;
 
 use worker::{
     PromptLoader, Worker, WorkerController, WorkerError, WorkerFilesystemAuthority, WorkerHandle,
-    WorkerWorkspaceContext, WorkspaceId,
+    WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
 };
 
 const DEFAULT_BACKEND_ID: &str = "worker-crate";
@@ -240,10 +240,29 @@ impl ProfileRuntimeWorkerFactory {
 #[derive(Debug, Clone)]
 enum RuntimeWorkspaceBackendRef {
     None,
-    LocalFilesystem { root: PathBuf },
+    LocalFilesystem {
+        root: PathBuf,
+    },
+    Http {
+        workspace_id: String,
+        base_url: String,
+    },
 }
 
 impl RuntimeWorkspaceBackendRef {
+    fn from_worker_request(
+        request: &CreateWorkerRequest,
+        binding: Option<&WorkingDirectoryBinding>,
+    ) -> Self {
+        if let Some(api) = request.workspace_api.as_ref() {
+            return Self::Http {
+                workspace_id: api.workspace_id.clone(),
+                base_url: api.base_url.clone(),
+            };
+        }
+        Self::from_working_directory(binding)
+    }
+
     fn from_working_directory(binding: Option<&WorkingDirectoryBinding>) -> Self {
         match binding {
             Some(binding) => Self::LocalFilesystem {
@@ -257,6 +276,13 @@ impl RuntimeWorkspaceBackendRef {
         match self {
             Self::None => WorkerWorkspaceContext::no_workspace(),
             Self::LocalFilesystem { root } => local_workspace_context(root),
+            Self::Http {
+                workspace_id,
+                base_url,
+            } => WorkerWorkspaceContext::with_client(
+                WorkspaceId::new(workspace_id.clone()).ok(),
+                WorkspaceClient::http(workspace_id.clone(), base_url.clone()),
+            ),
         }
     }
 }
@@ -350,8 +376,10 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 )
             })
             .unwrap_or(WorkerFilesystemAuthority::None);
-        let workspace_backend_ref =
-            RuntimeWorkspaceBackendRef::from_working_directory(request.working_directory.as_ref());
+        let workspace_backend_ref = RuntimeWorkspaceBackendRef::from_worker_request(
+            &request.request,
+            request.working_directory.as_ref(),
+        );
         let workspace_context = workspace_backend_ref.worker_context();
         let selector = profile.as_deref().unwrap_or("builtin:default");
         let archive = self
@@ -422,8 +450,10 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 )
             })
             .unwrap_or(WorkerFilesystemAuthority::None);
-        let workspace_backend_ref =
-            RuntimeWorkspaceBackendRef::from_working_directory(request.working_directory.as_ref());
+        let workspace_backend_ref = RuntimeWorkspaceBackendRef::from_worker_request(
+            &request.request,
+            request.working_directory.as_ref(),
+        );
         let workspace_context = workspace_backend_ref.worker_context();
         let (manifest, loader) = Self::restore_fallback_manifest(&worker_name)?;
 
@@ -1187,6 +1217,7 @@ mod tests {
         store_dir: PathBuf,
         worker_metadata_dir: PathBuf,
         observed_cwds: Arc<Mutex<Vec<PathBuf>>>,
+        observed_workspace_clients: Arc<Mutex<Vec<WorkspaceClient>>>,
     }
 
     #[async_trait]
@@ -1232,10 +1263,15 @@ mod tests {
                 .as_ref()
                 .map(|binding| binding.root().to_path_buf())
                 .unwrap_or_else(|| self.cwd.clone());
-            let workspace_backend_ref = RuntimeWorkspaceBackendRef::from_working_directory(
+            let workspace_backend_ref = RuntimeWorkspaceBackendRef::from_worker_request(
+                &request.request,
                 request.working_directory.as_ref(),
             );
             let workspace_context = workspace_backend_ref.worker_context();
+            self.observed_workspace_clients
+                .lock()
+                .unwrap()
+                .push(workspace_context.client().clone());
             let scope = Scope::writable(&scope_root).map_err(|err| err.to_string())?;
             let worker = Worker::new(
                 manifest,
@@ -1354,6 +1390,7 @@ mod tests {
             initial_input: None,
             working_directory_request: None,
             working_directory: None,
+            workspace_api: None,
         }
     }
 
@@ -1454,6 +1491,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let store = tempfile::tempdir().unwrap();
         let observed_cwds = Arc::new(Mutex::new(Vec::new()));
+        let observed_workspace_clients = Arc::new(Mutex::new(Vec::new()));
         let factory = MockFactory {
             client: client.clone(),
             runtime_base: runtime_base.path().to_path_buf(),
@@ -1461,13 +1499,19 @@ mod tests {
             store_dir: store.path().join("sessions"),
             worker_metadata_dir: store.path().join("workers"),
             observed_cwds: observed_cwds.clone(),
+            observed_workspace_clients: observed_workspace_clients.clone(),
         };
         let backend = WorkerRuntimeExecutionBackend::new(factory).unwrap();
         let runtime =
             EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), Arc::new(backend))
                 .unwrap();
         runtime.store_config_bundle(test_bundle()).unwrap();
-        let detail = runtime.create_worker(create_request("chat")).unwrap();
+        let mut request = create_request("chat");
+        request.workspace_api = Some(crate::catalog::WorkspaceApiRef {
+            workspace_id: "ws-test".to_string(),
+            base_url: "http://127.0.0.1:3999".to_string(),
+        });
+        let detail = runtime.create_worker(request).unwrap();
 
         runtime
             .send_input(&detail.worker_ref, WorkerInput::user("say hello"))
@@ -1495,6 +1539,10 @@ mod tests {
 
         assert_eq!(client.captured.lock().unwrap().len(), 1);
         assert!(observed_cwds.lock().unwrap().is_empty());
+        assert_eq!(
+            observed_workspace_clients.lock().unwrap().as_slice(),
+            &[WorkspaceClient::http("ws-test", "http://127.0.0.1:3999")]
+        );
         let names = captured_tool_names(&client, 0);
         for forbidden in core_filesystem_tool_names() {
             assert!(
@@ -1519,6 +1567,7 @@ mod tests {
         let repo = create_clean_repo();
         let store = tempfile::tempdir().unwrap();
         let observed_cwds = Arc::new(Mutex::new(Vec::new()));
+        let observed_workspace_clients = Arc::new(Mutex::new(Vec::new()));
         let factory = MockFactory {
             client: client.clone(),
             runtime_base: runtime_base.path().to_path_buf(),
@@ -1526,6 +1575,7 @@ mod tests {
             store_dir: store.path().join("sessions"),
             worker_metadata_dir: store.path().join("workers"),
             observed_cwds: observed_cwds.clone(),
+            observed_workspace_clients: observed_workspace_clients.clone(),
         };
         let backend = WorkerRuntimeExecutionBackend::new(factory)
             .unwrap()

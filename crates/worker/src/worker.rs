@@ -135,6 +135,11 @@ pub enum WorkspaceIdError {
 /// adapter code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceClient {
+    /// Runtime/host supplied an HTTP workspace API endpoint.
+    Http {
+        workspace_id: String,
+        base_url: String,
+    },
     /// Runtime/host supplied a workspace API handle. The string is an opaque
     /// diagnostic/backend kind, not an endpoint, path, or secret-bearing value.
     Available { kind: String },
@@ -145,6 +150,13 @@ pub enum WorkspaceClient {
 impl WorkspaceClient {
     pub fn available(kind: impl Into<String>) -> Self {
         Self::Available { kind: kind.into() }
+    }
+
+    pub fn http(workspace_id: impl Into<String>, base_url: impl Into<String>) -> Self {
+        Self::Http {
+            workspace_id: workspace_id.into(),
+            base_url: base_url.into(),
+        }
     }
 
     pub fn unavailable(reason: impl Into<String>) -> Self {
@@ -158,7 +170,7 @@ impl WorkspaceClient {
     }
 
     pub fn is_available(&self) -> bool {
-        matches!(self, Self::Available { .. })
+        matches!(self, Self::Available { .. } | Self::Http { .. })
     }
 }
 

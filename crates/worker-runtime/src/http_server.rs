@@ -982,6 +982,7 @@ mod tests {
             initial_input: None,
             working_directory_request: None,
             working_directory: None,
+            workspace_api: None,
         }
     }
 
@@ -1293,6 +1294,7 @@ mod ws_tests {
             initial_input: None,
             working_directory_request: None,
             working_directory: None,
+            workspace_api: None,
         }
     }
 

@@ -167,6 +167,12 @@ pub struct WorkingDirectoryStatus {
     pub summary: WorkingDirectorySummary,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceApiRef {
+    pub workspace_id: String,
+    pub base_url: String,
+}
+
 /// Canonical Runtime Worker creation request.
 ///
 /// Browser/product launch semantics are resolved by a backend before this
@@ -188,6 +194,8 @@ pub struct CreateWorkerRequest {
     pub working_directory_request: Option<WorkingDirectoryRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<WorkingDirectoryClaim>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_api: Option<WorkspaceApiRef>,
 }
 
 /// Worker lifecycle status for the in-memory embedded runtime.

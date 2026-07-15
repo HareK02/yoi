@@ -82,7 +82,7 @@ fn io_err(path: impl Into<PathBuf>, source: io::Error) -> TicketError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum TicketStatus {
     Open,
     Closed,
@@ -111,7 +111,7 @@ impl fmt::Display for TicketStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ExtensibleTicketStatus {
     Open,
     Closed,
@@ -155,7 +155,8 @@ impl From<TicketStatus> for ExtensibleTicketStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TicketWorkflowState {
     Planning,
     Ready,
@@ -221,7 +222,7 @@ impl fmt::Display for TicketWorkflowState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MarkdownText(pub String);
 
 impl MarkdownText {
@@ -246,7 +247,7 @@ impl From<String> for MarkdownText {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TicketIdOrSlug {
     Id(String),
     Slug(String),
@@ -273,7 +274,8 @@ impl From<String> for TicketIdOrSlug {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TicketEventKind {
     Create,
     Comment,
@@ -340,7 +342,8 @@ impl From<&str> for TicketEventKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TicketReviewResult {
     Approve,
     RequestChanges,
@@ -375,13 +378,13 @@ impl From<&str> for TicketReviewResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketReference {
     pub kind: String,
     pub target: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewTicketEvent {
     pub kind: TicketEventKind,
     pub author: Option<String>,
@@ -400,7 +403,7 @@ impl NewTicketEvent {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketStateChange {
     pub from: String,
     pub to: String,
@@ -428,7 +431,7 @@ impl TicketStateChange {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketIntakeSummary {
     pub author: Option<String>,
     pub body: MarkdownText,
@@ -445,7 +448,7 @@ impl TicketIntakeSummary {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketReview {
     pub result: TicketReviewResult,
     pub author: Option<String>,
@@ -470,7 +473,7 @@ impl TicketReview {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewTicket {
     pub title: String,
     pub slug: Option<String>,
@@ -507,7 +510,7 @@ impl NewTicket {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketFilter {
     pub state: Option<TicketWorkflowState>,
 }
@@ -522,7 +525,7 @@ impl TicketFilter {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketRef {
     pub id: String,
     pub slug: String,
@@ -568,7 +571,7 @@ impl fmt::Display for TicketRelationKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewTicketRelation {
     pub kind: TicketRelationKind,
     pub target: String,
@@ -596,7 +599,7 @@ struct TicketRelationArtifact {
     relations: Vec<TicketRelation>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DerivedTicketRelation {
     pub source_ticket: String,
     pub inverse_kind: String,
@@ -606,7 +609,7 @@ pub struct DerivedTicketRelation {
     pub at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketRelationBlocker {
     pub blocking_ticket: String,
     pub reason_kind: String,
@@ -615,14 +618,14 @@ pub struct TicketRelationBlocker {
     pub blocking_state: TicketWorkflowState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketRelationNotice {
     pub related_ticket: String,
     pub kind: TicketRelationKind,
     pub message: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketRelationView {
     pub outgoing: Vec<TicketRelation>,
     pub incoming: Vec<DerivedTicketRelation>,
@@ -702,7 +705,7 @@ pub struct AcceptedOrchestrationPlan {
     pub role_plan: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewOrchestrationPlanRecord {
     pub kind: OrchestrationPlanKind,
     pub related_ticket: Option<String>,
@@ -727,7 +730,7 @@ pub struct OrchestrationPlanRecord {
     pub at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketMeta {
     pub id: String,
     pub slug: String,
@@ -748,7 +751,7 @@ pub struct TicketMeta {
     pub raw: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketSummary {
     pub id: String,
     pub slug: String,
@@ -765,31 +768,31 @@ pub struct TicketSummary {
     pub updated_at: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketInvalidRecord {
     pub label: String,
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketPartialList {
     pub tickets: Vec<TicketSummary>,
     pub invalid_records: Vec<TicketInvalidRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketPartial {
     pub ticket: Ticket,
     pub invalid_records: Vec<TicketInvalidRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketDocument {
     pub body: MarkdownText,
     pub raw_frontmatter: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketEvent {
     pub kind: TicketEventKind,
     pub author: Option<String>,
@@ -805,13 +808,13 @@ pub struct TicketEvent {
     pub attributes: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketArtifactRef {
     /// Path relative to the ticket's `artifacts/` directory.
     pub relative_path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ticket {
     pub meta: TicketMeta,
     pub document: TicketDocument,
@@ -821,20 +824,20 @@ pub struct Ticket {
     pub resolution: Option<MarkdownText>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TicketDoctorSeverity {
     Error,
     Warning,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketDoctorDiagnostic {
     pub severity: TicketDoctorSeverity,
     pub message: String,
     pub path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketDoctorReport {
     pub diagnostics: Vec<TicketDoctorDiagnostic>,
 }
@@ -869,6 +872,7 @@ impl TicketDoctorReport {
 }
 
 pub trait TicketBackend {
+    fn default_intake_ready_state_change_body(&self, from: &str) -> String;
     fn list(&self, filter: TicketFilter) -> Result<Vec<TicketSummary>>;
     fn show(&self, id: TicketIdOrSlug) -> Result<Ticket>;
     fn create(&self, input: NewTicket) -> Result<TicketRef>;
@@ -913,6 +917,195 @@ pub trait TicketBackend {
         kind: Option<OrchestrationPlanKind>,
     ) -> Result<Vec<OrchestrationPlanRecord>>;
     fn doctor(&self) -> Result<TicketDoctorReport>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum TicketBackendOperation {
+    DefaultIntakeReadyStateChangeBody {
+        from: String,
+    },
+    List {
+        filter: TicketFilter,
+    },
+    Show {
+        id: TicketIdOrSlug,
+    },
+    Create {
+        input: NewTicket,
+    },
+    AddEvent {
+        id: TicketIdOrSlug,
+        event: NewTicketEvent,
+    },
+    AddStateChanged {
+        id: TicketIdOrSlug,
+        change: TicketStateChange,
+    },
+    AddIntakeSummary {
+        id: TicketIdOrSlug,
+        summary: TicketIntakeSummary,
+    },
+    SetStateField {
+        id: TicketIdOrSlug,
+        field: String,
+        change: TicketStateChange,
+    },
+    SetWorkflowState {
+        id: TicketIdOrSlug,
+        change: TicketStateChange,
+    },
+    MarkIntakeReady {
+        id: TicketIdOrSlug,
+        summary: TicketIntakeSummary,
+        change: TicketStateChange,
+    },
+    QueueReady {
+        id: TicketIdOrSlug,
+        queued_by: String,
+    },
+    Review {
+        id: TicketIdOrSlug,
+        review: TicketReview,
+    },
+    Close {
+        id: TicketIdOrSlug,
+        resolution: MarkdownText,
+    },
+    AddTicketRelation {
+        id: TicketIdOrSlug,
+        relation: NewTicketRelation,
+    },
+    QueryTicketRelations {
+        ticket: Option<TicketIdOrSlug>,
+        kind: Option<TicketRelationKind>,
+    },
+    RelationView {
+        id: TicketIdOrSlug,
+    },
+    AddOrchestrationPlanRecord {
+        id: TicketIdOrSlug,
+        record: NewOrchestrationPlanRecord,
+    },
+    QueryOrchestrationPlanRecords {
+        ticket: Option<TicketIdOrSlug>,
+        kind: Option<OrchestrationPlanKind>,
+    },
+    Doctor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "result", content = "value", rename_all = "snake_case")]
+pub enum TicketBackendOperationResult {
+    Text(String),
+    Unit,
+    Tickets(Vec<TicketSummary>),
+    Ticket(Ticket),
+    TicketRef(TicketRef),
+    Relation(TicketRelation),
+    Relations(Vec<TicketRelation>),
+    RelationView(TicketRelationView),
+    OrchestrationPlanRecord(OrchestrationPlanRecord),
+    OrchestrationPlanRecords(Vec<OrchestrationPlanRecord>),
+    DoctorReport(TicketDoctorReport),
+}
+
+pub fn execute_ticket_backend_operation<B>(
+    backend: &B,
+    operation: TicketBackendOperation,
+) -> Result<TicketBackendOperationResult>
+where
+    B: TicketBackend + ?Sized,
+{
+    Ok(match operation {
+        TicketBackendOperation::DefaultIntakeReadyStateChangeBody { from } => {
+            TicketBackendOperationResult::Text(
+                backend.default_intake_ready_state_change_body(&from),
+            )
+        }
+        TicketBackendOperation::List { filter } => {
+            TicketBackendOperationResult::Tickets(backend.list(filter)?)
+        }
+        TicketBackendOperation::Show { id } => {
+            TicketBackendOperationResult::Ticket(backend.show(id)?)
+        }
+        TicketBackendOperation::Create { input } => {
+            TicketBackendOperationResult::TicketRef(backend.create(input)?)
+        }
+        TicketBackendOperation::AddEvent { id, event } => {
+            backend.add_event(id, event)?;
+            TicketBackendOperationResult::Unit
+        }
+        TicketBackendOperation::AddStateChanged { id, change } => {
+            backend.add_state_changed(id, change)?;
+            TicketBackendOperationResult::Unit
+        }
+        TicketBackendOperation::AddIntakeSummary { id, summary } => {
+            backend.add_intake_summary(id, summary)?;
+            TicketBackendOperationResult::Unit
+        }
+        TicketBackendOperation::SetStateField { id, field, change } => {
+            backend.set_state_field(id, &field, change)?;
+            TicketBackendOperationResult::Unit
+        }
+        TicketBackendOperation::SetWorkflowState { id, change } => {
+            backend.set_workflow_state(id, change)?;
+            TicketBackendOperationResult::Unit
+        }
+        TicketBackendOperation::MarkIntakeReady {
+            id,
+            summary,
+            change,
+        } => {
+            backend.mark_intake_ready(id, summary, change)?;
+            TicketBackendOperationResult::Unit
+        }
+        TicketBackendOperation::QueueReady { id, queued_by } => {
+            backend.queue_ready(id, &queued_by)?;
+            TicketBackendOperationResult::Unit
+        }
+        TicketBackendOperation::Review { id, review } => {
+            backend.review(id, review)?;
+            TicketBackendOperationResult::Unit
+        }
+        TicketBackendOperation::Close { id, resolution } => {
+            backend.close(id, resolution)?;
+            TicketBackendOperationResult::Unit
+        }
+        TicketBackendOperation::AddTicketRelation { id, relation } => {
+            TicketBackendOperationResult::Relation(backend.add_ticket_relation(id, relation)?)
+        }
+        TicketBackendOperation::QueryTicketRelations { ticket, kind } => {
+            TicketBackendOperationResult::Relations(backend.query_ticket_relations(ticket, kind)?)
+        }
+        TicketBackendOperation::RelationView { id } => {
+            TicketBackendOperationResult::RelationView(backend.relation_view(id)?)
+        }
+        TicketBackendOperation::AddOrchestrationPlanRecord { id, record } => {
+            TicketBackendOperationResult::OrchestrationPlanRecord(
+                backend.add_orchestration_plan_record(id, record)?,
+            )
+        }
+        TicketBackendOperation::QueryOrchestrationPlanRecords { ticket, kind } => {
+            TicketBackendOperationResult::OrchestrationPlanRecords(
+                backend.query_orchestration_plan_records(ticket, kind)?,
+            )
+        }
+        TicketBackendOperation::Doctor => {
+            TicketBackendOperationResult::DoctorReport(backend.doctor()?)
+        }
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum TicketBackendHttpResponse {
+    Ok {
+        result: TicketBackendOperationResult,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1392,6 +1585,10 @@ impl LocalTicketBackend {
 }
 
 impl TicketBackend for LocalTicketBackend {
+    fn default_intake_ready_state_change_body(&self, from: &str) -> String {
+        self.default_intake_ready_state_change_body(from)
+    }
+
     fn list(&self, filter: TicketFilter) -> Result<Vec<TicketSummary>> {
         let mut tickets = Vec::new();
         for dir in self.iter_ticket_dirs(filter)? {

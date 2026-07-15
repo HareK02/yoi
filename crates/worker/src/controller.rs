@@ -33,7 +33,7 @@ use crate::spawn::tool::spawn_worker_tool;
 use crate::ticket_event_notify::{
     TicketEventCompanionNotifyHook, companion_worker_name_for_workspace,
 };
-use crate::worker::{SystemItemCommitter, Worker, WorkerError, WorkerRunResult};
+use crate::worker::{SystemItemCommitter, Worker, WorkerError, WorkerRunResult, WorkspaceClient};
 use protocol::{
     AlertLevel, AlertSource, ErrorCode, Event, Method, RewindTargetId, RunResult, Segment,
     TurnResult, WorkerStatus,
@@ -715,21 +715,35 @@ where
                 crate::feature::builtin::ticket::TicketFeatureAccess::Lifecycle
             }
         };
-        // Ticket tools are typed operations over the currently checked-out work
-        // tree. They require explicit local filesystem authority and must not
-        // use workspace identity as a cwd fallback.
-        let ticket_cwd = local_filesystem
-            .as_ref()
-            .map(|local| &local.cwd)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "ticket tools require local Worker filesystem authority",
-                )
-            })?;
+        // Ticket tools are typed operations over the current workspace Ticket backend.
+        // Runtime-hosted Workers prefer the workspace API URI carried by the
+        // Worker context; legacy/local Workers fall back to the checked-out worktree.
+        let ticket_backend = match worker.workspace_client() {
+            WorkspaceClient::Http {
+                workspace_id,
+                base_url,
+            } => crate::feature::builtin::ticket::TicketFeatureBackend::WorkspaceHttp {
+                workspace_id: workspace_id.clone(),
+                base_url: base_url.clone(),
+            },
+            _ => {
+                let ticket_cwd = local_filesystem
+                    .as_ref()
+                    .map(|local| &local.cwd)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "ticket tools require local Worker filesystem authority",
+                        )
+                    })?;
+                crate::feature::builtin::ticket::TicketFeatureBackend::Local {
+                    root: ticket_cwd.clone(),
+                }
+            }
+        };
         feature_registry.add_module(
             crate::feature::builtin::ticket::ticket_tools_feature_with_options(
-                ticket_cwd,
+                ticket_backend,
                 feature_config.ticket.enabled.then_some(ticket_access),
                 feature_config.ticket_orchestration.enabled,
             ),

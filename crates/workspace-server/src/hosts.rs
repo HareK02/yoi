@@ -17,7 +17,7 @@ use worker_runtime::catalog::{
     ConfigBundleRef, CreateWorkerRequest, ProfileSelector, ProfileSourceArchiveHttpRef,
     ProfileSourceArchiveSource, WorkerDetail as EmbeddedWorkerDetail,
     WorkerStatus as EmbeddedWorkerStatus, WorkingDirectoryClaim, WorkingDirectoryRequest,
-    WorkingDirectoryStatus, WorkingDirectorySummary,
+    WorkingDirectoryStatus, WorkingDirectorySummary, WorkspaceApiRef,
 };
 use worker_runtime::config_bundle::{ConfigBundle, ConfigBundleAvailability, ConfigBundleSummary};
 #[cfg(test)]
@@ -1182,6 +1182,8 @@ impl RuntimeRegistry {
 pub struct EmbeddedWorkerRuntime {
     runtime_id: String,
     host_id: String,
+    workspace_id: String,
+    backend_base_url: Option<String>,
     runtime: worker_runtime::Runtime,
     execution_enabled: bool,
     resource_broker: BackendResourceBroker,
@@ -1234,10 +1236,18 @@ impl EmbeddedWorkerRuntime {
         self
     }
 
+    pub fn with_backend_base_url(mut self, backend_base_url: impl Into<String>) -> Self {
+        self.backend_base_url = Some(backend_base_url.into().trim_end_matches('/').to_string());
+        self
+    }
+
     pub fn from_runtime(workspace_id: impl AsRef<str>, runtime: worker_runtime::Runtime) -> Self {
+        let workspace_id = workspace_id.as_ref().to_string();
         Self {
             runtime_id: EMBEDDED_RUNTIME_ID.to_string(),
-            host_id: host_id_for_embedded_workspace(workspace_id.as_ref()),
+            host_id: host_id_for_embedded_workspace(&workspace_id),
+            workspace_id,
+            backend_base_url: None,
             runtime,
             execution_enabled: false,
             resource_broker: BackendResourceBroker::default(),
@@ -1556,6 +1566,13 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
             initial_input: request.initial_input.clone(),
             working_directory_request: request.resolved_working_directory_request.clone(),
             working_directory: request.resolved_working_directory.clone(),
+            workspace_api: self
+                .backend_base_url
+                .as_ref()
+                .map(|base_url| WorkspaceApiRef {
+                    workspace_id: self.workspace_id.clone(),
+                    base_url: base_url.clone(),
+                }),
         };
         match self.runtime.create_worker(create_request) {
             Ok(detail) => {
@@ -2392,6 +2409,10 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
             initial_input: request.initial_input.clone(),
             working_directory_request: request.resolved_working_directory_request.clone(),
             working_directory: request.resolved_working_directory.clone(),
+            workspace_api: Some(WorkspaceApiRef {
+                workspace_id: self.workspace_id.clone(),
+                base_url: self.backend_base_url.clone(),
+            }),
         };
         match self.post_json::<_, RuntimeHttpWorkerResponse>("/v1/workers", &create) {
             Ok(response) => WorkerSpawnResult {
