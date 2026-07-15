@@ -9,8 +9,6 @@
 //! 3. Usage evidence report（明示使用回数 + resident exposure cost）
 //! 4. 整理材料（Linter Warn ベース、hard protection 判定はしない）
 //!
-//! 既存 `knowledge/*` 本文は埋めず、agent に `KnowledgeQuery` 経由で引かせる
-//! 設計（`docs/plan/memory.md` §retrieval 経路 / §Consolidation の Knowledge アクセス）。
 
 use std::fmt::Write;
 
@@ -29,7 +27,7 @@ pub fn build_consolidate_input(
     let mut out = String::new();
     out.push_str(
         "consolidation input. Run the integration step first \
-         (fold the staging activity logs into memory and knowledge), then the \
+         (fold the staging activity logs into memory), then the \
          tidy step (clean up existing records). Use the memory tools for \
          every write — direct file writes are denied by the worker scope.\n\n",
     );
@@ -100,7 +98,7 @@ fn push_kind_records(out: &mut String, layout: &WorkspaceLayout, kind: RecordKin
     let dir = match kind {
         RecordKind::Decision => layout.decisions_dir(),
         RecordKind::Request => layout.requests_dir(),
-        RecordKind::Knowledge | RecordKind::Summary => return,
+        RecordKind::Summary => return,
     };
     let entries = match std::fs::read_dir(&dir) {
         Ok(it) => it,
@@ -135,13 +133,13 @@ fn push_kind_records(out: &mut String, layout: &WorkspaceLayout, kind: RecordKin
 
 fn render_usage_report(report: &UsageReport) -> String {
     if report.is_empty() {
-        return "(empty — no explicit memory/knowledge usage events recorded yet. \
+        return "(empty — no explicit memory usage events recorded yet. \
                 Treat this as lack of evidence, not proof that records are unused.)\n"
             .to_string();
     }
     let json = serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string());
     format!(
-        "This report is evidence only. Do not make hard Knowledge-creation or tidy-protection decisions from it alone.\n\n```json\n{json}\n```\n"
+        "This report is evidence only. Do not make hard tidy-protection decisions from it alone.\n\n```json\n{json}\n```\n"
     )
 }
 
@@ -276,7 +274,7 @@ mod tests {
         assert!(out.contains("Replaced decisions"));
         assert!(out.contains("Sources overflow"));
         assert!(out.contains("Similar slug clusters"));
-        assert!(out.contains("no explicit memory/knowledge usage events"));
+        assert!(out.contains("no explicit memory usage events"));
     }
 
     #[test]

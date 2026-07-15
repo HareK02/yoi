@@ -317,8 +317,6 @@ export function segmentsToText(segments: Segment[]): string {
             `[paste ${segment.id}: ${segment.chars} chars / ${segment.lines} lines]`;
         case "file_ref":
           return `@file ${segment.path}`;
-        case "knowledge_ref":
-          return `@knowledge ${segment.slug}`;
         case "unknown":
           return "[unknown segment]";
       }

@@ -48,14 +48,6 @@ The following is the current durable session/workspace summary. Treat it as back
 {{ summary }}\
 """
 
-resident_knowledge_section = """\
----
-## Resident knowledge
-
-The following knowledge records are advertised resident.{% if knowledge_query_available and memory_read_available %} Use the KnowledgeQuery / MemoryRead tools to fetch the full body when relevant.{% elif knowledge_query_available %} Use KnowledgeQuery to search related knowledge records when relevant.{% elif memory_read_available %} Use MemoryRead on a known knowledge slug when the full body is required.{% endif %}
-
-{{ entries }}\
-"""
 
 worker_orchestration_guidance_section = "{% include \"$yoi/common/worker-orchestration\" %}"
 

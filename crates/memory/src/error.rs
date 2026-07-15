@@ -8,7 +8,7 @@ use thiserror::Error;
 /// Top-level error for memory operations that don't fit the lint flow.
 #[derive(Debug, Error)]
 pub enum MemoryError {
-    #[error("path is not under the memory or knowledge tree: {}", .0.display())]
+    #[error("path is not under the memory tree: {}", .0.display())]
     OutsideMemoryTree(PathBuf),
     #[error("path is not absolute: {}", .0.display())]
     RelativePath(PathBuf),
@@ -55,11 +55,6 @@ pub enum LintError {
 
     #[error("Decisions `status` must be one of open|resolved|replaced (got `{0}`)")]
     InvalidStatus(String),
-
-    #[error(
-        "Knowledge with model_invokation: true cannot have description longer than {limit} chars (got {actual})"
-    )]
-    DescriptionTooLong { actual: usize, limit: usize },
 
     #[error("body exceeds the size limit for this record kind: {actual} chars > {limit}")]
     BodyTooLong { actual: usize, limit: usize },

@@ -2,13 +2,13 @@
 
 ## Role
 
-`memory` owns generated memory, Knowledge records, staging/consolidation mechanics, linting, and audit observations.
+`memory` owns generated memory, records, staging/consolidation mechanics, linting, and audit observations.
 
 ## Boundaries
 
 Owns:
 
-- memory/Knowledge record parsing and validation
+- memory/record parsing and validation
 - memory lint subcommand backend behavior
 - staging and consolidation file mechanics
 - audit log observation writes

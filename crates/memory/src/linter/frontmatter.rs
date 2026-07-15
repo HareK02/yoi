@@ -42,9 +42,6 @@ fn parse_missing_field(msg: &str) -> Option<&'static str> {
         "status",
         "kind",
         "description",
-        "model_invokation",
-        "user_invocable",
-        "last_sources",
         "requires",
     ];
     FIELDS.iter().copied().find(|n| *n == field_name)

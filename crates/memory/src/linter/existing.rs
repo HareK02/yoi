@@ -1,4 +1,4 @@
-//! Walks `<workspace>/memory/{decisions,requests}/` and `<workspace>/knowledge/` to collect
+//! Walks `<workspace>/memory/{decisions,requests}/` to collect
 //! the slug set the linter needs for reference-integrity and
 //! same-slug-duplication checks.
 //!
@@ -10,9 +10,7 @@ use std::io;
 use std::path::Path;
 
 use crate::Slug;
-use crate::schema::{
-    DecisionFrontmatter, KnowledgeFrontmatter, RequestFrontmatter, split_frontmatter,
-};
+use crate::schema::{DecisionFrontmatter, RequestFrontmatter, split_frontmatter};
 use crate::workspace::{RecordKind, WorkspaceLayout};
 
 /// Snapshot of every record currently on disk under the workspace.
@@ -25,7 +23,6 @@ use crate::workspace::{RecordKind, WorkspaceLayout};
 pub struct ExistingRecords {
     decisions: HashMap<Slug, DecisionMeta>,
     requests: HashSet<Slug>,
-    knowledge: HashSet<Slug>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,7 +35,6 @@ impl ExistingRecords {
         match kind {
             RecordKind::Decision => self.decisions.contains_key(slug),
             RecordKind::Request => self.requests.contains(slug),
-            RecordKind::Knowledge => self.knowledge.contains(slug),
             RecordKind::Summary => false,
         }
     }
@@ -51,7 +47,6 @@ impl ExistingRecords {
         match kind {
             RecordKind::Decision => self.decisions.keys().collect(),
             RecordKind::Request => self.requests.iter().collect(),
-            RecordKind::Knowledge => self.knowledge.iter().collect(),
             RecordKind::Summary => Vec::new(),
         }
     }
@@ -72,10 +67,6 @@ pub fn scan_existing(layout: &WorkspaceLayout) -> io::Result<ExistingRecords> {
         // responsibility to fix.
         let _ = parse_silent::<RequestFrontmatter>(path);
         out.requests.insert(slug);
-    })?;
-    scan_dir(&layout.knowledge_dir(), |path, slug| {
-        let _ = parse_silent::<KnowledgeFrontmatter>(path);
-        out.knowledge.insert(slug);
     })?;
 
     Ok(out)

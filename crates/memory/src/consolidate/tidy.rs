@@ -14,9 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::Slug;
-use crate::schema::{
-    DecisionFrontmatter, KnowledgeFrontmatter, RequestFrontmatter, split_frontmatter,
-};
+use crate::schema::{DecisionFrontmatter, RequestFrontmatter, split_frontmatter};
 use crate::workspace::{RecordKind, WorkspaceLayout};
 
 /// `sources` overflow を flag する閾値。`linter::warnings::SOURCES_OVERFLOW_THRESHOLD`
@@ -69,7 +67,6 @@ pub fn collect_tidy_hints(layout: &WorkspaceLayout) -> TidyHints {
 
     let decisions = read_kind_records(layout, RecordKind::Decision);
     let requests = read_kind_records(layout, RecordKind::Request);
-    let knowledge = read_kind_records(layout, RecordKind::Knowledge);
 
     for (slug, content) in &decisions {
         let fm = parse_yaml::<DecisionFrontmatter>(content);
@@ -99,31 +96,16 @@ pub fn collect_tidy_hints(layout: &WorkspaceLayout) -> TidyHints {
             }
         }
     }
-    for (slug, content) in &knowledge {
-        if let Some(fm) = parse_yaml::<KnowledgeFrontmatter>(content) {
-            if fm.last_sources.len() > SOURCES_OVERFLOW_THRESHOLD {
-                hints.sources_overflow.push(SourcesOverflow {
-                    kind: RecordKind::Knowledge,
-                    slug: slug.clone(),
-                    count: fm.last_sources.len(),
-                });
-            }
-        }
-    }
     hints.sources_overflow.sort_by(|a, b| {
         (a.kind.as_str(), a.slug.as_str()).cmp(&(b.kind.as_str(), b.slug.as_str()))
     });
 
     let decision_slugs: Vec<&str> = decisions.keys().map(|s| s.as_str()).collect();
     let request_slugs: Vec<&str> = requests.keys().map(|s| s.as_str()).collect();
-    let knowledge_slugs: Vec<&str> = knowledge.keys().map(|s| s.as_str()).collect();
     if let Some(c) = cluster_similar(&decision_slugs, RecordKind::Decision) {
         hints.similar_slug_clusters.extend(c);
     }
     if let Some(c) = cluster_similar(&request_slugs, RecordKind::Request) {
-        hints.similar_slug_clusters.extend(c);
-    }
-    if let Some(c) = cluster_similar(&knowledge_slugs, RecordKind::Knowledge) {
         hints.similar_slug_clusters.extend(c);
     }
     hints
@@ -133,14 +115,12 @@ pub fn collect_tidy_hints(layout: &WorkspaceLayout) -> TidyHints {
     hints
 }
 
-/// `<root>/.yoi/memory/<kind>/*.md` (Knowledge は
-/// `<root>/.yoi/knowledge/*.md`) を slug ごとに `(slug, full content)`
+/// `<root>/.yoi/memory/<kind>/*.md` を slug ごとに `(slug, full content)`
 /// 化して返す。
 fn read_kind_records(layout: &WorkspaceLayout, kind: RecordKind) -> BTreeMap<String, String> {
     let dir = match kind {
         RecordKind::Decision => layout.decisions_dir(),
         RecordKind::Request => layout.requests_dir(),
-        RecordKind::Knowledge => layout.knowledge_dir(),
         RecordKind::Summary => return BTreeMap::new(),
     };
     let mut out: BTreeMap<String, String> = BTreeMap::new();

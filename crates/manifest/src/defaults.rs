@@ -98,5 +98,5 @@ pub const COMPACT_DEFAULT_REFERENCE_COUNT: usize = 5;
 pub const MEMORY_EXTRACT_WORKER_MAX_TURNS: Option<u32> = Some(8);
 
 /// Default language used by memory extraction / consolidation workers for
-/// durable memory and knowledge text. See [`crate::MemoryConfig::language`].
+/// durable memory text. See [`crate::MemoryConfig::language`].
 pub const MEMORY_LANGUAGE: &str = "English";

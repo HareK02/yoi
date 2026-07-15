@@ -1,4 +1,4 @@
-export type ComposerCompletionKind = "command" | "file" | "knowledge";
+export type ComposerCompletionKind = "command" | "file";
 
 export type ComposerCompletionToken = {
   sigil: ":" | "@" | "#";
@@ -83,9 +83,9 @@ function completionKindForSigil(
   switch (sigil) {
     case ":":
       return "command";
+    default:
+      return "file";
     case "@":
       return "file";
-    case "#":
-      return "knowledge";
   }
 }

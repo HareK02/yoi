@@ -5,7 +5,6 @@
 //! `<root>/.yoi/` subdirectory — alongside workspace project records
 //! generated durable memory. The trees inside it:
 //!
-//! - `<root>/.yoi/knowledge/<slug>.md`
 //! - `<root>/.yoi/memory/summary.md`
 //! - `<root>/.yoi/memory/decisions/<slug>.md`
 //! - `<root>/.yoi/memory/requests/<slug>.md`
@@ -26,7 +25,6 @@ use lint_common::RecordLintError;
 
 const YOI_DIR: &str = ".yoi";
 const MEMORY_DIR: &str = "memory";
-const KNOWLEDGE_DIR: &str = "knowledge";
 const SUMMARY_FILE: &str = "summary.md";
 const DECISIONS_DIR: &str = "decisions";
 const REQUESTS_DIR: &str = "requests";
@@ -42,7 +40,6 @@ pub enum RecordKind {
     Summary,
     Decision,
     Request,
-    Knowledge,
 }
 
 impl RecordKind {
@@ -51,7 +48,6 @@ impl RecordKind {
             Self::Summary => "summary",
             Self::Decision => "decision",
             Self::Request => "request",
-            Self::Knowledge => "knowledge",
         }
     }
 }
@@ -110,10 +106,6 @@ impl WorkspaceLayout {
         self.yoi_dir().join(MEMORY_DIR)
     }
 
-    pub fn knowledge_dir(&self) -> PathBuf {
-        self.yoi_dir().join(KNOWLEDGE_DIR)
-    }
-
     pub fn summary_path(&self) -> PathBuf {
         self.memory_dir().join(SUMMARY_FILE)
     }
@@ -158,12 +150,8 @@ impl WorkspaceLayout {
         self.requests_dir().join(format!("{slug}.md"))
     }
 
-    pub fn knowledge_path(&self, slug: &Slug) -> PathBuf {
-        self.knowledge_dir().join(format!("{slug}.md"))
-    }
-
     /// Classify a path under the memory tree. Returns `None` if the
-    /// path is not under `.yoi/memory/` or `.yoi/knowledge/`
+    /// path is not under `.yoi/memory/`
     /// of this workspace, or if it lives in
     /// `_staging/` / `_usage/` / `_logs/` (opaque subsystem-owned trees).
     ///
@@ -173,11 +161,7 @@ impl WorkspaceLayout {
     /// can surface it as a write violation.
     pub fn classify(&self, path: &Path) -> Result<Option<ClassifiedPath>, LintError> {
         let memory = self.memory_dir();
-        let knowledge = self.knowledge_dir();
 
-        if let Ok(rel) = path.strip_prefix(&knowledge) {
-            return Ok(Some(classify_kinded_md(rel, RecordKind::Knowledge, path)?));
-        }
         let rel = match path.strip_prefix(&memory) {
             Ok(r) => r,
             Err(_) => return Ok(None),
@@ -283,16 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn classifies_knowledge() {
-        let cp = layout()
-            .classify(&PathBuf::from("/ws/.yoi/knowledge/x.md"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(cp.kind, RecordKind::Knowledge);
-    }
-
-    #[test]
-    fn staging_returns_none() {
+    fn staging_tree_is_opaque_to_classifier() {
         assert!(
             layout()
                 .classify(&PathBuf::from("/ws/.yoi/memory/_staging/abc.json"))

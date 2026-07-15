@@ -595,7 +595,6 @@ impl App {
         self.input_history.cancel_browse();
         match kind {
             CompletionKind::File => self.input.replace_with_file_ref(start, value),
-            CompletionKind::Knowledge => self.input.replace_with_knowledge_ref(start, value),
         }
         self.completion = None;
         true
@@ -607,7 +606,6 @@ impl App {
     /// suggestion" — partial typing like `@README.` followed by
     /// Enter should chip when the popup is on `README.md`.
     ///
-    /// Files and Knowledge entries chipify here. Directory file entries return `false`
     /// so the caller can fall through to `apply_completion_text`
     /// for drill-in — chip-ifying a directory on Enter would strand
     /// the user with no way to inspect children.
@@ -628,7 +626,6 @@ impl App {
         self.input_history.cancel_browse();
         match kind {
             CompletionKind::File => self.input.replace_with_file_ref(start, value),
-            CompletionKind::Knowledge => self.input.replace_with_knowledge_ref(start, value),
         }
         self.completion = None;
         true
@@ -2166,13 +2163,13 @@ impl App {
                 self.blocks.push(Block::WorkerEvent { event });
             }
             session_store::SystemItem::FileAttachment { body, .. }
-            | session_store::SystemItem::Knowledge { body, .. }
             | session_store::SystemItem::TaskReminder { body, .. }
             | session_store::SystemItem::Interrupt { body } => {
                 self.task_store.apply_system_message_text(&body);
                 self.blocks.push(Block::SystemMessage { text: body });
             }
             session_store::SystemItem::LegacyIgnored { .. } => {}
+            session_store::SystemItem::LegacyKnowledgeIgnored { .. } => {}
         }
     }
 
@@ -2970,24 +2967,6 @@ mod completion_flow_tests {
     }
 
     #[test]
-    fn outdated_completions_event_is_dropped() {
-        let mut app = App::new("test".into());
-        for c in "@x".chars() {
-            app.insert_char(c);
-        }
-        let _ = app.refresh_completion();
-        // Reply for a different kind shouldn't overwrite state.
-        app.handle_worker_event(Event::Completions {
-            kind: CompletionKind::Knowledge,
-            entries: vec![CompletionEntry {
-                value: "stale".into(),
-                is_dir: false,
-            }],
-        });
-        assert!(app.completion.as_ref().unwrap().entries.is_empty());
-    }
-
-    #[test]
     fn committed_user_message_survives_fresh_segment_rotation() {
         let mut app = App::new("test".into());
         let start = session_store::LogEntry::SegmentStart {
@@ -3696,9 +3675,6 @@ mod completion_flow_tests {
             },
             Segment::Text {
                 content: " and ".into(),
-            },
-            Segment::KnowledgeRef {
-                slug: "design-note".into(),
             },
             Segment::Paste {
                 id: 1,

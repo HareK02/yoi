@@ -31,7 +31,6 @@ Deno.test("completionTokenAt detects TUI-style sigils before the cursor", () => 
     prefix: "src/ma",
   });
   assertEquals(completionTokenAt(":comp", 5)?.kind, "command");
-  assertEquals(completionTokenAt("ask #mem", 8)?.kind, "knowledge");
   assertEquals(completionTokenAt("run /work", 9), null);
 });
 

@@ -1,6 +1,6 @@
-//! `MemoryQuery` / `KnowledgeQuery` tools.
+//! `MemoryQuery` tool.
 //!
-//! Both perform a case-insensitive substring scan over markdown record
+//! Performs a case-insensitive substring scan over markdown record
 //! files. With a `query` set, returns `{slug, kind, ..., excerpt}` hits
 //! with `excerpt_lines` lines of context around each match. With `query`
 //! omitted, returns one entry per file (no excerpt) so the agent can
@@ -10,8 +10,6 @@
 //!   requests/}`. `.yoi/memory/_staging/`,
 //!   `.yoi/memory/_usage/`, and `.yoi/memory/_logs/` are excluded
 //!   by construction.
-//! - `KnowledgeQuery` walks `.yoi/knowledge/*.md` and supports a
-//!   `kind` filter against the Knowledge frontmatter's `kind` field.
 //!
 //! No derived index — the file tree is the source of truth and is
 //! re-scanned per call. 出現順: within a file by line order, across
@@ -25,7 +23,6 @@ use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::{Deserialize, Serialize};
 
 use crate::audit::{AuditStatus, RecordUsageAudit, append_record_usage};
-use crate::schema::{KnowledgeFrontmatter, split_frontmatter};
 use crate::workspace::WorkspaceLayout;
 
 const DEFAULT_RESULT_LIMIT: usize = 20;
@@ -37,14 +34,6 @@ with line context. Omit `query` to list every record (one entry per file, no exc
 when you don't yet know what's in there. Result count is capped (configurable via the \
 manifest's `[memory]` section). Use the returned `slug` + `kind` with MemoryRead to fetch \
 the full record. Workflow and staging directories are not visible.";
-
-const KNOWLEDGE_QUERY_DESCRIPTION: &str = "Inspect knowledge records. With `query` set, \
-returns substring hits with line context; omit `query` to list every record (one entry \
-per file, no excerpt). Optional `kind` filters by the Knowledge frontmatter's `kind` \
-field; records whose frontmatter fails to parse are skipped when `kind` is given. Result \
-count is capped (configurable via the manifest's `[memory]` section). Returns \
-`{slug, kind, description, model_invokation, excerpt}` entries. Use the returned `slug` \
-with MemoryRead (kind=knowledge) for the full record.";
 
 /// Tunables passed in from the manifest.
 #[derive(Debug, Clone, Copy)]
@@ -85,17 +74,6 @@ struct MemoryQueryParams {
     query: Option<String>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct KnowledgeQueryParams {
-    /// Optional substring filter. Case-insensitive. Omit to list every
-    /// knowledge record under the query scope.
-    #[serde(default)]
-    query: Option<String>,
-    /// Optional filter on the Knowledge frontmatter's `kind` field.
-    #[serde(default)]
-    kind: Option<String>,
-}
-
 #[derive(Debug, Serialize)]
 struct MemoryRecord {
     slug: String,
@@ -104,22 +82,7 @@ struct MemoryRecord {
     excerpt: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct KnowledgeRecord {
-    slug: String,
-    kind: Option<String>,
-    description: Option<String>,
-    model_invokation: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    excerpt: Option<String>,
-}
-
 struct MemoryQueryTool {
-    layout: WorkspaceLayout,
-    config: QueryConfig,
-}
-
-struct KnowledgeQueryTool {
     layout: WorkspaceLayout,
     config: QueryConfig,
 }
@@ -224,123 +187,6 @@ impl Tool for MemoryQueryTool {
                 op: "query".to_string(),
                 status: AuditStatus::Success,
                 kind: "memory".to_string(),
-                slug: None,
-                path: None,
-                query: params.query.clone(),
-                result_count: Some(records.len()),
-                reason: if records.len() >= limit {
-                    Some("result_limit_reached".to_string())
-                } else {
-                    None
-                },
-            },
-        );
-        Ok(ToolOutput {
-            summary,
-            content: Some(body),
-        })
-    }
-}
-
-#[async_trait]
-impl Tool for KnowledgeQueryTool {
-    async fn execute(
-        &self,
-        input_json: &str,
-        _ctx: llm_engine::tool::ToolExecutionContext,
-    ) -> Result<ToolOutput, ToolError> {
-        let params: KnowledgeQueryParams = serde_json::from_str(input_json).map_err(|e| {
-            ToolError::InvalidArgument(format!("invalid KnowledgeQuery input: {e}"))
-        })?;
-        let needle = match params.query.as_deref() {
-            Some(q) => match validate_query(q) {
-                Ok(q) => Some(q),
-                Err(err) => {
-                    let _ = append_record_usage(
-                        &self.layout,
-                        RecordUsageAudit {
-                            op: "query".to_string(),
-                            status: AuditStatus::Failed,
-                            kind: "knowledge".to_string(),
-                            slug: None,
-                            path: None,
-                            query: params.query.clone(),
-                            result_count: None,
-                            reason: Some(err.to_string()),
-                        },
-                    );
-                    return Err(err);
-                }
-            },
-            None => None,
-        };
-        let kind_filter = params.kind.as_deref();
-
-        let mut records: Vec<KnowledgeRecord> = Vec::new();
-        let limit = self.config.result_limit;
-        let ctx = self.config.excerpt_lines;
-
-        for (path, slug) in list_md_files(&self.layout.knowledge_dir()) {
-            if records.len() >= limit {
-                break;
-            }
-            let raw = match std::fs::read_to_string(&path) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let fm = parse_knowledge_frontmatter(&raw);
-
-            // kind filter applies to the frontmatter's kind field.
-            if let Some(filter) = kind_filter {
-                let matches = fm
-                    .as_ref()
-                    .map(|f| f.kind.as_str() == filter)
-                    .unwrap_or(false);
-                if !matches {
-                    continue;
-                }
-            }
-
-            let kind = fm.as_ref().map(|f| f.kind.clone());
-            let description = fm.as_ref().map(|f| f.description.clone());
-            let model_invokation = fm.as_ref().map(|f| f.model_invokation);
-
-            match needle.as_deref() {
-                Some(n) => {
-                    scan_text(&raw, n, ctx, limit - records.len(), |excerpt| {
-                        records.push(KnowledgeRecord {
-                            slug: slug.clone(),
-                            kind: kind.clone(),
-                            description: description.clone(),
-                            model_invokation,
-                            excerpt: Some(excerpt),
-                        });
-                    });
-                }
-                None => {
-                    records.push(KnowledgeRecord {
-                        slug: slug.clone(),
-                        kind,
-                        description,
-                        model_invokation,
-                        excerpt: None,
-                    });
-                }
-            }
-        }
-
-        let body = serde_json::to_string_pretty(&records)
-            .map_err(|e| ToolError::ExecutionFailed(format!("serialize records: {e}")))?;
-        let summary = match params.query.as_deref() {
-            Some(q) => format!("{} hit(s) for {q:?}", records.len()),
-            None => format!("{} record(s)", records.len()),
-        };
-        let _ = append_record_usage(
-            &self.layout,
-            RecordUsageAudit {
-                op: "query".to_string(),
-                status: AuditStatus::Success,
-                kind: "knowledge".to_string(),
                 slug: None,
                 path: None,
                 query: params.query.clone(),
@@ -470,14 +316,6 @@ fn scan_text(
     }
 }
 
-/// Best-effort frontmatter parse. Returns `None` if missing/malformed
-/// — query still finds matches in the body even when the header is
-/// broken.
-fn parse_knowledge_frontmatter(raw: &str) -> Option<KnowledgeFrontmatter> {
-    let (yaml, _body) = split_frontmatter(raw).ok()?;
-    serde_yaml::from_str::<KnowledgeFrontmatter>(yaml).ok()
-}
-
 pub fn memory_query_tool(layout: WorkspaceLayout, config: QueryConfig) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(MemoryQueryParams);
@@ -486,21 +324,6 @@ pub fn memory_query_tool(layout: WorkspaceLayout, config: QueryConfig) -> ToolDe
             .description(MEMORY_QUERY_DESCRIPTION)
             .input_schema(schema_value);
         let tool: Arc<dyn Tool> = Arc::new(MemoryQueryTool {
-            layout: layout.clone(),
-            config,
-        });
-        (meta, tool)
-    })
-}
-
-pub fn knowledge_query_tool(layout: WorkspaceLayout, config: QueryConfig) -> ToolDefinition {
-    Arc::new(move || {
-        let schema = schemars::schema_for!(KnowledgeQueryParams);
-        let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
-        let meta = ToolMeta::new("KnowledgeQuery")
-            .description(KNOWLEDGE_QUERY_DESCRIPTION)
-            .input_schema(schema_value);
-        let tool: Arc<dyn Tool> = Arc::new(KnowledgeQueryTool {
             layout: layout.clone(),
             config,
         });
@@ -524,7 +347,6 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".yoi/memory/decisions")).unwrap();
         std::fs::create_dir_all(dir.path().join(".yoi/memory/requests")).unwrap();
         std::fs::create_dir_all(dir.path().join(".yoi/memory/_staging")).unwrap();
-        std::fs::create_dir_all(dir.path().join(".yoi/knowledge")).unwrap();
         (dir, layout)
     }
 
@@ -537,19 +359,6 @@ mod tests {
         std::fs::write(path, content).unwrap();
     }
 
-    fn write_knowledge(dir: &Path, slug: &str, kind: &str, description: &str, body: &str) {
-        let path = dir.join(".yoi/knowledge").join(format!("{slug}.md"));
-        let content = format!(
-            "---\ncreated_at: {n}\nupdated_at: {n}\nkind: {kind}\ndescription: \"{description}\"\nmodel_invokation: false\nuser_invocable: true\nlast_sources: []\n---\n{body}",
-            n = now()
-        );
-        std::fs::write(path, content).unwrap();
-    }
-
-    fn parse_records<T: for<'de> serde::Deserialize<'de>>(out: &ToolOutput) -> Vec<T> {
-        serde_json::from_str(out.content.as_ref().unwrap()).unwrap()
-    }
-
     #[derive(Deserialize)]
     struct OwnedMemoryRecord {
         slug: String,
@@ -558,16 +367,10 @@ mod tests {
         excerpt: Option<String>,
     }
 
-    #[derive(Deserialize)]
-    struct OwnedKnowledgeRecord {
-        slug: String,
-        kind: Option<String>,
-        description: Option<String>,
-        model_invokation: Option<bool>,
-        #[serde(default)]
-        excerpt: Option<String>,
+    fn parse_records(out: &ToolOutput) -> Vec<OwnedMemoryRecord> {
+        let text = out.content.as_ref().unwrap_or(&out.summary);
+        serde_json::from_str(text).unwrap()
     }
-
     #[tokio::test]
     async fn memory_query_finds_decision_body() {
         let (dir, layout) = setup();
@@ -640,22 +443,9 @@ mod tests {
     async fn query_hits_do_not_log_usage() {
         let (dir, layout) = setup();
         write_decision(dir.path(), "alpha", "needle line\n");
-        write_knowledge(
-            dir.path(),
-            "policy",
-            "policy",
-            "needle desc",
-            "needle body\n",
-        );
-
         let (_, memory_tool) = memory_query_tool(layout.clone(), QueryConfig::default())();
-        let (_, knowledge_tool) = knowledge_query_tool(layout.clone(), QueryConfig::default())();
         let inp = serde_json::json!({ "query": "needle" });
         memory_tool
-            .execute(&inp.to_string(), Default::default())
-            .await
-            .unwrap();
-        knowledge_tool
             .execute(&inp.to_string(), Default::default())
             .await
             .unwrap();
@@ -723,117 +513,5 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
-    }
-
-    #[tokio::test]
-    async fn knowledge_query_returns_frontmatter_fields() {
-        let (dir, layout) = setup();
-        write_knowledge(
-            dir.path(),
-            "policy",
-            "policy",
-            "the policy doc",
-            "Ollama first\n",
-        );
-        let (_, tool) = knowledge_query_tool(layout, QueryConfig::default())();
-        let inp = serde_json::json!({ "query": "ollama" });
-        let out = tool
-            .execute(&inp.to_string(), Default::default())
-            .await
-            .unwrap();
-        let records: Vec<OwnedKnowledgeRecord> = parse_records(&out);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].slug, "policy");
-        assert_eq!(records[0].kind.as_deref(), Some("policy"));
-        assert_eq!(records[0].description.as_deref(), Some("the policy doc"));
-        assert_eq!(records[0].model_invokation, Some(false));
-        assert!(
-            records[0]
-                .excerpt
-                .as_deref()
-                .unwrap()
-                .to_lowercase()
-                .contains("ollama")
-        );
-    }
-
-    #[tokio::test]
-    async fn knowledge_query_without_query_lists_all_records() {
-        let (dir, layout) = setup();
-        write_knowledge(dir.path(), "p1", "policy", "d1", "body\n");
-        write_knowledge(dir.path(), "h1", "howto", "d2", "body\n");
-
-        let (_, tool) = knowledge_query_tool(layout, QueryConfig::default())();
-        let out = tool.execute("{}", Default::default()).await.unwrap();
-        let records: Vec<OwnedKnowledgeRecord> = parse_records(&out);
-        let mut slugs: Vec<&str> = records.iter().map(|r| r.slug.as_str()).collect();
-        slugs.sort();
-        assert_eq!(slugs, vec!["h1", "p1"]);
-        assert!(records.iter().all(|r| r.excerpt.is_none()));
-    }
-
-    #[tokio::test]
-    async fn knowledge_query_kind_filter() {
-        let (dir, layout) = setup();
-        write_knowledge(dir.path(), "p1", "policy", "d1", "needle\n");
-        write_knowledge(dir.path(), "h1", "howto", "d2", "needle\n");
-
-        let (_, tool) = knowledge_query_tool(layout, QueryConfig::default())();
-        let inp = serde_json::json!({ "query": "needle", "kind": "howto" });
-        let out = tool
-            .execute(&inp.to_string(), Default::default())
-            .await
-            .unwrap();
-        let records: Vec<OwnedKnowledgeRecord> = parse_records(&out);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].slug, "h1");
-    }
-
-    #[tokio::test]
-    async fn knowledge_query_kind_filter_works_without_query() {
-        let (dir, layout) = setup();
-        write_knowledge(dir.path(), "p1", "policy", "d1", "body\n");
-        write_knowledge(dir.path(), "h1", "howto", "d2", "body\n");
-
-        let (_, tool) = knowledge_query_tool(layout, QueryConfig::default())();
-        let inp = serde_json::json!({ "kind": "howto" });
-        let out = tool
-            .execute(&inp.to_string(), Default::default())
-            .await
-            .unwrap();
-        let records: Vec<OwnedKnowledgeRecord> = parse_records(&out);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].slug, "h1");
-        assert!(records[0].excerpt.is_none());
-    }
-
-    #[tokio::test]
-    async fn knowledge_query_searches_frontmatter_too() {
-        let (dir, layout) = setup();
-        write_knowledge(dir.path(), "p", "policy", "mentions xyzzy here", "body\n");
-
-        let (_, tool) = knowledge_query_tool(layout, QueryConfig::default())();
-        let inp = serde_json::json!({ "query": "xyzzy" });
-        let out = tool
-            .execute(&inp.to_string(), Default::default())
-            .await
-            .unwrap();
-        let records: Vec<OwnedKnowledgeRecord> = parse_records(&out);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].slug, "p");
-    }
-
-    #[tokio::test]
-    async fn knowledge_query_no_matches_returns_empty() {
-        let (dir, layout) = setup();
-        write_knowledge(dir.path(), "p", "policy", "d", "no match\n");
-        let (_, tool) = knowledge_query_tool(layout, QueryConfig::default())();
-        let inp = serde_json::json!({ "query": "absent" });
-        let out = tool
-            .execute(&inp.to_string(), Default::default())
-            .await
-            .unwrap();
-        let records: Vec<OwnedKnowledgeRecord> = parse_records(&out);
-        assert!(records.is_empty());
     }
 }

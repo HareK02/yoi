@@ -321,7 +321,6 @@ pub fn snapshot_records(layout: &WorkspaceLayout) -> BTreeMap<String, RecordSnap
     snapshot_one(&mut out, "summary", "summary", layout.summary_path());
     snapshot_dir(&mut out, "decision", layout.decisions_dir());
     snapshot_dir(&mut out, "request", layout.requests_dir());
-    snapshot_dir(&mut out, "knowledge", layout.knowledge_dir());
     out
 }
 

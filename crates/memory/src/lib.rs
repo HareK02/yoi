@@ -1,10 +1,9 @@
-//! Memory subsystem: persistence layer for `memory/*` and `knowledge/*` records.
+//! Memory subsystem: persistence layer for `memory/*` records.
 //!
 //! Self-contained: provides its own Tool implementations (read/write/edit)
-//! that target `<workspace>/memory/` and `<workspace>/knowledge/` only,
-//! with a pre-write Linter built in. Generic CRUD tools (in the `tools`
-//! crate) must not touch these directories — Worker is responsible for
-//! denying them at the Scope level when memory is enabled.
+//! that target `<workspace>/memory/` only, with a pre-write Linter built in.
+//! Generic CRUD tools (in the `tools` crate) must not touch this directory —
+//! Worker is responsible for denying it at the Scope level when memory is enabled.
 
 pub mod audit;
 pub mod consolidate;
@@ -22,10 +21,7 @@ pub use error::{LintError, LintWarning, MemoryError};
 pub use extract::ExtractPointerPayload;
 pub use lint_common::{RecordLintError, Slug, is_valid_slug};
 pub use linter::{LintReport, Linter};
-pub use resident::{
-    ResidentKnowledgeEntry, collect_resident_knowledge, collect_resident_summary,
-    list_knowledge_slugs,
-};
+pub use resident::collect_resident_summary;
 pub use scope::deny_write_rules;
 pub use usage::{
     UsageEvent, UsageEventKind, UsageRecordSnapshot, UsageReport, UsageReportRecord, UsageSource,
