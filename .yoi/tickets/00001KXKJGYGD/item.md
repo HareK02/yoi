@@ -1,8 +1,8 @@
 ---
 title: 'Replace workflow tracking with proper Skills support'
-state: 'planning'
+state: 'ready'
 created_at: '2026-07-15T19:02:13Z'
-updated_at: '2026-07-15T19:02:13Z'
+updated_at: '2026-07-15T19:27:11Z'
 assignee: null
 ---
 
