@@ -169,3 +169,35 @@ Next action:
 - Route to external Reviewer Pod before merge/close decisions。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-15T20:53:02Z status: request_changes -->
+
+## Review: request changes
+
+External review result: request_changes
+
+Evidence reviewed:
+- Implementation worktree was clean。
+- `rg "ActiveWorkflow|active_workflow|Active workflow"` and `rg "resources/workflows|\\.yoi/workflow|workflow invocation|Resident workflows"` were clean。
+
+Blockers:
+
+1. `WorkflowInvoke` web/generated surfaces remain active。
+   - `web/workspace/src/lib/generated/protocol.ts:82` still includes `{ kind: "workflow_invoke", slug: string }`。
+   - `web/workspace/src/lib/workspace/console/composer-command.ts:191` still emits `workflow_invoke`。
+   - `web/workspace/src/lib/workspace/console/model.ts:322` still handles it。
+   - `composer-command.test.ts:28` still expects it。
+   - This violates workflow resource/invocation removal acceptance。
+
+2. Relevant tests fail after removal。
+   - `cargo test -p ticket --lib scaffold_config_includes_backend_and_all_fixed_roles -- --nocapture` fails because `crates/ticket/src/config.rs:1115-1120` still asserts role `workflow = ...`。
+   - `cargo test -p tui --lib live_system_item_workflow_appends_system_message_block -- --nocapture` fails because `crates/tui/src/app.rs:3326-3340` still expects legacy workflow SystemItem rendering instead of ignored/drop/diagnostic behavior。
+   - This violates validation acceptance。
+
+3. Stale docs/config wording remains。
+   - `docs/manifest.toml:283-293` still documents loading `skills.directories` “as Workflows,” conflicting with prompt/docs cleanup and Workflow authority removal。
+
+Non-blocking note:
+- Core Rust ActiveWorkflow/resource deletions appear largely in place, and broad new Skills support was not introduced in the inspected diff。
+
+---
