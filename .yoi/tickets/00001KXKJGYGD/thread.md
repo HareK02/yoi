@@ -267,3 +267,38 @@ Remaining blocker:
 Blocker: remove the remaining slash workflow completion surface and stale protocol comments/types, without introducing hidden Workflow compatibility。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-15T21:23:24Z -->
+
+## Implementation report
+
+Second follow-up implementation progress report after request_changes:
+
+- Coder Pod `yoi-coder-00001KXKJGYGD-workflow-removal` completed the remaining slash workflow completion fix。
+- Follow-up commit: `0b56052a447adeb12ee641f1136d121431fbd798` (`fix: remove workflow completion surface`)。
+- Orchestrator inspected worktree status, branch log, commit stats, and `git diff --check 83ad7506..HEAD`; worktree was clean and diff check passed。
+
+Fix summary:
+- Removed `/` as a web console completion sigil。
+- Web console completions now only recognize commands, file refs, and Knowledge refs。
+- Removed `workflow` from web console completion result typing。
+- Updated route-side completion response typing to exclude `workflow`。
+- Updated web completion tests so slash text remains plain text / no completion token。
+- Removed stale Workflow completion/resolver wording from protocol comments。
+- Did not add hidden Workflow compatibility or broad Skills replacement。
+
+Coder-reported validation passed:
+- `rg "ActiveWorkflow|active_workflow|Active workflow"`: no matches。
+- Focused completion-surface grep for `workflow_invoke`, workflow completion kind, slash Workflow resolver wording, `resources/workflows`, `.yoi/workflow`, `workflow invocation`, `Resident workflows`: no matches。
+- Focused web/protocol grep for `kind.*workflow`: no matches; remaining project-wide `kind: "workflow"` mentions are only legacy persisted `SystemItem` ignore tests for bounded compatibility。
+- `git diff --check`
+- `cd web/workspace && deno task check && deno task test`
+- `cargo test -p yoi --tests`
+- `cargo check -p yoi`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Next action:
+- Request focused re-review of the remaining workflow completion blocker and overall acceptance before merge/close decisions。
+
+---
