@@ -293,3 +293,27 @@ Next action:
 - Request focused re-review of the previous Panel overlay blocker and overall acceptance before merge/close decisions。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-15T17:45:34Z status: approve -->
+
+## Review: approve
+
+Focused re-review result: approve
+
+Evidence:
+- Previous blocker is fixed: `crates/tui/src/workspace_panel.rs:674-694` now loads `TicketConfig::load_workspace(worktree_root)`, uses `overlay_config.backend_root()` and `overlay_config.ticket_record_language()`, and reports a clear diagnostic when the configured root is not a directory。
+- Regression `workspace_panel_orchestration_overlay_uses_configured_backend_root` covers non-default overlay roots and reviewer reran it successfully (`1 passed`)。
+- No new co-equal legacy authority was found: legacy `.yoi/ticket.config.toml` remains only the documented fallback through `TicketConfig::load_workspace` when workspace `[ticket]` is absent。
+- Overall acceptance remains satisfied by inspected paths: direct CLI/Objectives, Worker feature setup, workspace-server records/backend endpoint, Panel/role launch, and queue/overlay paths resolve through workspace Ticket settings/defaults。
+- `.yoi/workspace.toml` carries backend/language/fixed role policy, docs/help note legacy obsolete, and operational/runtime settings remain outside tracked Ticket policy。
+
+Validation performed by reviewer:
+- clean `git status`。
+- HEAD `40f21145`。
+- `git diff --check c68ed1fd..HEAD`。
+- focused source review。
+- focused TUI regression test。
+
+Blockers: none。
+
+---
