@@ -2,7 +2,7 @@
 title: 'Implement Agent Skills support'
 state: 'planning'
 created_at: '2026-07-15T19:43:46Z'
-updated_at: '2026-07-15T20:04:47Z'
+updated_at: '2026-07-15T20:43:42Z'
 assignee: null
 ---
 
@@ -10,7 +10,7 @@ assignee: null
 
 Yoi は再利用可能な作業手順、作法、報告形式、補助資料を、LLM-facing な手順資源として扱う必要がある。これらは external state や authority を直接動かす仕組みではなく、Agent が必要な時に参照・活用する procedural guidance として定義する。
 
-Agent Skills 標準に従い、workspace-local Skills は `.yoi/skills/` 配下の `SKILL.md` package として扱う。Ticket、Worker、workdir、repository、network などの外部状態変更は typed feature/tool surface が持ち、Skill はその使い方や作業の進め方を記述する。
+Agent Skills 標準に従い、workspace-local Skills は `.yoi/skills/` 配下の `SKILL.md` package として扱う。Skill discovery / lint / catalog / activation は Workspace backend を authority とし、Worker は Workspace API から Skill metadata / body を受け取る。Ticket、Worker、workdir、repository、network などの外部状態変更は typed feature/tool surface が持ち、Skill はその使い方や作業の進め方を記述する。
 
 ## 要件
 
@@ -55,11 +55,25 @@ Agent Skills 標準に従い、workspace-local Skills は `.yoi/skills/` 配下�
   - 既存 parser が workflow 互換のために受けている field がある場合、標準 field か Yoi の明示拡張として再分類し、不要なものは warning ではなく lint error または unsupported として扱う。
   - Agent Skills 標準外の Yoi 拡張を残す場合は、projection 由来ではなく独立した必要性を説明し、namespace / compatibility 方針を明示する。
 
+### Workspace authority / API
+
+- Skill discovery / lint / catalog / activation の authority は Workspace backend とする。
+  - `.yoi/skills/` は tracked workspace data の保存場所であり、Worker が各自で filesystem scan する source of truth ではない。
+  - Web Workspace UI、Runtime Worker、embedded Worker、CLI は Workspace backend API 経由で同じ Skill view を得る。
+- Workspace backend は Skill catalog API を提供する。
+  - `name` / `description` / source / provenance / override status / diagnostics を返す。
+  - invalid Skill は catalog diagnostics として報告し、Worker ごとにばらばらな parse behavior を持たせない。
+- Workspace backend は Skill activation/read API を提供する。
+  - `/skill-slug` activation は Workspace backend から full `SKILL.md` body を取得し、Worker history に append / commit してから LLM context に載せる。
+  - Worker は `WorkspaceClient::Http` がある場合、Skill body を local file path から直接読まない。
+- Local-only / legacy Worker path が必要な場合も、同じ Workspace skill loader logic を共有し、別 schema / 別 precedence を作らない。
+- Workspace settings / Profile / role が advertised skills や default visible skill catalog を指定する場合も、最終的な解決は Workspace backend の catalog authority に寄せる。
+
 ### Progressive disclosure / loading
 
-- Skill metadata は startup / Worker initialization 時に軽量 catalog として読めるようにする。
+- Skill metadata は Worker initialization 時に Workspace backend から軽量 catalog として取得できるようにする。
   - model-visible な常時情報は `name` と `description` を中心にする。
-- Full `SKILL.md` body は Skill が activate / select された時だけ LLM context に入れる。
+- Full `SKILL.md` body は Skill が activate / select された時だけ Workspace backend から取得して LLM context に入れる。
 - `references/` / `scripts/` / `assets/` の内容はさらに必要時だけ読む。
 - Builtin skill と workspace skill の discovery / override / provenance を定義する。
   - workspace `.yoi/skills/<name>/SKILL.md` が同名 builtin skill を override できるかを明示する。
@@ -94,7 +108,7 @@ Agent Skills 標準に従い、workspace-local Skills は `.yoi/skills/` 配下�
 - Skill activation surface。
   - `/skill-name` のような slash command を持つか、Skill selection / activation tool にするか。
 - Skill catalog を model-visible にする方法。
-  - 起動時 prompt に metadata 一覧を常時載せるか、SkillList / SkillRead のような tools で探索させるか。
+  - 起動時 prompt に metadata 一覧を常時載せるか、Workspace SkillList / SkillRead API-backed tools で探索させるか。
 - `allowed-tools` の扱い。
   - Agent Skills 標準では experimental なので、Yoi で authority として尊重するか、lint metadata として読むだけにするか。
   - 尊重する場合、既存 feature/tool permission とどう合成するか。
@@ -102,7 +116,7 @@ Agent Skills 標準に従い、workspace-local Skills は `.yoi/skills/` 配下�
   - Skill bundled script を通常 Bash / tool authority で実行するだけにするか、Skill script 実行専用 tool を作るか。
   - script dependencies / shebang / executable bit / sandbox の扱い。
 - Skill file access。
-  - `references/` / `assets/` を通常 `Read` で読むだけにするか、Skill resource read tool を作るか。
+  - `references/` / `assets/` を Workspace Skill resource API 経由で読むか、通常 `Read` に Workspace backend-resolved path authority を渡すか。
   - deeply nested reference chain をどこまで許すか。
 - Builtin skill の配置場所。
   - `resources/skills/<name>/SKILL.md` とするか、別の runtime resource layout にするか。
@@ -116,9 +130,10 @@ Agent Skills 標準に従い、workspace-local Skills は `.yoi/skills/` 配下�
 
 ## 受け入れ条件
 
-- `.yoi/skills/<skill-name>/SKILL.md` が Agent Skills 標準の required frontmatter と naming rules で lint される。
-- builtin/workspace Skill の loading、override priority、provenance、lint が tests で確認されている。
-- Full `SKILL.md` body は activation 時にのみ LLM context に入り、metadata catalog と progressive disclosure の分離が tests で確認されている。
+- `.yoi/skills/<skill-name>/SKILL.md` が Agent Skills 標準の required frontmatter と naming rules で Workspace backend によって lint される。
+- builtin/workspace Skill の loading、override priority、provenance、lint が Workspace backend API tests で確認されている。
+- Worker / Web / CLI が同じ Workspace backend Skill catalog を参照し、Worker-local filesystem scan が primary authority になっていないことを tests で確認している。
+- Full `SKILL.md` body は activation 時にのみ Workspace backend から取得されて LLM context に入り、metadata catalog と progressive disclosure の分離が tests で確認されている。
 - Workflow projection 由来の標準外 Skill fields / semantics が Skill schema から除去され、Agent Skills 標準 field と明示的な Yoi 拡張だけが受理されることを tests で確認している。
 - role prompts / internal prompts / docs が Skill 前提に更新されている。
 - Ticket queue、Worker spawn、workdir 管理などの外部状態制御は Skill ではなく feature/tool surface に残る。

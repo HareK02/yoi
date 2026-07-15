@@ -85,3 +85,16 @@ LocalTicketBackend によって作成されました。
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-07-15T20:43:42Z -->
+
+## Decision
+
+Workspace backend を Skill discovery / lint / catalog / activation の authority とする。
+
+`.yoi/skills/` は tracked workspace data の保存場所だが、Runtime Worker が各自で直接 scan して別々の Skill view を持つ構造にはしない。Web Workspace UI、Runtime Worker、embedded Worker、CLI は Workspace backend API から同じ catalog / diagnostics / activation body を取得する。
+
+これにより、Skill の override/provenance/lint diagnostics、Web からの編集・検証、Worker への progressive disclosure を同じ authority に寄せる。
+
+
+---
