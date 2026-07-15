@@ -235,3 +235,30 @@ Next action:
 - Route to external Reviewer Pod before merge/close decisions。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-15T17:26:26Z status: request_changes -->
+
+## Review: request changes
+
+External review result: request_changes
+
+Acceptance blocker:
+- Workspace settings が active Panel Ticket reads の全経路で durable authority になっていない。
+- `crates/tui/src/workspace_panel.rs:673-688` は orchestration worktree overlay を `worktree_root.join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH)` (`.yoi/tickets`) から直接読んでいる。
+- そのため orchestration worktree 側の `TicketConfig` / workspace `[ticket.backend].root` を解決しておらず、non-default Ticket root では Panel overlay が “no .yoi/tickets directory” と扱う、または orchestration state を見落とす。
+- これは configured backend-root authority と Panel resolution-path acceptance focus に違反する。
+
+Positive evidence:
+- `TicketConfig` は `.yoi/workspace.toml [ticket]` を legacy fallback / precedence / default tests 付きで読むようになっている。
+- Direct Ticket CLI、Objective link validation、Worker feature setup、workspace-server record/backend endpoint、queue handoff、role launch は概ね `TicketConfig::load_workspace` 経由になっている。
+- `.yoi/workspace.toml` に backend/language/role config が入り、docs は legacy config obsolete を記録している。
+
+Validation performed by reviewer:
+- read-only diff/source inspection。
+- implementation worktree で `git status --short`, `git rev-parse`, `git diff --check c68ed1fd..HEAD`。
+- test rerun はしていない。
+
+Non-blocking note:
+- non-default-root Panel orchestration-overlay test を追加すると、この経路の regression を防げる。
+
+---
