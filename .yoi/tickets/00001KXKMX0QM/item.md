@@ -2,7 +2,7 @@
 title: 'Implement Agent Skills support'
 state: 'planning'
 created_at: '2026-07-15T19:43:46Z'
-updated_at: '2026-07-15T19:56:41Z'
+updated_at: '2026-07-15T20:00:00Z'
 assignee: null
 ---
 
@@ -49,6 +49,11 @@ Agent Skills 標準に従い、workspace-local Skills は `.yoi/skills/` 配下�
   - `references/` は必要時に読む追加 docs。
   - `scripts/` は agent が実行し得る補助 code。
   - `assets/` は templates / static resources。
+- Workflow projection のために作られた標準外の独自仕様は Skill schema から削除する。
+  - Skill を `WorkflowRecord` に変換するための `model_invokation` / `user_invocable` 相当の概念を Skill frontmatter / catalog に持ち込まない。
+  - workflow invocation や workflow graph 前提の field / semantics を Agent Skills として受理しない。
+  - 既存 parser が workflow 互換のために受けている field がある場合、標準 field か Yoi の明示拡張として再分類し、不要なものは warning ではなく lint error または unsupported として扱う。
+  - Agent Skills 標準外の Yoi 拡張を残す場合は、projection 由来ではなく独立した必要性を説明し、namespace / compatibility 方針を明示する。
 
 ### Progressive disclosure / loading
 
@@ -114,6 +119,7 @@ Agent Skills 標準に従い、workspace-local Skills は `.yoi/skills/` 配下�
 - `.yoi/skills/<skill-name>/SKILL.md` が Agent Skills 標準の required frontmatter と naming rules で lint される。
 - builtin/workspace Skill の loading、override priority、provenance、lint が tests で確認されている。
 - Full `SKILL.md` body は activation 時にのみ LLM context に入り、metadata catalog と progressive disclosure の分離が tests で確認されている。
+- Workflow projection 由来の標準外 Skill fields / semantics が Skill schema から除去され、Agent Skills 標準 field と明示的な Yoi 拡張だけが受理されることを tests で確認している。
 - role prompts / internal prompts / docs が Skill 前提に更新されている。
 - Ticket queue、Worker spawn、workdir 管理などの外部状態制御は Skill ではなく feature/tool surface に残る。
 - Skill implementation decision points のうち初期実装で決めないものは、明示的に unsupported / ignored / warning として扱われる。
