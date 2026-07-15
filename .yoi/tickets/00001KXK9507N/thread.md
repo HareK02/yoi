@@ -149,3 +149,31 @@ Next action:
 - Wait for explicit follow-up. On follow-up, re-check Ticket/relation/plan/worktree state, then record `queued -> inprogress` before creating `/home/hare/Projects/yoi/.worktree/00001KXK9507N-ticket-workspace-settings` and spawning role Pods。
 
 ---
+
+<!-- event: decision author: orchestrator at: 2026-07-15T16:30:32Z -->
+
+## Decision
+
+Implementation follow-up accepted。
+
+Evidence rechecked before side effects:
+- Ticket remains `queued` and has prior implementation-ready IntentPacket / accepted plan。
+- `TicketRelationQuery(00001KXK9507N)`: 0 blockers。
+- `TicketOrchestrationPlanQuery(00001KXK9507N)`: accepted plan exists for branch/worktree `work/00001KXK9507N-ticket-workspace-settings` / `/home/hare/Projects/yoi/.worktree/00001KXK9507N-ticket-workspace-settings`。
+- `TicketList(inprogress)`: 0 件。
+- Orchestrator worktree is clean。
+- No existing `00001KXK9507N` worktree/branch was reported in the recheck。
+
+Next action:
+- Record `queued -> inprogress` now, then create the dedicated implementation worktree and route implementation to sibling Coder Pod。
+- Per current user instruction, do not call `StopPod` during later cleanup。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-07-15T16:30:37Z from: queued to: inprogress reason: accepted_for_implementation field: state -->
+
+## State changed
+
+Explicit follow-up authorized implementation start. Ticket/relation/plan/worktree state was rechecked and no blockers were found. Moving to inprogress before worktree creation or role Pod spawn.
+
+---
