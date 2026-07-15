@@ -206,3 +206,34 @@ Next action:
 - Route to external Reviewer Pod before merge/close decisions。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-15T22:35:41Z status: request_changes -->
+
+## Review: request changes
+
+External review result: request_changes
+
+Blockers:
+
+1. Model-visible Ticket tool description still advertises Knowledge。
+   - `crates/ticket/src/tool.rs:165` appends tool description text saying `memory.language for Memory/Knowledge`。
+   - This keeps Knowledge in active LLM/tool guidance and violates tool/schema surface acceptance。
+
+2. Current design docs still describe Knowledge as active support。
+   - `docs/design/overview.md:18` says the `memory` crate owns “Knowledge records.”
+   - This is active design guidance, not historical note, and contradicts docs/prompts cleanup acceptance。
+
+Positive evidence:
+- `MemoryToolKind` now accepts only summary/decision/request。
+- `MemoryQuery` scans only summary/decisions/requests。
+- Protocol/web completions are file-only。
+- Old persisted Knowledge system items are compatibility-ignored。
+
+Validation performed:
+- Static read-only review of clean worktree commit `f786e019`。
+- No tests rerun because static blockers remain。
+
+Non-blocking cleanup:
+- `crates/tui/src/input.rs:237-269` has stale comments mentioning `#<typed>`, though code only triggers `@` file completion。
+
+---
