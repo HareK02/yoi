@@ -8,6 +8,14 @@
       "note": "Skills support follows removal of legacy workflow tracking/resource paths.",
       "author": "yoi ticket",
       "at": "2026-07-15T19:45:40Z"
+    },
+    {
+      "ticket_id": "00001KXKMX0QM",
+      "kind": "depends_on",
+      "target": "00001KXKP2A71",
+      "note": "Agent Skills support should be implemented after obsolete Knowledge support is removed.",
+      "author": "yoi ticket",
+      "at": "2026-07-15T20:04:47Z"
     }
   ]
 }

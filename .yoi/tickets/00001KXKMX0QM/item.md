@@ -2,7 +2,7 @@
 title: 'Implement Agent Skills support'
 state: 'planning'
 created_at: '2026-07-15T19:43:46Z'
-updated_at: '2026-07-15T20:00:00Z'
+updated_at: '2026-07-15T20:04:47Z'
 assignee: null
 ---
 
