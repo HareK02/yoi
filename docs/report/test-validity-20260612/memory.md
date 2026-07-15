@@ -43,7 +43,7 @@
 - tool の edge case が不足している。
   - `MemoryRead` の `offset` / `limit` / truncation summary、limit=0 の `.max(1)` 挙動、空ファイル・末尾改行なしの line numbering が未検証。
   - `MemoryEdit` の `replace_all`, duplicate old_string reject, old_string empty, identical replacement, non-UTF-8 file, summary edit path が未検証。
-  - `MemoryWrite` の invalid slug、summary with slug、Knowledge/Request 作成、write success audit contents、warning summary/audit reason が未検証。
+  - `MemoryWrite` の invalid slug、summary with slug、Request 作成、write success audit contents、warning summary/audit reason が未検証。
   - `MemoryDelete` は成功 path のみで、missing file、summary slug forbidden、invalid slug、workflow kind reject、audit failure record が未検証。
 - 誤解を招く / 弱い test がある。
   - `write_aggregates_multiple_errors` は名前に反して、実際の assertion は `status` / `missing` の substring だけで、body too long など複数 error aggregation を確認していない。現実の linter は frontmatter parse failure で早期 return するため、この test は「複数 error が集約される」保証になっていない。

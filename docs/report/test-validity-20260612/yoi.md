@@ -38,7 +38,7 @@
 
 - `memory_lint.rs` は主要な CLI 固有 invariants をカバーしている:
   - option parsing と usage error
-  - 意図した memory/Knowledge record path だけが lint されること
+  - 意図した memory record path だけが lint されること
   - invalid record が lint failure になること
   - `--warnings-as-errors` が status を変えること
   - JSON output が parse 可能で、期待される counts を含むこと
