@@ -2,13 +2,13 @@
 title: "効果的な Memory システム設計・検証"
 state: "active"
 created_at: "2026-06-20T15:16:00Z"
-updated_at: "2026-06-20T15:16:00Z"
+updated_at: "2026-07-15T21:18:00Z"
 linked_tickets: ["00001KSKBPHRG", "00001KT02TCCG", "00001KTGCAFXG", "00001KSKBPTHR"]
 ---
 
 ## Goal
 
-Yoi の Memory / Knowledge / generated memory / resident context / retrieval / usage metrics を、実際の開発・設計・レビュー・オーケストレーションに効く sensemaking substrate として再設計・検証する。
+Yoi の Memory / generated memory / resident context / retrieval / usage metrics を、実際の開発・設計・レビュー・オーケストレーションに効く sensemaking substrate として再設計・検証する。Knowledge は separate record kind として削除する方針であり、この Objective では Memory と authority record / Skill / docs の境界を再整理する。
 
 この Objective でいう「効果的な Memory システム」は、単に多く保存する仕組みではなく、作業中の問いに対して relevant material を集め、根拠を検証可能にし、再表現・仮説形成・反証探索・意思決定・成果物への反映を低コストにする仕組みである。
 
@@ -41,9 +41,9 @@ Yoi の現行 Memory は、この流れのうち「保存」と「一部の検�
 
 - Ticket / task / question ごとの shoebox がない。
 - shoebox から evidence snippets を切り出し、source / provenance / applicability / confidence と共に扱う evidence file がない。
-- `summary`, `decision`, `request`, `knowledge` は storage taxonomy であり、sensemaking 用 schema としては粗い。
+- `summary`, `decision`, `request` は durable memory storage taxonomy であり、sensemaking 用 schema としては粗い。Knowledge record kind は削除方針なので、再利用可能な手順は Skill、保守された設計資料は docs / Ticket decisions に寄せる。
 - decision は残るが、hypothesis space、alternative、rejected reason、disconfirming evidence が残りにくい。
-- reviewer / orchestrator が confirmation bias を避けるための反証探索導線が弱い。
+- reviewer / orchestrator が confirmation bias を避けるための反証探索導線が弱い。関連する手順誘導は旧 Workflow ではなく Skill と role prompt / typed tools へ寄せる。
 - resident exposure と explicit retrieval は観測できても、Memory が product に効いたかは測りにくい。
 
 この Objective は、Memory 関連の設計・検証・検討・考察を一元化し、個別 Ticket がばらばらに storage、prompt、retrieval、metrics を改善して再び墓場を増やすことを防ぐための判断背景である。
@@ -115,15 +115,15 @@ Memory が prompt に入った、または query されたことは成功では�
 - Ticket routing 用 Memory shoebox artifact を試作する。
 - evidence snippet schema / source resolver を設計する。
 - hypothesis / rejected alternative / disconfirming evidence の表現を追加する。
-- Reviewer workflow に反証探索を入れる。
+- Reviewer Skill / review process に反証探索を入れる。
 - Memory usage metrics を product impact oriented に拡張する。
 - stale / contradiction / renewal の検出・表示を設計する。
 
 ## Success criteria / exit conditions
 
-- Memory システムの目的が「保存」ではなく「sensemaking loop 支援」として project records / docs / prompts / workflows で一貫して説明されている。
+- Memory システムの目的が「保存」ではなく「sensemaking loop 支援」として project records / docs / prompts / Skills で一貫して説明されている。
 - Pirolli & Card の `shoebox -> evidence file -> schema -> hypotheses -> product` に対応する Yoi 内の責務と非責務が整理されている。
-- Ticket / Objective / docs / session logs / Memory / Knowledge の authority boundary が明確で、Memory が authority を僭称しない。
+- Ticket / Objective / docs / session logs / Memory / Skills の authority boundary が明確で、Memory が authority を僭称せず、Skill は手順資源として外部状態 authority を持たない。
 - 少なくとも一つの実作業 routing / review / design analysis で、task-bound shoebox または evidence file が生成・利用され、作業品質にどう効いたかが確認されている。
 - Memory records または関連 artifacts が source / provenance / applicability / staleness / supports-or-refutes のいずれかを扱えるようになっている。
 - Reviewer / Orchestrator が supporting evidence だけでなく、contradicting evidence / stale assumptions / rejected alternatives を探す導線を持っている。
@@ -131,7 +131,7 @@ Memory が prompt に入った、または query されたことは成功では�
 - 古い Memory が放置されるのではなく、stale / superseded / contradicted / needs-review として扱える方針がある。
 - 後続の実装 Ticket が concrete slice として分割され、Objective が Ticket dependency や進捗 container として使われていない。
 
-この Objective は、Memory が少なくとも一つの中規模設計・実装・レビュー作業で「関連情報を見つける」「根拠を確認する」「代替案/反証を検討する」「成果物へ反映する」流れを実証し、その設計方針が docs / workflows / metrics に反映された時点で `done` を検討できる。
+この Objective は、Memory が少なくとも一つの中規模設計・実装・レビュー作業で「関連情報を見つける」「根拠を確認する」「代替案/反証を検討する」「成果物へ反映する」流れを実証し、その設計方針が docs / Skills / metrics に反映された時点で `done` を検討できる。
 
 ## Decision context
 
@@ -141,8 +141,8 @@ Memory が prompt に入った、または query されたことは成功では�
 - Memory は durable project authority ではない。Ticket、docs、git history、session logs、明示 user instruction の代替として使わない。
 - Objective context は判断背景であり、個別実装の authority は各 Ticket body/thread/artifacts と明示的な Ticket relations / OrchestrationPlan records にある。
 - `history` に残らない context-only injection を改善案にしない。新しい context input は history に commit する原則を守る。
-- Knowledge は単なる長期保存ではなく、再利用可能な schema / model / procedure / invariant として再検討する余地がある。
-- Generated memory / curated Knowledge / Ticket / docs / report の境界を再定義する場合は、authority boundary と migration/staleness を明示する。
+- Knowledge record kind は削除方針。再利用可能な手順・作法は Agent Skills (`.yoi/skills/<skill>/SKILL.md`) へ、durable policy/rationale は Memory decisions / maintained docs / Ticket decisions へ、外部状態 authority は typed feature/tool surface へ分ける。
+- Generated memory / Ticket / docs / report / Skill の境界を再定義する場合は、authority boundary と migration/staleness を明示する。
 - 関連する既存 Ticket:
   - `00001KSKBPHRG` — Prompt / Workflow 評価メトリクスと改善 Offer
   - `00001KT02TCCG` — Memory prompt: conditional guidance and proactive lookup
@@ -183,9 +183,9 @@ Yoi 初期設計では、これを参考に以下を意図していた。
 - activity token 閾値で extract を発火する。
 - compact より前に session log range を抽出する。
 - extract は `decisions`, `discussions`, `attempts`, `requests` などの候補を staging に保存する。
-- 抽出時点では Knowledge 化せず、純粋な「起きたこと」に寄せる。
-- consolidation が summary / decisions / requests / knowledge candidates を整理する。
-- consolidation 入力に linter warnings / usage metrics / Knowledge 化候補を含める。
+- 抽出時点では durable policy / Skill / docs へ早期分類せず、純粋な「起きたこと」に寄せる。
+- consolidation が summary / decisions / requests と、必要に応じた docs / Skill / Ticket decision 更新候補を整理する。
+- consolidation 入力に linter warnings / usage metrics / stale cleanup 候補を含める。
 - stale / superseded / unused / noisy な情報を整理する。
 
 この Objective での再解釈:
@@ -224,7 +224,7 @@ HermesAgent で特に重要だった点:
 
 この Objective での再解釈:
 
-- HermesAgent の `MEMORY.md` / `USER.md` / `skills` の分離は、Yoi の Knowledge / Workflow / prompt resource / docs / Ticket decision / generated memory の責務再整理に使える。
+- HermesAgent の `MEMORY.md` / `USER.md` / `skills` の分離は、Yoi の Memory / Skills / prompt resources / docs / Ticket decision / generated memory の責務再整理に使える。
 - reusable procedure, reviewer focus, orchestration tactic, project preference, user preference, design invariant を同じ Memory bucket に入れると墓場化しやすい。
 - `Nothing to save.` / empty extraction allowed は重要だが、保存抑制だけでは効果的な Memory にはならない。保存されたものが task-bound shoebox / evidence / schema / hypothesis / product に接続される必要がある。
 - frozen snapshot / prompt cache 配慮は Yoi の history/context 加工原則と整合するが、それだけでは retrieval / resurfacing / disconfirmation は解決しない。

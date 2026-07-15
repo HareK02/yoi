@@ -2,7 +2,7 @@
 title: "Team workspace control plane and runtime architecture"
 state: "active"
 created_at: "2026-06-20T14:26:29Z"
-updated_at: "2026-07-07T12:40:00Z"
+updated_at: "2026-07-15T21:18:00Z"
 linked_tickets: ["00001KVMFFYVX", "00001KWMBAA6V"]
 ---
 
@@ -10,15 +10,15 @@ linked_tickets: ["00001KVMFFYVX", "00001KWMBAA6V"]
 
 Yoi を、単一のローカル開発ディレクトリで動くエージェント実行ツールから、チームで作業・判断・実行結果を管理できるワークスペース基盤へ発展させる。
 
-この Objective の中心は、Web から扱える管理システムを作り、その管理システムにローカル Runtime・リモート Runtime・将来のクラウド Runtime を接続できるようにすることである。管理システムは Ticket、Objective、Memory、Knowledge、Artifact、Policy、Actor、Repository、Runtime state の正本を持つ。Runtime はその管理システムから Worker launch request / config bundle / repository target / authority を受け取り、作業環境を用意して Worker を実行し、結果・イベント・証跡を返す。
+この Objective の中心は、Web から扱える管理システムを作り、その管理システムにローカル Runtime・リモート Runtime・将来のクラウド Runtime を接続できるようにすることである。管理システムは Ticket、Objective、Memory、Skill catalog、Artifact、Policy、Actor、Repository、Runtime state の正本を持つ。Runtime はその管理システムから Worker launch request / config bundle / repository target / authority を受け取り、作業環境を用意して Worker を実行し、結果・イベント・証跡を返す。
 
-この Objective は Git ホスティングサービスを作るものではない。Git は重要な Repository provider として扱うが、Yoi の Workspace は Git Repository root と同じものにしない。Yoi が作るべきものは、コード・ドキュメント・データ・成果物などの Repository と Runtime を接続しながら、人間とエージェントの作業、Ticket lifecycle、Memory/Knowledge、検証証跡、実行環境配置を管理するチームワークスペースである。
+この Objective は Git ホスティングサービスを作るものではない。Git は重要な Repository provider として扱うが、Yoi の Workspace は Git Repository root と同じものにしない。Yoi が作るべきものは、コード・ドキュメント・データ・成果物などの Repository と Runtime を接続しながら、人間とエージェントの作業、Ticket lifecycle、Memory、Skill catalog、検証証跡、実行環境配置を管理するチームワークスペースである。
 
 ## Glossary
 
 この Objective では、以下の語をこの意味で使う。
 
-- Workspace: チームまたはプロジェクトの管理単位。Ticket、Objective、Memory、Knowledge、Artifact、Policy、Actor、Repository、Runtime state を持つ。Git Repository root ではない。
+- Workspace: チームまたはプロジェクトの管理単位。Ticket、Objective、Memory、Skill catalog、Artifact、Policy、Actor、Repository、Runtime state を持つ。Git Repository root ではない。
 - Control plane: Workspace の正本を持ち、Web UI / API / CLI から操作される管理システム。
 - Runtime: Worker 群を束ねる実行基盤。Worker lifecycle、sandbox、mount、cache、checkout/worktree/container filesystem などの working directory materialization、event/control plane を管理する。将来的には 1 つの Runtime が複数 Workspace / Repository の Worker を抱えられる。
 - Worker: Runtime が管理する 1 つの agent/session/process。Runtime が用意した working directory と authority の中で動く。
@@ -32,7 +32,7 @@ Yoi を、単一のローカル開発ディレクトリで動くエージェン�
 - Objective: 複数の Ticket を束ねる長期目標や設計方針。
 - Artifact: Ticket や Worker 実行に紐づく成果物や証跡。diff、log、validation result、review result、report など。
 - Memory: エージェントやユーザーが再利用するための要約された文脈。Ticket や Artifact の正本ではない。
-- Knowledge: 保守された知識や設計判断。Memory より人間が維持する資料に近い。
+- Skill catalog: `.yoi/skills` / builtin skills から Workspace backend が解決する procedural guidance catalog。外部状態 authority は持たず、Ticket / Worker / workdir などの操作は typed feature/tool surface が担う。
 - Actor: 人間、エージェント、システム、外部サービスなど、Workspace 上で操作や発言を行う主体。
 
 ## Motivation / background
@@ -44,7 +44,7 @@ Yoi を、単一のローカル開発ディレクトリで動くエージェン�
 - Ticket をローカル作業メモではなく、チームの作業調整 record にする。
 - 実行証跡は Ticket thread、Artifact、WorkerRef snapshot、Runtime event として扱い、独立した実行単位概念を先に増やさない。
 - 管理システムと Runtime を分ける。
-- まず Web から Ticket、Objective、Memory、Knowledge、Artifact、Runtime / Worker state を見られるようにする。
+- まず Web から Ticket、Objective、Memory、Skill catalog、Artifact、Runtime / Worker state を見られるようにする。
 - 最初はローカル Runtime を使い、後でリモート Runtime、クラウド Runtime、runtime pool、resource allocation、quota、billing、sandboxing に拡張する。
 - Git ホスティング機能を取り込むのではなく、Git Repository / worktree / clone は Repository provider と working directory materialization の手段として扱う。
 
@@ -56,7 +56,7 @@ OSS として Control plane、Runtime、Web frontend、protocol を公開しつ�
 
 Team Workspace の正本は server-side control plane に置く。`.yoi` は local backend、single-user/self-hosted compatibility、offline/export/import、local projection、migration bridge として残せるが、multi-user SaaS の正本とはみなさない。
 
-Control plane は Ticket、Objective、Memory、Knowledge、Artifact、Actor、Permission、Audit、Repository、Runtime / Worker state を管理する。Web UI、CLI、TUI、将来の desktop client は、この Control plane を操作する client であり、別の正本 store を持たない。
+Control plane は Ticket、Objective、Memory、Skill catalog、Artifact、Actor、Permission、Audit、Repository、Runtime / Worker state を管理する。Web UI、CLI、TUI、将来の desktop client は、この Control plane を操作する client であり、別の正本 store を持たない。
 
 ### 2. Workspace と Repository を同一視しない
 
@@ -126,20 +126,21 @@ Ticket には次の概念が必要になる。
 - Board / queue / planning / review / done / archived views.
 - Conflict handling and concurrent editing policy.
 
-### 4. Memory / Knowledge の本格再設計は後回しにする
+### 4. Memory / Skill catalog の本格再設計は後回しにする
 
-Memory / Knowledge は Ticket / Artifact のコピーではない。再利用可能な文脈、方針、学習された制約、保守された知識として扱う。ただし、Memory の意味論・抽出・承認・検索・staleness 処理を今この Objective で先に作り込まない。
+Memory は Ticket / Artifact のコピーではない。再利用可能な文脈、方針、学習された制約を扱うが、Ticket や Artifact の authority を置き換えない。Skill catalog は procedural guidance の catalog であり、外部状態 authority を持たない。Knowledge record kind は削除方針なので、この Objective では separate Knowledge storage を新しい control plane entity として増やさない。
 
-理由は、Memory の正しい設計が Workspace control plane の record model、Actor / visibility / permission、Ticket、Artifact / evidence、RepositoryPoint、Runtime に渡す context の監査方法に依存するためである。これらが固まる前に Memory schema だけを作ると、local `.yoi` 前提や現行 agent runtime 前提に引っ張られ、後で再設計が必要になる。
+理由は、Memory と Skill catalog の正しい設計が Workspace control plane の record model、Actor / visibility / permission、Ticket、Artifact / evidence、RepositoryPoint、Runtime に渡す context の監査方法に依存するためである。これらが固まる前に Memory schema や Skill API だけを作ると、local `.yoi` 前提や現行 agent runtime 前提に引っ張られ、後で再設計が必要になる。
 
-この Objective では、Memory / Knowledge について以下の platform contract だけを維持する。
+この Objective では、Memory / Skill catalog について以下の platform contract だけを維持する。
 
-- Memory / Knowledge は Control plane が扱う record だが、Ticket / Artifact の authority を置き換えない。
-- 将来、Memory / Knowledge の canonical storage は Workspace control plane 側に置く。
-- local `.yoi` memory は compatibility、offline/export/import、local projection、migration bridge として扱う。
-- Personal Memory、Workspace Memory、Worker Summary、Maintained Knowledge は分離が必要である。
+- Memory は Control plane が扱う record だが、Ticket / Artifact の authority を置き換えない。
+- Skill catalog は Workspace backend が扱う prompt/resource catalog だが、Ticket / Worker / workdir / queue の authority を持たない。
+- 将来、Memory と Skill catalog の canonical storage / API は Workspace control plane 側に置く。
+- local `.yoi` memory と `.yoi/skills` は compatibility、offline/export/import、local projection、migration bridge として扱う。
+- Personal Memory、Workspace Memory、Worker Summary、Skill catalog は分離が必要である。
 - Generated Memory には provenance、visibility、approval、audit が必要である。
-- Runtime / Worker に渡した Memory/Knowledge context は、将来 ContextPack などとして Artifact/evidence に記録できる必要がある。
+- Runtime / Worker に渡した Memory / Skill context は、将来 ContextPack などとして Artifact/evidence に記録できる必要がある。
 
 本格的な Memory 再設計は、Memory の保存先を Workspace backend / control plane record に移すタイミングで回収する。それまでは低リスクな観察、問題例の収集、既存 local memory の互換維持に留める。
 
@@ -200,7 +201,7 @@ Desktop app は対応コストが高いので、まず Web frontend を primary 
 - TUI/local panel: fallback、dogfooding surface。
 - Future desktop: Web/control-plane model が安定した後に検討する optional client。
 
-Web UI は Ticket、Objective、Memory、Knowledge、Runtime、Worker、Artifact を扱う。UI の都合で正本を二重化しない。
+Web UI は Ticket、Objective、Memory、Skill catalog、Runtime、Worker、Artifact を扱う。UI の都合で正本を二重化しない。
 
 ### 7. 多重起動コストと runtime placement を見直す
 
@@ -226,17 +227,17 @@ Worker の一元管理、データ永続化、アーカイブは将来的には�
 ## Initial phases / candidate tickets
 
 1. **Vocabulary / architecture record**
-   - Workspace / RepositoryId / RepositorySelector / RepositoryPoint / working directory / Runtime / Worker / Control Plane / Ticket / Memory / Knowledge の用語と境界を固める。
+   - Workspace / RepositoryId / RepositorySelector / RepositoryPoint / working directory / Runtime / Worker / Control Plane / Ticket / Memory の用語と境界を固める。
 2. **Team-space canonical data model**
-   - Ticket / Objective / Target / Artifact / Actor / Permission / Audit / Memory / Knowledge の entity/event model を設計する。
+   - Ticket / Objective / Target / Artifact / Actor / Permission / Audit / Memory の entity/event model を設計する。
 3. **Ticket evidence model**
    - Ticket lifecycle、WorkerRef、Artifact、validation evidence、review evidence、Ticket thread の責務を明確化する。
 4. **Memory storage migration boundary**
-   - Memory / Knowledge の本格再設計は後回しにし、まずは Workspace backend に移す時の platform contract、compatibility/cache/export 方針、将来の provenance / visibility / approval 要件だけを固定する。
+   - Memory の本格再設計は後回しにし、まずは Workspace backend に移す時の platform contract、compatibility/cache/export 方針、将来の provenance / visibility / approval 要件だけを固定する。
 5. **Control plane backend architecture**
    - local `.yoi` backend と server-side canonical backend の境界、migration/export/import、compatibility mode を設計する。
 6. **Web control plane MVP design**
-   - read-only Ticket / Objective / Memory / Knowledge / Runtime / Worker state UI/API の範囲を決める。
+   - read-only Ticket / Objective / Memory / Runtime / Worker state UI/API の範囲を決める。
 7. **Local Runtime protocol design**
    - Web/control plane から local Runtime に安全な操作を送り、Runtime が Worker lifecycle と working directory materialization を担う protocol と authority boundary を設計する。
 8. **Repository and working directory materialization model**
@@ -258,16 +259,16 @@ Worker の一元管理、データ永続化、アーカイブは将来的には�
 
 ## Success criteria / exit conditions
 
-- Workspace / RepositoryId / RepositorySelector / RepositoryPoint / working directory / Runtime / Worker / Control Plane / Ticket / Memory / Knowledge の境界が文書化されている。
+- Workspace / RepositoryId / RepositorySelector / RepositoryPoint / working directory / Runtime / Worker / Control Plane / Ticket / Memory の境界が文書化されている。
 - Ticket が team coordination record として、target selector / Artifact / Actor / Permission / Audit と分離された model を持つ。
 - `.yoi` local backend は compatibility/local backend として整理され、server-side canonical backend の設計を阻害しない。
-- Web UI/API が Ticket / Objective / Runtime / Worker state を中心とした read-only view を提供できる設計または MVP を持つ。Memory / Knowledge は既存 record の表示または将来 placeholder に留め、本格再設計をこの段階の必須条件にしない。
+- Web UI/API が Ticket / Objective / Runtime / Worker state を中心とした read-only view を提供できる設計または MVP を持つ。Memory は既存 record の表示または将来 placeholder に留め、本格再設計をこの段階の必須条件にしない。
 - Control plane から local Runtime に対して、現在のローカル管理画面相当の安全な操作を実行できる design/protocol がある。
 - Runtime は single Workspace / Git repository root 専用 process ではなく、sandbox/authority が成立すれば複数 Workspace / Repository の Worker を抱えられる execution substrate として設計されている。
 - Git Repository root に依存しない Workspace model があり、Git Repository は Repository provider の一種として扱われている。
 - Ticket と Objective は Workspace 配下に平たく存在し、Repository への所属ではなく RepositoryId / RepositorySelector / path scope / intent で対象を表現する。
 - Git worktree 相当は working directory materialization strategy として扱われ、Artifact/evidence が concrete RepositoryPoint を記録する。
-- Memory / Knowledge は Ticket / Artifact の authority を置き換えない record として platform contract だけを持つ。本格的な意味論・抽出・承認・検索・staleness 処理は、Memory の保存先を Workspace backend / control plane record に移すタイミングで回収する。
+- Memory は Ticket / Artifact の authority を置き換えない record として platform contract だけを持つ。本格的な意味論・抽出・承認・検索・staleness 処理は、Memory の保存先を Workspace backend / control plane record に移すタイミングで回収する。
 - Hosted Runtime / resource allocation / SaaS offering に進むための後続 Ticket が切れる状態になっている。
 - 既存 local dogfooding runtime を壊さず、local use と remote-capable architecture が両立している。
 
