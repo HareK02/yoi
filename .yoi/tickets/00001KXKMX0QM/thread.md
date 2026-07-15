@@ -252,3 +252,68 @@ Critical risks / reviewer focus:
 Dependencies Workflow removal and Knowledge removal are closed, no blockers remain, accepted plan recorded. Moving queued Ticket to inprogress before creating worktree or spawning role Pods.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-15T23:46:45Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Coder Pod `yoi-coder-00001KXKMX0QM-agent-skills` completed implementation in `/home/hare/Projects/yoi/.worktree/00001KXKMX0QM-agent-skills-support` on branch `work/00001KXKMX0QM-agent-skills-support`。
+- Implementation commit: `62ef89a1634fd12a503156ce95baebbf037ef96f` (`feat: add workspace-backed agent skills`)。
+- Orchestrator inspected worktree status, branch log, commit stats, and `git diff --check 05c50e32..HEAD`; worktree was clean and diff check passed。
+
+Implementation summary:
+- Added first-class Skill schema/types and Workspace HTTP client support in `worker`。
+- Added Workspace backend Skill discovery/lint/catalog/detail/activation in `yoi-workspace-server`。
+- Added builtin Skill resource at `resources/skills/agent-skills/SKILL.md`。
+- Added Workspace server API endpoints:
+  - `GET /api/w/{workspace_id}/skills`
+  - `GET /api/w/{workspace_id}/skills/lint`
+  - `GET /api/w/{workspace_id}/skills/{name}`
+  - `GET /api/w/{workspace_id}/skills/{name}/activate`
+- Added `yoi-workspace-server skills list|lint|show` CLI surface。
+- Added Web Workspace API helpers/types for Skill catalog/detail/activation endpoints。
+- Added Worker Skill activation method using `WorkspaceClient::Http`; activation commits a `SystemItem::SkillActivation` and appends the Skill body into engine history before later LLM context use。
+- Added prompt guidance clarifying Skills are procedural LLM guidance only, not authority for external state changes。
+
+Skill behavior:
+- Workspace Skills load from `.yoi/skills/<skill-name>/SKILL.md`。
+- Lint enforces required `name` / `description`, parent-dir match, name length/pattern, description bounds, optional `license` / `compatibility` / string-map `metadata`。
+- `allowed-tools` is parsed as metadata but emits explicit ignored/non-authoritative warning。
+- Builtin + workspace Skills are loaded by Workspace backend; workspace Skills deterministically override builtin Skills with path-free provenance such as `builtin:agent-skills` / `workspace:debug-rust`。
+- Catalog responses contain lightweight metadata only; full `SKILL.md` body is returned only from detail/activation endpoints。
+- References/assets/scripts are Skill-relative resource refs only; no raw absolute paths are exposed. Resource reads/execution are not implemented, scripts are explicitly non-executable diagnostics。
+- No `/skill-name` activation syntax, Workflow projection/compatibility path, or Knowledge active support was added。
+
+Files/resources touched:
+- `crates/workspace-server/src/skills.rs`
+- `crates/workspace-server/src/server.rs`
+- `crates/workspace-server/src/main.rs`
+- `crates/workspace-server/src/lib.rs`
+- `crates/worker/src/skill.rs`
+- `crates/worker/src/worker.rs`
+- `crates/worker/src/lib.rs`
+- `crates/session-store/src/system_item.rs`
+- `crates/tui/src/app.rs`
+- `web/workspace/src/lib/workspace/api/http.ts`
+- `web/workspace/src/lib/workspace/api/http.test.ts`
+- `resources/skills/agent-skills/SKILL.md`
+- `resources/prompts/common/tool-usage.md`
+
+Coder-reported validation passed:
+- `cargo test -p yoi-workspace-server --lib`
+- `cargo test -p worker --lib --tests`
+- `cargo check -p yoi-workspace-server`
+- `cargo check -p yoi`
+- `cargo test -p yoi --tests`
+- `cd web/workspace && deno task check && deno task test` (`54 passed`, existing App.svelte warnings only)
+- `git diff --check`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+- `rg "WorkflowRecord|model_invokation|user_invocable|KnowledgeQuery|kind = knowledge|#<slug>|workflow_invoke"`: no active regressions found。
+
+Next action:
+- Route to external Reviewer Pod before merge/close decisions。
+
+---
