@@ -2,7 +2,7 @@
 title: 'Remove Knowledge support'
 state: 'queued'
 created_at: '2026-07-15T20:04:08Z'
-updated_at: '2026-07-15T20:27:02Z'
+updated_at: '2026-07-15T20:27:51Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-07-15T20:27:02Z'
