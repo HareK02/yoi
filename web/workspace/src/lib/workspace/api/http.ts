@@ -3,17 +3,106 @@ export type ApiResult<T> = {
   error: string | null;
 };
 
+export type SkillDiagnosticSeverity = "error" | "warning";
+
+export type SkillDiagnostic = {
+  severity: SkillDiagnosticSeverity;
+  code: string;
+  message: string;
+  source?: string;
+};
+
+export type SkillProvenance = {
+  kind: "builtin" | "workspace";
+  id: string;
+};
+
+export type SkillCatalogEntry = {
+  name: string;
+  description: string;
+  provenance: SkillProvenance;
+  overrides: SkillProvenance[];
+  diagnostics: SkillDiagnostic[];
+};
+
+export type SkillCatalogResponse = {
+  authority: string;
+  entries: SkillCatalogEntry[];
+  diagnostics: SkillDiagnostic[];
+};
+
+export type SkillResourceRef = {
+  kind: string;
+  name: string;
+  supported: boolean;
+  diagnostic?: string;
+};
+
+export type SkillDetailResponse = {
+  name: string;
+  description: string;
+  provenance: SkillProvenance;
+  overrides: SkillProvenance[];
+  diagnostics: SkillDiagnostic[];
+  body: string;
+  allowed_tools: string[];
+  allowed_tools_status: string;
+  resources: SkillResourceRef[];
+};
+
 function normalizePath(path: string): string {
-  if (!path || path === '/') return '';
-  return path.startsWith('/') ? path : `/${path}`;
+  if (!path || path === "/") return "";
+  return path.startsWith("/") ? path : `/${path}`;
 }
 
-export function workspaceRoute(workspaceId: string, path = ''): string {
+export function workspaceRoute(workspaceId: string, path = ""): string {
   return `/w/${encodeURIComponent(workspaceId)}${normalizePath(path)}`;
 }
 
-export function workspaceApiPath(workspaceId: string, path = ''): string {
+export function workspaceApiPath(workspaceId: string, path = ""): string {
   return `/api/w/${encodeURIComponent(workspaceId)}${normalizePath(path)}`;
+}
+
+export function workspaceSkillCatalogPath(workspaceId: string): string {
+  return workspaceApiPath(workspaceId, "/skills");
+}
+
+export function workspaceSkillDetailPath(
+  workspaceId: string,
+  name: string,
+): string {
+  return workspaceApiPath(workspaceId, `/skills/${encodeURIComponent(name)}`);
+}
+
+export function workspaceSkillActivationPath(
+  workspaceId: string,
+  name: string,
+): string {
+  return workspaceApiPath(
+    workspaceId,
+    `/skills/${encodeURIComponent(name)}/activate`,
+  );
+}
+
+export async function loadWorkspaceSkillCatalog(
+  fetchFn: typeof fetch,
+  workspaceId: string,
+): Promise<ApiResult<SkillCatalogResponse>> {
+  return loadJson<SkillCatalogResponse>(
+    fetchFn,
+    workspaceSkillCatalogPath(workspaceId),
+  );
+}
+
+export async function loadWorkspaceSkillDetail(
+  fetchFn: typeof fetch,
+  workspaceId: string,
+  name: string,
+): Promise<ApiResult<SkillDetailResponse>> {
+  return loadJson<SkillDetailResponse>(
+    fetchFn,
+    workspaceSkillDetailPath(workspaceId, name),
+  );
 }
 
 export async function loadJson<T>(
@@ -50,7 +139,10 @@ export async function workspaceApiJson<T>(path: string): Promise<T> {
   return requireJson<T>(await fetch(path), path);
 }
 
-export async function workspaceApiJsonWithBody<T>(path: string, init: RequestInit): Promise<T> {
+export async function workspaceApiJsonWithBody<T>(
+  path: string,
+  init: RequestInit,
+): Promise<T> {
   return requireJson<T>(
     await fetch(path, {
       headers: {

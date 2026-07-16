@@ -2163,6 +2163,7 @@ impl App {
                 self.blocks.push(Block::WorkerEvent { event });
             }
             session_store::SystemItem::FileAttachment { body, .. }
+            | session_store::SystemItem::SkillActivation { body, .. }
             | session_store::SystemItem::TaskReminder { body, .. }
             | session_store::SystemItem::Interrupt { body } => {
                 self.task_store.apply_system_message_text(&body);

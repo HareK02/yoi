@@ -15,6 +15,7 @@ enum Command {
     Init(InitOptions),
     ConfigDefault,
     ConfigDiff(WorkspacePathOptions),
+    Skills(SkillsCommand),
     Help,
 }
 
@@ -34,6 +35,13 @@ struct InitOptions {
 #[derive(Debug)]
 struct WorkspacePathOptions {
     workspace: PathBuf,
+}
+
+#[derive(Debug)]
+enum SkillsCommand {
+    List(WorkspacePathOptions),
+    Lint(WorkspacePathOptions),
+    Show { workspace: PathBuf, name: String },
 }
 
 #[derive(Debug)]
@@ -65,6 +73,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Init(options) => run_init(options),
         Command::ConfigDefault => run_config_default(),
         Command::ConfigDiff(options) => run_config_diff(options),
+        Command::Skills(command) => run_skills(command),
         Command::Help => Ok(()),
     }
 }
@@ -84,6 +93,7 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             Ok(Command::Init(parse_init_options(rest)?))
         }
         "config" => parse_config_command(rest),
+        "skills" => parse_skills_command(rest),
         "serve" => {
             if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
                 print_serve_help();
@@ -96,7 +106,7 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             Ok(Command::Help)
         }
         other => Err(CliError(format!(
-            "unknown command `{other}`; expected `init`, `config`, or `serve`"
+            "unknown command `{other}`; expected `init`, `config`, `skills`, or `serve`"
         ))),
     }
 }
@@ -120,6 +130,39 @@ fn run_config_default() -> Result<(), Box<dyn std::error::Error>> {
 fn run_config_diff(options: WorkspacePathOptions) -> Result<(), Box<dyn std::error::Error>> {
     let diff = WorkspaceBackendConfigFile::local_config_diff_for_workspace(&options.workspace)?;
     print!("{}", diff.text);
+    Ok(())
+}
+
+fn run_skills(command: SkillsCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        SkillsCommand::List(options) => {
+            let catalog = yoi_workspace_server::skills::catalog(&options.workspace);
+            println!("{}", serde_json::to_string_pretty(&catalog)?);
+        }
+        SkillsCommand::Lint(options) => {
+            let catalog = yoi_workspace_server::skills::lint(&options.workspace);
+            println!("{}", serde_json::to_string_pretty(&catalog)?);
+            if catalog
+                .diagnostics
+                .iter()
+                .chain(
+                    catalog
+                        .entries
+                        .iter()
+                        .flat_map(|entry| entry.diagnostics.iter()),
+                )
+                .any(|diagnostic| {
+                    diagnostic.severity == worker::skill::SkillDiagnosticSeverity::Error
+                })
+            {
+                return Err(Box::new(CliError("Skill lint found errors".to_string())));
+            }
+        }
+        SkillsCommand::Show { workspace, name } => {
+            let detail = yoi_workspace_server::skills::detail(&workspace, &name)?;
+            println!("{}", serde_json::to_string_pretty(&detail)?);
+        }
+    }
     Ok(())
 }
 
@@ -183,6 +226,37 @@ fn parse_config_command(args: &[String]) -> Result<Command, CliError> {
         }
         other => Err(CliError(format!(
             "unknown config subcommand `{other}`; expected `default` or `diff`"
+        ))),
+    }
+}
+
+fn parse_skills_command(args: &[String]) -> Result<Command, CliError> {
+    let Some((subcommand, rest)) = args.split_first() else {
+        print_skills_help();
+        return Ok(Command::Help);
+    };
+    match subcommand.as_str() {
+        "list" => Ok(Command::Skills(SkillsCommand::List(
+            parse_workspace_path_options(rest)?,
+        ))),
+        "lint" => Ok(Command::Skills(SkillsCommand::Lint(
+            parse_workspace_path_options(rest)?,
+        ))),
+        "show" => {
+            let Some((name, rest)) = rest.split_first() else {
+                return Err(CliError("skills show requires a Skill name".to_string()));
+            };
+            Ok(Command::Skills(SkillsCommand::Show {
+                workspace: parse_workspace_path_options(rest)?.workspace,
+                name: name.to_string(),
+            }))
+        }
+        "--help" | "-h" => {
+            print_skills_help();
+            Ok(Command::Help)
+        }
+        other => Err(CliError(format!(
+            "unknown skills subcommand `{other}`; expected `list`, `lint`, or `show`"
         ))),
     }
 }
@@ -333,7 +407,7 @@ fn parse_listen(value: &str) -> Result<SocketAddr, CliError> {
 
 fn print_help() {
     println!(
-        "yoi-workspace-server\n\nUsage:\n  yoi-workspace-server init [OPTIONS]\n  yoi-workspace-server config <COMMAND> [OPTIONS]\n  yoi-workspace-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
+        "yoi-workspace-server\n\nUsage:\n  yoi-workspace-server init [OPTIONS]\n  yoi-workspace-server config <COMMAND> [OPTIONS]\n  yoi-workspace-server skills <COMMAND> [OPTIONS]\n  yoi-workspace-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
     );
 }
 
@@ -346,6 +420,12 @@ fn print_init_help() {
 fn print_config_help() {
     println!(
         "yoi-workspace-server config\n\nUsage:\n  yoi-workspace-server config default\n  yoi-workspace-server config diff [OPTIONS]\n\nDescription:\n  Prints the packaged Workspace Backend config template or compares it with the workspace-local config.\n\nOptions for diff:\n      --workspace <PATH>  Workspace root (defaults to cwd)\n  -h, --help              Print help"
+    );
+}
+
+fn print_skills_help() {
+    println!(
+        "yoi-workspace-server skills\n\nUsage:\n  yoi-workspace-server skills list [OPTIONS]\n  yoi-workspace-server skills lint [OPTIONS]\n  yoi-workspace-server skills show <NAME> [OPTIONS]\n\nDescription:\n  Uses the Workspace backend Skill catalog/lint/detail authority. Catalog output is lightweight and omits full SKILL.md bodies; detail output includes the body. allowed-tools and scripts are diagnostics only.\n\nOptions:\n      --workspace <PATH>  Workspace root (defaults to cwd)\n  -h, --help              Print help"
     );
 }
 

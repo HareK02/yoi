@@ -139,6 +139,10 @@ pub enum SystemItem {
     /// byte-identical to what was sent.
     FileAttachment { path: String, body: String },
 
+    /// Explicit Agent Skill activation. `body` is the exact LLM-facing
+    /// Skill text committed before any subsequent LLM request can use it.
+    SkillActivation { name: String, body: String },
+
     /// Historical persisted Knowledge reference resolution. Knowledge is no
     /// longer active, so restored sessions ignore this item instead of replaying
     /// archived record text into model context.
@@ -174,6 +178,7 @@ impl SystemItem {
             SystemItem::Notification { body, .. } => body.clone(),
             SystemItem::WorkerEvent { body, .. } => body.clone(),
             SystemItem::FileAttachment { body, .. } => body.clone(),
+            SystemItem::SkillActivation { body, .. } => body.clone(),
             SystemItem::LegacyKnowledgeIgnored { .. } => String::new(),
             SystemItem::LegacyIgnored { slug } => {
                 format!("Ignored legacy procedure item: /{slug}")
@@ -196,6 +201,7 @@ impl SystemItem {
             SystemItem::Notification { .. } => "notification",
             SystemItem::WorkerEvent { .. } => "worker_event",
             SystemItem::FileAttachment { .. } => "file_attachment",
+            SystemItem::SkillActivation { .. } => "skill_activation",
             SystemItem::LegacyKnowledgeIgnored { .. } => "legacy_knowledge_ignored",
             SystemItem::LegacyIgnored { .. } => "legacy_ignored",
             SystemItem::TaskReminder { .. } => "task_reminder",

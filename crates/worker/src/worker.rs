@@ -49,6 +49,7 @@ use crate::prompt::loader::PromptLoader;
 use crate::prompt::system::{SystemPromptContext, SystemPromptError, SystemPromptTemplate};
 use crate::runtime::dir;
 use crate::runtime::worker_allocation::{self, ScopeAllocationGuard, ScopeLockError};
+use crate::skill::{SkillActivationResponse, SkillClientError};
 #[cfg(test)]
 use async_trait::async_trait;
 use protocol::{
@@ -894,6 +895,31 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// This never grants local filesystem authority.
     pub fn workspace_client(&self) -> &WorkspaceClient {
         self.workspace_context.client()
+    }
+
+    /// Activate an Agent Skill through the Workspace backend/client and commit
+    /// the returned SKILL.md body to history before it can influence an LLM run.
+    ///
+    /// This deliberately does not scan `.yoi/skills` locally: when a Workspace
+    /// HTTP client is available, catalog/detail/activation authority belongs to
+    /// the Workspace backend API.
+    pub fn activate_skill(&mut self, name: &str) -> Result<SkillActivationResponse, WorkerError> {
+        let activation = self.workspace_client().activate_skill(name)?;
+        self.ensure_segment_head()?;
+        let body = format!(
+            "Agent Skill `{}` activated from {}.\n\n{}",
+            activation.name, activation.provenance.id, activation.body
+        );
+        self.commit_entry(LogEntry::SystemItem {
+            ts: segment_log::now_millis(),
+            item: SystemItem::SkillActivation {
+                name: activation.name.clone(),
+                body: body.clone(),
+            },
+        })?;
+        self.engine_mut()
+            .append_history(std::iter::once(llm_engine::Item::system_message(body)));
+        Ok(activation)
     }
 
     pub(crate) fn worker_metadata_store(&self) -> St
@@ -4789,6 +4815,9 @@ pub enum WorkerError {
     #[error(transparent)]
     PromptCatalog(#[from] CatalogError),
 
+    #[error(transparent)]
+    Skill(#[from] SkillClientError),
+
     #[error("memory extract staging write failed: {0}")]
     ExtractStaging(#[source] memory::extract::StagingError),
 
@@ -5937,6 +5966,102 @@ mod build_summary_prompt_tests {
 
         assert!(!prompt.contains("Resident memory summary"));
         assert!(!prompt.contains("resident summary marker"));
+    }
+
+    #[test]
+    fn activate_skill_commits_and_appends_history_before_future_context_use() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            assert!(
+                request_line
+                    .starts_with("GET /api/w/ws-skill/skills/triage-errors/activate HTTP/1.1")
+            );
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            let body = serde_json::json!({
+                "name": "triage-errors",
+                "provenance": { "kind": "workspace", "id": "workspace:triage-errors" },
+                "diagnostics": [],
+                "body": "---\nname: triage-errors\ndescription: Use when testing activation history.\n---\n\n# Triage Errors\n\nCommitted Skill body."
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = minimal_manifest();
+        let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
+        let cwd = dir.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let scope = Scope::writable(&cwd).unwrap();
+        let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
+        let mut worker = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(Worker::new(
+                manifest,
+                Engine::new(NoopClient),
+                store,
+                WorkerWorkspaceContext::with_client(
+                    Some(WorkspaceId::new("ws-skill").unwrap()),
+                    WorkspaceClient::http("ws-skill", format!("http://{addr}")),
+                ),
+                authority,
+                scope,
+            ))
+            .unwrap();
+
+        let activation = worker.activate_skill("triage-errors").unwrap();
+
+        assert_eq!(activation.name, "triage-errors");
+        server.join().unwrap();
+        let history = worker.history();
+        assert_eq!(history.len(), 1);
+        let history_text = history[0].as_text().unwrap();
+        assert!(
+            history_text
+                .contains("Agent Skill `triage-errors` activated from workspace:triage-errors")
+        );
+        assert!(history_text.contains("# Triage Errors"));
+        assert!(history_text.contains("Committed Skill body."));
+
+        let entries = worker
+            .store
+            .read_all(
+                worker.segment_state.session_id(),
+                worker.segment_state.segment_id(),
+            )
+            .unwrap();
+        assert!(entries.iter().any(|entry| {
+            matches!(
+                entry,
+                LogEntry::SystemItem {
+                    item: SystemItem::SkillActivation { name, body },
+                    ..
+                } if name == "triage-errors"
+                    && body.contains("# Triage Errors")
+                    && body == history_text
+            )
+        }));
     }
 
     fn minimal_manifest() -> WorkerManifest {
