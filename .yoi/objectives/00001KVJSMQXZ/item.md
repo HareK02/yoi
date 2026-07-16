@@ -2,13 +2,13 @@
 title: "効果的な Memory システム設計・検証"
 state: "active"
 created_at: "2026-06-20T15:16:00Z"
-updated_at: "2026-07-15T21:18:00Z"
-linked_tickets: ["00001KSKBPHRG", "00001KT02TCCG", "00001KTGCAFXG", "00001KSKBPTHR"]
+updated_at: "2026-07-16T04:38:00Z"
+linked_tickets: ["00001KSKBPHRG", "00001KT02TCCG", "00001KTGCAFXG", "00001KSKBPTHR", "00001KXMEZNYC", "00001KXMK7YMC", "00001KXMK846H"]
 ---
 
 ## Goal
 
-Yoi の Memory / generated memory / resident context / retrieval / usage metrics を、実際の開発・設計・レビュー・オーケストレーションに効く sensemaking substrate として再設計・検証する。Knowledge は separate record kind として削除する方針であり、この Objective では Memory と authority record / Skill / docs の境界を再整理する。
+Yoi の Memory / Knowledge / Skills / generated context / resident context / retrieval / usage metrics を、実際の開発・設計・レビュー・オーケストレーションに効く sensemaking substrate として再設計・検証する。Memory は短期・変化前提の context、Knowledge は育てる long-term note、Skill は移植可能な workflow として分け、この Objective ではそれらと authority record / docs / typed tools の境界を再整理する。
 
 この Objective でいう「効果的な Memory システム」は、単に多く保存する仕組みではなく、作業中の問いに対して relevant material を集め、根拠を検証可能にし、再表現・仮説形成・反証探索・意思決定・成果物への反映を低コストにする仕組みである。
 
@@ -41,7 +41,7 @@ Yoi の現行 Memory は、この流れのうち「保存」と「一部の検�
 
 - Ticket / task / question ごとの shoebox がない。
 - shoebox から evidence snippets を切り出し、source / provenance / applicability / confidence と共に扱う evidence file がない。
-- `summary`, `decision`, `request` は durable memory storage taxonomy であり、sensemaking 用 schema としては粗い。Knowledge record kind は削除方針なので、再利用可能な手順は Skill、保守された設計資料は docs / Ticket decisions に寄せる。
+- `summary`, `decision`, `request` は durable memory storage taxonomy であり、sensemaking 用 schema としては粗い。Knowledge は古い record kind をそのまま残すのではなく、育てる long-term note subsystem として再設計する。再利用可能な手順は Skill、保守された設計資料は Knowledge / docs / Ticket decisions に寄せる。
 - decision は残るが、hypothesis space、alternative、rejected reason、disconfirming evidence が残りにくい。
 - reviewer / orchestrator が confirmation bias を避けるための反証探索導線が弱い。関連する手順誘導は旧 Workflow ではなく Skill と role prompt / typed tools へ寄せる。
 - resident exposure と explicit retrieval は観測できても、Memory が product に効いたかは測りにくい。
@@ -67,7 +67,16 @@ Memory 墓場化の最初の原因は、保存情報が現在の問いに集ま�
 
 この段階では大きな永続 schema 追加に飛びつかず、report / Ticket artifact / bounded generated context として検証してよい。
 
-### 3. Memory を authority にしない
+### 3. Session Overview を extract の足場にする
+
+現在の extract は、tool call / tool result summary を含む flat slice から意味を復元しようとして断片化しやすい。改善方針は、main Worker が通常 Assistant Message として Progress message を残し、user messages + Assistant messages を Session Overview として先に読む形にする。
+
+- Progress message は専用 Tool ではなく通常 Message とし、ユーザーへの進捗報告と extract 用 semantic summary を兼ねる。
+- extract worker には専用の read-only evidence tools を渡し、Overview で重要そうに見えた箇所だけ session range / tool summaries / source anchors を探索させる。
+- extract worker は Memory / Knowledge / Skill を直接更新しない。output は必ず staging を挟み、source / provenance を host 側で機械的に保持する。
+- trigger は LLM call 単位ではなく、Overview accumulation、evidence growth、Worker run cycle、task boundary を組み合わせる。mid-run 発火を入れる場合も staging/checkpoint extraction に限定する。
+
+### 4. Memory を authority にしない
 
 Memory は Ticket、docs、git history、session logs、user instruction の代替ではない。Memory は authority record への evidence index / schema / reasoning aid として扱う。
 
@@ -78,7 +87,7 @@ Memory は Ticket、docs、git history、session logs、user instruction の代�
 - Memory の断定をそのまま authority として使わない。
 - Ticket body/thread/artifacts を読まずに Objective や Memory だけで実装判断できる状態を作らない。
 
-### 4. 反証探索を first-class にする
+### 5. 反証探索を first-class にする
 
 より効果的な Memory は、過去方針を思い出すだけでなく、現在案を疑うために使える必要がある。
 
@@ -92,7 +101,7 @@ Reviewer / Orchestrator / Intake の導線では、次を探せるようにす�
 - authority boundary risks
 - prior failures / reports
 
-### 5. Metrics は exposure から product impact へ寄せる
+### 6. Metrics は exposure から product impact へ寄せる
 
 Memory が prompt に入った、または query されたことは成功ではない。評価は次を区別する。
 
@@ -105,7 +114,7 @@ Memory が prompt に入った、または query されたことは成功では�
 - contradicted / invalidated
 - led to docs or decision update
 
-### 6. 後続 Ticket は concrete slice に分割する
+### 7. 後続 Ticket は concrete slice に分割する
 
 この Objective は中期的な設計・検証の一元化 record であり、umbrella Ticket ではない。実装や調査は、単独で実装・レビュー・close できる concrete Ticket に分割する。
 
@@ -118,6 +127,10 @@ Memory が prompt に入った、または query されたことは成功では�
 - Reviewer Skill / review process に反証探索を入れる。
 - Memory usage metrics を product impact oriented に拡張する。
 - stale / contradiction / renewal の検出・表示を設計する。
+- turn 中の Progress message を通常 Assistant Message として残す prompt/guidance を追加する (`00001KXMEZNYC`)。
+- Session Overview + Evidence index を使う extract input を設計・実装する。
+- extract worker 専用の read-only evidence search/read/source-anchor tools を設計する。
+- extract output を staging に限定し、source range と output entry を結びつける schema を設計する。
 
 ## Success criteria / exit conditions
 
@@ -126,6 +139,9 @@ Memory が prompt に入った、または query されたことは成功では�
 - Ticket / Objective / docs / session logs / Memory / Skills の authority boundary が明確で、Memory が authority を僭称せず、Skill は手順資源として外部状態 authority を持たない。
 - 少なくとも一つの実作業 routing / review / design analysis で、task-bound shoebox または evidence file が生成・利用され、作業品質にどう効いたかが確認されている。
 - Memory records または関連 artifacts が source / provenance / applicability / staleness / supports-or-refutes のいずれかを扱えるようになっている。
+- extract が User / Assistant messages 由来の Session Overview を primary input とし、tool logs を evidence として探索できる設計になっている。
+- extract worker 専用の read-only evidence tools が設計され、main Worker の tool surface を増やさない方針になっている。
+- extract output は direct Memory / Knowledge / Skill write ではなく staging を挟む方針になっている。
 - Reviewer / Orchestrator が supporting evidence だけでなく、contradicting evidence / stale assumptions / rejected alternatives を探す導線を持っている。
 - Memory usage metrics が resident exposure と product impact を区別している。
 - 古い Memory が放置されるのではなく、stale / superseded / contradicted / needs-review として扱える方針がある。
@@ -141,13 +157,14 @@ Memory が prompt に入った、または query されたことは成功では�
 - Memory は durable project authority ではない。Ticket、docs、git history、session logs、明示 user instruction の代替として使わない。
 - Objective context は判断背景であり、個別実装の authority は各 Ticket body/thread/artifacts と明示的な Ticket relations / OrchestrationPlan records にある。
 - `history` に残らない context-only injection を改善案にしない。新しい context input は history に commit する原則を守る。
-- Knowledge record kind は削除方針。再利用可能な手順・作法は Agent Skills (`.yoi/skills/<skill>/SKILL.md`) へ、durable policy/rationale は Memory decisions / maintained docs / Ticket decisions へ、外部状態 authority は typed feature/tool surface へ分ける。
+- Knowledge は古い unused record kind をそのまま残すのではなく、育てる long-term Markdown note subsystem として再設計する。再利用可能な手順・作法は Agent Skills (`.yoi/skills/<skill>/SKILL.md`) へ、durable policy/rationale は Knowledge / maintained docs / Ticket decisions へ、外部状態 authority は typed feature/tool surface へ分ける。
 - Generated memory / Ticket / docs / report / Skill の境界を再定義する場合は、authority boundary と migration/staleness を明示する。
 - 関連する既存 Ticket:
   - `00001KSKBPHRG` — Prompt / Workflow 評価メトリクスと改善 Offer
   - `00001KT02TCCG` — Memory prompt: conditional guidance and proactive lookup
   - `00001KTGCAFXG` — Use .yoi/memory marker for repo-local memory root
   - `00001KSKBPTHR` — ワークスペースのメモリーをLintするヘッドレスCLI
+  - `00001KXMEZNYC` — ターン中のProgress messageを残す指示を追加する
 
 ## Historical references / prior design sources
 
@@ -224,7 +241,10 @@ HermesAgent で特に重要だった点:
 
 この Objective での再解釈:
 
-- HermesAgent の `MEMORY.md` / `USER.md` / `skills` の分離は、Yoi の Memory / Skills / prompt resources / docs / Ticket decision / generated memory の責務再整理に使える。
+- HermesAgent の `MEMORY.md` / `USER.md` / `skills` の分離は、Yoi の Memory / Knowledge / Skills / prompt resources / docs / Ticket decision / generated memory の責務再整理に使える。
+- Yoi は foreground isolation 自体をすでに持つため、取り入れるべきなのは isolation そのものではなく、Overview を足場にした maintenance / extraction の質改善である。
+- main Worker が通常 Assistant Message として残す Progress message は、人間向け進捗報告と machine-readable session overview を兼ねられる。
+- extract worker は専用 read-only evidence tools で必要箇所だけ探索し、direct write ではなく staging に出力する。
 - reusable procedure, reviewer focus, orchestration tactic, project preference, user preference, design invariant を同じ Memory bucket に入れると墓場化しやすい。
 - `Nothing to save.` / empty extraction allowed は重要だが、保存抑制だけでは効果的な Memory にはならない。保存されたものが task-bound shoebox / evidence / schema / hypothesis / product に接続される必要がある。
 - frozen snapshot / prompt cache 配慮は Yoi の history/context 加工原則と整合するが、それだけでは retrieval / resurfacing / disconfirmation は解決しない。
@@ -242,6 +262,7 @@ Codex と HermesAgent の調査から、Yoi が継承すべきものと、継承
 - stale / noisy / unused entries の cleanup。
 - procedural memory と declarative memory の分離。
 - session search / usage metrics / linter feedback を consolidation に入れる設計。
+- user / Assistant messages から作る Session Overview を semantic guide にし、tool logs を evidence として探索する設計。
 
 足りないもの:
 
