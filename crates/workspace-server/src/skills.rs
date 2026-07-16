@@ -287,7 +287,19 @@ fn parse_skill_source(source: SkillSource) -> Result<ParsedSkill, Vec<SkillDiagn
         ));
         return Err(diagnostics);
     };
-    let frontmatter = match serde_yaml::from_str::<SkillFrontmatter>(frontmatter) {
+    let frontmatter_value = match serde_yaml::from_str::<serde_yaml::Value>(frontmatter) {
+        Ok(value) => value,
+        Err(error) => {
+            diagnostics.push(SkillDiagnostic::error(
+                "invalid_frontmatter_yaml",
+                format!("SKILL.md frontmatter is invalid YAML: {error}"),
+                Some(provenance.id.clone()),
+            ));
+            return Err(diagnostics);
+        }
+    };
+    diagnose_unsupported_frontmatter_keys(&frontmatter_value, &provenance, &mut diagnostics);
+    let frontmatter = match serde_yaml::from_value::<SkillFrontmatter>(frontmatter_value) {
         Ok(frontmatter) => frontmatter,
         Err(error) => {
             diagnostics.push(SkillDiagnostic::error(
@@ -440,6 +452,79 @@ fn validate_optional_string(
             Some(provenance.id.clone()),
         ));
     }
+}
+
+fn diagnose_unsupported_frontmatter_keys(
+    value: &serde_yaml::Value,
+    provenance: &SkillProvenance,
+    diagnostics: &mut Vec<SkillDiagnostic>,
+) {
+    let Some(mapping) = value.as_mapping() else {
+        diagnostics.push(SkillDiagnostic::error(
+            "invalid_frontmatter_shape",
+            "SKILL.md frontmatter must be a YAML mapping",
+            Some(provenance.id.clone()),
+        ));
+        return;
+    };
+
+    for key in mapping.keys() {
+        let Some(key) = key.as_str() else {
+            diagnostics.push(SkillDiagnostic::error(
+                "invalid_frontmatter_key",
+                "Skill frontmatter keys must be strings",
+                Some(provenance.id.clone()),
+            ));
+            continue;
+        };
+        if !is_supported_frontmatter_key(key) {
+            let (code, message) = if is_workflow_projection_key(key) {
+                (
+                    "unsupported_workflow_frontmatter_field",
+                    format!(
+                        "Skill frontmatter field `{key}` is a removed Workflow projection/invocation field and is not accepted as Skill semantics"
+                    ),
+                )
+            } else {
+                (
+                    "unsupported_frontmatter_field",
+                    format!(
+                        "Skill frontmatter field `{key}` is not supported; supported fields are name, description, license, compatibility, metadata, and allowed-tools"
+                    ),
+                )
+            };
+            diagnostics.push(SkillDiagnostic::error(
+                code,
+                message,
+                Some(provenance.id.clone()),
+            ));
+        }
+    }
+}
+
+fn is_supported_frontmatter_key(key: &str) -> bool {
+    matches!(
+        key,
+        "name" | "description" | "license" | "compatibility" | "metadata" | "allowed-tools"
+    )
+}
+
+fn is_workflow_projection_key(key: &str) -> bool {
+    matches!(
+        key,
+        "model_invokation"
+            | "model_invocation"
+            | "user_invocable"
+            | "workflow"
+            | "workflow_record"
+            | "workflow_invoke"
+            | "invocation"
+            | "invocations"
+            | "graph"
+            | "nodes"
+            | "edges"
+            | "triggers"
+    )
 }
 
 fn parse_allowed_tools(
@@ -597,6 +682,64 @@ mod tests {
                 .any(|d| d.code == "invalid_skill_directory_name")
         );
         assert!(diagnostics.iter().any(|d| d.code == "name_parent_mismatch"));
+    }
+
+    #[test]
+    fn workflow_projection_frontmatter_fields_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            tmp.path(),
+            "workflow-shaped",
+            "---\nname: workflow-shaped\ndescription: Use when proving workflow projection fields are rejected as Skills.\nmodel_invokation: old-typo\nuser_invocable: true\ngraph: {}\ninvocation:\n  run: now\n---\n\n# Workflow Shaped",
+        );
+
+        let catalog = catalog(tmp.path());
+        assert!(
+            catalog
+                .entries
+                .iter()
+                .all(|entry| entry.name != "workflow-shaped")
+        );
+        let codes = catalog
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect::<Vec<_>>();
+        assert!(codes.contains(&"unsupported_workflow_frontmatter_field"));
+        for unsupported in ["model_invokation", "user_invocable", "graph", "invocation"] {
+            assert!(
+                catalog.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "unsupported_workflow_frontmatter_field"
+                        && diagnostic.message.contains(unsupported)
+                }),
+                "missing unsupported-field diagnostic for {unsupported}"
+            );
+        }
+        assert!(matches!(
+            detail(tmp.path(), "workflow-shaped"),
+            Err(SkillError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn unknown_frontmatter_fields_are_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_skill(
+            tmp.path(),
+            "unknown-field",
+            "---\nname: unknown-field\ndescription: Use when proving unsupported Skill fields are rejected.\ncustom-authority: no\n---\n\n# Unknown",
+        );
+
+        let catalog = catalog(tmp.path());
+        assert!(
+            catalog
+                .entries
+                .iter()
+                .all(|entry| entry.name != "unknown-field")
+        );
+        assert!(catalog.diagnostics.iter().any(|diagnostic| diagnostic.code
+            == "unsupported_frontmatter_field"
+            && diagnostic.message.contains("custom-authority")));
     }
 
     #[test]
