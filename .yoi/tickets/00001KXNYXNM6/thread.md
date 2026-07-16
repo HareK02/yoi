@@ -14,3 +14,12 @@ Overview-first extract implementation was split so this Ticket owns the staging 
 
 
 ---
+
+<!-- event: state_changed author: workspace-panel at: 2026-07-16T19:26:52Z from: ready to: queued reason: queued field: state -->
+
+## State changed
+
+Ticket を `workspace-panel` が queued にしました。
+
+
+---
