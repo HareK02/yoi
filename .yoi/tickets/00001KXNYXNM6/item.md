@@ -2,7 +2,7 @@
 title: 'Extract stagingのsource anchor形式を実装する'
 state: 'inprogress'
 created_at: '2026-07-16T17:17:22Z'
-updated_at: '2026-07-16T19:40:54Z'
+updated_at: '2026-07-16T19:44:01Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-07-16T19:26:52Z'

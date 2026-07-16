@@ -165,3 +165,28 @@ Next action:
 - Route to external Reviewer Pod before merge/close decisions。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-16T19:44:01Z status: approve -->
+
+## Review: approve
+
+External review result: approve
+
+Evidence:
+- bounded anchor fields and evidence kind constants are added in `crates/memory/src/schema/common.rs:45-98`。
+- all four staging entry types carry default/skip-empty `source_refs` hidden from extract JSON schema via `#[schemars(skip)]` in `crates/memory/src/extract/payload.rs:45-92`。
+- old/no-ref JSON and new ref roundtrip tests cover preservation/empty serialization in `payload.rs:121-253`。
+- legacy record-level `source.session_id` compatibility is covered in `crates/memory/src/consolidate/staging.rs:147-188`。
+- consolidation passes refs through visible pretty JSON and tests preservation in `crates/memory/src/consolidate/input.rs:60-70,281-318`。
+
+Validation performed by reviewer:
+- implementation worktree clean before/after。
+- `cargo test -p memory` passed。
+- `git diff --check HEAD~1..HEAD` passed。
+
+Blockers: none。
+
+Non-blocking note:
+- `label` / `summary` の length/raw-content discipline は type enforcement ではなく semantic/host-policy に残る。ただし raw message/tool-result embedding や out-of-scope session-explore/disposition implementation は導入されていない。
+
+---
