@@ -412,3 +412,120 @@ Non-blocking note:
 - detail/activation for invalid Skills still surface as not-found while catalog/lint carries diagnostics; acceptable for this initial authority model。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-16T00:14:34Z -->
+
+## Implementation report
+
+Merge / final validation report:
+
+- Reviewer approved the implementation after unsupported Skill frontmatter and Worker activation/history fixes。
+- Merged branch `work/00001KXKMX0QM-agent-skills-support` into orchestration branch with merge commit `1611e04d merge: agent skills support`。
+- Final validation was rerun in `/home/hare/Projects/yoi/.worktree/orchestration` after merge。
+
+Validation passed:
+- Regression grep for `WorkflowRecord|model_invokation|user_invocable|KnowledgeQuery|kind = knowledge|#<slug>|workflow_invoke` with only expected Skill rejection logic/tests where applicable。
+- `git diff --check`
+- `cargo test -p yoi-workspace-server --lib`
+- `cargo test -p worker --lib --tests`
+- `cargo test -p yoi --tests`
+- `cd web/workspace && deno task check`
+- `cd web/workspace && deno task test`
+- `cargo check -p yoi-workspace-server`
+- `cargo check -p yoi`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Validation log:
+- `/run/user/1000/yoi/yoi-orchestrator/bash-output/agent-skills-final-validation-1784160679.txt`
+
+Reviewed/merged implementation commits:
+- `62ef89a1 feat: add workspace-backed agent skills`
+- `4ddfccee fix: reject unsupported skill fields`
+
+Notes:
+- Workspace backend is the Skill catalog/detail/lint/activation authority。
+- Workspace Skills live under `.yoi/skills/<skill-name>/SKILL.md`; builtin Skill resources are supported with deterministic workspace override/provenance diagnostics。
+- Catalog is lightweight; detail/activation returns full body。
+- Worker activation through `WorkspaceClient::Http` commits/appends Skill body to history before later LLM context use。
+- `allowed-tools` and scripts/resources are diagnostic/non-authoritative in this initial implementation。
+- Workflow and Knowledge active surfaces were not reintroduced。
+- Per user instruction, no `StopPod` cleanup was performed。
+
+---
+
+<!-- event: state_changed author: orchestrator at: 2026-07-16T00:14:40Z from: inprogress to: done reason: implementation_validated field: state -->
+
+## State changed
+
+Implementation was reviewed, merged into orchestration branch, and final validation passed. Moving to done before closure.
+
+---
+
+<!-- event: state_changed author: hare at: 2026-07-16T00:15:05Z from: done to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-07-16T00:15:05Z status: closed -->
+
+## 完了
+
+Agent Skills support を実装・レビュー・merge・検証した。
+
+実装内容:
+- first-class Skill schema/types と Workspace HTTP client support を追加。
+- Workspace backend に Skill discovery / lint / catalog / detail / activation を追加。
+- Workspace API endpoints を追加:
+  - `GET /api/w/{workspace_id}/skills`
+  - `GET /api/w/{workspace_id}/skills/lint`
+  - `GET /api/w/{workspace_id}/skills/{name}`
+  - `GET /api/w/{workspace_id}/skills/{name}/activate`
+- `yoi-workspace-server skills list|lint|show` CLI surface を追加。
+- Web Workspace API helpers/types を追加。
+- builtin Skill resource `resources/skills/agent-skills/SKILL.md` を追加。
+- Worker Skill activation method を追加し、`WorkspaceClient::Http` 経由で Skill activation を取得し、`SystemItem::SkillActivation` を commit し、Skill body を engine history に append するようにした。
+- Prompt guidance を更新し、Skills は procedural LLM guidance であり external state authority ではないことを明示。
+
+Skill behavior:
+- Workspace Skills are read from `.yoi/skills/<skill-name>/SKILL.md`。
+- Lint validates required `name` / `description`, parent-dir match, name length/pattern, description bounds, optional `license` / `compatibility` / string-map `metadata`。
+- Unknown frontmatter keys are lint errors。
+- Workflow/projection/invocation-shaped keys such as `model_invokation`, `user_invocable`, `graph`, `invocation` are explicitly rejected with `unsupported_workflow_frontmatter_field`。
+- `allowed-tools` is parsed/diagnosed as experimental ignored/non-authoritative metadata。
+- Builtin and workspace Skills are loaded deterministically; workspace Skills override builtin Skills with path-free provenance。
+- Catalog responses contain lightweight metadata only; detail/activation returns full `SKILL.md` body。
+- References/assets/scripts are Skill-relative and non-executable/non-authoritative; no raw absolute paths are exposed。
+- No `/skill-name` syntax, Workflow compatibility path, or Knowledge active support was added。
+
+Review:
+- Initial review requested changes for silently accepted unsupported Workflow frontmatter and missing Worker activation/history coverage。
+- `4ddfccee fix: reject unsupported skill fields` added unsupported-key diagnostics/regression tests and Worker activation/history tests。
+- Focused re-review approved with no blockers。
+- Non-blocking note: detail/activation for invalid Skills returns not-found while catalog/lint carries diagnostics; acceptable for this initial authority model。
+
+Merge / validation:
+- Merge commit: `1611e04d merge: agent skills support`。
+- Final validation passed:
+  - Regression grep for removed Workflow/Knowledge active surfaces。
+  - `git diff --check`
+  - `cargo test -p yoi-workspace-server --lib`
+  - `cargo test -p worker --lib --tests`
+  - `cargo test -p yoi --tests`
+  - `cd web/workspace && deno task check`
+  - `cd web/workspace && deno task test`
+  - `cargo check -p yoi-workspace-server`
+  - `cargo check -p yoi`
+  - `yoi ticket doctor`
+  - `nix build .#yoi --no-link`
+- Validation log: `/run/user/1000/yoi/yoi-orchestrator/bash-output/agent-skills-final-validation-1784160679.txt`
+
+Cleanup:
+- Implementation worktree/branch cleanup will be performed after close commit。
+- Per user instruction, `StopPod` is not used。
+
+---
