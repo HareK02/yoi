@@ -115,3 +115,53 @@ Next action:
 Dashboard queue authorization was inspected, no blockers were found, and an accepted plan was recorded. Moving queued Ticket to inprogress before creating worktree or spawning role Pods.
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-16T19:40:54Z -->
+
+## Implementation report
+
+Implementation progress report:
+
+- Coder Pod `yoi-coder-00001KXNYXNM6-staging-anchors` completed implementation in `/home/hare/Projects/yoi/.worktree/00001KXNYXNM6-staging-source-anchors` on branch `work/00001KXNYXNM6-staging-source-anchors`。
+- Implementation commit: `31798fb2 feat: add staging entry source anchors`。
+- Orchestrator inspected worktree status, branch log, commit stats, and `git diff --check 08c4547a..HEAD`; worktree was clean and diff check passed。
+
+Implementation summary:
+- Added bounded entry-level source/evidence metadata types in `crates/memory/src/schema/common.rs`:
+  - `EvidenceKind(pub String)` with known constants: `message`, `tool_call`, `tool_result`, `file_ref`, `ticket_ref`, `objective_ref`。
+  - `SourceEvidenceRef` with optional skip-empty serde fields: `session_id`, `segment_id`, `entry_range`, `evidence_id`, `evidence_kind`, `label`, `summary`。
+- Added `source_refs: Vec<SourceEvidenceRef>` to `DecisionEntry`, `DiscussionEntry`, `AttemptEntry`, and `RequestEntry`。
+- `source_refs` defaults empty and is skipped during serialization when empty。
+- `source_refs` is marked `#[schemars(skip)]` so host-resolved anchors are not exposed as LLM-authored extract-schema fields。
+- Existing `StagingRecord.source` remains record-level source range。
+- Added deserialization-only compatibility for legacy record-level `SourceRef` using old `source.session_id` when `segment_id` is absent。
+- Consolidation input renders staging records as pretty JSON, preserving entry-level refs losslessly。
+- Did not implement session-explore, resolver tools, extract launch paths, or staging resolution/disposition。
+
+Files touched:
+- `crates/memory/src/schema/common.rs`
+- `crates/memory/src/schema/mod.rs`
+- `crates/memory/src/extract/payload.rs`
+- `crates/memory/src/extract/staging.rs`
+- `crates/memory/src/consolidate/input.rs`
+- `crates/memory/src/consolidate/staging.rs`
+
+Test/evidence coverage added or updated:
+- Old staging JSON without `source_refs` deserializes and reserializes without empty `source_refs`。
+- New staging JSON with entry-level refs roundtrips through serde, preserving session id / segment id / entry range / evidence id / evidence kind / label / summary。
+- Legacy `source.session_id` staging JSON is accepted for compatibility。
+- Consolidation rendering includes/preserves entry-level refs in staging JSON input text。
+
+Coder-reported validation passed:
+- `cargo fmt`
+- `cargo test -p memory`
+- `cargo check -p yoi`
+- `git diff --check`
+- `git diff --check HEAD~1 HEAD`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Next action:
+- Route to external Reviewer Pod before merge/close decisions。
+
+---
