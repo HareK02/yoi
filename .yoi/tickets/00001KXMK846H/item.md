@@ -10,8 +10,6 @@ assignee: null
 
 現状の staging は extract output の一時保存としては機能しているが、Memory 化前の審査キューとしての情報が弱い。consolidation が成功すると consumed staging は削除されるため、どの staging entry を Memory 化したか、何を捨てたか、なぜ捨てたか、何を Knowledge / Skill candidate に送るべきだったかが machine-readable に残りにくい。
 
-この Ticket では設計だけで止めず、staging entry の resolution / disposition を実装し、consolidation が staging から Memory 化する際の審査・剪定結果を残せるようにする。Memory は短期・変化前提の context であり、staging から無制限に append しない。
-
 関連:
 
 - Objective `00001KVJSMQXZ`

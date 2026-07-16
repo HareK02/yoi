@@ -40,3 +40,12 @@ Marked ready by `yoi ticket state`.
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-07-16T17:19:41Z -->
+
+## Decision
+
+Rescoped from broad Overview-first extract implementation to the worker implementation slice. This Ticket now implements an extract worker that runs with only the builtin:session-explore feature enabled, connected to an immutable conversation snapshot and filtered Overview projection. It depends on Ticket 00001KXNYXNM6 for the staging source anchor / evidence ref format.
+
+
+---

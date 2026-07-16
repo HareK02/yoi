@@ -1,6 +1,6 @@
 ---
 created_at: "2026-07-15T21:33:00Z"
-updated_at: "2026-07-16T03:45:00Z"
+updated_at: "2026-07-16T17:18:00Z"
 objective: "00001KVJSMQXZ"
 status: "architecture-draft"
 notes: "Memory / Knowledge / Skills を別々の workspace resource として再設計するための draft architecture。この文書は Objective resource であり、実装 authority ではない。"
@@ -8,21 +8,24 @@ notes: "Memory / Knowledge / Skills を別々の workspace resource として再
 
 # Memory / Knowledge / Skills architecture overview
 
-## 立場
+## 1. Position
 
-Yoi は **Memory**、**Knowledge**、**Skills** を 1 つの汎用 record store に押し込めるのではなく、別々の resource class として扱う。
+Yoi は **Memory**、**Knowledge**、**Skills** を 1 つの汎用 record store に押し込めず、別々の resource class として扱う。
 
-sensemaking model よりも、実際に運用できる architecture の方が重要。Pirolli & Card の sensemaking process は背景知識としては有用だが、product shape が固まる前に shoebox / evidence / hypothesis infrastructure を第一級概念にする必要はない。まず目指すべきなのは、成果物が人間に読める形で成長できる clear な workspace resource model である。
+最初に固めるべきなのは、成果物が人間に読める形で成長できる workspace resource model である。Pirolli & Card の sensemaking process は有用な背景知識だが、storage taxonomy を shoebox / evidence / hypothesis として先に固定しない。sensemaking は Memory / Knowledge / Skills の上に乗る usage pattern として扱う。
 
-目標の分割:
+Target split:
 
 - **Memory**: 短期 fact、嗜好、現在の focus、進行中の context。変化する前提で書く。
 - **Knowledge**: 長期的に育てる note。人間と agent が改訂し、相互リンクで mesh を形成し、durable project understanding として読めるもの。
 - **Skill**: Agent Skills format に従う、移植可能で確立された手順・workflow。
 
-これは、以前の draft にあった sensemaking artifact 中心の見方を置き換える。sensemaking は Memory / Knowledge / Skills の上に乗る usage pattern であり、中心の storage taxonomy ではない。
+この文書の中核は次の 2 つである。
 
-## Design goals
+1. resource class の境界を明確にする。
+2. session から extract / staging / consolidation を経て resource に至る pipeline の責務を明確にする。
+
+## 2. Design goals
 
 - 人間が読め、成長できる artifact を作る。
   - 一時的な model summary だけでは足りない。
@@ -42,9 +45,9 @@ sensemaking model よりも、実際に運用できる architecture の方が重
 - 可能な限り Workspace backend を resource API の共有 authority にする。
   - `WorkspaceClient::Http` が使えるときに、Worker ごとに local view が分岐してはいけない。
 
-## Resource classes
+## 3. Resource model
 
-### Memory
+### 3.1 Memory
 
 Memory は、agent が作業を継続する助けになる volatile / short-to-medium-term な情報を扱う。長期的な project truth のふりはしない。
 
@@ -53,7 +56,7 @@ Memory record に入るもの:
 - 現在の focus。
 - user preferences。
 - working assumptions。
-- authority が別にある recent decisions。
+- authority が別にある recent decisions の要約や pointer。
 - 進行中の constraints。
 - あとで Ticket / doc / session を再確認するための reminder。
 - session から得た observations。
@@ -68,6 +71,59 @@ Memory は provisional に書く:
 - 可能なら Tickets / docs / Knowledge notes への pointer を優先する。
 
 Memory は resident context と lightweight lookup には有用だが、permanent note system として最適化しない。
+
+#### 3.1.1 Memory storage profile: bounded H2 Markdown file
+
+Memory の初期 storage profile は、bounded な single Markdown file にする。
+
+Memory は Knowledge のような note bundle ではない。1〜3 行程度の short items を H2 section ごとに並べる resident context surface として扱う。
+
+初期 filesystem shape:
+
+```text
+.yoi/memory/
+  memory.md
+  _staging/
+  _resolutions.jsonl
+```
+
+`memory.md` は H2 section を基本単位にする。
+
+```md
+# Workspace Memory
+
+## Current focus
+
+- Memory extract redesign is focused on Overview-first extraction and staging resolution.
+  Scope: Yoi repo. Source: Objective 00001KVJSMQXZ. Stale when related tickets close.
+
+## Preferences
+
+- User prefers implementation Tickets, not design-only Tickets.
+  Scope: Yoi dogfooding. Source: 2026-07-16 session.
+
+## Working assumptions
+
+- Knowledge should be OKF-compatible, while volatile Memory and staging should not be OKF.
+  Scope: Memory architecture redesign. Source: architecture objective.
+
+## Reminders
+
+- Re-check extract/consolidation prompts after staging resolution is implemented.
+```
+
+Recommended H2 sections:
+
+- `## Current focus`
+- `## Preferences`
+- `## Working assumptions`
+- `## Constraints`
+- `## Reminders`
+- `## Stale or superseded`
+
+Each item should stay short. When useful, include `Scope`, `Source`, and `Stale when` inline. Long explanations, evidence-heavy analysis, durable rationale, citations, and cross-linked concepts should be routed to Knowledge rather than expanded inside Memory.
+
+The single-file layout is an initial storage profile, not an API contract. Workers, Web, Runtime, and CLI should use the Workspace Memory API view rather than depending on the exact file layout, so storage can later split or evolve without changing the model-visible contract.
 
 #### Memory examples
 
@@ -84,7 +140,7 @@ Source: recent Tickets and Objective updates.
 Expected to change after current milestone.
 ```
 
-### Knowledge
+### 3.2 Knowledge
 
 Knowledge は long-term note system。人間と agent が育て、改訂し、link し、split / merge しながら読むもの。抽出 snippet の山ではなく、project understanding の mesh を形成する。
 
@@ -93,15 +149,73 @@ Target Knowledge は、古い未使用の Knowledge feature をそのまま残�
 Knowledge notes の要件:
 
 - Markdown-first で人間が読める。
-- stable ID / slug を持つ。
+- OKF-compatible な concept document として扱える。
+- stable path / slug を持ち、OKF concept ID として参照できる。
+- Yoi 内部で move / rename に強い identity が必要な場合は、extension frontmatter として `yoi_id` を持てる。
 - bidirectional links / backlinks を support する。
+- Obsidian-style wiki links (`[[slug]]`, `[[slug|label]]`) を support し、Knowledge mesh の authoring shorthand として使える。
 - 必要なら tags や typed relations を support する。
-- 重要な claim には provenance を残す。
+- 重要な claim には provenance / citations を残す。
 - Tickets、Objectives、docs、commits、reports、Skills、他 Knowledge notes に link できる。
 - review / staleness / supersession を support する。
 - 自動生成だけに頼らず、意図的に maintain される。
 
 Knowledge は、長期 architecture note、conceptual model、subsystem explanation、decision context、recurring constraints、domain understanding を育てる場所である。
+
+#### 3.2.1 Knowledge format profile: OKF-compatible bundle
+
+Yoi Knowledge は、可能な限り Open Knowledge Format (OKF) compatible な bundle として設計する。
+
+OKF から採用する baseline:
+
+- Knowledge bundle は Markdown file tree とする。
+- non-reserved `.md` file は concept document とする。
+- concept document は YAML frontmatter + Markdown body とする。
+- path without `.md` を OKF concept ID として扱う。
+- `type` は required field とする。
+- `title`, `description`, `resource`, `tags`, `timestamp` は recommended field とする。
+- normal Markdown links を OKF-compatible graph edges として扱う。
+- Obsidian-style wiki links (`[[slug]]`, `[[slug|label]]`) も graph edges として扱い、Markdown links へ解決・export できるようにする。
+- `index.md` は progressive disclosure のための directory listing として使える。
+- `log.md` は agent-readable update history として使える。
+- `# Citations` section は external source / authority reference を示す convention として使う。
+- consumers は unknown frontmatter fields、unknown `type`、broken links を tolerant に扱う。
+
+Yoi は OKF に extension frontmatter を足してよい。候補:
+
+```yaml
+yoi_id: 00001...
+status: draft | active | stale | superseded
+source_refs: []
+authority_refs: []
+objective_refs: []
+ticket_refs: []
+skill_refs: []
+reviewed_at: 2026-07-16T00:00:00Z
+staleness: "Revisit when ..."
+supersedes: []
+superseded_by: null
+```
+
+Filesystem shape の例:
+
+```text
+.yoi/knowledge/
+  index.md
+  log.md
+  architecture/
+    index.md
+    memory-architecture.md
+    workspace-authority.md
+  references/
+    pirolli-card-2005-sensemaking.md
+```
+
+OKF compatibility は Knowledge の exchange / storage profile であり、Memory / staging / Skill の format ではない。
+
+- Memory は短期・変化前提の resident context store なので OKF にしない。
+- staging は extract / consolidation の審査キューなので OKF にしない。
+- Skill は Agent Skills format を維持する。OKF `type: Playbook` に吸収しない。
 
 #### Knowledge examples
 
@@ -115,7 +229,7 @@ Knowledge は、長期 architecture note、conceptual model、subsystem explanat
   - Ticket state authority と transition graph の rationale を説明する。
   - 関連 decisions と code locations に link する。
 
-### Skill
+### 3.3 Skill
 
 Skill は、ある種類の task に対して確立された、portable な workflow / procedure。Agent Skills format に従う。
 
@@ -150,9 +264,9 @@ Skill は、project-specific assumptions が少なく、別 workspace に移し�
 - `architecture-review`
   - design proposals、alternatives、authority boundaries を評価する方法。
 
-## Boundaries
+## 4. Resource boundaries and authority
 
-### Memory vs Knowledge
+### 4.1 Memory vs Knowledge
 
 Memory は provisional / change-oriented。Knowledge は maintained / growth-oriented。
 
@@ -179,7 +293,7 @@ Memory observation -> candidate note/update -> Knowledge note / docs / Ticket de
 
 Promotion は明示的に行う。すべての Memory item が Knowledge になるわけではない。
 
-### Knowledge vs Docs
+### 4.2 Knowledge vs Docs
 
 Docs は public / project-facing な maintained exposition。Knowledge は internal で、link され、発展する understanding。
 
@@ -188,15 +302,15 @@ Knowledge note は後で doc になり得るが、threshold は違う:
 - Knowledge は uncertainty、partial models、evidence links を含められる。
 - Docs は settled explanations または user/developer guidance を提示するべき。
 
-### Knowledge vs Ticket decisions
+### 4.3 Knowledge vs Ticket decisions
 
 Ticket decisions は work item history と state の authority。Knowledge notes は複数 Ticket をまたいだ synthesis。
 
 ある decision が Ticket の requirement、state、acceptance criteria を変えるなら、それは Ticket に記録する。Knowledge はそこに link し、より広い pattern を説明できる。
 
-### Skill vs Knowledge
+### 4.4 Skill vs Knowledge
 
-Knowledge は「何が true か」「project をどう理解するか」を説明する。Skill は「 recurring task をどう実行するか」を説明する。
+Knowledge は「何が true か」「project をどう理解するか」を説明する。Skill は「recurring task をどう実行するか」を説明する。
 
 Skill を使うべきとき:
 
@@ -211,7 +325,7 @@ Knowledge を使うべきとき:
 - Memory architecture。
 - Ticket lifecycle rationale。
 
-### Skill vs Feature/Plugin
+### 4.5 Skill vs Feature/Plugin
 
 Skill は prompt/resource guidance。Feature/Plugin は executable authority と tool surface。
 
@@ -219,11 +333,11 @@ Skill は「何をどう進めるか」を書けるが、Ticket、Workspace、Me
 
 例: Skill は「review 前に Ticket shoebox を作る」と指示できる。実際に作成する authority は Workspace / Memory feature の typed tool/API が提供する。
 
-## Workspace authority
+## 5. Workspace API authority
 
 Target architecture は Workspace-backed にする。
 
-### Memory API
+### 5.1 Memory API
 
 Workspace backend が最終的に提供するもの:
 
@@ -234,24 +348,26 @@ Workspace backend が最終的に提供するもの:
 - provenance と audit events。
 - preference / current-focus surfaces。
 
-移行期間中は local `.yoi/memory` を compatibility / offline storage として残してよい。
+移行期間中は local `.yoi/memory` を compatibility / offline storage として残してよい。初期 storage profile は H2 section ベースの bounded `.yoi/memory/memory.md` だが、これは API contract ではない。
 
-### Knowledge API
+### 5.2 Knowledge API
 
 Workspace backend は、raw filesystem layout を唯一の interface にするのではなく、proper note API を提供する。
 
 - Knowledge catalog / list / search。
 - note read / write / edit / delete。
-- link / backlink extraction。
+- OKF-compatible frontmatter validation / normalization。
+- link / backlink extraction from Markdown links and wiki links (`[[slug]]`)。
 - relation / tag metadata。
 - staleness / supersession markers。
 - note diagnostics / lint。
-- source / provenance refs。
+- source / provenance refs and citations。
 - Markdown files からの import / export。
+- OKF bundle import / export profile。
 
-Filesystem representation は残してよい。おそらく `.yoi/knowledge/` 配下になる。ただし Worker / Runtime / Web / CLI は、利用可能なら Workspace API view に収束する。
+Filesystem representation は `.yoi/knowledge/` 配下の OKF-compatible bundle を第一候補にする。ただし Worker / Runtime / Web / CLI は、利用可能なら raw filesystem ではなく Workspace API view に収束する。
 
-### Skill API
+### 5.3 Skill API
 
 Skill support は separate Skill Ticket の方針に従う。
 
@@ -260,130 +376,69 @@ Skill support は separate Skill Ticket の方針に従う。
 - `WorkspaceClient::Http` が使えるとき、Workers は Workspace API から Skill metadata / body を使う。
 - Skill references / assets は backend-resolved authority または Skill resource APIs 経由で access する。
 
-## Human-readable growth path
+## 6. Session-to-resource pipeline
 
-中核要件は、有用な material が人間に読める形へ成長できること。
-
-典型的な path:
+この章が extract 改善の中心である。`extract -> staging -> consolidate` の分割は維持する。3 つは同じ memory maintenance pipeline の一部だが、判断の種類が違う。
 
 ```text
-Session observation
-  -> Memory record
-  -> Knowledge note candidate
-  -> Knowledge note with links/backlinks
-  -> maintained doc or Ticket decision if it becomes authority
+Session history
+  -> Overview + Evidence index
+  -> extract
+  -> staging
+  -> consolidation
+  -> Memory / Knowledge candidate / Skill candidate / Ticket-doc candidate / discard
 ```
 
-```text
-Repeated successful procedure
-  -> Memory observation / Ticket comment
-  -> draft Skill
-  -> `.yoi/skills/<skill>/SKILL.md`
-  -> builtin or shared Skill if portable
-```
+役割の要約:
 
-```text
-Design discussion
-  -> Objective resource
-  -> Knowledge note synthesis
-  -> implementation Tickets
-  -> docs after stabilization
-```
+- **extract**: session から候補を拾う。recall 寄り。Memory 化はしない。
+- **staging**: provenance 付き候補キュー。まだ Memory ではない。
+- **consolidation**: staging を審査・剪定・統合する。precision 寄り。Memory 肥大化と陳腐化を防ぐ。
 
-Architecture は、これらの promotion を explicit and reviewable にする。
+### 6.1 Overview: transcript as semantic backbone
 
-## Sensemaking as a usage pattern
+Overview は、committed history にある user messages と normal Assistant text outputs から作る。Assistant text outputs には、最終応答だけでなく、長い作業中の Progress message も含める。
 
-Sensemaking は有用だが、resource model の上に重なる pattern として扱う。
-
-Pirolli & Card の flow は Yoi resource にこう mapping できる:
-
-```text
-External sources -> Memory/search/shoebox artifact -> Knowledge notes / Objective resources -> Tickets/docs/Skills/products
-```
-
-ただし、実際の workflows が必要性を示すまでは、`shoebox` や `hypothesis matrix` を mandatory first-class concepts にしない。
-
-初期の sensemaking support は lightweight でよい:
-
-- Ticket / Objective artifacts としての task-bound collected references。
-- provenance 付き evidence summaries。
-- review Skills における explicit contradictory evidence sections。
-- recurring patterns を synthesize する Knowledge notes。
-
-## Extract / review mechanism comparison
-
-Yoi は foreground 応答生成からの隔離をすでに持っている。次に改善すべきなのは isolation そのものではなく、extract worker が意味のない flat slice から文脈を復元しようとしている点である。
-
-Target は、通常 Assistant Message を session overview の backbone とし、extract worker が専用の read-only evidence tools で必要箇所だけ探索し、出力は必ず staging を挟む形にする。
-
-```text
-Main Worker
-  -> user-facing Progress / final Assistant messages を history に残す
-  -> tool calls / tool results は evidence log として残る
-  -> overview が一定量溜まる、または run/task boundary に到達する
-  -> extract worker が Overview を読む
-  -> extract worker が専用 evidence tools で必要範囲だけ探索する
-  -> write_extracted で structured staging payload を出す
-  -> consolidation / review が Memory / Knowledge / Skill candidate を扱う
-```
-
-### Current Yoi pipeline
-
-現在の Yoi extraction は activity-log pipeline:
-
-- `build_extract_input` が conversation slice を flat Markdown として render する。
-  - user / assistant text は保持する。
-  - tool-call names を含める。
-  - raw tool-result content ではなく tool-result summaries のみを含める。
-  - reasoning は落とす。
-- extract worker の tool は `write_extracted` 1 つだけ。
-- `write_extracted` は `decisions`、`discussions`、`attempts`、`requests` を持つ structured `ExtractedPayload` を 1 件受け取る。
-- LLM は provenance を作らない。Worker が `StagingRecord` を書くときに `source` を機械的に付与する。
-- empty payload は valid で、no-op として扱える。
-- consolidation は後で staging entries、full current Memory records、usage evidence、tidy hints を consume する。
-- consolidation は Memory tools 経由で write し、linter feedback に対応し、record を merge / replace し、outdated / superseded / unused / noisy records を clean up する。
-
-この価値は、provenance と audit boundary が clear なこと。特に Knowledge notes、design records、Tickets、docs、その他 durable project understanding に影響し得る material に向いている。
-
-弱点は、flat slice だけでは「なぜその tool を使ったのか」「何のための探索だったのか」「どの時点の結論なのか」が抜けやすいこと。extract worker が local な tool summary から意味を推測すると、断片的な attempts や無用な discussions が増えやすい。
-
-### HermesAgent / Codex からの再解釈
-
-HermesAgent は background review により、conversation snapshot から Memory / Skill update を直接判断する。参考になるのは、maintenance を foreground interaction から隔離し、保存すべきものがなければ NOP にする点である。一方で、direct write-only review は Yoi には強すぎる。staged evidence layer がないと、auditability を失いやすく、one session への overfit や過剰 rewrite が起きやすい。
-
-Codex は session / rollout を durable source として扱い、background pipeline が後から claim / extract / consolidate する。参考になるのは、turn-local sidecar そのものではなく、durable source、phase separation、claim/lease/retry/global lock、workspace diff/baseline guard の発想である。
-
-Yoi では両者を単純コピーせず、次のように分ける:
-
-- foreground isolation は既存設計の前提として扱う。
-- main Worker は、人間にも有用な Progress message を通常 Assistant Message として残す。
-- extract worker は、Overview を semantic guide として読み、必要な evidence だけを read-only tool で探索する。
-- extract worker は durable Memory / Knowledge / Skill を直接書かず、必ず staging に structured output を出す。
-- consolidation / review が、staging を Memory update、Knowledge candidate、Skill candidate、Ticket/doc update candidate に整理する。
-
-### Overview-first extract
-
-Overview は、committed history にある user messages と normal Assistant messages から作る。Assistant messages には、最終応答だけでなく、長い作業中の Progress message も含める。
-
-Progress message は専用 Tool ではなく通常 Assistant Message とする。Tool surface を増やさず、ユーザーへの進捗報告と extract 用 semantic summary を兼ねるためである。内容は public に見せられる短い作業状態に限る。
+Progress message は専用 Tool ではなく、ordinary user-visible prose response として残す。Tool surface を増やさず、ユーザーへの進捗報告と extract 用 semantic summary を兼ねるためである。
 
 Overview に含めるもの:
 
-- user requests / corrections / approvals;
-- Assistant progress messages;
-- Assistant final responses;
-- parent delegation や Ticket context のように、history に commit された task context;
+- user requests / corrections / approvals。
+- Assistant progress messages。
+- Assistant final responses。
+- parent delegation や Ticket context のように、history に commit された task context。
 - tool evidence への bounded index。
 
 Overview に含めないもの:
 
-- raw reasoning / chain-of-thought;
-- raw tool-result content 全文;
-- secret-like data;
+- raw reasoning / chain-of-thought。
+- raw tool-result content 全文。
+- secret-like data。
 - history に commit されていない hidden context injection。
 
-### Extract worker evidence tools
+Overview の意図は、extract worker に「何のための探索だったか」「どの判断が節目だったか」「どこが未解決か」を伝えることである。Overview は authority ではない。durable output には evidence と source anchors が必要である。
+
+### 6.2 Extract: candidate generation
+
+Extract は candidate generation であり、Memory 化ではない。入力は Overview-first / Evidence-index-second にする。
+
+Extract の責務:
+
+- Overview を読んで、重要そうな request / discussion / decision / attempt を見つける。
+- 必要な箇所だけ evidence tools で確認する。
+- source anchors を持つ candidate を staging に出す。
+- empty / NOP を正常結果として扱う。
+
+Extract がしてはいけないこと:
+
+- Memory / Knowledge / Skill / Ticket / docs を直接変更しない。
+- tool result 全文や reasoning を無制限に取り込まない。
+- local slice だけから根拠を推測しない。
+- 「進捗報告があった」こと自体を Memory 化しない。
+
+初期の extract output schema は既存の `decisions` / `discussions` / `attempts` / `requests` を維持してよい。ただし、entry-level evidence refs / source anchors を段階的に追加できる形にする。
+
+### 6.3 Extract worker evidence tools
 
 extract worker には専用の constrained evidence tools を渡す。これは main Worker の tool 数を増やすものではなく、extract 専用 worker の read-only surface である。
 
@@ -401,18 +456,94 @@ extract worker には専用の constrained evidence tools を渡す。これは 
 - provenance first。extract worker が根拠を推測せず、読んだ evidence range を output と結びつけられるようにする。
 - NOP allowed。Overview を読んで保存価値がなければ empty payload で終わる。
 
-### Staging remains mandatory
+### 6.4 Staging: provenance-backed candidate queue
 
-extract output は必ず staging を挟む。
+Staging は Memory ではない。Staging は、extract が拾った candidate を provenance 付きで保管し、consolidation が後で審査できるようにする queue / buffer である。
 
-理由:
+Staging の責務:
 
-- Progress message は semantic guide であり、authority ではない。
-- extract worker の判断は候補であり、direct Memory / Knowledge / Skill update にしない。
-- staging があることで source range、review、consolidation、stale cleanup、later synthesis を維持できる。
-- Knowledge / Skill / docs のような long-term artifacts は、staging と review / consolidation を経て育てるべき。
+- source anchors を保持する。
+- candidate と Overview / Evidence の対応を保持する。
+- extract と consolidation を decouple する。
+- duplicate / defer / discard / consumed の追跡対象になる。
+- crash / cancel / long-running work の途中でも、後から審査できる候補を残す。
 
-### Trigger policy
+Staging がしてはいけないこと:
+
+- Memory として resident context に直接入らない。
+- Knowledge note の代替にならない。
+- raw session log の永久保存場所にならない。
+- staging entry をすべて Memory 化する前提にしない。
+
+Pirolli & Card 的には、staging は shoebox / evidence file に近い。ただし Yoi の storage taxonomy そのものを shoebox にするのではなく、審査前の evidence-backed candidate queue として扱う。
+
+### 6.5 Staging resolution: the important filter
+
+Staging から Memory 化する段階が、Memory 肥大化と陳腐化を防ぐ中核 filter である。
+
+Consolidation は staging entry ごとに resolution / disposition を決めるべきである。
+
+Disposition action 候補:
+
+- `discard`: 保存価値なし。discard reason を残す。
+- `merge_memory`: 既存 Memory に統合する。
+- `replace_memory`: 古い Memory を新しい内容で置換する。
+- `mark_memory_stale`: 既存 Memory が古くなったことを記録する。
+- `delete_memory`: 邪魔または誤った Memory を削除する。
+- `defer`: 価値判断できないため短期保留する。TTL / defer reason を持つ。
+- `promote_to_knowledge_candidate`: long-term note に育てる候補へ送る。
+- `promote_to_skill_candidate`: recurring / portable procedure の候補へ送る。
+- `link_to_authority`: Ticket / doc / commit / Objective への pointer だけ残す。
+- `create_ticket_or_doc_candidate`: authority / public guidance にすべき候補として送る。
+
+Resolution に残すべき情報:
+
+- staging entry id。
+- action。
+- reason。
+- source anchors。
+- target record / candidate destination。
+- consolidation run id / consumed_by。
+- reviewed_at。
+- discard / defer / stale reason。
+
+Consumed staging を削除する場合も、resolution は残す。これにより「何を Memory にしなかったか」が改善材料として残る。
+
+### 6.6 Consolidation: memoryization, routing, and gardening
+
+Consolidation は precision-oriented pass である。staging を読んで、Memory にするか、別 resource candidate に送るか、捨てるかを決める。
+
+Consolidation の責務:
+
+- staging entry を評価する。
+- Memory 化するなら usefulness / scope / staleness / source を要求する。
+- 既存 Memory と merge / replace / mark stale / delete する。
+- Knowledge / Skill / Ticket / docs candidate に routing する。
+- discard reason / defer reason を残す。
+- linter feedback / usage evidence / tidy hints を使う。
+- Memory bloat と stale records を防ぐ。
+
+Consolidation がしてはいけないこと:
+
+- staging entry を無条件に append しない。
+- Ticket / docs / git / session log の mirror を Memory に作らない。
+- Knowledge / Skill / docs を background review だけで無制限に rewrite しない。
+- source / provenance のない claim を durable Memory にしない。
+
+Memory 化に必要な minimum fields / prose:
+
+```text
+content: 何を覚えるか
+scope: どこで効くか
+why_useful: 今後なぜ役立つか
+source: staging / evidence anchor
+staleness: 何が起きたら古くなるか
+destination_reason: なぜ Knowledge / Skill / Ticket / docs ではなく Memory なのか
+```
+
+Consolidation は append worker ではなく garden worker である。新規作成より、既存 record の統合・置換・陳腐化・削除を優先する。
+
+### 6.7 Trigger policy
 
 発火単位は LLM call 単位にしない。LLM call 単位では文脈が薄く、断片的な extraction になりやすい。
 
@@ -425,31 +556,141 @@ extract output は必ず staging を挟む。
 
 この trigger は「意味のある overview が溜まったか」と「evidence が失われる前に staging したいか」の両方で判断する。
 
-### Target Yoi lanes
+## 7. Sensemaking interpretation
 
-Yoi は 1 つの generic extractor ではなく、maintenance lanes に分ける。
+Sensemaking は storage taxonomy ではなく、pipeline の見方として使う。
 
-1. **Overview-guided extract lane**
-   - user / Assistant messages から Overview を作る。
-   - extract worker が dedicated evidence tools で必要箇所だけ探索する。
-   - output は必ず staging。
-   - decisions / discussions / attempts / requests に加え、将来の Memory / Knowledge / Skill candidate の材料になる source anchors を残す。
+Pirolli & Card の flow を Yoi に対応させるとこうなる:
 
-2. **Consolidation / tidy lane**
-   - staging entries、existing Memory、usage evidence、linter feedback、stale/noisy hints を統合する。
-   - legacy Knowledge as generated memory 前提を外し、Knowledge は redesigned note subsystem への candidate として扱う。
+```text
+External data sources
+  = session log, tool results, Tickets, docs, code, web refs
 
-3. **Memory update lane**
-   - short-term facts、preferences、current focus、stale Memory cleanup を扱う。
-   - direct write/edit/delete を許す場合でも、extract worker ではなく別 lane の bounded Memory API と audit event で扱う。
+Shoebox
+  = Overview + Evidence index + selected candidate ranges
 
-4. **Skill / Knowledge candidate lane**
-   - Skill は recurrence / portability rules で gate する。
-   - Knowledge は linked Markdown notes への proposal / candidate とし、自動 direct rewrite を避ける。
+Evidence file
+  = source anchors 付き staging entries
 
-この lane split により、session は人間にも機械にも追いやすくなり、extract は断片的な tool log ではなく Overview を足場にして evidence を確認できる。Yoi の auditability は staging によって維持する。
+Schemas / hypotheses
+  = Memory 化すべきか、Knowledge/Skill に送るべきか、stale かの判断
 
-## Implementation posture
+Product
+  = Memory update, Knowledge candidate, Skill candidate,
+    Ticket/doc update, review evidence, discard resolution
+```
+
+重要なのは、Memory 化を evidence から product へ進める審査の一形態として扱うこと。Memory record は「将来の作業に効く」という hypothesis なので、scope、why_useful、staleness、source が必要である。
+
+初期 sensemaking support は lightweight でよい:
+
+- task-bound collected references as Ticket/Objective artifacts。
+- provenance 付き evidence summaries。
+- review Skills における explicit contradictory evidence sections。
+- recurring patterns を synthesize する Knowledge notes。
+- staging resolution に discard / defer / promote reason を残す。
+
+## 8. Human-readable growth paths
+
+中核要件は、有用な material が人間に読める形へ成長できること。
+
+Typical paths:
+
+```text
+Session observation
+  -> staging candidate
+  -> Memory record
+  -> Knowledge note candidate
+  -> Knowledge note with links/backlinks
+  -> maintained doc or Ticket decision if it becomes authority
+```
+
+```text
+Repeated successful procedure
+  -> staging candidate / Memory observation / Ticket comment
+  -> Skill candidate
+  -> `.yoi/skills/<skill>/SKILL.md`
+  -> builtin or shared Skill if portable
+```
+
+```text
+Design discussion
+  -> Objective resource
+  -> Knowledge note synthesis
+  -> implementation Tickets
+  -> docs after stabilization
+```
+
+Architecture は、これらの promotion を explicit and reviewable にする。
+
+## 9. External reference lessons
+
+### 9.1 Current Yoi pipeline
+
+現在の Yoi extraction は activity-log pipeline:
+
+- `build_extract_input` が conversation slice を flat Markdown として render する。
+  - user / assistant text は保持する。
+  - tool-call names を含める。
+  - raw tool-result content ではなく tool-result summaries のみを含める。
+  - reasoning は落とす。
+- extract worker の tool は `write_extracted` 1 つだけ。
+- `write_extracted` は `decisions`、`discussions`、`attempts`、`requests` を持つ structured `ExtractedPayload` を 1 件受け取る。
+- LLM は provenance を作らない。Worker が `StagingRecord` を書くときに `source` を機械的に付与する。
+- empty payload は valid で、no-op として扱える。
+- consolidation は後で staging entries、full current Memory records、usage evidence、tidy hints を consume する。
+- consolidation は Memory tools 経由で write し、linter feedback に対応し、record を merge / replace し、outdated / superseded / unused / noisy records を clean up する。
+
+残す価値がある点:
+
+- foreground 応答生成から memory maintenance が隔離されている。
+- provenance が host 側で機械付与される。
+- extract が direct write せず staging を挟む。
+- empty / no-op が許される。
+- consolidation が linter feedback と tidy hints を使う。
+
+変えるべき点:
+
+- flat slice ではなく Overview-first / Evidence-index-second にする。
+- extract worker に read-only evidence tools を持たせる。
+- staging を一時バッファではなく審査キューとして扱う。
+- consolidation に entry-level disposition / resolution を要求する。
+- legacy Knowledge as generated memory 前提を外す。
+
+### 9.2 HermesAgent
+
+HermesAgent は background review により、conversation snapshot から Memory / Skill update を直接判断する。
+
+参考になる点:
+
+- maintenance を foreground interaction から隔離する。
+- 保存すべきものがなければ NOP にする。
+- Memory と Skill を分ける。
+- prompt snapshot / drift / injection guard を重視する。
+
+そのまま採用しない点:
+
+- direct write-only review を主経路にしない。
+- aggressive Skill update bias を避ける。
+- `MEMORY.md` / `USER.md` two-file model を Yoi 全体の architecture にしない。
+
+Yoi では、Hermes 的な direct maintenance は bounded Memory update lane では参考になるが、extract worker 自体は direct write しない。
+
+### 9.3 Codex
+
+Codex は session / rollout を durable source として扱い、background pipeline が後から claim / extract / consolidate する。
+
+参考になる点:
+
+- durable source。
+- phase separation。
+- claim / lease / retry / global lock。
+- workspace diff / baseline guard。
+- extraction と consolidation の分離。
+
+Yoi では、Codex 的な durable job / phase pipeline は staging resolution と consolidation scheduling に取り入れる価値がある。ただし、この architecture phase ではまず Overview-first extract と staging resolution を優先する。
+
+## 10. Implementation posture
 
 現在の実装は redesign してよい。既存の Memory / Knowledge shape があるからという理由で残さない。
 
@@ -463,59 +704,66 @@ Recommended implementation sequence:
    - legacy `knowledge/*` を generated memory として扱う stale consolidation prompt language を削除する。
 
 2. **Progress message guidance を追加する**
-   - 長い作業や tool loop の節目で、main Worker が通常 Assistant Message として短い Progress message を残す。
+   - 長い作業や tool loop の節目で、main Worker が ordinary user-visible prose response として短い Progress message を残す。
    - 専用 Tool は追加しない。
    - Progress message は public に見せられる作業状態、確認済み事実、判断、未解決点、次の作業に限定する。
 
-3. **Overview-first extract input を設計する**
-   - user messages + Assistant messages を semantic Overview として優先する。
+3. **Overview-first extract input を実装する**
+   - user messages + Assistant text outputs を semantic Overview として優先する。
    - tool calls / tool results は Evidence index として分離する。
    - committed history だけから Overview を作り、hidden context injection を避ける。
 
-4. **Extract worker 専用 evidence tools を設計する**
+4. **Extract worker 専用 evidence tools を実装する**
    - extract worker に read-only Evidence search / Evidence read / Source anchor resolver を渡す。
    - main Worker の tool surface は増やさない。
    - output tool は `write_extracted` を維持し、structured payload を 1 回提出させる。
-   - source range と output entry を結びつけられる schema / staging format を設計する。
+   - source range と output entry を結びつけられる schema / staging format を実装する。
 
-5. **Staging-first extract を実装する**
+5. **Staging-first extract を維持する**
    - extract worker は direct Memory / Knowledge / Skill write をしない。
    - overview accumulation / evidence growth / run or task boundary で extract を予約する。
    - mid-run 発火を入れる場合も staging/checkpoint extraction に限定する。
 
-6. **Target Knowledge note model を設計する**
-   - Markdown note format。
+6. **Staging resolution / disposition を実装する**
+   - staging entry ごとに discard / merge / replace / stale / delete / defer / promote / link を記録する。
+   - consumed staging を削除する前に resolution log / archive を残す。
+   - discard reason と defer reason を extract prompt 改善に使えるようにする。
+
+7. **Target Knowledge note model を設計する**
+   - OKF-compatible Markdown concept document / bundle profile。
+   - Yoi extension frontmatter。
    - link / backlink model。
-   - provenance / staleness metadata。
+   - provenance / citations / staleness metadata。
    - Workspace API surface。
    - reviewable Knowledge updates の candidate / staging format。
 
-7. **Consolidation / tidy lane を更新する**
+8. **Consolidation / tidy lane を更新する**
    - staging entries、existing Memory、usage evidence、linter feedback、stale/noisy hints を統合する。
    - legacy Knowledge as generated memory 前提を外す。
    - Memory update、Knowledge candidate、Skill candidate を分けて扱う。
 
-8. **Minimal Knowledge catalog/read/write を実装する**
-   - Markdown files と Workspace API から始める。
-   - lint と backlinks を追加する。
+9. **Minimal Knowledge catalog/read/write を実装する**
+   - OKF-compatible Markdown files と Workspace API から始める。
+   - frontmatter validation / lint と backlinks を追加する。
+   - `index.md` progressive disclosure と `# Citations` の扱いを実装する。
 
-9. **Skill support を別に実装する**
-   - Agent Skills standard と Workspace authority に従う。
-   - Skill と Knowledge note schema を混ぜない。
-   - automatic Skill modification は recurrence と portability で gate する。
+10. **Skill support を別に実装する**
+    - Agent Skills standard と Workspace authority に従う。
+    - Skill と Knowledge note schema を混ぜない。
+    - automatic Skill modification は recurrence と portability で gate する。
 
-10. **Promotion workflows/tools を追加する**
+11. **Promotion workflows/tools を追加する**
     - Memory -> Knowledge candidate。
     - Knowledge -> docs / Ticket decision candidate。
     - repeated procedure -> Skill candidate。
 
-11. **Resource classes が安定してから sensemaking helpers を追加する**
+12. **Resource classes が安定してから sensemaking helpers を追加する**
     - collected refs。
     - evidence extraction。
     - contradiction / staleness views。
     - product-impact metrics。
 
-## Non-goals
+## 11. Non-goals
 
 - Memory を唯一の long-term knowledge store として扱うこと。
 - Knowledge を名前だけ変えた generated memory として扱うこと。
@@ -523,13 +771,20 @@ Recommended implementation sequence:
 - Worker history / tool results の外で context injection を隠すこと。
 - Knowledge notes を Tickets / docs / git history より authoritative にすること。
 - review なしに Knowledge / Skills / docs を自動 rewrite すること。
+- extract worker に direct resource mutation authority を持たせること。
+- staging entry をすべて Memory 化すること。
 - human-readable artifact model が安定する前に vector database を設計すること。
+- volatile Memory や staging queue を OKF concept document として扱うこと。
+- H2 Markdown single-file layout を Workspace Memory API の長期 contract として固定すること。
+- Agent Skills format を OKF Playbook documents で置き換えること。
 
-## Open decisions
+## 12. Open decisions
 
-- Target Knowledge は `.yoi/knowledge/<slug>.md`、nested directories、index + notes のどれを使うか。
-- Knowledge notes の exact frontmatter。
-- Link syntax と backlink extraction rules。
+- Knowledge bundle の exact directory organization: flat files、nested directories、domain directories のどれを初期推奨にするか。
+- Yoi extension frontmatter の exact fields。
+- Yoi stable `yoi_id` を必須にするか optional にするか。
+- OKF `type` values の初期 convention をどうするか。
+- Link syntax は OKF-compatible Markdown links と Obsidian-style wiki links (`[[slug]]`, `[[slug|label]]`) を support する。canonical internal representation と export normalization をどうするか。
 - Knowledge note IDs / slugs と titles の関係。
 - Memory は local-first のままにするか、Knowledge と同じ phase で Workspace API-first にするか。
 - Memory / Knowledge APIs は同じ crate にするか、別 domain crates にするか。
@@ -540,18 +795,20 @@ Recommended implementation sequence:
 - Overview trigger を overview token count、Assistant message count、evidence growth、run/task boundary のどれで制御するか。
 - mid-run extract をどこまで許すか。初期は staging/checkpoint extraction に限定する方針。
 - source range と `ExtractedPayload` entries をどう結びつけるか。
+- staging resolution log / archive の保持期間と compact policy。
 - どの Memory sidecar writes を direct に許し、どれを staged proposals にするか。extract worker 自体は direct write しない。
 - Skill sidecar output は patches/proposals だけから始めるか、low-risk Skill edits を auto-apply してよいか。
 - Memory / Knowledge / Skill Workspace APIs をまたぐ sidecar audit events をどう表現するか。
 - prompt-cache-aware sidecar input で full replay と digest-plus-tail をどう選ぶか。
 
-## Exit criteria for architecture phase
+## 13. Exit criteria for architecture phase
 
 この architecture は、次が満たされたら Tickets に分割できる。
 
 - Memory / Knowledge / Skill boundary が accepted される。
-- long-term linked notes としての target Knowledge が accepted される。
+- OKF-compatible bundle / Markdown concept documents としての target Knowledge が accepted される。
 - Memory / Knowledge / Skills の Workspace backend authority が accepted される。
 - Overview-first extract、extract worker 専用 evidence tools、staging-first output の方針が accepted される。
+- staging resolution / disposition と、staging -> Memory 化 filter の方針が accepted される。
 - 最初の implementation slice が選ばれる。
 - non-goals が accepted され、old Workflow tracking や old unused Knowledge をそのまま再作成しないことが確認される。

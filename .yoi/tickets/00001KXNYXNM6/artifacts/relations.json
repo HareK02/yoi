@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KXNYXNM6",
+      "kind": "related",
+      "target": "00001KXMK846H",
+      "note": "staging source anchors feed later staging resolution/disposition and Memoryization filtering.",
+      "author": "yoi ticket",
+      "at": "2026-07-16T17:19:11Z"
+    }
+  ]
+}
