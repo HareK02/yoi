@@ -347,3 +347,36 @@ Non-blocking note:
 - Catalog/detail progressive disclosure and path-free provenance generally look aligned。
 
 ---
+
+<!-- event: implementation_report author: orchestrator at: 2026-07-16T00:07:38Z -->
+
+## Implementation report
+
+Follow-up implementation progress report after request_changes:
+
+- Coder Pod `yoi-coder-00001KXKMX0QM-agent-skills` completed the review fixes in `/home/hare/Projects/yoi/.worktree/00001KXKMX0QM-agent-skills-support`。
+- Follow-up commit: `4ddfccee2d414a2dfe67a940906b505dd237132d` (`fix: reject unsupported skill fields`)。
+- Orchestrator inspected worktree status, branch log, commit stats, and `git diff --check 05c50e32..HEAD`; worktree was clean and diff check passed。
+
+Fix summary:
+- Added Skill frontmatter unsupported-key detection in `crates/workspace-server/src/skills.rs`。
+- Unknown frontmatter keys are now lint errors。
+- Workflow/projection/invocation-shaped keys such as `model_invokation`, `user_invocable`, `graph`, and `invocation` are explicitly rejected with `unsupported_workflow_frontmatter_field`。
+- Unsupported/unknown-field Skills no longer become active catalog/detail/activation entries。
+- Added regression tests for `model_invokation`, `user_invocable`, `graph`, `invocation`, and generic unknown frontmatter fields。
+- Added Worker activation/history coverage in `crates/worker/src/worker.rs`:
+  - verifies `Worker::activate_skill` fetches activation through Workspace HTTP client;
+  - verifies Skill body is appended to Worker engine history;
+  - verifies committed `SystemItem::SkillActivation` content matches the history-visible Skill activation content。
+
+Coder-reported validation passed:
+- `cargo test -p yoi-workspace-server skills --lib`
+- `cargo test -p worker skill --lib`
+- `git diff --check`
+- `cargo check -p yoi`
+- `yoi ticket doctor`
+- `nix build .#yoi --no-link`
+
+Web/API types were not changed in this follow-up, so web checks were not rerun。
+
+---

@@ -2,7 +2,7 @@
 title: 'Implement Agent Skills support'
 state: 'inprogress'
 created_at: '2026-07-15T19:43:46Z'
-updated_at: '2026-07-15T23:53:00Z'
+updated_at: '2026-07-16T00:07:38Z'
 assignee: null
 queued_by: 'workspace-panel'
 queued_at: '2026-07-15T21:26:15Z'
