@@ -206,8 +206,8 @@ pub fn render_tidy_hints(tidy: &TidyHints) -> String {
 mod tests {
     use super::*;
     use crate::consolidate::tidy::{SimilarSlugCluster, SourcesOverflow};
-    use crate::extract::{ExtractedPayload, write_staging};
-    use crate::schema::SourceRef;
+    use crate::extract::{DecisionEntry, ExtractedPayload, write_staging};
+    use crate::schema::{EvidenceKind, SourceEvidenceRef, SourceRef};
     use chrono::Utc;
     use std::path::Path;
 
@@ -275,6 +275,46 @@ mod tests {
         assert!(out.contains("Sources overflow"));
         assert!(out.contains("Similar slug clusters"));
         assert!(out.contains("no explicit memory usage events"));
+    }
+
+    #[test]
+    fn staging_render_preserves_entry_source_refs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let layout = WorkspaceLayout::new(dir.path().to_path_buf());
+        let (_id, _) = write_staging(
+            &layout,
+            SourceRef {
+                segment_id: "segment-record".into(),
+                range: [0, 10],
+            },
+            ExtractedPayload {
+                decisions: vec![DecisionEntry {
+                    options: vec!["preserve".into()],
+                    chosen: "preserve".into(),
+                    rationale: "consolidation input is lossless JSON".into(),
+                    source_refs: vec![SourceEvidenceRef {
+                        session_id: Some("session-1".into()),
+                        segment_id: Some("segment-1".into()),
+                        entry_range: Some([3, 4]),
+                        evidence_id: Some("ev-1".into()),
+                        evidence_kind: Some(EvidenceKind::new(EvidenceKind::MESSAGE)),
+                        label: Some("user message".into()),
+                        summary: Some("bounded summary".into()),
+                    }],
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let staging = crate::consolidate::staging::list_staging_entries(&layout);
+
+        let out = render_staging_records(&staging);
+
+        assert!(out.contains("source_refs"));
+        assert!(out.contains("session-1"));
+        assert!(out.contains("entry_range"));
+        assert!(out.contains("ev-1"));
+        assert!(out.contains("message"));
     }
 
     #[test]

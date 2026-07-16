@@ -79,6 +79,7 @@ mod tests {
                 options: vec!["a".into(), "b".into()],
                 chosen: "a".into(),
                 rationale: "shorter".into(),
+                source_refs: Vec::new(),
             }],
             ..Default::default()
         };
