@@ -1,8 +1,8 @@
 ---
 title: 'ターン中のProgress messageを残す指示を追加する'
-state: 'ready'
+state: 'closed'
 created_at: '2026-07-16T03:19:36Z'
-updated_at: '2026-07-16T03:22:00Z'
+updated_at: '2026-07-16T16:48:26Z'
 assignee: null
 ---
 

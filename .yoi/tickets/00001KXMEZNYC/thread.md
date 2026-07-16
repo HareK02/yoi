@@ -46,3 +46,25 @@ Marked ready by `yoi ticket state`.
 
 
 ---
+
+<!-- event: state_changed author: hare at: 2026-07-16T16:48:26Z from: ready to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-07-16T16:48:26Z status: closed -->
+
+## 完了
+
+Progress message guidance was added to `resources/prompts/common/writing.md`.
+
+The prompt now instructs long-running work to emit short ordinary user-visible prose progress updates at meaningful boundaries, without tool calls, hidden notes, chain-of-thought, raw reasoning, secrets, or verbose tool-output details.
+
+Validation: `nix build .#yoi` passed.
+
+
+---
