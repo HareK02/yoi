@@ -380,3 +380,35 @@ Coder-reported validation passed:
 Web/API types were not changed in this follow-up, so web checks were not rerun。
 
 ---
+
+<!-- event: review author: reviewer at: 2026-07-16T00:10:51Z status: approve -->
+
+## Review: approve
+
+Focused re-review result: approve
+
+Evidence:
+- Previous blockers fixed:
+  - Skill frontmatter is now parsed through a raw YAML value。
+  - Unsupported/workflow-shaped keys are diagnosed as errors (`crates/workspace-server/src/skills.rs:290-302`, `457-528`)。
+  - Error diagnostics prevent catalog/detail/activation (`skills.rs:393-398`)。
+  - Regression coverage exists for `model_invokation`, `user_invocable`, `graph`, `invocation`, and generic unknown fields (`skills.rs:687-743`)。
+  - Worker activation/history is covered by an HTTP-backed activation test verifying backend fetch, history append, and committed `SystemItem::SkillActivation` body equality (`crates/worker/src/worker.rs:5971-6065`)。
+- Focused validation passed:
+  - `cargo test -p yoi-workspace-server skills --lib`
+  - `cargo test -p worker skill --lib`
+  - `git diff --check`
+- Worktree remained clean。
+- Rechecked acceptance focus:
+  - Workspace backend remains the Skill catalog/detail/lint/activation authority。
+  - builtin/workspace override/provenance/progressive disclosure behavior remains covered。
+  - `allowed-tools` / scripts remain diagnostic/non-authoritative。
+  - no raw-path resource leakage was introduced。
+  - `rg` for removed Workflow/Knowledge surfaces only finds new rejection logic/tests。
+
+Blockers: none。
+
+Non-blocking note:
+- detail/activation for invalid Skills still surface as not-found while catalog/lint carries diagnostics; acceptable for this initial authority model。
+
+---
