@@ -40,7 +40,7 @@
   - running 中の submit queueing
   - rollback 時の入力復元
   - input history persistence
-  - file / knowledge completion
+  - file completion
   - typed `Segment` の保持
   - context usage 表示
   - live system item / task snapshot の反映

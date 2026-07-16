@@ -19,14 +19,14 @@ use crate::linter::{LintReport, Linter, WriteMode};
 use crate::tool::MemoryToolKind;
 use crate::workspace::WorkspaceLayout;
 
-const DESCRIPTION: &str = "Replace a substring in an existing memory or knowledge \
+const DESCRIPTION: &str = "Replace a substring in an existing memory \
 record selected by `kind` + `slug`. By default `old_string` must be unique in the \
 file; set `replace_all: true` to replace every occurrence. The resulting content \
 is re-validated by the memory linter; failure leaves the file untouched.";
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct EditParams {
-    /// Record kind: `summary` | `decision` | `request` | `knowledge`.
+    /// Record kind: `summary` | `decision` | `request`.
     kind: MemoryToolKind,
     /// Slug. Required for everything except `summary`; forbidden for `summary`.
     #[serde(default)]

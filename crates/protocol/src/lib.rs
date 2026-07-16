@@ -70,9 +70,7 @@ pub enum Method {
     ///
     /// Reply is sent on the same socket as `Event::Completions` (not
     /// broadcast). The IPC server handles this directly and writes
-    /// the response straight back to the requesting socket. Empty
-    /// results for resolvers that are not yet wired up
-    /// (Knowledge / Workflow).
+    /// the response straight back to the requesting socket.
     ListCompletions {
         kind: CompletionKind,
         prefix: String,
@@ -173,7 +171,7 @@ impl WorkerEvent {
 /// `Method::Run` and `Event::UserMessage` carry `Vec<Segment>`. Dumb
 /// clients (CLI piping, scripts) only need to produce a single
 /// `Segment::Text`; richer clients (TUI / GUI) construct typed atoms
-/// (paste chips, file refs, knowledge refs, workflow invocations) and
+/// (paste chips, file refs) and
 /// send them through directly so the Worker side never has to re-parse a
 /// flattened string.
 ///
@@ -203,10 +201,6 @@ pub enum Segment {
     /// `[Dir: <path>]` listings; the flattened user text keeps the literal
     /// `@<path>` placeholder either way.
     FileRef { path: String },
-    /// `#<slug>` Knowledge reference (see `docs/plan/memory.md`).
-    KnowledgeRef { slug: String },
-    /// `/<slug>` Workflow invocation (see `docs/plan/workflow.md`).
-    WorkflowInvoke { slug: String },
     /// Unknown variant from a newer client. Worker treats this as an
     /// unresolved input — surfaces an alert and inserts a placeholder.
     /// Round-trip is lossy: re-serializing yields `{"kind":"unknown"}`.
@@ -225,9 +219,8 @@ impl Segment {
     /// to surface user-visible alerts for unresolved refs should do so
     /// alongside this call (Worker does so at submit time).
     ///
-    /// Sigil-prefixed variants (`FileRef` / `KnowledgeRef` / `WorkflowInvoke`)
-    /// flatten back to their literal sigil form (`@<path>`, `#<slug>`,
-    /// `/<slug>`) — matching what the user originally typed. Resolved
+    /// Sigil-prefixed variants (`FileRef`) flatten back to their literal
+    /// sigil form (`@<path>`) when converted to text.
     /// content (e.g. file body or shallow directory listing for `FileRef`) is
     /// delivered as separate `Item::system_message`s adjacent to the user
     /// message; the resolution itself is the caller's job. `Unknown` falls back to
@@ -242,17 +235,7 @@ impl Segment {
                     out.push('@');
                     out.push_str(path);
                 }
-                Segment::KnowledgeRef { slug } => {
-                    out.push('#');
-                    out.push_str(slug);
-                }
-                Segment::WorkflowInvoke { slug } => {
-                    out.push('/');
-                    out.push_str(slug);
-                }
-                Segment::Unknown => {
-                    out.push_str("[unknown input segment]");
-                }
+                Segment::Unknown => {}
             }
         }
         out
@@ -295,8 +278,7 @@ pub enum Event {
     ///
     /// Carries the JSON form of `session_store::SystemItem`. Covers
     /// `Method::Notify` echoes, child-Worker lifecycle events from
-    /// `Method::WorkerEvent`, `@<path>` / `#<slug>` / `/<slug>`
-    /// resolution payloads, and any future agent-side injection kind.
+    /// `Method::WorkerEvent`, `@<path>` resolution payloads, and any future
     /// Clients dispatch on the `kind` tag for typed rendering instead
     /// of parsing free-text prefixes like `[Notification] …` or
     /// `[File: …]`.
@@ -607,26 +589,17 @@ pub enum AlertSource {
 
 /// Kind of completion requested by `Method::ListCompletions`.
 ///
-/// Mirrors the TUI prefix sigils: `@` → `File`, `#` → `Knowledge`,
-/// `/` → `Workflow`. Knowledge and Workflow resolvers are currently
-/// stubs (always reply with empty `entries`); the wire shape is
-/// nailed down here so the TUI side can ship without waiting for
-/// the memory / workflow tickets.
+/// Mirrors the completion prefix sigil: `@` → `File`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum CompletionKind {
     File,
-    Knowledge,
-    Workflow,
 }
 
-/// One candidate returned in `Event::Completions::entries`.
+/// One completion candidate for a prefix query.
 ///
-/// `value` is a path (file kind) or a slug (knowledge / workflow).
-/// `is_dir` is meaningful only for the file kind — it lets the TUI
-/// keep a trailing `/` after a directory selection so the user can
-/// drill in without re-typing the prefix.
+/// `value` is a path (file kind).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
 pub struct CompletionEntry {
@@ -1190,16 +1163,16 @@ mod tests {
     #[test]
     fn event_completions_format_and_default_is_dir() {
         let event = Event::Completions {
-            kind: CompletionKind::Workflow,
+            kind: CompletionKind::File,
             entries: vec![CompletionEntry {
-                value: "clear".into(),
+                value: "src/main.rs".into(),
                 is_dir: false,
             }],
         };
         let json = serde_json::to_string(&event).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["event"], "completions");
-        assert_eq!(parsed["data"]["kind"], "workflow");
+        assert_eq!(parsed["data"]["kind"], "file");
         assert_eq!(parsed["data"]["entries"][0]["value"], "clear");
 
         // is_dir defaults to false on inbound payloads that omit it.

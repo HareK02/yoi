@@ -15,7 +15,7 @@ That rule shapes the crate split. The runtime can restart, attach, compact, or d
 - `client` contains reusable one-shot socket/runtime-command mechanics so lower crates do not depend on the product CLI.
 - `manifest` resolves Profiles, Manifests, model/provider references, scopes, prompts, and tool permission policy into a runtime contract.
 - `tools` implements built-in tools with bounded output and policy-aware execution.
-- `memory` owns generated memory, Knowledge records, linting, staging, and audit observations.
+- `memory` owns generated memory summary/decision/request records, linting, staging, and audit observations.
 - `workspace-server` is the local Workspace control-plane seam. It can project Tickets, Workers, lifecycle, usage, and orchestration events, but browser/API operations must stay on opaque backend identities instead of raw local paths, sockets, Worker names, or session files.
 - `tui` is a UI over Worker authority; it should not invent durable state.
 

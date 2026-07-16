@@ -14,6 +14,7 @@ pub mod records;
 pub mod repositories;
 pub mod resource_broker;
 pub mod server;
+pub mod skills;
 pub mod store;
 
 pub use config::{

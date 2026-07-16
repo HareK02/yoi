@@ -965,7 +965,7 @@ fn push_padded_lines(lines: &mut Vec<Line<'static>>, text: &str, kind: MessageKi
 /// Render `Block::UserMessage` from typed segments. Each non-text
 /// segment renders as a one-piece chip whose colour matches the input
 /// area's chip presentation (paste = magenta, `@` file = cyan,
-/// `#` knowledge = green, `/` workflow = yellow), so the user
+/// `/` workflow = yellow), so the user
 /// recognises their own typed atoms in the scrollback.
 fn render_user_message(
     lines: &mut Vec<Line<'static>>,
@@ -1097,10 +1097,6 @@ fn chip_span_for(seg: &Segment, fallback: Style) -> (Style, String) {
             format!("[Clipboard #{id} | {chars} chars, {line_count} lines]"),
         ),
         Segment::FileRef { path } => (Style::default().fg(Color::Cyan), format!("@{path}")),
-        Segment::KnowledgeRef { slug } => (Style::default().fg(Color::Green), format!("#{slug}")),
-        Segment::WorkflowInvoke { slug } => {
-            (Style::default().fg(Color::Yellow), format!("/{slug}"))
-        }
         Segment::Unknown => (fallback, "[unknown segment]".to_owned()),
     }
 }
@@ -1115,8 +1111,6 @@ fn segment_display_text(seg: &Segment) -> String {
             id, chars, lines, ..
         } => format!("[Clipboard #{id} | {chars} chars, {lines} lines]"),
         Segment::FileRef { path } => format!("@{path}"),
-        Segment::KnowledgeRef { slug } => format!("#{slug}"),
-        Segment::WorkflowInvoke { slug } => format!("/{slug}"),
         Segment::Unknown => "[unknown segment]".to_owned(),
     }
 }

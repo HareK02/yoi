@@ -1,6 +1,6 @@
 # Tickets and development workflow
 
-Yoi project work is tracked through Tickets. For normal use, interact with Tickets through `yoi panel`, Ticket tools, the `yoi ticket ...` CLI, and Ticket workflows. Git history plus Ticket files remain the authoritative state-transition record behind those interfaces.
+Yoi project work is tracked through Tickets. For normal use, interact with Tickets through `yoi panel`, Ticket tools, the `yoi ticket ...` CLI, and typed role surfaces. Git history plus Ticket files remain the authoritative state-transition record behind those interfaces.
 
 The current local backend stores each Ticket in the flat `.yoi/tickets/<ticket-id>/` layout. The directory name is the canonical opaque Ticket id: a fixed-width Crockford base32 Unix epoch millisecond timestamp. Slugs and frontmatter `id`/`slug` fields are not current-state authority. That storage detail matters for maintainers and backend compatibility, but it is not the primary user-facing workflow.
 
@@ -25,7 +25,7 @@ Use the highest-level interface that matches the work:
 - Use `yoi panel` for the Ticket/Intake/Orchestrator workspace Dashboard and role-launch actions.
 - Use `yoi objective ...` for lightweight medium-term Objective records and their non-blocking canonical Ticket links.
 - Inside Workers, use typed Ticket tools to create, inspect, comment, review, and close Tickets.
-- For multi-step work, follow the Ticket Intake, Orchestrator Routing, planning/requirements-sync, and Multi-agent workflows.
+- For multi-step work, follow the typed Ticket role surfaces and recorded Ticket lifecycle gates.
 
 Maintainers can inspect the local `.yoi/tickets/` files directly when debugging storage, but normal user instructions should go through `yoi panel`, Ticket tools, or `yoi ticket ...`.
 
@@ -55,7 +55,7 @@ Use them when a Worker needs to materialize or update project records:
 - Reviewer records approve/request-changes review results.
 - Maintainer closes a Ticket with a resolution when merge/validation/cleanup evidence is complete.
 
-Do not bypass workflow gates just because Ticket tools are available. Ticket mutation is a project-record operation and should remain auditable.
+Do not bypass Ticket lifecycle gates just because Ticket tools are available. Ticket mutation is a project-record operation and should remain auditable.
 
 ## Objective records
 
@@ -122,22 +122,18 @@ root = ".yoi/tickets"
 [ticket.roles.intake]
 profile = "project:intake"
 launch_prompt = "$workspace/ticket/intake/launch"
-workflow = "ticket-intake-workflow"
 
 [ticket.roles.orchestrator]
 profile = "project:orchestrator"
 launch_prompt = "$workspace/ticket/orchestrator/launch"
-workflow = "ticket-orchestrator-routing"
 
 [ticket.roles.coder]
 profile = "project:coder"
 launch_prompt = "$workspace/ticket/coder/launch"
-workflow = "multi-agent-workflow"
 
 [ticket.roles.reviewer]
 profile = "project:reviewer"
 launch_prompt = "$workspace/ticket/reviewer/launch"
-workflow = "multi-agent-workflow"
 ```
 
 Fixed roles are:
@@ -155,7 +151,7 @@ when a spike is useful, let the Orchestrator create an ordinary task-specific re
 
 `launch_prompt` is a per-action first-run prompt reference for future prompt resolution. Current launcher behavior exposes the ref but does not treat it as system instruction.
 
-`workflow` is the workflow the launched role should follow. State and phase-specific prompt injection are future work; any dynamic prompt content must be committed as history before it affects model context.
+Role launch prompts are plain history input. State and phase-specific prompt injection are future work; any dynamic prompt content must be committed as history before it affects model context.
 
 `provider = "builtin:yoi_local"` selects Yoi's built-in local Ticket backend. `root = ".yoi/tickets"` is the canonical local storage root for this repository. Legacy `kind = "local"` is accepted only as a short transitional alias; new configs should use `provider`.
 
@@ -165,15 +161,10 @@ If `.yoi/workspace.toml` has no `[ticket]` table and no legacy fallback file exi
 - backend root: `<workspace>/.yoi/tickets`
 - all role profiles: `inherit`
 - no launch prompt refs
-- workflows:
-  - intake: `ticket-intake-workflow`
-  - orchestrator: `ticket-orchestrator-routing`
-  - coder: `multi-agent-workflow`
-  - reviewer: `multi-agent-workflow`
 
 Important: top-level Ticket role launches cannot execute `profile = "inherit"` because top-level launch has no parent Profile to inherit from. Configure concrete role profiles in `.yoi/workspace.toml` under `[ticket.roles.*]` before using `yoi panel` role-launch actions.
 
-## Workflow lifecycle
+## Ticket lifecycle
 
 Ticket-driven development normally moves through these gates:
 
@@ -189,7 +180,7 @@ Each gate records its decision or evidence in the Ticket thread or artifacts.
 
 ### 1. Intake
 
-Use `ticket-intake-workflow` when a user request is broad, ambiguous, or not yet a Ticket.
+Use the Intake role launch prompt when a user request is broad, ambiguous, or not yet a Ticket.
 
 Intake should:
 
@@ -202,7 +193,7 @@ Intake should not schedule implementation, spawn coder/reviewer Workers, create 
 
 ### 2. Orchestrator routing
 
-Use `ticket-orchestrator-routing` to classify the next action for an existing Ticket.
+Use the Orchestrator role launch prompt to classify the next action for an existing Ticket.
 
 Routing classifications include:
 
@@ -219,7 +210,7 @@ Routing decisions should be recorded with `TicketComment` using `plan` or `decis
 
 ### 3. Planning/requirements sync
 
-Use `ticket-preflight-workflow` only as a legacy-compatible planning/requirements sync entry. Return `ready` or `queued` Tickets to `planning` only when the Orchestrator can name a concrete missing decision or information item after bounded project-context checks; risk flags and risky domains are context-lookup and reviewer-focus signals, not automatic stop gates.
+Use planning/requirements sync only as a bounded Ticket refinement step. Return `ready` or `queued` Tickets to `planning` only when the Orchestrator can name a concrete missing decision or information item after bounded project-context checks; risk flags and risky domains are context-lookup and reviewer-focus signals, not automatic stop gates.
 
 Planning sync should resolve or record:
 
@@ -233,7 +224,7 @@ Do not send Tickets with unresolved concrete missing decisions/information direc
 
 ### 4. Implementation assignment
 
-Use `multi-agent-workflow` for implementation-ready Tickets.
+Use the Coder and Reviewer role launch prompts for implementation-ready Tickets.
 
 The Orchestrator should prepare an `IntentPacket` with:
 
@@ -292,19 +283,18 @@ The role-launch path is:
 User triggers a Ticket action in yoi panel
   -> Dashboard builds a TicketRoleLaunchContext
   -> client Ticket role launcher reads .yoi/workspace.toml [ticket] settings
-  -> launcher selects the role Profile and workflow
+  -> launcher selects the role Profile
   -> launcher spawns the role Worker
-  -> launcher sends Method::Run with WorkflowInvoke + Text segments
+  -> launcher sends Method::Run with Text segments
   -> launcher waits for run-acceptance evidence
   -> Dashboard reports success/failure
 ```
 
-The launched Worker receives dynamic Ticket/action context as its first committed run input. The Dashboard does not inject hidden context, does not write Ticket files directly, and does not construct prompt/workflow segments by hand.
+The launched Worker receives dynamic Ticket/action context as its first committed run input. The Dashboard does not inject hidden context, does not write Ticket files directly, and does not construct prompt segments by hand.
 
 The first run input contains:
 
 - the selected fixed role;
-- the workflow canonical id from workspace `[ticket.roles.<role>]` settings;
 - Ticket id when the action targets an existing Ticket;
 - freeform user instruction/context from the action;
 - configured `launch_prompt` reference if present, as an unresolved reference for future prompt resolution.
@@ -324,19 +314,15 @@ root = ".yoi/tickets"
 
 [ticket.roles.intake]
 profile = "project:intake"
-workflow = "ticket-intake-workflow"
 
 [ticket.roles.orchestrator]
 profile = "project:orchestrator"
-workflow = "ticket-orchestrator-routing"
 
 [ticket.roles.coder]
 profile = "project:coder"
-workflow = "multi-agent-workflow"
 
 [ticket.roles.reviewer]
 profile = "project:reviewer"
-workflow = "multi-agent-workflow"
 ```
 
 If a role still uses `profile = "inherit"`, the Dashboard fails closed with a diagnostic explaining that a concrete profile is required.

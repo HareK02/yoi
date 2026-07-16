@@ -1,4 +1,4 @@
-//! `MemoryDelete` tool for removing memory / knowledge records with audit logging.
+//! `MemoryDelete` tool for removing memory records with audit logging.
 
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use crate::audit::{AuditStatus, RecordOperationAudit, append_record_operation, f
 use crate::tool::MemoryToolKind;
 use crate::workspace::WorkspaceLayout;
 
-const DESCRIPTION: &str = "Delete an existing memory or knowledge record selected by `kind` + `slug`. \
+const DESCRIPTION: &str = "Delete an existing memory record selected by `kind` + `slug`. \
 For `summary` omit `slug`; for the others `slug` is required. The delete is audited and cannot target \
 workflow or staging/log files.";
 

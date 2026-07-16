@@ -1,7 +1,7 @@
-export type ComposerCompletionKind = "command" | "file" | "knowledge" | "workflow";
+export type ComposerCompletionKind = "command" | "file";
 
 export type ComposerCompletionToken = {
-  sigil: ":" | "@" | "#" | "/";
+  sigil: ":" | "@";
   kind: ComposerCompletionKind;
   start: number;
   end: number;
@@ -35,7 +35,7 @@ export function completionTokenAt(
 ): ComposerCompletionToken | null {
   const boundedCursor = Math.max(0, Math.min(cursor, value.length));
   const before = value.slice(0, boundedCursor);
-  const match = /(^|\s)([:@#/])([^\s]*)$/.exec(before);
+  const match = /(^|\s)([:@])([^\s]*)$/.exec(before);
   if (!match) {
     return null;
   }
@@ -51,7 +51,9 @@ export function completionTokenAt(
   };
 }
 
-export function localCommandCompletions(prefix: string): ComposerCompletionEntry[] {
+export function localCommandCompletions(
+  prefix: string,
+): ComposerCompletionEntry[] {
   const normalized = prefix.toLowerCase();
   return COLON_COMMAND_COMPLETIONS.filter((entry) =>
     entry.value.toLowerCase().startsWith(normalized)
@@ -65,21 +67,23 @@ export function applyCompletion(
 ): CompletionApplyResult {
   const suffix = entry.is_dir ? "/" : " ";
   const replacement = `${token.sigil}${entry.value}${suffix}`;
-  const restStart = !entry.is_dir && value[token.end] === " " ? token.end + 1 : token.end;
-  const next = `${value.slice(0, token.start)}${replacement}${value.slice(restStart)}`;
+  const restStart = !entry.is_dir && value[token.end] === " "
+    ? token.end + 1
+    : token.end;
+  const next = `${value.slice(0, token.start)}${replacement}${
+    value.slice(restStart)
+  }`;
   const cursor = token.start + replacement.length;
   return { value: next, cursor };
 }
 
-function completionKindForSigil(sigil: ComposerCompletionToken["sigil"]): ComposerCompletionKind {
+function completionKindForSigil(
+  sigil: ComposerCompletionToken["sigil"],
+): ComposerCompletionKind {
   switch (sigil) {
     case ":":
       return "command";
     case "@":
       return "file";
-    case "#":
-      return "knowledge";
-    case "/":
-      return "workflow";
   }
 }

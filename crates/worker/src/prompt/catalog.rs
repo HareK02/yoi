@@ -83,15 +83,6 @@ pub enum WorkerPrompt {
     /// AGENTS.md section when memory is enabled, summary injection is enabled,
     /// and `memory/summary.md` has a valid non-empty body.
     ResidentMemorySummarySection,
-    /// Trailing `## Resident knowledge` section, appended after the
-    /// resident memory summary when memory is enabled, Knowledge resident
-    /// injection is enabled, and at least one `knowledge/*` record advertises
-    /// `model_invokation: true`.
-    ResidentKnowledgeSection,
-    /// Trailing `## Resident workflows` section, appended after resident
-    /// knowledge when Workflow resident injection is enabled and at least one
-    /// workflow advertises `model_invokation: true`.
-    ResidentWorkflowsSection,
     /// Trailing Worker orchestration guidance, appended when registered tools
     /// include Worker-management capabilities.
     WorkerOrchestrationGuidanceSection,
@@ -114,8 +105,6 @@ impl WorkerPrompt {
             Self::WorkingBoundariesSection => "working_boundaries_section",
             Self::AgentsMdSection => "agents_md_section",
             Self::ResidentMemorySummarySection => "resident_memory_summary_section",
-            Self::ResidentKnowledgeSection => "resident_knowledge_section",
-            Self::ResidentWorkflowsSection => "resident_workflows_section",
             Self::WorkerOrchestrationGuidanceSection => "worker_orchestration_guidance_section",
             Self::TicketEventCompanionNotice => "ticket_event_companion_notice",
             Self::SpawnWorkerToolDescription => "spawn_worker_tool_description",
@@ -135,8 +124,6 @@ impl WorkerPrompt {
         WorkerPrompt::WorkingBoundariesSection,
         WorkerPrompt::AgentsMdSection,
         WorkerPrompt::ResidentMemorySummarySection,
-        WorkerPrompt::ResidentKnowledgeSection,
-        WorkerPrompt::ResidentWorkflowsSection,
         WorkerPrompt::WorkerOrchestrationGuidanceSection,
         WorkerPrompt::TicketEventCompanionNotice,
         WorkerPrompt::SpawnWorkerToolDescription,
@@ -152,8 +139,6 @@ impl WorkerPrompt {
         "working_boundaries_section",
         "agents_md_section",
         "resident_memory_summary_section",
-        "resident_knowledge_section",
-        "resident_workflows_section",
         "worker_orchestration_guidance_section",
         "ticket_event_companion_notice",
         "spawn_worker_tool_description",
@@ -391,34 +376,6 @@ impl PromptCatalog {
         )
     }
 
-    /// Render `WorkerPrompt::ResidentKnowledgeSection` with `{{ entries }}`
-    /// (a pre-formatted list block authored by the caller).
-    pub fn resident_knowledge_section(
-        &self,
-        entries: &str,
-        knowledge_query_available: bool,
-        memory_read_available: bool,
-    ) -> Result<String, CatalogError> {
-        use std::collections::BTreeMap;
-        let mut m: BTreeMap<&'static str, Value> = BTreeMap::new();
-        m.insert("entries", Value::from(entries));
-        m.insert(
-            "knowledge_query_available",
-            Value::from(knowledge_query_available),
-        );
-        m.insert("memory_read_available", Value::from(memory_read_available));
-        self.render(WorkerPrompt::ResidentKnowledgeSection, Value::from(m))
-    }
-
-    /// Render `WorkerPrompt::ResidentWorkflowsSection` with `{{ entries }}`
-    /// (a pre-formatted list block authored by the caller).
-    pub fn resident_workflows_section(&self, entries: &str) -> Result<String, CatalogError> {
-        self.render(
-            WorkerPrompt::ResidentWorkflowsSection,
-            single("entries", entries),
-        )
-    }
-
     /// Render `WorkerPrompt::WorkerOrchestrationGuidanceSection` (no inputs).
     pub fn worker_orchestration_guidance_section(&self) -> Result<String, CatalogError> {
         self.render(
@@ -570,7 +527,6 @@ mod tests {
         let extract = cat.memory_extract_system("Japanese").unwrap();
         let consolidate = cat.memory_consolidation_system("Japanese").unwrap();
         for rendered in [compact, extract, consolidate] {
-            assert!(!rendered.contains("### Memory and knowledge"));
             assert!(!rendered.contains("Do not query memory every turn"));
             assert!(!rendered.contains("Strong lookup triggers include"));
         }
@@ -750,7 +706,7 @@ compact_system = "PREFIX\n{% include \"$yoi/internal/compact_system\" %}"
         assert!(rendered.contains("Do not use `sleep` or polling loops"));
         assert!(rendered.contains("worktree state, diff, and test results"));
         assert!(rendered.contains("not scheduler or auto-maintain authorization"));
-        assert!(rendered.contains("bypass user/workflow authorization"));
+        assert!(rendered.contains("bypass user/Ticket authorization"));
     }
 
     #[test]

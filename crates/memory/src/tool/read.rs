@@ -1,8 +1,8 @@
 //! `MemoryRead` tool.
 //!
-//! Reads a memory or knowledge record by `(kind, slug)`. Returns
+//! Reads a memory record by `(kind, slug)`. Returns
 //! line-numbered content (1-based), like the generic Read tool. The
-//! agent never names a path — `Search` returns `{kind, slug, ...}`
+//! agent never names a path — `MemoryQuery` returns `{kind, slug, ...}`
 //! and that pair feeds straight into Read.
 
 use std::sync::Arc;
@@ -16,8 +16,8 @@ use crate::tool::MemoryToolKind;
 use crate::usage::{self, UsageSource};
 use crate::workspace::WorkspaceLayout;
 
-const DESCRIPTION: &str = "Read a memory or knowledge record by `kind` + `slug`. \
-`kind` is one of: summary, decision, request, knowledge. \
+const DESCRIPTION: &str = "Read a memory record by `kind` + `slug`. \
+`kind` is one of: summary, decision, request. \
 For `summary` omit `slug`; for the others `slug` is required. \
 Returns line-numbered output (1-based).";
 
@@ -25,7 +25,7 @@ const DEFAULT_LIMIT: usize = 2000;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ReadParams {
-    /// Record kind: `summary` | `decision` | `request` | `knowledge`.
+    /// Record kind: `summary` | `decision` | `request`.
     kind: MemoryToolKind,
     /// Slug. Required for everything except `summary`; forbidden for `summary`.
     #[serde(default)]
@@ -288,22 +288,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidArgument(_)));
-    }
-
-    #[tokio::test]
-    async fn knowledge_path_resolution() {
-        let (dir, layout) = setup();
-        let path = dir.path().join(".yoi/knowledge/policy.md");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "k\n").unwrap();
-
-        let (_, tool) = read_tool(layout)();
-        let inp = serde_json::json!({ "kind": "knowledge", "slug": "policy" });
-        let out = tool
-            .execute(&inp.to_string(), Default::default())
-            .await
-            .unwrap();
-        assert!(out.content.unwrap().contains("k"));
     }
 
     #[tokio::test]

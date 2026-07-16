@@ -1196,9 +1196,8 @@ mod tests {
         assert!(config.contains("# language = \"Japanese\""));
         for role in TicketRole::ALL {
             assert!(config.contains(&format!(
-                "[ticket.roles.{role}]\nprofile = \"{}\"\nworkflow = \"{}\"",
-                role.default_profile(),
-                role.default_workflow()
+                "[ticket.roles.{role}]\nprofile = \"{}\"",
+                role.default_profile()
             )));
         }
         assert!(!config.contains("[ticket.roles.investigator]"));

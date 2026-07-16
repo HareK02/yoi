@@ -35,28 +35,7 @@ Deno.test("workerConsoleHref encodes runtime and worker target authority", () =>
   );
 });
 
-Deno.test("segmentsToText preserves protocol segment semantics", () => {
-  const text = segmentsToText([
-    { kind: "text", content: "hello" },
-    { kind: "file_ref", path: "/tmp/example.md" },
-    { kind: "knowledge_ref", slug: "design-note" },
-    { kind: "workflow_invoke", slug: "ticket-review" },
-  ]);
 
-  assert(text.includes("hello"), "text segment should render content");
-  assert(
-    text.includes("@file /tmp/example.md"),
-    "file ref should render as a file reference",
-  );
-  assert(
-    text.includes("@knowledge design-note"),
-    "knowledge ref should render as a knowledge reference",
-  );
-  assert(
-    text.includes("/ticket-review"),
-    "workflow invocation should render as slash command",
-  );
-});
 
 Deno.test("projectConsole projects visible protocol rows", () => {
   const projection = projectConsole([

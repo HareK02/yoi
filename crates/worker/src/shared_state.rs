@@ -6,16 +6,6 @@ use session_store::SegmentId;
 
 use crate::fs_view::WorkerFsView;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkflowCandidate {
-    pub slug: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KnowledgeCandidate {
-    pub slug: String,
-}
-
 /// Shared state between WorkerController and runtime directory.
 ///
 /// Controller updates this in-memory; RuntimeDir writes the status
@@ -24,8 +14,8 @@ pub struct KnowledgeCandidate {
 /// History and typed user-segment mirrors used to live here so the
 /// IPC layer could answer `Method::GetHistory`. Those reads now go
 /// directly through the session-log sink (`Event::Snapshot` +
-/// `Event::Entry`), so this struct holds only status, identity,
-/// greeting, and completion lookup hubs.
+/// live events), so this struct holds only status, identity,
+/// greeting, and filesystem completion lookup hubs.
 pub struct WorkerSharedState {
     pub worker_name: String,
     pub segment_id: SegmentId,
@@ -39,8 +29,6 @@ pub struct WorkerSharedState {
     /// (only relevant for unit tests that build a `WorkerSharedState`
     /// directly without spinning up a controller).
     fs_view: OnceLock<WorkerFsView>,
-    workflows: OnceLock<Vec<WorkflowCandidate>>,
-    knowledge: OnceLock<Vec<KnowledgeCandidate>>,
 }
 
 impl WorkerSharedState {
@@ -57,8 +45,6 @@ impl WorkerSharedState {
             greeting,
             status: RwLock::new(WorkerStatus::Idle),
             fs_view: OnceLock::new(),
-            workflows: OnceLock::new(),
-            knowledge: OnceLock::new(),
         }
     }
 
@@ -72,40 +58,6 @@ impl WorkerSharedState {
     /// tests that didn't wire one up.
     pub fn fs_view(&self) -> Option<&WorkerFsView> {
         self.fs_view.get()
-    }
-
-    pub fn set_workflows(&self, workflows: Vec<WorkflowCandidate>) {
-        let _ = self.workflows.set(workflows);
-    }
-
-    pub fn list_workflow_completions(&self, prefix: &str) -> Vec<WorkflowCandidate> {
-        self.workflows
-            .get()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter(|candidate| candidate.slug.starts_with(prefix))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    pub fn set_knowledge(&self, knowledge: Vec<KnowledgeCandidate>) {
-        let _ = self.knowledge.set(knowledge);
-    }
-
-    pub fn list_knowledge_completions(&self, prefix: &str) -> Vec<KnowledgeCandidate> {
-        self.knowledge
-            .get()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter(|candidate| candidate.slug.starts_with(prefix))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
     pub fn set_status(&self, status: WorkerStatus) {
@@ -188,36 +140,5 @@ mod tests {
         let json = state.status_json();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["state"], "running");
-    }
-
-    #[test]
-    fn knowledge_completions_empty_when_unset() {
-        let state = test_state();
-        assert!(state.list_knowledge_completions("").is_empty());
-        assert!(state.list_knowledge_completions("foo").is_empty());
-    }
-
-    #[test]
-    fn knowledge_completions_filter_by_prefix() {
-        let state = test_state();
-        state.set_knowledge(vec![
-            KnowledgeCandidate {
-                slug: "alpha".into(),
-            },
-            KnowledgeCandidate {
-                slug: "alphabet".into(),
-            },
-            KnowledgeCandidate {
-                slug: "beta".into(),
-            },
-        ]);
-        let all = state.list_knowledge_completions("");
-        assert_eq!(all.len(), 3);
-        let alpha = state.list_knowledge_completions("alpha");
-        assert_eq!(
-            alpha.iter().map(|c| c.slug.as_str()).collect::<Vec<_>>(),
-            vec!["alpha", "alphabet"]
-        );
-        assert!(state.list_knowledge_completions("zzz").is_empty());
     }
 }

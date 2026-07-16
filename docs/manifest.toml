@@ -232,7 +232,7 @@ permission = "write"
 # ===== [memory] =============================================================
 # Memory subsystem の opt-in。
 #   - セクションが *ある*    … memory tools (MemoryRead/Write/Edit) を登録、
-#                              `<workspace>/memory/` と `<workspace>/knowledge/`
+#                              `<workspace>/memory/` と `<workspace>/`
 #                              の通常 write を Worker 自体に対して deny する。
 #   - セクションが *無い*    … 何も起きない (legacy 動作)。
 # `[memory]` だけ書いて中身を省略するのも有効 (全フィールド既定値で有効化)。
@@ -243,7 +243,7 @@ permission = "write"
 # workspace_root = "/abs/path/to/workspace"
 #
 # # 任意。デフォルト: tool 側既定 = 20。
-# # MemoryQuery / KnowledgeQuery が 1 回に返す最大件数。
+# # MemoryQuery / MemoryQuery が 1 回に返す最大件数。
 # query_result_limit = 20
 #
 # # 任意。デフォルト: tool 側既定 = 3。
@@ -281,8 +281,8 @@ permission = "write"
 
 
 # ===== [skills] =============================================================
-# 外部 Agent Skills (`SKILL.md`) を Workflow として読み込むディレクトリ群。
-# セクション省略 = 何もロードしない (implicit な `$config_dir/skills/` 検索や
+# 外部 Agent Skills (`SKILL.md`) の候補ディレクトリ群。
+# セクション省略 = 何も使用しない (implicit な `$config_dir/skills/` 検索や
 # builtin probe は存在しない)。
 # [skills]
 #

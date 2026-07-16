@@ -38,7 +38,7 @@
 
 - `memory_lint.rs` は主要な CLI 固有 invariants をカバーしている:
   - option parsing と usage error
-  - 意図した memory/Knowledge record path だけが lint されること
+  - 意図した memory record path だけが lint されること
   - invalid record が lint failure になること
   - `--warnings-as-errors` が status を変えること
   - JSON output が parse 可能で、期待される counts を含むこと
@@ -97,7 +97,7 @@
   - `show` における path traversal / invalid id rejection
   - paused/done/archived/all に対する list filtering
 
-- `memory_lint.rs` には妥当な focused tests があるが、decisions と Knowledge records を明示的にはカバーしておらず、symlink/directory の特殊性、読めない file、summary fragments を超えた stdout human-output details もカバーしていない。
+- `memory_lint.rs` には妥当な focused tests があるが、decisions を明示的にはカバーしておらず、symlink/directory の特殊性、読めない file、summary fragments を超えた stdout human-output details もカバーしていない。
 
 - `session_cli.rs` は意図的に薄いが、ほとんどは最小 fixture を通じて delegated analytics output shape を検証している。より広い analytics correctness は `session-analytics` に属する。`yoi` crate には、unknown subcommands/options と duplicate path handling の test がまだない。
 

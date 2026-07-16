@@ -6,7 +6,7 @@ export type AlertLevel = "warn" | "error";
 
 export type AlertSource = "worker" | "engine" | "compactor" | "agents_md";
 
-export type CompletionKind = "file" | "knowledge" | "workflow";
+export type CompletionKind = "file";
 
 export type WorkerStatus = "idle" | "running" | "paused";
 
@@ -79,7 +79,7 @@ message: string,
  */
 timestamp_ms: number, };
 
-export type Segment = { "kind": "text", content: string, } | { "kind": "paste", id: number, chars: number, lines: number, content: string, } | { "kind": "file_ref", path: string, } | { "kind": "knowledge_ref", slug: string, } | { "kind": "workflow_invoke", slug: string, } | { "kind": "unknown" };
+export type Segment = { "kind": "text", content: string, } | { "kind": "paste", id: number, chars: number, lines: number, content: string, } | { "kind": "file_ref", path: string, } | { "kind": "unknown" };
 
 export type WorkerEvent = { "kind": "turn_ended", worker_name: string, } | { "kind": "errored", worker_name: string, message: string, } | { "kind": "shut_down", worker_name: string, } | { "kind": "scope_sub_delegated",
 /**

@@ -108,24 +108,6 @@ impl WorkerHandle {
                     is_dir: c.is_dir,
                 })
                 .collect(),
-            protocol::CompletionKind::Knowledge => self
-                .shared_state
-                .list_knowledge_completions(prefix)
-                .into_iter()
-                .map(|c| protocol::CompletionEntry {
-                    value: c.slug,
-                    is_dir: false,
-                })
-                .collect(),
-            protocol::CompletionKind::Workflow => self
-                .shared_state
-                .list_workflow_completions(prefix)
-                .into_iter()
-                .map(|c| protocol::CompletionEntry {
-                    value: c.slug,
-                    is_dir: false,
-                })
-                .collect(),
         }
     }
 
@@ -340,20 +322,6 @@ impl WorkerController {
         if let Some(fs_for_view) = fs_for_view {
             shared_state.set_fs_view(crate::fs_view::WorkerFsView::new(fs_for_view));
         }
-        shared_state.set_workflows(
-            worker
-                .workflow_completions()
-                .into_iter()
-                .map(|slug| crate::shared_state::WorkflowCandidate { slug })
-                .collect(),
-        );
-        shared_state.set_knowledge(
-            worker
-                .knowledge_completions()
-                .into_iter()
-                .map(|slug| crate::shared_state::KnowledgeCandidate { slug })
-                .collect(),
-        );
         runtime_dir.write_manifest(&manifest_toml).await?;
         runtime_dir.write_status(&shared_state).await?;
 
@@ -768,7 +736,7 @@ where
 
         // Memory tools require both explicit feature exposure and memory storage
         // configuration. This keeps resident-memory config separate from the
-        // model-visible Memory*/Knowledge* tool surface.
+        // model-visible Memory* tool surface.
         if feature_config.memory.enabled {
             let mem = memory_config.as_ref().ok_or_else(|| {
                 std::io::Error::new(
@@ -791,8 +759,7 @@ where
             worker.register_tool(memory::tool::write_tool(layout.clone()));
             worker.register_tool(memory::tool::edit_tool(layout.clone()));
             worker.register_tool(memory::tool::delete_tool(layout.clone()));
-            worker.register_tool(memory::tool::memory_query_tool(layout.clone(), query_cfg));
-            worker.register_tool(memory::tool::knowledge_query_tool(layout, query_cfg));
+            worker.register_tool(memory::tool::memory_query_tool(layout, query_cfg));
         }
 
         // Worker-orchestration tools (SpawnWorker + the four comm tools) share
@@ -1584,7 +1551,6 @@ fn worker_error_code(e: &WorkerError) -> ErrorCode {
             _ => ErrorCode::Internal,
         },
         WorkerError::Provider(_) => ErrorCode::ProviderError,
-        WorkerError::WorkflowResolve(_) => ErrorCode::InvalidRequest,
         _ => ErrorCode::Internal,
     }
 }

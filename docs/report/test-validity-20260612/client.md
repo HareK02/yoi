@@ -35,7 +35,7 @@
   - `inherit` profile は top-level launches で拒否される;
   - 解決不能な profile selectors は spawn 前に失敗する;
   - concrete role config と scaffold config が launch plans を生成する;
-  - 設定された workflow/profile/launch prompt refs が表面化される;
+  - 設定された profile/launch prompt refs が表面化される;
   - spawn config が pod name、profile、role、workspace root、`cwd` 境界を正しく保持する;
   - prompt override precedence がテストされている;
   - role-specific launch prompts が intake、orchestrator、coder、reviewer 向けの重要な運用ガイダンスを含む。
