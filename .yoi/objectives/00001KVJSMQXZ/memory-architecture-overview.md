@@ -1,6 +1,6 @@
 ---
 created_at: "2026-07-15T21:33:00Z"
-updated_at: "2026-07-16T17:18:00Z"
+updated_at: "2026-07-16T18:20:00Z"
 objective: "00001KVJSMQXZ"
 status: "architecture-draft"
 notes: "Memory / Knowledge / Skills を別々の workspace resource として再設計するための draft architecture。この文書は Objective resource であり、実装 authority ではない。"
@@ -65,7 +65,7 @@ Memory record に入るもの:
 Memory は provisional に書く:
 
 - いつ / なぜ learned したかを書く。
-- scope と applicability を書く。
+- どの前提で learned したかを必要な範囲で書く。
 - staleness / supersession を許す。
 - authoritative records を verbatim にコピーしない。
 - 可能なら Tickets / docs / Knowledge notes への pointer を優先する。
@@ -95,17 +95,17 @@ Memory は Knowledge のような note bundle ではない。1〜3 行程度の 
 ## Current focus
 
 - Memory extract redesign is focused on Overview-first extraction and staging resolution.
-  Scope: Yoi repo. Source: Objective 00001KVJSMQXZ. Stale when related tickets close.
+  Source: Objective 00001KVJSMQXZ. Stale when related tickets close.
 
 ## Preferences
 
 - User prefers implementation Tickets, not design-only Tickets.
-  Scope: Yoi dogfooding. Source: 2026-07-16 session.
+  Source: 2026-07-16 session.
 
 ## Working assumptions
 
 - Knowledge should be OKF-compatible, while volatile Memory and staging should not be OKF.
-  Scope: Memory architecture redesign. Source: architecture objective.
+  Source: architecture objective.
 
 ## Reminders
 
@@ -121,7 +121,7 @@ Recommended H2 sections:
 - `## Reminders`
 - `## Stale or superseded`
 
-Each item should stay short. When useful, include `Scope`, `Source`, and `Stale when` inline. Long explanations, evidence-heavy analysis, durable rationale, citations, and cross-linked concepts should be routed to Knowledge rather than expanded inside Memory.
+Each item should stay short. When useful, include `Source` and `Stale when` inline. Long explanations, evidence-heavy analysis, durable rationale, citations, and cross-linked concepts should be routed to Knowledge rather than expanded inside Memory.
 
 The single-file layout is an initial storage profile, not an API contract. Workers, Web, Runtime, and CLI should use the Workspace Memory API view rather than depending on the exact file layout, so storage can later split or evolve without changing the model-visible contract.
 
@@ -129,7 +129,6 @@ The single-file layout is an initial storage profile, not an API contract. Worke
 
 ```text
 User preference: prefers direct commits only when explicitly requested.
-Scope: this repository / current dogfooding workflow.
 Source: repeated user corrections in sessions around git operations.
 Staleness: revisit if user changes repo workflow.
 ```
@@ -420,50 +419,149 @@ Overview の意図は、extract worker に「何のための探索だったか�
 
 ### 6.2 Extract: candidate generation
 
-Extract は candidate generation であり、Memory 化ではない。入力は Overview-first / Evidence-index-second にする。
+Extract は candidate generation であり、Memory 化ではない。runtime 側の extract worker が Overview と session evidence を読んで、後で記憶化を検討すべき **flat candidate records** を staging に出す。
 
 Extract の責務:
 
-- Overview を読んで、重要そうな request / discussion / decision / attempt を見つける。
+- Overview を読んで、記憶化を検討すべき candidate を見つける。
 - 必要な箇所だけ evidence tools で確認する。
-- source anchors を持つ candidate を staging に出す。
-- empty / NOP を正常結果として扱う。
+- candidate ごとに bounded evidence snippets / source anchors を選ぶ。
+- candidate ごとに `stage_candidate` を呼び、1 candidate = 1 staging record として保存する。
+- 最後に `finish_extraction` を呼び、staged count または NOP reason を残す。
 
 Extract がしてはいけないこと:
 
 - Memory / Knowledge / Skill / Ticket / docs を直接変更しない。
+- batch payload として複数 candidate を 1 staging record にまとめない。
 - tool result 全文や reasoning を無制限に取り込まない。
 - local slice だけから根拠を推測しない。
+- tool call chronology、generic progress、current focus update を抽出しない。
 - 「進捗報告があった」こと自体を Memory 化しない。
 
-初期の extract output schema は既存の `decisions` / `discussions` / `attempts` / `requests` を維持してよい。ただし、entry-level evidence refs / source anchors を段階的に追加できる形にする。
+Staging candidate は、Consolidation がそれ単体で discard / merge / promote / defer を判断できる最小単位にする。
 
-### 6.3 Extract worker evidence tools
+旧 `decisions` / `discussions` / `attempts` / `requests` batch schema は維持しなくてよい。互換性よりも、flat candidate records と clear responsibility を優先する。
 
-extract worker には専用の constrained evidence tools を渡す。これは main Worker の tool 数を増やすものではなく、extract 専用 worker の read-only surface である。
+#### 6.2.1 Extract candidate taxonomy
 
-必要な tool category:
+Extract が抽出する対象は activity log ではない。抽出対象は次の candidate kinds に絞る。
 
-- **Evidence search**: session slice / tool summaries / message index から query で候補 range を探す。
-- **Evidence read**: bounded な session entry range、tool call/result summary、必要なら host が許す bounded content excerpt を読む。
-- **Source anchor resolver**: `session_id`, entry range, tool call id, file path, Ticket/Objective artifact ref などを staging source に結びつける。
-- **write_extracted**: structured payload を 1 回提出する既存 output tool。
+| kind | extract で見る観点 | consolidation での扱い |
+| --- | --- | --- |
+| `preference` | ユーザーまたは workspace の継続的な好み・作法。単発指示ではなく、今後の agent behavior に効くもの。 | Memory に短く merge / replace する候補。既存 preference と重複するなら統合。Ticket/docs の要件そのものなら mirror せず authority link へ。曖昧なら discard / defer。 |
+| `working_assumption` | 現時点で仮に置いている設計・実装前提。future work に影響し、変更条件や反証条件があり得るもの。 | Memory に入れる場合は short-lived assumption として stale condition 必須。長期設計なら Knowledge candidate。すでに authority record に反映済みなら Memory には pointer だけ、または discard。 |
+| `constraint` | 今後守るべき境界・禁止・invariant。実装や review でチェック可能なもの。 | active implementation に効くなら Memory。durable policy なら Ticket decision / Knowledge / docs candidate。破られた既存 Memory があれば mark_stale / replace。 |
+| `decision` | alternatives / chosen / rationale がある判断。単なる事実確認や作業進行ではないもの。 | まず authority routing を判断する。Ticket 要件・state・acceptance に関係するなら Ticket decision/comment candidate。長期設計なら Knowledge/Objective candidate。短期実装判断だけ Memory に短く置く。会話中の一時結論なら discard。 |
+| `open_question` | 未解決で後続作業に影響する問い。next action が書けるもの。単なる会話中の疑問ではない。 | Memory reminder にするか、Ticket follow-up / planning item に送る。解決済みなら discard。長く残る概念的問いなら Knowledge candidate。TTL / defer reason を持たせる。 |
+| `lesson` | 検証・失敗・試行から得た再利用価値のある学び。同じ失敗を避ける、作業方法を改善する、Skill 化できる可能性があるもの。 | Memory に短く残すか、recurring / portable なら Skill candidate。単なる tool execution result は discard。validation evidence として Ticket/report に残すべきものは authority link。 |
+
+抽出しないもの:
+
+- `current_focus` update。これは resident summary surface であり、extract candidate kind ではない。
+- tool call chronology。
+- file read/write history。
+- generic progress updates。
+- one-off chit-chat。
+- resolved local confusion。
+- assistant self-corrections without durable consequence。
+- authoritative Ticket/docs/git facts copied verbatim。
+- validation results unless they imply a reusable lesson, active blocker, or authority evidence。
+- implementation details that belong only in commit diff。
+
+### 6.3 Extract worker tools
+
+extract worker には `session-explore` feature の constrained tools だけを渡す。これは main Worker の tool 数を増やすものではない。
+
+Tool surface:
+
+- `search_evidence`: session snapshot / tool summaries / message index から query で候補 range を探す。
+- `read_evidence`: bounded な session entry range、tool call/result summary、host が許す bounded excerpt を読む。
+- `stage_candidate`: 1 candidate を staging record として保存する。
+- `finish_extraction`: extract run を終了し、staged count または NOP reason を記録する。
+
+`stage_candidate` は direct Memory write ではない。これは staging write だけを行う output tool である。
+
+`stage_candidate` input の概念形:
+
+```json
+{
+  "kind": "decision",
+  "claim": "Overview is runtime-only extract projection, not staging data.",
+  "why_useful": "Clarifies extract/consolidate responsibility boundary.",
+  "staleness": "Revisit if Workspace can directly explore runtime sessions.",
+  "evidence_ids": ["E001", "E002"]
+}
+```
+
+Host wrapper は `evidence_ids` を runtime reference environment から解決し、bounded evidence snippets と source anchors を staging record に機械的に付与する。LLM に自由な source anchor を書かせない。
+
+`finish_extraction` の概念形:
+
+```json
+{
+  "staged_count": 0,
+  "reason": "Only local progress and tool chronology; no durable candidates."
+}
+```
+
+候補が無い場合は `stage_candidate` を呼ばず、`finish_extraction` で NOP を明示する。tool call なし終了も host 側では NOP fallback として扱ってよいが、基本は `finish_extraction` を要求する。
 
 制約:
 
-- read-only。file write、Ticket mutation、Memory/Knowledge/Skill direct write は持たせない。
+- read-only evidence access。file write、Ticket mutation、Memory/Knowledge/Skill direct write は持たせない。
 - bounded output。large tool result は summary / excerpt / pointer に留める。
-- provenance first。extract worker が根拠を推測せず、読んだ evidence range を output と結びつけられるようにする。
-- NOP allowed。Overview を読んで保存価値がなければ empty payload で終わる。
+- provenance first。extract worker が根拠を推測せず、読んだ evidence ids を `stage_candidate` に渡す。
 
-### 6.4 Staging: provenance-backed candidate queue
+### 6.4 Staging: flat provenance-backed candidate records
 
-Staging は Memory ではない。Staging は、extract が拾った candidate を provenance 付きで保管し、consolidation が後で審査できるようにする queue / buffer である。
+Staging は Memory ではない。Staging は、extract が切り出した candidate を provenance 付きで保管し、consolidation が後で審査できるようにする queue である。
+
+Staging は flat records にする。
+
+```text
+1 extract run = 0..N staging records
+1 staging record = 1 candidate = 1 consolidation decision unit
+```
+
+1 record の概念形:
+
+```json
+{
+  "schema_version": 2,
+  "id": "stg_...",
+  "extract_run_id": "er_...",
+  "source": {
+    "segment_id": "segment-1",
+    "range": [120, 180]
+  },
+  "kind": "constraint",
+  "claim": "Extract worker must not direct-write Memory/Knowledge/Skill; it only writes staging.",
+  "why_useful": "Preserves runtime/embedded responsibility boundary.",
+  "staleness": "Revisit if extract and consolidation move into the same Workspace execution context.",
+  "evidence": [
+    {
+      "id": "E001",
+      "kind": "message",
+      "entry_range": [132, 133],
+      "excerpt": "extract worker は Memory / Knowledge / Skill を直接更新しない",
+      "summary": "User and architecture discussion fixed staging-only extract boundary."
+    }
+  ],
+  "source_refs": [
+    {
+      "evidence_id": "E001",
+      "evidence_kind": "message",
+      "entry_range": [132, 133]
+    }
+  ]
+}
+```
 
 Staging の責務:
 
+- candidate kind / claim / hints を保持する。
+- extract が選んだ bounded evidence snippets を保持する。
 - source anchors を保持する。
-- candidate と Overview / Evidence の対応を保持する。
 - extract と consolidation を decouple する。
 - duplicate / defer / discard / consumed の追跡対象になる。
 - crash / cancel / long-running work の途中でも、後から審査できる候補を残す。
@@ -472,7 +570,8 @@ Staging がしてはいけないこと:
 
 - Memory として resident context に直接入らない。
 - Knowledge note の代替にならない。
-- raw session log の永久保存場所にならない。
+- raw session log や Overview 全体の保存場所にならない。
+- extract run 単位の batch file として複数 candidate を抱え込まない。
 - staging entry をすべて Memory 化する前提にしない。
 
 Pirolli & Card 的には、staging は shoebox / evidence file に近い。ただし Yoi の storage taxonomy そのものを shoebox にするのではなく、審査前の evidence-backed candidate queue として扱う。
@@ -515,10 +614,10 @@ Consolidation は precision-oriented pass である。staging を読んで、Mem
 
 Consolidation の責務:
 
-- staging entry を評価する。
-- Memory 化するなら usefulness / scope / staleness / source を要求する。
+- staging entry を candidate kind ごとの扱いに沿って評価する。
+- Memory 化するなら usefulness / staleness / source を要求する。
 - 既存 Memory と merge / replace / mark stale / delete する。
-- Knowledge / Skill / Ticket / docs candidate に routing する。
+- decision / constraint / lesson などを authority / Knowledge / Skill / Ticket / docs candidate に routing する。
 - discard reason / defer reason を残す。
 - linter feedback / usage evidence / tidy hints を使う。
 - Memory bloat と stale records を防ぐ。
@@ -534,7 +633,6 @@ Memory 化に必要な minimum fields / prose:
 
 ```text
 content: 何を覚えるか
-scope: どこで効くか
 why_useful: 今後なぜ役立つか
 source: staging / evidence anchor
 staleness: 何が起きたら古くなるか
@@ -549,12 +647,13 @@ Consolidation は append worker ではなく garden worker である。新規作
 
 初期方針:
 
-- overview token count または Assistant Progress/final message count が一定量を超えたら extract を予約する。
-- tool evidence growth が大きい場合も extract を予約できる。
-- Worker run cycle / task boundary / Ticket phase boundary では extract を試す。
-- long-running 中に mid-run 発火する場合も、direct update ではなく staging/checkpoint extraction に限定する。
+- 現行通り、Worker run cycle が完了してから threshold を判定し、超えていれば extract を発火する。
+- extract 開始時点で immutable snapshot / Overview projection / Evidence index を作る。
+- LLM call ごとには発火しない。
+- Run 中の Overview accumulation trigger / mid-run extract は初期実装に含めない。
+- 将来 long-running 中に mid-run 発火を入れる場合も、direct update ではなく staging/checkpoint extraction に限定する。
 
-この trigger は「意味のある overview が溜まったか」と「evidence が失われる前に staging したいか」の両方で判断する。
+この trigger は、まず既存の post-run memory job model を保ち、extract の入力品質と staging record 粒度の改善に集中する。
 
 ## 7. Sensemaking interpretation
 
@@ -580,7 +679,7 @@ Product
     Ticket/doc update, review evidence, discard resolution
 ```
 
-重要なのは、Memory 化を evidence から product へ進める審査の一形態として扱うこと。Memory record は「将来の作業に効く」という hypothesis なので、scope、why_useful、staleness、source が必要である。
+重要なのは、Memory 化を evidence から product へ進める審査の一形態として扱うこと。Memory record は「将来の作業に効く」という hypothesis なので、why_useful、staleness、source が必要である。
 
 初期 sensemaking support は lightweight でよい:
 
@@ -713,11 +812,12 @@ Recommended implementation sequence:
    - tool calls / tool results は Evidence index として分離する。
    - committed history だけから Overview を作り、hidden context injection を避ける。
 
-4. **Extract worker 専用 evidence tools を実装する**
-   - extract worker に read-only Evidence search / Evidence read / Source anchor resolver を渡す。
+4. **Extract worker 専用 evidence tools と staging output tools を実装する**
+   - extract worker に read-only Evidence search / Evidence read を渡す。
    - main Worker の tool surface は増やさない。
-   - output tool は `write_extracted` を維持し、structured payload を 1 回提出させる。
-   - source range と output entry を結びつけられる schema / staging format を実装する。
+   - output tools は `stage_candidate` / `finish_extraction` にする。
+   - `stage_candidate` は 1 candidate = 1 flat staging record を書く。
+   - source range と candidate record を結びつけられる schema / staging format を実装する。
 
 5. **Staging-first extract を維持する**
    - extract worker は direct Memory / Knowledge / Skill write をしない。
@@ -772,6 +872,7 @@ Recommended implementation sequence:
 - Knowledge notes を Tickets / docs / git history より authoritative にすること。
 - review なしに Knowledge / Skills / docs を自動 rewrite すること。
 - extract worker に direct resource mutation authority を持たせること。
+- extract run 単位の batch staging record に複数 candidate を抱え込ませること。
 - staging entry をすべて Memory 化すること。
 - human-readable artifact model が安定する前に vector database を設計すること。
 - volatile Memory や staging queue を OKF concept document として扱うこと。
@@ -791,10 +892,11 @@ Recommended implementation sequence:
 - Memory -> Knowledge の promotion UI/tool をどうするか。
 - personal Memory と workspace Memory をどう区別するか。
 - Knowledge drafts の auto-generation をどこまで許すか。
-- extract worker 専用 evidence tools の exact API: search/read/resolver の引数、上限、source anchor format。
+- extract worker 専用 evidence tools の exact API: search/read の引数、上限、evidence id format。
+- `stage_candidate` / `finish_extraction` の exact tool schema。
+- flat staging record の exact fields: `claim`, `why_useful`, `staleness`, `evidence`, `source_refs`, `extract_run_id` など。
 - Overview trigger を overview token count、Assistant message count、evidence growth、run/task boundary のどれで制御するか。
 - mid-run extract をどこまで許すか。初期は staging/checkpoint extraction に限定する方針。
-- source range と `ExtractedPayload` entries をどう結びつけるか。
 - staging resolution log / archive の保持期間と compact policy。
 - どの Memory sidecar writes を direct に許し、どれを staged proposals にするか。extract worker 自体は direct write しない。
 - Skill sidecar output は patches/proposals だけから始めるか、low-risk Skill edits を auto-apply してよいか。

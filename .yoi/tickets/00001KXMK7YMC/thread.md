@@ -49,3 +49,12 @@ Rescoped from broad Overview-first extract implementation to the worker implemen
 
 
 ---
+
+<!-- event: decision author: hare at: 2026-07-17T18:10:00Z -->
+
+## Decision
+
+Design updated: abandon the old batch `write_extracted` / `decisions` / `discussions` / `attempts` / `requests` staging direction. Extract now stages flat candidate records with `stage_candidate` and finishes with `finish_extraction`. The older dependency on 00001KXNYXNM6 is historical; the active schema dependency is 00001KXRM6G0G.
+
+
+---

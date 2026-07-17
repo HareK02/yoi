@@ -2,8 +2,8 @@
 title: "効果的な Memory システム設計・検証"
 state: "active"
 created_at: "2026-06-20T15:16:00Z"
-updated_at: "2026-07-16T17:24:00Z"
-linked_tickets: ["00001KSKBPHRG", "00001KT02TCCG", "00001KTGCAFXG", "00001KSKBPTHR", "00001KXMEZNYC", "00001KXMK7YMC", "00001KXNYXNM6", "00001KXMK846H"]
+updated_at: "2026-07-17T18:10:00Z"
+linked_tickets: ["00001KSKBPHRG", "00001KT02TCCG", "00001KTGCAFXG", "00001KSKBPTHR", "00001KXMEZNYC", "00001KXMK7YMC", "00001KXNYXNM6", "00001KXRM6G0G", "00001KXMK846H"]
 ---
 
 ## Goal
@@ -74,7 +74,7 @@ Memory 墓場化の最初の原因は、保存情報が現在の問いに集ま�
 - Progress message は専用 Tool ではなく通常 Message とし、ユーザーへの進捗報告と extract 用 semantic summary を兼ねる。
 - extract worker には専用の read-only evidence tools を渡し、Overview で重要そうに見えた箇所だけ session range / tool summaries / source anchors を探索させる。
 - extract worker は Memory / Knowledge / Skill を直接更新しない。output は必ず staging を挟み、source / provenance を host 側で機械的に保持する。
-- trigger は LLM call 単位ではなく、Overview accumulation、evidence growth、Worker run cycle、task boundary を組み合わせる。mid-run 発火を入れる場合も staging/checkpoint extraction に限定する。
+- trigger は初期実装では現行通り Worker run cycle 完了後の threshold 判定にする。LLM call 単位や Run 中の Overview accumulation trigger は含めない。
 
 ### 4. Memory を authority にしない
 

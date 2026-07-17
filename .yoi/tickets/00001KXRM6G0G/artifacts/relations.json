@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "relations": [
+    {
+      "ticket_id": "00001KXRM6G0G",
+      "kind": "related",
+      "target": "00001KXMK846H",
+      "note": "flat staging records are the consolidation decision units for later resolution/disposition.",
+      "author": "yoi ticket",
+      "at": "2026-07-17T18:10:00Z"
+    }
+  ]
+}
