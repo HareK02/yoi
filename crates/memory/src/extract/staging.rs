@@ -1,9 +1,12 @@
-//! `<workspace>/.yoi/memory/_staging/<id>.json` への書き出しヘルパー。
+//! extract staging writer.
 //!
-//! 1 件 1 ファイル、UUIDv7 命名（短命なので衝突回避と順序を兼ねる）。
-//! `source` を機械付与した [`StagingRecord`] 形式で保存する。
+//! Staging is flat: one file is one candidate and one consolidation decision
+//! unit. The transitional extract tool still submits `ExtractedPayload` with
+//! `candidates[]`; this writer expands it into one [`StagingRecord`] per
+//! candidate.
 
 use std::fs;
+use std::io;
 use std::path::PathBuf;
 
 use uuid::Uuid;
@@ -12,104 +15,108 @@ use crate::extract::payload::{ExtractedPayload, StagingRecord};
 use crate::schema::SourceRef;
 use crate::workspace::WorkspaceLayout;
 
-/// staging 書き出し時のエラー。
-#[derive(Debug, thiserror::Error)]
-pub enum StagingError {
-    #[error("failed to create staging dir {}: {source}", .path.display())]
-    CreateDir {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to write staging file {}: {source}", .path.display())]
-    Write {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to serialize staging record: {0}")]
-    Serialize(#[from] serde_json::Error),
+/// Filesystem result for a single staged candidate.
+#[derive(Debug, Clone)]
+pub struct StagingWriteResult {
+    pub id: Uuid,
+    pub path: PathBuf,
 }
 
-/// `payload` を `source` で wrap して staging に書き出す。
+/// Write one flat staging JSON file per extracted candidate.
 ///
-/// 戻り値は割り当てられた staging file の (id, path)。`payload` が
-/// 完全に空の場合は呼び出し側が事前に `is_empty()` で skip 推奨だが、
-/// この関数は空でも正規に書き出す（仕様 §Extract で空配列許容と
-/// 明記されており、書く / 書かないの判断は呼び出し側に委ねる）。
+/// Returns an empty vector when `payload` has no candidates.
 pub fn write_staging(
     layout: &WorkspaceLayout,
     source: SourceRef,
     payload: ExtractedPayload,
-) -> Result<(Uuid, PathBuf), StagingError> {
-    let staging_dir = layout.staging_dir();
-    fs::create_dir_all(&staging_dir).map_err(|source| StagingError::CreateDir {
-        path: staging_dir.clone(),
-        source,
-    })?;
+) -> io::Result<Vec<StagingWriteResult>> {
+    if payload.candidates.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    let id = Uuid::now_v7();
-    let path = staging_dir.join(format!("{id}.json"));
-    let record = StagingRecord { source, payload };
-    let json = serde_json::to_string_pretty(&record)?;
-    fs::write(&path, json).map_err(|source| StagingError::Write {
-        path: path.clone(),
-        source,
-    })?;
-    Ok((id, path))
+    let dir = layout.staging_dir();
+    fs::create_dir_all(&dir)?;
+    let extract_run_id = Uuid::now_v7().to_string();
+    let mut written = Vec::with_capacity(payload.candidates.len());
+
+    for candidate in payload.candidates {
+        let id = Uuid::now_v7();
+        let record = StagingRecord::from_candidate(
+            id.to_string(),
+            extract_run_id.clone(),
+            source.clone(),
+            candidate,
+            Vec::new(),
+            Vec::new(),
+        );
+        let path = dir.join(format!("{}.json", id));
+        let bytes = serde_json::to_vec_pretty(&record).map_err(io::Error::other)?;
+        fs::write(&path, bytes)?;
+        written.push(StagingWriteResult { id, path });
+    }
+
+    Ok(written)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::extract::payload::{DecisionEntry, ExtractedPayload};
+    use crate::extract::payload::{CandidateKind, ExtractedCandidate};
 
-    #[test]
-    fn writes_record_with_machine_attached_source() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let layout = WorkspaceLayout::new(tmp.path().to_path_buf());
+    fn layout() -> WorkspaceLayout {
+        let dir = tempfile::tempdir().unwrap();
+        // leak tempdir for the duration of the test process; sufficient for unit tests
+        let path = dir.keep();
+        WorkspaceLayout::new(path)
+    }
 
-        let source = SourceRef {
-            segment_id: "sess-1".into(),
-            range: [3, 7],
-        };
-        let payload = ExtractedPayload {
-            decisions: vec![DecisionEntry {
-                options: vec!["a".into(), "b".into()],
-                chosen: "a".into(),
-                rationale: "shorter".into(),
-                source_refs: Vec::new(),
-            }],
-            ..Default::default()
-        };
-        let (id, path) = write_staging(&layout, source.clone(), payload).unwrap();
-        assert_eq!(path.parent().unwrap(), layout.staging_dir());
-        assert!(
-            path.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .contains(&id.to_string())
-        );
+    fn source() -> SourceRef {
+        SourceRef {
+            segment_id: "segment-1".into(),
+            range: [1, 3],
+        }
+    }
 
-        let written: StagingRecord =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(written.source.segment_id, "sess-1");
-        assert_eq!(written.source.range, [3, 7]);
-        assert_eq!(written.payload.decisions.len(), 1);
+    fn candidate(kind: CandidateKind, claim: &str) -> ExtractedCandidate {
+        ExtractedCandidate {
+            kind,
+            claim: claim.into(),
+            why_useful: "useful for future consolidation".into(),
+            staleness: None,
+            evidence_ids: Vec::new(),
+        }
     }
 
     #[test]
-    fn empty_payload_is_written_verbatim() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let layout = WorkspaceLayout::new(tmp.path().to_path_buf());
-        let source = SourceRef {
-            segment_id: "sess".into(),
-            range: [0, 0],
+    fn writes_one_file_per_candidate() {
+        let layout = layout();
+        let payload = ExtractedPayload {
+            candidates: vec![
+                candidate(CandidateKind::Preference, "Prefer implementation tickets"),
+                candidate(CandidateKind::Decision, "Use flat staging records"),
+            ],
         };
-        let (_, path) = write_staging(&layout, source, ExtractedPayload::default()).unwrap();
-        let written: StagingRecord =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(written.payload.is_empty());
+        let results = write_staging(&layout, source(), payload).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_ne!(results[0].id, results[1].id);
+
+        let first = fs::read_to_string(&results[0].path).unwrap();
+        let second = fs::read_to_string(&results[1].path).unwrap();
+        let first_record: StagingRecord = serde_json::from_str(&first).unwrap();
+        let second_record: StagingRecord = serde_json::from_str(&second).unwrap();
+
+        assert_eq!(first_record.kind, CandidateKind::Preference);
+        assert_eq!(second_record.kind, CandidateKind::Decision);
+        assert_eq!(first_record.extract_run_id, second_record.extract_run_id);
+        assert_eq!(first_record.source.segment_id, "segment-1");
+    }
+
+    #[test]
+    fn empty_payload_writes_nothing() {
+        let layout = layout();
+        let results = write_staging(&layout, source(), ExtractedPayload::default()).unwrap();
+        assert!(results.is_empty());
+        assert!(!layout.staging_dir().exists());
     }
 }

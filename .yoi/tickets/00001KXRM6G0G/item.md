@@ -1,14 +1,16 @@
 ---
 title: 'Flat candidate staging record schemaを実装する'
-state: 'ready'
+state: 'closed'
 created_at: '2026-07-17T18:07:40Z'
-updated_at: '2026-07-17T18:10:00Z'
+updated_at: '2026-07-17T19:56:08Z'
 assignee: null
+queued_by: 'yoi ticket'
+queued_at: '2026-07-17T19:48:08Z'
 ---
 
 ## 背景
 
-旧 staging は extract run ごとの batch payload (`decisions` / `discussions` / `attempts` / `requests`) と entry-level source refs を前提にしていた。しかし、consolidation から見ると batch は session に紐いた不必要な集団になり、record ごとの discard / merge / promote / defer が曖昧になる。
+旧 staging は extract run ごとの batch payload (`decisions` / `discussions` / `attempts` / `requests`) と entry-level source refs を前提にしていた。しかし、consolidation から見ると batch は session に紐づいた不必要な集団になり、record ごとの discard / merge / promote / defer が曖昧になる。
 
 新方針では、extract は記憶化を検討すべき candidate を kind taxonomy に基づいて切り出し、candidate ごとに flat staging record を作る。
 

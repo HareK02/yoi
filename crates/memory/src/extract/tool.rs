@@ -12,10 +12,10 @@ use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 
 use crate::extract::payload::ExtractedPayload;
 
-const WRITE_EXTRACTED_DESCRIPTION: &str = "Submit the final activity-log JSON for this slice. \
-Pass an object with `decisions`, `discussions`, `attempts`, and `requests` arrays (any may be empty). \
-Call this exactly once and end the turn. Do not include `source`, session metadata, or free-form prose — \
-the wrapper attaches provenance mechanically.";
+const WRITE_EXTRACTED_DESCRIPTION: &str = "Submit extracted memory-candidate JSON for this slice. \
+Pass an object with a `candidates` array. Each candidate must have `kind`, `claim`, and `why_useful`; \
+`staleness` and `evidence_ids` are optional. Call this exactly once and end the turn. Do not include \
+record ids, source anchors, session metadata, or free-form prose — the wrapper attaches staging metadata mechanically.";
 
 /// extract sub-Engine の出力受け口。`ExtractedPayload` 1 件をホストする。
 #[derive(Debug, Default)]
@@ -63,11 +63,8 @@ impl Tool for WriteExtractedTool {
             ToolError::InvalidArgument(format!("invalid write_extracted input: {e}"))
         })?;
         let summary = format!(
-            "Recorded activity log: decisions={} discussions={} attempts={} requests={}",
-            payload.decisions.len(),
-            payload.discussions.len(),
-            payload.attempts.len(),
-            payload.requests.len(),
+            "Recorded memory candidates: candidates={}",
+            payload.candidates.len(),
         );
         {
             let mut guard = self
@@ -116,20 +113,17 @@ mod tests {
         let ctx = Arc::new(ExtractWorkerContext::new());
         let tool: Arc<dyn Tool> = Arc::new(WriteExtractedTool { ctx: ctx.clone() });
         let input = serde_json::json!({
-            "decisions": [{
-                "options": ["a", "b"],
-                "chosen": "a",
-                "rationale": "test"
-            }],
-            "discussions": [],
-            "attempts": [],
-            "requests": []
+            "candidates": [{
+                "kind": "decision",
+                "claim": "Use flat staging",
+                "why_useful": "Consolidation can resolve candidates independently"
+            }]
         })
         .to_string();
         let out = tool.execute(&input, Default::default()).await.unwrap();
-        assert!(out.summary.contains("decisions=1"));
+        assert!(out.summary.contains("candidates=1"));
         let payload = ctx.take_payload().unwrap();
-        assert_eq!(payload.decisions.len(), 1);
+        assert_eq!(payload.candidates.len(), 1);
         assert_eq!(ctx.call_count(), 1);
     }
 
@@ -138,22 +132,21 @@ mod tests {
         let ctx = Arc::new(ExtractWorkerContext::new());
         let tool: Arc<dyn Tool> = Arc::new(WriteExtractedTool { ctx: ctx.clone() });
 
-        let first =
-            serde_json::json!({"decisions": [], "discussions": [], "attempts": [], "requests": []})
-                .to_string();
+        let first = serde_json::json!({"candidates": []}).to_string();
         tool.execute(&first, Default::default()).await.unwrap();
 
         let second = serde_json::json!({
-            "decisions": [],
-            "discussions": [],
-            "attempts": [{"action": "x", "result": "ok", "succeeded": true}],
-            "requests": []
+            "candidates": [{
+                "kind": "lesson",
+                "claim": "Validation should use Nix build",
+                "why_useful": "Packaging can fail independently"
+            }]
         })
         .to_string();
         tool.execute(&second, Default::default()).await.unwrap();
 
         let payload = ctx.take_payload().unwrap();
-        assert_eq!(payload.attempts.len(), 1);
+        assert_eq!(payload.candidates.len(), 1);
         assert_eq!(ctx.call_count(), 2);
     }
 

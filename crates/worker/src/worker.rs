@@ -3172,15 +3172,15 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         });
 
         let source_segment_id = self.segment_state.segment_id();
-        let staging_id = if payload.is_empty() {
-            String::new()
+        let staging_results = if payload.is_empty() {
+            Vec::new()
         } else {
             let source = memory::schema::SourceRef {
                 segment_id: source_segment_id.to_string(),
                 range: [start_entry as u64, end_entry as u64],
             };
-            let (id, _) = match extract::write_staging(&layout, source, payload) {
-                Ok(result) => result,
+            match extract::write_staging(&layout, source, payload) {
+                Ok(results) => results,
                 Err(err) => {
                     let usage = usage_capture
                         .lock()
@@ -3197,9 +3197,12 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                     );
                     return Err(WorkerError::ExtractStaging(err));
                 }
-            };
-            id.to_string()
+            }
         };
+        let staging_id = staging_results
+            .first()
+            .map(|result| result.id.to_string())
+            .unwrap_or_default();
 
         let pointer_payload = extract::ExtractPointerPayload {
             processed_through_entry: end_entry,
@@ -3220,16 +3223,12 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             .expect("extract_pointer poisoned") = Some(pointer_payload);
 
         let mut extract_audit = extract_audit_base;
-        if !staging_id.is_empty() {
-            extract_audit.staging_count = 1;
-            extract_audit.staging_ids.push(staging_id.clone());
-            extract_audit.staging_paths.push(
-                layout
-                    .staging_dir()
-                    .join(format!("{staging_id}.json"))
-                    .display()
-                    .to_string(),
-            );
+        extract_audit.staging_count = staging_results.len();
+        for result in &staging_results {
+            extract_audit.staging_ids.push(result.id.to_string());
+            extract_audit
+                .staging_paths
+                .push(result.path.display().to_string());
         }
         let usage = usage_capture
             .lock()
@@ -4819,7 +4818,7 @@ pub enum WorkerError {
     Skill(#[from] SkillClientError),
 
     #[error("memory extract staging write failed: {0}")]
-    ExtractStaging(#[source] memory::extract::StagingError),
+    ExtractStaging(#[source] std::io::Error),
 
     #[error("memory consolidation lock acquisition failed: {0}")]
     ConsolidationLock(#[source] memory::consolidate::LockError),

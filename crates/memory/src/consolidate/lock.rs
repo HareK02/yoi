@@ -200,7 +200,7 @@ fn pid_is_alive(_pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extract::{ExtractedPayload, write_staging};
+    use crate::extract::{CandidateKind, ExtractedCandidate, ExtractedPayload, write_staging};
     use crate::schema::SourceRef;
 
     fn make_layout() -> (tempfile::TempDir, WorkspaceLayout) {
@@ -208,6 +208,18 @@ mod tests {
         let layout = WorkspaceLayout::new(dir.path().to_path_buf());
         std::fs::create_dir_all(layout.staging_dir()).unwrap();
         (dir, layout)
+    }
+
+    fn candidate_payload(claim: &str) -> ExtractedPayload {
+        ExtractedPayload {
+            candidates: vec![ExtractedCandidate {
+                kind: CandidateKind::Lesson,
+                claim: claim.into(),
+                why_useful: "useful for test".into(),
+                staleness: None,
+                evidence_ids: Vec::new(),
+            }],
+        }
     }
 
     #[test]
@@ -257,24 +269,28 @@ mod tests {
     #[test]
     fn release_drops_consumed_entries_and_unlinks_lock() {
         let (_dir, layout) = make_layout();
-        let (id_a, _) = write_staging(
+        let id_a = write_staging(
             &layout,
             SourceRef {
                 segment_id: "s".into(),
                 range: [0, 0],
             },
-            ExtractedPayload::default(),
+            candidate_payload("a"),
         )
-        .unwrap();
-        let (id_b, _) = write_staging(
+        .unwrap()
+        .remove(0)
+        .id;
+        let id_b = write_staging(
             &layout,
             SourceRef {
                 segment_id: "s".into(),
                 range: [1, 1],
             },
-            ExtractedPayload::default(),
+            candidate_payload("b"),
         )
-        .unwrap();
+        .unwrap()
+        .remove(0)
+        .id;
 
         let lock = StagingLock::acquire(&layout, std::process::id(), "worker", vec![id_a]).unwrap();
         let lock_path = lock.path().to_path_buf();

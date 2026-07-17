@@ -11,8 +11,8 @@ use llm_engine::Item;
 pub fn build_extract_input(items: &[Item]) -> String {
     let mut out = String::new();
     out.push_str(
-        "Extract activity logs from the conversation slice below. \
-         Follow the system prompt's schema strictly and call `write_extracted` once.\n\n",
+        "Extract memory candidates from the conversation slice below. \
+         Follow the system prompt's candidate schema strictly and call `write_extracted` once.\n\n",
     );
     out.push_str("## Conversation slice\n");
     out.push_str(&render_items(items));

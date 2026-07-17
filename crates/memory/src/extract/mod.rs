@@ -1,4 +1,4 @@
-//! extract: 活動抽出。
+//! extract: memory candidate extraction.
 //!
 //! 通常 Worker の post-run hook で発火する disposable Engine と、その
 //! 出力を `<workspace>/.yoi/memory/_staging/<id>.json` に書き出す
@@ -24,10 +24,11 @@ mod tool;
 
 pub use input::build_extract_input;
 pub use payload::{
-    AttemptEntry, DecisionEntry, DiscussionEntry, ExtractedPayload, RequestEntry, StagingRecord,
+    CandidateKind, ExtractedCandidate, ExtractedPayload, STAGING_SCHEMA_VERSION, StagingEvidence,
+    StagingRecord,
 };
 pub use pointer::{ExtractPointerPayload, fold_pointer};
-pub use staging::{StagingError, write_staging};
+pub use staging::{StagingWriteResult, write_staging};
 pub use tool::{ExtractWorkerContext, write_extracted_tool};
 
 /// session-store `LogEntry::Extension` で使う domain 名。

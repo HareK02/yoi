@@ -206,7 +206,10 @@ pub fn render_tidy_hints(tidy: &TidyHints) -> String {
 mod tests {
     use super::*;
     use crate::consolidate::tidy::{SimilarSlugCluster, SourcesOverflow};
-    use crate::extract::{DecisionEntry, ExtractedPayload, write_staging};
+    use crate::extract::{
+        CandidateKind, ExtractedCandidate, ExtractedPayload, STAGING_SCHEMA_VERSION,
+        StagingEvidence, StagingRecord, write_staging,
+    };
     use crate::schema::{EvidenceKind, SourceEvidenceRef, SourceRef};
     use chrono::Utc;
     use std::path::Path;
@@ -220,6 +223,18 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(p, content).unwrap();
+    }
+
+    fn candidate_payload(kind: CandidateKind, claim: &str) -> ExtractedPayload {
+        ExtractedPayload {
+            candidates: vec![ExtractedCandidate {
+                kind,
+                claim: claim.into(),
+                why_useful: "useful for consolidation".into(),
+                staleness: None,
+                evidence_ids: Vec::new(),
+            }],
+        }
     }
 
     #[test]
@@ -238,13 +253,13 @@ mod tests {
                 n = now()
             ),
         );
-        let (_id, _) = write_staging(
+        let _written = write_staging(
             &layout,
             SourceRef {
                 segment_id: "s".into(),
                 range: [0, 1],
             },
-            ExtractedPayload::default(),
+            candidate_payload(CandidateKind::Preference, "Prefer concise tickets"),
         )
         .unwrap();
         let staging = crate::consolidate::staging::list_staging_entries(&layout);
@@ -281,29 +296,40 @@ mod tests {
     fn staging_render_preserves_entry_source_refs() {
         let dir = tempfile::TempDir::new().unwrap();
         let layout = WorkspaceLayout::new(dir.path().to_path_buf());
-        let (_id, _) = write_staging(
-            &layout,
-            SourceRef {
+        std::fs::create_dir_all(layout.staging_dir()).unwrap();
+        let id = uuid::Uuid::now_v7();
+        let record = StagingRecord {
+            schema_version: STAGING_SCHEMA_VERSION,
+            id: id.to_string(),
+            extract_run_id: "run-1".into(),
+            source: SourceRef {
                 segment_id: "segment-record".into(),
                 range: [0, 10],
             },
-            ExtractedPayload {
-                decisions: vec![DecisionEntry {
-                    options: vec!["preserve".into()],
-                    chosen: "preserve".into(),
-                    rationale: "consolidation input is lossless JSON".into(),
-                    source_refs: vec![SourceEvidenceRef {
-                        session_id: Some("session-1".into()),
-                        segment_id: Some("segment-1".into()),
-                        entry_range: Some([3, 4]),
-                        evidence_id: Some("ev-1".into()),
-                        evidence_kind: Some(EvidenceKind::new(EvidenceKind::MESSAGE)),
-                        label: Some("user message".into()),
-                        summary: Some("bounded summary".into()),
-                    }],
-                }],
-                ..Default::default()
-            },
+            kind: CandidateKind::Decision,
+            claim: "Keep flat staging records".into(),
+            why_useful: "consolidation input is lossless JSON".into(),
+            staleness: None,
+            evidence: vec![StagingEvidence {
+                id: "ev-1".into(),
+                kind: EvidenceKind::new(EvidenceKind::MESSAGE),
+                entry_range: Some([3, 4]),
+                excerpt: Some("bounded excerpt".into()),
+                summary: Some("bounded summary".into()),
+            }],
+            source_refs: vec![SourceEvidenceRef {
+                session_id: Some("session-1".into()),
+                segment_id: Some("segment-1".into()),
+                entry_range: Some([3, 4]),
+                evidence_id: Some("ev-1".into()),
+                evidence_kind: Some(EvidenceKind::new(EvidenceKind::MESSAGE)),
+                label: Some("user message".into()),
+                summary: Some("bounded summary".into()),
+            }],
+        };
+        std::fs::write(
+            layout.staging_dir().join(format!("{id}.json")),
+            serde_json::to_string_pretty(&record).unwrap(),
         )
         .unwrap();
         let staging = crate::consolidate::staging::list_staging_entries(&layout);

@@ -116,11 +116,19 @@ pub fn list_staging_entries_snapshot(layout: &WorkspaceLayout) -> StagingEntries
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extract::{ExtractedPayload, write_staging};
+    use crate::extract::{CandidateKind, ExtractedCandidate, ExtractedPayload, write_staging};
     use crate::schema::SourceRef;
 
-    fn empty_payload() -> ExtractedPayload {
-        ExtractedPayload::default()
+    fn candidate_payload(claim: &str) -> ExtractedPayload {
+        ExtractedPayload {
+            candidates: vec![ExtractedCandidate {
+                kind: CandidateKind::Lesson,
+                claim: claim.into(),
+                why_useful: "useful for later consolidation".into(),
+                staleness: None,
+                evidence_ids: Vec::new(),
+            }],
+        }
     }
 
     fn source(segment_id: &str, range: [u64; 2]) -> SourceRef {
@@ -135,9 +143,18 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let layout = WorkspaceLayout::new(tmp.path().to_path_buf());
 
-        let (id1, _) = write_staging(&layout, source("s", [0, 1]), empty_payload()).unwrap();
-        let (id2, _) = write_staging(&layout, source("s", [2, 3]), empty_payload()).unwrap();
-        let (id3, _) = write_staging(&layout, source("s", [4, 5]), empty_payload()).unwrap();
+        let id1 = write_staging(&layout, source("s", [0, 1]), candidate_payload("one"))
+            .unwrap()
+            .remove(0)
+            .id;
+        let id2 = write_staging(&layout, source("s", [2, 3]), candidate_payload("two"))
+            .unwrap()
+            .remove(0)
+            .id;
+        let id3 = write_staging(&layout, source("s", [4, 5]), candidate_payload("three"))
+            .unwrap()
+            .remove(0)
+            .id;
 
         let entries = list_staging_entries(&layout);
         let ids: Vec<Uuid> = entries.iter().map(|e| e.id).collect();
@@ -148,13 +165,15 @@ mod tests {
     fn skips_lock_file_and_counts_invalid_json() {
         let tmp = tempfile::TempDir::new().unwrap();
         let layout = WorkspaceLayout::new(tmp.path().to_path_buf());
-        let (_id, _) = write_staging(&layout, source("s", [0, 1]), empty_payload()).unwrap();
+        let _id = write_staging(&layout, source("s", [0, 1]), candidate_payload("kept"))
+            .unwrap()
+            .remove(0)
+            .id;
 
-        // Drop a non-UUID json file, an unparsable UUID-named json file, a
-        // legacy source UUID-named json file, and a bare lock file alongside.
+        // Drop a non-UUID json file, an unparsable UUID-named json file, an
+        // old batch-schema UUID-named json file, and a bare lock file alongside.
         // Lock files are not `.json`; invalid `.json` files are surfaced
         // separately instead of being mistaken for an empty staging directory.
-        // Legacy `source.session_id` staging remains readable for compatibility.
         std::fs::write(layout.staging_dir().join("not-a-uuid.json"), "{}").unwrap();
         let bad_id = Uuid::now_v7();
         std::fs::write(layout.staging_dir().join(format!("{bad_id}.json")), "{").unwrap();
@@ -174,17 +193,12 @@ mod tests {
         std::fs::write(layout.staging_dir().join(".consolidation.lock"), "{}").unwrap();
 
         let entries = list_staging_entries(&layout);
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 1);
 
         let snapshot = list_staging_entries_snapshot(&layout);
-        assert_eq!(snapshot.entries.len(), 2);
-        assert_eq!(snapshot.invalid_count, 2);
-        assert!(
-            snapshot
-                .entries
-                .iter()
-                .any(|entry| entry.record.source.segment_id == "legacy-session")
-        );
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.invalid_count, 3);
+        assert_eq!(snapshot.entries[0].record.claim, "kept");
     }
 
     #[test]

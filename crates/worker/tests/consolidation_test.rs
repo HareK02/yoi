@@ -24,7 +24,7 @@ use llm_engine::Engine;
 use llm_engine::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
 use llm_engine::llm_client::{ClientError, LlmClient, Request};
 use memory::WorkspaceLayout;
-use memory::extract::{ExtractedPayload, write_staging};
+use memory::extract::{CandidateKind, ExtractedCandidate, ExtractedPayload, write_staging};
 use memory::schema::SourceRef;
 use session_store::FsStore;
 use session_store::{CombinedStore, FsWorkerStore};
@@ -182,18 +182,32 @@ async fn make_worker_with(
     .unwrap()
 }
 
+fn staging_payload(claim: String) -> ExtractedPayload {
+    ExtractedPayload {
+        candidates: vec![ExtractedCandidate {
+            kind: CandidateKind::Lesson,
+            claim,
+            why_useful: "useful for consolidation trigger tests".into(),
+            staleness: None,
+            evidence_ids: Vec::new(),
+        }],
+    }
+}
+
 fn write_n_staging(layout: &WorkspaceLayout, n: usize) -> Vec<uuid::Uuid> {
     let mut ids = Vec::new();
     for i in 0..n {
-        let (id, _) = write_staging(
+        let id = write_staging(
             layout,
             SourceRef {
                 segment_id: format!("s-{i}"),
                 range: [i as u64, i as u64],
             },
-            ExtractedPayload::default(),
+            staging_payload(format!("candidate-{i}")),
         )
-        .unwrap();
+        .unwrap()
+        .remove(0)
+        .id;
         ids.push(id);
     }
     ids
