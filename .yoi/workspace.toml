@@ -11,16 +11,12 @@ root = ".yoi/tickets"
 
 [ticket.roles.intake]
 profile = "builtin:intake"
-workflow = "ticket-intake-workflow"
 
 [ticket.roles.orchestrator]
 profile = "builtin:orchestrator"
-workflow = "ticket-orchestrator-routing"
 
 [ticket.roles.coder]
 profile = "builtin:coder"
-workflow = "multi-agent-workflow"
 
 [ticket.roles.reviewer]
 profile = "builtin:reviewer"
-workflow = "multi-agent-workflow"
