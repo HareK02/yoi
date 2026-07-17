@@ -30,6 +30,7 @@ use tools::ScopedFs;
 
 use crate::compact::usage_tracker::UsageTracker;
 use crate::fs_view::{ReadRequirement, slice_lines};
+use crate::session_reference::{ReferenceKind, SearchOptions, SessionReferenceView};
 
 /// Aggregated output of a compact worker run.
 #[derive(Debug, Default, Clone)]
@@ -143,6 +144,7 @@ this to verify details before writing the summary.";
 
 struct SessionLogToolState {
     items: Arc<Vec<Item>>,
+    view: SessionReferenceView,
 }
 
 struct SearchSessionLogTool {
@@ -165,27 +167,44 @@ impl Tool for SearchSessionLogTool {
                 "search_session_log query must not be empty".to_string(),
             ));
         }
-        let offset = params.offset.unwrap_or(0).min(self.state.items.len());
+        let offset = params.offset.unwrap_or(0);
         let limit = params
             .limit
             .unwrap_or(20)
             .clamp(1, SESSION_SEARCH_MAX_RESULTS);
-        let mut hits = Vec::new();
-        for (idx, item) in self.state.items.iter().enumerate().skip(offset) {
-            let haystack = session_item_search_text(item).to_lowercase();
-            if haystack.contains(&query) {
-                hits.push(format_session_item(
-                    idx,
-                    item,
-                    SessionReadMode::Compact,
-                    600,
-                ));
-                if hits.len() >= limit {
-                    break;
-                }
-            }
-        }
-        let mut content = hits.join("\n\n");
+        let hits = self.state.view.search(&SearchOptions {
+            query: params.query.clone(),
+            kind: None,
+            tool_part: None,
+            tool_name: None,
+            limit: Some(limit),
+            min_entry_index: Some(offset as u64),
+        });
+        let blocks = hits
+            .iter()
+            .map(|hit| {
+                let part = hit
+                    .tool_part
+                    .map(|part| format!(" {part:?}"))
+                    .unwrap_or_default();
+                let tool = hit
+                    .tool_name
+                    .as_ref()
+                    .map(|name| format!(" {name}"))
+                    .unwrap_or_default();
+                format!(
+                    "[{} {}{}{} {:?}] {}\n{}",
+                    hit.id,
+                    hit.kind.as_str(),
+                    part,
+                    tool,
+                    hit.entry_range,
+                    hit.label,
+                    hit.summary
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut content = blocks.join("\n\n");
         let truncated = truncate_to_token_budget(&mut content, SESSION_TOOL_MAX_OUTPUT_TOKENS);
         let summary = if hits.is_empty() {
             format!("No session log hits for {query:?} from item offset {offset}.")
@@ -531,7 +550,8 @@ pub(crate) fn write_summary_tool(ctx: Arc<Mutex<CompactWorkerContext>>) -> ToolD
 }
 
 pub(crate) fn search_session_log_tool(items: Arc<Vec<Item>>) -> ToolDefinition {
-    let state = Arc::new(SessionLogToolState { items });
+    let view = SessionReferenceView::new("compact-target", (*items).clone());
+    let state = Arc::new(SessionLogToolState { items, view });
     Arc::new(move || {
         let schema = schemars::schema_for!(SearchSessionParams);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
@@ -546,7 +566,8 @@ pub(crate) fn search_session_log_tool(items: Arc<Vec<Item>>) -> ToolDefinition {
 }
 
 pub(crate) fn read_session_items_tool(items: Arc<Vec<Item>>) -> ToolDefinition {
-    let state = Arc::new(SessionLogToolState { items });
+    let view = SessionReferenceView::new("compact-target", (*items).clone());
+    let state = Arc::new(SessionLogToolState { items, view });
     Arc::new(move || {
         let schema = schemars::schema_for!(ReadSessionParams);
         let schema_value = serde_json::to_value(schema).unwrap_or(serde_json::json!({}));
@@ -839,8 +860,9 @@ mod tests {
                 "very large raw trace body with secret detail",
             ),
         ]);
+        let view = SessionReferenceView::new("test", (*items).clone());
         let tool: Arc<dyn Tool> = Arc::new(SearchSessionLogTool {
-            state: Arc::new(SessionLogToolState { items }),
+            state: Arc::new(SessionLogToolState { items, view }),
         });
         let input = serde_json::json!({ "query": "compact", "limit": 10 }).to_string();
         let out = tool.execute(&input, Default::default()).await.unwrap();
@@ -858,8 +880,9 @@ mod tests {
             "read trace",
             "raw trace detail",
         )]);
+        let view = SessionReferenceView::new("test", (*items).clone());
         let tool: Arc<dyn Tool> = Arc::new(ReadSessionItemsTool {
-            state: Arc::new(SessionLogToolState { items }),
+            state: Arc::new(SessionLogToolState { items, view }),
         });
         let input = serde_json::json!({ "offset": 0, "limit": 1, "mode": "full" }).to_string();
         let out = tool.execute(&input, Default::default()).await.unwrap();

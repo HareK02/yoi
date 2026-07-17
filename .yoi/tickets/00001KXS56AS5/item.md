@@ -1,9 +1,11 @@
 ---
 title: 'Session reference viewを共通基盤として実装する'
-state: 'ready'
+state: 'closed'
 created_at: '2026-07-17T23:04:40Z'
-updated_at: '2026-07-17T23:20:00Z'
+updated_at: '2026-07-17T23:27:20Z'
 assignee: null
+queued_by: 'yoi ticket'
+queued_at: '2026-07-17T23:15:15Z'
 ---
 
 ## 背景
