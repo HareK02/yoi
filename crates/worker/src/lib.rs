@@ -16,6 +16,7 @@ mod shutdown_after_idle;
 pub mod skill;
 pub mod spawn;
 
+mod internal_worker;
 mod interrupt_prep;
 mod permission;
 mod ticket_event_notify;

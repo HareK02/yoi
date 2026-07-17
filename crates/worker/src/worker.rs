@@ -37,6 +37,7 @@ use crate::hook::{
     PreToolCall,
 };
 use crate::in_flight::InFlightEvents;
+use crate::internal_worker::{InternalWorkerSpec, run_internal_worker};
 
 const COMPACTION_EXTENSION_DOMAIN: &str = "yoi.compaction";
 const COMPACTION_BLOCK_ID: &str = "compact";
@@ -3129,40 +3130,34 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 return Err(WorkerError::PromptCatalog(err));
             }
         };
-        let mut extract_worker = Engine::new(client).system_prompt(extract_system_prompt);
-        extract_worker.set_cache_key(Some(self.segment_id().to_string()));
-
-        extract_worker.set_max_turns(extract_worker_max_turns);
-
-        let usage_capture = Arc::new(Mutex::new(None));
-        let usage_capture_for_worker = usage_capture.clone();
-        extract_worker.on_usage(move |event| {
-            *usage_capture_for_worker
-                .lock()
-                .expect("memory extract usage capture poisoned") =
-                Some(usage_audit_from_event(event));
-        });
-
         let ctx = Arc::new(extract::ExtractWorkerContext::new());
-        extract_worker.register_tool(extract::write_extracted_tool(ctx.clone()));
-
         let input_text = extract::build_extract_input(&items_to_extract);
-        if let Err(err) = extract_worker.run(input_text).await {
-            let usage = usage_capture
-                .lock()
-                .expect("memory extract usage capture poisoned")
-                .clone();
-            audit.emit(
-                &layout,
-                event_tx,
-                lifecycle_status_for_worker_error(&err),
-                format!("worker_failed: {err}"),
-                usage,
-                Some(extract_audit_base),
-                None,
-            );
-            return Err(WorkerError::Engine(err));
-        }
+        let internal_result = run_internal_worker(InternalWorkerSpec {
+            purpose: "memory_extract",
+            system_prompt: extract_system_prompt,
+            input: input_text,
+            client,
+            cache_key: Some(self.segment_id().to_string()),
+            max_turns: extract_worker_max_turns,
+            tools: vec![extract::write_extracted_tool(ctx.clone())],
+        })
+        .await;
+        let usage = match internal_result {
+            Ok(result) => result.usage.as_ref().map(usage_audit_from_event),
+            Err(err) => {
+                let usage = err.usage.as_ref().map(usage_audit_from_event);
+                audit.emit(
+                    &layout,
+                    event_tx,
+                    lifecycle_status_for_worker_error(&err.source),
+                    format!("worker_failed: {}", err.source),
+                    usage,
+                    Some(extract_audit_base),
+                    None,
+                );
+                return Err(WorkerError::Engine(err.source));
+            }
+        };
 
         let payload = ctx.take_payload().unwrap_or_else(|| {
             tracing::warn!(
@@ -3182,16 +3177,12 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             match extract::write_staging(&layout, source, payload) {
                 Ok(results) => results,
                 Err(err) => {
-                    let usage = usage_capture
-                        .lock()
-                        .expect("memory extract usage capture poisoned")
-                        .clone();
                     audit.emit(
                         &layout,
                         event_tx,
                         memory::audit::WorkerLifecycleStatus::Failed,
                         format!("staging_write_failed: {err}"),
-                        usage,
+                        usage.clone(),
                         Some(extract_audit_base),
                         None,
                     );
@@ -3230,10 +3221,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 .staging_paths
                 .push(result.path.display().to_string());
         }
-        let usage = usage_capture
-            .lock()
-            .expect("memory extract usage capture poisoned")
-            .clone();
         let reason = if staging_id.is_empty() {
             "completed_no_staging_output"
         } else {

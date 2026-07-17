@@ -1,8 +1,8 @@
 ---
 title: 'Internal Worker runnerを実装する'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-07-17T20:47:11Z'
-updated_at: '2026-07-17T20:47:48Z'
+updated_at: '2026-07-17T20:58:47Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-17T20:47:48Z'
