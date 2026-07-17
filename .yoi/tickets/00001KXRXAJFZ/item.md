@@ -27,7 +27,7 @@ Protocol に外部 API として載せる段階ではない。まず Worker 内�
 
 - Worker 内部に reusable internal worker runner を追加する。
 - runner は少なくとも次を受け取れる。
-  - purpose / name。
+  - slug / name。
   - system prompt。
   - initial user input。
   - tool definitions / limited tool registry。

@@ -3133,7 +3133,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let ctx = Arc::new(extract::ExtractWorkerContext::new());
         let input_text = extract::build_extract_input(&items_to_extract);
         let internal_result = run_internal_worker(InternalWorkerSpec {
-            purpose: "memory_extract",
+            slug: "memory-extract",
             system_prompt: extract_system_prompt,
             input: input_text,
             client,

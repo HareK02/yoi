@@ -14,8 +14,8 @@ use llm_engine::{Engine, EngineError};
 
 /// Specification for a single internal worker run.
 pub(crate) struct InternalWorkerSpec {
-    /// Stable purpose label for audit/debug/persistence metadata.
-    pub purpose: &'static str,
+    /// Stable slug for audit/debug/future persistence metadata.
+    pub slug: &'static str,
     /// System prompt for the isolated engine.
     pub system_prompt: String,
     /// Initial user input for the isolated engine.
@@ -33,7 +33,7 @@ pub(crate) struct InternalWorkerSpec {
 /// Result metadata for an internal worker run.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct InternalWorkerRunResult {
-    pub purpose: &'static str,
+    pub slug: &'static str,
     /// Last usage event observed for this internal run.
     pub usage: Option<UsageEvent>,
 }
@@ -41,7 +41,7 @@ pub(crate) struct InternalWorkerRunResult {
 /// Error metadata for an internal worker run.
 #[derive(Debug)]
 pub(crate) struct InternalWorkerRunError {
-    pub purpose: &'static str,
+    pub slug: &'static str,
     pub source: EngineError,
     /// Last usage event observed before the failure, if any.
     pub usage: Option<UsageEvent>,
@@ -52,7 +52,7 @@ pub(crate) async fn run_internal_worker(
     spec: InternalWorkerSpec,
 ) -> Result<InternalWorkerRunResult, InternalWorkerRunError> {
     let InternalWorkerSpec {
-        purpose,
+        slug,
         system_prompt,
         input,
         client,
@@ -82,9 +82,9 @@ pub(crate) async fn run_internal_worker(
         .clone();
 
     match run_result {
-        Ok(_output) => Ok(InternalWorkerRunResult { purpose, usage }),
+        Ok(_output) => Ok(InternalWorkerRunResult { slug, usage }),
         Err(source) => Err(InternalWorkerRunError {
-            purpose,
+            slug,
             source,
             usage,
         }),
