@@ -30,7 +30,10 @@ use tools::ScopedFs;
 
 use crate::compact::usage_tracker::UsageTracker;
 use crate::fs_view::{ReadRequirement, slice_lines};
-use crate::session_reference::{ReferenceKind, SearchOptions, SessionReferenceView};
+use crate::session_reference::{
+    ReadDetail, ReadOptions, ReadSelector, ReferenceKind, SearchOptions, SessionReferenceView,
+    ToolPart,
+};
 
 /// Aggregated output of a compact worker run.
 #[derive(Debug, Default, Clone)]
@@ -241,17 +244,36 @@ impl Tool for ReadSessionItemsTool {
         let offset = params.offset.min(self.state.items.len());
         let limit = params.limit.clamp(1, SESSION_READ_MAX_ITEMS);
         let end = offset.saturating_add(limit).min(self.state.items.len());
-        let mut blocks = Vec::new();
-        for idx in offset..end {
-            blocks.push(format_session_item(
-                idx,
-                &self.state.items[idx],
-                mode,
-                4_000,
-            ));
-        }
-        let mut content = blocks.join("\n\n");
-        let truncated = truncate_to_token_budget(&mut content, SESSION_TOOL_MAX_OUTPUT_TOKENS);
+        let detail = match mode {
+            SessionReadMode::Compact => ReadDetail::Compact,
+            SessionReadMode::Full => ReadDetail::Full,
+        };
+        let read = if offset >= end {
+            crate::session_reference::ReadResult {
+                entries: Vec::new(),
+                truncated: false,
+            }
+        } else {
+            self.state.view.read(
+                ReadSelector::EntryRange([offset as u64, end.saturating_sub(1) as u64]),
+                ReadOptions {
+                    include_tools: true,
+                    tool_part: ToolPart::Both,
+                    detail,
+                    max_items: limit,
+                    max_bytes: 48 * 1024,
+                },
+            )
+        };
+        let mut content = read
+            .entries
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let token_truncated =
+            truncate_to_token_budget(&mut content, SESSION_TOOL_MAX_OUTPUT_TOKENS);
+        let truncated = read.truncated || token_truncated;
         let summary = if truncated {
             format!(
                 "Read session items {offset}..{end} in {mode:?} mode; output truncated. Narrow the range."
@@ -282,93 +304,6 @@ impl SessionReadMode {
             ))),
         }
     }
-}
-
-fn session_item_search_text(item: &Item) -> String {
-    match item {
-        Item::Message { role, content, .. } => format!(
-            "{:?} {}",
-            role,
-            content
-                .iter()
-                .map(|p| p.as_text())
-                .collect::<Vec<_>>()
-                .join("")
-        ),
-        Item::ToolCall {
-            name, arguments, ..
-        } => format!("tool_call {name} {arguments}"),
-        Item::ToolResult {
-            summary, content, ..
-        } => format!(
-            "tool_result {summary} {}",
-            content.as_deref().unwrap_or_default()
-        ),
-        Item::Reasoning { text, summary, .. } => format!("reasoning {text} {}", summary.join(" ")),
-    }
-}
-
-fn format_session_item(idx: usize, item: &Item, mode: SessionReadMode, max_chars: usize) -> String {
-    match item {
-        Item::Message { role, content, .. } => {
-            let text = content
-                .iter()
-                .map(|p| p.as_text())
-                .collect::<Vec<_>>()
-                .join("");
-            format!(
-                "[{idx} Message {:?}] {}",
-                role,
-                truncate_chars(&text, max_chars)
-            )
-        }
-        Item::ToolCall {
-            name, arguments, ..
-        } => match mode {
-            SessionReadMode::Compact => format!("[{idx} ToolCall] {name} (arguments omitted)"),
-            SessionReadMode::Full => format!(
-                "[{idx} ToolCall] {name}\narguments: {}",
-                truncate_chars(arguments, max_chars)
-            ),
-        },
-        Item::ToolResult {
-            summary,
-            content,
-            is_error,
-            ..
-        } => match mode {
-            SessionReadMode::Compact => format!(
-                "[{idx} ToolResult{}] {} (content omitted)",
-                if *is_error { " error" } else { "" },
-                truncate_chars(summary, 800)
-            ),
-            SessionReadMode::Full => format!(
-                "[{idx} ToolResult{}] {}\ncontent: {}",
-                if *is_error { " error" } else { "" },
-                truncate_chars(summary, 800),
-                truncate_chars(content.as_deref().unwrap_or(""), max_chars)
-            ),
-        },
-        Item::Reasoning { summary, .. } => match mode {
-            SessionReadMode::Compact => format!(
-                "[{idx} Reasoning] {} (body omitted)",
-                truncate_chars(&summary.join(" "), 800)
-            ),
-            SessionReadMode::Full => format!(
-                "[{idx} Reasoning] {} (body omitted)",
-                truncate_chars(&summary.join(" "), 800)
-            ),
-        },
-    }
-}
-
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let mut out = text.chars().take(max_chars).collect::<String>();
-    out.push_str("… [truncated]");
-    out
 }
 
 fn truncate_to_token_budget(text: &mut String, max_tokens: u64) -> bool {

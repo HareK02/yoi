@@ -121,10 +121,17 @@ pub(crate) enum ReadSelector<'a> {
     EntryRange([u64; 2]),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadDetail {
+    Compact,
+    Full,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ReadOptions {
     pub include_tools: bool,
     pub tool_part: ToolPart,
+    pub detail: ReadDetail,
     pub max_items: usize,
     pub max_bytes: usize,
 }
@@ -134,6 +141,7 @@ impl Default for ReadOptions {
         Self {
             include_tools: true,
             tool_part: ToolPart::Both,
+            detail: ReadDetail::Compact,
             max_items: DEFAULT_READ_MAX_ITEMS,
             max_bytes: DEFAULT_READ_MAX_BYTES,
         }
@@ -344,7 +352,7 @@ impl SessionReferenceView {
             let Some(item) = self.items.get(entry.entry_range[0] as usize) else {
                 continue;
             };
-            let text = render_item(item, entry, max_bytes.saturating_sub(bytes));
+            let text = render_item(item, entry, options.detail, max_bytes.saturating_sub(bytes));
             bytes = bytes.saturating_add(text.len());
             entries.push(ReadEntry {
                 id: entry.id.clone(),
@@ -378,7 +386,12 @@ impl SessionReferenceView {
     }
 }
 
-fn render_item(item: &Item, entry: &ReferenceEntry, max_bytes: usize) -> String {
+fn render_item(
+    item: &Item,
+    entry: &ReferenceEntry,
+    detail: ReadDetail,
+    max_bytes: usize,
+) -> String {
     let text = match item {
         Item::Message { role, content, .. } => {
             let text = content
@@ -390,14 +403,28 @@ fn render_item(item: &Item, entry: &ReferenceEntry, max_bytes: usize) -> String 
         }
         Item::ToolCall {
             name, arguments, ..
-        } => format!("[{} ToolInput {name}]\narguments: {arguments}", entry.id),
+        } => match detail {
+            ReadDetail::Compact => format!("[{} ToolInput {name}] (arguments omitted)", entry.id),
+            ReadDetail::Full => format!("[{} ToolInput {name}]\narguments: {arguments}", entry.id),
+        },
         Item::ToolResult {
-            summary, content, ..
-        } => format!(
-            "[{} ToolOutput]\nsummary: {summary}\ncontent: {}",
-            entry.id,
-            content.as_deref().unwrap_or_default()
-        ),
+            summary,
+            content,
+            is_error,
+            ..
+        } => match detail {
+            ReadDetail::Compact => format!(
+                "[{} ToolOutput{}]\nsummary: {summary}\ncontent: (omitted)",
+                entry.id,
+                if *is_error { " error" } else { "" }
+            ),
+            ReadDetail::Full => format!(
+                "[{} ToolOutput{}]\nsummary: {summary}\ncontent: {}",
+                entry.id,
+                if *is_error { " error" } else { "" },
+                content.as_deref().unwrap_or_default()
+            ),
+        },
         Item::Reasoning { .. } => format!("[{} Reasoning omitted]", entry.id),
     };
     truncate_chars(&text, max_bytes)
@@ -488,6 +515,7 @@ mod tests {
             ReadSelector::EntryRange([0, 3]),
             ReadOptions {
                 include_tools: false,
+                detail: ReadDetail::Compact,
                 max_items: 10,
                 max_bytes: 1_000,
                 ..ReadOptions::default()
