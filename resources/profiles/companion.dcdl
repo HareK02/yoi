@@ -8,7 +8,6 @@ import "./default.dcdl" // {
         memory = { enabled = true; };
         web = { enabled = true; };
         workers = { enabled = true; };
-        ticket = { enabled = false; access = "lifecycle"; };
         ticket_orchestration = { enabled = false; };
     };
 }
