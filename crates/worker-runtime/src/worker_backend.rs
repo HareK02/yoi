@@ -620,7 +620,12 @@ where
     {
         let (tx, rx) = mpsc::sync_channel(1);
         self.spawn_on_adapter_runtime(async move {
-            let _ = tx.send(task.await);
+            let handle = tokio::spawn(task);
+            let result = match handle.await {
+                Ok(result) => result,
+                Err(err) => Err(format!("worker adapter task failed: {err}")),
+            };
+            let _ = tx.send(result);
         })?;
         Self::wait_for_runtime_task(rx)
     }
@@ -1410,6 +1415,22 @@ mod tests {
         ) -> Result<WorkerHandle, String> {
             Err("restore failed".to_string())
         }
+    }
+
+    #[test]
+    fn adapter_runtime_reports_task_panic() {
+        let backend = WorkerRuntimeExecutionBackend::new(FailingFactory).unwrap();
+
+        let error = backend
+            .run_on_adapter_runtime(async {
+                panic!("adapter boom");
+                #[allow(unreachable_code)]
+                Ok::<(), String>(())
+            })
+            .unwrap_err();
+
+        assert!(error.contains("worker adapter task failed"));
+        assert!(error.contains("adapter boom") || error.contains("panicked"));
     }
 
     fn create_clean_repo() -> tempfile::TempDir {
