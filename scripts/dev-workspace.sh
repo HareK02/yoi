@@ -1,4 +1,23 @@
 #!/usr/bin/env bash
+# Development process switcher for the workspace web/backend/runtime stack.
+#
+# Common usage:
+#   scripts/dev-workspace.sh status    # inspect managed pids and port listeners only
+#   scripts/dev-workspace.sh restart   # restart backend/runtime only; frontend is left running
+#   scripts/dev-workspace.sh start     # move runtime/backend/frontend listeners to this checkout
+#   scripts/dev-workspace.sh stop      # stop runtime/backend/frontend listeners
+#
+# Safety notes:
+# - start/stop/restart are detached by default and run after
+#   YOI_DEV_ACTION_DELAY_SECONDS=60. This gives API/tool-call sessions time to
+#   persist their result before backend/runtime processes are stopped.
+# - Use restart for normal backend/runtime code changes. It intentionally does
+#   not touch the frontend dev server.
+# - Use start or stop when the frontend listener must also move between
+#   worktrees; frontend binds to 0.0.0.0 by default for browser access.
+# - Avoid YOI_DEV_WORKSPACE_FOREGROUND=1 during active API sessions; it runs the
+#   mutating action synchronously and can interrupt the session that invoked it.
+# - Check the printed scheduled_log after a detached action completes.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
