@@ -320,20 +320,21 @@ impl LocalGitWorktreeMaterializer {
                 )
             })?;
 
-        let status = git_stdout(&source_root, ["status", "--porcelain"])?;
-        if !status.trim().is_empty() {
-            return Err(WorkingDirectoryDiagnostic::new(
-                "working_directory_dirty_source_rejected",
-                "working directory materialization rejects dirty source repository state",
-            ));
-        }
-
         let selector = request
             .repository
             .selector
             .as_deref()
             .unwrap_or("HEAD")
             .to_string();
+        if selector == "HEAD" {
+            let status = git_stdout(&source_root, ["status", "--porcelain"])?;
+            if !status.trim().is_empty() {
+                return Err(WorkingDirectoryDiagnostic::new(
+                    "working_directory_dirty_source_rejected",
+                    "working directory materialization rejects dirty source repository state",
+                ));
+            }
+        }
         let commit_spec = format!("{selector}^{{commit}}");
         let resolved_commit = git_stdout(&source_root, ["rev-parse", commit_spec.as_str()])?
             .trim()
@@ -849,6 +850,30 @@ mod tests {
 
         assert_eq!(error.code, "working_directory_dirty_source_rejected");
         assert!(error.message.contains("dirty source"));
+    }
+
+    #[test]
+    fn branch_selector_allows_dirty_source_materialization() {
+        let repo = create_clean_repo();
+        git(repo.path(), &["branch", "pinned"]);
+        fs::write(repo.path().join("dirty.txt"), "dirty\n").unwrap();
+        let runtime_root = tempfile::tempdir().unwrap();
+        let materializer = LocalGitWorktreeMaterializer::new(runtime_root.path());
+        let mut request = request(repo.path());
+        request.repository.selector = Some(RepositorySelector::from("pinned"));
+
+        let binding = materializer.materialize(&worker_ref(1), &request).unwrap();
+
+        assert_eq!(
+            binding
+                .working_directory
+                .evidence
+                .requested_selector
+                .as_deref(),
+            Some("pinned")
+        );
+        assert!(binding.root.join("README.md").exists());
+        assert!(!binding.root.join("dirty.txt").exists());
     }
 
     #[test]

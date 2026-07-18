@@ -981,7 +981,7 @@ fn builtin_default_profile_artifact() -> serde_json::Value {
             "memory": { "enabled": true },
             "web": { "enabled": true },
             "workers": { "enabled": true },
-            "ticket": { "enabled": false, "access": "lifecycle" },
+            "ticket": { "enabled": true, "access": "lifecycle" },
             "ticket_orchestration": { "enabled": false }
         },
         "memory": {
@@ -1761,6 +1761,12 @@ worker_context_max_tokens = 68000
         assert!(resolved.manifest.scope.allow.is_empty());
         assert!(resolved.manifest.delegation_scope.allow.is_empty());
         assert!(resolved.manifest.session.record_event_trace);
+        assert!(resolved.manifest.feature.ticket.enabled);
+        assert_eq!(
+            resolved.manifest.feature.ticket.access,
+            crate::TicketFeatureAccessConfig::Lifecycle
+        );
+        assert!(!resolved.manifest.feature.ticket_orchestration.enabled);
         assert_eq!(
             resolved.profile.as_ref().unwrap().name.as_deref(),
             Some("default")
