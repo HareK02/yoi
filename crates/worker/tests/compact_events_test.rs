@@ -539,16 +539,14 @@ target = "./"
 permission = "write"
 "#;
 
-fn write_extracted_tool_use_events(call_id: &str) -> Vec<LlmEvent> {
+fn finish_extraction_tool_use_events(call_id: &str) -> Vec<LlmEvent> {
     let input = serde_json::json!({
-        "decisions": [],
-        "discussions": [],
-        "attempts": [],
-        "requests": []
+        "staged_count": 0,
+        "no_candidates_reason": "test run has no durable candidates"
     })
     .to_string();
     vec![
-        LlmEvent::tool_use_start(0, call_id, "write_extracted"),
+        LlmEvent::tool_use_start(0, call_id, "finish_extraction"),
         LlmEvent::tool_input_delta(0, input),
         LlmEvent::tool_use_stop(0),
         LlmEvent::Status(StatusEvent {
@@ -561,13 +559,13 @@ fn write_extracted_tool_use_events(call_id: &str) -> Vec<LlmEvent> {
 async fn compact_resets_extract_pointer_so_extract_can_fire_again() {
     // Mock LLM responses, in call order:
     //   [0] first run with usage(1000) so extract threshold (=1) fires.
-    //   [1] extract worker invokes write_extracted with empty payload.
+    //   [1] extract worker invokes finish_extraction with empty output.
     //   [2] extract worker closes after the tool result.
     //   [3] compact worker invokes write_summary.
     //   [4] compact worker closes after the tool result.
     let client = MockClient::new(vec![
         text_events_with_usage("hi", 1000),
-        write_extracted_tool_use_events("ec1"),
+        finish_extraction_tool_use_events("ec1"),
         single_text_events("done"),
         write_summary_tool_use_events("sc1", "summary"),
         single_text_events("done"),
@@ -703,7 +701,7 @@ permission = "write"
 async fn extract_large_unprocessed_range_does_not_abort_on_input_occupancy() {
     let client = MockClient::new(vec![
         text_events_with_usage("recorded", 1000),
-        write_extracted_tool_use_events("ec-large"),
+        finish_extraction_tool_use_events("ec-large"),
         single_text_events("done"),
     ]);
     let mut worker = make_worker_with_manifest(EXTRACT_NO_COMPACT_MANIFEST, client).await;
@@ -724,7 +722,7 @@ async fn extract_large_unprocessed_range_does_not_abort_on_input_occupancy() {
 async fn spawn_and_wait_drives_extract_to_completion() {
     let client = MockClient::new(vec![
         text_events_with_usage("hi", 1000),
-        write_extracted_tool_use_events("ec1"),
+        finish_extraction_tool_use_events("ec1"),
         single_text_events("done"),
     ]);
     let mut worker = make_worker_with_manifest(EXTRACT_NO_COMPACT_MANIFEST, client).await;
@@ -752,7 +750,7 @@ async fn detached_extract_does_not_fork_session_log() {
     // `ensure_head_or_fork` does not spawn a new session.
     let client = MockClient::new(vec![
         text_events_with_usage("hi", 1000),
-        write_extracted_tool_use_events("ec1"),
+        finish_extraction_tool_use_events("ec1"),
         single_text_events("done"),
         text_events_with_usage("ok", 1000),
     ]);

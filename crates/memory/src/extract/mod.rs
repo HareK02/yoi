@@ -28,7 +28,7 @@ pub use payload::{
     StagingRecord,
 };
 pub use pointer::{ExtractPointerPayload, fold_pointer};
-pub use staging::{StagingWriteResult, write_staging};
+pub use staging::{StagingWriteResult, write_staging, write_staging_candidate};
 pub use tool::{ExtractWorkerContext, write_extracted_tool};
 
 /// session-store `LogEntry::Extension` で使う domain 名。

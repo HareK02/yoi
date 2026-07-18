@@ -1,9 +1,11 @@
 ---
 title: 'session-explore feature付きextract workerを実装する'
-state: 'planning'
+state: 'closed'
 created_at: '2026-07-16T04:34:01Z'
-updated_at: '2026-07-17T18:10:00Z'
+updated_at: '2026-07-18T01:35:46Z'
 assignee: null
+queued_by: 'yoi ticket'
+queued_at: '2026-07-18T01:12:22Z'
 ---
 
 ## 背景

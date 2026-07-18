@@ -31,8 +31,7 @@ use tools::ScopedFs;
 use crate::compact::usage_tracker::UsageTracker;
 use crate::fs_view::{ReadRequirement, slice_lines};
 use crate::session_reference::{
-    ReadDetail, ReadOptions, ReadSelector, ReferenceKind, SearchOptions, SessionReferenceView,
-    ToolPart,
+    ReadDetail, ReadOptions, ReadSelector, SearchOptions, SessionReferenceView, ToolPart,
 };
 
 /// Aggregated output of a compact worker run.

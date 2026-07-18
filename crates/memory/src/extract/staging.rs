@@ -11,8 +11,10 @@ use std::path::PathBuf;
 
 use uuid::Uuid;
 
-use crate::extract::payload::{ExtractedPayload, StagingRecord};
-use crate::schema::SourceRef;
+use crate::extract::payload::{
+    ExtractedCandidate, ExtractedPayload, StagingEvidence, StagingRecord,
+};
+use crate::schema::{SourceEvidenceRef, SourceRef};
 use crate::workspace::WorkspaceLayout;
 
 /// Filesystem result for a single staged candidate.
@@ -34,28 +36,46 @@ pub fn write_staging(
         return Ok(Vec::new());
     }
 
-    let dir = layout.staging_dir();
-    fs::create_dir_all(&dir)?;
     let extract_run_id = Uuid::now_v7().to_string();
     let mut written = Vec::with_capacity(payload.candidates.len());
 
     for candidate in payload.candidates {
-        let id = Uuid::now_v7();
-        let record = StagingRecord::from_candidate(
-            id.to_string(),
-            extract_run_id.clone(),
+        written.push(write_staging_candidate(
+            layout,
             source.clone(),
+            &extract_run_id,
             candidate,
             Vec::new(),
             Vec::new(),
-        );
-        let path = dir.join(format!("{}.json", id));
-        let bytes = serde_json::to_vec_pretty(&record).map_err(io::Error::other)?;
-        fs::write(&path, bytes)?;
-        written.push(StagingWriteResult { id, path });
+        )?);
     }
 
     Ok(written)
+}
+
+pub fn write_staging_candidate(
+    layout: &WorkspaceLayout,
+    source: SourceRef,
+    extract_run_id: &str,
+    candidate: ExtractedCandidate,
+    evidence: Vec<StagingEvidence>,
+    source_refs: Vec<SourceEvidenceRef>,
+) -> io::Result<StagingWriteResult> {
+    let dir = layout.staging_dir();
+    fs::create_dir_all(&dir)?;
+    let id = Uuid::now_v7();
+    let record = StagingRecord::from_candidate(
+        id.to_string(),
+        extract_run_id.to_string(),
+        source,
+        candidate,
+        evidence,
+        source_refs,
+    );
+    let path = dir.join(format!("{}.json", id));
+    let bytes = serde_json::to_vec_pretty(&record).map_err(io::Error::other)?;
+    fs::write(&path, bytes)?;
+    Ok(StagingWriteResult { id, path })
 }
 
 #[cfg(test)]

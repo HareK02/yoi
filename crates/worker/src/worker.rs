@@ -30,7 +30,9 @@ use manifest::{
 
 use crate::compact::state::CompactState;
 use crate::compact::usage_tracker::UsageTracker;
-use crate::feature::builtin::TaskFeature;
+use crate::feature::builtin::{
+    SessionExploreFeature, SessionExploreState, TaskFeature, render_extract_input,
+};
 use crate::feature::{FeatureRegistryBuilder, FeatureRegistryInstallReport};
 use crate::hook::{
     Hook, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd, PostToolCall, PreLlmRequest,
@@ -3130,8 +3132,47 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 return Err(WorkerError::PromptCatalog(err));
             }
         };
-        let ctx = Arc::new(extract::ExtractWorkerContext::new());
-        let input_text = extract::build_extract_input(&items_to_extract);
+        let source_segment_id = self.segment_state.segment_id();
+        let source = memory::schema::SourceRef {
+            segment_id: source_segment_id.to_string(),
+            range: [start_entry as u64, end_entry as u64],
+        };
+        let session_view = crate::session_reference::SessionReferenceView::new(
+            source_segment_id.to_string(),
+            items_to_extract,
+        );
+        let session_explore_state = SessionExploreState::new(session_view, layout.clone(), source);
+        let input_text = render_extract_input(session_explore_state.view());
+        let mut internal_tools = Vec::new();
+        let mut internal_hook_builder = HookRegistryBuilder::new();
+        let feature_report = FeatureRegistryBuilder::new()
+            .with_module(SessionExploreFeature::new(session_explore_state.clone()))
+            .install_into_pending(&mut internal_tools, &mut internal_hook_builder);
+        let installed_tool_names = feature_report.installed_tool_names();
+        let expected_extract_tools = [
+            "search_evidence",
+            "read_evidence",
+            "stage_candidate",
+            "finish_extraction",
+        ];
+        if !expected_extract_tools.iter().all(|name| {
+            installed_tool_names
+                .iter()
+                .any(|installed| installed == name)
+        }) {
+            audit.emit(
+                &layout,
+                event_tx,
+                memory::audit::WorkerLifecycleStatus::Failed,
+                "session_explore_feature_install_failed",
+                None,
+                Some(extract_audit_base),
+                None,
+            );
+            return Err(WorkerError::FeatureInstall(
+                "session-explore feature install failed".to_string(),
+            ));
+        }
         let internal_result = run_internal_worker(InternalWorkerSpec {
             slug: "memory-extract",
             system_prompt: extract_system_prompt,
@@ -3139,7 +3180,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             client,
             cache_key: Some(self.segment_id().to_string()),
             max_turns: extract_worker_max_turns,
-            tools: vec![extract::write_extracted_tool(ctx.clone())],
+            tools: internal_tools,
         })
         .await;
         let usage = match internal_result {
@@ -3159,37 +3200,13 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             }
         };
 
-        let payload = ctx.take_payload().unwrap_or_else(|| {
+        let staging_results = session_explore_state.staged();
+        if !session_explore_state.is_finished() {
             tracing::warn!(
-                "extract worker did not call write_extracted; advancing pointer with empty payload"
+                staged_count = staging_results.len(),
+                "extract worker did not call finish_extraction; advancing pointer with staged output"
             );
-            extract::ExtractedPayload::default()
-        });
-
-        let source_segment_id = self.segment_state.segment_id();
-        let staging_results = if payload.is_empty() {
-            Vec::new()
-        } else {
-            let source = memory::schema::SourceRef {
-                segment_id: source_segment_id.to_string(),
-                range: [start_entry as u64, end_entry as u64],
-            };
-            match extract::write_staging(&layout, source, payload) {
-                Ok(results) => results,
-                Err(err) => {
-                    audit.emit(
-                        &layout,
-                        event_tx,
-                        memory::audit::WorkerLifecycleStatus::Failed,
-                        format!("staging_write_failed: {err}"),
-                        usage.clone(),
-                        Some(extract_audit_base),
-                        None,
-                    );
-                    return Err(WorkerError::ExtractStaging(err));
-                }
-            }
-        };
+        }
         let staging_id = staging_results
             .first()
             .map(|result| result.id.to_string())
@@ -4806,6 +4823,9 @@ pub enum WorkerError {
 
     #[error("memory extract staging write failed: {0}")]
     ExtractStaging(#[source] std::io::Error),
+
+    #[error("feature install failed: {0}")]
+    FeatureInstall(String),
 
     #[error("memory consolidation lock acquisition failed: {0}")]
     ConsolidationLock(#[source] memory::consolidate::LockError),

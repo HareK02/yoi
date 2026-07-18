@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use llm_engine::{Item, Role};
+use memory::extract::StagingEvidence;
 use memory::schema::{EvidenceKind, SourceEvidenceRef};
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
@@ -36,7 +37,7 @@ impl ReferenceKind {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "user" => Some(Self::User),
-            "assistant" => Some(Self::Assistant),
+            "assistant" | "agent" => Some(Self::Assistant),
             "system" => Some(Self::System),
             "tool" => Some(Self::Tool),
             _ => None,
@@ -44,10 +45,7 @@ impl ReferenceKind {
     }
 
     fn evidence_kind(self) -> EvidenceKind {
-        match self {
-            Self::User | Self::Assistant | Self::System => EvidenceKind::new(EvidenceKind::MESSAGE),
-            Self::Tool => EvidenceKind::new(EvidenceKind::TOOL_RESULT),
-        }
+        EvidenceKind::new(EvidenceKind::MESSAGE)
     }
 }
 
@@ -92,6 +90,20 @@ pub(crate) struct ReferenceEntry {
     pub label: String,
     pub summary: String,
     search_text: String,
+}
+
+impl ReferenceEntry {
+    fn evidence_kind(&self) -> EvidenceKind {
+        match (self.kind, self.tool_part) {
+            (ReferenceKind::Tool, Some(ToolPart::Input)) => {
+                EvidenceKind::new(EvidenceKind::TOOL_CALL)
+            }
+            (ReferenceKind::Tool, Some(ToolPart::Output | ToolPart::Both) | None) => {
+                EvidenceKind::new(EvidenceKind::TOOL_RESULT)
+            }
+            _ => self.kind.evidence_kind(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -378,10 +390,36 @@ impl SessionReferenceView {
             segment_id: Some(self.segment_id.clone()),
             entry_range: Some(entry.entry_range),
             evidence_id: Some(entry.id.clone()),
-            evidence_kind: Some(entry.kind.evidence_kind()),
+            evidence_kind: Some(entry.evidence_kind()),
             label: Some(entry.label.clone()),
             summary: Some(entry.summary.clone()),
             ..Default::default()
+        })
+    }
+
+    pub(crate) fn staging_evidence_for(&self, id: &str) -> Option<StagingEvidence> {
+        let entry = self.index.iter().find(|entry| entry.id == id)?;
+        let read = self.read(
+            ReadSelector::Id(id),
+            ReadOptions {
+                include_tools: true,
+                tool_part: ToolPart::Both,
+                detail: ReadDetail::Compact,
+                max_items: 1,
+                max_bytes: 2 * 1024,
+            },
+        );
+        let excerpt = read
+            .entries
+            .first()
+            .map(|entry| entry.text.clone())
+            .unwrap_or_else(|| entry.summary.clone());
+        Some(StagingEvidence {
+            id: entry.id.clone(),
+            kind: entry.evidence_kind(),
+            entry_range: Some(entry.entry_range),
+            excerpt: Some(excerpt),
+            summary: Some(entry.summary.clone()),
         })
     }
 }
