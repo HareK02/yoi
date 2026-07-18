@@ -12,6 +12,8 @@ FRONTEND_HOST="${YOI_DEV_FRONTEND_HOST:-0.0.0.0}"
 FRONTEND_PORT="${YOI_DEV_FRONTEND_PORT:-5173}"
 
 RUNTIME_ENABLED="${YOI_DEV_RUNTIME_ENABLED:-1}"
+ACTION_DELAY_SECONDS="${YOI_DEV_ACTION_DELAY_SECONDS:-60}"
+FOREGROUND_MODE="${YOI_DEV_WORKSPACE_FOREGROUND:-0}"
 
 usage() {
   cat <<EOF
@@ -23,12 +25,18 @@ Manage the local Yoi development stack for this checkout:
   frontend  deno run -A npm:vite@7.2.7 dev --host $FRONTEND_HOST --port $FRONTEND_PORT  (cwd: web/workspace)
 
 Actions:
-  start     stop existing listeners on the configured ports, then start runtime, backend, and frontend from this checkout
-  stop      stop runtime, backend, and frontend
-  restart   stop/start runtime and backend only; frontend is left untouched
+  start     schedule a detached job that stops existing listeners, then starts runtime, backend, and frontend from this checkout
+  stop      schedule a detached job that stops runtime, backend, and frontend
+  restart   schedule a detached job that stops/starts runtime and backend only; frontend is left untouched
   status    print pidfile and port-listener status without mutating processes
 
+By default, start/stop/restart return immediately and run in a detached job after $ACTION_DELAY_SECONDS seconds.
+This keeps API/tool-call sessions intact while the backend/runtime are restarted. Set
+YOI_DEV_WORKSPACE_FOREGROUND=1 to run the mutating action synchronously.
+
 Environment overrides:
+  YOI_DEV_ACTION_DELAY_SECONDS=60  delay before detached mutating actions run
+  YOI_DEV_WORKSPACE_FOREGROUND=1   run start/stop/restart synchronously instead of scheduling
   YOI_DEV_BACKEND_LISTEN=127.0.0.1:8787
   YOI_DEV_RUNTIME_BIND=127.0.0.1:38800
   YOI_DEV_RUNTIME_ENABLED=1        set to 0 to skip the standalone runtime process
@@ -275,8 +283,42 @@ status_all() {
   status_service frontend "$FRONTEND_PORT"
 }
 
-main() {
-  local action="${1:-}"
+schedule_detached_action() {
+  local action="$1"
+  ensure_dirs
+
+  local stamp job_log
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  job_log="$LOG_DIR/${action}-$stamp.job.log"
+
+  log "scheduling $action in ${ACTION_DELAY_SECONDS}s; log: $job_log"
+  setsid bash -lc '
+    set -euo pipefail
+    delay="$1"
+    root="$2"
+    action="$3"
+    sleep "$delay"
+    cd "$root"
+    printf "[%s] dev-workspace %s starting\n" "$(date -Is)" "$action"
+    YOI_DEV_WORKSPACE_FOREGROUND=1 "$root/scripts/dev-workspace.sh" "$action"
+    status=$?
+    printf "[%s] dev-workspace %s finished with status %s\n" "$(date -Is)" "$action" "$status"
+    exit "$status"
+  ' dev-workspace-job "$ACTION_DELAY_SECONDS" "$ROOT_DIR" "$action" >>"$job_log" 2>&1 < /dev/null &
+
+  printf 'scheduled_action=%s\n' "$action"
+  printf 'scheduled_pid=%s\n' "$!"
+  printf 'scheduled_after_seconds=%s\n' "$ACTION_DELAY_SECONDS"
+  printf 'scheduled_log=%s\n' "$job_log"
+}
+
+run_mutating_action() {
+  local action="$1"
+  if [[ "$FOREGROUND_MODE" != "1" ]]; then
+    schedule_detached_action "$action"
+    return 0
+  fi
+
   case "$action" in
     start)
       start_all
@@ -286,6 +328,25 @@ main() {
       ;;
     restart)
       restart_runtime_backend
+      ;;
+    *)
+      printf 'unknown mutating action: %s\n' "$action" >&2
+      return 2
+      ;;
+  esac
+}
+
+main() {
+  local action="${1:-}"
+  case "$action" in
+    start)
+      run_mutating_action start
+      ;;
+    stop)
+      run_mutating_action stop
+      ;;
+    restart)
+      run_mutating_action restart
       ;;
     status)
       status_all
