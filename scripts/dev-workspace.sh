@@ -32,6 +32,9 @@ FRONTEND_PORT="${YOI_DEV_FRONTEND_PORT:-5173}"
 
 RUNTIME_ENABLED="${YOI_DEV_RUNTIME_ENABLED:-1}"
 ACTION_DELAY_SECONDS="${YOI_DEV_ACTION_DELAY_SECONDS:-60}"
+WORKDIR_ID="$(basename "$(dirname "$(dirname "$ROOT_DIR")")")"
+UNIT_PREFIX="${YOI_DEV_SYSTEMD_UNIT_PREFIX:-yoi-dev-$WORKDIR_ID}"
+USE_SYSTEMD="${YOI_DEV_USE_SYSTEMD:-1}"
 FOREGROUND_MODE="${YOI_DEV_WORKSPACE_FOREGROUND:-0}"
 
 usage() {
@@ -39,8 +42,8 @@ usage() {
 Usage: $(basename "$0") <start|stop|restart|status>
 
 Manage the local Yoi development stack for this checkout:
-  runtime   cargo run -p worker-runtime --features ws-server,fs-store --bin worker-runtime-rest-server -- --bind $RUNTIME_BIND
-  backend   cargo run -p yoi-workspace-server -- serve --workspace $ROOT_DIR --db $ROOT_DIR/.yoi/workspace.db --listen $BACKEND_LISTEN
+  runtime   target/debug/worker-runtime-rest-server --bind $RUNTIME_BIND
+  backend   target/debug/yoi-workspace-server serve --workspace $ROOT_DIR --db $ROOT_DIR/.yoi/workspace.db --listen $BACKEND_LISTEN
   frontend  deno run -A npm:vite@7.2.7 dev --host $FRONTEND_HOST --port $FRONTEND_PORT  (cwd: web/workspace)
 
 Actions:
@@ -49,7 +52,7 @@ Actions:
   restart   schedule a detached job that stops/starts runtime and backend only; frontend is left untouched
   status    print pidfile and port-listener status without mutating processes
 
-By default, start/stop/restart return immediately and run in a detached job after $ACTION_DELAY_SECONDS seconds.
+By default, start/stop/restart return immediately and run in a fully detached nohup+setsid job after $ACTION_DELAY_SECONDS seconds.
 This keeps API/tool-call sessions intact while the backend/runtime are restarted. Set
 YOI_DEV_WORKSPACE_FOREGROUND=1 to run the mutating action synchronously.
 
@@ -69,12 +72,42 @@ log() {
   printf '[dev-workspace] %s\n' "$*" >&2
 }
 
+run_cargo() {
+  if command -v cc >/dev/null 2>&1 && command -v pkg-config >/dev/null 2>&1; then
+    cargo "$@"
+    return
+  fi
+  if command -v nix >/dev/null 2>&1 && [[ -f "$ROOT_DIR/flake.nix" ]]; then
+    nix develop "$ROOT_DIR" -c cargo "$@"
+    return
+  fi
+  cargo "$@"
+}
+
 ensure_dirs() {
   mkdir -p "$PID_DIR" "$LOG_DIR"
 }
 
 pid_file() {
   printf '%s/%s.pid' "$PID_DIR" "$1"
+}
+
+systemd_unit_name() {
+  local name="$1"
+  printf '%s-%s.service' "$UNIT_PREFIX" "$name"
+}
+
+systemd_available() {
+  [[ "$USE_SYSTEMD" != "0" ]] || return 1
+  command -v systemd-run >/dev/null 2>&1 || return 1
+  systemctl --user is-system-running >/dev/null 2>&1 || return 1
+}
+
+systemd_main_pid() {
+  local name="$1"
+  local unit
+  unit="$(systemd_unit_name "$name")"
+  systemctl --user show -P MainPID "$unit" 2>/dev/null | awk '$1 != "" && $1 != "0" { print $1; exit }'
 }
 
 log_file() {
@@ -155,19 +188,26 @@ stop_pid() {
 
 stop_managed_service() {
   local name="$1"
-  local file
+  local file unit pid
   file="$(pid_file "$name")"
-  if [[ ! -f "$file" ]]; then
-    return 0
+
+  if systemd_available; then
+    unit="$(systemd_unit_name "$name")"
+    if systemctl --user is-active --quiet "$unit" 2>/dev/null; then
+      log "stopping $name systemd unit $unit"
+      systemctl --user stop "$unit" 2>/dev/null || true
+    fi
   fi
 
-  local pid
-  pid="$(cat "$file")"
-  if is_running "$pid"; then
-    stop_pid "$pid" "$name"
+  if [[ -f "$file" ]]; then
+    pid="$(cat "$file")"
+    if is_running "$pid"; then
+      stop_pid "$pid" "$name"
+    fi
+    rm -f "$file"
   fi
-  rm -f "$file"
 }
+
 
 stop_port_listeners() {
   local label="$1"
@@ -209,17 +249,60 @@ start_service() {
   stop_managed_service "$name"
   stop_port_listeners "$name" "$port"
 
-  local logfile pidfile
+  local logfile pidfile pid
   logfile="$(log_file "$name")"
   pidfile="$(pid_file "$name")"
+  : >"$logfile"
+
+  if systemd_available; then
+    local unit
+    unit="$(systemd_unit_name "$name")"
+    log "starting $name systemd unit $unit; log: $logfile"
+    systemd-run --user --unit="$unit" --collect --same-dir --working-directory="$cwd" \
+      --property="StandardOutput=append:$logfile" \
+      --property="StandardError=append:$logfile" \
+      --property="KillMode=control-group" \
+      "$@" >/dev/null
+    for _ in {1..50}; do
+      pid="$(systemd_main_pid "$name" || true)"
+      if [[ -n "$pid" ]]; then
+        printf '%s\n' "$pid" >"$pidfile"
+        log "$name systemd pid $pid"
+        return 0
+      fi
+      sleep 0.1
+    done
+    printf '%s\n' "$name systemd unit did not expose MainPID" >&2
+    return 1
+  fi
+
   log "starting $name; log: $logfile"
   (
     cd "$cwd"
     exec setsid "$@"
   ) >"$logfile" 2>&1 &
-  local pid="$!"
+  pid="$!"
   printf '%s\n' "$pid" >"$pidfile"
   log "$name pid $pid"
+}
+
+
+build_runtime_backend() {
+  if [[ "$RUNTIME_ENABLED" != "0" ]]; then
+    log "building runtime binary"
+    (
+      cd "$ROOT_DIR"
+      run_cargo build -p worker-runtime --features ws-server,fs-store --bin worker-runtime-rest-server
+    )
+  else
+    log "runtime disabled by YOI_DEV_RUNTIME_ENABLED=0; skipping runtime build"
+  fi
+
+  log "building backend binary"
+  (
+    cd "$ROOT_DIR"
+    run_cargo build -p yoi-workspace-server --bin yoi-workspace-server
+  )
 }
 
 start_runtime() {
@@ -227,17 +310,27 @@ start_runtime() {
     log "runtime disabled by YOI_DEV_RUNTIME_ENABLED=0"
     return 0
   fi
-  local port
+  local port runtime_bin
   port="$(port_for_addr "$RUNTIME_BIND")"
+  runtime_bin="$ROOT_DIR/target/debug/worker-runtime-rest-server"
+  if [[ ! -x "$runtime_bin" ]]; then
+    printf 'runtime binary not found or not executable: %s\n' "$runtime_bin" >&2
+    return 1
+  fi
   start_service runtime "$ROOT_DIR" "$port" \
-    cargo run -p worker-runtime --features ws-server,fs-store --bin worker-runtime-rest-server -- --bind "$RUNTIME_BIND"
+    "$runtime_bin" --bind "$RUNTIME_BIND"
 }
 
 start_backend() {
-  local port
+  local port backend_bin
   port="$(port_for_addr "$BACKEND_LISTEN")"
+  backend_bin="$ROOT_DIR/target/debug/yoi-workspace-server"
+  if [[ ! -x "$backend_bin" ]]; then
+    printf 'backend binary not found or not executable: %s\n' "$backend_bin" >&2
+    return 1
+  fi
   start_service backend "$ROOT_DIR" "$port" \
-    cargo run -p yoi-workspace-server -- serve --workspace "$ROOT_DIR" --db "$ROOT_DIR/.yoi/workspace.db" --listen "$BACKEND_LISTEN"
+    "$backend_bin" serve --workspace "$ROOT_DIR" --db "$ROOT_DIR/.yoi/workspace.db" --listen "$BACKEND_LISTEN"
 }
 
 start_frontend() {
@@ -256,6 +349,7 @@ stop_runtime_backend() {
 }
 
 start_runtime_backend() {
+  build_runtime_backend
   start_runtime
   start_backend
 }
@@ -285,15 +379,25 @@ status_service() {
   local port="$2"
   local managed="-"
   local listeners="-"
-  if service_pid "$name" >/dev/null; then
+  local unit="-"
+  local systemd_pid=""
+  if systemd_available; then
+    unit="$(systemd_unit_name "$name")"
+    systemd_pid="$(systemd_main_pid "$name" || true)"
+    if [[ -n "$systemd_pid" ]]; then
+      managed="$systemd_pid"
+    fi
+  fi
+  if [[ "$managed" == "-" ]] && service_pid "$name" >/dev/null; then
     managed="$(service_pid "$name")"
   fi
   mapfile -t pids < <(listener_pids_for_port "$port" || true)
   if [[ "${#pids[@]}" -gt 0 ]]; then
     listeners="${pids[*]}"
   fi
-  printf '%-8s managed_pid=%-8s port=%-6s listener_pids=%s\n' "$name" "$managed" "$port" "$listeners"
+  printf '%-8s managed_pid=%-8s port=%-6s listener_pids=%-12s unit=%s\n' "$name" "$managed" "$port" "$listeners" "$unit"
 }
+
 
 status_all() {
   ensure_dirs
@@ -311,7 +415,7 @@ schedule_detached_action() {
   job_log="$LOG_DIR/${action}-$stamp.job.log"
 
   log "scheduling $action in ${ACTION_DELAY_SECONDS}s; log: $job_log"
-  setsid bash -lc '
+  nohup setsid bash -c '
     set -euo pipefail
     delay="$1"
     root="$2"
@@ -324,9 +428,11 @@ schedule_detached_action() {
     printf "[%s] dev-workspace %s finished with status %s\n" "$(date -Is)" "$action" "$status"
     exit "$status"
   ' dev-workspace-job "$ACTION_DELAY_SECONDS" "$ROOT_DIR" "$action" >>"$job_log" 2>&1 < /dev/null &
+  local scheduled_pid="$!"
+  disown "$scheduled_pid" 2>/dev/null || true
 
   printf 'scheduled_action=%s\n' "$action"
-  printf 'scheduled_pid=%s\n' "$!"
+  printf 'scheduled_pid=%s\n' "$scheduled_pid"
   printf 'scheduled_after_seconds=%s\n' "$ACTION_DELAY_SECONDS"
   printf 'scheduled_log=%s\n' "$job_log"
 }
