@@ -12,7 +12,8 @@ use ticket::config::{
 use ticket::{
     LocalTicketBackend, MarkdownText, NewTicket, NewTicketEvent, NewTicketRelation, TicketBackend,
     TicketDoctorSeverity, TicketEventKind, TicketIdOrSlug, TicketIntakeSummary, TicketListQuery,
-    TicketRelationKind, TicketReview, TicketReviewResult, TicketSummary, TicketWorkflowState,
+    TicketListState, TicketRelationKind, TicketReview, TicketReviewResult, TicketSummary,
+    TicketWorkflowState,
 };
 
 const DEFAULT_LIST_LIMIT: usize = 50;
@@ -49,7 +50,7 @@ pub struct CreateOptions {
 pub enum ListState {
     Active,
     All,
-    States(Vec<TicketWorkflowState>),
+    States(Vec<TicketListState>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1060,7 +1061,7 @@ fn parse_list_state(raw: &str) -> Result<ListState, TicketCliError> {
 
     let mut states = Vec::new();
     for token in tokens {
-        let state = TicketWorkflowState::parse(token).ok_or_else(|| {
+        let state = TicketListState::parse(token).ok_or_else(|| {
             TicketCliError::new(format!(
                 "invalid state: {token}; expected active, all, planning, ready, queued, inprogress, done, closed"
             ))
@@ -1554,18 +1555,17 @@ mod tests {
     fn ticket_cli_list_defaults_to_active_and_accepts_multi_state_filter() {
         let default = parse_ticket_args(&args(&["list"])).unwrap();
         match default {
-            TicketCommand::List(options) => assert_eq!(options.state, ListState::Active),
+            TicketCli::Command(TicketCommand::List(options)) => {
+                assert_eq!(options.state, ListState::Active)
+            }
             other => panic!("unexpected command: {other:?}"),
         }
 
         let explicit = parse_ticket_args(&args(&["list", "--state", "planning,closed"])).unwrap();
         match explicit {
-            TicketCommand::List(options) => assert_eq!(
+            TicketCli::Command(TicketCommand::List(options)) => assert_eq!(
                 options.state,
-                ListState::States(vec![
-                    TicketWorkflowState::Planning,
-                    TicketWorkflowState::Closed
-                ])
+                ListState::States(vec![TicketListState::Planning, TicketListState::Closed])
             ),
             other => panic!("unexpected command: {other:?}"),
         }

@@ -16,8 +16,8 @@ use crate::{
     NewTicket, NewTicketEvent, NewTicketRelation, OrchestrationPlanKind, OrchestrationPlanRecord,
     Result as TicketResult, Ticket, TicketBackend, TicketDoctorDiagnostic, TicketDoctorReport,
     TicketDoctorSeverity, TicketError, TicketEventKind, TicketIdOrSlug, TicketIntakeSummary,
-    TicketRef, TicketRelation, TicketRelationKind, TicketRelationView, TicketReview,
-    TicketReviewResult, TicketStateChange, TicketSummary, TicketWorkflowState,
+    TicketListState, TicketRef, TicketRelation, TicketRelationKind, TicketRelationView,
+    TicketReview, TicketReviewResult, TicketStateChange, TicketSummary, TicketWorkflowState,
 };
 
 const DEFAULT_LIST_LIMIT: usize = 50;
@@ -373,6 +373,17 @@ impl TicketWorkflowStateParam {
             Self::Closed => TicketWorkflowState::Closed,
         }
     }
+
+    fn into_list_state(self) -> TicketListState {
+        match self {
+            Self::Planning => TicketListState::Planning,
+            Self::Ready => TicketListState::Ready,
+            Self::Queued => TicketListState::Queued,
+            Self::Inprogress => TicketListState::InProgress,
+            Self::Done => TicketListState::Done,
+            Self::Closed => TicketListState::Closed,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
@@ -389,14 +400,14 @@ enum TicketListStateParam {
 }
 
 impl TicketListStateParam {
-    fn as_state(self) -> Option<TicketWorkflowState> {
+    fn as_list_state(self) -> Option<TicketListState> {
         match self {
-            Self::Planning => Some(TicketWorkflowState::Planning),
-            Self::Ready => Some(TicketWorkflowState::Ready),
-            Self::Queued => Some(TicketWorkflowState::Queued),
-            Self::Inprogress => Some(TicketWorkflowState::InProgress),
-            Self::Done => Some(TicketWorkflowState::Done),
-            Self::Closed => Some(TicketWorkflowState::Closed),
+            Self::Planning => Some(TicketListState::Planning),
+            Self::Ready => Some(TicketListState::Ready),
+            Self::Queued => Some(TicketListState::Queued),
+            Self::Inprogress => Some(TicketListState::InProgress),
+            Self::Done => Some(TicketListState::Done),
+            Self::Closed => Some(TicketListState::Closed),
             Self::Active | Self::All => None,
         }
     }
@@ -428,15 +439,15 @@ impl TicketListParams {
                     "TicketList `states` must include at least one workflow state".to_string(),
                 ));
             }
-            crate::TicketListQuery::states(states.into_iter().map(|state| state.into_state()))
+            crate::TicketListQuery::states(states.into_iter().map(|state| state.into_list_state()))
         } else {
             match self.state.unwrap_or(TicketListStateParam::Active) {
                 TicketListStateParam::Active => crate::TicketListQuery::active(),
                 TicketListStateParam::All => crate::TicketListQuery::all(),
                 state => crate::TicketListQuery::state(
                     state
-                        .as_state()
-                        .expect("workflow state list param maps to TicketWorkflowState"),
+                        .as_list_state()
+                        .expect("workflow state list param maps to TicketListState"),
                 ),
             }
         };

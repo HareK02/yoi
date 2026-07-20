@@ -510,6 +510,53 @@ impl NewTicket {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TicketListState {
+    Planning,
+    Ready,
+    Queued,
+    InProgress,
+    Done,
+    Closed,
+}
+
+impl TicketListState {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "planning" => Some(Self::Planning),
+            "ready" => Some(Self::Ready),
+            "queued" => Some(Self::Queued),
+            "inprogress" => Some(Self::InProgress),
+            "done" => Some(Self::Done),
+            "closed" => Some(Self::Closed),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Planning => "planning",
+            Self::Ready => "ready",
+            Self::Queued => "queued",
+            Self::InProgress => "inprogress",
+            Self::Done => "done",
+            Self::Closed => "closed",
+        }
+    }
+
+    fn matches_workflow_state(self, state: TicketWorkflowState) -> bool {
+        match self {
+            Self::Planning => state == TicketWorkflowState::Planning,
+            Self::Ready => state == TicketWorkflowState::Ready,
+            Self::Queued => state == TicketWorkflowState::Queued,
+            Self::InProgress => state == TicketWorkflowState::InProgress,
+            Self::Done => state == TicketWorkflowState::Done,
+            Self::Closed => state == TicketWorkflowState::Closed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TicketStateSelector {
@@ -517,8 +564,8 @@ pub enum TicketStateSelector {
     Active,
     /// Every workflow state, including closed.
     All,
-    /// An explicit set of workflow states.
-    States(BTreeSet<TicketWorkflowState>),
+    /// An explicit set of list-query state tokens.
+    States(BTreeSet<TicketListState>),
 }
 
 impl Default for TicketStateSelector {
@@ -551,11 +598,11 @@ impl TicketListQuery {
         }
     }
 
-    pub fn state(state: TicketWorkflowState) -> Self {
+    pub fn state(state: TicketListState) -> Self {
         Self::states([state])
     }
 
-    pub fn states(states: impl IntoIterator<Item = TicketWorkflowState>) -> Self {
+    pub fn states(states: impl IntoIterator<Item = TicketListState>) -> Self {
         Self {
             state: TicketStateSelector::States(states.into_iter().collect()),
         }
@@ -565,7 +612,9 @@ impl TicketListQuery {
         match &self.state {
             TicketStateSelector::Active => state != TicketWorkflowState::Closed,
             TicketStateSelector::All => true,
-            TicketStateSelector::States(states) => states.contains(&state),
+            TicketStateSelector::States(states) => states
+                .iter()
+                .any(|query_state| query_state.matches_workflow_state(state)),
         }
     }
 
@@ -4060,15 +4109,15 @@ state: planning
         assert!(all_ids.contains(&closed.id.as_str()));
 
         let ready_only = backend
-            .list(TicketListQuery::state(TicketWorkflowState::Ready))
+            .list(TicketListQuery::state(TicketListState::Ready))
             .unwrap();
         assert_eq!(ready_only.len(), 1);
         assert_eq!(ready_only[0].id, ready.id);
 
         let planning_or_closed = backend
             .list(TicketListQuery::states([
-                TicketWorkflowState::Planning,
-                TicketWorkflowState::Closed,
+                TicketListState::Planning,
+                TicketListState::Closed,
             ]))
             .unwrap();
         let explicit_ids = planning_or_closed
