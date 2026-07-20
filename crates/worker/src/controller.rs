@@ -548,7 +548,10 @@ fn install_ticket_event_companion_notify_hook<C, St>(
 
     let ticket_feature = &worker.manifest().feature.ticket;
     if !ticket_feature.enabled
-        || !matches!(ticket_feature.access, TicketFeatureAccessConfig::Lifecycle)
+        || !matches!(
+            ticket_feature.access,
+            TicketFeatureAccessConfig::OrchestrationControl | TicketFeatureAccessConfig::Lifecycle
+        )
     {
         return;
     }
@@ -678,6 +681,21 @@ where
         let ticket_access = match feature_config.ticket.access {
             TicketFeatureAccessConfig::ReadOnly => {
                 crate::feature::builtin::ticket::TicketFeatureAccess::ReadOnly
+            }
+            TicketFeatureAccessConfig::WorkspaceAuthoring => {
+                crate::feature::builtin::ticket::TicketFeatureAccess::WorkspaceAuthoring
+            }
+            TicketFeatureAccessConfig::Intake => {
+                crate::feature::builtin::ticket::TicketFeatureAccess::Intake
+            }
+            TicketFeatureAccessConfig::OrchestrationControl => {
+                crate::feature::builtin::ticket::TicketFeatureAccess::OrchestrationControl
+            }
+            TicketFeatureAccessConfig::WorkReport => {
+                crate::feature::builtin::ticket::TicketFeatureAccess::WorkReport
+            }
+            TicketFeatureAccessConfig::Review => {
+                crate::feature::builtin::ticket::TicketFeatureAccess::Review
             }
             TicketFeatureAccessConfig::Lifecycle => {
                 crate::feature::builtin::ticket::TicketFeatureAccess::Lifecycle

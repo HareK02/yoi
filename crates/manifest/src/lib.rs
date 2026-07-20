@@ -180,6 +180,12 @@ impl Default for TicketFeatureConfig {
 #[serde(rename_all = "snake_case")]
 pub enum TicketFeatureAccessConfig {
     ReadOnly,
+    WorkspaceAuthoring,
+    Intake,
+    OrchestrationControl,
+    WorkReport,
+    Review,
+    /// Legacy broad mutation preset retained as a migration shim.
     Lifecycle,
 }
 

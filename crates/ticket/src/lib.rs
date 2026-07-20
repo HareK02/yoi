@@ -510,6 +510,21 @@ impl NewTicket {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketItemEdit {
+    pub title: Option<String>,
+    pub body: Option<MarkdownText>,
+    pub author: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketDependencyCheck {
+    pub ticket: TicketSummary,
+    pub blockers: Vec<TicketRelationBlocker>,
+    pub queue_guard: TicketQueueGuard,
+    pub recommended_action: TicketWorkspaceNextAction,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TicketListState {
@@ -1391,6 +1406,8 @@ pub trait TicketBackend {
     fn list(&self, filter: TicketListQuery) -> Result<Vec<TicketSummary>>;
     fn show(&self, id: TicketIdOrSlug) -> Result<Ticket>;
     fn create(&self, input: NewTicket) -> Result<TicketRef>;
+    fn edit_item(&self, id: TicketIdOrSlug, edit: TicketItemEdit) -> Result<Ticket>;
+    fn dependency_check(&self, id: TicketIdOrSlug) -> Result<TicketDependencyCheck>;
     fn add_event(&self, id: TicketIdOrSlug, event: NewTicketEvent) -> Result<()>;
     fn add_state_changed(&self, id: TicketIdOrSlug, change: TicketStateChange) -> Result<()>;
     fn add_intake_summary(&self, id: TicketIdOrSlug, summary: TicketIntakeSummary) -> Result<()>;
@@ -1448,6 +1465,13 @@ pub enum TicketBackendOperation {
     },
     Create {
         input: NewTicket,
+    },
+    EditItem {
+        id: TicketIdOrSlug,
+        edit: TicketItemEdit,
+    },
+    DependencyCheck {
+        id: TicketIdOrSlug,
     },
     AddEvent {
         id: TicketIdOrSlug,
@@ -1517,6 +1541,7 @@ pub enum TicketBackendOperationResult {
     Tickets(Vec<TicketSummary>),
     Ticket(Ticket),
     TicketRef(TicketRef),
+    DependencyCheck(TicketDependencyCheck),
     Relation(TicketRelation),
     Relations(Vec<TicketRelation>),
     RelationView(TicketRelationView),
@@ -1546,6 +1571,12 @@ where
         }
         TicketBackendOperation::Create { input } => {
             TicketBackendOperationResult::TicketRef(backend.create(input)?)
+        }
+        TicketBackendOperation::EditItem { id, edit } => {
+            TicketBackendOperationResult::Ticket(backend.edit_item(id, edit)?)
+        }
+        TicketBackendOperation::DependencyCheck { id } => {
+            TicketBackendOperationResult::DependencyCheck(backend.dependency_check(id)?)
         }
         TicketBackendOperation::AddEvent { id, event } => {
             backend.add_event(id, event)?;
@@ -2215,6 +2246,79 @@ impl TicketBackend for LocalTicketBackend {
             id: id.clone(),
             slug: id,
             status: TicketStatus::Open,
+        })
+    }
+
+    fn edit_item(&self, id: TicketIdOrSlug, edit: TicketItemEdit) -> Result<Ticket> {
+        if edit.title.is_none() && edit.body.is_none() {
+            return Err(TicketError::Conflict(
+                "TicketEditItem requires at least one of title or body".to_string(),
+            ));
+        }
+        if let Some(title) = edit.title.as_deref() {
+            validate_required_event_value("title", title)?;
+        }
+        if let Some(author) = edit.author.as_deref() {
+            validate_required_event_value("author", author)?;
+        }
+        let _lock = self.acquire_lock()?;
+        let dir = self.find_ticket_dir(&id)?;
+        let item = dir.join("item.md");
+        let mut content = fs::read_to_string(&item).map_err(|e| io_err(&item, e))?;
+        let mut updates = Vec::new();
+        if let Some(title) = edit.title.as_deref() {
+            updates.push(("title", title));
+        }
+        if !updates.is_empty() {
+            content = replace_frontmatter_fields(&content, &updates).map_err(|message| {
+                TicketError::Parse {
+                    path: item.clone(),
+                    message,
+                }
+            })?;
+        }
+        if let Some(body) = edit.body.as_ref() {
+            content = replace_item_body(&content, body.as_str()).map_err(|message| {
+                TicketError::Parse {
+                    path: item.clone(),
+                    message,
+                }
+            })?;
+        }
+        atomic_write(&item, content.as_bytes())?;
+
+        let author = edit.author.unwrap_or_else(default_author);
+        let mut changes = Vec::new();
+        if edit.title.is_some() {
+            changes.push("title");
+        }
+        if edit.body.is_some() {
+            changes.push("body");
+        }
+        let body = MarkdownText::new(format!("Ticket item updated: {}.", changes.join(", ")));
+        self.append_thread_event(
+            &dir,
+            "item_edit",
+            self.generated_heading("Item updated", "項目更新"),
+            &author,
+            None,
+            &[],
+            &body,
+        )?;
+        self.ticket_from_dir(&dir)
+    }
+
+    fn dependency_check(&self, id: TicketIdOrSlug) -> Result<TicketDependencyCheck> {
+        let ticket = self.show(id)?;
+        let summary = ticket_summary_from_meta(ticket.meta.clone());
+        let projection = project_ticket_workspace_item(&summary, &ticket.relations.blockers, None);
+        Ok(TicketDependencyCheck {
+            ticket: summary,
+            blockers: ticket.relations.blockers,
+            queue_guard: projection.queue_guard,
+            recommended_action: projection
+                .next_action
+                .unwrap_or(TicketWorkspaceNextAction::WaitForOrchestrator),
         })
     }
 
@@ -3732,6 +3836,32 @@ fn replace_frontmatter_fields(
     }
     let mut out = lines.join("\n");
     if content.ends_with('\n') {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn replace_item_body(content: &str, body: &str) -> std::result::Result<String, String> {
+    let mut lines = content.lines();
+    if lines.next() != Some("---") {
+        return Err("item.md missing frontmatter opener".to_string());
+    }
+    let mut frontmatter = vec!["---".to_string()];
+    let mut found_close = false;
+    for line in lines.by_ref() {
+        frontmatter.push(line.to_string());
+        if line == "---" {
+            found_close = true;
+            break;
+        }
+    }
+    if !found_close {
+        return Err("item.md missing frontmatter closer".to_string());
+    }
+    let mut out = frontmatter.join("\n");
+    out.push_str("\n");
+    out.push_str(body);
+    if !out.ends_with('\n') {
         out.push('\n');
     }
     Ok(out)

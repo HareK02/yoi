@@ -128,8 +128,12 @@ impl FeatureFlagConfigPartial {
 pub struct TicketFeatureConfigPartial {
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// Legacy access field. Prefer `preset` for new profile/DCDL authoring.
     #[serde(default)]
     pub access: Option<TicketFeatureAccessConfig>,
+    /// Semantic Ticket access preset for profile/DCDL authoring.
+    #[serde(default)]
+    pub preset: Option<TicketFeatureAccessConfig>,
 }
 
 impl TicketFeatureConfigPartial {
@@ -137,6 +141,7 @@ impl TicketFeatureConfigPartial {
         Self {
             enabled: other.enabled.or(self.enabled),
             access: other.access.or(self.access),
+            preset: other.preset.or(self.preset),
         }
     }
 }
@@ -190,7 +195,7 @@ impl From<TicketFeatureConfigPartial> for TicketFeatureConfig {
     fn from(value: TicketFeatureConfigPartial) -> Self {
         Self {
             enabled: value.enabled.unwrap_or_default(),
-            access: value.access.unwrap_or_default(),
+            access: value.preset.or(value.access).unwrap_or_default(),
         }
     }
 }
@@ -200,6 +205,7 @@ impl From<TicketFeatureConfig> for TicketFeatureConfigPartial {
         Self {
             enabled: Some(value.enabled),
             access: Some(value.access),
+            preset: None,
         }
     }
 }

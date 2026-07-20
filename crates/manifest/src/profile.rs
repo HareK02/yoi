@@ -16,8 +16,8 @@ use crate::model::{AuthRef, ModelManifest};
 use crate::plugin::PluginConfig;
 use crate::{
     EngineManifestConfig, McpConfig, McpStdioCwdPolicy, MemoryConfig, Permission, ResolveError,
-    ScopeConfig, ScopeRule, SkillsConfig, WebConfig, WorkerManifest, WorkerManifestConfig,
-    WorkerMetaConfig, paths,
+    ScopeConfig, ScopeRule, SkillsConfig, TicketFeatureAccessConfig, WebConfig, WorkerManifest,
+    WorkerManifestConfig, WorkerMetaConfig, paths,
 };
 
 const PROFILE_FORMAT_V1: &str = "yoi.profile.v1";
@@ -1012,6 +1012,18 @@ fn apply_role_profile(
     value["feature"]["memory"] = serde_json::json!({ "enabled": memory });
     value["feature"]["web"] = serde_json::json!({ "enabled": web });
     value["feature"]["workers"] = serde_json::json!({ "enabled": workers });
+    let ticket_access = match slug {
+        "companion" => TicketFeatureAccessConfig::WorkspaceAuthoring,
+        "intake" => TicketFeatureAccessConfig::Intake,
+        "orchestrator" => TicketFeatureAccessConfig::OrchestrationControl,
+        "coder" => TicketFeatureAccessConfig::WorkReport,
+        "reviewer" => TicketFeatureAccessConfig::Review,
+        _ => TicketFeatureAccessConfig::Lifecycle,
+    };
+    value["feature"]["ticket"] = serde_json::json!({
+        "enabled": true,
+        "preset": ticket_access,
+    });
     value["feature"]["ticket_orchestration"] =
         serde_json::json!({ "enabled": ticket_orchestration });
 }
@@ -1439,6 +1451,10 @@ mod tests {
         assert_eq!(companion.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
         assert!(companion.web.is_some());
         assert!(companion.feature.ticket.enabled);
+        assert_eq!(
+            companion.feature.ticket.access,
+            TicketFeatureAccessConfig::WorkspaceAuthoring
+        );
         assert!(!companion.feature.ticket_orchestration.enabled);
         assert_eq!(
             companion.compaction.as_ref().unwrap().threshold,
@@ -1461,6 +1477,10 @@ mod tests {
         assert!(intake.feature.task.enabled);
         assert!(!intake.feature.workers.enabled);
         assert!(intake.feature.ticket.enabled);
+        assert_eq!(
+            intake.feature.ticket.access,
+            TicketFeatureAccessConfig::Intake
+        );
         assert!(intake.scope.allow.is_empty());
         assert!(intake.delegation_scope.allow.is_empty());
         assert_eq!(intake.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
@@ -1472,6 +1492,10 @@ mod tests {
         assert!(orchestrator.feature.task.enabled);
         assert!(orchestrator.feature.workers.enabled);
         assert!(orchestrator.feature.ticket.enabled);
+        assert_eq!(
+            orchestrator.feature.ticket.access,
+            TicketFeatureAccessConfig::OrchestrationControl
+        );
         assert!(orchestrator.feature.ticket_orchestration.enabled);
         assert!(orchestrator.scope.allow.is_empty());
         assert!(orchestrator.delegation_scope.allow.is_empty());
@@ -1491,12 +1515,20 @@ mod tests {
         assert!(coder.web.is_some());
         assert!(coder.compaction.is_some());
         assert!(coder.feature.ticket.enabled);
+        assert_eq!(
+            coder.feature.ticket.access,
+            TicketFeatureAccessConfig::WorkReport
+        );
         assert!(!coder.feature.ticket_orchestration.enabled);
 
         let reviewer = resolve("reviewer");
         assert!(reviewer.feature.task.enabled);
         assert!(!reviewer.feature.workers.enabled);
         assert!(reviewer.feature.ticket.enabled);
+        assert_eq!(
+            reviewer.feature.ticket.access,
+            TicketFeatureAccessConfig::Review
+        );
         assert!(!reviewer.feature.ticket_orchestration.enabled);
         assert!(reviewer.scope.allow.is_empty());
         assert!(reviewer.delegation_scope.allow.is_empty());

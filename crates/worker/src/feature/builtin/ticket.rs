@@ -17,8 +17,7 @@ use ticket::{
     tool::{
         TICKET_BASE_READ_ONLY_TOOL_NAMES, TICKET_BASE_TOOL_NAMES,
         TICKET_ORCHESTRATION_READ_ONLY_TOOL_NAMES, TICKET_ORCHESTRATION_TOOL_NAMES,
-        TICKET_READ_ONLY_TOOL_NAMES, TICKET_TOOL_NAMES, TicketToolBackend, ticket_tool_description,
-        ticket_tools,
+        TicketToolBackend, ticket_tool_description, ticket_tools,
     },
 };
 
@@ -34,24 +33,96 @@ The tools operate through the ticket crate backend and do not grant generic file
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TicketFeatureAccess {
-    /// Status/diagnostic access for views such as Companion that must not mutate Tickets.
+    /// Status/diagnostic access for views that must not mutate Tickets.
     ReadOnly,
-    /// Full Ticket lifecycle access, including the read-only tools and all mutating Ticket tools.
+    /// User/Companion authoring access for shaping current Ticket specs and queueing work.
+    WorkspaceAuthoring,
+    /// Intake access for creating/refining planning Tickets and marking them ready.
+    Intake,
+    /// Orchestrator control access for state/thread/relation/orchestration operations.
+    OrchestrationControl,
+    /// Coder-style access for reading Tickets and writing implementation reports/comments.
+    WorkReport,
+    /// Reviewer-style access for reading Tickets and writing review/comment thread events.
+    Review,
+    /// Legacy full lifecycle access retained as a migration shim.
     Lifecycle,
 }
+
+const WORKSPACE_AUTHORING_BASE_TOOL_NAMES: [&str; 10] = [
+    "TicketCreate",
+    "TicketEditItem",
+    "TicketList",
+    "TicketShow",
+    "TicketComment",
+    "TicketReview",
+    "TicketQueue",
+    "TicketClose",
+    "TicketDependencyCheck",
+    "TicketDoctor",
+];
+
+const INTAKE_BASE_TOOL_NAMES: [&str; 8] = [
+    "TicketCreate",
+    "TicketEditItem",
+    "TicketList",
+    "TicketShow",
+    "TicketComment",
+    "TicketIntakeReady",
+    "TicketDependencyCheck",
+    "TicketDoctor",
+];
+
+const ORCHESTRATION_CONTROL_BASE_TOOL_NAMES: [&str; 8] = [
+    "TicketList",
+    "TicketShow",
+    "TicketComment",
+    "TicketReview",
+    "TicketWorkflowState",
+    "TicketClose",
+    "TicketDependencyCheck",
+    "TicketDoctor",
+];
+
+const WORK_REPORT_BASE_TOOL_NAMES: [&str; 5] = [
+    "TicketList",
+    "TicketShow",
+    "TicketComment",
+    "TicketDependencyCheck",
+    "TicketDoctor",
+];
+
+const REVIEW_BASE_TOOL_NAMES: [&str; 6] = [
+    "TicketList",
+    "TicketShow",
+    "TicketComment",
+    "TicketReview",
+    "TicketDependencyCheck",
+    "TicketDoctor",
+];
+
+const RELATION_WRITE_TOOL_NAMES: [&str; 2] = ["TicketRelationRecord", "TicketRelationQuery"];
 
 impl TicketFeatureAccess {
     pub fn base_tool_names(self) -> &'static [&'static str] {
         match self {
             Self::ReadOnly => &TICKET_BASE_READ_ONLY_TOOL_NAMES,
+            Self::WorkspaceAuthoring => &WORKSPACE_AUTHORING_BASE_TOOL_NAMES,
+            Self::Intake => &INTAKE_BASE_TOOL_NAMES,
+            Self::OrchestrationControl => &ORCHESTRATION_CONTROL_BASE_TOOL_NAMES,
+            Self::WorkReport => &WORK_REPORT_BASE_TOOL_NAMES,
+            Self::Review => &REVIEW_BASE_TOOL_NAMES,
             Self::Lifecycle => &TICKET_BASE_TOOL_NAMES,
         }
     }
 
     pub fn orchestration_tool_names(self) -> &'static [&'static str] {
         match self {
-            Self::ReadOnly => &TICKET_ORCHESTRATION_READ_ONLY_TOOL_NAMES,
-            Self::Lifecycle => &TICKET_ORCHESTRATION_TOOL_NAMES,
+            Self::ReadOnly | Self::WorkReport | Self::Review => {
+                &TICKET_ORCHESTRATION_READ_ONLY_TOOL_NAMES
+            }
+            Self::WorkspaceAuthoring | Self::Intake => &RELATION_WRITE_TOOL_NAMES,
+            Self::OrchestrationControl | Self::Lifecycle => &TICKET_ORCHESTRATION_TOOL_NAMES,
         }
     }
 }
@@ -200,12 +271,6 @@ impl TicketFeature {
     }
 
     fn enabled_tool_names(&self) -> Vec<&'static str> {
-        if self.include_base_tools && self.include_orchestration_tools {
-            return match self.access {
-                TicketFeatureAccess::ReadOnly => TICKET_READ_ONLY_TOOL_NAMES.to_vec(),
-                TicketFeatureAccess::Lifecycle => TICKET_TOOL_NAMES.to_vec(),
-            };
-        }
         let mut names = Vec::new();
         if self.include_base_tools {
             names.extend_from_slice(self.access.base_tool_names());
@@ -418,6 +483,20 @@ impl TicketBackend for WorkspaceHttpTicketBackend {
         expect_ticket_result!(
             self.invoke(TicketBackendOperation::Create { input }),
             TicketBackendOperationResult::TicketRef
+        )
+    }
+
+    fn edit_item(&self, id: TicketIdOrSlug, edit: ticket::TicketItemEdit) -> TicketResult<Ticket> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::EditItem { id, edit }),
+            TicketBackendOperationResult::Ticket
+        )
+    }
+
+    fn dependency_check(&self, id: TicketIdOrSlug) -> TicketResult<ticket::TicketDependencyCheck> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::DependencyCheck { id }),
+            TicketBackendOperationResult::DependencyCheck
         )
     }
 
@@ -713,6 +792,74 @@ mod tests {
                 .collect::<Vec<_>>(),
             TICKET_ORCHESTRATION_TOOL_NAMES
         );
+    }
+
+    #[test]
+    fn semantic_access_presets_expose_role_capability_surfaces() {
+        let temp = TempDir::new().unwrap();
+
+        let workspace_authoring = ticket_tools_feature_with_options(
+            temp.path(),
+            Some(TicketFeatureAccess::WorkspaceAuthoring),
+            false,
+        );
+        let workspace_descriptor = workspace_authoring.descriptor();
+        let workspace_tools = workspace_descriptor
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(workspace_tools.contains(&"TicketCreate"));
+        assert!(workspace_tools.contains(&"TicketEditItem"));
+        assert!(workspace_tools.contains(&"TicketQueue"));
+        assert!(!workspace_tools.contains(&"TicketWorkflowState"));
+
+        let orchestration = ticket_tools_feature_with_options(
+            temp.path(),
+            Some(TicketFeatureAccess::OrchestrationControl),
+            true,
+        );
+        let orchestration_descriptor = orchestration.descriptor();
+        let orchestration_tools = orchestration_descriptor
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(orchestration_tools.contains(&"TicketWorkflowState"));
+        assert!(orchestration_tools.contains(&"TicketDependencyCheck"));
+        assert!(orchestration_tools.contains(&"TicketRelationRecord"));
+        assert!(orchestration_tools.contains(&"TicketOrchestrationPlanRecord"));
+        assert!(!orchestration_tools.contains(&"TicketEditItem"));
+        assert!(!orchestration_tools.contains(&"TicketQueue"));
+
+        let work_report = ticket_tools_feature_with_options(
+            temp.path(),
+            Some(TicketFeatureAccess::WorkReport),
+            false,
+        );
+        let work_report_descriptor = work_report.descriptor();
+        let work_report_tools = work_report_descriptor
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(work_report_tools.contains(&"TicketComment"));
+        assert!(!work_report_tools.contains(&"TicketReview"));
+        assert!(!work_report_tools.contains(&"TicketWorkflowState"));
+
+        let review = ticket_tools_feature_with_options(
+            temp.path(),
+            Some(TicketFeatureAccess::Review),
+            false,
+        );
+        let review_descriptor = review.descriptor();
+        let review_tools = review_descriptor
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(review_tools.contains(&"TicketReview"));
+        assert!(!review_tools.contains(&"TicketWorkflowState"));
     }
 
     #[test]
