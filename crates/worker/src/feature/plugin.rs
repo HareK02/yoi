@@ -2552,8 +2552,39 @@ struct TungstenitePluginWebSocketClient;
 type AsyncSystemWebSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+struct PluginWebSocketRuntime {
+    runtime: Option<TokioRuntime>,
+}
+
+impl PluginWebSocketRuntime {
+    fn new(runtime: TokioRuntime) -> Self {
+        Self {
+            runtime: Some(runtime),
+        }
+    }
+
+    fn get(&self) -> &TokioRuntime {
+        self.runtime
+            .as_ref()
+            .expect("plugin websocket runtime missing")
+    }
+}
+
+impl Drop for PluginWebSocketRuntime {
+    fn drop(&mut self) {
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        if TokioHandle::try_current().is_ok() {
+            let _ = tokio::task::spawn_blocking(move || drop(runtime));
+        } else {
+            drop(runtime);
+        }
+    }
+}
+
 struct TungstenitePluginWebSocketConnection {
-    runtime: TokioRuntime,
+    runtime: PluginWebSocketRuntime,
     socket: AsyncSystemWebSocket,
 }
 
@@ -2592,7 +2623,7 @@ impl PluginWebSocketClient for TungstenitePluginWebSocketClient {
             )
             .await
         };
-        let (socket, _response) = block_on_websocket_future(&runtime, open)
+        let (socket, _response) = block_on_websocket_future(runtime.get(), open)
             .map_err(|error| {
                 PluginWebSocketError::new(format!(
                     "WebSocket open timed out after {} ms for {}: {error}",
@@ -2619,7 +2650,7 @@ impl PluginWebSocketConnection for TungstenitePluginWebSocketConnection {
             PLUGIN_WEBSOCKET_DEFAULT_TIMEOUT,
             self.socket.send(Message::Text(text.to_string().into())),
         );
-        block_on_websocket_future(&self.runtime, send)
+        block_on_websocket_future(self.runtime.get(), send)
             .map_err(|_| PluginWebSocketError::new("WebSocket send timed out"))?
             .map_err(|error| PluginWebSocketError::new(format!("WebSocket send failed: {error}")))
     }
@@ -2631,7 +2662,7 @@ impl PluginWebSocketConnection for TungstenitePluginWebSocketConnection {
     ) -> Result<PluginWebSocketRecvResponse, PluginWebSocketError> {
         for _ in 0..PLUGIN_WEBSOCKET_MAX_CONTROL_FRAMES {
             let next = tokio::time::timeout(timeout, self.socket.next());
-            let message = block_on_websocket_future(&self.runtime, next)
+            let message = block_on_websocket_future(self.runtime.get(), next)
                 .map_err(|_| PluginWebSocketError::new("WebSocket receive timed out"))?
                 .ok_or_else(|| PluginWebSocketError::new("WebSocket stream ended"))?
                 .map_err(|error| {
@@ -2660,7 +2691,7 @@ impl PluginWebSocketConnection for TungstenitePluginWebSocketConnection {
                         PLUGIN_WEBSOCKET_DEFAULT_TIMEOUT,
                         self.socket.send(Message::Pong(payload)),
                     );
-                    block_on_websocket_future(&self.runtime, send)
+                    block_on_websocket_future(self.runtime.get(), send)
                         .map_err(|_| PluginWebSocketError::new("WebSocket pong timed out"))?
                         .map_err(|error| {
                             PluginWebSocketError::new(format!("WebSocket pong failed: {error}"))
@@ -2676,19 +2707,20 @@ impl PluginWebSocketConnection for TungstenitePluginWebSocketConnection {
 
     fn close(&mut self) -> Result<(), PluginWebSocketError> {
         let close = tokio::time::timeout(PLUGIN_WEBSOCKET_DEFAULT_TIMEOUT, self.socket.close(None));
-        block_on_websocket_future(&self.runtime, close)
+        block_on_websocket_future(self.runtime.get(), close)
             .map_err(|_| PluginWebSocketError::new("WebSocket close timed out"))?
             .map_err(|error| PluginWebSocketError::new(format!("WebSocket close failed: {error}")))
     }
 }
 
-fn new_websocket_runtime() -> Result<TokioRuntime, PluginWebSocketError> {
-    TokioRuntimeBuilder::new_current_thread()
+fn new_websocket_runtime() -> Result<PluginWebSocketRuntime, PluginWebSocketError> {
+    let runtime = TokioRuntimeBuilder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| {
             PluginWebSocketError::new(format!("WebSocket runtime build failed: {error}"))
-        })
+        })?;
+    Ok(PluginWebSocketRuntime::new(runtime))
 }
 
 fn block_on_websocket_future<F: std::future::Future>(
@@ -5655,6 +5687,12 @@ mod tests {
     use std::path::Path;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn websocket_runtime_drop_is_safe_inside_async_context() {
+        let runtime = new_websocket_runtime().unwrap();
+        drop(runtime);
+    }
 
     fn tool(name: &str) -> manifest::plugin::PluginToolManifest {
         manifest::plugin::PluginToolManifest {

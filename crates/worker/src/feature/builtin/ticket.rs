@@ -313,7 +313,6 @@ impl FeatureModule for TicketFeature {
 struct WorkspaceHttpTicketBackend {
     workspace_id: String,
     base_url: String,
-    client: reqwest::blocking::Client,
 }
 
 impl WorkspaceHttpTicketBackend {
@@ -321,7 +320,6 @@ impl WorkspaceHttpTicketBackend {
         Self {
             workspace_id,
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: reqwest::blocking::Client::new(),
         }
     }
 
@@ -336,12 +334,26 @@ impl WorkspaceHttpTicketBackend {
         &self,
         operation: TicketBackendOperation,
     ) -> TicketResult<TicketBackendOperationResult> {
+        let endpoint = self.endpoint();
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return std::thread::spawn(move || Self::invoke_http(endpoint, operation))
+                .join()
+                .map_err(|_| {
+                    TicketError::Conflict("ticket backend request thread panicked".to_string())
+                })?;
+        }
+        Self::invoke_http(endpoint, operation)
+    }
+
+    fn invoke_http(
+        endpoint: String,
+        operation: TicketBackendOperation,
+    ) -> TicketResult<TicketBackendOperationResult> {
         let body = serde_json::to_string(&operation).map_err(|error| {
             TicketError::Conflict(format!("serialize ticket operation: {error}"))
         })?;
-        let response = self
-            .client
-            .post(self.endpoint())
+        let response = reqwest::blocking::Client::new()
+            .post(endpoint)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body)
             .send()
@@ -979,6 +991,20 @@ provider = "github"
         assert!(!root.join("open").exists());
         assert!(!root.join("pending").exists());
         assert!(!root.join("closed").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workspace_http_backend_invoke_is_safe_inside_async_context() {
+        let backend =
+            WorkspaceHttpTicketBackend::new("workspace-a".to_string(), "not-a-url".to_string());
+
+        let error = backend
+            .invoke(TicketBackendOperation::DefaultIntakeReadyStateChangeBody {
+                from: "planning".to_string(),
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("ticket backend request failed"));
     }
 
     #[test]

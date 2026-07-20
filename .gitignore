@@ -1,6 +1,7 @@
 /target
 /result
 /.direnv
+/.yoi/dev
 .worktree
 *.local*
 .env

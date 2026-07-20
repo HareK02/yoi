@@ -1,0 +1,1 @@
+Worker stop/delete no longer cleans up Workdir materialization. Spawn failure rollback is limited to newly materialized Workdirs and uses Workdir cleanup by id so rollback does not leave corrupted records. Existing Workdir binds survive spawn failures.

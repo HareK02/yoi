@@ -543,7 +543,6 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
 struct RuntimeWorkerExecution {
     handle: WorkerHandle,
     busy: Arc<AtomicBool>,
-    working_directory: Option<WorkingDirectoryBinding>,
 }
 
 /// `worker-runtime` execution backend backed by real `worker` crate Workers.
@@ -621,7 +620,12 @@ where
     {
         let (tx, rx) = mpsc::sync_channel(1);
         self.spawn_on_adapter_runtime(async move {
-            let _ = tx.send(task.await);
+            let handle = tokio::spawn(task);
+            let result = match handle.await {
+                Ok(result) => result,
+                Err(err) => Err(format!("worker adapter task failed: {err}")),
+            };
+            let _ = tx.send(result);
         })?;
         Self::wait_for_runtime_task(rx)
     }
@@ -721,14 +725,7 @@ where
                 ));
             }
         };
-        workers.insert(
-            worker_ref.clone(),
-            RuntimeWorkerExecution {
-                handle,
-                busy,
-                working_directory: working_directory.clone(),
-            },
-        );
+        workers.insert(worker_ref.clone(), RuntimeWorkerExecution { handle, busy });
 
         WorkerExecutionSpawnResult::Connected {
             handle: WorkerExecutionHandle::new(worker_ref, self.backend_id()),
@@ -816,6 +813,7 @@ where
         }
 
         let mut request = request;
+        let mut rollback_working_directory = None;
         let working_directory = match (
             request.request.working_directory_request.as_ref(),
             request.request.working_directory.as_ref(),
@@ -836,6 +834,7 @@ where
                 match materializer.materialize(&request.worker_ref, working_directory_request) {
                     Ok(binding) => {
                         request.working_directory = Some(binding.clone());
+                        rollback_working_directory = Some(binding.clone());
                         Some(binding)
                     }
                     Err(error) => {
@@ -887,9 +886,9 @@ where
             Err(message) => {
                 if let (Some(materializer), Some(binding)) = (
                     self.working_directory_materializer.as_ref(),
-                    working_directory.as_ref(),
+                    rollback_working_directory.as_ref(),
                 ) {
-                    let _ = materializer.cleanup(binding);
+                    let _ = materializer.cleanup_working_directory(&binding.working_directory.id);
                 }
                 return WorkerExecutionSpawnResult::Errored(WorkerExecutionResult::errored(
                     WorkerExecutionOperation::Spawn,
@@ -1089,19 +1088,12 @@ where
                 "execution handle does not reference a live Worker",
             );
         };
-        let result = self.send_method(
+        self.send_method(
             WorkerExecutionOperation::Stop,
             execution.handle,
             Method::Shutdown,
             WorkerExecutionRunState::Stopped,
-        );
-        if let (Some(materializer), Some(binding)) = (
-            self.working_directory_materializer.as_ref(),
-            execution.working_directory.as_ref(),
-        ) {
-            let _ = materializer.cleanup(binding);
-        }
-        result
+        )
     }
 
     fn cancel_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
@@ -1162,7 +1154,8 @@ mod tests {
     use crate::Runtime as EmbeddedRuntime;
     use crate::catalog::{
         ConfigBundleRef, CreateWorkerRequest, MaterializerKind, ProfileSelector,
-        RepositorySelector, WorkingDirectoryRepository, WorkingDirectoryRequest,
+        RepositorySelector, WorkingDirectoryClaim, WorkingDirectoryRepository,
+        WorkingDirectoryRequest,
     };
     use crate::execution::WorkerExecutionContext;
     use crate::management::RuntimeOptions;
@@ -1404,6 +1397,42 @@ mod tests {
         assert!(status.success(), "git {:?} failed", args);
     }
 
+    #[derive(Clone)]
+    struct FailingFactory;
+
+    #[async_trait]
+    impl RuntimeWorkerFactory for FailingFactory {
+        async fn spawn_controller(
+            &self,
+            _request: WorkerExecutionSpawnRequest,
+        ) -> Result<WorkerHandle, String> {
+            Err("spawn failed".to_string())
+        }
+
+        async fn restore_controller(
+            &self,
+            _request: WorkerExecutionRestoreRequest,
+        ) -> Result<WorkerHandle, String> {
+            Err("restore failed".to_string())
+        }
+    }
+
+    #[test]
+    fn adapter_runtime_reports_task_panic() {
+        let backend = WorkerRuntimeExecutionBackend::new(FailingFactory).unwrap();
+
+        let error = backend
+            .run_on_adapter_runtime(async {
+                panic!("adapter boom");
+                #[allow(unreachable_code)]
+                Ok::<(), String>(())
+            })
+            .unwrap_err();
+
+        assert!(error.contains("worker adapter task failed"));
+        assert!(error.contains("adapter boom") || error.contains("panicked"));
+    }
+
     fn create_clean_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         git(dir.path(), &["init"]);
@@ -1430,6 +1459,17 @@ mod tests {
             materializer: MaterializerKind::LocalGitWorktree,
             backend_workdir_id: None,
         }
+    }
+
+    fn materialized_worktree_root(
+        runtime_base: &std::path::Path,
+        working_directory_id: &str,
+    ) -> PathBuf {
+        runtime_base
+            .join("working-directories")
+            .join(working_directory_id)
+            .join("root")
+            .join("repo-main")
     }
 
     #[test]
@@ -1616,5 +1656,118 @@ mod tests {
         assert!(cwd.starts_with(runtime_base.path()));
         assert!(!cwd.starts_with(repo.path()));
         assert!(cwd.join("README.md").exists());
+    }
+
+    #[test]
+    fn stopping_and_deleting_worker_preserves_bound_working_directory() {
+        let client = MockClient::new(simple_text_events());
+        let runtime_base = tempfile::tempdir().unwrap();
+        let repo = create_clean_repo();
+        let store = tempfile::tempdir().unwrap();
+        let factory = MockFactory {
+            client,
+            runtime_base: runtime_base.path().to_path_buf(),
+            cwd: repo.path().to_path_buf(),
+            store_dir: store.path().join("sessions"),
+            worker_metadata_dir: store.path().join("workers"),
+            observed_cwds: Arc::new(Mutex::new(Vec::new())),
+            observed_workspace_clients: Arc::new(Mutex::new(Vec::new())),
+        };
+        let backend = WorkerRuntimeExecutionBackend::new(factory)
+            .unwrap()
+            .with_working_directory_materializer(LocalGitWorktreeMaterializer::new(
+                runtime_base.path(),
+            ));
+        let runtime =
+            EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), Arc::new(backend))
+                .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let mut request = create_request("chat");
+        request.working_directory_request = Some(working_directory_request(repo.path()));
+        let detail = runtime.create_worker(request).unwrap();
+        let workdir_id = detail
+            .execution
+            .working_directory
+            .as_ref()
+            .unwrap()
+            .summary
+            .working_directory_id
+            .clone();
+        let worktree_root = materialized_worktree_root(runtime_base.path(), &workdir_id);
+        assert!(worktree_root.join("README.md").exists());
+
+        runtime.stop_worker(&detail.worker_ref, None).unwrap();
+        runtime.delete_worker(&detail.worker_ref).unwrap();
+
+        assert!(worktree_root.join("README.md").exists());
+        let status = runtime.working_directory(&workdir_id).unwrap();
+        assert_eq!(
+            status.summary.status,
+            crate::catalog::WorkingDirectoryStatusKind::Active
+        );
+        assert_eq!(status.summary.cleanliness.as_deref(), Some("clean"));
+        assert_eq!(status.summary.primary_worker_id, None);
+    }
+
+    #[test]
+    fn spawn_failure_with_existing_working_directory_preserves_workdir() {
+        let runtime_base = tempfile::tempdir().unwrap();
+        let repo = create_clean_repo();
+        let backend = WorkerRuntimeExecutionBackend::new(FailingFactory)
+            .unwrap()
+            .with_working_directory_materializer(LocalGitWorktreeMaterializer::new(
+                runtime_base.path(),
+            ));
+        let runtime =
+            EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), Arc::new(backend))
+                .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let status = runtime
+            .create_working_directory(working_directory_request(repo.path()))
+            .unwrap();
+        let workdir_id = status.summary.working_directory_id.clone();
+        let worktree_root = materialized_worktree_root(runtime_base.path(), &workdir_id);
+        assert!(worktree_root.join("README.md").exists());
+        let mut request = create_request("chat");
+        request.working_directory = Some(WorkingDirectoryClaim {
+            working_directory_id: workdir_id.clone(),
+            relative_cwd: None,
+        });
+
+        let error = runtime.create_worker(request).unwrap_err();
+
+        assert!(format!("{error:?}").contains("spawn failed"));
+        assert!(worktree_root.join("README.md").exists());
+        let status = runtime.working_directory(&workdir_id).unwrap();
+        assert_eq!(
+            status.summary.status,
+            crate::catalog::WorkingDirectoryStatusKind::Active
+        );
+    }
+
+    #[test]
+    fn spawn_failure_with_new_materialization_rolls_back_workdir_record() {
+        let runtime_base = tempfile::tempdir().unwrap();
+        let repo = create_clean_repo();
+        let backend = WorkerRuntimeExecutionBackend::new(FailingFactory)
+            .unwrap()
+            .with_working_directory_materializer(LocalGitWorktreeMaterializer::new(
+                runtime_base.path(),
+            ));
+        let runtime =
+            EmbeddedRuntime::with_execution_backend(RuntimeOptions::default(), Arc::new(backend))
+                .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let mut request = create_request("chat");
+        request.working_directory_request = Some(working_directory_request(repo.path()));
+
+        let error = runtime.create_worker(request).unwrap_err();
+
+        assert!(format!("{error:?}").contains("spawn failed"));
+        let working_directories_root = runtime_base.path().join("working-directories");
+        let remaining_entries = fs::read_dir(working_directories_root)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(remaining_entries, 0);
     }
 }

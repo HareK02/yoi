@@ -237,7 +237,7 @@ enabled = true
 enabled = false
 
 [feature.ticket]
-enabled = false
+enabled = true
 access = "lifecycle"
 
 [feature.ticket_orchestration]
@@ -298,6 +298,8 @@ mod tests {
         assert!(profile.contains("slug = \"default\""));
         assert!(profile.contains("ref = \"codex-oauth/gpt-5.5\""));
         assert!(profile.contains("scope = \"workspace_write\""));
+        assert!(profile.contains("[feature.ticket]\nenabled = true\naccess = \"lifecycle\""));
+        assert!(profile.contains("[feature.ticket_orchestration]\nenabled = false"));
     }
 
     #[test]

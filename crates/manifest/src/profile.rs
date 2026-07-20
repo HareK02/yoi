@@ -895,7 +895,6 @@ fn builtin_profile_artifact(label: &str) -> Option<serde_json::Value> {
                 true,
                 true,
                 false,
-                false,
             );
             Some(value)
         }
@@ -909,7 +908,6 @@ fn builtin_profile_artifact(label: &str) -> Option<serde_json::Value> {
                 true,
                 true,
                 false,
-                true,
                 false,
             );
             Some(value)
@@ -920,7 +918,6 @@ fn builtin_profile_artifact(label: &str) -> Option<serde_json::Value> {
                 "orchestrator",
                 "Ticket orchestrator profile.",
                 "workspace_write",
-                true,
                 true,
                 true,
                 true,
@@ -940,7 +937,6 @@ fn builtin_profile_artifact(label: &str) -> Option<serde_json::Value> {
                 true,
                 false,
                 false,
-                false,
             );
             Some(value)
         }
@@ -953,7 +949,6 @@ fn builtin_profile_artifact(label: &str) -> Option<serde_json::Value> {
                 true,
                 true,
                 true,
-                false,
                 false,
                 false,
             );
@@ -981,7 +976,7 @@ fn builtin_default_profile_artifact() -> serde_json::Value {
             "memory": { "enabled": true },
             "web": { "enabled": true },
             "workers": { "enabled": true },
-            "ticket": { "enabled": false, "access": "lifecycle" },
+            "ticket": { "enabled": true, "access": "lifecycle" },
             "ticket_orchestration": { "enabled": false }
         },
         "memory": {
@@ -1009,19 +1004,16 @@ fn apply_role_profile(
     memory: bool,
     web: bool,
     workers: bool,
-    ticket: bool,
     ticket_orchestration: bool,
 ) {
     value["slug"] = serde_json::Value::String(slug.to_string());
     value["description"] = serde_json::Value::String(description.to_string());
-    value["feature"] = serde_json::json!({
-        "task": { "enabled": task },
-        "memory": { "enabled": memory },
-        "web": { "enabled": web },
-        "workers": { "enabled": workers },
-        "ticket": { "enabled": ticket, "access": "lifecycle" },
-        "ticket_orchestration": { "enabled": ticket_orchestration }
-    });
+    value["feature"]["task"] = serde_json::json!({ "enabled": task });
+    value["feature"]["memory"] = serde_json::json!({ "enabled": memory });
+    value["feature"]["web"] = serde_json::json!({ "enabled": web });
+    value["feature"]["workers"] = serde_json::json!({ "enabled": workers });
+    value["feature"]["ticket_orchestration"] =
+        serde_json::json!({ "enabled": ticket_orchestration });
 }
 
 fn reject_manifest_shaped_profile(value: &serde_json::Value) -> Result<(), ProfileError> {
@@ -1441,12 +1433,13 @@ mod tests {
         let companion = resolve("companion");
         assert!(companion.feature.task.enabled);
         assert!(companion.feature.workers.enabled);
-        assert!(!companion.feature.ticket.enabled);
         assert!(companion.scope.allow.is_empty());
         assert!(companion.scope.deny.is_empty());
         assert!(companion.delegation_scope.allow.is_empty());
         assert_eq!(companion.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
         assert!(companion.web.is_some());
+        assert!(companion.feature.ticket.enabled);
+        assert!(!companion.feature.ticket_orchestration.enabled);
         assert_eq!(
             companion.compaction.as_ref().unwrap().threshold,
             Some(240000)
@@ -1497,11 +1490,14 @@ mod tests {
         assert_eq!(coder.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
         assert!(coder.web.is_some());
         assert!(coder.compaction.is_some());
+        assert!(coder.feature.ticket.enabled);
+        assert!(!coder.feature.ticket_orchestration.enabled);
 
         let reviewer = resolve("reviewer");
         assert!(reviewer.feature.task.enabled);
         assert!(!reviewer.feature.workers.enabled);
-        assert!(!reviewer.feature.ticket.enabled);
+        assert!(reviewer.feature.ticket.enabled);
+        assert!(!reviewer.feature.ticket_orchestration.enabled);
         assert!(reviewer.scope.allow.is_empty());
         assert!(reviewer.delegation_scope.allow.is_empty());
         assert_eq!(reviewer.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
@@ -1761,6 +1757,12 @@ worker_context_max_tokens = 68000
         assert!(resolved.manifest.scope.allow.is_empty());
         assert!(resolved.manifest.delegation_scope.allow.is_empty());
         assert!(resolved.manifest.session.record_event_trace);
+        assert!(resolved.manifest.feature.ticket.enabled);
+        assert_eq!(
+            resolved.manifest.feature.ticket.access,
+            crate::TicketFeatureAccessConfig::Lifecycle
+        );
+        assert!(!resolved.manifest.feature.ticket_orchestration.enabled);
         assert_eq!(
             resolved.profile.as_ref().unwrap().name.as_deref(),
             Some("default")
