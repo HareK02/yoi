@@ -739,6 +739,415 @@ pub struct TicketRelationView {
     pub notices: Vec<TicketRelationNotice>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketWorkspaceActionPriority {
+    ReadyForQueue,
+    ActiveWork,
+    Background,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketWorkspaceNextAction {
+    Clarify,
+    QueueForOrchestrator,
+    Close,
+    WaitForOrchestrator,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketWorkspaceRowKind {
+    Planning,
+    Ticket,
+    Review,
+    ActiveWork,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketWorkspaceStateOverlay {
+    pub source: String,
+    pub workflow_state: TicketWorkflowState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketQueueGuard {
+    pub can_queue_for_orchestrator: bool,
+    pub reason: Option<String>,
+    pub blocked_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketWorkspaceProjection {
+    pub kind: TicketWorkspaceRowKind,
+    pub priority: TicketWorkspaceActionPriority,
+    pub next_action: Option<TicketWorkspaceNextAction>,
+    pub visible_state: String,
+    pub visible_overlay: Option<TicketWorkspaceStateOverlay>,
+    pub disabled_reason: Option<String>,
+    pub key_hint: Option<String>,
+    pub blocked_reason: Option<String>,
+    pub queue_guard: TicketQueueGuard,
+}
+
+pub fn project_ticket_workspace_item(
+    summary: &TicketSummary,
+    relation_blockers: &[TicketRelationBlocker],
+    orchestration_overlay: Option<&TicketWorkspaceStateOverlay>,
+) -> TicketWorkspaceProjection {
+    let visible_overlay = orchestration_overlay
+        .filter(|overlay| {
+            ticket_overlay_state_has_progressed(summary.workflow_state, overlay.workflow_state)
+        })
+        .cloned();
+    let mut projection = derive_ticket_workspace_projection(summary, relation_blockers);
+    if let Some(overlay) = visible_overlay.as_ref() {
+        apply_workspace_overlay_to_projection(&mut projection, summary.workflow_state, overlay);
+    }
+    projection.visible_state =
+        ticket_workspace_state_display(summary.workflow_state, visible_overlay.as_ref());
+    projection.visible_overlay = visible_overlay;
+    projection.queue_guard = ticket_queue_guard(
+        summary,
+        relation_blockers,
+        projection.visible_overlay.as_ref(),
+    );
+    projection
+}
+
+pub fn ticket_queue_guard(
+    summary: &TicketSummary,
+    relation_blockers: &[TicketRelationBlocker],
+    orchestration_overlay: Option<&TicketWorkspaceStateOverlay>,
+) -> TicketQueueGuard {
+    if orchestration_overlay.is_some() {
+        return TicketQueueGuard {
+            can_queue_for_orchestrator: false,
+            reason: Some(
+                "orchestration overlay already shows progress; duplicate queue is suppressed"
+                    .to_string(),
+            ),
+            blocked_reason: None,
+        };
+    }
+    if summary.workflow_state != TicketWorkflowState::Ready {
+        return TicketQueueGuard {
+            can_queue_for_orchestrator: false,
+            reason: Some(format!(
+                "Ticket state is {}; only ready Tickets can be queued for Orchestrator",
+                summary.workflow_state.as_str()
+            )),
+            blocked_reason: None,
+        };
+    }
+    let active_blockers = relation_blockers
+        .iter()
+        .filter(|blocker| !relation_blocker_allows_ready_queue(blocker))
+        .collect::<Vec<_>>();
+    if !active_blockers.is_empty() {
+        let blockers = format_workspace_relation_blockers(&active_blockers);
+        return TicketQueueGuard {
+            can_queue_for_orchestrator: false,
+            reason: Some(format!("waiting for {blockers}")),
+            blocked_reason: Some(blockers),
+        };
+    }
+    TicketQueueGuard {
+        can_queue_for_orchestrator: true,
+        reason: None,
+        blocked_reason: None,
+    }
+}
+
+fn derive_ticket_workspace_projection(
+    summary: &TicketSummary,
+    relation_blockers: &[TicketRelationBlocker],
+) -> TicketWorkspaceProjection {
+    if !relation_blockers.is_empty() {
+        let active_blockers = relation_blockers
+            .iter()
+            .filter(|blocker| !relation_blocker_allows_ready_queue(blocker))
+            .collect::<Vec<_>>();
+        if !active_blockers.is_empty() || summary.workflow_state != TicketWorkflowState::Ready {
+            let blockers_to_report = if active_blockers.is_empty() {
+                relation_blockers.iter().collect::<Vec<_>>()
+            } else {
+                active_blockers
+            };
+            let blockers = format_workspace_relation_blockers(&blockers_to_report);
+            let waiting_reason = format!("waiting for {blockers}");
+            return TicketWorkspaceProjection {
+                kind: workspace_row_kind_for_state(summary.workflow_state),
+                priority: match summary.workflow_state {
+                    TicketWorkflowState::Queued | TicketWorkflowState::InProgress => {
+                        TicketWorkspaceActionPriority::ActiveWork
+                    }
+                    _ => TicketWorkspaceActionPriority::Background,
+                },
+                next_action: Some(TicketWorkspaceNextAction::WaitForOrchestrator),
+                visible_state: summary.workflow_state.as_str().to_string(),
+                visible_overlay: None,
+                disabled_reason: Some(format!(
+                    "Queue disabled: {waiting_reason}. Resolve dependency/blocker before ready -> queued."
+                )),
+                key_hint: Some(format!("Gate: {waiting_reason}")),
+                blocked_reason: Some(blockers),
+                queue_guard: TicketQueueGuard {
+                    can_queue_for_orchestrator: false,
+                    reason: Some(waiting_reason),
+                    blocked_reason: None,
+                },
+            };
+        }
+
+        let blockers = format_workspace_relation_blockers(
+            &relation_blockers
+                .iter()
+                .collect::<Vec<&TicketRelationBlocker>>(),
+        );
+        return TicketWorkspaceProjection {
+            kind: TicketWorkspaceRowKind::Ticket,
+            priority: TicketWorkspaceActionPriority::ReadyForQueue,
+            next_action: Some(TicketWorkspaceNextAction::QueueForOrchestrator),
+            visible_state: summary.workflow_state.as_str().to_string(),
+            visible_overlay: None,
+            disabled_reason: None,
+            key_hint: Some(format!(
+                "Queue allowed: prerequisites are already queued/in progress; Orchestrator will preserve order ({blockers})."
+            )),
+            blocked_reason: None,
+            queue_guard: TicketQueueGuard {
+                can_queue_for_orchestrator: true,
+                reason: None,
+                blocked_reason: None,
+            },
+        };
+    }
+
+    match summary.workflow_state {
+        TicketWorkflowState::Ready => TicketWorkspaceProjection {
+            kind: TicketWorkspaceRowKind::Ticket,
+            priority: TicketWorkspaceActionPriority::ReadyForQueue,
+            next_action: Some(TicketWorkspaceNextAction::QueueForOrchestrator),
+            visible_state: summary.workflow_state.as_str().to_string(),
+            visible_overlay: None,
+            disabled_reason: None,
+            key_hint: Some(
+                "Queue transitions ready -> queued and may notify Orchestrator".to_string(),
+            ),
+            blocked_reason: None,
+            queue_guard: TicketQueueGuard {
+                can_queue_for_orchestrator: true,
+                reason: None,
+                blocked_reason: None,
+            },
+        },
+        TicketWorkflowState::Queued => TicketWorkspaceProjection {
+            kind: TicketWorkspaceRowKind::ActiveWork,
+            priority: TicketWorkspaceActionPriority::ActiveWork,
+            next_action: Some(TicketWorkspaceNextAction::WaitForOrchestrator),
+            visible_state: summary.workflow_state.as_str().to_string(),
+            visible_overlay: None,
+            disabled_reason: Some("Ticket is queued for Orchestrator routing.".to_string()),
+            key_hint: None,
+            blocked_reason: None,
+            queue_guard: TicketQueueGuard {
+                can_queue_for_orchestrator: false,
+                reason: Some("Ticket is already queued for Orchestrator routing".to_string()),
+                blocked_reason: None,
+            },
+        },
+        TicketWorkflowState::InProgress => TicketWorkspaceProjection {
+            kind: TicketWorkspaceRowKind::ActiveWork,
+            priority: TicketWorkspaceActionPriority::ActiveWork,
+            next_action: Some(TicketWorkspaceNextAction::WaitForOrchestrator),
+            visible_state: summary.workflow_state.as_str().to_string(),
+            visible_overlay: None,
+            disabled_reason: Some("Ticket is already in progress.".to_string()),
+            key_hint: None,
+            blocked_reason: None,
+            queue_guard: TicketQueueGuard {
+                can_queue_for_orchestrator: false,
+                reason: Some("Ticket is already in progress".to_string()),
+                blocked_reason: None,
+            },
+        },
+        TicketWorkflowState::Done => TicketWorkspaceProjection {
+            kind: TicketWorkspaceRowKind::Review,
+            priority: TicketWorkspaceActionPriority::Background,
+            next_action: Some(TicketWorkspaceNextAction::Close),
+            visible_state: summary.workflow_state.as_str().to_string(),
+            visible_overlay: None,
+            disabled_reason: Some(
+                "state is done; close if a resolution is still missing.".to_string(),
+            ),
+            key_hint: None,
+            blocked_reason: None,
+            queue_guard: TicketQueueGuard {
+                can_queue_for_orchestrator: false,
+                reason: Some("Ticket is done; close or review instead of queueing".to_string()),
+                blocked_reason: None,
+            },
+        },
+        TicketWorkflowState::Planning => TicketWorkspaceProjection {
+            kind: TicketWorkspaceRowKind::Planning,
+            priority: TicketWorkspaceActionPriority::Background,
+            next_action: Some(TicketWorkspaceNextAction::Clarify),
+            visible_state: summary.workflow_state.as_str().to_string(),
+            visible_overlay: None,
+            disabled_reason: Some(
+                "Ticket is still in planning; mark it ready before queueing.".to_string(),
+            ),
+            key_hint: Some("Planning/Intake helpers can set state = ready".to_string()),
+            blocked_reason: None,
+            queue_guard: TicketQueueGuard {
+                can_queue_for_orchestrator: false,
+                reason: Some("Ticket is still in planning".to_string()),
+                blocked_reason: None,
+            },
+        },
+        TicketWorkflowState::Closed => TicketWorkspaceProjection {
+            kind: TicketWorkspaceRowKind::Review,
+            priority: TicketWorkspaceActionPriority::Background,
+            next_action: Some(TicketWorkspaceNextAction::WaitForOrchestrator),
+            visible_state: summary.workflow_state.as_str().to_string(),
+            visible_overlay: None,
+            disabled_reason: Some("Ticket is closed.".to_string()),
+            key_hint: None,
+            blocked_reason: None,
+            queue_guard: TicketQueueGuard {
+                can_queue_for_orchestrator: false,
+                reason: Some("Ticket is closed".to_string()),
+                blocked_reason: None,
+            },
+        },
+    }
+}
+
+fn workspace_row_kind_for_state(state: TicketWorkflowState) -> TicketWorkspaceRowKind {
+    match state {
+        TicketWorkflowState::Planning => TicketWorkspaceRowKind::Planning,
+        TicketWorkflowState::Queued | TicketWorkflowState::InProgress => {
+            TicketWorkspaceRowKind::ActiveWork
+        }
+        TicketWorkflowState::Done | TicketWorkflowState::Closed => TicketWorkspaceRowKind::Review,
+        TicketWorkflowState::Ready => TicketWorkspaceRowKind::Ticket,
+    }
+}
+
+fn apply_workspace_overlay_to_projection(
+    projection: &mut TicketWorkspaceProjection,
+    local: TicketWorkflowState,
+    overlay: &TicketWorkspaceStateOverlay,
+) {
+    projection.next_action = Some(TicketWorkspaceNextAction::WaitForOrchestrator);
+    let overlay_state = overlay.workflow_state.as_str();
+    match overlay.workflow_state {
+        TicketWorkflowState::Done | TicketWorkflowState::Closed => {
+            projection.kind = TicketWorkspaceRowKind::Review;
+            projection.priority = TicketWorkspaceActionPriority::Background;
+            projection.disabled_reason = Some(format!(
+                "{} worktree overlay shows Ticket state {overlay_state}; local state remains {} until merge/review/close authority updates the current branch.",
+                overlay.source,
+                local.as_str()
+            ));
+            projection.key_hint = Some(format!(
+                "Merge pending: local: {} · {}: {overlay_state}",
+                local.as_str(),
+                overlay.source
+            ));
+        }
+        TicketWorkflowState::InProgress | TicketWorkflowState::Queued => {
+            projection.kind = TicketWorkspaceRowKind::ActiveWork;
+            projection.priority = TicketWorkspaceActionPriority::ActiveWork;
+            projection.disabled_reason = Some(format!(
+                "{} worktree overlay shows Ticket state {overlay_state}; local state remains {} and duplicate queue/start actions are suppressed.",
+                overlay.source,
+                local.as_str()
+            ));
+            projection.key_hint = Some(format!(
+                "Progress overlay: local: {} · {}: {overlay_state}",
+                local.as_str(),
+                overlay.source
+            ));
+        }
+        TicketWorkflowState::Planning | TicketWorkflowState::Ready => {}
+    }
+}
+
+fn ticket_workspace_state_display(
+    local: TicketWorkflowState,
+    overlay: Option<&TicketWorkspaceStateOverlay>,
+) -> String {
+    match overlay {
+        Some(overlay) => format!(
+            "{}→{}",
+            compact_ticket_state_label(local),
+            compact_ticket_state_label(overlay.workflow_state)
+        ),
+        None => local.as_str().to_string(),
+    }
+}
+
+fn ticket_overlay_state_has_progressed(
+    local: TicketWorkflowState,
+    overlay: TicketWorkflowState,
+) -> bool {
+    workflow_state_progress_rank(overlay) > workflow_state_progress_rank(local)
+}
+
+fn workflow_state_progress_rank(state: TicketWorkflowState) -> u8 {
+    match state {
+        TicketWorkflowState::Planning => 0,
+        TicketWorkflowState::Ready => 1,
+        TicketWorkflowState::Queued => 2,
+        TicketWorkflowState::InProgress => 3,
+        TicketWorkflowState::Done => 4,
+        TicketWorkflowState::Closed => 5,
+    }
+}
+
+fn compact_ticket_state_label(state: TicketWorkflowState) -> &'static str {
+    match state {
+        TicketWorkflowState::Planning => "plan",
+        TicketWorkflowState::Ready => "ready",
+        TicketWorkflowState::Queued => "q",
+        TicketWorkflowState::InProgress => "prog",
+        TicketWorkflowState::Done => "done",
+        TicketWorkflowState::Closed => "cls",
+    }
+}
+
+fn relation_blocker_allows_ready_queue(blocker: &TicketRelationBlocker) -> bool {
+    matches!(
+        blocker.blocking_state,
+        TicketWorkflowState::Queued | TicketWorkflowState::InProgress
+    )
+}
+
+fn format_workspace_relation_blockers(blockers: &[&TicketRelationBlocker]) -> String {
+    let shown_blockers = blockers.iter().take(3).count();
+    let mut formatted = blockers
+        .iter()
+        .take(3)
+        .map(|blocker| {
+            format!(
+                "{} via {} (state: {})",
+                blocker.blocking_ticket,
+                blocker.reason_kind,
+                blocker.blocking_state.as_str()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining_blockers = blockers.len().saturating_sub(shown_blockers);
+    if remaining_blockers > 0 {
+        formatted.push_str(&format!(" (+{remaining_blockers} more)"));
+    }
+    formatted
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrchestrationPlanKind {
@@ -3960,6 +4369,108 @@ mod tests {
 
     fn backend(dir: &TempDir) -> LocalTicketBackend {
         LocalTicketBackend::new(dir.path().join("tickets"))
+    }
+
+    fn summary_with_state(state: TicketWorkflowState) -> TicketSummary {
+        TicketSummary {
+            id: "000TEST".to_string(),
+            slug: "000TEST".to_string(),
+            title: "Test Ticket".to_string(),
+            status: ExtensibleTicketStatus::Open,
+            kind: "ticket".to_string(),
+            priority: "P2".to_string(),
+            labels: Vec::new(),
+            readiness: None,
+            workflow_state: state,
+            workflow_state_explicit: true,
+            queued_by: None,
+            queued_at: None,
+            updated_at: Some("2026-07-20T00:00:00Z".to_string()),
+        }
+    }
+
+    fn blocker_with_state(state: TicketWorkflowState) -> TicketRelationBlocker {
+        TicketRelationBlocker {
+            blocking_ticket: "000BLOCK".to_string(),
+            reason_kind: "depends_on".to_string(),
+            relation_kind: TicketRelationKind::DependsOn,
+            note: None,
+            blocking_state: state,
+        }
+    }
+
+    #[test]
+    fn workspace_projection_queues_ready_ticket_for_orchestrator() {
+        let summary = summary_with_state(TicketWorkflowState::Ready);
+        let projection = project_ticket_workspace_item(&summary, &[], None);
+
+        assert_eq!(projection.kind, TicketWorkspaceRowKind::Ticket);
+        assert_eq!(
+            projection.priority,
+            TicketWorkspaceActionPriority::ReadyForQueue
+        );
+        assert_eq!(
+            projection.next_action,
+            Some(TicketWorkspaceNextAction::QueueForOrchestrator)
+        );
+        assert!(projection.queue_guard.can_queue_for_orchestrator);
+        assert!(projection.disabled_reason.is_none());
+    }
+
+    #[test]
+    fn workspace_projection_blocks_ready_queue_on_unstarted_dependency() {
+        let summary = summary_with_state(TicketWorkflowState::Ready);
+        let blockers = [blocker_with_state(TicketWorkflowState::Planning)];
+        let projection = project_ticket_workspace_item(&summary, &blockers, None);
+
+        assert_eq!(projection.kind, TicketWorkspaceRowKind::Ticket);
+        assert_eq!(
+            projection.next_action,
+            Some(TicketWorkspaceNextAction::WaitForOrchestrator)
+        );
+        assert!(!projection.queue_guard.can_queue_for_orchestrator);
+        assert!(projection.blocked_reason.is_some());
+        assert!(projection.disabled_reason.is_some());
+    }
+
+    #[test]
+    fn workspace_projection_allows_ready_queue_when_dependency_is_already_queued() {
+        let summary = summary_with_state(TicketWorkflowState::Ready);
+        let blockers = [blocker_with_state(TicketWorkflowState::Queued)];
+        let projection = project_ticket_workspace_item(&summary, &blockers, None);
+
+        assert_eq!(
+            projection.next_action,
+            Some(TicketWorkspaceNextAction::QueueForOrchestrator)
+        );
+        assert!(projection.queue_guard.can_queue_for_orchestrator);
+        assert!(projection.blocked_reason.is_none());
+        assert!(
+            projection
+                .key_hint
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Orchestrator will preserve order")
+        );
+    }
+
+    #[test]
+    fn workspace_projection_overlay_suppresses_duplicate_queue() {
+        let summary = summary_with_state(TicketWorkflowState::Ready);
+        let overlay = TicketWorkspaceStateOverlay {
+            source: "orchestration".to_string(),
+            workflow_state: TicketWorkflowState::InProgress,
+        };
+        let projection = project_ticket_workspace_item(&summary, &[], Some(&overlay));
+
+        assert_eq!(projection.kind, TicketWorkspaceRowKind::ActiveWork);
+        assert_eq!(
+            projection.next_action,
+            Some(TicketWorkspaceNextAction::WaitForOrchestrator)
+        );
+        assert_eq!(projection.visible_state, "ready→prog");
+        assert!(!projection.queue_guard.can_queue_for_orchestrator);
+        assert!(projection.visible_overlay.is_some());
     }
 
     #[test]
