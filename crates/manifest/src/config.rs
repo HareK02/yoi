@@ -19,8 +19,8 @@ use crate::plugin::PluginConfig;
 use crate::{
     CompactionConfig, EngineManifest, FeatureConfig, FeatureFlagConfig, FileUploadLimits,
     McpConfig, McpEnvValue, McpStdioCwdPolicy, MemoryConfig, ScopeConfig, SessionConfig,
-    SkillsConfig, TicketFeatureAccessConfig, TicketFeatureConfig, ToolOutputLimits,
-    ToolPermissionConfig, ToolPermissionRule, WebConfig, WorkerManifest, WorkerMeta,
+    SkillsConfig, TicketFeatureConfig, ToolOutputLimits, ToolPermissionConfig, ToolPermissionRule,
+    WebConfig, WorkerManifest, WorkerMeta,
 };
 
 /// Partial-form Worker manifest. Every field is optional; one or more
@@ -87,8 +87,6 @@ pub struct FeatureConfigPartial {
     #[serde(default)]
     pub ticket: Option<TicketFeatureConfigPartial>,
     #[serde(default)]
-    pub ticket_orchestration: Option<FeatureFlagConfigPartial>,
-    #[serde(default)]
     pub plugins: Option<FeatureFlagConfigPartial>,
 }
 
@@ -100,11 +98,6 @@ impl FeatureConfigPartial {
             web: merge_option(self.web, other.web, FeatureFlagConfigPartial::merge),
             workers: merge_option(self.workers, other.workers, FeatureFlagConfigPartial::merge),
             ticket: merge_option(self.ticket, other.ticket, TicketFeatureConfigPartial::merge),
-            ticket_orchestration: merge_option(
-                self.ticket_orchestration,
-                other.ticket_orchestration,
-                FeatureFlagConfigPartial::merge,
-            ),
             plugins: merge_option(self.plugins, other.plugins, FeatureFlagConfigPartial::merge),
         }
     }
@@ -124,19 +117,24 @@ impl FeatureFlagConfigPartial {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
 pub struct TicketFeatureConfigPartial {
-    #[serde(default)]
     pub enabled: Option<bool>,
-    #[serde(default)]
-    pub access: Option<TicketFeatureAccessConfig>,
+    pub authoring: Option<bool>,
+    pub thread: Option<bool>,
+    pub intake: Option<bool>,
+    pub orchestration_control: Option<bool>,
 }
 
 impl TicketFeatureConfigPartial {
     fn merge(self, other: Self) -> Self {
         Self {
             enabled: other.enabled.or(self.enabled),
-            access: other.access.or(self.access),
+            authoring: other.authoring.or(self.authoring),
+            thread: other.thread.or(self.thread),
+            intake: other.intake.or(self.intake),
+            orchestration_control: other.orchestration_control.or(self.orchestration_control),
         }
     }
 }
@@ -157,10 +155,6 @@ impl From<FeatureConfigPartial> for FeatureConfig {
             ticket: value
                 .ticket
                 .map(TicketFeatureConfig::from)
-                .unwrap_or_default(),
-            ticket_orchestration: value
-                .ticket_orchestration
-                .map(FeatureFlagConfig::from)
                 .unwrap_or_default(),
             plugins: value
                 .plugins
@@ -190,7 +184,10 @@ impl From<TicketFeatureConfigPartial> for TicketFeatureConfig {
     fn from(value: TicketFeatureConfigPartial) -> Self {
         Self {
             enabled: value.enabled.unwrap_or_default(),
-            access: value.access.unwrap_or_default(),
+            authoring: value.authoring.unwrap_or_default(),
+            thread: value.thread.unwrap_or_default(),
+            intake: value.intake.unwrap_or_default(),
+            orchestration_control: value.orchestration_control.unwrap_or_default(),
         }
     }
 }
@@ -199,7 +196,10 @@ impl From<TicketFeatureConfig> for TicketFeatureConfigPartial {
     fn from(value: TicketFeatureConfig) -> Self {
         Self {
             enabled: Some(value.enabled),
-            access: Some(value.access),
+            authoring: Some(value.authoring),
+            thread: Some(value.thread),
+            intake: Some(value.intake),
+            orchestration_control: Some(value.orchestration_control),
         }
     }
 }
@@ -212,7 +212,6 @@ impl From<FeatureConfig> for FeatureConfigPartial {
             web: Some(value.web.into()),
             workers: Some(value.workers.into()),
             ticket: Some(value.ticket.into()),
-            ticket_orchestration: Some(value.ticket_orchestration.into()),
             plugins: Some(value.plugins.into()),
         }
     }
@@ -1758,7 +1757,6 @@ worker_max_turns = 7
         assert!(!manifest.feature.web.enabled);
         assert!(!manifest.feature.workers.enabled);
         assert!(!manifest.feature.ticket.enabled);
-        assert!(!manifest.feature.ticket_orchestration.enabled);
     }
 
     #[test]
@@ -1770,10 +1768,10 @@ enabled = true
 
 [feature.ticket]
 enabled = true
-access = "read_only"
-
-[feature.ticket_orchestration]
-enabled = true
+authoring = false
+thread = false
+intake = false
+orchestration_control = false
 "#,
         )
         .unwrap();
@@ -1803,11 +1801,10 @@ enabled = true
             .unwrap();
         assert!(manifest.feature.task.enabled);
         assert!(manifest.feature.ticket.enabled);
-        assert_eq!(
-            manifest.feature.ticket.access,
-            TicketFeatureAccessConfig::ReadOnly
-        );
-        assert!(manifest.feature.ticket_orchestration.enabled);
+        assert!(!manifest.feature.ticket.authoring);
+        assert!(!manifest.feature.ticket.thread);
+        assert!(!manifest.feature.ticket.intake);
+        assert!(!manifest.feature.ticket.orchestration_control);
         assert!(!manifest.feature.memory.enabled);
     }
 
@@ -1820,14 +1817,18 @@ enabled = true
 
 [feature.ticket]
 enabled = true
-access = "read_only"
+authoring = false
+thread = false
+intake = false
+orchestration_control = false
 "#,
         )
         .unwrap();
         let upper = WorkerManifestConfig::from_toml(
             r#"
 [feature.ticket]
-access = "lifecycle"
+thread = true
+orchestration_control = true
 
 [feature.web]
 enabled = true
@@ -1861,10 +1862,10 @@ enabled = true
             .unwrap();
         assert!(manifest.feature.memory.enabled);
         assert!(manifest.feature.ticket.enabled);
-        assert_eq!(
-            manifest.feature.ticket.access,
-            TicketFeatureAccessConfig::Lifecycle
-        );
+        assert!(!manifest.feature.ticket.authoring);
+        assert!(manifest.feature.ticket.thread);
+        assert!(!manifest.feature.ticket.intake);
+        assert!(manifest.feature.ticket.orchestration_control);
         assert!(manifest.feature.web.enabled);
         assert!(!manifest.feature.workers.enabled);
     }

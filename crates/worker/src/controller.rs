@@ -4,7 +4,6 @@ use std::sync::atomic::Ordering;
 
 use llm_engine::EngineError;
 use llm_engine::llm_client::client::LlmClient;
-use manifest::TicketFeatureAccessConfig;
 use session_store::WorkerMetadataStore;
 use session_store::{LogEntry, Store};
 use ticket::LocalTicketBackend;
@@ -547,9 +546,7 @@ fn install_ticket_event_companion_notify_hook<C, St>(
     }
 
     let ticket_feature = &worker.manifest().feature.ticket;
-    if !ticket_feature.enabled
-        || !matches!(ticket_feature.access, TicketFeatureAccessConfig::Lifecycle)
-    {
+    if !ticket_feature.enabled || !ticket_feature.orchestration_control {
         return;
     }
 
@@ -674,14 +671,12 @@ where
     if feature_config.task.enabled {
         feature_registry.add_module(task_feature);
     }
-    if feature_config.ticket.enabled || feature_config.ticket_orchestration.enabled {
-        let ticket_access = match feature_config.ticket.access {
-            TicketFeatureAccessConfig::ReadOnly => {
-                crate::feature::builtin::ticket::TicketFeatureAccess::ReadOnly
-            }
-            TicketFeatureAccessConfig::Lifecycle => {
-                crate::feature::builtin::ticket::TicketFeatureAccess::Lifecycle
-            }
+    if feature_config.ticket.enabled {
+        let ticket_access = crate::feature::builtin::ticket::TicketFeatureAccess {
+            authoring: feature_config.ticket.authoring,
+            thread: feature_config.ticket.thread,
+            intake: feature_config.ticket.intake,
+            orchestration_control: feature_config.ticket.orchestration_control,
         };
         // Ticket tools are typed operations over the current workspace Ticket backend.
         // Runtime-hosted Workers prefer the workspace API URI carried by the
@@ -710,10 +705,9 @@ where
             }
         };
         feature_registry.add_module(
-            crate::feature::builtin::ticket::ticket_tools_feature_with_options(
+            crate::feature::builtin::ticket::ticket_tools_feature_with_backend(
                 ticket_backend,
-                feature_config.ticket.enabled.then_some(ticket_access),
-                feature_config.ticket_orchestration.enabled,
+                ticket_access,
             ),
         );
     }

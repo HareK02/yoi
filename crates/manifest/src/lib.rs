@@ -115,8 +115,6 @@ pub struct FeatureConfig {
     #[serde(default)]
     pub ticket: TicketFeatureConfig,
     #[serde(default)]
-    pub ticket_orchestration: FeatureFlagConfig,
-    #[serde(default)]
     pub plugins: FeatureFlagConfig,
 }
 
@@ -128,7 +126,6 @@ impl Default for FeatureConfig {
             web: FeatureFlagConfig::disabled(),
             workers: FeatureFlagConfig::disabled(),
             ticket: TicketFeatureConfig::default(),
-            ticket_orchestration: FeatureFlagConfig::disabled(),
             plugins: FeatureFlagConfig::disabled(),
         }
     }
@@ -156,37 +153,18 @@ impl Default for FeatureFlagConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TicketFeatureConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Which non-orchestration Ticket surface to expose when `enabled = true`.
-    /// Orchestration-plan/relation tools are controlled independently by
-    /// `[feature.ticket_orchestration].enabled`.
     #[serde(default)]
-    pub access: TicketFeatureAccessConfig,
-}
-
-impl Default for TicketFeatureConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            access: TicketFeatureAccessConfig::Lifecycle,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TicketFeatureAccessConfig {
-    ReadOnly,
-    Lifecycle,
-}
-
-impl Default for TicketFeatureAccessConfig {
-    fn default() -> Self {
-        Self::Lifecycle
-    }
+    pub authoring: bool,
+    #[serde(default)]
+    pub thread: bool,
+    #[serde(default)]
+    pub intake: bool,
+    #[serde(default)]
+    pub orchestration_control: bool,
 }
 
 /// External Agent Skills (`SKILL.md`) ingest configuration. Skills are

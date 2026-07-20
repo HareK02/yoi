@@ -26,8 +26,7 @@ feature = {
     memory = { enabled = true; };
     web = { enabled = true; };
     workers = { enabled = true; };
-    ticket = { enabled = true; access = "lifecycle"; };
-    ticket_orchestration = { enabled = false; };
+    ticket = { enabled = true; authoring = true; thread = true; };
 };
 
 memory = {

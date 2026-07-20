@@ -11,8 +11,9 @@ use ticket::config::{
 };
 use ticket::{
     LocalTicketBackend, MarkdownText, NewTicket, NewTicketEvent, NewTicketRelation, TicketBackend,
-    TicketDoctorSeverity, TicketEventKind, TicketFilter, TicketIdOrSlug, TicketIntakeSummary,
-    TicketRelationKind, TicketReview, TicketReviewResult, TicketSummary, TicketWorkflowState,
+    TicketDoctorSeverity, TicketEventKind, TicketIdOrSlug, TicketIntakeSummary, TicketListQuery,
+    TicketListState, TicketRelationKind, TicketReview, TicketReviewResult, TicketSummary,
+    TicketWorkflowState,
 };
 
 const DEFAULT_LIST_LIMIT: usize = 50;
@@ -45,15 +46,11 @@ pub struct CreateOptions {
     pub title: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListState {
-    Planning,
-    Ready,
-    Queued,
-    InProgress,
-    Done,
-    Closed,
+    Active,
     All,
+    States(Vec<TicketListState>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,13 +378,9 @@ fn list(
     options: ListOptions,
 ) -> Result<TicketCliOutput, TicketCliError> {
     let filter = match options.state {
-        ListState::Planning => TicketFilter::state(TicketWorkflowState::Planning),
-        ListState::Ready => TicketFilter::state(TicketWorkflowState::Ready),
-        ListState::Queued => TicketFilter::state(TicketWorkflowState::Queued),
-        ListState::InProgress => TicketFilter::state(TicketWorkflowState::InProgress),
-        ListState::Done => TicketFilter::state(TicketWorkflowState::Done),
-        ListState::Closed => TicketFilter::state(TicketWorkflowState::Closed),
-        ListState::All => TicketFilter::all(),
+        ListState::Active => TicketListQuery::active(),
+        ListState::All => TicketListQuery::all(),
+        ListState::States(states) => TicketListQuery::states(states),
     };
     let tickets = backend.list(filter)?;
     let count = tickets.len();
@@ -750,7 +743,7 @@ fn parse_create(args: &[String]) -> Result<CreateOptions, TicketCliError> {
 }
 
 fn parse_list(args: &[String]) -> Result<ListOptions, TicketCliError> {
-    let mut state = ListState::All;
+    let mut state = ListState::Active;
     let mut limit = None;
     let mut i = 0;
     while i < args.len() {
@@ -1042,17 +1035,42 @@ fn option_with_value(
     Ok(None)
 }
 
-fn parse_list_state(value: &str) -> Result<ListState, TicketCliError> {
-    match value {
-        "planning" => Ok(ListState::Planning),
-        "ready" => Ok(ListState::Ready),
-        "queued" => Ok(ListState::Queued),
-        "inprogress" => Ok(ListState::InProgress),
-        "done" => Ok(ListState::Done),
-        "closed" => Ok(ListState::Closed),
-        "all" => Ok(ListState::All),
-        _ => Err(TicketCliError::new(format!("invalid state: {value}"))),
+fn parse_list_state(raw: &str) -> Result<ListState, TicketCliError> {
+    let tokens = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return Err(TicketCliError::new("--state must not be empty"));
     }
+    if tokens.len() == 1 {
+        match tokens[0] {
+            "active" => return Ok(ListState::Active),
+            "all" => return Ok(ListState::All),
+            _ => {}
+        }
+    } else if tokens
+        .iter()
+        .any(|token| *token == "active" || *token == "all")
+    {
+        return Err(TicketCliError::new(
+            "--state active/all cannot be mixed with workflow states",
+        ));
+    }
+
+    let mut states = Vec::new();
+    for token in tokens {
+        let state = TicketListState::parse(token).ok_or_else(|| {
+            TicketCliError::new(format!(
+                "invalid state: {token}; expected active, all, planning, ready, queued, inprogress, done, closed"
+            ))
+        })?;
+        if !states.contains(&state) {
+            states.push(state);
+        }
+    }
+    Ok(ListState::States(states))
 }
 
 fn parse_list_limit(value: &str) -> Result<usize, TicketCliError> {
@@ -1148,7 +1166,7 @@ fn default_author() -> String {
 }
 
 fn help_text() -> &'static str {
-    "yoi ticket\n\nUsage:\n  yoi ticket init\n  yoi ticket create --title <title>\n  yoi ticket list [--state planning|ready|queued|inprogress|done|closed|all] [--limit <n>]\n  yoi ticket show <id>\n  yoi ticket comment <id> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket review <id> (--approve|--request-changes) (--file <path>|--message <text>)\n  yoi ticket state <id> <planning|ready|queued|inprogress|done|closed>\n  yoi ticket close <id> (--resolution <text>|--file <path>)\n  yoi ticket relation add --ticket <id> --kind <depends_on|blocks|related|supersedes|duplicate_of> --target <id> [--note <text>]\n  yoi ticket relation list [--ticket <id>] [--kind <kind>]\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  `yoi ticket init` writes explicit fixed role profiles and optional [ticket].language into .yoi/workspace.toml.\n  Uses workspace Ticket settings from .yoi/workspace.toml [ticket] when present; .yoi/ticket.config.toml is a read-only migration fallback only.\n  Supported provider: builtin:yoi_local.\n  Without configured Ticket settings, the local backend root is <cwd>/.yoi/tickets.\n"
+    "yoi ticket\n\nUsage:\n  yoi ticket init\n  yoi ticket create --title <title>\n  yoi ticket list [--state active|all|planning|ready|queued|inprogress|done|closed[,..]] [--limit <n>]\n  yoi ticket show <id>\n  yoi ticket comment <id> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket review <id> (--approve|--request-changes) (--file <path>|--message <text>)\n  yoi ticket state <id> <planning|ready|queued|inprogress|done|closed>\n  yoi ticket close <id> (--resolution <text>|--file <path>)\n  yoi ticket relation add --ticket <id> --kind <depends_on|blocks|related|supersedes|duplicate_of> --target <id> [--note <text>]\n  yoi ticket relation list [--ticket <id>] [--kind <kind>]\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  `yoi ticket init` writes explicit fixed role profiles and optional [ticket].language into .yoi/workspace.toml.\n  Uses workspace Ticket settings from .yoi/workspace.toml [ticket] when present; .yoi/ticket.config.toml is a read-only migration fallback only.\n  Supported provider: builtin:yoi_local.\n  Without configured Ticket settings, the local backend root is <cwd>/.yoi/tickets.\n"
 }
 
 #[cfg(test)]
@@ -1531,6 +1549,29 @@ mod tests {
         let cli = parse_ticket_args(&args(&["state", &ticket_id, "closed"])).unwrap();
         let err = run_in_workspace(cli, temp.path()).unwrap_err();
         assert!(err.to_string().contains("use `yoi ticket close"));
+    }
+
+    #[test]
+    fn ticket_cli_list_defaults_to_active_and_accepts_multi_state_filter() {
+        let default = parse_ticket_args(&args(&["list"])).unwrap();
+        match default {
+            TicketCli::Command(TicketCommand::List(options)) => {
+                assert_eq!(options.state, ListState::Active)
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let explicit = parse_ticket_args(&args(&["list", "--state", "planning,closed"])).unwrap();
+        match explicit {
+            TicketCli::Command(TicketCommand::List(options)) => assert_eq!(
+                options.state,
+                ListState::States(vec![TicketListState::Planning, TicketListState::Closed])
+            ),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let mixed = parse_ticket_args(&args(&["list", "--state", "active,planning"])).unwrap_err();
+        assert!(mixed.to_string().contains("cannot be mixed"));
     }
 
     #[test]

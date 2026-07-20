@@ -10,16 +10,11 @@ use ticket::{
     LocalTicketBackend, MarkdownText, NewOrchestrationPlanRecord, NewTicket, NewTicketEvent,
     NewTicketRelation, OrchestrationPlanKind, OrchestrationPlanRecord, Result as TicketResult,
     Ticket, TicketBackend, TicketBackendHttpResponse, TicketBackendOperation,
-    TicketBackendOperationResult, TicketDoctorReport, TicketError, TicketFilter, TicketIdOrSlug,
-    TicketIntakeSummary, TicketRef, TicketRelation, TicketRelationKind, TicketRelationView,
-    TicketReview, TicketStateChange, TicketSummary,
+    TicketBackendOperationResult, TicketDoctorReport, TicketError, TicketIdOrSlug,
+    TicketIntakeSummary, TicketListQuery, TicketRef, TicketRelation, TicketRelationKind,
+    TicketRelationView, TicketReview, TicketStateChange, TicketSummary,
     config::{DEFAULT_TICKET_BACKEND_RELATIVE_PATH, TicketConfig},
-    tool::{
-        TICKET_BASE_READ_ONLY_TOOL_NAMES, TICKET_BASE_TOOL_NAMES,
-        TICKET_ORCHESTRATION_READ_ONLY_TOOL_NAMES, TICKET_ORCHESTRATION_TOOL_NAMES,
-        TICKET_READ_ONLY_TOOL_NAMES, TICKET_TOOL_NAMES, TicketToolBackend, ticket_tool_description,
-        ticket_tools,
-    },
+    tool::{TICKET_TOOL_NAMES, TicketToolBackend, ticket_tool_description, ticket_tools},
 };
 
 use crate::feature::{
@@ -32,29 +27,145 @@ const FEATURE_NAME: &str = "Ticket tools";
 const FEATURE_DESCRIPTION: &str = "Typed local Ticket work-item operations over a bounded backend root. \
 The tools operate through the ticket crate backend and do not grant generic filesystem write scope.";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TicketFeatureAccess {
-    /// Status/diagnostic access for views such as Companion that must not mutate Tickets.
-    ReadOnly,
-    /// Full Ticket lifecycle access, including the read-only tools and all mutating Ticket tools.
-    Lifecycle,
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TicketFeatureAccess {
+    pub authoring: bool,
+    pub thread: bool,
+    pub intake: bool,
+    pub orchestration_control: bool,
 }
 
 impl TicketFeatureAccess {
-    pub fn base_tool_names(self) -> &'static [&'static str] {
-        match self {
-            Self::ReadOnly => &TICKET_BASE_READ_ONLY_TOOL_NAMES,
-            Self::Lifecycle => &TICKET_BASE_TOOL_NAMES,
+    pub const fn read_only() -> Self {
+        Self {
+            authoring: false,
+            thread: false,
+            intake: false,
+            orchestration_control: false,
         }
     }
 
-    pub fn orchestration_tool_names(self) -> &'static [&'static str] {
-        match self {
-            Self::ReadOnly => &TICKET_ORCHESTRATION_READ_ONLY_TOOL_NAMES,
-            Self::Lifecycle => &TICKET_ORCHESTRATION_TOOL_NAMES,
+    pub const fn workspace_authoring() -> Self {
+        Self {
+            authoring: true,
+            thread: true,
+            intake: false,
+            orchestration_control: false,
         }
     }
+
+    pub const fn intake() -> Self {
+        Self {
+            authoring: true,
+            thread: true,
+            intake: true,
+            orchestration_control: false,
+        }
+    }
+
+    pub const fn orchestration_control() -> Self {
+        Self {
+            authoring: false,
+            thread: true,
+            intake: false,
+            orchestration_control: true,
+        }
+    }
+
+    pub const fn work_report() -> Self {
+        Self {
+            authoring: false,
+            thread: true,
+            intake: false,
+            orchestration_control: false,
+        }
+    }
+
+    pub const fn review() -> Self {
+        Self {
+            authoring: false,
+            thread: true,
+            intake: false,
+            orchestration_control: false,
+        }
+    }
+
+    pub fn tool_names(self) -> Vec<&'static str> {
+        TICKET_TOOL_NAMES
+            .iter()
+            .copied()
+            .filter(|name| self.allows_tool(name))
+            .collect()
+    }
+
+    fn allows_tool(self, name: &str) -> bool {
+        READ_ONLY_TOOL_NAMES.contains(&name)
+            || (self.authoring && AUTHORING_TOOL_NAMES.contains(&name))
+            || (self.thread && THREAD_TOOL_NAMES.contains(&name))
+            || (self.intake && INTAKE_TOOL_NAMES.contains(&name))
+            || (self.orchestration_control
+                && ORCHESTRATION_CONTROL_ADDITIONAL_TOOL_NAMES.contains(&name))
+    }
 }
+
+const READ_ONLY_TOOL_NAMES: &[&str] = &[
+    "TicketList",
+    "TicketShow",
+    "TicketDependencyCheck",
+    "TicketDoctor",
+    "TicketRelationQuery",
+    "TicketOrchestrationPlanQuery",
+];
+
+const AUTHORING_TOOL_NAMES: &[&str] = &[
+    "TicketCreate",
+    "TicketEditItem",
+    "TicketQueue",
+    "TicketClose",
+    "TicketRelationRecord",
+];
+
+const THREAD_TOOL_NAMES: &[&str] = &["TicketComment", "TicketReview"];
+
+const INTAKE_TOOL_NAMES: &[&str] = &["TicketIntakeReady"];
+
+const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
+    "TicketCreate",
+    "TicketEditItem",
+    "TicketList",
+    "TicketShow",
+    "TicketComment",
+    "TicketReview",
+    "TicketQueue",
+    "TicketClose",
+    "TicketDependencyCheck",
+    "TicketDoctor",
+    "TicketRelationRecord",
+    "TicketRelationQuery",
+    "TicketOrchestrationPlanQuery",
+];
+
+const ORCHESTRATION_CONTROL_TOOL_NAMES: &[&str] = &[
+    "TicketList",
+    "TicketShow",
+    "TicketComment",
+    "TicketReview",
+    "TicketWorkflowState",
+    "TicketClose",
+    "TicketDependencyCheck",
+    "TicketDoctor",
+    "TicketRelationRecord",
+    "TicketRelationQuery",
+    "TicketOrchestrationPlanRecord",
+    "TicketOrchestrationPlanQuery",
+];
+
+const ORCHESTRATION_CONTROL_ADDITIONAL_TOOL_NAMES: &[&str] = &[
+    "TicketWorkflowState",
+    "TicketClose",
+    "TicketRelationRecord",
+    "TicketOrchestrationPlanRecord",
+];
 
 #[derive(Clone, Debug)]
 pub enum TicketFeatureBackend {
@@ -96,94 +207,59 @@ pub struct TicketFeature {
     record_language: Option<String>,
     config_error: Option<String>,
     access: TicketFeatureAccess,
-    include_base_tools: bool,
-    include_orchestration_tools: bool,
 }
 
 impl TicketFeature {
     pub fn new(backend_root: impl Into<PathBuf>) -> Self {
-        Self::new_with_access(backend_root, TicketFeatureAccess::Lifecycle)
+        Self::new_with_access(backend_root, TicketFeatureAccess::workspace_authoring())
     }
 
     pub fn new_with_access(backend_root: impl Into<PathBuf>, access: TicketFeatureAccess) -> Self {
-        Self::new_with_options(backend_root, Some(access), true)
-    }
-
-    pub fn new_with_options(
-        backend_root: impl Into<PathBuf>,
-        access: Option<TicketFeatureAccess>,
-        include_orchestration_tools: bool,
-    ) -> Self {
         Self::with_backend(
             TicketFeatureBackend::Local {
                 root: backend_root.into(),
             },
             access,
-            include_orchestration_tools,
         )
     }
 
-    pub fn with_backend(
-        backend: TicketFeatureBackend,
-        access: Option<TicketFeatureAccess>,
-        include_orchestration_tools: bool,
-    ) -> Self {
+    pub fn with_backend(backend: TicketFeatureBackend, access: TicketFeatureAccess) -> Self {
         if let TicketFeatureBackend::LocalWorkspace { workspace_root } = backend {
-            return Self::for_workspace_with_options(
-                workspace_root,
-                access,
-                include_orchestration_tools,
-            );
+            return Self::for_workspace_with_access(workspace_root, access);
         }
         Self {
             backend,
             record_language: None,
             config_error: None,
-            access: access.unwrap_or(TicketFeatureAccess::Lifecycle),
-            include_base_tools: access.is_some(),
-            include_orchestration_tools,
+            access,
         }
     }
 
     pub fn for_workspace(workspace: impl AsRef<Path>) -> Self {
-        Self::for_workspace_with_access(workspace, TicketFeatureAccess::Lifecycle)
+        Self::for_workspace_with_access(workspace, TicketFeatureAccess::workspace_authoring())
     }
 
     pub fn for_workspace_with_access(
         workspace: impl AsRef<Path>,
         access: TicketFeatureAccess,
     ) -> Self {
-        Self::for_workspace_with_options(workspace, Some(access), true)
-    }
-
-    pub fn for_workspace_with_options(
-        workspace: impl AsRef<Path>,
-        access: Option<TicketFeatureAccess>,
-        include_orchestration_tools: bool,
-    ) -> Self {
         let workspace = workspace.as_ref();
         match TicketConfig::load_workspace(workspace) {
             Ok(config) => {
                 let backend_root = config.backend_root().to_path_buf();
                 let record_language = config.ticket_record_language().map(str::to_string);
-                let mut feature =
-                    Self::new_with_options(backend_root, access, include_orchestration_tools);
+                let mut feature = Self::new_with_access(backend_root, access);
                 feature.record_language = record_language;
                 feature
             }
-            Err(error) => {
-                let access_value = access.unwrap_or(TicketFeatureAccess::Lifecycle);
-                Self {
-                    backend: TicketFeatureBackend::Local {
-                        root: workspace.join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH),
-                    },
-                    record_language: None,
-                    config_error: Some(error.to_string()),
-                    access: access_value,
-                    include_base_tools: access.is_some(),
-                    include_orchestration_tools,
-                }
-            }
+            Err(error) => Self {
+                backend: TicketFeatureBackend::Local {
+                    root: workspace.join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH),
+                },
+                record_language: None,
+                config_error: Some(error.to_string()),
+                access,
+            },
         }
     }
 
@@ -200,20 +276,7 @@ impl TicketFeature {
     }
 
     fn enabled_tool_names(&self) -> Vec<&'static str> {
-        if self.include_base_tools && self.include_orchestration_tools {
-            return match self.access {
-                TicketFeatureAccess::ReadOnly => TICKET_READ_ONLY_TOOL_NAMES.to_vec(),
-                TicketFeatureAccess::Lifecycle => TICKET_TOOL_NAMES.to_vec(),
-            };
-        }
-        let mut names = Vec::new();
-        if self.include_base_tools {
-            names.extend_from_slice(self.access.base_tool_names());
-        }
-        if self.include_orchestration_tools {
-            names.extend_from_slice(self.access.orchestration_tool_names());
-        }
-        names
+        self.access.tool_names()
     }
 
     fn usable_backend_root(&self) -> Result<PathBuf, String> {
@@ -271,9 +334,9 @@ impl FeatureModule for TicketFeature {
         let mut descriptor = FeatureDescriptor::builtin(FEATURE_ID, FEATURE_NAME)
             .with_description(FEATURE_DESCRIPTION);
         let enabled_tool_names = self.enabled_tool_names();
-        for name in &enabled_tool_names {
+        for name in enabled_tool_names {
             descriptor = descriptor.with_tool(ToolDeclaration::new(
-                *name,
+                name,
                 ticket_tool_description(name, self.record_language.as_deref()),
             ));
         }
@@ -400,7 +463,7 @@ impl TicketBackend for WorkspaceHttpTicketBackend {
         }
     }
 
-    fn list(&self, filter: TicketFilter) -> TicketResult<Vec<TicketSummary>> {
+    fn list(&self, filter: TicketListQuery) -> TicketResult<Vec<TicketSummary>> {
         expect_ticket_result!(
             self.invoke(TicketBackendOperation::List { filter }),
             TicketBackendOperationResult::Tickets
@@ -418,6 +481,20 @@ impl TicketBackend for WorkspaceHttpTicketBackend {
         expect_ticket_result!(
             self.invoke(TicketBackendOperation::Create { input }),
             TicketBackendOperationResult::TicketRef
+        )
+    }
+
+    fn edit_item(&self, id: TicketIdOrSlug, edit: ticket::TicketItemEdit) -> TicketResult<Ticket> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::EditItem { id, edit }),
+            TicketBackendOperationResult::Ticket
+        )
+    }
+
+    fn dependency_check(&self, id: TicketIdOrSlug) -> TicketResult<ticket::TicketDependencyCheck> {
+        expect_ticket_result!(
+            self.invoke(TicketBackendOperation::DependencyCheck { id }),
+            TicketBackendOperationResult::DependencyCheck
         )
     }
 
@@ -601,12 +678,11 @@ pub fn ticket_tools_feature_with_access(
     TicketFeature::for_workspace_with_access(workspace, access)
 }
 
-pub fn ticket_tools_feature_with_options(
+pub fn ticket_tools_feature_with_backend(
     backend: impl Into<TicketFeatureBackend>,
-    access: Option<TicketFeatureAccess>,
-    include_orchestration_tools: bool,
+    access: TicketFeatureAccess,
 ) -> TicketFeature {
-    TicketFeature::with_backend(backend.into(), access, include_orchestration_tools)
+    TicketFeature::with_backend(backend.into(), access)
 }
 
 #[cfg(test)]
@@ -618,10 +694,6 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
     use tempfile::TempDir;
-    use ticket::tool::{
-        TICKET_BASE_TOOL_NAMES, TICKET_ORCHESTRATION_TOOL_NAMES, TICKET_READ_ONLY_TOOL_NAMES,
-        TICKET_TOOL_NAMES,
-    };
 
     fn make_ticket_root(root: &Path) {
         std::fs::create_dir_all(root).unwrap();
@@ -653,66 +725,114 @@ mod tests {
         let descriptor = feature.descriptor();
         assert_eq!(descriptor.id.to_string(), "builtin:ticket");
         assert_eq!(descriptor.runtime, FeatureRuntimeKind::Builtin);
-        assert_eq!(descriptor.tools.len(), TICKET_TOOL_NAMES.len());
+        assert_eq!(descriptor.tools.len(), WORKSPACE_AUTHORING_TOOL_NAMES.len());
         assert_eq!(
             descriptor
                 .tools
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
-            TICKET_TOOL_NAMES
+            WORKSPACE_AUTHORING_TOOL_NAMES
         );
     }
 
     #[test]
     fn read_only_descriptor_declares_only_state_tools() {
         let temp = TempDir::new().unwrap();
-        let feature = ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::ReadOnly);
+        let feature =
+            ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::read_only());
         let descriptor = feature.descriptor();
-        assert_eq!(feature.access(), TicketFeatureAccess::ReadOnly);
-        assert_eq!(descriptor.tools.len(), TICKET_READ_ONLY_TOOL_NAMES.len());
+        assert_eq!(feature.access(), TicketFeatureAccess::read_only());
+        assert_eq!(descriptor.tools.len(), READ_ONLY_TOOL_NAMES.len());
         assert_eq!(
             descriptor
                 .tools
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
-            TICKET_READ_ONLY_TOOL_NAMES
+            READ_ONLY_TOOL_NAMES
         );
     }
 
     #[test]
-    fn descriptor_can_expose_base_ticket_without_orchestration_tools() {
+    fn orchestration_control_descriptor_declares_orchestration_tools() {
         let temp = TempDir::new().unwrap();
-        let feature = ticket_tools_feature_with_options(
+        let feature = ticket_tools_feature_with_access(
             temp.path(),
-            Some(TicketFeatureAccess::Lifecycle),
-            false,
+            TicketFeatureAccess::orchestration_control(),
         );
         let descriptor = feature.descriptor();
+        assert_eq!(
+            feature.access(),
+            TicketFeatureAccess::orchestration_control()
+        );
         assert_eq!(
             descriptor
                 .tools
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
-            TICKET_BASE_TOOL_NAMES
+            ORCHESTRATION_CONTROL_TOOL_NAMES
         );
     }
 
     #[test]
-    fn descriptor_can_expose_orchestration_only_tools() {
+    fn additive_ticket_capabilities_expose_expected_tool_surfaces() {
         let temp = TempDir::new().unwrap();
-        let feature = ticket_tools_feature_with_options(temp.path(), None, true);
-        let descriptor = feature.descriptor();
-        assert_eq!(
-            descriptor
-                .tools
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect::<Vec<_>>(),
-            TICKET_ORCHESTRATION_TOOL_NAMES
+
+        let workspace_authoring = ticket_tools_feature_with_access(
+            temp.path(),
+            TicketFeatureAccess::workspace_authoring(),
         );
+        let workspace_descriptor = workspace_authoring.descriptor();
+        let workspace_tools = workspace_descriptor
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(workspace_tools.contains(&"TicketCreate"));
+        assert!(workspace_tools.contains(&"TicketEditItem"));
+        assert!(workspace_tools.contains(&"TicketQueue"));
+        assert!(!workspace_tools.contains(&"TicketWorkflowState"));
+
+        let orchestration = ticket_tools_feature_with_access(
+            temp.path(),
+            TicketFeatureAccess::orchestration_control(),
+        );
+        let orchestration_descriptor = orchestration.descriptor();
+        let orchestration_tools = orchestration_descriptor
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(orchestration_tools.contains(&"TicketWorkflowState"));
+        assert!(orchestration_tools.contains(&"TicketDependencyCheck"));
+        assert!(orchestration_tools.contains(&"TicketRelationRecord"));
+        assert!(orchestration_tools.contains(&"TicketOrchestrationPlanRecord"));
+        assert!(!orchestration_tools.contains(&"TicketEditItem"));
+        assert!(!orchestration_tools.contains(&"TicketQueue"));
+
+        let work_report =
+            ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::work_report());
+        let work_report_descriptor = work_report.descriptor();
+        let work_report_tools = work_report_descriptor
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(work_report_tools.contains(&"TicketComment"));
+        assert!(work_report_tools.contains(&"TicketReview"));
+        assert!(!work_report_tools.contains(&"TicketWorkflowState"));
+
+        let review = ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::review());
+        let review_descriptor = review.descriptor();
+        let review_tools = review_descriptor
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(review_tools.contains(&"TicketReview"));
+        assert!(!review_tools.contains(&"TicketWorkflowState"));
     }
 
     #[test]
@@ -724,20 +844,17 @@ mod tests {
         let report = FeatureRegistryBuilder::new()
             .with_module(ticket_tools_feature_with_access(
                 temp.path(),
-                TicketFeatureAccess::ReadOnly,
+                TicketFeatureAccess::read_only(),
             ))
             .install_into_pending(&mut pending_tools, &mut hooks);
 
-        assert_eq!(pending_tools.len(), TICKET_READ_ONLY_TOOL_NAMES.len());
-        assert_eq!(
-            report.reports[0].installed_tools,
-            TICKET_READ_ONLY_TOOL_NAMES
-        );
+        assert_eq!(pending_tools.len(), READ_ONLY_TOOL_NAMES.len());
+        assert_eq!(report.reports[0].installed_tools, READ_ONLY_TOOL_NAMES);
         let pending_names = pending_tools
             .iter()
             .map(|definition| definition().0.name)
             .collect::<Vec<_>>();
-        assert_eq!(pending_names, TICKET_READ_ONLY_TOOL_NAMES);
+        assert_eq!(pending_names, READ_ONLY_TOOL_NAMES);
         for name in ticket::tool::TICKET_MUTATING_TOOL_NAMES {
             assert!(
                 !report.reports[0]
@@ -760,7 +877,8 @@ language = "Japanese"
 "#,
         );
         make_ticket_root(&temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH));
-        let feature = ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::ReadOnly);
+        let feature =
+            ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::read_only());
         let descriptor = feature.descriptor();
         let descriptor_description = descriptor
             .tools
@@ -777,11 +895,8 @@ language = "Japanese"
             .with_module(feature)
             .install_into_pending(&mut pending_tools, &mut hooks);
 
-        assert_eq!(pending_tools.len(), TICKET_READ_ONLY_TOOL_NAMES.len());
-        assert_eq!(
-            report.reports[0].installed_tools,
-            TICKET_READ_ONLY_TOOL_NAMES
-        );
+        assert_eq!(pending_tools.len(), READ_ONLY_TOOL_NAMES.len());
+        assert_eq!(report.reports[0].installed_tools, READ_ONLY_TOOL_NAMES);
         let description = pending_tool_description(&pending_tools, "TicketShow");
         assert!(description.contains("Ticket record language: Japanese"));
         assert!(description.contains("distinct from worker.language"));
@@ -789,7 +904,7 @@ language = "Japanese"
     }
 
     #[test]
-    fn lifecycle_installation_exposes_lifecycle_tools() {
+    fn workspace_authoring_installation_exposes_authoring_tools() {
         let temp = TempDir::new().unwrap();
         make_ticket_root(&temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH));
         let mut pending_tools = Vec::new();
@@ -797,36 +912,31 @@ language = "Japanese"
         let report = FeatureRegistryBuilder::new()
             .with_module(ticket_tools_feature_with_access(
                 temp.path(),
-                TicketFeatureAccess::Lifecycle,
+                TicketFeatureAccess::workspace_authoring(),
             ))
             .install_into_pending(&mut pending_tools, &mut hooks);
 
-        assert_eq!(pending_tools.len(), TICKET_TOOL_NAMES.len());
-        assert_eq!(report.reports[0].installed_tools, TICKET_TOOL_NAMES);
-        for name in ticket::tool::TICKET_MUTATING_TOOL_NAMES {
-            assert!(
-                report.reports[0]
-                    .installed_tools
-                    .iter()
-                    .any(|tool| tool == name)
-            );
-        }
+        assert_eq!(pending_tools.len(), WORKSPACE_AUTHORING_TOOL_NAMES.len());
+        let installed = report.reports[0]
+            .installed_tools
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(installed, WORKSPACE_AUTHORING_TOOL_NAMES);
+        assert!(installed.iter().any(|tool| *tool == "TicketCreate"));
+        assert!(installed.iter().any(|tool| *tool == "TicketEditItem"));
+        assert!(installed.iter().any(|tool| *tool == "TicketQueue"));
+        assert!(!installed.iter().any(|tool| *tool == "TicketIntakeReady"));
+        assert!(!installed.iter().any(|tool| *tool == "TicketWorkflowState"));
         assert!(
-            report.reports[0]
-                .installed_tools
+            !installed
                 .iter()
-                .any(|tool| tool == "TicketIntakeReady")
-        );
-        assert!(
-            report.reports[0]
-                .installed_tools
-                .iter()
-                .any(|tool| tool == "TicketWorkflowState")
+                .any(|tool| *tool == "TicketOrchestrationPlanRecord")
         );
     }
 
     #[test]
-    fn lifecycle_ticket_role_style_context_exposes_ticket_language_guidance() {
+    fn workspace_authoring_context_exposes_ticket_language_guidance() {
         let temp = TempDir::new().unwrap();
         write_ticket_config(
             temp.path(),
@@ -841,12 +951,15 @@ language = "Japanese"
         let report = FeatureRegistryBuilder::new()
             .with_module(ticket_tools_feature_with_access(
                 temp.path(),
-                TicketFeatureAccess::Lifecycle,
+                TicketFeatureAccess::workspace_authoring(),
             ))
             .install_into_pending(&mut pending_tools, &mut hooks);
 
-        assert_eq!(pending_tools.len(), TICKET_TOOL_NAMES.len());
-        assert_eq!(report.reports[0].installed_tools, TICKET_TOOL_NAMES);
+        assert_eq!(pending_tools.len(), WORKSPACE_AUTHORING_TOOL_NAMES.len());
+        assert_eq!(
+            report.reports[0].installed_tools,
+            WORKSPACE_AUTHORING_TOOL_NAMES
+        );
         let description = pending_tool_description(&pending_tools, "TicketComment");
         assert!(description.contains("Ticket record language: Japanese"));
         assert!(description.contains("durable Ticket record and Ticket tool body text"));
@@ -864,10 +977,13 @@ language = "Japanese"
             .with_module(ticket_tools_feature(temp.path()))
             .install_into_pending(&mut pending_tools, &mut hooks);
 
-        assert_eq!(pending_tools.len(), TICKET_TOOL_NAMES.len());
+        assert_eq!(pending_tools.len(), WORKSPACE_AUTHORING_TOOL_NAMES.len());
         assert_eq!(report.reports.len(), 1);
         assert!(report.reports[0].installed);
-        assert_eq!(report.reports[0].installed_tools, TICKET_TOOL_NAMES);
+        assert_eq!(
+            report.reports[0].installed_tools,
+            WORKSPACE_AUTHORING_TOOL_NAMES
+        );
         assert!(report.reports[0].skipped.is_empty());
     }
 
@@ -899,7 +1015,7 @@ profile = "project:coder"
             .with_module(feature)
             .install_into_pending(&mut pending_tools, &mut hooks);
 
-        assert_eq!(pending_tools.len(), TICKET_TOOL_NAMES.len());
+        assert_eq!(pending_tools.len(), WORKSPACE_AUTHORING_TOOL_NAMES.len());
         assert!(report.reports[0].diagnostics.is_empty());
     }
 
@@ -985,8 +1101,11 @@ provider = "github"
             .with_module(ticket_tools_feature(temp.path()))
             .install_into_pending(&mut pending_tools, &mut hooks);
 
-        assert_eq!(pending_tools.len(), TICKET_TOOL_NAMES.len());
-        assert_eq!(report.reports[0].installed_tools, TICKET_TOOL_NAMES);
+        assert_eq!(pending_tools.len(), WORKSPACE_AUTHORING_TOOL_NAMES.len());
+        assert_eq!(
+            report.reports[0].installed_tools,
+            WORKSPACE_AUTHORING_TOOL_NAMES
+        );
         assert!(report.reports[0].diagnostics.is_empty());
         assert!(!root.join("open").exists());
         assert!(!root.join("pending").exists());

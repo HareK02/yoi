@@ -10,8 +10,10 @@ use ticket::config::{
     WORKSPACE_SETTINGS_RELATIVE_PATH,
 };
 use ticket::{
-    LocalTicketBackend, TicketBackend, TicketError, TicketEvent, TicketFilter, TicketIdOrSlug,
-    TicketInvalidRecord, TicketMeta, TicketRelationBlocker, TicketSummary, TicketWorkflowState,
+    LocalTicketBackend, TicketBackend, TicketError, TicketEvent, TicketIdOrSlug,
+    TicketInvalidRecord, TicketListQuery, TicketMeta, TicketRelationBlocker, TicketSummary,
+    TicketWorkflowState, TicketWorkspaceActionPriority, TicketWorkspaceNextAction,
+    TicketWorkspaceRowKind, TicketWorkspaceStateOverlay, project_ticket_workspace_item,
 };
 
 use crate::role_session_registry::{PanelRegistrySnapshot, PanelRegistryStore};
@@ -266,11 +268,7 @@ pub(crate) struct TicketPanelEntry {
     pub(crate) intake_workers: Vec<TicketAssociatedIntakeEntry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TicketStateOverlay {
-    pub(crate) source: String,
-    pub(crate) workflow_state: TicketWorkflowState,
-}
+pub(crate) type TicketStateOverlay = TicketWorkspaceStateOverlay;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TicketAssociatedIntakeEntry {
@@ -693,7 +691,7 @@ fn load_orchestration_ticket_overlay_states(
     let backend = LocalTicketBackend::new(ticket_root.to_path_buf())
         .with_record_language(overlay_config.ticket_record_language());
     let partial = backend
-        .list_partial(TicketFilter::all())
+        .list_partial(TicketListQuery::all())
         .map_err(|error| error.to_string())?;
     let mut states = BTreeMap::new();
     for summary in partial.tickets {
@@ -1092,7 +1090,7 @@ fn build_ticket_rows(
     registry: &PanelRegistrySnapshot,
     orchestration_overlay: &BTreeMap<String, TicketStateOverlay>,
 ) -> ticket::Result<TicketRowsBuild> {
-    let partial = backend.list_partial(TicketFilter::all())?;
+    let partial = backend.list_partial(TicketListQuery::all())?;
     let mut ticket_rows = Vec::new();
     let mut invalid_records = partial.invalid_records;
     for summary in partial.tickets {
@@ -1232,29 +1230,24 @@ fn ticket_row(
             related_workers.push(worker_name);
         }
     }
-    let visible_overlay = orchestration_overlay
-        .filter(|overlay| {
-            overlay_state_has_progressed(summary.workflow_state, overlay.workflow_state)
-        })
-        .cloned();
-    let mut derived = derive_ticket_state(&summary, relation_blockers);
-    if let Some(overlay) = visible_overlay.as_ref() {
-        apply_orchestration_overlay_to_derived(&mut derived, summary.workflow_state, overlay);
-    }
+    let projection =
+        project_ticket_workspace_item(&summary, relation_blockers, orchestration_overlay);
     let latest_event = events.last();
-    let state_display = ticket_state_display(summary.workflow_state, visible_overlay.as_ref());
+    let kind = panel_row_kind_from_workspace(projection.kind);
+    let priority = action_priority_from_workspace(projection.priority);
+    let next_action = projection.next_action.map(next_user_action_from_workspace);
     let entry = TicketPanelEntry {
         id: summary.id.clone(),
         title: summary.title.clone(),
         priority: summary.priority.clone(),
         workflow_state: summary.workflow_state,
         workflow_state_explicit: summary.workflow_state_explicit,
-        orchestration_overlay: visible_overlay,
-        next_action: derived.action,
+        orchestration_overlay: projection.visible_overlay.clone(),
+        next_action,
         updated_at: summary.updated_at.clone(),
         latest_event_kind: latest_event.map(|event| event.kind.as_str().to_string()),
         latest_event_excerpt: latest_event.and_then(|event| excerpt(event.body.as_str(), 72)),
-        blocked_reason: derived.blocked_reason.clone(),
+        blocked_reason: projection.blocked_reason.clone(),
         related_workers: related_workers.clone(),
         local_claim,
         intake_workers,
@@ -1262,251 +1255,42 @@ fn ticket_row(
     let subtitle = ticket_subtitle(&entry);
     PanelRow {
         key: PanelRowKey::Ticket(summary.id),
-        kind: derived.kind,
+        kind,
         title: summary.title,
         subtitle,
-        status: state_display,
-        priority: derived.priority,
-        next_action: derived.action,
+        status: projection.visible_state,
+        priority,
+        next_action,
         ticket: Some(entry),
         related_workers,
-        disabled_reason: derived.disabled_reason,
-        key_hint: derived.key_hint,
+        disabled_reason: projection.disabled_reason,
+        key_hint: projection.key_hint,
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DerivedTicketState {
-    kind: PanelRowKind,
-    priority: ActionPriority,
-    action: Option<NextUserAction>,
-    disabled_reason: Option<String>,
-    key_hint: Option<String>,
-    blocked_reason: Option<String>,
-}
-
-fn workflow_state_progress_rank(state: TicketWorkflowState) -> u8 {
-    match state {
-        TicketWorkflowState::Planning => 0,
-        TicketWorkflowState::Ready => 1,
-        TicketWorkflowState::Queued => 2,
-        TicketWorkflowState::InProgress => 3,
-        TicketWorkflowState::Done => 4,
-        TicketWorkflowState::Closed => 5,
+fn panel_row_kind_from_workspace(kind: TicketWorkspaceRowKind) -> PanelRowKind {
+    match kind {
+        TicketWorkspaceRowKind::Planning => PanelRowKind::Planning,
+        TicketWorkspaceRowKind::Ticket => PanelRowKind::Ticket,
+        TicketWorkspaceRowKind::Review => PanelRowKind::Review,
+        TicketWorkspaceRowKind::ActiveWork => PanelRowKind::ActiveWork,
     }
 }
 
-fn overlay_state_has_progressed(local: TicketWorkflowState, overlay: TicketWorkflowState) -> bool {
-    workflow_state_progress_rank(overlay) > workflow_state_progress_rank(local)
-}
-
-fn ticket_state_display(
-    local: TicketWorkflowState,
-    overlay: Option<&TicketStateOverlay>,
-) -> String {
-    match overlay {
-        Some(overlay) => format!(
-            "{}→{}",
-            compact_ticket_state_label(local),
-            compact_ticket_state_label(overlay.workflow_state)
-        ),
-        None => local.as_str().to_string(),
+fn action_priority_from_workspace(priority: TicketWorkspaceActionPriority) -> ActionPriority {
+    match priority {
+        TicketWorkspaceActionPriority::ReadyForQueue => ActionPriority::ReadyForQueue,
+        TicketWorkspaceActionPriority::ActiveWork => ActionPriority::ActiveWork,
+        TicketWorkspaceActionPriority::Background => ActionPriority::Background,
     }
 }
 
-fn compact_ticket_state_label(state: TicketWorkflowState) -> &'static str {
-    match state {
-        TicketWorkflowState::Planning => "plan",
-        TicketWorkflowState::Ready => "ready",
-        TicketWorkflowState::Queued => "q",
-        TicketWorkflowState::InProgress => "prog",
-        TicketWorkflowState::Done => "done",
-        TicketWorkflowState::Closed => "cls",
-    }
-}
-
-fn apply_orchestration_overlay_to_derived(
-    derived: &mut DerivedTicketState,
-    local: TicketWorkflowState,
-    overlay: &TicketStateOverlay,
-) {
-    derived.action = Some(NextUserAction::Wait);
-    let overlay_state = overlay.workflow_state.as_str();
-    match overlay.workflow_state {
-        TicketWorkflowState::Done | TicketWorkflowState::Closed => {
-            derived.kind = PanelRowKind::Review;
-            derived.priority = ActionPriority::Background;
-            derived.disabled_reason = Some(format!(
-                "{} worktree overlay shows Ticket state {overlay_state}; local state remains {} until merge/review/close authority updates the current branch.",
-                overlay.source,
-                local.as_str()
-            ));
-            derived.key_hint = Some(format!(
-                "Merge pending: local: {} · {}: {overlay_state}",
-                local.as_str(),
-                overlay.source
-            ));
-        }
-        TicketWorkflowState::InProgress | TicketWorkflowState::Queued => {
-            derived.kind = PanelRowKind::ActiveWork;
-            derived.priority = ActionPriority::ActiveWork;
-            derived.disabled_reason = Some(format!(
-                "{} worktree overlay shows Ticket state {overlay_state}; local state remains {} and duplicate queue/start actions are suppressed.",
-                overlay.source,
-                local.as_str()
-            ));
-            derived.key_hint = Some(format!(
-                "Progress overlay: local: {} · {}: {overlay_state}",
-                local.as_str(),
-                overlay.source
-            ));
-        }
-        TicketWorkflowState::Planning | TicketWorkflowState::Ready => {}
-    }
-}
-
-fn format_relation_blockers(blockers: &[&TicketRelationBlocker]) -> String {
-    let shown_blockers = blockers.iter().take(3).count();
-    let mut formatted = blockers
-        .iter()
-        .take(3)
-        .map(|blocker| {
-            format!(
-                "{} via {} (state: {})",
-                blocker.blocking_ticket,
-                blocker.reason_kind,
-                blocker.blocking_state.as_str()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let remaining_blockers = blockers.len().saturating_sub(shown_blockers);
-    if remaining_blockers > 0 {
-        formatted.push_str(&format!(" (+{remaining_blockers} more)"));
-    }
-    formatted
-}
-
-fn relation_blocker_allows_ready_queue(blocker: &TicketRelationBlocker) -> bool {
-    matches!(
-        blocker.blocking_state,
-        TicketWorkflowState::Queued | TicketWorkflowState::InProgress
-    )
-}
-
-fn derive_ticket_state(
-    summary: &TicketSummary,
-    relation_blockers: &[TicketRelationBlocker],
-) -> DerivedTicketState {
-    if !relation_blockers.is_empty() {
-        let active_blockers = relation_blockers
-            .iter()
-            .filter(|blocker| !relation_blocker_allows_ready_queue(blocker))
-            .collect::<Vec<_>>();
-        if !active_blockers.is_empty() || summary.workflow_state != TicketWorkflowState::Ready {
-            let blockers_to_report = if active_blockers.is_empty() {
-                relation_blockers.iter().collect::<Vec<_>>()
-            } else {
-                active_blockers
-            };
-            let blockers = format_relation_blockers(&blockers_to_report);
-            let waiting_reason = format!("waiting for {blockers}");
-            return DerivedTicketState {
-                kind: match summary.workflow_state {
-                    TicketWorkflowState::Planning => PanelRowKind::Planning,
-                    TicketWorkflowState::Queued | TicketWorkflowState::InProgress => {
-                        PanelRowKind::ActiveWork
-                    }
-                    TicketWorkflowState::Done | TicketWorkflowState::Closed => PanelRowKind::Review,
-                    TicketWorkflowState::Ready => PanelRowKind::Ticket,
-                },
-                priority: match summary.workflow_state {
-                    TicketWorkflowState::Queued | TicketWorkflowState::InProgress => {
-                        ActionPriority::ActiveWork
-                    }
-                    _ => ActionPriority::Background,
-                },
-                action: Some(NextUserAction::Wait),
-                disabled_reason: Some(format!(
-                    "Queue disabled: {waiting_reason}. Resolve dependency/blocker before ready -> queued."
-                )),
-                key_hint: Some(format!("Gate: {waiting_reason}")),
-                blocked_reason: Some(blockers),
-            };
-        }
-
-        let blockers = format_relation_blockers(
-            &relation_blockers
-                .iter()
-                .collect::<Vec<&TicketRelationBlocker>>(),
-        );
-        return DerivedTicketState {
-            kind: PanelRowKind::Ticket,
-            priority: ActionPriority::ReadyForQueue,
-            action: Some(NextUserAction::Queue),
-            disabled_reason: None,
-            key_hint: Some(format!(
-                "Queue allowed: prerequisites are already queued/in progress; Orchestrator will preserve order ({blockers})."
-            )),
-            blocked_reason: None,
-        };
-    }
-
-    match summary.workflow_state {
-        TicketWorkflowState::Ready => DerivedTicketState {
-            kind: PanelRowKind::Ticket,
-            priority: ActionPriority::ReadyForQueue,
-            action: Some(NextUserAction::Queue),
-            disabled_reason: None,
-            key_hint: Some(
-                "Queue transitions ready -> queued and may notify Orchestrator".to_string(),
-            ),
-            blocked_reason: None,
-        },
-        TicketWorkflowState::Queued => DerivedTicketState {
-            kind: PanelRowKind::ActiveWork,
-            priority: ActionPriority::ActiveWork,
-            action: Some(NextUserAction::Wait),
-            disabled_reason: Some("Ticket is queued for Orchestrator routing.".to_string()),
-            key_hint: None,
-            blocked_reason: None,
-        },
-        TicketWorkflowState::InProgress => DerivedTicketState {
-            kind: PanelRowKind::ActiveWork,
-            priority: ActionPriority::ActiveWork,
-            action: Some(NextUserAction::Wait),
-            disabled_reason: Some("Ticket is already in progress.".to_string()),
-            key_hint: None,
-            blocked_reason: None,
-        },
-        TicketWorkflowState::Done => DerivedTicketState {
-            kind: PanelRowKind::Review,
-            priority: ActionPriority::Background,
-            action: Some(NextUserAction::Close),
-            disabled_reason: Some(
-                "state is done; close if a resolution is still missing.".to_string(),
-            ),
-            key_hint: None,
-            blocked_reason: None,
-        },
-        TicketWorkflowState::Planning => DerivedTicketState {
-            kind: PanelRowKind::Planning,
-            priority: ActionPriority::Background,
-            action: Some(NextUserAction::Clarify),
-            disabled_reason: Some(
-                "Ticket is still in planning; mark it ready before queueing.".to_string(),
-            ),
-            key_hint: Some("Planning/Intake helpers can set state = ready".to_string()),
-            blocked_reason: None,
-        },
-        TicketWorkflowState::Closed => DerivedTicketState {
-            kind: PanelRowKind::Review,
-            priority: ActionPriority::Background,
-            action: Some(NextUserAction::Wait),
-            disabled_reason: Some("Ticket is closed.".to_string()),
-            key_hint: None,
-            blocked_reason: None,
-        },
+fn next_user_action_from_workspace(action: TicketWorkspaceNextAction) -> NextUserAction {
+    match action {
+        TicketWorkspaceNextAction::Clarify => NextUserAction::Clarify,
+        TicketWorkspaceNextAction::QueueForOrchestrator => NextUserAction::Queue,
+        TicketWorkspaceNextAction::Close => NextUserAction::Close,
+        TicketWorkspaceNextAction::WaitForOrchestrator => NextUserAction::Wait,
     }
 }
 
@@ -1649,6 +1433,31 @@ pub(crate) fn local_claim_status_for_pod(
         return TicketLocalClaimStatus::Restorable;
     }
     TicketLocalClaimStatus::Stale
+}
+
+fn ticket_state_display(
+    local: TicketWorkflowState,
+    overlay: Option<&TicketStateOverlay>,
+) -> String {
+    match overlay {
+        Some(overlay) => format!(
+            "{}→{}",
+            compact_ticket_state_label(local),
+            compact_ticket_state_label(overlay.workflow_state)
+        ),
+        None => local.as_str().to_string(),
+    }
+}
+
+fn compact_ticket_state_label(state: TicketWorkflowState) -> &'static str {
+    match state {
+        TicketWorkflowState::Planning => "plan",
+        TicketWorkflowState::Ready => "ready",
+        TicketWorkflowState::Queued => "q",
+        TicketWorkflowState::InProgress => "prog",
+        TicketWorkflowState::Done => "done",
+        TicketWorkflowState::Closed => "cls",
+    }
 }
 
 fn ticket_subtitle(entry: &TicketPanelEntry) -> Option<String> {
@@ -2522,7 +2331,7 @@ mod tests {
             input.workflow_state = Some(TicketWorkflowState::Ready);
         });
         let ticket_id = backend
-            .list(TicketFilter::all())
+            .list(TicketListQuery::all())
             .unwrap()
             .into_iter()
             .find(|ticket| ticket.title == "Ticket With Intake")
@@ -2619,7 +2428,7 @@ mod tests {
         write_ticket_config(temp.path());
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
         create_ticket(&backend, "Claimed Planning", |_| {});
-        let summary = backend.list(TicketFilter::all()).unwrap().remove(0);
+        let summary = backend.list(TicketListQuery::all()).unwrap().remove(0);
         let store = PanelRegistryStore::from_root(temp.path().join("local-registry"));
         store
             .claim_ticket(&summary.id, None, "ticket-claimed-intake", "intake")

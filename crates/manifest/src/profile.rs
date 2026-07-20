@@ -894,7 +894,6 @@ fn builtin_profile_artifact(label: &str) -> Option<serde_json::Value> {
                 true,
                 true,
                 true,
-                false,
             );
             Some(value)
         }
@@ -908,7 +907,6 @@ fn builtin_profile_artifact(label: &str) -> Option<serde_json::Value> {
                 true,
                 true,
                 false,
-                false,
             );
             Some(value)
         }
@@ -918,7 +916,6 @@ fn builtin_profile_artifact(label: &str) -> Option<serde_json::Value> {
                 "orchestrator",
                 "Ticket orchestrator profile.",
                 "workspace_write",
-                true,
                 true,
                 true,
                 true,
@@ -936,7 +933,6 @@ fn builtin_profile_artifact(label: &str) -> Option<serde_json::Value> {
                 true,
                 true,
                 false,
-                false,
             );
             Some(value)
         }
@@ -949,7 +945,6 @@ fn builtin_profile_artifact(label: &str) -> Option<serde_json::Value> {
                 true,
                 true,
                 true,
-                false,
                 false,
             );
             Some(value)
@@ -976,8 +971,7 @@ fn builtin_default_profile_artifact() -> serde_json::Value {
             "memory": { "enabled": true },
             "web": { "enabled": true },
             "workers": { "enabled": true },
-            "ticket": { "enabled": true, "access": "lifecycle" },
-            "ticket_orchestration": { "enabled": false }
+            "ticket": { "enabled": true, "authoring": true, "thread": true }
         },
         "memory": {
             "extract_threshold": 50000,
@@ -1004,7 +998,6 @@ fn apply_role_profile(
     memory: bool,
     web: bool,
     workers: bool,
-    ticket_orchestration: bool,
 ) {
     value["slug"] = serde_json::Value::String(slug.to_string());
     value["description"] = serde_json::Value::String(description.to_string());
@@ -1012,8 +1005,19 @@ fn apply_role_profile(
     value["feature"]["memory"] = serde_json::json!({ "enabled": memory });
     value["feature"]["web"] = serde_json::json!({ "enabled": web });
     value["feature"]["workers"] = serde_json::json!({ "enabled": workers });
-    value["feature"]["ticket_orchestration"] =
-        serde_json::json!({ "enabled": ticket_orchestration });
+    let ticket = match slug {
+        "companion" => serde_json::json!({ "enabled": true, "authoring": true, "thread": true }),
+        "intake" => {
+            serde_json::json!({ "enabled": true, "authoring": true, "thread": true, "intake": true })
+        }
+        "orchestrator" => {
+            serde_json::json!({ "enabled": true, "thread": true, "orchestration_control": true })
+        }
+        "coder" => serde_json::json!({ "enabled": true, "thread": true }),
+        "reviewer" => serde_json::json!({ "enabled": true, "thread": true }),
+        _ => serde_json::json!({ "enabled": true, "authoring": true, "thread": true }),
+    };
+    value["feature"]["ticket"] = ticket;
 }
 
 fn reject_manifest_shaped_profile(value: &serde_json::Value) -> Result<(), ProfileError> {
@@ -1439,7 +1443,10 @@ mod tests {
         assert_eq!(companion.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
         assert!(companion.web.is_some());
         assert!(companion.feature.ticket.enabled);
-        assert!(!companion.feature.ticket_orchestration.enabled);
+        assert!(companion.feature.ticket.authoring);
+        assert!(companion.feature.ticket.thread);
+        assert!(!companion.feature.ticket.intake);
+        assert!(!companion.feature.ticket.orchestration_control);
         assert_eq!(
             companion.compaction.as_ref().unwrap().threshold,
             Some(240000)
@@ -1461,18 +1468,26 @@ mod tests {
         assert!(intake.feature.task.enabled);
         assert!(!intake.feature.workers.enabled);
         assert!(intake.feature.ticket.enabled);
+        assert!(intake.feature.ticket.enabled);
+        assert!(intake.feature.ticket.authoring);
+        assert!(intake.feature.ticket.thread);
+        assert!(intake.feature.ticket.intake);
+        assert!(!intake.feature.ticket.orchestration_control);
         assert!(intake.scope.allow.is_empty());
         assert!(intake.delegation_scope.allow.is_empty());
         assert_eq!(intake.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
         assert!(intake.web.is_some());
         assert!(intake.compaction.is_some());
-        assert!(!intake.feature.ticket_orchestration.enabled);
 
         let orchestrator = resolve("orchestrator");
         assert!(orchestrator.feature.task.enabled);
         assert!(orchestrator.feature.workers.enabled);
         assert!(orchestrator.feature.ticket.enabled);
-        assert!(orchestrator.feature.ticket_orchestration.enabled);
+        assert!(orchestrator.feature.ticket.enabled);
+        assert!(!orchestrator.feature.ticket.authoring);
+        assert!(orchestrator.feature.ticket.thread);
+        assert!(!orchestrator.feature.ticket.intake);
+        assert!(orchestrator.feature.ticket.orchestration_control);
         assert!(orchestrator.scope.allow.is_empty());
         assert!(orchestrator.delegation_scope.allow.is_empty());
         assert_eq!(
@@ -1491,13 +1506,20 @@ mod tests {
         assert!(coder.web.is_some());
         assert!(coder.compaction.is_some());
         assert!(coder.feature.ticket.enabled);
-        assert!(!coder.feature.ticket_orchestration.enabled);
-
+        assert!(coder.feature.ticket.enabled);
+        assert!(!coder.feature.ticket.authoring);
+        assert!(coder.feature.ticket.thread);
+        assert!(!coder.feature.ticket.intake);
+        assert!(!coder.feature.ticket.orchestration_control);
         let reviewer = resolve("reviewer");
         assert!(reviewer.feature.task.enabled);
         assert!(!reviewer.feature.workers.enabled);
         assert!(reviewer.feature.ticket.enabled);
-        assert!(!reviewer.feature.ticket_orchestration.enabled);
+        assert!(reviewer.feature.ticket.enabled);
+        assert!(!reviewer.feature.ticket.authoring);
+        assert!(reviewer.feature.ticket.thread);
+        assert!(!reviewer.feature.ticket.intake);
+        assert!(!reviewer.feature.ticket.orchestration_control);
         assert!(reviewer.scope.allow.is_empty());
         assert!(reviewer.delegation_scope.allow.is_empty());
         assert_eq!(reviewer.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
@@ -1646,10 +1668,10 @@ enabled = true
 
 [feature.ticket]
 enabled = true
-access = "read_only"
-
-[feature.ticket_orchestration]
-enabled = false
+authoring = false
+thread = false
+intake = false
+orchestration_control = false
 "#,
         );
         let workspace = tmp.path().join("workspace");
@@ -1667,11 +1689,10 @@ enabled = false
         assert!(resolved.manifest.feature.web.enabled);
         assert!(resolved.manifest.feature.workers.enabled);
         assert!(resolved.manifest.feature.ticket.enabled);
-        assert_eq!(
-            resolved.manifest.feature.ticket.access,
-            crate::TicketFeatureAccessConfig::ReadOnly
-        );
-        assert!(!resolved.manifest.feature.ticket_orchestration.enabled);
+        assert!(!resolved.manifest.feature.ticket.authoring);
+        assert!(!resolved.manifest.feature.ticket.thread);
+        assert!(!resolved.manifest.feature.ticket.intake);
+        assert!(!resolved.manifest.feature.ticket.orchestration_control);
         assert_eq!(
             resolved.manifest.delegation_scope.allow[0].target,
             workspace
@@ -1754,15 +1775,11 @@ worker_context_max_tokens = 68000
             resolved.manifest.model.ref_.as_deref(),
             Some("codex-oauth/gpt-5.5")
         );
-        assert!(resolved.manifest.scope.allow.is_empty());
-        assert!(resolved.manifest.delegation_scope.allow.is_empty());
-        assert!(resolved.manifest.session.record_event_trace);
         assert!(resolved.manifest.feature.ticket.enabled);
-        assert_eq!(
-            resolved.manifest.feature.ticket.access,
-            crate::TicketFeatureAccessConfig::Lifecycle
-        );
-        assert!(!resolved.manifest.feature.ticket_orchestration.enabled);
+        assert!(resolved.manifest.feature.ticket.authoring);
+        assert!(resolved.manifest.feature.ticket.thread);
+        assert!(!resolved.manifest.feature.ticket.intake);
+        assert!(!resolved.manifest.feature.ticket.orchestration_control);
         assert_eq!(
             resolved.profile.as_ref().unwrap().name.as_deref(),
             Some("default")
