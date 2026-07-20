@@ -14,5 +14,5 @@ pub(crate) use session_explore::{
 pub use task::{TaskFeature, task_tools_feature};
 pub use ticket::{
     TicketFeature, TicketFeatureAccess, ticket_tools_feature, ticket_tools_feature_with_access,
-    ticket_tools_feature_with_options,
+    ticket_tools_feature_with_backend,
 };

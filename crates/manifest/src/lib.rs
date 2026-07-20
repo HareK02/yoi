@@ -115,8 +115,6 @@ pub struct FeatureConfig {
     #[serde(default)]
     pub ticket: TicketFeatureConfig,
     #[serde(default)]
-    pub ticket_orchestration: FeatureFlagConfig,
-    #[serde(default)]
     pub plugins: FeatureFlagConfig,
 }
 
@@ -128,7 +126,6 @@ impl Default for FeatureConfig {
             web: FeatureFlagConfig::disabled(),
             workers: FeatureFlagConfig::disabled(),
             ticket: TicketFeatureConfig::default(),
-            ticket_orchestration: FeatureFlagConfig::disabled(),
             plugins: FeatureFlagConfig::disabled(),
         }
     }
@@ -160,18 +157,15 @@ impl Default for FeatureFlagConfig {
 pub struct TicketFeatureConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Which non-orchestration Ticket surface to expose when `enabled = true`.
-    /// Orchestration-plan/relation tools are controlled independently by
-    /// `[feature.ticket_orchestration].enabled`.
     #[serde(default)]
-    pub access: TicketFeatureAccessConfig,
+    pub preset: TicketFeatureAccessConfig,
 }
 
 impl Default for TicketFeatureConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            access: TicketFeatureAccessConfig::Lifecycle,
+            preset: TicketFeatureAccessConfig::default(),
         }
     }
 }
@@ -185,13 +179,11 @@ pub enum TicketFeatureAccessConfig {
     OrchestrationControl,
     WorkReport,
     Review,
-    /// Legacy broad mutation preset retained as a migration shim.
-    Lifecycle,
 }
 
 impl Default for TicketFeatureAccessConfig {
     fn default() -> Self {
-        Self::Lifecycle
+        Self::WorkspaceAuthoring
     }
 }
 

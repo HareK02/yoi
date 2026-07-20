@@ -238,10 +238,7 @@ enabled = false
 
 [feature.ticket]
 enabled = true
-access = "lifecycle"
-
-[feature.ticket_orchestration]
-enabled = false
+preset = "workspace_authoring"
 
 [memory]
 extract_threshold = 50000
@@ -298,8 +295,9 @@ mod tests {
         assert!(profile.contains("slug = \"default\""));
         assert!(profile.contains("ref = \"codex-oauth/gpt-5.5\""));
         assert!(profile.contains("scope = \"workspace_write\""));
-        assert!(profile.contains("[feature.ticket]\nenabled = true\naccess = \"lifecycle\""));
-        assert!(profile.contains("[feature.ticket_orchestration]\nenabled = false"));
+        assert!(
+            profile.contains("[feature.ticket]\nenabled = true\npreset = \"workspace_authoring\"")
+        );
     }
 
     #[test]

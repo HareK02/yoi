@@ -548,10 +548,7 @@ fn install_ticket_event_companion_notify_hook<C, St>(
 
     let ticket_feature = &worker.manifest().feature.ticket;
     if !ticket_feature.enabled
-        || !matches!(
-            ticket_feature.access,
-            TicketFeatureAccessConfig::OrchestrationControl | TicketFeatureAccessConfig::Lifecycle
-        )
+        || ticket_feature.preset != TicketFeatureAccessConfig::OrchestrationControl
     {
         return;
     }
@@ -677,8 +674,8 @@ where
     if feature_config.task.enabled {
         feature_registry.add_module(task_feature);
     }
-    if feature_config.ticket.enabled || feature_config.ticket_orchestration.enabled {
-        let ticket_access = match feature_config.ticket.access {
+    if feature_config.ticket.enabled {
+        let ticket_access = match feature_config.ticket.preset {
             TicketFeatureAccessConfig::ReadOnly => {
                 crate::feature::builtin::ticket::TicketFeatureAccess::ReadOnly
             }
@@ -696,9 +693,6 @@ where
             }
             TicketFeatureAccessConfig::Review => {
                 crate::feature::builtin::ticket::TicketFeatureAccess::Review
-            }
-            TicketFeatureAccessConfig::Lifecycle => {
-                crate::feature::builtin::ticket::TicketFeatureAccess::Lifecycle
             }
         };
         // Ticket tools are typed operations over the current workspace Ticket backend.
@@ -728,10 +722,9 @@ where
             }
         };
         feature_registry.add_module(
-            crate::feature::builtin::ticket::ticket_tools_feature_with_options(
+            crate::feature::builtin::ticket::ticket_tools_feature_with_backend(
                 ticket_backend,
-                feature_config.ticket.enabled.then_some(ticket_access),
-                feature_config.ticket_orchestration.enabled,
+                ticket_access,
             ),
         );
     }

@@ -87,8 +87,6 @@ pub struct FeatureConfigPartial {
     #[serde(default)]
     pub ticket: Option<TicketFeatureConfigPartial>,
     #[serde(default)]
-    pub ticket_orchestration: Option<FeatureFlagConfigPartial>,
-    #[serde(default)]
     pub plugins: Option<FeatureFlagConfigPartial>,
 }
 
@@ -100,11 +98,6 @@ impl FeatureConfigPartial {
             web: merge_option(self.web, other.web, FeatureFlagConfigPartial::merge),
             workers: merge_option(self.workers, other.workers, FeatureFlagConfigPartial::merge),
             ticket: merge_option(self.ticket, other.ticket, TicketFeatureConfigPartial::merge),
-            ticket_orchestration: merge_option(
-                self.ticket_orchestration,
-                other.ticket_orchestration,
-                FeatureFlagConfigPartial::merge,
-            ),
             plugins: merge_option(self.plugins, other.plugins, FeatureFlagConfigPartial::merge),
         }
     }
@@ -128,10 +121,6 @@ impl FeatureFlagConfigPartial {
 pub struct TicketFeatureConfigPartial {
     #[serde(default)]
     pub enabled: Option<bool>,
-    /// Legacy access field. Prefer `preset` for new profile/DCDL authoring.
-    #[serde(default)]
-    pub access: Option<TicketFeatureAccessConfig>,
-    /// Semantic Ticket access preset for profile/DCDL authoring.
     #[serde(default)]
     pub preset: Option<TicketFeatureAccessConfig>,
 }
@@ -140,7 +129,6 @@ impl TicketFeatureConfigPartial {
     fn merge(self, other: Self) -> Self {
         Self {
             enabled: other.enabled.or(self.enabled),
-            access: other.access.or(self.access),
             preset: other.preset.or(self.preset),
         }
     }
@@ -162,10 +150,6 @@ impl From<FeatureConfigPartial> for FeatureConfig {
             ticket: value
                 .ticket
                 .map(TicketFeatureConfig::from)
-                .unwrap_or_default(),
-            ticket_orchestration: value
-                .ticket_orchestration
-                .map(FeatureFlagConfig::from)
                 .unwrap_or_default(),
             plugins: value
                 .plugins
@@ -195,7 +179,7 @@ impl From<TicketFeatureConfigPartial> for TicketFeatureConfig {
     fn from(value: TicketFeatureConfigPartial) -> Self {
         Self {
             enabled: value.enabled.unwrap_or_default(),
-            access: value.preset.or(value.access).unwrap_or_default(),
+            preset: value.preset.unwrap_or_default(),
         }
     }
 }
@@ -204,8 +188,7 @@ impl From<TicketFeatureConfig> for TicketFeatureConfigPartial {
     fn from(value: TicketFeatureConfig) -> Self {
         Self {
             enabled: Some(value.enabled),
-            access: Some(value.access),
-            preset: None,
+            preset: Some(value.preset),
         }
     }
 }
@@ -218,7 +201,6 @@ impl From<FeatureConfig> for FeatureConfigPartial {
             web: Some(value.web.into()),
             workers: Some(value.workers.into()),
             ticket: Some(value.ticket.into()),
-            ticket_orchestration: Some(value.ticket_orchestration.into()),
             plugins: Some(value.plugins.into()),
         }
     }
@@ -1764,7 +1746,6 @@ worker_max_turns = 7
         assert!(!manifest.feature.web.enabled);
         assert!(!manifest.feature.workers.enabled);
         assert!(!manifest.feature.ticket.enabled);
-        assert!(!manifest.feature.ticket_orchestration.enabled);
     }
 
     #[test]
@@ -1776,10 +1757,7 @@ enabled = true
 
 [feature.ticket]
 enabled = true
-access = "read_only"
-
-[feature.ticket_orchestration]
-enabled = true
+preset = "read_only"
 "#,
         )
         .unwrap();
@@ -1810,10 +1788,9 @@ enabled = true
         assert!(manifest.feature.task.enabled);
         assert!(manifest.feature.ticket.enabled);
         assert_eq!(
-            manifest.feature.ticket.access,
+            manifest.feature.ticket.preset,
             TicketFeatureAccessConfig::ReadOnly
         );
-        assert!(manifest.feature.ticket_orchestration.enabled);
         assert!(!manifest.feature.memory.enabled);
     }
 
@@ -1826,14 +1803,14 @@ enabled = true
 
 [feature.ticket]
 enabled = true
-access = "read_only"
+preset = "read_only"
 "#,
         )
         .unwrap();
         let upper = WorkerManifestConfig::from_toml(
             r#"
 [feature.ticket]
-access = "lifecycle"
+preset = "orchestration_control"
 
 [feature.web]
 enabled = true
@@ -1868,8 +1845,8 @@ enabled = true
         assert!(manifest.feature.memory.enabled);
         assert!(manifest.feature.ticket.enabled);
         assert_eq!(
-            manifest.feature.ticket.access,
-            TicketFeatureAccessConfig::Lifecycle
+            manifest.feature.ticket.preset,
+            TicketFeatureAccessConfig::OrchestrationControl
         );
         assert!(manifest.feature.web.enabled);
         assert!(!manifest.feature.workers.enabled);
