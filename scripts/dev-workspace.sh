@@ -318,7 +318,7 @@ start_runtime() {
     return 1
   fi
   start_service runtime "$ROOT_DIR" "$port" \
-    "$runtime_bin" --bind "$RUNTIME_BIND"
+    env RUST_BACKTRACE="${RUST_BACKTRACE:-1}" "$runtime_bin" --bind "$RUNTIME_BIND"
 }
 
 start_backend() {
