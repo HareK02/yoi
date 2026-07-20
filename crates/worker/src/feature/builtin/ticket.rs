@@ -10,9 +10,9 @@ use ticket::{
     LocalTicketBackend, MarkdownText, NewOrchestrationPlanRecord, NewTicket, NewTicketEvent,
     NewTicketRelation, OrchestrationPlanKind, OrchestrationPlanRecord, Result as TicketResult,
     Ticket, TicketBackend, TicketBackendHttpResponse, TicketBackendOperation,
-    TicketBackendOperationResult, TicketDoctorReport, TicketError, TicketFilter, TicketIdOrSlug,
-    TicketIntakeSummary, TicketRef, TicketRelation, TicketRelationKind, TicketRelationView,
-    TicketReview, TicketStateChange, TicketSummary,
+    TicketBackendOperationResult, TicketDoctorReport, TicketError, TicketIdOrSlug,
+    TicketIntakeSummary, TicketListQuery, TicketRef, TicketRelation, TicketRelationKind,
+    TicketRelationView, TicketReview, TicketStateChange, TicketSummary,
     config::{DEFAULT_TICKET_BACKEND_RELATIVE_PATH, TicketConfig},
     tool::{
         TICKET_BASE_READ_ONLY_TOOL_NAMES, TICKET_BASE_TOOL_NAMES,
@@ -400,7 +400,7 @@ impl TicketBackend for WorkspaceHttpTicketBackend {
         }
     }
 
-    fn list(&self, filter: TicketFilter) -> TicketResult<Vec<TicketSummary>> {
+    fn list(&self, filter: TicketListQuery) -> TicketResult<Vec<TicketSummary>> {
         expect_ticket_result!(
             self.invoke(TicketBackendOperation::List { filter }),
             TicketBackendOperationResult::Tickets

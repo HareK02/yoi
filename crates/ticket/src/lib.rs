@@ -510,18 +510,75 @@ impl NewTicket {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TicketFilter {
-    pub state: Option<TicketWorkflowState>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketStateSelector {
+    /// All non-closed workflow states: planning, ready, queued, inprogress, and done.
+    Active,
+    /// Every workflow state, including closed.
+    All,
+    /// An explicit set of workflow states.
+    States(BTreeSet<TicketWorkflowState>),
 }
 
-impl TicketFilter {
+impl Default for TicketStateSelector {
+    fn default() -> Self {
+        Self::Active
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketListQuery {
+    pub state: TicketStateSelector,
+}
+
+impl Default for TicketListQuery {
+    fn default() -> Self {
+        Self::active()
+    }
+}
+
+impl TicketListQuery {
+    pub fn active() -> Self {
+        Self {
+            state: TicketStateSelector::Active,
+        }
+    }
+
     pub fn all() -> Self {
-        Self { state: None }
+        Self {
+            state: TicketStateSelector::All,
+        }
     }
 
     pub fn state(state: TicketWorkflowState) -> Self {
-        Self { state: Some(state) }
+        Self::states([state])
+    }
+
+    pub fn states(states: impl IntoIterator<Item = TicketWorkflowState>) -> Self {
+        Self {
+            state: TicketStateSelector::States(states.into_iter().collect()),
+        }
+    }
+
+    pub fn matches_state(&self, state: TicketWorkflowState) -> bool {
+        match &self.state {
+            TicketStateSelector::Active => state != TicketWorkflowState::Closed,
+            TicketStateSelector::All => true,
+            TicketStateSelector::States(states) => states.contains(&state),
+        }
+    }
+
+    pub fn state_filter_label(&self) -> String {
+        match &self.state {
+            TicketStateSelector::Active => "active".to_string(),
+            TicketStateSelector::All => "all".to_string(),
+            TicketStateSelector::States(states) => states
+                .iter()
+                .map(|state| state.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+        }
     }
 }
 
@@ -873,7 +930,7 @@ impl TicketDoctorReport {
 
 pub trait TicketBackend {
     fn default_intake_ready_state_change_body(&self, from: &str) -> String;
-    fn list(&self, filter: TicketFilter) -> Result<Vec<TicketSummary>>;
+    fn list(&self, filter: TicketListQuery) -> Result<Vec<TicketSummary>>;
     fn show(&self, id: TicketIdOrSlug) -> Result<Ticket>;
     fn create(&self, input: NewTicket) -> Result<TicketRef>;
     fn add_event(&self, id: TicketIdOrSlug, event: NewTicketEvent) -> Result<()>;
@@ -926,7 +983,7 @@ pub enum TicketBackendOperation {
         from: String,
     },
     List {
-        filter: TicketFilter,
+        filter: TicketListQuery,
     },
     Show {
         id: TicketIdOrSlug,
@@ -1143,10 +1200,10 @@ impl LocalTicketBackend {
         }
     }
 
-    pub fn list_partial(&self, filter: TicketFilter) -> Result<TicketPartialList> {
+    pub fn list_partial(&self, filter: TicketListQuery) -> Result<TicketPartialList> {
         let mut output = TicketPartialList::default();
         let mut invalid_seen = BTreeSet::new();
-        for dir in self.iter_ticket_dirs(TicketFilter::all())? {
+        for dir in self.iter_ticket_dirs(TicketListQuery::all())? {
             let item = dir.join("item.md");
             if !item.exists() {
                 continue;
@@ -1155,10 +1212,7 @@ impl LocalTicketBackend {
                 .and_then(|parsed| ticket_meta_for_dir(&dir, parsed.frontmatter))
             {
                 Ok(meta) => {
-                    if filter
-                        .state
-                        .is_some_and(|state| meta.workflow_state != state)
-                    {
+                    if !filter.matches_state(meta.workflow_state) {
                         continue;
                     }
                     output.tickets.push(ticket_summary_from_meta(meta));
@@ -1255,7 +1309,7 @@ impl LocalTicketBackend {
         }
     }
 
-    fn iter_ticket_dirs(&self, filter: TicketFilter) -> Result<Vec<PathBuf>> {
+    fn iter_ticket_dirs(&self, filter: TicketListQuery) -> Result<Vec<PathBuf>> {
         let mut dirs = Vec::new();
         if !self.root.exists() {
             return Ok(dirs);
@@ -1275,10 +1329,10 @@ impl LocalTicketBackend {
             if !item.is_file() {
                 continue;
             }
-            if let Some(state) = filter.state {
+            if !matches!(filter.state, TicketStateSelector::All) {
                 let parsed = read_item_file(&item)?;
                 let meta = ticket_meta_for_dir(&path, parsed.frontmatter)?;
-                if meta.workflow_state != state {
+                if !filter.matches_state(meta.workflow_state) {
                     continue;
                 }
             }
@@ -1495,7 +1549,7 @@ impl LocalTicketBackend {
 
     fn all_ticket_relation_records(&self) -> Result<Vec<TicketRelation>> {
         let mut relations = Vec::new();
-        for dir in self.iter_ticket_dirs(TicketFilter::all())? {
+        for dir in self.iter_ticket_dirs(TicketListQuery::all())? {
             relations.extend(self.read_ticket_relations_for_dir(&dir)?);
         }
         sort_ticket_relations(&mut relations);
@@ -1508,7 +1562,7 @@ impl LocalTicketBackend {
         invalid_seen: &mut BTreeSet<String>,
     ) -> Result<Vec<TicketRelation>> {
         let mut relations = Vec::new();
-        for dir in self.iter_ticket_dirs(TicketFilter::all())? {
+        for dir in self.iter_ticket_dirs(TicketListQuery::all())? {
             match self.read_ticket_relations_for_dir(&dir) {
                 Ok(records) => relations.extend(records),
                 Err(error) => {
@@ -1539,7 +1593,7 @@ impl LocalTicketBackend {
 
     fn ticket_state_index(&self) -> Result<HashMap<String, TicketWorkflowState>> {
         let mut states = HashMap::new();
-        for dir in self.iter_ticket_dirs(TicketFilter::all())? {
+        for dir in self.iter_ticket_dirs(TicketListQuery::all())? {
             let item = dir.join("item.md");
             let meta = ticket_meta_for_dir(&dir, read_item_file(&item)?.frontmatter)?;
             states.insert(meta.id, meta.workflow_state);
@@ -1553,7 +1607,7 @@ impl LocalTicketBackend {
         invalid_seen: &mut BTreeSet<String>,
     ) -> Result<HashMap<String, TicketWorkflowState>> {
         let mut states = HashMap::new();
-        for dir in self.iter_ticket_dirs(TicketFilter::all())? {
+        for dir in self.iter_ticket_dirs(TicketListQuery::all())? {
             let item = dir.join("item.md");
             match read_item_file(&item)
                 .and_then(|parsed| ticket_meta_for_dir(&dir, parsed.frontmatter))
@@ -1589,7 +1643,7 @@ impl TicketBackend for LocalTicketBackend {
         self.default_intake_ready_state_change_body(from)
     }
 
-    fn list(&self, filter: TicketFilter) -> Result<Vec<TicketSummary>> {
+    fn list(&self, filter: TicketListQuery) -> Result<Vec<TicketSummary>> {
         let mut tickets = Vec::new();
         for dir in self.iter_ticket_dirs(filter)? {
             let item = dir.join("item.md");
@@ -2088,7 +2142,7 @@ impl TicketBackend for LocalTicketBackend {
             let dir = self.find_ticket_dir(&ticket)?;
             records.extend(self.read_orchestration_plan_records_for_dir(&dir)?);
         } else {
-            for dir in self.iter_ticket_dirs(TicketFilter::all())? {
+            for dir in self.iter_ticket_dirs(TicketListQuery::all())? {
                 records.extend(self.read_orchestration_plan_records_for_dir(&dir)?);
             }
         }
@@ -2117,7 +2171,7 @@ impl TicketBackend for LocalTicketBackend {
             }
         }
 
-        for dir in self.iter_ticket_dirs(TicketFilter::all())? {
+        for dir in self.iter_ticket_dirs(TicketListQuery::all())? {
             let ticket_id = match ticket_id_from_dir(&dir) {
                 Ok(id) => id,
                 Err(err) => {
@@ -3976,6 +4030,57 @@ state: planning
     }
 
     #[test]
+    fn list_query_defaults_to_active_and_supports_all_or_explicit_states() {
+        let tmp = TempDir::new().unwrap();
+        let backend = backend(&tmp);
+        let planning = backend.create(NewTicket::new("Planning Ticket")).unwrap();
+        let mut ready_input = NewTicket::new("Ready Ticket");
+        ready_input.workflow_state = Some(TicketWorkflowState::Ready);
+        let ready = backend.create(ready_input).unwrap();
+        let mut closed_input = NewTicket::new("Closed Ticket");
+        closed_input.workflow_state = Some(TicketWorkflowState::Closed);
+        let closed = backend.create(closed_input).unwrap();
+
+        let active = backend.list(TicketListQuery::default()).unwrap();
+        let active_ids = active
+            .iter()
+            .map(|ticket| ticket.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(active_ids.contains(&planning.id.as_str()));
+        assert!(active_ids.contains(&ready.id.as_str()));
+        assert!(!active_ids.contains(&closed.id.as_str()));
+
+        let all = backend.list(TicketListQuery::all()).unwrap();
+        let all_ids = all
+            .iter()
+            .map(|ticket| ticket.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(all_ids.contains(&planning.id.as_str()));
+        assert!(all_ids.contains(&ready.id.as_str()));
+        assert!(all_ids.contains(&closed.id.as_str()));
+
+        let ready_only = backend
+            .list(TicketListQuery::state(TicketWorkflowState::Ready))
+            .unwrap();
+        assert_eq!(ready_only.len(), 1);
+        assert_eq!(ready_only[0].id, ready.id);
+
+        let planning_or_closed = backend
+            .list(TicketListQuery::states([
+                TicketWorkflowState::Planning,
+                TicketWorkflowState::Closed,
+            ]))
+            .unwrap();
+        let explicit_ids = planning_or_closed
+            .iter()
+            .map(|ticket| ticket.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(explicit_ids.contains(&planning.id.as_str()));
+        assert!(explicit_ids.contains(&closed.id.as_str()));
+        assert!(!explicit_ids.contains(&ready.id.as_str()));
+    }
+
+    #[test]
     fn create_writes_local_ticket_layout() {
         let tmp = TempDir::new().unwrap();
         let backend = backend(&tmp);
@@ -4036,9 +4141,9 @@ state: planning
         )
         .unwrap();
 
-        assert!(backend.list(TicketFilter::all()).is_err());
+        assert!(backend.list(TicketListQuery::all()).is_err());
 
-        let partial = backend.list_partial(TicketFilter::all()).unwrap();
+        let partial = backend.list_partial(TicketListQuery::all()).unwrap();
         assert_eq!(partial.tickets.len(), 1);
         assert_eq!(partial.tickets[0].id, valid.id);
         assert_eq!(partial.invalid_records.len(), 1);
