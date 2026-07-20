@@ -8,6 +8,6 @@ import "./default.dcdl" // {
         memory = { enabled = true; };
         web = { enabled = true; };
         workers = { enabled = false; };
-        ticket = { enabled = true; preset = "review"; };
+        ticket = { enabled = true; thread = true; };
     };
 }

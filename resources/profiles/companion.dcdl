@@ -8,6 +8,6 @@ import "./default.dcdl" // {
         memory = { enabled = true; };
         web = { enabled = true; };
         workers = { enabled = true; };
-        ticket = { enabled = true; preset = "workspace_authoring"; };
+        ticket = { enabled = true; authoring = true; thread = true; };
     };
 }

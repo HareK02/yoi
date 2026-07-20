@@ -238,7 +238,8 @@ enabled = false
 
 [feature.ticket]
 enabled = true
-preset = "workspace_authoring"
+authoring = true
+thread = true
 
 [memory]
 extract_threshold = 50000
@@ -296,7 +297,7 @@ mod tests {
         assert!(profile.contains("ref = \"codex-oauth/gpt-5.5\""));
         assert!(profile.contains("scope = \"workspace_write\""));
         assert!(
-            profile.contains("[feature.ticket]\nenabled = true\npreset = \"workspace_authoring\"")
+            profile.contains("[feature.ticket]\nenabled = true\nauthoring = true\nthread = true")
         );
     }
 

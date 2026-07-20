@@ -14,7 +14,7 @@ use ticket::{
     TicketIntakeSummary, TicketListQuery, TicketRef, TicketRelation, TicketRelationKind,
     TicketRelationView, TicketReview, TicketStateChange, TicketSummary,
     config::{DEFAULT_TICKET_BACKEND_RELATIVE_PATH, TicketConfig},
-    tool::{TicketToolBackend, ticket_tool_description, ticket_tools},
+    tool::{TICKET_TOOL_NAMES, TicketToolBackend, ticket_tool_description, ticket_tools},
 };
 
 use crate::feature::{
@@ -27,23 +27,88 @@ const FEATURE_NAME: &str = "Ticket tools";
 const FEATURE_DESCRIPTION: &str = "Typed local Ticket work-item operations over a bounded backend root. \
 The tools operate through the ticket crate backend and do not grant generic filesystem write scope.";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TicketFeatureAccess {
-    /// Status/diagnostic access for views that must not mutate Tickets.
-    ReadOnly,
-    /// User/Companion authoring access for shaping current Ticket specs and queueing work.
-    WorkspaceAuthoring,
-    /// Intake access for creating/refining planning Tickets and marking them ready.
-    Intake,
-    /// Orchestrator control access for state/thread/relation/orchestration operations.
-    OrchestrationControl,
-    /// Coder-style access for reading Tickets and writing implementation reports/comments.
-    WorkReport,
-    /// Reviewer-style access for reading Tickets and writing review/comment thread events.
-    Review,
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TicketFeatureAccess {
+    pub authoring: bool,
+    pub thread: bool,
+    pub intake: bool,
+    pub orchestration_control: bool,
 }
 
-const READ_ONLY_TOOL_NAMES: [&str; 6] = [
+impl TicketFeatureAccess {
+    pub const fn read_only() -> Self {
+        Self {
+            authoring: false,
+            thread: false,
+            intake: false,
+            orchestration_control: false,
+        }
+    }
+
+    pub const fn workspace_authoring() -> Self {
+        Self {
+            authoring: true,
+            thread: true,
+            intake: false,
+            orchestration_control: false,
+        }
+    }
+
+    pub const fn intake() -> Self {
+        Self {
+            authoring: true,
+            thread: true,
+            intake: true,
+            orchestration_control: false,
+        }
+    }
+
+    pub const fn orchestration_control() -> Self {
+        Self {
+            authoring: false,
+            thread: true,
+            intake: false,
+            orchestration_control: true,
+        }
+    }
+
+    pub const fn work_report() -> Self {
+        Self {
+            authoring: false,
+            thread: true,
+            intake: false,
+            orchestration_control: false,
+        }
+    }
+
+    pub const fn review() -> Self {
+        Self {
+            authoring: false,
+            thread: true,
+            intake: false,
+            orchestration_control: false,
+        }
+    }
+
+    pub fn tool_names(self) -> Vec<&'static str> {
+        TICKET_TOOL_NAMES
+            .iter()
+            .copied()
+            .filter(|name| self.allows_tool(name))
+            .collect()
+    }
+
+    fn allows_tool(self, name: &str) -> bool {
+        READ_ONLY_TOOL_NAMES.contains(&name)
+            || (self.authoring && AUTHORING_TOOL_NAMES.contains(&name))
+            || (self.thread && THREAD_TOOL_NAMES.contains(&name))
+            || (self.intake && INTAKE_TOOL_NAMES.contains(&name))
+            || (self.orchestration_control
+                && ORCHESTRATION_CONTROL_ADDITIONAL_TOOL_NAMES.contains(&name))
+    }
+}
+
+const READ_ONLY_TOOL_NAMES: &[&str] = &[
     "TicketList",
     "TicketShow",
     "TicketDependencyCheck",
@@ -52,7 +117,19 @@ const READ_ONLY_TOOL_NAMES: [&str; 6] = [
     "TicketOrchestrationPlanQuery",
 ];
 
-const WORKSPACE_AUTHORING_TOOL_NAMES: [&str; 12] = [
+const AUTHORING_TOOL_NAMES: &[&str] = &[
+    "TicketCreate",
+    "TicketEditItem",
+    "TicketQueue",
+    "TicketClose",
+    "TicketRelationRecord",
+];
+
+const THREAD_TOOL_NAMES: &[&str] = &["TicketComment", "TicketReview"];
+
+const INTAKE_TOOL_NAMES: &[&str] = &["TicketIntakeReady"];
+
+const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketCreate",
     "TicketEditItem",
     "TicketList",
@@ -65,22 +142,10 @@ const WORKSPACE_AUTHORING_TOOL_NAMES: [&str; 12] = [
     "TicketDoctor",
     "TicketRelationRecord",
     "TicketRelationQuery",
+    "TicketOrchestrationPlanQuery",
 ];
 
-const INTAKE_TOOL_NAMES: [&str; 10] = [
-    "TicketCreate",
-    "TicketEditItem",
-    "TicketList",
-    "TicketShow",
-    "TicketComment",
-    "TicketIntakeReady",
-    "TicketDependencyCheck",
-    "TicketDoctor",
-    "TicketRelationRecord",
-    "TicketRelationQuery",
-];
-
-const ORCHESTRATION_CONTROL_TOOL_NAMES: [&str; 12] = [
+const ORCHESTRATION_CONTROL_TOOL_NAMES: &[&str] = &[
     "TicketList",
     "TicketShow",
     "TicketComment",
@@ -95,39 +160,12 @@ const ORCHESTRATION_CONTROL_TOOL_NAMES: [&str; 12] = [
     "TicketOrchestrationPlanQuery",
 ];
 
-const WORK_REPORT_TOOL_NAMES: [&str; 7] = [
-    "TicketList",
-    "TicketShow",
-    "TicketComment",
-    "TicketDependencyCheck",
-    "TicketDoctor",
-    "TicketRelationQuery",
-    "TicketOrchestrationPlanQuery",
+const ORCHESTRATION_CONTROL_ADDITIONAL_TOOL_NAMES: &[&str] = &[
+    "TicketWorkflowState",
+    "TicketClose",
+    "TicketRelationRecord",
+    "TicketOrchestrationPlanRecord",
 ];
-
-const REVIEW_TOOL_NAMES: [&str; 8] = [
-    "TicketList",
-    "TicketShow",
-    "TicketComment",
-    "TicketReview",
-    "TicketDependencyCheck",
-    "TicketDoctor",
-    "TicketRelationQuery",
-    "TicketOrchestrationPlanQuery",
-];
-
-impl TicketFeatureAccess {
-    pub fn tool_names(self) -> &'static [&'static str] {
-        match self {
-            Self::ReadOnly => &READ_ONLY_TOOL_NAMES,
-            Self::WorkspaceAuthoring => &WORKSPACE_AUTHORING_TOOL_NAMES,
-            Self::Intake => &INTAKE_TOOL_NAMES,
-            Self::OrchestrationControl => &ORCHESTRATION_CONTROL_TOOL_NAMES,
-            Self::WorkReport => &WORK_REPORT_TOOL_NAMES,
-            Self::Review => &REVIEW_TOOL_NAMES,
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub enum TicketFeatureBackend {
@@ -173,7 +211,7 @@ pub struct TicketFeature {
 
 impl TicketFeature {
     pub fn new(backend_root: impl Into<PathBuf>) -> Self {
-        Self::new_with_access(backend_root, TicketFeatureAccess::WorkspaceAuthoring)
+        Self::new_with_access(backend_root, TicketFeatureAccess::workspace_authoring())
     }
 
     pub fn new_with_access(backend_root: impl Into<PathBuf>, access: TicketFeatureAccess) -> Self {
@@ -198,7 +236,7 @@ impl TicketFeature {
     }
 
     pub fn for_workspace(workspace: impl AsRef<Path>) -> Self {
-        Self::for_workspace_with_access(workspace, TicketFeatureAccess::WorkspaceAuthoring)
+        Self::for_workspace_with_access(workspace, TicketFeatureAccess::workspace_authoring())
     }
 
     pub fn for_workspace_with_access(
@@ -237,7 +275,7 @@ impl TicketFeature {
         self.access
     }
 
-    fn enabled_tool_names(&self) -> &'static [&'static str] {
+    fn enabled_tool_names(&self) -> Vec<&'static str> {
         self.access.tool_names()
     }
 
@@ -298,7 +336,7 @@ impl FeatureModule for TicketFeature {
         let enabled_tool_names = self.enabled_tool_names();
         for name in enabled_tool_names {
             descriptor = descriptor.with_tool(ToolDeclaration::new(
-                *name,
+                name,
                 ticket_tool_description(name, self.record_language.as_deref()),
             ));
         }
@@ -701,9 +739,10 @@ mod tests {
     #[test]
     fn read_only_descriptor_declares_only_state_tools() {
         let temp = TempDir::new().unwrap();
-        let feature = ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::ReadOnly);
+        let feature =
+            ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::read_only());
         let descriptor = feature.descriptor();
-        assert_eq!(feature.access(), TicketFeatureAccess::ReadOnly);
+        assert_eq!(feature.access(), TicketFeatureAccess::read_only());
         assert_eq!(descriptor.tools.len(), READ_ONLY_TOOL_NAMES.len());
         assert_eq!(
             descriptor
@@ -720,10 +759,13 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let feature = ticket_tools_feature_with_access(
             temp.path(),
-            TicketFeatureAccess::OrchestrationControl,
+            TicketFeatureAccess::orchestration_control(),
         );
         let descriptor = feature.descriptor();
-        assert_eq!(feature.access(), TicketFeatureAccess::OrchestrationControl);
+        assert_eq!(
+            feature.access(),
+            TicketFeatureAccess::orchestration_control()
+        );
         assert_eq!(
             descriptor
                 .tools
@@ -735,11 +777,13 @@ mod tests {
     }
 
     #[test]
-    fn semantic_access_presets_expose_role_capability_surfaces() {
+    fn additive_ticket_capabilities_expose_expected_tool_surfaces() {
         let temp = TempDir::new().unwrap();
 
-        let workspace_authoring =
-            ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::WorkspaceAuthoring);
+        let workspace_authoring = ticket_tools_feature_with_access(
+            temp.path(),
+            TicketFeatureAccess::workspace_authoring(),
+        );
         let workspace_descriptor = workspace_authoring.descriptor();
         let workspace_tools = workspace_descriptor
             .tools
@@ -753,7 +797,7 @@ mod tests {
 
         let orchestration = ticket_tools_feature_with_access(
             temp.path(),
-            TicketFeatureAccess::OrchestrationControl,
+            TicketFeatureAccess::orchestration_control(),
         );
         let orchestration_descriptor = orchestration.descriptor();
         let orchestration_tools = orchestration_descriptor
@@ -769,7 +813,7 @@ mod tests {
         assert!(!orchestration_tools.contains(&"TicketQueue"));
 
         let work_report =
-            ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::WorkReport);
+            ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::work_report());
         let work_report_descriptor = work_report.descriptor();
         let work_report_tools = work_report_descriptor
             .tools
@@ -777,10 +821,10 @@ mod tests {
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>();
         assert!(work_report_tools.contains(&"TicketComment"));
-        assert!(!work_report_tools.contains(&"TicketReview"));
+        assert!(work_report_tools.contains(&"TicketReview"));
         assert!(!work_report_tools.contains(&"TicketWorkflowState"));
 
-        let review = ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::Review);
+        let review = ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::review());
         let review_descriptor = review.descriptor();
         let review_tools = review_descriptor
             .tools
@@ -800,7 +844,7 @@ mod tests {
         let report = FeatureRegistryBuilder::new()
             .with_module(ticket_tools_feature_with_access(
                 temp.path(),
-                TicketFeatureAccess::ReadOnly,
+                TicketFeatureAccess::read_only(),
             ))
             .install_into_pending(&mut pending_tools, &mut hooks);
 
@@ -833,7 +877,8 @@ language = "Japanese"
 "#,
         );
         make_ticket_root(&temp.path().join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH));
-        let feature = ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::ReadOnly);
+        let feature =
+            ticket_tools_feature_with_access(temp.path(), TicketFeatureAccess::read_only());
         let descriptor = feature.descriptor();
         let descriptor_description = descriptor
             .tools
@@ -867,7 +912,7 @@ language = "Japanese"
         let report = FeatureRegistryBuilder::new()
             .with_module(ticket_tools_feature_with_access(
                 temp.path(),
-                TicketFeatureAccess::WorkspaceAuthoring,
+                TicketFeatureAccess::workspace_authoring(),
             ))
             .install_into_pending(&mut pending_tools, &mut hooks);
 
@@ -906,7 +951,7 @@ language = "Japanese"
         let report = FeatureRegistryBuilder::new()
             .with_module(ticket_tools_feature_with_access(
                 temp.path(),
-                TicketFeatureAccess::WorkspaceAuthoring,
+                TicketFeatureAccess::workspace_authoring(),
             ))
             .install_into_pending(&mut pending_tools, &mut hooks);
 

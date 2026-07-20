@@ -153,38 +153,18 @@ impl Default for FeatureFlagConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TicketFeatureConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
-    pub preset: TicketFeatureAccessConfig,
-}
-
-impl Default for TicketFeatureConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            preset: TicketFeatureAccessConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TicketFeatureAccessConfig {
-    ReadOnly,
-    WorkspaceAuthoring,
-    Intake,
-    OrchestrationControl,
-    WorkReport,
-    Review,
-}
-
-impl Default for TicketFeatureAccessConfig {
-    fn default() -> Self {
-        Self::WorkspaceAuthoring
-    }
+    pub authoring: bool,
+    #[serde(default)]
+    pub thread: bool,
+    #[serde(default)]
+    pub intake: bool,
+    #[serde(default)]
+    pub orchestration_control: bool,
 }
 
 /// External Agent Skills (`SKILL.md`) ingest configuration. Skills are

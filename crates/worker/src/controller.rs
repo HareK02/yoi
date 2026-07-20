@@ -4,7 +4,6 @@ use std::sync::atomic::Ordering;
 
 use llm_engine::EngineError;
 use llm_engine::llm_client::client::LlmClient;
-use manifest::TicketFeatureAccessConfig;
 use session_store::WorkerMetadataStore;
 use session_store::{LogEntry, Store};
 use ticket::LocalTicketBackend;
@@ -547,9 +546,7 @@ fn install_ticket_event_companion_notify_hook<C, St>(
     }
 
     let ticket_feature = &worker.manifest().feature.ticket;
-    if !ticket_feature.enabled
-        || ticket_feature.preset != TicketFeatureAccessConfig::OrchestrationControl
-    {
+    if !ticket_feature.enabled || !ticket_feature.orchestration_control {
         return;
     }
 
@@ -675,25 +672,11 @@ where
         feature_registry.add_module(task_feature);
     }
     if feature_config.ticket.enabled {
-        let ticket_access = match feature_config.ticket.preset {
-            TicketFeatureAccessConfig::ReadOnly => {
-                crate::feature::builtin::ticket::TicketFeatureAccess::ReadOnly
-            }
-            TicketFeatureAccessConfig::WorkspaceAuthoring => {
-                crate::feature::builtin::ticket::TicketFeatureAccess::WorkspaceAuthoring
-            }
-            TicketFeatureAccessConfig::Intake => {
-                crate::feature::builtin::ticket::TicketFeatureAccess::Intake
-            }
-            TicketFeatureAccessConfig::OrchestrationControl => {
-                crate::feature::builtin::ticket::TicketFeatureAccess::OrchestrationControl
-            }
-            TicketFeatureAccessConfig::WorkReport => {
-                crate::feature::builtin::ticket::TicketFeatureAccess::WorkReport
-            }
-            TicketFeatureAccessConfig::Review => {
-                crate::feature::builtin::ticket::TicketFeatureAccess::Review
-            }
+        let ticket_access = crate::feature::builtin::ticket::TicketFeatureAccess {
+            authoring: feature_config.ticket.authoring,
+            thread: feature_config.ticket.thread,
+            intake: feature_config.ticket.intake,
+            orchestration_control: feature_config.ticket.orchestration_control,
         };
         // Ticket tools are typed operations over the current workspace Ticket backend.
         // Runtime-hosted Workers prefer the workspace API URI carried by the
