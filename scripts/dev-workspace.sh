@@ -410,13 +410,42 @@ schedule_detached_action() {
   local action="$1"
   ensure_dirs
 
-  local stamp job_log
+  local stamp job_log job_unit
   stamp="$(date +%Y%m%d-%H%M%S)"
   job_log="$LOG_DIR/${action}-$stamp.job.log"
+  job_unit="${UNIT_PREFIX}-${action}-${stamp}-job.service"
 
   log "scheduling $action in ${ACTION_DELAY_SECONDS}s; log: $job_log"
+  if systemd_available; then
+    systemd-run --user --unit="$job_unit" --collect --working-directory="$ROOT_DIR" \
+      --property="StandardOutput=append:$job_log" \
+      --property="StandardError=append:$job_log" \
+      bash -c '
+        set -uo pipefail
+        delay="$1"
+        root="$2"
+        action="$3"
+        sleep "$delay"
+        cd "$root"
+        printf "[%s] dev-workspace %s starting\n" "$(date -Is)" "$action"
+        YOI_DEV_WORKSPACE_FOREGROUND=1 "$root/scripts/dev-workspace.sh" "$action"
+        status=$?
+        printf "[%s] dev-workspace %s finished with status %s\n" "$(date -Is)" "$action" "$status"
+        exit "$status"
+      ' dev-workspace-job "$ACTION_DELAY_SECONDS" "$ROOT_DIR" "$action" >/dev/null
+
+    local scheduled_pid
+    scheduled_pid="$(systemctl --user show -P MainPID "$job_unit" 2>/dev/null | awk '$1 != "" && $1 != "0" { print $1; exit }' || true)"
+    printf 'scheduled_action=%s\n' "$action"
+    printf 'scheduled_unit=%s\n' "$job_unit"
+    printf 'scheduled_pid=%s\n' "${scheduled_pid:--}"
+    printf 'scheduled_after_seconds=%s\n' "$ACTION_DELAY_SECONDS"
+    printf 'scheduled_log=%s\n' "$job_log"
+    return 0
+  fi
+
   nohup setsid bash -c '
-    set -euo pipefail
+    set -uo pipefail
     delay="$1"
     root="$2"
     action="$3"
