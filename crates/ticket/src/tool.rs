@@ -97,8 +97,8 @@ const CREATE_DESCRIPTION: &str = "Create a Ticket through the configured typed T
 Inputs mirror the Ticket `item.md` fields; `title` is required, `body` is Markdown, and the \
 backend assigns the id and writes the local Ticket file layout under the configured backend root.";
 const LIST_DESCRIPTION: &str = "List Tickets from the configured typed Ticket backend as a \
-lightweight bounded overview for selection only. Filter by state (`planning`, `ready`, `queued`, \
-`inprogress`, `done`, `closed`, or `all`). Output is short summaries only; use TicketShow before \
+lightweight bounded overview for selection only. Filter by query (`active`, `all`, a single workflow \
+state, or an explicit workflow-state list). Output is short summaries only; use TicketShow before \
 routing, closing, planning, or implementation decisions.";
 const SHOW_DESCRIPTION: &str = "Show one Ticket by id or exact query through the configured \
 typed Ticket backend. Output includes bounded Markdown body, recent thread events, resolution, and \
@@ -214,7 +214,7 @@ impl TicketBackend for TicketToolBackend {
         self.backend.default_intake_ready_state_change_body(from)
     }
 
-    fn list(&self, filter: crate::TicketFilter) -> TicketResult<Vec<TicketSummary>> {
+    fn list(&self, filter: crate::TicketListQuery) -> TicketResult<Vec<TicketSummary>> {
         self.backend.list(filter)
     }
 
@@ -375,9 +375,10 @@ impl TicketWorkflowStateParam {
     }
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum TicketListStateParam {
+    Active,
     Planning,
     Ready,
     Queued,
@@ -388,45 +389,60 @@ enum TicketListStateParam {
 }
 
 impl TicketListStateParam {
-    fn as_filter(self) -> (crate::TicketFilter, &'static str) {
+    fn as_state(self) -> Option<TicketWorkflowState> {
         match self {
-            Self::Planning => (
-                crate::TicketFilter::state(TicketWorkflowState::Planning),
-                "planning",
-            ),
-            Self::Ready => (
-                crate::TicketFilter::state(TicketWorkflowState::Ready),
-                "ready",
-            ),
-            Self::Queued => (
-                crate::TicketFilter::state(TicketWorkflowState::Queued),
-                "queued",
-            ),
-            Self::Inprogress => (
-                crate::TicketFilter::state(TicketWorkflowState::InProgress),
-                "inprogress",
-            ),
-            Self::Done => (
-                crate::TicketFilter::state(TicketWorkflowState::Done),
-                "done",
-            ),
-            Self::Closed => (
-                crate::TicketFilter::state(TicketWorkflowState::Closed),
-                "closed",
-            ),
-            Self::All => (crate::TicketFilter::all(), "all"),
+            Self::Planning => Some(TicketWorkflowState::Planning),
+            Self::Ready => Some(TicketWorkflowState::Ready),
+            Self::Queued => Some(TicketWorkflowState::Queued),
+            Self::Inprogress => Some(TicketWorkflowState::InProgress),
+            Self::Done => Some(TicketWorkflowState::Done),
+            Self::Closed => Some(TicketWorkflowState::Closed),
+            Self::Active | Self::All => None,
         }
     }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TicketListParams {
-    /// State filter. Defaults to all Tickets.
+    /// State filter. Defaults to active Tickets (all non-closed states). Use `all` to include closed Tickets.
     #[serde(default)]
     state: Option<TicketListStateParam>,
+    /// Explicit workflow-state filter list. Cannot be combined with `state`.
+    #[serde(default)]
+    states: Option<Vec<TicketWorkflowStateParam>>,
     /// Maximum number of summaries to return. Defaults to 50, max 100.
     #[serde(default)]
     limit: Option<usize>,
+}
+
+impl TicketListParams {
+    fn into_query(self) -> Result<(crate::TicketListQuery, String, Option<usize>), TicketError> {
+        let query = if let Some(states) = self.states {
+            if self.state.is_some() {
+                return Err(TicketError::Conflict(
+                    "TicketList accepts either `state` or `states`, not both".to_string(),
+                ));
+            }
+            if states.is_empty() {
+                return Err(TicketError::Conflict(
+                    "TicketList `states` must include at least one workflow state".to_string(),
+                ));
+            }
+            crate::TicketListQuery::states(states.into_iter().map(|state| state.into_state()))
+        } else {
+            match self.state.unwrap_or(TicketListStateParam::Active) {
+                TicketListStateParam::Active => crate::TicketListQuery::active(),
+                TicketListStateParam::All => crate::TicketListQuery::all(),
+                state => crate::TicketListQuery::state(
+                    state
+                        .as_state()
+                        .expect("workflow state list param maps to TicketWorkflowState"),
+                ),
+            }
+        };
+        let label = query.state_filter_label();
+        Ok((query, label, self.limit))
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -825,9 +841,10 @@ impl Tool for TicketListTool {
         _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketListParams = parse_input("TicketList", input_json)?;
-        let state = params.state.unwrap_or(TicketListStateParam::All);
-        let (filter, state_filter) = state.as_filter();
-        let limit = bounded(params.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
+        let (filter, state_filter, params_limit) = params
+            .into_query()
+            .map_err(|error| backend_error("TicketList", error))?;
+        let limit = bounded(params_limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
         let tickets = self
             .backend
             .list(filter)
@@ -1825,6 +1842,16 @@ mod tests {
                 .unwrap();
         }
 
+        let active = list
+            .execute(&json!({}).to_string(), Default::default())
+            .await
+            .unwrap();
+        let active_json: Value = serde_json::from_str(&active.content.unwrap()).unwrap();
+        assert_eq!(active_json["state_filter"], "active");
+        assert_eq!(active_json["count"].as_u64(), Some(3));
+        assert_eq!(active_json["returned"].as_u64(), Some(3));
+        assert_eq!(active_json["truncated"].as_bool(), Some(false));
+
         let all = list
             .execute(&json!({ "state": "all" }).to_string(), Default::default())
             .await
@@ -1855,6 +1882,53 @@ mod tests {
             Some(DEFAULT_LIST_LIMIT as u64)
         );
         assert_eq!(closed_json["truncated"].as_bool(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn ticket_list_tool_accepts_multi_state_list_and_rejects_mixed_filters() {
+        let temp = TempDir::new().unwrap();
+        let backend = backend(&temp);
+        let list = tool_by_name(backend.clone(), "TicketList");
+        let planning = backend.create(NewTicket::new("Planning Ticket")).unwrap();
+        let mut ready_input = NewTicket::new("Ready Ticket");
+        ready_input.workflow_state = Some(TicketWorkflowState::Ready);
+        let ready = backend.create(ready_input).unwrap();
+        let mut closed_input = NewTicket::new("Closed Ticket");
+        closed_input.workflow_state = Some(TicketWorkflowState::Closed);
+        let closed = backend.create(closed_input).unwrap();
+
+        let listed = list
+            .execute(
+                &json!({ "states": ["planning", "closed"] }).to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let listed_json: Value = serde_json::from_str(&listed.content.unwrap()).unwrap();
+        assert_eq!(listed_json["state_filter"], "planning,closed");
+        assert_eq!(listed_json["count"].as_u64(), Some(2));
+        let listed_ids = listed_json["tickets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|ticket| ticket["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(listed_ids.contains(&planning.id.as_str()));
+        assert!(listed_ids.contains(&closed.id.as_str()));
+        assert!(!listed_ids.contains(&ready.id.as_str()));
+
+        let mixed = list
+            .execute(
+                &json!({ "state": "active", "states": ["planning"] }).to_string(),
+                Default::default(),
+            )
+            .await;
+        assert!(mixed.is_err());
+
+        let empty = list
+            .execute(&json!({ "states": [] }).to_string(), Default::default())
+            .await;
+        assert!(empty.is_err());
     }
 
     #[tokio::test]
@@ -2408,7 +2482,10 @@ mod tests {
         assert!(!id.contains("escape"));
         assert!(!temp.path().join("escape").exists());
         assert!(temp.path().join("tickets").join(id).is_dir());
-        assert_eq!(backend.list(crate::TicketFilter::all()).unwrap().len(), 1);
+        assert_eq!(
+            backend.list(crate::TicketListQuery::all()).unwrap().len(),
+            1
+        );
     }
 
     #[test]

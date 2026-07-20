@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use project_record::validate_record_id;
 use serde::{Deserialize, Serialize};
 use ticket::config::TicketConfig;
-use ticket::{LocalTicketBackend, TicketFilter, TicketIdOrSlug};
+use ticket::{LocalTicketBackend, TicketIdOrSlug, TicketListQuery};
 
 use crate::{Error, Result};
 
@@ -35,7 +35,7 @@ impl LocalProjectRecordReader {
     }
 
     pub fn list_tickets(&self, limit: usize) -> Result<ProjectRecordList<TicketSummary>> {
-        let partial = self.ticket_backend.list_partial(TicketFilter::all())?;
+        let partial = self.ticket_backend.list_partial(TicketListQuery::all())?;
         let mut items = partial
             .tickets
             .into_iter()

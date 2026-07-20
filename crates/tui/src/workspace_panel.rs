@@ -10,8 +10,9 @@ use ticket::config::{
     WORKSPACE_SETTINGS_RELATIVE_PATH,
 };
 use ticket::{
-    LocalTicketBackend, TicketBackend, TicketError, TicketEvent, TicketFilter, TicketIdOrSlug,
-    TicketInvalidRecord, TicketMeta, TicketRelationBlocker, TicketSummary, TicketWorkflowState,
+    LocalTicketBackend, TicketBackend, TicketError, TicketEvent, TicketIdOrSlug,
+    TicketInvalidRecord, TicketListQuery, TicketMeta, TicketRelationBlocker, TicketSummary,
+    TicketWorkflowState,
 };
 
 use crate::role_session_registry::{PanelRegistrySnapshot, PanelRegistryStore};
@@ -693,7 +694,7 @@ fn load_orchestration_ticket_overlay_states(
     let backend = LocalTicketBackend::new(ticket_root.to_path_buf())
         .with_record_language(overlay_config.ticket_record_language());
     let partial = backend
-        .list_partial(TicketFilter::all())
+        .list_partial(TicketListQuery::all())
         .map_err(|error| error.to_string())?;
     let mut states = BTreeMap::new();
     for summary in partial.tickets {
@@ -1092,7 +1093,7 @@ fn build_ticket_rows(
     registry: &PanelRegistrySnapshot,
     orchestration_overlay: &BTreeMap<String, TicketStateOverlay>,
 ) -> ticket::Result<TicketRowsBuild> {
-    let partial = backend.list_partial(TicketFilter::all())?;
+    let partial = backend.list_partial(TicketListQuery::all())?;
     let mut ticket_rows = Vec::new();
     let mut invalid_records = partial.invalid_records;
     for summary in partial.tickets {
@@ -2522,7 +2523,7 @@ mod tests {
             input.workflow_state = Some(TicketWorkflowState::Ready);
         });
         let ticket_id = backend
-            .list(TicketFilter::all())
+            .list(TicketListQuery::all())
             .unwrap()
             .into_iter()
             .find(|ticket| ticket.title == "Ticket With Intake")
@@ -2619,7 +2620,7 @@ mod tests {
         write_ticket_config(temp.path());
         let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
         create_ticket(&backend, "Claimed Planning", |_| {});
-        let summary = backend.list(TicketFilter::all()).unwrap().remove(0);
+        let summary = backend.list(TicketListQuery::all()).unwrap().remove(0);
         let store = PanelRegistryStore::from_root(temp.path().join("local-registry"));
         store
             .claim_ticket(&summary.id, None, "ticket-claimed-intake", "intake")
