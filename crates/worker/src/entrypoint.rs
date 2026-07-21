@@ -4,24 +4,18 @@ use std::process::ExitCode;
 
 use crate::{
     PromptLoader, Worker, WorkerController, WorkerFilesystemAuthority, WorkerWorkspaceContext,
-    WorkspaceId,
 };
 use clap::{CommandFactory, FromArgMatches, Parser};
-use manifest::{
-    Permission, ProfileResolveOptions, ProfileResolver, ProfileSelector, ScopeConfig, ScopeRule,
-    WorkerManifest, WorkerManifestConfig, paths,
-    plugin::{PluginDiscoveryOptions, resolve_plugin_config_for_startup},
-};
+use manifest::{Permission, ScopeConfig, ScopeRule, WorkerManifest, WorkerManifestConfig, paths};
 use session_store::{CombinedStore, FsWorkerStore, WorkerMetadataStore};
 use session_store::{FsStore, SegmentId, Store};
 use ticket::config::TicketRole;
 
 #[derive(Debug, Parser)]
-#[command(about = "Spawn a Worker process from a profile or a single manifest file")]
+#[command(about = "Spawn a Worker process from a manifest or builtin defaults")]
 struct Cli {
-    /// Profile to evaluate. Accepts an explicit path, `path:<path>`, a
-    /// discovered profile name, `default`, or a source-qualified name such as
-    /// `project:coder`.
+    /// Legacy profile selector. Direct worker startup no longer resolves
+    /// workspace-local profiles; pass a Backend-resolved manifest instead.
     #[arg(
         long,
         value_name = "PROFILE",
@@ -29,8 +23,8 @@ struct Cli {
     )]
     profile: Option<String>,
 
-    /// Runtime workspace root for profile discovery, default Worker naming, and process context.
-    /// Defaults to the current directory.
+    /// Process root/cwd context for direct worker startup. This is not Workspace
+    /// authority and does not enable `.yoi` discovery. Defaults to current dir.
     #[arg(long, value_name = "PATH")]
     workspace: Option<PathBuf>,
 
@@ -106,22 +100,8 @@ fn runtime_workspace_root(cli: &Cli) -> Result<PathBuf, String> {
     }
 }
 
-fn runtime_workspace_context(workspace_root: &Path) -> WorkerWorkspaceContext {
-    WorkerWorkspaceContext::local_filesystem(read_workspace_id_hint(workspace_root))
-}
-
-fn read_workspace_id_hint(workspace_root: &Path) -> Option<WorkspaceId> {
-    let path = workspace_root.join(".yoi/workspace.toml");
-    let contents = std::fs::read_to_string(path).ok()?;
-    let value = toml::from_str::<toml::Value>(&contents).ok()?;
-    let id = value.get("id")?.as_str()?.to_string();
-    match WorkspaceId::new(id) {
-        Ok(id) => Some(id),
-        Err(err) => {
-            tracing::warn!("ignoring invalid workspace id in .yoi/workspace.toml: {err}");
-            None
-        }
-    }
+fn runtime_workspace_context() -> WorkerWorkspaceContext {
+    WorkerWorkspaceContext::no_workspace()
 }
 
 fn runtime_worker_name(cli: &Cli, workspace_root: &Path) -> String {
@@ -158,61 +138,37 @@ fn sanitise_worker_name(raw: &str) -> String {
 }
 
 fn resolve_manifest(cli: &Cli) -> Result<(WorkerManifest, PromptLoader), String> {
-    resolve_manifest_with_profile_loader(cli, load_profile)
-}
-
-fn resolve_manifest_with_profile_loader<F>(
-    cli: &Cli,
-    load_profile_fn: F,
-) -> Result<(WorkerManifest, PromptLoader), String>
-where
-    F: FnOnce(&ProfileSelector, &Path, &str) -> Result<(WorkerManifest, PromptLoader), String>,
-{
-    let workspace_root = runtime_workspace_root(cli)?;
-    let runtime_worker_name = runtime_worker_name(cli, &workspace_root);
-    let ((mut manifest, loader), manifest_source) =
-        if let Some(config_json) = cli.spawn_config_json.as_deref() {
-            (
-                load_spawn_config_json(config_json)?,
-                ManifestSource::SpawnConfig,
-            )
-        } else if let Some(profile) = &cli.profile {
-            let selector = ProfileSelector::parse_cli(profile);
-            (
-                load_profile_fn(&selector, &workspace_root, &runtime_worker_name)?,
-                ManifestSource::ProfileLaunch,
-            )
-        } else if let Some(path) = &cli.manifest {
-            (
-                load_single_manifest(path, cli.worker.as_deref(), &runtime_worker_name)?,
-                ManifestSource::ManifestFile,
-            )
-        } else {
-            if cli.project.is_some() {
-                return Err(
-                "--project is no longer supported; normal startup uses profile discovery/default, \
-                 and --manifest <PATH> is the only one-file manifest mode"
+    let process_root = runtime_workspace_root(cli)?;
+    let runtime_worker_name = runtime_worker_name(cli, &process_root);
+    let ((mut manifest, loader), apply_direct_launch_policy) = if let Some(config_json) =
+        cli.spawn_config_json.as_deref()
+    {
+        (load_spawn_config_json(config_json)?, false)
+    } else if let Some(profile) = &cli.profile {
+        return Err(format!(
+            "--profile {profile} requires Backend-resolved manifest authority; direct worker startup does not discover workspace-local profiles"
+        ));
+    } else if let Some(path) = &cli.manifest {
+        (
+            load_single_manifest(path, cli.worker.as_deref(), &runtime_worker_name)?,
+            false,
+        )
+    } else {
+        if cli.project.is_some() {
+            return Err(
+                "--project is no longer supported; direct worker startup uses --manifest, \
+                     --spawn-config-json, or builtin defaults only"
                     .to_string(),
             );
-            }
-            let selector = ProfileSelector::Default;
-            (
-                load_profile_fn(&selector, &workspace_root, &runtime_worker_name)?,
-                ManifestSource::ProfileLaunch,
-            )
-        };
+        }
+        (load_builtin_default_manifest(&runtime_worker_name)?, true)
+    };
 
-    if manifest_source == ManifestSource::ProfileLaunch {
-        apply_profile_launch_policy(&mut manifest, &workspace_root, cli.ticket_role.as_deref())?;
+    if apply_direct_launch_policy {
+        apply_profile_launch_policy(&mut manifest, &process_root, cli.ticket_role.as_deref())?;
     }
     apply_session_restore_overrides(&mut manifest, cli)?;
-    apply_plugin_resolution_plan(&mut manifest, &workspace_root);
     Ok((manifest, loader))
-}
-
-fn apply_plugin_resolution_plan(manifest: &mut WorkerManifest, workspace_root: &Path) {
-    let options = PluginDiscoveryOptions::new(workspace_root);
-    manifest.plugins = resolve_plugin_config_for_startup(&manifest.plugins, &options);
 }
 
 fn apply_session_restore_overrides(manifest: &mut WorkerManifest, cli: &Cli) -> Result<(), String> {
@@ -230,34 +186,25 @@ fn load_spawn_config_json(config_json: &str) -> Result<(WorkerManifest, PromptLo
     Ok((manifest, PromptLoader::builtins_only()))
 }
 
-fn load_profile(
-    selector: &ProfileSelector,
-    workspace_root: &Path,
+fn load_builtin_default_manifest(
     worker_name: &str,
 ) -> Result<(WorkerManifest, PromptLoader), String> {
-    let resolver = ProfileResolver::new().with_workspace_base(workspace_root);
-    let options = ProfileResolveOptions::with_worker_name(worker_name);
-    let resolved = resolver.resolve(selector, options).map_err(|e| {
-        format!(
-            "failed to resolve profile {}: {e}",
-            selector.display_label()
-        )
-    })?;
-    Ok((resolved.manifest, PromptLoader::builtins_only()))
+    let mut config = WorkerManifestConfig::builtin_defaults();
+    config.worker.name = Some(worker_name.to_string());
+    let manifest = WorkerManifest::try_from(config)
+        .map_err(|e| format!("failed to resolve builtin worker defaults: {e}"))?;
+    Ok((manifest, PromptLoader::builtins_only()))
 }
 
 pub fn resolve_runtime_profile_manifest(
-    profile: Option<&str>,
-    workspace_root: &Path,
-    worker_name: &str,
+    _profile: Option<&str>,
+    _workspace_root: &Path,
+    _worker_name: &str,
 ) -> Result<(WorkerManifest, PromptLoader), String> {
-    let selector = profile
-        .map(ProfileSelector::parse_cli)
-        .unwrap_or(ProfileSelector::Default);
-    let (mut manifest, loader) = load_profile(&selector, workspace_root, worker_name)?;
-    apply_profile_launch_policy(&mut manifest, workspace_root, None)?;
-    apply_plugin_resolution_plan(&mut manifest, workspace_root);
-    Ok((manifest, loader))
+    Err(
+        "runtime profile resolution requires a pre-resolved manifest/profile archive from Backend authority"
+            .to_string(),
+    )
 }
 
 pub fn resolve_runtime_profile_manifest_from_manifest(
@@ -269,13 +216,15 @@ pub fn resolve_runtime_profile_manifest_from_manifest(
         manifest.worker.name = worker_name.to_string();
     }
     apply_profile_launch_policy(&mut manifest, workspace_root, None)?;
-    apply_plugin_resolution_plan(&mut manifest, workspace_root);
+    // Do not run plugin discovery here: runtime-created Workers receive their
+    // resolved manifest/profile archive from Backend authority, not by scanning
+    // materialized workdir-local plugin stores.
     Ok((manifest, PromptLoader::builtins_only()))
 }
 
 pub fn resolve_runtime_profile_manifest_from_manifest_without_filesystem(
     mut manifest: WorkerManifest,
-    workspace_root: &Path,
+    _workspace_root: &Path,
     worker_name: &str,
 ) -> Result<(WorkerManifest, PromptLoader), String> {
     if manifest.worker.name.is_empty() {
@@ -283,7 +232,7 @@ pub fn resolve_runtime_profile_manifest_from_manifest_without_filesystem(
     }
     manifest.scope = ScopeConfig::default();
     manifest.delegation_scope = ScopeConfig::default();
-    apply_plugin_resolution_plan(&mut manifest, workspace_root);
+    // Same as the filesystem-capable runtime path: no local discovery.
     Ok((manifest, PromptLoader::builtins_only()))
 }
 
@@ -326,13 +275,6 @@ fn load_single_manifest(
         ));
     }
     Ok((manifest, PromptLoader::builtins_only()))
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ManifestSource {
-    ProfileLaunch,
-    ManifestFile,
-    SpawnConfig,
 }
 
 fn read_rule(target: PathBuf) -> ScopeRule {
@@ -548,7 +490,7 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
     let store = CombinedStore::new(session_store, worker_metadata_store);
     let filesystem_authority =
         WorkerFilesystemAuthority::local(workspace_root.clone(), cwd.clone());
-    let workspace_context = runtime_workspace_context(&workspace_root);
+    let workspace_context = runtime_workspace_context();
 
     let mut worker = if cli.adopt {
         let callback = match cli.callback.clone() {
@@ -863,226 +805,46 @@ permission = "write"
     }
 
     #[test]
-    fn profile_launch_preserves_workspace_override_scope_allow_in_final_manifest() {
+    fn profile_resolution_is_rejected_for_direct_worker_startup() {
+        let cli = Cli::try_parse_from(["yoi worker", "--profile", "project:coder"]).unwrap();
+
+        let err = resolve_manifest(&cli).unwrap_err();
+
+        assert!(
+            err.contains("--profile project:coder requires Backend-resolved manifest authority")
+        );
+    }
+
+    #[test]
+    fn normal_startup_uses_builtin_defaults_without_local_profile_discovery() {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path().join("runtime-workspace");
-        let external = tmp.path().join("external-readable");
         let yoi_dir = workspace.join(".yoi");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::create_dir_all(&external).unwrap();
         std::fs::create_dir_all(&yoi_dir).unwrap();
         write(
             &yoi_dir.join("override.local.toml"),
-            &format!(
-                r#"
-[[scope.allow]]
-target = "{}"
-permission = "read"
-recursive = true
-"#,
-                external.display()
-            ),
-        );
-        let profile = tmp.path().join("profile.toml");
-        write(
-            &profile,
             r#"
-slug = "override-scope"
+[worker]
+name = "from-local-override"
 
-[model]
-scheme = "anthropic"
-model_id = "test-model"
+[engine]
+language = "override"
 "#,
         );
-        let cli = Cli::try_parse_from([
-            "yoi worker",
-            "--workspace",
-            workspace.to_str().unwrap(),
-            "--profile",
-            profile.to_str().unwrap(),
-        ])
-        .unwrap();
-
-        let (manifest, _loader) = resolve_manifest(&cli).unwrap();
-        let snapshot = serde_json::to_value(&manifest).unwrap();
-        let snapshot_scope: ScopeConfig =
-            serde_json::from_value(snapshot["scope"].clone()).unwrap();
-
-        assert_scope_contains(&manifest.scope.allow, &external, Permission::Read);
-        assert_scope_contains(&manifest.scope.allow, &workspace, Permission::Write);
-        assert_scope_contains(
-            &manifest.scope.deny,
-            &workspace.join(".worktree"),
-            Permission::Write,
-        );
-        assert_scope_contains(&snapshot_scope.allow, &external, Permission::Read);
-        assert_scope_contains(&snapshot_scope.allow, &workspace, Permission::Write);
-        assert_scope_contains(
-            &snapshot_scope.deny,
-            &workspace.join(".worktree"),
-            Permission::Write,
-        );
-    }
-
-    #[test]
-    fn profile_uses_selected_profile() {
-        let tmp = TempDir::new().unwrap();
-        let profile = tmp.path().join("profile.toml");
-        let cli = Cli::try_parse_from([
-            "yoi worker",
-            "--profile",
-            profile.to_str().unwrap(),
-            "--worker",
-            "from-profile-name",
-        ])
-        .unwrap();
-        let mut called = false;
-
-        let (manifest, loader) =
-            resolve_manifest_with_profile_loader(&cli, |selector, _workspace_root, worker_name| {
-                called = true;
-                assert_eq!(selector, &ProfileSelector::path(profile.clone()));
-                assert_eq!(worker_name, "from-profile-name");
-                let mut manifest =
-                    WorkerManifest::from_toml(&manifest_toml("from-profile", tmp.path())).unwrap();
-                manifest.worker.name = worker_name.to_string();
-                Ok((manifest, PromptLoader::builtins_only()))
-            })
-            .unwrap();
-
-        assert!(called);
-        assert_eq!(manifest.worker.name, "from-profile-name");
-        assert!(loader.user_dir().is_none());
-        assert!(loader.workspace_dir().is_none());
-    }
-
-    #[test]
-    fn profile_accepts_source_qualified_discovered_name() {
-        let tmp = TempDir::new().unwrap();
-        let cli = Cli::try_parse_from([
-            "yoi worker",
-            "--profile",
-            "project:coder",
-            "--worker",
-            "from-profile-name",
-        ])
-        .unwrap();
-        let mut called = false;
-
-        let (manifest, _loader) =
-            resolve_manifest_with_profile_loader(&cli, |selector, _workspace_root, worker_name| {
-                called = true;
-                assert_eq!(
-                    selector,
-                    &ProfileSelector::source_named(
-                        manifest::ProfileRegistrySource::Project,
-                        "coder"
-                    )
-                );
-                let mut manifest =
-                    WorkerManifest::from_toml(&manifest_toml("from-profile", tmp.path())).unwrap();
-                manifest.worker.name = worker_name.to_string();
-                Ok((manifest, PromptLoader::builtins_only()))
-            })
-            .unwrap();
-
-        assert!(called);
-        assert_eq!(manifest.worker.name, "from-profile-name");
-    }
-
-    #[test]
-    fn profile_without_explicit_worker_uses_workspace_basename_not_selector() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().join("other-workspace");
-        std::fs::create_dir(&workspace).unwrap();
-        let cli = Cli::try_parse_from([
-            "yoi worker",
-            "--workspace",
-            workspace.to_str().unwrap(),
-            "--profile",
-            "project:companion",
-        ])
-        .unwrap();
-        let mut called = false;
-
-        let (manifest, _loader) =
-            resolve_manifest_with_profile_loader(&cli, |selector, workspace_root, worker_name| {
-                called = true;
-                assert_eq!(
-                    selector,
-                    &ProfileSelector::source_named(
-                        manifest::ProfileRegistrySource::Project,
-                        "companion"
-                    )
-                );
-                assert_eq!(workspace_root, workspace.as_path());
-                assert_eq!(worker_name, "other-workspace");
-                let mut manifest =
-                    WorkerManifest::from_toml(&manifest_toml("profile-selector-name", tmp.path()))
-                        .unwrap();
-                manifest.worker.name = worker_name.to_string();
-                Ok((manifest, PromptLoader::builtins_only()))
-            })
-            .unwrap();
-
-        assert!(called);
-        assert_eq!(manifest.worker.name, "other-workspace");
-    }
-
-    #[test]
-    fn normal_startup_uses_default_profile() {
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().join("runtime-workspace");
-        std::fs::create_dir(&workspace).unwrap();
         let cli = Cli::try_parse_from(["yoi worker", "--workspace", workspace.to_str().unwrap()])
             .unwrap();
-        let mut called = false;
 
-        let (manifest, _loader) =
-            resolve_manifest_with_profile_loader(&cli, |selector, _workspace_root, worker_name| {
-                called = true;
-                assert_eq!(selector, &ProfileSelector::Default);
-                assert_eq!(worker_name, "runtime-workspace");
-                let mut manifest =
-                    WorkerManifest::from_toml(&manifest_toml("from-default-profile", tmp.path()))
-                        .unwrap();
-                manifest.worker.name = worker_name.to_string();
-                Ok((manifest, PromptLoader::builtins_only()))
-            })
-            .unwrap();
+        let (manifest, loader) = resolve_manifest(&cli).unwrap();
 
-        assert!(called);
         assert_eq!(manifest.worker.name, "runtime-workspace");
-        assert_eq!(manifest.scope.allow.len(), 2);
-        assert_scope_contains(&manifest.scope.allow, tmp.path(), Permission::Write);
+        assert_ne!(manifest.engine.language, "override");
+        assert!(loader.user_dir().is_none());
+        assert!(loader.workspace_dir().is_none());
         assert_scope_contains(&manifest.scope.allow, &workspace, Permission::Write);
-        assert_eq!(manifest.scope.deny.len(), 1);
-        assert_scope_contains(
-            &manifest.scope.deny,
-            &tmp.path().join("runtime-workspace/.worktree"),
-            Permission::Write,
-        );
-        assert_eq!(manifest.delegation_scope.allow.len(), 2);
-        assert_eq!(
-            manifest.delegation_scope.allow[0].target,
-            tmp.path().join("runtime-workspace")
-        );
-        assert_eq!(
-            manifest.delegation_scope.allow[0].permission,
-            Permission::Read
-        );
-        assert_eq!(
-            manifest.delegation_scope.allow[1].target,
-            tmp.path().join("runtime-workspace/.worktree")
-        );
-        assert_eq!(
-            manifest.delegation_scope.allow[1].permission,
-            Permission::Write
-        );
     }
 
     #[test]
-    fn orchestrator_profile_launch_gets_read_root_and_worktree_delegation_from_launch_policy() {
+    fn orchestrator_direct_startup_gets_read_root_and_worktree_delegation_from_launch_policy() {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path().join("original-workspace");
         std::fs::create_dir(&workspace).unwrap();
@@ -1090,41 +852,17 @@ model_id = "test-model"
             "yoi worker",
             "--workspace",
             workspace.to_str().unwrap(),
-            "--profile",
-            "builtin:orchestrator",
             "--ticket-role",
             "orchestrator",
         ])
         .unwrap();
 
-        let (manifest, _loader) =
-            resolve_manifest_with_profile_loader(&cli, |selector, _workspace_root, worker_name| {
-                assert_eq!(
-                    selector,
-                    &ProfileSelector::source_named(
-                        manifest::ProfileRegistrySource::Builtin,
-                        "orchestrator"
-                    )
-                );
-                let mut manifest = WorkerManifest::from_toml(&manifest_toml(
-                    "from-orchestrator-profile",
-                    tmp.path(),
-                ))
-                .unwrap();
-                manifest.worker.name = worker_name.to_string();
-                Ok((manifest, PromptLoader::builtins_only()))
-            })
-            .unwrap();
+        let (manifest, _loader) = resolve_manifest(&cli).unwrap();
 
-        assert_eq!(manifest.scope.allow.len(), 2);
-        assert_scope_contains(&manifest.scope.allow, tmp.path(), Permission::Write);
         assert_scope_contains(&manifest.scope.allow, &workspace, Permission::Read);
         assert!(manifest.scope.deny.is_empty());
         assert_eq!(manifest.delegation_scope.allow.len(), 2);
-        assert_eq!(
-            manifest.delegation_scope.allow[0].target,
-            tmp.path().join("original-workspace")
-        );
+        assert_eq!(manifest.delegation_scope.allow[0].target, workspace);
         assert_eq!(
             manifest.delegation_scope.allow[0].permission,
             Permission::Read
@@ -1137,23 +875,12 @@ model_id = "test-model"
             manifest.delegation_scope.allow[1].permission,
             Permission::Write
         );
-        assert!(
-            !manifest
-                .delegation_scope
-                .allow
-                .iter()
-                .any(|rule| rule.target == tmp.path().join("original-workspace")
-                    && rule.permission == Permission::Write)
-        );
     }
 
     #[test]
     fn project_flag_no_longer_enables_ambient_manifest_cascade() {
         let cli = Cli::try_parse_from(["yoi worker", "--project", "."]).unwrap();
-        let err = resolve_manifest_with_profile_loader(&cli, |_, _, _| {
-            panic!("default profile loader must not run when deprecated --project is present")
-        })
-        .unwrap_err();
+        let err = resolve_manifest(&cli).unwrap_err();
         assert!(err.contains("--project is no longer supported"));
     }
 
@@ -1235,25 +962,11 @@ permission = "write"
     }
 
     #[test]
-    fn worker_flag_with_no_manifest_creates_from_default_profile_with_typed_name() {
-        let tmp = TempDir::new().unwrap();
+    fn worker_flag_with_no_manifest_creates_from_builtin_defaults_with_typed_name() {
         let cli = Cli::try_parse_from(["yoi worker", "--worker", "agent"]).unwrap();
-        let mut called = false;
 
-        let (manifest, _loader) =
-            resolve_manifest_with_profile_loader(&cli, |selector, _workspace_root, worker_name| {
-                called = true;
-                assert_eq!(selector, &ProfileSelector::Default);
-                assert_eq!(worker_name, "agent");
-                let mut manifest =
-                    WorkerManifest::from_toml(&manifest_toml("from-default-profile", tmp.path()))
-                        .unwrap();
-                manifest.worker.name = worker_name.to_string();
-                Ok((manifest, PromptLoader::builtins_only()))
-            })
-            .unwrap();
+        let (manifest, _loader) = resolve_manifest(&cli).unwrap();
 
-        assert!(called);
         assert_eq!(manifest.worker.name, "agent");
     }
 

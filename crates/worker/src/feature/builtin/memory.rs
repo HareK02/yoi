@@ -18,6 +18,8 @@ use memory::backend::{
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
+use crate::worker::WorkspaceClient;
+
 #[derive(Clone, Debug)]
 pub struct WorkspaceHttpMemoryBackend {
     workspace_id: String,
@@ -32,39 +34,88 @@ impl WorkspaceHttpMemoryBackend {
         }
     }
 
+    pub fn execute_operation(
+        &self,
+        operation: MemoryBackendOperation,
+    ) -> Result<MemoryBackendOperationResult, WorkspaceMemoryBackendError> {
+        execute_http_memory_backend(&self.workspace_id, &self.base_url, operation)
+    }
+
     fn execute(&self, operation: MemoryBackendOperation) -> Result<ToolOutput, ToolError> {
-        let url = format!(
-            "{}/api/w/{}/memory/backend",
-            self.base_url.trim_end_matches('/'),
-            self.workspace_id
-        );
-        let response = reqwest::blocking::Client::new()
-            .post(url)
-            .json(&operation)
-            .send()
-            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-        let status = response.status();
-        let body = response
-            .text()
-            .map_err(|error| ToolError::ExecutionFailed(error.to_string()))?;
-        if !status.is_success() {
-            return Err(ToolError::ExecutionFailed(format!(
-                "workspace memory backend returned HTTP {status}: {body}"
-            )));
-        }
-        let response: MemoryBackendHttpResponse = serde_json::from_str(&body).map_err(|error| {
-            ToolError::ExecutionFailed(format!("decode memory backend response: {error}"))
-        })?;
-        match response {
-            MemoryBackendHttpResponse::Ok {
-                result: MemoryBackendOperationResult::ToolOutput(output),
-            } => Ok(tool_output(output)),
-            MemoryBackendHttpResponse::Ok { result } => Err(ToolError::ExecutionFailed(format!(
+        match self.execute_operation(operation) {
+            Ok(MemoryBackendOperationResult::ToolOutput(output)) => Ok(tool_output(output)),
+            Ok(result) => Err(ToolError::ExecutionFailed(format!(
                 "unexpected memory backend result for model-visible tool: {result:?}"
             ))),
-            MemoryBackendHttpResponse::Error { message } => {
-                Err(ToolError::ExecutionFailed(message))
+            Err(error) => Err(ToolError::ExecutionFailed(error.to_string())),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WorkspaceMemoryBackendError {
+    #[error("workspace memory backend is unavailable: {reason}")]
+    Unavailable { reason: String },
+    #[error("workspace memory backend request failed: {0}")]
+    Request(#[from] reqwest::Error),
+    #[error("workspace memory backend returned HTTP {status}: {body}")]
+    Http {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    #[error("decode memory backend response: {0}")]
+    Decode(#[from] serde_json::Error),
+    #[error("workspace memory backend rejected operation: {0}")]
+    Backend(String),
+}
+
+impl WorkspaceClient {
+    pub fn execute_memory_backend_operation(
+        &self,
+        operation: MemoryBackendOperation,
+    ) -> Result<MemoryBackendOperationResult, WorkspaceMemoryBackendError> {
+        match self {
+            WorkspaceClient::Http {
+                workspace_id,
+                base_url,
+            } => execute_http_memory_backend(workspace_id, base_url, operation),
+            WorkspaceClient::Available { kind } => Err(WorkspaceMemoryBackendError::Unavailable {
+                reason: format!(
+                    "workspace client kind `{kind}` does not expose the Backend Workspace API"
+                ),
+            }),
+            WorkspaceClient::Unavailable { reason } => {
+                Err(WorkspaceMemoryBackendError::Unavailable {
+                    reason: reason.clone(),
+                })
             }
+        }
+    }
+}
+
+fn execute_http_memory_backend(
+    workspace_id: &str,
+    base_url: &str,
+    operation: MemoryBackendOperation,
+) -> Result<MemoryBackendOperationResult, WorkspaceMemoryBackendError> {
+    let url = format!(
+        "{}/api/w/{}/memory/backend",
+        base_url.trim_end_matches('/'),
+        workspace_id
+    );
+    let response = reqwest::blocking::Client::new()
+        .post(url)
+        .json(&operation)
+        .send()?;
+    let status = response.status();
+    let body = response.text()?;
+    if !status.is_success() {
+        return Err(WorkspaceMemoryBackendError::Http { status, body });
+    }
+    match serde_json::from_str::<MemoryBackendHttpResponse>(&body)? {
+        MemoryBackendHttpResponse::Ok { result } => Ok(result),
+        MemoryBackendHttpResponse::Error { message } => {
+            Err(WorkspaceMemoryBackendError::Backend(message))
         }
     }
 }
