@@ -2,11 +2,11 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
-use memory::extract::{
-    CandidateKind, ExtractedCandidate, StagingWriteResult, write_staging_candidate,
+use memory::backend::{
+    MemoryBackendOperation, MemoryBackendOperationResult, MemoryStageCandidateOperation,
 };
+use memory::extract::{CandidateKind, ExtractedCandidate};
 use memory::schema::SourceRef;
-use memory::workspace::WorkspaceLayout;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -19,6 +19,7 @@ use crate::session_reference::{
     ReadDetail, ReadOptions, ReadSelector, ReferenceKind, SearchOptions, SessionReferenceView,
     ToolPart,
 };
+use crate::worker::WorkspaceClient;
 
 const SEARCH_EVIDENCE_DESCRIPTION: &str = "Search the host-created session evidence index. Use this to find stable evidence ids before staging a memory candidate. Supports kind=user|assistant|system|tool and tool_part=input|output|both.";
 const READ_EVIDENCE_DESCRIPTION: &str = "Read bounded session evidence by evidence_id or entry_range. Use compact mode for normal verification and full mode only when exact tool arguments or result content are necessary.";
@@ -28,22 +29,22 @@ const FINISH_EXTRACTION_DESCRIPTION: &str = "Finish the extract worker run after
 #[derive(Clone)]
 pub(crate) struct SessionExploreState {
     view: Arc<SessionReferenceView>,
-    layout: WorkspaceLayout,
+    workspace_client: WorkspaceClient,
     source: SourceRef,
     extract_run_id: String,
-    staged: Arc<Mutex<Vec<StagingWriteResult>>>,
+    staged: Arc<Mutex<Vec<String>>>,
     finished: Arc<Mutex<Option<FinishExtractionParams>>>,
 }
 
 impl SessionExploreState {
     pub(crate) fn new(
         view: SessionReferenceView,
-        layout: WorkspaceLayout,
+        workspace_client: WorkspaceClient,
         source: SourceRef,
     ) -> Self {
         Self {
             view: Arc::new(view),
-            layout,
+            workspace_client,
             source,
             extract_run_id: Uuid::now_v7().to_string(),
             staged: Arc::new(Mutex::new(Vec::new())),
@@ -55,7 +56,7 @@ impl SessionExploreState {
         &self.view
     }
 
-    pub(crate) fn staged(&self) -> Vec<StagingWriteResult> {
+    pub(crate) fn staged(&self) -> Vec<String> {
         self.staged
             .lock()
             .expect("session explore staged state poisoned")
@@ -420,21 +421,45 @@ impl Tool for StageCandidateTool {
             staleness: params.staleness,
             evidence_ids: params.evidence_ids,
         };
-        let written = write_staging_candidate(
-            &self.state.layout,
-            self.state.source.clone(),
-            &self.state.extract_run_id,
-            candidate,
-            evidence,
-            source_refs,
-        )
-        .map_err(|e| ToolError::ExecutionFailed(format!("write staging failed: {e}")))?;
-        let id = written.id.to_string();
+        let result = self
+            .state
+            .workspace_client
+            .execute_memory_backend_operation(MemoryBackendOperation::StageCandidate(
+                MemoryStageCandidateOperation {
+                    source: self.state.source.clone(),
+                    extract_run_id: self.state.extract_run_id.clone(),
+                    candidate,
+                    evidence,
+                    source_refs,
+                },
+            ))
+            .map_err(|e| ToolError::ExecutionFailed(format!("write staging failed: {e}")))?;
+        let ids = match result {
+            MemoryBackendOperationResult::StagingWritten(output) if output.staging_count == 1 => {
+                output.staging_ids
+            }
+            MemoryBackendOperationResult::StagingWritten(output) => {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "stage_candidate expected one staging record, backend wrote {}",
+                    output.staging_count
+                )));
+            }
+            other => {
+                return Err(ToolError::ExecutionFailed(format!(
+                    "unexpected memory backend result for stage_candidate: {other:?}"
+                )));
+            }
+        };
+        let id = ids.into_iter().next().ok_or_else(|| {
+            ToolError::ExecutionFailed(
+                "stage_candidate backend did not return a staging id".to_string(),
+            )
+        })?;
         self.state
             .staged
             .lock()
             .expect("session explore staged state poisoned")
-            .push(written);
+            .push(id.clone());
         Ok(ToolOutput {
             summary: format!("Staged memory candidate {id}."),
             content: Some(format!("staging_id: {id}")),
@@ -583,14 +608,66 @@ fn truncate_line(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use llm_engine::Item;
-    use tempfile::TempDir;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    fn stub_memory_backend_response(
+        body: &'static str,
+    ) -> (WorkspaceClient, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = Vec::new();
+            let mut temp = [0_u8; 1024];
+            let header_end = loop {
+                let read = stream.read(&mut temp).unwrap();
+                if read == 0 {
+                    break buffer.len();
+                }
+                buffer.extend_from_slice(&temp[..read]);
+                if let Some(pos) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&buffer[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            while buffer.len() < header_end + content_length {
+                let read = stream.read(&mut temp).unwrap();
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&temp[..read]);
+            }
+            let request = String::from_utf8_lossy(&buffer).into_owned();
+            tx.send(request).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (
+            WorkspaceClient::http("test-workspace", format!("http://{addr}")),
+            rx,
+        )
+    }
 
     #[test]
     fn descriptor_declares_session_explore_tools() {
-        let temp = TempDir::new().unwrap();
         let state = SessionExploreState::new(
             SessionReferenceView::new("segment-1", vec![Item::user_message("remember this")]),
-            WorkspaceLayout::new(temp.path()),
+            WorkspaceClient::available("test-backend"),
             SourceRef {
                 segment_id: "segment-1".to_string(),
                 range: [0, 0],
@@ -635,10 +712,12 @@ mod tests {
 
     #[tokio::test]
     async fn stage_candidate_writes_staging_record_with_source_evidence() {
-        let temp = TempDir::new().unwrap();
+        let (client, request_rx) = stub_memory_backend_response(
+            r#"{"Ok":{"result":{"StagingWritten":{"staging_count":1,"staging_ids":["00000000-0000-7000-8000-000000000001"]}}}}"#,
+        );
         let state = SessionExploreState::new(
             SessionReferenceView::new("segment-1", vec![Item::user_message("durable decision")]),
-            WorkspaceLayout::new(temp.path()),
+            client,
             SourceRef {
                 segment_id: "segment-1".to_string(),
                 range: [0, 0],
@@ -661,13 +740,14 @@ mod tests {
         .unwrap();
 
         let staged = state.staged();
-        assert_eq!(staged.len(), 1);
-        let bytes = std::fs::read(&staged[0].path).unwrap();
-        let record: memory::extract::StagingRecord = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(record.kind, CandidateKind::Decision);
-        assert_eq!(record.evidence.len(), 1);
-        assert_eq!(record.evidence[0].id, "M0000");
-        assert_eq!(record.source_refs.len(), 1);
-        assert_eq!(record.source_refs[0].evidence_id.as_deref(), Some("M0000"));
+        assert_eq!(
+            staged,
+            vec!["00000000-0000-7000-8000-000000000001".to_string()]
+        );
+        let request = request_rx.recv().unwrap();
+        assert!(request.contains("\"StageCandidate\""));
+        assert!(request.contains("\"kind\":\"decision\""));
+        assert!(request.contains("\"id\":\"M0000\""));
+        assert!(request.contains("\"evidence_id\":\"M0000\""));
     }
 }

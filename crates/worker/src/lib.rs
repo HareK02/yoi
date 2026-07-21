@@ -20,7 +20,6 @@ pub mod spawn;
 mod internal_worker;
 mod interrupt_prep;
 mod permission;
-mod ticket_event_notify;
 mod worker;
 
 pub use compact::token_counter::{EstimateSource, SplitPoint, TokenEstimate};

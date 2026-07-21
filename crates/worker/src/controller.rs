@@ -6,10 +6,7 @@ use llm_engine::EngineError;
 use llm_engine::llm_client::client::LlmClient;
 use session_store::WorkerMetadataStore;
 use session_store::{LogEntry, Store};
-use ticket::LocalTicketBackend;
-use ticket::config::TicketConfig;
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tracing::{debug, warn};
 
 use crate::discovery::{
     WorkerDiscovery, list_workers_tool, restore_worker_tool, send_to_peer_worker_tool,
@@ -29,9 +26,6 @@ use crate::shutdown_after_idle::{
 use crate::spawn::comm_tools::{read_worker_output_tool, send_to_worker_tool, stop_worker_tool};
 use crate::spawn::registry::SpawnedWorkerRegistry;
 use crate::spawn::tool::spawn_worker_tool;
-use crate::ticket_event_notify::{
-    TicketEventCompanionNotifyHook, companion_worker_name_for_workspace,
-};
 use crate::worker::{SystemItemCommitter, Worker, WorkerError, WorkerRunResult, WorkspaceClient};
 use protocol::{
     AlertLevel, AlertSource, ErrorCode, Event, Method, RewindTargetId, RunResult, Segment,
@@ -288,12 +282,6 @@ impl WorkerController {
         )
         .await?;
 
-        install_ticket_event_companion_notify_hook(
-            &mut worker,
-            runtime_base.to_path_buf(),
-            spawned_registry.clone(),
-        );
-
         // Intake role Workers self-terminate only after a successful
         // TicketIntakeReady turn has fully settled back to Idle. The request
         // is transient controller state, not model-visible context or ticket
@@ -533,84 +521,6 @@ fn wire_event_bridges_on_engine<C, St>(
     // per-item commit channel is wired at the top of this function.
 }
 
-fn install_ticket_event_companion_notify_hook<C, St>(
-    worker: &mut Worker<C, St>,
-    runtime_base: PathBuf,
-    spawned_registry: Arc<SpawnedWorkerRegistry>,
-) where
-    C: LlmClient + Clone + 'static,
-    St: Store + WorkerMetadataStore + Clone + Send + Sync + 'static,
-{
-    if !is_ticket_orchestrator_role(worker.runtime_ticket_role()) {
-        return;
-    }
-
-    let ticket_feature = &worker.manifest().feature.ticket;
-    if !ticket_feature.enabled || !ticket_feature.orchestration_control {
-        return;
-    }
-
-    let Some(local) = worker.local_working_directory() else {
-        return;
-    };
-    let Some(companion_worker_name) = companion_worker_name_for_workspace(&local.root) else {
-        return;
-    };
-    if companion_worker_name == worker.manifest().worker.name {
-        return;
-    }
-
-    let Ok(ticket_config) = TicketConfig::load_workspace(&local.cwd) else {
-        return;
-    };
-    let backend_root = ticket_config.backend_root().to_path_buf();
-    if !backend_root.is_dir() {
-        return;
-    }
-
-    let discovery = WorkerDiscovery::new(
-        worker.worker_metadata_store(),
-        worker.manifest().worker.name.clone(),
-        runtime_base,
-        Some(local.cwd.clone()),
-        spawned_registry,
-    );
-    match discovery.ensure_existing_peer(&companion_worker_name) {
-        Ok(Some(_)) => {
-            debug!(
-                companion = %companion_worker_name,
-                orchestrator = %worker.manifest().worker.name,
-                "ensured Companion peer relationship for Orchestrator Ticket event notifications"
-            );
-        }
-        Ok(None) => {
-            debug!(
-                companion = %companion_worker_name,
-                orchestrator = %worker.manifest().worker.name,
-                "Companion metadata is missing; Ticket event notifications will skip until Companion exists"
-            );
-        }
-        Err(error) => {
-            warn!(
-                companion = %companion_worker_name,
-                orchestrator = %worker.manifest().worker.name,
-                error = %error,
-                "failed to ensure Companion peer relationship for Orchestrator Ticket event notifications"
-            );
-        }
-    }
-    worker.add_post_tool_call_hook(TicketEventCompanionNotifyHook::new(
-        LocalTicketBackend::new(backend_root),
-        discovery,
-        companion_worker_name,
-    ));
-}
-
-fn is_ticket_orchestrator_role(role: Option<&str>) -> bool {
-    role.map(|role| role.eq_ignore_ascii_case("orchestrator"))
-        .unwrap_or(false)
-}
-
 /// Register the builtin file-manipulation tools, optional memory tools,
 /// and the Worker-orchestration tools (SpawnWorker + comm) on the Worker's
 /// Engine. Returns the `ScopedFs` clone used to attach a `WorkerFsView` to
@@ -632,7 +542,6 @@ where
     let local_filesystem = worker.local_working_directory().cloned();
     let local_workspace_root = local_filesystem.as_ref().map(|local| local.root.clone());
     let task_feature = worker.task_feature();
-    let session_id_for_usage = worker.segment_id().to_string();
     let memory_config = worker.manifest().memory.clone();
     let web_config = worker.manifest().web.clone();
     let mcp_config = worker.manifest().mcp.clone();
@@ -679,8 +588,8 @@ where
             orchestration_control: feature_config.ticket.orchestration_control,
         };
         // Ticket tools are typed operations over the current workspace Ticket backend.
-        // Runtime-hosted Workers prefer the workspace API URI carried by the
-        // Worker context; legacy/local Workers fall back to the checked-out worktree.
+        // Workspace access must be authority-bound to the Backend Workspace API; the
+        // Worker must not fall back to a local `.yoi/tickets` store.
         let ticket_backend = match worker.workspace_client() {
             WorkspaceClient::Http {
                 workspace_id,
@@ -690,18 +599,10 @@ where
                 base_url: base_url.clone(),
             },
             _ => {
-                let ticket_cwd = local_filesystem
-                    .as_ref()
-                    .map(|local| &local.cwd)
-                    .ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "ticket tools require local Worker filesystem authority",
-                        )
-                    })?;
-                crate::feature::builtin::ticket::TicketFeatureBackend::LocalWorkspace {
-                    workspace_root: ticket_cwd.clone(),
-                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ticket tools require Backend Workspace API authority",
+                ));
             }
         };
         feature_registry.add_module(
@@ -729,27 +630,18 @@ where
         let workspace_client = worker.workspace_client().clone();
         let worker = worker.engine_mut();
 
-        // Memory tools require explicit feature exposure. Storage access may be
-        // provided by local filesystem authority or the path-free Workspace HTTP API.
+        // Memory tools require explicit feature exposure. Workspace memory access
+        // is authority-bound to the Backend Workspace API; the Worker must not
+        // register local filesystem memory tools even when it has local cwd/root
+        // authority for shell/file tools.
         if feature_config.memory.enabled {
-            if let Some(workspace_root) = local_workspace_root.as_ref() {
-                let mem = memory_config.as_ref().ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "[feature.memory].enabled = true requires a [memory] configuration section",
-                    )
-                })?;
-                let layout = memory::WorkspaceLayout::resolve(mem, workspace_root);
-                let query_cfg = memory::tool::QueryConfig::from(mem);
-                worker.register_tool(memory::tool::read_tool_with_usage(
-                    layout.clone(),
-                    session_id_for_usage,
-                ));
-                worker.register_tool(memory::tool::write_tool(layout.clone()));
-                worker.register_tool(memory::tool::edit_tool(layout.clone()));
-                worker.register_tool(memory::tool::delete_tool(layout.clone()));
-                worker.register_tool(memory::tool::memory_query_tool(layout, query_cfg));
-            } else if let WorkspaceClient::Http {
+            let _mem = memory_config.as_ref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "[feature.memory].enabled = true requires a [memory] configuration section",
+                )
+            })?;
+            if let WorkspaceClient::Http {
                 workspace_id,
                 base_url,
             } = workspace_client
@@ -763,7 +655,7 @@ where
             } else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "memory tools require Workspace HTTP API or local Worker filesystem authority",
+                    "memory tools require Backend Workspace API authority",
                 ));
             }
         }

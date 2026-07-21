@@ -11,8 +11,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::extract::{ExtractedPayload, write_staging};
-use crate::schema::SourceRef;
+use crate::audit::{AuditEvent, append_audit_event};
+use crate::extract::{
+    ExtractedCandidate, ExtractedPayload, StagingEvidence, write_staging, write_staging_candidate,
+};
+use crate::schema::{SourceEvidenceRef, SourceRef};
 use crate::tool::MemoryToolKind;
 use crate::workspace::WorkspaceLayout;
 
@@ -24,6 +27,9 @@ pub enum MemoryBackendOperation {
     Write(MemoryWriteOperation),
     Edit(MemoryEditOperation),
     Delete(MemoryDeleteOperation),
+    ResidentSummary(MemoryResidentSummaryOperation),
+    AppendAudit(MemoryAppendAuditOperation),
+    StageCandidate(MemoryStageCandidateOperation),
     StageExtracted(MemoryStageExtractedOperation),
 }
 
@@ -42,6 +48,7 @@ pub enum MemoryBackendHttpResponse {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MemoryBackendOperationResult {
     ToolOutput(MemoryToolOutput),
+    Acknowledged(MemoryBackendAckOutput),
     StagingWritten(MemoryStagingWriteOutput),
 }
 
@@ -95,10 +102,34 @@ pub struct MemoryDeleteOperation {
     pub slug: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MemoryResidentSummaryOperation {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryAppendAuditOperation {
+    pub event: AuditEvent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryStageCandidateOperation {
+    pub source: SourceRef,
+    pub extract_run_id: String,
+    pub candidate: ExtractedCandidate,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<StagingEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<SourceEvidenceRef>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryStageExtractedOperation {
     pub source: SourceRef,
     pub payload: ExtractedPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryBackendAckOutput {
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +158,33 @@ pub fn execute_memory_backend_operation(
         MemoryBackendOperation::Delete(operation) => {
             execute_delete(layout, operation).map(MemoryBackendOperationResult::ToolOutput)
         }
+        MemoryBackendOperation::ResidentSummary(_operation) => Ok(
+            MemoryBackendOperationResult::ToolOutput(execute_resident_summary(layout)),
+        ),
+        MemoryBackendOperation::AppendAudit(operation) => {
+            append_audit_event(layout, &operation.event)?;
+            Ok(MemoryBackendOperationResult::Acknowledged(
+                MemoryBackendAckOutput {
+                    summary: "memory audit event appended".to_string(),
+                },
+            ))
+        }
+        MemoryBackendOperation::StageCandidate(operation) => {
+            let written = write_staging_candidate(
+                layout,
+                operation.source,
+                &operation.extract_run_id,
+                operation.candidate,
+                operation.evidence,
+                operation.source_refs,
+            )?;
+            Ok(MemoryBackendOperationResult::StagingWritten(
+                MemoryStagingWriteOutput {
+                    staging_count: 1,
+                    staging_ids: vec![written.id.to_string()],
+                },
+            ))
+        }
         MemoryBackendOperation::StageExtracted(operation) => {
             let written = write_staging(layout, operation.source, operation.payload)?;
             Ok(MemoryBackendOperationResult::StagingWritten(
@@ -136,6 +194,19 @@ pub fn execute_memory_backend_operation(
                 },
             ))
         }
+    }
+}
+
+fn execute_resident_summary(layout: &WorkspaceLayout) -> MemoryToolOutput {
+    match crate::collect_resident_summary(layout) {
+        Some(summary) => MemoryToolOutput {
+            summary: "resident memory summary collected".to_string(),
+            content: Some(summary),
+        },
+        None => MemoryToolOutput {
+            summary: "resident memory summary unavailable".to_string(),
+            content: None,
+        },
     }
 }
 

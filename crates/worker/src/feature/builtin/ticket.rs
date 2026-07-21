@@ -129,6 +129,7 @@ const THREAD_TOOL_NAMES: &[&str] = &["TicketComment", "TicketReview"];
 
 const INTAKE_TOOL_NAMES: &[&str] = &["TicketIntakeReady"];
 
+#[cfg(test)]
 const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketCreate",
     "TicketEditItem",
@@ -145,6 +146,7 @@ const WORKSPACE_AUTHORING_TOOL_NAMES: &[&str] = &[
     "TicketOrchestrationPlanQuery",
 ];
 
+#[cfg(test)]
 const ORCHESTRATION_CONTROL_TOOL_NAMES: &[&str] = &[
     "TicketList",
     "TicketShow",
@@ -171,9 +173,6 @@ const ORCHESTRATION_CONTROL_ADDITIONAL_TOOL_NAMES: &[&str] = &[
 pub enum TicketFeatureBackend {
     Local {
         root: PathBuf,
-    },
-    LocalWorkspace {
-        workspace_root: PathBuf,
     },
     WorkspaceHttp {
         workspace_id: String,
@@ -224,9 +223,6 @@ impl TicketFeature {
     }
 
     pub fn with_backend(backend: TicketFeatureBackend, access: TicketFeatureAccess) -> Self {
-        if let TicketFeatureBackend::LocalWorkspace { workspace_root } = backend {
-            return Self::for_workspace_with_access(workspace_root, access);
-        }
         Self {
             backend,
             record_language: None,
@@ -266,7 +262,6 @@ impl TicketFeature {
     pub fn backend_root(&self) -> Option<&Path> {
         match &self.backend {
             TicketFeatureBackend::Local { root } => Some(root),
-            TicketFeatureBackend::LocalWorkspace { workspace_root } => Some(workspace_root),
             TicketFeatureBackend::WorkspaceHttp { .. } => None,
         }
     }
@@ -293,8 +288,7 @@ impl TicketFeature {
     }
     fn tool_backend(&self, context: &mut FeatureInstallContext<'_>) -> Option<TicketToolBackend> {
         match &self.backend {
-            TicketFeatureBackend::Local { root: _ }
-            | TicketFeatureBackend::LocalWorkspace { workspace_root: _ } => {
+            TicketFeatureBackend::Local { root: _ } => {
                 let usable_root = match self.usable_backend_root() {
                     Ok(root) => root,
                     Err(reason) => {

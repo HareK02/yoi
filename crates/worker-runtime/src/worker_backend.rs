@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -240,9 +240,6 @@ impl ProfileRuntimeWorkerFactory {
 #[derive(Debug, Clone)]
 enum RuntimeWorkspaceBackendRef {
     None,
-    LocalFilesystem {
-        root: PathBuf,
-    },
     Http {
         workspace_id: String,
         base_url: String,
@@ -250,32 +247,19 @@ enum RuntimeWorkspaceBackendRef {
 }
 
 impl RuntimeWorkspaceBackendRef {
-    fn from_worker_request(
-        request: &CreateWorkerRequest,
-        binding: Option<&WorkingDirectoryBinding>,
-    ) -> Self {
+    fn from_worker_request(request: &CreateWorkerRequest) -> Self {
         if let Some(api) = request.workspace_api.as_ref() {
             return Self::Http {
                 workspace_id: api.workspace_id.clone(),
                 base_url: api.base_url.clone(),
             };
         }
-        Self::from_working_directory(binding)
-    }
-
-    fn from_working_directory(binding: Option<&WorkingDirectoryBinding>) -> Self {
-        match binding {
-            Some(binding) => Self::LocalFilesystem {
-                root: binding.root().to_path_buf(),
-            },
-            None => Self::None,
-        }
+        Self::None
     }
 
     fn worker_context(&self) -> WorkerWorkspaceContext {
         match self {
             Self::None => WorkerWorkspaceContext::no_workspace(),
-            Self::LocalFilesystem { root } => local_workspace_context(root),
             Self::Http {
                 workspace_id,
                 base_url,
@@ -285,17 +269,6 @@ impl RuntimeWorkspaceBackendRef {
             ),
         }
     }
-}
-
-fn local_workspace_context(root: &Path) -> WorkerWorkspaceContext {
-    WorkerWorkspaceContext::local_filesystem(read_workspace_id_hint(root))
-}
-
-fn read_workspace_id_hint(root: &Path) -> Option<WorkspaceId> {
-    let contents = std::fs::read_to_string(root.join(".yoi/workspace.toml")).ok()?;
-    let value = toml::from_str::<toml::Value>(&contents).ok()?;
-    let id = value.get("id")?.as_str()?.to_string();
-    WorkspaceId::new(id).ok()
 }
 
 #[cfg(feature = "http-server")]
@@ -377,10 +350,8 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 )
             })
             .unwrap_or(WorkerFilesystemAuthority::None);
-        let workspace_backend_ref = RuntimeWorkspaceBackendRef::from_worker_request(
-            &request.request,
-            request.working_directory.as_ref(),
-        );
+        let workspace_backend_ref =
+            RuntimeWorkspaceBackendRef::from_worker_request(&request.request);
         let workspace_context = workspace_backend_ref.worker_context();
         let selector = profile.as_deref().unwrap_or("builtin:default");
         let archive = self
@@ -458,10 +429,8 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                 )
             })
             .unwrap_or(WorkerFilesystemAuthority::None);
-        let workspace_backend_ref = RuntimeWorkspaceBackendRef::from_worker_request(
-            &request.request,
-            request.working_directory.as_ref(),
-        );
+        let workspace_backend_ref =
+            RuntimeWorkspaceBackendRef::from_worker_request(&request.request);
         let workspace_context = workspace_backend_ref.worker_context();
         let (manifest, loader) = Self::restore_fallback_manifest(&worker_name)?;
 
@@ -1264,10 +1233,8 @@ mod tests {
                 .as_ref()
                 .map(|binding| binding.root().to_path_buf())
                 .unwrap_or_else(|| self.cwd.clone());
-            let workspace_backend_ref = RuntimeWorkspaceBackendRef::from_worker_request(
-                &request.request,
-                request.working_directory.as_ref(),
-            );
+            let workspace_backend_ref =
+                RuntimeWorkspaceBackendRef::from_worker_request(&request.request);
             let workspace_context = workspace_backend_ref.worker_context();
             self.observed_workspace_clients
                 .lock()
@@ -1664,6 +1631,12 @@ mod tests {
         assert!(cwd.starts_with(runtime_base.path()));
         assert!(!cwd.starts_with(repo.path()));
         assert!(cwd.join("README.md").exists());
+        assert_eq!(
+            observed_workspace_clients.lock().unwrap().as_slice(),
+            &[WorkspaceClient::Unavailable {
+                reason: "no workspace configured".to_string()
+            }]
+        );
     }
 
     #[test]

@@ -30,6 +30,7 @@ use manifest::{
 
 use crate::compact::state::CompactState;
 use crate::compact::usage_tracker::UsageTracker;
+use crate::feature::builtin::memory::WorkspaceMemoryBackendError;
 use crate::feature::builtin::{
     SessionExploreFeature, SessionExploreState, TaskFeature, render_extract_input,
 };
@@ -506,8 +507,6 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// [`Self::from_manifest`], or defaults to the builtin pack when a
     /// Worker is constructed through lower-level paths that have no loader.
     prompts: Arc<PromptCatalog>,
-    /// Memory workspace layout used for Memory record operations.
-    memory_layout: Option<memory::WorkspaceLayout>,
     /// When true (default), the system-prompt assembler may append the
     /// workspace memory summary (`memory/summary.md`). Internal disposable
     /// workers disable this so resident memory exposure is opt-in per Worker.
@@ -607,7 +606,6 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
             usage_history: self.usage_history.clone(),
             tracker: None,
             task_feature: self.task_feature.clone(),
-            memory_layout: self.memory_layout.clone(),
             system_prompt_template: None,
             alerter: self.alerter.clone(),
             event_tx: self.event_tx.clone(),
@@ -806,7 +804,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             callback_socket: None,
             runtime_ticket_role: None,
             prompts,
-            memory_layout: None,
             inject_resident_summary: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
@@ -900,6 +897,20 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         self.workspace_context.client()
     }
 
+    fn resident_summary_from_workspace_authority(&self) -> Result<Option<String>, WorkerError> {
+        let result = self.workspace_client().execute_memory_backend_operation(
+            memory::backend::MemoryBackendOperation::ResidentSummary(
+                memory::backend::MemoryResidentSummaryOperation::default(),
+            ),
+        )?;
+        match result {
+            memory::backend::MemoryBackendOperationResult::ToolOutput(output) => Ok(output.content),
+            other => Err(WorkerError::FeatureInstall(format!(
+                "unexpected memory backend result for resident summary: {other:?}"
+            ))),
+        }
+    }
+
     /// Activate an Agent Skill through the Workspace backend/client and commit
     /// the returned SKILL.md body to history before it can influence an LLM run.
     ///
@@ -923,13 +934,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         self.engine_mut()
             .append_history(std::iter::once(llm_engine::Item::system_message(body)));
         Ok(activation)
-    }
-
-    pub(crate) fn worker_metadata_store(&self) -> St
-    where
-        St: Clone,
-    {
-        self.store.clone()
     }
 
     /// The Worker's directory scope, as a shared atomically-swappable
@@ -1487,17 +1491,20 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 }
             }
         }
-        let memory_layout = self.memory_layout.as_ref();
         let inject_summary = self.inject_resident_summary
-            && memory_layout.is_some()
             && self
                 .manifest
                 .memory
                 .as_ref()
-                .and_then(|m| m.inject_summary)
-                .unwrap_or(true);
+                .is_some_and(|m| m.inject_summary.unwrap_or(true));
         let resident_summary: Option<String> = if inject_summary {
-            memory_layout.and_then(memory::collect_resident_summary)
+            match self.resident_summary_from_workspace_authority() {
+                Ok(summary) => summary,
+                Err(error) => {
+                    tracing::debug!(%error, "resident memory summary unavailable");
+                    None
+                }
+            }
         } else {
             None
         };
@@ -2854,15 +2861,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         total_now.saturating_sub(total_at_pointer)
     }
 
-    fn local_memory_layout(
-        &self,
-        memory_cfg: &manifest::MemoryConfig,
-    ) -> Option<memory::WorkspaceLayout> {
-        self.filesystem_authority
-            .as_local()
-            .map(|local| memory::WorkspaceLayout::resolve(memory_cfg, &local.root))
-    }
-
     /// extract (memory.extract) post-run trigger.
     ///
     /// Called by the Controller before spawning the background memory task so
@@ -2879,10 +2877,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let Some(memory_cfg) = self.manifest.memory.clone() else {
             return Ok(());
         };
-        let Some(layout) = self.local_memory_layout(&memory_cfg) else {
-            tracing::debug!("workspace memory extract unavailable: no local filesystem authority");
-            return Ok(());
-        };
         // `Some(0)` means disabled, same as `None`. Otherwise the
         // `tokens_since >= 0` comparison would fire on every post-run.
         let Some(threshold) = memory_cfg.extract_threshold.filter(|n| *n > 0) else {
@@ -2896,7 +2890,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 Some(model_audit_from_manifest(model)),
             )
             .emit(
-                &layout,
+                self.workspace_client(),
                 self.event_tx.as_ref(),
                 memory::audit::WorkerLifecycleStatus::Skipped,
                 "extract_threshold_disabled",
@@ -2925,7 +2919,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                     Some(model_audit_from_manifest(model)),
                 )
                 .emit(
-                    &layout,
+                    self.workspace_client(),
                     self.event_tx.as_ref(),
                     memory::audit::WorkerLifecycleStatus::Skipped,
                     "extract_already_in_flight",
@@ -2970,10 +2964,6 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     ) -> Result<ExtractDecision, WorkerError> {
         use memory::extract;
 
-        let Some(layout) = self.local_memory_layout(memory_cfg) else {
-            tracing::debug!("workspace memory extract unavailable: no local filesystem authority");
-            return Ok(ExtractDecision::Skipped);
-        };
         let model = memory_cfg
             .extract_model
             .as_ref()
@@ -2998,7 +2988,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let tokens_since = self.tokens_added_since(processed_history_len);
         if tokens_since < threshold {
             audit.emit(
-                &layout,
+                self.workspace_client(),
                 event_tx,
                 memory::audit::WorkerLifecycleStatus::Skipped,
                 format!(
@@ -3019,7 +3009,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             .len();
         if current_history_len <= processed_history_len {
             audit.emit(
-                &layout,
+                self.workspace_client(),
                 event_tx,
                 memory::audit::WorkerLifecycleStatus::Skipped,
                 "no_new_history_items",
@@ -3042,7 +3032,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             .len();
         if entries_now == 0 {
             audit.emit(
-                &layout,
+                self.workspace_client(),
                 event_tx,
                 memory::audit::WorkerLifecycleStatus::Skipped,
                 "empty_segment_log",
@@ -3059,7 +3049,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             .unwrap_or(0);
         if start_entry > end_entry {
             audit.emit(
-                &layout,
+                self.workspace_client(),
                 event_tx,
                 memory::audit::WorkerLifecycleStatus::Skipped,
                 "no_new_segment_entries",
@@ -3084,7 +3074,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             ..Default::default()
         };
         audit.emit(
-            &layout,
+            self.workspace_client(),
             event_tx,
             memory::audit::WorkerLifecycleStatus::Started,
             format!("token_threshold_reached tokens_since={tokens_since} threshold={threshold}"),
@@ -3105,7 +3095,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             Ok(client) => client,
             Err(err) => {
                 audit.emit(
-                    &layout,
+                    self.workspace_client(),
                     event_tx,
                     memory::audit::WorkerLifecycleStatus::Failed,
                     format!("client_build_failed: {err}"),
@@ -3121,7 +3111,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             Ok(prompt) => prompt,
             Err(err) => {
                 audit.emit(
-                    &layout,
+                    self.workspace_client(),
                     event_tx,
                     memory::audit::WorkerLifecycleStatus::Failed,
                     format!("prompt_render_failed: {err}"),
@@ -3141,7 +3131,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             source_segment_id.to_string(),
             items_to_extract,
         );
-        let session_explore_state = SessionExploreState::new(session_view, layout.clone(), source);
+        let session_explore_state =
+            SessionExploreState::new(session_view, self.workspace_client().clone(), source);
         let input_text = render_extract_input(session_explore_state.view());
         let mut internal_tools = Vec::new();
         let mut internal_hook_builder = HookRegistryBuilder::new();
@@ -3161,7 +3152,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 .any(|installed| installed == name)
         }) {
             audit.emit(
-                &layout,
+                self.workspace_client(),
                 event_tx,
                 memory::audit::WorkerLifecycleStatus::Failed,
                 "session_explore_feature_install_failed",
@@ -3188,7 +3179,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             Err(err) => {
                 let usage = err.usage.as_ref().map(usage_audit_from_event);
                 audit.emit(
-                    &layout,
+                    self.workspace_client(),
                     event_tx,
                     lifecycle_status_for_worker_error(&err.source),
                     format!("worker_failed: {}", err.source),
@@ -3207,10 +3198,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 "extract worker did not call finish_extraction; advancing pointer with staged output"
             );
         }
-        let staging_id = staging_results
-            .first()
-            .map(|result| result.id.to_string())
-            .unwrap_or_default();
+        let staging_id = staging_results.first().cloned().unwrap_or_default();
 
         let pointer_payload = extract::ExtractPointerPayload {
             processed_through_entry: end_entry,
@@ -3232,11 +3220,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
 
         let mut extract_audit = extract_audit_base;
         extract_audit.staging_count = staging_results.len();
-        for result in &staging_results {
-            extract_audit.staging_ids.push(result.id.to_string());
-            extract_audit
-                .staging_paths
-                .push(result.path.display().to_string());
+        for id in &staging_results {
+            extract_audit.staging_ids.push(id.clone());
         }
         let reason = if staging_id.is_empty() {
             "completed_no_staging_output"
@@ -3244,7 +3229,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             "completed_staging_written"
         };
         audit.emit(
-            &layout,
+            self.workspace_client(),
             event_tx,
             memory::audit::WorkerLifecycleStatus::Completed,
             reason,
@@ -3256,357 +3241,46 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         Ok(ExtractDecision::Completed)
     }
 
-    /// Build the LlmClient for the consolidation (memory.consolidation) Engine.
-    ///
-    /// Uses `memory.consolidation_model` from manifest if set, otherwise
-    /// clones the main client. Mirrors [`build_extractor_client`].
-    fn build_consolidator_client(
-        &self,
-        memory_cfg: &manifest::MemoryConfig,
-    ) -> Result<Box<dyn LlmClient>, WorkerError> {
-        if let Some(ref m) = memory_cfg.consolidation_model {
-            let client = crate::model_client::build_client(m)?;
-            return Ok(client);
-        }
-        let worker = self.engine.as_ref().expect("worker taken during run");
-        Ok(worker.client().clone_boxed())
-    }
-
     /// consolidation (memory.consolidation) trigger.
     ///
-    /// Intended to run from a background memory task after extract may have
-    /// added staging entries. Compact is deferred until the next turn starts,
-    /// so consolidation no longer blocks the controller's post-run path.
-    ///
-    /// Behaviour follows `docs/plan/memory.md` §Consolidation / §並走防止:
-    /// the staging-side `StagingLock` enforces cross-process exclusion;
-    /// `consolidation_in_flight` keeps in-process callers honest. On
-    /// success, the lock is released *with* consumed-id cleanup; on
-    /// worker failure, only the lock file is unlinked so the staging
-    /// entries remain for a future retry.
+    /// Worker no longer has direct Workspace filesystem authority. Until consolidation is
+    /// exposed as a Backend Workspace Authority operation, the Worker must not inspect
+    /// staging, acquire staging locks, or register local memory tools directly.
     pub async fn try_post_run_consolidate(&mut self) -> Result<(), WorkerError> {
         let Some(memory_cfg) = self.manifest.memory.clone() else {
             return Ok(());
-        };
-        let Some(layout) = self.local_memory_layout(&memory_cfg) else {
-            tracing::debug!(
-                "workspace memory consolidation unavailable: no local filesystem authority"
-            );
-            return Ok(());
-        };
-        // `Some(0)` collapses to `None` — staging count / bytes always
-        // satisfies `>= 0`, which would fire consolidation on every post-run.
-        // Treating zero as disabled lines up with `extract_threshold` and
-        // matches the "no threshold ⇒ consolidation off" invariant in the
-        // ticket's §Trigger.
-        let files_threshold = memory_cfg.consolidation_threshold_files.filter(|n| *n > 0);
-        let bytes_threshold = memory_cfg.consolidation_threshold_bytes.filter(|n| *n > 0);
-        if files_threshold.is_none() && bytes_threshold.is_none() {
-            let model = memory_cfg
-                .consolidation_model
-                .as_ref()
-                .unwrap_or(&self.manifest.model);
-            WorkerAuditBase::new(
-                memory::audit::AuditWorker::MemoryConsolidation,
-                memory::audit::AuditTrigger::StagingBacklog,
-                Some(model_audit_from_manifest(model)),
-            )
-            .emit(
-                &layout,
-                self.event_tx.as_ref(),
-                memory::audit::WorkerLifecycleStatus::Skipped,
-                "consolidation_threshold_disabled",
-                None,
-                None,
-                None,
-            );
-            return Ok(());
-        }
-
-        loop {
-            if self
-                .consolidation_in_flight
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                let model = memory_cfg
-                    .consolidation_model
-                    .as_ref()
-                    .unwrap_or(&self.manifest.model);
-                WorkerAuditBase::new(
-                    memory::audit::AuditWorker::MemoryConsolidation,
-                    memory::audit::AuditTrigger::StagingBacklog,
-                    Some(model_audit_from_manifest(model)),
-                )
-                .emit(
-                    &layout,
-                    self.event_tx.as_ref(),
-                    memory::audit::WorkerLifecycleStatus::Skipped,
-                    "consolidation_already_in_flight",
-                    None,
-                    None,
-                    None,
-                );
-                return Ok(());
-            }
-            let result = self
-                .run_consolidate_once(&memory_cfg, files_threshold, bytes_threshold)
-                .await;
-            self.consolidation_in_flight.store(false, Ordering::Release);
-
-            match result {
-                Ok(ConsolidateDecision::Skipped) => return Ok(()),
-                Ok(ConsolidateDecision::Completed) => continue,
-                Err(e) => {
-                    tracing::warn!(error = %e, "consolidation failed");
-                    self.alert(
-                        AlertLevel::Warn,
-                        AlertSource::Worker,
-                        format!("memory consolidation failed: {e}"),
-                    );
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    /// Single consolidation iteration: snapshot staging, decide whether to
-    /// fire, run the worker if so, release the lock and clean up consumed
-    /// IDs.
-    async fn run_consolidate_once(
-        &mut self,
-        memory_cfg: &manifest::MemoryConfig,
-        files_threshold: Option<usize>,
-        bytes_threshold: Option<u64>,
-    ) -> Result<ConsolidateDecision, WorkerError> {
-        use memory::consolidate;
-
-        let Some(layout) = self.local_memory_layout(memory_cfg) else {
-            tracing::debug!(
-                "workspace memory consolidation unavailable: no local filesystem authority"
-            );
-            return Ok(ConsolidateDecision::Skipped);
         };
         let model = memory_cfg
             .consolidation_model
             .as_ref()
             .unwrap_or(&self.manifest.model);
-        let audit = WorkerAuditBase::new(
+        let files_threshold = memory_cfg.consolidation_threshold_files.filter(|n| *n > 0);
+        let bytes_threshold = memory_cfg.consolidation_threshold_bytes.filter(|n| *n > 0);
+        let reason = if files_threshold.is_none() && bytes_threshold.is_none() {
+            "consolidation_threshold_disabled"
+        } else {
+            "consolidation_backend_operation_unavailable"
+        };
+        WorkerAuditBase::new(
             memory::audit::AuditWorker::MemoryConsolidation,
             memory::audit::AuditTrigger::StagingBacklog,
             Some(model_audit_from_manifest(model)),
-        );
-        let event_tx = self.event_tx.as_ref();
-
-        let staging_snapshot = consolidate::list_staging_entries_snapshot(&layout);
-        let invalid_staging_count = staging_snapshot.invalid_count;
-        let entries = staging_snapshot.entries;
-        if entries.is_empty() {
-            let reason = if invalid_staging_count == 0 {
-                "no_staging_entries".to_string()
-            } else {
-                format!("no_valid_staging_entries invalid={invalid_staging_count}")
-            };
-            audit.emit(
-                &layout,
-                event_tx,
-                memory::audit::WorkerLifecycleStatus::Skipped,
-                reason,
-                None,
-                None,
-                Some(memory::audit::ConsolidationAudit {
-                    invalid_staging_count,
-                    ..Default::default()
-                }),
-            );
-            return Ok(ConsolidateDecision::Skipped);
-        }
-
-        let total_files = entries.len();
-        let total_bytes: u64 = entries.iter().map(|e| e.bytes).sum();
-        let consumed_ids: Vec<uuid::Uuid> = entries.iter().map(|e| e.id).collect();
-        let base_consolidation = memory::audit::ConsolidationAudit {
-            staging_count: total_files,
-            invalid_staging_count,
-            staging_bytes: total_bytes,
-            consumed_staging_ids: consumed_ids.iter().map(ToString::to_string).collect(),
-            operations: memory::audit::OperationCounts::default(),
-        };
-        let files_hit = files_threshold.is_some_and(|n| total_files >= n);
-        let bytes_hit = bytes_threshold.is_some_and(|n| total_bytes >= n);
-        if !files_hit && !bytes_hit {
-            audit.emit(
-                &layout,
-                event_tx,
-                memory::audit::WorkerLifecycleStatus::Skipped,
-                format!(
-                    "threshold_not_reached files={total_files} bytes={total_bytes} files_threshold={files_threshold:?} bytes_threshold={bytes_threshold:?}"
-                ),
-                None,
-                None,
-                Some(base_consolidation),
-            );
-            return Ok(ConsolidateDecision::Skipped);
-        }
-
-        let lock = match consolidate::StagingLock::acquire(
-            &layout,
-            std::process::id(),
-            self.manifest.worker.name.clone(),
-            consumed_ids,
-        ) {
-            Ok(l) => l,
-            Err(memory::consolidate::LockError::InUse { .. }) => {
-                audit.emit(
-                    &layout,
-                    event_tx,
-                    memory::audit::WorkerLifecycleStatus::Skipped,
-                    "staging_lock_in_use",
-                    None,
-                    None,
-                    Some(base_consolidation),
-                );
-                return Ok(ConsolidateDecision::Skipped);
-            }
-            Err(e) => {
-                audit.emit(
-                    &layout,
-                    event_tx,
-                    memory::audit::WorkerLifecycleStatus::Failed,
-                    format!("staging_lock_failed: {e}"),
-                    None,
-                    None,
-                    Some(base_consolidation),
-                );
-                return Err(WorkerError::ConsolidationLock(e));
-            }
-        };
-
-        audit.emit(
-            &layout,
-            event_tx,
-            memory::audit::WorkerLifecycleStatus::Started,
-            format!("staging_threshold_reached files={total_files} bytes={total_bytes}"),
+        )
+        .emit(
+            self.workspace_client(),
+            self.event_tx.as_ref(),
+            memory::audit::WorkerLifecycleStatus::Skipped,
+            reason,
             None,
             None,
-            Some(base_consolidation.clone()),
+            None,
         );
-
-        let before_records = memory::audit::snapshot_records(&layout);
-
-        let client = match self.build_consolidator_client(memory_cfg) {
-            Ok(c) => c,
-            Err(e) => {
-                lock.release_only();
-                audit.emit(
-                    &layout,
-                    event_tx,
-                    memory::audit::WorkerLifecycleStatus::Failed,
-                    format!("client_build_failed: {e}"),
-                    None,
-                    None,
-                    Some(base_consolidation),
-                );
-                return Err(e);
-            }
-        };
-        let memory_language = memory_language(memory_cfg);
-        let consolidation_system_prompt =
-            match self.prompts.memory_consolidation_system(memory_language) {
-                Ok(p) => p,
-                Err(e) => {
-                    lock.release_only();
-                    audit.emit(
-                        &layout,
-                        event_tx,
-                        memory::audit::WorkerLifecycleStatus::Failed,
-                        format!("prompt_render_failed: {e}"),
-                        None,
-                        None,
-                        Some(base_consolidation),
-                    );
-                    return Err(WorkerError::PromptCatalog(e));
-                }
-            };
-        let mut worker = Engine::new(client).system_prompt(consolidation_system_prompt);
-        worker.set_cache_key(Some(self.segment_id().to_string()));
-
-        let usage_capture = Arc::new(Mutex::new(None));
-        let usage_capture_for_worker = usage_capture.clone();
-        worker.on_usage(move |event| {
-            *usage_capture_for_worker
-                .lock()
-                .expect("memory consolidation usage capture poisoned") =
-                Some(usage_audit_from_event(event));
-        });
-
-        // Memory tools are self-contained — they bypass ScopedFs and write
-        // directly under the workspace via WorkspaceLayout. Resident section
-        // injection is a Worker-level concern; this disposable Engine is built
-        // without it by construction, in keeping with `docs/plan/memory.md`
-        let query_cfg = memory::tool::QueryConfig::from(memory_cfg);
-        worker.register_tool(memory::tool::read_tool_with_usage(
-            layout.clone(),
-            self.segment_id().to_string(),
-        ));
-        worker.register_tool(memory::tool::write_tool(layout.clone()));
-        worker.register_tool(memory::tool::edit_tool(layout.clone()));
-        worker.register_tool(memory::tool::delete_tool(layout.clone()));
-        worker.register_tool(memory::tool::memory_query_tool(layout.clone(), query_cfg));
-
-        let tidy = consolidate::collect_tidy_hints(&layout);
-        let usage_report = match memory::build_usage_report(&layout) {
-            Ok(report) => report,
-            Err(err) => {
-                warn!(error = %err, "failed to build memory usage report for consolidation");
-                memory::UsageReport::empty()
-            }
-        };
-        let input_text =
-            consolidate::build_consolidate_input(&layout, &entries, &tidy, &usage_report);
-
-        let run_result = worker.run(input_text).await;
-        let usage = usage_capture
-            .lock()
-            .expect("memory consolidation usage capture poisoned")
-            .clone();
-        match run_result {
-            Ok(_) => {
-                lock.release_with_cleanup(&layout);
-                let after_records = memory::audit::snapshot_records(&layout);
-                let mut consolidation = base_consolidation;
-                consolidation.operations =
-                    memory::audit::operation_counts_from_snapshots(&before_records, &after_records);
-                let reason = if consolidation.operations.total_record_changes() == 0 {
-                    "completed_no_record_changes"
-                } else {
-                    "completed_record_changes"
-                };
-                audit.emit(
-                    &layout,
-                    event_tx,
-                    memory::audit::WorkerLifecycleStatus::Completed,
-                    reason,
-                    usage,
-                    None,
-                    Some(consolidation),
-                );
-                Ok(ConsolidateDecision::Completed)
-            }
-            Err(e) => {
-                lock.release_only();
-                audit.emit(
-                    &layout,
-                    event_tx,
-                    lifecycle_status_for_worker_error(&e),
-                    format!("worker_failed: {e}"),
-                    usage,
-                    None,
-                    Some(base_consolidation),
-                );
-                Err(WorkerError::Engine(e))
-            }
+        if reason == "consolidation_backend_operation_unavailable" {
+            tracing::debug!(
+                "workspace memory consolidation skipped: backend operation is unavailable"
+            );
         }
+        Ok(())
     }
 }
 
@@ -3685,7 +3359,7 @@ impl WorkerAuditBase {
 
     fn emit(
         &self,
-        layout: &memory::WorkspaceLayout,
+        workspace_client: &WorkspaceClient,
         event_tx: Option<&broadcast::Sender<Event>>,
         status: memory::audit::WorkerLifecycleStatus,
         reason: impl Into<String>,
@@ -3694,19 +3368,25 @@ impl WorkerAuditBase {
         consolidation: Option<memory::audit::ConsolidationAudit>,
     ) {
         let reason = reason.into();
-        let _ = memory::audit::append_worker_lifecycle(
-            layout,
-            memory::audit::WorkerLifecycleAudit {
-                run_id: self.run_id,
-                worker: self.worker,
-                status,
-                trigger: self.trigger,
-                reason: reason.clone(),
-                model: self.model.clone(),
-                usage,
-                extract,
-                consolidation,
-            },
+        let payload = memory::audit::WorkerLifecycleAudit {
+            run_id: self.run_id,
+            worker: self.worker,
+            status,
+            trigger: self.trigger,
+            reason: reason.clone(),
+            model: self.model.clone(),
+            usage,
+            extract,
+            consolidation,
+        };
+        let _ = workspace_client.execute_memory_backend_operation(
+            memory::backend::MemoryBackendOperation::AppendAudit(
+                memory::backend::MemoryAppendAuditOperation {
+                    event: memory::audit::AuditEvent::new(
+                        memory::audit::AuditPayload::WorkerLifecycle(payload),
+                    ),
+                },
+            ),
         );
         if should_emit_memory_worker_event(self.worker, status, &reason) {
             emit_memory_worker_event(
@@ -3763,16 +3443,6 @@ enum ExtractDecision {
     /// Threshold not reached, or no items to extract.
     Skipped,
     /// Extract ran and pointer advanced. Caller re-evaluates threshold.
-    Completed,
-}
-
-/// Outcome of a single consolidation iteration. Internal to
-/// `try_post_run_consolidate` / `run_consolidate_once`.
-enum ConsolidateDecision {
-    /// Either threshold not met, no staging, or another Worker holds the lock.
-    Skipped,
-    /// Consolidation ran. Caller re-evaluates threshold against any
-    /// staging entries that arrived during the run (Coalesce).
     Completed,
 }
 
@@ -3878,7 +3548,6 @@ where
             callback_socket: None,
             runtime_ticket_role: None,
             prompts: common.prompts,
-            memory_layout: common.memory_layout,
             inject_resident_summary: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
@@ -3984,7 +3653,6 @@ where
             callback_socket: Some(callback_socket),
             runtime_ticket_role: None,
             prompts: common.prompts,
-            memory_layout: common.memory_layout,
             inject_resident_summary: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
@@ -4216,7 +3884,6 @@ where
             callback_socket: None,
             runtime_ticket_role: None,
             prompts: common.prompts,
-            memory_layout: common.memory_layout,
             inject_resident_summary: true,
             extract_in_flight: Arc::new(AtomicBool::new(false)),
             consolidation_in_flight: Arc::new(AtomicBool::new(false)),
@@ -4821,8 +4488,8 @@ pub enum WorkerError {
     #[error(transparent)]
     Skill(#[from] SkillClientError),
 
-    #[error("memory extract staging write failed: {0}")]
-    ExtractStaging(#[source] std::io::Error),
+    #[error(transparent)]
+    WorkspaceMemoryBackend(#[from] WorkspaceMemoryBackendError),
 
     #[error("feature install failed: {0}")]
     FeatureInstall(String),
@@ -4869,7 +4536,6 @@ struct WorkerCommon {
     delegation_scope: DelegationScope,
     client: Box<dyn LlmClient>,
     prompts: Arc<PromptCatalog>,
-    memory_layout: Option<memory::WorkspaceLayout>,
     system_prompt_template: Option<SystemPromptTemplate>,
 }
 
@@ -5011,11 +4677,6 @@ fn prepare_worker_common_from_scope(
 
     let client = crate::model_client::build_client(&manifest.model)?;
     let prompts = PromptCatalog::load(loader, manifest.worker.prompt_pack.as_deref())?;
-    let memory_layout = manifest.memory.as_ref().and_then(|mem| {
-        filesystem_authority
-            .as_local()
-            .map(|local| memory::WorkspaceLayout::resolve(mem, &local.root))
-    });
     let system_prompt_template = if parse_template {
         Some(
             SystemPromptTemplate::parse(&manifest.engine.instruction, loader.clone())
@@ -5032,7 +4693,6 @@ fn prepare_worker_common_from_scope(
         delegation_scope,
         client,
         prompts,
-        memory_layout,
         system_prompt_template,
     })
 }
@@ -5089,10 +4749,6 @@ mod spawned_context_tests {
             common.filesystem_authority.as_local().unwrap().cwd,
             cwd.canonicalize().unwrap()
         );
-        assert_eq!(
-            common.memory_layout.as_ref().unwrap().root(),
-            workspace_root.canonicalize().unwrap()
-        );
     }
 
     #[test]
@@ -5127,7 +4783,6 @@ mod spawned_context_tests {
             Some(workspace_id.as_str())
         );
         assert!(common.workspace_context.client().is_available());
-        assert!(common.memory_layout.is_none());
     }
 
     #[test]
@@ -5867,29 +5522,29 @@ mod build_summary_prompt_tests {
         let store = session_store::FsStore::new(dir.path().join("sessions")).unwrap();
         let cwd = dir.path().join("workspace");
         std::fs::create_dir_all(&cwd).unwrap();
-        if let Some(doc) = summary_doc {
-            std::fs::create_dir_all(cwd.join(".yoi/memory")).unwrap();
-            std::fs::write(cwd.join(".yoi/memory/summary.md"), doc).unwrap();
-        }
         let mut manifest = minimal_manifest();
-        manifest.memory = memory_config;
+        manifest.memory = memory_config.clone();
         let scope = Scope::writable(&cwd).unwrap();
         let authority = WorkerFilesystemAuthority::local(cwd.clone(), cwd.clone());
+        let workspace_context = if memory_config
+            .as_ref()
+            .is_some_and(|cfg| cfg.inject_summary.unwrap_or(true))
+            && gates.summary
+        {
+            stub_memory_backend_context(summary_doc.and_then(summary_content_for_backend))
+        } else {
+            WorkerWorkspaceContext::local_filesystem(None)
+        };
         let mut worker = Worker::new(
             manifest,
             Engine::new(NoopClient),
             store,
-            WorkerWorkspaceContext::local_filesystem(None),
+            workspace_context,
             authority,
             scope,
         )
         .await
         .unwrap();
-        worker.memory_layout = worker
-            .manifest
-            .memory
-            .as_ref()
-            .map(|mem| memory::WorkspaceLayout::resolve(mem, &cwd));
         worker.set_resident_memory_injection(gates.summary);
         let template = SystemPromptTemplate::parse(
             "$yoi/default",
@@ -5903,6 +5558,56 @@ mod build_summary_prompt_tests {
 
     fn summary_doc(body: &str) -> String {
         format!("---\nupdated_at: 2026-01-01T00:00:00Z\n---\n{body}")
+    }
+
+    fn summary_content_for_backend(doc: &str) -> Option<String> {
+        if doc.contains("this is not yaml") {
+            return None;
+        }
+        if let Some(rest) = doc.strip_prefix("---\n") {
+            if let Some((_, body)) = rest.split_once("\n---\n") {
+                return Some(body.to_string());
+            }
+        }
+        Some(doc.to_string())
+    }
+
+    fn stub_memory_backend_context(content: Option<String>) -> WorkerWorkspaceContext {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer).unwrap();
+            let body = serde_json::json!({
+                "Ok": {
+                    "result": {
+                        "ToolOutput": {
+                            "summary": if content.is_some() {
+                                "resident memory summary collected"
+                            } else {
+                                "resident memory summary unavailable"
+                            },
+                            "content": content,
+                        }
+                    }
+                }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        WorkerWorkspaceContext::with_client(
+            Some(WorkspaceId::new("test-memory").unwrap()),
+            WorkspaceClient::http("test-memory", format!("http://{addr}")),
+        )
     }
 
     #[tokio::test]

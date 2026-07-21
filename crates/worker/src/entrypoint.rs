@@ -247,17 +247,14 @@ fn load_profile(
 }
 
 pub fn resolve_runtime_profile_manifest(
-    profile: Option<&str>,
-    workspace_root: &Path,
-    worker_name: &str,
+    _profile: Option<&str>,
+    _workspace_root: &Path,
+    _worker_name: &str,
 ) -> Result<(WorkerManifest, PromptLoader), String> {
-    let selector = profile
-        .map(ProfileSelector::parse_cli)
-        .unwrap_or(ProfileSelector::Default);
-    let (mut manifest, loader) = load_profile(&selector, workspace_root, worker_name)?;
-    apply_profile_launch_policy(&mut manifest, workspace_root, None)?;
-    apply_plugin_resolution_plan(&mut manifest, workspace_root);
-    Ok((manifest, loader))
+    Err(
+        "runtime profile resolution requires a pre-resolved manifest/profile archive from Backend authority"
+            .to_string(),
+    )
 }
 
 pub fn resolve_runtime_profile_manifest_from_manifest(
@@ -269,13 +266,15 @@ pub fn resolve_runtime_profile_manifest_from_manifest(
         manifest.worker.name = worker_name.to_string();
     }
     apply_profile_launch_policy(&mut manifest, workspace_root, None)?;
-    apply_plugin_resolution_plan(&mut manifest, workspace_root);
+    // Do not run plugin discovery here: runtime-created Workers receive their
+    // resolved manifest/profile archive from Backend authority, not by scanning
+    // the materialized workdir's `.yoi/plugins`.
     Ok((manifest, PromptLoader::builtins_only()))
 }
 
 pub fn resolve_runtime_profile_manifest_from_manifest_without_filesystem(
     mut manifest: WorkerManifest,
-    workspace_root: &Path,
+    _workspace_root: &Path,
     worker_name: &str,
 ) -> Result<(WorkerManifest, PromptLoader), String> {
     if manifest.worker.name.is_empty() {
@@ -283,7 +282,7 @@ pub fn resolve_runtime_profile_manifest_from_manifest_without_filesystem(
     }
     manifest.scope = ScopeConfig::default();
     manifest.delegation_scope = ScopeConfig::default();
-    apply_plugin_resolution_plan(&mut manifest, workspace_root);
+    // Same as the filesystem-capable runtime path: no local `.yoi` discovery.
     Ok((manifest, PromptLoader::builtins_only()))
 }
 
