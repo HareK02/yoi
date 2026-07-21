@@ -11,7 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::{SecondsFormat, Utc};
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use memory::backend::{
     MemoryBackendHttpResponse, MemoryBackendOperation, execute_memory_backend_operation,
 };
@@ -22,6 +22,9 @@ use ticket::{
     execute_ticket_backend_operation,
 };
 use tokio::net::TcpListener;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
 
@@ -42,7 +45,7 @@ use crate::hosts::{
 use crate::identity::WorkspaceIdentity;
 use crate::observation::{
     BackendObservationProxy, ObservationProxyError, RuntimeObservationClient,
-    RuntimeObservationSourceConfig,
+    RuntimeObservationSource, RuntimeObservationSourceConfig,
 };
 use crate::profile_settings::{
     CreateWorkspaceProfileSourceRequest, DeleteWorkspaceProfileSourceRequest,
@@ -3412,19 +3415,140 @@ async fn worker_protocol_ws(
                 .into_response();
         }
     };
-    ws.on_upgrade(move |socket| {
-        worker_protocol_ws_session(api.runtime, source, runtime_id, worker_id, socket)
-    })
+    ws.on_upgrade(move |socket| worker_protocol_ws_session(source, socket))
 }
 
-async fn worker_protocol_ws_session(
-    runtime: Arc<RuntimeRegistry>,
-    source: crate::observation::RuntimeObservationSource,
-    runtime_id: String,
-    worker_id: String,
+async fn worker_protocol_ws_session(source: RuntimeObservationSource, socket: WebSocket) {
+    match source {
+        RuntimeObservationSource::RemoteWs(config) => {
+            remote_worker_protocol_ws_session(config, socket).await;
+        }
+        RuntimeObservationSource::Embedded(source) => {
+            embedded_worker_protocol_ws_session(source, socket).await;
+        }
+    }
+}
+
+async fn remote_worker_protocol_ws_session(
+    config: RuntimeObservationSourceConfig,
+    socket: WebSocket,
+) {
+    let mut request = match config.endpoint.clone().into_client_request() {
+        Ok(request) => request,
+        Err(error) => {
+            let mut socket = socket;
+            let event = protocol_error_event(format!(
+                "failed to build runtime protocol WebSocket request: {error}"
+            ));
+            let _ = send_protocol_event(&mut socket, &event).await;
+            return;
+        }
+    };
+    if let Some(token) = &config.bearer_token {
+        match format!("Bearer {token}").parse() {
+            Ok(value) => {
+                request.headers_mut().insert("authorization", value);
+            }
+            Err(error) => {
+                let mut socket = socket;
+                let event = protocol_error_event(format!(
+                    "failed to build runtime authorization header: {error}"
+                ));
+                let _ = send_protocol_event(&mut socket, &event).await;
+                return;
+            }
+        }
+    }
+
+    let (upstream, _) = match connect_async(request).await {
+        Ok(connection) => connection,
+        Err(error) => {
+            let mut socket = socket;
+            let event = protocol_error_event(format!(
+                "failed to connect runtime protocol WebSocket: {error}"
+            ));
+            let _ = send_protocol_event(&mut socket, &event).await;
+            return;
+        }
+    };
+
+    let (mut client_sink, mut client_stream) = socket.split();
+    let (mut upstream_sink, mut upstream_stream) = upstream.split();
+
+    loop {
+        tokio::select! {
+            inbound = client_stream.next() => {
+                match inbound {
+                    Some(Ok(WsMessage::Text(text))) => {
+                        if upstream_sink.send(TungsteniteMessage::Text(text.to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(WsMessage::Binary(binary))) => {
+                        if upstream_sink.send(TungsteniteMessage::Binary(binary.to_vec().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(WsMessage::Close(_))) | None => {
+                        let _ = upstream_sink.send(TungsteniteMessage::Close(None)).await;
+                        break;
+                    }
+                    Some(Ok(WsMessage::Ping(payload))) => {
+                        if upstream_sink.send(TungsteniteMessage::Ping(payload.to_vec().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(WsMessage::Pong(payload))) => {
+                        if upstream_sink.send(TungsteniteMessage::Pong(payload.to_vec().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Err(_)) => break,
+                }
+            }
+            outbound = upstream_stream.next() => {
+                match outbound {
+                    Some(Ok(TungsteniteMessage::Text(text))) => {
+                        if client_sink.send(WsMessage::Text(text.to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(TungsteniteMessage::Binary(binary))) => {
+                        if client_sink.send(WsMessage::Binary(binary.to_vec().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(TungsteniteMessage::Close(_))) | None => {
+                        let _ = client_sink.send(WsMessage::Close(None)).await;
+                        break;
+                    }
+                    Some(Ok(TungsteniteMessage::Ping(payload))) => {
+                        if client_sink.send(WsMessage::Ping(payload.to_vec().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(TungsteniteMessage::Pong(payload))) => {
+                        if client_sink.send(WsMessage::Pong(payload.to_vec().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(TungsteniteMessage::Frame(_))) => {}
+                    Some(Err(_)) => break,
+                }
+            }
+        }
+    }
+}
+
+async fn embedded_worker_protocol_ws_session(
+    source: crate::observation::EmbeddedRuntimeObservationSource,
     mut socket: WebSocket,
 ) {
-    let mut upstream = match RuntimeObservationClient::connect(&source).await {
+    let mut upstream = match RuntimeObservationClient::connect(&RuntimeObservationSource::Embedded(
+        source.clone(),
+    ))
+    .await
+    {
         Ok(client) => client,
         Err(error) => {
             let event = protocol_error_event(error.message());
@@ -3438,7 +3562,7 @@ async fn worker_protocol_ws_session(
             inbound = socket.next() => {
                 match inbound {
                     Some(Ok(WsMessage::Text(text))) => match serde_json::from_str::<protocol::Method>(&text) {
-                        Ok(method) => match runtime.send_protocol_method(&runtime_id, &worker_id, method) {
+                        Ok(method) => match source.runtime.send_protocol_method(&source.worker_ref, method) {
                             Ok(events) => {
                                 for event in events {
                                     if !send_protocol_event(&mut socket, &event).await {
@@ -3447,7 +3571,7 @@ async fn worker_protocol_ws_session(
                                 }
                             }
                             Err(error) => {
-                                let event = protocol_error_event(error.message());
+                                let event = protocol_error_event(error.to_string());
                                 if !send_protocol_event(&mut socket, &event).await {
                                     return;
                                 }
@@ -3492,7 +3616,6 @@ async fn worker_protocol_ws_session(
         }
     }
 }
-
 async fn send_protocol_event(socket: &mut WebSocket, event: &protocol::Event) -> bool {
     match serde_json::to_string(event) {
         Ok(text) => socket.send(WsMessage::Text(text.into())).await.is_ok(),
@@ -5349,7 +5472,7 @@ mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
-    use futures::StreamExt;
+    use futures::{SinkExt, StreamExt};
     use serde_json::{Value, json};
     use std::{fs, sync::Arc};
     use tokio_tungstenite::connect_async;
@@ -7786,6 +7909,22 @@ mod tests {
         assert!(matches!(
             next_client_frame(&mut stream).await,
             protocol::Event::Snapshot { .. }
+        ));
+
+        stream
+            .send(Message::Text(
+                serde_json::to_string(&protocol::Method::ListCompletions {
+                    kind: protocol::CompletionKind::File,
+                    prefix: String::new(),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_client_frame(&mut stream).await,
+            protocol::Event::Completions { .. }
         ));
 
         runtime

@@ -135,3 +135,34 @@ Verification:
 - `git diff --check`
 
 ---
+
+<!-- event: implementation_report author: assistant at: 2026-07-21T11:42:36Z -->
+
+## Implementation report
+
+Bug fix after manual TUI send failure:
+
+Observed symptom:
+- TUI send over Backend protocol reported a `does not support Worker protocol command transport` style error.
+
+Root cause:
+- `/events/ws` had been removed and `/protocol/ws` unified, but workspace-server still handled inbound client `protocol::Method` by calling `RuntimeRegistry::send_protocol_method(...)`.
+- For remote runtime-backed workers, Backend must be only a protocol WS proxy. Calling the registry default method hits the unsupported path instead of tunneling the frame to the runtime's `/protocol/ws`.
+
+Fix:
+- Workspace-server now branches by observation/protocol source:
+  - `RemoteWs`: proxy raw WebSocket frames bidirectionally between client `/api/.../protocol/ws` and runtime `/v1/.../protocol/ws`. Backend does not deserialize or interpret method frames in this path.
+  - `Embedded`: use in-process runtime adapter for method dispatch while streaming embedded observation events.
+- Added/updated test so sending `Method::ListCompletions` through the workspace-server protocol proxy returns `Event::Completions` from the runtime, proving method frames reach the runtime instead of the Backend unsupported fallback.
+
+Verification:
+- `nix develop -c cargo fmt -- --check`
+- `nix develop -c cargo check -p yoi-workspace-server -p client -p worker-runtime`
+- `nix develop -c cargo test -p yoi-workspace-server proxies_worker_protocol_ws_as_raw_events --lib`
+- `nix develop -c cargo test -p client backend_runtime --lib`
+- `nix develop -c cargo test -p worker-runtime --features ws-server --lib protocol_ws`
+- `nix develop -c cargo test -p yoi-workspace-server protocol_ws --lib`
+- `deno test --allow-read web/workspace/src/lib/workspace/console/worker-console.ui.test.ts`
+- `git diff --check`
+
+---
