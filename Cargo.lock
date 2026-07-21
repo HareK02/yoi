@@ -5850,6 +5850,7 @@ dependencies = [
  "chrono",
  "futures",
  "manifest",
+ "memory",
  "project-record",
  "protocol",
  "reqwest",

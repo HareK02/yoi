@@ -4971,7 +4971,11 @@ fn prepare_worker_common_with_context(
         let layout = memory::WorkspaceLayout::resolve(mem, &local.root);
         scope_config.deny.extend(memory::deny_write_rules(&layout));
     }
-    let scope = Scope::from_config(&scope_config).map_err(WorkerError::Scope)?;
+    let scope = if scope_config.allow.is_empty() && filesystem_authority.as_local().is_none() {
+        Scope::empty()
+    } else {
+        Scope::from_config(&scope_config).map_err(WorkerError::Scope)?
+    };
     prepare_worker_common_from_scope(
         manifest,
         loader,

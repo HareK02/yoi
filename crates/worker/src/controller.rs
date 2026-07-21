@@ -726,34 +726,46 @@ where
     }
 
     {
+        let workspace_client = worker.workspace_client().clone();
         let worker = worker.engine_mut();
 
-        // Memory tools require both explicit feature exposure and memory storage
-        // configuration. This keeps resident-memory config separate from the
-        // model-visible Memory* tool surface.
+        // Memory tools require explicit feature exposure. Storage access may be
+        // provided by local filesystem authority or the path-free Workspace HTTP API.
         if feature_config.memory.enabled {
-            let mem = memory_config.as_ref().ok_or_else(|| {
-                std::io::Error::new(
+            if let Some(workspace_root) = local_workspace_root.as_ref() {
+                let mem = memory_config.as_ref().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "[feature.memory].enabled = true requires a [memory] configuration section",
+                    )
+                })?;
+                let layout = memory::WorkspaceLayout::resolve(mem, workspace_root);
+                let query_cfg = memory::tool::QueryConfig::from(mem);
+                worker.register_tool(memory::tool::read_tool_with_usage(
+                    layout.clone(),
+                    session_id_for_usage,
+                ));
+                worker.register_tool(memory::tool::write_tool(layout.clone()));
+                worker.register_tool(memory::tool::edit_tool(layout.clone()));
+                worker.register_tool(memory::tool::delete_tool(layout.clone()));
+                worker.register_tool(memory::tool::memory_query_tool(layout, query_cfg));
+            } else if let WorkspaceClient::Http {
+                workspace_id,
+                base_url,
+            } = workspace_client
+            {
+                for definition in crate::feature::builtin::memory::workspace_http_memory_tools(
+                    workspace_id,
+                    base_url,
+                ) {
+                    worker.register_tool(definition);
+                }
+            } else {
+                return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "[feature.memory].enabled = true requires a [memory] configuration section",
-                )
-            })?;
-            let workspace_root = local_workspace_root.as_ref().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "memory tools require local Worker filesystem authority",
-                )
-            })?;
-            let layout = memory::WorkspaceLayout::resolve(mem, workspace_root);
-            let query_cfg = memory::tool::QueryConfig::from(mem);
-            worker.register_tool(memory::tool::read_tool_with_usage(
-                layout.clone(),
-                session_id_for_usage,
-            ));
-            worker.register_tool(memory::tool::write_tool(layout.clone()));
-            worker.register_tool(memory::tool::edit_tool(layout.clone()));
-            worker.register_tool(memory::tool::delete_tool(layout.clone()));
-            worker.register_tool(memory::tool::memory_query_tool(layout, query_cfg));
+                    "memory tools require Workspace HTTP API or local Worker filesystem authority",
+                ));
+            }
         }
 
         // Worker-orchestration tools (SpawnWorker + the four comm tools) share

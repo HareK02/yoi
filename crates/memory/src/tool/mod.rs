@@ -28,7 +28,9 @@ pub use write::write_tool;
 
 /// Kinds the memory tools accept as input. `Workflow` is intentionally
 /// excluded — workflows are sub-Engine context, not agent-editable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum MemoryToolKind {
     Summary,

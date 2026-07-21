@@ -169,6 +169,13 @@ pub enum ScopeError {
 }
 
 impl Scope {
+    pub fn empty() -> Self {
+        Self {
+            allow: Vec::new(),
+            deny: Vec::new(),
+        }
+    }
+
     /// Build a [`Scope`] from a declarative [`ScopeConfig`].
     ///
     /// Every `target` in `config` must already be absolute — per-layer

@@ -273,6 +273,20 @@ pub fn resolve_runtime_profile_manifest_from_manifest(
     Ok((manifest, PromptLoader::builtins_only()))
 }
 
+pub fn resolve_runtime_profile_manifest_from_manifest_without_filesystem(
+    mut manifest: WorkerManifest,
+    workspace_root: &Path,
+    worker_name: &str,
+) -> Result<(WorkerManifest, PromptLoader), String> {
+    if manifest.worker.name.is_empty() {
+        manifest.worker.name = worker_name.to_string();
+    }
+    manifest.scope = ScopeConfig::default();
+    manifest.delegation_scope = ScopeConfig::default();
+    apply_plugin_resolution_plan(&mut manifest, workspace_root);
+    Ok((manifest, PromptLoader::builtins_only()))
+}
+
 fn load_single_manifest(
     path: &Path,
     explicit_worker_name: Option<&str>,

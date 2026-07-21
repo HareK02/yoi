@@ -1449,64 +1449,51 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
 
     fn create_working_directory(
         &self,
-        request: WorkingDirectoryRequest,
+        _request: WorkingDirectoryRequest,
     ) -> RuntimeWorkingDirectoryResult {
-        match self.runtime.create_working_directory(request) {
-            Ok(working_directory) => RuntimeWorkingDirectoryResult {
-                state: WorkerOperationState::Accepted,
-                working_directory: Some(working_directory),
-                diagnostics: Vec::new(),
-            },
-            Err(err) => RuntimeWorkingDirectoryResult {
-                state: WorkerOperationState::Rejected,
-                working_directory: None,
-                diagnostics: vec![embedded_runtime_diagnostic(&err)],
-            },
+        RuntimeWorkingDirectoryResult {
+            state: WorkerOperationState::Rejected,
+            working_directory: None,
+            diagnostics: vec![embedded_workdir_unsupported_diagnostic()],
         }
     }
 
     fn list_working_directories(&self) -> RuntimeList<WorkingDirectoryStatus> {
-        match self.runtime.list_working_directories() {
-            Ok(items) => RuntimeList::new(items, Vec::new()),
-            Err(err) => RuntimeList::new(Vec::new(), vec![embedded_runtime_diagnostic(&err)]),
-        }
+        RuntimeList::new(Vec::new(), Vec::new())
     }
 
-    fn working_directory(&self, working_directory_id: &str) -> RuntimeWorkingDirectoryResult {
-        match self.runtime.working_directory(working_directory_id) {
-            Ok(working_directory) => RuntimeWorkingDirectoryResult {
-                state: WorkerOperationState::Accepted,
-                working_directory: Some(working_directory),
-                diagnostics: Vec::new(),
-            },
-            Err(err) => RuntimeWorkingDirectoryResult {
-                state: WorkerOperationState::Rejected,
-                working_directory: None,
-                diagnostics: vec![embedded_runtime_diagnostic(&err)],
-            },
+    fn working_directory(&self, _working_directory_id: &str) -> RuntimeWorkingDirectoryResult {
+        RuntimeWorkingDirectoryResult {
+            state: WorkerOperationState::Rejected,
+            working_directory: None,
+            diagnostics: vec![embedded_workdir_unsupported_diagnostic()],
         }
     }
 
     fn cleanup_working_directory(
         &self,
-        working_directory_id: &str,
+        _working_directory_id: &str,
     ) -> RuntimeWorkingDirectoryResult {
-        match self.runtime.cleanup_working_directory(working_directory_id) {
-            Ok(working_directory) => RuntimeWorkingDirectoryResult {
-                state: WorkerOperationState::Accepted,
-                working_directory: Some(working_directory),
-                diagnostics: Vec::new(),
-            },
-            Err(err) => RuntimeWorkingDirectoryResult {
-                state: WorkerOperationState::Rejected,
-                working_directory: None,
-                diagnostics: vec![embedded_runtime_diagnostic(&err)],
-            },
+        RuntimeWorkingDirectoryResult {
+            state: WorkerOperationState::Rejected,
+            working_directory: None,
+            diagnostics: vec![embedded_workdir_unsupported_diagnostic()],
         }
     }
 
     fn spawn_worker(&self, request: WorkerSpawnRequest) -> WorkerSpawnResult {
         let mut diagnostics = Vec::new();
+        if request.resolved_working_directory_request.is_some()
+            || request.resolved_working_directory.is_some()
+        {
+            diagnostics.push(embedded_workdir_unsupported_diagnostic());
+            return WorkerSpawnResult {
+                state: WorkerOperationState::Rejected,
+                worker: None,
+                acceptance_evidence: Vec::new(),
+                diagnostics,
+            };
+        }
         if matches!(
             request.acceptance,
             WorkerSpawnAcceptanceRequirement::SocketReady
@@ -2647,12 +2634,15 @@ fn embedded_spawn_execution_failure_diagnostic(
         worker_runtime::execution::WorkerExecutionOutcome::Unsupported => "unsupported",
         worker_runtime::execution::WorkerExecutionOutcome::Errored => "errored",
     };
+    let detail = result
+        .message
+        .as_deref()
+        .map(|message| format!(": {message}"))
+        .unwrap_or_default();
     Some(diagnostic(
         format!("embedded_worker_execution_spawn_{status}"),
         severity,
-        format!(
-            "Embedded Worker execution spawn was {status} during setup; check runtime configuration"
-        ),
+        format!("Embedded Worker execution spawn was {status} during setup{detail}"),
     ))
 }
 
@@ -3004,6 +2994,14 @@ fn remote_lifecycle_rejected(
         event_id: None,
         diagnostics: vec![diagnostic],
     }
+}
+
+fn embedded_workdir_unsupported_diagnostic() -> RuntimeDiagnostic {
+    diagnostic(
+        "embedded_worker_workdir_unsupported",
+        DiagnosticSeverity::Error,
+        "Embedded Runtime is no-workdir only; choose a non-embedded Runtime for workspace-file Workers".to_string(),
+    )
 }
 
 fn embedded_runtime_diagnostic(error: &EmbeddedRuntimeError) -> RuntimeDiagnostic {

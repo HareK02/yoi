@@ -361,6 +361,7 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
     ) -> Result<WorkerHandle, String> {
         let worker_name = Self::runtime_worker_name(&request);
         let profile = self.runtime_profile(&request);
+        let has_local_filesystem = request.working_directory.is_some();
         let worker_root = request
             .working_directory
             .as_ref()
@@ -385,17 +386,24 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         let archive = self
             .resolve_profile_source_archive(&request.request.profile_source)
             .await?;
-        let (mut manifest, loader) = {
+        let (manifest, loader) = {
             let manifest = archive
                 .resolve_profile(selector, &worker_root, &worker_name)
                 .map_err(|err| format!("failed to resolve profile source archive: {err}"))?;
-            worker::entrypoint::resolve_runtime_profile_manifest_from_manifest(
-                manifest,
-                &worker_root,
-                &worker_name,
-            )?
+            if has_local_filesystem {
+                worker::entrypoint::resolve_runtime_profile_manifest_from_manifest(
+                    manifest,
+                    &worker_root,
+                    &worker_name,
+                )?
+            } else {
+                worker::entrypoint::resolve_runtime_profile_manifest_from_manifest_without_filesystem(
+                    manifest,
+                    &worker_root,
+                    &worker_name,
+                )?
+            }
         };
-        manifest.worker.name = worker_name;
 
         let store_dir = self.store_dir()?;
         let session_store = FsStore::new(&store_dir).map_err(|err| {

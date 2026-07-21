@@ -6,6 +6,7 @@
 //! Worker is responsible for denying it at the Scope level when memory is enabled.
 
 pub mod audit;
+pub mod backend;
 pub mod consolidate;
 pub mod error;
 pub mod extract;

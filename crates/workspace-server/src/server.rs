@@ -12,6 +12,9 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::{SecondsFormat, Utc};
 use futures::StreamExt;
+use memory::backend::{
+    MemoryBackendHttpResponse, MemoryBackendOperation, execute_memory_backend_operation,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ticket::{
@@ -21,7 +24,6 @@ use ticket::{
 use tokio::net::TcpListener;
 use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
-use worker_runtime::working_directory::LocalGitWorktreeMaterializer;
 
 use crate::companion::{
     CompanionCancelRequest, CompanionConsole, CompanionMessageRequest, CompanionMessageResponse,
@@ -193,10 +195,7 @@ impl WorkspaceApi {
             crate::Error::Store(format!(
                 "failed to initialize embedded Worker backend: {err}"
             ))
-        })?
-        .with_working_directory_materializer(LocalGitWorktreeMaterializer::new(
-            config.embedded_runtime_store_root.clone(),
-        ));
+        })?;
         Self::new_with_execution_backend_and_broker(
             config,
             store,
@@ -329,6 +328,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/tickets/backend",
             post(scoped_ticket_backend_operation),
+        )
+        .route(
+            "/api/w/{workspace_id}/memory/backend",
+            post(scoped_memory_backend_operation),
         )
         .route("/api/tickets/{id}", get(get_ticket))
         .route("/api/w/{workspace_id}/skills", get(scoped_list_skills))
@@ -1275,6 +1278,23 @@ async fn scoped_ticket_backend_operation(
     Ok(Json(response))
 }
 
+async fn scoped_memory_backend_operation(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Json(operation): Json<MemoryBackendOperation>,
+) -> ApiResult<Json<MemoryBackendHttpResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let memory_config = manifest::MemoryConfig::default();
+    let layout = memory::WorkspaceLayout::resolve(&memory_config, &api.config.workspace_root);
+    let response = match execute_memory_backend_operation(&layout, operation) {
+        Ok(result) => MemoryBackendHttpResponse::Ok { result },
+        Err(error) => MemoryBackendHttpResponse::Error {
+            message: sanitize_backend_error(&error.to_string()),
+        },
+    };
+    Ok(Json(response))
+}
+
 async fn scoped_list_skills(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
@@ -1501,10 +1521,21 @@ async fn scoped_list_working_directories(
 async fn scoped_create_working_directory(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
-    Json(request): Json<BrowserWorkingDirectoryCreateRequest>,
+    Json(_request): Json<BrowserWorkingDirectoryCreateRequest>,
 ) -> ApiResult<Json<BrowserWorkingDirectoryDetailResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    create_working_directory_for_runtime(api, request)
+    Err(ApiError::with_diagnostics(
+        Error::RuntimeOperationFailed {
+            runtime_id: "workspace-backend".to_string(),
+            code: "backend_workdir_create_unsupported".to_string(),
+            message: "Working directory creation must be scoped to a concrete Runtime".to_string(),
+        },
+        vec![RuntimeDiagnostic {
+            code: "backend_workdir_create_unsupported".to_string(),
+            severity: DiagnosticSeverity::Error,
+            message: "Use runtime-scoped Worker creation or a runtime-scoped working-directory API; the backend does not own workdir lifecycle.".to_string(),
+        }],
+    ))
 }
 
 async fn scoped_working_directory_detail(
@@ -3128,6 +3159,27 @@ struct RuntimeConfigBundleAvailabilityQuery {
     digest: String,
 }
 
+fn reject_workdir_for_embedded_runtime(
+    runtime_id: &str,
+    has_workdir: bool,
+) -> std::result::Result<(), ApiError> {
+    if runtime_id != EMBEDDED_WORKER_RUNTIME_ID || !has_workdir {
+        return Ok(());
+    }
+    Err(ApiError::with_diagnostics(
+        Error::RuntimeOperationFailed {
+            runtime_id: runtime_id.to_string(),
+            code: "embedded_worker_workdir_unsupported".to_string(),
+            message: "The embedded Runtime does not accept working directories".to_string(),
+        },
+        vec![RuntimeDiagnostic {
+            code: "embedded_worker_workdir_unsupported".to_string(),
+            severity: DiagnosticSeverity::Error,
+            message: "Choose a non-embedded Runtime for workspace-file Workers; embedded Workers are no-workdir Workspace-API workers.".to_string(),
+        }],
+    ))
+}
+
 fn reject_no_workdir_for_non_embedded_runtime(
     runtime_id: &str,
 ) -> std::result::Result<(), ApiError> {
@@ -3155,6 +3207,10 @@ async fn create_runtime_worker(
     AxumPath(runtime_id): AxumPath<String>,
     Json(mut request): Json<WorkerSpawnRequest>,
 ) -> ApiResult<Json<WorkerSpawnResult>> {
+    reject_workdir_for_embedded_runtime(
+        &runtime_id,
+        request.working_directory_request.is_some() || request.resolved_working_directory.is_some(),
+    )?;
     if request.working_directory_request.is_none() && request.resolved_working_directory.is_none() {
         reject_no_workdir_for_non_embedded_runtime(&runtime_id)?;
     }
@@ -6031,89 +6087,6 @@ mod tests {
             .unwrap();
     }
 
-    fn create_observed_workdir(api: &WorkspaceApi) -> String {
-        let Json(response) = create_working_directory_for_runtime(
-            api.clone(),
-            BrowserWorkingDirectoryCreateRequest {
-                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
-                repository_id: TEST_REPOSITORY_ID.to_string(),
-                selector: Some("HEAD".to_string()),
-            },
-        )
-        .unwrap_or_else(|err| panic!("create observed workdir: {}", err.error));
-        response.item.working_directory_id
-    }
-
-    #[tokio::test]
-    async fn observed_workdir_reports_verified_cleanliness_for_cleanup() {
-        let workspace = tempfile::tempdir().unwrap();
-        init_clean_git_workspace(workspace.path());
-        let api = test_api(workspace.path()).await;
-        let workdir_id = create_observed_workdir(&api);
-        sync_runtime_workdir_observations(&api, EMBEDDED_WORKER_RUNTIME_ID)
-            .unwrap_or_else(|err| panic!("sync runtime workdir observations: {}", err.error));
-
-        let stored = api
-            .store
-            .get_workdir_registry(&api.config.workspace_id, workdir_id.as_str())
-            .unwrap()
-            .expect("workdir registry row");
-        assert_eq!(stored.materialization_status, "present");
-        assert_eq!(stored.cleanliness, "clean");
-
-        let plan = build_runtime_cleanup_plan(&api, EMBEDDED_WORKER_RUNTIME_ID)
-            .unwrap_or_else(|err| panic!("cleanup plan: {}", err.error));
-        let candidate = plan
-            .workdirs
-            .iter()
-            .find(|candidate| candidate.workdir_id == workdir_id)
-            .expect("cleanup candidate");
-        assert_eq!(candidate.cleanliness, CleanupWorkdirCleanliness::Clean);
-        assert_eq!(candidate.action, CleanupTargetKind::WorkdirCleanCleanup);
-        assert!(candidate.reason.contains("clean"));
-
-        let target_id = candidate.target_id.clone();
-        let request = ExecuteRuntimeCleanupRequest {
-            expected_plan_revision: plan.revision,
-            expected_plan_digest: plan.digest,
-            worker_target_ids: Vec::new(),
-            workdir_target_ids: vec![target_id],
-            confirm_dirty_discard_target_ids: Vec::new(),
-        };
-        let response = execute_runtime_cleanup(&api, EMBEDDED_WORKER_RUNTIME_ID, request)
-            .unwrap_or_else(|err| panic!("cleanup execution: {}", err.error));
-        assert_eq!(
-            response.results[0].action,
-            CleanupTargetKind::WorkdirCleanCleanup
-        );
-        assert_eq!(response.results[0].status, "deleted");
-    }
-
-    #[tokio::test]
-    async fn stale_clean_registry_row_is_downgraded_by_real_observation_before_cleanup() {
-        let workspace = tempfile::tempdir().unwrap();
-        init_clean_git_workspace(workspace.path());
-        let api = test_api(workspace.path()).await;
-        let workdir_id = create_observed_workdir(&api);
-        let mut stale_clean = api
-            .store
-            .get_workdir_registry(&api.config.workspace_id, workdir_id.as_str())
-            .unwrap()
-            .expect("workdir registry row");
-        stale_clean.cleanliness = "clean".to_string();
-        api.store.upsert_workdir_registry(&stale_clean).unwrap();
-
-        let plan = build_runtime_cleanup_plan(&api, EMBEDDED_WORKER_RUNTIME_ID)
-            .unwrap_or_else(|err| panic!("cleanup plan: {}", err.error));
-        let candidate = plan
-            .workdirs
-            .iter()
-            .find(|candidate| candidate.workdir_id == workdir_id)
-            .expect("cleanup candidate");
-        assert_eq!(candidate.cleanliness, CleanupWorkdirCleanliness::Clean);
-        assert_eq!(candidate.action, CleanupTargetKind::WorkdirCleanCleanup);
-    }
-
     #[tokio::test]
     async fn synthetic_verified_clean_workdir_can_still_use_clean_cleanup_path() {
         let workspace = tempfile::tempdir().unwrap();
@@ -6478,71 +6451,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_working_directory_create_list_detail_and_cleanup_are_path_safe() {
+    async fn browser_working_directory_create_is_rejected_as_backend_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let app = test_app(dir.path()).await;
         let workspace_path = format!("/api/w/{TEST_WORKSPACE_ID}/working-directories");
 
-        let created = post_json(
-            app.clone(),
-            &workspace_path,
-            serde_json::json!({
-                "repository_id": TEST_REPOSITORY_ID,
-                "selector": "HEAD",
-            }),
-        )
-        .await;
-        let working_directory_id = created["item"]["working_directory_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert_eq!(created["item"]["repository_id"], TEST_REPOSITORY_ID);
-        assert_eq!(created["item"]["requested_selector"], "HEAD");
-        assert_eq!(created["item"]["status"], "active");
-        let projected = serde_json::to_string(&created).unwrap();
-        assert!(!projected.contains(dir.path().to_string_lossy().as_ref()));
-
-        let list = get_json(app.clone(), &workspace_path).await;
-        assert_eq!(list["items"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            list["items"][0]["working_directory_id"],
-            working_directory_id
-        );
-
-        let detail_path = format!("{workspace_path}/{working_directory_id}");
-        let detail = get_json(app.clone(), &detail_path).await;
-        assert_eq!(detail["item"]["working_directory_id"], working_directory_id);
-
-        let cleanup_plan_path = format!(
-            "/api/w/{TEST_WORKSPACE_ID}/runtimes/{EMBEDDED_WORKER_RUNTIME_ID}/cleanup-plan"
-        );
-        let plan = get_json(app.clone(), &cleanup_plan_path).await;
-        let target_id = plan["workdirs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|candidate| candidate["workdir_id"] == working_directory_id)
-            .and_then(|candidate| candidate["target_id"].as_str())
-            .unwrap()
-            .to_string();
-        let removed = request_json(
+        let response = request_json(
             app,
             "POST",
-            &format!(
-                "/api/w/{TEST_WORKSPACE_ID}/runtimes/{EMBEDDED_WORKER_RUNTIME_ID}/cleanup-executions"
-            ),
+            &workspace_path,
             Some(serde_json::json!({
-                "expected_plan_revision": plan["revision"],
-                "expected_plan_digest": plan["digest"],
-                "worker_target_ids": [],
-                "workdir_target_ids": [target_id],
-                "confirm_dirty_discard_target_ids": [target_id]
+                "repository_id": TEST_REPOSITORY_ID,
+                "selector": "HEAD",
             })),
-            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
         )
         .await;
-        assert_eq!(removed["results"][0]["status"], "deleted");
+        assert!(
+            response["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "backend_workdir_create_unsupported"),
+            "expected backend lifecycle diagnostic, got {response}"
+        );
+        let projected = serde_json::to_string(&response).unwrap();
+        assert!(!projected.contains(dir.path().to_string_lossy().as_ref()));
     }
 
     #[tokio::test]
@@ -6550,24 +6485,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_clean_git_workspace(dir.path());
         let app = test_app(dir.path()).await;
-        let working_directories_path = format!("/api/w/{TEST_WORKSPACE_ID}/working-directories");
-        let created = post_json(
-            app.clone(),
-            &working_directories_path,
-            serde_json::json!({
-                "repository_id": TEST_REPOSITORY_ID,
-                "selector": "HEAD",
-            }),
-        )
-        .await;
-        let working_directory_id = created["item"]["working_directory_id"].as_str().unwrap();
+        let working_directory_id = "test-workdir";
 
         let response = request_json(
             app,
             "POST",
             &format!("/api/w/{TEST_WORKSPACE_ID}/workers"),
             Some(serde_json::json!({
-                "runtime_id": EMBEDDED_WORKER_RUNTIME_ID,
+                "runtime_id": "remote-runtime",
                 "display_name": "Coding Worker",
                 "profile": "builtin:coder",
                 "initial_text": "",
@@ -6987,7 +6912,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_worker_spawn_accepts_safe_repository_selector() {
+    async fn runtime_worker_spawn_rejects_embedded_workdir_request() {
         let dir = tempfile::tempdir().unwrap();
         let app = test_app(dir.path()).await;
         let response = request_json(
@@ -7009,9 +6934,17 @@ mod tests {
                     "selector": "HEAD"
                 }
             })),
-            StatusCode::OK,
+            StatusCode::BAD_REQUEST,
         )
         .await;
+        assert!(
+            response["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "embedded_worker_workdir_unsupported"),
+            "expected embedded workdir diagnostic, got {response}"
+        );
         let projected = serde_json::to_string(&response).unwrap();
         assert!(!projected.contains(dir.path().to_string_lossy().as_ref()));
     }
