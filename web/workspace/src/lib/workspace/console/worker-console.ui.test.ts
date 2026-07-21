@@ -65,17 +65,17 @@ Deno.test("Worker Console uses protocol observation events without transcript fe
   );
 
   assert(
-    consolePage.includes("seenObservationEventIds") &&
-      consolePage.includes(
-        "rememberObservationEvent(frame.envelope.event_id)",
-      ) &&
+    consolePage.includes("connectProtocolTransport") &&
+      consolePage.includes("handleIncomingProtocolEvent") &&
+      consolePage.includes("/protocol/ws") &&
+      !consolePage.includes("seenObservationEventIds") &&
       consolePage.includes("createConsoleProjector") &&
       consolePage.includes("consoleProjector.append(eventBatch)") &&
       consolePage.includes("{#each lines as item (item.id)}") &&
       !consolePage.includes("projectConsole(observedEvents.map") &&
       !consolePage.includes("/transcript") &&
       !consolePage.includes("WorkerTranscriptProjection"),
-    "Console should render protocol observation replay/live events directly and dedupe repeated frames by event id",
+    "Console should render raw protocol replay/live events directly from the unified protocol WS",
   );
 });
 
@@ -285,8 +285,11 @@ Deno.test("Worker Console page is routed by runtime_id and worker_id through bac
   );
   assert(
     !consolePage.includes("/transcript") &&
-      consolePage.includes("/events/ws") && consolePage.includes("/input"),
-    "Console should use protocol observation WS and input APIs without a transcript API",
+      consolePage.includes("/protocol/ws") &&
+      !consolePage.includes("/events" + "/ws") &&
+      !consolePage.includes("/input") &&
+      !consolePage.includes("/completions"),
+    "Console should use only the protocol WS for observation and operations",
   );
   assert(
     !consolePage.includes("/api/companion"),

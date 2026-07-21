@@ -245,22 +245,6 @@ export type WorkerInputResult = {
   diagnostics: Diagnostic[];
 };
 
-export type ClientWorkerEventWsEnvelope = {
-  event_id: string;
-  runtime_id: string;
-  worker_id: string;
-  payload: PodProtocolEvent;
-};
-
-export type ClientWorkerEventWsDiagnostic = {
-  code: string;
-  message: string;
-};
-
-export type ClientWorkerEventWsFrame =
-  | { kind: "event"; envelope: ClientWorkerEventWsEnvelope }
-  | { kind: "diagnostic"; diagnostic: ClientWorkerEventWsDiagnostic };
-
 export type ListResponse<T> = {
   workspace_id: string;
   limit: number;

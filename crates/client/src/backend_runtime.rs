@@ -1,16 +1,11 @@
-use std::collections::VecDeque;
-use std::fmt;
-use std::time::Duration;
-
 use futures::{SinkExt, StreamExt};
 use protocol::{ErrorCode, Event, Method};
 use serde::Deserialize;
+use std::collections::VecDeque;
+use std::fmt;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
-
-const RECONNECT_DELAY: Duration = Duration::from_millis(500);
-const MAX_RECONNECT_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendRuntimeTarget {
@@ -163,8 +158,7 @@ pub struct BackendRuntimeClient {
     command_tx: mpsc::UnboundedSender<Method>,
     events: mpsc::UnboundedReceiver<Event>,
     diagnostics: VecDeque<Event>,
-    _observation_task: tokio::task::JoinHandle<()>,
-    _command_task: tokio::task::JoinHandle<()>,
+    _protocol_task: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Debug)]
@@ -262,16 +256,10 @@ impl BackendRuntimeClient {
         let (event_tx, rx) = mpsc::unbounded_channel();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
 
-        let observation_target = target.clone();
-        let observation_tx = event_tx.clone();
-        let observation_task = tokio::spawn(async move {
-            observe_worker_events(observation_target, observation_tx).await;
-        });
-
-        let command_target = target.clone();
-        let command_event_tx = event_tx.clone();
-        let command_task = tokio::spawn(async move {
-            run_worker_protocol_commands(command_target, command_rx, command_event_tx).await;
+        let protocol_target = target.clone();
+        let protocol_event_tx = event_tx.clone();
+        let protocol_task = tokio::spawn(async move {
+            run_worker_protocol_transport(protocol_target, command_rx, protocol_event_tx).await;
         });
 
         Ok(Self {
@@ -279,8 +267,7 @@ impl BackendRuntimeClient {
             command_tx,
             events: rx,
             diagnostics: VecDeque::new(),
-            _observation_task: observation_task,
-            _command_task: command_task,
+            _protocol_task: protocol_task,
         })
     }
 
@@ -311,12 +298,11 @@ impl BackendRuntimeClient {
 
 impl Drop for BackendRuntimeClient {
     fn drop(&mut self) {
-        self._observation_task.abort();
-        self._command_task.abort();
+        self._protocol_task.abort();
     }
 }
 
-async fn run_worker_protocol_commands(
+async fn run_worker_protocol_transport(
     target: BackendRuntimeTarget,
     mut commands: mpsc::UnboundedReceiver<Method>,
     tx: mpsc::UnboundedSender<Event>,
@@ -402,81 +388,6 @@ async fn run_worker_protocol_commands(
     }
 }
 
-async fn observe_worker_events(target: BackendRuntimeTarget, tx: mpsc::UnboundedSender<Event>) {
-    let mut attempts = 0_usize;
-
-    loop {
-        let url = observation_ws_url(&target);
-        match connect_async(&url).await {
-            Ok((mut ws, _)) => {
-                attempts = 0;
-                while let Some(frame) = ws.next().await {
-                    match frame {
-                        Ok(TungsteniteMessage::Text(text)) => {
-                            match serde_json::from_str::<ClientWorkerEventWsFrame>(&text) {
-                                Ok(ClientWorkerEventWsFrame::Event { envelope }) => {
-                                    if envelope.runtime_id != target.runtime_id
-                                        || envelope.worker_id != target.worker_id
-                                    {
-                                        let _ = tx.send(diagnostic_event(format!(
-                                            "Backend observation frame target mismatch: got {}:{}, expected {}",
-                                            envelope.runtime_id,
-                                            envelope.worker_id,
-                                            target.display_label()
-                                        )));
-                                        continue;
-                                    }
-                                    let _ = tx.send(envelope.payload);
-                                }
-                                Ok(ClientWorkerEventWsFrame::Diagnostic { diagnostic }) => {
-                                    let message = format!(
-                                        "Backend observation diagnostic [{}]: {}",
-                                        diagnostic.code, diagnostic.message
-                                    );
-                                    let _ = tx.send(diagnostic_event(message));
-                                }
-                                Err(error) => {
-                                    let _ = tx.send(diagnostic_event(format!(
-                                        "Backend observation frame was not valid JSON: {error}"
-                                    )));
-                                }
-                            }
-                        }
-                        Ok(TungsteniteMessage::Close(_)) => break,
-                        Ok(TungsteniteMessage::Ping(_))
-                        | Ok(TungsteniteMessage::Pong(_))
-                        | Ok(TungsteniteMessage::Binary(_))
-                        | Ok(TungsteniteMessage::Frame(_)) => {}
-                        Err(error) => {
-                            let _ = tx.send(diagnostic_event(format!(
-                                "Backend observation WebSocket error for {}: {error}",
-                                target.display_label()
-                            )));
-                            break;
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                let _ = tx.send(diagnostic_event(format!(
-                    "Backend observation WebSocket connect failed for {}: {error}",
-                    target.display_label()
-                )));
-            }
-        }
-
-        attempts += 1;
-        if attempts > MAX_RECONNECT_ATTEMPTS {
-            let _ = tx.send(diagnostic_event(format!(
-                "Backend observation stream for {} stopped after {MAX_RECONNECT_ATTEMPTS} reconnect attempts",
-                target.display_label()
-            )));
-            break;
-        }
-        tokio::time::sleep(RECONNECT_DELAY).await;
-    }
-}
-
 fn diagnostic_event(message: impl Into<String>) -> Event {
     Event::Error {
         code: ErrorCode::Internal,
@@ -552,15 +463,6 @@ fn backend_runtime_workers_path(workspace_id: Option<&str>, runtime_id: &str) ->
     }
 }
 
-fn observation_ws_url(target: &BackendRuntimeTarget) -> String {
-    let path = format!(
-        "/api/runtimes/{}/workers/{}/events/ws",
-        path_segment_encode(&target.runtime_id),
-        path_segment_encode(&target.worker_id)
-    );
-    join_base_and_path(&http_base_to_ws(&target.base_url), &path)
-}
-
 fn protocol_ws_url(target: &BackendRuntimeTarget) -> String {
     let path = format!(
         "/api/runtimes/{}/workers/{}/protocol/ws",
@@ -611,42 +513,14 @@ pub struct BackendDiagnostic {
     pub message: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum ClientWorkerEventWsFrame {
-    Event {
-        envelope: ClientWorkerEventWsEnvelope,
-    },
-    Diagnostic {
-        diagnostic: ClientWorkerEventWsDiagnostic,
-    },
-}
-
-#[derive(Debug, Deserialize)]
-struct ClientWorkerEventWsEnvelope {
-    runtime_id: String,
-    worker_id: String,
-    payload: Event,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClientWorkerEventWsDiagnostic {
-    code: String,
-    message: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn command_and_observation_urls_use_backend_protocol_paths() {
+    fn protocol_url_uses_backend_runtime_worker_identity() {
         let target =
             BackendRuntimeTarget::new("http://127.0.0.1:8787/", "runtime/one", "worker one");
-        assert_eq!(
-            observation_ws_url(&target),
-            "ws://127.0.0.1:8787/api/runtimes/runtime%2Fone/workers/worker%20one/events/ws"
-        );
         assert_eq!(
             protocol_ws_url(&target),
             "ws://127.0.0.1:8787/api/runtimes/runtime%2Fone/workers/worker%20one/protocol/ws"

@@ -24,7 +24,6 @@
     import type { Event as ProtocolEvent, Method as ProtocolMethod, RewindTarget, Segment } from "$lib/generated/protocol";
     import { workspaceApiPath } from "$lib/workspace/api/http";
     import type {
-        ClientWorkerEventWsFrame,
         Diagnostic,
         Worker,
         PodProtocolEvent,
@@ -98,13 +97,10 @@
     let rewindHeadEntries = $state(0);
     let controlNotice = $state<string | null>(null);
     let composerNotice = $state<string | null>(null);
-    let streamState = $state<"connecting" | "open" | "closed" | "error">(
+    let protocolState = $state<"connecting" | "open" | "closed" | "error">(
         "connecting",
     );
-    let commandState = $state<"connecting" | "open" | "closed" | "error">(
-        "connecting",
-    );
-    let commandSocket: WebSocket | null = null;
+    let protocolSocket: WebSocket | null = null;
     let pendingCompletionRequest: {
         resolve: (entries: ComposerCompletionEntry[]) => void;
         reject: (error: Error) => void;
@@ -129,8 +125,8 @@
     let consoleProjection = $state.raw<ConsoleProjection>(
         consoleProjector.snapshot(),
     );
-    let seenObservationEventIds = new Set<string>();
     let pendingObservationEvents: ConsoleEventInput[] = [];
+    let protocolEventSequence = 0;
     let pendingObservedStates: Array<string | null> = [];
     let pendingStreamDiagnostics: Diagnostic[] = [];
     let observationFlushHandle: number | null = null;
@@ -208,7 +204,6 @@
         consoleProjection = consoleProjector.reset();
         eventObservedAtById.clear();
         advanceEventObservedAtVersion();
-        seenObservationEventIds = new Set();
     }
 
     function cancelObservationFlush() {
@@ -253,23 +248,27 @@
         }
     }
 
-    function queueObservationEvent(
-        frame: ClientWorkerEventWsFrame & { kind: "event" },
-    ) {
-        if (!rememberObservationEvent(frame.envelope.event_id)) {
+    function handleIncomingProtocolEvent(payload: ProtocolEvent) {
+        handleProtocolCommandEvent(payload);
+        if (payload.event === "completions" || payload.event === "error") {
+            if (payload.event === "error") {
+                queueObservationDiagnostic({
+                    code: payload.data.code,
+                    severity: "error",
+                    message: payload.data.message,
+                });
+            }
             return;
         }
+
+        const eventId = `protocol-${++protocolEventSequence}`;
         const observedAtMs = Date.now();
-        eventObservedAtById.set(frame.envelope.event_id, observedAtMs);
-        const payload = frame.envelope.payload;
+        eventObservedAtById.set(eventId, observedAtMs);
         pendingObservationEvents.push({
-            eventId: frame.envelope.event_id,
+            eventId,
             event: payload,
             observedAtMs,
         });
-        if (payload.event === "rewind_targets") {
-            handleProtocolCommandEvent(payload as ProtocolEvent);
-        }
         pendingObservedStates.push(workerStateFromProtocolEvent(payload));
         scheduleObservationFlush();
     }
@@ -277,14 +276,6 @@
     function queueObservationDiagnostic(diagnostic: Diagnostic) {
         pendingStreamDiagnostics.push(diagnostic);
         scheduleObservationFlush();
-    }
-
-    function rememberObservationEvent(eventId: string): boolean {
-        if (seenObservationEventIds.has(eventId)) {
-            return false;
-        }
-        seenObservationEventIds.add(eventId);
-        return true;
     }
 
     async function applyComposerCompletion(event: KeyboardEvent) {
@@ -502,89 +493,16 @@
         }
     }
 
-    function connectObservation(
+    function connectProtocolTransport(
         targetWorker: Worker | null,
         token: number,
         target: ConsoleTarget,
     ) {
         if (!targetWorker) {
-            streamState = "closed";
+            protocolState = "closed";
             return;
         }
-        streamState = "connecting";
-        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const wsPath = workerApiPath(
-            `/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(
-                target.workerId,
-            )}/events/ws`,
-        );
-        const ws = new WebSocket(
-            `${protocol}//${window.location.host}${wsPath}`,
-        );
-
-        ws.onopen = () => {
-            if (token === reloadToken) {
-                streamState = "open";
-            }
-        };
-        ws.onmessage = (message) => {
-            if (token !== reloadToken) {
-                return;
-            }
-            try {
-                const frame = JSON.parse(
-                    String(message.data),
-                ) as ClientWorkerEventWsFrame;
-                if (frame.kind === "event") {
-                    queueObservationEvent(frame);
-                } else {
-                    queueObservationDiagnostic({
-                        code: frame.diagnostic.code,
-                        severity: "warning",
-                        message: frame.diagnostic.message,
-                    });
-                }
-            } catch (error) {
-                queueObservationDiagnostic({
-                    code: "worker_observation_frame_invalid",
-                    severity: "warning",
-                    message:
-                        error instanceof Error ? error.message : String(error),
-                });
-            }
-        };
-        ws.onerror = () => {
-            if (token === reloadToken) {
-                streamState = "error";
-                streamDiagnostics = [
-                    ...streamDiagnostics,
-                    {
-                        code: "worker_observation_ws_error",
-                        severity: "error",
-                        message: "Worker observation WebSocket failed.",
-                    },
-                ];
-            }
-        };
-        ws.onclose = () => {
-            if (token === reloadToken && streamState !== "error") {
-                streamState = "closed";
-            }
-        };
-
-        return () => ws.close();
-    }
-
-    function connectProtocolCommands(
-        targetWorker: Worker | null,
-        token: number,
-        target: ConsoleTarget,
-    ) {
-        if (!targetWorker) {
-            commandState = "closed";
-            return;
-        }
-        commandState = "connecting";
+        protocolState = "connecting";
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
         const wsPath = workerApiPath(
             `/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(
@@ -594,11 +512,11 @@
         const ws = new WebSocket(
             `${protocol}//${window.location.host}${wsPath}`,
         );
-        commandSocket = ws;
+        protocolSocket = ws;
 
         ws.onopen = () => {
             if (token === reloadToken) {
-                commandState = "open";
+                protocolState = "open";
             }
         };
         ws.onmessage = (message) => {
@@ -606,14 +524,14 @@
                 return;
             }
             try {
-                handleProtocolCommandEvent(
+                handleIncomingProtocolEvent(
                     JSON.parse(String(message.data)) as ProtocolEvent,
                 );
             } catch (error) {
                 streamDiagnostics = [
                     ...streamDiagnostics,
                     {
-                        code: "worker_protocol_command_frame_invalid",
+                        code: "worker_protocol_frame_invalid",
                         severity: "warning",
                         message:
                             error instanceof Error ? error.message : String(error),
@@ -623,42 +541,42 @@
         };
         ws.onerror = () => {
             if (token === reloadToken) {
-                commandState = "error";
+                protocolState = "error";
                 streamDiagnostics = [
                     ...streamDiagnostics,
                     {
-                        code: "worker_protocol_command_ws_error",
+                        code: "worker_protocol_ws_error",
                         severity: "error",
-                        message: "Worker protocol command WebSocket failed.",
+                        message: "Worker protocol WebSocket failed.",
                     },
                 ];
             }
         };
         ws.onclose = () => {
-            if (commandSocket === ws) {
-                commandSocket = null;
+            if (protocolSocket === ws) {
+                protocolSocket = null;
             }
-            if (token === reloadToken && commandState !== "error") {
-                commandState = "closed";
+            if (token === reloadToken && protocolState !== "error") {
+                protocolState = "closed";
             }
             rejectPendingCompletion(
-                new Error("Worker protocol command WebSocket closed."),
+                new Error("Worker protocol WebSocket closed."),
             );
         };
 
         return () => {
-            if (commandSocket === ws) {
-                commandSocket = null;
+            if (protocolSocket === ws) {
+                protocolSocket = null;
             }
             ws.close();
         };
     }
 
     function sendProtocolMethod(method: ProtocolMethod) {
-        if (!commandSocket || commandSocket.readyState !== WebSocket.OPEN) {
-            throw new Error("Worker protocol command WebSocket is not open.");
+        if (!protocolSocket || protocolSocket.readyState !== WebSocket.OPEN) {
+            throw new Error("Worker protocol WebSocket is not open.");
         }
-        commandSocket.send(JSON.stringify(method));
+        protocolSocket.send(JSON.stringify(method));
     }
 
     function handleProtocolCommandEvent(event: ProtocolEvent) {
@@ -1162,8 +1080,7 @@
         void loadConsoleData(target);
     });
 
-    $effect(() => connectObservation(worker, reloadToken, consoleTarget));
-    $effect(() => connectProtocolCommands(worker, reloadToken, consoleTarget));
+    $effect(() => connectProtocolTransport(worker, reloadToken, consoleTarget));
 </script>
 
 <svelte:head>
@@ -1182,14 +1099,14 @@
         <div class="console-header-actions">
             <div
                 class="console-status-pill"
-                class:warn={streamState !== "open"}
+                class:warn={protocolState !== "open"}
             >
-                {workerState} · stream {streamState} · command {commandState}
+                {workerState} · protocol {protocolState}
             </div>
             <button
                 type="button"
                 class="secondary-button"
-                disabled={commandState !== "open"}
+                disabled={protocolState !== "open"}
                 onclick={() => sendControl({ method: "cancel" }, "Cancel")}
             >
                 Cancel
@@ -1197,7 +1114,7 @@
             <button
                 type="button"
                 class="secondary-button"
-                disabled={commandState !== "open"}
+                disabled={protocolState !== "open"}
                 onclick={() => sendControl({ method: "pause" }, "Pause")}
             >
                 Pause
@@ -1205,7 +1122,7 @@
             <button
                 type="button"
                 class="secondary-button"
-                disabled={commandState !== "open"}
+                disabled={protocolState !== "open"}
                 onclick={() => sendControl({ method: "resume" }, "Resume")}
             >
                 Resume
@@ -1213,7 +1130,7 @@
             <button
                 type="button"
                 class="secondary-button"
-                disabled={commandState !== "open"}
+                disabled={protocolState !== "open"}
                 onclick={() => sendControl({ method: "compact" }, "Compact")}
             >
                 Compact
@@ -1221,7 +1138,7 @@
             <button
                 type="button"
                 class="secondary-button"
-                disabled={commandState !== "open"}
+                disabled={protocolState !== "open"}
                 onclick={requestRewindTargets}
             >
                 Rewind
@@ -1249,7 +1166,7 @@
                     <button
                         type="button"
                         class="secondary-button"
-                        disabled={commandState !== "open" || !target.eligible}
+                        disabled={protocolState !== "open" || !target.eligible}
                         title={target.disabled_reason ?? target.warning ?? undefined}
                         onclick={() => rewindTo(target)}
                     >
@@ -1377,7 +1294,7 @@
             {#if diagnostics.length > 0}
                 <details
                     class="metadata-details"
-                    open={streamState === "error"}
+                    open={protocolState === "error"}
                 >
                     <summary>Diagnostics ({diagnostics.length})</summary>
                     <ul>

@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Error as TungsteniteError, Message as TungsteniteMessage};
-use worker_runtime::http_server::{RuntimeWorkerEventWsEnvelope, RuntimeWorkerEventWsFrame};
 
 /// Backend-private source for a runtime worker observation stream.
 #[derive(Clone, PartialEq, Eq)]
@@ -104,42 +103,12 @@ pub struct RuntimeObservationUpstreamEvent {
     pub payload: protocol::Event,
 }
 
-/// Backend-local frame exposed to browser/future-TUI clients.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ClientWorkerEventWsFrame {
-    Event {
-        envelope: ClientWorkerEventWsEnvelope,
-    },
-    Diagnostic {
-        diagnostic: ClientWorkerEventWsDiagnostic,
-    },
-}
-
-/// Backend-owned event envelope. It intentionally omits Runtime endpoints,
-/// credentials, sockets and session paths.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ClientWorkerEventWsEnvelope {
-    pub event_id: String,
-    pub runtime_id: String,
-    pub worker_id: String,
-    pub payload: protocol::Event,
-}
-
-/// Client-facing typed observation diagnostic.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClientWorkerEventWsDiagnostic {
-    pub code: String,
-    pub message: String,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ObservationProxyError {
     RuntimeUnavailable(String),
     WorkerNotFound(String),
     UpstreamDisconnect(String),
     MalformedFrame(String),
-    ObservationOnly,
 }
 
 impl ObservationProxyError {
@@ -149,7 +118,6 @@ impl ObservationProxyError {
             ObservationProxyError::WorkerNotFound(_) => "backend.worker_not_found",
             ObservationProxyError::UpstreamDisconnect(_) => "backend.upstream_disconnect",
             ObservationProxyError::MalformedFrame(_) => "backend.malformed_frame",
-            ObservationProxyError::ObservationOnly => "backend.observation_only",
         }
     }
 
@@ -159,24 +127,6 @@ impl ObservationProxyError {
             | ObservationProxyError::WorkerNotFound(message)
             | ObservationProxyError::UpstreamDisconnect(message)
             | ObservationProxyError::MalformedFrame(message) => message,
-            ObservationProxyError::ObservationOnly => {
-                "backend worker event WebSocket is observation-only"
-            }
-        }
-    }
-}
-
-impl ClientWorkerEventWsFrame {
-    pub fn event(envelope: ClientWorkerEventWsEnvelope) -> Self {
-        Self::Event { envelope }
-    }
-
-    pub fn diagnostic(error: ObservationProxyError) -> Self {
-        Self::Diagnostic {
-            diagnostic: ClientWorkerEventWsDiagnostic {
-                code: error.code().to_string(),
-                message: error.message().to_string(),
-            },
         }
     }
 }
@@ -238,15 +188,6 @@ impl BackendObservationProxy {
                 ))
             })
     }
-
-    pub fn map_event(&self, event: RuntimeObservationUpstreamEvent) -> ClientWorkerEventWsEnvelope {
-        ClientWorkerEventWsEnvelope {
-            event_id: event.runtime_event_id,
-            runtime_id: event.runtime_id,
-            worker_id: event.worker_id,
-            payload: event.payload,
-        }
-    }
 }
 
 fn map_runtime_connect_error(error: TungsteniteError) -> ObservationProxyError {
@@ -262,24 +203,6 @@ fn map_runtime_connect_error(error: TungsteniteError) -> ObservationProxyError {
         )),
         error => ObservationProxyError::RuntimeUnavailable(format!(
             "failed to connect runtime WebSocket: {error}"
-        )),
-    }
-}
-
-fn map_runtime_diagnostic(code: String, message: String) -> ObservationProxyError {
-    match code.as_str() {
-        "runtime.worker_not_found" => ObservationProxyError::WorkerNotFound(message),
-        "runtime.cursor_malformed"
-        | "runtime.cursor_unknown_or_expired"
-        | "runtime.cursor_expired" => ObservationProxyError::RuntimeUnavailable(message),
-        "runtime.unavailable" => ObservationProxyError::RuntimeUnavailable(message),
-        "runtime.upstream_closed" | "runtime.websocket_error" => {
-            ObservationProxyError::UpstreamDisconnect(message)
-        }
-        "runtime.serialize_failed" => ObservationProxyError::MalformedFrame(message),
-        "runtime.observation_only" => ObservationProxyError::ObservationOnly,
-        _ => ObservationProxyError::RuntimeUnavailable(format!(
-            "runtime diagnostic {code}: {message}"
         )),
     }
 }
@@ -361,32 +284,17 @@ impl RuntimeWsObservationClient {
                     ));
                 }
             };
-            let frame: RuntimeWorkerEventWsFrame =
-                serde_json::from_str(&text).map_err(|error| {
-                    ObservationProxyError::MalformedFrame(format!(
-                        "failed to decode runtime observation frame: {error}"
-                    ))
-                })?;
-            match frame {
-                RuntimeWorkerEventWsFrame::Event { envelope } => {
-                    return Ok(self.map_envelope(envelope));
-                }
-                RuntimeWorkerEventWsFrame::Diagnostic { diagnostic } => {
-                    return Err(map_runtime_diagnostic(diagnostic.code, diagnostic.message));
-                }
-            }
-        }
-    }
-
-    fn map_envelope(
-        &self,
-        envelope: RuntimeWorkerEventWsEnvelope,
-    ) -> RuntimeObservationUpstreamEvent {
-        RuntimeObservationUpstreamEvent {
-            runtime_id: self.runtime_id.clone(),
-            worker_id: self.worker_id.clone(),
-            runtime_event_id: envelope.event_id,
-            payload: envelope.payload,
+            let payload: protocol::Event = serde_json::from_str(&text).map_err(|error| {
+                ObservationProxyError::MalformedFrame(format!(
+                    "failed to decode runtime protocol event frame: {error}"
+                ))
+            })?;
+            return Ok(RuntimeObservationUpstreamEvent {
+                runtime_id: self.runtime_id.clone(),
+                worker_id: self.worker_id.clone(),
+                runtime_event_id: "protocol".to_string(),
+                payload,
+            });
         }
     }
 }
@@ -548,7 +456,8 @@ mod tests {
         RuntimeObservationSourceConfig {
             runtime_id: "remote-runtime".to_string(),
             worker_id: "worker-1".to_string(),
-            endpoint: "wss://remote.example.invalid/private/workers/worker-1/events/ws".to_string(),
+            endpoint: "wss://remote.example.invalid/private/workers/worker-1/protocol/ws"
+                .to_string(),
             bearer_token: Some("top-secret-bearer-token".to_string()),
         }
     }
@@ -563,7 +472,7 @@ mod tests {
         assert!(debug.contains("<redacted>"));
         for forbidden in [
             "remote.example.invalid",
-            "/private/workers/worker-1/events/ws",
+            "/private/workers/worker-1/protocol/ws",
             "top-secret-bearer-token",
         ] {
             assert!(
@@ -582,7 +491,7 @@ mod tests {
         assert!(debug.contains("source_count"));
         for forbidden in [
             "remote.example.invalid",
-            "/private/workers/worker-1/events/ws",
+            "/private/workers/worker-1/protocol/ws",
             "top-secret-bearer-token",
         ] {
             assert!(

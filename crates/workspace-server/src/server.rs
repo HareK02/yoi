@@ -41,8 +41,8 @@ use crate::hosts::{
 };
 use crate::identity::WorkspaceIdentity;
 use crate::observation::{
-    BackendObservationProxy, ClientWorkerEventWsFrame, ObservationProxyError,
-    RuntimeObservationClient, RuntimeObservationSourceConfig,
+    BackendObservationProxy, ObservationProxyError, RuntimeObservationClient,
+    RuntimeObservationSourceConfig,
 };
 use crate::profile_settings::{
     CreateWorkspaceProfileSourceRequest, DeleteWorkspaceProfileSourceRequest,
@@ -546,14 +546,6 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/cancel",
             post(scoped_cancel_runtime_worker),
-        )
-        .route(
-            "/api/runtimes/{runtime_id}/workers/{worker_id}/events/ws",
-            get(worker_observation_ws),
-        )
-        .route(
-            "/api/w/{workspace_id}/runtimes/{runtime_id}/workers/{worker_id}/events/ws",
-            get(scoped_worker_observation_ws),
         )
         .route(
             "/api/runtimes/{runtime_id}/workers/{worker_id}/protocol/ws",
@@ -2452,19 +2444,6 @@ async fn scoped_cancel_runtime_worker(
     .await
 }
 
-async fn scoped_worker_observation_ws(
-    ws: WebSocketUpgrade,
-    State(api): State<WorkspaceApi>,
-    AxumPath(path): AxumPath<ScopedRuntimeWorkerPath>,
-) -> Response {
-    if let Err(err) = validate_workspace_scope(&api, &path.workspace_id) {
-        return err.into_response();
-    }
-    worker_observation_ws(State(api), AxumPath((path.runtime_id, path.worker_id)), ws)
-        .await
-        .into_response()
-}
-
 async fn scoped_worker_protocol_ws(
     ws: WebSocketUpgrade,
     State(api): State<WorkspaceApi>,
@@ -3414,57 +3393,101 @@ async fn worker_protocol_ws(
     AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    match api.runtime.worker(&runtime_id, &worker_id) {
-        Ok(_) => ws.on_upgrade(move |socket| {
-            worker_protocol_ws_session(api.runtime, runtime_id, worker_id, socket)
-        }),
-        Err(error) => ApiError::from(error.into_error()).into_response(),
-    }
+    let source = match api.observation_proxy.source(&runtime_id, &worker_id) {
+        Ok(source) => source,
+        Err(ObservationProxyError::WorkerNotFound(_)) => {
+            match api.runtime.observation_source(&runtime_id, &worker_id) {
+                Ok(source) => source,
+                Err(error) => return ApiError::from(error.into_error()).into_response(),
+            }
+        }
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": error.code(),
+                    "message": error.message(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    ws.on_upgrade(move |socket| {
+        worker_protocol_ws_session(api.runtime, source, runtime_id, worker_id, socket)
+    })
 }
 
 async fn worker_protocol_ws_session(
     runtime: Arc<RuntimeRegistry>,
+    source: crate::observation::RuntimeObservationSource,
     runtime_id: String,
     worker_id: String,
     mut socket: WebSocket,
 ) {
-    while let Some(frame) = socket.next().await {
-        match frame {
-            Ok(WsMessage::Text(text)) => match serde_json::from_str::<protocol::Method>(&text) {
-                Ok(method) => match runtime.send_protocol_method(&runtime_id, &worker_id, method) {
-                    Ok(events) => {
-                        for event in events {
+    let mut upstream = match RuntimeObservationClient::connect(&source).await {
+        Ok(client) => client,
+        Err(error) => {
+            let event = protocol_error_event(error.message());
+            let _ = send_protocol_event(&mut socket, &event).await;
+            return;
+        }
+    };
+
+    loop {
+        tokio::select! {
+            inbound = socket.next() => {
+                match inbound {
+                    Some(Ok(WsMessage::Text(text))) => match serde_json::from_str::<protocol::Method>(&text) {
+                        Ok(method) => match runtime.send_protocol_method(&runtime_id, &worker_id, method) {
+                            Ok(events) => {
+                                for event in events {
+                                    if !send_protocol_event(&mut socket, &event).await {
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let event = protocol_error_event(error.message());
+                                if !send_protocol_event(&mut socket, &event).await {
+                                    return;
+                                }
+                            }
+                        },
+                        Err(error) => {
+                            let event =
+                                protocol_error_event(format!("malformed protocol method frame: {error}"));
                             if !send_protocol_event(&mut socket, &event).await {
                                 return;
                             }
                         }
-                    }
-                    Err(error) => {
-                        let event = protocol_error_event(error.message());
-                        if !send_protocol_event(&mut socket, &event).await {
+                    },
+                    Some(Ok(WsMessage::Close(_))) | None => return,
+                    Some(Ok(WsMessage::Ping(payload))) => {
+                        if socket.send(WsMessage::Pong(payload)).await.is_err() {
                             return;
                         }
                     }
-                },
-                Err(error) => {
-                    let event =
-                        protocol_error_event(format!("malformed protocol method frame: {error}"));
-                    if !send_protocol_event(&mut socket, &event).await {
+                    Some(Ok(WsMessage::Pong(_))) | Some(Ok(WsMessage::Binary(_))) => {}
+                    Some(Err(error)) => {
+                        let event = protocol_error_event(format!("protocol WebSocket error: {error}"));
+                        let _ = send_protocol_event(&mut socket, &event).await;
                         return;
                     }
                 }
-            },
-            Ok(WsMessage::Close(_)) => return,
-            Ok(WsMessage::Ping(payload)) => {
-                if socket.send(WsMessage::Pong(payload)).await.is_err() {
-                    return;
-                }
             }
-            Ok(WsMessage::Pong(_)) | Ok(WsMessage::Binary(_)) => {}
-            Err(error) => {
-                let event = protocol_error_event(format!("protocol WebSocket error: {error}"));
-                let _ = send_protocol_event(&mut socket, &event).await;
-                return;
+            upstream_event = upstream.next_event() => {
+                match upstream_event {
+                    Ok(event) => {
+                        if !send_protocol_event(&mut socket, &event.payload).await {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let event = protocol_error_event(error.message());
+                        let _ = send_protocol_event(&mut socket, &event).await;
+                        return;
+                    }
+                }
             }
         }
     }
@@ -3489,116 +3512,6 @@ fn protocol_error_event(message: impl Into<String>) -> protocol::Event {
     protocol::Event::Error {
         code: protocol::ErrorCode::Internal,
         message: message.into(),
-    }
-}
-
-async fn worker_observation_ws(
-    State(api): State<WorkspaceApi>,
-    AxumPath((runtime_id, worker_id)): AxumPath<(String, String)>,
-    ws: WebSocketUpgrade,
-) -> impl IntoResponse {
-    match api.observation_proxy.source(&runtime_id, &worker_id) {
-        Ok(source) => ws.on_upgrade(move |socket| {
-            worker_observation_ws_session(api.observation_proxy, source, socket)
-        }),
-        Err(ObservationProxyError::WorkerNotFound(_)) => {
-            match api.runtime.observation_source(&runtime_id, &worker_id) {
-                Ok(source) => ws.on_upgrade(move |socket| {
-                    worker_observation_ws_session(api.observation_proxy, source, socket)
-                }),
-                Err(error) => ApiError::from(error.into_error()).into_response(),
-            }
-        }
-        Err(error) => {
-            let status = StatusCode::BAD_REQUEST;
-            (
-                status,
-                Json(serde_json::json!({
-                    "error": error.code(),
-                    "message": error.message(),
-                })),
-            )
-                .into_response()
-        }
-    }
-}
-
-async fn worker_observation_ws_session(
-    proxy: BackendObservationProxy,
-    source: crate::observation::RuntimeObservationSource,
-    mut socket: WebSocket,
-) {
-    let mut upstream = match RuntimeObservationClient::connect(&source).await {
-        Ok(client) => client,
-        Err(error) => {
-            let _ = send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::diagnostic(error))
-                .await;
-            return;
-        }
-    };
-
-    loop {
-        tokio::select! {
-            inbound = socket.next() => {
-                match inbound {
-                    Some(Ok(WsMessage::Close(_))) | None => return,
-                    Some(Ok(WsMessage::Ping(payload))) => {
-                        if socket.send(WsMessage::Pong(payload)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Some(Ok(WsMessage::Pong(_))) => {}
-                    Some(Ok(_)) => {
-                        let _ = send_client_ws_frame(
-                            &mut socket,
-                            ClientWorkerEventWsFrame::diagnostic(ObservationProxyError::ObservationOnly),
-                        ).await;
-                        return;
-                    }
-                    Some(Err(error)) => {
-                        let _ = send_client_ws_frame(
-                            &mut socket,
-                            ClientWorkerEventWsFrame::diagnostic(
-                                ObservationProxyError::MalformedFrame(format!(
-                                    "client WebSocket receive error: {error}"
-                                )),
-                            ),
-                        ).await;
-                        return;
-                    }
-                }
-            }
-            upstream_event = upstream.next_event() => {
-                match upstream_event {
-                    Ok(event) => {
-                        let envelope = proxy.map_event(event);
-                        if !send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::event(envelope)).await {
-                            return;
-                        }
-                    },
-                    Err(error) => {
-                        let _ = send_client_ws_frame(&mut socket, ClientWorkerEventWsFrame::diagnostic(error)).await;
-                        return;
-                    }
-                }
-            }
-        }
-    }
-}
-
-async fn send_client_ws_frame(socket: &mut WebSocket, frame: ClientWorkerEventWsFrame) -> bool {
-    match serde_json::to_string(&frame) {
-        Ok(text) => socket.send(WsMessage::Text(text.into())).await.is_ok(),
-        Err(error) => {
-            let fallback =
-                ClientWorkerEventWsFrame::diagnostic(ObservationProxyError::MalformedFrame(
-                    format!("failed to serialize backend observation frame: {error}"),
-                ));
-            let Ok(text) = serde_json::to_string(&fallback) else {
-                return false;
-            };
-            socket.send(WsMessage::Text(text.into())).await.is_ok()
-        }
     }
 }
 
@@ -5436,7 +5349,7 @@ mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
-    use futures::{SinkExt, StreamExt};
+    use futures::StreamExt;
     use serde_json::{Value, json};
     use std::{fs, sync::Arc};
     use tokio_tungstenite::connect_async;
@@ -5449,7 +5362,6 @@ mod tests {
         TicketWorkerRole, WorkerInputKind, WorkerOperationState, WorkerSpawnAcceptanceRequirement,
         WorkerSpawnIntent,
     };
-    use crate::observation::ClientWorkerEventWsDiagnostic;
     use crate::store::SqliteWorkspaceStore;
 
     const TEST_WORKSPACE_ID: &str = "0192f0e8-4d84-7d6e-a000-000000000001";
@@ -7861,53 +7773,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxies_worker_observation_ws_with_backend_cursors_and_diagnostics() {
-        let (runtime, worker_ref) = runtime_with_worker();
-        let runtime_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let runtime_addr = runtime_listener.local_addr().unwrap();
-        tokio::spawn({
-            let runtime = runtime.clone();
-            async move {
-                worker_runtime::http_server::serve_runtime_http(runtime, runtime_listener, None)
-                    .await
-                    .unwrap()
-            }
-        });
-
-        let dir = tempfile::tempdir().unwrap();
-        let store = SqliteWorkspaceStore::in_memory().unwrap();
-        let mut config = test_server_config(dir.path());
-        config
-            .runtime_event_sources
-            .push(RuntimeObservationSourceConfig {
-                runtime_id: "runtime-a".into(),
-                worker_id: "worker-a".into(),
-                endpoint: format!(
-                    "ws://{runtime_addr}/v1/workers/{}/events/ws",
-                    worker_ref.worker_id
-                ),
-                bearer_token: None,
-            });
-        let api = WorkspaceApi::new_with_execution_backend(
-            config,
-            Arc::new(store),
-            Arc::new(DeterministicExecutionBackend::default()),
-        )
-        .await
-        .unwrap();
-        let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let app_addr = app_listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(app_listener, build_router(api)).await.unwrap() });
-
-        let url = format!("ws://{app_addr}/api/runtimes/runtime-a/workers/worker-a/events/ws");
-        let (mut stream, _) = connect_async(&url).await.unwrap();
-        let snapshot = next_client_frame(&mut stream).await;
-        let ClientWorkerEventWsFrame::Event { envelope: snapshot } = snapshot else {
-            panic!("expected snapshot event");
+    async fn proxies_worker_protocol_ws_as_raw_events() {
+        let (runtime, worker_ref, endpoint) = spawn_runtime_worker().await;
+        let source = RuntimeObservationSourceConfig {
+            runtime_id: "runtime-a".into(),
+            worker_id: "worker-a".into(),
+            endpoint,
+            bearer_token: None,
         };
-        assert_eq!(snapshot.runtime_id, "runtime-a");
-        assert_eq!(snapshot.worker_id, "worker-a");
-        assert!(matches!(snapshot.payload, protocol::Event::Snapshot { .. }));
+        let (url, _dir) = spawn_workspace_proxy(source).await;
+        let (mut stream, _) = connect_async(&url).await.unwrap();
+        assert!(matches!(
+            next_client_frame(&mut stream).await,
+            protocol::Event::Snapshot { .. }
+        ));
 
         runtime
             .observe_worker_event(
@@ -7917,59 +7796,16 @@ mod tests {
                 },
             )
             .unwrap();
-        let live = next_client_frame(&mut stream).await;
-        let ClientWorkerEventWsFrame::Event { envelope: live } = live else {
-            panic!("expected live event");
-        };
-        assert_eq!(live.runtime_id, "runtime-a");
-        assert_eq!(live.worker_id, "worker-a");
-        assert!(matches!(live.payload, protocol::Event::TextDelta { .. }));
-
-        let (mut fresh, _) = connect_async(&url).await.unwrap();
-        let fresh_snapshot = next_client_frame(&mut fresh).await;
         assert!(matches!(
-            fresh_snapshot,
-            ClientWorkerEventWsFrame::Event { envelope } if matches!(envelope.payload, protocol::Event::Snapshot { .. })
+            next_client_frame(&mut stream).await,
+            protocol::Event::TextDelta { .. }
         ));
-        runtime
-            .observe_worker_event(
-                &worker_ref,
-                protocol::Event::TextDone {
-                    text: "fresh".into(),
-                },
-            )
-            .unwrap();
-        let fresh_event = next_client_frame(&mut fresh).await;
-        assert!(matches!(
-            fresh_event,
-            ClientWorkerEventWsFrame::Event { envelope } if matches!(envelope.payload, protocol::Event::TextDone { .. })
-        ));
-
-        let (mut query_stream, _) = connect_async(format!("{url}?cursor=bad")).await.unwrap();
-        let query_snapshot = next_client_frame(&mut query_stream).await;
-        assert!(matches!(
-            query_snapshot,
-            ClientWorkerEventWsFrame::Event { envelope } if matches!(envelope.payload, protocol::Event::Snapshot { .. })
-        ));
-
-        stream.send(Message::Text("{}".into())).await.unwrap();
-        let mut saw_observation_only = false;
-        for _ in 0..3 {
-            if let ClientWorkerEventWsFrame::Diagnostic { diagnostic } =
-                next_client_frame(&mut stream).await
-            {
-                assert_eq!(diagnostic.code, "backend.observation_only");
-                saw_observation_only = true;
-                break;
-            }
-        }
-        assert!(saw_observation_only, "expected observation-only diagnostic");
     }
 
     #[tokio::test]
-    async fn proxy_maps_runtime_worker_not_found_http_404_to_typed_backend_diagnostic() {
+    async fn proxy_maps_runtime_worker_not_found_http_404_to_protocol_error_event() {
         let (_runtime, _worker_ref, endpoint) = spawn_runtime_worker().await;
-        let endpoint = endpoint.replace("/events/ws", "/missing-worker/events/ws");
+        let endpoint = endpoint.replace("/protocol/ws", "/missing-worker/protocol/ws");
         let source = RuntimeObservationSourceConfig {
             runtime_id: "runtime-a".into(),
             worker_id: "worker-a".into(),
@@ -7978,48 +7814,22 @@ mod tests {
         };
         let (url, _dir) = spawn_workspace_proxy(source).await;
         let (mut stream, _) = connect_async(&url).await.unwrap();
-        let diagnostic = next_client_diagnostic(&mut stream).await;
-        assert_eq!(diagnostic.code, "backend.worker_not_found");
-    }
-
-    #[tokio::test]
-    async fn proxy_reports_actual_upstream_disconnect_separately() {
-        let endpoint = spawn_closing_runtime_ws().await;
-        let source = RuntimeObservationSourceConfig {
-            runtime_id: "runtime-a".into(),
-            worker_id: "worker-a".into(),
-            endpoint,
-            bearer_token: None,
-        };
-        let (url, _dir) = spawn_workspace_proxy(source).await;
-        let (mut stream, _) = connect_async(&url).await.unwrap();
-        let diagnostic = next_client_diagnostic(&mut stream).await;
-        assert_eq!(diagnostic.code, "backend.upstream_disconnect");
+        assert!(matches!(
+            next_client_frame(&mut stream).await,
+            protocol::Event::Error { .. }
+        ));
     }
 
     async fn next_client_frame(
         stream: &mut tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
-    ) -> ClientWorkerEventWsFrame {
+    ) -> protocol::Event {
         let message = stream.next().await.unwrap().unwrap();
         let Message::Text(text) = message else {
             panic!("expected text frame");
         };
         serde_json::from_str(&text).unwrap()
-    }
-
-    async fn next_client_diagnostic(
-        stream: &mut tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        >,
-    ) -> ClientWorkerEventWsDiagnostic {
-        match next_client_frame(stream).await {
-            ClientWorkerEventWsFrame::Diagnostic { diagnostic } => diagnostic,
-            ClientWorkerEventWsFrame::Event { envelope } => {
-                panic!("expected diagnostic, got event: {envelope:?}")
-            }
-        }
     }
 
     async fn spawn_runtime_worker() -> (
@@ -8039,7 +7849,7 @@ mod tests {
             }
         });
         let endpoint = format!(
-            "ws://{runtime_addr}/v1/workers/{}/events/ws",
+            "ws://{runtime_addr}/v1/workers/{}/protocol/ws",
             worker_ref.worker_id
         );
         (runtime, worker_ref, endpoint)
@@ -8065,22 +7875,10 @@ mod tests {
         let app_addr = app_listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(app_listener, build_router(api)).await.unwrap() });
         (
-            format!("ws://{app_addr}/api/runtimes/{runtime_id}/workers/{worker_id}/events/ws"),
+            format!("ws://{app_addr}/api/runtimes/{runtime_id}/workers/{worker_id}/protocol/ws"),
             dir,
         )
     }
-
-    async fn spawn_closing_runtime_ws() -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let _ = websocket.close(None).await;
-        });
-        format!("ws://{addr}/events/ws")
-    }
-
     async fn get_json(app: Router, uri: &str) -> Value {
         let response = app
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())

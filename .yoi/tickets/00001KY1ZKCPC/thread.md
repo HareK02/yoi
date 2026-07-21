@@ -95,3 +95,43 @@ Frontend check note:
 - The Svelte page was updated against the generated protocol types in `web/workspace/src/lib/generated/protocol.ts`, but a frontend-native check still needs to be run in an environment with the frontend deps installed.
 
 ---
+
+<!-- event: implementation_report author: assistant at: 2026-07-21T11:29:08Z -->
+
+## Implementation report
+
+Follow-up implementation after design clarification:
+
+Changed the transport split so `/events/ws` no longer exists. `/protocol/ws` is now the single Worker protocol WebSocket for both directions:
+
+- client -> runtime/backend: raw `protocol::Method` JSON frames
+- runtime/backend -> client: raw `protocol::Event` JSON frames
+
+Runtime changes:
+- Removed `/v1/workers/{worker_id}/events/ws` route.
+- Removed runtime-specific event WS envelope/diagnostic frame types.
+- Extended `/v1/workers/{worker_id}/protocol/ws` to stream snapshot/backlog/live observation events as raw `protocol::Event` while also accepting method frames on the same socket.
+
+Workspace Backend changes:
+- Removed public `/api/.../events/ws` and `/api/w/.../events/ws` routes.
+- Removed Backend client event WS envelope types.
+- Workspace `/protocol/ws` now proxies/streams raw protocol events and forwards raw protocol methods on the same socket.
+- Runtime observation source endpoint generation now targets runtime `/protocol/ws` instead of `/events/ws`.
+
+Client/frontend changes:
+- TUI `BackendRuntimeClient` no longer opens a separate observation socket. It uses only `/protocol/ws` for send and receive.
+- Browser Console no longer opens both observation and command sockets. It uses one protocol socket for replay/live events, completions, rewind targets, and controls.
+- Removed old frontend `ClientWorkerEventWs*` types.
+- Updated frontend UI tests to assert protocol-only Console behavior and absence of operation HTTP paths.
+
+Verification:
+- `nix develop -c cargo fmt -- --check`
+- `nix develop -c cargo check -p worker-runtime -p yoi-workspace-server -p client -p tui`
+- `nix develop -c cargo test -p client backend_runtime --lib`
+- `nix develop -c cargo test -p worker-runtime --features ws-server --lib protocol_ws`
+- `nix develop -c cargo test -p yoi-workspace-server protocol_ws --lib`
+- `nix develop -c cargo test -p yoi-workspace-server proxy_maps_runtime_worker_not_found_http_404_to_protocol_error_event --lib`
+- `deno test --allow-read web/workspace/src/lib/workspace/console/worker-console.ui.test.ts` from `web/workspace`
+- `git diff --check`
+
+---

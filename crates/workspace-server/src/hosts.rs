@@ -2128,7 +2128,7 @@ impl RemoteWorkerRuntime {
         } else if let Some(rest) = base.strip_prefix("http://") {
             base = format!("ws://{rest}");
         }
-        format!("{base}/v1/workers/{worker_id}/events/ws")
+        format!("{base}/v1/workers/{worker_id}/protocol/ws")
     }
 
     fn get_json<T>(&self, path: &str) -> Result<T, RuntimeDiagnostic>
@@ -4285,7 +4285,7 @@ mod tests {
             panic!("remote runtime should expose a remote WS observation source");
         };
         assert!(observation.endpoint.starts_with("ws://127.0.0.1:"));
-        assert!(observation.endpoint.ends_with("/v1/workers/1/events/ws"));
+        assert!(observation.endpoint.ends_with("/v1/workers/1/protocol/ws"));
         assert_eq!(observation.bearer_token.as_deref(), Some(secret.as_str()));
 
         let workers = registry.list_workers(10);
