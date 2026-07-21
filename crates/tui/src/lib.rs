@@ -1,4 +1,5 @@
 mod app;
+mod backend_worker_picker;
 mod block;
 mod cache;
 mod command;
@@ -33,7 +34,7 @@ use crossterm::execute;
 use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
 use session_store::SegmentId;
 
-use client::{BackendRuntimeTarget, WorkerRuntimeCommand};
+use client::{BackendRuntimeListTarget, BackendRuntimeTarget, WorkerRuntimeCommand};
 
 #[derive(Debug, Clone)]
 pub struct LaunchOptions {
@@ -55,6 +56,9 @@ pub enum LaunchMode {
         worker_name: String,
         socket_override: Option<PathBuf>,
     },
+    /// `yoi workers` / `yoi --backend <url>`: list Backend-authoritative runtime workers,
+    /// then attach to the selected Worker through the Backend Runtime API.
+    BackendRuntimePicker { target: BackendRuntimeListTarget },
     /// `yoi --backend <url> --runtime-id <id> --worker-id <id>`: connect through the
     /// Workspace Backend Runtime API and observe the Backend-proxied event stream.
     BackendRuntime { target: BackendRuntimeTarget },
@@ -106,6 +110,7 @@ pub async fn launch(options: LaunchOptions) -> ExitCode {
             worker_name,
             socket_override,
         } => console::run_worker_name(worker_name, socket_override, runtime_command).await,
+        LaunchMode::BackendRuntimePicker { target } => backend_worker_picker::run(target).await,
         LaunchMode::BackendRuntime { target } => console::run_backend_runtime(target).await,
         LaunchMode::Resume { all } => {
             console::run_resume(runtime_command, workspace_root.clone(), all).await

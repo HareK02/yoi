@@ -23,6 +23,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = "0.9.34"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+toml = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

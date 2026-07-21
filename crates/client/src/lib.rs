@@ -14,7 +14,12 @@ pub mod spawn;
 pub mod ticket_role;
 mod worker_client;
 
-pub use backend_runtime::{BackendRuntimeClient, BackendRuntimeClientError, BackendRuntimeTarget};
+pub use backend_runtime::{
+    BackendRuntimeClient, BackendRuntimeClientError, BackendRuntimeListResponse,
+    BackendRuntimeListTarget, BackendRuntimeSummary, BackendRuntimeTarget,
+    BackendWorkerCapabilitySummary, BackendWorkerImplementationSummary, BackendWorkerSummary,
+    BackendWorkerWorkspaceSummary, BackendWorkingDirectorySummary, list_backend_workers,
+};
 pub use runtime_command::WorkerRuntimeCommand;
 
 pub use spawn::{

@@ -6,13 +6,16 @@ mod session_cli;
 mod ticket_cli;
 mod worker_cleanup_cli;
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use client::{BackendRuntimeTarget, WorkerRuntimeCommand};
+use client::{BackendRuntimeListTarget, BackendRuntimeTarget, WorkerRuntimeCommand};
 use memory_lint::{LintCliOptions, LintStatus};
+use serde::Deserialize;
 use session_store::SegmentId;
 use tui::{LaunchMode, LaunchOptions};
 
@@ -207,6 +210,7 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
     match args[0].as_str() {
         "--help" | "-h" => return Ok(Mode::Help),
         "resume" => return parse_resume_args(&args[1..]),
+        "workers" => return parse_workers_args(&args[1..]),
         "worker" => {
             if let Some(cli) = worker_cleanup_cli::parse_worker_management_args(&args[1..])
                 .map_err(|e| ParseError(e.to_string()))?
@@ -290,6 +294,7 @@ fn parse_console_options(args: &[String]) -> Result<Mode, ParseError> {
     let mut worker_name = None;
     let mut socket_override = None;
     let mut backend_url = None;
+    let mut workspace_id = None;
     let mut runtime_id = None;
     let mut worker_id = None;
     let mut profile = None;
@@ -333,6 +338,16 @@ fn parse_console_options(args: &[String]) -> Result<Mode, ParseError> {
                     return Err(ParseError("--workspace requires a value".to_string()));
                 }
                 workspace_root = PathBuf::from(value);
+                i += 2;
+            }
+            "--workspace-id" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError("--workspace-id requires a value".to_string()))?;
+                if value.starts_with('-') || value.is_empty() {
+                    return Err(ParseError("--workspace-id requires a value".to_string()));
+                }
+                workspace_id = Some(value.clone());
                 i += 2;
             }
             "--backend" => {
@@ -407,6 +422,14 @@ fn parse_console_options(args: &[String]) -> Result<Mode, ParseError> {
                 workspace_root = PathBuf::from(value);
                 i += 1;
             }
+            arg if arg.starts_with("--workspace-id=") => {
+                let value = arg.trim_start_matches("--workspace-id=");
+                if value.is_empty() {
+                    return Err(ParseError("--workspace-id requires a value".to_string()));
+                }
+                workspace_id = Some(value.to_string());
+                i += 1;
+            }
             arg if arg.starts_with("--backend=") => {
                 let value = arg.trim_start_matches("--backend=");
                 if value.is_empty() {
@@ -458,13 +481,13 @@ fn parse_console_options(args: &[String]) -> Result<Mode, ParseError> {
         }
     }
 
-    let backend_target_present =
-        backend_url.is_some() || runtime_id.is_some() || worker_id.is_some();
-    if backend_target_present
-        && (backend_url.is_none() || runtime_id.is_none() || worker_id.is_none())
-    {
+    let backend_target_present = backend_url.is_some()
+        || workspace_id.is_some()
+        || runtime_id.is_some()
+        || worker_id.is_some();
+    if backend_target_present && worker_id.is_some() && runtime_id.is_none() {
         return Err(ParseError(
-            "--backend, --runtime-id, and --worker-id are required together".to_string(),
+            "--worker-id requires --runtime-id for Backend Runtime API attach".to_string(),
         ));
     }
     if backend_target_present
@@ -493,13 +516,22 @@ fn parse_console_options(args: &[String]) -> Result<Mode, ParseError> {
     }
 
     if backend_target_present {
+        let workspace_id = match workspace_id {
+            Some(workspace_id) => Some(workspace_id),
+            None => resolve_workspace_id_from_root(&workspace_root)?,
+        };
+        let backend_url = resolve_backend_url(backend_url, workspace_id.as_deref())?;
+        if let (Some(runtime_id), Some(worker_id)) = (runtime_id.clone(), worker_id) {
+            return Ok(Mode::Tui {
+                mode: LaunchMode::BackendRuntime {
+                    target: BackendRuntimeTarget::new(backend_url, runtime_id, worker_id),
+                },
+                workspace_root,
+            });
+        }
         return Ok(Mode::Tui {
-            mode: LaunchMode::BackendRuntime {
-                target: BackendRuntimeTarget::new(
-                    backend_url.expect("checked by backend_target_present"),
-                    runtime_id.expect("checked by backend_target_present"),
-                    worker_id.expect("checked by backend_target_present"),
-                ),
+            mode: LaunchMode::BackendRuntimePicker {
+                target: BackendRuntimeListTarget::new(backend_url, workspace_id, runtime_id),
             },
             workspace_root,
         });
@@ -533,6 +565,125 @@ fn parse_console_options(args: &[String]) -> Result<Mode, ParseError> {
         mode: LaunchMode::Spawn {
             worker_name: None,
             profile: None,
+        },
+        workspace_root,
+    })
+}
+
+fn parse_workers_args(args: &[String]) -> Result<Mode, ParseError> {
+    let mut workspace_root = current_dir()?;
+    let mut workspace_id = None;
+    let mut backend_url = None;
+    let mut runtime_id = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "--help" | "-h" => {
+                return Err(ParseError(
+                    "usage: yoi workers [--workspace PATH] [--workspace-id ID] [--backend URL] [--runtime-id ID]".to_string(),
+                ));
+            }
+            "--workspace" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError("--workspace requires a value".to_string()))?;
+                if value.starts_with('-') || value.is_empty() {
+                    return Err(ParseError("--workspace requires a value".to_string()));
+                }
+                workspace_root = PathBuf::from(value);
+                i += 2;
+            }
+            "--workspace-id" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError("--workspace-id requires a value".to_string()))?;
+                if value.starts_with('-') || value.is_empty() {
+                    return Err(ParseError("--workspace-id requires a value".to_string()));
+                }
+                workspace_id = Some(value.clone());
+                i += 2;
+            }
+            "--backend" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError("--backend requires a URL".to_string()))?;
+                if value.starts_with('-') || value.is_empty() {
+                    return Err(ParseError("--backend requires a URL".to_string()));
+                }
+                backend_url = Some(value.clone());
+                i += 2;
+            }
+            "--runtime-id" | "--runtime" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError("--runtime-id requires a value".to_string()))?;
+                if value.starts_with('-') || value.is_empty() {
+                    return Err(ParseError("--runtime-id requires a value".to_string()));
+                }
+                runtime_id = Some(value.clone());
+                i += 2;
+            }
+            arg if arg.starts_with("--workspace=") => {
+                let value = arg.trim_start_matches("--workspace=");
+                if value.is_empty() {
+                    return Err(ParseError("--workspace requires a value".to_string()));
+                }
+                workspace_root = PathBuf::from(value);
+                i += 1;
+            }
+            arg if arg.starts_with("--workspace-id=") => {
+                let value = arg.trim_start_matches("--workspace-id=");
+                if value.is_empty() {
+                    return Err(ParseError("--workspace-id requires a value".to_string()));
+                }
+                workspace_id = Some(value.to_string());
+                i += 1;
+            }
+            arg if arg.starts_with("--backend=") => {
+                let value = arg.trim_start_matches("--backend=");
+                if value.is_empty() {
+                    return Err(ParseError("--backend requires a URL".to_string()));
+                }
+                backend_url = Some(value.to_string());
+                i += 1;
+            }
+            arg if arg.starts_with("--runtime-id=") => {
+                let value = arg.trim_start_matches("--runtime-id=");
+                if value.is_empty() {
+                    return Err(ParseError("--runtime-id requires a value".to_string()));
+                }
+                runtime_id = Some(value.to_string());
+                i += 1;
+            }
+            arg if arg.starts_with("--runtime=") => {
+                let value = arg.trim_start_matches("--runtime=");
+                if value.is_empty() {
+                    return Err(ParseError("--runtime-id requires a value".to_string()));
+                }
+                runtime_id = Some(value.to_string());
+                i += 1;
+            }
+            arg if arg.starts_with('-') => {
+                return Err(ParseError(format!("unknown yoi workers option `{arg}`")));
+            }
+            value => {
+                return Err(ParseError(format!(
+                    "yoi workers does not accept positional argument `{value}`"
+                )));
+            }
+        }
+    }
+
+    let workspace_id = match workspace_id {
+        Some(workspace_id) => Some(workspace_id),
+        None => resolve_workspace_id_from_root(&workspace_root)?,
+    };
+    let backend_url = resolve_backend_url(backend_url, workspace_id.as_deref())?;
+    Ok(Mode::Tui {
+        mode: LaunchMode::BackendRuntimePicker {
+            target: BackendRuntimeListTarget::new(backend_url, workspace_id, runtime_id),
         },
         workspace_root,
     })
@@ -605,6 +756,127 @@ fn parse_resume_args(args: &[String]) -> Result<Mode, ParseError> {
 fn current_dir() -> Result<PathBuf, ParseError> {
     std::env::current_dir()
         .map_err(|e| ParseError(format!("failed to resolve current directory: {e}")))
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceIdentityFile {
+    #[serde(alias = "workspace_id")]
+    id: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ClientConfigFile {
+    default_backend: Option<String>,
+    #[serde(default)]
+    backends: BTreeMap<String, ClientBackendConfig>,
+    #[serde(default)]
+    workspaces: BTreeMap<String, ClientWorkspaceConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientBackendConfig {
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientWorkspaceConfig {
+    backend: String,
+}
+
+fn resolve_workspace_id_from_root(workspace_root: &Path) -> Result<Option<String>, ParseError> {
+    let mut current = if workspace_root.is_absolute() {
+        workspace_root.to_path_buf()
+    } else {
+        current_dir()?.join(workspace_root)
+    };
+    loop {
+        let path = current.join(".yoi").join("workspace.toml");
+        if path.is_file() {
+            let contents = fs::read_to_string(&path)
+                .map_err(|e| ParseError(format!("failed to read {}: {e}", path.display())))?;
+            let identity: WorkspaceIdentityFile = toml::from_str(&contents)
+                .map_err(|e| ParseError(format!("failed to parse {}: {e}", path.display())))?;
+            let id = identity.id.trim();
+            if id.is_empty() {
+                return Err(ParseError(format!(
+                    "{} must contain a non-empty workspace id",
+                    path.display()
+                )));
+            }
+            return Ok(Some(id.to_string()));
+        }
+        if !current.pop() {
+            return Ok(None);
+        }
+    }
+}
+
+fn resolve_backend_url(
+    explicit_backend_url: Option<String>,
+    workspace_id: Option<&str>,
+) -> Result<String, ParseError> {
+    if let Some(url) = explicit_backend_url {
+        return Ok(url);
+    }
+    let Some(config) = read_client_config()? else {
+        return Err(ParseError(client_config_missing_message(workspace_id)));
+    };
+    let backend_name = workspace_id
+        .and_then(|id| {
+            config
+                .workspaces
+                .get(id)
+                .map(|workspace| workspace.backend.as_str())
+        })
+        .or(config.default_backend.as_deref())
+        .ok_or_else(|| ParseError(client_config_missing_message(workspace_id)))?;
+    let backend = config.backends.get(backend_name).ok_or_else(|| {
+        ParseError(format!(
+            "client config references backend `{backend_name}`, but [backends.{backend_name}] is not defined"
+        ))
+    })?;
+    let url = backend.url.trim();
+    if url.is_empty() {
+        return Err(ParseError(format!(
+            "client config backend `{backend_name}` must contain a non-empty url"
+        )));
+    }
+    Ok(url.to_string())
+}
+
+fn read_client_config() -> Result<Option<ClientConfigFile>, ParseError> {
+    let Some(path) = client_config_path() else {
+        return Ok(None);
+    };
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let contents = fs::read_to_string(&path)
+        .map_err(|e| ParseError(format!("failed to read {}: {e}", path.display())))?;
+    toml::from_str::<ClientConfigFile>(&contents)
+        .map(Some)
+        .map_err(|e| ParseError(format!("failed to parse {}: {e}", path.display())))
+}
+
+fn client_config_path() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(home).join("yoi").join("client.toml"));
+    }
+    std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".config")
+            .join("yoi")
+            .join("client.toml")
+    })
+}
+
+fn client_config_missing_message(workspace_id: Option<&str>) -> String {
+    match workspace_id {
+        Some(workspace_id) => format!(
+            "Backend URL is required. Pass --backend <URL> or configure $XDG_CONFIG_HOME/yoi/client.toml with [workspaces.{workspace_id}] backend = <name> and [backends.<name>].url"
+        ),
+        None => "Backend URL is required. Pass --backend <URL> or configure default_backend in $XDG_CONFIG_HOME/yoi/client.toml".to_string(),
+    }
 }
 
 fn parse_workspace_args(args: &[String]) -> Result<Mode, ParseError> {
@@ -1024,9 +1296,9 @@ fn parse_session_id(value: &str) -> Result<SegmentId, ParseError> {
 
 fn print_help() {
     println!(
-        "yoi\n\nUsage:\n  yoi [OPTIONS]\n  yoi resume [--workspace <PATH>] [--all]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi worker [WORKER_OPTIONS]\n  yoi worker delete <NAME> [--force] [--dry-run]\n  yoi worker prune --older-than <DURATION> [--force] [--dry-run]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi session prune --unreferenced [--older-than <DURATION>] [--force] [--dry-run]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi workspace init [OPTIONS]
+        "yoi\n\nUsage:\n  yoi [OPTIONS]\n  yoi resume [--workspace <PATH>] [--all]\n  yoi workers [--workspace <PATH>] [--workspace-id <ID>] [--backend <URL>] [--runtime-id <ID>]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi worker [WORKER_OPTIONS]\n  yoi worker delete <NAME> [--force] [--dry-run]\n  yoi worker prune --older-than <DURATION> [--force] [--dry-run]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi session prune --unreferenced [--older-than <DURATION>] [--force] [--dry-run]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi workspace init [OPTIONS]
   yoi workspace config <COMMAND> [OPTIONS]
-  yoi workspace serve [OPTIONS]\n  yoi plugin new <rust-component-tool|rust-component-service> <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Worker chat/client surface (default, --worker, yoi resume, Backend Runtime target)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n      --workspace <PATH> Runtime workspace root for default Console/--worker (defaults to cwd)\n      --worker <NAME>       Open the Worker Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Worker Console to a specific socket with --worker\n      --session <UUID>   Resume a specific session segment in the Worker Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
+  yoi workspace serve [OPTIONS]\n  yoi plugin new <rust-component-tool|rust-component-service> <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Worker chat/client surface (default, --worker, yoi resume, Backend Runtime target)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n      --workspace <PATH> Runtime workspace root for default Console/--worker/workers (defaults to cwd)\n      --workspace-id <ID> Workspace identity for Backend scoped routes\n      --backend <URL>    Workspace Backend API URL for Backend Runtime attach/list\n      --runtime-id <ID>  Backend Runtime identity for attach/list\n      --worker <NAME>       Open the Worker Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Worker Console to a specific socket with --worker\n      --session <UUID>   Resume a specific session segment in the Worker Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
     );
 }
 
@@ -1095,13 +1367,51 @@ mod tests {
     }
 
     #[test]
-    fn parse_backend_runtime_target_requires_complete_identity() {
+    fn parse_backend_runtime_target_requires_runtime_for_worker_identity() {
         let err = parse_args_from(["--backend", "http://127.0.0.1:8787", "--worker-id", "w"])
             .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "--backend, --runtime-id, and --worker-id are required together"
+            "--worker-id requires --runtime-id for Backend Runtime API attach"
         );
+    }
+
+    #[test]
+    fn parse_backend_runtime_picker_target_mode() {
+        match parse_args_from(["--backend", "http://127.0.0.1:8787", "--runtime-id", "r"]).unwrap()
+        {
+            Mode::Tui {
+                mode: LaunchMode::BackendRuntimePicker { target },
+                ..
+            } => {
+                assert_eq!(target.base_url, "http://127.0.0.1:8787");
+                assert_eq!(target.runtime_id.as_deref(), Some("r"));
+            }
+            _ => panic!("expected BackendRuntimePicker mode"),
+        }
+    }
+
+    #[test]
+    fn parse_workers_subcommand_uses_backend_runtime_picker() {
+        match parse_args_from([
+            "workers",
+            "--backend",
+            "http://127.0.0.1:8787",
+            "--workspace-id",
+            "workspace-a",
+        ])
+        .unwrap()
+        {
+            Mode::Tui {
+                mode: LaunchMode::BackendRuntimePicker { target },
+                ..
+            } => {
+                assert_eq!(target.base_url, "http://127.0.0.1:8787");
+                assert_eq!(target.workspace_id.as_deref(), Some("workspace-a"));
+                assert_eq!(target.runtime_id, None);
+            }
+            _ => panic!("expected BackendRuntimePicker mode"),
+        }
     }
 
     #[test]

@@ -5815,6 +5815,7 @@ dependencies = [
  "tempfile",
  "ticket",
  "tokio",
+ "toml",
  "tui",
  "worker",
 ]
