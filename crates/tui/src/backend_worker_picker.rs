@@ -22,8 +22,19 @@ pub(crate) async fn run(target: BackendRuntimeListTarget) -> Result<(), Box<dyn 
         ))
     })?;
     if response.items.is_empty() {
+        let diagnostics = response
+            .diagnostics
+            .iter()
+            .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let detail = if diagnostics.is_empty() {
+            "no backend diagnostics".to_string()
+        } else {
+            diagnostics
+        };
         return Err(Box::new(io::Error::other(format!(
-            "Backend returned no runtime workers for workspace {}",
+            "Backend returned no runtime workers for workspace {} ({detail})",
             response.workspace_id
         ))));
     }

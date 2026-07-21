@@ -473,11 +473,11 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         )
         .route(
             "/api/runtimes/{runtime_id}/workers",
-            post(create_runtime_worker),
+            get(list_runtime_workers).post(create_runtime_worker),
         )
         .route(
             "/api/w/{workspace_id}/runtimes/{runtime_id}/workers",
-            post(scoped_create_runtime_worker),
+            get(scoped_list_runtime_workers).post(scoped_create_runtime_worker),
         )
         .route(
             "/api/runtimes/{runtime_id}/config-bundles",
@@ -2305,6 +2305,14 @@ async fn scoped_post_companion_cancel(
     post_companion_cancel(State(api), Json(request)).await
 }
 
+async fn scoped_list_runtime_workers(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedRuntimePath>,
+) -> ApiResult<Json<RuntimeListResponse<WorkerSummary>>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    list_runtime_workers(State(api), AxumPath(path.runtime_id)).await
+}
+
 async fn scoped_create_runtime_worker(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedRuntimePath>,
@@ -3200,6 +3208,24 @@ fn reject_no_workdir_for_non_embedded_runtime(
                 .to_string(),
         }],
     ))
+}
+
+async fn list_runtime_workers(
+    State(api): State<WorkspaceApi>,
+    AxumPath(runtime_id): AxumPath<String>,
+) -> ApiResult<Json<RuntimeListResponse<WorkerSummary>>> {
+    let limit = api.config.max_records.min(200);
+    let worker_list = api
+        .runtime
+        .list_workers_for_runtime(&runtime_id, limit)
+        .map_err(|err| err.into_error())?;
+    Ok(Json(RuntimeListResponse {
+        workspace_id: api.workspace_id().to_string(),
+        limit,
+        items: worker_list.items,
+        source: "runtime_registry".to_string(),
+        diagnostics: worker_list.diagnostics,
+    }))
 }
 
 async fn create_runtime_worker(

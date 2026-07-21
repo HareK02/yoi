@@ -902,6 +902,26 @@ impl RuntimeRegistry {
         RuntimeList::new(items, diagnostics)
     }
 
+    pub fn list_workers_for_runtime(
+        &self,
+        runtime_id: &str,
+        limit: usize,
+    ) -> Result<RuntimeList<WorkerSummary>, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        let worker_list = runtime.list_workers(limit);
+        let mut items: Vec<_> = worker_list
+            .items
+            .into_iter()
+            .filter(|worker| !is_retired_companion_worker(worker))
+            .take(limit)
+            .collect();
+        items.truncate(limit);
+        let mut diagnostics = worker_list.diagnostics;
+        diagnostics.truncate(MAX_DIAGNOSTICS);
+        Ok(RuntimeList::new(items, diagnostics))
+    }
+
     pub fn list_workers_for_host(
         &self,
         host_id: &str,
@@ -3772,6 +3792,30 @@ mod tests {
         assert_eq!(from_runtime_a.runtime_id, "runtime-a");
         assert_eq!(from_runtime_a.host_id, "host-a");
         assert_eq!(from_runtime_a.label, "worker from runtime a");
+    }
+
+    #[test]
+    fn registry_worker_list_can_be_scoped_by_runtime_id() {
+        let registry = RuntimeRegistry::new(vec![
+            Arc::new(FixtureRuntime::with_worker(
+                "runtime-a",
+                "host-a",
+                "shared-worker",
+                "worker from runtime a",
+            )),
+            Arc::new(FixtureRuntime::with_worker(
+                "runtime-b",
+                "host-b",
+                "shared-worker",
+                "worker from runtime b",
+            )),
+        ]);
+
+        let listed = registry.list_workers_for_runtime("runtime-b", 10).unwrap();
+        assert_eq!(listed.items.len(), 1);
+        assert_eq!(listed.items[0].runtime_id, "runtime-b");
+        assert_eq!(listed.items[0].host_id, "host-b");
+        assert_eq!(listed.items[0].label, "worker from runtime b");
     }
 
     #[test]
