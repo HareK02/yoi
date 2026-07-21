@@ -1,8 +1,8 @@
 ---
 title: 'TUI backend runtime worker listを表面化する'
-state: 'inprogress'
+state: 'closed'
 created_at: '2026-07-18T02:39:04Z'
-updated_at: '2026-07-18T02:46:09Z'
+updated_at: '2026-07-21T09:16:15Z'
 assignee: null
 queued_by: 'yoi ticket'
 queued_at: '2026-07-18T02:39:40Z'

@@ -74,3 +74,55 @@ Resume condition:
 
 
 ---
+
+<!-- event: implementation_report author: assistant at: 2026-07-21T09:12:45Z -->
+
+## Implementation report
+
+UI consistency follow-up:
+
+- Committed `4a08b69b fix: align backend worker picker style`.
+- Reworked `backend_worker_picker` to match the existing resume picker design rules:
+  - inline viewport via `TerminalOptions { viewport: Viewport::Inline(...) }`
+  - borderless one-line title / one row per worker / one-line hint layout
+  - `▶` selection marker and Cyan primary identity styling
+  - DarkGray metadata / preview styling and Green/Yellow/Red state badges
+  - polling event loop with `↑/↓`, `j/k`, `Enter`, `Esc`, `Ctrl-C`
+  - close-view handling matching the resume picker to avoid overwriting lower rows
+- Removed the initial fullscreen bordered `List`/details-panel layout.
+
+Verification:
+- `nix develop -c cargo fmt`
+- `nix develop -c cargo check -p tui`
+- `nix develop -c cargo test -p tui backend_worker_picker --lib`
+- `git diff --check`
+
+---
+
+<!-- event: state_changed author: hare at: 2026-07-21T09:16:15Z from: inprogress to: closed reason: closed field: state -->
+
+## State changed
+
+Ticket を closed にしました。
+
+
+---
+
+<!-- event: close author: hare at: 2026-07-21T09:16:15Z status: closed -->
+
+## 完了
+
+Backend/runtime authoritative worker list is now surfaced in the TUI.
+
+Completed scope:
+- Added backend runtime worker list DTO/API to the client crate.
+- Added `yoi workers` and Backend runtime picker launch routing.
+- Added client-side Backend URL resolution from explicit `--backend` or `$XDG_CONFIG_HOME/yoi/client.toml`, with workspace id read from explicit `--workspace-id` or `<workspace>/.yoi/workspace.toml`.
+- Added TUI Backend worker picker using Backend `WorkerSummary` as authority and displaying runtime id, worker id, label/profile, state, and working-directory summary.
+- Fixed missing GET routes for runtime worker list endpoints.
+- Aligned the Backend worker picker styling/controls with the existing inline resume picker.
+- Fixed the `nix develop` shell hook syntax error in `devshell.nix`.
+
+Validation performed under `nix develop` included targeted cargo check/test/fmt and `git diff --check`. Manual TUI verification was also reported successful by the user.
+
+---
