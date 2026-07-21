@@ -2,9 +2,9 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::time::Duration;
 
-use futures::StreamExt;
-use protocol::{ErrorCode, Event, Method, Segment};
-use serde::{Deserialize, Serialize};
+use futures::{SinkExt, StreamExt};
+use protocol::{ErrorCode, Event, Method};
+use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
@@ -160,10 +160,11 @@ pub struct BackendWorkerSummary {
 #[derive(Debug)]
 pub struct BackendRuntimeClient {
     target: BackendRuntimeTarget,
-    http: reqwest::Client,
+    command_tx: mpsc::UnboundedSender<Method>,
     events: mpsc::UnboundedReceiver<Event>,
     diagnostics: VecDeque<Event>,
     _observation_task: tokio::task::JoinHandle<()>,
+    _command_task: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Debug)]
@@ -258,21 +259,28 @@ pub async fn list_backend_workers(
 impl BackendRuntimeClient {
     pub async fn connect(target: BackendRuntimeTarget) -> Result<Self, BackendRuntimeClientError> {
         validate_target(&target)?;
-        let http = reqwest::Client::new();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (event_tx, rx) = mpsc::unbounded_channel();
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
 
         let observation_target = target.clone();
-        let observation_tx = tx.clone();
+        let observation_tx = event_tx.clone();
         let observation_task = tokio::spawn(async move {
             observe_worker_events(observation_target, observation_tx).await;
         });
 
+        let command_target = target.clone();
+        let command_event_tx = event_tx.clone();
+        let command_task = tokio::spawn(async move {
+            run_worker_protocol_commands(command_target, command_rx, command_event_tx).await;
+        });
+
         Ok(Self {
             target,
-            http,
+            command_tx,
             events: rx,
             diagnostics: VecDeque::new(),
             _observation_task: observation_task,
+            _command_task: command_task,
         })
     }
 
@@ -291,163 +299,106 @@ impl BackendRuntimeClient {
     }
 
     pub async fn send(&mut self, method: &Method) -> Result<(), BackendRuntimeClientError> {
-        match backend_command_from_method(method) {
-            BackendCommand::Input { kind, content } => {
-                let url = self.worker_api_url("input");
-                match self
-                    .http
-                    .post(url)
-                    .json(&WorkerInputRequest { kind, content })
-                    .send()
-                    .await
-                    .and_then(|response| response.error_for_status())
-                {
-                    Ok(response) => match response.json::<WorkerInputResult>().await {
-                        Ok(result) => self.enqueue_operation_diagnostics(
-                            "input",
-                            result.state,
-                            result.diagnostics,
-                        ),
-                        Err(error) => self.enqueue_diagnostic(format!(
-                            "Backend runtime input response could not be decoded for {}: {error}",
-                            self.target.display_label()
-                        )),
-                    },
-                    Err(error) => self.enqueue_diagnostic(format!(
-                        "Backend runtime input failed for {}: {error}",
-                        self.target.display_label()
-                    )),
-                }
-            }
-            BackendCommand::Lifecycle { action, reason } => {
-                let url = self.worker_api_url(action);
-                match self
-                    .http
-                    .post(url)
-                    .json(&WorkerLifecycleRequest { reason })
-                    .send()
-                    .await
-                    .and_then(|response| response.error_for_status())
-                {
-                    Ok(response) => match response.json::<WorkerLifecycleResult>().await {
-                        Ok(result) => self.enqueue_operation_diagnostics(
-                            action,
-                            result.state,
-                            result.diagnostics,
-                        ),
-                        Err(error) => self.enqueue_diagnostic(format!(
-                            "Backend runtime {action} response could not be decoded for {}: {error}",
-                            self.target.display_label()
-                        )),
-                    },
-                    Err(error) => self.enqueue_diagnostic(format!(
-                        "Backend runtime {action} failed for {}: {error}",
-                        self.target.display_label()
-                    )),
-                }
-            }
-            BackendCommand::Unsupported(message) => {
-                self.enqueue_diagnostic(message);
-            }
-        }
-        Ok(())
-    }
-
-    fn worker_api_url(&self, suffix: &str) -> String {
-        let path = format!(
-            "/api/runtimes/{}/workers/{}/{}",
-            path_segment_encode(&self.target.runtime_id),
-            path_segment_encode(&self.target.worker_id),
-            suffix
-        );
-        join_base_and_path(&self.target.base_url, &path)
-    }
-
-    fn enqueue_operation_diagnostics(
-        &mut self,
-        operation: &str,
-        state: String,
-        diagnostics: Vec<BackendDiagnostic>,
-    ) {
-        if state != "accepted" {
-            self.enqueue_diagnostic(format!(
-                "Backend runtime {operation} was {state} for {}",
+        self.command_tx.send(method.clone()).map_err(|_| {
+            BackendRuntimeClientError::InvalidTarget(format!(
+                "Backend protocol command stream is closed for {}",
                 self.target.display_label()
-            ));
-        }
-        for diagnostic in diagnostics {
-            self.enqueue_diagnostic(format!(
-                "Backend runtime {operation} diagnostic [{}]: {}",
-                diagnostic.code, diagnostic.message
-            ));
-        }
-    }
-
-    fn enqueue_diagnostic(&mut self, message: impl Into<String>) {
-        self.diagnostics.push_back(diagnostic_event(message));
+            ))
+        })?;
+        Ok(())
     }
 }
 
 impl Drop for BackendRuntimeClient {
     fn drop(&mut self) {
         self._observation_task.abort();
+        self._command_task.abort();
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum BackendCommand {
-    Input {
-        kind: WorkerInputKind,
-        content: String,
-    },
-    Lifecycle {
-        action: &'static str,
-        reason: Option<String>,
-    },
-    Unsupported(String),
-}
-
-fn backend_command_from_method(method: &Method) -> BackendCommand {
-    match method {
-        Method::Run { input } => BackendCommand::Input {
-            kind: WorkerInputKind::User,
-            content: Segment::flatten_to_text(input),
-        },
-        Method::Notify { message, .. } => BackendCommand::Input {
-            kind: WorkerInputKind::System,
-            content: message.clone(),
-        },
-        Method::Cancel => BackendCommand::Lifecycle {
-            action: "cancel",
-            reason: Some("requested from TUI Backend Runtime API client".to_string()),
-        },
-        Method::Shutdown => BackendCommand::Lifecycle {
-            action: "stop",
-            reason: Some("requested from TUI Backend Runtime API client".to_string()),
-        },
-        Method::Pause => BackendCommand::Unsupported(
-            "Backend Runtime API does not expose pause/resume for the TUI client yet; command was not sent".to_string(),
-        ),
-        Method::Resume => BackendCommand::Unsupported(
-            "Backend Runtime API does not expose resume for the TUI client yet; command was not sent".to_string(),
-        ),
-        Method::Compact => BackendCommand::Unsupported(
-            "Backend Runtime API does not expose compaction for the TUI client yet; command was not sent".to_string(),
-        ),
-        Method::ListCompletions { .. } => BackendCommand::Unsupported(
-            "Backend Runtime API does not expose completion lookup for the TUI client yet".to_string(),
-        ),
-        Method::ListRewindTargets | Method::RewindTo { .. } => BackendCommand::Unsupported(
-            "Backend Runtime API does not expose rewind controls for the TUI client yet; command was not sent".to_string(),
-        ),
-        Method::ListWorkers | Method::RestoreWorker { .. } | Method::RegisterPeer { .. } => {
-            BackendCommand::Unsupported(
-                "Backend Runtime API worker-management controls are not available from this Console connection".to_string(),
-            )
+async fn run_worker_protocol_commands(
+    target: BackendRuntimeTarget,
+    mut commands: mpsc::UnboundedReceiver<Method>,
+    tx: mpsc::UnboundedSender<Event>,
+) {
+    let url = protocol_ws_url(&target);
+    match connect_async(&url).await {
+        Ok((ws, _)) => {
+            let (mut sink, mut stream) = ws.split();
+            loop {
+                tokio::select! {
+                    maybe_method = commands.recv() => {
+                        let Some(method) = maybe_method else {
+                            break;
+                        };
+                        match serde_json::to_string(&method) {
+                            Ok(text) => {
+                                if let Err(error) = sink.send(TungsteniteMessage::Text(text.into())).await {
+                                    let _ = tx.send(diagnostic_event(format!(
+                                        "Backend protocol command send failed for {}: {error}",
+                                        target.display_label()
+                                    )));
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                let _ = tx.send(diagnostic_event(format!(
+                                    "Backend protocol command could not serialize method for {}: {error}",
+                                    target.display_label()
+                                )));
+                            }
+                        }
+                    }
+                    frame = stream.next() => {
+                        match frame {
+                            Some(Ok(TungsteniteMessage::Text(text))) => {
+                                match serde_json::from_str::<Event>(&text) {
+                                    Ok(event) => {
+                                        let _ = tx.send(event);
+                                    }
+                                    Err(error) => {
+                                        let _ = tx.send(diagnostic_event(format!(
+                                            "Backend protocol response was not valid Event JSON for {}: {error}",
+                                            target.display_label()
+                                        )));
+                                    }
+                                }
+                            }
+                            Some(Ok(TungsteniteMessage::Close(_))) | None => {
+                                let _ = tx.send(diagnostic_event(format!(
+                                    "Backend protocol command stream closed for {}",
+                                    target.display_label()
+                                )));
+                                break;
+                            }
+                            Some(Ok(TungsteniteMessage::Ping(_)))
+                            | Some(Ok(TungsteniteMessage::Pong(_)))
+                            | Some(Ok(TungsteniteMessage::Binary(_)))
+                            | Some(Ok(TungsteniteMessage::Frame(_))) => {}
+                            Some(Err(error)) => {
+                                let _ = tx.send(diagnostic_event(format!(
+                                    "Backend protocol WebSocket error for {}: {error}",
+                                    target.display_label()
+                                )));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
-        Method::WorkerEvent(_) => BackendCommand::Unsupported(
-            "Backend Runtime API does not accept child Worker lifecycle events from this Console connection".to_string(),
-        ),
+        Err(error) => {
+            let _ = tx.send(diagnostic_event(format!(
+                "Backend protocol WebSocket connect failed for {}: {error}",
+                target.display_label()
+            )));
+            while commands.recv().await.is_some() {
+                let _ = tx.send(diagnostic_event(format!(
+                    "Backend protocol command was not sent because command stream is unavailable for {}",
+                    target.display_label()
+                )));
+            }
+        }
     }
 }
 
@@ -610,6 +561,15 @@ fn observation_ws_url(target: &BackendRuntimeTarget) -> String {
     join_base_and_path(&http_base_to_ws(&target.base_url), &path)
 }
 
+fn protocol_ws_url(target: &BackendRuntimeTarget) -> String {
+    let path = format!(
+        "/api/runtimes/{}/workers/{}/protocol/ws",
+        path_segment_encode(&target.runtime_id),
+        path_segment_encode(&target.worker_id)
+    );
+    join_base_and_path(&http_base_to_ws(&target.base_url), &path)
+}
+
 fn http_base_to_ws(base: &str) -> String {
     if let Some(rest) = base.strip_prefix("https://") {
         format!("wss://{rest}")
@@ -641,38 +601,6 @@ fn percent_encode(input: &str, keep: impl Fn(u8) -> bool) -> String {
         }
     }
     encoded
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum WorkerInputKind {
-    User,
-    System,
-}
-
-#[derive(Debug, Serialize)]
-struct WorkerInputRequest {
-    kind: WorkerInputKind,
-    content: String,
-}
-
-#[derive(Debug, Serialize)]
-struct WorkerLifecycleRequest {
-    reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WorkerInputResult {
-    state: String,
-    #[serde(default)]
-    diagnostics: Vec<BackendDiagnostic>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WorkerLifecycleResult {
-    state: String,
-    #[serde(default)]
-    diagnostics: Vec<BackendDiagnostic>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -712,47 +640,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backend_command_maps_run_to_user_input_without_runtime_endpoint() {
-        let method = Method::Run {
-            input: vec![
-                Segment::text("hello"),
-                Segment::FileRef {
-                    path: "src/lib.rs".into(),
-                },
-            ],
-        };
-        assert_eq!(
-            backend_command_from_method(&method),
-            BackendCommand::Input {
-                kind: WorkerInputKind::User,
-                content: "hello@src/lib.rs".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn backend_worker_list_paths_use_scoped_workspace_when_available() {
-        assert_eq!(
-            backend_runtimes_path(Some("workspace/one")),
-            "/api/w/workspace%2Fone/runtimes"
-        );
-        assert_eq!(
-            backend_runtime_workers_path(Some("workspace/one"), "runtime one"),
-            "/api/w/workspace%2Fone/runtimes/runtime%20one/workers"
-        );
-        assert_eq!(
-            backend_runtime_workers_path(None, "runtime one"),
-            "/api/runtimes/runtime%20one/workers"
-        );
-    }
-
-    #[test]
-    fn observation_url_uses_backend_runtime_worker_identity() {
+    fn command_and_observation_urls_use_backend_protocol_paths() {
         let target =
             BackendRuntimeTarget::new("http://127.0.0.1:8787/", "runtime/one", "worker one");
         assert_eq!(
             observation_ws_url(&target),
             "ws://127.0.0.1:8787/api/runtimes/runtime%2Fone/workers/worker%20one/events/ws"
+        );
+        assert_eq!(
+            protocol_ws_url(&target),
+            "ws://127.0.0.1:8787/api/runtimes/runtime%2Fone/workers/worker%20one/protocol/ws"
         );
     }
 }

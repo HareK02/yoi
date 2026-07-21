@@ -3,7 +3,10 @@
     import ConsoleLineItem from "$lib/workspace/console/ConsoleLineItem.svelte";
     import ConsoleTimeline from "$lib/workspace/console/ConsoleTimeline.svelte";
     import { chatSubmit } from "$lib/workspace/console/chat-submit";
-    import { buildComposerRequest } from "$lib/workspace/console/composer-command";
+    import {
+        buildComposerRequest,
+        type WorkerConsoleInputRequest,
+    } from "$lib/workspace/console/composer-command";
     import {
         applyCompletion,
         completionTokenAt,
@@ -18,12 +21,12 @@
         type ConsoleLine,
         type ConsoleProjection,
     } from "$lib/workspace/console/model";
+    import type { Event as ProtocolEvent, Method as ProtocolMethod, RewindTarget, Segment } from "$lib/generated/protocol";
     import { workspaceApiPath } from "$lib/workspace/api/http";
     import type {
         ClientWorkerEventWsFrame,
         Diagnostic,
         Worker,
-        WorkerInputResult,
         PodProtocolEvent,
     } from "$lib/workspace/sidebar/types";
 
@@ -44,13 +47,6 @@
     function workerApiPath(path: string): string {
         return workspaceApiPath(workspaceId, path);
     }
-
-    type WorkerCompletionsResult = {
-        kind: "file";
-        prefix: string;
-        entries: ComposerCompletionEntry[];
-        diagnostics: Diagnostic[];
-    };
 
     type TimelineKind = "turn" | "assistant";
 
@@ -98,10 +94,22 @@
     let completionError = $state<string | null>(null);
     let sending = $state(false);
     let sendError = $state<string | null>(null);
+    let rewindTargets = $state<RewindTarget[]>([]);
+    let rewindHeadEntries = $state(0);
+    let controlNotice = $state<string | null>(null);
     let composerNotice = $state<string | null>(null);
     let streamState = $state<"connecting" | "open" | "closed" | "error">(
         "connecting",
     );
+    let commandState = $state<"connecting" | "open" | "closed" | "error">(
+        "connecting",
+    );
+    let commandSocket: WebSocket | null = null;
+    let pendingCompletionRequest: {
+        resolve: (entries: ComposerCompletionEntry[]) => void;
+        reject: (error: Error) => void;
+        timeout: number;
+    } | null = null;
     let streamDiagnostics = $state<Diagnostic[]>([]);
     let workerDetailsOpen = $state(false);
     let timelineOpen = $state(false);
@@ -160,37 +168,6 @@
             throw new Error(`GET ${path} failed: ${response.status}`);
         }
         return response.json() as Promise<T>;
-    }
-
-    async function postJson<T>(
-        path: string,
-        body: unknown,
-        timeoutMs = 30_000,
-    ): Promise<T> {
-        const controller = new AbortController();
-        const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
-        try {
-            const response = await fetch(path, {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify(body),
-                signal: controller.signal,
-            });
-            if (!response.ok) {
-                let detail = "";
-                try {
-                    detail = await response.text();
-                } catch {
-                    detail = "";
-                }
-                throw new Error(
-                    `POST ${path} failed: ${response.status}${detail ? ` ${detail}` : ""}`,
-                );
-            }
-            return response.json() as Promise<T>;
-        } finally {
-            window.clearTimeout(timeout);
-        }
     }
 
     async function loadWorker(target: ConsoleTarget) {
@@ -284,14 +261,16 @@
         }
         const observedAtMs = Date.now();
         eventObservedAtById.set(frame.envelope.event_id, observedAtMs);
+        const payload = frame.envelope.payload;
         pendingObservationEvents.push({
             eventId: frame.envelope.event_id,
-            event: frame.envelope.payload,
+            event: payload,
             observedAtMs,
         });
-        pendingObservedStates.push(
-            workerStateFromProtocolEvent(frame.envelope.payload),
-        );
+        if (payload.event === "rewind_targets") {
+            handleProtocolCommandEvent(payload as ProtocolEvent);
+        }
+        pendingObservedStates.push(workerStateFromProtocolEvent(payload));
         scheduleObservationFlush();
     }
 
@@ -354,16 +333,29 @@
         if (token.kind === "command") {
             return localCommandCompletions(token.prefix);
         }
-        const result = await postJson<WorkerCompletionsResult>(
-            workerApiPath(
-                `/runtimes/${encodeURIComponent(runtimeId)}/workers/${encodeURIComponent(workerId)}/completions`,
-            ),
-            { kind: token.kind, prefix: token.prefix },
-        );
-        if (result.diagnostics.length > 0 && result.entries.length === 0) {
-            throw new Error(diagnosticsToText(result.diagnostics));
-        }
-        return result.entries;
+        return new Promise((resolve, reject) => {
+            if (pendingCompletionRequest) {
+                rejectPendingCompletion(
+                    new Error("Superseded by a newer completion request."),
+                );
+            }
+            const timeout = window.setTimeout(() => {
+                rejectPendingCompletion(
+                    new Error("Worker completion request timed out."),
+                );
+            }, 30_000);
+            pendingCompletionRequest = { resolve, reject, timeout };
+            try {
+                sendProtocolMethod({
+                    method: "list_completions",
+                    params: { kind: token.kind, prefix: token.prefix },
+                });
+            } catch (error) {
+                rejectPendingCompletion(
+                    error instanceof Error ? error : new Error(String(error)),
+                );
+            }
+        });
     }
 
     function handleComposerKeydown(event: KeyboardEvent) {
@@ -401,6 +393,63 @@
         composerTextareaElement?.focus();
     }
 
+    function sendControl(method: ProtocolMethod, label: string) {
+        try {
+            sendProtocolMethod(method);
+            controlNotice = `${label} sent through Worker protocol.`;
+        } catch (error) {
+            controlNotice = null;
+            sendError = error instanceof Error ? error.message : String(error);
+        }
+    }
+
+    function requestRewindTargets() {
+        sendControl({ method: "list_rewind_targets" }, "Rewind target request");
+    }
+
+    function rewindTo(target: RewindTarget) {
+        sendControl(
+            {
+                method: "rewind_to",
+                params: {
+                    target: target.id,
+                    expected_head_entries: rewindHeadEntries,
+                },
+            },
+            `Rewind to ${target.preview || "target"}`,
+        );
+    }
+
+    function composerRequestToProtocolMethod(
+        request: WorkerConsoleInputRequest,
+    ): ProtocolMethod {
+        switch (request.kind) {
+            case "user":
+                return {
+                    method: "run",
+                    params: {
+                        input: request.segments ?? [
+                            { kind: "text", content: request.content },
+                        ],
+                    },
+                };
+            case "system":
+                return {
+                    method: "notify",
+                    params: { message: request.content, auto_run: true },
+                };
+            case "compact":
+                return { method: "compact" };
+            case "list_rewind_targets":
+                return { method: "list_rewind_targets" };
+            case "register_peer":
+                return {
+                    method: "register_peer",
+                    params: { name: request.content },
+                };
+        }
+    }
+
     async function submitDraft(value = draft) {
         const command = buildComposerRequest(value);
         if (!command.ok) {
@@ -420,20 +469,13 @@
         sending = true;
         sendError = null;
         try {
-            const result = await postJson<WorkerInputResult>(
-                workerApiPath(
-                    `/runtimes/${encodeURIComponent(runtimeId)}/workers/${encodeURIComponent(workerId)}/input`,
-                ),
-                command.request,
-            );
-            if (result.state === "accepted") {
-                draft = "";
+            const method = composerRequestToProtocolMethod(command.request);
+            sendProtocolMethod(method);
+            draft = "";
+            if (method.method === "run" || method.method === "notify") {
                 liveWorkerState = "running";
-            } else {
-                sendError =
-                    diagnosticsToText(result.diagnostics) ||
-                    `Input was ${result.state}.`;
             }
+            composerNotice = "Sent through Worker protocol.";
         } catch (error) {
             sendError = error instanceof Error ? error.message : String(error);
         } finally {
@@ -531,6 +573,138 @@
         };
 
         return () => ws.close();
+    }
+
+    function connectProtocolCommands(
+        targetWorker: Worker | null,
+        token: number,
+        target: ConsoleTarget,
+    ) {
+        if (!targetWorker) {
+            commandState = "closed";
+            return;
+        }
+        commandState = "connecting";
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const wsPath = workerApiPath(
+            `/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(
+                target.workerId,
+            )}/protocol/ws`,
+        );
+        const ws = new WebSocket(
+            `${protocol}//${window.location.host}${wsPath}`,
+        );
+        commandSocket = ws;
+
+        ws.onopen = () => {
+            if (token === reloadToken) {
+                commandState = "open";
+            }
+        };
+        ws.onmessage = (message) => {
+            if (token !== reloadToken) {
+                return;
+            }
+            try {
+                handleProtocolCommandEvent(
+                    JSON.parse(String(message.data)) as ProtocolEvent,
+                );
+            } catch (error) {
+                streamDiagnostics = [
+                    ...streamDiagnostics,
+                    {
+                        code: "worker_protocol_command_frame_invalid",
+                        severity: "warning",
+                        message:
+                            error instanceof Error ? error.message : String(error),
+                    },
+                ];
+            }
+        };
+        ws.onerror = () => {
+            if (token === reloadToken) {
+                commandState = "error";
+                streamDiagnostics = [
+                    ...streamDiagnostics,
+                    {
+                        code: "worker_protocol_command_ws_error",
+                        severity: "error",
+                        message: "Worker protocol command WebSocket failed.",
+                    },
+                ];
+            }
+        };
+        ws.onclose = () => {
+            if (commandSocket === ws) {
+                commandSocket = null;
+            }
+            if (token === reloadToken && commandState !== "error") {
+                commandState = "closed";
+            }
+            rejectPendingCompletion(
+                new Error("Worker protocol command WebSocket closed."),
+            );
+        };
+
+        return () => {
+            if (commandSocket === ws) {
+                commandSocket = null;
+            }
+            ws.close();
+        };
+    }
+
+    function sendProtocolMethod(method: ProtocolMethod) {
+        if (!commandSocket || commandSocket.readyState !== WebSocket.OPEN) {
+            throw new Error("Worker protocol command WebSocket is not open.");
+        }
+        commandSocket.send(JSON.stringify(method));
+    }
+
+    function handleProtocolCommandEvent(event: ProtocolEvent) {
+        if (event.event === "completions") {
+            const pending = pendingCompletionRequest;
+            if (!pending) {
+                return;
+            }
+            pendingCompletionRequest = null;
+            window.clearTimeout(pending.timeout);
+            pending.resolve(event.data.entries);
+            return;
+        }
+        if (event.event === "rewind_targets") {
+            rewindHeadEntries = event.data.head_entries;
+            rewindTargets = event.data.targets;
+            controlNotice =
+                event.data.targets.length === 0
+                    ? "No rewind targets are available."
+                    : `Loaded ${event.data.targets.length} rewind target(s).`;
+            return;
+        }
+        if (event.event === "error") {
+            const error = new Error(event.data.message);
+            if (pendingCompletionRequest) {
+                rejectPendingCompletion(error);
+            }
+            streamDiagnostics = [
+                ...streamDiagnostics,
+                {
+                    code: event.data.code,
+                    severity: "error",
+                    message: event.data.message,
+                },
+            ];
+        }
+    }
+
+    function rejectPendingCompletion(error: Error) {
+        const pending = pendingCompletionRequest;
+        if (!pending) {
+            return;
+        }
+        pendingCompletionRequest = null;
+        window.clearTimeout(pending.timeout);
+        pending.reject(error);
     }
 
     function mergeDiagnostics(...groups: Diagnostic[][]): Diagnostic[] {
@@ -989,6 +1163,7 @@
     });
 
     $effect(() => connectObservation(worker, reloadToken, consoleTarget));
+    $effect(() => connectProtocolCommands(worker, reloadToken, consoleTarget));
 </script>
 
 <svelte:head>
@@ -1009,8 +1184,48 @@
                 class="console-status-pill"
                 class:warn={streamState !== "open"}
             >
-                {workerState} · stream {streamState}
+                {workerState} · stream {streamState} · command {commandState}
             </div>
+            <button
+                type="button"
+                class="secondary-button"
+                disabled={commandState !== "open"}
+                onclick={() => sendControl({ method: "cancel" }, "Cancel")}
+            >
+                Cancel
+            </button>
+            <button
+                type="button"
+                class="secondary-button"
+                disabled={commandState !== "open"}
+                onclick={() => sendControl({ method: "pause" }, "Pause")}
+            >
+                Pause
+            </button>
+            <button
+                type="button"
+                class="secondary-button"
+                disabled={commandState !== "open"}
+                onclick={() => sendControl({ method: "resume" }, "Resume")}
+            >
+                Resume
+            </button>
+            <button
+                type="button"
+                class="secondary-button"
+                disabled={commandState !== "open"}
+                onclick={() => sendControl({ method: "compact" }, "Compact")}
+            >
+                Compact
+            </button>
+            <button
+                type="button"
+                class="secondary-button"
+                disabled={commandState !== "open"}
+                onclick={requestRewindTargets}
+            >
+                Rewind
+            </button>
             <button
                 type="button"
                 class="secondary-button"
@@ -1021,6 +1236,32 @@
             </button>
         </div>
     </section>
+
+    {#if controlNotice}
+        <p class="console-notice">{controlNotice}</p>
+    {/if}
+
+    {#if rewindTargets.length > 0}
+        <section class="card rewind-targets" aria-label="Rewind targets">
+            <h3>Rewind targets</h3>
+            <div class="rewind-target-list">
+                {#each rewindTargets as target (JSON.stringify(target.id))}
+                    <button
+                        type="button"
+                        class="secondary-button"
+                        disabled={commandState !== "open" || !target.eligible}
+                        title={target.disabled_reason ?? target.warning ?? undefined}
+                        onclick={() => rewindTo(target)}
+                    >
+                        {target.preview || `${target.turn_index}`}
+                        {#if target.warning || target.disabled_reason}
+                            <span>{target.warning ?? target.disabled_reason}</span>
+                        {/if}
+                    </button>
+                {/each}
+            </div>
+        </section>
+    {/if}
 
     <section class:timeline-open={timelineOpen} class="console-body">
         <div class="console-timeline-spacer" aria-hidden="true"></div>
@@ -1265,6 +1506,35 @@
 
     .console-status-pill.warn {
         color: var(--warning);
+    }
+
+    .console-notice {
+        margin: 0;
+        color: var(--text-muted);
+        font-size: 0.86rem;
+    }
+
+    .rewind-targets {
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+        padding: var(--space-3);
+    }
+
+    .rewind-targets h3 {
+        margin: 0;
+        font-size: 0.9rem;
+    }
+
+    .rewind-target-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: var(--space-2);
+    }
+
+    .rewind-target-list span {
+        margin-left: 0.5rem;
+        color: var(--text-muted);
     }
 
     .console-body {

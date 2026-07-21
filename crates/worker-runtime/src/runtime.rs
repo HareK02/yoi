@@ -35,6 +35,7 @@ use crate::observation::{
 };
 #[cfg(feature = "ws-server")]
 use crate::observation::{WorkerObservationCursor, WorkerObservationEvent};
+use protocol::{Event, Method};
 use std::collections::BTreeMap;
 #[cfg(feature = "ws-server")]
 use std::collections::VecDeque;
@@ -559,6 +560,71 @@ impl Runtime {
         Ok(backend.worker_completions(&handle, kind, prefix))
     }
 
+    /// Accept a protocol method for a Worker through a Backend/runtime transport.
+    ///
+    /// Most methods are delivered to the execution backend unchanged. Methods with
+    /// direct same-connection replies in the local socket protocol return those
+    /// events from this function so WebSocket transports can write them back to the
+    /// requesting client without rebroadcasting them.
+    pub fn send_protocol_method(
+        &self,
+        worker_ref: &WorkerRef,
+        method: Method,
+    ) -> Result<Vec<Event>, RuntimeError> {
+        if let Method::ListCompletions { kind, prefix } = method {
+            let entries = self.worker_completions(worker_ref, kind, &prefix)?;
+            return Ok(vec![Event::Completions { kind, entries }]);
+        }
+
+        let (backend, handle) = {
+            let mut state = self.lock()?;
+            state.ensure_running()?;
+            state.ensure_worker_ref(worker_ref)?;
+            let worker = state.worker(worker_ref)?;
+            if !worker.status.is_active() {
+                return Err(RuntimeError::InvalidRequest(format!(
+                    "worker {} is not running",
+                    worker_ref.worker_id
+                )));
+            }
+            let backend = state.execution_backend.clone();
+            let handle = worker.execution_handle.clone();
+            match (backend, handle) {
+                (Some(backend), Some(handle)) => (backend, handle),
+                _ => {
+                    let result = WorkerExecutionResult::rejected(
+                        WorkerExecutionOperation::ProtocolMethod,
+                        "worker has no execution backend",
+                    );
+                    let worker = state.worker_mut(worker_ref)?;
+                    let mut execution = WorkerExecutionStatus::unconnected().with_result(result);
+                    execution.binding = worker.execution.binding.clone();
+                    worker.execution = execution;
+                    state.persist_worker(&worker_ref.worker_id)?;
+                    return Err(RuntimeError::WorkerExecutionUnavailable {
+                        worker_id: worker_ref.worker_id.clone(),
+                        message: "worker has no execution backend".to_string(),
+                    });
+                }
+            }
+        };
+
+        let dispatch_result = backend.dispatch_method(&handle, method);
+        if !dispatch_result.is_accepted() {
+            self.record_execution_result(worker_ref, dispatch_result.clone())?;
+            return Err(RuntimeError::WorkerExecutionRejected {
+                worker_id: worker_ref.worker_id.clone(),
+                operation: dispatch_result.operation,
+                outcome: dispatch_result.outcome,
+                message: dispatch_result.message_or_default(),
+                result: dispatch_result,
+            });
+        }
+
+        self.record_execution_result(worker_ref, dispatch_result)?;
+        Ok(Vec::new())
+    }
+
     fn commit_created_worker(
         &self,
         worker_ref: &WorkerRef,
@@ -641,7 +707,8 @@ impl Runtime {
             WorkerExecutionOperation::Cancel => backend.cancel_worker(&handle),
             WorkerExecutionOperation::Spawn
             | WorkerExecutionOperation::Restore
-            | WorkerExecutionOperation::Input => return Ok(()),
+            | WorkerExecutionOperation::Input
+            | WorkerExecutionOperation::ProtocolMethod => return Ok(()),
         };
         if result.is_accepted() {
             self.record_execution_result(worker_ref, result)?;

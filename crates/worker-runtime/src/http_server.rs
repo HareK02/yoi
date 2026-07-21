@@ -154,7 +154,12 @@ pub fn runtime_http_router(runtime: Runtime, local_token: Option<String>) -> Rou
         .route("/v1/workers/{worker_id}/cancel", post(cancel_worker));
 
     #[cfg(feature = "ws-server")]
-    let router = router.route("/v1/workers/{worker_id}/events/ws", get(worker_events_ws));
+    let router = router
+        .route("/v1/workers/{worker_id}/events/ws", get(worker_events_ws))
+        .route(
+            "/v1/workers/{worker_id}/protocol/ws",
+            get(worker_protocol_ws),
+        );
 
     router
         .with_state(state.clone())
@@ -504,6 +509,94 @@ async fn create_worker(
         .create_worker(request)
         .map_err(RuntimeHttpRestError::runtime)?;
     Ok(Json(RuntimeHttpWorkerResponse { worker }))
+}
+
+#[cfg(feature = "ws-server")]
+async fn worker_protocol_ws(
+    State(state): State<RuntimeHttpState>,
+    Path(worker_id): Path<String>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, RuntimeHttpRestError> {
+    let worker_ref = worker_ref_for(&state.runtime, worker_id)?;
+    state
+        .runtime
+        .worker_detail(&worker_ref)
+        .map_err(RuntimeHttpRestError::runtime)?;
+    Ok(ws
+        .on_upgrade(move |socket| worker_protocol_ws_session(state.runtime, worker_ref, socket))
+        .into_response())
+}
+
+#[cfg(feature = "ws-server")]
+async fn worker_protocol_ws_session(
+    runtime: Runtime,
+    worker_ref: WorkerRef,
+    mut socket: WebSocket,
+) {
+    while let Some(frame) = socket.next().await {
+        match frame {
+            Ok(WsMessage::Text(text)) => match serde_json::from_str::<protocol::Method>(&text) {
+                Ok(method) => match runtime.send_protocol_method(&worker_ref, method) {
+                    Ok(events) => {
+                        for event in events {
+                            if !send_protocol_event(&mut socket, &event).await {
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let event = protocol_error_event(error.to_string());
+                        if !send_protocol_event(&mut socket, &event).await {
+                            return;
+                        }
+                    }
+                },
+                Err(error) => {
+                    let event =
+                        protocol_error_event(format!("malformed protocol method frame: {error}"));
+                    if !send_protocol_event(&mut socket, &event).await {
+                        return;
+                    }
+                }
+            },
+            Ok(WsMessage::Close(_)) => return,
+            Ok(WsMessage::Ping(payload)) => {
+                if socket.send(WsMessage::Pong(payload)).await.is_err() {
+                    return;
+                }
+            }
+            Ok(WsMessage::Pong(_)) | Ok(WsMessage::Binary(_)) => {}
+            Err(error) => {
+                let event = protocol_error_event(format!("protocol WebSocket error: {error}"));
+                let _ = send_protocol_event(&mut socket, &event).await;
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "ws-server")]
+async fn send_protocol_event(socket: &mut WebSocket, event: &protocol::Event) -> bool {
+    match serde_json::to_string(event) {
+        Ok(text) => socket.send(WsMessage::Text(text.into())).await.is_ok(),
+        Err(error) => {
+            let fallback = protocol_error_event(format!(
+                "failed to serialize protocol response event: {error}"
+            ));
+            let Ok(text) = serde_json::to_string(&fallback) else {
+                return false;
+            };
+            socket.send(WsMessage::Text(text.into())).await.is_ok()
+        }
+    }
+}
+
+#[cfg(feature = "ws-server")]
+fn protocol_error_event(message: impl Into<String>) -> protocol::Event {
+    protocol::Event::Error {
+        code: protocol::ErrorCode::Internal,
+        message: message.into(),
+    }
 }
 
 #[cfg(feature = "ws-server")]

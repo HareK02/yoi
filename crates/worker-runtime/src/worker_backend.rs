@@ -722,6 +722,27 @@ impl<F> Drop for WorkerRuntimeExecutionBackend<F> {
     }
 }
 
+fn method_starts_turn(method: &Method) -> bool {
+    matches!(
+        method,
+        Method::Run { .. }
+            | Method::Notify { auto_run: true, .. }
+            | Method::Resume
+            | Method::Compact
+    )
+}
+
+fn accepted_run_state_for_method(method: &Method) -> WorkerExecutionRunState {
+    match method {
+        Method::Run { .. }
+        | Method::Notify { auto_run: true, .. }
+        | Method::Resume
+        | Method::Compact => WorkerExecutionRunState::Busy,
+        Method::Shutdown => WorkerExecutionRunState::Stopped,
+        _ => WorkerExecutionRunState::Idle,
+    }
+}
+
 impl<F> WorkerExecutionBackend for WorkerRuntimeExecutionBackend<F>
 where
     F: RuntimeWorkerFactory,
@@ -1033,6 +1054,48 @@ where
             accepted_run_state,
         );
         if accepted_is_idle || result.outcome != crate::execution::WorkerExecutionOutcome::Accepted
+        {
+            busy.store(false, Ordering::SeqCst);
+        }
+        result
+    }
+
+    fn dispatch_method(
+        &self,
+        handle: &WorkerExecutionHandle,
+        method: Method,
+    ) -> WorkerExecutionResult {
+        let (worker, busy) = match self.get_execution(handle) {
+            Ok(execution) => execution,
+            Err(mut result) => {
+                result.operation = WorkerExecutionOperation::ProtocolMethod;
+                return result;
+            }
+        };
+
+        let starts_turn = method_starts_turn(&method);
+        if starts_turn
+            && (worker.shared_state.get_status() != WorkerStatus::Idle
+                || busy
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err())
+        {
+            return WorkerExecutionResult::busy(
+                WorkerExecutionOperation::ProtocolMethod,
+                "Worker is already running; runtime adapter v0 does not queue protocol methods",
+            );
+        }
+
+        let accepted_run_state = accepted_run_state_for_method(&method);
+        let accepted_is_idle = accepted_run_state == WorkerExecutionRunState::Idle;
+        let result = self.send_method(
+            WorkerExecutionOperation::ProtocolMethod,
+            worker,
+            method,
+            accepted_run_state,
+        );
+        if (starts_turn && accepted_is_idle)
+            || (starts_turn && result.outcome != crate::execution::WorkerExecutionOutcome::Accepted)
         {
             busy.store(false, Ordering::SeqCst);
         }

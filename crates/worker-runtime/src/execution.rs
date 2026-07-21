@@ -6,6 +6,7 @@ use crate::interaction::WorkerInput;
 #[cfg(feature = "ws-server")]
 use crate::observation::WorkerObservationEvent;
 use crate::working_directory::{WorkingDirectoryBinding, WorkingDirectoryDiagnostic};
+use protocol::Method;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
@@ -63,6 +64,7 @@ pub enum WorkerExecutionOperation {
     Spawn,
     Restore,
     Input,
+    ProtocolMethod,
     Stop,
     Cancel,
 }
@@ -380,6 +382,17 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         input: WorkerInput,
     ) -> WorkerExecutionResult;
 
+    fn dispatch_method(
+        &self,
+        _handle: &WorkerExecutionHandle,
+        _method: Method,
+    ) -> WorkerExecutionResult {
+        WorkerExecutionResult::unsupported(
+            WorkerExecutionOperation::ProtocolMethod,
+            "execution backend does not support direct Worker protocol methods",
+        )
+    }
+
     fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
         WorkerExecutionResult::unsupported(
             WorkerExecutionOperation::Stop,
@@ -477,6 +490,14 @@ impl WorkerExecutionBackendRef {
         input: WorkerInput,
     ) -> WorkerExecutionResult {
         self.backend.dispatch_input(handle, input)
+    }
+
+    pub(crate) fn dispatch_method(
+        &self,
+        handle: &WorkerExecutionHandle,
+        method: Method,
+    ) -> WorkerExecutionResult {
+        self.backend.dispatch_method(handle, method)
     }
 
     pub(crate) fn stop_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {

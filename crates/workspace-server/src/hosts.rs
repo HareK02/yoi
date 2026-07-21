@@ -514,6 +514,21 @@ pub enum RuntimeRegistryError {
 }
 
 impl RuntimeRegistryError {
+    pub fn message(&self) -> String {
+        match self {
+            Self::InvalidIdentifier { kind, value } => {
+                format!("invalid {kind} identifier `{value}`")
+            }
+            Self::UnknownRuntime(runtime_id) => format!("unknown runtime `{runtime_id}`"),
+            Self::UnknownHost(host_id) => format!("unknown host `{host_id}`"),
+            Self::UnknownWorker {
+                runtime_id,
+                worker_id,
+            } => format!("unknown worker `{worker_id}` in runtime `{runtime_id}`"),
+            Self::RuntimeOperationFailed { message, .. } => message.clone(),
+        }
+    }
+
     pub fn into_error(self) -> Error {
         match self {
             Self::InvalidIdentifier { kind, value } => Error::InvalidRuntimeIdentifier {
@@ -656,6 +671,18 @@ pub trait WorkspaceWorkerRuntime: Send + Sync {
                 "runtime does not implement config bundle listing".to_string(),
             )],
         }
+    }
+
+    fn send_protocol_method(
+        &self,
+        _worker_id: &str,
+        _method: protocol::Method,
+    ) -> Result<Vec<protocol::Event>, RuntimeRegistryError> {
+        Err(RuntimeRegistryError::RuntimeOperationFailed {
+            runtime_id: self.runtime_id().to_string(),
+            code: "worker_protocol_method_unsupported".to_string(),
+            message: "runtime does not support Worker protocol command transport".to_string(),
+        })
     }
 
     fn stop_worker(
@@ -1060,6 +1087,26 @@ impl RuntimeRegistry {
         validate_backend_identifier("runtime_id", runtime_id)?;
         let runtime = self.runtime(runtime_id)?;
         Ok(runtime.list_config_bundles())
+    }
+
+    pub fn send_protocol_method(
+        &self,
+        runtime_id: &str,
+        worker_id: &str,
+        method: protocol::Method,
+    ) -> Result<Vec<protocol::Event>, RuntimeRegistryError> {
+        validate_backend_identifier("runtime_id", runtime_id)?;
+        validate_backend_identifier("worker_id", worker_id)?;
+        let runtime = self.runtime(runtime_id)?;
+        let lookup = runtime.worker(worker_id);
+        if lookup.worker.is_none() {
+            return Err(operation_failed_or_unknown_worker(
+                runtime_id,
+                worker_id,
+                lookup.diagnostics,
+            ));
+        }
+        runtime.send_protocol_method(worker_id, method)
     }
 
     pub fn send_input(
@@ -1805,6 +1852,35 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 worker_ref,
             },
         ))
+    }
+
+    fn send_protocol_method(
+        &self,
+        worker_id: &str,
+        method: protocol::Method,
+    ) -> Result<Vec<protocol::Event>, RuntimeRegistryError> {
+        if !self.execution_enabled {
+            return Err(RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: "embedded_worker_execution_unavailable".to_string(),
+                message: format!(
+                    "worker protocol command for '{worker_id}' requires an embedded execution backend"
+                ),
+            });
+        }
+        let Some(worker_ref) = self.worker_ref(worker_id) else {
+            return Err(RuntimeRegistryError::UnknownWorker {
+                runtime_id: self.runtime_id.clone(),
+                worker_id: worker_id.to_string(),
+            });
+        };
+        self.runtime
+            .send_protocol_method(&worker_ref, method)
+            .map_err(|error| RuntimeRegistryError::RuntimeOperationFailed {
+                runtime_id: self.runtime_id.clone(),
+                code: "embedded_worker_protocol_command_failed".to_string(),
+                message: error.to_string(),
+            })
     }
 
     fn send_input(&self, worker_id: &str, request: WorkerInputRequest) -> WorkerInputResult {
