@@ -1,0 +1,12 @@
+target/
+.git/
+.yoi/
+.direnv/
+result
+result-*
+.env
+.env.*
+**/node_modules/
+web/workspace/build/
+web/workspace/.svelte-kit/
+web/workspace/.vite/
