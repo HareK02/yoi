@@ -8549,6 +8549,131 @@ mod tests {
             dir,
         )
     }
+
+    #[tokio::test]
+    async fn auth_passkey_session_and_device_login_flow_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_app(dir.path()).await;
+
+        let registration_options = post_json(
+            app.clone(),
+            "/api/auth/passkeys/registration/options",
+            json!({
+                "handle": "alice",
+                "display_name": "Alice"
+            }),
+        )
+        .await;
+        let registration_challenge = registration_options["challenge"].as_str().unwrap();
+        let registered = post_json(
+            app.clone(),
+            "/api/auth/passkeys/registration/complete",
+            json!({
+                "challenge": registration_challenge,
+                "credential_id": "credential-1",
+                "public_key_cose": "public-key-cose",
+                "transports": ["internal"]
+            }),
+        )
+        .await;
+        assert_eq!(registered["user"]["handle"], "alice");
+
+        let login_options = post_json(
+            app.clone(),
+            "/api/auth/passkeys/login/options",
+            json!({ "handle": "alice" }),
+        )
+        .await;
+        assert_eq!(
+            login_options["allow_credentials"][0]["credential_id"],
+            "credential-1"
+        );
+        let login_challenge = login_options["challenge"].as_str().unwrap();
+        let login_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/passkeys/login/complete")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "challenge": login_challenge,
+                            "credential_id": "credential-1"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login_response.status(), StatusCode::OK);
+        let cookie = login_response
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let login_bytes = to_bytes(login_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let login_json: Value = serde_json::from_slice(&login_bytes).unwrap();
+        assert_eq!(login_json["user"]["handle"], "alice");
+
+        let device = post_json(
+            app.clone(),
+            "/api/auth/device-login/start",
+            json!({ "client_name": "test cli" }),
+        )
+        .await;
+        let approved = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/device-login/approve")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("Cookie", cookie)
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "user_code": device["user_code"].as_str().unwrap()
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approved.status(), StatusCode::OK);
+
+        let polled = post_json(
+            app.clone(),
+            "/api/auth/device-login/poll",
+            json!({ "device_code": device["device_code"].as_str().unwrap() }),
+        )
+        .await;
+        assert_eq!(polled["status"], "approved");
+        let access_token = polled["access_token"].as_str().unwrap();
+
+        let whoami = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/auth/whoami")
+                    .header("Authorization", format!("Bearer {access_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(whoami.status(), StatusCode::OK);
+        let whoami_bytes = to_bytes(whoami.into_body(), usize::MAX).await.unwrap();
+        let whoami_json: Value = serde_json::from_slice(&whoami_bytes).unwrap();
+        assert_eq!(whoami_json["actor"]["handle"], "alice");
+        assert_eq!(whoami_json["actor"]["auth_method"], "api_token");
+    }
+
     async fn get_json(app: Router, uri: &str) -> Value {
         let response = app
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
