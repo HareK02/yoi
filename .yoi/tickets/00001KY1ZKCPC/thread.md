@@ -414,3 +414,52 @@ Verification:
 Note: `deno fmt --check` on the touched files still reports existing formatting changes outside this patch scope, so it was not used as the gating check for this small change.
 
 ---
+
+<!-- event: comment author: assistant at: 2026-07-22T07:12:46Z -->
+
+## Comment
+
+Requested Web Console tool-path display change before implementation:
+
+- Use the Worker's protocol `snapshot.greeting.cwd` as the display base.
+- For known display portions of edit-related tools plus `Read`, `Grep`, and `Glob`, show absolute paths relative to cwd.
+- Do not globally replace arbitrary tool output text; only rewrite known path-bearing parts of known tool display formats.
+
+Implementation plan:
+- Carry `greeting.cwd` through the Web Console projection state.
+- Add a focused display normalizer for known tool output formats:
+  - `Read ... from <path>` / read error path forms if present.
+  - grep result path prefixes such as `<path>:line:...` and summary lines like matching lines in files.
+  - glob found-path listing entries.
+  - edit/write-style success/error lines that explicitly include a file path.
+- Add focused model tests for the supported formats and keep transcript/protocol payloads unchanged.
+
+---
+
+<!-- event: implementation_report author: assistant at: 2026-07-22T07:23:32Z -->
+
+## Implementation report
+
+Implementation report for Web Console known tool-path display relativization:
+
+- Web Console projection now carries `snapshot.greeting.cwd` in `ConsoleProjection`.
+- Each `ToolCallView` captures the current cwd so later rendering can use the correct display base without changing protocol payloads or stored tool output.
+- Added path-display normalization scoped to known tool display formats only:
+  - `Read`: `file_path` display and `Read ... from <path>` summary/detail path.
+  - `Write`: `file_path` display and known `Created` / `Overwrote` / `Wrote` / related result-line path prefixes.
+  - `Edit`: `file_path` display and known `Edited <path> (...)` result-line path prefix.
+  - `Glob`: line-start cwd paths in result preview.
+  - `Grep`: line-start cwd paths in result preview, including `path:line:...` output.
+- Paths outside cwd are left absolute.
+- Arbitrary default tool output, Bash output, and argument JSON/details are not globally rewritten.
+
+Tests:
+- Added a focused Web model regression test with `snapshot.greeting.cwd = /repo` covering Read/Write/Edit/Glob/Grep display output.
+- The test asserts cwd-contained paths become relative while `/outside/...` paths remain absolute.
+
+Verification:
+- `cd web/workspace && deno test --allow-read=src --allow-env=VSCODE_TEXTMATE_DEBUG src/lib/workspace/console/model.test.ts`
+- `cd web/workspace && deno task check` passed with 0 errors; it still reports the existing 2 a11y warnings in `+page.svelte`.
+- `git diff --check`
+
+---

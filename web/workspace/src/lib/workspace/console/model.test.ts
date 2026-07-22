@@ -36,6 +36,27 @@ function consoleLine(id: string, kind: ConsoleLine["kind"]): ConsoleLine {
   };
 }
 
+function snapshotEvent(cwd: string): Event {
+  return {
+    event: "snapshot",
+    data: {
+      entries: [],
+      greeting: {
+        worker_name: "Worker",
+        cwd,
+        provider: "provider",
+        model: "model",
+        scope_summary: "bounded",
+        tools: [],
+        context_window: 100,
+        context_tokens: 20,
+      },
+      status: "idle",
+      in_flight: { blocks: [] },
+    },
+  };
+}
+
 Deno.test("workerConsoleHref encodes runtime and worker target authority", () => {
   assert(
     workerConsoleHref({
@@ -884,5 +905,158 @@ Deno.test("selectConsoleTimelineLines keeps all users and only last assistant pe
   assertEquals(
     selectConsoleTimelineLines(items).map(({ item, index }) => `${index}:${item.id}`),
     ["0:u1", "3:a2", "4:u2", "6:a4"],
+  );
+});
+
+Deno.test("projectConsole relativizes known tool path displays from snapshot cwd", () => {
+  const projection = projectConsole([
+    { eventId: "cwd-0", event: snapshotEvent("/repo") },
+    {
+      eventId: "cwd-1",
+      event: {
+        event: "tool_call_done",
+        data: {
+          id: "read-rel",
+          name: "Read",
+          arguments: JSON.stringify({ file_path: "/repo/src/main.rs" }),
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "cwd-2",
+      event: {
+        event: "tool_result",
+        data: {
+          id: "read-rel",
+          summary: "Read 4 line(s) [1..4] of 20 from /repo/src/main.rs",
+          is_error: false,
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "cwd-3",
+      event: {
+        event: "tool_call_done",
+        data: {
+          id: "write-rel",
+          name: "Write",
+          arguments: JSON.stringify({ file_path: "/repo/out.txt", content: "ok" }),
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "cwd-4",
+      event: {
+        event: "tool_result",
+        data: {
+          id: "write-rel",
+          summary: "Wrote /repo/out.txt",
+          output: "Wrote /repo/out.txt",
+          is_error: false,
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "cwd-5",
+      event: {
+        event: "tool_call_done",
+        data: {
+          id: "edit-rel",
+          name: "Edit",
+          arguments: JSON.stringify({
+            file_path: "/repo/src/main.rs",
+            old_string: "a",
+            new_string: "b",
+          }),
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "cwd-6",
+      event: {
+        event: "tool_result",
+        data: {
+          id: "edit-rel",
+          summary: "Edited /repo/src/main.rs (1 replacement)",
+          output: "Edited /repo/src/main.rs (1 replacement)",
+          is_error: false,
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "cwd-7",
+      event: {
+        event: "tool_call_done",
+        data: {
+          id: "glob-rel",
+          name: "Glob",
+          arguments: JSON.stringify({ path: "/repo", pattern: "**/*.rs" }),
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "cwd-8",
+      event: {
+        event: "tool_result",
+        data: {
+          id: "glob-rel",
+          summary: "Found 2 file(s) matching **/*.rs",
+          output: "Found 2 file(s) matching **/*.rs\n/repo/src/main.rs\n/outside/lib.rs",
+          is_error: false,
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "cwd-9",
+      event: {
+        event: "tool_call_done",
+        data: {
+          id: "grep-rel",
+          name: "Grep",
+          arguments: JSON.stringify({ pattern: "needle", path: "/repo" }),
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "cwd-10",
+      event: {
+        event: "tool_result",
+        data: {
+          id: "grep-rel",
+          summary: "2 matching line(s) in 2 file(s)",
+          output: "/repo/src/main.rs:12:needle\n/outside/lib.rs:1:needle",
+          is_error: false,
+        },
+      } satisfies Event,
+    },
+  ]);
+
+  const bodies = projection.lines.filter((line) => line.kind === "tool").map((line) => line.body);
+  assertEquals(bodies[0], "Read — 1 file read\n  src/main.rs");
+  assert(
+    projection.lines[0].detail?.includes("from src/main.rs"),
+    "Read summary detail path should be relative",
+  );
+  assert(
+    bodies.some((body) => body.includes("Write — out.txt") && body.includes("Wrote out.txt")),
+    "Write header and known result path should be relative",
+  );
+  assert(
+    bodies.some((body) =>
+      body.includes("Edit — src/main.rs") && body.includes("Edited src/main.rs")
+    ),
+    "Edit header and known result path should be relative",
+  );
+  assert(
+    bodies.some((body) =>
+      body.includes("src/main.rs") && body.includes("/outside/lib.rs")
+    ),
+    "Glob should relativize cwd paths and keep outside paths absolute",
+  );
+  assert(
+    bodies.some((body) =>
+      body.includes("src/main.rs:12:needle") && body.includes("/outside/lib.rs:1:needle")
+    ),
+    "Grep should relativize line-start cwd paths and keep outside paths absolute",
   );
 });

@@ -34,6 +34,7 @@ type ToolCallView = {
   summary?: string;
   output?: string | null;
   isError?: boolean;
+  cwd?: string | null;
 };
 
 export type ConsoleDiffLine = {
@@ -61,6 +62,7 @@ export type ConsoleProjection = {
   lines: ConsoleLine[];
   status: string | null;
   usage: string | null;
+  cwd: string | null;
   lastEventId: string | null;
 };
 
@@ -138,6 +140,7 @@ export function emptyConsoleProjection(): ConsoleProjection {
     lines: [],
     status: null,
     usage: null,
+    cwd: null,
     lastEventId: null,
   };
 }
@@ -183,6 +186,7 @@ export function applyProtocolEvent(
     lines: [...projection.lines],
     status: projection.status,
     usage: projection.usage,
+    cwd: projection.cwd,
     lastEventId: envelope.eventId,
   };
   const event = envelope.event;
@@ -284,16 +288,21 @@ export function applyProtocolEvent(
       break;
     case "snapshot":
       next.status = event.data.status;
-      next.lines = snapshotLinesFromEntries(envelope.eventId, event.data.entries);
+      next.cwd = event.data.greeting.cwd;
+      next.lines = snapshotLinesFromEntries(
+        envelope.eventId,
+        event.data.entries,
+        next.cwd,
+      );
       for (const block of event.data.in_flight?.blocks ?? []) {
-        next.lines.push(inFlightLine(envelope.eventId, block));
+        next.lines.push(inFlightLine(envelope.eventId, block, next.cwd));
       }
       break;
     case "status":
       next.status = event.data.status;
       break;
     case "segment_rotated":
-      next.lines = snapshotLinesFromEntries(envelope.eventId, [event.data.entry]);
+      next.lines = snapshotLinesFromEntries(envelope.eventId, [event.data.entry], next.cwd);
       break;
     case "invoke_start":
     case "turn_start":
@@ -504,6 +513,7 @@ function upsertToolCall(
       summary: update.summary,
       output: update.output,
       isError: update.isError,
+      cwd: update.cwd ?? projection.cwd,
     });
     projection.lines.push(created);
     return created;
@@ -518,6 +528,7 @@ function upsertToolCall(
       ...update,
       id,
       name: update.name ?? existing.toolCall!.name,
+      cwd: update.cwd ?? existing.toolCall!.cwd ?? projection.cwd,
     },
   });
   projection.lines[index] = updated;
@@ -537,6 +548,7 @@ function appendToolArgs(
       name: "Tool",
       argsStream: delta,
       state: "streaming_args",
+      cwd: projection.cwd,
     }));
     return;
   }
@@ -567,6 +579,7 @@ function attachToolResult(
         name: "Tool",
         argsStream: "",
         state: result.isError ? "error" : "done",
+        cwd: projection.cwd,
         ...result,
       }),
       title: result.isError ? "Call · Tool result error" : "Call · Tool result",
@@ -703,6 +716,10 @@ function readAggregateLine(group: ConsoleLine[]): ConsoleLine {
 }
 
 function readPath(toolCall: ToolCallView): string {
+  return displayPath(readRawPath(toolCall), toolCall.cwd);
+}
+
+function readRawPath(toolCall: ToolCallView): string {
   const args = parsedArgs(toolCall);
   return stringField(args, "file_path") ?? "?";
 }
@@ -712,37 +729,37 @@ function readDetail(toolCall: ToolCallView): string {
     `id: ${toolCall.id}`,
     `state: ${stateSuffix(toolCall.state)}`,
     `path: ${readPath(toolCall)}`,
-    toolCall.summary ? `summary: ${toolCall.summary}` : undefined,
+    toolCall.summary
+      ? `summary: ${normalizeKnownToolResult(toolCall.name, toolCall.summary, toolCall.cwd)}`
+      : undefined,
   ]);
 }
 
 function renderReadTool(toolCall: ToolCallView): string {
-  const args = parsedArgs(toolCall);
-  const path = stringField(args, "file_path") ?? "?";
-  return `Read — ${path} (${stateSuffix(toolCall.state)})`;
+  return `Read — ${readPath(toolCall)} (${stateSuffix(toolCall.state)})`;
 }
 
 function renderWriteTool(toolCall: ToolCallView): string {
   const args = parsedArgs(toolCall);
-  const path = stringField(args, "file_path") ?? "?";
+  const path = displayPath(stringField(args, "file_path") ?? "?", toolCall.cwd);
   const content = stringField(args, "content");
   return compactLines([
     `Write — ${path} (${stateSuffix(toolCall.state)})`,
     cappedSection(content, 5),
-    resultText(toolCall),
+    knownToolResultText(toolCall),
   ]);
 }
 
 function renderEditTool(toolCall: ToolCallView): string {
   const args = parsedArgs(toolCall);
-  const path = stringField(args, "file_path") ?? "?";
+  const path = displayPath(stringField(args, "file_path") ?? "?", toolCall.cwd);
   const diff = editDiff(toolCall) ?? [];
   const removes = diff.filter((line) => line.kind === "remove").length;
   const adds = diff.filter((line) => line.kind === "add").length;
   return compactLines([
     `Edit — ${path} (${stateSuffix(toolCall.state)})`,
     diff.length > 0 ? `diff: -${removes} +${adds}` : undefined,
-    resultText(toolCall),
+    knownToolResultText(toolCall),
   ]);
 }
 
@@ -829,7 +846,7 @@ function renderSearchTool(toolCall: ToolCallView): string {
   const summary = toolCall.summary?.trim();
   return compactLines([
     `${toolCall.name} — ${toolHeaderSuffix(toolCall, summary)}`,
-    resultText(toolCall),
+    knownToolResultText(toolCall),
   ]);
 }
 
@@ -838,7 +855,7 @@ function renderGrepTool(toolCall: ToolCallView): string {
   return compactLines([
     `Grep — ${toolHeaderSuffix(toolCall, summary)}`,
     grepQueryText(toolCall),
-    cappedResultSection(resultText(toolCall), 5),
+    cappedResultSection(knownToolResultText(toolCall), 5),
   ]);
 }
 
@@ -884,7 +901,9 @@ function toolCallDetail(toolCall: ToolCallView): string {
   return compactLines([
     `id: ${toolCall.id}`,
     `state: ${stateSuffix(toolCall.state)}`,
-    toolCall.summary ? `summary: ${toolCall.summary}` : undefined,
+    toolCall.summary
+      ? `summary: ${normalizeKnownToolResult(toolCall.name, toolCall.summary, toolCall.cwd)}`
+      : undefined,
     argsText(toolCall) ? `arguments:\n${argsText(toolCall)}` : undefined,
   ]);
 }
@@ -894,6 +913,84 @@ function resultText(toolCall: ToolCallView): string | undefined {
     return toolCall.output;
   }
   return toolCall.summary;
+}
+
+function knownToolResultText(toolCall: ToolCallView): string | undefined {
+  const text = resultText(toolCall);
+  if (!text) return undefined;
+  return normalizeKnownToolResult(toolCall.name, text, toolCall.cwd);
+}
+
+function normalizeKnownToolResult(
+  toolName: string,
+  text: string,
+  cwd: string | null | undefined,
+): string {
+  if (!cwd) return text;
+  switch (toolName) {
+    case "Read":
+      return normalizeReadResultPaths(text, cwd);
+    case "Grep":
+      return normalizeLineStartPaths(text, cwd);
+    case "Glob":
+      return normalizeLineStartPaths(text, cwd);
+    case "Edit":
+    case "Write":
+      return normalizeEditResultPaths(text, cwd);
+    default:
+      return text;
+  }
+}
+
+function displayPath(path: string, cwd: string | null | undefined): string {
+  if (!cwd || !path.startsWith("/")) return path;
+  const normalizedCwd = cwd.endsWith("/") ? cwd.slice(0, -1) : cwd;
+  if (path === normalizedCwd) return ".";
+  const prefix = `${normalizedCwd}/`;
+  return path.startsWith(prefix) ? path.slice(prefix.length) : path;
+}
+
+function normalizeReadResultPaths(text: string, cwd: string): string {
+  return text.split("\n").map((line) => {
+    const readMatch = line.match(
+      /^(Read \d+ line\(s\)(?: \[[^\]]+\])?(?: of \d+)? from )(.+)$/,
+    );
+    if (readMatch) {
+      return `${readMatch[1]}${displayPath(readMatch[2], cwd)}`;
+    }
+    return normalizeKnownPathSuffix(line, cwd);
+  }).join("\n");
+}
+
+function normalizeEditResultPaths(text: string, cwd: string): string {
+  return text.split("\n").map((line) => {
+    const simpleMatch = line.match(
+      /^(Edited |Wrote |Created |Overwrote |Deleted )(.+?)( \(.+\))?$/,
+    );
+    if (simpleMatch) {
+      return `${simpleMatch[1]}${displayPath(simpleMatch[2], cwd)}${
+        simpleMatch[3] ?? ""
+      }`;
+    }
+    return normalizeKnownPathSuffix(line, cwd);
+  }).join("\n");
+}
+
+function normalizeKnownPathSuffix(line: string, cwd: string): string {
+  const match = line.match(
+    /^(.*\b(?:from|path|file not found|not a directory): )(.+)$/,
+  );
+  if (!match) return line;
+  return `${match[1]}${displayPath(match[2], cwd)}`;
+}
+
+function normalizeLineStartPaths(text: string, cwd: string): string {
+  const normalizedCwd = cwd.endsWith("/") ? cwd.slice(0, -1) : cwd;
+  const prefix = `${normalizedCwd}/`;
+  return text.split("\n").map((line) => {
+    if (line === normalizedCwd) return ".";
+    return line.startsWith(prefix) ? line.slice(prefix.length) : line;
+  }).join("\n");
 }
 
 function argsText(toolCall: ToolCallView): string {
@@ -992,14 +1089,21 @@ function usageText(
   } · cache ${data.cache_read_input_tokens ?? "unknown"}`;
 }
 
-function snapshotLinesFromEntries(eventId: string, entries: unknown[]): ConsoleLine[] {
+function snapshotLinesFromEntries(
+  eventId: string,
+  entries: unknown[],
+  cwd: string | null,
+): ConsoleLine[] {
   const projection: ConsoleProjection = {
     lines: [],
     status: null,
     usage: null,
+    cwd,
     lastEventId: eventId,
   };
-  entries.forEach((entry, index) => applyLogEntry(projection, `${eventId}-snapshot-${index}`, entry));
+  entries.forEach((entry, index) =>
+    applyLogEntry(projection, `${eventId}-snapshot-${index}`, entry)
+  );
   return projection.lines;
 }
 
@@ -1143,7 +1247,11 @@ function loggedContentText(parts: unknown[]): string {
     .join("\n");
 }
 
-function inFlightLine(eventId: string, block: InFlightBlock): ConsoleLine {
+function inFlightLine(
+  eventId: string,
+  block: InFlightBlock,
+  cwd: string | null,
+): ConsoleLine {
   switch (block.kind) {
     case "text":
       return line(
@@ -1170,6 +1278,7 @@ function inFlightLine(eventId: string, block: InFlightBlock): ConsoleLine {
         argsStream: block.args,
         arguments: block.state === "done" ? block.args : undefined,
         state: inFlightToolState(block.state),
+        cwd,
       });
   }
 }
