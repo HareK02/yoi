@@ -34,15 +34,15 @@ impl WorkspaceHttpMemoryBackend {
         }
     }
 
-    pub fn execute_operation(
+    pub async fn execute_operation(
         &self,
         operation: MemoryBackendOperation,
     ) -> Result<MemoryBackendOperationResult, WorkspaceMemoryBackendError> {
-        execute_http_memory_backend(&self.workspace_id, &self.base_url, operation)
+        execute_http_memory_backend(&self.workspace_id, &self.base_url, operation).await
     }
 
-    fn execute(&self, operation: MemoryBackendOperation) -> Result<ToolOutput, ToolError> {
-        match self.execute_operation(operation) {
+    async fn execute(&self, operation: MemoryBackendOperation) -> Result<ToolOutput, ToolError> {
+        match self.execute_operation(operation).await {
             Ok(MemoryBackendOperationResult::ToolOutput(output)) => Ok(tool_output(output)),
             Ok(result) => Err(ToolError::ExecutionFailed(format!(
                 "unexpected memory backend result for model-visible tool: {result:?}"
@@ -70,7 +70,7 @@ pub enum WorkspaceMemoryBackendError {
 }
 
 impl WorkspaceClient {
-    pub fn execute_memory_backend_operation(
+    pub async fn execute_memory_backend_operation(
         &self,
         operation: MemoryBackendOperation,
     ) -> Result<MemoryBackendOperationResult, WorkspaceMemoryBackendError> {
@@ -78,7 +78,7 @@ impl WorkspaceClient {
             WorkspaceClient::Http {
                 workspace_id,
                 base_url,
-            } => execute_http_memory_backend(workspace_id, base_url, operation),
+            } => execute_http_memory_backend(workspace_id, base_url, operation).await,
             WorkspaceClient::Available { kind } => Err(WorkspaceMemoryBackendError::Unavailable {
                 reason: format!(
                     "workspace client kind `{kind}` does not expose the Backend Workspace API"
@@ -93,7 +93,7 @@ impl WorkspaceClient {
     }
 }
 
-fn execute_http_memory_backend(
+async fn execute_http_memory_backend(
     workspace_id: &str,
     base_url: &str,
     operation: MemoryBackendOperation,
@@ -103,12 +103,13 @@ fn execute_http_memory_backend(
         base_url.trim_end_matches('/'),
         workspace_id
     );
-    let response = reqwest::blocking::Client::new()
+    let response = reqwest::Client::new()
         .post(url)
         .json(&operation)
-        .send()?;
+        .send()
+        .await?;
     let status = response.status();
-    let body = response.text()?;
+    let body = response.text().await?;
     if !status.is_success() {
         return Err(WorkspaceMemoryBackendError::Http { status, body });
     }
@@ -220,7 +221,7 @@ impl Tool for WorkspaceHttpMemoryTool {
         _ctx: ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let operation = (self.build)(input_json)?;
-        self.backend.execute(operation)
+        self.backend.execute(operation).await
     }
 }
 

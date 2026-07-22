@@ -897,12 +897,17 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         self.workspace_context.client()
     }
 
-    fn resident_summary_from_workspace_authority(&self) -> Result<Option<String>, WorkerError> {
-        let result = self.workspace_client().execute_memory_backend_operation(
-            memory::backend::MemoryBackendOperation::ResidentSummary(
-                memory::backend::MemoryResidentSummaryOperation::default(),
-            ),
-        )?;
+    async fn resident_summary_from_workspace_authority(
+        &self,
+    ) -> Result<Option<String>, WorkerError> {
+        let result = self
+            .workspace_client()
+            .execute_memory_backend_operation(
+                memory::backend::MemoryBackendOperation::ResidentSummary(
+                    memory::backend::MemoryResidentSummaryOperation::default(),
+                ),
+            )
+            .await?;
         match result {
             memory::backend::MemoryBackendOperationResult::ToolOutput(output) => Ok(output.content),
             other => Err(WorkerError::FeatureInstall(format!(
@@ -1465,7 +1470,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// Subsequent invocations are no-ops: the template field is
     /// consumed with `Option::take()`, so the materialised value
     /// persists across all later turns and compaction.
-    fn ensure_system_prompt_materialized(&mut self) -> Result<(), WorkerError> {
+    async fn ensure_system_prompt_materialized(&mut self) -> Result<(), WorkerError> {
         let Some(template) = self.system_prompt_template.take() else {
             return Ok(());
         };
@@ -1498,7 +1503,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 .as_ref()
                 .is_some_and(|m| m.inject_summary.unwrap_or(true));
         let resident_summary: Option<String> = if inject_summary {
-            match self.resident_summary_from_workspace_authority() {
+            match self.resident_summary_from_workspace_authority().await {
                 Ok(summary) => summary,
                 Err(error) => {
                     tracing::debug!(%error, "resident memory summary unavailable");
@@ -1579,7 +1584,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
     /// first so extract sees a stable history range).
     async fn prepare_for_run(&mut self) -> Result<(), WorkerError> {
         self.ensure_interceptor_installed();
-        self.ensure_system_prompt_materialized()?;
+        self.ensure_system_prompt_materialized().await?;
         self.cleanup_finished_memory_task();
         self.ensure_segment_head()?;
         if self.should_pre_run_compact() {
@@ -2897,7 +2902,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 None,
                 None,
                 None,
-            );
+            )
+            .await;
             return Ok(());
         };
 
@@ -2926,7 +2932,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                     None,
                     None,
                     None,
-                );
+                )
+                .await;
                 return Ok(());
             }
             let result = self.run_extract_once(&memory_cfg, threshold).await;
@@ -2997,7 +3004,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 None,
                 None,
                 None,
-            );
+            ).await;
             return Ok(ExtractDecision::Skipped);
         }
 
@@ -3008,18 +3015,23 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             .history()
             .len();
         if current_history_len <= processed_history_len {
-            audit.emit(
-                self.workspace_client(),
-                event_tx,
-                memory::audit::WorkerLifecycleStatus::Skipped,
-                "no_new_history_items",
-                None,
-                Some(memory::audit::ExtractAudit {
-                    history_range: Some([processed_history_len as u64, current_history_len as u64]),
-                    ..Default::default()
-                }),
-                None,
-            );
+            audit
+                .emit(
+                    self.workspace_client(),
+                    event_tx,
+                    memory::audit::WorkerLifecycleStatus::Skipped,
+                    "no_new_history_items",
+                    None,
+                    Some(memory::audit::ExtractAudit {
+                        history_range: Some([
+                            processed_history_len as u64,
+                            current_history_len as u64,
+                        ]),
+                        ..Default::default()
+                    }),
+                    None,
+                )
+                .await;
             return Ok(ExtractDecision::Skipped);
         }
 
@@ -3031,15 +3043,17 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             .read_all(self.session_id(), self.segment_id())?
             .len();
         if entries_now == 0 {
-            audit.emit(
-                self.workspace_client(),
-                event_tx,
-                memory::audit::WorkerLifecycleStatus::Skipped,
-                "empty_segment_log",
-                None,
-                None,
-                None,
-            );
+            audit
+                .emit(
+                    self.workspace_client(),
+                    event_tx,
+                    memory::audit::WorkerLifecycleStatus::Skipped,
+                    "empty_segment_log",
+                    None,
+                    None,
+                    None,
+                )
+                .await;
             return Ok(ExtractDecision::Skipped);
         }
         let end_entry = entries_now - 1;
@@ -3048,21 +3062,26 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             .map(|p| p.processed_through_entry + 1)
             .unwrap_or(0);
         if start_entry > end_entry {
-            audit.emit(
-                self.workspace_client(),
-                event_tx,
-                memory::audit::WorkerLifecycleStatus::Skipped,
-                "no_new_segment_entries",
-                None,
-                Some(memory::audit::ExtractAudit {
-                    session_id: Some(self.session_id().to_string()),
-                    segment_id: Some(self.segment_id().to_string()),
-                    entry_range: Some([start_entry as u64, end_entry as u64]),
-                    history_range: Some([processed_history_len as u64, current_history_len as u64]),
-                    ..Default::default()
-                }),
-                None,
-            );
+            audit
+                .emit(
+                    self.workspace_client(),
+                    event_tx,
+                    memory::audit::WorkerLifecycleStatus::Skipped,
+                    "no_new_segment_entries",
+                    None,
+                    Some(memory::audit::ExtractAudit {
+                        session_id: Some(self.session_id().to_string()),
+                        segment_id: Some(self.segment_id().to_string()),
+                        entry_range: Some([start_entry as u64, end_entry as u64]),
+                        history_range: Some([
+                            processed_history_len as u64,
+                            current_history_len as u64,
+                        ]),
+                        ..Default::default()
+                    }),
+                    None,
+                )
+                .await;
             return Ok(ExtractDecision::Skipped);
         }
 
@@ -3073,15 +3092,19 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             history_range: Some([processed_history_len as u64, current_history_len as u64]),
             ..Default::default()
         };
-        audit.emit(
-            self.workspace_client(),
-            event_tx,
-            memory::audit::WorkerLifecycleStatus::Started,
-            format!("token_threshold_reached tokens_since={tokens_since} threshold={threshold}"),
-            None,
-            Some(extract_audit_base.clone()),
-            None,
-        );
+        audit
+            .emit(
+                self.workspace_client(),
+                event_tx,
+                memory::audit::WorkerLifecycleStatus::Started,
+                format!(
+                    "token_threshold_reached tokens_since={tokens_since} threshold={threshold}"
+                ),
+                None,
+                Some(extract_audit_base.clone()),
+                None,
+            )
+            .await;
 
         let items_to_extract = self.engine.as_ref().expect("worker present").history()
             [processed_history_len..current_history_len]
@@ -3094,15 +3117,17 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let client = match self.build_extractor_client(memory_cfg) {
             Ok(client) => client,
             Err(err) => {
-                audit.emit(
-                    self.workspace_client(),
-                    event_tx,
-                    memory::audit::WorkerLifecycleStatus::Failed,
-                    format!("client_build_failed: {err}"),
-                    None,
-                    Some(extract_audit_base),
-                    None,
-                );
+                audit
+                    .emit(
+                        self.workspace_client(),
+                        event_tx,
+                        memory::audit::WorkerLifecycleStatus::Failed,
+                        format!("client_build_failed: {err}"),
+                        None,
+                        Some(extract_audit_base),
+                        None,
+                    )
+                    .await;
                 return Err(err);
             }
         };
@@ -3110,15 +3135,17 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         let extract_system_prompt = match self.prompts.memory_extract_system(memory_language) {
             Ok(prompt) => prompt,
             Err(err) => {
-                audit.emit(
-                    self.workspace_client(),
-                    event_tx,
-                    memory::audit::WorkerLifecycleStatus::Failed,
-                    format!("prompt_render_failed: {err}"),
-                    None,
-                    Some(extract_audit_base),
-                    None,
-                );
+                audit
+                    .emit(
+                        self.workspace_client(),
+                        event_tx,
+                        memory::audit::WorkerLifecycleStatus::Failed,
+                        format!("prompt_render_failed: {err}"),
+                        None,
+                        Some(extract_audit_base),
+                        None,
+                    )
+                    .await;
                 return Err(WorkerError::PromptCatalog(err));
             }
         };
@@ -3151,15 +3178,17 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
                 .iter()
                 .any(|installed| installed == name)
         }) {
-            audit.emit(
-                self.workspace_client(),
-                event_tx,
-                memory::audit::WorkerLifecycleStatus::Failed,
-                "session_explore_feature_install_failed",
-                None,
-                Some(extract_audit_base),
-                None,
-            );
+            audit
+                .emit(
+                    self.workspace_client(),
+                    event_tx,
+                    memory::audit::WorkerLifecycleStatus::Failed,
+                    "session_explore_feature_install_failed",
+                    None,
+                    Some(extract_audit_base),
+                    None,
+                )
+                .await;
             return Err(WorkerError::FeatureInstall(
                 "session-explore feature install failed".to_string(),
             ));
@@ -3178,15 +3207,17 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             Ok(result) => result.usage.as_ref().map(usage_audit_from_event),
             Err(err) => {
                 let usage = err.usage.as_ref().map(usage_audit_from_event);
-                audit.emit(
-                    self.workspace_client(),
-                    event_tx,
-                    lifecycle_status_for_worker_error(&err.source),
-                    format!("worker_failed: {}", err.source),
-                    usage,
-                    Some(extract_audit_base),
-                    None,
-                );
+                audit
+                    .emit(
+                        self.workspace_client(),
+                        event_tx,
+                        lifecycle_status_for_worker_error(&err.source),
+                        format!("worker_failed: {}", err.source),
+                        usage,
+                        Some(extract_audit_base),
+                        None,
+                    )
+                    .await;
                 return Err(WorkerError::Engine(err.source));
             }
         };
@@ -3228,15 +3259,17 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         } else {
             "completed_staging_written"
         };
-        audit.emit(
-            self.workspace_client(),
-            event_tx,
-            memory::audit::WorkerLifecycleStatus::Completed,
-            reason,
-            usage,
-            Some(extract_audit),
-            None,
-        );
+        audit
+            .emit(
+                self.workspace_client(),
+                event_tx,
+                memory::audit::WorkerLifecycleStatus::Completed,
+                reason,
+                usage,
+                Some(extract_audit),
+                None,
+            )
+            .await;
 
         Ok(ExtractDecision::Completed)
     }
@@ -3274,7 +3307,8 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             None,
             None,
             None,
-        );
+        )
+        .await;
         if reason == "consolidation_backend_operation_unavailable" {
             tracing::debug!(
                 "workspace memory consolidation skipped: backend operation is unavailable"
@@ -3357,7 +3391,7 @@ impl WorkerAuditBase {
         }
     }
 
-    fn emit(
+    async fn emit(
         &self,
         workspace_client: &WorkspaceClient,
         event_tx: Option<&broadcast::Sender<Event>>,
@@ -3379,15 +3413,15 @@ impl WorkerAuditBase {
             extract,
             consolidation,
         };
-        let _ = workspace_client.execute_memory_backend_operation(
-            memory::backend::MemoryBackendOperation::AppendAudit(
+        let _ = workspace_client
+            .execute_memory_backend_operation(memory::backend::MemoryBackendOperation::AppendAudit(
                 memory::backend::MemoryAppendAuditOperation {
                     event: memory::audit::AuditEvent::new(
                         memory::audit::AuditPayload::WorkerLifecycle(payload),
                     ),
                 },
-            ),
-        );
+            ))
+            .await;
         if should_emit_memory_worker_event(self.worker, status, &reason) {
             emit_memory_worker_event(
                 event_tx,
@@ -5552,7 +5586,7 @@ mod build_summary_prompt_tests {
         )
         .unwrap();
         worker.set_system_prompt_template(template);
-        worker.ensure_system_prompt_materialized().unwrap();
+        worker.ensure_system_prompt_materialized().await.unwrap();
         worker.engine().get_system_prompt().unwrap().to_string()
     }
 
@@ -5583,17 +5617,15 @@ mod build_summary_prompt_tests {
             let mut buffer = [0_u8; 1024];
             let _ = stream.read(&mut buffer).unwrap();
             let body = serde_json::json!({
-                "Ok": {
-                    "result": {
-                        "ToolOutput": {
-                            "summary": if content.is_some() {
-                                "resident memory summary collected"
-                            } else {
-                                "resident memory summary unavailable"
-                            },
-                            "content": content,
-                        }
-                    }
+                "status": "ok",
+                "result": {
+                    "kind": "tool_output",
+                    "summary": if content.is_some() {
+                        "resident memory summary collected"
+                    } else {
+                        "resident memory summary unavailable"
+                    },
+                    "content": content,
                 }
             })
             .to_string();

@@ -433,6 +433,7 @@ impl Tool for StageCandidateTool {
                     source_refs,
                 },
             ))
+            .await
             .map_err(|e| ToolError::ExecutionFailed(format!("write staging failed: {e}")))?;
         let ids = match result {
             MemoryBackendOperationResult::StagingWritten(output) if output.staging_count == 1 => {
@@ -713,7 +714,7 @@ mod tests {
     #[tokio::test]
     async fn stage_candidate_writes_staging_record_with_source_evidence() {
         let (client, request_rx) = stub_memory_backend_response(
-            r#"{"Ok":{"result":{"StagingWritten":{"staging_count":1,"staging_ids":["00000000-0000-7000-8000-000000000001"]}}}}"#,
+            r#"{"status":"ok","result":{"kind":"staging_written","staging_count":1,"staging_ids":["00000000-0000-7000-8000-000000000001"]}}"#,
         );
         let state = SessionExploreState::new(
             SessionReferenceView::new("segment-1", vec![Item::user_message("durable decision")]),
@@ -745,7 +746,7 @@ mod tests {
             vec!["00000000-0000-7000-8000-000000000001".to_string()]
         );
         let request = request_rx.recv().unwrap();
-        assert!(request.contains("\"StageCandidate\""));
+        assert!(request.contains("\"operation\":\"stage_candidate\""));
         assert!(request.contains("\"kind\":\"decision\""));
         assert!(request.contains("\"id\":\"M0000\""));
         assert!(request.contains("\"evidence_id\":\"M0000\""));
