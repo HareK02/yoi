@@ -1,0 +1,38 @@
+name: yoi
+
+services:
+  runtime:
+    image: yoi-runtime:latest
+    pull_policy: never
+    restart: unless-stopped
+    expose:
+      - "38800"
+    volumes:
+      - runtime-data:/runtime-data
+      - runtime-workdirs:/workdirs
+
+  server:
+    image: yoi-server:latest
+    pull_policy: never
+    restart: unless-stopped
+    depends_on:
+      - runtime
+    expose:
+      - "8787"
+    volumes:
+      - server-data:/server-data
+      - ./docker/workspace:/workspace:ro
+
+  webui:
+    image: yoi-webui:latest
+    pull_policy: never
+    restart: unless-stopped
+    depends_on:
+      - server
+    ports:
+      - "${YOI_WEBUI_PORT:-8080}:80"
+
+volumes:
+  runtime-data:
+  runtime-workdirs:
+  server-data:

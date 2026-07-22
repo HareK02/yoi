@@ -16,10 +16,12 @@ let
 
   runtimeDirs = pkgs.runCommand "yoi-runtime-dirs" { } ''
     mkdir -p "$out/runtime-data" "$out/workdirs"
+    chmod 0777 "$out/runtime-data" "$out/workdirs"
   '';
 
   serverDirs = pkgs.runCommand "yoi-server-dirs" { } ''
     mkdir -p "$out/server-data" "$out/workspace"
+    chmod 0777 "$out/server-data" "$out/workspace"
   '';
 
   runtimeRoot =
@@ -248,7 +250,6 @@ in
         "/runtime-data" = { };
         "/workdirs" = { };
       };
-      User = "10001:0";
       WorkingDir = "/runtime-data";
     };
   };
@@ -276,7 +277,6 @@ in
         "/server-data" = { };
         "/workspace" = { };
       };
-      User = "10002:0";
       WorkingDir = "/server-data";
     };
   };

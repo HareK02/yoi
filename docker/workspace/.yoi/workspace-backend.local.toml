@@ -1,0 +1,16 @@
+[server]
+listen = "0.0.0.0:8787"
+frontend_url = "http://127.0.0.1:8080"
+
+[data]
+root = "/server-data"
+workspace_database_path = "/server-data/workspace.db"
+embedded_runtime_store_root = "/server-data/embedded-runtime"
+
+[limits]
+max_records = 200
+
+[[runtimes.remote]]
+id = "docker-runtime"
+endpoint = "http://runtime:38800"
+display_name = "Docker Runtime"
