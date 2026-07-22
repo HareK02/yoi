@@ -324,6 +324,8 @@
         if (token.kind === "command") {
             return localCommandCompletions(token.prefix);
         }
+        const completionKind = token.kind;
+        const completionPrefix = token.prefix;
         return new Promise((resolve, reject) => {
             if (pendingCompletionRequest) {
                 rejectPendingCompletion(
@@ -339,7 +341,7 @@
             try {
                 sendProtocolMethod({
                     method: "list_completions",
-                    params: { kind: token.kind, prefix: token.prefix },
+                    params: { kind: completionKind, prefix: completionPrefix },
                 });
             } catch (error) {
                 rejectPendingCompletion(

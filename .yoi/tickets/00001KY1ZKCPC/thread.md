@@ -341,3 +341,38 @@ Verification:
 - `git diff --check`
 
 ---
+
+<!-- event: comment author: assistant at: 2026-07-22T06:25:37Z -->
+
+## Comment
+
+Reported issue before implementation:
+
+- TUI shows the `Compacting...` progress/status indication.
+- Web Console does not show the same indication.
+
+Investigation plan:
+- Compare TUI protocol/event handling with Web Console protocol/event handling.
+- Confirm whether the relevant protocol event reaches the browser and is dropped by frontend state/rendering, or whether the event is not forwarded through the Backend/runtime protocol WS path.
+- Fix the narrow missing mapping/rendering path without adding a synthetic event outside the normal Worker protocol/session flow.
+
+---
+
+<!-- event: implementation_report author: assistant at: 2026-07-22T06:36:51Z -->
+
+## Implementation report
+
+Implementation report for Web Console compact/rotation display gap:
+
+- Web Console already handled live `compact_start` by projecting a `Compacting…` status row.
+- The projection was still ignoring `segment_rotated`, while TUI reseeds the visible transcript from the new segment start entry. This made Web diverge around compaction/segment-rotation boundaries.
+- Updated `web/workspace/src/lib/workspace/console/model.ts` so `segment_rotated` reprojects `event.data.entry` through the same log-entry projection path used by `snapshot`.
+- Added a Web projection regression test asserting `segment_rotated` replaces stale visible rows with the new segment seed.
+- While running Web check, fixed a narrow `list_completions` TypeScript narrowing issue in `+page.svelte`: command completions return early, then the file completion kind/prefix are captured before the Promise closure.
+
+Verification:
+- `cd web/workspace && deno test --allow-read=src --allow-env=VSCODE_TEXTMATE_DEBUG src/lib/workspace/console/model.test.ts`
+- `cd web/workspace && deno task check` passes with 0 errors; it still reports 2 existing a11y warnings in `+page.svelte`.
+- `git diff --check`
+
+---

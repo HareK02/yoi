@@ -818,3 +818,42 @@ Deno.test("projectConsole renders snapshot entries and in-flight output", () => 
     ],
   );
 });
+
+Deno.test("projectConsole reseeds visible rows from segment rotation", () => {
+  const projection = projectConsole([
+    {
+      eventId: "rotation-before",
+      event: {
+        event: "user_message",
+        data: { segments: [{ kind: "text", content: "before rotation" }] },
+      } satisfies Event,
+    },
+    {
+      eventId: "rotation-event",
+      event: {
+        event: "segment_rotated",
+        data: {
+          entry: {
+            kind: "segment_start",
+            ts: 10,
+            session_id: "00000000-0000-0000-0000-000000000001",
+            system_prompt: null,
+            config: {},
+            history: [
+              {
+                kind: "message",
+                role: "user",
+                content: [{ kind: "text", text: "after rotation seed" }],
+              },
+            ],
+          },
+        },
+      } satisfies Event,
+    },
+  ]);
+
+  assertEquals(
+    projection.lines.map((line) => `${line.kind}:${line.body}`),
+    ["user:after rotation seed"],
+  );
+});

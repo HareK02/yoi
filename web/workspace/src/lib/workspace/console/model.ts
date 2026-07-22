@@ -259,6 +259,9 @@ export function applyProtocolEvent(
     case "status":
       next.status = event.data.status;
       break;
+    case "segment_rotated":
+      next.lines = snapshotLinesFromEntries(envelope.eventId, [event.data.entry]);
+      break;
     case "invoke_start":
     case "turn_start":
     case "turn_end":
@@ -272,7 +275,6 @@ export function applyProtocolEvent(
       appendAlertLine(next, envelope.eventId, event.data);
       break;
     case "memory_worker":
-    case "segment_rotated":
     case "completions":
     case "rewind_targets":
     case "rewind_applied":
