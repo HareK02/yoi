@@ -23,9 +23,9 @@ Human browser auth is modeled as Passkey/WebAuthn ceremony endpoints:
 - `POST /api/auth/passkeys/login/complete`
 - `GET /api/auth/whoami`
 
-The store persists registration/login challenges, passkey credential IDs, COSE public key payloads, transports, browser sessions, and challenge consumption. Successful login mints an HttpOnly `SameSite=Lax` cookie session.
+The store persists registration/login challenges, serialized WebAuthn ceremony state, verified passkey credentials, browser sessions, and challenge consumption. Successful login mints an HttpOnly `SameSite=Lax` cookie session.
 
-Current boundary: the API and persistence shape are WebAuthn-oriented, but cryptographic attestation/assertion verification is not implemented in this step. The completion endpoints consume the server-issued challenge and validate credential/user binding. A follow-up should wire a WebAuthn verifier crate and replace the provisional completion payloads with verified browser `PublicKeyCredential` responses before this is exposed outside trusted development use.
+Completion endpoints require browser `PublicKeyCredential` responses and verify them with `webauthn-rs` before a passkey is stored or a browser session is issued. Fake or stale credential responses are rejected by the verifier, and consumed challenges cannot be reused.
 
 ## CLI/TUI device login
 
@@ -52,4 +52,3 @@ The resolved actor includes `user_id`, `account_id`, `handle`, `display_name`, a
 - Organization membership and RBAC.
 - Password login, OAuth login, or other human auth methods.
 - Token scoping beyond Backend API bearer authentication.
-- Production WebAuthn cryptographic verification; the schema/API are prepared for it, but the verifier integration remains follow-up work.

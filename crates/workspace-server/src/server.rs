@@ -26,13 +26,20 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use url::Url;
+use uuid::Uuid;
+use webauthn_rs::prelude::{
+    CreationChallengeResponse, Passkey, PasskeyAuthentication, PasskeyRegistration,
+    PublicKeyCredential, RegisterPublicKeyCredential, RequestChallengeResponse, Webauthn,
+    WebauthnBuilder,
+};
 use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
 
 use crate::auth::{
-    AuthPublicConfig, AuthenticatedUser, RequestActor, auth_error, is_expired, mint_secret,
-    new_challenge, new_id, new_user_code, normalize_handle, resolve_request_actor, rfc3339_after,
-    session_set_cookie, token_hash,
+    AuthPublicConfig, AuthenticatedUser, RequestActor, auth_error, is_expired, mint_secret, new_id,
+    new_user_code, normalize_handle, resolve_request_actor, rfc3339_after, session_set_cookie,
+    token_hash,
 };
 use crate::companion::{
     CompanionCancelRequest, CompanionConsole, CompanionMessageRequest, CompanionMessageResponse,
@@ -138,9 +145,9 @@ impl ServerConfig {
             embedded_runtime_store_root,
             static_assets_dir: None,
             auth: AuthConfig::Passkey {
-                rp_id: "127.0.0.1".to_string(),
-                origin: "http://127.0.0.1:8787".to_string(),
-                public_base_url: "http://127.0.0.1:8787".to_string(),
+                rp_id: "localhost".to_string(),
+                origin: "http://localhost:8787".to_string(),
+                public_base_url: "http://localhost:8787".to_string(),
                 cookie_name: "yoi_workspace_session".to_string(),
             },
             max_records: 200,
@@ -2503,36 +2510,15 @@ struct PasskeyRegistrationOptionsRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PasskeyRegistrationOptionsResponse {
-    challenge: String,
-    rp: PublicKeyCredentialRpEntity,
-    user: PublicKeyCredentialUserEntity,
-    timeout_ms: u64,
-    attestation: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PublicKeyCredentialRpEntity {
-    id: String,
-    name: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PublicKeyCredentialUserEntity {
-    id: String,
-    name: String,
-    display_name: String,
+    challenge_id: String,
+    public_key: CreationChallengeResponse,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PasskeyRegistrationCompleteRequest {
-    challenge: String,
-    credential_id: String,
-    public_key_cose: String,
-    #[serde(default)]
-    transports: Vec<String>,
-    #[serde(default)]
-    sign_count: u64,
+    challenge_id: String,
+    credential: RegisterPublicKeyCredential,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2544,23 +2530,15 @@ struct PasskeyLoginOptionsRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PasskeyLoginOptionsResponse {
-    challenge: String,
-    rp_id: String,
-    timeout_ms: u64,
-    allow_credentials: Vec<PasskeyAllowedCredential>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PasskeyAllowedCredential {
-    credential_id: String,
-    transports: Vec<String>,
+    challenge_id: String,
+    public_key: RequestChallengeResponse,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PasskeyLoginCompleteRequest {
-    challenge: String,
-    credential_id: String,
+    challenge_id: String,
+    credential: PublicKeyCredential,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2634,32 +2612,41 @@ async fn post_passkey_registration_options(
     Json(request): Json<PasskeyRegistrationOptionsRequest>,
 ) -> ApiResult<Json<PasskeyRegistrationOptionsResponse>> {
     let user = ensure_user_account(&api, &request.handle, request.display_name.as_deref())?;
+    let webauthn = webauthn(&api.config)?;
+    let exclude_credentials = passkeys_for_user(&api, &user.user_id)?
+        .into_iter()
+        .map(|passkey| passkey.cred_id().clone())
+        .collect();
+    let user_unique_id = Uuid::now_v7();
+    let (public_key, state) = webauthn
+        .start_passkey_registration(
+            user_unique_id,
+            &user.handle,
+            &user.display_name,
+            Some(exclude_credentials),
+        )
+        .map_err(|error| auth_error("webauthn_registration_options_failed", &error.to_string()))?;
+    let challenge_id = new_id("webauthn-registration");
     let auth = auth_public_config(&api.config);
-    let challenge = new_challenge();
     api.store.put_auth_challenge(&AuthChallengeRecord {
-        challenge_id: new_id("auth-challenge"),
+        challenge_id: challenge_id.clone(),
         ceremony: "passkey_registration".to_string(),
-        challenge: challenge.clone(),
-        user_id: Some(user.user_id.clone()),
-        rp_id: auth.rp_id.clone(),
-        origin: auth.origin.clone(),
+        challenge: challenge_id.clone(),
+        user_id: Some(user.user_id),
+        rp_id: auth.rp_id,
+        origin: auth.origin,
+        state_json: Some(
+            serde_json::to_string(&state).map_err(|error| {
+                auth_error("webauthn_state_serialize_failed", &error.to_string())
+            })?,
+        ),
         expires_at: rfc3339_after(Duration::minutes(5)),
         created_at: crate::auth::now_rfc3339(),
         consumed_at: None,
     })?;
     Ok(Json(PasskeyRegistrationOptionsResponse {
-        challenge,
-        rp: PublicKeyCredentialRpEntity {
-            id: auth.rp_id,
-            name: "Yoi Workspace".to_string(),
-        },
-        user: PublicKeyCredentialUserEntity {
-            id: user.user_id,
-            name: user.handle,
-            display_name: user.display_name,
-        },
-        timeout_ms: 300_000,
-        attestation: "none".to_string(),
+        challenge_id,
+        public_key,
     }))
 }
 
@@ -2669,8 +2656,8 @@ async fn post_passkey_registration_complete(
 ) -> ApiResult<Json<AuthUserResponse>> {
     let challenge = api
         .store
-        .consume_auth_challenge(
-            &request.challenge,
+        .consume_auth_challenge_by_id(
+            &request.challenge_id,
             "passkey_registration",
             &crate::auth::now_rfc3339(),
         )?
@@ -2699,21 +2686,33 @@ async fn post_passkey_registration_complete(
             "passkey registration user does not exist",
         )
     })?;
-    let transports_json = if request.transports.is_empty() {
-        None
-    } else {
-        Some(
-            serde_json::to_string(&request.transports)
-                .map_err(|error| auth_error("invalid_passkey_transports", &error.to_string()))?,
+    let state_json = challenge.state_json.ok_or_else(|| {
+        auth_error(
+            "missing_webauthn_state",
+            "passkey registration state was not persisted",
         )
-    };
+    })?;
+    let state: PasskeyRegistration = serde_json::from_str(&state_json)
+        .map_err(|error| auth_error("webauthn_state_deserialize_failed", &error.to_string()))?;
+    let webauthn = webauthn(&api.config)?;
+    let passkey = webauthn
+        .finish_passkey_registration(&request.credential, &state)
+        .map_err(|error| {
+            auth_error(
+                "webauthn_registration_verification_failed",
+                &error.to_string(),
+            )
+        })?;
+    let credential_id = passkey_credential_id(&passkey)?;
     api.store
         .upsert_passkey_credential(&PasskeyCredentialRecord {
-            credential_id: request.credential_id,
+            credential_id,
             user_id: user.user_id.clone(),
-            public_key_cose: request.public_key_cose,
-            transports_json,
-            sign_count: request.sign_count,
+            public_key_cose: serde_json::to_string(&passkey).map_err(|error| {
+                auth_error("webauthn_passkey_serialize_failed", &error.to_string())
+            })?,
+            transports_json: None,
+            sign_count: 0,
             created_at: crate::auth::now_rfc3339(),
             last_used_at: None,
         })?;
@@ -2731,41 +2730,39 @@ async fn post_passkey_login_options(
         None => api.store.any_user()?,
     }
     .ok_or_else(|| auth_error("unknown_auth_user", "no matching user account exists"))?;
-    let credentials = api.store.list_passkey_credentials_for_user(&user.user_id)?;
-    if credentials.is_empty() {
+    let passkeys = passkeys_for_user(&api, &user.user_id)?;
+    if passkeys.is_empty() {
         return Err(auth_error(
             "passkey_not_registered",
             "user has no registered passkey credentials",
         )
         .into());
     }
+    let webauthn = webauthn(&api.config)?;
+    let (public_key, state) = webauthn
+        .start_passkey_authentication(&passkeys)
+        .map_err(|error| auth_error("webauthn_login_options_failed", &error.to_string()))?;
+    let challenge_id = new_id("webauthn-login");
     let auth = auth_public_config(&api.config);
-    let challenge = new_challenge();
     api.store.put_auth_challenge(&AuthChallengeRecord {
-        challenge_id: new_id("auth-challenge"),
+        challenge_id: challenge_id.clone(),
         ceremony: "passkey_login".to_string(),
-        challenge: challenge.clone(),
+        challenge: challenge_id.clone(),
         user_id: Some(user.user_id),
-        rp_id: auth.rp_id.clone(),
+        rp_id: auth.rp_id,
         origin: auth.origin,
+        state_json: Some(
+            serde_json::to_string(&state).map_err(|error| {
+                auth_error("webauthn_state_serialize_failed", &error.to_string())
+            })?,
+        ),
         expires_at: rfc3339_after(Duration::minutes(5)),
         created_at: crate::auth::now_rfc3339(),
         consumed_at: None,
     })?;
     Ok(Json(PasskeyLoginOptionsResponse {
-        challenge,
-        rp_id: auth.rp_id,
-        timeout_ms: 300_000,
-        allow_credentials: credentials
-            .into_iter()
-            .map(|credential| PasskeyAllowedCredential {
-                credential_id: credential.credential_id,
-                transports: credential
-                    .transports_json
-                    .and_then(|raw| serde_json::from_str(&raw).ok())
-                    .unwrap_or_default(),
-            })
-            .collect(),
+        challenge_id,
+        public_key,
     }))
 }
 
@@ -2775,8 +2772,8 @@ async fn post_passkey_login_complete(
 ) -> ApiResult<Response> {
     let challenge = api
         .store
-        .consume_auth_challenge(
-            &request.challenge,
+        .consume_auth_challenge_by_id(
+            &request.challenge_id,
             "passkey_login",
             &crate::auth::now_rfc3339(),
         )?
@@ -2793,26 +2790,63 @@ async fn post_passkey_login_complete(
         )
         .into());
     }
-    let credential = api
+    let user_id = challenge.user_id.ok_or_else(|| {
+        auth_error(
+            "invalid_passkey_challenge",
+            "passkey login challenge is not bound to a user",
+        )
+    })?;
+    let user = api
         .store
-        .get_passkey_credential(&request.credential_id)?
+        .get_user(&user_id)?
+        .ok_or_else(|| auth_error("unknown_auth_user", "passkey user does not exist"))?;
+    let state_json = challenge.state_json.ok_or_else(|| {
+        auth_error(
+            "missing_webauthn_state",
+            "passkey login state was not persisted",
+        )
+    })?;
+    let state: PasskeyAuthentication = serde_json::from_str(&state_json)
+        .map_err(|error| auth_error("webauthn_state_deserialize_failed", &error.to_string()))?;
+    let webauthn = webauthn(&api.config)?;
+    let auth_result = webauthn
+        .finish_passkey_authentication(&request.credential, &state)
+        .map_err(|error| auth_error("webauthn_login_verification_failed", &error.to_string()))?;
+    let credential_id = serde_json::to_value(auth_result.cred_id())
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .ok_or_else(|| {
+            auth_error(
+                "invalid_webauthn_credential_id",
+                "verified credential id was not serializable",
+            )
+        })?;
+    let stored = api
+        .store
+        .get_passkey_credential(&credential_id)?
         .ok_or_else(|| {
             auth_error(
                 "unknown_passkey_credential",
-                "passkey credential is not registered",
+                "verified passkey credential is not registered",
             )
         })?;
-    if Some(credential.user_id.clone()) != challenge.user_id {
+    if stored.user_id != user.user_id {
         return Err(auth_error(
             "passkey_user_mismatch",
-            "passkey credential does not belong to the challenged user",
+            "verified passkey credential does not belong to the challenged user",
         )
         .into());
     }
-    let user = api
-        .store
-        .get_user(&credential.user_id)?
-        .ok_or_else(|| auth_error("unknown_auth_user", "passkey user does not exist"))?;
+    api.store
+        .upsert_passkey_credential(&PasskeyCredentialRecord {
+            credential_id,
+            user_id: user.user_id.clone(),
+            public_key_cose: stored.public_key_cose,
+            transports_json: stored.transports_json,
+            sign_count: u64::from(auth_result.counter()),
+            created_at: stored.created_at,
+            last_used_at: Some(crate::auth::now_rfc3339()),
+        })?;
     let session_token = mint_secret("yoi_sess");
     api.store.create_browser_session(&BrowserSessionRecord {
         session_id: new_id("session"),
@@ -2987,6 +3021,42 @@ async fn get_auth_whoami(
     Ok(Json(WhoamiResponse {
         actor: resolve_actor(&api, &headers).await?,
     }))
+}
+
+fn webauthn(config: &ServerConfig) -> ApiResult<Webauthn> {
+    let auth = auth_public_config(config);
+    let origin = Url::parse(&auth.origin)
+        .map_err(|error| auth_error("invalid_webauthn_origin", &error.to_string()))?;
+    WebauthnBuilder::new(&auth.rp_id, &origin)
+        .map_err(|error| auth_error("webauthn_builder_failed", &error.to_string()))?
+        .rp_name("Yoi Workspace")
+        .build()
+        .map_err(|error| auth_error("webauthn_builder_failed", &error.to_string()).into())
+}
+
+fn passkeys_for_user(api: &WorkspaceApi, user_id: &str) -> ApiResult<Vec<Passkey>> {
+    api.store
+        .list_passkey_credentials_for_user(user_id)?
+        .into_iter()
+        .map(|record| {
+            serde_json::from_str::<Passkey>(&record.public_key_cose).map_err(|error| {
+                auth_error("webauthn_passkey_deserialize_failed", &error.to_string()).into()
+            })
+        })
+        .collect()
+}
+
+fn passkey_credential_id(passkey: &Passkey) -> ApiResult<String> {
+    serde_json::to_value(passkey.cred_id())
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .ok_or_else(|| {
+            auth_error(
+                "invalid_webauthn_credential_id",
+                "verified passkey credential id was not serializable",
+            )
+            .into()
+        })
 }
 
 fn auth_public_config(config: &ServerConfig) -> AuthPublicConfig {
@@ -8551,7 +8621,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_passkey_session_and_device_login_flow_round_trip() {
+    async fn passkey_registration_rejects_unverified_credential_response() {
         let dir = tempfile::tempdir().unwrap();
         let app = test_app(dir.path()).await;
 
@@ -8564,42 +8634,28 @@ mod tests {
             }),
         )
         .await;
-        let registration_challenge = registration_options["challenge"].as_str().unwrap();
-        let registered = post_json(
-            app.clone(),
-            "/api/auth/passkeys/registration/complete",
-            json!({
-                "challenge": registration_challenge,
-                "credential_id": "credential-1",
-                "public_key_cose": "public-key-cose",
-                "transports": ["internal"]
-            }),
-        )
-        .await;
-        assert_eq!(registered["user"]["handle"], "alice");
+        assert!(registration_options["public_key"].is_object());
+        let challenge_id = registration_options["challenge_id"].as_str().unwrap();
 
-        let login_options = post_json(
-            app.clone(),
-            "/api/auth/passkeys/login/options",
-            json!({ "handle": "alice" }),
-        )
-        .await;
-        assert_eq!(
-            login_options["allow_credentials"][0]["credential_id"],
-            "credential-1"
-        );
-        let login_challenge = login_options["challenge"].as_str().unwrap();
-        let login_response = app
+        let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/auth/passkeys/login/complete")
+                    .uri("/api/auth/passkeys/registration/complete")
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
-                            "challenge": login_challenge,
-                            "credential_id": "credential-1"
+                            "challenge_id": challenge_id,
+                            "credential": {
+                                "id": "credential-1",
+                                "rawId": "Y3JlZGVudGlhbC0x",
+                                "type": "public-key",
+                                "response": {
+                                    "clientDataJSON": "e30",
+                                    "attestationObject": "e30"
+                                }
+                            }
                         }))
                         .unwrap(),
                     ))
@@ -8607,71 +8663,22 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(login_response.status(), StatusCode::OK);
-        let cookie = login_response
-            .headers()
-            .get(SET_COOKIE)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        let login_bytes = to_bytes(login_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let login_json: Value = serde_json::from_slice(&login_bytes).unwrap();
-        assert_eq!(login_json["user"]["handle"], "alice");
+        assert_ne!(response.status(), StatusCode::OK);
 
-        let device = post_json(
-            app.clone(),
-            "/api/auth/device-login/start",
-            json!({ "client_name": "test cli" }),
-        )
-        .await;
-        let approved = app
-            .clone()
+        let login_without_registered_passkey = app
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/auth/device-login/approve")
+                    .uri("/api/auth/passkeys/login/options")
                     .header(CONTENT_TYPE, "application/json")
-                    .header("Cookie", cookie)
                     .body(Body::from(
-                        serde_json::to_vec(&json!({
-                            "user_code": device["user_code"].as_str().unwrap()
-                        }))
-                        .unwrap(),
+                        serde_json::to_vec(&json!({ "handle": "alice" })).unwrap(),
                     ))
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(approved.status(), StatusCode::OK);
-
-        let polled = post_json(
-            app.clone(),
-            "/api/auth/device-login/poll",
-            json!({ "device_code": device["device_code"].as_str().unwrap() }),
-        )
-        .await;
-        assert_eq!(polled["status"], "approved");
-        let access_token = polled["access_token"].as_str().unwrap();
-
-        let whoami = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/api/auth/whoami")
-                    .header("Authorization", format!("Bearer {access_token}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(whoami.status(), StatusCode::OK);
-        let whoami_bytes = to_bytes(whoami.into_body(), usize::MAX).await.unwrap();
-        let whoami_json: Value = serde_json::from_slice(&whoami_bytes).unwrap();
-        assert_eq!(whoami_json["actor"]["handle"], "alice");
-        assert_eq!(whoami_json["actor"]["auth_method"], "api_token");
+        assert_ne!(login_without_registered_passkey.status(), StatusCode::OK);
     }
 
     async fn get_json(app: Router, uri: &str) -> Value {

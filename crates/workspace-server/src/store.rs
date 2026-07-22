@@ -57,6 +57,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "account identity and login flow schema",
         apply: create_account_identity_tables,
     },
+    Migration {
+        version: 9,
+        name: "webauthn challenge state",
+        apply: add_webauthn_challenge_state,
+    },
 ];
 
 struct Migration {
@@ -116,6 +121,7 @@ pub struct AuthChallengeRecord {
     pub user_id: Option<String>,
     pub rp_id: String,
     pub origin: String,
+    pub state_json: Option<String>,
     pub expires_at: String,
     pub created_at: String,
     pub consumed_at: Option<String>,
@@ -226,6 +232,12 @@ pub trait ControlPlaneStore: Send + Sync {
     fn consume_auth_challenge(
         &self,
         challenge: &str,
+        ceremony: &str,
+        consumed_at: &str,
+    ) -> Result<Option<AuthChallengeRecord>>;
+    fn consume_auth_challenge_by_id(
+        &self,
+        challenge_id: &str,
         ceremony: &str,
         consumed_at: &str,
     ) -> Result<Option<AuthChallengeRecord>>;
@@ -524,9 +536,9 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     fn put_auth_challenge(&self, record: &AuthChallengeRecord) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
-                r#"INSERT INTO auth_challenges (challenge_id, ceremony, challenge, user_id, rp_id, origin, expires_at, created_at, consumed_at)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
-                params![record.challenge_id, record.ceremony, record.challenge, record.user_id, record.rp_id, record.origin, record.expires_at, record.created_at, record.consumed_at],
+                r#"INSERT INTO auth_challenges (challenge_id, ceremony, challenge, user_id, rp_id, origin, state_json, expires_at, created_at, consumed_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+                params![record.challenge_id, record.ceremony, record.challenge, record.user_id, record.rp_id, record.origin, record.state_json, record.expires_at, record.created_at, record.consumed_at],
             )?;
             Ok(())
         })
@@ -546,6 +558,33 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     )
                     .as_str(),
                     params![challenge, ceremony],
+                    read_auth_challenge_record,
+                )
+                .optional()?;
+            if let Some(record) = record.as_ref() {
+                conn.execute(
+                    "UPDATE auth_challenges SET consumed_at = ?2 WHERE challenge_id = ?1",
+                    params![record.challenge_id, consumed_at],
+                )?;
+            }
+            Ok(record)
+        })
+    }
+
+    fn consume_auth_challenge_by_id(
+        &self,
+        challenge_id: &str,
+        ceremony: &str,
+        consumed_at: &str,
+    ) -> Result<Option<AuthChallengeRecord>> {
+        self.with_conn(|conn| {
+            let record = conn
+                .query_row(
+                    auth_challenge_select_sql(
+                        "WHERE challenge_id = ?1 AND ceremony = ?2 AND consumed_at IS NULL",
+                    )
+                    .as_str(),
+                    params![challenge_id, ceremony],
                     read_auth_challenge_record,
                 )
                 .optional()?;
@@ -1025,7 +1064,7 @@ fn read_passkey_credential_record(
 
 fn auth_challenge_select_sql(where_clause: &str) -> String {
     format!(
-        "SELECT challenge_id, ceremony, challenge, user_id, rp_id, origin, expires_at, created_at, consumed_at FROM auth_challenges {where_clause}"
+        "SELECT challenge_id, ceremony, challenge, user_id, rp_id, origin, state_json, expires_at, created_at, consumed_at FROM auth_challenges {where_clause}"
     )
 }
 
@@ -1037,9 +1076,10 @@ fn read_auth_challenge_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthC
         user_id: row.get(3)?,
         rp_id: row.get(4)?,
         origin: row.get(5)?,
-        expires_at: row.get(6)?,
-        created_at: row.get(7)?,
-        consumed_at: row.get(8)?,
+        state_json: row.get(6)?,
+        expires_at: row.get(7)?,
+        created_at: row.get(8)?,
+        consumed_at: row.get(9)?,
     })
 }
 
@@ -1226,6 +1266,13 @@ CREATE INDEX IF NOT EXISTS idx_worker_workdir_links_worker
     Ok(())
 }
 
+fn add_webauthn_challenge_state(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "auth_challenges", "state_json")? {
+        conn.execute_batch("ALTER TABLE auth_challenges ADD COLUMN state_json TEXT;")?;
+    }
+    Ok(())
+}
+
 fn create_account_identity_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -1265,6 +1312,7 @@ CREATE TABLE IF NOT EXISTS auth_challenges (
     user_id TEXT REFERENCES users(user_id) ON DELETE CASCADE,
     rp_id TEXT NOT NULL,
     origin TEXT NOT NULL,
+    state_json TEXT,
     expires_at TEXT NOT NULL,
     created_at TEXT NOT NULL,
     consumed_at TEXT
@@ -1897,7 +1945,7 @@ mod tests {
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 8);
+        assert_eq!(store.schema_version().await.unwrap(), 9);
 
         let record = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
@@ -1910,7 +1958,7 @@ mod tests {
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 8);
+        assert_eq!(reopened.schema_version().await.unwrap(), 9);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -2127,7 +2175,7 @@ mod tests {
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 8);
+        assert_eq!(store.schema_version().await.unwrap(), 9);
 
         store
             .with_conn(|conn| {
@@ -2317,7 +2365,7 @@ mod tests {
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 8);
+        assert_eq!(store.schema_version().await.unwrap(), 9);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),
@@ -2388,6 +2436,7 @@ mod tests {
             user_id: Some(user.user_id.clone()),
             rp_id: "127.0.0.1".to_string(),
             origin: "http://127.0.0.1:8787".to_string(),
+            state_json: None,
             expires_at: "2026-07-22T00:05:00Z".to_string(),
             created_at: now.clone(),
             consumed_at: None,

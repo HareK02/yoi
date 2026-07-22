@@ -15,8 +15,8 @@ pub const WORKSPACE_BACKEND_CONFIG_TEMPLATE: &str =
     include_str!("../../../resources/workspace-backend.default.toml");
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
 const DEFAULT_FRONTEND_URL: &str = "http://127.0.0.1:5173";
-const DEFAULT_AUTH_PUBLIC_BASE_URL: &str = "http://127.0.0.1:8787";
-const DEFAULT_AUTH_RP_ID: &str = "127.0.0.1";
+const DEFAULT_AUTH_PUBLIC_BASE_URL: &str = "http://localhost:8787";
+const DEFAULT_AUTH_RP_ID: &str = "localhost";
 const DEFAULT_AUTH_COOKIE_NAME: &str = "yoi_workspace_session";
 const DEFAULT_MAX_RECORDS: usize = 200;
 
