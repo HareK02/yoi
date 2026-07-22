@@ -6,6 +6,7 @@ use worker_runtime::observation::{WorkerObservationCursor, WorkerObservationEven
 
 use axum::http::StatusCode;
 use futures::{SinkExt, StreamExt};
+use protocol::stream::decode_event;
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -284,7 +285,7 @@ impl RuntimeWsObservationClient {
                     ));
                 }
             };
-            let payload: protocol::Event = serde_json::from_str(&text).map_err(|error| {
+            let payload: protocol::Event = decode_event(&text).map_err(|error| {
                 ObservationProxyError::MalformedFrame(format!(
                     "failed to decode runtime protocol event frame: {error}"
                 ))

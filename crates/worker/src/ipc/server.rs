@@ -10,7 +10,7 @@ use crate::controller::WorkerHandle;
 use crate::ipc::protocol_session::{
     dispatch_worker_protocol_method, live_log_entry_event, subscribe_worker_protocol_session,
 };
-use protocol::{ErrorCode, Event, Method};
+use protocol::{ErrorCode, Event};
 
 /// Unix socket server for Worker Protocol.
 ///
@@ -84,14 +84,14 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: WorkerHandle)
     // keeps the snapshot/live boundary gap-free.
     let mut streams = subscribe_worker_protocol_session(&handle);
     for alert in streams.alert_snapshot {
-        if writer.write(&Event::Alert(alert)).await.is_err() {
+        if writer.write_event(&Event::Alert(alert)).await.is_err() {
             return;
         }
     }
 
     // Send the typed snapshot up front so late attachers can
     // reconstruct view state without an extra round trip.
-    if writer.write(&streams.snapshot_event).await.is_err() {
+    if writer.write_event(&streams.snapshot_event).await.is_err() {
         return;
     }
 
@@ -105,7 +105,7 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: WorkerHandle)
                 match entry {
                     Ok(entry) => {
                         if let Some(event) = live_log_entry_event(entry) {
-                            if writer.write(&event).await.is_err() {
+                            if writer.write_event(&event).await.is_err() {
                                 break;
                             }
                         }
@@ -123,7 +123,7 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: WorkerHandle)
             event = streams.events.recv() => {
                 match event {
                     Ok(event) => {
-                        if writer.write(&event).await.is_err() {
+                        if writer.write_event(&event).await.is_err() {
                             break;
                         }
                     }
@@ -131,11 +131,11 @@ async fn handle_connection(stream: tokio::net::UnixStream, handle: WorkerHandle)
                 }
             }
             // Client methods → handle or forward to controller
-            method = reader.next::<Method>() => {
+            method = reader.next_method() => {
                 match method {
                     Ok(Some(method)) => {
                         if let Some(response) = dispatch_worker_protocol_method(&handle, method).await
-                            && writer.write(&response).await.is_err()
+                            && writer.write_event(&response).await.is_err()
                         {
                             break;
                         }

@@ -4,6 +4,24 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
+use crate::{Event, Method};
+
+pub fn encode_method(method: &Method) -> Result<String, serde_json::Error> {
+    serde_json::to_string(method)
+}
+
+pub fn decode_method(input: &str) -> Result<Method, serde_json::Error> {
+    serde_json::from_str(input.trim())
+}
+
+pub fn encode_event(event: &Event) -> Result<String, serde_json::Error> {
+    serde_json::to_string(event)
+}
+
+pub fn decode_event(input: &str) -> Result<Event, serde_json::Error> {
+    serde_json::from_str(input.trim())
+}
+
 /// JSONL line reader over an async byte stream.
 ///
 /// Wraps the inner reader and deserialises each non‑empty line as `T`.
@@ -41,6 +59,10 @@ impl<R: AsyncBufRead + Unpin> JsonLineReader<R> {
             return Ok(Some(value));
         }
     }
+
+    pub async fn next_method(&mut self) -> Result<Option<Method>, io::Error> {
+        self.next::<Method>().await
+    }
 }
 
 /// JSONL line writer over an async byte stream.
@@ -61,5 +83,9 @@ impl<W: AsyncWrite + Unpin> JsonLineWriter<W> {
         self.inner.write_all(b"\n").await?;
         self.inner.flush().await?;
         Ok(())
+    }
+
+    pub async fn write_event(&mut self, event: &Event) -> Result<(), io::Error> {
+        self.write(event).await
     }
 }

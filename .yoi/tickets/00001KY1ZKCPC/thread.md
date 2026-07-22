@@ -301,3 +301,43 @@ Verification:
 - `git diff --check`
 
 ---
+
+<!-- event: implementation_report author: assistant at: 2026-07-22T05:03:17Z -->
+
+## Implementation report
+
+Implementation update for shared protocol frame/pump semantics:
+
+- Added Method/Event-specific JSON codec helpers in `protocol::stream`:
+  - `encode_method` / `decode_method`
+  - `encode_event` / `decode_event`
+  - `JsonLineReader::next_method()`
+  - `JsonLineWriter::write_event()`
+- Updated local IPC to use the shared codec helpers and the shared `worker::ipc::protocol_session` semantics.
+- Updated runtime WS and workspace-server embedded protocol handling to use the same `decode_method` / `encode_event` helpers instead of direct `serde_json` calls.
+- Updated Backend runtime client and remote observation client to use `encode_method` / `decode_event` for protocol frames.
+
+Resulting split:
+- Shared:
+  - JSON shape for `protocol::Method` / `protocol::Event`
+  - Method/Event encode/decode
+  - WorkerHandle subscription semantics
+  - live `LogEntry -> Event` mapping
+  - direct-response method semantics such as `ListCompletions`
+- Transport-specific:
+  - Unix IPC uses JSONL line boundary.
+  - WebSocket uses one text frame per JSON value.
+
+This makes WS effectively a frame-boundary adapter around the same JSON protocol frames rather than a separate protocol implementation.
+
+Verification:
+- `nix develop -c cargo fmt -- --check`
+- `nix develop -c cargo check -p protocol -p worker -p worker-runtime -p yoi-workspace-server -p client -p tui`
+- `nix develop -c cargo test -p worker --lib ipc::protocol_session`
+- `nix develop -c cargo test -p worker --lib ipc::server`
+- `nix develop -c cargo test -p worker-runtime --features ws-server --lib protocol_ws`
+- `nix develop -c cargo test -p yoi-workspace-server protocol_ws --lib`
+- `nix develop -c cargo test -p client backend_runtime --lib`
+- `git diff --check`
+
+---

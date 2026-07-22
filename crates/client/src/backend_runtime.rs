@@ -1,4 +1,5 @@
 use futures::{SinkExt, StreamExt};
+use protocol::stream::{decode_event, encode_method};
 use protocol::{ErrorCode, Event, Method};
 use serde::Deserialize;
 use std::collections::VecDeque;
@@ -317,7 +318,7 @@ async fn run_worker_protocol_transport(
                         let Some(method) = maybe_method else {
                             break;
                         };
-                        match serde_json::to_string(&method) {
+                        match encode_method(&method) {
                             Ok(text) => {
                                 if let Err(error) = sink.send(TungsteniteMessage::Text(text.into())).await {
                                     let _ = tx.send(diagnostic_event(format!(
@@ -338,7 +339,7 @@ async fn run_worker_protocol_transport(
                     frame = stream.next() => {
                         match frame {
                             Some(Ok(TungsteniteMessage::Text(text))) => {
-                                match serde_json::from_str::<Event>(&text) {
+                                match decode_event(&text) {
                                     Ok(event) => {
                                         let _ = tx.send(event);
                                     }

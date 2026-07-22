@@ -15,6 +15,7 @@ use futures::{SinkExt, StreamExt};
 use memory::backend::{
     MemoryBackendHttpResponse, MemoryBackendOperation, execute_memory_backend_operation,
 };
+use protocol::stream::{decode_method, encode_event};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ticket::{
@@ -3561,7 +3562,7 @@ async fn embedded_worker_protocol_ws_session(
         tokio::select! {
             inbound = socket.next() => {
                 match inbound {
-                    Some(Ok(WsMessage::Text(text))) => match serde_json::from_str::<protocol::Method>(&text) {
+                    Some(Ok(WsMessage::Text(text))) => match decode_method(&text) {
                         Ok(method) => match source.runtime.send_protocol_method(&source.worker_ref, method) {
                             Ok(events) => {
                                 for event in events {
@@ -3617,13 +3618,13 @@ async fn embedded_worker_protocol_ws_session(
     }
 }
 async fn send_protocol_event(socket: &mut WebSocket, event: &protocol::Event) -> bool {
-    match serde_json::to_string(event) {
+    match encode_event(event) {
         Ok(text) => socket.send(WsMessage::Text(text.into())).await.is_ok(),
         Err(error) => {
             let fallback = protocol_error_event(format!(
                 "failed to serialize protocol response event: {error}"
             ));
-            let Ok(text) = serde_json::to_string(&fallback) else {
+            let Ok(text) = encode_event(&fallback) else {
                 return false;
             };
             socket.send(WsMessage::Text(text.into())).await.is_ok()

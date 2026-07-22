@@ -30,6 +30,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 #[cfg(feature = "ws-server")]
 use futures::StreamExt;
+#[cfg(feature = "ws-server")]
+use protocol::stream::{decode_method, encode_event};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::SocketAddr;
@@ -521,7 +523,7 @@ async fn worker_protocol_ws_session(
         tokio::select! {
             inbound = socket.next() => {
                 match inbound {
-                    Some(Ok(WsMessage::Text(text))) => match serde_json::from_str::<protocol::Method>(&text) {
+                    Some(Ok(WsMessage::Text(text))) => match decode_method(&text) {
                         Ok(method) => match runtime.send_protocol_method(&worker_ref, method) {
                             Ok(events) => {
                                 for event in events {
@@ -587,13 +589,13 @@ async fn worker_protocol_ws_session(
 
 #[cfg(feature = "ws-server")]
 async fn send_protocol_event(socket: &mut WebSocket, event: &protocol::Event) -> bool {
-    match serde_json::to_string(event) {
+    match encode_event(event) {
         Ok(text) => socket.send(WsMessage::Text(text.into())).await.is_ok(),
         Err(error) => {
             let fallback = protocol_error_event(format!(
                 "failed to serialize protocol response event: {error}"
             ));
-            let Ok(text) = serde_json::to_string(&fallback) else {
+            let Ok(text) = encode_event(&fallback) else {
                 return false;
             };
             socket.send(WsMessage::Text(text.into())).await.is_ok()
