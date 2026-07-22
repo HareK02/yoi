@@ -4,6 +4,7 @@
 //! it is not the product CLI facade. Existing `.yoi` Ticket and Objective files
 //! remain the canonical project records and are read through bounded bridge APIs.
 
+pub mod auth;
 pub mod companion;
 pub mod config;
 pub mod hosts;

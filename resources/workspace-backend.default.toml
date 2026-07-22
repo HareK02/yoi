@@ -41,6 +41,14 @@ frontend_url = "http://127.0.0.1:5173"
 [limits]
 max_records = 200
 
+[auth]
+# WebAuthn / Passkey relying-party settings. For local development keep rp_id
+# aligned with the browser host in public_base_url/origin.
+rp_id = "127.0.0.1"
+origin = "http://127.0.0.1:8787"
+public_base_url = "http://127.0.0.1:8787"
+cookie_name = "yoi_workspace_session"
+
 # Repository registry. Browser/API repository projection reads only configured
 # entries and never falls back to the backend process cwd. Relative URI values
 # are resolved from this workspace config root. Git is the v0 supported provider.
