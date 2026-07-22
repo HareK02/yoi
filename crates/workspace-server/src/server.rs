@@ -1587,7 +1587,6 @@ fn create_working_directory_for_runtime(
         resolved_commit: None,
         materialization_status: "pending".to_string(),
         cleanliness: "unknown".to_string(),
-        management_kind: "backend_managed".to_string(),
         created_at: now_registry_timestamp(),
         updated_at: now_registry_timestamp(),
     };
@@ -1610,12 +1609,7 @@ fn create_working_directory_for_runtime(
             result.diagnostics,
         ));
     };
-    let record = workdir_record_from_summary(
-        &api,
-        &runtime_id,
-        &working_directory.summary,
-        "backend_managed",
-    );
+    let record = workdir_record_from_summary(&api, &runtime_id, &working_directory.summary);
     api.store.upsert_workdir_registry(&record)?;
     Ok(Json(BrowserWorkingDirectoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
@@ -1634,17 +1628,7 @@ fn working_directory_detail_for_runtime(
         .working_directory(runtime_id, working_directory_id)
         .map_err(|err| err.into_error())?;
     if let Some(working_directory) = result.working_directory {
-        let management_kind = api
-            .store
-            .get_workdir_registry(&api.config.workspace_id, working_directory_id)?
-            .map(|record| record.management_kind)
-            .unwrap_or_else(|| "runtime_unmanaged".to_string());
-        let record = workdir_record_from_summary(
-            &api,
-            runtime_id,
-            &working_directory.summary,
-            management_kind.as_str(),
-        );
+        let record = workdir_record_from_summary(&api, runtime_id, &working_directory.summary);
         api.store.upsert_workdir_registry(&record)?;
         return Ok(Json(BrowserWorkingDirectoryDetailResponse {
             workspace_id: api.config.workspace_id.clone(),
@@ -1711,17 +1695,7 @@ fn cleanup_working_directory_for_runtime(
             result.diagnostics,
         ));
     };
-    let management_kind = api
-        .store
-        .get_workdir_registry(&api.config.workspace_id, working_directory_id)?
-        .map(|record| record.management_kind)
-        .unwrap_or_else(|| "runtime_unmanaged".to_string());
-    let record = workdir_record_from_summary(
-        &api,
-        runtime_id,
-        &working_directory.summary,
-        management_kind.as_str(),
-    );
+    let record = workdir_record_from_summary(&api, runtime_id, &working_directory.summary);
     api.store.upsert_workdir_registry(&record)?;
     Ok(Json(BrowserWorkingDirectoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
@@ -3010,20 +2984,8 @@ async fn create_workspace_worker(
         WorkerRegistryDisplayNamePolicy::UseProvided,
     )?;
     if let Some(working_directory) = worker.working_directory.as_ref() {
-        let management_kind = api
-            .store
-            .get_workdir_registry(
-                &api.config.workspace_id,
-                &working_directory.working_directory_id,
-            )?
-            .map(|existing| existing.management_kind)
-            .unwrap_or_else(|| "runtime_unmanaged".to_string());
-        let workdir_record = workdir_record_from_summary(
-            &api,
-            worker.runtime_id.as_str(),
-            working_directory,
-            management_kind.as_str(),
-        );
+        let workdir_record =
+            workdir_record_from_summary(&api, worker.runtime_id.as_str(), working_directory);
         api.store.upsert_workdir_registry(&workdir_record)?;
         link_worker_to_workdir(
             &api,
@@ -3047,7 +3009,6 @@ async fn create_workspace_worker(
                         &api,
                         worker.runtime_id.as_str(),
                         &status.summary,
-                        "runtime_unmanaged",
                     );
                     api.store.upsert_workdir_registry(&record)?;
                 }
@@ -4425,7 +4386,7 @@ fn working_directory_summaries(api: &WorkspaceApi) -> ApiResult<Vec<WorkingDirec
     let _ = sync_all_runtime_workdir_observations(api);
     let records = api
         .store
-        .list_managed_workdir_registry(&api.config.workspace_id, 200)?;
+        .list_workdir_registry(&api.config.workspace_id, 200)?;
     Ok(records
         .iter()
         .map(workdir_summary_from_record)
@@ -4619,20 +4580,8 @@ fn sync_worker_observation(
         WorkerRegistryDisplayNamePolicy::PreserveExisting,
     )?;
     if let Some(working_directory) = worker.working_directory.as_ref() {
-        let management_kind = api
-            .store
-            .get_workdir_registry(
-                &api.config.workspace_id,
-                &working_directory.working_directory_id,
-            )?
-            .map(|existing| existing.management_kind)
-            .unwrap_or_else(|| "runtime_unmanaged".to_string());
-        let workdir_record = workdir_record_from_summary(
-            api,
-            worker.runtime_id.as_str(),
-            working_directory,
-            management_kind.as_str(),
-        );
+        let workdir_record =
+            workdir_record_from_summary(api, worker.runtime_id.as_str(), working_directory);
         api.store.upsert_workdir_registry(&workdir_record)?;
         link_worker_to_workdir(api, &record, &working_directory.working_directory_id)?;
     }
@@ -4663,7 +4612,6 @@ fn upsert_pending_backend_workdir(
         resolved_commit: None,
         materialization_status: "pending".to_string(),
         cleanliness: "unknown".to_string(),
-        management_kind: "backend_managed".to_string(),
         created_at: timestamp.clone(),
         updated_at: timestamp,
     })?;
@@ -4692,12 +4640,7 @@ fn sync_runtime_workdir_observations(
             &api.config.workspace_id,
             &status.summary.working_directory_id,
         )?;
-        let management_kind = existing
-            .as_ref()
-            .map(|existing| existing.management_kind.clone())
-            .unwrap_or_else(|| "runtime_unmanaged".to_string());
-        let mut record =
-            workdir_record_from_summary(api, runtime_id, &status.summary, management_kind.as_str());
+        let mut record = workdir_record_from_summary(api, runtime_id, &status.summary);
         preserve_workdir_identity_for_corrupted_summary(&mut record, existing.as_ref());
         api.store.upsert_workdir_registry(&record)?;
     }
@@ -4719,13 +4662,8 @@ fn sync_runtime_workdir_observations(
                             record.workdir_id.as_str(),
                         )?;
                     } else {
-                        let management_kind = record.management_kind.clone();
-                        let mut updated = workdir_record_from_summary(
-                            api,
-                            runtime_id,
-                            &status.summary,
-                            management_kind.as_str(),
-                        );
+                        let mut updated =
+                            workdir_record_from_summary(api, runtime_id, &status.summary);
                         preserve_workdir_identity_for_corrupted_summary(
                             &mut updated,
                             Some(&record),
@@ -4792,17 +4730,7 @@ fn sync_linked_workdir_after_worker_stop(
             .working_directory(runtime_id, link.workdir_id.as_str())
             .map_err(|err| err.into_error())?;
         if let Some(status) = result.working_directory {
-            let management_kind = api
-                .store
-                .get_workdir_registry(&api.config.workspace_id, link.workdir_id.as_str())?
-                .map(|record| record.management_kind)
-                .unwrap_or_else(|| "runtime_unmanaged".to_string());
-            let record = workdir_record_from_summary(
-                api,
-                runtime_id,
-                &status.summary,
-                management_kind.as_str(),
-            );
+            let record = workdir_record_from_summary(api, runtime_id, &status.summary);
             api.store.upsert_workdir_registry(&record)?;
         } else if let Some(mut record) = api
             .store
@@ -4822,7 +4750,6 @@ fn workdir_record_from_summary(
     api: &WorkspaceApi,
     runtime_id: &str,
     summary: &WorkingDirectorySummary,
-    management_kind: &str,
 ) -> WorkdirRegistryRecord {
     let timestamp = now_registry_timestamp();
     WorkdirRegistryRecord {
@@ -4844,7 +4771,6 @@ fn workdir_record_from_summary(
             .cleanliness
             .clone()
             .unwrap_or_else(|| "unknown".to_string()),
-        management_kind: management_kind.to_string(),
         created_at: timestamp.clone(),
         updated_at: timestamp,
     }
@@ -4895,7 +4821,6 @@ fn workdir_summary_from_record(record: &WorkdirRegistryRecord) -> WorkingDirecto
         status,
         cleanliness: Some(record.cleanliness.clone()),
         primary_worker_id: None,
-        management_kind: Some(record.management_kind.clone()),
     }
 }
 
@@ -5517,7 +5442,6 @@ mod tests {
             resolved_commit: Some("abcdef".to_string()),
             materialization_status: "missing".to_string(),
             cleanliness: "clean".to_string(),
-            management_kind: "backend_managed".to_string(),
             created_at: "1".to_string(),
             updated_at: "3".to_string(),
         };
@@ -5538,22 +5462,13 @@ mod tests {
             projected.working_directory.as_ref().unwrap().status,
             WorkingDirectoryStatusKind::NotFound
         );
-        assert_eq!(
-            projected
-                .working_directory
-                .as_ref()
-                .unwrap()
-                .management_kind
-                .as_deref(),
-            Some("backend_managed")
-        );
         let serialized = serde_json::to_string(&projected).unwrap();
         assert!(!serialized.contains("/tmp/"));
         assert!(!serialized.contains("materialized_path"));
     }
 
     #[tokio::test]
-    async fn workspace_managed_workdir_summaries_exclude_runtime_unmanaged_rows() {
+    async fn workspace_workdir_summaries_include_runtime_observed_rows() {
         let dir = tempfile::tempdir().unwrap();
         let api = test_api(dir.path()).await;
         api.store
@@ -5566,7 +5481,6 @@ mod tests {
                 resolved_commit: None,
                 materialization_status: "present".to_string(),
                 cleanliness: "clean".to_string(),
-                management_kind: "backend_managed".to_string(),
                 created_at: "1".to_string(),
                 updated_at: "1".to_string(),
             })
@@ -5581,29 +5495,29 @@ mod tests {
                 resolved_commit: None,
                 materialization_status: "present".to_string(),
                 cleanliness: "unknown".to_string(),
-                management_kind: "runtime_unmanaged".to_string(),
                 created_at: "1".to_string(),
                 updated_at: "2".to_string(),
             })
             .unwrap();
 
-        let managed = working_directory_summaries(&api)
+        let summaries = working_directory_summaries(&api)
             .unwrap_or_else(|err| panic!("working_directory_summaries failed: {}", err.error));
-        assert_eq!(managed.len(), 1);
-        assert_eq!(managed[0].working_directory_id, "managed");
-        assert_eq!(
-            managed[0].management_kind.as_deref(),
-            Some("backend_managed")
-        );
+        let ids = summaries
+            .iter()
+            .map(|summary| summary.working_directory_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"managed"));
+        assert!(ids.contains(&"runtime-direct"));
 
         let (runtime_projection, _) =
             runtime_working_directory_summaries(&api, EMBEDDED_WORKER_RUNTIME_ID).unwrap_or_else(
                 |err| panic!("runtime_working_directory_summaries failed: {}", err.error),
             );
-        assert!(runtime_projection.iter().any(|summary| {
-            summary.working_directory_id == "runtime-direct"
-                && summary.management_kind.as_deref() == Some("runtime_unmanaged")
-        }));
+        assert!(
+            runtime_projection
+                .iter()
+                .any(|summary| summary.working_directory_id == "runtime-direct")
+        );
     }
     #[test]
     fn unmanaged_runtime_workdir_projection_is_typed_and_diagnostic_safe() {
@@ -5616,7 +5530,6 @@ mod tests {
             resolved_commit: None,
             materialization_status: "present".to_string(),
             cleanliness: "unknown".to_string(),
-            management_kind: "runtime_unmanaged".to_string(),
             created_at: "1".to_string(),
             updated_at: "2".to_string(),
         };
@@ -5624,10 +5537,6 @@ mod tests {
         let projected = workdir_summary_from_record(&workdir);
 
         assert_eq!(projected.status, WorkingDirectoryStatusKind::Active);
-        assert_eq!(
-            projected.management_kind.as_deref(),
-            Some("runtime_unmanaged")
-        );
         let serialized = serde_json::to_string(&projected).unwrap();
         assert!(!serialized.contains("/tmp/"));
         assert!(!serialized.contains("materialized_path"));
@@ -6227,7 +6136,6 @@ mod tests {
                 workdir_id: workdir_id.to_string(),
                 runtime_id: "runtime-test".to_string(),
                 repository_id: "repo-test".to_string(),
-                management_kind: "backend_managed".to_string(),
                 selector: Some("HEAD".to_string()),
                 resolved_commit: None,
                 materialization_status: status.to_string(),

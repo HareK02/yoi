@@ -123,8 +123,6 @@ pub struct BackendWorkingDirectorySummary {
     pub cleanliness: Option<String>,
     #[serde(default)]
     pub primary_worker_id: Option<String>,
-    #[serde(default)]
-    pub management_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

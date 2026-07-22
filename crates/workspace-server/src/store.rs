@@ -47,6 +47,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add workdir runtime observation states",
         apply: add_workdir_runtime_observation_states,
     },
+    Migration {
+        version: 7,
+        name: "remove workdir registry management kind",
+        apply: remove_workdir_registry_management_kind_column,
+    },
 ];
 
 struct Migration {
@@ -91,8 +96,6 @@ pub struct WorkdirRegistryRecord {
     pub resolved_commit: Option<String>,
     pub materialization_status: String,
     pub cleanliness: String,
-    /// `backend_managed` rows are authored by this Backend; `runtime_unmanaged` is for diagnostics only.
-    pub management_kind: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -148,11 +151,6 @@ pub trait ControlPlaneStore: Send + Sync {
         workdir_id: &str,
     ) -> Result<Option<WorkdirRegistryRecord>>;
     fn list_workdir_registry(
-        &self,
-        workspace_id: &str,
-        limit: usize,
-    ) -> Result<Vec<WorkdirRegistryRecord>>;
-    fn list_managed_workdir_registry(
         &self,
         workspace_id: &str,
         limit: usize,
@@ -378,8 +376,8 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             conn.execute(
                 r#"INSERT INTO workdir_registry (
                     workspace_id, workdir_id, runtime_id, repository_id, selector, resolved_commit,
-                    materialization_status, cleanliness, management_kind, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    materialization_status, cleanliness, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                 ON CONFLICT(workspace_id, workdir_id) DO UPDATE SET
                     runtime_id = excluded.runtime_id,
                     repository_id = excluded.repository_id,
@@ -387,7 +385,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     resolved_commit = excluded.resolved_commit,
                     materialization_status = excluded.materialization_status,
                     cleanliness = excluded.cleanliness,
-                    management_kind = excluded.management_kind,
                     updated_at = excluded.updated_at"#,
                 params![
                     record.workspace_id,
@@ -398,7 +395,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                     record.resolved_commit,
                     record.materialization_status,
                     record.cleanliness,
-                    record.management_kind,
                     record.created_at,
                     record.updated_at,
                 ],
@@ -437,22 +433,6 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
                 params![workspace_id, limit as i64],
                 read_workdir_registry_record,
             )?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(Error::from)
-        })
-    }
-
-    fn list_managed_workdir_registry(
-        &self,
-        workspace_id: &str,
-        limit: usize,
-    ) -> Result<Vec<WorkdirRegistryRecord>> {
-        self.with_conn(|conn| {
-            let sql = workdir_registry_select_sql(
-                "WHERE workspace_id = ?1 AND management_kind = 'backend_managed' ORDER BY updated_at DESC LIMIT ?2",
-            );
-            let mut stmt = conn.prepare(sql.as_str())?;
-            let rows = stmt.query_map(params![workspace_id, limit as i64], read_workdir_registry_record)?;
             rows.collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(Error::from)
         })
@@ -577,7 +557,7 @@ fn read_worker_registry_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Work
 fn workdir_registry_select_sql(where_clause: &str) -> String {
     format!(
         "SELECT workspace_id, workdir_id, runtime_id, repository_id, selector, resolved_commit, \
-         materialization_status, cleanliness, management_kind, created_at, updated_at \
+         materialization_status, cleanliness, created_at, updated_at \
          FROM workdir_registry {where_clause}"
     )
 }
@@ -594,9 +574,8 @@ fn read_workdir_registry_record(
         resolved_commit: row.get(5)?,
         materialization_status: row.get(6)?,
         cleanliness: row.get(7)?,
-        management_kind: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
 }
 
@@ -629,7 +608,6 @@ CREATE TABLE IF NOT EXISTS workdir_registry (
     resolved_commit TEXT,
     materialization_status TEXT NOT NULL CHECK (materialization_status IN ('pending', 'present', 'not_found', 'corrupted', 'unknown', 'failed')),
     cleanliness TEXT NOT NULL CHECK (cleanliness IN ('clean', 'dirty', 'unknown')),
-    management_kind TEXT NOT NULL CHECK (management_kind IN ('backend_managed', 'runtime_unmanaged')),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (workspace_id, workdir_id),
@@ -948,7 +926,6 @@ fn add_workdir_runtime_observation_states(conn: &Connection) -> Result<()> {
             resolved_commit TEXT,
             materialization_status TEXT NOT NULL CHECK (materialization_status IN ('pending', 'present', 'not_found', 'corrupted', 'unknown', 'failed')),
             cleanliness TEXT NOT NULL CHECK (cleanliness IN ('clean', 'dirty', 'unknown')),
-            management_kind TEXT NOT NULL CHECK (management_kind IN ('backend_managed', 'runtime_unmanaged')),
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (workspace_id, workdir_id),
@@ -956,7 +933,7 @@ fn add_workdir_runtime_observation_states(conn: &Connection) -> Result<()> {
         );
         INSERT OR REPLACE INTO workdir_registry_v6 (
             workspace_id, workdir_id, runtime_id, repository_id, selector, resolved_commit,
-            materialization_status, cleanliness, management_kind, created_at, updated_at
+            materialization_status, cleanliness, created_at, updated_at
         )
         SELECT
             workspace_id, workdir_id, runtime_id, repository_id, selector, resolved_commit,
@@ -965,10 +942,52 @@ fn add_workdir_runtime_observation_states(conn: &Connection) -> Result<()> {
                 WHEN 'removed' THEN 'not_found'
                 ELSE materialization_status
             END,
-            cleanliness, management_kind, created_at, updated_at
+            cleanliness, created_at, updated_at
         FROM workdir_registry;
         DROP TABLE workdir_registry;
         ALTER TABLE workdir_registry_v6 RENAME TO workdir_registry;
+        CREATE INDEX IF NOT EXISTS idx_workdir_registry_workspace_updated
+            ON workdir_registry(workspace_id, updated_at DESC);
+        "#,
+    )?;
+    Ok(())
+}
+
+fn remove_workdir_registry_management_kind_column(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "workdir_registry")?
+        || !table_columns(conn, "workdir_registry")?
+            .iter()
+            .any(|column| column == "management_kind")
+    {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        r#"
+        CREATE TABLE workdir_registry_v7 (
+            workspace_id TEXT NOT NULL,
+            workdir_id TEXT NOT NULL,
+            runtime_id TEXT NOT NULL,
+            repository_id TEXT NOT NULL,
+            selector TEXT,
+            resolved_commit TEXT,
+            materialization_status TEXT NOT NULL CHECK (materialization_status IN ('pending', 'present', 'not_found', 'corrupted', 'unknown', 'failed')),
+            cleanliness TEXT NOT NULL CHECK (cleanliness IN ('clean', 'dirty', 'unknown')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (workspace_id, workdir_id),
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+        );
+        INSERT OR REPLACE INTO workdir_registry_v7 (
+            workspace_id, workdir_id, runtime_id, repository_id, selector, resolved_commit,
+            materialization_status, cleanliness, created_at, updated_at
+        )
+        SELECT
+            workspace_id, workdir_id, runtime_id, repository_id, selector, resolved_commit,
+            materialization_status, cleanliness, created_at, updated_at
+        FROM workdir_registry;
+        DROP TABLE workdir_registry;
+        ALTER TABLE workdir_registry_v7 RENAME TO workdir_registry;
         CREATE INDEX IF NOT EXISTS idx_workdir_registry_workspace_updated
             ON workdir_registry(workspace_id, updated_at DESC);
         "#,
@@ -1199,7 +1218,7 @@ mod tests {
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 6);
+        assert_eq!(store.schema_version().await.unwrap(), 7);
 
         let record = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
@@ -1211,7 +1230,7 @@ mod tests {
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 6);
+        assert_eq!(reopened.schema_version().await.unwrap(), 7);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -1420,7 +1439,7 @@ mod tests {
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 6);
+        assert_eq!(store.schema_version().await.unwrap(), 7);
 
         store
             .with_conn(|conn| {
@@ -1550,7 +1569,6 @@ mod tests {
             resolved_commit: Some("abcdef".to_string()),
             materialization_status: "not_found".to_string(),
             cleanliness: "clean".to_string(),
-            management_kind: "backend_managed".to_string(),
             created_at: "2".to_string(),
             updated_at: "3".to_string(),
         };
@@ -1564,7 +1582,6 @@ mod tests {
             resolved_commit: Some("123456".to_string()),
             materialization_status: "present".to_string(),
             cleanliness: "unknown".to_string(),
-            management_kind: "runtime_unmanaged".to_string(),
             created_at: "3".to_string(),
             updated_at: "4".to_string(),
         };
@@ -1596,12 +1613,6 @@ mod tests {
         assert_eq!(
             store.list_workdir_registry("local-dev", 10).unwrap(),
             vec![unmanaged_workdir.clone(), workdir.clone()]
-        );
-        assert_eq!(
-            store
-                .list_managed_workdir_registry("local-dev", 10)
-                .unwrap(),
-            vec![workdir]
         );
         assert_eq!(
             store

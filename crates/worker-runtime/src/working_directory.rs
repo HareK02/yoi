@@ -48,7 +48,6 @@ impl WorkingDirectory {
             status: self.status.clone(),
             cleanliness: None,
             primary_worker_id: None,
-            management_kind: None,
         }
     }
 }
@@ -222,7 +221,6 @@ impl LocalGitWorktreeMaterializer {
                 status: WorkingDirectoryStatusKind::Corrupted,
                 cleanliness: Some("unknown".to_string()),
                 primary_worker_id: None,
-                management_kind: None,
             },
         }
     }

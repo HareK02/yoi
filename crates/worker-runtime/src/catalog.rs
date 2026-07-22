@@ -156,10 +156,6 @@ pub struct WorkingDirectorySummary {
     pub cleanliness: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_worker_id: Option<WorkerId>,
-    /// Backend projection metadata. Runtimes leave this absent; Workspace Browser
-    /// APIs fill it with `backend_managed` or `runtime_unmanaged`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub management_kind: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

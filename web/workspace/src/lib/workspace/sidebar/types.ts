@@ -125,7 +125,6 @@ export type WorkingDirectorySummary = {
   status: string;
   cleanliness?: string | null;
   primary_worker_id?: number | null;
-  management_kind?: "backend_managed" | "runtime_unmanaged" | string | null;
   cleanup_target: {
     kind: string;
     working_directory_id: string;
