@@ -166,3 +166,35 @@ Verification:
 - `git diff --check`
 
 ---
+
+<!-- event: implementation_report author: assistant at: 2026-07-22T02:11:40Z -->
+
+## Implementation report
+
+Bug fix for missing local echo in TUI/Web:
+
+Observed symptom:
+- Sending from TUI/Web over unified `/protocol/ws` reached the runtime and was accepted as `protocol_method`, but the user's sent content did not appear in the Console.
+
+Root cause:
+- The old HTTP input path emitted observation events for accepted input via `input_protocol_event(...)` (`Event::UserMessage` for user input / `Event::SystemItem` for system input).
+- The new raw `Method::Run` / `Method::Notify` protocol path dispatched the method to the execution backend but did not record the corresponding observation echo event.
+- Therefore the unified protocol stream had assistant/runtime events, but no echo event representing the user-sent content.
+
+Fix:
+- Added protocol-method observation echo in `worker-runtime` after accepted `Runtime::send_protocol_method(...)` dispatch.
+- `Method::Run` now records `Event::UserMessage { segments }`.
+- `Method::Notify` now records a system input `Event::SystemItem`.
+- Kept compact/list_rewind_targets/register_peer command echoes aligned with the old command-input observation shape.
+- Added a runtime protocol WS regression test: send `Method::Run` over `/protocol/ws` and assert the same socket receives `Event::UserMessage` with the sent text.
+
+Verification:
+- `nix develop -c cargo fmt -- --check`
+- `nix develop -c cargo check -p worker-runtime -p yoi-workspace-server -p client -p tui`
+- `nix develop -c cargo test -p worker-runtime --features ws-server --lib protocol_ws_echoes_accepted_run_as_user_message`
+- `nix develop -c cargo test -p worker-runtime --features ws-server --lib protocol_ws`
+- `nix develop -c cargo test -p yoi-workspace-server protocol_ws --lib`
+- `nix develop -c cargo test -p client backend_runtime --lib`
+- `git diff --check`
+
+---

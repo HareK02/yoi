@@ -1167,6 +1167,17 @@ mod ws_tests {
                 WorkerExecutionRunState::Idle,
             )
         }
+
+        fn dispatch_method(
+            &self,
+            _handle: &WorkerExecutionHandle,
+            _method: protocol::Method,
+        ) -> WorkerExecutionResult {
+            WorkerExecutionResult::accepted(
+                WorkerExecutionOperation::ProtocolMethod,
+                WorkerExecutionRunState::Idle,
+            )
+        }
     }
 
     fn ws_test_bundle(profile: ProfileSelector) -> ConfigBundle {
@@ -1326,6 +1337,34 @@ mod ws_tests {
             next_frame(&mut stream).await,
             protocol::Event::TextDone { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn protocol_ws_echoes_accepted_run_as_user_message() {
+        let (_runtime, _worker_ref, url) = spawn_runtime_server().await;
+        let (mut stream, _) = connect_async(&url).await.unwrap();
+        let _ = next_frame(&mut stream).await;
+
+        stream
+            .send(Message::Text(
+                serde_json::to_string(&protocol::Method::Run {
+                    input: vec![protocol::Segment::text("hello from protocol")],
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+        match next_frame(&mut stream).await {
+            protocol::Event::UserMessage { segments } => {
+                assert_eq!(
+                    protocol::Segment::flatten_to_text(&segments),
+                    "hello from protocol"
+                );
+            }
+            event => panic!("expected user message echo, got {event:?}"),
+        }
     }
 
     #[tokio::test]
