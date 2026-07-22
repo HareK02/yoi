@@ -15,8 +15,9 @@ It is not a dumping ground for external research, old plans, API inventories, or
 7. [`development/plugin-development.md`](development/plugin-development.md) — how to build, package, enable, and inspect Yoi Plugins.
 8. [`design/memory-knowledge.md`](design/memory-knowledge.md) — generated memory and audit records.
 9. [`design/workspace-kanban-orchestrator-runtime.md`](design/workspace-kanban-orchestrator-runtime.md) — how Kanban operations become durable orchestration events and backend-internal routing decisions.
-10. [`development/work-items.md`](development/work-items.md) — how project work is recorded and reviewed.
-11. [`development/validation.md`](development/validation.md) — how to check changes.
+10. [`design/workspace-runtime-docker.md`](design/workspace-runtime-docker.md) — the WebUI / Backend / Runtime split, Docker image layout, worker launch path, and workdir materialization boundary.
+11. [`development/work-items.md`](development/work-items.md) — how project work is recorded and reviewed.
+12. [`development/validation.md`](development/validation.md) — how to check changes.
 
 ## What belongs here
 
