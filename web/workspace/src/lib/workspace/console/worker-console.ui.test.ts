@@ -152,14 +152,16 @@ Deno.test("Worker Console composer fits to content without manual resize", async
   );
   assert(
     consolePage.includes("use:fitTextarea={{ value: draft, maxRows: 10 }}") &&
-      consolePage.includes("class=\"composer-input-shell\" onclick={handleComposerShellClick}") &&
+      consolePage.includes("<div class=\"composer-input-shell\">") &&
+      !consolePage.includes("handleComposerShellClick") &&
       consolePage.includes("bind:this={composerTextareaElement}") &&
-      consolePage.includes("composerTextareaElement?.focus()") &&
       consolePage.includes('event.key === "PageUp" || event.key === "PageDown"') &&
       consolePage.includes("scrollConsoleByPage") &&
       consolePage.includes("class=\"composer-input-footer\"") &&
+      consolePage.includes("pointer-events: none") &&
       consolePage.includes("class=\"composer-footer-slot\"") &&
       consolePage.includes("class=\"composer-send-button\"") &&
+      consolePage.includes("pointer-events: auto") &&
       consolePage.includes("class=\"composer-send-icon\"") &&
       consolePage.includes('d="M8 6L12 2L16 6"') &&
       consolePage.includes(".console-composer textarea") &&

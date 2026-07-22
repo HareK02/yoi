@@ -376,17 +376,6 @@
         window.requestAnimationFrame(updateConsoleScrollMetrics);
     }
 
-    function handleComposerShellClick(event: MouseEvent) {
-        const target = event.target;
-        if (
-            target instanceof Element &&
-            target.closest("button, textarea, a")
-        ) {
-            return;
-        }
-        composerTextareaElement?.focus();
-    }
-
     function sendControl(method: ProtocolMethod, label: string) {
         try {
             sendProtocolMethod(method);
@@ -1317,7 +1306,7 @@
     {/if}
 
     <form class="console-composer card" onsubmit={sendMessage}>
-        <div class="composer-input-shell" onclick={handleComposerShellClick}>
+        <div class="composer-input-shell">
             <textarea
                 id="worker-console-message"
                 aria-label="Console input"
@@ -1603,8 +1592,7 @@
     }
 
     .composer-input-shell {
-        display: grid;
-        gap: var(--space-2);
+        position: relative;
         border: 1px solid var(--line);
         border-radius: 18px;
         background: var(--bg-raised);
@@ -1618,12 +1606,16 @@
     }
 
     .composer-input-footer {
+        position: absolute;
+        right: 0.7rem;
+        bottom: 0.7rem;
+        left: 1rem;
         display: grid;
         grid-template-columns: minmax(0, 1fr) auto;
         gap: var(--space-2);
         align-items: end;
         min-height: 2.35rem;
-        padding-left: 0.65rem;
+        pointer-events: none;
     }
 
     .composer-footer-slot {
@@ -1633,17 +1625,18 @@
     .console-composer textarea {
         box-sizing: border-box;
         width: 100%;
-        min-height: 0;
+        min-height: 5.35rem;
         resize: none;
         overflow-y: hidden;
         border: 0;
         border-radius: 14px;
         background: transparent;
-        padding: 0.55rem 0.65rem;
+        padding: 0.55rem 3.4rem 3rem 0.65rem;
         font: inherit;
         line-height: 1.45;
         color: var(--text-strong);
         outline: none;
+        cursor: text;
     }
 
     .console-composer textarea:disabled {
@@ -1661,6 +1654,7 @@
         color: var(--bg);
         cursor: pointer;
         padding: 0;
+        pointer-events: auto;
     }
 
     .composer-send-button:disabled {

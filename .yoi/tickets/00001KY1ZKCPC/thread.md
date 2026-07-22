@@ -463,3 +463,42 @@ Verification:
 - `git diff --check`
 
 ---
+
+<!-- event: comment author: assistant at: 2026-07-22T07:53:01Z -->
+
+## Comment
+
+Requested Web Console composer a11y/focus refactor before implementation:
+
+- Requirement: clicking anywhere in the composer input surface except the button should focus the textarea.
+- Preferred structure: do not add `role="button"` to a layout `<div>` and do not wrap the send button in a `<label>`.
+- Instead, make the textarea itself occupy the input surface and use padding/overlay layout for the footer and send button.
+- The send button remains structurally outside/above the textarea surface and handles submit normally.
+- Expected result: remove the clickable `<div>` a11y warning while preserving the composer click-to-focus behavior.
+
+---
+
+<!-- event: implementation_report author: assistant at: 2026-07-22T07:55:21Z -->
+
+## Implementation report
+
+Implementation report for Web Console composer focus/a11y refactor:
+
+- Removed the `onclick={handleComposerShellClick}` layout-div focus handler and deleted `handleComposerShellClick`.
+- Kept the composer shell as non-interactive layout.
+- Made the textarea itself occupy the input surface:
+  - larger min-height
+  - right/bottom padding reserved for the overlaid footer and send button
+  - `cursor: text`
+- Changed the footer to an absolute overlay with `pointer-events: none`, so clicks on non-button footer/composer area pass through to the textarea.
+- Kept the send button as a normal submit button with `pointer-events: auto`.
+- Updated the Web UI fixture test to assert the shell no longer has the click handler and the overlay pointer-event layout is present.
+
+Verification:
+- `cd web/workspace && deno test --allow-read=src --allow-env=VSCODE_TEXTMATE_DEBUG src/lib/workspace/console/worker-console.ui.test.ts`
+- `cd web/workspace && deno task check`
+- `git diff --check`
+
+Result: `svelte-check found 0 errors and 0 warnings`.
+
+---
