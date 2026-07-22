@@ -17,6 +17,7 @@
     import { fitTextarea } from "$lib/workspace/console/textarea-fit";
     import {
         createConsoleProjector,
+        selectConsoleTimelineLines,
         type ConsoleEventInput,
         type ConsoleLine,
         type ConsoleProjection,
@@ -643,8 +644,10 @@
         metrics: ScrollMetrics,
     ): TimelineLayout {
         const denominator = Math.max(items.length - 1, 1);
-        const rawMarks = items
-            .map((item, index) => timelineMarkForLine(item, index, denominator))
+        const rawMarks = selectConsoleTimelineLines(items)
+            .map(({ item, index }) =>
+                timelineMarkForLine(item, index, denominator)
+            )
             .filter((mark): mark is TimelineMark => mark !== null);
         const trackHeight = timelineTrackHeight(metrics);
         const positioned = positionTimelineMarks(rawMarks, trackHeight);

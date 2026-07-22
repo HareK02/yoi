@@ -376,3 +376,41 @@ Verification:
 - `git diff --check`
 
 ---
+
+<!-- event: comment author: assistant at: 2026-07-22T07:04:51Z -->
+
+## Comment
+
+Requested Web Console timeline-bar display change before implementation:
+
+- Keep user-message markers/items as they are today.
+- For assistant display in the timeline bar, show only the last assistant item within each turn.
+
+Implementation plan:
+- Locate the Web timeline-bar projection/rendering path.
+- Change only the timeline-bar item derivation/filtering, not the underlying transcript/event model.
+- Add/update focused Web tests if there is a projection helper; otherwise verify through existing Web check and keep the diff scoped.
+
+---
+
+<!-- event: implementation_report author: assistant at: 2026-07-22T07:08:39Z -->
+
+## Implementation report
+
+Implementation report for Web Console timeline-bar assistant filtering:
+
+- Added `selectConsoleTimelineLines()` in `web/workspace/src/lib/workspace/console/model.ts`.
+- The selector keeps every `user` line in the timeline selection.
+- Assistant lines are grouped by user-delimited turns, and only the last assistant line in each turn is selected.
+- Non-user/non-assistant lines remain excluded from the timeline bar selection.
+- Updated `+page.svelte` timeline layout construction to use the selector before converting selected lines to timeline marks. Positioning still uses the full transcript line count, so marks remain aligned to scroll position.
+- Added a focused model test for `user, assistant, tool, assistant, user, assistant, assistant` to assert the selected timeline items are `u1`, `a2`, `u2`, and `a4`.
+
+Verification:
+- `cd web/workspace && deno test --allow-read=src --allow-env=VSCODE_TEXTMATE_DEBUG src/lib/workspace/console/model.test.ts`
+- `cd web/workspace && deno task check` passed with 0 errors; it still reports the existing 2 a11y warnings in `+page.svelte`.
+- `git diff --check`
+
+Note: `deno fmt --check` on the touched files still reports existing formatting changes outside this patch scope, so it was not used as the gating check for this small change.
+
+---

@@ -3,7 +3,9 @@ import {
   createConsoleProjector,
   projectConsole,
   segmentsToText,
+  selectConsoleTimelineLines,
   workerConsoleHref,
+  type ConsoleLine,
 } from "./model.ts";
 
 declare const Deno: {
@@ -22,6 +24,16 @@ function assertEquals<T>(actual: T, expected: T): void {
   if (actualJson !== expectedJson) {
     throw new Error(`Expected ${expectedJson}, got ${actualJson}`);
   }
+}
+
+function consoleLine(id: string, kind: ConsoleLine["kind"]): ConsoleLine {
+  return {
+    id,
+    kind,
+    title: kind,
+    body: id,
+    source: "event",
+  };
 }
 
 Deno.test("workerConsoleHref encodes runtime and worker target authority", () => {
@@ -855,5 +867,22 @@ Deno.test("projectConsole reseeds visible rows from segment rotation", () => {
   assertEquals(
     projection.lines.map((line) => `${line.kind}:${line.body}`),
     ["user:after rotation seed"],
+  );
+});
+
+Deno.test("selectConsoleTimelineLines keeps all users and only last assistant per turn", () => {
+  const items = [
+    consoleLine("u1", "user"),
+    consoleLine("a1", "assistant"),
+    consoleLine("tool1", "tool"),
+    consoleLine("a2", "assistant"),
+    consoleLine("u2", "user"),
+    consoleLine("a3", "assistant"),
+    consoleLine("a4", "assistant"),
+  ];
+
+  assertEquals(
+    selectConsoleTimelineLines(items).map(({ item, index }) => `${index}:${item.id}`),
+    ["0:u1", "3:a2", "4:u2", "6:a4"],
   );
 });
