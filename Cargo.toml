@@ -99,4 +99,6 @@ tokio-tungstenite = "0.29"
 tower = "0.5"
 toml = "1.1"
 tracing = "0.1"
+url = "2.5"
 uuid = "1.23"
+webauthn-rs = { version = "0.5.2", features = ["danger-allow-state-serialisation", "danger-credential-internals"] }

@@ -15,7 +15,26 @@ pub const WORKSPACE_BACKEND_CONFIG_TEMPLATE: &str =
     include_str!("../../../resources/workspace-backend.default.toml");
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
 const DEFAULT_FRONTEND_URL: &str = "http://127.0.0.1:5173";
+const DEFAULT_AUTH_PUBLIC_BASE_URL: &str = "http://localhost:8787";
+const DEFAULT_AUTH_RP_ID: &str = "localhost";
+const DEFAULT_AUTH_COOKIE_NAME: &str = "yoi_workspace_session";
 const DEFAULT_MAX_RECORDS: usize = 200;
+
+fn default_auth_rp_id() -> String {
+    DEFAULT_AUTH_RP_ID.to_string()
+}
+
+fn default_auth_origin() -> String {
+    DEFAULT_AUTH_PUBLIC_BASE_URL.to_string()
+}
+
+fn default_auth_public_base_url() -> String {
+    DEFAULT_AUTH_PUBLIC_BASE_URL.to_string()
+}
+
+fn default_auth_cookie_name() -> String {
+    DEFAULT_AUTH_COOKIE_NAME.to_string()
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -26,6 +45,8 @@ pub struct WorkspaceBackendConfigFile {
     pub data: WorkspaceBackendDataConfig,
     #[serde(default)]
     pub limits: WorkspaceBackendLimitsConfig,
+    #[serde(default)]
+    pub auth: WorkspaceBackendAuthConfig,
     #[serde(default)]
     pub repositories: Vec<WorkspaceRepositoryConfigFile>,
     #[serde(default)]
@@ -59,6 +80,30 @@ pub struct WorkspaceBackendDataConfig {
 pub struct WorkspaceBackendLimitsConfig {
     #[serde(default)]
     pub max_records: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceBackendAuthConfig {
+    #[serde(default = "default_auth_rp_id")]
+    pub rp_id: String,
+    #[serde(default = "default_auth_origin")]
+    pub origin: String,
+    #[serde(default = "default_auth_public_base_url")]
+    pub public_base_url: String,
+    #[serde(default = "default_auth_cookie_name")]
+    pub cookie_name: String,
+}
+
+impl Default for WorkspaceBackendAuthConfig {
+    fn default() -> Self {
+        Self {
+            rp_id: default_auth_rp_id(),
+            origin: default_auth_origin(),
+            public_base_url: default_auth_public_base_url(),
+            cookie_name: default_auth_cookie_name(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -290,8 +335,11 @@ impl WorkspaceBackendConfigFile {
             .iter()
             .map(resolve_remote_runtime)
             .collect::<Result<Vec<_>>>()?;
-        server.auth = AuthConfig::LocalDevToken {
-            token_configured: false,
+        server.auth = AuthConfig::Passkey {
+            rp_id: self.auth.rp_id.trim().to_string(),
+            origin: self.auth.origin.trim().to_string(),
+            public_base_url: self.auth.public_base_url.trim().to_string(),
+            cookie_name: self.auth.cookie_name.trim().to_string(),
         };
 
         Ok(ResolvedWorkspaceBackendConfig {

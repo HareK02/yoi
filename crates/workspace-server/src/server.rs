@@ -5,12 +5,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION};
+use axum::http::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, SET_COOKIE};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
-use chrono::{SecondsFormat, Utc};
+use chrono::{Duration, SecondsFormat, Utc};
 use futures::{SinkExt, StreamExt};
 use memory::backend::{
     MemoryBackendHttpResponse, MemoryBackendOperation, execute_memory_backend_operation,
@@ -26,9 +26,21 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use url::Url;
+use uuid::Uuid;
+use webauthn_rs::prelude::{
+    CreationChallengeResponse, Passkey, PasskeyAuthentication, PasskeyRegistration,
+    PublicKeyCredential, RegisterPublicKeyCredential, RequestChallengeResponse, Webauthn,
+    WebauthnBuilder,
+};
 use worker_runtime::resource::{BackendResourceError, BackendResourceFetchRequest};
 use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeExecutionBackend};
 
+use crate::auth::{
+    AuthPublicConfig, AuthenticatedUser, RequestActor, auth_error, is_expired, mint_secret, new_id,
+    new_user_code, normalize_handle, resolve_request_actor, rfc3339_after, session_set_cookie,
+    token_hash,
+};
 use crate::companion::{
     CompanionCancelRequest, CompanionConsole, CompanionMessageRequest, CompanionMessageResponse,
     CompanionStatusResponse, CompanionTranscriptProjection,
@@ -64,8 +76,9 @@ use crate::repositories::{
 use crate::resource_broker::BackendResourceBroker;
 use crate::skills;
 use crate::store::{
-    ControlPlaneStore, WorkdirRegistryRecord, WorkerRegistryRecord, WorkerWorkdirLinkRecord,
-    WorkspaceRecord,
+    AccountRecord, ApiTokenRecord, AuthChallengeRecord, BrowserSessionRecord, ControlPlaneStore,
+    DeviceLoginFlowRecord, PasskeyCredentialRecord, UserRecord, WorkdirRegistryRecord,
+    WorkerRegistryRecord, WorkerWorkdirLinkRecord, WorkspaceRecord,
 };
 use crate::{Error, Result};
 use worker_runtime::catalog::{
@@ -91,9 +104,14 @@ fn embedded_runtime_id() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AuthConfig {
-    /// Local/dev-only mode. If a token is configured by a future entrypoint, it
-    /// is a development guard only and not a production SaaS auth model.
-    LocalDevToken { token_configured: bool },
+    /// Browser human auth uses Passkey ceremonies and HttpOnly cookie sessions;
+    /// CLI/TUI auth uses API tokens obtained through the device login flow.
+    Passkey {
+        rp_id: String,
+        origin: String,
+        public_base_url: String,
+        cookie_name: String,
+    },
 }
 
 #[derive(Clone)]
@@ -126,8 +144,11 @@ impl ServerConfig {
             frontend_url: "http://127.0.0.1:5173".to_string(),
             embedded_runtime_store_root,
             static_assets_dir: None,
-            auth: AuthConfig::LocalDevToken {
-                token_configured: false,
+            auth: AuthConfig::Passkey {
+                rp_id: "localhost".to_string(),
+                origin: "http://localhost:8787".to_string(),
+                public_base_url: "http://localhost:8787".to_string(),
+                cookie_name: "yoi_workspace_session".to_string(),
             },
             max_records: 200,
             repositories: Vec::new(),
@@ -233,6 +254,7 @@ impl WorkspaceApi {
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: config.workspace_id.clone(),
+                owner_account_id: None,
                 display_name: config.workspace_display_name.clone(),
                 state: "active".to_string(),
                 created_at: config.workspace_created_at.clone(),
@@ -297,6 +319,28 @@ impl WorkspaceApi {
 
 pub fn build_router(api: WorkspaceApi) -> Router {
     Router::new()
+        .route("/api/auth/config", get(get_auth_config))
+        .route("/api/auth/bootstrap-user", post(post_auth_bootstrap_user))
+        .route(
+            "/api/auth/passkeys/registration/options",
+            post(post_passkey_registration_options),
+        )
+        .route(
+            "/api/auth/passkeys/registration/complete",
+            post(post_passkey_registration_complete),
+        )
+        .route(
+            "/api/auth/passkeys/login/options",
+            post(post_passkey_login_options),
+        )
+        .route(
+            "/api/auth/passkeys/login/complete",
+            post(post_passkey_login_complete),
+        )
+        .route("/api/auth/device-login/start", post(post_device_login_start))
+        .route("/api/auth/device-login/approve", post(post_device_login_approve))
+        .route("/api/auth/device-login/poll", post(post_device_login_poll))
+        .route("/api/auth/whoami", get(get_auth_whoami))
         .route("/api/workspace", get(get_workspace))
         .route("/api/w/{workspace_id}/workspace", get(scoped_get_workspace))
         .route(
@@ -2441,6 +2485,654 @@ async fn scoped_list_host_workers(
 ) -> ApiResult<Json<RuntimeListResponse<WorkerSummary>>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
     list_host_workers(State(api), AxumPath(path.host_id)).await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthBootstrapUserRequest {
+    handle: String,
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AuthUserResponse {
+    user: AuthenticatedUser,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasskeyRegistrationOptionsRequest {
+    handle: String,
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PasskeyRegistrationOptionsResponse {
+    challenge_id: String,
+    public_key: CreationChallengeResponse,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasskeyRegistrationCompleteRequest {
+    challenge_id: String,
+    credential: RegisterPublicKeyCredential,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasskeyLoginOptionsRequest {
+    #[serde(default)]
+    handle: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PasskeyLoginOptionsResponse {
+    challenge_id: String,
+    public_key: RequestChallengeResponse,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasskeyLoginCompleteRequest {
+    challenge_id: String,
+    credential: PublicKeyCredential,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PasskeyLoginCompleteResponse {
+    user: AuthenticatedUser,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceLoginStartRequest {
+    #[serde(default)]
+    client_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DeviceLoginStartResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    verification_uri_complete: String,
+    expires_in: u64,
+    interval: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceLoginApproveRequest {
+    user_code: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DeviceLoginApproveResponse {
+    status: String,
+    user: AuthenticatedUser,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceLoginPollRequest {
+    device_code: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DeviceLoginPollResponse {
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_type: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WhoamiResponse {
+    actor: Option<RequestActor>,
+}
+
+async fn get_auth_config(State(api): State<WorkspaceApi>) -> ApiResult<Json<AuthPublicConfig>> {
+    Ok(Json(auth_public_config(&api.config)))
+}
+
+async fn post_auth_bootstrap_user(
+    State(api): State<WorkspaceApi>,
+    Json(request): Json<AuthBootstrapUserRequest>,
+) -> ApiResult<Json<AuthUserResponse>> {
+    let user = ensure_user_account(&api, &request.handle, request.display_name.as_deref())?;
+    Ok(Json(AuthUserResponse { user }))
+}
+
+async fn post_passkey_registration_options(
+    State(api): State<WorkspaceApi>,
+    Json(request): Json<PasskeyRegistrationOptionsRequest>,
+) -> ApiResult<Json<PasskeyRegistrationOptionsResponse>> {
+    let user = ensure_user_account(&api, &request.handle, request.display_name.as_deref())?;
+    let webauthn = webauthn(&api.config)?;
+    let exclude_credentials = passkeys_for_user(&api, &user.user_id)?
+        .into_iter()
+        .map(|passkey| passkey.cred_id().clone())
+        .collect();
+    let user_unique_id = Uuid::now_v7();
+    let (public_key, state) = webauthn
+        .start_passkey_registration(
+            user_unique_id,
+            &user.handle,
+            &user.display_name,
+            Some(exclude_credentials),
+        )
+        .map_err(|error| auth_error("webauthn_registration_options_failed", &error.to_string()))?;
+    let challenge_id = new_id("webauthn-registration");
+    let auth = auth_public_config(&api.config);
+    api.store.put_auth_challenge(&AuthChallengeRecord {
+        challenge_id: challenge_id.clone(),
+        ceremony: "passkey_registration".to_string(),
+        challenge: challenge_id.clone(),
+        user_id: Some(user.user_id),
+        rp_id: auth.rp_id,
+        origin: auth.origin,
+        state_json: Some(
+            serde_json::to_string(&state).map_err(|error| {
+                auth_error("webauthn_state_serialize_failed", &error.to_string())
+            })?,
+        ),
+        expires_at: rfc3339_after(Duration::minutes(5)),
+        created_at: crate::auth::now_rfc3339(),
+        consumed_at: None,
+    })?;
+    Ok(Json(PasskeyRegistrationOptionsResponse {
+        challenge_id,
+        public_key,
+    }))
+}
+
+async fn post_passkey_registration_complete(
+    State(api): State<WorkspaceApi>,
+    Json(request): Json<PasskeyRegistrationCompleteRequest>,
+) -> ApiResult<Json<AuthUserResponse>> {
+    let challenge = api
+        .store
+        .consume_auth_challenge_by_id(
+            &request.challenge_id,
+            "passkey_registration",
+            &crate::auth::now_rfc3339(),
+        )?
+        .ok_or_else(|| {
+            auth_error(
+                "invalid_passkey_challenge",
+                "passkey registration challenge is invalid or already consumed",
+            )
+        })?;
+    if is_expired(&challenge.expires_at) {
+        return Err(auth_error(
+            "expired_passkey_challenge",
+            "passkey registration challenge expired",
+        )
+        .into());
+    }
+    let user_id = challenge.user_id.ok_or_else(|| {
+        auth_error(
+            "invalid_passkey_challenge",
+            "passkey registration challenge is not bound to a user",
+        )
+    })?;
+    let user = api.store.get_user(&user_id)?.ok_or_else(|| {
+        auth_error(
+            "unknown_auth_user",
+            "passkey registration user does not exist",
+        )
+    })?;
+    let state_json = challenge.state_json.ok_or_else(|| {
+        auth_error(
+            "missing_webauthn_state",
+            "passkey registration state was not persisted",
+        )
+    })?;
+    let state: PasskeyRegistration = serde_json::from_str(&state_json)
+        .map_err(|error| auth_error("webauthn_state_deserialize_failed", &error.to_string()))?;
+    let webauthn = webauthn(&api.config)?;
+    let passkey = webauthn
+        .finish_passkey_registration(&request.credential, &state)
+        .map_err(|error| {
+            auth_error(
+                "webauthn_registration_verification_failed",
+                &error.to_string(),
+            )
+        })?;
+    let credential_id = passkey_credential_id(&passkey)?;
+    api.store
+        .upsert_passkey_credential(&PasskeyCredentialRecord {
+            credential_id,
+            user_id: user.user_id.clone(),
+            public_key_cose: serde_json::to_string(&passkey).map_err(|error| {
+                auth_error("webauthn_passkey_serialize_failed", &error.to_string())
+            })?,
+            transports_json: None,
+            sign_count: 0,
+            created_at: crate::auth::now_rfc3339(),
+            last_used_at: None,
+        })?;
+    Ok(Json(AuthUserResponse {
+        user: user_response(user),
+    }))
+}
+
+async fn post_passkey_login_options(
+    State(api): State<WorkspaceApi>,
+    Json(request): Json<PasskeyLoginOptionsRequest>,
+) -> ApiResult<Json<PasskeyLoginOptionsResponse>> {
+    let user = match request.handle.as_deref() {
+        Some(handle) => api.store.get_user_by_handle(&normalize_handle(handle)?)?,
+        None => api.store.any_user()?,
+    }
+    .ok_or_else(|| auth_error("unknown_auth_user", "no matching user account exists"))?;
+    let passkeys = passkeys_for_user(&api, &user.user_id)?;
+    if passkeys.is_empty() {
+        return Err(auth_error(
+            "passkey_not_registered",
+            "user has no registered passkey credentials",
+        )
+        .into());
+    }
+    let webauthn = webauthn(&api.config)?;
+    let (public_key, state) = webauthn
+        .start_passkey_authentication(&passkeys)
+        .map_err(|error| auth_error("webauthn_login_options_failed", &error.to_string()))?;
+    let challenge_id = new_id("webauthn-login");
+    let auth = auth_public_config(&api.config);
+    api.store.put_auth_challenge(&AuthChallengeRecord {
+        challenge_id: challenge_id.clone(),
+        ceremony: "passkey_login".to_string(),
+        challenge: challenge_id.clone(),
+        user_id: Some(user.user_id),
+        rp_id: auth.rp_id,
+        origin: auth.origin,
+        state_json: Some(
+            serde_json::to_string(&state).map_err(|error| {
+                auth_error("webauthn_state_serialize_failed", &error.to_string())
+            })?,
+        ),
+        expires_at: rfc3339_after(Duration::minutes(5)),
+        created_at: crate::auth::now_rfc3339(),
+        consumed_at: None,
+    })?;
+    Ok(Json(PasskeyLoginOptionsResponse {
+        challenge_id,
+        public_key,
+    }))
+}
+
+async fn post_passkey_login_complete(
+    State(api): State<WorkspaceApi>,
+    Json(request): Json<PasskeyLoginCompleteRequest>,
+) -> ApiResult<Response> {
+    let challenge = api
+        .store
+        .consume_auth_challenge_by_id(
+            &request.challenge_id,
+            "passkey_login",
+            &crate::auth::now_rfc3339(),
+        )?
+        .ok_or_else(|| {
+            auth_error(
+                "invalid_passkey_challenge",
+                "passkey login challenge is invalid or already consumed",
+            )
+        })?;
+    if is_expired(&challenge.expires_at) {
+        return Err(auth_error(
+            "expired_passkey_challenge",
+            "passkey login challenge expired",
+        )
+        .into());
+    }
+    let user_id = challenge.user_id.ok_or_else(|| {
+        auth_error(
+            "invalid_passkey_challenge",
+            "passkey login challenge is not bound to a user",
+        )
+    })?;
+    let user = api
+        .store
+        .get_user(&user_id)?
+        .ok_or_else(|| auth_error("unknown_auth_user", "passkey user does not exist"))?;
+    let state_json = challenge.state_json.ok_or_else(|| {
+        auth_error(
+            "missing_webauthn_state",
+            "passkey login state was not persisted",
+        )
+    })?;
+    let state: PasskeyAuthentication = serde_json::from_str(&state_json)
+        .map_err(|error| auth_error("webauthn_state_deserialize_failed", &error.to_string()))?;
+    let webauthn = webauthn(&api.config)?;
+    let auth_result = webauthn
+        .finish_passkey_authentication(&request.credential, &state)
+        .map_err(|error| auth_error("webauthn_login_verification_failed", &error.to_string()))?;
+    let credential_id = serde_json::to_value(auth_result.cred_id())
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .ok_or_else(|| {
+            auth_error(
+                "invalid_webauthn_credential_id",
+                "verified credential id was not serializable",
+            )
+        })?;
+    let stored = api
+        .store
+        .get_passkey_credential(&credential_id)?
+        .ok_or_else(|| {
+            auth_error(
+                "unknown_passkey_credential",
+                "verified passkey credential is not registered",
+            )
+        })?;
+    if stored.user_id != user.user_id {
+        return Err(auth_error(
+            "passkey_user_mismatch",
+            "verified passkey credential does not belong to the challenged user",
+        )
+        .into());
+    }
+    api.store
+        .upsert_passkey_credential(&PasskeyCredentialRecord {
+            credential_id,
+            user_id: user.user_id.clone(),
+            public_key_cose: stored.public_key_cose,
+            transports_json: stored.transports_json,
+            sign_count: u64::from(auth_result.counter()),
+            created_at: stored.created_at,
+            last_used_at: Some(crate::auth::now_rfc3339()),
+        })?;
+    let session_token = mint_secret("yoi_sess");
+    api.store.create_browser_session(&BrowserSessionRecord {
+        session_id: new_id("session"),
+        token_hash: token_hash(&session_token),
+        user_id: user.user_id.clone(),
+        created_at: crate::auth::now_rfc3339(),
+        expires_at: rfc3339_after(Duration::days(14)),
+        revoked_at: None,
+    })?;
+    let cookie_name = auth_public_config(&api.config).cookie_name;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        SET_COOKIE,
+        session_set_cookie(&cookie_name, &session_token, 14 * 24 * 60 * 60)
+            .parse()
+            .map_err(|error| {
+                auth_error(
+                    "invalid_session_cookie",
+                    &format!("failed to build session cookie: {error}"),
+                )
+            })?,
+    );
+    Ok((
+        headers,
+        Json(PasskeyLoginCompleteResponse {
+            user: user_response(user),
+        }),
+    )
+        .into_response())
+}
+
+async fn post_device_login_start(
+    State(api): State<WorkspaceApi>,
+    Json(request): Json<DeviceLoginStartRequest>,
+) -> ApiResult<Json<DeviceLoginStartResponse>> {
+    let auth = auth_public_config(&api.config);
+    let device_code = mint_secret("yoi_device");
+    let user_code = new_user_code();
+    let verification_uri = format!(
+        "{}/login/device",
+        auth.public_base_url.trim_end_matches('/')
+    );
+    let verification_uri_complete = format!("{verification_uri}?user_code={user_code}");
+    api.store.create_device_login_flow(&DeviceLoginFlowRecord {
+        device_code: device_code.clone(),
+        user_code: user_code.clone(),
+        verification_uri: verification_uri.clone(),
+        client_name: request.client_name,
+        user_id: None,
+        api_token_id: None,
+        issued_access_token: None,
+        created_at: crate::auth::now_rfc3339(),
+        expires_at: rfc3339_after(Duration::minutes(10)),
+        approved_at: None,
+        consumed_at: None,
+    })?;
+    Ok(Json(DeviceLoginStartResponse {
+        device_code,
+        user_code,
+        verification_uri,
+        verification_uri_complete,
+        expires_in: 600,
+        interval: 5,
+    }))
+}
+
+async fn post_device_login_approve(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+    Json(request): Json<DeviceLoginApproveRequest>,
+) -> ApiResult<Json<DeviceLoginApproveResponse>> {
+    let actor = require_actor(&api, &headers).await?;
+    let flow = api
+        .store
+        .get_device_login_flow_by_user_code(&request.user_code.trim().to_ascii_uppercase())?
+        .ok_or_else(|| {
+            auth_error(
+                "unknown_device_login_code",
+                "device login code does not exist",
+            )
+        })?;
+    if is_expired(&flow.expires_at) {
+        return Err(auth_error("expired_device_login", "device login code expired").into());
+    }
+    if flow.approved_at.is_some() || flow.consumed_at.is_some() {
+        return Err(auth_error(
+            "device_login_already_used",
+            "device login code is already used",
+        )
+        .into());
+    }
+    let access_token = mint_secret("yoi_api");
+    let token_id = new_id("api-token");
+    api.store.create_api_token(&ApiTokenRecord {
+        token_id: token_id.clone(),
+        token_hash: token_hash(&access_token),
+        user_id: actor.user_id.clone(),
+        label: flow
+            .client_name
+            .clone()
+            .unwrap_or_else(|| "yoi device login".to_string()),
+        created_at: crate::auth::now_rfc3339(),
+        expires_at: None,
+        revoked_at: None,
+        last_used_at: None,
+    })?;
+    let approved = api.store.approve_device_login_flow(
+        &flow.device_code,
+        &actor.user_id,
+        &token_id,
+        &access_token,
+        &crate::auth::now_rfc3339(),
+    )?;
+    if !approved {
+        return Err(auth_error(
+            "device_login_already_used",
+            "device login code is already used",
+        )
+        .into());
+    }
+    Ok(Json(DeviceLoginApproveResponse {
+        status: "approved".to_string(),
+        user: actor.user(),
+    }))
+}
+
+async fn post_device_login_poll(
+    State(api): State<WorkspaceApi>,
+    Json(request): Json<DeviceLoginPollRequest>,
+) -> ApiResult<Json<DeviceLoginPollResponse>> {
+    let Some(flow) = api
+        .store
+        .get_device_login_flow_by_device_code(&request.device_code)?
+    else {
+        return Err(auth_error("unknown_device_login", "device login flow does not exist").into());
+    };
+    if is_expired(&flow.expires_at) {
+        return Ok(Json(DeviceLoginPollResponse {
+            status: "expired".to_string(),
+            access_token: None,
+            token_type: None,
+        }));
+    }
+    if flow.approved_at.is_none() {
+        return Ok(Json(DeviceLoginPollResponse {
+            status: "pending".to_string(),
+            access_token: None,
+            token_type: None,
+        }));
+    }
+    let Some(consumed) = api
+        .store
+        .consume_device_login_token(&request.device_code, &crate::auth::now_rfc3339())?
+    else {
+        return Ok(Json(DeviceLoginPollResponse {
+            status: "consumed".to_string(),
+            access_token: None,
+            token_type: None,
+        }));
+    };
+    Ok(Json(DeviceLoginPollResponse {
+        status: "approved".to_string(),
+        access_token: consumed.issued_access_token,
+        token_type: Some("Bearer".to_string()),
+    }))
+}
+
+async fn get_auth_whoami(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+) -> ApiResult<Json<WhoamiResponse>> {
+    Ok(Json(WhoamiResponse {
+        actor: resolve_actor(&api, &headers).await?,
+    }))
+}
+
+fn webauthn(config: &ServerConfig) -> ApiResult<Webauthn> {
+    let auth = auth_public_config(config);
+    let origin = Url::parse(&auth.origin)
+        .map_err(|error| auth_error("invalid_webauthn_origin", &error.to_string()))?;
+    WebauthnBuilder::new(&auth.rp_id, &origin)
+        .map_err(|error| auth_error("webauthn_builder_failed", &error.to_string()))?
+        .rp_name("Yoi Workspace")
+        .build()
+        .map_err(|error| auth_error("webauthn_builder_failed", &error.to_string()).into())
+}
+
+fn passkeys_for_user(api: &WorkspaceApi, user_id: &str) -> ApiResult<Vec<Passkey>> {
+    api.store
+        .list_passkey_credentials_for_user(user_id)?
+        .into_iter()
+        .map(|record| {
+            serde_json::from_str::<Passkey>(&record.public_key_cose).map_err(|error| {
+                auth_error("webauthn_passkey_deserialize_failed", &error.to_string()).into()
+            })
+        })
+        .collect()
+}
+
+fn passkey_credential_id(passkey: &Passkey) -> ApiResult<String> {
+    serde_json::to_value(passkey.cred_id())
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .ok_or_else(|| {
+            auth_error(
+                "invalid_webauthn_credential_id",
+                "verified passkey credential id was not serializable",
+            )
+            .into()
+        })
+}
+
+fn auth_public_config(config: &ServerConfig) -> AuthPublicConfig {
+    match &config.auth {
+        AuthConfig::Passkey {
+            rp_id,
+            origin,
+            public_base_url,
+            cookie_name,
+        } => AuthPublicConfig {
+            rp_id: rp_id.clone(),
+            origin: origin.clone(),
+            public_base_url: public_base_url.clone(),
+            cookie_name: cookie_name.clone(),
+        },
+    }
+}
+
+fn ensure_user_account(
+    api: &WorkspaceApi,
+    handle: &str,
+    display_name: Option<&str>,
+) -> ApiResult<AuthenticatedUser> {
+    let handle = normalize_handle(handle)?;
+    if let Some(user) = api.store.get_user_by_handle(&handle)? {
+        return Ok(user_response(user));
+    }
+    let now = crate::auth::now_rfc3339();
+    let display_name = display_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(handle.as_str())
+        .to_string();
+    let account = AccountRecord {
+        account_id: new_id("acct-user"),
+        kind: "user".to_string(),
+        handle: handle.clone(),
+        display_name: display_name.clone(),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    api.store.upsert_account(&account)?;
+    let user = UserRecord {
+        user_id: new_id("user"),
+        account_id: account.account_id,
+        handle,
+        display_name,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    api.store.upsert_user(&user)?;
+    Ok(user_response(user))
+}
+
+fn user_response(user: UserRecord) -> AuthenticatedUser {
+    AuthenticatedUser {
+        user_id: user.user_id,
+        account_id: user.account_id,
+        handle: user.handle,
+        display_name: user.display_name,
+    }
+}
+
+async fn resolve_actor(api: &WorkspaceApi, headers: &HeaderMap) -> ApiResult<Option<RequestActor>> {
+    let cookie_name = auth_public_config(&api.config).cookie_name;
+    Ok(resolve_request_actor(api.store.as_ref(), headers, &cookie_name).await?)
+}
+
+async fn require_actor(api: &WorkspaceApi, headers: &HeaderMap) -> ApiResult<RequestActor> {
+    resolve_actor(api, headers).await?.ok_or_else(|| {
+        auth_error(
+            "auth_required",
+            "request requires a browser session or Bearer API token",
+        )
+        .into()
+    })
 }
 
 async fn get_workspace(State(api): State<WorkspaceApi>) -> ApiResult<Json<WorkspaceResponse>> {
@@ -7927,6 +8619,68 @@ mod tests {
             dir,
         )
     }
+
+    #[tokio::test]
+    async fn passkey_registration_rejects_unverified_credential_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_app(dir.path()).await;
+
+        let registration_options = post_json(
+            app.clone(),
+            "/api/auth/passkeys/registration/options",
+            json!({
+                "handle": "alice",
+                "display_name": "Alice"
+            }),
+        )
+        .await;
+        assert!(registration_options["public_key"].is_object());
+        let challenge_id = registration_options["challenge_id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/passkeys/registration/complete")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "challenge_id": challenge_id,
+                            "credential": {
+                                "id": "credential-1",
+                                "rawId": "Y3JlZGVudGlhbC0x",
+                                "type": "public-key",
+                                "response": {
+                                    "clientDataJSON": "e30",
+                                    "attestationObject": "e30"
+                                }
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::OK);
+
+        let login_without_registered_passkey = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/passkeys/login/options")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "handle": "alice" })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(login_without_registered_passkey.status(), StatusCode::OK);
+    }
+
     async fn get_json(app: Router, uri: &str) -> Value {
         let response = app
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
