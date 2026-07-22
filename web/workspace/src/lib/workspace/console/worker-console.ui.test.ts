@@ -27,9 +27,13 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
   );
 
   assert(
-    workspacePage.includes("href={`/w/${workspaceId}/runtimes`}") &&
-      workspacePage.includes("href={`/w/${workspaceId}/workers`}"),
-    "top workspace page should link to Runtimes and Workers pages",
+    workspacePage.includes("ticketsHref") &&
+      workspacePage.includes("runtimeSettingsHref") &&
+      workspacePage.includes("workersHref") &&
+      workspacePage.includes("workspaceRoute(workspaceId, '/tickets')") &&
+      workspacePage.includes("workspaceRoute(workspaceId, '/settings/runtimes')") &&
+      workspacePage.includes("workspaceRoute(workspaceId, '/workers')"),
+    "top workspace page should link to Tickets, Runtime Inventory under Settings, and the Workers page",
   );
   assert(
     !workspacePage.includes("workerConsoleHref") &&
@@ -51,8 +55,66 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
   );
   assert(
     !sidebar.includes("CompanionNavSection") &&
+      sidebar.includes("TicketsNavSection") &&
       sidebar.includes("WorkersNavSection"),
-    "standalone Companion/Console navigation should not remain canonical",
+    "standalone Companion/Console navigation should not remain canonical and Tickets should be primary workspace navigation",
+  );
+});
+
+Deno.test("workspace Tickets surface uses read-only Backend Ticket APIs", async () => {
+  const ticketsNav = await Deno.readTextFile(
+    new URL("../sidebar/TicketsNavSection.svelte", import.meta.url),
+  );
+  const ticketsLoad = await Deno.readTextFile(
+    new URL("./../../../routes/w/[workspaceId]/tickets/+page.ts", import.meta.url),
+  );
+  const ticketsPage = await Deno.readTextFile(
+    new URL("./../../../routes/w/[workspaceId]/tickets/+page.svelte", import.meta.url),
+  );
+  const ticketDetailLoad = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/tickets/[ticketId]/+page.ts",
+      import.meta.url,
+    ),
+  );
+  const ticketDetailPage = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/tickets/[ticketId]/+page.svelte",
+      import.meta.url,
+    ),
+  );
+
+  assert(
+    ticketsNav.includes("workspaceRoute(workspaceId, '/tickets')") &&
+      ticketsNav.includes("Open Tickets"),
+    "Tickets sidebar section should link to the workspace Tickets surface",
+  );
+  assert(
+    ticketsLoad.includes('workspaceApiPath(params.workspaceId, "/tickets")') &&
+      ticketsPage.includes("This surface is read-only") &&
+      ticketsPage.includes("workspaceRoute(data.workspaceId, `/tickets/${ticket.id}`)"),
+    "Tickets list should read the workspace-scoped Ticket API and link to Ticket details",
+  );
+  assert(
+    ticketDetailLoad.includes("`/tickets/${encodeURIComponent(ticketId)}`") &&
+      ticketDetailPage.includes("event_count") &&
+      ticketDetailPage.includes("artifact_count") &&
+      ticketDetailPage.includes("<pre>{data.ticket.data.body"),
+    "Ticket detail should read one Ticket record and expose body plus metadata without mutation controls",
+  );
+});
+
+Deno.test("root layout does not keep legacy unscoped route compatibility", async () => {
+  const layoutLoad = await Deno.readTextFile(
+    new URL("./../../../routes/+layout.ts", import.meta.url),
+  );
+
+  assert(
+    !layoutLoad.includes("scopedCompatibilityRoute") &&
+      !layoutLoad.includes('pathname === "/runtimes"') &&
+      !layoutLoad.includes("return workspaceRoute(workspaceId, pathname)") &&
+      layoutLoad.includes("workspaceRoute(workspace.data.workspace_id)"),
+    "root layout should bootstrap the workspace entry only, not preserve legacy unscoped routes",
   );
 });
 
@@ -188,49 +250,50 @@ Deno.test("Decodal source editor keeps imperative EditorView out of reactive sta
   );
 });
 
-Deno.test("workspace Runtime management pages expose Runtimes and Runtime-owned workdirs", async () => {
+Deno.test("workspace Runtime inventory lives under Settings admin routes", async () => {
   const sidebar = await Deno.readTextFile(
     new URL("../sidebar/WorkspaceSidebar.svelte", import.meta.url),
   );
-  const runtimesNav = await Deno.readTextFile(
-    new URL("../sidebar/RuntimesNavSection.svelte", import.meta.url),
+  const settingsModel = await Deno.readTextFile(
+    new URL("../settings/model.ts", import.meta.url),
   );
   const runtimesPage = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/runtimes/+page.svelte",
+      "./../../../routes/w/[workspaceId]/settings/runtimes/+page.svelte",
       import.meta.url,
     ),
   );
   const workdirsPage = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workdirs/+page.svelte",
+      "./../../../routes/w/[workspaceId]/settings/runtimes/[runtimeId]/workdirs/+page.svelte",
       import.meta.url,
     ),
   );
   const workdirsLoad = await Deno.readTextFile(
     new URL(
-      "./../../../routes/w/[workspaceId]/runtimes/[runtimeId]/workdirs/+page.ts",
+      "./../../../routes/w/[workspaceId]/settings/runtimes/[runtimeId]/workdirs/+page.ts",
       import.meta.url,
     ),
   );
 
   assert(
-    sidebar.includes("RuntimesNavSection") &&
-      runtimesNav.includes("href={runtimesHref}") &&
-      runtimesNav.includes("/runtimes"),
-    "sidebar should expose Runtime management navigation",
+    !sidebar.includes("RuntimesNavSection") &&
+      settingsModel.includes('id: "runtime-inventory"') &&
+      settingsModel.includes('return `${SETTINGS_ROUTE}/runtimes`;'),
+    "Runtime inventory should be admin Settings navigation, not primary workspace sidebar navigation",
   );
   assert(
-    runtimesPage.includes("Open workdirs") &&
+    runtimesPage.includes("Runtime Inventory") &&
+      runtimesPage.includes("Open workdirs") &&
       runtimesPage.includes("runtimes-table") &&
-      runtimesPage.includes("/workdirs"),
-    "Runtimes page should table Runtimes and link to each Runtime's workdirs",
+      runtimesPage.includes("/settings/runtimes/${encodeURIComponent(runtime.runtime_id)}/workdirs"),
+    "Settings Runtime Inventory page should table Runtimes and link to each Runtime's workdirs",
   );
   assert(
-    workdirsPage.includes("Workdirs") &&
+    workdirsPage.includes("Runtime Inventory") &&
       workdirsPage.includes("workdirs-table") &&
       workdirsLoad.includes("/working-directories"),
-    "Workdirs page should read Runtime-owned working-directory API while using workdir UI language",
+    "Runtime workdirs should remain backed by Runtime APIs without legacy Runtime route redirects",
   );
 });
 

@@ -38,7 +38,7 @@ Deno.test("workspace route helpers scope browser routes and API by immutable wor
   );
 });
 
-Deno.test("unscoped layout bootstraps then redirects instead of loading unscoped workspace data", async () => {
+Deno.test("root layout bootstraps only the scoped workspace entry", async () => {
   const layout = await Deno.readTextFile(
     new URL("./../../../routes/+layout.ts", import.meta.url),
   );
@@ -47,23 +47,16 @@ Deno.test("unscoped layout bootstraps then redirects instead of loading unscoped
     "unscoped layout may use only the workspace-id bootstrap endpoint",
   );
   assert(
-    layout.includes("throw redirect(307") && layout.includes("workspaceRoute("),
-    "unscoped layout should redirect to the scoped workspace route",
+    layout.includes("throw redirect(307") &&
+      layout.includes("workspaceRoute(workspace.data.workspace_id)") &&
+      !layout.includes("scopedCompatibilityRoute") &&
+      !layout.includes("workspaceRoute(workspaceId, pathname)"),
+    "root layout should redirect only to the scoped workspace entry",
   );
   assert(
     !layout.includes("`/api${path}`") &&
       !layout.includes('"/api/repositories"'),
     "layout must not fall back to unscoped workspace-scoped API calls",
-  );
-
-  const unscopedSettings = await Deno.readTextFile(
-    new URL("./../../../routes/settings/+page.svelte", import.meta.url),
-  );
-  assert(
-    unscopedSettings.includes("Redirecting to scoped settings") &&
-      !unscopedSettings.includes("fetch(") &&
-      !unscopedSettings.includes("settingsApiPath"),
-    "unscoped settings route should remain a thin redirect shim, not a data/control surface",
   );
 });
 

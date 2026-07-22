@@ -1,8 +1,12 @@
 <script lang="ts">
+  import { workspaceRoute } from '$lib/workspace/api/http';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
   let workspaceId = $derived(data.workspace?.workspace_id ?? data.workspaceId);
+  let ticketsHref = $derived(workspaceRoute(workspaceId, '/tickets'));
+  let runtimeSettingsHref = $derived(workspaceRoute(workspaceId, '/settings/runtimes'));
+  let workersHref = $derived(workspaceRoute(workspaceId, '/workers'));
 </script>
 
 <svelte:head>
@@ -39,12 +43,17 @@
 </section>
 
 <section class="workspace-actions" aria-label="Workspace sections">
-  <a class="workspace-action-card" href={`/w/${workspaceId}/runtimes`}>
-    <span>Runtimes</span>
-    <strong>Manage runtimes and workdirs</strong>
+  <a class="workspace-action-card" href={ticketsHref}>
+    <span>Tickets</span>
+    <strong>Browse workspace tickets</strong>
+    <small>Read typed Ticket records</small>
+  </a>
+  <a class="workspace-action-card" href={runtimeSettingsHref}>
+    <span>Runtime Inventory</span>
+    <strong>Open admin runtime inventory</strong>
     <small>{data.hosts?.items.length ?? 0} host{(data.hosts?.items.length ?? 0) === 1 ? '' : 's'} visible</small>
   </a>
-  <a class="workspace-action-card" href={`/w/${workspaceId}/workers`}>
+  <a class="workspace-action-card" href={workersHref}>
     <span>Workers</span>
     <strong>Open worker list</strong>
     <small>Inspect status and attach to consoles</small>

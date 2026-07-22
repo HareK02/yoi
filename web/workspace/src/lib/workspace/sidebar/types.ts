@@ -320,6 +320,31 @@ export type TicketSummary = {
   record_source?: string;
 };
 
+export type TicketListResponse = {
+  workspace_id: string;
+  limit: number;
+  items: TicketSummary[];
+  invalid_records: InvalidProjectRecord[];
+  record_authority: string;
+};
+
+export type TicketDetail = {
+  id: string;
+  title: string;
+  state: string;
+  priority?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  queued_by?: string | null;
+  queued_at?: string | null;
+  risk_flags: string[];
+  body: string;
+  body_truncated: boolean;
+  event_count: number;
+  artifact_count: number;
+  record_source: string;
+};
+
 export type TicketKanbanColumn = {
   state: string;
   items: TicketSummary[];

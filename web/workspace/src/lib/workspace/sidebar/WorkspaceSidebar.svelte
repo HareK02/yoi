@@ -2,7 +2,7 @@
   import { workspaceRoute } from '$lib/workspace/api/http';
   import ObjectivesNavSection from './ObjectivesNavSection.svelte';
   import RepositoriesNavSection from './RepositoriesNavSection.svelte';
-  import RuntimesNavSection from './RuntimesNavSection.svelte';
+  import TicketsNavSection from './TicketsNavSection.svelte';
   import WorkersNavSection from './WorkersNavSection.svelte';
   import type { RepositoryListResponse, WorkspaceResponse } from './types';
 
@@ -107,7 +107,7 @@
     <nav class="sidebar-sections" aria-label="Workspace sections">
       <RepositoriesNavSection {repositories} {repositoriesError} {currentPath} {workspaceId} />
       <ObjectivesNavSection {currentPath} {workspaceId} />
-      <RuntimesNavSection {currentPath} {workspaceId} />
+      <TicketsNavSection {currentPath} {workspaceId} />
       <WorkersNavSection {currentPath} {workspaceId} />
     </nav>
   {/if}

@@ -445,12 +445,14 @@
 	.runtime-card {
 		padding: 0;
 	}
+	.ticket-list,
 	.objective-list {
 		display: flex;
 		flex-direction: column;
 		gap: var(--space-2);
 		margin-top: var(--space-4);
 	}
+	.ticket-row,
 	.objective-row {
 		display: grid;
 		grid-template-columns: minmax(0, 1fr) max-content;
@@ -463,27 +465,34 @@
 		text-decoration: none;
 		transition: background-color 140ms ease;
 	}
+	.ticket-row:hover,
+	.ticket-row:focus-visible,
 	.objective-row:hover,
 	.objective-row:focus-visible {
 		background: var(--interactive-hover);
 	}
+	.ticket-row.selected,
 	.objective-row.selected {
 		background: var(--interactive-selected);
 	}
+	.ticket-row.selected .ticket-title,
 	.objective-row.selected .objective-title {
 		color: var(--accent);
 	}
+	.ticket-main,
 	.objective-main {
 		display: grid;
 		gap: var(--space-1);
 		min-width: 0;
 	}
+	.ticket-title-row,
 	.objective-title-row {
 		display: flex;
 		align-items: baseline;
 		gap: var(--space-2);
 		min-width: 0;
 	}
+	.ticket-title,
 	.objective-title {
 		min-width: 0;
 		overflow: hidden;
@@ -500,12 +509,14 @@
 		letter-spacing: 0.05em;
 		text-transform: uppercase;
 	}
+	.ticket-summary,
 	.objective-summary {
 		margin: 0;
 		color: var(--text-muted);
 		font-size: 0.88rem;
 		line-height: 1.4;
 	}
+	.ticket-meta,
 	.objective-meta {
 		display: flex;
 		flex-wrap: wrap;
@@ -518,10 +529,12 @@
 		white-space: nowrap;
 	}
 	@media (max-width: 900px) {
+		.ticket-row,
 		.objective-row {
 			grid-template-columns: 1fr;
 			gap: var(--space-2);
 		}
+		.ticket-meta,
 		.objective-meta {
 			justify-content: flex-start;
 			text-align: left;
@@ -542,12 +555,45 @@
 	.runtime-heading span.warn {
 		color: var(--warning);
 	}
+	.detail-heading.compact {
+		margin-bottom: var(--space-2);
+	}
 	.detail-heading h3 {
 		margin: 0;
 	}
 	.detail-heading span {
 		color: var(--text-muted);
 		font-size: 0.8rem;
+	}
+	.ticket-detail-grid {
+		margin-bottom: var(--space-4);
+	}
+	.risk-flags {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--space-2);
+		margin-bottom: var(--space-4);
+	}
+	.risk-flags span,
+	.warning-pill {
+		border-radius: 999px;
+		padding: 0.18rem 0.55rem;
+		background: var(--bg-subtle);
+		color: var(--warning);
+		font-size: 0.72rem;
+		font-weight: 800;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+	}
+	.ticket-body pre {
+		overflow-x: auto;
+		margin: 0;
+		padding: var(--space-4);
+		border: 1px solid var(--line);
+		border-radius: var(--radius-panel);
+		background: var(--bg-raised);
+		color: var(--text);
+		white-space: pre-wrap;
 	}
 	dl {
 		display: grid;

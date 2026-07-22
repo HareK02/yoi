@@ -105,7 +105,7 @@
 <section class="workdirs-page" aria-labelledby="workdirs-heading">
   <header class="page-header-row">
     <div>
-      <p class="breadcrumb"><a href={`/w/${data.workspaceId}/runtimes`}>Runtimes</a> / {runtimeLabel}</p>
+      <p class="breadcrumb"><a href={`/w/${data.workspaceId}/settings/runtimes`}>Runtime Inventory</a> / {runtimeLabel}</p>
       <h1 id="workdirs-heading">Workdirs</h1>
       <p>Workdirs owned by <code>{data.runtimeId}</code>.</p>
       {#if data.cleanupPlanError}<p class="section-state error">{data.cleanupPlanError}</p>{/if}

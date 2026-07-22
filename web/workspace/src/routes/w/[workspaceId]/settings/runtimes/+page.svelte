@@ -10,15 +10,15 @@
 </script>
 
 <svelte:head>
-  <title>Runtimes · Yoi Workspace</title>
-  <meta name="description" content="Workspace Runtimes" />
+  <title>Runtime Inventory · Settings · Yoi Workspace</title>
+  <meta name="description" content="Workspace Runtime inventory" />
 </svelte:head>
 
 <section class="runtimes-page" aria-labelledby="runtimes-heading">
   <header class="page-header-row">
     <div>
-      <h1 id="runtimes-heading">Runtimes</h1>
-      <p>Execution backends available to this workspace.</p>
+      <h1 id="runtimes-heading">Runtime Inventory</h1>
+      <p>Admin view of execution backends available to this workspace.</p>
     </div>
   </header>
 
@@ -53,7 +53,7 @@
               <td>{runtimePlatform(runtime)}</td>
               <td>{runtime.capabilities.max_workers} workers</td>
               <td>
-                <a class="inline-link" href={`/w/${data.workspaceId}/runtimes/${encodeURIComponent(runtime.runtime_id)}/workdirs`}>
+                <a class="inline-link" href={`/w/${data.workspaceId}/settings/runtimes/${encodeURIComponent(runtime.runtime_id)}/workdirs`}>
                   Open workdirs
                 </a>
               </td>

@@ -6,6 +6,7 @@ export type Diagnostic = {
 
 export type SettingsSectionId =
   | "runtime-connections"
+  | "runtime-inventory"
   | "profile-sources"
   | "backend-config"
   | "workspace-identity";
@@ -86,6 +87,18 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
     ],
   },
   {
+    id: "runtime-inventory",
+    label: "Runtime Inventory",
+    status: "read-only",
+    summary:
+      "Inspect registered Runtime handles and their materialized workdirs from the admin settings surface instead of the normal workspace navigation.",
+    bullets: [
+      "Runtime state is operational Backend/Runtime context, not a workspace content object like Objectives or Repositories.",
+      "Workdir cleanup remains scoped to typed Runtime APIs and stays outside the primary workspace sidebar.",
+      "Console routes may still target a Runtime handle directly, but Runtime discovery belongs under Settings.",
+    ],
+  },
+  {
     id: "profile-sources",
     label: "Profile Sources",
     status: "editable",
@@ -145,6 +158,8 @@ export function settingsSectionHref(id: SettingsSectionId): string {
   switch (id) {
     case "runtime-connections":
       return `${SETTINGS_ROUTE}/runtime-connections`;
+    case "runtime-inventory":
+      return `${SETTINGS_ROUTE}/runtimes`;
     case "profile-sources":
       return `${SETTINGS_ROUTE}/profiles`;
     case "workspace-identity":
