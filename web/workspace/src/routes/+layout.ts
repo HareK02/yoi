@@ -11,7 +11,8 @@ export const load: LayoutLoad = async ({ fetch, params, url }) => {
 
   if (!workspaceId) {
     const workspace = await loadJson<WorkspaceResponse>(fetch, "/api/workspace");
-    if (workspace.data) {
+    const publicRoutes = new Set(["/account", "/login/device"]);
+    if (workspace.data && !publicRoutes.has(url.pathname)) {
       const scopedPath = workspaceRoute(workspace.data.workspace_id);
       throw redirect(307, `${scopedPath}${url.search}`);
     }

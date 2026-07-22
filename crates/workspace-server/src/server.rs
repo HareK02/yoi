@@ -38,8 +38,8 @@ use worker_runtime::worker_backend::{ProfileRuntimeWorkerFactory, WorkerRuntimeE
 
 use crate::auth::{
     AuthPublicConfig, AuthenticatedUser, RequestActor, auth_error, is_expired, mint_secret, new_id,
-    new_user_code, normalize_handle, resolve_request_actor, rfc3339_after, session_set_cookie,
-    token_hash,
+    new_user_code, normalize_handle, parse_cookie, resolve_request_actor, rfc3339_after,
+    session_set_cookie, token_hash,
 };
 use crate::companion::{
     CompanionCancelRequest, CompanionConsole, CompanionMessageRequest, CompanionMessageResponse,
@@ -337,6 +337,7 @@ pub fn build_router(api: WorkspaceApi) -> Router {
             "/api/auth/passkeys/login/complete",
             post(post_passkey_login_complete),
         )
+        .route("/api/auth/logout", post(post_auth_logout))
         .route("/api/auth/device-login/start", post(post_device_login_start))
         .route("/api/auth/device-login/approve", post(post_device_login_approve))
         .route("/api/auth/device-login/poll", post(post_device_login_poll))
@@ -2595,6 +2596,11 @@ struct WhoamiResponse {
     actor: Option<RequestActor>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct LogoutResponse {
+    status: String,
+}
+
 async fn get_auth_config(State(api): State<WorkspaceApi>) -> ApiResult<Json<AuthPublicConfig>> {
     Ok(Json(auth_public_config(&api.config)))
 }
@@ -3021,6 +3027,37 @@ async fn get_auth_whoami(
     Ok(Json(WhoamiResponse {
         actor: resolve_actor(&api, &headers).await?,
     }))
+}
+
+async fn post_auth_logout(
+    State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    let auth = auth_public_config(&api.config);
+    if let Some(session_token) = parse_cookie(&headers, &auth.cookie_name) {
+        let _ = api
+            .store
+            .revoke_browser_session(&token_hash(&session_token), &crate::auth::now_rfc3339())?;
+    }
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        SET_COOKIE,
+        session_set_cookie(&auth.cookie_name, "", 0)
+            .parse()
+            .map_err(|error| {
+                auth_error(
+                    "invalid_session_cookie",
+                    &format!("failed to build logout cookie: {error}"),
+                )
+            })?,
+    );
+    Ok((
+        response_headers,
+        Json(LogoutResponse {
+            status: "logged_out".to_string(),
+        }),
+    )
+        .into_response())
 }
 
 fn webauthn(config: &ServerConfig) -> ApiResult<Webauthn> {

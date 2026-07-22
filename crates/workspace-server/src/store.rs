@@ -243,6 +243,7 @@ pub trait ControlPlaneStore: Send + Sync {
     ) -> Result<Option<AuthChallengeRecord>>;
     fn create_browser_session(&self, record: &BrowserSessionRecord) -> Result<()>;
     fn resolve_browser_session(&self, token_hash: &str) -> Result<Option<BrowserSessionRecord>>;
+    fn revoke_browser_session(&self, token_hash: &str, revoked_at: &str) -> Result<bool>;
     fn create_api_token(&self, record: &ApiTokenRecord) -> Result<()>;
     fn resolve_api_token(&self, token_hash: &str) -> Result<Option<ApiTokenRecord>>;
     fn mark_api_token_used(&self, token_hash: &str, used_at: &str) -> Result<()>;
@@ -618,6 +619,16 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )
             .optional()
             .map_err(Error::from)
+        })
+    }
+
+    fn revoke_browser_session(&self, token_hash: &str, revoked_at: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "UPDATE browser_sessions SET revoked_at = ?2 WHERE token_hash = ?1 AND revoked_at IS NULL",
+                params![token_hash, revoked_at],
+            )?;
+            Ok(changed > 0)
         })
     }
 
@@ -2453,6 +2464,31 @@ mod tests {
                 .consume_auth_challenge("challenge", "passkey_login", "2026-07-22T00:01:00Z")
                 .unwrap(),
             None
+        );
+
+        let browser_session = BrowserSessionRecord {
+            session_id: "session-id".to_string(),
+            token_hash: "session-hash".to_string(),
+            user_id: user.user_id.clone(),
+            created_at: now.clone(),
+            expires_at: "2026-07-22T12:00:00Z".to_string(),
+            revoked_at: None,
+        };
+        store.create_browser_session(&browser_session).unwrap();
+        assert_eq!(
+            store.resolve_browser_session("session-hash").unwrap(),
+            Some(browser_session)
+        );
+        assert!(
+            store
+                .revoke_browser_session("session-hash", "2026-07-22T00:02:00Z")
+                .unwrap()
+        );
+        assert_eq!(store.resolve_browser_session("session-hash").unwrap(), None);
+        assert!(
+            !store
+                .revoke_browser_session("session-hash", "2026-07-22T00:03:00Z")
+                .unwrap()
         );
 
         let api_token = ApiTokenRecord {
