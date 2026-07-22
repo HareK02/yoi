@@ -43,7 +43,7 @@ rustPlatform.buildRustPackage rec {
     filter = sourceFilter;
   };
 
-  cargoHash = "sha256-MUEySmRu5Te8+GCwlt3qk7jxcumYIMvnuvj64o2XuDw=";
+  cargoHash = "sha256-iZaTREhL/aLixn67A1+Gi9opqh2j/yyFuGMyBBvuATM=";
 
   depsExtraArgs = {
     # Older fetchCargoVendor utilities used crates.io's API download endpoint,
@@ -93,6 +93,7 @@ rustPlatform.buildRustPackage rec {
 
   postBuild = ''
     cargo build --offline --profile release -p yoi-workspace-server --bin yoi-workspace-server
+    cargo build --offline --profile release -p worker-runtime --bin worker-runtime-rest-server --features ws-server,fs-store
   '';
 
   # The package check is a credential-free install smoke check below. Running the
@@ -105,13 +106,15 @@ rustPlatform.buildRustPackage rec {
 
     yoi_bin=$(find . -type f -name yoi | head -n 1)
     workspace_server_bin=$(find . -type f -name yoi-workspace-server | head -n 1)
-    if [ -z "$yoi_bin" ] || [ -z "$workspace_server_bin" ]; then
+    worker_runtime_bin=$(find . -type f -name worker-runtime-rest-server | head -n 1)
+    if [ -z "$yoi_bin" ] || [ -z "$workspace_server_bin" ] || [ -z "$worker_runtime_bin" ]; then
       echo "built binaries not found" >&2
-      find . -maxdepth 6 -type f \( -name yoi -o -name yoi-workspace-server \) -print >&2
+      find . -maxdepth 6 -type f \( -name yoi -o -name yoi-workspace-server -o -name worker-runtime-rest-server \) -print >&2
       exit 1
     fi
     install -Dm755 "$yoi_bin" "$out/bin/yoi"
     install -Dm755 "$workspace_server_bin" "$out/bin/yoi-workspace-server"
+    install -Dm755 "$worker_runtime_bin" "$out/bin/worker-runtime-rest-server"
 
     runHook postInstall
   '';
@@ -123,7 +126,9 @@ rustPlatform.buildRustPackage rec {
     "$out/bin/yoi" worker --help >/dev/null
     test -x "$out/bin/yoi"
     test -x "$out/bin/yoi-workspace-server"
+    test -x "$out/bin/worker-runtime-rest-server"
     "$out/bin/yoi-workspace-server" --help >/dev/null
+    "$out/bin/worker-runtime-rest-server" --help >/dev/null
     test ! -e "$out/bin/yoi-pod"
     test ! -e "$out/share/yoi/resources"
     if "$out/bin/yoi" --session not-a-uuid 2>yoi.err; then
