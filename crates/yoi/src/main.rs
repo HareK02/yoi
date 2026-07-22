@@ -12,10 +12,14 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::Duration;
 
-use client::{BackendRuntimeListTarget, BackendRuntimeTarget, WorkerRuntimeCommand};
+use client::{
+    BackendAuthTarget, BackendRuntimeListTarget, BackendRuntimeTarget, WorkerRuntimeCommand,
+    start_device_login, wait_for_device_login,
+};
 use memory_lint::{LintCliOptions, LintStatus};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use session_store::SegmentId;
 use tui::{LaunchMode, LaunchOptions};
 
@@ -35,6 +39,10 @@ enum Mode {
     WorkspaceServer {
         subcommand: String,
         args: Vec<String>,
+    },
+    Login {
+        backend_url: String,
+        no_wait: bool,
     },
     WorkerRuntime(Vec<String>),
     Keys,
@@ -85,6 +93,16 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Mode::WorkspaceServer { subcommand, args } => run_workspace_server(&subcommand, args),
+        Mode::Login {
+            backend_url,
+            no_wait,
+        } => match run_login(&backend_url, no_wait).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("yoi login: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Mode::MemoryLint(options) => match memory_lint::run(&options) {
             Ok(LintStatus::Clean) => ExitCode::SUCCESS,
             Ok(LintStatus::Failed) => ExitCode::FAILURE,
@@ -240,6 +258,9 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
         }
         "workspace" => {
             return parse_workspace_args(&args[1..]);
+        }
+        "login" => {
+            return parse_login_args(&args[1..]);
         }
         "mcp" => {
             let mcp_cli = parse_mcp_args(&args[1..])?;
@@ -859,15 +880,7 @@ fn read_client_config() -> Result<Option<ClientConfigFile>, ParseError> {
 }
 
 fn client_config_path() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(home).join("yoi").join("client.toml"));
-    }
-    std::env::var_os("HOME").map(|home| {
-        PathBuf::from(home)
-            .join(".config")
-            .join("yoi")
-            .join("client.toml")
-    })
+    yoi_config_dir().map(|dir| dir.join("client.toml"))
 }
 
 fn client_config_missing_message(workspace_id: Option<&str>) -> String {
@@ -877,6 +890,137 @@ fn client_config_missing_message(workspace_id: Option<&str>) -> String {
         ),
         None => "Backend URL is required. Pass --backend <URL> or configure default_backend in $XDG_CONFIG_HOME/yoi/client.toml".to_string(),
     }
+}
+
+fn parse_login_args(args: &[String]) -> Result<Mode, ParseError> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        return Err(ParseError(
+            "yoi login usage: yoi login [--backend <URL>] [--no-wait]".to_string(),
+        ));
+    }
+    let mut backend_url = None;
+    let mut no_wait = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--backend" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| ParseError("--backend requires a URL".to_string()))?;
+                if value.starts_with('-') || value.is_empty() {
+                    return Err(ParseError("--backend requires a URL".to_string()));
+                }
+                backend_url = Some(value.clone());
+                i += 2;
+            }
+            arg if arg.starts_with("--backend=") => {
+                let value = arg.trim_start_matches("--backend=");
+                if value.is_empty() {
+                    return Err(ParseError("--backend requires a URL".to_string()));
+                }
+                backend_url = Some(value.to_string());
+                i += 1;
+            }
+            "--no-wait" => {
+                no_wait = true;
+                i += 1;
+            }
+            other => {
+                return Err(ParseError(format!(
+                    "unknown yoi login argument '{other}' (try 'yoi login --help')"
+                )));
+            }
+        }
+    }
+    let backend_url = resolve_backend_url(backend_url, None)?;
+    Ok(Mode::Login {
+        backend_url,
+        no_wait,
+    })
+}
+
+async fn run_login(backend_url: &str, no_wait: bool) -> Result<(), ParseError> {
+    let target = BackendAuthTarget::new(backend_url.to_string());
+    let start = start_device_login(&target, Some("yoi cli"))
+        .await
+        .map_err(|error| ParseError(error.to_string()))?;
+    println!("Open this URL in your browser to approve Yoi CLI login:");
+    println!("  {}", start.verification_uri_complete);
+    println!();
+    println!("User code: {}", start.user_code);
+    println!("Expires in: {} seconds", start.expires_in);
+    if no_wait {
+        println!("Device code: {}", start.device_code);
+        println!(
+            "Run without --no-wait after approving, or poll the Backend device endpoint manually."
+        );
+        return Ok(());
+    }
+    let token = wait_for_device_login(
+        &target,
+        &start.device_code,
+        Duration::from_secs(start.interval.max(1)),
+        Duration::from_secs(start.expires_in.max(1)),
+    )
+    .await
+    .map_err(|error| ParseError(error.to_string()))?;
+    save_backend_token(backend_url, &token)?;
+    println!("Saved Backend API token for {backend_url}");
+    Ok(())
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct BackendTokenFile {
+    #[serde(default)]
+    tokens: BTreeMap<String, BackendTokenEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BackendTokenEntry {
+    token_type: String,
+    access_token: String,
+}
+
+fn save_backend_token(backend_url: &str, access_token: &str) -> Result<(), ParseError> {
+    let path = backend_token_path().ok_or_else(|| {
+        ParseError("HOME or XDG_CONFIG_HOME is required to save Backend token".to_string())
+    })?;
+    let mut file = if path.is_file() {
+        let contents = fs::read_to_string(&path)
+            .map_err(|error| ParseError(format!("failed to read {}: {error}", path.display())))?;
+        serde_json::from_str::<BackendTokenFile>(&contents)
+            .map_err(|error| ParseError(format!("failed to parse {}: {error}", path.display())))?
+    } else {
+        BackendTokenFile::default()
+    };
+    file.tokens.insert(
+        backend_url.trim_end_matches('/').to_string(),
+        BackendTokenEntry {
+            token_type: "Bearer".to_string(),
+            access_token: access_token.to_string(),
+        },
+    );
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            ParseError(format!("failed to create {}: {error}", parent.display()))
+        })?;
+    }
+    let serialized = serde_json::to_string_pretty(&file)
+        .map_err(|error| ParseError(format!("failed to serialize Backend token file: {error}")))?;
+    fs::write(&path, format!("{serialized}\n"))
+        .map_err(|error| ParseError(format!("failed to write {}: {error}", path.display())))?;
+    Ok(())
+}
+
+fn backend_token_path() -> Option<PathBuf> {
+    yoi_config_dir().map(|dir| dir.join("backend-tokens.json"))
+}
+
+fn yoi_config_dir() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(home).join("yoi"));
+    }
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config").join("yoi"))
 }
 
 fn parse_workspace_args(args: &[String]) -> Result<Mode, ParseError> {
