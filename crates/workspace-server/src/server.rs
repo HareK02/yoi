@@ -233,6 +233,7 @@ impl WorkspaceApi {
         store
             .upsert_workspace(&WorkspaceRecord {
                 workspace_id: config.workspace_id.clone(),
+                owner_account_id: None,
                 display_name: config.workspace_display_name.clone(),
                 state: "active".to_string(),
                 created_at: config.workspace_created_at.clone(),

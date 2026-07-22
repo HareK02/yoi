@@ -52,6 +52,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "remove workdir registry management kind",
         apply: remove_workdir_registry_management_kind_column,
     },
+    Migration {
+        version: 8,
+        name: "account identity and login flow schema",
+        apply: create_account_identity_tables,
+    },
 ];
 
 struct Migration {
@@ -63,10 +68,94 @@ struct Migration {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceRecord {
     pub workspace_id: String,
+    /// Account/namespace owner abstraction. `None` is allowed for legacy/local
+    /// workspaces until a user account is bootstrapped.
+    pub owner_account_id: Option<String>,
     pub display_name: String,
     pub state: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountRecord {
+    pub account_id: String,
+    pub kind: String,
+    pub handle: String,
+    pub display_name: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserRecord {
+    pub user_id: String,
+    pub account_id: String,
+    pub handle: String,
+    pub display_name: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PasskeyCredentialRecord {
+    pub credential_id: String,
+    pub user_id: String,
+    pub public_key_cose: String,
+    pub transports_json: Option<String>,
+    pub sign_count: u64,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthChallengeRecord {
+    pub challenge_id: String,
+    pub ceremony: String,
+    pub challenge: String,
+    pub user_id: Option<String>,
+    pub rp_id: String,
+    pub origin: String,
+    pub expires_at: String,
+    pub created_at: String,
+    pub consumed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserSessionRecord {
+    pub session_id: String,
+    pub token_hash: String,
+    pub user_id: String,
+    pub created_at: String,
+    pub expires_at: String,
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiTokenRecord {
+    pub token_id: String,
+    pub token_hash: String,
+    pub user_id: String,
+    pub label: String,
+    pub created_at: String,
+    pub expires_at: Option<String>,
+    pub revoked_at: Option<String>,
+    pub last_used_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceLoginFlowRecord {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub client_name: Option<String>,
+    pub user_id: Option<String>,
+    pub api_token_id: Option<String>,
+    pub issued_access_token: Option<String>,
+    pub created_at: String,
+    pub expires_at: String,
+    pub approved_at: Option<String>,
+    pub consumed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,6 +205,57 @@ pub trait ControlPlaneStore: Send + Sync {
     async fn schema_version(&self) -> Result<i64>;
     async fn upsert_workspace(&self, record: &WorkspaceRecord) -> Result<()>;
     async fn get_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceRecord>>;
+
+    fn upsert_account(&self, record: &AccountRecord) -> Result<()>;
+    fn get_account(&self, account_id: &str) -> Result<Option<AccountRecord>>;
+    fn get_account_by_handle(&self, kind: &str, handle: &str) -> Result<Option<AccountRecord>>;
+    fn upsert_user(&self, record: &UserRecord) -> Result<()>;
+    fn get_user(&self, user_id: &str) -> Result<Option<UserRecord>>;
+    fn get_user_by_handle(&self, handle: &str) -> Result<Option<UserRecord>>;
+    fn any_user(&self) -> Result<Option<UserRecord>>;
+    fn upsert_passkey_credential(&self, record: &PasskeyCredentialRecord) -> Result<()>;
+    fn get_passkey_credential(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<PasskeyCredentialRecord>>;
+    fn list_passkey_credentials_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<PasskeyCredentialRecord>>;
+    fn put_auth_challenge(&self, record: &AuthChallengeRecord) -> Result<()>;
+    fn consume_auth_challenge(
+        &self,
+        challenge: &str,
+        ceremony: &str,
+        consumed_at: &str,
+    ) -> Result<Option<AuthChallengeRecord>>;
+    fn create_browser_session(&self, record: &BrowserSessionRecord) -> Result<()>;
+    fn resolve_browser_session(&self, token_hash: &str) -> Result<Option<BrowserSessionRecord>>;
+    fn create_api_token(&self, record: &ApiTokenRecord) -> Result<()>;
+    fn resolve_api_token(&self, token_hash: &str) -> Result<Option<ApiTokenRecord>>;
+    fn mark_api_token_used(&self, token_hash: &str, used_at: &str) -> Result<()>;
+    fn create_device_login_flow(&self, record: &DeviceLoginFlowRecord) -> Result<()>;
+    fn get_device_login_flow_by_user_code(
+        &self,
+        user_code: &str,
+    ) -> Result<Option<DeviceLoginFlowRecord>>;
+    fn get_device_login_flow_by_device_code(
+        &self,
+        device_code: &str,
+    ) -> Result<Option<DeviceLoginFlowRecord>>;
+    fn approve_device_login_flow(
+        &self,
+        device_code: &str,
+        user_id: &str,
+        api_token_id: &str,
+        issued_access_token: &str,
+        approved_at: &str,
+    ) -> Result<bool>;
+    fn consume_device_login_token(
+        &self,
+        device_code: &str,
+        consumed_at: &str,
+    ) -> Result<Option<DeviceLoginFlowRecord>>;
 
     fn upsert_worker_registry(&self, record: &WorkerRegistryRecord) -> Result<()>;
     fn get_worker_registry(
@@ -213,14 +353,16 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         self.with_conn(|conn| {
             conn.execute(
                 r#"INSERT INTO workspaces (
-                    workspace_id, display_name, state, created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                    workspace_id, owner_account_id, display_name, state, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                 ON CONFLICT(workspace_id) DO UPDATE SET
+                    owner_account_id = COALESCE(excluded.owner_account_id, workspaces.owner_account_id),
                     display_name = excluded.display_name,
                     state = excluded.state,
                     updated_at = excluded.updated_at"#,
                 params![
                     record.workspace_id,
+                    record.owner_account_id,
                     record.display_name,
                     record.state,
                     record.created_at,
@@ -234,21 +376,322 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     async fn get_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceRecord>> {
         self.with_conn(|conn| {
             conn.query_row(
-                r#"SELECT workspace_id, display_name, state, created_at, updated_at
+                r#"SELECT workspace_id, owner_account_id, display_name, state, created_at, updated_at
                    FROM workspaces WHERE workspace_id = ?1"#,
                 params![workspace_id],
-                |row| {
-                    Ok(WorkspaceRecord {
-                        workspace_id: row.get(0)?,
-                        display_name: row.get(1)?,
-                        state: row.get(2)?,
-                        created_at: row.get(3)?,
-                        updated_at: row.get(4)?,
-                    })
-                },
+                read_workspace_record,
             )
             .optional()
             .map_err(Error::from)
+        })
+    }
+
+    fn upsert_account(&self, record: &AccountRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO accounts (account_id, kind, handle, display_name, created_at, updated_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                   ON CONFLICT(account_id) DO UPDATE SET
+                       handle = excluded.handle,
+                       display_name = excluded.display_name,
+                       updated_at = excluded.updated_at"#,
+                params![record.account_id, record.kind, record.handle, record.display_name, record.created_at, record.updated_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn get_account(&self, account_id: &str) -> Result<Option<AccountRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                account_select_sql("WHERE account_id = ?1").as_str(),
+                params![account_id],
+                read_account_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn get_account_by_handle(&self, kind: &str, handle: &str) -> Result<Option<AccountRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                account_select_sql("WHERE kind = ?1 AND handle = ?2").as_str(),
+                params![kind, handle],
+                read_account_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn upsert_user(&self, record: &UserRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO users (user_id, account_id, handle, display_name, created_at, updated_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                   ON CONFLICT(user_id) DO UPDATE SET
+                       handle = excluded.handle,
+                       display_name = excluded.display_name,
+                       updated_at = excluded.updated_at"#,
+                params![record.user_id, record.account_id, record.handle, record.display_name, record.created_at, record.updated_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn get_user(&self, user_id: &str) -> Result<Option<UserRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                user_select_sql("WHERE user_id = ?1").as_str(),
+                params![user_id],
+                read_user_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn get_user_by_handle(&self, handle: &str) -> Result<Option<UserRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                user_select_sql("WHERE handle = ?1").as_str(),
+                params![handle],
+                read_user_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn any_user(&self) -> Result<Option<UserRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                user_select_sql("ORDER BY created_at ASC LIMIT 1").as_str(),
+                [],
+                read_user_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn upsert_passkey_credential(&self, record: &PasskeyCredentialRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO passkey_credentials (credential_id, user_id, public_key_cose, transports_json, sign_count, created_at, last_used_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                   ON CONFLICT(credential_id) DO UPDATE SET
+                       public_key_cose = excluded.public_key_cose,
+                       transports_json = excluded.transports_json,
+                       sign_count = excluded.sign_count,
+                       last_used_at = excluded.last_used_at"#,
+                params![record.credential_id, record.user_id, record.public_key_cose, record.transports_json, record.sign_count, record.created_at, record.last_used_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn get_passkey_credential(
+        &self,
+        credential_id: &str,
+    ) -> Result<Option<PasskeyCredentialRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                passkey_select_sql("WHERE credential_id = ?1").as_str(),
+                params![credential_id],
+                read_passkey_credential_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn list_passkey_credentials_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<PasskeyCredentialRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                passkey_select_sql("WHERE user_id = ?1 ORDER BY created_at ASC").as_str(),
+            )?;
+            let rows = stmt.query_map(params![user_id], read_passkey_credential_record)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        })
+    }
+
+    fn put_auth_challenge(&self, record: &AuthChallengeRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO auth_challenges (challenge_id, ceremony, challenge, user_id, rp_id, origin, expires_at, created_at, consumed_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+                params![record.challenge_id, record.ceremony, record.challenge, record.user_id, record.rp_id, record.origin, record.expires_at, record.created_at, record.consumed_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn consume_auth_challenge(
+        &self,
+        challenge: &str,
+        ceremony: &str,
+        consumed_at: &str,
+    ) -> Result<Option<AuthChallengeRecord>> {
+        self.with_conn(|conn| {
+            let record = conn
+                .query_row(
+                    auth_challenge_select_sql(
+                        "WHERE challenge = ?1 AND ceremony = ?2 AND consumed_at IS NULL",
+                    )
+                    .as_str(),
+                    params![challenge, ceremony],
+                    read_auth_challenge_record,
+                )
+                .optional()?;
+            if let Some(record) = record.as_ref() {
+                conn.execute(
+                    "UPDATE auth_challenges SET consumed_at = ?2 WHERE challenge_id = ?1",
+                    params![record.challenge_id, consumed_at],
+                )?;
+            }
+            Ok(record)
+        })
+    }
+
+    fn create_browser_session(&self, record: &BrowserSessionRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO browser_sessions (session_id, token_hash, user_id, created_at, expires_at, revoked_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+                params![record.session_id, record.token_hash, record.user_id, record.created_at, record.expires_at, record.revoked_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn resolve_browser_session(&self, token_hash: &str) -> Result<Option<BrowserSessionRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                browser_session_select_sql("WHERE token_hash = ?1 AND revoked_at IS NULL").as_str(),
+                params![token_hash],
+                read_browser_session_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn create_api_token(&self, record: &ApiTokenRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO api_tokens (token_id, token_hash, user_id, label, created_at, expires_at, revoked_at, last_used_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+                params![record.token_id, record.token_hash, record.user_id, record.label, record.created_at, record.expires_at, record.revoked_at, record.last_used_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn resolve_api_token(&self, token_hash: &str) -> Result<Option<ApiTokenRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                api_token_select_sql("WHERE token_hash = ?1 AND revoked_at IS NULL").as_str(),
+                params![token_hash],
+                read_api_token_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn mark_api_token_used(&self, token_hash: &str, used_at: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "UPDATE api_tokens SET last_used_at = ?2 WHERE token_hash = ?1",
+                params![token_hash, used_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn create_device_login_flow(&self, record: &DeviceLoginFlowRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO device_login_flows (device_code, user_code, verification_uri, client_name, user_id, api_token_id, issued_access_token, created_at, expires_at, approved_at, consumed_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
+                params![record.device_code, record.user_code, record.verification_uri, record.client_name, record.user_id, record.api_token_id, record.issued_access_token, record.created_at, record.expires_at, record.approved_at, record.consumed_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn get_device_login_flow_by_user_code(
+        &self,
+        user_code: &str,
+    ) -> Result<Option<DeviceLoginFlowRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                device_login_select_sql("WHERE user_code = ?1").as_str(),
+                params![user_code],
+                read_device_login_flow_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn get_device_login_flow_by_device_code(
+        &self,
+        device_code: &str,
+    ) -> Result<Option<DeviceLoginFlowRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                device_login_select_sql("WHERE device_code = ?1").as_str(),
+                params![device_code],
+                read_device_login_flow_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn approve_device_login_flow(
+        &self,
+        device_code: &str,
+        user_id: &str,
+        api_token_id: &str,
+        issued_access_token: &str,
+        approved_at: &str,
+    ) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                r#"UPDATE device_login_flows
+                   SET user_id = ?2, api_token_id = ?3, issued_access_token = ?4, approved_at = ?5
+                   WHERE device_code = ?1 AND approved_at IS NULL AND consumed_at IS NULL"#,
+                params![
+                    device_code,
+                    user_id,
+                    api_token_id,
+                    issued_access_token,
+                    approved_at
+                ],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
+    fn consume_device_login_token(
+        &self,
+        device_code: &str,
+        consumed_at: &str,
+    ) -> Result<Option<DeviceLoginFlowRecord>> {
+        self.with_conn(|conn| {
+            let record = conn.query_row(device_login_select_sql("WHERE device_code = ?1 AND approved_at IS NOT NULL AND consumed_at IS NULL").as_str(), params![device_code], read_device_login_flow_record).optional()?;
+            if record.is_some() {
+                conn.execute("UPDATE device_login_flows SET consumed_at = ?2, issued_access_token = NULL WHERE device_code = ?1", params![device_code, consumed_at])?;
+            }
+            Ok(record)
         })
     }
 
@@ -515,6 +958,151 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
     }
 }
 
+fn read_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
+    Ok(WorkspaceRecord {
+        workspace_id: row.get(0)?,
+        owner_account_id: row.get(1)?,
+        display_name: row.get(2)?,
+        state: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+fn account_select_sql(where_clause: &str) -> String {
+    format!(
+        "SELECT account_id, kind, handle, display_name, created_at, updated_at FROM accounts {where_clause}"
+    )
+}
+
+fn read_account_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRecord> {
+    Ok(AccountRecord {
+        account_id: row.get(0)?,
+        kind: row.get(1)?,
+        handle: row.get(2)?,
+        display_name: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+fn user_select_sql(where_clause: &str) -> String {
+    format!(
+        "SELECT user_id, account_id, handle, display_name, created_at, updated_at FROM users {where_clause}"
+    )
+}
+
+fn read_user_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserRecord> {
+    Ok(UserRecord {
+        user_id: row.get(0)?,
+        account_id: row.get(1)?,
+        handle: row.get(2)?,
+        display_name: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+fn passkey_select_sql(where_clause: &str) -> String {
+    format!(
+        "SELECT credential_id, user_id, public_key_cose, transports_json, sign_count, created_at, last_used_at FROM passkey_credentials {where_clause}"
+    )
+}
+
+fn read_passkey_credential_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PasskeyCredentialRecord> {
+    Ok(PasskeyCredentialRecord {
+        credential_id: row.get(0)?,
+        user_id: row.get(1)?,
+        public_key_cose: row.get(2)?,
+        transports_json: row.get(3)?,
+        sign_count: row.get(4)?,
+        created_at: row.get(5)?,
+        last_used_at: row.get(6)?,
+    })
+}
+
+fn auth_challenge_select_sql(where_clause: &str) -> String {
+    format!(
+        "SELECT challenge_id, ceremony, challenge, user_id, rp_id, origin, expires_at, created_at, consumed_at FROM auth_challenges {where_clause}"
+    )
+}
+
+fn read_auth_challenge_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthChallengeRecord> {
+    Ok(AuthChallengeRecord {
+        challenge_id: row.get(0)?,
+        ceremony: row.get(1)?,
+        challenge: row.get(2)?,
+        user_id: row.get(3)?,
+        rp_id: row.get(4)?,
+        origin: row.get(5)?,
+        expires_at: row.get(6)?,
+        created_at: row.get(7)?,
+        consumed_at: row.get(8)?,
+    })
+}
+
+fn browser_session_select_sql(where_clause: &str) -> String {
+    format!(
+        "SELECT session_id, token_hash, user_id, created_at, expires_at, revoked_at FROM browser_sessions {where_clause}"
+    )
+}
+
+fn read_browser_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrowserSessionRecord> {
+    Ok(BrowserSessionRecord {
+        session_id: row.get(0)?,
+        token_hash: row.get(1)?,
+        user_id: row.get(2)?,
+        created_at: row.get(3)?,
+        expires_at: row.get(4)?,
+        revoked_at: row.get(5)?,
+    })
+}
+
+fn api_token_select_sql(where_clause: &str) -> String {
+    format!(
+        "SELECT token_id, token_hash, user_id, label, created_at, expires_at, revoked_at, last_used_at FROM api_tokens {where_clause}"
+    )
+}
+
+fn read_api_token_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiTokenRecord> {
+    Ok(ApiTokenRecord {
+        token_id: row.get(0)?,
+        token_hash: row.get(1)?,
+        user_id: row.get(2)?,
+        label: row.get(3)?,
+        created_at: row.get(4)?,
+        expires_at: row.get(5)?,
+        revoked_at: row.get(6)?,
+        last_used_at: row.get(7)?,
+    })
+}
+
+fn device_login_select_sql(where_clause: &str) -> String {
+    format!(
+        "SELECT device_code, user_code, verification_uri, client_name, user_id, api_token_id, issued_access_token, created_at, expires_at, approved_at, consumed_at FROM device_login_flows {where_clause}"
+    )
+}
+
+fn read_device_login_flow_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<DeviceLoginFlowRecord> {
+    Ok(DeviceLoginFlowRecord {
+        device_code: row.get(0)?,
+        user_code: row.get(1)?,
+        verification_uri: row.get(2)?,
+        client_name: row.get(3)?,
+        user_id: row.get(4)?,
+        api_token_id: row.get(5)?,
+        issued_access_token: row.get(6)?,
+        created_at: row.get(7)?,
+        expires_at: row.get(8)?,
+        approved_at: row.get(9)?,
+        consumed_at: row.get(10)?,
+    })
+}
+
 fn read_worker_workdir_link_record(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<WorkerWorkdirLinkRecord> {
@@ -635,6 +1223,97 @@ CREATE INDEX IF NOT EXISTS idx_worker_workdir_links_worker
     ON worker_workdir_links(workspace_id, runtime_id, runtime_worker_id, linked_at DESC);
 "#,
     )?;
+    Ok(())
+}
+
+fn create_account_identity_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS accounts (
+    account_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('user', 'organization')),
+    handle TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (kind, handle)
+);
+
+CREATE TABLE IF NOT EXISTS users (
+    user_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL UNIQUE REFERENCES accounts(account_id) ON DELETE CASCADE,
+    handle TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS passkey_credentials (
+    credential_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    public_key_cose TEXT NOT NULL,
+    transports_json TEXT,
+    sign_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    last_used_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS auth_challenges (
+    challenge_id TEXT PRIMARY KEY,
+    ceremony TEXT NOT NULL CHECK (ceremony IN ('passkey_registration', 'passkey_login')),
+    challenge TEXT NOT NULL UNIQUE,
+    user_id TEXT REFERENCES users(user_id) ON DELETE CASCADE,
+    rp_id TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    consumed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS browser_sessions (
+    session_id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS api_tokens (
+    token_id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT,
+    revoked_at TEXT,
+    last_used_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS device_login_flows (
+    device_code TEXT PRIMARY KEY,
+    user_code TEXT NOT NULL UNIQUE,
+    verification_uri TEXT NOT NULL,
+    client_name TEXT,
+    user_id TEXT REFERENCES users(user_id) ON DELETE SET NULL,
+    api_token_id TEXT REFERENCES api_tokens(token_id) ON DELETE SET NULL,
+    issued_access_token TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    approved_at TEXT,
+    consumed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_browser_sessions_token_hash ON browser_sessions(token_hash);
+CREATE INDEX IF NOT EXISTS idx_api_tokens_token_hash ON api_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS idx_device_login_user_code ON device_login_flows(user_code);
+"#,
+    )?;
+    if !column_exists(conn, "workspaces", "owner_account_id")? {
+        conn.execute_batch(
+            "ALTER TABLE workspaces ADD COLUMN owner_account_id TEXT REFERENCES accounts(account_id) ON DELETE SET NULL;",
+        )?;
+    }
     Ok(())
 }
 
@@ -1218,10 +1897,11 @@ mod tests {
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 7);
+        assert_eq!(store.schema_version().await.unwrap(), 8);
 
         let record = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
+            owner_account_id: None,
             display_name: "Yoi Dev".to_string(),
             state: "active".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -1230,7 +1910,7 @@ mod tests {
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 7);
+        assert_eq!(reopened.schema_version().await.unwrap(), 8);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -1260,6 +1940,13 @@ mod tests {
             "worker_registry",
             "workdir_registry",
             "worker_workdir_links",
+            "accounts",
+            "users",
+            "passkey_credentials",
+            "auth_challenges",
+            "browser_sessions",
+            "api_tokens",
+            "device_login_flows",
         ] {
             assert!(
                 tables.contains(expected),
@@ -1293,6 +1980,7 @@ mod tests {
                 "state",
                 "created_at",
                 "updated_at",
+                "owner_account_id",
             ],
         );
         assert_columns(
@@ -1439,7 +2127,7 @@ mod tests {
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 7);
+        assert_eq!(store.schema_version().await.unwrap(), 8);
 
         store
             .with_conn(|conn| {
@@ -1479,6 +2167,7 @@ mod tests {
                         "state",
                         "created_at",
                         "updated_at",
+                        "owner_account_id",
                     ],
                 );
                 let legacy_workspace_columns = table_columns(conn, "legacy_workspaces")?;
@@ -1503,6 +2192,7 @@ mod tests {
             store.get_workspace("legacy-workspace").await.unwrap(),
             Some(WorkspaceRecord {
                 workspace_id: "legacy-workspace".to_string(),
+                owner_account_id: None,
                 display_name: "Legacy Workspace".to_string(),
                 state: "active".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -1512,6 +2202,7 @@ mod tests {
 
         let new_record = WorkspaceRecord {
             workspace_id: "new-workspace".to_string(),
+            owner_account_id: None,
             display_name: "New Workspace".to_string(),
             state: "active".to_string(),
             created_at: "2026-02-01T00:00:00Z".to_string(),
@@ -1531,6 +2222,7 @@ mod tests {
         let store = SqliteWorkspaceStore::open(&db).unwrap();
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
+            owner_account_id: None,
             display_name: "Local Dev".to_string(),
             state: "active".to_string(),
             created_at: "1".to_string(),
@@ -1619,6 +2311,161 @@ mod tests {
                 .list_worker_workdir_links("local-dev", "embedded", 1)
                 .unwrap(),
             vec![link]
+        );
+    }
+
+    #[tokio::test]
+    async fn account_and_login_records_round_trip() {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        assert_eq!(store.schema_version().await.unwrap(), 8);
+        let now = "2026-07-22T00:00:00Z".to_string();
+        let account = AccountRecord {
+            account_id: "acct-user-alice".to_string(),
+            kind: "user".to_string(),
+            handle: "alice".to_string(),
+            display_name: "Alice".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        store.upsert_account(&account).unwrap();
+        let user = UserRecord {
+            user_id: "user-alice".to_string(),
+            account_id: account.account_id.clone(),
+            handle: account.handle.clone(),
+            display_name: account.display_name.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        store.upsert_user(&user).unwrap();
+        assert_eq!(
+            store.get_account_by_handle("user", "alice").unwrap(),
+            Some(account.clone())
+        );
+        assert_eq!(
+            store.get_user_by_handle("alice").unwrap(),
+            Some(user.clone())
+        );
+
+        let workspace = WorkspaceRecord {
+            workspace_id: "workspace".to_string(),
+            owner_account_id: Some(account.account_id.clone()),
+            display_name: "Workspace".to_string(),
+            state: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        store.upsert_workspace(&workspace).await.unwrap();
+        assert_eq!(
+            store.get_workspace("workspace").await.unwrap(),
+            Some(workspace)
+        );
+
+        let passkey = PasskeyCredentialRecord {
+            credential_id: "cred-1".to_string(),
+            user_id: user.user_id.clone(),
+            public_key_cose: "public-key".to_string(),
+            transports_json: Some("[\\\"internal\\\"]".to_string()),
+            sign_count: 0,
+            created_at: now.clone(),
+            last_used_at: None,
+        };
+        store.upsert_passkey_credential(&passkey).unwrap();
+        assert_eq!(
+            store.get_passkey_credential("cred-1").unwrap(),
+            Some(passkey.clone())
+        );
+        assert_eq!(
+            store
+                .list_passkey_credentials_for_user(&user.user_id)
+                .unwrap(),
+            vec![passkey]
+        );
+
+        let challenge = AuthChallengeRecord {
+            challenge_id: "challenge-id".to_string(),
+            ceremony: "passkey_login".to_string(),
+            challenge: "challenge".to_string(),
+            user_id: Some(user.user_id.clone()),
+            rp_id: "127.0.0.1".to_string(),
+            origin: "http://127.0.0.1:8787".to_string(),
+            expires_at: "2026-07-22T00:05:00Z".to_string(),
+            created_at: now.clone(),
+            consumed_at: None,
+        };
+        store.put_auth_challenge(&challenge).unwrap();
+        assert_eq!(
+            store
+                .consume_auth_challenge("challenge", "passkey_login", "2026-07-22T00:01:00Z")
+                .unwrap(),
+            Some(challenge)
+        );
+        assert_eq!(
+            store
+                .consume_auth_challenge("challenge", "passkey_login", "2026-07-22T00:01:00Z")
+                .unwrap(),
+            None
+        );
+
+        let api_token = ApiTokenRecord {
+            token_id: "token-id".to_string(),
+            token_hash: "hash".to_string(),
+            user_id: user.user_id.clone(),
+            label: "cli".to_string(),
+            created_at: now.clone(),
+            expires_at: None,
+            revoked_at: None,
+            last_used_at: None,
+        };
+        store.create_api_token(&api_token).unwrap();
+        assert_eq!(
+            store.resolve_api_token("hash").unwrap(),
+            Some(api_token.clone())
+        );
+        store
+            .mark_api_token_used("hash", "2026-07-22T00:02:00Z")
+            .unwrap();
+        assert_eq!(
+            store
+                .resolve_api_token("hash")
+                .unwrap()
+                .unwrap()
+                .last_used_at,
+            Some("2026-07-22T00:02:00Z".to_string())
+        );
+
+        let flow = DeviceLoginFlowRecord {
+            device_code: "device".to_string(),
+            user_code: "USER-CODE".to_string(),
+            verification_uri: "http://127.0.0.1:8787/login/device".to_string(),
+            client_name: Some("yoi".to_string()),
+            user_id: None,
+            api_token_id: None,
+            issued_access_token: None,
+            created_at: now.clone(),
+            expires_at: "2026-07-22T00:10:00Z".to_string(),
+            approved_at: None,
+            consumed_at: None,
+        };
+        store.create_device_login_flow(&flow).unwrap();
+        store
+            .approve_device_login_flow(
+                "device",
+                &user.user_id,
+                "token-id",
+                "access",
+                "2026-07-22T00:03:00Z",
+            )
+            .unwrap();
+        let approved = store
+            .consume_device_login_token("device", "2026-07-22T00:04:00Z")
+            .unwrap()
+            .unwrap();
+        assert_eq!(approved.issued_access_token, Some("access".to_string()));
+        assert_eq!(
+            store
+                .consume_device_login_token("device", "2026-07-22T00:05:00Z")
+                .unwrap(),
+            None
         );
     }
 
