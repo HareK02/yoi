@@ -1,1 +1,0 @@
-Orchestrator が implementation worktree を original workspace 配下に作成する場合でも、implementation branch は Orchestrator workspace current HEAD / orchestration branch HEAD を base とするよう、role prompt / routing prompt / merge completion prompt に明記した。検証は cargo fmt、cargo test -p client ticket_role、cargo check --workspace、nix build .#yoi、git diff --check、target/debug/yoi ticket doctor で完了。

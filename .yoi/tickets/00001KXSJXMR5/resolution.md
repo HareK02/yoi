@@ -1,1 +1,0 @@
-Default profile now enables Ticket lifecycle tools by default while keeping ticket orchestration disabled. Builtin default profile and setup-generated user default profile were updated, with focused tests covering the new expectations.

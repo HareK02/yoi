@@ -1,1 +1,0 @@
-`scripts/dev-workspace.sh` now schedules `start`, `stop`, and `restart` as detached background jobs by default, returning schedule/log details immediately. `status` and `help` remain synchronous, and `YOI_DEV_WORKSPACE_FOREGROUND=1` preserves an explicit foreground/debug path.

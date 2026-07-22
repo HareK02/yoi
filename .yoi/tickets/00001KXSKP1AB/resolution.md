@@ -1,1 +1,0 @@
-Added `scripts/dev-workspace.sh` with start/stop/restart/status. Start moves runtime/backend/frontend to this checkout, frontend binds `0.0.0.0`, restart intentionally leaves frontend untouched. Runtime files are kept under ignored `.yoi/dev/`.

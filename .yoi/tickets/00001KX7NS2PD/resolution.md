@@ -1,1 +1,0 @@
-Removed durable `lifecycle_state` from Backend worker registry. Runtime remains the authority for live status/state; registry-only Workers project as archived, and cleanup planning uses live Runtime worker observation for running-linked checks. Existing DBs are migrated by schema v4 to remove the legacy column.

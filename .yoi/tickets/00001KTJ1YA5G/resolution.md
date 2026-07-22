@@ -1,1 +1,0 @@
-Panel/Intake の Ticket state change commit policy は、独立チケットとして扱わず、00001KTJ42528 Reduce Ticket lifecycle commit noise に吸収する。Orchestrator 専用 worktree / publication policy 方針により、Panel/Intake の auto-commit 可否だけを単独で決める前提が古くなったため、今後は Ticket lifecycle 全体の低ノイズ commit / dirty-state / main workspace への publication policy として一本化して扱う。

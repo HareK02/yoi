@@ -1,1 +1,0 @@
-docs stale audit の高優先指摘を反映し、architecture / compaction / TUI keybindings / system-prompt-template / plan docs を現行の protocol・session-store/pod-store・work-items 運用に合わせて更新した。旧 llm persistence / maintainer work item plan は superseded/historical と明示。検証は ./tickets.sh doctor と git diff --check。

@@ -1,1 +1,0 @@
-現時点では fresh-start-path を独立機能として実装しない方針に変更する。問題の実体は Pod 名の restorable metadata 衝突と古い Pod/session 履歴の蓄積であり、fresh start 専用 UX ではなく、Pod 名を明示的に空ける archive/delete と storage cleanup/prune の設計で扱う。既存の通常 lifecycle（restorable -> restore、missing -> spawn）は維持し、restore bypass の専用 path は作らない。必要になれば Pod/session storage cleanup commands として別 Ticket を切る。

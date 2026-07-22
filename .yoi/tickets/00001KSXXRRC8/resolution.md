@@ -1,1 +1,0 @@
-Simplified the LLM-facing Pod tool surface: `ListPods` now uses visibility/state-backed listing semantics, `ListVisiblePods` and `InspectPod` are removed from the active tool/protocol surface, and `AttachOrRestorePod` is renamed to `RestorePod`. TUI/protocol/docs/tests were updated, external review approved, and main workspace validation passed.

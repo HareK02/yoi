@@ -1,1 +1,0 @@
-Merged branch tui-keys-inline-viewport-ui via merge commit dbb47e0 after external review approval. Validation on develop passed: cargo fmt --check, cargo test -p pod, cargo test -p tui, cargo check -p insomnia, ./tickets.sh doctor.

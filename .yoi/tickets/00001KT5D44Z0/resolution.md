@@ -1,1 +1,0 @@
-Unified reasoning persistence with the Thinking block lifecycle. Removed the separate ReasoningItem event/collector path; Anthropic and OpenAI Responses reasoning metadata now persist via block stop metadata; reviewer blocker fixed; focused tests and nix build passed.

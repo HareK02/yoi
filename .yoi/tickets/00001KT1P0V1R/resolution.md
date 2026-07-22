@@ -1,1 +1,0 @@
-Implemented TUI-initiated peer Pod handshake and peer messaging. Peers are persisted separately from spawned children, appear in ListPods as peers, and can receive peer messages through a distinct tool/method. Reviewer blockers were fixed; focused tests and nix build passed.

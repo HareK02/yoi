@@ -1,1 +1,0 @@
-Workdir dirty source rejection is now scoped to the `HEAD` selector. Explicit branch selectors can materialize detached workdirs from their resolved commit even when the source worktree has uncommitted changes.

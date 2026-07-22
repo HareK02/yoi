@@ -1,1 +1,0 @@
-Removed obsolete placeholder crates/daemon workspace member. Updated Cargo workspace/default-members, Cargo.lock, TUI completion fixtures, and package.nix cargoHash. Validation passed: cargo fmt --check; cargo test -p tui; cargo check --workspace; git diff --check; yoi ticket doctor; nix build .#yoi --no-link.
