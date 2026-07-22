@@ -235,3 +235,69 @@ Verification:
 - `git diff --check`
 
 ---
+
+<!-- event: decision author: assistant at: 2026-07-22T03:41:01Z -->
+
+## Decision
+
+Design correction / implementation target:
+
+Runtime protocol WS should be thin. `/v1/workers/{worker_id}/protocol/ws` is already worker-id scoped, so after worker lookup it should not reimplement Worker protocol semantics. It should connect the WebSocket framing to the same Worker protocol session behavior used by local IPC.
+
+Current issue:
+- Local IPC protocol session in `worker/src/ipc/server.rs` already knows how to combine:
+  - `WorkerHandle::event_tx` protocol events
+  - `SegmentLogSink` live log entries (`LogEntry::UserInput` -> `Event::UserMessage`, etc.)
+  - `Method` frame reading and event writing
+- Runtime WS has been recreating similar logic in `worker-runtime/src/http_server.rs` / `worker_backend.rs`.
+- This duplicated logic caused drift: runtime protocol streaming initially missed `SegmentLogSink` live entries, and a bad synthetic echo workaround was added before being corrected.
+
+Decision:
+- Do not make runtime/backend interpret normal Worker protocol operations.
+- Backend remains a raw protocol WS proxy for remote runtime workers.
+- Runtime remains a worker-id lookup + lifecycle boundary; for protocol WS it should delegate to a shared Worker protocol session implementation.
+- Local IPC and runtime WS should use the same session logic so user echo, system items, invoke events, completions, rewind, pause/resume, etc. cannot diverge.
+
+Implementation target:
+- Extract the local IPC protocol session logic into a reusable Worker protocol session helper that is not Unix-socket-specific.
+- Local IPC server uses the helper.
+- Runtime protocol WS uses the same helper or a thin adapter around it.
+- Remove duplicated live-entry/event bridging from runtime-specific code where possible.
+- Keep lifecycle/runtime management outside the protocol session helper.
+
+---
+
+<!-- event: implementation_report author: assistant at: 2026-07-22T03:51:04Z -->
+
+## Implementation report
+
+Implementation update for thin runtime protocol session:
+
+- Added `worker::ipc::protocol_session` as the shared Worker protocol session helper.
+  - `subscribe_worker_protocol_session(&WorkerHandle)` centralizes snapshot + alert + live log entry + event subscriptions.
+  - `live_log_entry_event(LogEntry)` centralizes the local IPC mapping:
+    - `SegmentStart` -> `Event::SegmentRotated`
+    - `UserInput` -> `Event::UserMessage`
+    - `SystemItem` -> `Event::SystemItem`
+    - `Invoke` -> `Event::InvokeStart`
+  - `dispatch_worker_protocol_method(...)` centralizes same-connection direct response handling for `ListCompletions`, forwarding other methods to `WorkerHandle::send`.
+- Updated local IPC server to use the shared helper instead of owning its own mapping/subscription logic.
+- Updated `worker-runtime` embedded backend bridge to use the same shared helper for live Worker/log event bridging.
+- Removed the duplicated `live_log_entry_event` mapping from runtime-specific code.
+
+Scope note:
+- This keeps Backend as raw WS proxy for remote runtime workers.
+- Runtime still performs worker-id lookup and execution/lifecycle boundary work, but protocol stream composition now uses the same Worker session helper as local IPC instead of maintaining a separate mapping implementation.
+- Full WS socket pump and Unix JSONL pump still have transport-specific loops, but the protocol subscription/mapping/direct-response semantics are no longer duplicated.
+
+Verification:
+- `nix develop -c cargo fmt -- --check`
+- `nix develop -c cargo check -p worker-runtime -p worker -p yoi-workspace-server -p client -p tui`
+- `nix develop -c cargo test -p worker --lib ipc::protocol_session`
+- `nix develop -c cargo test -p worker --lib ipc::server`
+- `nix develop -c cargo test -p worker-runtime --features ws-server --lib protocol_ws`
+- `nix develop -c cargo test -p yoi-workspace-server protocol_ws --lib`
+- `nix develop -c cargo test -p client backend_runtime --lib`
+- `git diff --check`
+
+---

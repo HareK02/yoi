@@ -30,13 +30,15 @@ use crate::working_directory::{
 };
 use async_trait::async_trait;
 use manifest::paths;
-use protocol::{Event, Method, Segment, WorkerStatus};
+use protocol::{Method, Segment, WorkerStatus};
 use session_store::FsStore;
-use session_store::{CombinedStore, FsWorkerStore, LogEntry};
+use session_store::{CombinedStore, FsWorkerStore};
 use tokio::runtime::Runtime;
 #[cfg(feature = "ws-server")]
 use tokio::sync::broadcast;
 
+#[cfg(feature = "ws-server")]
+use worker::ipc::protocol_session::{live_log_entry_event, subscribe_worker_protocol_session};
 use worker::{
     PromptLoader, Worker, WorkerController, WorkerError, WorkerFilesystemAuthority, WorkerHandle,
     WorkerWorkspaceContext, WorkspaceClient, WorkspaceId,
@@ -666,8 +668,9 @@ where
         let busy = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "ws-server")]
         {
-            let mut events = handle.subscribe();
-            let (_entries, mut entry_events) = handle.sink.subscribe_with_snapshot();
+            let streams = subscribe_worker_protocol_session(&handle);
+            let mut events = streams.events;
+            let mut entry_events = streams.log_entries;
             let bridge_handle = handle.clone();
             let bridge_busy = busy.clone();
             if let Err(message) = self.spawn_on_adapter_runtime(async move {
@@ -735,22 +738,6 @@ impl<F> Drop for WorkerRuntimeExecutionBackend<F> {
         {
             let _ = std::thread::spawn(move || drop(runtime)).join();
         }
-    }
-}
-
-fn live_log_entry_event(entry: LogEntry) -> Option<Event> {
-    match entry {
-        LogEntry::SegmentStart { .. } => {
-            let value = serde_json::to_value(&entry).expect("LogEntry is Serialize");
-            Some(Event::SegmentRotated { entry: value })
-        }
-        LogEntry::UserInput { segments, .. } => Some(Event::UserMessage { segments }),
-        LogEntry::SystemItem { item, .. } => {
-            let value = serde_json::to_value(&item).expect("SystemItem is Serialize");
-            Some(Event::SystemItem { item: value })
-        }
-        LogEntry::Invoke { trigger, .. } => Some(Event::InvokeStart { kind: trigger }),
-        _ => None,
     }
 }
 
@@ -1239,21 +1226,6 @@ mod tests {
     use llm_engine::llm_client::event::{Event as LlmEvent, ResponseStatus, StatusEvent};
     use llm_engine::llm_client::{ClientError, LlmClient, Request};
     use manifest::{Scope, WorkerManifest};
-
-    #[test]
-    fn runtime_bridge_maps_live_user_input_log_entry_to_user_message() {
-        let segments = vec![Segment::text("hello through normal bridge")];
-        let event = live_log_entry_event(LogEntry::UserInput {
-            ts: session_store::segment_log::now_millis(),
-            segments: segments.clone(),
-        })
-        .expect("UserInput must be live-relevant");
-
-        match event {
-            Event::UserMessage { segments: echoed } => assert_eq!(echoed, segments),
-            other => panic!("expected UserMessage, got {other:?}"),
-        }
-    }
 
     #[derive(Clone)]
     struct MockClient {
