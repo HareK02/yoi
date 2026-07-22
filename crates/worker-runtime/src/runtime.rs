@@ -576,8 +576,6 @@ impl Runtime {
             return Ok(vec![Event::Completions { kind, entries }]);
         }
 
-        let observation_payload = protocol_method_observation_event(&method);
-
         let (backend, handle) = {
             let mut state = self.lock()?;
             state.ensure_running()?;
@@ -624,9 +622,6 @@ impl Runtime {
         }
 
         self.record_execution_result(worker_ref, dispatch_result)?;
-        if let Some(payload) = observation_payload {
-            self.record_protocol_method_observation(worker_ref, payload)?;
-        }
         Ok(Vec::new())
     }
 
@@ -963,7 +958,12 @@ impl Runtime {
         worker_ref: &WorkerRef,
         input: WorkerInput,
     ) -> Result<(), RuntimeError> {
-        self.record_protocol_method_observation(worker_ref, input_protocol_event(&input))
+        let mut state = self.lock()?;
+        state.ensure_worker_ref(worker_ref)?;
+        let event =
+            state.push_worker_observation_event(worker_ref.clone(), input_protocol_event(&input));
+        state.persist_worker_observation_event(&event)?;
+        Ok(())
     }
 
     #[cfg(not(feature = "ws-server"))]
@@ -971,28 +971,6 @@ impl Runtime {
         &self,
         _worker_ref: &WorkerRef,
         _input: WorkerInput,
-    ) -> Result<(), RuntimeError> {
-        Ok(())
-    }
-
-    #[cfg(feature = "ws-server")]
-    fn record_protocol_method_observation(
-        &self,
-        worker_ref: &WorkerRef,
-        payload: Event,
-    ) -> Result<(), RuntimeError> {
-        let mut state = self.lock()?;
-        state.ensure_worker_ref(worker_ref)?;
-        let event = state.push_worker_observation_event(worker_ref.clone(), payload);
-        state.persist_worker_observation_event(&event)?;
-        Ok(())
-    }
-
-    #[cfg(not(feature = "ws-server"))]
-    fn record_protocol_method_observation(
-        &self,
-        _worker_ref: &WorkerRef,
-        _payload: Event,
     ) -> Result<(), RuntimeError> {
         Ok(())
     }
@@ -1859,48 +1837,6 @@ fn validate_worker_input(input: &WorkerInput) -> Result<(), RuntimeError> {
 }
 
 #[cfg(feature = "ws-server")]
-fn protocol_method_observation_event(method: &Method) -> Option<Event> {
-    match method {
-        Method::Run { input } => Some(Event::UserMessage {
-            segments: input.clone(),
-        }),
-        Method::Notify { message, .. } => Some(Event::SystemItem {
-            item: serde_json::json!({
-                "kind": "embedded_worker_system_input",
-                "content": message,
-            }),
-        }),
-        Method::RegisterPeer { name } => Some(Event::SystemItem {
-            item: serde_json::json!({
-                "kind": "embedded_worker_command_input",
-                "command": "register_peer",
-                "content": name,
-            }),
-        }),
-        Method::Compact => Some(Event::SystemItem {
-            item: serde_json::json!({
-                "kind": "embedded_worker_command_input",
-                "command": "compact",
-                "content": "",
-            }),
-        }),
-        Method::ListRewindTargets => Some(Event::SystemItem {
-            item: serde_json::json!({
-                "kind": "embedded_worker_command_input",
-                "command": "list_rewind_targets",
-                "content": "",
-            }),
-        }),
-        _ => None,
-    }
-}
-
-#[cfg(not(feature = "ws-server"))]
-fn protocol_method_observation_event(_method: &Method) -> Option<Event> {
-    None
-}
-
-#[cfg(feature = "ws-server")]
 fn input_protocol_event(input: &WorkerInput) -> protocol::Event {
     match input.kind {
         WorkerInputKind::User => protocol::Event::UserMessage {
@@ -1941,7 +1877,6 @@ mod tests {
         WorkerExecutionRestoreRequest, WorkerExecutionRunState,
     };
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     fn task_request(_objective: &str) -> CreateWorkerRequest {

@@ -198,3 +198,40 @@ Verification:
 - `git diff --check`
 
 ---
+
+<!-- event: implementation_report author: assistant at: 2026-07-22T02:54:28Z -->
+
+## Implementation report
+
+Correction after review:
+
+The previous fix synthesized `Event::UserMessage` in `Runtime::send_protocol_method(...)`. That was the wrong layer. `UserMessage` is part of the normal Worker protocol/log output path and should not be constructed by the runtime transport layer.
+
+Root cause refined:
+- The embedded Worker backend bridge only subscribed to `WorkerHandle::event_tx`.
+- Local socket clients also subscribe to `SegmentLogSink` live entries; `LogEntry::UserInput` is mapped to `Event::UserMessage` there.
+- Runtime observation/protocol streaming missed that `SegmentLogSink` live-entry path, so user input echo events were absent when using runtime protocol transport.
+
+Fix:
+- Removed the runtime-side synthetic protocol-method echo from `Runtime::send_protocol_method(...)`.
+- Updated `WorkerRuntimeExecutionBackend::connect_handle(...)` to bridge both:
+  - direct Worker protocol events from `WorkerHandle::subscribe()`
+  - live session log entries from `handle.sink.subscribe_with_snapshot()`
+- Added runtime bridge mapping matching local IPC behavior:
+  - `LogEntry::SegmentStart` -> `Event::SegmentRotated`
+  - `LogEntry::UserInput` -> `Event::UserMessage`
+  - `LogEntry::SystemItem` -> `Event::SystemItem`
+  - `LogEntry::Invoke` -> `Event::InvokeStart`
+- Removed the fake protocol-WS echo test that depended on synthetic runtime behavior.
+- Added a unit test that locks the normal bridge mapping: live `LogEntry::UserInput` maps to `Event::UserMessage`.
+
+Verification:
+- `nix develop -c cargo fmt -- --check`
+- `nix develop -c cargo check -p worker-runtime -p yoi-workspace-server -p client -p tui`
+- `nix develop -c cargo test -p worker-runtime --features ws-server --lib runtime_bridge_maps_live_user_input_log_entry_to_user_message`
+- `nix develop -c cargo test -p worker-runtime --features ws-server --lib protocol_ws`
+- `nix develop -c cargo test -p yoi-workspace-server protocol_ws --lib`
+- `nix develop -c cargo test -p client backend_runtime --lib`
+- `git diff --check`
+
+---

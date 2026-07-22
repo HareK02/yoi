@@ -2,7 +2,7 @@
 title: 'Backend runtime経由の操作をprotocol transportへ統一しTUI同等にする'
 state: 'planning'
 created_at: '2026-07-21T09:20:07Z'
-updated_at: '2026-07-22T02:11:40Z'
+updated_at: '2026-07-22T02:54:28Z'
 assignee: null
 readiness: 'draft'
 ---
