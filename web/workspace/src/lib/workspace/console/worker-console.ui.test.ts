@@ -385,7 +385,13 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
     new URL("../auth/api.ts", import.meta.url),
   );
   const rootLayout = await Deno.readTextFile(
+    new URL("./../../../routes/+layout.svelte", import.meta.url),
+  );
+  const rootLayoutLoad = await Deno.readTextFile(
     new URL("./../../../routes/+layout.ts", import.meta.url),
+  );
+  const sidebar = await Deno.readTextFile(
+    new URL("../sidebar/WorkspaceSidebar.svelte", import.meta.url),
   );
 
   assert(
@@ -412,7 +418,16 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
     "Auth model should stay on Backend auth APIs rather than workspace authorization APIs",
   );
   assert(
-    rootLayout.includes('"/account"') && rootLayout.includes('"/login/device"'),
+    rootLayout.includes("workspace-topbar") &&
+      rootLayout.includes("topbar-icon-button") &&
+      rootLayout.includes('href="/account"') &&
+      rootLayout.includes("Open Account") &&
+      !sidebar.includes("accountHref") &&
+      !sidebar.includes("Open Account"),
+    "Account navigation should live in the global layout header, not the workspace sidebar",
+  );
+  assert(
+    rootLayoutLoad.includes('"/account"') && rootLayoutLoad.includes('"/login/device"'),
     "Root layout should not redirect account and device-login public routes to a workspace",
   );
 });
