@@ -12,8 +12,8 @@
     repositories?: RepositoryListResponse | null;
     repositoriesError?: string | null;
     currentPath?: string;
-    collapsed?: boolean;
-    onToggleCollapsed?: () => void;
+    folded?: boolean;
+    onToggleFold?: () => void;
   };
 
   let {
@@ -22,8 +22,8 @@
     repositories = null,
     repositoriesError = null,
     currentPath = '/',
-    collapsed = false,
-    onToggleCollapsed
+    folded = false,
+    onToggleFold
   }: Props = $props();
 
   let workspaceId = $derived(workspace?.workspace_id ?? '');
@@ -32,7 +32,7 @@
 </script>
 
 <aside
-  class:collapsed
+  class:folded
   class="workspace-sidebar"
   aria-label="Workspace navigation"
 >
@@ -52,14 +52,14 @@
       </div>
 
       <button
-        class="sidebar-collapse-button"
+        class="sidebar-fold-button"
         type="button"
-        aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-        aria-expanded={!collapsed}
-        title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-        onclick={onToggleCollapsed}
+        aria-label={folded ? 'Unfold sidebar' : 'Fold sidebar'}
+        aria-expanded={!folded}
+        title={folded ? 'Unfold sidebar' : 'Fold sidebar'}
+        onclick={onToggleFold}
       >
-        {#if collapsed}
+        {#if folded}
           <svg class="sidebar-icon" aria-hidden="true" viewBox="0 0 24 24">
             <path d="m6 17 5-5-5-5" />
             <path d="m13 17 5-5-5-5" />
@@ -103,7 +103,7 @@
     </div>
   </header>
 
-  {#if !collapsed}
+  {#if !folded}
     <nav class="sidebar-sections" aria-label="Workspace sections">
       <RepositoriesNavSection {repositories} {repositoriesError} {currentPath} {workspaceId} />
       <ObjectivesNavSection {currentPath} {workspaceId} />

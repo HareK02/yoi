@@ -5,10 +5,10 @@
   import type { LayoutProps } from './$types';
 
   let { data, children }: LayoutProps = $props();
-  let sidebarCollapsed = $state(false);
+  let sidebarFolded = $state(false);
 
-  function toggleSidebar() {
-    sidebarCollapsed = !sidebarCollapsed;
+  function toggleSidebarFold() {
+    sidebarFolded = !sidebarFolded;
   }
 </script>
 
@@ -19,8 +19,8 @@
     repositories={data.repositories ?? null}
     repositoriesError={data.repositoriesError ?? null}
     currentPath={page.url.pathname}
-    collapsed={sidebarCollapsed}
-    onToggleCollapsed={toggleSidebar}
+    folded={sidebarFolded}
+    onToggleFold={toggleSidebarFold}
   />
 {/snippet}
 

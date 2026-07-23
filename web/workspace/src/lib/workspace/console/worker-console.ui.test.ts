@@ -459,6 +459,16 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
     "Workspace layout should load workspace data and register a WorkspaceSidebar snippet",
   );
   assert(
+    workspaceLayout.includes("sidebarFolded") &&
+      workspaceLayout.includes("onToggleFold={toggleSidebarFold}") &&
+      sidebar.includes("folded?: boolean") &&
+      sidebar.includes("onToggleFold?: () => void") &&
+      sidebar.includes("sidebar-fold-button") &&
+      sidebar.includes("Fold sidebar") &&
+      sidebar.includes("Unfold sidebar"),
+    "Workspace sidebar should keep a visible fold button with fold/folded naming",
+  );
+  assert(
     sidebarOverride.includes("controller.setSidebar(sidebar)") &&
       sidebarOverride.includes("controller.clearSidebar(sidebar)"),
     "SidebarOverride should register and clean up the child-provided sidebar snippet",
