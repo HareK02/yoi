@@ -141,31 +141,13 @@
 		grid-row: 1;
 		display: flex;
 		align-items: center;
-		justify-content: space-between;
+		justify-content: flex-end;
 		min-width: 0;
 		min-height: 3.25rem;
 		padding: 0 var(--space-5);
 		border-bottom: 1px solid var(--line);
 		background: color-mix(in srgb, var(--bg-raised) 88%, transparent);
 		backdrop-filter: blur(14px);
-	}
-	.workspace-topbar-title {
-		display: inline-flex;
-		align-items: center;
-		gap: var(--space-2);
-		color: var(--text-strong);
-		font-weight: 700;
-	}
-	.workspace-topbar-logo {
-		display: inline-grid;
-		width: 1.8rem;
-		height: 1.8rem;
-		place-items: center;
-		border-radius: var(--radius-soft);
-		background: var(--interactive-hover);
-		color: var(--text-strong);
-		font-size: 0.9rem;
-		font-weight: 800;
 	}
 	.workspace-topbar-actions {
 		display: inline-flex;
@@ -235,6 +217,8 @@
 		.workspace-sidebar {
 			grid-column: 1;
 			grid-row: 1;
+			border-right: 0;
+			border-bottom: 1px solid var(--line);
 		}
 		.workspace-topbar {
 			grid-column: 1;
@@ -258,6 +242,7 @@
 		min-height: 0;
 		overflow-y: auto;
 		padding: var(--space-4) var(--space-3);
+		border-right: 1px solid var(--line);
 	}
 	.sidebar-header {
 		display: grid;

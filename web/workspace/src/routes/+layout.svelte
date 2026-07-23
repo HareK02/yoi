@@ -22,10 +22,6 @@
     onToggleCollapsed={() => (sidebarCollapsed = !sidebarCollapsed)}
   />
   <header class="workspace-topbar">
-    <div class="workspace-topbar-title" aria-label="Yoi Workspace">
-      <span class="workspace-topbar-logo" aria-hidden="true">Y</span>
-      <span>Yoi</span>
-    </div>
     <nav class="workspace-topbar-actions" aria-label="Global navigation">
       <a class="topbar-icon-button" href="/account" aria-label="Open Account" title="Account">
         <svg class="topbar-icon" aria-hidden="true" viewBox="0 0 24 24">
