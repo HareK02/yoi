@@ -1,5 +1,6 @@
 <script lang="ts">
   import { workspaceRoute } from '$lib/workspace/api/http';
+  import './sidebar.css';
   import ObjectivesNavSection from './ObjectivesNavSection.svelte';
   import RepositoriesNavSection from './RepositoriesNavSection.svelte';
   import TicketsNavSection from './TicketsNavSection.svelte';

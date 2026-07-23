@@ -42,3 +42,100 @@
     {@render children()}
   </main>
 </div>
+
+<style>
+  .workspace-layout {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+    width: 100vw;
+    height: 100dvh;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    min-width: 0;
+  }
+
+  .workspace-topbar {
+    grid-column: 2;
+    grid-row: 1;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    min-width: 0;
+    min-height: 3.25rem;
+    padding: 0 var(--space-5);
+    border-bottom: 1px solid var(--line);
+    background: color-mix(in srgb, var(--bg-raised) 88%, transparent);
+    backdrop-filter: blur(14px);
+  }
+
+  .workspace-topbar-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .topbar-icon-button {
+    display: inline-flex;
+    width: 2.35rem;
+    height: 2.35rem;
+    align-items: center;
+    justify-content: center;
+    border-radius: 999px;
+    color: var(--text-muted);
+    text-decoration: none;
+  }
+
+  .topbar-icon-button:hover,
+  .topbar-icon-button:focus-visible {
+    background: var(--interactive-hover);
+    color: var(--text-muted);
+  }
+
+  .topbar-icon {
+    width: 1.1rem;
+    height: 1.1rem;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .shell {
+    grid-column: 2;
+    grid-row: 2;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-6);
+    min-width: 0;
+    min-height: 0;
+    overflow-y: auto;
+    padding: var(--space-6);
+  }
+
+  @media (max-width: 760px) {
+    .workspace-layout {
+      grid-template-columns: 1fr;
+      grid-template-rows: auto auto 1fr;
+      width: 100vw;
+      height: auto;
+      min-height: 100dvh;
+      overflow: visible;
+    }
+
+    .workspace-topbar {
+      grid-column: 1;
+      grid-row: 2;
+      padding: 0 var(--space-4);
+    }
+
+    .shell {
+      grid-column: 1;
+      grid-row: 3;
+      overflow: visible;
+      padding: var(--space-5) var(--space-4);
+    }
+  }
+</style>

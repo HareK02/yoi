@@ -1,4 +1,6 @@
 <script lang="ts">
+  import './sidebar.css';
+
   type Props = {
     currentPath: string;
   };
