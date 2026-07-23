@@ -19,6 +19,10 @@ async function jsonOrThrow<T>(response: Response): Promise<T> {
   return text ? JSON.parse(text) as T : (null as T);
 }
 
+function browserOrigin(): string | null {
+  return globalThis.location?.origin ?? null;
+}
+
 export async function loadWhoami(fetcher: typeof fetch = fetch): Promise<WhoamiResponse> {
   return await fetcher("/api/auth/whoami", { credentials: "same-origin" }).then(jsonOrThrow<WhoamiResponse>);
 }
@@ -32,7 +36,7 @@ export async function registerPasskey(
     method: "POST",
     headers: { "content-type": "application/json" },
     credentials: "same-origin",
-    body: JSON.stringify({ handle, display_name: displayName }),
+    body: JSON.stringify({ handle, display_name: displayName, browser_origin: browserOrigin() }),
   }).then(jsonOrThrow<PasskeyRegistrationOptionsResponse>);
 
   const credential = await navigator.credentials.create({
@@ -61,7 +65,7 @@ export async function loginWithPasskey(
     method: "POST",
     headers: { "content-type": "application/json" },
     credentials: "same-origin",
-    body: JSON.stringify({ handle }),
+    body: JSON.stringify({ handle, browser_origin: browserOrigin() }),
   }).then(jsonOrThrow<PasskeyLoginOptionsResponse>);
 
   const credential = await navigator.credentials.get({

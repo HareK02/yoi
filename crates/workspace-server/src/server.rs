@@ -2507,6 +2507,8 @@ struct PasskeyRegistrationOptionsRequest {
     handle: String,
     #[serde(default)]
     display_name: Option<String>,
+    #[serde(default)]
+    browser_origin: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2527,6 +2529,8 @@ struct PasskeyRegistrationCompleteRequest {
 struct PasskeyLoginOptionsRequest {
     #[serde(default)]
     handle: Option<String>,
+    #[serde(default)]
+    browser_origin: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2619,7 +2623,12 @@ async fn post_passkey_registration_options(
     Json(request): Json<PasskeyRegistrationOptionsRequest>,
 ) -> ApiResult<Json<PasskeyRegistrationOptionsResponse>> {
     let user = ensure_user_account(&api, &request.handle, request.display_name.as_deref())?;
-    let auth = auth_config_for_origin(&api.config, request_origin(&headers).as_deref())?;
+    let header_origin = request_origin(&headers);
+    let requested_origin = request
+        .browser_origin
+        .as_deref()
+        .or(header_origin.as_deref());
+    let auth = auth_config_for_origin(&api.config, requested_origin)?;
     let webauthn = webauthn_for_auth(&auth)?;
     let exclude_credentials = passkeys_for_user(&api, &user.user_id)?
         .into_iter()
@@ -2746,7 +2755,12 @@ async fn post_passkey_login_options(
         )
         .into());
     }
-    let auth = auth_config_for_origin(&api.config, request_origin(&headers).as_deref())?;
+    let header_origin = request_origin(&headers);
+    let requested_origin = request
+        .browser_origin
+        .as_deref()
+        .or(header_origin.as_deref());
+    let auth = auth_config_for_origin(&api.config, requested_origin)?;
     let webauthn = webauthn_for_auth(&auth)?;
     let (public_key, state) = webauthn
         .start_passkey_authentication(&passkeys)
@@ -3087,9 +3101,17 @@ fn auth_config_for_origin(
             "request Origin header does not contain a host",
         )
     })?;
-    if host == auth.rp_id {
-        auth.origin = request_origin.to_string();
+    if host != auth.rp_id {
+        return Err(auth_error(
+            "webauthn_origin_rp_id_mismatch",
+            &format!(
+                "browser origin host {host} does not match configured RP ID {}",
+                auth.rp_id
+            ),
+        )
+        .into());
     }
+    auth.origin = request_origin.to_string();
     Ok(auth)
 }
 
