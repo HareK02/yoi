@@ -11,6 +11,7 @@ use crate::server::{AuthConfig, ServerConfig};
 use crate::{Error, Result};
 
 pub const WORKSPACE_BACKEND_CONFIG_RELATIVE_PATH: &str = ".yoi/workspace-backend.local.toml";
+pub const BACKEND_RUNTIMES_CONFIG_FILE_NAME: &str = "runtimes.toml";
 pub const WORKSPACE_BACKEND_CONFIG_TEMPLATE: &str =
     include_str!("../../../resources/workspace-backend.default.toml");
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
@@ -49,6 +50,11 @@ pub struct WorkspaceBackendConfigFile {
     pub auth: WorkspaceBackendAuthConfig,
     #[serde(default)]
     pub repositories: Vec<WorkspaceRepositoryConfigFile>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BackendRuntimesConfigFile {
     #[serde(default)]
     pub runtimes: WorkspaceBackendRuntimesConfig,
 }
@@ -198,6 +204,74 @@ pub struct ResolvedWorkspaceBackendConfig {
     pub database_path: PathBuf,
 }
 
+impl BackendRuntimesConfigFile {
+    pub fn path_for_config_dir(config_dir: impl AsRef<Path>) -> PathBuf {
+        config_dir.as_ref().join(BACKEND_RUNTIMES_CONFIG_FILE_NAME)
+    }
+
+    pub fn default_path() -> Option<PathBuf> {
+        manifest::paths::config_dir().map(Self::path_for_config_dir)
+    }
+
+    pub fn load_default() -> Result<Self> {
+        match Self::default_path() {
+            Some(path) => Self::load_from_path(path),
+            None => Ok(Self::default()),
+        }
+    }
+
+    pub fn load_from_config_dir(config_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::load_from_path(Self::path_for_config_dir(config_dir))
+    }
+
+    pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        match fs::read_to_string(path) {
+            Ok(raw) => Self::parse_str(&raw, path),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(Error::Io(error)),
+        }
+    }
+
+    pub fn write_default(&self) -> Result<PathBuf> {
+        let path = Self::default_path().ok_or_else(|| {
+            Error::Config(
+                "YOI_CONFIG_DIR, YOI_HOME, XDG_CONFIG_HOME, or HOME is required to write Backend runtimes config"
+                    .to_string(),
+            )
+        })?;
+        self.write_to_path(&path)?;
+        Ok(path)
+    }
+
+    pub fn write_to_config_dir(&self, config_dir: impl AsRef<Path>) -> Result<()> {
+        self.write_to_path(Self::path_for_config_dir(config_dir))
+    }
+
+    pub fn write_to_path(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let raw = toml::to_string_pretty(self).map_err(|error| {
+            Error::Config(format!(
+                "failed to serialize Backend runtimes config: {error}"
+            ))
+        })?;
+        fs::write(path, raw)?;
+        Ok(())
+    }
+
+    pub fn parse_str(raw: &str, path: impl AsRef<Path>) -> Result<Self> {
+        toml::from_str(raw).map_err(|error| {
+            Error::Config(format!(
+                "failed to parse Backend runtimes config `{}`: {error}",
+                path.as_ref().display()
+            ))
+        })
+    }
+}
+
 impl WorkspaceBackendConfigFile {
     pub fn path_for_workspace(workspace_root: impl AsRef<Path>) -> PathBuf {
         workspace_root
@@ -277,6 +351,19 @@ impl WorkspaceBackendConfigFile {
         workspace_root: impl AsRef<Path>,
         identity: WorkspaceIdentity,
     ) -> Result<ResolvedWorkspaceBackendConfig> {
+        self.resolve_with_runtime_config(
+            workspace_root,
+            identity,
+            &BackendRuntimesConfigFile::default(),
+        )
+    }
+
+    pub fn resolve_with_runtime_config(
+        &self,
+        workspace_root: impl AsRef<Path>,
+        identity: WorkspaceIdentity,
+        runtime_config: &BackendRuntimesConfigFile,
+    ) -> Result<ResolvedWorkspaceBackendConfig> {
         let workspace_root = workspace_root.as_ref();
         let data_root = self
             .data
@@ -312,6 +399,7 @@ impl WorkspaceBackendConfigFile {
             })?;
 
         let mut server = ServerConfig::local_dev(workspace_root.to_path_buf(), identity);
+        server.database_path = database_path.clone();
         server.frontend_url = self
             .server
             .frontend_url
@@ -329,7 +417,7 @@ impl WorkspaceBackendConfigFile {
             .iter()
             .map(|repository| resolve_repository(workspace_root, repository))
             .collect::<Result<Vec<_>>>()?;
-        server.remote_runtime_sources = self
+        server.remote_runtime_sources = runtime_config
             .runtimes
             .remote
             .iter()
@@ -352,7 +440,9 @@ impl WorkspaceBackendConfigFile {
 
 impl ResolvedWorkspaceBackendConfig {
     pub fn with_database_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.database_path = path.into();
+        let path = path.into();
+        self.database_path = path.clone();
+        self.server.database_path = path;
         self
     }
 
@@ -663,15 +753,80 @@ uri = "https://example.com/org/repo.git"
     }
 
     #[test]
-    fn token_value_field_is_not_in_schema() {
+    fn backend_runtimes_config_loads_from_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = BackendRuntimesConfigFile {
+            runtimes: WorkspaceBackendRuntimesConfig {
+                remote: vec![RemoteRuntimeConfigFile {
+                    id: "arc".to_string(),
+                    endpoint: "http://127.0.0.1:38800".to_string(),
+                    display_name: Some("arc".to_string()),
+                    token_ref: None,
+                }],
+            },
+        };
+        config.write_to_config_dir(dir.path()).unwrap();
+        let loaded = BackendRuntimesConfigFile::load_from_config_dir(dir.path()).unwrap();
+        assert_eq!(loaded, config);
+        assert_eq!(
+            BackendRuntimesConfigFile::path_for_config_dir(dir.path()),
+            dir.path().join("runtimes.toml")
+        );
+    }
+
+    #[test]
+    fn workspace_backend_config_rejects_runtime_entries() {
         let error = WorkspaceBackendConfigFile::parse_str(
+            r#"
+[[runtimes.remote]]
+id = "arc"
+endpoint = "http://legacy.example.test"
+display_name = "legacy arc"
+"#,
+            "test",
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unknown field `runtimes`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn backend_runtimes_config_is_the_only_runtime_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_config = WorkspaceBackendConfigFile::parse_str("", "test").unwrap();
+        let runtime_config = BackendRuntimesConfigFile::parse_str(
+            r#"
+[[runtimes.remote]]
+id = "arc"
+endpoint = "http://xdg.example.test"
+display_name = "xdg arc"
+"#,
+            "runtimes.toml",
+        )
+        .unwrap();
+        let resolved = workspace_config
+            .resolve_with_runtime_config(dir.path(), identity(), &runtime_config)
+            .unwrap();
+        assert_eq!(resolved.server.remote_runtime_sources.len(), 1);
+        assert_eq!(resolved.server.remote_runtime_sources[0].runtime_id, "arc");
+        assert_eq!(
+            resolved.server.remote_runtime_sources[0].base_url.as_str(),
+            "http://xdg.example.test"
+        );
+    }
+
+    #[test]
+    fn token_value_field_is_not_in_runtime_schema() {
+        let error = BackendRuntimesConfigFile::parse_str(
             r#"
 [[runtimes.remote]]
 id = "remote"
 endpoint = "http://127.0.0.1:8790"
 token = "secret"
 "#,
-            "test",
+            "runtimes.toml",
         )
         .unwrap_err();
         assert!(
@@ -683,17 +838,22 @@ token = "secret"
     #[test]
     fn token_ref_fails_closed_until_secret_resolution_exists() {
         let dir = tempfile::tempdir().unwrap();
-        let config = WorkspaceBackendConfigFile::parse_str(
+        let workspace_config = WorkspaceBackendConfigFile::parse_str("", "test").unwrap();
+        let runtime_config = BackendRuntimesConfigFile::parse_str(
             r#"
 [[runtimes.remote]]
 id = "remote"
 endpoint = "http://127.0.0.1:8790"
 token_ref = "local:remote-token"
 "#,
-            "test",
+            "runtimes.toml",
         )
         .unwrap();
-        let error = match config.resolve(dir.path(), identity()) {
+        let error = match workspace_config.resolve_with_runtime_config(
+            dir.path(),
+            identity(),
+            &runtime_config,
+        ) {
             Ok(_) => panic!("token_ref should fail closed until secret resolution exists"),
             Err(error) => error,
         };

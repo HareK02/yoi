@@ -121,7 +121,7 @@ impl ProfileRuntimeWorkerFactory {
             .clone()
             .or_else(paths::sessions_dir)
             .ok_or_else(|| {
-                "could not resolve sessions directory (set YOI_HOME, YOI_DATA_DIR, or HOME)"
+                "could not resolve sessions directory (set YOI_DATA_DIR, YOI_HOME, XDG_DATA_HOME, or HOME)"
                     .to_string()
             })
     }

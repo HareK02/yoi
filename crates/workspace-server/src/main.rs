@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 use yoi_workspace_server::{
-    SqliteWorkspaceStore, WORKSPACE_BACKEND_CONFIG_TEMPLATE, WorkspaceBackendConfigFile,
-    WorkspaceIdentity, serve,
+    BackendRuntimesConfigFile, SqliteWorkspaceStore, WORKSPACE_BACKEND_CONFIG_TEMPLATE,
+    WorkspaceBackendConfigFile, WorkspaceIdentity, serve,
 };
 
 #[derive(Debug)]
@@ -169,7 +169,9 @@ fn run_skills(command: SkillsCommand) -> Result<(), Box<dyn std::error::Error>> 
 async fn run_serve(options: ServeOptions) -> Result<(), Box<dyn std::error::Error>> {
     let identity = WorkspaceIdentity::load_required(&options.workspace)?;
     let config_file = WorkspaceBackendConfigFile::load_for_workspace(&options.workspace)?;
-    let mut resolved = config_file.resolve(&options.workspace, identity)?;
+    let runtime_config = BackendRuntimesConfigFile::load_default()?;
+    let mut resolved =
+        config_file.resolve_with_runtime_config(&options.workspace, identity, &runtime_config)?;
     if let Some(db) = options.db {
         resolved = resolved.with_database_path(db);
     }
@@ -311,8 +313,7 @@ fn parse_init_options(args: &[String]) -> Result<InitOptions, CliError> {
 }
 
 fn parse_serve_options(args: &[String]) -> Result<ServeOptions, CliError> {
-    let mut workspace = std::env::current_dir()
-        .map_err(|error| CliError(format!("failed to resolve current directory: {error}")))?;
+    let mut workspace = None;
     let mut db = None;
     let mut frontend = None;
     let mut listen = None;
@@ -326,7 +327,7 @@ fn parse_serve_options(args: &[String]) -> Result<ServeOptions, CliError> {
                 let value = args
                     .get(index)
                     .ok_or_else(|| CliError("--workspace requires a value".to_string()))?;
-                workspace = PathBuf::from(value);
+                workspace = Some(PathBuf::from(value));
             }
             "--db" => {
                 index += 1;
@@ -350,7 +351,7 @@ fn parse_serve_options(args: &[String]) -> Result<ServeOptions, CliError> {
                 listen = Some(parse_listen(value)?);
             }
             _ if arg.starts_with("--workspace=") => {
-                workspace = PathBuf::from(value_after_equals(arg, "--workspace")?);
+                workspace = Some(PathBuf::from(value_after_equals(arg, "--workspace")?));
             }
             _ if arg.starts_with("--db=") => {
                 db = Some(PathBuf::from(value_after_equals(arg, "--db")?));
@@ -373,6 +374,8 @@ fn parse_serve_options(args: &[String]) -> Result<ServeOptions, CliError> {
         index += 1;
     }
 
+    let workspace = workspace
+        .ok_or_else(|| CliError("serve requires --workspace <path>; the current directory is no longer used as an implicit workspace".to_string()))?;
     let workspace = workspace.canonicalize().map_err(|error| {
         CliError(format!(
             "failed to canonicalize workspace `{}`: {error}",
@@ -431,7 +434,7 @@ fn print_skills_help() {
 
 fn print_serve_help() {
     println!(
-        "yoi-workspace-server serve\n\nUsage:\n  yoi-workspace-server serve [OPTIONS]\n\nDescription:\n  Serves an already initialized Workspace. Run `yoi workspace init` first.\n\nOptions:\n      --workspace <PATH>  Workspace root containing .yoi project records (defaults to cwd)\n      --db <PATH>         SQLite database path (legacy dev override)\n      --frontend <PATH>   Static SPA build directory to serve (legacy dev override)\n      --listen <ADDR>     Listen address (legacy dev override; default 127.0.0.1:8787)\n  -h, --help              Print help"
+        "yoi-workspace-server serve\n\nUsage:\n  yoi-workspace-server serve --workspace <PATH> [OPTIONS]\n\nDescription:\n  Serves an already initialized Workspace. Run `yoi workspace init --workspace <PATH>` first. Backend serve no longer treats the process current directory as an implicit Workspace.\n\nOptions:\n      --workspace <PATH>  Workspace root containing .yoi project records (required)\n      --db <PATH>         SQLite database path (legacy dev override)\n      --frontend <PATH>   Static SPA build directory to serve (legacy dev override)\n      --listen <ADDR>     Listen address (legacy dev override; default 127.0.0.1:8787)\n  -h, --help              Print help"
     );
 }
 
@@ -448,6 +451,38 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let args = vec!["--workspace".to_string(), temp.path().display().to_string()];
         let options = parse_init_options(&args).unwrap();
+        assert_eq!(options.workspace, temp.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn parse_serve_rejects_missing_workspace() {
+        let args = vec!["--listen".to_string(), "127.0.0.1:0".to_string()];
+        let error = parse_serve_options(&args).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "serve requires --workspace <path>; the current directory is no longer used as an implicit workspace"
+        );
+    }
+
+    #[test]
+    fn parse_serve_requires_explicit_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let args = vec![
+            "--workspace".to_string(),
+            temp.path().display().to_string(),
+            "--listen".to_string(),
+            "127.0.0.1:0".to_string(),
+        ];
+        let options = parse_serve_options(&args).unwrap();
+        assert_eq!(options.workspace, temp.path().canonicalize().unwrap());
+        assert_eq!(options.listen.unwrap(), "127.0.0.1:0".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_serve_accepts_equals_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let args = vec![format!("--workspace={}", temp.path().display())];
+        let options = parse_serve_options(&args).unwrap();
         assert_eq!(options.workspace, temp.path().canonicalize().unwrap());
     }
 

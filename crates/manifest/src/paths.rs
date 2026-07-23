@@ -13,7 +13,7 @@
 //! | base | 1. `YOI_<KIND>_DIR` | 2. `YOI_HOME` | 3. `XDG_*` | 4. 既定 |
 //! |---|---|---|---|---|
 //! | config  | `YOI_CONFIG_DIR`  | `$YOI_HOME/config` | `$XDG_CONFIG_HOME/yoi` | `$HOME/.config/yoi` |
-//! | data    | `YOI_DATA_DIR`    | `$YOI_HOME`        | —                            | `$HOME/.yoi` |
+//! | data    | `YOI_DATA_DIR`    | `$YOI_HOME`        | `$XDG_DATA_HOME/yoi`   | `$HOME/.local/share/yoi` |
 //! | runtime | `YOI_RUNTIME_DIR` | `$YOI_HOME/run`    | `$XDG_RUNTIME_DIR/yoi` | `$HOME/.yoi/run` |
 //!
 //! `YOI_HOME=$X` のとき config は `$X/config`、data は `$X` 直下、
@@ -42,6 +42,7 @@ pub fn data_dir() -> Option<PathBuf> {
     resolve_data_dir_from_parts(
         env_path("YOI_DATA_DIR"),
         env_path("YOI_HOME"),
+        env_path("XDG_DATA_HOME"),
         env_path("HOME"),
     )
 }
@@ -131,6 +132,7 @@ fn resolve_config_dir_from_parts(
 fn resolve_data_dir_from_parts(
     yoi_data_dir: Option<PathBuf>,
     yoi_home: Option<PathBuf>,
+    xdg_data_home: Option<PathBuf>,
     home: Option<PathBuf>,
 ) -> Option<PathBuf> {
     if let Some(p) = yoi_data_dir {
@@ -139,7 +141,10 @@ fn resolve_data_dir_from_parts(
     if let Some(p) = yoi_home {
         return Some(p);
     }
-    Some(home?.join(".yoi"))
+    if let Some(p) = xdg_data_home {
+        return Some(p.join("yoi"));
+    }
+    Some(home?.join(".local").join("share").join("yoi"))
 }
 
 fn resolve_runtime_dir_from_parts(
@@ -268,20 +273,35 @@ mod tests {
     }
 
     #[test]
-    fn data_dir_default_is_dot_yoi() {
+    fn data_dir_falls_back_to_home_local_share() {
         assert_eq!(
-            resolve_data_dir_from_parts(None, None, Some(PathBuf::from("/h"))).unwrap(),
-            PathBuf::from("/h/.yoi")
+            resolve_data_dir_from_parts(None, None, None, Some(PathBuf::from("/h"))).unwrap(),
+            PathBuf::from("/h/.local/share/yoi")
         );
     }
 
     #[test]
-    fn data_dir_yoi_home_is_data_dir_itself() {
+    fn data_dir_uses_xdg_when_set() {
+        assert_eq!(
+            resolve_data_dir_from_parts(
+                None,
+                None,
+                Some(PathBuf::from("/xdg-data")),
+                Some(PathBuf::from("/h")),
+            )
+            .unwrap(),
+            PathBuf::from("/xdg-data/yoi")
+        );
+    }
+
+    #[test]
+    fn data_dir_yoi_home_outranks_xdg() {
         assert_eq!(
             resolve_data_dir_from_parts(
                 None,
                 Some(PathBuf::from("/sand")),
-                Some(PathBuf::from("/h"))
+                Some(PathBuf::from("/xdg-data")),
+                Some(PathBuf::from("/h")),
             )
             .unwrap(),
             PathBuf::from("/sand")
@@ -294,6 +314,7 @@ mod tests {
             resolve_data_dir_from_parts(
                 Some(PathBuf::from("/explicit-data")),
                 Some(PathBuf::from("/sand")),
+                Some(PathBuf::from("/xdg-data")),
                 Some(PathBuf::from("/h")),
             )
             .unwrap(),
@@ -365,7 +386,7 @@ mod tests {
     #[test]
     fn returns_none_when_nothing_set() {
         assert!(resolve_config_dir_from_parts(None, None, None, None).is_none());
-        assert!(resolve_data_dir_from_parts(None, None, None).is_none());
+        assert!(resolve_data_dir_from_parts(None, None, None, None).is_none());
         assert!(resolve_runtime_dir_from_parts(None, None, None, None).is_none());
     }
 

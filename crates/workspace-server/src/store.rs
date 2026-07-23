@@ -83,6 +83,21 @@ pub struct WorkspaceRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepositoryRecord {
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub name: String,
+    pub kind: String,
+    pub provider: Option<String>,
+    pub uri: String,
+    pub default_ref: Option<String>,
+    pub auth_ref_kind: Option<String>,
+    pub auth_ref_key: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AccountRecord {
     pub account_id: String,
     pub kind: String,
@@ -211,6 +226,8 @@ pub trait ControlPlaneStore: Send + Sync {
     async fn schema_version(&self) -> Result<i64>;
     async fn upsert_workspace(&self, record: &WorkspaceRecord) -> Result<()>;
     async fn get_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceRecord>>;
+    fn upsert_repository(&self, record: &RepositoryRecord) -> Result<()>;
+    fn list_repositories(&self, workspace_id: &str) -> Result<Vec<RepositoryRecord>>;
 
     fn upsert_account(&self, record: &AccountRecord) -> Result<()>;
     fn get_account(&self, account_id: &str) -> Result<Option<AccountRecord>>;
@@ -396,6 +413,56 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )
             .optional()
             .map_err(Error::from)
+        })
+    }
+
+    fn upsert_repository(&self, record: &RepositoryRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO repositories (
+                    workspace_id, repository_id, name, kind, provider, uri, default_ref,
+                    auth_ref_kind, auth_ref_key, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ON CONFLICT(repository_id) DO UPDATE SET
+                    workspace_id = excluded.workspace_id,
+                    name = excluded.name,
+                    kind = excluded.kind,
+                    provider = excluded.provider,
+                    uri = excluded.uri,
+                    default_ref = excluded.default_ref,
+                    auth_ref_kind = excluded.auth_ref_kind,
+                    auth_ref_key = excluded.auth_ref_key,
+                    updated_at = excluded.updated_at"#,
+                params![
+                    record.workspace_id,
+                    record.repository_id,
+                    record.name,
+                    record.kind,
+                    record.provider,
+                    record.uri,
+                    record.default_ref,
+                    record.auth_ref_kind,
+                    record.auth_ref_key,
+                    record.created_at,
+                    record.updated_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn list_repositories(&self, workspace_id: &str) -> Result<Vec<RepositoryRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"SELECT workspace_id, repository_id, name, kind, provider, uri, default_ref,
+                          auth_ref_kind, auth_ref_key, created_at, updated_at
+                   FROM repositories
+                   WHERE workspace_id = ?1
+                   ORDER BY repository_id ASC"#,
+            )?;
+            let rows = stmt.query_map(params![workspace_id], read_repository_record)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
         })
     }
 
@@ -1016,6 +1083,22 @@ fn read_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceR
         state: row.get(3)?,
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
+    })
+}
+
+fn read_repository_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepositoryRecord> {
+    Ok(RepositoryRecord {
+        workspace_id: row.get(0)?,
+        repository_id: row.get(1)?,
+        name: row.get(2)?,
+        kind: row.get(3)?,
+        provider: row.get(4)?,
+        uri: row.get(5)?,
+        default_ref: row.get(6)?,
+        auth_ref_kind: row.get(7)?,
+        auth_ref_key: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
     })
 }
 
@@ -2271,6 +2354,44 @@ mod tests {
         assert_eq!(
             store.get_workspace("new-workspace").await.unwrap(),
             Some(new_record)
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_records_round_trip() {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        assert_eq!(store.schema_version().await.unwrap(), 9);
+        let workspace = WorkspaceRecord {
+            workspace_id: "local-dev".to_string(),
+            owner_account_id: None,
+            display_name: "Local Dev".to_string(),
+            state: "active".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        store.upsert_workspace(&workspace).await.unwrap();
+
+        let repository = RepositoryRecord {
+            workspace_id: "local-dev".to_string(),
+            repository_id: "main".to_string(),
+            name: "Yoi".to_string(),
+            kind: "git".to_string(),
+            provider: Some("git".to_string()),
+            uri: ".".to_string(),
+            default_ref: Some("HEAD".to_string()),
+            auth_ref_kind: None,
+            auth_ref_key: None,
+            created_at: "2".to_string(),
+            updated_at: "2".to_string(),
+        };
+        store.upsert_repository(&repository).unwrap();
+        assert_eq!(
+            store.list_repositories("local-dev").unwrap(),
+            vec![repository]
+        );
+        assert_eq!(
+            store.list_repositories("other-workspace").unwrap(),
+            Vec::new()
         );
     }
 

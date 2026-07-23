@@ -4294,6 +4294,7 @@ dependencies = [
  "fs4",
  "llm-engine",
  "project-record",
+ "rusqlite",
  "schemars",
  "serde",
  "serde_json",

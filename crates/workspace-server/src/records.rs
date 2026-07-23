@@ -3,8 +3,7 @@ use std::path::{Path, PathBuf};
 
 use project_record::validate_record_id;
 use serde::{Deserialize, Serialize};
-use ticket::config::TicketConfig;
-use ticket::{LocalTicketBackend, TicketIdOrSlug, TicketListQuery};
+use ticket::{SqliteTicketBackend, TicketBackend, TicketIdOrSlug, TicketListQuery};
 
 use crate::{Error, Result};
 
@@ -14,19 +13,19 @@ const SUMMARY_BODY_LIMIT: usize = 240;
 #[derive(Debug, Clone)]
 pub struct LocalProjectRecordReader {
     workspace_root: PathBuf,
-    ticket_backend: LocalTicketBackend,
+    ticket_backend: SqliteTicketBackend,
 }
 
 impl LocalProjectRecordReader {
-    pub fn new(workspace_root: impl Into<PathBuf>) -> Result<Self> {
+    pub fn new(
+        workspace_root: impl Into<PathBuf>,
+        database_path: impl Into<PathBuf>,
+        workspace_id: impl Into<String>,
+    ) -> Result<Self> {
         let workspace_root = workspace_root.into();
-        let ticket_config = TicketConfig::load_workspace(&workspace_root)
-            .map_err(|error| Error::Config(format!("load Ticket workspace settings: {error}")))?;
-        let ticket_backend = LocalTicketBackend::new(ticket_config.backend_root().to_path_buf())
-            .with_record_language(ticket_config.ticket_record_language());
         Ok(Self {
             workspace_root,
-            ticket_backend,
+            ticket_backend: SqliteTicketBackend::new(database_path, workspace_id),
         })
     }
 
@@ -35,9 +34,9 @@ impl LocalProjectRecordReader {
     }
 
     pub fn list_tickets(&self, limit: usize) -> Result<ProjectRecordList<TicketSummary>> {
-        let partial = self.ticket_backend.list_partial(TicketListQuery::all())?;
-        let mut items = partial
-            .tickets
+        let mut items = self
+            .ticket_backend
+            .list(TicketListQuery::all())?
             .into_iter()
             .map(|item| TicketSummary {
                 id: item.id,
@@ -47,7 +46,7 @@ impl LocalProjectRecordReader {
                 updated_at: item.updated_at,
                 queued_by: item.queued_by,
                 queued_at: item.queued_at,
-                record_source: "local_yoi_ticket".to_string(),
+                record_source: "sqlite_yoi_ticket".to_string(),
             })
             .collect::<Vec<_>>();
         items.sort_by(|a, b| {
@@ -58,24 +57,16 @@ impl LocalProjectRecordReader {
         items.truncate(limit.min(200));
         Ok(ProjectRecordList {
             items,
-            invalid_records: partial
-                .invalid_records
-                .into_iter()
-                .map(|record| InvalidProjectRecord {
-                    label: record.label,
-                    reason: record.reason,
-                })
-                .collect(),
+            invalid_records: Vec::new(),
             record_authority: "local_yoi_project_records".to_string(),
         })
     }
 
     pub fn ticket(&self, id: &str) -> Result<TicketDetail> {
         validate_project_id(id)?;
-        let partial = self
+        let ticket = self
             .ticket_backend
-            .show_partial(TicketIdOrSlug::Id(id.to_string()))?;
-        let ticket = partial.ticket;
+            .show(TicketIdOrSlug::Id(id.to_string()))?;
         let (body, body_truncated) =
             truncate_body(ticket.document.body.as_str(), DETAIL_BODY_LIMIT);
         Ok(TicketDetail {
@@ -92,7 +83,7 @@ impl LocalProjectRecordReader {
             body_truncated,
             event_count: ticket.events.len(),
             artifact_count: ticket.artifacts.len(),
-            record_source: "local_yoi_ticket".to_string(),
+            record_source: "sqlite_yoi_ticket".to_string(),
         })
     }
 
@@ -296,14 +287,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_local_yoi_ticket_and_objective_records_without_migration() {
+    fn reads_sqlite_yoi_ticket_and_objective_records_without_migration() {
         let dir = tempfile::tempdir().unwrap();
         write_ticket(dir.path(), "00000000001J2", "Read bridge", "ready");
+        let db_path = dir.path().join("workspace.db");
+        SqliteTicketBackend::new(&db_path, "workspace-test")
+            .import_from_local_backend(&ticket::LocalTicketBackend::new(
+                dir.path().join(".yoi/tickets"),
+            ))
+            .unwrap();
         write_objective(dir.path(), "00000000001J3", "Control plane", "active");
 
-        let reader = LocalProjectRecordReader::new(dir.path()).unwrap();
+        let reader = LocalProjectRecordReader::new(dir.path(), &db_path, "workspace-test").unwrap();
         let tickets = reader.list_tickets(20).unwrap();
         assert_eq!(tickets.record_authority, "local_yoi_project_records");
+        assert_eq!(tickets.items[0].record_source, "sqlite_yoi_ticket");
         assert_eq!(tickets.items[0].id, "00000000001J2");
         assert_eq!(tickets.items[0].state, "ready");
 
@@ -318,34 +316,16 @@ mod tests {
         assert!(objective.body.contains("Objective body"));
     }
     #[test]
-    fn reads_tickets_from_workspace_settings_backend_root() {
+    fn does_not_read_legacy_ticket_files_without_sqlite_import() {
         let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join(".yoi")).unwrap();
-        fs::write(
-            dir.path().join(".yoi/workspace.toml"),
-            r#"
-[ticket]
-language = "Japanese"
+        write_ticket(dir.path(), "00000000001J5", "Legacy file", "ready");
+        let db_path = dir.path().join("workspace.db");
 
-[ticket.backend]
-provider = "builtin:yoi_local"
-root = "project-records/tickets"
-"#,
-        )
-        .unwrap();
-        write_ticket_at(
-            &dir.path().join("project-records/tickets"),
-            "00000000001J4",
-            "Configured root",
-            "ready",
-        );
-        write_ticket(dir.path(), "00000000001J5", "Default root", "ready");
-
-        let reader = LocalProjectRecordReader::new(dir.path()).unwrap();
+        let reader = LocalProjectRecordReader::new(dir.path(), &db_path, "workspace-test").unwrap();
         let tickets = reader.list_tickets(20).unwrap();
-        assert_eq!(tickets.items.len(), 1);
-        assert_eq!(tickets.items[0].id, "00000000001J4");
+        assert!(tickets.items.is_empty());
     }
+
     fn write_ticket(root: &Path, id: &str, title: &str, state: &str) {
         write_ticket_at(&root.join(".yoi/tickets"), id, title, state);
     }

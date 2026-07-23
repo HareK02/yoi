@@ -219,7 +219,7 @@ fn default_store_dir() -> Result<PathBuf, PickerError> {
         PickerError::Io(io::Error::new(
             io::ErrorKind::NotFound,
             "could not resolve sessions directory \
-             (set YOI_HOME, YOI_DATA_DIR, or HOME)",
+             (set YOI_DATA_DIR, YOI_HOME, XDG_DATA_HOME, or HOME)",
         ))
     })
 }
@@ -231,7 +231,7 @@ fn default_worker_metadata_dir() -> Result<PathBuf, PickerError> {
             PickerError::Io(io::Error::new(
                 io::ErrorKind::NotFound,
                 "could not resolve worker state directory \
-             (set YOI_HOME, YOI_DATA_DIR, or HOME)",
+             (set YOI_DATA_DIR, YOI_HOME, XDG_DATA_HOME, or HOME)",
             ))
         })
 }

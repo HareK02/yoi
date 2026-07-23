@@ -13,6 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use chrono::Utc;
 use fs4::fs_std::FileExt;
 use project_record::{allocate_record_id, unix_epoch_millis_now, validate_record_id};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
 use thiserror::Error;
@@ -71,6 +72,8 @@ pub enum TicketError {
     Locked { path: PathBuf },
     #[error("ticket conflict: {0}")]
     Conflict(String),
+    #[error("SQLite ticket backend error: {0}")]
+    Sqlite(String),
     #[error("ticket parse error in {path}: {message}")]
     Parse { path: PathBuf, message: String },
 }
@@ -80,6 +83,10 @@ fn io_err(path: impl Into<PathBuf>, source: io::Error) -> TicketError {
         path: path.into(),
         source,
     }
+}
+
+fn sqlite_err(error: impl std::fmt::Display) -> TicketError {
+    TicketError::Sqlite(error.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2127,6 +2134,993 @@ impl LocalTicketBackend {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SqliteTicketBackend {
+    db_path: PathBuf,
+    workspace_id: String,
+    record_language: Option<String>,
+}
+
+impl SqliteTicketBackend {
+    pub fn new(db_path: impl Into<PathBuf>, workspace_id: impl Into<String>) -> Self {
+        Self {
+            db_path: db_path.into(),
+            workspace_id: workspace_id.into(),
+            record_language: None,
+        }
+    }
+
+    pub fn with_record_language(mut self, language: Option<&str>) -> Self {
+        self.record_language = language.and_then(normalized_record_language);
+        self
+    }
+
+    pub fn db_path(&self) -> &Path {
+        self.db_path.as_path()
+    }
+    pub fn workspace_id(&self) -> &str {
+        self.workspace_id.as_str()
+    }
+    pub fn record_language(&self) -> Option<&str> {
+        self.record_language.as_deref()
+    }
+
+    pub fn import_from_local_backend(&self, local: &LocalTicketBackend) -> Result<()> {
+        let conn = self.open_connection()?;
+        self.ensure_schema(&conn)?;
+        conn.execute_batch("BEGIN IMMEDIATE").map_err(sqlite_err)?;
+        let result = (|| {
+            for summary in local.list(TicketListQuery::all())? {
+                let ticket = local.show(TicketIdOrSlug::Id(summary.id.clone()))?;
+                self.store_ticket(&conn, &ticket)?;
+                self.import_artifact_content(&conn, local.root(), &ticket)?;
+            }
+            Ok(())
+        })();
+        finish_sqlite_transaction(&conn, result)
+    }
+
+    fn open_connection(&self) -> Result<Connection> {
+        if let Some(parent) = self.db_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| io_err(parent, error))?;
+        }
+        let conn = Connection::open(&self.db_path).map_err(sqlite_err)?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(sqlite_err)?;
+        Ok(conn)
+    }
+
+    fn ensure_schema(&self, conn: &Connection) -> Result<()> {
+        conn.execute_batch(r#"
+CREATE TABLE IF NOT EXISTS typed_tickets (
+    workspace_id TEXT NOT NULL,
+    ticket_id TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    priority TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT,
+    updated_at TEXT,
+    assignee TEXT,
+    readiness TEXT,
+    workflow_state TEXT NOT NULL,
+    workflow_state_explicit INTEGER NOT NULL,
+    queued_by TEXT,
+    queued_at TEXT,
+    resolution TEXT,
+    PRIMARY KEY (workspace_id, ticket_id)
+);
+CREATE TABLE IF NOT EXISTS typed_ticket_labels (
+    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, ordinal INTEGER NOT NULL, label TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, ticket_id, ordinal),
+    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS typed_ticket_risk_flags (
+    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, ordinal INTEGER NOT NULL, risk_flag TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, ticket_id, ordinal),
+    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS typed_ticket_raw_frontmatter (
+    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, ticket_id, key),
+    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS typed_ticket_events (
+    workspace_id TEXT NOT NULL,
+    ticket_id TEXT NOT NULL,
+    event_index INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    author TEXT,
+    at TEXT,
+    status TEXT,
+    from_state TEXT,
+    to_state TEXT,
+    reason TEXT,
+    state_field TEXT,
+    heading TEXT,
+    body TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, ticket_id, event_index),
+    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS typed_ticket_event_references (
+    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, event_index INTEGER NOT NULL, ordinal INTEGER NOT NULL, kind TEXT NOT NULL, target TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, ticket_id, event_index, ordinal),
+    FOREIGN KEY (workspace_id, ticket_id, event_index) REFERENCES typed_ticket_events(workspace_id, ticket_id, event_index) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS typed_ticket_event_attributes (
+    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, event_index INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, ticket_id, event_index, key),
+    FOREIGN KEY (workspace_id, ticket_id, event_index) REFERENCES typed_ticket_events(workspace_id, ticket_id, event_index) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS typed_ticket_relations (
+    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, kind TEXT NOT NULL, target TEXT NOT NULL, note TEXT, author TEXT NOT NULL, at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, ticket_id, kind, target),
+    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS typed_ticket_orchestration_plans (
+    workspace_id TEXT NOT NULL,
+    ticket_id TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    related_ticket TEXT,
+    note TEXT,
+    accepted_summary TEXT,
+    accepted_branch TEXT,
+    accepted_worktree TEXT,
+    accepted_role_plan TEXT,
+    author TEXT NOT NULL,
+    at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, ticket_id, record_id),
+    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS typed_ticket_artifacts (
+    workspace_id TEXT NOT NULL, ticket_id TEXT NOT NULL, relative_path TEXT NOT NULL, content BLOB NOT NULL,
+    PRIMARY KEY (workspace_id, ticket_id, relative_path),
+    FOREIGN KEY (workspace_id, ticket_id) REFERENCES typed_tickets(workspace_id, ticket_id) ON DELETE CASCADE
+);
+"#).map_err(sqlite_err)
+    }
+
+    fn with_write<R>(&self, op: impl FnOnce(&Connection) -> Result<R>) -> Result<R> {
+        let conn = self.open_connection()?;
+        self.ensure_schema(&conn)?;
+        conn.execute_batch("BEGIN IMMEDIATE").map_err(sqlite_err)?;
+        finish_sqlite_transaction(&conn, op(&conn))
+    }
+
+    fn with_read<R>(&self, op: impl FnOnce(&Connection) -> Result<R>) -> Result<R> {
+        let conn = self.open_connection()?;
+        self.ensure_schema(&conn)?;
+        op(&conn)
+    }
+
+    fn created_event_body(&self) -> &'static str {
+        if is_japanese_record_language(self.record_language()) {
+            "Ticket が作成されました。"
+        } else {
+            "Ticket created."
+        }
+    }
+
+    fn default_item_body(&self) -> &'static str {
+        if is_japanese_record_language(self.record_language()) {
+            "## 背景\n\n## 要件\n\n## 受け入れ条件\n"
+        } else {
+            DEFAULT_TICKET_BODY
+        }
+    }
+
+    fn resolve_ticket_id(&self, conn: &Connection, id: TicketIdOrSlug) -> Result<String> {
+        let query = id.as_query().to_string();
+        let mut stmt = conn.prepare("SELECT ticket_id FROM typed_tickets WHERE workspace_id = ?1 AND (ticket_id = ?2 OR slug = ?2) ORDER BY ticket_id").map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![self.workspace_id, query], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(sqlite_err)?;
+        let matches = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sqlite_err)?;
+        match matches.as_slice() {
+            [one] => Ok(one.clone()),
+            [] => Err(TicketError::NotFound(id.as_query().to_string())),
+            _ => Err(TicketError::Ambiguous {
+                query: id.as_query().to_string(),
+                matches: matches.into_iter().map(PathBuf::from).collect(),
+            }),
+        }
+    }
+
+    fn ticket_exists(&self, conn: &Connection, id: &str) -> Result<bool> {
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM typed_tickets WHERE workspace_id = ?1 AND ticket_id = ?2",
+                params![self.workspace_id, id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(sqlite_err)?
+            .is_some())
+    }
+
+    fn insert_event(&self, conn: &Connection, ticket_id: &str, event: &TicketEvent) -> Result<()> {
+        let next_index: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(event_index), -1) + 1 FROM typed_ticket_events WHERE workspace_id = ?1 AND ticket_id = ?2",
+            params![self.workspace_id, ticket_id],
+            |row| row.get(0),
+        ).map_err(sqlite_err)?;
+        conn.execute(r#"INSERT INTO typed_ticket_events
+            (workspace_id, ticket_id, event_index, kind, author, at, status, from_state, to_state, reason, state_field, heading, body)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
+            params![self.workspace_id, ticket_id, next_index, event.kind.as_str(), event.author, event.at, event.status, event.from, event.to, event.reason, event.state_field, event.heading, event.body.as_str()]
+        ).map_err(sqlite_err)?;
+        for (ordinal, reference) in event.references.iter().enumerate() {
+            conn.execute("INSERT INTO typed_ticket_event_references (workspace_id, ticket_id, event_index, ordinal, kind, target) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![self.workspace_id, ticket_id, next_index, ordinal as i64, reference.kind, reference.target]).map_err(sqlite_err)?;
+        }
+        for (key, value) in &event.attributes {
+            conn.execute("INSERT INTO typed_ticket_event_attributes (workspace_id, ticket_id, event_index, key, value) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![self.workspace_id, ticket_id, next_index, key, value]).map_err(sqlite_err)?;
+        }
+        Ok(())
+    }
+
+    fn touch_ticket(&self, conn: &Connection, ticket_id: &str, updated_at: &str) -> Result<()> {
+        conn.execute(
+            "UPDATE typed_tickets SET updated_at = ?3 WHERE workspace_id = ?1 AND ticket_id = ?2",
+            params![self.workspace_id, ticket_id, updated_at],
+        )
+        .map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    fn store_ticket(&self, conn: &Connection, ticket: &Ticket) -> Result<()> {
+        conn.execute(
+            "DELETE FROM typed_tickets WHERE workspace_id = ?1 AND ticket_id = ?2",
+            params![self.workspace_id, ticket.meta.id],
+        )
+        .map_err(sqlite_err)?;
+        self.insert_ticket(conn, ticket)
+    }
+
+    fn insert_ticket(&self, conn: &Connection, ticket: &Ticket) -> Result<()> {
+        conn.execute(r#"INSERT INTO typed_tickets
+            (workspace_id, ticket_id, slug, title, status, kind, priority, body, created_at, updated_at, assignee, readiness, workflow_state, workflow_state_explicit, queued_by, queued_at, resolution)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"#,
+            params![self.workspace_id, ticket.meta.id, ticket.meta.slug, ticket.meta.title, ticket.meta.status.as_str(), ticket.meta.kind, ticket.meta.priority, ticket.document.body.as_str(), ticket.meta.created_at, ticket.meta.updated_at, ticket.meta.assignee, ticket.meta.readiness, ticket.meta.workflow_state.as_str(), if ticket.meta.workflow_state_explicit { 1 } else { 0 }, ticket.meta.queued_by, ticket.meta.queued_at, ticket.resolution.as_ref().map(|body| body.as_str())]
+        ).map_err(sqlite_err)?;
+        self.insert_ordered_values(
+            conn,
+            "typed_ticket_labels",
+            "label",
+            &ticket.meta.id,
+            &ticket.meta.labels,
+        )?;
+        self.insert_ordered_values(
+            conn,
+            "typed_ticket_risk_flags",
+            "risk_flag",
+            &ticket.meta.id,
+            &ticket.meta.risk_flags,
+        )?;
+        for (key, value) in &ticket.meta.raw {
+            conn.execute("INSERT INTO typed_ticket_raw_frontmatter (workspace_id, ticket_id, key, value) VALUES (?1, ?2, ?3, ?4)", params![self.workspace_id, ticket.meta.id, key, value]).map_err(sqlite_err)?;
+        }
+        for event in &ticket.events {
+            self.insert_event(conn, &ticket.meta.id, event)?;
+        }
+        for relation in &ticket.relations.outgoing {
+            self.insert_relation(conn, relation)?;
+        }
+        Ok(())
+    }
+
+    fn insert_ordered_values(
+        &self,
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        ticket_id: &str,
+        values: &[String],
+    ) -> Result<()> {
+        for (ordinal, value) in values.iter().enumerate() {
+            let sql = format!(
+                "INSERT INTO {table} (workspace_id, ticket_id, ordinal, {column}) VALUES (?1, ?2, ?3, ?4)"
+            );
+            conn.execute(
+                &sql,
+                params![self.workspace_id, ticket_id, ordinal as i64, value],
+            )
+            .map_err(sqlite_err)?;
+        }
+        Ok(())
+    }
+
+    fn import_artifact_content(
+        &self,
+        conn: &Connection,
+        local_root: &Path,
+        ticket: &Ticket,
+    ) -> Result<()> {
+        for artifact in &ticket.artifacts {
+            validate_artifact_relative_path(&artifact.relative_path)?;
+            let path = local_root
+                .join(&ticket.meta.id)
+                .join("artifacts")
+                .join(&artifact.relative_path);
+            let content = fs::read(&path).map_err(|error| io_err(&path, error))?;
+            conn.execute("INSERT OR REPLACE INTO typed_ticket_artifacts (workspace_id, ticket_id, relative_path, content) VALUES (?1, ?2, ?3, ?4)",
+                params![self.workspace_id, ticket.meta.id, artifact.relative_path.to_string_lossy(), content]).map_err(sqlite_err)?;
+        }
+        Ok(())
+    }
+
+    fn ticket_meta_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TicketMeta> {
+        let state_raw: String = row.get(12)?;
+        Ok(TicketMeta {
+            id: row.get(0)?,
+            slug: row.get(1)?,
+            title: row.get(2)?,
+            status: ExtensibleTicketStatus::from(row.get::<_, String>(3)?.as_str()),
+            kind: row.get(4)?,
+            priority: row.get(5)?,
+            labels: Vec::new(),
+            created_at: row.get(6)?,
+            updated_at: row.get(7)?,
+            assignee: row.get(8)?,
+            readiness: row.get(9)?,
+            risk_flags: Vec::new(),
+            workflow_state: TicketWorkflowState::parse(&state_raw)
+                .unwrap_or(TicketWorkflowState::Planning),
+            workflow_state_explicit: row.get::<_, i64>(13)? != 0,
+            queued_by: row.get(14)?,
+            queued_at: row.get(15)?,
+            raw: BTreeMap::new(),
+        })
+    }
+
+    fn load_ticket(&self, conn: &Connection, ticket_id: &str) -> Result<Ticket> {
+        let (mut meta, body, resolution): (TicketMeta, String, Option<String>) = conn.query_row(r#"SELECT ticket_id, slug, title, status, kind, priority, created_at, updated_at, assignee, readiness, body, resolution, workflow_state, workflow_state_explicit, queued_by, queued_at FROM typed_tickets WHERE workspace_id = ?1 AND ticket_id = ?2"#,
+            params![self.workspace_id, ticket_id], |row| Ok((Self::ticket_meta_from_row(row)?, row.get(10)?, row.get(11)?))).optional().map_err(sqlite_err)?.ok_or_else(|| TicketError::NotFound(ticket_id.to_string()))?;
+        meta.labels = self.load_ordered_values(conn, "typed_ticket_labels", "label", ticket_id)?;
+        meta.risk_flags =
+            self.load_ordered_values(conn, "typed_ticket_risk_flags", "risk_flag", ticket_id)?;
+        meta.raw = self.load_key_values(conn, "typed_ticket_raw_frontmatter", ticket_id)?;
+        let events = self.load_events(conn, ticket_id)?;
+        let artifacts = self.load_artifacts(conn, ticket_id)?;
+        let relations = self.relation_view_for_meta(conn, &meta)?;
+        Ok(Ticket {
+            meta,
+            document: TicketDocument {
+                body: MarkdownText::new(body),
+                raw_frontmatter: BTreeMap::new(),
+            },
+            events,
+            artifacts,
+            relations,
+            resolution: resolution.map(MarkdownText::new),
+        })
+    }
+
+    fn load_ordered_values(
+        &self,
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        ticket_id: &str,
+    ) -> Result<Vec<String>> {
+        let sql = format!(
+            "SELECT {column} FROM {table} WHERE workspace_id = ?1 AND ticket_id = ?2 ORDER BY ordinal ASC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![self.workspace_id, ticket_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(sqlite_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sqlite_err)
+    }
+
+    fn load_key_values(
+        &self,
+        conn: &Connection,
+        table: &str,
+        ticket_id: &str,
+    ) -> Result<BTreeMap<String, String>> {
+        let sql = format!(
+            "SELECT key, value FROM {table} WHERE workspace_id = ?1 AND ticket_id = ?2 ORDER BY key ASC"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![self.workspace_id, ticket_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sqlite_err)?;
+        let mut map = BTreeMap::new();
+        for row in rows {
+            let (key, value) = row.map_err(sqlite_err)?;
+            map.insert(key, value);
+        }
+        Ok(map)
+    }
+
+    fn load_events(&self, conn: &Connection, ticket_id: &str) -> Result<Vec<TicketEvent>> {
+        let mut stmt = conn.prepare(r#"SELECT event_index, kind, author, at, status, from_state, to_state, reason, state_field, heading, body FROM typed_ticket_events WHERE workspace_id = ?1 AND ticket_id = ?2 ORDER BY event_index ASC"#).map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![self.workspace_id, ticket_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            })
+            .map_err(sqlite_err)?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (index, kind, author, at, status, from, to, reason, state_field, heading, body) =
+                row.map_err(sqlite_err)?;
+            events.push(TicketEvent {
+                kind: TicketEventKind::from(kind.as_str()),
+                author,
+                at,
+                status,
+                from,
+                to,
+                reason,
+                state_field,
+                heading,
+                body: MarkdownText::new(body),
+                references: self.load_event_references(conn, ticket_id, index)?,
+                attributes: self.load_event_attributes(conn, ticket_id, index)?,
+            });
+        }
+        Ok(events)
+    }
+
+    fn load_event_references(
+        &self,
+        conn: &Connection,
+        ticket_id: &str,
+        event_index: i64,
+    ) -> Result<Vec<TicketReference>> {
+        let mut stmt = conn.prepare("SELECT kind, target FROM typed_ticket_event_references WHERE workspace_id = ?1 AND ticket_id = ?2 AND event_index = ?3 ORDER BY ordinal ASC").map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![self.workspace_id, ticket_id, event_index], |row| {
+                Ok(TicketReference {
+                    kind: row.get(0)?,
+                    target: row.get(1)?,
+                })
+            })
+            .map_err(sqlite_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sqlite_err)
+    }
+
+    fn load_event_attributes(
+        &self,
+        conn: &Connection,
+        ticket_id: &str,
+        event_index: i64,
+    ) -> Result<BTreeMap<String, String>> {
+        let mut stmt = conn.prepare("SELECT key, value FROM typed_ticket_event_attributes WHERE workspace_id = ?1 AND ticket_id = ?2 AND event_index = ?3 ORDER BY key ASC").map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![self.workspace_id, ticket_id, event_index], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sqlite_err)?;
+        let mut map = BTreeMap::new();
+        for row in rows {
+            let (key, value) = row.map_err(sqlite_err)?;
+            map.insert(key, value);
+        }
+        Ok(map)
+    }
+
+    fn load_artifacts(&self, conn: &Connection, ticket_id: &str) -> Result<Vec<TicketArtifactRef>> {
+        let mut stmt = conn.prepare("SELECT relative_path FROM typed_ticket_artifacts WHERE workspace_id = ?1 AND ticket_id = ?2 ORDER BY relative_path ASC").map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![self.workspace_id, ticket_id], |row| {
+                Ok(TicketArtifactRef {
+                    relative_path: PathBuf::from(row.get::<_, String>(0)?),
+                })
+            })
+            .map_err(sqlite_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sqlite_err)
+    }
+
+    fn list_summaries(
+        &self,
+        conn: &Connection,
+        filter: TicketListQuery,
+    ) -> Result<Vec<TicketSummary>> {
+        let mut stmt = conn.prepare(r#"SELECT ticket_id, slug, title, status, kind, priority, created_at, updated_at, assignee, readiness, body, resolution, workflow_state, workflow_state_explicit, queued_by, queued_at FROM typed_tickets WHERE workspace_id = ?1 ORDER BY ticket_id ASC"#).map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![self.workspace_id], Self::ticket_meta_from_row)
+            .map_err(sqlite_err)?;
+        let mut summaries = Vec::new();
+        for row in rows {
+            let mut meta = row.map_err(sqlite_err)?;
+            if !filter.matches_state(meta.workflow_state) {
+                continue;
+            }
+            meta.labels =
+                self.load_ordered_values(conn, "typed_ticket_labels", "label", &meta.id)?;
+            summaries.push(ticket_summary_from_meta(meta));
+        }
+        Ok(summaries)
+    }
+
+    fn state_index(&self, conn: &Connection) -> Result<HashMap<String, TicketWorkflowState>> {
+        let mut stmt = conn
+            .prepare("SELECT ticket_id, workflow_state FROM typed_tickets WHERE workspace_id = ?1")
+            .map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![self.workspace_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(sqlite_err)?;
+        let mut states = HashMap::new();
+        for row in rows {
+            let (id, state) = row.map_err(sqlite_err)?;
+            states.insert(
+                id,
+                TicketWorkflowState::parse(&state).unwrap_or(TicketWorkflowState::Planning),
+            );
+        }
+        Ok(states)
+    }
+
+    fn all_relations(&self, conn: &Connection) -> Result<Vec<TicketRelation>> {
+        let mut stmt = conn.prepare(r#"SELECT ticket_id, kind, target, note, author, at FROM typed_ticket_relations WHERE workspace_id = ?1 ORDER BY ticket_id ASC, kind ASC, target ASC"#).map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![self.workspace_id], |row| {
+                Ok(TicketRelation {
+                    ticket_id: row.get(0)?,
+                    kind: TicketRelationKind::parse(&row.get::<_, String>(1)?)
+                        .unwrap_or(TicketRelationKind::Related),
+                    target: row.get(2)?,
+                    note: row.get(3)?,
+                    author: row.get(4)?,
+                    at: row.get(5)?,
+                })
+            })
+            .map_err(sqlite_err)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sqlite_err)
+    }
+
+    fn insert_relation(&self, conn: &Connection, relation: &TicketRelation) -> Result<()> {
+        conn.execute(r#"INSERT OR REPLACE INTO typed_ticket_relations (workspace_id, ticket_id, kind, target, note, author, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+            params![self.workspace_id, relation.ticket_id, relation.kind.as_str(), relation.target, relation.note, relation.author, relation.at]).map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    fn relation_view_for_meta(
+        &self,
+        conn: &Connection,
+        meta: &TicketMeta,
+    ) -> Result<TicketRelationView> {
+        let relations = self.all_relations(conn)?;
+        let states = self.state_index(conn)?;
+        Ok(relation_view_from_records(meta, &relations, &states))
+    }
+}
+
+fn finish_sqlite_transaction<R>(conn: &Connection, result: Result<R>) -> Result<R> {
+    match result {
+        Ok(output) => {
+            conn.execute_batch("COMMIT").map_err(sqlite_err)?;
+            Ok(output)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn validate_artifact_relative_path(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(TicketError::PathEscapesRoot {
+            path: path.to_path_buf(),
+        });
+    }
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => {}
+            _ => {
+                return Err(TicketError::PathEscapesRoot {
+                    path: path.to_path_buf(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+impl TicketBackend for SqliteTicketBackend {
+    fn default_intake_ready_state_change_body(&self, from: &str) -> String {
+        if is_japanese_record_language(self.record_language()) {
+            format!("Ticket planning が完了しました。state {from} -> ready。\n")
+        } else {
+            format!("Ticket planning complete; state {from} -> ready.\n")
+        }
+    }
+
+    fn list(&self, filter: TicketListQuery) -> Result<Vec<TicketSummary>> {
+        self.with_read(|conn| self.list_summaries(conn, filter))
+    }
+
+    fn show(&self, id: TicketIdOrSlug) -> Result<Ticket> {
+        self.with_read(|conn| {
+            let ticket_id = self.resolve_ticket_id(conn, id)?;
+            self.load_ticket(conn, &ticket_id)
+        })
+    }
+
+    fn create(&self, input: NewTicket) -> Result<TicketRef> {
+        self.with_write(|conn| {
+            if input.title.trim().is_empty() {
+                return Err(TicketError::Conflict(
+                    "ticket title must not be empty".to_string(),
+                ));
+            }
+            let base_millis = unix_epoch_millis_now().map_err(|err| {
+                TicketError::Conflict(format!("failed to read ticket id timestamp: {err}"))
+            })?;
+            let id = allocate_record_id(base_millis, |candidate| {
+                self.ticket_exists(conn, candidate).unwrap_or(true)
+            })
+            .map_err(|err| {
+                TicketError::Conflict(format!("failed to allocate unique ticket id: {err}"))
+            })?;
+            let now = now_utc();
+            let state = input
+                .workflow_state
+                .unwrap_or(TicketWorkflowState::Planning);
+            let status = if state == TicketWorkflowState::Closed {
+                ExtensibleTicketStatus::Closed
+            } else {
+                ExtensibleTicketStatus::Open
+            };
+            let meta = TicketMeta {
+                id: id.clone(),
+                slug: input.slug.clone().unwrap_or_else(|| id.clone()),
+                title: input.title,
+                status,
+                kind: input.kind,
+                priority: input.priority,
+                labels: input.labels,
+                created_at: Some(now.clone()),
+                updated_at: Some(now.clone()),
+                assignee: input.assignee,
+                readiness: input.readiness,
+                risk_flags: input.risk_flags,
+                workflow_state: state,
+                workflow_state_explicit: true,
+                queued_by: input.queued_by,
+                queued_at: input.queued_at,
+                raw: BTreeMap::new(),
+            };
+            let body = if input.body.as_str() == DEFAULT_TICKET_BODY {
+                MarkdownText::new(self.default_item_body())
+            } else {
+                input.body
+            };
+            let author = input
+                .author
+                .unwrap_or_else(|| "SqliteTicketBackend".to_string());
+            let ticket = Ticket {
+                meta,
+                document: TicketDocument {
+                    body,
+                    raw_frontmatter: BTreeMap::new(),
+                },
+                events: vec![TicketEvent {
+                    kind: TicketEventKind::Create,
+                    author: Some(author),
+                    at: Some(now),
+                    status: None,
+                    from: None,
+                    to: None,
+                    reason: None,
+                    state_field: None,
+                    heading: Some(TicketEventKind::Create.heading()),
+                    body: MarkdownText::new(self.created_event_body()),
+                    references: Vec::new(),
+                    attributes: BTreeMap::new(),
+                }],
+                artifacts: Vec::new(),
+                relations: TicketRelationView::default(),
+                resolution: None,
+            };
+            self.insert_ticket(conn, &ticket)?;
+            Ok(TicketRef {
+                id: id.clone(),
+                slug: id,
+                status: TicketStatus::Open,
+            })
+        })
+    }
+
+    fn edit_item(&self, id: TicketIdOrSlug, edit: TicketItemEdit) -> Result<Ticket> {
+        self.with_write(|conn| {
+            if edit.title.is_none() && edit.body.is_none() { return Err(TicketError::Conflict("TicketEditItem requires at least one of title or body".to_string())); }
+            let ticket_id = self.resolve_ticket_id(conn, id)?;
+            let now = now_utc();
+            if let Some(title) = edit.title.as_ref() {
+                validate_required_event_value("title", title)?;
+                conn.execute("UPDATE typed_tickets SET title = ?3, updated_at = ?4 WHERE workspace_id = ?1 AND ticket_id = ?2", params![self.workspace_id, ticket_id, title, now]).map_err(sqlite_err)?;
+            }
+            if let Some(body) = edit.body.as_ref() {
+                conn.execute("UPDATE typed_tickets SET body = ?3, updated_at = ?4 WHERE workspace_id = ?1 AND ticket_id = ?2", params![self.workspace_id, ticket_id, body.as_str(), now]).map_err(sqlite_err)?;
+            }
+            let event = TicketEvent { kind: TicketEventKind::Other("item_edit".to_string()), author: Some(edit.author.unwrap_or_else(default_author)), at: Some(now), status: None, from: None, to: None, reason: None, state_field: None, heading: Some("Item edit".to_string()), body: edit.body.unwrap_or_else(|| MarkdownText::new("Ticket item metadata updated.")), references: Vec::new(), attributes: BTreeMap::new() };
+            self.insert_event(conn, &ticket_id, &event)?;
+            self.load_ticket(conn, &ticket_id)
+        })
+    }
+
+    fn dependency_check(&self, id: TicketIdOrSlug) -> Result<TicketDependencyCheck> {
+        let ticket = self.show(id)?;
+        let blockers = ticket.relations.blockers.clone();
+        let summary = ticket_summary_from_meta(ticket.meta.clone());
+        let projection = project_ticket_workspace_item(&summary, &blockers, None);
+        Ok(TicketDependencyCheck {
+            ticket: summary,
+            blockers,
+            queue_guard: projection.queue_guard,
+            recommended_action: projection
+                .next_action
+                .unwrap_or(TicketWorkspaceNextAction::WaitForOrchestrator),
+        })
+    }
+
+    fn add_event(&self, id: TicketIdOrSlug, event: NewTicketEvent) -> Result<()> {
+        self.with_write(|conn| {
+            let ticket_id = self.resolve_ticket_id(conn, id)?;
+            let at = now_utc();
+            self.insert_event(
+                conn,
+                &ticket_id,
+                &TicketEvent {
+                    kind: event.kind.clone(),
+                    author: event.author.or_else(|| Some(default_author())),
+                    at: Some(at.clone()),
+                    status: None,
+                    from: None,
+                    to: None,
+                    reason: None,
+                    state_field: None,
+                    heading: Some(event.kind.heading()),
+                    body: event.body,
+                    references: event.references,
+                    attributes: BTreeMap::new(),
+                },
+            )?;
+            self.touch_ticket(conn, &ticket_id, &at)
+        })
+    }
+
+    fn add_state_changed(&self, id: TicketIdOrSlug, change: TicketStateChange) -> Result<()> {
+        self.set_workflow_state(id, change)
+    }
+
+    fn add_intake_summary(&self, id: TicketIdOrSlug, summary: TicketIntakeSummary) -> Result<()> {
+        self.with_write(|conn| {
+            validate_intake_summary(&summary)?;
+            let ticket_id = self.resolve_ticket_id(conn, id)?;
+            let at = now_utc();
+            self.insert_event(
+                conn,
+                &ticket_id,
+                &TicketEvent {
+                    kind: TicketEventKind::IntakeSummary,
+                    author: Some(summary.author.unwrap_or_else(default_author)),
+                    at: Some(at.clone()),
+                    status: None,
+                    from: None,
+                    to: None,
+                    reason: None,
+                    state_field: None,
+                    heading: Some(TicketEventKind::IntakeSummary.heading()),
+                    body: summary.body,
+                    references: summary.references,
+                    attributes: BTreeMap::new(),
+                },
+            )?;
+            self.touch_ticket(conn, &ticket_id, &at)
+        })
+    }
+
+    fn set_state_field(
+        &self,
+        id: TicketIdOrSlug,
+        _field: &str,
+        change: TicketStateChange,
+    ) -> Result<()> {
+        self.set_workflow_state(id, change)
+    }
+
+    fn set_workflow_state(&self, id: TicketIdOrSlug, change: TicketStateChange) -> Result<()> {
+        self.with_write(|conn| {
+            validate_state_change(&change)?;
+            let ticket_id = self.resolve_ticket_id(conn, id)?;
+            let to = TicketWorkflowState::parse(&change.to).ok_or_else(|| TicketError::Conflict(format!("unknown workflow_state '{}':", change.to)))?;
+            let at = now_utc();
+            self.insert_event(conn, &ticket_id, &TicketEvent { kind: TicketEventKind::StateChanged, author: Some(change.author.clone().unwrap_or_else(default_author)), at: Some(at.clone()), status: None, from: Some(change.from), to: Some(change.to), reason: Some(change.reason), state_field: Some("state".to_string()), heading: Some(TicketEventKind::StateChanged.heading()), body: change.body, references: change.references, attributes: BTreeMap::new() })?;
+            conn.execute("UPDATE typed_tickets SET workflow_state = ?3, workflow_state_explicit = 1, updated_at = ?4, status = CASE WHEN ?3 = 'closed' THEN 'closed' ELSE status END WHERE workspace_id = ?1 AND ticket_id = ?2", params![self.workspace_id, ticket_id, to.as_str(), at]).map_err(sqlite_err)?;
+            Ok(())
+        })
+    }
+
+    fn mark_intake_ready(
+        &self,
+        id: TicketIdOrSlug,
+        summary: TicketIntakeSummary,
+        change: TicketStateChange,
+    ) -> Result<()> {
+        self.add_intake_summary(id.clone(), summary)?;
+        self.set_workflow_state(id, change)
+    }
+
+    fn queue_ready(&self, id: TicketIdOrSlug, queued_by: &str) -> Result<()> {
+        self.with_write(|conn| {
+            let ticket_id = self.resolve_ticket_id(conn, id)?;
+            let ticket = self.load_ticket(conn, &ticket_id)?;
+            if ticket.meta.workflow_state != TicketWorkflowState::Ready { return Err(TicketError::Conflict(format!("Ticket state is {}; only ready Tickets can be queued", ticket.meta.workflow_state.as_str()))); }
+            let at = now_utc();
+            conn.execute("UPDATE typed_tickets SET workflow_state = 'queued', workflow_state_explicit = 1, queued_by = ?3, queued_at = ?4, updated_at = ?4 WHERE workspace_id = ?1 AND ticket_id = ?2", params![self.workspace_id, ticket_id, queued_by, at]).map_err(sqlite_err)?;
+            self.insert_event(conn, &ticket_id, &TicketEvent { kind: TicketEventKind::StateChanged, author: Some(queued_by.to_string()), at: Some(at), status: None, from: Some("ready".to_string()), to: Some("queued".to_string()), reason: Some("queued".to_string()), state_field: Some("state".to_string()), heading: Some(TicketEventKind::StateChanged.heading()), body: MarkdownText::new(format!("Queued for Orchestrator by {queued_by}.")), references: Vec::new(), attributes: BTreeMap::new() })
+        })
+    }
+
+    fn review(&self, id: TicketIdOrSlug, review: TicketReview) -> Result<()> {
+        self.with_write(|conn| {
+            let ticket_id = self.resolve_ticket_id(conn, id)?;
+            let at = now_utc();
+            let mut attributes = BTreeMap::new();
+            attributes.insert("result".to_string(), review.result.as_str().to_string());
+            self.insert_event(
+                conn,
+                &ticket_id,
+                &TicketEvent {
+                    kind: TicketEventKind::Review,
+                    author: Some(review.author.unwrap_or_else(default_author)),
+                    at: Some(at.clone()),
+                    status: Some(review.result.as_str().to_string()),
+                    from: None,
+                    to: None,
+                    reason: None,
+                    state_field: None,
+                    heading: Some(review.result.heading()),
+                    body: review.body,
+                    references: Vec::new(),
+                    attributes,
+                },
+            )?;
+            self.touch_ticket(conn, &ticket_id, &at)
+        })
+    }
+
+    fn close(&self, id: TicketIdOrSlug, resolution: MarkdownText) -> Result<()> {
+        self.with_write(|conn| {
+            let ticket_id = self.resolve_ticket_id(conn, id)?;
+            let at = now_utc();
+            conn.execute("UPDATE typed_tickets SET status = 'closed', workflow_state = 'closed', workflow_state_explicit = 1, updated_at = ?3, resolution = ?4 WHERE workspace_id = ?1 AND ticket_id = ?2", params![self.workspace_id, ticket_id, at, resolution.as_str()]).map_err(sqlite_err)?;
+            self.insert_event(conn, &ticket_id, &TicketEvent { kind: TicketEventKind::Close, author: Some(default_author()), at: Some(at), status: Some("closed".to_string()), from: None, to: Some("closed".to_string()), reason: None, state_field: Some("state".to_string()), heading: Some(TicketEventKind::Close.heading()), body: resolution, references: Vec::new(), attributes: BTreeMap::new() })
+        })
+    }
+
+    fn add_ticket_relation(
+        &self,
+        id: TicketIdOrSlug,
+        relation: NewTicketRelation,
+    ) -> Result<TicketRelation> {
+        self.with_write(|conn| {
+            let ticket_id = self.resolve_ticket_id(conn, id)?;
+            let target =
+                self.resolve_ticket_id(conn, TicketIdOrSlug::Query(relation.target.clone()))?;
+            let output = TicketRelation {
+                ticket_id,
+                kind: relation.kind,
+                target,
+                note: relation.note,
+                author: relation.author.unwrap_or_else(default_author),
+                at: now_utc(),
+            };
+            self.insert_relation(conn, &output)?;
+            Ok(output)
+        })
+    }
+
+    fn query_ticket_relations(
+        &self,
+        ticket: Option<TicketIdOrSlug>,
+        kind: Option<TicketRelationKind>,
+    ) -> Result<Vec<TicketRelation>> {
+        self.with_read(|conn| {
+            let ticket_id = ticket
+                .map(|id| self.resolve_ticket_id(conn, id))
+                .transpose()?;
+            let mut relations = self.all_relations(conn)?;
+            if let Some(ticket_id) = ticket_id {
+                relations.retain(|relation| {
+                    relation.ticket_id == ticket_id || relation.target == ticket_id
+                });
+            }
+            if let Some(kind) = kind {
+                relations.retain(|relation| relation.kind == kind);
+            }
+            sort_ticket_relations(&mut relations);
+            Ok(relations)
+        })
+    }
+
+    fn relation_view(&self, id: TicketIdOrSlug) -> Result<TicketRelationView> {
+        self.with_read(|conn| {
+            let ticket_id = self.resolve_ticket_id(conn, id)?;
+            Ok(self.load_ticket(conn, &ticket_id)?.relations)
+        })
+    }
+
+    fn add_orchestration_plan_record(
+        &self,
+        id: TicketIdOrSlug,
+        record: NewOrchestrationPlanRecord,
+    ) -> Result<OrchestrationPlanRecord> {
+        self.with_write(|conn| {
+            let ticket_id = self.resolve_ticket_id(conn, id)?;
+            let meta = self.load_ticket(conn, &ticket_id)?.meta;
+            let output = OrchestrationPlanRecord { id: allocate_record_id(unix_epoch_millis_now().unwrap_or(0), |_| false).map_err(|err| TicketError::Conflict(format!("failed to allocate orchestration plan id: {err}")))?, ticket_id, kind: record.kind, related_ticket: record.related_ticket, note: record.note, accepted_plan: record.accepted_plan, author: record.author.unwrap_or_else(default_author), at: now_utc() };
+            validate_orchestration_plan_record(&output, Some(&meta))?;
+            conn.execute(r#"INSERT INTO typed_ticket_orchestration_plans (workspace_id, ticket_id, record_id, kind, related_ticket, note, accepted_summary, accepted_branch, accepted_worktree, accepted_role_plan, author, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
+                params![self.workspace_id, output.ticket_id, output.id, output.kind.as_str(), output.related_ticket, output.note, output.accepted_plan.as_ref().map(|plan| plan.summary.as_str()), output.accepted_plan.as_ref().and_then(|plan| plan.branch.as_deref()), output.accepted_plan.as_ref().and_then(|plan| plan.worktree.as_deref()), output.accepted_plan.as_ref().and_then(|plan| plan.role_plan.as_deref()), output.author, output.at]).map_err(sqlite_err)?;
+            Ok(output)
+        })
+    }
+
+    fn query_orchestration_plan_records(
+        &self,
+        ticket: Option<TicketIdOrSlug>,
+        kind: Option<OrchestrationPlanKind>,
+    ) -> Result<Vec<OrchestrationPlanRecord>> {
+        self.with_read(|conn| {
+            let ticket_id = ticket.map(|id| self.resolve_ticket_id(conn, id)).transpose()?;
+            let mut stmt = conn.prepare("SELECT ticket_id, record_id, kind, related_ticket, note, accepted_summary, accepted_branch, accepted_worktree, accepted_role_plan, author, at FROM typed_ticket_orchestration_plans WHERE workspace_id = ?1 ORDER BY at ASC, record_id ASC").map_err(sqlite_err)?;
+            let rows = stmt.query_map(params![self.workspace_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?, row.get::<_, Option<String>>(7)?, row.get::<_, Option<String>>(8)?, row.get::<_, String>(9)?, row.get::<_, String>(10)?))).map_err(sqlite_err)?;
+            let mut records = Vec::new();
+            for row in rows {
+                let (record_ticket, id, kind_raw, related_ticket, note, summary, branch, worktree, role_plan, author, at) = row.map_err(sqlite_err)?;
+                if ticket_id.as_ref().is_some_and(|ticket_id| ticket_id != &record_ticket) { continue; }
+                let Some(record_kind) = OrchestrationPlanKind::parse(&kind_raw) else { continue; };
+                if kind.is_some_and(|expected| expected != record_kind) { continue; }
+                records.push(OrchestrationPlanRecord { ticket_id: record_ticket, id, kind: record_kind, related_ticket, note, accepted_plan: summary.map(|summary| AcceptedOrchestrationPlan { summary, branch, worktree, role_plan }), author, at });
+            }
+            Ok(records)
+        })
+    }
+
+    fn doctor(&self) -> Result<TicketDoctorReport> {
+        self.with_read(|conn| {
+            let _ = self.list_summaries(conn, TicketListQuery::all())?;
+            Ok(TicketDoctorReport::default())
+        })
+    }
+}
+
 impl TicketBackend for LocalTicketBackend {
     fn default_intake_ready_state_change_body(&self, from: &str) -> String {
         self.default_intake_ready_state_change_body(from)
@@ -3198,6 +4192,7 @@ fn invalid_ticket_record_reason(error: &TicketError) -> &'static str {
             "invalid ticket record identity"
         }
         TicketError::Locked { .. } => "ticket backend is locked",
+        TicketError::Sqlite(_) => "could not read ticket record",
         TicketError::NotFound(_) => "ticket record is missing",
         TicketError::Ambiguous { .. } | TicketError::Conflict(_) => {
             "invalid ticket record metadata"
@@ -4813,6 +5808,72 @@ state: planning
         assert!(record.meta.workflow_state_explicit);
         let report = backend.doctor().unwrap();
         assert!(report.is_ok(), "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn sqlite_backend_persists_core_ticket_operations() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteTicketBackend::new(tmp.path().join("workspace.db"), "workspace-test");
+        let created = backend.create(NewTicket::new("SQLite Ticket")).unwrap();
+        backend
+            .add_event(
+                TicketIdOrSlug::Id(created.id.clone()),
+                NewTicketEvent::new(TicketEventKind::Comment, "Imported into SQLite."),
+            )
+            .unwrap();
+        backend
+            .review(
+                TicketIdOrSlug::Id(created.id.clone()),
+                TicketReview::approve("Looks good."),
+            )
+            .unwrap();
+        backend
+            .close(
+                TicketIdOrSlug::Id(created.id.clone()),
+                MarkdownText::new("Done."),
+            )
+            .unwrap();
+
+        let reopened = SqliteTicketBackend::new(tmp.path().join("workspace.db"), "workspace-test");
+        let list = reopened.list(TicketListQuery::all()).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, created.id);
+        assert_eq!(list[0].workflow_state, TicketWorkflowState::Closed);
+        let ticket = reopened.show(TicketIdOrSlug::Id(created.id)).unwrap();
+        assert_eq!(ticket.meta.title, "SQLite Ticket");
+        assert!(ticket.events.iter().any(|event| {
+            event.kind == TicketEventKind::Comment && event.body.0.contains("Imported into SQLite")
+        }));
+        assert!(
+            ticket
+                .events
+                .iter()
+                .any(|event| event.kind == TicketEventKind::Review
+                    && event.body.0.contains("Looks good"))
+        );
+        assert!(
+            ticket
+                .resolution
+                .as_ref()
+                .is_some_and(|resolution| resolution.0.contains("Done"))
+        );
+    }
+
+    #[test]
+    fn sqlite_backend_imports_legacy_local_layout_explicitly() {
+        let tmp = TempDir::new().unwrap();
+        let local = backend(&tmp);
+        let created = local.create(NewTicket::new("Legacy Ticket")).unwrap();
+        let db = SqliteTicketBackend::new(tmp.path().join("workspace.db"), "workspace-test");
+        db.import_from_local_backend(&local).unwrap();
+
+        let ticket = db.show(TicketIdOrSlug::Id(created.id.clone())).unwrap();
+        assert_eq!(ticket.meta.id, created.id);
+        assert_eq!(ticket.meta.title, "Legacy Ticket");
+
+        fs::remove_dir_all(local.root()).unwrap();
+        let ticket = db.show(TicketIdOrSlug::Id(created.id)).unwrap();
+        assert_eq!(ticket.meta.title, "Legacy Ticket");
     }
 
     #[test]

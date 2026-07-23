@@ -6,14 +6,14 @@ use std::path::{Path, PathBuf};
 
 use chrono::{SecondsFormat, Utc};
 use ticket::config::{
-    DEFAULT_TICKET_BACKEND_RELATIVE_PATH, TICKET_CONFIG_RELATIVE_PATH, TicketConfig,
-    WORKSPACE_SETTINGS_RELATIVE_PATH, ticket_config_scaffold,
+    TICKET_CONFIG_RELATIVE_PATH, TicketConfig, WORKSPACE_SETTINGS_RELATIVE_PATH,
+    ticket_config_scaffold,
 };
 use ticket::{
-    LocalTicketBackend, MarkdownText, NewTicket, NewTicketEvent, NewTicketRelation, TicketBackend,
-    TicketDoctorSeverity, TicketEventKind, TicketIdOrSlug, TicketIntakeSummary, TicketListQuery,
-    TicketListState, TicketRelationKind, TicketReview, TicketReviewResult, TicketSummary,
-    TicketWorkflowState,
+    LocalTicketBackend, MarkdownText, NewTicket, NewTicketEvent, NewTicketRelation,
+    SqliteTicketBackend, TicketBackend, TicketDoctorSeverity, TicketEventKind, TicketIdOrSlug,
+    TicketIntakeSummary, TicketListQuery, TicketListState, TicketRelationKind, TicketReview,
+    TicketReviewResult, TicketSummary, TicketWorkflowState,
 };
 
 const DEFAULT_LIST_LIMIT: usize = 50;
@@ -30,6 +30,7 @@ pub enum TicketCli {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TicketCommand {
     Init,
+    ImportLocal,
     Create(CreateOptions),
     List(ListOptions),
     Show { query: String },
@@ -179,6 +180,14 @@ pub fn parse_ticket_args(args: &[String]) -> Result<TicketCli, TicketCliError> {
             }
             TicketCommand::Init
         }
+        "import-local" => {
+            if args.len() != 1 {
+                return Err(TicketCliError::new(
+                    "ticket import-local takes no arguments",
+                ));
+            }
+            TicketCommand::ImportLocal
+        }
         "create" => TicketCommand::Create(parse_create(&args[1..])?),
         "list" => TicketCommand::List(parse_list(&args[1..])?),
         "show" => TicketCommand::Show {
@@ -232,19 +241,22 @@ fn run_command(
 ) -> Result<TicketCliOutput, TicketCliError> {
     match command {
         TicketCommand::Init => init(workspace),
+        TicketCommand::ImportLocal => import_local(workspace),
         command => {
             let backend = backend_for_workspace(workspace)?;
             match command {
-                TicketCommand::Create(options) => create(&backend, options),
-                TicketCommand::List(options) => list(&backend, options),
-                TicketCommand::Show { query } => show(&backend, query),
-                TicketCommand::Comment(options) => comment(&backend, options),
-                TicketCommand::Review(options) => review(&backend, options),
-                TicketCommand::State(options) => state(&backend, options),
-                TicketCommand::Close(options) => close(&backend, options),
-                TicketCommand::Relation(options) => relation(&backend, options),
-                TicketCommand::Doctor => doctor(&backend),
-                TicketCommand::Init => unreachable!("init handled before backend setup"),
+                TicketCommand::Create(options) => create(backend.as_ref(), options),
+                TicketCommand::List(options) => list(backend.as_ref(), options),
+                TicketCommand::Show { query } => show(backend.as_ref(), query),
+                TicketCommand::Comment(options) => comment(backend.as_ref(), options),
+                TicketCommand::Review(options) => review(backend.as_ref(), options),
+                TicketCommand::State(options) => state(backend.as_ref(), options),
+                TicketCommand::Close(options) => close(backend.as_ref(), options),
+                TicketCommand::Relation(options) => relation(backend.as_ref(), options),
+                TicketCommand::Doctor => doctor(backend.as_ref()),
+                TicketCommand::Init | TicketCommand::ImportLocal => {
+                    unreachable!("handled before backend setup")
+                }
             }
         }
     }
@@ -262,9 +274,6 @@ fn init(workspace: &Path) -> Result<TicketCliOutput, TicketCliError> {
 
     let yoi_dir = workspace.join(".yoi");
     fs::create_dir_all(&yoi_dir)?;
-    let tickets_dir = workspace.join(DEFAULT_TICKET_BACKEND_RELATIVE_PATH);
-    fs::create_dir_all(&tickets_dir)?;
-    fs::write(tickets_dir.join(".gitkeep"), b"")?;
 
     let settings_path = workspace.join(WORKSPACE_SETTINGS_RELATIVE_PATH);
     let scaffold = ticket_config_scaffold();
@@ -311,8 +320,8 @@ fn init(workspace: &Path) -> Result<TicketCliOutput, TicketCliError> {
         "updated"
     };
     Ok(success(format!(
-        "{verb}\t{}\nensured\t{}\n",
-        WORKSPACE_SETTINGS_RELATIVE_PATH, DEFAULT_TICKET_BACKEND_RELATIVE_PATH
+        "{verb}\t{}\nbackend\tworkspace-sqlite\n",
+        WORKSPACE_SETTINGS_RELATIVE_PATH
     )))
 }
 
@@ -356,14 +365,92 @@ fn workspace_settings_uuid_v7(workspace: &Path) -> String {
     )
 }
 
-fn backend_for_workspace(workspace: &Path) -> Result<LocalTicketBackend, TicketCliError> {
+fn backend_for_workspace(workspace: &Path) -> Result<Box<dyn TicketBackend>, TicketCliError> {
     let config = TicketConfig::load_workspace(workspace)?;
-    Ok(LocalTicketBackend::new(config.backend_root().to_path_buf())
-        .with_record_language(config.ticket_record_language()))
+    let workspace_id = workspace_id_for_workspace(workspace)?;
+    let db_path = workspace_ticket_database_path(workspace, &workspace_id)?;
+    Ok(Box::new(
+        SqliteTicketBackend::new(db_path, workspace_id)
+            .with_record_language(config.ticket_record_language()),
+    ))
+}
+
+fn import_local(workspace: &Path) -> Result<TicketCliOutput, TicketCliError> {
+    let config = TicketConfig::load_workspace(workspace)?;
+    let local = LocalTicketBackend::new(config.backend_root().to_path_buf())
+        .with_record_language(config.ticket_record_language());
+    let workspace_id = workspace_id_for_workspace(workspace)?;
+    let db_path = workspace_ticket_database_path(workspace, &workspace_id)?;
+    let sqlite = SqliteTicketBackend::new(db_path.clone(), workspace_id)
+        .with_record_language(config.ticket_record_language());
+    sqlite.import_from_local_backend(&local)?;
+    Ok(success(format!(
+        "imported\t{}\nbackend\t{}\n",
+        config.backend_root().display(),
+        db_path.display()
+    )))
+}
+
+fn workspace_id_for_workspace(workspace: &Path) -> Result<String, TicketCliError> {
+    let settings_path = workspace.join(WORKSPACE_SETTINGS_RELATIVE_PATH);
+    let raw = fs::read_to_string(&settings_path).map_err(|error| {
+        TicketCliError::new(format!(
+            "failed to read workspace settings {}: {error}",
+            settings_path.display()
+        ))
+    })?;
+    let value: toml::Value = toml::from_str(&raw).map_err(|error| {
+        TicketCliError::new(format!(
+            "failed to parse workspace settings {}: {error}",
+            settings_path.display()
+        ))
+    })?;
+    value
+        .get("workspace_id")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            TicketCliError::new(format!(
+                "workspace settings {} must contain workspace_id for SQLite Ticket backend",
+                settings_path.display()
+            ))
+        })
+}
+
+fn workspace_ticket_database_path(
+    workspace: &Path,
+    workspace_id: &str,
+) -> Result<PathBuf, TicketCliError> {
+    #[cfg(not(test))]
+    let _ = workspace;
+
+    #[cfg(test)]
+    {
+        return Ok(workspace
+            .join(".test-yoi-data")
+            .join("workspace-server")
+            .join(workspace_id)
+            .join("workspace.db"));
+    }
+
+    #[cfg(not(test))]
+    {
+        let data_dir = manifest::paths::data_dir().ok_or_else(|| {
+            TicketCliError::new(
+                "could not resolve Yoi data directory for SQLite Ticket backend (set YOI_DATA_DIR, YOI_HOME, XDG_DATA_HOME, or HOME)",
+            )
+        })?;
+        Ok(data_dir
+            .join("workspace-server")
+            .join(workspace_id)
+            .join("workspace.db"))
+    }
 }
 
 fn create(
-    backend: &LocalTicketBackend,
+    backend: &dyn TicketBackend,
     options: CreateOptions,
 ) -> Result<TicketCliOutput, TicketCliError> {
     let mut input = NewTicket::new(options.title);
@@ -374,7 +461,7 @@ fn create(
 }
 
 fn list(
-    backend: &LocalTicketBackend,
+    backend: &dyn TicketBackend,
     options: ListOptions,
 ) -> Result<TicketCliOutput, TicketCliError> {
     let filter = match options.state {
@@ -410,7 +497,7 @@ fn list(
     Ok(success(stdout))
 }
 
-fn show(backend: &LocalTicketBackend, query: String) -> Result<TicketCliOutput, TicketCliError> {
+fn show(backend: &dyn TicketBackend, query: String) -> Result<TicketCliOutput, TicketCliError> {
     let ticket = backend.show(TicketIdOrSlug::Query(query))?;
     let mut stdout = String::new();
     stdout.push_str(&format!("# {}\n\n", ticket.meta.title));
@@ -545,7 +632,7 @@ fn is_obsolete_ticket_frontmatter_key(key: &str) -> bool {
 }
 
 fn comment(
-    backend: &LocalTicketBackend,
+    backend: &dyn TicketBackend,
     options: CommentOptions,
 ) -> Result<TicketCliOutput, TicketCliError> {
     let role = options.role.as_str().to_string();
@@ -556,7 +643,7 @@ fn comment(
 }
 
 fn review(
-    backend: &LocalTicketBackend,
+    backend: &dyn TicketBackend,
     options: ReviewOptions,
 ) -> Result<TicketCliOutput, TicketCliError> {
     let result = options.result.as_str().to_string();
@@ -573,7 +660,7 @@ fn review(
 }
 
 fn state(
-    backend: &LocalTicketBackend,
+    backend: &dyn TicketBackend,
     options: StateOptions,
 ) -> Result<TicketCliOutput, TicketCliError> {
     let id = TicketIdOrSlug::Query(options.query.clone());
@@ -626,7 +713,7 @@ fn state(
 }
 
 fn close(
-    backend: &LocalTicketBackend,
+    backend: &dyn TicketBackend,
     options: CloseOptions,
 ) -> Result<TicketCliOutput, TicketCliError> {
     backend.close(
@@ -637,7 +724,7 @@ fn close(
 }
 
 fn relation(
-    backend: &LocalTicketBackend,
+    backend: &dyn TicketBackend,
     options: RelationOptions,
 ) -> Result<TicketCliOutput, TicketCliError> {
     match options.action {
@@ -683,7 +770,7 @@ fn relation(
     }
 }
 
-fn doctor(backend: &LocalTicketBackend) -> Result<TicketCliOutput, TicketCliError> {
+fn doctor(backend: &dyn TicketBackend) -> Result<TicketCliOutput, TicketCliError> {
     let report = backend.doctor()?;
     let mut stdout = String::new();
     if report.is_ok() {
@@ -1166,14 +1253,13 @@ fn default_author() -> String {
 }
 
 fn help_text() -> &'static str {
-    "yoi ticket\n\nUsage:\n  yoi ticket init\n  yoi ticket create --title <title>\n  yoi ticket list [--state active|all|planning|ready|queued|inprogress|done|closed[,..]] [--limit <n>]\n  yoi ticket show <id>\n  yoi ticket comment <id> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket review <id> (--approve|--request-changes) (--file <path>|--message <text>)\n  yoi ticket state <id> <planning|ready|queued|inprogress|done|closed>\n  yoi ticket close <id> (--resolution <text>|--file <path>)\n  yoi ticket relation add --ticket <id> --kind <depends_on|blocks|related|supersedes|duplicate_of> --target <id> [--note <text>]\n  yoi ticket relation list [--ticket <id>] [--kind <kind>]\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  `yoi ticket init` writes explicit fixed role profiles and optional [ticket].language into .yoi/workspace.toml.\n  Uses workspace Ticket settings from .yoi/workspace.toml [ticket] when present; .yoi/ticket.config.toml is a read-only migration fallback only.\n  Supported provider: builtin:yoi_local.\n  Without configured Ticket settings, the local backend root is <cwd>/.yoi/tickets.\n"
+    "yoi ticket\n\nUsage:\n  yoi ticket init\n  yoi ticket import-local\n  yoi ticket create --title <title>\n  yoi ticket list [--state active|all|planning|ready|queued|inprogress|done|closed[,..]] [--limit <n>]\n  yoi ticket show <id>\n  yoi ticket comment <id> [--role comment|plan|decision|implementation_report] (--file <path>|--message <text>)\n  yoi ticket review <id> (--approve|--request-changes) (--file <path>|--message <text>)\n  yoi ticket state <id> <planning|ready|queued|inprogress|done|closed>\n  yoi ticket close <id> (--resolution <text>|--file <path>)\n  yoi ticket relation add --ticket <id> --kind <depends_on|blocks|related|supersedes|duplicate_of> --target <id> [--note <text>]\n  yoi ticket relation list [--ticket <id>] [--kind <kind>]\n  yoi ticket doctor\n\nOptions:\n  -h, --help    Print help\n\nBackend:\n  Tickets are stored in the workspace SQLite DB under the Yoi data directory.\n  `yoi ticket import-local` imports the legacy .yoi/tickets backend root configured in .yoi/workspace.toml.\n  `yoi ticket init` writes explicit fixed role profiles and optional [ticket].language into .yoi/workspace.toml, but does not create .yoi/tickets.\n"
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use ticket::TicketEventKind;
     use ticket::config::TicketRole;
 
     fn args(items: &[&str]) -> Vec<String> {
@@ -1181,6 +1267,13 @@ mod tests {
     }
 
     fn run(temp: &TempDir, items: &[&str]) -> TicketCliOutput {
+        if items.first().copied() != Some("init")
+            && !temp.path().join(WORKSPACE_SETTINGS_RELATIVE_PATH).exists()
+        {
+            let init_cli = parse_ticket_args(&args(&["init"])).unwrap();
+            let init = run_in_workspace(init_cli, temp.path()).unwrap();
+            assert_eq!(init.status, TicketCliStatus::Success);
+        }
         let cli = parse_ticket_args(&args(items)).unwrap();
         run_in_workspace(cli, temp.path()).unwrap()
     }
@@ -1201,9 +1294,8 @@ mod tests {
         let initialized = run(&temp, &["init"]);
         assert_eq!(initialized.status, TicketCliStatus::Success);
         assert!(initialized.stdout.contains("created\t.yoi/workspace.toml"));
-        assert!(initialized.stdout.contains("ensured\t.yoi/tickets"));
-        assert!(temp.path().join(".yoi/tickets").exists());
-        assert!(temp.path().join(".yoi/tickets/.gitkeep").exists());
+        assert!(initialized.stdout.contains("backend\tworkspace-sqlite"));
+        assert!(!temp.path().join(".yoi/tickets").exists());
 
         let config = fs::read_to_string(temp.path().join(".yoi/workspace.toml")).unwrap();
         assert!(config.contains("workspace_id = \""));
@@ -1299,21 +1391,8 @@ mod tests {
         assert_eq!(created.status, TicketCliStatus::Success);
         assert!(created.stdout.contains("created\t"));
         let ticket_id = created_id(&created);
-        assert!(temp.path().join(".yoi/tickets").join(&ticket_id).exists());
+        assert!(!temp.path().join(".yoi/tickets").exists());
         assert!(!temp.path().join("work-items").exists());
-        let created_item = fs::read_to_string(
-            temp.path()
-                .join(".yoi/tickets")
-                .join(&ticket_id)
-                .join("item.md"),
-        )
-        .unwrap();
-        assert!(created_item.contains("state:"));
-        assert!(created_item.contains("planning"));
-        assert!(!created_item.contains("legacy_ticket:"));
-        assert!(!created_item.contains("needs_preflight:"));
-        assert!(!created_item.contains("slug:"));
-        assert!(!created_item.contains("workflow_state:"));
 
         let listed = run(&temp, &["list", "--state", "planning"]);
         assert!(listed.stdout.contains("state\tid\ttitle"));
@@ -1395,29 +1474,21 @@ mod tests {
         assert_eq!(doctor.status, TicketCliStatus::Success);
         assert_eq!(doctor.stdout, "doctor: ok\n");
 
-        let backend = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
-        let ticket = backend.show(TicketIdOrSlug::Id(ticket_id.clone())).unwrap();
-        assert!(ticket.resolution.is_some());
-        assert_eq!(ticket.meta.workflow_state, TicketWorkflowState::Closed);
-        assert!(
-            ticket
-                .events
-                .iter()
-                .any(|event| event.kind == TicketEventKind::ImplementationReport)
-        );
-        assert!(
-            ticket
-                .events
-                .iter()
-                .any(|event| event.kind == TicketEventKind::Review)
-        );
+        let final_show = run(&temp, &["show", &ticket_id]);
+        assert!(final_show.stdout.contains("State: closed"));
+        assert!(final_show.stdout.contains("Done via yoi ticket."));
+        assert!(final_show.stdout.contains("implementation_report"));
+        assert!(final_show.stdout.contains("review"));
     }
 
     #[test]
     fn ticket_cli_show_omits_obsolete_overlay_fields_from_legacy_frontmatter() {
         let temp = TempDir::new().unwrap();
-        let created = run(&temp, &["create", "--title", "Legacy Overlay"]);
-        let ticket_id = created_id(&created);
+        let initialized = run(&temp, &["init"]);
+        assert_eq!(initialized.status, TicketCliStatus::Success);
+        let local = LocalTicketBackend::new(temp.path().join(".yoi/tickets"));
+        let created = local.create(NewTicket::new("Legacy Overlay")).unwrap();
+        let ticket_id = created.id;
         let item_path = temp
             .path()
             .join(".yoi/tickets")
@@ -1433,6 +1504,9 @@ mod tests {
             ),
         )
         .unwrap();
+
+        let imported = run(&temp, &["import-local"]);
+        assert_eq!(imported.status, TicketCliStatus::Success);
 
         let shown = run(&temp, &["show", &ticket_id]);
         assert_eq!(shown.status, TicketCliStatus::Success);
@@ -1496,20 +1570,22 @@ mod tests {
     }
 
     #[test]
-    fn ticket_cli_uses_configured_backend_root() {
+    fn ticket_cli_import_local_uses_configured_backend_root() {
         let temp = TempDir::new().unwrap();
         fs::create_dir_all(temp.path().join(".yoi")).unwrap();
         fs::write(
             temp.path().join(".yoi/workspace.toml"),
-            "[ticket]\nlanguage = \"Japanese\"\n\n[ticket.backend]\nprovider = \"builtin:yoi_local\"\nroot = \"custom-tickets\"\n",
+            "workspace_id = \"workspace-test\"\n\n[ticket]\nlanguage = \"Japanese\"\n\n[ticket.backend]\nprovider = \"builtin:yoi_local\"\nroot = \"custom-tickets\"\n",
         )
         .unwrap();
+        let local = LocalTicketBackend::new(temp.path().join("custom-tickets"));
+        let created = local.create(NewTicket::new("Configured Root")).unwrap();
 
-        let created = run(&temp, &["create", "--title", "Configured Root"]);
-        let ticket_id = created_id(&created);
-
-        assert!(temp.path().join("custom-tickets").join(ticket_id).exists());
-        assert!(!temp.path().join("custom-tickets/open").exists());
+        let imported = run(&temp, &["import-local"]);
+        assert_eq!(imported.status, TicketCliStatus::Success);
+        let shown = run(&temp, &["show", &created.id]);
+        assert_eq!(shown.status, TicketCliStatus::Success);
+        assert!(shown.stdout.contains("# Configured Root"));
         assert!(!temp.path().join("work-items").exists());
     }
 

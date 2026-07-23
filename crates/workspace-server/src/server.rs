@@ -19,7 +19,7 @@ use protocol::stream::{decode_method, encode_event};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ticket::{
-    LocalTicketBackend, TicketBackendHttpResponse, TicketBackendOperation,
+    SqliteTicketBackend, TicketBackendHttpResponse, TicketBackendOperation,
     execute_ticket_backend_operation,
 };
 use tokio::net::TcpListener;
@@ -45,7 +45,7 @@ use crate::companion::{
     CompanionCancelRequest, CompanionConsole, CompanionMessageRequest, CompanionMessageResponse,
     CompanionStatusResponse, CompanionTranscriptProjection,
 };
-use crate::config::{RemoteRuntimeConfigFile, WorkspaceBackendConfigFile, resolve_remote_runtime};
+use crate::config::{BackendRuntimesConfigFile, RemoteRuntimeConfigFile, resolve_remote_runtime};
 use crate::hosts::{
     ConfigBundleCheckResult, ConfigBundleSyncResult, DiagnosticSeverity, EmbeddedWorkerRuntime,
     HostSummary, RemoteRuntimeConfig, RemoteWorkerRuntime, RuntimeDiagnostic, RuntimeRegistry,
@@ -77,8 +77,8 @@ use crate::resource_broker::BackendResourceBroker;
 use crate::skills;
 use crate::store::{
     AccountRecord, ApiTokenRecord, AuthChallengeRecord, BrowserSessionRecord, ControlPlaneStore,
-    DeviceLoginFlowRecord, PasskeyCredentialRecord, UserRecord, WorkdirRegistryRecord,
-    WorkerRegistryRecord, WorkerWorkdirLinkRecord, WorkspaceRecord,
+    DeviceLoginFlowRecord, PasskeyCredentialRecord, RepositoryRecord, UserRecord,
+    WorkdirRegistryRecord, WorkerRegistryRecord, WorkerWorkdirLinkRecord, WorkspaceRecord,
 };
 use crate::{Error, Result};
 use worker_runtime::catalog::{
@@ -120,6 +120,7 @@ pub struct ServerConfig {
     pub workspace_display_name: String,
     pub workspace_created_at: String,
     pub workspace_root: PathBuf,
+    pub database_path: PathBuf,
     pub frontend_url: String,
     pub embedded_runtime_store_root: PathBuf,
     pub static_assets_dir: Option<PathBuf>,
@@ -128,6 +129,7 @@ pub struct ServerConfig {
     pub repositories: Vec<ConfiguredRepository>,
     pub runtime_event_sources: Vec<RuntimeObservationSourceConfig>,
     pub remote_runtime_sources: Vec<RemoteRuntimeConfig>,
+    pub runtime_config_path: Option<PathBuf>,
     pub backend_base_url: Option<String>,
 }
 
@@ -136,11 +138,14 @@ impl ServerConfig {
         let workspace_root = workspace_root.into();
         let workspace_id = identity.workspace_id;
         let embedded_runtime_store_root = Self::default_embedded_runtime_store_root(&workspace_id);
+        let database_path =
+            Self::default_workspace_backend_data_root(&workspace_id).join("workspace.db");
         Self {
             workspace_id,
             workspace_display_name: identity.display_name,
             workspace_created_at: identity.created_at,
             workspace_root,
+            database_path,
             frontend_url: "http://127.0.0.1:5173".to_string(),
             embedded_runtime_store_root,
             static_assets_dir: None,
@@ -154,6 +159,7 @@ impl ServerConfig {
             repositories: Vec::new(),
             runtime_event_sources: Vec::new(),
             remote_runtime_sources: Vec::new(),
+            runtime_config_path: BackendRuntimesConfigFile::default_path(),
             backend_base_url: None,
         }
     }
@@ -246,7 +252,7 @@ impl WorkspaceApi {
     }
 
     async fn new_with_execution_backend_and_broker(
-        config: ServerConfig,
+        mut config: ServerConfig,
         store: Arc<dyn ControlPlaneStore>,
         execution_backend: Arc<dyn worker_runtime::execution::WorkerExecutionBackend>,
         resource_broker: BackendResourceBroker,
@@ -261,6 +267,8 @@ impl WorkspaceApi {
                 updated_at: config.workspace_created_at.clone(),
             })
             .await?;
+        import_configured_repositories(store.as_ref(), &config)?;
+        config.repositories = load_configured_repositories_from_store(store.as_ref(), &config)?;
         let runtime = RuntimeRegistry::for_workspace(
             EmbeddedWorkerRuntime::new_fs_store_with_execution_backend(
                 config.workspace_id.clone(),
@@ -298,7 +306,11 @@ impl WorkspaceApi {
         let companion = Arc::new(CompanionConsole::disabled());
         let observation_proxy = BackendObservationProxy::new(config.runtime_event_sources.clone());
         Ok(Self {
-            records: LocalProjectRecordReader::new(config.workspace_root.clone())?,
+            records: LocalProjectRecordReader::new(
+                config.workspace_root.clone(),
+                config.database_path.clone(),
+                config.workspace_id.clone(),
+            )?,
             config,
             store,
             runtime,
@@ -314,6 +326,76 @@ impl WorkspaceApi {
 
     fn repository_reader(&self) -> RepositoryRegistryReader {
         RepositoryRegistryReader::new(self.config.repositories.clone())
+    }
+}
+
+fn import_configured_repositories(
+    store: &dyn ControlPlaneStore,
+    config: &ServerConfig,
+) -> Result<()> {
+    if config.repositories.is_empty() {
+        return Ok(());
+    }
+    let now = crate::auth::now_rfc3339();
+    for repository in &config.repositories {
+        store.upsert_repository(&RepositoryRecord {
+            workspace_id: config.workspace_id.clone(),
+            repository_id: repository.id.clone(),
+            name: repository
+                .display_name
+                .clone()
+                .unwrap_or_else(|| repository.id.clone()),
+            kind: repository.provider.clone(),
+            provider: Some(repository.provider.clone()),
+            uri: repository.uri.clone(),
+            default_ref: repository.default_selector.clone(),
+            auth_ref_kind: None,
+            auth_ref_key: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        })?;
+    }
+    Ok(())
+}
+
+fn load_configured_repositories_from_store(
+    store: &dyn ControlPlaneStore,
+    config: &ServerConfig,
+) -> Result<Vec<ConfiguredRepository>> {
+    store
+        .list_repositories(&config.workspace_id)?
+        .into_iter()
+        .map(|record| configured_repository_from_record(&config.workspace_root, record))
+        .collect()
+}
+
+fn configured_repository_from_record(
+    workspace_root: &Path,
+    record: RepositoryRecord,
+) -> Result<ConfiguredRepository> {
+    let provider = record.provider.unwrap_or_else(|| record.kind.clone());
+    if record.uri.contains("://") {
+        return Err(Error::Config(format!(
+            "repository `{}` uses a remote URI, but remote repository materialization is not implemented",
+            record.repository_id
+        )));
+    }
+    let path = resolve_backend_path(workspace_root, Path::new(&record.uri));
+    Ok(ConfiguredRepository {
+        id: record.repository_id,
+        provider,
+        uri: record.uri,
+        path,
+        display_name: Some(record.name),
+        default_selector: record.default_ref,
+    })
+}
+
+fn resolve_backend_path(workspace_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root.join(path)
     }
 }
 
@@ -1316,8 +1398,11 @@ async fn scoped_ticket_backend_operation(
     validate_workspace_scope(&api, &path.workspace_id)?;
     let config = ticket::config::TicketConfig::load_workspace(&api.config.workspace_root)
         .map_err(|error| Error::Config(format!("load Ticket workspace settings: {error}")))?;
-    let backend = LocalTicketBackend::new(config.backend_root().to_path_buf())
-        .with_record_language(config.ticket_record_language());
+    let backend = SqliteTicketBackend::new(
+        api.config.database_path.clone(),
+        api.config.workspace_id.clone(),
+    )
+    .with_record_language(config.ticket_record_language());
     let response = match execute_ticket_backend_operation(&backend, operation) {
         Ok(result) => TicketBackendHttpResponse::Ok { result },
         Err(error) => TicketBackendHttpResponse::Error {
@@ -3358,7 +3443,7 @@ async fn list_repositories(
     Ok(Json(RepositoryListResponse {
         workspace_id: api.config.workspace_id,
         items,
-        source: "workspace_backend_config".to_string(),
+        source: "workspace-control-plane".to_string(),
         diagnostics: repository_diagnostics(diagnostics),
     }))
 }
@@ -3371,7 +3456,7 @@ async fn repository_detail(
     Ok(Json(RepositoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
         item,
-        source: "workspace_backend_config".to_string(),
+        source: "workspace-control-plane".to_string(),
     }))
 }
 
@@ -3466,10 +3551,10 @@ async fn list_workers(
 async fn get_runtime_connection_settings(
     State(api): State<WorkspaceApi>,
 ) -> ApiResult<Json<RuntimeConnectionSettingsResponse>> {
-    let local_config = load_workspace_backend_config_for_settings(&api)?;
+    let runtime_config = load_backend_runtimes_config_for_settings(&api)?;
     Ok(Json(runtime_connection_settings_response(
         &api,
-        &local_config,
+        &runtime_config,
     )))
 }
 
@@ -3478,7 +3563,7 @@ async fn add_remote_runtime_connection(
     Json(request): Json<AddRemoteRuntimeConnectionRequest>,
 ) -> ApiResult<Json<RuntimeConnectionMutationResponse>> {
     validate_runtime_connection_request(&request)?;
-    let mut local_config = load_workspace_backend_config_for_settings(&api)?;
+    let mut runtime_config = load_backend_runtimes_config_for_settings(&api)?;
     let id = request.runtime_id.trim().to_string();
     if id == EMBEDDED_WORKER_RUNTIME_ID {
         return Err(settings_bad_request(
@@ -3496,7 +3581,7 @@ async fn add_remote_runtime_connection(
             "remote Runtime token_ref persistence is not supported by this v0 browser settings surface",
         ));
     }
-    if local_config
+    if runtime_config
         .runtimes
         .remote
         .iter()
@@ -3538,12 +3623,12 @@ async fn add_remote_runtime_connection(
     )
     .map(|host| host.with_resource_broker(api.resource_broker.clone()))
     .map_err(|err| err.into_error())?;
-    local_config.runtimes.remote.push(remote_config);
-    write_workspace_backend_config_for_settings(&api, &local_config)?;
+    runtime_config.runtimes.remote.push(remote_config);
+    write_backend_runtimes_config_for_settings(&api, &runtime_config)?;
     api.runtime.register_or_replace(active_runtime);
     let mut response = runtime_connection_mutation_response(
         &api,
-        &local_config,
+        &runtime_config,
         vec![settings_diagnostic(
             "runtime_registry_applied",
             DiagnosticSeverity::Info,
@@ -3551,9 +3636,9 @@ async fn add_remote_runtime_connection(
         )],
     );
     response.diagnostics.push(settings_diagnostic(
-        "workspace_backend_config_rewritten",
+        "backend_runtimes_config_rewritten",
         DiagnosticSeverity::Info,
-        "Local Runtime connection config was rewritten from the typed schema; comments and formatting are not preserved in v0.",
+        "Backend runtimes config was rewritten from the typed schema; comments and formatting are not preserved in v0.",
     ));
     Ok(Json(response))
 }
@@ -3568,13 +3653,13 @@ async fn delete_remote_runtime_connection(
             "the embedded Runtime is built in and cannot be deleted from remote Runtime config",
         ));
     }
-    let mut local_config = load_workspace_backend_config_for_settings(&api)?;
-    let before = local_config.runtimes.remote.len();
-    local_config
+    let mut runtime_config = load_backend_runtimes_config_for_settings(&api)?;
+    let before = runtime_config.runtimes.remote.len();
+    runtime_config
         .runtimes
         .remote
         .retain(|remote| remote.id != runtime_id);
-    if before == local_config.runtimes.remote.len() {
+    if before == runtime_config.runtimes.remote.len() {
         return Err(Error::UnknownRuntime(runtime_id).into());
     }
     match api
@@ -3605,10 +3690,10 @@ async fn delete_remote_runtime_connection(
             ));
         }
     }
-    write_workspace_backend_config_for_settings(&api, &local_config)?;
+    write_backend_runtimes_config_for_settings(&api, &runtime_config)?;
     let mut response = runtime_connection_mutation_response(
         &api,
-        &local_config,
+        &runtime_config,
         vec![settings_diagnostic(
             "runtime_registry_applied",
             DiagnosticSeverity::Info,
@@ -3616,9 +3701,9 @@ async fn delete_remote_runtime_connection(
         )],
     );
     response.diagnostics.push(settings_diagnostic(
-        "workspace_backend_config_rewritten",
+        "backend_runtimes_config_rewritten",
         DiagnosticSeverity::Info,
-        "Local Runtime connection config was rewritten from the typed schema; comments and formatting are not preserved in v0.",
+        "Backend runtimes config was rewritten from the typed schema; comments and formatting are not preserved in v0.",
     ));
     Ok(Json(response))
 }
@@ -3627,8 +3712,8 @@ async fn test_remote_runtime_connection(
     State(api): State<WorkspaceApi>,
     AxumPath(runtime_id): AxumPath<String>,
 ) -> ApiResult<Json<RemoteRuntimeTestResponse>> {
-    let local_config = load_workspace_backend_config_for_settings(&api)?;
-    let remote = local_config
+    let runtime_config = load_backend_runtimes_config_for_settings(&api)?;
+    let remote = runtime_config
         .runtimes
         .remote
         .iter()
@@ -4483,54 +4568,64 @@ fn workers_response(api: WorkspaceApi) -> ApiResult<RuntimeListResponse<WorkerSu
     })
 }
 
-fn load_workspace_backend_config_for_settings(
+fn load_backend_runtimes_config_for_settings(
     api: &WorkspaceApi,
-) -> ApiResult<WorkspaceBackendConfigFile> {
-    WorkspaceBackendConfigFile::load_for_workspace(&api.config.workspace_root).map_err(|error| {
+) -> ApiResult<BackendRuntimesConfigFile> {
+    api.config
+        .runtime_config_path
+        .as_ref()
+        .map(BackendRuntimesConfigFile::load_from_path)
+        .transpose()
+        .map_err(|error| {
+            Error::Config(format!(
+                "failed to read Backend runtimes config for Runtime connections: {}",
+                sanitize_backend_error(&error.to_string())
+            ))
+            .into()
+        })
+        .map(|config| config.unwrap_or_default())
+}
+
+fn write_backend_runtimes_config_for_settings(
+    api: &WorkspaceApi,
+    runtime_config: &BackendRuntimesConfigFile,
+) -> ApiResult<()> {
+    let path = api.config.runtime_config_path.as_ref().ok_or_else(|| {
+        Error::Config(
+            "Backend runtimes config path is unavailable; set YOI_CONFIG_DIR, YOI_HOME, XDG_CONFIG_HOME, or HOME"
+                .to_string(),
+        )
+    })?;
+    runtime_config.write_to_path(path).map_err(|error| {
         Error::Config(format!(
-            "failed to read workspace backend local config for Runtime connections: {}",
+            "failed to write Backend runtimes config for Runtime connections: {}",
             sanitize_backend_error(&error.to_string())
         ))
         .into()
     })
 }
 
-fn write_workspace_backend_config_for_settings(
-    api: &WorkspaceApi,
-    local_config: &WorkspaceBackendConfigFile,
-) -> ApiResult<()> {
-    local_config
-        .write_for_workspace(&api.config.workspace_root)
-        .map_err(|error| {
-            Error::Config(format!(
-                "failed to write workspace backend local config for Runtime connections: {}",
-                sanitize_backend_error(&error.to_string())
-            ))
-            .into()
-        })
-}
-
 fn runtime_connection_settings_response(
     api: &WorkspaceApi,
-    local_config: &WorkspaceBackendConfigFile,
+    runtime_config: &BackendRuntimesConfigFile,
 ) -> RuntimeConnectionSettingsResponse {
     RuntimeConnectionSettingsResponse {
         workspace_id: api.config.workspace_id.clone(),
         embedded: embedded_runtime_connection_summary(api),
-        remotes: remote_runtime_connection_summaries(api, local_config, false),
+        remotes: remote_runtime_connection_summaries(api, runtime_config, false),
         diagnostics: Vec::new(),
     }
 }
 
 fn runtime_connection_mutation_response(
     api: &WorkspaceApi,
-    local_config: &WorkspaceBackendConfigFile,
+    runtime_config: &BackendRuntimesConfigFile,
     diagnostics: Vec<RuntimeDiagnostic>,
 ) -> RuntimeConnectionMutationResponse {
     RuntimeConnectionMutationResponse {
         workspace_id: api.config.workspace_id.clone(),
         restart_required: false,
-        remotes: remote_runtime_connection_summaries(api, local_config, false),
+        remotes: remote_runtime_connection_summaries(api, runtime_config, false),
         diagnostics,
     }
 }
@@ -4576,14 +4671,14 @@ fn embedded_runtime_connection_summary(api: &WorkspaceApi) -> RuntimeConnectionS
 
 fn remote_runtime_connection_summaries(
     api: &WorkspaceApi,
-    local_config: &WorkspaceBackendConfigFile,
+    runtime_config: &BackendRuntimesConfigFile,
     restart_required: bool,
 ) -> Vec<RemoteRuntimeConnectionSummary> {
     let live_runtimes = api
         .runtime
         .list_runtimes(api.config.max_records.min(200))
         .items;
-    local_config
+    runtime_config
         .runtimes
         .remote
         .iter()
@@ -6191,6 +6286,7 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::WorkspaceBackendRuntimesConfig;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use futures::{SinkExt, StreamExt};
@@ -6750,6 +6846,7 @@ mod tests {
         let store_root = workspace_root.join(".test-embedded-runtime-store");
         let mut config = ServerConfig::local_dev(workspace_root.clone(), test_identity())
             .with_embedded_runtime_store_root(store_root);
+        config.runtime_config_path = Some(workspace_root.join(".test-config/runtimes.toml"));
         config.repositories = vec![ConfiguredRepository {
             id: TEST_REPOSITORY_ID.to_string(),
             provider: "git".to_string(),
@@ -6796,7 +6893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_backend_endpoint_uses_workspace_settings_backend_root() {
+    async fn ticket_backend_endpoint_uses_workspace_sqlite_backend() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".yoi")).unwrap();
         fs::write(
@@ -6809,7 +6906,7 @@ mod tests {
         let api = test_api(dir.path()).await;
 
         let Json(response) = scoped_ticket_backend_operation(
-            State(api),
+            State(api.clone()),
             AxumPath(ScopedWorkspacePath {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
             }),
@@ -6826,12 +6923,13 @@ mod tests {
             } => ticket_ref,
             other => panic!("unexpected ticket backend response: {other:?}"),
         };
+        assert!(api.config.database_path.is_file());
         assert!(
-            dir.path()
+            !dir.path()
                 .join("server-tickets")
                 .join(&ticket_ref.id)
                 .join("item.md")
-                .is_file()
+                .exists()
         );
         assert!(
             !dir.path()
@@ -7423,7 +7521,10 @@ mod tests {
         let projected = serde_json::to_string(&added).unwrap();
         assert!(!projected.contains("runtime.example.invalid"));
 
-        let persisted = WorkspaceBackendConfigFile::load_for_workspace(dir.path()).unwrap();
+        let persisted = BackendRuntimesConfigFile::load_from_path(
+            dir.path().join(".test-config/runtimes.toml"),
+        )
+        .unwrap();
         assert_eq!(persisted.runtimes.remote.len(), 1);
         assert_eq!(persisted.runtimes.remote[0].id, "team-runtime");
         assert_eq!(
@@ -7462,7 +7563,10 @@ mod tests {
                 .iter()
                 .any(|runtime| runtime["runtime_id"] == "team-runtime")
         );
-        let persisted = WorkspaceBackendConfigFile::load_for_workspace(dir.path()).unwrap();
+        let persisted = BackendRuntimesConfigFile::load_from_path(
+            dir.path().join(".test-config/runtimes.toml"),
+        )
+        .unwrap();
         assert!(persisted.runtimes.remote.is_empty());
     }
 
@@ -7524,7 +7628,10 @@ mod tests {
                 .iter()
                 .any(|diagnostic| { diagnostic["code"] == "remote_runtime_delete_blocked" })
         );
-        let persisted = WorkspaceBackendConfigFile::load_for_workspace(dir.path()).unwrap();
+        let persisted = BackendRuntimesConfigFile::load_from_path(
+            dir.path().join(".test-config/runtimes.toml"),
+        )
+        .unwrap();
         assert_eq!(persisted.runtimes.remote.len(), 1);
     }
 
@@ -7545,8 +7652,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let endpoint = format!("http://{runtime_addr}");
-        WorkspaceBackendConfigFile {
-            runtimes: crate::config::WorkspaceBackendRuntimesConfig {
+        BackendRuntimesConfigFile {
+            runtimes: WorkspaceBackendRuntimesConfig {
                 remote: vec![RemoteRuntimeConfigFile {
                     id: "probe-runtime".to_string(),
                     endpoint: endpoint.clone(),
@@ -7554,9 +7661,8 @@ mod tests {
                     token_ref: None,
                 }],
             },
-            ..WorkspaceBackendConfigFile::default()
         }
-        .write_for_workspace(dir.path())
+        .write_to_path(dir.path().join(".test-config/runtimes.toml"))
         .unwrap();
         let app = test_app(dir.path()).await;
 
@@ -7610,8 +7716,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let endpoint = format!("http://{runtime_addr}");
-        WorkspaceBackendConfigFile {
-            runtimes: crate::config::WorkspaceBackendRuntimesConfig {
+        BackendRuntimesConfigFile {
+            runtimes: WorkspaceBackendRuntimesConfig {
                 remote: vec![RemoteRuntimeConfigFile {
                     id: "control-only-runtime".to_string(),
                     display_name: Some("Control-only Runtime".to_string()),
@@ -7619,9 +7725,8 @@ mod tests {
                     token_ref: None,
                 }],
             },
-            ..WorkspaceBackendConfigFile::default()
         }
-        .write_for_workspace(dir.path())
+        .write_to_path(dir.path().join(".test-config/runtimes.toml"))
         .unwrap();
         let app = test_app(dir.path()).await;
 
@@ -7963,7 +8068,7 @@ mod tests {
         assert_eq!(repositories["items"][0]["kind"], "git");
         assert_eq!(
             repositories["items"][0]["record_authority"],
-            "workspace-backend-config"
+            "workspace-control-plane"
         );
         assert!(
             repositories

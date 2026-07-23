@@ -209,7 +209,7 @@ impl RepositoryRegistryReader {
             kind: repository.provider.clone(),
             provider: repository.provider.clone(),
             default_selector: repository.default_selector.clone(),
-            record_authority: "workspace-backend-config".to_string(),
+            record_authority: "workspace-control-plane".to_string(),
             git,
             diagnostics,
         }

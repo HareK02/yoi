@@ -449,8 +449,8 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
         }
     };
     // Initialize persistent store. `paths::sessions_dir()` only
-    // returns None when none of YOI_HOME / YOI_DATA_DIR /
-    // HOME is set — surface that as a hard error to match the
+    // returns None when none of YOI_DATA_DIR / YOI_HOME /
+    // XDG_DATA_HOME / HOME is set — surface that as a hard error to match the
     // runtime-dir resolution below, rather than silently writing to a
     // relative path under cwd.
     let store_dir = match cli.store.clone() {
@@ -460,7 +460,7 @@ async fn run_cli_inner(cli: Cli) -> ExitCode {
             None => {
                 eprintln!(
                     "error: could not resolve sessions directory \
-                     (set --store, YOI_HOME, YOI_DATA_DIR, or HOME)"
+                     (set --store, YOI_DATA_DIR, YOI_HOME, XDG_DATA_HOME, or HOME)"
                 );
                 return ExitCode::FAILURE;
             }
