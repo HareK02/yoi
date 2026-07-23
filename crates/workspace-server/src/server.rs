@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, SET_COOKIE};
+use axum::http::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION, ORIGIN, SET_COOKIE};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -2615,10 +2615,12 @@ async fn post_auth_bootstrap_user(
 
 async fn post_passkey_registration_options(
     State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
     Json(request): Json<PasskeyRegistrationOptionsRequest>,
 ) -> ApiResult<Json<PasskeyRegistrationOptionsResponse>> {
     let user = ensure_user_account(&api, &request.handle, request.display_name.as_deref())?;
-    let webauthn = webauthn(&api.config)?;
+    let auth = auth_config_for_origin(&api.config, request_origin(&headers).as_deref())?;
+    let webauthn = webauthn_for_auth(&auth)?;
     let exclude_credentials = passkeys_for_user(&api, &user.user_id)?
         .into_iter()
         .map(|passkey| passkey.cred_id().clone())
@@ -2633,7 +2635,6 @@ async fn post_passkey_registration_options(
         )
         .map_err(|error| auth_error("webauthn_registration_options_failed", &error.to_string()))?;
     let challenge_id = new_id("webauthn-registration");
-    let auth = auth_public_config(&api.config);
     api.store.put_auth_challenge(&AuthChallengeRecord {
         challenge_id: challenge_id.clone(),
         ceremony: "passkey_registration".to_string(),
@@ -2680,7 +2681,7 @@ async fn post_passkey_registration_complete(
         )
         .into());
     }
-    let user_id = challenge.user_id.ok_or_else(|| {
+    let user_id = challenge.user_id.clone().ok_or_else(|| {
         auth_error(
             "invalid_passkey_challenge",
             "passkey registration challenge is not bound to a user",
@@ -2692,7 +2693,7 @@ async fn post_passkey_registration_complete(
             "passkey registration user does not exist",
         )
     })?;
-    let state_json = challenge.state_json.ok_or_else(|| {
+    let state_json = challenge.state_json.clone().ok_or_else(|| {
         auth_error(
             "missing_webauthn_state",
             "passkey registration state was not persisted",
@@ -2700,7 +2701,7 @@ async fn post_passkey_registration_complete(
     })?;
     let state: PasskeyRegistration = serde_json::from_str(&state_json)
         .map_err(|error| auth_error("webauthn_state_deserialize_failed", &error.to_string()))?;
-    let webauthn = webauthn(&api.config)?;
+    let webauthn = webauthn_for_challenge(&api.config, &challenge)?;
     let passkey = webauthn
         .finish_passkey_registration(&request.credential, &state)
         .map_err(|error| {
@@ -2729,6 +2730,7 @@ async fn post_passkey_registration_complete(
 
 async fn post_passkey_login_options(
     State(api): State<WorkspaceApi>,
+    headers: HeaderMap,
     Json(request): Json<PasskeyLoginOptionsRequest>,
 ) -> ApiResult<Json<PasskeyLoginOptionsResponse>> {
     let user = match request.handle.as_deref() {
@@ -2744,12 +2746,12 @@ async fn post_passkey_login_options(
         )
         .into());
     }
-    let webauthn = webauthn(&api.config)?;
+    let auth = auth_config_for_origin(&api.config, request_origin(&headers).as_deref())?;
+    let webauthn = webauthn_for_auth(&auth)?;
     let (public_key, state) = webauthn
         .start_passkey_authentication(&passkeys)
         .map_err(|error| auth_error("webauthn_login_options_failed", &error.to_string()))?;
     let challenge_id = new_id("webauthn-login");
-    let auth = auth_public_config(&api.config);
     api.store.put_auth_challenge(&AuthChallengeRecord {
         challenge_id: challenge_id.clone(),
         ceremony: "passkey_login".to_string(),
@@ -2796,7 +2798,7 @@ async fn post_passkey_login_complete(
         )
         .into());
     }
-    let user_id = challenge.user_id.ok_or_else(|| {
+    let user_id = challenge.user_id.clone().ok_or_else(|| {
         auth_error(
             "invalid_passkey_challenge",
             "passkey login challenge is not bound to a user",
@@ -2806,7 +2808,7 @@ async fn post_passkey_login_complete(
         .store
         .get_user(&user_id)?
         .ok_or_else(|| auth_error("unknown_auth_user", "passkey user does not exist"))?;
-    let state_json = challenge.state_json.ok_or_else(|| {
+    let state_json = challenge.state_json.clone().ok_or_else(|| {
         auth_error(
             "missing_webauthn_state",
             "passkey login state was not persisted",
@@ -2814,7 +2816,7 @@ async fn post_passkey_login_complete(
     })?;
     let state: PasskeyAuthentication = serde_json::from_str(&state_json)
         .map_err(|error| auth_error("webauthn_state_deserialize_failed", &error.to_string()))?;
-    let webauthn = webauthn(&api.config)?;
+    let webauthn = webauthn_for_challenge(&api.config, &challenge)?;
     let auth_result = webauthn
         .finish_passkey_authentication(&request.credential, &state)
         .map_err(|error| auth_error("webauthn_login_verification_failed", &error.to_string()))?;
@@ -3060,8 +3062,48 @@ async fn post_auth_logout(
         .into_response())
 }
 
-fn webauthn(config: &ServerConfig) -> ApiResult<Webauthn> {
-    let auth = auth_public_config(config);
+fn request_origin(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn auth_config_for_origin(
+    config: &ServerConfig,
+    request_origin: Option<&str>,
+) -> ApiResult<AuthPublicConfig> {
+    let mut auth = auth_public_config(config);
+    let Some(request_origin) = request_origin else {
+        return Ok(auth);
+    };
+    let origin = Url::parse(request_origin)
+        .map_err(|error| auth_error("invalid_webauthn_request_origin", &error.to_string()))?;
+    let host = origin.host_str().ok_or_else(|| {
+        auth_error(
+            "invalid_webauthn_request_origin",
+            "request Origin header does not contain a host",
+        )
+    })?;
+    if host == auth.rp_id {
+        auth.origin = request_origin.to_string();
+    }
+    Ok(auth)
+}
+
+fn webauthn_for_challenge(
+    config: &ServerConfig,
+    challenge: &AuthChallengeRecord,
+) -> ApiResult<Webauthn> {
+    let mut auth = auth_public_config(config);
+    auth.rp_id = challenge.rp_id.clone();
+    auth.origin = challenge.origin.clone();
+    webauthn_for_auth(&auth)
+}
+
+fn webauthn_for_auth(auth: &AuthPublicConfig) -> ApiResult<Webauthn> {
     let origin = Url::parse(&auth.origin)
         .map_err(|error| auth_error("invalid_webauthn_origin", &error.to_string()))?;
     WebauthnBuilder::new(&auth.rp_id, &origin)
