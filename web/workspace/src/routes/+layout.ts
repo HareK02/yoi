@@ -8,12 +8,12 @@ export const prerender = false;
 
 export const load: LayoutLoad = async ({ fetch, params, url }) => {
   if (params.workspaceId) {
-    return {};
+    return { workspaceScoped: true };
   }
 
   const publicRoutes = new Set(["/account", "/login/device"]);
   if (publicRoutes.has(url.pathname)) {
-    return {};
+    return { workspaceScoped: false };
   }
 
   const workspace = await loadJson<WorkspaceResponse>(fetch, "/api/workspace");
@@ -21,5 +21,5 @@ export const load: LayoutLoad = async ({ fetch, params, url }) => {
     const scopedPath = workspaceRoute(workspace.data.workspace_id);
     throw redirect(307, `${scopedPath}${url.search}`);
   }
-  return {};
+  return { workspaceScoped: false };
 };

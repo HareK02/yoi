@@ -390,6 +390,9 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
   const rootLayoutLoad = await Deno.readTextFile(
     new URL("./../../../routes/+layout.ts", import.meta.url),
   );
+  const globalSidebar = await Deno.readTextFile(
+    new URL("../sidebar/GlobalSidebar.svelte", import.meta.url),
+  );
   const workspaceLayout = await Deno.readTextFile(
     new URL("./../../../routes/w/[workspaceId]/+layout.svelte", import.meta.url),
   );
@@ -424,7 +427,9 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
     "Auth model should stay on Backend auth APIs rather than workspace authorization APIs",
   );
   assert(
-    rootLayout.includes("workspace-topbar") &&
+    rootLayout.includes("GlobalSidebar") &&
+      rootLayout.includes("global-sidebar-layout") &&
+      rootLayout.includes("workspace-topbar") &&
       rootLayout.includes("topbar-icon-button") &&
       rootLayout.includes('href="/account"') &&
       rootLayout.includes("Open Account") &&
@@ -432,6 +437,14 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
       !sidebar.includes("accountHref") &&
       !sidebar.includes("Open Account"),
     "Account navigation should live in the global layout header, not the workspace sidebar",
+  );
+  assert(
+    globalSidebar.includes("Global") &&
+      globalSidebar.includes("/account") &&
+      globalSidebar.includes("/login/device") &&
+      !globalSidebar.includes("Tickets") &&
+      !globalSidebar.includes("Repositories"),
+    "Root default sidebar should contain only global navigation, not workspace-scoped sections",
   );
   assert(
     workspaceLayout.includes("WorkspaceSidebar") &&

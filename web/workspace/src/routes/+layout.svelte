@@ -1,9 +1,11 @@
 <script lang="ts">
+  import { page } from '$app/state';
   import WorkspaceAlerts from '$lib/workspace/alerts/WorkspaceAlerts.svelte';
+  import GlobalSidebar from '$lib/workspace/sidebar/GlobalSidebar.svelte';
   import '../app.css';
   import type { LayoutProps } from './$types';
 
-  let { children }: LayoutProps = $props();
+  let { data, children }: LayoutProps = $props();
 </script>
 
 <WorkspaceAlerts />
@@ -19,7 +21,12 @@
       </a>
     </nav>
   </header>
-  <div class="app-shell">
-    {@render children()}
+  <div class:global-sidebar-layout={!data.workspaceScoped} class="app-shell">
+    {#if !data.workspaceScoped}
+      <GlobalSidebar currentPath={page.url.pathname} />
+    {/if}
+    <div class="app-content">
+      {@render children()}
+    </div>
   </div>
 </div>
