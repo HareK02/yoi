@@ -124,7 +124,7 @@
 @layer layout {
 	.workspace-layout {
 		display: grid;
-		grid-template-columns: minmax(220px, 280px) minmax(0, 1fr);
+		grid-template-columns: auto minmax(0, 1fr);
 		grid-template-rows: auto minmax(0, 1fr);
 		width: 100vw;
 		height: 100dvh;
@@ -132,9 +132,6 @@
 		padding: 0;
 		overflow: hidden;
 		min-width: 0;
-	}
-	.workspace-layout.sidebar-collapsed {
-		grid-template-columns: max-content minmax(0, 1fr);
 	}
 	.workspace-topbar {
 		grid-column: 2;
@@ -206,6 +203,7 @@
 		.global-sidebar {
 			grid-column: 1;
 			grid-row: 1;
+			width: auto;
 			border-right: 0;
 			border-bottom: 1px solid var(--line);
 		}
@@ -217,12 +215,10 @@
 			min-height: 100dvh;
 			overflow: visible;
 		}
-		.workspace-layout.sidebar-collapsed {
-			grid-template-columns: 1fr;
-		}
 		.workspace-sidebar {
 			grid-column: 1;
 			grid-row: 1;
+			width: auto;
 			border-right: 0;
 			border-bottom: 1px solid var(--line);
 		}
@@ -243,6 +239,7 @@
 	.global-sidebar {
 		grid-column: 1;
 		grid-row: 1 / 3;
+		width: clamp(220px, 20vw, 280px);
 		min-width: 0;
 		min-height: 0;
 		overflow-y: auto;
@@ -256,6 +253,7 @@
 	.workspace-sidebar {
 		grid-column: 1;
 		grid-row: 1 / 3;
+		width: clamp(220px, 20vw, 280px);
 		align-self: stretch;
 		min-width: 0;
 		min-height: 0;
@@ -263,6 +261,10 @@
 		padding: var(--space-4) var(--space-3);
 		border-right: 1px solid var(--line);
 	}
+	.workspace-sidebar.collapsed {
+		width: max-content;
+	}
+
 	.sidebar-header {
 		display: grid;
 		gap: var(--space-2);

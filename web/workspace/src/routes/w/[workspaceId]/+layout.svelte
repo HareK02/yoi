@@ -2,20 +2,14 @@
   import { page } from '$app/state';
   import SidebarOverride from '$lib/workspace/sidebar/SidebarOverride.svelte';
   import WorkspaceSidebar from '$lib/workspace/sidebar/WorkspaceSidebar.svelte';
-  import { getSidebarController } from '$lib/workspace/sidebar/context';
   import type { LayoutProps } from './$types';
 
   let { data, children }: LayoutProps = $props();
   let sidebarCollapsed = $state(false);
-  const sidebarController = getSidebarController();
 
   function toggleSidebar() {
     sidebarCollapsed = !sidebarCollapsed;
   }
-
-  $effect(() => {
-    sidebarController.setCollapsed(sidebarCollapsed);
-  });
 </script>
 
 {#snippet workspaceSidebar()}

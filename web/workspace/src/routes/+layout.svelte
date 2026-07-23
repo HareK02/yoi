@@ -9,7 +9,6 @@
 
   let { children }: LayoutProps = $props();
   let sidebar = $state<SidebarSnippet | null>(null);
-  let sidebarCollapsed = $state(false);
 
   setContext(SIDEBAR_CONTEXT, {
     setSidebar(snippet: SidebarSnippet) {
@@ -17,17 +16,13 @@
     },
     clearSidebar(snippet: SidebarSnippet) {
       if (sidebar === snippet) sidebar = null;
-      sidebarCollapsed = false;
-    },
-    setCollapsed(collapsed: boolean) {
-      sidebarCollapsed = collapsed;
     },
   });
 </script>
 
 <WorkspaceAlerts />
 
-<div class:sidebar-collapsed={sidebarCollapsed} class="workspace-layout">
+<div class="workspace-layout">
   {#if sidebar}
     {@render sidebar()}
   {:else}
