@@ -13,8 +13,6 @@
     repositories?: RepositoryListResponse | null;
     repositoriesError?: string | null;
     currentPath?: string;
-    folded?: boolean;
-    onToggleFold?: () => void;
   };
 
   let {
@@ -22,9 +20,7 @@
     workspaceError = null,
     repositories = null,
     repositoriesError = null,
-    currentPath = '/',
-    folded = false,
-    onToggleFold
+    currentPath = '/'
   }: Props = $props();
 
   let workspaceId = $derived(workspace?.workspace_id ?? '');
@@ -32,35 +28,8 @@
   let settingsHref = $derived(workspaceId ? workspaceRoute(workspaceId, '/settings') : '/settings');
 </script>
 
-<aside
-  class:folded
-  class="workspace-sidebar"
-  aria-label="Workspace navigation"
->
+<div class="workspace-sidebar">
   <header class="sidebar-header">
-    <div class="sidebar-control-row">
-      <button
-        class="sidebar-fold-button"
-        type="button"
-        aria-label={folded ? 'Unfold sidebar' : 'Fold sidebar'}
-        aria-expanded={!folded}
-        title={folded ? 'Unfold sidebar' : 'Fold sidebar'}
-        onclick={onToggleFold}
-      >
-        {#if folded}
-          <svg class="sidebar-icon" aria-hidden="true" viewBox="0 0 24 24">
-            <path d="m6 17 5-5-5-5" />
-            <path d="m13 17 5-5-5-5" />
-          </svg>
-        {:else}
-          <svg class="sidebar-icon" aria-hidden="true" viewBox="0 0 24 24">
-            <path d="m11 17-5-5 5-5" />
-            <path d="m18 17-5-5 5-5" />
-          </svg>
-        {/if}
-      </button>
-    </div>
-
     <div class="sidebar-title-row">
       <div class="workspace-label">
         {#if workspace}
@@ -106,12 +75,10 @@
     </div>
   </header>
 
-  {#if !folded}
-    <nav class="sidebar-sections" aria-label="Workspace sections">
-      <RepositoriesNavSection {repositories} {repositoriesError} {currentPath} {workspaceId} />
-      <ObjectivesNavSection {currentPath} {workspaceId} />
-      <TicketsNavSection {currentPath} {workspaceId} />
-      <WorkersNavSection {currentPath} {workspaceId} />
-    </nav>
-  {/if}
-</aside>
+  <nav class="sidebar-sections" aria-label="Workspace sections">
+    <RepositoriesNavSection {repositories} {repositoriesError} {currentPath} {workspaceId} />
+    <ObjectivesNavSection {currentPath} {workspaceId} />
+    <TicketsNavSection {currentPath} {workspaceId} />
+    <WorkersNavSection {currentPath} {workspaceId} />
+  </nav>
+</div>

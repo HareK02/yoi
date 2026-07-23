@@ -3,6 +3,7 @@
   import { setContext } from 'svelte';
   import WorkspaceAlerts from '$lib/workspace/alerts/WorkspaceAlerts.svelte';
   import GlobalSidebar from '$lib/workspace/sidebar/GlobalSidebar.svelte';
+  import SidebarFrame from '$lib/workspace/sidebar/SidebarFrame.svelte';
   import { SIDEBAR_CONTEXT, type SidebarSnippet } from '$lib/workspace/sidebar/context';
   import '../app.css';
   import type { LayoutProps } from './$types';
@@ -23,11 +24,13 @@
 <WorkspaceAlerts />
 
 <div class="workspace-layout">
-  {#if sidebar}
-    {@render sidebar()}
-  {:else}
-    <GlobalSidebar currentPath={page.url.pathname} />
-  {/if}
+  <SidebarFrame>
+    {#if sidebar}
+      {@render sidebar()}
+    {:else}
+      <GlobalSidebar currentPath={page.url.pathname} />
+    {/if}
+  </SidebarFrame>
   <header class="workspace-topbar">
     <nav class="workspace-topbar-actions" aria-label="Global navigation">
       <a class="topbar-icon-button" href="/account" aria-label="Open Account" title="Account">

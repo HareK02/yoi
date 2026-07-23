@@ -393,6 +393,12 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
   const globalSidebar = await Deno.readTextFile(
     new URL("../sidebar/GlobalSidebar.svelte", import.meta.url),
   );
+  const sidebarFrame = await Deno.readTextFile(
+    new URL("../sidebar/SidebarFrame.svelte", import.meta.url),
+  );
+  const sidebarCss = await Deno.readTextFile(
+    new URL("../sidebar/sidebar.css", import.meta.url),
+  );
   const workspaceLayout = await Deno.readTextFile(
     new URL("./../../../routes/w/[workspaceId]/+layout.svelte", import.meta.url),
   );
@@ -432,6 +438,7 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
   assert(
     rootLayout.includes("SIDEBAR_CONTEXT") &&
       rootLayout.includes("GlobalSidebar") &&
+      rootLayout.includes("SidebarFrame") &&
       rootLayout.includes("{@render sidebar()}") &&
       !rootLayout.includes("WorkspaceSidebar") &&
       rootLayout.includes("workspace-topbar") &&
@@ -459,14 +466,23 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
     "Workspace layout should load workspace data and register a WorkspaceSidebar snippet",
   );
   assert(
-    workspaceLayout.includes("sidebarFolded") &&
-      workspaceLayout.includes("onToggleFold={toggleSidebarFold}") &&
-      sidebar.includes("folded?: boolean") &&
-      sidebar.includes("onToggleFold?: () => void") &&
-      sidebar.includes("sidebar-fold-button") &&
-      sidebar.includes("Fold sidebar") &&
-      sidebar.includes("Unfold sidebar"),
-    "Workspace sidebar should keep a visible fold button with fold/folded naming",
+    sidebarFrame.includes("let folded = $state(false)") &&
+      sidebarFrame.includes("sidebar-fold-button") &&
+      sidebarFrame.includes("Fold sidebar") &&
+      sidebarFrame.includes("Unfold sidebar") &&
+      !workspaceLayout.includes("sidebarFolded") &&
+      !workspaceLayout.includes("onToggleFold") &&
+      !sidebar.includes("folded?: boolean") &&
+      !sidebar.includes("onToggleFold?: () => void") &&
+      !sidebar.includes("sidebar-fold-button"),
+    "Sidebar fold control should belong to SidebarFrame, not WorkspaceSidebar",
+  );
+  assert(
+    sidebarCss.startsWith("@layer reset, tokens, base, layout, components;") &&
+      sidebarCss.includes(".sidebar-frame") &&
+      sidebarCss.includes(".sidebar-link") &&
+      sidebarCss.includes("text-decoration: none"),
+    "Sidebar styles should define their layer order before component rules so base link styles do not win by import order",
   );
   assert(
     sidebarOverride.includes("controller.setSidebar(sidebar)") &&

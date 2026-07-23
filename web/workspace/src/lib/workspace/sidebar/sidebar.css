@@ -1,5 +1,7 @@
+@layer reset, tokens, base, layout, components;
+
 @layer components {
-	.global-sidebar {
+	.sidebar-frame {
 		grid-column: 1;
 		grid-row: 1 / 3;
 		width: clamp(220px, 20vw, 280px);
@@ -9,23 +11,21 @@
 		padding: var(--space-4) var(--space-3);
 		border-right: 1px solid var(--line);
 	}
-	.global-sidebar-section {
+	.sidebar-frame.folded {
+		width: max-content;
+		overflow: hidden;
+		padding-inline: var(--space-2);
+	}
+	.sidebar-frame-content,
+	.global-sidebar,
+	.workspace-sidebar {
+		min-width: 0;
+	}
+	.global-sidebar,
+	.global-sidebar-section,
+	.workspace-sidebar {
 		display: grid;
 		gap: var(--space-2);
-	}
-	.workspace-sidebar {
-		grid-column: 1;
-		grid-row: 1 / 3;
-		width: clamp(220px, 20vw, 280px);
-		align-self: stretch;
-		min-width: 0;
-		min-height: 0;
-		overflow-y: auto;
-		padding: var(--space-4) var(--space-3);
-		border-right: 1px solid var(--line);
-	}
-	.workspace-sidebar.folded {
-		width: max-content;
 	}
 	.sidebar-header {
 		display: grid;
@@ -38,6 +38,13 @@
 		display: flex;
 		justify-content: flex-end;
 		gap: var(--space-1);
+	}
+	.sidebar-control-row {
+		margin-bottom: var(--space-2);
+	}
+	.sidebar-frame.folded .sidebar-control-row {
+		justify-content: center;
+		margin-bottom: 0;
 	}
 	.sidebar-title-row {
 		display: flex;
@@ -84,13 +91,13 @@
 		color: var(--text-muted);
 		text-decoration: none;
 	}
-		.sidebar-fold-button {
-			border: 1px solid var(--line);
-			background: var(--bg-raised);
-			box-shadow: var(--shadow-soft);
-			color: var(--text-strong);
-			cursor: pointer;
-		}
+	.sidebar-fold-button {
+		border: 1px solid var(--line);
+		background: var(--bg-raised);
+		box-shadow: var(--shadow-soft);
+		color: var(--text-strong);
+		cursor: pointer;
+	}
 	.sidebar-icon {
 		width: 18px;
 		height: 18px;
@@ -106,25 +113,6 @@
 	.sidebar-fold-button:focus-visible {
 		background: var(--interactive-hover);
 		color: var(--text-muted);
-	}
-	.workspace-sidebar.folded {
-		overflow: hidden;
-		padding-inline: var(--space-2);
-	}
-	.workspace-sidebar.folded .sidebar-header {
-		margin-bottom: 0;
-	}
-	.workspace-sidebar.folded .sidebar-control-row,
-	.workspace-sidebar.folded .sidebar-title-row,
-	.workspace-sidebar.folded .sidebar-actions-row {
-		justify-content: center;
-	}
-	.workspace-sidebar.folded .sidebar-actions-row {
-		align-items: center;
-		flex-direction: column;
-	}
-	.workspace-sidebar.folded .workspace-label {
-		display: none;
 	}
 	.sidebar-sections {
 		display: grid;
@@ -249,8 +237,8 @@
 	}
 
 	@media (max-width: 760px) {
-		.global-sidebar,
-		.workspace-sidebar {
+		.sidebar-frame,
+		.sidebar-frame.folded {
 			grid-column: 1;
 			grid-row: 1;
 			width: auto;

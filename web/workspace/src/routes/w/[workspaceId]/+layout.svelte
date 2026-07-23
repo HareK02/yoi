@@ -5,11 +5,6 @@
   import type { LayoutProps } from './$types';
 
   let { data, children }: LayoutProps = $props();
-  let sidebarFolded = $state(false);
-
-  function toggleSidebarFold() {
-    sidebarFolded = !sidebarFolded;
-  }
 </script>
 
 {#snippet workspaceSidebar()}
@@ -19,8 +14,6 @@
     repositories={data.repositories ?? null}
     repositoriesError={data.repositoriesError ?? null}
     currentPath={page.url.pathname}
-    folded={sidebarFolded}
-    onToggleFold={toggleSidebarFold}
   />
 {/snippet}
 

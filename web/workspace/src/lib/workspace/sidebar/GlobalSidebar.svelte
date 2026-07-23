@@ -13,7 +13,7 @@
   ];
 </script>
 
-<aside class="global-sidebar" aria-label="Global navigation">
+<div class="global-sidebar" aria-label="Global navigation">
   <div class="global-sidebar-section">
     <p class="sidebar-section-label">Global</p>
     <nav class="sidebar-list" aria-label="Global pages">
@@ -29,4 +29,4 @@
       {/each}
     </nav>
   </div>
-</aside>
+</div>
