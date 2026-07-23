@@ -84,11 +84,13 @@
 		color: var(--text-muted);
 		text-decoration: none;
 	}
-	.sidebar-fold-button {
-		border: 0;
-		background: transparent;
-		cursor: pointer;
-	}
+		.sidebar-fold-button {
+			border: 1px solid var(--line);
+			background: var(--bg-raised);
+			box-shadow: var(--shadow-soft);
+			color: var(--text-strong);
+			cursor: pointer;
+		}
 	.sidebar-icon {
 		width: 18px;
 		height: 18px;
