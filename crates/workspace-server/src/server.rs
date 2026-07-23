@@ -2669,7 +2669,7 @@ async fn post_passkey_registration_options(
 async fn post_passkey_registration_complete(
     State(api): State<WorkspaceApi>,
     Json(request): Json<PasskeyRegistrationCompleteRequest>,
-) -> ApiResult<Json<AuthUserResponse>> {
+) -> ApiResult<Response> {
     let challenge = api
         .store
         .consume_auth_challenge_by_id(
@@ -2732,9 +2732,7 @@ async fn post_passkey_registration_complete(
             created_at: crate::auth::now_rfc3339(),
             last_used_at: None,
         })?;
-    Ok(Json(AuthUserResponse {
-        user: user_response(user),
-    }))
+    issue_browser_session_response(&api, user)
 }
 
 async fn post_passkey_login_options(
@@ -2869,6 +2867,10 @@ async fn post_passkey_login_complete(
             created_at: stored.created_at,
             last_used_at: Some(crate::auth::now_rfc3339()),
         })?;
+    issue_browser_session_response(&api, user)
+}
+
+fn issue_browser_session_response(api: &WorkspaceApi, user: UserRecord) -> ApiResult<Response> {
     let session_token = mint_secret("yoi_sess");
     api.store.create_browser_session(&BrowserSessionRecord {
         session_id: new_id("session"),
@@ -2893,7 +2895,7 @@ async fn post_passkey_login_complete(
     );
     Ok((
         headers,
-        Json(PasskeyLoginCompleteResponse {
+        Json(AuthUserResponse {
             user: user_response(user),
         }),
     )

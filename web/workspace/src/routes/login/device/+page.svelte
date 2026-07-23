@@ -22,7 +22,7 @@
     try {
       const whoami = await loadWhoami();
       actor = whoami.actor;
-      if (actor?.user.handle) handle = actor.user.handle;
+      if (actor?.handle) handle = actor.handle;
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
     } finally {
@@ -85,7 +85,7 @@
     {#if loading}
       <p class="muted">Loading session…</p>
     {:else if actor}
-      <p>Logged in as <strong>{actor.user.display_name}</strong> <span class="muted">@{actor.user.handle}</span>.</p>
+      <p>Logged in as <strong>{actor.display_name}</strong> <span class="muted">@{actor.handle}</span>.</p>
     {:else}
       <p class="muted">You need to log in with a passkey before approving a device login.</p>
       <form class="settings-form" onsubmit={(event) => { event.preventDefault(); void login(); }}>

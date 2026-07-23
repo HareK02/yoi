@@ -22,9 +22,9 @@
     try {
       const whoami = await loadWhoami();
       actor = whoami.actor;
-      if (actor?.user.handle) {
-        handle = actor.user.handle;
-        displayName = actor.user.display_name;
+      if (actor?.handle) {
+        handle = actor.handle;
+        displayName = actor.display_name;
       }
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
@@ -104,23 +104,23 @@
         <dl class="account-details">
           <div>
             <dt>Handle</dt>
-            <dd>{actor.user.handle}</dd>
+            <dd>{actor.handle}</dd>
           </div>
           <div>
             <dt>Display name</dt>
-            <dd>{actor.user.display_name}</dd>
+            <dd>{actor.display_name}</dd>
           </div>
           <div>
             <dt>User ID</dt>
-            <dd><code>{actor.user.user_id}</code></dd>
+            <dd><code>{actor.user_id}</code></dd>
           </div>
           <div>
             <dt>Account ID</dt>
-            <dd><code>{actor.user.account_id}</code></dd>
+            <dd><code>{actor.account_id}</code></dd>
           </div>
           <div>
             <dt>Auth kind</dt>
-            <dd>{actor.auth_kind}</dd>
+            <dd>{actor.auth_method}</dd>
           </div>
         </dl>
         <div class="settings-action-row">

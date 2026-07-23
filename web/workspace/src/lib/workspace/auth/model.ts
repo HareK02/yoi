@@ -5,9 +5,8 @@ export type AuthenticatedUser = {
   display_name: string;
 };
 
-export type RequestActor = {
-  user: AuthenticatedUser;
-  auth_kind: string;
+export type RequestActor = AuthenticatedUser & {
+  auth_method: "browser_session" | "api_token" | string;
 };
 
 export type WhoamiResponse = {
