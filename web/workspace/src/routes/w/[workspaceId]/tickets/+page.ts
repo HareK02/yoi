@@ -5,7 +5,7 @@ import type { PageLoad } from "./$types";
 export const load = (async ({ fetch, params }) => {
   const tickets = await loadJson<TicketListResponse>(
     fetch,
-    workspaceApiPath(params.workspaceId, "/tickets"),
+    `${workspaceApiPath(params.workspaceId, "/tickets")}?limit=1000`,
   );
 
   return {

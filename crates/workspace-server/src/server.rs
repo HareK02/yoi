@@ -1395,9 +1395,10 @@ async fn scoped_delete_profile_source(
 async fn scoped_list_tickets(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Query(query): Query<TicketKanbanQuery>,
 ) -> ApiResult<Json<ListResponse<crate::records::TicketSummary>>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    list_tickets(State(api)).await
+    list_tickets(State(api), Query(query)).await
 }
 
 async fn scoped_get_ticket(
@@ -3406,8 +3407,10 @@ fn companion_console_extension_point(status: &CompanionStatusResponse) -> Extens
 
 async fn list_tickets(
     State(api): State<WorkspaceApi>,
+    Query(query): Query<TicketKanbanQuery>,
 ) -> ApiResult<Json<ListResponse<crate::records::TicketSummary>>> {
-    let limit = api.config.max_records.min(200);
+    let requested_limit = query.limit.unwrap_or(api.config.max_records);
+    let limit = requested_limit.min(1000);
     let ProjectRecordList {
         items,
         invalid_records,

@@ -90,10 +90,12 @@ Deno.test("workspace Tickets surface uses read-only Backend Ticket APIs", async 
     "Tickets sidebar section should link to the workspace Tickets surface",
   );
   assert(
-    ticketsLoad.includes('workspaceApiPath(params.workspaceId, "/tickets")') &&
-      ticketsPage.includes("This surface is read-only") &&
+    ticketsLoad.includes('`${workspaceApiPath(params.workspaceId, "/tickets")}?limit=1000`') &&
+      ticketsPage.includes("Notion-style filtering and sorting") &&
+      ticketsPage.includes("toggleSort('updated_at')") &&
+      ticketsPage.includes("bind:value={stateFilter}") &&
       ticketsPage.includes("workspaceRoute(data.workspaceId, `/tickets/${ticket.id}`)"),
-    "Tickets list should read the workspace-scoped Ticket API and link to Ticket details",
+    "Tickets list should read the workspace-scoped Ticket API and expose sortable/filterable table links",
   );
   assert(
     ticketDetailLoad.includes("`/tickets/${encodeURIComponent(ticketId)}`") &&
