@@ -1,26 +1,14 @@
 <script lang="ts">
-  import { page } from '$app/state';
   import WorkspaceAlerts from '$lib/workspace/alerts/WorkspaceAlerts.svelte';
-  import WorkspaceSidebar from '$lib/workspace/sidebar/WorkspaceSidebar.svelte';
   import '../app.css';
   import type { LayoutProps } from './$types';
 
-  let { data, children }: LayoutProps = $props();
-  let sidebarCollapsed = $state(false);
+  let { children }: LayoutProps = $props();
 </script>
 
 <WorkspaceAlerts />
 
-<div class:sidebar-collapsed={sidebarCollapsed} class="workspace-layout">
-  <WorkspaceSidebar
-    workspace={data.workspace}
-    workspaceError={data.workspaceError}
-    repositories={data.repositories}
-    repositoriesError={data.repositoriesError}
-    currentPath={page.url.pathname}
-    collapsed={sidebarCollapsed}
-    onToggleCollapsed={() => (sidebarCollapsed = !sidebarCollapsed)}
-  />
+<div class="app-layout">
   <header class="workspace-topbar">
     <nav class="workspace-topbar-actions" aria-label="Global navigation">
       <a class="topbar-icon-button" href="/account" aria-label="Open Account" title="Account">
@@ -31,7 +19,7 @@
       </a>
     </nav>
   </header>
-  <main class="shell">
+  <div class="app-shell">
     {@render children()}
-  </main>
+  </div>
 </div>
