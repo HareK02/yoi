@@ -393,6 +393,15 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
   const globalSidebar = await Deno.readTextFile(
     new URL("../sidebar/GlobalSidebar.svelte", import.meta.url),
   );
+  const workspaceLayout = await Deno.readTextFile(
+    new URL("./../../../routes/w/[workspaceId]/+layout.svelte", import.meta.url),
+  );
+  const workspaceLayoutLoad = await Deno.readTextFile(
+    new URL("./../../../routes/w/[workspaceId]/+layout.ts", import.meta.url),
+  );
+  const sidebarOverride = await Deno.readTextFile(
+    new URL("../sidebar/SidebarOverride.svelte", import.meta.url),
+  );
   const sidebar = await Deno.readTextFile(
     new URL("../sidebar/WorkspaceSidebar.svelte", import.meta.url),
   );
@@ -421,16 +430,17 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
     "Auth model should stay on Backend auth APIs rather than workspace authorization APIs",
   );
   assert(
-    rootLayout.includes("GlobalSidebar") &&
-      rootLayout.includes("WorkspaceSidebar") &&
-      rootLayout.includes("data.workspaceScoped") &&
+    rootLayout.includes("SIDEBAR_CONTEXT") &&
+      rootLayout.includes("GlobalSidebar") &&
+      rootLayout.includes("{@render sidebar()}") &&
+      !rootLayout.includes("WorkspaceSidebar") &&
       rootLayout.includes("workspace-topbar") &&
       rootLayout.includes("topbar-icon-button") &&
       rootLayout.includes('href="/account"') &&
       rootLayout.includes("Open Account") &&
       !sidebar.includes("accountHref") &&
       !sidebar.includes("Open Account"),
-    "Root layout chrome should choose GlobalSidebar or WorkspaceSidebar while account navigation stays in the header",
+    "Root layout chrome should render a registered sidebar snippet or default global sidebar while account navigation stays in the header",
   );
   assert(
     globalSidebar.includes("Global") &&
@@ -441,10 +451,17 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
     "Root default sidebar should contain only global navigation, not workspace-scoped sections",
   );
   assert(
-    rootLayoutLoad.includes("params.workspaceId") &&
-      rootLayoutLoad.includes("workspaceApiPath(workspaceId") &&
-      rootLayoutLoad.includes("workspaceScoped: true"),
-    "Root layout load should provide workspace-scoped sidebar data when a workspace route is active",
+    workspaceLayout.includes("{#snippet workspaceSidebar()}") &&
+      workspaceLayout.includes("WorkspaceSidebar") &&
+      workspaceLayout.includes("<SidebarOverride sidebar={workspaceSidebar} />") &&
+      workspaceLayoutLoad.includes("params.workspaceId") &&
+      workspaceLayoutLoad.includes("workspaceApiPath(workspaceId"),
+    "Workspace layout should load workspace data and register a WorkspaceSidebar snippet",
+  );
+  assert(
+    sidebarOverride.includes("controller.setSidebar(sidebar)") &&
+      sidebarOverride.includes("controller.clearSidebar(sidebar)"),
+    "SidebarOverride should register and clean up the child-provided sidebar snippet",
   );
   assert(
     rootLayoutLoad.includes('"/account"') && rootLayoutLoad.includes('"/login/device"'),

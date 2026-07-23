@@ -1,28 +1,35 @@
 <script lang="ts">
   import { page } from '$app/state';
+  import { setContext } from 'svelte';
   import WorkspaceAlerts from '$lib/workspace/alerts/WorkspaceAlerts.svelte';
   import GlobalSidebar from '$lib/workspace/sidebar/GlobalSidebar.svelte';
-  import WorkspaceSidebar from '$lib/workspace/sidebar/WorkspaceSidebar.svelte';
+  import { SIDEBAR_CONTEXT, type SidebarSnippet } from '$lib/workspace/sidebar/context';
   import '../app.css';
   import type { LayoutProps } from './$types';
 
-  let { data, children }: LayoutProps = $props();
+  let { children }: LayoutProps = $props();
+  let sidebar = $state<SidebarSnippet | null>(null);
   let sidebarCollapsed = $state(false);
+
+  setContext(SIDEBAR_CONTEXT, {
+    setSidebar(snippet: SidebarSnippet) {
+      sidebar = snippet;
+    },
+    clearSidebar(snippet: SidebarSnippet) {
+      if (sidebar === snippet) sidebar = null;
+      sidebarCollapsed = false;
+    },
+    setCollapsed(collapsed: boolean) {
+      sidebarCollapsed = collapsed;
+    },
+  });
 </script>
 
 <WorkspaceAlerts />
 
-<div class:sidebar-collapsed={data.workspaceScoped && sidebarCollapsed} class="workspace-layout">
-  {#if data.workspaceScoped}
-    <WorkspaceSidebar
-      workspace={data.workspace ?? null}
-      workspaceError={data.workspaceError ?? null}
-      repositories={data.repositories ?? null}
-      repositoriesError={data.repositoriesError ?? null}
-      currentPath={page.url.pathname}
-      collapsed={sidebarCollapsed}
-      onToggleCollapsed={() => (sidebarCollapsed = !sidebarCollapsed)}
-    />
+<div class:sidebar-collapsed={sidebarCollapsed} class="workspace-layout">
+  {#if sidebar}
+    {@render sidebar()}
   {:else}
     <GlobalSidebar currentPath={page.url.pathname} />
   {/if}
