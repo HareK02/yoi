@@ -37,20 +37,7 @@
   aria-label="Workspace navigation"
 >
   <header class="sidebar-header">
-    <div class="sidebar-title-row">
-      <div class="workspace-label">
-        {#if workspace}
-          <div class="workspace-name">{workspace.display_name}</div>
-        {:else}
-          <div class="workspace-name">Yoi workspace</div>
-          {#if workspaceError}
-            <p class="workspace-status error">Workspace summary unavailable.</p>
-          {:else}
-            <p class="workspace-status">Loading workspace…</p>
-          {/if}
-        {/if}
-      </div>
-
+    <div class="sidebar-control-row">
       <button
         class="sidebar-fold-button"
         type="button"
@@ -71,6 +58,21 @@
           </svg>
         {/if}
       </button>
+    </div>
+
+    <div class="sidebar-title-row">
+      <div class="workspace-label">
+        {#if workspace}
+          <div class="workspace-name">{workspace.display_name}</div>
+        {:else}
+          <div class="workspace-name">Yoi workspace</div>
+          {#if workspaceError}
+            <p class="workspace-status error">Workspace summary unavailable.</p>
+          {:else}
+            <p class="workspace-status">Loading workspace…</p>
+          {/if}
+        {/if}
+      </div>
     </div>
 
     <div class="sidebar-actions-row">

@@ -271,6 +271,12 @@
 		margin-bottom: var(--space-2);
 		min-width: 0;
 	}
+	.sidebar-control-row,
+	.sidebar-actions-row {
+		display: flex;
+		justify-content: flex-end;
+		gap: var(--space-1);
+	}
 	.sidebar-title-row {
 		display: flex;
 		align-items: center;
@@ -304,11 +310,6 @@
 	.section-state.error,
 	.error {
 		color: var(--danger);
-	}
-	.sidebar-actions-row {
-		display: flex;
-		justify-content: flex-end;
-		gap: var(--space-1);
 	}
 	.sidebar-icon-button,
 	.sidebar-fold-button {
@@ -349,6 +350,7 @@
 	.workspace-sidebar.folded .sidebar-header {
 		margin-bottom: 0;
 	}
+	.workspace-sidebar.folded .sidebar-control-row,
 	.workspace-sidebar.folded .sidebar-title-row,
 	.workspace-sidebar.folded .sidebar-actions-row {
 		justify-content: center;
