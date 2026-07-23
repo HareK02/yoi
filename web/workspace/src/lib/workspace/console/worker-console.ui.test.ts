@@ -393,12 +393,6 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
   const globalSidebar = await Deno.readTextFile(
     new URL("../sidebar/GlobalSidebar.svelte", import.meta.url),
   );
-  const workspaceLayout = await Deno.readTextFile(
-    new URL("./../../../routes/w/[workspaceId]/+layout.svelte", import.meta.url),
-  );
-  const workspaceLayoutLoad = await Deno.readTextFile(
-    new URL("./../../../routes/w/[workspaceId]/+layout.ts", import.meta.url),
-  );
   const sidebar = await Deno.readTextFile(
     new URL("../sidebar/WorkspaceSidebar.svelte", import.meta.url),
   );
@@ -428,15 +422,15 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
   );
   assert(
     rootLayout.includes("GlobalSidebar") &&
-      rootLayout.includes("global-sidebar-layout") &&
+      rootLayout.includes("WorkspaceSidebar") &&
+      rootLayout.includes("data.workspaceScoped") &&
       rootLayout.includes("workspace-topbar") &&
       rootLayout.includes("topbar-icon-button") &&
       rootLayout.includes('href="/account"') &&
       rootLayout.includes("Open Account") &&
-      !rootLayout.includes("WorkspaceSidebar") &&
       !sidebar.includes("accountHref") &&
       !sidebar.includes("Open Account"),
-    "Account navigation should live in the global layout header, not the workspace sidebar",
+    "Root layout chrome should choose GlobalSidebar or WorkspaceSidebar while account navigation stays in the header",
   );
   assert(
     globalSidebar.includes("Global") &&
@@ -447,10 +441,10 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
     "Root default sidebar should contain only global navigation, not workspace-scoped sections",
   );
   assert(
-    workspaceLayout.includes("WorkspaceSidebar") &&
-      workspaceLayout.includes("workspace={data.workspace}") &&
-      workspaceLayoutLoad.includes("workspaceApiPath(params.workspaceId"),
-    "Workspace sidebar and workspace-scoped data loading should live under /w/[workspaceId] layout",
+    rootLayoutLoad.includes("params.workspaceId") &&
+      rootLayoutLoad.includes("workspaceApiPath(workspaceId") &&
+      rootLayoutLoad.includes("workspaceScoped: true"),
+    "Root layout load should provide workspace-scoped sidebar data when a workspace route is active",
   );
   assert(
     rootLayoutLoad.includes('"/account"') && rootLayoutLoad.includes('"/login/device"'),

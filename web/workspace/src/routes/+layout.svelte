@@ -2,15 +2,30 @@
   import { page } from '$app/state';
   import WorkspaceAlerts from '$lib/workspace/alerts/WorkspaceAlerts.svelte';
   import GlobalSidebar from '$lib/workspace/sidebar/GlobalSidebar.svelte';
+  import WorkspaceSidebar from '$lib/workspace/sidebar/WorkspaceSidebar.svelte';
   import '../app.css';
   import type { LayoutProps } from './$types';
 
   let { data, children }: LayoutProps = $props();
+  let sidebarCollapsed = $state(false);
 </script>
 
 <WorkspaceAlerts />
 
-<div class="app-layout">
+<div class:sidebar-collapsed={data.workspaceScoped && sidebarCollapsed} class="workspace-layout">
+  {#if data.workspaceScoped}
+    <WorkspaceSidebar
+      workspace={data.workspace ?? null}
+      workspaceError={data.workspaceError ?? null}
+      repositories={data.repositories ?? null}
+      repositoriesError={data.repositoriesError ?? null}
+      currentPath={page.url.pathname}
+      collapsed={sidebarCollapsed}
+      onToggleCollapsed={() => (sidebarCollapsed = !sidebarCollapsed)}
+    />
+  {:else}
+    <GlobalSidebar currentPath={page.url.pathname} />
+  {/if}
   <header class="workspace-topbar">
     <nav class="workspace-topbar-actions" aria-label="Global navigation">
       <a class="topbar-icon-button" href="/account" aria-label="Open Account" title="Account">
@@ -21,12 +36,7 @@
       </a>
     </nav>
   </header>
-  <div class:global-sidebar-layout={!data.workspaceScoped} class="app-shell">
-    {#if !data.workspaceScoped}
-      <GlobalSidebar currentPath={page.url.pathname} />
-    {/if}
-    <div class="app-content">
-      {@render children()}
-    </div>
-  </div>
+  <main class="shell">
+    {@render children()}
+  </main>
 </div>
