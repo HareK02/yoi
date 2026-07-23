@@ -368,7 +368,7 @@ fn workspace_settings_uuid_v7(workspace: &Path) -> String {
 fn backend_for_workspace(workspace: &Path) -> Result<Box<dyn TicketBackend>, TicketCliError> {
     let config = TicketConfig::load_workspace(workspace)?;
     let workspace_id = workspace_id_for_workspace(workspace)?;
-    let db_path = workspace_ticket_database_path(workspace, &workspace_id)?;
+    let db_path = server_database_path(workspace)?;
     Ok(Box::new(
         SqliteTicketBackend::new(db_path, workspace_id)
             .with_record_language(config.ticket_record_language()),
@@ -380,7 +380,7 @@ fn import_local(workspace: &Path) -> Result<TicketCliOutput, TicketCliError> {
     let local = LocalTicketBackend::new(config.backend_root().to_path_buf())
         .with_record_language(config.ticket_record_language());
     let workspace_id = workspace_id_for_workspace(workspace)?;
-    let db_path = workspace_ticket_database_path(workspace, &workspace_id)?;
+    let db_path = server_database_path(workspace)?;
     let sqlite = SqliteTicketBackend::new(db_path.clone(), workspace_id)
         .with_record_language(config.ticket_record_language());
     sqlite.import_from_local_backend(&local)?;
@@ -389,6 +389,27 @@ fn import_local(workspace: &Path) -> Result<TicketCliOutput, TicketCliError> {
         config.backend_root().display(),
         db_path.display()
     )))
+}
+
+fn server_database_path(workspace: &Path) -> Result<PathBuf, TicketCliError> {
+    #[cfg(test)]
+    {
+        return Ok(workspace
+            .join(".test-yoi-data")
+            .join("server")
+            .join("server.db"));
+    }
+
+    #[cfg(not(test))]
+    {
+        let _ = workspace;
+        let data_dir = manifest::paths::data_dir().ok_or_else(|| {
+            TicketCliError::new(
+                "could not resolve Yoi data directory for SQLite Ticket backend (set YOI_DATA_DIR, YOI_HOME, XDG_DATA_HOME, or HOME)",
+            )
+        })?;
+        Ok(data_dir.join("server").join("server.db"))
+    }
 }
 
 fn workspace_id_for_workspace(workspace: &Path) -> Result<String, TicketCliError> {
@@ -417,36 +438,6 @@ fn workspace_id_for_workspace(workspace: &Path) -> Result<String, TicketCliError
                 settings_path.display()
             ))
         })
-}
-
-fn workspace_ticket_database_path(
-    workspace: &Path,
-    workspace_id: &str,
-) -> Result<PathBuf, TicketCliError> {
-    #[cfg(not(test))]
-    let _ = workspace;
-
-    #[cfg(test)]
-    {
-        return Ok(workspace
-            .join(".test-yoi-data")
-            .join("workspace-server")
-            .join(workspace_id)
-            .join("workspace.db"));
-    }
-
-    #[cfg(not(test))]
-    {
-        let data_dir = manifest::paths::data_dir().ok_or_else(|| {
-            TicketCliError::new(
-                "could not resolve Yoi data directory for SQLite Ticket backend (set YOI_DATA_DIR, YOI_HOME, XDG_DATA_HOME, or HOME)",
-            )
-        })?;
-        Ok(data_dir
-            .join("workspace-server")
-            .join(workspace_id)
-            .join("workspace.db"))
-    }
 }
 
 fn create(

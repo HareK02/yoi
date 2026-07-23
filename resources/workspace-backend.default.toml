@@ -25,14 +25,15 @@ frontend_url = "http://127.0.0.1:5173"
 # static_assets_dir = "web/workspace/dist"
 
 [data]
-# Backend data root override. Leave commented to use the user-data fallback:
-#   <data_dir>/workspace-server/<workspace_id>/
+# Workspace-scoped runtime/data root override. Leave commented to use the user-data fallback:
+#   <data_dir>/server/workspaces/<workspace_id>/
 # Relative paths are resolved from the workspace root.
 # root = ".yoi/workspace-backend.data"
 
-# Explicit control-plane SQLite DB path override.
-# If omitted, this falls back to `<data.root>/workspace.db`.
-# workspace_database_path = ".yoi/workspace-backend.data/workspace.db"
+# Explicit control-plane SQLite DB path override. Normal `serve` uses the Yoi
+# server DB at `<data_dir>/server/server.db`; keep this commented unless a
+# local test needs a custom DB path.
+# workspace_database_path = ".yoi/workspace-backend.data/server.db"
 
 # Explicit embedded Runtime fs-store root override.
 # If omitted, this falls back to `<data.root>/embedded-runtime`.

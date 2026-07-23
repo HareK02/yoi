@@ -138,8 +138,7 @@ impl ServerConfig {
         let workspace_root = workspace_root.into();
         let workspace_id = identity.workspace_id;
         let embedded_runtime_store_root = Self::default_embedded_runtime_store_root(&workspace_id);
-        let database_path =
-            Self::default_workspace_backend_data_root(&workspace_id).join("workspace.db");
+        let database_path = Self::default_server_database_path();
         Self {
             workspace_id,
             workspace_display_name: identity.display_name,
@@ -164,13 +163,31 @@ impl ServerConfig {
         }
     }
 
+    pub fn server_data_root_for_data_dir(data_dir: impl Into<PathBuf>) -> PathBuf {
+        data_dir.into().join("server")
+    }
+
+    pub fn default_server_data_root() -> PathBuf {
+        match manifest::paths::data_dir() {
+            Some(data_dir) => Self::server_data_root_for_data_dir(data_dir),
+            None => std::env::temp_dir().join("yoi").join("server"),
+        }
+    }
+
+    pub fn server_database_path_for_data_dir(data_dir: impl Into<PathBuf>) -> PathBuf {
+        Self::server_data_root_for_data_dir(data_dir).join("server.db")
+    }
+
+    pub fn default_server_database_path() -> PathBuf {
+        Self::default_server_data_root().join("server.db")
+    }
+
     pub fn workspace_backend_data_root_for_data_dir(
         data_dir: impl Into<PathBuf>,
         workspace_id: impl AsRef<str>,
     ) -> PathBuf {
-        data_dir
-            .into()
-            .join("workspace-server")
+        Self::server_data_root_for_data_dir(data_dir)
+            .join("workspaces")
             .join(workspace_id.as_ref())
     }
 
@@ -181,7 +198,8 @@ impl ServerConfig {
             }
             None => std::env::temp_dir()
                 .join("yoi")
-                .join("workspace-server")
+                .join("server")
+                .join("workspaces")
                 .join(workspace_id.as_ref()),
         }
     }
@@ -6846,6 +6864,7 @@ mod tests {
         let store_root = workspace_root.join(".test-embedded-runtime-store");
         let mut config = ServerConfig::local_dev(workspace_root.clone(), test_identity())
             .with_embedded_runtime_store_root(store_root);
+        config.database_path = workspace_root.join(".test-yoi-server.db");
         config.runtime_config_path = Some(workspace_root.join(".test-config/runtimes.toml"));
         config.repositories = vec![ConfiguredRepository {
             id: TEST_REPOSITORY_ID.to_string(),
@@ -7952,7 +7971,6 @@ mod tests {
     #[tokio::test]
     async fn serves_bounded_read_apis_and_static_spa_separately() {
         let dir = tempfile::tempdir().unwrap();
-        write_ticket(dir.path(), "00000000001J2", "API Ticket", "ready");
         write_objective(dir.path(), "00000000001J3", "API Objective", "active");
         let static_dir = dir.path().join("static");
         std::fs::create_dir_all(static_dir.join("assets")).unwrap();
@@ -7961,6 +7979,12 @@ mod tests {
 
         let store = SqliteWorkspaceStore::in_memory().unwrap();
         let mut config = test_server_config(dir.path());
+        write_ticket(
+            &config.database_path,
+            TEST_WORKSPACE_ID,
+            "API Ticket",
+            ticket::TicketWorkflowState::Ready,
+        );
         config.static_assets_dir = Some(static_dir);
         let api = WorkspaceApi::new_with_execution_backend(
             config,
@@ -8044,7 +8068,7 @@ mod tests {
         );
 
         let tickets = get_json(app.clone(), "/api/tickets").await;
-        assert_eq!(tickets["items"][0]["id"], "00000000001J2");
+        assert_eq!(tickets["items"][0]["title"], "API Ticket");
         assert_eq!(tickets["items"][0]["state"], "ready");
 
         let objectives = get_json(app.clone(), "/api/objectives").await;
@@ -8098,7 +8122,7 @@ mod tests {
             .iter()
             .find(|column| column["state"] == "ready")
             .unwrap();
-        assert_eq!(ready_column["items"][0]["id"], "00000000001J2");
+        assert_eq!(ready_column["items"][0]["title"], "API Ticket");
         assert_eq!(
             repository_tickets["diagnostics"][0]["code"],
             "repository_ticket_target_metadata_absent"
@@ -8456,7 +8480,8 @@ mod tests {
         assert_eq!(
             default_root,
             data_dir
-                .join("workspace-server")
+                .join("server")
+                .join("workspaces")
                 .join(TEST_WORKSPACE_ID)
                 .join("embedded-runtime")
         );
@@ -8941,25 +8966,18 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    fn write_ticket(root: &Path, id: &str, title: &str, state: &str) {
-        let ticket_dir = root.join(".yoi/tickets").join(id);
-        std::fs::create_dir_all(&ticket_dir).unwrap();
-        std::fs::write(
-            ticket_dir.join("item.md"),
-            format!(
-                r#"---
-title: "{title}"
-state: "{state}"
-created_at: "2026-01-01T00:00:00Z"
-updated_at: "2026-01-02T00:00:00Z"
----
+    fn write_ticket(
+        database_path: &Path,
+        workspace_id: &str,
+        title: &str,
+        state: ticket::TicketWorkflowState,
+    ) {
+        use ticket::TicketBackend as _;
 
-Ticket body.
-"#,
-            ),
-        )
-        .unwrap();
-        std::fs::write(ticket_dir.join("thread.md"), "").unwrap();
+        let backend = ticket::SqliteTicketBackend::new(database_path, workspace_id);
+        let mut input = ticket::NewTicket::new(title);
+        input.workflow_state = Some(state);
+        backend.create(input).unwrap();
     }
 
     fn write_objective(root: &Path, id: &str, title: &str, state: &str) {

@@ -378,7 +378,7 @@ impl WorkspaceBackendConfigFile {
             .workspace_database_path
             .as_ref()
             .map(|path| resolve_workspace_path(workspace_root, path))
-            .unwrap_or_else(|| data_root.join("workspace.db"));
+            .unwrap_or_else(ServerConfig::default_server_database_path);
         let embedded_runtime_store_root = self
             .data
             .embedded_runtime_store_root
@@ -570,7 +570,7 @@ mod tests {
         assert_eq!(resolved.listen, "127.0.0.1:8787".parse().unwrap());
         assert_eq!(resolved.server.frontend_url, DEFAULT_FRONTEND_URL);
         assert_eq!(resolved.server.max_records, DEFAULT_MAX_RECORDS);
-        assert!(resolved.database_path.ends_with("workspace.db"));
+        assert!(resolved.database_path.ends_with("server.db"));
         assert!(
             resolved
                 .server
@@ -643,7 +643,7 @@ embedded_runtime_store_root = "/tmp/yoi-runtime"
     }
 
     #[test]
-    fn data_root_derives_database_and_runtime_store_paths() {
+    fn data_root_derives_runtime_store_path_only() {
         let dir = tempfile::tempdir().unwrap();
         let config = WorkspaceBackendConfigFile::parse_str(
             r#"
@@ -655,10 +655,7 @@ root = ".local-data"
         .unwrap();
         let resolved = config.resolve(dir.path(), identity()).unwrap();
 
-        assert_eq!(
-            resolved.database_path,
-            dir.path().join(".local-data/workspace.db")
-        );
+        assert!(resolved.database_path.ends_with("server.db"));
         assert_eq!(
             resolved.server.embedded_runtime_store_root,
             dir.path().join(".local-data/embedded-runtime")

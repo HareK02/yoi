@@ -1053,12 +1053,6 @@ fn parse_workspace_args(args: &[String]) -> Result<Mode, ParseError> {
             if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
                 return Ok(Mode::WorkspaceHelp);
             }
-            if !has_workspace_option(rest) {
-                return Err(ParseError(
-                    "yoi workspace serve requires --workspace <PATH>; cwd is no longer forwarded as an implicit workspace"
-                        .to_string(),
-                ));
-            }
             Ok(Mode::WorkspaceServer {
                 subcommand: "serve".to_string(),
                 args: rest.to_vec(),
@@ -1069,11 +1063,6 @@ fn parse_workspace_args(args: &[String]) -> Result<Mode, ParseError> {
             "unknown yoi workspace subcommand `{other}`; expected `init`, `config`, or `serve`"
         ))),
     }
-}
-
-fn has_workspace_option(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| arg == "--workspace" || arg.starts_with("--workspace="))
 }
 
 fn run_workspace_server(subcommand: &str, args: Vec<String>) -> ExitCode {
@@ -1453,13 +1442,13 @@ fn print_help() {
     println!(
         "yoi\n\nUsage:\n  yoi [OPTIONS]\n  yoi resume [--workspace <PATH>] [--all]\n  yoi workers [--workspace <PATH>] [--workspace-id <ID>] [--backend <URL>] [--runtime-id <ID>]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi worker [WORKER_OPTIONS]\n  yoi worker delete <NAME> [--force] [--dry-run]\n  yoi worker prune --older-than <DURATION> [--force] [--dry-run]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi session prune --unreferenced [--older-than <DURATION>] [--force] [--dry-run]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi workspace init [OPTIONS]
   yoi workspace config <COMMAND> [OPTIONS]
-  yoi workspace serve --workspace <PATH> [OPTIONS]\n  yoi plugin new <rust-component-tool|rust-component-service> <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Worker chat/client surface (default, --worker, yoi resume, Backend Runtime target)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n      --workspace <PATH> Runtime workspace root for default Console/--worker/workers (defaults to cwd)\n      --workspace-id <ID> Workspace identity for Backend scoped routes\n      --backend <URL>    Workspace Backend API URL for Backend Runtime attach/list\n      --runtime-id <ID>  Backend Runtime identity for attach/list\n      --worker <NAME>       Open the Worker Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Worker Console to a specific socket with --worker\n      --session <UUID>   Resume a specific session segment in the Worker Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
+  yoi workspace serve [OPTIONS]\n  yoi plugin new <rust-component-tool|rust-component-service> <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Worker chat/client surface (default, --worker, yoi resume, Backend Runtime target)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n      --workspace <PATH> Runtime workspace root for default Console/--worker/workers (defaults to cwd)\n      --workspace-id <ID> Workspace identity for Backend scoped routes\n      --backend <URL>    Workspace Backend API URL for Backend Runtime attach/list\n      --runtime-id <ID>  Backend Runtime identity for attach/list\n      --worker <NAME>       Open the Worker Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Worker Console to a specific socket with --worker\n      --session <UUID>   Resume a specific session segment in the Worker Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
     );
 }
 
 fn print_workspace_help() {
     println!(
-        "yoi workspace\n\nUsage:\n  yoi workspace init [OPTIONS]\n  yoi workspace config <COMMAND> [OPTIONS]\n  yoi workspace serve --workspace <PATH> [OPTIONS]\n\nDescription:\n  Launches the separate yoi-workspace-server executable. The yoi binary does not link the workspace server crate. `serve` requires an explicit workspace path and never forwards cwd as an implicit backend workspace.\n\nSubcommands:\n  init            Initialize .yoi/workspace.toml and .yoi/workspace-backend.local.toml\n  config default  Print the latest packaged Backend config template\n  config diff     Compare workspace local config with the packaged template\n  serve           Serve an explicitly selected Workspace\n\nOptions forwarded to init/config diff:\n      --workspace <PATH>  Workspace root (defaults to cwd)\n\nOptions forwarded to serve:\n      --workspace <PATH>  Workspace root (required)\n\nLegacy dev options forwarded to serve:\n      --db <PATH>         SQLite database path override\n      --frontend <PATH>   Static SPA build directory to serve\n      --listen <ADDR>     Listen address override\n  -h, --help              Print help\n\nEnvironment:\n  YOI_WORKSPACE_SERVER_COMMAND  Path to yoi-workspace-server executable override\n"
+        "yoi workspace\n\nUsage:\n  yoi workspace init [OPTIONS]\n  yoi workspace config <COMMAND> [OPTIONS]\n  yoi workspace serve [OPTIONS]\n\nDescription:\n  Launches the separate yoi-workspace-server executable. The yoi binary does not link the workspace server crate. `serve` reads Workspace records from the Yoi server DB.\n\nSubcommands:\n  init            Initialize .yoi/workspace.toml, .yoi/workspace-backend.local.toml, and a server DB Workspace record\n  config default  Print the latest packaged Backend config template\n  config diff     Compare workspace local config with the packaged template\n  serve           Serve the Workspace recorded in the server DB\n\nOptions forwarded to init/config diff:\n      --workspace <PATH>  Workspace root (defaults to cwd)\n\nOptions forwarded to serve:\n      --listen <ADDR>     Listen address override\n  -h, --help              Print help\n\nEnvironment:\n  YOI_WORKSPACE_SERVER_COMMAND  Path to yoi-workspace-server executable override\n"
     );
 }
 
@@ -1700,34 +1689,24 @@ mod tests {
 
     #[test]
     fn parse_workspace_serve_passthrough() {
-        match parse_args_from([
-            "workspace",
-            "serve",
-            "--workspace",
-            "/tmp/ws",
-            "--listen",
-            "127.0.0.1:0",
-        ])
-        .unwrap()
-        {
+        match parse_args_from(["workspace", "serve", "--listen", "127.0.0.1:0"]).unwrap() {
             Mode::WorkspaceServer { subcommand, args } => {
                 assert_eq!(subcommand, "serve");
-                assert_eq!(
-                    args,
-                    vec!["--workspace", "/tmp/ws", "--listen", "127.0.0.1:0"]
-                );
+                assert_eq!(args, vec!["--listen", "127.0.0.1:0"]);
             }
             other => panic!("unexpected mode: {other:?}"),
         }
     }
 
     #[test]
-    fn parse_workspace_serve_requires_explicit_workspace() {
-        let err = parse_args_from(["workspace", "serve", "--listen", "127.0.0.1:0"]).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "yoi workspace serve requires --workspace <PATH>; cwd is no longer forwarded as an implicit workspace"
-        );
+    fn parse_workspace_serve_leaves_legacy_flags_to_server() {
+        match parse_args_from(["workspace", "serve", "--workspace", "/tmp/ws"]).unwrap() {
+            Mode::WorkspaceServer { subcommand, args } => {
+                assert_eq!(subcommand, "serve");
+                assert_eq!(args, vec!["--workspace", "/tmp/ws"]);
+            }
+            other => panic!("unexpected mode: {other:?}"),
+        }
     }
 
     #[test]

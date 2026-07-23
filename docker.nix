@@ -262,14 +262,13 @@ in
       Entrypoint = [ "/bin/yoi-workspace-server" ];
       Cmd = [
         "serve"
-        "--workspace"
-        "/workspace"
-        "--db"
-        "/server-data/workspace.db"
         "--listen"
         "0.0.0.0:8787"
       ];
-      Env = [ "PATH=/bin" ] ++ commonEnv;
+      Env = [
+        "PATH=/bin"
+        "YOI_DATA_DIR=/server-data"
+      ] ++ commonEnv;
       ExposedPorts = {
         "8787/tcp" = { };
       };

@@ -21,7 +21,22 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUNTIME_DIR="${YOI_DEV_RUNTIME_DIR:-$ROOT_DIR/.yoi/dev}"
+
+default_dev_runtime_dir() {
+  if [[ -n "${YOI_DEV_RUNTIME_DIR:-}" ]]; then
+    printf '%s\n' "$YOI_DEV_RUNTIME_DIR"
+  elif [[ -n "${YOI_RUNTIME_DIR:-}" ]]; then
+    printf '%s/yoi-dev\n' "$YOI_RUNTIME_DIR"
+  elif [[ -n "${YOI_HOME:-}" ]]; then
+    printf '%s/run/yoi-dev\n' "$YOI_HOME"
+  elif [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+    printf '%s/yoi/dev\n' "$XDG_RUNTIME_DIR"
+  else
+    printf '%s/.local/share/yoi/run/dev\n' "${HOME:?HOME is required when XDG_RUNTIME_DIR is unset}"
+  fi
+}
+
+RUNTIME_DIR="$(default_dev_runtime_dir)"
 PID_DIR="$RUNTIME_DIR/pids"
 LOG_DIR="$RUNTIME_DIR/logs"
 
@@ -43,7 +58,7 @@ Usage: $(basename "$0") <start|stop|restart|status>
 
 Manage the local Yoi development stack for this checkout:
   runtime   target/debug/worker-runtime-rest-server --bind $RUNTIME_BIND
-  backend   target/debug/yoi-workspace-server serve --workspace $ROOT_DIR --db $ROOT_DIR/.yoi/workspace.db --listen $BACKEND_LISTEN
+  backend   target/debug/yoi-workspace-server serve --listen $BACKEND_LISTEN
   frontend  deno run -A npm:vite@7.2.7 dev --host $FRONTEND_HOST --port $FRONTEND_PORT  (cwd: web/workspace)
 
 Actions:
@@ -64,7 +79,7 @@ Environment overrides:
   YOI_DEV_RUNTIME_ENABLED=1        set to 0 to skip the standalone runtime process
   YOI_DEV_FRONTEND_HOST=0.0.0.0
   YOI_DEV_FRONTEND_PORT=5173
-  YOI_DEV_RUNTIME_DIR=$ROOT_DIR/.yoi/dev
+  YOI_DEV_RUNTIME_DIR=$RUNTIME_DIR  pid/log directory override (defaults to XDG runtime/data fallback)
 EOF
 }
 
@@ -330,7 +345,7 @@ start_backend() {
     return 1
   fi
   start_service backend "$ROOT_DIR" "$port" \
-    "$backend_bin" serve --workspace "$ROOT_DIR" --db "$ROOT_DIR/.yoi/workspace.db" --listen "$BACKEND_LISTEN"
+    "$backend_bin" serve --listen "$BACKEND_LISTEN"
 }
 
 start_frontend() {

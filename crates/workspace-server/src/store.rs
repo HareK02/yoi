@@ -226,6 +226,7 @@ pub trait ControlPlaneStore: Send + Sync {
     async fn schema_version(&self) -> Result<i64>;
     async fn upsert_workspace(&self, record: &WorkspaceRecord) -> Result<()>;
     async fn get_workspace(&self, workspace_id: &str) -> Result<Option<WorkspaceRecord>>;
+    fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>>;
     fn upsert_repository(&self, record: &RepositoryRecord) -> Result<()>;
     fn list_repositories(&self, workspace_id: &str) -> Result<Vec<RepositoryRecord>>;
 
@@ -413,6 +414,19 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )
             .optional()
             .map_err(Error::from)
+        })
+    }
+
+    fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"SELECT workspace_id, owner_account_id, display_name, state, created_at, updated_at
+                   FROM workspaces
+                   ORDER BY workspace_id ASC"#,
+            )?;
+            let rows = stmt.query_map([], read_workspace_record)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
         })
     }
 

@@ -27,13 +27,12 @@ The Vite dev server proxies `/api/*` to `http://127.0.0.1:8787`, so frontend hot
 If you want to run the backend from the repository root instead:
 
 ```bash
-cargo run -p yoi-workspace-server -- serve \
-  --workspace . \
-  --db .yoi/workspace.db \
-  --listen 127.0.0.1:8787
+cargo run -p yoi-workspace-server -- serve --listen 127.0.0.1:8787
 ```
 
-## Static build served by Rust backend
+The backend reads Workspace records from the Yoi server DB at `<data_dir>/server/server.db`. Run `cargo run -p yoi-workspace-server -- init --workspace .` first when the server DB has not been initialized.
+
+## Static build
 
 Build the SPA:
 
@@ -41,25 +40,7 @@ Build the SPA:
 deno task build
 ```
 
-Then serve the static build and API from the Rust backend:
-
-```bash
-cargo run -p yoi-workspace-server -- serve \
-  --workspace ../.. \
-  --db ../../.yoi/workspace.db \
-  --frontend build \
-  --listen 127.0.0.1:8787
-```
-
-From the repository root, the equivalent command is:
-
-```bash
-cargo run -p yoi-workspace-server -- serve \
-  --workspace . \
-  --db .yoi/workspace.db \
-  --frontend web/workspace/build \
-  --listen 127.0.0.1:8787
-```
+Static asset packaging is a deployment concern. Local development normally uses the Vite dev server proxy plus the Rust backend command above.
 
 ## Checks
 
