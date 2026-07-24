@@ -18,9 +18,9 @@ Deno.test("workspace app css uses bundled UI fonts", async () => {
       appCss.includes("gen-interface-jp/500.css") &&
       appCss.includes("gen-interface-jp/600.css") &&
       appCss.includes("gen-interface-jp/700.css") &&
-      appCss.includes("--font-sans:") &&
-      appCss.includes('"Gen Interface JP"') &&
-      appCss.includes("Inter"),
+      appCss.includes('--font-sans: "Gen Interface JP", sans-serif;') &&
+      !appCss.includes("ui-sans-serif") &&
+      !appCss.includes("system-ui"),
     "global app css should import the tracked Gen Interface JP weights and prefer it in the sans font stack",
   );
   assert(
@@ -28,9 +28,9 @@ Deno.test("workspace app css uses bundled UI fonts", async () => {
       appCss.includes("@fontsource/ibm-plex-mono/latin-500.css") &&
       appCss.includes("@fontsource/ibm-plex-mono/latin-600.css") &&
       appCss.includes("@fontsource/ibm-plex-mono/latin-700.css") &&
-      appCss.includes("--font-mono:") &&
-      appCss.includes('"IBM Plex Mono"') &&
-      appCss.includes("ui-monospace"),
+      appCss.includes('--font-mono: "IBM Plex Mono", monospace;') &&
+      !appCss.includes("ui-monospace") &&
+      !appCss.includes("SFMono-Regular"),
     "global app css should import the tracked IBM Plex Mono weights and prefer it in the mono font stack",
   );
 });
