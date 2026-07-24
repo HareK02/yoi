@@ -241,7 +241,7 @@
   .ticket-filter {
     display: grid;
     gap: 0.35rem;
-    color: var(--muted-foreground, #667085);
+    color: var(--text-muted);
     font-size: 0.78rem;
     font-weight: 600;
     letter-spacing: 0.02em;
@@ -251,9 +251,9 @@
   .ticket-filter input,
   .ticket-filter select {
     min-height: 2.35rem;
-    border: 1px solid var(--border, #d0d5dd);
+    border: 1px solid var(--line);
     border-radius: 0.6rem;
-    background: var(--surface, #fff);
+    background: var(--bg-raised);
     color: inherit;
     font: inherit;
     font-weight: 500;
@@ -264,9 +264,9 @@
 
   .secondary-button {
     min-height: 2.35rem;
-    border: 1px solid var(--border, #d0d5dd);
+    border: 1px solid var(--line);
     border-radius: 0.6rem;
-    background: var(--surface, #fff);
+    background: var(--bg-raised);
     color: inherit;
     cursor: pointer;
     font: inherit;
@@ -275,7 +275,7 @@
   }
 
   .ticket-table-wrap {
-    border: 1px solid var(--border, #d0d5dd);
+    border: 1px solid var(--line);
     border-radius: 0.8rem;
     overflow: auto;
   }
@@ -284,20 +284,22 @@
     width: 100%;
     min-width: 58rem;
     border-collapse: collapse;
+    background: var(--bg-raised);
+    color: var(--text);
     font-size: 0.9rem;
   }
 
   .ticket-table th,
   .ticket-table td {
-    border-bottom: 1px solid var(--border, #eaecf0);
+    border-bottom: 1px solid var(--line);
     padding: 0.72rem 0.8rem;
     text-align: left;
     vertical-align: top;
   }
 
   .ticket-table th {
-    background: var(--subtle-surface, #f9fafb);
-    color: var(--muted-foreground, #667085);
+    background: var(--bg-subtle);
+    color: var(--text-muted);
     font-size: 0.76rem;
     letter-spacing: 0.04em;
     position: sticky;
@@ -312,7 +314,7 @@
   }
 
   .ticket-table tbody tr:hover {
-    background: var(--hover-surface, #f9fafb);
+    background: var(--interactive-hover);
   }
 
   .ticket-title-cell {
@@ -333,7 +335,7 @@
   .ticket-title-cell span,
   .ticket-table small,
   .muted {
-    color: var(--muted-foreground, #667085);
+    color: var(--text-muted);
     display: block;
     font-size: 0.78rem;
     margin-top: 0.2rem;
