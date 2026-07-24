@@ -318,6 +318,67 @@ export type RepositoryLogResponse = {
   diagnostics: Diagnostic[];
 };
 
+export type MemoryCandidateKind =
+  | 'preference'
+  | 'working_assumption'
+  | 'constraint'
+  | 'decision'
+  | 'open_question'
+  | 'lesson';
+
+export type MemorySourceRef = {
+  segment_id: string;
+  range: [number, number];
+};
+
+export type MemoryStagingEvidence = {
+  id: string;
+  kind: string;
+  entry_range?: [number, number] | null;
+  excerpt?: string | null;
+  summary?: string | null;
+};
+
+export type MemorySourceEvidenceRef = {
+  session_id?: string | null;
+  segment_id?: string | null;
+  entry_range?: [number, number] | null;
+  evidence_id?: string | null;
+  evidence_kind?: string | null;
+  label?: string | null;
+  summary?: string | null;
+};
+
+export type MemoryStagingRecord = {
+  schema_version: number;
+  id: string;
+  extract_run_id: string;
+  source: MemorySourceRef;
+  kind: MemoryCandidateKind;
+  claim: string;
+  why_useful: string;
+  staleness?: string | null;
+  evidence?: MemoryStagingEvidence[];
+  source_refs?: MemorySourceEvidenceRef[];
+};
+
+export type MemoryStagingEntry = {
+  id: string;
+  byte_len: number;
+  record: MemoryStagingRecord;
+};
+
+export type MemoryStagingListResponse = {
+  limit: number;
+  returned_count: number;
+  total_valid_count: number;
+  invalid_count: number;
+  truncated: boolean;
+  order: string;
+  record_authority: string;
+  items: MemoryStagingEntry[];
+};
+
 export type TicketSummary = {
   id: string;
   title: string;

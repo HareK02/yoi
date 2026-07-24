@@ -2,6 +2,7 @@
   import { workspaceRoute } from '$lib/workspace/api/http';
   import './sidebar.css';
   import ObjectivesNavSection from './ObjectivesNavSection.svelte';
+  import MemoryNavSection from './MemoryNavSection.svelte';
   import RepositoriesNavSection from './RepositoriesNavSection.svelte';
   import TicketsNavSection from './TicketsNavSection.svelte';
   import WorkersNavSection from './WorkersNavSection.svelte';
@@ -78,6 +79,7 @@
   <nav class="sidebar-sections" aria-label="Workspace sections">
     <RepositoriesNavSection {repositories} {repositoriesError} {currentPath} {workspaceId} />
     <ObjectivesNavSection {currentPath} {workspaceId} />
+    <MemoryNavSection {currentPath} {workspaceId} />
     <TicketsNavSection {currentPath} {workspaceId} />
     <WorkersNavSection {currentPath} {workspaceId} />
   </nav>

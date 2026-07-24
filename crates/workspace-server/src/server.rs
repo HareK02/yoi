@@ -56,6 +56,7 @@ use crate::hosts::{
     WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest, WorkerSummary, WorkerWorkspaceSummary,
 };
 use crate::identity::WorkspaceIdentity;
+use crate::memory_staging::{MemoryStagingListResponse, list_memory_staging};
 use crate::observation::{
     BackendObservationProxy, ObservationProxyError, RuntimeObservationClient,
     RuntimeObservationSource, RuntimeObservationSourceConfig,
@@ -478,6 +479,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/tickets/backend",
             post(scoped_ticket_backend_operation),
+        )
+        .route(
+            "/api/w/{workspace_id}/memory/staging",
+            get(scoped_list_memory_staging),
         )
         .route(
             "/api/w/{workspace_id}/memory/backend",
@@ -1140,6 +1145,11 @@ struct TicketKanbanQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct MemoryStagingQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
 struct TranscriptQuery {
     start: Option<usize>,
     limit: Option<usize>,
@@ -1430,6 +1440,17 @@ async fn scoped_ticket_backend_operation(
         },
     };
     Ok(Json(response))
+}
+
+async fn scoped_list_memory_staging(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Query(query): Query<MemoryStagingQuery>,
+) -> ApiResult<Json<MemoryStagingListResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let memory_config = manifest::MemoryConfig::default();
+    let layout = memory::WorkspaceLayout::resolve(&memory_config, &api.config.workspace_root);
+    Ok(Json(list_memory_staging(&layout, query.limit)))
 }
 
 async fn scoped_memory_backend_operation(

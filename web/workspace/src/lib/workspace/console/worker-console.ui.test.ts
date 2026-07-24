@@ -56,6 +56,7 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
   assert(
     !sidebar.includes("CompanionNavSection") &&
       sidebar.includes("TicketsNavSection") &&
+      sidebar.includes("MemoryNavSection") &&
       sidebar.includes("WorkersNavSection"),
     "standalone Companion/Console navigation should not remain canonical and Tickets should be primary workspace navigation",
   );
@@ -106,6 +107,32 @@ Deno.test("workspace Tickets surface uses read-only Backend Ticket APIs", async 
       ticketDetailPage.includes("artifact_count") &&
       ticketDetailPage.includes("<pre>{data.ticket.data.body"),
     "Ticket detail should read one Ticket record and expose body plus metadata without mutation controls",
+  );
+});
+
+Deno.test("workspace Memory Staging surface uses read-only scoped memory API", async () => {
+  const memoryNav = await Deno.readTextFile(
+    new URL("../sidebar/MemoryNavSection.svelte", import.meta.url),
+  );
+  const memoryLoad = await Deno.readTextFile(
+    new URL("./../../../routes/w/[workspaceId]/memory/staging/+page.ts", import.meta.url),
+  );
+  const memoryPage = await Deno.readTextFile(
+    new URL("./../../../routes/w/[workspaceId]/memory/staging/+page.svelte", import.meta.url),
+  );
+
+  assert(
+    memoryNav.includes("workspaceRoute(workspaceId, '/memory/staging')") &&
+      memoryNav.includes("pending extraction candidates"),
+    "Memory sidebar section should link to the workspace Memory Staging surface",
+  );
+  assert(
+    memoryLoad.includes("workspaceApiPath(params.workspaceId, '/memory/staging')") &&
+      memoryPage.includes("Memory Staging") &&
+      memoryPage.includes("Workspace Server memory authority") &&
+      memoryPage.includes("data.staging.data.invalid_count") &&
+      memoryPage.includes("entry.record.evidence"),
+    "Memory Staging page should read the scoped API and expose staged records without mutation controls",
   );
 });
 
