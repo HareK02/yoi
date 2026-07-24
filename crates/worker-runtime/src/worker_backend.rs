@@ -20,8 +20,9 @@ use crate::catalog::{
 };
 use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionHandle, WorkerExecutionOperation,
-    WorkerExecutionRestoreRequest, WorkerExecutionResult, WorkerExecutionRunState,
-    WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
+    WorkerExecutionRestoreDryRequest, WorkerExecutionRestoreRequest, WorkerExecutionResult,
+    WorkerExecutionRunState, WorkerExecutionSpawnRequest, WorkerExecutionSpawnResult,
+    WorkerRestoreDryCheck,
 };
 use crate::interaction::{WorkerInput, WorkerInputKind};
 use crate::resource::{BackendResourceClient, ProfileSourceArchiveCache};
@@ -32,7 +33,7 @@ use async_trait::async_trait;
 use manifest::paths;
 use protocol::{Method, Segment, WorkerStatus};
 use session_store::FsStore;
-use session_store::{CombinedStore, FsWorkerStore};
+use session_store::{CombinedStore, FsWorkerStore, Store, WorkerMetadataStore};
 use tokio::runtime::Runtime;
 #[cfg(feature = "ws-server")]
 use tokio::sync::broadcast;
@@ -60,6 +61,16 @@ pub trait RuntimeWorkerFactory: Send + Sync + 'static {
         &self,
         request: WorkerExecutionRestoreRequest,
     ) -> Result<WorkerHandle, String>;
+
+    async fn dry_restore_controller(
+        &self,
+        _request: WorkerExecutionRestoreDryRequest,
+    ) -> WorkerRestoreDryCheck {
+        WorkerRestoreDryCheck::unavailable(
+            "restore_dry_check_unsupported",
+            "runtime worker factory does not support side-effect-free restore validation",
+        )
+    }
 }
 
 /// Production factory that resolves a normal Worker profile and spawns it under
@@ -328,6 +339,83 @@ async fn fetch_profile_source_archive_http(
     )
 }
 
+impl ProfileRuntimeWorkerFactory {
+    async fn try_dry_restore_controller(
+        &self,
+        request: WorkerExecutionRestoreDryRequest,
+    ) -> Result<(), String> {
+        let WorkerExecutionRestoreDryRequest {
+            worker_ref,
+            request,
+            previous_execution: _,
+            working_directory,
+            config_bundle: _,
+        } = request;
+        let store_dir = self.store_dir()?;
+        let session_store = FsStore::new(&store_dir).map_err(|err| {
+            format!(
+                "failed to initialize session store at {}: {err}",
+                store_dir.display()
+            )
+        })?;
+        let worker_metadata_dir = self.worker_metadata_dir(&store_dir);
+        let worker_metadata_store = FsWorkerStore::new(&worker_metadata_dir).map_err(|err| {
+            format!(
+                "failed to initialize worker metadata store at {}: {err}",
+                worker_metadata_dir.display()
+            )
+        })?;
+        let worker_name = Self::runtime_worker_name_for_ref(&worker_ref);
+        let active_segment = worker_metadata_store
+            .read_by_name(&worker_name)
+            .map_err(|err| format!("failed to read Worker metadata for {worker_name}: {err}"))?
+            .ok_or_else(|| format!("missing Worker metadata for {worker_name}"))?
+            .active
+            .ok_or_else(|| format!("Worker metadata for {worker_name} has no active segment"))?;
+        let active_segment_id = active_segment
+            .segment_id
+            .ok_or_else(|| format!("Worker metadata for {worker_name} has no active segment id"))?;
+        let raw_entries = session_store
+            .read_all(active_segment.session_id, active_segment_id)
+            .map_err(|err| {
+                format!(
+                    "failed to read active segment {} for session {}: {err}",
+                    active_segment_id, active_segment.session_id
+                )
+            })?;
+        let state = session_store::collect_state(&raw_entries);
+        if state.entries_count == 0 {
+            return Err(format!("active segment {active_segment_id} is empty"));
+        }
+        let worker_root = working_directory
+            .as_ref()
+            .map(|binding| binding.root.clone())
+            .unwrap_or_else(|| self.profile_base_dir.clone());
+        let profile = self.runtime_profile_for_request(&request);
+        let selector = profile.as_deref().unwrap_or("builtin:default");
+        let archive = self
+            .resolve_profile_source_archive(&request.profile_source)
+            .await?;
+        let manifest = archive
+            .resolve_profile(selector, &worker_root, &worker_name)
+            .map_err(|err| format!("failed to resolve profile source archive: {err}"))?;
+        if working_directory.is_some() {
+            worker::entrypoint::resolve_runtime_profile_manifest_from_manifest(
+                manifest,
+                &worker_root,
+                &worker_name,
+            )?;
+        } else {
+            worker::entrypoint::resolve_runtime_profile_manifest_from_manifest_without_filesystem(
+                manifest,
+                &worker_root,
+                &worker_name,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
     async fn spawn_controller(
@@ -409,6 +497,16 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             .await
             .map_err(|err| format!("failed to spawn Worker controller: {err}"))?;
         Ok(handle)
+    }
+
+    async fn dry_restore_controller(
+        &self,
+        request: WorkerExecutionRestoreDryRequest,
+    ) -> WorkerRestoreDryCheck {
+        match self.try_dry_restore_controller(request).await {
+            Ok(()) => WorkerRestoreDryCheck::valid("restore dry-check succeeded"),
+            Err(message) => WorkerRestoreDryCheck::invalid("restore_dry_check_failed", message),
+        }
     }
 
     async fn restore_controller(
@@ -923,6 +1021,75 @@ where
         )
     }
 
+    fn dry_restore_worker(
+        &self,
+        mut request: WorkerExecutionRestoreDryRequest,
+    ) -> WorkerRestoreDryCheck {
+        let working_directory = match request.previous_execution.working_directory.clone() {
+            Some(status) => {
+                let Some(materializer) = self.working_directory_materializer.as_ref() else {
+                    return WorkerRestoreDryCheck::invalid(
+                        "restore_dry_check_failed",
+                        "persisted worker has a working directory binding, but no materializer is configured for this runtime backend",
+                    );
+                };
+                let relative_cwd = request
+                    .request
+                    .working_directory
+                    .as_ref()
+                    .and_then(|working_directory| working_directory.relative_cwd.as_deref());
+                match materializer
+                    .bind_working_directory(&status.summary.working_directory_id, relative_cwd)
+                {
+                    Ok(binding) => Some(binding),
+                    Err(error) => {
+                        return WorkerRestoreDryCheck::invalid(
+                            "restore_dry_check_failed",
+                            error.to_string(),
+                        );
+                    }
+                }
+            }
+            None if request.request.working_directory_request.is_some() => {
+                return WorkerRestoreDryCheck::invalid(
+                    "restore_dry_check_failed",
+                    "persisted worker requested a working directory, but no persisted working directory binding is available to restore",
+                );
+            }
+            None if request.request.working_directory.is_some() => {
+                let Some(materializer) = self.working_directory_materializer.as_ref() else {
+                    return WorkerRestoreDryCheck::invalid(
+                        "restore_dry_check_failed",
+                        "persisted worker has a working directory claim, but no materializer is configured for this runtime backend",
+                    );
+                };
+                let working_directory =
+                    request.request.working_directory.as_ref().expect("checked");
+                match materializer.bind_working_directory(
+                    &working_directory.working_directory_id,
+                    working_directory.relative_cwd.as_deref(),
+                ) {
+                    Ok(binding) => Some(binding),
+                    Err(error) => {
+                        return WorkerRestoreDryCheck::invalid(
+                            "restore_dry_check_failed",
+                            error.to_string(),
+                        );
+                    }
+                }
+            }
+            None => None,
+        };
+        request.working_directory = working_directory;
+        let factory = self.factory.clone();
+        self.run_on_adapter_runtime(
+            async move { Ok(factory.dry_restore_controller(request).await) },
+        )
+        .unwrap_or_else(|message| {
+            WorkerRestoreDryCheck::unavailable("restore_dry_check_unavailable", message)
+        })
+    }
+
     fn restore_worker(
         &self,
         mut request: WorkerExecutionRestoreRequest,
@@ -1217,6 +1384,7 @@ mod tests {
         WorkingDirectoryRequest,
     };
     use crate::execution::WorkerExecutionContext;
+    use crate::identity::WorkerRef;
     use crate::management::RuntimeOptions;
     use crate::observation::WorkerObservationCursor;
     use crate::working_directory::LocalGitWorktreeMaterializer;
@@ -1260,6 +1428,19 @@ mod tests {
             let events = self.responses.get(idx).cloned().unwrap_or_default();
             Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
         }
+    }
+
+    #[cfg(feature = "ws-server")]
+    fn test_execution_context(worker_ref: WorkerRef) -> WorkerExecutionContext {
+        WorkerExecutionContext::new(
+            worker_ref,
+            Arc::new(|_, _| panic!("unused test event sink")),
+        )
+    }
+
+    #[cfg(not(feature = "ws-server"))]
+    fn test_execution_context(worker_ref: WorkerRef) -> WorkerExecutionContext {
+        WorkerExecutionContext::new(worker_ref)
     }
 
     struct MockFactory {
@@ -1535,7 +1716,7 @@ mod tests {
         let request = WorkerExecutionSpawnRequest {
             worker_ref: worker_ref.clone(),
             request: create_request("1"),
-            context: WorkerExecutionContext::new(worker_ref, Arc::new(|_, _| panic!("unused"))),
+            context: test_execution_context(worker_ref),
             working_directory: None,
             config_bundle: None,
         };

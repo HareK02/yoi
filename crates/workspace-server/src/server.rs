@@ -6915,6 +6915,15 @@ mod tests {
                 .cleanup_working_directory(working_directory_id)
         }
 
+        fn dry_restore_worker(
+            &self,
+            _request: worker_runtime::execution::WorkerExecutionRestoreDryRequest,
+        ) -> worker_runtime::execution::WorkerRestoreDryCheck {
+            worker_runtime::execution::WorkerRestoreDryCheck::valid(
+                "deterministic test backend dry restore ok",
+            )
+        }
+
         fn spawn_worker(
             &self,
             request: worker_runtime::execution::WorkerExecutionSpawnRequest,

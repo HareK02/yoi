@@ -2749,6 +2749,17 @@ fn embedded_worker_projection_diagnostics(
         }
     }
 
+    if let Some(restore_dry_check) = execution.restore_dry_check.as_ref() {
+        diagnostics.push(diagnostic(
+            "embedded_worker_execution_restore_dry_check",
+            DiagnosticSeverity::Error,
+            format!(
+                "Worker restore dry-test {}: {}",
+                restore_dry_check.code, restore_dry_check.message
+            ),
+        ));
+    }
+
     diagnostics
 }
 

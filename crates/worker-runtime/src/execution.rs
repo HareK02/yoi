@@ -164,6 +164,49 @@ pub struct WorkerExecutionStatus {
     pub binding: Option<WorkerExecutionBindingIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<WorkingDirectoryStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_dry_check: Option<WorkerRestoreDryCheck>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRestoreDryCheckStatus {
+    Valid,
+    Invalid,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerRestoreDryCheck {
+    pub status: WorkerRestoreDryCheckStatus,
+    pub code: String,
+    pub message: String,
+}
+
+impl WorkerRestoreDryCheck {
+    pub fn valid(message: impl Into<String>) -> Self {
+        Self {
+            status: WorkerRestoreDryCheckStatus::Valid,
+            code: "restore_dry_check_valid".to_string(),
+            message: message.into(),
+        }
+    }
+
+    pub fn invalid(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: WorkerRestoreDryCheckStatus::Invalid,
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    pub fn unavailable(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: WorkerRestoreDryCheckStatus::Unavailable,
+            code: code.into(),
+            message: message.into(),
+        }
+    }
 }
 
 impl WorkerExecutionStatus {
@@ -177,18 +220,21 @@ impl WorkerExecutionStatus {
             run_state,
             binding: None,
             working_directory: None,
+            restore_dry_check: None,
         }
     }
 
     pub fn stopped_from(mut previous: Self) -> Self {
         previous.backend = WorkerExecutionBackendKind::Stopped;
         previous.run_state = WorkerExecutionRunState::Stopped;
+        previous.restore_dry_check = None;
         previous
     }
 
     pub fn corrupted(mut previous: Self) -> Self {
         previous.backend = WorkerExecutionBackendKind::Corrupted;
         previous.run_state = WorkerExecutionRunState::Errored;
+        previous.restore_dry_check = None;
         previous
     }
 
@@ -204,6 +250,14 @@ impl WorkerExecutionStatus {
 
     pub fn with_result(mut self, result: WorkerExecutionResult) -> Self {
         self.run_state = result.run_state;
+        self
+    }
+
+    pub fn with_restore_dry_check(
+        mut self,
+        restore_dry_check: Option<WorkerRestoreDryCheck>,
+    ) -> Self {
+        self.restore_dry_check = restore_dry_check;
         self
     }
 }
@@ -308,6 +362,16 @@ pub struct WorkerExecutionSpawnRequest {
     pub config_bundle: Option<ConfigBundle>,
 }
 
+/// Request passed to a [`WorkerExecutionBackend`] when validating a restore without side effects.
+#[derive(Clone, Debug)]
+pub struct WorkerExecutionRestoreDryRequest {
+    pub worker_ref: WorkerRef,
+    pub request: crate::catalog::CreateWorkerRequest,
+    pub previous_execution: WorkerExecutionStatus,
+    pub working_directory: Option<WorkingDirectoryBinding>,
+    pub config_bundle: Option<ConfigBundle>,
+}
+
 /// Request passed to a [`WorkerExecutionBackend`] when restoring a persisted Worker.
 #[derive(Clone, Debug)]
 pub struct WorkerExecutionRestoreRequest {
@@ -349,6 +413,16 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
     fn backend_id(&self) -> &str;
 
     fn spawn_worker(&self, request: WorkerExecutionSpawnRequest) -> WorkerExecutionSpawnResult;
+
+    fn dry_restore_worker(
+        &self,
+        _request: WorkerExecutionRestoreDryRequest,
+    ) -> WorkerRestoreDryCheck {
+        WorkerRestoreDryCheck::unavailable(
+            "restore_dry_check_unsupported",
+            "execution backend does not support side-effect-free restore validation",
+        )
+    }
 
     fn restore_worker(
         &self,
@@ -471,6 +545,13 @@ impl WorkerExecutionBackendRef {
         request: WorkerExecutionSpawnRequest,
     ) -> WorkerExecutionSpawnResult {
         self.backend.spawn_worker(request)
+    }
+
+    pub(crate) fn dry_restore_worker(
+        &self,
+        request: WorkerExecutionRestoreDryRequest,
+    ) -> WorkerRestoreDryCheck {
+        self.backend.dry_restore_worker(request)
     }
 
     pub(crate) fn restore_worker(

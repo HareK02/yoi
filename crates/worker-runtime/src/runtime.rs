@@ -11,14 +11,13 @@ use crate::config_bundle::{
 use crate::diagnostics::DiagnosticSeverity;
 use crate::diagnostics::RuntimeDiagnostic;
 use crate::error::RuntimeError;
-#[cfg(feature = "fs-store")]
-use crate::execution::WorkerExecutionRestoreRequest;
 use crate::execution::{
     WorkerExecutionBackend, WorkerExecutionBackendKind, WorkerExecutionBackendRef,
     WorkerExecutionBindingIdentity, WorkerExecutionHandle, WorkerExecutionOperation,
     WorkerExecutionResult, WorkerExecutionRunState, WorkerExecutionSpawnRequest,
-    WorkerExecutionSpawnResult, WorkerExecutionStatus,
+    WorkerExecutionSpawnResult, WorkerExecutionStatus, WorkerRestoreDryCheckStatus,
 };
+use crate::execution::{WorkerExecutionRestoreDryRequest, WorkerExecutionRestoreRequest};
 #[cfg(feature = "fs-store")]
 use crate::fs_store::{
     FsRuntimeStore, FsRuntimeStoreOptions, PersistedRuntimeState, PersistedWorkerRecord,
@@ -434,11 +433,16 @@ impl Runtime {
     /// List Workers known to this Runtime.
     pub fn list_workers(&self) -> Result<Vec<WorkerSummary>, RuntimeError> {
         let state = self.lock()?;
-        Ok(state
-            .workers
-            .values()
-            .map(|worker| worker.summary())
-            .collect())
+        let mut summaries = Vec::with_capacity(state.workers.len());
+        for worker in state.workers.values() {
+            let restore_dry_check = corrupted_worker_restore_dry_check(
+                state.execution_backend.as_ref(),
+                worker,
+                &state.config_bundles,
+            );
+            summaries.push(worker.summary_with_restore_dry_check(restore_dry_check));
+        }
+        Ok(summaries)
     }
 
     /// Fetch Worker detail.  The supplied [`WorkerRef`] must match this Runtime.
@@ -513,6 +517,7 @@ impl Runtime {
             run_state: dispatch_result.run_state,
             binding: worker.execution.binding.clone(),
             working_directory: worker.execution.working_directory.clone(),
+            restore_dry_check: None,
         };
 
         let status = worker.status;
@@ -670,6 +675,7 @@ impl Runtime {
             run_state: result.run_state,
             binding: worker.execution.binding.clone(),
             working_directory: worker.execution.working_directory.clone(),
+            restore_dry_check: None,
         };
         state.persist_worker(&worker_ref.worker_id)?;
         Ok(())
@@ -1039,6 +1045,7 @@ impl Runtime {
             worker_ref: WorkerRef,
             request: CreateWorkerRequest,
             previous_execution: WorkerExecutionStatus,
+            config_bundle: Option<ConfigBundle>,
         }
 
         let candidates = {
@@ -1105,10 +1112,17 @@ impl Runtime {
                         continue;
                     }
                 }
+                let config_bundle = worker
+                    .request
+                    .config_bundle
+                    .as_ref()
+                    .and_then(|bundle_ref| state.config_bundles.get(&bundle_ref.id))
+                    .cloned();
                 candidates.push(RestoreCandidate {
                     worker_ref: worker.worker_ref.clone(),
                     request: worker.request.clone(),
                     previous_execution: worker.execution.clone(),
+                    config_bundle,
                 });
             }
             candidates
@@ -1122,6 +1136,36 @@ impl Runtime {
             let Some(backend) = backend else {
                 return Ok(());
             };
+            let dry_check = backend.dry_restore_worker(WorkerExecutionRestoreDryRequest {
+                worker_ref: candidate.worker_ref.clone(),
+                request: candidate.request.clone(),
+                previous_execution: candidate.previous_execution.clone(),
+                working_directory: None,
+                config_bundle: candidate.config_bundle.clone(),
+            });
+            match dry_check.status {
+                WorkerRestoreDryCheckStatus::Valid => {}
+                WorkerRestoreDryCheckStatus::Invalid => {
+                    let mut state = self.lock()?;
+                    state.record_restore_failure(
+                        &candidate.worker_ref,
+                        WorkerExecutionResult::errored(
+                            WorkerExecutionOperation::Restore,
+                            dry_check.message,
+                        ),
+                    )?;
+                    continue;
+                }
+                WorkerRestoreDryCheckStatus::Unavailable => {
+                    let mut state = self.lock()?;
+                    state.record_restore_unavailable(
+                        &candidate.worker_ref,
+                        candidate.previous_execution.clone(),
+                        dry_check.message,
+                    )?;
+                    continue;
+                }
+            }
             let request = WorkerExecutionRestoreRequest {
                 worker_ref: candidate.worker_ref.clone(),
                 request: candidate.request,
@@ -1618,6 +1662,33 @@ impl RuntimeState {
         Ok(())
     }
 
+    #[cfg(feature = "fs-store")]
+    fn record_restore_unavailable(
+        &mut self,
+        worker_ref: &WorkerRef,
+        previous_execution: WorkerExecutionStatus,
+        message: String,
+    ) -> Result<(), RuntimeError> {
+        let diagnostic_id = self.next_diagnostic_id;
+        self.next_diagnostic_id += 1;
+        self.diagnostics.push(RuntimeDiagnostic {
+            id: diagnostic_id,
+            severity: DiagnosticSeverity::Warning,
+            code: "worker_execution_restore_unavailable".to_string(),
+            message: format!(
+                "worker {} execution restore deferred: {message}",
+                worker_ref.worker_id
+            ),
+            worker_ref: Some(worker_ref.clone()),
+        });
+        let worker = self.worker_mut(worker_ref)?;
+        worker.execution_handle = None;
+        worker.execution = WorkerExecutionStatus::stopped_from(previous_execution);
+        self.persist_runtime_snapshot()?;
+        self.persist_worker(&worker_ref.worker_id)?;
+        Ok(())
+    }
+
     fn push_event(
         &mut self,
         worker_ref: Option<WorkerRef>,
@@ -1744,13 +1815,50 @@ struct WorkerRecord {
     last_event_id: u64,
 }
 
+fn corrupted_worker_restore_dry_check(
+    execution_backend: Option<&WorkerExecutionBackendRef>,
+    worker: &WorkerRecord,
+    config_bundles: &BTreeMap<String, ConfigBundle>,
+) -> Option<crate::execution::WorkerRestoreDryCheck> {
+    if worker.execution.backend != WorkerExecutionBackendKind::Corrupted {
+        return None;
+    }
+    let Some(execution_backend) = execution_backend else {
+        return Some(crate::execution::WorkerRestoreDryCheck::unavailable(
+            "restore_dry_check_backend_unavailable",
+            "execution backend is unavailable; restore dry-test was not run",
+        ));
+    };
+    let config_bundle = worker
+        .request
+        .config_bundle
+        .as_ref()
+        .and_then(|bundle_ref| config_bundles.get(&bundle_ref.id))
+        .cloned();
+    Some(
+        execution_backend.dry_restore_worker(WorkerExecutionRestoreDryRequest {
+            worker_ref: worker.worker_ref.clone(),
+            request: worker.request.clone(),
+            previous_execution: worker.execution.clone(),
+            working_directory: None,
+            config_bundle,
+        }),
+    )
+}
+
 impl WorkerRecord {
-    fn summary(&self) -> WorkerSummary {
+    fn summary_with_restore_dry_check(
+        &self,
+        restore_dry_check: Option<crate::execution::WorkerRestoreDryCheck>,
+    ) -> WorkerSummary {
         WorkerSummary {
             worker_ref: self.worker_ref.clone(),
             worker_id: self.worker_id,
             status: self.status,
-            execution: self.execution.clone(),
+            execution: self
+                .execution
+                .clone()
+                .with_restore_dry_check(restore_dry_check),
             profile: self.request.profile.clone(),
             profile_source: self.request.profile_source.reference(),
             config_bundle: self.request.config_bundle.clone(),
@@ -1888,9 +1996,11 @@ mod tests {
     };
     use crate::execution::{
         WorkerExecutionBackend, WorkerExecutionContext, WorkerExecutionHandle,
-        WorkerExecutionRestoreRequest, WorkerExecutionRunState,
+        WorkerExecutionRestoreDryRequest, WorkerExecutionRestoreRequest, WorkerExecutionRunState,
     };
     use std::collections::BTreeMap;
+    #[cfg(feature = "fs-store")]
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     fn task_request(_objective: &str) -> CreateWorkerRequest {
@@ -1959,6 +2069,8 @@ mod tests {
         dispatch_result: Mutex<Option<WorkerExecutionResult>>,
         restore_result: Mutex<Option<WorkerExecutionSpawnResult>>,
         restore_count: Mutex<u64>,
+        dry_restore_result: Mutex<Option<crate::execution::WorkerRestoreDryCheck>>,
+        dry_restore_count: Mutex<u64>,
         contexts: Mutex<BTreeMap<WorkerId, WorkerExecutionContext>>,
         #[cfg(feature = "ws-server")]
         snapshots: Mutex<BTreeMap<WorkerId, protocol::Event>>,
@@ -1967,6 +2079,18 @@ mod tests {
     impl TestExecutionBackend {
         fn set_dispatch_result(&self, result: WorkerExecutionResult) {
             *self.dispatch_result.lock().unwrap() = Some(result);
+        }
+
+        fn set_dry_restore_result(&self, result: crate::execution::WorkerRestoreDryCheck) {
+            *self.dry_restore_result.lock().unwrap() = Some(result);
+        }
+
+        fn dry_restore_count(&self) -> u64 {
+            *self.dry_restore_count.lock().unwrap()
+        }
+
+        fn restore_count(&self) -> u64 {
+            *self.restore_count.lock().unwrap()
         }
 
         #[cfg(feature = "ws-server")]
@@ -2007,6 +2131,20 @@ mod tests {
                     .as_ref()
                     .map(|binding| binding.status()),
             }
+        }
+
+        fn dry_restore_worker(
+            &self,
+            _request: WorkerExecutionRestoreDryRequest,
+        ) -> crate::execution::WorkerRestoreDryCheck {
+            *self.dry_restore_count.lock().unwrap() += 1;
+            self.dry_restore_result
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| {
+                    crate::execution::WorkerRestoreDryCheck::valid("test dry restore ok")
+                })
         }
 
         fn restore_worker(
@@ -2119,6 +2257,35 @@ mod tests {
         let fetched = runtime.worker_detail(&detail.worker_ref).unwrap();
         assert_eq!(fetched.worker_id, detail.worker_id);
         assert_eq!(fetched.profile, detail.profile);
+    }
+
+    #[test]
+    fn list_corrupted_worker_runs_restore_dry_check_and_reports_error() {
+        let (runtime, backend) = runtime_and_backend();
+        let detail = runtime
+            .create_worker(task_request("restore dry-check"))
+            .unwrap();
+        backend.set_dry_restore_result(crate::execution::WorkerRestoreDryCheck::invalid(
+            "restore_dry_check_failed",
+            "missing Worker metadata for worker-1",
+        ));
+        {
+            let mut state = runtime.lock().unwrap();
+            let worker = state.worker_mut(&detail.worker_ref).unwrap();
+            worker.execution = WorkerExecutionStatus::corrupted(worker.execution.clone());
+        }
+
+        let list = runtime.list_workers().unwrap();
+
+        assert_eq!(backend.dry_restore_count(), 1);
+        let dry_check = list[0].execution.restore_dry_check.as_ref().unwrap();
+        assert_eq!(
+            dry_check.status,
+            crate::execution::WorkerRestoreDryCheckStatus::Invalid
+        );
+        assert_eq!(dry_check.code, "restore_dry_check_failed");
+        assert!(dry_check.message.contains("missing Worker metadata"));
+        assert_eq!(backend.restore_count(), 0);
     }
 
     #[test]
@@ -2757,6 +2924,63 @@ mod tests {
                 .any(
                     |event| event.kind == RuntimeEventKind::WorkerExecutionRestored
                         && event.worker_ref.as_ref() == Some(&worker.worker_ref)
+                )
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "fs-store")]
+    #[test]
+    fn fs_store_marks_worker_corrupted_when_restore_dry_check_fails() {
+        let root = fs_store_root("execution-dry-restore-failed");
+        let runtime = Runtime::with_fs_store_and_execution_backend(
+            crate::fs_store::FsRuntimeStoreOptions {
+                root: root.clone(),
+                display_name: None,
+                limits: RuntimeLimits::default(),
+            },
+            Arc::new(TestExecutionBackend::default()),
+        )
+        .unwrap();
+        runtime.store_config_bundle(test_bundle()).unwrap();
+        let worker = runtime
+            .create_worker(task_request("dry restore failure"))
+            .unwrap();
+        drop(runtime);
+
+        let restoring_backend = Arc::new(TestExecutionBackend::default());
+        restoring_backend.set_dry_restore_result(crate::execution::WorkerRestoreDryCheck::invalid(
+            "restore_dry_check_failed",
+            "missing Worker metadata for dry restore failure",
+        ));
+        let restored = Runtime::with_fs_store_and_execution_backend(
+            crate::fs_store::FsRuntimeStoreOptions {
+                root: root.clone(),
+                display_name: None,
+                limits: RuntimeLimits::default(),
+            },
+            restoring_backend.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(restoring_backend.dry_restore_count(), 1);
+        assert_eq!(restoring_backend.restore_count(), 0);
+        let restored_worker = restored.worker_detail(&worker.worker_ref).unwrap();
+        assert_eq!(restored_worker.status, WorkerStatus::Running);
+        assert_eq!(
+            restored_worker.execution.backend,
+            WorkerExecutionBackendKind::Corrupted
+        );
+        assert!(
+            restored
+                .diagnostics()
+                .unwrap()
+                .iter()
+                .any(
+                    |diagnostic| diagnostic.code == "worker_execution_restore_failed"
+                        && diagnostic.message.contains("missing Worker metadata")
+                        && diagnostic.worker_ref.as_ref() == Some(&worker.worker_ref)
                 )
         );
 
