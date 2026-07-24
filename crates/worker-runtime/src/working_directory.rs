@@ -10,7 +10,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const WORKING_DIRECTORIES_DIR: &str = "working-directories";
+const CHECKOUT_DIR: &str = "checkout";
 const MATERIALIZATION_RECORD: &str = "materialization.json";
 static NEXT_WORKING_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -200,9 +200,7 @@ impl LocalGitWorktreeMaterializer {
     }
 
     fn working_directory_root(&self, working_directory_id: &str) -> PathBuf {
-        self.runtime_root
-            .join(WORKING_DIRECTORIES_DIR)
-            .join(working_directory_id)
+        self.runtime_root.join(working_directory_id)
     }
 
     fn corrupted_status(&self, working_directory_id: &str) -> WorkingDirectoryStatus {
@@ -346,9 +344,7 @@ impl LocalGitWorktreeMaterializer {
             .filter(|value| !value.is_empty());
 
         let working_directory_root = self.working_directory_root(&working_directory_id);
-        let worktree_root = working_directory_root
-            .join("root")
-            .join(sanitize_path_component(&request.repository.id));
+        let worktree_root = working_directory_root.join(CHECKOUT_DIR);
         if worktree_root.exists() {
             return Err(WorkingDirectoryDiagnostic::new(
                 "working_directory_exists",
@@ -455,8 +451,7 @@ impl WorkingDirectoryMaterializer for LocalGitWorktreeMaterializer {
     fn list_working_directories(
         &self,
     ) -> Result<Vec<WorkingDirectoryStatus>, WorkingDirectoryDiagnostic> {
-        let root = self.runtime_root.join(WORKING_DIRECTORIES_DIR);
-        let entries = match fs::read_dir(&root) {
+        let entries = match fs::read_dir(&self.runtime_root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(_) => {
@@ -800,6 +795,17 @@ mod tests {
             .unwrap();
 
         assert!(binding.root.starts_with(runtime_root.path()));
+        assert_eq!(
+            binding.working_directory_root(),
+            runtime_root
+                .path()
+                .join(&binding.working_directory.id)
+                .as_path()
+        );
+        assert_eq!(
+            binding.root(),
+            binding.working_directory_root().join(CHECKOUT_DIR)
+        );
         assert!(binding.root.join("README.md").exists());
         let branch = git_stdout(binding.root(), ["branch", "--show-current"]).unwrap();
         assert!(

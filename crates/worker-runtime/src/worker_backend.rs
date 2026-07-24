@@ -1703,11 +1703,7 @@ mod tests {
         runtime_base: &std::path::Path,
         working_directory_id: &str,
     ) -> PathBuf {
-        runtime_base
-            .join("working-directories")
-            .join(working_directory_id)
-            .join("root")
-            .join("repo-main")
+        runtime_base.join(working_directory_id).join("checkout")
     }
 
     #[test]
@@ -2008,7 +2004,7 @@ mod tests {
         let error = runtime.create_worker(request).unwrap_err();
 
         assert!(format!("{error:?}").contains("spawn failed"));
-        let working_directories_root = runtime_base.path().join("working-directories");
+        let working_directories_root = runtime_base.path();
         let remaining_entries = fs::read_dir(working_directories_root)
             .map(|entries| entries.count())
             .unwrap_or(0);

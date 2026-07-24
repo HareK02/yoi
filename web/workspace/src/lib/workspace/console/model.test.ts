@@ -323,7 +323,7 @@ Deno.test("projectConsole shows Grep query and caps result preview to five entri
 
 Deno.test("projectConsole keeps Grep error detail in the body", () => {
   const message =
-    "Tool execution failed: Invalid argument: path is outside allowed scope: /home/hare/.yoi/workdirs/working-directories/0019f5bce74f1000000/root/main/ghq.local/github/openai/codex";
+    "Tool execution failed: Invalid argument: path is outside allowed scope: /home/hare/.yoi/workdirs/0019f5bce74f1000000/checkout/ghq.local/github/openai/codex";
   const projection = projectConsole([
     {
       eventId: "74",
