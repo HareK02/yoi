@@ -1,4 +1,10 @@
-export type WorkspaceAlertLevel = "success" | "info" | "warning" | "error" | "system" | "debug";
+export type WorkspaceAlertLevel =
+  | "success"
+  | "info"
+  | "warning"
+  | "error"
+  | "system"
+  | "debug";
 
 export type WorkspaceAlert = {
   id: string;
@@ -32,7 +38,8 @@ export function pushWorkspaceAlert(
   message: string,
   options: { title?: string; id?: string } = {},
 ): string {
-  const id = options.id ?? `${Date.now().toString(36)}-${(sequence++).toString(36)}`;
+  const id = options.id ??
+    `${Date.now().toString(36)}-${(sequence++).toString(36)}`;
   alerts = [
     ...alerts.filter((alert) => alert.id !== id),
     {

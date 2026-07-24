@@ -16,5 +16,8 @@ Deno.test("parseSigilSegments turns file sigils into file refs", () => {
 });
 
 Deno.test("parseSigilSegments leaves hash sigils as plain text", () => {
-  assertEquals(parseSigilSegments("ask #memory"), [{ kind: "text", content: "ask #memory" }]);
+  assertEquals(parseSigilSegments("ask #memory"), [{
+    kind: "text",
+    content: "ask #memory",
+  }]);
 });

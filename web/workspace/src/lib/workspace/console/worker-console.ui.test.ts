@@ -10,7 +10,9 @@ function assert(condition: unknown, message: string): asserts condition {
 }
 
 Deno.test("workspace app css uses bundled UI fonts", async () => {
-  const appCss = await Deno.readTextFile(new URL("./../../../app.css", import.meta.url));
+  const appCss = await Deno.readTextFile(
+    new URL("./../../../app.css", import.meta.url),
+  );
   assert(
     appCss.includes("gen-interface-jp/400.css") &&
       appCss.includes("gen-interface-jp/500.css") &&
@@ -34,12 +36,20 @@ Deno.test("workspace app css uses bundled UI fonts", async () => {
 });
 
 Deno.test("workspace feature css is owned outside app css", async () => {
-  const appCss = await Deno.readTextFile(new URL("./../../../app.css", import.meta.url));
+  const appCss = await Deno.readTextFile(
+    new URL("./../../../app.css", import.meta.url),
+  );
   const workspaceLayout = await Deno.readTextFile(
-    new URL("./../../../routes/w/[workspaceId]/+layout.svelte", import.meta.url),
+    new URL(
+      "./../../../routes/w/[workspaceId]/+layout.svelte",
+      import.meta.url,
+    ),
   );
   const settingsLayout = await Deno.readTextFile(
-    new URL("./../../../routes/w/[workspaceId]/settings/+layout.svelte", import.meta.url),
+    new URL(
+      "./../../../routes/w/[workspaceId]/settings/+layout.svelte",
+      import.meta.url,
+    ),
   );
   const accountPage = await Deno.readTextFile(
     new URL("./../../../routes/account/+page.svelte", import.meta.url),
@@ -86,7 +96,9 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
       workspacePage.includes("runtimeSettingsHref") &&
       workspacePage.includes("workersHref") &&
       workspacePage.includes("workspaceRoute(workspaceId, '/tickets')") &&
-      workspacePage.includes("workspaceRoute(workspaceId, '/settings/runtimes')") &&
+      workspacePage.includes(
+        "workspaceRoute(workspaceId, '/settings/runtimes')",
+      ) &&
       workspacePage.includes("workspaceRoute(workspaceId, '/workers')"),
     "top workspace page should link to Tickets, Runtime Inventory under Settings, and the Workers page",
   );
@@ -99,7 +111,7 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
     workersPage.includes("workerConsoleHref(worker, data.workspaceId)") &&
       workersPage.includes('<table class="workers-table">') &&
       workersPage.includes('class="icon-action"') &&
-      workersPage.includes('Delete ${worker.label}'),
+      workersPage.includes("Delete ${worker.label}"),
     "dedicated Workers page should expose a table, console link target, and icon actions per Worker",
   );
   assert(
@@ -122,10 +134,16 @@ Deno.test("workspace Tickets surface uses read-only Backend Ticket APIs", async 
     new URL("../sidebar/TicketsNavSection.svelte", import.meta.url),
   );
   const ticketsLoad = await Deno.readTextFile(
-    new URL("./../../../routes/w/[workspaceId]/tickets/+page.ts", import.meta.url),
+    new URL(
+      "./../../../routes/w/[workspaceId]/tickets/+page.ts",
+      import.meta.url,
+    ),
   );
   const ticketsPage = await Deno.readTextFile(
-    new URL("./../../../routes/w/[workspaceId]/tickets/+page.svelte", import.meta.url),
+    new URL(
+      "./../../../routes/w/[workspaceId]/tickets/+page.svelte",
+      import.meta.url,
+    ),
   );
   const ticketDetailLoad = await Deno.readTextFile(
     new URL(
@@ -146,14 +164,18 @@ Deno.test("workspace Tickets surface uses read-only Backend Ticket APIs", async 
     "Tickets sidebar section should link to the workspace Tickets surface",
   );
   assert(
-    ticketsLoad.includes('`${workspaceApiPath(params.workspaceId, "/tickets")}?limit=1000`') &&
+    ticketsLoad.includes(
+      '`${workspaceApiPath(params.workspaceId, "/tickets")}?limit=1000`',
+    ) &&
       ticketsPage.includes("Notion-style filtering and sorting") &&
       ticketsPage.includes("toggleSort('updated_at')") &&
       ticketsPage.includes("bind:value={visibilityFilter}") &&
       ticketsPage.includes("sortKey = $state<SortKey>('panel')") &&
       ticketsPage.includes("workspace_action_priority") &&
       ticketsPage.includes("bind:value={stateFilter}") &&
-      ticketsPage.includes("workspaceRoute(data.workspaceId, `/tickets/${ticket.id}`)"),
+      ticketsPage.includes(
+        "workspaceRoute(data.workspaceId, `/tickets/${ticket.id}`)",
+      ),
     "Tickets list should read the workspace-scoped Ticket API and expose sortable/filterable table links",
   );
   assert(
@@ -170,10 +192,16 @@ Deno.test("workspace Memory Staging surface uses read-only scoped memory API", a
     new URL("../sidebar/MemoryNavSection.svelte", import.meta.url),
   );
   const memoryLoad = await Deno.readTextFile(
-    new URL("./../../../routes/w/[workspaceId]/memory/staging/+page.ts", import.meta.url),
+    new URL(
+      "./../../../routes/w/[workspaceId]/memory/staging/+page.ts",
+      import.meta.url,
+    ),
   );
   const memoryPage = await Deno.readTextFile(
-    new URL("./../../../routes/w/[workspaceId]/memory/staging/+page.svelte", import.meta.url),
+    new URL(
+      "./../../../routes/w/[workspaceId]/memory/staging/+page.svelte",
+      import.meta.url,
+    ),
   );
 
   assert(
@@ -182,7 +210,8 @@ Deno.test("workspace Memory Staging surface uses read-only scoped memory API", a
     "Memory sidebar section should link to the workspace Memory Staging surface",
   );
   assert(
-    memoryLoad.includes("workspaceApiPath(params.workspaceId, '/memory/staging')") &&
+    memoryLoad.includes("workspaceApiPath(params.workspaceId") &&
+      memoryLoad.includes('"/memory/staging"') &&
       memoryPage.includes("Memory Staging") &&
       memoryPage.includes("Workspace Server memory authority") &&
       memoryPage.includes("data.staging.data.invalid_count") &&
@@ -236,7 +265,9 @@ Deno.test("Worker Console renders markdown only for message rows", async () => {
   assert(
     consoleLine.includes("function shouldRenderMarkdown") &&
       consoleLine.includes("item.kind === 'tool'") &&
-      consoleLine.includes('<p class="console-plain-text">{bodyTextAfterToolSummary(item)}</p>') &&
+      consoleLine.includes(
+        '<p class="console-plain-text">{bodyTextAfterToolSummary(item)}</p>',
+      ) &&
       consoleLine.includes("{:else if shouldRenderMarkdown(item)}") &&
       consoleLine.includes("<RichMarkdown text={item.body || '—'} />"),
     "Console should keep markdown rendering to user/assistant/system message bodies and render tool text literally",
@@ -249,7 +280,9 @@ Deno.test("Worker Console renders Edit diffs without preformatted template gaps"
   );
 
   assert(
-    consoleLine.includes('<div class="console-diff" role="group" aria-label="Edit diff">') &&
+    consoleLine.includes(
+      '<div class="console-diff" role="group" aria-label="Edit diff">',
+    ) &&
       consoleLine.includes("{#each item.diff as diffLine}") &&
       consoleLine.includes("class={`diff-line ${diffLine.kind}`}") &&
       !consoleLine.includes('<pre class="console-diff"'),
@@ -276,7 +309,7 @@ Deno.test("Worker Console exposes a foldable timeline beside the scroll body", a
       consolePage.includes("jumpToTimelineMark") &&
       consoleLine.includes("data-console-line-id={item.id}") &&
       consolePage.includes("class:timeline-open={timelineOpen}") &&
-      consolePage.includes("class=\"timeline-fold\"") &&
+      consolePage.includes('class="timeline-fold"') &&
       consolePage.includes("expanded={timelineOpen}") &&
       !consolePage.includes("{#if timelineOpen}") &&
       consolePage.includes("handleTimelineRailPointerDown") &&
@@ -301,17 +334,19 @@ Deno.test("Worker Console composer fits to content without manual resize", async
   );
   assert(
     consolePage.includes("use:fitTextarea={{ value: draft, maxRows: 10 }}") &&
-      consolePage.includes("<div class=\"composer-input-shell\">") &&
+      consolePage.includes('<div class="composer-input-shell">') &&
       !consolePage.includes("handleComposerShellClick") &&
       consolePage.includes("bind:this={composerTextareaElement}") &&
-      consolePage.includes('event.key === "PageUp" || event.key === "PageDown"') &&
+      consolePage.includes(
+        'event.key === "PageUp" || event.key === "PageDown"',
+      ) &&
       consolePage.includes("scrollConsoleByPage") &&
-      consolePage.includes("class=\"composer-input-footer\"") &&
+      consolePage.includes('class="composer-input-footer"') &&
       consolePage.includes("pointer-events: none") &&
-      consolePage.includes("class=\"composer-footer-slot\"") &&
-      consolePage.includes("class=\"composer-send-button\"") &&
+      consolePage.includes('class="composer-footer-slot"') &&
+      consolePage.includes('class="composer-send-button"') &&
       consolePage.includes("pointer-events: auto") &&
-      consolePage.includes("class=\"composer-send-icon\"") &&
+      consolePage.includes('class="composer-send-icon"') &&
       consolePage.includes('d="M8 6L12 2L16 6"') &&
       consolePage.includes(".console-composer textarea") &&
       consolePage.includes("resize: none") &&
@@ -366,14 +401,16 @@ Deno.test("workspace Runtime inventory lives under Settings admin routes", async
   assert(
     !sidebar.includes("RuntimesNavSection") &&
       settingsModel.includes('id: "runtime-inventory"') &&
-      settingsModel.includes('return `${SETTINGS_ROUTE}/runtimes`;'),
+      settingsModel.includes("return `${SETTINGS_ROUTE}/runtimes`;"),
     "Runtime inventory should be admin Settings navigation, not primary workspace sidebar navigation",
   );
   assert(
     runtimesPage.includes("Runtime Inventory") &&
       runtimesPage.includes("Open workdirs") &&
       runtimesPage.includes("runtimes-table") &&
-      runtimesPage.includes("/settings/runtimes/${encodeURIComponent(runtime.runtime_id)}/workdirs"),
+      runtimesPage.includes(
+        "/settings/runtimes/${encodeURIComponent(runtime.runtime_id)}/workdirs",
+      ),
     "Settings Runtime Inventory page should table Runtimes and link to each Runtime's workdirs",
   );
   assert(
@@ -431,7 +468,9 @@ Deno.test("Worker Console page is routed by runtime_id and worker_id through bac
   assert(
     consolePage.includes("workspaceApiPath(workspaceId, path)") &&
       consolePage.includes("workerApiPath(") &&
-      consolePage.includes("`/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(") &&
+      consolePage.includes(
+        "`/runtimes/${encodeURIComponent(target.runtimeId)}/workers/${encodeURIComponent(",
+      ) &&
       consolePage.includes("target.workerId"),
     "Worker detail should use the scoped backend Worker detail API",
   );
@@ -460,14 +499,16 @@ Deno.test("Worker Console page is routed by runtime_id and worker_id through bac
     "target-change effect should load data without depending on manual refresh state reads",
   );
   assert(
-    consolePage.includes('const workerRunning = $derived(workerState === "running");') &&
+    consolePage.includes(
+      'const workerRunning = $derived(workerState === "running");',
+    ) &&
       consolePage.includes(
         'const composerEditable = $derived(protocolState === "open" && !sending);',
       ) &&
       consolePage.includes('sendControl({ method: "cancel" }, "Stop")') &&
       consolePage.includes("enabled: canSubmitDraft") &&
       consolePage.includes("disabled={!composerEditable}") &&
-      consolePage.includes('class:stop={workerRunning}') &&
+      consolePage.includes("class:stop={workerRunning}") &&
       consolePage.includes('"Stop Worker"') &&
       consolePage.includes("disabled={composerSubmitDisabled}") &&
       !consolePage.includes("disabled={!inputReady || sending}") &&
@@ -502,7 +543,10 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
     new URL("../sidebar/sidebar.css", import.meta.url),
   );
   const workspaceLayout = await Deno.readTextFile(
-    new URL("./../../../routes/w/[workspaceId]/+layout.svelte", import.meta.url),
+    new URL(
+      "./../../../routes/w/[workspaceId]/+layout.svelte",
+      import.meta.url,
+    ),
   );
   const workspaceLayoutLoad = await Deno.readTextFile(
     new URL("./../../../routes/w/[workspaceId]/+layout.ts", import.meta.url),
@@ -562,7 +606,9 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
   assert(
     workspaceLayout.includes("{#snippet workspaceSidebar()}") &&
       workspaceLayout.includes("WorkspaceSidebar") &&
-      workspaceLayout.includes("<SidebarOverride sidebar={workspaceSidebar} />") &&
+      workspaceLayout.includes(
+        "<SidebarOverride sidebar={workspaceSidebar} />",
+      ) &&
       workspaceLayoutLoad.includes("params.workspaceId") &&
       workspaceLayoutLoad.includes("workspaceApiPath(workspaceId"),
     "Workspace layout should load workspace data and register a WorkspaceSidebar snippet",
@@ -592,7 +638,8 @@ Deno.test("Account UI owns browser passkey session state without workspace autho
     "SidebarOverride should register and clean up the child-provided sidebar snippet",
   );
   assert(
-    rootLayoutLoad.includes('"/account"') && rootLayoutLoad.includes('"/login/device"'),
+    rootLayoutLoad.includes('"/account"') &&
+      rootLayoutLoad.includes('"/login/device"'),
     "Root layout should not redirect account and device-login public routes to a workspace",
   );
 });

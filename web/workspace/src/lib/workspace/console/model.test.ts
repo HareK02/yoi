@@ -1,11 +1,11 @@
 import type { Event } from "$lib/generated/protocol";
 import {
+  type ConsoleLine,
   createConsoleProjector,
   projectConsole,
   segmentsToText,
   selectConsoleTimelineLines,
   workerConsoleHref,
-  type ConsoleLine,
 } from "./model.ts";
 
 declare const Deno: {
@@ -67,8 +67,6 @@ Deno.test("workerConsoleHref encodes runtime and worker target authority", () =>
     "href should contain encoded runtime_id and worker_id segments",
   );
 });
-
-
 
 Deno.test("projectConsole projects visible protocol rows", () => {
   const projection = projectConsole([
@@ -192,7 +190,8 @@ Deno.test("projectConsole groups tool call lifecycle into one Call block", () =>
         data: {
           id: "call-1",
           summary: "command completed",
-          output: "/repo\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline12",
+          output:
+            "/repo\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline12",
           is_error: false,
         },
       } satisfies Event,
@@ -269,7 +268,10 @@ Deno.test("projectConsole caps default tool request and result previews", () => 
   assertEquals(line.title, "Call · CustomTool");
   assertEquals(line.body.split("\n").length, 7);
   assert(line.body.includes("CustomTool — done"), "tool state should be shown");
-  assert(line.body.includes('"first": "one"'), "request preview should be shown");
+  assert(
+    line.body.includes('"first": "one"'),
+    "request preview should be shown",
+  );
   assert(line.body.includes("out1"), "result preview should be shown");
   assert(!line.body.includes("third"), "request preview should be capped");
   assert(!line.body.includes("out3"), "result preview should be capped");
@@ -305,7 +307,10 @@ Deno.test("projectConsole shows Grep query and caps result preview to five entri
 
   const [line] = projection.lines.filter((line) => line.kind === "tool");
   assertEquals(line.title, "Call · Grep");
-  assert(line.body.includes("Grep — 6 matches"), "Grep summary should be shown");
+  assert(
+    line.body.includes("Grep — 6 matches"),
+    "Grep summary should be shown",
+  );
   assert(line.body.includes("query: needle"), "Grep query should be shown");
   assert(line.body.includes("hit1"), "first result should be shown");
   assert(line.body.includes("hit5"), "fifth result should be shown");
@@ -840,7 +845,9 @@ Deno.test("projectConsole renders snapshot entries and in-flight output", () => 
 
   assertEquals(projection.status, "running");
   assertEquals(
-    projection.lines.map((line) => `${line.kind}:${line.body}:${line.streaming}`),
+    projection.lines.map((line) =>
+      `${line.kind}:${line.body}:${line.streaming}`
+    ),
     [
       "user:seed user:false",
       "user:new user:false",
@@ -903,7 +910,9 @@ Deno.test("selectConsoleTimelineLines keeps all users and only last assistant pe
   ];
 
   assertEquals(
-    selectConsoleTimelineLines(items).map(({ item, index }) => `${index}:${item.id}`),
+    selectConsoleTimelineLines(items).map(({ item, index }) =>
+      `${index}:${item.id}`
+    ),
     ["0:u1", "3:a2", "4:u2", "6:a4"],
   );
 });
@@ -940,7 +949,10 @@ Deno.test("projectConsole relativizes known tool path displays from snapshot cwd
         data: {
           id: "write-rel",
           name: "Write",
-          arguments: JSON.stringify({ file_path: "/repo/out.txt", content: "ok" }),
+          arguments: JSON.stringify({
+            file_path: "/repo/out.txt",
+            content: "ok",
+          }),
         },
       } satisfies Event,
     },
@@ -1001,7 +1013,8 @@ Deno.test("projectConsole relativizes known tool path displays from snapshot cwd
         data: {
           id: "glob-rel",
           summary: "Found 2 file(s) matching **/*.rs",
-          output: "Found 2 file(s) matching **/*.rs\n/repo/src/main.rs\n/outside/lib.rs",
+          output:
+            "Found 2 file(s) matching **/*.rs\n/repo/src/main.rs\n/outside/lib.rs",
           is_error: false,
         },
       } satisfies Event,
@@ -1031,14 +1044,18 @@ Deno.test("projectConsole relativizes known tool path displays from snapshot cwd
     },
   ]);
 
-  const bodies = projection.lines.filter((line) => line.kind === "tool").map((line) => line.body);
+  const bodies = projection.lines.filter((line) => line.kind === "tool").map((
+    line,
+  ) => line.body);
   assertEquals(bodies[0], "Read — 1 file read\n  src/main.rs");
   assert(
     projection.lines[0].detail?.includes("from src/main.rs"),
     "Read summary detail path should be relative",
   );
   assert(
-    bodies.some((body) => body.includes("Write — out.txt") && body.includes("Wrote out.txt")),
+    bodies.some((body) =>
+      body.includes("Write — out.txt") && body.includes("Wrote out.txt")
+    ),
     "Write header and known result path should be relative",
   );
   assert(
@@ -1055,7 +1072,8 @@ Deno.test("projectConsole relativizes known tool path displays from snapshot cwd
   );
   assert(
     bodies.some((body) =>
-      body.includes("src/main.rs:12:needle") && body.includes("/outside/lib.rs:1:needle")
+      body.includes("src/main.rs:12:needle") &&
+      body.includes("/outside/lib.rs:1:needle")
     ),
     "Grep should relativize line-start cwd paths and keep outside paths absolute",
   );

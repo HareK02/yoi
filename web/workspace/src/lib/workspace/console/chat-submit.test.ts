@@ -53,9 +53,16 @@ Deno.test("shouldSubmitChatKey still supports explicit Cmd+Enter behavior", () =
 });
 
 Deno.test("shouldSubmitChatKey ignores IME composition and repeated Enter", () => {
-  const options = { mode: "mod-enter" as const, modKey: "meta" as const, enabled: true };
+  const options = {
+    mode: "mod-enter" as const,
+    modKey: "meta" as const,
+    enabled: true,
+  };
   assertEquals(
-    shouldSubmitChatKey({ key: "Enter", metaKey: true, isComposing: true }, options),
+    shouldSubmitChatKey(
+      { key: "Enter", metaKey: true, isComposing: true },
+      options,
+    ),
     false,
   );
   assertEquals(
@@ -69,7 +76,14 @@ Deno.test("shouldSubmitChatKey ignores IME composition and repeated Enter", () =
 });
 
 Deno.test("shouldSubmitChatKey supports enter submit mode", () => {
-  const options = { mode: "enter" as const, modKey: "meta" as const, enabled: true };
+  const options = {
+    mode: "enter" as const,
+    modKey: "meta" as const,
+    enabled: true,
+  };
   assert(shouldSubmitChatKey({ key: "Enter" }, options), "Enter should submit");
-  assertEquals(shouldSubmitChatKey({ key: "Enter", shiftKey: true }, options), false);
+  assertEquals(
+    shouldSubmitChatKey({ key: "Enter", shiftKey: true }, options),
+    false,
+  );
 });

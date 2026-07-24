@@ -10,7 +10,10 @@ import type { PageLoad } from "./$types";
 export const load: PageLoad = async ({ fetch, params }) => {
   const runtimeId = params.runtimeId;
   const [runtimes, workdirs, cleanupPlan] = await Promise.all([
-    loadJson<ListResponse<Runtime>>(fetch, workspaceApiPath(params.workspaceId, "/runtimes")),
+    loadJson<ListResponse<Runtime>>(
+      fetch,
+      workspaceApiPath(params.workspaceId, "/runtimes"),
+    ),
     loadJson<BrowserWorkingDirectoryListResponse>(
       fetch,
       workspaceApiPath(
@@ -20,7 +23,10 @@ export const load: PageLoad = async ({ fetch, params }) => {
     ),
     loadJson<RuntimeCleanupPlanResponse>(
       fetch,
-      workspaceApiPath(params.workspaceId, `/runtimes/${encodeURIComponent(runtimeId)}/cleanup-plan`),
+      workspaceApiPath(
+        params.workspaceId,
+        `/runtimes/${encodeURIComponent(runtimeId)}/cleanup-plan`,
+      ),
     ),
   ]);
 

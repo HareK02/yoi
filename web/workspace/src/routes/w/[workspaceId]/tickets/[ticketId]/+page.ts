@@ -6,7 +6,10 @@ export const load = (async ({ fetch, params }) => {
   const ticketId = params.ticketId;
   const ticket = await loadJson<TicketDetail>(
     fetch,
-    workspaceApiPath(params.workspaceId, `/tickets/${encodeURIComponent(ticketId)}`),
+    workspaceApiPath(
+      params.workspaceId,
+      `/tickets/${encodeURIComponent(ticketId)}`,
+    ),
   );
 
   return {

@@ -12,112 +12,294 @@ export type WorkerStatus = "idle" | "running" | "paused";
 
 export type TurnResult = "finished" | "paused";
 
-export type InvokeKind = "user_send" | "notify" | "worker_event" | "system_reminder" | "wakeup";
+export type InvokeKind =
+  | "user_send"
+  | "notify"
+  | "worker_event"
+  | "system_reminder"
+  | "wakeup";
 
 export type RunResult = "finished" | "paused" | "limit_reached" | "rolled_back";
 
-export type ErrorCode = "already_running" | "not_running" | "not_paused" | "provider_error" | "tool_error" | "invalid_request" | "internal";
+export type ErrorCode =
+  | "already_running"
+  | "not_running"
+  | "not_paused"
+  | "provider_error"
+  | "tool_error"
+  | "invalid_request"
+  | "internal";
 
 export type Permission = "read" | "write";
 
 export type InFlightToolCallState = "pending" | "streaming_args" | "done";
 
 export type ScopeRule = {
-/**
- * Target path. Must be absolute by the time a `Scope` is built from
- * this rule — relative paths are resolved per-layer against the
- * manifest file's directory (cwd for overlay layers) before cascade
- * merge.
- */
-target: string,
-/**
- * Permission level this rule grants (allow) or caps strictly below
- * (deny).
- */
-permission: Permission,
-/**
- * When `false`, the rule only matches the target itself and its
- * direct children. Defaults to `true`.
- */
-recursive: boolean, };
+  /**
+   * Target path. Must be absolute by the time a `Scope` is built from
+   * this rule — relative paths are resolved per-layer against the
+   * manifest file's directory (cwd for overlay layers) before cascade
+   * merge.
+   */
+  target: string;
+  /**
+   * Permission level this rule grants (allow) or caps strictly below
+   * (deny).
+   */
+  permission: Permission;
+  /**
+   * When `false`, the rule only matches the target itself and its
+   * direct children. Defaults to `true`.
+   */
+  recursive: boolean;
+};
 
-export type CompletionEntry = { value: string, is_dir: boolean, };
+export type CompletionEntry = { value: string; is_dir: boolean };
 
-export type RewindTargetId = { segment_id: string, user_input_entry_index: number, };
+export type RewindTargetId = {
+  segment_id: string;
+  user_input_entry_index: number;
+};
 
-export type RewindTarget = { id: RewindTargetId, expected_head_entries: number, truncate_entries: number, turn_index: number, timestamp_ms: number | null, preview: string, eligible: boolean, disabled_reason: string | null, warning: string | null, };
+export type RewindTarget = {
+  id: RewindTargetId;
+  expected_head_entries: number;
+  truncate_entries: number;
+  turn_index: number;
+  timestamp_ms: number | null;
+  preview: string;
+  eligible: boolean;
+  disabled_reason: string | null;
+  warning: string | null;
+};
 
-export type RewindSummary = { truncated_to_entries: number, discarded_entries: number, tool_side_effect_warning: boolean, };
+export type RewindSummary = {
+  truncated_to_entries: number;
+  discarded_entries: number;
+  tool_side_effect_warning: boolean;
+};
 
-export type InFlightBlock = { "kind": "text", text: string, finished?: boolean, } | { "kind": "thinking", text: string, finished?: boolean, } | { "kind": "tool_call", id: string, name: string, args: string, state?: InFlightToolCallState, };
+export type InFlightBlock =
+  | { "kind": "text"; text: string; finished?: boolean }
+  | { "kind": "thinking"; text: string; finished?: boolean }
+  | {
+    "kind": "tool_call";
+    id: string;
+    name: string;
+    args: string;
+    state?: InFlightToolCallState;
+  };
 
-export type InFlightSnapshot = { blocks?: Array<InFlightBlock>, };
+export type InFlightSnapshot = { blocks?: Array<InFlightBlock> };
 
-export type Greeting = { worker_name: string, cwd: string, provider: string, model: string, scope_summary: string, tools: Array<string>,
-/**
- * Model context window in tokens. Always filled by the Worker greeting.
- */
-context_window: number,
-/**
- * Estimated current session context tokens at connect time.
- */
-context_tokens: number, };
+export type Greeting = {
+  worker_name: string;
+  cwd: string;
+  provider: string;
+  model: string;
+  scope_summary: string;
+  tools: Array<string>;
+  /**
+   * Model context window in tokens. Always filled by the Worker greeting.
+   */
+  context_window: number;
+  /**
+   * Estimated current session context tokens at connect time.
+   */
+  context_tokens: number;
+};
 
-export type Alert = { level: AlertLevel, source: AlertSource, message: string,
-/**
- * Milliseconds since the Unix epoch.
- */
-timestamp_ms: number, };
+export type Alert = {
+  level: AlertLevel;
+  source: AlertSource;
+  message: string;
+  /**
+   * Milliseconds since the Unix epoch.
+   */
+  timestamp_ms: number;
+};
 
-export type MemoryWorkerEvent = { worker: string, status: string, run_id: string, trigger: string, reason: string,
-/**
- * Human-readable compact form for actionbar rendering.
- */
-message: string,
-/**
- * Milliseconds since the Unix epoch.
- */
-timestamp_ms: number, };
+export type MemoryWorkerEvent = {
+  worker: string;
+  status: string;
+  run_id: string;
+  trigger: string;
+  reason: string;
+  /**
+   * Human-readable compact form for actionbar rendering.
+   */
+  message: string;
+  /**
+   * Milliseconds since the Unix epoch.
+   */
+  timestamp_ms: number;
+};
 
-export type Segment = { "kind": "text", content: string, } | { "kind": "paste", id: number, chars: number, lines: number, content: string, } | { "kind": "file_ref", path: string, } | { "kind": "unknown" };
+export type Segment =
+  | { "kind": "text"; content: string }
+  | {
+    "kind": "paste";
+    id: number;
+    chars: number;
+    lines: number;
+    content: string;
+  }
+  | { "kind": "file_ref"; path: string }
+  | { "kind": "unknown" };
 
-export type WorkerEvent = { "kind": "turn_ended", worker_name: string, } | { "kind": "errored", worker_name: string, message: string, } | { "kind": "shut_down", worker_name: string, } | { "kind": "scope_sub_delegated",
-/**
- * Sub-delegating Worker (= the sender itself).
- */
-parent_worker: string,
-/**
- * Name of the grandchild Worker.
- */
-sub_worker: string,
-/**
- * Unix-socket path where the grandchild is reachable.
- */
-sub_socket: string,
-/**
- * Scope delegated to the grandchild.
- */
-scope: Array<ScopeRule>, };
+export type WorkerEvent =
+  | { "kind": "turn_ended"; worker_name: string }
+  | { "kind": "errored"; worker_name: string; message: string }
+  | { "kind": "shut_down"; worker_name: string }
+  | {
+    "kind": "scope_sub_delegated";
+    /**
+     * Sub-delegating Worker (= the sender itself).
+     */
+    parent_worker: string;
+    /**
+     * Name of the grandchild Worker.
+     */
+    sub_worker: string;
+    /**
+     * Unix-socket path where the grandchild is reachable.
+     */
+    sub_socket: string;
+    /**
+     * Scope delegated to the grandchild.
+     */
+    scope: Array<ScopeRule>;
+  };
 
-export type Method = { "method": "run", "params": { input: Array<Segment>, } } | { "method": "notify", "params": { message: string, auto_run?: boolean, } } | { "method": "worker_event", "params": WorkerEvent } | { "method": "resume" } | { "method": "cancel" } | { "method": "pause" } | { "method": "compact" } | { "method": "list_rewind_targets" } | { "method": "rewind_to", "params": { target: RewindTargetId, expected_head_entries: number, } } | { "method": "shutdown" } | { "method": "list_completions", "params": { kind: CompletionKind, prefix: string, } } | { "method": "list_workers" } | { "method": "restore_worker", "params": { name: string, } } | { "method": "register_peer", "params": { name: string, } };
+export type Method =
+  | { "method": "run"; "params": { input: Array<Segment> } }
+  | { "method": "notify"; "params": { message: string; auto_run?: boolean } }
+  | { "method": "worker_event"; "params": WorkerEvent }
+  | { "method": "resume" }
+  | { "method": "cancel" }
+  | { "method": "pause" }
+  | { "method": "compact" }
+  | { "method": "list_rewind_targets" }
+  | {
+    "method": "rewind_to";
+    "params": { target: RewindTargetId; expected_head_entries: number };
+  }
+  | { "method": "shutdown" }
+  | {
+    "method": "list_completions";
+    "params": { kind: CompletionKind; prefix: string };
+  }
+  | { "method": "list_workers" }
+  | { "method": "restore_worker"; "params": { name: string } }
+  | { "method": "register_peer"; "params": { name: string } };
 
-export type Event = { "event": "user_message", "data": { segments: Array<Segment>, } } | { "event": "system_item", "data": { item: unknown, } } | { "event": "invoke_start", "data": { kind: InvokeKind, } } | { "event": "turn_start", "data": { turn: number, } } | { "event": "turn_end", "data": { turn: number, result: TurnResult, } } | { "event": "llm_call_start", "data": { llm_call: number, } } | { "event": "llm_call_end", "data": { llm_call: number, } } | { "event": "llm_retry", "data": { llm_call: number,
-/**
- * The attempt that just failed. 1 origin.
- */
-failed_attempt: number, max_attempts: number, wait_ms: number, elapsed_ms: number, status?: number | null, error: string, } } | { "event": "llm_continuation", "data": { llm_call: number, attempt: number, max_attempts: number, reason: string, } } | { "event": "text_delta", "data": { text: string, } } | { "event": "text_done", "data": { text: string, } } | { "event": "thinking_start" } | { "event": "thinking_delta", "data": { text: string, } } | { "event": "thinking_done", "data": { text: string, } } | { "event": "tool_call_start", "data": { id: string, name: string, } } | { "event": "tool_call_args_delta", "data": { id: string, json: string, } } | { "event": "tool_call_done", "data": { id: string, name: string, arguments: string, } } | { "event": "tool_result", "data": { id: string,
-/**
- * Short human-readable summary. Always present; used by clients
- * that only want a 1-line rendering (e.g. collapsed views).
- */
-summary: string,
-/**
- * Full tool output. Absent when the tool chose to return
- * summary-only, or when the result was pruned.
- */
-output?: string | null, is_error: boolean, } } | { "event": "usage", "data": { input_tokens: number | null, output_tokens: number | null, cache_read_input_tokens?: number | null, } } | { "event": "run_end", "data": { result: RunResult, } } | { "event": "error", "data": { code: ErrorCode, message: string, } } | { "event": "snapshot", "data": { entries: Array<unknown>, greeting: Greeting, status: WorkerStatus,
-/**
- * Unfinished model output that has already streamed in the current
- * run but is not yet represented by committed snapshot entries.
- */
-in_flight?: InFlightSnapshot, } } | { "event": "segment_rotated", "data": { entry: unknown, } } | { "event": "status", "data": { status: WorkerStatus, } } | { "event": "completions", "data": { kind: CompletionKind, entries: Array<CompletionEntry>, } } | { "event": "rewind_targets", "data": { head_entries: number, targets: Array<RewindTarget>, } } | { "event": "rewind_applied", "data": { entries: Array<unknown>, input: Array<Segment>, summary: RewindSummary, } } | { "event": "workers_listed", "data": { workers: unknown, } } | { "event": "worker_restored", "data": { result: unknown, } } | { "event": "peer_registered", "data": { result: unknown, } } | { "event": "alert", "data": Alert } | { "event": "memory_worker", "data": MemoryWorkerEvent } | { "event": "compact_start" } | { "event": "compact_done", "data": { new_segment_id: string, } } | { "event": "compact_failed", "data": { error: string, } } | { "event": "shutdown" };
+export type Event =
+  | { "event": "user_message"; "data": { segments: Array<Segment> } }
+  | { "event": "system_item"; "data": { item: unknown } }
+  | { "event": "invoke_start"; "data": { kind: InvokeKind } }
+  | { "event": "turn_start"; "data": { turn: number } }
+  | { "event": "turn_end"; "data": { turn: number; result: TurnResult } }
+  | { "event": "llm_call_start"; "data": { llm_call: number } }
+  | { "event": "llm_call_end"; "data": { llm_call: number } }
+  | {
+    "event": "llm_retry";
+    "data": {
+      llm_call: number;
+      /**
+       * The attempt that just failed. 1 origin.
+       */
+      failed_attempt: number;
+      max_attempts: number;
+      wait_ms: number;
+      elapsed_ms: number;
+      status?: number | null;
+      error: string;
+    };
+  }
+  | {
+    "event": "llm_continuation";
+    "data": {
+      llm_call: number;
+      attempt: number;
+      max_attempts: number;
+      reason: string;
+    };
+  }
+  | { "event": "text_delta"; "data": { text: string } }
+  | { "event": "text_done"; "data": { text: string } }
+  | { "event": "thinking_start" }
+  | { "event": "thinking_delta"; "data": { text: string } }
+  | { "event": "thinking_done"; "data": { text: string } }
+  | { "event": "tool_call_start"; "data": { id: string; name: string } }
+  | { "event": "tool_call_args_delta"; "data": { id: string; json: string } }
+  | {
+    "event": "tool_call_done";
+    "data": { id: string; name: string; arguments: string };
+  }
+  | {
+    "event": "tool_result";
+    "data": {
+      id: string;
+      /**
+       * Short human-readable summary. Always present; used by clients
+       * that only want a 1-line rendering (e.g. collapsed views).
+       */
+      summary: string;
+      /**
+       * Full tool output. Absent when the tool chose to return
+       * summary-only, or when the result was pruned.
+       */
+      output?: string | null;
+      is_error: boolean;
+    };
+  }
+  | {
+    "event": "usage";
+    "data": {
+      input_tokens: number | null;
+      output_tokens: number | null;
+      cache_read_input_tokens?: number | null;
+    };
+  }
+  | { "event": "run_end"; "data": { result: RunResult } }
+  | { "event": "error"; "data": { code: ErrorCode; message: string } }
+  | {
+    "event": "snapshot";
+    "data": {
+      entries: Array<unknown>;
+      greeting: Greeting;
+      status: WorkerStatus;
+      /**
+       * Unfinished model output that has already streamed in the current
+       * run but is not yet represented by committed snapshot entries.
+       */
+      in_flight?: InFlightSnapshot;
+    };
+  }
+  | { "event": "segment_rotated"; "data": { entry: unknown } }
+  | { "event": "status"; "data": { status: WorkerStatus } }
+  | {
+    "event": "completions";
+    "data": { kind: CompletionKind; entries: Array<CompletionEntry> };
+  }
+  | {
+    "event": "rewind_targets";
+    "data": { head_entries: number; targets: Array<RewindTarget> };
+  }
+  | {
+    "event": "rewind_applied";
+    "data": {
+      entries: Array<unknown>;
+      input: Array<Segment>;
+      summary: RewindSummary;
+    };
+  }
+  | { "event": "workers_listed"; "data": { workers: unknown } }
+  | { "event": "worker_restored"; "data": { result: unknown } }
+  | { "event": "peer_registered"; "data": { result: unknown } }
+  | { "event": "alert"; "data": Alert }
+  | { "event": "memory_worker"; "data": MemoryWorkerEvent }
+  | { "event": "compact_start" }
+  | { "event": "compact_done"; "data": { new_segment_id: string } }
+  | { "event": "compact_failed"; "data": { error: string } }
+  | { "event": "shutdown" };

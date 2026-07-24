@@ -25,7 +25,10 @@ export function projectRepositoryNav(
     count: summaries.length,
     diagnostics: repositories?.diagnostics ?? [],
     items: summaries.map((repository) => {
-      const href = workspaceRoute(workspaceId, `/repositories/${encodeURIComponent(repository.id)}`);
+      const href = workspaceRoute(
+        workspaceId,
+        `/repositories/${encodeURIComponent(repository.id)}`,
+      );
       return {
         id: repository.id,
         title: repository.display_name || repository.id,

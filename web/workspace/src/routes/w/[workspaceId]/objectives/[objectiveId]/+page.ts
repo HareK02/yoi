@@ -9,7 +9,7 @@ export const load: PageLoad = async ({ fetch, params }) => {
   const apiPath = (path: string) => workspaceApiPath(params.workspaceId, path);
   const objectiveId = params.objectiveId;
   const [objectives, objective] = await Promise.all([
-    loadJson<ObjectiveListResponse>(fetch, apiPath('/objectives')),
+    loadJson<ObjectiveListResponse>(fetch, apiPath("/objectives")),
     loadJson<ObjectiveDetail>(
       fetch,
       apiPath(`/objectives/${encodeURIComponent(objectiveId)}`),

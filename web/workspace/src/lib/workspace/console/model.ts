@@ -1,6 +1,6 @@
 import type {
-  Event as ProtocolEvent,
   Alert,
+  Event as ProtocolEvent,
   InFlightBlock,
   InFlightToolCallState,
   Segment,
@@ -148,7 +148,10 @@ export function emptyConsoleProjection(): ConsoleProjection {
 export function projectConsole(
   events: ConsoleEventInput[] = [],
 ): ConsoleProjection {
-  const projection = events.reduce(applyProtocolEvent, emptyConsoleProjection());
+  const projection = events.reduce(
+    applyProtocolEvent,
+    emptyConsoleProjection(),
+  );
   return projectVisibleConsole(projection);
 }
 
@@ -171,7 +174,9 @@ export function createConsoleProjector() {
   };
 }
 
-function projectVisibleConsole(projection: ConsoleProjection): ConsoleProjection {
+function projectVisibleConsole(
+  projection: ConsoleProjection,
+): ConsoleProjection {
   return {
     ...projection,
     lines: aggregateReadToolLines(projection.lines),
@@ -302,7 +307,9 @@ export function applyProtocolEvent(
       next.status = event.data.status;
       break;
     case "segment_rotated":
-      next.lines = snapshotLinesFromEntries(envelope.eventId, [event.data.entry], next.cwd);
+      next.lines = snapshotLinesFromEntries(envelope.eventId, [
+        event.data.entry,
+      ], next.cwd);
       break;
     case "invoke_start":
     case "turn_start":
@@ -730,7 +737,9 @@ function readDetail(toolCall: ToolCallView): string {
     `state: ${stateSuffix(toolCall.state)}`,
     `path: ${readPath(toolCall)}`,
     toolCall.summary
-      ? `summary: ${normalizeKnownToolResult(toolCall.name, toolCall.summary, toolCall.cwd)}`
+      ? `summary: ${
+        normalizeKnownToolResult(toolCall.name, toolCall.summary, toolCall.cwd)
+      }`
       : undefined,
   ]);
 }
@@ -902,7 +911,9 @@ function toolCallDetail(toolCall: ToolCallView): string {
     `id: ${toolCall.id}`,
     `state: ${stateSuffix(toolCall.state)}`,
     toolCall.summary
-      ? `summary: ${normalizeKnownToolResult(toolCall.name, toolCall.summary, toolCall.cwd)}`
+      ? `summary: ${
+        normalizeKnownToolResult(toolCall.name, toolCall.summary, toolCall.cwd)
+      }`
       : undefined,
     argsText(toolCall) ? `arguments:\n${argsText(toolCall)}` : undefined,
   ]);
@@ -1155,7 +1166,8 @@ function applyExtensionEntry(
   }
   const blockId = stringField(payload, "block_id") || "compact";
   const state = stringField(payload, "state") || "running";
-  const message = stringField(payload, "message") || compactMessageForState(state, payload);
+  const message = stringField(payload, "message") ||
+    compactMessageForState(state, payload);
   upsertStatusLine(
     projection,
     blockId,
@@ -1204,26 +1216,38 @@ function applyLoggedItem(
       break;
     }
     case "reasoning": {
-      const text = stringField(item, "text") ?? arrayField(item, "summary").filter((value) => typeof value === "string").join("\n");
+      const text = stringField(item, "text") ??
+        arrayField(item, "summary").filter((value) => typeof value === "string")
+          .join("\n");
       if (text) {
         projection.lines.push(line(eventId, "thinking", "Thought", text));
       }
       break;
     }
     case "tool_call":
-      upsertToolCall(projection, eventId, stringField(item, "call_id") ?? eventId, {
-        name: stringField(item, "name") ?? "Tool",
-        arguments: stringField(item, "arguments") ?? "",
-        argsStream: stringField(item, "arguments") ?? "",
-        state: "running",
-      });
+      upsertToolCall(
+        projection,
+        eventId,
+        stringField(item, "call_id") ?? eventId,
+        {
+          name: stringField(item, "name") ?? "Tool",
+          arguments: stringField(item, "arguments") ?? "",
+          argsStream: stringField(item, "arguments") ?? "",
+          state: "running",
+        },
+      );
       break;
     case "tool_result":
-      attachToolResult(projection, eventId, stringField(item, "call_id") ?? eventId, {
-        summary: stringField(item, "summary") ?? "",
-        output: stringField(item, "content"),
-        isError: item["is_error"] === true,
-      });
+      attachToolResult(
+        projection,
+        eventId,
+        stringField(item, "call_id") ?? eventId,
+        {
+          summary: stringField(item, "summary") ?? "",
+          output: stringField(item, "content"),
+          isError: item["is_error"] === true,
+        },
+      );
       break;
     default:
       break;

@@ -1,5 +1,9 @@
 import { loadJson, workspaceApiPath } from "$lib/workspace/api/http";
-import type { ListResponse, RuntimeCleanupPlanResponse, Worker } from "$lib/workspace/sidebar/types";
+import type {
+  ListResponse,
+  RuntimeCleanupPlanResponse,
+  Worker,
+} from "$lib/workspace/sidebar/types";
 import type { PageLoad } from "./$types";
 
 export const load: PageLoad = async ({ fetch, params }) => {
@@ -7,12 +11,17 @@ export const load: PageLoad = async ({ fetch, params }) => {
     fetch,
     workspaceApiPath(params.workspaceId, "/workers"),
   );
-  const runtimeIds = Array.from(new Set(workers.data?.items.map((worker) => worker.runtime_id) ?? []));
+  const runtimeIds = Array.from(
+    new Set(workers.data?.items.map((worker) => worker.runtime_id) ?? []),
+  );
   const cleanupPlanEntries = await Promise.all(
     runtimeIds.map(async (runtimeId) => {
       const cleanupPlan = await loadJson<RuntimeCleanupPlanResponse>(
         fetch,
-        workspaceApiPath(params.workspaceId, `/runtimes/${encodeURIComponent(runtimeId)}/cleanup-plan`),
+        workspaceApiPath(
+          params.workspaceId,
+          `/runtimes/${encodeURIComponent(runtimeId)}/cleanup-plan`,
+        ),
       );
       return [runtimeId, cleanupPlan] as const;
     }),

@@ -35,17 +35,23 @@ export function defaultWorkerLaunchForm(
   const preferredProfile =
     options?.profiles.find((candidate) => candidate.id === "builtin:coder") ??
       options?.profiles[0];
-  const availableWorkingDirectories = options?.working_directories.filter((directory) =>
-    directory.status === "active" &&
-    directory.cleanliness === "clean" &&
-    directory.primary_worker_id == null &&
-    directory.occupied_by == null
-  ) ?? [];
+  const availableWorkingDirectories =
+    options?.working_directories.filter((directory) =>
+      directory.status === "active" &&
+      directory.cleanliness === "clean" &&
+      directory.primary_worker_id == null &&
+      directory.occupied_by == null
+    ) ?? [];
   const selectedRuntime = current.runtime_id
-    ? options?.runtimes.find((runtime) => runtime.runtime_id === current.runtime_id)
+    ? options?.runtimes.find((runtime) =>
+      runtime.runtime_id === current.runtime_id
+    )
     : preferredRuntime;
-  const workdirlessRuntime = selectedRuntime?.working_directory_required === false;
-  const preferredWorkingDirectory = workdirlessRuntime ? undefined : availableWorkingDirectories[0];
+  const workdirlessRuntime =
+    selectedRuntime?.working_directory_required === false;
+  const preferredWorkingDirectory = workdirlessRuntime
+    ? undefined
+    : availableWorkingDirectories[0];
   const preferredRepository =
     options?.repositories.find((repository) =>
       repository.id === current.working_directory_repository_id
@@ -60,12 +66,13 @@ export function defaultWorkerLaunchForm(
         ? current.profile
         : preferredProfile?.id || "",
     initial_text: current.initial_text,
-    working_directory_id: !workdirlessRuntime && availableWorkingDirectories.some(
-        (directory) =>
-          directory.working_directory_id === current.working_directory_id,
-      )
-      ? current.working_directory_id
-      : preferredWorkingDirectory?.working_directory_id || "",
+    working_directory_id:
+      !workdirlessRuntime && availableWorkingDirectories.some(
+          (directory) =>
+            directory.working_directory_id === current.working_directory_id,
+        )
+        ? current.working_directory_id
+        : preferredWorkingDirectory?.working_directory_id || "",
     working_directory_repository_id: current.working_directory_repository_id ||
       preferredRepository?.id || "",
     working_directory_selector: current.working_directory_selector ||

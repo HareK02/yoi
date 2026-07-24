@@ -23,7 +23,9 @@ export type ChatSubmitKeyEventLike = {
   which?: number;
 };
 
-function normalizeOptions(options: ChatSubmitOptions): NormalizedChatSubmitOptions {
+function normalizeOptions(
+  options: ChatSubmitOptions,
+): NormalizedChatSubmitOptions {
   return {
     mode: "mod-enter",
     modKey: "auto",
@@ -47,7 +49,8 @@ function isApplePlatform(): boolean {
   }
   const platform = navigator.platform || "";
   const userAgent = navigator.userAgent || "";
-  return /Mac|iPhone|iPad|iPod/.test(platform) || /Mac|iPhone|iPad|iPod/.test(userAgent);
+  return /Mac|iPhone|iPad|iPod/.test(platform) ||
+    /Mac|iPhone|iPad|iPod/.test(userAgent);
 }
 
 function resolveModKey(modKey: ChatSubmitModKey): "meta" | "ctrl" {
@@ -57,8 +60,13 @@ function resolveModKey(modKey: ChatSubmitModKey): "meta" | "ctrl" {
   return modKey;
 }
 
-function isModPressed(event: ChatSubmitKeyEventLike, modKey: ChatSubmitModKey): boolean {
-  return resolveModKey(modKey) === "meta" ? event.metaKey === true : event.ctrlKey === true;
+function isModPressed(
+  event: ChatSubmitKeyEventLike,
+  modKey: ChatSubmitModKey,
+): boolean {
+  return resolveModKey(modKey) === "meta"
+    ? event.metaKey === true
+    : event.ctrlKey === true;
 }
 
 export function shouldSubmitChatKey(
@@ -79,7 +87,10 @@ export function shouldSubmitChatKey(
   return isModPressed(event, options.modKey);
 }
 
-export function chatSubmit(node: HTMLTextAreaElement, options: ChatSubmitOptions) {
+export function chatSubmit(
+  node: HTMLTextAreaElement,
+  options: ChatSubmitOptions,
+) {
   let current = normalizeOptions(options);
   let isComposing = false;
 

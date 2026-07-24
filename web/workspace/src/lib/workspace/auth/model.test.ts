@@ -11,7 +11,9 @@ declare const Deno: {
 
 function assertEquals<T>(actual: T, expected: T): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-    throw new Error(`expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+    throw new Error(
+      `expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`,
+    );
   }
 }
 
@@ -19,7 +21,9 @@ function bytes(buffer: BufferSource): number[] {
   if (buffer instanceof ArrayBuffer) {
     return [...new Uint8Array(buffer)];
   }
-  return [...new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)];
+  return [
+    ...new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength),
+  ];
 }
 
 Deno.test("base64url helpers round-trip binary data", () => {
@@ -43,13 +47,20 @@ Deno.test("prepareRegistrationOptions decodes binary public key fields", () => {
         displayName: "Local User",
       },
       pubKeyCredParams: [{ type: "public-key", alg: -7 }],
-      excludeCredentials: [{ type: "public-key", id: "BwgJ" as unknown as BufferSource }],
+      excludeCredentials: [{
+        type: "public-key",
+        id: "BwgJ" as unknown as BufferSource,
+      }],
     },
   });
 
   assertEquals(bytes(options.challenge), [1, 2, 3]);
   assertEquals(bytes(options.user.id), [4, 5, 6]);
-  assertEquals(bytes(options.excludeCredentials?.[0].id as BufferSource), [7, 8, 9]);
+  assertEquals(bytes(options.excludeCredentials?.[0].id as BufferSource), [
+    7,
+    8,
+    9,
+  ]);
 });
 
 Deno.test("prepareLoginOptions decodes challenge and allowed credential ids", () => {
@@ -57,10 +68,17 @@ Deno.test("prepareLoginOptions decodes challenge and allowed credential ids", ()
     challenge_id: "challenge-1",
     public_key: {
       challenge: "AQID" as unknown as BufferSource,
-      allowCredentials: [{ type: "public-key", id: "BwgJ" as unknown as BufferSource }],
+      allowCredentials: [{
+        type: "public-key",
+        id: "BwgJ" as unknown as BufferSource,
+      }],
     },
   });
 
   assertEquals(bytes(options.challenge), [1, 2, 3]);
-  assertEquals(bytes(options.allowCredentials?.[0].id as BufferSource), [7, 8, 9]);
+  assertEquals(bytes(options.allowCredentials?.[0].id as BufferSource), [
+    7,
+    8,
+    9,
+  ]);
 });

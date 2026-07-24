@@ -1,20 +1,22 @@
 import {
   authenticationCredentialToJson,
-  isPublicKeyCredential,
-  prepareLoginOptions,
-  prepareRegistrationOptions,
-  registrationCredentialToJson,
   type DeviceApprovalResponse,
+  isPublicKeyCredential,
   type PasskeyLoginOptionsResponse,
   type PasskeyRegistrationOptionsResponse,
   type PasskeyUserResponse,
+  prepareLoginOptions,
+  prepareRegistrationOptions,
+  registrationCredentialToJson,
   type WhoamiResponse,
 } from "./model";
 
 async function jsonOrThrow<T>(response: Response): Promise<T> {
   const text = await response.text();
   if (!response.ok) {
-    throw new Error(`${response.status} ${response.statusText}${text ? `: ${text}` : ""}`);
+    throw new Error(
+      `${response.status} ${response.statusText}${text ? `: ${text}` : ""}`,
+    );
   }
   return text ? JSON.parse(text) as T : (null as T);
 }
@@ -23,8 +25,12 @@ function browserOrigin(): string | null {
   return globalThis.location?.origin ?? null;
 }
 
-export async function loadWhoami(fetcher: typeof fetch = fetch): Promise<WhoamiResponse> {
-  return await fetcher("/api/auth/whoami", { credentials: "same-origin" }).then(jsonOrThrow<WhoamiResponse>);
+export async function loadWhoami(
+  fetcher: typeof fetch = fetch,
+): Promise<WhoamiResponse> {
+  return await fetcher("/api/auth/whoami", { credentials: "same-origin" }).then(
+    jsonOrThrow<WhoamiResponse>,
+  );
 }
 
 export async function registerPasskey(
@@ -36,14 +42,20 @@ export async function registerPasskey(
     method: "POST",
     headers: { "content-type": "application/json" },
     credentials: "same-origin",
-    body: JSON.stringify({ handle, display_name: displayName, browser_origin: browserOrigin() }),
+    body: JSON.stringify({
+      handle,
+      display_name: displayName,
+      browser_origin: browserOrigin(),
+    }),
   }).then(jsonOrThrow<PasskeyRegistrationOptionsResponse>);
 
   const credential = await navigator.credentials.create({
     publicKey: prepareRegistrationOptions(options),
   });
   if (!isPublicKeyCredential(credential)) {
-    throw new Error("Passkey registration did not return a public-key credential.");
+    throw new Error(
+      "Passkey registration did not return a public-key credential.",
+    );
   }
 
   return await fetcher("/api/auth/passkeys/registration/complete", {

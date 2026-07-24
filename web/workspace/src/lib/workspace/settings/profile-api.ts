@@ -1,7 +1,4 @@
-import {
-  workspaceApiJson,
-  workspaceApiJsonWithBody,
-} from "../api/http";
+import { workspaceApiJson, workspaceApiJsonWithBody } from "../api/http";
 import type {
   ProfileSettingsMutationResponse,
   ProfileSettingsResponse,
@@ -124,7 +121,9 @@ export function fetchProfileSourceTree(
   sourceTreeId: string,
 ): Promise<WorkspaceProfileSourceTreeResponse> {
   return workspaceApiJson(
-    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/trees/${encodeURIComponent(sourceTreeId)}`,
+    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/trees/${
+      encodeURIComponent(sourceTreeId)
+    }`,
   );
 }
 
@@ -134,7 +133,9 @@ export function fetchProfileTreeFile(
   path: string,
 ): Promise<WorkspaceProfileSourceTreeFileResponse> {
   return workspaceApiJson(
-    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/trees/${encodeURIComponent(sourceTreeId)}/file?path=${encodeURIComponent(path)}`,
+    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/trees/${
+      encodeURIComponent(sourceTreeId)
+    }/file?path=${encodeURIComponent(path)}`,
   );
 }
 
@@ -144,7 +145,9 @@ export function writeProfileTreeFile(
   request: { path: string; content: string; revision?: string | null },
 ): Promise<WorkspaceProfileSourceTreeFileResponse> {
   return workspaceApiJsonWithBody(
-    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/trees/${encodeURIComponent(sourceTreeId)}/file`,
+    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/trees/${
+      encodeURIComponent(sourceTreeId)
+    }/file`,
     { method: "PUT", body: JSON.stringify(request) },
   );
 }
@@ -155,7 +158,9 @@ export function deleteProfileTreeFile(
   request: { path: string; revision: string },
 ): Promise<WorkspaceProfileSourceTreeResponse> {
   return workspaceApiJsonWithBody(
-    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/trees/${encodeURIComponent(sourceTreeId)}/file`,
+    `/api/w/${encodeURIComponent(workspaceId)}/settings/profiles/trees/${
+      encodeURIComponent(sourceTreeId)
+    }/file`,
     { method: "DELETE", body: JSON.stringify(request) },
   );
 }

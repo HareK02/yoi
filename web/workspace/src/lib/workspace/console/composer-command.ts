@@ -25,7 +25,8 @@ type CommandSpec = {
 const COMMANDS: Record<string, CommandSpec> = {
   help: {
     usage: ":help [command]",
-    description: "Show available Web Console commands or details for one command.",
+    description:
+      "Show available Web Console commands or details for one command.",
   },
   "?": {
     usage: ":? [command]",
@@ -49,7 +50,8 @@ const COMMANDS: Record<string, CommandSpec> = {
   },
   peer: {
     usage: ":peer <worker-name>",
-    description: "Register another existing Worker as a reciprocal metadata peer.",
+    description:
+      "Register another existing Worker as a reciprocal metadata peer.",
   },
   system: {
     usage: ":system <message>",
@@ -71,7 +73,9 @@ export function buildComposerRequest(value: string): ComposerCommandResult {
     request: {
       kind: "user",
       content,
-      segments: segments.some((segment) => segment.kind !== "text") ? segments : undefined,
+      segments: segments.some((segment) => segment.kind !== "text")
+        ? segments
+        : undefined,
     },
   };
 }
@@ -97,13 +101,21 @@ function buildColonCommand(commandLine: string): ComposerCommandResult {
       if (argv.length > 0) {
         return invalidUsage("compact");
       }
-      return { ok: true, request: { kind: "compact", content: "" }, notice: "compact requested" };
+      return {
+        ok: true,
+        request: { kind: "compact", content: "" },
+        notice: "compact requested",
+      };
     case "rewind":
     case "rollback":
       if (argv.length > 0) {
         return invalidUsage("rewind");
       }
-      return { ok: true, request: { kind: "list_rewind_targets", content: "" }, notice: "rewind targets requested" };
+      return {
+        ok: true,
+        request: { kind: "list_rewind_targets", content: "" },
+        notice: "rewind targets requested",
+      };
     case "peer":
       if (argv.length !== 1) {
         return invalidUsage("peer");
@@ -156,7 +168,10 @@ function helpCommand(argv: string[]): ComposerCommandResult {
 }
 
 function invalidUsage(name: string): ComposerCommandResult {
-  return { ok: false, message: `Invalid arguments. Usage: ${COMMANDS[name].usage}` };
+  return {
+    ok: false,
+    message: `Invalid arguments. Usage: ${COMMANDS[name].usage}`,
+  };
 }
 
 export function parseSigilSegments(input: string): Segment[] {
@@ -178,7 +193,9 @@ export function parseSigilSegments(input: string): Segment[] {
   if (cursor < input.length) {
     segments.push({ kind: "text", content: input.slice(cursor) });
   }
-  return coalesceTextSegments(segments.length > 0 ? segments : [{ kind: "text", content: input }]);
+  return coalesceTextSegments(
+    segments.length > 0 ? segments : [{ kind: "text", content: input }],
+  );
 }
 
 function sigilSegment(sigil: string, value: string): Segment {

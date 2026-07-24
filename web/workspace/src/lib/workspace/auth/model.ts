@@ -15,12 +15,16 @@ export type WhoamiResponse = {
 
 export type PasskeyRegistrationOptionsResponse = {
   challenge_id: string;
-  public_key: PublicKeyCredentialCreationOptions | { publicKey: PublicKeyCredentialCreationOptions };
+  public_key: PublicKeyCredentialCreationOptions | {
+    publicKey: PublicKeyCredentialCreationOptions;
+  };
 };
 
 export type PasskeyLoginOptionsResponse = {
   challenge_id: string;
-  public_key: PublicKeyCredentialRequestOptions | { publicKey: PublicKeyCredentialRequestOptions };
+  public_key: PublicKeyCredentialRequestOptions | {
+    publicKey: PublicKeyCredentialRequestOptions;
+  };
 };
 
 export type PasskeyUserResponse = {
@@ -65,7 +69,10 @@ export function bufferToBase64Url(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer);
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(
+    /=+$/g,
+    "",
+  );
 }
 
 function unwrapPublicKey<T>(value: T | { publicKey: T }): T {
@@ -79,12 +86,16 @@ export function prepareRegistrationOptions(
   options: PasskeyRegistrationOptionsResponse,
 ): PublicKeyCredentialCreationOptions {
   const publicKey = structuredClone(unwrapPublicKey(options.public_key));
-  publicKey.challenge = base64UrlToBuffer(publicKey.challenge as unknown as string);
+  publicKey.challenge = base64UrlToBuffer(
+    publicKey.challenge as unknown as string,
+  );
   publicKey.user = {
     ...publicKey.user,
     id: base64UrlToBuffer(publicKey.user.id as unknown as string),
   };
-  publicKey.excludeCredentials = publicKey.excludeCredentials?.map((credential) => ({
+  publicKey.excludeCredentials = publicKey.excludeCredentials?.map((
+    credential,
+  ) => ({
     ...credential,
     id: base64UrlToBuffer(credential.id as unknown as string),
   }));
@@ -95,8 +106,12 @@ export function prepareLoginOptions(
   options: PasskeyLoginOptionsResponse,
 ): PublicKeyCredentialRequestOptions {
   const publicKey = structuredClone(unwrapPublicKey(options.public_key));
-  publicKey.challenge = base64UrlToBuffer(publicKey.challenge as unknown as string);
-  publicKey.allowCredentials = publicKey.allowCredentials?.map((credential) => ({
+  publicKey.challenge = base64UrlToBuffer(
+    publicKey.challenge as unknown as string,
+  );
+  publicKey.allowCredentials = publicKey.allowCredentials?.map((
+    credential,
+  ) => ({
     ...credential,
     id: base64UrlToBuffer(credential.id as unknown as string),
   }));
@@ -131,11 +146,15 @@ export function authenticationCredentialToJson(
       clientDataJSON: bufferToBase64Url(response.clientDataJSON),
       authenticatorData: bufferToBase64Url(response.authenticatorData),
       signature: bufferToBase64Url(response.signature),
-      userHandle: response.userHandle ? bufferToBase64Url(response.userHandle) : null,
+      userHandle: response.userHandle
+        ? bufferToBase64Url(response.userHandle)
+        : null,
     },
   };
 }
 
-export function isPublicKeyCredential(credential: Credential | null): credential is PublicKeyCredential {
+export function isPublicKeyCredential(
+  credential: Credential | null,
+): credential is PublicKeyCredential {
   return credential != null && credential.type === "public-key";
 }

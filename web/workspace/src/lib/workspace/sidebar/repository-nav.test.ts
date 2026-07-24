@@ -25,18 +25,22 @@ function repositories(
 }
 
 Deno.test("repository nav does not invent main for an empty registry", () => {
-  const projection = projectRepositoryNav({
-    workspace_id: "workspace-1",
-    items: [],
-    source: "workspace_backend_config",
-    diagnostics: [
-      {
-        code: "repository_config_empty",
-        severity: "warning",
-        message: "No repositories configured",
-      },
-    ],
-  }, "/w/workspace-1", "workspace-1");
+  const projection = projectRepositoryNav(
+    {
+      workspace_id: "workspace-1",
+      items: [],
+      source: "workspace_backend_config",
+      diagnostics: [
+        {
+          code: "repository_config_empty",
+          severity: "warning",
+          message: "No repositories configured",
+        },
+      ],
+    },
+    "/w/workspace-1",
+    "workspace-1",
+  );
 
   assertEquals(projection.count, 0);
   assertEquals(projection.items, []);

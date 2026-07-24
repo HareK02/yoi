@@ -2,7 +2,8 @@
 
 SvelteKit static SPA for the Yoi workspace control plane.
 
-The frontend is intentionally static. Workspace authority, validation, and API behavior live in the Rust `yoi-workspace-server` backend.
+The frontend is intentionally static. Workspace authority, validation, and API
+behavior live in the Rust `yoi-workspace-server` backend.
 
 ## Development
 
@@ -22,7 +23,9 @@ cd web/workspace
 deno task dev
 ```
 
-The Vite dev server proxies `/api/*` to `http://127.0.0.1:8787`, so frontend hot reload works while the Rust backend serves the workspace API. Open the Vite URL printed by `deno task dev`.
+The Vite dev server proxies `/api/*` to `http://127.0.0.1:8787`, so frontend hot
+reload works while the Rust backend serves the workspace API. Open the Vite URL
+printed by `deno task dev`.
 
 If you want to run the backend from the repository root instead:
 
@@ -30,7 +33,10 @@ If you want to run the backend from the repository root instead:
 cargo run -p yoi-workspace-server -- serve --listen 127.0.0.1:8787
 ```
 
-The backend reads Workspace records from the Yoi server DB at `<data_dir>/server/server.db`. Run `cargo run -p yoi-workspace-server -- init --workspace .` first when the server DB has not been initialized.
+The backend reads Workspace records from the Yoi server DB at
+`<data_dir>/server/server.db`. Run
+`cargo run -p yoi-workspace-server -- init --workspace .` first when the server
+DB has not been initialized.
 
 ## Static build
 
@@ -40,7 +46,8 @@ Build the SPA:
 deno task build
 ```
 
-Static asset packaging is a deployment concern. Local development normally uses the Vite dev server proxy plus the Rust backend command above.
+Static asset packaging is a deployment concern. Local development normally uses
+the Vite dev server proxy plus the Rust backend command above.
 
 ## Checks
 
