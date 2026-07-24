@@ -14,6 +14,10 @@ Deno.test("workspace app css uses bundled UI fonts", async () => {
     new URL("./../../../app.css", import.meta.url),
   );
   assert(
+    !appCss.includes('"tailwindcss"'),
+    "global app css should not import Tailwind defaults",
+  );
+  assert(
     appCss.includes("gen-interface-jp/400.css") &&
       appCss.includes("gen-interface-jp/500.css") &&
       appCss.includes("gen-interface-jp/600.css") &&
