@@ -3769,6 +3769,65 @@ where
         .await
     }
 
+    /// Recreate a pending Worker whose metadata has a session id but no
+    /// materialized segment yet.
+    ///
+    /// Pending Workers have already had their profile source resolved at creation
+    /// time, but they have not rendered the system prompt or written
+    /// `SegmentStart`. Restore therefore uses only the resolved manifest snapshot
+    /// stored in Worker metadata and never re-resolves the profile source.
+    pub async fn restore_pending_from_worker_metadata_with_context(
+        worker_name: &str,
+        fallback: WorkerManifest,
+        store: St,
+        loader: PromptLoader,
+        workspace_context: WorkerWorkspaceContext,
+        filesystem_authority: WorkerFilesystemAuthority,
+    ) -> Result<Self, WorkerError> {
+        let metadata =
+            store
+                .read_by_name(worker_name)?
+                .ok_or_else(|| WorkerError::WorkerMetadataMissing {
+                    worker_name: worker_name.to_string(),
+                })?;
+        let active = metadata
+            .active
+            .ok_or_else(|| WorkerError::WorkerMetadataInactive {
+                worker_name: worker_name.to_string(),
+            })?;
+        if let Some(segment_id) = active.segment_id {
+            return Self::restore_from_manifest_with_context(
+                active.session_id,
+                segment_id,
+                restore_manifest_from_worker_metadata_snapshot(
+                    worker_name,
+                    metadata.resolved_manifest_snapshot,
+                    fallback,
+                )?,
+                store,
+                loader,
+                workspace_context,
+                filesystem_authority,
+            )
+            .await;
+        }
+        let snapshot = metadata.resolved_manifest_snapshot.ok_or_else(|| {
+            WorkerError::WorkerMetadataManifestSnapshotMissing {
+                worker_name: worker_name.to_string(),
+            }
+        })?;
+        let manifest =
+            restore_manifest_from_worker_metadata_snapshot(worker_name, Some(snapshot), fallback)?;
+        Self::from_manifest_with_context(
+            manifest,
+            store,
+            loader,
+            workspace_context,
+            filesystem_authority,
+        )
+        .await
+    }
+
     /// Restore a Worker from an existing session log.
     ///
     /// Uses the resolved manifest supplied by the caller, seeds a
@@ -4547,6 +4606,9 @@ pub enum WorkerError {
         worker_name: String,
         session_id: SessionId,
     },
+
+    #[error("worker metadata for {worker_name} does not include a resolved manifest snapshot")]
+    WorkerMetadataManifestSnapshotMissing { worker_name: String },
 
     #[error(
         "worker metadata for {worker_name} contains an invalid resolved manifest snapshot: {source}"

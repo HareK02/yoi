@@ -344,13 +344,7 @@ impl ProfileRuntimeWorkerFactory {
         &self,
         request: WorkerExecutionRestoreDryRequest,
     ) -> Result<(), String> {
-        let WorkerExecutionRestoreDryRequest {
-            worker_ref,
-            request,
-            previous_execution: _,
-            working_directory,
-            config_bundle: _,
-        } = request;
+        let WorkerExecutionRestoreDryRequest { worker_ref, .. } = request;
         let store_dir = self.store_dir()?;
         let session_store = FsStore::new(&store_dir).map_err(|err| {
             format!(
@@ -386,31 +380,6 @@ impl ProfileRuntimeWorkerFactory {
         let state = session_store::collect_state(&raw_entries);
         if state.entries_count == 0 {
             return Err(format!("active segment {active_segment_id} is empty"));
-        }
-        let worker_root = working_directory
-            .as_ref()
-            .map(|binding| binding.root.clone())
-            .unwrap_or_else(|| self.profile_base_dir.clone());
-        let profile = self.runtime_profile_for_request(&request);
-        let selector = profile.as_deref().unwrap_or("builtin:default");
-        let archive = self
-            .resolve_profile_source_archive(&request.profile_source)
-            .await?;
-        let manifest = archive
-            .resolve_profile(selector, &worker_root, &worker_name)
-            .map_err(|err| format!("failed to resolve profile source archive: {err}"))?;
-        if working_directory.is_some() {
-            worker::entrypoint::resolve_runtime_profile_manifest_from_manifest(
-                manifest,
-                &worker_root,
-                &worker_name,
-            )?;
-        } else {
-            worker::entrypoint::resolve_runtime_profile_manifest_from_manifest_without_filesystem(
-                manifest,
-                &worker_root,
-                &worker_name,
-            )?;
         }
         Ok(())
     }
@@ -514,11 +483,6 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
         request: WorkerExecutionRestoreRequest,
     ) -> Result<WorkerHandle, String> {
         let worker_name = Self::runtime_worker_name_for_ref(&request.worker_ref);
-        let worker_root = request
-            .working_directory
-            .as_ref()
-            .map(|binding| binding.root().to_path_buf())
-            .unwrap_or_else(|| self.profile_base_dir.clone());
         let filesystem_authority = request
             .working_directory
             .as_ref()
@@ -564,24 +528,6 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
             Err(WorkerError::WorkerMetadataPending { .. })
                 if request.request.initial_input.is_none() =>
             {
-                let profile = self.runtime_profile_for_request(&request.request);
-                let selector = profile.as_deref().unwrap_or("builtin:default");
-                let archive = self
-                    .resolve_profile_source_archive(&request.request.profile_source)
-                    .await?;
-                let (mut pending_manifest, pending_loader) = {
-                    let manifest = archive
-                        .resolve_profile(selector, &worker_root, &worker_name)
-                        .map_err(|err| {
-                            format!("failed to resolve profile source archive: {err}")
-                        })?;
-                    worker::entrypoint::resolve_runtime_profile_manifest_from_manifest(
-                        manifest,
-                        &worker_root,
-                        &worker_name,
-                    )?
-                };
-                pending_manifest.worker.name = worker_name.clone();
                 let session_store = FsStore::new(&store_dir).map_err(|err| {
                     format!(
                         "failed to initialize session store at {}: {err}",
@@ -596,15 +542,16 @@ impl RuntimeWorkerFactory for ProfileRuntimeWorkerFactory {
                         )
                     })?;
                 let store = CombinedStore::new(session_store, worker_metadata_store);
-                Worker::from_manifest_with_context(
-                    pending_manifest,
+                Worker::restore_pending_from_worker_metadata_with_context(
+                    &worker_name,
+                    manifest.clone(),
                     store,
-                    pending_loader,
+                    loader,
                     workspace_context,
                     filesystem_authority,
                 )
                 .await
-                .map_err(|err| format!("failed to recreate pending Worker from profile: {err}"))?
+                .map_err(|err| format!("failed to recreate pending Worker from metadata: {err}"))?
             }
             Err(err) => return Err(format!("failed to restore Worker from metadata: {err}")),
         };
@@ -1468,6 +1415,7 @@ mod tests {
                 [model]
                 scheme = "anthropic"
                 model_id = "test-model"
+                auth = { kind = "none" }
 
                 [engine]
                 max_tokens = 100
@@ -1738,6 +1686,122 @@ mod tests {
             .resolve_profile_source_archive(&source)
             .await
             .expect("embedded archive should resolve without Backend resource client");
+    }
+
+    #[tokio::test]
+    async fn dry_restore_validates_saved_worker_state_without_profile_source_resolution() {
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("sessions");
+        let worker_metadata_dir = root.path().join("workers");
+        let worker_ref = WorkerRef::new(crate::identity::WorkerId::new(1));
+        let worker_name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&worker_ref);
+        let session_id = session_store::new_session_id();
+        let segment_id = session_store::new_segment_id();
+        FsStore::new(&store_dir)
+            .unwrap()
+            .create_segment(
+                session_id,
+                segment_id,
+                &[session_store::LogEntry::Invoke {
+                    ts: 1,
+                    trigger: protocol::InvokeKind::UserSend,
+                }],
+            )
+            .unwrap();
+        FsWorkerStore::new(&worker_metadata_dir)
+            .unwrap()
+            .set_active(
+                &worker_name,
+                Some(session_store::WorkerActiveSegmentRef::active_segment(
+                    session_id, segment_id,
+                )),
+                None,
+            )
+            .unwrap();
+
+        let request = create_request("restore");
+        let result = ProfileRuntimeWorkerFactory::new(root.path())
+            .with_store_dir(&store_dir)
+            .with_worker_metadata_dir(&worker_metadata_dir)
+            .dry_restore_controller(WorkerExecutionRestoreDryRequest {
+                worker_ref,
+                request,
+                previous_execution: crate::execution::WorkerExecutionStatus::alive(
+                    WorkerExecutionRunState::Idle,
+                ),
+                working_directory: None,
+                config_bundle: None,
+            })
+            .await;
+
+        assert_eq!(
+            result.status,
+            crate::execution::WorkerRestoreDryCheckStatus::Valid,
+            "{}",
+            result.message
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_pending_worker_uses_saved_manifest_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("sessions");
+        let worker_metadata_dir = root.path().join("workers");
+        let worker_ref = WorkerRef::new(crate::identity::WorkerId::new(1));
+        let worker_name = ProfileRuntimeWorkerFactory::runtime_worker_name_for_ref(&worker_ref);
+        let session_id = session_store::new_session_id();
+        let manifest = manifest::WorkerManifest::from_toml(&format!(
+            r#"
+                [worker]
+                name = "{}"
+                pwd = "{}"
+
+                [model]
+                scheme = "anthropic"
+                model_id = "test-model"
+                auth = {{ kind = "none" }}
+
+                [engine]
+                max_tokens = 100
+
+                [[scope.allow]]
+                target = "{}"
+                permission = "write"
+            "#,
+            worker_name,
+            root.path().display(),
+            root.path().display(),
+        ))
+        .unwrap();
+        FsWorkerStore::new(&worker_metadata_dir)
+            .unwrap()
+            .set_active(
+                &worker_name,
+                Some(session_store::WorkerActiveSegmentRef::pending_segment(
+                    session_id,
+                )),
+                Some(serde_json::to_value(&manifest).unwrap()),
+            )
+            .unwrap();
+
+        let request = create_request("restore");
+        let handle = ProfileRuntimeWorkerFactory::new(root.path())
+            .with_store_dir(&store_dir)
+            .with_worker_metadata_dir(&worker_metadata_dir)
+            .restore_controller(WorkerExecutionRestoreRequest {
+                worker_ref: worker_ref.clone(),
+                request,
+                context: test_execution_context(worker_ref),
+                previous_execution: crate::execution::WorkerExecutionStatus::alive(
+                    WorkerExecutionRunState::Idle,
+                ),
+                working_directory: None,
+                config_bundle: None,
+            })
+            .await
+            .expect("pending restore should use the saved manifest snapshot");
+
+        handle.send(Method::Shutdown).await.unwrap();
     }
 
     #[test]
