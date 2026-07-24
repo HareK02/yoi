@@ -2,6 +2,7 @@
   import { page } from '$app/state';
   import { workspaceRoute } from '$lib/workspace/api/http';
   import { SETTINGS_SECTIONS, settingsSectionHref } from '$lib/workspace/settings/model';
+  import '$lib/workspace/styles/settings.css';
   import type { LayoutProps } from './$types';
 
   let { data, children }: LayoutProps = $props();

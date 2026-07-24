@@ -16,7 +16,9 @@ Deno.test("workspace app css uses bundled UI fonts", async () => {
       appCss.includes("gen-interface-jp/500.css") &&
       appCss.includes("gen-interface-jp/600.css") &&
       appCss.includes("gen-interface-jp/700.css") &&
-      appCss.includes('"Gen Interface JP", Inter'),
+      appCss.includes("--font-sans:") &&
+      appCss.includes('"Gen Interface JP"') &&
+      appCss.includes("Inter"),
     "global app css should import the tracked Gen Interface JP weights and prefer it in the sans font stack",
   );
   assert(
@@ -24,8 +26,41 @@ Deno.test("workspace app css uses bundled UI fonts", async () => {
       appCss.includes("@fontsource/ibm-plex-mono/latin-500.css") &&
       appCss.includes("@fontsource/ibm-plex-mono/latin-600.css") &&
       appCss.includes("@fontsource/ibm-plex-mono/latin-700.css") &&
-      appCss.includes('"IBM Plex Mono", ui-monospace'),
+      appCss.includes("--font-mono:") &&
+      appCss.includes('"IBM Plex Mono"') &&
+      appCss.includes("ui-monospace"),
     "global app css should import the tracked IBM Plex Mono weights and prefer it in the mono font stack",
+  );
+});
+
+Deno.test("workspace feature css is owned outside app css", async () => {
+  const appCss = await Deno.readTextFile(new URL("./../../../app.css", import.meta.url));
+  const workspaceLayout = await Deno.readTextFile(
+    new URL("./../../../routes/w/[workspaceId]/+layout.svelte", import.meta.url),
+  );
+  const settingsLayout = await Deno.readTextFile(
+    new URL("./../../../routes/w/[workspaceId]/settings/+layout.svelte", import.meta.url),
+  );
+  const accountPage = await Deno.readTextFile(
+    new URL("./../../../routes/account/+page.svelte", import.meta.url),
+  );
+  const deviceLoginPage = await Deno.readTextFile(
+    new URL("./../../../routes/login/device/+page.svelte", import.meta.url),
+  );
+
+  assert(
+    !appCss.includes(".workspace-actions") &&
+      !appCss.includes(".worker-new-page") &&
+      !appCss.includes(".settings-page"),
+    "app.css should not own workspace, worker, or settings page implementation classes",
+  );
+  assert(
+    workspaceLayout.includes("$lib/workspace/styles/workspace-pages.css") &&
+      workspaceLayout.includes("$lib/workspace/styles/workers.css") &&
+      settingsLayout.includes("$lib/workspace/styles/settings.css") &&
+      accountPage.includes("$lib/workspace/styles/settings.css") &&
+      deviceLoginPage.includes("$lib/workspace/styles/settings.css"),
+    "feature-owned CSS should be imported by the layouts/pages that need it",
   );
 });
 

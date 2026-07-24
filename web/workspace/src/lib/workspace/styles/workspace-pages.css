@@ -1,0 +1,299 @@
+@layer reset, tokens, base, layout, components;
+@layer components {
+  .workspace-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-3);
+  }
+  .workspace-action-card {
+    display: grid;
+    gap: var(--space-1);
+    padding: var(--space-4);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-card);
+    background: var(--bg-raised);
+    color: inherit;
+    text-decoration: none;
+  }
+  .workspace-action-card:hover,
+  .workspace-action-card:focus-visible {
+    border-color: var(--accent);
+  }
+  .workspace-action-card span,
+  .workspace-action-card small {
+    color: var(--text-muted);
+  }
+  .workspace-action-card span {
+    font-size: 0.78rem;
+  }
+  .workspace-action-card strong {
+    color: var(--text-strong);
+  }
+  @media (max-width: 720px) {
+    .workspace-actions {
+      grid-template-columns: 1fr;
+    }
+  }
+  .runtime-card {
+    padding: 0;
+  }
+  .ticket-list,
+  .objective-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    margin-top: var(--space-4);
+  }
+  .ticket-row,
+  .objective-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) max-content;
+    align-items: start;
+    gap: var(--space-4);
+    padding: var(--space-3) var(--space-4);
+    border-radius: var(--radius-panel);
+    background: var(--bg-raised);
+    color: inherit;
+    text-decoration: none;
+    transition: background-color 140ms ease;
+  }
+  .ticket-row:hover,
+  .ticket-row:focus-visible,
+  .objective-row:hover,
+  .objective-row:focus-visible {
+    background: var(--interactive-hover);
+  }
+  .ticket-row.selected,
+  .objective-row.selected {
+    background: var(--interactive-selected);
+  }
+  .ticket-row.selected .ticket-title,
+  .objective-row.selected .objective-title {
+    color: var(--accent);
+  }
+  .ticket-main,
+  .objective-main {
+    display: grid;
+    gap: var(--space-1);
+    min-width: 0;
+  }
+  .ticket-title-row,
+  .objective-title-row {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+  .ticket-title,
+  .objective-title {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--text-strong);
+    font-weight: 700;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .state-pill {
+    flex: 0 0 auto;
+    color: var(--success);
+    font-size: 0.76rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+  .ticket-summary,
+  .objective-summary {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 0.88rem;
+    line-height: 1.4;
+  }
+  .ticket-meta,
+  .objective-meta {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: var(--space-2);
+    color: var(--text-faint);
+    font-size: 0.78rem;
+    line-height: 1.35;
+    text-align: right;
+    white-space: nowrap;
+  }
+  @media (max-width: 900px) {
+    .ticket-row,
+    .objective-row {
+      grid-template-columns: 1fr;
+      gap: var(--space-2);
+    }
+    .ticket-meta,
+    .objective-meta {
+      justify-content: flex-start;
+      text-align: left;
+      white-space: normal;
+    }
+  }
+  .runtime-heading,
+  .detail-heading {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-3);
+    margin-bottom: var(--space-3);
+  }
+  .runtime-heading span {
+    color: var(--success);
+  }
+  .runtime-heading span.warn {
+    color: var(--warning);
+  }
+  .detail-heading.compact {
+    margin-bottom: var(--space-2);
+  }
+  .detail-heading h3 {
+    margin: 0;
+  }
+  .detail-heading span {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+  }
+  .ticket-detail-grid {
+    margin-bottom: var(--space-4);
+  }
+  .risk-flags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin-bottom: var(--space-4);
+  }
+  .risk-flags span,
+  .warning-pill {
+    border-radius: 999px;
+    padding: 0.18rem 0.55rem;
+    background: var(--bg-subtle);
+    color: var(--warning);
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  .ticket-body pre {
+    overflow-x: auto;
+    margin: 0;
+    padding: var(--space-4);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-panel);
+    background: var(--bg-raised);
+    color: var(--text);
+    white-space: pre-wrap;
+  }
+  dl {
+    display: grid;
+    gap: var(--space-1);
+    margin: 0;
+  }
+  dl > div {
+    display: grid;
+    grid-template-columns: minmax(6.5rem, 10rem) minmax(0, 1fr);
+    align-items: baseline;
+    gap: var(--space-3);
+    min-width: 0;
+  }
+  dt {
+    color: var(--text-faint);
+    font-size: 0.72rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+  dd {
+    min-width: 0;
+    margin: 0;
+  }
+  dd small {
+    display: inline;
+    margin-top: 0;
+    margin-left: var(--space-2);
+  }
+  .table-wrap {
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  th,
+  td {
+    border-bottom: 1px solid var(--line);
+    padding: 10px 8px;
+    text-align: left;
+    vertical-align: top;
+  }
+  th {
+    color: var(--text-faint);
+    font-size: 0.78rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .page-header-row,
+  .workers-page-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: var(--space-4);
+  }
+  .page-header-row h1,
+  .page-header-row p,
+  .workers-page-header h1,
+  .workers-page-header p {
+    margin: 0;
+  }
+  .page-header-row h1,
+  .workers-page-header h1 {
+    color: var(--text-strong);
+    font-size: clamp(1.6rem, 4vw, 2.4rem);
+    line-height: 1.05;
+  }
+  .page-header-row p:not(.breadcrumb),
+  .workers-page-header p {
+    margin-top: var(--space-2);
+    color: var(--text-muted);
+  }
+  .breadcrumb {
+    margin-bottom: var(--space-2);
+    color: var(--text-muted);
+    font-size: 0.85rem;
+  }
+  .breadcrumb a {
+    color: inherit;
+  }
+  .runtimes-page,
+  .workdirs-page,
+  .workers-page {
+    display: grid;
+    gap: var(--space-4);
+  }
+  .workers-table-wrap {
+    border-top: 1px solid var(--line);
+  }
+  .workers-table td small {
+    display: block;
+    margin-top: 0.2rem;
+    color: var(--text-muted);
+  }
+  .diagnostics {
+    margin-top: var(--space-4);
+  }
+  .diagnostics li {
+    display: grid;
+    gap: var(--space-1);
+    margin-bottom: var(--space-3);
+  }
+  .record-body {
+    overflow-x: auto;
+    padding: var(--space-4) 0 0;
+    border-top: 1px solid var(--line);
+    color: var(--text);
+    white-space: pre-wrap;
+  }
+}

@@ -6,6 +6,7 @@
     logout,
     registerPasskey,
   } from '$lib/workspace/auth/api';
+  import '$lib/workspace/styles/settings.css';
   import type { RequestActor } from '$lib/workspace/auth/model';
 
   let actor = $state<RequestActor | null>(null);

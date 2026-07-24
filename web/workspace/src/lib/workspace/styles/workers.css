@@ -1,0 +1,197 @@
+@layer reset, tokens, base, layout, components;
+@layer components {
+  .section-heading-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .section-action {
+    margin-left: auto;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--bg-subtle);
+    color: var(--text-strong);
+    font-size: 0.72rem;
+    padding: 0.2rem 0.55rem;
+    cursor: pointer;
+    text-decoration: none;
+  }
+
+  .section-action:hover,
+  .section-action:focus-visible,
+  .section-action.active {
+    background: var(--interactive-hover);
+  }
+
+  .worker-launch-form {
+    display: grid;
+    gap: 0.65rem;
+    margin: 0;
+    padding: 0;
+  }
+
+  .worker-launch-form label {
+    display: grid;
+    gap: 0.25rem;
+    color: var(--text-muted);
+    font-size: 0.78rem;
+  }
+
+  .worker-launch-form input,
+  .worker-launch-form select,
+  .worker-launch-form textarea {
+    width: 100%;
+    border: 1px solid var(--line);
+    border-radius: 0.55rem;
+    background: var(--bg-raised);
+    color: var(--text-strong);
+    padding: 0.45rem 0.55rem;
+    font: inherit;
+  }
+
+  .worker-launch-form textarea {
+    resize: vertical;
+  }
+
+  .worker-launch-form button {
+    border: 0;
+    border-radius: 0.6rem;
+    background: var(--accent);
+    color: var(--bg);
+    font-weight: 700;
+    padding: 0.5rem 0.75rem;
+    cursor: pointer;
+  }
+
+  .worker-launch-form button:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+  .worker-new-page {
+    display: grid;
+    gap: var(--space-5);
+    max-width: 68rem;
+  }
+  .worker-new-page-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: var(--space-4);
+  }
+  .worker-new-page-header h1,
+  .worker-new-page-header p {
+    margin: 0;
+  }
+  .worker-new-page-header h1 {
+    color: var(--text-strong);
+    font-size: clamp(1.6rem, 4vw, 2.4rem);
+    line-height: 1.05;
+  }
+  .worker-new-page-header p:not(.eyebrow) {
+    margin-top: var(--space-2);
+    color: var(--text-muted);
+  }
+  .worker-launch-form {
+    display: grid;
+    gap: var(--space-5);
+    max-width: 48rem;
+  }
+  .worker-form-section {
+    display: grid;
+    gap: var(--space-3);
+  }
+  .worker-form-section h2 {
+    margin: 0;
+    color: var(--text-strong);
+    font-size: 1rem;
+  }
+  .worker-launch-sentence {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    color: var(--text-muted);
+    font-size: 0.95rem;
+    white-space: nowrap;
+  }
+  .worker-inline-select {
+    width: auto;
+    min-width: 0;
+    max-width: 100%;
+  }
+  .worker-inline-select.wd-select {
+    min-width: 20rem;
+  }
+  .new-working-directory-panel {
+    display: grid;
+    gap: var(--space-3);
+    padding-left: var(--space-3);
+  }
+  .new-working-directory-panel h3 {
+    margin: 0;
+    color: var(--text-strong);
+    font-size: 0.95rem;
+  }
+  .new-working-directory-fields,
+  .worker-detail-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-3);
+  }
+  .worker-new-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    flex-wrap: wrap;
+  }
+  .secondary-link {
+    color: var(--text-muted);
+    text-decoration: none;
+  }
+  .secondary-link:hover,
+  .secondary-link:focus-visible {
+    color: var(--text-strong);
+  }
+  @media (max-width: 720px) {
+    .worker-launch-sentence {
+      align-items: stretch;
+      flex-direction: column;
+      white-space: normal;
+    }
+    .worker-inline-select,
+    .worker-inline-select.wd-select {
+      width: 100%;
+      min-width: 0;
+    }
+    .new-working-directory-fields,
+    .worker-detail-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+  .worker-submit-error {
+    display: grid;
+    gap: var(--space-2);
+  }
+  .worker-submit-error p {
+    margin: 0;
+  }
+  .worker-error-diagnostics {
+    display: grid;
+    gap: var(--space-1);
+    margin: 0;
+    padding-left: var(--space-4);
+  }
+  .worker-error-diagnostics li {
+    color: var(--text-muted);
+  }
+  .worker-error-diagnostics li.error {
+    color: var(--danger);
+  }
+  .worker-error-diagnostics strong {
+    color: inherit;
+    font-weight: 750;
+  }
+  .worker-error-diagnostics span {
+    display: block;
+  }
+}
