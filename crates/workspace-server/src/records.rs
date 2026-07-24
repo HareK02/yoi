@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 
 use project_record::validate_record_id;
 use serde::{Deserialize, Serialize};
-use ticket::{SqliteTicketBackend, TicketBackend, TicketIdOrSlug, TicketListQuery};
+use ticket::{
+    SqliteTicketBackend, TicketBackend, TicketIdOrSlug, TicketListQuery,
+    TicketWorkspaceActionPriority, project_ticket_workspace_item,
+};
 
 use crate::{Error, Result};
 
@@ -34,11 +37,13 @@ impl LocalProjectRecordReader {
     }
 
     pub fn list_tickets(&self, limit: usize) -> Result<ProjectRecordList<TicketSummary>> {
-        let mut items = self
-            .ticket_backend
-            .list(TicketListQuery::all())?
-            .into_iter()
-            .map(|item| TicketSummary {
+        let mut items = Vec::new();
+        for item in self.ticket_backend.list(TicketListQuery::all())? {
+            let ticket = self
+                .ticket_backend
+                .show(TicketIdOrSlug::Id(item.id.clone()))?;
+            let projection = project_ticket_workspace_item(&item, &ticket.relations.blockers, None);
+            items.push(TicketSummary {
                 id: item.id,
                 title: item.title,
                 state: item.workflow_state.as_str().to_string(),
@@ -46,15 +51,17 @@ impl LocalProjectRecordReader {
                 updated_at: item.updated_at,
                 queued_by: item.queued_by,
                 queued_at: item.queued_at,
+                workspace_action_priority: workspace_action_priority_name(projection.priority)
+                    .to_string(),
                 record_source: "sqlite_yoi_ticket".to_string(),
-            })
-            .collect::<Vec<_>>();
+            });
+        }
         items.sort_by(|a, b| {
             b.updated_at
                 .cmp(&a.updated_at)
                 .then_with(|| a.id.cmp(&b.id))
         });
-        items.truncate(limit.min(200));
+        items.truncate(limit);
         Ok(ProjectRecordList {
             items,
             invalid_records: Vec::new(),
@@ -148,6 +155,14 @@ impl LocalProjectRecordReader {
     }
 }
 
+fn workspace_action_priority_name(priority: TicketWorkspaceActionPriority) -> &'static str {
+    match priority {
+        TicketWorkspaceActionPriority::ReadyForQueue => "ready_for_queue",
+        TicketWorkspaceActionPriority::ActiveWork => "active_work",
+        TicketWorkspaceActionPriority::Background => "background",
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectRecordList<T> {
     pub items: Vec<T>,
@@ -170,6 +185,7 @@ pub struct TicketSummary {
     pub updated_at: Option<String>,
     pub queued_by: Option<String>,
     pub queued_at: Option<String>,
+    pub workspace_action_priority: String,
     pub record_source: String,
 }
 
@@ -304,6 +320,10 @@ mod tests {
         assert_eq!(tickets.items[0].record_source, "sqlite_yoi_ticket");
         assert_eq!(tickets.items[0].id, "00000000001J2");
         assert_eq!(tickets.items[0].state, "ready");
+        assert_eq!(
+            tickets.items[0].workspace_action_priority,
+            "ready_for_queue"
+        );
 
         let ticket = reader.ticket("00000000001J2").unwrap();
         assert!(ticket.body.contains("Ticket body"));

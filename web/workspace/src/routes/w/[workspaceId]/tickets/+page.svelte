@@ -3,17 +3,18 @@
   import type { TicketSummary } from '$lib/workspace/sidebar/types';
   import type { PageProps } from './$types';
 
-  type SortKey = 'title' | 'state' | 'priority' | 'updated_at' | 'queued_at' | 'id';
+  type SortKey = 'panel' | 'title' | 'state' | 'priority' | 'updated_at' | 'queued_at' | 'id';
   type SortDirection = 'asc' | 'desc';
 
   let { data }: PageProps = $props();
 
   let query = $state('');
+  let visibilityFilter = $state<'open' | 'closed' | 'all'>('open');
   let stateFilter = $state('all');
   let priorityFilter = $state('all');
   let queuedFilter = $state('all');
-  let sortKey = $state<SortKey>('updated_at');
-  let sortDirection = $state<SortDirection>('desc');
+  let sortKey = $state<SortKey>('panel');
+  let sortDirection = $state<SortDirection>('asc');
 
   const tickets = $derived(data.tickets.data?.items ?? []);
   const states = $derived(uniqueValues(tickets.map((ticket) => ticket.state)));
@@ -34,6 +35,12 @@
   function filterTickets(items: TicketSummary[]): TicketSummary[] {
     const needle = query.trim().toLowerCase();
     return items.filter((ticket) => {
+      if (visibilityFilter === 'open' && ticket.state === 'closed') {
+        return false;
+      }
+      if (visibilityFilter === 'closed' && ticket.state !== 'closed') {
+        return false;
+      }
       if (stateFilter !== 'all' && ticket.state !== stateFilter) {
         return false;
       }
@@ -63,10 +70,34 @@
   }
 
   function compareTicketValues(left: TicketSummary, right: TicketSummary, key: SortKey): number {
+    if (key === 'panel') {
+      return comparePanelOrder(left, right);
+    }
     if (key === 'updated_at' || key === 'queued_at') {
       return compareDate(left[key], right[key]);
     }
     return compareText(ticketValue(left, key), ticketValue(right, key));
+  }
+
+  function comparePanelOrder(left: TicketSummary, right: TicketSummary): number {
+    return compareNumber(panelActionPriority(left), panelActionPriority(right))
+      || compareDate(right.updated_at, left.updated_at)
+      || compareText(left.title, right.title);
+  }
+
+  function panelActionPriority(ticket: TicketSummary): number {
+    if (ticket.workspace_action_priority) {
+      if (ticket.workspace_action_priority === 'ready_for_queue') return 0;
+      if (ticket.workspace_action_priority === 'active_work') return 1;
+      if (ticket.workspace_action_priority === 'background') return 2;
+    }
+    if (ticket.state === 'ready') return 0;
+    if (ticket.state === 'queued' || ticket.state === 'inprogress') return 1;
+    return 2;
+  }
+
+  function compareNumber(left: number, right: number): number {
+    return left - right;
   }
 
   function ticketValue(ticket: TicketSummary, key: SortKey): string | null | undefined {
@@ -107,9 +138,12 @@
 
   function resetFilters() {
     query = '';
+    visibilityFilter = 'open';
     stateFilter = 'all';
     priorityFilter = 'all';
     queuedFilter = 'all';
+    sortKey = 'panel';
+    sortDirection = 'asc';
   }
 </script>
 
@@ -143,6 +177,14 @@
           <input bind:value={query} type="search" placeholder="Title, id, state, source…" />
         </label>
         <label class="ticket-filter">
+          <span>Visibility</span>
+          <select bind:value={visibilityFilter}>
+            <option value="open">Open</option>
+            <option value="closed">Closed</option>
+            <option value="all">All</option>
+          </select>
+        </label>
+        <label class="ticket-filter">
           <span>State</span>
           <select bind:value={stateFilter}>
             <option value="all">All states</option>
@@ -168,6 +210,7 @@
             <option value="unqueued">Unqueued</option>
           </select>
         </label>
+        <button class="secondary-button" type="button" onclick={() => toggleSort('panel')}>Panel order {sortLabel('panel')}</button>
         <button class="secondary-button" type="button" onclick={resetFilters}>Reset</button>
       </div>
 
@@ -232,7 +275,7 @@
 
   .ticket-database-toolbar {
     display: grid;
-    grid-template-columns: minmax(16rem, 1.8fr) repeat(3, minmax(9rem, 1fr)) auto;
+    grid-template-columns: minmax(16rem, 1.8fr) repeat(4, minmax(9rem, 1fr)) auto auto;
     gap: 0.75rem;
     align-items: end;
     margin: 1rem 0;

@@ -326,6 +326,7 @@ export type TicketSummary = {
   updated_at?: string | null;
   queued_by?: string | null;
   queued_at?: string | null;
+  workspace_action_priority?: 'ready_for_queue' | 'active_work' | 'background' | null;
   record_source?: string;
 };
 

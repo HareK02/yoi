@@ -93,6 +93,9 @@ Deno.test("workspace Tickets surface uses read-only Backend Ticket APIs", async 
     ticketsLoad.includes('`${workspaceApiPath(params.workspaceId, "/tickets")}?limit=1000`') &&
       ticketsPage.includes("Notion-style filtering and sorting") &&
       ticketsPage.includes("toggleSort('updated_at')") &&
+      ticketsPage.includes("bind:value={visibilityFilter}") &&
+      ticketsPage.includes("sortKey = $state<SortKey>('panel')") &&
+      ticketsPage.includes("workspace_action_priority") &&
       ticketsPage.includes("bind:value={stateFilter}") &&
       ticketsPage.includes("workspaceRoute(data.workspaceId, `/tickets/${ticket.id}`)"),
     "Tickets list should read the workspace-scoped Ticket API and expose sortable/filterable table links",
