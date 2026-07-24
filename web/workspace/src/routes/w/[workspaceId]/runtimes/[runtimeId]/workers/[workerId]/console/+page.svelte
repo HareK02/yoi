@@ -156,8 +156,15 @@
         mergeDiagnostics(worker?.diagnostics ?? [], streamDiagnostics),
     );
     const workerState = $derived(liveWorkerState ?? worker?.state ?? "loading");
+    const workerRunning = $derived(workerState === "running");
     const inputReady = $derived(workerState === "idle");
-    const canSend = $derived(inputReady && draft.trim().length > 0 && !sending);
+    const composerEditable = $derived(protocolState === "open" && !sending);
+    const canSubmitDraft = $derived(inputReady && composerEditable);
+    const canSend = $derived(canSubmitDraft && draft.trim().length > 0);
+    const canStopFromComposer = $derived(workerRunning && composerEditable);
+    const composerSubmitDisabled = $derived(
+        workerRunning ? !canStopFromComposer : !canSend,
+    );
 
     async function getJson<T>(path: string): Promise<T> {
         const response = await fetch(path);
@@ -433,6 +440,14 @@
         }
     }
 
+    function handleComposerSubmit(value = draft) {
+        if (workerRunning) {
+            sendControl({ method: "cancel" }, "Stop");
+            return;
+        }
+        void submitDraft(value);
+    }
+
     async function submitDraft(value = draft) {
         const command = buildComposerRequest(value);
         if (!command.ok) {
@@ -466,9 +481,9 @@
         }
     }
 
-    async function sendMessage(event: SubmitEvent) {
+    function sendMessage(event: SubmitEvent) {
         event.preventDefault();
-        await submitDraft();
+        handleComposerSubmit();
     }
 
     function workerStateFromProtocolEvent(
@@ -1314,12 +1329,12 @@
                 bind:this={composerTextareaElement}
                 bind:value={draft}
                 use:chatSubmit={{
-                    enabled: inputReady && !sending,
-                    onSubmit: (value) => void submitDraft(value),
+                    enabled: canSubmitDraft,
+                    onSubmit: (value) => handleComposerSubmit(value),
                 }}
                 use:fitTextarea={{ value: draft, maxRows: 10 }}
                 onkeydown={handleComposerKeydown}
-                disabled={!inputReady || sending}></textarea>
+                disabled={!composerEditable}></textarea>
             <div class="composer-input-footer">
                 <div class="composer-footer-slot">
                     {#if completionBusy || completionError || completionEntries.length > 0}
@@ -1342,18 +1357,33 @@
                 </div>
                 <button
                     class="composer-send-button"
+                    class:stop={workerRunning}
                     type="submit"
-                    aria-label={sending ? "Sending message" : "Send message"}
-                    disabled={!canSend}
+                    aria-label={workerRunning
+                        ? "Stop Worker"
+                        : sending
+                          ? "Sending message"
+                          : "Send message"}
+                    disabled={composerSubmitDisabled}
                 >
-                    <svg
-                        class="composer-send-icon"
-                        aria-hidden="true"
-                        viewBox="0 0 24 24"
-                    >
-                        <path d="M8 6L12 2L16 6" />
-                        <path d="M12 2V22" />
-                    </svg>
+                    {#if workerRunning}
+                        <svg
+                            class="composer-send-icon"
+                            aria-hidden="true"
+                            viewBox="0 0 24 24"
+                        >
+                            <path d="M7 7H17V17H7Z" />
+                        </svg>
+                    {:else}
+                        <svg
+                            class="composer-send-icon"
+                            aria-hidden="true"
+                            viewBox="0 0 24 24"
+                        >
+                            <path d="M8 6L12 2L16 6" />
+                            <path d="M12 2V22" />
+                        </svg>
+                    {/if}
                 </button>
             </div>
         </div>
@@ -1655,6 +1685,11 @@
         cursor: pointer;
         padding: 0;
         pointer-events: auto;
+    }
+
+    .composer-send-button.stop {
+        background: var(--danger);
+        color: var(--bg);
     }
 
     .composer-send-button:disabled {

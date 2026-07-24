@@ -416,6 +416,21 @@ Deno.test("Worker Console page is routed by runtime_id and worker_id through bac
       !consolePage.includes("void refreshConsole();\n  });\n\n  $effect"),
     "target-change effect should load data without depending on manual refresh state reads",
   );
+  assert(
+    consolePage.includes('const workerRunning = $derived(workerState === "running");') &&
+      consolePage.includes(
+        'const composerEditable = $derived(protocolState === "open" && !sending);',
+      ) &&
+      consolePage.includes('sendControl({ method: "cancel" }, "Stop")') &&
+      consolePage.includes("enabled: canSubmitDraft") &&
+      consolePage.includes("disabled={!composerEditable}") &&
+      consolePage.includes('class:stop={workerRunning}') &&
+      consolePage.includes('"Stop Worker"') &&
+      consolePage.includes("disabled={composerSubmitDisabled}") &&
+      !consolePage.includes("disabled={!inputReady || sending}") &&
+      !consolePage.includes("enabled: inputReady && !sending"),
+    "Worker Console composer should stay editable during runs and turn the submit button into a Stop control",
+  );
 });
 
 Deno.test("Account UI owns browser passkey session state without workspace authorization", async () => {
