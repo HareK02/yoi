@@ -9,6 +9,18 @@ function assert(condition: unknown, message: string): asserts condition {
   }
 }
 
+Deno.test("workspace app css uses bundled Gen Interface JP font", async () => {
+  const appCss = await Deno.readTextFile(new URL("./../../../app.css", import.meta.url));
+  assert(
+    appCss.includes("gen-interface-jp/400.css") &&
+      appCss.includes("gen-interface-jp/500.css") &&
+      appCss.includes("gen-interface-jp/600.css") &&
+      appCss.includes("gen-interface-jp/700.css") &&
+      appCss.includes('"Gen Interface JP", Inter'),
+    "global app css should import the tracked Gen Interface JP weights and prefer it in the sans font stack",
+  );
+});
+
 Deno.test("workspace Worker list lives on the dedicated Workers page", async () => {
   const workspacePage = await Deno.readTextFile(
     new URL("./../../../routes/w/[workspaceId]/+page.svelte", import.meta.url),

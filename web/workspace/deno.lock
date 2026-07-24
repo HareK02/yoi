@@ -11,6 +11,7 @@
     "npm:cookie@0.6.0": "0.6.0",
     "npm:decodal-codemirror@0.1.2": "0.1.2",
     "npm:devalue@5.6.4": "5.6.4",
+    "npm:gen-interface-jp@0.8.0": "0.8.0",
     "npm:set-cookie-parser@2.7.2": "2.7.2",
     "npm:shiki@3.13.0": "3.13.0",
     "npm:sv@*": "0.10.8",
@@ -715,6 +716,9 @@
       "os": ["darwin"],
       "scripts": true
     },
+    "gen-interface-jp@0.8.0": {
+      "integrity": "sha512-7rIytSAfuugVjYithrQseT0zqeUIkJd0LY3Ugdfbk/FxzMSeagcskeZlof5uWJ5liW3Zhn7pdLHq2OIvAftx+A=="
+    },
     "graceful-fs@4.2.11": {
       "integrity": "sha512-RbJ5/jmFcNNCcDV5o9eTnBLJ/HszWV0P73bc+Ff4nS/rJj+YaS6IGyiOL0VoBYX+l1Wrl3k63h/KrH+nhJ0XvQ=="
     },
@@ -1182,6 +1186,7 @@
     "packageJson": {
       "dependencies": [
         "npm:@tailwindcss/vite@^4.1.17",
+        "npm:gen-interface-jp@0.8.0",
         "npm:tailwindcss@^4.1.17"
       ]
     }
