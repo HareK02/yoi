@@ -139,6 +139,15 @@ pub struct WorkingDirectoryCleanupTarget {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkingDirectoryOccupancy {
+    pub runtime_id: String,
+    pub runtime_worker_id: u64,
+    pub worker_id: String,
+    pub display_name: String,
+    pub linked_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkingDirectorySummary {
     pub working_directory_id: String,
     pub repository_id: String,
@@ -156,6 +165,8 @@ pub struct WorkingDirectorySummary {
     pub cleanliness: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_worker_id: Option<WorkerId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occupied_by: Option<WorkingDirectoryOccupancy>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

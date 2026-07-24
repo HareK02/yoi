@@ -115,6 +115,14 @@ export type WorkingDirectoryRepositoryOption = {
   default_selector?: string | null;
 };
 
+export type WorkingDirectoryOccupancy = {
+  runtime_id: string;
+  runtime_worker_id: number;
+  worker_id: string;
+  display_name: string;
+  linked_at: string;
+};
+
 export type WorkingDirectorySummary = {
   working_directory_id: string;
   repository_id: string;
@@ -125,6 +133,7 @@ export type WorkingDirectorySummary = {
   status: string;
   cleanliness?: string | null;
   primary_worker_id?: number | null;
+  occupied_by?: WorkingDirectoryOccupancy | null;
   cleanup_target: {
     kind: string;
     working_directory_id: string;

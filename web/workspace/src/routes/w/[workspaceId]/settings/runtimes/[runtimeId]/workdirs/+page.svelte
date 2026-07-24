@@ -129,6 +129,7 @@
             <th>Commit</th>
             <th>Status</th>
             <th>Cleanliness</th>
+            <th>Occupied by</th>
             <th>Action</th>
           </tr>
         </thead>
@@ -142,6 +143,14 @@
               <td><code>{commitLabel(workdir)}</code></td>
               <td>{workdir.status}</td>
               <td>{workdir.cleanliness ?? 'unknown'}</td>
+              <td>
+                {#if workdir.occupied_by}
+                  <span>{workdir.occupied_by.display_name}</span>
+                  <small>{workdir.occupied_by.runtime_id}:{workdir.occupied_by.runtime_worker_id}</small>
+                {:else}
+                  <span class="muted">—</span>
+                {/if}
+              </td>
               <td>
                 {#if cleanup}
                   <button

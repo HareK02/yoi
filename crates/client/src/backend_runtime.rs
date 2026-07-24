@@ -106,6 +106,15 @@ pub struct BackendWorkingDirectoryCleanupTarget {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct BackendWorkingDirectoryOccupancy {
+    pub runtime_id: String,
+    pub runtime_worker_id: u64,
+    pub worker_id: String,
+    pub display_name: String,
+    pub linked_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct BackendWorkingDirectorySummary {
     pub working_directory_id: String,
     pub repository_id: String,
@@ -122,7 +131,9 @@ pub struct BackendWorkingDirectorySummary {
     #[serde(default)]
     pub cleanliness: Option<String>,
     #[serde(default)]
-    pub primary_worker_id: Option<String>,
+    pub primary_worker_id: Option<u64>,
+    #[serde(default)]
+    pub occupied_by: Option<BackendWorkingDirectoryOccupancy>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

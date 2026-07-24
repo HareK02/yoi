@@ -86,6 +86,40 @@ Deno.test("defaultWorkerLaunchForm chooses active runtime, coder profile, reposi
   assertEquals(form.working_directory_selector, "HEAD");
 });
 
+Deno.test("defaultWorkerLaunchForm skips occupied working directories", () => {
+  const form = defaultWorkerLaunchForm(
+    {
+      ...options,
+      working_directories: [
+        {
+          ...options.working_directories[0],
+          occupied_by: {
+            runtime_id: "embedded",
+            runtime_worker_id: 12,
+            worker_id: "embedded:12",
+            display_name: "Worker 12",
+            linked_at: "2026-07-24T00:00:00Z",
+          },
+        },
+      ],
+    },
+    {
+      runtime_id: "",
+      display_name: "",
+      profile: "",
+      initial_text: "hello",
+      working_directory_id: "",
+      working_directory_repository_id: "",
+      working_directory_selector: "",
+      relative_cwd: "",
+    },
+  );
+
+  assertEquals(form.working_directory_id, "");
+  assertEquals(form.working_directory_repository_id, "repo");
+  assertEquals(form.working_directory_selector, "HEAD");
+});
+
 Deno.test("buildBrowserCreateWorkerRequest sends working_directory id and relative cwd only", () => {
   const request = buildBrowserCreateWorkerRequest({
     runtime_id: "embedded",

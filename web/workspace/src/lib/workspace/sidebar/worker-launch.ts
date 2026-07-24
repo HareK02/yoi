@@ -38,7 +38,8 @@ export function defaultWorkerLaunchForm(
   const availableWorkingDirectories = options?.working_directories.filter((directory) =>
     directory.status === "active" &&
     directory.cleanliness === "clean" &&
-    directory.primary_worker_id == null
+    directory.primary_worker_id == null &&
+    directory.occupied_by == null
   ) ?? [];
   const selectedRuntime = current.runtime_id
     ? options?.runtimes.find((runtime) => runtime.runtime_id === current.runtime_id)

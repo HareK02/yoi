@@ -50,7 +50,10 @@
     selectedRuntimeAllowsNoWorkdir
       ? []
       : (options?.working_directories ?? []).filter((directory) =>
-        directory.status === 'active' && directory.cleanliness === 'clean' && directory.primary_worker_id == null
+        directory.status === 'active' &&
+        directory.cleanliness === 'clean' &&
+        directory.primary_worker_id == null &&
+        directory.occupied_by == null
       ),
   );
   let canStartWorker = $derived(Boolean(

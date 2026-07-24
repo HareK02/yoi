@@ -84,14 +84,15 @@ use crate::{Error, Result};
 use worker_runtime::catalog::{
     ConfigBundleRef, MaterializerKind, ProfileSelector,
     RepositorySelector as RuntimeRepositorySelector, WorkingDirectoryClaim,
-    WorkingDirectoryRepository, WorkingDirectoryRequest, WorkingDirectoryStatusKind,
-    WorkingDirectorySummary,
+    WorkingDirectoryOccupancy, WorkingDirectoryRepository, WorkingDirectoryRequest,
+    WorkingDirectoryStatusKind, WorkingDirectorySummary,
 };
 use worker_runtime::config_bundle::ConfigBundle;
 use worker_runtime::http_server::{
     RuntimeHttpConfigBundleAvailabilityResponse, RuntimeHttpConfigBundlesResponse,
     RuntimeHttpSummaryResponse, RuntimeHttpWorkerResponse, RuntimeHttpWorkersResponse,
 };
+use worker_runtime::identity::WorkerId;
 use worker_runtime::interaction::{
     WorkerInput as EmbeddedWorkerInput, WorkerInputKind as EmbeddedWorkerInputKind,
 };
@@ -1760,9 +1761,11 @@ fn create_working_directory_for_runtime(
     };
     let record = workdir_record_from_summary(&api, &runtime_id, &working_directory.summary);
     api.store.upsert_workdir_registry(&record)?;
+    let mut summary = working_directory.summary;
+    apply_workdir_occupancy_projection(&api, &mut summary)?;
     Ok(Json(BrowserWorkingDirectoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
-        item: working_directory.summary,
+        item: summary,
         diagnostics: result.diagnostics,
     }))
 }
@@ -1779,9 +1782,11 @@ fn working_directory_detail_for_runtime(
     if let Some(working_directory) = result.working_directory {
         let record = workdir_record_from_summary(&api, runtime_id, &working_directory.summary);
         api.store.upsert_workdir_registry(&record)?;
+        let mut summary = working_directory.summary;
+        apply_workdir_occupancy_projection(&api, &mut summary)?;
         return Ok(Json(BrowserWorkingDirectoryDetailResponse {
             workspace_id: api.config.workspace_id.clone(),
-            item: working_directory.summary,
+            item: summary,
             diagnostics: result.diagnostics,
         }));
     }
@@ -1791,7 +1796,7 @@ fn working_directory_detail_for_runtime(
     {
         return Ok(Json(BrowserWorkingDirectoryDetailResponse {
             workspace_id: api.config.workspace_id.clone(),
-            item: workdir_summary_from_record(&record),
+            item: projected_workdir_summary_from_record(&api, &record)?,
             diagnostics: result.diagnostics,
         }));
     }
@@ -1846,9 +1851,11 @@ fn cleanup_working_directory_for_runtime(
     };
     let record = workdir_record_from_summary(&api, runtime_id, &working_directory.summary);
     api.store.upsert_workdir_registry(&record)?;
+    let mut summary = working_directory.summary;
+    apply_workdir_occupancy_projection(&api, &mut summary)?;
     Ok(Json(BrowserWorkingDirectoryDetailResponse {
         workspace_id: api.config.workspace_id.clone(),
-        item: working_directory.summary,
+        item: summary,
         diagnostics: result.diagnostics,
     }))
 }
@@ -5298,10 +5305,11 @@ fn working_directory_summaries(api: &WorkspaceApi) -> ApiResult<Vec<WorkingDirec
     let records = api
         .store
         .list_workdir_registry(&api.config.workspace_id, 200)?;
-    Ok(records
+    records
         .iter()
-        .map(workdir_summary_from_record)
-        .collect::<Vec<_>>())
+        .map(|record| projected_workdir_summary_from_record(api, record))
+        .collect::<Result<Vec<_>>>()
+        .map_err(ApiError::from)
 }
 
 fn available_working_directory_summaries(
@@ -5319,11 +5327,7 @@ fn available_working_directory_summaries(
         {
             continue;
         }
-        let links = api.store.list_workdir_worker_links(
-            &api.config.workspace_id,
-            summary.working_directory_id.as_str(),
-        )?;
-        if links.is_empty() && summary.primary_worker_id.is_none() {
+        if summary.occupied_by.is_none() && summary.primary_worker_id.is_none() {
             available.push(summary);
         }
     }
@@ -5341,8 +5345,9 @@ fn runtime_working_directory_summaries(
     let items = records
         .iter()
         .filter(|record| record.runtime_id == runtime_id)
-        .map(workdir_summary_from_record)
-        .collect::<Vec<_>>();
+        .map(|record| projected_workdir_summary_from_record(api, record))
+        .collect::<Result<Vec<_>>>()
+        .map_err(ApiError::from)?;
     Ok((items, diagnostics))
 }
 
@@ -5474,7 +5479,18 @@ fn merge_worker_registry_projection(
         workdirs
             .iter()
             .find(|workdir| workdir.workdir_id == link.workdir_id)
-            .map(|workdir| workdir_summary_from_record(workdir))
+            .map(|workdir| {
+                let mut workdir_summary = workdir_summary_from_record(workdir);
+                workdir_summary.primary_worker_id = Some(WorkerId::new(record.runtime_worker_id));
+                workdir_summary.occupied_by = Some(WorkingDirectoryOccupancy {
+                    runtime_id: record.runtime_id.clone(),
+                    runtime_worker_id: record.runtime_worker_id,
+                    worker_id: format!("{}:{}", record.runtime_id, record.runtime_worker_id),
+                    display_name: record.display_name.clone(),
+                    linked_at: link.linked_at.clone(),
+                });
+                workdir_summary
+            })
     });
     summary
 }
@@ -5732,7 +5748,50 @@ fn workdir_summary_from_record(record: &WorkdirRegistryRecord) -> WorkingDirecto
         status,
         cleanliness: Some(record.cleanliness.clone()),
         primary_worker_id: None,
+        occupied_by: None,
     }
+}
+
+fn apply_workdir_occupancy_projection(
+    api: &WorkspaceApi,
+    summary: &mut WorkingDirectorySummary,
+) -> Result<()> {
+    let links = api
+        .store
+        .list_workdir_worker_links(&api.config.workspace_id, &summary.working_directory_id)?;
+    let Some(link) = links.first() else {
+        summary.primary_worker_id = None;
+        summary.occupied_by = None;
+        return Ok(());
+    };
+
+    let worker = api.store.get_worker_registry(
+        &api.config.workspace_id,
+        &link.runtime_id,
+        link.runtime_worker_id,
+    )?;
+    let display_name = worker
+        .as_ref()
+        .map(|worker| worker.display_name.clone())
+        .unwrap_or_else(|| format!("{}:{}", link.runtime_id, link.runtime_worker_id));
+    summary.primary_worker_id = Some(WorkerId::new(link.runtime_worker_id));
+    summary.occupied_by = Some(WorkingDirectoryOccupancy {
+        runtime_id: link.runtime_id.clone(),
+        runtime_worker_id: link.runtime_worker_id,
+        worker_id: format!("{}:{}", link.runtime_id, link.runtime_worker_id),
+        display_name,
+        linked_at: link.linked_at.clone(),
+    });
+    Ok(())
+}
+
+fn projected_workdir_summary_from_record(
+    api: &WorkspaceApi,
+    record: &WorkdirRegistryRecord,
+) -> Result<WorkingDirectorySummary> {
+    let mut summary = workdir_summary_from_record(record);
+    apply_workdir_occupancy_projection(api, &mut summary)?;
+    Ok(summary)
 }
 
 fn link_worker_to_workdir(
@@ -6370,10 +6429,16 @@ mod tests {
         let projected = merge_worker_registry_projection(None, &worker, vec![link], &[workdir]);
 
         assert_eq!(projected.state, "missing");
+        let working_directory = projected.working_directory.as_ref().unwrap();
         assert_eq!(
-            projected.working_directory.as_ref().unwrap().status,
+            working_directory.status,
             WorkingDirectoryStatusKind::NotFound
         );
+        let occupied_by = working_directory.occupied_by.as_ref().unwrap();
+        assert_eq!(occupied_by.runtime_id, "embedded");
+        assert_eq!(occupied_by.runtime_worker_id, 1);
+        assert_eq!(occupied_by.display_name, "Missing Worker");
+        assert_eq!(occupied_by.linked_at, "4");
         let serialized = serde_json::to_string(&projected).unwrap();
         assert!(!serialized.contains("/tmp/"));
         assert!(!serialized.contains("materialized_path"));
@@ -6411,6 +6476,33 @@ mod tests {
                 updated_at: "2".to_string(),
             })
             .unwrap();
+        api.store
+            .upsert_worker_registry(&WorkerRegistryRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                runtime_worker_id: 7,
+                display_name: "Worker Seven".to_string(),
+                profile: Some("builtin:coder".to_string()),
+                retention_state: "normal".to_string(),
+                transcript_ref: None,
+                session_ref: None,
+                summary_ref: None,
+                diagnostics_ref: None,
+                created_at: "1".to_string(),
+                updated_at: "2".to_string(),
+            })
+            .unwrap();
+        api.store
+            .upsert_worker_workdir_link(&WorkerWorkdirLinkRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                runtime_id: EMBEDDED_WORKER_RUNTIME_ID.to_string(),
+                runtime_worker_id: 7,
+                workdir_id: "managed".to_string(),
+                role: "primary_cwd".to_string(),
+                linked_at: "3".to_string(),
+                unlinked_at: None,
+            })
+            .unwrap();
 
         let summaries = working_directory_summaries(&api)
             .unwrap_or_else(|err| panic!("working_directory_summaries failed: {}", err.error));
@@ -6420,6 +6512,15 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(ids.contains(&"managed"));
         assert!(ids.contains(&"runtime-direct"));
+        let managed = summaries
+            .iter()
+            .find(|summary| summary.working_directory_id == "managed")
+            .unwrap();
+        let occupied_by = managed.occupied_by.as_ref().unwrap();
+        assert_eq!(occupied_by.runtime_id, EMBEDDED_WORKER_RUNTIME_ID);
+        assert_eq!(occupied_by.runtime_worker_id, 7);
+        assert_eq!(occupied_by.display_name, "Worker Seven");
+        assert_eq!(occupied_by.linked_at, "3");
 
         let (runtime_projection, _) =
             runtime_working_directory_summaries(&api, EMBEDDED_WORKER_RUNTIME_ID).unwrap_or_else(
