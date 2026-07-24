@@ -1629,38 +1629,24 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
                 }),
         };
         match self.runtime.create_worker(create_request) {
-            Ok(detail) => {
-                let execution_failure =
-                    embedded_spawn_execution_failure_diagnostic(&detail.execution);
-                if let Some(diagnostic) = execution_failure {
-                    diagnostics.push(diagnostic);
-                    WorkerSpawnResult {
-                        state: WorkerOperationState::Rejected,
-                        worker: Some(self.map_worker_detail(detail)),
-                        acceptance_evidence: Vec::new(),
-                        diagnostics,
-                    }
-                } else {
-                    WorkerSpawnResult {
-                        state: WorkerOperationState::Accepted,
-                        worker: Some(self.map_worker_detail(detail)),
-                        acceptance_evidence: vec![
-                            WorkerSpawnAcceptanceEvidence {
-                                kind: "embedded_runtime_worker_created".to_string(),
-                                detail: "worker-runtime catalog accepted a backend-internal tools-less Worker"
-                                    .to_string(),
-                            },
-                            WorkerSpawnAcceptanceEvidence {
-                                kind: "embedded_runtime_backend_internal_projection".to_string(),
-                                detail:
-                                    "only runtime_id plus worker_id backend projections were exposed"
-                                        .to_string(),
-                            },
-                        ],
-                        diagnostics,
-                    }
-                }
-            }
+            Ok(detail) => WorkerSpawnResult {
+                state: WorkerOperationState::Accepted,
+                worker: Some(self.map_worker_detail(detail)),
+                acceptance_evidence: vec![
+                    WorkerSpawnAcceptanceEvidence {
+                        kind: "embedded_runtime_worker_created".to_string(),
+                        detail:
+                            "worker-runtime catalog accepted a backend-internal tools-less Worker"
+                                .to_string(),
+                    },
+                    WorkerSpawnAcceptanceEvidence {
+                        kind: "embedded_runtime_backend_internal_projection".to_string(),
+                        detail: "only runtime_id plus worker_id backend projections were exposed"
+                            .to_string(),
+                    },
+                ],
+                diagnostics,
+            },
             Err(err) => {
                 diagnostics.push(embedded_runtime_diagnostic(&err));
                 WorkerSpawnResult {
@@ -2710,38 +2696,6 @@ fn embedded_runtime_status_label(status: RuntimeStatus) -> &'static str {
     }
 }
 
-fn embedded_spawn_execution_failure_diagnostic(
-    execution: &worker_runtime::execution::WorkerExecutionStatus,
-) -> Option<RuntimeDiagnostic> {
-    let result = execution.last_result.as_ref()?;
-    let severity = match result.outcome {
-        worker_runtime::execution::WorkerExecutionOutcome::Accepted => return None,
-        worker_runtime::execution::WorkerExecutionOutcome::Rejected
-        | worker_runtime::execution::WorkerExecutionOutcome::Busy
-        | worker_runtime::execution::WorkerExecutionOutcome::Unsupported => {
-            DiagnosticSeverity::Warning
-        }
-        worker_runtime::execution::WorkerExecutionOutcome::Errored => DiagnosticSeverity::Error,
-    };
-    let status = match result.outcome {
-        worker_runtime::execution::WorkerExecutionOutcome::Accepted => "accepted",
-        worker_runtime::execution::WorkerExecutionOutcome::Rejected => "rejected",
-        worker_runtime::execution::WorkerExecutionOutcome::Busy => "busy",
-        worker_runtime::execution::WorkerExecutionOutcome::Unsupported => "unsupported",
-        worker_runtime::execution::WorkerExecutionOutcome::Errored => "errored",
-    };
-    let detail = result
-        .message
-        .as_deref()
-        .map(|message| format!(": {message}"))
-        .unwrap_or_default();
-    Some(diagnostic(
-        format!("embedded_worker_execution_spawn_{status}"),
-        severity,
-        format!("Embedded Worker execution spawn was {status} during setup{detail}"),
-    ))
-}
-
 fn runtime_worker_can_stop(
     execution_enabled: bool,
     status: EmbeddedWorkerStatus,
@@ -2749,26 +2703,11 @@ fn runtime_worker_can_stop(
 ) -> bool {
     execution_enabled
         && status == EmbeddedWorkerStatus::Running
-        && execution.backend == worker_runtime::execution::WorkerExecutionBackendKind::Connected
-        && !matches!(
+        && execution.backend == worker_runtime::execution::WorkerExecutionBackendKind::Alive
+        && matches!(
             execution.run_state,
-            WorkerExecutionRunState::Stopped
-                | WorkerExecutionRunState::Rejected
-                | WorkerExecutionRunState::Errored
-                | WorkerExecutionRunState::Unconnected
+            WorkerExecutionRunState::Idle | WorkerExecutionRunState::Busy
         )
-        && !execution_last_result_blocks_control(execution)
-}
-
-fn execution_last_result_blocks_control(execution: &WorkerExecutionStatus) -> bool {
-    execution.last_result.as_ref().is_some_and(|result| {
-        matches!(
-            result.outcome,
-            worker_runtime::execution::WorkerExecutionOutcome::Rejected
-                | worker_runtime::execution::WorkerExecutionOutcome::Errored
-                | worker_runtime::execution::WorkerExecutionOutcome::Unsupported
-        )
-    })
 }
 
 fn embedded_worker_status_label(status: EmbeddedWorkerStatus) -> &'static str {
@@ -2788,27 +2727,26 @@ fn embedded_worker_projection_diagnostics(
         "Worker identity is projected only as runtime_id plus worker_id; embedded runtime internals remain backend-private".to_string(),
     )];
 
-    if execution.backend == WorkerExecutionBackendKind::Stale {
-        diagnostics.push(diagnostic(
-            "embedded_worker_execution_stale",
-            DiagnosticSeverity::Warning,
-            "Worker execution handle is not connected in this server process; persisted execution binding was marked stale".to_string(),
-        ));
-    } else if execution.backend == WorkerExecutionBackendKind::Unconnected
-        || execution.run_state == WorkerExecutionRunState::Unconnected
-    {
-        diagnostics.push(diagnostic(
-            "embedded_worker_execution_unconnected",
-            DiagnosticSeverity::Warning,
-            "Worker execution handle is not connected in this server process".to_string(),
-        ));
-    } else if execution.run_state == WorkerExecutionRunState::Rejected {
-        diagnostics.push(diagnostic(
-            "embedded_worker_execution_spawn_rejected",
+    match execution.backend {
+        WorkerExecutionBackendKind::Stopped => diagnostics.push(diagnostic(
+            "embedded_worker_execution_stopped",
+            DiagnosticSeverity::Info,
+            "Worker execution is stopped; the runtime will restore it before dispatching input or protocol methods".to_string(),
+        )),
+        WorkerExecutionBackendKind::Corrupted => diagnostics.push(diagnostic(
+            "embedded_worker_execution_corrupted",
             DiagnosticSeverity::Error,
-            "Worker execution spawn was rejected; backend-private details are not exposed"
-                .to_string(),
-        ));
+            "Worker execution state is corrupted and cannot be restored without repair".to_string(),
+        )),
+        WorkerExecutionBackendKind::Alive => {
+            if execution.run_state == WorkerExecutionRunState::Rejected {
+                diagnostics.push(diagnostic(
+                    "embedded_worker_execution_rejected",
+                    DiagnosticSeverity::Warning,
+                    "Worker execution rejected the last transient operation; retry or inspect runtime logs".to_string(),
+                ));
+            }
+        }
     }
 
     diagnostics
@@ -2821,19 +2759,19 @@ fn embedded_worker_execution_status_label(
     match status {
         EmbeddedWorkerStatus::Stopped => "stopped",
         EmbeddedWorkerStatus::Cancelled => "cancelled",
-        EmbeddedWorkerStatus::Running => {
-            if execution.backend == worker_runtime::execution::WorkerExecutionBackendKind::Stale {
-                return "stale";
+        EmbeddedWorkerStatus::Running => match execution.backend {
+            worker_runtime::execution::WorkerExecutionBackendKind::Stopped => "stopped",
+            worker_runtime::execution::WorkerExecutionBackendKind::Corrupted => "corrupted",
+            worker_runtime::execution::WorkerExecutionBackendKind::Alive => {
+                match execution.run_state {
+                    WorkerExecutionRunState::Idle => "idle",
+                    WorkerExecutionRunState::Busy => "running",
+                    WorkerExecutionRunState::Stopped => "stopped",
+                    WorkerExecutionRunState::Rejected => "rejected",
+                    WorkerExecutionRunState::Errored => "errored",
+                }
             }
-            match execution.run_state {
-                WorkerExecutionRunState::Idle => "idle",
-                WorkerExecutionRunState::Busy => "running",
-                WorkerExecutionRunState::Stopped => "stopped",
-                WorkerExecutionRunState::Rejected => "rejected",
-                WorkerExecutionRunState::Errored => "errored",
-                WorkerExecutionRunState::Unconnected => "unconnected",
-            }
-        }
+        },
     }
 }
 
@@ -4331,7 +4269,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_runtime_projection_blocks_stale_and_unconnected_execution_input() {
+    fn remote_runtime_projection_blocks_stopped_and_corrupted_execution_stop() {
         let (base_url, server) = serve_mock_http(vec![
             mock_response(
                 "GET",
@@ -4343,30 +4281,26 @@ mod tests {
                     worker_json_with_execution(
                         "remote:primary",
                         "1",
-                        "stale",
-                        "unconnected",
-                        None,
+                        "stopped",
+                        "stopped",
                     ),
                     worker_json_with_execution(
                         "remote:primary",
                         "2",
-                        "unconnected",
-                        "unconnected",
-                        None,
+                        "corrupted",
+                        "errored",
                     ),
                     worker_json_with_execution(
                         "remote:primary",
                         "3",
-                        "connected",
+                        "alive",
                         "rejected",
-                        Some("rejected"),
                     ),
                     worker_json_with_execution(
                         "remote:primary",
                         "4",
-                        "connected",
+                        "alive",
                         "errored",
-                        Some("errored"),
                     )
                     ]
                 })
@@ -4381,9 +4315,8 @@ mod tests {
                     "worker": worker_json_with_execution(
                     "remote:primary",
                     "1",
-                    "stale",
-                    "unconnected",
-                    None,
+                    "stopped",
+                    "stopped",
                 )})
                 .to_string(),
             ),
@@ -4411,14 +4344,14 @@ mod tests {
                 worker.worker_id
             );
         }
-        assert_eq!(workers.items[0].state, "stale");
-        assert_eq!(workers.items[1].state, "unconnected");
+        assert_eq!(workers.items[0].state, "stopped");
+        assert_eq!(workers.items[1].state, "corrupted");
         assert_eq!(workers.items[2].state, "rejected");
         assert_eq!(workers.items[3].state, "errored");
 
-        let stale_detail = registry.worker("remote:primary", "1").unwrap();
-        assert!(!stale_detail.capabilities.can_stop);
-        assert_eq!(stale_detail.state, "stale");
+        let stopped_detail = registry.worker("remote:primary", "1").unwrap();
+        assert!(!stopped_detail.capabilities.can_stop);
+        assert_eq!(stopped_detail.state, "stopped");
 
         server.join().expect("mock remote server finished");
     }
@@ -4599,7 +4532,7 @@ mod tests {
     }
 
     fn worker_json(runtime_id: &str, worker_id: &str) -> serde_json::Value {
-        worker_json_with_execution(runtime_id, worker_id, "connected", "idle", None)
+        worker_json_with_execution(runtime_id, worker_id, "alive", "idle")
     }
 
     fn worker_json_with_execution(
@@ -4607,23 +4540,14 @@ mod tests {
         worker_id: &str,
         backend: &str,
         run_state: &str,
-        last_outcome: Option<&str>,
     ) -> serde_json::Value {
-        let last_result = last_outcome.map(|outcome| {
-            json!({
-                "operation": "input",
-                "outcome": outcome,
-                "run_state": run_state,
-                "message": format!("{outcome} result")
-            })
-        });
         let worker_id = worker_id.parse::<u64>().unwrap();
         json!({
             "worker_ref": { "runtime_id": runtime_id, "worker_id": worker_id },
             "runtime_id": runtime_id,
             "worker_id": worker_id,
             "status": "running",
-            "execution": { "backend": backend, "run_state": run_state, "last_result": last_result },
+            "execution": { "backend": backend, "run_state": run_state },
             "intent": { "kind": "role", "role": "coder", "purpose": "remote test" },
             "profile": { "kind": "builtin", "value": "coder" },
             "profile_source": {

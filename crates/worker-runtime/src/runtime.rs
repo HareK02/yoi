@@ -357,7 +357,7 @@ impl Runtime {
                 worker_id: worker_id.clone(),
                 status: WorkerStatus::Running,
                 request: request.clone(),
-                execution: WorkerExecutionStatus::unconnected(),
+                execution: WorkerExecutionStatus::stopped(),
                 execution_handle: None,
                 last_event_id: event_id,
             };
@@ -471,14 +471,13 @@ impl Runtime {
             match (backend, handle) {
                 (Some(backend), Some(handle)) => (backend, handle),
                 _ => {
-                    let result = WorkerExecutionResult::rejected(
-                        WorkerExecutionOperation::Input,
-                        "worker has no execution backend",
-                    );
                     let worker = state.worker_mut(worker_ref)?;
-                    let mut execution = WorkerExecutionStatus::unconnected().with_result(result);
-                    execution.binding = worker.execution.binding.clone();
-                    worker.execution = execution;
+                    worker.execution =
+                        if worker.execution.backend == WorkerExecutionBackendKind::Corrupted {
+                            worker.execution.clone()
+                        } else {
+                            WorkerExecutionStatus::stopped_from(worker.execution.clone())
+                        };
                     state.persist_worker(&worker_ref.worker_id)?;
                     return Err(RuntimeError::WorkerExecutionUnavailable {
                         worker_id: worker_ref.worker_id.clone(),
@@ -510,11 +509,10 @@ impl Runtime {
         let worker = state.worker_mut(worker_ref)?;
         worker.last_event_id = event_id;
         worker.execution = WorkerExecutionStatus {
-            backend: WorkerExecutionBackendKind::Connected,
+            backend: WorkerExecutionBackendKind::Alive,
             run_state: dispatch_result.run_state,
             binding: worker.execution.binding.clone(),
             working_directory: worker.execution.working_directory.clone(),
-            last_result: Some(dispatch_result),
         };
 
         let status = worker.status;
@@ -592,14 +590,13 @@ impl Runtime {
             match (backend, handle) {
                 (Some(backend), Some(handle)) => (backend, handle),
                 _ => {
-                    let result = WorkerExecutionResult::rejected(
-                        WorkerExecutionOperation::ProtocolMethod,
-                        "worker has no execution backend",
-                    );
                     let worker = state.worker_mut(worker_ref)?;
-                    let mut execution = WorkerExecutionStatus::unconnected().with_result(result);
-                    execution.binding = worker.execution.binding.clone();
-                    worker.execution = execution;
+                    worker.execution =
+                        if worker.execution.backend == WorkerExecutionBackendKind::Corrupted {
+                            worker.execution.clone()
+                        } else {
+                            WorkerExecutionStatus::stopped_from(worker.execution.clone())
+                        };
                     state.persist_worker(&worker_ref.worker_id)?;
                     return Err(RuntimeError::WorkerExecutionUnavailable {
                         worker_id: worker_ref.worker_id.clone(),
@@ -638,7 +635,7 @@ impl Runtime {
             let binding = WorkerExecutionBindingIdentity::from_handle(&handle);
             let worker = state.worker_mut(worker_ref)?;
             worker.execution_handle = Some(handle);
-            let mut execution = WorkerExecutionStatus::connected(run_state).with_binding(binding);
+            let mut execution = WorkerExecutionStatus::alive(run_state).with_binding(binding);
             if let Some(status) = working_directory {
                 execution = execution.with_working_directory(status);
             }
@@ -669,11 +666,10 @@ impl Runtime {
         let mut state = self.lock()?;
         let worker = state.worker_mut(worker_ref)?;
         worker.execution = WorkerExecutionStatus {
-            backend: WorkerExecutionBackendKind::Connected,
+            backend: WorkerExecutionBackendKind::Alive,
             run_state: result.run_state,
             binding: worker.execution.binding.clone(),
             working_directory: worker.execution.working_directory.clone(),
-            last_result: Some(result),
         };
         state.persist_worker(&worker_ref.worker_id)?;
         Ok(())
@@ -1048,6 +1044,24 @@ impl Runtime {
         let candidates = {
             let mut state = self.lock()?;
             let Some(backend) = state.execution_backend.clone() else {
+                let worker_ids: Vec<_> = state.workers.keys().cloned().collect();
+                for worker_id in worker_ids {
+                    let Some(worker) = state.workers.get(&worker_id) else {
+                        continue;
+                    };
+                    if worker.execution.backend != WorkerExecutionBackendKind::Alive {
+                        continue;
+                    }
+                    let worker_ref = worker.worker_ref.clone();
+                    let worker = state.worker_mut(&worker_ref)?;
+                    worker.execution =
+                        if worker.execution.backend == WorkerExecutionBackendKind::Corrupted {
+                            worker.execution.clone()
+                        } else {
+                            WorkerExecutionStatus::stopped_from(worker.execution.clone())
+                        };
+                    state.persist_worker(&worker_ref.worker_id)?;
+                }
                 return Ok(());
             };
             let backend_id = backend.backend_id().to_string();
@@ -1059,7 +1073,10 @@ impl Runtime {
                 };
                 if !worker.status.is_active()
                     || worker.execution_handle.is_some()
-                    || worker.execution.backend != WorkerExecutionBackendKind::Stale
+                    || !matches!(
+                        worker.execution.backend,
+                        WorkerExecutionBackendKind::Alive | WorkerExecutionBackendKind::Stopped
+                    )
                     || worker
                         .execution
                         .binding
@@ -1152,7 +1169,7 @@ impl Runtime {
         {
             let worker = state.worker_mut(worker_ref)?;
             worker.execution_handle = Some(handle.clone());
-            let mut execution = WorkerExecutionStatus::connected(run_state)
+            let mut execution = WorkerExecutionStatus::alive(run_state)
                 .with_binding(WorkerExecutionBindingIdentity::from_handle(&handle));
             if let Some(status) = working_directory {
                 execution = execution.with_working_directory(status);
@@ -1269,22 +1286,21 @@ impl RuntimeState {
         let mut diagnostics = persisted.diagnostics;
         let mut next_diagnostic_id = persisted.next_diagnostic_id;
         for (worker_id, worker) in persisted.workers {
-            let execution = if worker.execution.binding.is_some()
-                && worker.execution.backend == WorkerExecutionBackendKind::Connected
+            let execution = if worker.execution.backend == WorkerExecutionBackendKind::Alive
+                && worker.execution.binding.is_none()
             {
-                let stale = WorkerExecutionStatus::stale(worker.execution);
                 diagnostics.push(RuntimeDiagnostic {
                     id: next_diagnostic_id,
-                    severity: DiagnosticSeverity::Warning,
-                    code: "worker_execution_mapping_stale".to_string(),
+                    severity: DiagnosticSeverity::Error,
+                    code: "worker_execution_binding_missing".to_string(),
                     message: format!(
-                        "worker {} has persisted execution binding identity but no live execution handle was restored",
+                        "worker {} was persisted as alive but has no execution binding identity",
                         worker.worker_id
                     ),
                     worker_ref: Some(worker.worker_ref.clone()),
                 });
                 next_diagnostic_id += 1;
-                stale
+                WorkerExecutionStatus::corrupted(worker.execution)
             } else {
                 worker.execution
             };
@@ -1596,9 +1612,7 @@ impl RuntimeState {
         });
         let worker = self.worker_mut(worker_ref)?;
         worker.execution_handle = None;
-        let mut execution = WorkerExecutionStatus::stale(worker.execution.clone());
-        execution.last_result = Some(result);
-        worker.execution = execution;
+        worker.execution = WorkerExecutionStatus::corrupted(worker.execution.clone());
         self.persist_runtime_snapshot()?;
         self.persist_worker(&worker_ref.worker_id)?;
         Ok(())
@@ -2623,7 +2637,7 @@ mod tests {
         assert_eq!(restored_worker.status, WorkerStatus::Stopped);
         assert_eq!(
             restored_worker.execution.backend,
-            WorkerExecutionBackendKind::Stale
+            WorkerExecutionBackendKind::Stopped
         );
         assert_eq!(
             restored_worker
@@ -2632,16 +2646,6 @@ mod tests {
                 .as_ref()
                 .map(|binding| binding.backend_id.as_str()),
             Some("test-execution-backend")
-        );
-        assert!(
-            restored
-                .diagnostics()
-                .unwrap()
-                .iter()
-                .any(
-                    |diagnostic| diagnostic.code == "worker_execution_mapping_stale"
-                        && diagnostic.worker_ref.as_ref() == Some(&worker.worker_ref)
-                )
         );
         #[cfg(feature = "ws-server")]
         {
@@ -2708,6 +2712,19 @@ mod tests {
             .unwrap();
         drop(runtime);
 
+        let backendless = Runtime::with_fs_store(crate::fs_store::FsRuntimeStoreOptions {
+            root: root.clone(),
+            display_name: None,
+            limits: RuntimeLimits::default(),
+        })
+        .unwrap();
+        let stopped_worker = backendless.worker_detail(&worker.worker_ref).unwrap();
+        assert_eq!(
+            stopped_worker.execution.backend,
+            WorkerExecutionBackendKind::Stopped
+        );
+        drop(backendless);
+
         let restoring_backend = Arc::new(TestExecutionBackend::default());
         let restored = Runtime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
@@ -2724,7 +2741,7 @@ mod tests {
         assert_eq!(restored_worker.status, WorkerStatus::Running);
         assert_eq!(
             restored_worker.execution.backend,
-            WorkerExecutionBackendKind::Connected
+            WorkerExecutionBackendKind::Alive
         );
         assert!(restored_worker.execution.binding.is_some());
         restored
@@ -2748,7 +2765,7 @@ mod tests {
 
     #[cfg(feature = "fs-store")]
     #[test]
-    fn fs_store_keeps_worker_stale_when_execution_restore_fails() {
+    fn fs_store_marks_worker_corrupted_when_execution_restore_fails() {
         let root = fs_store_root("execution-restore-failed");
         let runtime = Runtime::with_fs_store_and_execution_backend(
             crate::fs_store::FsRuntimeStoreOptions {
@@ -2785,7 +2802,7 @@ mod tests {
         assert_eq!(restored_worker.status, WorkerStatus::Running);
         assert_eq!(
             restored_worker.execution.backend,
-            WorkerExecutionBackendKind::Stale
+            WorkerExecutionBackendKind::Corrupted
         );
         assert!(
             restored

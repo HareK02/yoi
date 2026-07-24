@@ -8452,7 +8452,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn embedded_runtime_fs_store_restores_catalog_config_bundle_and_stale_execution() {
+    async fn embedded_runtime_fs_store_restores_catalog_config_bundle_and_corrupts_failed_execution()
+     {
         let dir = tempfile::tempdir().unwrap();
         let config = test_server_config(dir.path().join("workspace"));
         let store_root = config.embedded_runtime_store_root.clone();
@@ -8539,13 +8540,13 @@ mod tests {
             .runtime
             .worker("embedded-worker-runtime", &worker_id)
             .expect("restored worker");
-        assert_eq!(restored_worker.state, "stale");
+        assert_eq!(restored_worker.state, "corrupted");
         assert!(!restored_worker.capabilities.can_stop);
         assert!(
             restored_worker
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == "embedded_worker_execution_stale")
+                .any(|diagnostic| diagnostic.code == "embedded_worker_execution_corrupted")
         );
 
         let bundles = restored
@@ -8566,7 +8567,7 @@ mod tests {
                 &worker_id,
                 WorkerInputRequest {
                     kind: WorkerInputKind::User,
-                    content: "should not be routed to stale handle".to_string(),
+                    content: "should not be routed to corrupted handle".to_string(),
                     segments: None,
                 },
             )

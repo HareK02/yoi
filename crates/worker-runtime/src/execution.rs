@@ -1,4 +1,4 @@
-use crate::catalog::{CreateWorkerRequest, WorkingDirectoryRequest, WorkingDirectoryStatus};
+use crate::catalog::{WorkingDirectoryRequest, WorkingDirectoryStatus};
 use crate::config_bundle::ConfigBundle;
 use crate::error::RuntimeError;
 use crate::identity::WorkerRef;
@@ -11,24 +11,29 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
 
-/// Coarse execution attachment visible through Worker catalog/detail responses.
+/// Persisted execution lifecycle visible through Worker catalog/detail responses.
 ///
-/// This deliberately does not expose backend handles, process paths, sockets,
-/// credentials, session files, or manifest paths. It only says whether Runtime
-/// has an execution backend attached for the Worker.
+/// This is intentionally a worker lifecycle projection, not a transport/backend
+/// handle state. Runtime restart boundaries invalidate live handles, so a
+/// persisted `alive` worker is restored on startup; restore deferral keeps the
+/// worker `stopped`, while structural restore failure marks it `corrupted`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerExecutionBackendKind {
+    /// Restoreable persisted state exists, but no live execution handle is attached.
     #[default]
-    Unconnected,
-    /// A durable execution binding was restored, but no live handle was recovered.
-    Stale,
-    Connected,
+    #[serde(alias = "unconnected", alias = "stale")]
+    Stopped,
+    /// A live execution handle is currently attached. Legacy `connected` maps here.
+    #[serde(alias = "connected")]
+    Alive,
+    /// Persisted execution state is structurally invalid and cannot be restored.
+    Corrupted,
 }
 
 /// Durable, non-authority execution binding projection.
 ///
-/// This records only enough identity to diagnose stale mappings after restore.
+/// This records only enough identity to restore through the same backend kind.
 /// It is not a live handle and must not contain sockets, paths, credentials, or
 /// provider-private authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,12 +54,11 @@ impl WorkerExecutionBindingIdentity {
 #[serde(rename_all = "snake_case")]
 pub enum WorkerExecutionRunState {
     #[default]
-    Unconnected,
+    Stopped,
     Idle,
     Busy,
     Rejected,
     Errored,
-    Stopped,
 }
 
 /// Execution operation that produced a result.
@@ -69,7 +73,18 @@ pub enum WorkerExecutionOperation {
     Cancel,
 }
 
-/// Typed execution result class.
+/// Typed execution result class. Results are transient operation outcomes and
+/// are not persisted as Worker lifecycle authority.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerExecutionResult {
+    pub operation: WorkerExecutionOperation,
+    pub outcome: WorkerExecutionOutcome,
+    pub run_state: WorkerExecutionRunState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Backend result class for a Worker execution operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerExecutionOutcome {
@@ -78,16 +93,6 @@ pub enum WorkerExecutionOutcome {
     Rejected,
     Errored,
     Unsupported,
-}
-
-/// Backend result for a Worker execution operation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkerExecutionResult {
-    pub operation: WorkerExecutionOperation,
-    pub outcome: WorkerExecutionOutcome,
-    pub run_state: WorkerExecutionRunState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
 }
 
 impl WorkerExecutionResult {
@@ -116,7 +121,7 @@ impl WorkerExecutionResult {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Rejected,
-            run_state: WorkerExecutionRunState::Rejected,
+            run_state: WorkerExecutionRunState::Stopped,
             message: Some(message.into()),
         }
     }
@@ -134,7 +139,7 @@ impl WorkerExecutionResult {
         Self {
             operation,
             outcome: WorkerExecutionOutcome::Unsupported,
-            run_state: WorkerExecutionRunState::Rejected,
+            run_state: WorkerExecutionRunState::Stopped,
             message: Some(message.into()),
         }
     }
@@ -159,28 +164,31 @@ pub struct WorkerExecutionStatus {
     pub binding: Option<WorkerExecutionBindingIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<WorkingDirectoryStatus>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_result: Option<WorkerExecutionResult>,
 }
 
 impl WorkerExecutionStatus {
-    pub fn unconnected() -> Self {
+    pub fn stopped() -> Self {
         Self::default()
     }
 
-    pub fn connected(run_state: WorkerExecutionRunState) -> Self {
+    pub fn alive(run_state: WorkerExecutionRunState) -> Self {
         Self {
-            backend: WorkerExecutionBackendKind::Connected,
+            backend: WorkerExecutionBackendKind::Alive,
             run_state,
             binding: None,
             working_directory: None,
-            last_result: None,
         }
     }
 
-    pub fn stale(mut previous: Self) -> Self {
-        previous.backend = WorkerExecutionBackendKind::Stale;
-        previous.run_state = WorkerExecutionRunState::Unconnected;
+    pub fn stopped_from(mut previous: Self) -> Self {
+        previous.backend = WorkerExecutionBackendKind::Stopped;
+        previous.run_state = WorkerExecutionRunState::Stopped;
+        previous
+    }
+
+    pub fn corrupted(mut previous: Self) -> Self {
+        previous.backend = WorkerExecutionBackendKind::Corrupted;
+        previous.run_state = WorkerExecutionRunState::Errored;
         previous
     }
 
@@ -196,7 +204,6 @@ impl WorkerExecutionStatus {
 
     pub fn with_result(mut self, result: WorkerExecutionResult) -> Self {
         self.run_state = result.run_state;
-        self.last_result = Some(result);
         self
     }
 }
@@ -266,13 +273,20 @@ impl WorkerExecutionContext {
         &self.worker_ref
     }
 
-    /// Publish a protocol event into the Runtime observation bus.
+    #[cfg(feature = "ws-server")]
+    pub fn publish_observation(
+        &self,
+        payload: protocol::Event,
+    ) -> Result<WorkerObservationEvent, RuntimeError> {
+        (self.observation_publisher)(self.worker_ref.clone(), payload)
+    }
+
     #[cfg(feature = "ws-server")]
     pub fn publish_protocol_event(
         &self,
         payload: protocol::Event,
     ) -> Result<WorkerObservationEvent, RuntimeError> {
-        (self.observation_publisher)(self.worker_ref.clone(), payload)
+        self.publish_observation(payload)
     }
 }
 
@@ -284,32 +298,29 @@ impl fmt::Debug for WorkerExecutionContext {
     }
 }
 
-/// Spawn/initialization request passed to an execution backend.
+/// Request passed to a [`WorkerExecutionBackend`] when spawning a Worker.
 #[derive(Clone, Debug)]
 pub struct WorkerExecutionSpawnRequest {
     pub worker_ref: WorkerRef,
-    pub request: CreateWorkerRequest,
+    pub request: crate::catalog::CreateWorkerRequest,
     pub context: WorkerExecutionContext,
     pub working_directory: Option<WorkingDirectoryBinding>,
     pub config_bundle: Option<ConfigBundle>,
 }
 
-/// Restore request passed to an execution backend for a persisted Runtime Worker.
-///
-/// The persisted execution status is a restore hint, not a live handle. Backends
-/// must create a fresh controller/handle before returning `Connected`.
+/// Request passed to a [`WorkerExecutionBackend`] when restoring a persisted Worker.
 #[derive(Clone, Debug)]
 pub struct WorkerExecutionRestoreRequest {
     pub worker_ref: WorkerRef,
-    pub request: CreateWorkerRequest,
+    pub request: crate::catalog::CreateWorkerRequest,
     pub context: WorkerExecutionContext,
     pub previous_execution: WorkerExecutionStatus,
     pub working_directory: Option<WorkingDirectoryBinding>,
     pub config_bundle: Option<ConfigBundle>,
 }
 
-/// Result of backend Worker spawn/initialization.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Backend outcome for Worker spawn/restore operations.
+#[derive(Clone, Debug)]
 pub enum WorkerExecutionSpawnResult {
     Connected {
         handle: WorkerExecutionHandle,
@@ -320,11 +331,20 @@ pub enum WorkerExecutionSpawnResult {
     Errored(WorkerExecutionResult),
 }
 
-/// Backend boundary for Worker execution.
-///
-/// Runtime owns Worker catalog, protocol observation, and lifecycle state. A
-/// backend owns concrete execution. The default Runtime has no backend, so input
-/// to those Workers is rejected instead of producing providerless responses.
+impl WorkerExecutionSpawnResult {
+    pub fn connected(
+        handle: WorkerExecutionHandle,
+        run_state: WorkerExecutionRunState,
+        working_directory: Option<WorkingDirectoryStatus>,
+    ) -> Self {
+        Self::Connected {
+            handle,
+            run_state,
+            working_directory,
+        }
+    }
+}
+
 pub trait WorkerExecutionBackend: Send + Sync + 'static {
     fn backend_id(&self) -> &str;
 
@@ -393,6 +413,15 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
         )
     }
 
+    fn worker_completions(
+        &self,
+        _handle: &WorkerExecutionHandle,
+        _kind: protocol::CompletionKind,
+        _prefix: &str,
+    ) -> Vec<protocol::CompletionEntry> {
+        Vec::new()
+    }
+
     fn stop_worker(&self, _handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
         WorkerExecutionResult::unsupported(
             WorkerExecutionOperation::Stop,
@@ -411,32 +440,30 @@ pub trait WorkerExecutionBackend: Send + Sync + 'static {
     fn worker_snapshot(&self, _handle: &WorkerExecutionHandle) -> Option<protocol::Event> {
         None
     }
-
-    fn worker_completions(
-        &self,
-        _handle: &WorkerExecutionHandle,
-        _kind: protocol::CompletionKind,
-        _prefix: &str,
-    ) -> Vec<protocol::CompletionEntry> {
-        Vec::new()
-    }
 }
 
 #[derive(Clone)]
 pub(crate) struct WorkerExecutionBackendRef {
-    id: String,
+    backend_id: String,
     backend: Arc<dyn WorkerExecutionBackend>,
 }
 
 impl WorkerExecutionBackendRef {
     pub(crate) fn new(backend: Arc<dyn WorkerExecutionBackend>) -> Result<Self, RuntimeError> {
-        let id = backend.backend_id().trim().to_string();
-        if id.is_empty() {
+        let backend_id = backend.backend_id().to_string();
+        if backend_id.trim().is_empty() {
             return Err(RuntimeError::InvalidRequest(
                 "execution backend id must not be empty".to_string(),
             ));
         }
-        Ok(Self { id, backend })
+        Ok(Self {
+            backend_id,
+            backend,
+        })
+    }
+
+    pub(crate) fn backend_id(&self) -> &str {
+        &self.backend_id
     }
 
     pub(crate) fn spawn_worker(
@@ -446,12 +473,6 @@ impl WorkerExecutionBackendRef {
         self.backend.spawn_worker(request)
     }
 
-    #[cfg(feature = "fs-store")]
-    pub(crate) fn backend_id(&self) -> &str {
-        &self.id
-    }
-
-    #[cfg(feature = "fs-store")]
     pub(crate) fn restore_worker(
         &self,
         request: WorkerExecutionRestoreRequest,
@@ -500,14 +521,6 @@ impl WorkerExecutionBackendRef {
         self.backend.dispatch_method(handle, method)
     }
 
-    pub(crate) fn stop_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
-        self.backend.stop_worker(handle)
-    }
-
-    pub(crate) fn cancel_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
-        self.backend.cancel_worker(handle)
-    }
-
     #[cfg(feature = "ws-server")]
     pub(crate) fn worker_snapshot(
         &self,
@@ -524,12 +537,62 @@ impl WorkerExecutionBackendRef {
     ) -> Vec<protocol::CompletionEntry> {
         self.backend.worker_completions(handle, kind, prefix)
     }
+
+    pub(crate) fn stop_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
+        self.backend.stop_worker(handle)
+    }
+
+    pub(crate) fn cancel_worker(&self, handle: &WorkerExecutionHandle) -> WorkerExecutionResult {
+        self.backend.cancel_worker(handle)
+    }
 }
 
 impl fmt::Debug for WorkerExecutionBackendRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WorkerExecutionBackendRef")
-            .field("id", &self.id)
+            .field("backend_id", &self.backend_id)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn execution_backend_kind_accepts_legacy_values() {
+        let connected: WorkerExecutionStatus = serde_json::from_value(json!({
+            "backend": "connected",
+            "run_state": "idle",
+            "binding": { "backend_id": "worker-crate" }
+        }))
+        .unwrap();
+        assert_eq!(connected.backend, WorkerExecutionBackendKind::Alive);
+
+        let stale: WorkerExecutionStatus = serde_json::from_value(json!({
+            "backend": "stale",
+            "run_state": "stopped",
+            "binding": { "backend_id": "worker-crate" }
+        }))
+        .unwrap();
+        assert_eq!(stale.backend, WorkerExecutionBackendKind::Stopped);
+
+        let unconnected: WorkerExecutionStatus = serde_json::from_value(json!({
+            "backend": "unconnected",
+            "run_state": "stopped"
+        }))
+        .unwrap();
+        assert_eq!(unconnected.backend, WorkerExecutionBackendKind::Stopped);
+    }
+
+    #[test]
+    fn execution_status_serializes_without_last_result() {
+        let status = WorkerExecutionStatus::alive(WorkerExecutionRunState::Idle).with_result(
+            WorkerExecutionResult::rejected(WorkerExecutionOperation::Input, "transient"),
+        );
+        let serialized = serde_json::to_value(status).unwrap();
+        assert_eq!(serialized["backend"], "alive");
+        assert!(serialized.get("last_result").is_none());
     }
 }

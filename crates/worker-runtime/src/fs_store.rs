@@ -473,7 +473,7 @@ struct WorkerSnapshot {
     worker_id: WorkerId,
     status: WorkerStatus,
     request: CreateWorkerRequest,
-    #[serde(default = "WorkerExecutionStatus::unconnected")]
+    #[serde(default = "WorkerExecutionStatus::stopped")]
     execution: WorkerExecutionStatus,
     last_event_id: u64,
 }
