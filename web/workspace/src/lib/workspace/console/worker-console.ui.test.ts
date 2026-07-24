@@ -9,7 +9,7 @@ function assert(condition: unknown, message: string): asserts condition {
   }
 }
 
-Deno.test("workspace app css uses bundled Gen Interface JP font", async () => {
+Deno.test("workspace app css uses bundled UI fonts", async () => {
   const appCss = await Deno.readTextFile(new URL("./../../../app.css", import.meta.url));
   assert(
     appCss.includes("gen-interface-jp/400.css") &&
@@ -18,6 +18,14 @@ Deno.test("workspace app css uses bundled Gen Interface JP font", async () => {
       appCss.includes("gen-interface-jp/700.css") &&
       appCss.includes('"Gen Interface JP", Inter'),
     "global app css should import the tracked Gen Interface JP weights and prefer it in the sans font stack",
+  );
+  assert(
+    appCss.includes("@fontsource/ibm-plex-mono/latin-400.css") &&
+      appCss.includes("@fontsource/ibm-plex-mono/latin-500.css") &&
+      appCss.includes("@fontsource/ibm-plex-mono/latin-600.css") &&
+      appCss.includes("@fontsource/ibm-plex-mono/latin-700.css") &&
+      appCss.includes('"IBM Plex Mono", ui-monospace'),
+    "global app css should import the tracked IBM Plex Mono weights and prefer it in the mono font stack",
   );
 });
 

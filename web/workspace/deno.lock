@@ -3,6 +3,7 @@
   "specifiers": {
     "npm:@codemirror/state@6.5.2": "6.5.2",
     "npm:@codemirror/view@6.38.8": "6.38.8",
+    "npm:@fontsource/ibm-plex-mono@5.3.0": "5.3.0",
     "npm:@sveltejs/adapter-static@3.0.9": "3.0.9_@sveltejs+kit@2.49.4__@sveltejs+vite-plugin-svelte@6.2.1___svelte@5.45.6___vite@7.2.7__svelte@5.45.6__typescript@5.9.3__vite@7.2.7_@sveltejs+vite-plugin-svelte@6.2.1__svelte@5.45.6__vite@7.2.7_svelte@5.45.6_typescript@5.9.3_vite@7.2.7",
     "npm:@sveltejs/kit@2.49.4": "2.49.4_@sveltejs+vite-plugin-svelte@6.2.1__svelte@5.45.6__vite@7.2.7_svelte@5.45.6_typescript@5.9.3_vite@7.2.7",
     "npm:@sveltejs/vite-plugin-svelte@6.2.1": "6.2.1_svelte@5.45.6_vite@7.2.7",
@@ -177,6 +178,9 @@
       "integrity": "sha512-alJC0uCZpTFrSL0CCDjcgleBXPnCrEAhTBILpeAp7M/OFgoqtAetfBzX0xM00MUsVVPpVjlPuMbREqnZCXaTnA==",
       "os": ["win32"],
       "cpu": ["x64"]
+    },
+    "@fontsource/ibm-plex-mono@5.3.0": {
+      "integrity": "sha512-eTgnZjZEGk1QtD3ZstF+Vclo2HLAni8YMy34/DxllwZvyz1lR/1RF/xTiAquOBO7MvqBx8D2Ig2WCPMVfdZu7Q=="
     },
     "@jridgewell/gen-mapping@0.3.13": {
       "integrity": "sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA==",
@@ -1185,6 +1189,7 @@
     ],
     "packageJson": {
       "dependencies": [
+        "npm:@fontsource/ibm-plex-mono@5.3.0",
         "npm:@tailwindcss/vite@^4.1.17",
         "npm:gen-interface-jp@0.8.0",
         "npm:tailwindcss@^4.1.17"
