@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
@@ -13,7 +13,8 @@ use axum::{Json, Router};
 use chrono::{Duration, SecondsFormat, Utc};
 use futures::{SinkExt, StreamExt};
 use memory::backend::{
-    MemoryBackendHttpResponse, MemoryBackendOperation, execute_memory_backend_operation,
+    MemoryBackendHttpResponse, MemoryBackendOperation, MemoryConsolidateStagingOperation,
+    MemoryConsolidationOutput, execute_memory_backend_operation,
 };
 use protocol::stream::{decode_method, encode_event};
 use serde::{Deserialize, Serialize};
@@ -230,6 +231,7 @@ pub struct WorkspaceApi {
     store: Arc<dyn ControlPlaneStore>,
     records: LocalProjectRecordReader,
     runtime: Arc<RuntimeRegistry>,
+    memory_consolidater_worker: Arc<Mutex<Option<(String, String)>>>,
     companion: Arc<CompanionConsole>,
     observation_proxy: BackendObservationProxy,
     resource_broker: BackendResourceBroker,
@@ -334,6 +336,7 @@ impl WorkspaceApi {
             config,
             store,
             runtime,
+            memory_consolidater_worker: Arc::new(Mutex::new(None)),
             companion,
             observation_proxy,
             resource_broker,
@@ -487,6 +490,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/memory/backend",
             post(scoped_memory_backend_operation),
+        )
+        .route(
+            "/api/w/{workspace_id}/memory/consolidation",
+            post(scoped_memory_consolidation),
         )
         .route("/api/tickets/{id}", get(get_ticket))
         .route("/api/w/{workspace_id}/skills", get(scoped_list_skills))
@@ -1468,6 +1475,198 @@ async fn scoped_memory_backend_operation(
         },
     };
     Ok(Json(response))
+}
+
+async fn scoped_memory_consolidation(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Json(operation): Json<MemoryConsolidateStagingOperation>,
+) -> ApiResult<Json<MemoryConsolidationOutput>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let memory_config = manifest::MemoryConfig::default();
+    let layout = memory::WorkspaceLayout::resolve(&memory_config, &api.config.workspace_root);
+    Ok(Json(start_memory_staging_consolidation(
+        api, &layout, operation,
+    )?))
+}
+
+fn start_memory_staging_consolidation(
+    api: WorkspaceApi,
+    layout: &memory::WorkspaceLayout,
+    operation: MemoryConsolidateStagingOperation,
+) -> ApiResult<MemoryConsolidationOutput> {
+    let snapshot = memory::consolidate::list_staging_entries_snapshot(layout);
+    let candidate_count = snapshot.entries.len();
+    let total_bytes = snapshot
+        .entries
+        .iter()
+        .map(|entry| entry.bytes)
+        .sum::<u64>();
+    if candidate_count == 0 {
+        return Ok(MemoryConsolidationOutput {
+            status: "skipped_empty".to_string(),
+            summary: "No Memory staging candidates are pending.".to_string(),
+            candidate_count,
+            total_bytes,
+        });
+    }
+    let reached_files = operation
+        .threshold_files
+        .is_some_and(|threshold| candidate_count >= threshold);
+    let reached_bytes = operation
+        .threshold_bytes
+        .is_some_and(|threshold| total_bytes >= threshold);
+    if !operation.force && !reached_files && !reached_bytes {
+        return Ok(MemoryConsolidationOutput {
+            status: "skipped_below_threshold".to_string(),
+            summary: format!(
+                "Memory staging backlog has {candidate_count} candidate(s), {total_bytes} byte(s), below configured threshold."
+            ),
+            candidate_count,
+            total_bytes,
+        });
+    }
+
+    let runtime_id = select_memory_consolidation_runtime(&api)?;
+    if let Some((existing_runtime_id, existing_worker_id)) = api
+        .memory_consolidater_worker
+        .lock()
+        .expect("memory consolidater worker lock poisoned")
+        .clone()
+    {
+        match api
+            .runtime
+            .worker(&existing_runtime_id, &existing_worker_id)
+        {
+            Ok(worker) if worker.state == "idle" => {
+                let delete = api
+                    .runtime
+                    .delete_worker(&existing_runtime_id, &existing_worker_id)
+                    .map_err(|err| err.into_error())?;
+                if delete.state != WorkerOperationState::Accepted || !delete.deleted {
+                    return Ok(MemoryConsolidationOutput {
+                        status: "skipped_existing_not_idle".to_string(),
+                        summary: format!(
+                            "Existing Memory consolidater '{}' was idle but could not be deleted.",
+                            existing_worker_id
+                        ),
+                        candidate_count,
+                        total_bytes,
+                    });
+                }
+                *api.memory_consolidater_worker
+                    .lock()
+                    .expect("memory consolidater worker lock poisoned") = None;
+            }
+            Ok(worker) => {
+                return Ok(MemoryConsolidationOutput {
+                    status: "skipped_existing_not_idle".to_string(),
+                    summary: format!(
+                        "Existing Memory consolidater '{}' is '{}', not confirmed idle.",
+                        existing_worker_id, worker.state
+                    ),
+                    candidate_count,
+                    total_bytes,
+                });
+            }
+            Err(_) => {
+                *api.memory_consolidater_worker
+                    .lock()
+                    .expect("memory consolidater worker lock poisoned") = None;
+            }
+        }
+    }
+
+    let profile_selector = ProfileSelector::Builtin("memory-consolidation".to_string());
+    let resolved_config_bundle = crate::profile_settings::build_workspace_profile_config_bundle(
+        &api.config.workspace_root,
+        &api.config.workspace_id,
+        &api.config.workspace_created_at,
+        "memory-consolidation",
+    )?;
+    let input = EmbeddedWorkerInput {
+        kind: EmbeddedWorkerInputKind::User,
+        content: format!(
+            "Process pending Memory staging candidates through MemoryStagingList, MemoryStagingRead, Memory tools, and MemoryStagingClose. Current backlog: {candidate_count} candidate(s), {total_bytes} byte(s)."
+        ),
+        segments: None,
+    };
+    let result = api
+        .runtime
+        .spawn_worker(
+            &runtime_id,
+            WorkerSpawnRequest {
+                requested_worker_name: Some("memory-consolidation".to_string()),
+                intent: WorkerSpawnIntent::WorkspaceOrchestrator,
+                acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                    expected_segments: 1,
+                },
+                profile: Some(profile_selector),
+                initial_input: Some(input),
+                working_directory_request: None,
+                resolved_working_directory_request: None,
+                resolved_working_directory: None,
+                resolved_config_bundle,
+            },
+        )
+        .map_err(|err| err.into_error())?;
+    if result.state != WorkerOperationState::Accepted {
+        return Ok(MemoryConsolidationOutput {
+            status: "skipped_spawn_rejected".to_string(),
+            summary: "Runtime rejected Memory consolidater spawn.".to_string(),
+            candidate_count,
+            total_bytes,
+        });
+    }
+    let Some(worker) = result.worker else {
+        return Ok(MemoryConsolidationOutput {
+            status: "skipped_spawn_missing_worker".to_string(),
+            summary:
+                "Runtime accepted Memory consolidater spawn without returning a Worker summary."
+                    .to_string(),
+            candidate_count,
+            total_bytes,
+        });
+    };
+    *api.memory_consolidater_worker
+        .lock()
+        .expect("memory consolidater worker lock poisoned") =
+        Some((worker.runtime_id.clone(), worker.worker_id.clone()));
+    Ok(MemoryConsolidationOutput {
+        status: "started".to_string(),
+        summary: format!(
+            "Started Memory consolidater '{}' for {candidate_count} staging candidate(s).",
+            worker.worker_id
+        ),
+        candidate_count,
+        total_bytes,
+    })
+}
+
+fn select_memory_consolidation_runtime(api: &WorkspaceApi) -> ApiResult<String> {
+    let runtimes = api.runtime.list_runtimes(100);
+    if let Some(runtime) = runtimes
+        .items
+        .iter()
+        .find(|runtime| {
+            runtime.runtime_id == EMBEDDED_WORKER_RUNTIME_ID
+                && runtime.capabilities.can_spawn_worker
+        })
+        .or_else(|| {
+            runtimes
+                .items
+                .iter()
+                .find(|runtime| runtime.capabilities.can_spawn_worker)
+        })
+    {
+        return Ok(runtime.runtime_id.clone());
+    }
+    Err(Error::RuntimeOperationFailed {
+        runtime_id: "memory-consolidation".to_string(),
+        code: "memory_consolidation_runtime_unavailable".to_string(),
+        message: "No runtime capable of spawning the Memory consolidater is available".to_string(),
+    }
+    .into())
 }
 
 async fn scoped_list_skills(

@@ -12,9 +12,11 @@ use llm_engine::tool::{
 };
 use memory::backend::{
     MemoryBackendHttpResponse, MemoryBackendOperation, MemoryBackendOperationResult,
-    MemoryDeleteOperation, MemoryEditOperation, MemoryQueryOperation, MemoryReadOperation,
-    MemoryToolOutput, MemoryWriteOperation,
+    MemoryConsolidateStagingOperation, MemoryConsolidationOutput, MemoryDeleteOperation,
+    MemoryEditOperation, MemoryQueryOperation, MemoryReadOperation, MemoryStagingCloseOperation,
+    MemoryStagingListOperation, MemoryStagingReadOperation, MemoryToolOutput, MemoryWriteOperation,
 };
+use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
@@ -91,6 +93,28 @@ impl WorkspaceClient {
             }
         }
     }
+
+    pub async fn request_memory_staging_consolidation(
+        &self,
+        operation: MemoryConsolidateStagingOperation,
+    ) -> Result<MemoryConsolidationOutput, WorkspaceMemoryBackendError> {
+        match self {
+            WorkspaceClient::Http {
+                workspace_id,
+                base_url,
+            } => execute_http_memory_consolidation(workspace_id, base_url, operation).await,
+            WorkspaceClient::Available { kind } => Err(WorkspaceMemoryBackendError::Unavailable {
+                reason: format!(
+                    "workspace client kind `{kind}` does not expose the Backend Workspace API"
+                ),
+            }),
+            WorkspaceClient::Unavailable { reason } => {
+                Err(WorkspaceMemoryBackendError::Unavailable {
+                    reason: reason.clone(),
+                })
+            }
+        }
+    }
 }
 
 async fn execute_http_memory_backend(
@@ -119,6 +143,29 @@ async fn execute_http_memory_backend(
             Err(WorkspaceMemoryBackendError::Backend(message))
         }
     }
+}
+
+async fn execute_http_memory_consolidation(
+    workspace_id: &str,
+    base_url: &str,
+    operation: MemoryConsolidateStagingOperation,
+) -> Result<MemoryConsolidationOutput, WorkspaceMemoryBackendError> {
+    let url = format!(
+        "{}/api/w/{}/memory/consolidation",
+        base_url.trim_end_matches('/'),
+        workspace_id
+    );
+    let response = reqwest::Client::new()
+        .post(url)
+        .json(&operation)
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        return Err(WorkspaceMemoryBackendError::Http { status, body });
+    }
+    serde_json::from_str::<MemoryConsolidationOutput>(&body).map_err(Into::into)
 }
 
 pub fn workspace_http_memory_tools(
@@ -185,6 +232,58 @@ pub fn workspace_http_memory_tools(
     ]
 }
 
+pub fn workspace_http_memory_consolidation_tools(
+    workspace_id: impl Into<String>,
+    base_url: impl Into<String>,
+) -> Vec<ToolDefinition> {
+    let workspace_id = workspace_id.into();
+    let base_url = base_url.into();
+    let mut tools = workspace_http_memory_tools(workspace_id.clone(), base_url.clone());
+    let backend = WorkspaceHttpMemoryBackend::new(workspace_id, base_url);
+    tools.extend([
+        memory_tool(
+            "MemoryStagingList",
+            STAGING_LIST_DESCRIPTION,
+            schema_for::<MemoryStagingListOperation>(),
+            backend.clone(),
+            |input| {
+                Ok(MemoryBackendOperation::StagingList(parse_input::<
+                    MemoryStagingListOperation,
+                >(
+                    input
+                )?))
+            },
+        ),
+        memory_tool(
+            "MemoryStagingRead",
+            STAGING_READ_DESCRIPTION,
+            schema_for::<MemoryStagingReadOperation>(),
+            backend.clone(),
+            |input| {
+                Ok(MemoryBackendOperation::StagingRead(parse_input::<
+                    MemoryStagingReadOperation,
+                >(
+                    input
+                )?))
+            },
+        ),
+        memory_tool(
+            "MemoryStagingClose",
+            STAGING_CLOSE_DESCRIPTION,
+            schema_for::<MemoryStagingCloseOperation>(),
+            backend,
+            |input| {
+                Ok(MemoryBackendOperation::StagingClose(parse_input::<
+                    MemoryStagingCloseOperation,
+                >(
+                    input
+                )?))
+            },
+        ),
+    ]);
+    tools
+}
+
 type OperationBuilder = fn(&str) -> Result<MemoryBackendOperation, ToolError>;
 
 fn memory_tool(
@@ -229,6 +328,10 @@ fn parse_input<T: DeserializeOwned>(input: &str) -> Result<T, ToolError> {
     serde_json::from_str(input).map_err(|error| ToolError::InvalidArgument(error.to_string()))
 }
 
+fn schema_for<T: JsonSchema>() -> serde_json::Value {
+    serde_json::to_value(schemars::schema_for!(T)).expect("memory tool schema should serialize")
+}
+
 fn tool_output(output: MemoryToolOutput) -> ToolOutput {
     ToolOutput {
         summary: output.summary,
@@ -243,6 +346,10 @@ const EDIT_DESCRIPTION: &str =
     "Replace text in a durable memory record through Workspace authority.";
 const DELETE_DESCRIPTION: &str = "Delete a durable memory record through Workspace authority.";
 const QUERY_DESCRIPTION: &str = "Query durable memory records through Workspace authority.";
+const STAGING_LIST_DESCRIPTION: &str =
+    "List pending Memory staging candidates without loading full record payloads.";
+const STAGING_READ_DESCRIPTION: &str = "Read one pending Memory staging candidate by candidate_id.";
+const STAGING_CLOSE_DESCRIPTION: &str = "Close one staging candidate with a required reason; records disposition and deletes the staging record.";
 
 fn kind_schema() -> serde_json::Value {
     json!({"type":"string","enum":["summary","decision","request"]})

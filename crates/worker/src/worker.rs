@@ -520,10 +520,7 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// the flag survives across `try_post_run_extract` calls without a
     /// `&mut self` race.
     extract_in_flight: Arc<AtomicBool>,
-    /// consolidation (memory.consolidation) in-process reentry guard. The
-    /// staging-side `StagingLock` already provides cross-process
-    /// exclusion, but this AtomicBool keeps a careless concurrent caller
-    /// inside the same Worker from racing on the staging snapshot.
+    /// consolidation (memory.consolidation) in-process reentry guard.
     consolidation_in_flight: Arc<AtomicBool>,
     /// Last completed extract boundary. `None` means no extract has
     /// run yet on this session — next extract starts from entry 0.
@@ -3274,11 +3271,10 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         Ok(ExtractDecision::Completed)
     }
 
-    /// consolidation (memory.consolidation) trigger.
+    /// Request Backend-managed Memory staging consolidation after a Worker turn.
     ///
-    /// Worker no longer has direct Workspace filesystem authority. Until consolidation is
-    /// exposed as a Backend Workspace Authority operation, the Worker must not inspect
-    /// staging, acquire staging locks, or register local memory tools directly.
+    /// Worker has no local Workspace memory authority. It only asks the Backend
+    /// Workspace to notify or spawn the dedicated consolidater Worker.
     pub async fn try_post_run_consolidate(&mut self) -> Result<(), WorkerError> {
         let Some(memory_cfg) = self.manifest.memory.clone() else {
             return Ok(());
@@ -3289,30 +3285,64 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
             .unwrap_or(&self.manifest.model);
         let files_threshold = memory_cfg.consolidation_threshold_files.filter(|n| *n > 0);
         let bytes_threshold = memory_cfg.consolidation_threshold_bytes.filter(|n| *n > 0);
-        let reason = if files_threshold.is_none() && bytes_threshold.is_none() {
-            "consolidation_threshold_disabled"
-        } else {
-            "consolidation_backend_operation_unavailable"
-        };
-        WorkerAuditBase::new(
-            memory::audit::AuditWorker::MemoryConsolidation,
-            memory::audit::AuditTrigger::StagingBacklog,
-            Some(model_audit_from_manifest(model)),
-        )
-        .emit(
-            self.workspace_client(),
-            self.event_tx.as_ref(),
-            memory::audit::WorkerLifecycleStatus::Skipped,
-            reason,
-            None,
-            None,
-            None,
-        )
-        .await;
-        if reason == "consolidation_backend_operation_unavailable" {
-            tracing::debug!(
-                "workspace memory consolidation skipped: backend operation is unavailable"
-            );
+        if files_threshold.is_none() && bytes_threshold.is_none() {
+            WorkerAuditBase::new(
+                memory::audit::AuditWorker::MemoryConsolidation,
+                memory::audit::AuditTrigger::StagingBacklog,
+                Some(model_audit_from_manifest(model)),
+            )
+            .emit(
+                self.workspace_client(),
+                self.event_tx.as_ref(),
+                memory::audit::WorkerLifecycleStatus::Skipped,
+                "consolidation_threshold_disabled",
+                None,
+                None,
+                None,
+            )
+            .await;
+            return Ok(());
+        }
+
+        match self
+            .workspace_client()
+            .request_memory_staging_consolidation(
+                memory::backend::MemoryConsolidateStagingOperation {
+                    force: false,
+                    threshold_files: files_threshold,
+                    threshold_bytes: bytes_threshold,
+                },
+            )
+            .await
+        {
+            Ok(output) => {
+                tracing::debug!(
+                    status = output.status.as_str(),
+                    summary = output.summary.as_str(),
+                    "requested backend memory staging consolidation"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to request backend memory staging consolidation"
+                );
+                WorkerAuditBase::new(
+                    memory::audit::AuditWorker::MemoryConsolidation,
+                    memory::audit::AuditTrigger::StagingBacklog,
+                    Some(model_audit_from_manifest(model)),
+                )
+                .emit(
+                    self.workspace_client(),
+                    self.event_tx.as_ref(),
+                    memory::audit::WorkerLifecycleStatus::Skipped,
+                    "consolidation_backend_operation_failed",
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            }
         }
         Ok(())
     }
@@ -4586,9 +4616,6 @@ pub enum WorkerError {
 
     #[error("feature install failed: {0}")]
     FeatureInstall(String),
-
-    #[error("memory consolidation lock acquisition failed: {0}")]
-    ConsolidationLock(#[source] memory::consolidate::LockError),
 
     #[error("session {segment_id} has no entries to restore")]
     SegmentEmpty { segment_id: SegmentId },

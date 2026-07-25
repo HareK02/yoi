@@ -646,10 +646,18 @@ where
                 base_url,
             } = workspace_client
             {
-                for definition in crate::feature::builtin::memory::workspace_http_memory_tools(
-                    workspace_id,
-                    base_url,
-                ) {
+                let definitions = if spawner_name == "memory-consolidation" {
+                    crate::feature::builtin::memory::workspace_http_memory_consolidation_tools(
+                        workspace_id,
+                        base_url,
+                    )
+                } else {
+                    crate::feature::builtin::memory::workspace_http_memory_tools(
+                        workspace_id,
+                        base_url,
+                    )
+                };
+                for definition in definitions {
                     worker.register_tool(definition);
                 }
             } else {

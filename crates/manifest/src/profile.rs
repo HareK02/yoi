@@ -62,6 +62,11 @@ const BUILTIN_PROFILES: &[BuiltinProfile] = &[
         label: "builtin:reviewer",
         description: "Bundled Reviewer role profile",
     },
+    BuiltinProfile {
+        name: "memory-consolidation",
+        label: "builtin:memory-consolidation",
+        description: "Bundled Memory staging consolidation profile",
+    },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

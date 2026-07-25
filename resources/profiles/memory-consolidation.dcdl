@@ -1,0 +1,9 @@
+worker = { name = "memory-consolidation"; }
+feature = {
+    task = { enabled = false; };
+    memory = { enabled = true; };
+    web = { enabled = false; };
+    workers = { enabled = false; };
+    ticket = { enabled = false; thread = false; };
+};
+system_prompt = { file = "internal/memory_consolidation_system.md"; };
