@@ -2892,7 +2892,14 @@ fn default_profile_source_archive(
         "builtin:default".to_string(),
         "profiles/default.dcdl".to_string(),
     );
-    for slug in ["companion", "intake", "orchestrator", "coder", "reviewer"] {
+    for slug in [
+        "companion",
+        "intake",
+        "orchestrator",
+        "coder",
+        "reviewer",
+        "memory-consolidation",
+    ] {
         entrypoints.insert(format!("builtin:{slug}"), format!("profiles/{slug}.dcdl"));
     }
     entrypoints.insert(selected, selected_path);
@@ -2922,9 +2929,20 @@ fn default_profile_source_archive(
         "profiles/reviewer.dcdl".to_string(),
         include_str!("../../../resources/profiles/reviewer.dcdl").to_string(),
     );
+    sources.insert(
+        "profiles/memory-consolidation.dcdl".to_string(),
+        include_str!("../../../resources/profiles/memory-consolidation.dcdl").to_string(),
+    );
 
     let mut imports = BTreeMap::new();
-    for slug in ["companion", "intake", "orchestrator", "coder", "reviewer"] {
+    for slug in [
+        "companion",
+        "intake",
+        "orchestrator",
+        "coder",
+        "reviewer",
+        "memory-consolidation",
+    ] {
         imports.insert(
             format!("profiles/{slug}.dcdl\0./default.dcdl"),
             "profiles/default.dcdl".to_string(),
@@ -2950,6 +2968,7 @@ fn embedded_profile_path(profile: &ProfileSelector) -> Result<String, String> {
             "orchestrator" => Ok("profiles/orchestrator.dcdl".to_string()),
             "coder" => Ok("profiles/coder.dcdl".to_string()),
             "reviewer" => Ok("profiles/reviewer.dcdl".to_string()),
+            "memory-consolidation" => Ok("profiles/memory-consolidation.dcdl".to_string()),
             other => Err(format!("unknown builtin profile selector: builtin:{other}")),
         },
         ProfileSelector::Named(name) => Err(format!("unknown named profile selector: {name}")),
@@ -3433,6 +3452,7 @@ mod tests {
             ProfileSelector::Builtin("builtin:orchestrator".to_string()),
             ProfileSelector::Builtin("builtin:coder".to_string()),
             ProfileSelector::Builtin("builtin:reviewer".to_string()),
+            ProfileSelector::Builtin("builtin:memory-consolidation".to_string()),
         ] {
             let bundle = default_embedded_config_bundle(
                 &selector,
@@ -3469,6 +3489,10 @@ mod tests {
                 .unwrap();
             assert_eq!(manifest.worker.name, "embedded-test-worker");
             assert_eq!(manifest.model.ref_.as_deref(), Some("codex-oauth/gpt-5.5"));
+            if selector_key == "builtin:memory-consolidation" {
+                assert!(manifest.feature.memory.enabled);
+                assert!(manifest.feature.memory.staging);
+            }
         }
     }
 

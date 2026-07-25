@@ -18,9 +18,9 @@ use crate::model::{AuthRef, ModelManifest, ReasoningControl};
 use crate::plugin::PluginConfig;
 use crate::{
     CompactionConfig, EngineManifest, FeatureConfig, FeatureFlagConfig, FileUploadLimits,
-    McpConfig, McpEnvValue, McpStdioCwdPolicy, MemoryConfig, ScopeConfig, SessionConfig,
-    SkillsConfig, TicketFeatureConfig, ToolOutputLimits, ToolPermissionConfig, ToolPermissionRule,
-    WebConfig, WorkerManifest, WorkerMeta,
+    McpConfig, McpEnvValue, McpStdioCwdPolicy, MemoryConfig, MemoryFeatureConfig, ScopeConfig,
+    SessionConfig, SkillsConfig, TicketFeatureConfig, ToolOutputLimits, ToolPermissionConfig,
+    ToolPermissionRule, WebConfig, WorkerManifest, WorkerMeta,
 };
 
 /// Partial-form Worker manifest. Every field is optional; one or more
@@ -79,7 +79,7 @@ pub struct FeatureConfigPartial {
     #[serde(default)]
     pub task: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
-    pub memory: Option<FeatureFlagConfigPartial>,
+    pub memory: Option<MemoryFeatureConfigPartial>,
     #[serde(default)]
     pub web: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
@@ -94,7 +94,7 @@ impl FeatureConfigPartial {
     fn merge(self, other: Self) -> Self {
         Self {
             task: merge_option(self.task, other.task, FeatureFlagConfigPartial::merge),
-            memory: merge_option(self.memory, other.memory, FeatureFlagConfigPartial::merge),
+            memory: merge_option(self.memory, other.memory, MemoryFeatureConfigPartial::merge),
             web: merge_option(self.web, other.web, FeatureFlagConfigPartial::merge),
             workers: merge_option(self.workers, other.workers, FeatureFlagConfigPartial::merge),
             ticket: merge_option(self.ticket, other.ticket, TicketFeatureConfigPartial::merge),
@@ -113,6 +113,23 @@ impl FeatureFlagConfigPartial {
     fn merge(self, other: Self) -> Self {
         Self {
             enabled: other.enabled.or(self.enabled),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MemoryFeatureConfigPartial {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub staging: Option<bool>,
+}
+
+impl MemoryFeatureConfigPartial {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            enabled: other.enabled.or(self.enabled),
+            staging: other.staging.or(self.staging),
         }
     }
 }
@@ -145,7 +162,7 @@ impl From<FeatureConfigPartial> for FeatureConfig {
             task: value.task.map(FeatureFlagConfig::from).unwrap_or_default(),
             memory: value
                 .memory
-                .map(FeatureFlagConfig::from)
+                .map(MemoryFeatureConfig::from)
                 .unwrap_or_default(),
             web: value.web.map(FeatureFlagConfig::from).unwrap_or_default(),
             workers: value
@@ -176,6 +193,24 @@ impl From<FeatureFlagConfig> for FeatureFlagConfigPartial {
     fn from(value: FeatureFlagConfig) -> Self {
         Self {
             enabled: Some(value.enabled),
+        }
+    }
+}
+
+impl From<MemoryFeatureConfigPartial> for MemoryFeatureConfig {
+    fn from(value: MemoryFeatureConfigPartial) -> Self {
+        Self {
+            enabled: value.enabled.unwrap_or_default(),
+            staging: value.staging.unwrap_or_default(),
+        }
+    }
+}
+
+impl From<MemoryFeatureConfig> for MemoryFeatureConfigPartial {
+    fn from(value: MemoryFeatureConfig) -> Self {
+        Self {
+            enabled: Some(value.enabled),
+            staging: Some(value.staging),
         }
     }
 }
@@ -1806,6 +1841,7 @@ orchestration_control = false
         assert!(!manifest.feature.ticket.intake);
         assert!(!manifest.feature.ticket.orchestration_control);
         assert!(!manifest.feature.memory.enabled);
+        assert!(!manifest.feature.memory.staging);
     }
 
     #[test]
@@ -1829,6 +1865,9 @@ orchestration_control = false
 [feature.ticket]
 thread = true
 orchestration_control = true
+
+[feature.memory]
+staging = true
 
 [feature.web]
 enabled = true
@@ -1861,6 +1900,7 @@ enabled = true
             .try_into()
             .unwrap();
         assert!(manifest.feature.memory.enabled);
+        assert!(manifest.feature.memory.staging);
         assert!(manifest.feature.ticket.enabled);
         assert!(!manifest.feature.ticket.authoring);
         assert!(manifest.feature.ticket.thread);

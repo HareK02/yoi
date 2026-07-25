@@ -1,9 +1,13 @@
-worker = { name = "memory-consolidation"; }
-feature = {
-    task = { enabled = false; };
-    memory = { enabled = true; };
-    web = { enabled = false; };
-    workers = { enabled = false; };
-    ticket = { enabled = false; thread = false; };
-};
-system_prompt = { file = "internal/memory_consolidation_system.md"; };
+import "./default.dcdl" // {
+    slug = "memory-consolidation";
+    description = "Memory staging consolidation profile.";
+    scope = "workspace_read";
+
+    feature = {
+        task = { enabled = false; };
+        memory = { enabled = true; staging = true; };
+        web = { enabled = false; };
+        workers = { enabled = false; };
+        ticket = { enabled = false; thread = false; };
+    };
+}

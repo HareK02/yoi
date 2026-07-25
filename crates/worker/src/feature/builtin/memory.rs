@@ -418,3 +418,44 @@ fn query_schema() -> serde_json::Value {
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llm_engine::tool::ToolDefinition;
+
+    fn tool_names(definitions: Vec<ToolDefinition>) -> Vec<String> {
+        let mut names = definitions
+            .into_iter()
+            .map(|tool| tool().0.name)
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn normal_workspace_memory_tools_do_not_include_staging_tools() {
+        let names = tool_names(workspace_http_memory_tools(
+            "workspace".to_string(),
+            "http://backend".to_string(),
+        ));
+
+        assert!(names.contains(&"MemoryQuery".to_string()));
+        assert!(!names.contains(&"MemoryStagingList".to_string()));
+        assert!(!names.contains(&"MemoryStagingRead".to_string()));
+        assert!(!names.contains(&"MemoryStagingClose".to_string()));
+    }
+
+    #[test]
+    fn consolidation_workspace_memory_tools_include_staging_tools() {
+        let names = tool_names(workspace_http_memory_consolidation_tools(
+            "workspace".to_string(),
+            "http://backend".to_string(),
+        ));
+
+        assert!(names.contains(&"MemoryQuery".to_string()));
+        assert!(names.contains(&"MemoryStagingList".to_string()));
+        assert!(names.contains(&"MemoryStagingRead".to_string()));
+        assert!(names.contains(&"MemoryStagingClose".to_string()));
+    }
+}

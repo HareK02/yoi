@@ -646,7 +646,7 @@ where
                 base_url,
             } = workspace_client
             {
-                let definitions = if spawner_name == "memory-consolidation" {
+                let definitions = if feature_config.memory.staging {
                     crate::feature::builtin::memory::workspace_http_memory_consolidation_tools(
                         workspace_id,
                         base_url,

@@ -107,7 +107,7 @@ pub struct FeatureConfig {
     #[serde(default)]
     pub task: FeatureFlagConfig,
     #[serde(default)]
-    pub memory: FeatureFlagConfig,
+    pub memory: MemoryFeatureConfig,
     #[serde(default)]
     pub web: FeatureFlagConfig,
     #[serde(default)]
@@ -122,7 +122,7 @@ impl Default for FeatureConfig {
     fn default() -> Self {
         Self {
             task: FeatureFlagConfig::disabled(),
-            memory: FeatureFlagConfig::disabled(),
+            memory: MemoryFeatureConfig::disabled(),
             web: FeatureFlagConfig::disabled(),
             workers: FeatureFlagConfig::disabled(),
             ticket: TicketFeatureConfig::default(),
@@ -148,6 +148,37 @@ impl FeatureFlagConfig {
 }
 
 impl Default for FeatureFlagConfig {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryFeatureConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Exposes Memory staging queue tools in addition to normal Memory CRUD/query tools.
+    #[serde(default)]
+    pub staging: bool,
+}
+
+impl MemoryFeatureConfig {
+    pub const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            staging: false,
+        }
+    }
+
+    pub const fn enabled() -> Self {
+        Self {
+            enabled: true,
+            staging: false,
+        }
+    }
+}
+
+impl Default for MemoryFeatureConfig {
     fn default() -> Self {
         Self::disabled()
     }

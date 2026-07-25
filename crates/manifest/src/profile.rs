@@ -954,6 +954,17 @@ fn builtin_profile_artifact(label: &str) -> Option<serde_json::Value> {
             );
             Some(value)
         }
+        "builtin:memory-consolidation" | "memory-consolidation" => {
+            value["slug"] = serde_json::Value::String("memory-consolidation".to_string());
+            value["description"] =
+                serde_json::Value::String("Memory staging consolidation profile.".to_string());
+            value["feature"]["task"] = serde_json::json!({ "enabled": false });
+            value["feature"]["memory"] = serde_json::json!({ "enabled": true, "staging": true });
+            value["feature"]["web"] = serde_json::json!({ "enabled": false });
+            value["feature"]["workers"] = serde_json::json!({ "enabled": false });
+            value["feature"]["ticket"] = serde_json::json!({ "enabled": false, "thread": false });
+            Some(value)
+        }
         _ => None,
     }
 }
@@ -1423,6 +1434,29 @@ mod tests {
             );
             assert_eq!(resolved.manifest.worker.name, "role-worker");
         }
+    }
+
+    #[test]
+    fn builtin_memory_consolidation_profile_enables_staging_by_feature() {
+        let tmp = TempDir::new().unwrap();
+        let resolved = ProfileResolver::new()
+            .with_workspace_base(tmp.path())
+            .resolve(
+                &ProfileSelector::source_named(
+                    ProfileRegistrySource::Builtin,
+                    "memory-consolidation",
+                ),
+                ProfileResolveOptions::with_worker_name("arbitrary-worker-name"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            resolved.profile.as_ref().unwrap().name.as_deref(),
+            Some("memory-consolidation")
+        );
+        assert_eq!(resolved.manifest.worker.name, "arbitrary-worker-name");
+        assert!(resolved.manifest.feature.memory.enabled);
+        assert!(resolved.manifest.feature.memory.staging);
     }
 
     #[test]
