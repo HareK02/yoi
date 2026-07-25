@@ -630,6 +630,29 @@ where
         let workspace_client = worker.workspace_client().clone();
         let worker = worker.engine_mut();
 
+        // Objective tools expose read-only project Objective context through the
+        // Backend Workspace API. Workers must not guess local `.yoi/objectives`
+        // paths or read Objective files directly.
+        if feature_config.objective.enabled {
+            if let WorkspaceClient::Http {
+                workspace_id,
+                base_url,
+            } = &workspace_client
+            {
+                for definition in crate::feature::builtin::objective::workspace_http_objective_tools(
+                    workspace_id.clone(),
+                    base_url.clone(),
+                ) {
+                    worker.register_tool(definition);
+                }
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "objective tools require Backend Workspace API authority",
+                ));
+            }
+        }
+
         // Memory tools require explicit feature exposure. Workspace memory access
         // is authority-bound to the Backend Workspace API; the Worker must not
         // register local filesystem memory tools even when it has local cwd/root

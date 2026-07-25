@@ -962,6 +962,7 @@ fn builtin_profile_artifact(label: &str) -> Option<serde_json::Value> {
             value["feature"]["memory"] = serde_json::json!({ "enabled": true, "staging": true });
             value["feature"]["web"] = serde_json::json!({ "enabled": false });
             value["feature"]["workers"] = serde_json::json!({ "enabled": false });
+            value["feature"]["objective"] = serde_json::json!({ "enabled": false });
             value["feature"]["ticket"] = serde_json::json!({ "enabled": false, "thread": false });
             Some(value)
         }
@@ -987,6 +988,7 @@ fn builtin_default_profile_artifact() -> serde_json::Value {
             "memory": { "enabled": true },
             "web": { "enabled": true },
             "workers": { "enabled": true },
+            "objective": { "enabled": true },
             "ticket": { "enabled": true, "authoring": true, "thread": true }
         },
         "memory": {
@@ -1457,6 +1459,7 @@ mod tests {
         assert_eq!(resolved.manifest.worker.name, "arbitrary-worker-name");
         assert!(resolved.manifest.feature.memory.enabled);
         assert!(resolved.manifest.feature.memory.staging);
+        assert!(!resolved.manifest.feature.objective.enabled);
     }
 
     #[test]
@@ -1484,6 +1487,7 @@ mod tests {
         assert!(companion.feature.ticket.enabled);
         assert!(companion.feature.ticket.authoring);
         assert!(companion.feature.ticket.thread);
+        assert!(companion.feature.objective.enabled);
         assert!(!companion.feature.ticket.intake);
         assert!(!companion.feature.ticket.orchestration_control);
         assert_eq!(
@@ -1510,6 +1514,7 @@ mod tests {
         assert!(intake.feature.ticket.enabled);
         assert!(intake.feature.ticket.authoring);
         assert!(intake.feature.ticket.thread);
+        assert!(intake.feature.objective.enabled);
         assert!(intake.feature.ticket.intake);
         assert!(!intake.feature.ticket.orchestration_control);
         assert!(intake.scope.allow.is_empty());
@@ -1525,6 +1530,7 @@ mod tests {
         assert!(orchestrator.feature.ticket.enabled);
         assert!(!orchestrator.feature.ticket.authoring);
         assert!(orchestrator.feature.ticket.thread);
+        assert!(orchestrator.feature.objective.enabled);
         assert!(!orchestrator.feature.ticket.intake);
         assert!(orchestrator.feature.ticket.orchestration_control);
         assert!(orchestrator.scope.allow.is_empty());
@@ -1548,6 +1554,7 @@ mod tests {
         assert!(coder.feature.ticket.enabled);
         assert!(!coder.feature.ticket.authoring);
         assert!(coder.feature.ticket.thread);
+        assert!(coder.feature.objective.enabled);
         assert!(!coder.feature.ticket.intake);
         assert!(!coder.feature.ticket.orchestration_control);
         let reviewer = resolve("reviewer");
@@ -1557,6 +1564,7 @@ mod tests {
         assert!(reviewer.feature.ticket.enabled);
         assert!(!reviewer.feature.ticket.authoring);
         assert!(reviewer.feature.ticket.thread);
+        assert!(reviewer.feature.objective.enabled);
         assert!(!reviewer.feature.ticket.intake);
         assert!(!reviewer.feature.ticket.orchestration_control);
         assert!(reviewer.scope.allow.is_empty());

@@ -1157,6 +1157,11 @@ struct MemoryStagingQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct ObjectiveListQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
 struct TranscriptQuery {
     start: Option<usize>,
     limit: Option<usize>,
@@ -1726,9 +1731,10 @@ fn skill_api_error(error: skills::SkillError) -> ApiError {
 async fn scoped_list_objectives(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
+    Query(query): Query<ObjectiveListQuery>,
 ) -> ApiResult<Json<ListResponse<crate::records::ObjectiveSummary>>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    list_objectives(State(api)).await
+    list_objectives(State(api), Query(query)).await
 }
 
 async fn scoped_get_objective(
@@ -3661,8 +3667,9 @@ async fn get_ticket(
 
 async fn list_objectives(
     State(api): State<WorkspaceApi>,
+    Query(query): Query<ObjectiveListQuery>,
 ) -> ApiResult<Json<ListResponse<crate::records::ObjectiveSummary>>> {
-    let limit = api.config.max_records.min(200);
+    let limit = query.limit.unwrap_or(api.config.max_records).min(1000);
     let ProjectRecordList {
         items,
         invalid_records,
@@ -8413,6 +8420,12 @@ mod tests {
         )
         .await;
         assert_eq!(scoped_objectives["items"][0]["id"], "00000000001J3");
+        let limited_objectives = get_json(
+            app.clone(),
+            &format!("/api/w/{TEST_WORKSPACE_ID}/objectives?limit=0"),
+        )
+        .await;
+        assert_eq!(limited_objectives["items"].as_array().unwrap().len(), 0);
         let scoped_objective = get_json(
             app.clone(),
             &format!("/api/w/{TEST_WORKSPACE_ID}/objectives/00000000001J3"),

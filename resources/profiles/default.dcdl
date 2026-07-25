@@ -26,6 +26,7 @@ feature = {
     memory = { enabled = true; };
     web = { enabled = true; };
     workers = { enabled = true; };
+    objective = { enabled = true; };
     ticket = { enabled = true; authoring = true; thread = true; };
 };
 

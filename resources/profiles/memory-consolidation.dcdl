@@ -8,6 +8,7 @@ import "./default.dcdl" // {
         memory = { enabled = true; staging = true; };
         web = { enabled = false; };
         workers = { enabled = false; };
+        objective = { enabled = false; };
         ticket = { enabled = false; thread = false; };
     };
 }

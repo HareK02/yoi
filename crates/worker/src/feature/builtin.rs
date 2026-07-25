@@ -5,6 +5,7 @@
 //! an external plugin-loading surface.
 
 pub mod memory;
+pub mod objective;
 pub mod session_explore;
 pub mod task;
 pub mod ticket;

@@ -85,6 +85,8 @@ pub struct FeatureConfigPartial {
     #[serde(default)]
     pub workers: Option<FeatureFlagConfigPartial>,
     #[serde(default)]
+    pub objective: Option<FeatureFlagConfigPartial>,
+    #[serde(default)]
     pub ticket: Option<TicketFeatureConfigPartial>,
     #[serde(default)]
     pub plugins: Option<FeatureFlagConfigPartial>,
@@ -97,6 +99,11 @@ impl FeatureConfigPartial {
             memory: merge_option(self.memory, other.memory, MemoryFeatureConfigPartial::merge),
             web: merge_option(self.web, other.web, FeatureFlagConfigPartial::merge),
             workers: merge_option(self.workers, other.workers, FeatureFlagConfigPartial::merge),
+            objective: merge_option(
+                self.objective,
+                other.objective,
+                FeatureFlagConfigPartial::merge,
+            ),
             ticket: merge_option(self.ticket, other.ticket, TicketFeatureConfigPartial::merge),
             plugins: merge_option(self.plugins, other.plugins, FeatureFlagConfigPartial::merge),
         }
@@ -167,6 +174,10 @@ impl From<FeatureConfigPartial> for FeatureConfig {
             web: value.web.map(FeatureFlagConfig::from).unwrap_or_default(),
             workers: value
                 .workers
+                .map(FeatureFlagConfig::from)
+                .unwrap_or_default(),
+            objective: value
+                .objective
                 .map(FeatureFlagConfig::from)
                 .unwrap_or_default(),
             ticket: value
@@ -246,6 +257,7 @@ impl From<FeatureConfig> for FeatureConfigPartial {
             memory: Some(value.memory.into()),
             web: Some(value.web.into()),
             workers: Some(value.workers.into()),
+            objective: Some(value.objective.into()),
             ticket: Some(value.ticket.into()),
             plugins: Some(value.plugins.into()),
         }
@@ -1791,6 +1803,7 @@ worker_max_turns = 7
         assert!(!manifest.feature.memory.enabled);
         assert!(!manifest.feature.web.enabled);
         assert!(!manifest.feature.workers.enabled);
+        assert!(!manifest.feature.objective.enabled);
         assert!(!manifest.feature.ticket.enabled);
     }
 
@@ -1842,6 +1855,7 @@ orchestration_control = false
         assert!(!manifest.feature.ticket.orchestration_control);
         assert!(!manifest.feature.memory.enabled);
         assert!(!manifest.feature.memory.staging);
+        assert!(!manifest.feature.objective.enabled);
     }
 
     #[test]
@@ -1868,6 +1882,9 @@ orchestration_control = true
 
 [feature.memory]
 staging = true
+
+[feature.objective]
+enabled = true
 
 [feature.web]
 enabled = true
@@ -1906,6 +1923,7 @@ enabled = true
         assert!(manifest.feature.ticket.thread);
         assert!(!manifest.feature.ticket.intake);
         assert!(manifest.feature.ticket.orchestration_control);
+        assert!(manifest.feature.objective.enabled);
         assert!(manifest.feature.web.enabled);
         assert!(!manifest.feature.workers.enabled);
     }
