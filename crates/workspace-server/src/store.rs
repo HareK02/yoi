@@ -67,6 +67,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "sqlite objective authority and memory staging import",
         apply: create_objective_sqlite_authority_tables,
     },
+    Migration {
+        version: 11,
+        name: "sqlite memory authority documents and staging resolutions",
+        apply: create_memory_authority_tables,
+    },
 ];
 
 struct Migration {
@@ -258,12 +263,33 @@ pub struct ObjectiveResourceRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryDocumentRecord {
+    pub workspace_id: String,
+    pub body_md: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemoryStagingRecord {
     pub workspace_id: String,
     pub candidate_id: String,
     pub raw_json: String,
     pub source_path: Option<String>,
     pub imported_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryStagingResolutionRecord {
+    pub workspace_id: String,
+    pub candidate_id: String,
+    pub action: String,
+    pub reason: String,
+    pub affected_refs_json: String,
+    pub staging_raw_json: String,
+    pub source_path: Option<String>,
+    pub imported_at: String,
+    pub resolved_at: String,
 }
 
 #[async_trait]
@@ -299,8 +325,36 @@ pub trait ControlPlaneStore: Send + Sync {
         workspace_id: &str,
         objective_id: &str,
     ) -> Result<Vec<ObjectiveResourceRecord>>;
+    fn ensure_memory_document(
+        &self,
+        workspace_id: &str,
+        default_body_md: &str,
+        now: &str,
+    ) -> Result<MemoryDocumentRecord>;
+    fn get_memory_document(&self, workspace_id: &str) -> Result<Option<MemoryDocumentRecord>>;
+    fn upsert_memory_document(&self, record: &MemoryDocumentRecord) -> Result<()>;
     fn upsert_memory_staging_record(&self, record: &MemoryStagingRecord) -> Result<()>;
+    fn list_memory_staging_records(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryStagingRecord>>;
+    fn get_memory_staging_record(
+        &self,
+        workspace_id: &str,
+        candidate_id: &str,
+    ) -> Result<Option<MemoryStagingRecord>>;
+    fn delete_memory_staging_record(&self, workspace_id: &str, candidate_id: &str) -> Result<bool>;
     fn count_memory_staging_records(&self, workspace_id: &str) -> Result<usize>;
+    fn insert_memory_staging_resolution(
+        &self,
+        record: &MemoryStagingResolutionRecord,
+    ) -> Result<()>;
+    fn list_memory_staging_resolutions(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryStagingResolutionRecord>>;
 
     fn upsert_account(&self, record: &AccountRecord) -> Result<()>;
     fn get_account(&self, account_id: &str) -> Result<Option<AccountRecord>>;
@@ -712,6 +766,64 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn ensure_memory_document(
+        &self,
+        workspace_id: &str,
+        default_body_md: &str,
+        now: &str,
+    ) -> Result<MemoryDocumentRecord> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT OR IGNORE INTO workspace_memory_documents (
+                    workspace_id, body_md, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?3)"#,
+                params![workspace_id, default_body_md, now],
+            )?;
+            conn.query_row(
+                r#"SELECT workspace_id, body_md, created_at, updated_at
+                   FROM workspace_memory_documents
+                   WHERE workspace_id = ?1"#,
+                params![workspace_id],
+                read_memory_document_record,
+            )
+            .map_err(Error::from)
+        })
+    }
+
+    fn get_memory_document(&self, workspace_id: &str) -> Result<Option<MemoryDocumentRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"SELECT workspace_id, body_md, created_at, updated_at
+                   FROM workspace_memory_documents
+                   WHERE workspace_id = ?1"#,
+                params![workspace_id],
+                read_memory_document_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn upsert_memory_document(&self, record: &MemoryDocumentRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO workspace_memory_documents (
+                    workspace_id, body_md, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(workspace_id) DO UPDATE SET
+                    body_md = excluded.body_md,
+                    updated_at = excluded.updated_at"#,
+                params![
+                    record.workspace_id,
+                    record.body_md,
+                    record.created_at,
+                    record.updated_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
     fn upsert_memory_staging_record(&self, record: &MemoryStagingRecord) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
@@ -734,6 +846,56 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
         })
     }
 
+    fn list_memory_staging_records(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryStagingRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"SELECT workspace_id, candidate_id, raw_json, source_path, imported_at
+                   FROM memory_staging_records
+                   WHERE workspace_id = ?1
+                   ORDER BY imported_at DESC, candidate_id ASC
+                   LIMIT ?2"#,
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id, limit as i64],
+                read_memory_staging_record,
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        })
+    }
+
+    fn get_memory_staging_record(
+        &self,
+        workspace_id: &str,
+        candidate_id: &str,
+    ) -> Result<Option<MemoryStagingRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"SELECT workspace_id, candidate_id, raw_json, source_path, imported_at
+                   FROM memory_staging_records
+                   WHERE workspace_id = ?1 AND candidate_id = ?2"#,
+                params![workspace_id, candidate_id],
+                read_memory_staging_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn delete_memory_staging_record(&self, workspace_id: &str, candidate_id: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "DELETE FROM memory_staging_records WHERE workspace_id = ?1 AND candidate_id = ?2",
+                params![workspace_id, candidate_id],
+            )?;
+            Ok(changed > 0)
+        })
+    }
+
     fn count_memory_staging_records(&self, workspace_id: &str) -> Result<usize> {
         self.with_conn(|conn| {
             conn.query_row(
@@ -743,6 +905,55 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             )
             .map(|count| count as usize)
             .map_err(Error::from)
+        })
+    }
+
+    fn insert_memory_staging_resolution(
+        &self,
+        record: &MemoryStagingResolutionRecord,
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO memory_staging_resolutions (
+                    workspace_id, candidate_id, action, reason, affected_refs_json,
+                    staging_raw_json, source_path, imported_at, resolved_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+                params![
+                    record.workspace_id,
+                    record.candidate_id,
+                    record.action,
+                    record.reason,
+                    record.affected_refs_json,
+                    record.staging_raw_json,
+                    record.source_path,
+                    record.imported_at,
+                    record.resolved_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn list_memory_staging_resolutions(
+        &self,
+        workspace_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryStagingResolutionRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"SELECT workspace_id, candidate_id, action, reason, affected_refs_json,
+                          staging_raw_json, source_path, imported_at, resolved_at
+                   FROM memory_staging_resolutions
+                   WHERE workspace_id = ?1
+                   ORDER BY resolved_at DESC, candidate_id ASC
+                   LIMIT ?2"#,
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id, limit as i64],
+                read_memory_staging_resolution_record,
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
         })
     }
 
@@ -1569,6 +1780,41 @@ fn read_objective_resource_record(
     })
 }
 
+fn read_memory_document_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryDocumentRecord> {
+    Ok(MemoryDocumentRecord {
+        workspace_id: row.get(0)?,
+        body_md: row.get(1)?,
+        created_at: row.get(2)?,
+        updated_at: row.get(3)?,
+    })
+}
+
+fn read_memory_staging_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryStagingRecord> {
+    Ok(MemoryStagingRecord {
+        workspace_id: row.get(0)?,
+        candidate_id: row.get(1)?,
+        raw_json: row.get(2)?,
+        source_path: row.get(3)?,
+        imported_at: row.get(4)?,
+    })
+}
+
+fn read_memory_staging_resolution_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<MemoryStagingResolutionRecord> {
+    Ok(MemoryStagingResolutionRecord {
+        workspace_id: row.get(0)?,
+        candidate_id: row.get(1)?,
+        action: row.get(2)?,
+        reason: row.get(3)?,
+        affected_refs_json: row.get(4)?,
+        staging_raw_json: row.get(5)?,
+        source_path: row.get(6)?,
+        imported_at: row.get(7)?,
+        resolved_at: row.get(8)?,
+    })
+}
+
 fn worker_registry_select_sql(where_clause: &str) -> String {
     format!(
         "SELECT workspace_id, runtime_id, runtime_worker_id, display_name, profile, \
@@ -1726,6 +1972,33 @@ CREATE TABLE IF NOT EXISTS memory_staging_records (
     imported_at TEXT NOT NULL,
     PRIMARY KEY (workspace_id, candidate_id),
     FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+);
+"#,
+    )?;
+    Ok(())
+}
+
+fn create_memory_authority_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS workspace_memory_documents (
+    workspace_id TEXT PRIMARY KEY REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    body_md TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_staging_resolutions (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    candidate_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    affected_refs_json TEXT NOT NULL,
+    staging_raw_json TEXT NOT NULL,
+    source_path TEXT,
+    imported_at TEXT NOT NULL,
+    resolved_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, candidate_id, resolved_at)
 );
 "#,
     )?;
@@ -2293,6 +2566,26 @@ CREATE TABLE IF NOT EXISTS memory_staging_records (
     PRIMARY KEY (workspace_id, candidate_id)
 );
 
+CREATE TABLE IF NOT EXISTS workspace_memory_documents (
+    workspace_id TEXT PRIMARY KEY REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    body_md TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_staging_resolutions (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    candidate_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    affected_refs_json TEXT NOT NULL,
+    staging_raw_json TEXT NOT NULL,
+    source_path TEXT,
+    imported_at TEXT NOT NULL,
+    resolved_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, candidate_id, resolved_at)
+);
+
 CREATE TABLE IF NOT EXISTS repositories (
     workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
     repository_id TEXT PRIMARY KEY,
@@ -2424,7 +2717,7 @@ mod tests {
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 10);
+        assert_eq!(store.schema_version().await.unwrap(), 11);
 
         let record = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
@@ -2437,7 +2730,7 @@ mod tests {
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 10);
+        assert_eq!(reopened.schema_version().await.unwrap(), 11);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -2458,6 +2751,10 @@ mod tests {
             "ticket_relations",
             "objectives",
             "objective_ticket_links",
+            "objective_resources",
+            "memory_staging_records",
+            "workspace_memory_documents",
+            "memory_staging_resolutions",
             "repositories",
             "ticket_targets",
             "ticket_target_paths",
@@ -2654,7 +2951,7 @@ mod tests {
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 10);
+        assert_eq!(store.schema_version().await.unwrap(), 11);
 
         store
             .with_conn(|conn| {
@@ -2667,6 +2964,9 @@ mod tests {
                     "ticket_worker_links",
                     "artifacts",
                     "audit_events",
+                    "workspace_memory_documents",
+                    "memory_staging_records",
+                    "memory_staging_resolutions",
                     "legacy_workspaces",
                     "legacy_repositories",
                     "legacy_runs",
@@ -2745,7 +3045,7 @@ mod tests {
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 10);
+        assert_eq!(store.schema_version().await.unwrap(), 11);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -2777,6 +3077,81 @@ mod tests {
         assert_eq!(
             store.list_repositories("other-workspace").unwrap(),
             Vec::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_authority_records_round_trip_and_close_staging() {
+        let store = SqliteWorkspaceStore::in_memory().unwrap();
+        assert_eq!(store.schema_version().await.unwrap(), 11);
+        let workspace = WorkspaceRecord {
+            workspace_id: "local-dev".to_string(),
+            owner_account_id: None,
+            display_name: "Local Dev".to_string(),
+            state: "active".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+        store.upsert_workspace(&workspace).await.unwrap();
+
+        let document = store
+            .ensure_memory_document("local-dev", "# Memory\n", "2")
+            .unwrap();
+        assert_eq!(document.body_md, "# Memory\n");
+        let updated = MemoryDocumentRecord {
+            workspace_id: "local-dev".to_string(),
+            body_md: "# Memory\n\n- fact\n".to_string(),
+            created_at: document.created_at.clone(),
+            updated_at: "3".to_string(),
+        };
+        store.upsert_memory_document(&updated).unwrap();
+        assert_eq!(
+            store.get_memory_document("local-dev").unwrap(),
+            Some(updated)
+        );
+
+        let staging = MemoryStagingRecord {
+            workspace_id: "local-dev".to_string(),
+            candidate_id: "candidate-a".to_string(),
+            raw_json: r#"{"kind":"summary","body":"candidate"}"#.to_string(),
+            source_path: Some("memory/_staging/candidate-a.json".to_string()),
+            imported_at: "4".to_string(),
+        };
+        store.upsert_memory_staging_record(&staging).unwrap();
+        assert_eq!(
+            store
+                .get_memory_staging_record("local-dev", "candidate-a")
+                .unwrap(),
+            Some(staging.clone())
+        );
+        assert_eq!(
+            store.list_memory_staging_records("local-dev", 10).unwrap(),
+            vec![staging.clone()]
+        );
+
+        let resolution = MemoryStagingResolutionRecord {
+            workspace_id: "local-dev".to_string(),
+            candidate_id: staging.candidate_id.clone(),
+            action: "apply".to_string(),
+            reason: "accepted".to_string(),
+            affected_refs_json: r#"["summary"]"#.to_string(),
+            staging_raw_json: staging.raw_json.clone(),
+            source_path: staging.source_path.clone(),
+            imported_at: staging.imported_at.clone(),
+            resolved_at: "5".to_string(),
+        };
+        store.insert_memory_staging_resolution(&resolution).unwrap();
+        assert!(
+            store
+                .delete_memory_staging_record("local-dev", "candidate-a")
+                .unwrap()
+        );
+        assert_eq!(store.count_memory_staging_records("local-dev").unwrap(), 0);
+        assert_eq!(
+            store
+                .list_memory_staging_resolutions("local-dev", 10)
+                .unwrap(),
+            vec![resolution]
         );
     }
 
@@ -2882,7 +3257,7 @@ mod tests {
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 10);
+        assert_eq!(store.schema_version().await.unwrap(), 11);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),

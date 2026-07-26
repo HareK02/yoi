@@ -21,8 +21,8 @@ pub mod skills;
 pub mod store;
 
 pub use authority::{
-    MemoryAuthorityMarker, MemoryAuthorityStatus, ObjectiveAuthority, SqliteWorkspaceAuthority,
-    TicketAuthority, WorkspaceAuthority,
+    MemoryAuthority, MemoryDocument, MemoryStagingEntry, MemoryStagingResolution,
+    ObjectiveAuthority, SqliteWorkspaceAuthority, TicketAuthority, WorkspaceAuthority,
 };
 pub use config::{
     BackendRuntimesConfigFile, ConfigDiff, ResolvedWorkspaceBackendConfig,
