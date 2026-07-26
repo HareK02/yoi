@@ -528,7 +528,7 @@ mod tests {
         let staging = authority
             .upsert_memory_staging_record(
                 "candidate-1",
-                r#"{"kind":"summary","body_md":"Candidate"}"#,
+                r#"{"claim":"Candidate"}"#,
                 Some("memory/_staging/candidate-1.json"),
             )
             .unwrap();

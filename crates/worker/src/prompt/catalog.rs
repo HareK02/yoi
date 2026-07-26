@@ -542,6 +542,28 @@ mod tests {
     }
 
     #[test]
+    fn memory_consolidation_prompt_describes_document_edit_policy_without_storage_details() {
+        let cat = PromptCatalog::builtins_only().unwrap();
+        let consolidate = cat.memory_consolidation_system("Japanese").unwrap();
+        assert!(consolidate.contains("Durable Memory is one Markdown document"));
+        assert!(consolidate.contains("existing `##` section"));
+        assert!(consolidate.contains("MemoryUpdateDocument"));
+        assert!(consolidate.contains("old_string"));
+        assert!(consolidate.contains("new_string"));
+        assert!(consolidate.contains("MemoryStagingClose"));
+        assert!(consolidate.contains("`applied`"));
+        assert!(consolidate.contains(r#"{"operation":"edit"}"#));
+        assert!(consolidate.contains("Do not create Knowledge, Skill, Ticket"));
+        assert!(consolidate.contains("Do not create separate categorized Memory records"));
+        assert!(!consolidate.contains("SQLite"));
+        assert!(!consolidate.contains("SQL"));
+        assert!(!consolidate.contains("storage"));
+        assert!(!consolidate.contains("decision record"));
+        assert!(!consolidate.contains("request record"));
+        assert!(!consolidate.contains("summary record"));
+    }
+
+    #[test]
     fn notify_wrapper_interpolates_message() {
         let cat = PromptCatalog::builtins_only().unwrap();
         let out = cat.notify_wrapper("file changed").unwrap();

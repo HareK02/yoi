@@ -324,7 +324,7 @@ fn tool_output(output: MemoryToolOutput) -> ToolOutput {
 const READ_DOCUMENT_DESCRIPTION: &str =
     "Read the Workspace memory Markdown document through Workspace authority.";
 const UPDATE_DOCUMENT_DESCRIPTION: &str =
-    "Replace the Workspace memory Markdown document through Workspace authority.";
+    "Edit the Workspace memory Markdown document by replacing an exact old_string with new_string.";
 const QUERY_DESCRIPTION: &str = "Query the Workspace memory document through Workspace authority.";
 const STAGING_LIST_DESCRIPTION: &str =
     "List pending Memory staging candidates without loading full record payloads.";
@@ -346,9 +346,11 @@ fn document_update_schema() -> serde_json::Value {
     json!({
         "type":"object",
         "additionalProperties": false,
-        "required":["body_md"],
+        "required":["old_string", "new_string"],
         "properties":{
-            "body_md":{"type":"string"}
+            "old_string":{"type":"string", "minLength": 1},
+            "new_string":{"type":"string"},
+            "replace_all":{"type":"boolean", "default": false}
         }
     })
 }
@@ -377,6 +379,15 @@ mod tests {
         names
     }
 
+    fn tool_meta(definitions: Vec<ToolDefinition>, name: &str) -> serde_json::Value {
+        definitions
+            .into_iter()
+            .map(|tool| tool().0)
+            .find(|meta| meta.name == name)
+            .unwrap_or_else(|| panic!("missing tool meta for {name}"))
+            .input_schema
+    }
+
     #[test]
     fn normal_workspace_memory_tools_do_not_include_staging_tools() {
         let names = tool_names(workspace_http_memory_tools(
@@ -394,6 +405,37 @@ mod tests {
         assert!(!names.contains(&"MemoryStagingList".to_string()));
         assert!(!names.contains(&"MemoryStagingRead".to_string()));
         assert!(!names.contains(&"MemoryStagingClose".to_string()));
+    }
+
+    #[test]
+    fn document_update_schema_is_edit_like_and_staging_close_has_no_legacy_kinds() {
+        let update_schema = tool_meta(
+            workspace_http_memory_tools("workspace".to_string(), "http://backend".to_string()),
+            "MemoryUpdateDocument",
+        );
+        assert_eq!(
+            update_schema["required"],
+            serde_json::json!(["old_string", "new_string"])
+        );
+        assert!(update_schema["properties"].get("old_string").is_some());
+        assert!(update_schema["properties"].get("new_string").is_some());
+        assert!(update_schema["properties"].get("replace_all").is_some());
+        assert!(update_schema["properties"].get("body_md").is_none());
+
+        let close_schema_text = tool_meta(
+            workspace_http_memory_consolidation_tools(
+                "workspace".to_string(),
+                "http://backend".to_string(),
+            ),
+            "MemoryStagingClose",
+        )
+        .to_string();
+        assert!(close_schema_text.contains("affected_memory"));
+        assert!(close_schema_text.contains("edit"));
+        assert!(!close_schema_text.contains("summary"));
+        assert!(!close_schema_text.contains("decision"));
+        assert!(!close_schema_text.contains("request"));
+        assert!(!close_schema_text.contains("slug"));
     }
 
     #[test]

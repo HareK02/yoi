@@ -1,9 +1,8 @@
-//! Memory subsystem: persistence layer for `memory/*` records.
+//! Memory subsystem support shared by Worker and Workspace authority paths.
 //!
-//! Self-contained: provides its own Tool implementations (read/write/edit)
-//! that target `<workspace>/memory/` only, with a pre-write Linter built in.
-//! Generic CRUD tools (in the `tools` crate) must not touch this directory —
-//! Worker is responsible for denying it at the Scope level when memory is enabled.
+//! Normal runtime Memory access is mediated through Workspace-backed backend
+//! operations. Generic filesystem tools must not touch local memory paths; Worker
+//! is responsible for denying them at the Scope level when memory is enabled.
 
 pub mod audit;
 pub mod backend;
@@ -14,7 +13,6 @@ pub mod linter;
 pub mod resident;
 pub mod schema;
 pub mod scope;
-pub mod tool;
 pub mod usage;
 pub mod workspace;
 

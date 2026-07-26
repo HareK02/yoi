@@ -3113,7 +3113,7 @@ mod tests {
         let staging = MemoryStagingRecord {
             workspace_id: "local-dev".to_string(),
             candidate_id: "candidate-a".to_string(),
-            raw_json: r#"{"kind":"summary","body":"candidate"}"#.to_string(),
+            raw_json: r#"{"claim":"candidate"}"#.to_string(),
             source_path: Some("memory/_staging/candidate-a.json".to_string()),
             imported_at: "4".to_string(),
         };

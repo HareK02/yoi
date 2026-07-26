@@ -1,9 +1,8 @@
 use memory::backend::{
     MemoryBackendAckOutput, MemoryBackendOperation, MemoryBackendOperationResult,
     MemoryDocumentReadOperation, MemoryDocumentUpdateOperation, MemoryQueryOperation,
-    MemoryReadOperation, MemoryStagingCloseAction, MemoryStagingCloseOperation,
-    MemoryStagingListOperation, MemoryStagingReadOperation, MemoryStagingWriteOutput,
-    MemoryToolOutput,
+    MemoryStagingCloseAction, MemoryStagingCloseOperation, MemoryStagingListOperation,
+    MemoryStagingReadOperation, MemoryStagingWriteOutput, MemoryToolOutput,
 };
 use memory::extract::{ExtractedCandidate, StagingEvidence, StagingRecord};
 use memory::schema::{SourceEvidenceRef, SourceRef};
@@ -24,10 +23,13 @@ pub fn execute_memory_backend_operation_with_authority<A: MemoryAuthority>(
         MemoryBackendOperation::Query(operation) => {
             execute_query(authority, operation).map(MemoryBackendOperationResult::ToolOutput)
         }
-        MemoryBackendOperation::ReadDocument(operation) => execute_read_document(authority, operation)
-            .map(MemoryBackendOperationResult::ToolOutput),
+        MemoryBackendOperation::ReadDocument(operation) => {
+            execute_read_document(authority, operation)
+                .map(MemoryBackendOperationResult::ToolOutput)
+        }
         MemoryBackendOperation::UpdateDocument(operation) => {
-            execute_update_document(authority, operation).map(MemoryBackendOperationResult::ToolOutput)
+            execute_update_document(authority, operation)
+                .map(MemoryBackendOperationResult::ToolOutput)
         }
         MemoryBackendOperation::ResidentSummary(_operation) => Ok(
             MemoryBackendOperationResult::ToolOutput(execute_resident_summary(authority)?),
@@ -73,19 +75,16 @@ pub fn execute_memory_backend_operation_with_authority<A: MemoryAuthority>(
                 },
             ))
         }
-        MemoryBackendOperation::StagingList(operation) => execute_staging_list(authority, operation)
-            .map(MemoryBackendOperationResult::ToolOutput),
-        MemoryBackendOperation::StagingRead(operation) => execute_staging_read(authority, operation)
-            .map(MemoryBackendOperationResult::ToolOutput),
-        MemoryBackendOperation::StagingClose(operation) => execute_staging_close(authority, operation)
-            .map(MemoryBackendOperationResult::ToolOutput),
-        MemoryBackendOperation::Read(operation) => execute_legacy_read(authority, operation)
-            .map(MemoryBackendOperationResult::ToolOutput),
-        MemoryBackendOperation::Write(_)
-        | MemoryBackendOperation::Edit(_)
-        | MemoryBackendOperation::Delete(_) => Err(Error::Store(
-            "legacy summary/decision/request Memory mutation operations are not supported by Workspace authority; use MemoryUpdateDocument".to_string(),
-        )),
+        MemoryBackendOperation::StagingList(operation) => {
+            execute_staging_list(authority, operation).map(MemoryBackendOperationResult::ToolOutput)
+        }
+        MemoryBackendOperation::StagingRead(operation) => {
+            execute_staging_read(authority, operation).map(MemoryBackendOperationResult::ToolOutput)
+        }
+        MemoryBackendOperation::StagingClose(operation) => {
+            execute_staging_close(authority, operation)
+                .map(MemoryBackendOperationResult::ToolOutput)
+        }
     }
 }
 
@@ -135,24 +134,6 @@ fn execute_query<A: MemoryAuthority>(
     }
 }
 
-fn execute_legacy_read<A: MemoryAuthority>(
-    authority: &A,
-    operation: MemoryReadOperation,
-) -> Result<MemoryToolOutput> {
-    if operation.kind.as_str() != "summary" || operation.slug.is_some() {
-        return Err(Error::Store(
-            "legacy kind/slug Memory reads are not supported by Workspace authority; use MemoryReadDocument".to_string(),
-        ));
-    }
-    execute_read_document(
-        authority,
-        MemoryDocumentReadOperation {
-            offset: operation.offset,
-            limit: operation.limit,
-        },
-    )
-}
-
 fn execute_read_document<A: MemoryAuthority>(
     authority: &A,
     operation: MemoryDocumentReadOperation,
@@ -185,18 +166,57 @@ fn execute_update_document<A: MemoryAuthority>(
     authority: &A,
     operation: MemoryDocumentUpdateOperation,
 ) -> Result<MemoryToolOutput> {
-    if operation.body_md.trim().is_empty() {
+    if operation.old_string == operation.new_string {
         return Err(Error::Store(
-            "memory document body_md must not be empty".to_string(),
+            "memory document old_string and new_string must differ".to_string(),
         ));
     }
-    let document = authority.update_memory_document(&operation.body_md)?;
+    if operation.old_string.is_empty() {
+        return Err(Error::Store(
+            "memory document old_string must not be empty".to_string(),
+        ));
+    }
+    let document = authority.ensure_memory_document()?;
+    let match_count = document.body_md.matches(&operation.old_string).count();
+    if match_count == 0 {
+        return Err(Error::Store(
+            "memory document old_string was not found".to_string(),
+        ));
+    }
+    if match_count > 1 && !operation.replace_all {
+        return Err(Error::Store(
+            "memory document old_string matched more than once; set replace_all=true to replace every occurrence".to_string(),
+        ));
+    }
+    let updated_body = if operation.replace_all {
+        document
+            .body_md
+            .replace(&operation.old_string, &operation.new_string)
+    } else {
+        document
+            .body_md
+            .replacen(&operation.old_string, &operation.new_string, 1)
+    };
+    if updated_body.trim().is_empty() {
+        return Err(Error::Store(
+            "memory document body must not become empty".to_string(),
+        ));
+    }
+    let updated = authority.update_memory_document(&updated_body)?;
     Ok(MemoryToolOutput {
         summary: format!(
-            "Updated Workspace memory document ({} bytes)",
-            document.body_md.len()
+            "Edited {} occurrence(s) in Workspace memory document",
+            if operation.replace_all {
+                match_count
+            } else {
+                1
+            }
         ),
-        content: Some(format!("updated_at={}", document.updated_at)),
+        content: Some(format!(
+            "updated_at={} bytes={}",
+            updated.updated_at,
+            updated.body_md.len()
+        )),
     })
 }
 
@@ -409,7 +429,9 @@ mod tests {
         execute_memory_backend_operation_with_authority(
             &authority,
             MemoryBackendOperation::UpdateDocument(MemoryDocumentUpdateOperation {
-                body_md: "# Memory\n\nSQLite backed body".into(),
+                old_string: "# Memory\n\n".into(),
+                new_string: "# Memory\n\nSQLite backed body".into(),
+                replace_all: false,
             }),
         )
         .unwrap();
