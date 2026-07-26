@@ -8312,6 +8312,7 @@ mod tests {
     async fn serves_bounded_read_apis_and_static_spa_separately() {
         let dir = tempfile::tempdir().unwrap();
         write_objective(dir.path(), "00000000001J3", "API Objective", "active");
+        write_memory_staging(dir.path(), "00000000001J4");
         let static_dir = dir.path().join("static");
         std::fs::create_dir_all(static_dir.join("assets")).unwrap();
         std::fs::write(static_dir.join("index.html"), "<main>Yoi Workspace</main>").unwrap();
@@ -8324,6 +8325,36 @@ mod tests {
             TEST_WORKSPACE_ID,
             "API Ticket",
             ticket::TicketWorkflowState::Ready,
+        );
+        let sqlite_store = SqliteWorkspaceStore::open(&config.database_path).unwrap();
+        sqlite_store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                owner_account_id: None,
+                display_name: "Test Workspace".to_string(),
+                state: "active".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+        crate::objective_import::import_legacy_objectives_and_memory_staging(
+            dir.path(),
+            TEST_WORKSPACE_ID,
+            &sqlite_store,
+        )
+        .unwrap();
+        assert_eq!(
+            sqlite_store
+                .count_memory_staging_records(TEST_WORKSPACE_ID)
+                .unwrap(),
+            1
+        );
+        write_objective(
+            dir.path(),
+            "00000000001J5",
+            "Filesystem Only Objective",
+            "active",
         );
         config.static_assets_dir = Some(static_dir);
         let api = WorkspaceApi::new_with_execution_backend(
@@ -8412,8 +8443,10 @@ mod tests {
         assert_eq!(tickets["items"][0]["state"], "ready");
 
         let objectives = get_json(app.clone(), "/api/objectives").await;
+        assert_eq!(objectives["items"].as_array().unwrap().len(), 1);
         assert_eq!(objectives["items"][0]["id"], "00000000001J3");
         assert_eq!(objectives["items"][0]["summary"], "Objective body.");
+        assert_eq!(objectives["record_authority"], "workspace-sqlite");
         let scoped_objectives = get_json(
             app.clone(),
             &format!("/api/w/{TEST_WORKSPACE_ID}/objectives"),
@@ -8432,6 +8465,11 @@ mod tests {
         )
         .await;
         assert_eq!(scoped_objective["id"], "00000000001J3");
+        assert_eq!(scoped_objective["record_source"], "workspace-sqlite");
+        assert_eq!(
+            scoped_objective["resources"][0]["path"],
+            "memory-architecture-overview.md"
+        );
 
         let repositories = get_json(app.clone(), "/api/repositories").await;
         assert_eq!(repositories["items"][0]["id"], TEST_REPOSITORY_ID);
@@ -9327,6 +9365,25 @@ mod tests {
         backend.create(input).unwrap();
     }
 
+    fn write_memory_staging(root: &Path, candidate_id: &str) {
+        let staging_dir = root.join(".yoi/memory/_staging");
+        std::fs::create_dir_all(&staging_dir).unwrap();
+        std::fs::write(
+            staging_dir.join(format!("{candidate_id}.json")),
+            format!(
+                r#"{{
+  "schema_version": 2,
+  "id": "{candidate_id}",
+  "kind": "working_assumption",
+  "claim": "Objective staging import test",
+  "why_useful": "Verifies SQLite push"
+}}
+"#,
+            ),
+        )
+        .unwrap();
+    }
+
     fn write_objective(root: &Path, id: &str, title: &str, state: &str) {
         let objective_dir = root.join(".yoi/objectives").join(id);
         std::fs::create_dir_all(&objective_dir).unwrap();
@@ -9344,6 +9401,11 @@ linked_tickets: ["00000000001J2"]
 Objective body.
 "#,
             ),
+        )
+        .unwrap();
+        std::fs::write(
+            objective_dir.join("memory-architecture-overview.md"),
+            "# Memory architecture\n\nResource body.\n",
         )
         .unwrap();
     }

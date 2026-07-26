@@ -1,8 +1,8 @@
 //! Local workspace web control plane backend bootstrap.
 //!
 //! This crate deliberately provides backend building blocks and an HTTP router;
-//! it is not the product CLI facade. Existing `.yoi` Ticket and Objective files
-//! remain the canonical project records and are read through bounded bridge APIs.
+//! it is not the product CLI facade. Tickets and Objectives are served through
+//! Backend authority surfaces rather than Worker-local filesystem access.
 
 pub mod auth;
 pub mod companion;
@@ -10,6 +10,7 @@ pub mod config;
 pub mod hosts;
 pub mod identity;
 pub mod memory_staging;
+pub mod objective_import;
 pub mod observation;
 pub mod profile_settings;
 pub mod records;

@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use project_record::validate_record_id;
@@ -8,14 +7,17 @@ use ticket::{
     TicketWorkspaceActionPriority, project_ticket_workspace_item,
 };
 
+use crate::store::{ControlPlaneStore, SqliteWorkspaceStore};
 use crate::{Error, Result};
 
 const DETAIL_BODY_LIMIT: usize = 64 * 1024;
 const SUMMARY_BODY_LIMIT: usize = 240;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LocalProjectRecordReader {
+    workspace_id: String,
     workspace_root: PathBuf,
+    store: SqliteWorkspaceStore,
     ticket_backend: SqliteTicketBackend,
 }
 
@@ -26,8 +28,12 @@ impl LocalProjectRecordReader {
         workspace_id: impl Into<String>,
     ) -> Result<Self> {
         let workspace_root = workspace_root.into();
+        let database_path = database_path.into();
+        let workspace_id = workspace_id.into();
         Ok(Self {
+            workspace_id: workspace_id.clone(),
             workspace_root,
+            store: SqliteWorkspaceStore::open(&database_path)?,
             ticket_backend: SqliteTicketBackend::new(database_path, workspace_id),
         })
     }
@@ -96,61 +102,65 @@ impl LocalProjectRecordReader {
 
     pub fn list_objectives(&self, limit: usize) -> Result<ProjectRecordList<ObjectiveSummary>> {
         let mut items = Vec::new();
-        let mut invalid_records = Vec::new();
-        let root = self.workspace_root.join(".yoi/objectives");
-        if !root.exists() {
-            return Ok(ProjectRecordList {
-                items,
-                invalid_records,
-                record_authority: "local_yoi_project_records".to_string(),
+        for record in self.store.list_objectives(&self.workspace_id, limit)? {
+            let linked_tickets = self
+                .store
+                .list_objective_ticket_links(&self.workspace_id, &record.objective_id)?
+                .into_iter()
+                .map(|link| link.ticket_id)
+                .collect::<Vec<_>>();
+            items.push(ObjectiveSummary {
+                id: record.objective_id,
+                title: record.title,
+                state: record.state,
+                updated_at: Some(record.updated_at),
+                summary: summarize_body(&record.body_md),
+                linked_tickets,
+                record_source: "workspace-sqlite".to_string(),
             });
         }
-
-        for entry in fs::read_dir(&root)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let id = entry.file_name().to_string_lossy().to_string();
-            match read_objective_summary(&path, &id) {
-                Ok(item) => items.push(item),
-                Err(error) => invalid_records.push(InvalidProjectRecord {
-                    label: id,
-                    reason: error.to_string(),
-                }),
-            }
-        }
-        items.sort_by(|a, b| {
-            b.updated_at
-                .cmp(&a.updated_at)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        items.truncate(limit.min(200));
         Ok(ProjectRecordList {
             items,
-            invalid_records,
-            record_authority: "local_yoi_project_records".to_string(),
+            invalid_records: Vec::new(),
+            record_authority: "workspace-sqlite".to_string(),
         })
     }
 
     pub fn objective(&self, id: &str) -> Result<ObjectiveDetail> {
         validate_project_id(id)?;
-        let path = self.workspace_root.join(".yoi/objectives").join(id);
-        let raw = fs::read_to_string(path.join("item.md"))?;
-        let (frontmatter, body) = split_frontmatter(&raw, id)?;
-        let meta: ObjectiveFrontmatter = serde_yaml::from_str(frontmatter)?;
-        let (body, body_truncated) = truncate_body(body, DETAIL_BODY_LIMIT);
+        let record = self
+            .store
+            .get_objective(&self.workspace_id, id)?
+            .ok_or_else(|| Error::Store(format!("unknown objective `{id}`")))?;
+        let linked_tickets = self
+            .store
+            .list_objective_ticket_links(&self.workspace_id, &record.objective_id)?
+            .into_iter()
+            .map(|link| link.ticket_id)
+            .collect::<Vec<_>>();
+        let resources = self
+            .store
+            .list_objective_resources(&self.workspace_id, &record.objective_id)?
+            .into_iter()
+            .map(|resource| ObjectiveResourceSummary {
+                path: resource.resource_path,
+                media_type: resource.media_type,
+                bytes: resource.body.len(),
+                updated_at: resource.updated_at,
+            })
+            .collect();
+        let (body, body_truncated) = truncate_body(&record.body_md, DETAIL_BODY_LIMIT);
         Ok(ObjectiveDetail {
-            id: id.to_string(),
-            title: meta.title,
-            state: meta.state,
-            created_at: meta.created_at,
-            updated_at: meta.updated_at,
-            linked_tickets: meta.linked_tickets,
+            id: record.objective_id,
+            title: record.title,
+            state: record.state,
+            created_at: Some(record.created_at),
+            updated_at: Some(record.updated_at),
+            linked_tickets,
+            resources,
             body,
             body_truncated,
-            record_source: "local_yoi_objective".to_string(),
+            record_source: "workspace-sqlite".to_string(),
         })
     }
 }
@@ -226,47 +236,18 @@ pub struct ObjectiveDetail {
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub linked_tickets: Vec<String>,
+    pub resources: Vec<ObjectiveResourceSummary>,
     pub body: String,
     pub body_truncated: bool,
     pub record_source: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct ObjectiveFrontmatter {
-    title: String,
-    state: String,
-    #[serde(default)]
-    created_at: Option<String>,
-    #[serde(default)]
-    updated_at: Option<String>,
-    #[serde(default)]
-    linked_tickets: Vec<String>,
-}
-
-fn read_objective_summary(path: &Path, id: &str) -> Result<ObjectiveSummary> {
-    validate_project_id(id)?;
-    let raw = fs::read_to_string(path.join("item.md"))?;
-    let (frontmatter, body) = split_frontmatter(&raw, id)?;
-    let meta: ObjectiveFrontmatter = serde_yaml::from_str(frontmatter)?;
-    Ok(ObjectiveSummary {
-        id: id.to_string(),
-        title: meta.title,
-        state: meta.state,
-        updated_at: meta.updated_at,
-        summary: summarize_body(body),
-        linked_tickets: meta.linked_tickets,
-        record_source: "local_yoi_objective".to_string(),
-    })
-}
-
-fn split_frontmatter<'a>(raw: &'a str, label: &str) -> Result<(&'a str, &'a str)> {
-    let rest = raw
-        .strip_prefix("---\n")
-        .ok_or_else(|| Error::MissingFrontmatter(label.to_string()))?;
-    let Some((frontmatter, body)) = rest.split_once("\n---\n") else {
-        return Err(Error::MissingFrontmatter(label.to_string()));
-    };
-    Ok((frontmatter, body))
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectiveResourceSummary {
+    pub path: String,
+    pub media_type: Option<String>,
+    pub bytes: usize,
+    pub updated_at: String,
 }
 
 fn validate_project_id(id: &str) -> Result<()> {
@@ -300,10 +281,13 @@ fn truncate_body(body: &str, limit: usize) -> (String, bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::fs;
 
-    #[test]
-    fn reads_sqlite_yoi_ticket_and_objective_records_without_migration() {
+    use super::*;
+    use crate::store::WorkspaceRecord;
+
+    #[tokio::test]
+    async fn reads_sqlite_yoi_ticket_and_objective_records_without_filesystem_authority() {
         let dir = tempfile::tempdir().unwrap();
         write_ticket(dir.path(), "00000000001J2", "Read bridge", "ready");
         let db_path = dir.path().join("workspace.db");
@@ -313,6 +297,24 @@ mod tests {
             ))
             .unwrap();
         write_objective(dir.path(), "00000000001J3", "Control plane", "active");
+        let store = SqliteWorkspaceStore::open(&db_path).unwrap();
+        store
+            .upsert_workspace(&WorkspaceRecord {
+                workspace_id: "workspace-test".to_string(),
+                owner_account_id: None,
+                display_name: "Workspace Test".to_string(),
+                state: "active".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+        crate::objective_import::import_legacy_objectives_and_memory_staging(
+            dir.path(),
+            "workspace-test",
+            &store,
+        )
+        .unwrap();
 
         let reader = LocalProjectRecordReader::new(dir.path(), &db_path, "workspace-test").unwrap();
         let tickets = reader.list_tickets(20).unwrap();

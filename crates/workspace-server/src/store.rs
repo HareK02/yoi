@@ -62,6 +62,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "webauthn challenge state",
         apply: add_webauthn_challenge_state,
     },
+    Migration {
+        version: 10,
+        name: "sqlite objective authority and memory staging import",
+        apply: create_objective_sqlite_authority_tables,
+    },
 ];
 
 struct Migration {
@@ -221,6 +226,46 @@ pub struct WorkerWorkdirLinkRecord {
     pub unlinked_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectiveRecord {
+    pub workspace_id: String,
+    pub objective_id: String,
+    pub title: String,
+    pub state: String,
+    pub body_md: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectiveTicketLinkRecord {
+    pub workspace_id: String,
+    pub objective_id: String,
+    pub ticket_id: String,
+    pub kind: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectiveResourceRecord {
+    pub workspace_id: String,
+    pub objective_id: String,
+    pub resource_path: String,
+    pub body: String,
+    pub media_type: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryStagingRecord {
+    pub workspace_id: String,
+    pub candidate_id: String,
+    pub raw_json: String,
+    pub source_path: Option<String>,
+    pub imported_at: String,
+}
+
 #[async_trait]
 pub trait ControlPlaneStore: Send + Sync {
     async fn schema_version(&self) -> Result<i64>;
@@ -229,6 +274,33 @@ pub trait ControlPlaneStore: Send + Sync {
     fn list_workspaces(&self) -> Result<Vec<WorkspaceRecord>>;
     fn upsert_repository(&self, record: &RepositoryRecord) -> Result<()>;
     fn list_repositories(&self, workspace_id: &str) -> Result<Vec<RepositoryRecord>>;
+
+    fn upsert_objective(&self, record: &ObjectiveRecord) -> Result<()>;
+    fn list_objectives(&self, workspace_id: &str, limit: usize) -> Result<Vec<ObjectiveRecord>>;
+    fn get_objective(
+        &self,
+        workspace_id: &str,
+        objective_id: &str,
+    ) -> Result<Option<ObjectiveRecord>>;
+    fn replace_objective_ticket_links(
+        &self,
+        workspace_id: &str,
+        objective_id: &str,
+        links: &[ObjectiveTicketLinkRecord],
+    ) -> Result<()>;
+    fn list_objective_ticket_links(
+        &self,
+        workspace_id: &str,
+        objective_id: &str,
+    ) -> Result<Vec<ObjectiveTicketLinkRecord>>;
+    fn upsert_objective_resource(&self, record: &ObjectiveResourceRecord) -> Result<()>;
+    fn list_objective_resources(
+        &self,
+        workspace_id: &str,
+        objective_id: &str,
+    ) -> Result<Vec<ObjectiveResourceRecord>>;
+    fn upsert_memory_staging_record(&self, record: &MemoryStagingRecord) -> Result<()>;
+    fn count_memory_staging_records(&self, workspace_id: &str) -> Result<usize>;
 
     fn upsert_account(&self, record: &AccountRecord) -> Result<()>;
     fn get_account(&self, account_id: &str) -> Result<Option<AccountRecord>>;
@@ -477,6 +549,200 @@ impl ControlPlaneStore for SqliteWorkspaceStore {
             let rows = stmt.query_map(params![workspace_id], read_repository_record)?;
             rows.collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(Error::from)
+        })
+    }
+
+    fn upsert_objective(&self, record: &ObjectiveRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO objectives (
+                    workspace_id, objective_id, title, state, body_md, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(objective_id) DO UPDATE SET
+                    workspace_id = excluded.workspace_id,
+                    title = excluded.title,
+                    state = excluded.state,
+                    body_md = excluded.body_md,
+                    created_at = excluded.created_at,
+                    updated_at = excluded.updated_at"#,
+                params![
+                    record.workspace_id,
+                    record.objective_id,
+                    record.title,
+                    record.state,
+                    record.body_md,
+                    record.created_at,
+                    record.updated_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn list_objectives(&self, workspace_id: &str, limit: usize) -> Result<Vec<ObjectiveRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"SELECT workspace_id, objective_id, title, state, body_md, created_at, updated_at
+                   FROM objectives
+                   WHERE workspace_id = ?1
+                   ORDER BY updated_at DESC, objective_id ASC
+                   LIMIT ?2"#,
+            )?;
+            let rows =
+                stmt.query_map(params![workspace_id, limit as i64], read_objective_record)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        })
+    }
+
+    fn get_objective(
+        &self,
+        workspace_id: &str,
+        objective_id: &str,
+    ) -> Result<Option<ObjectiveRecord>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                r#"SELECT workspace_id, objective_id, title, state, body_md, created_at, updated_at
+                   FROM objectives
+                   WHERE workspace_id = ?1 AND objective_id = ?2"#,
+                params![workspace_id, objective_id],
+                read_objective_record,
+            )
+            .optional()
+            .map_err(Error::from)
+        })
+    }
+
+    fn replace_objective_ticket_links(
+        &self,
+        workspace_id: &str,
+        objective_id: &str,
+        links: &[ObjectiveTicketLinkRecord],
+    ) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM objective_ticket_links WHERE workspace_id = ?1 AND objective_id = ?2",
+                params![workspace_id, objective_id],
+            )?;
+            for link in links {
+                conn.execute(
+                    r#"INSERT INTO objective_ticket_links (
+                        workspace_id, objective_id, ticket_id, kind, created_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5)
+                    ON CONFLICT(objective_id, ticket_id, kind) DO UPDATE SET
+                        workspace_id = excluded.workspace_id,
+                        created_at = excluded.created_at"#,
+                    params![
+                        link.workspace_id,
+                        link.objective_id,
+                        link.ticket_id,
+                        link.kind,
+                        link.created_at,
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    fn list_objective_ticket_links(
+        &self,
+        workspace_id: &str,
+        objective_id: &str,
+    ) -> Result<Vec<ObjectiveTicketLinkRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"SELECT workspace_id, objective_id, ticket_id, kind, created_at
+                   FROM objective_ticket_links
+                   WHERE workspace_id = ?1 AND objective_id = ?2
+                   ORDER BY ticket_id ASC, kind ASC"#,
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id, objective_id],
+                read_objective_ticket_link_record,
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        })
+    }
+
+    fn upsert_objective_resource(&self, record: &ObjectiveResourceRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO objective_resources (
+                    workspace_id, objective_id, resource_path, body, media_type, created_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(objective_id, resource_path) DO UPDATE SET
+                    workspace_id = excluded.workspace_id,
+                    body = excluded.body,
+                    media_type = excluded.media_type,
+                    updated_at = excluded.updated_at"#,
+                params![
+                    record.workspace_id,
+                    record.objective_id,
+                    record.resource_path,
+                    record.body,
+                    record.media_type,
+                    record.created_at,
+                    record.updated_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn list_objective_resources(
+        &self,
+        workspace_id: &str,
+        objective_id: &str,
+    ) -> Result<Vec<ObjectiveResourceRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"SELECT workspace_id, objective_id, resource_path, body, media_type, created_at, updated_at
+                   FROM objective_resources
+                   WHERE workspace_id = ?1 AND objective_id = ?2
+                   ORDER BY resource_path ASC"#,
+            )?;
+            let rows = stmt.query_map(
+                params![workspace_id, objective_id],
+                read_objective_resource_record,
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Error::from)
+        })
+    }
+
+    fn upsert_memory_staging_record(&self, record: &MemoryStagingRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO memory_staging_records (
+                    workspace_id, candidate_id, raw_json, source_path, imported_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                ON CONFLICT(workspace_id, candidate_id) DO UPDATE SET
+                    raw_json = excluded.raw_json,
+                    source_path = excluded.source_path,
+                    imported_at = excluded.imported_at"#,
+                params![
+                    record.workspace_id,
+                    record.candidate_id,
+                    record.raw_json,
+                    record.source_path,
+                    record.imported_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn count_memory_staging_records(&self, workspace_id: &str) -> Result<usize> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM memory_staging_records WHERE workspace_id = ?1",
+                params![workspace_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count as usize)
+            .map_err(Error::from)
         })
     }
 
@@ -1265,6 +1531,44 @@ fn read_worker_workdir_link_record(
     })
 }
 
+fn read_objective_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<ObjectiveRecord> {
+    Ok(ObjectiveRecord {
+        workspace_id: row.get(0)?,
+        objective_id: row.get(1)?,
+        title: row.get(2)?,
+        state: row.get(3)?,
+        body_md: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+fn read_objective_ticket_link_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ObjectiveTicketLinkRecord> {
+    Ok(ObjectiveTicketLinkRecord {
+        workspace_id: row.get(0)?,
+        objective_id: row.get(1)?,
+        ticket_id: row.get(2)?,
+        kind: row.get(3)?,
+        created_at: row.get(4)?,
+    })
+}
+
+fn read_objective_resource_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ObjectiveResourceRecord> {
+    Ok(ObjectiveResourceRecord {
+        workspace_id: row.get(0)?,
+        objective_id: row.get(1)?,
+        resource_path: row.get(2)?,
+        body: row.get(3)?,
+        media_type: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
 fn worker_registry_select_sql(where_clause: &str) -> String {
     format!(
         "SELECT workspace_id, runtime_id, runtime_worker_id, display_name, profile, \
@@ -1378,6 +1682,53 @@ fn add_webauthn_challenge_state(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "auth_challenges", "state_json")? {
         conn.execute_batch("ALTER TABLE auth_challenges ADD COLUMN state_json TEXT;")?;
     }
+    Ok(())
+}
+
+fn create_objective_sqlite_authority_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+PRAGMA foreign_keys = OFF;
+ALTER TABLE objective_ticket_links RENAME TO objective_ticket_links_old;
+CREATE TABLE objective_ticket_links (
+    workspace_id TEXT NOT NULL,
+    objective_id TEXT NOT NULL,
+    ticket_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (objective_id, ticket_id, kind),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    FOREIGN KEY (objective_id) REFERENCES objectives(objective_id) ON DELETE CASCADE
+);
+INSERT OR IGNORE INTO objective_ticket_links (workspace_id, objective_id, ticket_id, kind, created_at)
+    SELECT workspace_id, objective_id, ticket_id, kind, created_at FROM objective_ticket_links_old;
+DROP TABLE objective_ticket_links_old;
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS objective_resources (
+    workspace_id TEXT NOT NULL,
+    objective_id TEXT NOT NULL,
+    resource_path TEXT NOT NULL,
+    body TEXT NOT NULL,
+    media_type TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (objective_id, resource_path),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    FOREIGN KEY (objective_id) REFERENCES objectives(objective_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS memory_staging_records (
+    workspace_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    raw_json TEXT NOT NULL,
+    source_path TEXT,
+    imported_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, candidate_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+);
+"#,
+    )?;
     Ok(())
 }
 
@@ -1916,10 +2267,30 @@ CREATE TABLE IF NOT EXISTS objectives (
 CREATE TABLE IF NOT EXISTS objective_ticket_links (
     workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
     objective_id TEXT NOT NULL REFERENCES objectives(objective_id) ON DELETE CASCADE,
-    ticket_id TEXT NOT NULL REFERENCES tickets(ticket_id) ON DELETE CASCADE,
+    ticket_id TEXT NOT NULL,
     kind TEXT NOT NULL,
     created_at TEXT NOT NULL,
     PRIMARY KEY (objective_id, ticket_id, kind)
+);
+
+CREATE TABLE IF NOT EXISTS objective_resources (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    objective_id TEXT NOT NULL REFERENCES objectives(objective_id) ON DELETE CASCADE,
+    resource_path TEXT NOT NULL,
+    body TEXT NOT NULL,
+    media_type TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (objective_id, resource_path)
+);
+
+CREATE TABLE IF NOT EXISTS memory_staging_records (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    candidate_id TEXT NOT NULL,
+    raw_json TEXT NOT NULL,
+    source_path TEXT,
+    imported_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, candidate_id)
 );
 
 CREATE TABLE IF NOT EXISTS repositories (
@@ -2053,7 +2424,7 @@ mod tests {
         let db = dir.path().join("control-plane.sqlite");
         let store = SqliteWorkspaceStore::open(&db).unwrap();
 
-        assert_eq!(store.schema_version().await.unwrap(), 9);
+        assert_eq!(store.schema_version().await.unwrap(), 10);
 
         let record = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
@@ -2066,7 +2437,7 @@ mod tests {
         store.upsert_workspace(&record).await.unwrap();
 
         let reopened = SqliteWorkspaceStore::open(&db).unwrap();
-        assert_eq!(reopened.schema_version().await.unwrap(), 9);
+        assert_eq!(reopened.schema_version().await.unwrap(), 10);
         assert_eq!(
             reopened.get_workspace("local-dev").await.unwrap(),
             Some(record)
@@ -2283,7 +2654,7 @@ mod tests {
         .unwrap();
 
         let store = SqliteWorkspaceStore::from_connection(conn).unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 9);
+        assert_eq!(store.schema_version().await.unwrap(), 10);
 
         store
             .with_conn(|conn| {
@@ -2374,7 +2745,7 @@ mod tests {
     #[tokio::test]
     async fn repository_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 9);
+        assert_eq!(store.schema_version().await.unwrap(), 10);
         let workspace = WorkspaceRecord {
             workspace_id: "local-dev".to_string(),
             owner_account_id: None,
@@ -2511,7 +2882,7 @@ mod tests {
     #[tokio::test]
     async fn account_and_login_records_round_trip() {
         let store = SqliteWorkspaceStore::in_memory().unwrap();
-        assert_eq!(store.schema_version().await.unwrap(), 9);
+        assert_eq!(store.schema_version().await.unwrap(), 10);
         let now = "2026-07-22T00:00:00Z".to_string();
         let account = AccountRecord {
             account_id: "acct-user-alice".to_string(),

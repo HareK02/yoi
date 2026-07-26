@@ -17,6 +17,7 @@ enum Command {
     Init(InitOptions),
     ConfigDefault,
     ConfigDiff(WorkspacePathOptions),
+    ImportObjectives(ImportObjectivesOptions),
     Skills(SkillsCommand),
     Help,
 }
@@ -34,6 +35,12 @@ struct InitOptions {
 #[derive(Debug)]
 struct WorkspacePathOptions {
     workspace: PathBuf,
+}
+
+#[derive(Debug)]
+struct ImportObjectivesOptions {
+    workspace: PathBuf,
+    database: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -72,6 +79,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Init(options) => run_init(options).await,
         Command::ConfigDefault => run_config_default(),
         Command::ConfigDiff(options) => run_config_diff(options),
+        Command::ImportObjectives(options) => run_import_objectives(options).await,
         Command::Skills(command) => run_skills(command),
         Command::Help => Ok(()),
     }
@@ -92,6 +100,15 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             Ok(Command::Init(parse_init_options(rest)?))
         }
         "config" => parse_config_command(rest),
+        "import-objectives" => {
+            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
+                print_import_objectives_help();
+                return Ok(Command::Help);
+            }
+            Ok(Command::ImportObjectives(parse_import_objectives_options(
+                rest,
+            )?))
+        }
         "skills" => parse_skills_command(rest),
         "serve" => {
             if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -105,7 +122,7 @@ fn parse_command(args: &[String]) -> Result<Command, CliError> {
             Ok(Command::Help)
         }
         other => Err(CliError(format!(
-            "unknown command `{other}`; expected `init`, `config`, `skills`, or `serve`"
+            "unknown command `{other}`; expected `init`, `config`, `import-objectives`, `skills`, or `serve`"
         ))),
     }
 }
@@ -166,6 +183,45 @@ fn run_config_default() -> Result<(), Box<dyn std::error::Error>> {
 fn run_config_diff(options: WorkspacePathOptions) -> Result<(), Box<dyn std::error::Error>> {
     let diff = WorkspaceBackendConfigFile::local_config_diff_for_workspace(&options.workspace)?;
     print!("{}", diff.text);
+    Ok(())
+}
+
+async fn run_import_objectives(
+    options: ImportObjectivesOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let identity = WorkspaceIdentity::load_required(&options.workspace)?;
+    let database_path = options
+        .database
+        .unwrap_or_else(ServerConfig::default_server_database_path);
+    let store = SqliteWorkspaceStore::open(&database_path)?;
+    store
+        .upsert_workspace(&WorkspaceRecord {
+            workspace_id: identity.workspace_id.clone(),
+            owner_account_id: None,
+            display_name: identity.display_name.clone(),
+            state: "active".to_string(),
+            created_at: identity.created_at.clone(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        })
+        .await?;
+    let report =
+        yoi_workspace_server::objective_import::import_legacy_objectives_and_memory_staging(
+            &options.workspace,
+            &identity.workspace_id,
+            &store,
+        )?;
+    println!(
+        "imported objectives={} resources={} ticket_links={} skipped_ticket_links={} memory_staging={} invalid_records={}",
+        report.objectives_imported,
+        report.objective_resources_imported,
+        report.objective_ticket_links_imported,
+        report.objective_ticket_links_skipped,
+        report.memory_staging_records_imported,
+        report.invalid_records.len(),
+    );
+    for invalid in report.invalid_records {
+        eprintln!("invalid objective record: {invalid}");
+    }
     Ok(())
 }
 
@@ -377,6 +433,47 @@ fn parse_workspace_path_options(args: &[String]) -> Result<WorkspacePathOptions,
     Ok(WorkspacePathOptions { workspace })
 }
 
+fn parse_import_objectives_options(args: &[String]) -> Result<ImportObjectivesOptions, CliError> {
+    let mut workspace = std::env::current_dir()
+        .map_err(|error| CliError(format!("failed to read current dir: {error}")))?;
+    let mut database = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--workspace" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| CliError("--workspace requires a path".to_string()))?;
+                workspace = PathBuf::from(value);
+            }
+            value if value.starts_with("--workspace=") => {
+                workspace = PathBuf::from(value_after_equals(arg, "--workspace")?);
+            }
+            "--database" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| CliError("--database requires a path".to_string()))?;
+                database = Some(PathBuf::from(value));
+            }
+            value if value.starts_with("--database=") => {
+                database = Some(PathBuf::from(value_after_equals(arg, "--database")?));
+            }
+            other => {
+                return Err(CliError(format!(
+                    "unknown import-objectives option `{other}`"
+                )));
+            }
+        }
+    }
+    let workspace = workspace
+        .canonicalize()
+        .map_err(|error| CliError(format!("failed to canonicalize workspace: {error}")))?;
+    Ok(ImportObjectivesOptions {
+        workspace,
+        database,
+    })
+}
+
 fn parse_init_options(args: &[String]) -> Result<InitOptions, CliError> {
     let mut workspace = std::env::current_dir()
         .map_err(|error| CliError(format!("failed to read current dir: {error}")))?;
@@ -453,7 +550,7 @@ fn parse_listen(value: &str) -> Result<SocketAddr, CliError> {
 
 fn print_help() {
     println!(
-        "yoi-workspace-server\n\nUsage:\n  yoi-workspace-server init [OPTIONS]\n  yoi-workspace-server config <COMMAND> [OPTIONS]\n  yoi-workspace-server skills <COMMAND> [OPTIONS]\n  yoi-workspace-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
+        "yoi-workspace-server\n\nUsage:\n  yoi-workspace-server init [OPTIONS]\n  yoi-workspace-server config <COMMAND> [OPTIONS]\n  yoi-workspace-server import-objectives [OPTIONS]\n  yoi-workspace-server skills <COMMAND> [OPTIONS]\n  yoi-workspace-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
     );
 }
 
@@ -466,6 +563,12 @@ fn print_init_help() {
 fn print_config_help() {
     println!(
         "yoi-workspace-server config\n\nUsage:\n  yoi-workspace-server config default\n  yoi-workspace-server config diff [OPTIONS]\n\nDescription:\n  Prints the packaged Workspace Backend config template or compares it with the workspace-local config.\n\nOptions for diff:\n      --workspace <PATH>  Workspace root (defaults to cwd)\n  -h, --help              Print help"
+    );
+}
+
+fn print_import_objectives_help() {
+    println!(
+        "yoi-workspace-server import-objectives\n\nUsage:\n  yoi-workspace-server import-objectives [OPTIONS]\n\nDescription:\n  Imports legacy .yoi/objectives records and .yoi/memory/_staging JSON files into the Workspace SQLite authority.\n\nOptions:\n      --workspace <PATH>  Workspace root (defaults to cwd)\n      --database <PATH>   Server SQLite DB path (defaults to canonical server DB)\n  -h, --help              Print help"
     );
 }
 
