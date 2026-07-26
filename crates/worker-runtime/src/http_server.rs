@@ -6,6 +6,7 @@
 //! Runtime process directly; a backend is expected to own any browser-facing
 //! credentials, registration, and policy.
 
+use crate::auth::{RuntimeAuthContext, RuntimeHttpAuthConfig, unix_now_seconds, verify_capability_token};
 use crate::Runtime;
 use crate::catalog::{
     ConfigBundleRef, CreateWorkerRequest, WorkerDetail, WorkerLifecycleAck, WorkerSummary,
@@ -23,7 +24,7 @@ use axum::extract::rejection::{JsonRejection, QueryRejection};
 #[cfg(feature = "ws-server")]
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::{Request, StatusCode, header};
+use axum::http::{Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -61,6 +62,8 @@ pub struct RuntimeHttpServerConfig {
     /// Minimal local bearer token placeholder for backend-to-Runtime calls.
     /// This is not a browser-facing credential model.
     pub local_token: Option<String>,
+    /// Optional signed Server-to-Runtime capability token authority.
+    pub auth: Option<RuntimeHttpAuthConfig>,
 }
 
 impl Default for RuntimeHttpServerConfig {
@@ -71,6 +74,7 @@ impl Default for RuntimeHttpServerConfig {
             limits: RuntimeLimits::default(),
             store: RuntimeHttpStoreSelection::Memory,
             local_token: None,
+            auth: None,
         }
     }
 }
@@ -113,15 +117,36 @@ pub async fn serve_runtime_http(
     Ok(())
 }
 
+/// Serve an existing Runtime on a pre-bound listener with signed capability-token auth.
+pub async fn serve_runtime_http_with_auth(
+    runtime: Runtime,
+    listener: TcpListener,
+    local_token: Option<String>,
+    auth: Option<RuntimeHttpAuthConfig>,
+) -> Result<(), RuntimeHttpServerError> {
+    axum::serve(listener, runtime_http_router_with_auth(runtime, local_token, auth)).await?;
+    Ok(())
+}
+
 /// Build the REST router for an existing Runtime.
 ///
 /// Handlers delegate to [`Runtime`] methods and keep Worker authority Runtime-local.
 /// The path contains only a Runtime-local `worker_id`; backend aliases are not
 /// accepted or forwarded as Runtime authority.
 pub fn runtime_http_router(runtime: Runtime, local_token: Option<String>) -> Router {
+    runtime_http_router_with_auth(runtime, local_token, None)
+}
+
+/// Build the REST router for an existing Runtime with signed capability-token auth.
+pub fn runtime_http_router_with_auth(
+    runtime: Runtime,
+    local_token: Option<String>,
+    auth: Option<RuntimeHttpAuthConfig>,
+) -> Router {
     let state = RuntimeHttpState {
         runtime,
         local_token: local_token.map(Arc::<str>::from),
+        auth: auth.map(Arc::new),
     };
 
     let router = Router::new()
@@ -163,13 +188,14 @@ pub fn runtime_http_router(runtime: Runtime, local_token: Option<String>) -> Rou
 
     router
         .with_state(state.clone())
-        .layer(middleware::from_fn_with_state(state, require_local_token))
+        .layer(middleware::from_fn_with_state(state, require_runtime_auth))
 }
 
 #[derive(Clone)]
 struct RuntimeHttpState {
     runtime: Runtime,
     local_token: Option<Arc<str>>,
+    auth: Option<Arc<RuntimeHttpAuthConfig>>,
 }
 
 /// `GET /v1/runtime` response.
@@ -700,17 +726,48 @@ fn parse_optional_lifecycle_request(
     })
 }
 
-async fn require_local_token(
+async fn require_runtime_auth(
     State(state): State<RuntimeHttpState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    let supplied = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+
+    if let Some(auth) = state.auth.as_deref() {
+        let Some(token) = supplied else {
+            return RuntimeHttpRestError::new(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "missing Runtime capability bearer token",
+            )
+            .into_response();
+        };
+        match verify_capability_token(
+            auth,
+            token,
+            required_runtime_permission(request.method(), request.uri().path()),
+            unix_now_seconds(),
+        ) {
+            Ok(context) => {
+                request.extensions_mut().insert(context);
+                return next.run(request).await;
+            }
+            Err(error) => {
+                return RuntimeHttpRestError::new(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    format!("invalid Runtime capability token: {error}"),
+                )
+                .into_response();
+            }
+        }
+    }
+
     if let Some(expected) = state.local_token.as_deref() {
-        let supplied = request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "));
         if supplied != Some(expected) {
             return RuntimeHttpRestError::new(
                 StatusCode::UNAUTHORIZED,
@@ -719,8 +776,49 @@ async fn require_local_token(
             )
             .into_response();
         }
+        request.extensions_mut().insert(RuntimeAuthContext {
+            server_id: "local-token".to_string(),
+            workspace_id: "local".to_string(),
+            permissions: Vec::new(),
+            token_id: "local-token".to_string(),
+            expires_at: 0,
+        });
     }
     next.run(request).await
+}
+
+fn required_runtime_permission(method: &Method, path: &str) -> Option<&'static str> {
+    if path == "/v1/runtime" {
+        return None;
+    }
+    if path == "/v1/workers" && *method == Method::GET {
+        return Some("workers:list");
+    }
+    if path == "/v1/workers" && *method == Method::POST {
+        return Some("workers:create");
+    }
+    if path.starts_with("/v1/config-bundles") || path.starts_with("/v1/working-directories") {
+        return Some("workers:create");
+    }
+    if path.ends_with("/input") {
+        return Some("workers:input");
+    }
+    if path.ends_with("/stop") || path.ends_with("/cancel") {
+        return Some("workers:stop");
+    }
+    if path.ends_with("/protocol") || path.ends_with("/protocol/ws") {
+        return Some("workers:protocol");
+    }
+    if path.ends_with("/completions") {
+        return Some("workers:read");
+    }
+    if path.starts_with("/v1/workers/") && *method == Method::DELETE {
+        return Some("workers:delete");
+    }
+    if path.starts_with("/v1/workers/") && *method == Method::GET {
+        return Some("workers:read");
+    }
+    None
 }
 
 #[derive(Debug)]

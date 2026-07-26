@@ -11,6 +11,11 @@ name = "worker-runtime-rest-server"
 path = "src/main.rs"
 required-features = ["ws-server", "fs-store"]
 
+[[bin]]
+name = "worker-runtime"
+path = "src/worker_runtime_bin.rs"
+required-features = ["ws-server", "fs-store"]
+
 [features]
 default = []
 fs-store = []
@@ -19,6 +24,7 @@ ws-server = ["http-server", "axum/ws", "dep:futures", "tokio/sync"]
 
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
 axum = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 decodal.workspace = true
@@ -29,6 +35,7 @@ session-store.workspace = true
 sha2.workspace = true
 serde_json.workspace = true
 reqwest = { version = "0.13", optional = true, default-features = false, features = ["json", "rustls"] }
+ring.workspace = true
 tar.workspace = true
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }

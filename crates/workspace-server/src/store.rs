@@ -72,6 +72,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "sqlite memory authority documents and staging resolutions",
         apply: create_memory_authority_tables,
     },
+    Migration {
+        version: 12,
+        name: "trusted remote runtime registry",
+        apply: create_trusted_runtime_registry_tables,
+    },
 ];
 
 struct Migration {
@@ -105,6 +110,17 @@ pub struct RepositoryRecord {
     pub auth_ref_key: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrustedRuntimeRecord {
+    pub runtime_id: String,
+    pub display_name: String,
+    pub base_url: String,
+    pub public_key: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub revoked_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -497,6 +513,59 @@ impl SqliteWorkspaceStore {
             .lock()
             .map_err(|_| Error::Store("sqlite connection lock poisoned".to_string()))?;
         f(&conn)
+    }
+
+    pub fn upsert_trusted_runtime(&self, record: &TrustedRuntimeRecord) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO trusted_runtime_records (
+                    runtime_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(runtime_id) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    base_url = excluded.base_url,
+                    public_key = excluded.public_key,
+                    updated_at = excluded.updated_at,
+                    revoked_at = excluded.revoked_at"#,
+                params![
+                    record.runtime_id,
+                    record.display_name,
+                    record.base_url,
+                    record.public_key,
+                    record.created_at,
+                    record.updated_at,
+                    record.revoked_at,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn list_trusted_runtimes(&self, include_revoked: bool) -> Result<Vec<TrustedRuntimeRecord>> {
+        self.with_conn(|conn| {
+            let sql = if include_revoked {
+                r#"SELECT runtime_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
+                   FROM trusted_runtime_records ORDER BY runtime_id ASC"#
+            } else {
+                r#"SELECT runtime_id, display_name, base_url, public_key, created_at, updated_at, revoked_at
+                   FROM trusted_runtime_records WHERE revoked_at IS NULL ORDER BY runtime_id ASC"#
+            };
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt.query_map([], read_trusted_runtime_record)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Error::from)
+        })
+    }
+
+    pub fn revoke_trusted_runtime(&self, runtime_id: &str, revoked_at: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                r#"UPDATE trusted_runtime_records
+                   SET revoked_at = ?2, updated_at = ?2
+                   WHERE runtime_id = ?1 AND revoked_at IS NULL"#,
+                params![runtime_id, revoked_at],
+            )?;
+            Ok(changed > 0)
+        })
     }
 }
 
@@ -1599,6 +1668,18 @@ fn account_select_sql(where_clause: &str) -> String {
     )
 }
 
+fn read_trusted_runtime_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrustedRuntimeRecord> {
+    Ok(TrustedRuntimeRecord {
+        runtime_id: row.get(0)?,
+        display_name: row.get(1)?,
+        base_url: row.get(2)?,
+        public_key: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+        revoked_at: row.get(6)?,
+    })
+}
+
 fn read_account_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRecord> {
     Ok(AccountRecord {
         account_id: row.get(0)?,
@@ -1999,6 +2080,23 @@ CREATE TABLE IF NOT EXISTS memory_staging_resolutions (
     imported_at TEXT NOT NULL,
     resolved_at TEXT NOT NULL,
     PRIMARY KEY (workspace_id, candidate_id, resolved_at)
+);
+"#,
+    )?;
+    Ok(())
+}
+
+fn create_trusted_runtime_registry_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS trusted_runtime_records (
+    runtime_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    public_key TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    revoked_at TEXT
 );
 "#,
     )?;

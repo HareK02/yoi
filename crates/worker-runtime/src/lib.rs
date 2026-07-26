@@ -6,6 +6,7 @@
 //! server is available only through the optional `http-server` / `ws-server`
 //! features.
 
+pub mod auth;
 pub mod catalog;
 pub mod config_bundle;
 pub mod diagnostics;
