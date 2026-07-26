@@ -257,7 +257,9 @@ fn run_identity_command(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
                     _ => return Err(Box::new(CliError(format!("unknown identity init argument `{flag}`")))),
                 }
             }
-            let server_id = server_id.unwrap_or_else(|| "server-main".to_string());
+            let server_id = server_id.ok_or_else(|| {
+                CliError("identity init requires --server-id".to_string())
+            })?;
             let path = server_identity_path();
             if read_server_identity_file(&path)?.is_some() && !replace {
                 return Err(Box::new(CliError(format!(
@@ -316,6 +318,7 @@ fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error
             let mut base_url = None;
             let mut public_key = None;
             let mut display_name = None;
+            let mut replace = false;
             while let Some(arg) = args.pop_front() {
                 let (flag, inline_value) = split_flag_value(arg)?;
                 match flag.as_str() {
@@ -323,6 +326,10 @@ fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error
                     "--base-url" | "--endpoint" => base_url = Some(take_value(&flag, inline_value, &mut args)?),
                     "--public-key" => public_key = Some(take_value(&flag, inline_value, &mut args)?),
                     "--display-name" => display_name = Some(take_value(&flag, inline_value, &mut args)?),
+                    "--replace" => {
+                        ensure_no_inline_value(&flag, inline_value.as_deref())?;
+                        replace = true;
+                    }
                     _ => return Err(Box::new(CliError(format!("unknown trust-runtime add argument `{flag}`")))),
                 }
             }
@@ -330,6 +337,7 @@ fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error
             let base_url = base_url.ok_or_else(|| CliError("trust-runtime add requires --base-url".to_string()))?;
             let public_key = public_key.ok_or_else(|| CliError("trust-runtime add requires --public-key".to_string()))?;
             decode_public_key(&public_key)?;
+            ensure_trusted_runtime_replace_allowed(&store, &runtime_id, replace)?;
             let now = Utc::now().to_rfc3339();
             store.upsert_trusted_runtime(&TrustedRuntimeRecord {
                 runtime_id: runtime_id.clone(),
@@ -396,6 +404,24 @@ fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error
         }
         _ => Err(Box::new(CliError(format!("unknown trust-runtime subcommand `{subcommand}`")))),
     }
+}
+
+fn ensure_trusted_runtime_replace_allowed(
+    store: &SqliteWorkspaceStore,
+    runtime_id: &str,
+    replace: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if store
+        .list_trusted_runtimes(true)?
+        .iter()
+        .any(|runtime| runtime.runtime_id == runtime_id)
+        && !replace
+    {
+        return Err(Box::new(CliError(format!(
+            "trusted runtime `{runtime_id}` already exists; pass --replace to update it"
+        ))));
+    }
+    Ok(())
 }
 
 fn split_flag_value(arg: String) -> Result<(String, Option<String>), CliError> {
@@ -743,7 +769,7 @@ fn parse_listen(value: &str) -> Result<SocketAddr, CliError> {
 
 fn print_help() {
     println!(
-        "yoi-workspace-server\n\nUsage:\n  yoi-workspace-server init [OPTIONS]\n  yoi-workspace-server config <COMMAND> [OPTIONS]\n  yoi-workspace-server skills <COMMAND> [OPTIONS]\n  yoi-workspace-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
+        "yoi-workspace-server\n\nUsage:\n  yoi-workspace-server init [OPTIONS]\n  yoi-workspace-server config <COMMAND> [OPTIONS]\n  yoi-workspace-server identity init --server-id <SERVER_ID> [--replace]\n  yoi-workspace-server identity show [--json]\n  yoi-workspace-server trust-runtime add --runtime-id <RUNTIME_ID> --base-url <URL> --public-key <KEY> [--display-name <NAME>] [--replace]\n  yoi-workspace-server trust-runtime list [--json] [--include-revoked]\n  yoi-workspace-server trust-runtime revoke --runtime-id <RUNTIME_ID>\n  yoi-workspace-server skills <COMMAND> [OPTIONS]\n  yoi-workspace-server serve [OPTIONS]\n\nOptions:\n  -h, --help    Print help"
     );
 }
 
@@ -811,6 +837,39 @@ mod tests {
             error.to_string(),
             "unknown serve option `--frontend=/tmp/web`"
         );
+    }
+
+    #[test]
+    fn server_identity_init_requires_explicit_server_id() {
+        let error = run_identity_command(vec!["init".to_string()]).unwrap_err();
+        assert_eq!(error.to_string(), "identity init requires --server-id");
+    }
+
+    #[test]
+    fn trusted_runtime_add_requires_replace_for_existing_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SqliteWorkspaceStore::open(temp.path().join("server.db")).unwrap();
+        let public_key = RuntimeIdentityMaterial::generate("runtime-a")
+            .unwrap()
+            .public_key;
+        store
+            .upsert_trusted_runtime(&TrustedRuntimeRecord {
+                runtime_id: "runtime-a".to_string(),
+                display_name: "Runtime A".to_string(),
+                base_url: "http://127.0.0.1:18080".to_string(),
+                public_key,
+                created_at: "2026-07-26T00:00:00Z".to_string(),
+                updated_at: "2026-07-26T00:00:00Z".to_string(),
+                revoked_at: None,
+            })
+            .unwrap();
+
+        let error = ensure_trusted_runtime_replace_allowed(&store, "runtime-a", false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "trusted runtime `runtime-a` already exists; pass --replace to update it"
+        );
+        ensure_trusted_runtime_replace_allowed(&store, "runtime-a", true).unwrap();
     }
 
     #[tokio::test]
