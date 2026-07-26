@@ -6,8 +6,10 @@
 //! Runtime process directly; a backend is expected to own any browser-facing
 //! credentials, registration, and policy.
 
-use crate::auth::{RuntimeAuthContext, RuntimeHttpAuthConfig, unix_now_seconds, verify_capability_token};
 use crate::Runtime;
+use crate::auth::{
+    RuntimeAuthContext, RuntimeHttpAuthConfig, unix_now_seconds, verify_capability_token,
+};
 use crate::catalog::{
     ConfigBundleRef, CreateWorkerRequest, WorkerDetail, WorkerLifecycleAck, WorkerSummary,
     WorkingDirectoryRequest, WorkingDirectoryStatus,
@@ -124,7 +126,11 @@ pub async fn serve_runtime_http_with_auth(
     local_token: Option<String>,
     auth: Option<RuntimeHttpAuthConfig>,
 ) -> Result<(), RuntimeHttpServerError> {
-    axum::serve(listener, runtime_http_router_with_auth(runtime, local_token, auth)).await?;
+    axum::serve(
+        listener,
+        runtime_http_router_with_auth(runtime, local_token, auth),
+    )
+    .await?;
     Ok(())
 }
 

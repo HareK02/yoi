@@ -44,7 +44,10 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), ProcessError> {
     let args = env::args().skip(1).collect::<Vec<_>>();
-    if matches!(args.first().map(String::as_str), Some("identity" | "trust-server")) {
+    if matches!(
+        args.first().map(String::as_str),
+        Some("identity" | "trust-server")
+    ) {
         return run_auth_command(args);
     }
     let Some(mut config) = parse_args(args)? else {
@@ -412,9 +415,8 @@ fn read_runtime_auth_file(path: &Path) -> Result<RuntimeAuthFile, ProcessError> 
         return Ok(RuntimeAuthFile::default());
     }
     let contents = std::fs::read_to_string(path)?;
-    toml::from_str(&contents).map_err(|error| {
-        ProcessError::Auth(format!("failed to parse {}: {error}", path.display()))
-    })
+    toml::from_str(&contents)
+        .map_err(|error| ProcessError::Auth(format!("failed to parse {}: {error}", path.display())))
 }
 
 fn write_runtime_auth_file(path: &Path, auth: &RuntimeAuthFile) -> Result<(), ProcessError> {
@@ -442,7 +444,9 @@ fn write_secret_file(path: &Path, contents: &[u8]) -> Result<(), ProcessError> {
     Ok(())
 }
 
-fn load_runtime_http_auth(config: &ProcessConfig) -> Result<Option<RuntimeHttpAuthConfig>, ProcessError> {
+fn load_runtime_http_auth(
+    config: &ProcessConfig,
+) -> Result<Option<RuntimeHttpAuthConfig>, ProcessError> {
     let path = runtime_auth_path(config);
     let auth = read_runtime_auth_file(&path)?;
     let Some(identity) = auth.identity else {
@@ -468,7 +472,11 @@ fn parse_auth_storage_flags(args: &mut VecDeque<String>) -> Result<ProcessConfig
             "--fs-runtime-dir" => {
                 config.fs_runtime_dir = Some(PathBuf::from(take_value(&flag, inline_value, args)?));
             }
-            _ => return Err(ProcessError::usage(format!("unknown auth command argument `{flag}`"))),
+            _ => {
+                return Err(ProcessError::usage(format!(
+                    "unknown auth command argument `{flag}`"
+                )));
+            }
         }
     }
     Ok(config)
@@ -480,7 +488,9 @@ fn run_auth_command(args: Vec<String>) -> Result<(), ProcessError> {
     match command.as_str() {
         "identity" => run_identity_command(args),
         "trust-server" => run_trust_server_command(args),
-        _ => Err(ProcessError::usage(format!("unknown auth command `{command}`"))),
+        _ => Err(ProcessError::usage(format!(
+            "unknown auth command `{command}`"
+        ))),
     }
 }
 
@@ -496,17 +506,31 @@ fn run_identity_command(mut args: VecDeque<String>) -> Result<(), ProcessError> 
             while let Some(arg) = args.pop_front() {
                 let (flag, inline_value) = split_flag_value(arg)?;
                 match flag.as_str() {
-                    "--runtime-id" => runtime_id = Some(take_value(&flag, inline_value, &mut args)?),
+                    "--runtime-id" => {
+                        runtime_id = Some(take_value(&flag, inline_value, &mut args)?)
+                    }
                     "--replace" => {
                         ensure_no_inline_value(&flag, inline_value.as_deref())?;
                         replace = true;
                     }
                     "--fs-root" | "--fs-runtime-dir" => {
                         rest.push_back(flag);
-                        if let Some(value) = inline_value { rest.push_back(value); }
-                        else { rest.push_back(args.pop_front().ok_or_else(|| ProcessError::usage(format!("{} requires a value", rest.back().unwrap())))?); }
+                        if let Some(value) = inline_value {
+                            rest.push_back(value);
+                        } else {
+                            rest.push_back(args.pop_front().ok_or_else(|| {
+                                ProcessError::usage(format!(
+                                    "{} requires a value",
+                                    rest.back().unwrap()
+                                ))
+                            })?);
+                        }
                     }
-                    _ => return Err(ProcessError::usage(format!("unknown identity init argument `{flag}`"))),
+                    _ => {
+                        return Err(ProcessError::usage(format!(
+                            "unknown identity init argument `{flag}`"
+                        )));
+                    }
                 }
             }
             let config = parse_auth_storage_flags(&mut rest)?;
@@ -521,9 +545,10 @@ fn run_identity_command(mut args: VecDeque<String>) -> Result<(), ProcessError> 
             let runtime_id = runtime_id.ok_or_else(|| {
                 ProcessError::usage("identity init requires --runtime-id".to_string())
             })?;
-            auth.identity = Some(RuntimeIdentityMaterial::generate(runtime_id).map_err(|error| {
-                ProcessError::Auth(error.to_string())
-            })?);
+            auth.identity = Some(
+                RuntimeIdentityMaterial::generate(runtime_id)
+                    .map_err(|error| ProcessError::Auth(error.to_string()))?,
+            );
             write_runtime_auth_file(&path, &auth)?;
             let identity = auth.identity.as_ref().unwrap();
             println!("runtime_id={}", identity.identity_id);
@@ -543,21 +568,40 @@ fn run_identity_command(mut args: VecDeque<String>) -> Result<(), ProcessError> 
                     }
                     "--fs-root" | "--fs-runtime-dir" => {
                         rest.push_back(flag);
-                        if let Some(value) = inline_value { rest.push_back(value); }
-                        else { rest.push_back(args.pop_front().ok_or_else(|| ProcessError::usage(format!("{} requires a value", rest.back().unwrap())))?); }
+                        if let Some(value) = inline_value {
+                            rest.push_back(value);
+                        } else {
+                            rest.push_back(args.pop_front().ok_or_else(|| {
+                                ProcessError::usage(format!(
+                                    "{} requires a value",
+                                    rest.back().unwrap()
+                                ))
+                            })?);
+                        }
                     }
-                    _ => return Err(ProcessError::usage(format!("unknown identity show argument `{flag}`"))),
+                    _ => {
+                        return Err(ProcessError::usage(format!(
+                            "unknown identity show argument `{flag}`"
+                        )));
+                    }
                 }
             }
             let config = parse_auth_storage_flags(&mut rest)?;
             let path = runtime_auth_path(&config);
             let auth = read_runtime_auth_file(&path)?;
             let Some(identity) = auth.identity else {
-                return Err(ProcessError::usage(format!("runtime identity is not initialized at {}", path.display())));
+                return Err(ProcessError::usage(format!(
+                    "runtime identity is not initialized at {}",
+                    path.display()
+                )));
             };
             let view = runtime_public_identity_view(&identity);
             if json {
-                println!("{}", serde_json::to_string_pretty(&view).map_err(|error| ProcessError::Auth(error.to_string()))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&view)
+                        .map_err(|error| ProcessError::Auth(error.to_string()))?
+                );
             } else {
                 println!("runtime_id={}", view.identity_id);
                 println!("public_key={}", view.public_key);
@@ -565,13 +609,17 @@ fn run_identity_command(mut args: VecDeque<String>) -> Result<(), ProcessError> 
             }
             Ok(())
         }
-        _ => Err(ProcessError::usage(format!("unknown identity subcommand `{subcommand}`"))),
+        _ => Err(ProcessError::usage(format!(
+            "unknown identity subcommand `{subcommand}`"
+        ))),
     }
 }
 
 fn run_trust_server_command(mut args: VecDeque<String>) -> Result<(), ProcessError> {
     let subcommand = args.pop_front().ok_or_else(|| {
-        ProcessError::usage("trust-server requires subcommand `add`, `list`, or `revoke`".to_string())
+        ProcessError::usage(
+            "trust-server requires subcommand `add`, `list`, or `revoke`".to_string(),
+        )
     })?;
     match subcommand.as_str() {
         "add" => {
@@ -584,31 +632,64 @@ fn run_trust_server_command(mut args: VecDeque<String>) -> Result<(), ProcessErr
                 let (flag, inline_value) = split_flag_value(arg)?;
                 match flag.as_str() {
                     "--server-id" => server_id = Some(take_value(&flag, inline_value, &mut args)?),
-                    "--public-key" => public_key = Some(take_value(&flag, inline_value, &mut args)?),
-                    "--display-name" => display_name = Some(take_value(&flag, inline_value, &mut args)?),
+                    "--public-key" => {
+                        public_key = Some(take_value(&flag, inline_value, &mut args)?)
+                    }
+                    "--display-name" => {
+                        display_name = Some(take_value(&flag, inline_value, &mut args)?)
+                    }
                     "--replace" => {
                         ensure_no_inline_value(&flag, inline_value.as_deref())?;
                         replace = true;
                     }
                     "--fs-root" | "--fs-runtime-dir" => {
                         rest.push_back(flag);
-                        if let Some(value) = inline_value { rest.push_back(value); }
-                        else { rest.push_back(args.pop_front().ok_or_else(|| ProcessError::usage(format!("{} requires a value", rest.back().unwrap())))?); }
+                        if let Some(value) = inline_value {
+                            rest.push_back(value);
+                        } else {
+                            rest.push_back(args.pop_front().ok_or_else(|| {
+                                ProcessError::usage(format!(
+                                    "{} requires a value",
+                                    rest.back().unwrap()
+                                ))
+                            })?);
+                        }
                     }
-                    _ => return Err(ProcessError::usage(format!("unknown trust-server add argument `{flag}`"))),
+                    _ => {
+                        return Err(ProcessError::usage(format!(
+                            "unknown trust-server add argument `{flag}`"
+                        )));
+                    }
                 }
             }
             let config = parse_auth_storage_flags(&mut rest)?;
             let path = runtime_auth_path(&config);
             let mut auth = read_runtime_auth_file(&path)?;
-            let server_id = server_id.ok_or_else(|| ProcessError::usage("trust-server add requires --server-id".to_string()))?;
-            let public_key = public_key.ok_or_else(|| ProcessError::usage("trust-server add requires --public-key".to_string()))?;
-            decode_public_key(&public_key).map_err(|error| ProcessError::usage(error.to_string()))?;
-            if auth.trusted_servers.iter().any(|server| server.server_id == server_id) && !replace {
-                return Err(ProcessError::usage(format!("trusted server `{server_id}` already exists; pass --replace to update it")));
+            let server_id = server_id.ok_or_else(|| {
+                ProcessError::usage("trust-server add requires --server-id".to_string())
+            })?;
+            let public_key = public_key.ok_or_else(|| {
+                ProcessError::usage("trust-server add requires --public-key".to_string())
+            })?;
+            decode_public_key(&public_key)
+                .map_err(|error| ProcessError::usage(error.to_string()))?;
+            if auth
+                .trusted_servers
+                .iter()
+                .any(|server| server.server_id == server_id)
+                && !replace
+            {
+                return Err(ProcessError::usage(format!(
+                    "trusted server `{server_id}` already exists; pass --replace to update it"
+                )));
             }
-            auth.trusted_servers.retain(|server| server.server_id != server_id);
-            auth.trusted_servers.push(TrustedServerKey { server_id: server_id.clone(), public_key, display_name });
+            auth.trusted_servers
+                .retain(|server| server.server_id != server_id);
+            auth.trusted_servers.push(TrustedServerKey {
+                server_id: server_id.clone(),
+                public_key,
+                display_name,
+            });
             write_runtime_auth_file(&path, &auth)?;
             println!("trusted_server_id={server_id}");
             println!("auth_file={}", path.display());
@@ -626,19 +707,40 @@ fn run_trust_server_command(mut args: VecDeque<String>) -> Result<(), ProcessErr
                     }
                     "--fs-root" | "--fs-runtime-dir" => {
                         rest.push_back(flag);
-                        if let Some(value) = inline_value { rest.push_back(value); }
-                        else { rest.push_back(args.pop_front().ok_or_else(|| ProcessError::usage(format!("{} requires a value", rest.back().unwrap())))?); }
+                        if let Some(value) = inline_value {
+                            rest.push_back(value);
+                        } else {
+                            rest.push_back(args.pop_front().ok_or_else(|| {
+                                ProcessError::usage(format!(
+                                    "{} requires a value",
+                                    rest.back().unwrap()
+                                ))
+                            })?);
+                        }
                     }
-                    _ => return Err(ProcessError::usage(format!("unknown trust-server list argument `{flag}`"))),
+                    _ => {
+                        return Err(ProcessError::usage(format!(
+                            "unknown trust-server list argument `{flag}`"
+                        )));
+                    }
                 }
             }
             let config = parse_auth_storage_flags(&mut rest)?;
             let auth = read_runtime_auth_file(&runtime_auth_path(&config))?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&auth.trusted_servers).map_err(|error| ProcessError::Auth(error.to_string()))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&auth.trusted_servers)
+                        .map_err(|error| ProcessError::Auth(error.to_string()))?
+                );
             } else {
                 for server in auth.trusted_servers {
-                    println!("server_id={} public_key={} display_name={}", server.server_id, server.public_key, server.display_name.unwrap_or_default());
+                    println!(
+                        "server_id={} public_key={} display_name={}",
+                        server.server_id,
+                        server.public_key,
+                        server.display_name.unwrap_or_default()
+                    );
                 }
             }
             Ok(())
@@ -652,26 +754,45 @@ fn run_trust_server_command(mut args: VecDeque<String>) -> Result<(), ProcessErr
                     "--server-id" => server_id = Some(take_value(&flag, inline_value, &mut args)?),
                     "--fs-root" | "--fs-runtime-dir" => {
                         rest.push_back(flag);
-                        if let Some(value) = inline_value { rest.push_back(value); }
-                        else { rest.push_back(args.pop_front().ok_or_else(|| ProcessError::usage(format!("{} requires a value", rest.back().unwrap())))?); }
+                        if let Some(value) = inline_value {
+                            rest.push_back(value);
+                        } else {
+                            rest.push_back(args.pop_front().ok_or_else(|| {
+                                ProcessError::usage(format!(
+                                    "{} requires a value",
+                                    rest.back().unwrap()
+                                ))
+                            })?);
+                        }
                     }
-                    _ => return Err(ProcessError::usage(format!("unknown trust-server revoke argument `{flag}`"))),
+                    _ => {
+                        return Err(ProcessError::usage(format!(
+                            "unknown trust-server revoke argument `{flag}`"
+                        )));
+                    }
                 }
             }
             let config = parse_auth_storage_flags(&mut rest)?;
             let path = runtime_auth_path(&config);
             let mut auth = read_runtime_auth_file(&path)?;
-            let server_id = server_id.ok_or_else(|| ProcessError::usage("trust-server revoke requires --server-id".to_string()))?;
+            let server_id = server_id.ok_or_else(|| {
+                ProcessError::usage("trust-server revoke requires --server-id".to_string())
+            })?;
             let before = auth.trusted_servers.len();
-            auth.trusted_servers.retain(|server| server.server_id != server_id);
+            auth.trusted_servers
+                .retain(|server| server.server_id != server_id);
             if auth.trusted_servers.len() == before {
-                return Err(ProcessError::usage(format!("trusted server `{server_id}` is not registered")));
+                return Err(ProcessError::usage(format!(
+                    "trusted server `{server_id}` is not registered"
+                )));
             }
             write_runtime_auth_file(&path, &auth)?;
             println!("revoked_server_id={server_id}");
             Ok(())
         }
-        _ => Err(ProcessError::usage(format!("unknown trust-server subcommand `{subcommand}`"))),
+        _ => Err(ProcessError::usage(format!(
+            "unknown trust-server subcommand `{subcommand}`"
+        ))),
     }
 }
 

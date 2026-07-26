@@ -51,8 +51,8 @@ pub struct RuntimeIdentityMaterial {
 impl RuntimeIdentityMaterial {
     pub fn generate(identity_id: impl Into<String>) -> Result<Self, RuntimeAuthError> {
         let rng = SystemRandom::new();
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
-            .map_err(|_| RuntimeAuthError::KeyGeneration)?;
+        let pkcs8 =
+            Ed25519KeyPair::generate_pkcs8(&rng).map_err(|_| RuntimeAuthError::KeyGeneration)?;
         let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
             .map_err(|_| RuntimeAuthError::InvalidPrivateKey)?;
         Ok(Self {
@@ -131,7 +131,10 @@ impl CapabilityTokenSigner {
         let payload = URL_SAFE_NO_PAD.encode(payload);
         let signing_input = format!("{SIGNING_INPUT_PREFIX}{payload}");
         let signature = pair.sign(signing_input.as_bytes());
-        Ok(format!("{TOKEN_PREFIX}.{payload}.{}", URL_SAFE_NO_PAD.encode(signature.as_ref())))
+        Ok(format!(
+            "{TOKEN_PREFIX}.{payload}.{}",
+            URL_SAFE_NO_PAD.encode(signature.as_ref())
+        ))
     }
 }
 
@@ -185,7 +188,11 @@ pub fn verify_capability_token(
         return Err(RuntimeAuthError::Expired);
     }
     if let Some(required) = required_permission {
-        if !claims.permissions.iter().any(|permission| permission == required) {
+        if !claims
+            .permissions
+            .iter()
+            .any(|permission| permission == required)
+        {
             return Err(RuntimeAuthError::MissingPermission(required.to_string()));
         }
     }

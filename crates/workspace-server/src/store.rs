@@ -541,7 +541,10 @@ impl SqliteWorkspaceStore {
         })
     }
 
-    pub fn list_trusted_runtimes(&self, include_revoked: bool) -> Result<Vec<TrustedRuntimeRecord>> {
+    pub fn list_trusted_runtimes(
+        &self,
+        include_revoked: bool,
+    ) -> Result<Vec<TrustedRuntimeRecord>> {
         self.with_conn(|conn| {
             let sql = if include_revoked {
                 r#"SELECT runtime_id, display_name, base_url, public_key, created_at, updated_at, revoked_at

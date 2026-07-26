@@ -2239,11 +2239,12 @@ impl RemoteWorkerRuntime {
         let capability_token = self.runtime_capability_token(path);
         run_blocking_http(move || {
             let request = request.header(CONTENT_TYPE, "application/json");
-            let request = if let Some(token) = capability_token.as_deref().or(bearer_token.as_deref()) {
-                request.header(AUTHORIZATION, format!("Bearer {token}"))
-            } else {
-                request
-            };
+            let request =
+                if let Some(token) = capability_token.as_deref().or(bearer_token.as_deref()) {
+                    request.header(AUTHORIZATION, format!("Bearer {token}"))
+                } else {
+                    request
+                };
             let response = request
                 .send()
                 .map_err(|err| remote_reqwest_diagnostic(&runtime_id, err))?;
