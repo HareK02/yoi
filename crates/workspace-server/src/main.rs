@@ -1,5 +1,5 @@
-use std::net::SocketAddr;
 use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -11,9 +11,8 @@ use worker_runtime::auth::{RuntimeIdentityMaterial, decode_public_key};
 use yoi_workspace_server::hosts::{RemoteRuntimeAuthConfig, RemoteRuntimeConfig};
 use yoi_workspace_server::store::{RepositoryRecord, SqliteWorkspaceStore, TrustedRuntimeRecord};
 use yoi_workspace_server::{
-    BackendRuntimesConfigFile, ControlPlaneStore, ServerConfig,
-    WORKSPACE_BACKEND_CONFIG_TEMPLATE, WorkspaceBackendConfigFile, WorkspaceIdentity,
-    WorkspaceRecord, serve,
+    BackendRuntimesConfigFile, ControlPlaneStore, ServerConfig, WORKSPACE_BACKEND_CONFIG_TEMPLATE,
+    WorkspaceBackendConfigFile, WorkspaceIdentity, WorkspaceRecord, serve,
 };
 
 #[derive(Debug)]
@@ -195,7 +194,9 @@ fn server_identity_path() -> PathBuf {
     ServerConfig::default_server_data_root().join("identity.toml")
 }
 
-fn read_server_identity_file(path: &Path) -> Result<Option<ServerIdentityFile>, Box<dyn std::error::Error>> {
+fn read_server_identity_file(
+    path: &Path,
+) -> Result<Option<ServerIdentityFile>, Box<dyn std::error::Error>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -203,7 +204,10 @@ fn read_server_identity_file(path: &Path) -> Result<Option<ServerIdentityFile>, 
     Ok(Some(toml::from_str(&contents)?))
 }
 
-fn write_server_identity_file(path: &Path, identity: &ServerIdentityFile) -> Result<(), Box<dyn std::error::Error>> {
+fn write_server_identity_file(
+    path: &Path,
+    identity: &ServerIdentityFile,
+) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -241,7 +245,9 @@ fn public_identity_view(identity: &RuntimeIdentityMaterial) -> PublicIdentityVie
 
 fn run_identity_command(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut args = VecDeque::from(args);
-    let subcommand = args.pop_front().ok_or_else(|| CliError("identity requires `init` or `show`".to_string()))?;
+    let subcommand = args
+        .pop_front()
+        .ok_or_else(|| CliError("identity requires `init` or `show`".to_string()))?;
     match subcommand.as_str() {
         "init" => {
             let mut server_id = None;
@@ -254,12 +260,15 @@ fn run_identity_command(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
                         ensure_no_inline_value(&flag, inline_value.as_deref())?;
                         replace = true;
                     }
-                    _ => return Err(Box::new(CliError(format!("unknown identity init argument `{flag}`")))),
+                    _ => {
+                        return Err(Box::new(CliError(format!(
+                            "unknown identity init argument `{flag}`"
+                        ))));
+                    }
                 }
             }
-            let server_id = server_id.ok_or_else(|| {
-                CliError("identity init requires --server-id".to_string())
-            })?;
+            let server_id = server_id
+                .ok_or_else(|| CliError("identity init requires --server-id".to_string()))?;
             let path = server_identity_path();
             if read_server_identity_file(&path)?.is_some() && !replace {
                 return Err(Box::new(CliError(format!(
@@ -268,7 +277,12 @@ fn run_identity_command(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
                 ))));
             }
             let identity = RuntimeIdentityMaterial::generate(server_id)?;
-            write_server_identity_file(&path, &ServerIdentityFile { identity: identity.clone() })?;
+            write_server_identity_file(
+                &path,
+                &ServerIdentityFile {
+                    identity: identity.clone(),
+                },
+            )?;
             println!("server_id={}", identity.identity_id);
             println!("public_key={}", identity.public_key);
             println!("identity_file={}", path.display());
@@ -283,12 +297,19 @@ fn run_identity_command(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
                         ensure_no_inline_value(&flag, inline_value.as_deref())?;
                         json = true;
                     }
-                    _ => return Err(Box::new(CliError(format!("unknown identity show argument `{flag}`")))),
+                    _ => {
+                        return Err(Box::new(CliError(format!(
+                            "unknown identity show argument `{flag}`"
+                        ))));
+                    }
                 }
             }
             let path = server_identity_path();
             let identity = read_server_identity_file(&path)?.ok_or_else(|| {
-                CliError(format!("server identity is not initialized at {}", path.display()))
+                CliError(format!(
+                    "server identity is not initialized at {}",
+                    path.display()
+                ))
             })?;
             let view = public_identity_view(&identity.identity);
             if json {
@@ -300,13 +321,17 @@ fn run_identity_command(args: Vec<String>) -> Result<(), Box<dyn std::error::Err
             }
             Ok(())
         }
-        _ => Err(Box::new(CliError(format!("unknown identity subcommand `{subcommand}`")))),
+        _ => Err(Box::new(CliError(format!(
+            "unknown identity subcommand `{subcommand}`"
+        )))),
     }
 }
 
 fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut args = VecDeque::from(args);
-    let subcommand = args.pop_front().ok_or_else(|| CliError("trust-runtime requires `add`, `list`, or `revoke`".to_string()))?;
+    let subcommand = args
+        .pop_front()
+        .ok_or_else(|| CliError("trust-runtime requires `add`, `list`, or `revoke`".to_string()))?;
     let database_path = ServerConfig::default_server_database_path();
     if let Some(parent) = database_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -322,20 +347,35 @@ fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error
             while let Some(arg) = args.pop_front() {
                 let (flag, inline_value) = split_flag_value(arg)?;
                 match flag.as_str() {
-                    "--runtime-id" => runtime_id = Some(take_value(&flag, inline_value, &mut args)?),
-                    "--base-url" | "--endpoint" => base_url = Some(take_value(&flag, inline_value, &mut args)?),
-                    "--public-key" => public_key = Some(take_value(&flag, inline_value, &mut args)?),
-                    "--display-name" => display_name = Some(take_value(&flag, inline_value, &mut args)?),
+                    "--runtime-id" => {
+                        runtime_id = Some(take_value(&flag, inline_value, &mut args)?)
+                    }
+                    "--base-url" | "--endpoint" => {
+                        base_url = Some(take_value(&flag, inline_value, &mut args)?)
+                    }
+                    "--public-key" => {
+                        public_key = Some(take_value(&flag, inline_value, &mut args)?)
+                    }
+                    "--display-name" => {
+                        display_name = Some(take_value(&flag, inline_value, &mut args)?)
+                    }
                     "--replace" => {
                         ensure_no_inline_value(&flag, inline_value.as_deref())?;
                         replace = true;
                     }
-                    _ => return Err(Box::new(CliError(format!("unknown trust-runtime add argument `{flag}`")))),
+                    _ => {
+                        return Err(Box::new(CliError(format!(
+                            "unknown trust-runtime add argument `{flag}`"
+                        ))));
+                    }
                 }
             }
-            let runtime_id = runtime_id.ok_or_else(|| CliError("trust-runtime add requires --runtime-id".to_string()))?;
-            let base_url = base_url.ok_or_else(|| CliError("trust-runtime add requires --base-url".to_string()))?;
-            let public_key = public_key.ok_or_else(|| CliError("trust-runtime add requires --public-key".to_string()))?;
+            let runtime_id = runtime_id
+                .ok_or_else(|| CliError("trust-runtime add requires --runtime-id".to_string()))?;
+            let base_url = base_url
+                .ok_or_else(|| CliError("trust-runtime add requires --base-url".to_string()))?;
+            let public_key = public_key
+                .ok_or_else(|| CliError("trust-runtime add requires --public-key".to_string()))?;
             decode_public_key(&public_key)?;
             ensure_trusted_runtime_replace_allowed(&store, &runtime_id, replace)?;
             let now = Utc::now().to_rfc3339();
@@ -366,7 +406,11 @@ fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error
                         ensure_no_inline_value(&flag, inline_value.as_deref())?;
                         include_revoked = true;
                     }
-                    _ => return Err(Box::new(CliError(format!("unknown trust-runtime list argument `{flag}`")))),
+                    _ => {
+                        return Err(Box::new(CliError(format!(
+                            "unknown trust-runtime list argument `{flag}`"
+                        ))));
+                    }
                 }
             }
             let records = store.list_trusted_runtimes(include_revoked)?;
@@ -390,19 +434,31 @@ fn run_trust_runtime_command(args: Vec<String>) -> Result<(), Box<dyn std::error
             while let Some(arg) = args.pop_front() {
                 let (flag, inline_value) = split_flag_value(arg)?;
                 match flag.as_str() {
-                    "--runtime-id" => runtime_id = Some(take_value(&flag, inline_value, &mut args)?),
-                    _ => return Err(Box::new(CliError(format!("unknown trust-runtime revoke argument `{flag}`")))),
+                    "--runtime-id" => {
+                        runtime_id = Some(take_value(&flag, inline_value, &mut args)?)
+                    }
+                    _ => {
+                        return Err(Box::new(CliError(format!(
+                            "unknown trust-runtime revoke argument `{flag}`"
+                        ))));
+                    }
                 }
             }
-            let runtime_id = runtime_id.ok_or_else(|| CliError("trust-runtime revoke requires --runtime-id".to_string()))?;
+            let runtime_id = runtime_id.ok_or_else(|| {
+                CliError("trust-runtime revoke requires --runtime-id".to_string())
+            })?;
             let now = Utc::now().to_rfc3339();
             if !store.revoke_trusted_runtime(&runtime_id, &now)? {
-                return Err(Box::new(CliError(format!("trusted runtime `{runtime_id}` is not registered or is already revoked"))));
+                return Err(Box::new(CliError(format!(
+                    "trusted runtime `{runtime_id}` is not registered or is already revoked"
+                ))));
             }
             println!("revoked_runtime_id={runtime_id}");
             Ok(())
         }
-        _ => Err(Box::new(CliError(format!("unknown trust-runtime subcommand `{subcommand}`")))),
+        _ => Err(Box::new(CliError(format!(
+            "unknown trust-runtime subcommand `{subcommand}`"
+        )))),
     }
 }
 
