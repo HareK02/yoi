@@ -520,8 +520,96 @@ impl NewTicket {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketItemEdit {
     pub title: Option<String>,
+    /// Whole-body replacement for legacy authoring surfaces. Prefer `body_replacement`
+    /// for small edits that should be validated against the current body.
     pub body: Option<MarkdownText>,
+    #[serde(default)]
+    pub body_replacement: Option<TicketBodyReplacement>,
     pub author: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketBodyReplacement {
+    pub old_string: String,
+    pub new_string: String,
+    #[serde(default)]
+    pub replace_all: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TicketBodyReplacementOutcome {
+    body: MarkdownText,
+    replacement_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TicketBodyEditAudit {
+    None,
+    WholeBody,
+    Partial { replacement_count: usize },
+}
+
+impl TicketItemEdit {
+    fn validate_body_edit_request(&self) -> Result<()> {
+        if self.body.is_some() && self.body_replacement.is_some() {
+            return Err(TicketError::Conflict(
+                "body and body_replacement cannot both be provided".into(),
+            ));
+        }
+
+        if let Some(replacement) = &self.body_replacement {
+            replacement.validate()?;
+        }
+
+        Ok(())
+    }
+
+    fn has_changes(&self) -> bool {
+        self.title.is_some() || self.body.is_some() || self.body_replacement.is_some()
+    }
+}
+
+impl TicketBodyReplacement {
+    fn validate(&self) -> Result<()> {
+        if self.old_string.is_empty() {
+            return Err(TicketError::Conflict(
+                "body_replacement.old_string must not be empty".into(),
+            ));
+        }
+        if self.old_string == self.new_string {
+            return Err(TicketError::Conflict(
+                "body_replacement.old_string and new_string must differ".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn apply(&self, current_body: &str) -> Result<TicketBodyReplacementOutcome> {
+        self.validate()?;
+
+        let replacement_count = current_body.matches(&self.old_string).count();
+        if replacement_count == 0 {
+            return Err(TicketError::NotFound(format!(
+                "old_string not found in ticket item body"
+            )));
+        }
+        if replacement_count > 1 && !self.replace_all {
+            return Err(TicketError::Conflict(format!(
+                "old_string matched {replacement_count} times; set replace_all=true to replace all occurrences"
+            )));
+        }
+
+        let body = if self.replace_all {
+            current_body.replace(&self.old_string, &self.new_string)
+        } else {
+            current_body.replacen(&self.old_string, &self.new_string, 1)
+        };
+
+        Ok(TicketBodyReplacementOutcome {
+            body: MarkdownText(body),
+            replacement_count,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2857,17 +2945,81 @@ impl TicketBackend for SqliteTicketBackend {
 
     fn edit_item(&self, id: TicketIdOrSlug, edit: TicketItemEdit) -> Result<Ticket> {
         self.with_write(|conn| {
-            if edit.title.is_none() && edit.body.is_none() { return Err(TicketError::Conflict("TicketEditItem requires at least one of title or body".to_string())); }
-            let ticket_id = self.resolve_ticket_id(conn, id)?;
-            let now = now_utc();
+            edit.validate_body_edit_request()?;
+            if !edit.has_changes() {
+                return Err(TicketError::Conflict(
+                    "TicketEditItem requires at least one of title, body, or body_replacement"
+                        .to_string(),
+                ));
+            }
             if let Some(title) = edit.title.as_ref() {
                 validate_required_event_value("title", title)?;
+            }
+            if let Some(author) = edit.author.as_deref() {
+                validate_required_event_value("author", author)?;
+            }
+            let ticket_id = self.resolve_ticket_id(conn, id)?;
+            let now = now_utc();
+            let mut body_edit_audit = TicketBodyEditAudit::None;
+            if let Some(title) = edit.title.as_ref() {
                 conn.execute("UPDATE typed_tickets SET title = ?3, updated_at = ?4 WHERE workspace_id = ?1 AND ticket_id = ?2", params![self.workspace_id, ticket_id, title, now]).map_err(sqlite_err)?;
             }
+            let mut updated_body = None;
             if let Some(body) = edit.body.as_ref() {
+                updated_body = Some(body.clone());
+                body_edit_audit = TicketBodyEditAudit::WholeBody;
+            }
+            if let Some(replacement) = edit.body_replacement.as_ref() {
+                let current_body: String = conn
+                    .query_row(
+                        "SELECT body FROM typed_tickets WHERE workspace_id = ?1 AND ticket_id = ?2",
+                        params![self.workspace_id, ticket_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(sqlite_err)?;
+                let outcome = replacement.apply(current_body.as_str())?;
+                updated_body = Some(outcome.body);
+                body_edit_audit = TicketBodyEditAudit::Partial {
+                    replacement_count: outcome.replacement_count,
+                };
+            }
+            if let Some(body) = updated_body.as_ref() {
                 conn.execute("UPDATE typed_tickets SET body = ?3, updated_at = ?4 WHERE workspace_id = ?1 AND ticket_id = ?2", params![self.workspace_id, ticket_id, body.as_str(), now]).map_err(sqlite_err)?;
             }
-            let event = TicketEvent { kind: TicketEventKind::Other("item_edit".to_string()), author: Some(edit.author.unwrap_or_else(default_author)), at: Some(now), status: None, from: None, to: None, reason: None, state_field: None, heading: Some("Item edit".to_string()), body: edit.body.unwrap_or_else(|| MarkdownText::new("Ticket item metadata updated.")), references: Vec::new(), attributes: BTreeMap::new() };
+
+            let mut changes = Vec::new();
+            if edit.title.is_some() {
+                changes.push("title");
+            }
+            if !matches!(body_edit_audit, TicketBodyEditAudit::None) {
+                changes.push("body");
+            }
+            let mut attributes = BTreeMap::new();
+            attributes.insert("changes".to_string(), changes.join(","));
+            let body = match body_edit_audit {
+                TicketBodyEditAudit::None => {
+                    MarkdownText::new(format!("Ticket item updated: {}.", changes.join(", ")))
+                }
+                TicketBodyEditAudit::WholeBody => {
+                    attributes.insert("body_edit".to_string(), "whole".to_string());
+                    MarkdownText::new(format!(
+                        "Ticket item updated: {}. Body was replaced as a whole.",
+                        changes.join(", ")
+                    ))
+                }
+                TicketBodyEditAudit::Partial { replacement_count } => {
+                    attributes.insert("body_edit".to_string(), "partial".to_string());
+                    attributes.insert(
+                        "replacement_count".to_string(),
+                        replacement_count.to_string(),
+                    );
+                    MarkdownText::new(format!(
+                        "Ticket item updated: {}. Body replacement applied to {replacement_count} occurrence(s).",
+                        changes.join(", ")
+                    ))
+                }
+            };
+            let event = TicketEvent { kind: TicketEventKind::Other("item_edit".to_string()), author: Some(edit.author.unwrap_or_else(default_author)), at: Some(now), status: None, from: None, to: None, reason: None, state_field: None, heading: Some("Item edit".to_string()), body, references: Vec::new(), attributes };
             self.insert_event(conn, &ticket_id, &event)?;
             self.load_ticket(conn, &ticket_id)
         })
@@ -3244,9 +3396,11 @@ impl TicketBackend for LocalTicketBackend {
     }
 
     fn edit_item(&self, id: TicketIdOrSlug, edit: TicketItemEdit) -> Result<Ticket> {
-        if edit.title.is_none() && edit.body.is_none() {
+        edit.validate_body_edit_request()?;
+        if !edit.has_changes() {
             return Err(TicketError::Conflict(
-                "TicketEditItem requires at least one of title or body".to_string(),
+                "TicketEditItem requires at least one of title, body, or body_replacement"
+                    .to_string(),
             ));
         }
         if let Some(title) = edit.title.as_deref() {
@@ -3259,6 +3413,7 @@ impl TicketBackend for LocalTicketBackend {
         let dir = self.find_ticket_dir(&id)?;
         let item = dir.join("item.md");
         let mut content = fs::read_to_string(&item).map_err(|e| io_err(&item, e))?;
+        let mut body_edit_audit = TicketBodyEditAudit::None;
         let mut updates = Vec::new();
         if let Some(title) = edit.title.as_deref() {
             updates.push(("title", title));
@@ -3278,6 +3433,23 @@ impl TicketBackend for LocalTicketBackend {
                     message,
                 }
             })?;
+            body_edit_audit = TicketBodyEditAudit::WholeBody;
+        }
+        if let Some(replacement) = edit.body_replacement.as_ref() {
+            let parsed = parse_item(&content).map_err(|message| TicketError::Parse {
+                path: item.clone(),
+                message,
+            })?;
+            let outcome = replacement.apply(parsed.body.as_str())?;
+            content = replace_item_body(&content, outcome.body.as_str()).map_err(|message| {
+                TicketError::Parse {
+                    path: item.clone(),
+                    message,
+                }
+            })?;
+            body_edit_audit = TicketBodyEditAudit::Partial {
+                replacement_count: outcome.replacement_count,
+            };
         }
         atomic_write(&item, content.as_bytes())?;
 
@@ -3286,17 +3458,41 @@ impl TicketBackend for LocalTicketBackend {
         if edit.title.is_some() {
             changes.push("title");
         }
-        if edit.body.is_some() {
+        if !matches!(body_edit_audit, TicketBodyEditAudit::None) {
             changes.push("body");
         }
-        let body = MarkdownText::new(format!("Ticket item updated: {}.", changes.join(", ")));
+        let mut attrs = Vec::new();
+        attrs.push(("changes", changes.join(",")));
+        let body = match body_edit_audit {
+            TicketBodyEditAudit::None => {
+                MarkdownText::new(format!("Ticket item updated: {}.", changes.join(", ")))
+            }
+            TicketBodyEditAudit::WholeBody => {
+                attrs.push(("body_edit", "whole".to_string()));
+                MarkdownText::new(format!(
+                    "Ticket item updated: {}. Body was replaced as a whole.",
+                    changes.join(", ")
+                ))
+            }
+            TicketBodyEditAudit::Partial { replacement_count } => {
+                attrs.push(("body_edit", "partial".to_string()));
+                attrs.push(("replacement_count", replacement_count.to_string()));
+                MarkdownText::new(format!(
+                    "Ticket item updated: {}. Body replacement applied to {replacement_count} occurrence(s).",
+                    changes.join(", ")
+                ))
+            }
+        };
         self.append_thread_event(
             &dir,
             "item_edit",
             self.generated_heading("Item updated", "項目更新"),
             &author,
             None,
-            &[],
+            &attrs
+                .iter()
+                .map(|(key, value)| (*key, value.as_str()))
+                .collect::<Vec<_>>(),
             &body,
         )?;
         self.ticket_from_dir(&dir)
@@ -5496,6 +5692,92 @@ mod tests {
         LocalTicketBackend::new(dir.path().join("tickets"))
     }
 
+    fn assert_partial_body_replacement_semantics<B: TicketBackend>(backend: &B) {
+        let mut input = NewTicket::new("Body Edit Ticket");
+        input.body = MarkdownText::new("alpha\nbeta\nalpha\n");
+        let created = backend.create(input).unwrap();
+
+        let edited = backend
+            .edit_item(
+                TicketIdOrSlug::Id(created.id.clone()),
+                TicketItemEdit {
+                    body_replacement: Some(TicketBodyReplacement {
+                        old_string: "alpha".to_string(),
+                        new_string: "ALPHA".to_string(),
+                        replace_all: true,
+                    }),
+                    author: Some("tester".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            edited.document.body.as_str().trim_start_matches('\n'),
+            "ALPHA\nbeta\nALPHA\n"
+        );
+        let edit_event = edited
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == TicketEventKind::Other("item_edit".to_string()))
+            .expect("item_edit event");
+        assert_eq!(
+            edit_event.attributes.get("body_edit"),
+            Some(&"partial".to_string())
+        );
+        assert_eq!(
+            edit_event.attributes.get("replacement_count"),
+            Some(&"2".to_string())
+        );
+        assert!(edit_event.body.as_str().contains("2 occurrence"));
+
+        let duplicate_err = backend
+            .edit_item(
+                TicketIdOrSlug::Id(created.id.clone()),
+                TicketItemEdit {
+                    body_replacement: Some(TicketBodyReplacement {
+                        old_string: "ALPHA".to_string(),
+                        new_string: "alpha".to_string(),
+                        replace_all: false,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(duplicate_err, TicketError::Conflict(_)));
+
+        let missing_err = backend
+            .edit_item(
+                TicketIdOrSlug::Id(created.id.clone()),
+                TicketItemEdit {
+                    body_replacement: Some(TicketBodyReplacement {
+                        old_string: "missing".to_string(),
+                        new_string: "present".to_string(),
+                        replace_all: false,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(missing_err, TicketError::NotFound(_)));
+
+        let ambiguous_err = backend
+            .edit_item(
+                TicketIdOrSlug::Id(created.id),
+                TicketItemEdit {
+                    body: Some(MarkdownText::new("whole body")),
+                    body_replacement: Some(TicketBodyReplacement {
+                        old_string: "beta".to_string(),
+                        new_string: "BETA".to_string(),
+                        replace_all: false,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(ambiguous_err, TicketError::Conflict(_)));
+    }
+
     fn summary_with_state(state: TicketWorkflowState) -> TicketSummary {
         TicketSummary {
             id: "000TEST".to_string(),
@@ -5808,6 +6090,20 @@ state: planning
         assert!(record.meta.workflow_state_explicit);
         let report = backend.doctor().unwrap();
         assert!(report.is_ok(), "{:?}", report.diagnostics);
+    }
+
+    #[test]
+    fn local_backend_edit_item_supports_partial_body_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let backend = backend(&tmp);
+        assert_partial_body_replacement_semantics(&backend);
+    }
+
+    #[test]
+    fn sqlite_backend_edit_item_supports_partial_body_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteTicketBackend::new(tmp.path().join("workspace.db"), "workspace-test");
+        assert_partial_body_replacement_semantics(&backend);
     }
 
     #[test]
