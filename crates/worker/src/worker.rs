@@ -507,8 +507,8 @@ pub struct Worker<C: LlmClient, St: Store> {
     /// [`Self::from_manifest`], or defaults to the builtin pack when a
     /// Worker is constructed through lower-level paths that have no loader.
     prompts: Arc<PromptCatalog>,
-    /// When true (default), the system-prompt assembler may append the
-    /// workspace memory summary (`memory/summary.md`). Internal disposable
+    /// When true (default), the system-prompt assembler may append resident
+    /// context from the workspace Memory document. Internal disposable
     /// workers disable this so resident memory exposure is opt-in per Worker.
     inject_resident_summary: bool,
     /// When true (default), the system-prompt assembler may append resident
@@ -833,7 +833,7 @@ impl<C: LlmClient, St: Store> Worker<C, St> {
         self.inject_resident_summary = enabled;
     }
 
-    /// Toggle `memory/summary.md` resident injection in the system prompt.
+    /// Toggle workspace Memory document resident injection in the system prompt.
     pub fn set_resident_summary_injection(&mut self, enabled: bool) {
         self.inject_resident_summary = enabled;
     }

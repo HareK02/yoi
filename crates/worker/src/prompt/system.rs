@@ -153,9 +153,9 @@ pub struct SystemPromptContext<'a> {
     /// Not visible from the template; consumed by the trailing-section
     /// formatter in [`SystemPromptTemplate::render`].
     pub agents_md: Option<String>,
-    /// The body of `<workspace>/.yoi/memory/summary.md`, with
-    /// frontmatter stripped. `None` disables the resident summary section;
-    /// empty strings are ignored by the trailing-section formatter.
+    /// The body of the workspace Memory document. `None` disables the
+    /// resident summary section; empty strings are ignored by the trailing-section
+    /// formatter.
     pub resident_summary: Option<&'a str>,
     /// Catalog used to render the fixed trailing section headers.
     /// Passed by reference so callers do not give up ownership across

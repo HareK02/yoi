@@ -80,8 +80,8 @@ pub enum WorkerPrompt {
     /// after the scope summary when an AGENTS.md is present.
     AgentsMdSection,
     /// Trailing `## Resident memory summary` section, appended after the
-    /// AGENTS.md section when memory is enabled, summary injection is enabled,
-    /// and `memory/summary.md` has a valid non-empty body.
+    /// AGENTS.md section when memory is enabled, resident injection is enabled,
+    /// and the workspace Memory document has a valid non-empty body.
     ResidentMemorySummarySection,
     /// Trailing Worker orchestration guidance, appended when registered tools
     /// include Worker-management capabilities.

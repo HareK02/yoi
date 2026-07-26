@@ -59,7 +59,10 @@ use crate::hosts::{
 };
 use crate::identity::WorkspaceIdentity;
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
-use crate::memory_staging::{MemoryStagingListResponse, list_memory_staging_from_authority};
+use crate::memory_staging::{
+    MemoryStagingListResponse, list_memory_staging_from_authority,
+    memory_staging_backlog_from_authority,
+};
 use crate::observation::{
     BackendObservationProxy, ObservationProxyError, RuntimeObservationClient,
     RuntimeObservationSource, RuntimeObservationSourceConfig,
@@ -1487,25 +1490,16 @@ async fn scoped_memory_consolidation(
     Json(operation): Json<MemoryConsolidateStagingOperation>,
 ) -> ApiResult<Json<MemoryConsolidationOutput>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let memory_config = manifest::MemoryConfig::default();
-    let layout = memory::WorkspaceLayout::resolve(&memory_config, &api.config.workspace_root);
-    Ok(Json(start_memory_staging_consolidation(
-        api, &layout, operation,
-    )?))
+    Ok(Json(start_memory_staging_consolidation(api, operation)?))
 }
 
 fn start_memory_staging_consolidation(
     api: WorkspaceApi,
-    layout: &memory::WorkspaceLayout,
     operation: MemoryConsolidateStagingOperation,
 ) -> ApiResult<MemoryConsolidationOutput> {
-    let snapshot = memory::consolidate::list_staging_entries_snapshot(layout);
-    let candidate_count = snapshot.entries.len();
-    let total_bytes = snapshot
-        .entries
-        .iter()
-        .map(|entry| entry.bytes)
-        .sum::<u64>();
+    let backlog = memory_staging_backlog_from_authority(&api.authority)?;
+    let candidate_count = backlog.candidate_count;
+    let total_bytes = backlog.total_bytes;
     if candidate_count == 0 {
         return Ok(MemoryConsolidationOutput {
             status: "skipped_empty".to_string(),
@@ -7219,6 +7213,62 @@ mod tests {
         config
     }
 
+    fn memory_staging_record_json(id: &str, claim: &str) -> String {
+        json!({
+            "schema_version": 1,
+            "id": id,
+            "extract_run_id": "extract-run-1",
+            "source": {
+                "segment_id": "segment-1",
+                "range": [0, 10],
+            },
+            "kind": "working_assumption",
+            "claim": claim,
+            "why_useful": "useful for future work",
+            "staleness": null,
+            "evidence": [],
+            "source_refs": [],
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn memory_consolidation_backlog_ignores_legacy_filesystem_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_server_config(dir.path());
+        let store = SqliteWorkspaceStore::open(&config.database_path).unwrap();
+        let api = WorkspaceApi::new_with_execution_backend(
+            config,
+            Arc::new(store),
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .await
+        .unwrap();
+        let legacy_staging_dir = dir.path().join(".yoi/memory/_staging");
+        fs::create_dir_all(&legacy_staging_dir).unwrap();
+        fs::write(
+            legacy_staging_dir.join("00000000001J4.json"),
+            memory_staging_record_json("00000000001J4", "legacy filesystem candidate"),
+        )
+        .unwrap();
+
+        let output = match start_memory_staging_consolidation(
+            api,
+            MemoryConsolidateStagingOperation {
+                force: true,
+                threshold_files: None,
+                threshold_bytes: None,
+            },
+        ) {
+            Ok(output) => output,
+            Err(_) => panic!("unexpected ApiError from memory consolidation trigger"),
+        };
+
+        assert_eq!(output.status, "skipped_empty");
+        assert_eq!(output.candidate_count, 0);
+        assert_eq!(output.total_bytes, 0);
+    }
+
     fn init_clean_git_workspace(path: &std::path::Path) {
         for args in [
             vec!["init"],
@@ -8377,7 +8427,7 @@ mod tests {
             .upsert_memory_staging_record(&MemoryStagingRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 candidate_id: "00000000001J4".to_string(),
-                raw_json: r#"{"id":"00000000001J4","kind":"working_assumption"}"#.to_string(),
+                raw_json: memory_staging_record_json("00000000001J4", "SQLite memory candidate"),
                 source_path: None,
                 imported_at: "2026-01-01T00:00:00Z".to_string(),
             })
@@ -8507,6 +8557,22 @@ mod tests {
         assert_eq!(
             scoped_objective["resources"][0]["path"],
             "memory-architecture-overview.md"
+        );
+
+        let memory_staging = get_json(
+            app.clone(),
+            &format!("/api/w/{TEST_WORKSPACE_ID}/memory/staging?limit=10"),
+        )
+        .await;
+        assert_eq!(
+            memory_staging["record_authority"],
+            "sqlite_workspace_authority.memory_staging"
+        );
+        assert_eq!(memory_staging["total_valid_count"], 1);
+        assert_eq!(memory_staging["invalid_count"], 0);
+        assert_eq!(
+            memory_staging["items"][0]["record"]["claim"],
+            "SQLite memory candidate"
         );
 
         let repositories = get_json(app.clone(), "/api/repositories").await;
