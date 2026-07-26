@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
@@ -55,9 +55,10 @@ use crate::hosts::{
     HostSummary, RemoteRuntimeConfig, RemoteWorkerRuntime, RuntimeDiagnostic, RuntimeRegistry,
     RuntimeRegistryError, RuntimeRegistryUnregisterResult, RuntimeSummary, WorkerCapabilitySummary,
     WorkerCompletionsRequest, WorkerCompletionsResult, WorkerImplementationSummary,
-    WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest, WorkerLifecycleResult,
-    WorkerOperationState, WorkerSpawnAcceptanceRequirement, WorkerSpawnIntent, WorkerSpawnRequest,
-    WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest, WorkerSummary, WorkerWorkspaceSummary,
+    WorkerInputKind, WorkerInputRequest, WorkerInputResult, WorkerLifecycleRequest,
+    WorkerLifecycleResult, WorkerOperationState, WorkerSpawnAcceptanceRequirement,
+    WorkerSpawnIntent, WorkerSpawnRequest, WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest,
+    WorkerSummary, WorkerWorkspaceSummary,
 };
 use crate::identity::WorkspaceIdentity;
 use crate::memory_backend::execute_memory_backend_operation_with_authority;
@@ -236,7 +237,6 @@ pub struct WorkspaceApi {
     store: Arc<dyn ControlPlaneStore>,
     authority: SqliteWorkspaceAuthority,
     runtime: Arc<RuntimeRegistry>,
-    memory_consolidater_worker: Arc<Mutex<Option<(String, String)>>>,
     companion: Arc<CompanionConsole>,
     observation_proxy: BackendObservationProxy,
     resource_broker: BackendResourceBroker,
@@ -340,7 +340,6 @@ impl WorkspaceApi {
             config,
             store,
             runtime,
-            memory_consolidater_worker: Arc::new(Mutex::new(None)),
             companion,
             observation_proxy,
             resource_broker,
@@ -1514,6 +1513,9 @@ async fn scoped_memory_backend_operation(
     Ok(Json(response))
 }
 
+const MEMORY_CONSOLIDATION_PROFILE: &str = "memory-consolidation";
+const MEMORY_CONSOLIDATION_WORKER_SCAN_LIMIT: usize = 100;
+
 async fn scoped_memory_consolidation(
     State(api): State<WorkspaceApi>,
     AxumPath(path): AxumPath<ScopedWorkspacePath>,
@@ -1556,67 +1558,27 @@ fn start_memory_staging_consolidation(
     }
 
     let runtime_id = select_memory_consolidation_runtime(&api)?;
-    if let Some((existing_runtime_id, existing_worker_id)) = api
-        .memory_consolidater_worker
-        .lock()
-        .expect("memory consolidater worker lock poisoned")
-        .clone()
-    {
-        match api
-            .runtime
-            .worker(&existing_runtime_id, &existing_worker_id)
-        {
-            Ok(worker) if worker.state == "idle" => {
-                let delete = api
-                    .runtime
-                    .delete_worker(&existing_runtime_id, &existing_worker_id)
-                    .map_err(|err| err.into_error())?;
-                if delete.state != WorkerOperationState::Accepted || !delete.deleted {
-                    return Ok(MemoryConsolidationOutput {
-                        status: "skipped_existing_not_idle".to_string(),
-                        summary: format!(
-                            "Existing Memory consolidater '{}' was idle but could not be deleted.",
-                            existing_worker_id
-                        ),
-                        candidate_count,
-                        total_bytes,
-                    });
-                }
-                *api.memory_consolidater_worker
-                    .lock()
-                    .expect("memory consolidater worker lock poisoned") = None;
-            }
-            Ok(worker) => {
-                return Ok(MemoryConsolidationOutput {
-                    status: "skipped_existing_not_idle".to_string(),
-                    summary: format!(
-                        "Existing Memory consolidater '{}' is '{}', not confirmed idle.",
-                        existing_worker_id, worker.state
-                    ),
-                    candidate_count,
-                    total_bytes,
-                });
-            }
-            Err(_) => {
-                *api.memory_consolidater_worker
-                    .lock()
-                    .expect("memory consolidater worker lock poisoned") = None;
-            }
-        }
+    let input_content = memory_consolidation_input_content(candidate_count, total_bytes);
+    if let Some(output) = try_reuse_memory_consolidation_worker(
+        &api,
+        &runtime_id,
+        &input_content,
+        candidate_count,
+        total_bytes,
+    )? {
+        return Ok(output);
     }
 
-    let profile_selector = ProfileSelector::Builtin("memory-consolidation".to_string());
+    let profile_selector = ProfileSelector::Builtin(MEMORY_CONSOLIDATION_PROFILE.to_string());
     let resolved_config_bundle = crate::profile_settings::build_workspace_profile_config_bundle(
         &api.config.workspace_root,
         &api.config.workspace_id,
         &api.config.workspace_created_at,
-        "memory-consolidation",
+        MEMORY_CONSOLIDATION_PROFILE,
     )?;
     let input = EmbeddedWorkerInput {
         kind: EmbeddedWorkerInputKind::User,
-        content: format!(
-            "Process pending Memory staging candidates through MemoryStagingList, MemoryStagingRead, Memory tools, and MemoryStagingClose. Current backlog: {candidate_count} candidate(s), {total_bytes} byte(s)."
-        ),
+        content: input_content,
         segments: None,
     };
     let result = api
@@ -1624,7 +1586,7 @@ fn start_memory_staging_consolidation(
         .spawn_worker(
             &runtime_id,
             WorkerSpawnRequest {
-                requested_worker_name: Some("memory-consolidation".to_string()),
+                requested_worker_name: Some(MEMORY_CONSOLIDATION_PROFILE.to_string()),
                 intent: WorkerSpawnIntent::WorkspaceOrchestrator,
                 acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
                     expected_segments: 1,
@@ -1656,10 +1618,6 @@ fn start_memory_staging_consolidation(
             total_bytes,
         });
     };
-    *api.memory_consolidater_worker
-        .lock()
-        .expect("memory consolidater worker lock poisoned") =
-        Some((worker.runtime_id.clone(), worker.worker_id.clone()));
     Ok(MemoryConsolidationOutput {
         status: "started".to_string(),
         summary: format!(
@@ -1669,6 +1627,88 @@ fn start_memory_staging_consolidation(
         candidate_count,
         total_bytes,
     })
+}
+
+fn try_reuse_memory_consolidation_worker(
+    api: &WorkspaceApi,
+    runtime_id: &str,
+    input_content: &str,
+    candidate_count: usize,
+    total_bytes: u64,
+) -> ApiResult<Option<MemoryConsolidationOutput>> {
+    let workers = api
+        .runtime
+        .list_workers_for_runtime(runtime_id, MEMORY_CONSOLIDATION_WORKER_SCAN_LIMIT)
+        .map_err(|err| err.into_error())?;
+    let mut consolidaters = workers
+        .items
+        .into_iter()
+        .filter(is_memory_consolidation_worker)
+        .collect::<Vec<_>>();
+    if consolidaters.is_empty() {
+        return Ok(None);
+    }
+    consolidaters.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
+    if let Some(worker) = consolidaters.iter().find(|worker| worker.state != "idle") {
+        return Ok(Some(MemoryConsolidationOutput {
+            status: "skipped_existing_not_idle".to_string(),
+            summary: format!(
+                "Existing Memory consolidater '{}' is '{}', not confirmed idle.",
+                worker.worker_id, worker.state
+            ),
+            candidate_count,
+            total_bytes,
+        }));
+    }
+    let worker = consolidaters
+        .first()
+        .expect("non-empty consolidater list")
+        .clone();
+    let input = api
+        .runtime
+        .send_input(
+            &worker.runtime_id,
+            &worker.worker_id,
+            WorkerInputRequest {
+                kind: WorkerInputKind::User,
+                content: input_content.to_string(),
+                segments: None,
+            },
+        )
+        .map_err(|err| err.into_error())?;
+    if input.state != WorkerOperationState::Accepted {
+        return Ok(Some(MemoryConsolidationOutput {
+            status: "skipped_existing_input_rejected".to_string(),
+            summary: format!(
+                "Existing idle Memory consolidater '{}' rejected the new consolidation input.",
+                worker.worker_id
+            ),
+            candidate_count,
+            total_bytes,
+        }));
+    }
+    Ok(Some(MemoryConsolidationOutput {
+        status: "reused".to_string(),
+        summary: format!(
+            "Reused Memory consolidater '{}' for {candidate_count} staging candidate(s).",
+            worker.worker_id
+        ),
+        candidate_count,
+        total_bytes,
+    }))
+}
+
+fn is_memory_consolidation_worker(worker: &WorkerSummary) -> bool {
+    [worker.profile.as_deref(), worker.role.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|value| value == MEMORY_CONSOLIDATION_PROFILE)
+}
+
+fn memory_consolidation_input_content(candidate_count: usize, total_bytes: u64) -> String {
+    format!(
+        "Process pending Memory staging candidates through MemoryStagingList, MemoryStagingRead, Memory tools, and MemoryStagingClose. Current backlog: {candidate_count} candidate(s), {total_bytes} byte(s)."
+    )
 }
 
 fn select_memory_consolidation_runtime(api: &WorkspaceApi) -> ApiResult<String> {
@@ -7297,6 +7337,89 @@ mod tests {
         assert_eq!(output.status, "skipped_empty");
         assert_eq!(output.candidate_count, 0);
         assert_eq!(output.total_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn memory_consolidation_reuses_existing_idle_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_server_config(dir.path());
+        let store = SqliteWorkspaceStore::open(&config.database_path).unwrap();
+        let api = WorkspaceApi::new_with_execution_backend(
+            config,
+            Arc::new(store),
+            Arc::new(DeterministicExecutionBackend::default()),
+        )
+        .await
+        .unwrap();
+        api.authority
+            .upsert_memory_staging_record(
+                "00000000000000000000000001",
+                &memory_staging_record_json("00000000000000000000000001", "first candidate"),
+                None,
+            )
+            .unwrap();
+
+        let resolved_config_bundle =
+            crate::profile_settings::build_workspace_profile_config_bundle(
+                &api.config.workspace_root,
+                &api.config.workspace_id,
+                &api.config.workspace_created_at,
+                MEMORY_CONSOLIDATION_PROFILE,
+            )
+            .unwrap();
+        let existing = api
+            .runtime
+            .spawn_worker(
+                EMBEDDED_WORKER_RUNTIME_ID,
+                WorkerSpawnRequest {
+                    requested_worker_name: Some(MEMORY_CONSOLIDATION_PROFILE.to_string()),
+                    intent: WorkerSpawnIntent::WorkspaceOrchestrator,
+                    acceptance: WorkerSpawnAcceptanceRequirement::RunAccepted {
+                        expected_segments: 0,
+                    },
+                    profile: Some(ProfileSelector::Builtin(
+                        MEMORY_CONSOLIDATION_PROFILE.to_string(),
+                    )),
+                    initial_input: None,
+                    working_directory_request: None,
+                    resolved_working_directory_request: None,
+                    resolved_working_directory: None,
+                    resolved_config_bundle,
+                },
+            )
+            .unwrap();
+        assert_eq!(existing.state, WorkerOperationState::Accepted);
+        let worker_id = existing.worker.unwrap().worker_id;
+        let worker = api
+            .runtime
+            .worker(EMBEDDED_WORKER_RUNTIME_ID, &worker_id)
+            .unwrap();
+        assert_eq!(worker.state, "idle");
+
+        let second = match start_memory_staging_consolidation(
+            api.clone(),
+            MemoryConsolidateStagingOperation {
+                force: true,
+                threshold_files: None,
+                threshold_bytes: None,
+            },
+        ) {
+            Ok(output) => output,
+            Err(_) => panic!("unexpected ApiError from second memory consolidation trigger"),
+        };
+        assert_eq!(second.status, "reused");
+        assert!(second.summary.contains(&worker_id));
+        let workers_after_second = api
+            .runtime
+            .list_workers_for_runtime(EMBEDDED_WORKER_RUNTIME_ID, 20)
+            .unwrap();
+        let consolidaters_after_second = workers_after_second
+            .items
+            .iter()
+            .filter(|worker| is_memory_consolidation_worker(worker))
+            .collect::<Vec<_>>();
+        assert_eq!(consolidaters_after_second.len(), 1);
+        assert_eq!(consolidaters_after_second[0].worker_id, worker_id);
     }
 
     fn init_clean_git_workspace(path: &std::path::Path) {
