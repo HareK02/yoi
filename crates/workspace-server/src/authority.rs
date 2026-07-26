@@ -17,8 +17,8 @@ const DETAIL_BODY_LIMIT: usize = 64 * 1024;
 /// Workspace-scoped runtime authority for project resources.
 ///
 /// Normal Backend API handlers should depend on this authority abstraction, not
-/// on legacy filesystem layouts. Filesystem readers belong in explicit import
-/// / migration helpers such as `objective_import`.
+/// on legacy filesystem layouts. Filesystem readers belong in explicitly
+/// temporary migration/repair tools and tests, not normal runtime authority paths.
 pub trait WorkspaceAuthority: ObjectiveAuthority + TicketAuthority + MemoryAuthorityMarker {}
 
 impl<T> WorkspaceAuthority for T where
@@ -216,7 +216,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::store::WorkspaceRecord;
+    use crate::store::{ObjectiveRecord, ObjectiveTicketLinkRecord, WorkspaceRecord};
 
     #[tokio::test]
     async fn sqlite_workspace_authority_reads_sqlite_records_without_filesystem_authority() {
@@ -228,7 +228,6 @@ mod tests {
                 dir.path().join(".yoi/tickets"),
             ))
             .unwrap();
-        write_objective(dir.path(), "00000000001J3", "Control plane", "active");
         let store = SqliteWorkspaceStore::open(&db_path).unwrap();
         store
             .upsert_workspace(&WorkspaceRecord {
@@ -241,12 +240,30 @@ mod tests {
             })
             .await
             .unwrap();
-        crate::objective_import::import_legacy_objectives_and_memory_staging(
-            dir.path(),
-            "workspace-test",
-            &store,
-        )
-        .unwrap();
+        store
+            .upsert_objective(&ObjectiveRecord {
+                workspace_id: "workspace-test".to_string(),
+                objective_id: "00000000001J3".to_string(),
+                title: "Control plane".to_string(),
+                state: "active".to_string(),
+                body_md: "Objective body.\n".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-02T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        store
+            .replace_objective_ticket_links(
+                "workspace-test",
+                "00000000001J3",
+                &[ObjectiveTicketLinkRecord {
+                    workspace_id: "workspace-test".to_string(),
+                    objective_id: "00000000001J3".to_string(),
+                    ticket_id: "00000000001J2".to_string(),
+                    kind: "linked".to_string(),
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                }],
+            )
+            .unwrap();
         write_objective(
             dir.path(),
             "00000000001J4",

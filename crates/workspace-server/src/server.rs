@@ -6607,7 +6607,10 @@ mod tests {
         TicketWorkerRole, WorkerInputKind, WorkerOperationState, WorkerSpawnAcceptanceRequirement,
         WorkerSpawnIntent,
     };
-    use crate::store::SqliteWorkspaceStore;
+    use crate::store::{
+        MemoryStagingRecord, ObjectiveRecord, ObjectiveResourceRecord, ObjectiveTicketLinkRecord,
+        SqliteWorkspaceStore,
+    };
 
     const TEST_WORKSPACE_ID: &str = "0192f0e8-4d84-7d6e-a000-000000000001";
     const TEST_REPOSITORY_ID: &str = "main";
@@ -8309,8 +8312,6 @@ mod tests {
     #[tokio::test]
     async fn serves_bounded_read_apis_and_static_spa_separately() {
         let dir = tempfile::tempdir().unwrap();
-        write_objective(dir.path(), "00000000001J3", "API Objective", "active");
-        write_memory_staging(dir.path(), "00000000001J4");
         let static_dir = dir.path().join("static");
         std::fs::create_dir_all(static_dir.join("assets")).unwrap();
         std::fs::write(static_dir.join("index.html"), "<main>Yoi Workspace</main>").unwrap();
@@ -8336,12 +8337,50 @@ mod tests {
             })
             .await
             .unwrap();
-        crate::objective_import::import_legacy_objectives_and_memory_staging(
-            dir.path(),
-            TEST_WORKSPACE_ID,
-            &sqlite_store,
-        )
-        .unwrap();
+        sqlite_store
+            .upsert_objective(&ObjectiveRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                objective_id: "00000000001J3".to_string(),
+                title: "API Objective".to_string(),
+                state: "active".to_string(),
+                body_md: "Objective body.\n".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-02T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        sqlite_store
+            .replace_objective_ticket_links(
+                TEST_WORKSPACE_ID,
+                "00000000001J3",
+                &[ObjectiveTicketLinkRecord {
+                    workspace_id: TEST_WORKSPACE_ID.to_string(),
+                    objective_id: "00000000001J3".to_string(),
+                    ticket_id: "00000000001J2".to_string(),
+                    kind: "linked".to_string(),
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                }],
+            )
+            .unwrap();
+        sqlite_store
+            .upsert_objective_resource(&ObjectiveResourceRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                objective_id: "00000000001J3".to_string(),
+                resource_path: "memory-architecture-overview.md".to_string(),
+                body: "# Memory architecture\n\nResource body.\n".to_string(),
+                media_type: Some("text/markdown".to_string()),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-02T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        sqlite_store
+            .upsert_memory_staging_record(&MemoryStagingRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                candidate_id: "00000000001J4".to_string(),
+                raw_json: r#"{"id":"00000000001J4","kind":"working_assumption"}"#.to_string(),
+                source_path: None,
+                imported_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .unwrap();
         assert_eq!(
             sqlite_store
                 .count_memory_staging_records(TEST_WORKSPACE_ID)
@@ -9361,25 +9400,6 @@ mod tests {
         let mut input = ticket::NewTicket::new(title);
         input.workflow_state = Some(state);
         backend.create(input).unwrap();
-    }
-
-    fn write_memory_staging(root: &Path, candidate_id: &str) {
-        let staging_dir = root.join(".yoi/memory/_staging");
-        std::fs::create_dir_all(&staging_dir).unwrap();
-        std::fs::write(
-            staging_dir.join(format!("{candidate_id}.json")),
-            format!(
-                r#"{{
-  "schema_version": 2,
-  "id": "{candidate_id}",
-  "kind": "working_assumption",
-  "claim": "Objective staging import test",
-  "why_useful": "Verifies SQLite push"
-}}
-"#,
-            ),
-        )
-        .unwrap();
     }
 
     fn write_objective(root: &Path, id: &str, title: &str, state: &str) {

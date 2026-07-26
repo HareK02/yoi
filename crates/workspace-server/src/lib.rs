@@ -11,7 +11,6 @@ pub mod config;
 pub mod hosts;
 pub mod identity;
 pub mod memory_staging;
-pub mod objective_import;
 pub mod observation;
 pub mod profile_settings;
 pub mod records;
