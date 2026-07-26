@@ -13,6 +13,7 @@ use std::{
     sync::{Arc, RwLock},
     time::Duration,
 };
+use worker_runtime::auth::{CapabilityTokenSigner, capability_claims};
 use worker_runtime::catalog::{
     ConfigBundleRef, CreateWorkerRequest, ProfileSelector, ProfileSourceArchiveHttpRef,
     ProfileSourceArchiveSource, WorkerDetail as EmbeddedWorkerDetail,
@@ -2015,9 +2016,16 @@ pub struct RemoteRuntimeConfig {
     pub display_name: String,
     pub base_url: String,
     pub bearer_token: Option<String>,
+    pub auth: Option<RemoteRuntimeAuthConfig>,
     pub cached_capabilities: RuntimeCapabilitySummary,
     pub cached_status: String,
     pub timeout: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteRuntimeAuthConfig {
+    pub server_id: String,
+    pub server_private_key: String,
 }
 
 impl std::fmt::Debug for RemoteRuntimeConfig {
@@ -2030,6 +2038,7 @@ impl std::fmt::Debug for RemoteRuntimeConfig {
                 "bearer_token",
                 &self.bearer_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("auth", &self.auth.as_ref().map(|_| "<capability-signer>"))
             .field("cached_capabilities", &self.cached_capabilities)
             .field("cached_status", &self.cached_status)
             .field("timeout", &self.timeout)
@@ -2049,6 +2058,7 @@ impl RemoteRuntimeConfig {
             display_name: display_name.into(),
             base_url: base_url.into(),
             bearer_token,
+            auth: None,
             cached_capabilities: remote_runtime_capabilities(
                 200, false, false, "unknown", "unknown",
             ),
@@ -2059,6 +2069,11 @@ impl RemoteRuntimeConfig {
 
     pub fn with_cached_capabilities(mut self, capabilities: RuntimeCapabilitySummary) -> Self {
         self.cached_capabilities = capabilities;
+        self
+    }
+
+    pub fn with_auth(mut self, auth: RemoteRuntimeAuthConfig) -> Self {
+        self.auth = Some(auth);
         self
     }
 
@@ -2081,11 +2096,27 @@ pub struct RemoteWorkerRuntime {
     backend_base_url: String,
     workspace_id: String,
     bearer_token: Option<String>,
+    auth: Option<RemoteRuntimeAuthConfig>,
     cached_capabilities: RuntimeCapabilitySummary,
     cached_status: String,
     host_id: String,
     resource_broker: BackendResourceBroker,
     http: BlockingHttpClient,
+}
+
+fn all_remote_runtime_permissions() -> Vec<String> {
+    [
+        "workers:list",
+        "workers:create",
+        "workers:read",
+        "workers:delete",
+        "workers:input",
+        "workers:stop",
+        "workers:protocol",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 impl RemoteWorkerRuntime {
@@ -2112,6 +2143,7 @@ impl RemoteWorkerRuntime {
             backend_base_url: backend_base_url.trim_end_matches('/').to_string(),
             workspace_id,
             bearer_token: config.bearer_token,
+            auth: config.auth,
             cached_capabilities: config.cached_capabilities,
             cached_status: config.cached_status,
             resource_broker: BackendResourceBroker::default(),
@@ -2150,7 +2182,7 @@ impl RemoteWorkerRuntime {
     where
         T: DeserializeOwned + Send + 'static,
     {
-        self.send_json(self.http.get(self.endpoint(path)))
+        self.send_json(path, self.http.get(self.endpoint(path)))
     }
 
     fn post_json<B, T>(&self, path: &str, body: &B) -> Result<T, RuntimeDiagnostic>
@@ -2158,25 +2190,56 @@ impl RemoteWorkerRuntime {
         B: Serialize + ?Sized,
         T: DeserializeOwned + Send + 'static,
     {
-        self.send_json(self.http.post(self.endpoint(path)).json(body))
+        self.send_json(path, self.http.post(self.endpoint(path)).json(body))
     }
 
     fn delete_json<T>(&self, path: &str) -> Result<T, RuntimeDiagnostic>
     where
         T: DeserializeOwned + Send + 'static,
     {
-        self.send_json(self.http.delete(self.endpoint(path)))
+        self.send_json(path, self.http.delete(self.endpoint(path)))
     }
 
-    fn send_json<T>(&self, request: RequestBuilder) -> Result<T, RuntimeDiagnostic>
+    fn runtime_capability_token(&self, path: &str) -> Option<String> {
+        let auth = self.auth.as_ref()?;
+        let signer = CapabilityTokenSigner::new(&auth.server_id, &auth.server_private_key);
+        let claims = capability_claims(
+            &auth.server_id,
+            &self.runtime_id,
+            &self.workspace_id,
+            all_remote_runtime_permissions(),
+            300,
+        )
+        .map_err(|error| {
+            eprintln!(
+                "failed to build Runtime capability claims for {} {}: {error}",
+                self.runtime_id, path
+            );
+            error
+        })
+        .ok()?;
+        signer
+            .sign(&claims)
+            .map_err(|error| {
+                eprintln!(
+                    "failed to sign Runtime capability token for {} {}: {error}",
+                    self.runtime_id, path
+                );
+                error
+            })
+            .ok()
+    }
+
+    fn send_json<T>(&self, path: &str, request: RequestBuilder) -> Result<T, RuntimeDiagnostic>
     where
         T: DeserializeOwned + Send + 'static,
     {
         let runtime_id = self.runtime_id.clone();
         let bearer_token = self.bearer_token.clone();
+        let capability_token = self.runtime_capability_token(path);
         run_blocking_http(move || {
             let request = request.header(CONTENT_TYPE, "application/json");
-            let request = if let Some(token) = bearer_token.as_deref() {
+            let request = if let Some(token) = capability_token.as_deref().or(bearer_token.as_deref()) {
                 request.header(AUTHORIZATION, format!("Bearer {token}"))
             } else {
                 request
@@ -2653,7 +2716,9 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
                 runtime_id: self.runtime_id.clone(),
                 worker_id: worker_id.to_string(),
                 endpoint: self.ws_endpoint(worker_id),
-                bearer_token: self.bearer_token.clone(),
+                bearer_token: self
+                    .runtime_capability_token(&format!("/v1/workers/{worker_id}/protocol"))
+                    .or_else(|| self.bearer_token.clone()),
             },
         ))
     }

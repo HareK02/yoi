@@ -259,6 +259,9 @@ fn parse_args_slice(args: &[String]) -> Result<Mode, ParseError> {
         "workspace" => {
             return parse_workspace_args(&args[1..]);
         }
+        "server" => {
+            return parse_workspace_args(&args[1..]);
+        }
         "login" => {
             return parse_login_args(&args[1..]);
         }
@@ -1026,7 +1029,7 @@ fn yoi_config_dir() -> Option<PathBuf> {
 fn parse_workspace_args(args: &[String]) -> Result<Mode, ParseError> {
     let Some((subcommand, rest)) = args.split_first() else {
         return Err(ParseError(
-            "yoi workspace requires `init`, `config`, or `serve` (try `yoi workspace --help`)"
+            "yoi workspace requires `init`, `config`, `identity`, `trust-runtime`, or `serve` (try `yoi workspace --help`)"
                 .to_string(),
         ));
     };
@@ -1049,6 +1052,15 @@ fn parse_workspace_args(args: &[String]) -> Result<Mode, ParseError> {
                 args: rest.to_vec(),
             })
         }
+        "identity" | "trust-runtime" => {
+            if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
+                return Ok(Mode::WorkspaceHelp);
+            }
+            Ok(Mode::WorkspaceServer {
+                subcommand: subcommand.clone(),
+                args: rest.to_vec(),
+            })
+        }
         "serve" => {
             if rest.iter().any(|arg| arg == "--help" || arg == "-h") {
                 return Ok(Mode::WorkspaceHelp);
@@ -1060,7 +1072,7 @@ fn parse_workspace_args(args: &[String]) -> Result<Mode, ParseError> {
         }
         "--help" | "-h" => Ok(Mode::WorkspaceHelp),
         other => Err(ParseError(format!(
-            "unknown yoi workspace subcommand `{other}`; expected `init`, `config`, or `serve`"
+            "unknown yoi workspace subcommand `{other}`; expected `init`, `config`, `identity`, `trust-runtime`, or `serve`"
         ))),
     }
 }
@@ -1442,13 +1454,18 @@ fn print_help() {
     println!(
         "yoi\n\nUsage:\n  yoi [OPTIONS]\n  yoi resume [--workspace <PATH>] [--all]\n  yoi workers [--workspace <PATH>] [--workspace-id <ID>] [--backend <URL>] [--runtime-id <ID>]\n  yoi panel [--workspace <PATH>]\n  yoi keys\n  yoi setup-model\n  yoi worker [WORKER_OPTIONS]\n  yoi worker delete <NAME> [--force] [--dry-run]\n  yoi worker prune --older-than <DURATION> [--force] [--dry-run]\n  yoi objective <COMMAND> [OPTIONS]\n  yoi session analyze <SESSION_JSONL_PATH> --json\n  yoi session prune --unreferenced [--older-than <DURATION>] [--force] [--dry-run]\n  yoi ticket <COMMAND> [OPTIONS]\n  yoi workspace init [OPTIONS]
   yoi workspace config <COMMAND> [OPTIONS]
-  yoi workspace serve [OPTIONS]\n  yoi plugin new <rust-component-tool|rust-component-service> <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Worker chat/client surface (default, --worker, yoi resume, Backend Runtime target)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n      --workspace <PATH> Runtime workspace root for default Console/--worker/workers (defaults to cwd)\n      --workspace-id <ID> Workspace identity for Backend scoped routes\n      --backend <URL>    Workspace Backend API URL for Backend Runtime attach/list\n      --runtime-id <ID>  Backend Runtime identity for attach/list\n      --worker <NAME>       Open the Worker Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Worker Console to a specific socket with --worker\n      --session <UUID>   Resume a specific session segment in the Worker Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
+  yoi workspace identity <COMMAND> [OPTIONS]
+  yoi workspace trust-runtime <COMMAND> [OPTIONS]
+  yoi workspace serve [OPTIONS]
+  yoi server identity <COMMAND> [OPTIONS]
+  yoi server trust-runtime <COMMAND> [OPTIONS]
+  yoi plugin new <rust-component-tool|rust-component-service> <PATH> [--json]\n  yoi plugin check <PATH_OR_PACKAGE> [--json]\n  yoi plugin pack <PATH> [--output <FILE>] [--json]\n  yoi plugin list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi plugin show <REF> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp list [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp show <SERVER> [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi mcp tools|resources|prompts [SERVER] [--workspace <PATH>] [--profile <REF>] [--json]\n  yoi memory lint [OPTIONS]\n\nSurfaces:\n  Console   Single-Worker chat/client surface (default, --worker, yoi resume, Backend Runtime target)\n  Dashboard Workspace cockpit/action surface (yoi panel)\n  TUI       Terminal UI implementation umbrella for Console and Dashboard\n\nOptions:\n      --workspace <PATH> Runtime workspace root for default Console/--worker/workers (defaults to cwd)\n      --workspace-id <ID> Workspace identity for Backend scoped routes\n      --backend <URL>    Workspace Backend API URL for Backend Runtime attach/list\n      --runtime-id <ID>  Backend Runtime identity for attach/list\n      --worker <NAME>       Open the Worker Console by name (attach/restore/create)\n      --socket <PATH>    Attach a Worker Console to a specific socket with --worker\n      --session <UUID>   Resume a specific session segment in the Worker Console\n      --profile <REF>    Select a reusable Profile recipe\n  -h, --help             Print help\n"
     );
 }
 
 fn print_workspace_help() {
     println!(
-        "yoi workspace\n\nUsage:\n  yoi workspace init [OPTIONS]\n  yoi workspace config <COMMAND> [OPTIONS]\n  yoi workspace serve [OPTIONS]\n\nDescription:\n  Launches the separate yoi-workspace-server executable. The yoi binary does not link the workspace server crate. `serve` reads Workspace records from the Yoi server DB.\n\nSubcommands:\n  init            Initialize .yoi/workspace.toml, .yoi/workspace-backend.local.toml, and a server DB Workspace record\n  config default  Print the latest packaged Backend config template\n  config diff     Compare workspace local config with the packaged template\n  serve           Serve the Workspace recorded in the server DB\n\nOptions forwarded to init/config diff:\n      --workspace <PATH>  Workspace root (defaults to cwd)\n\nOptions forwarded to serve:\n      --listen <ADDR>     Listen address override\n  -h, --help              Print help\n\nEnvironment:\n  YOI_WORKSPACE_SERVER_COMMAND  Path to yoi-workspace-server executable override\n"
+        "yoi workspace\n\nUsage:\n  yoi workspace init [OPTIONS]\n  yoi workspace config <COMMAND> [OPTIONS]\n  yoi workspace identity <COMMAND> [OPTIONS]\n  yoi workspace trust-runtime <COMMAND> [OPTIONS]\n  yoi workspace serve [OPTIONS]\n  yoi server identity <COMMAND> [OPTIONS]\n  yoi server trust-runtime <COMMAND> [OPTIONS]\n\nDescription:\n  Launches the separate yoi-workspace-server executable. The yoi binary does not link the workspace server crate. `serve` reads Workspace records from the Yoi server DB.\n\nSubcommands:\n  init            Initialize .yoi/workspace.toml, .yoi/workspace-backend.local.toml, and a server DB Workspace record\n  config default  Print the latest packaged Backend config template\n  config diff     Compare workspace local config with the packaged template\n  identity        Initialize/show the Server signing identity\n  trust-runtime   Register/list/revoke trusted remote Runtime records\n  serve           Serve the Workspace recorded in the server DB\n\nOptions forwarded to init/config diff:\n      --workspace <PATH>  Workspace root (defaults to cwd)\n\nOptions forwarded to serve:\n      --listen <ADDR>     Listen address override\n  -h, --help              Print help\n\nEnvironment:\n  YOI_WORKSPACE_SERVER_COMMAND  Path to yoi-workspace-server executable override\n"
     );
 }
 
