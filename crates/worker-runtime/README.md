@@ -10,7 +10,7 @@ From the repository root:
 cargo run -p worker-runtime \
   --features ws-server,fs-store \
   --bin worker-runtime-rest-server \
-  -- --workspace .
+  -- --bind 127.0.0.1:38800
 ```
 
 By default the server listens on:
@@ -25,9 +25,8 @@ To bind another address explicitly:
 cargo run -p worker-runtime \
   --features ws-server,fs-store \
   --bin worker-runtime-rest-server \
-  -- --workspace . --bind 127.0.0.1:38800
+  -- --bind 0.0.0.0:38800
 ```
 
-`--workspace` is currently a legacy bootstrap input for the v0 local materializer / Worker profile resolution path. It is not intended to be the long-term Runtime identity or a single-workspace binding. Future Runtime launches should receive Workspace / Repository context through Worker launch requests and config bundles instead.
-
 The REST server is intended for a trusted Backend/proxy, not direct browser access.
+For authenticated remote Runtime setup, see [`../../docs/development/server-runtime-auth.md`](../../docs/development/server-runtime-auth.md).

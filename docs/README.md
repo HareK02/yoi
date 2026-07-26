@@ -16,8 +16,9 @@ It is not a dumping ground for external research, old plans, API inventories, or
 8. [`design/memory-knowledge.md`](design/memory-knowledge.md) — generated memory and audit records.
 9. [`design/workspace-kanban-orchestrator-runtime.md`](design/workspace-kanban-orchestrator-runtime.md) — how Kanban operations become durable orchestration events and backend-internal routing decisions.
 10. [`design/workspace-runtime-docker.md`](design/workspace-runtime-docker.md) — the WebUI / Backend / Runtime split, Docker image layout, worker launch path, and workdir materialization boundary.
-11. [`development/work-items.md`](development/work-items.md) — how project work is recorded and reviewed.
-12. [`development/validation.md`](development/validation.md) — how to check changes.
+11. [`development/server-runtime-auth.md`](development/server-runtime-auth.md) — manual Workspace Server / Runtime public-key exchange and authenticated Runtime startup checks.
+12. [`development/work-items.md`](development/work-items.md) — how project work is recorded and reviewed.
+13. [`development/validation.md`](development/validation.md) — how to check changes.
 
 ## What belongs here
 
