@@ -5,6 +5,7 @@
 //! Backend authority surfaces rather than Worker-local filesystem access.
 
 pub mod auth;
+pub mod authority;
 pub mod companion;
 pub mod config;
 pub mod hosts;
@@ -20,15 +21,17 @@ pub mod server;
 pub mod skills;
 pub mod store;
 
+pub use authority::{
+    MemoryAuthorityMarker, MemoryAuthorityStatus, ObjectiveAuthority, SqliteWorkspaceAuthority,
+    TicketAuthority, WorkspaceAuthority,
+};
 pub use config::{
     BackendRuntimesConfigFile, ConfigDiff, ResolvedWorkspaceBackendConfig,
     WORKSPACE_BACKEND_CONFIG_RELATIVE_PATH, WORKSPACE_BACKEND_CONFIG_TEMPLATE,
     WorkspaceBackendConfigFile,
 };
 pub use identity::{WORKSPACE_IDENTITY_RELATIVE_PATH, WorkspaceIdentity};
-pub use records::{
-    LocalProjectRecordReader, ObjectiveDetail, ObjectiveSummary, TicketDetail, TicketSummary,
-};
+pub use records::{ObjectiveDetail, ObjectiveSummary, TicketDetail, TicketSummary};
 pub use repositories::{
     ConfiguredRepository, GitCommitSummary, GitRemoteSummary, GitRepositorySummary,
     RepositoryLogRead, RepositoryRegistryReader, RepositorySummary,

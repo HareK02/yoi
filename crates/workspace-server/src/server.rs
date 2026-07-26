@@ -42,6 +42,7 @@ use crate::auth::{
     new_user_code, normalize_handle, parse_cookie, resolve_request_actor, rfc3339_after,
     session_set_cookie, token_hash,
 };
+use crate::authority::{ObjectiveAuthority, SqliteWorkspaceAuthority, TicketAuthority};
 use crate::companion::{
     CompanionCancelRequest, CompanionConsole, CompanionMessageRequest, CompanionMessageResponse,
     CompanionStatusResponse, CompanionTranscriptProjection,
@@ -68,9 +69,7 @@ use crate::profile_settings::{
     UpdateWorkspaceMetadataRequest, UpdateWorkspaceProfileRegistryRequest,
     UpdateWorkspaceProfileSourceRequest, WriteWorkspaceProfileTreeFileRequest,
 };
-use crate::records::{
-    LocalProjectRecordReader, ObjectiveDetail, ProjectRecordList, TicketDetail, TicketSummary,
-};
+use crate::records::{ObjectiveDetail, ProjectRecordList, TicketDetail, TicketSummary};
 use crate::repositories::{
     ConfiguredRepository, RepositoryListProjection, RepositoryLogRead, RepositoryLookupError,
     RepositoryRegistryReader, RepositorySummary,
@@ -229,7 +228,7 @@ impl ServerConfig {
 pub struct WorkspaceApi {
     config: ServerConfig,
     store: Arc<dyn ControlPlaneStore>,
-    records: LocalProjectRecordReader,
+    authority: SqliteWorkspaceAuthority,
     runtime: Arc<RuntimeRegistry>,
     memory_consolidater_worker: Arc<Mutex<Option<(String, String)>>>,
     companion: Arc<CompanionConsole>,
@@ -328,8 +327,7 @@ impl WorkspaceApi {
         let companion = Arc::new(CompanionConsole::disabled());
         let observation_proxy = BackendObservationProxy::new(config.runtime_event_sources.clone());
         Ok(Self {
-            records: LocalProjectRecordReader::new(
-                config.workspace_root.clone(),
+            authority: SqliteWorkspaceAuthority::new(
                 config.database_path.clone(),
                 config.workspace_id.clone(),
             )?,
@@ -3648,7 +3646,7 @@ async fn list_tickets(
         items,
         invalid_records,
         record_authority,
-    } = api.records.list_tickets(limit)?;
+    } = api.authority.list_tickets(limit)?;
     Ok(Json(ListResponse {
         workspace_id: api.config.workspace_id,
         limit,
@@ -3662,7 +3660,7 @@ async fn get_ticket(
     State(api): State<WorkspaceApi>,
     AxumPath(id): AxumPath<String>,
 ) -> ApiResult<Json<TicketDetail>> {
-    Ok(Json(api.records.ticket(&id)?))
+    Ok(Json(api.authority.ticket(&id)?))
 }
 
 async fn list_objectives(
@@ -3674,7 +3672,7 @@ async fn list_objectives(
         items,
         invalid_records,
         record_authority,
-    } = api.records.list_objectives(limit)?;
+    } = api.authority.list_objectives(limit)?;
     Ok(Json(ListResponse {
         workspace_id: api.config.workspace_id,
         limit,
@@ -3688,7 +3686,7 @@ async fn get_objective(
     State(api): State<WorkspaceApi>,
     AxumPath(id): AxumPath<String>,
 ) -> ApiResult<Json<ObjectiveDetail>> {
-    Ok(Json(api.records.objective(&id)?))
+    Ok(Json(api.authority.objective(&id)?))
 }
 
 async fn list_repositories(
@@ -3752,7 +3750,7 @@ async fn repository_tickets(
         items,
         invalid_records,
         record_authority,
-    } = api.records.list_tickets(limit)?;
+    } = api.authority.list_tickets(limit)?;
     Ok(Json(RepositoryTicketsResponse {
         workspace_id: api.config.workspace_id,
         repository_id: canonical_repository_id,
