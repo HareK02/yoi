@@ -14,11 +14,11 @@ use serde_json::{Value, json};
 use crate::{
     AcceptedOrchestrationPlan, LocalTicketBackend, MarkdownText, NewOrchestrationPlanRecord,
     NewTicket, NewTicketEvent, NewTicketRelation, OrchestrationPlanKind, OrchestrationPlanRecord,
-    Result as TicketResult, Ticket, TicketBackend, TicketDoctorDiagnostic, TicketDoctorReport,
-    TicketDoctorSeverity, TicketError, TicketEventKind, TicketIdOrSlug, TicketIntakeSummary,
-    TicketListState, TicketRef, TicketRelation, TicketRelationKind, TicketRelationView,
-    TicketReview, TicketReviewResult, TicketStateChange, TicketSummary, TicketWorkflowState,
-    default_author,
+    Result as TicketResult, Ticket, TicketBackend, TicketBodyReplacement, TicketDoctorDiagnostic,
+    TicketDoctorReport, TicketDoctorSeverity, TicketError, TicketEventKind, TicketIdOrSlug,
+    TicketIntakeSummary, TicketListState, TicketRef, TicketRelation, TicketRelationKind,
+    TicketRelationView, TicketReview, TicketReviewResult, TicketStateChange, TicketSummary,
+    TicketWorkflowState, default_author,
 };
 
 const DEFAULT_LIST_LIMIT: usize = 50;
@@ -391,9 +391,18 @@ struct TicketEditItemParams {
     /// Optional replacement title.
     #[serde(default)]
     title: Option<String>,
-    /// Optional replacement Markdown body.
+    /// Optional replacement Markdown body. This replaces the entire item body.
     #[serde(default)]
     body: Option<String>,
+    /// Exact body substring to replace. Must be provided with `new_string`; omitted for whole-body edits.
+    #[serde(default)]
+    old_string: Option<String>,
+    /// Replacement text for `old_string`. Must be provided with `old_string`.
+    #[serde(default)]
+    new_string: Option<String>,
+    /// Replace every occurrence of `old_string`; by default exactly one occurrence is required.
+    #[serde(default)]
+    replace_all: bool,
     /// Optional thread author for the audited item_edit event.
     #[serde(default)]
     author: Option<String>,
@@ -930,9 +939,26 @@ impl Tool for TicketEditItemTool {
         _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
         let params: TicketEditItemParams = parse_input("TicketEditItem", input_json)?;
+        let body_replacement = match (params.old_string, params.new_string) {
+            (Some(old_string), Some(new_string)) => Some(TicketBodyReplacement {
+                old_string,
+                new_string,
+                replace_all: params.replace_all,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(backend_error(
+                    "TicketEditItem",
+                    TicketError::Conflict(
+                        "old_string and new_string must be provided together".to_string(),
+                    ),
+                ));
+            }
+        };
         let edit = crate::TicketItemEdit {
             title: params.title,
             body: params.body.map(MarkdownText::new),
+            body_replacement,
             author: params.author,
         };
         let ticket = self
@@ -2181,6 +2207,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ticket_edit_item_tool_supports_exact_body_replacement() {
+        let temp = TempDir::new().unwrap();
+        let backend = backend(&temp);
+        let mut input = NewTicket::new("Tool Body Edit");
+        input.body = MarkdownText::new("one\ntwo\none\n");
+        let created = backend.create(input).unwrap();
+        let edit = tool_by_name(backend.clone(), "TicketEditItem");
+
+        let output = edit
+            .execute(
+                &json!({
+                    "ticket": created.id.clone(),
+                    "old_string": "one",
+                    "new_string": "ONE",
+                    "replace_all": true,
+                    "author": "tool-test"
+                })
+                .to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_str(&output.content.unwrap()).unwrap();
+        assert_eq!(
+            value["body"].as_str().unwrap().trim_start_matches('\n'),
+            "ONE\ntwo\nONE\n"
+        );
+
+        let record = backend
+            .show(TicketIdOrSlug::Id(created.id.clone()))
+            .unwrap();
+        let event = record
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == TicketEventKind::Other("item_edit".to_string()))
+            .expect("item_edit event");
+        assert_eq!(
+            event.attributes.get("body_edit"),
+            Some(&"partial".to_string())
+        );
+        assert_eq!(
+            event.attributes.get("replacement_count"),
+            Some(&"2".to_string())
+        );
+
+        let error = edit
+            .execute(
+                &json!({
+                    "ticket": created.id,
+                    "old_string": "ONE"
+                })
+                .to_string(),
+                Default::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("old_string and new_string"));
+    }
+
+    #[tokio::test]
     async fn ticket_relation_tools_record_query_and_show_derived_view() {
         let temp = TempDir::new().unwrap();
         let backend = backend(&temp);
@@ -2698,6 +2785,16 @@ mod tests {
             .input_schema
             .to_string();
         assert!(plan_query_schema.contains("relation_kind"));
+        let edit_schema = tools
+            .iter()
+            .map(|definition| definition().0)
+            .find(|meta| meta.name == "TicketEditItem")
+            .unwrap()
+            .input_schema
+            .to_string();
+        assert!(edit_schema.contains("old_string"));
+        assert!(edit_schema.contains("new_string"));
+        assert!(edit_schema.contains("replace_all"));
         let names = tools
             .into_iter()
             .map(|definition| definition().0)
