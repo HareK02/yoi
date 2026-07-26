@@ -12,9 +12,9 @@ use llm_engine::tool::{
 };
 use memory::backend::{
     MemoryBackendHttpResponse, MemoryBackendOperation, MemoryBackendOperationResult,
-    MemoryConsolidateStagingOperation, MemoryConsolidationOutput, MemoryDeleteOperation,
-    MemoryEditOperation, MemoryQueryOperation, MemoryReadOperation, MemoryStagingCloseOperation,
-    MemoryStagingListOperation, MemoryStagingReadOperation, MemoryToolOutput, MemoryWriteOperation,
+    MemoryConsolidateStagingOperation, MemoryConsolidationOutput, MemoryDocumentReadOperation,
+    MemoryDocumentUpdateOperation, MemoryQueryOperation, MemoryStagingCloseOperation,
+    MemoryStagingListOperation, MemoryStagingReadOperation, MemoryToolOutput,
 };
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -175,47 +175,29 @@ pub fn workspace_http_memory_tools(
     let backend = WorkspaceHttpMemoryBackend::new(workspace_id, base_url);
     vec![
         memory_tool(
-            "MemoryRead",
-            READ_DESCRIPTION,
-            read_schema(),
+            "MemoryReadDocument",
+            READ_DOCUMENT_DESCRIPTION,
+            document_read_schema(),
             backend.clone(),
             |input| {
-                Ok(MemoryBackendOperation::Read(parse_input::<
-                    MemoryReadOperation,
-                >(input)?))
+                Ok(MemoryBackendOperation::ReadDocument(parse_input::<
+                    MemoryDocumentReadOperation,
+                >(
+                    input
+                )?))
             },
         ),
         memory_tool(
-            "MemoryWrite",
-            WRITE_DESCRIPTION,
-            write_schema(),
+            "MemoryUpdateDocument",
+            UPDATE_DOCUMENT_DESCRIPTION,
+            document_update_schema(),
             backend.clone(),
             |input| {
-                Ok(MemoryBackendOperation::Write(parse_input::<
-                    MemoryWriteOperation,
-                >(input)?))
-            },
-        ),
-        memory_tool(
-            "MemoryEdit",
-            EDIT_DESCRIPTION,
-            edit_schema(),
-            backend.clone(),
-            |input| {
-                Ok(MemoryBackendOperation::Edit(parse_input::<
-                    MemoryEditOperation,
-                >(input)?))
-            },
-        ),
-        memory_tool(
-            "MemoryDelete",
-            DELETE_DESCRIPTION,
-            delete_schema(),
-            backend.clone(),
-            |input| {
-                Ok(MemoryBackendOperation::Delete(parse_input::<
-                    MemoryDeleteOperation,
-                >(input)?))
+                Ok(MemoryBackendOperation::UpdateDocument(parse_input::<
+                    MemoryDocumentUpdateOperation,
+                >(
+                    input
+                )?))
             },
         ),
         memory_tool(
@@ -339,72 +321,34 @@ fn tool_output(output: MemoryToolOutput) -> ToolOutput {
     }
 }
 
-const READ_DESCRIPTION: &str = "Read a durable memory record through Workspace authority.";
-const WRITE_DESCRIPTION: &str =
-    "Create or overwrite a durable memory record through Workspace authority.";
-const EDIT_DESCRIPTION: &str =
-    "Replace text in a durable memory record through Workspace authority.";
-const DELETE_DESCRIPTION: &str = "Delete a durable memory record through Workspace authority.";
-const QUERY_DESCRIPTION: &str = "Query durable memory records through Workspace authority.";
+const READ_DOCUMENT_DESCRIPTION: &str =
+    "Read the Workspace memory Markdown document through Workspace authority.";
+const UPDATE_DOCUMENT_DESCRIPTION: &str =
+    "Replace the Workspace memory Markdown document through Workspace authority.";
+const QUERY_DESCRIPTION: &str = "Query the Workspace memory document through Workspace authority.";
 const STAGING_LIST_DESCRIPTION: &str =
     "List pending Memory staging candidates without loading full record payloads.";
 const STAGING_READ_DESCRIPTION: &str = "Read one pending Memory staging candidate by candidate_id.";
 const STAGING_CLOSE_DESCRIPTION: &str = "Close one staging candidate with a required reason; records disposition and deletes the staging record.";
 
-fn kind_schema() -> serde_json::Value {
-    json!({"type":"string","enum":["summary","decision","request"]})
-}
-
-fn read_schema() -> serde_json::Value {
+fn document_read_schema() -> serde_json::Value {
     json!({
         "type":"object",
         "additionalProperties": false,
-        "required":["kind"],
         "properties":{
-            "kind": kind_schema(),
-            "slug":{"type":["string","null"]},
             "offset":{"type":["integer","null"],"minimum":0},
             "limit":{"type":["integer","null"],"minimum":0}
         }
     })
 }
 
-fn write_schema() -> serde_json::Value {
+fn document_update_schema() -> serde_json::Value {
     json!({
         "type":"object",
         "additionalProperties": false,
-        "required":["kind","content"],
+        "required":["body_md"],
         "properties":{
-            "kind": kind_schema(),
-            "slug":{"type":["string","null"]},
-            "content":{"type":"string"}
-        }
-    })
-}
-
-fn edit_schema() -> serde_json::Value {
-    json!({
-        "type":"object",
-        "additionalProperties": false,
-        "required":["kind","old_string","new_string"],
-        "properties":{
-            "kind": kind_schema(),
-            "slug":{"type":["string","null"]},
-            "old_string":{"type":"string"},
-            "new_string":{"type":"string"},
-            "replace_all":{"type":"boolean","default":false}
-        }
-    })
-}
-
-fn delete_schema() -> serde_json::Value {
-    json!({
-        "type":"object",
-        "additionalProperties": false,
-        "required":["kind"],
-        "properties":{
-            "kind": kind_schema(),
-            "slug":{"type":["string","null"]}
+            "body_md":{"type":"string"}
         }
     })
 }
@@ -441,6 +385,12 @@ mod tests {
         ));
 
         assert!(names.contains(&"MemoryQuery".to_string()));
+        assert!(names.contains(&"MemoryReadDocument".to_string()));
+        assert!(names.contains(&"MemoryUpdateDocument".to_string()));
+        assert!(!names.contains(&"MemoryRead".to_string()));
+        assert!(!names.contains(&"MemoryWrite".to_string()));
+        assert!(!names.contains(&"MemoryEdit".to_string()));
+        assert!(!names.contains(&"MemoryDelete".to_string()));
         assert!(!names.contains(&"MemoryStagingList".to_string()));
         assert!(!names.contains(&"MemoryStagingRead".to_string()));
         assert!(!names.contains(&"MemoryStagingClose".to_string()));
@@ -454,6 +404,8 @@ mod tests {
         ));
 
         assert!(names.contains(&"MemoryQuery".to_string()));
+        assert!(names.contains(&"MemoryReadDocument".to_string()));
+        assert!(names.contains(&"MemoryUpdateDocument".to_string()));
         assert!(names.contains(&"MemoryStagingList".to_string()));
         assert!(names.contains(&"MemoryStagingRead".to_string()));
         assert!(names.contains(&"MemoryStagingClose".to_string()));

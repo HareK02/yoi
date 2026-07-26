@@ -14,7 +14,7 @@ use chrono::{Duration, SecondsFormat, Utc};
 use futures::{SinkExt, StreamExt};
 use memory::backend::{
     MemoryBackendHttpResponse, MemoryBackendOperation, MemoryConsolidateStagingOperation,
-    MemoryConsolidationOutput, execute_memory_backend_operation,
+    MemoryConsolidationOutput,
 };
 use protocol::stream::{decode_method, encode_event};
 use serde::{Deserialize, Serialize};
@@ -58,7 +58,8 @@ use crate::hosts::{
     WorkerSpawnResult, WorkerSpawnWorkingDirectoryRequest, WorkerSummary, WorkerWorkspaceSummary,
 };
 use crate::identity::WorkspaceIdentity;
-use crate::memory_staging::{MemoryStagingListResponse, list_memory_staging};
+use crate::memory_backend::execute_memory_backend_operation_with_authority;
+use crate::memory_staging::{MemoryStagingListResponse, list_memory_staging_from_authority};
 use crate::observation::{
     BackendObservationProxy, ObservationProxyError, RuntimeObservationClient,
     RuntimeObservationSource, RuntimeObservationSourceConfig,
@@ -1458,9 +1459,10 @@ async fn scoped_list_memory_staging(
     Query(query): Query<MemoryStagingQuery>,
 ) -> ApiResult<Json<MemoryStagingListResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let memory_config = manifest::MemoryConfig::default();
-    let layout = memory::WorkspaceLayout::resolve(&memory_config, &api.config.workspace_root);
-    Ok(Json(list_memory_staging(&layout, query.limit)))
+    Ok(Json(list_memory_staging_from_authority(
+        &api.authority,
+        query.limit,
+    )?))
 }
 
 async fn scoped_memory_backend_operation(
@@ -1469,9 +1471,8 @@ async fn scoped_memory_backend_operation(
     Json(operation): Json<MemoryBackendOperation>,
 ) -> ApiResult<Json<MemoryBackendHttpResponse>> {
     validate_workspace_scope(&api, &path.workspace_id)?;
-    let memory_config = manifest::MemoryConfig::default();
-    let layout = memory::WorkspaceLayout::resolve(&memory_config, &api.config.workspace_root);
-    let response = match execute_memory_backend_operation(&layout, operation) {
+    let response = match execute_memory_backend_operation_with_authority(&api.authority, operation)
+    {
         Ok(result) => MemoryBackendHttpResponse::Ok { result },
         Err(error) => MemoryBackendHttpResponse::Error {
             message: sanitize_backend_error(&error.to_string()),

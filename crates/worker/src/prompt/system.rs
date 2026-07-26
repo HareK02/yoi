@@ -201,10 +201,8 @@ impl<'a> SystemPromptContext<'a> {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ToolCapabilities {
     memory_query: bool,
-    memory_read: bool,
-    memory_write: bool,
-    memory_edit: bool,
-    memory_delete: bool,
+    memory_read_document: bool,
+    memory_update_document: bool,
     worker_spawn: bool,
     worker_send: bool,
     worker_read_output: bool,
@@ -219,10 +217,8 @@ impl ToolCapabilities {
         for name in names {
             match name.as_str() {
                 "MemoryQuery" => capabilities.memory_query = true,
-                "MemoryRead" => capabilities.memory_read = true,
-                "MemoryWrite" => capabilities.memory_write = true,
-                "MemoryEdit" => capabilities.memory_edit = true,
-                "MemoryDelete" => capabilities.memory_delete = true,
+                "MemoryReadDocument" => capabilities.memory_read_document = true,
+                "MemoryUpdateDocument" => capabilities.memory_update_document = true,
                 "SpawnWorker" => capabilities.worker_spawn = true,
                 "SendToWorker" => capabilities.worker_send = true,
                 "ReadWorkerOutput" => capabilities.worker_read_output = true,
@@ -236,11 +232,7 @@ impl ToolCapabilities {
     }
 
     fn memory_records(self) -> bool {
-        self.memory_query
-            || self.memory_read
-            || self.memory_write
-            || self.memory_edit
-            || self.memory_delete
+        self.memory_query || self.memory_read_document || self.memory_update_document
     }
 
     fn memory_any(self) -> bool {
@@ -248,7 +240,7 @@ impl ToolCapabilities {
     }
 
     fn memory_mutation(self) -> bool {
-        self.memory_write || self.memory_edit || self.memory_delete
+        self.memory_update_document
     }
 
     fn worker_management(self) -> bool {
@@ -265,10 +257,14 @@ impl ToolCapabilities {
         map.insert("memory_any", Value::from(self.memory_any()));
         map.insert("memory_records", Value::from(self.memory_records()));
         map.insert("memory_query", Value::from(self.memory_query));
-        map.insert("memory_read", Value::from(self.memory_read));
-        map.insert("memory_write", Value::from(self.memory_write));
-        map.insert("memory_edit", Value::from(self.memory_edit));
-        map.insert("memory_delete", Value::from(self.memory_delete));
+        map.insert(
+            "memory_read_document",
+            Value::from(self.memory_read_document),
+        );
+        map.insert(
+            "memory_update_document",
+            Value::from(self.memory_update_document),
+        );
         map.insert("memory_mutation", Value::from(self.memory_mutation()));
         map.insert("worker_management", Value::from(self.worker_management()));
         Value::from(map)
@@ -407,16 +403,10 @@ mod tests {
     }
 
     fn memory_tool_names() -> Vec<String> {
-        [
-            "MemoryQuery",
-            "MemoryRead",
-            "MemoryWrite",
-            "MemoryEdit",
-            "MemoryDelete",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect()
+        ["MemoryQuery", "MemoryReadDocument", "MemoryUpdateDocument"]
+            .into_iter()
+            .map(String::from)
+            .collect()
     }
 
     fn worker_management_tool_names() -> Vec<String> {
@@ -463,9 +453,9 @@ mod tests {
         assert!(rendered.contains("### Memory"));
         assert!(rendered.contains("small targeted `MemoryQuery`"));
         assert!(rendered.contains("Strong lookup triggers include"));
-        assert!(rendered.contains("MemoryRead(kind=summary)"));
+        assert!(rendered.contains("MemoryReadDocument"));
         assert!(rendered.contains("Do not query memory every turn"));
-        assert!(rendered.contains("MemoryWrite"));
+        assert!(rendered.contains("MemoryUpdateDocument"));
         assert!(rendered.contains("## Language"));
         assert!(rendered.contains("`language`: `match the user's language"));
         // Trailing section must be present.
@@ -508,15 +498,15 @@ mod tests {
             .render(&ctx(
                 dir.path(),
                 &scope,
-                vec!["MemoryQuery".into(), "MemoryRead".into()],
+                vec!["MemoryQuery".into(), "MemoryReadDocument".into()],
                 None,
             ))
             .unwrap();
 
         assert!(rendered.contains("### Memory"));
         assert!(rendered.contains("small targeted `MemoryQuery`"));
-        assert!(rendered.contains("MemoryRead(kind=summary)"));
-        assert!(!rendered.contains("MemoryWrite"));
+        assert!(rendered.contains("MemoryReadDocument"));
+        assert!(!rendered.contains("MemoryUpdateDocument"));
         assert!(!rendered.contains("MemoryEdit"));
         assert!(!rendered.contains("MemoryDelete"));
     }
@@ -555,7 +545,7 @@ mod tests {
             .render(&ctx(
                 dir.path(),
                 &scope,
-                vec!["Read".into(), "Edit".into(), "MemoryRead".into()],
+                vec!["Read".into(), "Edit".into(), "MemoryReadDocument".into()],
                 None,
             ))
             .unwrap();
