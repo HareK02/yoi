@@ -42,7 +42,9 @@ use crate::auth::{
     new_user_code, normalize_handle, parse_cookie, resolve_request_actor, rfc3339_after,
     session_set_cookie, token_hash,
 };
-use crate::authority::{ObjectiveAuthority, SqliteWorkspaceAuthority, TicketAuthority};
+use crate::authority::{
+    MemoryAuthority, ObjectiveAuthority, SqliteWorkspaceAuthority, TicketAuthority,
+};
 use crate::companion::{
     CompanionCancelRequest, CompanionConsole, CompanionMessageRequest, CompanionMessageResponse,
     CompanionStatusResponse, CompanionTranscriptProjection,
@@ -484,6 +486,10 @@ pub fn build_router(api: WorkspaceApi) -> Router {
         .route(
             "/api/w/{workspace_id}/tickets/backend",
             post(scoped_ticket_backend_operation),
+        )
+        .route(
+            "/api/w/{workspace_id}/memory",
+            get(scoped_get_memory_document),
         )
         .route(
             "/api/w/{workspace_id}/memory/staging",
@@ -1454,6 +1460,30 @@ async fn scoped_ticket_backend_operation(
         },
     };
     Ok(Json(response))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MemoryDocumentResponse {
+    body_md: String,
+    created_at: String,
+    updated_at: String,
+    bytes: usize,
+    record_source: String,
+}
+
+async fn scoped_get_memory_document(
+    State(api): State<WorkspaceApi>,
+    AxumPath(path): AxumPath<ScopedWorkspacePath>,
+) -> ApiResult<Json<MemoryDocumentResponse>> {
+    validate_workspace_scope(&api, &path.workspace_id)?;
+    let document = api.authority.memory_document()?;
+    Ok(Json(MemoryDocumentResponse {
+        bytes: document.body_md.len(),
+        body_md: document.body_md,
+        created_at: document.created_at,
+        updated_at: document.updated_at,
+        record_source: document.record_source,
+    }))
 }
 
 async fn scoped_list_memory_staging(
@@ -6603,8 +6633,8 @@ mod tests {
         WorkerSpawnIntent,
     };
     use crate::store::{
-        MemoryStagingRecord, ObjectiveRecord, ObjectiveResourceRecord, ObjectiveTicketLinkRecord,
-        SqliteWorkspaceStore,
+        MemoryDocumentRecord, MemoryStagingRecord, ObjectiveRecord, ObjectiveResourceRecord,
+        ObjectiveTicketLinkRecord, SqliteWorkspaceStore,
     };
 
     const TEST_WORKSPACE_ID: &str = "0192f0e8-4d84-7d6e-a000-000000000001";
@@ -8424,6 +8454,15 @@ mod tests {
             })
             .unwrap();
         sqlite_store
+            .upsert_memory_document(&MemoryDocumentRecord {
+                workspace_id: TEST_WORKSPACE_ID.to_string(),
+                body_md: "# Memory\n\n## Project facts\n\n- Frontend can read this document.\n"
+                    .to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-02T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        sqlite_store
             .upsert_memory_staging_record(&MemoryStagingRecord {
                 workspace_id: TEST_WORKSPACE_ID.to_string(),
                 candidate_id: "00000000001J4".to_string(),
@@ -8557,6 +8596,19 @@ mod tests {
         assert_eq!(
             scoped_objective["resources"][0]["path"],
             "memory-architecture-overview.md"
+        );
+
+        let memory_document =
+            get_json(app.clone(), &format!("/api/w/{TEST_WORKSPACE_ID}/memory")).await;
+        assert_eq!(memory_document["created_at"], "2026-01-01T00:00:00Z");
+        assert_eq!(memory_document["updated_at"], "2026-01-02T00:00:00Z");
+        assert_eq!(memory_document["bytes"], 63);
+        assert_eq!(memory_document["record_source"], "workspace-sqlite");
+        assert!(
+            memory_document["body_md"]
+                .as_str()
+                .unwrap()
+                .contains("Frontend can read this document.")
         );
 
         let memory_staging = get_json(

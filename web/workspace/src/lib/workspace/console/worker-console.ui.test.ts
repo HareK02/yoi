@@ -191,17 +191,26 @@ Deno.test("workspace Tickets surface uses read-only Backend Ticket APIs", async 
   );
 });
 
-Deno.test("workspace Memory Staging surface uses read-only scoped memory API", async () => {
+Deno.test("workspace Memory surfaces use read-only scoped memory APIs", async () => {
   const memoryNav = await Deno.readTextFile(
     new URL("../sidebar/MemoryNavSection.svelte", import.meta.url),
   );
-  const memoryLoad = await Deno.readTextFile(
+  const memoryDocumentLoad = await Deno.readTextFile(
+    new URL("./../../../routes/w/[workspaceId]/memory/+page.ts", import.meta.url),
+  );
+  const memoryDocumentPage = await Deno.readTextFile(
+    new URL(
+      "./../../../routes/w/[workspaceId]/memory/+page.svelte",
+      import.meta.url,
+    ),
+  );
+  const memoryStagingLoad = await Deno.readTextFile(
     new URL(
       "./../../../routes/w/[workspaceId]/memory/staging/+page.ts",
       import.meta.url,
     ),
   );
-  const memoryPage = await Deno.readTextFile(
+  const memoryStagingPage = await Deno.readTextFile(
     new URL(
       "./../../../routes/w/[workspaceId]/memory/staging/+page.svelte",
       import.meta.url,
@@ -209,17 +218,28 @@ Deno.test("workspace Memory Staging surface uses read-only scoped memory API", a
   );
 
   assert(
-    memoryNav.includes("workspaceRoute(workspaceId, '/memory/staging')") &&
+    memoryNav.includes("workspaceRoute(workspaceId, '/memory')") &&
+      memoryNav.includes("durable workspace memory") &&
+      memoryNav.includes("workspaceRoute(workspaceId, '/memory/staging')") &&
       memoryNav.includes("pending extraction candidates"),
-    "Memory sidebar section should link to the workspace Memory Staging surface",
+    "Memory sidebar section should link to Document and Staging surfaces",
   );
   assert(
-    memoryLoad.includes("workspaceApiPath(params.workspaceId") &&
-      memoryLoad.includes('"/memory/staging"') &&
-      memoryPage.includes("Memory Staging") &&
-      memoryPage.includes("Workspace Server memory authority") &&
-      memoryPage.includes("data.staging.data.invalid_count") &&
-      memoryPage.includes("entry.record.evidence"),
+    memoryDocumentLoad.includes("workspaceApiPath(params.workspaceId") &&
+      memoryDocumentLoad.includes('"/memory"') &&
+      memoryDocumentPage.includes("Memory Document") &&
+      memoryDocumentPage.includes("This view is read-only") &&
+      memoryDocumentPage.includes("data.memory.data.body_md") &&
+      memoryDocumentPage.includes("data.memory.data.updated_at"),
+    "Memory Document page should read the scoped API and expose the durable document without mutation controls",
+  );
+  assert(
+    memoryStagingLoad.includes("workspaceApiPath(params.workspaceId") &&
+      memoryStagingLoad.includes('"/memory/staging"') &&
+      memoryStagingPage.includes("Memory Staging") &&
+      memoryStagingPage.includes("Workspace Server memory authority") &&
+      memoryStagingPage.includes("data.staging.data.invalid_count") &&
+      memoryStagingPage.includes("entry.record.evidence"),
     "Memory Staging page should read the scoped API and expose staged records without mutation controls",
   );
 });

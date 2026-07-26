@@ -318,6 +318,14 @@ export type RepositoryLogResponse = {
   diagnostics: Diagnostic[];
 };
 
+export type MemoryDocumentResponse = {
+  body_md: string;
+  created_at: string;
+  updated_at: string;
+  bytes: number;
+  record_source: string;
+};
+
 export type MemoryCandidateKind =
   | "preference"
   | "working_assumption"
