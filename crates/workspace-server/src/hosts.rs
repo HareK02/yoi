@@ -230,9 +230,15 @@ pub struct WorkerSummary {
     pub runtime_id: String,
     pub worker_id: String,
     pub host_id: String,
+    /// Human-readable display name. This is not identity and may be duplicated.
+    pub display_name: String,
+    /// Backward-compatible display label. New UI should prefer `display_name`.
     pub label: String,
     pub role: Option<String>,
     pub profile: Option<String>,
+    pub singleton_key: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub workspace: WorkerWorkspaceSummary,
     pub state: String,
     pub last_seen_at: Option<String>,
@@ -1334,13 +1340,24 @@ impl EmbeddedWorkerRuntime {
     }
 
     fn map_worker_summary(&self, summary: worker_runtime::catalog::WorkerSummary) -> WorkerSummary {
+        let worker_id = summary.worker_ref.worker_id.to_string();
+        let profile = embedded_profile_label(&summary.profile);
+        let display = worker_display_metadata(
+            &worker_id,
+            profile.as_deref(),
+            summary.display_name.as_deref(),
+            true,
+        );
         WorkerSummary {
             runtime_id: self.runtime_id.clone(),
-            worker_id: summary.worker_ref.worker_id.to_string(),
+            worker_id,
             host_id: self.host_id.clone(),
-            label: safe_display_hint(&summary.worker_ref.worker_id.to_string()),
-            role: embedded_profile_label(&summary.profile),
-            profile: embedded_profile_label(&summary.profile),
+            display_name: display.display_name.clone(),
+            label: display.display_name,
+            role: profile.clone(),
+            profile,
+            singleton_key: display.singleton_key,
+            tags: display.tags,
             workspace: WorkerWorkspaceSummary {
                 visibility: "backend_internal".to_string(),
                 identity: "runtime_registry_worker".to_string(),
@@ -1368,13 +1385,24 @@ impl EmbeddedWorkerRuntime {
     }
 
     fn map_worker_detail(&self, detail: EmbeddedWorkerDetail) -> WorkerSummary {
+        let worker_id = detail.worker_id.to_string();
+        let profile = embedded_profile_label(&detail.profile);
+        let display = worker_display_metadata(
+            &worker_id,
+            profile.as_deref(),
+            detail.display_name.as_deref(),
+            true,
+        );
         WorkerSummary {
             runtime_id: self.runtime_id.clone(),
-            worker_id: detail.worker_id.to_string(),
+            worker_id,
             host_id: self.host_id.clone(),
-            label: safe_display_hint(&detail.worker_id.to_string()),
-            role: embedded_profile_label(&detail.profile),
-            profile: embedded_profile_label(&detail.profile),
+            display_name: display.display_name.clone(),
+            label: display.display_name,
+            role: profile.clone(),
+            profile,
+            singleton_key: display.singleton_key,
+            tags: display.tags,
             workspace: WorkerWorkspaceSummary {
                 visibility: "backend_internal".to_string(),
                 identity: "runtime_registry_worker".to_string(),
@@ -1579,9 +1607,9 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         }
         if request.requested_worker_name.is_some() {
             diagnostics.push(diagnostic(
-                "embedded_worker_name_ignored",
+                "embedded_worker_name_display_only",
                 DiagnosticSeverity::Info,
-                "Embedded Runtime v0 allocates opaque runtime-local worker ids; requested display names are not authority".to_string(),
+                "requested_worker_name is used only as display_name; embedded Runtime allocates opaque runtime-local worker ids".to_string(),
             ));
         }
         if matches!(request.acceptance, WorkerSpawnAcceptanceRequirement::RunAccepted { expected_segments } if expected_segments > 0)
@@ -1615,6 +1643,7 @@ impl WorkspaceWorkerRuntime for EmbeddedWorkerRuntime {
         };
         let create_request = CreateWorkerRequest {
             profile,
+            display_name: request.requested_worker_name.clone(),
             config_bundle: None,
             profile_source,
             initial_input: request.initial_input.clone(),
@@ -2174,13 +2203,24 @@ impl RemoteWorkerRuntime {
     }
 
     fn map_worker_summary(&self, summary: worker_runtime::catalog::WorkerSummary) -> WorkerSummary {
+        let worker_id = summary.worker_ref.worker_id.to_string();
+        let profile = embedded_profile_label(&summary.profile);
+        let display = worker_display_metadata(
+            &worker_id,
+            profile.as_deref(),
+            summary.display_name.as_deref(),
+            false,
+        );
         WorkerSummary {
             runtime_id: self.runtime_id.clone(),
-            worker_id: summary.worker_ref.worker_id.to_string(),
+            worker_id,
             host_id: self.host_id.clone(),
-            label: safe_display_hint(&summary.worker_ref.worker_id.to_string()),
-            role: None,
-            profile: embedded_profile_label(&summary.profile),
+            display_name: display.display_name.clone(),
+            label: display.display_name,
+            role: profile.clone(),
+            profile,
+            singleton_key: display.singleton_key,
+            tags: display.tags,
             workspace: WorkerWorkspaceSummary {
                 visibility: "remote_runtime".to_string(),
                 identity: "runtime_registry_worker".to_string(),
@@ -2208,13 +2248,24 @@ impl RemoteWorkerRuntime {
     }
 
     fn map_worker_detail(&self, detail: EmbeddedWorkerDetail) -> WorkerSummary {
+        let worker_id = detail.worker_id.to_string();
+        let profile = embedded_profile_label(&detail.profile);
+        let display = worker_display_metadata(
+            &worker_id,
+            profile.as_deref(),
+            detail.display_name.as_deref(),
+            false,
+        );
         WorkerSummary {
             runtime_id: self.runtime_id.clone(),
-            worker_id: detail.worker_id.to_string(),
+            worker_id,
             host_id: self.host_id.clone(),
-            label: safe_display_hint(&detail.worker_id.to_string()),
-            role: None,
-            profile: embedded_profile_label(&detail.profile),
+            display_name: display.display_name.clone(),
+            label: display.display_name,
+            role: profile.clone(),
+            profile,
+            singleton_key: display.singleton_key,
+            tags: display.tags,
             workspace: WorkerWorkspaceSummary {
                 visibility: "remote_runtime".to_string(),
                 identity: "runtime_registry_worker".to_string(),
@@ -2473,6 +2524,7 @@ impl WorkspaceWorkerRuntime for RemoteWorkerRuntime {
         };
         let create = CreateWorkerRequest {
             profile,
+            display_name: request.requested_worker_name.clone(),
             config_bundle: None,
             profile_source,
             initial_input: request.initial_input.clone(),
@@ -3000,8 +3052,81 @@ fn ticket_role_profile_slug(role: &TicketWorkerRole) -> &'static str {
 fn embedded_profile_label(profile: &ProfileSelector) -> Option<String> {
     Some(match profile {
         ProfileSelector::RuntimeDefault => "runtime_default".to_string(),
-        ProfileSelector::Builtin(name) | ProfileSelector::Named(name) => safe_display_hint(name),
+        ProfileSelector::Builtin(name) | ProfileSelector::Named(name) => {
+            if name.strip_prefix("builtin:").unwrap_or(name) == MEMORY_CONSOLIDATION_PROFILE {
+                MEMORY_CONSOLIDATION_PROFILE.to_string()
+            } else {
+                safe_display_hint(name)
+            }
+        }
     })
+}
+
+const MEMORY_CONSOLIDATION_PROFILE: &str = "memory-consolidation";
+const MEMORY_CONSOLIDATION_SINGLETON_KEY: &str = "workspace-memory-consolidation";
+
+struct WorkerDisplayMetadata {
+    display_name: String,
+    singleton_key: Option<String>,
+    tags: Vec<String>,
+}
+
+fn worker_display_metadata(
+    worker_id: &str,
+    profile_label: Option<&str>,
+    requested_display_name: Option<&str>,
+    internal: bool,
+) -> WorkerDisplayMetadata {
+    if profile_label == Some(MEMORY_CONSOLIDATION_PROFILE) {
+        let mut tags = vec![
+            "memory".to_string(),
+            "consolidation".to_string(),
+            "singleton".to_string(),
+        ];
+        if internal {
+            tags.insert(0, "internal".to_string());
+        }
+        return WorkerDisplayMetadata {
+            display_name: "Memory Consolidation".to_string(),
+            singleton_key: Some(MEMORY_CONSOLIDATION_SINGLETON_KEY.to_string()),
+            tags,
+        };
+    }
+    let display_name = requested_display_name
+        .filter(|value| !value.trim().is_empty())
+        .map(safe_display_hint)
+        .or_else(|| profile_label.map(profile_display_name))
+        .unwrap_or_else(|| format!("Worker {worker_id}"));
+    let mut tags = Vec::new();
+    if internal {
+        tags.push("internal".to_string());
+    }
+    if let Some(profile_label) = profile_label {
+        tags.push(format!("profile:{profile_label}"));
+    }
+    WorkerDisplayMetadata {
+        display_name,
+        singleton_key: None,
+        tags,
+    }
+}
+
+fn profile_display_name(profile_label: &str) -> String {
+    match profile_label {
+        "runtime_default" => "Default Worker".to_string(),
+        value => value
+            .split(['-', '_'])
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
 }
 
 fn embedded_input_rejected(
@@ -3389,9 +3514,12 @@ pub fn placeholder_worker(host_id: impl Into<String>) -> WorkerSummary {
         runtime_id: "placeholder".to_string(),
         worker_id: "worker-placeholder".to_string(),
         host_id,
+        display_name: "Worker runtime actions are not implemented".to_string(),
         label: "Worker runtime actions are not implemented".to_string(),
         role: None,
         profile: None,
+        singleton_key: None,
+        tags: Vec::new(),
         workspace: WorkerWorkspaceSummary {
             visibility: "none".to_string(),
             identity: "unsupported".to_string(),
@@ -3720,9 +3848,12 @@ mod tests {
                     runtime_id: runtime_id.to_string(),
                     worker_id: worker_id.to_string(),
                     host_id: host_id.to_string(),
+                    display_name: label.to_string(),
                     label: label.to_string(),
                     role: None,
                     profile: None,
+                    singleton_key: None,
+                    tags: Vec::new(),
                     workspace: WorkerWorkspaceSummary {
                         visibility: "opaque".to_string(),
                         identity: host_id.to_string(),

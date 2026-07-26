@@ -114,13 +114,16 @@ Deno.test("workspace Worker list lives on the dedicated Workers page", async () 
   assert(
     workersPage.includes("workerConsoleHref(worker, data.workspaceId)") &&
       workersPage.includes('<table class="workers-table">') &&
-      workersPage.includes('class="icon-action"') &&
-      workersPage.includes("Delete ${worker.label}"),
+      workersPage.includes("workerDisplayName = worker.display_name || worker.label") &&
+      workersPage.includes("worker <code>{worker.worker_id}</code>") &&
+      workersPage.includes("Delete ${workerDisplayName}"),
     "dedicated Workers page should expose a table, console link target, and icon actions per Worker",
   );
   assert(
     workersNav.includes("href={`/w/${workspaceId}/workers`}") &&
       workersNav.includes("filter(canShowWorkerInSidebar)") &&
+      workersNav.includes("worker.display_name || worker.label") &&
+      workersNav.includes("worker {worker.worker_id}") &&
       !workersNav.includes('aria-disabled="true"'),
     "Workers sidebar should link to the Worker list page and omit registry-only Workers",
   );

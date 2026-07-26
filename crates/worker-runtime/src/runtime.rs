@@ -1860,6 +1860,7 @@ impl WorkerRecord {
                 .clone()
                 .with_restore_dry_check(restore_dry_check),
             profile: self.request.profile.clone(),
+            display_name: self.request.display_name.clone(),
             profile_source: self.request.profile_source.reference(),
             config_bundle: self.request.config_bundle.clone(),
             last_event_id: self.last_event_id,
@@ -1873,6 +1874,7 @@ impl WorkerRecord {
             status: self.status,
             execution: self.execution.clone(),
             profile: self.request.profile.clone(),
+            display_name: self.request.display_name.clone(),
             profile_source: self.request.profile_source.reference(),
             config_bundle: self.request.config_bundle.clone(),
             last_event_id: self.last_event_id,
@@ -2008,6 +2010,7 @@ mod tests {
         let bundle = test_bundle_for_profile(profile.clone());
         CreateWorkerRequest {
             profile,
+            display_name: None,
             profile_source: crate::catalog::ProfileSourceArchiveSource::Http {
                 location: crate::catalog::ProfileSourceArchiveHttpRef {
                     url: "http://127.0.0.1/profile-source.tar".to_string(),

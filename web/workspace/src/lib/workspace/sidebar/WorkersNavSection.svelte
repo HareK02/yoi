@@ -105,11 +105,11 @@
         <li>
           <a href={href} class="nav-item worker-nav-item" class:active={currentPath === href} aria-current={currentPath === href ? 'page' : undefined}>
             <span class="worker-title-row">
-              <span class="item-title">{worker.label}</span>
+              <span class="item-title">{worker.display_name || worker.label}</span>
               <span class="worker-task-title">-</span>
             </span>
             <span class="item-meta">
-              {worker.role ? `${worker.role} · ` : ''}{worker.state} · 🖥 {worker.host_id}
+              worker {worker.worker_id} · {worker.role ? `${worker.role} · ` : ''}{worker.state} · 🖥 {worker.host_id}
               {worker.working_directory ? ` · wd:${worker.working_directory.repository_id}@${worker.working_directory.resolved_commit.slice(0, 8)}` : ''}
             </span>
           </a>

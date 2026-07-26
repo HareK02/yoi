@@ -192,6 +192,8 @@ pub struct WorkspaceApiRef {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateWorkerRequest {
     pub profile: ProfileSelector,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub profile_source: ProfileSourceArchiveSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_bundle: Option<ConfigBundleRef>,
@@ -228,6 +230,8 @@ pub struct WorkerSummary {
     pub status: WorkerStatus,
     pub execution: WorkerExecutionStatus,
     pub profile: ProfileSelector,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub profile_source: ProfileSourceArchiveRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_bundle: Option<ConfigBundleRef>,
@@ -242,6 +246,8 @@ pub struct WorkerDetail {
     pub status: WorkerStatus,
     pub execution: WorkerExecutionStatus,
     pub profile: ProfileSelector,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub profile_source: ProfileSourceArchiveRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_bundle: Option<ConfigBundleRef>,

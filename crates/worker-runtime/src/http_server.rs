@@ -887,6 +887,7 @@ mod tests {
         let bundle = test_bundle(profile.clone());
         CreateWorkerRequest {
             profile,
+            display_name: None,
             profile_source: crate::catalog::ProfileSourceArchiveSource::Http {
                 location: crate::catalog::ProfileSourceArchiveHttpRef {
                     url: "http://127.0.0.1/profile-source.tar".to_string(),
@@ -1210,6 +1211,7 @@ mod ws_tests {
         let bundle = ws_test_bundle(ProfileSelector::RuntimeDefault);
         CreateWorkerRequest {
             profile: ProfileSelector::RuntimeDefault,
+            display_name: None,
             profile_source: crate::catalog::ProfileSourceArchiveSource::Http {
                 location: crate::catalog::ProfileSourceArchiveHttpRef {
                     url: "http://127.0.0.1/profile-source.tar".to_string(),

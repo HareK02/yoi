@@ -1559,6 +1559,7 @@ mod tests {
         let bundle = test_bundle();
         CreateWorkerRequest {
             profile: ProfileSelector::RuntimeDefault,
+            display_name: None,
             profile_source: crate::catalog::ProfileSourceArchiveSource::Embedded {
                 archive: bundle.profile_source_archive.clone().unwrap(),
             },

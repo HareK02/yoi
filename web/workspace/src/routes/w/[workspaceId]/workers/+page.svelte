@@ -190,14 +190,15 @@
             {@const cleanup = cleanupCandidate(worker)}
             {@const canDelete = cleanup && !cleanup.blocking_reason}
             {@const anyActionDisabled = actionsDisabled()}
+            {@const workerDisplayName = worker.display_name || worker.label}
             <tr>
               <td>
                 {#if canOpenWorkerConsole(worker)}
-                  <a class="worker-title-link" href={workerConsoleHref(worker, data.workspaceId)}><strong>{worker.label}</strong></a>
+                  <a class="worker-title-link" href={workerConsoleHref(worker, data.workspaceId)}><strong>{workerDisplayName}</strong></a>
                 {:else}
-                  <strong>{worker.label}</strong>
+                  <strong>{workerDisplayName}</strong>
                 {/if}
-                <small><code>{worker.worker_id}</code></small>
+                <small>worker <code>{worker.worker_id}</code></small>
               </td>
               <td><code>{worker.runtime_id}</code></td>
               <td>{workerProfile(worker)}</td>
@@ -205,12 +206,12 @@
               <td><span class="pill {worker.pinned ? 'success' : 'muted'}">{worker.retention_state ?? 'normal'}</span></td>
               <td>{workerDirectory(worker)}</td>
               <td>
-                <div class="worker-actions" aria-label={`Actions for ${worker.label}`}>
+                <div class="worker-actions" aria-label={`Actions for ${workerDisplayName}`}>
                   <button
                     class="icon-action"
                     type="button"
                     disabled={anyActionDisabled}
-                    aria-label={worker.pinned ? `Unpin ${worker.label}` : `Pin ${worker.label}`}
+                    aria-label={worker.pinned ? `Unpin ${workerDisplayName}` : `Pin ${workerDisplayName}`}
                     title={worker.pinned ? 'Unpin' : 'Pin'}
                     onclick={() => setPinned(worker, !worker.pinned)}
                   >
@@ -227,7 +228,7 @@
                       class="icon-action danger"
                       type="button"
                       disabled={!canDelete || anyActionDisabled}
-                      aria-label={`Delete ${worker.label}`}
+                      aria-label={`Delete ${workerDisplayName}`}
                       title={cleanup.blocking_reason ?? cleanup.reason}
                       onclick={() => deleteWorker(worker, cleanup)}
                     >

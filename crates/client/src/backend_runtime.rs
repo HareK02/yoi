@@ -141,11 +141,17 @@ pub struct BackendWorkerSummary {
     pub runtime_id: String,
     pub worker_id: String,
     pub host_id: String,
+    #[serde(default)]
+    pub display_name: String,
     pub label: String,
     #[serde(default)]
     pub role: Option<String>,
     #[serde(default)]
     pub profile: Option<String>,
+    #[serde(default)]
+    pub singleton_key: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub workspace: BackendWorkerWorkspaceSummary,
     pub state: String,
     #[serde(default)]

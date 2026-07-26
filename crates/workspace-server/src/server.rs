@@ -1514,6 +1514,7 @@ async fn scoped_memory_backend_operation(
 }
 
 const MEMORY_CONSOLIDATION_PROFILE: &str = "memory-consolidation";
+const MEMORY_CONSOLIDATION_SINGLETON_KEY: &str = "workspace-memory-consolidation";
 const MEMORY_CONSOLIDATION_WORKER_SCAN_LIMIT: usize = 100;
 
 async fn scoped_memory_consolidation(
@@ -1699,10 +1700,11 @@ fn try_reuse_memory_consolidation_worker(
 }
 
 fn is_memory_consolidation_worker(worker: &WorkerSummary) -> bool {
-    [worker.profile.as_deref(), worker.role.as_deref()]
-        .into_iter()
-        .flatten()
-        .any(|value| value == MEMORY_CONSOLIDATION_PROFILE)
+    worker.singleton_key.as_deref() == Some(MEMORY_CONSOLIDATION_SINGLETON_KEY)
+        || [worker.profile.as_deref(), worker.role.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|value| value == MEMORY_CONSOLIDATION_PROFILE)
 }
 
 fn memory_consolidation_input_content(candidate_count: usize, total_bytes: u64) -> String {
@@ -5723,7 +5725,10 @@ fn worker_summary_from_registry(record: &WorkerRegistryRecord) -> WorkerSummary 
         runtime_id: record.runtime_id.clone(),
         host_id: "backend-registry".to_string(),
         role: None,
+        display_name: record.display_name.clone(),
         label: record.display_name.clone(),
+        singleton_key: None,
+        tags: Vec::new(),
         state: "missing".to_string(),
         last_seen_at: Some(record.updated_at.clone()),
         pinned: record.retention_state == "pinned",
@@ -7395,6 +7400,13 @@ mod tests {
             .worker(EMBEDDED_WORKER_RUNTIME_ID, &worker_id)
             .unwrap();
         assert_eq!(worker.state, "idle");
+        assert_eq!(worker.display_name, "Memory Consolidation");
+        assert_eq!(
+            worker.singleton_key.as_deref(),
+            Some(MEMORY_CONSOLIDATION_SINGLETON_KEY)
+        );
+        assert!(worker.tags.iter().any(|tag| tag == "memory"));
+        assert!(worker.tags.iter().any(|tag| tag == "consolidation"));
 
         let second = match start_memory_staging_consolidation(
             api.clone(),
@@ -7942,6 +7954,7 @@ mod tests {
         let bundle = runtime_test_bundle();
         worker_runtime::catalog::CreateWorkerRequest {
             profile: worker_runtime::catalog::ProfileSelector::RuntimeDefault,
+            display_name: None,
             profile_source: worker_runtime::catalog::ProfileSourceArchiveSource::Http {
                 location: worker_runtime::catalog::ProfileSourceArchiveHttpRef {
                     url: "http://127.0.0.1/profile-source.tar".to_string(),

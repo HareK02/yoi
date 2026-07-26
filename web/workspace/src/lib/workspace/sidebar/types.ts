@@ -77,9 +77,12 @@ export type Worker = {
   runtime_id: string;
   worker_id: string;
   host_id: string;
+  display_name: string;
   label: string;
   role?: string | null;
   profile?: string | null;
+  singleton_key?: string | null;
+  tags: string[];
   workspace: { visibility: string; identity: string };
   state: string;
   pinned?: boolean;
