@@ -28,6 +28,8 @@ use crate::workspace::WorkspaceLayout;
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum MemoryBackendOperation {
     Query(MemoryQueryOperation),
+    ReadDocument(MemoryDocumentReadOperation),
+    UpdateDocument(MemoryDocumentUpdateOperation),
     Read(MemoryReadOperation),
     Write(MemoryWriteOperation),
     Edit(MemoryEditOperation),
@@ -71,6 +73,19 @@ pub struct MemoryToolOutput {
 pub struct MemoryQueryOperation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryDocumentReadOperation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryDocumentUpdateOperation {
+    pub body_md: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +247,14 @@ pub fn execute_memory_backend_operation(
         MemoryBackendOperation::Query(operation) => {
             execute_query(layout, operation).map(MemoryBackendOperationResult::ToolOutput)
         }
+        MemoryBackendOperation::ReadDocument(_operation) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Memory document operations require WorkspaceAuthority-backed executor",
+        )),
+        MemoryBackendOperation::UpdateDocument(_operation) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Memory document operations require WorkspaceAuthority-backed executor",
+        )),
         MemoryBackendOperation::Read(operation) => {
             execute_read(layout, operation).map(MemoryBackendOperationResult::ToolOutput)
         }

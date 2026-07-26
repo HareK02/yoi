@@ -8,8 +8,8 @@ Use this loop:
 
 1. Call `MemoryStagingList` to inspect pending candidates.
 2. Pick one candidate and call `MemoryStagingRead` for the full record.
-3. Use `MemoryQuery` / `MemoryRead` to compare against durable Memory.
-4. If the candidate should change durable Memory, use `MemoryWrite`, `MemoryEdit`, or `MemoryDelete` first.
+3. Use `MemoryQuery` / `MemoryReadDocument` to compare against durable Memory.
+4. If the candidate should change durable Memory, update the single durable Markdown document with `MemoryUpdateDocument` first.
 5. Call `MemoryStagingClose` exactly once for every candidate you finish. Always include a concrete reason.
 
 `MemoryStagingClose` removes the staging candidate after recording your disposition. Use it for both applied candidates and candidates that should not become Memory.

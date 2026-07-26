@@ -10,6 +10,7 @@ pub mod companion;
 pub mod config;
 pub mod hosts;
 pub mod identity;
+pub mod memory_backend;
 pub mod memory_staging;
 pub mod observation;
 pub mod profile_settings;

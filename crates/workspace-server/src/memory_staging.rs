@@ -4,6 +4,9 @@ use memory::extract::StagingRecord;
 use memory::schema::{SourceEvidenceRef, SourceRef};
 use serde::{Deserialize, Serialize};
 
+use crate::Result;
+use crate::authority::MemoryAuthority;
+
 const DEFAULT_MEMORY_STAGING_LIMIT: usize = 100;
 const MAX_MEMORY_STAGING_LIMIT: usize = 500;
 
@@ -86,6 +89,48 @@ pub fn list_memory_staging(
         record_authority: "workspace_memory_staging".to_string(),
         items,
     }
+}
+
+pub fn list_memory_staging_from_authority<A: MemoryAuthority>(
+    authority: &A,
+    requested_limit: Option<usize>,
+) -> Result<MemoryStagingListResponse> {
+    let limit = requested_limit
+        .unwrap_or(DEFAULT_MEMORY_STAGING_LIMIT)
+        .min(MAX_MEMORY_STAGING_LIMIT);
+    let entries = authority.list_memory_staging_records(MAX_MEMORY_STAGING_LIMIT + 1)?;
+    let fetched_count = entries.len();
+    let mut invalid_count = 0usize;
+    let mut total_valid_count = 0usize;
+    let mut valid_items = Vec::with_capacity(fetched_count.min(limit));
+    for entry in entries {
+        let record = match serde_json::from_str::<StagingRecord>(&entry.raw_json) {
+            Ok(record) => record,
+            Err(_) => {
+                invalid_count += 1;
+                continue;
+            }
+        };
+        total_valid_count += 1;
+        if valid_items.len() < limit {
+            valid_items.push(MemoryStagingEntrySummary {
+                id: entry.candidate_id,
+                byte_len: entry.raw_json.len() as u64,
+                record: memory_staging_record_summary(record),
+            });
+        }
+    }
+    let returned_count = valid_items.len();
+    Ok(MemoryStagingListResponse {
+        limit,
+        returned_count,
+        total_valid_count,
+        invalid_count,
+        truncated: total_valid_count > returned_count || fetched_count > MAX_MEMORY_STAGING_LIMIT,
+        order: "uuidv7_ascending".to_string(),
+        record_authority: "sqlite_workspace_authority.memory_staging".to_string(),
+        items: valid_items,
+    })
 }
 
 fn memory_staging_entry_summary(entry: StagingEntry) -> MemoryStagingEntrySummary {
