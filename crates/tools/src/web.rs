@@ -47,7 +47,7 @@ impl WebTools {
             .user_agent("yoi-web-tools/0.1")
             .build()
             .expect("static reqwest client configuration is valid");
-        let secret_store = manifest::paths::data_dir().map(SecretStore::new);
+        let secret_store = manifest::paths::secret_data_dir().map(SecretStore::new);
         Self {
             config,
             client,

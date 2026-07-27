@@ -5,6 +5,9 @@
 //! - **`config_dir`** — 人が手で書く / 編集する設定。`profiles.toml`,
 //!   `providers.toml`, `models.toml`, `prompts/`, `prompts.toml` 等
 //! - **`data_dir`** — プログラムが書く永続データ。`sessions/` 等
+//! - **`secret_data_dir`** — local secret store の読み書き base。既存
+//!   secret store は path-derived key を使うため、通常 data とは別に
+//!   legacy `$HOME/.yoi` を既定にする
 //! - **`runtime_dir`** — 再起動で消えてよいランタイム状態。socket,
 //!   `workers.json`, `pid` ファイル等
 //!
@@ -14,6 +17,7 @@
 //! |---|---|---|---|---|
 //! | config  | `YOI_CONFIG_DIR`  | `$YOI_HOME/config` | `$XDG_CONFIG_HOME/yoi` | `$HOME/.config/yoi` |
 //! | data    | `YOI_DATA_DIR`    | `$YOI_HOME`        | `$XDG_DATA_HOME/yoi`   | `$HOME/.local/share/yoi` |
+//! | secrets | `YOI_DATA_DIR`    | `$YOI_HOME`        | —                      | `$HOME/.yoi` |
 //! | runtime | `YOI_RUNTIME_DIR` | `$YOI_HOME/run`    | `$XDG_RUNTIME_DIR/yoi` | `$HOME/.yoi/run` |
 //!
 //! `YOI_HOME=$X` のとき config は `$X/config`、data は `$X` 直下、
@@ -43,6 +47,19 @@ pub fn data_dir() -> Option<PathBuf> {
         env_path("YOI_DATA_DIR"),
         env_path("YOI_HOME"),
         env_path("XDG_DATA_HOME"),
+        env_path("HOME"),
+    )
+}
+
+/// Secret store 用の data directory。
+///
+/// SecretStore は base path から復号 key を導出するため、通常 data dir の
+/// XDG fallback には追従させず、明示 override が無い場合は legacy
+/// `$HOME/.yoi` を読み書きする。
+pub fn secret_data_dir() -> Option<PathBuf> {
+    resolve_secret_data_dir_from_parts(
+        env_path("YOI_DATA_DIR"),
+        env_path("YOI_HOME"),
         env_path("HOME"),
     )
 }
@@ -145,6 +162,20 @@ fn resolve_data_dir_from_parts(
         return Some(p.join("yoi"));
     }
     Some(home?.join(".local").join("share").join("yoi"))
+}
+
+fn resolve_secret_data_dir_from_parts(
+    yoi_data_dir: Option<PathBuf>,
+    yoi_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(p) = yoi_data_dir {
+        return Some(p);
+    }
+    if let Some(p) = yoi_home {
+        return Some(p);
+    }
+    Some(home?.join(".yoi"))
 }
 
 fn resolve_runtime_dir_from_parts(
@@ -315,6 +346,40 @@ mod tests {
                 Some(PathBuf::from("/explicit-data")),
                 Some(PathBuf::from("/sand")),
                 Some(PathBuf::from("/xdg-data")),
+                Some(PathBuf::from("/h")),
+            )
+            .unwrap(),
+            PathBuf::from("/explicit-data")
+        );
+    }
+
+    #[test]
+    fn secret_data_dir_falls_back_to_home_dot_yoi() {
+        assert_eq!(
+            resolve_secret_data_dir_from_parts(None, None, Some(PathBuf::from("/h"))).unwrap(),
+            PathBuf::from("/h/.yoi")
+        );
+    }
+
+    #[test]
+    fn secret_data_dir_yoi_home_wins() {
+        assert_eq!(
+            resolve_secret_data_dir_from_parts(
+                None,
+                Some(PathBuf::from("/sand")),
+                Some(PathBuf::from("/h"))
+            )
+            .unwrap(),
+            PathBuf::from("/sand")
+        );
+    }
+
+    #[test]
+    fn secret_data_dir_explicit_wins_over_yoi_home() {
+        assert_eq!(
+            resolve_secret_data_dir_from_parts(
+                Some(PathBuf::from("/explicit-data")),
+                Some(PathBuf::from("/sand")),
                 Some(PathBuf::from("/h")),
             )
             .unwrap(),

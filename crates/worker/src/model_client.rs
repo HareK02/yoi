@@ -70,11 +70,11 @@ struct DefaultSecretResolver;
 
 impl SecretResolver for DefaultSecretResolver {
     fn get_secret(&self, id: &str) -> Result<SecretValue, secrets::Error> {
-        let data_dir = manifest::paths::data_dir().ok_or_else(|| secrets::Error::Read {
-            path: std::path::PathBuf::from("<data_dir>"),
+        let data_dir = manifest::paths::secret_data_dir().ok_or_else(|| secrets::Error::Read {
+            path: std::path::PathBuf::from("<secret_data_dir>"),
             source: std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "could not determine yoi data directory",
+                "could not determine yoi secret data directory",
             ),
         })?;
         SecretStore::new(data_dir).get(id)

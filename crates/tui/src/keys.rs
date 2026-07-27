@@ -218,10 +218,10 @@ impl std::fmt::Debug for Action {
 }
 
 pub async fn launch() -> ExitCode {
-    let data_dir = match manifest::paths::data_dir() {
+    let data_dir = match manifest::paths::secret_data_dir() {
         Some(path) => path,
         None => {
-            eprintln!("yoi keys: could not determine yoi data directory");
+            eprintln!("yoi keys: could not determine yoi secret data directory");
             return ExitCode::FAILURE;
         }
     };
