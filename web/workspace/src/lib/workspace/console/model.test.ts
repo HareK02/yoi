@@ -859,6 +859,53 @@ Deno.test("projectConsole renders snapshot entries and in-flight output", () => 
   );
 });
 
+Deno.test("projectConsole clears transient in-flight rows", () => {
+  const projection = projectConsole([
+    {
+      eventId: "20",
+      event: {
+        event: "snapshot",
+        data: {
+          entries: [
+            {
+              kind: "assistant_item",
+              ts: 1,
+              item: {
+                kind: "message",
+                role: "assistant",
+                content: [{ kind: "text", text: "latest committed" }],
+              },
+            },
+          ],
+          greeting: {
+            worker_name: "Worker",
+            cwd: "/repo",
+            provider: "provider",
+            model: "model",
+            scope_summary: "bounded",
+            tools: [],
+            context_window: 100,
+            context_tokens: 20,
+          },
+          status: "running",
+          in_flight: {
+            blocks: [{ kind: "text", text: "stale partial" }],
+          },
+        },
+      } satisfies Event,
+    },
+    {
+      eventId: "21",
+      event: { event: "in_flight_cleared" } satisfies Event,
+    },
+  ]);
+
+  assertEquals(
+    projection.lines.map((line) => `${line.kind}:${line.body}`),
+    ["assistant:latest committed"],
+  );
+});
+
 Deno.test("projectConsole reseeds visible rows from segment rotation", () => {
   const projection = projectConsole([
     {

@@ -225,6 +225,7 @@ export type Event =
       reason: string;
     };
   }
+  | { "event": "in_flight_cleared" }
   | { "event": "text_delta"; "data": { text: string } }
   | { "event": "text_done"; "data": { text: string } }
   | { "event": "thinking_start" }

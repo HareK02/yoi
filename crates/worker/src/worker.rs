@@ -654,6 +654,12 @@ impl<C: LlmClient + Clone + 'static, St: Store + Clone + 'static> Worker<C, St> 
         self.in_flight = Some(in_flight);
     }
 
+    pub fn clear_in_flight_events(&self) {
+        if let Some(in_flight) = &self.in_flight {
+            in_flight.clear();
+        }
+    }
+
     /// Wire `Engine::on_history_append` to commit each appended item
     /// directly as a singular `LogEntry::AssistantItem` / `ToolResult`
     /// through the writer. The controller calls this once per spawned

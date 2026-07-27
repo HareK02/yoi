@@ -139,7 +139,13 @@ async fn finish_controller_run<C, St>(
     // history / user_segments are no longer mirrored on WorkerSharedState —
     // clients reconstruct them from `Event::Snapshot` + live
     // `Event::Entry` deliveries driven by the session-log sink. We
-    // only flip the status and kick post-run memory jobs here.
+    // flip the status and kick post-run memory jobs here.
+    //
+    // In-flight blocks are run-local streaming state, not durable transcript.
+    // Any block not cleared by a committed AssistantItem must be discarded at
+    // the terminal run boundary so reconnect snapshots cannot append stale
+    // partial text/tool arguments after newer entries.
+    worker.clear_in_flight_events();
     set_controller_status(shared_state, runtime_dir, event_tx, new_status).await;
     worker.spawn_post_run_memory_jobs();
 }
@@ -807,6 +813,10 @@ async fn controller_loop<C, St>(
             // after this point is delivered to the turn and must not be discarded by
             // the Engine at run start.
             worker.engine_mut().clear_pending_cancel();
+            // In-flight display state belongs to the active run only. Defensive
+            // clear at run start prevents stale partial output left by an older
+            // interrupted/error turn from being carried into the next snapshot.
+            worker.clear_in_flight_events();
             set_controller_status(
                 &shared_state,
                 &runtime_dir,
@@ -943,6 +953,7 @@ async fn controller_loop<C, St>(
             Method::Cancel => match shared_state.get_status() {
                 WorkerStatus::Paused => match worker.cancel_paused_turn() {
                     Ok(()) => {
+                        worker.clear_in_flight_events();
                         set_controller_status(
                             &shared_state,
                             &runtime_dir,
@@ -1028,6 +1039,7 @@ async fn controller_loop<C, St>(
             } => match shared_state.get_status() {
                 WorkerStatus::Idle => {
                     if apply_rewind(&mut worker, &event_tx, target, expected_head_entries) {
+                        worker.clear_in_flight_events();
                         shared_state.set_status(WorkerStatus::Idle);
                         let _ = event_tx.send(Event::Status {
                             status: WorkerStatus::Idle,

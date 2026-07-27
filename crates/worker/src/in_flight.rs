@@ -201,6 +201,16 @@ impl InFlightEvents {
         f()
     }
 
+    pub(crate) fn clear(&self) {
+        let cleared = {
+            let mut inner = self.lock();
+            inner.clear()
+        };
+        if cleared {
+            let _ = self.event_tx.send(Event::InFlightCleared);
+        }
+    }
+
     fn lock(&self) -> MutexGuard<'_, InFlightInner> {
         self.inner.lock().expect("in-flight event mutex poisoned")
     }
@@ -268,6 +278,15 @@ impl InFlightInner {
                 .iter()
                 .filter_map(TrackedBlock::to_snapshot_block)
                 .collect(),
+        }
+    }
+
+    fn clear(&mut self) -> bool {
+        if self.blocks.is_empty() {
+            false
+        } else {
+            self.blocks.clear();
+            true
         }
     }
 
@@ -567,6 +586,37 @@ mod tests {
                 finished: false,
             }]
         );
+    }
+
+    #[test]
+    fn clear_discards_uncommitted_blocks_and_notifies_clients() {
+        let (event_tx, _) = broadcast::channel(16);
+        let mut rx = event_tx.subscribe();
+        let in_flight = InFlightEvents::new(event_tx);
+        let text = in_flight.start_text_block();
+        in_flight.text_delta(text, "stale".into());
+        let tool = in_flight.tool_call_start("call-1".into(), "Bash".into());
+        in_flight.tool_call_args_delta(tool, "call-1".into(), "{\"command\":".into());
+
+        in_flight.clear();
+
+        let guard = in_flight.snapshot_guard();
+        assert!(snapshot_from_guard(&guard).is_empty());
+        drop(guard);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Event::TextDelta { text } if text == "stale"
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Event::ToolCallStart { .. }
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Event::ToolCallArgsDelta { .. }
+        ));
+        assert!(matches!(rx.try_recv().unwrap(), Event::InFlightCleared));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
