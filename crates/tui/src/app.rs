@@ -1030,12 +1030,6 @@ impl App {
                     "LLM stream interrupted; continuing generation ({attempt}/{max_attempts}): {reason}"
                 ));
             }
-            Event::InFlightCleared => {
-                self.assistant_streaming = false;
-                self.latest_llm_wait_event = None;
-                self.mark_orphan_tool_calls_incomplete();
-                self.current_tool = None;
-            }
             Event::TextDelta { text } => {
                 self.latest_llm_wait_event = None;
                 self.append_assistant_text(&text);

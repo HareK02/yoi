@@ -363,10 +363,6 @@ pub enum Event {
         max_attempts: u32,
         reason: String,
     },
-    /// Any transient streaming blocks that were not committed to history were
-    /// discarded at a run boundary. Clients should remove live in-flight lines
-    /// without modifying persisted transcript entries.
-    InFlightCleared,
     TextDelta {
         text: String,
     },

@@ -303,9 +303,6 @@ export function applyProtocolEvent(
         next.lines.push(inFlightLine(envelope.eventId, block, next.cwd));
       }
       break;
-    case "in_flight_cleared":
-      next.lines = next.lines.filter((line) => line.kind !== "in_flight");
-      break;
     case "status":
       next.status = event.data.status;
       break;

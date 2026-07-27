@@ -202,13 +202,8 @@ impl InFlightEvents {
     }
 
     pub(crate) fn clear(&self) {
-        let cleared = {
-            let mut inner = self.lock();
-            inner.clear()
-        };
-        if cleared {
-            let _ = self.event_tx.send(Event::InFlightCleared);
-        }
+        let mut inner = self.lock();
+        inner.clear();
     }
 
     fn lock(&self) -> MutexGuard<'_, InFlightInner> {
@@ -589,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_discards_uncommitted_blocks_and_notifies_clients() {
+    fn clear_discards_uncommitted_blocks_without_protocol_event() {
         let (event_tx, _) = broadcast::channel(16);
         let mut rx = event_tx.subscribe();
         let in_flight = InFlightEvents::new(event_tx);
@@ -615,7 +610,6 @@ mod tests {
             rx.try_recv().unwrap(),
             Event::ToolCallArgsDelta { .. }
         ));
-        assert!(matches!(rx.try_recv().unwrap(), Event::InFlightCleared));
         assert!(rx.try_recv().is_err());
     }
 
