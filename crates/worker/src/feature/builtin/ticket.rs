@@ -20,7 +20,7 @@ use ticket::{
 use crate::feature::{
     FeatureDescriptor, FeatureDiagnostic, FeatureInstallContext, FeatureInstallError,
     FeatureInstructionContribution, FeatureInstructionDeclaration, FeatureInstructionId,
-    FeatureInstructionOrder, FeatureModule, ToolContribution, ToolDeclaration,
+    FeatureModule, ToolContribution, ToolDeclaration,
 };
 
 const FEATURE_ID: &str = "ticket";
@@ -34,7 +34,6 @@ fn ticket_workflow_instruction() -> FeatureInstructionDeclaration {
     FeatureInstructionDeclaration::new(
         FeatureInstructionId::builtin(TICKET_WORKFLOW_INSTRUCTION_ID),
         TICKET_WORKFLOW_PROMPT_REF,
-        FeatureInstructionOrder::WorkflowPolicy,
         "Typed Ticket workflow guidance",
     )
     .expect("static Ticket workflow instruction declaration is valid")

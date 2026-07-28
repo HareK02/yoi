@@ -414,7 +414,6 @@ mod tests {
         FeatureInstructionDeclaration::new(
             crate::feature::FeatureInstructionId::builtin("ticket.workflow"),
             "$yoi/common/tickets",
-            crate::feature::FeatureInstructionOrder::WorkflowPolicy,
             "Ticket workflow guidance",
         )
         .unwrap()
@@ -424,7 +423,6 @@ mod tests {
         FeatureInstructionDeclaration::new(
             crate::feature::FeatureInstructionId::builtin("worker.orchestration"),
             "$yoi/common/worker-orchestration",
-            crate::feature::FeatureInstructionOrder::OrchestrationPolicy,
             "Worker orchestration guidance",
         )
         .unwrap()

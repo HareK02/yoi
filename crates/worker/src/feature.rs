@@ -11,7 +11,7 @@
 //! [`crate::hook::HookRegistryBuilder`], and provider output is represented as
 //! ordinary feature reports/diagnostics instead of a separate authority layer.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -340,18 +340,10 @@ impl fmt::Display for FeatureInstructionId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FeatureInstructionOrder {
-    OrchestrationPolicy,
-    WorkflowPolicy,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeatureInstructionDeclaration {
     pub id: FeatureInstructionId,
     pub prompt_ref: String,
-    pub order: FeatureInstructionOrder,
     pub description: String,
 }
 
@@ -359,7 +351,6 @@ impl FeatureInstructionDeclaration {
     pub fn new(
         id: FeatureInstructionId,
         prompt_ref: impl Into<String>,
-        order: FeatureInstructionOrder,
         description: impl Into<String>,
     ) -> Result<Self, FeatureInstallError> {
         let prompt_ref = prompt_ref.into();
@@ -371,7 +362,6 @@ impl FeatureInstructionDeclaration {
         Ok(Self {
             id,
             prompt_ref,
-            order,
             description: description.into(),
         })
     }
@@ -1396,13 +1386,14 @@ impl FeatureRegistryInstallReport {
 pub fn dedupe_instruction_contributions(
     instructions: impl IntoIterator<Item = FeatureInstructionDeclaration>,
 ) -> Vec<FeatureInstructionDeclaration> {
-    let mut by_id = BTreeMap::new();
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
     for instruction in instructions {
-        by_id.entry(instruction.id.clone()).or_insert(instruction);
+        if seen.insert(instruction.id.clone()) {
+            deduped.push(instruction);
+        }
     }
-    let mut instructions = by_id.into_values().collect::<Vec<_>>();
-    instructions.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.id.cmp(&b.id)));
-    instructions
+    deduped
 }
 
 /// Builder/installer for enabled feature modules.
@@ -1730,15 +1721,10 @@ mod tests {
         }
     }
 
-    fn instruction(
-        id: &'static str,
-        prompt_ref: &'static str,
-        order: FeatureInstructionOrder,
-    ) -> FeatureInstructionDeclaration {
+    fn instruction(id: &'static str, prompt_ref: &'static str) -> FeatureInstructionDeclaration {
         FeatureInstructionDeclaration::new(
             FeatureInstructionId::builtin(id),
             prompt_ref,
-            order,
             "test instruction",
         )
         .unwrap()
@@ -1771,38 +1757,22 @@ mod tests {
     }
 
     #[test]
-    fn instruction_contributions_are_deduped_and_sorted() {
-        let workflow = instruction(
-            "workflow",
-            "$yoi/common/tickets",
-            FeatureInstructionOrder::WorkflowPolicy,
-        );
-        let orchestration = instruction(
-            "orchestration",
-            "$yoi/common/worker-orchestration",
-            FeatureInstructionOrder::OrchestrationPolicy,
-        );
+    fn instruction_contributions_are_deduped_in_registration_order() {
+        let workflow = instruction("workflow", "$yoi/common/tickets");
+        let orchestration = instruction("orchestration", "$yoi/common/worker-orchestration");
         let contributions = dedupe_instruction_contributions([
             workflow.clone(),
             orchestration.clone(),
             workflow.clone(),
         ]);
 
-        assert_eq!(contributions, vec![orchestration, workflow]);
+        assert_eq!(contributions, vec![workflow, orchestration]);
     }
 
     #[test]
     fn undeclared_instruction_contribution_is_rejected() {
-        let declared = instruction(
-            "declared",
-            "$yoi/common/tickets",
-            FeatureInstructionOrder::WorkflowPolicy,
-        );
-        let undeclared = instruction(
-            "undeclared",
-            "$yoi/common/tickets",
-            FeatureInstructionOrder::WorkflowPolicy,
-        );
+        let declared = instruction("declared", "$yoi/common/tickets");
+        let undeclared = instruction("undeclared", "$yoi/common/tickets");
         let descriptor =
             FeatureDescriptor::builtin("instruction", "Instruction").with_instruction(declared);
         let mut hook_builder = HookRegistryBuilder::default();

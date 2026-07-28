@@ -35,8 +35,8 @@ use crate::feature::builtin::{
     SessionExploreFeature, SessionExploreState, TaskFeature, render_extract_input,
 };
 use crate::feature::{
-    FeatureInstructionDeclaration, FeatureInstructionId, FeatureInstructionOrder,
-    FeatureRegistryBuilder, FeatureRegistryInstallReport, dedupe_instruction_contributions,
+    FeatureInstructionDeclaration, FeatureInstructionId, FeatureRegistryBuilder,
+    FeatureRegistryInstallReport, dedupe_instruction_contributions,
 };
 use crate::hook::{
     Hook, HookRegistryBuilder, OnAbort, OnPromptSubmit, OnTurnEnd, PostToolCall, PreLlmRequest,
@@ -54,7 +54,6 @@ fn worker_orchestration_instruction() -> FeatureInstructionDeclaration {
     FeatureInstructionDeclaration::new(
         FeatureInstructionId::builtin(WORKER_ORCHESTRATION_INSTRUCTION_ID),
         WORKER_ORCHESTRATION_PROMPT_REF,
-        FeatureInstructionOrder::OrchestrationPolicy,
         "Worker orchestration guidance",
     )
     .expect("static Worker orchestration instruction declaration is valid")
