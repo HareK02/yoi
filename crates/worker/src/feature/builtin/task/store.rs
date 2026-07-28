@@ -18,6 +18,12 @@ pub enum TaskStatus {
     Deleted,
 }
 
+impl TaskStatus {
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Pending | Self::Inprogress)
+    }
+}
+
 impl std::fmt::Display for TaskStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
@@ -54,6 +60,8 @@ pub struct TaskSnapshot {
     pub tasks: Vec<TaskEntry>,
 }
 
+pub const DEFAULT_TASK_LIST_LIMIT: usize = 20;
+
 impl TaskStore {
     pub fn new() -> Self {
         Self {
@@ -85,6 +93,13 @@ impl TaskStore {
             .clone()
     }
 
+    pub fn list_active(&self) -> Vec<TaskEntry> {
+        self.list()
+            .into_iter()
+            .filter(|task| task.status.is_active())
+            .collect()
+    }
+
     pub fn get(&self, taskid: u64) -> Option<TaskEntry> {
         self.inner
             .lock()
@@ -106,11 +121,12 @@ impl TaskStore {
             return Err(TaskStoreError::NoFields);
         }
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let task = inner
+        let task_position = inner
             .tasks
-            .iter_mut()
-            .find(|t| t.taskid == taskid)
+            .iter()
+            .position(|t| t.taskid == taskid)
             .ok_or(TaskStoreError::Missing(taskid))?;
+        let task = &mut inner.tasks[task_position];
         if let Some(status) = status {
             task.status = status;
         }
@@ -120,11 +136,21 @@ impl TaskStore {
         if let Some(description) = description {
             task.description = description;
         }
-        Ok(task.clone())
+        let updated = task.clone();
+        if !updated.status.is_active() {
+            inner.tasks.remove(task_position);
+        }
+        Ok(updated)
     }
 
     pub fn snapshot(&self) -> TaskSnapshot {
-        TaskSnapshot { tasks: self.list() }
+        self.snapshot_limited(DEFAULT_TASK_LIST_LIMIT)
+    }
+
+    pub fn snapshot_limited(&self, limit: usize) -> TaskSnapshot {
+        TaskSnapshot {
+            tasks: self.list_active().into_iter().take(limit).collect(),
+        }
     }
 
     pub fn replay_history(&self, history: &[Item]) {
@@ -168,6 +194,10 @@ impl TaskStore {
     }
 
     pub fn replace_with(&self, tasks: Vec<TaskEntry>) {
+        let tasks: Vec<_> = tasks
+            .into_iter()
+            .filter(|task| task.status.is_active())
+            .collect();
         let next_taskid = tasks
             .iter()
             .map(|t| t.taskid)
@@ -237,27 +267,26 @@ pub fn snapshot_overview(tasks: &[TaskEntry]) -> String {
         .iter()
         .filter(|t| t.status == TaskStatus::Inprogress)
         .count();
-    let completed = tasks
-        .iter()
-        .filter(|t| t.status == TaskStatus::Completed)
-        .count();
-    let deleted = tasks
-        .iter()
-        .filter(|t| t.status == TaskStatus::Deleted)
-        .count();
-    format!(
-        "TaskStore: {} task(s) (pending: {pending}, inprogress: {inprogress}, completed: {completed}, deleted: {deleted})",
-        tasks.len()
-    )
+    let active = pending + inprogress;
+    format!("TaskStore: {active} active task(s) (pending: {pending}, inprogress: {inprogress})")
 }
 
 pub fn render_snapshot(tasks: &[TaskEntry]) -> String {
+    let active_tasks: Vec<_> = tasks
+        .iter()
+        .filter(|task| task.status.is_active())
+        .cloned()
+        .collect();
     let snapshot = TaskSnapshot {
-        tasks: tasks.to_vec(),
+        tasks: active_tasks.clone(),
     };
     let json =
         serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| String::from("{\"tasks\":[]}"));
-    format!("{}\n\n```json\n{}\n```\n", snapshot_overview(tasks), json)
+    format!(
+        "{}\n\n```json\n{}\n```\n",
+        snapshot_overview(&active_tasks),
+        json
+    )
 }
 
 pub(super) fn parse_compact_snapshot_text(text: &str) -> Option<Vec<TaskEntry>> {
@@ -270,7 +299,13 @@ pub(super) fn parse_compact_snapshot_text(text: &str) -> Option<Vec<TaskEntry>> 
     let rest = &text[start..];
     let end = rest.find(end_marker)?;
     let snapshot: TaskSnapshot = serde_json::from_str(&rest[..end]).ok()?;
-    Some(snapshot.tasks)
+    Some(
+        snapshot
+            .tasks
+            .into_iter()
+            .filter(|task| task.status.is_active())
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -288,11 +323,9 @@ mod tests {
         ];
         let store = TaskStore::from_history(&history);
         let tasks = store.list();
-        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].taskid, 1);
         assert_eq!(tasks[0].status, TaskStatus::Pending);
-        assert_eq!(tasks[1].taskid, 2);
-        assert_eq!(tasks[1].status, TaskStatus::Completed);
     }
 
     /// Wrap snapshot text the way `Worker::try_pre_run_compact` does, so tests
@@ -300,7 +333,7 @@ mod tests {
     fn wrap_snapshot_system_message(snapshot: &str) -> String {
         format!(
             "[Session TaskStore snapshot]\n\n{snapshot}\n\n\
-             This is the complete session task list preserved across compaction. \
+             This is the active session task list preserved across compaction. \
              The following TaskList tool result presents the same state through the tool lane."
         )
     }
@@ -322,11 +355,9 @@ mod tests {
         ];
         let store = TaskStore::from_history(&history);
         let tasks = store.list();
-        assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[0].taskid, 1);
-        assert_eq!(tasks[0].status, TaskStatus::Completed);
-        assert_eq!(tasks[1].taskid, 2);
-        assert_eq!(tasks[1].subject, "new");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].taskid, 2);
+        assert_eq!(tasks[0].subject, "new");
     }
 
     #[test]
@@ -365,15 +396,12 @@ mod tests {
         ];
         let store = TaskStore::from_history(&history);
         let tasks = store.list();
-        assert_eq!(tasks.len(), 3);
-        assert_eq!(tasks[0].taskid, 1);
-        assert_eq!(tasks[0].subject, "A");
-        assert_eq!(tasks[0].status, TaskStatus::Completed);
-        assert_eq!(tasks[1].taskid, 2);
-        assert_eq!(tasks[1].subject, "B");
-        assert_eq!(tasks[1].status, TaskStatus::Inprogress);
-        assert_eq!(tasks[2].taskid, 3);
-        assert_eq!(tasks[2].subject, "C");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].taskid, 2);
+        assert_eq!(tasks[0].subject, "B");
+        assert_eq!(tasks[0].status, TaskStatus::Inprogress);
+        assert_eq!(tasks[1].taskid, 3);
+        assert_eq!(tasks[1].subject, "C");
     }
 
     #[test]
@@ -415,9 +443,10 @@ mod tests {
         let snapshot_text = pre.snapshot_text();
         let system = Item::system_message(wrap_snapshot_system_message(&snapshot_text));
         let call = Item::tool_call("compact-tasklist", "TaskList", "{}");
+        let active_tasks = pre.list_active();
         let result = Item::tool_result_with_content(
             "compact-tasklist",
-            snapshot_overview(&pre.list()),
+            snapshot_overview(&active_tasks),
             snapshot_text.clone(),
         );
 
@@ -426,7 +455,7 @@ mod tests {
             .as_text()
             .and_then(parse_compact_snapshot_text)
             .expect("system message should parse as snapshot");
-        assert_eq!(extracted, pre.list());
+        assert_eq!(extracted, active_tasks);
 
         // The synthetic call/result pair shares one call_id and carries the
         // expected tool name + detailed content.
@@ -453,6 +482,6 @@ mod tests {
 
         // Replaying the full triple reconstructs the same TaskStore.
         let store = TaskStore::from_history(&[system, call, result]);
-        assert_eq!(store.list(), pre.list());
+        assert_eq!(store.list(), active_tasks);
     }
 }

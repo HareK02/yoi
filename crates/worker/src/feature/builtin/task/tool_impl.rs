@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use llm_engine::tool::{Tool, ToolDefinition, ToolError, ToolMeta, ToolOutput};
 use serde::Deserialize;
 
-use super::store::{TaskEntry, TaskStatus, TaskStore, render_snapshot, snapshot_overview};
+use super::store::{DEFAULT_TASK_LIST_LIMIT, TaskEntry, TaskStatus, TaskStore, snapshot_overview};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TaskCreateParams {
@@ -17,7 +17,11 @@ struct TaskCreateParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct TaskListParams {}
+struct TaskListParams {
+    /// Maximum number of active tasks to return. Defaults to 20.
+    #[serde(default)]
+    limit: Option<usize>,
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TaskGetParams {
@@ -58,9 +62,7 @@ coordination. Do not create a task just because a request has several steps, and
 one for short questions, quick checks, single reviews, or one-off commands. Prefer updating an \
 existing active task over creating a duplicate. Input only `subject` and `description`; `taskid` \
 is assigned automatically and initial `status` is `pending`.";
-const LIST_DESCRIPTION: &str = "List every session-lifetime task, including completed and \
-deleted entries. Tasks are user-visible real-time status for short-term current-work tracking. \
-Takes an empty object as input.";
+const LIST_DESCRIPTION: &str = "List active session-lifetime tasks. Completed and deleted tasks are forgotten and omitted. Defaults to 20 tasks unless `limit` is provided.";
 const GET_DESCRIPTION: &str = "Get one session-lifetime task by `taskid`. Tasks are \
 user-visible real-time status for short-term current-work tracking. Returns an error if the task \
 does not exist.";
@@ -81,7 +83,7 @@ impl Tool for TaskCreateTool {
         let params: TaskCreateParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid TaskCreate input: {e}")))?;
         let created = self.store.create(params.subject, params.description);
-        let tasks = self.store.list();
+        let tasks = self.store.list_active();
         Ok(task_output(
             format!(
                 "Created task {} ({})\n{}",
@@ -90,7 +92,6 @@ impl Tool for TaskCreateTool {
                 snapshot_overview(&tasks)
             ),
             &created,
-            &tasks,
         ))
     }
 }
@@ -102,12 +103,14 @@ impl Tool for TaskListTool {
         input_json: &str,
         _ctx: llm_engine::tool::ToolExecutionContext,
     ) -> Result<ToolOutput, ToolError> {
-        let _: TaskListParams = serde_json::from_str(input_json)
+        let params: TaskListParams = serde_json::from_str(input_json)
             .map_err(|e| ToolError::InvalidArgument(format!("invalid TaskList input: {e}")))?;
-        let tasks = self.store.list();
+        let limit = params.limit.unwrap_or(DEFAULT_TASK_LIST_LIMIT);
+        let active_tasks = self.store.list_active();
+        let tasks: Vec<_> = active_tasks.iter().take(limit).cloned().collect();
         Ok(ToolOutput {
-            summary: snapshot_overview(&tasks),
-            content: Some(render_snapshot(&tasks)),
+            summary: list_overview(active_tasks.len(), tasks.len()),
+            content: Some(render_task_list(&tasks)),
         })
     }
 }
@@ -150,7 +153,7 @@ impl Tool for TaskUpdateTool {
                 params.description,
             )
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-        let tasks = self.store.list();
+        let tasks = self.store.list_active();
         Ok(task_output(
             format!(
                 "Updated task {} ({})\n{}",
@@ -159,21 +162,35 @@ impl Tool for TaskUpdateTool {
                 snapshot_overview(&tasks)
             ),
             &updated,
-            &tasks,
         ))
     }
 }
 
-fn task_output(summary: String, task: &TaskEntry, tasks: &[TaskEntry]) -> ToolOutput {
+fn task_output(summary: String, task: &TaskEntry) -> ToolOutput {
     let content = serde_json::json!({
         "task": task,
-        "snapshot": { "tasks": tasks },
     });
     ToolOutput {
         summary,
         content: Some(serde_json::to_string_pretty(&content).unwrap_or_default()),
     }
 }
+
+fn list_overview(total_active: usize, returned: usize) -> String {
+    if returned < total_active {
+        format!(
+            "TaskStore: {returned} active task(s) shown; {} omitted.",
+            total_active - returned
+        )
+    } else {
+        format!("TaskStore: {returned} active task(s)")
+    }
+}
+
+fn render_task_list(tasks: &[TaskEntry]) -> String {
+    serde_json::to_string_pretty(tasks).unwrap_or_default()
+}
+
 fn task_create_tool(store: TaskStore) -> ToolDefinition {
     Arc::new(move || {
         let schema = schemars::schema_for!(TaskCreateParams);
@@ -286,10 +303,105 @@ mod tests {
         assert!(out.content.unwrap().contains("implement tasks"));
 
         let out = list.execute("{}", Default::default()).await.unwrap();
-        assert!(out.summary.contains("1 task(s)"));
+        assert!(out.summary.contains("1 active task(s)"));
         let content = out.content.unwrap();
         assert!(content.contains("\"taskid\": 1"));
-        assert!(content.contains("```json"));
+        assert!(!content.contains("\"limit\""));
+        assert!(!content.contains("```json"));
+    }
+
+    #[tokio::test]
+    async fn task_list_omits_completed_deleted_and_defaults_to_twenty() {
+        let store = TaskStore::new();
+        let create = tool(task_create_tool(store.clone()));
+        let update = tool(task_update_tool(store.clone()));
+        let list = tool(task_list_tool(store.clone()));
+
+        for i in 0..25 {
+            create
+                .execute(
+                    &format!(r#"{{"subject":"task {i}","description":"desc {i}"}}"#),
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        update
+            .execute(r#"{"taskid":1,"status":"completed"}"#, Default::default())
+            .await
+            .unwrap();
+        update
+            .execute(r#"{"taskid":2,"status":"deleted"}"#, Default::default())
+            .await
+            .unwrap();
+
+        let out = list.execute("{}", Default::default()).await.unwrap();
+        assert_eq!(
+            out.summary,
+            "TaskStore: 20 active task(s) shown; 3 omitted."
+        );
+        let content = out.content.unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let tasks = json.as_array().unwrap();
+        assert_eq!(tasks.len(), 20);
+        let ids: Vec<u64> = tasks
+            .iter()
+            .map(|task| task["taskid"].as_u64().unwrap())
+            .collect();
+        assert!(!ids.contains(&1));
+        assert!(!ids.contains(&2));
+        assert!(!content.contains("\"limit\""));
+        assert!(!content.contains("\"total_active\""));
+        assert!(!content.contains("\"truncated\""));
+
+        let out = list
+            .execute(r#"{"limit":3}"#, Default::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            out.summary,
+            "TaskStore: 3 active task(s) shown; 20 omitted."
+        );
+        let content = out.content.unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(json.as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn task_create_and_update_results_do_not_include_full_snapshot() {
+        let store = TaskStore::new();
+        let create = tool(task_create_tool(store.clone()));
+        let update = tool(task_update_tool(store.clone()));
+
+        create
+            .execute(
+                r#"{"subject":"done","description":"completed task"}"#,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        update
+            .execute(r#"{"taskid":1,"status":"completed"}"#, Default::default())
+            .await
+            .unwrap();
+        create
+            .execute(
+                r#"{"subject":"active","description":"active task"}"#,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+
+        let out = update
+            .execute(r#"{"taskid":2,"status":"inprogress"}"#, Default::default())
+            .await
+            .unwrap();
+        let content = out.content.unwrap();
+        assert!(content.contains("\"task\""));
+        assert!(content.contains("\"taskid\": 2"));
+        assert!(!content.contains("\"snapshot\""));
+        assert!(!content.contains("\"taskid\": 1"));
+        assert!(!content.contains("completed task"));
     }
 
     #[tokio::test]

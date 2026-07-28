@@ -76,7 +76,7 @@ impl TaskFeature {
     /// pointing at the same feature-owned store after rewind.
     pub fn restore_from_history(&self, history: &[Item]) {
         let restored = TaskStore::from_history(history);
-        self.state.task_store.replace_with(restored.list());
+        self.state.task_store.replace_with(restored.list_active());
     }
 
     /// Feature-owned snapshot text used by compaction to preserve Task state.
@@ -86,7 +86,7 @@ impl TaskFeature {
 
     /// Feature-owned compact summary used for the synthetic TaskList result.
     pub fn snapshot_overview(&self) -> String {
-        snapshot_overview(&self.state.task_store.list())
+        snapshot_overview(&self.state.task_store.list_active())
     }
 
     #[cfg(test)]

@@ -27,6 +27,12 @@ pub enum TaskStatus {
     Deleted,
 }
 
+impl TaskStatus {
+    fn is_active(self) -> bool {
+        matches!(self, Self::Pending | Self::Inprogress)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct TaskEntry {
     pub taskid: u64,
@@ -106,8 +112,10 @@ impl TaskStore {
             }
             "TaskUpdate" => {
                 if let Ok(p) = serde_json::from_str::<TaskUpdateParams>(arguments)
-                    && let Some(t) = self.tasks.iter_mut().find(|t| t.taskid == p.taskid)
+                    && let Some(task_position) =
+                        self.tasks.iter().position(|t| t.taskid == p.taskid)
                 {
+                    let t = &mut self.tasks[task_position];
                     if let Some(s) = p.status {
                         t.status = s;
                     }
@@ -116,6 +124,9 @@ impl TaskStore {
                     }
                     if let Some(d) = p.description {
                         t.description = d;
+                    }
+                    if !t.status.is_active() {
+                        self.tasks.remove(task_position);
                     }
                 }
             }
@@ -132,6 +143,10 @@ impl TaskStore {
     }
 
     fn replace_with(&mut self, tasks: Vec<TaskEntry>) {
+        let tasks: Vec<_> = tasks
+            .into_iter()
+            .filter(|task| task.status.is_active())
+            .collect();
         self.next_taskid = tasks
             .iter()
             .map(|t| t.taskid)
@@ -175,7 +190,13 @@ fn parse_snapshot_text(text: &str) -> Option<Vec<TaskEntry>> {
     let rest = &text[start..];
     let end = rest.find(end_marker)?;
     let snapshot: TaskSnapshot = serde_json::from_str(&rest[..end]).ok()?;
-    Some(snapshot.tasks)
+    Some(
+        snapshot
+            .tasks
+            .into_iter()
+            .filter(|task| task.status.is_active())
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -220,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn counts_classifies_each_status() {
+    fn counts_tracks_only_active_tasks_after_completion() {
         let mut s = TaskStore::new();
         s.apply_tool_call("TaskCreate", r#"{"subject":"a","description":""}"#);
         s.apply_tool_call("TaskCreate", r#"{"subject":"b","description":""}"#);
@@ -230,9 +251,9 @@ mod tests {
         let c = s.counts();
         assert_eq!(c.pending, 1);
         assert_eq!(c.inprogress, 1);
-        assert_eq!(c.completed, 1);
+        assert_eq!(c.completed, 0);
         assert_eq!(c.deleted, 0);
-        assert_eq!(c.total(), 3);
+        assert_eq!(c.total(), 2);
         assert_eq!(c.active(), 2);
     }
 
@@ -242,7 +263,7 @@ mod tests {
     fn wrap_snapshot(json_body: &str, overview: &str) -> String {
         format!(
             "[Session TaskStore snapshot]\n\n{overview}\n\n```json\n{json_body}\n```\n\n\
-             This is the complete session task list preserved across compaction. \
+             This is the active session task list preserved across compaction. \
              The following TaskList tool result presents the same state through the tool lane."
         )
     }
@@ -267,20 +288,19 @@ mod tests {
 }"#;
         let text = wrap_snapshot(
             body,
-            "TaskStore: 2 task(s) (pending: 1, inprogress: 0, completed: 1, deleted: 0)",
+            "TaskStore: 1 active task(s) (pending: 1, inprogress: 0)",
         );
         let mut s = TaskStore::new();
         s.apply_tool_call("TaskCreate", r#"{"subject":"stale","description":""}"#);
         s.apply_system_message_text(&text);
         let tasks = s.tasks();
-        assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[0].taskid, 5);
-        assert_eq!(tasks[0].status, TaskStatus::Completed);
-        assert_eq!(tasks[1].taskid, 7);
-        // Subsequent TaskCreate must continue beyond the highest taskid
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].taskid, 7);
+        assert_eq!(tasks[0].status, TaskStatus::Pending);
+        // Subsequent TaskCreate must continue beyond the highest active taskid
         // observed in the snapshot.
         s.apply_tool_call("TaskCreate", r#"{"subject":"new","description":""}"#);
-        assert_eq!(s.tasks()[2].taskid, 8);
+        assert_eq!(s.tasks()[1].taskid, 8);
     }
 
     #[test]
@@ -304,7 +324,7 @@ mod tests {
     }
   ]
 }"#;
-        let text = wrap_snapshot(body, "TaskStore: 1 task(s)");
+        let text = wrap_snapshot(body, "TaskStore: 1 active task(s)");
         let mut s = TaskStore::new();
         s.apply_system_message_text(&text);
         let t = &s.tasks()[0];
@@ -329,13 +349,13 @@ mod snapshot_format_contract {
     fn wrap_pod_style(snapshot_text: &str) -> String {
         format!(
             "[Session TaskStore snapshot]\n\n{snapshot_text}\n\n\
-             This is the complete session task list preserved across compaction. \
+             This is the active session task list preserved across compaction. \
              The following TaskList tool result presents the same state through the tool lane."
         )
     }
 
     fn snapshot_fixture() -> &'static str {
-        r#"TaskStore: 2 task(s) (pending: 0, inprogress: 1, completed: 1, deleted: 0)
+        r#"TaskStore: 1 active task(s) (pending: 0, inprogress: 1)
 
 ```json
 {
@@ -345,12 +365,6 @@ mod snapshot_format_contract {
       "status": "inprogress",
       "subject": "first",
       "description": "first desc"
-    },
-    {
-      "taskid": 2,
-      "status": "completed",
-      "subject": "second",
-      "description": "second desc with\nnewline"
     }
   ]
 }
@@ -358,7 +372,7 @@ mod snapshot_format_contract {
     }
 
     fn empty_snapshot_fixture() -> &'static str {
-        r#"TaskStore: 0 task(s) (pending: 0, inprogress: 0, completed: 0, deleted: 0)
+        r#"TaskStore: 0 active task(s) (pending: 0, inprogress: 0)
 
 ```json
 {
@@ -384,15 +398,11 @@ mod snapshot_format_contract {
         downstream.apply_system_message_text(&envelope);
 
         let tasks = downstream.tasks();
-        assert_eq!(tasks.len(), 2, "TUI parsed wrong number of tasks");
+        assert_eq!(tasks.len(), 1, "TUI parsed wrong number of tasks");
         assert_eq!(tasks[0].taskid, 1);
         assert_eq!(tasks[0].subject, "first");
         assert_eq!(tasks[0].description, "first desc");
         assert_eq!(status_label(tasks[0].status), "inprogress");
-        assert_eq!(tasks[1].taskid, 2);
-        assert_eq!(tasks[1].subject, "second");
-        assert_eq!(tasks[1].description, "second desc with\nnewline");
-        assert_eq!(status_label(tasks[1].status), "completed");
     }
 
     #[test]
